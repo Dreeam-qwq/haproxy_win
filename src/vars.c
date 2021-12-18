@@ -36,6 +36,26 @@ static unsigned int var_reqres_limit = 0;
 static unsigned int var_check_limit = 0;
 static uint64_t var_name_hash_seed = 0;
 
+/* Structure and array matching set-var conditions to their respective flag
+ * value.
+ */
+struct var_set_condition {
+       const char *cond_str;
+       uint flag;
+};
+
+static struct var_set_condition conditions_array[] = {
+       { "ifexists", VF_COND_IFEXISTS },
+       { "ifnotexists", VF_COND_IFNOTEXISTS },
+       { "ifempty", VF_COND_IFEMPTY },
+       { "ifnotempty", VF_COND_IFNOTEMPTY },
+       { "ifset", VF_COND_IFSET },
+       { "ifnotset", VF_COND_IFNOTSET },
+       { "ifgt", VF_COND_IFGT },
+       { "iflt", VF_COND_IFLT },
+       { NULL, 0 }
+};
+
 /* returns the struct vars pointer for a session, stream and scope, or NULL if
  * it does not exist.
  */
@@ -301,6 +321,25 @@ static int smp_fetch_var(const struct arg *args, struct sample *smp, const char 
 	return vars_get_by_desc(var_desc, smp, def);
 }
 
+/*
+ * Clear the contents of a variable so that it can be reset directly.
+ * This function is used just before a variable is filled out of a sample's
+ * content.
+ */
+static inline void var_clear_buffer(struct sample *smp, struct vars *vars, struct var *var, int var_type)
+{
+       if (var_type == SMP_T_STR || var_type == SMP_T_BIN) {
+               ha_free(&var->data.u.str.area);
+               var_accounting_diff(vars, smp->sess, smp->strm,
+                                   -var->data.u.str.data);
+       }
+       else if (var_type == SMP_T_METH && var->data.u.meth.meth == HTTP_METH_OTHER) {
+               ha_free(&var->data.u.meth.str.area);
+               var_accounting_diff(vars, smp->sess, smp->strm,
+                                   -var->data.u.meth.str.data);
+       }
+}
+
 /* This function tries to create a variable whose name hash is <name_hash> in
  * scope <scope> and store sample <smp> as its value.
  *
@@ -310,10 +349,17 @@ static int smp_fetch_var(const struct arg *args, struct sample *smp, const char 
  * a bool (which is memory-less).
  *
  * Flags is a bitfield that may contain one of the following flags:
- *   - VF_UPDATEONLY: if the scope is SCOPE_PROC, the variable may only be
- *     updated but not created.
  *   - VF_CREATEONLY: do nothing if the variable already exists (success).
  *   - VF_PERMANENT: this flag will be passed to the variable upon creation
+ *
+ *   - VF_COND_IFEXISTS: only set variable if it already exists
+ *   - VF_COND_IFNOTEXISTS: only set variable if it did not exist yet
+ *   - VF_COND_IFEMPTY: only set variable if sample is empty
+ *   - VF_COND_IFNOTEMPTY: only set variable if sample is not empty
+ *   - VF_COND_IFSET: only set variable if its type is not SMP_TYPE_ANY
+ *   - VF_COND_IFNOTSET: only set variable if its type is ANY
+ *   - VF_COND_IFGT: only set variable if its value is greater than the sample's
+ *   - VF_COND_IFLT: ony set variable if its value is less than the sample's
  *
  * It returns 0 on failure, non-zero on success.
  */
@@ -322,6 +368,7 @@ static int var_set(uint64_t name_hash, enum vars_scope scope, struct sample *smp
 	struct vars *vars;
 	struct var *var;
 	int ret = 0;
+	int previous_type = SMP_T_ANY;
 
 	vars = get_vars(smp->sess, smp->strm, scope);
 	if (!vars || vars->scope != scope)
@@ -338,21 +385,10 @@ static int var_set(uint64_t name_hash, enum vars_scope scope, struct sample *smp
 			goto unlock;
 		}
 
-		/* free its used memory. */
-		if (var->data.type == SMP_T_STR ||
-		    var->data.type == SMP_T_BIN) {
-			ha_free(&var->data.u.str.area);
-			var_accounting_diff(vars, smp->sess, smp->strm,
-					    -var->data.u.str.data);
-		}
-		else if (var->data.type == SMP_T_METH && var->data.u.meth.meth == HTTP_METH_OTHER) {
-			ha_free(&var->data.u.meth.str.area);
-			var_accounting_diff(vars, smp->sess, smp->strm,
-					    -var->data.u.meth.str.data);
-		}
+		if (flags & VF_COND_IFNOTEXISTS)
+			goto unlock;
 	} else {
-		/* creation permitted for proc ? */
-		if (flags & VF_UPDATEONLY && scope == SCOPE_PROC)
+		if (flags & VF_COND_IFEXISTS)
 			goto unlock;
 
 		/* Check memory available. */
@@ -366,25 +402,67 @@ static int var_set(uint64_t name_hash, enum vars_scope scope, struct sample *smp
 		LIST_APPEND(&vars->head, &var->l);
 		var->name_hash = name_hash;
 		var->flags = flags & VF_PERMANENT;
+		var->data.type = SMP_T_ANY;
 	}
 
+	/* A variable of type SMP_T_ANY is considered as unset (either created
+	 * and never set or unset-var was called on it).
+	 */
+	if ((flags & VF_COND_IFSET && var->data.type == SMP_T_ANY) ||
+	    (flags & VF_COND_IFNOTSET && var->data.type != SMP_T_ANY))
+		goto unlock;
+
 	/* Set type. */
+	previous_type = var->data.type;
 	var->data.type = smp->data.type;
+
+	if (flags & VF_COND_IFEMPTY) {
+		switch(smp->data.type) {
+		case SMP_T_ANY:
+		case SMP_T_STR:
+		case SMP_T_BIN:
+			/* The actual test on the contents of the sample will be
+			 * performed later.
+			 */
+			break;
+		default:
+			/* The sample cannot be empty since it has a scalar type. */
+			var->data.type = previous_type;
+			goto unlock;
+		}
+	}
 
 	/* Copy data. If the data needs memory, the function can fail. */
 	switch (var->data.type) {
 	case SMP_T_BOOL:
+		var_clear_buffer(smp, vars, var, previous_type);
+		var->data.u.sint = smp->data.u.sint;
+		break;
 	case SMP_T_SINT:
+		if (previous_type == var->data.type) {
+			if (((flags & VF_COND_IFGT) && !(var->data.u.sint > smp->data.u.sint)) ||
+			    ((flags & VF_COND_IFLT) && !(var->data.u.sint < smp->data.u.sint)))
+				goto unlock;
+		}
+		var_clear_buffer(smp, vars, var, previous_type);
 		var->data.u.sint = smp->data.u.sint;
 		break;
 	case SMP_T_IPV4:
+		var_clear_buffer(smp, vars, var, previous_type);
 		var->data.u.ipv4 = smp->data.u.ipv4;
 		break;
 	case SMP_T_IPV6:
+		var_clear_buffer(smp, vars, var, previous_type);
 		var->data.u.ipv6 = smp->data.u.ipv6;
 		break;
 	case SMP_T_STR:
 	case SMP_T_BIN:
+		if ((flags & VF_COND_IFNOTEMPTY && !smp->data.u.str.data) ||
+		    (flags & VF_COND_IFEMPTY && smp->data.u.str.data)) {
+			var->data.type = previous_type;
+			goto unlock;
+		}
+		var_clear_buffer(smp, vars, var, previous_type);
 		if (!var_accounting_add(vars, smp->sess, smp->strm, smp->data.u.str.data)) {
 			var->data.type = SMP_T_BOOL; /* This type doesn't use additional memory. */
 			goto unlock;
@@ -402,6 +480,7 @@ static int var_set(uint64_t name_hash, enum vars_scope scope, struct sample *smp
 		       var->data.u.str.data);
 		break;
 	case SMP_T_METH:
+		var_clear_buffer(smp, vars, var, previous_type);
 		var->data.u.meth.meth = smp->data.u.meth.meth;
 		if (smp->data.u.meth.meth != HTTP_METH_OTHER)
 			break;
@@ -457,10 +536,44 @@ static int var_unset(uint64_t name_hash, enum vars_scope scope, struct sample *s
 	return 1;
 }
 
+
+/*
+ * Convert a string set-var condition into its numerical value.
+ * The corresponding bit is set in the <cond_bitmap> parameter if the
+ * <cond> is known.
+ * Returns 1 in case of success.
+ */
+static int vars_parse_cond_param(const struct buffer *cond, uint *cond_bitmap, char **err)
+{
+	struct var_set_condition *cond_elt = &conditions_array[0];
+
+	/* The conditions array is NULL terminated. */
+	while (cond_elt->cond_str) {
+		if (chunk_strcmp(cond, cond_elt->cond_str) == 0) {
+			*cond_bitmap |= cond_elt->flag;
+			break;
+		}
+		++cond_elt;
+	}
+
+	if (cond_elt->cond_str == NULL && err)
+		memprintf(err, "unknown condition \"%.*s\"", (int)cond->data, cond->area);
+
+	return cond_elt->cond_str != NULL;
+}
+
 /* Returns 0 if fails, else returns 1. */
 static int smp_conv_store(const struct arg *args, struct sample *smp, void *private)
 {
-	return var_set(args[0].data.var.name_hash, args[0].data.var.scope, smp, 0);
+	uint conditions = 0;
+	int cond_idx = 1;
+
+	while (args[cond_idx].type == ARGT_STR) {
+		if (vars_parse_cond_param(&args[cond_idx++].data.str, &conditions, NULL) == 0)
+			break;
+	}
+
+	return var_set(args[0].data.var.name_hash, args[0].data.var.scope, smp, conditions);
 }
 
 /* Returns 0 if fails, else returns 1. */
@@ -502,7 +615,8 @@ int vars_check_arg(struct arg *arg, char **err)
 	return 1;
 }
 
-/* This function stores a sample in a variable if it was already defined.
+/* This function stores a sample in a variable unless it is of type "proc" and
+ * not defined yet.
  * Returns zero on failure and non-zero otherwise. The variable not being
  * defined is treated as a failure.
  */
@@ -515,7 +629,8 @@ int vars_set_by_name_ifexist(const char *name, size_t len, struct sample *smp)
 	if (!vars_hash_name(name, len, &scope, &hash, NULL))
 		return 0;
 
-	return var_set(hash, scope, smp, VF_UPDATEONLY);
+	/* Variable creation is allowed for all scopes apart from the PROC one. */
+	return var_set(hash, scope, smp, (scope == SCOPE_PROC) ? VF_COND_IFEXISTS : 0);
 }
 
 
@@ -692,7 +807,7 @@ static enum act_return action_store(struct act_rule *rule, struct proxy *px,
 		smp_set_owner(&smp, px, sess, s, 0);
 		smp.data.type = SMP_T_STR;
 		smp.data.u.str = *fmtstr;
-		var_set(rule->arg.vars.name_hash, rule->arg.vars.scope, &smp, 0);
+		var_set(rule->arg.vars.name_hash, rule->arg.vars.scope, &smp, rule->arg.vars.conditions);
 	}
 	else {
 		/* an expression is used */
@@ -702,7 +817,7 @@ static enum act_return action_store(struct act_rule *rule, struct proxy *px,
 	}
 
 	/* Store the sample, and ignore errors. */
-	var_set(rule->arg.vars.name_hash, rule->arg.vars.scope, &smp, 0);
+	var_set(rule->arg.vars.name_hash, rule->arg.vars.scope, &smp, rule->arg.vars.conditions);
 	free_trash_chunk(fmtstr);
 	return ACT_RET_CONT;
 }
@@ -751,14 +866,21 @@ static int smp_check_var(struct arg *args, char **err)
 static int conv_check_var(struct arg *args, struct sample_conv *conv,
                           const char *file, int line, char **err_msg)
 {
-	return vars_check_arg(&args[0], err_msg);
+	int cond_idx = 1;
+	uint conditions = 0;
+	int retval = vars_check_arg(&args[0], err_msg);
+
+	while (retval && args[cond_idx].type == ARGT_STR)
+		retval = vars_parse_cond_param(&args[cond_idx++].data.str, &conditions, err_msg);
+
+	return retval;
 }
 
 /* This function is a common parser for using variables. It understands
  * the format:
  *
- *   set-var-fmt(<variable-name>) <format-string>
- *   set-var(<variable-name>) <expression>
+ *   set-var-fmt(<variable-name>[,<cond> ...]) <format-string>
+ *   set-var(<variable-name>[,<cond> ...]) <expression>
  *   unset-var(<variable-name>)
  *
  * It returns ACT_RET_PRS_ERR if fails and <err> is filled with an error
@@ -774,6 +896,9 @@ static enum act_parse_ret parse_store(const char **args, int *arg, struct proxy 
 	const char *kw_name;
 	int flags = 0, set_var = 0; /* 0=unset-var, 1=set-var, 2=set-var-fmt */
 	struct sample empty_smp = { };
+	struct ist condition = IST_NULL;
+	struct ist var = IST_NULL;
+	struct ist varname_ist = IST_NULL;
 
 	if (strncmp(var_name, "set-var-fmt", 11) == 0) {
 		var_name += 11;
@@ -800,6 +925,28 @@ static enum act_parse_ret parse_store(const char **args, int *arg, struct proxy 
 		memprintf(err, "incomplete argument after action '%s'. Expects 'set-var(<var-name>)', 'set-var-fmt(<var-name>)' or 'unset-var(<var-name>)'",
 			  args[*arg-1]);
 		return ACT_RET_PRS_ERR;
+	}
+
+	/* Parse the optional conditions. */
+	var = ist2(var_name, var_len);
+	varname_ist = istsplit(&var, ',');
+	var_len = istlen(varname_ist);
+
+	condition = istsplit(&var, ',');
+
+	if (istlen(condition) && set_var == 0) {
+		memprintf(err, "unset-var does not expect parameters after the variable name. Only \"set-var\" and \"set-var-fmt\" manage conditions");
+		return ACT_RET_PRS_ERR;
+	}
+
+	while (istlen(condition)) {
+		struct buffer cond = {};
+
+		chunk_initlen(&cond, istptr(condition), 0, istlen(condition));
+		if (vars_parse_cond_param(&cond, &rule->arg.vars.conditions, err) == 0)
+			return ACT_RET_PRS_ERR;
+
+		condition = istsplit(&var, ',');
 	}
 
 	LIST_INIT(&rule->arg.vars.fmt);
@@ -1205,7 +1352,7 @@ static struct sample_fetch_kw_list sample_fetch_keywords = {ILH, {
 INITCALL1(STG_REGISTER, sample_register_fetches, &sample_fetch_keywords);
 
 static struct sample_conv_kw_list sample_conv_kws = {ILH, {
-	{ "set-var",   smp_conv_store, ARG1(1,STR), conv_check_var, SMP_T_ANY, SMP_T_ANY },
+	{ "set-var",   smp_conv_store, ARG5(1,STR,STR,STR,STR,STR), conv_check_var, SMP_T_ANY, SMP_T_ANY },
 	{ "unset-var", smp_conv_clear, ARG1(1,STR), conv_check_var, SMP_T_ANY, SMP_T_ANY },
 	{ /* END */ },
 }};

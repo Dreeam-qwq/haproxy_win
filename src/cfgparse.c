@@ -2212,7 +2212,9 @@ err:
 	return err_code;
 }
 
-#if defined(USE_THREAD) && defined(__linux__) && defined USE_CPU_AFFINITY
+#if defined(USE_THREAD) && defined USE_CPU_AFFINITY
+#if defined(__linux__)
+
 /* filter directory name of the pattern node<X> */
 static int numa_filter(const struct dirent *dir)
 {
@@ -2372,7 +2374,59 @@ static int numa_detect_topology()
 
 	return ha_cpuset_count(&node_cpu_set);
 }
-#endif /* __linux__ && USE_CPU_AFFINITY */
+
+#elif defined(__FreeBSD__)
+static int numa_detect_topology()
+{
+	struct hap_cpuset node_cpu_set;
+	int ndomains = 0, i;
+	size_t len = sizeof(ndomains);
+
+	if (sysctlbyname("vm.ndomains", &ndomains, &len, NULL, 0) == -1) {
+		ha_notice("Cannot assess the number of CPUs domains\n");
+		return 0;
+	}
+
+	BUG_ON(ndomains > MAXMEMDOM);
+	ha_cpuset_zero(&node_cpu_set);
+
+	/*
+	 * We retrieve the first active valid CPU domain
+	 * with active cpu and binding it, we returns
+	 * the number of cpu from the said domain
+	 */
+	for (i = 0; i < ndomains; i ++) {
+		struct hap_cpuset dom;
+		ha_cpuset_zero(&dom);
+		if (cpuset_getaffinity(CPU_LEVEL_WHICH, CPU_WHICH_DOMAIN, i, sizeof(dom.cpuset), &dom.cpuset) == -1)
+			continue;
+
+		if (!ha_cpuset_count(&dom))
+			continue;
+
+		ha_cpuset_assign(&node_cpu_set, &dom);
+
+		ha_diag_warning("Multi-socket cpu detected, automatically binding on active CPUs of '%d' (%u active cpu(s))\n", i, ha_cpuset_count(&node_cpu_set));
+		if (cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_PID, -1, sizeof(node_cpu_set.cpuset), &node_cpu_set.cpuset) == -1) {
+			ha_warning("Cannot set the cpu affinity for this multi-cpu machine\n");
+
+			/* clear the cpuset used as return value */
+			ha_cpuset_zero(&node_cpu_set);
+		}
+		break;
+	}
+
+	return ha_cpuset_count(&node_cpu_set);
+}
+
+#else
+static int numa_detect_topology()
+{
+	return 0;
+}
+
+#endif
+#endif /* USE_THREAD && USE_CPU_AFFINITY */
 
 /*
  * Returns the error code, 0 if OK, or any combination of :
@@ -2425,7 +2479,7 @@ int check_config_validity()
 #if defined(USE_THREAD)
 		{
 			int numa_cores = 0;
-#if defined(__linux__) && defined USE_CPU_AFFINITY
+#if defined(USE_CPU_AFFINITY)
 			if (global.numa_cpu_mapping && !thread_cpu_mask_forced())
 				numa_cores = numa_detect_topology();
 #endif
