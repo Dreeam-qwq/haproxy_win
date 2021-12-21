@@ -1083,11 +1083,12 @@ static inline void quic_rx_pkts_del(struct quic_conn *qc)
 			break;
 		}
 
-		if (!HA_ATOMIC_LOAD(&pkt->refcnt)) {
-			b_del(&qc->rx.buf, pkt->raw_len);
-			LIST_DELETE(&pkt->qc_rx_pkt_list);
-			pool_free(pool_head_quic_rx_packet, pkt);
-		}
+		if (HA_ATOMIC_LOAD(&pkt->refcnt))
+			break;
+
+		b_del(&qc->rx.buf, pkt->raw_len);
+		LIST_DELETE(&pkt->qc_rx_pkt_list);
+		pool_free(pool_head_quic_rx_packet, pkt);
 	}
 }
 
@@ -1136,6 +1137,32 @@ static inline void qc_el_rx_pkts_del(struct quic_enc_level *qel)
 		quic_rx_packet_refdec(pkt);
 	}
 	HA_RWLOCK_WRUNLOCK(QUIC_LOCK, &qel->rx.pkts_rwlock);
+}
+
+static inline void qc_list_qel_rx_pkts(struct quic_enc_level *qel)
+{
+	struct eb64_node *node;
+
+	HA_RWLOCK_RDLOCK(QUIC_LOCK, &qel->rx.pkts_rwlock);
+	node = eb64_first(&qel->rx.pkts);
+	while (node) {
+		struct quic_rx_packet *pkt;
+
+		pkt = eb64_entry(&node->node, struct quic_rx_packet, pn_node);
+		fprintf(stderr, "pkt@%p type=%d pn=%llu\n",
+		        pkt, pkt->type, (ull)pkt->pn_node.key);
+		node = eb64_next(node);
+	}
+	HA_RWLOCK_RDUNLOCK(QUIC_LOCK, &qel->rx.pkts_rwlock);
+}
+
+static inline void qc_list_all_rx_pkts(struct quic_conn *qc)
+{
+	fprintf(stderr, "REMAINING QEL RX PKTS:\n");
+	qc_list_qel_rx_pkts(&qc->els[QUIC_TLS_ENC_LEVEL_INITIAL]);
+	qc_list_qel_rx_pkts(&qc->els[QUIC_TLS_ENC_LEVEL_EARLY_DATA]);
+	qc_list_qel_rx_pkts(&qc->els[QUIC_TLS_ENC_LEVEL_HANDSHAKE]);
+	qc_list_qel_rx_pkts(&qc->els[QUIC_TLS_ENC_LEVEL_APP]);
 }
 
 void quic_set_tls_alert(struct quic_conn *qc, int alert);
