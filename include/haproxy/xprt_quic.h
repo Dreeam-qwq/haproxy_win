@@ -133,8 +133,8 @@ static inline unsigned long quic_get_cid_tid(const struct quic_cid *cid)
 	return cid->data[0] % global.nbthread;
 }
 
-/* Free the CIDs attached to <conn> QUIC connection.
- * Always succeeds.
+/* Free the CIDs attached to <conn> QUIC connection. This must be called under
+ * the CID lock.
  */
 static inline void free_quic_conn_cids(struct quic_conn *conn)
 {
@@ -147,9 +147,7 @@ static inline void free_quic_conn_cids(struct quic_conn *conn)
 		cid = eb64_entry(&node->node, struct quic_connection_id, seq_num);
 
 		/* remove the CID from the receiver tree */
-		HA_RWLOCK_WRLOCK(QUIC_LOCK, &conn->li->rx.cids_lock);
 		ebmb_delete(&cid->node);
-		HA_RWLOCK_WRUNLOCK(QUIC_LOCK, &conn->li->rx.cids_lock);
 
 		/* remove the CID from the quic_conn tree */
 		node = eb64_next(node);
@@ -1165,6 +1163,8 @@ static inline void qc_list_all_rx_pkts(struct quic_conn *qc)
 	qc_list_qel_rx_pkts(&qc->els[QUIC_TLS_ENC_LEVEL_HANDSHAKE]);
 	qc_list_qel_rx_pkts(&qc->els[QUIC_TLS_ENC_LEVEL_APP]);
 }
+
+void chunk_frm_appendf(struct buffer *buf, const struct quic_frame *frm);
 
 void quic_set_tls_alert(struct quic_conn *qc, int alert);
 int quic_set_app_ops(struct quic_conn *qc, const unsigned char *alpn, size_t alpn_len);
