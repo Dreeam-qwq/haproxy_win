@@ -213,6 +213,19 @@ list of options is :
     getaddrinfo() exist on various systems and cause anomalies that are
     difficult to troubleshoot.
 
+  -dL : dumps the list of dynamic shared libraries that are loaded at the end
+   of the config processing. This will generally also include deep dependencies
+   such as anything loaded from Lua code for example, as well as the executable
+   itself. The list is printed in a format that ought to be easy enough to
+   sanitize to directly produce a tarball of all dependencies. Since it doesn't
+   stop the program's startup, it is recommended to only use it in combination
+   with "-c" and "-q" where only the list of loaded objects will be displayed
+   (or nothing in case of error). In addition, keep in mind that when providing
+   such a package to help with a core file analysis, most libraries are in fact
+   symbolic links that need to be dereferenced when creating the archive:
+
+       ./haproxy -W -q -c -dL -f foo.cfg | tar -T - -hzcf archive.tgz
+
   -dM[<byte>] : forces memory poisoning, which means that each and every
     memory region allocated with malloc() or pool_alloc() will be filled with
     <byte> before being passed to the caller. When <byte> is not specified, it
@@ -2622,6 +2635,19 @@ show info [typed|json] [desc] [float]
 
   $ echo "show info json" | socat /var/run/haproxy.sock stdio | \
     python -m json.tool
+
+show libs
+  Dump the list of loaded shared dynamic libraries and object files, on systems
+  that support it. When available, for each shared object the range of virtual
+  addresses will be indicated, the size and the path to the object. This can be
+  used for example to try to estimate what library provides a function that
+  appears in a dump. Note that on many systems, addresses will change upon each
+  restart (address space randomization), so that this list would need to be
+  retrieved upon startup if it is expected to be used to analyse a core file.
+  This command may only be issued on sockets configured for levels "operator"
+  or "admin". Note that the output format may vary between operating systems,
+  architectures and even haproxy versions, and ought not to be relied on in
+  scripts.
 
 show map [[@<ver>] <map>]
   Dump info about map converters. Without argument, the list of all available
