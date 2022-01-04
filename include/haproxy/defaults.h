@@ -404,7 +404,11 @@
 
 /* default per-thread pool cache size when enabled */
 #ifndef CONFIG_HAP_POOL_CACHE_SIZE
-#define CONFIG_HAP_POOL_CACHE_SIZE 1048576
+#define CONFIG_HAP_POOL_CACHE_SIZE 524288
+#endif
+
+#ifndef CONFIG_HAP_POOL_CLUSTER_SIZE
+#define CONFIG_HAP_POOL_CLUSTER_SIZE 8
 #endif
 
 /* Number of samples used to compute the times reported in stats. A power of

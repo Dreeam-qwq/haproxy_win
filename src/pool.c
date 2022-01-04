@@ -282,10 +282,8 @@ void *pool_alloc_nocache(struct pool_head *pool)
 	swrate_add_scaled(&pool->needed_avg, POOL_AVG_SAMPLES, pool->used, POOL_AVG_SAMPLES/4);
 	_HA_ATOMIC_INC(&pool->used);
 
-#ifdef DEBUG_MEMORY_POOLS
 	/* keep track of where the element was allocated from */
-	*POOL_LINK(pool, ptr) = (void *)pool;
-#endif
+	POOL_DEBUG_SET_MARK(pool, ptr);
 	return ptr;
 }
 
@@ -303,6 +301,54 @@ void pool_free_nocache(struct pool_head *pool, void *ptr)
 
 #ifdef CONFIG_HAP_POOLS
 
+/* removes up to <count> items from the end of the local pool cache <ph> for
+ * pool <pool>. The shared pool is refilled with these objects in the limit
+ * of the number of acceptable objects, and the rest will be released to the
+ * OS. It is not a problem is <count> is larger than the number of objects in
+ * the local cache. The counters are automatically updated.
+ */
+static void pool_evict_last_items(struct pool_head *pool, struct pool_cache_head *ph, uint count)
+{
+	struct pool_cache_item *item;
+	struct pool_item *pi, *head = NULL;
+	uint released = 0;
+	uint cluster = 0;
+	uint to_free_max;
+
+	to_free_max = pool_releasable(pool);
+
+	while (released < count && !LIST_ISEMPTY(&ph->list)) {
+		item = LIST_PREV(&ph->list, typeof(item), by_pool);
+		LIST_DELETE(&item->by_pool);
+		LIST_DELETE(&item->by_lru);
+
+		if (to_free_max > released || cluster) {
+			pi = (struct pool_item *)item;
+			pi->next = NULL;
+			pi->down = head;
+			head = pi;
+			cluster++;
+			if (cluster >= CONFIG_HAP_POOL_CLUSTER_SIZE) {
+				/* enough to make a cluster */
+				pool_put_to_shared_cache(pool, head, cluster);
+				cluster = 0;
+				head = NULL;
+			}
+		} else
+			pool_free_nocache(pool, item);
+
+		released++;
+	}
+
+	/* incomplete cluster left */
+	if (cluster)
+		pool_put_to_shared_cache(pool, head, cluster);
+
+	ph->count -= released;
+	pool_cache_count -= released;
+	pool_cache_bytes -= released * pool->size;
+}
+
 /* Evicts some of the oldest objects from one local cache, until its number of
  * objects is no more than 16+1/8 of the total number of locally cached objects
  * or the total size of the local cache is no more than 75% of its maximum (i.e.
@@ -312,17 +358,11 @@ void pool_free_nocache(struct pool_head *pool, void *ptr)
 void pool_evict_from_local_cache(struct pool_head *pool)
 {
 	struct pool_cache_head *ph = &pool->cache[tid];
-	struct pool_cache_item *item;
 
-	while (ph->count >= 16 + pool_cache_count / 8 &&
+	while (ph->count >= CONFIG_HAP_POOL_CLUSTER_SIZE &&
+	       ph->count >= 16 + pool_cache_count / 8 &&
 	       pool_cache_bytes > CONFIG_HAP_POOL_CACHE_SIZE * 3 / 4) {
-		item = LIST_NEXT(&ph->list, typeof(item), by_pool);
-		ph->count--;
-		pool_cache_bytes -= pool->size;
-		pool_cache_count--;
-		LIST_DELETE(&item->by_pool);
-		LIST_DELETE(&item->by_lru);
-		pool_put_to_shared_cache(pool, item);
+		pool_evict_last_items(pool, ph, CONFIG_HAP_POOL_CLUSTER_SIZE);
 	}
 }
 
@@ -342,12 +382,7 @@ void pool_evict_from_local_caches()
 		 */
 		ph = LIST_NEXT(&item->by_pool, struct pool_cache_head *, list);
 		pool = container_of(ph - tid, struct pool_head, cache);
-		LIST_DELETE(&item->by_pool);
-		LIST_DELETE(&item->by_lru);
-		ph->count--;
-		pool_cache_count--;
-		pool_cache_bytes -= pool->size;
-		pool_put_to_shared_cache(pool, item);
+		pool_evict_last_items(pool, ph, CONFIG_HAP_POOL_CLUSTER_SIZE);
 	} while (pool_cache_bytes > CONFIG_HAP_POOL_CACHE_SIZE * 7 / 8);
 }
 
@@ -368,7 +403,7 @@ void pool_put_to_cache(struct pool_head *pool, void *ptr)
 	pool_cache_bytes += pool->size;
 
 	if (unlikely(pool_cache_bytes > CONFIG_HAP_POOL_CACHE_SIZE * 3 / 4)) {
-		if (ph->count >= 16 + pool_cache_count / 8)
+		if (ph->count >= 16 + pool_cache_count / 8 + CONFIG_HAP_POOL_CLUSTER_SIZE)
 			pool_evict_from_local_cache(pool);
 		if (pool_cache_bytes > CONFIG_HAP_POOL_CACHE_SIZE)
 			pool_evict_from_local_caches();
@@ -390,12 +425,87 @@ void pool_gc(struct pool_head *pool_ctx)
 
 #else /* CONFIG_HAP_NO_GLOBAL_POOLS */
 
+/* Tries to refill the local cache <pch> from the shared one for pool <pool>.
+ * This is only used when pools are in use and shared pools are enabled. No
+ * malloc() is attempted, and poisonning is never performed. The purpose is to
+ * get the fastest possible refilling so that the caller can easily check if
+ * the cache has enough objects for its use.
+ */
+void pool_refill_local_from_shared(struct pool_head *pool, struct pool_cache_head *pch)
+{
+	struct pool_cache_item *item;
+	struct pool_item *ret, *down;
+	uint count;
+
+	/* we'll need to reference the first element to figure the next one. We
+	 * must temporarily lock it so that nobody allocates then releases it,
+	 * or the dereference could fail.
+	 */
+	ret = _HA_ATOMIC_LOAD(&pool->free_list);
+	do {
+		while (unlikely(ret == POOL_BUSY)) {
+			__ha_cpu_relax();
+			ret = _HA_ATOMIC_LOAD(&pool->free_list);
+		}
+		if (ret == NULL)
+			return;
+	} while (unlikely((ret = _HA_ATOMIC_XCHG(&pool->free_list, POOL_BUSY)) == POOL_BUSY));
+
+	if (unlikely(ret == NULL)) {
+		HA_ATOMIC_STORE(&pool->free_list, NULL);
+		return;
+	}
+
+	/* this releases the lock */
+	HA_ATOMIC_STORE(&pool->free_list, ret->next);
+
+	/* now store the retrieved object(s) into the local cache */
+	count = 0;
+	for (; ret; ret = down) {
+		down = ret->down;
+		/* keep track of where the element was allocated from */
+		POOL_DEBUG_SET_MARK(pool, ret);
+
+		item = (struct pool_cache_item *)ret;
+		LIST_INSERT(&pch->list, &item->by_pool);
+		LIST_INSERT(&th_ctx->pool_lru_head, &item->by_lru);
+		count++;
+	}
+	HA_ATOMIC_ADD(&pool->used, count);
+	pch->count += count;
+	pool_cache_count += count;
+	pool_cache_bytes += count * pool->size;
+}
+
+/* Adds pool item cluster <item> to the shared cache, which contains <count>
+ * elements. The caller is advised to first check using pool_releasable() if
+ * it's wise to add this series of objects there. Both the pool and the item's
+ * head must be valid.
+ */
+void pool_put_to_shared_cache(struct pool_head *pool, struct pool_item *item, uint count)
+{
+	struct pool_item *free_list;
+
+	_HA_ATOMIC_SUB(&pool->used, count);
+	free_list = _HA_ATOMIC_LOAD(&pool->free_list);
+	do {
+		while (unlikely(free_list == POOL_BUSY)) {
+			__ha_cpu_relax();
+			free_list = _HA_ATOMIC_LOAD(&pool->free_list);
+		}
+		_HA_ATOMIC_STORE(&item->next, free_list);
+		__ha_barrier_atomic_store();
+	} while (!_HA_ATOMIC_CAS(&pool->free_list, &free_list, item));
+	__ha_barrier_atomic_store();
+	swrate_add(&pool->needed_avg, POOL_AVG_SAMPLES, pool->used);
+}
+
 /*
  * This function frees whatever can be freed in pool <pool>.
  */
 void pool_flush(struct pool_head *pool)
 {
-	void *next, *temp;
+	struct pool_item *next, *temp, *down;
 
 	if (!pool)
 		return;
@@ -417,8 +527,11 @@ void pool_flush(struct pool_head *pool)
 
 	while (next) {
 		temp = next;
-		next = *POOL_LINK(pool, temp);
-		pool_put_to_os(pool, temp);
+		next = temp->next;
+		for (; temp; temp = down) {
+			down = temp->down;
+			pool_put_to_os(pool, temp);
+		}
 	}
 	/* here, we should have pool->allocated == pool->used */
 }
@@ -437,13 +550,16 @@ void pool_gc(struct pool_head *pool_ctx)
 		thread_isolate();
 
 	list_for_each_entry(entry, &pools, list) {
-		void *temp;
-		//qfprintf(stderr, "Flushing pool %s\n", entry->name);
+		struct pool_item *temp, *down;
+
 		while (entry->free_list &&
 		       (int)(entry->allocated - entry->used) > (int)entry->minavail) {
 			temp = entry->free_list;
-			entry->free_list = *POOL_LINK(entry, temp);
-			pool_put_to_os(entry, temp);
+			entry->free_list = temp->next;
+			for (; temp; temp = down) {
+				down = temp->down;
+				pool_put_to_os(entry, temp);
+			}
 		}
 	}
 

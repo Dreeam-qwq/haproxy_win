@@ -45,6 +45,39 @@
 	static struct pool_head *(ptr) __read_mostly; \
 	REGISTER_POOL(&ptr, name, size)
 
+/* By default, free objects are linked by a pointer stored at the beginning of
+ * the memory area. When DEBUG_MEMORY_POOLS is set, the allocated area is
+ * inflated by the size of a pointer so that the link is placed at the end
+ * of the objects. Hence free objects in pools remain intact. In addition,
+ * this location is used to keep a pointer to the pool the object was
+ * allocated from, and verify it's freed into the appropriate one.
+ */
+#ifdef DEBUG_MEMORY_POOLS
+
+# define POOL_EXTRA (sizeof(void *))
+# define POOL_DEBUG_SET_MARK(pool, item)				\
+	do {								\
+		typeof(pool) __p = (pool);				\
+		typeof(item) __i = (item);				\
+		*(typeof(pool)*)(((char *)__i) + __p->size) = __p;	\
+	} while (0)
+
+# define POOL_DEBUG_CHECK_MARK(pool, item)				\
+	do {								\
+		typeof(pool) __p = (pool);				\
+		typeof(item) __i = (item);				\
+		if (*(typeof(pool)*)(((char *)__i) + __p->size) != __p)	\
+			ABORT_NOW();					\
+	} while (0)
+
+#else // DEBUG_MEMORY_POOLS
+
+# define POOL_EXTRA (0)
+# define POOL_DEBUG_SET_MARK(pool, item)   do { } while (0)
+# define POOL_DEBUG_CHECK_MARK(pool, item) do { } while (0)
+
+#endif // DEBUG_MEMORY_POOLS
+
 /* poison each newly allocated area with this byte if >= 0 */
 extern int mem_poison_byte;
 
@@ -77,6 +110,35 @@ void pool_evict_from_local_cache(struct pool_head *pool);
 void pool_evict_from_local_caches(void);
 void pool_put_to_cache(struct pool_head *pool, void *ptr);
 
+#if defined(CONFIG_HAP_NO_GLOBAL_POOLS)
+
+static inline int pool_is_crowded(const struct pool_head *pool)
+{
+	/* no shared pools, hence they're always full */
+	return 1;
+}
+
+static inline uint pool_releasable(const struct pool_head *pool)
+{
+	/* no room left */
+	return 0;
+}
+
+static inline void pool_refill_local_from_shared(struct pool_head *pool, struct pool_cache_head *pch)
+{
+	/* ignored without shared pools */
+}
+
+static inline void pool_put_to_shared_cache(struct pool_head *pool, struct pool_item *item, uint count)
+{
+	/* ignored without shared pools */
+}
+
+#else /* CONFIG_HAP_NO_GLOBAL_POOLS */
+
+void pool_refill_local_from_shared(struct pool_head *pool, struct pool_cache_head *pch);
+void pool_put_to_shared_cache(struct pool_head *pool, struct pool_item *item, uint count);
+
 /* returns true if the pool is considered to have too many free objects */
 static inline int pool_is_crowded(const struct pool_head *pool)
 {
@@ -84,93 +146,33 @@ static inline int pool_is_crowded(const struct pool_head *pool)
 	       (int)(pool->allocated - pool->used) >= pool->minavail;
 }
 
-
-#if defined(CONFIG_HAP_NO_GLOBAL_POOLS)
-
-/* this is essentially used with local caches and a fast malloc library,
- * which may sometimes be faster than the local shared pools because it
- * will maintain its own per-thread arenas.
+/* Returns the max number of entries that may be brought back to the pool
+ * before it's considered as full. Note that it is only usable for releasing
+ * objects, hence the function assumes that no more than ->used entries will
+ * be released in the worst case, and that this value is always lower than or
+ * equal to ->allocated. It's important to understand that under thread
+ * contention these values may not always be accurate but the principle is that
+ * any deviation remains contained.
  */
-static inline void *pool_get_from_shared_cache(struct pool_head *pool)
+static inline uint pool_releasable(const struct pool_head *pool)
 {
-	return NULL;
+	uint alloc, used;
+
+	alloc = HA_ATOMIC_LOAD(&pool->allocated);
+	used = HA_ATOMIC_LOAD(&pool->used);
+	if (used < alloc)
+		used = alloc;
+
+	if (alloc < swrate_avg(pool->needed_avg + pool->needed_avg / 4, POOL_AVG_SAMPLES))
+		return used; // less than needed is allocated, can release everything
+
+	if ((uint)(alloc - used) < pool->minavail)
+		return pool->minavail - (alloc - used); // less than minimum available
+
+	/* there are enough objects in this pool */
+	return 0;
 }
 
-static inline void pool_put_to_shared_cache(struct pool_head *pool, void *ptr)
-{
-	pool_free_nocache(pool, ptr);
-}
-
-#else /* CONFIG_HAP_NO_GLOBAL_POOLS */
-
-/*
- * Returns a pointer to type <type> taken from the pool <pool_type> if
- * available, otherwise returns NULL. No malloc() is attempted, and poisonning
- * is never performed. The purpose is to get the fastest possible allocation.
- */
-static inline void *pool_get_from_shared_cache(struct pool_head *pool)
-{
-	void *ret;
-
-	/* we'll need to reference the first element to figure the next one. We
-	 * must temporarily lock it so that nobody allocates then releases it,
-	 * or the dereference could fail.
-	 */
-	ret = pool->free_list;
-	do {
-		while (unlikely(ret == POOL_BUSY)) {
-			__ha_cpu_relax();
-			ret = _HA_ATOMIC_LOAD(&pool->free_list);
-		}
-		if (ret == NULL)
-			return ret;
-	} while (unlikely((ret = _HA_ATOMIC_XCHG(&pool->free_list, POOL_BUSY)) == POOL_BUSY));
-
-	if (unlikely(ret == NULL)) {
-		_HA_ATOMIC_STORE(&pool->free_list, NULL);
-		goto out;
-	}
-
-	/* this releases the lock */
-	_HA_ATOMIC_STORE(&pool->free_list, *POOL_LINK(pool, ret));
-	_HA_ATOMIC_INC(&pool->used);
-
-#ifdef DEBUG_MEMORY_POOLS
-	/* keep track of where the element was allocated from */
-	*POOL_LINK(pool, ret) = (void *)pool;
-#endif
-
- out:
-	__ha_barrier_atomic_store();
-	return ret;
-}
-
-/* Locklessly add item <ptr> to pool <pool>, then update the pool used count.
- * Both the pool and the pointer must be valid. Use pool_free() for normal
- * operations.
- */
-static inline void pool_put_to_shared_cache(struct pool_head *pool, void *ptr)
-{
-	void **free_list;
-
-	_HA_ATOMIC_DEC(&pool->used);
-
-	if (unlikely(pool_is_crowded(pool))) {
-		pool_put_to_os(pool, ptr);
-	} else {
-		free_list = _HA_ATOMIC_LOAD(&pool->free_list);
-		do {
-			while (unlikely(free_list == POOL_BUSY)) {
-				__ha_cpu_relax();
-				free_list = _HA_ATOMIC_LOAD(&pool->free_list);
-			}
-			_HA_ATOMIC_STORE(POOL_LINK(pool, ptr), (void *)free_list);
-			__ha_barrier_atomic_store();
-		} while (!_HA_ATOMIC_CAS(&pool->free_list, &free_list, ptr));
-		__ha_barrier_atomic_store();
-	}
-	swrate_add(&pool->needed_avg, POOL_AVG_SAMPLES, pool->used);
-}
 
 #endif /* CONFIG_HAP_NO_GLOBAL_POOLS */
 
@@ -188,19 +190,23 @@ static inline void *pool_get_from_cache(struct pool_head *pool)
 	struct pool_cache_head *ph;
 
 	ph = &pool->cache[tid];
-	if (LIST_ISEMPTY(&ph->list))
-		return pool_get_from_shared_cache(pool);
+	if (unlikely(LIST_ISEMPTY(&ph->list))) {
+		pool_refill_local_from_shared(pool, ph);
+		if (LIST_ISEMPTY(&ph->list))
+			return NULL;
+	}
 
 	item = LIST_NEXT(&ph->list, typeof(item), by_pool);
+	LIST_DELETE(&item->by_pool);
+	LIST_DELETE(&item->by_lru);
+
+	/* keep track of where the element was allocated from */
+	POOL_DEBUG_SET_MARK(pool, item);
+
 	ph->count--;
 	pool_cache_bytes -= pool->size;
 	pool_cache_count--;
-	LIST_DELETE(&item->by_pool);
-	LIST_DELETE(&item->by_lru);
-#ifdef DEBUG_MEMORY_POOLS
-	/* keep track of where the element was allocated from */
-	*POOL_LINK(pool, item) = (void *)pool;
-#endif
+
 	return item;
 }
 
@@ -282,11 +288,9 @@ static inline void *pool_zalloc(struct pool_head *pool)
 static inline void pool_free(struct pool_head *pool, void *ptr)
 {
         if (likely(ptr != NULL)) {
-#ifdef DEBUG_MEMORY_POOLS
 		/* we'll get late corruption if we refill to the wrong pool or double-free */
-		if (*POOL_LINK(pool, ptr) != (void *)pool)
-			ABORT_NOW();
-#endif
+		POOL_DEBUG_CHECK_MARK(pool, ptr);
+
 		if (unlikely(mem_poison_byte >= 0))
 			memset(ptr, mem_poison_byte, pool->size);
 
