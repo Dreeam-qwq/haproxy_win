@@ -191,6 +191,28 @@ REGISTER_CONFIG_POSTPARSER("multi-threaded accept queue", accept_queue_init);
 
 #endif // USE_THREAD
 
+/* Memory allocation and initialization of the per_thr field.
+ * Returns 0 if the field has been successfully initialized, -1 on failure.
+ */
+int li_init_per_thr(struct listener *li)
+{
+	int i;
+
+	/* allocate per-thread elements for listener */
+	li->per_thr = calloc(global.nbthread, sizeof(*li->per_thr));
+	if (!li->per_thr)
+		return -1;
+
+	for (i = 0; i < global.nbthread; ++i) {
+		MT_LIST_INIT(&li->per_thr[i].quic_accept.list);
+		MT_LIST_INIT(&li->per_thr[i].quic_accept.conns);
+
+		li->per_thr[i].li = li;
+	}
+
+	return 0;
+}
+
 /* helper to get listener status for stats */
 enum li_status get_li_status(struct listener *l)
 {
@@ -266,7 +288,7 @@ void listener_set_state(struct listener *l, enum li_state st)
  */
 void enable_listener(struct listener *listener)
 {
-	HA_SPIN_LOCK(LISTENER_LOCK, &listener->lock);
+	HA_RWLOCK_WRLOCK(LISTENER_LOCK, &listener->lock);
 
 	/* If this listener is supposed to be only in the master, close it in
 	 * the workers. Conversely, if it's supposed to be only in the workers
@@ -293,7 +315,7 @@ void enable_listener(struct listener *listener)
 		}
 	}
 
-	HA_SPIN_UNLOCK(LISTENER_LOCK, &listener->lock);
+	HA_RWLOCK_WRUNLOCK(LISTENER_LOCK, &listener->lock);
 }
 
 /*
@@ -322,7 +344,7 @@ void stop_listener(struct listener *l, int lpx, int lpr, int lli)
 		HA_SPIN_LOCK(PROTO_LOCK, &proto_lock);
 
 	if (!lli)
-		HA_SPIN_LOCK(LISTENER_LOCK, &l->lock);
+		HA_RWLOCK_WRLOCK(LISTENER_LOCK, &l->lock);
 
 	if (l->state > LI_INIT) {
 		do_unbind_listener(l);
@@ -334,7 +356,7 @@ void stop_listener(struct listener *l, int lpx, int lpr, int lli)
 	}
 
 	if (!lli)
-		HA_SPIN_UNLOCK(LISTENER_LOCK, &l->lock);
+		HA_RWLOCK_WRUNLOCK(LISTENER_LOCK, &l->lock);
 
 	if (!lpr)
 		HA_SPIN_UNLOCK(PROTO_LOCK, &proto_lock);
@@ -429,7 +451,7 @@ int pause_listener(struct listener *l)
 	struct proxy *px = l->bind_conf->frontend;
 	int ret = 1;
 
-	HA_SPIN_LOCK(LISTENER_LOCK, &l->lock);
+	HA_RWLOCK_WRLOCK(LISTENER_LOCK, &l->lock);
 
 	if (l->state <= LI_PAUSED)
 		goto end;
@@ -446,7 +468,7 @@ int pause_listener(struct listener *l)
 		send_log(px, LOG_WARNING, "Paused %s %s.\n", proxy_cap_str(px->cap), px->id);
 	}
   end:
-	HA_SPIN_UNLOCK(LISTENER_LOCK, &l->lock);
+	HA_RWLOCK_WRUNLOCK(LISTENER_LOCK, &l->lock);
 	return ret;
 }
 
@@ -466,7 +488,7 @@ int resume_listener(struct listener *l)
 	int was_paused = px && px->li_paused;
 	int ret = 1;
 
-	HA_SPIN_LOCK(LISTENER_LOCK, &l->lock);
+	HA_RWLOCK_WRLOCK(LISTENER_LOCK, &l->lock);
 
 	/* check that another thread didn't to the job in parallel (e.g. at the
 	 * end of listen_accept() while we'd come from dequeue_all_listeners().
@@ -495,7 +517,7 @@ int resume_listener(struct listener *l)
 		send_log(px, LOG_WARNING, "Resumed %s %s.\n", proxy_cap_str(px->cap), px->id);
 	}
   end:
-	HA_SPIN_UNLOCK(LISTENER_LOCK, &l->lock);
+	HA_RWLOCK_WRUNLOCK(LISTENER_LOCK, &l->lock);
 	return ret;
 }
 
@@ -504,7 +526,7 @@ int resume_listener(struct listener *l)
  */
 static void listener_full(struct listener *l)
 {
-	HA_SPIN_LOCK(LISTENER_LOCK, &l->lock);
+	HA_RWLOCK_WRLOCK(LISTENER_LOCK, &l->lock);
 	if (l->state >= LI_READY) {
 		MT_LIST_DELETE(&l->wait_queue);
 		if (l->state != LI_FULL) {
@@ -512,7 +534,7 @@ static void listener_full(struct listener *l)
 			listener_set_state(l, LI_FULL);
 		}
 	}
-	HA_SPIN_UNLOCK(LISTENER_LOCK, &l->lock);
+	HA_RWLOCK_WRUNLOCK(LISTENER_LOCK, &l->lock);
 }
 
 /* Marks a ready listener as limited so that we only try to re-enable it when
@@ -520,13 +542,13 @@ static void listener_full(struct listener *l)
  */
 static void limit_listener(struct listener *l, struct mt_list *list)
 {
-	HA_SPIN_LOCK(LISTENER_LOCK, &l->lock);
+	HA_RWLOCK_WRLOCK(LISTENER_LOCK, &l->lock);
 	if (l->state == LI_READY) {
 		MT_LIST_TRY_APPEND(list, &l->wait_queue);
 		l->rx.proto->disable(l);
 		listener_set_state(l, LI_LIMITED);
 	}
-	HA_SPIN_UNLOCK(LISTENER_LOCK, &l->lock);
+	HA_RWLOCK_WRUNLOCK(LISTENER_LOCK, &l->lock);
 }
 
 /* Dequeues all listeners waiting for a resource the global wait queue */
@@ -608,9 +630,9 @@ void do_unbind_listener(struct listener *listener)
  */
 void unbind_listener(struct listener *listener)
 {
-	HA_SPIN_LOCK(LISTENER_LOCK, &listener->lock);
+	HA_RWLOCK_WRLOCK(LISTENER_LOCK, &listener->lock);
 	do_unbind_listener(listener);
-	HA_SPIN_UNLOCK(LISTENER_LOCK, &listener->lock);
+	HA_RWLOCK_WRUNLOCK(LISTENER_LOCK, &listener->lock);
 }
 
 /* creates one or multiple listeners for bind_conf <bc> on sockaddr <ss> on port
@@ -656,7 +678,7 @@ int create_listeners(struct bind_conf *bc, const struct sockaddr_storage *ss,
 
 		l->extra_counters = NULL;
 
-		HA_SPIN_INIT(&l->lock);
+		HA_RWLOCK_INIT(&l->lock);
 		_HA_ATOMIC_INC(&jobs);
 		_HA_ATOMIC_INC(&listeners);
 	}
@@ -698,7 +720,7 @@ struct listener *clone_listener(struct listener *src)
 
 	l->rx.proto->add(l->rx.proto, l);
 
-	HA_SPIN_INIT(&l->lock);
+	HA_RWLOCK_INIT(&l->lock);
 	_HA_ATOMIC_INC(&jobs);
 	_HA_ATOMIC_INC(&listeners);
 	global.maxsock++;
@@ -735,9 +757,9 @@ void __delete_listener(struct listener *listener)
 void delete_listener(struct listener *listener)
 {
 	HA_SPIN_LOCK(PROTO_LOCK, &proto_lock);
-	HA_SPIN_LOCK(LISTENER_LOCK, &listener->lock);
+	HA_RWLOCK_WRLOCK(LISTENER_LOCK, &listener->lock);
 	__delete_listener(listener);
-	HA_SPIN_UNLOCK(LISTENER_LOCK, &listener->lock);
+	HA_RWLOCK_WRUNLOCK(LISTENER_LOCK, &listener->lock);
 	HA_SPIN_UNLOCK(PROTO_LOCK, &proto_lock);
 }
 
@@ -893,7 +915,18 @@ void listener_accept(struct listener *l)
 			} while (!_HA_ATOMIC_CAS(&actconn, (int *)(&count), next_actconn));
 		}
 
-		cli_conn = l->rx.proto->accept_conn(l, &status);
+		/* be careful below, the listener might be shutting down in
+		 * another thread on error and we must not dereference its
+		 * FD without a bit of protection.
+		 */
+		cli_conn = NULL;
+		status = CO_AC_PERMERR;
+
+		HA_RWLOCK_RDLOCK(LISTENER_LOCK, &l->lock);
+		if (l->rx.flags & RX_F_BOUND)
+			cli_conn = l->rx.proto->accept_conn(l, &status);
+		HA_RWLOCK_RDUNLOCK(LISTENER_LOCK, &l->lock);
+
 		if (!cli_conn) {
 			switch (status) {
 			case CO_AC_DONE:
@@ -953,6 +986,9 @@ void listener_accept(struct listener *l)
 
 
 #if defined(USE_THREAD)
+		if (l->rx.flags & RX_F_LOCAL_ACCEPT)
+			goto local_accept;
+
 		mask = thread_mask(l->rx.bind_thread) & all_threads_mask;
 		if (atleast2(mask) && (global.tune.options & GTUNE_LISTENER_MQ) && !stopping) {
 			struct accept_queue_ring *ring;
@@ -1066,6 +1102,7 @@ void listener_accept(struct listener *l)
 		}
 #endif // USE_THREAD
 
+ local_accept:
 		_HA_ATOMIC_INC(&l->thr_conn[tid]);
 		ret = l->accept(cli_conn);
 		if (unlikely(ret <= 0)) {

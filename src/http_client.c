@@ -46,12 +46,6 @@ static struct applet httpclient_applet;
  * The functions will be  starting by "hc_cli" for "httpclient cli"
  */
 
-static struct http_hdr default_httpclient_hdrs[2] = {
-		{ .n = IST("User-Agent"), .v = IST("HAProxy") },
-		{ .n = IST_NULL, .v = IST_NULL },
-};
-
-
 /* What kind of data we need to read */
 #define HC_CLI_F_RES_STLINE     0x01
 #define HC_CLI_F_RES_HDR        0x02
@@ -149,7 +143,7 @@ static int hc_cli_parse(char **args, char *payload, struct appctx *appctx, void 
 	appctx->ctx.cli.p0 = hc; /* store the httpclient ptr in the applet */
 	appctx->ctx.cli.i0 = 0;
 
-	if (httpclient_req_gen(hc, hc->req.url, hc->req.meth, default_httpclient_hdrs, body) != ERR_NONE)
+	if (httpclient_req_gen(hc, hc->req.url, hc->req.meth, NULL, body) != ERR_NONE)
 		goto err;
 
 
@@ -266,7 +260,10 @@ int httpclient_req_gen(struct httpclient *hc, const struct ist url, enum http_me
 	struct ist meth_ist, vsn;
 	unsigned int flags = HTX_SL_F_VER_11 | HTX_SL_F_NORMALIZED_URI | HTX_SL_F_HAS_SCHM;
 	int i;
-	int foundhost = 0;
+	int foundhost = 0, foundaccept = 0, foundua = 0;
+
+	if (!b_alloc(&hc->req.buf))
+		goto error;
 
 	if (meth >= HTTP_METH_OTHER)
 		goto error;
@@ -278,6 +275,10 @@ int httpclient_req_gen(struct httpclient *hc, const struct ist url, enum http_me
 	htx = htx_from_buf(&hc->req.buf);
 	if (!htx)
 		goto error;
+
+	if (!hc->ops.req_payload && !isttest(payload))
+		flags |= HTX_SL_F_BODYLESS;
+
 	sl = htx_add_stline(htx, HTX_BLK_REQ_SL, flags, meth_ist, url, vsn);
 	if (!sl) {
 		goto error;
@@ -291,6 +292,10 @@ int httpclient_req_gen(struct httpclient *hc, const struct ist url, enum http_me
 
 		if (isteqi(hdrs[i].n, ist("host")))
 			foundhost = 1;
+		else if (isteqi(hdrs[i].n, ist("accept")))
+			foundaccept = 1;
+		else if (isteqi(hdrs[i].n, ist("user-agent")))
+			foundua = 1;
 
 		if (!htx_add_header(htx, hdrs[i].n, hdrs[i].v))
 			goto error;
@@ -303,6 +308,17 @@ int httpclient_req_gen(struct httpclient *hc, const struct ist url, enum http_me
 		if (!http_update_host(htx, sl, url))
 			goto error;
 	}
+
+	if (!foundaccept) {
+		if (!htx_add_header(htx, ist("Accept"), ist("*/*")))
+			goto error;
+	}
+
+	if (!foundua) {
+		if (!htx_add_header(htx, ist("User-Agent"), ist(HTTPCLIENT_USERAGENT)))
+			goto error;
+	}
+
 
 	if (!htx_add_endof(htx, HTX_BLK_EOH))
 		goto error;
@@ -337,10 +353,13 @@ int httpclient_res_xfer(struct httpclient *hc, struct buffer *dst)
 {
 	int ret;
 
-	ret = b_force_xfer(dst, &hc->res.buf, MIN(1024, b_data(&hc->res.buf)));
+	ret = b_force_xfer(dst, &hc->res.buf, b_data(&hc->res.buf));
 	/* call the client once we consumed all data */
-	if (!b_data(&hc->res.buf) && hc->appctx)
-		appctx_wakeup(hc->appctx);
+	if (!b_data(&hc->res.buf)) {
+		b_free(&hc->res.buf);
+		if (hc->appctx)
+			appctx_wakeup(hc->appctx);
+	}
 	return ret;
 }
 
@@ -359,6 +378,9 @@ int httpclient_req_xfer(struct httpclient *hc, struct ist src, int end)
 {
 	int ret = 0;
 	struct htx *htx;
+
+	if (!b_alloc(&hc->req.buf))
+		goto error;
 
 	htx = htx_from_buf(&hc->req.buf);
 	if (!htx)
@@ -419,7 +441,7 @@ struct appctx *httpclient_start(struct httpclient *hc)
 		ha_alert("httpclient: out of memory in %s:%d.\n", __FUNCTION__, __LINE__);
 		goto out_free_appctx;
 	}
-	if ((s = stream_new(sess, &appctx->obj_type, &BUF_NULL)) == NULL) {
+	if ((s = stream_new(sess, &appctx->obj_type, &hc->req.buf)) == NULL) {
 		ha_alert("httpclient: Failed to initialize stream %s:%d.\n", __FUNCTION__, __LINE__);
 		goto out_free_appctx;
 	}
@@ -456,7 +478,11 @@ struct appctx *httpclient_start(struct httpclient *hc)
 	hc->appctx = appctx;
 	hc->flags |= HTTPCLIENT_FS_STARTED;
 	appctx->ctx.httpclient.ptr = hc;
-	appctx->st0 = HTTPCLIENT_S_REQ;
+
+	/* The request was transferred when the stream was created. So switch
+	 * directly to REQ_BODY or RES_STLINE state
+	 */
+	appctx->st0 = (hc->ops.req_payload ? HTTPCLIENT_S_REQ_BODY : HTTPCLIENT_S_RES_STLINE);
 
 	return appctx;
 
@@ -531,19 +557,13 @@ void httpclient_destroy(struct httpclient *hc)
 struct httpclient *httpclient_new(void *caller, enum http_meth_t meth, struct ist url)
 {
 	struct httpclient *hc;
-	struct buffer *b;
 
 	hc = calloc(1, sizeof(*hc));
 	if (!hc)
 		goto err;
 
-	b = b_alloc(&hc->req.buf);
-	if (!b)
-		goto err;
-	b = b_alloc(&hc->res.buf);
-	if (!b)
-		goto err;
-
+	hc->req.buf = BUF_NULL;
+	hc->res.buf = BUF_NULL;
 	hc->caller = caller;
 	hc->req.url = istdup(url);
 	hc->req.meth = meth;
@@ -586,6 +606,9 @@ static void httpclient_applet_io_handler(struct appctx *appctx)
 				if (!ret)
 					goto more;
 
+				if (!b_data(&hc->req.buf))
+					b_free(&hc->req.buf);
+
 				htx = htx_from_buf(&req->buf);
 				if (!htx)
 					goto more;
@@ -619,6 +642,10 @@ static void httpclient_applet_io_handler(struct appctx *appctx)
 						ret = b_xfer(&req->buf, &hc->req.buf, b_data(&hc->req.buf));
 						if (!ret)
 							goto more;
+
+						if (!b_data(&hc->req.buf))
+							b_free(&hc->req.buf);
+
 						htx = htx_from_buf(&req->buf);
 						if (!htx)
 							goto more;
@@ -738,8 +765,11 @@ static void httpclient_applet_io_handler(struct appctx *appctx)
 				if (!htx || htx_is_empty(htx))
 					goto more;
 
+				if (!b_alloc(&hc->res.buf))
+					goto more;
+
 				if (b_full(&hc->res.buf))
-				goto process_data;
+					goto process_data;
 
 				/* decapsule the htx data to raw data */
 				for (pos = htx_get_first(htx); pos != -1; pos = htx_get_next(htx, pos)) {

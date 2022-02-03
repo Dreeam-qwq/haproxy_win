@@ -45,7 +45,7 @@
 #include <haproxy/quic_sock.h>
 #include <haproxy/sock_inet.h>
 #include <haproxy/tools.h>
-#include <haproxy/xprt_quic-t.h>
+#include <haproxy/xprt_quic.h>
 
 
 static void quic_add_listener(struct protocol *proto, struct listener *listener);
@@ -518,10 +518,9 @@ int quic_connect_server(struct connection *conn, int flags)
  */
 static void quic_add_listener(struct protocol *proto, struct listener *listener)
 {
-	MT_LIST_INIT(&listener->rx.pkts);
-	listener->rx.odcids = EB_ROOT_UNIQUE;
-	listener->rx.cids = EB_ROOT_UNIQUE;
-	HA_RWLOCK_INIT(&listener->rx.cids_lock);
+	listener->flags |= LI_F_QUIC_LISTENER;
+	listener->rx.flags |= RX_F_LOCAL_ACCEPT;
+
 	default_add_listener(proto, listener);
 }
 
@@ -540,18 +539,26 @@ static int quic_alloc_tx_rings_listener(struct listener *l)
 	MT_LIST_INIT(&l->rx.tx_qring_list);
 	for (i = 0; i < global.nbthread; i++) {
 		unsigned char *buf;
-		struct qring *qr = &l->rx.tx_qrings[i];
+		struct qring *qr;
+
+		qr = calloc(1, sizeof *qr);
+		if (!qr)
+			goto err;
 
 		buf = pool_alloc(pool_head_quic_tx_ring);
-		if (!buf)
+		if (!buf) {
+			free(qr);
 			goto err;
+		}
 
 		qr->cbuf = cbuf_new(buf, QUIC_TX_RING_BUFSZ);
 		if (!qr->cbuf) {
 			pool_free(pool_head_quic_tx_ring, buf);
+			free(qr);
 			goto err;
 		}
 
+        l->rx.tx_qrings[i] = qr;
 		MT_LIST_APPEND(&l->rx.tx_qring_list, &qr->mt_list);
 	}
 
@@ -561,6 +568,7 @@ static int quic_alloc_tx_rings_listener(struct listener *l)
 	while ((qr = MT_LIST_POP(&l->rx.tx_qring_list, typeof(qr), mt_list))) {
 		pool_free(pool_head_quic_tx_ring, qr->cbuf->buf);
 		cbuf_free(qr->cbuf);
+		free(qr);
 	}
 	free(l->rx.tx_qrings);
 	return 0;
@@ -581,22 +589,83 @@ static int quic_alloc_rxbufs_listener(struct listener *l)
 	MT_LIST_INIT(&l->rx.rxbuf_list);
 	for (i = 0; i < global.nbthread; i++) {
 		char *buf;
+		struct rxbuf *rxbuf;
 
-		rxbuf = &l->rx.rxbufs[i];
-		buf = pool_alloc(pool_head_quic_rxbuf);
-		if (!buf)
+		rxbuf = calloc(1, sizeof *rxbuf);
+		if (!rxbuf)
 			goto err;
 
+		buf = pool_alloc(pool_head_quic_rxbuf);
+		if (!buf) {
+			free(rxbuf);
+			goto err;
+		}
+
+		l->rx.rxbufs[i] = rxbuf;
+
 		rxbuf->buf = b_make(buf, QUIC_RX_BUFSZ, 0, 0);
+		LIST_INIT(&rxbuf->dgrams);
 		MT_LIST_APPEND(&l->rx.rxbuf_list, &rxbuf->mt_list);
 	}
 
 	return 1;
 
  err:
-	while ((rxbuf = MT_LIST_POP(&l->rx.rxbuf_list, typeof(rxbuf), mt_list)))
+	while ((rxbuf = MT_LIST_POP(&l->rx.rxbuf_list, typeof(rxbuf), mt_list))) {
 		pool_free(pool_head_quic_rxbuf, rxbuf->buf.area);
+		free(rxbuf);
+	}
 	free(l->rx.rxbufs);
+	return 0;
+}
+
+/* Allocate QUIC listener datagram handlers, one by thread.
+ * Returns 1 if succeeded, 0 if not.
+ */
+static int quic_alloc_dghdlrs_listener(struct listener *l)
+{
+	int i;
+
+	l->rx.dghdlrs = calloc(global.nbthread, sizeof *l->rx.dghdlrs);
+	if (!l->rx.dghdlrs)
+		return 0;
+
+	for (i = 0; i < global.nbthread; i++) {
+		struct quic_dghdlr *dghdlr;
+
+		dghdlr = calloc(1, sizeof *dghdlr);
+		if (!dghdlr)
+			goto err;
+
+		dghdlr->task = tasklet_new();
+		if (!dghdlr->task) {
+			free(dghdlr);
+			goto err;
+		}
+
+		dghdlr->task->tid = i;
+		dghdlr->task->context = dghdlr;
+		dghdlr->task->process = quic_lstnr_dghdlr;
+		dghdlr->odcids = EB_ROOT_UNIQUE;
+		dghdlr->cids = EB_ROOT_UNIQUE;
+		MT_LIST_INIT(&dghdlr->dgrams);
+		l->rx.dghdlrs[i] = dghdlr;
+	}
+
+	return 1;
+
+ err:
+	for (i = 0; i < global.nbthread; i++) {
+		struct quic_dghdlr *dghdlr = l->rx.dghdlrs[i];
+
+		if (!dghdlr)
+			break;
+
+		tasklet_free(dghdlr->task);
+		free(dghdlr);
+	}
+	free(l->rx.dghdlrs);
+
 	return 0;
 }
 
@@ -631,8 +700,9 @@ static int quic_bind_listener(struct listener *listener, char *errmsg, int errle
 	}
 
 	if (!quic_alloc_tx_rings_listener(listener) ||
-	    !quic_alloc_rxbufs_listener(listener)) {
-		msg = "could not initialize tx/rx rings";
+	    !quic_alloc_rxbufs_listener(listener) ||
+	    !quic_alloc_dghdlrs_listener(listener)) {
+		msg = "could not initialize tx/rx rings or dgram handlers";
 		err |= ERR_WARN;
 		goto udp_return;
 	}

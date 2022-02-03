@@ -284,6 +284,7 @@ void *pool_alloc_nocache(struct pool_head *pool)
 
 	/* keep track of where the element was allocated from */
 	POOL_DEBUG_SET_MARK(pool, ptr);
+	POOL_DEBUG_TRACE_CALLER(pool, (struct pool_cache_item *)ptr, NULL);
 	return ptr;
 }
 
@@ -319,6 +320,7 @@ static void pool_evict_last_items(struct pool_head *pool, struct pool_cache_head
 
 	while (released < count && !LIST_ISEMPTY(&ph->list)) {
 		item = LIST_PREV(&ph->list, typeof(item), by_pool);
+		pool_check_pattern(ph, item, pool->size);
 		LIST_DELETE(&item->by_pool);
 		LIST_DELETE(&item->by_lru);
 
@@ -389,16 +391,19 @@ void pool_evict_from_local_caches()
 /* Frees an object to the local cache, possibly pushing oldest objects to the
  * shared cache, which itself may decide to release some of them to the OS.
  * While it is unspecified what the object becomes past this point, it is
- * guaranteed to be released from the users' perpective.
+ * guaranteed to be released from the users' perpective. A caller address may
+ * be passed and stored into the area when DEBUG_POOL_TRACING is set.
  */
-void pool_put_to_cache(struct pool_head *pool, void *ptr)
+void pool_put_to_cache(struct pool_head *pool, void *ptr, const void *caller)
 {
 	struct pool_cache_item *item = (struct pool_cache_item *)ptr;
 	struct pool_cache_head *ph = &pool->cache[tid];
 
 	LIST_INSERT(&ph->list, &item->by_pool);
 	LIST_INSERT(&th_ctx->pool_lru_head, &item->by_lru);
+	POOL_DEBUG_TRACE_CALLER(pool, item, caller);
 	ph->count++;
+	pool_fill_pattern(ph, item, pool->size);
 	pool_cache_count++;
 	pool_cache_bytes += pool->size;
 
@@ -467,9 +472,11 @@ void pool_refill_local_from_shared(struct pool_head *pool, struct pool_cache_hea
 		POOL_DEBUG_SET_MARK(pool, ret);
 
 		item = (struct pool_cache_item *)ret;
+		POOL_DEBUG_TRACE_CALLER(pool, item, NULL);
 		LIST_INSERT(&pch->list, &item->by_pool);
 		LIST_INSERT(&th_ctx->pool_lru_head, &item->by_lru);
 		count++;
+		pool_fill_pattern(pch, item, pool->size);
 	}
 	HA_ATOMIC_ADD(&pool->used, count);
 	pch->count += count;
@@ -584,6 +591,59 @@ void pool_gc(struct pool_head *pool_ctx)
 }
 
 #endif /* CONFIG_HAP_POOLS */
+
+/*
+ * Returns a pointer to type <type> taken from the pool <pool_type> or
+ * dynamically allocated. In the first case, <pool_type> is updated to point to
+ * the next element in the list. <flags> is a binary-OR of POOL_F_* flags.
+ * Prefer using pool_alloc() which does the right thing without flags.
+ */
+void *__pool_alloc(struct pool_head *pool, unsigned int flags)
+{
+	void *p = NULL;
+	void *caller = NULL;
+
+#ifdef DEBUG_FAIL_ALLOC
+	if (unlikely(!(flags & POOL_F_NO_FAIL) && mem_should_fail(pool)))
+		return NULL;
+#endif
+
+#if defined(DEBUG_POOL_TRACING)
+	caller = __builtin_return_address(0);
+#endif
+	if (!p)
+		p = pool_get_from_cache(pool, caller);
+	if (unlikely(!p))
+		p = pool_alloc_nocache(pool);
+
+	if (likely(p)) {
+		if (unlikely(flags & POOL_F_MUST_ZERO))
+			memset(p, 0, pool->size);
+		else if (unlikely(!(flags & POOL_F_NO_POISON) && mem_poison_byte >= 0))
+			memset(p, mem_poison_byte, pool->size);
+	}
+	return p;
+}
+
+/*
+ * Puts a memory area back to the corresponding pool. <ptr> be valid. Using
+ * pool_free() is preferred.
+ */
+void __pool_free(struct pool_head *pool, void *ptr)
+{
+	const void *caller = NULL;
+
+#if defined(DEBUG_POOL_TRACING)
+	caller = __builtin_return_address(0);
+#endif
+	/* we'll get late corruption if we refill to the wrong pool or double-free */
+	POOL_DEBUG_CHECK_MARK(pool, ptr);
+
+	if (unlikely(mem_poison_byte >= 0))
+		memset(ptr, mem_poison_byte, pool->size);
+
+	pool_put_to_cache(pool, ptr, caller);
+}
 
 
 #ifdef DEBUG_UAF

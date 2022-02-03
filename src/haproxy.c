@@ -1,6 +1,6 @@
 /*
  * HAProxy : High Availability-enabled HTTP/TCP proxy
- * Copyright 2000-2021 Willy Tarreau <willy@haproxy.org>.
+ * Copyright 2000-2022 Willy Tarreau <willy@haproxy.org>.
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License
@@ -673,6 +673,7 @@ static void mworker_reexec()
 #endif
 	setenv("HAPROXY_MWORKER_REEXEC", "1", 1);
 
+	mworker_cleanup_proc();
 	mworker_proc_list_to_env(); /* put the children description in the env */
 
 	/* ensure that we close correctly every listeners before reexecuting */
@@ -855,6 +856,9 @@ void reexec_on_failure()
 	list_for_each_entry(child, &proc_list, list) {
 		child->failedreloads++;
 	}
+
+	/* do not keep unused FDs retrieved from the previous process */
+	sock_drop_unused_old_sockets();
 
 	usermsgs_clr(NULL);
 	ha_warning("Loading failure!\n");
@@ -1933,37 +1937,25 @@ static void init(int argc, char **argv)
 
 		if (getenv("HAPROXY_MWORKER_REEXEC") == NULL) {
 
-			tmproc = calloc(1, sizeof(*tmproc));
+			tmproc = mworker_proc_new();
 			if (!tmproc) {
 				ha_alert("Cannot allocate process structures.\n");
 				exit(EXIT_FAILURE);
 			}
 			tmproc->options |= PROC_O_TYPE_MASTER; /* master */
-			tmproc->failedreloads = 0;
-			tmproc->reloads = 0;
 			tmproc->pid = pid;
 			tmproc->timestamp = start_date.tv_sec;
-			tmproc->ipc_fd[0] = -1;
-			tmproc->ipc_fd[1] = -1;
-
 			proc_self = tmproc;
 
 			LIST_APPEND(&proc_list, &tmproc->list);
 		}
 
-		tmproc = calloc(1, sizeof(*tmproc));
+		tmproc = mworker_proc_new();
 		if (!tmproc) {
 			ha_alert("Cannot allocate process structures.\n");
 			exit(EXIT_FAILURE);
 		}
-
 		tmproc->options |= PROC_O_TYPE_WORKER; /* worker */
-		tmproc->pid = -1;
-		tmproc->failedreloads = 0;
-		tmproc->reloads = 0;
-		tmproc->timestamp = -1;
-		tmproc->ipc_fd[0] = -1;
-		tmproc->ipc_fd[1] = -1;
 
 		if (mworker_cli_sockpair_new(tmproc, 0) < 0) {
 			exit(EXIT_FAILURE);
@@ -2988,7 +2980,12 @@ int main(int argc, char **argv)
 #endif
 	}
 
-	if (old_unixsocket) {
+	/* Try to get the listeners FD from the previous process using
+	 * _getsocks on the stat socket, it must never been done in wait mode
+	 * and check mode
+	 */
+	if (old_unixsocket &&
+	    !(global.mode & (MODE_MWORKER_WAIT|MODE_CHECK|MODE_CHECK_CONDITION))) {
 		if (strcmp("/dev/null", old_unixsocket) != 0) {
 			if (sock_get_old_sockets(old_unixsocket) != 0) {
 				ha_alert("Failed to get the sockets from the old process!\n");
@@ -3049,14 +3046,7 @@ int main(int argc, char **argv)
 	/* Ok, all listeners should now be bound, close any leftover sockets
 	 * the previous process gave us, we don't need them anymore
 	 */
-	while (xfer_sock_list != NULL) {
-		struct xfer_sock_list *tmpxfer = xfer_sock_list->next;
-		close(xfer_sock_list->fd);
-		free(xfer_sock_list->iface);
-		free(xfer_sock_list->namespace);
-		free(xfer_sock_list);
-		xfer_sock_list = tmpxfer;
-	}
+	sock_drop_unused_old_sockets();
 
 	/* prepare pause/play signals */
 	signal_register_fct(SIGTTOU, sig_pause, SIGTTOU);
@@ -3233,12 +3223,12 @@ int main(int argc, char **argv)
 #ifdef USE_CPU_AFFINITY
 		if (!in_parent && ha_cpuset_count(&cpu_map.proc)) {   /* only do this if the process has a CPU map */
 
-#ifdef __FreeBSD__
-			struct hap_cpuset *set = &cpu_map.proc;
-			ret = cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_PID, -1, sizeof(set->cpuset), &set->cpuset);
-#elif defined(__linux__) || defined(__DragonFly__)
+#if defined(CPUSET_USE_CPUSET) || defined(__DragonFly__)
 			struct hap_cpuset *set = &cpu_map.proc;
 			sched_setaffinity(0, sizeof(set->cpuset), &set->cpuset);
+#elif defined(__FreeBSD__)
+			struct hap_cpuset *set = &cpu_map.proc;
+			ret = cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_PID, -1, sizeof(set->cpuset), &set->cpuset);
 #endif
 		}
 #endif
@@ -3300,8 +3290,10 @@ int main(int argc, char **argv)
 				 * workers, we don't need to close the worker
 				 * side of other workers since it's done with
 				 * the bind_proc */
-				if (child->ipc_fd[0] >= 0)
+				if (child->ipc_fd[0] >= 0) {
 					close(child->ipc_fd[0]);
+					child->ipc_fd[0] = -1;
+				}
 				if (child->options & PROC_O_TYPE_WORKER &&
 				    child->reloads == 0) {
 					/* keep this struct if this is our pid */

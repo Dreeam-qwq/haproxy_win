@@ -209,6 +209,19 @@ static inline int qcc_is_dead(const struct qcc *qcc)
 {
 	fprintf(stderr, "%s: %lu\n", __func__, qcc->strms[QCS_CLT_BIDI].nb_streams);
 
+	if (!qcc->strms[QCS_CLT_BIDI].nb_streams && !qcc->task)
+		return 1;
+
+	return 0;
+}
+
+/* Return true if the mux timeout should be armed. */
+static inline int qcc_may_expire(struct qcc *qcc)
+{
+
+	/* Consider that the timeout must be set if no bidirectional streams
+	 * are opened.
+	 */
 	if (!qcc->strms[QCS_CLT_BIDI].nb_streams)
 		return 1;
 
@@ -234,6 +247,9 @@ static void qc_release(struct qcc *qcc)
 	}
 
 	if (conn) {
+		LIST_DEL_INIT(&conn->stopping_list);
+
+		conn->qc->conn = NULL;
 		conn->mux = NULL;
 		conn->ctx = NULL;
 
@@ -242,6 +258,7 @@ static void qc_release(struct qcc *qcc)
 		if (conn->destroy_cb)
 			conn->destroy_cb(conn);
 		conn_free(conn);
+		fprintf(stderr, "conn@%p released\n", conn);
 	}
 }
 
@@ -281,7 +298,7 @@ static int qcs_push_frame(struct qcs *qcs, struct buffer *payload, int fin, uint
 		frm->stream.len = total;
 	}
 
-	MT_LIST_APPEND(&qel->pktns->tx.frms, &frm->mt_list);
+	LIST_APPEND(&qel->pktns->tx.frms, &frm->list);
  out:
 	fprintf(stderr, "%s: total=%d fin=%d id=%llu offset=%lu\n",
 	        __func__, total, fin, (ull)qcs->by_id.key, offset);
@@ -337,6 +354,11 @@ static int qc_send(struct qcc *qcc)
 	return ret;
 }
 
+/* Release all streams that are already marked as detached. This is only done
+ * if their TX buffers are empty or if a CONNECTION_CLOSE has been received.
+ *
+ * Return the number of released stream.
+ */
 static int qc_release_detached_streams(struct qcc *qcc)
 {
 	struct eb64_node *node;
@@ -348,8 +370,7 @@ static int qc_release_detached_streams(struct qcc *qcc)
 		node = eb64_next(node);
 
 		if (qcs->flags & QC_SF_DETACH) {
-			if ((!b_data(&qcs->tx.buf) && !b_data(&qcs->tx.xprt_buf)) ||
-			    qcc->flags & QC_CF_CC_RECV) {
+			if ((!b_data(&qcs->tx.buf) && !b_data(&qcs->tx.xprt_buf))) {
 				qcs_destroy(qcs);
 				release = 1;
 			}
@@ -372,11 +393,42 @@ static struct task *qc_io_cb(struct task *t, void *ctx, unsigned int status)
 	qc_send(qcc);
 
 	if (qc_release_detached_streams(qcc)) {
-		if (qcc_is_dead(qcc)) {
-			qc_release(qcc);
-			return NULL;
+		/* Schedule the mux timeout if no bidirectional streams left. */
+		if (qcc_may_expire(qcc)) {
+			qcc->task->expire = tick_add(now_ms, qcc->timeout);
+			task_queue(qcc->task);
 		}
 	}
+
+	return NULL;
+}
+
+static struct task *qc_timeout_task(struct task *t, void *ctx, unsigned int state)
+{
+	struct qcc *qcc = ctx;
+	int expired = tick_is_expired(t->expire, now_ms);
+
+	fprintf(stderr, "%s\n", __func__);
+
+	if (qcc) {
+		if (!expired) {
+			fprintf(stderr, "%s: not expired\n", __func__);
+			return t;
+		}
+
+		if (!qcc_may_expire(qcc)) {
+			fprintf(stderr, "%s: cannot expire\n", __func__);
+			t->expire = TICK_ETERNITY;
+			return t;
+		}
+	}
+
+	fprintf(stderr, "%s: timeout\n", __func__);
+	task_destroy(t);
+	qcc->task = NULL;
+
+	if (qcc_is_dead(qcc))
+		qc_release(qcc);
 
 	return NULL;
 }
@@ -393,7 +445,7 @@ static int qc_init(struct connection *conn, struct proxy *prx,
 
 	qcc->conn = conn;
 	conn->ctx = qcc;
-	conn->qc->qcc = qcc;
+	qcc->flags = 0;
 
 	qcc->app_ops = NULL;
 
@@ -439,11 +491,30 @@ static int qc_init(struct connection *conn, struct proxy *prx,
 	qcc->wait_event.tasklet->process = qc_io_cb;
 	qcc->wait_event.tasklet->context = qcc;
 
+	/* haproxy timeouts */
+	qcc->timeout = prx->timeout.client;
+	qcc->task = task_new_here();
+	if (!qcc->task)
+		goto fail_no_timeout_task;
+	qcc->task->process = qc_timeout_task;
+	qcc->task->context = qcc;
+	qcc->task->expire = tick_add(now_ms, qcc->timeout);
+
+	if (!conn_is_back(conn)) {
+		if (!LIST_INLIST(&conn->stopping_list)) {
+			LIST_APPEND(&mux_stopping_data[tid].list,
+			            &conn->stopping_list);
+		}
+	}
+
+	HA_ATOMIC_STORE(&conn->qc->qcc, qcc);
 	/* init read cycle */
 	tasklet_wakeup(qcc->wait_event.tasklet);
 
 	return 0;
 
+ fail_no_timeout_task:
+	tasklet_free(qcc->wait_event.tasklet);
  fail_no_tasklet:
 	pool_free(pool_head_qcc, qcc);
  fail_no_qcc:
@@ -458,16 +529,22 @@ static void qc_detach(struct conn_stream *cs)
 	fprintf(stderr, "%s: leaving with tx.buf.data=%lu, tx.xprt_buf.data=%lu\n",
 	        __func__, b_data(&qcs->tx.buf), b_data(&qcs->tx.xprt_buf));
 
-	if ((b_data(&qcs->tx.buf) || b_data(&qcs->tx.xprt_buf)) &&
-	    !(qcc->flags & QC_CF_CC_RECV)) {
+	/* TODO on CONNECTION_CLOSE reception, it should be possible to free
+	 * qcs instances. This should be done once the buffering and ACK
+	 * managment between xprt and mux is reorganized.
+	 */
+
+	if ((b_data(&qcs->tx.buf) || b_data(&qcs->tx.xprt_buf))) {
 		qcs->flags |= QC_SF_DETACH;
 		return;
 	}
 
 	qcs_destroy(qcs);
-	if (qcc_is_dead(qcc)) {
-		qc_release(qcc);
-		return;
+
+	/* Schedule the mux timeout if no bidirectional streams left. */
+	if (qcc_may_expire(qcc)) {
+		qcc->task->expire = tick_add(now_ms, qcc->timeout);
+		task_queue(qcc->task);
 	}
 }
 
@@ -520,6 +597,20 @@ static int qc_unsubscribe(struct conn_stream *cs, int event_type, struct wait_ev
 	return 0;
 }
 
+static int qc_wake(struct connection *conn)
+{
+	struct qcc *qcc = conn->ctx;
+
+	/* Check if a soft-stop is in progress.
+	 * Release idling front connection if this is the case.
+	 */
+	if (unlikely(conn->qc->li->bind_conf->frontend->flags & (PR_FL_DISABLED|PR_FL_STOPPED))) {
+		qc_release(qcc);
+	}
+
+	return 1;
+}
+
 static const struct mux_ops qc_ops = {
 	.init = qc_init,
 	.detach = qc_detach,
@@ -527,6 +618,7 @@ static const struct mux_ops qc_ops = {
 	.snd_buf = qc_snd_buf,
 	.subscribe = qc_subscribe,
 	.unsubscribe = qc_unsubscribe,
+	.wake = qc_wake,
 };
 
 static struct mux_proto_list mux_proto_quic =

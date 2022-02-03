@@ -990,6 +990,8 @@ static int h1_init(struct connection *conn, struct proxy *proxy, struct session 
 		tasklet_free(h1c->wait_event.tasklet);
 	pool_free(pool_head_h1c, h1c);
  fail_h1c:
+	if (!conn_is_back(conn))
+		LIST_DEL_INIT(&conn->stopping_list);
 	conn->ctx = conn_ctx; // restore saved context
 	TRACE_DEVEL("leaving in error", H1_EV_H1C_NEW|H1_EV_H1C_END|H1_EV_H1C_ERR);
 	return -1;
@@ -2332,7 +2334,6 @@ static size_t h1_process_mux(struct h1c *h1c, struct buffer *buf, size_t count)
 								    H1_EV_TX_DATA|H1_EV_STRM_ERR|H1_EV_H1C_ERR|H1_EV_H1S_ERR, h1c->conn, h1s);
 							goto error;
 						}
-						h1m->curr_len -= vlen;
 					}
 					if ((h1m->flags & H1_MF_RESP) && (h1s->flags & H1S_F_BODYLESS_RESP)) {
 						TRACE_PROTO("Skip data for bodyless response", H1_EV_TX_DATA|H1_EV_TX_BODY, h1c->conn, h1s, chn_htx);
@@ -2378,6 +2379,8 @@ static size_t h1_process_mux(struct h1c *h1c, struct buffer *buf, size_t count)
 						    H1_EV_TX_DATA|H1_EV_TX_BODY, h1c->conn, h1s, 0, (size_t[]){v.len});
 
 			  skip_data:
+				if (h1m->state == H1_MSG_DATA && (h1m->flags & H1_MF_CLEN))
+					h1m->curr_len -= vlen;
 				if (last_data)
 					goto done;
 				break;
@@ -2999,7 +3002,8 @@ static int h1_process(struct h1c * h1c)
 	 */
 	if (!(h1c->flags & H1C_F_IS_BACK)) {
 		if (unlikely(h1c->px->flags & (PR_FL_DISABLED|PR_FL_STOPPED))) {
-			if (h1c->flags & H1C_F_WAIT_NEXT_REQ)
+			if (!(h1c->px->options & PR_O_IDLE_CLOSE_RESP) &&
+				h1c->flags & H1C_F_WAIT_NEXT_REQ)
 				goto release;
 		}
 	}

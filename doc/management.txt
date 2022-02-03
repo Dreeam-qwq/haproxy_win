@@ -31,6 +31,7 @@ Summary
 9.2.      Typed output format
 9.3.      Unix Socket commands
 9.4.      Master CLI
+9.4.1.    Master CLI commands
 10.   Tricks for easier configuration management
 11.   Well-known traps to avoid
 12.   Debugging and performance issues
@@ -1941,6 +1942,13 @@ experimental-mode [on|off]
   development. These features are currently not stable and should be used with
   care. They may be subject to breaking changes across versions.
 
+  When used from the master CLI, this command shouldn't be prefixed, as it will
+  set the mode for any worker when connecting to its CLI.
+
+  Example:
+    echo "@1; experimental-mode on; del server be1/s2" | socat /var/run/haproxy.master -
+    echo "experimental-mode on; @1 del server be1/s2" | socat /var/run/haproxy.master -
+
 expert-mode [on|off]
   This command is similar to experimental-mode but is used to toggle the
   expert mode.
@@ -1952,6 +1960,13 @@ expert-mode [on|off]
   to do so. Note that this command is purposely not listed in the help message.
   This command is only accessible in admin level. Changing to another level
   automatically resets the expert mode.
+
+  When used from the master CLI, this command shouldn't be prefixed, as it will
+  set the mode for any worker when connecting to its CLI.
+
+  Example:
+    echo "@1; expert-mode on; debug dev exit 1" | socat /var/run/haproxy.master -
+    echo "expert-mode on; @1 debug dev exit 1" | socat /var/run/haproxy.master -
 
 get map <map> <value>
 get acl <acl> <value>
@@ -2185,8 +2200,13 @@ set server <backend>/<server> fqdn <FQDN>
   Change a server's FQDN to the value passed in argument. This requires the
   internal run-time DNS resolver to be configured and enabled for this server.
 
-set server <backend>/<server> ssl [ on | off ]
+set server <backend>/<server> ssl [ on | off ]  (deprecated)
   This option configures SSL ciphering on outgoing connections to the server.
+  When switch off, all traffic becomes plain text; health check path is not
+  changed.
+
+  This command is deprecated, create a new server dynamically with or without
+  SSL instead, using the "add server" command.
 
 set severity-output [ none | number | string ]
   Change the severity output format of the stats socket connected to for the
@@ -3604,87 +3624,127 @@ Example:
    # haproxy -Ws -S /tmp/master-socket,uid,1000,gid,1000,mode,600 -f test1.cfg
    # haproxy -W -S /tmp/master-socket,level,user -f test1.cfg
 
-The master CLI introduces a 'show proc' command to surpervise the
-processes:
 
-Example:
+9.4.1 Master CLI commands
+--------------------------
 
-  $ echo 'show proc' | socat /var/run/haproxy-master.sock -
-  #<PID>          <type>          <reloads>       <uptime>        <version>
-  1162            master          5 [failed: 0]   0d00h02m07s     2.5-dev13
-  # workers
-  1271            worker          1               0d00h00m00s     2.5-dev13
-  # old workers
-  1233            worker          3               0d00h00m43s     2.0-dev3-6019f6-289
-  # programs
-  1244            foo             0               0d00h00m00s     -
-  1255            bar             0               0d00h00m00s     -
+@<[!]pid>
+  The master CLI uses a special prefix notation to access the multiple
+  processes. This notation is easily identifiable as it begins by a @.
 
+  A @ prefix can be followed by a relative process number or by an exclamation
+  point and a PID. (e.g. @1 or @!1271). A @ alone could be use to specify the
+  master. Leaving processes are only accessible with the PID as relative process
+  number are only usable with the current processes.
 
-In this example, the master has been reloaded 5 times but one of the old
-worker is still running and survived 3 reloads. You could access the CLI of
-this worker to understand what's going on.
+  Examples:
 
-When the prompt is enabled (via the "prompt" command), the context the CLI is
-working on is displayed in the prompt. The master is identified by the "master"
-string, and other processes are identified with their PID. In case the last
-reload failed, the master prompt will be changed to "master[ReloadFailed]>" so
-that it becomes visible that the process is still running on the previous
-configuration and that the new configuration is not operational.
+    $ socat /var/run/haproxy-master.sock readline
+    prompt
+    master> @1 show info; @2 show info
+    [...]
+    Process_num: 1
+    Pid: 1271
+    [...]
+    Process_num: 2
+    Pid: 1272
+    [...]
+    master>
 
-The master CLI uses a special prefix notation to access the multiple
-processes. This notation is easily identifiable as it begins by a @.
+    $ echo '@!1271 show info; @!1272 show info' | socat /var/run/haproxy-master.sock -
+    [...]
 
-A @ prefix can be followed by a relative process number or by an exclamation
-point and a PID. (e.g. @1 or @!1271). A @ alone could be use to specify the
-master. Leaving processes are only accessible with the PID as relative process
-number are only usable with the current processes.
+  A prefix could be use as a command, which will send every next commands to
+  the specified process.
 
-Examples:
+  Examples:
 
-  $ socat /var/run/haproxy-master.sock readline
-  prompt
-  master> @1 show info; @2 show info
-  [...]
-  Process_num: 1
-  Pid: 1271
-  [...]
-  Process_num: 2
-  Pid: 1272
-  [...]
-  master>
+    $ socat /var/run/haproxy-master.sock readline
+    prompt
+    master> @1
+    1271> show info
+    [...]
+    1271> show stat
+    [...]
+    1271> @
+    master>
 
-  $ echo '@!1271 show info; @!1272 show info' | socat /var/run/haproxy-master.sock -
-  [...]
+    $ echo '@1; show info; show stat; @2; show info; show stat' | socat /var/run/haproxy-master.sock -
+    [...]
 
-A prefix could be use as a command, which will send every next commands to
-the specified process.
+expert-mode [on|off]
+  This command activates the "expert-mode" for every worker accessed from the
+  master CLI. Combined with "mcli-debug-mode" it also activates the command on
+  the master. Display the flag "e" in the master CLI prompt.
 
-Examples:
+  See also "expert-mode" in Section 9.3 and "mcli-debug-mode" in 9.4.1.
 
-  $ socat /var/run/haproxy-master.sock readline
-  prompt
-  master> @1
-  1271> show info
-  [...]
-  1271> show stat
-  [...]
-  1271> @
-  master>
+experimental-mode [on|off]
+  This command activates the "experimental-mode" for every worker accessed from
+  the master CLI. Combined with "mcli-debug-mode" it also activates the command on
+  the master. Display the flag "x" in the master CLI prompt.
 
-  $ echo '@1; show info; show stat; @2; show info; show stat' | socat /var/run/haproxy-master.sock -
-  [...]
+  See also "experimental-mode" in Section 9.3 and "mcli-debug-mode" in 9.4.1.
 
-You can also reload the HAProxy master process with the "reload" command which
-does the same as a `kill -USR2` on the master process, provided that the user
-has at least "operator" or "admin" privileges.
+mcli-debug-mode [on|off]
+  This keyword allows a special mode in the master CLI which enables every
+  keywords that were meant for a worker CLI on the master CLI, allowing to debug
+  the master process. Once activated, you list the new available keywords with
+  "help". Combined with "experimental-mode" or "expert-mode" it enables even
+  more keywords. Display the flag "d" in the master CLI prompt.
 
-Example:
+prompt
+  When the prompt is enabled (via the "prompt" command), the context the CLI is
+  working on is displayed in the prompt. The master is identified by the "master"
+  string, and other processes are identified with their PID. In case the last
+  reload failed, the master prompt will be changed to "master[ReloadFailed]>" so
+  that it becomes visible that the process is still running on the previous
+  configuration and that the new configuration is not operational.
 
-  $ echo "reload" | socat /var/run/haproxy-master.sock stdin
+  The prompt of the master CLI is able to display several flags which are the
+  enable modes. "d" for mcli-debug-mode, "e" for expert-mode, "x" for
+  experimental-mode.
 
-Note that a reload will close the connection to the master CLI.
+  Example:
+     $ socat /var/run/haproxy-master.sock -
+     prompt
+     master> expert-mode on
+     master(e)> experimental-mode on
+     master(xe)> mcli-debug-mode on
+     master(xed)> @1
+     95191(xed)>
 
+reload
+  You can also reload the HAProxy master process with the "reload" command which
+  does the same as a `kill -USR2` on the master process, provided that the user
+  has at least "operator" or "admin" privileges.
+
+  Example:
+
+    $ echo "reload" | socat /var/run/haproxy-master.sock stdin
+
+  Note that a reload will close the connection to the master CLI.
+
+show proc
+  The master CLI introduces a 'show proc' command to surpervise the
+  processe.
+
+  Example:
+
+    $ echo 'show proc' | socat /var/run/haproxy-master.sock -
+    #<PID>          <type>          <reloads>       <uptime>        <version>
+    1162            master          5 [failed: 0]   0d00h02m07s     2.5-dev13
+    # workers
+    1271            worker          1               0d00h00m00s     2.5-dev13
+    # old workers
+    1233            worker          3               0d00h00m43s     2.0-dev3-6019f6-289
+    # programs
+    1244            foo             0               0d00h00m00s     -
+    1255            bar             0               0d00h00m00s     -
+
+  In this example, the master has been reloaded 5 times but one of the old
+  worker is still running and survived 3 reloads. You could access the CLI of
+  this worker to understand what's going on.
 
 10. Tricks for easier configuration management
 ----------------------------------------------

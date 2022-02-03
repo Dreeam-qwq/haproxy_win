@@ -54,7 +54,7 @@
  */
 #ifdef DEBUG_MEMORY_POOLS
 
-# define POOL_EXTRA (sizeof(void *))
+# define POOL_EXTRA_MARK (sizeof(void *))
 # define POOL_DEBUG_SET_MARK(pool, item)				\
 	do {								\
 		typeof(pool) __p = (pool);				\
@@ -72,11 +72,33 @@
 
 #else // DEBUG_MEMORY_POOLS
 
-# define POOL_EXTRA (0)
+# define POOL_EXTRA_MARK (0)
 # define POOL_DEBUG_SET_MARK(pool, item)   do { } while (0)
 # define POOL_DEBUG_CHECK_MARK(pool, item) do { } while (0)
 
 #endif // DEBUG_MEMORY_POOLS
+
+/* It's possible to trace callers of pool_free() by placing their pointer
+ * after the end of the area and the optional mark above.
+ */
+#if defined(DEBUG_POOL_TRACING)
+# define POOL_EXTRA_CALLER (sizeof(void *))
+# define POOL_DEBUG_TRACE_CALLER(pool, item, caller)			\
+	do {								\
+		typeof(pool) __p = (pool);				\
+		typeof(item) __i = (item);				\
+		typeof(caller) __c = (caller);				\
+		*(typeof(caller)*)(((char *)__i) + __p->size + POOL_EXTRA_MARK) = __c; \
+	} while (0)
+
+#else // DEBUG_POOL_TRACING
+
+# define POOL_EXTRA_CALLER (0)
+# define POOL_DEBUG_TRACE_CALLER(pool, item, caller)   do { } while (0)
+
+#endif
+
+# define POOL_EXTRA (POOL_EXTRA_MARK + POOL_EXTRA_CALLER)
 
 /* poison each newly allocated area with this byte if >= 0 */
 extern int mem_poison_byte;
@@ -97,6 +119,8 @@ void create_pool_callback(struct pool_head **ptr, char *name, unsigned int size)
 void *pool_destroy(struct pool_head *pool);
 void pool_destroy_all(void);
 int mem_should_fail(const struct pool_head *pool);
+void *__pool_alloc(struct pool_head *pool, unsigned int flags);
+void __pool_free(struct pool_head *pool, void *ptr);
 
 
 #ifdef CONFIG_HAP_POOLS
@@ -108,7 +132,7 @@ extern THREAD_LOCAL size_t pool_cache_count;   /* #cache objects   */
 
 void pool_evict_from_local_cache(struct pool_head *pool);
 void pool_evict_from_local_caches(void);
-void pool_put_to_cache(struct pool_head *pool, void *ptr);
+void pool_put_to_cache(struct pool_head *pool, void *ptr, const void *caller);
 
 #if defined(CONFIG_HAP_NO_GLOBAL_POOLS)
 
@@ -180,11 +204,69 @@ static inline uint pool_releasable(const struct pool_head *pool)
  * cache first, then from the second level if it exists.
  */
 
+#if defined(DEBUG_POOL_INTEGRITY)
+
+/* Updates <pch>'s fill_pattern and fills the free area after <item> with it,
+ * up to <size> bytes. The item part is left untouched.
+ */
+static inline void pool_fill_pattern(struct pool_cache_head *pch, struct pool_cache_item *item, uint size)
+{
+	ulong *ptr = (ulong *)item;
+	uint ofs;
+	ulong u;
+
+	if (size <= sizeof(*item))
+		return;
+
+	/* Upgrade the fill_pattern to change about half of the bits
+	 * (to be sure to catch static flag corruption), and apply it.
+	 */
+	u = pch->fill_pattern += ~0UL / 3; // 0x55...55
+	ofs = sizeof(*item) / sizeof(*ptr);
+	while (ofs < size / sizeof(*ptr))
+		ptr[ofs++] = u;
+}
+
+/* check for a pool_cache_item integrity after extracting it from the cache. It
+ * must have been previously initialized using pool_fill_pattern(). If any
+ * corruption is detected, the function provokes an immediate crash.
+ */
+static inline void pool_check_pattern(struct pool_cache_head *pch, struct pool_cache_item *item, uint size)
+{
+	const ulong *ptr = (const ulong *)item;
+	uint ofs;
+	ulong u;
+
+	if (size <= sizeof(*item))
+		return;
+
+	/* let's check that all words past *item are equal */
+	ofs = sizeof(*item) / sizeof(*ptr);
+	u = ptr[ofs++];
+	while (ofs < size / sizeof(*ptr)) {
+		if (unlikely(ptr[ofs] != u))
+			ABORT_NOW();
+		ofs++;
+	}
+}
+
+#else
+
+static inline void pool_fill_pattern(struct pool_cache_head *pch, struct pool_cache_item *item, uint size)
+{
+}
+
+static inline void pool_check_pattern(struct pool_cache_head *pch, struct pool_cache_item *item, uint size)
+{
+}
+
+#endif
+
 /* Tries to retrieve an object from the local pool cache corresponding to pool
  * <pool>. If none is available, tries to allocate from the shared cache, and
  * returns NULL if nothing is available.
  */
-static inline void *pool_get_from_cache(struct pool_head *pool)
+static inline void *pool_get_from_cache(struct pool_head *pool, const void *caller)
 {
 	struct pool_cache_item *item;
 	struct pool_cache_head *ph;
@@ -196,12 +278,23 @@ static inline void *pool_get_from_cache(struct pool_head *pool)
 			return NULL;
 	}
 
+#if defined(DEBUG_POOL_INTEGRITY)
+	/* allocate oldest objects first so as to keep them as long as possible
+	 * in the cache before being reused and maximizing the chance to detect
+	 * an overwrite.
+	 */
+	item = LIST_PREV(&ph->list, typeof(item), by_pool);
+	pool_check_pattern(ph, item, pool->size);
+#else
+	/* allocate hottest objects first */
 	item = LIST_NEXT(&ph->list, typeof(item), by_pool);
+#endif
 	LIST_DELETE(&item->by_pool);
 	LIST_DELETE(&item->by_lru);
 
 	/* keep track of where the element was allocated from */
 	POOL_DEBUG_SET_MARK(pool, item);
+	POOL_DEBUG_TRACE_CALLER(pool, item, caller);
 
 	ph->count--;
 	pool_cache_bytes -= pool->size;
@@ -214,12 +307,12 @@ static inline void *pool_get_from_cache(struct pool_head *pool)
 
 /* no cache pools implementation */
 
-static inline void *pool_get_from_cache(struct pool_head *pool)
+static inline void *pool_get_from_cache(struct pool_head *pool, const void *caller)
 {
 	return NULL;
 }
 
-static inline void pool_put_to_cache(struct pool_head *pool, void *ptr)
+static inline void pool_put_to_cache(struct pool_head *pool, void *ptr, const void *caller)
 {
 	pool_free_nocache(pool, ptr);
 }
@@ -231,72 +324,26 @@ static inline void pool_put_to_cache(struct pool_head *pool, void *ptr)
 
 /*
  * Returns a pointer to type <type> taken from the pool <pool_type> or
- * dynamically allocated. In the first case, <pool_type> is updated to point to
- * the next element in the list. <flags> is a binary-OR of POOL_F_* flags.
- * Prefer using pool_alloc() which does the right thing without flags.
- */
-static inline void *__pool_alloc(struct pool_head *pool, unsigned int flags)
-{
-	void *p = NULL;
-
-#ifdef DEBUG_FAIL_ALLOC
-	if (!(flags & POOL_F_NO_FAIL) && mem_should_fail(pool))
-		return NULL;
-#endif
-
-	if (!p)
-		p = pool_get_from_cache(pool);
-	if (!p)
-		p = pool_alloc_nocache(pool);
-
-	if (p) {
-		if (flags & POOL_F_MUST_ZERO)
-			memset(p, 0, pool->size);
-		else if (!(flags & POOL_F_NO_POISON) && mem_poison_byte >= 0)
-			memset(p, mem_poison_byte, pool->size);
-	}
-	return p;
-}
-
-/*
- * Returns a pointer to type <type> taken from the pool <pool_type> or
  * dynamically allocated. Memory poisonning is performed if enabled.
  */
-static inline void *pool_alloc(struct pool_head *pool)
-{
-	return __pool_alloc(pool, 0);
-}
+#define pool_alloc(pool) __pool_alloc((pool), 0)
 
 /*
  * Returns a pointer to type <type> taken from the pool <pool_type> or
  * dynamically allocated. The area is zeroed.
  */
-static inline void *pool_zalloc(struct pool_head *pool)
-{
-	return __pool_alloc(pool, POOL_F_MUST_ZERO);
-}
+#define pool_zalloc(pool) __pool_alloc((pool), POOL_F_MUST_ZERO)
 
 /*
- * Puts a memory area back to the corresponding pool.
- * Items are chained directly through a pointer that
- * is written in the beginning of the memory area, so
- * there's no need for any carrier cell. This implies
- * that each memory area is at least as big as one
- * pointer. Just like with the libc's free(), nothing
- * is done if <ptr> is NULL.
+ * Puts a memory area back to the corresponding pool. Just like with the libc's
+ * free(), <ptr> may be NULL.
  */
-static inline void pool_free(struct pool_head *pool, void *ptr)
-{
-        if (likely(ptr != NULL)) {
-		/* we'll get late corruption if we refill to the wrong pool or double-free */
-		POOL_DEBUG_CHECK_MARK(pool, ptr);
-
-		if (unlikely(mem_poison_byte >= 0))
-			memset(ptr, mem_poison_byte, pool->size);
-
-		pool_put_to_cache(pool, ptr);
-	}
-}
+#define pool_free(pool, ptr)				\
+	do {						\
+		typeof(ptr) __ptr = (ptr);		\
+		if (likely((__ptr) != NULL))		\
+			__pool_free(pool, __ptr);	\
+	} while (0)
 
 #endif /* _HAPROXY_POOL_H */
 

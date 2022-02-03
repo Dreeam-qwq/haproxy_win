@@ -51,6 +51,11 @@ extern struct pool_head *pool_head_quic_connection_id;
 
 int ssl_quic_initial_ctx(struct bind_conf *bind_conf);
 
+static inline int qc_is_listener(struct quic_conn *qc)
+{
+	return qc->flags & QUIC_FL_CONN_LISTENER;
+}
+
 /* Update the mux stream-related transport parameters from <qc> connection */
 static inline void quic_transport_params_update(struct quic_conn *qc)
 {
@@ -127,12 +132,6 @@ static inline void quic_cid_dump(struct buffer *buf,
 	chunk_appendf(buf, ")");
 }
 
-/* Simply compute a thread ID from a CID */
-static inline unsigned long quic_get_cid_tid(const struct quic_cid *cid)
-{
-	return cid->data[0] % global.nbthread;
-}
-
 /* Free the CIDs attached to <conn> QUIC connection. This must be called under
  * the CID lock.
  */
@@ -172,8 +171,27 @@ static inline void quic_connection_id_to_frm_cpy(struct quic_frame *dst,
 	to->stateless_reset_token = src->stateless_reset_token;
 }
 
+/* Retrieve the associated thread ID for <cid>. */
+static inline unsigned long quic_get_cid_tid(const unsigned char *cid)
+{
+	return *cid % global.nbthread;
+}
+
+/* Modify <cid> to have a CID linked to the thread ID <target_tid>. This is
+ * based on quic_get_cid_tid.
+ */
+static inline void quic_pin_cid_to_tid(unsigned char *cid, int target_tid)
+{
+	cid[0] = cid[0] - (cid[0] % global.nbthread) + target_tid;
+}
+
 /* Allocate a new CID with <seq_num> as sequence number and attach it to <root>
  * ebtree.
+ *
+ * The CID is randomly generated in part with the result altered to be
+ * associated with the current thread ID. This means this function must only
+ * be called by the quic_conn thread.
+ *
  * Returns the new CID if succeeded, NULL if not.
  */
 static inline struct quic_connection_id *new_quic_cid(struct eb_root *root,
@@ -193,6 +211,8 @@ static inline struct quic_connection_id *new_quic_cid(struct eb_root *root,
 		fprintf(stderr, "Could not generate %d random bytes\n", cid->cid.len);
 		goto err;
 	}
+
+	quic_pin_cid_to_tid(cid->cid.data, tid);
 
 	cid->qc = qc;
 
@@ -482,6 +502,8 @@ static inline void quic_transport_params_init(struct quic_transport_params *p,
 	if (server)
 		p->with_stateless_reset_token      = 1;
 	p->active_connection_id_limit          = 8;
+
+	p->retry_source_connection_id.len = 0;
 
 }
 
@@ -774,6 +796,15 @@ static inline int quic_transport_params_encode(unsigned char *buf,
 		                                  p->original_destination_connection_id.data,
 		                                  p->original_destination_connection_id.len))
 			return 0;
+
+		if (p->retry_source_connection_id.len) {
+			if (!quic_transport_param_enc_mem(&pos, end,
+			                                  QUIC_TP_RETRY_SOURCE_CONNECTION_ID,
+			                                  p->retry_source_connection_id.data,
+			                                  p->retry_source_connection_id.len))
+				return 0;
+		}
+
 		if (p->with_stateless_reset_token &&
 			!quic_transport_param_enc_mem(&pos, end, QUIC_TP_STATELESS_RESET_TOKEN,
 			                              p->stateless_reset_token,
@@ -922,7 +953,7 @@ static inline int quic_transport_params_store(struct quic_conn *conn, int server
  */
 static inline void quic_pktns_init(struct quic_pktns *pktns)
 {
-	MT_LIST_INIT(&pktns->tx.frms);
+	LIST_INIT(&pktns->tx.frms);
 	pktns->tx.next_pn = -1;
 	pktns->tx.pkts = EB_ROOT_UNIQUE;
 	pktns->tx.largest_acked_pn = -1;
@@ -1168,8 +1199,10 @@ void chunk_frm_appendf(struct buffer *buf, const struct quic_frame *frm);
 
 void quic_set_tls_alert(struct quic_conn *qc, int alert);
 int quic_set_app_ops(struct quic_conn *qc, const unsigned char *alpn, size_t alpn_len);
-ssize_t quic_lstnr_dgram_read(struct buffer *buf, size_t len, void *owner,
-                              struct sockaddr_storage *saddr);
+struct task *quic_lstnr_dghdlr(struct task *t, void *ctx, unsigned int state);
+int quic_lstnr_dgram_dispatch(unsigned char *buf, size_t len, void *owner,
+                              struct sockaddr_storage *saddr,
+                              struct quic_dgram *new_dgram, struct list *dgrams);
 
 #endif /* USE_QUIC */
 #endif /* _HAPROXY_XPRT_QUIC_H */

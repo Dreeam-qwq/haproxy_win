@@ -17,6 +17,7 @@
 
 #include <haproxy/connection.h>
 #include <haproxy/listener.h>
+#include <haproxy/quic_sock.h>
 #include <haproxy/session.h>
 #include <haproxy/xprt_quic.h>
 
@@ -106,8 +107,6 @@ static int new_quic_cli_conn(struct quic_conn *qc, struct listener *l,
 	cli_conn->handle.fd = l->rx.fd;
 	cli_conn->target = &l->obj_type;
 
-	/* XXX Should not be there. */
-	l->accept = quic_session_accept;
 	/* We need the xprt context before accepting (->accept()) the connection:
 	 * we may receive packet before this connection acception.
 	 */
@@ -141,30 +140,25 @@ int quic_sock_accepting_conn(const struct receiver *rx)
 struct connection *quic_sock_accept_conn(struct listener *l, int *status)
 {
 	struct quic_conn *qc;
-	struct quic_rx_packet *pkt;
-	int ret;
+	struct li_per_thread *lthr = &l->per_thr[tid];
 
-	qc = NULL;
-	pkt = MT_LIST_POP(&l->rx.pkts, struct quic_rx_packet *, rx_list);
-	/* Should never happen. */
-	if (!pkt)
+	qc = MT_LIST_POP(&lthr->quic_accept.conns, struct quic_conn *, accept_list);
+	if (!qc)
+		goto done;
+
+	if (!new_quic_cli_conn(qc, l, &qc->peer_addr))
 		goto err;
-
-	qc = pkt->qc;
-	if (!new_quic_cli_conn(qc, l, &pkt->saddr))
-		goto err;
-
-	ret = CO_AC_DONE;
 
  done:
-	if (status)
-		*status = ret;
-
+	*status = CO_AC_DONE;
 	return qc ? qc->conn : NULL;
 
  err:
-	ret = CO_AC_PAUSE;
-	goto done;
+	/* in case of error reinsert the element to process it later. */
+	MT_LIST_INSERT(&lthr->quic_accept.conns, &qc->accept_list);
+
+	*status = CO_AC_PAUSE;
+	return NULL;
 }
 
 /* Function called on a read event from a listening socket. It tries
@@ -179,8 +173,10 @@ void quic_sock_fd_iocb(int fd)
 	struct quic_transport_params *params;
 	/* Source address */
 	struct sockaddr_storage saddr = {0};
-	size_t max_sz;
+	size_t max_sz, cspace;
 	socklen_t saddrlen;
+	struct quic_dgram *dgram, *dgramp, *new_dgram;
+	unsigned char *dgram_buf;
 
 	BUG_ON(!l);
 
@@ -193,20 +189,49 @@ void quic_sock_fd_iocb(int fd)
 	rxbuf = MT_LIST_POP(&l->rx.rxbuf_list, typeof(rxbuf), mt_list);
 	if (!rxbuf)
 		goto out;
+
 	buf = &rxbuf->buf;
+
+	new_dgram = NULL;
+	/* Remove all consumed datagrams of this buffer */
+	list_for_each_entry_safe(dgram, dgramp, &rxbuf->dgrams, list) {
+		if (HA_ATOMIC_LOAD(&dgram->buf))
+			break;
+
+		LIST_DELETE(&dgram->list);
+		b_del(buf, dgram->len);
+		if (!new_dgram)
+			new_dgram = dgram;
+		else
+			pool_free(pool_head_quic_dgram, dgram);
+	}
 
 	params = &l->bind_conf->quic_params;
 	max_sz = params->max_udp_payload_size;
-	if (b_contig_space(buf) < max_sz) {
-		/* Note that when we enter this function, <buf> is always empty */
-		b_reset(buf);
+	cspace = b_contig_space(buf);
+	if (cspace < max_sz) {
+		struct quic_dgram *dgram;
+
+		/* Allocate a fake datagram, without data to locate
+		 * the end of the RX buffer (required during purging).
+		 */
+		dgram = pool_zalloc(pool_head_quic_dgram);
+		if (!dgram)
+			goto out;
+
+		dgram->len = cspace;
+		LIST_APPEND(&rxbuf->dgrams, &dgram->list);
+		/* Consume the remaining space */
+		b_add(buf, cspace);
 		if (b_contig_space(buf) < max_sz)
 			goto out;
+
 	}
 
+	dgram_buf = (unsigned char *)b_tail(buf);
 	saddrlen = sizeof saddr;
 	do {
-		ret = recvfrom(fd, b_tail(buf), max_sz, 0,
+		ret = recvfrom(fd, dgram_buf, max_sz, 0,
 		               (struct sockaddr *)&saddr, &saddrlen);
 		if (ret < 0) {
 			if (errno == EINTR)
@@ -218,8 +243,107 @@ void quic_sock_fd_iocb(int fd)
 	} while (0);
 
 	b_add(buf, ret);
-	quic_lstnr_dgram_read(buf, ret, l, &saddr);
-	b_del(buf, ret);
+	if (!quic_lstnr_dgram_dispatch(dgram_buf, ret, l, &saddr,
+	                               new_dgram, &rxbuf->dgrams)) {
+		/* If wrong, consume this datagram */
+		b_del(buf, ret);
+	}
  out:
 	MT_LIST_APPEND(&l->rx.rxbuf_list, &rxbuf->mt_list);
 }
+
+
+/*********************** QUIC accept queue management ***********************/
+/* per-thread accept queues */
+struct quic_accept_queue *quic_accept_queues;
+
+/* Install <qc> on the queue ready to be accepted. The queue task is then woken
+ * up. If <qc> accept is already scheduled or done, nothing is done.
+ */
+void quic_accept_push_qc(struct quic_conn *qc)
+{
+	struct quic_accept_queue *queue = &quic_accept_queues[qc->tid];
+	struct li_per_thread *lthr = &qc->li->per_thr[qc->tid];
+
+	/* early return if accept is already in progress/done for this
+	 * connection
+	 */
+	if (HA_ATOMIC_BTS(&qc->flags, QUIC_FL_ACCEPT_REGISTERED_BIT))
+		return;
+
+	BUG_ON(MT_LIST_INLIST(&qc->accept_list));
+
+	/* 1. insert the listener in the accept queue
+	 *
+	 * Use TRY_APPEND as there is a possible race even with INLIST if
+	 * multiple threads try to add the same listener instance from several
+	 * quic_conn.
+	 */
+	if (!MT_LIST_INLIST(&(lthr->quic_accept.list)))
+		MT_LIST_TRY_APPEND(&queue->listeners, &(lthr->quic_accept.list));
+
+	/* 2. insert the quic_conn in the listener per-thread queue. */
+	MT_LIST_APPEND(&lthr->quic_accept.conns, &qc->accept_list);
+
+	/* 3. wake up the queue tasklet */
+	tasklet_wakeup(quic_accept_queues[qc->tid].tasklet);
+}
+
+/* Tasklet handler to accept QUIC connections. Call listener_accept on every
+ * listener instances registered in the accept queue.
+ */
+static struct task *quic_accept_run(struct task *t, void *ctx, unsigned int i)
+{
+	struct li_per_thread *lthr;
+	struct mt_list *elt1, elt2;
+	struct quic_accept_queue *queue = &quic_accept_queues[tid];
+
+	mt_list_for_each_entry_safe(lthr, &queue->listeners, quic_accept.list, elt1, elt2) {
+		listener_accept(lthr->li);
+		MT_LIST_DELETE_SAFE(elt1);
+	}
+
+	return NULL;
+}
+
+static int quic_alloc_accept_queues(void)
+{
+	int i;
+
+	quic_accept_queues = calloc(global.nbthread, sizeof(struct quic_accept_queue));
+	if (!quic_accept_queues) {
+		ha_alert("Failed to allocate the quic accept queues.\n");
+		return 0;
+	}
+
+	for (i = 0; i < global.nbthread; ++i) {
+		struct tasklet *task;
+		if (!(task = tasklet_new())) {
+			ha_alert("Failed to allocate the quic accept queue on thread %d.\n", i);
+			return 0;
+		}
+
+		tasklet_set_tid(task, i);
+		task->process = quic_accept_run;
+		quic_accept_queues[i].tasklet = task;
+
+		MT_LIST_INIT(&quic_accept_queues[i].listeners);
+	}
+
+	return 1;
+}
+REGISTER_POST_CHECK(quic_alloc_accept_queues);
+
+static int quic_deallocate_accept_queues(void)
+{
+	int i;
+
+	if (quic_accept_queues) {
+		for (i = 0; i < global.nbthread; ++i)
+			tasklet_free(quic_accept_queues[i].tasklet);
+		free(quic_accept_queues);
+	}
+
+	return 1;
+}
+REGISTER_POST_DEINIT(quic_deallocate_accept_queues);

@@ -135,14 +135,37 @@ endif
 #       call it only once.
 cc-opt = $(shell set -e; if $(CC) -Werror $(1) -E -xc - -o /dev/null </dev/null >&0 2>/dev/null; then echo "$(1)"; fi;)
 
-# same but emits $2 if $1 is not supported
-cc-opt-alt = $(shell set -e; if $(CC) -Werror $(1) -E -xc - -o /dev/null </dev/null >&0 2>/dev/null; then echo "$(1)"; else echo "$(2)"; fi;)
+# same but tries with $2 if $1 is not supported
+cc-opt-alt = $(if $(shell set -e; if $(CC) -Werror $(1) -E -xc - -o /dev/null </dev/null >&0 2>/dev/null; then echo 1;fi),$(1),$(call cc-opt,$(2)))
+
+# validate a list of options one at a time
+cc-all-opts  = $(foreach a,$(1),$(call cc-opt,$(a)))
+
+# try to pass plenty of options at once, take them on success or try them
+# one at a time on failure and keep successful ones. This is handy to quickly
+# validate most common options.
+cc-all-fast = $(if $(call cc-opt,$(1)),$(1),$(call cc-all-opts,$(1)))
+
+# Below we verify that the compiler supports any -Wno-something option to
+# disable any warning, or if a special option is needed to achieve that. This
+# will allow to get rid of testing when the compiler doesn't care. The result
+# is made of two variables:
+#  - cc-anywno that's non-empty if the compiler supports disabling anything
+#  - cc-wnouwo that may contain an option needed to enable this behavior
+# Gcc 4.x and above do not need any option but will still complain about unknown
+# options if another warning or error happens, and as such they're not testable.
+# Clang needs a special option -Wno-unknown-warning-option. Compilers not
+# supporting this option will check all warnings individually.
+cc-anywno := $(call cc-opt,-Wno-haproxy-warning)
+cc-wnouwo := $(if $(cc-anywno),,$(call cc-opt,-Wno-unknown-warning-option))
+cc-anywno := $(if $(cc-anywno)$(cc-wnouwo),1)
 
 # Disable a warning when supported by the compiler. Don't put spaces around the
 # warning! And don't use cc-opt which doesn't always report an error until
-# another one is also returned.
+# another one is also returned. If "cc-anywno" is set, the compiler supports
+# -Wno- followed by anything so we don't even need to start the compiler.
 # Usage: CFLAGS += $(call cc-nowarn,warning). Eg: $(call cc-opt,format-truncation)
-cc-nowarn = $(shell set -e; if $(CC) -Werror -W$(1) -E -xc - -o /dev/null </dev/null >&0 2>/dev/null; then echo "-Wno-$(1)"; fi;)
+cc-nowarn = $(if $(cc-anywno),-Wno-$(1),$(shell set -e; if $(CC) -Werror -W$(1) -E -xc - -o /dev/null </dev/null >&0 2>/dev/null; then echo "-Wno-$(1)"; fi;))
 
 #### Installation options.
 DESTDIR =
@@ -193,8 +216,13 @@ REG_TEST_SCRIPT=./scripts/run-regtests.sh
 # We rely on signed integer wraparound on overflow, however clang think it
 # can do whatever it wants since it's an undefined behavior, so use -fwrapv
 # to be sure we get the intended behavior.
+WARN_CFLAGS := -Wtype-limits -Wshift-negative-value -Wshift-overflow=2 \
+               -Wduplicated-cond -Wnull-dereference
 SPEC_CFLAGS := -Wall -Wextra -Wundef -Wdeclaration-after-statement
-SPEC_CFLAGS += $(call cc-opt-alt,-fwrapv,$(call cc-opt,-fno-strict-overflow))
+SPEC_CFLAGS += $(call cc-all-fast,$(WARN_CFLAGS))
+
+SPEC_CFLAGS += $(call cc-opt-alt,-fwrapv,-fno-strict-overflow)
+SPEC_CFLAGS += $(cc-wnouwo)
 SPEC_CFLAGS += $(call cc-nowarn,address-of-packed-member)
 SPEC_CFLAGS += $(call cc-nowarn,unused-label)
 SPEC_CFLAGS += $(call cc-nowarn,sign-compare)
@@ -203,11 +231,7 @@ SPEC_CFLAGS += $(call cc-nowarn,clobbered)
 SPEC_CFLAGS += $(call cc-nowarn,missing-field-initializers)
 SPEC_CFLAGS += $(call cc-nowarn,cast-function-type)
 SPEC_CFLAGS += $(call cc-nowarn,string-plus-int)
-SPEC_CFLAGS += $(call cc-opt,-Wtype-limits)
-SPEC_CFLAGS += $(call cc-opt,-Wshift-negative-value)
-SPEC_CFLAGS += $(call cc-opt,-Wshift-overflow=2)
-SPEC_CFLAGS += $(call cc-opt,-Wduplicated-cond)
-SPEC_CFLAGS += $(call cc-opt,-Wnull-dereference)
+SPEC_CFLAGS += $(call cc-nowarn,atomic-alignment)
 
 ifneq ($(ERR),)
 SPEC_CFLAGS += -Werror
@@ -230,10 +254,10 @@ SMALL_OPTS =
 # passed as-is to CFLAGS). Please check sources for their exact meaning or do
 # not use them at all. Some even more obscure ones might also be available
 # without appearing here. Currently defined DEBUG macros include DEBUG_FULL,
-# DEBUG_MEM_STATS, DEBUG_DONT_SHARE_POOLS, DEBUG_FD,
+# DEBUG_MEM_STATS, DEBUG_DONT_SHARE_POOLS, DEBUG_FD, DEBUG_POOL_INTEGRITY,
 # DEBUG_NO_POOLS, DEBUG_FAIL_ALLOC, DEBUG_STRICT_NOCRASH, DEBUG_HPACK,
 # DEBUG_AUTH, DEBUG_SPOE, DEBUG_UAF, DEBUG_THREAD, DEBUG_STRICT, DEBUG_DEV,
-# DEBUG_TASK, DEBUG_MEMORY_POOLS.
+# DEBUG_TASK, DEBUG_MEMORY_POOLS, DEBUG_POOL_TRACING.
 DEBUG =
 
 #### Trace options
@@ -377,7 +401,7 @@ ifeq ($(TARGET),solaris)
   set_target_defaults = $(call default_opts, \
     USE_POLL USE_TPROXY USE_LIBCRYPT USE_CRYPT_H USE_GETADDRINFO USE_THREAD \
     USE_RT USE_OBSOLETE_LINKER USE_EVPORTS USE_CLOSEFROM)
-  TARGET_CFLAGS  = -DFD_SETSIZE=65536 -D_REENTRANT -D_XOPEN_SOURCE=500 -D__EXTENSIONS__
+  TARGET_CFLAGS  = -DFD_SETSIZE=65536 -D_REENTRANT -D_XOPEN_SOURCE=600 -D__EXTENSIONS__
   TARGET_LDFLAGS = -lnsl -lsocket
 endif
 
@@ -595,7 +619,7 @@ ifneq ($(USE_QUIC),)
 OPTIONS_OBJS += src/quic_sock.o src/proto_quic.o src/xprt_quic.o src/quic_tls.o \
                 src/quic_frame.o src/quic_cc.o src/quic_cc_newreno.o src/mux_quic.o \
                 src/cbuf.o src/qpack-dec.o src/qpack-tbl.o src/h3.o src/qpack-enc.o \
-                src/hq_interop.o
+                src/hq_interop.o src/cfgparse-quic.o
 endif
 
 ifneq ($(USE_LUA),)
@@ -652,6 +676,9 @@ endif
 ifneq ($(USE_PCRE2),)
 OPTIONS_CFLAGS  += -DDA_REGEX_HDR=\"dac_pcre2.c\" -DDA_REGEX_TAG=2
 endif
+OPTIONS_OBJS	+= $(DEVICEATLAS_LIB)/Os/daunix.o
+OPTIONS_OBJS	+= $(DEVICEATLAS_LIB)/dadwcom.o
+OPTIONS_OBJS	+= $(DEVICEATLAS_LIB)/dasch.o
 OPTIONS_OBJS	+= $(DEVICEATLAS_LIB)/json.o
 OPTIONS_OBJS	+= $(DEVICEATLAS_LIB)/dac.o
 endif
@@ -1032,7 +1059,7 @@ clean:
 	$(Q)rm -f haproxy-$(VERSION) haproxy-$(VERSION)$(SUBVERS)$(EXTRAVERSION) nohup.out gmon.out
 	$(Q)rm -f addons/promex/*.[oas]
 	$(Q)rm -f addons/51degrees/*.[oas] addons/51degrees/dummy/*.[oas] addons/51degrees/dummy/*/*.[oas]
-	$(Q)rm -f addons/deviceatlas/*.[oas] addons/deviceatlas/dummy/*.[oas]
+	$(Q)rm -f addons/deviceatlas/*.[oas] addons/deviceatlas/dummy/*.[oas] addons/deviceatlas/dummy/*.o
 	$(Q)rm -f addons/ot/src/*.[oas]
 	$(Q)rm -f addons/wurfl/*.[oas] addons/wurfl/dummy/*.[oas]
 	$(Q)rm -f admin/*/*.[oas] admin/*/*/*.[oas]

@@ -62,16 +62,23 @@ typedef unsigned long long ull;
 /* Common definitions for short and long QUIC packet headers. */
 /* QUIC connection ID maximum length for version 1. */
 #define QUIC_CID_MAXLEN               20 /* bytes */
+/* QUIC original destination connection ID minial length */
+#define QUIC_ODCID_MINLEN              8 /* bytes */
 /*
  * All QUIC packets with long headers are made of at least (in bytes):
  * flags(1), version(4), DCID length(1), DCID(0..20), SCID length(1), SCID(0..20)
  */
 #define QUIC_LONG_PACKET_MINLEN            7
+/* DCID offset from beginning of a long packet */
+#define QUIC_LONG_PACKET_DCID_OFF         (1 + sizeof(uint32_t))
 /*
  * All QUIC packets with short headers are made of at least (in bytes):
  * flags(1), DCID(0..20)
  */
 #define QUIC_SHORT_PACKET_MINLEN           1
+/* DCID offset from beginning of a short packet */
+#define QUIC_SHORT_PACKET_DCID_OFF         1
+
 /* Byte 0 of QUIC packets. */
 #define QUIC_PACKET_LONG_HEADER_BIT  0x80 /* Long header format if set, short if not. */
 #define QUIC_PACKET_FIXED_BIT        0x40 /* Must always be set for all the headers. */
@@ -216,6 +223,8 @@ enum quic_pkt_type {
 #define           QUIC_EV_CONN_BCFRMS    (1ULL << 36)
 #define           QUIC_EV_CONN_XPRTSEND  (1ULL << 37)
 #define           QUIC_EV_CONN_XPRTRECV  (1ULL << 38)
+#define           QUIC_EV_CONN_FREED     (1ULL << 39)
+#define           QUIC_EV_CONN_CLOSE     (1ULL << 40)
 
 /* Similar to kernel min()/max() definitions. */
 #define QUIC_MIN(a, b) ({ \
@@ -243,6 +252,7 @@ extern struct pool_head *pool_head_quic_rxbuf;
 extern struct pool_head *pool_head_quic_rx_packet;
 extern struct pool_head *pool_head_quic_tx_packet;
 extern struct pool_head *pool_head_quic_frame;
+extern struct pool_head *pool_head_quic_dgram;
 
 /* QUIC connection id data.
  *
@@ -304,6 +314,7 @@ struct preferred_address {
 #define QUIC_TP_PREFERRED_ADDRESS                   13
 #define QUIC_TP_ACTIVE_CONNECTION_ID_LIMIT          14
 #define QUIC_TP_INITIAL_SOURCE_CONNECTION_ID        15
+#define QUIC_TP_RETRY_SOURCE_CONNECTION_ID          16
 
 /*
  * These defines are not for transport parameter type, but the maximum accepted value for
@@ -344,6 +355,10 @@ struct quic_transport_params {
 	 * When received by clients, must be set to 1 if present.
 	 */
 	struct quic_cid original_destination_connection_id;            /* Forbidden for clients */
+	/*
+	 * MUST be sent by servers after Retry.
+	 */
+	struct quic_cid retry_source_connection_id;                    /* Forbidden for clients */
 	/* MUST be present both for servers and clients. */
 	struct quic_cid initial_source_connection_id;
 	struct preferred_address preferred_address;                    /* Forbidden for clients */
@@ -384,7 +399,7 @@ struct quic_arngs {
 struct quic_pktns {
 	struct {
 		/* List of frames to send. */
-		struct mt_list frms;
+		struct list frms;
 		/* Next packet number to use for transmissions. */
 		int64_t next_pn;
 		/* Largest acked sent packet. */
@@ -406,6 +421,19 @@ struct quic_pktns {
 		struct quic_arngs arngs;
 	} rx;
 	unsigned int flags;
+};
+
+/* QUIC datagram */
+struct quic_dgram {
+	void *owner;
+	unsigned char *buf;
+	size_t len;
+	unsigned char *dcid;
+	size_t dcid_len;
+	struct sockaddr_storage saddr;
+	struct quic_conn *qc;
+	struct list list;
+	struct mt_list mt_list;
 };
 
 /* The QUIC packet numbers are 62-bits integers */
@@ -433,6 +461,7 @@ struct quic_rx_packet {
 	/* Packet number length */
 	uint32_t pnl;
 	uint64_t token_len;
+	const unsigned char *token;
 	/* Packet length */
 	uint64_t len;
 	/* Packet length before decryption */
@@ -447,21 +476,13 @@ struct quic_rx_packet {
 	unsigned int flags;
 };
 
-/* UDP datagram context used by the I/O handler receiver callbacks.
- * Useful to store the connection
- */
-struct quic_dgram_ctx {
-	struct quic_conn *qc;
-	struct quic_cid dcid;
-	void *owner;
+/* QUIC datagram handler */
+struct quic_dghdlr {
+	struct mt_list dgrams;
+	struct tasklet *task;
+	struct eb_root odcids;
+	struct eb_root cids;
 };
-
-/* QUIC packet reader. */
-typedef ssize_t qpkt_read_func(unsigned char *buf,
-                               const unsigned char *end,
-                               struct quic_rx_packet *qpkt,
-                               struct quic_dgram_ctx *dgram_ctx,
-                               struct sockaddr_storage *saddr);
 
 /* Structure to store enough information about the RX CRYPTO frames. */
 struct quic_rx_crypto_frm {
@@ -603,7 +624,19 @@ struct qring {
 /* QUIC RX buffer */
 struct rxbuf {
 	struct buffer buf;
+	struct list dgrams;
 	struct mt_list mt_list;
+};
+
+/* Status of the connection/mux layer. This defines how to handle app data.
+ *
+ * During a standard quic_conn lifetime it transitions like this :
+ * QC_MUX_NULL -> QC_MUX_READY -> QC_MUX_RELEASED
+ */
+enum qc_mux_state {
+	QC_MUX_NULL,     /* not allocated, data should be buffered */
+	QC_MUX_READY,    /* allocated, ready to handle data */
+	QC_MUX_RELEASED, /* released, data can be dropped */
 };
 
 /* The number of buffers for outgoing packets (must be a power of two). */
@@ -623,6 +656,9 @@ struct rxbuf {
 #define QUIC_FL_CONN_IO_CB_WAKEUP (1U << QUIC_FL_CONN_IO_CB_WAKEUP_BIT)
 
 #define QUIC_FL_POST_HANDSHAKE_FRAMES_BUILT     (1U << 2)
+#define QUIC_FL_CONN_LISTENER                   (1U << 3)
+#define QUIC_FL_ACCEPT_REGISTERED_BIT                  4
+#define QUIC_FL_ACCEPT_REGISTERED               (1U << QUIC_FL_ACCEPT_REGISTERED_BIT)
 #define QUIC_FL_CONN_IMMEDIATE_CLOSE            (1U << 31)
 struct quic_conn {
 	/* The quic_conn instance is refcounted as it can be used by threads
@@ -638,6 +674,7 @@ struct quic_conn {
 	/* Thread ID this connection is attached to */
 	int tid;
 	int state;
+	enum qc_mux_state mux_state; /* status of the connection/mux layer */
 	uint64_t err_code;
 	unsigned char enc_params[QUIC_TP_MAX_ENCLEN]; /* encoded QUIC transport parameters */
 	size_t enc_params_len;
@@ -658,6 +695,8 @@ struct quic_conn {
 	struct quic_pktns pktns[QUIC_TLS_PKTNS_MAX];
 
 	struct ssl_sock_ctx *xprt_ctx;
+
+	struct sockaddr_storage peer_addr;
 
 	/* Used only to reach the tasklet for the I/O handler from this quic_conn object. */
 	struct connection *conn;
@@ -709,11 +748,14 @@ struct quic_conn {
 	struct quic_path *path;
 
 	struct listener *li; /* only valid for frontend connections */
+	struct mt_list accept_list; /* chaining element used for accept, only valid for frontend connections */
 	/* MUX */
 	struct qcc *qcc;
 	struct task *timer_task;
 	unsigned int timer;
 	unsigned int flags;
+
+	const struct qcc_app_ops *app_ops;
 };
 
 #endif /* USE_QUIC */

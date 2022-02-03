@@ -79,6 +79,7 @@
 #include <haproxy/vars.h>
 #include <haproxy/xprt_quic.h>
 #include <haproxy/xxhash.h>
+#include <haproxy/istbuf.h>
 
 
 /* ***** READ THIS before adding code here! *****
@@ -133,6 +134,8 @@ struct global_ssl global_ssl = {
 static BIO_METHOD *ha_meth;
 
 DECLARE_STATIC_POOL(ssl_sock_ctx_pool, "ssl_sock_ctx_pool", sizeof(struct ssl_sock_ctx));
+
+DECLARE_STATIC_POOL(ssl_sock_client_sni_pool, "ssl_sock_client_sni_pool", TLSEXT_MAXLEN_host_name + 1);
 
 /* ssl stats module */
 enum {
@@ -434,6 +437,9 @@ static STACK_OF(X509_NAME)* ssl_get_client_ca_file(char *path)
 struct pool_head *pool_head_ssl_capture __read_mostly = NULL;
 int ssl_capture_ptr_index = -1;
 int ssl_app_data_index = -1;
+#ifdef USE_QUIC
+int ssl_qc_app_data_index = -1;
+#endif /* USE_QUIC */
 
 #ifdef HAVE_SSL_KEYLOG
 int ssl_keylog_index = -1;
@@ -442,6 +448,9 @@ struct pool_head *pool_head_ssl_keylog_str __read_mostly = NULL;
 #endif
 
 int ssl_client_crt_ref_index = -1;
+
+/* Used to store the client's SNI in case of ClientHello callback error */
+int ssl_client_sni_index = -1;
 
 #if (defined SSL_CTRL_SET_TLSEXT_TICKET_KEY_CB && TLS_TICKETS_NO > 0)
 struct list tlskeys_reference = LIST_HEAD_INIT(tlskeys_reference);
@@ -1515,9 +1524,26 @@ out:
 void ssl_sock_infocbk(const SSL *ssl, int where, int ret)
 {
 	struct connection *conn = SSL_get_ex_data(ssl, ssl_app_data_index);
-	struct ssl_sock_ctx *ctx = conn->xprt_ctx;
+#ifdef USE_QUIC
+	struct quic_conn *qc = SSL_get_ex_data(ssl, ssl_qc_app_data_index);
+#endif /* USE_QUIC */
+	struct ssl_sock_ctx *ctx = NULL;
+
 	BIO *write_bio;
 	(void)ret; /* shut gcc stupid warning */
+
+	if (conn)
+		ctx = conn->xprt_ctx;
+#ifdef USE_QUIC
+	else if (qc)
+		ctx = qc->xprt_ctx;
+#endif /* USE_QUIC */
+
+	if (!ctx) {
+		/* must never happen */
+		ABORT_NOW();
+		return;
+	}
 
 #ifndef SSL_OP_NO_RENEGOTIATION
 	/* Please note that BoringSSL defines this macro to zero so don't
@@ -1525,7 +1551,7 @@ void ssl_sock_infocbk(const SSL *ssl, int where, int ret)
 	 */
 	if (where & SSL_CB_HANDSHAKE_START) {
 		/* Disable renegotiation (CVE-2009-3555) */
-		if ((conn->flags & (CO_FL_WAIT_L6_CONN | CO_FL_EARLY_SSL_HS | CO_FL_EARLY_DATA)) == 0) {
+		if (conn && (conn->flags & (CO_FL_WAIT_L6_CONN | CO_FL_EARLY_SSL_HS | CO_FL_EARLY_DATA)) == 0) {
 			conn->flags |= CO_FL_ERROR;
 			conn->err_code = CO_ER_SSL_RENEG;
 		}
@@ -1975,21 +2001,21 @@ static int ssl_sock_advertise_alpn_protos(SSL *s, const unsigned char **out,
 {
 	struct ssl_bind_conf *conf = arg;
 #ifdef USE_QUIC
-	struct connection *conn = SSL_get_ex_data(s, ssl_app_data_index);
+	struct quic_conn *qc = SSL_get_ex_data(s, ssl_qc_app_data_index);
 #endif
 
 	if (SSL_select_next_proto((unsigned char**) out, outlen, (const unsigned char *)conf->alpn_str,
 	                          conf->alpn_len, server, server_len) != OPENSSL_NPN_NEGOTIATED) {
 #ifdef USE_QUIC
-		if (conn->qc)
-			quic_set_tls_alert(conn->qc, SSL_AD_NO_APPLICATION_PROTOCOL);
+		if (qc)
+			quic_set_tls_alert(qc, SSL_AD_NO_APPLICATION_PROTOCOL);
 #endif
 		return SSL_TLSEXT_ERR_NOACK;
 	}
 
 #ifdef USE_QUIC
-	if (conn->qc && !quic_set_app_ops(conn->qc, *out, *outlen)) {
-		quic_set_tls_alert(conn->qc, SSL_AD_NO_APPLICATION_PROTOCOL);
+	if (qc && !quic_set_app_ops(qc, *out, *outlen)) {
+		quic_set_tls_alert(qc, SSL_AD_NO_APPLICATION_PROTOCOL);
 		return SSL_TLSEXT_ERR_NOACK;
 	}
 #endif
@@ -2446,8 +2472,11 @@ int ssl_sock_switchctx_cbk(const struct ssl_early_callback_ctx *ctx)
 int ssl_sock_switchctx_cbk(SSL *ssl, int *al, void *arg)
 {
 #endif
-	struct connection *conn;
-	struct bind_conf *s;
+	struct connection *conn = SSL_get_ex_data(ssl, ssl_app_data_index);
+#ifdef USE_QUIC
+	struct quic_conn *qc = SSL_get_ex_data(ssl, ssl_qc_app_data_index);
+#endif /* USE_QUIC */
+	struct bind_conf *s = NULL;
 	const uint8_t *extension_data;
 	size_t extension_len;
 	int has_rsa_sig = 0, has_ecdsa_sig = 0;
@@ -2459,17 +2488,27 @@ int ssl_sock_switchctx_cbk(SSL *ssl, int *al, void *arg)
 	int allow_early = 0;
 	int i;
 
-	conn = SSL_get_ex_data(ssl, ssl_app_data_index);
-	s = __objt_listener(conn->target)->bind_conf;
+	if (conn)
+		s = __objt_listener(conn->target)->bind_conf;
+#ifdef USE_QUIC
+	else if (qc)
+		s = qc->li->bind_conf;
+#endif /* USE_QUIC */
+
+	if (!s) {
+		/* must never happen */
+		ABORT_NOW();
+		return 0;
+	}
 
 #ifdef USE_QUIC
-	if (conn->qc) {
+	if (qc) {
 		/* Look for the QUIC transport parameters. */
 #ifdef OPENSSL_IS_BORINGSSL
-		if (!SSL_early_callback_ctx_extension_get(ctx, con->qc->tps_tls_ext,
+		if (!SSL_early_callback_ctx_extension_get(ctx, qc->tps_tls_ext,
 		                                          &extension_data, &extension_len))
 #else
-		if (!SSL_client_hello_get0_ext(ssl, conn->qc->tps_tls_ext,
+		if (!SSL_client_hello_get0_ext(ssl, qc->tps_tls_ext,
 		                               &extension_data, &extension_len))
 #endif
 		{
@@ -2478,17 +2517,15 @@ int ssl_sock_switchctx_cbk(SSL *ssl, int *al, void *arg)
 			 * which would be set after calling quic_set_tls_alert().
 			 */
 			*al = SSL_AD_MISSING_EXTENSION;
-			quic_set_tls_alert(conn->qc, SSL_AD_MISSING_EXTENSION);
+			quic_set_tls_alert(qc, SSL_AD_MISSING_EXTENSION);
 			return 0;
 		}
 
-		if (!quic_transport_params_store(conn->qc, 0, extension_data,
+		if (!quic_transport_params_store(qc, 0, extension_data,
 		                                 extension_data + extension_len))
 			goto abort;
-
-		quic_mux_transport_params_update(conn->qc->qcc);
 	}
-#endif
+#endif /* USE_QUIC */
 
 	if (s->ssl_conf.early_data)
 		allow_early = 1;
@@ -2705,11 +2742,27 @@ int ssl_sock_switchctx_cbk(SSL *ssl, int *al, void *arg)
 		goto allow_early;
 	}
 
+	/* We are about to raise an handshake error so the servername extension
+	 * callback will never be called and the SNI will never be stored in the
+	 * SSL context. In order for the ssl_fc_sni sample fetch to still work
+	 * in such a case, we store the SNI ourselves as an ex_data information
+	 * in the SSL context.
+	 */
+	{
+		char *client_sni = pool_alloc(ssl_sock_client_sni_pool);
+		if (client_sni) {
+			strncpy(client_sni, trash.area, TLSEXT_MAXLEN_host_name);
+			client_sni[TLSEXT_MAXLEN_host_name] = '\0';
+			SSL_set_ex_data(ssl, ssl_client_sni_index, client_sni);
+		}
+	}
+
 	/* other cases fallback on abort, if strict-sni is set but no node was found */
 
  abort:
 	/* abort handshake (was SSL_TLSEXT_ERR_ALERT_FATAL) */
-	conn->err_code = CO_ER_SSL_HANDSHAKE;
+	if (conn)
+		conn->err_code = CO_ER_SSL_HANDSHAKE;
 #ifdef OPENSSL_IS_BORINGSSL
 	return ssl_select_cert_error;
 #else
@@ -7380,9 +7433,43 @@ int ssl_ocsp_response_print(struct buffer *ocsp_response, struct buffer *out)
 	}
 
 	if (OCSP_RESPONSE_print(bio, resp, 0) != 0) {
-		write = BIO_read(bio, out->area, out->size - 1);
-		out->area[write] = '\0';
-		out->data = write;
+		struct buffer *trash = get_trash_chunk();
+		struct ist ist_block = IST_NULL;
+		struct ist ist_double_lf = IST_NULL;
+		static struct ist double_lf = IST("\n\n");
+
+		write = BIO_read(bio, trash->area, trash->size - 1);
+		trash->data = write;
+
+		/* Look for empty lines in the 'trash' buffer and add a space to
+		 * the beginning to avoid having empty lines in the output
+		 * (without changing the appearance of the information
+		 * displayed).
+		 */
+		ist_block = ist2(b_orig(trash), b_data(trash));
+
+		ist_double_lf = istist(ist_block, double_lf);
+
+		while (istlen(ist_double_lf)) {
+			/* istptr(ist_double_lf) points to the first \n of a
+			 * \n\n pattern.
+			 */
+			uint empty_line_offset = istptr(ist_double_lf) + 1 - istptr(ist_block);
+
+			/* Write up to the first '\n' of the "\n\n" pattern into
+			 * the output buffer.
+			 */
+			b_putblk(out, istptr(ist_block), empty_line_offset);
+			/* Add an extra space. */
+			b_putchr(out, ' ');
+
+			/* Keep looking for empty lines in the rest of the data. */
+			ist_block = istadv(ist_block, empty_line_offset);
+
+			ist_double_lf = istist(ist_block, double_lf);
+		}
+
+		b_istput(out, ist_block);
 	}
 
 	if (bio)
@@ -7584,6 +7671,11 @@ static void ssl_sock_clt_crt_free_func(void *parent, void *ptr, CRYPTO_EX_DATA *
 	X509_free((X509*)ptr);
 }
 
+static void ssl_sock_clt_sni_free_func(void *parent, void *ptr, CRYPTO_EX_DATA *ad, int idx, long argl, void *argp)
+{
+	pool_free(ssl_sock_client_sni_pool, ptr);
+}
+
 __attribute__((constructor))
 static void __ssl_sock_init(void)
 {
@@ -7628,10 +7720,14 @@ static void __ssl_sock_init(void)
 
 	ssl_app_data_index = SSL_get_ex_new_index(0, NULL, NULL, NULL, NULL);
 	ssl_capture_ptr_index = SSL_get_ex_new_index(0, NULL, NULL, NULL, ssl_sock_capture_free_func);
+#ifdef USE_QUIC
+	ssl_qc_app_data_index = SSL_get_ex_new_index(0, NULL, NULL, NULL, NULL);
+#endif /* USE_QUIC */
 #ifdef HAVE_SSL_KEYLOG
 	ssl_keylog_index = SSL_get_ex_new_index(0, NULL, NULL, NULL, ssl_sock_keylog_free_func);
 #endif
 	ssl_client_crt_ref_index = SSL_get_ex_new_index(0, NULL, NULL, NULL, ssl_sock_clt_crt_free_func);
+	ssl_client_sni_index = SSL_get_ex_new_index(0, NULL, NULL, NULL, ssl_sock_clt_sni_free_func);
 #ifndef OPENSSL_NO_ENGINE
 	ENGINE_load_builtin_engines();
 	hap_register_post_check(ssl_check_async_engine_count);

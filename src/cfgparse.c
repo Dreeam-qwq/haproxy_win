@@ -66,6 +66,7 @@
 #include <haproxy/log.h>
 #include <haproxy/mailers.h>
 #include <haproxy/namespace.h>
+#include <haproxy/quic_sock.h>
 #include <haproxy/obj_type-t.h>
 #include <haproxy/peers-t.h>
 #include <haproxy/peers.h>
@@ -3901,7 +3902,16 @@ out_uri_auth_compat:
 			if (!listener->maxaccept)
 				listener->maxaccept = global.tune.maxaccept ? global.tune.maxaccept : MAX_ACCEPT;
 
+			/* listener accept callback */
 			listener->accept = session_accept_fd;
+#ifdef USE_QUIC
+			/* override the accept callback for QUIC listeners. */
+			if (listener->flags & LI_F_QUIC_LISTENER) {
+				listener->accept = quic_session_accept;
+				li_init_per_thr(listener);
+			}
+#endif
+
 			listener->analysers |= curproxy->fe_req_ana;
 			listener->default_target = curproxy->default_target;
 

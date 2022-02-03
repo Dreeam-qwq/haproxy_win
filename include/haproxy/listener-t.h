@@ -170,6 +170,7 @@ struct bind_conf {
 #endif
 #ifdef USE_QUIC
 	struct quic_transport_params quic_params; /* QUIC transport parameters. */
+	unsigned int quic_force_retry:1;          /* always send Retry on reception of Initial without token */
 #endif
 	struct proxy *frontend;    /* the frontend all these listeners belong to, or NULL */
 	const struct mux_proto_list *mux_proto; /* the mux to use for all incoming connections (specified by the "proto" keyword) */
@@ -190,6 +191,18 @@ struct bind_conf {
 	struct rx_settings settings; /* all the settings needed for the listening socket */
 };
 
+/* Fields of a listener allocated per thread */
+struct li_per_thread {
+	struct {
+		struct mt_list list;  /* list element in the QUIC accept queue */
+		struct mt_list conns; /* list of QUIC connections from this listener ready to be accepted */
+	} quic_accept;
+
+	struct listener *li; /* back reference on the listener */
+};
+
+#define LI_F_QUIC_LISTENER       0x00000001  /* listener uses proto quic */
+
 /* The listener will be directly referenced by the fdtab[] which holds its
  * socket. The listener provides the protocol-specific accept() function to
  * the fdtab.
@@ -200,7 +213,8 @@ struct listener {
 	short int nice;                 /* nice value to assign to the instantiated tasks */
 	int luid;			/* listener universally unique ID, used for SNMP */
 	int options;			/* socket options : LI_O_* */
-	__decl_thread(HA_SPINLOCK_T lock);
+	int flags;                      /* LI_F_* flags */
+	__decl_thread(HA_RWLOCK_T lock);
 
 	struct fe_counters *counters;	/* statistics counters */
 	int nbconn;			/* current number of connections on this listener */
@@ -229,6 +243,8 @@ struct listener {
 	struct {
 		struct eb32_node id;	/* place in the tree of used IDs */
 	} conf;				/* config information */
+
+	struct li_per_thread *per_thr;  /* per-thread fields */
 
 	EXTRA_COUNTERS(extra_counters);
 };

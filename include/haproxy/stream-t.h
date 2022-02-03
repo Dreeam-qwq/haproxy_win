@@ -83,10 +83,10 @@
 #define SF_WEBSOCKET    0x00400000	/* websocket stream */
 
 /* flags for the proxy of the master CLI */
-/* 0x1.. to 0x3 are reserved for ACCESS_LVL_MASK */
+/* 0x0001.. to 0x8000 are reserved for ACCESS_* flags from cli-t.h */
 
-#define PCLI_F_PROMPT          0x4
-#define PCLI_F_PAYLOAD         0x8
+#define PCLI_F_PROMPT   0x10000
+#define PCLI_F_PAYLOAD  0x20000
 
 struct hlua;
 struct proxy;
@@ -143,7 +143,7 @@ struct stream {
 	struct list back_refs;          /* list of users tracking this stream */
 	struct buffer_wait buffer_wait; /* position in the list of objects waiting for a buffer */
 
-	struct freq_ctr call_rate;      /* stream task call rate */
+	struct freq_ctr call_rate;      /* stream task call rate without making progress */
 
 	short store_count;
 	enum obj_type obj_type;         /* object type == OBJ_TYPE_STREAM */

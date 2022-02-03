@@ -122,7 +122,8 @@ static char *cli_gen_usage_msg(struct appctx *appctx, char * const *args)
 		for (kw = &kw_list->kw[0]; kw->str_kw[0]; kw++) {
 			if (kw->level & ~appctx->cli_level & (ACCESS_MASTER_ONLY|ACCESS_EXPERT|ACCESS_EXPERIMENTAL))
 				continue;
-			if ((appctx->cli_level & ~kw->level & (ACCESS_MASTER_ONLY|ACCESS_MASTER)) ==
+			if (!(appctx->cli_level & ACCESS_MCLI_DEBUG) &&
+			    (appctx->cli_level & ~kw->level & (ACCESS_MASTER_ONLY|ACCESS_MASTER)) ==
 			    (ACCESS_MASTER_ONLY|ACCESS_MASTER))
 				continue;
 
@@ -162,8 +163,9 @@ static char *cli_gen_usage_msg(struct appctx *appctx, char * const *args)
 			for (kw = &kw_list->kw[0]; kw->str_kw[0]; kw++) {
 				if (kw->level & ~appctx->cli_level & (ACCESS_MASTER_ONLY|ACCESS_EXPERT|ACCESS_EXPERIMENTAL))
 					continue;
-				if ((appctx->cli_level & ~kw->level & (ACCESS_MASTER_ONLY|ACCESS_MASTER)) ==
-				    (ACCESS_MASTER_ONLY|ACCESS_MASTER))
+				if (!(appctx->cli_level & ACCESS_MCLI_DEBUG) &&
+				    ((appctx->cli_level & ~kw->level & (ACCESS_MASTER_ONLY|ACCESS_MASTER)) ==
+				    (ACCESS_MASTER_ONLY|ACCESS_MASTER)))
 					continue;
 
 				for (idx = 0; idx < length; idx++) {
@@ -249,11 +251,13 @@ static char *cli_gen_usage_msg(struct appctx *appctx, char * const *args)
 			if (kw->level & ~appctx->cli_level & (ACCESS_MASTER_ONLY|ACCESS_EXPERT|ACCESS_EXPERIMENTAL))
 				continue;
 
-			/* in master don't display commands that have neither the master bit
-			 * nor the master-only bit.
+			/* in master, if the CLI don't have the
+			 * ACCESS_MCLI_DEBUG don't display commands that have
+			 * neither the master bit nor the master-only bit.
 			 */
-			if ((appctx->cli_level & ~kw->level & (ACCESS_MASTER_ONLY|ACCESS_MASTER)) ==
-			    (ACCESS_MASTER_ONLY|ACCESS_MASTER))
+			if (!(appctx->cli_level & ACCESS_MCLI_DEBUG) &&
+			    ((appctx->cli_level & ~kw->level & (ACCESS_MASTER_ONLY|ACCESS_MASTER)) ==
+			    (ACCESS_MASTER_ONLY|ACCESS_MASTER)))
 				continue;
 
 			for (idx = 0; idx < length; idx++) {
@@ -750,7 +754,8 @@ static int cli_parse_request(struct appctx *appctx)
 	kw = cli_find_kw(args);
 	if (!kw ||
 	    (kw->level & ~appctx->cli_level & ACCESS_MASTER_ONLY) ||
-	    (appctx->cli_level & ~kw->level & (ACCESS_MASTER_ONLY|ACCESS_MASTER)) == (ACCESS_MASTER_ONLY|ACCESS_MASTER)) {
+	    (!(appctx->cli_level & ACCESS_MCLI_DEBUG) &&
+	     (appctx->cli_level & ~kw->level & (ACCESS_MASTER_ONLY|ACCESS_MASTER)) == (ACCESS_MASTER_ONLY|ACCESS_MASTER))) {
 		/* keyword not found in this mode */
 		cli_gen_usage_msg(appctx, args);
 		return 0;
@@ -890,9 +895,20 @@ static void cli_io_handler(struct appctx *appctx)
 				break;
 			}
 
-			/* '- 1' is to ensure a null byte can always be inserted at the end */
-			reql = co_getline(si_oc(si), str,
-					  appctx->chunk->size - appctx->chunk->data - 1);
+			/* payload doesn't take escapes nor does it end on semi-colons, so
+			 * we use the regular getline. Normal mode however must stop on
+			 * LFs and semi-colons that are not prefixed by a backslash. Note
+			 * that we reserve one byte at the end to insert a trailing nul byte.
+			 */
+
+			if (appctx->st1 & APPCTX_CLI_ST1_PAYLOAD)
+				reql = co_getline(si_oc(si), str,
+				                  appctx->chunk->size - appctx->chunk->data - 1);
+			else
+				reql = co_getdelim(si_oc(si), str,
+				                   appctx->chunk->size - appctx->chunk->data - 1,
+				                   "\n;", '\\');
+
 			if (reql <= 0) { /* closed or EOL not found */
 				if (reql == 0)
 					break;
@@ -1077,6 +1093,17 @@ static void cli_io_handler(struct appctx *appctx)
 			appctx->st0 = CLI_ST_GETREQ;
 			/* reactivate the \n at the end of the response for the next command */
 			appctx->st1 &= ~APPCTX_CLI_ST1_NOLF;
+
+			/* this forces us to yield between pipelined commands and
+			 * avoid extremely long latencies (e.g. "del map" etc). In
+			 * addition this increases the likelihood that the stream
+			 * refills the buffer with new bytes in non-interactive
+			 * mode, avoiding to close on apparently empty commands.
+			 */
+			if (co_data(si_oc(si))) {
+				appctx_wakeup(appctx);
+				goto out;
+			}
 		}
 	}
 
@@ -1729,6 +1756,10 @@ static int cli_parse_expert_experimental_mode(char **args, char *payload, struct
 	char *level_str;
 	char *output = NULL;
 
+	/* this will ask the applet to not output a \n after the command */
+	if (*args[1] && *args[2] && strcmp(args[2], "-") == 0)
+		appctx->st1 |= APPCTX_CLI_ST1_NOLF;
+
 	if (!cli_has_level(appctx, ACCESS_LVL_ADMIN))
 		return 1;
 
@@ -1739,6 +1770,10 @@ static int cli_parse_expert_experimental_mode(char **args, char *payload, struct
 	else if (strcmp(args[0], "experimental-mode") == 0) {
 		level = ACCESS_EXPERIMENTAL;
 		level_str = "experimental-mode";
+	}
+	else if (strcmp(args[0], "mcli-debug-mode") == 0) {
+		level = ACCESS_MCLI_DEBUG;
+		level_str = "mcli-debug-mode";
 	}
 	else {
 		return 1;
@@ -2092,10 +2127,29 @@ void pcli_write_prompt(struct stream *s)
 		chunk_appendf(msg, "+ ");
 	} else {
 		if (s->pcli_next_pid == 0)
-			chunk_appendf(msg, "master%s> ",
+			chunk_appendf(msg, "master%s",
 			              (proc_self->failedreloads > 0) ? "[ReloadFailed]" : "");
 		else
-			chunk_appendf(msg, "%d> ", s->pcli_next_pid);
+			chunk_appendf(msg, "%d", s->pcli_next_pid);
+
+		if (s->pcli_flags & (ACCESS_EXPERIMENTAL|ACCESS_EXPERT|ACCESS_MCLI_DEBUG)) {
+			chunk_appendf(msg, "(");
+
+			if (s->pcli_flags & ACCESS_EXPERIMENTAL)
+				chunk_appendf(msg, "x");
+
+			if (s->pcli_flags & ACCESS_EXPERT)
+				chunk_appendf(msg, "e");
+
+			if (s->pcli_flags & ACCESS_MCLI_DEBUG)
+				chunk_appendf(msg, "d");
+
+			chunk_appendf(msg, ")");
+		}
+
+		chunk_appendf(msg, "> ");
+
+
 	}
 	co_inject(oc, msg->area, msg->data);
 }
@@ -2240,6 +2294,36 @@ int pcli_find_and_exec_kw(struct stream *s, char **args, int argl, char **errmsg
 		s->pcli_flags &= ~ACCESS_LVL_MASK;
 		s->pcli_flags |= ACCESS_LVL_USER;
 		return argl;
+
+	} else if (strcmp(args[0], "expert-mode") == 0) {
+		if (!pcli_has_level(s, ACCESS_LVL_ADMIN)) {
+			memprintf(errmsg, "Permission denied!\n");
+			return -1;
+		}
+
+		s->pcli_flags &= ~ACCESS_EXPERT;
+		if ((argl > 1) && (strcmp(args[1], "on") == 0))
+			s->pcli_flags |= ACCESS_EXPERT;
+		return argl;
+
+	} else if (strcmp(args[0], "experimental-mode") == 0) {
+		if (!pcli_has_level(s, ACCESS_LVL_ADMIN)) {
+			memprintf(errmsg, "Permission denied!\n");
+			return -1;
+		}
+		s->pcli_flags &= ~ACCESS_EXPERIMENTAL;
+		if ((argl > 1) && (strcmp(args[1], "on") == 0))
+			s->pcli_flags |= ACCESS_EXPERIMENTAL;
+		return argl;
+	} else if (strcmp(args[0], "mcli-debug-mode") == 0) {
+		if (!pcli_has_level(s, ACCESS_LVL_ADMIN)) {
+			memprintf(errmsg, "Permission denied!\n");
+			return -1;
+		}
+		s->pcli_flags &= ~ACCESS_MCLI_DEBUG;
+		if ((argl > 1) && (strcmp(args[1], "on") == 0))
+			s->pcli_flags |= ACCESS_MCLI_DEBUG;
+		return argl;
 	}
 
 	return 0;
@@ -2256,8 +2340,8 @@ int pcli_find_and_exec_kw(struct stream *s, char **args, int argl, char **errmsg
  */
 int pcli_parse_request(struct stream *s, struct channel *req, char **errmsg, int *next_pid)
 {
-	char *str = (char *)ci_head(req);
-	char *end = (char *)ci_stop(req);
+	char *str;
+	char *end;
 	char *args[MAX_CLI_ARGS + 1]; /* +1 for storing a NULL */
 	int argl; /* number of args */
 	char *p;
@@ -2267,6 +2351,15 @@ int pcli_parse_request(struct stream *s, struct channel *req, char **errmsg, int
 	int reql = 0;
 	int ret;
 	int i = 0;
+
+	/* we cannot deal with a wrapping buffer, so let's take care of this
+	 * first.
+	 */
+	if (b_head(&req->buf) + b_data(&req->buf) > b_wrap(&req->buf))
+		b_slow_realign(&req->buf, trash.area, co_data(req));
+
+	str = (char *)ci_head(req);
+	end = (char *)ci_stop(req);
 
 	p = str;
 
@@ -2302,7 +2395,7 @@ int pcli_parse_request(struct stream *s, struct channel *req, char **errmsg, int
 	end = p + reql;
 
 	/* there is no end to this command, need more to parse ! */
-	if (*(end-1) != '\n') {
+	if (!reql || *(end-1) != '\n') {
 		return -1;
 	}
 
@@ -2346,7 +2439,7 @@ int pcli_parse_request(struct stream *s, struct channel *req, char **errmsg, int
 	wtrim = pcli_find_and_exec_kw(s, args, argl, errmsg, next_pid);
 
 	/* End of words are ending by \0, we need to replace the \0s by spaces
-1	   before forwarding them */
+	   before forwarding them */
 	p = str;
 	while (p < end-1) {
 		if (*p == '\0')
@@ -2379,6 +2472,21 @@ int pcli_parse_request(struct stream *s, struct channel *req, char **errmsg, int
 	}
 
 	if (ret > 1) {
+
+		/* the mcli-debug-mode is only sent to the applet of the master */
+		if ((s->pcli_flags & ACCESS_MCLI_DEBUG) && *next_pid <= 0) {
+			ci_insert_line2(req, 0, "mcli-debug-mode on -", strlen("mcli-debug-mode on -"));
+			ret += strlen("mcli-debug-mode on -") + 2;
+		}
+		if (s->pcli_flags & ACCESS_EXPERIMENTAL) {
+			ci_insert_line2(req, 0, "experimental-mode on -", strlen("experimental-mode on -"));
+			ret += strlen("experimental-mode on -") + 2;
+		}
+		if (s->pcli_flags & ACCESS_EXPERT) {
+			ci_insert_line2(req, 0, "expert-mode on -", strlen("expert-mode on -"));
+			ret += strlen("expert-mode on -") + 2;
+		}
+
 		if (pcli_has_level(s, ACCESS_LVL_ADMIN)) {
 			goto end;
 		} else if (pcli_has_level(s, ACCESS_LVL_OPER)) {
@@ -2419,20 +2527,11 @@ read_again:
 	/* We don't know yet to which server we will connect */
 	channel_dont_connect(req);
 
-
-	/* we are not waiting for a response, there is no more request and we
-	 * receive a close from the client, we can leave */
-	if (!(ci_data(req)) && req->flags & CF_SHUTR) {
-		channel_shutw_now(&s->res);
-		s->req.analysers &= ~AN_REQ_WAIT_CLI;
-		return 1;
-	}
-
 	req->flags |= CF_READ_DONTWAIT;
 
 	/* need more data */
 	if (!ci_data(req))
-		return 0;
+		goto missing_data;
 
 	/* If there is data available for analysis, log the end of the idle time. */
 	if (c_data(req) && s->logs.t_idle == -1)
@@ -2475,14 +2574,14 @@ read_again:
 		/* we trimmed things but we might have other commands to consume */
 		pcli_write_prompt(s);
 		goto read_again;
-	} else if (to_forward == -1 && errmsg) {
-		/* there was an error during the parsing */
-			pcli_reply_and_close(s, errmsg);
-			s->req.analysers &= ~AN_REQ_WAIT_CLI;
-			return 0;
-	} else if (to_forward == -1 && channel_full(req, global.tune.maxrewrite)) {
-		/* buffer is full and we didn't catch the end of a command */
-		goto send_help;
+	} else if (to_forward == -1) {
+                if (errmsg) {
+                        /* there was an error during the parsing */
+                        pcli_reply_and_close(s, errmsg);
+                        s->req.analysers &= ~AN_REQ_WAIT_CLI;
+                        return 0;
+                }
+                goto missing_data;
 	}
 
 	return 0;
@@ -2491,6 +2590,20 @@ send_help:
 	b_reset(&req->buf);
 	b_putblk(&req->buf, "help\n", 5);
 	goto read_again;
+
+missing_data:
+        if (req->flags & CF_SHUTR) {
+                /* There is no more request or a only a partial one and we
+                 * receive a close from the client, we can leave */
+                channel_shutw_now(&s->res);
+                s->req.analysers &= ~AN_REQ_WAIT_CLI;
+                return 1;
+        }
+        else if (channel_full(req, global.tune.maxrewrite)) {
+                /* buffer is full and we didn't catch the end of a command */
+                goto send_help;
+        }
+        return 0;
 
 server_disconnect:
 	pcli_reply_and_close(s, "Can't connect to the target CLI!\n");
@@ -2977,8 +3090,9 @@ static struct cli_kw_list cli_kws = {{ },{
 	{ { "prompt", NULL },                    NULL,                                                                                                cli_parse_simple, NULL, NULL, NULL, ACCESS_MASTER },
 	{ { "quit", NULL },                      NULL,                                                                                                cli_parse_simple, NULL, NULL, NULL, ACCESS_MASTER },
 	{ { "_getsocks", NULL },                 NULL,                                                                                                _getsocks, NULL },
-	{ { "expert-mode", NULL },               NULL,                                                                                                cli_parse_expert_experimental_mode, NULL }, // not listed
-	{ { "experimental-mode", NULL },         NULL,                                                                                                cli_parse_expert_experimental_mode, NULL }, // not listed
+	{ { "expert-mode", NULL },               NULL,                                                                                                cli_parse_expert_experimental_mode, NULL, NULL, NULL, ACCESS_MASTER }, // not listed
+	{ { "experimental-mode", NULL },         NULL,                                                                                                cli_parse_expert_experimental_mode, NULL, NULL, NULL, ACCESS_MASTER }, // not listed
+	{ { "mcli-debug-mode", NULL },         NULL,                                                                                                  cli_parse_expert_experimental_mode, NULL, NULL, NULL, ACCESS_MASTER_ONLY }, // not listed
 	{ { "set", "maxconn", "global",  NULL }, "set maxconn global <value>              : change the per-process maxconn setting",                  cli_parse_set_maxconn_global, NULL },
 	{ { "set", "rate-limit", NULL },         "set rate-limit <setting> <value>        : change a rate limiting value",                            cli_parse_set_ratelimit, NULL },
 	{ { "set", "severity-output",  NULL },   "set severity-output [none|number|string]: set presence of severity level in feedback information",  cli_parse_set_severity_output, NULL, NULL },
