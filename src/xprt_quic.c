@@ -2751,8 +2751,7 @@ int qc_send_ppkts(struct qring *qr, struct ssl_sock_ctx *ctx)
 		TRACE_PROTO("to send", QUIC_EV_CONN_SPPKTS, qc);
 		for (pkt = first_pkt; pkt; pkt = pkt->next)
 			quic_tx_packet_refinc(pkt);
-		if (ctx->xprt->snd_buf(NULL, qc->xprt_ctx,
-		                       &tmpbuf, tmpbuf.data, 0) <= 0) {
+		if(qc_snd_buf(qc, &tmpbuf, tmpbuf.data, 0) <= 0) {
 			for (pkt = first_pkt; pkt; pkt = pkt->next)
 				quic_tx_packet_refdec(pkt);
 			break;
@@ -5143,121 +5142,6 @@ static struct quic_tx_packet *qc_build_pkt(unsigned char **pos,
 	return NULL;
 }
 
-/* Copy up to <count> bytes from connection <conn> internal stream storage into buffer <buf>.
- * Return the number of bytes which have been copied.
- */
-static size_t quic_conn_to_buf(struct connection *conn, void *xprt_ctx,
-                               struct buffer *buf, size_t count, int flags)
-{
-	size_t try, done = 0;
-
-	if (!conn_ctrl_ready(conn))
-		return 0;
-
-	if (!fd_recv_ready(conn->handle.fd))
-		return 0;
-
-	conn->flags &= ~CO_FL_WAIT_ROOM;
-
-	/* read the largest possible block. For this, we perform only one call
-	 * to recv() unless the buffer wraps and we exactly fill the first hunk,
-	 * in which case we accept to do it once again.
-	 */
-	while (count > 0) {
-		try = b_contig_space(buf);
-		if (!try)
-			break;
-
-		if (try > count)
-			try = count;
-
-		b_add(buf, try);
-		done += try;
-		count -= try;
-	}
-
-	if (unlikely(conn->flags & CO_FL_WAIT_L4_CONN) && done)
-		conn->flags &= ~CO_FL_WAIT_L4_CONN;
-
- leave:
-	return done;
-
- read0:
-	conn_sock_read0(conn);
-	conn->flags &= ~CO_FL_WAIT_L4_CONN;
-
-	/* Now a final check for a possible asynchronous low-level error
-	 * report. This can happen when a connection receives a reset
-	 * after a shutdown, both POLL_HUP and POLL_ERR are queued, and
-	 * we might have come from there by just checking POLL_HUP instead
-	 * of recv()'s return value 0, so we have no way to tell there was
-	 * an error without checking.
-	 */
-	if (unlikely(fdtab[conn->handle.fd].state & FD_POLL_ERR))
-		conn->flags |= CO_FL_ERROR | CO_FL_SOCK_RD_SH | CO_FL_SOCK_WR_SH;
-	goto leave;
-}
-
-
-/* Send up to <count> pending bytes from buffer <buf> to connection <conn>'s
- * socket. <flags> may contain some CO_SFL_* flags to hint the system about
- * other pending data for example, but this flag is ignored at the moment.
- * Only one call to send() is performed, unless the buffer wraps, in which case
- * a second call may be performed. The connection's flags are updated with
- * whatever special event is detected (error, empty). The caller is responsible
- * for taking care of those events and avoiding the call if inappropriate. The
- * function does not call the connection's polling update function, so the caller
- * is responsible for this. It's up to the caller to update the buffer's contents
- * based on the return value.
- */
-static size_t quic_conn_from_buf(struct connection *conn, void *xprt_ctx, const struct buffer *buf, size_t count, int flags)
-{
-	ssize_t ret;
-	size_t try, done;
-	int send_flag;
-	struct quic_conn *qc = ((struct ssl_sock_ctx *)xprt_ctx)->qc;
-
-	done = 0;
-	/* send the largest possible block. For this we perform only one call
-	 * to send() unless the buffer wraps and we exactly fill the first hunk,
-	 * in which case we accept to do it once again.
-	 */
-	while (count) {
-		try = b_contig_data(buf, done);
-		if (try > count)
-			try = count;
-
-		send_flag = MSG_DONTWAIT | MSG_NOSIGNAL;
-		if (try < count || flags & CO_SFL_MSG_MORE)
-			send_flag |= MSG_MORE;
-
-		ret = sendto(qc->li->rx.fd, b_peek(buf, done), try, send_flag,
-		             (struct sockaddr *)&qc->peer_addr, get_addr_len(&qc->peer_addr));
-		if (ret > 0) {
-			count -= ret;
-			done += ret;
-
-			if (ret < try)
-				break;
-		}
-		else if (ret == 0 || errno == EAGAIN || errno == ENOTCONN || errno == EINPROGRESS) {
-			ABORT_NOW();
-		}
-		else if (errno != EINTR) {
-			ABORT_NOW();
-		}
-	}
-
-	if (done > 0) {
-		/* we count the total bytes sent, and the send rate for 32-byte
-		 * blocks. The reason for the latter is that freq_ctr are
-		 * limited to 4GB and that it's not enough per second.
-		 */
-		_HA_ATOMIC_ADD(&global.out_bytes, done);
-		update_freq_ctr(&global.out_32bps, (done + 16) / 32);
-	}
-	return done;
-}
 
 /* Called from the upper layer, to subscribe <es> to events <event_type>. The
  * event subscriber <es> is not allowed to change from a previous call as long
@@ -5336,8 +5220,6 @@ static int qc_xprt_start(struct connection *conn, void *ctx)
 /* transport-layer operations for QUIC connections. */
 static struct xprt_ops ssl_quic = {
 	.close    = quic_close,
-	.snd_buf  = quic_conn_from_buf,
-	.rcv_buf  = quic_conn_to_buf,
 	.subscribe = quic_conn_subscribe,
 	.unsubscribe = quic_conn_unsubscribe,
 	.init     = qc_conn_init,
@@ -5457,7 +5339,7 @@ int quic_lstnr_dgram_dispatch(unsigned char *buf, size_t len, void *owner,
 	struct quic_dgram *dgram;
 	unsigned char *dcid;
 	size_t dcid_len;
-	int tid;
+	int cid_tid;
 	struct listener *l = owner;
 
 	if (!len || !quic_get_dgram_dcid(buf, buf + len, &dcid, &dcid_len))
@@ -5467,7 +5349,8 @@ int quic_lstnr_dgram_dispatch(unsigned char *buf, size_t len, void *owner,
 	if (!dgram)
 		goto err;
 
-	tid = quic_get_cid_tid(dcid);
+	cid_tid = quic_get_cid_tid(dcid);
+
 	/* All the members must be initialized! */
 	dgram->owner = owner;
 	dgram->buf = buf;
@@ -5477,9 +5360,9 @@ int quic_lstnr_dgram_dispatch(unsigned char *buf, size_t len, void *owner,
 	dgram->saddr = *saddr;
 	dgram->qc = NULL;
 	LIST_APPEND(dgrams, &dgram->list);
-	MT_LIST_APPEND(&l->rx.dghdlrs[tid]->dgrams, &dgram->mt_list);
+	MT_LIST_APPEND(&l->rx.dghdlrs[cid_tid]->dgrams, &dgram->mt_list);
 
-	tasklet_wakeup(l->rx.dghdlrs[tid]->task);
+	tasklet_wakeup(l->rx.dghdlrs[cid_tid]->task);
 
 	return 1;
 

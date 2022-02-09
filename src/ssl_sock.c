@@ -1050,8 +1050,31 @@ int ssl_sock_update_ocsp_response(struct buffer *ocsp_response, char **err)
 
 #endif
 
+
+/*
+ * Initialize an HMAC context <hctx> using the <key> and <md> parameters.
+ * Returns -1 in case of error, 1 otherwise.
+ */
+static int ssl_hmac_init(MAC_CTX *hctx, unsigned char *key, int key_len, const EVP_MD *md)
+{
+#ifdef HAVE_OSSL_PARAM
+       OSSL_PARAM params[3];
+
+       params[0] = OSSL_PARAM_construct_octet_string(OSSL_MAC_PARAM_KEY, key, key_len);
+       params[1] = OSSL_PARAM_construct_utf8_string(OSSL_MAC_PARAM_DIGEST, (char*)EVP_MD_name(md), 0);
+       params[2] = OSSL_PARAM_construct_end();
+       if (EVP_MAC_CTX_set_params(hctx, params) == 0)
+               return -1; /* error in mac initialisation */
+
+#else
+       HMAC_Init_ex(hctx, key, key_len, md, NULL);
+#endif
+       return 1;
+}
+
 #if (defined SSL_CTRL_SET_TLSEXT_TICKET_KEY_CB && TLS_TICKETS_NO > 0)
-static int ssl_tlsext_ticket_key_cb(SSL *s, unsigned char key_name[16], unsigned char *iv, EVP_CIPHER_CTX *ectx, HMAC_CTX *hctx, int enc)
+
+static int ssl_tlsext_ticket_key_cb(SSL *s, unsigned char key_name[16], unsigned char *iv, EVP_CIPHER_CTX *ectx, MAC_CTX *hctx, int enc)
 {
 	struct tls_keys_ref *ref;
 	union tls_sess_key *keys;
@@ -1078,7 +1101,8 @@ static int ssl_tlsext_ticket_key_cb(SSL *s, unsigned char key_name[16], unsigned
 			if(!EVP_EncryptInit_ex(ectx, EVP_aes_128_cbc(), NULL, keys[head].key_128.aes_key, iv))
 				goto end;
 
-			HMAC_Init_ex(hctx, keys[head].key_128.hmac_key, 16, TLS_TICKET_HASH_FUNCT(), NULL);
+			if (ssl_hmac_init(hctx, keys[head].key_128.hmac_key, 16, TLS_TICKET_HASH_FUNCT()) < 0)
+				goto end;
 			ret = 1;
 		}
 		else if (ref->key_size_bits == 256 ) {
@@ -1086,7 +1110,8 @@ static int ssl_tlsext_ticket_key_cb(SSL *s, unsigned char key_name[16], unsigned
 			if(!EVP_EncryptInit_ex(ectx, EVP_aes_256_cbc(), NULL, keys[head].key_256.aes_key, iv))
 				goto end;
 
-			HMAC_Init_ex(hctx, keys[head].key_256.hmac_key, 32, TLS_TICKET_HASH_FUNCT(), NULL);
+			if (ssl_hmac_init(hctx,  keys[head].key_256.hmac_key, 32, TLS_TICKET_HASH_FUNCT()) < 0)
+				goto end;
 			ret = 1;
 		}
 	} else {
@@ -1099,14 +1124,16 @@ static int ssl_tlsext_ticket_key_cb(SSL *s, unsigned char key_name[16], unsigned
 
 	  found:
 		if (ref->key_size_bits == 128) {
-			HMAC_Init_ex(hctx, keys[(head + i) % TLS_TICKETS_NO].key_128.hmac_key, 16, TLS_TICKET_HASH_FUNCT(), NULL);
+			if (ssl_hmac_init(hctx, keys[(head + i) % TLS_TICKETS_NO].key_128.hmac_key, 16, TLS_TICKET_HASH_FUNCT()) < 0)
+				goto end;
 			if(!EVP_DecryptInit_ex(ectx, EVP_aes_128_cbc(), NULL, keys[(head + i) % TLS_TICKETS_NO].key_128.aes_key, iv))
 				goto end;
 			/* 2 for key renewal, 1 if current key is still valid */
 			ret = i ? 2 : 1;
 		}
 		else if (ref->key_size_bits == 256) {
-			HMAC_Init_ex(hctx, keys[(head + i) % TLS_TICKETS_NO].key_256.hmac_key, 32, TLS_TICKET_HASH_FUNCT(), NULL);
+			if (ssl_hmac_init(hctx, keys[(head + i) % TLS_TICKETS_NO].key_256.hmac_key, 32, TLS_TICKET_HASH_FUNCT()) < 0)
+				goto end;
 			if(!EVP_DecryptInit_ex(ectx, EVP_aes_256_cbc(), NULL, keys[(head + i) % TLS_TICKETS_NO].key_256.aes_key, iv))
 				goto end;
 			/* 2 for key renewal, 1 if current key is still valid */
@@ -2209,6 +2236,16 @@ ssl_sock_do_create_cert(const char *servername, struct bind_conf *bind_conf, SSL
 #ifndef OPENSSL_NO_DH
 	SSL_CTX_set_tmp_dh_callback(ssl_ctx, ssl_get_tmp_dh);
 #endif
+
+#if (HA_OPENSSL_VERSION_NUMBER >= 0x10101000L)
+#if defined(SSL_CTX_set1_curves_list)
+	{
+		const char *ecdhe = (bind_conf->ssl_conf.ecdhe ? bind_conf->ssl_conf.ecdhe : ECDHE_DEFAULT_CURVE);
+		if (!SSL_CTX_set1_curves_list(ssl_ctx, ecdhe))
+			goto end;
+	}
+#endif
+#else
 #if defined(SSL_CTX_set_tmp_ecdh) && !defined(OPENSSL_NO_ECDH)
 	{
 		const char *ecdhe = (bind_conf->ssl_conf.ecdhe ? bind_conf->ssl_conf.ecdhe : ECDHE_DEFAULT_CURVE);
@@ -2222,7 +2259,8 @@ ssl_sock_do_create_cert(const char *servername, struct bind_conf *bind_conf, SSL
 		SSL_CTX_set_tmp_ecdh(ssl_ctx, ecc);
 		EC_KEY_free(ecc);
 	}
-#endif
+#endif /* defined(SSL_CTX_set_tmp_ecdh) && !defined(OPENSSL_NO_ECDH) */
+#endif /* HA_OPENSSL_VERSION_NUMBER >= 0x10101000L */
  end:
 	return ssl_ctx;
 
@@ -2234,14 +2272,6 @@ ssl_sock_do_create_cert(const char *servername, struct bind_conf *bind_conf, SSL
 	return NULL;
 }
 
-SSL_CTX *
-ssl_sock_create_cert(struct connection *conn, const char *servername, unsigned int key)
-{
-	struct bind_conf *bind_conf = __objt_listener(conn->target)->bind_conf;
-	struct ssl_sock_ctx *ctx = conn->xprt_ctx;
-
-	return ssl_sock_do_create_cert(servername, bind_conf, ctx->ssl);
-}
 
 /* Do a lookup for a certificate in the LRU cache used to store generated
  * certificates and immediately assign it to the SSL session if not null. */
@@ -4593,7 +4623,7 @@ static int ssl_sock_prepare_ctx(struct bind_conf *bind_conf, struct ssl_bind_con
 	}
 #if (defined SSL_CTRL_SET_TLSEXT_TICKET_KEY_CB && TLS_TICKETS_NO > 0)
 	if(bind_conf->keys_ref) {
-		if (!SSL_CTX_set_tlsext_ticket_key_cb(ctx, ssl_tlsext_ticket_key_cb)) {
+		if (!SSL_CTX_set_tlsext_ticket_key_evp_cb(ctx, ssl_tlsext_ticket_key_cb)) {
 			memprintf(err, "%sProxy '%s': unable to set callback for TLS ticket validation for bind '%s' at [%s:%d].\n",
 			          err && *err ? *err : "", curproxy->id, bind_conf->arg, bind_conf->file, bind_conf->line);
 			cfgerr |= ERR_ALERT | ERR_FATAL;
@@ -4685,38 +4715,43 @@ static int ssl_sock_prepare_ctx(struct bind_conf *bind_conf, struct ssl_bind_con
 		}
 		(void)SSL_CTX_set_ecdh_auto(ctx, 1);
 	}
-#endif
-#if defined(SSL_CTX_set_tmp_ecdh) && !defined(OPENSSL_NO_ECDH)
+#endif /* defined(SSL_CTX_set1_curves_list) */
+
 	if (!conf_curves) {
-		int i;
-		EC_KEY  *ecdh;
 #if (HA_OPENSSL_VERSION_NUMBER >= 0x10101000L)
+#if defined(SSL_CTX_set1_curves_list)
 		const char *ecdhe = (ssl_conf && ssl_conf->ecdhe) ? ssl_conf->ecdhe :
 			(bind_conf->ssl_conf.ecdhe ? bind_conf->ssl_conf.ecdhe :
 			 NULL);
 
-		if (ecdhe == NULL) {
-			(void)SSL_CTX_set_ecdh_auto(ctx, 1);
-			return cfgerr;
+		if (ecdhe && SSL_CTX_set1_curves_list(ctx, ecdhe) == 0) {
+			memprintf(err, "%sProxy '%s': unable to set elliptic named curve to '%s' for bind '%s' at [%s:%d].\n",
+				  err && *err ? *err : "", curproxy->id, ecdhe, bind_conf->arg, bind_conf->file, bind_conf->line);
+			cfgerr |= ERR_ALERT | ERR_FATAL;
 		}
+#endif /* defined(SSL_CTX_set1_curves_list) */
 #else
+#if defined(SSL_CTX_set_tmp_ecdh) && !defined(OPENSSL_NO_ECDH)
+		int i;
+		EC_KEY  *ecdh;
+
 		const char *ecdhe = (ssl_conf && ssl_conf->ecdhe) ? ssl_conf->ecdhe :
 			(bind_conf->ssl_conf.ecdhe ? bind_conf->ssl_conf.ecdhe :
 			 ECDHE_DEFAULT_CURVE);
-#endif
 
 		i = OBJ_sn2nid(ecdhe);
 		if (!i || ((ecdh = EC_KEY_new_by_curve_name(i)) == NULL)) {
 			memprintf(err, "%sProxy '%s': unable to set elliptic named curve to '%s' for bind '%s' at [%s:%d].\n",
-			          err && *err ? *err : "", curproxy->id, ecdhe, bind_conf->arg, bind_conf->file, bind_conf->line);
+				  err && *err ? *err : "", curproxy->id, ecdhe, bind_conf->arg, bind_conf->file, bind_conf->line);
 			cfgerr |= ERR_ALERT | ERR_FATAL;
 		}
 		else {
 			SSL_CTX_set_tmp_ecdh(ctx, ecdh);
 			EC_KEY_free(ecdh);
 		}
+#endif /* defined(SSL_CTX_set_tmp_ecdh) && !defined(OPENSSL_NO_ECDH) */
+#endif /* HA_OPENSSL_VERSION_NUMBER >= 0x10101000L */
 	}
-#endif
 
 	return cfgerr;
 }
