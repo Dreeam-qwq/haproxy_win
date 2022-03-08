@@ -28,6 +28,7 @@
 #ifndef _HAPROXY_BUG_H
 #define _HAPROXY_BUG_H
 
+#include <haproxy/atomic.h>
 #include <haproxy/compiler.h>
 
 /* quick debugging hack, should really be removed ASAP */
@@ -37,41 +38,120 @@
 #define DPRINTF(x...)
 #endif
 
+#define DUMP_TRACE() do { extern void ha_backtrace_to_stderr(void); ha_backtrace_to_stderr(); } while (0)
+
 #ifdef DEBUG_USE_ABORT
 /* abort() is better recognized by code analysis tools */
-#define ABORT_NOW() do { extern void ha_backtrace_to_stderr(void); ha_backtrace_to_stderr(); abort(); } while (0)
+#define ABORT_NOW() do { DUMP_TRACE(); abort(); } while (0)
 #else
 /* More efficient than abort() because it does not mangle the
   * stack and stops at the exact location we need.
   */
-#define ABORT_NOW() do { extern void ha_backtrace_to_stderr(void); ha_backtrace_to_stderr(); (*(volatile int*)1=0); } while (0)
+#define ABORT_NOW() do { DUMP_TRACE(); (*(volatile int*)1=0); my_unreachable(); } while (0)
 #endif
 
-/* BUG_ON: complains if <cond> is true when DEBUG_STRICT or DEBUG_STRICT_NOCRASH
- * are set, does nothing otherwise. With DEBUG_STRICT in addition it immediately
- * crashes using ABORT_NOW() above.
+/* This is the generic low-level macro dealing with conditional warnings and
+ * bugs. The caller decides whether to crash or not and what prefix and suffix
+ * to pass. The macro returns the boolean value of the condition as an int for
+ * the case where it wouldn't die. The <crash> flag is made of:
+ *  - crash & 1: crash yes/no;
+ *  - crash & 2: taint as bug instead of warn
  */
-#if defined(DEBUG_STRICT) || defined(DEBUG_STRICT_NOCRASH)
+#define _BUG_ON(cond, file, line, crash, pfx, sfx)			\
+	__BUG_ON(cond, file, line, crash, pfx, sfx)
+
+#define __BUG_ON(cond, file, line, crash, pfx, sfx)                     \
+	(unlikely(cond) ? ({						\
+		complain(NULL, "\n" pfx "condition \"" #cond "\" matched at " file ":" #line "" sfx "\n", crash); \
+		if (crash & 1)						\
+			ABORT_NOW();					\
+		else							\
+			DUMP_TRACE();					\
+		1; /* let's return the true condition */		\
+	}) : 0)
+
+/* This one is equivalent except that it only emits the message once by
+ * maintaining a static counter. This may be used with warnings to detect
+ * certain unexpected conditions in field. Later on, in cores it will be
+ * possible to verify these counters.
+ */
+#define _BUG_ON_ONCE(cond, file, line, crash, pfx, sfx)			\
+	__BUG_ON_ONCE(cond, file, line, crash, pfx, sfx)
+
+#define __BUG_ON_ONCE(cond, file, line, crash, pfx, sfx)                \
+	(unlikely(cond) ? ({						\
+		static int __match_count_##line;			\
+		complain(&__match_count_##line, "\n" pfx "condition \"" #cond "\" matched at " file ":" #line "" sfx "\n", crash); \
+		if (crash & 1)						\
+			ABORT_NOW();					\
+		else							\
+			DUMP_TRACE();					\
+		1; /* let's return the true condition */		\
+	}) : 0)
+
+/* DEBUG_STRICT enables/disables runtime checks on condition <cond>
+ * DEBUG_STRICT_ACTION indicates the level of verification on the rules when
+ * <cond> is true:
+ *
+ *    macro   BUG_ON()    WARN_ON()    CHECK_IF()
+ * value  0    warn         warn         warn
+ *        1    CRASH        warn         warn
+ *        2    CRASH        CRASH        warn
+ *        3    CRASH        CRASH        CRASH
+ */
+
+/* The macros below are for general use */
 #if defined(DEBUG_STRICT)
-#define CRASH_NOW() ABORT_NOW()
+# if defined(DEBUG_STRICT_ACTION) && (DEBUG_STRICT_ACTION < 1)
+/* Lowest level: BUG_ON() warns, WARN_ON() warns, CHECK_IF() warns */
+#  define BUG_ON(cond)       _BUG_ON     (cond, __FILE__, __LINE__, 2, "WARNING: bug ",   " (not crashing but process is untrusted now, please report to developers)")
+#  define WARN_ON(cond)      _BUG_ON     (cond, __FILE__, __LINE__, 0, "WARNING: warn ",  " (please report to developers)")
+#  define CHECK_IF(cond)     _BUG_ON_ONCE(cond, __FILE__, __LINE__, 0, "WARNING: check ", " (please report to developers)")
+# elif !defined(DEBUG_STRICT_ACTION) || (DEBUG_STRICT_ACTION == 1)
+/* default level: BUG_ON() crashes, WARN_ON() warns, CHECK_IF() warns */
+#  define BUG_ON(cond)       _BUG_ON     (cond, __FILE__, __LINE__, 3, "FATAL: bug ",     "")
+#  define WARN_ON(cond)      _BUG_ON     (cond, __FILE__, __LINE__, 0, "WARNING: warn ",  " (please report to developers)")
+#  define CHECK_IF(cond)     _BUG_ON_ONCE(cond, __FILE__, __LINE__, 0, "WARNING: check ", " (please report to developers)")
+# elif defined(DEBUG_STRICT_ACTION) && (DEBUG_STRICT_ACTION == 2)
+/* Stricter level: BUG_ON() crashes, WARN_ON() crashes, CHECK_IF() warns */
+#  define BUG_ON(cond)       _BUG_ON     (cond, __FILE__, __LINE__, 3, "FATAL: bug ",     "")
+#  define WARN_ON(cond)      _BUG_ON     (cond, __FILE__, __LINE__, 1, "FATAL: warn ",    "")
+#  define CHECK_IF(cond)     _BUG_ON_ONCE(cond, __FILE__, __LINE__, 0, "WARNING: check ", " (please report to developers)")
+# elif defined(DEBUG_STRICT_ACTION) && (DEBUG_STRICT_ACTION >= 3)
+/* Developer/CI level: BUG_ON() crashes, WARN_ON() crashes, CHECK_IF() crashes */
+#  define BUG_ON(cond)       _BUG_ON     (cond, __FILE__, __LINE__, 3, "FATAL: bug ",     "")
+#  define WARN_ON(cond)      _BUG_ON     (cond, __FILE__, __LINE__, 1, "FATAL: warn ",    "")
+#  define CHECK_IF(cond)     _BUG_ON_ONCE(cond, __FILE__, __LINE__, 1, "FATAL: check ",   "")
+# endif
 #else
-#define CRASH_NOW() do { extern void ha_backtrace_to_stderr(void); ha_backtrace_to_stderr(); } while (0)
+#  define BUG_ON(cond)
+#  define WARN_ON(cond)
+#  define CHECK_IF(cond)
 #endif
 
-#define BUG_ON(cond) _BUG_ON(cond, __FILE__, __LINE__)
-#define _BUG_ON(cond, file, line) __BUG_ON(cond, file, line)
-#define __BUG_ON(cond, file, line)                                             \
-	do {                                                                   \
-		if (unlikely(cond)) {					       \
-			const char msg[] = "\nFATAL: bug condition \"" #cond "\" matched at " file ":" #line "\n"; \
-			DISGUISE(write(2, msg, __builtin_strlen(msg)));        \
-			CRASH_NOW();                                           \
-		}                                                              \
-	} while (0)
+/* These macros are only for hot paths and remain disabled unless DEBUG_STRICT is 2 or above.
+ * Only developers/CI should use these levels as they may significantly impact performance by
+ * enabling checks in sensitive areas.
+ */
+#if defined(DEBUG_STRICT) && (DEBUG_STRICT > 1)
+# if defined(DEBUG_STRICT_ACTION) && (DEBUG_STRICT_ACTION < 1)
+/* Lowest level: BUG_ON() warns, CHECK_IF() warns */
+#  define BUG_ON_HOT(cond)   _BUG_ON_ONCE(cond, __FILE__, __LINE__, 2, "WARNING: bug ",   " (not crashing but process is untrusted now, please report to developers)")
+#  define CHECK_IF_HOT(cond) _BUG_ON_ONCE(cond, __FILE__, __LINE__, 0, "WARNING: check ", " (please report to developers)")
+# elif !defined(DEBUG_STRICT_ACTION) || (DEBUG_STRICT_ACTION < 3)
+/* default level: BUG_ON() crashes, CHECK_IF() warns */
+#  define BUG_ON_HOT(cond)   _BUG_ON     (cond, __FILE__, __LINE__, 3, "FATAL: bug ",     "")
+#  define CHECK_IF_HOT(cond) _BUG_ON_ONCE(cond, __FILE__, __LINE__, 0, "WARNING: check ", " (please report to developers)")
+# elif defined(DEBUG_STRICT_ACTION) && (DEBUG_STRICT_ACTION >= 3)
+/* Developer/CI level: BUG_ON() crashes, CHECK_IF() crashes */
+#  define BUG_ON_HOT(cond)   _BUG_ON     (cond, __FILE__, __LINE__, 3, "FATAL: bug ",     "")
+#  define CHECK_IF_HOT(cond) _BUG_ON_ONCE(cond, __FILE__, __LINE__, 1, "FATAL: check ",   "")
+# endif
 #else
-#undef CRASH_NOW
-#define BUG_ON(cond)
+#  define BUG_ON_HOT(cond)
+#  define CHECK_IF_HOT(cond)
 #endif
+
 
 /* When not optimizing, clang won't remove that code, so only compile it in when optimizing */
 #if defined(__GNUC__) && defined(__OPTIMIZE__)
@@ -96,6 +176,32 @@
 		free(*__x);						\
 		*__x = NULL;						\
 	} while (0)
+
+
+/* handle 'tainted' status */
+enum tainted_flags {
+	TAINTED_CONFIG_EXP_KW_DECLARED = 0x00000001,
+	TAINTED_ACTION_EXP_EXECUTED    = 0x00000002,
+	TAINTED_CLI_EXPERT_MODE        = 0x00000004,
+	TAINTED_CLI_EXPERIMENTAL_MODE  = 0x00000008,
+	TAINTED_WARN                   = 0x00000010, /* a WARN_ON triggered */
+	TAINTED_BUG                    = 0x00000020, /* a BUG_ON triggered */
+};
+
+/* this is a bit field made of TAINTED_*, and is declared in haproxy.c */
+extern unsigned int tainted;
+
+void complain(int *counter, const char *msg, int taint);
+
+static inline void mark_tainted(const enum tainted_flags flag)
+{
+	HA_ATOMIC_OR(&tainted, flag);
+}
+
+static inline unsigned int get_tainted()
+{
+	return HA_ATOMIC_LOAD(&tainted);
+}
 
 #if defined(DEBUG_MEM_STATS)
 #include <stdlib.h>

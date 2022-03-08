@@ -233,7 +233,9 @@ static void check_trace(enum trace_level level, uint64_t mask,
 
 
 	if (check->cs) {
-		chunk_appendf(&trace_buf, " - conn=%p(0x%08x)", check->cs->conn, check->cs->conn->flags);
+		struct connection *conn = cs_conn(check->cs);
+
+		chunk_appendf(&trace_buf, " - conn=%p(0x%08x)", conn, conn ? conn->flags : 0);
 		chunk_appendf(&trace_buf, " cs=%p(0x%08x)", check->cs, check->cs->flags);
 	}
 
@@ -791,7 +793,7 @@ void chk_report_conn_err(struct check *check, int errno_bck, int expired)
 		retrieve_errno_from_socket(conn);
 
 	if (conn && !(conn->flags & CO_FL_ERROR) &&
-	    !(cs->flags & CS_FL_ERROR) && !expired)
+	    cs && !(cs->flags & CS_FL_ERROR) && !expired)
 		return;
 
 	TRACE_ENTER(CHK_EV_HCHK_END|CHK_EV_HCHK_ERR, check, 0, 0, (size_t[]){expired});
@@ -904,7 +906,7 @@ void chk_report_conn_err(struct check *check, int errno_bck, int expired)
 		set_server_check_status(check, HCHK_STATUS_SOCKERR, err_msg);
 	}
 
-	if (!conn || !conn->ctrl) {
+	if (!cs || !conn || !conn->ctrl) {
 		/* error before any connection attempt (connection allocation error or no control layer) */
 		set_server_check_status(check, HCHK_STATUS_SOCKERR, err_msg);
 	}
@@ -1016,8 +1018,8 @@ int httpchk_build_status_header(struct server *s, struct buffer *buf)
  */
 static int wake_srv_chk(struct conn_stream *cs)
 {
-	struct connection *conn = cs->conn;
-	struct check *check = cs->data;
+	struct connection *conn;
+	struct check *check = __cs_check(cs);
 	struct email_alertq *q = container_of(check, typeof(*q), check);
 	int ret = 0;
 
@@ -1031,9 +1033,9 @@ static int wake_srv_chk(struct conn_stream *cs)
 	ret = tcpcheck_main(check);
 
 	cs = check->cs;
-	conn = cs->conn;
+	conn = cs_conn(cs);
 
-	if (unlikely(conn->flags & CO_FL_ERROR || cs->flags & CS_FL_ERROR)) {
+	if (unlikely(!conn || !cs || conn->flags & CO_FL_ERROR || cs->flags & CS_FL_ERROR)) {
 		/* We may get error reports bypassing the I/O handlers, typically
 		 * the case when sending a pure TCP check which fails, then the I/O
 		 * handlers above are not called. This is completely handled by the
@@ -1053,7 +1055,7 @@ static int wake_srv_chk(struct conn_stream *cs)
 		ret = -1;
 
 		if (check->wait_list.events)
-			cs->conn->mux->unsubscribe(cs, check->wait_list.events, &check->wait_list);
+			conn->mux->unsubscribe(cs, check->wait_list.events, &check->wait_list);
 
 		/* We may have been scheduled to run, and the
 		 * I/O handler expects to have a cs, so remove
@@ -1092,7 +1094,6 @@ struct task *process_chk_conn(struct task *t, void *context, unsigned int state)
 {
 	struct check *check = context;
 	struct proxy *proxy = check->proxy;
-	struct conn_stream *cs;
 	struct connection *conn;
 	int rv;
 	int expired = tick_is_expired(t->expire, now_ms);
@@ -1135,8 +1136,7 @@ struct task *process_chk_conn(struct task *t, void *context, unsigned int state)
 		expired = 0;
 	}
 
-	cs = check->cs;
-	conn = cs_conn(cs);
+	conn = cs_conn(check->cs);
 
 	/* there was a test running.
 	 * First, let's check whether there was an uncaught error,
@@ -1146,17 +1146,15 @@ struct task *process_chk_conn(struct task *t, void *context, unsigned int state)
 		/* Here the connection must be defined. Otherwise the
 		 * error would have already been detected
 		 */
-		if ((conn && ((conn->flags & CO_FL_ERROR) || (cs->flags & CS_FL_ERROR))) || expired) {
+		if ((conn && ((conn->flags & CO_FL_ERROR) || (check->cs->flags & CS_FL_ERROR))) || expired) {
 			TRACE_ERROR("report connection error", CHK_EV_TASK_WAKE|CHK_EV_HCHK_END|CHK_EV_HCHK_ERR, check);
 			chk_report_conn_err(check, 0, expired);
 		}
 		else {
 			if (check->state & CHK_ST_CLOSE_CONN) {
 				TRACE_DEVEL("closing current connection", CHK_EV_TASK_WAKE|CHK_EV_HCHK_RUN, check);
-				cs_destroy(cs);
-				cs = NULL;
+				cs_detach_endp(check->cs);
 				conn = NULL;
-				check->cs = NULL;
 				check->state &= ~CHK_ST_CLOSE_CONN;
 				tcpcheck_main(check);
 			}
@@ -1171,6 +1169,7 @@ struct task *process_chk_conn(struct task *t, void *context, unsigned int state)
 	TRACE_STATE("health-check complete or aborted", CHK_EV_TASK_WAKE|CHK_EV_HCHK_END, check);
 
 	check->current_step = NULL;
+	conn = cs_conn(check->cs);
 
 	if (conn && conn->xprt) {
 		/* The check was aborted and the connection was not yet closed.
@@ -1178,21 +1177,18 @@ struct task *process_chk_conn(struct task *t, void *context, unsigned int state)
 		 * as a failed response coupled with "observe layer7" caused the
 		 * server state to be suddenly changed.
 		 */
-		cs_drain_and_close(cs);
+		cs_drain_and_close(check->cs);
 	}
 
-	if (cs) {
-		if (check->wait_list.events)
-			cs->conn->mux->unsubscribe(cs, check->wait_list.events, &check->wait_list);
-		/* We may have been scheduled to run, and the
-		 * I/O handler expects to have a cs, so remove
-		 * the tasklet
-		 */
-		tasklet_remove_from_tasklet_list(check->wait_list.tasklet);
-		cs_destroy(cs);
-		cs = check->cs = NULL;
-		conn = NULL;
-	}
+	/* TODO: must be handled by cs_detach_endp */
+	if (conn && check->wait_list.events)
+		conn->mux->unsubscribe(check->cs, check->wait_list.events, &check->wait_list);
+	/* We may have been scheduled to run, and the
+	 * I/O handler expects to have a cs, so remove
+	 * the tasklet
+	 */
+	tasklet_remove_from_tasklet_list(check->wait_list.tasklet);
+	cs_detach_endp(check->cs);
 
 	if (check->sess != NULL) {
 		vars_prune(&check->vars, check->sess, NULL);
@@ -1352,8 +1348,8 @@ void free_check(struct check *check)
 	check_release_buf(check, &check->bi);
 	check_release_buf(check, &check->bo);
 	if (check->cs) {
-		ha_free(&check->cs->conn);
-		cs_free(check->cs);
+		cs_detach_endp(check->cs);
+		cs_detach_app(check->cs);
 		check->cs = NULL;
 	}
 }
@@ -1392,14 +1388,17 @@ int start_check_task(struct check *check, int mininter,
 	/* task for the check. Process-based checks exclusively run on thread 1. */
 	if (check->type == PR_O2_EXT_CHK)
 		t = task_new_on(0);
-	else
+	else {
+		check->cs = cs_new();
+		if (!check->cs)
+			goto fail_alloc_cs;
+		if (cs_attach_app(check->cs, &check->obj_type) < 0)
+			goto fail_attach_cs;
 		t = task_new_anywhere();
-
-	if (!t) {
-		ha_alert("Starting [%s:%s] check: out of memory.\n",
-			 check->server->proxy->id, check->server->id);
-		return 0;
 	}
+
+	if (!t)
+		goto fail_alloc_task;
 
 	check->task = t;
 	t->process = process_chk;
@@ -1417,6 +1416,14 @@ int start_check_task(struct check *check, int mininter,
 	task_queue(t);
 
 	return 1;
+
+  fail_alloc_task:
+  fail_attach_cs:
+	cs_free(check->cs);
+  fail_alloc_cs:
+	ha_alert("Starting [%s:%s] check: out of memory.\n",
+		 check->server->proxy->id, check->server->id);
+	return 0;
 }
 
 /*

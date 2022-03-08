@@ -467,11 +467,15 @@ struct ssl_engine_list {
 
 #ifndef OPENSSL_NO_DH
 static int ssl_dh_ptr_index = -1;
-static DH *global_dh = NULL;
-static DH *local_dh_1024 = NULL;
-static DH *local_dh_2048 = NULL;
-static DH *local_dh_4096 = NULL;
-static DH *ssl_get_tmp_dh(SSL *ssl, int export, int keylen);
+static HASSL_DH *global_dh = NULL;
+static HASSL_DH *local_dh_1024 = NULL;
+static HASSL_DH *local_dh_2048 = NULL;
+static HASSL_DH *local_dh_4096 = NULL;
+#if (HA_OPENSSL_VERSION_NUMBER < 0x3000000fL)
+static DH *ssl_get_tmp_dh_cbk(SSL *ssl, int export, int keylen);
+#else
+static void ssl_sock_set_tmp_dh_from_pkey(SSL_CTX *ctx, EVP_PKEY *pkey);
+#endif
 #endif /* OPENSSL_NO_DH */
 
 #if (defined SSL_CTRL_SET_TLSEXT_HOSTNAME && !defined SSL_NO_GENERATE_CERTIFICATES)
@@ -608,12 +612,15 @@ static forceinline void ssl_sock_dump_errors(struct connection *conn)
 
 	if (unlikely(global.mode & MODE_DEBUG)) {
 		while(1) {
+			const char *func = NULL;
+			ERR_peek_error_func(&func);
+
 			ret = ERR_get_error();
 			if (ret == 0)
 				return;
 			fprintf(stderr, "fd[%#x] OpenSSL error[0x%lx] %s: %s\n",
 			        conn->handle.fd, ret,
-			        ERR_func_error_string(ret), ERR_reason_error_string(ret));
+			        func, ERR_reason_error_string(ret));
 		}
 	}
 }
@@ -2234,7 +2241,11 @@ ssl_sock_do_create_cert(const char *servername, struct bind_conf *bind_conf, SSL
 	if (newcrt) X509_free(newcrt);
 
 #ifndef OPENSSL_NO_DH
-	SSL_CTX_set_tmp_dh_callback(ssl_ctx, ssl_get_tmp_dh);
+#if (HA_OPENSSL_VERSION_NUMBER < 0x3000000fL)
+	SSL_CTX_set_tmp_dh_callback(ssl_ctx, ssl_get_tmp_dh_cbk);
+#else
+	ssl_sock_set_tmp_dh_from_pkey(ssl_ctx, pkey);
+#endif
 #endif
 
 #if (HA_OPENSSL_VERSION_NUMBER >= 0x10101000L)
@@ -2896,7 +2907,47 @@ static int ssl_sock_switchctx_cbk(SSL *ssl, int *al, void *priv)
 
 #ifndef OPENSSL_NO_DH
 
-static DH * ssl_get_dh_1024(void)
+static inline HASSL_DH *ssl_new_dh_fromdata(BIGNUM *p, BIGNUM *g)
+{
+#if (HA_OPENSSL_VERSION_NUMBER >= 0x3000000fL)
+	OSSL_PARAM_BLD *tmpl = NULL;
+	OSSL_PARAM *params = NULL;
+	EVP_PKEY_CTX *ctx = NULL;
+	EVP_PKEY *pkey = NULL;
+
+	if ((tmpl = OSSL_PARAM_BLD_new()) == NULL
+	    || !OSSL_PARAM_BLD_push_BN(tmpl, OSSL_PKEY_PARAM_FFC_P, p)
+	    || !OSSL_PARAM_BLD_push_BN(tmpl, OSSL_PKEY_PARAM_FFC_G, g)
+	    || (params = OSSL_PARAM_BLD_to_param(tmpl)) == NULL) {
+		goto end;
+	}
+	ctx = EVP_PKEY_CTX_new_from_name(NULL, "DH", NULL);
+	if (ctx == NULL
+	    || !EVP_PKEY_fromdata_init(ctx)
+	    || !EVP_PKEY_fromdata(ctx, &pkey, EVP_PKEY_KEY_PARAMETERS, params)) {
+		goto end;
+	}
+
+end:
+	EVP_PKEY_CTX_free(ctx);
+	OSSL_PARAM_free(params);
+	OSSL_PARAM_BLD_free(tmpl);
+	return pkey;
+#else
+
+	HASSL_DH *dh = DH_new();
+
+	if (!dh)
+		return NULL;
+
+	DH_set0_pqg(dh, p, NULL, g);
+
+	return dh;
+#endif
+}
+
+
+static HASSL_DH * ssl_get_dh_1024(void)
 {
 	static unsigned char dh1024_p[]={
 		0xFA,0xF9,0x2A,0x22,0x2A,0xA7,0x7F,0xE1,0x67,0x4E,0x53,0xF7,
@@ -2917,22 +2968,19 @@ static DH * ssl_get_dh_1024(void)
 
 	BIGNUM *p;
 	BIGNUM *g;
-	DH *dh = DH_new();
-	if (dh) {
-		p = BN_bin2bn(dh1024_p, sizeof dh1024_p, NULL);
-		g = BN_bin2bn(dh1024_g, sizeof dh1024_g, NULL);
 
-		if (!p || !g) {
-			DH_free(dh);
-			dh = NULL;
-		} else {
-			DH_set0_pqg(dh, p, NULL, g);
-		}
-	}
+	HASSL_DH *dh = NULL;
+
+	p = BN_bin2bn(dh1024_p, sizeof dh1024_p, NULL);
+	g = BN_bin2bn(dh1024_g, sizeof dh1024_g, NULL);
+
+	if (p && g)
+		dh = ssl_new_dh_fromdata(p, g);
+
 	return dh;
 }
 
-static DH *ssl_get_dh_2048(void)
+static HASSL_DH *ssl_get_dh_2048(void)
 {
 	static unsigned char dh2048_p[]={
 		0xEC,0x86,0xF8,0x70,0xA0,0x33,0x16,0xEC,0x05,0x1A,0x73,0x59,
@@ -2964,22 +3012,19 @@ static DH *ssl_get_dh_2048(void)
 
 	BIGNUM *p;
 	BIGNUM *g;
-	DH *dh = DH_new();
-	if (dh) {
-		p = BN_bin2bn(dh2048_p, sizeof dh2048_p, NULL);
-		g = BN_bin2bn(dh2048_g, sizeof dh2048_g, NULL);
 
-		if (!p || !g) {
-			DH_free(dh);
-			dh = NULL;
-		} else {
-			DH_set0_pqg(dh, p, NULL, g);
-		}
-	}
+	HASSL_DH *dh = NULL;
+
+	p = BN_bin2bn(dh2048_p, sizeof dh2048_p, NULL);
+	g = BN_bin2bn(dh2048_g, sizeof dh2048_g, NULL);
+
+	if (p && g)
+		dh = ssl_new_dh_fromdata(p, g);
+
 	return dh;
 }
 
-static DH *ssl_get_dh_4096(void)
+static HASSL_DH *ssl_get_dh_4096(void)
 {
 	static unsigned char dh4096_p[]={
 		0xDE,0x16,0x94,0xCD,0x99,0x58,0x07,0xF1,0xF7,0x32,0x96,0x11,
@@ -3032,28 +3077,23 @@ static DH *ssl_get_dh_4096(void)
 
 	BIGNUM *p;
 	BIGNUM *g;
-	DH *dh = DH_new();
-	if (dh) {
-		p = BN_bin2bn(dh4096_p, sizeof dh4096_p, NULL);
-		g = BN_bin2bn(dh4096_g, sizeof dh4096_g, NULL);
 
-		if (!p || !g) {
-			DH_free(dh);
-			dh = NULL;
-		} else {
-			DH_set0_pqg(dh, p, NULL, g);
-		}
-	}
+	HASSL_DH *dh = NULL;
+
+	p = BN_bin2bn(dh4096_p, sizeof dh4096_p, NULL);
+	g = BN_bin2bn(dh4096_g, sizeof dh4096_g, NULL);
+
+	if (p && g)
+		dh = ssl_new_dh_fromdata(p, g);
+
 	return dh;
 }
 
-/* Returns Diffie-Hellman parameters matching the private key length
-   but not exceeding global_ssl.default_dh_param */
-static DH *ssl_get_tmp_dh(SSL *ssl, int export, int keylen)
+static HASSL_DH *ssl_get_tmp_dh(EVP_PKEY *pkey)
 {
-	DH *dh = NULL;
-	EVP_PKEY *pkey = SSL_get_privatekey(ssl);
+	HASSL_DH *dh = NULL;
 	int type;
+	int keylen = 0;
 
 	type = pkey ? EVP_PKEY_base_id(pkey) : EVP_PKEY_NONE;
 
@@ -3069,21 +3109,103 @@ static DH *ssl_get_tmp_dh(SSL *ssl, int export, int keylen)
 	}
 
 	if (keylen >= 4096) {
+		if (!local_dh_4096)
+			local_dh_4096 = ssl_get_dh_4096();
 		dh = local_dh_4096;
 	}
 	else if (keylen >= 2048) {
+		if (!local_dh_2048)
+			local_dh_2048 = ssl_get_dh_2048();
 		dh = local_dh_2048;
 	}
 	else {
+		if (!local_dh_1024)
+			local_dh_1024 = ssl_get_dh_1024();
 		dh = local_dh_1024;
 	}
 
 	return dh;
 }
 
-static DH * ssl_sock_get_dh_from_file(const char *filename)
+#if (HA_OPENSSL_VERSION_NUMBER < 0x3000000fL)
+/* Returns Diffie-Hellman parameters matching the private key length
+   but not exceeding global_ssl.default_dh_param */
+static HASSL_DH *ssl_get_tmp_dh_cbk(SSL *ssl, int export, int keylen)
 {
-	DH *dh = NULL;
+	EVP_PKEY *pkey = SSL_get_privatekey(ssl);
+
+	return ssl_get_tmp_dh(pkey);
+}
+#endif
+
+static int ssl_sock_set_tmp_dh(SSL_CTX *ctx, HASSL_DH *dh)
+{
+#if (HA_OPENSSL_VERSION_NUMBER < 0x3000000fL)
+	return SSL_CTX_set_tmp_dh(ctx, dh);
+#else
+	int retval = 0;
+	HASSL_DH_up_ref(dh);
+
+	retval = SSL_CTX_set0_tmp_dh_pkey(ctx, dh);
+
+	if (!retval)
+		HASSL_DH_free(dh);
+
+	return retval;
+#endif
+}
+
+#if (HA_OPENSSL_VERSION_NUMBER >= 0x3000000fL)
+static void ssl_sock_set_tmp_dh_from_pkey(SSL_CTX *ctx, EVP_PKEY *pkey)
+{
+	HASSL_DH *dh = NULL;
+	if (pkey && (dh = ssl_get_tmp_dh(pkey))) {
+		HASSL_DH_up_ref(dh);
+		if (!SSL_CTX_set0_tmp_dh_pkey(ctx, dh))
+			HASSL_DH_free(dh);
+	}
+	else
+		SSL_CTX_set_dh_auto(ctx, 1);
+}
+#endif
+
+HASSL_DH *ssl_sock_get_dh_from_bio(BIO *bio)
+{
+#if (HA_OPENSSL_VERSION_NUMBER >= 0x3000000fL)
+	HASSL_DH *dh = NULL;
+	OSSL_DECODER_CTX *dctx = NULL;
+	const char *format = "PEM";
+	const char *keytype = "DH";
+
+	dctx = OSSL_DECODER_CTX_new_for_pkey(&dh, format, NULL, keytype,
+					     OSSL_KEYMGMT_SELECT_DOMAIN_PARAMETERS,
+					     NULL, NULL);
+
+	if (dctx == NULL || OSSL_DECODER_CTX_get_num_decoders(dctx) == 0)
+		goto end;
+
+	/* The DH parameters might not be the first section found in the PEM
+	 * file so we need to iterate over all of them until we find the right
+	 * one.
+	 */
+	while (!BIO_eof(bio) && !dh)
+		OSSL_DECODER_from_bio(dctx, bio);
+
+end:
+	OSSL_DECODER_CTX_free(dctx);
+	return dh;
+#else
+	HASSL_DH *dh = NULL;
+
+	dh = PEM_read_bio_DHparams(bio, NULL, NULL, NULL);
+
+	return dh;
+#endif
+}
+
+static HASSL_DH * ssl_sock_get_dh_from_file(const char *filename)
+{
+	HASSL_DH *dh = NULL;
 	BIO *in = BIO_new(BIO_s_file());
 
 	if (in == NULL)
@@ -3092,7 +3214,7 @@ static DH * ssl_sock_get_dh_from_file(const char *filename)
 	if (BIO_read_filename(in, filename) <= 0)
 		goto end;
 
-	dh = PEM_read_bio_DHparams(in, NULL, NULL, NULL);
+	dh = ssl_sock_get_dh_from_bio(in);
 
 end:
         if (in)
@@ -3241,11 +3363,11 @@ static int ssl_sock_load_dh_params(SSL_CTX *ctx, const struct cert_key_and_chain
                                    const char *path, char **err)
 {
 	int ret = 0;
-	DH *dh = NULL;
+	HASSL_DH *dh = NULL;
 
 	if (ckch && ckch->dh) {
 		dh = ckch->dh;
-		if (!SSL_CTX_set_tmp_dh(ctx, dh)) {
+		if (!ssl_sock_set_tmp_dh(ctx, dh)) {
 			memprintf(err, "%sunable to load the DH parameter specified in '%s'",
 				  err && *err ? *err : "", path);
 #if defined(SSL_CTX_set_dh_auto)
@@ -3267,7 +3389,7 @@ static int ssl_sock_load_dh_params(SSL_CTX *ctx, const struct cert_key_and_chain
 		}
 	}
 	else if (global_dh) {
-		if (!SSL_CTX_set_tmp_dh(ctx, global_dh)) {
+		if (!ssl_sock_set_tmp_dh(ctx, global_dh)) {
 			memprintf(err, "%sunable to use the global DH parameter for certificate '%s'",
 				  err && *err ? *err : "", path);
 #if defined(SSL_CTX_set_dh_auto)
@@ -3298,7 +3420,7 @@ static int ssl_sock_load_dh_params(SSL_CTX *ctx, const struct cert_key_and_chain
 				goto end;
 			}
 
-			if (!SSL_CTX_set_tmp_dh(ctx, local_dh_1024)) {
+			if (!ssl_sock_set_tmp_dh(ctx, local_dh_1024)) {
 				memprintf(err, "%sunable to load default 1024 bits DH parameter for certificate '%s'.\n",
 					  err && *err ? *err : "", path);
 #if defined(SSL_CTX_set_dh_auto)
@@ -3314,7 +3436,11 @@ static int ssl_sock_load_dh_params(SSL_CTX *ctx, const struct cert_key_and_chain
 			}
 		}
 		else {
-			SSL_CTX_set_tmp_dh_callback(ctx, ssl_get_tmp_dh);
+#if (HA_OPENSSL_VERSION_NUMBER < 0x3000000fL)
+			SSL_CTX_set_tmp_dh_callback(ctx, ssl_get_tmp_dh_cbk);
+#else
+			ssl_sock_set_tmp_dh_from_pkey(ctx, ckch ? ckch->key : NULL);
+#endif
 		}
 	}
 
@@ -4651,17 +4777,6 @@ static int ssl_sock_prepare_ctx(struct bind_conf *bind_conf, struct ssl_bind_con
 #endif
 
 #ifndef OPENSSL_NO_DH
-	/* If tune.ssl.default-dh-param has not been set,
-	   neither has ssl-default-dh-file and no static DH
-	   params were in the certificate file. */
-	if (global_ssl.default_dh_param == 0 &&
-	    global_dh == NULL &&
-	    (ssl_dh_ptr_index == -1 ||
-	     SSL_CTX_get_ex_data(ctx, ssl_dh_ptr_index) == NULL)) {
-		/* default to dh-param 2048 */
-		global_ssl.default_dh_param = 2048;
-	}
-
 	if (global_ssl.default_dh_param >= 1024) {
 		if (local_dh_1024 == NULL) {
 			local_dh_1024 = ssl_get_dh_1024();
@@ -7080,7 +7195,7 @@ static inline int cli_io_handler_tlskeys_entries(struct appctx *appctx) {
  */
 static int cli_io_handler_tlskeys_files(struct appctx *appctx) {
 
-	struct stream_interface *si = appctx->owner;
+	struct stream_interface *si = cs_si(appctx->owner);
 
 	switch (appctx->st2) {
 	case STAT_ST_INIT:
@@ -7356,7 +7471,7 @@ static int cli_io_handler_show_ocspresponse(struct appctx *appctx)
 	struct buffer *trash = alloc_trash_chunk();
 	struct buffer *tmp = NULL;
 	struct ebmb_node *node;
-	struct stream_interface *si = appctx->owner;
+	struct stream_interface *si = cs_si(appctx->owner);
 	struct certificate_ocsp *ocsp = NULL;
 	BIO *bio = NULL;
 	int write = -1;
@@ -7396,9 +7511,12 @@ static int cli_io_handler_show_ocspresponse(struct appctx *appctx)
 
 		/* Decode the certificate ID (serialized into the key). */
 		d2i_OCSP_CERTID(&certid, &p, ocsp->key_length);
+		if (!certid)
+			goto end;
 
 		/* Dump the CERTID info */
 		ocsp_certid_print(bio, certid, 1);
+		OCSP_CERTID_free(certid);
 		write = BIO_read(bio, tmp->area, tmp->size-1);
 		/* strip trailing LFs */
 		while (write > 0 && tmp->area[write-1] == '\n')
@@ -7452,6 +7570,7 @@ int ssl_ocsp_response_print(struct buffer *ocsp_response, struct buffer *out)
 	int write = -1;
 	OCSP_RESPONSE *resp;
 	const unsigned char *p;
+	int retval = -1;
 
 	if (!ocsp_response)
 		return -1;
@@ -7464,7 +7583,7 @@ int ssl_ocsp_response_print(struct buffer *ocsp_response, struct buffer *out)
 	resp = d2i_OCSP_RESPONSE(NULL, &p, ocsp_response->data);
 	if (!resp) {
 		chunk_appendf(out, "Unable to parse OCSP response");
-		return -1;
+		goto end;
 	}
 
 	if (OCSP_RESPONSE_print(bio, resp, 0) != 0) {
@@ -7474,6 +7593,8 @@ int ssl_ocsp_response_print(struct buffer *ocsp_response, struct buffer *out)
 		static struct ist double_lf = IST("\n\n");
 
 		write = BIO_read(bio, trash->area, trash->size - 1);
+		if (write <= 0)
+			goto end;
 		trash->data = write;
 
 		/* Look for empty lines in the 'trash' buffer and add a space to
@@ -7504,13 +7625,16 @@ int ssl_ocsp_response_print(struct buffer *ocsp_response, struct buffer *out)
 			ist_double_lf = istist(ist_block, double_lf);
 		}
 
-		b_istput(out, ist_block);
+		retval = (b_istput(out, ist_block) <= 0);
 	}
 
+end:
 	if (bio)
 		BIO_free(bio);
 
-	return 0;
+	OCSP_RESPONSE_free(resp);
+
+	return retval;
 }
 
 /*
@@ -7534,14 +7658,17 @@ static int cli_io_handler_show_ocspresponse_detail(struct appctx *appctx)
 {
 	struct buffer *trash = alloc_trash_chunk();
 	struct certificate_ocsp *ocsp = NULL;
-	struct stream_interface *si = appctx->owner;
+	struct stream_interface *si = cs_si(appctx->owner);
 
 	ocsp = appctx->ctx.cli.p0;
 
 	if (trash == NULL)
 		return 1;
 
-	ssl_ocsp_response_print(&ocsp->response, trash);
+	if (ssl_ocsp_response_print(&ocsp->response, trash)) {
+		free_trash_chunk(trash);
+		return 1;
+	}
 
 	if (ci_putchk(si_ic(si), trash) == -1) {
 		si_rx_room_blk(si);
@@ -7608,7 +7735,7 @@ enum act_return ssl_action_wait_for_hs(struct act_rule *rule, struct proxy *px,
 	struct conn_stream *cs;
 
 	conn = objt_conn(sess->origin);
-	cs = objt_cs(s->si[0].end);
+	cs = s->csf;
 
 	if (conn && cs) {
 		if (conn->flags & (CO_FL_EARLY_SSL_HS | CO_FL_SSL_WAIT_HS)) {
@@ -7783,8 +7910,10 @@ static void __ssl_sock_init(void)
 #ifndef OPENSSL_NO_ENGINE
 	hap_register_post_deinit(ssl_free_engines);
 #endif
+#if HA_OPENSSL_VERSION_NUMBER < 0x3000000fL
 	/* Load SSL string for the verbose & debug mode. */
 	ERR_load_SSL_strings();
+#endif
 	ha_meth = BIO_meth_new(0x666, "ha methods");
 	BIO_meth_set_write(ha_meth, ha_ssl_write);
 	BIO_meth_set_read(ha_meth, ha_ssl_read);
@@ -7871,19 +8000,19 @@ void ssl_free_engines(void) {
 #ifndef OPENSSL_NO_DH
 void ssl_free_dh(void) {
 	if (local_dh_1024) {
-		DH_free(local_dh_1024);
+		HASSL_DH_free(local_dh_1024);
 		local_dh_1024 = NULL;
 	}
 	if (local_dh_2048) {
-		DH_free(local_dh_2048);
+		HASSL_DH_free(local_dh_2048);
 		local_dh_2048 = NULL;
 	}
 	if (local_dh_4096) {
-		DH_free(local_dh_4096);
+		HASSL_DH_free(local_dh_4096);
 		local_dh_4096 = NULL;
 	}
 	if (global_dh) {
-		DH_free(global_dh);
+		HASSL_DH_free(global_dh);
 		global_dh = NULL;
 	}
 }

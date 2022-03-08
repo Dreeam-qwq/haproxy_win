@@ -2,7 +2,7 @@
  * include/proto/quic_cc.h
  * This file contains prototypes for QUIC congestion control.
  *
- * Copyright 2019 HAProxy Technologies, Frédéric Lécaille <flecaille@haproxy.com>
+ * Copyright 2019 HAProxy Technologies, Frederic Lecaille <flecaille@haproxy.com>
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -57,11 +57,7 @@ static inline void quic_cc_event_trace(struct buffer *buf, const struct quic_cc_
 		              (unsigned long long)ev->ack.acked, ev->ack.time_sent);
 		break;
 	case QUIC_CC_EVT_LOSS:
-		chunk_appendf(buf, "loss now_ms=%u max_ack_delay=%u lost_bytes=%llu"
-		              " time_sent=%u period=%u",
-		              ev->loss.now_ms, ev->loss.max_ack_delay,
-		              (unsigned long long)ev->loss.lost_bytes,
-		              ev->loss.newest_time_sent, ev->loss.period);
+		chunk_appendf(buf, "now_ms=%u time_sent=%u", now_ms, ev->loss.time_sent);
 		break;
 	case QUIC_CC_EVT_ECN_CE:
 		chunk_appendf(buf, "ecn_ce");

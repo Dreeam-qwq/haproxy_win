@@ -1,7 +1,7 @@
 /*
  * QPACK decompressor
  *
- * Copyright 2021 HAProxy Technologies, Frédéric Lécaille <flecaille@haproxy.com>
+ * Copyright 2021 HAProxy Technologies, Frederic Lecaille <flecaille@haproxy.com>
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -67,8 +67,8 @@ static uint64_t qpack_get_varint(const unsigned char **buf, uint64_t *len_in, in
 	uint8_t shift = 0;
 
 	len--;
-	ret = *raw++ & ((1 << b) - 1);
-	if (ret != (uint64_t)((1 << b) - 1))
+	ret = *raw++ & ((1ULL << b) - 1);
+	if (ret != (uint64_t)((1ULL << b) - 1))
 		goto end;
 
 	while (len && (*raw & 128)) {
@@ -351,7 +351,7 @@ int qpack_decode_fs(const unsigned char *raw, size_t len, struct buffer *tmp,
 				goto out;
 			}
 
-			qpack_debug_printf(stderr, " n=%d hanme=%d name_len=%llu", !!n, !!hname, (unsigned long long)name_len);
+			qpack_debug_printf(stderr, " n=%d hname=%d name_len=%llu", !!n, !!hname, (unsigned long long)name_len);
 			/* Name string */
 
 			if (len < name_len) {

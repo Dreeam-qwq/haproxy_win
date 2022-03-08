@@ -27,8 +27,9 @@ struct httpclient {
 		void (*res_payload)(struct httpclient *hc);         /* payload received */
 		void (*res_end)(struct httpclient *hc);             /* end of the response */
 	} ops;
-	struct sockaddr_storage dst;          /* destination address */
+	struct sockaddr_storage *dst;         /* destination address */
 	struct appctx *appctx;                /* HTTPclient appctx */
+	int timeout_server;                   /* server timeout in ms */
 	void *caller;                         /* ptr of the caller */
 	unsigned int flags;                   /* other flags */
 };

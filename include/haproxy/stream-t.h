@@ -88,6 +88,7 @@
 #define PCLI_F_PROMPT   0x10000
 #define PCLI_F_PAYLOAD  0x20000
 
+struct conn_stream;
 struct hlua;
 struct proxy;
 struct pendconn;
@@ -163,7 +164,9 @@ struct stream {
 	struct vars vars_txn;                   /* list of variables for the txn scope. */
 	struct vars vars_reqres;                /* list of variables for the request and resp scope. */
 
-	struct stream_interface si[2];          /* client and server stream interfaces */
+	struct conn_stream *csf;                /* frontend conn-stream */
+	struct conn_stream *csb;                /* backend conn-stream */
+
 	struct strm_logs logs;                  /* logs for this stream */
 
 	void (*do_log)(struct stream *s);       /* the function to call in order to log (or NULL) */

@@ -26,6 +26,8 @@
 
 #if (OPENSSL_VERSION_NUMBER >= 0x3000000fL)
 #include <openssl/core_names.h>
+#include <openssl/decoder.h>
+#include <openssl/param_build.h>
 #endif
 
 #if defined(LIBRESSL_VERSION_NUMBER)
@@ -87,8 +89,14 @@
 #if (HA_OPENSSL_VERSION_NUMBER >= 0x3000000fL)
 #define HAVE_OSSL_PARAM
 #define MAC_CTX EVP_MAC_CTX
-#else
+#define HASSL_DH EVP_PKEY
+#define HASSL_DH_free EVP_PKEY_free
+#define HASSL_DH_up_ref EVP_PKEY_up_ref
+#else /* HA_OPENSSL_VERSION_NUMBER >= 0x3000000fL */
 #define MAC_CTX HMAC_CTX
+#define HASSL_DH DH
+#define HASSL_DH_free DH_free
+#define HASSL_DH_up_ref DH_up_ref
 #endif
 
 #if (HA_OPENSSL_VERSION_NUMBER < 0x0090800fL)
@@ -166,7 +174,7 @@ static inline int SSL_SESSION_set1_id_context(SSL_SESSION *s, const unsigned cha
 #endif
 
 
-#if (HA_OPENSSL_VERSION_NUMBER < 0x1000200fL) && (LIBRESSL_VERSION_NUMBER < 0x2070500fL)
+#if (HA_OPENSSL_VERSION_NUMBER < 0x1000200fL) && (!defined(LIBRESSL_VERSION_NUMBER) || LIBRESSL_VERSION_NUMBER < 0x2070500fL)
 /* introduced in openssl 1.0.2 */
 
 static inline STACK_OF(X509) *X509_chain_up_ref(STACK_OF(X509) *chain)
@@ -314,6 +322,22 @@ static inline X509 *X509_STORE_CTX_get0_cert(X509_STORE_CTX *ctx)
 #if defined(SSL_CTRL_SET_TLSEXT_TICKET_KEY_CB)
 #define SSL_CTX_set_tlsext_ticket_key_evp_cb SSL_CTX_set_tlsext_ticket_key_cb
 #endif
+
+/*
+ * Functions introduced in OpenSSL 3.0.0
+ */
+static inline unsigned long ERR_peek_error_func(const char **func)
+{
+	unsigned long ret = ERR_peek_error();
+	if (ret == 0)
+		return ret;
+
+	if (func)
+		*func = ERR_func_error_string(ret);
+
+	return ret;
+}
+
 #endif
 
 #if (HA_OPENSSL_VERSION_NUMBER >= 0x1010000fL) || (defined(LIBRESSL_VERSION_NUMBER) && LIBRESSL_VERSION_NUMBER >= 0x2070200fL)

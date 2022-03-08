@@ -1,7 +1,7 @@
 /*
  * QUIC socket management.
  *
- * Copyright 2020 HAProxy Technologies, Frédéric Lécaille <flecaille@haproxy.com>
+ * Copyright 2020 HAProxy Technologies, Frederic Lecaille <flecaille@haproxy.com>
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License
@@ -233,14 +233,11 @@ void quic_sock_fd_iocb(int fd)
 	do {
 		ret = recvfrom(fd, dgram_buf, max_sz, 0,
 		               (struct sockaddr *)&saddr, &saddrlen);
-		if (ret < 0) {
-			if (errno == EINTR)
-				continue;
-			if (errno == EAGAIN)
-				fd_cant_recv(fd);
+		if (ret < 0 && errno == EAGAIN) {
+			fd_cant_recv(fd);
 			goto out;
 		}
-	} while (0);
+	} while (ret < 0 && errno == EINTR);
 
 	b_add(buf, ret);
 	if (!quic_lstnr_dgram_dispatch(dgram_buf, ret, l, &saddr,

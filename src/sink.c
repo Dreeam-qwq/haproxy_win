@@ -636,6 +636,7 @@ static struct appctx *sink_forward_session_create(struct sink *sink, struct sink
 	struct proxy *p = sink->forward_px;
 	struct appctx *appctx;
 	struct session *sess;
+	struct conn_stream *cs;
 	struct stream *s;
 	struct applet *applet = &sink_forward_applet;
 
@@ -650,21 +651,28 @@ static struct appctx *sink_forward_session_create(struct sink *sink, struct sink
 
 	sess = session_new(p, NULL, &appctx->obj_type);
 	if (!sess) {
-		ha_alert("out of memory in peer_session_create().\n");
+		ha_alert("out of memory in sink_forward_session_create().\n");
 		goto out_free_appctx;
 	}
 
-	if ((s = stream_new(sess, &appctx->obj_type, &BUF_NULL)) == NULL) {
-		ha_alert("Failed to initialize stream in peer_session_create().\n");
+	cs = cs_new();
+	if (!cs) {
+		ha_alert("out of memory in sink_forward_session_create");
 		goto out_free_sess;
+	}
+	cs_attach_endp(cs, &appctx->obj_type, appctx);
+
+	if ((s = stream_new(sess, cs, &BUF_NULL)) == NULL) {
+		ha_alert("Failed to initialize stream in sink_forward_session_create().\n");
+		goto out_free_cs;
 	}
 
 
 	s->target = &sft->srv->obj_type;
-	if (!sockaddr_alloc(&s->si[1].dst, &sft->srv->addr, sizeof(sft->srv->addr)))
+	if (!sockaddr_alloc(&cs_si(s->csb)->dst, &sft->srv->addr, sizeof(sft->srv->addr)))
 		goto out_free_strm;
 	s->flags = SF_ASSIGNED|SF_ADDR_SET;
-	s->si[1].flags |= SI_FL_NOLINGER;
+	cs_si(s->csb)->flags |= SI_FL_NOLINGER;
 
 	s->do_log = NULL;
 	s->uniq_id = 0;
@@ -676,13 +684,14 @@ static struct appctx *sink_forward_session_create(struct sink *sink, struct sink
 	s->res.rto = TICK_ETERNITY;
 	s->res.rex = TICK_ETERNITY;
 	sft->appctx = appctx;
-	task_wakeup(s->task, TASK_WOKEN_INIT);
 	return appctx;
 
 	/* Error unrolling */
  out_free_strm:
 	LIST_DELETE(&s->list);
 	pool_free(pool_head_stream, s);
+  out_free_cs:
+	cs_free(cs);
  out_free_sess:
 	session_free(sess);
  out_free_appctx:

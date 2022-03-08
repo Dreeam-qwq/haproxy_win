@@ -40,14 +40,25 @@
 #define POOL_F_MUST_ZERO    0x00000002  // zero the returned area
 #define POOL_F_NO_FAIL      0x00000004  // do not randomly fail
 
+/* pool debugging flags */
+#define POOL_DBG_FAIL_ALLOC 0x00000001  // randomly fail memory allocations
+#define POOL_DBG_DONT_MERGE 0x00000002  // do not merge same-size pools
+#define POOL_DBG_COLD_FIRST 0x00000004  // pick cold objects first
+#define POOL_DBG_INTEGRITY  0x00000008  // perform integrity checks on cache
+#define POOL_DBG_NO_GLOBAL  0x00000010  // disable global pools
+#define POOL_DBG_NO_CACHE   0x00000020  // disable thread-local pool caches
+#define POOL_DBG_CALLER     0x00000040  // trace last caller's location
+#define POOL_DBG_TAG        0x00000080  // place a tag at the end of the area
+#define POOL_DBG_POISON     0x00000100  // poison memory area on pool_alloc()
+
 
 /* This is the head of a thread-local cache */
 struct pool_cache_head {
 	struct list list;    /* head of objects in this pool */
 	unsigned int count;  /* number of objects in this pool */
-#if defined(DEBUG_POOL_INTEGRITY)
+	unsigned int tid;    /* thread id, for debugging only */
+	struct pool_head *pool; /* assigned pool, for debugging only */
 	ulong fill_pattern;  /* pattern used to fill the area on free */
-#endif
 } THREAD_ALIGNED(64);
 
 /* This represents one item stored in the thread-local cache. <by_pool> links
@@ -105,12 +116,11 @@ struct pool_head {
 	unsigned int flags;	/* MEM_F_* */
 	unsigned int users;	/* number of pools sharing this zone */
 	unsigned int failed;	/* failed allocations */
-	/* 32-bit hole here */
+	unsigned int alloc_sz;	/* allocated size (includes hidden fields) */
 	struct list list;	/* list of all known pools */
+	void *base_addr;        /* allocation address, for free() */
 	char name[12];		/* name of the pool */
-#ifdef CONFIG_HAP_POOLS
-	struct pool_cache_head cache[MAX_THREADS]; /* pool caches */
-#endif
+	struct pool_cache_head cache[MAX_THREADS] THREAD_ALIGNED(64); /* pool caches */
 } __attribute__((aligned(64)));
 
 #endif /* _HAPROXY_POOL_T_H */

@@ -1272,7 +1272,7 @@ static unsigned int htx_cache_dump_blk(struct appctx *appctx, struct htx *htx, e
 	unsigned int max, total;
 	uint32_t blksz;
 
-	max = htx_get_max_blksz(htx, channel_htx_recv_max(si_ic(appctx->owner), htx));
+	max = htx_get_max_blksz(htx, channel_htx_recv_max(si_ic(cs_si(appctx->owner)), htx));
 	if (!max)
 		return 0;
 	blksz = ((type == HTX_BLK_HDR || type == HTX_BLK_TLR)
@@ -1315,7 +1315,7 @@ static unsigned int htx_cache_dump_data_blk(struct appctx *appctx, struct htx *h
 	unsigned int max, total, rem_data;
 	uint32_t blksz;
 
-	max = htx_get_max_blksz(htx, channel_htx_recv_max(si_ic(appctx->owner), htx));
+	max = htx_get_max_blksz(htx, channel_htx_recv_max(si_ic(cs_si(appctx->owner)), htx));
 	if (!max)
 		return 0;
 
@@ -1429,7 +1429,7 @@ static void http_cache_io_handler(struct appctx *appctx)
 {
 	struct cache_entry *cache_ptr = appctx->ctx.cache.entry;
 	struct shared_block *first = block_ptr(cache_ptr);
-	struct stream_interface *si = appctx->owner;
+	struct stream_interface *si = cs_si(appctx->owner);
 	struct channel *req = si_oc(si);
 	struct channel *res = si_ic(si);
 	struct htx *req_htx, *res_htx;
@@ -1812,7 +1812,7 @@ enum act_return http_action_req_cache_use(struct act_rule *rule, struct proxy *p
 		}
 
 		s->target = &http_cache_applet.obj_type;
-		if ((appctx = si_register_handler(&s->si[1], objt_applet(s->target)))) {
+		if ((appctx = si_register_handler(cs_si(s->csb), objt_applet(s->target)))) {
 			appctx->st0 = HTX_CACHE_INIT;
 			appctx->rule = rule;
 			appctx->ctx.cache.entry = res;
@@ -2563,7 +2563,7 @@ static int cli_parse_show_cache(char **args, char *payload, struct appctx *appct
 static int cli_io_handler_show_cache(struct appctx *appctx)
 {
 	struct cache* cache = appctx->ctx.cli.p0;
-	struct stream_interface *si = appctx->owner;
+	struct stream_interface *si = cs_si(appctx->owner);
 
 	if (cache == NULL) {
 		cache = LIST_ELEM((caches).n, typeof(struct cache *), list);
@@ -2649,7 +2649,7 @@ smp_fetch_res_cache_name(const struct arg *args, struct sample *smp,
 		return 0;
 
 	/* Get appctx from the stream_interface. */
-	appctx = si_appctx(&smp->strm->si[1]);
+	appctx = cs_appctx(smp->strm->csb);
 	if (appctx && appctx->rule) {
 		cconf = appctx->rule->arg.act.p[0];
 		if (cconf) {

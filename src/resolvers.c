@@ -2586,7 +2586,7 @@ static int stats_dump_resolv_to_buffer(struct stream_interface *si,
                                     struct field *stats, size_t stats_count,
                                     struct list *stat_modules)
 {
-	struct appctx *appctx = __objt_appctx(si->end);
+	struct appctx *appctx = __cs_appctx(si->cs);
 	struct channel *rep = si_ic(si);
 	struct stats_module *mod;
 	size_t idx = 0;
@@ -2620,7 +2620,7 @@ int stats_dump_resolvers(struct stream_interface *si,
                          struct field *stats, size_t stats_count,
                          struct list *stat_modules)
 {
-	struct appctx *appctx = __objt_appctx(si->end);
+	struct appctx *appctx = __cs_appctx(si->cs);
 	struct channel *rep = si_ic(si);
 	struct resolvers *resolver = appctx->ctx.stats.obj1;
 	struct dns_nameserver *ns = appctx->ctx.stats.obj2;
@@ -2745,7 +2745,7 @@ static int cli_parse_stat_resolvers(char **args, char *payload, struct appctx *a
  */
 static int cli_io_handler_dump_resolvers_to_buffer(struct appctx *appctx)
 {
-	struct stream_interface *si = appctx->owner;
+	struct stream_interface *si = cs_si(appctx->owner);
 	struct resolvers    *resolvers;
 	struct dns_nameserver   *ns;
 

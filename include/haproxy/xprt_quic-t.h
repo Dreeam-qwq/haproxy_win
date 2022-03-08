@@ -2,7 +2,7 @@
  * include/haproxy/xprt_quic-t.h
  * This file contains applet function prototypes
  *
- * Copyright 2019 HAProxy Technologies, Frédéric Lécaille <flecaille@haproxy.com>
+ * Copyright 2019 HAProxy Technologies, Frederic Lecaille <flecaille@haproxy.com>
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -196,7 +196,7 @@ enum quic_pkt_type {
 #define           QUIC_EV_CONN_HPKT      (1ULL << 9)
 #define           QUIC_EV_CONN_PAPKT     (1ULL << 10)
 #define           QUIC_EV_CONN_PAPKTS    (1ULL << 11)
-#define           QUIC_EV_CONN_HDSHK     (1ULL << 12)
+#define           QUIC_EV_CONN_IO_CB     (1ULL << 12)
 #define           QUIC_EV_CONN_RMHP      (1ULL << 13)
 #define           QUIC_EV_CONN_PRSHPKT   (1ULL << 14)
 #define           QUIC_EV_CONN_PRSAPKT   (1ULL << 15)
@@ -248,7 +248,6 @@ enum quic_pkt_type {
 
 extern struct trace_source trace_quic;
 extern struct pool_head *pool_head_quic_tx_ring;
-extern struct pool_head *pool_head_quic_rxbuf;
 extern struct pool_head *pool_head_quic_rx_packet;
 extern struct pool_head *pool_head_quic_tx_packet;
 extern struct pool_head *pool_head_quic_frame;
@@ -497,6 +496,7 @@ struct quic_rx_strm_frm {
 	struct eb64_node offset_node;
 	uint64_t len;
 	const unsigned char *data;
+	int fin;
 	struct quic_rx_packet *pkt;
 };
 
@@ -734,8 +734,6 @@ struct quic_conn {
 		struct quic_transport_params params;
 		/* RX buffer */
 		struct buffer buf;
-		/* RX buffer read/write lock */
-		__decl_thread(HA_RWLOCK_T buf_rwlock);
 		struct list pkt_list;
 	} rx;
 	struct {

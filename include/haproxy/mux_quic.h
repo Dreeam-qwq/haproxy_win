@@ -7,9 +7,10 @@
 #endif
 
 #include <haproxy/api.h>
+#include <haproxy/connection.h>
 #include <haproxy/mux_quic-t.h>
+#include <haproxy/xprt_quic-t.h>
 
-void quic_mux_transport_params_update(struct qcc *qcc);
 struct qcs *qcs_new(struct qcc *qcc, uint64_t id, enum qcs_type type);
 void uni_qcs_free(struct qcs *qcs);
 
@@ -18,6 +19,10 @@ struct buffer *qc_get_buf(struct qcs *qcs, struct buffer *bptr);
 int qcs_subscribe(struct qcs *qcs, int event_type, struct wait_event *es);
 void qcs_notify_recv(struct qcs *qcs);
 void qcs_notify_send(struct qcs *qcs);
+
+int qcc_recv(struct qcc *qcc, uint64_t id, uint64_t len, uint64_t offset,
+             char fin, char *data, struct qcs **out_qcs);
+int qcc_decode_qcs(struct qcc *qcc, struct qcs *qcs);
 
 /* Bit shift to get the stream sub ID for internal use which is obtained
  * shifting the stream IDs by this value, knowing that the
@@ -38,12 +43,26 @@ static inline enum qcs_type qcs_id_type(uint64_t id)
 	return id & QCS_ID_TYPE_MASK;
 }
 
-/* Return 1 if the stream with <id> as ID attached to <qcc> connection
- * has been locally initiated, 0 if not.
- */
-static inline int qc_local_stream_id(struct qcc *qcc, uint64_t id)
+/* Return true if stream has been opened locally. */
+static inline int quic_stream_is_local(struct qcc *qcc, uint64_t id)
 {
-	return id & QCS_ID_SRV_INTIATOR_BIT;
+	return conn_is_back(qcc->conn) == !(id & QCS_ID_SRV_INTIATOR_BIT);
+}
+
+/* Return true if stream is opened by peer. */
+static inline int quic_stream_is_remote(struct qcc *qcc, uint64_t id)
+{
+	return !quic_stream_is_local(qcc, id);
+}
+
+static inline int quic_stream_is_uni(uint64_t id)
+{
+	return id & QCS_ID_DIR_BIT;
+}
+
+static inline int quic_stream_is_bidi(uint64_t id)
+{
+	return !quic_stream_is_uni(id);
 }
 
 struct eb64_node *qcc_get_qcs(struct qcc *qcc, uint64_t id);

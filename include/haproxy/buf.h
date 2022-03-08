@@ -81,6 +81,7 @@ static inline size_t b_data(const struct buffer *b)
 /* b_room() : returns the amount of room left in the buffer */
 static inline size_t b_room(const struct buffer *b)
 {
+	BUG_ON_HOT(b->data > b->size);
 	return b->size - b_data(b);
 }
 
@@ -210,6 +211,7 @@ static inline char *b_tail(const struct buffer *b)
 static inline size_t b_next_ofs(const struct buffer *b, size_t o)
 {
 	o++;
+	BUG_ON_HOT(o > b->size);
 	if (o == b->size)
 		o = 0;
 	return o;
@@ -218,6 +220,7 @@ static inline size_t b_next_ofs(const struct buffer *b, size_t o)
 static inline char *b_next(const struct buffer *b, const char *p)
 {
 	p++;
+	BUG_ON_HOT(p > b_wrap(b));
 	if (p == b_wrap(b))
 		p = b_orig(b);
 	return (char *)p;
@@ -232,6 +235,7 @@ static inline size_t b_dist(const struct buffer *b, const char *from, const char
 {
 	ssize_t dist = to - from;
 
+	BUG_ON_HOT((dist > 0 && dist > b_size(b)) || (dist < 0 && -dist > b_size(b)));
 	dist += dist < 0 ? b_size(b) : 0;
 	return dist;
 }
@@ -241,6 +245,7 @@ static inline size_t b_dist(const struct buffer *b, const char *from, const char
  */
 static inline int b_almost_full(const struct buffer *b)
 {
+	BUG_ON_HOT(b->data > b->size);
 	return b_data(b) >= b_size(b) * 3 / 4;
 }
 
@@ -259,6 +264,7 @@ static inline int b_almost_full(const struct buffer *b)
  */
 static inline int b_space_wraps(const struct buffer *b)
 {
+	BUG_ON_HOT(b->data > b->size);
 	if ((ssize_t)__b_head_ofs(b) <= 0)
 		return 0;
 	if (__b_tail_ofs(b) >= b_size(b))
@@ -297,6 +303,8 @@ static inline size_t b_contig_space(const struct buffer *b)
 {
 	size_t left, right;
 
+	BUG_ON_HOT(b->data > b->size);
+
 	right = b_head_ofs(b);
 	left  = right + b_data(b);
 
@@ -318,6 +326,10 @@ static inline size_t b_contig_space(const struct buffer *b)
 static inline size_t b_getblk(const struct buffer *buf, char *blk, size_t len, size_t offset)
 {
 	size_t firstblock;
+
+	BUG_ON(buf->data > buf->size);
+	BUG_ON(offset > buf->data);
+	BUG_ON(offset + len > buf->data);
 
 	if (len + offset > b_data(buf))
 		return 0;
@@ -350,6 +362,10 @@ static inline size_t b_getblk(const struct buffer *buf, char *blk, size_t len, s
 static inline size_t b_getblk_nc(const struct buffer *buf, const char **blk1, size_t *len1, const char **blk2, size_t *len2, size_t ofs, size_t max)
 {
 	size_t l1;
+
+	BUG_ON_HOT(buf->data > buf->size);
+	BUG_ON_HOT(ofs > buf->data);
+	BUG_ON_HOT(ofs + max > buf->data);
 
 	if (!max)
 		return 0;
@@ -393,18 +409,21 @@ static inline struct buffer b_make(char *area, size_t size, size_t head, size_t 
 /* b_sub() : decreases the buffer length by <count> */
 static inline void b_sub(struct buffer *b, size_t count)
 {
+	BUG_ON_HOT(b->data < count);
 	b->data -= count;
 }
 
 /* b_add() : increase the buffer length by <count> */
 static inline void b_add(struct buffer *b, size_t count)
 {
+	BUG_ON_HOT(b->data + count > b->size);
 	b->data += count;
 }
 
 /* b_set_data() : sets the buffer's length */
 static inline void b_set_data(struct buffer *b, size_t len)
 {
+	BUG_ON_HOT(len > b->size);
 	b->data = len;
 }
 
@@ -414,6 +433,7 @@ static inline void b_set_data(struct buffer *b, size_t len)
  */
 static inline void b_del(struct buffer *b, size_t del)
 {
+	BUG_ON_HOT(b->data < del);
 	b->data -= del;
 	b->head += del;
 	if (b->head >= b->size)
@@ -442,6 +462,8 @@ static inline void b_slow_realign(struct buffer *b, char *swap, size_t output)
 {
 	size_t block1 = output;
 	size_t block2 = 0;
+
+	BUG_ON_HOT(b->data > b->size);
 
 	/* process output data in two steps to cover wrapping */
 	if (block1 > b_size(b) - b_head_ofs(b)) {
@@ -479,6 +501,9 @@ static inline void b_slow_realign_ofs(struct buffer *b, char *swap, size_t ofs)
 {
 	size_t block1 = b_data(b);
 	size_t block2 = 0;
+
+	BUG_ON_HOT(b->data > b->size);
+	BUG_ON_HOT(ofs > b->size);
 
 	if (__b_tail_ofs(b) >= b_size(b)) {
 		block2 = b_tail_ofs(b);
@@ -518,6 +543,8 @@ static inline void b_putchr(struct buffer *b, char c)
 static inline void __b_putblk(struct buffer *b, const char *blk, size_t len)
 {
 	size_t half = b_contig_space(b);
+
+	BUG_ON(b_data(b) + len > b_size(b));
 
 	if (half > len)
 		half = len;
@@ -636,10 +663,13 @@ static inline void b_move(const struct buffer *b, size_t src, size_t len, ssize_
 	size_t dst  = src + size + shift;
 	size_t cnt;
 
+	BUG_ON(len > size);
+
 	if (dst >= size)
 		dst -= size;
 
 	if (shift < 0) {
+		BUG_ON(-shift >= size);
 		/* copy from left to right */
 		for (; (cnt = len); len -= cnt) {
 			if (cnt > size - src)
@@ -657,6 +687,7 @@ static inline void b_move(const struct buffer *b, size_t src, size_t len, ssize_
 		}
 	}
 	else if (shift > 0) {
+		BUG_ON(shift >= size);
 		/* copy from right to left */
 		for (; (cnt = len); len -= cnt) {
 			size_t src_end = src + len;
@@ -689,6 +720,8 @@ static inline void b_move(const struct buffer *b, size_t src, size_t len, ssize_
 static inline int b_rep_blk(struct buffer *b, char *pos, char *end, const char *blk, size_t len)
 {
 	int delta;
+
+	BUG_ON(pos < b->area || pos >= b->area + b->size);
 
 	delta = len - (end - pos);
 
@@ -755,6 +788,8 @@ static inline void __b_put_varint(struct buffer *b, uint64_t v)
 	char  *wrap = b_wrap(b);
 	char  *tail = b_tail(b);
 
+	BUG_ON_HOT(data >= size);
+
 	if (v >= 0xF0) {
 		/* more than one byte, first write the 4 least significant
 		 * bits, then follow with 7 bits per byte.
@@ -775,6 +810,7 @@ static inline void __b_put_varint(struct buffer *b, uint64_t v)
 
 	/* last byte */
 	*tail = v;
+	BUG_ON_HOT(data >= size);
 	data++;
 	b->data = data;
 }
@@ -791,6 +827,8 @@ static inline int b_put_varint(struct buffer *b, uint64_t v)
 	char  *tail = b_tail(b);
 
 	if (data != size && v >= 0xF0) {
+		BUG_ON_HOT(data > size);
+
 		/* more than one byte, first write the 4 least significant
 		 * bits, then follow with 7 bits per byte.
 		 */
@@ -875,6 +913,8 @@ static inline int b_peek_varint(struct buffer *b, size_t ofs, uint64_t *vptr)
 	uint64_t v = 0;
 	int bits = 0;
 
+	BUG_ON_HOT(ofs > data);
+
 	if (data != 0 && (*head >= 0xF0)) {
 		v = *head;
 		bits += 4;
@@ -947,7 +987,7 @@ static inline void br_init(struct buffer *r, size_t size)
 /* Returns number of elements in the ring, root included */
 static inline unsigned int br_size(const struct buffer *r)
 {
-	BUG_ON(r->area != BUF_RING.area);
+	BUG_ON_HOT(r->area != BUF_RING.area);
 
 	return r->size;
 }
@@ -955,7 +995,7 @@ static inline unsigned int br_size(const struct buffer *r)
 /* Returns true if no more buffers may be added */
 static inline unsigned int br_full(const struct buffer *r)
 {
-	BUG_ON(r->area != BUF_RING.area);
+	BUG_ON_HOT(r->area != BUF_RING.area);
 
 	return r->data + 1 == r->head || r->data + 1 == r->head - 1 + r->size;
 }
@@ -963,7 +1003,7 @@ static inline unsigned int br_full(const struct buffer *r)
 /* Returns the index of the ring's head buffer */
 static inline unsigned int br_head_idx(const struct buffer *r)
 {
-	BUG_ON(r->area != BUF_RING.area);
+	BUG_ON_HOT(r->area != BUF_RING.area);
 
 	return r->head;
 }
@@ -971,7 +1011,7 @@ static inline unsigned int br_head_idx(const struct buffer *r)
 /* Returns the index of the ring's tail buffer */
 static inline unsigned int br_tail_idx(const struct buffer *r)
 {
-	BUG_ON(r->area != BUF_RING.area);
+	BUG_ON_HOT(r->area != BUF_RING.area);
 
 	return r->data;
 }
@@ -979,7 +1019,7 @@ static inline unsigned int br_tail_idx(const struct buffer *r)
 /* Returns a pointer to the ring's head buffer */
 static inline struct buffer *br_head(struct buffer *r)
 {
-	BUG_ON(r->area != BUF_RING.area);
+	BUG_ON_HOT(r->area != BUF_RING.area);
 
 	return r + br_head_idx(r);
 }
@@ -987,7 +1027,7 @@ static inline struct buffer *br_head(struct buffer *r)
 /* Returns a pointer to the ring's tail buffer */
 static inline struct buffer *br_tail(struct buffer *r)
 {
-	BUG_ON(r->area != BUF_RING.area);
+	BUG_ON_HOT(r->area != BUF_RING.area);
 
 	return r + br_tail_idx(r);
 }
@@ -995,7 +1035,7 @@ static inline struct buffer *br_tail(struct buffer *r)
 /* Returns the amount of data of the ring's HEAD buffer */
 static inline unsigned int br_data(const struct buffer *r)
 {
-	BUG_ON(r->area != BUF_RING.area);
+	BUG_ON_HOT(r->area != BUF_RING.area);
 
 	return b_data(r + br_head_idx(r));
 }
@@ -1003,7 +1043,7 @@ static inline unsigned int br_data(const struct buffer *r)
 /* Returns non-zero if the ring is non-full or its tail has some room */
 static inline unsigned int br_has_room(const struct buffer *r)
 {
-	BUG_ON(r->area != BUF_RING.area);
+	BUG_ON_HOT(r->area != BUF_RING.area);
 
 	if (!br_full(r))
 		return 1;
@@ -1019,7 +1059,7 @@ static inline struct buffer *br_tail_add(struct buffer *r)
 {
 	struct buffer *b;
 
-	BUG_ON(r->area != BUF_RING.area);
+	BUG_ON_HOT(r->area != BUF_RING.area);
 
 	b = br_tail(r);
 	if (!b_size(b))
@@ -1048,7 +1088,7 @@ static inline struct buffer *br_head_pick(struct buffer *r)
 {
 	struct buffer *b;
 
-	BUG_ON(r->area != BUF_RING.area);
+	BUG_ON_HOT(r->area != BUF_RING.area);
 
 	b = br_head(r);
 	if (r->head != r->data) {
@@ -1066,7 +1106,7 @@ static inline struct buffer *br_head_pick(struct buffer *r)
  */
 static inline struct buffer *br_del_head(struct buffer *r)
 {
-	BUG_ON(r->area != BUF_RING.area);
+	BUG_ON_HOT(r->area != BUF_RING.area);
 
 	if (r->head != r->data) {
 		r->head++;

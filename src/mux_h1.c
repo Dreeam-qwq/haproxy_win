@@ -15,6 +15,7 @@
 #include <haproxy/api.h>
 #include <haproxy/cfgparse.h>
 #include <haproxy/connection.h>
+#include <haproxy/conn_stream.h>
 #include <haproxy/h1.h>
 #include <haproxy/h1_htx.h>
 #include <haproxy/h2.h>
@@ -677,16 +678,17 @@ static inline size_t h1s_data_pending(const struct h1s *h1s)
  * success or NULL on error. */
 static struct conn_stream *h1s_new_cs(struct h1s *h1s, struct buffer *input)
 {
+	struct h1c *h1c = h1s->h1c;
 	struct conn_stream *cs;
 
-	TRACE_ENTER(H1_EV_STRM_NEW, h1s->h1c->conn, h1s);
-	cs = cs_new(h1s->h1c->conn, h1s->h1c->conn->target);
+	TRACE_ENTER(H1_EV_STRM_NEW, h1c->conn, h1s);
+	cs = cs_new();
 	if (!cs) {
-		TRACE_ERROR("CS allocation failure", H1_EV_STRM_NEW|H1_EV_STRM_END|H1_EV_STRM_ERR, h1s->h1c->conn, h1s);
+		TRACE_ERROR("CS allocation failure", H1_EV_STRM_NEW|H1_EV_STRM_END|H1_EV_STRM_ERR, h1c->conn, h1s);
 		goto err;
 	}
+	cs_attach_endp(cs, &h1c->conn->obj_type, h1s);
 	h1s->cs = cs;
-	cs->ctx = h1s;
 
 	if (h1s->flags & H1S_F_NOT_FIRST)
 		cs->flags |= CS_FL_NOT_FIRST;
@@ -694,22 +696,22 @@ static struct conn_stream *h1s_new_cs(struct h1s *h1s, struct buffer *input)
 	if (h1s->req.flags & H1_MF_UPG_WEBSOCKET)
 		cs->flags |= CS_FL_WEBSOCKET;
 
-	if (stream_create_from_cs(cs, input) < 0) {
-		TRACE_DEVEL("leaving on stream creation failure", H1_EV_STRM_NEW|H1_EV_STRM_END|H1_EV_STRM_ERR, h1s->h1c->conn, h1s);
+	if (!stream_new(h1c->conn->owner, cs, input)) {
+		TRACE_DEVEL("leaving on stream creation failure", H1_EV_STRM_NEW|H1_EV_STRM_END|H1_EV_STRM_ERR, h1c->conn, h1s);
 		goto err;
 	}
 
-	HA_ATOMIC_INC(&h1s->h1c->px_counters->open_streams);
-	HA_ATOMIC_INC(&h1s->h1c->px_counters->total_streams);
+	HA_ATOMIC_INC(&h1c->px_counters->open_streams);
+	HA_ATOMIC_INC(&h1c->px_counters->total_streams);
 
-	h1s->h1c->flags = (h1s->h1c->flags & ~H1C_F_ST_EMBRYONIC) | H1C_F_ST_ATTACHED | H1C_F_ST_READY;
-	TRACE_LEAVE(H1_EV_STRM_NEW, h1s->h1c->conn, h1s);
+	h1c->flags = (h1c->flags & ~H1C_F_ST_EMBRYONIC) | H1C_F_ST_ATTACHED | H1C_F_ST_READY;
+	TRACE_LEAVE(H1_EV_STRM_NEW, h1c->conn, h1s);
 	return cs;
 
   err:
 	cs_free(cs);
 	h1s->cs = NULL;
-	TRACE_DEVEL("leaving on error", H1_EV_STRM_NEW|H1_EV_STRM_ERR, h1s->h1c->conn, h1s);
+	TRACE_DEVEL("leaving on error", H1_EV_STRM_NEW|H1_EV_STRM_ERR, h1c->conn, h1s);
 	return NULL;
 }
 
@@ -1349,11 +1351,11 @@ static void h1_capture_bad_message(struct h1c *h1c, struct h1s *h1s,
 	struct proxy *other_end;
 	union error_snapshot_ctx ctx;
 
-	if ((h1c->flags & H1C_F_ST_ATTACHED) && h1s->cs->data) {
+	if ((h1c->flags & H1C_F_ST_ATTACHED) && cs_strm(h1s->cs)) {
 		if (sess == NULL)
-			sess = si_strm(h1s->cs->data)->sess;
+			sess = __cs_strm(h1s->cs)->sess;
 		if (!(h1m->flags & H1_MF_RESP))
-			other_end = si_strm(h1s->cs->data)->be;
+			other_end = __cs_strm(h1s->cs)->be;
 		else
 			other_end = sess->fe;
 	} else
@@ -2840,7 +2842,7 @@ static int h1_send(struct h1c *h1c)
 	}
 
   end:
-	if (!(h1c->flags & H1C_F_OUT_FULL))
+	if (!(h1c->flags & (H1C_F_OUT_FULL|H1C_F_OUT_ALLOC)))
 		h1_wake_stream_for_send(h1c->h1s);
 
 	/* We're done, no more to send */
@@ -3219,21 +3221,14 @@ struct task *h1_timeout_task(struct task *t, void *context, unsigned int state)
  * Attach a new stream to a connection
  * (Used for outgoing connections)
  */
-static struct conn_stream *h1_attach(struct connection *conn, struct session *sess)
+static int h1_attach(struct connection *conn, struct conn_stream *cs, struct session *sess)
 {
 	struct h1c *h1c = conn->ctx;
-	struct conn_stream *cs = NULL;
 	struct h1s *h1s;
 
 	TRACE_ENTER(H1_EV_STRM_NEW, conn);
 	if (h1c->flags & H1C_F_ST_ERROR) {
 		TRACE_ERROR("h1c on error", H1_EV_STRM_NEW|H1_EV_STRM_END|H1_EV_STRM_ERR, conn);
-		goto err;
-	}
-
-	cs = cs_new(h1c->conn, h1c->conn->target);
-	if (!cs) {
-		TRACE_ERROR("CS allocation failure", H1_EV_STRM_NEW|H1_EV_STRM_END|H1_EV_STRM_ERR, conn);
 		goto err;
 	}
 
@@ -3248,11 +3243,10 @@ static struct conn_stream *h1_attach(struct connection *conn, struct session *se
 	xprt_set_used(conn, conn->xprt, conn->xprt_ctx);
 
 	TRACE_LEAVE(H1_EV_STRM_NEW, conn, h1s);
-	return cs;
+	return 0;
   err:
-	cs_free(cs);
 	TRACE_DEVEL("leaving on error", H1_EV_STRM_NEW|H1_EV_STRM_END|H1_EV_STRM_ERR, conn);
-	return NULL;
+	return -1;
 }
 
 /* Retrieves a valid conn_stream from this connection, or returns NULL. For
@@ -3426,9 +3420,9 @@ static void h1_shutr(struct conn_stream *cs, enum cs_shr_mode mode)
 	/* NOTE: Be sure to handle abort (cf. h2_shutr) */
 	if (cs->flags & CS_FL_SHR)
 		goto end;
-	if (conn_xprt_ready(cs->conn) && cs->conn->xprt->shutr)
-		cs->conn->xprt->shutr(cs->conn, cs->conn->xprt_ctx,
-				      (mode == CS_SHR_DRAIN));
+
+	if (conn_xprt_ready(h1c->conn) && h1c->conn->xprt->shutr)
+		h1c->conn->xprt->shutr(h1c->conn, h1c->conn->xprt_ctx, (mode == CS_SHR_DRAIN));
   end:
 	TRACE_LEAVE(H1_EV_STRM_SHUT, h1c->conn, h1s);
 }
@@ -3471,7 +3465,7 @@ static void h1_shutw(struct conn_stream *cs, enum cs_shw_mode mode)
 		h1c->flags |= H1C_F_ST_SILENT_SHUT;
 
 	if (!b_data(&h1c->obuf))
-		h1_shutw_conn(cs->conn);
+		h1_shutw_conn(h1c->conn);
   end:
 	TRACE_LEAVE(H1_EV_STRM_SHUT, h1c->conn, h1s);
 }
@@ -3678,28 +3672,28 @@ static int h1_rcv_pipe(struct conn_stream *cs, struct pipe *pipe, unsigned int c
 	struct h1m *h1m = (!(h1c->flags & H1C_F_IS_BACK) ? &h1s->req : &h1s->res);
 	int ret = 0;
 
-	TRACE_ENTER(H1_EV_STRM_RECV, cs->conn, h1s, 0, (size_t[]){count});
+	TRACE_ENTER(H1_EV_STRM_RECV, h1c->conn, h1s, 0, (size_t[]){count});
 
 	if ((h1m->flags & H1_MF_CHNK) || (h1m->state != H1_MSG_DATA && h1m->state != H1_MSG_TUNNEL)) {
 		h1c->flags &= ~H1C_F_WANT_SPLICE;
-		TRACE_STATE("Allow xprt rcv_buf on !(msg_data|msg_tunnel)", H1_EV_STRM_RECV, cs->conn, h1s);
+		TRACE_STATE("Allow xprt rcv_buf on !(msg_data|msg_tunnel)", H1_EV_STRM_RECV, h1c->conn, h1s);
 		goto end;
 	}
 
 	h1c->flags |= H1C_F_WANT_SPLICE;
 	if (h1s_data_pending(h1s)) {
-		TRACE_STATE("flush input buffer before splicing", H1_EV_STRM_RECV, cs->conn, h1s);
+		TRACE_STATE("flush input buffer before splicing", H1_EV_STRM_RECV, h1c->conn, h1s);
 		goto end;
 	}
 
 	if (!h1_recv_allowed(h1c)) {
-		TRACE_DEVEL("leaving on !recv_allowed", H1_EV_STRM_RECV, cs->conn, h1s);
+		TRACE_DEVEL("leaving on !recv_allowed", H1_EV_STRM_RECV, h1c->conn, h1s);
 		goto end;
 	}
 
 	if (h1m->state == H1_MSG_DATA && (h1m->flags & H1_MF_CLEN) && count > h1m->curr_len)
 		count = h1m->curr_len;
-	ret = cs->conn->xprt->rcv_pipe(cs->conn, cs->conn->xprt_ctx, pipe, count);
+	ret = h1c->conn->xprt->rcv_pipe(h1c->conn, h1c->conn->xprt_ctx, pipe, count);
 	if (ret >= 0) {
 		if (h1m->state == H1_MSG_DATA && (h1m->flags & H1_MF_CLEN)) {
 			if (ret > h1m->curr_len) {
@@ -3707,14 +3701,14 @@ static int h1_rcv_pipe(struct conn_stream *cs, struct pipe *pipe, unsigned int c
 				h1c->flags |= H1C_F_ST_ERROR;
 				cs->flags  |= CS_FL_ERROR;
 				TRACE_ERROR("too much payload, more than announced",
-					    H1_EV_RX_DATA|H1_EV_STRM_ERR|H1_EV_H1C_ERR|H1_EV_H1S_ERR, cs->conn, h1s);
+					    H1_EV_RX_DATA|H1_EV_STRM_ERR|H1_EV_H1C_ERR|H1_EV_H1S_ERR, h1c->conn, h1s);
 				goto end;
 			}
 			h1m->curr_len -= ret;
 			if (!h1m->curr_len) {
 				h1m->state = H1_MSG_DONE;
 				h1c->flags &= ~H1C_F_WANT_SPLICE;
-				TRACE_STATE("payload fully received", H1_EV_STRM_RECV, cs->conn, h1s);
+				TRACE_STATE("payload fully received", H1_EV_STRM_RECV, h1c->conn, h1s);
 			}
 		}
 		HA_ATOMIC_ADD(&h1c->px_counters->bytes_in, ret);
@@ -3722,22 +3716,22 @@ static int h1_rcv_pipe(struct conn_stream *cs, struct pipe *pipe, unsigned int c
 	}
 
   end:
-	if (conn_xprt_read0_pending(cs->conn)) {
+	if (conn_xprt_read0_pending(h1c->conn)) {
 		h1s->flags |= H1S_F_REOS;
 		h1c->flags &= ~H1C_F_WANT_SPLICE;
-		TRACE_STATE("Allow xprt rcv_buf on read0", H1_EV_STRM_RECV, cs->conn, h1s);
+		TRACE_STATE("Allow xprt rcv_buf on read0", H1_EV_STRM_RECV, h1c->conn, h1s);
 	}
 
 	if (!(h1c->flags & H1C_F_WANT_SPLICE)) {
 		TRACE_STATE("notify the mux can't use splicing anymore", H1_EV_STRM_RECV, h1c->conn, h1s);
 		cs->flags &= ~CS_FL_MAY_SPLICE;
 		if (!(h1c->wait_event.events & SUB_RETRY_RECV)) {
-			TRACE_STATE("restart receiving data, subscribing", H1_EV_STRM_RECV, cs->conn, h1s);
-			cs->conn->xprt->subscribe(cs->conn, cs->conn->xprt_ctx, SUB_RETRY_RECV, &h1c->wait_event);
+			TRACE_STATE("restart receiving data, subscribing", H1_EV_STRM_RECV, h1c->conn, h1s);
+			h1c->conn->xprt->subscribe(h1c->conn, h1c->conn->xprt_ctx, SUB_RETRY_RECV, &h1c->wait_event);
 		}
 	}
 
-	TRACE_LEAVE(H1_EV_STRM_RECV, cs->conn, h1s, 0, (size_t[]){ret});
+	TRACE_LEAVE(H1_EV_STRM_RECV, h1c->conn, h1s, 0, (size_t[]){ret});
 	return ret;
 }
 
@@ -3748,37 +3742,37 @@ static int h1_snd_pipe(struct conn_stream *cs, struct pipe *pipe)
 	struct h1m *h1m = (!(h1c->flags & H1C_F_IS_BACK) ? &h1s->res : &h1s->req);
 	int ret = 0;
 
-	TRACE_ENTER(H1_EV_STRM_SEND, cs->conn, h1s, 0, (size_t[]){pipe->data});
+	TRACE_ENTER(H1_EV_STRM_SEND, h1c->conn, h1s, 0, (size_t[]){pipe->data});
 
 	if (b_data(&h1c->obuf)) {
 		if (!(h1c->wait_event.events & SUB_RETRY_SEND)) {
-			TRACE_STATE("more data to send, subscribing", H1_EV_STRM_SEND, cs->conn, h1s);
-			cs->conn->xprt->subscribe(cs->conn, cs->conn->xprt_ctx, SUB_RETRY_SEND, &h1c->wait_event);
+			TRACE_STATE("more data to send, subscribing", H1_EV_STRM_SEND, h1c->conn, h1s);
+			h1c->conn->xprt->subscribe(h1c->conn, h1c->conn->xprt_ctx, SUB_RETRY_SEND, &h1c->wait_event);
 		}
 		goto end;
 	}
 
-	ret = cs->conn->xprt->snd_pipe(cs->conn, cs->conn->xprt_ctx, pipe);
+	ret = h1c->conn->xprt->snd_pipe(h1c->conn, h1c->conn->xprt_ctx, pipe);
 	if (h1m->state == H1_MSG_DATA && (h1m->flags & H1_MF_CLEN)) {
 		if (ret > h1m->curr_len) {
 			h1s->flags |= H1S_F_PROCESSING_ERROR;
 			h1c->flags |= H1C_F_ST_ERROR;
 			cs->flags  |= CS_FL_ERROR;
 			TRACE_ERROR("too much payload, more than announced",
-				    H1_EV_TX_DATA|H1_EV_STRM_ERR|H1_EV_H1C_ERR|H1_EV_H1S_ERR, cs->conn, h1s);
+				    H1_EV_TX_DATA|H1_EV_STRM_ERR|H1_EV_H1C_ERR|H1_EV_H1S_ERR, h1c->conn, h1s);
 			goto end;
 		}
 		h1m->curr_len -= ret;
 		if (!h1m->curr_len) {
 			h1m->state = H1_MSG_DONE;
-			TRACE_STATE("payload fully xferred", H1_EV_TX_DATA|H1_EV_TX_BODY, cs->conn, h1s);
+			TRACE_STATE("payload fully xferred", H1_EV_TX_DATA|H1_EV_TX_BODY, h1c->conn, h1s);
 		}
 	}
 	HA_ATOMIC_ADD(&h1c->px_counters->bytes_out, ret);
 	HA_ATOMIC_ADD(&h1c->px_counters->spliced_bytes_out, ret);
 
   end:
-	TRACE_LEAVE(H1_EV_STRM_SEND, cs->conn, h1s, 0, (size_t[]){ret});
+	TRACE_LEAVE(H1_EV_STRM_SEND, h1c->conn, h1s, 0, (size_t[]){ret});
 	return ret;
 }
 #endif
@@ -3834,8 +3828,8 @@ static int h1_show_fd(struct buffer *msg, struct connection *conn)
 			      h1m_state_str(h1s->req.state),
 			      h1m_state_str(h1s->res.state), method, h1s->status);
 		if (h1s->cs)
-			chunk_appendf(msg, " .cs.flg=0x%08x .cs.data=%p",
-				      h1s->cs->flags, h1s->cs->data);
+			chunk_appendf(msg, " .cs.flg=0x%08x .cs.app=%p",
+				      h1s->cs->flags, h1s->cs->app);
 
 		chunk_appendf(&trash, " .subs=%p", h1s->subs);
 		if (h1s->subs) {
