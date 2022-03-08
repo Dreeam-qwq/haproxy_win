@@ -24,6 +24,7 @@
 
 #include <haproxy/action-t.h>
 #include <haproxy/api.h>
+#include <haproxy/conn_stream.h>
 #include <haproxy/fd.h>
 #include <haproxy/freq_ctr.h>
 #include <haproxy/obj_type.h>
@@ -58,8 +59,7 @@ extern struct pool_head *pool_head_uniqueid;
 
 extern struct data_cb sess_conn_cb;
 
-struct stream *stream_new(struct session *sess, enum obj_type *origin, struct buffer *input);
-int stream_create_from_cs(struct conn_stream *cs, struct buffer *input);
+struct stream *stream_new(struct session *sess, struct conn_stream *cs, struct buffer *input);
 int stream_upgrade_from_cs(struct conn_stream *cs, struct buffer *input);
 int stream_set_http_mode(struct stream *s, const struct mux_proto_list *mux_proto);
 
@@ -313,7 +313,7 @@ static inline void stream_init_srv_conn(struct stream *strm)
 
 static inline void stream_choose_redispatch(struct stream *s)
 {
-	struct stream_interface *si = &s->si[1];
+	struct stream_interface *si = cs_si(s->csb);
 
 	/* If the "redispatch" option is set on the backend, we are allowed to
 	 * retry on another server. By default this redispatch occurs on the
@@ -342,7 +342,7 @@ static inline void stream_choose_redispatch(struct stream *s)
 		if (may_dequeue_tasks(objt_server(s->target), s->be))
 			process_srv_queue(objt_server(s->target));
 
-		sockaddr_free(&s->si[1].dst);
+		sockaddr_free(&cs_si(s->csb)->dst);
 		s->flags &= ~(SF_DIRECT | SF_ASSIGNED | SF_ADDR_SET);
 		si->state = SI_ST_REQ;
 	} else {

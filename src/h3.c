@@ -18,6 +18,7 @@
 
 #include <haproxy/buf.h>
 #include <haproxy/connection.h>
+#include <haproxy/conn_stream.h>
 #include <haproxy/dynbuf.h>
 #include <haproxy/h3.h>
 #include <haproxy/http.h>
@@ -93,19 +94,149 @@ static inline size_t h3_decode_frm_header(uint64_t *ftype, uint64_t *flen,
 	return hlen;
 }
 
-/* Decode <qcs> remotely initiated bidi-stream.
+/* Parse from buffer <buf> a H3 HEADERS frame of length <len>. Data are copied
+ * in a local HTX buffer and transfer to the conn-stream layer. <fin> must be
+ * set if this is the last data to transfer from this stream.
+ *
+ * Returns 0 on success else non-zero.
+ */
+static int h3_headers_to_htx(struct qcs *qcs, struct buffer *buf, uint64_t len,
+                             char fin)
+{
+	struct buffer htx_buf = BUF_NULL;
+	struct buffer *tmp = get_trash_chunk();
+	struct htx *htx = NULL;
+	struct htx_sl *sl;
+	struct http_hdr list[global.tune.max_http_hdr];
+	struct conn_stream *cs;
+	unsigned int flags = HTX_SL_F_NONE;
+	struct ist meth = IST_NULL, path = IST_NULL;
+	//struct ist scheme = IST_NULL, authority = IST_NULL;
+	struct ist authority = IST_NULL;
+	int hdr_idx;
+
+	if (qpack_decode_fs((const unsigned char *)b_head(buf), len, tmp, list) < 0)
+		return 1;
+
+	qc_get_buf(qcs, &htx_buf);
+	BUG_ON(!b_size(&htx_buf));
+	htx = htx_from_buf(&htx_buf);
+
+	/* first treat pseudo-header to build the start line */
+	hdr_idx = 0;
+	while (1) {
+		if (isteq(list[hdr_idx].n, ist("")))
+			break;
+
+		if (istmatch(list[hdr_idx].n, ist(":"))) {
+			/* pseudo-header */
+			if (isteq(list[hdr_idx].n, ist(":method")))
+				meth = list[hdr_idx].v;
+			else if (isteq(list[hdr_idx].n, ist(":path")))
+				path = list[hdr_idx].v;
+			//else if (isteq(list[hdr_idx].n, ist(":scheme")))
+			//	scheme = list[hdr_idx].v;
+			else if (isteq(list[hdr_idx].n, ist(":authority")))
+				authority = list[hdr_idx].v;
+		}
+
+		++hdr_idx;
+	}
+
+	flags |= HTX_SL_F_VER_11;
+
+	sl = htx_add_stline(htx, HTX_BLK_REQ_SL, flags, meth, path, ist("HTTP/3.0"));
+	if (!sl)
+		return 1;
+
+	if (fin)
+		sl->flags |= HTX_SL_F_BODYLESS;
+
+	sl->info.req.meth = find_http_meth(meth.ptr, meth.len);
+	BUG_ON(sl->info.req.meth == HTTP_METH_OTHER);
+
+	if (isttest(authority))
+		htx_add_header(htx, ist("host"), authority);
+
+	/* now treat standard headers */
+	hdr_idx = 0;
+	while (1) {
+		if (isteq(list[hdr_idx].n, ist("")))
+			break;
+
+		if (!istmatch(list[hdr_idx].n, ist(":")))
+			htx_add_header(htx, list[hdr_idx].n, list[hdr_idx].v);
+
+		++hdr_idx;
+	}
+
+	htx_add_endof(htx, HTX_BLK_EOH);
+	htx_to_buf(htx, &htx_buf);
+
+	if (fin)
+		htx->flags |= HTX_FL_EOM;
+
+	cs = cs_new();
+	if (!cs)
+		return 1;
+	cs_attach_endp(cs, &qcs->qcc->conn->obj_type, qcs);
+
+	cs->flags |= CS_FL_NOT_FIRST;
+	cs->ctx = qcs;
+	stream_new(qcs->qcc->conn->owner, cs, &htx_buf);
+
+	/* buffer is transferred to conn_stream and set to NULL
+	 * except on stream creation error.
+	 */
+	b_free(&htx_buf);
+	offer_buffers(NULL, 1);
+
+	return 0;
+}
+
+/* Copy from buffer <buf> a H3 DATA frame of length <len> in QUIC stream <qcs>
+ * HTX buffer. <fin> must be set if this is the last data to transfer from this
+ * stream.
+ *
+ * Returns 0 on success else non-zero
+ */
+static int h3_data_to_htx(struct qcs *qcs, struct buffer *buf, uint64_t len,
+                          char fin)
+{
+	struct buffer *appbuf;
+	struct htx *htx = NULL;
+	size_t htx_sent;
+	int htx_space;
+
+	appbuf = qc_get_buf(qcs, &qcs->rx.app_buf);
+	BUG_ON(!appbuf);
+	htx = htx_from_buf(appbuf);
+
+	htx_space = htx_free_data_space(htx);
+	if (!htx_space || htx_space < len) {
+		ABORT_NOW(); /* TODO handle this case properly */
+	}
+
+	htx_sent = htx_add_data(htx, ist2(b_head(buf), len));
+	if (htx_sent < len) {
+		ABORT_NOW(); /* TODO handle this case properly */
+	}
+
+	if (fin)
+		htx->flags |= HTX_FL_EOM;
+	htx_to_buf(htx, appbuf);
+
+	return 0;
+}
+
+/* Decode <qcs> remotely initiated bidi-stream. <fin> must be set to indicate
+ * that we received the last data of the stream.
  * Returns <0 on error else 0.
  */
 static int h3_decode_qcs(struct qcs *qcs, int fin, void *ctx)
 {
 	struct buffer *rxbuf = &qcs->rx.buf;
-	struct h3 *h3 = ctx;
-	struct htx *htx = NULL;
-	struct htx_sl *sl;
-	struct conn_stream *cs;
-	struct http_hdr list[global.tune.max_http_hdr];
-	unsigned int flags = HTX_SL_F_NONE;
-	int hdr_idx;
+	int ret;
 
 	h3_debug_printf(stderr, "%s: STREAM ID: %llu\n", __func__, qcs->by_id.key);
 	if (!b_data(rxbuf))
@@ -115,6 +246,7 @@ static int h3_decode_qcs(struct qcs *qcs, int fin, void *ctx)
 		size_t hlen;
 		uint64_t ftype, flen;
 		struct buffer b;
+		char last_stream_frame = 0;
 
 		/* Work on a copy of <rxbuf> */
 		b = h3_b_dup(rxbuf);
@@ -124,90 +256,26 @@ static int h3_decode_qcs(struct qcs *qcs, int fin, void *ctx)
 
 		h3_debug_printf(stderr, "%s: ftype: %llu, flen: %llu\n", __func__,
 		        (unsigned long long)ftype, (unsigned long long)flen);
-		if (flen > b_data(&b))
+		if (flen > b_data(&b) && !b_full(rxbuf))
 			break;
+
+		/* TODO handle full rxbuf */
+		BUG_ON(flen > b_size(rxbuf));
 
 		b_del(rxbuf, hlen);
+		last_stream_frame = (fin && flen == b_data(rxbuf));
+
 		switch (ftype) {
 		case H3_FT_DATA:
+			ret = h3_data_to_htx(qcs, rxbuf, flen, last_stream_frame);
+			/* TODO handle error reporting. Stream closure required. */
+			if (ret) { ABORT_NOW(); }
 			break;
 		case H3_FT_HEADERS:
-		{
-			const unsigned char *buf = (const unsigned char *)b_head(rxbuf);
-			size_t len = b_data(rxbuf);
-			struct buffer htx_buf = BUF_NULL;
-			struct buffer *tmp = get_trash_chunk();
-			struct ist meth = IST_NULL, path = IST_NULL;
-			//struct ist scheme = IST_NULL, authority = IST_NULL;
-			struct ist authority = IST_NULL;
-
-			if (qpack_decode_fs(buf, len, tmp, list) < 0) {
-				h3->err = QPACK_DECOMPRESSION_FAILED;
-				return -1;
-			}
-
-			b_alloc(&htx_buf);
-			htx = htx_from_buf(&htx_buf);
-
-			/* first treat pseudo-header to build the start line */
-			hdr_idx = 0;
-			while (1) {
-				if (isteq(list[hdr_idx].n, ist("")))
-					break;
-
-				if (istmatch(list[hdr_idx].n, ist(":"))) {
-					/* pseudo-header */
-					if (isteq(list[hdr_idx].n, ist(":method")))
-						meth = list[hdr_idx].v;
-					else if (isteq(list[hdr_idx].n, ist(":path")))
-						path = list[hdr_idx].v;
-					//else if (isteq(list[hdr_idx].n, ist(":scheme")))
-					//	scheme = list[hdr_idx].v;
-					else if (isteq(list[hdr_idx].n, ist(":authority")))
-						authority = list[hdr_idx].v;
-				}
-
-				++hdr_idx;
-			}
-
-			flags |= HTX_SL_F_VER_11;
-
-			sl = htx_add_stline(htx, HTX_BLK_REQ_SL, flags, meth, path, ist("HTTP/3.0"));
-			if (!sl)
-				goto fail;
-			sl->flags |= HTX_SL_F_BODYLESS;
-			sl->info.req.meth = find_http_meth(meth.ptr, meth.len);
-			BUG_ON(sl->info.req.meth == HTTP_METH_OTHER);
-
-			if (isttest(authority))
-				htx_add_header(htx, ist("host"), authority);
-
-			/* now treat standard headers */
-			hdr_idx = 0;
-			while (1) {
-				if (isteq(list[hdr_idx].n, ist("")))
-					break;
-
-				if (!istmatch(list[hdr_idx].n, ist(":")))
-					htx_add_header(htx, list[hdr_idx].n, list[hdr_idx].v);
-
-				++hdr_idx;
-			}
-
-			htx_add_endof(htx, HTX_BLK_EOH);
-			htx_to_buf(htx, &htx_buf);
-
-			cs = cs_new(qcs->qcc->conn, qcs->qcc->conn->target);
-			cs->ctx = qcs;
-			stream_create_from_cs(cs, &htx_buf);
-
-			/* buffer is transferred to conn_stream and set to NULL
-			 * except on stream creation error.
-			 */
-			b_free(&htx_buf);
-
+			ret = h3_headers_to_htx(qcs, rxbuf, flen, last_stream_frame);
+			/* TODO handle error reporting. Stream closure required. */
+			if (ret) { ABORT_NOW(); }
 			break;
-		}
 		case H3_FT_PUSH_PROMISE:
 			/* Not supported */
 			break;
@@ -220,15 +288,7 @@ static int h3_decode_qcs(struct qcs *qcs, int fin, void *ctx)
 		b_del(rxbuf, flen);
 	}
 
-	if (htx) {
-		if (fin && !b_data(rxbuf))
-			htx->flags |= HTX_FL_EOM;
-	}
-
 	return 0;
-
- fail:
-	return -1;
 }
 
 /* Parse a SETTINGS frame which must not be truncated with <flen> as length from
@@ -468,6 +528,14 @@ static int h3_resp_headers_send(struct qcs *qcs, struct htx *htx)
 	for (hdr = 0; hdr < sizeof(list) / sizeof(list[0]); ++hdr) {
 		if (isteq(list[hdr].n, ist("")))
 			break;
+
+		/* draft-ietf-quic-http34 4.1. HTTP Message Exchanges
+		 * Transfer codings (see Section 6.1 of [HTTP11]) are not
+		 * defined for HTTP/3; the Transfer-Encoding header field MUST
+		 * NOT be used.
+		 */
+		if (isteq(list[hdr].n, ist("transfer-encoding")))
+			continue;
 
 		if (qpack_encode_header(&headers_buf, list[hdr].n, list[hdr].v))
 			ABORT_NOW();
@@ -769,10 +837,6 @@ static int h3_uqs_init(struct h3_uqs *h3_uqs, struct h3 *h3,
 	h3_uqs->wait_event.tasklet->process = t;
 	h3_uqs->wait_event.tasklet->context = h3_uqs;
 	return 1;
-
- err:
-	tasklet_free(h3_uqs->wait_event.tasklet);
-	return 0;
 }
 
 static inline void h3_uqs_release(struct h3_uqs *h3_uqs)

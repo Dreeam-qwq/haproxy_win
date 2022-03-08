@@ -249,7 +249,7 @@ void ha_task_dump(struct buffer *buf, const struct task *task, const char *pfx)
 	if (task->process == process_stream && task->context)
 		s = (struct stream *)task->context;
 	else if (task->process == task_run_applet && task->context)
-		s = si_strm(((struct appctx *)task->context)->owner);
+		s = si_strm(cs_si(((struct appctx *)task->context)->owner));
 	else if (task->process == si_cs_io_cb && task->context)
 		s = si_strm((struct stream_interface *)task->context);
 
@@ -288,7 +288,7 @@ void ha_task_dump(struct buffer *buf, const struct task *task, const char *pfx)
  */
 static int cli_io_handler_show_threads(struct appctx *appctx)
 {
-	struct stream_interface *si = appctx->owner;
+	struct stream_interface *si = cs_si(appctx->owner);
 	int thr;
 
 	if (unlikely(si_ic(si)->flags & (CF_WRITE_ERROR|CF_SHUTW)))
@@ -337,6 +337,22 @@ void ha_panic()
 		abort();
 }
 
+/* Complain with message <msg> on stderr. If <counter> is not NULL, it is
+ * atomically incremented, and the message is only printed when the counter
+ * was zero, so that the message is only printed once. <taint> is only checked
+ * on bit 1, and will taint the process either for a bug (2) or warn (0).
+ */
+void complain(int *counter, const char *msg, int taint)
+{
+	if (counter && _HA_ATOMIC_FETCH_ADD(counter, 1))
+		return;
+	DISGUISE(write(2, msg, strlen(msg)));
+	if (taint & 2)
+		mark_tainted(TAINTED_BUG);
+	else
+		mark_tainted(TAINTED_WARN);
+}
+
 /* parse a "debug dev exit" command. It always returns 1, though it should never return. */
 static int debug_parse_cli_exit(char **args, char *payload, struct appctx *appctx, void *private)
 {
@@ -360,6 +376,32 @@ int debug_parse_cli_bug(char **args, char *payload, struct appctx *appctx, void 
 
 	_HA_ATOMIC_INC(&debug_commands_issued);
 	BUG_ON(one > zero);
+	return 1;
+}
+
+/* parse a "debug dev warn" command. It always returns 1.
+ * Note: we make sure not to make the function static so that it appears in the trace.
+ */
+int debug_parse_cli_warn(char **args, char *payload, struct appctx *appctx, void *private)
+{
+	if (!cli_has_level(appctx, ACCESS_LVL_ADMIN))
+		return 1;
+
+	_HA_ATOMIC_INC(&debug_commands_issued);
+	WARN_ON(one > zero);
+	return 1;
+}
+
+/* parse a "debug dev check" command. It always returns 1.
+ * Note: we make sure not to make the function static so that it appears in the trace.
+ */
+int debug_parse_cli_check(char **args, char *payload, struct appctx *appctx, void *private)
+{
+	if (!cli_has_level(appctx, ACCESS_LVL_ADMIN))
+		return 1;
+
+	_HA_ATOMIC_INC(&debug_commands_issued);
+	CHECK_IF(one > zero);
 	return 1;
 }
 
@@ -632,7 +674,7 @@ static int debug_parse_cli_write(char **args, char *payload, struct appctx *appc
  */
 static int debug_parse_cli_stream(char **args, char *payload, struct appctx *appctx, void *private)
 {
-	struct stream *s = si_strm(appctx->owner);
+	struct stream *s = si_strm(cs_si(appctx->owner));
 	int arg;
 	void *ptr;
 	int size;
@@ -684,17 +726,17 @@ static int debug_parse_cli_stream(char **args, char *payload, struct appctx *app
 		} else if (isteq(name, ist("res.w"))) {
 			ptr = (!s || !may_access(s)) ? NULL : &s->res.wex; size = sizeof(s->res.wex);
 		} else if (isteq(name, ist("sif.f"))) {
-			ptr = (!s || !may_access(s)) ? NULL : &s->si[0].flags; size = sizeof(s->si[0].flags);
+			ptr = (!s || !may_access(s)) ? NULL : &cs_si(s->csf)->flags; size = sizeof(cs_si(s->csf)->flags);
 		} else if (isteq(name, ist("sib.f"))) {
-			ptr = (!s || !may_access(s)) ? NULL : &s->si[1].flags; size = sizeof(s->si[1].flags);
+			ptr = (!s || !may_access(s)) ? NULL : &cs_si(s->csb)->flags; size = sizeof(cs_si(s->csb)->flags);
 		} else if (isteq(name, ist("sif.x"))) {
-			ptr = (!s || !may_access(s)) ? NULL : &s->si[0].exp; size = sizeof(s->si[0].exp);
+			ptr = (!s || !may_access(s)) ? NULL : &cs_si(s->csf)->exp; size = sizeof(cs_si(s->csf)->exp);
 		} else if (isteq(name, ist("sib.x"))) {
-			ptr = (!s || !may_access(s)) ? NULL : &s->si[1].exp; size = sizeof(s->si[1].exp);
+			ptr = (!s || !may_access(s)) ? NULL : &cs_si(s->csb)->exp; size = sizeof(cs_si(s->csb)->exp);
 		} else if (isteq(name, ist("sif.s"))) {
-			ptr = (!s || !may_access(s)) ? NULL : &s->si[0].state; size = sizeof(s->si[0].state);
+			ptr = (!s || !may_access(s)) ? NULL : &cs_si(s->csf)->state; size = sizeof(cs_si(s->csf)->state);
 		} else if (isteq(name, ist("sib.s"))) {
-			ptr = (!s || !may_access(s)) ? NULL : &s->si[1].state; size = sizeof(s->si[1].state);
+			ptr = (!s || !may_access(s)) ? NULL : &cs_si(s->csf)->state; size = sizeof(cs_si(s->csb)->state);
 		} else if (isteq(name, ist("wake"))) {
 			if (s && may_access(s) && may_access((void *)s + sizeof(*s) - 1))
 				task_wakeup(s->task, TASK_WOKEN_TIMER|TASK_WOKEN_IO|TASK_WOKEN_MSG);
@@ -1182,7 +1224,7 @@ static int debug_parse_cli_memstats(char **args, char *payload, struct appctx *a
  */
 static int debug_iohandler_memstats(struct appctx *appctx)
 {
-	struct stream_interface *si = appctx->owner;
+	struct stream_interface *si = cs_si(appctx->owner);
 	struct mem_stats *ptr = appctx->ctx.cli.p0;
 	int ret = 1;
 
@@ -1372,6 +1414,7 @@ REGISTER_PER_THREAD_INIT(init_debug_per_thread);
 /* register cli keywords */
 static struct cli_kw_list cli_kws = {{ },{
 	{{ "debug", "dev", "bug", NULL },      "debug dev bug                           : call BUG_ON() and crash",                 debug_parse_cli_bug,   NULL, NULL, NULL, ACCESS_EXPERT },
+	{{ "debug", "dev", "check", NULL },    "debug dev check                         : call CHECK_IF() and possibly crash",      debug_parse_cli_check, NULL, NULL, NULL, ACCESS_EXPERT },
 	{{ "debug", "dev", "close", NULL },    "debug dev close  <fd>                   : close this file descriptor",              debug_parse_cli_close, NULL, NULL, NULL, ACCESS_EXPERT },
 	{{ "debug", "dev", "delay", NULL },    "debug dev delay  [ms]                   : sleep this long",                         debug_parse_cli_delay, NULL, NULL, NULL, ACCESS_EXPERT },
 #if defined(DEBUG_DEV)
@@ -1390,6 +1433,7 @@ static struct cli_kw_list cli_kws = {{ },{
 	{{ "debug", "dev", "stream",NULL },    "debug dev stream [k=v]*                 : show/manipulate stream flags",            debug_parse_cli_stream,NULL, NULL, NULL, ACCESS_EXPERT },
 	{{ "debug", "dev", "sym",   NULL },    "debug dev sym    <addr>                 : resolve symbol address",                  debug_parse_cli_sym,   NULL, NULL, NULL, ACCESS_EXPERT },
 	{{ "debug", "dev", "tkill", NULL },    "debug dev tkill  [thr] [sig]            : send signal to thread",                   debug_parse_cli_tkill, NULL, NULL, NULL, ACCESS_EXPERT },
+	{{ "debug", "dev", "warn",  NULL },    "debug dev warn                          : call WARN_ON() and possibly crash",       debug_parse_cli_warn,  NULL, NULL, NULL, ACCESS_EXPERT },
 	{{ "debug", "dev", "write", NULL },    "debug dev write  [size]                 : write that many bytes in return",         debug_parse_cli_write, NULL, NULL, NULL, ACCESS_EXPERT },
 #if defined(HA_HAVE_DUMP_LIBS)
 	{{ "show", "libs", NULL, NULL },       "show libs                               : show loaded object files and libraries", debug_parse_cli_show_libs, NULL, NULL },

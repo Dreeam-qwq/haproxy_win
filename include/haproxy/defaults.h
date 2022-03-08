@@ -354,7 +354,7 @@
 
 /* ssl max dh param size */
 #ifndef SSL_DEFAULT_DH_PARAM
-#define SSL_DEFAULT_DH_PARAM 0
+#define SSL_DEFAULT_DH_PARAM 2048
 #endif
 
 /* max memory cost per SSL session */
@@ -383,6 +383,11 @@
 /* available memory estimate : count about 3% of overhead in various structures */
 #ifndef MEM_USABLE_RATIO
 #define MEM_USABLE_RATIO 0.97
+#endif
+
+/* if not 0, maximum allocatable memory per process in MB */
+#ifndef HAPROXY_MEMMAX
+#define HAPROXY_MEMMAX 0
 #endif
 
 /* Pools are always enabled unless explicitly disabled. When disabled, the

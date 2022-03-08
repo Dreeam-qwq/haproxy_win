@@ -177,8 +177,8 @@ DOCDIR = $(PREFIX)/doc/haproxy
 #### TARGET system
 # Use TARGET=<target_name> to optimize for a specific target OS among the
 # following list (use the default "generic" if uncertain) :
-#    linux-glibc, linux-glibc-legacy, linux-musl, solaris, freebsd, dragonfly,
-#    openbsd, netbsd, cygwin, haiku, aix51, aix52, aix72-gcc, osx, generic,
+#    linux-glibc, linux-glibc-legacy, linux-musl, solaris, freebsd, freebsd-glibc,
+#    dragonfly, openbsd, netbsd, cygwin, haiku, aix51, aix52, aix72-gcc, osx, generic,
 #    custom
 TARGET =
 
@@ -255,10 +255,10 @@ SMALL_OPTS =
 # not use them at all. Some even more obscure ones might also be available
 # without appearing here. Currently defined DEBUG macros include DEBUG_FULL,
 # DEBUG_MEM_STATS, DEBUG_DONT_SHARE_POOLS, DEBUG_FD, DEBUG_POOL_INTEGRITY,
-# DEBUG_NO_POOLS, DEBUG_FAIL_ALLOC, DEBUG_STRICT_NOCRASH, DEBUG_HPACK,
+# DEBUG_NO_POOLS, DEBUG_FAIL_ALLOC, DEBUG_STRICT_ACTION=[0-3], DEBUG_HPACK,
 # DEBUG_AUTH, DEBUG_SPOE, DEBUG_UAF, DEBUG_THREAD, DEBUG_STRICT, DEBUG_DEV,
 # DEBUG_TASK, DEBUG_MEMORY_POOLS, DEBUG_POOL_TRACING.
-DEBUG =
+DEBUG = -DDEBUG_STRICT -DDEBUG_MEMORY_POOLS
 
 #### Trace options
 # Use TRACE=1 to trace function calls to file "trace.out" or to stderr if not
@@ -410,6 +410,13 @@ ifeq ($(TARGET),freebsd)
   set_target_defaults = $(call default_opts, \
     USE_POLL USE_TPROXY USE_LIBCRYPT USE_THREAD USE_CPU_AFFINITY USE_KQUEUE   \
     USE_ACCEPT4 USE_CLOSEFROM USE_GETADDRINFO USE_PROCCTL)
+endif
+
+# kFreeBSD glibc
+ifeq ($(TARGET),freebsd-glibc)
+  set_target_defaults = $(call default_opts, \
+    USE_POLL USE_TPROXY USE_LIBCRYPT USE_THREAD USE_CPU_AFFINITY USE_KQUEUE   \
+    USE_ACCEPT4 USE_GETADDRINFO USE_CRYPT_H USE_DL)
 endif
 
 # DragonFlyBSD 4.3 and above
@@ -935,7 +942,7 @@ OBJS += src/mux_h2.o src/mux_fcgi.o src/http_ana.o src/mux_h1.o               \
         src/base64.o src/uri_auth.o src/time.o src/ebsttree.o src/ebistree.o  \
         src/dynbuf.o src/auth.o src/wdt.o src/pipe.o src/http_acl.o           \
         src/hpack-huff.o src/hpack-enc.o src/dict.o src/init.o src/freq_ctr.o \
-        src/ebtree.o src/hash.o src/dgram.o src/version.o
+        src/ebtree.o src/hash.o src/dgram.o src/version.o src/conn_stream.o
 
 ifneq ($(TRACE),)
 OBJS += src/calltrace.o

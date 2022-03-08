@@ -15,6 +15,7 @@
 #include <haproxy/api.h>
 #include <haproxy/cfgparse.h>
 #include <haproxy/connection.h>
+#include <haproxy/conn_stream.h>
 #include <haproxy/h2.h>
 #include <haproxy/hpack-dec.h>
 #include <haproxy/hpack-enc.h>
@@ -1528,13 +1529,12 @@ static struct h2s *h2c_frt_stream_new(struct h2c *h2c, int id, struct buffer *in
 	if (!h2s)
 		goto out;
 
-	cs = cs_new(h2c->conn, h2c->conn->target);
+	cs = cs_new();
 	if (!cs)
 		goto out_close;
-
 	cs->flags |= CS_FL_NOT_FIRST;
+	cs_attach_endp(cs, &h2c->conn->obj_type, h2s);
 	h2s->cs = cs;
-	cs->ctx = h2s;
 	h2c->nb_cs++;
 
 	/* FIXME wrong analogy between ext-connect and websocket, this need to
@@ -1543,7 +1543,13 @@ static struct h2s *h2c_frt_stream_new(struct h2c *h2c, int id, struct buffer *in
 	if (flags & H2_SF_EXT_CONNECT_RCVD)
 		cs->flags |= CS_FL_WEBSOCKET;
 
-	if (stream_create_from_cs(cs, input) < 0)
+	/* The stream will record the request's accept date (which is either the
+	 * end of the connection's or the date immediately after the previous
+	 * request) and the idle time, which is the delay since the previous
+	 * request. We can set the value now, it will be copied by stream_new().
+	 */
+	sess->t_idle = tv_ms_elapsed(&sess->tv_accept, &now) - sess->t_handshake;
+	if (!stream_new(h2c->conn->owner, cs, input))
 		goto out_free_cs;
 
 	/* We want the accept date presented to the next stream to be the one
@@ -1554,6 +1560,7 @@ static struct h2s *h2c_frt_stream_new(struct h2c *h2c, int id, struct buffer *in
 	sess->accept_date = date;
 	sess->tv_accept   = now;
 	sess->t_handshake = 0;
+	sess->t_idle = 0;
 
 	/* OK done, the stream lives its own life now */
 	if (h2_frt_has_too_many_cs(h2c))
@@ -4173,23 +4180,16 @@ do_leave:
  * Attach a new stream to a connection
  * (Used for outgoing connections)
  */
-static struct conn_stream *h2_attach(struct connection *conn, struct session *sess)
+static int h2_attach(struct connection *conn, struct conn_stream *cs, struct session *sess)
 {
-	struct conn_stream *cs;
 	struct h2s *h2s;
 	struct h2c *h2c = conn->ctx;
 
 	TRACE_ENTER(H2_EV_H2S_NEW, conn);
-	cs = cs_new(conn, conn->target);
-	if (!cs) {
-		TRACE_DEVEL("leaving on CS allocation failure", H2_EV_H2S_NEW|H2_EV_H2S_ERR, conn);
-		return NULL;
-	}
 	h2s = h2c_bck_stream_new(h2c, cs, sess);
 	if (!h2s) {
 		TRACE_DEVEL("leaving on stream creation failure", H2_EV_H2S_NEW|H2_EV_H2S_ERR, conn);
-		cs_free(cs);
-		return NULL;
+		return -1;
 	}
 
 	/* the connection is not idle anymore, let's mark this */
@@ -4197,7 +4197,7 @@ static struct conn_stream *h2_attach(struct connection *conn, struct session *se
 	xprt_set_used(h2c->conn, h2c->conn->xprt, h2c->conn->xprt_ctx);
 
 	TRACE_LEAVE(H2_EV_H2S_NEW, conn, h2s);
-	return cs;
+	return 0;
 }
 
 /* Retrieves the first valid conn_stream from this connection, or returns NULL.
@@ -4288,7 +4288,7 @@ static void h2_detach(struct conn_stream *cs)
 	/* this stream may be blocked waiting for some data to leave (possibly
 	 * an ES or RST frame), so orphan it in this case.
 	 */
-	if (!(cs->conn->flags & CO_FL_ERROR) &&
+	if (!(h2c->conn->flags & CO_FL_ERROR) &&
 	    (h2c->st0 < H2_CS_ERROR) &&
 	    (h2s->flags & (H2_SF_BLK_MBUSY | H2_SF_BLK_MROOM | H2_SF_BLK_MFCTL)) &&
 	    ((h2s->flags & (H2_SF_WANT_SHUTR | H2_SF_WANT_SHUTW)) || h2s->subs)) {
@@ -5259,7 +5259,7 @@ static size_t h2s_frt_make_resp_headers(struct h2s *h2s, struct htx *htx)
 	if (h2c->flags & H2_CF_SHTS_UPDATED) {
 		/* was sent above */
 		h2c->flags |= H2_CF_DTSU_EMITTED;
-		h2c->flags &= H2_CF_SHTS_UPDATED;
+		h2c->flags &= ~H2_CF_SHTS_UPDATED;
 	}
 
 	if (es_now) {
@@ -6351,7 +6351,7 @@ static size_t h2_rcv_buf(struct conn_stream *cs, struct buffer *buf, size_t coun
 
 	/* transfer possibly pending data to the upper layer */
 	h2s_htx = htx_from_buf(&h2s->rxbuf);
-	if (htx_is_empty(h2s_htx)) {
+	if (htx_is_empty(h2s_htx) && !(h2s_htx->flags & HTX_FL_PARSING_ERROR)) {
 		/* Here htx_to_buf() will set buffer data to 0 because
 		 * the HTX is empty.
 		 */
@@ -6651,8 +6651,8 @@ static int h2_show_fd(struct buffer *msg, struct connection *conn)
 			      (unsigned int)b_head_ofs(&h2s->rxbuf), (unsigned int)b_size(&h2s->rxbuf),
 			      h2s->cs);
 		if (h2s->cs)
-			chunk_appendf(msg, "(.flg=0x%08x .data=%p)",
-				      h2s->cs->flags, h2s->cs->data);
+			chunk_appendf(msg, "(.flg=0x%08x .app=%p)",
+				      h2s->cs->flags, h2s->cs->app);
 
 		chunk_appendf(&trash, " .subs=%p", h2s->subs);
 		if (h2s->subs) {

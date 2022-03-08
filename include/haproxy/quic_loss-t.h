@@ -2,7 +2,7 @@
  * include/types/quic_loss.h
  * This file contains definitions for QUIC loss detection.
  *
- * Copyright 2019 HAProxy Technologies, Frédéric Lécaille <flecaille@haproxy.com>
+ * Copyright 2019 HAProxy Technologies, Frederic Lecaille <flecaille@haproxy.com>
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -40,7 +40,7 @@
 struct quic_loss {
 	/* The most recent RTT measurement. */
 	unsigned int latest_rtt;
-	/* Smoothed RTT << 4*/
+	/* Smoothed RTT << 3 */
 	unsigned int srtt;
 	/* RTT variation << 2 */
 	unsigned int rtt_var;

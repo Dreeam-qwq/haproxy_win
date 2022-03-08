@@ -2,7 +2,7 @@
  * include/haproxy/quic_enc.h
  * This file contains QUIC varint encoding function prototypes
  *
- * Copyright 2021 HAProxy Technologies, Frédéric Lécaille <flecaille@haproxy.com>
+ * Copyright 2021 HAProxy Technologies, Frederic Lecaille <flecaille@haproxy.com>
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -83,6 +83,23 @@ static inline size_t quic_int_getsize(uint64_t val)
 		return 4;
 	case QUIC_VARINT_4_BYTE_MAX + 1 ... QUIC_VARINT_8_BYTE_MAX:
 		return 8;
+	default:
+		return 0;
+	}
+}
+
+/* Returns the maximum integer which may be encoded with <size> bytes */
+static inline size_t quic_max_int_by_size(int size)
+{
+	switch (size) {
+	case 1:
+		return QUIC_VARINT_1_BYTE_MAX;
+	case 2:
+		return QUIC_VARINT_2_BYTE_MAX;
+	case 4:
+		return QUIC_VARINT_4_BYTE_MAX;
+	case 8:
+		return QUIC_VARINT_8_BYTE_MAX;
 	default:
 		return 0;
 	}

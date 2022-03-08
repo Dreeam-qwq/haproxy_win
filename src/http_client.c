@@ -165,7 +165,7 @@ err:
  */
 static int hc_cli_io_handler(struct appctx *appctx)
 {
-	struct stream_interface *si = appctx->owner;
+	struct stream_interface *si = cs_si(appctx->owner);
 	struct buffer *trash = alloc_trash_chunk();
 	struct httpclient *hc = appctx->ctx.cli.p0;
 	struct http_hdr *hdrs, *hdr;
@@ -173,7 +173,8 @@ static int hc_cli_io_handler(struct appctx *appctx)
 	if (!trash)
 		goto out;
 	if (appctx->ctx.cli.i0 & HC_CLI_F_RES_STLINE) {
-		chunk_appendf(trash, "%s %d %s\n",istptr(hc->res.vsn), hc->res.status, istptr(hc->res.reason));
+		chunk_appendf(trash, "%.*s %d %.*s\n", (unsigned int)istlen(hc->res.vsn), istptr(hc->res.vsn),
+			      hc->res.status, (unsigned int)istlen(hc->res.reason), istptr(hc->res.reason));
 		if (ci_putchk(si_ic(si), trash) == -1)
 			si_rx_room_blk(si);
 		appctx->ctx.cli.i0 &= ~HC_CLI_F_RES_STLINE;
@@ -235,7 +236,7 @@ static void hc_cli_release(struct appctx *appctx)
 
 /* register cli keywords */
 static struct cli_kw_list cli_kws = {{ },{
-	{ { "httpclient", NULL }, "httpclient <method> <URI>   : launch an HTTP request", hc_cli_parse, hc_cli_io_handler, hc_cli_release,  NULL, ACCESS_EXPERT},
+	{ { "httpclient", NULL }, "httpclient <method> <URI>               : launch an HTTP request", hc_cli_parse, hc_cli_io_handler, hc_cli_release,  NULL, ACCESS_EXPERT},
 	{ { NULL }, NULL, NULL, NULL }
 }};
 
@@ -351,9 +352,10 @@ error:
  */
 int httpclient_res_xfer(struct httpclient *hc, struct buffer *dst)
 {
+	size_t room = b_room(dst);
 	int ret;
 
-	ret = b_force_xfer(dst, &hc->res.buf, b_data(&hc->res.buf));
+	ret = b_force_xfer(dst, &hc->res.buf, MIN(room, b_data(&hc->res.buf)));
 	/* call the client once we consumed all data */
 	if (!b_data(&hc->res.buf)) {
 		b_free(&hc->res.buf);
@@ -403,6 +405,40 @@ error:
 	return ret;
 }
 
+/* Set the 'timeout server' in ms for the next httpclient request */
+void httpclient_set_timeout(struct httpclient *hc, int timeout)
+{
+	hc->timeout_server = timeout;
+}
+
+/*
+ * Sets a destination for the httpclient from an HAProxy addr format
+ * This will prevent to determine the destination from the URL
+ * Return 0 in case of success or -1 otherwise.
+ */
+int httpclient_set_dst(struct httpclient *hc, const char *dst)
+{
+	struct sockaddr_storage *sk;
+	char *errmsg = NULL;
+
+	sockaddr_free(&hc->dst);
+	/* 'sk' is statically allocated (no need to be freed). */
+	sk = str2sa_range(dst, NULL, NULL, NULL, NULL, NULL,
+	                  &errmsg, NULL, NULL,
+	                  PA_O_PORT_OK | PA_O_STREAM | PA_O_XPRT | PA_O_CONNECT);
+	if (!sk) {
+		ha_alert("httpclient: Failed to parse destination address in %s\n", errmsg);
+		free(errmsg);
+		return -1;
+	}
+
+	if (!sockaddr_alloc(&hc->dst, sk, sizeof(*sk))) {
+		ha_alert("httpclient: Failed to allocate sockaddr in %s:%d.\n", __FUNCTION__, __LINE__);
+		return -1;
+	}
+
+	return 0;
+}
 
 /*
  * Start the HTTP client
@@ -418,13 +454,22 @@ struct appctx *httpclient_start(struct httpclient *hc)
 	struct applet *applet = &httpclient_applet;
 	struct appctx *appctx;
 	struct session *sess;
+	struct conn_stream *cs;
 	struct stream *s;
 	int len;
+	struct sockaddr_storage ss_url;
+	struct sockaddr_storage* ss_dst;
 	struct split_url out;
 
+	/* if the client was started and not ended, an applet is already
+	 * running, we shouldn't try anything */
+	if (httpclient_started(hc) && !httpclient_ended(hc))
+		return NULL;
+
+	hc->flags = 0;
+
 	/* parse URI and fill sockaddr_storage */
-	/* FIXME: use a resolver */
-	len = url2sa(istptr(hc->req.url), istlen(hc->req.url), &hc->dst, &out);
+	len = url2sa(istptr(hc->req.url), istlen(hc->req.url), &ss_url, &out);
 	if (len == -1) {
 		ha_alert("httpclient: cannot parse uri '%s'.\n", istptr(hc->req.url));
 		goto out;
@@ -441,12 +486,28 @@ struct appctx *httpclient_start(struct httpclient *hc)
 		ha_alert("httpclient: out of memory in %s:%d.\n", __FUNCTION__, __LINE__);
 		goto out_free_appctx;
 	}
-	if ((s = stream_new(sess, &appctx->obj_type, &hc->req.buf)) == NULL) {
+	cs = cs_new();
+	if (!cs) {
+		ha_alert("httpclient: out of memory in %s:%d.\n", __FUNCTION__, __LINE__);
+		goto out_free_sess;
+	}
+	cs_attach_endp(cs, &appctx->obj_type, appctx);
+	if ((s = stream_new(sess, cs, &hc->req.buf)) == NULL) {
 		ha_alert("httpclient: Failed to initialize stream %s:%d.\n", __FUNCTION__, __LINE__);
-		goto out_free_appctx;
+		goto out_free_cs;
 	}
 
-	if (!sockaddr_alloc(&s->si[1].dst, &hc->dst, sizeof(hc->dst))) {
+	/* set the "timeout server" */
+	s->req.wto = hc->timeout_server;
+	s->res.rto = hc->timeout_server;
+
+	/* if httpclient_set_dst() was used, sets the alternative address */
+	if (hc->dst)
+		ss_dst = hc->dst;
+	else
+		ss_dst = &ss_url;
+
+	if (!sockaddr_alloc(&cs_si(s->csb)->dst, ss_dst, sizeof(*hc->dst))) {
 		ha_alert("httpclient: Failed to initialize stream in %s:%d.\n", __FUNCTION__, __LINE__);
 		goto out_free_stream;
 	}
@@ -467,14 +528,13 @@ struct appctx *httpclient_start(struct httpclient *hc)
 	}
 
 	s->flags |= SF_ASSIGNED|SF_ADDR_SET;
-	s->si[1].flags |= SI_FL_NOLINGER;
+	cs_si(s->csb)->flags |= SI_FL_NOLINGER;
 	s->res.flags |= CF_READ_DONTWAIT;
 
 	/* applet is waiting for data */
-	si_cant_get(&s->si[0]);
+	si_cant_get(cs_si(s->csf));
 	appctx_wakeup(appctx);
 
-	task_wakeup(s->task, TASK_WOKEN_INIT);
 	hc->appctx = appctx;
 	hc->flags |= HTTPCLIENT_FS_STARTED;
 	appctx->ctx.httpclient.ptr = hc;
@@ -489,6 +549,8 @@ struct appctx *httpclient_start(struct httpclient *hc)
 out_free_stream:
 	LIST_DELETE(&s->list);
 	pool_free(pool_head_stream, s);
+out_free_cs:
+	cs_free(cs);
 out_free_sess:
 	session_free(sess);
 out_free_appctx:
@@ -545,7 +607,7 @@ void httpclient_destroy(struct httpclient *hc)
 	}
 	ha_free(&hc->res.hdrs);
 	b_free(&hc->res.buf);
-
+	sockaddr_free(&hc->dst);
 
 	free(hc);
 
@@ -578,7 +640,7 @@ err:
 static void httpclient_applet_io_handler(struct appctx *appctx)
 {
 	struct httpclient *hc = appctx->ctx.httpclient.ptr;
-	struct stream_interface *si = appctx->owner;
+	struct stream_interface *si = cs_si(appctx->owner);
 	struct stream *s = si_strm(si);
 	struct channel *req = &s->req;
 	struct channel *res = &s->res;
@@ -991,5 +1053,5 @@ err:
 
 /* initialize the proxy and servers for the HTTP client */
 
-INITCALL0(STG_REGISTER, httpclient_init);
+INITCALL0(STG_INIT, httpclient_init);
 REGISTER_CONFIG_POSTPARSER("httpclient", httpclient_cfg_postparser);

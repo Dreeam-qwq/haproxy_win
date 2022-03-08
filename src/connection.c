@@ -17,6 +17,7 @@
 #include <haproxy/api.h>
 #include <haproxy/cfgparse.h>
 #include <haproxy/connection.h>
+#include <haproxy/conn_stream.h>
 #include <haproxy/fd.h>
 #include <haproxy/frontend.h>
 #include <haproxy/hash.h>
@@ -26,14 +27,14 @@
 #include <haproxy/net_helper.h>
 #include <haproxy/proto_tcp.h>
 #include <haproxy/sample.h>
-#include <haproxy/ssl_sock.h>
+#include <haproxy/session.h>
 #include <haproxy/stream_interface.h>
+#include <haproxy/ssl_sock.h>
 #include <haproxy/tools.h>
 #include <haproxy/xxhash.h>
 
 
 DECLARE_POOL(pool_head_connection,     "connection",     sizeof(struct connection));
-DECLARE_POOL(pool_head_connstream,     "conn_stream",    sizeof(struct conn_stream));
 DECLARE_POOL(pool_head_conn_hash_node, "conn_hash_node", sizeof(struct conn_hash_node));
 DECLARE_POOL(pool_head_sockaddr,       "sockaddr",       sizeof(struct sockaddr_storage));
 DECLARE_POOL(pool_head_authority,      "authority",      PP2_AUTHORITY_MAX);
@@ -559,42 +560,6 @@ void sockaddr_free(struct sockaddr_storage **sap)
 	*sap = NULL;
 }
 
-/* Releases a conn_stream previously allocated by cs_new(), as well as any
- * buffer it would still hold.
- */
-void cs_free(struct conn_stream *cs)
-{
-
-	pool_free(pool_head_connstream, cs);
-}
-
-/* Tries to allocate a new conn_stream and initialize its main fields. If
- * <conn> is NULL, then a new connection is allocated on the fly, initialized,
- * and assigned to cs->conn ; this connection will then have to be released
- * using pool_free() or conn_free(). The conn_stream is initialized and added
- * to the mux's stream list on success, then returned. On failure, nothing is
- * allocated and NULL is returned.
- */
-struct conn_stream *cs_new(struct connection *conn, void *target)
-{
-	struct conn_stream *cs;
-
-	cs = pool_alloc(pool_head_connstream);
-	if (unlikely(!cs))
-		return NULL;
-
-	if (!conn) {
-		conn = conn_new(target);
-		if (unlikely(!conn)) {
-			cs_free(cs);
-			return NULL;
-		}
-	}
-
-	cs_init(cs, conn);
-	return cs;
-}
-
 /* Try to add a handshake pseudo-XPRT. If the connection's first XPRT is
  * raw_sock, then just use the new XPRT as the connection XPRT, otherwise
  * call the xprt's add_xprt() method.
@@ -1108,9 +1073,8 @@ int conn_recv_proxy(struct connection *conn, int flag)
 				if (!isttest(conn->proxy_authority))
 					goto fail;
 				if (istcpy(&conn->proxy_authority, tlv, PP2_AUTHORITY_MAX) < 0) {
-					/* This is technically unreachable, because we verified above
-					 * that the TLV value fits.
-					 */
+					/* This is impossible, because we verified that the TLV value fits. */
+					my_unreachable();
 					goto fail;
 				}
 				break;
@@ -1122,9 +1086,8 @@ int conn_recv_proxy(struct connection *conn, int flag)
 				if (!isttest(conn->proxy_unique_id))
 					goto fail;
 				if (istcpy(&conn->proxy_unique_id, tlv, UNIQUEID_LEN) < 0) {
-					/* This is technically unreachable, because we verified above
-					 * that the TLV value fits.
-					 */
+					/* This is impossible, because we verified that the TLV value fits. */
+					my_unreachable();
 					goto fail;
 				}
 				break;
@@ -1135,12 +1098,11 @@ int conn_recv_proxy(struct connection *conn, int flag)
 		}
 
 		/* Verify that the PROXYv2 header ends at a TLV boundary.
-		 * This is technically unreachable, because the TLV parsing already
-		 * verifies that a TLV does not exceed the total length and also
-		 * that there is space for a TLV header.
+		 * This is can not be true, because the TLV parsing already
+		 * verifies that a TLV does not exceed the total length and
+		 * also that there is space for a TLV header.
 		 */
-		if (tlv_offset != total_v2_len)
-			goto bad_header;
+		BUG_ON(tlv_offset != total_v2_len);
 
 		/* unsupported protocol, keep local connection address */
 		break;
@@ -1603,13 +1565,22 @@ int conn_recv_socks4_proxy_response(struct connection *conn)
 	return 0;
 }
 
-/* Lists the known proto mux on <out> */
+/* registers proto mux list <list>. Modifies the list element! */
+void register_mux_proto(struct mux_proto_list *list)
+{
+	LIST_APPEND(&mux_proto_list.list, &list->list);
+}
+
+/* Lists the known proto mux on <out>. This function is used by "haproxy -vv"
+ * and is suitable for early boot just after the "REGISTER" stage because it
+ * doesn't depend on anything to be already allocated.
+ */
 void list_mux_proto(FILE *out)
 {
 	struct mux_proto_list *item;
-	struct buffer *chk = get_trash_chunk();
 	struct ist proto;
 	char *mode, *side;
+	int done;
 
 	fprintf(out, "Available multiplexer protocols :\n"
 		"(protocols marked as <default> cannot be specified using 'proto' keyword)\n");
@@ -1634,19 +1605,27 @@ void list_mux_proto(FILE *out)
 		else
 			side = "NONE";
 
-		chunk_reset(chk);
-		if (item->mux->flags & MX_FL_HTX)
-			chunk_strcpy(chk, "HTX");
-		if (item->mux->flags & MX_FL_CLEAN_ABRT)
-			chunk_appendf(chk, "%sCLEAN_ABRT", (b_data(chk) ? "|": ""));
-		if (item->mux->flags & MX_FL_HOL_RISK)
-			chunk_appendf(chk, "%sHOL_RISK", (b_data(chk) ? "|": ""));
-		if (item->mux->flags & MX_FL_NO_UPG)
-			chunk_appendf(chk, "%sNO_UPG", (b_data(chk) ? "|": ""));
+		fprintf(out, " %15s : mode=%-10s side=%-8s  mux=%-8s flags=",
+			(proto.len ? proto.ptr : "<default>"), mode, side, item->mux->name);
 
-		fprintf(out, " %15s : mode=%-10s side=%-8s  mux=%-8s flags=%.*s\n",
-			(proto.len ? proto.ptr : "<default>"), mode, side, item->mux->name,
-			(int)b_data(chk), b_orig(chk));
+		done = 0;
+
+		/* note: the block below could be simplied using macros but for only
+		 * 4 flags it's not worth it.
+		 */
+		if (item->mux->flags & MX_FL_HTX)
+			done |= fprintf(out, "%sHTX", done ? "|" : "");
+
+		if (item->mux->flags & MX_FL_CLEAN_ABRT)
+			done |= fprintf(out, "%sCLEAN_ABRT", done ? "|" : "");
+
+		if (item->mux->flags & MX_FL_HOL_RISK)
+			done |= fprintf(out, "%sHOL_RISK", done ? "|" : "");
+
+		if (item->mux->flags & MX_FL_NO_UPG)
+			done |= fprintf(out, "%sNO_UPG", done ? "|" : "");
+
+		fprintf(out, "\n");
 	}
 }
 
@@ -1762,8 +1741,8 @@ static int make_proxy_line_v2(char *buf, int buf_len, struct server *srv, struct
 	memcpy(hdr->sig, pp2_signature, PP2_SIGNATURE_LEN);
 
 	if (strm) {
-		src = si_src(&strm->si[0]);
-		dst = si_dst(&strm->si[0]);
+		src = si_src(strm->csf->si);
+		dst = si_dst(strm->csf->si);
 	}
 	else if (remote && conn_get_src(remote) && conn_get_dst(remote)) {
 		src = conn_src(remote);
@@ -1961,8 +1940,8 @@ int make_proxy_line(char *buf, int buf_len, struct server *srv, struct connectio
 		const struct sockaddr_storage *dst = NULL;
 
 		if (strm) {
-			src = si_src(&strm->si[0]);
-			dst = si_dst(&strm->si[0]);
+			src = si_src(strm->csf->si);
+			dst = si_dst(strm->csf->si);
 		}
 		else if (remote && conn_get_src(remote) && conn_get_dst(remote)) {
 			src = conn_src(remote);
@@ -2042,7 +2021,7 @@ smp_fetch_fc_http_major(const struct arg *args, struct sample *smp, const char *
                 conn = (kw[0] == 'b') ? cs_conn(__objt_check(smp->sess->origin)->cs) : NULL;
         else
                 conn = (kw[0] != 'b') ? objt_conn(smp->sess->origin) :
-			smp->strm ? cs_conn(objt_cs(smp->strm->si[1].end)) : NULL;
+			smp->strm ? cs_conn(smp->strm->csb) : NULL;
 
 	/* No connection or a connection with a RAW muxx */
 	if (!conn || (conn->mux && !(conn->mux->flags & MX_FL_HTX)))
@@ -2139,7 +2118,7 @@ int smp_fetch_fc_err(const struct arg *args, struct sample *smp, const char *kw,
                 conn = (kw[0] == 'b') ? cs_conn(__objt_check(smp->sess->origin)->cs) : NULL;
         else
                 conn = (kw[0] != 'b') ? objt_conn(smp->sess->origin) :
-			smp->strm ? cs_conn(objt_cs(smp->strm->si[1].end)) : NULL;
+			smp->strm ? cs_conn(smp->strm->csb) : NULL;
 
 	if (!conn)
 		return 0;
@@ -2166,7 +2145,7 @@ int smp_fetch_fc_err_str(const struct arg *args, struct sample *smp, const char 
                 conn = (kw[0] == 'b') ? cs_conn(__objt_check(smp->sess->origin)->cs) : NULL;
         else
                 conn = (kw[0] != 'b') ? objt_conn(smp->sess->origin) :
-			smp->strm ? cs_conn(objt_cs(smp->strm->si[1].end)) : NULL;
+			smp->strm ? cs_conn(smp->strm->csb) : NULL;
 
 	if (!conn)
 		return 0;

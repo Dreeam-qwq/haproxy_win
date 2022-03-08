@@ -17,6 +17,7 @@
 #include <haproxy/api.h>
 #include <haproxy/cfgparse.h>
 #include <haproxy/connection.h>
+#include <haproxy/conn_stream.h>
 #include <haproxy/errors.h>
 #include <haproxy/fcgi-app.h>
 #include <haproxy/fcgi.h>
@@ -1229,8 +1230,8 @@ static int fcgi_set_default_param(struct fcgi_conn *fconn, struct fcgi_strm *fst
 				  struct fcgi_strm_params *params)
 {
 	struct connection *cli_conn = objt_conn(fstrm->sess->origin);
-	const struct sockaddr_storage *src = si_src(si_opposite(fstrm->cs->data));
-	const struct sockaddr_storage *dst = si_dst(si_opposite(fstrm->cs->data));
+	const struct sockaddr_storage *src = (cs_check(fstrm->cs) ? conn_src(fconn->conn) : si_src(si_opposite(cs_si(fstrm->cs))));
+	const struct sockaddr_storage *dst = (cs_check(fstrm->cs) ? conn_dst(fconn->conn) : si_dst(si_opposite(cs_si(fstrm->cs))));
 	struct ist p;
 
 	if (!sl)
@@ -3311,11 +3312,11 @@ static void fcgi_strm_capture_bad_message(struct fcgi_conn *fconn, struct fcgi_s
 	struct proxy *other_end;
 	union error_snapshot_ctx ctx;
 
-	if (fstrm->cs && fstrm->cs->data) {
+	if (fstrm->cs && cs_strm(fstrm->cs)) {
 		if (sess == NULL)
-			sess = si_strm(fstrm->cs->data)->sess;
+			sess = __cs_strm(fstrm->cs)->sess;
 		if (!(h1m->flags & H1_MF_RESP))
-			other_end = si_strm(fstrm->cs->data)->be;
+			other_end = __cs_strm(fstrm->cs)->be;
 		else
 			other_end = sess->fe;
 	} else
@@ -3515,34 +3516,26 @@ static size_t fcgi_strm_parse_response(struct fcgi_strm *fstrm, struct buffer *b
  * Attach a new stream to a connection
  * (Used for outgoing connections)
  */
-static struct conn_stream *fcgi_attach(struct connection *conn, struct session *sess)
+static int fcgi_attach(struct connection *conn, struct conn_stream *cs, struct session *sess)
 {
-	struct conn_stream *cs;
 	struct fcgi_strm *fstrm;
 	struct fcgi_conn *fconn = conn->ctx;
 
 	TRACE_ENTER(FCGI_EV_FSTRM_NEW, conn);
-	cs = cs_new(conn, conn->target);
-	if (!cs) {
-		TRACE_ERROR("CS allocation failure", FCGI_EV_FSTRM_NEW|FCGI_EV_FSTRM_ERR, conn);
-		goto err;
-	}
 	fstrm = fcgi_conn_stream_new(fconn, cs, sess);
-	if (!fstrm) {
-		cs_free(cs);
+	if (!fstrm)
 		goto err;
-	}
 
 	/* the connection is not idle anymore, let's mark this */
 	HA_ATOMIC_AND(&fconn->wait_event.tasklet->state, ~TASK_F_USR1);
 	xprt_set_used(conn, conn->xprt, conn->xprt_ctx);
 
 	TRACE_LEAVE(FCGI_EV_FSTRM_NEW, conn, fstrm);
-	return cs;
+	return 0;
 
   err:
 	TRACE_DEVEL("leaving on error", FCGI_EV_FSTRM_NEW|FCGI_EV_FSTRM_ERR, conn);
-	return NULL;
+	return -1;
 }
 
 /* Retrieves the first valid conn_stream from this connection, or returns NULL.
@@ -3616,7 +3609,7 @@ static void fcgi_detach(struct conn_stream *cs)
 	/* this stream may be blocked waiting for some data to leave, so orphan
 	 * it in this case.
 	 */
-	if (!(cs->conn->flags & CO_FL_ERROR) &&
+	if (!(fconn->conn->flags & CO_FL_ERROR) &&
 	    (fconn->state != FCGI_CS_CLOSED) &&
 	    (fstrm->flags & (FCGI_SF_BLK_MBUSY|FCGI_SF_BLK_MROOM)) &&
 	    (fstrm->subs || (fstrm->flags & (FCGI_SF_WANT_SHUTR|FCGI_SF_WANT_SHUTW)))) {
@@ -4196,8 +4189,8 @@ static int fcgi_show_fd(struct buffer *msg, struct connection *conn)
 			      (unsigned int)b_head_ofs(&fstrm->rxbuf), (unsigned int)b_size(&fstrm->rxbuf),
 			      fstrm->cs);
 		if (fstrm->cs)
-			chunk_appendf(msg, " .cs.flg=0x%08x .cs.data=%p",
-				      fstrm->cs->flags, fstrm->cs->data);
+			chunk_appendf(msg, " .cs.flg=0x%08x .cs.app=%p",
+				      fstrm->cs->flags, fstrm->cs->app);
 		chunk_appendf(&trash, " .subs=%p", fstrm->subs);
 		if (fstrm->subs) {
 			chunk_appendf(&trash, "(ev=%d tl=%p", fstrm->subs->events, fstrm->subs->tasklet);

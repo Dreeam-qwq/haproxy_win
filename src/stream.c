@@ -157,8 +157,8 @@ static void strm_trace(enum trace_level level, uint64_t mask, const struct trace
 		return;
 
 	task = s->task;
-	si_f = &s->si[0];
-	si_b = &s->si[1];
+	si_f = cs_si(s->csf);
+	si_b = cs_si(s->csb);
 	req  = &s->req;
 	res  = &s->res;
 	htx  = (msg ? htxbuf(&msg->chn->buf) : NULL);
@@ -266,39 +266,22 @@ static void strm_trace(enum trace_level level, uint64_t mask, const struct trace
 	}
 }
 
-/* Create a new stream for connection <conn>. Return < 0 on error. This is only
- * valid right after the handshake, before the connection's data layer is
- * initialized, because it relies on the session to be in conn->owner. On
+/* Upgrade an existing stream for conn-stream <cs>. Return < 0 on error. This
+ * is only valid right after a TCP to H1 upgrade. The stream should be
+ * "reativated" by removing SF_IGNORE flag. And the right mode must be set.  On
  * success, <input> buffer is transferred to the stream and thus points to
- * BUF_NULL. On error, it is unchanged and it is the caller responsibility to
- * release it.
- */
-int stream_create_from_cs(struct conn_stream *cs, struct buffer *input)
-{
-	struct stream *strm;
-
-	strm = stream_new(cs->conn->owner, &cs->obj_type, input);
-	if (strm == NULL)
-		return -1;
-
-	task_wakeup(strm->task, TASK_WOKEN_INIT);
-	return 0;
-}
-
-/* Upgrade an existing TCP stream for connection <conn>. Return < 0 on error.
- * This is only valid right after a TCP to H1 upgrade. The stream should be
- * "reativated" by removing SF_IGNORE flag. And the right mode must be set.
- * On success, <input> buffer is transferred to the stream and thus points to
  * BUF_NULL. On error, it is unchanged and it is the caller responsibility to
  * release it (this never happens for now).
  */
 int stream_upgrade_from_cs(struct conn_stream *cs, struct buffer *input)
 {
-	struct stream_interface *si = cs->data;
-	struct stream *s = si_strm(si);
+	struct stream *s = __cs_strm(cs);
+	const struct mux_ops *mux = cs_conn_mux(cs);
 
-	if (cs->conn->mux->flags & MX_FL_HTX)
-		s->flags |= SF_HTX;
+	if (mux) {
+		if (mux->flags & MX_FL_HTX)
+			s->flags |= SF_HTX;
+	}
 
 	if (!b_is_null(input)) {
 		/* Xfer the input buffer to the request channel. <input> will
@@ -328,12 +311,12 @@ int stream_buf_available(void *arg)
 {
 	struct stream *s = arg;
 
-	if (!s->req.buf.size && !s->req.pipe && (s->si[0].flags & SI_FL_RXBLK_BUFF) &&
+	if (!s->req.buf.size && !s->req.pipe && (cs_si(s->csf)->flags & SI_FL_RXBLK_BUFF) &&
 	    b_alloc(&s->req.buf))
-		si_rx_buff_rdy(&s->si[0]);
-	else if (!s->res.buf.size && !s->res.pipe && (s->si[1].flags & SI_FL_RXBLK_BUFF) &&
+		si_rx_buff_rdy(cs_si(s->csf));
+	else if (!s->res.buf.size && !s->res.pipe && (cs_si(s->csb)->flags & SI_FL_RXBLK_BUFF) &&
 		 b_alloc(&s->res.buf))
-		si_rx_buff_rdy(&s->si[1]);
+		si_rx_buff_rdy(cs_si(s->csb));
 	else
 		return 0;
 
@@ -354,12 +337,10 @@ int stream_buf_available(void *arg)
  * transfer to the stream and <input> is set to BUF_NULL. On error, <input>
  * buffer is unchanged and it is the caller responsibility to release it.
  */
-struct stream *stream_new(struct session *sess, enum obj_type *origin, struct buffer *input)
+struct stream *stream_new(struct session *sess, struct conn_stream *cs, struct buffer *input)
 {
 	struct stream *s;
 	struct task *t;
-	struct conn_stream *cs  = objt_cs(origin);
-	struct appctx *appctx   = objt_appctx(origin);
 
 	DBG_TRACE_ENTER(STRM_EV_STRM_NEW);
 	if (unlikely((s = pool_alloc(pool_head_stream)) == NULL))
@@ -411,8 +392,6 @@ struct stream *stream_new(struct session *sess, enum obj_type *origin, struct bu
 	memcpy(s->stkctr, sess->stkctr, sizeof(s->stkctr));
 
 	s->sess = sess;
-	s->si[0].flags = SI_FL_NONE;
-	s->si[1].flags = SI_FL_ISBACK;
 
 	s->stream_epoch = _HA_ATOMIC_LOAD(&stream_epoch);
 	s->uniq_id = _HA_ATOMIC_FETCH_ADD(&global.req_count, 1);
@@ -454,43 +433,43 @@ struct stream *stream_new(struct session *sess, enum obj_type *origin, struct bu
 	vars_init_head(&s->vars_txn,    SCOPE_TXN);
 	vars_init_head(&s->vars_reqres, SCOPE_REQ);
 
-	/* this part should be common with other protocols */
-	if (si_reset(&s->si[0]) < 0)
-		goto out_fail_alloc;
-	si_set_state(&s->si[0], SI_ST_EST);
-	s->si[0].hcto = sess->fe->timeout.clientfin;
-
-	if (cs && cs->conn->mux) {
-		if (cs->conn->mux->flags & MX_FL_CLEAN_ABRT)
-			s->si[0].flags |= SI_FL_CLEAN_ABRT;
-		if (cs->conn->mux->flags & MX_FL_HTX)
-			s->flags |= SF_HTX;
-
-		if (cs->flags & CS_FL_WEBSOCKET)
-			s->flags |= SF_WEBSOCKET;
-	}
         /* Set SF_HTX flag for HTTP frontends. */
 	if (sess->fe->mode == PR_MODE_HTTP)
 		s->flags |= SF_HTX;
 
-	/* attach the incoming connection to the stream interface now. */
-	if (cs)
-		si_attach_cs(&s->si[0], cs);
-	else if (appctx)
-		si_attach_appctx(&s->si[0], appctx);
+	s->csf = cs;
+	s->csb = cs_new();
+	if (!s->csb)
+		goto out_fail_alloc_csb;
+
+	if (cs_attach_app(s->csf, &s->obj_type) < 0)
+		goto out_fail_attach_csf;
+	if (cs_attach_app(s->csb, &s->obj_type) < 0)
+		goto out_fail_attach_csb;
+
+	si_set_state(cs_si(s->csf), SI_ST_EST);
+	cs_si(s->csf)->hcto = sess->fe->timeout.clientfin;
 
 	if (likely(sess->fe->options2 & PR_O2_INDEPSTR))
-		s->si[0].flags |= SI_FL_INDEP_STR;
+		cs_si(s->csf)->flags |= SI_FL_INDEP_STR;
 
-	/* pre-initialize the other side's stream interface to an INIT state. The
-	 * callbacks will be initialized before attempting to connect.
-	 */
-	if (si_reset(&s->si[1]) < 0)
-		goto out_fail_alloc_si1;
-	s->si[1].hcto = TICK_ETERNITY;
-
+	cs_si(s->csb)->flags = SI_FL_ISBACK;
+	cs_si(s->csb)->hcto = TICK_ETERNITY;
 	if (likely(sess->fe->options2 & PR_O2_INDEPSTR))
-		s->si[1].flags |= SI_FL_INDEP_STR;
+		cs_si(s->csb)->flags |= SI_FL_INDEP_STR;
+
+	if (cs->flags & CS_FL_WEBSOCKET)
+		s->flags |= SF_WEBSOCKET;
+	if (cs_conn(cs)) {
+		const struct mux_ops *mux = cs_conn_mux(cs);
+
+		if (mux) {
+			if (mux->flags & MX_FL_CLEAN_ABRT)
+				cs_si(s->csf)->flags |= SI_FL_CLEAN_ABRT;
+			if (mux->flags & MX_FL_HTX)
+				s->flags |= SF_HTX;
+		}
+	}
 
 	stream_init_srv_conn(s);
 	s->target = sess->listener ? sess->listener->default_target : NULL;
@@ -555,10 +534,9 @@ struct stream *stream_new(struct session *sess, enum obj_type *origin, struct bu
 	if (flt_stream_init(s) < 0 || flt_stream_start(s) < 0)
 		goto out_fail_accept;
 
-	s->si[1].l7_buffer = BUF_NULL;
 	/* finish initialization of the accepted file descriptor */
-	if (appctx)
-		si_want_get(&s->si[0]);
+	if (cs_appctx(cs))
+		si_want_get(cs_si(s->csf));
 
 	if (sess->fe->accept && sess->fe->accept(s) < 0)
 		goto out_fail_accept;
@@ -581,16 +559,19 @@ struct stream *stream_new(struct session *sess, enum obj_type *origin, struct bu
 	 * the caller must handle the task_wakeup
 	 */
 	DBG_TRACE_LEAVE(STRM_EV_STRM_NEW, s);
+	task_wakeup(s->task, TASK_WOKEN_INIT);
 	return s;
 
 	/* Error unrolling */
  out_fail_accept:
 	flt_stream_release(s, 0);
-	task_destroy(t);
-	tasklet_free(s->si[1].wait_event.tasklet);
 	LIST_DELETE(&s->list);
-out_fail_alloc_si1:
-	tasklet_free(s->si[0].wait_event.tasklet);
+ out_fail_attach_csb:
+	si_free(cs_si(s->csf));
+ out_fail_attach_csf:
+	cs_free(s->csb);
+ out_fail_alloc_csb:
+	task_destroy(t);
  out_fail_alloc:
 	pool_free(pool_head_stream, s);
 	DBG_TRACE_DEVEL("leaving on error", STRM_EV_STRM_NEW|STRM_EV_STRM_ERR);
@@ -605,7 +586,7 @@ static void stream_free(struct stream *s)
 	struct session *sess = strm_sess(s);
 	struct proxy *fe = sess->fe;
 	struct bref *bref, *back;
-	struct conn_stream *cli_cs = objt_cs(s->si[0].end);
+	/* struct conn_stream *cli_cs = objt_cs(s->si[0].end); */
 	int must_free_sess;
 	int i;
 
@@ -666,8 +647,9 @@ static void stream_free(struct stream *s)
 		http_destroy_txn(s);
 
 	/* ensure the client-side transport layer is destroyed */
-	if (cli_cs)
-		cs_close(cli_cs);
+	/* Be sure it is useless !! */
+	/* if (cli_cs) */
+	/* 	cs_close(cli_cs); */
 
 	for (i = 0; i < s->store_count; i++) {
 		if (!s->store[i].ts)
@@ -730,25 +712,20 @@ static void stream_free(struct stream *s)
 	LIST_DELETE(&s->list);
 
 	/* applets do not release session yet */
-	must_free_sess = objt_appctx(sess->origin) && sess->origin == s->si[0].end;
+	/* FIXME: Handle it in appctx_free ??? */
+	must_free_sess = objt_appctx(sess->origin) && sess->origin == s->csf->end;
 
+	/* FIXME: ATTENTION, si CSF est libere avant, ca plante !!!! */
+	cs_detach_endp(s->csb);
+	cs_detach_endp(s->csf);
+	cs_detach_app(s->csb);
+	cs_detach_app(s->csf);
 
-	si_release_endpoint(&s->si[1]);
-	si_release_endpoint(&s->si[0]);
-
-	tasklet_free(s->si[0].wait_event.tasklet);
-	tasklet_free(s->si[1].wait_event.tasklet);
-
-	b_free(&s->si[1].l7_buffer);
 	if (must_free_sess) {
 		sess->origin = NULL;
 		session_free(sess);
 	}
 
-	sockaddr_free(&s->si[0].src);
-	sockaddr_free(&s->si[0].dst);
-	sockaddr_free(&s->si[1].src);
-	sockaddr_free(&s->si[1].dst);
 	pool_free(pool_head_stream, s);
 
 	/* We may want to free the maximum amount of pools if the proxy is stopping */
@@ -777,13 +754,8 @@ static void stream_free(struct stream *s)
  */
 static int stream_alloc_work_buffer(struct stream *s)
 {
-	if (LIST_INLIST(&s->buffer_wait.list))
-		LIST_DEL_INIT(&s->buffer_wait.list);
-
 	if (b_alloc(&s->res.buf))
 		return 1;
-
-	LIST_APPEND(&th_ctx->buffer_wq, &s->buffer_wait.list);
 	return 0;
 }
 
@@ -887,9 +859,8 @@ int stream_set_timeout(struct stream *s, enum act_timeout_name name, int timeout
  */
 static void back_establish(struct stream *s)
 {
-	struct stream_interface *si = &s->si[1];
-	struct conn_stream *srv_cs = objt_cs(si->end);
-	struct connection *conn = srv_cs ? srv_cs->conn : objt_conn(si->end);
+	struct connection *conn = cs_conn(s->csb);
+	struct stream_interface *si = cs_si(s->csb);
 	struct channel *req = &s->req;
 	struct channel *rep = &s->res;
 
@@ -935,7 +906,7 @@ static void back_establish(struct stream *s)
 
 	si_rx_endp_more(si);
 	rep->flags |= CF_READ_ATTACHED; /* producer is now attached */
-	if (objt_cs(si->end)) {
+	if (conn) {
 		/* real connections have timeouts
 		 * if already defined, it means that a set-timeout rule has
 		 * been executed so do not overwrite them
@@ -972,7 +943,7 @@ static void back_establish(struct stream *s)
 static void sess_set_term_flags(struct stream *s)
 {
 	if (!(s->flags & SF_FINST_MASK)) {
-		if (s->si[1].state == SI_ST_INI) {
+		if (cs_si(s->csb)->state == SI_ST_INI) {
 			/* anything before REQ in fact */
 			_HA_ATOMIC_INC(&strm_fe(s)->fe_counters.failed_req);
 			if (strm_li(s) && strm_li(s)->counters)
@@ -980,11 +951,11 @@ static void sess_set_term_flags(struct stream *s)
 
 			s->flags |= SF_FINST_R;
 		}
-		else if (s->si[1].state == SI_ST_QUE)
+		else if (cs_si(s->csb)->state == SI_ST_QUE)
 			s->flags |= SF_FINST_Q;
-		else if (si_state_in(s->si[1].state, SI_SB_REQ|SI_SB_TAR|SI_SB_ASS|SI_SB_CON|SI_SB_CER|SI_SB_RDY))
+		else if (si_state_in(cs_si(s->csb)->state, SI_SB_REQ|SI_SB_TAR|SI_SB_ASS|SI_SB_CON|SI_SB_CER|SI_SB_RDY))
 			s->flags |= SF_FINST_C;
-		else if (s->si[1].state == SI_ST_EST || s->si[1].prev_state == SI_ST_EST)
+		else if (cs_si(s->csb)->state == SI_ST_EST || cs_si(s->csb)->prev_state == SI_ST_EST)
 			s->flags |= SF_FINST_D;
 		else
 			s->flags |= SF_FINST_L;
@@ -1008,21 +979,21 @@ enum act_return process_use_service(struct act_rule *rule, struct proxy *px,
 	if (flags & ACT_OPT_FIRST) {
 		/* Register applet. this function schedules the applet. */
 		s->target = &rule->applet.obj_type;
-		if (unlikely(!si_register_handler(&s->si[1], objt_applet(s->target))))
+		appctx = si_register_handler(cs_si(s->csb), objt_applet(s->target));
+		if (unlikely(!appctx))
 			return ACT_RET_ERR;
 
 		/* Initialise the context. */
-		appctx = si_appctx(&s->si[1]);
 		memset(&appctx->ctx, 0, sizeof(appctx->ctx));
 		appctx->rule = rule;
 	}
 	else
-		appctx = si_appctx(&s->si[1]);
+		appctx = __cs_appctx(s->csb);
 
 	/* Stops the applet scheduling, in case of the init function miss
 	 * some data.
 	 */
-	si_stop_get(&s->si[1]);
+	si_stop_get(cs_si(s->csb));
 
 	/* Call initialisation. */
 	if (rule->applet.init)
@@ -1041,7 +1012,7 @@ enum act_return process_use_service(struct act_rule *rule, struct proxy *px,
 	}
 
 	/* Now we can schedule the applet. */
-	si_cant_get(&s->si[1]);
+	si_cant_get(cs_si(s->csb));
 	appctx_wakeup(appctx);
 	return ACT_RET_STOP;
 }
@@ -1490,8 +1461,8 @@ static int process_store_rules(struct stream *s, struct channel *rep, int an_bit
  */
 int stream_set_http_mode(struct stream *s, const struct mux_proto_list *mux_proto)
 {
+	struct conn_stream *cs = s->csf;
 	struct connection  *conn;
-	struct conn_stream *cs;
 
 	/* Already an HTTP stream */
 	if (IS_HTX_STRM(s))
@@ -1502,17 +1473,16 @@ int stream_set_http_mode(struct stream *s, const struct mux_proto_list *mux_prot
 	if (unlikely(!s->txn && !http_create_txn(s)))
 		return 0;
 
-	conn = objt_conn(strm_sess(s)->origin);
-	cs = objt_cs(s->si[0].end);
-	if (conn && cs) {
-		si_rx_endp_more(&s->si[0]);
+	conn = cs_conn(cs);
+	if (conn) {
+		si_rx_endp_more(cs_si(s->csf));
 		/* Make sure we're unsubscribed, the the new
 		 * mux will probably want to subscribe to
 		 * the underlying XPRT
 		 */
-		if (s->si[0].wait_event.events)
-			conn->mux->unsubscribe(cs, s->si[0].wait_event.events,
-					       &s->si[0].wait_event);
+		if (cs_si(s->csf)->wait_event.events)
+			conn->mux->unsubscribe(cs, cs_si(s->csf)->wait_event.events,
+					       &(cs_si(s->csf)->wait_event));
 
 		if (conn->mux->flags & MX_FL_NO_UPG)
 			return 0;
@@ -1530,8 +1500,8 @@ int stream_set_http_mode(struct stream *s, const struct mux_proto_list *mux_prot
 			 * silently destroyed. The new mux will create new
 			 * streams.
 			 */
-			cs_free(cs);
-			si_detach_endpoint(&s->si[0]);
+			/* FIXME: must be tested */
+			/* si_release_endpoint(cs_si(s->csf)); */
 			s->logs.logwait = 0;
 			s->logs.level = 0;
 			channel_abort(&s->req);
@@ -1621,8 +1591,8 @@ struct task *process_stream(struct task *t, void *context, unsigned int state)
 	req = &s->req;
 	res = &s->res;
 
-	si_f = &s->si[0];
-	si_b = &s->si[1];
+	si_f = cs_si(s->csf);
+	si_b = cs_si(s->csb);
 
 	/* First, attempt to receive pending data from I/O layers */
 	si_sync_recv(si_f);
@@ -1717,15 +1687,24 @@ struct task *process_stream(struct task *t, void *context, unsigned int state)
 
  resync_stream_interface:
 	/* below we may emit error messages so we have to ensure that we have
-	 * our buffers properly allocated.
+	 * our buffers properly allocated. If the allocation failed, an error is
+	 * triggered.
+	 *
+	 * NOTE: An error is returned because the mechanism to queue entities
+	 *       waiting for a buffer is totally broken for now. However, this
+	 *       part must be refactored. When it will be handled, this part
+	 *       must be be reviewed too.
 	 */
 	if (!stream_alloc_work_buffer(s)) {
-		/* No buffer available, we've been subscribed to the list of
-		 * buffer waiters, let's wait for our turn.
-		 */
-		si_f->flags &= ~SI_FL_DONT_WAKE;
-		si_b->flags &= ~SI_FL_DONT_WAKE;
-		goto update_exp_and_leave;
+		si_f->flags |= SI_FL_ERR;
+		si_f->err_type = SI_ET_CONN_RES;
+
+		si_b->flags |= SI_FL_ERR;
+		si_b->err_type = SI_ET_CONN_RES;
+
+		if (!(s->flags & SF_ERR_MASK))
+			s->flags |= SF_ERR_RESOURCE;
+		sess_set_term_flags(s);
 	}
 
 	/* 1b: check for low-level errors reported at the stream interface.
@@ -2160,10 +2139,10 @@ struct task *process_stream(struct task *t, void *context, unsigned int state)
 	if (!(req->flags & (CF_KERN_SPLICING|CF_SHUTR)) &&
 	    req->to_forward &&
 	    (global.tune.options & GTUNE_USE_SPLICE) &&
-	    (objt_cs(si_f->end) && __objt_cs(si_f->end)->conn->xprt && __objt_cs(si_f->end)->conn->xprt->rcv_pipe &&
-	     __objt_cs(si_f->end)->conn->mux && __objt_cs(si_f->end)->conn->mux->rcv_pipe) &&
-	    (objt_cs(si_b->end) && __objt_cs(si_b->end)->conn->xprt && __objt_cs(si_b->end)->conn->xprt->snd_pipe &&
-	     __objt_cs(si_b->end)->conn->mux && __objt_cs(si_b->end)->conn->mux->snd_pipe) &&
+	    (cs_conn(si_f->cs) && __cs_conn(si_f->cs)->xprt && __cs_conn(si_f->cs)->xprt->rcv_pipe &&
+	     __cs_conn(si_f->cs)->mux && __cs_conn(si_f->cs)->mux->rcv_pipe) &&
+	    (cs_conn(si_b->cs) && __cs_conn(si_b->cs)->xprt && __cs_conn(si_b->cs)->xprt->snd_pipe &&
+	     __cs_conn(si_b->cs)->mux && __cs_conn(si_b->cs)->mux->snd_pipe) &&
 	    (pipes_used < global.maxpipes) &&
 	    (((sess->fe->options2|s->be->options2) & PR_O2_SPLIC_REQ) ||
 	     (((sess->fe->options2|s->be->options2) & PR_O2_SPLIC_AUT) &&
@@ -2195,7 +2174,7 @@ struct task *process_stream(struct task *t, void *context, unsigned int state)
 			}
 		}
 		else {
-			si_release_endpoint(si_b);
+			cs_detach_endp(s->csb);
 			si_b->state = SI_ST_CLO; /* shutw+ini = abort */
 			channel_shutw_now(req);        /* fix buffer flags upon abort */
 			channel_shutr_now(res);
@@ -2353,10 +2332,10 @@ struct task *process_stream(struct task *t, void *context, unsigned int state)
 	if (!(res->flags & (CF_KERN_SPLICING|CF_SHUTR)) &&
 	    res->to_forward &&
 	    (global.tune.options & GTUNE_USE_SPLICE) &&
-	    (objt_cs(si_f->end) && __objt_cs(si_f->end)->conn->xprt && __objt_cs(si_f->end)->conn->xprt->snd_pipe &&
-	     __objt_cs(si_f->end)->conn->mux && __objt_cs(si_f->end)->conn->mux->snd_pipe) &&
-	    (objt_cs(si_b->end) && __objt_cs(si_b->end)->conn->xprt && __objt_cs(si_b->end)->conn->xprt->rcv_pipe &&
-	     __objt_cs(si_b->end)->conn->mux && __objt_cs(si_b->end)->conn->mux->rcv_pipe) &&
+	    (cs_conn(si_f->cs) && __cs_conn(si_f->cs)->xprt && __cs_conn(si_f->cs)->xprt->snd_pipe &&
+	     __cs_conn(si_f->cs)->mux && __cs_conn(si_f->cs)->mux->snd_pipe) &&
+	    (cs_conn(si_b->cs) && __cs_conn(si_b->cs)->xprt && __cs_conn(si_b->cs)->xprt->rcv_pipe &&
+	     __cs_conn(si_b->cs)->mux && __cs_conn(si_b->cs)->mux->rcv_pipe) &&
 	    (pipes_used < global.maxpipes) &&
 	    (((sess->fe->options2|s->be->options2) & PR_O2_SPLIC_RTR) ||
 	     (((sess->fe->options2|s->be->options2) & PR_O2_SPLIC_AUT) &&
@@ -2432,18 +2411,18 @@ struct task *process_stream(struct task *t, void *context, unsigned int state)
 		if (si_b->state == SI_ST_CLO &&
 		    si_b->prev_state == SI_ST_EST) {
 			chunk_printf(&trash, "%08x:%s.srvcls[%04x:%04x]\n",
-				      s->uniq_id, s->be->id,
-			              objt_cs(si_f->end) ? (unsigned short)__objt_cs(si_f->end)->conn->handle.fd : -1,
-			              objt_cs(si_b->end) ? (unsigned short)__objt_cs(si_b->end)->conn->handle.fd : -1);
+				     s->uniq_id, s->be->id,
+				     cs_conn(si_f->cs) ? (unsigned short)__cs_conn(si_f->cs)->handle.fd : -1,
+				     cs_conn(si_b->cs) ? (unsigned short)__cs_conn(si_b->cs)->handle.fd : -1);
 			DISGUISE(write(1, trash.area, trash.data));
 		}
 
 		if (si_f->state == SI_ST_CLO &&
 		    si_f->prev_state == SI_ST_EST) {
 			chunk_printf(&trash, "%08x:%s.clicls[%04x:%04x]\n",
-				      s->uniq_id, s->be->id,
-			              objt_cs(si_f->end) ? (unsigned short)__objt_cs(si_f->end)->conn->handle.fd : -1,
-			              objt_cs(si_b->end) ? (unsigned short)__objt_cs(si_b->end)->conn->handle.fd : -1);
+				     s->uniq_id, s->be->id,
+				     cs_conn(si_f->cs) ? (unsigned short)__cs_conn(si_f->cs)->handle.fd : -1,
+				     cs_conn(si_b->cs) ? (unsigned short)__cs_conn(si_b->cs)->handle.fd : -1);
 			DISGUISE(write(1, trash.area, trash.data));
 		}
 	}
@@ -2509,9 +2488,9 @@ struct task *process_stream(struct task *t, void *context, unsigned int state)
 	if (unlikely((global.mode & MODE_DEBUG) &&
 		     (!(global.mode & MODE_QUIET) || (global.mode & MODE_VERBOSE)))) {
 		chunk_printf(&trash, "%08x:%s.closed[%04x:%04x]\n",
-			      s->uniq_id, s->be->id,
-		              objt_cs(si_f->end) ? (unsigned short)__objt_cs(si_f->end)->conn->handle.fd : -1,
-		              objt_cs(si_b->end) ? (unsigned short)__objt_cs(si_b->end)->conn->handle.fd : -1);
+			     s->uniq_id, s->be->id,
+			     cs_conn(si_f->cs) ? (unsigned short)__cs_conn(si_f->cs)->handle.fd : -1,
+			     cs_conn(si_b->cs) ? (unsigned short)__cs_conn(si_b->cs)->handle.fd : -1);
 		DISGUISE(write(1, trash.area, trash.data));
 	}
 
@@ -2734,22 +2713,22 @@ void stream_dump(struct buffer *buf, const struct stream *s, const char *pfx, ch
 		return;
 	}
 
-	si_f = &s->si[0];
-	si_b = &s->si[1];
 	req = &s->req;
 	res = &s->res;
 
-	csf = objt_cs(si_f->end);
+	csf = s->csf;
+	si_f = cs_si(csf);
 	cof = cs_conn(csf);
-	acf = objt_appctx(si_f->end);
+	acf = cs_appctx(csf);
 	if (cof && cof->src && addr_to_str(cof->src, pn, sizeof(pn)) >= 0)
 		src = pn;
 	else if (acf)
 		src = acf->applet->name;
 
-	csb = objt_cs(si_b->end);
+	csb = s->csb;
+	si_b = cs_si(csb);
 	cob = cs_conn(csb);
-	acb = objt_appctx(si_b->end);
+	acb = cs_appctx(csb);
 	srv = objt_server(s->target);
 	if (srv)
 		dst = srv->id;
@@ -2760,8 +2739,8 @@ void stream_dump(struct buffer *buf, const struct stream *s, const char *pfx, ch
 	              "%sstrm=%p,%x src=%s fe=%s be=%s dst=%s%c"
 		      "%stxn=%p,%x txn.req=%s,%x txn.rsp=%s,%x%c"
 	              "%srqf=%x rqa=%x rpf=%x rpa=%x sif=%s,%x sib=%s,%x%c"
-	              "%saf=%p,%u csf=%p,%x%c"
-	              "%sab=%p,%u csb=%p,%x%c"
+		      "%scsf=%p,%x csb=%p,%x%c"
+	              "%saf=%p,%u sab=%p,%u%c"
 	              "%scof=%p,%x:%s(%p)/%s(%p)/%s(%d)%c"
 	              "%scob=%p,%x:%s(%p)/%s(%p)/%s(%d)%c"
 	              "",
@@ -2772,8 +2751,8 @@ void stream_dump(struct buffer *buf, const struct stream *s, const char *pfx, ch
 	              pfx, req->flags, req->analysers, res->flags, res->analysers,
 	                   si_state_str(si_f->state), si_f->flags,
 	                   si_state_str(si_b->state), si_b->flags, eol,
-	              pfx, acf, acf ? acf->st0   : 0, csf, csf ? csf->flags : 0, eol,
-	              pfx, acb, acb ? acb->st0   : 0, csb, csb ? csb->flags : 0, eol,
+		      pfx, csf, csf->flags, csb, csb->flags, eol,
+	              pfx, acf, acf ? acf->st0   : 0, acb, acb ? acb->st0   : 0, eol,
 	              pfx, cof, cof ? cof->flags : 0, conn_get_mux_name(cof), cof?cof->ctx:0, conn_get_xprt_name(cof),
 	                   cof ? cof->xprt_ctx : 0, conn_get_ctrl_name(cof), cof ? cof->handle.fd : 0, eol,
 	              pfx, cob, cob ? cob->flags : 0, conn_get_mux_name(cob), cob?cob->ctx:0, conn_get_xprt_name(cob),
@@ -2795,7 +2774,7 @@ void stream_dump_and_crash(enum obj_type *obj, int rate)
 		if (!appctx)
 			return;
 		ptr = appctx;
-		s = si_strm(appctx->owner);
+		s = si_strm(cs_si(appctx->owner));
 		if (!s)
 			return;
 	}
@@ -3113,7 +3092,7 @@ void list_services(FILE *out)
  */
 static int stats_dump_full_strm_to_buffer(struct stream_interface *si, struct stream *strm)
 {
-	struct appctx *appctx = __objt_appctx(si->end);
+	struct appctx *appctx = __cs_appctx(si->cs);
 	struct tm tm;
 	extern const char *monthname[12];
 	char pn[INET6_ADDRSTRLEN];
@@ -3165,12 +3144,12 @@ static int stats_dump_full_strm_to_buffer(struct stream_interface *si, struct st
 
 		chunk_appendf(&trash,
 			     "  flags=0x%x, conn_retries=%d, srv_conn=%p, pend_pos=%p waiting=%d epoch=%#x\n",
-			     strm->flags, strm->si[1].conn_retries, strm->srv_conn, strm->pend_pos,
+			     strm->flags, strm->csb->si->conn_retries, strm->srv_conn, strm->pend_pos,
 			     LIST_INLIST(&strm->buffer_wait.list), strm->stream_epoch);
 
 		chunk_appendf(&trash,
 			     "  frontend=%s (id=%u mode=%s), listener=%s (id=%u)",
-			     strm_fe(strm)->id, strm_fe(strm)->uuid, strm_fe(strm)->mode ? "http" : "tcp",
+			     strm_fe(strm)->id, strm_fe(strm)->uuid, proxy_mode_str(strm_fe(strm)->mode),
 			     strm_li(strm) ? strm_li(strm)->name ? strm_li(strm)->name : "?" : "?",
 			     strm_li(strm) ? strm_li(strm)->luid : 0);
 
@@ -3193,13 +3172,11 @@ static int stats_dump_full_strm_to_buffer(struct stream_interface *si, struct st
 			chunk_appendf(&trash,
 				     "  backend=%s (id=%u mode=%s)",
 				     strm->be->id,
-				     strm->be->uuid, strm->be->mode ? "http" : "tcp");
+				     strm->be->uuid, proxy_mode_str(strm->be->mode));
 		else
 			chunk_appendf(&trash, "  backend=<NONE> (id=-1 mode=-)");
 
-		cs = objt_cs(strm->si[1].end);
-		conn = cs_conn(cs);
-
+		conn = cs_conn(strm->csb);
 		switch (conn && conn_get_src(conn) ? addr_to_str(conn->src, pn, sizeof(pn)) : AF_UNSPEC) {
 		case AF_INET:
 		case AF_INET6:
@@ -3263,35 +3240,36 @@ static int stats_dump_full_strm_to_buffer(struct stream_interface *si, struct st
 
 		chunk_appendf(&trash,
 			     "  si[0]=%p (state=%s flags=0x%02x endp0=%s:%p exp=%s et=0x%03x sub=%d)\n",
-			     &strm->si[0],
-			     si_state_str(strm->si[0].state),
-			     strm->si[0].flags,
-			     obj_type_name(strm->si[0].end),
-			     obj_base_ptr(strm->si[0].end),
-			     strm->si[0].exp ?
-			             tick_is_expired(strm->si[0].exp, now_ms) ? "<PAST>" :
-			                     human_time(TICKS_TO_MS(strm->si[0].exp - now_ms),
+			     strm->csf->si,
+			     si_state_str(strm->csf->si->state),
+			     strm->csf->si->flags,
+			     obj_type_name(strm->csf->end),
+			     obj_base_ptr(strm->csf->end),
+			     strm->csf->si->exp ?
+			             tick_is_expired(strm->csf->si->exp, now_ms) ? "<PAST>" :
+			                     human_time(TICKS_TO_MS(strm->csf->si->exp - now_ms),
 			                     TICKS_TO_MS(1000)) : "<NEVER>",
-			      strm->si[0].err_type, strm->si[0].wait_event.events);
+			      strm->csf->si->err_type, strm->csf->si->wait_event.events);
 
 		chunk_appendf(&trash,
 			     "  si[1]=%p (state=%s flags=0x%02x endp1=%s:%p exp=%s et=0x%03x sub=%d)\n",
-			     &strm->si[1],
-			     si_state_str(strm->si[1].state),
-			     strm->si[1].flags,
-			     obj_type_name(strm->si[1].end),
-			     obj_base_ptr(strm->si[1].end),
-			     strm->si[1].exp ?
-			             tick_is_expired(strm->si[1].exp, now_ms) ? "<PAST>" :
-			                     human_time(TICKS_TO_MS(strm->si[1].exp - now_ms),
+			     strm->csb->si,
+			     si_state_str(strm->csb->si->state),
+			     strm->csb->si->flags,
+			     obj_type_name(strm->csb->end),
+			     obj_base_ptr(strm->csb->end),
+			     strm->csb->si->exp ?
+			             tick_is_expired(strm->csb->si->exp, now_ms) ? "<PAST>" :
+			                     human_time(TICKS_TO_MS(strm->csb->si->exp - now_ms),
 			                     TICKS_TO_MS(1000)) : "<NEVER>",
-			     strm->si[1].err_type, strm->si[1].wait_event.events);
+			     strm->csb->si->err_type, strm->csb->si->wait_event.events);
 
-		if ((cs = objt_cs(strm->si[0].end)) != NULL) {
-			conn = cs->conn;
+		cs = strm->csf;
+		chunk_appendf(&trash, "  cs=%p csf=0x%08x ctx=%p\n", cs, cs->flags, cs->ctx);
 
+		if ((conn = cs_conn(cs)) != NULL) {
 			chunk_appendf(&trash,
-			              "  co0=%p ctrl=%s xprt=%s mux=%s data=%s target=%s:%p\n",
+			              "      co0=%p ctrl=%s xprt=%s mux=%s data=%s target=%s:%p\n",
 				      conn,
 				      conn_get_ctrl_name(conn),
 				      conn_get_xprt_name(conn),
@@ -3308,11 +3286,10 @@ static int stats_dump_full_strm_to_buffer(struct stream_interface *si, struct st
 			              conn->handle.fd >= 0 ? !!(fdtab[conn->handle.fd].update_mask & tid_bit) : 0,
 				      conn->handle.fd >= 0 ? fdtab[conn->handle.fd].thread_mask: 0);
 
-			chunk_appendf(&trash, "      cs=%p csf=0x%08x ctx=%p\n", cs, cs->flags, cs->ctx);
 		}
-		else if ((tmpctx = objt_appctx(strm->si[0].end)) != NULL) {
+		else if ((tmpctx = cs_appctx(cs)) != NULL) {
 			chunk_appendf(&trash,
-			              "  app0=%p st0=%d st1=%d st2=%d applet=%s tmask=0x%lx nice=%d calls=%u rate=%u cpu=%llu lat=%llu\n",
+			              "      app0=%p st0=%d st1=%d st2=%d applet=%s tmask=0x%lx nice=%d calls=%u rate=%u cpu=%llu lat=%llu\n",
 				      tmpctx,
 				      tmpctx->st0,
 				      tmpctx->st1,
@@ -3323,11 +3300,11 @@ static int stats_dump_full_strm_to_buffer(struct stream_interface *si, struct st
 			              (unsigned long long)tmpctx->t->cpu_time, (unsigned long long)tmpctx->t->lat_time);
 		}
 
-		if ((cs = objt_cs(strm->si[1].end)) != NULL) {
-			conn = cs->conn;
-
+		cs = strm->csb;
+		chunk_appendf(&trash, "  cs=%p csf=0x%08x ctx=%p\n", cs, cs->flags, cs->ctx);
+		if ((conn = cs_conn(cs)) != NULL) {
 			chunk_appendf(&trash,
-			              "  co1=%p ctrl=%s xprt=%s mux=%s data=%s target=%s:%p\n",
+			              "      co1=%p ctrl=%s xprt=%s mux=%s data=%s target=%s:%p\n",
 				      conn,
 				      conn_get_ctrl_name(conn),
 				      conn_get_xprt_name(conn),
@@ -3344,11 +3321,10 @@ static int stats_dump_full_strm_to_buffer(struct stream_interface *si, struct st
 			              conn->handle.fd >= 0 ? !!(fdtab[conn->handle.fd].update_mask & tid_bit) : 0,
 				      conn->handle.fd >= 0 ? fdtab[conn->handle.fd].thread_mask: 0);
 
-			chunk_appendf(&trash, "      cs=%p csf=0x%08x ctx=%p\n", cs, cs->flags, cs->ctx);
 		}
-		else if ((tmpctx = objt_appctx(strm->si[1].end)) != NULL) {
+		else if ((tmpctx = cs_appctx(cs)) != NULL) {
 			chunk_appendf(&trash,
-			              "  app1=%p st0=%d st1=%d st2=%d applet=%s tmask=0x%lx nice=%d calls=%u rate=%u cpu=%llu lat=%llu\n",
+			              "      app1=%p st0=%d st1=%d st2=%d applet=%s tmask=0x%lx nice=%d calls=%u rate=%u cpu=%llu lat=%llu\n",
 				      tmpctx,
 				      tmpctx->st0,
 				      tmpctx->st1,
@@ -3485,7 +3461,7 @@ static int cli_parse_show_sess(char **args, char *payload, struct appctx *appctx
 	/* let's set our own stream's epoch to the current one and increment
 	 * it so that we know which streams were already there before us.
 	 */
-	si_strm(appctx->owner)->stream_epoch = _HA_ATOMIC_FETCH_ADD(&stream_epoch, 1);
+	si_strm(cs_si(appctx->owner))->stream_epoch = _HA_ATOMIC_FETCH_ADD(&stream_epoch, 1);
 	return 0;
 }
 
@@ -3496,7 +3472,7 @@ static int cli_parse_show_sess(char **args, char *payload, struct appctx *appctx
  */
 static int cli_io_handler_dump_sess(struct appctx *appctx)
 {
-	struct stream_interface *si = appctx->owner;
+	struct stream_interface *si = cs_si(appctx->owner);
 	struct connection *conn;
 
 	thread_isolate();
@@ -3548,7 +3524,7 @@ static int cli_io_handler_dump_sess(struct appctx *appctx)
 			else {
 				/* check if we've found a stream created after issuing the "show sess" */
 				curr_strm = LIST_ELEM(appctx->ctx.sess.bref.ref, struct stream *, list);
-				if ((int)(curr_strm->stream_epoch - si_strm(appctx->owner)->stream_epoch) > 0)
+				if ((int)(curr_strm->stream_epoch - si_strm(cs_si(appctx->owner))->stream_epoch) > 0)
 					done = 1;
 			}
 
@@ -3658,24 +3634,24 @@ static int cli_io_handler_dump_sess(struct appctx *appctx)
 				     human_time(TICKS_TO_MS(curr_strm->res.analyse_exp - now_ms),
 						TICKS_TO_MS(1000)) : "");
 
-			conn = cs_conn(objt_cs(curr_strm->si[0].end));
+			conn = cs_conn(curr_strm->csf);
 			chunk_appendf(&trash,
 				     " s0=[%d,%1xh,fd=%d,ex=%s]",
-				     curr_strm->si[0].state,
-				     curr_strm->si[0].flags,
+				     curr_strm->csf->si->state,
+				     curr_strm->csf->si->flags,
 				     conn ? conn->handle.fd : -1,
-				     curr_strm->si[0].exp ?
-				     human_time(TICKS_TO_MS(curr_strm->si[0].exp - now_ms),
+				     curr_strm->csf->si->exp ?
+				     human_time(TICKS_TO_MS(curr_strm->csf->si->exp - now_ms),
 						TICKS_TO_MS(1000)) : "");
 
-			conn = cs_conn(objt_cs(curr_strm->si[1].end));
+			conn = cs_conn(curr_strm->csb);
 			chunk_appendf(&trash,
 				     " s1=[%d,%1xh,fd=%d,ex=%s]",
-				     curr_strm->si[1].state,
-				     curr_strm->si[1].flags,
+				     curr_strm->csb->si->state,
+				     curr_strm->csb->si->flags,
 				     conn ? conn->handle.fd : -1,
-				     curr_strm->si[1].exp ?
-				     human_time(TICKS_TO_MS(curr_strm->si[1].exp - now_ms),
+				     curr_strm->csb->si->exp ?
+				     human_time(TICKS_TO_MS(curr_strm->csb->si->exp - now_ms),
 						TICKS_TO_MS(1000)) : "");
 
 			chunk_appendf(&trash,

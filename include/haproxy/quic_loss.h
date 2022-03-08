@@ -2,7 +2,7 @@
  * include/proto/quic_loss.h
  * This file provides interface definition for QUIC loss detection.
  *
- * Copyright 2019 HAProxy Technologies, Frédéric Lécaille <flecaille@haproxy.com>
+ * Copyright 2019 HAProxy Technologies, Frederic Lecaille <flecaille@haproxy.com>
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -35,7 +35,7 @@
 
 static inline void quic_loss_init(struct quic_loss *ql)
 {
-	ql->srtt = QUIC_LOSS_INITIAL_RTT << 4;
+	ql->srtt = QUIC_LOSS_INITIAL_RTT << 3;
 	ql->rtt_var = (QUIC_LOSS_INITIAL_RTT >> 1) << 2;
 	ql->rtt_min = 0;
 	ql->pto_count = 0;
@@ -128,7 +128,7 @@ static inline struct quic_pktns *quic_pto_pktns(struct quic_conn *qc,
                                                 unsigned int *pto)
 {
 	int i;
-	unsigned int duration, lpto, time_of_last_eliciting;
+	unsigned int duration, lpto;
 	struct quic_loss *ql = &qc->path->loss;
 	struct quic_pktns *pktns, *p;
 
@@ -141,7 +141,7 @@ static inline struct quic_pktns *quic_pto_pktns(struct quic_conn *qc,
 		struct quic_enc_level *hel;
 
 		hel = &qc->els[QUIC_TLS_ENC_LEVEL_HANDSHAKE];
-		if (hel->tls_ctx.tx.flags & QUIC_FL_TLS_SECRETS_SET) {
+		if (hel->tls_ctx.flags & QUIC_FL_TLS_SECRETS_SET) {
 			pktns = &qc->pktns[QUIC_TLS_PKTNS_HANDSHAKE];
 		}
 		else {
@@ -170,9 +170,7 @@ static inline struct quic_pktns *quic_pto_pktns(struct quic_conn *qc,
 		}
 
 		p = &qc->pktns[i];
-		time_of_last_eliciting = p->tx.time_of_last_eliciting;
-		tmp_pto =
-			tick_first(lpto, tick_add(time_of_last_eliciting, duration));
+		tmp_pto = tick_add(p->tx.time_of_last_eliciting, duration);
 		if (!tick_isset(lpto) || tmp_pto < lpto) {
 			lpto = tmp_pto;
 			pktns = p;

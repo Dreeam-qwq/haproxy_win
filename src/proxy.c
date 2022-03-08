@@ -379,6 +379,10 @@ const char *proxy_mode_str(int mode) {
 		return "http";
 	else if (mode == PR_MODE_CLI)
 		return "cli";
+	else if (mode == PR_MODE_SYSLOG)
+		return "syslog";
+	else if (mode == PR_MODE_PEERS)
+		return "peers";
 	else
 		return "unknown";
 }
@@ -1839,7 +1843,7 @@ struct proxy *parse_new_proxy(const char *name, unsigned int cap,
                               const struct proxy *defproxy)
 {
 	struct proxy *curproxy = NULL;
-	char *errmsg;
+	char *errmsg = NULL;
 
 	if (!(curproxy = alloc_new_proxy(name, cap, &errmsg))) {
 		ha_alert("parsing [%s:%d] : %s\n", file, linenum, errmsg);
@@ -2265,12 +2269,12 @@ int stream_set_backend(struct stream *s, struct proxy *be)
 	proxy_inc_be_ctr(be);
 
 	/* assign new parameters to the stream from the new backend */
-	s->si[1].flags &= ~SI_FL_INDEP_STR;
+	cs_si(s->csb)->flags &= ~SI_FL_INDEP_STR;
 	if (be->options2 & PR_O2_INDEPSTR)
-		s->si[1].flags |= SI_FL_INDEP_STR;
+		cs_si(s->csb)->flags |= SI_FL_INDEP_STR;
 
 	if (tick_isset(be->timeout.serverfin))
-		s->si[1].hcto = be->timeout.serverfin;
+		cs_si(s->csb)->hcto = be->timeout.serverfin;
 
 	/* We want to enable the backend-specific analysers except those which
 	 * were already run as part of the frontend/listener. Note that it would
@@ -2612,7 +2616,7 @@ static void dump_server_addr(const struct sockaddr_storage *addr, char *addr_str
  */
 static int dump_servers_state(struct stream_interface *si)
 {
-	struct appctx *appctx = __objt_appctx(si->end);
+	struct appctx *appctx = __cs_appctx(si->cs);
 	struct proxy *px = appctx->ctx.cli.p0;
 	struct server *srv;
 	char srv_addr[INET6_ADDRSTRLEN + 1];
@@ -2689,7 +2693,7 @@ static int dump_servers_state(struct stream_interface *si)
  */
 static int cli_io_handler_servers_state(struct appctx *appctx)
 {
-	struct stream_interface *si = appctx->owner;
+	struct stream_interface *si = cs_si(appctx->owner);
 	struct proxy *curproxy;
 
 	chunk_reset(&trash);
@@ -2736,7 +2740,7 @@ static int cli_io_handler_servers_state(struct appctx *appctx)
  */
 static int cli_io_handler_show_backend(struct appctx *appctx)
 {
-	struct stream_interface *si = appctx->owner;
+	struct stream_interface *si = cs_si(appctx->owner);
 	struct proxy *curproxy;
 
 	chunk_reset(&trash);
@@ -3039,7 +3043,7 @@ static int cli_parse_show_errors(char **args, char *payload, struct appctx *appc
  */
 static int cli_io_handler_show_errors(struct appctx *appctx)
 {
-	struct stream_interface *si = appctx->owner;
+	struct stream_interface *si = cs_si(appctx->owner);
 	extern const char *monthname[12];
 
 	if (unlikely(si_ic(si)->flags & (CF_WRITE_ERROR|CF_SHUTW)))

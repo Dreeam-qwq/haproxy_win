@@ -54,7 +54,7 @@ smp_fetch_src(const struct arg *args, struct sample *smp, const char *kw, void *
 	if (kw[0] == 'b') { /* bc_src */
 		struct connection *conn = ((obj_type(smp->sess->origin) == OBJ_TYPE_CHECK)
 					   ? cs_conn(__objt_check(smp->sess->origin)->cs)
-					   : (smp->strm ? cs_conn(objt_cs(smp->strm->si[1].end)): NULL));
+					   : (smp->strm ? cs_conn(smp->strm->csb): NULL));
 		if (conn && conn_get_src(conn))
 			src = conn_src(conn);
 	}
@@ -65,7 +65,7 @@ smp_fetch_src(const struct arg *args, struct sample *smp, const char *kw, void *
 			src = conn_src(conn);
 	}
         else /* src */
-		src = (smp->strm ? si_src(&smp->strm->si[0]) : sess_src(smp->sess));
+		src = (smp->strm ? si_src(smp->strm->csf->si) : sess_src(smp->sess));
 
 	if (!src)
 		return 0;
@@ -98,7 +98,7 @@ smp_fetch_sport(const struct arg *args, struct sample *smp, const char *kw, void
 	if (kw[0] == 'b') { /* bc_src_port */
 		struct connection *conn = ((obj_type(smp->sess->origin) == OBJ_TYPE_CHECK)
 					   ? cs_conn(__objt_check(smp->sess->origin)->cs)
-					   : (smp->strm ? cs_conn(objt_cs(smp->strm->si[1].end)): NULL));
+					   : (smp->strm ? cs_conn(smp->strm->csb): NULL));
 		if (conn && conn_get_src(conn))
 			src = conn_src(conn);
 	}
@@ -109,7 +109,7 @@ smp_fetch_sport(const struct arg *args, struct sample *smp, const char *kw, void
 			src = conn_src(conn);
 	}
         else /* src_port */
-		src = (smp->strm ? si_src(&smp->strm->si[0]) : sess_src(smp->sess));
+		src = (smp->strm ? si_src(smp->strm->csf->si) : sess_src(smp->sess));
 
 	if (!src)
 		return 0;
@@ -133,7 +133,7 @@ smp_fetch_dst(const struct arg *args, struct sample *smp, const char *kw, void *
 	if (kw[0] == 'b') { /* bc_dst */
 		struct connection *conn = ((obj_type(smp->sess->origin) == OBJ_TYPE_CHECK)
 					   ? cs_conn(__objt_check(smp->sess->origin)->cs)
-					   : (smp->strm ? cs_conn(objt_cs(smp->strm->si[1].end)): NULL));
+					   : (smp->strm ? cs_conn(smp->strm->csb): NULL));
 		if (conn && conn_get_dst(conn))
 			dst = conn_dst(conn);
 	}
@@ -144,7 +144,7 @@ smp_fetch_dst(const struct arg *args, struct sample *smp, const char *kw, void *
 			dst = conn_dst(conn);
 	}
         else /* dst */
-		dst = (smp->strm ? si_dst(&smp->strm->si[0]) : sess_dst(smp->sess));
+		dst = (smp->strm ? si_dst(smp->strm->csf->si) : sess_dst(smp->sess));
 
 	if (!dst)
 		return 0;
@@ -181,7 +181,7 @@ int smp_fetch_dst_is_local(const struct arg *args, struct sample *smp, const cha
 			dst = conn_dst(conn);
 	}
 	else /* dst_is_local */
-		dst = (smp->strm ? si_dst(&smp->strm->si[0]) : sess_dst(smp->sess));
+		dst = (smp->strm ? si_dst(smp->strm->csf->si) : sess_dst(smp->sess));
 
 	if (!dst)
 		return 0;
@@ -207,7 +207,7 @@ int smp_fetch_src_is_local(const struct arg *args, struct sample *smp, const cha
 			src = conn_src(conn);
 	}
 	else /* src_is_local */
-		src = (smp->strm ? si_src(&smp->strm->si[0]) : sess_src(smp->sess));
+		src = (smp->strm ? si_src(smp->strm->csf->si) : sess_src(smp->sess));
 
 	if (!src)
 		return 0;
@@ -229,7 +229,7 @@ smp_fetch_dport(const struct arg *args, struct sample *smp, const char *kw, void
 	if (kw[0] == 'b') { /* bc_dst_port */
 		struct connection *conn = ((obj_type(smp->sess->origin) == OBJ_TYPE_CHECK)
 					   ? cs_conn(__objt_check(smp->sess->origin)->cs)
-					   : (smp->strm ? cs_conn(objt_cs(smp->strm->si[1].end)): NULL));
+					   : (smp->strm ? cs_conn(smp->strm->csb): NULL));
 		if (conn && conn_get_dst(conn))
 			dst = conn_dst(conn);
 	}
@@ -240,7 +240,7 @@ smp_fetch_dport(const struct arg *args, struct sample *smp, const char *kw, void
 			dst = conn_dst(conn);
 	}
         else /* dst_port */
-		dst = (smp->strm ? si_dst(&smp->strm->si[0]) : sess_dst(smp->sess));
+		dst = (smp->strm ? si_dst(smp->strm->csf->si) : sess_dst(smp->sess));
 
 	if (!dst)
 		return 0;
@@ -325,7 +325,7 @@ static inline int get_tcp_info(const struct arg *args, struct sample *smp,
 	/* get the object associated with the stream interface.The
 	 * object can be other thing than a connection. For example,
 	 * it be a appctx. */
-	conn = cs_conn(objt_cs(smp->strm->si[dir].end));
+	conn = (dir == 0 ? cs_conn(smp->strm->csf) : cs_conn(smp->strm->csb));
 	if (!conn)
 		return 0;
 

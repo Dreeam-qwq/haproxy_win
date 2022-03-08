@@ -42,11 +42,23 @@ struct qcc {
 		} tx;
 	} strms[QCS_MAX_TYPES];
 
+	/* Flow-control related fields which are enforced on our side. */
+	struct {
+		uint64_t max_bidi_streams; /* max sub-ID of bidi stream allowed for the peer */
+		uint64_t initial_max_bidi_streams; /* max initial sub-ID of bidi stream allowed for the peer */
+		uint64_t closed_bidi_streams; /* total count of closed bidi stream since last MAX_STREAMS emission */
+	} lfctl;
+
+	/* Flow-control related fields from the endpoint which we must respect. */
+	struct {
+	} rfctl;
+
 	struct {
 		uint64_t max_data; /* Maximum number of bytes which may be received */
 	} rx;
 	struct {
 		uint64_t max_data; /* Maximum number of bytes which may be sent */
+		struct list frms; /* list of frames ready to be sent */
 	} tx;
 
 	struct eb_root streams_by_id; /* all active streams by their ID */
@@ -63,9 +75,10 @@ struct qcc {
 };
 
 #define QC_SF_NONE              0x00000000
-#define QC_SF_FIN_STREAM        0x00000001  // FIN bit must be set for last frame of the stream
-#define QC_SF_BLK_MROOM         0x00000002  // app layer is blocked waiting for room in the qcs.tx.buf
-#define QC_SF_DETACH            0x00000004  // cs is detached but there is remaining data to send
+#define QC_SF_FIN_RECV          0x00000001  // last frame received for this stream
+#define QC_SF_FIN_STREAM        0x00000002  // FIN bit must be set for last frame of the stream
+#define QC_SF_BLK_MROOM         0x00000004  // app layer is blocked waiting for room in the qcs.tx.buf
+#define QC_SF_DETACH            0x00000008  // cs is detached but there is remaining data to send
 
 struct qcs {
 	struct qcc *qcc;
@@ -76,6 +89,7 @@ struct qcs {
 		struct eb_root frms; /* received frames ordered by their offsets */
 		uint64_t offset; /* the current offset of received data */
 		struct buffer buf; /* receive buffer, always valid (buf_empty or real buffer) */
+		struct buffer app_buf; /* receive buffer used by conn_stream layer */
 	} rx;
 	struct {
 		uint64_t offset;   /* the current offset of received data */

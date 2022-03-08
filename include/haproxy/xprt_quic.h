@@ -2,7 +2,7 @@
  * include/haproxy/xprt_quic.h
  * This file contains QUIC xprt function prototypes
  *
- * Copyright 2020 HAProxy Technologies, Frédéric Lécaille <flecaille@haproxy.com>
+ * Copyright 2020 HAProxy Technologies, Frederic Lecaille <flecaille@haproxy.com>
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -331,7 +331,8 @@ static inline uint64_t quic_max_int(size_t sz)
  * buffer with <sz> as size for a data field of bytes prefixed by its QUIC
  * variable-length (may be 0).
  * Also put in <*len_sz> the size of this QUIC variable-length.
- * So after returning from this function we have : <*len_sz> + <ret> = <sz>.
+ * So after returning from this function we have : <*len_sz> + <ret> <= <sz>
+ * (<*len_sz> = { max(i), i + ret <= <sz> }) .
  */
 static inline size_t max_available_room(size_t sz, size_t *len_sz)
 {
@@ -346,8 +347,22 @@ static inline size_t max_available_room(size_t sz, size_t *len_sz)
 	*len_sz = quic_int_getsize(ret);
 	/* Difference between the two sizes. Note that <sz_sz> >= <*len_sz>. */
 	diff = sz_sz - *len_sz;
-	if (unlikely(diff > 0))
-		ret += diff;
+	if (unlikely(diff > 0)) {
+		/* Let's try to take into an account remaining bytes.
+		 *
+		 *                  <----------------> <sz_sz>
+		 *  <--------------><-------->  +----> <max_int>
+		 *       <ret>       <len_sz>   |
+		 *  +---------------------------+-----------....
+		 *  <--------------------------------> <sz>
+		 */
+		size_t max_int = quic_max_int_by_size(*len_sz);
+
+		if (max_int + *len_sz <= sz)
+			ret = max_int;
+		else
+			ret = sz - diff;
+	}
 
 	return ret;
 }
@@ -966,7 +981,7 @@ static inline void quic_pktns_init(struct quic_pktns *pktns)
 /* Discard <pktns> packet number space attached to <qc> QUIC connection.
  * Its loss information are reset. Deduce the outstanding bytes for this
  * packet number space from the outstanding bytes for the path of this
- * connection§.
+ * connection.
  * Note that all the non acknowledged TX packets and their frames are freed.
  * Always succeeds. 
  */
@@ -1034,7 +1049,7 @@ static inline size_t quic_path_room(struct quic_path *path)
  */
 static inline size_t quic_path_prep_data(struct quic_path *path)
 {
-	if (path->in_flight > path->cwnd)
+	if (path->prep_in_flight > path->cwnd)
 		return 0;
 
 	return path->cwnd - path->prep_in_flight;
@@ -1197,6 +1212,7 @@ struct task *quic_lstnr_dghdlr(struct task *t, void *ctx, unsigned int state);
 int quic_lstnr_dgram_dispatch(unsigned char *buf, size_t len, void *owner,
                               struct sockaddr_storage *saddr,
                               struct quic_dgram *new_dgram, struct list *dgrams);
+int qc_send_app_pkts(struct quic_conn *qc, struct list *frms);
 
 #endif /* USE_QUIC */
 #endif /* _HAPROXY_XPRT_QUIC_H */

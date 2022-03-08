@@ -4,32 +4,15 @@
 
 #include <haproxy/api.h>
 #include <haproxy/connection.h>
+#include <haproxy/conn_stream.h>
 #include <haproxy/dynbuf.h>
+#include <haproxy/htx.h>
 #include <haproxy/pool.h>
 #include <haproxy/ssl_sock-t.h>
+#include <haproxy/xprt_quic.h>
 
 DECLARE_POOL(pool_head_qcc, "qcc", sizeof(struct qcc));
 DECLARE_POOL(pool_head_qcs, "qcs", sizeof(struct qcs));
-
-void quic_mux_transport_params_update(struct qcc *qcc)
-{
-	struct quic_transport_params *clt_params;
-
-	/* Client parameters, params used to TX. */
-	clt_params = &qcc->conn->qc->tx.params;
-
-	qcc->tx.max_data = clt_params->initial_max_data;
-	/* Client initiated streams must respect the server flow control. */
-	qcc->strms[QCS_CLT_BIDI].rx.max_data = clt_params->initial_max_stream_data_bidi_local;
-	qcc->strms[QCS_CLT_UNI].rx.max_data = clt_params->initial_max_stream_data_uni;
-
-	/* Server initiated streams must respect the server flow control. */
-	qcc->strms[QCS_SRV_BIDI].max_streams = clt_params->initial_max_streams_bidi;
-	qcc->strms[QCS_SRV_BIDI].tx.max_data = clt_params->initial_max_stream_data_bidi_remote;
-
-	qcc->strms[QCS_SRV_UNI].max_streams = clt_params->initial_max_streams_uni;
-	qcc->strms[QCS_SRV_UNI].tx.max_data = clt_params->initial_max_stream_data_uni;
-}
 
 /* Allocate a new QUIC streams with id <id> and type <type>. */
 struct qcs *qcs_new(struct qcc *qcc, uint64_t id, enum qcs_type type)
@@ -51,6 +34,7 @@ struct qcs *qcs_new(struct qcc *qcc, uint64_t id, enum qcs_type type)
 	qcc->strms[type].nb_streams++;
 
 	qcs->rx.buf = BUF_NULL;
+	qcs->rx.app_buf = BUF_NULL;
 	qcs->rx.offset = 0;
 	qcs->rx.frms = EB_ROOT_UNIQUE;
 
@@ -130,7 +114,7 @@ struct eb64_node *qcc_get_qcs(struct qcc *qcc, uint64_t id)
 	strm_type = id & QCS_ID_TYPE_MASK;
 	sub_id = id >> QCS_ID_TYPE_SHIFT;
 	strm_node = NULL;
-	if (qc_local_stream_id(qcc, id)) {
+	if (quic_stream_is_local(qcc, id)) {
 		/* Local streams: this stream must be already opened. */
 		strm_node = eb64_lookup(&qcc->streams_by_id, id);
 		if (!strm_node) {
@@ -146,9 +130,13 @@ struct eb64_node *qcc_get_qcs(struct qcc *qcc, uint64_t id)
 
 		strms = &qcc->streams_by_id;
 		qcs_type = qcs_id_type(id);
-		if (sub_id + 1 > qcc->strms[qcs_type].max_streams) {
-			/* streams limit reached */
-			goto out;
+
+		/* TODO also checks max-streams for uni streams */
+		if (quic_stream_is_bidi(id)) {
+			if (sub_id + 1 > qcc->lfctl.max_bidi_streams) {
+				/* streams limit reached */
+				goto out;
+			}
 		}
 
 		/* Note: ->largest_id was initialized with (uint64_t)-1 as value, 0 being a
@@ -189,10 +177,110 @@ struct eb64_node *qcc_get_qcs(struct qcc *qcc, uint64_t id)
 	return NULL;
 }
 
+/* Handle a new STREAM frame <strm_frm>. The frame content will be copied in
+ * the buffer of the stream instance. The stream instance will be stored in
+ * <out_qcs>. In case of success, the caller can immediatly call qcc_decode_qcs
+ * to process the frame content.
+ *
+ * Returns 0 on success. On errors, two codes are present.
+ * - 1 is returned if the frame cannot be decoded and must be discarded.
+ * - 2 is returned if the stream cannot decode at the moment the frame. The
+ *   frame should be buffered to be handled later.
+ */
+int qcc_recv(struct qcc *qcc, uint64_t id, uint64_t len, uint64_t offset,
+             char fin, char *data, struct qcs **out_qcs)
+{
+	struct qcs *qcs;
+	struct eb64_node *strm_node;
+	size_t total, diff;
+
+	strm_node = qcc_get_qcs(qcc, id);
+	if (!strm_node) {
+		fprintf(stderr, "%s: stream not found\n", __func__);
+		return 1;
+	}
+
+	qcs = eb64_entry(&strm_node->node, struct qcs, by_id);
+	*out_qcs = qcs;
+
+	if (offset > qcs->rx.offset)
+		return 2;
+
+	if (offset + len <= qcs->rx.offset) {
+		fprintf(stderr, "%s: already received STREAM data\n", __func__);
+		return 1;
+	}
+
+	/* Last frame already handled for this stream. */
+	BUG_ON(qcs->flags & QC_SF_FIN_RECV);
+
+	if (!qc_get_buf(qcs, &qcs->rx.buf)) {
+		/* TODO should mark qcs as full */
+		return 2;
+	}
+
+	fprintf(stderr, "%s: new STREAM data\n", __func__);
+	diff = qcs->rx.offset - offset;
+
+	/* TODO do not partially copy a frame if not enough size left. Maybe
+	 * this can be optimized.
+	 */
+	if (len > b_room(&qcs->rx.buf)) {
+		/* TODO handle STREAM frames larger than RX buffer. */
+		BUG_ON(len > b_size(&qcs->rx.buf));
+		return 2;
+	}
+
+	len -= diff;
+	data += diff;
+
+	total = b_putblk(&qcs->rx.buf, data, len);
+	/* TODO handle partial copy of a STREAM frame. */
+	BUG_ON(len != total);
+
+	qcs->rx.offset += total;
+
+	if (fin)
+		qcs->flags |= QC_SF_FIN_RECV;
+
+ out:
+	return 0;
+}
+
+/* Decode the content of STREAM frames already received on the stream instance
+ * <qcs>.
+ *
+ * Returns 0 on success else non-zero.
+ */
+int qcc_decode_qcs(struct qcc *qcc, struct qcs *qcs)
+{
+	if (qcc->app_ops->decode_qcs(qcs, qcs->flags & QC_SF_FIN_RECV, qcc->ctx) < 0) {
+		fprintf(stderr, "%s: decoding error\n", __func__);
+		return 1;
+	}
+
+	return 0;
+}
+
+static int qc_is_max_streams_needed(struct qcc *qcc)
+{
+	return qcc->lfctl.closed_bidi_streams > qcc->lfctl.initial_max_bidi_streams / 2;
+}
+
 /* detaches the QUIC stream from its QCC and releases it to the QCS pool. */
 static void qcs_destroy(struct qcs *qcs)
 {
+	const uint64_t id = qcs->by_id.key;
+
 	fprintf(stderr, "%s: release stream %llu\n", __func__, qcs->by_id.key);
+
+	if (quic_stream_is_remote(qcs->qcc, id)) {
+		if (quic_stream_is_bidi(id)) {
+			++qcs->qcc->lfctl.closed_bidi_streams;
+			if (qc_is_max_streams_needed(qcs->qcc))
+				tasklet_wakeup(qcs->qcc->wait_event.tasklet);
+		}
+	}
 
 	eb64_delete(&qcs->by_id);
 
@@ -262,12 +350,13 @@ static void qc_release(struct qcc *qcc)
 	}
 }
 
-static int qcs_push_frame(struct qcs *qcs, struct buffer *payload, int fin, uint64_t offset)
+static int qcs_push_frame(struct qcs *qcs, struct buffer *payload, int fin, uint64_t offset,
+                          struct list *frm_list)
 {
 	struct quic_frame *frm;
 	struct buffer *buf = &qcs->tx.xprt_buf;
-	struct quic_enc_level *qel = &qcs->qcc->conn->qc->els[QUIC_TLS_ENC_LEVEL_APP];
 	int total = 0, to_xfer;
+	unsigned char *btail;
 
 	fprintf(stderr, "%s\n", __func__);
 
@@ -280,6 +369,8 @@ static int qcs_push_frame(struct qcs *qcs, struct buffer *payload, int fin, uint
 	if (!frm)
 		goto err;
 
+	/* store buffer end before transfering data for frm.stream.data */
+	btail = (unsigned char *)b_tail(buf);
 	total = b_force_xfer(buf, payload, to_xfer);
 	/* FIN is positioned only when the buffer has been totally emptied. */
 	fin = fin && !b_data(payload);
@@ -292,13 +383,14 @@ static int qcs_push_frame(struct qcs *qcs, struct buffer *payload, int fin, uint
 	}
 	frm->stream.qcs = (struct qcs *)qcs;
 	frm->stream.buf = buf;
+	frm->stream.data = btail;
 	frm->stream.id = qcs->by_id.key;
 	if (total) {
 		frm->type |= QUIC_STREAM_FRAME_TYPE_LEN_BIT;
 		frm->stream.len = total;
 	}
 
-	LIST_APPEND(&qel->pktns->tx.frms, &frm->list);
+	LIST_APPEND(frm_list, &frm->list);
  out:
 	fprintf(stderr, "%s: total=%d fin=%d id=%llu offset=%lu\n",
 	        __func__, total, fin, (ull)qcs->by_id.key, offset);
@@ -308,38 +400,72 @@ static int qcs_push_frame(struct qcs *qcs, struct buffer *payload, int fin, uint
 	return -1;
 }
 
+/* Wrapper for send on transport layer. Send a list of frames <frms> for the
+ * connection <qcc>.
+ *
+ * Returns 0 if all data sent with success else non-zero.
+ */
+static int qc_send_frames(struct qcc *qcc, struct list *frms)
+{
+	void *first_frm = NULL;
+
+ retry_send:
+	if (!LIST_ISEMPTY(frms))
+		qc_send_app_pkts(qcc->conn->qc, frms);
+
+	/* if the frame list is not empty, retry immediatly to send. Remember
+	 * the first frame in the list : if the pointer did not advance, it
+	 * means the transport layer is blocked.
+	 *
+	 * TODO implement immediate retry on transport layer. This way on mux
+	 * always subscribe if the list is not empty.
+	 */
+	if (!LIST_ISEMPTY(frms) && first_frm != frms->n) {
+		first_frm = frms->n;
+		goto retry_send;
+	}
+
+	if (!LIST_ISEMPTY(frms)) {
+		fprintf(stderr, "%s: remaining frames to send\n", __func__);
+		qcc->conn->xprt->subscribe(qcc->conn, qcc->conn->xprt_ctx,
+		                           SUB_RETRY_SEND, &qcc->wait_event);
+		return 1;
+	}
+
+	return 0;
+}
+
 static int qc_send(struct qcc *qcc)
 {
 	struct eb64_node *node;
-	int xprt_wake = 0;
-	int ret;
+	int ret = 0;
 
 	fprintf(stderr, "%s\n", __func__);
 
-	/* TODO simple loop through all streams and check if there is frames to
-	 * send
+	/* loop through all streams, construct STREAM frames if data available.
+	 * TODO optimize the loop to favor streams which are not too heavy.
 	 */
 	node = eb64_first(&qcc->streams_by_id);
 	while (node) {
 		struct qcs *qcs = container_of(node, struct qcs, by_id);
 		struct buffer *buf = &qcs->tx.buf;
+
 		if (b_data(buf)) {
 			char fin = qcs->flags & QC_SF_FIN_STREAM;
-			ret = qcs_push_frame(qcs, buf, fin, qcs->tx.offset);
-			if (ret < 0)
-				ABORT_NOW();
+			ret = qcs_push_frame(qcs, buf, fin, qcs->tx.offset,
+			                     &qcc->tx.frms);
+			BUG_ON(ret < 0); /* TODO handle this properly */
 
 			if (ret > 0) {
 				qcs_notify_send(qcs);
 				if (qcs->flags & QC_SF_BLK_MROOM)
 					qcs->flags &= ~QC_SF_BLK_MROOM;
-
-				xprt_wake = 1;
 			}
 
 			fprintf(stderr, "%s ret=%d\n", __func__, ret);
 			qcs->tx.offset += ret;
 
+			/* Subscribe if not all data can be send. */
 			if (b_data(buf)) {
 				qcc->conn->xprt->subscribe(qcc->conn, qcc->conn->xprt_ctx,
 				                           SUB_RETRY_SEND, &qcc->wait_event);
@@ -348,8 +474,8 @@ static int qc_send(struct qcc *qcc)
 		node = eb64_next(node);
 	}
 
-	if (xprt_wake)
-		tasklet_wakeup(((struct ssl_sock_ctx *)(qcc->conn->xprt_ctx))->wait_event.tasklet);
+	qc_send_frames(qcc, &qcc->tx.frms);
+	/* TODO adjust ret if not all frames are sent. */
 
 	return ret;
 }
@@ -384,11 +510,44 @@ static int qc_release_detached_streams(struct qcc *qcc)
 	return release;
 }
 
+/* Send a MAX_STREAM_BIDI frame to update the limit of bidirectional streams
+ * allowed to be opened by the peer. The caller should have first checked if
+ * this is required with qc_is_max_streams_needed.
+ *
+ * Returns 0 on success else non-zero.
+ */
+static int qc_send_max_streams(struct qcc *qcc)
+{
+	struct list frms = LIST_HEAD_INIT(frms);
+	struct quic_frame *frm;
+
+	frm = pool_zalloc(pool_head_quic_frame);
+	BUG_ON(!frm); /* TODO handle this properly */
+
+	frm->type = QUIC_FT_MAX_STREAMS_BIDI;
+	frm->max_streams_bidi.max_streams = qcc->lfctl.max_bidi_streams +
+	                                    qcc->lfctl.closed_bidi_streams;
+	fprintf(stderr, "SET MAX_STREAMS %lu\n", frm->max_streams_bidi.max_streams);
+	LIST_APPEND(&frms, &frm->list);
+
+	if (qc_send_frames(qcc, &frms))
+		return 1;
+
+	/* save the new limit if the frame has been send. */
+	qcc->lfctl.max_bidi_streams += qcc->lfctl.closed_bidi_streams;
+	qcc->lfctl.closed_bidi_streams = 0;
+
+	return 0;
+}
+
 static struct task *qc_io_cb(struct task *t, void *ctx, unsigned int status)
 {
 	struct qcc *qcc = ctx;
 
 	fprintf(stderr, "%s\n", __func__);
+
+	if (qc_is_max_streams_needed(qcc))
+		qc_send_max_streams(qcc);
 
 	qc_send(qcc);
 
@@ -425,6 +584,10 @@ static struct task *qc_timeout_task(struct task *t, void *ctx, unsigned int stat
 
 	fprintf(stderr, "%s: timeout\n", __func__);
 	task_destroy(t);
+
+	if (!qcc)
+		return NULL;
+
 	qcc->task = NULL;
 
 	if (qcc_is_dead(qcc))
@@ -437,7 +600,7 @@ static int qc_init(struct connection *conn, struct proxy *prx,
                    struct session *sess, struct buffer *input)
 {
 	struct qcc *qcc;
-	struct quic_transport_params *srv_params;
+	struct quic_transport_params *lparams;
 
 	qcc = pool_alloc(pool_head_qcc);
 	if (!qcc)
@@ -452,36 +615,40 @@ static int qc_init(struct connection *conn, struct proxy *prx,
 	qcc->streams_by_id = EB_ROOT_UNIQUE;
 
 	/* Server parameters, params used for RX flow control. */
-	srv_params = &conn->qc->rx.params;
+	lparams = &conn->qc->rx.params;
 
-	qcc->rx.max_data = srv_params->initial_max_data;
+	qcc->rx.max_data = lparams->initial_max_data;
 	qcc->tx.max_data = 0;
+	LIST_INIT(&qcc->tx.frms);
 
 	/* Client initiated streams must respect the server flow control. */
-	qcc->strms[QCS_CLT_BIDI].max_streams = srv_params->initial_max_streams_bidi;
+	qcc->strms[QCS_CLT_BIDI].max_streams = lparams->initial_max_streams_bidi;
 	qcc->strms[QCS_CLT_BIDI].nb_streams = 0;
 	qcc->strms[QCS_CLT_BIDI].largest_id = -1;
 	qcc->strms[QCS_CLT_BIDI].rx.max_data = 0;
-	qcc->strms[QCS_CLT_BIDI].tx.max_data = srv_params->initial_max_stream_data_bidi_remote;
+	qcc->strms[QCS_CLT_BIDI].tx.max_data = lparams->initial_max_stream_data_bidi_remote;
 
-	qcc->strms[QCS_CLT_UNI].max_streams = srv_params->initial_max_streams_uni;
+	qcc->strms[QCS_CLT_UNI].max_streams = lparams->initial_max_streams_uni;
 	qcc->strms[QCS_CLT_UNI].nb_streams = 0;
 	qcc->strms[QCS_CLT_UNI].largest_id = -1;
 	qcc->strms[QCS_CLT_UNI].rx.max_data = 0;
-	qcc->strms[QCS_CLT_UNI].tx.max_data = srv_params->initial_max_stream_data_uni;
+	qcc->strms[QCS_CLT_UNI].tx.max_data = lparams->initial_max_stream_data_uni;
 
 	/* Server initiated streams must respect the server flow control. */
 	qcc->strms[QCS_SRV_BIDI].max_streams = 0;
 	qcc->strms[QCS_SRV_BIDI].nb_streams = 0;
 	qcc->strms[QCS_SRV_BIDI].largest_id = -1;
-	qcc->strms[QCS_SRV_BIDI].rx.max_data = srv_params->initial_max_stream_data_bidi_local;
+	qcc->strms[QCS_SRV_BIDI].rx.max_data = lparams->initial_max_stream_data_bidi_local;
 	qcc->strms[QCS_SRV_BIDI].tx.max_data = 0;
 
 	qcc->strms[QCS_SRV_UNI].max_streams = 0;
 	qcc->strms[QCS_SRV_UNI].nb_streams = 0;
 	qcc->strms[QCS_SRV_UNI].largest_id = -1;
-	qcc->strms[QCS_SRV_UNI].rx.max_data = srv_params->initial_max_stream_data_uni;
+	qcc->strms[QCS_SRV_UNI].rx.max_data = lparams->initial_max_stream_data_uni;
 	qcc->strms[QCS_SRV_UNI].tx.max_data = 0;
+
+	qcc->lfctl.max_bidi_streams = qcc->lfctl.initial_max_bidi_streams = lparams->initial_max_streams_bidi;
+	qcc->lfctl.closed_bidi_streams = 0;
 
 	qcc->wait_event.tasklet = tasklet_new();
 	if (!qcc->wait_event.tasklet)
@@ -552,10 +719,67 @@ static void qc_detach(struct conn_stream *cs)
 static size_t qc_rcv_buf(struct conn_stream *cs, struct buffer *buf,
                          size_t count, int flags)
 {
-	/* XXX TODO XXX */
+	struct qcs *qcs = cs->ctx;
+	struct htx *qcs_htx = NULL;
+	struct htx *cs_htx = NULL;
+	size_t ret = 0;
+	char fin = 0;
+
 	fprintf(stderr, "%s\n", __func__);
 
-	return 0;
+	qcs_htx = htx_from_buf(&qcs->rx.app_buf);
+	if (htx_is_empty(qcs_htx)) {
+		/* Set buffer data to 0 as HTX is empty. */
+		htx_to_buf(qcs_htx, &qcs->rx.app_buf);
+		goto end;
+	}
+
+	ret = qcs_htx->data;
+
+	cs_htx = htx_from_buf(buf);
+	if (htx_is_empty(cs_htx) && htx_used_space(qcs_htx) <= count) {
+		htx_to_buf(cs_htx, buf);
+		htx_to_buf(qcs_htx, &qcs->rx.app_buf);
+		b_xfer(buf, &qcs->rx.app_buf, b_data(&qcs->rx.app_buf));
+		goto end;
+	}
+
+	htx_xfer_blks(cs_htx, qcs_htx, count, HTX_BLK_UNUSED);
+	BUG_ON(qcs_htx->flags & HTX_FL_PARSING_ERROR);
+
+	/* Copy EOM from src to dst buffer if all data copied. */
+	if (htx_is_empty(qcs_htx) && (qcs_htx->flags & HTX_FL_EOM)) {
+		cs_htx->flags |= HTX_FL_EOM;
+		fin = 1;
+	}
+
+	cs_htx->extra = qcs_htx->extra ? (qcs_htx->data + qcs_htx->extra) : 0;
+	htx_to_buf(cs_htx, buf);
+	htx_to_buf(qcs_htx, &qcs->rx.app_buf);
+	ret -= qcs_htx->data;
+
+ end:
+	if (b_data(&qcs->rx.app_buf)) {
+		cs->flags |= (CS_FL_RCV_MORE | CS_FL_WANT_ROOM);
+	}
+	else {
+		cs->flags &= ~(CS_FL_RCV_MORE | CS_FL_WANT_ROOM);
+		if (cs->flags & CS_FL_ERR_PENDING)
+			cs->flags |= CS_FL_ERROR;
+
+		if (fin)
+			cs->flags |= (CS_FL_EOI|CS_FL_EOS);
+
+		if (b_size(&qcs->rx.app_buf)) {
+			b_free(&qcs->rx.app_buf);
+			offer_buffers(NULL, 1);
+		}
+	}
+
+	if (ret)
+		tasklet_wakeup(qcs->qcc->wait_event.tasklet);
+
+	return ret;
 }
 
 static size_t qc_snd_buf(struct conn_stream *cs, struct buffer *buf,

@@ -218,6 +218,9 @@ int jobs = 0;   /* number of active jobs (conns, listeners, active tasks, ...) *
 int unstoppable_jobs = 0;  /* number of active jobs that can't be stopped during a soft stop */
 int active_peers = 0; /* number of active peers (connection attempts and connected) */
 int connected_peers = 0; /* number of connected peers (verified ones) */
+int arg_mode = 0;	/* MODE_DEBUG etc as passed on command line ... */
+char *change_dir = NULL; /* set when -C is passed */
+char *check_condition = NULL; /* check condition passed to -cc */
 
 /* Here we store information about the pids of the processes we may pause
  * or kill. We will send them a signal every 10 ms until we can bind to all
@@ -258,7 +261,7 @@ static void *run_thread_poll_loop(void *data);
 unsigned int warned = 0;
 
 /* set if experimental features have been used for the current process */
-static unsigned int tainted = 0;
+unsigned int tainted = 0;
 
 unsigned int experimental_directives_allowed = 0;
 
@@ -561,7 +564,7 @@ static void usage(char *name)
 		"        [ -p <pidfile> ] [ -m <max megs> ] [ -C <dir> ] [-- <cfgfile>*]\n"
 		"        -v displays version ; -vv shows known build options.\n"
 		"        -d enters debug mode ; -db only disables background mode.\n"
-		"        -dM[<byte>] poisons memory with <byte> (defaults to 0x50)\n"
+		"        -dM[<byte>,help,...] debug memory (default: poison with <byte>/0x50)\n"
 		"        -V enters verbose mode (disables quiet mode)\n"
 		"        -D goes daemon ; -C changes to <dir> before loading files.\n"
 		"        -W master-worker mode.\n"
@@ -1446,103 +1449,105 @@ static int check_if_maxsock_permitted(int maxsock)
 	return ret == 0;
 }
 
-void mark_tainted(const enum tainted_flags flag)
-{
-	HA_ATOMIC_OR(&tainted, flag);
-}
-
-unsigned int get_tainted()
-{
-	int tainted_state;
-	HA_ATOMIC_STORE(&tainted_state, tainted);
-	return tainted_state;
-}
-
-/*
- * This function initializes all the necessary variables. It only returns
- * if everything is OK. If something fails, it exits.
+/* This performs th every basic early initialization at the end of the PREPARE
+ * init stage. It may only assume that list heads are initialized, but not that
+ * anything else is correct. It will initialize a number of variables that
+ * depend on command line and will pre-parse the command line. If it fails, it
+ * directly exits.
  */
-static void init(int argc, char **argv)
+static void init_early(int argc, char **argv)
 {
-	int arg_mode = 0;	/* MODE_DEBUG, ... */
-	char *tmp;
-	char *cfg_pidfile = NULL;
-	int err_code = 0;
-	char *err_msg = NULL;
-	struct wordlist *wl;
 	char *progname;
-	char *change_dir = NULL;
-	struct proxy *px;
-	struct post_check_fct *pcf;
-	int ideal_maxconn;
-	char *check_condition = NULL;
+	char *tmp;
+	int len;
 
+	/* First, let's initialize most global variables */
+	totalconn = actconn = listeners = stopping = 0;
+	killed = pid = 0;
+
+	global.maxsock = 10; /* reserve 10 fds ; will be incremented by socket eaters */
+	global.rlimit_memmax_all = HAPROXY_MEMMAX;
 	global.mode = MODE_STARTING;
-	old_argv = copy_argv(argc, argv);
-	if (!old_argv) {
-		ha_alert("failed to copy argv.\n");
-		exit(1);
-	}
 
-	if (!init_trash_buffers(1)) {
-		ha_alert("failed to initialize trash buffers.\n");
-		exit(1);
-	}
+	/* if we were in mworker mode, we should restart in mworker mode */
+	if (getenv("HAPROXY_MWORKER_REEXEC") != NULL)
+		global.mode |= MODE_MWORKER;
 
-	/* NB: POSIX does not make it mandatory for gethostname() to NULL-terminate
-	 * the string in case of truncation, and at least FreeBSD appears not to do
-	 * it.
+	/* initialize date, time, and pid */
+	tzset();
+	clock_init_process_date();
+	start_date = now;
+	pid = getpid();
+
+	/* Set local host name and adjust some environment variables.
+	 * NB: POSIX does not make it mandatory for gethostname() to
+	 * NULL-terminate the string in case of truncation, and at least
+	 * FreeBSD appears not to do it.
 	 */
 	memset(hostname, 0, sizeof(hostname));
 	gethostname(hostname, sizeof(hostname) - 1);
 
-	if ((localpeer = strdup(hostname)) == NULL) {
+	/* preset some environment variables */
+	localpeer = strdup(hostname);
+	if (!localpeer || setenv("HAPROXY_LOCALPEER", localpeer, 1) < 0) {
 		ha_alert("Cannot allocate memory for local peer.\n");
 		exit(EXIT_FAILURE);
 	}
-	setenv("HAPROXY_LOCALPEER", localpeer, 1);
 
-	/* we were in mworker mode, we should restart in mworker mode */
-	if (getenv("HAPROXY_MWORKER_REEXEC") != NULL)
-		global.mode |= MODE_MWORKER;
-
-	/*
-	 * Initialize the previously static variables.
-	 */
-
-	totalconn = actconn = listeners = stopping = 0;
-	killed = 0;
-
-
-#ifdef HAPROXY_MEMMAX
-	global.rlimit_memmax_all = HAPROXY_MEMMAX;
-#endif
-
-	tzset();
-	clock_init_process_date();
-	start_date = now;
-
-	ha_random_boot(argv);
-
-	if (init_acl() != 0)
-		exit(1);
-
+	/* Initialize the random generators */
 #ifdef USE_OPENSSL
-	/* Initialize the random generator.
-	 * Must be called before chroot for access to /dev/urandom
+	/* Initialize SSL random generator. Must be called before chroot for
+	 * access to /dev/urandom, and before ha_random_boot() which may use
+	 * RAND_bytes().
 	 */
 	if (!ssl_initialize_random()) {
 		ha_alert("OpenSSL random data generator initialization failed.\n");
-		exit(1);
+		exit(EXIT_FAILURE);
+	}
+#endif
+	ha_random_boot(argv); // the argv pointer brings some kernel-fed entropy
+
+	/* Some CPU affinity stuff may have to be initialized */
+#ifdef USE_CPU_AFFINITY
+	{
+		int i;
+		ha_cpuset_zero(&cpu_map.proc);
+		ha_cpuset_zero(&cpu_map.proc_t1);
+		for (i = 0; i < MAX_THREADS; ++i) {
+			ha_cpuset_zero(&cpu_map.thread[i]);
+		}
 	}
 #endif
 
-	/* Initialise lua. */
-	hlua_init();
+	/* extract the program name from argv[0], it will be used for the logs
+	 * and error messages.
+	 */
+	progname = *argv;
+	while ((tmp = strchr(progname, '/')) != NULL)
+		progname = tmp + 1;
 
-	/* Initialize process vars */
-	vars_init_head(&proc_vars, SCOPE_PROC);
+	len = strlen(progname);
+	progname = strdup(progname);
+	if (!progname) {
+		ha_alert("Cannot allocate memory for log_tag.\n");
+		exit(EXIT_FAILURE);
+	}
 
+	chunk_initlen(&global.log_tag, progname, len, len);
+}
+
+/* handles program arguments. Very minimal parsing is performed, variables are
+ * fed with some values, and lists are completed with other ones. In case of
+ * error, it will exit.
+ */
+static void init_args(int argc, char **argv)
+{
+	char *progname = global.log_tag.area;
+	char *err_msg = NULL;
+
+	/* pre-fill in the global tuning options before we let the cmdline
+	 * change them.
+	 */
 	global.tune.options |= GTUNE_USE_SELECT;  /* select() is always available */
 #if defined(USE_POLL)
 	global.tune.options |= GTUNE_USE_POLL;
@@ -1570,19 +1575,14 @@ static void init(int argc, char **argv)
 #endif
 	global.tune.options |= GTUNE_STRICT_LIMITS;
 
-	pid = getpid();
-	progname = *argv;
-	while ((tmp = strchr(progname, '/')) != NULL)
-		progname = tmp + 1;
-
-	/* the process name is used for the logs only */
-	chunk_initlen(&global.log_tag, strdup(progname), strlen(progname), strlen(progname));
-	if (b_orig(&global.log_tag) == NULL) {
-		chunk_destroy(&global.log_tag);
-		ha_alert("Cannot allocate memory for log_tag.\n");
+	/* keep a copy of original arguments for the master process */
+	old_argv = copy_argv(argc, argv);
+	if (!old_argv) {
+		ha_alert("failed to copy argv.\n");
 		exit(EXIT_FAILURE);
 	}
 
+	/* skip program name and start */
 	argc--; argv++;
 	while (argc > 0) {
 		char *flag;
@@ -1635,8 +1635,21 @@ static void init(int argc, char **argv)
 				arg_mode |= MODE_DIAG;
 			else if (*flag == 'd' && flag[1] == 'W')
 				arg_mode |= MODE_ZERO_WARNING;
-			else if (*flag == 'd' && flag[1] == 'M')
-				mem_poison_byte = flag[2] ? strtol(flag + 2, NULL, 0) : 'P';
+			else if (*flag == 'd' && flag[1] == 'M') {
+				int ret = pool_parse_debugging(flag + 2, &err_msg);
+
+				if (ret <= -1) {
+					if (ret < -1)
+						ha_alert("-dM: %s\n", err_msg);
+					else
+						printf("%s\n", err_msg);
+					ha_free(&err_msg);
+					exit(ret < -1 ? EXIT_FAILURE : 0);
+				} else if (ret == 0) {
+					ha_warning("-dM: %s\n", err_msg);
+					ha_free(&err_msg);
+				}
+			}
 			else if (*flag == 'd' && flag[1] == 'r')
 				global.tune.options |= GTUNE_RESOLVE_DONTFAIL;
 #if defined(HA_HAVE_DUMP_LIBS)
@@ -1772,7 +1785,13 @@ static void init(int argc, char **argv)
 						exit(1);
 					}
 					break;
-				case 'p' : cfg_pidfile = *argv; break;
+				case 'p' :
+					free(global.pidfile);
+					if ((global.pidfile = strdup(*argv)) == NULL) {
+						ha_alert("Cannot allocate memory for pidfile.\n");
+						exit(EXIT_FAILURE);
+					}
+					break;
 				default: usage(progname);
 				}
 			}
@@ -1781,6 +1800,32 @@ static void init(int argc, char **argv)
 			usage(progname);
 		argv++; argc--;
 	}
+	free(err_msg);
+}
+
+/*
+ * This function initializes all the necessary variables. It only returns
+ * if everything is OK. If something fails, it exits.
+ */
+static void init(int argc, char **argv)
+{
+	char *progname = global.log_tag.area;
+	int err_code = 0;
+	struct wordlist *wl;
+	struct proxy *px;
+	struct post_check_fct *pcf;
+	int ideal_maxconn;
+
+	if (!init_trash_buffers(1)) {
+		ha_alert("failed to initialize trash buffers.\n");
+		exit(1);
+	}
+
+	if (init_acl() != 0)
+		exit(1);
+
+	/* Initialise lua. */
+	hlua_init();
 
 	global.mode |= (arg_mode & (MODE_DAEMON | MODE_MWORKER | MODE_FOREGROUND | MODE_VERBOSE
 				    | MODE_QUIET | MODE_CHECK | MODE_DEBUG | MODE_ZERO_WARNING
@@ -1802,19 +1847,6 @@ static void init(int argc, char **argv)
 		ha_alert("Could not change to directory %s : %s\n", change_dir, strerror(errno));
 		exit(1);
 	}
-
-	global.maxsock = 10; /* reserve 10 fds ; will be incremented by socket eaters */
-
-#ifdef USE_CPU_AFFINITY
-	{
-		int i;
-		ha_cpuset_zero(&cpu_map.proc);
-		ha_cpuset_zero(&cpu_map.proc_t1);
-		for (i = 0; i < MAX_THREADS; ++i) {
-			ha_cpuset_zero(&cpu_map.thread[i]);
-		}
-	}
-#endif
 
 	usermsgs_clr("config");
 
@@ -2123,11 +2155,6 @@ static void init(int argc, char **argv)
 				global.maxsock += p->peers_fe->maxconn;
 	}
 
-	if (cfg_pidfile) {
-		free(global.pidfile);
-		global.pidfile = strdup(cfg_pidfile);
-	}
-
 	/* Now we want to compute the maxconn and possibly maxsslconn values.
 	 * It's a bit tricky. Maxconn defaults to the pre-computed value based
 	 * on rlim_fd_cur and the number of FDs in use due to the configuration,
@@ -2422,8 +2449,6 @@ static void init(int argc, char **argv)
 
 	if (!hlua_post_init())
 		exit(1);
-
-	free(err_msg);
 }
 
 void deinit(void)
@@ -2907,12 +2932,21 @@ int main(int argc, char **argv)
 	/* process all initcalls in order of potential dependency */
 	RUN_INITCALLS(STG_PREPARE);
 	RUN_INITCALLS(STG_LOCK);
+	RUN_INITCALLS(STG_REGISTER);
+
+	/* now's time to initialize early boot variables */
+	init_early(argc, argv);
+
+	/* handles argument parsing */
+	init_args(argc, argv);
+
 	RUN_INITCALLS(STG_ALLOC);
 	RUN_INITCALLS(STG_POOL);
-	RUN_INITCALLS(STG_REGISTER);
 	RUN_INITCALLS(STG_INIT);
 
+	/* this is the late init where the config is parsed */
 	init(argc, argv);
+
 	signal_register_fct(SIGQUIT, dump, SIGQUIT);
 	signal_register_fct(SIGUSR1, sig_soft_stop, SIGUSR1);
 	signal_register_fct(SIGHUP, sig_dump_state, SIGHUP);
@@ -3069,7 +3103,8 @@ int main(int argc, char **argv)
 	}
 
 	/* open log & pid files before the chroot */
-	if ((global.mode & MODE_DAEMON || global.mode & MODE_MWORKER) && global.pidfile != NULL) {
+	if ((global.mode & MODE_DAEMON || global.mode & MODE_MWORKER) &&
+	    !(global.mode & MODE_MWORKER_WAIT) && global.pidfile != NULL) {
 		unlink(global.pidfile);
 		pidfd = open(global.pidfile, O_CREAT | O_WRONLY | O_TRUNC, 0644);
 		if (pidfd < 0) {

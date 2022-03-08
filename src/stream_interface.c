@@ -28,12 +28,16 @@
 #include <haproxy/http_htx.h>
 #include <haproxy/pipe-t.h>
 #include <haproxy/pipe.h>
+#include <haproxy/pool.h>
 #include <haproxy/proxy.h>
 #include <haproxy/stream-t.h>
 #include <haproxy/stream_interface.h>
 #include <haproxy/task.h>
 #include <haproxy/ticks.h>
 #include <haproxy/tools.h>
+
+
+DECLARE_POOL(pool_head_streaminterface, "stream_interface", sizeof(struct stream_interface));
 
 
 /* functions used by default on a detached stream-interface */
@@ -88,8 +92,8 @@ struct si_ops si_applet_ops = {
 /* Functions used to communicate with a conn_stream. The first two may be used
  * directly, the last one is mostly a wake callback.
  */
-int si_cs_recv(struct conn_stream *cs);
-int si_cs_send(struct conn_stream *cs);
+static int si_cs_recv(struct conn_stream *cs);
+static int si_cs_send(struct conn_stream *cs);
 static int si_cs_process(struct conn_stream *cs);
 
 
@@ -97,6 +101,35 @@ struct data_cb si_conn_cb = {
 	.wake    = si_cs_process,
 	.name    = "STRM",
 };
+
+
+struct stream_interface *si_new(struct conn_stream *cs)
+{
+	struct stream_interface *si;
+
+	si = pool_alloc(pool_head_streaminterface);
+	if (unlikely(!si))
+		return NULL;
+	si->flags = SI_FL_NONE;
+	if (si_init(si) < 0) {
+		pool_free(pool_head_streaminterface, si);
+		return NULL;
+	}
+	si->cs = cs;
+	return si;
+}
+
+void si_free(struct stream_interface *si)
+{
+	if (!si)
+		return;
+
+	b_free(&si->l7_buffer);
+	tasklet_free(si->wait_event.tasklet);
+	sockaddr_free(&si->src);
+	sockaddr_free(&si->dst);
+	pool_free(pool_head_streaminterface, si);
+}
 
 /*
  * This function only has to be called once after a wakeup event in case of
@@ -306,13 +339,14 @@ struct appctx *si_register_handler(struct stream_interface *si, struct applet *a
 
 	DPRINTF(stderr, "registering handler %p for si %p (was %p)\n", app, si, si_task(si));
 
-	appctx = si_alloc_appctx(si, app);
+	appctx = appctx_new(app);
 	if (!appctx)
 		return NULL;
-
+	cs_attach_endp(si->cs, &appctx->obj_type, appctx);
+	appctx->t->nice = si_strm(si)->task->nice;
 	si_cant_get(si);
 	appctx_wakeup(appctx);
-	return si_appctx(si);
+	return appctx;
 }
 
 /* This callback is used to send a valid PROXY protocol line to a socket being
@@ -353,14 +387,10 @@ int conn_si_send_proxy(struct connection *conn, unsigned int flag)
 		 */
 
 		if (cs && cs->data_cb == &si_conn_cb) {
-			struct stream_interface *si = cs->data;
-			struct conn_stream *remote_cs = objt_cs(si_opposite(si)->end);
-			struct stream *strm = si_strm(si);
-
 			ret = make_proxy_line(trash.area, trash.size,
 					      objt_server(conn->target),
-					      remote_cs ? remote_cs->conn : NULL,
-					      strm);
+					      cs_conn(si_opposite(cs_si(cs))->cs),
+					      cs_strm(cs));
 		}
 		else {
 			/* The target server expects a LOCAL line to be sent first. Retrieving
@@ -434,7 +464,7 @@ static void stream_int_notify(struct stream_interface *si)
 
 	/* process consumer side */
 	if (channel_is_empty(oc)) {
-		struct connection *conn = objt_cs(si->end) ? __objt_cs(si->end)->conn : NULL;
+		struct connection *conn = cs_conn(si->cs);
 
 		if (((oc->flags & (CF_SHUTW|CF_SHUTW_NOW)) == CF_SHUTW_NOW) &&
 		    (si->state == SI_ST_EST) && (!conn || !(conn->flags & (CO_FL_WAIT_XPRT | CO_FL_EARLY_SSL_HS))))
@@ -563,10 +593,12 @@ static void stream_int_notify(struct stream_interface *si)
  */
 static int si_cs_process(struct conn_stream *cs)
 {
-	struct connection *conn = cs->conn;
-	struct stream_interface *si = cs->data;
+	struct connection *conn = __cs_conn(cs);
+	struct stream_interface *si = cs_si(cs);
 	struct channel *ic = si_ic(si);
 	struct channel *oc = si_oc(si);
+
+	BUG_ON(!conn);
 
 	/* If we have data to send, try it now */
 	if (!channel_is_empty(oc) && !(si->wait_event.events & SUB_RETRY_SEND))
@@ -647,10 +679,10 @@ static int si_cs_process(struct conn_stream *cs)
  * caller to commit polling changes. The caller should check conn->flags
  * for errors.
  */
-int si_cs_send(struct conn_stream *cs)
+static int si_cs_send(struct conn_stream *cs)
 {
-	struct connection *conn = cs->conn;
-	struct stream_interface *si = cs->data;
+	struct connection *conn = __cs_conn(cs);
+	struct stream_interface *si = cs_si(cs);
 	struct channel *oc = si_oc(si);
 	int ret;
 	int did_send = 0;
@@ -753,10 +785,10 @@ int si_cs_send(struct conn_stream *cs)
 			}
 		}
 
-		ret = cs->conn->mux->snd_buf(cs, &oc->buf, co_data(oc), send_flag);
+		ret = conn->mux->snd_buf(cs, &oc->buf, co_data(oc), send_flag);
 		if (ret > 0) {
 			did_send = 1;
-			co_set_data(oc, co_data(oc) - ret);
+			c_rew(oc, ret);
 			c_realign_if_empty(oc);
 
 			if (!co_data(oc)) {
@@ -797,10 +829,10 @@ int si_cs_send(struct conn_stream *cs)
 struct task *si_cs_io_cb(struct task *t, void *ctx, unsigned int state)
 {
 	struct stream_interface *si = ctx;
-	struct conn_stream *cs = objt_cs(si->end);
+	struct conn_stream *cs = si->cs;
 	int ret = 0;
 
-	if (!cs)
+	if (!cs_conn(cs))
 		return t;
 
 	if (!(si->wait_event.events & SUB_RETRY_SEND) && !channel_is_empty(si_oc(si)))
@@ -906,6 +938,30 @@ void si_update_tx(struct stream_interface *si)
 	}
 }
 
+/* This tries to perform a synchronous receive on the stream interface to
+ * try to collect last arrived data. In practice it's only implemented on
+ * conn_streams. Returns 0 if nothing was done, non-zero if new data or a
+ * shutdown were collected. This may result on some delayed receive calls
+ * to be programmed and performed later, though it doesn't provide any
+ * such guarantee.
+ */
+int si_sync_recv(struct stream_interface *si)
+{
+	if (!si_state_in(si->state, SI_SB_RDY|SI_SB_EST))
+		return 0;
+
+	if (!cs_conn_mux(si->cs))
+		return 0; // only conn_streams are supported
+
+	if (si->wait_event.events & SUB_RETRY_RECV)
+		return 0; // already subscribed
+
+	if (!si_rx_endp_ready(si) || si_rx_blocked(si))
+		return 0; // already failed
+
+	return si_cs_recv(si->cs);
+}
+
 /* perform a synchronous send() for the stream interface. The CF_WRITE_NULL and
  * CF_WRITE_PARTIAL flags are cleared prior to the attempt, and will possibly
  * be updated in case of success.
@@ -913,7 +969,6 @@ void si_update_tx(struct stream_interface *si)
 void si_sync_send(struct stream_interface *si)
 {
 	struct channel *oc = si_oc(si);
-	struct conn_stream *cs;
 
 	oc->flags &= ~(CF_WRITE_NULL|CF_WRITE_PARTIAL);
 
@@ -926,11 +981,10 @@ void si_sync_send(struct stream_interface *si)
 	if (!si_state_in(si->state, SI_SB_CON|SI_SB_RDY|SI_SB_EST))
 		return;
 
-	cs = objt_cs(si->end);
-	if (!cs || !cs->conn->mux)
+	if (!cs_conn_mux(si->cs))
 		return;
 
-	si_cs_send(cs);
+	si_cs_send(si->cs);
 }
 
 /* Updates at once the channel flags, and timers of both stream interfaces of a
@@ -961,15 +1015,15 @@ void si_update_both(struct stream_interface *si_f, struct stream_interface *si_b
 	/* stream ints are processed outside of process_stream() and must be
 	 * handled at the latest moment.
 	 */
-	if (obj_type(si_f->end) == OBJ_TYPE_APPCTX &&
+	if (cs_appctx(si_f->cs) &&
 	    ((si_rx_endp_ready(si_f) && !si_rx_blocked(si_f)) ||
 	     (si_tx_endp_ready(si_f) && !si_tx_blocked(si_f))))
-		appctx_wakeup(si_appctx(si_f));
+		appctx_wakeup(__cs_appctx(si_f->cs));
 
-	if (obj_type(si_b->end) == OBJ_TYPE_APPCTX &&
+	if (cs_appctx(si_b->cs) &&
 	    ((si_rx_endp_ready(si_b) && !si_rx_blocked(si_b)) ||
 	     (si_tx_endp_ready(si_b) && !si_tx_blocked(si_b))))
-		appctx_wakeup(si_appctx(si_b));
+		appctx_wakeup(__cs_appctx(si_b->cs));
 }
 
 /*
@@ -984,8 +1038,10 @@ void si_update_both(struct stream_interface *si_f, struct stream_interface *si_b
  */
 static void stream_int_shutr_conn(struct stream_interface *si)
 {
-	struct conn_stream *cs = __objt_cs(si->end);
+	struct conn_stream *cs = si->cs;
 	struct channel *ic = si_ic(si);
+
+	BUG_ON(!cs_conn(cs));
 
 	si_rx_shut_blk(si);
 	if (ic->flags & CF_SHUTR)
@@ -1020,9 +1076,11 @@ static void stream_int_shutr_conn(struct stream_interface *si)
  */
 static void stream_int_shutw_conn(struct stream_interface *si)
 {
-	struct conn_stream *cs = __objt_cs(si->end);
+	struct conn_stream *cs = si->cs;
 	struct channel *ic = si_ic(si);
 	struct channel *oc = si_oc(si);
+
+	BUG_ON(!cs_conn(cs));
 
 	oc->flags &= ~CF_SHUTW_NOW;
 	if (oc->flags & CF_SHUTW)
@@ -1117,7 +1175,10 @@ static void stream_int_chk_rcv_conn(struct stream_interface *si)
 static void stream_int_chk_snd_conn(struct stream_interface *si)
 {
 	struct channel *oc = si_oc(si);
-	struct conn_stream *cs = __objt_cs(si->end);
+	struct conn_stream *cs = si->cs;
+	struct connection *conn = cs_conn(cs);
+
+	BUG_ON(!conn);
 
 	if (unlikely(!si_state_in(si->state, SI_SB_CON|SI_SB_RDY|SI_SB_EST) ||
 	    (oc->flags & CF_SHUTW)))
@@ -1133,7 +1194,7 @@ static void stream_int_chk_snd_conn(struct stream_interface *si)
 	if (!(si->wait_event.events & SUB_RETRY_SEND) && !channel_is_empty(si_oc(si)))
 		si_cs_send(cs);
 
-	if (cs->flags & (CS_FL_ERROR|CS_FL_ERR_PENDING) || cs->conn->flags & CO_FL_ERROR) {
+	if (cs->flags & (CS_FL_ERROR|CS_FL_ERR_PENDING) || conn->flags & CO_FL_ERROR) {
 		/* Write error on the file descriptor */
 		if (si->state >= SI_ST_CON)
 			si->flags |= SI_FL_ERR;
@@ -1208,10 +1269,10 @@ static void stream_int_chk_snd_conn(struct stream_interface *si)
  * into the buffer from the connection. It iterates over the mux layer's
  * rcv_buf function.
  */
-int si_cs_recv(struct conn_stream *cs)
+static int si_cs_recv(struct conn_stream *cs)
 {
-	struct connection *conn = cs->conn;
-	struct stream_interface *si = cs->data;
+	struct connection *conn = __cs_conn(cs);
+	struct stream_interface *si = cs_si(cs);
 	struct channel *ic = si_ic(si);
 	int ret, max, cur_read = 0;
 	int read_poll = MAX_READ_POLL_LOOPS;
@@ -1374,9 +1435,14 @@ int si_cs_recv(struct conn_stream *cs)
 		 * CS_FL_RCV_MORE on the CS if more space is needed.
 		 */
 		max = channel_recv_max(ic);
-		ret = cs->conn->mux->rcv_buf(cs, &ic->buf, max, cur_flags);
+		ret = conn->mux->rcv_buf(cs, &ic->buf, max, cur_flags);
 
 		if (cs->flags & CS_FL_WANT_ROOM) {
+			/* CS_FL_WANT_ROOM must not be reported if the channel's
+			 * buffer is empty.
+			 */
+			BUG_ON(c_empty(ic));
+
 			si_rx_room_blk(si);
 			/* Add READ_PARTIAL because some data are pending but
 			 * cannot be xferred to the channel
@@ -1538,9 +1604,11 @@ int si_cs_recv(struct conn_stream *cs)
  */
 static void stream_int_read0(struct stream_interface *si)
 {
-	struct conn_stream *cs = __objt_cs(si->end);
+	struct conn_stream *cs = si->cs;
 	struct channel *ic = si_ic(si);
 	struct channel *oc = si_oc(si);
+
+	BUG_ON(!cs_conn(cs));
 
 	si_rx_shut_blk(si);
 	if (ic->flags & CF_SHUTR)
@@ -1588,6 +1656,8 @@ void si_applet_wake_cb(struct stream_interface *si)
 {
 	struct channel *ic = si_ic(si);
 
+	BUG_ON(!cs_appctx(si->cs));
+
 	/* If the applet wants to write and the channel is closed, it's a
 	 * broken pipe and it must be reported.
 	 */
@@ -1611,7 +1681,7 @@ void si_applet_wake_cb(struct stream_interface *si)
 	 */
 	if ((si_rx_endp_ready(si) && !si_rx_blocked(si)) ||
 	    (si_tx_endp_ready(si) && !si_tx_blocked(si)))
-		appctx_wakeup(si_appctx(si));
+		appctx_wakeup(__cs_appctx(si->cs));
 }
 
 /*
@@ -1625,6 +1695,8 @@ void si_applet_wake_cb(struct stream_interface *si)
 static void stream_int_shutr_applet(struct stream_interface *si)
 {
 	struct channel *ic = si_ic(si);
+
+	BUG_ON(!cs_appctx(si->cs));
 
 	si_rx_shut_blk(si);
 	if (ic->flags & CF_SHUTR)
@@ -1660,6 +1732,8 @@ static void stream_int_shutw_applet(struct stream_interface *si)
 	struct channel *ic = si_ic(si);
 	struct channel *oc = si_oc(si);
 
+	BUG_ON(!cs_appctx(si->cs));
+
 	oc->flags &= ~CF_SHUTW_NOW;
 	if (oc->flags & CF_SHUTW)
 		return;
@@ -1673,7 +1747,7 @@ static void stream_int_shutw_applet(struct stream_interface *si)
 	}
 
 	/* on shutw we always wake the applet up */
-	appctx_wakeup(si_appctx(si));
+	appctx_wakeup(__cs_appctx(si->cs));
 
 	switch (si->state) {
 	case SI_ST_RDY:
@@ -1711,13 +1785,15 @@ static void stream_int_chk_rcv_applet(struct stream_interface *si)
 {
 	struct channel *ic = si_ic(si);
 
+	BUG_ON(!cs_appctx(si->cs));
+
 	DPRINTF(stderr, "%s: si=%p, si->state=%d ic->flags=%08x oc->flags=%08x\n",
 		__FUNCTION__,
 		si, si->state, ic->flags, si_oc(si)->flags);
 
 	if (!ic->pipe) {
 		/* (re)start reading */
-		appctx_wakeup(si_appctx(si));
+		appctx_wakeup(__cs_appctx(si->cs));
 	}
 }
 
@@ -1725,6 +1801,8 @@ static void stream_int_chk_rcv_applet(struct stream_interface *si)
 static void stream_int_chk_snd_applet(struct stream_interface *si)
 {
 	struct channel *oc = si_oc(si);
+
+	BUG_ON(!cs_appctx(si->cs));
 
 	DPRINTF(stderr, "%s: si=%p, si->state=%d ic->flags=%08x oc->flags=%08x\n",
 		__FUNCTION__,
@@ -1743,7 +1821,7 @@ static void stream_int_chk_snd_applet(struct stream_interface *si)
 
 	if (!channel_is_empty(oc)) {
 		/* (re)start sending */
-		appctx_wakeup(si_appctx(si));
+		appctx_wakeup(__cs_appctx(si->cs));
 	}
 }
 

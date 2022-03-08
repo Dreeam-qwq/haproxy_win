@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 HAProxy Technologies, Frédéric Lécaille <flecaille@haproxy.com>
+ * Copyright 2019 HAProxy Technologies, Frederic Lecaille <flecaille@haproxy.com>
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License
@@ -501,8 +501,7 @@ static int quic_build_stream_frame(unsigned char **buf, const unsigned char *end
                                    struct quic_frame *frm, struct quic_conn *conn)
 {
 	struct quic_stream *stream = &frm->stream;
-	size_t offset, block1, block2;
-	struct buffer b;
+	const unsigned char *wrap;
 
 	if (!quic_enc_int(buf, end, stream->id) ||
 	    ((frm->type & QUIC_STREAM_FRAME_TYPE_OFF_BIT) && !quic_enc_int(buf, end, stream->offset.key)) ||
@@ -510,19 +509,19 @@ static int quic_build_stream_frame(unsigned char **buf, const unsigned char *end
 	     (!quic_enc_int(buf, end, stream->len) || end - *buf < stream->len)))
 		return 0;
 
-	/* Buffer copy */
-	b = *stream->buf;
-	offset = (frm->type & QUIC_STREAM_FRAME_TYPE_OFF_BIT) ?
-		stream->offset.key & (b_size(stream->buf) - 1): 0;
-	block1 = b_wrap(&b) - (b_orig(&b) + offset);
-	if (block1 > stream->len)
-		block1 = stream->len;
-	block2 = stream->len - block1;
-	memcpy(*buf, b_orig(&b) + offset, block1);
-	*buf += block1;
-	if (block2) {
-		memcpy(*buf, b_orig(&b), block2);
-		*buf += block2;
+	wrap = (const unsigned char *)b_wrap(stream->buf);
+	if (stream->data + stream->len > wrap) {
+		size_t to_copy = wrap - stream->data;
+		memcpy(*buf, stream->data, to_copy);
+		*buf += to_copy;
+
+		to_copy = stream->len - to_copy;
+		memcpy(*buf, b_orig(stream->buf), to_copy);
+		*buf += to_copy;
+	}
+	else {
+		memcpy(*buf, stream->data, stream->len);
+		*buf += stream->len;
 	}
 
 	return 1;
@@ -1000,8 +999,8 @@ static int quic_parse_handshake_done_frame(struct quic_frame *frm, struct quic_c
 struct quic_frame_builder {
 	int (*func)(unsigned char **buf, const unsigned char *end,
                  struct quic_frame *frm, struct quic_conn *conn);
+	uint32_t mask;
 	unsigned char flags;
-	unsigned char mask;
 };
 
 const struct quic_frame_builder quic_frame_builders[] = {
@@ -1041,8 +1040,8 @@ const struct quic_frame_builder quic_frame_builders[] = {
 struct quic_frame_parser {
 	int (*func)(struct quic_frame *frm, struct quic_conn *qc,
                 const unsigned char **buf, const unsigned char *end);
+	uint32_t mask;
 	unsigned char flags;
-	unsigned char mask;
 };
 
 const struct quic_frame_parser quic_frame_parsers[] = {
@@ -1094,13 +1093,13 @@ int qc_parse_frm(struct quic_frame *frm, struct quic_rx_packet *pkt,
 	}
 
 	frm->type = *(*buf)++;
-	if (frm->type > QUIC_FT_MAX) {
+	if (frm->type >= QUIC_FT_MAX) {
 		TRACE_DEVEL("wrong frame type", QUIC_EV_CONN_PRSFRM, qc, frm);
 		return 0;
 	}
 
 	parser = &quic_frame_parsers[frm->type];
-	if (!(parser->mask & (1 << pkt->type))) {
+	if (!(parser->mask & (1U << pkt->type))) {
 		TRACE_DEVEL("unauthorized frame", QUIC_EV_CONN_PRSFRM, qc, frm);
 		return 0;
 	}
@@ -1126,10 +1125,10 @@ int qc_build_frm(unsigned char **buf, const unsigned char *end,
 	const struct quic_frame_builder *builder;
 
 	builder = &quic_frame_builders[frm->type];
-	if (!(builder->mask & (1 << pkt->type))) {
+	if (!(builder->mask & (1U << pkt->type))) {
 		/* XXX This it a bug to send an unauthorized frame with such a packet type XXX */
 		TRACE_DEVEL("frame skipped", QUIC_EV_CONN_BFRM, qc, frm);
-		BUG_ON(!(builder->mask & (1 << pkt->type)));
+		BUG_ON(!(builder->mask & (1U << pkt->type)));
 	}
 
 	if (end <= *buf) {
