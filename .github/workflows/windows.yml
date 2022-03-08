@@ -58,7 +58,7 @@ jobs:
           ERR=1 \
           TARGET=${{ matrix.TARGET }} \
           CC=${{ matrix.CC }} \
-          DEBUG="-DDEBUG_STRICT -DDEBUG_MEMORY_POOLS -DDEBUG_POOL_INTEGRITY" \
+          DEBUG=-DDEBUG_STRICT=1 \
           ${{ join(matrix.FLAGS, ' ') }}
     - name: Upload a Build Artifact
       uses: actions/upload-artifact@v2.3.0
