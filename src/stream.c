@@ -99,6 +99,9 @@ static const struct trace_event strm_trace_events[] = {
 
 	{ .mask = STRM_EV_TCP_ANA,      .name = "tcp_ana",      .desc = "TCP analyzers" },
 	{ .mask = STRM_EV_TCP_ERR,      .name = "tcp_err",      .desc = "error during TCP analyzis" },
+
+	{ .mask = STRM_EV_FLT_ANA,      .name = "flt_ana",      .desc = "Filter analyzers" },
+	{ .mask = STRM_EV_FLT_ERR,      .name = "flt_err",      .desc = "error during filter analyzis" },
 	{}
 };
 
@@ -247,8 +250,8 @@ static void strm_trace(enum trace_level level, uint64_t mask, const struct trace
 		chunk_appendf(&trace_buf, " buf=(%u@%p+%u/%u, %u@%p+%u/%u)",
 			      (unsigned int)b_data(&req->buf), b_orig(&req->buf),
 			      (unsigned int)b_head_ofs(&req->buf), (unsigned int)b_size(&req->buf),
-			      (unsigned int)b_data(&req->buf), b_orig(&req->buf),
-			      (unsigned int)b_head_ofs(&req->buf), (unsigned int)b_size(&req->buf));
+			      (unsigned int)b_data(&res->buf), b_orig(&res->buf),
+			      (unsigned int)b_head_ofs(&res->buf), (unsigned int)b_size(&res->buf));
 	}
 
 	/* If msg defined, display htx info if defined (level > USER) */
@@ -483,7 +486,7 @@ struct stream *stream_new(struct session *sess, struct conn_stream *cs, struct b
 
 	channel_init(&s->req);
 	s->req.flags |= CF_READ_ATTACHED; /* the producer is already connected */
-	s->req.analysers = sess->listener ? sess->listener->analysers : 0;
+	s->req.analysers = sess->listener ? sess->listener->analysers : sess->fe->fe_req_ana;
 
 	if (IS_HTX_STRM(s)) {
 		/* Be sure to have HTTP analysers because in case of
