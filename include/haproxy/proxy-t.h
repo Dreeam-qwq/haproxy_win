@@ -322,8 +322,7 @@ struct proxy {
 	int srvtcpka_cnt;                       /* The maximum number of keepalive probes TCP should send before dropping the connection. (server side) */
 	int srvtcpka_idle;                      /* The time (in seconds) the connection needs to remain idle before TCP starts sending keepalive probes. (server side) */
 	int srvtcpka_intvl;                     /* The time (in seconds) between individual keepalive probes. (server side) */
-	int monitor_uri_len;			/* length of the string above. 0 if unused */
-	char *monitor_uri;			/* a special URI to which we respond with HTTP/200 OK */
+	struct ist monitor_uri;			/* a special URI to which we respond with HTTP/200 OK */
 	struct list mon_fail_cond;              /* list of conditions to fail monitoring requests (chained) */
 	struct {				/* WARNING! check proxy_reset_timeouts() in proxy.h !!! */
 		int client;                     /* client I/O timeout (in ticks) */
@@ -353,12 +352,9 @@ struct proxy {
 	unsigned int tot_fe_maxconn;		/* #maxconn of frontends linked to that backend, it is used to compute fullconn */
 	struct net_addr except_xff_net;         /* don't x-forward-for for this address. */
 	struct net_addr except_xot_net;         /* don't x-original-to for this address. */
-	char *fwdfor_hdr_name;			/* header to use - default: "x-forwarded-for" */
-	char *orgto_hdr_name;			/* header to use - default: "x-original-to" */
-	int fwdfor_hdr_len;			/* length of "x-forwarded-for" header */
-	int orgto_hdr_len;			/* length of "x-original-to" header */
-	char *server_id_hdr_name;                   /* the header to use to send the server id (name) */
-	int server_id_hdr_len;                      /* the length of the id (name) header... name */
+	struct ist fwdfor_hdr_name;			/* header to use - default: "x-forwarded-for" */
+	struct ist orgto_hdr_name;			/* header to use - default: "x-original-to" */
+	struct ist server_id_hdr_name;                   /* the header to use to send the server id (name) */
 	int conn_retries;			/* maximum number of connect retries */
 	unsigned int retry_type;                /* Type of retry allowed */
 	int redispatch_after;			/* number of retries before redispatch */

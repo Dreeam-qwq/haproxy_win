@@ -156,7 +156,7 @@ void free_proxy(struct proxy *p)
 	free(p->lbprm.arg_str);
 	free(p->server_state_file_name);
 	free(p->capture_name);
-	free(p->monitor_uri);
+	istfree(&p->monitor_uri);
 	free(p->rdp_cookie_name);
 	free(p->invalid_rep);
 	free(p->invalid_req);
@@ -332,7 +332,7 @@ void free_proxy(struct proxy *p)
 		pxdf->fct(p);
 
 	free(p->desc);
-	free(p->fwdfor_hdr_name);
+	istfree(&p->fwdfor_hdr_name);
 
 	task_destroy(p->task);
 
@@ -1274,7 +1274,7 @@ int proxy_cfg_ensure_no_http(struct proxy *curproxy)
 		ha_warning("cookie will be ignored for %s '%s' (needs 'mode http').\n",
 			   proxy_type_str(curproxy), curproxy->id);
 	}
-	if (curproxy->monitor_uri != NULL) {
+	if (isttest(curproxy->monitor_uri)) {
 		ha_warning("monitor-uri will be ignored for %s '%s' (needs 'mode http').\n",
 			   proxy_type_str(curproxy), curproxy->id);
 	}
@@ -1436,12 +1436,12 @@ void proxy_free_defaults(struct proxy *defproxy)
 	ha_free(&defproxy->cookie_attrs);
 	ha_free(&defproxy->lbprm.arg_str);
 	ha_free(&defproxy->capture_name);
-	ha_free(&defproxy->monitor_uri);
+	istfree(&defproxy->monitor_uri);
 	ha_free(&defproxy->defbe.name);
 	ha_free(&defproxy->conn_src.iface_name);
-	ha_free(&defproxy->fwdfor_hdr_name); defproxy->fwdfor_hdr_len = 0;
-	ha_free(&defproxy->orgto_hdr_name); defproxy->orgto_hdr_len = 0;
-	ha_free(&defproxy->server_id_hdr_name); defproxy->server_id_hdr_len = 0;
+	istfree(&defproxy->fwdfor_hdr_name);
+	istfree(&defproxy->orgto_hdr_name);
+	istfree(&defproxy->server_id_hdr_name);
 
 	list_for_each_entry_safe(acl, aclb, &defproxy->acl, list) {
 		LIST_DELETE(&acl->list);
@@ -1601,20 +1601,14 @@ static int proxy_defproxy_cpy(struct proxy *curproxy, const struct proxy *defpro
 	curproxy->tcp_req.inspect_delay = defproxy->tcp_req.inspect_delay;
 	curproxy->tcp_rep.inspect_delay = defproxy->tcp_rep.inspect_delay;
 
-	if (defproxy->fwdfor_hdr_len) {
-		curproxy->fwdfor_hdr_len  = defproxy->fwdfor_hdr_len;
-		curproxy->fwdfor_hdr_name = strdup(defproxy->fwdfor_hdr_name);
-	}
+	if (isttest(defproxy->fwdfor_hdr_name))
+		curproxy->fwdfor_hdr_name = istdup(defproxy->fwdfor_hdr_name);
 
-	if (defproxy->orgto_hdr_len) {
-		curproxy->orgto_hdr_len  = defproxy->orgto_hdr_len;
-		curproxy->orgto_hdr_name = strdup(defproxy->orgto_hdr_name);
-	}
+	if (isttest(defproxy->orgto_hdr_name))
+		curproxy->orgto_hdr_name = istdup(defproxy->orgto_hdr_name);
 
-	if (defproxy->server_id_hdr_len) {
-		curproxy->server_id_hdr_len  = defproxy->server_id_hdr_len;
-		curproxy->server_id_hdr_name = strdup(defproxy->server_id_hdr_name);
-	}
+	if (isttest(defproxy->server_id_hdr_name))
+		curproxy->server_id_hdr_name = istdup(defproxy->server_id_hdr_name);
 
 	/* initialize error relocations */
 	if (!proxy_dup_default_conf_errors(curproxy, defproxy, &tmpmsg)) {
@@ -1711,9 +1705,8 @@ static int proxy_defproxy_cpy(struct proxy *curproxy, const struct proxy *defpro
 		curproxy->timeout.tarpit = defproxy->timeout.tarpit;
 		curproxy->timeout.httpreq = defproxy->timeout.httpreq;
 		curproxy->timeout.httpka = defproxy->timeout.httpka;
-		if (defproxy->monitor_uri)
-			curproxy->monitor_uri = strdup(defproxy->monitor_uri);
-		curproxy->monitor_uri_len = defproxy->monitor_uri_len;
+		if (isttest(defproxy->monitor_uri))
+			curproxy->monitor_uri = istdup(defproxy->monitor_uri);
 		if (defproxy->defbe.name)
 			curproxy->defbe.name = strdup(defproxy->defbe.name);
 

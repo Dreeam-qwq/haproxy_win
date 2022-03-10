@@ -575,13 +575,10 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 			goto out;
 		}
 
-		free(curproxy->monitor_uri);
-		curproxy->monitor_uri_len = strlen(args[1]);
-		curproxy->monitor_uri = calloc(1, curproxy->monitor_uri_len + 1);
-		if (!curproxy->monitor_uri)
+		istfree(&curproxy->monitor_uri);
+		curproxy->monitor_uri = istdup(ist(args[1]));
+		if (!isttest(curproxy->monitor_uri))
 			goto alloc_error;
-		memcpy(curproxy->monitor_uri, args[1], curproxy->monitor_uri_len);
-		curproxy->monitor_uri[curproxy->monitor_uri_len] = '\0';
 
 		goto out;
 	}
@@ -1386,12 +1383,11 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 		}
 
 		/* set the desired header name, in lower case */
-		free(curproxy->server_id_hdr_name);
-		curproxy->server_id_hdr_name = strdup(args[1]);
-		if (!curproxy->server_id_hdr_name)
+		istfree(&curproxy->server_id_hdr_name);
+		curproxy->server_id_hdr_name = istdup(ist(args[1]));
+		if (!isttest(curproxy->server_id_hdr_name))
 			goto alloc_error;
-		curproxy->server_id_hdr_len  = strlen(curproxy->server_id_hdr_name);
-		ist2bin_lc(curproxy->server_id_hdr_name, ist2(curproxy->server_id_hdr_name, curproxy->server_id_hdr_len));
+		ist2bin_lc(istptr(curproxy->server_id_hdr_name), curproxy->server_id_hdr_name);
 	}
 	else if (strcmp(args[0], "block") == 0) {
 		ha_alert("parsing [%s:%d] : The '%s' directive is not supported anymore since HAProxy 2.1. Use 'http-request deny' which uses the exact same syntax.\n", file, linenum, args[0]);
@@ -2334,11 +2330,10 @@ stats_error_parsing:
 
 			curproxy->options |= PR_O_FWDFOR | PR_O_FF_ALWAYS;
 
-			free(curproxy->fwdfor_hdr_name);
-			curproxy->fwdfor_hdr_name = strdup(DEF_XFORWARDFOR_HDR);
-			if (!curproxy->fwdfor_hdr_name)
+			istfree(&curproxy->fwdfor_hdr_name);
+			curproxy->fwdfor_hdr_name = istdup(ist(DEF_XFORWARDFOR_HDR));
+			if (!isttest(curproxy->fwdfor_hdr_name))
 				goto alloc_error;
-			curproxy->fwdfor_hdr_len  = strlen(DEF_XFORWARDFOR_HDR);
 			curproxy->except_xff_net.family = AF_UNSPEC;
 
 			/* loop to go through arguments - start at 2, since 0+1 = "option" "forwardfor" */
@@ -2377,11 +2372,10 @@ stats_error_parsing:
 						err_code |= ERR_ALERT | ERR_FATAL;
 						goto out;
 					}
-					free(curproxy->fwdfor_hdr_name);
-					curproxy->fwdfor_hdr_name = strdup(args[cur_arg+1]);
-					if (!curproxy->fwdfor_hdr_name)
+					istfree(&curproxy->fwdfor_hdr_name);
+					curproxy->fwdfor_hdr_name = istdup(ist(args[cur_arg+1]));
+					if (!isttest(curproxy->fwdfor_hdr_name))
 						goto alloc_error;
-					curproxy->fwdfor_hdr_len  = strlen(curproxy->fwdfor_hdr_name);
 					cur_arg += 2;
 				} else if (strcmp(args[cur_arg], "if-none") == 0) {
 					curproxy->options &= ~PR_O_FF_ALWAYS;
@@ -2404,11 +2398,10 @@ stats_error_parsing:
 
 			curproxy->options |= PR_O_ORGTO;
 
-			free(curproxy->orgto_hdr_name);
-			curproxy->orgto_hdr_name = strdup(DEF_XORIGINALTO_HDR);
-			if (!curproxy->orgto_hdr_name)
+			istfree(&curproxy->orgto_hdr_name);
+			curproxy->orgto_hdr_name = istdup(ist(DEF_XORIGINALTO_HDR));
+			if (!isttest(curproxy->orgto_hdr_name))
 				goto alloc_error;
-			curproxy->orgto_hdr_len  = strlen(DEF_XORIGINALTO_HDR);
 			curproxy->except_xot_net.family = AF_UNSPEC;
 
 			/* loop to go through arguments - start at 2, since 0+1 = "option" "originalto" */
@@ -2446,11 +2439,10 @@ stats_error_parsing:
 						err_code |= ERR_ALERT | ERR_FATAL;
 						goto out;
 					}
-					free(curproxy->orgto_hdr_name);
-					curproxy->orgto_hdr_name = strdup(args[cur_arg+1]);
-					if (!curproxy->orgto_hdr_name)
+					istfree(&curproxy->orgto_hdr_name);
+					curproxy->orgto_hdr_name = istdup(ist(args[cur_arg+1]));
+					if (!isttest(curproxy->orgto_hdr_name))
 						goto alloc_error;
-					curproxy->orgto_hdr_len  = strlen(curproxy->orgto_hdr_name);
 					cur_arg += 2;
 				} else {
 					/* unknown suboption - catchall */

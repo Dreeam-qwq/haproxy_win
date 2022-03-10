@@ -203,9 +203,8 @@ int http_wait_for_request(struct stream *s, struct channel *req, int an_bit)
 	 * used. It is a workaround to let HTTP/2 health-checks work as
 	 * expected.
 	 */
-	if (unlikely(sess->fe->monitor_uri_len != 0)) {
-		const struct ist monitor_uri = ist2(sess->fe->monitor_uri,
-		                                    sess->fe->monitor_uri_len);
+	if (unlikely(isttest(sess->fe->monitor_uri))) {
+		const struct ist monitor_uri = sess->fe->monitor_uri;
 		struct http_uri_parser parser = http_uri_parser_init(htx_sl_req_uri(sl));
 
 		if ((istptr(monitor_uri)[0] == '/' &&
@@ -656,8 +655,7 @@ int http_process_request(struct stream *s, struct channel *req, int an_bit)
 	if ((sess->fe->options | s->be->options) & PR_O_FWDFOR) {
 		const struct sockaddr_storage *src = si_src(cs_si(s->csf));
 		struct http_hdr_ctx ctx = { .blk = NULL };
-		struct ist hdr = ist2(s->be->fwdfor_hdr_len ? s->be->fwdfor_hdr_name : sess->fe->fwdfor_hdr_name,
-				      s->be->fwdfor_hdr_len ? s->be->fwdfor_hdr_len : sess->fe->fwdfor_hdr_len);
+		struct ist hdr = isttest(s->be->fwdfor_hdr_name) ? s->be->fwdfor_hdr_name : sess->fe->fwdfor_hdr_name;
 
 		if (!((sess->fe->options | s->be->options) & PR_O_FF_ALWAYS) &&
 		    http_find_header(htx, hdr, &ctx, 0)) {
@@ -713,8 +711,7 @@ int http_process_request(struct stream *s, struct channel *req, int an_bit)
 	 */
 	if ((sess->fe->options | s->be->options) & PR_O_ORGTO) {
 		const struct sockaddr_storage *dst = si_dst(cs_si(s->csf));
-		struct ist hdr = ist2(s->be->orgto_hdr_len ? s->be->orgto_hdr_name : sess->fe->orgto_hdr_name,
-				      s->be->orgto_hdr_len ? s->be->orgto_hdr_len  : sess->fe->orgto_hdr_len);
+		struct ist hdr = isttest(s->be->orgto_hdr_name) ? s->be->orgto_hdr_name : sess->fe->orgto_hdr_name;
 
 		if (dst && dst->ss_family == AF_INET) {
 			/* Add an X-Original-To header unless the destination IP is
@@ -2747,6 +2744,8 @@ static enum rule_result http_req_get_intercept_rule(struct proxy *px, struct lis
 					break;
 				case ACT_RET_STOP:
 					rule_ret = HTTP_RULE_RES_STOP;
+					s->last_rule_file = rule->conf.file;
+					s->last_rule_line = rule->conf.line;
 					goto end;
 				case ACT_RET_YIELD:
 					s->current_rule = rule;
@@ -2754,20 +2753,30 @@ static enum rule_result http_req_get_intercept_rule(struct proxy *px, struct lis
 					goto end;
 				case ACT_RET_ERR:
 					rule_ret = HTTP_RULE_RES_ERROR;
+					s->last_rule_file = rule->conf.file;
+					s->last_rule_line = rule->conf.line;
 					goto end;
 				case ACT_RET_DONE:
 					rule_ret = HTTP_RULE_RES_DONE;
+					s->last_rule_file = rule->conf.file;
+					s->last_rule_line = rule->conf.line;
 					goto end;
 				case ACT_RET_DENY:
 					if (txn->status == -1)
 						txn->status = 403;
 					rule_ret = HTTP_RULE_RES_DENY;
+					s->last_rule_file = rule->conf.file;
+					s->last_rule_line = rule->conf.line;
 					goto end;
 				case ACT_RET_ABRT:
 					rule_ret = HTTP_RULE_RES_ABRT;
+					s->last_rule_file = rule->conf.file;
+					s->last_rule_line = rule->conf.line;
 					goto end;
 				case ACT_RET_INV:
 					rule_ret = HTTP_RULE_RES_BADREQ;
+					s->last_rule_file = rule->conf.file;
+					s->last_rule_line = rule->conf.line;
 					goto end;
 			}
 			continue; /* eval the next rule */
@@ -2777,12 +2786,16 @@ static enum rule_result http_req_get_intercept_rule(struct proxy *px, struct lis
 		switch (rule->action) {
 			case ACT_ACTION_ALLOW:
 				rule_ret = HTTP_RULE_RES_STOP;
+				s->last_rule_file = rule->conf.file;
+				s->last_rule_line = rule->conf.line;
 				goto end;
 
 			case ACT_ACTION_DENY:
 				txn->status = rule->arg.http_reply->status;
 				txn->http_reply = rule->arg.http_reply;
 				rule_ret = HTTP_RULE_RES_DENY;
+				s->last_rule_file = rule->conf.file;
+				s->last_rule_line = rule->conf.line;
 				goto end;
 
 			case ACT_HTTP_REQ_TARPIT:
@@ -2790,6 +2803,8 @@ static enum rule_result http_req_get_intercept_rule(struct proxy *px, struct lis
 				txn->status = rule->arg.http_reply->status;
 				txn->http_reply = rule->arg.http_reply;
 				rule_ret = HTTP_RULE_RES_DENY;
+				s->last_rule_file = rule->conf.file;
+				s->last_rule_line = rule->conf.line;
 				goto end;
 
 			case ACT_HTTP_REDIR: {
@@ -2799,6 +2814,8 @@ static enum rule_result http_req_get_intercept_rule(struct proxy *px, struct lis
 					break;
 
 				rule_ret = ret ? HTTP_RULE_RES_ABRT : HTTP_RULE_RES_ERROR;
+				s->last_rule_file = rule->conf.file;
+				s->last_rule_line = rule->conf.line;
 				goto end;
 			}
 
@@ -2890,6 +2907,8 @@ resume_execution:
 					break;
 				case ACT_RET_STOP:
 					rule_ret = HTTP_RULE_RES_STOP;
+					s->last_rule_file = rule->conf.file;
+					s->last_rule_line = rule->conf.line;
 					goto end;
 				case ACT_RET_YIELD:
 					s->current_rule = rule;
@@ -2897,20 +2916,30 @@ resume_execution:
 					goto end;
 				case ACT_RET_ERR:
 					rule_ret = HTTP_RULE_RES_ERROR;
+					s->last_rule_file = rule->conf.file;
+					s->last_rule_line = rule->conf.line;
 					goto end;
 				case ACT_RET_DONE:
 					rule_ret = HTTP_RULE_RES_DONE;
+					s->last_rule_file = rule->conf.file;
+					s->last_rule_line = rule->conf.line;
 					goto end;
 				case ACT_RET_DENY:
 					if (txn->status == -1)
 						txn->status = 502;
 					rule_ret = HTTP_RULE_RES_DENY;
+					s->last_rule_file = rule->conf.file;
+					s->last_rule_line = rule->conf.line;
 					goto end;
 				case ACT_RET_ABRT:
 					rule_ret = HTTP_RULE_RES_ABRT;
+					s->last_rule_file = rule->conf.file;
+					s->last_rule_line = rule->conf.line;
 					goto end;
 				case ACT_RET_INV:
 					rule_ret = HTTP_RULE_RES_BADREQ;
+					s->last_rule_file = rule->conf.file;
+					s->last_rule_line = rule->conf.line;
 					goto end;
 			}
 			continue; /* eval the next rule */
@@ -2920,12 +2949,16 @@ resume_execution:
 		switch (rule->action) {
 			case ACT_ACTION_ALLOW:
 				rule_ret = HTTP_RULE_RES_STOP; /* "allow" rules are OK */
+				s->last_rule_file = rule->conf.file;
+				s->last_rule_line = rule->conf.line;
 				goto end;
 
 			case ACT_ACTION_DENY:
 				txn->status = rule->arg.http_reply->status;
 				txn->http_reply = rule->arg.http_reply;
 				rule_ret = HTTP_RULE_RES_DENY;
+				s->last_rule_file = rule->conf.file;
+				s->last_rule_line = rule->conf.line;
 				goto end;
 
 			case ACT_HTTP_REDIR: {
@@ -2935,6 +2968,8 @@ resume_execution:
 					break;
 
 				rule_ret = ret ? HTTP_RULE_RES_ABRT : HTTP_RULE_RES_ERROR;
+				s->last_rule_file = rule->conf.file;
+				s->last_rule_line = rule->conf.line;
 				goto end;
 			}
 			/* other flags exists, but normally, they never be matched. */
