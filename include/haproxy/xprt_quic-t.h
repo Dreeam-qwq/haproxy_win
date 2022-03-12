@@ -391,6 +391,10 @@ struct quic_arngs {
 #define QUIC_FL_PKTNS_ACK_RECEIVED_BIT 0
 #define QUIC_FL_PKTNS_ACK_RECEIVED  (1UL << QUIC_FL_PKTNS_ACK_RECEIVED_BIT)
 
+/* Flag the packet number space as requiring an ACK frame to be sent. */
+#define QUIC_FL_PKTNS_ACK_REQUIRED_BIT 1
+#define QUIC_FL_PKTNS_ACK_REQUIRED  (1UL << QUIC_FL_PKTNS_ACK_REQUIRED_BIT)
+
 /* The maximum number of dgrams which may be sent upon PTO expirations. */
 #define QUIC_MAX_NB_PTO_DGRAMS         2
 
@@ -643,10 +647,6 @@ enum qc_mux_state {
 #define QUIC_CONN_TX_BUFS_NB 8
 #define QUIC_CONN_TX_BUF_SZ  QUIC_PACKET_MAXLEN
 
-/* Flag the packet number space as requiring an ACK frame to be sent. */
-#define QUIC_FL_PKTNS_ACK_REQUIRED_BIT 0
-#define QUIC_FL_PKTNS_ACK_REQUIRED  (1UL << QUIC_FL_PKTNS_ACK_REQUIRED_BIT)
-
 /* Flags at connection level */
 #define QUIC_FL_CONN_ANTI_AMPLIFICATION_REACHED_BIT 0
 #define QUIC_FL_CONN_ANTI_AMPLIFICATION_REACHED \
@@ -659,15 +659,9 @@ enum qc_mux_state {
 #define QUIC_FL_CONN_LISTENER                   (1U << 3)
 #define QUIC_FL_ACCEPT_REGISTERED_BIT                  4
 #define QUIC_FL_ACCEPT_REGISTERED               (1U << QUIC_FL_ACCEPT_REGISTERED_BIT)
+#define QUIC_FL_CONN_IDLE_TIMER_RESTARTED_AFTER_READ (1U << 6)
 #define QUIC_FL_CONN_IMMEDIATE_CLOSE            (1U << 31)
 struct quic_conn {
-	/* The quic_conn instance is refcounted as it can be used by threads
-	 * outside of the connection pinned thread.
-	 *
-	 * By default it is initialized to 0.
-	 */
-	uint refcount;
-
 	uint32_t version;
 	/* QUIC transport parameters TLS extension */
 	int tps_tls_ext;
@@ -742,6 +736,7 @@ struct quic_conn {
 		struct quic_tls_kp nxt_tx;
 	} ku;
 	unsigned int max_ack_delay;
+	unsigned int max_idle_timeout;
 	struct quic_path paths[1];
 	struct quic_path *path;
 
@@ -751,6 +746,8 @@ struct quic_conn {
 	struct qcc *qcc;
 	struct task *timer_task;
 	unsigned int timer;
+	/* Idle timer task */
+	struct task *idle_timer_task;
 	unsigned int flags;
 
 	const struct qcc_app_ops *app_ops;

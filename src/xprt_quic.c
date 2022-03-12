@@ -174,6 +174,7 @@ static struct quic_tx_packet *qc_build_pkt(unsigned char **pos, const unsigned c
                                            struct quic_conn *qc, size_t dglen, int pkt_type,
                                            int padding, int ack, int probe, int cc, int *err);
 static struct task *quic_conn_app_io_cb(struct task *t, void *context, unsigned int state);
+static void qc_idle_timer_rearm(struct quic_conn *qc, int read);
 
 /* Only for debug purpose */
 struct enc_debug_info {
@@ -2455,7 +2456,8 @@ static inline void qc_set_dg(struct cbuf *cbuf,
  * <frms> list of prebuilt frames.
  * A header made of two fields is added to each datagram: the datagram length followed
  * by the address of the first packet in this datagram.
- * Returns 1 if succeeded, or 0 if something wrong happened.
+ * Returns the number of bytes prepared in packets if succeeded (may be 0),
+ * or -1 if something wrong happened.
  */
 static int qc_prep_app_pkts(struct quic_conn *qc, struct qring *qr,
                             struct list *frms)
@@ -2526,7 +2528,7 @@ static int qc_prep_app_pkts(struct quic_conn *qc, struct qring *qr,
 		case -2:
 			goto err;
 		case -1:
-			goto out;
+			goto stop_build;
 		default:
 			break;
 		}
@@ -2575,7 +2577,8 @@ static int qc_prep_app_pkts(struct quic_conn *qc, struct qring *qr,
  * several packets in the same datagram. A header made of two fields is added
  * to each datagram: the datagram length followed by the address of the first
  * packet in this datagram.
- * Returns 1 if succeeded, or 0 if something wrong happened.
+ * Returns the number of bytes prepared in packets if succeeded (may be 0),
+ * or -1 if something wrong happened.
  */
 static int qc_prep_pkts(struct quic_conn *qc, struct qring *qr,
                         enum quic_tls_enc_level tel,
@@ -2827,6 +2830,8 @@ int qc_send_ppkts(struct qring *qr, struct ssl_sock_ctx *ctx)
 			if (pkt->flags & QUIC_FL_TX_PACKET_ACK_ELICITING) {
 				pkt->pktns->tx.time_of_last_eliciting = time_sent;
 				qc->path->ifae_pkts++;
+				if (qc->flags & QUIC_FL_CONN_IDLE_TIMER_RESTARTED_AFTER_READ)
+					qc_idle_timer_rearm(qc, 0);
 			}
 			qc->path->in_flight += pkt->in_flight_len;
 			pkt->pktns->tx.in_flight += pkt->in_flight_len;
@@ -3203,9 +3208,11 @@ int qc_treat_rx_pkts(struct quic_enc_level *cur_el, struct quic_enc_level *next_
 			else {
 				struct quic_arng ar = { .first = pkt->pn, .last = pkt->pn };
 
-				if (pkt->flags & QUIC_FL_RX_PACKET_ACK_ELICITING &&
-				    (!(HA_ATOMIC_ADD_FETCH(&qc->rx.nb_ack_eliciting, 1) & 1) || force_ack))
-					HA_ATOMIC_BTS(&qel->pktns->flags, QUIC_FL_PKTNS_ACK_REQUIRED_BIT);
+				if (pkt->flags & QUIC_FL_RX_PACKET_ACK_ELICITING) {
+					if (!(HA_ATOMIC_ADD_FETCH(&qc->rx.nb_ack_eliciting, 1) & 1) || force_ack)
+						HA_ATOMIC_BTS(&qel->pktns->flags, QUIC_FL_PKTNS_ACK_REQUIRED_BIT);
+					qc_idle_timer_rearm(qc, 1);
+				}
 				if (pkt->pn > largest_pn)
 					largest_pn = pkt->pn;
 				/* Update the list of ranges to acknowledge. */
@@ -3514,33 +3521,35 @@ static int quic_conn_enc_level_init(struct quic_conn *qc,
 	return 0;
 }
 
-/* Increment the <qc> refcount.
+/* Release the quic_conn <qc>. The connection is removed from the CIDs tree.
+ * The connection tasklet is killed.
  *
- * This operation must be conducted when manipulating the quic_conn outside of
- * the connection pinned thread. These threads can only retrieve the connection
- * in the CID tree, so this function must be conducted under the CID lock.
+ * This function must only be called by the thread responsible of the quic_conn
+ * tasklet.
  */
-static inline void quic_conn_take(struct quic_conn *qc)
+static void quic_conn_release(struct quic_conn *qc)
 {
-	HA_ATOMIC_INC(&qc->refcount);
-}
-
-/* Decrement the <qc> refcount. If the refcount is zero *BEFORE* the
- * subtraction, the quic_conn is freed.
- */
-static void quic_conn_drop(struct quic_conn *qc)
-{
-	struct ssl_sock_ctx *conn_ctx;
 	int i;
+	struct ssl_sock_ctx *conn_ctx;
 
-	if (!qc)
-		return;
+	if (qc->idle_timer_task) {
+		task_destroy(qc->idle_timer_task);
+		qc->idle_timer_task = NULL;
+	}
 
-	if (HA_ATOMIC_FETCH_SUB(&qc->refcount, 1))
-		return;
+	if (qc->timer_task) {
+		task_destroy(qc->timer_task);
+		qc->timer_task = NULL;
+	}
+
+	/* remove the connection from receiver cids trees */
+	ebmb_delete(&qc->odcid_node);
+	ebmb_delete(&qc->scid_node);
+	free_quic_conn_cids(qc);
 
 	conn_ctx = HA_ATOMIC_LOAD(&qc->xprt_ctx);
 	if (conn_ctx) {
+		tasklet_free(conn_ctx->wait_event.tasklet);
 		SSL_free(conn_ctx->ssl);
 		pool_free(pool_head_quic_conn_ctx, conn_ctx);
 	}
@@ -3553,55 +3562,17 @@ static void quic_conn_drop(struct quic_conn *qc)
 	TRACE_PROTO("QUIC conn. freed", QUIC_EV_CONN_FREED, qc);
 }
 
-/* Release the quic_conn <qc>. It will decrement its refcount so that the
- * connection will be freed once all threads have finished to work with it. The
- * connection is removed from the CIDs tree and thus cannot be found by other
- * threads after it. The connection tasklet is killed.
- *
- * Do not use <qc> after it as it may be freed. This function must only be
- * called by the thread responsible of the quic_conn tasklet.
- */
-static void quic_conn_release(struct quic_conn *qc)
-{
-	struct ssl_sock_ctx *conn_ctx;
-
-	/* remove the connection from receiver cids trees */
-	ebmb_delete(&qc->odcid_node);
-	ebmb_delete(&qc->scid_node);
-	free_quic_conn_cids(qc);
-
-	/* Kill the tasklet. Do not use tasklet_free as this is not thread safe
-	 * as other threads may call tasklet_wakeup after this.
-	 */
-	conn_ctx = HA_ATOMIC_LOAD(&qc->xprt_ctx);
-	if (conn_ctx)
-		tasklet_kill(conn_ctx->wait_event.tasklet);
-
-	quic_conn_drop(qc);
-}
-
 void quic_close(struct connection *conn, void *xprt_ctx)
 {
 	struct ssl_sock_ctx *conn_ctx = xprt_ctx;
 	struct quic_conn *qc = conn_ctx->qc;
 
 	TRACE_ENTER(QUIC_EV_CONN_CLOSE, qc);
-	/* This task must be deleted by the connection-pinned thread. */
-	if (qc->timer_task) {
-		task_destroy(qc->timer_task);
-		qc->timer_task = NULL;
-	}
 
 	/* Next application data can be dropped. */
 	qc->mux_state = QC_MUX_RELEASED;
 
 	TRACE_LEAVE(QUIC_EV_CONN_CLOSE, qc);
-
-	/* TODO for now release the quic_conn on notification by the upper
-	 * layer. It could be useful to delay it if there is remaining data to
-	 * send or data to be acked.
-	 */
-	quic_conn_release(qc);
 }
 
 /* Callback called upon loss detection and PTO timer expirations. */
@@ -3690,8 +3661,6 @@ static struct quic_conn *qc_new_conn(unsigned int version, int ipv4,
 		TRACE_PROTO("Could not allocate a new connection", QUIC_EV_CONN_INIT);
 		goto err;
 	}
-
-	HA_ATOMIC_STORE(&qc->refcount, 0);
 
 	buf_area = pool_alloc(pool_head_quic_conn_rxbuf);
 	if (!buf_area) {
@@ -3791,7 +3760,7 @@ static struct quic_conn *qc_new_conn(unsigned int version, int ipv4,
 	pool_free(pool_head_quic_conn_rxbuf, buf_area);
 	if (qc)
 		qc->rx.buf.area = NULL;
-	quic_conn_drop(qc);
+	quic_conn_release(qc);
 	return NULL;
 }
 
@@ -3808,6 +3777,50 @@ static int quic_conn_init_timer(struct quic_conn *qc)
 	qc->timer = TICK_ETERNITY;
 	qc->timer_task->process = process_timer;
 	qc->timer_task->context = qc->xprt_ctx;
+
+	return 1;
+}
+
+/* Rearm the idle timer for <qc> QUIC connection depending on <read> boolean
+ * which is set to 1 when receiving a packet , and 0 when sending packet
+ */
+static void qc_idle_timer_rearm(struct quic_conn *qc, int read)
+{
+	unsigned int expire;
+
+	expire = QUIC_MAX(3 * quic_pto(qc), qc->max_idle_timeout);
+	if (read) {
+		qc->flags |= QUIC_FL_CONN_IDLE_TIMER_RESTARTED_AFTER_READ;
+	}
+	else {
+		qc->flags &= ~QUIC_FL_CONN_IDLE_TIMER_RESTARTED_AFTER_READ;
+	}
+	qc->idle_timer_task->expire = tick_add(now_ms, MS_TO_TICKS(expire));
+}
+
+/* The task handling the idle timeout */
+static struct task *qc_idle_timer_task(struct task *t, void *ctx, unsigned int state)
+{
+	struct quic_conn *qc = ctx;
+
+	quic_conn_release(qc);
+
+	return NULL;
+}
+
+/* Initialize the idle timeout task for <qc>.
+ * Returns 1 if succeeded, 0 if not.
+ */
+static int quic_conn_init_idle_timer_task(struct quic_conn *qc)
+{
+	qc->idle_timer_task = task_new_here();
+	if (!qc->idle_timer_task)
+		return 0;
+
+	qc->idle_timer_task->process = qc_idle_timer_task;
+	qc->idle_timer_task->context = qc;
+	qc_idle_timer_rearm(qc, 1);
+	task_queue(qc->idle_timer_task);
 
 	return 1;
 }
@@ -4163,9 +4176,6 @@ static struct quic_conn *retrieve_qc_conn_from_cid(struct quic_rx_packet *pkt,
 	found_in_dcid = 1;
 
  end:
-	if (qc)
-		quic_conn_take(qc);
-
 	/* If found in DCIDs tree, remove the quic_conn from the ODCIDs tree.
 	 * If already done, this is a noop.
 	 */
@@ -4478,6 +4488,9 @@ static ssize_t qc_lstnr_pkt_rcv(unsigned char *buf, const unsigned char *end,
 			if (!quic_conn_init_timer(qc))
 				goto err;
 
+			if (!quic_conn_init_idle_timer_task(qc))
+				goto err;
+
 			/* NOTE: the socket address has been concatenated to the destination ID
 			 * chosen by the client for Initial packets.
 			 */
@@ -4506,14 +4519,12 @@ static ssize_t qc_lstnr_pkt_rcv(unsigned char *buf, const unsigned char *end,
 				pkt->qc = qc;
 			}
 
-			quic_conn_take(qc);
-
 			if (likely(!qc_to_purge)) {
 				/* Enqueue this packet. */
 				pkt->qc = qc;
 			}
 			else {
-				quic_conn_drop(qc_to_purge);
+				quic_conn_release(qc_to_purge);
 			}
 		}
 		else {
@@ -4619,9 +4630,6 @@ static ssize_t qc_lstnr_pkt_rcv(unsigned char *buf, const unsigned char *end,
 
 	TRACE_LEAVE(QUIC_EV_CONN_LPKT, qc ? qc : NULL, pkt);
 
-	if (qc)
-		quic_conn_drop(qc);
-
 	return pkt->len;
 
  err:
@@ -4638,9 +4646,6 @@ static ssize_t qc_lstnr_pkt_rcv(unsigned char *buf, const unsigned char *end,
 		pkt->len = end - beg;
 	TRACE_DEVEL("Leaving in error", QUIC_EV_CONN_LPKT,
 	            qc ? qc : NULL, pkt);
-
-	if (qc)
-		quic_conn_drop(qc);
 
 	return -1;
 }
@@ -4884,6 +4889,10 @@ static inline int qc_build_frms(struct list *outlist, struct list *inlist,
 				/* <cf> STREAM data have been consumed. */
 				LIST_DELETE(&cf->list);
 				LIST_APPEND(outlist, &cf->list);
+
+				qcc_streams_sent_done(cf->stream.qcs,
+				                      cf->stream.len,
+				                      cf->stream.offset.key);
 			}
 			else {
 				struct quic_frame *new_cf;
@@ -4915,7 +4924,20 @@ static inline int qc_build_frms(struct list *outlist, struct list *inlist,
 				cf->stream.len -= dlen;
 				cf->stream.offset.key += dlen;
 				cf->stream.data = (unsigned char *)b_peek(&cf_buf, dlen);
+
+				qcc_streams_sent_done(new_cf->stream.qcs,
+				                      new_cf->stream.len,
+				                      new_cf->stream.offset.key);
 			}
+
+			/* TODO the MUX is notified about the frame sending via
+			 * previous qcc_streams_sent_done call. However, the
+			 * sending can fail later, for example if the sendto
+			 * system call returns an error. As the MUX has been
+			 * notified, the transport layer is responsible to
+			 * bufferize and resent the announced data later.
+			 */
+
 			break;
 
 		default:
@@ -5241,7 +5263,7 @@ static struct quic_tx_packet *qc_build_pkt(unsigned char **pos,
 	/* Consume a packet number */
 	qel->pktns->tx.next_pn++;
 	qc->tx.prep_bytes += pkt->len;
-	if (qc->tx.prep_bytes >= 3 * qc->rx.bytes)
+	if (qc->tx.prep_bytes >= 3 * qc->rx.bytes && !quic_peer_validated_addr(qc))
 		HA_ATOMIC_OR(&qc->flags, QUIC_FL_CONN_ANTI_AMPLIFICATION_REACHED);
 	/* Now that a correct packet is built, let us consume <*pos> buffer. */
 	*pos = end;
