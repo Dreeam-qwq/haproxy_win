@@ -22,6 +22,7 @@
 #include <haproxy/istbuf.h>
 #include <haproxy/h1_htx.h>
 #include <haproxy/http.h>
+#include <haproxy/http_ana-t.h>
 #include <haproxy/http_client.h>
 #include <haproxy/http_htx.h>
 #include <haproxy/htx.h>
@@ -644,11 +645,13 @@ static void httpclient_applet_io_handler(struct appctx *appctx)
 	struct stream *s = si_strm(si);
 	struct channel *req = &s->req;
 	struct channel *res = &s->res;
+	struct http_msg *msg = &s->txn->rsp;
 	struct htx_blk *blk = NULL;
 	struct htx *htx;
 	struct htx_sl *sl = NULL;
 	int32_t pos;
 	uint32_t hdr_num;
+	uint32_t sz;
 	int ret;
 
 
@@ -732,12 +735,12 @@ static void httpclient_applet_io_handler(struct appctx *appctx)
 
 			case HTTPCLIENT_S_RES_STLINE:
 				/* copy the start line in the hc structure,then remove the htx block */
-				if (!b_data(&res->buf))
+				if (!co_data(res) || (msg->msg_state < HTTP_MSG_DATA))
 					goto more;
 				htx = htxbuf(&res->buf);
 				if (!htx)
 					goto more;
-				blk = htx_get_first_blk(htx);
+				blk = htx_get_head_blk(htx);
 				if (blk && (htx_get_blk_type(blk) == HTX_BLK_RES_SL))
 					sl = htx_get_blk_ptr(htx, blk);
 				if (!sl || (!(sl->flags & HTX_SL_F_IS_RESP)))
@@ -747,7 +750,9 @@ static void httpclient_applet_io_handler(struct appctx *appctx)
 				hc->res.status = sl->info.res.status;
 				hc->res.vsn = istdup(htx_sl_res_vsn(sl));
 				hc->res.reason = istdup(htx_sl_res_reason(sl));
-				co_htx_remove_blk(res, htx, blk);
+				sz = htx_get_blksz(blk);
+				co_set_data(res, co_data(res) - sz);
+				htx_remove_blk(htx, blk);
 				/* caller callback */
 				if (hc->ops.res_stline)
 					hc->ops.res_stline(hc);
@@ -769,7 +774,7 @@ static void httpclient_applet_io_handler(struct appctx *appctx)
 				{
 					struct http_hdr hdrs[global.tune.max_http_hdr];
 
-					if (!b_data(&res->buf))
+					if (!co_data(res) || (msg->msg_state < HTTP_MSG_DATA))
 						goto more;
 					htx = htxbuf(&res->buf);
 					if (!htx)
@@ -777,26 +782,34 @@ static void httpclient_applet_io_handler(struct appctx *appctx)
 
 					hdr_num = 0;
 
-					for (pos = htx_get_first(htx);  pos != -1; pos = htx_get_next(htx, pos)) {
+					for (pos = htx_get_head(htx);  pos != -1; pos = htx_get_next(htx, pos)) {
 						struct htx_blk *blk = htx_get_blk(htx, pos);
 						enum htx_blk_type type = htx_get_blk_type(blk);
+						uint32_t sz = htx_get_blksz(blk);
 
+						if (type == HTX_BLK_UNUSED) {
+							c_rew(res, sz);
+							htx_remove_blk(htx, blk);
+						}
+
+						if (type == HTX_BLK_HDR) {
+							hdrs[hdr_num].n = istdup(htx_get_blk_name(htx, blk));
+							hdrs[hdr_num].v = istdup(htx_get_blk_value(htx, blk));
+							if (!isttest(hdrs[hdr_num].v) || !isttest(hdrs[hdr_num].n))
+								goto end;
+							c_rew(res, sz);
+							htx_remove_blk(htx, blk);
+							hdr_num++;
+						}
+
+						/* create a NULL end of array and leave the loop */
 						if (type == HTX_BLK_EOH) {
 							hdrs[hdr_num].n = IST_NULL;
 							hdrs[hdr_num].v = IST_NULL;
-							co_htx_remove_blk(res, htx, blk);
+							c_rew(res, sz);
+							htx_remove_blk(htx, blk);
 							break;
 						}
-
-						if (type != HTX_BLK_HDR)
-							continue;
-
-						hdrs[hdr_num].n = istdup(htx_get_blk_name(htx, blk));
-						hdrs[hdr_num].v = istdup(htx_get_blk_value(htx, blk));
-						if (!isttest(hdrs[hdr_num].v) || !isttest(hdrs[hdr_num].n))
-							goto end;
-						co_htx_remove_blk(res, htx, blk);
-						hdr_num++;
 					}
 
 					if (hdr_num) {
@@ -826,6 +839,9 @@ static void httpclient_applet_io_handler(struct appctx *appctx)
 				 * The IO handler removes the htx blocks in the response buffer and
 				 * push them in the hc->res.buf buffer in a raw format.
 				 */
+				if (!co_data(res) || (msg->msg_state < HTTP_MSG_DATA))
+					goto more;
+
 				htx = htxbuf(&res->buf);
 				if (!htx || htx_is_empty(htx))
 					goto more;
@@ -837,30 +853,54 @@ static void httpclient_applet_io_handler(struct appctx *appctx)
 					goto process_data;
 
 				/* decapsule the htx data to raw data */
-				for (pos = htx_get_first(htx); pos != -1; pos = htx_get_next(htx, pos)) {
-					enum htx_blk_type type;
+				for (pos = htx_get_head(htx); pos != -1; pos = htx_get_next(htx, pos)) {
+					struct htx_blk *blk = htx_get_blk(htx, pos);
+					enum htx_blk_type type = htx_get_blk_type(blk);
+					size_t count = co_data(res);
+					uint32_t blksz = htx_get_blksz(blk);
+					uint32_t room = b_room(&hc->res.buf);
+					uint32_t vlen;
 
-					blk = htx_get_blk(htx, pos);
-					type = htx_get_blk_type(blk);
+					/* we should try to copy the maximum output data in a block, which fit
+					 * the destination buffer */
+					vlen = MIN(count, blksz);
+					vlen = MIN(vlen, room);
+
+					if (vlen == 0)
+						goto process_data;
+
 					if (type == HTX_BLK_DATA) {
 						struct ist v = htx_get_blk_value(htx, blk);
 
-						if ((b_room(&hc->res.buf) < v.len) )
-							goto process_data;
+						__b_putblk(&hc->res.buf, v.ptr, vlen);
+						c_rew(res, vlen);
 
-						__b_putblk(&hc->res.buf, v.ptr, v.len);
-						co_htx_remove_blk(res, htx, blk);
+						if (vlen == blksz)
+							htx_remove_blk(htx, blk);
+						else
+							htx_cut_data_blk(htx, blk, vlen);
+
 						/* the data must be processed by the caller in the receive phase */
 						if (hc->ops.res_payload)
 							hc->ops.res_payload(hc);
+
+						/* cannot copy everything, need to processs */
+						if (vlen != blksz)
+							goto process_data;
 					} else {
+						if (vlen != blksz)
+							goto process_data;
+
 						/* remove any block which is not a data block */
-						co_htx_remove_blk(res, htx, blk);
+						c_rew(res, blksz);
+						htx_remove_blk(htx, blk);
 					}
 				}
+
 				/* if not finished, should be called again */
-				if (!(htx->flags & HTX_FL_EOM))
+				if (!(htx_is_empty(htx) && (htx->flags & HTX_FL_EOM)))
 					goto more;
+
 
 				/* end of message, we should quit */
 				appctx->st0 = HTTPCLIENT_S_RES_END;
@@ -1021,6 +1061,7 @@ static int httpclient_cfg_postparser()
 {
 	struct logsrv *logsrv;
 	struct proxy *curproxy = httpclient_proxy;
+	char *errmsg = NULL;
 
 	/* copy logs from "global" log list */
 	list_for_each_entry(logsrv, &global.logsrvs, list) {
@@ -1036,19 +1077,34 @@ static int httpclient_cfg_postparser()
 		LIST_APPEND(&curproxy->logsrvs, &node->list);
 	}
 	if (curproxy->conf.logformat_string) {
-		char *err = NULL;
-
 		curproxy->conf.args.ctx = ARGC_LOG;
 		if (!parse_logformat_string(curproxy->conf.logformat_string, curproxy, &curproxy->logformat,
 					    LOG_OPT_MANDATORY|LOG_OPT_MERGE_SPACES,
-					    SMP_VAL_FE_LOG_END, &err)) {
-			ha_alert("httpclient: failed to parse log-format : %s.\n", err);
-			free(err);
+					    SMP_VAL_FE_LOG_END, &errmsg)) {
+			ha_alert("httpclient: failed to parse log-format : %s.\n", errmsg);
+			free(errmsg);
 			goto err;
 		}
 		curproxy->conf.args.file = NULL;
 		curproxy->conf.args.line = 0;
 	}
+
+#ifdef USE_OPENSSL
+	{
+		int err_code = 0;
+
+		/* init the SNI expression */
+		/* always use the host header as SNI, without the port */
+		httpclient_srv_ssl->sni_expr = strdup("req.hdr(host),field(1,:)");
+		err_code |= server_parse_sni_expr(httpclient_srv_ssl, httpclient_proxy, &errmsg);
+		if (err_code & ERR_CODE) {
+			ha_alert("httpclient: failed to configure sni: %s.\n", errmsg);
+			free(errmsg);
+			goto err;
+		}
+	}
+#endif
+
 	return 0;
 err:
 	return 1;

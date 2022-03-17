@@ -36,6 +36,7 @@
 #include <netdb.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <getopt.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <sys/stat.h>
@@ -76,6 +77,9 @@ struct {
 } history[MAXREORDER];
 int history_idx = 0;
 unsigned int rand_rate = 0;
+unsigned int corr_rate = 0;
+unsigned int corr_span = 1;
+unsigned int corr_base = 0;
 
 struct conn conns[MAXCONN];        // sole connection for now
 int fd_frt;
@@ -318,6 +322,14 @@ int handle_frt(int fd, struct pollfd *pfd, struct conn *conns, int nbconn)
 	if (ret < 0)
 		return errno == EAGAIN ? 0 : -1;
 
+	if (corr_rate > 0 && prng(100) < corr_rate) {
+		unsigned int rnd = prng(corr_span * 256); // pos and value
+		unsigned int pos = corr_base + (rnd >> 8);
+
+		if (pos < ret)
+			pktbuf[pos] ^= rnd;
+	}
+
 	conn = NULL;
 	for (i = 0; i < nbconn; i++) {
 		if (addr.ss_family != conns[i].cli_addr.ss_family)
@@ -409,30 +421,64 @@ int handle_bck(int fd, struct pollfd *pfd, struct conn *conns, int nbconn)
 	return ret;
 }
 
+/* print the usage message for program named <name> and exit with status <status> */
+void usage(int status, const char *name)
+{
+	if (strchr(name, '/'))
+		name = strrchr(name, '/') + 1;
+	die(status,
+	    "Usage: %s [-h] [options] [<laddr>:]<lport> [<saddr>:]<sport>\n"
+	    "Options:\n"
+	    "  -h           display this help\n"
+	    "  -r rate      reorder/duplicate/lose around <rate>%% of packets\n"
+	    "  -s seed      force initial random seed (currently %#x)\n"
+	    "  -c rate      corrupt around <rate>%% of packets\n"
+	    "  -o ofs       start offset of corrupted area (def: 0)\n"
+	    "  -w width     width of the corrupted area (def: 1)\n"
+	    "", name, prng_state);
+}
+
 int main(int argc, char **argv)
 {
 	struct errmsg err;
 	struct pollfd *pfd;
+	int opt;
 	int i;
 
 	err.len = 0;
 	err.size = 100;
 	err.msg = malloc(err.size);
 
-	if (argc < 3)
-		die(1, "Usage: %s [<laddr>:]<lport> [<saddr>:]<sport> [rand_rate%% [seed]]\n", argv[0]);
+	while ((opt = getopt(argc, argv, "hr:s:c:o:w:")) != -1) {
+		switch (opt) {
+		case 'r': // rand_rate%
+			rand_rate = atoi(optarg);
+			break;
+		case 's': // seed
+			prng_state = atol(optarg);
+			break;
+		case 'c': // corruption rate
+			corr_rate = atol(optarg);
+			break;
+		case 'o': // corruption offset
+			corr_base = atol(optarg);
+			break;
+		case 'w': // corruption width
+			corr_span = atol(optarg);
+			break;
+		default: // help, anything else
+			usage(0, argv[0]);
+		}
+	}
 
-	if (addr_to_ss(argv[1], &frt_addr, &err) < 0)
+	if (argc - optind < 2)
+		usage(1, argv[0]);
+
+	if (addr_to_ss(argv[optind], &frt_addr, &err) < 0)
 		die(1, "parsing listen address: %s\n", err.msg);
 
-	if (addr_to_ss(argv[2], &srv_addr, &err) < 0)
+	if (addr_to_ss(argv[optind+1], &srv_addr, &err) < 0)
 		die(1, "parsing server address: %s\n", err.msg);
-
-	if (argc > 3)
-		rand_rate = atoi(argv[3]);
-
-	if (argc > 4)
-		prng_state = atol(argv[4]);
 
 	pfd = calloc(sizeof(struct pollfd), MAXCONN + 1);
 	if (!pfd)
