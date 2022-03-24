@@ -978,17 +978,43 @@ static inline void quic_pktns_init(struct quic_pktns *pktns)
 	LIST_INIT(&pktns->tx.frms);
 	pktns->tx.next_pn = -1;
 	pktns->tx.pkts = EB_ROOT_UNIQUE;
-	pktns->tx.largest_acked_pn = -1;
 	pktns->tx.time_of_last_eliciting = 0;
 	pktns->tx.loss_time = TICK_ETERNITY;
 	pktns->tx.in_flight = 0;
 
 	pktns->rx.largest_pn = -1;
+	pktns->rx.largest_acked_pn = -1;
 	pktns->rx.arngs.root = EB_ROOT_UNIQUE;
 	pktns->rx.arngs.sz = 0;
 	pktns->rx.arngs.enc_sz = 0;
 
 	pktns->flags = 0;
+}
+
+/* Returns the current largest acknowledged packet number if exists, -1 if not */
+static inline int64_t quic_pktns_get_largest_acked_pn(struct quic_pktns *pktns)
+{
+	struct eb64_node *ar = eb64_last(&pktns->rx.arngs.root);
+
+	if (!ar)
+		return -1;
+
+	return eb64_entry(&ar->node, struct quic_arng_node, first)->last;
+}
+
+/* Increment the reference counter of <pkt> */
+static inline void quic_tx_packet_refinc(struct quic_tx_packet *pkt)
+{
+	HA_ATOMIC_ADD(&pkt->refcnt, 1);
+}
+
+/* Decrement the reference counter of <pkt> */
+static inline void quic_tx_packet_refdec(struct quic_tx_packet *pkt)
+{
+	if (!HA_ATOMIC_SUB_FETCH(&pkt->refcnt, 1)) {
+		BUG_ON(!LIST_ISEMPTY(&pkt->frms));
+		pool_free(pool_head_quic_tx_packet, pkt);
+	}
 }
 
 /* Discard <pktns> packet number space attached to <qc> QUIC connection.
@@ -1003,12 +1029,14 @@ static inline void quic_pktns_discard(struct quic_pktns *pktns,
 {
 	struct eb64_node *node;
 
+	qc->path->in_flight -= pktns->tx.in_flight;
+	qc->path->prep_in_flight -= pktns->tx.in_flight;
+	qc->path->loss.pto_count = 0;
+
 	pktns->tx.time_of_last_eliciting = 0;
 	pktns->tx.loss_time = TICK_ETERNITY;
 	pktns->tx.pto_probe = 0;
 	pktns->tx.in_flight = 0;
-	qc->path->loss.pto_count = 0;
-	qc->path->in_flight -= pktns->tx.in_flight;
 
 	node = eb64_first(&pktns->tx.pkts);
 	while (node) {
@@ -1019,10 +1047,11 @@ static inline void quic_pktns_discard(struct quic_pktns *pktns,
 		node = eb64_next(node);
 		list_for_each_entry_safe(frm, frmbak, &pkt->frms, list) {
 			LIST_DELETE(&frm->list);
+			quic_tx_packet_refdec(frm->pkt);
 			pool_free(pool_head_quic_frame, frm);
 		}
 		eb64_delete(&pkt->pn_node);
-		pool_free(pool_head_quic_tx_packet, pkt);
+		quic_tx_packet_refdec(pkt);
 	}
 }
 
@@ -1158,19 +1187,6 @@ static inline void quic_rx_packet_refdec(struct quic_rx_packet *pkt)
 	do {
 		refcnt = HA_ATOMIC_LOAD(&pkt->refcnt);
 	} while (refcnt && !HA_ATOMIC_CAS(&pkt->refcnt, &refcnt, refcnt - 1));
-}
-
-/* Increment the reference counter of <pkt> */
-static inline void quic_tx_packet_refinc(struct quic_tx_packet *pkt)
-{
-	HA_ATOMIC_ADD(&pkt->refcnt, 1);
-}
-
-/* Decrement the reference counter of <pkt> */
-static inline void quic_tx_packet_refdec(struct quic_tx_packet *pkt)
-{
-	if (!HA_ATOMIC_SUB_FETCH(&pkt->refcnt, 1))
-		pool_free(pool_head_quic_tx_packet, pkt);
 }
 
 /* Delete all RX packets for <qel> QUIC encryption level */

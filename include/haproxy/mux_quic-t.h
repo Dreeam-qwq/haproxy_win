@@ -22,7 +22,8 @@ enum qcs_type {
 	QCS_MAX_TYPES
 };
 
-#define QC_CF_CC_RECV 0x00000001
+#define QC_CF_CC_RECV   0x00000001
+#define QC_CF_BLK_MFCTL 0x00000002 /* sending blocked due to connection flow-control */
 
 struct qcc {
 	struct connection *conn;
@@ -42,22 +43,25 @@ struct qcc {
 		} tx;
 	} strms[QCS_MAX_TYPES];
 
-	/* Flow-control related fields which are enforced on our side. */
+	/* flow-control fields set by us enforced on our side. */
 	struct {
-		uint64_t max_bidi_streams; /* max sub-ID of bidi stream allowed for the peer */
-		uint64_t initial_max_bidi_streams; /* max initial sub-ID of bidi stream allowed for the peer */
-		uint64_t closed_bidi_streams; /* total count of closed bidi stream since last MAX_STREAMS emission */
+		uint64_t ms_bidi_init; /* max initial sub-ID of bidi stream allowed for the peer */
+		uint64_t ms_bidi; /* max sub-ID of bidi stream allowed for the peer */
+		uint64_t cl_bidi_r; /* total count of closed remote bidi stream since last MAX_STREAMS emission */
 	} lfctl;
 
-	/* Flow-control related fields from the endpoint which we must respect. */
+	/* flow-control fields set by the peer which we must respect. */
 	struct {
+		uint64_t md; /* connection flow control limit updated on MAX_DATA frames reception */
+		uint64_t msd_bidi_l; /* initial max-stream-data for peer local streams */
+		uint64_t msd_bidi_r; /* initial max-stream-data for peer remote streams */
 	} rfctl;
 
 	struct {
 		uint64_t max_data; /* Maximum number of bytes which may be received */
 	} rx;
 	struct {
-		uint64_t max_data; /* Maximum number of bytes which may be sent */
+		uint64_t sent_offsets; /* sum of all offset sent */
 	} tx;
 
 	struct eb_root streams_by_id; /* all active streams by their ID */
@@ -74,10 +78,11 @@ struct qcc {
 };
 
 #define QC_SF_NONE              0x00000000
-#define QC_SF_FIN_RECV          0x00000001  // last frame received for this stream
-#define QC_SF_FIN_STREAM        0x00000002  // FIN bit must be set for last frame of the stream
-#define QC_SF_BLK_MROOM         0x00000004  // app layer is blocked waiting for room in the qcs.tx.buf
-#define QC_SF_DETACH            0x00000008  // cs is detached but there is remaining data to send
+#define QC_SF_FIN_RECV          0x00000001  /* last frame received for this stream */
+#define QC_SF_FIN_STREAM        0x00000002  /* FIN bit must be set for last frame of the stream */
+#define QC_SF_BLK_MROOM         0x00000004  /* app layer is blocked waiting for room in the qcs.tx.buf */
+#define QC_SF_DETACH            0x00000008  /* cs is detached but there is remaining data to send */
+#define QC_SF_BLK_SFCTL         0x00000010  /* stream blocked due to stream flow control limit */
 
 struct qcs {
 	struct qcc *qcc;
@@ -97,6 +102,7 @@ struct qcs {
 		uint64_t ack_offset; /* last acked ordered byte offset */
 		struct buffer buf; /* transmit buffer before sending via xprt */
 		struct buffer xprt_buf; /* buffer for xprt sending, cleared on ACK. */
+		uint64_t msd; /* fctl bytes limit to respect on emission */
 	} tx;
 
 	struct eb64_node by_id; /* place in qcc's streams_by_id */

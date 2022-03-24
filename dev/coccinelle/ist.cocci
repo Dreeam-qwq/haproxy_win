@@ -3,9 +3,15 @@ struct ist i;
 expression p, l;
 @@
 
+(
+- i.ptr = p;
+- i.len = strlen(i.ptr);
++ i = ist(p);
+|
 - i.ptr = p;
 - i.len = l;
 + i = ist2(p, l);
+)
 
 @@
 @@

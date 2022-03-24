@@ -298,7 +298,19 @@ struct act_rule *new_act_rule(enum act_from from, const char *file, int linenum)
 	rule->from = from;
 	rule->conf.file = file ? strdup(file) : NULL;
 	rule->conf.line = linenum;
+	LIST_INIT(&rule->list);
 	return rule;
+}
+
+/* fees rule <rule> and its elements as well as the condition */
+void free_act_rule(struct act_rule *rule)
+{
+	LIST_DELETE(&rule->list);
+	free_acl_cond(rule->cond);
+	if (rule->release_ptr)
+		rule->release_ptr(rule);
+	free(rule->conf.file);
+	free(rule);
 }
 
 void free_act_rules(struct list *rules)
@@ -306,11 +318,6 @@ void free_act_rules(struct list *rules)
 	struct act_rule *rule, *ruleb;
 
 	list_for_each_entry_safe(rule, ruleb, rules, list) {
-		LIST_DELETE(&rule->list);
-		free_acl_cond(rule->cond);
-		if (rule->release_ptr)
-			rule->release_ptr(rule);
-		free(rule->conf.file);
-		free(rule);
+		free_act_rule(rule);
 	}
 }

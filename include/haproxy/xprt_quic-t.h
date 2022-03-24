@@ -225,6 +225,7 @@ enum quic_pkt_type {
 #define           QUIC_EV_CONN_XPRTRECV  (1ULL << 38)
 #define           QUIC_EV_CONN_FREED     (1ULL << 39)
 #define           QUIC_EV_CONN_CLOSE     (1ULL << 40)
+#define           QUIC_EV_CONN_ACKSTRM   (1ULL << 41)
 
 /* Similar to kernel min()/max() definitions. */
 #define QUIC_MIN(a, b) ({ \
@@ -387,9 +388,9 @@ struct quic_arngs {
 	size_t enc_sz;
 };
 
-/* Flag the packet number space as having received an ACK frame */
-#define QUIC_FL_PKTNS_ACK_RECEIVED_BIT 0
-#define QUIC_FL_PKTNS_ACK_RECEIVED  (1UL << QUIC_FL_PKTNS_ACK_RECEIVED_BIT)
+/* Flag the packet number space as having received a packet */
+#define QUIC_FL_PKTNS_PKT_RECEIVED_BIT 0
+#define QUIC_FL_PKTNS_PKT_RECEIVED  (1UL << QUIC_FL_PKTNS_PKT_RECEIVED_BIT)
 
 /* Flag the packet number space as requiring an ACK frame to be sent. */
 #define QUIC_FL_PKTNS_ACK_REQUIRED_BIT 1
@@ -405,8 +406,6 @@ struct quic_pktns {
 		struct list frms;
 		/* Next packet number to use for transmissions. */
 		int64_t next_pn;
-		/* Largest acked sent packet. */
-		int64_t largest_acked_pn;
 		/* The packet which has been sent. */
 		struct eb_root pkts;
 		/* The time the most recent ack-eliciting packer was sent. */
@@ -421,6 +420,8 @@ struct quic_pktns {
 	struct {
 		/* Largest packet number */
 		int64_t largest_pn;
+		/* Largest acked sent packet. */
+		int64_t largest_acked_pn;
 		struct quic_arngs arngs;
 	} rx;
 	unsigned int flags;
@@ -524,7 +525,7 @@ struct quic_tx_packet {
 	struct eb64_node pn_node;
 	/* The list of frames of this packet. */
 	struct list frms;
-	/* The time this packet was sent (usec). */
+	/* The time this packet was sent (ms). */
 	unsigned int time_sent;
 	/* Packet number spakce. */
 	struct quic_pktns *pktns;
@@ -534,6 +535,8 @@ struct quic_tx_packet {
 	int refcnt;
 	/* Next packet in the same datagram */
 	struct quic_tx_packet *next;
+	/* Largest acknowledged packet number if this packet contains an ACK frame */
+	int64_t largest_acked_pn;
 	unsigned char type;
 };
 

@@ -33,6 +33,11 @@ struct qcs *qcs_new(struct qcc *qcc, uint64_t id, enum qcs_type type)
 	eb64_insert(&qcc->streams_by_id, &qcs->by_id);
 	qcc->strms[type].nb_streams++;
 
+	/* If stream is local, use peer remote-limit, or else the opposite. */
+	/* TODO use uni limit for unidirectional streams */
+	qcs->tx.msd = quic_stream_is_local(qcc, id) ? qcc->rfctl.msd_bidi_r :
+	                                              qcc->rfctl.msd_bidi_l;
+
 	qcs->rx.buf = BUF_NULL;
 	qcs->rx.app_buf = BUF_NULL;
 	qcs->rx.offset = 0;
@@ -134,7 +139,7 @@ struct eb64_node *qcc_get_qcs(struct qcc *qcc, uint64_t id)
 
 		/* TODO also checks max-streams for uni streams */
 		if (quic_stream_is_bidi(id)) {
-			if (sub_id + 1 > qcc->lfctl.max_bidi_streams) {
+			if (sub_id + 1 > qcc->lfctl.ms_bidi) {
 				/* streams limit reached */
 				goto out;
 			}
@@ -197,7 +202,7 @@ int qcc_recv(struct qcc *qcc, uint64_t id, uint64_t len, uint64_t offset,
 
 	strm_node = qcc_get_qcs(qcc, id);
 	if (!strm_node) {
-		fprintf(stderr, "%s: stream not found\n", __func__);
+		fprintf(stderr, "%s: stream not found: %ld\n", __func__, id);
 		return 1;
 	}
 
@@ -248,6 +253,50 @@ int qcc_recv(struct qcc *qcc, uint64_t id, uint64_t len, uint64_t offset,
 	return 0;
 }
 
+/* Handle a new MAX_DATA frame. <max> must contains the maximum data field of
+ * the frame.
+ *
+ * Returns 0 on success else non-zero.
+ */
+int qcc_recv_max_data(struct qcc *qcc, uint64_t max)
+{
+	if (qcc->rfctl.md < max) {
+		qcc->rfctl.md = max;
+
+		if (qcc->flags & QC_CF_BLK_MFCTL) {
+			qcc->flags &= ~QC_CF_BLK_MFCTL;
+			tasklet_wakeup(qcc->wait_event.tasklet);
+		}
+	}
+	return 0;
+}
+
+/* Handle a new MAX_STREAM_DATA frame. <max> must contains the maximum data
+ * field of the frame and <id> is the identifier of the QUIC stream.
+ *
+ * Returns 0 on success else non-zero.
+ */
+int qcc_recv_max_stream_data(struct qcc *qcc, uint64_t id, uint64_t max)
+{
+	struct qcs *qcs;
+	struct eb64_node *node;
+
+	node = eb64_lookup(&qcc->streams_by_id, id);
+	if (node) {
+		qcs = eb64_entry(&node->node, struct qcs, by_id);
+		if (max > qcs->tx.msd) {
+			qcs->tx.msd = max;
+
+			if (qcs->flags & QC_SF_BLK_SFCTL) {
+				qcs->flags &= ~QC_SF_BLK_SFCTL;
+				tasklet_wakeup(qcc->wait_event.tasklet);
+			}
+		}
+	}
+
+	return 0;
+}
+
 /* Decode the content of STREAM frames already received on the stream instance
  * <qcs>.
  *
@@ -265,7 +314,7 @@ int qcc_decode_qcs(struct qcc *qcc, struct qcs *qcs)
 
 static int qc_is_max_streams_needed(struct qcc *qcc)
 {
-	return qcc->lfctl.closed_bidi_streams > qcc->lfctl.initial_max_bidi_streams / 2;
+	return qcc->lfctl.cl_bidi_r > qcc->lfctl.ms_bidi_init / 2;
 }
 
 /* detaches the QUIC stream from its QCC and releases it to the QCS pool. */
@@ -277,7 +326,7 @@ static void qcs_destroy(struct qcs *qcs)
 
 	if (quic_stream_is_remote(qcs->qcc, id)) {
 		if (quic_stream_is_bidi(id)) {
-			++qcs->qcc->lfctl.closed_bidi_streams;
+			++qcs->qcc->lfctl.cl_bidi_r;
 			if (qc_is_max_streams_needed(qcs->qcc))
 				tasklet_wakeup(qcs->qcc->wait_event.tasklet);
 		}
@@ -351,10 +400,23 @@ static void qc_release(struct qcc *qcc)
 	}
 }
 
+/* Prepare a STREAM frame for <qcs> instance. First, transfer data from
+ * <payload> to <out> buffer. The STREAM frame payload points to the <out>
+ * buffer. The frame is then pushed to <frm_list>. If <fin> is set, and the
+ * <payload> buf is emptied after transfer, FIN bit is set on the STREAM frame.
+ * Transfer is automatically adjusted to not exceed the stream flow-control
+ * limit. <max_data> must contains the current sum offsets for the connection.
+ * This is useful to not exceed the connection flow-control limit when using
+ * repeatdly this function on multiple streams before passing the data to the
+ * lower layer.
+ *
+ * Returns the total bytes of newly transferred data or a negative error code.
+ */
 static int qcs_push_frame(struct qcs *qcs, struct buffer *out,
                           struct buffer *payload, int fin,
-                          struct list *frm_list)
+                          struct list *frm_list, uint64_t max_data)
 {
+	struct qcc *qcc = qcs->qcc;
 	struct quic_frame *frm;
 	int head, left, to_xfer;
 	int total = 0;
@@ -367,9 +429,9 @@ static int qcs_push_frame(struct qcs *qcs, struct buffer *out,
 	 * QCS out buffer diagram
 	 *             head           left    to_xfer
 	 *         -------------> ----------> ----->
-	 * ==================================================
+	 * --------------------------------------------------
 	 *       |...............|xxxxxxxxxxx|<<<<<
-	 * ==================================================
+	 * --------------------------------------------------
 	 *       ^ ack-off       ^ sent-off  ^ off
 	 *
 	 * STREAM frame
@@ -383,6 +445,17 @@ static int qcs_push_frame(struct qcs *qcs, struct buffer *out,
 	head = qcs->tx.sent_offset - qcs->tx.ack_offset;
 	left = qcs->tx.offset - qcs->tx.sent_offset;
 	to_xfer = QUIC_MIN(b_data(payload), b_room(out));
+
+	BUG_ON_HOT(qcs->tx.offset > qcs->tx.msd);
+	/* do not exceed flow control limit */
+	if (qcs->tx.offset + to_xfer > qcs->tx.msd)
+		to_xfer = qcs->tx.msd - qcs->tx.offset;
+
+	BUG_ON_HOT(max_data > qcc->rfctl.md);
+	/* do not overcome flow control limit on connection */
+	if (max_data + to_xfer > qcc->rfctl.md)
+		to_xfer = qcc->rfctl.md - max_data;
+
 	if (!left && !to_xfer)
 		goto out;
 
@@ -429,7 +502,8 @@ static int qcs_push_frame(struct qcs *qcs, struct buffer *out,
  */
 void qcc_streams_sent_done(struct qcs *qcs, uint64_t data, uint64_t offset)
 {
-	uint64_t diff = data;
+	struct qcc *qcc = qcs->qcc;
+	uint64_t diff;
 
 	BUG_ON(offset > qcs->tx.sent_offset);
 
@@ -441,8 +515,17 @@ void qcc_streams_sent_done(struct qcs *qcs, uint64_t data, uint64_t offset)
 
 	diff = offset + data - qcs->tx.sent_offset;
 
+	/* increase offset sum on connection */
+	qcc->tx.sent_offsets += diff;
+	BUG_ON_HOT(qcc->tx.sent_offsets > qcc->rfctl.md);
+	if (qcc->tx.sent_offsets == qcc->rfctl.md)
+		qcc->flags |= QC_CF_BLK_MFCTL;
+
 	/* increase offset on stream */
 	qcs->tx.sent_offset += diff;
+	BUG_ON_HOT(qcs->tx.sent_offset > qcs->tx.msd);
+	if (qcs->tx.sent_offset == qcs->tx.msd)
+		qcs->flags |= QC_SF_BLK_SFCTL;
 }
 
 /* Wrapper for send on transport layer. Send a list of frames <frms> for the
@@ -467,6 +550,9 @@ static int qc_send_frames(struct qcc *qcc, struct list *frms)
 	struct quic_frame *first_frm;
 	uint64_t first_offset = 0;
 	char first_stream_frame_type;
+
+	if (LIST_ISEMPTY(frms))
+		return 0;
 
  retry_send:
 	first_frm = LIST_ELEM(frms->n, struct quic_frame *, list);
@@ -510,13 +596,21 @@ static int qc_send_frames(struct qcc *qcc, struct list *frms)
 	return 0;
 }
 
+/* Proceed to sending. Loop through all available streams for the <qcc>
+ * instance and try to send as much as possible.
+ *
+ * Returns the total of bytes sent to the transport layer.
+ */
 static int qc_send(struct qcc *qcc)
 {
 	struct list frms = LIST_HEAD_INIT(frms);
 	struct eb64_node *node;
-	int ret = 0;
+	int total = 0;
 
 	fprintf(stderr, "%s\n", __func__);
+
+	if (qcc->flags & QC_CF_BLK_MFCTL)
+		return 0;
 
 	/* loop through all streams, construct STREAM frames if data available.
 	 * TODO optimize the loop to favor streams which are not too heavy.
@@ -537,9 +631,17 @@ static int qc_send(struct qcc *qcc)
 			continue;
 		}
 
+		if (qcs->flags & QC_SF_BLK_SFCTL) {
+			node = eb64_next(node);
+			continue;
+		}
+
 		if (b_data(buf) || b_data(out)) {
+			int ret;
 			char fin = qcs->flags & QC_SF_FIN_STREAM;
-			ret = qcs_push_frame(qcs, out, buf, fin, &frms);
+
+			ret = qcs_push_frame(qcs, out, buf, fin, &frms,
+			                     qcc->tx.sent_offsets + total);
 			BUG_ON(ret < 0); /* TODO handle this properly */
 
 			if (ret > 0) {
@@ -550,6 +652,7 @@ static int qc_send(struct qcc *qcc)
 
 			fprintf(stderr, "%s ret=%d\n", __func__, ret);
 			qcs->tx.offset += ret;
+			total += ret;
 
 			/* Subscribe if not all data can be send. */
 			if (b_data(buf)) {
@@ -561,9 +664,8 @@ static int qc_send(struct qcc *qcc)
 	}
 
 	qc_send_frames(qcc, &frms);
-	/* TODO adjust ret if not all frames are sent. */
 
-	return ret;
+	return total;
 }
 
 /* Release all streams that are already marked as detached. This is only done
@@ -611,8 +713,8 @@ static int qc_send_max_streams(struct qcc *qcc)
 	BUG_ON(!frm); /* TODO handle this properly */
 
 	frm->type = QUIC_FT_MAX_STREAMS_BIDI;
-	frm->max_streams_bidi.max_streams = qcc->lfctl.max_bidi_streams +
-	                                    qcc->lfctl.closed_bidi_streams;
+	frm->max_streams_bidi.max_streams = qcc->lfctl.ms_bidi +
+	                                    qcc->lfctl.cl_bidi_r;
 	fprintf(stderr, "SET MAX_STREAMS %lu\n", frm->max_streams_bidi.max_streams);
 	LIST_APPEND(&frms, &frm->list);
 
@@ -620,8 +722,8 @@ static int qc_send_max_streams(struct qcc *qcc)
 		return 1;
 
 	/* save the new limit if the frame has been send. */
-	qcc->lfctl.max_bidi_streams += qcc->lfctl.closed_bidi_streams;
-	qcc->lfctl.closed_bidi_streams = 0;
+	qcc->lfctl.ms_bidi += qcc->lfctl.cl_bidi_r;
+	qcc->lfctl.cl_bidi_r = 0;
 
 	return 0;
 }
@@ -686,7 +788,7 @@ static int qc_init(struct connection *conn, struct proxy *prx,
                    struct session *sess, struct buffer *input)
 {
 	struct qcc *qcc;
-	struct quic_transport_params *lparams;
+	struct quic_transport_params *lparams, *rparams;
 
 	qcc = pool_alloc(pool_head_qcc);
 	if (!qcc)
@@ -704,7 +806,7 @@ static int qc_init(struct connection *conn, struct proxy *prx,
 	lparams = &conn->qc->rx.params;
 
 	qcc->rx.max_data = lparams->initial_max_data;
-	qcc->tx.max_data = 0;
+	qcc->tx.sent_offsets = 0;
 
 	/* Client initiated streams must respect the server flow control. */
 	qcc->strms[QCS_CLT_BIDI].max_streams = lparams->initial_max_streams_bidi;
@@ -732,8 +834,13 @@ static int qc_init(struct connection *conn, struct proxy *prx,
 	qcc->strms[QCS_SRV_UNI].rx.max_data = lparams->initial_max_stream_data_uni;
 	qcc->strms[QCS_SRV_UNI].tx.max_data = 0;
 
-	qcc->lfctl.max_bidi_streams = qcc->lfctl.initial_max_bidi_streams = lparams->initial_max_streams_bidi;
-	qcc->lfctl.closed_bidi_streams = 0;
+	qcc->lfctl.ms_bidi = qcc->lfctl.ms_bidi_init = lparams->initial_max_streams_bidi;
+	qcc->lfctl.cl_bidi_r = 0;
+
+	rparams = &conn->qc->tx.params;
+	qcc->rfctl.md = rparams->initial_max_data;
+	qcc->rfctl.msd_bidi_l = rparams->initial_max_stream_data_bidi_local;
+	qcc->rfctl.msd_bidi_r = rparams->initial_max_stream_data_bidi_remote;
 
 	qcc->wait_event.tasklet = tasklet_new();
 	if (!qcc->wait_event.tasklet)
@@ -742,6 +849,7 @@ static int qc_init(struct connection *conn, struct proxy *prx,
 	qcc->subs = NULL;
 	qcc->wait_event.tasklet->process = qc_io_cb;
 	qcc->wait_event.tasklet->context = qcc;
+	qcc->wait_event.events = 0;
 
 	/* haproxy timeouts */
 	qcc->timeout = prx->timeout.client;
