@@ -33,8 +33,6 @@
 #include <haproxy/tools.h>
 #include <haproxy/xprt_quic.h>
 
-#define DEBUG_H3
-
 #if defined(DEBUG_H3)
 #define h3_debug_printf fprintf
 #define h3_debug_hexdump debug_hexdump
@@ -651,7 +649,7 @@ size_t h3_snd_buf(struct conn_stream *cs, struct buffer *buf, size_t count, int 
 	int32_t idx;
 	int ret;
 
-	fprintf(stderr, "%s\n", __func__);
+	h3_debug_printf(stderr, "%s\n", __func__);
 
 	htx = htx_from_buf(buf);
 
@@ -836,13 +834,14 @@ static int h3_uqs_init(struct h3_uqs *h3_uqs, struct h3 *h3,
 
 	h3_uqs->wait_event.tasklet->process = t;
 	h3_uqs->wait_event.tasklet->context = h3_uqs;
+	h3_uqs->wait_event.events = 0;
 	return 1;
 }
 
 static inline void h3_uqs_release(struct h3_uqs *h3_uqs)
 {
 	if (h3_uqs->qcs)
-		uni_qcs_free(h3_uqs->qcs);
+		qcs_free(h3_uqs->qcs);
 }
 
 static inline void h3_uqs_release_all(struct h3 *h3)
@@ -894,6 +893,15 @@ static int h3_init(struct qcc *qcc)
 	return 0;
 }
 
+static void h3_release(void *ctx)
+{
+	struct h3 *h3 = ctx;
+
+	h3_uqs_release_all(h3);
+	h3_uqs_tasklets_release(h3);
+	pool_free(pool_head_h3, h3);
+}
+
 /* HTTP/3 application layer operations */
 const struct qcc_app_ops h3_ops = {
 	.init        = h3_init,
@@ -901,4 +909,5 @@ const struct qcc_app_ops h3_ops = {
 	.decode_qcs  = h3_decode_qcs,
 	.snd_buf     = h3_snd_buf,
 	.finalize    = h3_finalize,
+	.release     = h3_release,
 };

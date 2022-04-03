@@ -130,27 +130,44 @@ flt_find_kw(const char *kw)
 /*
  * Dumps all registered "filter" keywords to the <out> string pointer. The
  * unsupported keywords are only dumped if their supported form was not found.
+ * If <out> is NULL, the output is emitted using a more compact format on stdout.
  */
 void
 flt_dump_kws(char **out)
 {
 	struct flt_kw_list *kwl;
+	const struct flt_kw *kwp, *kw;
+	const char *scope = NULL;
 	int index;
 
-	if (!out)
-		return;
+	if (out)
+		*out = NULL;
 
-	*out = NULL;
-	list_for_each_entry(kwl, &flt_keywords.list, list) {
-		for (index = 0; kwl->kw[index].kw != NULL; index++) {
-			if (kwl->kw[index].parse ||
-			    flt_find_kw(kwl->kw[index].kw) == &kwl->kw[index]) {
-				memprintf(out, "%s[%4s] %s%s\n", *out ? *out : "",
-				          kwl->scope,
-				          kwl->kw[index].kw,
-				          kwl->kw[index].parse ? "" : " (not supported)");
+	for (kw = kwp = NULL;; kwp = kw) {
+		list_for_each_entry(kwl, &flt_keywords.list, list) {
+			for (index = 0; kwl->kw[index].kw != NULL; index++) {
+				if ((kwl->kw[index].parse ||
+				     flt_find_kw(kwl->kw[index].kw) == &kwl->kw[index])
+				    && strordered(kwp ? kwp->kw : NULL,
+						  kwl->kw[index].kw,
+						  kw != kwp ? kw->kw : NULL)) {
+					kw = &kwl->kw[index];
+					scope = kwl->scope;
+				}
 			}
 		}
+
+		if (kw == kwp)
+			break;
+
+		if (out)
+			memprintf(out, "%s[%4s] %s%s\n", *out ? *out : "",
+				  scope,
+				  kw->kw,
+				  kw->parse ? "" : " (not supported)");
+		else
+			printf("%s [%s]\n",
+			       kw->kw, scope);
 	}
 }
 

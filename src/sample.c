@@ -327,6 +327,8 @@ static const char *fetch_ckp_names[SMP_CKP_ENTRIES] = {
 	[SMP_CKP_FE_HRS_BDY] = "frontend http-response body rule",
 	[SMP_CKP_FE_LOG_END] = "logs",
 	[SMP_CKP_BE_CHK_RUL] = "backend tcp-check rule",
+	[SMP_CKP_CFG_PARSER] = "configuration parser",
+	[SMP_CKP_CLI_PARSER] = "CLI parser",
 };
 
 /* This function returns the type of the data returned by the sample_expr.
@@ -430,6 +432,123 @@ struct sample_fetch *find_sample_fetch(const char *kw, int len)
 		}
 	}
 	return NULL;
+}
+
+/* dump list of registered sample fetch keywords on stdout */
+void smp_dump_fetch_kw(void)
+{
+	struct sample_fetch_kw_list *kwl;
+	struct sample_fetch *kwp, *kw;
+	uint64_t mask;
+	int index;
+	int arg;
+	int bit;
+
+	for (bit = 0; bit <= SMP_CKP_ENTRIES + 1; bit++) {
+		putchar('#');
+		for (index = 0; bit + index <= SMP_CKP_ENTRIES; index++)
+			putchar(' ');
+		for (index = 0; index < bit && index < SMP_CKP_ENTRIES; index++)
+			printf((bit <= SMP_CKP_ENTRIES) ? "/ " : " |");
+		for (index = bit; bit < SMP_CKP_ENTRIES && index < SMP_CKP_ENTRIES + 2; index++)
+			if (index == bit)
+				putchar('_');
+			else if (index == bit + 1)
+				putchar('.');
+			else
+				putchar('-');
+		printf(" %s\n", (bit < SMP_CKP_ENTRIES) ? fetch_ckp_names[bit] : "");
+	}
+
+	for (kw = kwp = NULL;; kwp = kw) {
+		list_for_each_entry(kwl, &sample_fetches.list, list) {
+			for (index = 0; kwl->kw[index].kw != NULL; index++) {
+				if (strordered(kwp ? kwp->kw : NULL,
+					       kwl->kw[index].kw,
+					       kw != kwp ? kw->kw : NULL))
+					kw = &kwl->kw[index];
+			}
+		}
+
+		if (kw == kwp)
+			break;
+
+		printf("[ ");
+		for (bit = 0; bit < SMP_CKP_ENTRIES; bit++)
+			printf("%s", (kw->val & (1 << bit)) ? "Y " : ". ");
+
+		printf("] %s", kw->kw);
+		if (kw->arg_mask) {
+			mask = kw->arg_mask >> ARGM_BITS;
+			printf("(");
+			for (arg = 0;
+			     arg < ARGM_NBARGS && ((mask >> (arg * ARGT_BITS)) & ARGT_MASK);
+			     arg++) {
+				if (arg == (kw->arg_mask & ARGM_MASK)) {
+					/* now dumping extra args */
+					printf("[");
+				}
+				if (arg)
+					printf(",");
+				printf("%s", arg_type_names[(mask >> (arg * ARGT_BITS)) & ARGT_MASK]);
+			}
+			if (arg > (kw->arg_mask & ARGM_MASK)) {
+				/* extra args were dumped */
+				printf("]");
+			}
+			printf(")");
+		}
+		printf(": %s", smp_to_type[kw->out_type]);
+		printf("\n");
+	}
+}
+
+/* dump list of registered sample converter keywords on stdout */
+void smp_dump_conv_kw(void)
+{
+	struct sample_conv_kw_list *kwl;
+	struct sample_conv *kwp, *kw;
+	uint64_t mask;
+	int index;
+	int arg;
+
+	for (kw = kwp = NULL;; kwp = kw) {
+		list_for_each_entry(kwl, &sample_convs.list, list) {
+			for (index = 0; kwl->kw[index].kw != NULL; index++) {
+				if (strordered(kwp ? kwp->kw : NULL,
+					       kwl->kw[index].kw,
+					       kw != kwp ? kw->kw : NULL))
+					kw = &kwl->kw[index];
+			}
+		}
+
+		if (kw == kwp)
+			break;
+
+		printf("%s", kw->kw);
+		if (kw->arg_mask) {
+			mask = kw->arg_mask >> ARGM_BITS;
+			printf("(");
+			for (arg = 0;
+			     arg < ARGM_NBARGS && ((mask >> (arg * ARGT_BITS)) & ARGT_MASK);
+			     arg++) {
+				if (arg == (kw->arg_mask & ARGM_MASK)) {
+					/* now dumping extra args */
+					printf("[");
+				}
+				if (arg)
+					printf(",");
+				printf("%s", arg_type_names[(mask >> (arg * ARGT_BITS)) & ARGT_MASK]);
+			}
+			if (arg > (kw->arg_mask & ARGM_MASK)) {
+				/* extra args were dumped */
+				printf("]");
+			}
+			printf(")");
+		}
+		printf(": %s => %s", smp_to_type[kw->out_type], smp_to_type[kw->in_type]);
+		printf("\n");
+	}
 }
 
 /* This function browses the list of available sample fetches. <current> is

@@ -4241,6 +4241,132 @@ void cfg_restore_sections(struct list *backup_sections)
 	}
 }
 
+/* dumps all registered keywords by section on stdout */
+void cfg_dump_registered_keywords()
+{
+	const char* sect_names[] = { "", "global", "listen", "userlist", "peers", 0 };
+	int section;
+	int index;
+
+	for (section = 1; sect_names[section]; section++) {
+		struct cfg_kw_list *kwl;
+		const struct cfg_keyword *kwp, *kwn;
+
+		printf("%s\n", sect_names[section]);
+
+		for (kwn = kwp = NULL;; kwp = kwn) {
+			list_for_each_entry(kwl, &cfg_keywords.list, list) {
+				for (index = 0; kwl->kw[index].kw != NULL; index++)
+					if (kwl->kw[index].section == section &&
+					    strordered(kwp ? kwp->kw : NULL, kwl->kw[index].kw, kwn != kwp ? kwn->kw : NULL))
+						kwn = &kwl->kw[index];
+			}
+			if (kwn == kwp)
+				break;
+			printf("\t%s\n", kwn->kw);
+		}
+
+		if (section == CFG_LISTEN) {
+			/* there are plenty of other keywords there */
+			extern struct list tcp_req_conn_keywords, tcp_req_sess_keywords,
+				tcp_req_cont_keywords, tcp_res_cont_keywords;
+			extern struct bind_kw_list bind_keywords;
+			extern struct ssl_bind_kw ssl_bind_kws[] __maybe_unused;
+			extern struct srv_kw_list srv_keywords;
+			struct bind_kw_list *bkwl;
+			struct srv_kw_list *skwl;
+			const struct bind_kw *bkwp, *bkwn;
+			const struct srv_kw *skwp, *skwn;
+			const struct ssl_bind_kw *sbkwp __maybe_unused, *sbkwn __maybe_unused;
+			const struct cfg_opt *coptp, *coptn;
+
+			for (bkwn = bkwp = NULL;; bkwp = bkwn) {
+				list_for_each_entry(bkwl, &bind_keywords.list, list) {
+					for (index = 0; bkwl->kw[index].kw != NULL; index++)
+						if (strordered(bkwp ? bkwp->kw : NULL,
+							       bkwl->kw[index].kw,
+							       bkwn != bkwp ? bkwn->kw : NULL))
+							bkwn = &bkwl->kw[index];
+				}
+				if (bkwn == bkwp)
+					break;
+
+				if (!bkwn->skip)
+					printf("\tbind <addr> %s\n", bkwn->kw);
+				else
+					printf("\tbind <addr> %s +%d\n", bkwn->kw, bkwn->skip);
+			}
+
+#if defined(USE_OPENSSL)
+			for (sbkwn = sbkwp = NULL;; sbkwp = sbkwn) {
+				for (index = 0; ssl_bind_kws[index].kw != NULL; index++) {
+					if (strordered(sbkwp ? sbkwp->kw : NULL,
+						       ssl_bind_kws[index].kw,
+						       sbkwn != sbkwp ? sbkwn->kw : NULL))
+						sbkwn = &ssl_bind_kws[index];
+				}
+				if (sbkwn == sbkwp)
+					break;
+				if (!sbkwn->skip)
+					printf("\tbind <addr> ssl %s\n", sbkwn->kw);
+				else
+					printf("\tbind <addr> ssl %s +%d\n", sbkwn->kw, sbkwn->skip);
+			}
+#endif
+
+			for (skwn = skwp = NULL;; skwp = skwn) {
+				list_for_each_entry(skwl, &srv_keywords.list, list) {
+					for (index = 0; skwl->kw[index].kw != NULL; index++)
+						if (strordered(skwp ? skwp->kw : NULL,
+							       skwl->kw[index].kw,
+							       skwn != skwp ? skwn->kw : NULL))
+							skwn = &skwl->kw[index];
+				}
+				if (skwn == skwp)
+					break;
+
+				if (!skwn->skip)
+					printf("\tserver <name> <addr> %s\n", skwn->kw);
+				else
+					printf("\tserver <name> <addr> %s +%d\n", skwn->kw, skwn->skip);
+			}
+
+			for (coptn = coptp = NULL;; coptp = coptn) {
+				for (index = 0; cfg_opts[index].name; index++)
+					if (strordered(coptp ? coptp->name : NULL,
+						       cfg_opts[index].name,
+						       coptn != coptp ? coptn->name : NULL))
+						coptn = &cfg_opts[index];
+
+				for (index = 0; cfg_opts2[index].name; index++)
+					if (strordered(coptp ? coptp->name : NULL,
+						       cfg_opts2[index].name,
+						       coptn != coptp ? coptn->name : NULL))
+						coptn = &cfg_opts2[index];
+				if (coptn == coptp)
+					break;
+
+				printf("\toption %s [ ", coptn->name);
+				if (coptn->cap & PR_CAP_FE)
+					printf("FE ");
+				if (coptn->cap & PR_CAP_BE)
+					printf("BE ");
+				if (coptn->mode == PR_MODE_HTTP)
+					printf("HTTP ");
+				printf("]\n");
+			}
+
+			dump_act_rules(&tcp_req_conn_keywords,        "\ttcp-request connection ");
+			dump_act_rules(&tcp_req_sess_keywords,        "\ttcp-request session ");
+			dump_act_rules(&tcp_req_cont_keywords,        "\ttcp-request content ");
+			dump_act_rules(&tcp_res_cont_keywords,        "\ttcp-response content ");
+			dump_act_rules(&http_req_keywords.list,       "\thttp-request ");
+			dump_act_rules(&http_res_keywords.list,       "\thttp-response ");
+			dump_act_rules(&http_after_res_keywords.list, "\thttp-after-response ");
+		}
+	}
+}
+
 /* these are the config sections handled by default */
 REGISTER_CONFIG_SECTION("listen",         cfg_parse_listen,    NULL);
 REGISTER_CONFIG_SECTION("frontend",       cfg_parse_listen,    NULL);

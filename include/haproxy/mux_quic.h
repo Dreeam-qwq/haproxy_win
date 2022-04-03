@@ -6,13 +6,15 @@
 #error "Must define USE_OPENSSL"
 #endif
 
+#include <import/eb64tree.h>
+
 #include <haproxy/api.h>
 #include <haproxy/connection.h>
 #include <haproxy/mux_quic-t.h>
 #include <haproxy/xprt_quic-t.h>
 
 struct qcs *qcs_new(struct qcc *qcc, uint64_t id, enum qcs_type type);
-void uni_qcs_free(struct qcs *qcs);
+void qcs_free(struct qcs *qcs);
 
 struct buffer *qc_get_buf(struct qcs *qcs, struct buffer *bptr);
 
@@ -68,7 +70,7 @@ static inline int quic_stream_is_bidi(uint64_t id)
 	return !quic_stream_is_uni(id);
 }
 
-struct eb64_node *qcc_get_qcs(struct qcc *qcc, uint64_t id);
+struct qcs *qcc_get_qcs(struct qcc *qcc, uint64_t id);
 
 /* Install the <app_ops> applicative layer of a QUIC connection on mux <qcc>.
  * Returns 0 on success else non-zero.
@@ -84,6 +86,22 @@ static inline int qcc_install_app_ops(struct qcc *qcc,
 		qcc->app_ops->finalize(qcc->ctx);
 
 	return 0;
+}
+
+/* Retrieve a qc_stream_desc from the MUX <qcc> with <id>. This function is
+ * useful for the transport layer.
+ *
+ * Returns the stream instance or NULL if not found.
+ */
+static inline struct qc_stream_desc *qcc_get_stream(struct qcc *qcc, uint64_t id)
+{
+	struct eb64_node *node;
+
+	node = eb64_lookup(&qcc->streams_by_id, id);
+	if (!node)
+		return NULL;
+
+	return eb64_entry(node, struct qc_stream_desc, by_id);
 }
 
 #endif /* USE_QUIC */

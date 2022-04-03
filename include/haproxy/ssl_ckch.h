@@ -42,7 +42,7 @@ struct ckch_store *ckchs_lookup(char *path);
 struct ckch_store *ckchs_dup(const struct ckch_store *src);
 struct ckch_store *ckch_store_new(const char *filename);
 void ckch_store_free(struct ckch_store *store);
-
+void ckch_store_replace(struct ckch_store *old_ckchs, struct ckch_store *new_ckchs);
 
 /* ckch_inst functions */
 void ckch_inst_free(struct ckch_inst *inst);
@@ -51,6 +51,8 @@ int ckch_inst_new_load_store(const char *path, struct ckch_store *ckchs, struct 
                              struct ssl_bind_conf *ssl_conf, char **sni_filter, int fcount, struct ckch_inst **ckchi, char **err);
 int ckch_inst_new_load_srv_store(const char *path, struct ckch_store *ckchs,
                                  struct ckch_inst **ckchi, char **err);
+int ckch_inst_rebuild(struct ckch_store *ckch_store, struct ckch_inst *ckchi,
+                      struct ckch_inst **new_inst, char **err);
 
 void ckch_deinit();
 void ckch_inst_add_cafile_link(struct ckch_inst *ckch_inst, struct bind_conf *bind_conf,
@@ -64,6 +66,8 @@ struct cafile_entry *ssl_store_create_cafile_entry(char *path, X509_STORE *store
 void ssl_store_delete_cafile_entry(struct cafile_entry *ca_e);
 int ssl_store_load_ca_from_buf(struct cafile_entry *ca_e, char *cert_buf);
 int ssl_store_load_locations_file(char *path, int create_if_none, enum cafile_type type);
+
+extern struct cert_exts cert_exts[];
 
 #endif /* USE_OPENSSL */
 #endif /* _HAPROXY_SSL_CRTLIST_H */

@@ -226,6 +226,7 @@ enum quic_pkt_type {
 #define           QUIC_EV_CONN_FREED     (1ULL << 39)
 #define           QUIC_EV_CONN_CLOSE     (1ULL << 40)
 #define           QUIC_EV_CONN_ACKSTRM   (1ULL << 41)
+#define           QUIC_EV_CONN_FRMLIST   (1ULL << 42)
 
 /* Similar to kernel min()/max() definitions. */
 #define QUIC_MIN(a, b) ({ \
@@ -389,12 +390,9 @@ struct quic_arngs {
 };
 
 /* Flag the packet number space as having received a packet */
-#define QUIC_FL_PKTNS_PKT_RECEIVED_BIT 0
-#define QUIC_FL_PKTNS_PKT_RECEIVED  (1UL << QUIC_FL_PKTNS_PKT_RECEIVED_BIT)
-
+#define QUIC_FL_PKTNS_PKT_RECEIVED  (1UL << 0)
 /* Flag the packet number space as requiring an ACK frame to be sent. */
-#define QUIC_FL_PKTNS_ACK_REQUIRED_BIT 1
-#define QUIC_FL_PKTNS_ACK_REQUIRED  (1UL << QUIC_FL_PKTNS_ACK_REQUIRED_BIT)
+#define QUIC_FL_PKTNS_ACK_REQUIRED  (1UL << 1)
 
 /* The maximum number of dgrams which may be sent upon PTO expirations. */
 #define QUIC_MAX_NB_PTO_DGRAMS         2
@@ -423,6 +421,7 @@ struct quic_pktns {
 		/* Largest acked sent packet. */
 		int64_t largest_acked_pn;
 		struct quic_arngs arngs;
+		unsigned int nb_aepkts_since_last_ack;
 	} rx;
 	unsigned int flags;
 };
@@ -446,6 +445,10 @@ struct quic_dgram {
 /* Default QUIC connection transport parameters */
 extern struct quic_transport_params quic_dflt_transport_params;
 
+/* Maximum number of ack-eliciting received packets since the last
+ * ACK frame was sent
+ */
+#define QUIC_MAX_RX_AEPKTS_SINCE_LAST_ACK       2
 /* Flag a received packet as being an ack-eliciting packet. */
 #define QUIC_FL_RX_PACKET_ACK_ELICITING (1UL << 0)
 
@@ -511,6 +514,8 @@ struct quic_rx_strm_frm {
 #define QUIC_FL_TX_PACKET_PADDING       (1UL << 1)
 /* Flag a sent packet as being in flight. */
 #define QUIC_FL_TX_PACKET_IN_FLIGHT     (QUIC_FL_TX_PACKET_ACK_ELICITING | QUIC_FL_TX_PACKET_PADDING)
+/* Flag a sent packet as containg an ACK frame */
+#define QUIC_FL_TX_PACKET_ACK           (1UL << 2)
 
 /* Structure to store enough information about TX QUIC packets. */
 struct quic_tx_packet {
@@ -651,19 +656,13 @@ enum qc_mux_state {
 #define QUIC_CONN_TX_BUF_SZ  QUIC_PACKET_MAXLEN
 
 /* Flags at connection level */
-#define QUIC_FL_CONN_ANTI_AMPLIFICATION_REACHED_BIT 0
-#define QUIC_FL_CONN_ANTI_AMPLIFICATION_REACHED \
-	(1U << QUIC_FL_CONN_ANTI_AMPLIFICATION_REACHED_BIT)
-
-#define QUIC_FL_CONN_IO_CB_WAKEUP_BIT               1
-#define QUIC_FL_CONN_IO_CB_WAKEUP (1U << QUIC_FL_CONN_IO_CB_WAKEUP_BIT)
-
-#define QUIC_FL_POST_HANDSHAKE_FRAMES_BUILT     (1U << 2)
-#define QUIC_FL_CONN_LISTENER                   (1U << 3)
-#define QUIC_FL_ACCEPT_REGISTERED_BIT                  4
-#define QUIC_FL_ACCEPT_REGISTERED               (1U << QUIC_FL_ACCEPT_REGISTERED_BIT)
+#define QUIC_FL_CONN_ANTI_AMPLIFICATION_REACHED  (1U << 0)
+#define QUIC_FL_CONN_IO_CB_WAKEUP                (1U << 1)
+#define QUIC_FL_CONN_POST_HANDSHAKE_FRAMES_BUILT (1U << 2)
+#define QUIC_FL_CONN_LISTENER                    (1U << 3)
+#define QUIC_FL_CONN_ACCEPT_REGISTERED           (1U << 4)
 #define QUIC_FL_CONN_IDLE_TIMER_RESTARTED_AFTER_READ (1U << 6)
-#define QUIC_FL_CONN_IMMEDIATE_CLOSE            (1U << 31)
+#define QUIC_FL_CONN_IMMEDIATE_CLOSE             (1U << 31)
 struct quic_conn {
 	uint32_t version;
 	/* QUIC transport parameters TLS extension */
@@ -725,8 +724,6 @@ struct quic_conn {
 	struct {
 		/* Number of received bytes. */
 		uint64_t bytes;
-		/* Number of ack-eliciting received packets. */
-		size_t nb_ack_eliciting;
 		/* Transport parameters the peer will receive */
 		struct quic_transport_params params;
 		/* RX buffer */
@@ -745,6 +742,9 @@ struct quic_conn {
 
 	struct listener *li; /* only valid for frontend connections */
 	struct mt_list accept_list; /* chaining element used for accept, only valid for frontend connections */
+
+	struct eb_root streams_by_id; /* storage for released qc_stream_desc */
+
 	/* MUX */
 	struct qcc *qcc;
 	struct task *timer_task;
@@ -754,6 +754,27 @@ struct quic_conn {
 	unsigned int flags;
 
 	const struct qcc_app_ops *app_ops;
+};
+
+/* QUIC STREAM descriptor.
+ *
+ * This structure is the low-level counterpart of the QUIC STREAM at the MUX
+ * layer. It provides a node for tree-storage and buffering for Tx.
+ *
+ * Once the MUX has finished to transfer data on a STREAM, it must release its
+ * QUIC STREAM descriptor. The descriptor will be kept by the quic_conn until
+ * all acknowledgement has been received.
+ */
+struct qc_stream_desc {
+	struct eb64_node by_id; /* id of the stream used for <streams_by_id> tree */
+
+	struct buffer buf; /* buffer for STREAM data on Tx, emptied on acknowledge */
+	uint64_t ack_offset; /* last acknowledged offset */
+	struct eb_root acked_frms; /* ACK frames tree for non-contiguous ACK ranges */
+
+	int release; /* set to 1 when the MUX has finished to use this stream */
+
+	void *ctx; /* MUX specific context */
 };
 
 #endif /* USE_QUIC */

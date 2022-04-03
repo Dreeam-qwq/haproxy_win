@@ -121,6 +121,7 @@ static const struct trace_event quic_trace_events[] = {
 	{ .mask = QUIC_EV_CONN_FREED,    .name = "conn_freed",       .desc = "releasing conn. memory" },
 	{ .mask = QUIC_EV_CONN_CLOSE,    .name = "conn_close",       .desc = "closing conn." },
 	{ .mask = QUIC_EV_CONN_ACKSTRM,  .name = "ack_strm",         .desc = "STREAM ack."},
+	{ .mask = QUIC_EV_CONN_FRMLIST,  .name = "frm_list",         .desc = "frame list"},
 	{ /* end */ }
 };
 
@@ -169,11 +170,12 @@ DECLARE_POOL(pool_head_quic_rx_strm_frm, "quic_rx_strm_frm", sizeof(struct quic_
 DECLARE_STATIC_POOL(pool_head_quic_crypto_buf, "quic_crypto_buf_pool", sizeof(struct quic_crypto_buf));
 DECLARE_POOL(pool_head_quic_frame, "quic_frame_pool", sizeof(struct quic_frame));
 DECLARE_STATIC_POOL(pool_head_quic_arng, "quic_arng_pool", sizeof(struct quic_arng_node));
+DECLARE_STATIC_POOL(pool_head_quic_conn_stream, "qc_stream_desc", sizeof(struct qc_stream_desc));
 
 static struct quic_tx_packet *qc_build_pkt(unsigned char **pos, const unsigned char *buf_end,
                                            struct quic_enc_level *qel, struct list *frms,
                                            struct quic_conn *qc, size_t dglen, int pkt_type,
-                                           int padding, int ack, int probe, int cc, int *err);
+                                           int padding, int probe, int cc, int *err);
 static struct task *quic_conn_app_io_cb(struct task *t, void *context, unsigned int state);
 static void qc_idle_timer_rearm(struct quic_conn *qc, int read);
 
@@ -283,6 +285,16 @@ static void quic_trace(enum trace_level level, uint64_t mask, const struct trace
 					quic_tls_keys_hexdump(&trace_buf, &tls_ctx->tx);
 			}
 
+		}
+
+		if (mask & QUIC_EV_CONN_FRMLIST) {
+			const struct list *l = a2;
+
+			if (l) {
+				const struct quic_frame *frm;
+				list_for_each_entry(frm, l, list)
+					chunk_frm_appendf(&trace_buf, frm);
+			}
 		}
 
 		if (mask & (QUIC_EV_CONN_HPKT|QUIC_EV_CONN_PAPKT)) {
@@ -396,8 +408,8 @@ static void quic_trace(enum trace_level level, uint64_t mask, const struct trace
 				chunk_appendf(&trace_buf,
 				              " qel=%c state=%s ack?%d cwnd=%llu ppif=%lld pif=%llu if=%llu pp=%u",
 				              quic_enc_level_char_from_qel(qel, qc),
-				              quic_hdshk_state_str(HA_ATOMIC_LOAD(&qc->state)),
-				              !!(HA_ATOMIC_LOAD(&qel->pktns->flags) & QUIC_FL_PKTNS_ACK_REQUIRED),
+				              quic_hdshk_state_str(qc->state),
+				              !!(qel->pktns->flags & QUIC_FL_PKTNS_ACK_REQUIRED),
 				              (unsigned long long)qc->path->cwnd,
 				              (unsigned long long)qc->path->prep_in_flight,
 				              (unsigned long long)qc->path->in_flight,
@@ -446,12 +458,12 @@ static void quic_trace(enum trace_level level, uint64_t mask, const struct trace
 
 		if (mask & QUIC_EV_CONN_ACKSTRM) {
 			const struct quic_stream *s = a2;
-			const struct qcs *qcs = a3;
+			const struct qc_stream_desc *stream = a3;
 
 			if (s)
 				chunk_appendf(&trace_buf, " off=%llu len=%llu", (ull)s->offset.key, (ull)s->len);
-			if (qcs)
-				chunk_appendf(&trace_buf, " ack_offset=%llu", (ull)qcs->tx.ack_offset);
+			if (stream)
+				chunk_appendf(&trace_buf, " ack_offset=%llu", (ull)stream->ack_offset);
 		}
 
 		if (mask & QUIC_EV_CONN_RTTUPDT) {
@@ -528,7 +540,7 @@ static void quic_trace(enum trace_level level, uint64_t mask, const struct trace
 				}
 			}
 
-			if (!(mask & QUIC_EV_CONN_SPTO) && qc->timer_task) {
+			if (!(mask & (QUIC_EV_CONN_SPTO|QUIC_EV_CONN_PTIMER)) && qc->timer_task) {
 				chunk_appendf(&trace_buf,
 				              " expire=%dms", TICKS_TO_MS(qc->timer - now_ms));
 			}
@@ -608,9 +620,9 @@ static inline int quic_peer_validated_addr(struct quic_conn *qc)
 
 	hdshk_pktns = qc->els[QUIC_TLS_ENC_LEVEL_HANDSHAKE].pktns;
 	app_pktns = qc->els[QUIC_TLS_ENC_LEVEL_APP].pktns;
-	if ((HA_ATOMIC_LOAD(&hdshk_pktns->flags) & QUIC_FL_PKTNS_PKT_RECEIVED) ||
-	    (HA_ATOMIC_LOAD(&app_pktns->flags) & QUIC_FL_PKTNS_PKT_RECEIVED) ||
-	    HA_ATOMIC_LOAD(&qc->state) >= QUIC_HS_ST_COMPLETE)
+	if ((hdshk_pktns->flags & QUIC_FL_PKTNS_PKT_RECEIVED) ||
+	    (app_pktns->flags & QUIC_FL_PKTNS_PKT_RECEIVED) ||
+	    qc->state >= QUIC_HS_ST_COMPLETE)
 		return 1;
 
 	return 0;
@@ -638,7 +650,7 @@ static inline void qc_set_timer(struct quic_conn *qc)
 	 * cancelled for a server which reached the anti-amplification limit.
 	 */
 	if (!quic_peer_validated_addr(qc) &&
-	    (HA_ATOMIC_LOAD(&qc->flags) & QUIC_FL_CONN_ANTI_AMPLIFICATION_REACHED)) {
+	    (qc->flags & QUIC_FL_CONN_ANTI_AMPLIFICATION_REACHED)) {
 		TRACE_PROTO("anti-amplification reached", QUIC_EV_CONN_STIMER, qc);
 		qc->timer = TICK_ETERNITY;
 		goto out;
@@ -651,7 +663,7 @@ static inline void qc_set_timer(struct quic_conn *qc)
 		goto out;
 	}
 
-	handshake_complete = HA_ATOMIC_LOAD(&qc->state) >= QUIC_HS_ST_COMPLETE;
+	handshake_complete = qc->state >= QUIC_HS_ST_COMPLETE;
 	pktns = quic_pto_pktns(qc, handshake_complete, &pto);
 	if (tick_isset(pto))
 		qc->timer = pto;
@@ -772,9 +784,9 @@ int ha_quic_set_encryption_secrets(SSL *ssl, enum ssl_encryption_level_t level,
 
 	TRACE_ENTER(QUIC_EV_CONN_RWSEC, qc);
 	BUG_ON(secret_len > QUIC_TLS_SECRET_LEN);
-	if (HA_ATOMIC_LOAD(&qc->flags) & QUIC_FL_CONN_IMMEDIATE_CLOSE) {
+	if (qc->flags & QUIC_FL_CONN_IMMEDIATE_CLOSE) {
 		TRACE_PROTO("CC required", QUIC_EV_CONN_RWSEC, qc);
-		goto out;
+		goto no_secret;
 	}
 
 	if (!quic_tls_ctx_keys_alloc(tls_ctx)) {
@@ -818,6 +830,7 @@ int ha_quic_set_encryption_secrets(SSL *ssl, enum ssl_encryption_level_t level,
 		struct quic_tls_kp *nxt_rx = &qc->ku.nxt_rx;
 		struct quic_tls_kp *nxt_tx = &qc->ku.nxt_tx;
 
+		/* These secrets must be stored only for Application encryption level */
 		if (!(rx->secret = pool_alloc(pool_head_quic_tls_secret)) ||
 		    !(tx->secret = pool_alloc(pool_head_quic_tls_secret))) {
 			TRACE_DEVEL("Could not allocate secrete keys", QUIC_EV_CONN_RWSEC, qc);
@@ -837,6 +850,7 @@ int ha_quic_set_encryption_secrets(SSL *ssl, enum ssl_encryption_level_t level,
 
  out:
 	tls_ctx->flags |= QUIC_FL_TLS_SECRETS_SET;
+ no_secret:
 	TRACE_LEAVE(QUIC_EV_CONN_RWSEC, qc, &level);
 	return 1;
 
@@ -858,7 +872,7 @@ int ha_set_rsec(SSL *ssl, enum ssl_encryption_level_t level,
 		&qc->els[ssl_to_quic_enc_level(level)].tls_ctx;
 
 	TRACE_ENTER(QUIC_EV_CONN_RSEC, qc);
-	if (HA_ATOMIC_LOAD(&qc->flags) & QUIC_FL_CONN_IMMEDIATE_CLOSE) {
+	if (qc->flags & QUIC_FL_CONN_IMMEDIATE_CLOSE) {
 		TRACE_PROTO("CC required", QUIC_EV_CONN_RSEC, qc);
 		goto out;
 	}
@@ -914,7 +928,7 @@ int ha_set_wsec(SSL *ssl, enum ssl_encryption_level_t level,
 	struct quic_tls_ctx *tls_ctx = &qc->els[ssl_to_quic_enc_level(level)].tls_ctx;
 
 	TRACE_ENTER(QUIC_EV_CONN_WSEC, qc);
-	if (HA_ATOMIC_LOAD(&qc->flags) & QUIC_FL_CONN_IMMEDIATE_CLOSE) {
+	if (qc->flags & QUIC_FL_CONN_IMMEDIATE_CLOSE) {
 		TRACE_PROTO("CC required", QUIC_EV_CONN_WSEC, qc);
 		goto out;
 	}
@@ -1043,8 +1057,8 @@ static int quic_crypto_data_cpy(struct quic_enc_level *qel,
 /* Set <alert> TLS alert as QUIC CRYPTO_ERROR error */
 void quic_set_tls_alert(struct quic_conn *qc, int alert)
 {
-	HA_ATOMIC_STORE(&qc->err_code, QC_ERR_CRYPTO_ERROR | alert);
-	HA_ATOMIC_OR(&qc->flags, QUIC_FL_CONN_IMMEDIATE_CLOSE);
+	qc->err_code = QC_ERR_CRYPTO_ERROR | alert;
+	qc->flags |= QUIC_FL_CONN_IMMEDIATE_CLOSE;
 	TRACE_PROTO("Alert set", QUIC_EV_CONN_SSLDATA, qc);
 }
 
@@ -1076,7 +1090,7 @@ int ha_quic_add_handshake_data(SSL *ssl, enum ssl_encryption_level_t level,
 
 	qc = SSL_get_ex_data(ssl, ssl_qc_app_data_index);
 	TRACE_ENTER(QUIC_EV_CONN_ADDDATA, qc);
-	if (HA_ATOMIC_LOAD(&qc->flags) & QUIC_FL_CONN_IMMEDIATE_CLOSE) {
+	if (qc->flags & QUIC_FL_CONN_IMMEDIATE_CLOSE) {
 		TRACE_PROTO("CC required", QUIC_EV_CONN_ADDDATA, qc);
 		goto out;
 	}
@@ -1121,7 +1135,7 @@ int ha_quic_send_alert(SSL *ssl, enum ssl_encryption_level_t level, uint8_t aler
 
 	TRACE_DEVEL("SSL alert", QUIC_EV_CONN_SSLALERT, qc, &alert, &level);
 	quic_set_tls_alert(qc, alert);
-	HA_ATOMIC_STORE(&qc->flags, QUIC_FL_CONN_IMMEDIATE_CLOSE);
+	qc->flags |= QUIC_FL_CONN_IMMEDIATE_CLOSE;
 	return 1;
 }
 
@@ -1187,7 +1201,6 @@ int ssl_quic_initial_ctx(struct bind_conf *bind_conf)
 	SSL_CTX_set_mode(ctx, SSL_MODE_RELEASE_BUFFERS);
 	SSL_CTX_set_min_proto_version(ctx, TLS1_3_VERSION);
 	SSL_CTX_set_max_proto_version(ctx, TLS1_3_VERSION);
-	SSL_CTX_set_default_verify_paths(ctx);
 
 #ifdef SSL_CTRL_SET_TLSEXT_HOSTNAME
 #ifdef OPENSSL_IS_BORINGSSL
@@ -1399,37 +1412,56 @@ static int qc_pkt_decrypt(struct quic_rx_packet *pkt, struct quic_enc_level *qel
 	return 1;
 }
 
-/* Remove from <qcs> stream the acknowledged frames.
- * Never fails.
+/* Free the stream descriptor <stream> buffer. This function should be used
+ * when all its data have been acknowledged. If the stream was released by the
+ * upper layer, the stream descriptor will be freed.
+ *
+ * Returns 0 if the stream was not freed else non-zero.
  */
-static int qcs_try_to_consume(struct qcs *qcs)
+static int qc_stream_desc_free(struct qc_stream_desc *stream)
+{
+	b_free(&stream->buf);
+	offer_buffers(NULL, 1);
+
+	if (stream->release) {
+		eb64_delete(&stream->by_id);
+		pool_free(pool_head_quic_conn_stream, stream);
+
+		return 1;
+	}
+
+	return 0;
+}
+
+/* Remove from <stream> the acknowledged frames.
+ *
+ * Returns 1 if at least one frame was removed else 0.
+ */
+static int quic_stream_try_to_consume(struct quic_conn *qc,
+                                      struct qc_stream_desc *stream)
 {
 	int ret;
 	struct eb64_node *frm_node;
 
 	ret = 0;
-	frm_node = eb64_first(&qcs->tx.acked_frms);
+	frm_node = eb64_first(&stream->acked_frms);
 	while (frm_node) {
 		struct quic_stream *strm;
 		struct quic_frame *frm;
 
 		strm = eb64_entry(&frm_node->node, struct quic_stream, offset);
-		if (strm->offset.key > qcs->tx.ack_offset)
+		if (strm->offset.key > stream->ack_offset)
 			break;
 
 		TRACE_PROTO("stream consumed", QUIC_EV_CONN_ACKSTRM,
-		            qcs->qcc->conn->qc, strm, qcs);
-		if (strm->offset.key + strm->len > qcs->tx.ack_offset) {
+		            qc, strm, stream);
+
+		if (strm->offset.key + strm->len > stream->ack_offset) {
 			const size_t diff = strm->offset.key + strm->len -
-			                    qcs->tx.ack_offset;
-			qcs->tx.ack_offset += diff;
+			                    stream->ack_offset;
+			stream->ack_offset += diff;
 			b_del(strm->buf, diff);
 			ret = 1;
-
-			if (!b_data(strm->buf)) {
-				b_free(strm->buf);
-				offer_buffers(NULL, 1);
-			}
 		}
 
 		frm_node = eb64_next(frm_node);
@@ -1440,6 +1472,9 @@ static int qcs_try_to_consume(struct qcs *qcs)
 		quic_tx_packet_refdec(frm->pkt);
 		pool_free(pool_head_quic_frame, frm);
 	}
+
+	if (!b_data(&stream->buf))
+		qc_stream_desc_free(stream);
 
 	return ret;
 }
@@ -1455,35 +1490,63 @@ static inline void qc_treat_acked_tx_frm(struct quic_conn *qc,
 	switch (frm->type) {
 	case QUIC_FT_STREAM_8 ... QUIC_FT_STREAM_F:
 	{
-		struct qcs *qcs = frm->stream.qcs;
-		struct quic_stream *strm = &frm->stream;
+		struct quic_stream *strm_frm = &frm->stream;
+		struct eb64_node *node = NULL;
+		struct qc_stream_desc *stream = NULL;
 
-		TRACE_PROTO("acked stream", QUIC_EV_CONN_ACKSTRM, qc, strm, qcs);
-		if (strm->offset.key <= qcs->tx.ack_offset) {
-			if (strm->offset.key + strm->len > qcs->tx.ack_offset) {
-				const size_t diff = strm->offset.key + strm->len -
-				                    qcs->tx.ack_offset;
-				qcs->tx.ack_offset += diff;
-				b_del(strm->buf, diff);
+		/* do not use strm_frm->stream as the qc_stream_desc instance
+		 * might be freed at this stage. Use the id to do a proper
+		 * lookup. First search in the MUX then in the released stream
+		 * list.
+		 *
+		 * TODO if lookup operation impact on the perf is noticeable,
+		 * implement a refcount on qc_stream_desc instances.
+		 */
+		if (qc->mux_state == QC_MUX_READY)
+			stream = qcc_get_stream(qc->qcc, strm_frm->id);
+		if (!stream) {
+			node = eb64_lookup(&qc->streams_by_id, strm_frm->id);
+			stream = eb64_entry(node, struct qc_stream_desc, by_id);
+		}
+
+		if (!stream) {
+			TRACE_PROTO("acked stream for released stream", QUIC_EV_CONN_ACKSTRM, qc, strm_frm);
+			LIST_DELETE(&frm->list);
+			quic_tx_packet_refdec(frm->pkt);
+			pool_free(pool_head_quic_frame, frm);
+
+			/* early return */
+			return;
+		}
+
+		TRACE_PROTO("acked stream", QUIC_EV_CONN_ACKSTRM, qc, strm_frm, stream);
+		if (strm_frm->offset.key <= stream->ack_offset) {
+			if (strm_frm->offset.key + strm_frm->len > stream->ack_offset) {
+				const size_t diff = strm_frm->offset.key + strm_frm->len -
+				                    stream->ack_offset;
+				stream->ack_offset += diff;
+				b_del(strm_frm->buf, diff);
 				stream_acked = 1;
 
-				if (!b_data(strm->buf)) {
-					b_free(strm->buf);
-					offer_buffers(NULL, 1);
+				if (!b_data(strm_frm->buf)) {
+					if (qc_stream_desc_free(stream)) {
+						/* early return */
+						return;
+					}
 				}
 			}
 
 			TRACE_PROTO("stream consumed", QUIC_EV_CONN_ACKSTRM,
-			            qcs->qcc->conn->qc, strm, qcs);
+			            qc, strm_frm, stream);
 			LIST_DELETE(&frm->list);
 			quic_tx_packet_refdec(frm->pkt);
 			pool_free(pool_head_quic_frame, frm);
 		}
 		else {
-			eb64_insert(&qcs->tx.acked_frms, &strm->offset);
+			eb64_insert(&stream->acked_frms, &strm_frm->offset);
 		}
 
-		stream_acked |= qcs_try_to_consume(qcs);
+		stream_acked |= quic_stream_try_to_consume(qc, stream);
 	}
 	break;
 	default:
@@ -1776,7 +1839,7 @@ static void qc_packet_loss_lookup(struct quic_pktns *pktns,
 		unsigned int loss_time_limit, time_sent;
 
 		pkt = eb64_entry(&node->node, struct quic_tx_packet, pn_node);
-		largest_acked_pn = HA_ATOMIC_LOAD(&pktns->rx.largest_acked_pn);
+		largest_acked_pn = pktns->rx.largest_acked_pn;
 		node = eb64_next(node);
 		if ((int64_t)pkt->pn_node.key > largest_acked_pn)
 			break;
@@ -1839,7 +1902,7 @@ static inline int qc_parse_ack_frm(struct quic_conn *qc,
 	largest_node = NULL;
 	time_sent = 0;
 
-	if ((int64_t)ack->largest_ack > HA_ATOMIC_LOAD(&qel->pktns->rx.largest_acked_pn)) {
+	if ((int64_t)ack->largest_ack > qel->pktns->rx.largest_acked_pn) {
 		largest_node = eb64_lookup(pkts, largest);
 		if (!largest_node) {
 			TRACE_DEVEL("Largest acked packet not found",
@@ -1891,7 +1954,7 @@ static inline int qc_parse_ack_frm(struct quic_conn *qc,
 
 	if (time_sent && (pkt_flags & QUIC_FL_TX_PACKET_ACK_ELICITING)) {
 		*rtt_sample = tick_remain(time_sent, now_ms);
-		HA_ATOMIC_STORE(&qel->pktns->rx.largest_acked_pn, ack->largest_ack);
+		qel->pktns->rx.largest_acked_pn = ack->largest_ack;
 	}
 
 	if (!LIST_ISEMPTY(&newly_acked_pkts)) {
@@ -1967,7 +2030,7 @@ static inline int qc_provide_cdata(struct quic_enc_level *el,
 	TRACE_PROTO("in order CRYPTO data",
 	            QUIC_EV_CONN_SSLDATA, qc, NULL, cf, ctx->ssl);
 
-	state = HA_ATOMIC_LOAD(&qc->state);
+	state = qc->state;
 	if (state < QUIC_HS_ST_COMPLETE) {
 		ssl_err = SSL_do_handshake(ctx->ssl);
 		if (ssl_err != 1) {
@@ -1989,12 +2052,12 @@ static inline int qc_provide_cdata(struct quic_enc_level *el,
 		/* I/O callback switch */
 		ctx->wait_event.tasklet->process = quic_conn_app_io_cb;
 		if (qc_is_listener(ctx->qc)) {
-			HA_ATOMIC_STORE(&qc->state, QUIC_HS_ST_CONFIRMED);
+			qc->state = QUIC_HS_ST_CONFIRMED;
 			/* The connection is ready to be accepted. */
 			quic_accept_push_qc(qc);
 		}
 		else {
-			HA_ATOMIC_STORE(&qc->state, QUIC_HS_ST_COMPLETE);
+			qc->state = QUIC_HS_ST_COMPLETE;
 		}
 	} else {
 		ssl_err = SSL_process_quic_post_handshake(ctx->ssl);
@@ -2109,7 +2172,7 @@ static int qc_handle_bidi_strm_frm(struct quic_rx_packet *pkt,
 		frm = eb64_entry(&frm_node->node,
 		                 struct quic_rx_strm_frm, offset_node);
 
-		ret = qcc_recv(qc->qcc, qcs->by_id.key, frm->len,
+		ret = qcc_recv(qc->qcc, qcs->id, frm->len,
 		               frm->offset_node.key, frm->fin,
 		               (char *)frm->data, &qcs);
 
@@ -2143,17 +2206,15 @@ static int qc_handle_uni_strm_frm(struct quic_rx_packet *pkt,
                                   struct quic_conn *qc)
 {
 	struct qcs *strm;
-	struct eb64_node *strm_node;
 	struct quic_rx_strm_frm *frm;
 	size_t strm_frm_len;
 
-	strm_node = qcc_get_qcs(qc->qcc, strm_frm->id);
-	if (!strm_node) {
+	strm = qcc_get_qcs(qc->qcc, strm_frm->id);
+	if (!strm) {
 		TRACE_PROTO("Stream not found", QUIC_EV_CONN_PSTRM, qc);
 		return 0;
 	}
 
-	strm = eb64_entry(&strm_node->node, struct qcs, by_id);
 	if (strm_frm->offset.key < strm->rx.offset) {
 		size_t diff;
 
@@ -2247,6 +2308,15 @@ static void qc_prep_fast_retrans(struct quic_enc_level *qel,
 	if (!pkt)
 		return;
 
+	/* When building a packet from another one, the field which may increase the
+	 * packet size is the packet number. And the maximum increase is 4 bytes.
+	 */
+	if (!quic_peer_validated_addr(qc) && qc_is_listener(qc) &&
+	    pkt->len + 4 > 3 * qc->rx.bytes - qc->tx.prep_bytes) {
+		TRACE_PROTO("anti-amplification limit would be reached", QUIC_EV_CONN_PRSAFRM, qc);
+		return;
+	}
+
 	qc_requeue_nacked_pkt_tx_frms(qc, &pkt->frms, &qel->pktns->tx.frms);
 }
 
@@ -2270,6 +2340,15 @@ static void qc_prep_hdshk_fast_retrans(struct quic_conn *qc)
 	struct quic_tx_packet *pkt;
 	struct list *tmp = &itmp;
 
+	/* Do not probe from a packet number space if some probing
+	 * was already asked.
+	 */
+	if (qel->pktns->tx.pto_probe) {
+		qel = hqel;
+		if (qel->pktns->tx.pto_probe)
+			return;
+	}
+
  start:
 	pkt = NULL;
 	pkts = &qel->pktns->tx.pkts;
@@ -2285,13 +2364,30 @@ static void qc_prep_hdshk_fast_retrans(struct quic_conn *qc)
 	if (!pkt)
 		goto end;
 
+	/* When building a packet from another one, the field which may increase the
+	 * packet size is the packet number. And the maximum increase is 4 bytes.
+	 */
+	if (!quic_peer_validated_addr(qc) && qc_is_listener(qc) &&
+	    pkt->len + 4 > 3 * qc->rx.bytes - qc->tx.prep_bytes) {
+		TRACE_PROTO("anti-amplification limit would be reached", QUIC_EV_CONN_PRSAFRM, qc);
+		goto end;
+	}
+
 	qel->pktns->tx.pto_probe += 1;
  requeue:
 	list_for_each_entry_safe(frm, frmbak, &pkt->frms, list) {
+		struct quic_frame *dup_frm;
+
+
+		dup_frm = pool_alloc(pool_head_quic_frame);
+		if (!dup_frm) {
+			TRACE_PROTO("could not duplicate frame", QUIC_EV_CONN_PRSAFRM, qc, frm);
+			break;
+		}
+
 		TRACE_PROTO("to resend frame", QUIC_EV_CONN_PRSAFRM, qc, frm);
-		LIST_DELETE(&frm->list);
-		frm->pkt = NULL;
-		LIST_APPEND(tmp, &frm->list);
+		*dup_frm = *frm;
+		LIST_APPEND(tmp, &dup_frm->list);
 	}
 
 	if (qel == iqel) {
@@ -2351,7 +2447,7 @@ static int qc_parse_pkt_frms(struct quic_rx_packet *pkt, struct ssl_sock_ctx *ct
 				unsigned int ack_delay;
 
 				ack_delay = !quic_application_pktns(qel->pktns, qc) ? 0 :
-					HA_ATOMIC_LOAD(&qc->state) >= QUIC_HS_ST_CONFIRMED ?
+					qc->state >= QUIC_HS_ST_CONFIRMED ?
 					MS_TO_TICKS(QUIC_MIN(quic_ack_delay_ms(&frm.ack, qc), qc->max_ack_delay)) :
 					MS_TO_TICKS(quic_ack_delay_ms(&frm.ack, qc));
 				quic_loss_srtt_update(&qc->path->loss, rtt_sample, ack_delay, qc);
@@ -2490,7 +2586,7 @@ static int qc_parse_pkt_frms(struct quic_rx_packet *pkt, struct ssl_sock_ctx *ct
 			if (qc_is_listener(ctx->qc))
 				goto err;
 
-			HA_ATOMIC_STORE(&qc->state, QUIC_HS_ST_CONFIRMED);
+			qc->state = QUIC_HS_ST_CONFIRMED;
 			break;
 		default:
 			goto err;
@@ -2498,7 +2594,7 @@ static int qc_parse_pkt_frms(struct quic_rx_packet *pkt, struct ssl_sock_ctx *ct
 	}
 
 	/* Flag this packet number space as having received a packet. */
-	HA_ATOMIC_OR(&qel->pktns->flags, QUIC_FL_PKTNS_PKT_RECEIVED);
+	qel->pktns->flags |= QUIC_FL_PKTNS_PKT_RECEIVED;
 
 	if (fast_retrans)
 		qc_prep_hdshk_fast_retrans(qc);
@@ -2508,17 +2604,18 @@ static int qc_parse_pkt_frms(struct quic_rx_packet *pkt, struct ssl_sock_ctx *ct
 	 * be discarded.
 	 */
 	if (pkt->type == QUIC_PACKET_TYPE_HANDSHAKE && qc_is_listener(ctx->qc)) {
-	    int state = HA_ATOMIC_LOAD(&qc->state);
-
-	    if (state >= QUIC_HS_ST_SERVER_INITIAL) {
-		    quic_tls_discard_keys(&qc->els[QUIC_TLS_ENC_LEVEL_INITIAL]);
-		    TRACE_PROTO("discarding Initial pktns", QUIC_EV_CONN_PRSHPKT, qc);
-		    quic_pktns_discard(qc->els[QUIC_TLS_ENC_LEVEL_INITIAL].pktns, qc);
-		    qc_set_timer(ctx->qc);
-		    qc_el_rx_pkts_del(&qc->els[QUIC_TLS_ENC_LEVEL_INITIAL]);
-		    qc_release_pktns_frms(qc->els[QUIC_TLS_ENC_LEVEL_INITIAL].pktns);
-		    if (state < QUIC_HS_ST_SERVER_HANDSHAKE)
-			    HA_ATOMIC_STORE(&qc->state, QUIC_HS_ST_SERVER_HANDSHAKE);
+	    if (qc->state >= QUIC_HS_ST_SERVER_INITIAL) {
+			if (!(qc->els[QUIC_TLS_ENC_LEVEL_INITIAL].tls_ctx.flags &
+			      QUIC_FL_TLS_SECRETS_DCD)) {
+				quic_tls_discard_keys(&qc->els[QUIC_TLS_ENC_LEVEL_INITIAL]);
+				TRACE_PROTO("discarding Initial pktns", QUIC_EV_CONN_PRSHPKT, qc);
+				quic_pktns_discard(qc->els[QUIC_TLS_ENC_LEVEL_INITIAL].pktns, qc);
+				qc_set_timer(ctx->qc);
+				qc_el_rx_pkts_del(&qc->els[QUIC_TLS_ENC_LEVEL_INITIAL]);
+				qc_release_pktns_frms(qc->els[QUIC_TLS_ENC_LEVEL_INITIAL].pktns);
+			}
+		    if (qc->state < QUIC_HS_ST_SERVER_HANDSHAKE)
+			    qc->state = QUIC_HS_ST_SERVER_HANDSHAKE;
 	    }
 	}
 
@@ -2588,6 +2685,33 @@ static inline void qc_set_dg(struct cbuf *cbuf,
 	cb_add(cbuf, dglen + sizeof dglen + sizeof pkt);
 }
 
+/* Returns 1 if a packet may be built for <qc> from <qel> encryption level
+ * with <frms> as ack-eliciting frame list to send, 0 if not.
+ * <cc> must equal to 1 if an immediate close was asked, 0 if not.
+ * <probe> must equalt to 1 if a probing packet is required, 0 if not.
+ */
+static int qc_may_build_pkt(struct quic_conn *qc, struct list *frms,
+                            struct quic_enc_level *qel, int cc, int probe)
+{
+	unsigned int must_ack =
+		qel->pktns->rx.nb_aepkts_since_last_ack >= QUIC_MAX_RX_AEPKTS_SINCE_LAST_ACK;
+
+	/* Do not build any more packet if the TX secrets are not available or
+	 * if there is nothing to send, i.e. if no CONNECTION_CLOSE or ACK are required
+	 * and if there is no more packets to send upon PTO expiration
+	 * and if there is no more ack-eliciting frames to send or in flight
+	 * congestion control limit is reached for prepared data
+	 */
+	if (!(qel->tls_ctx.flags & QUIC_FL_TLS_SECRETS_SET) ||
+	    (!cc && !probe && !must_ack &&
+	     (LIST_ISEMPTY(frms) || qc->path->prep_in_flight >= qc->path->cwnd))) {
+		TRACE_DEVEL("nothing more to do", QUIC_EV_CONN_PHPKTS, qc);
+		return 0;
+	}
+
+	return 1;
+}
+
 /* Prepare as much as possible short packets which are also datagrams into <qr>
  * ring buffer for the QUIC connection with <ctx> as I/O handler context from
  * <frms> list of prebuilt frames.
@@ -2622,28 +2746,17 @@ static int qc_prep_app_pkts(struct quic_conn *qc, struct qring *qr,
 	 */
 	end_buf = pos + cb_contig_space(cbuf) - sizeof(uint16_t);
 	while (end_buf - pos >= (int)qc->path->mtu + dg_headlen) {
-		int err, probe, ack, cc;
+		int err, probe, cc;
 
 		TRACE_POINT(QUIC_EV_CONN_PHPKTS, qc, qel);
-		probe = ack = 0;
-		cc =  HA_ATOMIC_LOAD(&qc->flags) & QUIC_FL_CONN_IMMEDIATE_CLOSE;
-		if (!cc) {
+		probe = 0;
+		cc =  qc->flags & QUIC_FL_CONN_IMMEDIATE_CLOSE;
+		/* We do not probe if an immediate close was asked */
+		if (!cc)
 			probe = qel->pktns->tx.pto_probe;
-			ack = HA_ATOMIC_BTR(&qel->pktns->flags, QUIC_FL_PKTNS_ACK_REQUIRED_BIT);
-		}
-		/* Do not build any more packet if the TX secrets are not available or
-		 * if there is nothing to send, i.e. if no CONNECTION_CLOSE or ACK are required
-		 * and if there is no more packets to send upon PTO expiration
-		 * and if there is no more CRYPTO data available or in flight
-		 * congestion control limit is reached for prepared data
-		 */
-		if (!(qel->tls_ctx.flags & QUIC_FL_TLS_SECRETS_SET) ||
-		    (!cc && !ack && !probe &&
-		     (LIST_ISEMPTY(frms) ||
-		      qc->path->prep_in_flight >= qc->path->cwnd))) {
-			TRACE_DEVEL("nothing more to do", QUIC_EV_CONN_PHPKTS, qc);
+
+		if (!qc_may_build_pkt(qc, frms, qel, cc, probe))
 			break;
-		}
 
 		/* Leave room for the datagram header */
 		pos += dg_headlen;
@@ -2655,12 +2768,7 @@ static int qc_prep_app_pkts(struct quic_conn *qc, struct qring *qr,
 		}
 
 		pkt = qc_build_pkt(&pos, end, qel, frms, qc, 0, 0,
-		                   QUIC_PACKET_TYPE_SHORT, ack, probe, cc, &err);
-		/* Restore the PTO dgrams counter if a packet could not be built */
-		if (err < 0) {
-			if (ack)
-				HA_ATOMIC_BTS(&qel->pktns->flags, QUIC_FL_PKTNS_ACK_REQUIRED_BIT);
-		}
+		                   QUIC_PACKET_TYPE_SHORT, probe, cc, &err);
 		switch (err) {
 		case -2:
 			goto err;
@@ -2740,30 +2848,17 @@ static int qc_prep_pkts(struct quic_conn *qc, struct qring *qr,
 	end_buf = pos + cb_contig_space(cbuf) - sizeof dglen;
 	first_pkt = prv_pkt = NULL;
 	while (end_buf - pos >= (int)qc->path->mtu + dg_headlen || prv_pkt) {
-		int err, probe, ack, cc;
+		int err, probe, cc;
 		enum quic_pkt_type pkt_type;
 
 		TRACE_POINT(QUIC_EV_CONN_PHPKTS, qc, qel);
-		probe = ack = 0;
-		cc =  HA_ATOMIC_LOAD(&qc->flags) & QUIC_FL_CONN_IMMEDIATE_CLOSE;
-		if (!cc) {
+		probe = 0;
+		cc =  qc->flags & QUIC_FL_CONN_IMMEDIATE_CLOSE;
+		/* We do not probe if an immediate close was asked */
+		if (!cc)
 			probe = qel->pktns->tx.pto_probe;
-			ack = HA_ATOMIC_BTR(&qel->pktns->flags, QUIC_FL_PKTNS_ACK_REQUIRED_BIT);
-		}
-		/* Do not build any more packet if the TX secrets are not available or
-		 * if there is nothing to send, i.e. if no CONNECTION_CLOSE or ACK are required
-		 * and if there is no more packets to send upon PTO expiration
-		 * and if there is no more CRYPTO data available or in flight
-		 * congestion control limit is reached for prepared data
-		 */
-		if (!(qel->tls_ctx.flags & QUIC_FL_TLS_SECRETS_SET) ||
-		    (!cc && !ack && !probe &&
-		     (LIST_ISEMPTY(&qel->pktns->tx.frms) ||
-		      qc->path->prep_in_flight >= qc->path->cwnd))) {
-			TRACE_DEVEL("nothing more to do", QUIC_EV_CONN_PHPKTS, qc);
-			/* Set the current datagram as prepared into <cbuf> if
-			 * the was already a correct packet which was previously written.
-			 */
+
+		if (!qc_may_build_pkt(qc, &qel->pktns->tx.frms, qel, cc, probe)) {
 			if (prv_pkt)
 				qc_set_dg(cbuf, dglen, first_pkt);
 			/* Let's select the next encryption level */
@@ -2790,12 +2885,7 @@ static int qc_prep_pkts(struct quic_conn *qc, struct qring *qr,
 		}
 
 		cur_pkt = qc_build_pkt(&pos, end, qel, &qel->pktns->tx.frms,
-		                       qc, dglen, padding, pkt_type, ack, probe, cc, &err);
-		/* Restore the PTO dgrams counter if a packet could not be built */
-		if (err < 0) {
-			if (ack)
-				HA_ATOMIC_BTS(&qel->pktns->flags, QUIC_FL_PKTNS_ACK_REQUIRED_BIT);
-		}
+		                       qc, dglen, padding, pkt_type, probe, cc, &err);
 		switch (err) {
 		case -2:
 			goto err;
@@ -2827,7 +2917,7 @@ static int qc_prep_pkts(struct quic_conn *qc, struct qring *qr,
 		/* Client: discard the Initial encryption keys as soon as
 		 * a handshake packet could be built.
 		 */
-		if (HA_ATOMIC_LOAD(&qc->state) == QUIC_HS_ST_CLIENT_INITIAL &&
+		if (qc->state == QUIC_HS_ST_CLIENT_INITIAL &&
 		    pkt_type == QUIC_PACKET_TYPE_HANDSHAKE) {
 			quic_tls_discard_keys(&qc->els[QUIC_TLS_ENC_LEVEL_INITIAL]);
 			TRACE_PROTO("discarding Initial pktns", QUIC_EV_CONN_PHPKTS, qc);
@@ -2835,13 +2925,13 @@ static int qc_prep_pkts(struct quic_conn *qc, struct qring *qr,
 			qc_set_timer(qc);
 			qc_el_rx_pkts_del(&qc->els[QUIC_TLS_ENC_LEVEL_INITIAL]);
 			qc_release_pktns_frms(qc->els[QUIC_TLS_ENC_LEVEL_INITIAL].pktns);
-			HA_ATOMIC_STORE(&qc->state, QUIC_HS_ST_CLIENT_HANDSHAKE);
+			qc->state = QUIC_HS_ST_CLIENT_HANDSHAKE;
 		}
 		/* If the data for the current encryption level have all been sent,
 		 * select the next level.
 		 */
 		if ((tel == QUIC_TLS_ENC_LEVEL_INITIAL || tel == QUIC_TLS_ENC_LEVEL_HANDSHAKE) &&
-		    (LIST_ISEMPTY(&qel->pktns->tx.frms))) {
+		    (LIST_ISEMPTY(&qel->pktns->tx.frms) && !qel->pktns->tx.pto_probe)) {
 			/* If QUIC_TLS_ENC_LEVEL_HANDSHAKE was already reached let's try QUIC_TLS_ENC_LEVEL_APP */
 			if (tel == QUIC_TLS_ENC_LEVEL_HANDSHAKE && next_tel == tel)
 				next_tel = QUIC_TLS_ENC_LEVEL_APP;
@@ -3001,7 +3091,7 @@ static int quic_build_post_handshake_frames(struct quic_conn *qc)
 	}
 
 	LIST_SPLICE(&qel->pktns->tx.frms, &frm_list);
-	HA_ATOMIC_OR(&qc->flags, QUIC_FL_POST_HANDSHAKE_FRAMES_BUILT);
+	qc->flags |= QUIC_FL_CONN_POST_HANDSHAKE_FRAMES_BUILT;
 
     return 1;
 
@@ -3032,7 +3122,7 @@ static int quic_build_post_handshake_frames(struct quic_conn *qc)
 }
 
 /* Deallocate <l> list of ACK ranges. */
-void free_quic_arngs(struct quic_arngs *arngs)
+void quic_free_arngs(struct quic_arngs *arngs)
 {
 	struct eb64_node *n;
 	struct quic_arng_node *ar;
@@ -3240,8 +3330,7 @@ static inline void qc_rm_hp_pkts(struct quic_conn *qc, struct quic_enc_level *el
 	TRACE_ENTER(QUIC_EV_CONN_ELRMHP, qc);
 	app_qel = &qc->els[QUIC_TLS_ENC_LEVEL_APP];
 	/* A server must not process incoming 1-RTT packets before the handshake is complete. */
-	if (el == app_qel && qc_is_listener(qc) &&
-	    HA_ATOMIC_LOAD(&qc->state) < QUIC_HS_ST_COMPLETE) {
+	if (el == app_qel && qc_is_listener(qc) && qc->state < QUIC_HS_ST_COMPLETE) {
 		TRACE_PROTO("hp not removed (handshake not completed)",
 		            QUIC_EV_CONN_ELRMHP, qc);
 		goto out;
@@ -3345,9 +3434,9 @@ int qc_treat_rx_pkts(struct quic_enc_level *cur_el, struct quic_enc_level *next_
 			else {
 				struct quic_arng ar = { .first = pkt->pn, .last = pkt->pn };
 
-				if (pkt->flags & QUIC_FL_RX_PACKET_ACK_ELICITING) {
-					if (!(HA_ATOMIC_ADD_FETCH(&qc->rx.nb_ack_eliciting, 1) & 1) || force_ack)
-						HA_ATOMIC_BTS(&qel->pktns->flags, QUIC_FL_PKTNS_ACK_REQUIRED_BIT);
+				if (pkt->flags & QUIC_FL_RX_PACKET_ACK_ELICITING || force_ack) {
+					qel->pktns->flags |= QUIC_FL_PKTNS_ACK_REQUIRED;
+					qel->pktns->rx.nb_aepkts_since_last_ack++;
 					qc_idle_timer_rearm(qc, 1);
 				}
 				if (pkt->pn > largest_pn)
@@ -3365,8 +3454,8 @@ int qc_treat_rx_pkts(struct quic_enc_level *cur_el, struct quic_enc_level *next_
 	HA_RWLOCK_WRUNLOCK(QUIC_LOCK, &qel->rx.pkts_rwlock);
 
 	/* Update the largest packet number. */
-	if (largest_pn != -1)
-		HA_ATOMIC_UPDATE_MAX(&qel->pktns->rx.largest_pn, largest_pn);
+	if (largest_pn != -1 && largest_pn > qel->pktns->rx.largest_pn)
+		qel->pktns->rx.largest_pn = largest_pn;
 	if (!qc_treat_rx_crypto_frms(qel, ctx))
 		goto err;
 
@@ -3452,15 +3541,13 @@ static struct task *quic_conn_app_io_cb(struct task *t, void *context, unsigned 
 	struct ssl_sock_ctx *ctx;
 	struct quic_conn *qc;
 	struct quic_enc_level *qel;
-	int st;
 
 
 	ctx = context;
 	qc = ctx->qc;
 	qel = &qc->els[QUIC_TLS_ENC_LEVEL_APP];
-	st = HA_ATOMIC_LOAD(&qc->state);
 
-	TRACE_PROTO("state", QUIC_EV_CONN_IO_CB, qc, &st);
+	TRACE_PROTO("state", QUIC_EV_CONN_IO_CB, qc, &qc->state);
 
 	if (!MT_LIST_ISEMPTY(&qel->rx.pqpkts) && qc_qel_may_rm_hp(qc, qel))
 		qc_rm_hp_pkts(qc, qel);
@@ -3474,7 +3561,7 @@ static struct task *quic_conn_app_io_cb(struct task *t, void *context, unsigned 
 	return t;
 
  err:
-	TRACE_DEVEL("leaving in error", QUIC_EV_CONN_IO_CB, qc, &st);
+	TRACE_DEVEL("leaving in error", QUIC_EV_CONN_IO_CB, qc, &qc->state);
 	return t;
 }
 
@@ -3493,10 +3580,10 @@ struct task *quic_conn_io_cb(struct task *t, void *context, unsigned int state)
 	qc = ctx->qc;
 	TRACE_ENTER(QUIC_EV_CONN_IO_CB, qc);
 	qr = NULL;
-	st = HA_ATOMIC_LOAD(&qc->state);
+	st = qc->state;
 	TRACE_PROTO("state", QUIC_EV_CONN_IO_CB, qc, &st);
-	if (HA_ATOMIC_LOAD(&qc->flags) & QUIC_FL_CONN_IO_CB_WAKEUP) {
-		HA_ATOMIC_BTR(&qc->flags, QUIC_FL_CONN_IO_CB_WAKEUP_BIT);
+	if (qc->flags & QUIC_FL_CONN_IO_CB_WAKEUP) {
+		qc->flags &= ~QUIC_FL_CONN_IO_CB_WAKEUP;
 		/* The I/O handler has been woken up by the dgram listener
 		 * after the anti-amplification was reached.
 		 */
@@ -3539,9 +3626,9 @@ struct task *quic_conn_io_cb(struct task *t, void *context, unsigned int state)
 		goto next_level;
 	}
 
-	st = HA_ATOMIC_LOAD(&qc->state);
+	st = qc->state;
 	if (st >= QUIC_HS_ST_COMPLETE) {
-		if (!(HA_ATOMIC_LOAD(&qc->flags) & QUIC_FL_POST_HANDSHAKE_FRAMES_BUILT) &&
+		if (!(qc->flags & QUIC_FL_CONN_POST_HANDSHAKE_FRAMES_BUILT) &&
 		    !quic_build_post_handshake_frames(qc))
 			goto err;
 
@@ -3668,6 +3755,20 @@ static void quic_conn_release(struct quic_conn *qc)
 {
 	int i;
 	struct ssl_sock_ctx *conn_ctx;
+	struct eb64_node *node;
+	struct quic_tls_ctx *app_tls_ctx;
+
+	/* free remaining stream descriptors */
+	node = eb64_first(&qc->streams_by_id);
+	while (node) {
+		struct qc_stream_desc *stream;
+
+		stream = eb64_entry(node, struct qc_stream_desc, by_id);
+		node = eb64_next(node);
+
+		eb64_delete(&stream->by_id);
+		pool_free(pool_head_quic_conn_stream, stream);
+	}
 
 	if (qc->idle_timer_task) {
 		task_destroy(qc->idle_timer_task);
@@ -3684,15 +3785,27 @@ static void quic_conn_release(struct quic_conn *qc)
 	ebmb_delete(&qc->scid_node);
 	free_quic_conn_cids(qc);
 
-	conn_ctx = HA_ATOMIC_LOAD(&qc->xprt_ctx);
+	conn_ctx = qc->xprt_ctx;
 	if (conn_ctx) {
 		tasklet_free(conn_ctx->wait_event.tasklet);
 		SSL_free(conn_ctx->ssl);
 		pool_free(pool_head_quic_conn_ctx, conn_ctx);
 	}
 
-	for (i = 0; i < QUIC_TLS_ENC_LEVEL_MAX; i++)
+	quic_tls_ku_free(qc);
+	for (i = 0; i < QUIC_TLS_ENC_LEVEL_MAX; i++) {
+		quic_tls_ctx_secs_free(&qc->els[i].tls_ctx);
 		quic_conn_enc_level_uninit(&qc->els[i]);
+	}
+
+	app_tls_ctx = &qc->els[QUIC_TLS_ENC_LEVEL_APP].tls_ctx;
+	pool_free(pool_head_quic_tls_secret, app_tls_ctx->rx.secret);
+	pool_free(pool_head_quic_tls_secret, app_tls_ctx->tx.secret);
+
+	for (i = 0; i < QUIC_TLS_PKTNS_MAX; i++) {
+		quic_pktns_tx_pkts_release(&qc->pktns[i]);
+		quic_free_arngs(&qc->pktns[i].rx.arngs);
+	}
 
 	pool_free(pool_head_quic_conn_rxbuf, qc->rx.buf.area);
 	pool_free(pool_head_quic_conn, qc);
@@ -3718,7 +3831,7 @@ static struct task *process_timer(struct task *task, void *ctx, unsigned int sta
 	struct ssl_sock_ctx *conn_ctx;
 	struct quic_conn *qc;
 	struct quic_pktns *pktns;
-	int i, st;
+	int i;
 
 	conn_ctx = task->context;
 	qc = conn_ctx->qc;
@@ -3736,9 +3849,8 @@ static struct task *process_timer(struct task *task, void *ctx, unsigned int sta
 		goto out;
 	}
 
-	st = HA_ATOMIC_LOAD(&qc->state);
 	if (qc->path->in_flight) {
-		pktns = quic_pto_pktns(qc, st >= QUIC_HS_ST_COMPLETE, NULL);
+		pktns = quic_pto_pktns(qc, qc->state >= QUIC_HS_ST_COMPLETE, NULL);
 		if (pktns == &qc->pktns[QUIC_TLS_PKTNS_INITIAL]) {
 			pktns->tx.pto_probe = 1;
 			if (qc->pktns[QUIC_TLS_PKTNS_HANDSHAKE].tx.in_flight)
@@ -3748,7 +3860,7 @@ static struct task *process_timer(struct task *task, void *ctx, unsigned int sta
 			pktns->tx.pto_probe = 2;
 		}
 	}
-	else if (!qc_is_listener(qc) && st <= QUIC_HS_ST_COMPLETE) {
+	else if (!qc_is_listener(qc) && qc->state <= QUIC_HS_ST_COMPLETE) {
 		struct quic_enc_level *iel = &qc->els[QUIC_TLS_ENC_LEVEL_INITIAL];
 		struct quic_enc_level *hel = &qc->els[QUIC_TLS_ENC_LEVEL_HANDSHAKE];
 
@@ -3811,7 +3923,7 @@ static struct quic_conn *qc_new_conn(unsigned int version, int ipv4,
 		l = owner;
 
 		qc->flags |= QUIC_FL_CONN_LISTENER;
-		HA_ATOMIC_STORE(&qc->state, QUIC_HS_ST_SERVER_INITIAL);
+		qc->state = QUIC_HS_ST_SERVER_INITIAL;
 		/* Copy the initial DCID with the address. */
 		qc->odcid.len = dcid_len;
 		qc->odcid.addrlen = dcid_addr_len;
@@ -3826,7 +3938,7 @@ static struct quic_conn *qc_new_conn(unsigned int version, int ipv4,
 	}
 	/* QUIC Client (outgoing connection to servers) */
 	else {
-		HA_ATOMIC_STORE(&qc->state, QUIC_HS_ST_CLIENT_INITIAL);
+		qc->state = QUIC_HS_ST_CLIENT_INITIAL;
 		if (dcid_len)
 			memcpy(qc->dcid.data, dcid, dcid_len);
 		qc->dcid.len = dcid_len;
@@ -3873,7 +3985,6 @@ static struct quic_conn *qc_new_conn(unsigned int version, int ipv4,
 	qc->tx.bytes = 0;
 	/* RX part. */
 	qc->rx.bytes = 0;
-	qc->rx.nb_ack_eliciting = 0;
 	qc->rx.buf = b_make(buf_area, QUIC_CONN_RX_BUFSZ, 0, 0);
 	LIST_INIT(&qc->rx.pkt_list);
 	if (!quic_tls_ku_init(qc)) {
@@ -3887,6 +3998,8 @@ static struct quic_conn *qc_new_conn(unsigned int version, int ipv4,
 
 	/* required to use MTLIST_IN_LIST */
 	MT_LIST_INIT(&qc->accept_list);
+
+	qc->streams_by_id = EB_ROOT_UNIQUE;
 
 	TRACE_LEAVE(QUIC_EV_CONN_INIT, qc);
 
@@ -4435,7 +4548,7 @@ int qc_conn_alloc_ssl_ctx(struct quic_conn *qc)
 	ctx->xprt = xprt_get(XPRT_QUIC);
 
 	/* Store the allocated context in <qc>. */
-	HA_ATOMIC_STORE(&qc->xprt_ctx, ctx);
+	qc->xprt_ctx = ctx;
 
 	return 0;
 
@@ -4715,20 +4828,20 @@ static ssize_t qc_lstnr_pkt_rcv(unsigned char *buf, const unsigned char *end,
 	 * properly drop the packet on failure.
 	 */
 	if (first_pkt && !quic_peer_validated_addr(qc) &&
-	    HA_ATOMIC_LOAD(&qc->flags) & QUIC_FL_CONN_ANTI_AMPLIFICATION_REACHED) {
+	    qc->flags & QUIC_FL_CONN_ANTI_AMPLIFICATION_REACHED) {
 		TRACE_PROTO("PTO timer must be armed after anti-amplication was reached",
 					QUIC_EV_CONN_LPKT, qc);
 		/* Reset the anti-amplification bit. It will be set again
 		 * when sending the next packet if reached again.
 		 */
-		HA_ATOMIC_BTR(&qc->flags, QUIC_FL_CONN_ANTI_AMPLIFICATION_REACHED_BIT);
-		HA_ATOMIC_OR(&qc->flags, QUIC_FL_CONN_IO_CB_WAKEUP_BIT);
+		qc->flags &= ~QUIC_FL_CONN_ANTI_AMPLIFICATION_REACHED;
+		qc->flags |= QUIC_FL_CONN_IO_CB_WAKEUP;
 		io_cb_wakeup = 1;
 	}
 
 	dgram->qc = qc;
 
-	if (HA_ATOMIC_LOAD(&qc->err_code)) {
+	if (qc->err_code) {
 		TRACE_PROTO("Connection error", QUIC_EV_CONN_LPKT, qc);
 		goto out;
 	}
@@ -4765,7 +4878,7 @@ static ssize_t qc_lstnr_pkt_rcv(unsigned char *buf, const unsigned char *end,
 	 * will start it if these contexts for the connection are not already
 	 * initialized.
 	 */
-	conn_ctx = HA_ATOMIC_LOAD(&qc->xprt_ctx);
+	conn_ctx = qc->xprt_ctx;
 	if (conn_ctx)
 		tasklet_wakeup(conn_ctx->wait_event.tasklet);
 
@@ -4778,7 +4891,7 @@ static ssize_t qc_lstnr_pkt_rcv(unsigned char *buf, const unsigned char *end,
 	 * This cannot be done by this thread.
 	 */
 	if (io_cb_wakeup) {
-		conn_ctx = HA_ATOMIC_LOAD(&qc->xprt_ctx);
+		conn_ctx = qc->xprt_ctx;
 		if (conn_ctx && conn_ctx->wait_event.tasklet)
 			tasklet_wakeup(conn_ctx->wait_event.tasklet);
 	}
@@ -5031,9 +5144,16 @@ static inline int qc_build_frms(struct list *outlist, struct list *inlist,
 				LIST_DELETE(&cf->list);
 				LIST_APPEND(outlist, &cf->list);
 
-				qcc_streams_sent_done(cf->stream.qcs,
-				                      cf->stream.len,
-				                      cf->stream.offset.key);
+				/* The MUX stream might be released at this
+				 * stage. This can most notably happen on
+				 * retransmission.
+				 */
+				if (qc->mux_state == QC_MUX_READY &&
+				    !cf->stream.stream->release) {
+					qcc_streams_sent_done(cf->stream.stream->ctx,
+					                      cf->stream.len,
+					                      cf->stream.offset.key);
+				}
 			}
 			else {
 				struct quic_frame *new_cf;
@@ -5046,7 +5166,7 @@ static inline int qc_build_frms(struct list *outlist, struct list *inlist,
 				}
 
 				new_cf->type = cf->type;
-				new_cf->stream.qcs = cf->stream.qcs;
+				new_cf->stream.stream = cf->stream.stream;
 				new_cf->stream.buf = cf->stream.buf;
 				new_cf->stream.id = cf->stream.id;
 				if (cf->type & QUIC_STREAM_FRAME_TYPE_OFF_BIT)
@@ -5066,9 +5186,16 @@ static inline int qc_build_frms(struct list *outlist, struct list *inlist,
 				cf->stream.offset.key += dlen;
 				cf->stream.data = (unsigned char *)b_peek(&cf_buf, dlen);
 
-				qcc_streams_sent_done(new_cf->stream.qcs,
-				                      new_cf->stream.len,
-				                      new_cf->stream.offset.key);
+				/* The MUX stream might be released at this
+				 * stage. This can most notably happen on
+				 * retransmission.
+				 */
+				if (qc->mux_state == QC_MUX_READY &&
+				    !cf->stream.stream->release) {
+					qcc_streams_sent_done(new_cf->stream.stream->ctx,
+					                      new_cf->stream.len,
+					                      new_cf->stream.offset.key);
+				}
 			}
 
 			/* TODO the MUX is notified about the frame sending via
@@ -5116,7 +5243,7 @@ static inline int qc_build_frms(struct list *outlist, struct list *inlist,
 static int qc_do_build_pkt(unsigned char *pos, const unsigned char *end,
                            size_t dglen, struct quic_tx_packet *pkt,
                            int64_t pn, size_t *pn_len, unsigned char **buf_pn,
-                           int ack, int padding, int cc, int probe,
+                           int padding, int cc, int probe,
                            struct quic_enc_level *qel, struct quic_conn *qc,
                            struct list *frms)
 {
@@ -5134,14 +5261,11 @@ static int qc_do_build_pkt(unsigned char *pos, const unsigned char *end,
 	/* Length field value with CRYPTO frames if present. */
 	len_frms = 0;
 	beg = pos;
-	/* When not probing and not acking, and no immediate close is required,
-	 * reduce the size of this buffer to respect
-	 * the congestion controller window. So, we do not limit the size of this
-	 * packet if we have an ACK frame to send because an ACK frame is not
-	 * ack-eliciting. This size will be limited if we have ack-eliciting
-	 * frames to send from <frms>.
+	/* When not probing, and no immediate close is required, reduce the size of this
+	 * buffer to respect the congestion controller window.
+	 * This size will be limited if we have ack-eliciting frames to send from <frms>.
 	 */
-	if (!probe && !ack && !cc) {
+	if (!probe && !LIST_ISEMPTY(frms) && !cc) {
 		size_t path_room;
 
 		path_room = quic_path_prep_data(qc->path);
@@ -5157,7 +5281,7 @@ static int qc_do_build_pkt(unsigned char *pos, const unsigned char *end,
 		goto no_room;
 
 	end -= QUIC_TLS_TAG_LEN;
-	rx_largest_acked_pn = HA_ATOMIC_LOAD(&qel->pktns->rx.largest_acked_pn);
+	rx_largest_acked_pn = qel->pktns->rx.largest_acked_pn;
 	/* packet number length */
 	*pn_len = quic_packet_number_length(pn, rx_largest_acked_pn);
 	/* Build the header */
@@ -5173,7 +5297,8 @@ static int qc_do_build_pkt(unsigned char *pos, const unsigned char *end,
 	head_len = pos - beg;
 	/* Build an ACK frame if required. */
 	ack_frm_len = 0;
-	if (!cc && ack && !eb_is_empty(&qel->pktns->rx.arngs.root)) {
+	if ((qel->pktns->flags & QUIC_FL_PKTNS_ACK_REQUIRED)) {
+	    BUG_ON(eb_is_empty(&qel->pktns->rx.arngs.root));
 		ack_frm.tx_ack.ack_delay = 0;
 		ack_frm.tx_ack.arngs = &qel->pktns->rx.arngs;
 		/* XXX BE CAREFUL XXX : here we reserved at least one byte for the
@@ -5193,6 +5318,7 @@ static int qc_do_build_pkt(unsigned char *pos, const unsigned char *end,
 	if (!cc && !LIST_ISEMPTY(frms)) {
 		ssize_t room = end - pos;
 
+		TRACE_PROTO("Avail. ack eliciting frames", QUIC_EV_CONN_FRMLIST, qc, frms);
 		/* Initialize the length of the frames built below to <len>.
 		 * If any frame could be successfully built by qc_build_frms(),
 		 * we will have len_frms > len.
@@ -5263,6 +5389,7 @@ static int qc_do_build_pkt(unsigned char *pos, const unsigned char *end,
 			goto no_room;
 
 		pkt->largest_acked_pn = quic_pktns_get_largest_acked_pn(qel->pktns);
+		pkt->flags |= QUIC_FL_TX_PACKET_ACK;
 	}
 
 	/* Ack-eliciting frames */
@@ -5318,14 +5445,15 @@ static int qc_do_build_pkt(unsigned char *pos, const unsigned char *end,
 
 	pkt->len = pos - beg;
 	LIST_SPLICE(&pkt->frms, &frm_list);
-	TRACE_PROTO("Ack eliciting frame", QUIC_EV_CONN_HPKT, qc, pkt);
+	TRACE_PROTO("Packet ack-eliciting frames", QUIC_EV_CONN_HPKT, qc, pkt);
 
 	return 1;
 
  no_room:
 	/* Replace the pre-built frames which could not be add to this packet */
 	LIST_SPLICE(frms, &frm_list);
-	TRACE_PROTO("Not enough room", QUIC_EV_CONN_HPKT, qc);
+	TRACE_PROTO("Remaining ack-eliciting frames", QUIC_EV_CONN_HPKT, qc, pkt);
+
 	return 0;
 }
 
@@ -5358,7 +5486,7 @@ static struct quic_tx_packet *qc_build_pkt(unsigned char **pos,
                                            const unsigned char *buf_end,
                                            struct quic_enc_level *qel, struct list *frms,
                                            struct quic_conn *qc, size_t dglen, int padding,
-                                           int pkt_type, int ack, int probe, int cc, int *err)
+                                           int pkt_type, int probe, int cc, int *err)
 {
 	/* The pointer to the packet number field. */
 	unsigned char *buf_pn;
@@ -5384,7 +5512,7 @@ static struct quic_tx_packet *qc_build_pkt(unsigned char **pos,
 
 	pn = qel->pktns->tx.next_pn + 1;
 	if (!qc_do_build_pkt(*pos, buf_end, dglen, pkt, pn, &pn_len, &buf_pn,
-	                     ack, padding, cc, probe, qel, qc, frms)) {
+	                     padding, cc, probe, qel, qc, frms)) {
 		*err = -1;
 		goto err;
 	}
@@ -5413,7 +5541,7 @@ static struct quic_tx_packet *qc_build_pkt(unsigned char **pos,
 	qel->pktns->tx.next_pn++;
 	qc->tx.prep_bytes += pkt->len;
 	if (qc->tx.prep_bytes >= 3 * qc->rx.bytes && !quic_peer_validated_addr(qc))
-		HA_ATOMIC_OR(&qc->flags, QUIC_FL_CONN_ANTI_AMPLIFICATION_REACHED);
+		qc->flags |= QUIC_FL_CONN_ANTI_AMPLIFICATION_REACHED;
 	/* Now that a correct packet is built, let us consume <*pos> buffer. */
 	*pos = end;
 	/* Attach the built packet to its tree. */
@@ -5423,6 +5551,11 @@ static struct quic_tx_packet *qc_build_pkt(unsigned char **pos,
 		pkt->in_flight_len = pkt->len;
 		qc->path->prep_in_flight += pkt->len;
 	}
+	if (pkt->flags & QUIC_FL_TX_PACKET_ACK) {
+		qel->pktns->flags &= ~QUIC_FL_PKTNS_ACK_REQUIRED;
+		qel->pktns->rx.nb_aepkts_since_last_ack = 0;
+	}
+
 	pkt->pktns = qel->pktns;
 	TRACE_LEAVE(QUIC_EV_CONN_HPKT, qc, pkt);
 
@@ -5484,7 +5617,7 @@ static int qc_conn_init(struct connection *conn, void **xprt_ctx)
 	if (*xprt_ctx)
 		goto out;
 
-	HA_ATOMIC_STORE(xprt_ctx, conn->qc->xprt_ctx);
+	*xprt_ctx = conn->qc->xprt_ctx;
 
  out:
 	TRACE_LEAVE(QUIC_EV_CONN_NEW, qc);
@@ -5658,6 +5791,50 @@ int quic_lstnr_dgram_dispatch(unsigned char *buf, size_t len, void *owner,
 
  err:
 	return 0;
+}
+
+/* Allocate a new stream descriptor with id <id>. The caller is responsible to
+ * store the stream in the appropriate tree.
+ *
+ * Returns the newly allocated instance on success or else NULL.
+ */
+struct qc_stream_desc *qc_stream_desc_new(uint64_t id, void *ctx)
+{
+	struct qc_stream_desc *stream;
+
+	stream = pool_alloc(pool_head_quic_conn_stream);
+	if (!stream)
+		return NULL;
+
+	stream->by_id.key = id;
+	stream->by_id.node.leaf_p = NULL;
+
+	stream->buf = BUF_NULL;
+	stream->acked_frms = EB_ROOT;
+	stream->ack_offset = 0;
+	stream->release = 0;
+	stream->ctx = ctx;
+
+	return stream;
+}
+
+/* Mark the stream descriptor <stream> as released by the upper layer. It will
+ * be freed as soon as all its buffered data are acknowledged. In the meantime,
+ * the stream is stored in the <qc> tree : thus it must have been removed from
+ * any other tree before calling this function.
+ */
+void qc_stream_desc_release(struct qc_stream_desc *stream,
+                            struct quic_conn *qc)
+{
+	BUG_ON(stream->by_id.node.leaf_p);
+
+	stream->release = 1;
+	stream->ctx = NULL;
+
+	if (!b_data(&stream->buf))
+		qc_stream_desc_free(stream);
+	else
+		eb64_insert(&qc->streams_by_id, &stream->by_id);
 }
 
 /* Function to automatically activate QUIC traces on stdout.

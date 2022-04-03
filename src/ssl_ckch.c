@@ -11,6 +11,7 @@
 
 #define _GNU_SOURCE
 #include <ctype.h>
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -1096,19 +1097,106 @@ int ssl_store_load_locations_file(char *path, int create_if_none, enum cafile_ty
 	 * X509_STORE_load_locations function because it performs forbidden disk
 	 * accesses. */
 	if (!store && create_if_none) {
+		STACK_OF(X509_OBJECT) *objs;
+		int cert_count = 0;
+		struct stat buf;
 		struct cafile_entry *ca_e;
+		const char *file = NULL;
+		const char *dir = NULL;
+
 		store = X509_STORE_new();
-		if (X509_STORE_load_locations(store, path, NULL)) {
-			ca_e = ssl_store_create_cafile_entry(path, store, type);
-			if (ca_e) {
-				ebst_insert(&cafile_tree, &ca_e->node);
+
+		if (strcmp(path, "@system-ca") == 0) {
+			dir = X509_get_default_cert_dir();
+
+		} else {
+
+			if (stat(path, &buf))
+				goto err;
+
+			if (S_ISDIR(buf.st_mode))
+				dir = path;
+			else
+				file = path;
+		}
+
+		if (file) {
+			if (!X509_STORE_load_locations(store, file, NULL)) {
+				goto err;
 			}
 		} else {
-			X509_STORE_free(store);
-			store = NULL;
+			int n, i;
+			struct dirent **de_list;
+
+			n = scandir(dir, &de_list, 0, alphasort);
+			if (n < 0)
+				goto err;
+
+			for (i= 0; i < n; i++) {
+				char *end;
+				struct dirent *de = de_list[i];
+				BIO *in = NULL;
+				X509 *ca = NULL;;
+
+				/* we try to load the files that would have
+				 * been loaded in an hashed directory loaded by
+				 * X509_LOOKUP_hash_dir, so according to "man 1
+				 * c_rehash", we should load  ".pem", ".crt",
+				 * ".cer", or ".crl"
+				 */
+				end = strrchr(de->d_name, '.');
+				if (!end || (strcmp(end, ".pem") != 0 &&
+				             strcmp(end, ".crt") != 0 &&
+				             strcmp(end, ".cer") != 0 &&
+				             strcmp(end, ".crl") != 0)) {
+					free(de);
+					continue;
+				}
+				in = BIO_new(BIO_s_file());
+				if (in == NULL)
+					goto scandir_err;
+
+				chunk_printf(&trash, "%s/%s", dir, de->d_name);
+
+				if (BIO_read_filename(in, trash.area) == 0)
+					goto scandir_err;
+
+				if (PEM_read_bio_X509_AUX(in, &ca, NULL, NULL) == NULL)
+					goto scandir_err;
+
+				if (X509_STORE_add_cert(store, ca) == 0)
+					goto scandir_err;
+
+				BIO_free(in);
+				free(de);
+				continue;
+
+scandir_err:
+				BIO_free(in);
+				free(de);
+				ha_warning("ca-file: '%s' couldn't load '%s'\n", path, trash.area);
+
+			}
+			free(de_list);
 		}
+
+		objs = X509_STORE_get0_objects(store);
+		cert_count = sk_X509_OBJECT_num(objs);
+		if (cert_count == 0)
+			ha_warning("ca-file: 0 CA were loaded from '%s'\n", path);
+
+		ca_e = ssl_store_create_cafile_entry(path, store, type);
+		if (!ca_e)
+			goto err;
+		ebst_insert(&cafile_tree, &ca_e->node);
 	}
 	return (store != NULL);
+
+err:
+	X509_STORE_free(store);
+	store = NULL;
+	return 0;
+
 }
 
 
@@ -1116,35 +1204,18 @@ int ssl_store_load_locations_file(char *path, int create_if_none, enum cafile_ty
 
 /* Type of SSL payloads that can be updated over the CLI */
 
-enum {
-	CERT_TYPE_PEM = 0,
-	CERT_TYPE_KEY,
+struct cert_exts cert_exts[] = {
+	{ "",        CERT_TYPE_PEM,      &ssl_sock_load_pem_into_ckch }, /* default mode, no extensions */
+	{ "crt",     CERT_TYPE_CRT,      &ssl_sock_load_pem_into_ckch },
+	{ "key",     CERT_TYPE_KEY,      &ssl_sock_load_key_into_ckch },
 #if ((defined SSL_CTRL_SET_TLSEXT_STATUS_REQ_CB && !defined OPENSSL_NO_OCSP) || defined OPENSSL_IS_BORINGSSL)
-	CERT_TYPE_OCSP,
-#endif
-	CERT_TYPE_ISSUER,
-#ifdef HAVE_SSL_SCTL
-	CERT_TYPE_SCTL,
-#endif
-	CERT_TYPE_MAX,
-};
-
-struct {
-	const char *ext;
-	int type;
-	int (*load)(const char *path, char *payload, struct cert_key_and_chain *ckch, char **err);
-	/* add a parsing callback */
-} cert_exts[CERT_TYPE_MAX+1] = {
-	[CERT_TYPE_PEM]    = { "",        CERT_TYPE_PEM,      &ssl_sock_load_pem_into_ckch }, /* default mode, no extensions */
-	[CERT_TYPE_KEY]    = { "key",     CERT_TYPE_KEY,      &ssl_sock_load_key_into_ckch },
-#if ((defined SSL_CTRL_SET_TLSEXT_STATUS_REQ_CB && !defined OPENSSL_NO_OCSP) || defined OPENSSL_IS_BORINGSSL)
-	[CERT_TYPE_OCSP]   = { "ocsp",    CERT_TYPE_OCSP,     &ssl_sock_load_ocsp_response_from_file },
+	{ "ocsp",    CERT_TYPE_OCSP,     &ssl_sock_load_ocsp_response_from_file },
 #endif
 #ifdef HAVE_SSL_SCTL
-	[CERT_TYPE_SCTL]   = { "sctl",    CERT_TYPE_SCTL,     &ssl_sock_load_sctl_from_file },
+	{ "sctl",    CERT_TYPE_SCTL,     &ssl_sock_load_sctl_from_file },
 #endif
-	[CERT_TYPE_ISSUER] = { "issuer",  CERT_TYPE_ISSUER,   &ssl_sock_load_issuer_file_into_ckch },
-	[CERT_TYPE_MAX]    = { NULL,      CERT_TYPE_MAX,      NULL },
+	{ "issuer",  CERT_TYPE_ISSUER,   &ssl_sock_load_issuer_file_into_ckch },
+	{ NULL,      CERT_TYPE_MAX,      NULL },
 };
 
 
@@ -1731,8 +1802,8 @@ static void cli_release_commit_cert(struct appctx *appctx)
  * specific ckch_store.
  * Returns 0 in case of success, 1 otherwise.
  */
-static int ckch_inst_rebuild(struct ckch_store *ckch_store, struct ckch_inst *ckchi,
-			     struct ckch_inst **new_inst, char **err)
+int ckch_inst_rebuild(struct ckch_store *ckch_store, struct ckch_inst *ckchi,
+                      struct ckch_inst **new_inst, char **err)
 {
 	int retval = 0;
 	int errcode = 0;
@@ -1831,9 +1902,56 @@ static void __ckch_inst_free_locked(struct ckch_inst *ckchi)
 	}
 }
 
+/* Replace a ckch_store in the ckch tree and insert the whole dependencies,
+* then free the previous dependencies and store.
+* Used in the case of a certificate update.
+*
+* Every dependencies must allocated before using this function.
+*
+* This function can't fail as it only update pointers, and does not alloc anything.
+*
+* /!\ This function must be used under the ckch lock. /!\
+*
+* - Insert every dependencies (SNI, crtlist_entry, ckch_inst, etc)
+* - Delete the old ckch_store from the tree
+* - Insert the new ckch_store
+* - Free the old dependencies and the old ckch_store
+*/
+void ckch_store_replace(struct ckch_store *old_ckchs, struct ckch_store *new_ckchs)
+{
+	struct crtlist_entry *entry;
+	struct ckch_inst *ckchi, *ckchis;
+
+	LIST_SPLICE(&new_ckchs->crtlist_entry, &old_ckchs->crtlist_entry);
+	list_for_each_entry(entry, &new_ckchs->crtlist_entry, by_ckch_store) {
+		ebpt_delete(&entry->node);
+		/* change the ptr and reinsert the node */
+		entry->node.key = new_ckchs;
+		ebpt_insert(&entry->crtlist->entries, &entry->node);
+	}
+	/* insert the new ckch_insts in the crtlist_entry */
+	list_for_each_entry(ckchi, &new_ckchs->ckch_inst, by_ckchs) {
+		if (ckchi->crtlist_entry)
+			LIST_INSERT(&ckchi->crtlist_entry->ckch_inst, &ckchi->by_crtlist_entry);
+	}
+	/* First, we insert every new SNIs in the trees, also replace the default_ctx */
+	list_for_each_entry_safe(ckchi, ckchis, &new_ckchs->ckch_inst, by_ckchs) {
+		__ssl_sock_load_new_ckch_instance(ckchi);
+	}
+	/* delete the old sni_ctx, the old ckch_insts and the ckch_store */
+	list_for_each_entry_safe(ckchi, ckchis, &old_ckchs->ckch_inst, by_ckchs) {
+		__ckch_inst_free_locked(ckchi);
+	}
+
+	ckch_store_free(old_ckchs);
+	ebst_insert(&ckchs_tree, &new_ckchs->node);
+}
+
 
 /*
  * This function tries to create the new ckch_inst and their SNIs
+ *
+ * /!\ don't forget to update __hlua_ckch_commit() if you changes things there. /!\
  */
 static int cli_io_handler_commit_cert(struct appctx *appctx)
 {
@@ -1841,9 +1959,8 @@ static int cli_io_handler_commit_cert(struct appctx *appctx)
 	int y = 0;
 	char *err = NULL;
 	struct ckch_store *old_ckchs, *new_ckchs = NULL;
-	struct ckch_inst *ckchi, *ckchis;
+	struct ckch_inst *ckchi;
 	struct buffer *trash = alloc_trash_chunk();
-	struct crtlist_entry *entry;
 
 	if (trash == NULL)
 		goto error;
@@ -1914,34 +2031,9 @@ static int cli_io_handler_commit_cert(struct appctx *appctx)
 				if (!new_ckchs)
 					continue;
 
-				/* get the list of crtlist_entry in the old store, and update the pointers to the store */
-				LIST_SPLICE(&new_ckchs->crtlist_entry, &old_ckchs->crtlist_entry);
-				list_for_each_entry(entry, &new_ckchs->crtlist_entry, by_ckch_store) {
-					ebpt_delete(&entry->node);
-					/* change the ptr and reinsert the node */
-					entry->node.key = new_ckchs;
-					ebpt_insert(&entry->crtlist->entries, &entry->node);
-				}
+				/* insert everything and remove the previous objects */
+				ckch_store_replace(old_ckchs, new_ckchs);
 
-				/* insert the new ckch_insts in the crtlist_entry */
-				list_for_each_entry(ckchi, &new_ckchs->ckch_inst, by_ckchs) {
-					if (ckchi->crtlist_entry)
-						LIST_INSERT(&ckchi->crtlist_entry->ckch_inst, &ckchi->by_crtlist_entry);
-				}
-
-				/* First, we insert every new SNIs in the trees, also replace the default_ctx */
-				list_for_each_entry_safe(ckchi, ckchis, &new_ckchs->ckch_inst, by_ckchs) {
-					__ssl_sock_load_new_ckch_instance(ckchi);
-				}
-
-				/* delete the old sni_ctx, the old ckch_insts and the ckch_store */
-				list_for_each_entry_safe(ckchi, ckchis, &old_ckchs->ckch_inst, by_ckchs) {
-					__ckch_inst_free_locked(ckchi);
-				}
-
-				/* Replace the old ckchs by the new one */
-				ckch_store_free(old_ckchs);
-				ebst_insert(&ckchs_tree, &new_ckchs->node);
 				appctx->st2 = SETCERT_ST_FIN;
 				/* fallthrough */
 			case SETCERT_ST_FIN:
@@ -2051,7 +2143,7 @@ static int cli_parse_set_cert(char **args, char *payload, struct appctx *appctx,
 	int i;
 	int errcode = 0;
 	char *end;
-	int type = CERT_TYPE_PEM;
+	struct cert_exts *cert_ext = &cert_exts[0]; /* default one, PEM */
 	struct cert_key_and_chain *ckch;
 	struct buffer *buf;
 
@@ -2079,12 +2171,12 @@ static int cli_parse_set_cert(char **args, char *payload, struct appctx *appctx,
 	}
 
 	/* check which type of file we want to update */
-	for (i = 0; cert_exts[i].type < CERT_TYPE_MAX; i++) {
+	for (i = 0; cert_exts[i].ext != NULL; i++) {
 		end = strrchr(buf->area, '.');
 		if (end && *cert_exts[i].ext && (strcmp(end + 1, cert_exts[i].ext) == 0)) {
 			*end = '\0';
 			buf->data = strlen(buf->area);
-			type = cert_exts[i].type;
+			cert_ext = &cert_exts[i];
 			break;
 		}
 	}
@@ -2099,7 +2191,7 @@ static int cli_parse_set_cert(char **args, char *payload, struct appctx *appctx,
 			/* we didn't find the transaction, must try more cases below */
 
 			/* if the del-ext option is activated we should try to take a look at a ".crt" too. */
-			if (type != CERT_TYPE_PEM && global_ssl.extra_files_noext) {
+			if (cert_ext->type != CERT_TYPE_PEM && global_ssl.extra_files_noext) {
 				if (!chunk_strcat(buf, ".crt")) {
 					memprintf(&err, "%sCan't allocate memory\n", err ? err : "");
 					errcode |= ERR_ALERT | ERR_FATAL;
@@ -2127,7 +2219,7 @@ static int cli_parse_set_cert(char **args, char *payload, struct appctx *appctx,
 
 		if (!appctx->ctx.ssl.old_ckchs) {
 			/* if the del-ext option is activated we should try to take a look at a ".crt" too. */
-			if (type != CERT_TYPE_PEM && global_ssl.extra_files_noext) {
+			if (cert_ext->type != CERT_TYPE_PEM && global_ssl.extra_files_noext) {
 				if (!chunk_strcat(buf, ".crt")) {
 					memprintf(&err, "%sCan't allocate memory\n", err ? err : "");
 					errcode |= ERR_ALERT | ERR_FATAL;
@@ -2169,7 +2261,7 @@ static int cli_parse_set_cert(char **args, char *payload, struct appctx *appctx,
 	ckch = new_ckchs->ckch;
 
 	/* appply the change on the duplicate */
-	if (cert_exts[type].load(buf->area, payload, ckch, &err) != 0) {
+	if (cert_ext->load(buf->area, payload, ckch, &err) != 0) {
 		memprintf(&err, "%sCan't load the payload\n", err ? err : "");
 		errcode |= ERR_ALERT | ERR_FATAL;
 		goto end;

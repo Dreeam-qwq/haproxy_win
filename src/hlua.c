@@ -53,6 +53,8 @@
 #include <haproxy/sample.h>
 #include <haproxy/server.h>
 #include <haproxy/session.h>
+#include <haproxy/ssl_ckch.h>
+#include <haproxy/ssl_sock.h>
 #include <haproxy/stats-t.h>
 #include <haproxy/stream.h>
 #include <haproxy/stream_interface.h>
@@ -7231,7 +7233,6 @@ __LJMP static int hlua_httpclient_send(lua_State *L, enum http_meth_t meth)
 	struct hlua *hlua;
 	const char *url_str = NULL;
 	const char *body_str = NULL;
-	int timeout;
 	size_t buf_len;
 	int ret;
 
@@ -7246,38 +7247,38 @@ __LJMP static int hlua_httpclient_send(lua_State *L, enum http_meth_t meth)
 
 	hlua_hc = hlua_checkhttpclient(L, 1);
 
-	ret = lua_getfield(L, -1, "dst");
-	if (ret == LUA_TSTRING) {
-		if (httpclient_set_dst(hlua_hc->hc, lua_tostring(L, -1)) < 0)
-			WILL_LJMP(luaL_error(L, "Can't use the 'dst' argument"));
-	}
-	lua_pop(L, 1);
+	lua_pushnil(L);  /* first key */
+	while (lua_next(L, 2)) {
+		if (strcmp(lua_tostring(L, -2), "dst") == 0) {
+			if (httpclient_set_dst(hlua_hc->hc, lua_tostring(L, -1)) < 0)
+				WILL_LJMP(luaL_error(L, "Can't use the 'dst' argument"));
 
-	ret = lua_getfield(L, -1, "url");
-	if (ret == LUA_TSTRING) {
-		url_str = lua_tostring(L, -1);
-	}
-	lua_pop(L, 1);
+		} else if (strcmp(lua_tostring(L, -2), "url") == 0) {
+			if (lua_type(L, -1) != LUA_TSTRING)
+				WILL_LJMP(luaL_error(L, "invalid parameter in 'url', must be a string"));
+			url_str = lua_tostring(L, -1);
 
-	ret = lua_getfield(L, -1, "timeout");
-	if (ret == LUA_TNUMBER) {
-		timeout = lua_tointeger(L, -1);
-		httpclient_set_timeout(hlua_hc->hc, timeout);
-	}
-	lua_pop(L, 1);
+		} else if (strcmp(lua_tostring(L, -2), "timeout") == 0) {
+			if (lua_type(L, -1) != LUA_TNUMBER)
+				WILL_LJMP(luaL_error(L, "invalid parameter in 'timeout', must be a number"));
+			httpclient_set_timeout(hlua_hc->hc, lua_tointeger(L, -1));
 
-	ret = lua_getfield(L, -1, "headers");
-	if (ret == LUA_TTABLE) {
-		hdrs = hlua_httpclient_table_to_hdrs(L);
-	}
-	lua_pop(L, 1);
+		} else if (strcmp(lua_tostring(L, -2), "headers") == 0) {
+			if (lua_type(L, -1) != LUA_TTABLE)
+				WILL_LJMP(luaL_error(L, "invalid parameter in 'headers', must be a table"));
+			hdrs = hlua_httpclient_table_to_hdrs(L);
 
-	ret = lua_getfield(L, -1, "body");
-	if (ret == LUA_TSTRING) {
-		body_str = lua_tolstring(L, -1, &buf_len);
-	}
+		} else if (strcmp(lua_tostring(L, -2), "body") == 0) {
+			if (lua_type(L, -1) != LUA_TSTRING)
+				WILL_LJMP(luaL_error(L, "invalid parameter in 'body', must be a string"));
+			body_str = lua_tolstring(L, -1, &buf_len);
 
-	lua_pop(L, 1);
+		} else {
+			WILL_LJMP(luaL_error(L, "'%s' invalid parameter name", lua_tostring(L, -2)));
+		}
+		/* removes 'value'; keeps 'key' for next iteration */
+		lua_pop(L, 1);
+	}
 
 	if (!url_str) {
 		WILL_LJMP(luaL_error(L, "'get' need a 'url' argument"));
@@ -11368,6 +11369,200 @@ static struct cfg_kw_list cfg_kws = {{ },{
 
 INITCALL1(STG_REGISTER, cfg_register_keywords, &cfg_kws);
 
+#ifdef USE_OPENSSL
+
+/*
+ * This function replace a ckch_store by another one, and rebuild the ckch_inst and all its dependencies.
+ * It does the sam as "cli_io_handler_commit_cert" but for lua, the major
+ * difference is that the yield in lua and for the CLI is not handled the same
+ * way.
+ */
+__LJMP static int hlua_ckch_commit_yield(lua_State *L, int status, lua_KContext ctx)
+{
+	struct ckch_inst **lua_ckchi = lua_touserdata(L, -1);
+	struct ckch_store **lua_ckchs = lua_touserdata(L, -2);
+	struct ckch_inst *ckchi = *lua_ckchi;
+	struct ckch_store *old_ckchs = lua_ckchs[0];
+	struct ckch_store *new_ckchs = lua_ckchs[1];
+	struct hlua *hlua;
+	char *err = NULL;
+	int y = 1;
+
+	hlua = hlua_gethlua(L);
+
+	/* get the first ckchi to copy */
+	if (ckchi == NULL)
+		ckchi = LIST_ELEM(old_ckchs->ckch_inst.n, typeof(ckchi), by_ckchs);
+
+	/* walk through the old ckch_inst and creates new ckch_inst using the updated ckchs */
+	list_for_each_entry_from(ckchi, &old_ckchs->ckch_inst, by_ckchs) {
+		struct ckch_inst *new_inst;
+
+		/* it takes a lot of CPU to creates SSL_CTXs, so we yield every 10 CKCH instances */
+		if (y % 10 == 0) {
+
+			*lua_ckchi = ckchi;
+
+			task_wakeup(hlua->task, TASK_WOKEN_MSG);
+			MAY_LJMP(hlua_yieldk(L, 0, 0, hlua_ckch_commit_yield, TICK_ETERNITY, 0));
+		}
+
+		if (ckch_inst_rebuild(new_ckchs, ckchi, &new_inst, &err))
+			goto error;
+
+		/* link the new ckch_inst to the duplicate */
+		LIST_APPEND(&new_ckchs->ckch_inst, &new_inst->by_ckchs);
+		y++;
+	}
+
+	/* The generation is finished, we can insert everything */
+	ckch_store_replace(old_ckchs, new_ckchs);
+
+	lua_pop(L, 2); /* pop the lua_ckchs and ckchi */
+
+	HA_SPIN_UNLOCK(CKCH_LOCK, &ckch_lock);
+
+	return 0;
+
+error:
+	ckch_store_free(new_ckchs);
+	HA_SPIN_UNLOCK(CKCH_LOCK, &ckch_lock);
+	WILL_LJMP(luaL_error(L, "%s", err));
+	free(err);
+
+	return 0;
+}
+
+/*
+ * Replace a ckch_store <filename> in the ckchs_tree with a ckch_store created
+ * from the table in parameter.
+ *
+ * This is equivalent to  "set ssl cert" + "commit ssl cert" over the CLI, which
+ * means it does not need to have a transaction since everything is done in the
+ * same function.
+ *
+ * CertCache.set{filename="", crt="", key="", sctl="", ocsp="", issuer=""}
+ *
+ */
+__LJMP static int hlua_ckch_set(lua_State *L)
+{
+	struct hlua *hlua;
+	struct ckch_inst **lua_ckchi;
+	struct ckch_store **lua_ckchs;
+	struct ckch_store *old_ckchs = NULL;
+	struct ckch_store *new_ckchs = NULL;
+	int errcode = 0;
+	char *err = NULL;
+	struct cert_exts *cert_ext = NULL;
+	char *filename;
+	struct cert_key_and_chain *ckch;
+	int ret;
+
+	if (lua_type(L, -1) != LUA_TTABLE)
+		WILL_LJMP(luaL_error(L, "'CertCache.set' needs a table as argument"));
+
+	hlua = hlua_gethlua(L);
+
+	/* FIXME: this should not return an error but should come back later */
+	if (HA_SPIN_TRYLOCK(CKCH_LOCK, &ckch_lock))
+		WILL_LJMP(luaL_error(L, "CertCache already under lock"));
+
+	ret = lua_getfield(L, -1, "filename");
+	if (ret != LUA_TSTRING) {
+		memprintf(&err, "%sNo filename specified!\n", err ? err : "");
+		errcode |= ERR_ALERT | ERR_FATAL;
+		goto end;
+	}
+	filename = (char *)lua_tostring(L, -1);
+
+
+	/* look for the filename in the tree */
+	old_ckchs = ckchs_lookup(filename);
+	if (!old_ckchs) {
+		memprintf(&err, "%sCan't replace a certificate which is not referenced by the configuration!\n", err ? err : "");
+		errcode |= ERR_ALERT | ERR_FATAL;
+		goto end;
+	}
+	/* TODO: handle extra_files_noext */
+
+	new_ckchs = ckchs_dup(old_ckchs);
+	if (!new_ckchs) {
+		memprintf(&err, "%sCannot allocate memory!\n", err ? err : "");
+		errcode |= ERR_ALERT | ERR_FATAL;
+		goto end;
+	}
+
+	ckch = new_ckchs->ckch;
+
+	/* loop on the field in the table, which have the same name as the
+	 * possible extensions of files */
+	lua_pushnil(L);
+	while (lua_next(L, 1)) {
+		int i;
+		const char *field = lua_tostring(L, -2);
+		char *payload = (char *)lua_tostring(L, -1);
+
+		if (!field || strcmp(field, "filename") == 0) {
+			lua_pop(L, 1);
+			continue;
+		}
+
+		for (i = 0; field && cert_exts[i].ext != NULL; i++) {
+			if (strcmp(field, cert_exts[i].ext) == 0) {
+				cert_ext = &cert_exts[i];
+				break;
+			}
+		}
+
+		/* this is the default type, the field is not supported */
+		if (cert_ext == NULL) {
+			memprintf(&err, "%sUnsupported field '%s'\n", err ? err : "", field);
+			errcode |= ERR_ALERT | ERR_FATAL;
+			goto end;
+		}
+
+		/* appply the change on the duplicate */
+		if (cert_exts->load(filename, payload, ckch, &err) != 0) {
+			memprintf(&err, "%sCan't load the payload\n", err ? err : "");
+			errcode |= ERR_ALERT | ERR_FATAL;
+			goto end;
+		}
+		lua_pop(L, 1);
+	}
+
+	/* store the pointers on the lua stack */
+        lua_ckchs = lua_newuserdata(L, sizeof(struct ckch_store *) * 2);
+	lua_ckchs[0] = old_ckchs;
+	lua_ckchs[1] = new_ckchs;
+	lua_ckchi = lua_newuserdata(L, sizeof(struct ckch_inst *));
+	*lua_ckchi = NULL;
+
+	task_wakeup(hlua->task, TASK_WOKEN_MSG);
+	MAY_LJMP(hlua_yieldk(L, 0, 0, hlua_ckch_commit_yield, TICK_ETERNITY, 0));
+
+end:
+	HA_SPIN_UNLOCK(CKCH_LOCK, &ckch_lock);
+
+	if (errcode & ERR_CODE) {
+		ckch_store_free(new_ckchs);
+		WILL_LJMP(luaL_error(L, "%s", err));
+	}
+	free(err);
+
+	return 0;
+}
+
+#else
+
+__LJMP static int hlua_ckch_set(lua_State *L)
+{
+	WILL_LJMP(luaL_error(L, "'CertCache.set' needs an HAProxy built with OpenSSL"));
+
+	return 0;
+}
+#endif /* ! USE_OPENSSL */
+
+
 
 /* This function can fail with an abort() due to an Lua critical error.
  * We are in the initialisation process of HAProxy, this abort() is
@@ -11842,6 +12037,18 @@ lua_State *hlua_init_state(int thread_num)
 
 	/* Set a name to the table. */
 	lua_setglobal(L, "Map");
+
+	/*
+	 *
+	 * Register "CertCache" class
+	 *
+	 */
+
+	/* Create and fill the metatable. */
+	lua_newtable(L);
+	/* Register */
+	hlua_class_function(L, "set",         hlua_ckch_set);
+	lua_setglobal(L, CLASS_CERTCACHE); /* Create global object called Regex */
 
 	/*
 	 *

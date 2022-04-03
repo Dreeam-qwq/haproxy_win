@@ -1308,6 +1308,35 @@ int init_acl()
 	return err;
 }
 
+/* dump known ACL keywords on stdout */
+void acl_dump_kwd(void)
+{
+	struct acl_kw_list *kwl;
+	const struct acl_keyword *kwp, *kw;
+	const char *name;
+	int index;
+
+	for (kw = kwp = NULL;; kwp = kw) {
+		list_for_each_entry(kwl, &acl_keywords.list, list) {
+			for (index = 0; kwl->kw[index].kw != NULL; index++) {
+				if (strordered(kwp ? kwp->kw : NULL,
+					       kwl->kw[index].kw,
+					       kw != kwp ? kw->kw : NULL))
+					kw = &kwl->kw[index];
+			}
+		}
+
+		if (kw == kwp)
+			break;
+
+		name = kw->fetch_kw;
+		if (!name)
+			name = kw->kw;
+
+		printf("%s = %s -m %s\n", kw->kw, name, pat_match_names[kw->match_type]);
+	}
+}
+
 void free_acl_cond(struct acl_cond *cond)
 {
 	struct acl_term_suite *suite, *suiteb;

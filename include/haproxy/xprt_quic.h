@@ -987,6 +987,7 @@ static inline void quic_pktns_init(struct quic_pktns *pktns)
 	pktns->rx.arngs.root = EB_ROOT_UNIQUE;
 	pktns->rx.arngs.sz = 0;
 	pktns->rx.arngs.enc_sz = 0;
+	pktns->rx.nb_aepkts_since_last_ack = 0;
 
 	pktns->flags = 0;
 }
@@ -1017,26 +1018,9 @@ static inline void quic_tx_packet_refdec(struct quic_tx_packet *pkt)
 	}
 }
 
-/* Discard <pktns> packet number space attached to <qc> QUIC connection.
- * Its loss information are reset. Deduce the outstanding bytes for this
- * packet number space from the outstanding bytes for the path of this
- * connection.
- * Note that all the non acknowledged TX packets and their frames are freed.
- * Always succeeds. 
- */
-static inline void quic_pktns_discard(struct quic_pktns *pktns,
-                                      struct quic_conn *qc)
+static inline void quic_pktns_tx_pkts_release(struct quic_pktns *pktns)
 {
 	struct eb64_node *node;
-
-	qc->path->in_flight -= pktns->tx.in_flight;
-	qc->path->prep_in_flight -= pktns->tx.in_flight;
-	qc->path->loss.pto_count = 0;
-
-	pktns->tx.time_of_last_eliciting = 0;
-	pktns->tx.loss_time = TICK_ETERNITY;
-	pktns->tx.pto_probe = 0;
-	pktns->tx.in_flight = 0;
 
 	node = eb64_first(&pktns->tx.pkts);
 	while (node) {
@@ -1053,6 +1037,27 @@ static inline void quic_pktns_discard(struct quic_pktns *pktns,
 		eb64_delete(&pkt->pn_node);
 		quic_tx_packet_refdec(pkt);
 	}
+}
+
+/* Discard <pktns> packet number space attached to <qc> QUIC connection.
+ * Its loss information are reset. Deduce the outstanding bytes for this
+ * packet number space from the outstanding bytes for the path of this
+ * connection.
+ * Note that all the non acknowledged TX packets and their frames are freed.
+ * Always succeeds.
+ */
+static inline void quic_pktns_discard(struct quic_pktns *pktns,
+                                      struct quic_conn *qc)
+{
+	qc->path->in_flight -= pktns->tx.in_flight;
+	qc->path->prep_in_flight -= pktns->tx.in_flight;
+	qc->path->loss.pto_count = 0;
+
+	pktns->tx.time_of_last_eliciting = 0;
+	pktns->tx.loss_time = TICK_ETERNITY;
+	pktns->tx.pto_probe = 0;
+	pktns->tx.in_flight = 0;
+	quic_pktns_tx_pkts_release(pktns);
 }
 
 /* Initialize <p> QUIC network path depending on <ipv4> boolean
@@ -1242,6 +1247,9 @@ int quic_lstnr_dgram_dispatch(unsigned char *buf, size_t len, void *owner,
                               struct sockaddr_storage *saddr,
                               struct quic_dgram *new_dgram, struct list *dgrams);
 int qc_send_app_pkts(struct quic_conn *qc, struct list *frms);
+
+struct qc_stream_desc *qc_stream_desc_new(uint64_t id, void *ctx);
+void qc_stream_desc_release(struct qc_stream_desc *stream, struct quic_conn *qc);
 
 #endif /* USE_QUIC */
 #endif /* _HAPROXY_XPRT_QUIC_H */

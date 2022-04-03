@@ -368,6 +368,43 @@ void cli_register_kw(struct cli_kw_list *kw_list)
 	LIST_APPEND(&cli_keywords.list, &kw_list->list);
 }
 
+/* list all known keywords on stdout, one per line */
+void cli_list_keywords(void)
+{
+	struct cli_kw_list *kw_list;
+	struct cli_kw *kwp, *kwn, *kw;
+	int idx;
+
+	for (kwn = kwp = NULL;; kwp = kwn) {
+		list_for_each_entry(kw_list, &cli_keywords.list, list) {
+			/* note: we sort based on the usage message when available,
+			 * otherwise we fall back to the first keyword.
+			 */
+			for (kw = &kw_list->kw[0]; kw->str_kw[0]; kw++) {
+				if (strordered(kwp ? kwp->usage ? kwp->usage : kwp->str_kw[0] : NULL,
+					       kw->usage ? kw->usage : kw->str_kw[0],
+					       kwn != kwp ? kwn->usage ? kwn->usage : kwn->str_kw[0] : NULL))
+					kwn = kw;
+			}
+		}
+
+		if (kwn == kwp)
+			break;
+
+		for (idx = 0; kwn->str_kw[idx]; idx++) {
+			printf("%s ", kwn->str_kw[idx]);
+		}
+		if (kwn->level & (ACCESS_MASTER_ONLY|ACCESS_MASTER))
+			printf("[MASTER] ");
+		if (!(kwn->level & ACCESS_MASTER_ONLY))
+			printf("[WORKER] ");
+		if (kwn->level & ACCESS_EXPERT)
+			printf("[EXPERT] ");
+		if (kwn->level & ACCESS_EXPERIMENTAL)
+			printf("[EXPERIM] ");
+		printf("\n");
+	}
+}
 
 /* allocate a new stats frontend named <name>, and return it
  * (or NULL in case of lack of memory).

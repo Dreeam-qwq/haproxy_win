@@ -35,9 +35,7 @@
 #include <haproxy/http-hdr.h>
 #include <haproxy/tools.h>
 
-#define DEBUG_HPACK
-
-#if defined(DEBUG_HPACK)
+#if defined(DEBUG_QPACK)
 #define qpack_debug_printf fprintf
 #define qpack_debug_hexdump debug_hexdump
 #else
@@ -206,8 +204,8 @@ int qpack_decode_fs(const unsigned char *raw, size_t len, struct buffer *tmp,
 		qpack_debug_printf(stderr, "efl_type=0x%02x\n", efl_type);
 		if (efl_type == QPACK_LFL_WPBNM) {
 			/* Literal field line with post-base name reference */
-			uint64_t index, length;
-			unsigned int n, h;
+			uint64_t index __maybe_unused, length;
+			unsigned int n __maybe_unused, h __maybe_unused;
 
 			qpack_debug_printf(stderr, "literal field line with post-base name reference:");
 			n = *raw & 0x08;
@@ -241,7 +239,7 @@ int qpack_decode_fs(const unsigned char *raw, size_t len, struct buffer *tmp,
 		}
 		else if (efl_type == QPACK_IFL_WPBI) {
 			/* Indexed field line with post-base index */
-			uint64_t index;
+			uint64_t index __maybe_unused;
 
 			qpack_debug_printf(stderr, "indexed field line with post-base index:");
 			index = qpack_get_varint(&raw, &len, 4);
@@ -275,7 +273,7 @@ int qpack_decode_fs(const unsigned char *raw, size_t len, struct buffer *tmp,
 		else if (efl_type & QPACK_LFL_WNR_BIT) {
 			/* Literal field line with name reference */
 			uint64_t index, length;
-			unsigned int t, n, h;
+			unsigned int t, n __maybe_unused, h;
 
 			qpack_debug_printf(stderr, "Literal field line with name reference:");
 			n = efl_type & 0x20;
@@ -338,7 +336,7 @@ int qpack_decode_fs(const unsigned char *raw, size_t len, struct buffer *tmp,
 		}
 		else if (efl_type & QPACK_LFL_WLN_BIT) {
 			/* Literal field line with literal name */
-			unsigned int n, hname, hvalue;
+			unsigned int n __maybe_unused, hname __maybe_unused, hvalue __maybe_unused;
 			uint64_t name_len, value_len;
 
 			qpack_debug_printf(stderr, "Literal field line with literal name:");

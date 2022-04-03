@@ -257,7 +257,7 @@ SMALL_OPTS =
 # DEBUG_MEM_STATS, DEBUG_DONT_SHARE_POOLS, DEBUG_FD, DEBUG_POOL_INTEGRITY,
 # DEBUG_NO_POOLS, DEBUG_FAIL_ALLOC, DEBUG_STRICT_ACTION=[0-3], DEBUG_HPACK,
 # DEBUG_AUTH, DEBUG_SPOE, DEBUG_UAF, DEBUG_THREAD, DEBUG_STRICT, DEBUG_DEV,
-# DEBUG_TASK, DEBUG_MEMORY_POOLS, DEBUG_POOL_TRACING.
+# DEBUG_TASK, DEBUG_MEMORY_POOLS, DEBUG_POOL_TRACING, DEBUG_QPACK.
 DEBUG = -DDEBUG_STRICT -DDEBUG_MEMORY_POOLS
 
 #### Trace options
@@ -626,7 +626,7 @@ ifneq ($(USE_QUIC),)
 OPTIONS_OBJS += src/quic_sock.o src/proto_quic.o src/xprt_quic.o src/quic_tls.o \
                 src/quic_frame.o src/quic_cc.o src/quic_cc_newreno.o src/mux_quic.o \
                 src/cbuf.o src/qpack-dec.o src/qpack-tbl.o src/h3.o src/qpack-enc.o \
-                src/hq_interop.o src/cfgparse-quic.o
+                src/hq_interop.o src/cfgparse-quic.o src/quic_loss.o
 endif
 
 ifneq ($(USE_LUA),)

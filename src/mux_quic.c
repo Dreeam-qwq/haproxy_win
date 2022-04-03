@@ -8,29 +8,118 @@
 #include <haproxy/dynbuf.h>
 #include <haproxy/htx.h>
 #include <haproxy/pool.h>
+#include <haproxy/sink.h>
 #include <haproxy/ssl_sock-t.h>
+#include <haproxy/trace.h>
 #include <haproxy/xprt_quic.h>
 
 DECLARE_POOL(pool_head_qcc, "qcc", sizeof(struct qcc));
 DECLARE_POOL(pool_head_qcs, "qcs", sizeof(struct qcs));
 
+/* trace source and events */
+static void qmux_trace(enum trace_level level, uint64_t mask,
+                       const struct trace_source *src,
+                       const struct ist where, const struct ist func,
+                       const void *a1, const void *a2, const void *a3, const void *a4);
+
+static const struct trace_event qmux_trace_events[] = {
+#define           QMUX_EV_QCC_RECV      (1ULL << 1)
+	{ .mask = QMUX_EV_QCC_RECV,     .name = "qcc_recv",     .desc = "Rx on QUIC connection" },
+#define           QMUX_EV_QCC_SEND      (1ULL << 2)
+	{ .mask = QMUX_EV_QCC_SEND,     .name = "qcc_send",     .desc = "Tx on QUIC connection" },
+#define           QMUX_EV_QCC_WAKE      (1ULL << 3)
+	{ .mask = QMUX_EV_QCC_WAKE,     .name = "qcc_wake",     .desc = "QUIC connection woken up" },
+#define           QMUX_EV_QCC_END       (1ULL << 4)
+	{ .mask = QMUX_EV_QCC_END,      .name = "qcc_end",      .desc = "QUIC connection terminated" },
+#define           QMUX_EV_QCC_NQCS      (1ULL << 5)
+	{ .mask = QMUX_EV_QCC_NQCS,     .name = "qcc_no_qcs",   .desc = "QUIC stream not found" },
+#define           QMUX_EV_QCS_NEW       (1ULL << 6)
+	{ .mask = QMUX_EV_QCS_NEW,      .name = "qcs_new",      .desc = "new QUIC stream" },
+#define           QMUX_EV_QCS_RECV      (1ULL << 7)
+	{ .mask = QMUX_EV_QCS_RECV,     .name = "qcs_recv",     .desc = "Rx on QUIC stream" },
+#define           QMUX_EV_QCS_SEND      (1ULL << 8)
+	{ .mask = QMUX_EV_QCS_SEND,     .name = "qcs_send",     .desc = "Tx on QUIC stream" },
+#define           QMUX_EV_QCS_END       (1ULL << 9)
+	{ .mask = QMUX_EV_QCS_END,      .name = "qcs_end",      .desc = "QUIC stream terminated" },
+#define           QMUX_EV_STRM_RECV     (1ULL << 10)
+	{ .mask = QMUX_EV_STRM_RECV,    .name = "strm_recv",    .desc = "receiving data for stream" },
+#define           QMUX_EV_STRM_SEND     (1ULL << 11)
+	{ .mask = QMUX_EV_STRM_SEND,    .name = "strm_send",    .desc = "sending data for stream" },
+#define           QMUX_EV_STRM_END      (1ULL << 12)
+	{ .mask = QMUX_EV_STRM_END,     .name = "strm_end",     .desc = "detaching app-layer stream" },
+#define           QMUX_EV_SEND_FRM      (1ULL << 13)
+	{ .mask = QMUX_EV_SEND_FRM,     .name = "send_frm",     .desc = "sending QUIC frame" },
+/* special event dedicated to qcs_push_frame */
+#define           QMUX_EV_QCS_PUSH_FRM  (1ULL << 14)
+	{ .mask = QMUX_EV_QCS_PUSH_FRM, .name = "qcs_push_frm", .desc = "qcs_push_frame" },
+	{ }
+};
+
+/* custom arg for QMUX_EV_QCS_PUSH_FRM */
+struct qcs_push_frm_trace_arg {
+	size_t sent;
+	int xfer;
+	char fin;
+	uint64_t offset;
+};
+
+static const struct name_desc qmux_trace_lockon_args[4] = {
+	/* arg1 */ { /* already used by the connection */ },
+	/* arg2 */ { .name="qcs", .desc="QUIC stream" },
+	/* arg3 */ { },
+	/* arg4 */ { }
+};
+
+static const struct name_desc qmux_trace_decoding[] = {
+#define QMUX_VERB_CLEAN    1
+	{ .name="clean",    .desc="only user-friendly stuff, generally suitable for level \"user\"" },
+#define QMUX_VERB_MINIMAL  2
+	{ .name="minimal",  .desc="report only qcc/qcs state and flags, no real decoding" },
+	{ /* end */ }
+};
+
+struct trace_source trace_qmux = {
+	.name = IST("qmux"),
+	.desc = "QUIC multiplexer",
+	.arg_def = TRC_ARG1_CONN,  /* TRACE()'s first argument is always a connection */
+	.default_cb = qmux_trace,
+	.known_events = qmux_trace_events,
+	.lockon_args = qmux_trace_lockon_args,
+	.decoding = qmux_trace_decoding,
+	.report_events = ~0,  /* report everything by default */
+};
+
+#define TRACE_SOURCE    &trace_qmux
+INITCALL1(STG_REGISTER, trace_register_source, TRACE_SOURCE);
+
 /* Allocate a new QUIC streams with id <id> and type <type>. */
 struct qcs *qcs_new(struct qcc *qcc, uint64_t id, enum qcs_type type)
 {
 	struct qcs *qcs;
+	struct qc_stream_desc *stream;
+
+	TRACE_ENTER(QMUX_EV_QCS_NEW, qcc->conn);
 
 	qcs = pool_alloc(pool_head_qcs);
 	if (!qcs)
 		goto out;
 
-	fprintf(stderr, "%s: stream ID %lu\n", __func__, id);
+	/* allocate transport layer stream descriptor */
+	stream = qc_stream_desc_new(id, qcs);
+	if (!stream) {
+		pool_free(pool_head_qcs, qcs);
+		qcs = NULL;
+		goto out;
+	}
 
+	qcs->stream = stream;
 	qcs->qcc = qcc;
 	qcs->cs = NULL;
 	qcs->flags = QC_SF_NONE;
 
-	qcs->by_id.key = id;
-	eb64_insert(&qcc->streams_by_id, &qcs->by_id);
+	qcs->id = id;
+	/* store transport layer stream descriptor in qcc tree */
+	eb64_insert(&qcc->streams_by_id, &stream->by_id);
 	qcc->strms[type].nb_streams++;
 
 	/* If stream is local, use peer remote-limit, or else the opposite. */
@@ -44,26 +133,33 @@ struct qcs *qcs_new(struct qcc *qcc, uint64_t id, enum qcs_type type)
 	qcs->rx.frms = EB_ROOT_UNIQUE;
 
 	qcs->tx.buf = BUF_NULL;
-	qcs->tx.xprt_buf = BUF_NULL;
 	qcs->tx.offset = 0;
 	qcs->tx.sent_offset = 0;
-	qcs->tx.ack_offset = 0;
-	qcs->tx.acked_frms = EB_ROOT;
 
 	qcs->wait_event.tasklet = NULL;
 	qcs->wait_event.events = 0;
 	qcs->subs = NULL;
 
  out:
+	TRACE_LEAVE(QMUX_EV_QCS_NEW, qcc->conn, qcs);
 	return qcs;
 }
 
-/* Free a qcs. This function must only be used for unidirectional streams.
- * Bidirectional streams are released by the upper layer through qc_detach().
+/* Free a qcs. This function must only be done to remove a stream on allocation
+ * error or connection shutdown. Else use qcs_destroy which handle all the
+ * QUIC connection mechanism.
  */
-void uni_qcs_free(struct qcs *qcs)
+void qcs_free(struct qcs *qcs)
 {
-	eb64_delete(&qcs->by_id);
+	b_free(&qcs->rx.buf);
+	b_free(&qcs->tx.buf);
+
+	BUG_ON(!qcs->qcc->strms[qcs_id_type(qcs->id)].nb_streams);
+	--qcs->qcc->strms[qcs_id_type(qcs->id)].nb_streams;
+
+	/* stream desc must be removed from MUX tree before release it */
+	eb64_delete(&qcs->stream->by_id);
+	qc_stream_desc_release(qcs->stream, qcs->qcc->conn->qc);
 	pool_free(pool_head_qcs, qcs);
 }
 
@@ -76,13 +172,23 @@ struct buffer *qc_get_buf(struct qcs *qcs, struct buffer *bptr)
 
 int qcs_subscribe(struct qcs *qcs, int event_type, struct wait_event *es)
 {
-	fprintf(stderr, "%s\n", __func__);
+	struct qcc *qcc = qcs->qcc;
+
+	TRACE_ENTER(QMUX_EV_STRM_SEND|QMUX_EV_STRM_RECV, qcc->conn, qcs);
 
 	BUG_ON(event_type & ~(SUB_RETRY_SEND|SUB_RETRY_RECV));
 	BUG_ON(qcs->subs && qcs->subs != es);
 
 	es->events |= event_type;
 	qcs->subs = es;
+
+	if (event_type & SUB_RETRY_RECV)
+		TRACE_DEVEL("subscribe(recv)", QMUX_EV_STRM_RECV, qcc->conn, qcs);
+
+	if (event_type & SUB_RETRY_SEND)
+		TRACE_DEVEL("subscribe(send)", QMUX_EV_STRM_SEND, qcc->conn, qcs);
+
+	TRACE_LEAVE(QMUX_EV_STRM_SEND|QMUX_EV_STRM_RECV, qcc->conn, qcs);
 
 	return 0;
 }
@@ -111,11 +217,13 @@ void qcs_notify_send(struct qcs *qcs)
  * several streams, depending on the already open ones.
  * Return this node if succeeded, NULL if not.
  */
-struct eb64_node *qcc_get_qcs(struct qcc *qcc, uint64_t id)
+struct qcs *qcc_get_qcs(struct qcc *qcc, uint64_t id)
 {
+	struct qc_stream_desc *stream;
 	unsigned int strm_type;
 	int64_t sub_id;
 	struct eb64_node *strm_node;
+	struct qcs *qcs = NULL;
 
 	strm_type = id & QCS_ID_TYPE_MASK;
 	sub_id = id >> QCS_ID_TYPE_SHIFT;
@@ -127,6 +235,8 @@ struct eb64_node *qcc_get_qcs(struct qcc *qcc, uint64_t id)
 			/* unknown stream id */
 			goto out;
 		}
+		stream = eb64_entry(strm_node, struct qc_stream_desc, by_id);
+		qcs = stream->ctx;
 	}
 	else {
 		/* Remote streams. */
@@ -155,29 +265,34 @@ struct eb64_node *qcc_get_qcs(struct qcc *qcc, uint64_t id)
 			 * So, let's "open" these streams.
 			 */
 			int64_t i;
-			struct qcs *qcs;
+			struct qcs *tmp_qcs;
 
-			qcs = NULL;
+			tmp_qcs = NULL;
 			for (i = largest_id + 1; i <= sub_id; i++) {
 				uint64_t id = (i << QCS_ID_TYPE_SHIFT) | strm_type;
 				enum qcs_type type = id & QCS_ID_DIR_BIT ? QCS_CLT_UNI : QCS_CLT_BIDI;
-				qcs = qcs_new(qcc, id, type);
-				if (!qcs) {
+
+				tmp_qcs = qcs_new(qcc, id, type);
+				if (!tmp_qcs) {
 					/* allocation failure */
 					goto out;
 				}
 
 				qcc->strms[qcs_type].largest_id = i;
 			}
-			if (qcs)
-				strm_node = &qcs->by_id;
+			if (tmp_qcs)
+				qcs = tmp_qcs;
 		}
 		else {
 			strm_node = eb64_lookup(strms, id);
+			if (strm_node) {
+				stream = eb64_entry(strm_node, struct qc_stream_desc, by_id);
+				qcs = stream->ctx;
+			}
 		}
 	}
 
-	return strm_node;
+	return qcs;
 
  out:
 	return NULL;
@@ -197,23 +312,23 @@ int qcc_recv(struct qcc *qcc, uint64_t id, uint64_t len, uint64_t offset,
              char fin, char *data, struct qcs **out_qcs)
 {
 	struct qcs *qcs;
-	struct eb64_node *strm_node;
 	size_t total, diff;
 
-	strm_node = qcc_get_qcs(qcc, id);
-	if (!strm_node) {
-		fprintf(stderr, "%s: stream not found: %ld\n", __func__, id);
+	TRACE_ENTER(QMUX_EV_QCC_RECV, qcc->conn);
+
+	qcs = qcc_get_qcs(qcc, id);
+	if (!qcs) {
+		TRACE_DEVEL("leaving on stream not found", QMUX_EV_QCC_RECV|QMUX_EV_QCC_NQCS, qcc->conn, NULL, &id);
 		return 1;
 	}
 
-	qcs = eb64_entry(&strm_node->node, struct qcs, by_id);
 	*out_qcs = qcs;
 
 	if (offset > qcs->rx.offset)
 		return 2;
 
 	if (offset + len <= qcs->rx.offset) {
-		fprintf(stderr, "%s: already received STREAM data\n", __func__);
+		TRACE_DEVEL("leaving on already received offset", QMUX_EV_QCC_RECV|QMUX_EV_QCS_RECV, qcc->conn, qcs);
 		return 1;
 	}
 
@@ -225,7 +340,7 @@ int qcc_recv(struct qcc *qcc, uint64_t id, uint64_t len, uint64_t offset,
 		return 2;
 	}
 
-	fprintf(stderr, "%s: new STREAM data\n", __func__);
+	TRACE_DEVEL("newly received offset", QMUX_EV_QCC_RECV|QMUX_EV_QCS_RECV, qcc->conn, qcs);
 	diff = qcs->rx.offset - offset;
 
 	/* TODO do not partially copy a frame if not enough size left. Maybe
@@ -250,6 +365,7 @@ int qcc_recv(struct qcc *qcc, uint64_t id, uint64_t len, uint64_t offset,
 		qcs->flags |= QC_SF_FIN_RECV;
 
  out:
+	TRACE_LEAVE(QMUX_EV_QCC_RECV, qcc->conn);
 	return 0;
 }
 
@@ -278,12 +394,14 @@ int qcc_recv_max_data(struct qcc *qcc, uint64_t max)
  */
 int qcc_recv_max_stream_data(struct qcc *qcc, uint64_t id, uint64_t max)
 {
+	struct qc_stream_desc *stream;
 	struct qcs *qcs;
 	struct eb64_node *node;
 
 	node = eb64_lookup(&qcc->streams_by_id, id);
 	if (node) {
-		qcs = eb64_entry(&node->node, struct qcs, by_id);
+		stream = eb64_entry(node, struct qc_stream_desc, by_id);
+		qcs = stream->ctx;
 		if (max > qcs->tx.msd) {
 			qcs->tx.msd = max;
 
@@ -304,10 +422,14 @@ int qcc_recv_max_stream_data(struct qcc *qcc, uint64_t id, uint64_t max)
  */
 int qcc_decode_qcs(struct qcc *qcc, struct qcs *qcs)
 {
+	TRACE_ENTER(QMUX_EV_QCS_RECV, qcc->conn, qcs);
+
 	if (qcc->app_ops->decode_qcs(qcs, qcs->flags & QC_SF_FIN_RECV, qcc->ctx) < 0) {
-		fprintf(stderr, "%s: decoding error\n", __func__);
+		TRACE_DEVEL("leaving on decoding error", QMUX_EV_QCS_RECV, qcc->conn, qcs);
 		return 1;
 	}
+
+	TRACE_LEAVE(QMUX_EV_QCS_RECV, qcc->conn, qcs);
 
 	return 0;
 }
@@ -320,9 +442,10 @@ static int qc_is_max_streams_needed(struct qcc *qcc)
 /* detaches the QUIC stream from its QCC and releases it to the QCS pool. */
 static void qcs_destroy(struct qcs *qcs)
 {
-	const uint64_t id = qcs->by_id.key;
+	struct connection *conn = qcs->qcc->conn;
+	const uint64_t id = qcs->id;
 
-	fprintf(stderr, "%s: release stream %llu\n", __func__, qcs->by_id.key);
+	TRACE_ENTER(QMUX_EV_QCS_END, conn, qcs);
 
 	if (quic_stream_is_remote(qcs->qcc, id)) {
 		if (quic_stream_is_bidi(id)) {
@@ -332,21 +455,13 @@ static void qcs_destroy(struct qcs *qcs)
 		}
 	}
 
-	eb64_delete(&qcs->by_id);
+	qcs_free(qcs);
 
-	b_free(&qcs->rx.buf);
-	b_free(&qcs->tx.buf);
-	b_free(&qcs->tx.xprt_buf);
-
-	--qcs->qcc->strms[qcs_id_type(qcs->by_id.key)].nb_streams;
-
-	pool_free(pool_head_qcs, qcs);
+	TRACE_LEAVE(QMUX_EV_QCS_END, conn);
 }
 
 static inline int qcc_is_dead(const struct qcc *qcc)
 {
-	fprintf(stderr, "%s: %lu\n", __func__, qcc->strms[QCS_CLT_BIDI].nb_streams);
-
 	if (!qcc->strms[QCS_CLT_BIDI].nb_streams && !qcc->task)
 		return 1;
 
@@ -373,13 +488,30 @@ static void qc_release(struct qcc *qcc)
 {
 	struct connection *conn = NULL;
 
+	TRACE_ENTER(QMUX_EV_QCC_END);
+
 	if (qcc) {
+		struct eb64_node *node;
+
 		/* The connection must be aattached to this mux to be released */
 		if (qcc->conn && qcc->conn->ctx == qcc)
 			conn = qcc->conn;
 
+		TRACE_DEVEL("freeing qcc", QMUX_EV_QCC_END, conn);
+
+		if (qcc->app_ops && qcc->app_ops->release)
+			qcc->app_ops->release(qcc->ctx);
+
 		if (qcc->wait_event.tasklet)
 			tasklet_free(qcc->wait_event.tasklet);
+
+		/* liberate remaining qcs instances */
+		node = eb64_first(&qcc->streams_by_id);
+		while (node) {
+			struct qc_stream_desc *stream = eb64_entry(node, struct qc_stream_desc, by_id);
+			node = eb64_next(node);
+			qcs_free(stream->ctx);
+		}
 
 		pool_free(pool_head_qcc, qcc);
 	}
@@ -391,13 +523,16 @@ static void qc_release(struct qcc *qcc)
 		conn->mux = NULL;
 		conn->ctx = NULL;
 
+		TRACE_DEVEL("freeing conn", QMUX_EV_QCC_END, conn);
+
 		conn_stop_tracking(conn);
 		conn_full_close(conn);
 		if (conn->destroy_cb)
 			conn->destroy_cb(conn);
 		conn_free(conn);
-		fprintf(stderr, "conn@%p released\n", conn);
 	}
+
+	TRACE_LEAVE(QMUX_EV_QCC_END);
 }
 
 /* Prepare a STREAM frame for <qcs> instance. First, transfer data from
@@ -421,7 +556,7 @@ static int qcs_push_frame(struct qcs *qcs, struct buffer *out,
 	int head, left, to_xfer;
 	int total = 0;
 
-	fprintf(stderr, "%s\n", __func__);
+	TRACE_ENTER(QMUX_EV_QCS_SEND, qcc->conn, qcs);
 
 	qc_get_buf(qcs, out);
 
@@ -439,10 +574,10 @@ static int qcs_push_frame(struct qcs *qcs, struct buffer *out,
 	 *                       |xxxxxxxxxxxxxxxxx|
 	 */
 
-	BUG_ON_HOT(qcs->tx.sent_offset < qcs->tx.ack_offset);
+	BUG_ON_HOT(qcs->tx.sent_offset < qcs->stream->ack_offset);
 	BUG_ON_HOT(qcs->tx.offset < qcs->tx.sent_offset);
 
-	head = qcs->tx.sent_offset - qcs->tx.ack_offset;
+	head = qcs->tx.sent_offset - qcs->stream->ack_offset;
 	left = qcs->tx.offset - qcs->tx.sent_offset;
 	to_xfer = QUIC_MIN(b_data(payload), b_room(out));
 
@@ -466,8 +601,8 @@ static int qcs_push_frame(struct qcs *qcs, struct buffer *out,
 	total = b_force_xfer(out, payload, to_xfer);
 
 	frm->type = QUIC_FT_STREAM_8;
-	frm->stream.qcs = (struct qcs *)qcs;
-	frm->stream.id = qcs->by_id.key;
+	frm->stream.stream = qcs->stream;
+	frm->stream.id = qcs->id;
 	frm->stream.buf = out;
 	frm->stream.data = (unsigned char *)b_peek(out, head);
 
@@ -487,12 +622,21 @@ static int qcs_push_frame(struct qcs *qcs, struct buffer *out,
 	}
 
 	LIST_APPEND(frm_list, &frm->list);
+
  out:
-	fprintf(stderr, "%s: sent=%lu total=%d fin=%d id=%llu offset=%lu\n",
-	        __func__, (long unsigned)b_data(out), total, fin, (ull)qcs->by_id.key, qcs->tx.sent_offset);
+	{
+		struct qcs_push_frm_trace_arg arg = {
+			.sent = b_data(out), .xfer = total, .fin  = fin,
+			.offset = qcs->tx.sent_offset
+		};
+		TRACE_LEAVE(QMUX_EV_QCS_SEND|QMUX_EV_QCS_PUSH_FRM,
+		            qcc->conn, qcs, &arg);
+	}
+
 	return total;
 
  err:
+	TRACE_DEVEL("leaving in error", QMUX_EV_QCS_SEND, qcc->conn, qcs);
 	return -1;
 }
 
@@ -551,8 +695,12 @@ static int qc_send_frames(struct qcc *qcc, struct list *frms)
 	uint64_t first_offset = 0;
 	char first_stream_frame_type;
 
-	if (LIST_ISEMPTY(frms))
+	TRACE_ENTER(QMUX_EV_QCC_SEND, qcc->conn);
+
+	if (LIST_ISEMPTY(frms)) {
+		TRACE_DEVEL("leaving with no frames to send", QMUX_EV_QCC_SEND, qcc->conn);
 		return 0;
+	}
 
  retry_send:
 	first_frm = LIST_ELEM(frms->n, struct quic_frame *, list);
@@ -587,11 +735,13 @@ static int qc_send_frames(struct qcc *qcc, struct list *frms)
 	 * Subscribe on it to retry later.
 	 */
 	if (!LIST_ISEMPTY(frms)) {
-		fprintf(stderr, "%s: remaining frames to send\n", __func__);
+		TRACE_DEVEL("leaving with remaining frames to send, subscribing", QMUX_EV_QCC_SEND, qcc->conn);
 		qcc->conn->xprt->subscribe(qcc->conn, qcc->conn->xprt_ctx,
 		                           SUB_RETRY_SEND, &qcc->wait_event);
 		return 1;
 	}
+
+	TRACE_LEAVE(QMUX_EV_QCC_SEND);
 
 	return 0;
 }
@@ -607,7 +757,7 @@ static int qc_send(struct qcc *qcc)
 	struct eb64_node *node;
 	int total = 0;
 
-	fprintf(stderr, "%s\n", __func__);
+	TRACE_ENTER(QMUX_EV_QCC_SEND);
 
 	if (qcc->flags & QC_CF_BLK_MFCTL)
 		return 0;
@@ -617,16 +767,17 @@ static int qc_send(struct qcc *qcc)
 	 */
 	node = eb64_first(&qcc->streams_by_id);
 	while (node) {
-		struct qcs *qcs = container_of(node, struct qcs, by_id);
+		struct qc_stream_desc *stream = eb64_entry(node, struct qc_stream_desc, by_id);
+		struct qcs *qcs = stream->ctx;
 		struct buffer *buf = &qcs->tx.buf;
-		struct buffer *out = &qcs->tx.xprt_buf;
+		struct buffer *out = &qcs->stream->buf;
 
 		/* TODO
 		 * for the moment, unidirectional streams have their own
 		 * mechanism for sending. This should be unified in the future,
 		 * in this case the next check will be removed.
 		 */
-		if (quic_stream_is_uni(qcs->by_id.key)) {
+		if (quic_stream_is_uni(qcs->id)) {
 			node = eb64_next(node);
 			continue;
 		}
@@ -638,7 +789,7 @@ static int qc_send(struct qcc *qcc)
 
 		if (b_data(buf) || b_data(out)) {
 			int ret;
-			char fin = qcs->flags & QC_SF_FIN_STREAM;
+			char fin = !!(qcs->flags & QC_SF_FIN_STREAM);
 
 			ret = qcs_push_frame(qcs, out, buf, fin, &frms,
 			                     qcc->tx.sent_offsets + total);
@@ -650,7 +801,6 @@ static int qc_send(struct qcc *qcc)
 					qcs->flags &= ~QC_SF_BLK_MROOM;
 			}
 
-			fprintf(stderr, "%s ret=%d\n", __func__, ret);
 			qcs->tx.offset += ret;
 			total += ret;
 
@@ -664,6 +814,8 @@ static int qc_send(struct qcc *qcc)
 	}
 
 	qc_send_frames(qcc, &frms);
+
+	TRACE_LEAVE(QMUX_EV_QCC_SEND);
 
 	return total;
 }
@@ -680,11 +832,13 @@ static int qc_release_detached_streams(struct qcc *qcc)
 
 	node = eb64_first(&qcc->streams_by_id);
 	while (node) {
-		struct qcs *qcs = container_of(node, struct qcs, by_id);
+		struct qc_stream_desc *stream = eb64_entry(node, struct qc_stream_desc, by_id);
+		struct qcs *qcs = stream->ctx;
 		node = eb64_next(node);
 
 		if (qcs->flags & QC_SF_DETACH) {
-			if ((!b_data(&qcs->tx.buf) && !b_data(&qcs->tx.xprt_buf))) {
+			if (!b_data(&qcs->tx.buf) &&
+			    qcs->tx.offset == qcs->tx.sent_offset) {
 				qcs_destroy(qcs);
 				release = 1;
 			}
@@ -715,7 +869,7 @@ static int qc_send_max_streams(struct qcc *qcc)
 	frm->type = QUIC_FT_MAX_STREAMS_BIDI;
 	frm->max_streams_bidi.max_streams = qcc->lfctl.ms_bidi +
 	                                    qcc->lfctl.cl_bidi_r;
-	fprintf(stderr, "SET MAX_STREAMS %lu\n", frm->max_streams_bidi.max_streams);
+	TRACE_DEVEL("sending MAX_STREAMS frame", QMUX_EV_SEND_FRM, qcc->conn, NULL, frm);
 	LIST_APPEND(&frms, &frm->list);
 
 	if (qc_send_frames(qcc, &frms))
@@ -732,7 +886,7 @@ static struct task *qc_io_cb(struct task *t, void *ctx, unsigned int status)
 {
 	struct qcc *qcc = ctx;
 
-	fprintf(stderr, "%s\n", __func__);
+	TRACE_ENTER(QMUX_EV_QCC_WAKE);
 
 	if (qc_is_max_streams_needed(qcc))
 		qc_send_max_streams(qcc);
@@ -747,6 +901,8 @@ static struct task *qc_io_cb(struct task *t, void *ctx, unsigned int status)
 		}
 	}
 
+	TRACE_LEAVE(QMUX_EV_QCC_WAKE);
+
 	return NULL;
 }
 
@@ -755,31 +911,34 @@ static struct task *qc_timeout_task(struct task *t, void *ctx, unsigned int stat
 	struct qcc *qcc = ctx;
 	int expired = tick_is_expired(t->expire, now_ms);
 
-	fprintf(stderr, "%s\n", __func__);
+	TRACE_ENTER(QMUX_EV_QCC_WAKE, qcc ? qcc->conn : NULL);
 
 	if (qcc) {
 		if (!expired) {
-			fprintf(stderr, "%s: not expired\n", __func__);
+			TRACE_DEVEL("leaving (not expired)", QMUX_EV_QCC_WAKE, qcc->conn);
 			return t;
 		}
 
 		if (!qcc_may_expire(qcc)) {
-			fprintf(stderr, "%s: cannot expire\n", __func__);
+			TRACE_DEVEL("leaving (cannot expired)", QMUX_EV_QCC_WAKE, qcc->conn);
 			t->expire = TICK_ETERNITY;
 			return t;
 		}
 	}
 
-	fprintf(stderr, "%s: timeout\n", __func__);
 	task_destroy(t);
 
-	if (!qcc)
+	if (!qcc) {
+		TRACE_DEVEL("leaving (not more qcc)", QMUX_EV_QCC_WAKE);
 		return NULL;
+	}
 
 	qcc->task = NULL;
 
 	if (qcc_is_dead(qcc))
 		qc_release(qcc);
+
+	TRACE_LEAVE(QMUX_EV_QCC_WAKE);
 
 	return NULL;
 }
@@ -886,15 +1045,15 @@ static void qc_detach(struct conn_stream *cs)
 	struct qcs *qcs = cs->ctx;
 	struct qcc *qcc = qcs->qcc;
 
-	fprintf(stderr, "%s: leaving with tx.buf.data=%lu, tx.xprt_buf.data=%lu\n",
-	        __func__, b_data(&qcs->tx.buf), b_data(&qcs->tx.xprt_buf));
+	TRACE_ENTER(QMUX_EV_STRM_END, qcc->conn, qcs);
 
 	/* TODO on CONNECTION_CLOSE reception, it should be possible to free
 	 * qcs instances. This should be done once the buffering and ACK
 	 * managment between xprt and mux is reorganized.
 	 */
 
-	if ((b_data(&qcs->tx.buf) || b_data(&qcs->tx.xprt_buf))) {
+	if (b_data(&qcs->tx.buf) || qcs->tx.offset > qcs->tx.sent_offset) {
+		TRACE_DEVEL("leaving with remaining data, detaching qcs", QMUX_EV_STRM_END, qcc->conn, qcs);
 		qcs->flags |= QC_SF_DETACH;
 		return;
 	}
@@ -906,6 +1065,8 @@ static void qc_detach(struct conn_stream *cs)
 		qcc->task->expire = tick_add(now_ms, qcc->timeout);
 		task_queue(qcc->task);
 	}
+
+	TRACE_LEAVE(QMUX_EV_STRM_END);
 }
 
 /* Called from the upper layer, to receive data */
@@ -918,7 +1079,7 @@ static size_t qc_rcv_buf(struct conn_stream *cs, struct buffer *buf,
 	size_t ret = 0;
 	char fin = 0;
 
-	fprintf(stderr, "%s\n", __func__);
+	TRACE_ENTER(QMUX_EV_STRM_RECV, qcs->qcc->conn, qcs);
 
 	qcs_htx = htx_from_buf(&qcs->rx.app_buf);
 	if (htx_is_empty(qcs_htx)) {
@@ -972,6 +1133,8 @@ static size_t qc_rcv_buf(struct conn_stream *cs, struct buffer *buf,
 	if (ret)
 		tasklet_wakeup(qcs->qcc->wait_event.tasklet);
 
+	TRACE_LEAVE(QMUX_EV_STRM_RECV, qcs->qcc->conn, qcs);
+
 	return ret;
 }
 
@@ -979,10 +1142,15 @@ static size_t qc_snd_buf(struct conn_stream *cs, struct buffer *buf,
                          size_t count, int flags)
 {
 	struct qcs *qcs = cs->ctx;
+	size_t ret;
 
-	fprintf(stderr, "%s\n", __func__);
+	TRACE_ENTER(QMUX_EV_STRM_SEND, qcs->qcc->conn, qcs);
 
-	return qcs->qcc->app_ops->snd_buf(cs, buf, count, flags);
+	ret = qcs->qcc->app_ops->snd_buf(cs, buf, count, flags);
+
+	TRACE_LEAVE(QMUX_EV_STRM_SEND, qcs->qcc->conn, qcs);
+
+	return ret;
 }
 
 /* Called from the upper layer, to subscribe <es> to events <event_type>. The
@@ -1027,6 +1195,76 @@ static int qc_wake(struct connection *conn)
 
 	return 1;
 }
+
+
+static void qmux_trace_frm(const struct quic_frame *frm)
+{
+	switch (frm->type) {
+	case QUIC_FT_MAX_STREAMS_BIDI:
+		chunk_appendf(&trace_buf, " max_streams=%lu",
+		              frm->max_streams_bidi.max_streams);
+		break;
+
+	case QUIC_FT_MAX_STREAMS_UNI:
+		chunk_appendf(&trace_buf, " max_streams=%lu",
+		              frm->max_streams_uni.max_streams);
+		break;
+
+	default:
+		break;
+	}
+}
+
+/* quic-mux trace handler */
+static void qmux_trace(enum trace_level level, uint64_t mask,
+                       const struct trace_source *src,
+                       const struct ist where, const struct ist func,
+                       const void *a1, const void *a2, const void *a3, const void *a4)
+{
+	const struct connection *conn = a1;
+	const struct qcc *qcc   = conn ? conn->ctx : NULL;
+	const struct qcs *qcs   = a2;
+
+	if (!qcc)
+		return;
+
+	if (src->verbosity > QMUX_VERB_CLEAN) {
+		chunk_appendf(&trace_buf, " : qcc=%p(F)", qcc);
+
+		if (qcs)
+			chunk_appendf(&trace_buf, " qcs=%p(%lu)", qcs, qcs->id);
+
+		if (mask & QMUX_EV_QCC_NQCS) {
+			const uint64_t *id = a3;
+			chunk_appendf(&trace_buf, " id=%lu", *id);
+		}
+
+		if (mask & QMUX_EV_SEND_FRM)
+			qmux_trace_frm(a3);
+
+		if (mask & QMUX_EV_QCS_PUSH_FRM) {
+			const struct qcs_push_frm_trace_arg *arg = a3;
+			chunk_appendf(&trace_buf, " sent=%lu xfer=%d fin=%d offset=%lu",
+			              arg->sent, arg->xfer, arg->fin, arg->offset);
+		}
+	}
+}
+
+/* Function to automatically activate QUIC MUX traces on stdout.
+ * Activated via the compilation flag -DENABLE_QUIC_STDOUT_TRACES.
+ * Main use for now is in the docker image for QUIC interop testing.
+ */
+static void qmux_init_stdout_traces(void)
+{
+#ifdef ENABLE_QUIC_STDOUT_TRACES
+	trace_qmux.sink = sink_find("stdout");
+	trace_qmux.level = TRACE_LEVEL_DEVELOPER;
+	trace_qmux.state = TRACE_STATE_RUNNING;
+	trace_qmux.verbosity = QMUX_VERB_MINIMAL;
+#endif
+}
+INITCALL0(STG_INIT, qmux_init_stdout_traces);
+
 
 static const struct mux_ops qc_ops = {
 	.init = qc_init,
