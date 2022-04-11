@@ -61,12 +61,12 @@ int quic_tls_derive_initial_secrets(const EVP_MD *md,
 
 int quic_tls_encrypt(unsigned char *buf, size_t len,
                      const unsigned char *aad, size_t aad_len,
-                     const EVP_CIPHER *aead,
+                     EVP_CIPHER_CTX *ctx, const EVP_CIPHER *aead,
                      const unsigned char *key, const unsigned char *iv);
 
 int quic_tls_decrypt(unsigned char *buf, size_t len,
                      unsigned char *aad, size_t aad_len,
-                     const EVP_CIPHER *aead,
+                     EVP_CIPHER_CTX *tls_ctx, const EVP_CIPHER *aead,
                      const unsigned char *key, const unsigned char *iv);
 
 int quic_tls_generate_retry_integrity_tag(unsigned char *odcid, size_t odcid_len,
@@ -78,6 +78,11 @@ int quic_tls_derive_keys(const EVP_CIPHER *aead, const EVP_CIPHER *hp,
                          unsigned char *iv, size_t ivlen,
                          unsigned char *hp_key, size_t hp_keylen,
                          const unsigned char *secret, size_t secretlen);
+
+int quic_tls_rx_ctx_init(EVP_CIPHER_CTX **rx_ctx,
+                         const EVP_CIPHER *aead, unsigned char *key);
+int quic_tls_tx_ctx_init(EVP_CIPHER_CTX **tx_ctx,
+                         const EVP_CIPHER *aead, unsigned char *key);
 
 int quic_tls_sec_update(const EVP_MD *md,
                         unsigned char *new_sec, size_t new_seclen,
@@ -370,10 +375,15 @@ static inline void quic_tls_ctx_secs_free(struct quic_tls_ctx *ctx)
 		memset(ctx->tx.key, 0, ctx->tx.keylen);
 		ctx->tx.keylen = 0;
 	}
+
+	EVP_CIPHER_CTX_free(ctx->rx.ctx);
 	pool_free(pool_head_quic_tls_iv,  ctx->rx.iv);
 	pool_free(pool_head_quic_tls_key, ctx->rx.key);
+
+	EVP_CIPHER_CTX_free(ctx->tx.ctx);
 	pool_free(pool_head_quic_tls_iv,  ctx->tx.iv);
 	pool_free(pool_head_quic_tls_key, ctx->tx.key);
+
 	ctx->rx.iv = ctx->tx.iv = NULL;
 	ctx->rx.key = ctx->tx.key = NULL;
 }
@@ -507,11 +517,17 @@ static inline int qc_new_isecs(struct quic_conn *qc,
 	                          rx_init_sec, sizeof rx_init_sec))
 		goto err;
 
+	if (!quic_tls_rx_ctx_init(&rx_ctx->ctx, rx_ctx->aead, rx_ctx->key))
+		goto err;
+
 	if (!quic_tls_derive_keys(ctx->tx.aead, ctx->tx.hp, ctx->tx.md,
 	                          tx_ctx->key, tx_ctx->keylen,
 	                          tx_ctx->iv, tx_ctx->ivlen,
 	                          tx_ctx->hp_key, sizeof tx_ctx->hp_key,
 	                          tx_init_sec, sizeof tx_init_sec))
+		goto err;
+
+	if (!quic_tls_tx_ctx_init(&tx_ctx->ctx, tx_ctx->aead, tx_ctx->key))
 		goto err;
 
 	ctx->flags |= QUIC_FL_TLS_SECRETS_SET;
@@ -530,12 +546,15 @@ static inline int qc_new_isecs(struct quic_conn *qc,
  */
 static inline void quic_tls_ku_free(struct quic_conn *qc)
 {
+	EVP_CIPHER_CTX_free(qc->ku.prv_rx.ctx);
 	pool_free(pool_head_quic_tls_secret, qc->ku.prv_rx.secret);
 	pool_free(pool_head_quic_tls_iv,     qc->ku.prv_rx.iv);
 	pool_free(pool_head_quic_tls_key,    qc->ku.prv_rx.key);
+	EVP_CIPHER_CTX_free(qc->ku.nxt_rx.ctx);
 	pool_free(pool_head_quic_tls_secret, qc->ku.nxt_rx.secret);
 	pool_free(pool_head_quic_tls_iv,     qc->ku.nxt_rx.iv);
 	pool_free(pool_head_quic_tls_key,    qc->ku.nxt_rx.key);
+	EVP_CIPHER_CTX_free(qc->ku.nxt_tx.ctx);
 	pool_free(pool_head_quic_tls_secret, qc->ku.nxt_tx.secret);
 	pool_free(pool_head_quic_tls_iv,     qc->ku.nxt_tx.iv);
 	pool_free(pool_head_quic_tls_key,    qc->ku.nxt_tx.key);

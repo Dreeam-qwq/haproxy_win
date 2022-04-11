@@ -591,6 +591,8 @@ static int h1_avail_streams(struct connection *conn)
 /* Refresh the h1c task timeout if necessary */
 static void h1_refresh_timeout(struct h1c *h1c)
 {
+	int is_idle_conn = 0;
+
 	if (h1c->task) {
 		if (!(h1c->flags & H1C_F_ST_ALIVE) || (h1c->flags & H1C_F_ST_SHUTDOWN)) {
 			/* half-closed or dead connections : switch to clientfin/serverfin
@@ -599,6 +601,7 @@ static void h1_refresh_timeout(struct h1c *h1c)
 			 */
 			h1c->task->expire = tick_add(now_ms, h1c->shut_timeout);
 			TRACE_DEVEL("refreshing connection's timeout (dead or half-closed)", H1_EV_H1C_SEND|H1_EV_H1C_RECV, h1c->conn);
+			is_idle_conn = 1;
 		}
 		else if (b_data(&h1c->obuf)) {
 			/* connection with pending outgoing data, need a timeout (server or client). */
@@ -609,6 +612,10 @@ static void h1_refresh_timeout(struct h1c *h1c)
 			/* front connections waiting for a fully usable stream need a timeout. */
 			h1c->task->expire = tick_add(now_ms, h1c->timeout);
 			TRACE_DEVEL("refreshing connection's timeout (alive front h1c but not ready)", H1_EV_H1C_SEND|H1_EV_H1C_RECV, h1c->conn);
+			/* A frontend connection not yet ready could be treated the same way as an idle
+			 * one in case of soft-close.
+			 */
+			is_idle_conn = 1;
 		}
 		else  {
 			/* alive back connections of front connections with a conn-stream attached */
@@ -618,6 +625,36 @@ static void h1_refresh_timeout(struct h1c *h1c)
 
 		/* Finally set the idle expiration date if shorter */
 		h1c->task->expire = tick_first(h1c->task->expire, h1c->idle_exp);
+
+		if ((h1c->px->flags & (PR_FL_DISABLED|PR_FL_STOPPED)) &&
+		     is_idle_conn && tick_isset(global.close_spread_end)) {
+			/* If a soft-stop is in progress and a close-spread-time
+			 * is set, we want to spread idle connection closing roughly
+			 * evenly across the defined window. This should only
+			 * act on idle frontend connections.
+			 * If the window end is already in the past, we wake the
+			 * timeout task up immediately so that it can be closed.
+			 */
+			int remaining_window = tick_remain(now_ms, global.close_spread_end);
+			if (remaining_window) {
+				/* We don't need to reset the expire if it would
+				 * already happen before the close window end.
+				 */
+				if (tick_is_le(global.close_spread_end, h1c->task->expire)) {
+					/* Set an expire value shorter than the current value
+					 * because the close spread window end comes earlier.
+					 */
+					h1c->task->expire = tick_add(now_ms, statistical_prng_range(remaining_window));
+					TRACE_DEVEL("connection timeout set to value before close-spread window end", H1_EV_H1C_SEND|H1_EV_H1C_RECV, h1c->conn);
+				}
+			}
+			else {
+				/* We are past the soft close window end, wake the timeout
+				 * task up immediately.
+				 */
+				task_wakeup(h1c->task, TASK_WOKEN_TIMER);
+			}
+		}
 		TRACE_DEVEL("new expiration date", H1_EV_H1C_SEND|H1_EV_H1C_RECV, h1c->conn, 0, 0, (size_t[]){h1c->task->expire});
 		task_queue(h1c->task);
 	}
@@ -1975,6 +2012,8 @@ static size_t h1_process_mux(struct h1c *h1c, struct buffer *buf, size_t count)
 						goto error;
 					}
 					h1m->curr_len -= count;
+					if (!h1m->curr_len)
+						last_data = 1;
 				}
 				if (chn_htx->flags & HTX_FL_EOM) {
 					TRACE_DEVEL("last message block", H1_EV_TX_DATA|H1_EV_TX_BODY, h1c->conn, h1s);
@@ -2282,8 +2321,9 @@ static size_t h1_process_mux(struct h1c *h1c, struct buffer *buf, size_t count)
 					TRACE_STATE("1xx response xferred", H1_EV_TX_DATA|H1_EV_TX_HDRS, h1c->conn, h1s);
 				}
 				else {
-					/* EOM flag is set and it is the last block */
-					if (htx_is_unique_blk(chn_htx, blk) && (chn_htx->flags & HTX_FL_EOM)) {
+					/* EOM flag is set or empty payload (C-L to 0) and it is the last block */
+					if (htx_is_unique_blk(chn_htx, blk) &&
+					    ((chn_htx->flags & HTX_FL_EOM) || ((h1m->flags & H1_MF_CLEN) && !h1m->curr_len))) {
 						if (h1m->flags & H1_MF_CHNK) {
 							if (!chunk_memcat(&tmp, "\r\n0\r\n\r\n", 7))
 								goto full;
@@ -2381,8 +2421,11 @@ static size_t h1_process_mux(struct h1c *h1c, struct buffer *buf, size_t count)
 						    H1_EV_TX_DATA|H1_EV_TX_BODY, h1c->conn, h1s, 0, (size_t[]){v.len});
 
 			  skip_data:
-				if (h1m->state == H1_MSG_DATA && (h1m->flags & H1_MF_CLEN))
+				if (h1m->state == H1_MSG_DATA && (h1m->flags & H1_MF_CLEN)) {
 					h1m->curr_len -= vlen;
+					if (!h1m->curr_len)
+						last_data = 1;
+				}
 				if (last_data)
 					goto done;
 				break;
@@ -2432,7 +2475,7 @@ static size_t h1_process_mux(struct h1c *h1c, struct buffer *buf, size_t count)
 				goto error; /* For now return an error */
 
 			  done:
-				if (!(chn_htx->flags & HTX_FL_EOM)) {
+				if (!(chn_htx->flags & HTX_FL_EOM) && (!(h1m->flags & H1_MF_CLEN) || h1m->curr_len)) {
 					TRACE_STATE("No EOM flags in done state", H1_EV_TX_DATA|H1_EV_H1C_ERR|H1_EV_H1S_ERR, h1c->conn, h1s);
 					goto error; /* For now return an error */
 				}
@@ -3005,8 +3048,25 @@ static int h1_process(struct h1c * h1c)
 	if (!(h1c->flags & H1C_F_IS_BACK)) {
 		if (unlikely(h1c->px->flags & (PR_FL_DISABLED|PR_FL_STOPPED))) {
 			if (!(h1c->px->options & PR_O_IDLE_CLOSE_RESP) &&
-				h1c->flags & H1C_F_WAIT_NEXT_REQ)
-				goto release;
+				h1c->flags & H1C_F_WAIT_NEXT_REQ) {
+
+				int send_close = 1;
+				/* If a close-spread-time option is set, we want to avoid
+				 * closing all the active HTTP2 connections at once so we add a
+				 * random factor that will spread the closing.
+				 */
+				if (tick_isset(global.close_spread_end)) {
+					int remaining_window = tick_remain(now_ms, global.close_spread_end);
+					if (remaining_window) {
+						/* This should increase the closing rate the
+						 * further along the window we are.
+						 */
+						send_close = (remaining_window <= statistical_prng_range(global.close_spread_time));
+					}
+				}
+				if (send_close)
+					goto release;
+			}
 		}
 	}
 

@@ -690,31 +690,44 @@ static void httpclient_applet_io_handler(struct appctx *appctx)
 				/* call the payload callback */
 				{
 					if (hc->ops.req_payload) {
+						struct htx *hc_htx;
 
 						/* call the request callback */
 						hc->ops.req_payload(hc);
-						/* check if the request buffer is empty */
 
+						hc_htx = htx_from_buf(&hc->req.buf);
 						htx = htx_from_buf(&req->buf);
-						if (!htx_is_empty(htx))
-							goto more;
-						/* Here htx_to_buf() will set buffer data to 0 because
-						 * the HTX is empty, and allow us to do an xfer.
-						 */
-						htx_to_buf(htx, &req->buf);
 
-						ret = b_xfer(&req->buf, &hc->req.buf, b_data(&hc->req.buf));
-						if (!ret)
+						if (htx_is_empty(hc_htx))
 							goto more;
+
+						if (htx_is_empty(htx)) {
+							size_t data = hc_htx->data;
+
+							/* Here htx_to_buf() will set buffer data to 0 because
+							 * the HTX is empty, and allow us to do an xfer.
+							 */
+							htx_to_buf(hc_htx, &hc->req.buf);
+							htx_to_buf(htx, &req->buf);
+							b_xfer(&req->buf, &hc->req.buf, b_data(&hc->req.buf));
+							channel_add_input(req, data);
+						} else {
+							struct htx_ret ret;
+
+							ret = htx_xfer_blks(htx, hc_htx, hc_htx->data, HTX_BLK_UNUSED);
+							channel_add_input(req, ret.ret);
+
+							/* we must copy the EOM if we empty the buffer */
+							if (htx_is_empty(hc_htx)) {
+								htx->flags |= (hc_htx->flags & HTX_FL_EOM);
+							}
+							htx_to_buf(htx, &req->buf);
+							htx_to_buf(hc_htx, &hc->req.buf);
+						}
+
 
 						if (!b_data(&hc->req.buf))
 							b_free(&hc->req.buf);
-
-						htx = htx_from_buf(&req->buf);
-						if (!htx)
-							goto more;
-
-						channel_add_input(req, htx->data);
 					}
 
 					htx = htx_from_buf(&req->buf);
@@ -935,8 +948,6 @@ more:
 	return;
 
 end:
-	if (hc->ops.res_end)
-		hc->ops.res_end(hc);
 	si_shutw(si);
 	si_shutr(si);
 	return;
@@ -952,6 +963,8 @@ static void httpclient_applet_release(struct appctx *appctx)
 	 * again from the caller */
 	hc->appctx = NULL;
 
+	if (hc->ops.res_end)
+		hc->ops.res_end(hc);
 
 	/* destroy the httpclient when set to autotokill */
 	if (hc->flags & HTTPCLIENT_FA_AUTOKILL) {
@@ -987,10 +1000,13 @@ static int httpclient_init()
 
 	proxy_preset_defaults(httpclient_proxy);
 
+	httpclient_proxy->options |= PR_O_WREQ_BODY;
+	httpclient_proxy->retry_type |= PR_RE_CONN_FAILED | PR_RE_DISCONNECTED | PR_RE_TIMEOUT;
 	httpclient_proxy->options2 |= PR_O2_INDEPSTR;
 	httpclient_proxy->mode = PR_MODE_HTTP;
 	httpclient_proxy->maxconn = 0;
 	httpclient_proxy->accept = NULL;
+	httpclient_proxy->conn_retries = CONN_RETRIES;
 	httpclient_proxy->timeout.client = TICK_ETERNITY;
 	/* The HTTP Client use the "option httplog" with the global log server */
 	httpclient_proxy->conf.logformat_string = default_http_log_format;

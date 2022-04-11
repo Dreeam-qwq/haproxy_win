@@ -21,8 +21,16 @@
 #define _OPENTRACING_VARS_H_
 
 #define FLT_OT_VARS_SCOPE       "txn"
+#define FLT_OT_VAR_CTX_SIZE     int8_t
 #define FLT_OT_VAR_CHAR_DASH    'D'
 #define FLT_OT_VAR_CHAR_SPACE   'S'
+
+struct flt_ot_ctx {
+	char value[BUFSIZ];
+	int  value_len;
+};
+
+typedef int (*flt_ot_ctx_loop_cb)(struct sample *, size_t, const char *, const char *, const char *, FLT_OT_VAR_CTX_SIZE, char **, void *);
 
 
 #ifndef DEBUG_OT
@@ -32,9 +40,7 @@ void                 flt_ot_vars_dump(struct stream *s);
 #endif
 int                  flt_ot_var_register(const char *scope, const char *prefix, const char *name, char **err);
 int                  flt_ot_var_set(struct stream *s, const char *scope, const char *prefix, const char *name, const char *value, uint opt, char **err);
-int                  flt_ot_var_unset(struct stream *s, const char *scope, const char *prefix, const char *name, uint opt, char **err);
 int                  flt_ot_vars_unset(struct stream *s, const char *scope, const char *prefix, uint opt, char **err);
-int                  flt_ot_var_get(struct stream *s, const char *scope, const char *prefix, const char *name, char **value, uint opt, char **err);
 struct otc_text_map *flt_ot_vars_get(struct stream *s, const char *scope, const char *prefix, uint opt, char **err);
 
 #endif /* _OPENTRACING_VARS_H_ */

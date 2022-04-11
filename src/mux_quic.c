@@ -462,7 +462,11 @@ static void qcs_destroy(struct qcs *qcs)
 
 static inline int qcc_is_dead(const struct qcc *qcc)
 {
-	if (!qcc->strms[QCS_CLT_BIDI].nb_streams && !qcc->task)
+	if (qcc->app_ops && qcc->app_ops->is_active &&
+	    qcc->app_ops->is_active(qcc, qcc->ctx))
+		return 0;
+
+	if ((qcc->conn->flags & CO_FL_ERROR) || !qcc->task)
 		return 1;
 
 	return 0;
@@ -471,14 +475,7 @@ static inline int qcc_is_dead(const struct qcc *qcc)
 /* Return true if the mux timeout should be armed. */
 static inline int qcc_may_expire(struct qcc *qcc)
 {
-
-	/* Consider that the timeout must be set if no bidirectional streams
-	 * are opened.
-	 */
-	if (!qcc->strms[QCS_CLT_BIDI].nb_streams)
-		return 1;
-
-	return 0;
+	return !qcc->nb_cs;
 }
 
 /* release function. This one should be called to free all resources allocated
@@ -501,6 +498,11 @@ static void qc_release(struct qcc *qcc)
 
 		if (qcc->app_ops && qcc->app_ops->release)
 			qcc->app_ops->release(qcc->ctx);
+
+		if (qcc->task) {
+			task_destroy(qcc->task);
+			qcc->task = NULL;
+		}
 
 		if (qcc->wait_event.tasklet)
 			tasklet_free(qcc->wait_event.tasklet);
@@ -746,6 +748,36 @@ static int qc_send_frames(struct qcc *qcc, struct list *frms)
 	return 0;
 }
 
+/* Send a MAX_STREAM_BIDI frame to update the limit of bidirectional streams
+ * allowed to be opened by the peer. The caller should have first checked if
+ * this is required with qc_is_max_streams_needed.
+ *
+ * Returns 0 on success else non-zero.
+ */
+static int qc_send_max_streams(struct qcc *qcc)
+{
+	struct list frms = LIST_HEAD_INIT(frms);
+	struct quic_frame *frm;
+
+	frm = pool_zalloc(pool_head_quic_frame);
+	BUG_ON(!frm); /* TODO handle this properly */
+
+	frm->type = QUIC_FT_MAX_STREAMS_BIDI;
+	frm->max_streams_bidi.max_streams = qcc->lfctl.ms_bidi +
+	                                    qcc->lfctl.cl_bidi_r;
+	TRACE_DEVEL("sending MAX_STREAMS frame", QMUX_EV_SEND_FRM, qcc->conn, NULL, frm);
+	LIST_APPEND(&frms, &frm->list);
+
+	if (qc_send_frames(qcc, &frms))
+		return 1;
+
+	/* save the new limit if the frame has been send. */
+	qcc->lfctl.ms_bidi += qcc->lfctl.cl_bidi_r;
+	qcc->lfctl.cl_bidi_r = 0;
+
+	return 0;
+}
+
 /* Proceed to sending. Loop through all available streams for the <qcc>
  * instance and try to send as much as possible.
  *
@@ -758,6 +790,15 @@ static int qc_send(struct qcc *qcc)
 	int total = 0;
 
 	TRACE_ENTER(QMUX_EV_QCC_SEND);
+
+	if (qcc->conn->flags & CO_FL_SOCK_WR_SH) {
+		qcc->conn->flags |= CO_FL_ERROR;
+		TRACE_DEVEL("leaving on error", QMUX_EV_QCC_SEND, qcc->conn);
+		return 0;
+	}
+
+	if (qc_is_max_streams_needed(qcc))
+		qc_send_max_streams(qcc);
 
 	if (qcc->flags & QC_CF_BLK_MFCTL)
 		return 0;
@@ -852,51 +893,23 @@ static int qc_release_detached_streams(struct qcc *qcc)
 	return release;
 }
 
-/* Send a MAX_STREAM_BIDI frame to update the limit of bidirectional streams
- * allowed to be opened by the peer. The caller should have first checked if
- * this is required with qc_is_max_streams_needed.
- *
- * Returns 0 on success else non-zero.
- */
-static int qc_send_max_streams(struct qcc *qcc)
-{
-	struct list frms = LIST_HEAD_INIT(frms);
-	struct quic_frame *frm;
-
-	frm = pool_zalloc(pool_head_quic_frame);
-	BUG_ON(!frm); /* TODO handle this properly */
-
-	frm->type = QUIC_FT_MAX_STREAMS_BIDI;
-	frm->max_streams_bidi.max_streams = qcc->lfctl.ms_bidi +
-	                                    qcc->lfctl.cl_bidi_r;
-	TRACE_DEVEL("sending MAX_STREAMS frame", QMUX_EV_SEND_FRM, qcc->conn, NULL, frm);
-	LIST_APPEND(&frms, &frm->list);
-
-	if (qc_send_frames(qcc, &frms))
-		return 1;
-
-	/* save the new limit if the frame has been send. */
-	qcc->lfctl.ms_bidi += qcc->lfctl.cl_bidi_r;
-	qcc->lfctl.cl_bidi_r = 0;
-
-	return 0;
-}
-
 static struct task *qc_io_cb(struct task *t, void *ctx, unsigned int status)
 {
 	struct qcc *qcc = ctx;
 
 	TRACE_ENTER(QMUX_EV_QCC_WAKE);
 
-	if (qc_is_max_streams_needed(qcc))
-		qc_send_max_streams(qcc);
-
 	qc_send(qcc);
 
 	if (qc_release_detached_streams(qcc)) {
-		/* Schedule the mux timeout if no bidirectional streams left. */
-		if (qcc_may_expire(qcc)) {
-			qcc->task->expire = tick_add(now_ms, qcc->timeout);
+		if (qcc_is_dead(qcc)) {
+			qc_release(qcc);
+		}
+		else {
+			if (qcc_may_expire(qcc))
+				qcc->task->expire = tick_add(now_ms, qcc->timeout);
+			else
+				qcc->task->expire = TICK_ETERNITY;
 			task_queue(qcc->task);
 		}
 	}
@@ -955,6 +968,7 @@ static int qc_init(struct connection *conn, struct proxy *prx,
 
 	qcc->conn = conn;
 	conn->ctx = qcc;
+	qcc->nb_cs = 0;
 	qcc->flags = 0;
 
 	qcc->app_ops = NULL;
@@ -1047,12 +1061,12 @@ static void qc_detach(struct conn_stream *cs)
 
 	TRACE_ENTER(QMUX_EV_STRM_END, qcc->conn, qcs);
 
-	/* TODO on CONNECTION_CLOSE reception, it should be possible to free
-	 * qcs instances. This should be done once the buffering and ACK
-	 * managment between xprt and mux is reorganized.
-	 */
+	cs->ctx = NULL;
+	qcs->cs = NULL;
+	--qcc->nb_cs;
 
-	if (b_data(&qcs->tx.buf) || qcs->tx.offset > qcs->tx.sent_offset) {
+	if ((b_data(&qcs->tx.buf) || qcs->tx.offset > qcs->tx.sent_offset) &&
+	    !(qcc->conn->flags & CO_FL_ERROR)) {
 		TRACE_DEVEL("leaving with remaining data, detaching qcs", QMUX_EV_STRM_END, qcc->conn, qcs);
 		qcs->flags |= QC_SF_DETACH;
 		return;
@@ -1060,9 +1074,14 @@ static void qc_detach(struct conn_stream *cs)
 
 	qcs_destroy(qcs);
 
-	/* Schedule the mux timeout if no bidirectional streams left. */
-	if (qcc_may_expire(qcc)) {
-		qcc->task->expire = tick_add(now_ms, qcc->timeout);
+	if (qcc_is_dead(qcc)) {
+		qc_release(qcc);
+	}
+	else {
+		if (qcc_may_expire(qcc))
+			qcc->task->expire = tick_add(now_ms, qcc->timeout);
+		else
+			qcc->task->expire = TICK_ETERNITY;
 		task_queue(qcc->task);
 	}
 
@@ -1182,17 +1201,74 @@ static int qc_unsubscribe(struct conn_stream *cs, int event_type, struct wait_ev
 	return 0;
 }
 
+/* Loop through all qcs from <qcc>. If CO_FL_ERROR is set on the connection,
+ * report CS_FL_ERR_PENDING|CS_FL_ERROR on the attached conn-streams and wake
+ * them.
+ */
+static int qc_wake_some_streams(struct qcc *qcc)
+{
+	struct qc_stream_desc *stream;
+	struct qcs *qcs;
+	struct eb64_node *node;
+
+	for (node = eb64_first(&qcc->streams_by_id); node;
+	     node = eb64_next(node)) {
+		stream = eb64_entry(node, struct qc_stream_desc, by_id);
+		qcs = stream->ctx;
+
+		if (!qcs->cs)
+			continue;
+
+		if (qcc->conn->flags & CO_FL_ERROR) {
+			qcs->cs->flags |= CS_FL_ERR_PENDING;
+			if (qcs->cs->flags & CS_FL_EOS)
+				qcs->cs->flags |= CS_FL_ERROR;
+
+			if (qcs->subs) {
+				qcs_notify_recv(qcs);
+				qcs_notify_send(qcs);
+			}
+			else if (qcs->cs->data_cb->wake) {
+				qcs->cs->data_cb->wake(qcs->cs);
+			}
+		}
+	}
+
+	return 0;
+}
+
 static int qc_wake(struct connection *conn)
 {
 	struct qcc *qcc = conn->ctx;
+	struct proxy *prx = conn->qc->li->bind_conf->frontend;
+
+	TRACE_ENTER(QMUX_EV_QCC_WAKE, conn);
 
 	/* Check if a soft-stop is in progress.
 	 * Release idling front connection if this is the case.
+	 *
+	 * TODO this is revelant for frontend connections only.
 	 */
-	if (unlikely(conn->qc->li->bind_conf->frontend->flags & (PR_FL_DISABLED|PR_FL_STOPPED))) {
-		qc_release(qcc);
-	}
+	if (unlikely(prx->flags & (PR_FL_DISABLED|PR_FL_STOPPED)))
+		goto release;
 
+	if (conn->qc->flags & QUIC_FL_CONN_NOTIFY_CLOSE)
+		qcc->conn->flags |= (CO_FL_SOCK_RD_SH|CO_FL_SOCK_WR_SH);
+
+	qc_send(qcc);
+
+	qc_wake_some_streams(qcc);
+
+	if (qcc_is_dead(qcc))
+		goto release;
+
+	TRACE_LEAVE(QMUX_EV_QCC_WAKE, conn);
+
+	return 0;
+
+ release:
+	qc_release(qcc);
+	TRACE_DEVEL("leaving after releasing the connection", QMUX_EV_QCC_WAKE);
 	return 1;
 }
 

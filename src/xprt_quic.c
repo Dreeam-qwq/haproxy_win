@@ -177,6 +177,7 @@ static struct quic_tx_packet *qc_build_pkt(unsigned char **pos, const unsigned c
                                            struct quic_conn *qc, size_t dglen, int pkt_type,
                                            int padding, int probe, int cc, int *err);
 static struct task *quic_conn_app_io_cb(struct task *t, void *context, unsigned int state);
+static void qc_idle_timer_do_rearm(struct quic_conn *qc);
 static void qc_idle_timer_rearm(struct quic_conn *qc, int read);
 
 /* Only for debug purpose */
@@ -347,8 +348,12 @@ static void quic_trace(enum trace_level level, uint64_t mask, const struct trace
 			const SSL *ssl = a4;
 
 			if (pkt) {
-				chunk_appendf(&trace_buf, " pkt@%p el=%c",
-				              pkt, quic_packet_type_enc_level_char(pkt->type));
+				chunk_appendf(&trace_buf, " pkt@%p", pkt);
+				if (pkt->type == QUIC_PACKET_TYPE_SHORT && pkt->data)
+					chunk_appendf(&trace_buf, " kp=%d",
+					              !!(*pkt->data & QUIC_PACKET_KEY_PHASE_BIT));
+				chunk_appendf(&trace_buf, " el=%c",
+				              quic_packet_type_enc_level_char(pkt->type));
 				if (pkt->pnl)
 					chunk_appendf(&trace_buf, " pnl=%u pn=%llu", pkt->pnl,
 					              (unsigned long long)pkt->pn);
@@ -728,6 +733,26 @@ static int quic_tls_key_update(struct quic_conn *qc)
 		return 0;
 	}
 
+	if (nxt_rx->ctx) {
+		EVP_CIPHER_CTX_free(nxt_rx->ctx);
+		nxt_rx->ctx = NULL;
+	}
+
+	if (!quic_tls_rx_ctx_init(&nxt_rx->ctx, tls_ctx->rx.aead, nxt_rx->key)) {
+		TRACE_DEVEL("could not initial RX TLS cipher context", QUIC_EV_CONN_RWSEC, qc);
+		return 0;
+	}
+
+	if (nxt_tx->ctx) {
+		EVP_CIPHER_CTX_free(nxt_tx->ctx);
+		nxt_tx->ctx = NULL;
+	}
+
+	if (!quic_tls_rx_ctx_init(&nxt_tx->ctx, tls_ctx->tx.aead, nxt_tx->key)) {
+		TRACE_DEVEL("could not initial RX TLS cipher context", QUIC_EV_CONN_RWSEC, qc);
+		return 0;
+	}
+
 	return 1;
 }
 
@@ -739,34 +764,42 @@ static void quic_tls_rotate_keys(struct quic_conn *qc)
 {
 	struct quic_tls_ctx *tls_ctx = &qc->els[QUIC_TLS_ENC_LEVEL_APP].tls_ctx;
 	unsigned char *curr_secret, *curr_iv, *curr_key;
+	EVP_CIPHER_CTX *curr_ctx;
 
 	/* Rotate the RX secrets */
+	curr_ctx = tls_ctx->rx.ctx;
 	curr_secret = tls_ctx->rx.secret;
 	curr_iv = tls_ctx->rx.iv;
 	curr_key = tls_ctx->rx.key;
 
+	tls_ctx->rx.ctx     = qc->ku.nxt_rx.ctx;
 	tls_ctx->rx.secret  = qc->ku.nxt_rx.secret;
 	tls_ctx->rx.iv      = qc->ku.nxt_rx.iv;
 	tls_ctx->rx.key     = qc->ku.nxt_rx.key;
 
+	qc->ku.nxt_rx.ctx    = qc->ku.prv_rx.ctx;
 	qc->ku.nxt_rx.secret = qc->ku.prv_rx.secret;
 	qc->ku.nxt_rx.iv     = qc->ku.prv_rx.iv;
 	qc->ku.nxt_rx.key    = qc->ku.prv_rx.key;
 
+	qc->ku.prv_rx.ctx    = curr_ctx;
 	qc->ku.prv_rx.secret = curr_secret;
 	qc->ku.prv_rx.iv     = curr_iv;
 	qc->ku.prv_rx.key    = curr_key;
 	qc->ku.prv_rx.pn     = tls_ctx->rx.pn;
 
 	/* Update the TX secrets */
+	curr_ctx = tls_ctx->tx.ctx;
 	curr_secret = tls_ctx->tx.secret;
 	curr_iv = tls_ctx->tx.iv;
 	curr_key = tls_ctx->tx.key;
 
+	tls_ctx->tx.ctx    = qc->ku.nxt_tx.ctx;
 	tls_ctx->tx.secret = qc->ku.nxt_tx.secret;
 	tls_ctx->tx.iv     = qc->ku.nxt_tx.iv;
 	tls_ctx->tx.key    = qc->ku.nxt_tx.key;
 
+	qc->ku.nxt_tx.ctx    = curr_ctx;
 	qc->ku.nxt_tx.secret = curr_secret;
 	qc->ku.nxt_tx.iv     = curr_iv;
 	qc->ku.nxt_tx.key    = curr_key;
@@ -808,6 +841,11 @@ int ha_quic_set_encryption_secrets(SSL *ssl, enum ssl_encryption_level_t level,
 		goto err;
 	}
 
+	if (!quic_tls_rx_ctx_init(&rx->ctx, rx->aead, rx->key)) {
+		TRACE_DEVEL("could not initial RX TLS cipher context", QUIC_EV_CONN_RWSEC, qc);
+		goto err;
+	}
+
 	/* Enqueue this connection asap if we could derive O-RTT secrets as
 	 * listener. Note that a listener derives only RX secrets for this
 	 * level.
@@ -822,6 +860,11 @@ int ha_quic_set_encryption_secrets(SSL *ssl, enum ssl_encryption_level_t level,
 	                          tx->iv, tx->ivlen, tx->hp_key, sizeof tx->hp_key,
 	                          write_secret, secret_len)) {
 		TRACE_DEVEL("TX key derivation failed", QUIC_EV_CONN_RWSEC, qc);
+		goto err;
+	}
+
+	if (!quic_tls_tx_ctx_init(&tx->ctx, tx->aead, tx->key)) {
+		TRACE_DEVEL("could not initial RX TLS cipher context", QUIC_EV_CONN_RWSEC, qc);
 		goto err;
 	}
 
@@ -1157,19 +1200,9 @@ static SSL_QUIC_METHOD ha_quic_method = {
  */
 int ssl_quic_initial_ctx(struct bind_conf *bind_conf)
 {
-	struct proxy *curproxy = bind_conf->frontend;
 	struct ssl_bind_conf __maybe_unused *ssl_conf_cur;
 	int cfgerr = 0;
 
-#if 0
-	/* XXX Did not manage to use this. */
-	const char *ciphers =
-		"TLS_AES_128_GCM_SHA256:"
-		"TLS_AES_256_GCM_SHA384:"
-		"TLS_CHACHA20_POLY1305_SHA256:"
-		"TLS_AES_128_CCM_SHA256";
-#endif
-	const char *groups = "X25519:P-256:P-384:P-521";
 	long options =
 		(SSL_OP_ALL & ~SSL_OP_DONT_INSERT_EMPTY_FRAGMENTS) |
 		SSL_OP_SINGLE_ECDH_USE |
@@ -1180,24 +1213,6 @@ int ssl_quic_initial_ctx(struct bind_conf *bind_conf)
 	bind_conf->initial_ctx = ctx;
 
 	SSL_CTX_set_options(ctx, options);
-#if 0
-	if (SSL_CTX_set_cipher_list(ctx, ciphers) != 1) {
-		ha_alert("Proxy '%s': unable to set TLS 1.3 cipher list to '%s' "
-		         "for bind '%s' at [%s:%d].\n",
-		         curproxy->id, ciphers,
-		         bind_conf->arg, bind_conf->file, bind_conf->line);
-		cfgerr++;
-	}
-#endif
-
-	if (SSL_CTX_set1_curves_list(ctx, groups) != 1) {
-		ha_alert("Proxy '%s': unable to set TLS 1.3 curves list to '%s' "
-		         "for bind '%s' at [%s:%d].\n",
-		         curproxy->id, groups,
-		         bind_conf->arg, bind_conf->file, bind_conf->line);
-		cfgerr++;
-	}
-
 	SSL_CTX_set_mode(ctx, SSL_MODE_RELEASE_BUFFERS);
 	SSL_CTX_set_min_proto_version(ctx, TLS1_3_VERSION);
 	SSL_CTX_set_max_proto_version(ctx, TLS1_3_VERSION);
@@ -1323,7 +1338,7 @@ static int quic_packet_encrypt(unsigned char *payload, size_t payload_len,
                                unsigned char *aad, size_t aad_len, uint64_t pn,
                                struct quic_tls_ctx *tls_ctx, struct quic_conn *qc)
 {
-	unsigned char iv[12];
+	unsigned char iv[QUIC_TLS_IV_LEN];
 	unsigned char *tx_iv = tls_ctx->tx.iv;
 	size_t tx_iv_sz = tls_ctx->tx.ivlen;
 	struct enc_debug_info edi;
@@ -1334,7 +1349,7 @@ static int quic_packet_encrypt(unsigned char *payload, size_t payload_len,
 	}
 
 	if (!quic_tls_encrypt(payload, payload_len, aad, aad_len,
-	                      tls_ctx->tx.aead, tls_ctx->tx.key, iv)) {
+	                      tls_ctx->tx.ctx, tls_ctx->tx.aead, tls_ctx->tx.key, iv)) {
 		TRACE_DEVEL("QUIC packet encryption failed", QUIC_EV_CONN_HPKT, qc);
 		goto err;
 	}
@@ -1353,8 +1368,9 @@ static int quic_packet_encrypt(unsigned char *payload, size_t payload_len,
 static int qc_pkt_decrypt(struct quic_rx_packet *pkt, struct quic_enc_level *qel)
 {
 	int ret, kp_changed;
-	unsigned char iv[12];
+	unsigned char iv[QUIC_TLS_IV_LEN];
 	struct quic_tls_ctx *tls_ctx = &qel->tls_ctx;
+	EVP_CIPHER_CTX *rx_ctx = tls_ctx->rx.ctx;
 	unsigned char *rx_iv = tls_ctx->rx.iv;
 	size_t rx_iv_sz = tls_ctx->rx.ivlen;
 	unsigned char *rx_key = tls_ctx->rx.key;
@@ -1373,13 +1389,15 @@ static int qc_pkt_decrypt(struct quic_rx_packet *pkt, struct quic_enc_level *qel
 				if (!pkt->qc->ku.prv_rx.pn)
 					return 0;
 
-				rx_iv = pkt->qc->ku.prv_rx.iv;
+				rx_ctx = pkt->qc->ku.prv_rx.ctx;
+				rx_iv  = pkt->qc->ku.prv_rx.iv;
 				rx_key = pkt->qc->ku.prv_rx.key;
 			}
 			else if (pkt->pn > qel->pktns->rx.largest_pn) {
 				/* Next key phase */
 				kp_changed = 1;
-				rx_iv = pkt->qc->ku.nxt_rx.iv;
+				rx_ctx = pkt->qc->ku.nxt_rx.ctx;
+				rx_iv  = pkt->qc->ku.nxt_rx.iv;
 				rx_key = pkt->qc->ku.nxt_rx.key;
 			}
 		}
@@ -1390,7 +1408,7 @@ static int qc_pkt_decrypt(struct quic_rx_packet *pkt, struct quic_enc_level *qel
 
 	ret = quic_tls_decrypt(pkt->data + pkt->aad_len, pkt->len - pkt->aad_len,
 	                       pkt->data, pkt->aad_len,
-	                       tls_ctx->rx.aead, rx_key, iv);
+	                       rx_ctx, tls_ctx->rx.aead, rx_key, iv);
 	if (!ret)
 		return 0;
 
@@ -1407,7 +1425,7 @@ static int qc_pkt_decrypt(struct quic_rx_packet *pkt, struct quic_enc_level *qel
 	}
 
 	/* Update the packet length (required to parse the frames). */
-	pkt->len = pkt->aad_len + ret;
+	pkt->len -= QUIC_TLS_TAG_LEN;
 
 	return 1;
 }
@@ -2576,10 +2594,20 @@ static int qc_parse_pkt_frms(struct quic_rx_packet *pkt, struct ssl_sock_ctx *ct
 			break;
 		case QUIC_FT_CONNECTION_CLOSE:
 		case QUIC_FT_CONNECTION_CLOSE_APP:
-			/* warn the mux to close the connection */
-			if (qc->mux_state == QC_MUX_READY) {
-				qc->qcc->flags |= QC_CF_CC_RECV;
-				tasklet_wakeup(qc->qcc->wait_event.tasklet);
+			if (!(qc->flags & QUIC_FL_CONN_DRAINING)) {
+				TRACE_PROTO("Entering draining state", QUIC_EV_CONN_PRSHPKT, qc);
+				/* RFC 9000 10.2. Immediate Close:
+				 * The closing and draining connection states exist to ensure
+				 * that connections close cleanly and that delayed or reordered
+				 * packets are properly discarded. These states SHOULD persist
+				 * for at least three times the current PTO interval...
+				 *
+				 * Rearm the idle timeout only one time when entering draining
+				 * state.
+				 */
+				qc_idle_timer_do_rearm(qc);
+				qc->flags |= QUIC_FL_CONN_DRAINING|QUIC_FL_CONN_IMMEDIATE_CLOSE;
+				qc_notify_close(qc);
 			}
 			break;
 		case QUIC_FT_HANDSHAKE_DONE:
@@ -3032,6 +3060,26 @@ int qc_send_ppkts(struct qring *qr, struct ssl_sock_ctx *ctx)
 				if (qc->flags & QUIC_FL_CONN_IDLE_TIMER_RESTARTED_AFTER_READ)
 					qc_idle_timer_rearm(qc, 0);
 			}
+			if (!(qc->flags & QUIC_FL_CONN_CLOSING) &&
+			    (pkt->flags & QUIC_FL_TX_PACKET_CC)) {
+				qc->flags |= QUIC_FL_CONN_CLOSING;
+				qc_notify_close(qc);
+
+				/* RFC 9000 10.2. Immediate Close:
+				 * The closing and draining connection states exist to ensure
+				 * that connections close cleanly and that delayed or reordered
+				 * packets are properly discarded. These states SHOULD persist
+				 * for at least three times the current PTO interval...
+				 *
+				 * Rearm the idle timeout only one time when entering closing
+				 * state.
+				 */
+				qc_idle_timer_do_rearm(qc);
+				if (qc->timer_task) {
+					task_destroy(qc->timer_task);
+					qc->timer_task = NULL;
+				}
+			}
 			qc->path->in_flight += pkt->in_flight_len;
 			pkt->pktns->tx.in_flight += pkt->in_flight_len;
 			if (pkt->in_flight_len)
@@ -3134,7 +3182,7 @@ void quic_free_arngs(struct quic_arngs *arngs)
 		ar = eb64_entry(&n->node, struct quic_arng_node, first);
 		next = eb64_next(n);
 		eb64_delete(n);
-		free(ar);
+		pool_free(pool_head_quic_arng, ar);
 		n = next;
 	}
 }
@@ -3555,9 +3603,14 @@ static struct task *quic_conn_app_io_cb(struct task *t, void *context, unsigned 
 	if (!qc_treat_rx_pkts(qel, NULL, ctx, 0))
 		goto err;
 
+	if ((qc->flags & QUIC_FL_CONN_DRAINING) &&
+	    !(qc->flags & QUIC_FL_CONN_IMMEDIATE_CLOSE))
+		goto out;
+
 	if (!qc_send_app_pkts(qc, &qel->pktns->tx.frms))
 		goto err;
 
+out:
 	return t;
 
  err:
@@ -3619,6 +3672,10 @@ struct task *quic_conn_io_cb(struct task *t, void *context, unsigned int state)
 	if (!qc_treat_rx_pkts(qel, next_qel, ctx, force_ack))
 		goto err;
 
+	if ((qc->flags & QUIC_FL_CONN_DRAINING) &&
+	    !(qc->flags & QUIC_FL_CONN_IMMEDIATE_CLOSE))
+		goto out;
+
 	if (zero_rtt && next_qel && !MT_LIST_ISEMPTY(&next_qel->rx.pqpkts) &&
 	    (next_qel->tls_ctx.flags & QUIC_FL_TLS_SECRETS_SET)) {
 		qel = next_qel;
@@ -3676,7 +3733,9 @@ struct task *quic_conn_io_cb(struct task *t, void *context, unsigned int state)
 		goto next_level;
 	}
 
-	MT_LIST_APPEND(qc->tx.qring_list, &qr->mt_list);
+ out:
+	if (qr)
+		MT_LIST_APPEND(qc->tx.qring_list, &qr->mt_list);
 	TRACE_LEAVE(QUIC_EV_CONN_IO_CB, qc, &st);
 	return t;
 
@@ -3758,6 +3817,9 @@ static void quic_conn_release(struct quic_conn *qc)
 	struct eb64_node *node;
 	struct quic_tls_ctx *app_tls_ctx;
 
+	/* We must not free the quic-conn if the MUX is still allocated. */
+	BUG_ON(qc->mux_state == QC_MUX_READY);
+
 	/* free remaining stream descriptors */
 	node = eb64_first(&qc->streams_by_id);
 	while (node) {
@@ -3766,8 +3828,11 @@ static void quic_conn_release(struct quic_conn *qc)
 		stream = eb64_entry(node, struct qc_stream_desc, by_id);
 		node = eb64_next(node);
 
-		eb64_delete(&stream->by_id);
-		pool_free(pool_head_quic_conn_stream, stream);
+		/* all streams attached to the quic-conn are released, so
+		 * qc_stream_desc_free will liberate the stream instance.
+		 */
+		BUG_ON(!stream->release);
+		qc_stream_desc_free(stream);
 	}
 
 	if (qc->idle_timer_task) {
@@ -3812,7 +3877,7 @@ static void quic_conn_release(struct quic_conn *qc)
 	TRACE_PROTO("QUIC conn. freed", QUIC_EV_CONN_FREED, qc);
 }
 
-void quic_close(struct connection *conn, void *xprt_ctx)
+static void quic_close(struct connection *conn, void *xprt_ctx)
 {
 	struct ssl_sock_ctx *conn_ctx = xprt_ctx;
 	struct quic_conn *qc = conn_ctx->qc;
@@ -3821,6 +3886,13 @@ void quic_close(struct connection *conn, void *xprt_ctx)
 
 	/* Next application data can be dropped. */
 	qc->mux_state = QC_MUX_RELEASED;
+
+	/* If the quic-conn timer has already expired free the quic-conn. */
+	if (qc->flags & QUIC_FL_CONN_EXP_TIMER) {
+		quic_conn_release(qc);
+		TRACE_LEAVE(QUIC_EV_CONN_CLOSE);
+		return;
+	}
 
 	TRACE_LEAVE(QUIC_EV_CONN_CLOSE, qc);
 }
@@ -3986,6 +4058,10 @@ static struct quic_conn *qc_new_conn(unsigned int version, int ipv4,
 	/* RX part. */
 	qc->rx.bytes = 0;
 	qc->rx.buf = b_make(buf_area, QUIC_CONN_RX_BUFSZ, 0, 0);
+
+	qc->nb_pkt_for_cc = 1;
+	qc->nb_pkt_since_cc = 0;
+
 	LIST_INIT(&qc->rx.pkt_list);
 	if (!quic_tls_ku_init(qc)) {
 		TRACE_PROTO("Key update initialization failed", QUIC_EV_CONN_INIT, qc);
@@ -4031,21 +4107,27 @@ static int quic_conn_init_timer(struct quic_conn *qc)
 	return 1;
 }
 
+/* Rearm the idle timer for <qc> QUIC connection. */
+static void qc_idle_timer_do_rearm(struct quic_conn *qc)
+{
+	unsigned int expire;
+
+	expire = QUIC_MAX(3 * quic_pto(qc), qc->max_idle_timeout);
+	qc->idle_timer_task->expire = tick_add(now_ms, MS_TO_TICKS(expire));
+}
+
 /* Rearm the idle timer for <qc> QUIC connection depending on <read> boolean
  * which is set to 1 when receiving a packet , and 0 when sending packet
  */
 static void qc_idle_timer_rearm(struct quic_conn *qc, int read)
 {
-	unsigned int expire;
-
-	expire = QUIC_MAX(3 * quic_pto(qc), qc->max_idle_timeout);
 	if (read) {
 		qc->flags |= QUIC_FL_CONN_IDLE_TIMER_RESTARTED_AFTER_READ;
 	}
 	else {
 		qc->flags &= ~QUIC_FL_CONN_IDLE_TIMER_RESTARTED_AFTER_READ;
 	}
-	qc->idle_timer_task->expire = tick_add(now_ms, MS_TO_TICKS(expire));
+	qc_idle_timer_do_rearm(qc);
 }
 
 /* The task handling the idle timeout */
@@ -4053,7 +4135,21 @@ static struct task *qc_idle_timer_task(struct task *t, void *ctx, unsigned int s
 {
 	struct quic_conn *qc = ctx;
 
-	quic_conn_release(qc);
+	/* Notify the MUX before settings QUIC_FL_CONN_EXP_TIMER or the MUX
+	 * might free the quic-conn too early via quic_close().
+	 */
+	qc_notify_close(qc);
+
+	/* If the MUX is still alive, keep the quic-conn. The MUX is
+	 * responsible to call quic_close to release it.
+	 */
+	qc->flags |= QUIC_FL_CONN_EXP_TIMER;
+	if (qc->mux_state != QC_MUX_READY)
+		quic_conn_release(qc);
+
+	/* TODO if the quic-conn cannot be freed because of the MUX, we may at
+	 * least clean some parts of it such as the tasklet.
+	 */
 
 	return NULL;
 }
@@ -4820,6 +4916,17 @@ static ssize_t qc_lstnr_pkt_rcv(unsigned char *buf, const unsigned char *end,
 		pkt->qc = qc;
 	}
 
+	if (qc->flags & QUIC_FL_CONN_CLOSING) {
+		if (++qc->nb_pkt_since_cc >= qc->nb_pkt_for_cc) {
+			qc->flags |= QUIC_FL_CONN_IMMEDIATE_CLOSE;
+			qc->nb_pkt_for_cc++;
+			qc->nb_pkt_since_cc = 0;
+		}
+		/* Skip the entire datagram */
+		pkt->len = end - beg;
+		TRACE_PROTO("Closing state connection", QUIC_EV_CONN_LPKT, pkt->qc);
+		goto out;
+	}
 
 	/* When multiple QUIC packets are coalesced on the same UDP datagram,
 	 * they must have the same DCID.
@@ -5425,8 +5532,12 @@ static int qc_do_build_pkt(unsigned char *pos, const unsigned char *end,
 	}
 
 	/* Build a CONNECTION_CLOSE frame if needed. */
-	if (cc && !qc_build_frm(&pos, end, &cc_frm, pkt, qc))
-		goto no_room;
+	if (cc) {
+		if (!qc_build_frm(&pos, end, &cc_frm, pkt, qc))
+			goto no_room;
+
+		pkt->flags |= QUIC_FL_TX_PACKET_CC;
+	}
 
 	/* Build a PADDING frame if needed. */
 	if (padding_len) {
@@ -5551,6 +5662,8 @@ static struct quic_tx_packet *qc_build_pkt(unsigned char **pos,
 		pkt->in_flight_len = pkt->len;
 		qc->path->prep_in_flight += pkt->len;
 	}
+	/* Always reset this flags */
+	qc->flags &= ~QUIC_FL_CONN_IMMEDIATE_CLOSE;
 	if (pkt->flags & QUIC_FL_TX_PACKET_ACK) {
 		qel->pktns->flags &= ~QUIC_FL_PKTNS_ACK_REQUIRED;
 		qel->pktns->rx.nb_aepkts_since_last_ack = 0;
@@ -5835,6 +5948,19 @@ void qc_stream_desc_release(struct qc_stream_desc *stream,
 		qc_stream_desc_free(stream);
 	else
 		eb64_insert(&qc->streams_by_id, &stream->by_id);
+}
+
+/* Notify the MUX layer if alive about an imminent close of <qc>. */
+void qc_notify_close(struct quic_conn *qc)
+{
+	if (qc->flags & QUIC_FL_CONN_NOTIFY_CLOSE)
+		return;
+
+	qc->flags |= QUIC_FL_CONN_NOTIFY_CLOSE;
+
+	/* wake up the MUX */
+	if (qc->mux_state == QC_MUX_READY && qc->conn->mux->wake)
+		qc->conn->mux->wake(qc->conn);
 }
 
 /* Function to automatically activate QUIC traces on stdout.

@@ -86,13 +86,17 @@ enum quic_tls_pktns {
 	QUIC_TLS_PKTNS_MAX,
 };
 
-/* The ciphersuites for AEAD QUIC-TLS have 16-bytes authentication tag */
+/* The ciphersuites for AEAD QUIC-TLS have 16-bytes authentication tags and
+ * 12 bytes for IVs.
+ */
 #define QUIC_TLS_TAG_LEN             16
+#define QUIC_TLS_IV_LEN              12
 
 extern unsigned char initial_salt[20];
 
 /* Key phase used for Key Update */
 struct quic_tls_kp {
+	EVP_CIPHER_CTX *ctx;
 	unsigned char *secret;
 	size_t secretlen;
 	unsigned char *iv;
@@ -112,6 +116,7 @@ struct quic_tls_kp {
 #define QUIC_FL_TLS_SECRETS_DCD  (1 << 2)
 
 struct quic_tls_secrets {
+	EVP_CIPHER_CTX *ctx;
 	const EVP_CIPHER *aead;
 	const EVP_MD *md;
 	const EVP_CIPHER *hp;
