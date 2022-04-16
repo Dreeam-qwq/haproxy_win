@@ -6,7 +6,7 @@
 # as published by the Free Software Foundation; either version
 # 2 of the License, or (at your option) any later version.
 
-name: Windows
+name: Haproxy Windows
 
 on:
   push:
@@ -35,7 +35,7 @@ jobs:
           - USE_THREAD=1
           - USE_ZLIB=1
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v3
     - uses: msys2/setup-msys2@v2
       with:
         install: >-
@@ -63,5 +63,5 @@ jobs:
     - name: Upload a Build Artifact
       uses: actions/upload-artifact@v2.3.0
       with:
-        name: haproxy
+        name: haproxy_win
         path: ./**.exe
