@@ -50,7 +50,6 @@
 #include <haproxy/quic_tls.h>
 #include <haproxy/sink.h>
 #include <haproxy/ssl_sock.h>
-#include <haproxy/stream_interface.h>
 #include <haproxy/task.h>
 #include <haproxy/trace.h>
 #include <haproxy/xprt_quic.h>
@@ -1442,6 +1441,27 @@ static int qc_stream_desc_free(struct qc_stream_desc *stream)
 	offer_buffers(NULL, 1);
 
 	if (stream->release) {
+		/* Free frames still waiting for an ACK. Even if the stream buf
+		 * is NULL, some frames could still be not acknowledged. This
+		 * is notably the case for retransmission where multiple frames
+		 * points to the same buffer content.
+		 */
+		struct eb64_node *frm_node = eb64_first(&stream->acked_frms);
+		while (frm_node) {
+			struct quic_stream *strm;
+			struct quic_frame *frm;
+
+			strm = eb64_entry(&frm_node->node, struct quic_stream, offset);
+
+			frm_node = eb64_next(frm_node);
+			eb64_delete(&strm->offset);
+
+			frm = container_of(strm, struct quic_frame, stream);
+			LIST_DELETE(&frm->list);
+			quic_tx_packet_refdec(frm->pkt);
+			pool_free(pool_head_quic_frame, frm);
+		}
+
 		eb64_delete(&stream->by_id);
 		pool_free(pool_head_quic_conn_stream, stream);
 
@@ -1491,8 +1511,10 @@ static int quic_stream_try_to_consume(struct quic_conn *qc,
 		pool_free(pool_head_quic_frame, frm);
 	}
 
-	if (!b_data(&stream->buf))
-		qc_stream_desc_free(stream);
+	if (!b_data(&stream->buf)) {
+		if (qc_stream_desc_free(stream))
+			TRACE_PROTO("stream released and freed", QUIC_EV_CONN_ACKSTRM, qc);
+	}
 
 	return ret;
 }
@@ -1548,8 +1570,14 @@ static inline void qc_treat_acked_tx_frm(struct quic_conn *qc,
 
 				if (!b_data(strm_frm->buf)) {
 					if (qc_stream_desc_free(stream)) {
-						/* early return */
-						return;
+						/* stream is freed at this stage,
+						 * no need to continue.
+						 */
+						TRACE_PROTO("stream released and freed", QUIC_EV_CONN_ACKSTRM, qc);
+						LIST_DELETE(&frm->list);
+						quic_tx_packet_refdec(frm->pkt);
+						pool_free(pool_head_quic_frame, frm);
+						break;
 					}
 				}
 			}
@@ -2004,14 +2032,16 @@ static forceinline void qc_ssl_dump_errors(struct connection *conn)
 {
 	if (unlikely(global.mode & MODE_DEBUG)) {
 		while (1) {
+			const char *func = NULL;
 			unsigned long ret;
 
+			ERR_peek_error_func(&func);
 			ret = ERR_get_error();
 			if (!ret)
 				return;
 
 			fprintf(stderr, "conn. @%p OpenSSL error[0x%lx] %s: %s\n", conn, ret,
-			        ERR_func_error_string(ret), ERR_reason_error_string(ret));
+			        func, ERR_reason_error_string(ret));
 		}
 	}
 }
@@ -2067,6 +2097,14 @@ static inline int qc_provide_cdata(struct quic_enc_level *el,
 		}
 
 		TRACE_PROTO("SSL handshake OK", QUIC_EV_CONN_IO_CB, qc, &state);
+
+		/* Check the alpn could be negotiated */
+		if (!qc->app_ops) {
+			TRACE_PROTO("No ALPN", QUIC_EV_CONN_IO_CB, qc, &state);
+			quic_set_tls_alert(qc, SSL_AD_NO_APPLICATION_PROTOCOL);
+			goto err;
+		}
+
 		/* I/O callback switch */
 		ctx->wait_event.tasklet->process = quic_conn_app_io_cb;
 		if (qc_is_listener(ctx->qc)) {
@@ -5691,7 +5729,7 @@ static struct quic_tx_packet *qc_build_pkt(unsigned char **pos,
  */
 static int quic_conn_subscribe(struct connection *conn, void *xprt_ctx, int event_type, struct wait_event *es)
 {
-	struct qcc *qcc = conn->qc->qcc;
+	struct qcc *qcc = conn->handle.qc->qcc;
 
 	BUG_ON(event_type & ~(SUB_RETRY_SEND|SUB_RETRY_RECV));
 	BUG_ON(qcc->subs && qcc->subs != es);
@@ -5700,10 +5738,10 @@ static int quic_conn_subscribe(struct connection *conn, void *xprt_ctx, int even
 	qcc->subs = es;
 
 	if (event_type & SUB_RETRY_RECV)
-		TRACE_DEVEL("subscribe(recv)", QUIC_EV_CONN_XPRTRECV, conn->qc, qcc);
+		TRACE_DEVEL("subscribe(recv)", QUIC_EV_CONN_XPRTRECV, conn->handle.qc, qcc);
 
 	if (event_type & SUB_RETRY_SEND)
-		TRACE_DEVEL("subscribe(send)", QUIC_EV_CONN_XPRTSEND, conn->qc, qcc);
+		TRACE_DEVEL("subscribe(send)", QUIC_EV_CONN_XPRTSEND, conn->handle.qc, qcc);
 
 	return 0;
 }
@@ -5730,7 +5768,7 @@ static int qc_conn_init(struct connection *conn, void **xprt_ctx)
 	if (*xprt_ctx)
 		goto out;
 
-	*xprt_ctx = conn->qc->xprt_ctx;
+	*xprt_ctx = conn->handle.qc->xprt_ctx;
 
  out:
 	TRACE_LEAVE(QUIC_EV_CONN_NEW, qc);
@@ -5744,10 +5782,13 @@ static int qc_xprt_start(struct connection *conn, void *ctx)
 	struct quic_conn *qc;
 	struct ssl_sock_ctx *qctx = ctx;
 
-	qc = conn->qc;
+	qc = conn->handle.qc;
 	if (qcc_install_app_ops(qc->qcc, qc->app_ops)) {
 		TRACE_PROTO("Cannot install app layer", QUIC_EV_CONN_LPKT, qc);
-		return 0;
+		/* prepare a CONNECTION_CLOSE frame */
+		qc->err_code = QC_ERR_APPLICATION_ERROR;
+		qc->flags |= QUIC_FL_CONN_IMMEDIATE_CLOSE;
+		return -1;
 	}
 
 	/* mux-quic can now be considered ready. */
@@ -5755,6 +5796,14 @@ static int qc_xprt_start(struct connection *conn, void *ctx)
 
 	tasklet_wakeup(qctx->wait_event.tasklet);
 	return 1;
+}
+
+static struct ssl_sock_ctx *qc_get_ssl_sock_ctx(struct connection *conn)
+{
+	if (!conn || conn->xprt != xprt_get(XPRT_QUIC) || !conn->handle.qc || !conn->xprt_ctx)
+		return NULL;
+
+	return conn->handle.qc->xprt_ctx;
 }
 
 /* transport-layer operations for QUIC connections. */
@@ -5767,6 +5816,7 @@ static struct xprt_ops ssl_quic = {
 	.prepare_bind_conf = ssl_sock_prepare_bind_conf,
 	.destroy_bind_conf = ssl_sock_destroy_bind_conf,
 	.get_alpn = ssl_sock_get_alpn,
+	.get_ssl_sock_ctx = qc_get_ssl_sock_ctx,
 	.name     = "QUIC",
 };
 

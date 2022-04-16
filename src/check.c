@@ -36,7 +36,7 @@
 #include <haproxy/check.h>
 #include <haproxy/chunk.h>
 #include <haproxy/dgram.h>
-#include <haproxy/dynbuf-t.h>
+#include <haproxy/dynbuf.h>
 #include <haproxy/extcheck.h>
 #include <haproxy/fd.h>
 #include <haproxy/global.h>
@@ -59,7 +59,6 @@
 #include <haproxy/server.h>
 #include <haproxy/ssl_sock.h>
 #include <haproxy/stats-t.h>
-#include <haproxy/stream_interface.h>
 #include <haproxy/task.h>
 #include <haproxy/tcpcheck.h>
 #include <haproxy/thread.h>
@@ -117,7 +116,7 @@ static const struct name_desc check_trace_decoding[] = {
 #define CHK_VERB_CLEAN    1
 	{ .name="clean",    .desc="only user-friendly stuff, generally suitable for level \"user\"" },
 #define CHK_VERB_MINIMAL  2
-	{ .name="minimal",  .desc="report info on stream and stream-interfaces" },
+	{ .name="minimal",  .desc="report info on stream and conn-streams" },
 #define CHK_VERB_SIMPLE   3
 	{ .name="simple",   .desc="add info on request and response channels" },
 #define CHK_VERB_ADVANCED 4
@@ -744,6 +743,8 @@ static int retrieve_errno_from_socket(struct connection *conn)
 	if (!conn_ctrl_ready(conn))
 		return 0;
 
+	BUG_ON(conn->flags & CO_FL_FDLESS);
+
 	if (getsockopt(conn->handle.fd, SOL_SOCKET, SO_ERROR, &skerr, &lskerr) == 0)
 		errno = skerr;
 
@@ -793,7 +794,7 @@ void chk_report_conn_err(struct check *check, int errno_bck, int expired)
 		retrieve_errno_from_socket(conn);
 
 	if (conn && !(conn->flags & CO_FL_ERROR) &&
-	    cs && !(cs->flags & CS_FL_ERROR) && !expired)
+	    cs && !(cs->endp->flags & CS_EP_ERROR) && !expired)
 		return;
 
 	TRACE_ENTER(CHK_EV_HCHK_END|CHK_EV_HCHK_ERR, check, 0, 0, (size_t[]){expired});
@@ -912,7 +913,7 @@ void chk_report_conn_err(struct check *check, int errno_bck, int expired)
 	}
 	else if (conn->flags & CO_FL_WAIT_L4_CONN) {
 		/* L4 not established (yet) */
-		if (conn->flags & CO_FL_ERROR || cs->flags & CS_FL_ERROR)
+		if (conn->flags & CO_FL_ERROR || cs->endp->flags & CS_EP_ERROR)
 			set_server_check_status(check, HCHK_STATUS_L4CON, err_msg);
 		else if (expired)
 			set_server_check_status(check, HCHK_STATUS_L4TOUT, err_msg);
@@ -927,12 +928,12 @@ void chk_report_conn_err(struct check *check, int errno_bck, int expired)
 	}
 	else if (conn->flags & CO_FL_WAIT_L6_CONN) {
 		/* L6 not established (yet) */
-		if (conn->flags & CO_FL_ERROR || cs->flags & CS_FL_ERROR)
+		if (conn->flags & CO_FL_ERROR || cs->endp->flags & CS_EP_ERROR)
 			set_server_check_status(check, HCHK_STATUS_L6RSP, err_msg);
 		else if (expired)
 			set_server_check_status(check, HCHK_STATUS_L6TOUT, err_msg);
 	}
-	else if (conn->flags & CO_FL_ERROR || cs->flags & CS_FL_ERROR) {
+	else if (conn->flags & CO_FL_ERROR || cs->endp->flags & CS_EP_ERROR) {
 		/* I/O error after connection was established and before we could diagnose */
 		set_server_check_status(check, HCHK_STATUS_SOCKERR, err_msg);
 	}
@@ -1035,7 +1036,7 @@ static int wake_srv_chk(struct conn_stream *cs)
 	cs = check->cs;
 	conn = cs_conn(cs);
 
-	if (unlikely(!conn || !cs || conn->flags & CO_FL_ERROR || cs->flags & CS_FL_ERROR)) {
+	if (unlikely(!conn || !cs || conn->flags & CO_FL_ERROR || cs->endp->flags & CS_EP_ERROR)) {
 		/* We may get error reports bypassing the I/O handlers, typically
 		 * the case when sending a pure TCP check which fails, then the I/O
 		 * handlers above are not called. This is completely handled by the
@@ -1051,11 +1052,12 @@ static int wake_srv_chk(struct conn_stream *cs)
 		/* Check complete or aborted. If connection not yet closed do it
 		 * now and wake the check task up to be sure the result is
 		 * handled ASAP. */
-		cs_drain_and_close(cs);
 		ret = -1;
-
-		if (check->wait_list.events)
-			conn->mux->unsubscribe(cs, check->wait_list.events, &check->wait_list);
+		if (conn)  {
+			cs_conn_drain_and_close(cs);
+			if (check->wait_list.events)
+				conn->mux->unsubscribe(cs, check->wait_list.events, &check->wait_list);
+		}
 
 		/* We may have been scheduled to run, and the
 		 * I/O handler expects to have a cs, so remove
@@ -1094,6 +1096,7 @@ struct task *process_chk_conn(struct task *t, void *context, unsigned int state)
 {
 	struct check *check = context;
 	struct proxy *proxy = check->proxy;
+	struct conn_stream *cs;
 	struct connection *conn;
 	int rv;
 	int expired = tick_is_expired(t->expire, now_ms);
@@ -1132,30 +1135,37 @@ struct task *process_chk_conn(struct task *t, void *context, unsigned int state)
 		task_set_affinity(t, tid_bit);
 
 		check->current_step = NULL;
+
+		check->cs = cs_new_from_check(check, CS_FL_NONE);
+		if (!check->cs) {
+			set_server_check_status(check, HCHK_STATUS_SOCKERR, NULL);
+			goto end;
+		}
 		tcpcheck_main(check);
 		expired = 0;
 	}
-
-	conn = cs_conn(check->cs);
 
 	/* there was a test running.
 	 * First, let's check whether there was an uncaught error,
 	 * which can happen on connect timeout or error.
 	 */
 	if (check->result == CHK_RES_UNKNOWN && likely(!(check->state & CHK_ST_PURGE))) {
+		cs = check->cs;
+		conn = (cs ? cs_conn(cs) : NULL);
+
 		/* Here the connection must be defined. Otherwise the
 		 * error would have already been detected
 		 */
-		if ((conn && ((conn->flags & CO_FL_ERROR) || (check->cs->flags & CS_FL_ERROR))) || expired) {
+		if ((conn && ((conn->flags & CO_FL_ERROR) || (cs->endp->flags & CS_EP_ERROR))) || expired) {
 			TRACE_ERROR("report connection error", CHK_EV_TASK_WAKE|CHK_EV_HCHK_END|CHK_EV_HCHK_ERR, check);
 			chk_report_conn_err(check, 0, expired);
 		}
 		else {
 			if (check->state & CHK_ST_CLOSE_CONN) {
 				TRACE_DEVEL("closing current connection", CHK_EV_TASK_WAKE|CHK_EV_HCHK_RUN, check);
-				cs_detach_endp(check->cs);
-				conn = NULL;
 				check->state &= ~CHK_ST_CLOSE_CONN;
+				conn = NULL;
+				cs_reset_endp(check->cs); /* error will be handled by tcpcheck_main() */
 				tcpcheck_main(check);
 			}
 			if (check->result == CHK_RES_UNKNOWN) {
@@ -1169,7 +1179,8 @@ struct task *process_chk_conn(struct task *t, void *context, unsigned int state)
 	TRACE_STATE("health-check complete or aborted", CHK_EV_TASK_WAKE|CHK_EV_HCHK_END, check);
 
 	check->current_step = NULL;
-	conn = cs_conn(check->cs);
+	cs = check->cs;
+	conn = (cs ? cs_conn(cs) : NULL);
 
 	if (conn && conn->xprt) {
 		/* The check was aborted and the connection was not yet closed.
@@ -1177,18 +1188,22 @@ struct task *process_chk_conn(struct task *t, void *context, unsigned int state)
 		 * as a failed response coupled with "observe layer7" caused the
 		 * server state to be suddenly changed.
 		 */
-		cs_drain_and_close(check->cs);
+		cs_conn_drain_and_close(cs);
 	}
 
-	/* TODO: must be handled by cs_detach_endp */
-	if (conn && check->wait_list.events)
-		conn->mux->unsubscribe(check->cs, check->wait_list.events, &check->wait_list);
-	/* We may have been scheduled to run, and the
-	 * I/O handler expects to have a cs, so remove
-	 * the tasklet
-	 */
-	tasklet_remove_from_tasklet_list(check->wait_list.tasklet);
-	cs_detach_endp(check->cs);
+	if (cs) {
+		if (conn && check->wait_list.events)
+			conn->mux->unsubscribe(cs, check->wait_list.events, &check->wait_list);
+		/* We may have been scheduled to run, and the
+		 * I/O handler expects to have a cs, so remove
+		 * the tasklet
+		 */
+		tasklet_remove_from_tasklet_list(check->wait_list.tasklet);
+		cs_detach_endp(cs);
+		cs_detach_app(cs);
+		cs = check->cs = NULL;
+		conn = NULL;
+	}
 
 	if (check->sess != NULL) {
 		vars_prune(&check->vars, check->sess, NULL);
@@ -1196,6 +1211,7 @@ struct task *process_chk_conn(struct task *t, void *context, unsigned int state)
 		check->sess = NULL;
 	}
 
+  end:
 	if (check->server && likely(!(check->state & CHK_ST_PURGE))) {
 		if (check->result == CHK_RES_FAILED) {
 			/* a failure or timeout detected */
@@ -1388,14 +1404,8 @@ int start_check_task(struct check *check, int mininter,
 	/* task for the check. Process-based checks exclusively run on thread 1. */
 	if (check->type == PR_O2_EXT_CHK)
 		t = task_new_on(0);
-	else {
-		check->cs = cs_new();
-		if (!check->cs)
-			goto fail_alloc_cs;
-		if (cs_attach_app(check->cs, &check->obj_type) < 0)
-			goto fail_attach_cs;
+	else
 		t = task_new_anywhere();
-	}
 
 	if (!t)
 		goto fail_alloc_task;
@@ -1418,9 +1428,6 @@ int start_check_task(struct check *check, int mininter,
 	return 1;
 
   fail_alloc_task:
-  fail_attach_cs:
-	cs_free(check->cs);
-  fail_alloc_cs:
 	ha_alert("Starting [%s:%s] check: out of memory.\n",
 		 check->server->proxy->id, check->server->id);
 	return 0;

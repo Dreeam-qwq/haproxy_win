@@ -117,9 +117,19 @@ struct qcs *qcs_new(struct qcc *qcc, uint64_t id, enum qcs_type type)
 	qcs->cs = NULL;
 	qcs->flags = QC_SF_NONE;
 
+	qcs->endp = cs_endpoint_new();
+	if (!qcs->endp) {
+		pool_free(pool_head_qcs, qcs);
+		return NULL;
+	}
+	qcs->endp->target = qcs;
+	qcs->endp->ctx = qcc->conn;
+	qcs->endp->flags |= (CS_EP_T_MUX|CS_EP_ORPHAN|CS_EP_NOT_FIRST);
+
 	qcs->id = id;
 	/* store transport layer stream descriptor in qcc tree */
 	eb64_insert(&qcc->streams_by_id, &stream->by_id);
+
 	qcc->strms[type].nb_streams++;
 
 	/* If stream is local, use peer remote-limit, or else the opposite. */
@@ -159,7 +169,9 @@ void qcs_free(struct qcs *qcs)
 
 	/* stream desc must be removed from MUX tree before release it */
 	eb64_delete(&qcs->stream->by_id);
-	qc_stream_desc_release(qcs->stream, qcs->qcc->conn->qc);
+	qc_stream_desc_release(qcs->stream, qcs->qcc->conn->handle.qc);
+	BUG_ON(qcs->endp && !(qcs->endp->flags & CS_EP_ORPHAN));
+	cs_endpoint_free(qcs->endp);
 	pool_free(pool_head_qcs, qcs);
 }
 
@@ -483,45 +495,36 @@ static inline int qcc_may_expire(struct qcc *qcc)
  */
 static void qc_release(struct qcc *qcc)
 {
-	struct connection *conn = NULL;
+	struct connection *conn = qcc->conn;
+	struct eb64_node *node;
 
 	TRACE_ENTER(QMUX_EV_QCC_END);
 
-	if (qcc) {
-		struct eb64_node *node;
+	if (qcc->app_ops && qcc->app_ops->release)
+		qcc->app_ops->release(qcc->ctx);
 
-		/* The connection must be aattached to this mux to be released */
-		if (qcc->conn && qcc->conn->ctx == qcc)
-			conn = qcc->conn;
-
-		TRACE_DEVEL("freeing qcc", QMUX_EV_QCC_END, conn);
-
-		if (qcc->app_ops && qcc->app_ops->release)
-			qcc->app_ops->release(qcc->ctx);
-
-		if (qcc->task) {
-			task_destroy(qcc->task);
-			qcc->task = NULL;
-		}
-
-		if (qcc->wait_event.tasklet)
-			tasklet_free(qcc->wait_event.tasklet);
-
-		/* liberate remaining qcs instances */
-		node = eb64_first(&qcc->streams_by_id);
-		while (node) {
-			struct qc_stream_desc *stream = eb64_entry(node, struct qc_stream_desc, by_id);
-			node = eb64_next(node);
-			qcs_free(stream->ctx);
-		}
-
-		pool_free(pool_head_qcc, qcc);
+	if (qcc->task) {
+		task_destroy(qcc->task);
+		qcc->task = NULL;
 	}
+
+	if (qcc->wait_event.tasklet)
+		tasklet_free(qcc->wait_event.tasklet);
+
+	/* liberate remaining qcs instances */
+	node = eb64_first(&qcc->streams_by_id);
+	while (node) {
+		struct qc_stream_desc *stream = eb64_entry(node, struct qc_stream_desc, by_id);
+		node = eb64_next(node);
+		qcs_free(stream->ctx);
+	}
+
+	pool_free(pool_head_qcc, qcc);
 
 	if (conn) {
 		LIST_DEL_INIT(&conn->stopping_list);
 
-		conn->qc->conn = NULL;
+		conn->handle.qc->conn = NULL;
 		conn->mux = NULL;
 		conn->ctx = NULL;
 
@@ -715,7 +718,7 @@ static int qc_send_frames(struct qcc *qcc, struct list *frms)
 	}
 
 	if (!LIST_ISEMPTY(frms))
-		qc_send_app_pkts(qcc->conn->qc, frms);
+		qc_send_app_pkts(qcc->conn->handle.qc, frms);
 
 	/* If there is frames left, check if the transport layer has send some
 	 * data or is blocked.
@@ -976,7 +979,7 @@ static int qc_init(struct connection *conn, struct proxy *prx,
 	qcc->streams_by_id = EB_ROOT_UNIQUE;
 
 	/* Server parameters, params used for RX flow control. */
-	lparams = &conn->qc->rx.params;
+	lparams = &conn->handle.qc->rx.params;
 
 	qcc->rx.max_data = lparams->initial_max_data;
 	qcc->tx.sent_offsets = 0;
@@ -1010,7 +1013,7 @@ static int qc_init(struct connection *conn, struct proxy *prx,
 	qcc->lfctl.ms_bidi = qcc->lfctl.ms_bidi_init = lparams->initial_max_streams_bidi;
 	qcc->lfctl.cl_bidi_r = 0;
 
-	rparams = &conn->qc->tx.params;
+	rparams = &conn->handle.qc->tx.params;
 	qcc->rfctl.md = rparams->initial_max_data;
 	qcc->rfctl.msd_bidi_l = rparams->initial_max_stream_data_bidi_local;
 	qcc->rfctl.msd_bidi_r = rparams->initial_max_stream_data_bidi_remote;
@@ -1040,7 +1043,7 @@ static int qc_init(struct connection *conn, struct proxy *prx,
 		}
 	}
 
-	HA_ATOMIC_STORE(&conn->qc->qcc, qcc);
+	HA_ATOMIC_STORE(&conn->handle.qc->qcc, qcc);
 	/* init read cycle */
 	tasklet_wakeup(qcc->wait_event.tasklet);
 
@@ -1054,14 +1057,22 @@ static int qc_init(struct connection *conn, struct proxy *prx,
 	return -1;
 }
 
+static void qc_destroy(void *ctx)
+{
+	struct qcc *qcc = ctx;
+
+	TRACE_ENTER(QMUX_EV_QCC_END, qcc->conn);
+	qc_release(qcc);
+	TRACE_LEAVE(QMUX_EV_QCC_END);
+}
+
 static void qc_detach(struct conn_stream *cs)
 {
-	struct qcs *qcs = cs->ctx;
+	struct qcs *qcs = __cs_mux(cs);
 	struct qcc *qcc = qcs->qcc;
 
 	TRACE_ENTER(QMUX_EV_STRM_END, qcc->conn, qcs);
 
-	cs->ctx = NULL;
 	qcs->cs = NULL;
 	--qcc->nb_cs;
 
@@ -1092,7 +1103,7 @@ static void qc_detach(struct conn_stream *cs)
 static size_t qc_rcv_buf(struct conn_stream *cs, struct buffer *buf,
                          size_t count, int flags)
 {
-	struct qcs *qcs = cs->ctx;
+	struct qcs *qcs = __cs_mux(cs);
 	struct htx *qcs_htx = NULL;
 	struct htx *cs_htx = NULL;
 	size_t ret = 0;
@@ -1133,15 +1144,15 @@ static size_t qc_rcv_buf(struct conn_stream *cs, struct buffer *buf,
 
  end:
 	if (b_data(&qcs->rx.app_buf)) {
-		cs->flags |= (CS_FL_RCV_MORE | CS_FL_WANT_ROOM);
+		cs->endp->flags |= (CS_EP_RCV_MORE | CS_EP_WANT_ROOM);
 	}
 	else {
-		cs->flags &= ~(CS_FL_RCV_MORE | CS_FL_WANT_ROOM);
-		if (cs->flags & CS_FL_ERR_PENDING)
-			cs->flags |= CS_FL_ERROR;
+		cs->endp->flags &= ~(CS_EP_RCV_MORE | CS_EP_WANT_ROOM);
+		if (cs->endp->flags & CS_EP_ERR_PENDING)
+			cs->endp->flags |= CS_EP_ERROR;
 
 		if (fin)
-			cs->flags |= (CS_FL_EOI|CS_FL_EOS);
+			cs->endp->flags |= (CS_EP_EOI|CS_EP_EOS);
 
 		if (b_size(&qcs->rx.app_buf)) {
 			b_free(&qcs->rx.app_buf);
@@ -1160,7 +1171,7 @@ static size_t qc_rcv_buf(struct conn_stream *cs, struct buffer *buf,
 static size_t qc_snd_buf(struct conn_stream *cs, struct buffer *buf,
                          size_t count, int flags)
 {
-	struct qcs *qcs = cs->ctx;
+	struct qcs *qcs = __cs_mux(cs);
 	size_t ret;
 
 	TRACE_ENTER(QMUX_EV_STRM_SEND, qcs->qcc->conn, qcs);
@@ -1180,7 +1191,7 @@ static size_t qc_snd_buf(struct conn_stream *cs, struct buffer *buf,
 static int qc_subscribe(struct conn_stream *cs, int event_type,
                         struct wait_event *es)
 {
-	return qcs_subscribe(cs->ctx, event_type, es);
+	return qcs_subscribe(__cs_mux(cs), event_type, es);
 }
 
 /* Called from the upper layer, to unsubscribe <es> from events <event_type>.
@@ -1189,7 +1200,7 @@ static int qc_subscribe(struct conn_stream *cs, int event_type,
  */
 static int qc_unsubscribe(struct conn_stream *cs, int event_type, struct wait_event *es)
 {
-	struct qcs *qcs = cs->ctx;
+	struct qcs *qcs = __cs_mux(cs);
 
 	BUG_ON(event_type & ~(SUB_RETRY_SEND|SUB_RETRY_RECV));
 	BUG_ON(qcs->subs && qcs->subs != es);
@@ -1202,7 +1213,7 @@ static int qc_unsubscribe(struct conn_stream *cs, int event_type, struct wait_ev
 }
 
 /* Loop through all qcs from <qcc>. If CO_FL_ERROR is set on the connection,
- * report CS_FL_ERR_PENDING|CS_FL_ERROR on the attached conn-streams and wake
+ * report CS_EP_ERR_PENDING|CS_EP_ERROR on the attached conn-streams and wake
  * them.
  */
 static int qc_wake_some_streams(struct qcc *qcc)
@@ -1220,9 +1231,9 @@ static int qc_wake_some_streams(struct qcc *qcc)
 			continue;
 
 		if (qcc->conn->flags & CO_FL_ERROR) {
-			qcs->cs->flags |= CS_FL_ERR_PENDING;
-			if (qcs->cs->flags & CS_FL_EOS)
-				qcs->cs->flags |= CS_FL_ERROR;
+			qcs->endp->flags |= CS_EP_ERR_PENDING;
+			if (qcs->endp->flags & CS_EP_EOS)
+				qcs->endp->flags |= CS_EP_ERROR;
 
 			if (qcs->subs) {
 				qcs_notify_recv(qcs);
@@ -1240,7 +1251,7 @@ static int qc_wake_some_streams(struct qcc *qcc)
 static int qc_wake(struct connection *conn)
 {
 	struct qcc *qcc = conn->ctx;
-	struct proxy *prx = conn->qc->li->bind_conf->frontend;
+	struct proxy *prx = conn->handle.qc->li->bind_conf->frontend;
 
 	TRACE_ENTER(QMUX_EV_QCC_WAKE, conn);
 
@@ -1252,7 +1263,7 @@ static int qc_wake(struct connection *conn)
 	if (unlikely(prx->flags & (PR_FL_DISABLED|PR_FL_STOPPED)))
 		goto release;
 
-	if (conn->qc->flags & QUIC_FL_CONN_NOTIFY_CLOSE)
+	if (conn->handle.qc->flags & QUIC_FL_CONN_NOTIFY_CLOSE)
 		qcc->conn->flags |= (CO_FL_SOCK_RD_SH|CO_FL_SOCK_WR_SH);
 
 	qc_send(qcc);
@@ -1344,12 +1355,15 @@ INITCALL0(STG_INIT, qmux_init_stdout_traces);
 
 static const struct mux_ops qc_ops = {
 	.init = qc_init,
+	.destroy = qc_destroy,
 	.detach = qc_detach,
 	.rcv_buf = qc_rcv_buf,
 	.snd_buf = qc_snd_buf,
 	.subscribe = qc_subscribe,
 	.unsubscribe = qc_unsubscribe,
 	.wake = qc_wake,
+	.flags = MX_FL_HTX|MX_FL_NO_UPG,
+	.name = "QUIC",
 };
 
 static struct mux_proto_list mux_proto_quic =

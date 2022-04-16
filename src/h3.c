@@ -176,7 +176,6 @@ static int h3_headers_to_htx(struct qcs *qcs, struct buffer *buf, uint64_t len,
 	cs = qc_attach_cs(qcs, &htx_buf);
 	if (!cs)
 		return 1;
-	cs->flags |= CS_FL_NOT_FIRST;
 
 	/* buffer is transferred to conn_stream and set to NULL
 	 * except on stream creation error.
@@ -231,7 +230,7 @@ static int h3_decode_qcs(struct qcs *qcs, int fin, void *ctx)
 	struct buffer *rxbuf = &qcs->rx.buf;
 	int ret;
 
-	h3_debug_printf(stderr, "%s: STREAM ID: %llu\n", __func__, qcs->by_id.key);
+	h3_debug_printf(stderr, "%s: STREAM ID: %lu\n", __func__, qcs->id);
 	if (!b_data(rxbuf))
 		return 0;
 
@@ -333,7 +332,7 @@ static int h3_control_recv(struct h3_uqs *h3_uqs, void *ctx)
 	struct buffer *rxbuf = &h3_uqs->qcs->rx.buf;
 	struct h3 *h3 = ctx;
 
-	h3_debug_printf(stderr, "%s STREAM ID: %llu\n", __func__,  h3_uqs->qcs->by_id.key);
+	h3_debug_printf(stderr, "%s STREAM ID: %lu\n", __func__,  h3_uqs->qcs->id);
 	if (!b_data(rxbuf))
 		return 1;
 
@@ -636,7 +635,7 @@ static int h3_resp_data_send(struct qcs *qcs, struct buffer *buf, size_t count)
 size_t h3_snd_buf(struct conn_stream *cs, struct buffer *buf, size_t count, int flags)
 {
 	size_t total = 0;
-	struct qcs *qcs = cs->ctx;
+	struct qcs *qcs = __cs_mux(cs);
 	struct htx *htx;
 	enum htx_blk_type btype;
 	struct htx_blk *blk;

@@ -25,6 +25,8 @@
 #include <haproxy/check.h>
 #include <haproxy/cli.h>
 #include <haproxy/connection.h>
+#include <haproxy/conn_stream.h>
+#include <haproxy/cs_utils.h>
 #include <haproxy/dict-t.h>
 #include <haproxy/errors.h>
 #include <haproxy/global.h>
@@ -40,7 +42,6 @@
 #include <haproxy/server.h>
 #include <haproxy/stats.h>
 #include <haproxy/stream.h>
-#include <haproxy/stream_interface.h>
 #include <haproxy/task.h>
 #include <haproxy/tcpcheck.h>
 #include <haproxy/time.h>
@@ -4314,7 +4315,7 @@ static int cli_parse_set_server(char **args, char *payload, struct appctx *appct
 
 static int cli_parse_get_weight(char **args, char *payload, struct appctx *appctx, void *private)
 {
-	struct stream_interface *si = cs_si(appctx->owner);
+	struct conn_stream *cs = appctx->owner;
 	struct proxy *px;
 	struct server *sv;
 	char *line;
@@ -4336,8 +4337,8 @@ static int cli_parse_get_weight(char **args, char *payload, struct appctx *appct
 	/* return server's effective weight at the moment */
 	snprintf(trash.area, trash.size, "%d (initial %d)\n", sv->uweight,
 		 sv->iweight);
-	if (ci_putstr(si_ic(si), trash.area) == -1) {
-		si_rx_room_blk(si);
+	if (ci_putstr(cs_ic(cs), trash.area) == -1) {
+		cs_rx_room_blk(cs);
 		return 0;
 	}
 	return 1;

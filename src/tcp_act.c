@@ -30,13 +30,13 @@
 #include <haproxy/arg.h>
 #include <haproxy/channel.h>
 #include <haproxy/connection.h>
+#include <haproxy/cs_utils.h>
 #include <haproxy/global.h>
 #include <haproxy/http_rules.h>
 #include <haproxy/proto_tcp.h>
 #include <haproxy/proxy-t.h>
 #include <haproxy/sample.h>
 #include <haproxy/session.h>
-#include <haproxy/stream_interface.h>
 #include <haproxy/tcp_rules.h>
 #include <haproxy/tools.h>
 
@@ -68,9 +68,9 @@ static enum act_return tcp_action_req_set_src(struct act_rule *rule, struct prox
 
 	case ACT_F_TCP_REQ_CNT:
 	case ACT_F_HTTP_REQ:
-		if (!si_get_src(cs_si(s->csf)))
+		if (!cs_get_src(s->csf))
 			goto end;
-		src = cs_si(s->csf)->src;
+		src = s->csf->src;
 		break;
 
 	default:
@@ -124,9 +124,9 @@ static enum act_return tcp_action_req_set_dst(struct act_rule *rule, struct prox
 
 	case ACT_F_TCP_REQ_CNT:
 	case ACT_F_HTTP_REQ:
-		if (!si_get_dst(cs_si(s->csf)))
+		if (!cs_get_dst(s->csf))
 			goto end;
-		dst = cs_si(s->csf)->dst;
+		dst = s->csf->dst;
 		break;
 
 	default:
@@ -181,9 +181,9 @@ static enum act_return tcp_action_req_set_src_port(struct act_rule *rule, struct
 
 	case ACT_F_TCP_REQ_CNT:
 	case ACT_F_HTTP_REQ:
-		if (!si_get_src(cs_si(s->csf)))
+		if (!cs_get_src(s->csf))
 			goto end;
-		src = cs_si(s->csf)->src;
+		src = s->csf->src;
 		break;
 
 	default:
@@ -236,9 +236,9 @@ static enum act_return tcp_action_req_set_dst_port(struct act_rule *rule, struct
 
 	case ACT_F_TCP_REQ_CNT:
 	case ACT_F_HTTP_REQ:
-		if (!si_get_dst(cs_si(s->csf)))
+		if (!cs_get_dst(s->csf))
 			goto end;
-		dst = cs_si(s->csf)->dst;
+		dst = s->csf->dst;
 		break;
 
 	default:
@@ -288,7 +288,10 @@ static enum act_return tcp_exec_action_silent_drop(struct act_rule *rule, struct
 	 * is present, returning with ERR will cause lingering to be disabled.
 	 */
 	if (strm)
-		strm->csf->si->flags |= SI_FL_NOLINGER;
+		strm->csf->flags |= CS_FL_NOLINGER;
+
+	if (conn->flags & CO_FL_FDLESS)
+		goto out;
 
 	/* We're on the client-facing side, we must force to disable lingering to
 	 * ensure we will use an RST exclusively and kill any pending data.

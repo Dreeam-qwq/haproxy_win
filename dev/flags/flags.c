@@ -3,9 +3,9 @@
 
 #include <haproxy/channel-t.h>
 #include <haproxy/connection-t.h>
+#include <haproxy/conn_stream-t.h>
 #include <haproxy/http_ana-t.h>
 #include <haproxy/stream-t.h>
-#include <haproxy/stream_interface-t.h>
 #include <haproxy/task-t.h>
 
 // 1 bit per flag, no hole permitted here
@@ -13,15 +13,15 @@
 #define SHOW_AS_CHN   0x00000002
 #define SHOW_AS_CONN  0x00000004
 #define SHOW_AS_CS    0x00000008
-#define SHOW_AS_SI    0x00000010
-#define SHOW_AS_SIET  0x00000020
-#define SHOW_AS_STRM  0x00000040
-#define SHOW_AS_TASK  0x00000080
-#define SHOW_AS_TXN   0x00000100
+#define SHOW_AS_SET   0x00000010
+#define SHOW_AS_STRM  0x00000020
+#define SHOW_AS_TASK  0x00000040
+#define SHOW_AS_TXN   0x00000080
+#define SHOW_AS_ENDP  0x00000100
 
 // command line names, must be in exact same order as the SHOW_AS_* flags above
 // so that show_as_words[i] matches flag 1U<<i.
-const char *show_as_words[] = { "ana", "chn", "conn", "cs", "si", "siet", "strm", "task", "txn", };
+const char *show_as_words[] = { "ana", "chn", "conn", "cs", "siet", "strm", "task", "txn", "endp", };
 
 #define SHOW_FLAG(f,n)					\
 	do {				 		\
@@ -177,6 +177,48 @@ void show_conn_flags(unsigned int f)
 	}
 	putchar('\n');
 }
+
+void show_endp_flags(unsigned int f)
+{
+	printf("endp->flags = ");
+	if (!f) {
+		printf("0\n");
+		return;
+	}
+
+	SHOW_FLAG(f, CS_EP_RXBLK_CHAN);
+	SHOW_FLAG(f, CS_EP_RXBLK_BUFF);
+	SHOW_FLAG(f, CS_EP_RXBLK_ROOM);
+	SHOW_FLAG(f, CS_EP_RXBLK_SHUT);
+	SHOW_FLAG(f, CS_EP_RXBLK_CONN);
+	SHOW_FLAG(f, CS_EP_RX_WAIT_EP);
+	SHOW_FLAG(f, CS_EP_WANT_GET);
+	SHOW_FLAG(f, CS_EP_WAIT_DATA);
+	SHOW_FLAG(f, CS_EP_KILL_CONN);
+	SHOW_FLAG(f, CS_EP_WAIT_FOR_HS);
+	SHOW_FLAG(f, CS_EP_WANT_ROOM);
+	SHOW_FLAG(f, CS_EP_ERROR);
+	SHOW_FLAG(f, CS_EP_ERR_PENDING);
+	SHOW_FLAG(f, CS_EP_EOS);
+	SHOW_FLAG(f, CS_EP_EOI);
+	SHOW_FLAG(f, CS_EP_RCV_MORE);
+	SHOW_FLAG(f, CS_EP_MAY_SPLICE);
+	SHOW_FLAG(f, CS_EP_WEBSOCKET);
+	SHOW_FLAG(f, CS_EP_NOT_FIRST);
+	SHOW_FLAG(f, CS_EP_SHWS);
+	SHOW_FLAG(f, CS_EP_SHWN);
+	SHOW_FLAG(f, CS_EP_SHRR);
+	SHOW_FLAG(f, CS_EP_SHRD);
+	SHOW_FLAG(f, CS_EP_ORPHAN);
+	SHOW_FLAG(f, CS_EP_DETACHED);
+	SHOW_FLAG(f, CS_EP_T_APPLET);
+	SHOW_FLAG(f, CS_EP_T_MUX);
+
+	if (f) {
+		printf("EXTRA(0x%08x)", f);
+	}
+	putchar('\n');
+}
 void show_cs_flags(unsigned int f)
 {
 	printf("cs->flags = ");
@@ -184,21 +226,13 @@ void show_cs_flags(unsigned int f)
 		printf("0\n");
 		return;
 	}
-	SHOW_FLAG(f, CS_FL_WEBSOCKET);
-	SHOW_FLAG(f, CS_FL_NOT_FIRST);
-	SHOW_FLAG(f, CS_FL_KILL_CONN);
-	SHOW_FLAG(f, CS_FL_WAIT_FOR_HS);
-	SHOW_FLAG(f, CS_FL_MAY_SPLICE);
-	SHOW_FLAG(f, CS_FL_EOI);
-	SHOW_FLAG(f, CS_FL_EOS);
-	SHOW_FLAG(f, CS_FL_ERR_PENDING);
-	SHOW_FLAG(f, CS_FL_WANT_ROOM);
-	SHOW_FLAG(f, CS_FL_RCV_MORE);
-	SHOW_FLAG(f, CS_FL_ERROR);
-	SHOW_FLAG(f, CS_FL_SHWS);
-	SHOW_FLAG(f, CS_FL_SHWN);
-	SHOW_FLAG(f, CS_FL_SHRR);
-	SHOW_FLAG(f, CS_FL_SHRD);
+	SHOW_FLAG(f, CS_FL_INDEP_STR);
+	SHOW_FLAG(f, CS_FL_DONT_WAKE);
+	SHOW_FLAG(f, CS_FL_NOLINGER);
+	SHOW_FLAG(f, CS_FL_NOHALF);
+	SHOW_FLAG(f, CS_FL_ADDR_FROM_SET);
+	SHOW_FLAG(f, CS_FL_ADDR_TO_SET);
+	SHOW_FLAG(f, CS_FL_ISBACK);
 
 	if (f) {
 		printf("EXTRA(0x%08x)", f);
@@ -206,62 +240,25 @@ void show_cs_flags(unsigned int f)
 	putchar('\n');
 }
 
-void show_si_et(unsigned int f)
+void show_strm_et(unsigned int f)
 {
-	printf("si->et      = ");
+	printf("strm->et    = ");
 	if (!f) {
-		printf("SI_ET_NONE\n");
+		printf("STRM_ET_NONE\n");
 		return;
 	}
 
-	SHOW_FLAG(f, SI_ET_QUEUE_TO);
-	SHOW_FLAG(f, SI_ET_QUEUE_ERR);
-	SHOW_FLAG(f, SI_ET_QUEUE_ABRT);
-	SHOW_FLAG(f, SI_ET_CONN_TO);
-	SHOW_FLAG(f, SI_ET_CONN_ERR);
-	SHOW_FLAG(f, SI_ET_CONN_ABRT);
-	SHOW_FLAG(f, SI_ET_CONN_RES);
-	SHOW_FLAG(f, SI_ET_CONN_OTHER);
-	SHOW_FLAG(f, SI_ET_DATA_TO);
-	SHOW_FLAG(f, SI_ET_DATA_ERR);
-	SHOW_FLAG(f, SI_ET_DATA_ABRT);
-
-	if (f) {
-		printf("EXTRA(0x%08x)", f);
-	}
-	putchar('\n');
-}
-
-void show_si_flags(unsigned int f)
-{
-	printf("si->flags   = ");
-	if (!f) {
-		printf("SI_FL_NONE\n");
-		return;
-	}
-
-	SHOW_FLAG(f, SI_FL_EXP);
-	SHOW_FLAG(f, SI_FL_ERR);
-	SHOW_FLAG(f, SI_FL_KILL_CONN);
-	SHOW_FLAG(f, SI_FL_WAIT_DATA);
-	SHOW_FLAG(f, SI_FL_ISBACK);
-	SHOW_FLAG(f, SI_FL_DONT_WAKE);
-	SHOW_FLAG(f, SI_FL_INDEP_STR);
-	SHOW_FLAG(f, SI_FL_NOLINGER);
-	SHOW_FLAG(f, SI_FL_NOHALF);
-	SHOW_FLAG(f, SI_FL_SRC_ADDR);
-	SHOW_FLAG(f, SI_FL_WANT_GET);
-	SHOW_FLAG(f, SI_FL_CLEAN_ABRT);
-	SHOW_FLAG(f, SI_FL_RXBLK_CHAN);
-	SHOW_FLAG(f, SI_FL_RXBLK_BUFF);
-	SHOW_FLAG(f, SI_FL_RXBLK_ROOM);
-	SHOW_FLAG(f, SI_FL_RXBLK_SHUT);
-	SHOW_FLAG(f, SI_FL_RXBLK_CONN);
-	SHOW_FLAG(f, SI_FL_RX_WAIT_EP);
-	SHOW_FLAG(f, SI_FL_L7_RETRY);
-	SHOW_FLAG(f, SI_FL_D_L7_RETRY);
-	SHOW_FLAG(f, SI_FL_ADDR_FROM_SET);
-	SHOW_FLAG(f, SI_FL_ADDR_TO_SET);
+	SHOW_FLAG(f, STRM_ET_QUEUE_TO);
+	SHOW_FLAG(f, STRM_ET_QUEUE_ERR);
+	SHOW_FLAG(f, STRM_ET_QUEUE_ABRT);
+	SHOW_FLAG(f, STRM_ET_CONN_TO);
+	SHOW_FLAG(f, STRM_ET_CONN_ERR);
+	SHOW_FLAG(f, STRM_ET_CONN_ABRT);
+	SHOW_FLAG(f, STRM_ET_CONN_RES);
+	SHOW_FLAG(f, STRM_ET_CONN_OTHER);
+	SHOW_FLAG(f, STRM_ET_DATA_TO);
+	SHOW_FLAG(f, STRM_ET_DATA_ERR);
+	SHOW_FLAG(f, STRM_ET_DATA_ABRT);
 
 	if (f) {
 		printf("EXTRA(0x%08x)", f);
@@ -311,6 +308,8 @@ void show_txn_flags(unsigned int f)
 		return;
 	}
 
+	SHOW_FLAG(f, TX_L7_RETRY);
+	SHOW_FLAG(f, TX_D_L7_RETRY);
 	SHOW_FLAG(f, TX_NOT_FIRST);
 	SHOW_FLAG(f, TX_USE_PX_CONN);
 	SHOW_FLAG(f, TX_CACHE_HAS_SEC_KEY);
@@ -362,6 +361,7 @@ void show_strm_flags(unsigned int f)
 		return;
 	}
 
+	SHOW_FLAG(f, SF_SRC_ADDR);
 	SHOW_FLAG(f, SF_WEBSOCKET);
 	SHOW_FLAG(f, SF_SRV_REUSED_ANTICIPATED);
 	SHOW_FLAG(f, SF_SRV_REUSED);
@@ -397,6 +397,7 @@ void show_strm_flags(unsigned int f)
 	SHOW_FLAG(f, SF_REDIRECTABLE);
 	SHOW_FLAG(f, SF_IGNORE);
 	SHOW_FLAG(f, SF_REDISP);
+	SHOW_FLAG(f, SF_CONN_EXP);
 	SHOW_FLAG(f, SF_CURR_SESS);
 	SHOW_FLAG(f, SF_MONITOR);
 	SHOW_FLAG(f, SF_FORCE_PRST);
@@ -483,8 +484,8 @@ int main(int argc, char **argv)
 		if (show_as & SHOW_AS_CHN)   show_chn_flags(flags);
 		if (show_as & SHOW_AS_CONN)  show_conn_flags(flags);
 		if (show_as & SHOW_AS_CS)    show_cs_flags(flags);
-		if (show_as & SHOW_AS_SI)    show_si_flags(flags);
-		if (show_as & SHOW_AS_SIET)  show_si_et(flags);
+		if (show_as & SHOW_AS_ENDP)  show_endp_flags(flags);
+		if (show_as & SHOW_AS_SET)   show_strm_et(flags);
 		if (show_as & SHOW_AS_STRM)  show_strm_flags(flags);
 		if (show_as & SHOW_AS_TASK)  show_task_state(flags);
 		if (show_as & SHOW_AS_TXN)   show_txn_flags(flags);

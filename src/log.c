@@ -25,9 +25,11 @@
 #include <sys/uio.h>
 
 #include <haproxy/api.h>
-#include <haproxy/applet-t.h>
+#include <haproxy/applet.h>
 #include <haproxy/cfgparse.h>
 #include <haproxy/clock.h>
+#include <haproxy/conn_stream.h>
+#include <haproxy/cs_utils.h>
 #include <haproxy/fd.h>
 #include <haproxy/frontend.h>
 #include <haproxy/global.h>
@@ -40,7 +42,6 @@
 #include <haproxy/sink.h>
 #include <haproxy/ssl_sock.h>
 #include <haproxy/stream.h>
-#include <haproxy/stream_interface.h>
 #include <haproxy/time.h>
 #include <haproxy/tools.h>
 
@@ -2114,7 +2115,7 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 				break;
 
 			case LOG_FMT_CLIENTIP:  // %ci
-				addr = (s ? si_src(cs_si(s->csf)) : sess_src(sess));
+				addr = (s ? cs_src(s->csf) : sess_src(sess));
 				if (addr)
 					ret = lf_ip(tmplog, (struct sockaddr *)addr, dst + maxsize - tmplog, tmp);
 				else
@@ -2127,7 +2128,7 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 				break;
 
 			case LOG_FMT_CLIENTPORT:  // %cp
-				addr = (s ? si_src(cs_si(s->csf)) : sess_src(sess));
+				addr = (s ? cs_src(s->csf) : sess_src(sess));
 				if (addr) {
 					/* sess->listener is always defined when the session's owner is an inbound connections */
 					if (addr->ss_family == AF_UNIX)
@@ -2145,7 +2146,7 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 				break;
 
 			case LOG_FMT_FRONTENDIP: // %fi
-				addr = (s ? si_dst(cs_si(s->csf)) : sess_dst(sess));
+				addr = (s ? cs_dst(s->csf) : sess_dst(sess));
 				if (addr)
 					ret = lf_ip(tmplog, (struct sockaddr *)addr, dst + maxsize - tmplog, tmp);
 				else
@@ -2158,7 +2159,7 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 				break;
 
 			case  LOG_FMT_FRONTENDPORT: // %fp
-				addr = (s ? si_dst(cs_si(s->csf)) : sess_dst(sess));
+				addr = (s ? cs_dst(s->csf) : sess_dst(sess));
 				if (addr) {
 					/* sess->listener is always defined when the session's owner is an inbound connections */
 					if (addr->ss_family == AF_UNIX)
@@ -2335,7 +2336,7 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 				tmplog += iret;
 
 				/* sess->listener may be undefined if the session's owner is a health-check */
-				if (sess->listener && sess->listener->bind_conf->xprt == xprt_get(XPRT_SSL))
+				if (sess->listener && sess->listener->bind_conf->xprt->get_ssl_sock_ctx)
 					LOGCHAR('~');
 				if (tmp->options & LOG_OPT_QUOTE)
 					LOGCHAR('"');
@@ -2614,10 +2615,7 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 			case LOG_FMT_RETRIES:  // %rq
 				if (s_flags & SF_REDISP)
 					LOGCHAR('+');
-				ret = ltoa_o(((s && cs_si(s->csb)->conn_retries > 0)
-					      ? (be->conn_retries - cs_si(s->csb)->conn_retries)
-					      : ((s && cs_si(s->csb)->state != SI_ST_INI) ? be->conn_retries : 0)),
-					     tmplog, dst + maxsize - tmplog);
+				ret = ltoa_o((s  ? s->conn_retries : 0), tmplog, dst + maxsize - tmplog);
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
@@ -3078,7 +3076,7 @@ void strm_log(struct stream *s)
 	err = (s->flags & SF_REDISP) ||
               ((s->flags & SF_ERR_MASK) > SF_ERR_LOCAL) ||
 	      (((s->flags & SF_ERR_MASK) == SF_ERR_NONE) &&
-	       (cs_si(s->csb)->conn_retries != s->be->conn_retries)) ||
+	       (s->conn_retries != s->be->conn_retries)) ||
 	      ((sess->fe->mode == PR_MODE_HTTP) && s->txn && s->txn->status >= 500);
 
 	if (!err && (sess->fe->options2 & PR_O2_NOLOGNORM))
@@ -3562,8 +3560,8 @@ out:
 static void syslog_io_handler(struct appctx *appctx)
 {
 	static THREAD_LOCAL struct ist metadata[LOG_META_FIELDS];
-	struct stream_interface *si = cs_si(appctx->owner);
-	struct stream *s = si_strm(si);
+	struct conn_stream *cs = appctx->owner;
+	struct stream *s = __cs_strm(cs);
 	struct proxy *frontend = strm_fe(s);
 	struct listener *l = strm_li(s);
 	struct buffer *buf = get_trash_chunk();
@@ -3575,14 +3573,14 @@ static void syslog_io_handler(struct appctx *appctx)
 	size_t size;
 
 	max_accept = l->maxaccept ? l->maxaccept : 1;
-	while (co_data(si_oc(si))) {
+	while (co_data(cs_oc(cs))) {
 		char c;
 
 		if (max_accept <= 0)
 			goto missing_budget;
 		max_accept--;
 
-		to_skip = co_getchar(si_oc(si), &c);
+		to_skip = co_getchar(cs_oc(cs), &c);
 		if (!to_skip)
 			goto missing_data;
 		else if (to_skip < 0)
@@ -3592,7 +3590,7 @@ static void syslog_io_handler(struct appctx *appctx)
 			/* rfc-6587, Non-Transparent-Framing: messages separated by
 			 * a trailing LF or CR LF
 			 */
-			to_skip = co_getline(si_oc(si), buf->area, buf->size);
+			to_skip = co_getline(cs_oc(cs), buf->area, buf->size);
 			if (!to_skip)
 				goto missing_data;
 			else if (to_skip < 0)
@@ -3616,7 +3614,7 @@ static void syslog_io_handler(struct appctx *appctx)
 			char *p = NULL;
 			int msglen;
 
-			to_skip = co_getword(si_oc(si), buf->area, buf->size, ' ');
+			to_skip = co_getword(cs_oc(cs), buf->area, buf->size, ' ');
 			if (!to_skip)
 				goto missing_data;
 			else if (to_skip < 0)
@@ -3633,7 +3631,7 @@ static void syslog_io_handler(struct appctx *appctx)
 			if (msglen > buf->size)
 				goto parse_error;
 
-			msglen = co_getblk(si_oc(si), buf->area, msglen, to_skip);
+			msglen = co_getblk(cs_oc(cs), buf->area, msglen, to_skip);
 			if (!msglen)
 				goto missing_data;
 			else if (msglen < 0)
@@ -3646,7 +3644,7 @@ static void syslog_io_handler(struct appctx *appctx)
 		else
 			goto parse_error;
 
-		co_skip(si_oc(si), to_skip);
+		co_skip(cs_oc(cs), to_skip);
 
 		/* update counters */
 		_HA_ATOMIC_INC(&cum_log_messages);
@@ -3660,7 +3658,7 @@ static void syslog_io_handler(struct appctx *appctx)
 
 missing_data:
 	/* we need more data to read */
-	si_oc(si)->flags |= CF_READ_DONTWAIT;
+	cs_oc(cs)->flags |= CF_READ_DONTWAIT;
 
 	return;
 
@@ -3683,10 +3681,10 @@ cli_abort:
 	_HA_ATOMIC_INC(&frontend->fe_counters.cli_aborts);
 
 close:
-	si_shutw(si);
-	si_shutr(si);
+	cs_shutw(cs);
+	cs_shutr(cs);
 
-	si_ic(si)->flags |= CF_READ_NULL;
+	cs_ic(cs)->flags |= CF_READ_NULL;
 
 	return;
 }

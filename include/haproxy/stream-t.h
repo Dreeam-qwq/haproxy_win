@@ -26,11 +26,11 @@
 
 #include <haproxy/api-t.h>
 #include <haproxy/channel-t.h>
+#include <haproxy/conn_stream-t.h>
 #include <haproxy/dynbuf-t.h>
 #include <haproxy/filters-t.h>
 #include <haproxy/obj_type-t.h>
 #include <haproxy/stick_table-t.h>
-#include <haproxy/stream_interface-t.h>
 #include <haproxy/vars-t.h>
 
 
@@ -43,6 +43,7 @@
 #define SF_FORCE_PRST	0x00000010	/* force persistence here, even if server is down */
 #define SF_MONITOR	0x00000020	/* this stream comes from a monitoring system */
 #define SF_CURR_SESS	0x00000040	/* a connection is currently being counted on the server */
+#define SF_CONN_EXP     0x00000080      /* timeout has expired */
 #define SF_REDISP	0x00000100	/* set if this stream was redispatched from one server to another */
 #define SF_IGNORE	0x00000200      /* The stream lead to a mux upgrade, and should be ignored */
 #define SF_REDIRECTABLE	0x00000400	/* set if this stream is redirectable (GET or HEAD) */
@@ -80,7 +81,8 @@
 
 #define SF_SRV_REUSED   0x00100000	/* the server-side connection was reused */
 #define SF_SRV_REUSED_ANTICIPATED  0x00200000  /* the connection was reused but the mux is not ready yet */
-#define SF_WEBSOCKET    0x00400000	/* websocket stream */
+#define SF_WEBSOCKET    0x00400000	/* websocket stream */ // TODO: must be removed
+#define SF_SRC_ADDR     0x00800000	/* get the source ip/port with getsockname */
 
 /* flags for the proxy of the master CLI */
 /* 0x0001.. to 0x8000 are reserved for ACCESS_* flags from cli-t.h */
@@ -88,7 +90,23 @@
 #define PCLI_F_PROMPT   0x10000
 #define PCLI_F_PAYLOAD  0x20000
 
-struct conn_stream;
+
+/* error types reported on the streams for more accurate reporting */
+enum {
+	STRM_ET_NONE       = 0x0000,  /* no error yet, leave it to zero */
+	STRM_ET_QUEUE_TO   = 0x0001,  /* queue timeout */
+	STRM_ET_QUEUE_ERR  = 0x0002,  /* queue error (eg: full) */
+	STRM_ET_QUEUE_ABRT = 0x0004,  /* aborted in queue by external cause */
+	STRM_ET_CONN_TO    = 0x0008,  /* connection timeout */
+	STRM_ET_CONN_ERR   = 0x0010,  /* connection error (eg: no server available) */
+	STRM_ET_CONN_ABRT  = 0x0020,  /* connection aborted by external cause (eg: abort) */
+	STRM_ET_CONN_RES   = 0x0040,  /* connection aborted due to lack of resources */
+	STRM_ET_CONN_OTHER = 0x0080,  /* connection aborted for other reason (eg: 500) */
+	STRM_ET_DATA_TO    = 0x0100,  /* timeout during data phase */
+	STRM_ET_DATA_ERR   = 0x0200,  /* error during data phase */
+	STRM_ET_DATA_ABRT  = 0x0400,  /* data phase aborted by external cause */
+};
+
 struct hlua;
 struct proxy;
 struct pendconn;
@@ -139,6 +157,11 @@ struct stream {
 	int16_t priority_class;         /* priority class of the stream for the pending queue */
 	int32_t priority_offset;        /* priority offset of the stream for the pending queue */
 
+	int conn_retries;               /* number of connect retries performed */
+	unsigned int conn_exp;          /* wake up time for connect, queue, turn-around, ... */
+	unsigned int conn_err_type;     /* first error detected, one of STRM_ET_* */
+	enum cs_state prev_conn_state;  /* CS_ST*, copy of previous state of the server conn-stream */
+
 	struct list list;               /* position in the thread's streams list */
 	struct mt_list by_srv;          /* position in server stream list */
 	struct list back_refs;          /* list of users tracking this stream */
@@ -171,7 +194,7 @@ struct stream {
 
 	void (*do_log)(struct stream *s);       /* the function to call in order to log (or NULL) */
 	void (*srv_error)(struct stream *s,     /* the function to call upon unrecoverable server errors (or NULL) */
-			  struct stream_interface *si);
+			  struct conn_stream *cs);
 
 	int pcli_next_pid;                      /* next target PID to use for the CLI proxy */
 	int pcli_flags;                         /* flags for CLI proxy */

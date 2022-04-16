@@ -33,15 +33,16 @@
 #define APPLET_WANT_DIE     0x01  /* applet was running and requested to die */
 
 struct appctx;
-struct stream;
 struct proxy;
+struct conn_stream;
+struct cs_endpoint;
 
 /* Applet descriptor */
 struct applet {
 	enum obj_type obj_type;            /* object type = OBJ_TYPE_APPLET */
 	/* 3 unused bytes here */
 	char *name;                        /* applet's name to report in logs */
-	int (*init)(struct appctx *, struct proxy *px, struct stream *strm);   /* callback to init resources, may be NULL.
+	int (*init)(struct appctx *);   /* callback to init resources, may be NULL.
 	                                     expect 1 if ok, 0 if an error occurs, -1 if miss data. */
 	void (*fct)(struct appctx *);      /* internal I/O handler, may never be NULL */
 	void (*release)(struct appctx *);  /* callback to release resources, may be NULL */
@@ -58,7 +59,8 @@ struct appctx {
 	struct buffer *chunk;       /* used to store unfinished commands */
 	unsigned int st2;          /* output state for stats, unused by peers  */
 	struct applet *applet;     /* applet this context refers to */
-	void *owner;               /* pointer to upper layer's entity (eg: conn_stream) */
+	struct conn_stream *owner;
+	struct cs_endpoint *endp;
 	struct act_rule *rule;     /* rule associated with the applet. */
 	int (*io_handler)(struct appctx *appctx);  /* used within the cli_io_handler when st0 = CLI_ST_CALLBACK */
 	void (*io_release)(struct appctx *appctx);  /* used within the cli_io_handler when st0 = CLI_ST_CALLBACK,

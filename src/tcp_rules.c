@@ -17,6 +17,8 @@
 #include <haproxy/cfgparse.h>
 #include <haproxy/channel.h>
 #include <haproxy/connection.h>
+#include <haproxy/conn_stream.h>
+#include <haproxy/cs_utils.h>
 #include <haproxy/global.h>
 #include <haproxy/list.h>
 #include <haproxy/log.h>
@@ -24,7 +26,6 @@
 #include <haproxy/sample.h>
 #include <haproxy/stick_table.h>
 #include <haproxy/stream-t.h>
-#include <haproxy/stream_interface.h>
 #include <haproxy/tcp_rules.h>
 #include <haproxy/ticks.h>
 #include <haproxy/tools.h>
@@ -116,7 +117,7 @@ int tcp_inspect_request(struct stream *s, struct channel *req, int an_bit)
 	 */
 
 	if ((req->flags & (CF_EOI|CF_SHUTR|CF_READ_ERROR)) || channel_full(req, global.tune.maxrewrite) ||
-	    si_rx_blocked_room(chn_prod(req)) ||
+	    cs_rx_blocked_room(chn_prod(req)) ||
 	    !s->be->tcp_req.inspect_delay || tick_is_expired(s->rules_exp, now_ms))
 		partial = SMP_OPT_FINAL;
 	else
@@ -253,7 +254,7 @@ resume_execution:
 		_HA_ATOMIC_INC(&sess->listener->counters->failed_req);
 
  reject:
-	si_must_kill_conn(chn_prod(req));
+	cs_must_kill_conn(chn_prod(req));
 	channel_abort(req);
 	channel_abort(&s->res);
 
@@ -299,7 +300,7 @@ int tcp_inspect_response(struct stream *s, struct channel *rep, int an_bit)
 	 * - if one rule returns KO, then return KO
 	 */
 	if ((rep->flags & (CF_EOI|CF_SHUTR|CF_READ_ERROR)) || channel_full(rep, global.tune.maxrewrite) ||
-	    si_rx_blocked_room(chn_prod(rep)) ||
+	    cs_rx_blocked_room(chn_prod(rep)) ||
 	    !s->be->tcp_rep.inspect_delay || tick_is_expired(s->rules_exp, now_ms))
 		partial = SMP_OPT_FINAL;
 	else
@@ -390,10 +391,10 @@ resume_execution:
 				goto deny;
 			}
 			else if (rule->action == ACT_TCP_CLOSE) {
-				chn_prod(rep)->flags |= SI_FL_NOLINGER | SI_FL_NOHALF;
-				si_must_kill_conn(chn_prod(rep));
-				si_shutr(chn_prod(rep));
-				si_shutw(chn_prod(rep));
+				chn_prod(rep)->flags |= CS_FL_NOLINGER | CS_FL_NOHALF;
+				cs_must_kill_conn(chn_prod(rep));
+				cs_shutr(chn_prod(rep));
+				cs_shutw(chn_prod(rep));
 				s->last_rule_file = rule->conf.file;
 				s->last_rule_line = rule->conf.line;
 				goto end;
@@ -450,7 +451,7 @@ resume_execution:
 		_HA_ATOMIC_INC(&__objt_server(s->target)->counters.failed_resp);
 
  reject:
-	si_must_kill_conn(chn_prod(rep));
+	cs_must_kill_conn(chn_prod(rep));
 	channel_abort(rep);
 	channel_abort(&s->req);
 
@@ -471,7 +472,7 @@ resume_execution:
 /* This function performs the TCP layer4 analysis on the current request. It
  * returns 0 if a reject rule matches, otherwise 1 if either an accept rule
  * matches or if no more rule matches. It can only use rules which don't need
- * any data. This only works on connection-based client-facing stream interfaces.
+ * any data. This only works on connection-based client-facing conn-streams.
  */
 int tcp_exec_l4_rules(struct session *sess)
 {
@@ -568,7 +569,7 @@ int tcp_exec_l4_rules(struct session *sess)
 /* This function performs the TCP layer5 analysis on the current request. It
  * returns 0 if a reject rule matches, otherwise 1 if either an accept rule
  * matches or if no more rule matches. It can only use rules which don't need
- * any data. This only works on session-based client-facing stream interfaces.
+ * any data. This only works on session-based client-facing conn-streams.
  * An example of valid use case is to track a stick-counter on the source
  * address extracted from the proxy protocol.
  */

@@ -17,7 +17,8 @@
 #include <haproxy/cli.h>
 #include <haproxy/dynbuf.h>
 #include <haproxy/cfgparse.h>
-#include <haproxy/connection.h>
+#include <haproxy/conn_stream.h>
+#include <haproxy/cs_utils.h>
 #include <haproxy/global.h>
 #include <haproxy/istbuf.h>
 #include <haproxy/h1_htx.h>
@@ -30,7 +31,6 @@
 #include <haproxy/proxy.h>
 #include <haproxy/server.h>
 #include <haproxy/ssl_sock-t.h>
-#include <haproxy/stream_interface.h>
 #include <haproxy/tools.h>
 
 #include <string.h>
@@ -166,7 +166,7 @@ err:
  */
 static int hc_cli_io_handler(struct appctx *appctx)
 {
-	struct stream_interface *si = cs_si(appctx->owner);
+	struct conn_stream *cs = appctx->owner;
 	struct buffer *trash = alloc_trash_chunk();
 	struct httpclient *hc = appctx->ctx.cli.p0;
 	struct http_hdr *hdrs, *hdr;
@@ -176,8 +176,8 @@ static int hc_cli_io_handler(struct appctx *appctx)
 	if (appctx->ctx.cli.i0 & HC_CLI_F_RES_STLINE) {
 		chunk_appendf(trash, "%.*s %d %.*s\n", (unsigned int)istlen(hc->res.vsn), istptr(hc->res.vsn),
 			      hc->res.status, (unsigned int)istlen(hc->res.reason), istptr(hc->res.reason));
-		if (ci_putchk(si_ic(si), trash) == -1)
-			si_rx_room_blk(si);
+		if (ci_putchk(cs_ic(cs), trash) == -1)
+			cs_rx_room_blk(cs);
 		appctx->ctx.cli.i0 &= ~HC_CLI_F_RES_STLINE;
 		goto out;
 	}
@@ -190,8 +190,8 @@ static int hc_cli_io_handler(struct appctx *appctx)
 		}
 		if (!chunk_memcat(trash, "\r\n", 2))
 			goto out;
-		if (ci_putchk(si_ic(si), trash) == -1)
-			si_rx_room_blk(si);
+		if (ci_putchk(cs_ic(cs), trash) == -1)
+			cs_rx_room_blk(cs);
 		appctx->ctx.cli.i0 &= ~HC_CLI_F_RES_HDR;
 		goto out;
 	}
@@ -199,8 +199,8 @@ static int hc_cli_io_handler(struct appctx *appctx)
 	if (appctx->ctx.cli.i0 & HC_CLI_F_RES_BODY) {
 		int ret;
 
-		ret = httpclient_res_xfer(hc, &si_ic(si)->buf);
-		channel_add_input(si_ic(si), ret); /* forward what we put in the buffer channel */
+		ret = httpclient_res_xfer(hc, cs_ib(cs));
+		channel_add_input(cs_ic(cs), ret); /* forward what we put in the buffer channel */
 
 		if (!httpclient_data(hc)) {/* remove the flag if the buffer was emptied */
 			appctx->ctx.cli.i0 &= ~HC_CLI_F_RES_BODY;
@@ -210,8 +210,8 @@ static int hc_cli_io_handler(struct appctx *appctx)
 
 	/* we must close only if F_END is the last flag */
 	if (appctx->ctx.cli.i0 ==  HC_CLI_F_RES_END) {
-		si_shutw(si);
-		si_shutr(si);
+		cs_shutw(cs);
+		cs_shutr(cs);
 		appctx->ctx.cli.i0 &= ~HC_CLI_F_RES_END;
 		goto out;
 	}
@@ -219,7 +219,7 @@ static int hc_cli_io_handler(struct appctx *appctx)
 out:
 	/* we didn't clear every flags, we should come back to finish things */
 	if (appctx->ctx.cli.i0)
-		si_rx_room_blk(si);
+		cs_rx_room_blk(cs);
 
 	free_trash_chunk(trash);
 	return 0;
@@ -457,6 +457,7 @@ struct appctx *httpclient_start(struct httpclient *hc)
 	struct session *sess;
 	struct conn_stream *cs;
 	struct stream *s;
+	struct sockaddr_storage *addr = NULL;
 	int len;
 	struct sockaddr_storage ss_url;
 	struct sockaddr_storage* ss_dst;
@@ -478,7 +479,7 @@ struct appctx *httpclient_start(struct httpclient *hc)
 
 	/* The HTTP client will be created in the same thread as the caller,
 	 * avoiding threading issues */
-	appctx = appctx_new(applet);
+	appctx = appctx_new(applet, NULL);
 	if (!appctx)
 		goto out;
 
@@ -487,20 +488,6 @@ struct appctx *httpclient_start(struct httpclient *hc)
 		ha_alert("httpclient: out of memory in %s:%d.\n", __FUNCTION__, __LINE__);
 		goto out_free_appctx;
 	}
-	cs = cs_new();
-	if (!cs) {
-		ha_alert("httpclient: out of memory in %s:%d.\n", __FUNCTION__, __LINE__);
-		goto out_free_sess;
-	}
-	cs_attach_endp(cs, &appctx->obj_type, appctx);
-	if ((s = stream_new(sess, cs, &hc->req.buf)) == NULL) {
-		ha_alert("httpclient: Failed to initialize stream %s:%d.\n", __FUNCTION__, __LINE__);
-		goto out_free_cs;
-	}
-
-	/* set the "timeout server" */
-	s->req.wto = hc->timeout_server;
-	s->res.rto = hc->timeout_server;
 
 	/* if httpclient_set_dst() was used, sets the alternative address */
 	if (hc->dst)
@@ -508,10 +495,19 @@ struct appctx *httpclient_start(struct httpclient *hc)
 	else
 		ss_dst = &ss_url;
 
-	if (!sockaddr_alloc(&cs_si(s->csb)->dst, ss_dst, sizeof(*hc->dst))) {
-		ha_alert("httpclient: Failed to initialize stream in %s:%d.\n", __FUNCTION__, __LINE__);
-		goto out_free_stream;
+	if (!sockaddr_alloc(&addr, ss_dst, sizeof(*hc->dst)))
+		goto out_free_sess;
+
+	cs = cs_new_from_applet(appctx->endp, sess, &hc->req.buf);
+	if (!cs) {
+		ha_alert("httpclient: Failed to initialize stream %s:%d.\n", __FUNCTION__, __LINE__);
+		goto out_free_addr;
 	}
+	s = DISGUISE(cs_strm(cs));
+
+	/* set the "timeout server" */
+	s->req.wto = hc->timeout_server;
+	s->res.rto = hc->timeout_server;
 
 	/* choose the SSL server or not */
 	switch (out.scheme) {
@@ -523,17 +519,22 @@ struct appctx *httpclient_start(struct httpclient *hc)
 			s->target = &httpclient_srv_ssl->obj_type;
 #else
 			ha_alert("httpclient: OpenSSL is not available %s:%d.\n", __FUNCTION__, __LINE__);
-			goto out_free_stream;
+			cs_detach_app(cs);
+			LIST_DELETE(&s->list);
+			pool_free(pool_head_stream, s);
+			cs_free(cs);
+			goto out_free_addr;
 #endif
 			break;
 	}
 
+	s->csb->dst = addr;
+	s->csb->flags |= CS_FL_NOLINGER;
 	s->flags |= SF_ASSIGNED|SF_ADDR_SET;
-	cs_si(s->csb)->flags |= SI_FL_NOLINGER;
 	s->res.flags |= CF_READ_DONTWAIT;
 
 	/* applet is waiting for data */
-	si_cant_get(cs_si(s->csf));
+	cs_cant_get(s->csf);
 	appctx_wakeup(appctx);
 
 	hc->appctx = appctx;
@@ -547,11 +548,8 @@ struct appctx *httpclient_start(struct httpclient *hc)
 
 	return appctx;
 
-out_free_stream:
-	LIST_DELETE(&s->list);
-	pool_free(pool_head_stream, s);
-out_free_cs:
-	cs_free(cs);
+out_free_addr:
+	sockaddr_free(&addr);
 out_free_sess:
 	session_free(sess);
 out_free_appctx:
@@ -641,8 +639,8 @@ err:
 static void httpclient_applet_io_handler(struct appctx *appctx)
 {
 	struct httpclient *hc = appctx->ctx.httpclient.ptr;
-	struct stream_interface *si = cs_si(appctx->owner);
-	struct stream *s = si_strm(si);
+	struct conn_stream *cs = appctx->owner;
+	struct stream *s = __cs_strm(cs);
 	struct channel *req = &s->req;
 	struct channel *res = &s->res;
 	struct htx_blk *blk = NULL;
@@ -736,7 +734,7 @@ static void httpclient_applet_io_handler(struct appctx *appctx)
 
 					/* if the request contains the HTX_FL_EOM, we finished the request part. */
 					if (htx->flags & HTX_FL_EOM) {
-						si->cs->flags |= CS_FL_EOI;
+						cs->endp->flags |= CS_EP_EOI;
 						req->flags |= CF_EOI;
 						appctx->st0 = HTTPCLIENT_S_RES_STLINE;
 					}
@@ -926,13 +924,13 @@ static void httpclient_applet_io_handler(struct appctx *appctx)
 
 process_data:
 
-	si_rx_chan_rdy(si);
+	cs_rx_chan_rdy(cs);
 
 	return;
 more:
 	/* There was not enough data in the response channel */
 
-	si_rx_room_blk(si);
+	cs_rx_room_blk(cs);
 
 	if (appctx->st0 == HTTPCLIENT_S_RES_END)
 		goto end;
@@ -948,8 +946,8 @@ more:
 	return;
 
 end:
-	si_shutw(si);
-	si_shutr(si);
+	cs_shutw(cs);
+	cs_shutr(cs);
 	return;
 }
 

@@ -18,6 +18,7 @@
 #include <haproxy/cfgparse.h>
 #include <haproxy/connection.h>
 #include <haproxy/conn_stream.h>
+#include <haproxy/cs_utils.h>
 #include <haproxy/fd.h>
 #include <haproxy/frontend.h>
 #include <haproxy/hash.h>
@@ -28,7 +29,6 @@
 #include <haproxy/proto_tcp.h>
 #include <haproxy/sample.h>
 #include <haproxy/session.h>
-#include <haproxy/stream_interface.h>
 #include <haproxy/ssl_sock.h>
 #include <haproxy/tools.h>
 #include <haproxy/xxhash.h>
@@ -433,7 +433,6 @@ void conn_init(struct connection *conn, void *target)
 	conn->dst = NULL;
 	conn->proxy_authority = IST_NULL;
 	conn->proxy_unique_id = IST_NULL;
-	conn->qc = NULL;
 	conn->hash_node = NULL;
 	conn->xprt = NULL;
 }
@@ -501,13 +500,6 @@ void conn_free(struct connection *conn)
 
 	pool_free(pool_head_conn_hash_node, conn->hash_node);
 	conn->hash_node = NULL;
-
-	/* By convention we always place a NULL where the ctx points to if the
-	 * mux is null. It may have been used to store the connection as a
-	 * stream_interface's end point for example.
-	 */
-	if (conn->ctx != NULL && conn->mux == NULL)
-		*(void **)conn->ctx = NULL;
 
 	conn_force_unsubscribe(conn);
 	pool_free(pool_head_connection, conn);
@@ -808,6 +800,8 @@ int conn_recv_proxy(struct connection *conn, int flag)
 
 	if (!conn_ctrl_ready(conn))
 		goto fail;
+
+	BUG_ON(conn->flags & CO_FL_FDLESS);
 
 	if (!fd_recv_ready(conn->handle.fd))
 		goto not_ready;
@@ -1161,6 +1155,101 @@ int conn_recv_proxy(struct connection *conn, int flag)
 	return 0;
 }
 
+/* This callback is used to send a valid PROXY protocol line to a socket being
+ * established. It returns 0 if it fails in a fatal way or needs to poll to go
+ * further, otherwise it returns non-zero and removes itself from the connection's
+ * flags (the bit is provided in <flag> by the caller). It is designed to be
+ * called by the connection handler and relies on it to commit polling changes.
+ * Note that it can emit a PROXY line by relying on the other end's address
+ * when the connection is attached to a conn-stream, or by resolving the
+ * local address otherwise (also called a LOCAL line).
+ */
+int conn_send_proxy(struct connection *conn, unsigned int flag)
+{
+	if (!conn_ctrl_ready(conn))
+		goto out_error;
+
+	/* If we have a PROXY line to send, we'll use this to validate the
+	 * connection, in which case the connection is validated only once
+	 * we've sent the whole proxy line. Otherwise we use connect().
+	 */
+	if (conn->send_proxy_ofs) {
+		struct conn_stream *cs;
+		int ret;
+
+		/* If there is no mux attached to the connection, it means the
+		 * connection context is a conn-stream.
+		 */
+		cs = (conn->mux ? cs_conn_get_first(conn) : conn->ctx);
+
+		/* The target server expects a PROXY line to be sent first.
+		 * If the send_proxy_ofs is negative, it corresponds to the
+		 * offset to start sending from then end of the proxy string
+		 * (which is recomputed every time since it's constant). If
+		 * it is positive, it means we have to send from the start.
+		 * We can only send a "normal" PROXY line when the connection
+		 * is attached to a conn-stream. Otherwise we can only
+		 * send a LOCAL line (eg: for use with health checks).
+		 */
+
+		if (cs && cs_strm(cs)) {
+			ret = make_proxy_line(trash.area, trash.size,
+					      objt_server(conn->target),
+					      cs_conn(cs_opposite(cs)),
+					      __cs_strm(cs));
+		}
+		else {
+			/* The target server expects a LOCAL line to be sent first. Retrieving
+			 * local or remote addresses may fail until the connection is established.
+			 */
+			if (!conn_get_src(conn) || !conn_get_dst(conn))
+				goto out_wait;
+
+			ret = make_proxy_line(trash.area, trash.size,
+					      objt_server(conn->target), conn,
+					      NULL);
+		}
+
+		if (!ret)
+			goto out_error;
+
+		if (conn->send_proxy_ofs > 0)
+			conn->send_proxy_ofs = -ret; /* first call */
+
+		/* we have to send trash from (ret+sp for -sp bytes). If the
+		 * data layer has a pending write, we'll also set MSG_MORE.
+		 */
+		ret = conn_ctrl_send(conn,
+				     trash.area + ret + conn->send_proxy_ofs,
+		                     -conn->send_proxy_ofs,
+		                     (conn->subs && conn->subs->events & SUB_RETRY_SEND) ? CO_SFL_MSG_MORE : 0);
+
+		if (ret < 0)
+			goto out_error;
+
+		conn->send_proxy_ofs += ret; /* becomes zero once complete */
+		if (conn->send_proxy_ofs != 0)
+			goto out_wait;
+
+		/* OK we've sent the whole line, we're connected */
+	}
+
+	/* The connection is ready now, simply return and let the connection
+	 * handler notify upper layers if needed.
+	 */
+	conn->flags &= ~CO_FL_WAIT_L4_CONN;
+	conn->flags &= ~flag;
+	return 1;
+
+ out_error:
+	/* Write error on the file descriptor */
+	conn->flags |= CO_FL_ERROR;
+	return 0;
+
+ out_wait:
+	return 0;
+}
+
 /* This handshake handler waits a NetScaler Client IP insertion header
  * at the beginning of the raw data stream. The header format is
  * described in doc/netscaler-client-ip-insertion-protocol.txt
@@ -1187,6 +1276,8 @@ int conn_recv_netscaler_cip(struct connection *conn, int flag)
 
 	if (!conn_ctrl_ready(conn))
 		goto fail;
+
+	BUG_ON(conn->flags & CO_FL_FDLESS);
 
 	if (!fd_recv_ready(conn->handle.fd))
 		goto not_ready;
@@ -1404,7 +1495,7 @@ int conn_send_socks4_proxy_request(struct connection *conn)
 				(conn->subs && conn->subs->events & SUB_RETRY_SEND) ? CO_SFL_MSG_MORE : 0);
 
 		DPRINTF(stderr, "SOCKS PROXY HS FD[%04X]: Before send remain is [%d], sent [%d]\n",
-				conn->handle.fd, -conn->send_proxy_ofs, ret);
+			conn_fd(conn), -conn->send_proxy_ofs, ret);
 
 		if (ret < 0) {
 			goto out_error;
@@ -1453,6 +1544,8 @@ int conn_recv_socks4_proxy_response(struct connection *conn)
 
 	if (!conn_ctrl_ready(conn))
 		goto fail;
+
+	BUG_ON(conn->flags & CO_FL_FDLESS);
 
 	if (!fd_recv_ready(conn->handle.fd))
 		goto not_ready;
@@ -1605,7 +1698,7 @@ void list_mux_proto(FILE *out)
 		else
 			side = "NONE";
 
-		fprintf(out, " %15s : mode=%-10s side=%-8s  mux=%-8s flags=",
+		fprintf(out, " %10s : mode=%-5s side=%-6s mux=%-5s flags=",
 			(proto.len ? proto.ptr : "<default>"), mode, side, item->mux->name);
 
 		done = 0;
@@ -1615,9 +1708,6 @@ void list_mux_proto(FILE *out)
 		 */
 		if (item->mux->flags & MX_FL_HTX)
 			done |= fprintf(out, "%sHTX", done ? "|" : "");
-
-		if (item->mux->flags & MX_FL_CLEAN_ABRT)
-			done |= fprintf(out, "%sCLEAN_ABRT", done ? "|" : "");
 
 		if (item->mux->flags & MX_FL_HOL_RISK)
 			done |= fprintf(out, "%sHOL_RISK", done ? "|" : "");
@@ -1741,8 +1831,8 @@ static int make_proxy_line_v2(char *buf, int buf_len, struct server *srv, struct
 	memcpy(hdr->sig, pp2_signature, PP2_SIGNATURE_LEN);
 
 	if (strm) {
-		src = si_src(strm->csf->si);
-		dst = si_dst(strm->csf->si);
+		src = cs_src(strm->csf);
+		dst = cs_dst(strm->csf);
 	}
 	else if (remote && conn_get_src(remote) && conn_get_dst(remote)) {
 		src = conn_src(remote);
@@ -1940,8 +2030,8 @@ int make_proxy_line(char *buf, int buf_len, struct server *srv, struct connectio
 		const struct sockaddr_storage *dst = NULL;
 
 		if (strm) {
-			src = si_src(strm->csf->si);
-			dst = si_dst(strm->csf->si);
+			src = cs_src(strm->csf);
+			dst = cs_dst(strm->csf);
 		}
 		else if (remote && conn_get_src(remote) && conn_get_dst(remote)) {
 			src = conn_src(remote);

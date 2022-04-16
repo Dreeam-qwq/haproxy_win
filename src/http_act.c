@@ -23,6 +23,8 @@
 #include <haproxy/capture-t.h>
 #include <haproxy/cfgparse.h>
 #include <haproxy/chunk.h>
+#include <haproxy/conn_stream.h>
+#include <haproxy/cs_utils.h>
 #include <haproxy/global.h>
 #include <haproxy/http.h>
 #include <haproxy/http_ana.h>
@@ -33,7 +35,6 @@
 #include <haproxy/pool.h>
 #include <haproxy/regex.h>
 #include <haproxy/sample.h>
-#include <haproxy/stream_interface.h>
 #include <haproxy/tools.h>
 #include <haproxy/uri_auth-t.h>
 #include <haproxy/uri_normalizer.h>
@@ -718,7 +719,7 @@ static enum act_parse_ret parse_http_set_status(const char **args, int *orig_arg
 static enum act_return http_action_reject(struct act_rule *rule, struct proxy *px,
                                           struct session *sess, struct stream *s, int flags)
 {
-	si_must_kill_conn(chn_prod(&s->req));
+	cs_must_kill_conn(chn_prod(&s->req));
 	channel_abort(&s->req);
 	channel_abort(&s->res);
 	s->req.analysers &= AN_REQ_FLT_END;
@@ -752,19 +753,17 @@ static enum act_parse_ret parse_http_action_reject(const char **args, int *orig_
 /* This function executes the "disable-l7-retry" HTTP action.
  * It disables L7 retries (all retry except for a connection failure). This
  * can be useful for example to avoid retrying on POST requests.
- * It just removes the L7 retry flag on the stream_interface, and always
+ * It just removes the L7 retry flag on the HTTP transaction, and always
  * return ACT_RET_CONT;
  */
 static enum act_return http_req_disable_l7_retry(struct act_rule *rule, struct proxy *px,
                                           struct session *sess, struct stream *s, int flags)
 {
-	struct stream_interface *si = cs_si(s->csb);
-
-	/* In theory, the SI_FL_L7_RETRY flags isn't set at this point, but
+	/* In theory, the TX_L7_RETRY flags isn't set at this point, but
 	 * let's be future-proof and remove it anyway.
 	 */
-	si->flags &= ~SI_FL_L7_RETRY;
-	si->flags |= SI_FL_D_L7_RETRY;
+	s->txn->flags &= ~TX_L7_RETRY;
+	s->txn->flags |= TX_D_L7_RETRY;
 	return ACT_RET_CONT;
 }
 

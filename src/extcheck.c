@@ -56,7 +56,7 @@ struct extcheck_env {
                                                   * such environment variables are not updatable. */
 #define EXTCHK_SIZE_ULONG     20                 /* max string length for an unsigned long value */
 #define EXTCHK_SIZE_UINT      11                 /* max string length for an unsigned int value */
-#define EXTCHK_SIZE_ADDR      INET6_ADDRSTRLEN+1 /* max string length for an address */
+#define EXTCHK_SIZE_ADDR      256                /* max string length for an IPv4/IPv6/UNIX address */
 
 /* external checks environment variables */
 enum {
@@ -311,21 +311,9 @@ int prepare_external_check(struct check *check)
 		goto err;
 	}
 
-	if (!check->argv[1] || !check->argv[2]) {
-		ha_alert("Starting [%s:%s] check: out of memory.\n", px->id, s->id);
-		goto err;
-	}
-
+	/* args 3 and 4 are the address, they're replaced on each check */
 	check->argv[3] = calloc(EXTCHK_SIZE_ADDR, sizeof(*check->argv[3]));
 	check->argv[4] = calloc(EXTCHK_SIZE_UINT, sizeof(*check->argv[4]));
-	if (!check->argv[3] || !check->argv[4]) {
-		ha_alert("Starting [%s:%s] check: out of memory.\n", px->id, s->id);
-		goto err;
-	}
-
-	addr_to_str(&s->addr, check->argv[3], EXTCHK_SIZE_ADDR);
-	if (s->addr.ss_family == AF_INET || s->addr.ss_family == AF_INET6)
-		snprintf(check->argv[4], EXTCHK_SIZE_UINT, "%u", s->svc_port);
 
 	for (i = 0; i < 5; i++) {
 		if (!check->argv[i]) {
@@ -427,12 +415,18 @@ static int connect_proc_chk(struct task *t)
 		/* Update some environment variables and command args: curconn, server addr and server port */
 		EXTCHK_SETENV(check, EXTCHK_HAPROXY_SERVER_CURCONN, ultoa_r(s->cur_sess, buf, sizeof(buf)), fail);
 
-		addr_to_str(&s->addr, check->argv[3], EXTCHK_SIZE_ADDR);
-		EXTCHK_SETENV(check, EXTCHK_HAPROXY_SERVER_ADDR, check->argv[3], fail);
+		if (s->addr.ss_family == AF_UNIX) {
+			const struct sockaddr_un *un = (struct sockaddr_un *)&s->addr;
+			strlcpy2(check->argv[3], un->sun_path, EXTCHK_SIZE_ADDR);
+			memcpy(check->argv[4], "NOT_USED", 9);
+		} else {
+			addr_to_str(&s->addr, check->argv[3], EXTCHK_SIZE_ADDR);
+			*check->argv[4] = 0; // just in case the address family changed
+			if (s->addr.ss_family == AF_INET || s->addr.ss_family == AF_INET6)
+				snprintf(check->argv[4], EXTCHK_SIZE_UINT, "%u", s->svc_port);
+		}
 
-		*check->argv[4] = 0;
-		if (s->addr.ss_family == AF_INET || s->addr.ss_family == AF_INET6)
-			snprintf(check->argv[4], EXTCHK_SIZE_UINT, "%u", s->svc_port);
+		EXTCHK_SETENV(check, EXTCHK_HAPROXY_SERVER_ADDR, check->argv[3], fail);
 		EXTCHK_SETENV(check, EXTCHK_HAPROXY_SERVER_PORT, check->argv[4], fail);
 
 		haproxy_unblock_signals();

@@ -33,7 +33,6 @@
 
 #include <haproxy/api-t.h>
 #include <haproxy/buf-t.h>
-#include <haproxy/conn_stream-t.h>
 #include <haproxy/obj_type-t.h>
 #include <haproxy/port_range-t.h>
 #include <haproxy/protocol-t.h>
@@ -51,6 +50,7 @@ struct pipe;
 struct quic_conn;
 struct bind_conf;
 struct qcs;
+struct ssl_sock_ctx;
 
 /* Note: subscribing to these events is only valid after the caller has really
  * attempted to perform the operation, and failed to proceed or complete.
@@ -115,6 +115,8 @@ enum {
 	/* flags used to report connection errors or other closing conditions */
 	CO_FL_ERROR         = 0x00100000,  /* a fatal error was reported     */
 	CO_FL_NOTIFY_DONE   = 0x001C0000,  /* any xprt shut/error flags above needs to be reported */
+
+	CO_FL_FDLESS        = 0x00200000,  /* this connection doesn't use any FD (e.g. QUIC) */
 
 	/* flags used to report connection status updates */
 	CO_FL_WAIT_L4_CONN  = 0x00400000,  /* waiting for L4 to be connected */
@@ -250,6 +252,18 @@ enum {
 	CO_SFL_STREAMER    = 0x0002,    /* Producer is continuously streaming data */
 };
 
+/* mux->shutr() modes */
+enum co_shr_mode {
+	CO_SHR_DRAIN        = 0,           /* read shutdown, drain any extra stuff */
+	CO_SHR_RESET        = 1,           /* read shutdown, reset any extra stuff */
+};
+
+/* mux->shutw() modes */
+enum co_shw_mode {
+	CO_SHW_NORMAL       = 0,           /* regular write shutdown */
+	CO_SHW_SILENT       = 1,           /* imminent close, don't notify peer */
+};
+
 /* known transport layers (for ease of lookup) */
 enum {
 	XPRT_RAW = 0,
@@ -262,10 +276,9 @@ enum {
 /* MUX-specific flags */
 enum {
 	MX_FL_NONE        = 0x00000000,
-	MX_FL_CLEAN_ABRT  = 0x00000001, /* abort is clearly reported as an error */
-	MX_FL_HTX         = 0x00000002, /* set if it is an HTX multiplexer */
-	MX_FL_HOL_RISK    = 0x00000004, /* set if the protocol is subject the to head-of-line blocking on server */
-	MX_FL_NO_UPG      = 0x00000008, /* set if mux does not support any upgrade */
+	MX_FL_HTX         = 0x00000001, /* set if it is an HTX multiplexer */
+	MX_FL_HOL_RISK    = 0x00000002, /* set if the protocol is subject the to head-of-line blocking on server */
+	MX_FL_NO_UPG      = 0x00000004, /* set if mux does not support any upgrade */
 };
 
 /* PROTO token registration */
@@ -324,10 +337,12 @@ struct wait_event {
 };
 
 /* A connection handle is how we differentiate two connections on the lower
- * layers. It usually is a file descriptor but can be a connection id.
+ * layers. It usually is a file descriptor but can be a connection id. The
+ * CO_FL_FDLESS flag indicates which one is relevant.
  */
 union conn_handle {
-	int fd;                 /* file descriptor, for regular sockets */
+	struct quic_conn *qc;   /* Only present if this connection is a QUIC one (CO_FL_FDLESS=1) */
+	int fd;                 /* file descriptor, for regular sockets (CO_FL_FDLESS=0) */
 };
 
 /* xprt_ops describes transport-layer operations for a connection. They
@@ -358,6 +373,7 @@ struct xprt_ops {
 	int (*unsubscribe)(struct connection *conn, void *xprt_ctx, int event_type, struct wait_event *es); /* Unsubscribe <es> from events */
 	int (*remove_xprt)(struct connection *conn, void *xprt_ctx, void *toremove_ctx, const struct xprt_ops *newops, void *newctx); /* Remove an xprt from the connection, used by temporary xprt such as the handshake one */
 	int (*add_xprt)(struct connection *conn, void *xprt_ctx, void *toadd_ctx, const struct xprt_ops *toadd_ops, void **oldxprt_ctx, const struct xprt_ops **oldxprt_ops); /* Add a new XPRT as the new xprt, and return the old one */
+	struct ssl_sock_ctx *(*get_ssl_sock_ctx)(struct connection *); /* retrieve the ssl_sock_ctx in use, or NULL if none */
 	int (*show_fd)(struct buffer *, const struct connection *, const void *ctx); /* append some data about xprt for "show fd"; returns non-zero if suspicious */
 };
 
@@ -375,11 +391,11 @@ struct mux_ops {
 	size_t (*snd_buf)(struct conn_stream *cs, struct buffer *buf, size_t count, int flags); /* Called from the upper layer to send data */
 	int  (*rcv_pipe)(struct conn_stream *cs, struct pipe *pipe, unsigned int count); /* recv-to-pipe callback */
 	int  (*snd_pipe)(struct conn_stream *cs, struct pipe *pipe); /* send-to-pipe callback */
-	void (*shutr)(struct conn_stream *cs, enum cs_shr_mode);     /* shutr function */
-	void (*shutw)(struct conn_stream *cs, enum cs_shw_mode);     /* shutw function */
+	void (*shutr)(struct conn_stream *cs, enum co_shr_mode);     /* shutr function */
+	void (*shutw)(struct conn_stream *cs, enum co_shw_mode);     /* shutw function */
 
 	int (*attach)(struct connection *conn, struct conn_stream *, struct session *sess); /* attach a conn_stream to an outgoing connection */
-	const struct conn_stream *(*get_first_cs)(const struct connection *); /* retrieves any valid conn_stream from this connection */
+	struct conn_stream *(*get_first_cs)(const struct connection *); /* retrieves any valid conn_stream from this connection */
 	void (*detach)(struct conn_stream *); /* Detach a conn_stream from an outgoing connection, when the request is done */
 	int (*show_fd)(struct buffer *, struct connection *); /* append some data about connection into chunk for "show fd"; returns non-zero if suspicious */
 	int (*subscribe)(struct conn_stream *cs, int event_type,  struct wait_event *es); /* Subscribe <es> to events, such as "being able to send" */
@@ -493,7 +509,6 @@ struct connection {
 	struct sockaddr_storage *dst; /* destination address (pool), when known, otherwise NULL */
 	struct ist proxy_authority;   /* Value of the authority TLV received via PROXYv2 */
 	struct ist proxy_unique_id;   /* Value of the unique ID TLV received via PROXYv2 */
-	struct quic_conn *qc;         /* Only present if this connection is a QUIC one */
 
 	/* used to identify a backend connection for http-reuse,
 	 * thus only present if conn.target is of type OBJ_TYPE_SERVER

@@ -44,7 +44,7 @@ extern struct trace_source trace_strm;
 #define  STRM_EV_STRM_ERR     (1ULL <<  2)
 #define  STRM_EV_STRM_ANA     (1ULL <<  3)
 #define  STRM_EV_STRM_PROC    (1ULL <<  4)
-#define  STRM_EV_SI_ST        (1ULL <<  5)
+#define  STRM_EV_CS_ST        (1ULL <<  5)
 #define  STRM_EV_HTTP_ANA     (1ULL <<  6)
 #define  STRM_EV_HTTP_ERR     (1ULL <<  7)
 #define  STRM_EV_TCP_ANA      (1ULL <<  8)
@@ -73,7 +73,7 @@ struct ist stream_generate_unique_id(struct stream *strm, struct list *format);
 void stream_process_counters(struct stream *s);
 void sess_change_server(struct stream *strm, struct server *newsrv);
 struct task *process_stream(struct task *t, void *context, unsigned int state);
-void default_srv_error(struct stream *s, struct stream_interface *si);
+void default_srv_error(struct stream *s, struct conn_stream *cs);
 
 /* Update the stream's backend and server time stats */
 void stream_update_time_stats(struct stream *s);
@@ -313,8 +313,6 @@ static inline void stream_init_srv_conn(struct stream *strm)
 
 static inline void stream_choose_redispatch(struct stream *s)
 {
-	struct stream_interface *si = cs_si(s->csb);
-
 	/* If the "redispatch" option is set on the backend, we are allowed to
 	 * retry on another server. By default this redispatch occurs on the
 	 * last retry, but if configured we allow redispatches to occur on
@@ -331,30 +329,45 @@ static inline void stream_choose_redispatch(struct stream *s)
 	    (s->be->options & PR_O_REDISP) && !(s->flags & SF_FORCE_PRST) &&
 	    ((__objt_server(s->target)->cur_state < SRV_ST_RUNNING) ||
 	     (((s->be->redispatch_after > 0) &&
-	       ((s->be->conn_retries - si->conn_retries) %
-	        s->be->redispatch_after == 0)) ||
+	       (s->conn_retries % s->be->redispatch_after == 0)) ||
 	      ((s->be->redispatch_after < 0) &&
-	       ((s->be->conn_retries - si->conn_retries) %
-	        (s->be->conn_retries + 1 + s->be->redispatch_after) == 0))) ||
+	       (s->conn_retries % (s->be->conn_retries + 1 + s->be->redispatch_after) == 0))) ||
 	     (!(s->flags & SF_DIRECT) && s->be->srv_act > 1 &&
 	      ((s->be->lbprm.algo & BE_LB_KIND) == BE_LB_KIND_RR)))) {
 		sess_change_server(s, NULL);
 		if (may_dequeue_tasks(objt_server(s->target), s->be))
 			process_srv_queue(objt_server(s->target));
 
-		sockaddr_free(&cs_si(s->csb)->dst);
+		sockaddr_free(&s->csb->dst);
 		s->flags &= ~(SF_DIRECT | SF_ASSIGNED | SF_ADDR_SET);
-		si->state = SI_ST_REQ;
+		s->csb->state = CS_ST_REQ;
 	} else {
 		if (objt_server(s->target))
 			_HA_ATOMIC_INC(&__objt_server(s->target)->counters.retries);
 		_HA_ATOMIC_INC(&s->be->be_counters.retries);
-		si->state = SI_ST_ASS;
+		s->csb->state = CS_ST_ASS;
 	}
 
 }
 
+/*
+ * This function only has to be called once after a wakeup event in case of
+ * suspected timeout. It controls the stream connection timeout and sets
+ * si->flags accordingly. It does NOT close anything, as this timeout may
+ * be used for any purpose. It returns 1 if the timeout fired, otherwise
+ * zero.
+ */
+static inline int stream_check_conn_timeout(struct stream *s)
+{
+	if (tick_is_expired(s->conn_exp, now_ms)) {
+		s->flags |= SF_CONN_EXP;
+		return 1;
+	}
+	return 0;
+}
+
 int stream_set_timeout(struct stream *s, enum act_timeout_name name, int timeout);
+void stream_retnclose(struct stream *s, const struct buffer *msg);
 
 void service_keywords_register(struct action_kw_list *kw_list);
 struct action_kw *service_find(const char *kw);

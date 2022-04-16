@@ -32,6 +32,7 @@
 #   USE_CRYPT_H          : set it if your system requires including crypt.h
 #   USE_GETADDRINFO      : use getaddrinfo() to resolve IPv6 host names.
 #   USE_OPENSSL          : enable use of OpenSSL. Recommended, but see below.
+#   USE_ENGINE           : enable use of OpenSSL Engine.
 #   USE_LUA              : enable Lua support.
 #   USE_ACCEPT4          : enable use of accept4() on linux. Automatic.
 #   USE_CLOSEFROM        : enable use of closefrom() on *bsd, solaris. Automatic.
@@ -334,7 +335,7 @@ use_opts = USE_EPOLL USE_KQUEUE USE_NETFILTER                                 \
            USE_PCRE USE_PCRE_JIT USE_PCRE2 USE_PCRE2_JIT USE_POLL             \
            USE_THREAD USE_BACKTRACE                                           \
            USE_STATIC_PCRE USE_STATIC_PCRE2 USE_TPROXY USE_LINUX_TPROXY       \
-           USE_LINUX_SPLICE USE_LIBCRYPT USE_CRYPT_H                          \
+           USE_LINUX_SPLICE USE_LIBCRYPT USE_CRYPT_H USE_ENGINE               \
            USE_GETADDRINFO USE_OPENSSL USE_LUA USE_ACCEPT4                    \
            USE_CLOSEFROM USE_ZLIB USE_SLZ USE_CPU_AFFINITY USE_TFO USE_NS     \
            USE_DL USE_RT USE_DEVICEATLAS USE_51DEGREES USE_WURFL USE_SYSTEMD  \
@@ -622,6 +623,15 @@ OPTIONS_LDFLAGS += -ldl
 endif
 OPTIONS_OBJS  += src/ssl_sample.o src/ssl_sock.o src/ssl_crtlist.o src/ssl_ckch.o src/ssl_utils.o src/cfgparse-ssl.o src/jwt.o
 endif
+
+ifneq ($(USE_ENGINE),)
+# OpenSSL 3.0 emits loud deprecation warnings by default when building with
+# engine support, and this option is made to silence them. Better use it
+# only when absolutely necessary, until there's a viable alternative to the
+# engine API.
+OPTIONS_CFLAGS += -DOPENSSL_SUPPRESS_DEPRECATED
+endif
+
 ifneq ($(USE_QUIC),)
 OPTIONS_OBJS += src/quic_sock.o src/proto_quic.o src/xprt_quic.o src/quic_tls.o \
                 src/quic_frame.o src/quic_cc.o src/quic_cc_newreno.o src/mux_quic.o \
@@ -919,7 +929,7 @@ OBJS += src/mux_h2.o src/mux_fcgi.o src/http_ana.o src/mux_h1.o               \
         src/resolvers.o src/backend.o src/cfgparse.o src/http_htx.o src/cli.o \
         src/proxy.o src/pattern.o src/connection.o src/check.o                \
         src/cfgparse-listen.o src/cache.o src/haproxy.o src/http_act.o        \
-        src/http_fetch.o src/stream_interface.o src/dns.o src/listener.o      \
+        src/http_fetch.o src/dns.o src/listener.o                             \
         src/http_client.o src/vars.o src/tcp_rules.o src/debug.o src/sink.o   \
         src/server_state.o src/filters.o src/h2.o src/fcgi-app.o src/task.o   \
         src/payload.o src/h1_htx.o src/mjson.o src/h1.o src/map.o             \

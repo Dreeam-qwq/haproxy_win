@@ -33,6 +33,7 @@
 #include <haproxy/api.h>
 #include <haproxy/arg.h>
 #include <haproxy/connection.h>
+#include <haproxy/cs_utils.h>
 #include <haproxy/errors.h>
 #include <haproxy/global.h>
 #include <haproxy/listener-t.h>
@@ -40,7 +41,6 @@
 #include <haproxy/proxy-t.h>
 #include <haproxy/sample.h>
 #include <haproxy/session.h>
-#include <haproxy/stream_interface.h>
 #include <haproxy/tools.h>
 
 /* Fetch the connection's source IPv4/IPv6 address. Depending on the keyword, it
@@ -65,7 +65,7 @@ smp_fetch_src(const struct arg *args, struct sample *smp, const char *kw, void *
 			src = conn_src(conn);
 	}
         else /* src */
-		src = (smp->strm ? si_src(smp->strm->csf->si) : sess_src(smp->sess));
+		src = (smp->strm ? cs_src(smp->strm->csf) : sess_src(smp->sess));
 
 	if (!src)
 		return 0;
@@ -109,7 +109,7 @@ smp_fetch_sport(const struct arg *args, struct sample *smp, const char *kw, void
 			src = conn_src(conn);
 	}
         else /* src_port */
-		src = (smp->strm ? si_src(smp->strm->csf->si) : sess_src(smp->sess));
+		src = (smp->strm ? cs_src(smp->strm->csf) : sess_src(smp->sess));
 
 	if (!src)
 		return 0;
@@ -144,7 +144,7 @@ smp_fetch_dst(const struct arg *args, struct sample *smp, const char *kw, void *
 			dst = conn_dst(conn);
 	}
         else /* dst */
-		dst = (smp->strm ? si_dst(smp->strm->csf->si) : sess_dst(smp->sess));
+		dst = (smp->strm ? cs_dst(smp->strm->csf) : sess_dst(smp->sess));
 
 	if (!dst)
 		return 0;
@@ -181,7 +181,7 @@ int smp_fetch_dst_is_local(const struct arg *args, struct sample *smp, const cha
 			dst = conn_dst(conn);
 	}
 	else /* dst_is_local */
-		dst = (smp->strm ? si_dst(smp->strm->csf->si) : sess_dst(smp->sess));
+		dst = (smp->strm ? cs_dst(smp->strm->csf) : sess_dst(smp->sess));
 
 	if (!dst)
 		return 0;
@@ -207,7 +207,7 @@ int smp_fetch_src_is_local(const struct arg *args, struct sample *smp, const cha
 			src = conn_src(conn);
 	}
 	else /* src_is_local */
-		src = (smp->strm ? si_src(smp->strm->csf->si) : sess_src(smp->sess));
+		src = (smp->strm ? cs_src(smp->strm->csf) : sess_src(smp->sess));
 
 	if (!src)
 		return 0;
@@ -240,7 +240,7 @@ smp_fetch_dport(const struct arg *args, struct sample *smp, const char *kw, void
 			dst = conn_dst(conn);
 	}
         else /* dst_port */
-		dst = (smp->strm ? si_dst(smp->strm->csf->si) : sess_dst(smp->sess));
+		dst = (smp->strm ? cs_dst(smp->strm->csf) : sess_dst(smp->sess));
 
 	if (!dst)
 		return 0;
@@ -322,7 +322,7 @@ static inline int get_tcp_info(const struct arg *args, struct sample *smp,
 	if (!smp->strm)
 		return 0;
 
-	/* get the object associated with the stream interface.The
+	/* get the object associated with the conn-stream.The
 	 * object can be other thing than a connection. For example,
 	 * it be a appctx. */
 	conn = (dir == 0 ? cs_conn(smp->strm->csf) : cs_conn(smp->strm->csb));
@@ -332,15 +332,24 @@ static inline int get_tcp_info(const struct arg *args, struct sample *smp,
 	/* The fd may not be available for the tcp_info struct, and the
 	  syscal can fail. */
 	optlen = sizeof(info);
-	if (getsockopt(conn->handle.fd, IPPROTO_TCP, TCP_INFO, &info, &optlen) == -1)
+	if ((conn->flags & CO_FL_FDLESS) ||
+	    getsockopt(conn->handle.fd, IPPROTO_TCP, TCP_INFO, &info, &optlen) == -1)
 		return 0;
 
 	/* extract the value. */
 	smp->data.type = SMP_T_SINT;
 	switch (val) {
+#if defined(__APPLE__)
+	case 0:  smp->data.u.sint = info.tcpi_rttcur;         break;
+	case 1:  smp->data.u.sint = info.tcpi_rttvar;         break;
+	case 2:  smp->data.u.sint = info.tcpi_tfo_syn_data_acked; break;
+	case 4:  smp->data.u.sint = info.tcpi_tfo_syn_loss;   break;
+	case 5:  smp->data.u.sint = info.tcpi_rto;            break;
+#else
+	/* all other platforms supporting TCP_INFO have these ones */
 	case 0:  smp->data.u.sint = info.tcpi_rtt;            break;
 	case 1:  smp->data.u.sint = info.tcpi_rttvar;         break;
-#if defined(__linux__)
+# if defined(__linux__)
 	/* these ones are common to all Linux versions */
 	case 2:  smp->data.u.sint = info.tcpi_unacked;        break;
 	case 3:  smp->data.u.sint = info.tcpi_sacked;         break;
@@ -348,7 +357,7 @@ static inline int get_tcp_info(const struct arg *args, struct sample *smp,
 	case 5:  smp->data.u.sint = info.tcpi_retrans;        break;
 	case 6:  smp->data.u.sint = info.tcpi_fackets;        break;
 	case 7:  smp->data.u.sint = info.tcpi_reordering;     break;
-#elif defined(__FreeBSD__) || defined(__NetBSD__)
+# elif defined(__FreeBSD__) || defined(__NetBSD__)
 	/* the ones are found on FreeBSD and NetBSD featuring TCP_INFO */
 	case 2:  smp->data.u.sint = info.__tcpi_unacked;      break;
 	case 3:  smp->data.u.sint = info.__tcpi_sacked;       break;
@@ -356,13 +365,15 @@ static inline int get_tcp_info(const struct arg *args, struct sample *smp,
 	case 5:  smp->data.u.sint = info.__tcpi_retrans;      break;
 	case 6:  smp->data.u.sint = info.__tcpi_fackets;      break;
 	case 7:  smp->data.u.sint = info.__tcpi_reordering;   break;
-#endif
+# endif
+#endif // apple
 	default: return 0;
 	}
 
 	return 1;
 }
 
+#if defined(__linux__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__APPLE__)
 /* get the mean rtt of a client connection */
 static int
 smp_fetch_fc_rtt(const struct arg *args, struct sample *smp, const char *kw, void *private)
@@ -376,7 +387,9 @@ smp_fetch_fc_rtt(const struct arg *args, struct sample *smp, const char *kw, voi
 
 	return 1;
 }
+#endif
 
+#if defined(__linux__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__APPLE__)
 /* get the variance of the mean rtt of a client connection */
 static int
 smp_fetch_fc_rttvar(const struct arg *args, struct sample *smp, const char *kw, void *private)
@@ -390,9 +403,10 @@ smp_fetch_fc_rttvar(const struct arg *args, struct sample *smp, const char *kw, 
 
 	return 1;
 }
+#endif
 
-#if defined(__linux__) || defined(__FreeBSD__) || defined(__NetBSD__)
 
+#if defined(__linux__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__APPLE__)
 /* get the unacked counter on a client connection */
 static int
 smp_fetch_fc_unacked(const struct arg *args, struct sample *smp, const char *kw, void *private)
@@ -401,7 +415,9 @@ smp_fetch_fc_unacked(const struct arg *args, struct sample *smp, const char *kw,
 		return 0;
 	return 1;
 }
+#endif
 
+#if defined(__linux__) || defined(__FreeBSD__) || defined(__NetBSD__)
 /* get the sacked counter on a client connection */
 static int
 smp_fetch_fc_sacked(const struct arg *args, struct sample *smp, const char *kw, void *private)
@@ -410,7 +426,9 @@ smp_fetch_fc_sacked(const struct arg *args, struct sample *smp, const char *kw, 
 		return 0;
 	return 1;
 }
+#endif
 
+#if defined(__linux__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__APPLE__)
 /* get the lost counter on a client connection */
 static int
 smp_fetch_fc_lost(const struct arg *args, struct sample *smp, const char *kw, void *private)
@@ -419,7 +437,9 @@ smp_fetch_fc_lost(const struct arg *args, struct sample *smp, const char *kw, vo
 		return 0;
 	return 1;
 }
+#endif
 
+#if defined(__linux__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__APPLE__)
 /* get the retrans counter on a client connection */
 static int
 smp_fetch_fc_retrans(const struct arg *args, struct sample *smp, const char *kw, void *private)
@@ -428,7 +448,9 @@ smp_fetch_fc_retrans(const struct arg *args, struct sample *smp, const char *kw,
 		return 0;
 	return 1;
 }
+#endif
 
+#if defined(__linux__) || defined(__FreeBSD__) || defined(__NetBSD__)
 /* get the fackets counter on a client connection */
 static int
 smp_fetch_fc_fackets(const struct arg *args, struct sample *smp, const char *kw, void *private)
@@ -437,7 +459,9 @@ smp_fetch_fc_fackets(const struct arg *args, struct sample *smp, const char *kw,
 		return 0;
 	return 1;
 }
+#endif
 
+#if defined(__linux__) || defined(__FreeBSD__) || defined(__NetBSD__)
 /* get the reordering counter on a client connection */
 static int
 smp_fetch_fc_reordering(const struct arg *args, struct sample *smp, const char *kw, void *private)
@@ -446,7 +470,7 @@ smp_fetch_fc_reordering(const struct arg *args, struct sample *smp, const char *
 		return 0;
 	return 1;
 }
-#endif // linux || freebsd || netbsd
+#endif
 #endif // TCP_INFO
 
 /* Note: must not be declared <const> as its list will be overwritten.
@@ -478,14 +502,24 @@ static struct sample_fetch_kw_list sample_fetch_keywords = {ILH, {
 #ifdef TCP_INFO
 	{ "fc_rtt",           smp_fetch_fc_rtt,           ARG1(0,STR), val_fc_time_value, SMP_T_SINT, SMP_USE_L4CLI },
 	{ "fc_rttvar",        smp_fetch_fc_rttvar,        ARG1(0,STR), val_fc_time_value, SMP_T_SINT, SMP_USE_L4CLI },
-#if defined(__linux__) || defined(__FreeBSD__) || defined(__NetBSD__)
+#if defined(__linux__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__APPLE__)
 	{ "fc_unacked",       smp_fetch_fc_unacked,       ARG1(0,STR), var_fc_counter, SMP_T_SINT, SMP_USE_L4CLI },
+#endif
+#if defined(__linux__) || defined(__FreeBSD__) || defined(__NetBSD__)
 	{ "fc_sacked",        smp_fetch_fc_sacked,        ARG1(0,STR), var_fc_counter, SMP_T_SINT, SMP_USE_L4CLI },
+#endif
+#if defined(__linux__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__APPLE__)
 	{ "fc_retrans",       smp_fetch_fc_retrans,       ARG1(0,STR), var_fc_counter, SMP_T_SINT, SMP_USE_L4CLI },
+#endif
+#if defined(__linux__) || defined(__FreeBSD__) || defined(__NetBSD__)
 	{ "fc_fackets",       smp_fetch_fc_fackets,       ARG1(0,STR), var_fc_counter, SMP_T_SINT, SMP_USE_L4CLI },
+#endif
+#if defined(__linux__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__APPLE__)
 	{ "fc_lost",          smp_fetch_fc_lost,          ARG1(0,STR), var_fc_counter, SMP_T_SINT, SMP_USE_L4CLI },
+#endif
+#if defined(__linux__) || defined(__FreeBSD__) || defined(__NetBSD__)
 	{ "fc_reordering",    smp_fetch_fc_reordering,    ARG1(0,STR), var_fc_counter, SMP_T_SINT, SMP_USE_L4CLI },
-#endif // linux || freebsd || netbsd
+#endif
 #endif // TCP_INFO
 	{ /* END */ },
 }};

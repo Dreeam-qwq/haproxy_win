@@ -26,6 +26,8 @@
 #include <haproxy/capture-t.h>
 #include <haproxy/cfgparse.h>
 #include <haproxy/cli.h>
+#include <haproxy/conn_stream.h>
+#include <haproxy/cs_utils.h>
 #include <haproxy/errors.h>
 #include <haproxy/fd.h>
 #include <haproxy/filters.h>
@@ -44,7 +46,6 @@
 #include <haproxy/signal.h>
 #include <haproxy/stats-t.h>
 #include <haproxy/stream.h>
-#include <haproxy/stream_interface.h>
 #include <haproxy/task.h>
 #include <haproxy/tcpcheck.h>
 #include <haproxy/time.h>
@@ -2303,12 +2304,12 @@ int stream_set_backend(struct stream *s, struct proxy *be)
 	proxy_inc_be_ctr(be);
 
 	/* assign new parameters to the stream from the new backend */
-	cs_si(s->csb)->flags &= ~SI_FL_INDEP_STR;
+	s->csb->flags &= ~CS_FL_INDEP_STR;
 	if (be->options2 & PR_O2_INDEPSTR)
-		cs_si(s->csb)->flags |= SI_FL_INDEP_STR;
+		s->csb->flags |= CS_FL_INDEP_STR;
 
 	if (tick_isset(be->timeout.serverfin))
-		cs_si(s->csb)->hcto = be->timeout.serverfin;
+		s->csb->hcto = be->timeout.serverfin;
 
 	/* We want to enable the backend-specific analysers except those which
 	 * were already run as part of the frontend/listener. Note that it would
@@ -2649,9 +2650,9 @@ static void dump_server_addr(const struct sockaddr_storage *addr, char *addr_str
  * It uses the proxy pointer from cli.p0, the proxy's id from cli.i0 and the server's
  * pointer from cli.p1.
  */
-static int dump_servers_state(struct stream_interface *si)
+static int dump_servers_state(struct conn_stream *cs)
 {
-	struct appctx *appctx = __cs_appctx(si->cs);
+	struct appctx *appctx = __cs_appctx(cs);
 	struct proxy *px = appctx->ctx.cli.p0;
 	struct server *srv;
 	char srv_addr[INET6_ADDRSTRLEN + 1];
@@ -2714,8 +2715,8 @@ static int dump_servers_state(struct stream_interface *si)
 			chunk_appendf(&trash, "\n");
 		}
 
-		if (ci_putchk(si_ic(si), &trash) == -1) {
-			si_rx_room_blk(si);
+		if (ci_putchk(cs_ic(cs), &trash) == -1) {
+			cs_rx_room_blk(cs);
 			return 0;
 		}
 	}
@@ -2728,7 +2729,7 @@ static int dump_servers_state(struct stream_interface *si)
  */
 static int cli_io_handler_servers_state(struct appctx *appctx)
 {
-	struct stream_interface *si = cs_si(appctx->owner);
+	struct conn_stream *cs = appctx->owner;
 	struct proxy *curproxy;
 
 	chunk_reset(&trash);
@@ -2747,8 +2748,8 @@ static int cli_io_handler_servers_state(struct appctx *appctx)
 			             "# bkname/svname bkid/svid addr port - purge_delay used_cur used_max need_est unsafe_nb safe_nb idle_lim idle_cur idle_per_thr[%d]\n",
 			             global.nbthread);
 
-		if (ci_putchk(si_ic(si), &trash) == -1) {
-			si_rx_room_blk(si);
+		if (ci_putchk(cs_ic(cs), &trash) == -1) {
+			cs_rx_room_blk(cs);
 			return 0;
 		}
 		appctx->st2 = STAT_ST_INFO;
@@ -2759,7 +2760,7 @@ static int cli_io_handler_servers_state(struct appctx *appctx)
 		curproxy = appctx->ctx.cli.p0;
 		/* servers are only in backends */
 		if ((curproxy->cap & PR_CAP_BE) && !(curproxy->cap & PR_CAP_INT)) {
-			if (!dump_servers_state(si))
+			if (!dump_servers_state(cs))
 				return 0;
 		}
 		/* only the selected proxy is dumped */
@@ -2775,15 +2776,15 @@ static int cli_io_handler_servers_state(struct appctx *appctx)
  */
 static int cli_io_handler_show_backend(struct appctx *appctx)
 {
-	struct stream_interface *si = cs_si(appctx->owner);
+	struct conn_stream *cs = appctx->owner;
 	struct proxy *curproxy;
 
 	chunk_reset(&trash);
 
 	if (!appctx->ctx.cli.p0) {
 		chunk_printf(&trash, "# name\n");
-		if (ci_putchk(si_ic(si), &trash) == -1) {
-			si_rx_room_blk(si);
+		if (ci_putchk(cs_ic(cs), &trash) == -1) {
+			cs_rx_room_blk(cs);
 			return 0;
 		}
 		appctx->ctx.cli.p0 = proxies_list;
@@ -2797,8 +2798,8 @@ static int cli_io_handler_show_backend(struct appctx *appctx)
 			continue;
 
 		chunk_appendf(&trash, "%s\n", curproxy->id);
-		if (ci_putchk(si_ic(si), &trash) == -1) {
-			si_rx_room_blk(si);
+		if (ci_putchk(cs_ic(cs), &trash) == -1) {
+			cs_rx_room_blk(cs);
 			return 0;
 		}
 	}
@@ -3072,16 +3073,16 @@ static int cli_parse_show_errors(char **args, char *payload, struct appctx *appc
 	return 0;
 }
 
-/* This function dumps all captured errors onto the stream interface's
+/* This function dumps all captured errors onto the conn-stream's
  * read buffer. It returns 0 if the output buffer is full and it needs
  * to be called again, otherwise non-zero.
  */
 static int cli_io_handler_show_errors(struct appctx *appctx)
 {
-	struct stream_interface *si = cs_si(appctx->owner);
+	struct conn_stream *cs = appctx->owner;
 	extern const char *monthname[12];
 
-	if (unlikely(si_ic(si)->flags & (CF_WRITE_ERROR|CF_SHUTW)))
+	if (unlikely(cs_ic(cs)->flags & (CF_WRITE_ERROR|CF_SHUTW)))
 		return 1;
 
 	chunk_reset(&trash);
@@ -3098,7 +3099,7 @@ static int cli_io_handler_show_errors(struct appctx *appctx)
 			     tm.tm_hour, tm.tm_min, tm.tm_sec, (int)(date.tv_usec/1000),
 			     error_snapshot_id);
 
-		if (ci_putchk(si_ic(si), &trash) == -1)
+		if (ci_putchk(cs_ic(cs), &trash) == -1)
 			goto cant_send;
 
 		appctx->ctx.errors.px = proxies_list;
@@ -3188,7 +3189,7 @@ static int cli_io_handler_show_errors(struct appctx *appctx)
 
 			chunk_appendf(&trash, "  \n");
 
-			if (ci_putchk(si_ic(si), &trash) == -1)
+			if (ci_putchk(cs_ic(cs), &trash) == -1)
 				goto cant_send_unlock;
 
 			appctx->ctx.errors.ptr = 0;
@@ -3199,7 +3200,7 @@ static int cli_io_handler_show_errors(struct appctx *appctx)
 			/* the snapshot changed while we were dumping it */
 			chunk_appendf(&trash,
 				     "  WARNING! update detected on this snapshot, dump interrupted. Please re-check!\n");
-			if (ci_putchk(si_ic(si), &trash) == -1)
+			if (ci_putchk(cs_ic(cs), &trash) == -1)
 				goto cant_send_unlock;
 
 			goto next;
@@ -3215,7 +3216,7 @@ static int cli_io_handler_show_errors(struct appctx *appctx)
 			if (newptr == appctx->ctx.errors.ptr)
 				goto cant_send_unlock;
 
-			if (ci_putchk(si_ic(si), &trash) == -1)
+			if (ci_putchk(cs_ic(cs), &trash) == -1)
 				goto cant_send_unlock;
 
 			appctx->ctx.errors.ptr = newptr;
@@ -3236,7 +3237,7 @@ static int cli_io_handler_show_errors(struct appctx *appctx)
  cant_send_unlock:
 	HA_RWLOCK_RDUNLOCK(PROXY_LOCK, &appctx->ctx.errors.px->lock);
  cant_send:
-	si_rx_room_blk(si);
+	cs_rx_room_blk(cs);
 	return 0;
 }
 

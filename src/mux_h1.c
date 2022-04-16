@@ -16,6 +16,7 @@
 #include <haproxy/cfgparse.h>
 #include <haproxy/connection.h>
 #include <haproxy/conn_stream.h>
+#include <haproxy/dynbuf.h>
 #include <haproxy/h1.h>
 #include <haproxy/h1_htx.h>
 #include <haproxy/h2.h>
@@ -28,7 +29,6 @@
 #include <haproxy/session-t.h>
 #include <haproxy/stats.h>
 #include <haproxy/stream.h>
-#include <haproxy/stream_interface.h>
 #include <haproxy/trace.h>
 
 /*
@@ -119,6 +119,7 @@ struct h1c {
 struct h1s {
 	struct h1c *h1c;
 	struct conn_stream *cs;
+	struct cs_endpoint *endp;
 	uint32_t flags;                /* Connection flags: H1S_F_* */
 
 	struct wait_event *subs;      /* Address of the wait_event the conn_stream associated is waiting on */
@@ -427,6 +428,8 @@ static void h1_trace(enum trace_level level, uint64_t mask, const struct trace_s
 		chunk_appendf(&trace_buf, " conn=%p(0x%08x)", h1c->conn, h1c->conn->flags);
 	if (h1s) {
 		chunk_appendf(&trace_buf, " h1s=%p(0x%08x)", h1s, h1s->flags);
+		if (h1s->endp)
+			chunk_appendf(&trace_buf, " endp=%p(0x%08x)", h1s->endp, h1s->endp->flags);
 		if (h1s->cs)
 			chunk_appendf(&trace_buf, " cs=%p(0x%08x)", h1s->cs, h1s->cs->flags);
 	}
@@ -716,25 +719,17 @@ static inline size_t h1s_data_pending(const struct h1s *h1s)
 static struct conn_stream *h1s_new_cs(struct h1s *h1s, struct buffer *input)
 {
 	struct h1c *h1c = h1s->h1c;
-	struct conn_stream *cs;
 
 	TRACE_ENTER(H1_EV_STRM_NEW, h1c->conn, h1s);
-	cs = cs_new();
-	if (!cs) {
-		TRACE_ERROR("CS allocation failure", H1_EV_STRM_NEW|H1_EV_STRM_END|H1_EV_STRM_ERR, h1c->conn, h1s);
-		goto err;
-	}
-	cs_attach_endp(cs, &h1c->conn->obj_type, h1s);
-	h1s->cs = cs;
 
 	if (h1s->flags & H1S_F_NOT_FIRST)
-		cs->flags |= CS_FL_NOT_FIRST;
-
+		h1s->endp->flags |= CS_EP_NOT_FIRST;
 	if (h1s->req.flags & H1_MF_UPG_WEBSOCKET)
-		cs->flags |= CS_FL_WEBSOCKET;
+		h1s->endp->flags |= CS_EP_WEBSOCKET;
 
-	if (!stream_new(h1c->conn->owner, cs, input)) {
-		TRACE_DEVEL("leaving on stream creation failure", H1_EV_STRM_NEW|H1_EV_STRM_END|H1_EV_STRM_ERR, h1c->conn, h1s);
+	h1s->cs = cs_new_from_mux(h1s->endp, h1c->conn->owner, input);
+	if (!h1s->cs) {
+		TRACE_ERROR("CS allocation failure", H1_EV_STRM_NEW|H1_EV_STRM_END|H1_EV_STRM_ERR, h1c->conn, h1s);
 		goto err;
 	}
 
@@ -743,11 +738,9 @@ static struct conn_stream *h1s_new_cs(struct h1s *h1s, struct buffer *input)
 
 	h1c->flags = (h1c->flags & ~H1C_F_ST_EMBRYONIC) | H1C_F_ST_ATTACHED | H1C_F_ST_READY;
 	TRACE_LEAVE(H1_EV_STRM_NEW, h1c->conn, h1s);
-	return cs;
+	return h1s->cs;
 
   err:
-	cs_free(cs);
-	h1s->cs = NULL;
 	TRACE_DEVEL("leaving on error", H1_EV_STRM_NEW|H1_EV_STRM_ERR, h1c->conn, h1s);
 	return NULL;
 }
@@ -785,6 +778,7 @@ static struct h1s *h1s_new(struct h1c *h1c)
 	h1c->h1s = h1s;
 	h1s->sess = NULL;
 	h1s->cs = NULL;
+	h1s->endp = NULL;
 	h1s->flags = H1S_F_WANT_KAL;
 	h1s->subs = NULL;
 	h1s->rxbuf = BUF_NULL;
@@ -811,9 +805,8 @@ static struct h1s *h1s_new(struct h1c *h1c)
 	return NULL;
 }
 
-static struct h1s *h1c_frt_stream_new(struct h1c *h1c)
+static struct h1s *h1c_frt_stream_new(struct h1c *h1c, struct conn_stream *cs, struct session *sess)
 {
-	struct session *sess = h1c->conn->owner;
 	struct h1s *h1s;
 
 	TRACE_ENTER(H1_EV_H1S_NEW, h1c->conn);
@@ -821,6 +814,21 @@ static struct h1s *h1c_frt_stream_new(struct h1c *h1c)
 	h1s = h1s_new(h1c);
 	if (!h1s)
 		goto fail;
+
+	if (cs) {
+		if (cs_attach_mux(cs, h1s, h1c->conn) < 0)
+			goto fail;
+		h1s->cs = cs;
+		h1s->endp = cs->endp;
+	}
+	else {
+		h1s->endp = cs_endpoint_new();
+		if (!h1s->endp)
+			goto fail;
+		h1s->endp->target = h1s;
+		h1s->endp->ctx = h1c->conn;
+		h1s->endp->flags |= (CS_EP_T_MUX|CS_EP_ORPHAN);
+	}
 
 	h1s->sess = sess;
 
@@ -834,6 +842,7 @@ static struct h1s *h1c_frt_stream_new(struct h1c *h1c)
 
   fail:
 	TRACE_DEVEL("leaving on error", H1_EV_STRM_NEW|H1_EV_STRM_ERR, h1c->conn);
+	pool_free(pool_head_h1s, h1s);
 	return NULL;
 }
 
@@ -847,10 +856,13 @@ static struct h1s *h1c_bck_stream_new(struct h1c *h1c, struct conn_stream *cs, s
 	if (!h1s)
 		goto fail;
 
+	if (cs_attach_mux(cs, h1s, h1c->conn) < 0)
+		goto fail;
+
 	h1s->flags |= H1S_F_RX_BLK;
 	h1s->cs = cs;
+	h1s->endp = cs->endp;
 	h1s->sess = sess;
-	cs->ctx = h1s;
 
 	h1c->flags = (h1c->flags & ~H1C_F_ST_EMBRYONIC) | H1C_F_ST_ATTACHED | H1C_F_ST_READY;
 
@@ -865,6 +877,7 @@ static struct h1s *h1c_bck_stream_new(struct h1c *h1c, struct conn_stream *cs, s
 
   fail:
 	TRACE_DEVEL("leaving on error", H1_EV_STRM_NEW|H1_EV_STRM_ERR, h1c->conn);
+	pool_free(pool_head_h1s, h1s);
 	return NULL;
 }
 
@@ -903,6 +916,8 @@ static void h1s_destroy(struct h1s *h1s)
 		}
 
 		HA_ATOMIC_DEC(&h1c->px_counters->open_streams);
+		BUG_ON(h1s->endp && !(h1s->endp->flags & CS_EP_ORPHAN));
+		cs_endpoint_free(h1s->endp);
 		pool_free(pool_head_h1s, h1s);
 	}
 }
@@ -990,13 +1005,8 @@ static int h1_init(struct connection *conn, struct proxy *proxy, struct session 
 	}
 	else if (conn_ctx) {
 		/* Upgraded frontend connection (from TCP) */
-		struct conn_stream *cs = conn_ctx;
-
-		if (!h1c_frt_stream_new(h1c))
+		if (!h1c_frt_stream_new(h1c, conn_ctx, h1c->conn->owner))
 			goto fail;
-
-		h1c->h1s->cs = cs;
-		cs->ctx = h1c->h1s;
 
 		/* Attach the CS but Not ready yet */
 		h1c->flags = (h1c->flags & ~H1C_F_ST_EMBRYONIC) | H1C_F_ST_ATTACHED;
@@ -1045,55 +1055,51 @@ static void h1_release(struct h1c *h1c)
 
 	TRACE_POINT(H1_EV_H1C_END);
 
-	if (h1c) {
-		/* The connection must be aattached to this mux to be released */
-		if (h1c->conn && h1c->conn->ctx == h1c)
-			conn = h1c->conn;
+	/* The connection must be aattached to this mux to be released */
+	if (h1c->conn && h1c->conn->ctx == h1c)
+		conn = h1c->conn;
 
-		TRACE_DEVEL("freeing h1c", H1_EV_H1C_END, conn);
-
-		if (conn && h1c->flags & H1C_F_UPG_H2C) {
-			TRACE_DEVEL("upgrading H1 to H2", H1_EV_H1C_END, conn);
-			/* Make sure we're no longer subscribed to anything */
-			if (h1c->wait_event.events)
-				conn->xprt->unsubscribe(conn, conn->xprt_ctx,
-				    h1c->wait_event.events, &h1c->wait_event);
-			if (conn_upgrade_mux_fe(conn, NULL, &h1c->ibuf, ist("h2"), PROTO_MODE_HTTP) != -1) {
-				/* connection successfully upgraded to H2, this
-				 * mux was already released */
-				return;
-			}
-			TRACE_ERROR("h2 upgrade failed", H1_EV_H1C_END|H1_EV_H1C_ERR, conn);
-			sess_log(conn->owner); /* Log if the upgrade failed */
+	if (conn && h1c->flags & H1C_F_UPG_H2C) {
+		TRACE_DEVEL("upgrading H1 to H2", H1_EV_H1C_END, conn);
+		/* Make sure we're no longer subscribed to anything */
+		if (h1c->wait_event.events)
+			conn->xprt->unsubscribe(conn, conn->xprt_ctx,
+						h1c->wait_event.events, &h1c->wait_event);
+		if (conn_upgrade_mux_fe(conn, NULL, &h1c->ibuf, ist("h2"), PROTO_MODE_HTTP) != -1) {
+			/* connection successfully upgraded to H2, this
+			 * mux was already released */
+			return;
 		}
-
-
-		if (LIST_INLIST(&h1c->buf_wait.list))
-			LIST_DEL_INIT(&h1c->buf_wait.list);
-
-		h1_release_buf(h1c, &h1c->ibuf);
-		h1_release_buf(h1c, &h1c->obuf);
-
-		if (h1c->task) {
-			h1c->task->context = NULL;
-			task_wakeup(h1c->task, TASK_WOKEN_OTHER);
-			h1c->task = NULL;
-		}
-
-		if (h1c->wait_event.tasklet)
-			tasklet_free(h1c->wait_event.tasklet);
-
-		h1s_destroy(h1c->h1s);
-		if (conn) {
-			if (h1c->wait_event.events != 0)
-				conn->xprt->unsubscribe(conn, conn->xprt_ctx, h1c->wait_event.events,
-							&h1c->wait_event);
-			h1_shutw_conn(conn);
-		}
-
-		HA_ATOMIC_DEC(&h1c->px_counters->open_conns);
-		pool_free(pool_head_h1c, h1c);
+		TRACE_ERROR("h2 upgrade failed", H1_EV_H1C_END|H1_EV_H1C_ERR, conn);
+		sess_log(conn->owner); /* Log if the upgrade failed */
 	}
+
+
+	if (LIST_INLIST(&h1c->buf_wait.list))
+		LIST_DEL_INIT(&h1c->buf_wait.list);
+
+	h1_release_buf(h1c, &h1c->ibuf);
+	h1_release_buf(h1c, &h1c->obuf);
+
+	if (h1c->task) {
+		h1c->task->context = NULL;
+		task_wakeup(h1c->task, TASK_WOKEN_OTHER);
+		h1c->task = NULL;
+	}
+
+	if (h1c->wait_event.tasklet)
+		tasklet_free(h1c->wait_event.tasklet);
+
+	h1s_destroy(h1c->h1s);
+	if (conn) {
+		if (h1c->wait_event.events != 0)
+			conn->xprt->unsubscribe(conn, conn->xprt_ctx, h1c->wait_event.events,
+						&h1c->wait_event);
+		h1_shutw_conn(conn);
+	}
+
+	HA_ATOMIC_DEC(&h1c->px_counters->open_conns);
+	pool_free(pool_head_h1c, h1c);
 
 	if (conn) {
 		if (!conn_is_back(conn))
@@ -1703,7 +1709,7 @@ static size_t h1_handle_trailers(struct h1s *h1s, struct h1m *h1m, struct htx *h
 			TRACE_ERROR("parsing error, reject H1 message", H1_EV_RX_DATA|H1_EV_RX_TLRS|H1_EV_H1S_ERR, h1s->h1c->conn, h1s);
 			h1_capture_bad_message(h1s->h1c, h1s, h1m, buf);
 		}
-		else if (ret == -2 || b_data(buf) != *ofs) {
+		else if (ret == -2) {
 			TRACE_STATE("RX path congested, waiting for more space", H1_EV_RX_DATA|H1_EV_RX_TLRS|H1_EV_H1S_BLK, h1s->h1c->conn, h1s);
 			h1s->flags |= H1S_F_RX_CONGESTED;
 		}
@@ -1880,11 +1886,11 @@ static size_t h1_process_demux(struct h1c *h1c, struct buffer *buf, size_t count
 	/* Here h1s->cs is always defined */
 	if (!(h1m->flags & H1_MF_CHNK) && (h1m->state == H1_MSG_DATA || (h1m->state == H1_MSG_TUNNEL))) {
 		TRACE_STATE("notify the mux can use splicing", H1_EV_RX_DATA|H1_EV_RX_BODY, h1c->conn, h1s);
-		h1s->cs->flags |= CS_FL_MAY_SPLICE;
+		h1s->endp->flags |= CS_EP_MAY_SPLICE;
 	}
 	else {
 		TRACE_STATE("notify the mux can't use splicing anymore", H1_EV_RX_DATA|H1_EV_RX_BODY, h1c->conn, h1s);
-		h1s->cs->flags &= ~CS_FL_MAY_SPLICE;
+		h1s->endp->flags &= ~CS_EP_MAY_SPLICE;
 	}
 
 	/* Set EOI on conn-stream in DONE state iff:
@@ -1896,7 +1902,7 @@ static size_t h1_process_demux(struct h1c *h1c, struct buffer *buf, size_t count
 	 */
 	if (((h1m->state == H1_MSG_DONE) && (h1m->flags & H1_MF_RESP)) ||
 	    ((h1m->state == H1_MSG_DONE) && (h1s->meth != HTTP_METH_CONNECT) && !(h1m->flags & H1_MF_CONN_UPG)))
-		h1s->cs->flags |= CS_FL_EOI;
+		h1s->endp->flags |= CS_EP_EOI;
 
   out:
 	/* When Input data are pending for this message, notify upper layer that
@@ -1906,20 +1912,20 @@ static size_t h1_process_demux(struct h1c *h1c, struct buffer *buf, size_t count
 	 *   - Headers or trailers are pending to be copied.
 	 */
 	if (h1s->flags & (H1S_F_RX_CONGESTED)) {
-		h1s->cs->flags |= CS_FL_RCV_MORE | CS_FL_WANT_ROOM;
+		h1s->endp->flags |= CS_EP_RCV_MORE | CS_EP_WANT_ROOM;
 		TRACE_STATE("waiting for more room", H1_EV_RX_DATA|H1_EV_H1S_BLK, h1c->conn, h1s);
 	}
 	else {
-		h1s->cs->flags &= ~(CS_FL_RCV_MORE | CS_FL_WANT_ROOM);
+		h1s->endp->flags &= ~(CS_EP_RCV_MORE | CS_EP_WANT_ROOM);
 		if (h1s->flags & H1S_F_REOS) {
-			h1s->cs->flags |= CS_FL_EOS;
+			h1s->endp->flags |= CS_EP_EOS;
 			if (h1m->state >= H1_MSG_DONE || !(h1m->flags & H1_MF_XFER_LEN)) {
 				/* DONE or TUNNEL or SHUTR without XFER_LEN, set
 				 * EOI on the conn-stream */
-				h1s->cs->flags |= CS_FL_EOI;
+				h1s->endp->flags |= CS_EP_EOI;
 			}
 			else if (h1m->state > H1_MSG_LAST_LF && h1m->state < H1_MSG_DONE) {
-				h1s->cs->flags |= CS_FL_ERROR;
+				h1s->endp->flags |= CS_EP_ERROR;
 				TRACE_ERROR("message aborted, set error on CS", H1_EV_RX_DATA|H1_EV_H1S_ERR, h1c->conn, h1s);
 			}
 
@@ -1937,8 +1943,7 @@ static size_t h1_process_demux(struct h1c *h1c, struct buffer *buf, size_t count
 
   err:
 	htx_to_buf(htx, buf);
-	if (h1s->cs)
-		h1s->cs->flags |= CS_FL_EOI;
+	h1s->endp->flags |= CS_EP_EOI;
 	TRACE_DEVEL("leaving on error", H1_EV_RX_DATA|H1_EV_STRM_ERR, h1c->conn, h1s);
 	return 0;
 }
@@ -2552,7 +2557,7 @@ static size_t h1_process_mux(struct h1c *h1c, struct buffer *buf, size_t count)
 			h1c->flags |= H1C_F_ST_ERROR;
 			TRACE_ERROR("txn done but data waiting to be sent, set error on h1c", H1_EV_H1C_ERR, h1c->conn, h1s);
 		}
-		h1s->cs->flags |= CS_FL_EOI;
+		h1s->endp->flags |= CS_EP_EOI;
 	}
 
 	TRACE_LEAVE(H1_EV_TX_DATA, h1c->conn, h1s, chn_htx, (size_t[]){total});
@@ -2949,7 +2954,7 @@ static int h1_process(struct h1c * h1c)
 
 		/* Create the H1 stream if not already there */
 		if (!h1s) {
-			h1s = h1c_frt_stream_new(h1c);
+			h1s = h1c_frt_stream_new(h1c, NULL, h1c->conn->owner);
 			if (!h1s) {
 				b_reset(&h1c->ibuf);
 				h1c->flags = (h1c->flags & ~(H1C_F_ST_IDLE|H1C_F_WAIT_NEXT_REQ)) | H1C_F_ST_ERROR;
@@ -3033,7 +3038,7 @@ static int h1_process(struct h1c * h1c)
 				TRACE_STATE("read0 on connection", H1_EV_H1C_RECV, conn, h1s);
 			}
 			if ((h1c->flags & H1C_F_ST_ERROR) || ((conn->flags & CO_FL_ERROR) && !b_data(&h1c->ibuf)))
-				h1s->cs->flags |= CS_FL_ERROR;
+				h1s->endp->flags |= CS_EP_ERROR;
 			TRACE_POINT(H1_EV_STRM_WAKE, h1c->conn, h1s);
 			h1_alert(h1s);
 		}
@@ -3087,9 +3092,9 @@ static int h1_process(struct h1c * h1c)
 		BUG_ON(!h1s || h1c->flags & H1C_F_ST_READY);
 
 		if (conn_xprt_read0_pending(conn) || (h1s->flags & H1S_F_REOS))
-			h1s->cs->flags |= CS_FL_EOS;
+			h1s->endp->flags |= CS_EP_EOS;
 		if ((h1c->flags & H1C_F_ST_ERROR) || (conn->flags & CO_FL_ERROR))
-			h1s->cs->flags |= CS_FL_ERROR;
+			h1s->endp->flags |= CS_EP_ERROR;
 		h1_alert(h1s);
 		TRACE_DEVEL("waiting to release the CS before releasing the connection", H1_EV_H1C_WAKE);
 	}
@@ -3241,7 +3246,7 @@ struct task *h1_timeout_task(struct task *t, void *context, unsigned int state)
 		if (h1c->flags & H1C_F_ST_ATTACHED) {
 			/* Don't release the H1 connection right now, we must destroy the
 			 * attached CS first. Here, the H1C must not be READY */
-			h1c->h1s->cs->flags |= (CS_FL_EOS|CS_FL_ERROR);
+			h1c->h1s->endp->flags |= (CS_EP_EOS|CS_EP_ERROR);
 			h1_alert(h1c->h1s);
 			h1_refresh_timeout(h1c);
 			HA_SPIN_UNLOCK(OTHER_LOCK, &idle_conns[tid].idle_conns_lock);
@@ -3312,7 +3317,7 @@ static int h1_attach(struct connection *conn, struct conn_stream *cs, struct ses
 /* Retrieves a valid conn_stream from this connection, or returns NULL. For
  * this mux, it's easy as we can only store a single conn_stream.
  */
-static const struct conn_stream *h1_get_first_cs(const struct connection *conn)
+static struct conn_stream *h1_get_first_cs(const struct connection *conn)
 {
 	struct h1c *h1c = conn->ctx;
 	struct h1s *h1s = h1c->h1s;
@@ -3328,7 +3333,7 @@ static void h1_destroy(void *ctx)
 	struct h1c *h1c = ctx;
 
 	TRACE_POINT(H1_EV_H1C_END, h1c->conn);
-	if (!h1c->h1s || !h1c->conn || h1c->conn->ctx != h1c)
+	if (!h1c->h1s || h1c->conn->ctx != h1c)
 		h1_release(h1c);
 }
 
@@ -3337,14 +3342,13 @@ static void h1_destroy(void *ctx)
  */
 static void h1_detach(struct conn_stream *cs)
 {
-	struct h1s *h1s = cs->ctx;
+	struct h1s *h1s = __cs_mux(cs);
 	struct h1c *h1c;
 	struct session *sess;
 	int is_not_first;
 
 	TRACE_ENTER(H1_EV_STRM_END, h1s ? h1s->h1c->conn : NULL, h1s);
 
-	cs->ctx = NULL;
 	if (!h1s) {
 		TRACE_LEAVE(H1_EV_STRM_END);
 		return;
@@ -3444,9 +3448,9 @@ static void h1_detach(struct conn_stream *cs)
 }
 
 
-static void h1_shutr(struct conn_stream *cs, enum cs_shr_mode mode)
+static void h1_shutr(struct conn_stream *cs, enum co_shr_mode mode)
 {
-	struct h1s *h1s = cs->ctx;
+	struct h1s *h1s = __cs_mux(cs);
 	struct h1c *h1c;
 
 	if (!h1s)
@@ -3455,9 +3459,9 @@ static void h1_shutr(struct conn_stream *cs, enum cs_shr_mode mode)
 
 	TRACE_ENTER(H1_EV_STRM_SHUT, h1c->conn, h1s, 0, (size_t[]){mode});
 
-	if (cs->flags & CS_FL_SHR)
+	if (cs->endp->flags & CS_EP_SHR)
 		goto end;
-	if (cs->flags & CS_FL_KILL_CONN) {
+	if (cs->endp->flags & CS_EP_KILL_CONN) {
 		TRACE_STATE("stream wants to kill the connection", H1_EV_STRM_SHUT, h1c->conn, h1s);
 		goto do_shutr;
 	}
@@ -3478,18 +3482,18 @@ static void h1_shutr(struct conn_stream *cs, enum cs_shr_mode mode)
 
   do_shutr:
 	/* NOTE: Be sure to handle abort (cf. h2_shutr) */
-	if (cs->flags & CS_FL_SHR)
+	if (cs->endp->flags & CS_EP_SHR)
 		goto end;
 
 	if (conn_xprt_ready(h1c->conn) && h1c->conn->xprt->shutr)
-		h1c->conn->xprt->shutr(h1c->conn, h1c->conn->xprt_ctx, (mode == CS_SHR_DRAIN));
+		h1c->conn->xprt->shutr(h1c->conn, h1c->conn->xprt_ctx, (mode == CO_SHR_DRAIN));
   end:
 	TRACE_LEAVE(H1_EV_STRM_SHUT, h1c->conn, h1s);
 }
 
-static void h1_shutw(struct conn_stream *cs, enum cs_shw_mode mode)
+static void h1_shutw(struct conn_stream *cs, enum co_shw_mode mode)
 {
-	struct h1s *h1s = cs->ctx;
+	struct h1s *h1s = __cs_mux(cs);
 	struct h1c *h1c;
 
 	if (!h1s)
@@ -3498,9 +3502,9 @@ static void h1_shutw(struct conn_stream *cs, enum cs_shw_mode mode)
 
 	TRACE_ENTER(H1_EV_STRM_SHUT, h1c->conn, h1s, 0, (size_t[]){mode});
 
-	if (cs->flags & CS_FL_SHW)
+	if (cs->endp->flags & CS_EP_SHW)
 		goto end;
-	if (cs->flags & CS_FL_KILL_CONN) {
+	if (cs->endp->flags & CS_EP_KILL_CONN) {
 		TRACE_STATE("stream wants to kill the connection", H1_EV_STRM_SHUT, h1c->conn, h1s);
 		goto do_shutw;
 	}
@@ -3521,7 +3525,7 @@ static void h1_shutw(struct conn_stream *cs, enum cs_shw_mode mode)
 
   do_shutw:
 	h1c->flags |= H1C_F_ST_SHUTDOWN;
-	if (mode != CS_SHW_NORMAL)
+	if (mode != CO_SHW_NORMAL)
 		h1c->flags |= H1C_F_ST_SILENT_SHUT;
 
 	if (!b_data(&h1c->obuf))
@@ -3549,7 +3553,7 @@ static void h1_shutw_conn(struct connection *conn)
  */
 static int h1_unsubscribe(struct conn_stream *cs, int event_type, struct wait_event *es)
 {
-	struct h1s *h1s = cs->ctx;
+	struct h1s *h1s = __cs_mux(cs);
 
 	if (!h1s)
 		return 0;
@@ -3578,7 +3582,7 @@ static int h1_unsubscribe(struct conn_stream *cs, int event_type, struct wait_ev
  */
 static int h1_subscribe(struct conn_stream *cs, int event_type, struct wait_event *es)
 {
-	struct h1s *h1s = cs->ctx;
+	struct h1s *h1s = __cs_mux(cs);
 	struct h1c *h1c;
 
 	if (!h1s)
@@ -3626,7 +3630,7 @@ static int h1_subscribe(struct conn_stream *cs, int event_type, struct wait_even
  */
 static size_t h1_rcv_buf(struct conn_stream *cs, struct buffer *buf, size_t count, int flags)
 {
-	struct h1s *h1s = cs->ctx;
+	struct h1s *h1s = __cs_mux(cs);
 	struct h1c *h1c = h1s->h1c;
 	struct h1m *h1m = (!(h1c->flags & H1C_F_IS_BACK) ? &h1s->req : &h1s->res);
 	size_t ret = 0;
@@ -3644,7 +3648,7 @@ static size_t h1_rcv_buf(struct conn_stream *cs, struct buffer *buf, size_t coun
 	else
 		TRACE_DEVEL("h1c ibuf not allocated", H1_EV_H1C_RECV|H1_EV_H1C_BLK, h1c->conn);
 
-	if ((flags & CO_RFL_BUF_FLUSH) && (cs->flags & CS_FL_MAY_SPLICE)) {
+	if ((flags & CO_RFL_BUF_FLUSH) && (h1s->endp->flags & CS_EP_MAY_SPLICE)) {
 		h1c->flags |= H1C_F_WANT_SPLICE;
 		TRACE_STATE("Block xprt rcv_buf to flush stream's buffer (want_splice)", H1_EV_STRM_RECV, h1c->conn, h1s);
 	}
@@ -3662,7 +3666,7 @@ static size_t h1_rcv_buf(struct conn_stream *cs, struct buffer *buf, size_t coun
 /* Called from the upper layer, to send data */
 static size_t h1_snd_buf(struct conn_stream *cs, struct buffer *buf, size_t count, int flags)
 {
-	struct h1s *h1s = cs->ctx;
+	struct h1s *h1s = __cs_mux(cs);
 	struct h1c *h1c;
 	size_t total = 0;
 
@@ -3682,7 +3686,7 @@ static size_t h1_snd_buf(struct conn_stream *cs, struct buffer *buf, size_t coun
 	}
 
 	if (h1c->flags & H1C_F_ST_ERROR) {
-		cs->flags |= CS_FL_ERROR;
+		h1s->endp->flags |= CS_EP_ERROR;
 		TRACE_ERROR("H1C on error, leaving in error", H1_EV_STRM_SEND|H1_EV_H1C_ERR|H1_EV_H1S_ERR|H1_EV_STRM_ERR, h1c->conn, h1s);
 		return 0;
 	}
@@ -3714,7 +3718,7 @@ static size_t h1_snd_buf(struct conn_stream *cs, struct buffer *buf, size_t coun
 	}
 
 	if (h1c->flags & H1C_F_ST_ERROR) {
-		cs->flags |= CS_FL_ERROR;
+		h1s->endp->flags |= CS_EP_ERROR;
 		TRACE_ERROR("reporting error to the app-layer stream", H1_EV_STRM_SEND|H1_EV_H1S_ERR|H1_EV_STRM_ERR, h1c->conn, h1s);
 	}
 
@@ -3727,7 +3731,7 @@ static size_t h1_snd_buf(struct conn_stream *cs, struct buffer *buf, size_t coun
 /* Send and get, using splicing */
 static int h1_rcv_pipe(struct conn_stream *cs, struct pipe *pipe, unsigned int count)
 {
-	struct h1s *h1s = cs->ctx;
+	struct h1s *h1s = __cs_mux(cs);
 	struct h1c *h1c = h1s->h1c;
 	struct h1m *h1m = (!(h1c->flags & H1C_F_IS_BACK) ? &h1s->req : &h1s->res);
 	int ret = 0;
@@ -3759,7 +3763,7 @@ static int h1_rcv_pipe(struct conn_stream *cs, struct pipe *pipe, unsigned int c
 			if (ret > h1m->curr_len) {
 				h1s->flags |= H1S_F_PARSING_ERROR;
 				h1c->flags |= H1C_F_ST_ERROR;
-				cs->flags  |= CS_FL_ERROR;
+				h1s->endp->flags  |= CS_EP_ERROR;
 				TRACE_ERROR("too much payload, more than announced",
 					    H1_EV_RX_DATA|H1_EV_STRM_ERR|H1_EV_H1C_ERR|H1_EV_H1S_ERR, h1c->conn, h1s);
 				goto end;
@@ -3784,7 +3788,7 @@ static int h1_rcv_pipe(struct conn_stream *cs, struct pipe *pipe, unsigned int c
 
 	if (!(h1c->flags & H1C_F_WANT_SPLICE)) {
 		TRACE_STATE("notify the mux can't use splicing anymore", H1_EV_STRM_RECV, h1c->conn, h1s);
-		cs->flags &= ~CS_FL_MAY_SPLICE;
+		h1s->endp->flags &= ~CS_EP_MAY_SPLICE;
 		if (!(h1c->wait_event.events & SUB_RETRY_RECV)) {
 			TRACE_STATE("restart receiving data, subscribing", H1_EV_STRM_RECV, h1c->conn, h1s);
 			h1c->conn->xprt->subscribe(h1c->conn, h1c->conn->xprt_ctx, SUB_RETRY_RECV, &h1c->wait_event);
@@ -3797,7 +3801,7 @@ static int h1_rcv_pipe(struct conn_stream *cs, struct pipe *pipe, unsigned int c
 
 static int h1_snd_pipe(struct conn_stream *cs, struct pipe *pipe)
 {
-	struct h1s *h1s = cs->ctx;
+	struct h1s *h1s = __cs_mux(cs);
 	struct h1c *h1c = h1s->h1c;
 	struct h1m *h1m = (!(h1c->flags & H1C_F_IS_BACK) ? &h1s->res : &h1s->req);
 	int ret = 0;
@@ -3817,7 +3821,7 @@ static int h1_snd_pipe(struct conn_stream *cs, struct pipe *pipe)
 		if (ret > h1m->curr_len) {
 			h1s->flags |= H1S_F_PROCESSING_ERROR;
 			h1c->flags |= H1C_F_ST_ERROR;
-			cs->flags  |= CS_FL_ERROR;
+			h1s->endp->flags  |= CS_EP_ERROR;
 			TRACE_ERROR("too much payload, more than announced",
 				    H1_EV_TX_DATA|H1_EV_STRM_ERR|H1_EV_H1C_ERR|H1_EV_H1S_ERR, h1c->conn, h1s);
 			goto end;
@@ -3882,15 +3886,17 @@ static int h1_show_fd(struct buffer *msg, struct connection *conn)
 			method = http_known_methods[h1s->meth].ptr;
 		else
 			method = "UNKNOWN";
-		chunk_appendf(msg, " h1s=%p h1s.flg=0x%x .req.state=%s .res.state=%s"
+		chunk_appendf(msg, " h1s=%p h1s.flg=0x%x .endp.flg=0x%x .req.state=%s .res.state=%s"
 		    " .meth=%s status=%d",
-			      h1s, h1s->flags,
+			      h1s, h1s->flags, h1s->endp->flags,
 			      h1m_state_str(h1s->req.state),
 			      h1m_state_str(h1s->res.state), method, h1s->status);
-		if (h1s->cs)
-			chunk_appendf(msg, " .cs.flg=0x%08x .cs.app=%p",
-				      h1s->cs->flags, h1s->cs->app);
-
+		if (h1s->endp) {
+			chunk_appendf(msg, " .endp.flg=0x%08x", h1s->endp->flags);
+			if (!(h1s->endp->flags & CS_EP_ORPHAN))
+				chunk_appendf(msg, " .cs.flg=0x%08x .cs.app=%p",
+					      h1s->cs->flags, h1s->cs->app);
+		}
 		chunk_appendf(&trash, " .subs=%p", h1s->subs);
 		if (h1s->subs) {
 			chunk_appendf(&trash, "(ev=%d tl=%p", h1s->subs->events, h1s->subs->tasklet);

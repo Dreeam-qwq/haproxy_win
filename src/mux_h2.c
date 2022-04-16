@@ -16,6 +16,7 @@
 #include <haproxy/cfgparse.h>
 #include <haproxy/connection.h>
 #include <haproxy/conn_stream.h>
+#include <haproxy/dynbuf.h>
 #include <haproxy/h2.h>
 #include <haproxy/hpack-dec.h>
 #include <haproxy/hpack-enc.h>
@@ -28,7 +29,6 @@
 #include <haproxy/session-t.h>
 #include <haproxy/stats.h>
 #include <haproxy/stream.h>
-#include <haproxy/stream_interface.h>
 #include <haproxy/trace.h>
 
 
@@ -202,7 +202,6 @@ enum h2_ss {
 
 #define H2_SF_WANT_SHUTR        0x00008000  // a stream couldn't shutr() (mux full/busy)
 #define H2_SF_WANT_SHUTW        0x00010000  // a stream couldn't shutw() (mux full/busy)
-#define H2_SF_KILL_CONN         0x00020000  // kill the whole connection with this stream
 
 #define H2_SF_EXT_CONNECT_SENT  0x00040000  // rfc 8441 an Extended CONNECT has been sent
 #define H2_SF_EXT_CONNECT_RCVD  0x00080000  // rfc 8441 an Extended CONNECT has been received and parsed
@@ -214,6 +213,7 @@ enum h2_ss {
  */
 struct h2s {
 	struct conn_stream *cs;
+	struct cs_endpoint *endp;
 	struct session *sess;
 	struct h2c *h2c;
 	struct eb32_node by_id; /* place in h2c's streams_by_id */
@@ -722,9 +722,16 @@ static void h2c_update_timeout(struct h2c *h2c)
 		} else if (br_data(h2c->mbuf)) {
 			/* pending output data: always the regular data timeout */
 			h2c->task->expire = tick_add_ifset(now_ms, h2c->timeout);
-		} else if (h2c->max_id > 0 && !b_data(&h2c->dbuf)) {
+		} else if (!(h2c->flags & H2_CF_IS_BACK) && h2c->max_id > 0 && !b_data(&h2c->dbuf)) {
 			/* idle after having seen one stream => keep-alive */
-			h2c->task->expire = tick_add_ifset(h2c->idle_start, h2c->proxy->timeout.httpka);
+			int to;
+
+			if (tick_isset(h2c->proxy->timeout.httpka))
+				to = h2c->proxy->timeout.httpka;
+			else
+				to = h2c->proxy->timeout.httpreq;
+
+			h2c->task->expire = tick_add_ifset(h2c->idle_start, to);
 			is_idle_conn = 1;
 		} else {
 			/* before first request, or started to deserialize a
@@ -1154,39 +1161,32 @@ static inline struct h2s *h2c_st_by_id(struct h2c *h2c, int id)
  */
 static void h2_release(struct h2c *h2c)
 {
-	struct connection *conn = NULL;
+	struct connection *conn = h2c->conn;
 
 	TRACE_ENTER(H2_EV_H2C_END);
 
-	if (h2c) {
-		/* The connection must be aattached to this mux to be released */
-		if (h2c->conn && h2c->conn->ctx == h2c)
-			conn = h2c->conn;
+	hpack_dht_free(h2c->ddht);
 
-		TRACE_DEVEL("freeing h2c", H2_EV_H2C_END, conn);
-		hpack_dht_free(h2c->ddht);
+	if (LIST_INLIST(&h2c->buf_wait.list))
+		LIST_DEL_INIT(&h2c->buf_wait.list);
 
-		if (LIST_INLIST(&h2c->buf_wait.list))
-			LIST_DEL_INIT(&h2c->buf_wait.list);
+	h2_release_buf(h2c, &h2c->dbuf);
+	h2_release_mbuf(h2c);
 
-		h2_release_buf(h2c, &h2c->dbuf);
-		h2_release_mbuf(h2c);
-
-		if (h2c->task) {
-			h2c->task->context = NULL;
-			task_wakeup(h2c->task, TASK_WOKEN_OTHER);
-			h2c->task = NULL;
-		}
-		if (h2c->wait_event.tasklet)
-			tasklet_free(h2c->wait_event.tasklet);
-		if (conn && h2c->wait_event.events != 0)
-			conn->xprt->unsubscribe(conn, conn->xprt_ctx, h2c->wait_event.events,
-						&h2c->wait_event);
-
-		HA_ATOMIC_DEC(&h2c->px_counters->open_conns);
-
-		pool_free(pool_head_h2c, h2c);
+	if (h2c->task) {
+		h2c->task->context = NULL;
+		task_wakeup(h2c->task, TASK_WOKEN_OTHER);
+		h2c->task = NULL;
 	}
+	if (h2c->wait_event.tasklet)
+		tasklet_free(h2c->wait_event.tasklet);
+	if (conn && h2c->wait_event.events != 0)
+		conn->xprt->unsubscribe(conn, conn->xprt_ctx, h2c->wait_event.events,
+					&h2c->wait_event);
+
+	HA_ATOMIC_DEC(&h2c->px_counters->open_conns);
+
+	pool_free(pool_head_h2c, h2c);
 
 	if (conn) {
 		if (!conn_is_back(conn))
@@ -1249,11 +1249,17 @@ static inline __maybe_unused int h2c_mux_busy(const struct h2c *h2c, const struc
 	return 1;
 }
 
-/* marks an error on the connection */
+/* marks an error on the connection. Before settings are sent, we must not send
+ * a GOAWAY frame, and the error state will prevent h2c_send_goaway_error()
+ * from verifying this so we set H2_CF_GOAWAY_FAILED to make sure it will not
+ * even try.
+ */
 static inline __maybe_unused void h2c_error(struct h2c *h2c, enum h2_err err)
 {
 	TRACE_POINT(H2_EV_H2C_ERR, h2c->conn, 0, 0, (void *)(long)(err));
 	h2c->errcode = err;
+	if (h2c->st0 < H2_CS_SETTINGS1)
+		h2c->flags |= H2_CF_GOAWAY_FAILED;
 	h2c->st0 = H2_CS_ERROR;
 }
 
@@ -1475,7 +1481,7 @@ static inline void h2s_close(struct h2s *h2s)
 		if (!h2s->id)
 			h2s->h2c->nb_reserved--;
 		if (h2s->cs) {
-			if (!(h2s->cs->flags & CS_FL_EOS) && !b_data(&h2s->rxbuf))
+			if (!(h2s->endp->flags & CS_EP_EOS) && !b_data(&h2s->rxbuf))
 				h2s_notify_recv(h2s);
 		}
 		HA_ATOMIC_DEC(&h2s->h2c->px_counters->open_streams);
@@ -1514,6 +1520,8 @@ static void h2s_destroy(struct h2s *h2s)
 
 	/* ditto, calling tasklet_free() here should be ok */
 	tasklet_free(h2s->shut_tl);
+	BUG_ON(h2s->endp && !(h2s->endp->flags & CS_EP_ORPHAN));
+	cs_endpoint_free(h2s->endp);
 	pool_free(pool_head_h2s, h2s);
 
 	TRACE_LEAVE(H2_EV_H2S_END, conn);
@@ -1546,6 +1554,7 @@ static struct h2s *h2s_new(struct h2c *h2c, int id)
 	LIST_INIT(&h2s->list);
 	h2s->h2c       = h2c;
 	h2s->cs        = NULL;
+	h2s->endp      = NULL;
 	h2s->sws       = 0;
 	h2s->flags     = H2_SF_NONE;
 	h2s->errcode   = H2_ERR_NO_ERROR;
@@ -1584,7 +1593,6 @@ static struct h2s *h2s_new(struct h2c *h2c, int id)
 static struct h2s *h2c_frt_stream_new(struct h2c *h2c, int id, struct buffer *input, uint32_t flags)
 {
 	struct session *sess = h2c->conn->owner;
-	struct conn_stream *cs;
 	struct h2s *h2s;
 
 	TRACE_ENTER(H2_EV_H2S_NEW, h2c->conn);
@@ -1596,19 +1604,18 @@ static struct h2s *h2c_frt_stream_new(struct h2c *h2c, int id, struct buffer *in
 	if (!h2s)
 		goto out;
 
-	cs = cs_new();
-	if (!cs)
+	h2s->endp = cs_endpoint_new();
+	if (!h2s->endp)
 		goto out_close;
-	cs->flags |= CS_FL_NOT_FIRST;
-	cs_attach_endp(cs, &h2c->conn->obj_type, h2s);
-	h2s->cs = cs;
-	h2c->nb_cs++;
+	h2s->endp->target = h2s;
+	h2s->endp->ctx = h2c->conn;
+	h2s->endp->flags |= (CS_EP_T_MUX|CS_EP_ORPHAN|CS_EP_NOT_FIRST);
 
 	/* FIXME wrong analogy between ext-connect and websocket, this need to
 	 * be refine.
 	 */
 	if (flags & H2_SF_EXT_CONNECT_RCVD)
-		cs->flags |= CS_FL_WEBSOCKET;
+		h2s->endp->flags |= CS_EP_WEBSOCKET;
 
 	/* The stream will record the request's accept date (which is either the
 	 * end of the connection's or the date immediately after the previous
@@ -1616,8 +1623,12 @@ static struct h2s *h2c_frt_stream_new(struct h2c *h2c, int id, struct buffer *in
 	 * request. We can set the value now, it will be copied by stream_new().
 	 */
 	sess->t_idle = tv_ms_elapsed(&sess->tv_accept, &now) - sess->t_handshake;
-	if (!stream_new(h2c->conn->owner, cs, input))
-		goto out_free_cs;
+
+	h2s->cs = cs_new_from_mux(h2s->endp, sess, input);
+	if (!h2s->cs) {
+		goto out_close;
+	}
+	h2c->nb_cs++;
 
 	/* We want the accept date presented to the next stream to be the one
 	 * we have now, the handshake time to be null (since the next stream
@@ -1635,12 +1646,6 @@ static struct h2s *h2c_frt_stream_new(struct h2c *h2c, int id, struct buffer *in
 	TRACE_LEAVE(H2_EV_H2S_NEW, h2c->conn);
 	return h2s;
 
- out_free_cs:
-	h2c->nb_cs--;
-	if (!h2c->nb_cs)
-		h2c->idle_start = now_ms;
-	cs_free(cs);
-	h2s->cs = NULL;
  out_close:
 	h2s_destroy(h2s);
  out:
@@ -1670,9 +1675,14 @@ static struct h2s *h2c_bck_stream_new(struct h2c *h2c, struct conn_stream *cs, s
 	if (!h2s)
 		goto out;
 
+	if (cs_attach_mux(cs, h2s, h2c->conn) < 0) {
+		h2s_destroy(h2s);
+		h2s = NULL;
+		goto out;
+	}
 	h2s->cs = cs;
+	h2s->endp = cs->endp;
 	h2s->sess = sess;
-	cs->ctx = h2s;
 	h2c->nb_cs++;
 
  out:
@@ -1879,7 +1889,8 @@ static int h2c_bck_send_preface(struct h2c *h2c)
  * the message, it subscribes the requester (either <h2s> or <h2c>) to future
  * notifications. It sets H2_CF_GOAWAY_SENT on success, and H2_CF_GOAWAY_FAILED
  * on unrecoverable failure. It will not attempt to send one again in this last
- * case so that it is safe to use h2c_error() to report such errors.
+ * case, nor will it send one if settings were not sent (e.g. still waiting for
+ * a preface) so that it is safe to use h2c_error() to report such errors.
  */
 static int h2c_send_goaway_error(struct h2c *h2c, struct h2s *h2s)
 {
@@ -1889,7 +1900,7 @@ static int h2c_send_goaway_error(struct h2c *h2c, struct h2s *h2s)
 
 	TRACE_ENTER(H2_EV_TX_FRAME|H2_EV_TX_GOAWAY, h2c->conn);
 
-	if (h2c->flags & H2_CF_GOAWAY_FAILED) {
+	if ((h2c->flags & H2_CF_GOAWAY_FAILED) || h2c->st0 < H2_CS_SETTINGS1) {
 		ret = 1; // claim that it worked
 		goto out;
 	}
@@ -2162,8 +2173,8 @@ static int h2_send_empty_data_es(struct h2s *h2s)
 	return ret;
 }
 
-/* wake a specific stream and assign its conn_stream some CS_FL_* flags among
- * CS_FL_ERR_PENDING and CS_FL_ERROR if needed. The stream's state
+/* wake a specific stream and assign its conn_stream some CS_EP_* flags among
+ * CS_EP_ERR_PENDING and CS_EP_ERROR if needed. The stream's state
  * is automatically updated accordingly. If the stream is orphaned, it is
  * destroyed.
  */
@@ -2189,9 +2200,9 @@ static void h2s_wake_one_stream(struct h2s *h2s)
 
 	if ((h2s->h2c->st0 >= H2_CS_ERROR || h2s->h2c->conn->flags & CO_FL_ERROR) ||
 	    (h2s->h2c->last_sid > 0 && (!h2s->id || h2s->id > h2s->h2c->last_sid))) {
-		h2s->cs->flags |= CS_FL_ERR_PENDING;
-		if (h2s->cs->flags & CS_FL_EOS)
-			h2s->cs->flags |= CS_FL_ERROR;
+		h2s->endp->flags |= CS_EP_ERR_PENDING;
+		if (h2s->endp->flags & CS_EP_EOS)
+			h2s->endp->flags |= CS_EP_ERROR;
 
 		if (h2s->st < H2_SS_ERROR)
 			h2s->st = H2_SS_ERROR;
@@ -2954,7 +2965,7 @@ static struct h2s *h2c_bck_handle_headers(struct h2c *h2c, struct h2s *h2s)
 	if (h2c->dff & H2_F_HEADERS_END_STREAM)
 		h2s->flags |= H2_SF_ES_RCVD;
 
-	if (h2s->cs && h2s->cs->flags & CS_FL_ERROR && h2s->st < H2_SS_ERROR)
+	if (h2s->cs && (h2s->endp->flags & CS_EP_ERROR) && h2s->st < H2_SS_ERROR)
 		h2s->st = H2_SS_ERROR;
 	else if (h2s->flags & H2_SF_ES_RCVD) {
 		if (h2s->st == H2_SS_OPEN)
@@ -3455,10 +3466,10 @@ static void h2_process_demux(struct h2c *h2c)
 		     h2c_read0_pending(h2c) ||
 		     h2s->st == H2_SS_CLOSED ||
 		     (h2s->flags & H2_SF_ES_RCVD) ||
-		     (h2s->cs->flags & (CS_FL_ERROR|CS_FL_ERR_PENDING|CS_FL_EOS)))) {
+		     (h2s->endp->flags & (CS_EP_ERROR|CS_EP_ERR_PENDING|CS_EP_EOS)))) {
 			/* we may have to signal the upper layers */
 			TRACE_DEVEL("notifying stream before switching SID", H2_EV_RX_FRAME|H2_EV_STRM_WAKE, h2c->conn, h2s);
-			h2s->cs->flags |= CS_FL_RCV_MORE;
+			h2s->endp->flags |= CS_EP_RCV_MORE;
 			h2s_notify_recv(h2s);
 		}
 		h2s = tmp_h2s;
@@ -3626,10 +3637,10 @@ static void h2_process_demux(struct h2c *h2c)
 	     h2c_read0_pending(h2c) ||
 	     h2s->st == H2_SS_CLOSED ||
 	     (h2s->flags & H2_SF_ES_RCVD) ||
-	     (h2s->cs->flags & (CS_FL_ERROR|CS_FL_ERR_PENDING|CS_FL_EOS)))) {
+	     (h2s->endp->flags & (CS_EP_ERROR|CS_EP_ERR_PENDING|CS_EP_EOS)))) {
 		/* we may have to signal the upper layers */
 		TRACE_DEVEL("notifying stream before switching SID", H2_EV_RX_FRAME|H2_EV_H2S_WAKE, h2c->conn, h2s);
-		h2s->cs->flags |= CS_FL_RCV_MORE;
+		h2s->endp->flags |= CS_EP_RCV_MORE;
 		h2s_notify_recv(h2s);
 	}
 
@@ -4076,7 +4087,7 @@ static int h2_process(struct h2c *h2c)
 
 		while (node) {
 			h2s = container_of(node, struct h2s, by_id);
-			if (h2s->cs && h2s->cs->flags & CS_FL_WAIT_FOR_HS)
+			if (h2s->cs && h2s->endp->flags & CS_EP_WAIT_FOR_HS)
 				h2s_notify_recv(h2s);
 			node = eb32_next(node);
 		}
@@ -4288,7 +4299,7 @@ static int h2_attach(struct connection *conn, struct conn_stream *cs, struct ses
  * beneficial to scan backwards from the end to reduce the likeliness to find
  * orphans.
  */
-static const struct conn_stream *h2_get_first_cs(const struct connection *conn)
+static struct conn_stream *h2_get_first_cs(const struct connection *conn)
 {
 	struct h2c *h2c = conn->ctx;
 	struct h2s *h2s;
@@ -4332,8 +4343,10 @@ static void h2_destroy(void *ctx)
 	struct h2c *h2c = ctx;
 
 	TRACE_ENTER(H2_EV_H2C_END, h2c->conn);
-	if (eb_is_empty(&h2c->streams_by_id) || !h2c->conn || h2c->conn->ctx != h2c)
+	if (eb_is_empty(&h2c->streams_by_id)) {
+		BUG_ON(h2c->conn->ctx != h2c);
 		h2_release(h2c);
+	}
 	TRACE_LEAVE(H2_EV_H2C_END);
 }
 
@@ -4342,13 +4355,12 @@ static void h2_destroy(void *ctx)
  */
 static void h2_detach(struct conn_stream *cs)
 {
-	struct h2s *h2s = cs->ctx;
+	struct h2s *h2s = __cs_mux(cs);
 	struct h2c *h2c;
 	struct session *sess;
 
 	TRACE_ENTER(H2_EV_STRM_END, h2s ? h2s->h2c->conn : NULL, h2s);
 
-	cs->ctx = NULL;
 	if (!h2s) {
 		TRACE_LEAVE(H2_EV_STRM_END);
 		return;
@@ -4494,7 +4506,7 @@ static void h2_do_shutr(struct h2s *h2s)
 	 * normally used to limit abuse. In this case we schedule a goaway to
 	 * close the connection.
 	 */
-	if ((h2s->flags & H2_SF_KILL_CONN) &&
+	if ((h2s->endp->flags & CS_EP_KILL_CONN) &&
 	    !(h2c->flags & (H2_CF_GOAWAY_SENT|H2_CF_GOAWAY_FAILED))) {
 		TRACE_STATE("stream wants to kill the connection", H2_EV_STRM_SHUT, h2c->conn, h2s);
 		h2c_error(h2c, H2_ERR_ENHANCE_YOUR_CALM);
@@ -4572,7 +4584,7 @@ static void h2_do_shutw(struct h2s *h2s)
 		 * normally used to limit abuse. In this case we schedule a goaway to
 		 * close the connection.
 		 */
-		if ((h2s->flags & H2_SF_KILL_CONN) &&
+		if ((h2s->endp->flags & CS_EP_KILL_CONN) &&
 		    !(h2c->flags & (H2_CF_GOAWAY_SENT|H2_CF_GOAWAY_FAILED))) {
 			TRACE_STATE("stream wants to kill the connection", H2_EV_STRM_SHUT, h2c->conn, h2s);
 			h2c_error(h2c, H2_ERR_ENHANCE_YOUR_CALM);
@@ -4660,29 +4672,22 @@ struct task *h2_deferred_shut(struct task *t, void *ctx, unsigned int state)
 }
 
 /* shutr() called by the conn_stream (mux_ops.shutr) */
-static void h2_shutr(struct conn_stream *cs, enum cs_shr_mode mode)
+static void h2_shutr(struct conn_stream *cs, enum co_shr_mode mode)
 {
-	struct h2s *h2s = cs->ctx;
+	struct h2s *h2s = __cs_mux(cs);
 
 	TRACE_ENTER(H2_EV_STRM_SHUT, h2s->h2c->conn, h2s);
-	if (cs->flags & CS_FL_KILL_CONN)
-		h2s->flags |= H2_SF_KILL_CONN;
-
 	if (mode)
 		h2_do_shutr(h2s);
-
 	TRACE_LEAVE(H2_EV_STRM_SHUT, h2s->h2c->conn, h2s);
 }
 
 /* shutw() called by the conn_stream (mux_ops.shutw) */
-static void h2_shutw(struct conn_stream *cs, enum cs_shw_mode mode)
+static void h2_shutw(struct conn_stream *cs, enum co_shw_mode mode)
 {
-	struct h2s *h2s = cs->ctx;
+	struct h2s *h2s = __cs_mux(cs);
 
 	TRACE_ENTER(H2_EV_STRM_SHUT, h2s->h2c->conn, h2s);
-	if (cs->flags & CS_FL_KILL_CONN)
-		h2s->flags |= H2_SF_KILL_CONN;
-
 	h2_do_shutw(h2s);
 	TRACE_LEAVE(H2_EV_STRM_SHUT, h2s->h2c->conn, h2s);
 }
@@ -5003,7 +5008,7 @@ next_frame:
 /* Transfer the payload of a DATA frame to the HTTP/1 side. The HTTP/2 frame
  * parser state is automatically updated. Returns > 0 if it could completely
  * send the current frame, 0 if it couldn't complete, in which case
- * CS_FL_RCV_MORE must be checked to know if some data remain pending (an empty
+ * CS_EP_RCV_MORE must be checked to know if some data remain pending (an empty
  * DATA frame can return 0 as a valid result). Stream errors are reported in
  * h2s->errcode and connection errors in h2c->errcode. The caller must already
  * have checked the frame header and ensured that the frame was complete or the
@@ -5319,7 +5324,7 @@ static size_t h2s_frt_make_resp_headers(struct h2s *h2s, struct htx *htx)
 			break;
 	}
 
-	if (!h2s->cs || h2s->cs->flags & CS_FL_SHW) {
+	if (!h2s->cs || h2s->endp->flags & CS_EP_SHW) {
 		/* Response already closed: add END_STREAM */
 		es_now = 1;
 	}
@@ -5739,7 +5744,7 @@ static size_t h2s_bck_make_req_headers(struct h2s *h2s, struct htx *htx)
 			break;
 	}
 
-	if (!h2s->cs || h2s->cs->flags & CS_FL_SHW) {
+	if (!h2s->cs || h2s->endp->flags & CS_EP_SHW) {
 		/* Request already closed: add END_STREAM */
 		es_now = 1;
 	}
@@ -6354,7 +6359,7 @@ static size_t h2s_make_trailers(struct h2s *h2s, struct htx *htx)
  */
 static int h2_subscribe(struct conn_stream *cs, int event_type, struct wait_event *es)
 {
-	struct h2s *h2s = cs->ctx;
+	struct h2s *h2s = __cs_mux(cs);
 	struct h2c *h2c = h2s->h2c;
 
 	TRACE_ENTER(H2_EV_STRM_SEND|H2_EV_STRM_RECV, h2c->conn, h2s);
@@ -6388,7 +6393,7 @@ static int h2_subscribe(struct conn_stream *cs, int event_type, struct wait_even
  */
 static int h2_unsubscribe(struct conn_stream *cs, int event_type, struct wait_event *es)
 {
-	struct h2s *h2s = cs->ctx;
+	struct h2s *h2s = __cs_mux(cs);
 
 	TRACE_ENTER(H2_EV_STRM_SEND|H2_EV_STRM_RECV, h2s->h2c->conn, h2s);
 
@@ -6428,7 +6433,7 @@ static int h2_unsubscribe(struct conn_stream *cs, int event_type, struct wait_ev
  */
 static size_t h2_rcv_buf(struct conn_stream *cs, struct buffer *buf, size_t count, int flags)
 {
-	struct h2s *h2s = cs->ctx;
+	struct h2s *h2s = __cs_mux(cs);
 	struct h2c *h2c = h2s->h2c;
 	struct htx *h2s_htx = NULL;
 	struct htx *buf_htx = NULL;
@@ -6463,7 +6468,7 @@ static size_t h2_rcv_buf(struct conn_stream *cs, struct buffer *buf, size_t coun
 	if (h2s_htx->flags & HTX_FL_PARSING_ERROR) {
 		buf_htx->flags |= HTX_FL_PARSING_ERROR;
 		if (htx_is_empty(buf_htx))
-			cs->flags |= CS_FL_EOI;
+			cs->endp->flags |= CS_EP_EOI;
 	}
 	else if (htx_is_empty(h2s_htx))
 		buf_htx->flags |= (h2s_htx->flags & HTX_FL_EOM);
@@ -6475,19 +6480,19 @@ static size_t h2_rcv_buf(struct conn_stream *cs, struct buffer *buf, size_t coun
 
   end:
 	if (b_data(&h2s->rxbuf))
-		cs->flags |= (CS_FL_RCV_MORE | CS_FL_WANT_ROOM);
+		cs->endp->flags |= (CS_EP_RCV_MORE | CS_EP_WANT_ROOM);
 	else {
-		cs->flags &= ~(CS_FL_RCV_MORE | CS_FL_WANT_ROOM);
+		cs->endp->flags &= ~(CS_EP_RCV_MORE | CS_EP_WANT_ROOM);
 		if (h2s->flags & H2_SF_ES_RCVD) {
-			cs->flags |= CS_FL_EOI;
+			cs->endp->flags |= CS_EP_EOI;
 			/* Add EOS flag for tunnel */
 			if (h2s->flags & H2_SF_BODY_TUNNEL)
-				cs->flags |= CS_FL_EOS;
+				cs->endp->flags |= CS_EP_EOS;
 		}
 		if (h2c_read0_pending(h2c) || h2s->st == H2_SS_CLOSED)
-			cs->flags |= CS_FL_EOS;
-		if (cs->flags & CS_FL_ERR_PENDING)
-			cs->flags |= CS_FL_ERROR;
+			cs->endp->flags |= CS_EP_EOS;
+		if (cs->endp->flags & CS_EP_ERR_PENDING)
+			cs->endp->flags |= CS_EP_ERROR;
 		if (b_size(&h2s->rxbuf)) {
 			b_free(&h2s->rxbuf);
 			offer_buffers(NULL, 1);
@@ -6511,7 +6516,7 @@ static size_t h2_rcv_buf(struct conn_stream *cs, struct buffer *buf, size_t coun
  */
 static size_t h2_snd_buf(struct conn_stream *cs, struct buffer *buf, size_t count, int flags)
 {
-	struct h2s *h2s = cs->ctx;
+	struct h2s *h2s = __cs_mux(cs);
 	size_t total = 0;
 	size_t ret;
 	struct htx *htx;
@@ -6539,7 +6544,7 @@ static size_t h2_snd_buf(struct conn_stream *cs, struct buffer *buf, size_t coun
 	}
 
 	if (h2s->h2c->st0 >= H2_CS_ERROR) {
-		cs->flags |= CS_FL_ERROR;
+		cs->endp->flags |= CS_EP_ERROR;
 		TRACE_DEVEL("connection is in error, leaving in error", H2_EV_H2S_SEND|H2_EV_H2S_BLK|H2_EV_H2S_ERR|H2_EV_STRM_ERR, h2s->h2c->conn, h2s);
 		return 0;
 	}
@@ -6553,7 +6558,7 @@ static size_t h2_snd_buf(struct conn_stream *cs, struct buffer *buf, size_t coun
 		int32_t id = h2c_get_next_sid(h2s->h2c);
 
 		if (id < 0) {
-			cs->flags |= CS_FL_ERROR;
+			cs->endp->flags |= CS_EP_ERROR;
 			TRACE_DEVEL("couldn't get a stream ID, leaving in error", H2_EV_H2S_SEND|H2_EV_H2S_BLK|H2_EV_H2S_ERR|H2_EV_STRM_ERR, h2s->h2c->conn, h2s);
 			return 0;
 		}
@@ -6665,10 +6670,10 @@ static size_t h2_snd_buf(struct conn_stream *cs, struct buffer *buf, size_t coun
 	    !b_data(&h2s->h2c->dbuf) &&
 	    (h2s->flags & (H2_SF_BLK_SFCTL | H2_SF_BLK_MFCTL))) {
 		TRACE_DEVEL("fctl with shutr, reporting error to app-layer", H2_EV_H2S_SEND|H2_EV_STRM_SEND|H2_EV_STRM_ERR, h2s->h2c->conn, h2s);
-		if (cs->flags & CS_FL_EOS)
-			cs->flags |= CS_FL_ERROR;
+		if (cs->endp->flags & CS_EP_EOS)
+			cs->endp->flags |= CS_EP_ERROR;
 		else
-			cs->flags |= CS_FL_ERR_PENDING;
+			cs->endp->flags |= CS_EP_ERR_PENDING;
 	}
 
 	if (total > 0 && !(h2s->flags & H2_SF_BLK_SFCTL) &&
@@ -6740,6 +6745,11 @@ static int h2_show_fd(struct buffer *msg, struct connection *conn)
 		if (h2s->cs)
 			chunk_appendf(msg, "(.flg=0x%08x .app=%p)",
 				      h2s->cs->flags, h2s->cs->app);
+
+		chunk_appendf(msg, "endp=%p", h2s->endp);
+		if (h2s->endp)
+			chunk_appendf(msg, "(.flg=0x%08x)",
+				      h2s->endp->flags);
 
 		chunk_appendf(&trash, " .subs=%p", h2s->subs);
 		if (h2s->subs) {
@@ -6908,7 +6918,7 @@ static const struct mux_ops h2_ops = {
 	.ctl = h2_ctl,
 	.show_fd = h2_show_fd,
 	.takeover = h2_takeover,
-	.flags = MX_FL_CLEAN_ABRT|MX_FL_HTX|MX_FL_HOL_RISK|MX_FL_NO_UPG,
+	.flags = MX_FL_HTX|MX_FL_HOL_RISK|MX_FL_NO_UPG,
 	.name = "H2",
 };
 

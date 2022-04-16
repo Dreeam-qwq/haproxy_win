@@ -28,11 +28,11 @@
 #include <haproxy/global.h>
 #include <haproxy/htx.h>
 #include <haproxy/stream.h>
-#include <haproxy/stream_interface-t.h>
 #include <haproxy/task.h>
 #include <haproxy/ticks.h>
 #include <haproxy/tools-t.h>
 
+struct conn_stream;
 
 /* perform minimal intializations, report 0 in case of error, 1 if OK. */
 int init_channel();
@@ -64,22 +64,22 @@ static inline struct stream *chn_strm(const struct channel *chn)
 		return LIST_ELEM(chn, struct stream *, req);
 }
 
-/* returns a pointer to the stream interface feeding the channel (producer) */
-static inline struct stream_interface *chn_prod(const struct channel *chn)
+/* returns a pointer to the conn-stream feeding the channel (producer) */
+static inline struct conn_stream *chn_prod(const struct channel *chn)
 {
 	if (chn->flags & CF_ISRESP)
-		return LIST_ELEM(chn, struct stream *, res)->csb->si;
+		return LIST_ELEM(chn, struct stream *, res)->csb;
 	else
-		return LIST_ELEM(chn, struct stream *, req)->csf->si;
+		return LIST_ELEM(chn, struct stream *, req)->csf;
 }
 
-/* returns a pointer to the stream interface consuming the channel (producer) */
-static inline struct stream_interface *chn_cons(const struct channel *chn)
+/* returns a pointer to the conn-stream consuming the channel (producer) */
+static inline struct conn_stream *chn_cons(const struct channel *chn)
 {
 	if (chn->flags & CF_ISRESP)
-		return LIST_ELEM(chn, struct stream *, res)->csf->si;
+		return LIST_ELEM(chn, struct stream *, res)->csf;
 	else
-		return LIST_ELEM(chn, struct stream *, req)->csb->si;
+		return LIST_ELEM(chn, struct stream *, req)->csb;
 }
 
 /* c_orig() : returns the pointer to the channel buffer's origin */
@@ -433,7 +433,7 @@ static inline int channel_is_rewritable(const struct channel *chn)
  */
 static inline int channel_may_send(const struct channel *chn)
 {
-	return chn_cons(chn)->state == SI_ST_EST;
+	return chn_cons(chn)->state == CS_ST_EST;
 }
 
 /* HTX version of channel_may_recv(). Returns non-zero if the channel can still
@@ -477,7 +477,7 @@ static inline int channel_htx_may_recv(const struct channel *chn, const struct h
  * are considered as available since they're supposed to leave the buffer. The
  * test is optimized to avoid as many operations as possible for the fast case
  * and to be used as an "if" condition. Just like channel_recv_limit(), we
- * never allow to overwrite the reserve until the output stream interface is
+ * never allow to overwrite the reserve until the output conn-stream is
  * connected, otherwise we could spin on a POST with http-send-name-header.
  */
 static inline int channel_may_recv(const struct channel *chn)

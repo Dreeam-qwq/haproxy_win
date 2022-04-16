@@ -107,15 +107,12 @@ static inline struct qc_stream_desc *qcc_get_stream(struct qcc *qcc, uint64_t id
 
 static inline struct conn_stream *qc_attach_cs(struct qcs *qcs, struct buffer *buf)
 {
-	struct conn_stream *cs = cs_new();
+	struct conn_stream *cs;
+
+	cs = cs_new_from_mux(qcs->endp, qcs->qcc->conn->owner, buf);
 	if (!cs)
 		return NULL;
-	cs_attach_endp(cs, &qcs->qcc->conn->obj_type, qcs);
-
 	qcs->cs = cs;
-	cs->ctx = qcs;
-	stream_new(qcs->qcc->conn->owner, cs, buf);
-
 	++qcs->qcc->nb_cs;
 
 	return cs;

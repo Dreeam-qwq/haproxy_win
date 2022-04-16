@@ -78,7 +78,6 @@ s *     queue's lock.
 #include <haproxy/sample.h>
 #include <haproxy/server-t.h>
 #include <haproxy/stream.h>
-#include <haproxy/stream_interface.h>
 #include <haproxy/task.h>
 #include <haproxy/tcp_rules.h>
 #include <haproxy/thread.h>
@@ -601,7 +600,7 @@ int pendconn_dequeue(struct stream *strm)
 
 	/* the entry might have been redistributed to another server */
 	if (!(strm->flags & SF_ADDR_SET))
-		sockaddr_free(&cs_si(strm->csb)->dst);
+		sockaddr_free(&strm->csb->dst);
 
 	if (p->target) {
 		/* a server picked this pendconn, it must skip LB */

@@ -50,6 +50,7 @@ extern struct mux_stopping_data mux_stopping_data[MAX_THREADS];
 
 /* receive a PROXY protocol header over a connection */
 int conn_recv_proxy(struct connection *conn, int flag);
+int conn_send_proxy(struct connection *conn, unsigned int flag);
 int make_proxy_line(char *buf, int buf_len, struct server *srv, struct connection *remote, struct stream *strm);
 
 int conn_append_debug_info(struct buffer *buf, const struct connection *conn, const char *pfx);
@@ -200,6 +201,16 @@ static inline void conn_stop_tracking(struct connection *conn)
 	conn->flags &= ~CO_FL_XPRT_TRACKED;
 }
 
+/* returns the connection's FD if the connection exists, its control is ready,
+ * and the connection has an FD, otherwise -1.
+ */
+static inline int conn_fd(const struct connection *conn)
+{
+	if (!conn || !conn_ctrl_ready(conn) || (conn->flags & CO_FL_FDLESS))
+		return -1;
+	return conn->handle.fd;
+}
+
 /* read shutdown, called from the rcv_buf/rcv_pipe handlers when
  * detecting an end of connection.
  */
@@ -210,6 +221,7 @@ static inline void conn_sock_read0(struct connection *c)
 		/* we don't risk keeping ports unusable if we found the
 		 * zero from the other side.
 		 */
+		BUG_ON(c->flags & CO_FL_FDLESS);
 		HA_ATOMIC_AND(&fdtab[c->handle.fd].state, ~FD_LINGER_RISK);
 	}
 }
@@ -226,6 +238,7 @@ static inline void conn_sock_shutw(struct connection *c, int clean)
 		/* don't perform a clean shutdown if we're going to reset or
 		 * if the shutr was already received.
 		 */
+		BUG_ON(c->flags & CO_FL_FDLESS);
 		if (!(c->flags & CO_FL_SOCK_RD_SH) && clean)
 			shutdown(c->handle.fd, SHUT_WR);
 	}
@@ -336,16 +349,32 @@ static inline int conn_get_src(struct connection *conn)
 	if (conn->flags & CO_FL_ADDR_FROM_SET)
 		return 1;
 
-	if (!conn_ctrl_ready(conn) || !conn->ctrl->fam->get_src)
-		return 0;
+	if (!conn_ctrl_ready(conn))
+		goto fail;
 
 	if (!sockaddr_alloc(&conn->src, NULL, 0))
-		return 0;
+		goto fail;
 
-	if (conn->ctrl->fam->get_src(conn->handle.fd, (struct sockaddr *)conn->src,
+	/* some stream protocols may provide their own get_src/dst functions */
+	if (conn->ctrl->get_src &&
+	    conn->ctrl->get_src(conn, (struct sockaddr *)conn->src, sizeof(*conn->src)) != -1)
+		goto done;
+
+	if (conn->ctrl->proto_type != PROTO_TYPE_STREAM)
+		goto fail;
+
+	/* most other socket-based stream protocols will use their socket family's functions */
+	if (conn->ctrl->fam->get_src && !(conn->flags & CO_FL_FDLESS) &&
+	    conn->ctrl->fam->get_src(conn->handle.fd, (struct sockaddr *)conn->src,
 	                        sizeof(*conn->src),
-	                        obj_type(conn->target) != OBJ_TYPE_LISTENER) == -1)
-		return 0;
+	                        obj_type(conn->target) != OBJ_TYPE_LISTENER) != -1)
+		goto done;
+
+	/* no other means */
+ fail:
+	sockaddr_free(&conn->src);
+	return 0;
+ done:
 	conn->flags |= CO_FL_ADDR_FROM_SET;
 	return 1;
 }
@@ -359,16 +388,32 @@ static inline int conn_get_dst(struct connection *conn)
 	if (conn->flags & CO_FL_ADDR_TO_SET)
 		return 1;
 
-	if (!conn_ctrl_ready(conn) || !conn->ctrl->fam->get_dst)
-		return 0;
+	if (!conn_ctrl_ready(conn))
+		goto fail;
 
 	if (!sockaddr_alloc(&conn->dst, NULL, 0))
-		return 0;
+		goto fail;
 
-	if (conn->ctrl->fam->get_dst(conn->handle.fd, (struct sockaddr *)conn->dst,
+	/* some stream protocols may provide their own get_src/dst functions */
+	if (conn->ctrl->get_dst &&
+	    conn->ctrl->get_dst(conn, (struct sockaddr *)conn->dst, sizeof(*conn->dst)) != -1)
+		goto done;
+
+	if (conn->ctrl->proto_type != PROTO_TYPE_STREAM)
+		goto fail;
+
+	/* most other socket-based stream protocols will use their socket family's functions */
+	if (conn->ctrl->fam->get_dst && !(conn->flags & CO_FL_FDLESS) &&
+	    conn->ctrl->fam->get_dst(conn->handle.fd, (struct sockaddr *)conn->dst,
 	                        sizeof(*conn->dst),
-	                        obj_type(conn->target) != OBJ_TYPE_LISTENER) == -1)
-		return 0;
+	                        obj_type(conn->target) != OBJ_TYPE_LISTENER) != -1)
+		goto done;
+
+	/* no other means */
+ fail:
+	sockaddr_free(&conn->dst);
+	return 0;
+ done:
 	conn->flags |= CO_FL_ADDR_TO_SET;
 	return 1;
 }
@@ -379,7 +424,7 @@ static inline int conn_get_dst(struct connection *conn)
  */
 static inline void conn_set_tos(const struct connection *conn, int tos)
 {
-	if (!conn || !conn_ctrl_ready(conn))
+	if (!conn || !conn_ctrl_ready(conn) || (conn->flags & CO_FL_FDLESS))
 		return;
 
 #ifdef IP_TOS
@@ -402,7 +447,7 @@ static inline void conn_set_tos(const struct connection *conn, int tos)
  */
 static inline void conn_set_mark(const struct connection *conn, int mark)
 {
-	if (!conn || !conn_ctrl_ready(conn))
+	if (!conn || !conn_ctrl_ready(conn) || (conn->flags & CO_FL_FDLESS))
 		return;
 
 #if defined(SO_MARK)
@@ -419,7 +464,7 @@ static inline void conn_set_mark(const struct connection *conn, int mark)
  */
 static inline void conn_set_quickack(const struct connection *conn, int value)
 {
-	if (!conn || !conn_ctrl_ready(conn))
+	if (!conn || !conn_ctrl_ready(conn) || (conn->flags & CO_FL_FDLESS))
 		return;
 
 #ifdef TCP_QUICKACK
@@ -604,15 +649,27 @@ static inline struct proxy *conn_get_proxy(const struct connection *conn)
 	return objt_proxy(conn->target);
 }
 
+/* unconditionally retrieves the ssl_sock_ctx for this connection. Prefer using
+ * the standard form conn_get_ssl_sock_ctx() which checks the transport layer
+ * and the availability of the method.
+ */
+static inline struct ssl_sock_ctx *__conn_get_ssl_sock_ctx(struct connection *conn)
+{
+	return conn->xprt->get_ssl_sock_ctx(conn);
+}
+
+/* retrieves the ssl_sock_ctx for this connection otherwise NULL */
+static inline struct ssl_sock_ctx *conn_get_ssl_sock_ctx(struct connection *conn)
+{
+	if (!conn || !conn->xprt || !conn->xprt->get_ssl_sock_ctx)
+		return NULL;
+	return conn->xprt->get_ssl_sock_ctx(conn);
+}
 
 /* boolean, returns true if connection is over SSL */
-static inline
-int conn_is_ssl(struct connection *conn)
+static inline int conn_is_ssl(struct connection *conn)
 {
-	if (!conn || conn->xprt != xprt_get(XPRT_SSL) || !conn->xprt_ctx)
-		return 0;
-	else
-		return 1;
+	return !!conn_get_ssl_sock_ctx(conn);
 }
 
 #endif /* _HAPROXY_CONNECTION_H */

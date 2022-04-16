@@ -27,8 +27,11 @@
 #endif
 
 #include <haproxy/api.h>
+#include <haproxy/applet.h>
 #include <haproxy/buf.h>
 #include <haproxy/cli.h>
+#include <haproxy/conn_stream.h>
+#include <haproxy/cs_utils.h>
 #include <haproxy/clock.h>
 #include <haproxy/debug.h>
 #include <haproxy/fd.h>
@@ -37,7 +40,6 @@
 #include <haproxy/http_ana.h>
 #include <haproxy/log.h>
 #include <haproxy/net_helper.h>
-#include <haproxy/stream_interface.h>
 #include <haproxy/task.h>
 #include <haproxy/thread.h>
 #include <haproxy/time.h>
@@ -249,9 +251,9 @@ void ha_task_dump(struct buffer *buf, const struct task *task, const char *pfx)
 	if (task->process == process_stream && task->context)
 		s = (struct stream *)task->context;
 	else if (task->process == task_run_applet && task->context)
-		s = si_strm(cs_si(((struct appctx *)task->context)->owner));
-	else if (task->process == si_cs_io_cb && task->context)
-		s = si_strm((struct stream_interface *)task->context);
+		s = cs_strm(((struct appctx *)task->context)->owner);
+	else if (task->process == cs_conn_io_cb && task->context)
+		s = cs_strm(((struct conn_stream *)task->context));
 
 	if (s)
 		stream_dump(buf, s, pfx, '\n');
@@ -288,10 +290,10 @@ void ha_task_dump(struct buffer *buf, const struct task *task, const char *pfx)
  */
 static int cli_io_handler_show_threads(struct appctx *appctx)
 {
-	struct stream_interface *si = cs_si(appctx->owner);
+	struct conn_stream *cs = appctx->owner;
 	int thr;
 
-	if (unlikely(si_ic(si)->flags & (CF_WRITE_ERROR|CF_SHUTW)))
+	if (unlikely(cs_ic(cs)->flags & (CF_WRITE_ERROR|CF_SHUTW)))
 		return 1;
 
 	if (appctx->st0)
@@ -302,9 +304,9 @@ static int cli_io_handler_show_threads(struct appctx *appctx)
 	chunk_reset(&trash);
 	ha_thread_dump_all_to_trash();
 
-	if (ci_putchk(si_ic(si), &trash) == -1) {
+	if (ci_putchk(cs_ic(cs), &trash) == -1) {
 		/* failed, try again */
-		si_rx_room_blk(si);
+		cs_rx_room_blk(cs);
 		appctx->st1 = thr;
 		return 0;
 	}
@@ -674,7 +676,7 @@ static int debug_parse_cli_write(char **args, char *payload, struct appctx *appc
  */
 static int debug_parse_cli_stream(char **args, char *payload, struct appctx *appctx, void *private)
 {
-	struct stream *s = si_strm(cs_si(appctx->owner));
+	struct stream *s = __cs_strm(appctx->owner);
 	int arg;
 	void *ptr;
 	int size;
@@ -692,7 +694,7 @@ static int debug_parse_cli_stream(char **args, char *payload, struct appctx *app
 	if (!*args[3]) {
 		return cli_err(appctx,
 			       "Usage: debug dev stream { <obj> <op> <value> | wake }*\n"
-			       "     <obj>   = {strm | strm.f | sif.f | sif.s | sif.x | sib.f | sib.s | sib.x |\n"
+			       "     <obj>   = {strm | strm.f | strm.x | csf.s | csb.s |\n"
 			       "                txn.f | req.f | req.r | req.w | res.f | res.r | res.w}\n"
 			       "     <op>    = {'' (show) | '=' (assign) | '^' (xor) | '+' (or) | '-' (andnot)}\n"
 			       "     <value> = 'now' | 64-bit dec/hex integer (0x prefix supported)\n"
@@ -711,6 +713,8 @@ static int debug_parse_cli_stream(char **args, char *payload, struct appctx *app
 			ptr = (!s || !may_access(s)) ? NULL : &s; size = sizeof(s);
 		} else if (isteq(name, ist("strm.f"))) {
 			ptr = (!s || !may_access(s)) ? NULL : &s->flags; size = sizeof(s->flags);
+		} else if (isteq(name, ist("strm.x"))) {
+			ptr = (!s || !may_access(s)) ? NULL : &s->conn_exp; size = sizeof(s->conn_exp);
 		} else if (isteq(name, ist("txn.f"))) {
 			ptr = (!s || !may_access(s)) ? NULL : &s->txn->flags; size = sizeof(s->txn->flags);
 		} else if (isteq(name, ist("req.f"))) {
@@ -725,18 +729,10 @@ static int debug_parse_cli_stream(char **args, char *payload, struct appctx *app
 			ptr = (!s || !may_access(s)) ? NULL : &s->req.wex; size = sizeof(s->req.wex);
 		} else if (isteq(name, ist("res.w"))) {
 			ptr = (!s || !may_access(s)) ? NULL : &s->res.wex; size = sizeof(s->res.wex);
-		} else if (isteq(name, ist("sif.f"))) {
-			ptr = (!s || !may_access(s)) ? NULL : &cs_si(s->csf)->flags; size = sizeof(cs_si(s->csf)->flags);
-		} else if (isteq(name, ist("sib.f"))) {
-			ptr = (!s || !may_access(s)) ? NULL : &cs_si(s->csb)->flags; size = sizeof(cs_si(s->csb)->flags);
-		} else if (isteq(name, ist("sif.x"))) {
-			ptr = (!s || !may_access(s)) ? NULL : &cs_si(s->csf)->exp; size = sizeof(cs_si(s->csf)->exp);
-		} else if (isteq(name, ist("sib.x"))) {
-			ptr = (!s || !may_access(s)) ? NULL : &cs_si(s->csb)->exp; size = sizeof(cs_si(s->csb)->exp);
-		} else if (isteq(name, ist("sif.s"))) {
-			ptr = (!s || !may_access(s)) ? NULL : &cs_si(s->csf)->state; size = sizeof(cs_si(s->csf)->state);
-		} else if (isteq(name, ist("sib.s"))) {
-			ptr = (!s || !may_access(s)) ? NULL : &cs_si(s->csf)->state; size = sizeof(cs_si(s->csb)->state);
+		} else if (isteq(name, ist("csf.s"))) {
+			ptr = (!s || !may_access(s)) ? NULL : &s->csf->state; size = sizeof(s->csf->state);
+		} else if (isteq(name, ist("csb.s"))) {
+			ptr = (!s || !may_access(s)) ? NULL : &s->csf->state; size = sizeof(s->csb->state);
 		} else if (isteq(name, ist("wake"))) {
 			if (s && may_access(s) && may_access((void *)s + sizeof(*s) - 1))
 				task_wakeup(s->task, TASK_WOKEN_TIMER|TASK_WOKEN_IO|TASK_WOKEN_MSG);
@@ -1040,7 +1036,7 @@ static int debug_parse_cli_fd(char **args, char *payload, struct appctx *appctx,
  */
 static int debug_iohandler_fd(struct appctx *appctx)
 {
-	struct stream_interface *si = cs_si(appctx->owner);
+	struct conn_stream *cs = appctx->owner;
 	struct sockaddr_storage sa;
 	struct stat statbuf;
 	socklen_t salen, vlen;
@@ -1049,7 +1045,7 @@ static int debug_iohandler_fd(struct appctx *appctx)
 	int ret = 1;
 	int i, fd;
 
-	if (unlikely(si_ic(si)->flags & (CF_WRITE_ERROR|CF_SHUTW)))
+	if (unlikely(cs_ic(cs)->flags & (CF_WRITE_ERROR|CF_SHUTW)))
 		goto end;
 
 	chunk_reset(&trash);
@@ -1173,8 +1169,8 @@ static int debug_iohandler_fd(struct appctx *appctx)
 
 		chunk_appendf(&trash, "\n");
 
-		if (ci_putchk(si_ic(si), &trash) == -1) {
-			si_rx_room_blk(si);
+		if (ci_putchk(cs_ic(cs), &trash) == -1) {
+			cs_rx_room_blk(cs);
 			appctx->ctx.cli.i0 = fd;
 			ret = 0;
 			break;
@@ -1224,11 +1220,11 @@ static int debug_parse_cli_memstats(char **args, char *payload, struct appctx *a
  */
 static int debug_iohandler_memstats(struct appctx *appctx)
 {
-	struct stream_interface *si = cs_si(appctx->owner);
+	struct conn_stream *cs = appctx->owner;
 	struct mem_stats *ptr = appctx->ctx.cli.p0;
 	int ret = 1;
 
-	if (unlikely(si_ic(si)->flags & (CF_WRITE_ERROR|CF_SHUTW)))
+	if (unlikely(cs_ic(cs)->flags & (CF_WRITE_ERROR|CF_SHUTW)))
 		goto end;
 
 	chunk_reset(&trash);
@@ -1273,8 +1269,8 @@ static int debug_iohandler_memstats(struct appctx *appctx)
 			     (unsigned long)ptr->size, (unsigned long)ptr->calls,
 			     (unsigned long)(ptr->calls ? (ptr->size / ptr->calls) : 0));
 
-		if (ci_putchk(si_ic(si), &trash) == -1) {
-			si_rx_room_blk(si);
+		if (ci_putchk(cs_ic(cs), &trash) == -1) {
+			cs_rx_room_blk(cs);
 			appctx->ctx.cli.p0 = ptr;
 			ret = 0;
 			break;

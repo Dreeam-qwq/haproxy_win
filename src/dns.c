@@ -21,10 +21,13 @@
 
 #include <haproxy/action.h>
 #include <haproxy/api.h>
+#include <haproxy/applet.h>
 #include <haproxy/cfgparse.h>
 #include <haproxy/channel.h>
 #include <haproxy/check.h>
 #include <haproxy/cli.h>
+#include <haproxy/conn_stream.h>
+#include <haproxy/cs_utils.h>
 #include <haproxy/dgram.h>
 #include <haproxy/dns.h>
 #include <haproxy/errors.h>
@@ -32,7 +35,6 @@
 #include <haproxy/log.h>
 #include <haproxy/ring.h>
 #include <haproxy/stream.h>
-#include <haproxy/stream_interface.h>
 #include <haproxy/tools.h>
 
 static THREAD_LOCAL char *dns_msg_trash;
@@ -407,7 +409,7 @@ out:
  */
 static void dns_session_io_handler(struct appctx *appctx)
 {
-	struct stream_interface *si = cs_si(appctx->owner);
+	struct conn_stream *cs = appctx->owner;
 	struct dns_session *ds = appctx->ctx.sft.ptr;
 	struct ring *ring = &ds->ring;
 	struct buffer *buf = &ring->buf;
@@ -429,21 +431,21 @@ static void dns_session_io_handler(struct appctx *appctx)
 		goto close;
 
 	/* an error was detected */
-	if (unlikely(si_ic(si)->flags & (CF_WRITE_ERROR|CF_SHUTW)))
+	if (unlikely(cs_ic(cs)->flags & (CF_WRITE_ERROR|CF_SHUTW)))
 		goto close;
 
 	/* con closed by server side, we will skip data write and drain data from channel */
-	if ((si_oc(si)->flags & CF_SHUTW)) {
+	if ((cs_oc(cs)->flags & CF_SHUTW)) {
 		goto read;
 	}
 
 	/* if the connection is not established, inform the stream that we want
 	 * to be notified whenever the connection completes.
 	 */
-	if (si_opposite(si)->state < SI_ST_EST) {
-		si_cant_get(si);
-		si_rx_conn_blk(si);
-		si_rx_endp_more(si);
+	if (cs_opposite(cs)->state < CS_ST_EST) {
+		cs_cant_get(cs);
+		cs_rx_conn_blk(cs);
+		cs_rx_endp_more(cs);
 		return;
 	}
 
@@ -475,7 +477,7 @@ static void dns_session_io_handler(struct appctx *appctx)
 	 * the message so that we can take our reference there if we have to
 	 * stop before the end (ret=0).
 	 */
-	if (si_opposite(si)->state == SI_ST_EST) {
+	if (cs_opposite(cs)->state == CS_ST_EST) {
 		/* we were already there, adjust the offset to be relative to
 		 * the buffer's head and remove us from the counter.
 		 */
@@ -497,7 +499,7 @@ static void dns_session_io_handler(struct appctx *appctx)
 			BUG_ON(msg_len + ofs + cnt + 1 > b_data(buf));
 
 			/* retrieve available room on output channel */
-			available_room = channel_recv_max(si_ic(si));
+			available_room = channel_recv_max(cs_ic(cs));
 
 			/* tx_msg_offset null means we are at the start of a new message */
 			if (!ds->tx_msg_offset) {
@@ -505,7 +507,7 @@ static void dns_session_io_handler(struct appctx *appctx)
 
 				/* check if there is enough room to put message len and query id */
 				if (available_room < sizeof(slen) + sizeof(new_qid)) {
-					si_rx_room_blk(si);
+					cs_rx_room_blk(cs);
 					ret = 0;
 					break;
 				}
@@ -513,7 +515,7 @@ static void dns_session_io_handler(struct appctx *appctx)
 				/* put msg len into then channel */
 				slen = (uint16_t)msg_len;
 				slen = htons(slen);
-				ci_putblk(si_ic(si), (char *)&slen, sizeof(slen));
+				ci_putblk(cs_ic(cs), (char *)&slen, sizeof(slen));
 				available_room -= sizeof(slen);
 
 				/* backup original query id */
@@ -531,7 +533,7 @@ static void dns_session_io_handler(struct appctx *appctx)
 				new_qid = htons(new_qid);
 
 				/* put new query id into the channel */
-				ci_putblk(si_ic(si), (char *)&new_qid, sizeof(new_qid));
+				ci_putblk(cs_ic(cs), (char *)&new_qid, sizeof(new_qid));
 				available_room -= sizeof(new_qid);
 
 				/* keep query id mapping */
@@ -563,7 +565,7 @@ static void dns_session_io_handler(struct appctx *appctx)
 
 			/* check if it remains available room on output chan */
 			if (unlikely(!available_room)) {
-				si_rx_room_blk(si);
+				cs_rx_room_blk(cs);
 				ret = 0;
 				break;
 			}
@@ -586,12 +588,12 @@ static void dns_session_io_handler(struct appctx *appctx)
 			}
 			trash.data += len;
 
-			if (ci_putchk(si_ic(si), &trash) == -1) {
+			if (ci_putchk(cs_ic(cs), &trash) == -1) {
 				/* should never happen since we
 				 * check available_room is large
 				 * enough here.
 				 */
-				si_rx_room_blk(si);
+				cs_rx_room_blk(cs);
 				ret = 0;
 				break;
 			}
@@ -599,7 +601,7 @@ static void dns_session_io_handler(struct appctx *appctx)
 			if (ds->tx_msg_offset) {
 				/* msg was not fully processed, we must  be awake to drain pending data */
 
-				si_rx_room_blk(si);
+				cs_rx_room_blk(cs);
 				ret = 0;
 				break;
 			}
@@ -619,7 +621,7 @@ static void dns_session_io_handler(struct appctx *appctx)
 		BUG_ON(LIST_INLIST(&appctx->wait_entry));
 		LIST_APPEND(&ring->waiters, &appctx->wait_entry);
 		HA_RWLOCK_WRUNLOCK(DNS_LOCK, &ring->lock);
-		si_rx_endp_done(si);
+		cs_rx_endp_done(cs);
 	}
 
 read:
@@ -639,35 +641,35 @@ read:
 
 			if (!ds->rx_msg.len) {
 				/* next message len is not fully available into the channel */
-				if (co_data(si_oc(si)) < 2)
+				if (co_data(cs_oc(cs)) < 2)
 					break;
 
 				/* retrieve message len */
-				co_getblk(si_oc(si), (char *)&msg_len, 2, 0);
+				co_getblk(cs_oc(cs), (char *)&msg_len, 2, 0);
 
 				/* mark as consumed */
-				co_skip(si_oc(si), 2);
+				co_skip(cs_oc(cs), 2);
 
 				/* store message len */
 				ds->rx_msg.len = ntohs(msg_len);
 			}
 
-			if (!co_data(si_oc(si))) {
+			if (!co_data(cs_oc(cs))) {
 				/* we need more data but nothing is available */
 				break;
 			}
 
-			if (co_data(si_oc(si)) + ds->rx_msg.offset < ds->rx_msg.len) {
+			if (co_data(cs_oc(cs)) + ds->rx_msg.offset < ds->rx_msg.len) {
 				/* message only partially available */
 
 				/* read available data */
-				co_getblk(si_oc(si), ds->rx_msg.area + ds->rx_msg.offset, co_data(si_oc(si)), 0);
+				co_getblk(cs_oc(cs), ds->rx_msg.area + ds->rx_msg.offset, co_data(cs_oc(cs)), 0);
 
 				/* update message offset */
-				ds->rx_msg.offset += co_data(si_oc(si));
+				ds->rx_msg.offset += co_data(cs_oc(cs));
 
 				/* consume all pending data from the channel */
-				co_skip(si_oc(si), co_data(si_oc(si)));
+				co_skip(cs_oc(cs), co_data(cs_oc(cs)));
 
 				/* we need to wait for more data */
 				break;
@@ -676,10 +678,10 @@ read:
 			/* enough data is available into the channel to read the message until the end */
 
 			/* read from the channel until the end of the message */
-			co_getblk(si_oc(si), ds->rx_msg.area + ds->rx_msg.offset, ds->rx_msg.len - ds->rx_msg.offset, 0);
+			co_getblk(cs_oc(cs), ds->rx_msg.area + ds->rx_msg.offset, ds->rx_msg.len - ds->rx_msg.offset, 0);
 
 			/* consume all data until the end of the message from the channel */
-			co_skip(si_oc(si), ds->rx_msg.len - ds->rx_msg.offset);
+			co_skip(cs_oc(cs), ds->rx_msg.len - ds->rx_msg.offset);
 
 			/* reset reader offset to 0 for next message reand */
 			ds->rx_msg.offset = 0;
@@ -725,7 +727,7 @@ read:
 
 		if (!LIST_INLIST(&ds->waiter)) {
 			/* there is no more pending data to read and the con was closed by the server side */
-			if (!co_data(si_oc(si)) && (si_oc(si)->flags & CF_SHUTW)) {
+			if (!co_data(cs_oc(cs)) && (cs_oc(cs)->flags & CF_SHUTW)) {
 				goto close;
 			}
 		}
@@ -734,9 +736,9 @@ read:
 
 	return;
 close:
-	si_shutw(si);
-	si_shutr(si);
-	si_ic(si)->flags |= CF_READ_NULL;
+	cs_shutw(cs);
+	cs_shutr(cs);
+	cs_ic(cs)->flags |= CF_READ_NULL;
 }
 
 void dns_queries_flush(struct dns_session *ds)
@@ -890,11 +892,11 @@ static struct appctx *dns_session_create(struct dns_session *ds)
 	struct conn_stream *cs;
 	struct stream *s;
 	struct applet *applet = &dns_session_applet;
+	struct sockaddr_storage *addr = NULL;
 
-	appctx = appctx_new(applet);
+	appctx = appctx_new(applet, NULL);
 	if (!appctx)
 		goto out_close;
-
 	appctx->ctx.sft.ptr = (void *)ds;
 
 	sess = session_new(ds->dss->srv->proxy, NULL, &appctx->obj_type);
@@ -903,24 +905,20 @@ static struct appctx *dns_session_create(struct dns_session *ds)
 		goto out_free_appctx;
 	}
 
-	cs = cs_new();
-	if (!cs) {
-		ha_alert("out of memory in dns_session_create().\n");
+	if (!sockaddr_alloc(&addr, &ds->dss->srv->addr, sizeof(ds->dss->srv->addr)))
 		goto out_free_sess;
-	}
-	cs_attach_endp(cs, &appctx->obj_type, appctx);
 
-	if ((s = stream_new(sess, cs, &BUF_NULL)) == NULL) {
+	cs = cs_new_from_applet(appctx->endp, sess, &BUF_NULL);
+	if (!cs) {
 		ha_alert("Failed to initialize stream in dns_session_create().\n");
-		goto out_free_cs;
+		goto out_free_addr;
 	}
 
-
+	s = DISGUISE(cs_strm(cs));
+	s->csb->dst = addr;
+	s->csb->flags |= CS_FL_NOLINGER;
 	s->target = &ds->dss->srv->obj_type;
-	if (!sockaddr_alloc(&cs_si(s->csb)->dst, &ds->dss->srv->addr, sizeof(ds->dss->srv->addr)))
-		goto out_free_strm;
 	s->flags = SF_ASSIGNED|SF_ADDR_SET;
-	cs_si(s->csb)->flags |= SI_FL_NOLINGER;
 
 	s->do_log = NULL;
 	s->uniq_id = 0;
@@ -935,11 +933,8 @@ static struct appctx *dns_session_create(struct dns_session *ds)
 	return appctx;
 
 	/* Error unrolling */
- out_free_strm:
-	LIST_DELETE(&s->list);
-	pool_free(pool_head_stream, s);
- out_free_cs:
-	cs_free(cs);
+ out_free_addr:
+	sockaddr_free(&addr);
  out_free_sess:
 	session_free(sess);
  out_free_appctx:

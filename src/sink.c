@@ -20,8 +20,11 @@
 
 #include <import/ist.h>
 #include <haproxy/api.h>
+#include <haproxy/applet.h>
 #include <haproxy/cfgparse.h>
 #include <haproxy/cli.h>
+#include <haproxy/conn_stream.h>
+#include <haproxy/cs_utils.h>
 #include <haproxy/errors.h>
 #include <haproxy/list.h>
 #include <haproxy/log.h>
@@ -29,7 +32,6 @@
 #include <haproxy/ring.h>
 #include <haproxy/signal.h>
 #include <haproxy/sink.h>
-#include <haproxy/stream_interface.h>
 #include <haproxy/time.h>
 #include <haproxy/tools.h>
 
@@ -294,8 +296,8 @@ void sink_setup_proxy(struct proxy *px)
  */
 static void sink_forward_io_handler(struct appctx *appctx)
 {
-	struct stream_interface *si = cs_si(appctx->owner);
-	struct stream *s = si_strm(si);
+	struct conn_stream *cs = appctx->owner;
+	struct stream *s = __cs_strm(cs);
 	struct sink *sink = strm_fe(s)->parent;
 	struct sink_forward_target *sft = appctx->ctx.sft.ptr;
 	struct ring *ring = sink->ctx.ring;
@@ -312,25 +314,25 @@ static void sink_forward_io_handler(struct appctx *appctx)
 	 * and we don't want expire on this case
 	 * with a syslog server
 	 */
-	si_oc(si)->rex = TICK_ETERNITY;
+	cs_oc(cs)->rex = TICK_ETERNITY;
 	/* rto should not change but it seems the case */
-	si_oc(si)->rto = TICK_ETERNITY;
+	cs_oc(cs)->rto = TICK_ETERNITY;
 
 	/* an error was detected */
-	if (unlikely(si_ic(si)->flags & (CF_WRITE_ERROR|CF_SHUTW)))
+	if (unlikely(cs_ic(cs)->flags & (CF_WRITE_ERROR|CF_SHUTW)))
 		goto close;
 
 	/* con closed by server side */
-	if ((si_oc(si)->flags & CF_SHUTW))
+	if ((cs_oc(cs)->flags & CF_SHUTW))
 		goto close;
 
 	/* if the connection is not established, inform the stream that we want
 	 * to be notified whenever the connection completes.
 	 */
-	if (si_opposite(si)->state < SI_ST_EST) {
-		si_cant_get(si);
-		si_rx_conn_blk(si);
-		si_rx_endp_more(si);
+	if (cs_opposite(cs)->state < CS_ST_EST) {
+		cs_cant_get(cs);
+		cs_rx_conn_blk(cs);
+		cs_rx_endp_more(cs);
 		return;
 	}
 
@@ -366,7 +368,7 @@ static void sink_forward_io_handler(struct appctx *appctx)
 	 * the message so that we can take our reference there if we have to
 	 * stop before the end (ret=0).
 	 */
-	if (si_opposite(si)->state == SI_ST_EST) {
+	if (cs_opposite(cs)->state == CS_ST_EST) {
 		/* we were already there, adjust the offset to be relative to
 		 * the buffer's head and remove us from the counter.
 		 */
@@ -394,8 +396,8 @@ static void sink_forward_io_handler(struct appctx *appctx)
 			trash.data += len;
 			trash.area[trash.data++] = '\n';
 
-			if (ci_putchk(si_ic(si), &trash) == -1) {
-				si_rx_room_blk(si);
+			if (ci_putchk(cs_ic(cs), &trash) == -1) {
+				cs_rx_room_blk(cs);
 				ret = 0;
 				break;
 			}
@@ -413,18 +415,18 @@ static void sink_forward_io_handler(struct appctx *appctx)
 		HA_RWLOCK_WRLOCK(LOGSRV_LOCK, &ring->lock);
 		LIST_APPEND(&ring->waiters, &appctx->wait_entry);
 		HA_RWLOCK_WRUNLOCK(LOGSRV_LOCK, &ring->lock);
-		si_rx_endp_done(si);
+		cs_rx_endp_done(cs);
 	}
 	HA_SPIN_UNLOCK(SFT_LOCK, &sft->lock);
 
 	/* always drain data from server */
-	co_skip(si_oc(si), si_oc(si)->output);
+	co_skip(cs_oc(cs), cs_oc(cs)->output);
 	return;
 
 close:
-	si_shutw(si);
-	si_shutr(si);
-	si_ic(si)->flags |= CF_READ_NULL;
+	cs_shutw(cs);
+	cs_shutr(cs);
+	cs_ic(cs)->flags |= CF_READ_NULL;
 }
 
 /*
@@ -433,8 +435,8 @@ close:
  */
 static void sink_forward_oc_io_handler(struct appctx *appctx)
 {
-	struct stream_interface *si = cs_si(appctx->owner);
-	struct stream *s = si_strm(si);
+	struct conn_stream *cs = appctx->owner;
+	struct stream *s = __cs_strm(cs);
 	struct sink *sink = strm_fe(s)->parent;
 	struct sink_forward_target *sft = appctx->ctx.sft.ptr;
 	struct ring *ring = sink->ctx.ring;
@@ -452,25 +454,25 @@ static void sink_forward_oc_io_handler(struct appctx *appctx)
 	 * and we don't want expire on this case
 	 * with a syslog server
 	 */
-	si_oc(si)->rex = TICK_ETERNITY;
+	cs_oc(cs)->rex = TICK_ETERNITY;
 	/* rto should not change but it seems the case */
-	si_oc(si)->rto = TICK_ETERNITY;
+	cs_oc(cs)->rto = TICK_ETERNITY;
 
 	/* an error was detected */
-	if (unlikely(si_ic(si)->flags & (CF_WRITE_ERROR|CF_SHUTW)))
+	if (unlikely(cs_ic(cs)->flags & (CF_WRITE_ERROR|CF_SHUTW)))
 		goto close;
 
 	/* con closed by server side */
-	if ((si_oc(si)->flags & CF_SHUTW))
+	if ((cs_oc(cs)->flags & CF_SHUTW))
 		goto close;
 
 	/* if the connection is not established, inform the stream that we want
 	 * to be notified whenever the connection completes.
 	 */
-	if (si_opposite(si)->state < SI_ST_EST) {
-		si_cant_get(si);
-		si_rx_conn_blk(si);
-		si_rx_endp_more(si);
+	if (cs_opposite(cs)->state < CS_ST_EST) {
+		cs_cant_get(cs);
+		cs_rx_conn_blk(cs);
+		cs_rx_endp_more(cs);
 		return;
 	}
 
@@ -506,7 +508,7 @@ static void sink_forward_oc_io_handler(struct appctx *appctx)
 	 * the message so that we can take our reference there if we have to
 	 * stop before the end (ret=0).
 	 */
-	if (si_opposite(si)->state == SI_ST_EST) {
+	if (cs_opposite(cs)->state == CS_ST_EST) {
 		/* we were already there, adjust the offset to be relative to
 		 * the buffer's head and remove us from the counter.
 		 */
@@ -538,8 +540,8 @@ static void sink_forward_oc_io_handler(struct appctx *appctx)
 
 			trash.data += b_getblk(buf, p + 1, msg_len, ofs + cnt);
 
-			if (ci_putchk(si_ic(si), &trash) == -1) {
-				si_rx_room_blk(si);
+			if (ci_putchk(cs_ic(cs), &trash) == -1) {
+				cs_rx_room_blk(cs);
 				ret = 0;
 				break;
 			}
@@ -557,36 +559,24 @@ static void sink_forward_oc_io_handler(struct appctx *appctx)
 		HA_RWLOCK_WRLOCK(LOGSRV_LOCK, &ring->lock);
 		LIST_APPEND(&ring->waiters, &appctx->wait_entry);
 		HA_RWLOCK_WRUNLOCK(LOGSRV_LOCK, &ring->lock);
-		si_rx_endp_done(si);
+		cs_rx_endp_done(cs);
 	}
 	HA_SPIN_UNLOCK(SFT_LOCK, &sft->lock);
 
 	/* always drain data from server */
-	co_skip(si_oc(si), si_oc(si)->output);
+	co_skip(cs_oc(cs), cs_oc(cs)->output);
 	return;
 
 close:
-	si_shutw(si);
-	si_shutr(si);
-	si_ic(si)->flags |= CF_READ_NULL;
+	cs_shutw(cs);
+	cs_shutr(cs);
+	cs_ic(cs)->flags |= CF_READ_NULL;
 }
 
 void __sink_forward_session_deinit(struct sink_forward_target *sft)
 {
-	struct stream_interface *si;
-	struct stream *s;
+	struct stream *s = __cs_strm(sft->appctx->owner);
 	struct sink *sink;
-
-	if (!sft->appctx)
-		return;
-
-	si = cs_si(sft->appctx->owner);
-	if (!si)
-		return;
-
-	s = si_strm(si);
-	if (!s)
-		return;
 
 	sink = strm_fe(s)->parent;
 	if (!sink)
@@ -639,11 +629,12 @@ static struct appctx *sink_forward_session_create(struct sink *sink, struct sink
 	struct conn_stream *cs;
 	struct stream *s;
 	struct applet *applet = &sink_forward_applet;
+	struct sockaddr_storage *addr = NULL;
 
 	if (sft->srv->log_proto == SRV_LOG_PROTO_OCTET_COUNTING)
 		applet = &sink_forward_oc_applet;
 
-	appctx = appctx_new(applet);
+	appctx = appctx_new(applet, NULL);
 	if (!appctx)
 		goto out_close;
 
@@ -655,24 +646,21 @@ static struct appctx *sink_forward_session_create(struct sink *sink, struct sink
 		goto out_free_appctx;
 	}
 
-	cs = cs_new();
-	if (!cs) {
-		ha_alert("out of memory in sink_forward_session_create");
+	if (!sockaddr_alloc(&addr, &sft->srv->addr, sizeof(sft->srv->addr)))
 		goto out_free_sess;
-	}
-	cs_attach_endp(cs, &appctx->obj_type, appctx);
 
-	if ((s = stream_new(sess, cs, &BUF_NULL)) == NULL) {
+	cs = cs_new_from_applet(appctx->endp, sess, &BUF_NULL);
+	if (!cs) {
 		ha_alert("Failed to initialize stream in sink_forward_session_create().\n");
-		goto out_free_cs;
+		goto out_free_addr;
 	}
+	s = DISGUISE(cs_strm(cs));
 
+	s->csb->dst = addr;
+	s->csb->flags |= CS_FL_NOLINGER;
 
 	s->target = &sft->srv->obj_type;
-	if (!sockaddr_alloc(&cs_si(s->csb)->dst, &sft->srv->addr, sizeof(sft->srv->addr)))
-		goto out_free_strm;
 	s->flags = SF_ASSIGNED|SF_ADDR_SET;
-	cs_si(s->csb)->flags |= SI_FL_NOLINGER;
 
 	s->do_log = NULL;
 	s->uniq_id = 0;
@@ -687,11 +675,8 @@ static struct appctx *sink_forward_session_create(struct sink *sink, struct sink
 	return appctx;
 
 	/* Error unrolling */
- out_free_strm:
-	LIST_DELETE(&s->list);
-	pool_free(pool_head_stream, s);
-  out_free_cs:
-	cs_free(cs);
+ out_free_addr:
+	sockaddr_free(&addr);
  out_free_sess:
 	session_free(sess);
  out_free_appctx:
