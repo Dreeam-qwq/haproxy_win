@@ -354,7 +354,7 @@
 
 /* ssl max dh param size */
 #ifndef SSL_DEFAULT_DH_PARAM
-#define SSL_DEFAULT_DH_PARAM 2048
+#define SSL_DEFAULT_DH_PARAM 0
 #endif
 
 /* max memory cost per SSL session */
@@ -388,6 +388,15 @@
 /* if not 0, maximum allocatable memory per process in MB */
 #ifndef HAPROXY_MEMMAX
 #define HAPROXY_MEMMAX 0
+#endif
+
+/* For USE_ZLIB, DEFAULT_MAXZLIBMEM may be set to a hard-coded value that will
+ * preset a maxzlibmem value. Just leave it to zero for other configurations.
+ * Note that it's expressed in megabytes.
+ */
+#if !defined(DEFAULT_MAXZLIBMEM) || !defined(USE_ZLIB)
+#undef DEFAULT_MAXZLIBMEM
+#define DEFAULT_MAXZLIBMEM 0
 #endif
 
 /* Pools are always enabled unless explicitly disabled. When disabled, the

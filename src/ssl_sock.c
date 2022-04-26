@@ -2954,6 +2954,41 @@ end:
 #endif
 }
 
+#if (HA_OPENSSL_VERSION_NUMBER >= 0x10101000L)
+static inline HASSL_DH *ssl_get_dh_by_nid(int nid)
+{
+#if (HA_OPENSSL_VERSION_NUMBER >= 0x3000000fL)
+	OSSL_PARAM params[2];
+	EVP_PKEY *pkey = NULL;
+	EVP_PKEY_CTX *pctx = EVP_PKEY_CTX_new_from_name(NULL, "DH", NULL);
+	const char *named_group = NULL;
+
+	if (!pctx)
+		goto end;
+
+	named_group = OBJ_nid2ln(nid);
+
+	if (!named_group)
+		goto end;
+
+	params[0] = OSSL_PARAM_construct_utf8_string("group", (char*)named_group, 0);
+	params[1] = OSSL_PARAM_construct_end();
+
+	if (EVP_PKEY_keygen_init(pctx) && EVP_PKEY_CTX_set_params(pctx, params))
+		EVP_PKEY_generate(pctx, &pkey);
+
+end:
+	EVP_PKEY_CTX_free(pctx);
+	return pkey;
+#else
+
+	HASSL_DH *dh = NULL;
+	dh = DH_new_by_nid(nid);
+	return dh;
+#endif
+}
+#endif
+
 
 static HASSL_DH * ssl_get_dh_1024(void)
 {
@@ -2990,6 +3025,7 @@ static HASSL_DH * ssl_get_dh_1024(void)
 
 static HASSL_DH *ssl_get_dh_2048(void)
 {
+#if (HA_OPENSSL_VERSION_NUMBER < 0x10101000L)
 	static unsigned char dh2048_p[]={
 		0xEC,0x86,0xF8,0x70,0xA0,0x33,0x16,0xEC,0x05,0x1A,0x73,0x59,
 		0xCD,0x1F,0x8B,0xF8,0x29,0xE4,0xD2,0xCF,0x52,0xDD,0xC2,0x24,
@@ -3030,10 +3066,14 @@ static HASSL_DH *ssl_get_dh_2048(void)
 		dh = ssl_new_dh_fromdata(p, g);
 
 	return dh;
+#else
+	return ssl_get_dh_by_nid(NID_ffdhe2048);
+#endif
 }
 
 static HASSL_DH *ssl_get_dh_4096(void)
 {
+#if (HA_OPENSSL_VERSION_NUMBER < 0x10101000L)
 	static unsigned char dh4096_p[]={
 		0xDE,0x16,0x94,0xCD,0x99,0x58,0x07,0xF1,0xF7,0x32,0x96,0x11,
 		0x04,0x82,0xD4,0x84,0x72,0x80,0x99,0x06,0xCA,0xF0,0xA3,0x68,
@@ -3095,6 +3135,9 @@ static HASSL_DH *ssl_get_dh_4096(void)
 		dh = ssl_new_dh_fromdata(p, g);
 
 	return dh;
+#else
+	return ssl_get_dh_by_nid(NID_ffdhe4096);
+#endif
 }
 
 static HASSL_DH *ssl_get_tmp_dh(EVP_PKEY *pkey)
@@ -3172,8 +3215,6 @@ static void ssl_sock_set_tmp_dh_from_pkey(SSL_CTX *ctx, EVP_PKEY *pkey)
 		if (!SSL_CTX_set0_tmp_dh_pkey(ctx, dh))
 			HASSL_DH_free(dh);
 	}
-	else
-		SSL_CTX_set_dh_auto(ctx, 1);
 }
 #endif
 
@@ -3378,14 +3419,8 @@ static int ssl_sock_load_dh_params(SSL_CTX *ctx, const struct cert_key_and_chain
 		if (!ssl_sock_set_tmp_dh(ctx, dh)) {
 			memprintf(err, "%sunable to load the DH parameter specified in '%s'",
 				  err && *err ? *err : "", path);
-#if defined(SSL_CTX_set_dh_auto)
-			SSL_CTX_set_dh_auto(ctx, 1);
-			memprintf(err, "%s, SSL library will use an automatically generated DH parameter.\n",
-				  err && *err ? *err : "");
-#else
 			memprintf(err, "%s, DH ciphers won't be available.\n",
 				  err && *err ? *err : "");
-#endif
 			ret |= ERR_WARN;
 			goto end;
 		}
@@ -3400,14 +3435,8 @@ static int ssl_sock_load_dh_params(SSL_CTX *ctx, const struct cert_key_and_chain
 		if (!ssl_sock_set_tmp_dh(ctx, global_dh)) {
 			memprintf(err, "%sunable to use the global DH parameter for certificate '%s'",
 				  err && *err ? *err : "", path);
-#if defined(SSL_CTX_set_dh_auto)
-			SSL_CTX_set_dh_auto(ctx, 1);
-			memprintf(err, "%s, SSL library will use an automatically generated DH parameter.\n",
-				  err && *err ? *err : "");
-#else
 			memprintf(err, "%s, DH ciphers won't be available.\n",
 				  err && *err ? *err : "");
-#endif
 			ret |= ERR_WARN;
 			goto end;
 		}
@@ -3416,39 +3445,38 @@ static int ssl_sock_load_dh_params(SSL_CTX *ctx, const struct cert_key_and_chain
 		/* Clear openssl global errors stack */
 		ERR_clear_error();
 
-		if (global_ssl.default_dh_param && global_ssl.default_dh_param <= 1024) {
-			/* we are limited to DH parameter of 1024 bits anyway */
-			if (local_dh_1024 == NULL)
-				local_dh_1024 = ssl_get_dh_1024();
+		/* We do not want DHE ciphers to be added to the cipher list
+		 * unless there is an explicit global dh option in the conf.
+		 */
+		if (global_ssl.default_dh_param) {
+			if (global_ssl.default_dh_param <= 1024) {
+				/* we are limited to DH parameter of 1024 bits anyway */
+				if (local_dh_1024 == NULL)
+					local_dh_1024 = ssl_get_dh_1024();
 
-			if (local_dh_1024 == NULL) {
-				memprintf(err, "%sunable to load default 1024 bits DH parameter for certificate '%s'.\n",
-					  err && *err ? *err : "", path);
-				ret |= ERR_ALERT | ERR_FATAL;
-				goto end;
-			}
+				if (local_dh_1024 == NULL) {
+					memprintf(err, "%sunable to load default 1024 bits DH parameter for certificate '%s'.\n",
+						  err && *err ? *err : "", path);
+					ret |= ERR_ALERT | ERR_FATAL;
+					goto end;
+				}
 
-			if (!ssl_sock_set_tmp_dh(ctx, local_dh_1024)) {
-				memprintf(err, "%sunable to load default 1024 bits DH parameter for certificate '%s'.\n",
-					  err && *err ? *err : "", path);
-#if defined(SSL_CTX_set_dh_auto)
-				SSL_CTX_set_dh_auto(ctx, 1);
-				memprintf(err, "%s, SSL library will use an automatically generated DH parameter.\n",
-					  err && *err ? *err : "");
-#else
-				memprintf(err, "%s, DH ciphers won't be available.\n",
-					  err && *err ? *err : "");
-#endif
-				ret |= ERR_WARN;
-				goto end;
+				if (!ssl_sock_set_tmp_dh(ctx, local_dh_1024)) {
+					memprintf(err, "%sunable to load default 1024 bits DH parameter for certificate '%s'.\n",
+						  err && *err ? *err : "", path);
+					memprintf(err, "%s, DH ciphers won't be available.\n",
+						  err && *err ? *err : "");
+					ret |= ERR_WARN;
+					goto end;
+				}
 			}
-		}
-		else {
+			else {
 #if (HA_OPENSSL_VERSION_NUMBER < 0x3000000fL)
-			SSL_CTX_set_tmp_dh_callback(ctx, ssl_get_tmp_dh_cbk);
+				SSL_CTX_set_tmp_dh_callback(ctx, ssl_get_tmp_dh_cbk);
 #else
-			ssl_sock_set_tmp_dh_from_pkey(ctx, ckch ? ckch->key : NULL);
+				ssl_sock_set_tmp_dh_from_pkey(ctx, ckch ? ckch->key : NULL);
 #endif
+			}
 		}
 	}
 
@@ -4785,21 +4813,12 @@ static int ssl_sock_prepare_ctx(struct bind_conf *bind_conf, struct ssl_bind_con
 #endif
 
 #ifndef OPENSSL_NO_DH
-	if (global_ssl.default_dh_param >= 1024) {
-		if (local_dh_1024 == NULL) {
-			local_dh_1024 = ssl_get_dh_1024();
-		}
-		if (global_ssl.default_dh_param >= 2048) {
-			if (local_dh_2048 == NULL) {
-				local_dh_2048 = ssl_get_dh_2048();
-			}
-			if (global_ssl.default_dh_param >= 4096) {
-				if (local_dh_4096 == NULL) {
-					local_dh_4096 = ssl_get_dh_4096();
-				}
-			}
-		}
-	}
+	if (!local_dh_1024)
+		local_dh_1024 = ssl_get_dh_1024();
+	if (!local_dh_2048)
+		local_dh_2048 = ssl_get_dh_2048();
+	if (!local_dh_4096)
+		local_dh_4096 = ssl_get_dh_4096();
 #endif /* OPENSSL_NO_DH */
 
 	SSL_CTX_set_info_callback(ctx, ssl_sock_infocbk);
@@ -6484,7 +6503,7 @@ static size_t ssl_sock_to_buf(struct connection *conn, void *xprt_ctx, struct bu
 			/* For SSL_ERROR_SYSCALL, make sure to clear the error
 			 * stack before shutting down the connection for
 			 * reading. */
-			if (ret == SSL_ERROR_SYSCALL && (!errno || errno == EAGAIN))
+			if (ret == SSL_ERROR_SYSCALL && (!errno || errno == EAGAIN || errno == EWOULDBLOCK))
 				goto clear_ssl_error;
 			/* otherwise it's a real error */
 			goto out_error;
@@ -7557,6 +7576,84 @@ yield:
 #endif
 }
 
+#ifdef HAVE_SSL_PROVIDERS
+struct provider_name {
+	const char *name;
+	struct list list;
+};
+
+
+static int ssl_provider_get_name_cb(OSSL_PROVIDER *provider, void *cbdata)
+{
+	struct list *provider_names = cbdata;
+	struct provider_name *item = NULL;
+	const char *name = OSSL_PROVIDER_get0_name(provider);
+
+	if (!provider_names)
+		return 0;
+
+	item = calloc(1, sizeof(*item));
+
+	if (!item)
+		return 0;
+
+	item->name = name;
+	LIST_APPEND(provider_names, &item->list);
+
+	return 1;
+}
+
+static void ssl_provider_get_name_list(struct list *provider_names)
+{
+	if (!provider_names)
+		return;
+
+	OSSL_PROVIDER_do_all(NULL, ssl_provider_get_name_cb, provider_names);
+}
+
+static void ssl_provider_clear_name_list(struct list *provider_names)
+{
+	struct provider_name *item = NULL, *item_s = NULL;
+
+	if (provider_names) {
+		list_for_each_entry_safe(item, item_s, provider_names, list) {
+			LIST_DELETE(&item->list);
+			free(item);
+		}
+	}
+}
+
+static int cli_io_handler_show_providers(struct appctx *appctx)
+{
+	struct buffer *trash = get_trash_chunk();
+	struct conn_stream *cs = appctx->owner;
+	struct list provider_names;
+	struct provider_name *name;
+
+	LIST_INIT(&provider_names);
+
+	chunk_appendf(trash, "Loaded providers : \n");
+
+	ssl_provider_get_name_list(&provider_names);
+
+	list_for_each_entry(name, &provider_names, list) {
+		chunk_appendf(trash, "\t- %s\n", name->name);
+	}
+
+	ssl_provider_clear_name_list(&provider_names);
+
+	if (ci_putchk(cs_ic(cs), trash) == -1) {
+		cs_rx_room_blk(cs);
+		goto yield;
+	}
+
+	return 1;
+
+yield:
+	return 0;
+}
+#endif
+
 
 #if ((defined SSL_CTRL_SET_TLSEXT_STATUS_REQ_CB && !defined OPENSSL_NO_OCSP) && !defined OPENSSL_IS_BORINGSSL)
 /*
@@ -7696,6 +7793,9 @@ static struct cli_kw_list cli_kws = {{ },{
 	{ { "set", "ssl", "ocsp-response", NULL }, "set ssl ocsp-response <resp|payload>    : update a certificate's OCSP Response from a base64-encode DER",      cli_parse_set_ocspresponse, NULL },
 
 	{ { "show", "ssl", "ocsp-response", NULL },"show ssl ocsp-response [id]             : display the IDs of the OCSP responses used in memory, or the details of a single OCSP response", cli_parse_show_ocspresponse, cli_io_handler_show_ocspresponse, NULL },
+#ifdef HAVE_SSL_PROVIDERS
+	{ { "show", "ssl", "providers", NULL },    "show ssl providers                      : show loaded SSL providers", NULL, cli_io_handler_show_providers },
+#endif
 	{ { NULL }, NULL, NULL, NULL }
 }};
 
@@ -7839,7 +7939,6 @@ static void ssl_sock_clt_sni_free_func(void *parent, void *ptr, CRYPTO_EX_DATA *
 	pool_free(ssl_sock_client_sni_pool, ptr);
 }
 
-__attribute__((constructor))
 static void __ssl_sock_init(void)
 {
 #if (!defined(OPENSSL_NO_COMP) && !defined(SSL_OP_NO_COMPRESSION))
@@ -7936,6 +8035,7 @@ static void __ssl_sock_init(void)
 	 */
 	hap_register_post_deinit(ssl_sock_unregister_msg_callbacks);
 }
+INITCALL0(STG_REGISTER, __ssl_sock_init);
 
 /* Compute and register the version string */
 static void ssl_register_build_options()
@@ -7979,6 +8079,23 @@ static void ssl_register_build_options()
 		if (methodVersions[i].option)
 			memprintf(&ptr, "%s %s", ptr, methodVersions[i].name);
 
+#ifdef HAVE_SSL_PROVIDERS
+	{
+		struct list provider_names;
+		struct provider_name *name;
+		LIST_INIT(&provider_names);
+		ssl_provider_get_name_list(&provider_names);
+
+		memprintf(&ptr, "%s\nOpenSSL providers loaded :", ptr);
+
+		list_for_each_entry(name, &provider_names, list) {
+			memprintf(&ptr, "%s %s", ptr, name->name);
+		}
+
+		ssl_provider_clear_name_list(&provider_names);
+	}
+#endif
+
 	hap_register_build_opts(ptr, 1);
 }
 
@@ -8018,7 +8135,6 @@ void ssl_free_dh(void) {
 }
 #endif
 
-__attribute__((destructor))
 static void __ssl_sock_deinit(void)
 {
 #if (defined SSL_CTRL_SET_TLSEXT_HOSTNAME && !defined SSL_NO_GENERATE_CERTIFICATES)
@@ -8040,6 +8156,7 @@ static void __ssl_sock_deinit(void)
 #endif
 	BIO_meth_free(ha_meth);
 }
+REGISTER_POST_DEINIT(__ssl_sock_deinit);
 
 
 /*

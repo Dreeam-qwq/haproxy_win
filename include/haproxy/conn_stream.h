@@ -47,12 +47,11 @@ void cs_free(struct conn_stream *cs);
 int cs_attach_mux(struct conn_stream *cs, void *target, void *ctx);
 int cs_attach_strm(struct conn_stream *cs, struct stream *strm);
 
+void cs_destroy(struct conn_stream *cs);
 int cs_reset_endp(struct conn_stream *cs);
-void cs_detach_endp(struct conn_stream *cs);
-void cs_detach_app(struct conn_stream *cs);
 
 struct appctx *cs_applet_create(struct conn_stream *cs, struct applet *app);
-void cs_applet_release(struct conn_stream *cs);
+void cs_applet_shut(struct conn_stream *cs);
 
 /* Returns the endpoint target without any control */
 static inline void *__cs_endp_target(const struct conn_stream *cs)
@@ -193,14 +192,14 @@ static inline void cs_conn_shutw(struct conn_stream *cs, enum co_shw_mode mode)
 }
 
 /* completely close a conn_stream (but do not detach it) */
-static inline void cs_conn_close(struct conn_stream *cs)
+static inline void cs_conn_shut(struct conn_stream *cs)
 {
 	cs_conn_shutw(cs, CO_SHW_SILENT);
 	cs_conn_shutr(cs, CO_SHR_RESET);
 }
 
 /* completely close a conn_stream after draining possibly pending data (but do not detach it) */
-static inline void cs_conn_drain_and_close(struct conn_stream *cs)
+static inline void cs_conn_drain_and_shut(struct conn_stream *cs)
 {
 	cs_conn_shutw(cs, CO_SHW_SILENT);
 	cs_conn_shutr(cs, CO_SHR_DRAIN);

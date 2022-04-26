@@ -45,6 +45,7 @@
 #include <haproxy/quic_frame.h>
 #include <haproxy/quic_loss.h>
 #include <haproxy/quic_sock.h>
+#include <haproxy/quic_stream.h>
 #include <haproxy/cbuf.h>
 #include <haproxy/proto_quic.h>
 #include <haproxy/quic_tls.h>
@@ -169,7 +170,6 @@ DECLARE_POOL(pool_head_quic_rx_strm_frm, "quic_rx_strm_frm", sizeof(struct quic_
 DECLARE_STATIC_POOL(pool_head_quic_crypto_buf, "quic_crypto_buf_pool", sizeof(struct quic_crypto_buf));
 DECLARE_POOL(pool_head_quic_frame, "quic_frame_pool", sizeof(struct quic_frame));
 DECLARE_STATIC_POOL(pool_head_quic_arng, "quic_arng_pool", sizeof(struct quic_arng_node));
-DECLARE_STATIC_POOL(pool_head_quic_conn_stream, "qc_stream_desc", sizeof(struct qc_stream_desc));
 
 static struct quic_tx_packet *qc_build_pkt(unsigned char **pos, const unsigned char *buf_end,
                                            struct quic_enc_level *qel, struct list *frms,
@@ -1429,48 +1429,6 @@ static int qc_pkt_decrypt(struct quic_rx_packet *pkt, struct quic_enc_level *qel
 	return 1;
 }
 
-/* Free the stream descriptor <stream> buffer. This function should be used
- * when all its data have been acknowledged. If the stream was released by the
- * upper layer, the stream descriptor will be freed.
- *
- * Returns 0 if the stream was not freed else non-zero.
- */
-static int qc_stream_desc_free(struct qc_stream_desc *stream)
-{
-	b_free(&stream->buf);
-	offer_buffers(NULL, 1);
-
-	if (stream->release) {
-		/* Free frames still waiting for an ACK. Even if the stream buf
-		 * is NULL, some frames could still be not acknowledged. This
-		 * is notably the case for retransmission where multiple frames
-		 * points to the same buffer content.
-		 */
-		struct eb64_node *frm_node = eb64_first(&stream->acked_frms);
-		while (frm_node) {
-			struct quic_stream *strm;
-			struct quic_frame *frm;
-
-			strm = eb64_entry(&frm_node->node, struct quic_stream, offset);
-
-			frm_node = eb64_next(frm_node);
-			eb64_delete(&strm->offset);
-
-			frm = container_of(strm, struct quic_frame, stream);
-			LIST_DELETE(&frm->list);
-			quic_tx_packet_refdec(frm->pkt);
-			pool_free(pool_head_quic_frame, frm);
-		}
-
-		eb64_delete(&stream->by_id);
-		pool_free(pool_head_quic_conn_stream, stream);
-
-		return 1;
-	}
-
-	return 0;
-}
-
 /* Remove from <stream> the acknowledged frames.
  *
  * Returns 1 if at least one frame was removed else 0.
@@ -1486,21 +1444,28 @@ static int quic_stream_try_to_consume(struct quic_conn *qc,
 	while (frm_node) {
 		struct quic_stream *strm;
 		struct quic_frame *frm;
+		size_t offset, len;
 
 		strm = eb64_entry(&frm_node->node, struct quic_stream, offset);
-		if (strm->offset.key > stream->ack_offset)
+		offset = strm->offset.key;
+		len = strm->len;
+
+		if (offset > stream->ack_offset)
 			break;
 
-		TRACE_PROTO("stream consumed", QUIC_EV_CONN_ACKSTRM,
-		            qc, strm, stream);
-
-		if (strm->offset.key + strm->len > stream->ack_offset) {
-			const size_t diff = strm->offset.key + strm->len -
-			                    stream->ack_offset;
-			stream->ack_offset += diff;
-			b_del(strm->buf, diff);
+		if (qc_stream_desc_ack(&stream, offset, len)) {
+			/* cf. next comment : frame may be freed at this stage. */
+			TRACE_PROTO("stream consumed", QUIC_EV_CONN_ACKSTRM,
+			            qc, stream ? strm : NULL, stream);
 			ret = 1;
 		}
+
+		/* If stream is NULL after qc_stream_desc_ack(), it means frame
+		 * has been freed. with the stream frames tree. Nothing to do
+		 * anymore in here.
+		 */
+		if (!stream)
+			return 1;
 
 		frm_node = eb64_next(frm_node);
 		eb64_delete(&strm->offset);
@@ -1509,11 +1474,6 @@ static int quic_stream_try_to_consume(struct quic_conn *qc,
 		LIST_DELETE(&frm->list);
 		quic_tx_packet_refdec(frm->pkt);
 		pool_free(pool_head_quic_frame, frm);
-	}
-
-	if (!b_data(&stream->buf)) {
-		if (qc_stream_desc_free(stream))
-			TRACE_PROTO("stream released and freed", QUIC_EV_CONN_ACKSTRM, qc);
 	}
 
 	return ret;
@@ -1533,23 +1493,18 @@ static inline void qc_treat_acked_tx_frm(struct quic_conn *qc,
 		struct quic_stream *strm_frm = &frm->stream;
 		struct eb64_node *node = NULL;
 		struct qc_stream_desc *stream = NULL;
+		const size_t offset = strm_frm->offset.key;
+		const size_t len = strm_frm->len;
 
 		/* do not use strm_frm->stream as the qc_stream_desc instance
 		 * might be freed at this stage. Use the id to do a proper
-		 * lookup. First search in the MUX then in the released stream
-		 * list.
+		 * lookup.
 		 *
 		 * TODO if lookup operation impact on the perf is noticeable,
 		 * implement a refcount on qc_stream_desc instances.
 		 */
-		if (qc->mux_state == QC_MUX_READY)
-			stream = qcc_get_stream(qc->qcc, strm_frm->id);
-		if (!stream) {
-			node = eb64_lookup(&qc->streams_by_id, strm_frm->id);
-			stream = eb64_entry(node, struct qc_stream_desc, by_id);
-		}
-
-		if (!stream) {
+		node = eb64_lookup(&qc->streams_by_id, strm_frm->id);
+		if (!node) {
 			TRACE_PROTO("acked stream for released stream", QUIC_EV_CONN_ACKSTRM, qc, strm_frm);
 			LIST_DELETE(&frm->list);
 			quic_tx_packet_refdec(frm->pkt);
@@ -1558,32 +1513,25 @@ static inline void qc_treat_acked_tx_frm(struct quic_conn *qc,
 			/* early return */
 			return;
 		}
+		stream = eb64_entry(node, struct qc_stream_desc, by_id);
 
 		TRACE_PROTO("acked stream", QUIC_EV_CONN_ACKSTRM, qc, strm_frm, stream);
-		if (strm_frm->offset.key <= stream->ack_offset) {
-			if (strm_frm->offset.key + strm_frm->len > stream->ack_offset) {
-				const size_t diff = strm_frm->offset.key + strm_frm->len -
-				                    stream->ack_offset;
-				stream->ack_offset += diff;
-				b_del(strm_frm->buf, diff);
+		if (offset <= stream->ack_offset) {
+			if (qc_stream_desc_ack(&stream, offset, len)) {
 				stream_acked = 1;
-
-				if (!b_data(strm_frm->buf)) {
-					if (qc_stream_desc_free(stream)) {
-						/* stream is freed at this stage,
-						 * no need to continue.
-						 */
-						TRACE_PROTO("stream released and freed", QUIC_EV_CONN_ACKSTRM, qc);
-						LIST_DELETE(&frm->list);
-						quic_tx_packet_refdec(frm->pkt);
-						pool_free(pool_head_quic_frame, frm);
-						break;
-					}
-				}
+				TRACE_PROTO("stream consumed", QUIC_EV_CONN_ACKSTRM,
+				            qc, strm_frm, stream);
 			}
 
-			TRACE_PROTO("stream consumed", QUIC_EV_CONN_ACKSTRM,
-			            qc, strm_frm, stream);
+			if (!stream) {
+				/* no need to continue if stream freed. */
+				TRACE_PROTO("stream released and freed", QUIC_EV_CONN_ACKSTRM, qc);
+				LIST_DELETE(&frm->list);
+				quic_tx_packet_refdec(frm->pkt);
+				pool_free(pool_head_quic_frame, frm);
+				break;
+			}
+
 			LIST_DELETE(&frm->list);
 			quic_tx_packet_refdec(frm->pkt);
 			pool_free(pool_head_quic_frame, frm);
@@ -1601,7 +1549,7 @@ static inline void qc_treat_acked_tx_frm(struct quic_conn *qc,
 		pool_free(pool_head_quic_frame, frm);
 	}
 
-	if (stream_acked) {
+	if (stream_acked && qc->mux_state == QC_MUX_READY) {
 		struct qcc *qcc = qc->qcc;
 
 		if (qcc->subs && qcc->subs->events & SUB_RETRY_SEND) {
@@ -4114,6 +4062,7 @@ static struct quic_conn *qc_new_conn(unsigned int version, int ipv4,
 	MT_LIST_INIT(&qc->accept_list);
 
 	qc->streams_by_id = EB_ROOT_UNIQUE;
+	qc->stream_buf_count = 0;
 
 	TRACE_LEAVE(QUIC_EV_CONN_INIT, qc);
 
@@ -5820,18 +5769,18 @@ static struct xprt_ops ssl_quic = {
 	.name     = "QUIC",
 };
 
-__attribute__((constructor))
 static void __quic_conn_init(void)
 {
 	ha_quic_meth = BIO_meth_new(0x666, "ha QUIC methods");
 	xprt_register(XPRT_QUIC, &ssl_quic);
 }
+INITCALL0(STG_REGISTER, __quic_conn_init);
 
-__attribute__((destructor))
 static void __quic_conn_deinit(void)
 {
 	BIO_meth_free(ha_quic_meth);
 }
+REGISTER_POST_DEINIT(__quic_conn_deinit);
 
 /* Read all the QUIC packets found in <buf> from QUIC connection with <owner>
  * as owner calling <func> function.
@@ -5954,50 +5903,6 @@ int quic_lstnr_dgram_dispatch(unsigned char *buf, size_t len, void *owner,
 
  err:
 	return 0;
-}
-
-/* Allocate a new stream descriptor with id <id>. The caller is responsible to
- * store the stream in the appropriate tree.
- *
- * Returns the newly allocated instance on success or else NULL.
- */
-struct qc_stream_desc *qc_stream_desc_new(uint64_t id, void *ctx)
-{
-	struct qc_stream_desc *stream;
-
-	stream = pool_alloc(pool_head_quic_conn_stream);
-	if (!stream)
-		return NULL;
-
-	stream->by_id.key = id;
-	stream->by_id.node.leaf_p = NULL;
-
-	stream->buf = BUF_NULL;
-	stream->acked_frms = EB_ROOT;
-	stream->ack_offset = 0;
-	stream->release = 0;
-	stream->ctx = ctx;
-
-	return stream;
-}
-
-/* Mark the stream descriptor <stream> as released by the upper layer. It will
- * be freed as soon as all its buffered data are acknowledged. In the meantime,
- * the stream is stored in the <qc> tree : thus it must have been removed from
- * any other tree before calling this function.
- */
-void qc_stream_desc_release(struct qc_stream_desc *stream,
-                            struct quic_conn *qc)
-{
-	BUG_ON(stream->by_id.node.leaf_p);
-
-	stream->release = 1;
-	stream->ctx = NULL;
-
-	if (!b_data(&stream->buf))
-		qc_stream_desc_free(stream);
-	else
-		eb64_insert(&qc->streams_by_id, &stream->by_id);
 }
 
 /* Notify the MUX layer if alive about an imminent close of <qc>. */

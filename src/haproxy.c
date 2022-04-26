@@ -175,7 +175,7 @@ struct global global = {
 	.nbthread = 0,
 	.req_count = 0,
 	.logsrvs = LIST_HEAD_INIT(global.logsrvs),
-	.maxzlibmem = 0,
+	.maxzlibmem = DEFAULT_MAXZLIBMEM * 1024U * 1024U,
 	.comp_rate_lim = 0,
 	.ssl_server_verify = SSL_SERVER_VERIFY_REQUIRED,
 	.unix_bind = {
@@ -203,6 +203,9 @@ struct global global = {
 #else
 		.idle_timer = 1000, /* 1 second */
 #endif
+#ifdef USE_QUIC
+		.quic_streams_buf = 30,
+#endif /* USE_QUIC */
 	},
 #ifdef USE_OPENSSL
 #ifdef DEFAULT_MAXSSLCONN
@@ -1359,6 +1362,9 @@ static int compute_ideal_maxconn()
 	 *   - two FDs per connection
 	 */
 
+	if (global.fd_hard_limit && remain > global.fd_hard_limit)
+		remain = global.fd_hard_limit;
+
 	/* subtract listeners and checks */
 	remain -= global.maxsock;
 
@@ -1435,6 +1441,9 @@ static int check_if_maxsock_permitted(int maxsock)
 {
 	struct rlimit orig_limit, test_limit;
 	int ret;
+
+	if (global.fd_hard_limit && maxsock > global.fd_hard_limit)
+		return 0;
 
 	if (getrlimit(RLIMIT_NOFILE, &orig_limit) != 0)
 		return 1;
@@ -1888,6 +1897,7 @@ static void init(int argc, char **argv)
 	struct wordlist *wl;
 	struct proxy *px;
 	struct post_check_fct *pcf;
+	struct pre_check_fct *prcf;
 	int ideal_maxconn;
 
 	if (!init_trash_buffers(1)) {
@@ -2104,6 +2114,8 @@ static void init(int argc, char **argv)
 	/* destroy unreferenced defaults proxies  */
 	proxy_destroy_all_unref_defaults();
 
+	list_for_each_entry(prcf, &pre_check_list, list)
+		err_code |= prcf->fct();
 
 	err_code |= check_config_validity();
 	for (px = proxies_list; px; px = px->next) {
@@ -3043,8 +3055,12 @@ int main(int argc, char **argv)
 		limit.rlim_cur = global.rlimit_nofile;
 		limit.rlim_max = MAX(rlim_fd_max_at_boot, limit.rlim_cur);
 
-		if (setrlimit(RLIMIT_NOFILE, &limit) == -1) {
+		if ((global.fd_hard_limit && limit.rlim_cur > global.fd_hard_limit) ||
+		    setrlimit(RLIMIT_NOFILE, &limit) == -1) {
 			getrlimit(RLIMIT_NOFILE, &limit);
+			if (global.fd_hard_limit && limit.rlim_cur > global.fd_hard_limit)
+				limit.rlim_cur = global.fd_hard_limit;
+
 			if (global.tune.options & GTUNE_STRICT_LIMITS) {
 				ha_alert("[%s.main()] Cannot raise FD limit to %d, limit is %d.\n",
 					 argv[0], global.rlimit_nofile, (int)limit.rlim_cur);
@@ -3053,6 +3069,9 @@ int main(int argc, char **argv)
 			else {
 				/* try to set it to the max possible at least */
 				limit.rlim_cur = limit.rlim_max;
+				if (global.fd_hard_limit && limit.rlim_cur > global.fd_hard_limit)
+					limit.rlim_cur = global.fd_hard_limit;
+
 				if (setrlimit(RLIMIT_NOFILE, &limit) != -1)
 					getrlimit(RLIMIT_NOFILE, &limit);
 

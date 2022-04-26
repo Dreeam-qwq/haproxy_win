@@ -524,6 +524,40 @@ static struct server *get_server_rch(struct stream *s, const struct server *avoi
 		return map_get_server_hash(px, hash);
 }
 
+/* sample expression HASH. Returns NULL if the sample is not found or if there
+ * are no server, relying on the caller to fall back to round robin instead.
+ */
+static struct server *get_server_expr(struct stream *s, const struct server *avoid)
+{
+	struct proxy  *px = s->be;
+	struct sample *smp;
+	unsigned int hash = 0;
+
+	if (px->lbprm.tot_weight == 0)
+		return NULL;
+
+	/* note: no need to hash if there's only one server left */
+	if (px->lbprm.tot_used == 1)
+		goto hash_done;
+
+	smp = sample_fetch_as_type(px, s->sess, s, SMP_OPT_DIR_REQ | SMP_OPT_FINAL, px->lbprm.expr, SMP_T_BIN);
+	if (!smp)
+		return NULL;
+
+	/* We have the desired data. Let's hash it according to the configured
+	 * options and algorithm.
+	 */
+	hash = gen_hash(px, smp->data.u.str.area, smp->data.u.str.data);
+
+	if ((px->lbprm.algo & BE_LB_HASH_MOD) == BE_LB_HMOD_AVAL)
+		hash = full_hash(hash);
+ hash_done:
+	if ((px->lbprm.algo & BE_LB_LKUP) == BE_LB_LKUP_CHTREE)
+		return chash_get_server_hash(px, hash, avoid);
+	else
+		return map_get_server_hash(px, hash);
+}
+
 /* random value  */
 static struct server *get_server_rnd(struct stream *s, const struct server *avoid)
 {
@@ -758,6 +792,11 @@ int assign_server(struct stream *s)
 			case BE_LB_HASH_RDP:
 				/* RDP Cookie hashing */
 				srv = get_server_rch(s, prev_srv);
+				break;
+
+			case BE_LB_HASH_SMP:
+				/* sample expression hashing */
+				srv = get_server_expr(s, prev_srv);
 				break;
 
 			default:
@@ -1529,7 +1568,9 @@ static int connect_server(struct stream *s)
 
 			if (avail <= 1) {
 				/* No more streams available, remove it from the list */
+				HA_SPIN_LOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
 				conn_delete_from_tree(&srv_conn->hash_node->node);
+				HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
 			}
 
 			if (avail >= 1) {
@@ -2113,7 +2154,7 @@ abort_connection:
 /* This function initiates a server connection request on a conn-stream
  * already in CS_ST_REQ state. Upon success, the state goes to CS_ST_ASS for
  * a real connection to a server, indicating that a server has been assigned,
- * or CS_ST_EST for a successful connection to an applet. It may also return
+ * or CS_ST_RDY for a successful connection to an applet. It may also return
  * CS_ST_QUE, or CS_ST_CLO upon error.
  */
 void back_handle_st_req(struct stream *s)
@@ -2126,12 +2167,14 @@ void back_handle_st_req(struct stream *s)
 	DBG_TRACE_ENTER(STRM_EV_STRM_PROC|STRM_EV_CS_ST, s);
 
 	if (unlikely(obj_type(s->target) == OBJ_TYPE_APPLET)) {
-		/* the applet directly goes to the EST state */
-		struct appctx *appctx = cs_appctx(s->csb);
+		struct appctx *appctx;
 
-		if (!appctx || appctx->applet != __objt_applet(s->target))
-			appctx = cs_applet_create(cs, objt_applet(s->target));
-
+		/* The target is an applet but the CS is in CS_ST_REQ. Thus it
+		 * means no appctx are attached to the CS. Otherwise, it will be
+		 * in CS_ST_RDY state. So, try to create the appctx now.
+		 */
+		BUG_ON(cs_appctx(cs));
+		appctx = cs_applet_create(cs, objt_applet(s->target));
 		if (!appctx) {
 			/* No more memory, let's immediately abort. Force the
 			 * error code to ignore the ERR_LOCAL which is not a
@@ -2150,15 +2193,7 @@ void back_handle_st_req(struct stream *s)
 			goto end;
 		}
 
-		if (tv_iszero(&s->logs.tv_request))
-			s->logs.tv_request = now;
-		s->logs.t_queue   = tv_ms_elapsed(&s->logs.tv_accept, &now);
-		cs->state     = CS_ST_EST;
-		s->conn_err_type  = STRM_ET_NONE;
-		be_set_sess_last(s->be);
-
 		DBG_TRACE_STATE("applet registered", STRM_EV_STRM_PROC|STRM_EV_CS_ST, s);
-		/* let back_establish() finish the job */
 		goto end;
 	}
 
@@ -2406,6 +2441,19 @@ void back_handle_st_rdy(struct stream *s)
 	struct channel *rep = &s->res;
 
 	DBG_TRACE_ENTER(STRM_EV_STRM_PROC|STRM_EV_CS_ST, s);
+
+	if (unlikely(obj_type(s->target) == OBJ_TYPE_APPLET)) {
+		/* Here the appctx must exists because the CS was set to
+		 * CS_ST_RDY state when the appctx was created.
+		 */
+		BUG_ON(!cs_appctx(s->csb));
+
+		if (tv_iszero(&s->logs.tv_request))
+			s->logs.tv_request = now;
+		s->logs.t_queue   = tv_ms_elapsed(&s->logs.tv_accept, &now);
+		be_set_sess_last(s->be);
+	}
+
 	/* We know the connection at least succeeded, though it could have
 	 * since met an error for any other reason. At least it didn't time out
 	 * even though the timeout might have been reported right after success.
@@ -2569,6 +2617,8 @@ const char *backend_lb_algo_str(int algo) {
 		return "hdr";
 	else if (algo == BE_LB_ALGO_RCH)
 		return "rdp-cookie";
+	else if (algo == BE_LB_ALGO_SMP)
+		return "hash";
 	else if (algo == BE_LB_ALGO_NONE)
 		return "none";
 	else
@@ -2696,6 +2746,23 @@ int backend_parse_balance(const char **args, char **err, struct proxy *curproxy)
 				memprintf(err, "%s only accepts 'check_post' modifier (got '%s').", args[0], args[2]);
 				return -1;
 			}
+		}
+	}
+	else if (strcmp(args[0], "hash") == 0) {
+		if (!*args[1]) {
+			memprintf(err, "%s requires a sample expression.", args[0]);
+			return -1;
+		}
+		curproxy->lbprm.algo &= ~BE_LB_ALGO;
+		curproxy->lbprm.algo |= BE_LB_ALGO_SMP;
+
+		ha_free(&curproxy->lbprm.arg_str);
+		curproxy->lbprm.arg_str = strdup(args[1]);
+		curproxy->lbprm.arg_len = strlen(args[1]);
+
+		if (*args[2]) {
+			memprintf(err, "%s takes no other argument (got '%s').", args[0], args[2]);
+			return -1;
 		}
 	}
 	else if (!strncmp(args[0], "hdr(", 4)) {

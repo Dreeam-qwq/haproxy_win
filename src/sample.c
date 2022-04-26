@@ -958,6 +958,17 @@ static int c_int2bin(struct sample *smp)
 	return 1;
 }
 
+static int c_bool2bin(struct sample *smp)
+{
+	struct buffer *chk = get_trash_chunk();
+
+	*(unsigned long long int *)chk->area = my_htonll(!!smp->data.u.sint);
+	chk->data = 8;
+	smp->data.u.str = *chk;
+	smp->data.type = SMP_T_BIN;
+	return 1;
+}
+
 
 /*****************************************************************/
 /*      Sample casts matrix:                                     */
@@ -968,7 +979,7 @@ static int c_int2bin(struct sample *smp)
 sample_cast_fct sample_casts[SMP_TYPES][SMP_TYPES] = {
 /*            to:  ANY     BOOL       SINT       ADDR        IPV4      IPV6        STR         BIN         METH */
 /* from:  ANY */ { c_none, c_none,    c_none,    c_none,     c_none,   c_none,     c_none,     c_none,     c_none,     },
-/*       BOOL */ { c_none, c_none,    c_none,    NULL,       NULL,     NULL,       c_int2str,  NULL,       NULL,       },
+/*       BOOL */ { c_none, c_none,    c_none,    NULL,       NULL,     NULL,       c_int2str,  c_bool2bin, NULL,       },
 /*       SINT */ { c_none, c_none,    c_none,    c_int2ip,   c_int2ip, c_int2ipv6, c_int2str,  c_int2bin,  NULL,       },
 /*       ADDR */ { c_none, NULL,      NULL,      NULL,       NULL,     NULL,       NULL,       NULL,       NULL,       },
 /*       IPV4 */ { c_none, NULL,      c_ip2int,  c_none,     c_none,   c_ip2ipv6,  c_ip2str,   c_addr2bin, NULL,       },
@@ -1295,6 +1306,8 @@ int smp_resolve_args(struct proxy *p, char **err)
 		case ARGC_ACL:   ctx = "ACL keyword"; break;
 		case ARGC_SRV:   where = "in server directive in"; break;
 		case ARGC_SPOE:  where = "in spoe-message directive in"; break;
+		case ARGC_UBK:   where = "in use_backend expression in"; break;
+		case ARGC_USRV:  where = "in use-server or balance expression in"; break;
 		case ARGC_HERR:  where = "in http-error directive in"; break;
 		case ARGC_OT:    where = "in ot-scope directive in"; break;
 		case ARGC_TCO:   where = "in tcp-request connection expression in"; break;
@@ -1562,7 +1575,8 @@ struct sample *sample_fetch_as_type(struct proxy *px, struct session *sess,
 	if (!sample_casts[smp->data.type][smp_type])
 		return NULL;
 
-	if (!sample_casts[smp->data.type][smp_type](smp))
+	if (sample_casts[smp->data.type][smp_type] != c_none &&
+	    !sample_casts[smp->data.type][smp_type](smp))
 		return NULL;
 
 	smp->flags &= ~SMP_F_MAY_CHANGE;

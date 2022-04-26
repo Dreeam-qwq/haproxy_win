@@ -244,13 +244,18 @@ void cs_free(struct conn_stream *cs)
 	pool_free(pool_head_connstream, cs);
 }
 
-/* Conditionally removes a conn-stream if it is detached and it there is no app
- * layer defined. Except on error path, this one must be used.
+/* Conditionally removes a conn-stream if it is detached and if there is no app
+ * layer defined. Except on error path, this one must be used. if release, the
+ * pointer on the CS is set to NULL.
  */
-static void cs_free_cond(struct conn_stream *cs)
+static void cs_free_cond(struct conn_stream **csp)
 {
-	if (!cs->app && (!cs->endp || (cs->endp->flags & CS_EP_DETACHED)))
+	struct conn_stream *cs = *csp;
+
+	if (!cs->app && (!cs->endp || (cs->endp->flags & CS_EP_DETACHED))) {
 		cs_free(cs);
+		*csp = NULL;
+	}
 }
 
 
@@ -344,8 +349,13 @@ int cs_attach_strm(struct conn_stream *cs, struct stream *strm)
  * endpoint is reset and flag as detached. If the app layer is also detached,
  * the conn-stream is released.
  */
-void cs_detach_endp(struct conn_stream *cs)
+static void cs_detach_endp(struct conn_stream **csp)
 {
+	struct conn_stream *cs = *csp;
+
+	if (!cs)
+		return;
+
 	if (!cs->endp)
 		goto reset_cs;
 
@@ -375,7 +385,7 @@ void cs_detach_endp(struct conn_stream *cs)
 		struct appctx *appctx = __cs_appctx(cs);
 
 		cs->endp->flags |= CS_EP_ORPHAN;
-		cs_applet_release(cs);
+		cs_applet_shut(cs);
 		appctx_free(appctx);
 		cs->endp = NULL;
 	}
@@ -394,14 +404,19 @@ void cs_detach_endp(struct conn_stream *cs)
 	if (cs_strm(cs))
 		cs->ops = &cs_app_embedded_ops;
 	cs->data_cb = NULL;
-	cs_free_cond(cs);
+	cs_free_cond(csp);
 }
 
 /* Detaches the conn_stream from the app layer. If there is no endpoint attached
  * to the conn_stream
  */
-void cs_detach_app(struct conn_stream *cs)
+static void cs_detach_app(struct conn_stream **csp)
 {
+	struct conn_stream *cs = *csp;
+
+	if (!cs)
+		return;
+
 	cs->app = NULL;
 	cs->data_cb = NULL;
 	sockaddr_free(&cs->src);
@@ -411,7 +426,17 @@ void cs_detach_app(struct conn_stream *cs)
 		tasklet_free(cs->wait_event.tasklet);
 	cs->wait_event.tasklet = NULL;
 	cs->wait_event.events = 0;
-	cs_free_cond(cs);
+	cs_free_cond(csp);
+}
+
+/* Destroy the conn_stream. It is detached from its endpoint and its
+ * application. After this call, the conn_stream must be considered as released.
+ */
+void cs_destroy(struct conn_stream *cs)
+{
+	cs_detach_endp(&cs);
+	cs_detach_app(&cs);
+	BUG_ON_HOT(cs);
 }
 
 /* Resets the conn-stream endpoint. It happens when the app layer want to renew
@@ -426,9 +451,10 @@ int cs_reset_endp(struct conn_stream *cs)
 	if (!__cs_endp_target(cs)) {
 		/* endpoint not attached or attached to a mux with no
 		 * target. Thus the endpoint will not be release but just
-		 * reset
+		 * reset. The app is still attached, the cs will not be
+		 * released.
 		 */
-		cs_detach_endp(cs);
+		cs_detach_endp(&cs);
 		return 0;
 	}
 
@@ -440,7 +466,8 @@ int cs_reset_endp(struct conn_stream *cs)
 		return -1;
 	}
 
-	cs_detach_endp(cs);
+	/* The app is still attached, the cs will not be released */
+	cs_detach_endp(&cs);
 	BUG_ON(cs->endp);
 	cs->endp = new_endp;
 	cs->endp->flags |= CS_EP_DETACHED;
@@ -468,16 +495,23 @@ struct appctx *cs_applet_create(struct conn_stream *cs, struct applet *app)
 	appctx->t->nice = __cs_strm(cs)->task->nice;
 	cs_cant_get(cs);
 	appctx_wakeup(appctx);
+
+	cs->state = CS_ST_RDY;
 	return appctx;
 }
 
 /* call the applet's release function if any. Needs to be called upon close() */
-void cs_applet_release(struct conn_stream *cs)
+void cs_applet_shut(struct conn_stream *cs)
 {
 	struct appctx *appctx = __cs_appctx(cs);
 
-	if (appctx->applet->release && !cs_state_in(cs->state, CS_SB_DIS|CS_SB_CLO))
+	if (cs->endp->flags & (CS_EP_SHR|CS_EP_SHW))
+		return;
+
+	if (appctx->applet->release)
 		appctx->applet->release(appctx);
+
+	cs->endp->flags |= CS_EP_SHRR | CS_EP_SHWN;
 }
 
 /*
@@ -645,7 +679,7 @@ static void cs_app_shutr_conn(struct conn_stream *cs)
 		return;
 
 	if (cs_oc(cs)->flags & CF_SHUTW) {
-		cs_conn_close(cs);
+		cs_conn_shut(cs);
 		cs->state = CS_ST_DIS;
 		__cs_strm(cs)->conn_exp = TICK_ETERNITY;
 	}
@@ -721,7 +755,7 @@ static void cs_app_shutw_conn(struct conn_stream *cs)
 		/* we may have to close a pending connection, and mark the
 		 * response buffer as shutr
 		 */
-		cs_conn_close(cs);
+		cs_conn_shut(cs);
 		/* fall through */
 	case CS_ST_CER:
 	case CS_ST_QUE:
@@ -874,7 +908,7 @@ static void cs_app_shutr_applet(struct conn_stream *cs)
 		return;
 
 	if (cs_oc(cs)->flags & CF_SHUTW) {
-		cs_applet_release(cs);
+		cs_applet_shut(cs);
 		cs->state = CS_ST_DIS;
 		__cs_strm(cs)->conn_exp = TICK_ETERNITY;
 	}
@@ -932,7 +966,7 @@ static void cs_app_shutw_applet(struct conn_stream *cs)
 	case CS_ST_QUE:
 	case CS_ST_TAR:
 		/* Note that none of these states may happen with applets */
-		cs_applet_release(cs);
+		cs_applet_shut(cs);
 		cs->state = CS_ST_DIS;
 		/* fall through */
 	default:
@@ -1252,7 +1286,7 @@ static void cs_conn_read0(struct conn_stream *cs)
 
  do_close:
 	/* OK we completely close the socket here just as if we went through cs_shut[rw]() */
-	cs_conn_close(cs);
+	cs_conn_shut(cs);
 
 	oc->flags &= ~CF_SHUTW_NOW;
 	oc->flags |= CF_SHUTW;

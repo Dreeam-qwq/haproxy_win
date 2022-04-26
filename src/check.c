@@ -369,7 +369,7 @@ static const struct analyze_status analyze_statuses[HANA_STATUS_SIZE] = {		/* 0:
  */
 static inline int unclean_errno(int err)
 {
-	if (err == EAGAIN || err == EINPROGRESS ||
+	if (err == EAGAIN || err == EWOULDBLOCK || err == EINPROGRESS ||
 	    err == EISCONN || err == EALREADY)
 		return 0;
 	return err;
@@ -1054,7 +1054,7 @@ static int wake_srv_chk(struct conn_stream *cs)
 		 * handled ASAP. */
 		ret = -1;
 		if (conn)  {
-			cs_conn_drain_and_close(cs);
+			cs_conn_drain_and_shut(cs);
 			if (check->wait_list.events)
 				conn->mux->unsubscribe(cs, check->wait_list.events, &check->wait_list);
 		}
@@ -1188,7 +1188,7 @@ struct task *process_chk_conn(struct task *t, void *context, unsigned int state)
 		 * as a failed response coupled with "observe layer7" caused the
 		 * server state to be suddenly changed.
 		 */
-		cs_conn_drain_and_close(cs);
+		cs_conn_drain_and_shut(cs);
 	}
 
 	if (cs) {
@@ -1199,8 +1199,7 @@ struct task *process_chk_conn(struct task *t, void *context, unsigned int state)
 		 * the tasklet
 		 */
 		tasklet_remove_from_tasklet_list(check->wait_list.tasklet);
-		cs_detach_endp(cs);
-		cs_detach_app(cs);
+		cs_destroy(cs);
 		cs = check->cs = NULL;
 		conn = NULL;
 	}
@@ -1364,8 +1363,7 @@ void free_check(struct check *check)
 	check_release_buf(check, &check->bi);
 	check_release_buf(check, &check->bo);
 	if (check->cs) {
-		cs_detach_endp(check->cs);
-		cs_detach_app(check->cs);
+		cs_destroy(check->cs);
 		check->cs = NULL;
 	}
 }

@@ -10,6 +10,8 @@
 
 #include <haproxy/buf-t.h>
 #include <haproxy/connection-t.h>
+#include <haproxy/list-t.h>
+#include <haproxy/quic_stream-t.h>
 #include <haproxy/xprt_quic-t.h>
 #include <haproxy/conn_stream-t.h>
 
@@ -25,6 +27,7 @@ enum qcs_type {
 };
 
 #define QC_CF_BLK_MFCTL 0x00000001 /* sending blocked due to connection flow-control */
+#define QC_CF_CONN_FULL 0x00000002 /* no stream buffers available on connection */
 
 struct qcc {
 	struct connection *conn;
@@ -68,6 +71,8 @@ struct qcc {
 
 	struct eb_root streams_by_id; /* all active streams by their ID */
 
+	struct list send_retry_list; /* list of qcs eligible to send retry */
+
 	struct wait_event wait_event;  /* To be used if we're waiting for I/Os */
 	struct wait_event *subs;
 
@@ -105,8 +110,11 @@ struct qcs {
 		uint64_t msd; /* fctl bytes limit to respect on emission */
 	} tx;
 
+	struct eb64_node by_id;
 	uint64_t id;
 	struct qc_stream_desc *stream;
+
+	struct list el; /* element of qcc.send_retry_list */
 
 	struct wait_event wait_event;
 	struct wait_event *subs;

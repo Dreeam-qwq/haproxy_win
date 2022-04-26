@@ -714,10 +714,8 @@ static void stream_free(struct stream *s)
 	/* FIXME: Handle it in appctx_free ??? */
 	must_free_sess = objt_appctx(sess->origin) && sess->origin == __cs_endp_target(s->csf);
 
-	cs_detach_endp(s->csb);
-	cs_detach_endp(s->csf);
-	cs_detach_app(s->csb);
-	cs_detach_app(s->csf);
+	cs_destroy(s->csb);
+	cs_destroy(s->csf);
 
 	if (must_free_sess) {
 		sess->origin = NULL;
@@ -2256,7 +2254,6 @@ struct task *process_stream(struct task *t, void *context, unsigned int state)
 			}
 		}
 		else {
-			cs_detach_endp(csb);
 			s->csb->state = CS_ST_CLO; /* shutw+ini = abort */
 			channel_shutw_now(req);        /* fix buffer flags upon abort */
 			channel_shutr_now(res);
@@ -3308,9 +3305,9 @@ static int stats_dump_full_strm_to_buffer(struct conn_stream *cs, struct stream 
 			      strm->txn->req.flags, strm->txn->rsp.flags);
 
 		csf = strm->csf;
-		chunk_appendf(&trash, "  cs=%p csf=0x%08x state=%s endp=%s,%p,0x%08x sub=%d\n",
+		chunk_appendf(&trash, "  csf=%p flags=0x%08x state=%s endp=%s,%p,0x%08x sub=%d\n",
 			      csf, csf->flags, cs_state_str(csf->state),
-			      (csf->endp->flags & CS_EP_T_MUX ? "CONN" : "APPCTX"),
+			      (csf->endp->flags & CS_EP_T_MUX ? "CONN" : (csf->endp->flags & CS_EP_T_APPLET ? "APPCTX" : "NONE")),
 			      csf->endp->target, csf->endp->flags, csf->wait_event.events);
 
 		if ((conn = cs_conn(csf)) != NULL) {
@@ -3347,9 +3344,9 @@ static int stats_dump_full_strm_to_buffer(struct conn_stream *cs, struct stream 
 		}
 
 		csb = strm->csb;
-		chunk_appendf(&trash, "  cs=%p csb=0x%08x state=%s endp=%s,%p,0x%08x sub=%d\n",
+		chunk_appendf(&trash, "  csb=%p flags=0x%08x state=%s endp=%s,%p,0x%08x sub=%d\n",
 			      csb, csb->flags, cs_state_str(csb->state),
-			      (csb->endp->flags & CS_EP_T_MUX ? "CONN" : "APPCTX"),
+			      (csb->endp->flags & CS_EP_T_MUX ? "CONN" : (csb->endp->flags & CS_EP_T_APPLET ? "APPCTX" : "NONE")),
 			      csb->endp->target, csb->endp->flags, csb->wait_event.events);
 		if ((conn = cs_conn(csb)) != NULL) {
 			chunk_appendf(&trash,

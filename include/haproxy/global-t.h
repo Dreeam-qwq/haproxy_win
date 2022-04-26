@@ -123,6 +123,7 @@ struct global {
 	char *pidfile;
 	char *node, *desc;		/* node name & description */
 	int localpeer_cmdline;		/* whether or not the commandline "-L" was set */
+	int fd_hard_limit;		/* hard limit on ulimit-n : 0=unset */
 	struct buffer log_tag;           /* name for syslog */
 	struct list logsrvs;
 	char *log_send_hostname;   /* set hostname in syslog header */
@@ -154,6 +155,9 @@ struct global {
 		int pool_low_count;   /* max number of opened fd before we stop using new idle connections */
 		int pool_high_count;  /* max number of opened fd before we start killing idle connections when creating new connections */
 		unsigned short idle_timer; /* how long before an empty buffer is considered idle (ms) */
+#ifdef USE_QUIC
+		unsigned int quic_streams_buf;
+#endif /* USE_QUIC */
 	} tune;
 	struct {
 		char *prefix;           /* path prefix of unix bind socket */
