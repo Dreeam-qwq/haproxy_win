@@ -24,7 +24,7 @@ void qcs_notify_recv(struct qcs *qcs);
 void qcs_notify_send(struct qcs *qcs);
 
 int qcc_recv(struct qcc *qcc, uint64_t id, uint64_t len, uint64_t offset,
-             char fin, char *data, struct qcs **out_qcs);
+             char fin, char *data, struct qcs **out_qcs, size_t *done);
 int qcc_recv_max_data(struct qcc *qcc, uint64_t max);
 int qcc_recv_max_stream_data(struct qcc *qcc, uint64_t id, uint64_t max);
 int qcc_decode_qcs(struct qcc *qcc, struct qcs *qcs);
@@ -87,22 +87,6 @@ static inline int qcc_install_app_ops(struct qcc *qcc,
 		qcc->app_ops->finalize(qcc->ctx);
 
 	return 0;
-}
-
-/* Retrieve a qc_stream_desc from the MUX <qcc> with <id>. This function is
- * useful for the transport layer.
- *
- * Returns the stream instance or NULL if not found.
- */
-static inline struct qc_stream_desc *qcc_get_stream(struct qcc *qcc, uint64_t id)
-{
-	struct eb64_node *node;
-
-	node = eb64_lookup(&qcc->streams_by_id, id);
-	if (!node)
-		return NULL;
-
-	return eb64_entry(node, struct qc_stream_desc, by_id);
 }
 
 static inline struct conn_stream *qc_attach_cs(struct qcs *qcs, struct buffer *buf)

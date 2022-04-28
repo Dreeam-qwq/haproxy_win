@@ -105,35 +105,37 @@ INITCALL1(STG_REGISTER, trace_register_source, TRACE_SOURCE);
 struct qcs *qcs_new(struct qcc *qcc, uint64_t id, enum qcs_type type)
 {
 	struct qcs *qcs;
-	struct qc_stream_desc *stream;
 
 	TRACE_ENTER(QMUX_EV_QCS_NEW, qcc->conn);
 
 	qcs = pool_alloc(pool_head_qcs);
 	if (!qcs)
-		goto out;
+		return NULL;
+
+	qcs->stream = NULL;
+	qcs->qcc = qcc;
+	qcs->cs = NULL;
+	qcs->flags = QC_SF_NONE;
+	qcs->ctx = NULL;
 
 	/* allocate transport layer stream descriptor
 	 *
 	 * TODO qc_stream_desc is only useful for Tx buffering. It should not
 	 * be required for unidirectional remote streams.
 	 */
-	stream = qc_stream_desc_new(id, qcs, qcc->conn->handle.qc);
-	if (!stream) {
-		pool_free(pool_head_qcs, qcs);
-		qcs = NULL;
-		goto out;
-	}
+	qcs->stream = qc_stream_desc_new(id, qcs, qcc->conn->handle.qc);
+	if (!qcs->stream)
+		goto err;
 
-	qcs->stream = stream;
-	qcs->qcc = qcc;
-	qcs->cs = NULL;
-	qcs->flags = QC_SF_NONE;
+	if (qcc->app_ops->attach) {
+		if (qcc->app_ops->attach(qcs))
+			goto err;
+	}
 
 	qcs->endp = cs_endpoint_new();
 	if (!qcs->endp) {
 		pool_free(pool_head_qcs, qcs);
-		return NULL;
+		goto err;
 	}
 	qcs->endp->target = qcs;
 	qcs->endp->ctx = qcc->conn;
@@ -155,6 +157,10 @@ struct qcs *qcs_new(struct qcc *qcc, uint64_t id, enum qcs_type type)
 	qcs->rx.offset = 0;
 	qcs->rx.frms = EB_ROOT_UNIQUE;
 
+	/* TODO use uni limit for unidirectional streams */
+	qcs->rx.msd = quic_stream_is_local(qcc, id) ? qcc->lfctl.msd_bidi_l :
+	                                              qcc->lfctl.msd_bidi_r;
+
 	qcs->tx.buf = BUF_NULL;
 	qcs->tx.offset = 0;
 	qcs->tx.sent_offset = 0;
@@ -166,6 +172,16 @@ struct qcs *qcs_new(struct qcc *qcc, uint64_t id, enum qcs_type type)
  out:
 	TRACE_LEAVE(QMUX_EV_QCS_NEW, qcc->conn, qcs);
 	return qcs;
+
+ err:
+	if (qcs->ctx && qcc->app_ops->detach)
+		qcc->app_ops->detach(qcs);
+
+	if (qcs->stream)
+		qc_stream_desc_release(qcs->stream);
+
+	pool_free(pool_head_qcs, qcs);
+	return NULL;
 }
 
 /* Free a qcs. This function must only be done to remove a stream on allocation
@@ -179,6 +195,9 @@ void qcs_free(struct qcs *qcs)
 
 	BUG_ON(!qcs->qcc->strms[qcs_id_type(qcs->id)].nb_streams);
 	--qcs->qcc->strms[qcs_id_type(qcs->id)].nb_streams;
+
+	if (qcs->ctx && qcs->qcc->app_ops->detach)
+		qcs->qcc->app_ops->detach(qcs);
 
 	qc_stream_desc_release(qcs->stream);
 
@@ -325,18 +344,22 @@ struct qcs *qcc_get_qcs(struct qcc *qcc, uint64_t id)
  * <out_qcs>. In case of success, the caller can immediatly call qcc_decode_qcs
  * to process the frame content.
  *
- * Returns 0 on success. On errors, two codes are present.
- * - 1 is returned if the frame cannot be decoded and must be discarded.
- * - 2 is returned if the stream cannot decode at the moment the frame. The
- *   frame should be buffered to be handled later.
+ * Returns a code indicating how the frame was handled.
+ * - 0: frame received completly and can be dropped.
+ * - 1: frame not received but can be dropped.
+ * - 2: frame cannot be handled, either partially or not at all. <done>
+ *   indicated the number of bytes handled. The rest should be buffered.
  */
 int qcc_recv(struct qcc *qcc, uint64_t id, uint64_t len, uint64_t offset,
-             char fin, char *data, struct qcs **out_qcs)
+             char fin, char *data, struct qcs **out_qcs, size_t *done)
 {
 	struct qcs *qcs;
 	size_t total, diff;
 
 	TRACE_ENTER(QMUX_EV_QCC_RECV, qcc->conn);
+
+	*out_qcs = NULL;
+	*done = 0;
 
 	qcs = qcc_get_qcs(qcc, id);
 	if (!qcs) {
@@ -356,8 +379,10 @@ int qcc_recv(struct qcc *qcc, uint64_t id, uint64_t len, uint64_t offset,
 
 	/* Last frame already handled for this stream. */
 	BUG_ON(qcs->flags & QC_SF_FIN_RECV);
+	/* TODO initial max-stream-data overflow. Implement FLOW_CONTROL_ERROR emission. */
+	BUG_ON(offset + len > qcs->rx.msd);
 
-	if (!qc_get_buf(qcs, &qcs->rx.buf)) {
+	if (!qc_get_buf(qcs, &qcs->rx.buf) || b_full(&qcs->rx.buf)) {
 		/* TODO should mark qcs as full */
 		return 2;
 	}
@@ -365,28 +390,27 @@ int qcc_recv(struct qcc *qcc, uint64_t id, uint64_t len, uint64_t offset,
 	TRACE_DEVEL("newly received offset", QMUX_EV_QCC_RECV|QMUX_EV_QCS_RECV, qcc->conn, qcs);
 	diff = qcs->rx.offset - offset;
 
-	/* TODO do not partially copy a frame if not enough size left. Maybe
-	 * this can be optimized.
-	 */
-	if (len > b_room(&qcs->rx.buf)) {
-		/* TODO handle STREAM frames larger than RX buffer. */
-		BUG_ON(len > b_size(&qcs->rx.buf));
-		return 2;
-	}
-
 	len -= diff;
 	data += diff;
 
-	total = b_putblk(&qcs->rx.buf, data, len);
-	/* TODO handle partial copy of a STREAM frame. */
-	BUG_ON(len != total);
+	/* TODO handle STREAM frames larger than RX buffer. */
+	BUG_ON(len > b_size(&qcs->rx.buf));
 
+	total = b_putblk(&qcs->rx.buf, data, len);
 	qcs->rx.offset += total;
+	*done = total;
+
+	/* TODO initial max-stream-data reached. Implement MAX_STREAM_DATA emission. */
+	BUG_ON(qcs->rx.offset == qcs->rx.msd);
+
+	if (total < len) {
+		TRACE_DEVEL("leaving on partially received offset", QMUX_EV_QCC_RECV|QMUX_EV_QCS_RECV, qcc->conn, qcs);
+		return 2;
+	}
 
 	if (fin)
 		qcs->flags |= QC_SF_FIN_RECV;
 
- out:
 	TRACE_LEAVE(QMUX_EV_QCC_RECV, qcc->conn);
 	return 0;
 }
@@ -555,20 +579,13 @@ static void qc_release(struct qcc *qcc)
 	TRACE_LEAVE(QMUX_EV_QCC_END);
 }
 
-/* Prepare a STREAM frame for <qcs> instance. First, transfer data from
- * <payload> to <out> buffer. The STREAM frame payload points to the <out>
- * buffer. The frame is then pushed to <frm_list>. If <fin> is set, and the
- * <payload> buf is emptied after transfer, FIN bit is set on the STREAM frame.
- * Transfer is automatically adjusted to not exceed the stream flow-control
- * limit. <max_data> must contains the current sum offsets for the connection.
- * This is useful to not exceed the connection flow-control limit when using
- * repeatdly this function on multiple streams before passing the data to the
- * lower layer.
+/* Transfer as much as possible data on <qcs> from <in> to <out>. <max_data> is
+ * the current flow-control limit on the connection which must not be exceeded.
  *
- * Returns the total bytes of newly transferred data. It may be 0 if none.
+ * Returns the total bytes of transferred data.
  */
 static int qcs_xfer_data(struct qcs *qcs, struct buffer *out,
-                         struct buffer *payload, uint64_t max_data)
+                         struct buffer *in, uint64_t max_data)
 {
 	struct qcc *qcc = qcs->qcc;
 	int left, to_xfer;
@@ -596,7 +613,7 @@ static int qcs_xfer_data(struct qcs *qcs, struct buffer *out,
 	BUG_ON_HOT(qcs->tx.offset < qcs->tx.sent_offset);
 
 	left = qcs->tx.offset - qcs->tx.sent_offset;
-	to_xfer = QUIC_MIN(b_data(payload), b_room(out));
+	to_xfer = QUIC_MIN(b_data(in), b_room(out));
 
 	BUG_ON_HOT(qcs->tx.offset > qcs->tx.msd);
 	/* do not exceed flow control limit */
@@ -611,7 +628,7 @@ static int qcs_xfer_data(struct qcs *qcs, struct buffer *out,
 	if (!left && !to_xfer)
 		goto out;
 
-	total = b_force_xfer(out, payload, to_xfer);
+	total = b_force_xfer(out, in, to_xfer);
 
  out:
 	{
@@ -625,6 +642,12 @@ static int qcs_xfer_data(struct qcs *qcs, struct buffer *out,
 	return total;
 }
 
+/* Prepare a STREAM frame for <qcs> instance using <out> as payload. The frame
+ * is appended in <frm_list>. Set <fin> if this is supposed to be the last
+ * stream frame.
+ *
+ * Returns the length of the STREAM frame or a negative error code.
+ */
 static int qcs_build_stream_frm(struct qcs *qcs, struct buffer *out, char fin,
                                 struct list *frm_list)
 {
@@ -654,6 +677,7 @@ static int qcs_build_stream_frm(struct qcs *qcs, struct buffer *out, char fin,
 	if (!frm)
 		goto err;
 
+	LIST_INIT(&frm->reflist);
 	frm->type = QUIC_FT_STREAM_8;
 	frm->stream.stream = qcs->stream;
 	frm->stream.id = qcs->id;
@@ -775,7 +799,7 @@ static int qc_send_frames(struct qcc *qcc, struct list *frms)
 	}
 
 	if (!LIST_ISEMPTY(frms))
-		qc_send_app_pkts(qcc->conn->handle.qc, frms);
+		qc_send_app_pkts(qcc->conn->handle.qc, 0, frms);
 
 	/* If there is frames left, check if the transport layer has send some
 	 * data or is blocked.
@@ -822,6 +846,7 @@ static int qc_send_max_streams(struct qcc *qcc)
 	frm = pool_zalloc(pool_head_quic_frame);
 	BUG_ON(!frm); /* TODO handle this properly */
 
+	LIST_INIT(&frm->reflist);
 	frm->type = QUIC_FT_MAX_STREAMS_BIDI;
 	frm->max_streams_bidi.max_streams = qcc->lfctl.ms_bidi +
 	                                    qcc->lfctl.cl_bidi_r;
@@ -889,7 +914,7 @@ static int _qc_send_qcs(struct qcs *qcs, struct list *frms,
 		fin = !!(fin && !b_data(buf));
 
 		ret = qcs_build_stream_frm(qcs, out, fin, frms);
-		BUG_ON(ret < 0); /* TODO handle this properly */
+		if (ret < 0) { ABORT_NOW(); /* TODO handle this properly */ }
 	}
 
 	return xfer;
@@ -1127,6 +1152,8 @@ static int qc_init(struct connection *conn, struct proxy *prx,
 	qcc->strms[QCS_SRV_UNI].tx.max_data = 0;
 
 	qcc->lfctl.ms_bidi = qcc->lfctl.ms_bidi_init = lparams->initial_max_streams_bidi;
+	qcc->lfctl.msd_bidi_l = lparams->initial_max_stream_data_bidi_local;
+	qcc->lfctl.msd_bidi_r = lparams->initial_max_stream_data_bidi_remote;
 	qcc->lfctl.cl_bidi_r = 0;
 
 	rparams = &conn->handle.qc->tx.params;

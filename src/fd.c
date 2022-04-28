@@ -363,6 +363,32 @@ void fd_delete(int fd)
 		_fd_delete_orphan(fd);
 }
 
+/* makes the new fd non-blocking and clears all other O_* flags; this is meant
+ * to be used on new FDs. Returns -1 on failure. The result is disguised at the
+ * end because some callers need to be able to ignore it regardless of the libc
+ * attributes.
+ */
+int fd_set_nonblock(int fd)
+{
+	int ret = fcntl(fd, F_SETFL, O_NONBLOCK);
+
+	return DISGUISE(ret);
+}
+
+/* sets the close-on-exec flag on fd; returns -1 on failure. The result is
+ * disguised at the end because some callers need to be able to ignore it
+ * regardless of the libc attributes.
+ */
+int fd_set_cloexec(int fd)
+{
+	int flags, ret;
+
+	flags = fcntl(fd, F_GETFD);
+	flags |= FD_CLOEXEC;
+	ret = fcntl(fd, F_SETFD, flags);
+	return DISGUISE(ret);
+}
+
 /*
  * Take over a FD belonging to another thread.
  * unexpected_conn is the expected owner of the fd.
@@ -609,7 +635,7 @@ ssize_t fd_write_frag_line(int fd, size_t maxlen, const struct ist pfx[], size_t
 	if (unlikely(!(fdtab[fd].state & FD_INITIALIZED))) {
 		HA_ATOMIC_OR(&fdtab[fd].state, FD_INITIALIZED);
 		if (!isatty(fd))
-			fcntl(fd, F_SETFL, O_NONBLOCK);
+			fd_set_nonblock(fd);
 	}
 	sent = writev(fd, iovec, vec);
 	HA_ATOMIC_BTR(&fdtab[fd].state, FD_EXCL_SYSCALL_BIT);
@@ -767,7 +793,7 @@ static int init_pollers_per_thread()
 
 	poller_rd_pipe = mypipe[0];
 	poller_wr_pipe[tid] = mypipe[1];
-	fcntl(poller_rd_pipe, F_SETFL, O_NONBLOCK);
+	fd_set_nonblock(poller_rd_pipe);
 	fd_insert(poller_rd_pipe, poller_pipe_io_handler, poller_pipe_io_handler, tid_bit);
 	fd_insert(poller_wr_pipe[tid], poller_pipe_io_handler, poller_pipe_io_handler, tid_bit);
 	fd_want_recv(poller_rd_pipe);

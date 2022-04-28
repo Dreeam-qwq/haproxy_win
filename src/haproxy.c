@@ -1608,7 +1608,7 @@ static void init_args(int argc, char **argv)
 				display_version();
 				if (flag[1] == 'v')  /* -vv */
 					display_build_opts();
-				exit(0);
+				deinit_and_exit(0);
 			}
 #if defined(USE_EPOLL)
 			else if (*flag == 'd' && flag[1] == 'e')
@@ -2557,6 +2557,8 @@ void deinit(void)
 	struct post_server_check_fct *pscf, *pscfb;
 	struct post_check_fct *pcf, *pcfb;
 	struct post_proxy_check_fct *ppcf, *ppcfb;
+	struct pre_check_fct *prcf, *prcfb;
+	struct cfg_postparser *pprs, *pprsb;
 	int cur_fd;
 
 	/* At this point the listeners state is weird:
@@ -2712,6 +2714,11 @@ void deinit(void)
 		free(ppcf);
 	}
 
+	list_for_each_entry_safe(prcf, prcfb, &pre_check_list, list) {
+		LIST_DELETE(&prcf->list);
+		free(prcf);
+	}
+
 	list_for_each_entry_safe(tif, tifb, &per_thread_init_list, list) {
 		LIST_DELETE(&tif->list);
 		free(tif);
@@ -2730,6 +2737,11 @@ void deinit(void)
 	list_for_each_entry_safe(tff, tffb, &per_thread_free_list, list) {
 		LIST_DELETE(&tff->list);
 		free(tff);
+	}
+
+	list_for_each_entry_safe(pprs, pprsb, &postparsers, list) {
+		LIST_DELETE(&pprs->list);
+		free(pprs);
 	}
 
 	vars_prune(&proc_vars, NULL, NULL);

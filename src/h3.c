@@ -68,6 +68,13 @@ struct h3 {
 
 DECLARE_STATIC_POOL(pool_head_h3, "h3", sizeof(struct h3));
 
+struct h3s {
+	int demux_frame_len;
+	int demux_frame_type;
+};
+
+DECLARE_STATIC_POOL(pool_head_h3s, "h3s", sizeof(struct h3s));
+
 /* Simple function to duplicate a buffer */
 static inline struct buffer h3_b_dup(struct buffer *b)
 {
@@ -95,7 +102,7 @@ static inline size_t h3_decode_frm_header(uint64_t *ftype, uint64_t *flen,
  * in a local HTX buffer and transfer to the conn-stream layer. <fin> must be
  * set if this is the last data to transfer from this stream.
  *
- * Returns 0 on success else non-zero.
+ * Returns the number of bytes handled or a negative error code.
  */
 static int h3_headers_to_htx(struct qcs *qcs, struct buffer *buf, uint64_t len,
                              char fin)
@@ -112,8 +119,10 @@ static int h3_headers_to_htx(struct qcs *qcs, struct buffer *buf, uint64_t len,
 	struct ist authority = IST_NULL;
 	int hdr_idx;
 
+	/* TODO support buffer wrapping */
+	BUG_ON(b_contig_data(buf, 0) != b_data(buf));
 	if (qpack_decode_fs((const unsigned char *)b_head(buf), len, tmp, list) < 0)
-		return 1;
+		return -1;
 
 	qc_get_buf(qcs, &htx_buf);
 	BUG_ON(!b_size(&htx_buf));
@@ -141,10 +150,11 @@ static int h3_headers_to_htx(struct qcs *qcs, struct buffer *buf, uint64_t len,
 	}
 
 	flags |= HTX_SL_F_VER_11;
+	flags |= HTX_SL_F_XFER_LEN;
 
 	sl = htx_add_stline(htx, HTX_BLK_REQ_SL, flags, meth, path, ist("HTTP/3.0"));
 	if (!sl)
-		return 1;
+		return -1;
 
 	if (fin)
 		sl->flags |= HTX_SL_F_BODYLESS;
@@ -175,7 +185,7 @@ static int h3_headers_to_htx(struct qcs *qcs, struct buffer *buf, uint64_t len,
 
 	cs = qc_attach_cs(qcs, &htx_buf);
 	if (!cs)
-		return 1;
+		return -1;
 
 	/* buffer is transferred to conn_stream and set to NULL
 	 * except on stream creation error.
@@ -183,42 +193,61 @@ static int h3_headers_to_htx(struct qcs *qcs, struct buffer *buf, uint64_t len,
 	b_free(&htx_buf);
 	offer_buffers(NULL, 1);
 
-	return 0;
+	return len;
 }
 
 /* Copy from buffer <buf> a H3 DATA frame of length <len> in QUIC stream <qcs>
  * HTX buffer. <fin> must be set if this is the last data to transfer from this
  * stream.
  *
- * Returns 0 on success else non-zero
+ * Returns the number of bytes handled or a negative error code.
  */
 static int h3_data_to_htx(struct qcs *qcs, struct buffer *buf, uint64_t len,
                           char fin)
 {
 	struct buffer *appbuf;
 	struct htx *htx = NULL;
-	size_t htx_sent;
+	size_t contig = 0, htx_sent = 0;
 	int htx_space;
+	char *head;
 
 	appbuf = qc_get_buf(qcs, &qcs->rx.app_buf);
 	BUG_ON(!appbuf);
 	htx = htx_from_buf(appbuf);
 
+	if (len > b_data(buf)) {
+		len = b_data(buf);
+		fin = 0;
+	}
+
+	head = b_head(buf);
+ retry:
 	htx_space = htx_free_data_space(htx);
-	if (!htx_space || htx_space < len) {
-		ABORT_NOW(); /* TODO handle this case properly */
+	if (!htx_space)
+		goto out;
+
+	if (len > htx_space) {
+		len = htx_space;
+		fin = 0;
 	}
 
-	htx_sent = htx_add_data(htx, ist2(b_head(buf), len));
-	if (htx_sent < len) {
-		ABORT_NOW(); /* TODO handle this case properly */
+	contig = b_contig_data(buf, contig);
+	if (len > contig) {
+		htx_sent = htx_add_data(htx, ist2(b_head(buf), contig));
+		head = b_orig(buf);
+		len -= contig;
+		goto retry;
 	}
 
-	if (fin)
+	htx_sent += htx_add_data(htx, ist2(head, len));
+	BUG_ON(htx_sent < len);
+
+	if (fin && len == htx_sent)
 		htx->flags |= HTX_FL_EOM;
-	htx_to_buf(htx, appbuf);
 
-	return 0;
+ out:
+	htx_to_buf(htx, appbuf);
+	return htx_sent;
 }
 
 /* Decode <qcs> remotely initiated bidi-stream. <fin> must be set to indicate
@@ -228,57 +257,73 @@ static int h3_data_to_htx(struct qcs *qcs, struct buffer *buf, uint64_t len,
 static int h3_decode_qcs(struct qcs *qcs, int fin, void *ctx)
 {
 	struct buffer *rxbuf = &qcs->rx.buf;
-	int ret;
+	struct h3s *h3s = qcs->ctx;
+	ssize_t ret;
 
 	h3_debug_printf(stderr, "%s: STREAM ID: %lu\n", __func__, qcs->id);
 	if (!b_data(rxbuf))
 		return 0;
 
 	while (b_data(rxbuf)) {
-		size_t hlen;
 		uint64_t ftype, flen;
 		struct buffer b;
 		char last_stream_frame = 0;
 
 		/* Work on a copy of <rxbuf> */
 		b = h3_b_dup(rxbuf);
-		hlen = h3_decode_frm_header(&ftype, &flen, &b);
-		if (!hlen)
-			break;
+		if (!h3s->demux_frame_len) {
+			size_t hlen = h3_decode_frm_header(&ftype, &flen, &b);
+			if (!hlen)
+				break;
 
-		h3_debug_printf(stderr, "%s: ftype: %llu, flen: %llu\n", __func__,
-		        (unsigned long long)ftype, (unsigned long long)flen);
+			h3_debug_printf(stderr, "%s: ftype: %lu, flen: %lu\n",
+			                __func__, ftype, flen);
+
+			b_del(rxbuf, hlen);
+			h3s->demux_frame_type = ftype;
+			h3s->demux_frame_len = flen;
+		}
+
+		flen = h3s->demux_frame_len;
+		ftype = h3s->demux_frame_type;
 		if (flen > b_data(&b) && !b_full(rxbuf))
 			break;
-
-		/* TODO handle full rxbuf */
-		BUG_ON(flen > b_size(rxbuf));
-
-		b_del(rxbuf, hlen);
 		last_stream_frame = (fin && flen == b_data(rxbuf));
 
 		switch (ftype) {
 		case H3_FT_DATA:
 			ret = h3_data_to_htx(qcs, rxbuf, flen, last_stream_frame);
 			/* TODO handle error reporting. Stream closure required. */
-			if (ret) { ABORT_NOW(); }
+			if (ret < 0) { ABORT_NOW(); }
 			break;
 		case H3_FT_HEADERS:
 			ret = h3_headers_to_htx(qcs, rxbuf, flen, last_stream_frame);
 			/* TODO handle error reporting. Stream closure required. */
-			if (ret) { ABORT_NOW(); }
+			if (ret < 0) { ABORT_NOW(); }
 			break;
 		case H3_FT_PUSH_PROMISE:
 			/* Not supported */
+			ret = MIN(b_data(rxbuf), flen);
 			break;
 		default:
 			/* draft-ietf-quic-http34 9. Extensions to HTTP/3
 			 * unknown frame types MUST be ignored
 			 */
 			h3_debug_printf(stderr, "ignore unknown frame type 0x%lx\n", ftype);
+			ret = MIN(b_data(rxbuf), flen);
 		}
-		b_del(rxbuf, flen);
+
+		if (!ret)
+			break;
+
+		b_del(rxbuf, ret);
+		BUG_ON(h3s->demux_frame_len < ret);
+		h3s->demux_frame_len -= ret;
 	}
+
+	/* TODO may be useful to wakeup the MUX if blocked due to full buffer.
+	 * However, currently, io-cb of MUX does not handle Rx.
+	 */
 
 	return 0;
 }
@@ -703,6 +748,21 @@ size_t h3_snd_buf(struct conn_stream *cs, struct buffer *buf, size_t count, int 
 	return total;
 }
 
+static int h3_attach(struct qcs *qcs)
+{
+	struct h3s *h3s;
+
+	h3s = pool_alloc(pool_head_h3s);
+	if (!h3s)
+		return 1;
+
+	qcs->ctx = h3s;
+	h3s->demux_frame_len = 0;
+	h3s->demux_frame_type = 0;
+
+	return 0;
+}
+
 /* Finalize the initialization of remotely initiated uni-stream <qcs>.
  * Return 1 if succeeded, 0 if not. In this latter case, set the ->err h3 error
  * to inform the QUIC mux layer of the encountered error.
@@ -761,6 +821,13 @@ static int h3_attach_ruqs(struct qcs *qcs, void *ctx)
 	}
 
 	return 1;
+}
+
+static void h3_detach(struct qcs *qcs)
+{
+	struct h3s *h3s = qcs->ctx;
+	pool_free(pool_head_h3s, h3s);
+	qcs->ctx = NULL;
 }
 
 static int h3_finalize(void *ctx)
@@ -911,9 +978,11 @@ static int h3_is_active(const struct qcc *qcc, void *ctx)
 /* HTTP/3 application layer operations */
 const struct qcc_app_ops h3_ops = {
 	.init        = h3_init,
+	.attach      = h3_attach,
 	.attach_ruqs = h3_attach_ruqs,
 	.decode_qcs  = h3_decode_qcs,
 	.snd_buf     = h3_snd_buf,
+	.detach      = h3_detach,
 	.finalize    = h3_finalize,
 	.is_active   = h3_is_active,
 	.release     = h3_release,

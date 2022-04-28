@@ -393,6 +393,8 @@ struct quic_arngs {
 #define QUIC_FL_PKTNS_PKT_RECEIVED  (1UL << 0)
 /* Flag the packet number space as requiring an ACK frame to be sent. */
 #define QUIC_FL_PKTNS_ACK_REQUIRED  (1UL << 1)
+/* Flag the packet number space as needing probing */
+#define QUIC_FL_PKTNS_PROBE_NEEDED  (1UL << 2)
 
 /* The maximum number of dgrams which may be sent upon PTO expirations. */
 #define QUIC_MAX_NB_PTO_DGRAMS         2
@@ -518,6 +520,10 @@ struct quic_rx_strm_frm {
 #define QUIC_FL_TX_PACKET_CC            (1UL << 2)
 /* Flag a sent packet as containg an ACK frame */
 #define QUIC_FL_TX_PACKET_ACK           (1UL << 3)
+/* Flag a sent packet as being coalesced to another one in the same datagram */
+#define QUIC_FL_TX_PACKET_COALESCED     (1UL << 4)
+/* Flag a sent packet as being probing with old data */
+#define QUIC_FL_TX_PACKET_PROBE_WITH_OLD_DATA (1UL << 5)
 
 /* Structure to store enough information about TX QUIC packets. */
 struct quic_tx_packet {
@@ -664,6 +670,8 @@ enum qc_mux_state {
 #define QUIC_FL_CONN_LISTENER                    (1U << 3)
 #define QUIC_FL_CONN_ACCEPT_REGISTERED           (1U << 4)
 #define QUIC_FL_CONN_IDLE_TIMER_RESTARTED_AFTER_READ (1U << 6)
+#define QUIC_FL_CONN_RETRANS_NEEDED              (1U << 7)
+#define QUIC_FL_CONN_RETRANS_OLD_DATA            (1U << 8)
 #define QUIC_FL_CONN_NOTIFY_CLOSE                (1U << 27) /* MUX notified about quic-conn imminent closure (idle-timeout or CONNECTION_CLOSE emission/reception) */
 #define QUIC_FL_CONN_EXP_TIMER                   (1U << 28) /* timer has expired, quic-conn can be freed */
 #define QUIC_FL_CONN_CLOSING                     (1U << 29)

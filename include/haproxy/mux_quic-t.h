@@ -52,6 +52,8 @@ struct qcc {
 	struct {
 		uint64_t ms_bidi_init; /* max initial sub-ID of bidi stream allowed for the peer */
 		uint64_t ms_bidi; /* max sub-ID of bidi stream allowed for the peer */
+		uint64_t msd_bidi_l; /* initial max-stream-data on local streams */
+		uint64_t msd_bidi_r; /* initial max-stream-data on remote streams */
 		uint64_t cl_bidi_r; /* total count of closed remote bidi stream since last MAX_STREAMS emission */
 	} lfctl;
 
@@ -96,12 +98,14 @@ struct qcs {
 	struct conn_stream *cs;
 	struct cs_endpoint *endp;
 	uint32_t flags;      /* QC_SF_* */
+	void *ctx;           /* app-ops context */
 
 	struct {
 		struct eb_root frms; /* received frames ordered by their offsets */
 		uint64_t offset; /* the current offset of received data */
 		struct buffer buf; /* receive buffer, always valid (buf_empty or real buffer) */
 		struct buffer app_buf; /* receive buffer used by conn_stream layer */
+		uint64_t msd; /* fctl bytes limit to enforce */
 	} rx;
 	struct {
 		uint64_t offset; /* last offset of data ready to be sent */
@@ -123,9 +127,11 @@ struct qcs {
 /* QUIC application layer operations */
 struct qcc_app_ops {
 	int (*init)(struct qcc *qcc);
+	int (*attach)(struct qcs *qcs);
 	int (*attach_ruqs)(struct qcs *qcs, void *ctx);
 	int (*decode_qcs)(struct qcs *qcs, int fin, void *ctx);
 	size_t (*snd_buf)(struct conn_stream *cs, struct buffer *buf, size_t count, int flags);
+	void (*detach)(struct qcs *qcs);
 	int (*finalize)(void *ctx);
 	int (*is_active)(const struct qcc *qcc, void *ctx);
 	void (*release)(void *ctx);
