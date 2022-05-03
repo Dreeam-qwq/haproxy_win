@@ -211,6 +211,8 @@ static int uxst_connect_server(struct connection *conn, int flags)
 	struct server *srv;
 	struct proxy *be;
 
+	BUG_ON(!conn->dst);
+
 	switch (obj_type(conn->target)) {
 	case OBJ_TYPE_PROXY:
 		be = __objt_proxy(conn->target);
@@ -333,8 +335,6 @@ static int uxst_connect_server(struct connection *conn, int flags)
 		 */
 		conn->flags &= ~CO_FL_WAIT_L4_CONN;
 	}
-
-	conn->flags |= CO_FL_ADDR_TO_SET;
 
 	/* Prepare to send a few handshakes related to the on-wire protocol. */
 	if (conn->send_proxy_ofs)

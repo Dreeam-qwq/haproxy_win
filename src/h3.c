@@ -223,8 +223,10 @@ static int h3_data_to_htx(struct qcs *qcs, struct buffer *buf, uint64_t len,
 	head = b_head(buf);
  retry:
 	htx_space = htx_free_data_space(htx);
-	if (!htx_space)
+	if (!htx_space) {
+		qcs->flags |= QC_SF_DEM_FULL;
 		goto out;
+	}
 
 	if (len > htx_space) {
 		len = htx_space;
@@ -264,7 +266,7 @@ static int h3_decode_qcs(struct qcs *qcs, int fin, void *ctx)
 	if (!b_data(rxbuf))
 		return 0;
 
-	while (b_data(rxbuf)) {
+	while (b_data(rxbuf) && !(qcs->flags & QC_SF_DEM_FULL)) {
 		uint64_t ftype, flen;
 		struct buffer b;
 		char last_stream_frame = 0;
@@ -313,12 +315,11 @@ static int h3_decode_qcs(struct qcs *qcs, int fin, void *ctx)
 			ret = MIN(b_data(rxbuf), flen);
 		}
 
-		if (!ret)
-			break;
-
-		b_del(rxbuf, ret);
-		BUG_ON(h3s->demux_frame_len < ret);
-		h3s->demux_frame_len -= ret;
+		if (ret) {
+			b_del(rxbuf, ret);
+			BUG_ON(h3s->demux_frame_len < ret);
+			h3s->demux_frame_len -= ret;
+		}
 	}
 
 	/* TODO may be useful to wakeup the MUX if blocked due to full buffer.

@@ -1721,7 +1721,6 @@ static inline void qc_requeue_nacked_pkt_tx_frms(struct quic_conn *qc,
 				/* Mark this STREAM frame as lost. A look up their stream descriptor
 				 * will be performed to check the stream is not consumed or released.
 				 */
-				fprintf(stderr, "LOST STREAM FRAME\n");
 				frm->flags = QUIC_FL_TX_FRAME_LOST;
 			}
 			LIST_APPEND(&tmp, &frm->list);
@@ -1905,64 +1904,6 @@ static inline void qc_release_lost_pkts(struct quic_conn *qc,
 		if (newest_lost != oldest_lost)
 			quic_tx_packet_refdec(newest_lost);
 	}
-}
-
-/* Look for packet loss from sent packets for <qel> encryption level of a
- * connection with <ctx> as I/O handler context. If remove is true, remove them from
- * their tree if deemed as lost or set the <loss_time> value the packet number
- * space if any not deemed lost.
- * Should be called after having received an ACK frame with newly acknowledged
- * packets or when the the loss detection timer has expired.
- * Always succeeds.
- */
-static void qc_packet_loss_lookup(struct quic_pktns *pktns,
-                                  struct quic_conn *qc,
-                                  struct list *lost_pkts)
-{
-	struct eb_root *pkts;
-	struct eb64_node *node;
-	struct quic_loss *ql;
-	unsigned int loss_delay;
-
-	TRACE_ENTER(QUIC_EV_CONN_PKTLOSS, qc, pktns);
-	pkts = &pktns->tx.pkts;
-	pktns->tx.loss_time = TICK_ETERNITY;
-	if (eb_is_empty(pkts))
-		goto out;
-
-	ql = &qc->path->loss;
-	loss_delay = QUIC_MAX(ql->latest_rtt, ql->srtt >> 3);
-	loss_delay = QUIC_MAX(loss_delay, MS_TO_TICKS(QUIC_TIMER_GRANULARITY));
-
-	node = eb64_first(pkts);
-	while (node) {
-		struct quic_tx_packet *pkt;
-		int64_t largest_acked_pn;
-		unsigned int loss_time_limit, time_sent;
-
-		pkt = eb64_entry(&node->node, struct quic_tx_packet, pn_node);
-		largest_acked_pn = pktns->rx.largest_acked_pn;
-		node = eb64_next(node);
-		if ((int64_t)pkt->pn_node.key > largest_acked_pn)
-			break;
-
-		time_sent = pkt->time_sent;
-		loss_time_limit = tick_add(time_sent, loss_delay);
-		if (tick_is_le(time_sent, now_ms) ||
-			(int64_t)largest_acked_pn >= pkt->pn_node.key + QUIC_LOSS_PACKET_THRESHOLD) {
-			eb64_delete(&pkt->pn_node);
-			LIST_APPEND(lost_pkts, &pkt->list);
-		}
-		else {
-			if (tick_isset(pktns->tx.loss_time))
-				pktns->tx.loss_time = tick_first(pktns->tx.loss_time, loss_time_limit);
-			else
-				pktns->tx.loss_time = loss_time_limit;
-		}
-	}
-
- out:
-	TRACE_LEAVE(QUIC_EV_CONN_PKTLOSS, qc, pktns, lost_pkts);
 }
 
 /* Parse ACK frame into <frm> from a buffer at <buf> address with <end> being at
@@ -2255,14 +2196,16 @@ static int qc_handle_bidi_strm_frm(struct quic_rx_packet *pkt,
 	               strm_frm->offset.key, strm_frm->fin,
 	               (char *)strm_frm->data, &qcs, &done);
 
-	/* invalid or already received frame */
+	/* invalid frame */
 	if (ret == 1)
+		return 0;
+
+	/* already fully received offset */
+	if (ret == 0 && done == 0)
 		return 1;
 
+	/* frame not handled (partially or completely) must be buffered */
 	if (ret == 2) {
-		/* frame cannot be parsed at the moment and should be
-		 * buffered.
-		 */
 		frm = new_quic_rx_strm_frm(strm_frm, pkt);
 		if (!frm) {
 			TRACE_PROTO("Could not alloc RX STREAM frame",
@@ -2270,6 +2213,7 @@ static int qc_handle_bidi_strm_frm(struct quic_rx_packet *pkt,
 			return 0;
 		}
 
+		/* frame partially handled by the MUX */
 		if (done) {
 			BUG_ON(done >= frm->len); /* must never happen */
 			frm->len -= done;
@@ -2304,6 +2248,8 @@ static int qc_handle_bidi_strm_frm(struct quic_rx_packet *pkt,
 		ret = qcc_recv(qc->qcc, qcs->id, frm->len,
 		               frm->offset_node.key, frm->fin,
 		               (char *)frm->data, &qcs, &done);
+
+		BUG_ON(ret == 1); /* must never happen for buffered frames */
 
 		/* interrupt the parsing if the frame cannot be handled
 		 * entirely for the moment only.
@@ -2423,10 +2369,22 @@ static int qc_handle_uni_strm_frm(struct quic_rx_packet *pkt,
 	return 1;
 }
 
+/* Returns 1 on success or 0 on error. On error, the packet containing the
+ * frame must not be acknowledged.
+ */
 static inline int qc_handle_strm_frm(struct quic_rx_packet *pkt,
                                      struct quic_stream *strm_frm,
                                      struct quic_conn *qc)
 {
+	/* RFC9000 13.1.  Packet Processing
+	 *
+	 * A packet MUST NOT be acknowledged until packet protection has been
+	 * successfully removed and all frames contained in the packet have
+	 * been processed. For STREAM frames, this means the data has been
+	 * enqueued in preparation to be received by the application protocol,
+	 * but it does not require that data be delivered and consumed.
+	 */
+
 	if (strm_frm->id & QCS_ID_DIR_BIT)
 		return qc_handle_uni_strm_frm(pkt, strm_frm, qc);
 	else
@@ -2731,6 +2689,7 @@ static int qc_parse_pkt_frms(struct quic_rx_packet *pkt, struct ssl_sock_ctx *ct
 		case QUIC_FT_STREAM_8 ... QUIC_FT_STREAM_F:
 		{
 			struct quic_stream *stream = &frm.stream;
+			unsigned nb_streams = qc->rx.strms[qcs_id_type(stream->id)].nb_streams;
 
 			if (qc_is_listener(ctx->qc)) {
 				if (stream->id & QUIC_STREAM_FRAME_ID_INITIATOR_BIT)
@@ -2738,9 +2697,17 @@ static int qc_parse_pkt_frms(struct quic_rx_packet *pkt, struct ssl_sock_ctx *ct
 			} else if (!(stream->id & QUIC_STREAM_FRAME_ID_INITIATOR_BIT))
 				goto err;
 
-			/* At the application layer the connection may have already been closed. */
-			if (qc->mux_state != QC_MUX_READY)
-				break;
+			/* The upper layer may not be allocated. */
+			if (qc->mux_state != QC_MUX_READY) {
+				if ((stream->id >> QCS_ID_TYPE_SHIFT) < nb_streams) {
+					TRACE_PROTO("Already closed stream", QUIC_EV_CONN_PRSHPKT, qc);
+					break;
+				}
+				else {
+					TRACE_PROTO("Stream not found", QUIC_EV_CONN_PRSHPKT, qc);
+					goto err;
+				}
+			}
 
 			if (!qc_handle_strm_frm(pkt, stream, qc))
 				goto err;
@@ -4005,11 +3972,25 @@ struct task *quic_conn_io_cb(struct task *t, void *context, unsigned int state)
 	    !(qc->flags & QUIC_FL_CONN_IMMEDIATE_CLOSE))
 		goto out;
 
-	if (zero_rtt && next_qel && !MT_LIST_ISEMPTY(&next_qel->rx.pqpkts) &&
-	    (next_qel->tls_ctx.flags & QUIC_FL_TLS_SECRETS_SET)) {
-		qel = next_qel;
-		next_qel = NULL;
-		goto next_level;
+	if (next_qel && next_qel == &qc->els[QUIC_TLS_ENC_LEVEL_EARLY_DATA] &&
+	    !MT_LIST_ISEMPTY(&next_qel->rx.pqpkts)) {
+	    if ((next_qel->tls_ctx.flags & QUIC_FL_TLS_SECRETS_SET)) {
+			qel = next_qel;
+			next_qel = NULL;
+			goto next_level;
+		}
+		else {
+			struct quic_rx_packet *pkt;
+			struct mt_list *elt1, elt2;
+			struct quic_enc_level *aqel = &qc->els[QUIC_TLS_ENC_LEVEL_EARLY_DATA];
+
+			/* Drop these 0-RTT packets */
+			TRACE_PROTO("drop all 0-RTT packets", QUIC_EV_CONN_PHPKTS, qc);
+			mt_list_for_each_entry_safe(pkt, &aqel->rx.pqpkts, list, elt1, elt2) {
+				MT_LIST_DELETE_SAFE(elt1);
+				quic_rx_packet_refdec(pkt);
+			}
+		}
 	}
 
 	st = qc->state;
@@ -4390,6 +4371,8 @@ static struct quic_conn *qc_new_conn(unsigned int version, int ipv4,
 	/* RX part. */
 	qc->rx.bytes = 0;
 	qc->rx.buf = b_make(buf_area, QUIC_CONN_RX_BUFSZ, 0, 0);
+	for (i = 0; i < QCS_MAX_TYPES; i++)
+		qc->rx.strms[i].nb_streams = 0;
 
 	qc->nb_pkt_for_cc = 1;
 	qc->nb_pkt_since_cc = 0;

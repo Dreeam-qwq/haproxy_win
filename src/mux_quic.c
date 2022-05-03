@@ -123,7 +123,7 @@ struct qcs *qcs_new(struct qcc *qcc, uint64_t id, enum qcs_type type)
 	 * TODO qc_stream_desc is only useful for Tx buffering. It should not
 	 * be required for unidirectional remote streams.
 	 */
-	qcs->stream = qc_stream_desc_new(id, qcs, qcc->conn->handle.qc);
+	qcs->stream = qc_stream_desc_new(id, type, qcs, qcc->conn->handle.qc);
 	if (!qcs->stream)
 		goto err;
 
@@ -345,7 +345,7 @@ struct qcs *qcc_get_qcs(struct qcc *qcc, uint64_t id)
  * to process the frame content.
  *
  * Returns a code indicating how the frame was handled.
- * - 0: frame received completly and can be dropped.
+ * - 0: frame received completely and can be dropped.
  * - 1: frame not received but can be dropped.
  * - 2: frame cannot be handled, either partially or not at all. <done>
  *   indicated the number of bytes handled. The rest should be buffered.
@@ -363,8 +363,14 @@ int qcc_recv(struct qcc *qcc, uint64_t id, uint64_t len, uint64_t offset,
 
 	qcs = qcc_get_qcs(qcc, id);
 	if (!qcs) {
-		TRACE_DEVEL("leaving on stream not found", QMUX_EV_QCC_RECV|QMUX_EV_QCC_NQCS, qcc->conn, NULL, &id);
-		return 1;
+		if ((id >> QCS_ID_TYPE_SHIFT) <= qcc->strms[qcs_id_type(id)].largest_id) {
+			TRACE_DEVEL("already released stream", QMUX_EV_QCC_RECV|QMUX_EV_QCC_NQCS, qcc->conn, NULL, &id);
+			return 0;
+		}
+		else {
+			TRACE_DEVEL("leaving on stream not found", QMUX_EV_QCC_RECV|QMUX_EV_QCC_NQCS, qcc->conn, NULL, &id);
+			return 1;
+		}
 	}
 
 	*out_qcs = qcs;
@@ -374,7 +380,7 @@ int qcc_recv(struct qcc *qcc, uint64_t id, uint64_t len, uint64_t offset,
 
 	if (offset + len <= qcs->rx.offset) {
 		TRACE_DEVEL("leaving on already received offset", QMUX_EV_QCC_RECV|QMUX_EV_QCS_RECV, qcc->conn, qcs);
-		return 1;
+		return 0;
 	}
 
 	/* Last frame already handled for this stream. */
@@ -1308,8 +1314,13 @@ static size_t qc_rcv_buf(struct conn_stream *cs, struct buffer *buf,
 		}
 	}
 
-	if (ret)
+	/* TODO QUIC MUX iocb does not treat RX : following wake-up is thus
+	 * useless for the moment. This may causes freezing transfer on POST.
+	 */
+	if (ret) {
+		qcs->flags &= ~QC_SF_DEM_FULL;
 		tasklet_wakeup(qcs->qcc->wait_event.tasklet);
+	}
 
 	TRACE_LEAVE(QMUX_EV_STRM_RECV, qcs->qcc->conn, qcs);
 

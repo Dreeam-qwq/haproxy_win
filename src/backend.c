@@ -866,7 +866,8 @@ out_ok:
  * The address is taken from the currently assigned server, or from the
  * dispatch or transparent address.
  *
- * Returns SRV_STATUS_OK on success.
+ * Returns SRV_STATUS_OK on success. Does nothing if the address was
+ * already set.
  * On error, no address is allocated and SRV_STATUS_INTERNAL is returned.
  */
 static int alloc_dst_address(struct sockaddr_storage **ss,
@@ -874,7 +875,9 @@ static int alloc_dst_address(struct sockaddr_storage **ss,
 {
 	const struct sockaddr_storage *dst;
 
-	*ss = NULL;
+	if (*ss)
+		return SRV_STATUS_OK;
+
 	if ((s->flags & SF_DIRECT) || (s->be->lbprm.algo & BE_LB_KIND)) {
 		/* A server is necessarily known for this stream */
 		if (!(s->flags & SF_ASSIGNED))
@@ -1070,7 +1073,8 @@ int assign_server_and_queue(struct stream *s)
  * with transparent mode.
  *
  * Returns SRV_STATUS_OK if no transparent mode or the address was successfully
- * allocated. Otherwise returns SRV_STATUS_INTERNAL.
+ * allocated. Otherwise returns SRV_STATUS_INTERNAL. Does nothing if the
+ * address was already allocated.
  */
 static int alloc_bind_address(struct sockaddr_storage **ss,
                               struct server *srv, struct stream *s)
@@ -1083,7 +1087,8 @@ static int alloc_bind_address(struct sockaddr_storage **ss,
 	size_t vlen;
 #endif
 
-	*ss = NULL;
+	if (*ss)
+		return SRV_STATUS_OK;
 
 #if defined(CONFIG_HAP_TRANSPARENT)
 	if (srv && srv->conn_src.opts & CO_SRC_BIND)
@@ -1335,7 +1340,7 @@ static int connect_server(struct stream *s)
 #ifdef USE_OPENSSL
 	struct sample *sni_smp = NULL;
 #endif
-	struct sockaddr_storage *bind_addr;
+	struct sockaddr_storage *bind_addr = NULL;
 	int proxy_line_ret;
 	int64_t hash = 0;
 	struct conn_hash_params hash_params;
@@ -1344,13 +1349,9 @@ static int connect_server(struct stream *s)
 	 * it can be NULL for dispatch mode or transparent backend */
 	srv = objt_server(s->target);
 
-	if (!(s->flags & SF_ADDR_SET)) {
-		err = alloc_dst_address(&s->csb->dst, srv, s);
-		if (err != SRV_STATUS_OK)
-			return SF_ERR_INTERNAL;
-
-		s->flags |= SF_ADDR_SET;
-	}
+	err = alloc_dst_address(&s->csb->dst, srv, s);
+	if (err != SRV_STATUS_OK)
+		return SF_ERR_INTERNAL;
 
 	err = alloc_bind_address(&bind_addr, srv, s);
 	if (err != SRV_STATUS_OK)
@@ -1577,6 +1578,7 @@ static int connect_server(struct stream *s)
 					srv_conn = NULL;
 					if (cs_reset_endp(s->csb) < 0)
 						return SF_ERR_INTERNAL;
+					s->csb->endp->flags &= CS_EP_DETACHED;
 				}
 			}
 			else
@@ -1898,7 +1900,7 @@ int srv_redispatch_connect(struct stream *s)
 		 */
 		if (((s->flags & (SF_DIRECT|SF_FORCE_PRST)) == SF_DIRECT) &&
 		    (s->be->options & PR_O_REDISP)) {
-			s->flags &= ~(SF_DIRECT | SF_ASSIGNED | SF_ADDR_SET);
+			s->flags &= ~(SF_DIRECT | SF_ASSIGNED);
 			sockaddr_free(&s->csb->dst);
 			goto redispatch;
 		}

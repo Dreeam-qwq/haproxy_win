@@ -12,7 +12,6 @@
 #include <haproxy/connection-t.h>
 #include <haproxy/list-t.h>
 #include <haproxy/quic_stream-t.h>
-#include <haproxy/xprt_quic-t.h>
 #include <haproxy/conn_stream-t.h>
 
 /* Stream types */
@@ -92,6 +91,7 @@ struct qcc {
 #define QC_SF_BLK_MROOM         0x00000004  /* app layer is blocked waiting for room in the qcs.tx.buf */
 #define QC_SF_DETACH            0x00000008  /* cs is detached but there is remaining data to send */
 #define QC_SF_BLK_SFCTL         0x00000010  /* stream blocked due to stream flow control limit */
+#define QC_SF_DEM_FULL          0x00000020  /* demux blocked on request channel buffer full */
 
 struct qcs {
 	struct qcc *qcc;

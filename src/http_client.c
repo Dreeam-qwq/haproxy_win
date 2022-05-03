@@ -536,7 +536,7 @@ struct appctx *httpclient_start(struct httpclient *hc)
 
 	s->csb->dst = addr;
 	s->csb->flags |= CS_FL_NOLINGER;
-	s->flags |= SF_ASSIGNED|SF_ADDR_SET;
+	s->flags |= SF_ASSIGNED;
 	s->res.flags |= CF_READ_DONTWAIT;
 
 	/* applet is waiting for data */
@@ -652,11 +652,9 @@ static void httpclient_applet_io_handler(struct appctx *appctx)
 	struct htx_blk *blk = NULL;
 	struct htx *htx;
 	struct htx_sl *sl = NULL;
-	int32_t pos;
 	uint32_t hdr_num;
 	uint32_t sz;
 	int ret;
-
 
 	while (1) {
 
@@ -718,7 +716,7 @@ static void httpclient_applet_io_handler(struct appctx *appctx)
 						} else {
 							struct htx_ret ret;
 
-							ret = htx_xfer_blks(htx, hc_htx, hc_htx->data, HTX_BLK_UNUSED);
+							ret = htx_xfer_blks(htx, hc_htx, htx_used_space(hc_htx), HTX_BLK_UNUSED);
 							channel_add_input(req, ret.ret);
 
 							/* we must copy the EOM if we empty the buffer */
@@ -767,7 +765,7 @@ static void httpclient_applet_io_handler(struct appctx *appctx)
 				hc->res.vsn = istdup(htx_sl_res_vsn(sl));
 				hc->res.reason = istdup(htx_sl_res_reason(sl));
 				sz = htx_get_blksz(blk);
-				co_set_data(res, co_data(res) - sz);
+				c_rew(res, sz);
 				htx_remove_blk(htx, blk);
 				/* caller callback */
 				if (hc->ops.res_stline)
@@ -797,33 +795,25 @@ static void httpclient_applet_io_handler(struct appctx *appctx)
 						goto more;
 
 					hdr_num = 0;
-
-					for (pos = htx_get_head(htx);  pos != -1; pos = htx_get_next(htx, pos)) {
-						struct htx_blk *blk = htx_get_blk(htx, pos);
+					blk = htx_get_head_blk(htx);
+					while (blk) {
 						enum htx_blk_type type = htx_get_blk_type(blk);
 						uint32_t sz = htx_get_blksz(blk);
 
-						if (type == HTX_BLK_UNUSED) {
-							c_rew(res, sz);
-							htx_remove_blk(htx, blk);
-						}
+						c_rew(res, sz);
+						blk = htx_remove_blk(htx, blk);
 
-						if (type == HTX_BLK_HDR) {
+						if (type == HTX_BLK_UNUSED)
+							continue;
+						else if (type == HTX_BLK_HDR) {
 							hdrs[hdr_num].n = istdup(htx_get_blk_name(htx, blk));
 							hdrs[hdr_num].v = istdup(htx_get_blk_value(htx, blk));
-							if (!isttest(hdrs[hdr_num].v) || !isttest(hdrs[hdr_num].n))
-								goto end;
-							c_rew(res, sz);
-							htx_remove_blk(htx, blk);
 							hdr_num++;
 						}
-
-						/* create a NULL end of array and leave the loop */
-						if (type == HTX_BLK_EOH) {
+						else if (type == HTX_BLK_EOH) {
+							/* create a NULL end of array and leave the loop */
 							hdrs[hdr_num].n = IST_NULL;
 							hdrs[hdr_num].v = IST_NULL;
-							c_rew(res, sz);
-							htx_remove_blk(htx, blk);
 							break;
 						}
 					}
@@ -869,8 +859,8 @@ static void httpclient_applet_io_handler(struct appctx *appctx)
 					goto process_data;
 
 				/* decapsule the htx data to raw data */
-				for (pos = htx_get_head(htx); pos != -1; pos = htx_get_next(htx, pos)) {
-					struct htx_blk *blk = htx_get_blk(htx, pos);
+				blk = htx_get_head_blk(htx);
+				while (blk) {
 					enum htx_blk_type type = htx_get_blk_type(blk);
 					size_t count = co_data(res);
 					uint32_t blksz = htx_get_blksz(blk);
@@ -892,7 +882,7 @@ static void httpclient_applet_io_handler(struct appctx *appctx)
 						c_rew(res, vlen);
 
 						if (vlen == blksz)
-							htx_remove_blk(htx, blk);
+							blk = htx_remove_blk(htx, blk);
 						else
 							htx_cut_data_blk(htx, blk, vlen);
 
@@ -909,7 +899,7 @@ static void httpclient_applet_io_handler(struct appctx *appctx)
 
 						/* remove any block which is not a data block */
 						c_rew(res, blksz);
-						htx_remove_blk(htx, blk);
+						blk = htx_remove_blk(htx, blk);
 					}
 				}
 
@@ -1164,9 +1154,9 @@ static int httpclient_parse_global_verify(char **args, int section_type, struct 
 		return -1;
 
 	if (strcmp(args[1],"none") == 0)
-		httpclient_ssl_verify = SSL_SERVER_VERIFY_NONE;
+		httpclient_ssl_verify = SSL_SOCK_VERIFY_NONE;
 	else if (strcmp(args[1],"required") == 0)
-		httpclient_ssl_verify = SSL_SERVER_VERIFY_REQUIRED;
+		httpclient_ssl_verify = SSL_SOCK_VERIFY_REQUIRED;
 	else {
 		ha_alert("parsing [%s:%d] : '%s' expects 'none' or 'required' as argument.\n", file, line, args[0]);
 		return -1;

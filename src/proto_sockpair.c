@@ -283,6 +283,8 @@ static int sockpair_connect_server(struct connection *conn, int flags)
 {
 	int sv[2], fd, dst_fd = -1;
 
+	BUG_ON(!conn->dst);
+
 	/* the FD is stored in the sockaddr struct */
 	dst_fd = ((struct sockaddr_in *)conn->dst)->sin_addr.s_addr;
 
@@ -349,8 +351,6 @@ static int sockpair_connect_server(struct connection *conn, int flags)
 	close(sv[0]); /* we don't need this side anymore */
 
 	conn->flags &= ~CO_FL_WAIT_L4_CONN;
-
-	conn->flags |= CO_FL_ADDR_TO_SET;
 
 	/* Prepare to send a few handshakes related to the on-wire protocol. */
 	if (conn->send_proxy_ofs)
@@ -482,7 +482,6 @@ struct connection *sockpair_accept_conn(struct listener *l, int *status)
 		/* just like with UNIX sockets, only the family is filled */
 		conn->src->ss_family = AF_UNIX;
 		conn->handle.fd = cfd;
-		conn->flags |= CO_FL_ADDR_FROM_SET;
 		ret = CO_AC_DONE;
 		goto done;
 	}
