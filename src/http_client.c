@@ -27,11 +27,14 @@
 #include <haproxy/http_ana-t.h>
 #include <haproxy/http_client.h>
 #include <haproxy/http_htx.h>
+#include <haproxy/http_rules.h>
 #include <haproxy/htx.h>
 #include <haproxy/log.h>
 #include <haproxy/proxy.h>
+#include <haproxy/resolvers.h>
 #include <haproxy/server.h>
 #include <haproxy/ssl_sock-t.h>
+#include <haproxy/sock_inet.h>
 #include <haproxy/tools.h>
 
 #include <string.h>
@@ -39,12 +42,20 @@
 
 static struct proxy *httpclient_proxy;
 static struct server *httpclient_srv_raw;
+
 #ifdef USE_OPENSSL
+/* if the httpclient is not configured, error are ignored and features are limited */
+static int hard_error_ssl = 0;
 static struct server *httpclient_srv_ssl;
 static int httpclient_ssl_verify = SSL_SOCK_VERIFY_REQUIRED;
+static char *httpclient_ssl_ca_file = NULL;
 #endif
 static struct applet httpclient_applet;
 
+/* if the httpclient is not configured, error are ignored and features are limited */
+static int hard_error_resolvers = 0;
+static char *resolvers_id = NULL;
+static char *resolvers_prefer = NULL;
 
 /* --- This part of the file implement an HTTP client over the CLI ---
  * The functions will be  starting by "hc_cli" for "httpclient cli"
@@ -445,11 +456,56 @@ int httpclient_set_dst(struct httpclient *hc, const char *dst)
 }
 
 /*
+ * Return a splitted URL in <scheme>, <host>, <port>
+ */
+static void httpclient_spliturl(struct ist url, enum http_scheme *scheme,
+                                struct ist *host, int *port)
+{
+	enum http_scheme scheme_tmp = SCH_HTTP;
+	int port_tmp = 0;
+	struct ist scheme_ist, authority_ist, host_ist, port_ist;
+	char *p, *end;
+	struct http_uri_parser parser;
+
+	parser = http_uri_parser_init(url);
+	scheme_ist = http_parse_scheme(&parser);
+
+	if (isteqi(scheme_ist, ist("http://"))){
+		scheme_tmp = SCH_HTTP;
+		port_tmp = 80;
+	} else if (isteqi(scheme_ist, ist("https://"))) {
+		scheme_tmp = SCH_HTTPS;
+		port_tmp = 443;
+	}
+
+	authority_ist = http_parse_authority(&parser, 1);
+	p = end = istend(authority_ist);
+
+	/* look for a port at the end of the authority */
+	while (p > istptr(authority_ist) && isdigit((unsigned char)*--p))
+		;
+
+	if (*p == ':') {
+		host_ist = ist2(istptr(authority_ist), p - istptr(authority_ist));
+		port_ist = istnext(ist2(p, end - p));
+		ist2str(trash.area, port_ist);
+		port_tmp = atoi(trash.area);
+	} else {
+		host_ist = authority_ist;
+	}
+
+	if (scheme)
+		*scheme = scheme_tmp;
+	if (host)
+		*host = host_ist;
+	if (port)
+		*port = port_tmp;
+
+}
+
+/*
  * Start the HTTP client
  * Create the appctx, session, stream and wakeup the applet
- *
- * FIXME: It also fill the sockaddr with the IP address, but currently only IP
- * in the URL are supported, it lacks a resolver.
  *
  * Return the <appctx> or NULL if it failed
  */
@@ -461,11 +517,13 @@ struct appctx *httpclient_start(struct httpclient *hc)
 	struct conn_stream *cs;
 	struct stream *s;
 	struct sockaddr_storage *addr = NULL;
-	int len;
-	struct sockaddr_storage ss_url;
-	struct sockaddr_storage* ss_dst;
-	struct split_url out;
+	struct sockaddr_storage ss_url = {};
+	struct sockaddr_storage *ss_dst;
 	enum obj_type *target = NULL;
+	struct ist host = IST_NULL;
+	enum http_scheme scheme;
+	int port;
+	int doresolve = 0;
 
 	/* if the client was started and not ended, an applet is already
 	 * running, we shouldn't try anything */
@@ -474,11 +532,22 @@ struct appctx *httpclient_start(struct httpclient *hc)
 
 	hc->flags = 0;
 
-	/* parse URI and fill sockaddr_storage */
-	len = url2sa(istptr(hc->req.url), istlen(hc->req.url), &ss_url, &out);
-	if (len == -1) {
-		ha_alert("httpclient: cannot parse uri '%s'.\n", istptr(hc->req.url));
-		goto out;
+	/* parse the URL and  */
+	httpclient_spliturl(hc->req.url, &scheme, &host, &port);
+
+	if (hc->dst) {
+		/* if httpclient_set_dst() was used, sets the alternative address */
+		ss_dst = hc->dst;
+	} else {
+		/* set the dst using the host, or 0.0.0.0 to resolve */
+
+		ist2str(trash.area, host);
+		ss_dst = str2ip2(trash.area, &ss_url, 0);
+		if (!ss_dst) { /* couldn't get an IP from that, try to resolve */
+			doresolve = 1;
+			ss_dst = str2ip2("0.0.0.0", &ss_url, 0);
+		}
+		sock_inet_set_port(ss_dst, port);
 	}
 
 	/* The HTTP client will be created in the same thread as the caller,
@@ -494,7 +563,7 @@ struct appctx *httpclient_start(struct httpclient *hc)
 	}
 
 	/* choose the SSL server or not */
-	switch (out.scheme) {
+	switch (scheme) {
 		case SCH_HTTP:
 			target = &httpclient_srv_raw->obj_type;
 			break;
@@ -513,13 +582,12 @@ struct appctx *httpclient_start(struct httpclient *hc)
 			break;
 	}
 
-	/* if httpclient_set_dst() was used, sets the alternative address */
-	if (hc->dst)
-		ss_dst = hc->dst;
-	else
-		ss_dst = &ss_url;
+	if (!ss_dst) {
+		ha_alert("httpclient: Failed to initialize address %s:%d.\n", __FUNCTION__, __LINE__);
+		goto out_free_sess;
+	}
 
-	if (!sockaddr_alloc(&addr, ss_dst, sizeof(*hc->dst)))
+	if (!sockaddr_alloc(&addr, ss_dst, sizeof(*ss_dst)))
 		goto out_free_sess;
 
 	cs = cs_new_from_applet(appctx->endp, sess, &hc->req.buf);
@@ -534,7 +602,16 @@ struct appctx *httpclient_start(struct httpclient *hc)
 	s->req.wto = hc->timeout_server;
 	s->res.rto = hc->timeout_server;
 
-	s->csb->dst = addr;
+	if (doresolve) {
+		/* in order to do the set-dst we need to put the address on the front */
+		s->csf->dst = addr;
+	} else {
+		/* in cases we don't use the resolve we already have the address
+		 * and must put it on the backend side, some of the cases are
+		 * not meant to be used on the frontend (sockpair, unix socket etc.) */
+		s->csb->dst = addr;
+	}
+
 	s->csb->flags |= CS_FL_NOLINGER;
 	s->flags |= SF_ASSIGNED;
 	s->res.flags |= CF_READ_DONTWAIT;
@@ -976,20 +1053,65 @@ static struct applet httpclient_applet = {
 	.release = httpclient_applet_release,
 };
 
+
+static int httpclient_resolve_init()
+{
+	struct act_rule *rule;
+	int i;
+	char *do_resolve = NULL;
+	char *http_rules[][11] = {
+	       { "set-var(txn.hc_ip)", "dst", "" },
+	       { do_resolve, "hdr(Host),lower", "if", "{", "var(txn.hc_ip)", "-m", "ip", "0.0.0.0", "}", "" },
+	       { "return", "status", "503", "if", "{", "var(txn.hc_ip)", "-m", "ip", "0.0.0.0", "}", "" },
+	       { "capture", "var(txn.hc_ip)", "len", "40", "" },
+	       { "set-dst", "var(txn.hc_ip)", "" },
+	       { "" }
+	};
+
+	if (!resolvers_id)
+		resolvers_id = strdup("default");
+
+	memprintf(&do_resolve, "do-resolve(txn.hc_ip,%s%s%s)", resolvers_id, resolvers_prefer ? "," : "", resolvers_prefer ? resolvers_prefer : "");
+	http_rules[1][0] = do_resolve;
+
+	/* if the resolver does not exist and no hard_error was set, simply ignore resolving */
+	if (!find_resolvers_by_id(resolvers_id) && !hard_error_resolvers) {
+		free(do_resolve);
+		return 0;
+	}
+
+
+	for (i = 0; *http_rules[i][0] != '\0'; i++) {
+		rule = parse_http_req_cond((const char **)http_rules[i], "httpclient", 0, httpclient_proxy);
+		if (!rule) {
+			free(do_resolve);
+			ha_alert("Couldn't setup the httpclient resolver.\n");
+			return 1;
+		}
+		LIST_APPEND(&httpclient_proxy->http_req_rules, &rule->list);
+	}
+
+	free(do_resolve);
+	return 0;
+}
+
+
+
 /*
  * Initialize the proxy for the HTTP client with 2 servers, one for raw HTTP,
  * the other for HTTPS.
  */
 static int httpclient_precheck()
 {
-	int err_code = 0;
+	int err_code = ERR_NONE;
 	char *errmsg = NULL;
 
 	if (global.mode & MODE_MWORKER_WAIT)
-		return 0;
+		return ERR_NONE;
 
 	httpclient_proxy = alloc_new_proxy("<HTTPCLIENT>", PR_CAP_LISTEN|PR_CAP_INT, &errmsg);
 	if (!httpclient_proxy) {
+		memprintf(&errmsg, "couldn't allocate proxy.");
 		err_code |= ERR_ALERT | ERR_FATAL;
 		goto err;
 	}
@@ -1011,17 +1133,21 @@ static int httpclient_precheck()
 	/* clear HTTP server */
 	httpclient_srv_raw = new_server(httpclient_proxy);
 	if (!httpclient_srv_raw) {
-		err_code |= ERR_ALERT | ERR_FATAL;
 		memprintf(&errmsg, "out of memory.");
+		err_code |= ERR_ALERT | ERR_FATAL;
 		goto err;
 	}
 
 	httpclient_srv_raw->iweight = 0;
 	httpclient_srv_raw->uweight = 0;
 	httpclient_srv_raw->xprt = xprt_get(XPRT_RAW);
+	httpclient_srv_raw->flags |= SRV_F_MAPPORTS;  /* needed to apply the port change with resolving */
 	httpclient_srv_raw->id = strdup("<HTTPCLIENT>");
-	if (!httpclient_srv_raw->id)
+	if (!httpclient_srv_raw->id) {
+		memprintf(&errmsg, "out of memory.");
+		err_code |= ERR_ALERT | ERR_FATAL;
 		goto err;
+	}
 
 #ifdef USE_OPENSSL
 	/* SSL HTTP server */
@@ -1035,19 +1161,35 @@ static int httpclient_precheck()
 	httpclient_srv_ssl->uweight = 0;
 	httpclient_srv_ssl->xprt = xprt_get(XPRT_SSL);
 	httpclient_srv_ssl->use_ssl = 1;
+	httpclient_srv_ssl->flags |= SRV_F_MAPPORTS;  /* needed to apply the port change with resolving */
 	httpclient_srv_ssl->id = strdup("<HTTPSCLIENT>");
-	if (!httpclient_srv_ssl->id)
+	if (!httpclient_srv_ssl->id) {
+		memprintf(&errmsg, "out of memory.");
+		err_code |= ERR_ALERT | ERR_FATAL;
 		goto err;
+	}
 
 	httpclient_srv_ssl->ssl_ctx.verify = httpclient_ssl_verify;
 	/* if the verify is required, try to load the system CA */
 	if (httpclient_ssl_verify == SSL_SOCK_VERIFY_REQUIRED) {
-		httpclient_srv_ssl->ssl_ctx.ca_file = strdup("@system-ca");
+
+		if (!httpclient_ssl_ca_file)
+			httpclient_ssl_ca_file = strdup("@system-ca");
+
+		httpclient_srv_ssl->ssl_ctx.ca_file = httpclient_ssl_ca_file;
 		if (!ssl_store_load_locations_file(httpclient_srv_ssl->ssl_ctx.ca_file, 1, CAFILE_CERT)) {
-			ha_warning("httpclient: cannot initialize SSL verify with 'ca-file \"%s\"'. Disabling SSL.\n", httpclient_srv_ssl->ssl_ctx.ca_file);
-			ha_free(&httpclient_srv_ssl->ssl_ctx.ca_file);
-			srv_drop(httpclient_srv_ssl);
-			httpclient_srv_ssl = NULL;
+			/* if we failed to load the ca-file, only quits in
+			 * error with hard_error, otherwise just disable the
+			 * feature. */
+			if (hard_error_ssl) {
+				memprintf(&errmsg, "cannot initialize SSL verify with 'ca-file \"%s\"'.", httpclient_srv_ssl->ssl_ctx.ca_file);
+				err_code |= ERR_ALERT | ERR_FATAL;
+				goto err;
+			} else {
+				ha_free(&httpclient_srv_ssl->ssl_ctx.ca_file);
+				srv_drop(httpclient_srv_ssl);
+				httpclient_srv_ssl = NULL;
+			}
 		}
 	}
 
@@ -1056,6 +1198,12 @@ static int httpclient_precheck()
 	/* add the proxy in the proxy list only if everything is successful */
 	httpclient_proxy->next = proxies_list;
 	proxies_list = httpclient_proxy;
+
+	if (httpclient_resolve_init() != 0) {
+		memprintf(&errmsg, "cannot initialize resolvers.");
+		err_code |= ERR_ALERT | ERR_FATAL;
+		goto err;
+	}
 
 	/* link the 2 servers in the proxy */
 	httpclient_srv_raw->next = httpclient_proxy->srv;
@@ -1069,34 +1217,36 @@ static int httpclient_precheck()
 #endif
 
 
-	return 0;
-
 err:
-	ha_alert("httpclient: cannot initialize.\n");
-	free(errmsg);
-	srv_drop(httpclient_srv_raw);
+	if (err_code & ERR_CODE) {
+		ha_alert("httpclient: cannot initialize: %s\n", errmsg);
+		free(errmsg);
+		srv_drop(httpclient_srv_raw);
 #ifdef USE_OPENSSL
-	srv_drop(httpclient_srv_ssl);
+		srv_drop(httpclient_srv_ssl);
 #endif
-	free_proxy(httpclient_proxy);
+		free_proxy(httpclient_proxy);
+	}
 	return err_code;
 }
 
 static int httpclient_postcheck()
 {
+	int err_code = ERR_NONE;
 	struct logsrv *logsrv;
 	struct proxy *curproxy = httpclient_proxy;
 	char *errmsg = NULL;
 
 	if (global.mode & MODE_MWORKER_WAIT)
-		return 0;
+		return ERR_NONE;
 
 	/* copy logs from "global" log list */
 	list_for_each_entry(logsrv, &global.logsrvs, list) {
 		struct logsrv *node = malloc(sizeof(*node));
 
 		if (!node) {
-			ha_alert("httpclient: cannot allocate memory.\n");
+			memprintf(&errmsg, "out of memory.");
+			err_code |= ERR_ALERT | ERR_FATAL;
 			goto err;
 		}
 
@@ -1111,8 +1261,8 @@ static int httpclient_postcheck()
 		if (!parse_logformat_string(curproxy->conf.logformat_string, curproxy, &curproxy->logformat,
 					    LOG_OPT_MANDATORY|LOG_OPT_MERGE_SPACES,
 					    SMP_VAL_FE_LOG_END, &errmsg)) {
-			ha_alert("httpclient: failed to parse log-format : %s.\n", errmsg);
-			free(errmsg);
+			memprintf(&errmsg, "failed to parse log-format : %s.", errmsg);
+			err_code |= ERR_ALERT | ERR_FATAL;
 			goto err;
 		}
 		curproxy->conf.args.file = NULL;
@@ -1121,23 +1271,24 @@ static int httpclient_postcheck()
 
 #ifdef USE_OPENSSL
 	if (httpclient_srv_ssl) {
-		int err_code = 0;
-
 		/* init the SNI expression */
 		/* always use the host header as SNI, without the port */
 		httpclient_srv_ssl->sni_expr = strdup("req.hdr(host),field(1,:)");
 		err_code |= server_parse_sni_expr(httpclient_srv_ssl, httpclient_proxy, &errmsg);
 		if (err_code & ERR_CODE) {
-			ha_alert("httpclient: failed to configure sni: %s.\n", errmsg);
-			free(errmsg);
+			memprintf(&errmsg, "failed to configure sni: %s.", errmsg);
 			goto err;
 		}
 	}
 #endif
 
-	return 0;
 err:
-	return 1;
+	if (err_code & ERR_CODE) {
+		ha_alert("httpclient: failed to initialize: %s\n", errmsg);
+		free(errmsg);
+
+	}
+	return err_code;
 }
 
 /* initialize the proxy and servers for the HTTP client */
@@ -1145,13 +1296,72 @@ err:
 REGISTER_PRE_CHECK(httpclient_precheck);
 REGISTER_POST_CHECK(httpclient_postcheck);
 
+static int httpclient_parse_global_resolvers(char **args, int section_type, struct proxy *curpx,
+                                        const struct proxy *defpx, const char *file, int line,
+                                        char **err)
+{
+	if (too_many_args(1, args, err, NULL))
+		return -1;
+
+	/* any configuration should set the hard_error flag */
+	hard_error_resolvers = 1;
+
+	free(resolvers_id);
+	resolvers_id = strdup(args[1]);
+
+	return 0;
+}
+
+static int httpclient_parse_global_prefer(char **args, int section_type, struct proxy *curpx,
+                                        const struct proxy *defpx, const char *file, int line,
+                                        char **err)
+{
+	if (too_many_args(1, args, err, NULL))
+		return -1;
+
+	/* any configuration should set the hard_error flag */
+	hard_error_resolvers = 1;
+
+
+	if (strcmp(args[1],"ipv4") == 0)
+		resolvers_prefer = "ipv4";
+	else if (strcmp(args[1],"ipv6") == 0)
+		resolvers_prefer = "ipv6";
+	else {
+		ha_alert("parsing [%s:%d] : '%s' expects 'ipv4' or 'ipv6' as argument.\n", file, line, args[0]);
+		return -1;
+	}
+
+	return 0;
+}
+
+
 #ifdef USE_OPENSSL
+static int httpclient_parse_global_ca_file(char **args, int section_type, struct proxy *curpx,
+                                        const struct proxy *defpx, const char *file, int line,
+                                        char **err)
+{
+	if (too_many_args(1, args, err, NULL))
+		return -1;
+
+	/* any configuration should set the hard_error flag */
+	hard_error_ssl = 1;
+
+	free(httpclient_ssl_ca_file);
+	httpclient_ssl_ca_file = strdup(args[1]);
+
+	return 0;
+}
+
 static int httpclient_parse_global_verify(char **args, int section_type, struct proxy *curpx,
                                         const struct proxy *defpx, const char *file, int line,
                                         char **err)
 {
 	if (too_many_args(1, args, err, NULL))
 		return -1;
+
+	/* any configuration should set the hard_error flag */
+	hard_error_ssl = 1;
 
 	if (strcmp(args[1],"none") == 0)
 		httpclient_ssl_verify = SSL_SOCK_VERIFY_NONE;
@@ -1164,11 +1374,16 @@ static int httpclient_parse_global_verify(char **args, int section_type, struct 
 
 	return 0;
 }
+#endif /* ! USE_OPENSSL */
 
 static struct cfg_kw_list cfg_kws = {ILH, {
-	{ CFG_GLOBAL, "httpclient-ssl-verify", httpclient_parse_global_verify },
+	{ CFG_GLOBAL, "httpclient.resolvers.id", httpclient_parse_global_resolvers },
+	{ CFG_GLOBAL, "httpclient.resolvers.prefer", httpclient_parse_global_prefer },
+#ifdef USE_OPENSSL
+	{ CFG_GLOBAL, "httpclient.ssl.verify", httpclient_parse_global_verify },
+	{ CFG_GLOBAL, "httpclient.ssl.ca-file", httpclient_parse_global_ca_file },
+#endif
 	{ 0, NULL, NULL },
 }};
 
 INITCALL1(STG_REGISTER, cfg_register_keywords, &cfg_kws);
-#endif
