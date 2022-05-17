@@ -44,6 +44,7 @@
 #include <import/lru.h>
 
 #include <haproxy/api.h>
+#include <haproxy/applet.h>
 #include <haproxy/arg.h>
 #include <haproxy/base64.h>
 #include <haproxy/channel.h>
@@ -184,6 +185,19 @@ static struct stats_module ssl_stats_module = {
 };
 
 INITCALL1(STG_REGISTER, stats_register_module, &ssl_stats_module);
+
+/* CLI context for "show tls-keys" */
+struct show_keys_ctx {
+	struct tls_keys_ref *next_ref; /* next reference to be dumped */
+	int names_only;                /* non-zero = only show file names */
+	int next_index;                /* next index to be dumped */
+	int dump_entries;              /* dump entries also */
+	enum {
+		SHOW_KEYS_INIT = 0,
+		SHOW_KEYS_LIST,
+		SHOW_KEYS_DONE,
+	} state;                       /* phase of the current dump */
+};
 
 /* ssl_sock_io_cb is exported to see it resolved in "show fd" */
 struct task *ssl_sock_io_cb(struct task *, void *, unsigned int);
@@ -467,6 +481,14 @@ struct ssl_engine_list {
 };
 #endif
 
+#ifdef HAVE_SSL_PROVIDERS
+struct list openssl_providers = LIST_HEAD_INIT(openssl_providers);
+struct ssl_provider_list {
+	struct list list;
+	OSSL_PROVIDER *provider;
+};
+#endif
+
 #ifndef OPENSSL_NO_DH
 static int ssl_dh_ptr_index = -1;
 static HASSL_DH *global_dh = NULL;
@@ -683,6 +705,33 @@ fail_get:
 	return err_code;
 }
 #endif
+
+#ifdef HAVE_SSL_PROVIDERS
+int ssl_init_provider(const char *provider_name)
+{
+	int err_code = ERR_ABORT;
+	struct ssl_provider_list *prov = NULL;
+
+	prov = calloc(1, sizeof(*prov));
+	if (!prov) {
+		ha_alert("ssl-provider %s: memory allocation failure\n", provider_name);
+		goto error;
+	}
+
+	if ((prov->provider = OSSL_PROVIDER_load(NULL, provider_name)) == NULL) {
+		ha_alert("ssl-provider %s: unknown provider\n", provider_name);
+		goto error;
+	}
+
+	LIST_INSERT(&openssl_providers, &prov->list);
+
+	return 0;
+
+error:
+	ha_free(&prov);
+	return err_code;
+}
+#endif /* HAVE_SSL_PROVIDERS */
 
 #ifdef SSL_MODE_ASYNC
 /*
@@ -7206,28 +7255,21 @@ struct tls_keys_ref *tlskeys_ref_lookup_ref(const char *reference)
 
 #if (defined SSL_CTRL_SET_TLSEXT_TICKET_KEY_CB && TLS_TICKETS_NO > 0)
 
-static int cli_io_handler_tlskeys_files(struct appctx *appctx);
+/* dumps all tls keys. Relies on the show_keys_ctx context from the appctx. */
+static int cli_io_handler_tlskeys_files(struct appctx *appctx)
+{
+	struct show_keys_ctx *ctx = appctx->svcctx;
+	struct conn_stream *cs = appctx_cs(appctx);
 
-static inline int cli_io_handler_tlskeys_entries(struct appctx *appctx) {
-	return cli_io_handler_tlskeys_files(appctx);
-}
-
-/* dumps all tls keys. Relies on cli.i0 (non-null = only list file names), cli.i1
- * (next index to be dumped), and cli.p0 (next key reference).
- */
-static int cli_io_handler_tlskeys_files(struct appctx *appctx) {
-
-	struct conn_stream *cs = appctx->owner;
-
-	switch (appctx->st2) {
-	case STAT_ST_INIT:
+	switch (ctx->state) {
+	case SHOW_KEYS_INIT:
 		/* Display the column headers. If the message cannot be sent,
 		 * quit the function with returning 0. The function is called
-		 * later and restart at the state "STAT_ST_INIT".
+		 * later and restart at the state "SHOW_KEYS_INIT".
 		 */
 		chunk_reset(&trash);
 
-		if (appctx->io_handler == cli_io_handler_tlskeys_entries)
+		if (ctx->dump_entries)
 			chunk_appendf(&trash, "# id secret\n");
 		else
 			chunk_appendf(&trash, "# id (file)\n");
@@ -7242,50 +7284,50 @@ static int cli_io_handler_tlskeys_files(struct appctx *appctx) {
 		 * available field of this pointer is <list>. It is used with the function
 		 * tlskeys_list_get_next() for retruning the first available entry
 		 */
-		if (appctx->ctx.cli.p0 == NULL)
-			appctx->ctx.cli.p0 = tlskeys_list_get_next(&tlskeys_reference, &tlskeys_reference);
+		if (ctx->next_ref == NULL)
+			ctx->next_ref = tlskeys_list_get_next(&tlskeys_reference, &tlskeys_reference);
 
-		appctx->st2 = STAT_ST_LIST;
+		ctx->state = SHOW_KEYS_LIST;
 		/* fall through */
 
-	case STAT_ST_LIST:
-		while (appctx->ctx.cli.p0) {
-			struct tls_keys_ref *ref = appctx->ctx.cli.p0;
+	case SHOW_KEYS_LIST:
+		while (ctx->next_ref) {
+			struct tls_keys_ref *ref = ctx->next_ref;
 
 			chunk_reset(&trash);
-			if (appctx->io_handler == cli_io_handler_tlskeys_entries && appctx->ctx.cli.i1 == 0)
+			if (ctx->dump_entries && ctx->next_index == 0)
 				chunk_appendf(&trash, "# ");
 
-			if (appctx->ctx.cli.i1 == 0)
+			if (ctx->next_index == 0)
 				chunk_appendf(&trash, "%d (%s)\n", ref->unique_id, ref->filename);
 
-			if (appctx->io_handler == cli_io_handler_tlskeys_entries) {
+			if (ctx->dump_entries) {
 				int head;
 
 				HA_RWLOCK_RDLOCK(TLSKEYS_REF_LOCK, &ref->lock);
 				head = ref->tls_ticket_enc_index;
-				while (appctx->ctx.cli.i1 < TLS_TICKETS_NO) {
+				while (ctx->next_index < TLS_TICKETS_NO) {
 					struct buffer *t2 = get_trash_chunk();
 
 					chunk_reset(t2);
 					/* should never fail here because we dump only a key in the t2 buffer */
 					if (ref->key_size_bits == 128) {
-						t2->data = a2base64((char *)(ref->tlskeys + (head + 2 + appctx->ctx.cli.i1) % TLS_TICKETS_NO),
+						t2->data = a2base64((char *)(ref->tlskeys + (head + 2 + ctx->next_index) % TLS_TICKETS_NO),
 						                   sizeof(struct tls_sess_key_128),
 						                   t2->area, t2->size);
-						chunk_appendf(&trash, "%d.%d %s\n", ref->unique_id, appctx->ctx.cli.i1,
+						chunk_appendf(&trash, "%d.%d %s\n", ref->unique_id, ctx->next_index,
 							      t2->area);
 					}
 					else if (ref->key_size_bits == 256) {
-						t2->data = a2base64((char *)(ref->tlskeys + (head + 2 + appctx->ctx.cli.i1) % TLS_TICKETS_NO),
+						t2->data = a2base64((char *)(ref->tlskeys + (head + 2 + ctx->next_index) % TLS_TICKETS_NO),
 						                   sizeof(struct tls_sess_key_256),
 						                   t2->area, t2->size);
-						chunk_appendf(&trash, "%d.%d %s\n", ref->unique_id, appctx->ctx.cli.i1,
+						chunk_appendf(&trash, "%d.%d %s\n", ref->unique_id, ctx->next_index,
 							      t2->area);
 					}
 					else {
 						/* This case should never happen */
-						chunk_appendf(&trash, "%d.%d <unknown>\n", ref->unique_id, appctx->ctx.cli.i1);
+						chunk_appendf(&trash, "%d.%d <unknown>\n", ref->unique_id, ctx->next_index);
 					}
 
 					if (ci_putchk(cs_ic(cs), &trash) == -1) {
@@ -7296,10 +7338,10 @@ static int cli_io_handler_tlskeys_files(struct appctx *appctx) {
 						cs_rx_room_blk(cs);
 						return 0;
 					}
-					appctx->ctx.cli.i1++;
+					ctx->next_index++;
 				}
 				HA_RWLOCK_RDUNLOCK(TLSKEYS_REF_LOCK, &ref->lock);
-				appctx->ctx.cli.i1 = 0;
+				ctx->next_index = 0;
 			}
 			if (ci_putchk(cs_ic(cs), &trash) == -1) {
 				/* let's try again later from this stream. We add ourselves into
@@ -7309,42 +7351,42 @@ static int cli_io_handler_tlskeys_files(struct appctx *appctx) {
 				return 0;
 			}
 
-			if (appctx->ctx.cli.i0 == 0) /* don't display everything if not necessary */
+			if (ctx->names_only == 0) /* don't display everything if not necessary */
 				break;
 
 			/* get next list entry and check the end of the list */
-			appctx->ctx.cli.p0 = tlskeys_list_get_next(&ref->list, &tlskeys_reference);
+			ctx->next_ref = tlskeys_list_get_next(&ref->list, &tlskeys_reference);
 		}
-
-		appctx->st2 = STAT_ST_FIN;
+		ctx->state = SHOW_KEYS_DONE;
 		/* fall through */
 
 	default:
-		appctx->st2 = STAT_ST_FIN;
 		return 1;
 	}
 	return 0;
 }
 
-/* sets cli.i0 to non-zero if only file lists should be dumped */
+/* Prepares a "show_keys_ctx" and sets the appropriate io_handler if needed */
 static int cli_parse_show_tlskeys(char **args, char *payload, struct appctx *appctx, void *private)
 {
+	struct show_keys_ctx *ctx = applet_reserve_svcctx(appctx, sizeof(*ctx));
+
 	/* no parameter, shows only file list */
 	if (!*args[2]) {
-		appctx->ctx.cli.i0 = 1;
-		appctx->io_handler = cli_io_handler_tlskeys_files;
+		ctx->names_only = 1;
 		return 0;
 	}
 
 	if (args[2][0] == '*') {
 		/* list every TLS ticket keys */
-		appctx->ctx.cli.i0 = 1;
+		ctx->names_only = 1;
 	} else {
-		appctx->ctx.cli.p0 = tlskeys_ref_lookup_ref(args[2]);
-		if (!appctx->ctx.cli.p0)
+		ctx->next_ref = tlskeys_ref_lookup_ref(args[2]);
+		if (!ctx->next_ref)
 			return cli_err(appctx, "'show tls-keys' unable to locate referenced filename\n");
 	}
-	appctx->io_handler = cli_io_handler_tlskeys_entries;
+
+	ctx->dump_entries = 1;
 	return 0;
 }
 
@@ -7418,7 +7460,9 @@ static int cli_parse_set_ocspresponse(char **args, char *payload, struct appctx 
 static int cli_io_handler_show_ocspresponse_detail(struct appctx *appctx);
 #endif
 
-/* parsing function for 'show ssl ocsp-response [id]' */
+/* parsing function for 'show ssl ocsp-response [id]'. If an entry is forced,
+ * it's set into appctx->svcctx.
+ */
 static int cli_parse_show_ocspresponse(char **args, char *payload, struct appctx *appctx, void *private)
 {
 #if ((defined SSL_CTRL_SET_TLSEXT_STATUS_REQ_CB && !defined OPENSSL_NO_OCSP) && !defined OPENSSL_IS_BORINGSSL)
@@ -7445,7 +7489,7 @@ static int cli_parse_show_ocspresponse(char **args, char *payload, struct appctx
 			return cli_err(appctx, "Certificate ID does not match any certificate.\n");
 		}
 
-		appctx->ctx.cli.p0 = ocsp;
+		appctx->svcctx = ocsp;
 		appctx->io_handler = cli_io_handler_show_ocspresponse_detail;
 	}
 
@@ -7486,6 +7530,7 @@ static inline int ocsp_certid_print(BIO *bp, OCSP_CERTID *certid, int indent)
 /*
  * IO handler of "show ssl ocsp-response". The command taking a specific ID
  * is managed in cli_io_handler_show_ocspresponse_detail.
+ * The current entry is taken from appctx->svcctx.
  */
 static int cli_io_handler_show_ocspresponse(struct appctx *appctx)
 {
@@ -7493,7 +7538,7 @@ static int cli_io_handler_show_ocspresponse(struct appctx *appctx)
 	struct buffer *trash = alloc_trash_chunk();
 	struct buffer *tmp = NULL;
 	struct ebmb_node *node;
-	struct conn_stream *cs = appctx->owner;
+	struct conn_stream *cs = appctx_cs(appctx);
 	struct certificate_ocsp *ocsp = NULL;
 	BIO *bio = NULL;
 	int write = -1;
@@ -7508,11 +7553,11 @@ static int cli_io_handler_show_ocspresponse(struct appctx *appctx)
 	if ((bio = BIO_new(BIO_s_mem())) == NULL)
 		goto end;
 
-	if (!appctx->ctx.cli.p0) {
+	if (!appctx->svcctx) {
 		chunk_appendf(trash, "# Certificate IDs\n");
 		node = ebmb_first(&cert_ocsp_tree);
 	} else {
-		node = &((struct certificate_ocsp *)appctx->ctx.cli.p0)->key;
+		node = &((struct certificate_ocsp *)appctx->svcctx)->key;
 	}
 
 	while (node) {
@@ -7555,7 +7600,7 @@ static int cli_io_handler_show_ocspresponse(struct appctx *appctx)
 	}
 
 end:
-	appctx->ctx.cli.p0 = NULL;
+	appctx->svcctx = NULL;
 	if (trash)
 		free_trash_chunk(trash);
 	if (tmp)
@@ -7572,7 +7617,7 @@ yield:
 		free_trash_chunk(tmp);
 	if (bio)
 		BIO_free(bio);
-	appctx->ctx.cli.p0 = ocsp;
+	appctx->svcctx = ocsp;
 	return 0;
 #else
 	return cli_err(appctx, "HAProxy was compiled against a version of OpenSSL that doesn't support OCSP stapling.\n");
@@ -7629,7 +7674,7 @@ static void ssl_provider_clear_name_list(struct list *provider_names)
 static int cli_io_handler_show_providers(struct appctx *appctx)
 {
 	struct buffer *trash = get_trash_chunk();
-	struct conn_stream *cs = appctx->owner;
+	struct conn_stream *cs = appctx_cs(appctx);
 	struct list provider_names;
 	struct provider_name *name;
 
@@ -7753,14 +7798,14 @@ int ssl_get_ocspresponse_detail(unsigned char *ocsp_certid, struct buffer *out)
 }
 
 
-/* IO handler of details "show ssl ocsp-response <id>". */
+/* IO handler of details "show ssl ocsp-response <id>".
+ * The current entry is taken from appctx->svcctx.
+ */
 static int cli_io_handler_show_ocspresponse_detail(struct appctx *appctx)
 {
 	struct buffer *trash = alloc_trash_chunk();
-	struct certificate_ocsp *ocsp = NULL;
-	struct conn_stream *cs = appctx->owner;
-
-	ocsp = appctx->ctx.cli.p0;
+	struct certificate_ocsp *ocsp = appctx->svcctx;
+	struct conn_stream *cs = appctx_cs(appctx);
 
 	if (trash == NULL)
 		return 1;
@@ -7774,7 +7819,8 @@ static int cli_io_handler_show_ocspresponse_detail(struct appctx *appctx)
 		cs_rx_room_blk(cs);
 		goto yield;
 	}
-	appctx->ctx.cli.p0 = NULL;
+
+	appctx->svcctx = NULL;
 	if (trash)
 		free_trash_chunk(trash);
 	return 1;
@@ -7790,7 +7836,7 @@ yield:
 /* register cli keywords */
 static struct cli_kw_list cli_kws = {{ },{
 #if (defined SSL_CTRL_SET_TLSEXT_TICKET_KEY_CB && TLS_TICKETS_NO > 0)
-	{ { "show", "tls-keys", NULL },            "show tls-keys [id|*]                    : show tls keys references or dump tls ticket keys when id specified", cli_parse_show_tlskeys, NULL },
+	{ { "show", "tls-keys", NULL },            "show tls-keys [id|*]                    : show tls keys references or dump tls ticket keys when id specified", cli_parse_show_tlskeys, cli_io_handler_tlskeys_files },
 	{ { "set", "ssl", "tls-key", NULL },       "set ssl tls-key [id|file] <key>         : set the next TLS key for the <id> or <file> listener to <key>",      cli_parse_set_tlskeys, NULL },
 #endif
 	{ { "set", "ssl", "ocsp-response", NULL }, "set ssl ocsp-response <resp|payload>    : update a certificate's OCSP Response from a base64-encode DER",      cli_parse_set_ocspresponse, NULL },
@@ -8013,6 +8059,9 @@ static void __ssl_sock_init(void)
 #if defined(USE_ENGINE) && !defined(OPENSSL_NO_ENGINE)
 	hap_register_post_deinit(ssl_free_engines);
 #endif
+#ifdef HAVE_SSL_PROVIDERS
+	hap_register_post_deinit(ssl_unload_providers);
+#endif
 #if HA_OPENSSL_VERSION_NUMBER < 0x3000000fL
 	/* Load SSL string for the verbose & debug mode. */
 	ERR_load_SSL_strings();
@@ -8113,6 +8162,17 @@ void ssl_free_engines(void) {
 		ENGINE_free(wl->e);
 		LIST_DELETE(&wl->list);
 		free(wl);
+	}
+}
+#endif
+
+#ifdef HAVE_SSL_PROVIDERS
+void ssl_unload_providers(void) {
+	struct ssl_provider_list *prov, *provb;
+	list_for_each_entry_safe(prov, provb, &openssl_providers, list) {
+		OSSL_PROVIDER_unload(prov->provider);
+		LIST_DELETE(&prov->list);
+		free(prov);
 	}
 }
 #endif

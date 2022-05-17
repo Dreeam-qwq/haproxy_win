@@ -580,12 +580,11 @@ struct stream *stream_new(struct session *sess, struct conn_stream *cs, struct b
 /*
  * frees  the context associated to a stream. It must have been removed first.
  */
-static void stream_free(struct stream *s)
+void stream_free(struct stream *s)
 {
 	struct session *sess = strm_sess(s);
 	struct proxy *fe = sess->fe;
 	struct bref *bref, *back;
-	int must_free_sess;
 	int i;
 
 	DBG_TRACE_POINT(STRM_EV_STRM_FREE, s);
@@ -709,17 +708,8 @@ static void stream_free(struct stream *s)
 	}
 	LIST_DELETE(&s->list);
 
-	/* applets do not release session yet */
-	/* FIXME: Handle it in appctx_free ??? */
-	must_free_sess = objt_appctx(sess->origin) && sess->origin == __cs_endp_target(s->csf);
-
 	cs_destroy(s->csb);
 	cs_destroy(s->csf);
-
-	if (must_free_sess) {
-		sess->origin = NULL;
-		session_free(sess);
-	}
 
 	pool_free(pool_head_stream, s);
 
@@ -1007,9 +997,8 @@ enum act_return process_use_service(struct act_rule *rule, struct proxy *px,
 			return ACT_RET_ERR;
 
 		/* Finish initialisation of the context. */
-		memset(&appctx->ctx, 0, sizeof(appctx->ctx));
 		appctx->rule = rule;
-		if (appctx->applet->init && !appctx->applet->init(appctx))
+		if (appctx_init(appctx) == -1)
 			return ACT_RET_ERR;
 	}
 	else
@@ -2818,7 +2807,7 @@ void stream_dump_and_crash(enum obj_type *obj, int rate)
 		if (!appctx)
 			return;
 		ptr = appctx;
-		s = __cs_strm(appctx->owner);
+		s = appctx_strm(appctx);
 		if (!s)
 			return;
 	}
@@ -3145,6 +3134,17 @@ void list_services(FILE *out)
 		fprintf(out, " none\n");
 }
 
+/* appctx context used by the "show sess" command */
+
+struct show_sess_ctx {
+	struct bref bref;	/* back-reference from the session being dumped */
+	void *target;		/* session we want to dump, or NULL for all */
+	unsigned int thr;       /* the thread number being explored (0..MAX_THREADS-1) */
+	unsigned int uid;	/* if non-null, the uniq_id of the session being dumped */
+	int section;		/* section of the session being dumped */
+	int pos;		/* last position of the current session's buffer */
+};
+
 /* This function dumps a complete stream state onto the conn-stream's
  * read buffer. The stream has to be set in strm. It returns 0 if the output
  * buffer is full and it needs to be called again, otherwise non-zero. It is
@@ -3153,6 +3153,7 @@ void list_services(FILE *out)
 static int stats_dump_full_strm_to_buffer(struct conn_stream *cs, struct stream *strm)
 {
 	struct appctx *appctx = __cs_appctx(cs);
+	struct show_sess_ctx *ctx = appctx->svcctx;
 	struct conn_stream *csf, *csb;
 	struct tm tm;
 	extern const char *monthname[12];
@@ -3162,7 +3163,7 @@ static int stats_dump_full_strm_to_buffer(struct conn_stream *cs, struct stream 
 
 	chunk_reset(&trash);
 
-	if (appctx->ctx.sess.section > 0 && appctx->ctx.sess.uid != strm->uniq_id) {
+	if (ctx->section > 0 && ctx->uid != strm->uniq_id) {
 		/* stream changed, no need to go any further */
 		chunk_appendf(&trash, "  *** session terminated while we were watching it ***\n");
 		if (ci_putchk(cs_ic(cs), &trash) == -1)
@@ -3170,10 +3171,10 @@ static int stats_dump_full_strm_to_buffer(struct conn_stream *cs, struct stream 
 		goto done;
 	}
 
-	switch (appctx->ctx.sess.section) {
+	switch (ctx->section) {
 	case 0: /* main status of the stream */
-		appctx->ctx.sess.uid = strm->uniq_id;
-		appctx->ctx.sess.section = 1;
+		ctx->uid = strm->uniq_id;
+		ctx->section = 1;
 		/* fall through */
 
 	case 1:
@@ -3335,7 +3336,7 @@ static int stats_dump_full_strm_to_buffer(struct conn_stream *cs, struct stream 
 				      tmpctx,
 				      tmpctx->st0,
 				      tmpctx->st1,
-				      tmpctx->st2,
+				      tmpctx->_st2,
 			              tmpctx->applet->name,
 			              tmpctx->t->thread_mask,
 			              tmpctx->t->nice, tmpctx->t->calls, read_freq_ctr(&tmpctx->call_rate),
@@ -3373,7 +3374,7 @@ static int stats_dump_full_strm_to_buffer(struct conn_stream *cs, struct stream 
 				      tmpctx,
 				      tmpctx->st0,
 				      tmpctx->st1,
-				      tmpctx->st2,
+				      tmpctx->_st2,
 			              tmpctx->applet->name,
 			              tmpctx->t->thread_mask,
 			              tmpctx->t->nice, tmpctx->t->calls, read_freq_ctr(&tmpctx->call_rate),
@@ -3480,33 +3481,39 @@ static int stats_dump_full_strm_to_buffer(struct conn_stream *cs, struct stream 
 	}
 	/* end of dump */
  done:
-	appctx->ctx.sess.uid = 0;
-	appctx->ctx.sess.section = 0;
+	ctx->uid = 0;
+	ctx->section = 0;
 	return 1;
  full:
 	return 0;
 }
 
-
 static int cli_parse_show_sess(char **args, char *payload, struct appctx *appctx, void *private)
 {
+	struct show_sess_ctx *ctx = applet_reserve_svcctx(appctx, sizeof(*ctx));
+
 	if (!cli_has_level(appctx, ACCESS_LVL_OPER))
 		return 1;
 
 	if (*args[2] && strcmp(args[2], "all") == 0)
-		appctx->ctx.sess.target = (void *)-1;
+		ctx->target = (void *)-1;
 	else if (*args[2])
-		appctx->ctx.sess.target = (void *)strtoul(args[2], NULL, 0);
+		ctx->target = (void *)strtoul(args[2], NULL, 0);
 	else
-		appctx->ctx.sess.target = NULL;
-	appctx->ctx.sess.section = 0; /* start with stream status */
-	appctx->ctx.sess.pos = 0;
-	appctx->ctx.sess.thr = 0;
+		ctx->target = NULL;
+	ctx->section = 0; /* start with stream status */
+	ctx->pos = 0;
+	ctx->thr = 0;
+
+	/* The back-ref must be reset, it will be detected and set by
+	 * the dump code upon first invocation.
+	 */
+	LIST_INIT(&ctx->bref.users);
 
 	/* let's set our own stream's epoch to the current one and increment
 	 * it so that we know which streams were already there before us.
 	 */
-	__cs_strm(appctx->owner)->stream_epoch = _HA_ATOMIC_FETCH_ADD(&stream_epoch, 1);
+	appctx_strm(appctx)->stream_epoch = _HA_ATOMIC_FETCH_ADD(&stream_epoch, 1);
 	return 0;
 }
 
@@ -3517,228 +3524,215 @@ static int cli_parse_show_sess(char **args, char *payload, struct appctx *appctx
  */
 static int cli_io_handler_dump_sess(struct appctx *appctx)
 {
-	struct conn_stream *cs = appctx->owner;
+	struct show_sess_ctx *ctx = appctx->svcctx;
+	struct conn_stream *cs = appctx_cs(appctx);
 	struct connection *conn;
 
 	thread_isolate();
+
+	if (ctx->thr >= global.nbthread) {
+		/* already terminated */
+		goto done;
+	}
 
 	if (unlikely(cs_ic(cs)->flags & (CF_WRITE_ERROR|CF_SHUTW))) {
 		/* If we're forced to shut down, we might have to remove our
 		 * reference to the last stream being dumped.
 		 */
-		if (appctx->st2 == STAT_ST_LIST) {
-			if (!LIST_ISEMPTY(&appctx->ctx.sess.bref.users)) {
-				LIST_DELETE(&appctx->ctx.sess.bref.users);
-				LIST_INIT(&appctx->ctx.sess.bref.users);
-			}
+		if (!LIST_ISEMPTY(&ctx->bref.users)) {
+			LIST_DELETE(&ctx->bref.users);
+			LIST_INIT(&ctx->bref.users);
 		}
 		goto done;
 	}
 
 	chunk_reset(&trash);
 
-	switch (appctx->st2) {
-	case STAT_ST_INIT:
-		/* the function had not been called yet, let's prepare the
-		 * buffer for a response. We initialize the current stream
-		 * pointer to the first in the global list. When a target
-		 * stream is being destroyed, it is responsible for updating
-		 * this pointer. We know we have reached the end when this
-		 * pointer points back to the head of the streams list.
-		 */
-		LIST_INIT(&appctx->ctx.sess.bref.users);
-		appctx->ctx.sess.bref.ref = ha_thread_ctx[appctx->ctx.sess.thr].streams.n;
-		appctx->st2 = STAT_ST_LIST;
-		/* fall through */
+	/* first, let's detach the back-ref from a possible previous stream */
+	if (!LIST_ISEMPTY(&ctx->bref.users)) {
+		LIST_DELETE(&ctx->bref.users);
+		LIST_INIT(&ctx->bref.users);
+	} else if (!ctx->bref.ref) {
+		/* first call, start with first stream */
+		ctx->bref.ref = ha_thread_ctx[ctx->thr].streams.n;
+	}
 
-	case STAT_ST_LIST:
-		/* first, let's detach the back-ref from a possible previous stream */
-		if (!LIST_ISEMPTY(&appctx->ctx.sess.bref.users)) {
-			LIST_DELETE(&appctx->ctx.sess.bref.users);
-			LIST_INIT(&appctx->ctx.sess.bref.users);
-		}
+	/* and start from where we stopped */
+	while (1) {
+		char pn[INET6_ADDRSTRLEN];
+		struct stream *curr_strm;
+		int done= 0;
 
-		/* and start from where we stopped */
-		while (1) {
-			char pn[INET6_ADDRSTRLEN];
-			struct stream *curr_strm;
-			int done= 0;
-
-			if (appctx->ctx.sess.bref.ref == &ha_thread_ctx[appctx->ctx.sess.thr].streams)
+		if (ctx->bref.ref == &ha_thread_ctx[ctx->thr].streams)
+			done = 1;
+		else {
+			/* check if we've found a stream created after issuing the "show sess" */
+			curr_strm = LIST_ELEM(ctx->bref.ref, struct stream *, list);
+			if ((int)(curr_strm->stream_epoch - appctx_strm(appctx)->stream_epoch) > 0)
 				done = 1;
-			else {
-				/* check if we've found a stream created after issuing the "show sess" */
-				curr_strm = LIST_ELEM(appctx->ctx.sess.bref.ref, struct stream *, list);
-				if ((int)(curr_strm->stream_epoch - __cs_strm(appctx->owner)->stream_epoch) > 0)
-					done = 1;
-			}
-
-			if (done) {
-				appctx->ctx.sess.thr++;
-				if (appctx->ctx.sess.thr >= global.nbthread)
-					break;
-				appctx->ctx.sess.bref.ref = ha_thread_ctx[appctx->ctx.sess.thr].streams.n;
-				continue;
-			}
-
-			if (appctx->ctx.sess.target) {
-				if (appctx->ctx.sess.target != (void *)-1 && appctx->ctx.sess.target != curr_strm)
-					goto next_sess;
-
-				LIST_APPEND(&curr_strm->back_refs, &appctx->ctx.sess.bref.users);
-				/* call the proper dump() function and return if we're missing space */
-				if (!stats_dump_full_strm_to_buffer(cs, curr_strm))
-					goto full;
-
-				/* stream dump complete */
-				LIST_DELETE(&appctx->ctx.sess.bref.users);
-				LIST_INIT(&appctx->ctx.sess.bref.users);
-				if (appctx->ctx.sess.target != (void *)-1) {
-					appctx->ctx.sess.target = NULL;
-					break;
-				}
-				else
-					goto next_sess;
-			}
-
-			chunk_appendf(&trash,
-				     "%p: proto=%s",
-				     curr_strm,
-				     strm_li(curr_strm) ? strm_li(curr_strm)->rx.proto->name : "?");
-
-			conn = objt_conn(strm_orig(curr_strm));
-			switch (conn && conn_get_src(conn) ? addr_to_str(conn->src, pn, sizeof(pn)) : AF_UNSPEC) {
-			case AF_INET:
-			case AF_INET6:
-				chunk_appendf(&trash,
-					     " src=%s:%d fe=%s be=%s srv=%s",
-					     pn,
-					     get_host_port(conn->src),
-					     strm_fe(curr_strm)->id,
-					     (curr_strm->be->cap & PR_CAP_BE) ? curr_strm->be->id : "<NONE>",
-					     objt_server(curr_strm->target) ? __objt_server(curr_strm->target)->id : "<none>"
-					     );
-				break;
-			case AF_UNIX:
-				chunk_appendf(&trash,
-					     " src=unix:%d fe=%s be=%s srv=%s",
-					     strm_li(curr_strm)->luid,
-					     strm_fe(curr_strm)->id,
-					     (curr_strm->be->cap & PR_CAP_BE) ? curr_strm->be->id : "<NONE>",
-					     objt_server(curr_strm->target) ? __objt_server(curr_strm->target)->id : "<none>"
-					     );
-				break;
-			}
-
-			chunk_appendf(&trash,
-				     " ts=%02x epoch=%#x age=%s calls=%u rate=%u cpu=%llu lat=%llu",
-			             curr_strm->task->state, curr_strm->stream_epoch,
-				     human_time(now.tv_sec - curr_strm->logs.tv_accept.tv_sec, 1),
-			             curr_strm->task->calls, read_freq_ctr(&curr_strm->call_rate),
-			             (unsigned long long)curr_strm->task->cpu_time, (unsigned long long)curr_strm->task->lat_time);
-
-			chunk_appendf(&trash,
-				     " rq[f=%06xh,i=%u,an=%02xh,rx=%s",
-				     curr_strm->req.flags,
-			             (unsigned int)ci_data(&curr_strm->req),
-				     curr_strm->req.analysers,
-				     curr_strm->req.rex ?
-				     human_time(TICKS_TO_MS(curr_strm->req.rex - now_ms),
-						TICKS_TO_MS(1000)) : "");
-
-			chunk_appendf(&trash,
-				     ",wx=%s",
-				     curr_strm->req.wex ?
-				     human_time(TICKS_TO_MS(curr_strm->req.wex - now_ms),
-						TICKS_TO_MS(1000)) : "");
-
-			chunk_appendf(&trash,
-				     ",ax=%s]",
-				     curr_strm->req.analyse_exp ?
-				     human_time(TICKS_TO_MS(curr_strm->req.analyse_exp - now_ms),
-						TICKS_TO_MS(1000)) : "");
-
-			chunk_appendf(&trash,
-				     " rp[f=%06xh,i=%u,an=%02xh,rx=%s",
-				     curr_strm->res.flags,
-			             (unsigned int)ci_data(&curr_strm->res),
-				     curr_strm->res.analysers,
-				     curr_strm->res.rex ?
-				     human_time(TICKS_TO_MS(curr_strm->res.rex - now_ms),
-						TICKS_TO_MS(1000)) : "");
-
-			chunk_appendf(&trash,
-				     ",wx=%s",
-				     curr_strm->res.wex ?
-				     human_time(TICKS_TO_MS(curr_strm->res.wex - now_ms),
-						TICKS_TO_MS(1000)) : "");
-
-			chunk_appendf(&trash,
-				     ",ax=%s]",
-				     curr_strm->res.analyse_exp ?
-				     human_time(TICKS_TO_MS(curr_strm->res.analyse_exp - now_ms),
-						TICKS_TO_MS(1000)) : "");
-
-			conn = cs_conn(curr_strm->csf);
-			chunk_appendf(&trash,
-				     " csf=[%d,%1xh,fd=%d]",
-				      curr_strm->csf->state,
-				     curr_strm->csf->flags,
-				     conn_fd(conn));
-
-			conn = cs_conn(curr_strm->csb);
-			chunk_appendf(&trash,
-				     " csb=[%d,%1xh,fd=%d]",
-				      curr_strm->csb->state,
-				     curr_strm->csb->flags,
-				     conn_fd(conn));
-
-			chunk_appendf(&trash,
-				     " exp=%s rc=%d c_exp=%s",
-				     curr_strm->task->expire ?
-				     human_time(TICKS_TO_MS(curr_strm->task->expire - now_ms),
-						TICKS_TO_MS(1000)) : "",
-				     curr_strm->conn_retries,
-				     curr_strm->conn_exp ?
-				     human_time(TICKS_TO_MS(curr_strm->conn_exp - now_ms),
-						TICKS_TO_MS(1000)) : "");
-			if (task_in_rq(curr_strm->task))
-				chunk_appendf(&trash, " run(nice=%d)", curr_strm->task->nice);
-
-			chunk_appendf(&trash, "\n");
-
-			if (ci_putchk(cs_ic(cs), &trash) == -1) {
-				/* let's try again later from this stream. We add ourselves into
-				 * this stream's users so that it can remove us upon termination.
-				 */
-				LIST_APPEND(&curr_strm->back_refs, &appctx->ctx.sess.bref.users);
-				goto full;
-			}
-
-		next_sess:
-			appctx->ctx.sess.bref.ref = curr_strm->list.n;
 		}
 
-		if (appctx->ctx.sess.target && appctx->ctx.sess.target != (void *)-1) {
-			/* specified stream not found */
-			if (appctx->ctx.sess.section > 0)
-				chunk_appendf(&trash, "  *** session terminated while we were watching it ***\n");
+		if (done) {
+			ctx->thr++;
+			if (ctx->thr >= global.nbthread)
+				break;
+			ctx->bref.ref = ha_thread_ctx[ctx->thr].streams.n;
+			continue;
+		}
+
+		if (ctx->target) {
+			if (ctx->target != (void *)-1 && ctx->target != curr_strm)
+				goto next_sess;
+
+			LIST_APPEND(&curr_strm->back_refs, &ctx->bref.users);
+			/* call the proper dump() function and return if we're missing space */
+			if (!stats_dump_full_strm_to_buffer(cs, curr_strm))
+				goto full;
+
+			/* stream dump complete */
+			LIST_DELETE(&ctx->bref.users);
+			LIST_INIT(&ctx->bref.users);
+			if (ctx->target != (void *)-1) {
+				ctx->target = NULL;
+				break;
+			}
 			else
-				chunk_appendf(&trash, "Session not found.\n");
-
-			if (ci_putchk(cs_ic(cs), &trash) == -1)
-				goto full;
-
-			appctx->ctx.sess.target = NULL;
-			appctx->ctx.sess.uid = 0;
-			goto done;
+				goto next_sess;
 		}
-		/* fall through */
 
-	default:
-		appctx->st2 = STAT_ST_FIN;
+		chunk_appendf(&trash,
+			     "%p: proto=%s",
+			     curr_strm,
+			     strm_li(curr_strm) ? strm_li(curr_strm)->rx.proto->name : "?");
+
+		conn = objt_conn(strm_orig(curr_strm));
+		switch (conn && conn_get_src(conn) ? addr_to_str(conn->src, pn, sizeof(pn)) : AF_UNSPEC) {
+		case AF_INET:
+		case AF_INET6:
+			chunk_appendf(&trash,
+				     " src=%s:%d fe=%s be=%s srv=%s",
+				     pn,
+				     get_host_port(conn->src),
+				     strm_fe(curr_strm)->id,
+				     (curr_strm->be->cap & PR_CAP_BE) ? curr_strm->be->id : "<NONE>",
+				     objt_server(curr_strm->target) ? __objt_server(curr_strm->target)->id : "<none>"
+				     );
+			break;
+		case AF_UNIX:
+			chunk_appendf(&trash,
+				     " src=unix:%d fe=%s be=%s srv=%s",
+				     strm_li(curr_strm)->luid,
+				     strm_fe(curr_strm)->id,
+				     (curr_strm->be->cap & PR_CAP_BE) ? curr_strm->be->id : "<NONE>",
+				     objt_server(curr_strm->target) ? __objt_server(curr_strm->target)->id : "<none>"
+				     );
+			break;
+		}
+
+		chunk_appendf(&trash,
+			     " ts=%02x epoch=%#x age=%s calls=%u rate=%u cpu=%llu lat=%llu",
+		             curr_strm->task->state, curr_strm->stream_epoch,
+			     human_time(now.tv_sec - curr_strm->logs.tv_accept.tv_sec, 1),
+		             curr_strm->task->calls, read_freq_ctr(&curr_strm->call_rate),
+		             (unsigned long long)curr_strm->task->cpu_time, (unsigned long long)curr_strm->task->lat_time);
+
+		chunk_appendf(&trash,
+			     " rq[f=%06xh,i=%u,an=%02xh,rx=%s",
+			     curr_strm->req.flags,
+		             (unsigned int)ci_data(&curr_strm->req),
+			     curr_strm->req.analysers,
+			     curr_strm->req.rex ?
+			     human_time(TICKS_TO_MS(curr_strm->req.rex - now_ms),
+					TICKS_TO_MS(1000)) : "");
+
+		chunk_appendf(&trash,
+			     ",wx=%s",
+			     curr_strm->req.wex ?
+			     human_time(TICKS_TO_MS(curr_strm->req.wex - now_ms),
+					TICKS_TO_MS(1000)) : "");
+
+		chunk_appendf(&trash,
+			     ",ax=%s]",
+			     curr_strm->req.analyse_exp ?
+			     human_time(TICKS_TO_MS(curr_strm->req.analyse_exp - now_ms),
+					TICKS_TO_MS(1000)) : "");
+
+		chunk_appendf(&trash,
+			     " rp[f=%06xh,i=%u,an=%02xh,rx=%s",
+			     curr_strm->res.flags,
+		             (unsigned int)ci_data(&curr_strm->res),
+			     curr_strm->res.analysers,
+			     curr_strm->res.rex ?
+			     human_time(TICKS_TO_MS(curr_strm->res.rex - now_ms),
+					TICKS_TO_MS(1000)) : "");
+
+		chunk_appendf(&trash,
+			     ",wx=%s",
+			     curr_strm->res.wex ?
+			     human_time(TICKS_TO_MS(curr_strm->res.wex - now_ms),
+					TICKS_TO_MS(1000)) : "");
+
+		chunk_appendf(&trash,
+			     ",ax=%s]",
+			     curr_strm->res.analyse_exp ?
+			     human_time(TICKS_TO_MS(curr_strm->res.analyse_exp - now_ms),
+					TICKS_TO_MS(1000)) : "");
+
+		conn = cs_conn(curr_strm->csf);
+		chunk_appendf(&trash,
+			     " csf=[%d,%1xh,fd=%d]",
+			      curr_strm->csf->state,
+			     curr_strm->csf->flags,
+			     conn_fd(conn));
+
+		conn = cs_conn(curr_strm->csb);
+		chunk_appendf(&trash,
+			     " csb=[%d,%1xh,fd=%d]",
+			      curr_strm->csb->state,
+			     curr_strm->csb->flags,
+			     conn_fd(conn));
+
+		chunk_appendf(&trash,
+			     " exp=%s rc=%d c_exp=%s",
+			     curr_strm->task->expire ?
+			     human_time(TICKS_TO_MS(curr_strm->task->expire - now_ms),
+					TICKS_TO_MS(1000)) : "",
+			     curr_strm->conn_retries,
+			     curr_strm->conn_exp ?
+			     human_time(TICKS_TO_MS(curr_strm->conn_exp - now_ms),
+					TICKS_TO_MS(1000)) : "");
+		if (task_in_rq(curr_strm->task))
+			chunk_appendf(&trash, " run(nice=%d)", curr_strm->task->nice);
+
+		chunk_appendf(&trash, "\n");
+
+		if (ci_putchk(cs_ic(cs), &trash) == -1) {
+			/* let's try again later from this stream. We add ourselves into
+			 * this stream's users so that it can remove us upon termination.
+			 */
+			LIST_APPEND(&curr_strm->back_refs, &ctx->bref.users);
+			goto full;
+		}
+
+	next_sess:
+		ctx->bref.ref = curr_strm->list.n;
+	}
+
+	if (ctx->target && ctx->target != (void *)-1) {
+		/* specified stream not found */
+		if (ctx->section > 0)
+			chunk_appendf(&trash, "  *** session terminated while we were watching it ***\n");
+		else
+			chunk_appendf(&trash, "Session not found.\n");
+
+		if (ci_putchk(cs_ic(cs), &trash) == -1)
+			goto full;
+
+		ctx->target = NULL;
+		ctx->uid = 0;
 		goto done;
 	}
+
  done:
 	thread_release();
 	return 1;
@@ -3750,15 +3744,17 @@ static int cli_io_handler_dump_sess(struct appctx *appctx)
 
 static void cli_release_show_sess(struct appctx *appctx)
 {
-	if (appctx->st2 == STAT_ST_LIST && appctx->ctx.sess.thr < global.nbthread) {
+	struct show_sess_ctx *ctx = appctx->svcctx;
+
+	if (ctx->thr < global.nbthread) {
 		/* a dump was aborted, either in error or timeout. We need to
 		 * safely detach from the target stream's list. It's mandatory
 		 * to lock because a stream on the target thread could be moving
 		 * our node.
 		 */
 		thread_isolate();
-		if (!LIST_ISEMPTY(&appctx->ctx.sess.bref.users))
-			LIST_DELETE(&appctx->ctx.sess.bref.users);
+		if (!LIST_ISEMPTY(&ctx->bref.users))
+			LIST_DELETE(&ctx->bref.users);
 		thread_release();
 	}
 }

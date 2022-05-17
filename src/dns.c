@@ -90,11 +90,15 @@ int dns_send_nameserver(struct dns_nameserver *ns, void *buf, size_t len)
 
 	if (ns->dgram) {
 		struct dgram_conn *dgram = &ns->dgram->conn;
-		int fd = dgram->t.sock.fd;
+		int fd;
 
-		if (dgram->t.sock.fd == -1) {
-			if (dns_connect_nameserver(ns) == -1)
+		HA_SPIN_LOCK(DNS_LOCK, &dgram->lock);
+		fd = dgram->t.sock.fd;
+		if (fd == -1) {
+			if (dns_connect_nameserver(ns) == -1) {
+				HA_SPIN_UNLOCK(DNS_LOCK, &dgram->lock);
 				return -1;
+			}
 			fd = dgram->t.sock.fd;
 		}
 
@@ -107,17 +111,21 @@ int dns_send_nameserver(struct dns_nameserver *ns, void *buf, size_t len)
 				ret = ring_write(ns->dgram->ring_req, DNS_TCP_MSG_MAX_SIZE, NULL, 0, &myist, 1);
 				if (!ret) {
 					ns->counters->snd_error++;
+					HA_SPIN_UNLOCK(DNS_LOCK, &dgram->lock);
 					return -1;
 				}
 				fd_cant_send(fd);
+				HA_SPIN_UNLOCK(DNS_LOCK, &dgram->lock);
 				return ret;
 			}
 			ns->counters->snd_error++;
 			fd_delete(fd);
 			dgram->t.sock.fd = -1;
+			HA_SPIN_UNLOCK(DNS_LOCK, &dgram->lock);
 			return -1;
 		}
 		ns->counters->sent++;
+		HA_SPIN_UNLOCK(DNS_LOCK, &dgram->lock);
 	}
 	else if (ns->stream) {
 		struct ist myist;
@@ -148,20 +156,27 @@ ssize_t dns_recv_nameserver(struct dns_nameserver *ns, void *data, size_t size)
 
 	if (ns->dgram) {
 		struct dgram_conn *dgram = &ns->dgram->conn;
-		int fd = dgram->t.sock.fd;
+		int fd;
 
-		if (fd == -1)
+		HA_SPIN_LOCK(DNS_LOCK, &dgram->lock);
+		fd = dgram->t.sock.fd;
+		if (fd == -1) {
+			HA_SPIN_UNLOCK(DNS_LOCK, &dgram->lock);
 			return -1;
+		}
 
 		if ((ret = recv(fd, data, size, 0)) < 0) {
 			if (errno == EAGAIN || errno == EWOULDBLOCK) {
 				fd_cant_recv(fd);
+				HA_SPIN_UNLOCK(DNS_LOCK, &dgram->lock);
 				return 0;
 			}
 			fd_delete(fd);
 			dgram->t.sock.fd = -1;
+			HA_SPIN_UNLOCK(DNS_LOCK, &dgram->lock);
 			return -1;
 		}
+		HA_SPIN_UNLOCK(DNS_LOCK, &dgram->lock);
 	}
 	else if (ns->stream) {
 		struct dns_stream_server *dss = ns->stream;
@@ -247,18 +262,25 @@ static void dns_resolve_recv(struct dgram_conn *dgram)
 	struct dns_nameserver *ns;
 	int fd;
 
+	HA_SPIN_LOCK(DNS_LOCK, &dgram->lock);
+
 	fd = dgram->t.sock.fd;
 
 	/* check if ready for reading */
-	if (!fd_recv_ready(fd))
+	if ((fd == -1) || !fd_recv_ready(fd)) {
+		HA_SPIN_UNLOCK(DNS_LOCK, &dgram->lock);
 		return;
+	}
 
 	/* no need to go further if we can't retrieve the nameserver */
 	if ((ns = dgram->owner) == NULL) {
 		_HA_ATOMIC_AND(&fdtab[fd].state, ~(FD_POLL_HUP|FD_POLL_ERR));
 		fd_stop_recv(fd);
+		HA_SPIN_UNLOCK(DNS_LOCK, &dgram->lock);
 		return;
 	}
+
+	HA_SPIN_UNLOCK(DNS_LOCK, &dgram->lock);
 
 	ns->process_responses(ns);
 }
@@ -273,16 +295,21 @@ static void dns_resolve_send(struct dgram_conn *dgram)
 	uint64_t msg_len;
 	size_t len, cnt, ofs;
 
+	HA_SPIN_LOCK(DNS_LOCK, &dgram->lock);
+
 	fd = dgram->t.sock.fd;
 
 	/* check if ready for sending */
-	if (!fd_send_ready(fd))
+	if ((fd == -1) || !fd_send_ready(fd)) {
+		HA_SPIN_UNLOCK(DNS_LOCK, &dgram->lock);
 		return;
+	}
 
 	/* no need to go further if we can't retrieve the nameserver */
 	if ((ns = dgram->owner) == NULL) {
 		_HA_ATOMIC_AND(&fdtab[fd].state, ~(FD_POLL_HUP|FD_POLL_ERR));
 		fd_stop_send(fd);
+		HA_SPIN_UNLOCK(DNS_LOCK, &dgram->lock);
 		return;
 	}
 
@@ -356,6 +383,7 @@ out:
 	ofs += ring->ofs;
 	ns->dgram->ofs_req = ofs;
 	HA_RWLOCK_RDUNLOCK(DNS_LOCK, &ring->lock);
+	HA_SPIN_UNLOCK(DNS_LOCK, &dgram->lock);
 
 }
 
@@ -378,6 +406,7 @@ int dns_dgram_init(struct dns_nameserver *ns, struct sockaddr_storage *sk)
 	dgram->conn.data      = &dns_dgram_cb;
 	dgram->conn.t.sock.fd = -1;
 	dgram->conn.addr.to = *sk;
+	HA_SPIN_INIT(&dgram->conn.lock);
 	ns->dgram = dgram;
 
 	dgram->ofs_req = ~0; /* init ring offset */
@@ -405,11 +434,12 @@ out:
 
 /*
  * IO Handler to handle message push to dns tcp server
+ * It takes its context from appctx->svcctx.
  */
 static void dns_session_io_handler(struct appctx *appctx)
 {
-	struct conn_stream *cs = appctx->owner;
-	struct dns_session *ds = appctx->ctx.sft.ptr;
+	struct conn_stream *cs = appctx_cs(appctx);
+	struct dns_session *ds = appctx->svcctx;
 	struct ring *ring = &ds->ring;
 	struct buffer *buf = &ring->buf;
 	uint64_t msg_len;
@@ -785,12 +815,47 @@ void dns_session_free(struct dns_session *ds)
 
 static struct appctx *dns_session_create(struct dns_session *ds);
 
+static int dns_session_init(struct appctx *appctx)
+{
+	struct dns_session *ds = appctx->svcctx;
+	struct stream *s;
+	struct sockaddr_storage *addr = NULL;
+
+	if (!sockaddr_alloc(&addr, &ds->dss->srv->addr, sizeof(ds->dss->srv->addr)))
+		goto error;
+
+	if (appctx_finalize_startup(appctx, ds->dss->srv->proxy, &BUF_NULL) == -1)
+		goto error;
+
+	s = appctx_strm(appctx);
+	s->csb->dst = addr;
+	s->csb->flags |= CS_FL_NOLINGER;
+	s->target = &ds->dss->srv->obj_type;
+	s->flags = SF_ASSIGNED;
+
+	s->do_log = NULL;
+	s->uniq_id = 0;
+
+	s->res.flags |= CF_READ_DONTWAIT;
+	/* for rto and rex to eternity to not expire on idle recv:
+	 * We are using a syslog server.
+	 */
+	s->res.rto = TICK_ETERNITY;
+	s->res.rex = TICK_ETERNITY;
+
+	ds->appctx = appctx;
+	return 0;
+
+  error:
+	return -1;
+}
+
 /*
  * Function to release a DNS tcp session
  */
 static void dns_session_release(struct appctx *appctx)
 {
-	struct dns_session *ds = appctx->ctx.sft.ptr;
+	struct dns_session *ds = appctx->svcctx;
 	struct dns_stream_server *dss __maybe_unused;
 
 	if (!ds)
@@ -878,66 +943,33 @@ static struct applet dns_session_applet = {
 	.obj_type = OBJ_TYPE_APPLET,
 	.name = "<STRMDNS>", /* used for logging */
 	.fct = dns_session_io_handler,
+	.init = dns_session_init,
 	.release = dns_session_release,
 };
 
 /*
  * Function used to create an appctx for a DNS session
+ * It sets its context into appctx->svcctx.
  */
 static struct appctx *dns_session_create(struct dns_session *ds)
 {
 	struct appctx *appctx;
-	struct session *sess;
-	struct conn_stream *cs;
-	struct stream *s;
-	struct applet *applet = &dns_session_applet;
-	struct sockaddr_storage *addr = NULL;
 
-	appctx = appctx_new(applet, NULL);
+	appctx = appctx_new_here(&dns_session_applet, NULL);
 	if (!appctx)
 		goto out_close;
-	appctx->ctx.sft.ptr = (void *)ds;
+	appctx->svcctx = (void *)ds;
 
-	sess = session_new(ds->dss->srv->proxy, NULL, &appctx->obj_type);
-	if (!sess) {
+	if (appctx_init(appctx) == -1) {
 		ha_alert("out of memory in dns_session_create().\n");
 		goto out_free_appctx;
 	}
 
-	if (!sockaddr_alloc(&addr, &ds->dss->srv->addr, sizeof(ds->dss->srv->addr)))
-		goto out_free_sess;
-
-	cs = cs_new_from_applet(appctx->endp, sess, &BUF_NULL);
-	if (!cs) {
-		ha_alert("Failed to initialize stream in dns_session_create().\n");
-		goto out_free_addr;
-	}
-
-	s = DISGUISE(cs_strm(cs));
-	s->csb->dst = addr;
-	s->csb->flags |= CS_FL_NOLINGER;
-	s->target = &ds->dss->srv->obj_type;
-	s->flags = SF_ASSIGNED;
-
-	s->do_log = NULL;
-	s->uniq_id = 0;
-
-	s->res.flags |= CF_READ_DONTWAIT;
-	/* for rto and rex to eternity to not expire on idle recv:
-	 * We are using a syslog server.
-	 */
-	s->res.rto = TICK_ETERNITY;
-	s->res.rex = TICK_ETERNITY;
-	ds->appctx = appctx;
 	return appctx;
 
 	/* Error unrolling */
- out_free_addr:
-	sockaddr_free(&addr);
- out_free_sess:
-	session_free(sess);
  out_free_appctx:
-	appctx_free(appctx);
+	appctx_free_on_early_error(appctx);
  out_close:
 	return NULL;
 }

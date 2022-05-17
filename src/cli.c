@@ -86,6 +86,24 @@ extern const char *stat_status_codes[];
 
 struct proxy *mworker_proxy; /* CLI proxy of the master */
 
+/* CLI context for the "show env" command */
+struct show_env_ctx {
+	char **var;      /* first variable to show */
+	int show_one;    /* stop after showing the first one */
+};
+
+/* CLI context for the "show fd" command */
+struct show_fd_ctx {
+	int fd;          /* first FD to show */
+	int show_one;    /* stop after showing one FD */
+};
+
+/* CLI context for the "show cli sockets" command */
+struct show_sock_ctx {
+	struct bind_conf *bind_conf;
+	struct listener *listener;
+};
+
 static int cmp_kw_entries(const void *a, const void *b)
 {
 	const struct cli_kw *l = *(const struct cli_kw **)a;
@@ -290,10 +308,7 @@ static char *cli_gen_usage_msg(struct appctx *appctx, char * const *args)
 	chunk_dup(&out, tmp);
 	dynamic_usage_msg = out.area;
 
-	appctx->ctx.cli.severity = LOG_INFO;
-	appctx->ctx.cli.msg = dynamic_usage_msg;
-	appctx->st0 = CLI_ST_PRINT;
-
+	cli_msg(appctx, LOG_INFO, dynamic_usage_msg);
 	return dynamic_usage_msg;
 }
 
@@ -707,7 +722,7 @@ static int cli_get_severity_output(struct appctx *appctx)
 {
 	if (appctx->cli_severity_output)
 		return appctx->cli_severity_output;
-	return strm_li(__cs_strm(appctx->owner))->bind_conf->severity_output;
+	return strm_li(appctx_strm(appctx))->bind_conf->severity_output;
 }
 
 /* Processes the CLI interpreter on the stats socket. This function is called
@@ -727,8 +742,15 @@ static int cli_parse_request(struct appctx *appctx)
 	int i = 0;
 	struct cli_kw *kw;
 
-	appctx->st2 = 0;
-	memset(&appctx->ctx.cli, 0, sizeof(appctx->ctx.cli));
+	appctx->_st2 = 0;
+
+	/* temporary for 2.6: let's make sure we clean the whole shared
+	 * context.
+	 */
+	if (sizeof(appctx->ctx) > sizeof(appctx->svc))
+		memset(&appctx->ctx, 0, sizeof(appctx->ctx));
+	else
+		memset(&appctx->svc, 0, sizeof(appctx->svc));
 
 	p = appctx->chunk->area;
 	end = p + appctx->chunk->data;
@@ -875,7 +897,7 @@ static int cli_output_msg(struct channel *chn, const char *msg, int severity, in
  */
 static void cli_io_handler(struct appctx *appctx)
 {
-	struct conn_stream *cs = appctx->owner;
+	struct conn_stream *cs = appctx_cs(appctx);
 	struct channel *req = cs_oc(cs);
 	struct channel *res = cs_ic(cs);
 	struct bind_conf *bind_conf = strm_li(__cs_strm(cs))->bind_conf;
@@ -895,8 +917,8 @@ static void cli_io_handler(struct appctx *appctx)
 
 	while (1) {
 		if (appctx->st0 == CLI_ST_INIT) {
-			/* Stats output not initialized yet */
-			memset(&appctx->ctx.stats, 0, sizeof(appctx->ctx.stats));
+			/* CLI/stats not initialized yet */
+			memset(&appctx->ctx, 0, sizeof(appctx->ctx));
 			/* reset severity to default at init */
 			appctx->cli_severity_output = bind_conf->severity_output;
 			appctx->st0 = CLI_ST_GETREQ;
@@ -1032,6 +1054,7 @@ static void cli_io_handler(struct appctx *appctx)
 			req->flags |= CF_READ_DONTWAIT; /* we plan to read small requests */
 		}
 		else {	/* output functions */
+			struct cli_print_ctx *ctx;
 			const char *msg;
 			int sev;
 
@@ -1042,15 +1065,17 @@ static void cli_io_handler(struct appctx *appctx)
 			case CLI_ST_PRINT_ERR:   /* print const error in msg */
 			case CLI_ST_PRINT_DYN:   /* print dyn message in msg, free */
 			case CLI_ST_PRINT_FREE:  /* print dyn error in err, free */
+				/* the message is in the svcctx */
+				ctx = applet_reserve_svcctx(appctx, sizeof(*ctx));
 				if (appctx->st0 == CLI_ST_PRINT || appctx->st0 == CLI_ST_PRINT_ERR) {
 					sev = appctx->st0 == CLI_ST_PRINT_ERR ?
-						LOG_ERR : appctx->ctx.cli.severity;
-					msg = appctx->ctx.cli.msg;
+						LOG_ERR : ctx->severity;
+					msg = ctx->msg;
 				}
 				else if (appctx->st0 == CLI_ST_PRINT_DYN || appctx->st0 == CLI_ST_PRINT_FREE) {
 					sev = appctx->st0 == CLI_ST_PRINT_FREE ?
-						LOG_ERR : appctx->ctx.cli.severity;
-					msg = appctx->ctx.cli.err;
+						LOG_ERR : ctx->severity;
+					msg = ctx->err;
 					if (!msg) {
 						sev = LOG_ERR;
 						msg = "Out of memory.\n";
@@ -1064,7 +1089,7 @@ static void cli_io_handler(struct appctx *appctx)
 				if (cli_output_msg(res, msg, sev, cli_get_severity_output(appctx)) != -1) {
 					if (appctx->st0 == CLI_ST_PRINT_FREE ||
 					    appctx->st0 == CLI_ST_PRINT_DYN) {
-						ha_free(&appctx->ctx.cli.err);
+						ha_free(&ctx->err);
 					}
 					appctx->st0 = CLI_ST_PROMPT;
 				}
@@ -1083,7 +1108,7 @@ static void cli_io_handler(struct appctx *appctx)
 					}
 				break;
 			default: /* abnormal state */
-				cs->endp->flags |= CS_EP_ERROR;
+				appctx->endp->flags |= CS_EP_ERROR;
 				break;
 			}
 
@@ -1187,19 +1212,22 @@ static void cli_release_handler(struct appctx *appctx)
 		appctx->io_release = NULL;
 	}
 	else if (appctx->st0 == CLI_ST_PRINT_FREE || appctx->st0 == CLI_ST_PRINT_DYN) {
-		ha_free(&appctx->ctx.cli.err);
+		struct cli_print_ctx *ctx = applet_reserve_svcctx(appctx, sizeof(*ctx));
+
+		ha_free(&ctx->err);
 	}
 }
 
 /* This function dumps all environmnent variables to the buffer. It returns 0
  * if the output buffer is full and it needs to be called again, otherwise
- * non-zero. Dumps only one entry if st2 == STAT_ST_END. It uses cli.p0 as the
- * pointer to the current variable.
+ * non-zero. It takes its context from the show_env_ctx in svcctx, and will
+ * start from ->var and dump only one variable if ->show_one is set.
  */
 static int cli_io_handler_show_env(struct appctx *appctx)
 {
-	struct conn_stream *cs = appctx->owner;
-	char **var = appctx->ctx.cli.p0;
+	struct show_env_ctx *ctx = appctx->svcctx;
+	struct conn_stream *cs = appctx_cs(appctx);
+	char **var = ctx->var;
 
 	if (unlikely(cs_ic(cs)->flags & (CF_WRITE_ERROR|CF_SHUTW)))
 		return 1;
@@ -1216,10 +1244,10 @@ static int cli_io_handler_show_env(struct appctx *appctx)
 			cs_rx_room_blk(cs);
 			return 0;
 		}
-		if (appctx->st2 == STAT_ST_END)
+		if (ctx->show_one)
 			break;
 		var++;
-		appctx->ctx.cli.p0 = var;
+		ctx->var = var;
 	}
 
 	/* dump complete */
@@ -1228,13 +1256,15 @@ static int cli_io_handler_show_env(struct appctx *appctx)
 
 /* This function dumps all file descriptors states (or the requested one) to
  * the buffer. It returns 0 if the output buffer is full and it needs to be
- * called again, otherwise non-zero. Dumps only one entry if st2 == STAT_ST_END.
- * It uses cli.i0 as the fd number to restart from.
+ * called again, otherwise non-zero. It takes its context from the show_fd_ctx
+ * in svcctx, only dumps one entry if ->show_one is non-zero, and (re)starts
+ * from ->fd.
  */
 static int cli_io_handler_show_fd(struct appctx *appctx)
 {
-	struct conn_stream *cs = appctx->owner;
-	int fd = appctx->ctx.cli.i0;
+	struct conn_stream *cs = appctx_cs(appctx);
+	struct show_fd_ctx *fdctx = appctx->svcctx;
+	int fd = fdctx->fd;
 	int ret = 1;
 
 	if (unlikely(cs_ic(cs)->flags & (CF_WRITE_ERROR|CF_SHUTW)))
@@ -1406,12 +1436,12 @@ static int cli_io_handler_show_fd(struct appctx *appctx)
 
 		if (ci_putchk(cs_ic(cs), &trash) == -1) {
 			cs_rx_room_blk(cs);
-			appctx->ctx.cli.i0 = fd;
+			fdctx->fd = fd;
 			ret = 0;
 			break;
 		}
 	skip:
-		if (appctx->st2 == STAT_ST_END)
+		if (fdctx->show_one)
 			break;
 
 		fd++;
@@ -1432,7 +1462,7 @@ static int cli_io_handler_show_fd(struct appctx *appctx)
  */
 static int cli_io_handler_show_activity(struct appctx *appctx)
 {
-	struct conn_stream *cs = appctx->owner;
+	struct conn_stream *cs = appctx_cs(appctx);
 	int thr;
 
 	if (unlikely(cs_ic(cs)->flags & (CF_WRITE_ERROR|CF_SHUTW)))
@@ -1530,102 +1560,93 @@ static int cli_io_handler_show_activity(struct appctx *appctx)
 
 /*
  * CLI IO handler for `show cli sockets`.
- * Uses ctx.cli.p0 to store the restart pointer.
+ * Uses the svcctx as a show_sock_ctx to store/retrieve the bind_conf and the
+ * listener pointers.
  */
 static int cli_io_handler_show_cli_sock(struct appctx *appctx)
 {
-	struct bind_conf *bind_conf;
-	struct conn_stream *cs = appctx->owner;
+	struct show_sock_ctx *ctx = applet_reserve_svcctx(appctx, sizeof(*ctx));
+	struct bind_conf *bind_conf = ctx->bind_conf;
+	struct conn_stream *cs = appctx_cs(appctx);
+
+	if (!global.cli_fe)
+		goto done;
 
 	chunk_reset(&trash);
 
-	switch (appctx->st2) {
-		case STAT_ST_INIT:
-			chunk_printf(&trash, "# socket lvl processes\n");
-			if (ci_putchk(cs_ic(cs), &trash) == -1) {
-				cs_rx_room_blk(cs);
-				return 0;
-			}
-			appctx->st2 = STAT_ST_LIST;
-			/* fall through */
-
-		case STAT_ST_LIST:
-			if (global.cli_fe) {
-				list_for_each_entry(bind_conf, &global.cli_fe->conf.bind, by_fe) {
-					struct listener *l;
-
-					/*
-					 * get the latest dumped node in appctx->ctx.cli.p0
-					 * if the current node is the first of the list
-					 */
-
-					if (appctx->ctx.cli.p0  &&
-					    &bind_conf->by_fe == (&global.cli_fe->conf.bind)->n) {
-						/* change the current node to the latest dumped and continue the loop */
-						bind_conf = LIST_ELEM(appctx->ctx.cli.p0, typeof(bind_conf), by_fe);
-						continue;
-					}
-
-					list_for_each_entry(l, &bind_conf->listeners, by_bind) {
-
-						char addr[46];
-						char port[6];
-
-						if (l->rx.addr.ss_family == AF_UNIX) {
-							const struct sockaddr_un *un;
-
-							un = (struct sockaddr_un *)&l->rx.addr;
-							if (un->sun_path[0] == '\0') {
-								chunk_appendf(&trash, "abns@%s ", un->sun_path+1);
-							} else {
-								chunk_appendf(&trash, "unix@%s ", un->sun_path);
-							}
-						} else if (l->rx.addr.ss_family == AF_INET) {
-							addr_to_str(&l->rx.addr, addr, sizeof(addr));
-							port_to_str(&l->rx.addr, port, sizeof(port));
-							chunk_appendf(&trash, "ipv4@%s:%s ", addr, port);
-						} else if (l->rx.addr.ss_family == AF_INET6) {
-							addr_to_str(&l->rx.addr, addr, sizeof(addr));
-							port_to_str(&l->rx.addr, port, sizeof(port));
-							chunk_appendf(&trash, "ipv6@[%s]:%s ", addr, port);
-						} else if (l->rx.addr.ss_family == AF_CUST_SOCKPAIR) {
-							chunk_appendf(&trash, "sockpair@%d ", ((struct sockaddr_in *)&l->rx.addr)->sin_addr.s_addr);
-						} else
-							chunk_appendf(&trash, "unknown ");
-
-						if ((bind_conf->level & ACCESS_LVL_MASK) == ACCESS_LVL_ADMIN)
-							chunk_appendf(&trash, "admin ");
-						else if ((bind_conf->level & ACCESS_LVL_MASK) == ACCESS_LVL_OPER)
-							chunk_appendf(&trash, "operator ");
-						else if ((bind_conf->level & ACCESS_LVL_MASK) == ACCESS_LVL_USER)
-							chunk_appendf(&trash, "user ");
-						else
-							chunk_appendf(&trash, "  ");
-
-						chunk_appendf(&trash, "all\n");
-
-						if (ci_putchk(cs_ic(cs), &trash) == -1) {
-							cs_rx_room_blk(cs);
-							return 0;
-						}
-					}
-					appctx->ctx.cli.p0 = &bind_conf->by_fe; /* store the latest list node dumped */
-				}
-			}
-			/* fall through */
-		default:
-			appctx->st2 = STAT_ST_FIN;
-			return 1;
+	if (!bind_conf) {
+		/* first call */
+		if (ci_putstr(cs_ic(cs), "# socket lvl processes\n") == -1)
+			goto full;
+		bind_conf = LIST_ELEM(global.cli_fe->conf.bind.n, typeof(bind_conf), by_fe);
 	}
+
+	list_for_each_entry_from(bind_conf, &global.cli_fe->conf.bind, by_fe) {
+		struct listener *l = ctx->listener;
+
+		if (!l)
+			l = LIST_ELEM(bind_conf->listeners.n, typeof(l), by_bind);
+
+		list_for_each_entry_from(l, &bind_conf->listeners, by_bind) {
+			char addr[46];
+			char port[6];
+
+			if (l->rx.addr.ss_family == AF_UNIX) {
+				const struct sockaddr_un *un;
+
+				un = (struct sockaddr_un *)&l->rx.addr;
+				if (un->sun_path[0] == '\0') {
+					chunk_appendf(&trash, "abns@%s ", un->sun_path+1);
+				} else {
+					chunk_appendf(&trash, "unix@%s ", un->sun_path);
+				}
+			} else if (l->rx.addr.ss_family == AF_INET) {
+				addr_to_str(&l->rx.addr, addr, sizeof(addr));
+				port_to_str(&l->rx.addr, port, sizeof(port));
+				chunk_appendf(&trash, "ipv4@%s:%s ", addr, port);
+			} else if (l->rx.addr.ss_family == AF_INET6) {
+				addr_to_str(&l->rx.addr, addr, sizeof(addr));
+				port_to_str(&l->rx.addr, port, sizeof(port));
+				chunk_appendf(&trash, "ipv6@[%s]:%s ", addr, port);
+			} else if (l->rx.addr.ss_family == AF_CUST_SOCKPAIR) {
+				chunk_appendf(&trash, "sockpair@%d ", ((struct sockaddr_in *)&l->rx.addr)->sin_addr.s_addr);
+			} else
+				chunk_appendf(&trash, "unknown ");
+
+			if ((bind_conf->level & ACCESS_LVL_MASK) == ACCESS_LVL_ADMIN)
+				chunk_appendf(&trash, "admin ");
+			else if ((bind_conf->level & ACCESS_LVL_MASK) == ACCESS_LVL_OPER)
+				chunk_appendf(&trash, "operator ");
+			else if ((bind_conf->level & ACCESS_LVL_MASK) == ACCESS_LVL_USER)
+				chunk_appendf(&trash, "user ");
+			else
+				chunk_appendf(&trash, "  ");
+
+			chunk_appendf(&trash, "all\n");
+
+			if (ci_putchk(cs_ic(cs), &trash) == -1) {
+				ctx->bind_conf = bind_conf;
+				ctx->listener  = l;
+				goto full;
+			}
+		}
+	}
+ done:
+	return 1;
+ full:
+	cs_rx_room_blk(cs);
+	return 0;
 }
 
 
 /* parse a "show env" CLI request. Returns 0 if it needs to continue, 1 if it
- * wants to stop here. It puts the variable to be dumped into cli.p0 if a single
- * variable is requested otherwise puts environ there.
+ * wants to stop here. It reserves a sohw_env_ctx where it puts the variable to
+ * be dumped as well as a flag if a single variable is requested, otherwise puts
+ * environ there.
  */
 static int cli_parse_show_env(char **args, char *payload, struct appctx *appctx, void *private)
 {
+	struct show_env_ctx *ctx = applet_reserve_svcctx(appctx, sizeof(*ctx));
 	extern char **environ;
 	char **var;
 
@@ -1645,26 +1666,26 @@ static int cli_parse_show_env(char **args, char *payload, struct appctx *appctx,
 		if (!*var)
 			return cli_err(appctx, "Variable not found\n");
 
-		appctx->st2 = STAT_ST_END;
+		ctx->show_one = 1;
 	}
-	appctx->ctx.cli.p0 = var;
+	ctx->var = var;
 	return 0;
 }
 
 /* parse a "show fd" CLI request. Returns 0 if it needs to continue, 1 if it
- * wants to stop here. It puts the FD number into cli.i0 if a specific FD is
- * requested and sets st2 to STAT_ST_END, otherwise leaves 0 in i0.
+ * wants to stop here. It sets a show_fd_ctx context where, if a specific fd is
+ * requested, it puts the FD number into ->fd and sets ->show_one to 1.
  */
 static int cli_parse_show_fd(char **args, char *payload, struct appctx *appctx, void *private)
 {
+	struct show_fd_ctx *ctx = applet_reserve_svcctx(appctx, sizeof(*ctx));
+
 	if (!cli_has_level(appctx, ACCESS_LVL_OPER))
 		return 1;
 
-	appctx->ctx.cli.i0 = 0;
-
 	if (*args[2]) {
-		appctx->ctx.cli.i0 = atoi(args[2]);
-		appctx->st2 = STAT_ST_END;
+		ctx->fd = atoi(args[2]);
+		ctx->show_one = 1;
 	}
 	return 0;
 }
@@ -1672,7 +1693,7 @@ static int cli_parse_show_fd(char **args, char *payload, struct appctx *appctx, 
 /* parse a "set timeout" CLI request. It always returns 1. */
 static int cli_parse_set_timeout(char **args, char *payload, struct appctx *appctx, void *private)
 {
-	struct stream *s = __cs_strm(appctx->owner);
+	struct stream *s = appctx_strm(appctx);
 
 	if (strcmp(args[2], "cli") == 0) {
 		unsigned timeout;
@@ -1955,7 +1976,7 @@ static int _getsocks(char **args, char *payload, struct appctx *appctx, void *pr
 	char *cmsgbuf = NULL;
 	unsigned char *tmpbuf = NULL;
 	struct cmsghdr *cmsg;
-	struct conn_stream *cs = appctx->owner;
+	struct conn_stream *cs = appctx_cs(appctx);
 	struct stream *s = __cs_strm(cs);
 	struct connection *remote = cs_conn(cs_opposite(cs));
 	struct msghdr msghdr;

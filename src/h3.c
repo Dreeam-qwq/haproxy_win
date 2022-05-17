@@ -25,6 +25,7 @@
 #include <haproxy/htx.h>
 #include <haproxy/istbuf.h>
 #include <haproxy/mux_quic.h>
+#include <haproxy/ncbuf.h>
 #include <haproxy/pool.h>
 #include <haproxy/qpack-dec.h>
 #include <haproxy/qpack-enc.h>
@@ -76,9 +77,9 @@ struct h3s {
 DECLARE_STATIC_POOL(pool_head_h3s, "h3s", sizeof(struct h3s));
 
 /* Simple function to duplicate a buffer */
-static inline struct buffer h3_b_dup(struct buffer *b)
+static inline struct buffer h3_b_dup(struct ncbuf *b)
 {
-	return b_make(b->area, b->size, b->head, b->data);
+	return b_make(ncb_orig(b), b->size, b->head, ncb_data(b, 0));
 }
 
 /* Decode a h3 frame header made of two QUIC varints from <b> buffer.
@@ -104,7 +105,7 @@ static inline size_t h3_decode_frm_header(uint64_t *ftype, uint64_t *flen,
  *
  * Returns the number of bytes handled or a negative error code.
  */
-static int h3_headers_to_htx(struct qcs *qcs, struct buffer *buf, uint64_t len,
+static int h3_headers_to_htx(struct qcs *qcs, struct ncbuf *buf, uint64_t len,
                              char fin)
 {
 	struct buffer htx_buf = BUF_NULL;
@@ -112,7 +113,6 @@ static int h3_headers_to_htx(struct qcs *qcs, struct buffer *buf, uint64_t len,
 	struct htx *htx = NULL;
 	struct htx_sl *sl;
 	struct http_hdr list[global.tune.max_http_hdr];
-	struct conn_stream *cs;
 	unsigned int flags = HTX_SL_F_NONE;
 	struct ist meth = IST_NULL, path = IST_NULL;
 	//struct ist scheme = IST_NULL, authority = IST_NULL;
@@ -120,8 +120,8 @@ static int h3_headers_to_htx(struct qcs *qcs, struct buffer *buf, uint64_t len,
 	int hdr_idx;
 
 	/* TODO support buffer wrapping */
-	BUG_ON(b_contig_data(buf, 0) != b_data(buf));
-	if (qpack_decode_fs((const unsigned char *)b_head(buf), len, tmp, list) < 0)
+	BUG_ON(ncb_head(buf) + len >= ncb_wrap(buf));
+	if (qpack_decode_fs((const unsigned char *)ncb_head(buf), len, tmp, list) < 0)
 		return -1;
 
 	qc_get_buf(qcs, &htx_buf);
@@ -183,8 +183,7 @@ static int h3_headers_to_htx(struct qcs *qcs, struct buffer *buf, uint64_t len,
 	if (fin)
 		htx->flags |= HTX_FL_EOM;
 
-	cs = qc_attach_cs(qcs, &htx_buf);
-	if (!cs)
+	if (!qc_attach_cs(qcs, &htx_buf))
 		return -1;
 
 	/* buffer is transferred to conn_stream and set to NULL
@@ -202,12 +201,12 @@ static int h3_headers_to_htx(struct qcs *qcs, struct buffer *buf, uint64_t len,
  *
  * Returns the number of bytes handled or a negative error code.
  */
-static int h3_data_to_htx(struct qcs *qcs, struct buffer *buf, uint64_t len,
+static int h3_data_to_htx(struct qcs *qcs, struct ncbuf *buf, uint64_t len,
                           char fin)
 {
 	struct buffer *appbuf;
 	struct htx *htx = NULL;
-	size_t contig = 0, htx_sent = 0;
+	size_t htx_sent = 0;
 	int htx_space;
 	char *head;
 
@@ -215,12 +214,12 @@ static int h3_data_to_htx(struct qcs *qcs, struct buffer *buf, uint64_t len,
 	BUG_ON(!appbuf);
 	htx = htx_from_buf(appbuf);
 
-	if (len > b_data(buf)) {
-		len = b_data(buf);
+	if (len > ncb_data(buf, 0)) {
+		len = ncb_data(buf, 0);
 		fin = 0;
 	}
 
-	head = b_head(buf);
+	head = ncb_head(buf);
  retry:
 	htx_space = htx_free_data_space(htx);
 	if (!htx_space) {
@@ -233,10 +232,10 @@ static int h3_data_to_htx(struct qcs *qcs, struct buffer *buf, uint64_t len,
 		fin = 0;
 	}
 
-	contig = b_contig_data(buf, contig);
-	if (len > contig) {
-		htx_sent = htx_add_data(htx, ist2(b_head(buf), contig));
-		head = b_orig(buf);
+	if (head + len > ncb_wrap(buf)) {
+		size_t contig = ncb_wrap(buf) - head;
+		htx_sent = htx_add_data(htx, ist2(ncb_head(buf), contig));
+		head = ncb_orig(buf);
 		len -= contig;
 		goto retry;
 	}
@@ -258,15 +257,15 @@ static int h3_data_to_htx(struct qcs *qcs, struct buffer *buf, uint64_t len,
  */
 static int h3_decode_qcs(struct qcs *qcs, int fin, void *ctx)
 {
-	struct buffer *rxbuf = &qcs->rx.buf;
+	struct ncbuf *rxbuf = &qcs->rx.ncbuf;
 	struct h3s *h3s = qcs->ctx;
 	ssize_t ret;
 
 	h3_debug_printf(stderr, "%s: STREAM ID: %lu\n", __func__, qcs->id);
-	if (!b_data(rxbuf))
+	if (!ncb_data(rxbuf, 0))
 		return 0;
 
-	while (b_data(rxbuf) && !(qcs->flags & QC_SF_DEM_FULL)) {
+	while (ncb_data(rxbuf, 0) && !(qcs->flags & QC_SF_DEM_FULL)) {
 		uint64_t ftype, flen;
 		struct buffer b;
 		char last_stream_frame = 0;
@@ -281,16 +280,17 @@ static int h3_decode_qcs(struct qcs *qcs, int fin, void *ctx)
 			h3_debug_printf(stderr, "%s: ftype: %lu, flen: %lu\n",
 			                __func__, ftype, flen);
 
-			b_del(rxbuf, hlen);
+			ncb_advance(rxbuf, hlen);
 			h3s->demux_frame_type = ftype;
 			h3s->demux_frame_len = flen;
+			qcs->rx.offset += hlen;
 		}
 
 		flen = h3s->demux_frame_len;
 		ftype = h3s->demux_frame_type;
-		if (flen > b_data(&b) && !b_full(rxbuf))
+		if (flen > b_data(&b) && !ncb_is_full(rxbuf))
 			break;
-		last_stream_frame = (fin && flen == b_data(rxbuf));
+		last_stream_frame = (fin && flen == ncb_total_data(rxbuf));
 
 		switch (ftype) {
 		case H3_FT_DATA:
@@ -305,20 +305,21 @@ static int h3_decode_qcs(struct qcs *qcs, int fin, void *ctx)
 			break;
 		case H3_FT_PUSH_PROMISE:
 			/* Not supported */
-			ret = MIN(b_data(rxbuf), flen);
+			ret = MIN(ncb_data(rxbuf, 0), flen);
 			break;
 		default:
 			/* draft-ietf-quic-http34 9. Extensions to HTTP/3
 			 * unknown frame types MUST be ignored
 			 */
 			h3_debug_printf(stderr, "ignore unknown frame type 0x%lx\n", ftype);
-			ret = MIN(b_data(rxbuf), flen);
+			ret = MIN(ncb_data(rxbuf, 0), flen);
 		}
 
 		if (ret) {
-			b_del(rxbuf, ret);
+			ncb_advance(rxbuf, ret);
 			BUG_ON(h3s->demux_frame_len < ret);
 			h3s->demux_frame_len -= ret;
+			qcs->rx.offset += ret;
 		}
 	}
 
@@ -333,12 +334,12 @@ static int h3_decode_qcs(struct qcs *qcs, int fin, void *ctx)
  * <rxbuf> buffer. This function does not update this buffer.
  * Returns 0 if something wrong happened, 1 if not.
  */
-static int h3_parse_settings_frm(struct h3 *h3, const struct buffer *rxbuf, size_t flen)
+static int h3_parse_settings_frm(struct h3 *h3, const struct ncbuf *rxbuf, size_t flen)
 {
 	uint64_t id, value;
 	const unsigned char *buf, *end;
 
-	buf = (const unsigned char *)b_head(rxbuf);
+	buf = (const unsigned char *)ncb_head(rxbuf);
 	end = buf + flen;
 
 	while (buf <= end) {
@@ -375,14 +376,14 @@ static int h3_parse_settings_frm(struct h3 *h3, const struct buffer *rxbuf, size
  */
 static int h3_control_recv(struct h3_uqs *h3_uqs, void *ctx)
 {
-	struct buffer *rxbuf = &h3_uqs->qcs->rx.buf;
+	struct ncbuf *rxbuf = &h3_uqs->qcs->rx.ncbuf;
 	struct h3 *h3 = ctx;
 
 	h3_debug_printf(stderr, "%s STREAM ID: %lu\n", __func__,  h3_uqs->qcs->id);
-	if (!b_data(rxbuf))
+	if (!ncb_data(rxbuf, 0))
 		return 1;
 
-	while (b_data(rxbuf)) {
+	while (ncb_data(rxbuf, 0)) {
 		size_t hlen;
 		uint64_t ftype, flen;
 		struct buffer b;
@@ -398,7 +399,8 @@ static int h3_control_recv(struct h3_uqs *h3_uqs, void *ctx)
 		if (flen > b_data(&b))
 			break;
 
-		b_del(rxbuf, hlen);
+		ncb_advance(rxbuf, hlen);
+		h3_uqs->qcs->rx.offset += hlen;
 		/* From here, a frame must not be truncated */
 		switch (ftype) {
 		case H3_FT_CANCEL_PUSH:
@@ -422,14 +424,15 @@ static int h3_control_recv(struct h3_uqs *h3_uqs, void *ctx)
 			h3->err = H3_FRAME_UNEXPECTED;
 			return 0;
 		}
-		b_del(rxbuf, flen);
+		ncb_advance(rxbuf, flen);
+		h3_uqs->qcs->rx.offset += flen;
 	}
 
 	/* Handle the case where remaining data are present in the buffer. This
 	 * can happen if there is an incomplete frame. In this case, subscribe
 	 * on the lower layer to restart receive operation.
 	 */
-	if (b_data(rxbuf))
+	if (ncb_data(rxbuf, 0))
 		qcs_subscribe(h3_uqs->qcs, SUB_RETRY_RECV, &h3_uqs->wait_event);
 
 	return 1;
@@ -772,11 +775,18 @@ static int h3_attach_ruqs(struct qcs *qcs, void *ctx)
 {
 	uint64_t strm_type;
 	struct h3 *h3 = ctx;
-	struct buffer *rxbuf = &qcs->rx.buf;
+	struct ncbuf *rxbuf = &qcs->rx.ncbuf;
+	struct buffer b;
+	size_t len = 0;
+
+	b = h3_b_dup(rxbuf);
 
 	/* First octets: the uni-stream type */
-	if (!b_quic_dec_int(&strm_type, rxbuf, NULL) || strm_type > H3_UNI_STRM_TP_MAX)
+	if (!b_quic_dec_int(&strm_type, &b, &len) || strm_type > H3_UNI_STRM_TP_MAX)
 		return 0;
+
+	ncb_advance(rxbuf, len);
+	qcs->rx.offset += len;
 
 	/* Note that for all the uni-streams below, this is an error to receive two times the
 	 * same type of uni-stream (even for Push stream which is not supported at this time.

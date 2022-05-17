@@ -38,8 +38,7 @@ struct check;
 struct cs_endpoint *cs_endpoint_new();
 void cs_endpoint_free(struct cs_endpoint *endp);
 
-struct conn_stream *cs_new_from_mux(struct cs_endpoint *endp, struct session *sess, struct buffer *input);
-struct conn_stream *cs_new_from_applet(struct cs_endpoint *endp, struct session *sess, struct buffer *input);
+struct conn_stream *cs_new_from_endp(struct cs_endpoint *endp, struct session *sess, struct buffer *input);
 struct conn_stream *cs_new_from_strm(struct stream *strm, unsigned int flags);
 struct conn_stream *cs_new_from_check(struct check *check, unsigned int flags);
 void cs_free(struct conn_stream *cs);
@@ -51,8 +50,6 @@ void cs_destroy(struct conn_stream *cs);
 int cs_reset_endp(struct conn_stream *cs);
 
 struct appctx *cs_applet_create(struct conn_stream *cs, struct applet *app);
-void cs_applet_shut(struct conn_stream *cs);
-
 /* Returns the endpoint target without any control */
 static inline void *__cs_endp_target(const struct conn_stream *cs)
 {
@@ -205,13 +202,13 @@ static inline void cs_conn_drain_and_shut(struct conn_stream *cs)
 	cs_conn_shutr(cs, CO_SHR_DRAIN);
 }
 
-/* sets CS_EP_ERROR or CS_EP_ERR_PENDING on the cs */
-static inline void cs_set_error(struct conn_stream *cs)
+/* sets CS_EP_ERROR or CS_EP_ERR_PENDING on the endpoint */
+static inline void cs_ep_set_error(struct cs_endpoint *endp)
 {
-	if (cs->endp->flags & CS_EP_EOS)
-		cs->endp->flags |= CS_EP_ERROR;
+	if (endp->flags & CS_EP_EOS)
+		endp->flags |= CS_EP_ERROR;
 	else
-		cs->endp->flags |= CS_EP_ERR_PENDING;
+		endp->flags |= CS_EP_ERR_PENDING;
 }
 
 /* Retrieves any valid conn_stream from this connection, preferably the first

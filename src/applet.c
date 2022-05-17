@@ -26,51 +26,36 @@ unsigned int nb_applets = 0;
 
 DECLARE_POOL(pool_head_appctx,  "appctx",  sizeof(struct appctx));
 
-/* Initializes all required fields for a new appctx. Note that it does the
- * minimum acceptable initialization for an appctx. This means only the
- * 3 integer states st0, st1, st2 and the chunk used to gather unfinished
- * commands are zeroed
- */
-static inline void appctx_init(struct appctx *appctx)
-{
-	appctx->st0 = appctx->st1 = appctx->st2 = 0;
-	appctx->chunk = NULL;
-	appctx->io_release = NULL;
-	appctx->call_rate.curr_tick = 0;
-	appctx->call_rate.curr_ctr = 0;
-	appctx->call_rate.prev_ctr = 0;
-	appctx->state = 0;
-	LIST_INIT(&appctx->wait_entry);
-}
-
-/* Tries to allocate a new appctx and initialize its main fields. The appctx
+/* Tries to allocate a new appctx and initialize all of its fields. The appctx
  * is returned on success, NULL on failure. The appctx must be released using
  * appctx_free(). <applet> is assigned as the applet, but it can be NULL. The
  * applet's task is always created on the current thread.
  */
-struct appctx *appctx_new(struct applet *applet, struct cs_endpoint *endp)
+struct appctx *appctx_new(struct applet *applet, struct cs_endpoint *endp, unsigned long thread_mask)
 {
 	struct appctx *appctx;
 
-	appctx = pool_alloc(pool_head_appctx);
+	/* Backend appctx cannot be started on another thread than the local one */
+	BUG_ON(thread_mask != tid_bit && endp);
+
+	appctx = pool_zalloc(pool_head_appctx);
 	if (unlikely(!appctx))
 		goto fail_appctx;
 
-	appctx_init(appctx);
+	LIST_INIT(&appctx->wait_entry);
 	appctx->obj_type = OBJ_TYPE_APPCTX;
 	appctx->applet = applet;
-
+	appctx->sess = NULL;
 	if (!endp) {
 		endp = cs_endpoint_new();
 		if (!endp)
 			goto fail_endp;
 		endp->target = appctx;
-		endp->ctx = appctx;
 		endp->flags |= (CS_EP_T_APPLET|CS_EP_ORPHAN);
 	}
 	appctx->endp = endp;
 
-	appctx->t = task_new_here();
+	appctx->t = task_new(thread_mask);
 	if (unlikely(!appctx->t))
 		goto fail_task;
 	appctx->t->process = task_run_applet;
@@ -91,6 +76,84 @@ struct appctx *appctx_new(struct applet *applet, struct cs_endpoint *endp)
 	return NULL;
 }
 
+/* Finalize the frontend appctx startup. It must not be called for a backend
+ * appctx. This function is responsible to create the appctx's session and the
+ * frontend conn-stream. By transitivity, the stream is also created.
+ *
+ * It returns 0 on success and -1 on error. In this case, it is the caller
+ * responsibility to release the appctx. However, the session is released if it
+ * was created. On success, if an error is encountered in the caller function,
+ * the stream must be released instead of the appctx. To be sure,
+ * appctx_free_on_early_error() must be called in this case.
+ */
+int appctx_finalize_startup(struct appctx *appctx, struct proxy *px, struct buffer *input)
+{
+	struct session *sess;
+
+	/* async startup is only possible for frontend appctx. Thus for orphan
+	 * appctx. Because no backend appctx can be orphan.
+	 */
+	BUG_ON(!(appctx->endp->flags & CS_EP_ORPHAN));
+
+	sess = session_new(px, NULL, &appctx->obj_type);
+	if (!sess)
+		return -1;
+	if (!cs_new_from_endp(appctx->endp, sess, input)) {
+		session_free(sess);
+		return -1;
+	}
+	appctx->sess = sess;
+	return 0;
+}
+
+/* Release function to call when an error occurred during init stage of a
+ * frontend appctx. For a backend appctx, it just calls appctx_free()
+ */
+void appctx_free_on_early_error(struct appctx *appctx)
+{
+	/* If a frontend apctx is attached to a conn-stream, release the stream
+	 * instead of the appctx.
+	 */
+	if (!(appctx->endp->flags & CS_EP_ORPHAN) && !(appctx_cs(appctx)->flags & CS_FL_ISBACK)) {
+		stream_free(appctx_strm(appctx));
+		return;
+	}
+	appctx_free(appctx);
+}
+
+/* reserves a command context of at least <size> bytes in the <appctx>, for
+ * use by a CLI command or any regular applet. The pointer to this context is
+ * stored in ctx.svcctx and is returned. The caller doesn't need to release
+ * it as it's allocated from reserved space. If the size is larger than
+ * APPLET_MAX_SVCCTX a crash will occur (hence that will never happen outside
+ * of development).
+ *
+ * Note that the command does *not* initialize the area, so that it can easily
+ * be used upon each entry in a function. It's left to the initialization code
+ * to do it if needed. The CLI will always zero the whole area before calling
+ * a keyword's ->parse() function.
+ */
+void *applet_reserve_svcctx(struct appctx *appctx, size_t size)
+{
+	BUG_ON(size > APPLET_MAX_SVCCTX);
+	appctx->svcctx = &appctx->svc.storage;
+	return appctx->svcctx;
+}
+
+/* call the applet's release() function if any, and marks the endp as shut.
+ * Needs to be called upon close().
+ */
+void appctx_shut(struct appctx *appctx)
+{
+	if (appctx->endp->flags & (CS_EP_SHR|CS_EP_SHW))
+		return;
+
+	if (appctx->applet->release)
+		appctx->applet->release(appctx);
+
+	appctx->endp->flags |= CS_EP_SHRR | CS_EP_SHWN;
+}
+
 /* Callback used to wake up an applet when a buffer is available. The applet
  * <appctx> is woken up if an input buffer was requested for the associated
  * conn-stream. In this case the buffer is immediately allocated and the
@@ -101,10 +164,10 @@ struct appctx *appctx_new(struct applet *applet, struct cs_endpoint *endp)
 int appctx_buf_available(void *arg)
 {
 	struct appctx *appctx = arg;
-	struct conn_stream *cs = appctx->owner;
+	struct conn_stream *cs = appctx_cs(appctx);
 
 	/* allocation requested ? */
-	if (!(cs->endp->flags & CS_EP_RXBLK_BUFF))
+	if (!(appctx->endp->flags & CS_EP_RXBLK_BUFF))
 		return 0;
 
 	cs_rx_buff_rdy(cs);
@@ -127,7 +190,7 @@ int appctx_buf_available(void *arg)
 struct task *task_run_applet(struct task *t, void *context, unsigned int state)
 {
 	struct appctx *app = context;
-	struct conn_stream *cs = app->owner;
+	struct conn_stream *cs;
 	unsigned int rate;
 	size_t count;
 
@@ -135,6 +198,21 @@ struct task *task_run_applet(struct task *t, void *context, unsigned int state)
 		__appctx_free(app);
 		return NULL;
 	}
+
+	if (app->endp->flags & CS_EP_ORPHAN) {
+		/* Finalize init of orphan appctx. .init callback function must
+		 * be defined and it must finalize appctx startup.
+		 */
+		BUG_ON(!app->applet->init);
+
+		if (appctx_init(app) == -1) {
+			appctx_free_on_early_error(app);
+			return NULL;
+		}
+		BUG_ON(!app->sess || !appctx_cs(app) || !appctx_strm(app));
+	}
+
+	cs = appctx_cs(app);
 
 	/* We always pretend the applet can't get and doesn't want to
 	 * put, it's up to it to change this if needed. This ensures
@@ -166,8 +244,8 @@ struct task *task_run_applet(struct task *t, void *context, unsigned int state)
 	/* measure the call rate and check for anomalies when too high */
 	rate = update_freq_ctr(&app->call_rate, 1);
 	if (rate >= 100000 && app->call_rate.prev_ctr && // looped more than 100k times over last second
-	    ((b_size(cs_ib(cs)) && cs->endp->flags & CS_EP_RXBLK_BUFF) || // asks for a buffer which is present
-	     (b_size(cs_ib(cs)) && !b_data(cs_ib(cs)) && cs->endp->flags & CS_EP_RXBLK_ROOM) || // asks for room in an empty buffer
+	    ((b_size(cs_ib(cs)) && app->endp->flags & CS_EP_RXBLK_BUFF) || // asks for a buffer which is present
+	     (b_size(cs_ib(cs)) && !b_data(cs_ib(cs)) && app->endp->flags & CS_EP_RXBLK_ROOM) || // asks for room in an empty buffer
 	     (b_data(cs_ob(cs)) && cs_tx_endp_ready(cs) && !cs_tx_blocked(cs)) || // asks for data already present
 	     (!b_data(cs_ib(cs)) && b_data(cs_ob(cs)) && // didn't return anything ...
 	      (cs_oc(cs)->flags & (CF_WRITE_PARTIAL|CF_SHUTW_NOW)) == CF_SHUTW_NOW))) { // ... and left data pending after a shut

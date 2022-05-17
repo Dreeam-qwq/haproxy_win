@@ -58,10 +58,12 @@
 #endif
 #endif
 
+#ifndef __maybe_unused
 /* silence the "unused" warnings without having to place painful #ifdefs.
  * For use with variables or functions.
  */
 #define __maybe_unused __attribute__((unused))
+#endif
 
 /* These macros are used to declare a section name for a variable.
  * WARNING: keep section names short, as MacOS limits them to 16 characters.
@@ -205,6 +207,14 @@
 	({ void *__p = (ptr); \
 		__p ? (type *)(__p - ((long)&((type *)0)->name)) : (type *)0; \
 	})
+#endif
+
+
+/* From gcc 6 and above, enum values may have attributes */
+#if __GNUC_PREREQ__(6, 0)
+#define ENUM_ATTRIBUTE(x) __attribute__(x)
+#else
+#define ENUM_ATTRIBUTE(x)
 #endif
 
 /* Some architectures have a double-word CAS, sometimes even dual-8 bytes.

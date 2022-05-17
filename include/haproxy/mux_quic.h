@@ -18,13 +18,14 @@ struct qcs *qcs_new(struct qcc *qcc, uint64_t id, enum qcs_type type);
 void qcs_free(struct qcs *qcs);
 
 struct buffer *qc_get_buf(struct qcs *qcs, struct buffer *bptr);
+struct ncbuf *qc_get_ncbuf(struct qcs *qcs, struct ncbuf *ncbuf);
 
 int qcs_subscribe(struct qcs *qcs, int event_type, struct wait_event *es);
 void qcs_notify_recv(struct qcs *qcs);
 void qcs_notify_send(struct qcs *qcs);
 
 int qcc_recv(struct qcc *qcc, uint64_t id, uint64_t len, uint64_t offset,
-             char fin, char *data, struct qcs **out_qcs, size_t *done);
+             char fin, char *data, struct qcs **out_qcs);
 int qcc_recv_max_data(struct qcc *qcc, uint64_t max);
 int qcc_recv_max_stream_data(struct qcc *qcc, uint64_t id, uint64_t max);
 int qcc_decode_qcs(struct qcc *qcc, struct qcs *qcs);
@@ -91,15 +92,11 @@ static inline int qcc_install_app_ops(struct qcc *qcc,
 
 static inline struct conn_stream *qc_attach_cs(struct qcs *qcs, struct buffer *buf)
 {
-	struct conn_stream *cs;
-
-	cs = cs_new_from_mux(qcs->endp, qcs->qcc->conn->owner, buf);
-	if (!cs)
+	if (!cs_new_from_endp(qcs->endp, qcs->qcc->conn->owner, buf))
 		return NULL;
-	qcs->cs = cs;
-	++qcs->qcc->nb_cs;
 
-	return cs;
+	++qcs->qcc->nb_cs;
+	return qcs->endp->cs;
 }
 
 #endif /* USE_QUIC */

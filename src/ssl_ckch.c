@@ -26,6 +26,7 @@
 #include <import/ebpttree.h>
 #include <import/ebsttree.h>
 
+#include <haproxy/applet.h>
 #include <haproxy/base64.h>
 #include <haproxy/channel.h>
 #include <haproxy/cli.h>
@@ -61,6 +62,78 @@ static struct {
 	char *path;
 } crlfile_transaction;
 
+/* CLI context used by "show cafile" */
+struct show_cafile_ctx {
+	struct cafile_entry *cur_cafile_entry;
+	struct cafile_entry *old_cafile_entry;
+	int ca_index;
+	int show_all;
+};
+
+/* CLI context used by "show crlfile" */
+struct show_crlfile_ctx {
+	struct cafile_entry *cafile_entry;
+	struct crlfile_entry *old_crlfile_entry;
+	int index;
+};
+
+/* CLI context used by "show cert" */
+struct show_cert_ctx {
+	struct ckch_store *old_ckchs;
+	struct ckch_store *cur_ckchs;
+	int transaction;
+};
+
+/* CLI context used by "commit cert" */
+struct commit_cert_ctx {
+	struct ckch_store *old_ckchs;
+	struct ckch_store *new_ckchs;
+	struct ckch_inst *next_ckchi;
+	enum {
+		CERT_ST_INIT = 0,
+		CERT_ST_GEN,
+		CERT_ST_INSERT,
+		CERT_ST_FIN,
+	} state;
+};
+
+/* CLI context used by "set cert" */
+struct set_cert_ctx {
+	struct ckch_store *old_ckchs;
+	struct ckch_store *new_ckchs;
+	char *path;
+};
+
+/* CLI context used by "set ca-file" */
+struct set_cafile_ctx {
+	struct cafile_entry *old_cafile_entry;
+	struct cafile_entry *new_cafile_entry;
+	char *path;
+};
+
+/* CLI context used by "set crl-file" */
+struct set_crlfile_ctx {
+	struct cafile_entry *old_crlfile_entry;
+	struct cafile_entry *new_crlfile_entry;
+	char *path;
+};
+
+/* CLI context used by "commit cafile" and "commit crlfile" */
+struct commit_cacrlfile_ctx {
+	struct cafile_entry *old_cafile_entry;
+	struct cafile_entry *new_cafile_entry;
+	struct cafile_entry *old_crlfile_entry;
+	struct cafile_entry *new_crlfile_entry;
+	struct ckch_inst_link *next_ckchi_link;
+	struct ckch_inst *next_ckchi;
+	int cafile_type; /* either CA or CRL, depending on the current command */
+	enum {
+		CACRL_ST_INIT = 0,
+		CACRL_ST_GEN,
+		CACRL_ST_INSERT,
+		CACRL_ST_FIN,
+	} state;
+};
 
 
 /********************  cert_key_and_chain functions *************************
@@ -266,6 +339,7 @@ int ssl_sock_load_files_into_ckch(const char *path, struct cert_key_and_chain *c
 {
 	struct buffer *fp = NULL;
 	int ret = 1;
+	struct stat st;
 
 	/* try to load the PEM */
 	if (ssl_sock_load_pem_into_ckch(path, NULL, ckch , err) != 0) {
@@ -300,34 +374,38 @@ int ssl_sock_load_files_into_ckch(const char *path, struct cert_key_and_chain *c
 
 	}
 
-	/* try to load an external private key if it wasn't in the PEM */
-	if ((ckch->key == NULL) && (global_ssl.extra_files & SSL_GF_KEY)) {
-		struct stat st;
-
-
-		if (!chunk_strcat(fp, ".key") || (b_data(fp) > MAXPATHLEN)) {
-			memprintf(err, "%s '%s' filename too long'.\n",
-			          err && *err ? *err : "", fp->area);
-			ret = 1;
-			goto end;
-		}
-
-		if (stat(fp->area, &st) == 0) {
-			if (ssl_sock_load_key_into_ckch(fp->area, NULL, ckch, err)) {
-				memprintf(err, "%s '%s' is present but cannot be read or parsed'.\n",
-					  err && *err ? *err : "", fp->area);
-				goto end;
-			}
-		}
-
-		if (ckch->key == NULL) {
-			memprintf(err, "%sNo Private Key found in '%s'.\n", err && *err ? *err : "", fp->area);
-			goto end;
-		}
-		/* remove the added extension */
-		*(fp->area + fp->data - strlen(".key")) = '\0';
-		b_sub(fp, strlen(".key"));
+	/* If no private key was found yet and we cannot look for it in extra
+	 * files, raise an error.
+	 */
+	if ((ckch->key == NULL) && !(global_ssl.extra_files & SSL_GF_KEY)) {
+		memprintf(err, "%sNo Private Key found in '%s'.\n", err && *err ? *err : "", fp->area);
+		goto end;
 	}
+
+	/* try to load an external private key if it wasn't in the PEM */
+	if (!chunk_strcat(fp, ".key") || (b_data(fp) > MAXPATHLEN)) {
+		memprintf(err, "%s '%s' filename too long'.\n",
+			  err && *err ? *err : "", fp->area);
+		ret = 1;
+		goto end;
+	}
+
+	if (stat(fp->area, &st) == 0) {
+		if (ssl_sock_load_key_into_ckch(fp->area, NULL, ckch, err)) {
+			memprintf(err, "%s '%s' is present but cannot be read or parsed'.\n",
+				  err && *err ? *err : "", fp->area);
+			goto end;
+		}
+	}
+
+	if (ckch->key == NULL) {
+		memprintf(err, "%sNo Private Key found in '%s'.\n", err && *err ? *err : "", fp->area);
+		goto end;
+	}
+	/* remove the added extension */
+	*(fp->area + fp->data - strlen(".key")) = '\0';
+	b_sub(fp, strlen(".key"));
+
 
 	if (!X509_check_private_key(ckch->cert, ckch->key)) {
 		memprintf(err, "%sinconsistencies between private key and certificate loaded '%s'.\n",
@@ -1143,13 +1221,15 @@ int ssl_store_load_locations_file(char *path, int create_if_none, enum cafile_ty
 				 * been loaded in an hashed directory loaded by
 				 * X509_LOOKUP_hash_dir, so according to "man 1
 				 * c_rehash", we should load  ".pem", ".crt",
-				 * ".cer", or ".crl"
+				 * ".cer", or ".crl". Files starting with a dot
+				 * are ignored.
 				 */
 				end = strrchr(de->d_name, '.');
-				if (!end || (strcmp(end, ".pem") != 0 &&
-				             strcmp(end, ".crt") != 0 &&
-				             strcmp(end, ".cer") != 0 &&
-				             strcmp(end, ".crl") != 0)) {
+				if (!end || de->d_name[0] == '.' ||
+				    (strcmp(end, ".pem") != 0 &&
+				     strcmp(end, ".crt") != 0 &&
+				     strcmp(end, ".cer") != 0 &&
+				     strcmp(end, ".crl") != 0)) {
 					free(de);
 					continue;
 				}
@@ -1231,18 +1311,21 @@ static void cli_release_show_cert(struct appctx *appctx)
 	HA_SPIN_UNLOCK(CKCH_LOCK, &ckch_lock);
 }
 
-/* IO handler of "show ssl cert <filename>" */
+/* IO handler of "show ssl cert <filename>".
+ * It makes use of a show_cert_ctx context, and ckchs_transaction in read-only.
+ */
 static int cli_io_handler_show_cert(struct appctx *appctx)
 {
+	struct show_cert_ctx *ctx = appctx->svcctx;
 	struct buffer *trash = alloc_trash_chunk();
 	struct ebmb_node *node;
-	struct conn_stream *cs = appctx->owner;
+	struct conn_stream *cs = appctx_cs(appctx);
 	struct ckch_store *ckchs;
 
 	if (trash == NULL)
 		return 1;
 
-	if (!appctx->ctx.ssl.old_ckchs) {
+	if (!ctx->old_ckchs) {
 		if (ckchs_transaction.old_ckchs) {
 			ckchs = ckchs_transaction.old_ckchs;
 			chunk_appendf(trash, "# transaction\n");
@@ -1250,11 +1333,11 @@ static int cli_io_handler_show_cert(struct appctx *appctx)
 		}
 	}
 
-	if (!appctx->ctx.cli.p0) {
+	if (!ctx->cur_ckchs) {
 		chunk_appendf(trash, "# filename\n");
 		node = ebmb_first(&ckchs_tree);
 	} else {
-		node = &((struct ckch_store *)appctx->ctx.cli.p0)->node;
+		node = &ctx->cur_ckchs->node;
 	}
 	while (node) {
 		ckchs = ebmb_entry(node, struct ckch_store, node);
@@ -1267,13 +1350,13 @@ static int cli_io_handler_show_cert(struct appctx *appctx)
 		}
 	}
 
-	appctx->ctx.cli.p0 = NULL;
+	ctx->cur_ckchs = NULL;
 	free_trash_chunk(trash);
 	return 1;
 yield:
 
 	free_trash_chunk(trash);
-	appctx->ctx.cli.p0 = ckchs;
+	ctx->cur_ckchs = ckchs;
 	return 0; /* should come back */
 }
 
@@ -1632,11 +1715,14 @@ static int ckch_store_show_ocsp_certid(struct ckch_store *ckch_store, struct buf
 }
 
 
-/* IO handler of the details "show ssl cert <filename>" */
+/* IO handler of the details "show ssl cert <filename>".
+ * It uses a struct show_cert_ctx and ckchs_transaction in read-only.
+ */
 static int cli_io_handler_show_cert_detail(struct appctx *appctx)
 {
-	struct conn_stream *cs = appctx->owner;
-	struct ckch_store *ckchs = appctx->ctx.cli.p0;
+	struct show_cert_ctx *ctx = appctx->svcctx;
+	struct conn_stream *cs = appctx_cs(appctx);
+	struct ckch_store *ckchs = ctx->cur_ckchs;
 	struct buffer *out = alloc_trash_chunk();
 	int retval = 0;
 
@@ -1679,14 +1765,17 @@ yield:
 }
 
 
-/* IO handler of the details "show ssl cert <filename.ocsp>" */
+/* IO handler of the details "show ssl cert <filename.ocsp>".
+ * It uses a show_cert_ctx.
+ */
 static int cli_io_handler_show_cert_ocsp_detail(struct appctx *appctx)
 {
 #if ((defined SSL_CTRL_SET_TLSEXT_STATUS_REQ_CB && !defined OPENSSL_NO_OCSP) && !defined OPENSSL_IS_BORINGSSL)
-	struct conn_stream *cs = appctx->owner;
-	struct ckch_store *ckchs = appctx->ctx.cli.p0;
+	struct show_cert_ctx *ctx = appctx->svcctx;
+	struct conn_stream *cs = appctx_cs(appctx);
+	struct ckch_store *ckchs = ctx->cur_ckchs;
 	struct buffer *out = alloc_trash_chunk();
-	int from_transaction = appctx->ctx.cli.i0;
+	int from_transaction = ctx->transaction;
 
 	if (!out)
 		goto end_no_putchk;
@@ -1729,6 +1818,7 @@ yield:
 /* parsing function for 'show ssl cert [certfile]' */
 static int cli_parse_show_cert(char **args, char *payload, struct appctx *appctx, void *private)
 {
+	struct show_cert_ctx *ctx = applet_reserve_svcctx(appctx, sizeof(*ctx));
 	struct ckch_store *ckchs;
 
 	if (!cli_has_level(appctx, ACCESS_LVL_OPER))
@@ -1769,10 +1859,10 @@ static int cli_parse_show_cert(char **args, char *payload, struct appctx *appctx
 
 		}
 
-		appctx->ctx.cli.p0 = ckchs;
+		ctx->cur_ckchs = ckchs;
 		/* use the IO handler that shows details */
 		if (show_ocsp_detail) {
-			appctx->ctx.cli.i0 = from_transaction;
+			ctx->transaction = from_transaction;
 			appctx->io_handler = cli_io_handler_show_cert_ocsp_detail;
 		}
 		else
@@ -1789,13 +1879,14 @@ error:
 /* release function of the  `set ssl cert' command, free things and unlock the spinlock */
 static void cli_release_commit_cert(struct appctx *appctx)
 {
+	struct commit_cert_ctx *ctx = appctx->svcctx;
 	struct ckch_store *new_ckchs;
 
 	HA_SPIN_UNLOCK(CKCH_LOCK, &ckch_lock);
 
-	if (appctx->st2 != SETCERT_ST_FIN) {
+	if (ctx->state != CERT_ST_FIN) {
 		/* free every new sni_ctx and the new store, which are not in the trees so no spinlock there */
-		new_ckchs = appctx->ctx.ssl.new_ckchs;
+		new_ckchs = ctx->new_ckchs;
 
 		/* if the allocation failed, we need to free everything from the temporary list */
 		ckch_store_free(new_ckchs);
@@ -1961,7 +2052,8 @@ void ckch_store_replace(struct ckch_store *old_ckchs, struct ckch_store *new_ckc
  */
 static int cli_io_handler_commit_cert(struct appctx *appctx)
 {
-	struct conn_stream *cs = appctx->owner;
+	struct commit_cert_ctx *ctx = appctx->svcctx;
+	struct conn_stream *cs = appctx_cs(appctx);
 	int y = 0;
 	char *err = NULL;
 	struct ckch_store *old_ckchs, *new_ckchs = NULL;
@@ -1975,17 +2067,17 @@ static int cli_io_handler_commit_cert(struct appctx *appctx)
 		goto error;
 
 	while (1) {
-		switch (appctx->st2) {
-			case SETCERT_ST_INIT:
+		switch (ctx->state) {
+			case CERT_ST_INIT:
 				/* This state just print the update message */
 				chunk_printf(trash, "Committing %s", ckchs_transaction.path);
 				if (ci_putchk(cs_ic(cs), trash) == -1) {
 					cs_rx_room_blk(cs);
 					goto yield;
 				}
-				appctx->st2 = SETCERT_ST_GEN;
+				ctx->state = CERT_ST_GEN;
 				/* fallthrough */
-			case SETCERT_ST_GEN:
+			case CERT_ST_GEN:
 				/*
 				 * This state generates the ckch instances with their
 				 * sni_ctxs and SSL_CTX.
@@ -1994,14 +2086,14 @@ static int cli_io_handler_commit_cert(struct appctx *appctx)
 				 * yield every 10 instances.
 				 */
 
-				old_ckchs = appctx->ctx.ssl.old_ckchs;
-				new_ckchs = appctx->ctx.ssl.new_ckchs;
+				old_ckchs = ctx->old_ckchs;
+				new_ckchs = ctx->new_ckchs;
 
 				if (!new_ckchs)
 					continue;
 
 				/* get the next ckchi to regenerate */
-				ckchi = appctx->ctx.ssl.next_ckchi;
+				ckchi = ctx->next_ckchi;
 				/* we didn't start yet, set it to the first elem */
 				if (ckchi == NULL)
 					ckchi = LIST_ELEM(old_ckchs->ckch_inst.n, typeof(ckchi), by_ckchs);
@@ -2013,7 +2105,7 @@ static int cli_io_handler_commit_cert(struct appctx *appctx)
 					/* it takes a lot of CPU to creates SSL_CTXs, so we yield every 10 CKCH instances */
 					if (y >= 10) {
 						/* save the next ckchi to compute */
-						appctx->ctx.ssl.next_ckchi = ckchi;
+						ctx->next_ckchi = ckchi;
 						goto yield;
 					}
 
@@ -2026,13 +2118,13 @@ static int cli_io_handler_commit_cert(struct appctx *appctx)
 					LIST_APPEND(&new_ckchs->ckch_inst, &new_inst->by_ckchs);
 					y++;
 				}
-				appctx->st2 = SETCERT_ST_INSERT;
+				ctx->state = CERT_ST_INSERT;
 				/* fallthrough */
-			case SETCERT_ST_INSERT:
+			case CERT_ST_INSERT:
 				/* The generation is finished, we can insert everything */
 
-				old_ckchs = appctx->ctx.ssl.old_ckchs;
-				new_ckchs = appctx->ctx.ssl.new_ckchs;
+				old_ckchs = ctx->old_ckchs;
+				new_ckchs = ctx->new_ckchs;
 
 				if (!new_ckchs)
 					continue;
@@ -2040,9 +2132,9 @@ static int cli_io_handler_commit_cert(struct appctx *appctx)
 				/* insert everything and remove the previous objects */
 				ckch_store_replace(old_ckchs, new_ckchs);
 
-				appctx->st2 = SETCERT_ST_FIN;
+				ctx->state = CERT_ST_FIN;
 				/* fallthrough */
-			case SETCERT_ST_FIN:
+			case CERT_ST_FIN:
 				/* we achieved the transaction, we can set everything to NULL */
 				ha_free(&ckchs_transaction.path);
 				ckchs_transaction.new_ckchs = NULL;
@@ -2084,6 +2176,7 @@ error:
  */
 static int cli_parse_commit_cert(char **args, char *payload, struct appctx *appctx, void *private)
 {
+	struct commit_cert_ctx *ctx = applet_reserve_svcctx(appctx, sizeof(*ctx));
 	char *err = NULL;
 
 	if (!cli_has_level(appctx, ACCESS_LVL_ADMIN))
@@ -2119,10 +2212,10 @@ static int cli_parse_commit_cert(char **args, char *payload, struct appctx *appc
 	}
 
 	/* init the appctx structure */
-	appctx->st2 = SETCERT_ST_INIT;
-	appctx->ctx.ssl.next_ckchi = NULL;
-	appctx->ctx.ssl.new_ckchs = ckchs_transaction.new_ckchs;
-	appctx->ctx.ssl.old_ckchs = ckchs_transaction.old_ckchs;
+	ctx->state = CERT_ST_INIT;
+	ctx->next_ckchi = NULL;
+	ctx->new_ckchs = ckchs_transaction.new_ckchs;
+	ctx->old_ckchs = ckchs_transaction.old_ckchs;
 
 	/* we don't unlock there, it will be unlock after the IO handler, in the release handler */
 	return 0;
@@ -2140,9 +2233,11 @@ error:
 
 /*
  * Parsing function of `set ssl cert`, it updates or creates a temporary ckch.
+ * It uses a set_cert_ctx context, and ckchs_transaction under a lock.
  */
 static int cli_parse_set_cert(char **args, char *payload, struct appctx *appctx, void *private)
 {
+	struct set_cert_ctx *ctx = applet_reserve_svcctx(appctx, sizeof(*ctx));
 	struct ckch_store *new_ckchs = NULL;
 	struct ckch_store *old_ckchs = NULL;
 	char *err = NULL;
@@ -2187,8 +2282,8 @@ static int cli_parse_set_cert(char **args, char *payload, struct appctx *appctx,
 		}
 	}
 
-	appctx->ctx.ssl.old_ckchs = NULL;
-	appctx->ctx.ssl.new_ckchs = NULL;
+	ctx->old_ckchs = NULL;
+	ctx->new_ckchs = NULL;
 
 	/* if there is an ongoing transaction */
 	if (ckchs_transaction.path) {
@@ -2216,14 +2311,14 @@ static int cli_parse_set_cert(char **args, char *payload, struct appctx *appctx,
 			}
 		}
 
-		appctx->ctx.ssl.old_ckchs = ckchs_transaction.new_ckchs;
+		ctx->old_ckchs = ckchs_transaction.new_ckchs;
 
 	} else {
 
 		/* lookup for the certificate in the tree */
-		appctx->ctx.ssl.old_ckchs = ckchs_lookup(buf->area);
+		ctx->old_ckchs = ckchs_lookup(buf->area);
 
-		if (!appctx->ctx.ssl.old_ckchs) {
+		if (!ctx->old_ckchs) {
 			/* if the del-ext option is activated we should try to take a look at a ".crt" too. */
 			if (cert_ext->type != CERT_TYPE_PEM && global_ssl.extra_files_noext) {
 				if (!chunk_strcat(buf, ".crt")) {
@@ -2231,29 +2326,29 @@ static int cli_parse_set_cert(char **args, char *payload, struct appctx *appctx,
 					errcode |= ERR_ALERT | ERR_FATAL;
 					goto end;
 				}
-				appctx->ctx.ssl.old_ckchs = ckchs_lookup(buf->area);
+				ctx->old_ckchs = ckchs_lookup(buf->area);
 			}
 		}
 	}
 
-	if (!appctx->ctx.ssl.old_ckchs) {
+	if (!ctx->old_ckchs) {
 		memprintf(&err, "%sCan't replace a certificate which is not referenced by the configuration!\n",
 		          err ? err : "");
 		errcode |= ERR_ALERT | ERR_FATAL;
 		goto end;
 	}
 
-	if (!appctx->ctx.ssl.path) {
+	if (!ctx->path) {
 	/* this is a new transaction, set the path of the transaction */
-		appctx->ctx.ssl.path = strdup(appctx->ctx.ssl.old_ckchs->path);
-		if (!appctx->ctx.ssl.path) {
+		ctx->path = strdup(ctx->old_ckchs->path);
+		if (!ctx->path) {
 			memprintf(&err, "%sCan't allocate memory\n", err ? err : "");
 			errcode |= ERR_ALERT | ERR_FATAL;
 			goto end;
 		}
 	}
 
-	old_ckchs = appctx->ctx.ssl.old_ckchs;
+	old_ckchs = ctx->old_ckchs;
 
 	/* duplicate the ckch store */
 	new_ckchs = ckchs_dup(old_ckchs);
@@ -2273,14 +2368,14 @@ static int cli_parse_set_cert(char **args, char *payload, struct appctx *appctx,
 		goto end;
 	}
 
-	appctx->ctx.ssl.new_ckchs = new_ckchs;
+	ctx->new_ckchs = new_ckchs;
 
 	/* we succeed, we can save the ckchs in the transaction */
 
 	/* if there wasn't a transaction, update the old ckchs */
 	if (!ckchs_transaction.old_ckchs) {
-		ckchs_transaction.old_ckchs = appctx->ctx.ssl.old_ckchs;
-		ckchs_transaction.path = appctx->ctx.ssl.path;
+		ckchs_transaction.old_ckchs = ctx->old_ckchs;
+		ckchs_transaction.path = ctx->path;
 		err = memprintf(&err, "Transaction created for certificate %s!\n", ckchs_transaction.path);
 	} else {
 		err = memprintf(&err, "Transaction updated for certificate %s!\n", ckchs_transaction.path);
@@ -2290,7 +2385,7 @@ static int cli_parse_set_cert(char **args, char *payload, struct appctx *appctx,
 	/* free the previous ckchs if there was a transaction */
 	ckch_store_free(ckchs_transaction.new_ckchs);
 
-	ckchs_transaction.new_ckchs = appctx->ctx.ssl.new_ckchs;
+	ckchs_transaction.new_ckchs = ctx->new_ckchs;
 
 
 	/* creates the SNI ctxs later in the IO handler */
@@ -2299,18 +2394,14 @@ end:
 	free_trash_chunk(buf);
 
 	if (errcode & ERR_CODE) {
-
-		ckch_store_free(appctx->ctx.ssl.new_ckchs);
-		appctx->ctx.ssl.new_ckchs = NULL;
-
-		appctx->ctx.ssl.old_ckchs = NULL;
-
-		ha_free(&appctx->ctx.ssl.path);
+		ckch_store_free(ctx->new_ckchs);
+		ctx->new_ckchs = NULL;
+		ctx->old_ckchs = NULL;
+		ha_free(&ctx->path);
 
 		HA_SPIN_UNLOCK(CKCH_LOCK, &ckch_lock);
 		return cli_dynerr(appctx, memprintf(&err, "%sCan't update %s!\n", err ? err : "", args[3]));
 	} else {
-
 		HA_SPIN_UNLOCK(CKCH_LOCK, &ckch_lock);
 		return cli_dynmsg(appctx, LOG_NOTICE, err);
 	}
@@ -2501,6 +2592,7 @@ error:
  */
 static int cli_parse_set_cafile(char **args, char *payload, struct appctx *appctx, void *private)
 {
+	struct set_cafile_ctx *ctx = applet_reserve_svcctx(appctx, sizeof(*ctx));
 	char *err = NULL;
 	int errcode = 0;
 	struct buffer *buf;
@@ -2528,8 +2620,8 @@ static int cli_parse_set_cafile(char **args, char *payload, struct appctx *appct
 		goto end;
 	}
 
-	appctx->ctx.ssl.old_cafile_entry = NULL;
-	appctx->ctx.ssl.new_cafile_entry = NULL;
+	ctx->old_cafile_entry = NULL;
+	ctx->new_cafile_entry = NULL;
 
 	/* if there is an ongoing transaction */
 	if (cafile_transaction.path) {
@@ -2539,36 +2631,36 @@ static int cli_parse_set_cafile(char **args, char *payload, struct appctx *appct
 			errcode |= ERR_ALERT | ERR_FATAL;
 			goto end;
 		}
-		appctx->ctx.ssl.old_cafile_entry = cafile_transaction.old_cafile_entry;
+		ctx->old_cafile_entry = cafile_transaction.old_cafile_entry;
 	}
 	else {
 		/* lookup for the certificate in the tree */
-		appctx->ctx.ssl.old_cafile_entry = ssl_store_get_cafile_entry(buf->area, 0);
+		ctx->old_cafile_entry = ssl_store_get_cafile_entry(buf->area, 0);
 	}
 
-	if (!appctx->ctx.ssl.old_cafile_entry) {
+	if (!ctx->old_cafile_entry) {
 		memprintf(&err, "%sCan't replace a CA file which is not referenced by the configuration!\n",
 		          err ? err : "");
 		errcode |= ERR_ALERT | ERR_FATAL;
 		goto end;
 	}
 
-	if (!appctx->ctx.ssl.path) {
+	if (!ctx->path) {
 		/* this is a new transaction, set the path of the transaction */
-		appctx->ctx.ssl.path = strdup(appctx->ctx.ssl.old_cafile_entry->path);
-		if (!appctx->ctx.ssl.path) {
+		ctx->path = strdup(ctx->old_cafile_entry->path);
+		if (!ctx->path) {
 			memprintf(&err, "%sCan't allocate memory\n", err ? err : "");
 			errcode |= ERR_ALERT | ERR_FATAL;
 			goto end;
 		}
 	}
 
-	if (appctx->ctx.ssl.new_cafile_entry)
-		ssl_store_delete_cafile_entry(appctx->ctx.ssl.new_cafile_entry);
+	if (ctx->new_cafile_entry)
+		ssl_store_delete_cafile_entry(ctx->new_cafile_entry);
 
 	/* Create a new cafile_entry without adding it to the cafile tree. */
-	appctx->ctx.ssl.new_cafile_entry = ssl_store_create_cafile_entry(appctx->ctx.ssl.path, NULL, CAFILE_CERT);
-	if (!appctx->ctx.ssl.new_cafile_entry) {
+	ctx->new_cafile_entry = ssl_store_create_cafile_entry(ctx->path, NULL, CAFILE_CERT);
+	if (!ctx->new_cafile_entry) {
 		memprintf(&err, "%sCannot allocate memory!\n",
 			  err ? err : "");
 		errcode |= ERR_ALERT | ERR_FATAL;
@@ -2576,7 +2668,7 @@ static int cli_parse_set_cafile(char **args, char *payload, struct appctx *appct
 	}
 
 	/* Fill the new entry with the new CAs. */
-	if (ssl_store_load_ca_from_buf(appctx->ctx.ssl.new_cafile_entry, payload)) {
+	if (ssl_store_load_ca_from_buf(ctx->new_cafile_entry, payload)) {
 		memprintf(&err, "%sInvalid payload\n", err ? err : "");
 		errcode |= ERR_ALERT | ERR_FATAL;
 		goto end;
@@ -2586,8 +2678,8 @@ static int cli_parse_set_cafile(char **args, char *payload, struct appctx *appct
 
 	/* if there wasn't a transaction, update the old CA */
 	if (!cafile_transaction.old_cafile_entry) {
-		cafile_transaction.old_cafile_entry = appctx->ctx.ssl.old_cafile_entry;
-		cafile_transaction.path = appctx->ctx.ssl.path;
+		cafile_transaction.old_cafile_entry = ctx->old_cafile_entry;
+		cafile_transaction.path = ctx->path;
 		err = memprintf(&err, "transaction created for CA %s!\n", cafile_transaction.path);
 	} else {
 		err = memprintf(&err, "transaction updated for CA %s!\n", cafile_transaction.path);
@@ -2596,7 +2688,7 @@ static int cli_parse_set_cafile(char **args, char *payload, struct appctx *appct
 	/* free the previous CA if there was a transaction */
 	ssl_store_delete_cafile_entry(cafile_transaction.new_cafile_entry);
 
-	cafile_transaction.new_cafile_entry = appctx->ctx.ssl.new_cafile_entry;
+	cafile_transaction.new_cafile_entry = ctx->new_cafile_entry;
 
 	/* creates the SNI ctxs later in the IO handler */
 
@@ -2604,12 +2696,10 @@ end:
 	free_trash_chunk(buf);
 
 	if (errcode & ERR_CODE) {
-		ssl_store_delete_cafile_entry(appctx->ctx.ssl.new_cafile_entry);
-		appctx->ctx.ssl.new_cafile_entry = NULL;
-		appctx->ctx.ssl.old_cafile_entry = NULL;
-
-		ha_free(&appctx->ctx.ssl.path);
-
+		ssl_store_delete_cafile_entry(ctx->new_cafile_entry);
+		ctx->new_cafile_entry = NULL;
+		ctx->old_cafile_entry = NULL;
+		ha_free(&ctx->path);
 		HA_SPIN_UNLOCK(CKCH_LOCK, &ckch_lock);
 		return cli_dynerr(appctx, memprintf(&err, "%sCan't update %s!\n", err ? err : "", args[3]));
 	} else {
@@ -2621,10 +2711,12 @@ end:
 
 
 /*
- * Parsing function of 'commit ssl ca-file'
+ * Parsing function of 'commit ssl ca-file'.
+ * It uses a commit_cacrlfile_ctx that's also shared with "commit ssl crl-file".
  */
 static int cli_parse_commit_cafile(char **args, char *payload, struct appctx *appctx, void *private)
 {
+	struct commit_cacrlfile_ctx *ctx = applet_reserve_svcctx(appctx, sizeof(*ctx));
 	char *err = NULL;
 
 	if (!cli_has_level(appctx, ACCESS_LVL_ADMIN))
@@ -2648,11 +2740,11 @@ static int cli_parse_commit_cafile(char **args, char *payload, struct appctx *ap
 		goto error;
 	}
 	/* init the appctx structure */
-	appctx->st2 = SETCERT_ST_INIT;
-	appctx->ctx.ssl.next_ckchi_link = NULL;
-	appctx->ctx.ssl.old_cafile_entry = cafile_transaction.old_cafile_entry;
-	appctx->ctx.ssl.new_cafile_entry = cafile_transaction.new_cafile_entry;
-	appctx->ctx.ssl.cafile_type = CAFILE_CERT;
+	ctx->state = CACRL_ST_INIT;
+	ctx->next_ckchi_link = NULL;
+	ctx->old_cafile_entry = cafile_transaction.old_cafile_entry;
+	ctx->new_cafile_entry = cafile_transaction.new_cafile_entry;
+	ctx->cafile_type = CAFILE_CERT;
 
 	return 0;
 
@@ -2670,15 +2762,19 @@ enum {
 	CREATE_NEW_INST_ERR = -2
 };
 
+/* this is called by the I/O handler for "commit cafile"/"commit crlfile", and
+ * it uses a context from cmomit_cacrlfile_ctx.
+ */
 static inline int __create_new_instance(struct appctx *appctx, struct ckch_inst *ckchi, int *count,
 					struct buffer *trash, char **err)
 {
+	struct commit_cacrlfile_ctx *ctx = appctx->svcctx;
 	struct ckch_inst *new_inst;
 
 	/* it takes a lot of CPU to creates SSL_CTXs, so we yield every 10 CKCH instances */
 	if (*count >= 10) {
 		/* save the next ckchi to compute */
-		appctx->ctx.ssl.next_ckchi = ckchi;
+		ctx->next_ckchi = ckchi;
 		return CREATE_NEW_INST_YIELD;
 	}
 
@@ -2701,7 +2797,8 @@ static inline int __create_new_instance(struct appctx *appctx, struct ckch_inst 
  */
 static int cli_io_handler_commit_cafile_crlfile(struct appctx *appctx)
 {
-	struct conn_stream *cs = appctx->owner;
+	struct commit_cacrlfile_ctx *ctx = appctx->svcctx;
+	struct conn_stream *cs = appctx_cs(appctx);
 	int y = 0;
 	char *err = NULL;
 	struct cafile_entry *old_cafile_entry = NULL, *new_cafile_entry = NULL;
@@ -2715,10 +2812,10 @@ static int cli_io_handler_commit_cafile_crlfile(struct appctx *appctx)
 		goto error;
 
 	while (1) {
-		switch (appctx->st2) {
-			case SETCERT_ST_INIT:
+		switch (ctx->state) {
+			case CACRL_ST_INIT:
 				/* This state just print the update message */
-				switch (appctx->ctx.ssl.cafile_type) {
+				switch (ctx->cafile_type) {
 				case CAFILE_CERT:
 					chunk_printf(trash, "Committing %s", cafile_transaction.path);
 					break;
@@ -2732,9 +2829,9 @@ static int cli_io_handler_commit_cafile_crlfile(struct appctx *appctx)
 					cs_rx_room_blk(cs);
 					goto yield;
 				}
-				appctx->st2 = SETCERT_ST_GEN;
+				ctx->state = CACRL_ST_GEN;
 				/* fallthrough */
-			case SETCERT_ST_GEN:
+			case CACRL_ST_GEN:
 				/*
 				 * This state generates the ckch instances with their
 				 * sni_ctxs and SSL_CTX.
@@ -2742,21 +2839,21 @@ static int cli_io_handler_commit_cafile_crlfile(struct appctx *appctx)
 				 * Since the SSL_CTX generation can be CPU consumer, we
 				 * yield every 10 instances.
 				 */
-				switch (appctx->ctx.ssl.cafile_type) {
+				switch (ctx->cafile_type) {
 				case CAFILE_CERT:
-					old_cafile_entry = appctx->ctx.ssl.old_cafile_entry;
-					new_cafile_entry = appctx->ctx.ssl.new_cafile_entry;
+					old_cafile_entry = ctx->old_cafile_entry;
+					new_cafile_entry = ctx->new_cafile_entry;
 					break;
 				case CAFILE_CRL:
-					old_cafile_entry = appctx->ctx.ssl.old_crlfile_entry;
-					new_cafile_entry = appctx->ctx.ssl.new_crlfile_entry;
+					old_cafile_entry = ctx->old_crlfile_entry;
+					new_cafile_entry = ctx->new_crlfile_entry;
 					break;
 				}
 				if (!new_cafile_entry)
 					continue;
 
 				/* get the next ckchi to regenerate */
-				ckchi_link = appctx->ctx.ssl.next_ckchi_link;
+				ckchi_link = ctx->next_ckchi_link;
 				/* we didn't start yet, set it to the first elem */
 				if (ckchi_link == NULL) {
 					ckchi_link = LIST_ELEM(old_cafile_entry->ckch_inst_link.n, typeof(ckchi_link), list);
@@ -2769,7 +2866,7 @@ static int cli_io_handler_commit_cafile_crlfile(struct appctx *appctx)
 				list_for_each_entry_from(ckchi_link, &old_cafile_entry->ckch_inst_link, list) {
 					switch (__create_new_instance(appctx, ckchi_link->ckch_inst, &y, trash, &err)) {
 					case CREATE_NEW_INST_YIELD:
-						appctx->ctx.ssl.next_ckchi_link = ckchi_link;
+						ctx->next_ckchi_link = ckchi_link;
 						goto yield;
 					case CREATE_NEW_INST_ERR:
 						goto error;
@@ -2777,18 +2874,18 @@ static int cli_io_handler_commit_cafile_crlfile(struct appctx *appctx)
 					}
 				}
 
-				appctx->st2 = SETCERT_ST_INSERT;
+				ctx->state = CACRL_ST_INSERT;
 				/* fallthrough */
-			case SETCERT_ST_INSERT:
+			case CACRL_ST_INSERT:
 				/* The generation is finished, we can insert everything */
-				switch (appctx->ctx.ssl.cafile_type) {
+				switch (ctx->cafile_type) {
 				case CAFILE_CERT:
-					old_cafile_entry = appctx->ctx.ssl.old_cafile_entry;
-					new_cafile_entry = appctx->ctx.ssl.new_cafile_entry;
+					old_cafile_entry = ctx->old_cafile_entry;
+					new_cafile_entry = ctx->new_cafile_entry;
 					break;
 				case CAFILE_CRL:
-					old_cafile_entry = appctx->ctx.ssl.old_crlfile_entry;
-					new_cafile_entry = appctx->ctx.ssl.new_crlfile_entry;
+					old_cafile_entry = ctx->old_crlfile_entry;
+					new_cafile_entry = ctx->new_crlfile_entry;
 					break;
 				}
 				if (!new_cafile_entry)
@@ -2816,11 +2913,11 @@ static int cli_io_handler_commit_cafile_crlfile(struct appctx *appctx)
 				ebmb_delete(&old_cafile_entry->node);
 				ssl_store_delete_cafile_entry(old_cafile_entry);
 
-				appctx->st2 = SETCERT_ST_FIN;
+				ctx->state = CACRL_ST_FIN;
 				/* fallthrough */
-			case SETCERT_ST_FIN:
+			case CACRL_ST_FIN:
 				/* we achieved the transaction, we can set everything to NULL */
-				switch (appctx->ctx.ssl.cafile_type) {
+				switch (ctx->cafile_type) {
 				case CAFILE_CERT:
 					ha_free(&cafile_transaction.path);
 					cafile_transaction.old_cafile_entry = NULL;
@@ -2908,11 +3005,15 @@ error:
 	return cli_dynerr(appctx, err);
 }
 
-/* release function of the `commit ssl ca-file' command, free things and unlock the spinlock */
+/* release function of the `commit ssl ca-file' command, free things and unlock the spinlock.
+ * It uses a commit_cacrlfile_ctx context.
+ */
 static void cli_release_commit_cafile(struct appctx *appctx)
 {
-	if (appctx->st2 != SETCERT_ST_FIN) {
-		struct cafile_entry *new_cafile_entry = appctx->ctx.ssl.new_cafile_entry;
+	struct commit_cacrlfile_ctx *ctx = appctx->svcctx;
+
+	if (ctx->state != CACRL_ST_FIN) {
+		struct cafile_entry *new_cafile_entry = ctx->new_cafile_entry;
 
 		/* Remove the uncommitted cafile_entry from the tree. */
 		ebmb_delete(&new_cafile_entry->node);
@@ -2922,18 +3023,22 @@ static void cli_release_commit_cafile(struct appctx *appctx)
 }
 
 
-/* IO handler of details "show ssl ca-file <filename[:index]>" */
+/* IO handler of details "show ssl ca-file <filename[:index]>".
+ * It uses a show_cafile_ctx context, and the global
+ * cafile_transaction.new_cafile_entry in read-only.
+ */
 static int cli_io_handler_show_cafile_detail(struct appctx *appctx)
 {
-	struct conn_stream *cs = appctx->owner;
-	struct cafile_entry *cafile_entry = appctx->ctx.cli.p0;
+	struct show_cafile_ctx *ctx = appctx->svcctx;
+	struct conn_stream *cs = appctx_cs(appctx);
+	struct cafile_entry *cafile_entry = ctx->cur_cafile_entry;
 	struct buffer *out = alloc_trash_chunk();
 	int i = 0;
 	X509 *cert;
 	STACK_OF(X509_OBJECT) *objs;
 	int retval = 0;
-	int ca_index = appctx->ctx.cli.i0;
-	int show_all = appctx->ctx.cli.i1;
+	int ca_index = ctx->ca_index;
+	int show_all = ctx->show_all;
 
 	if (!out)
 		goto end_no_putchk;
@@ -2987,15 +3092,19 @@ end_no_putchk:
 	return 1;
 yield:
 	/* save the current state */
-	appctx->ctx.cli.i0 = i;
+	ctx->ca_index = i;
 	free_trash_chunk(out);
 	return 0; /* should come back */
 }
 
 
-/* parsing function for 'show ssl ca-file [cafile[:index]]' */
+/* parsing function for 'show ssl ca-file [cafile[:index]]'.
+ * It prepares a show_cafile_ctx context, and checks the global
+ * cafile_transaction under the ckch_lock (read only).
+ */
 static int cli_parse_show_cafile(char **args, char *payload, struct appctx *appctx, void *private)
 {
+	struct show_cafile_ctx *ctx = applet_reserve_svcctx(appctx, sizeof(*ctx));
 	struct cafile_entry *cafile_entry;
 	int ca_index = 0;
 	char *colons;
@@ -3009,8 +3118,8 @@ static int cli_parse_show_cafile(char **args, char *payload, struct appctx *appc
 	if (HA_SPIN_TRYLOCK(CKCH_LOCK, &ckch_lock))
 		return cli_err(appctx, "Can't show!\nOperations on certificates are currently locked!\n");
 
-	appctx->ctx.cli.i1 = 1; /* show all certificates */
-	appctx->ctx.cli.i0 = 0;
+	ctx->show_all = 1; /* show all certificates */
+	ctx->ca_index = 0;
 	/* check if there is a certificate to lookup */
 	if (*args[3]) {
 
@@ -3026,8 +3135,8 @@ static int cli_parse_show_cafile(char **args, char *payload, struct appctx *appc
 				goto error;
 			}
 			*colons = '\0';
-			appctx->ctx.cli.i0 = ca_index - 1; /* we start counting at 0 in the ca_store, but at 1 on the CLI */
-			appctx->ctx.cli.i1 = 0; /* show only one certificate */
+			ctx->ca_index = ca_index - 1; /* we start counting at 0 in the ca_store, but at 1 on the CLI */
+			ctx->show_all = 0; /* show only one certificate */
 		}
 
 		if (*args[3] == '*') {
@@ -3046,7 +3155,7 @@ static int cli_parse_show_cafile(char **args, char *payload, struct appctx *appc
 				goto error;
 		}
 
-		appctx->ctx.cli.p0 = cafile_entry;
+		ctx->cur_cafile_entry = cafile_entry;
 		/* use the IO handler that shows details */
 		appctx->io_handler = cli_io_handler_show_cafile_detail;
 	}
@@ -3083,18 +3192,22 @@ static int get_certificate_count(struct cafile_entry *cafile_entry)
 }
 
 /* IO handler of "show ssl ca-file". The command taking a specific CA file name
- * is managed in cli_io_handler_show_cafile_detail. */
+ * is managed in cli_io_handler_show_cafile_detail.
+ * It uses a show_cafile_ctx and the global cafile_transaction.new_cafile_entry
+ * in read-only.
+ */
 static int cli_io_handler_show_cafile(struct appctx *appctx)
 {
+	struct show_cafile_ctx *ctx = appctx->svcctx;
 	struct buffer *trash = alloc_trash_chunk();
 	struct ebmb_node *node;
-	struct conn_stream *cs = appctx->owner;
+	struct conn_stream *cs = appctx_cs(appctx);
 	struct cafile_entry *cafile_entry;
 
 	if (trash == NULL)
 		return 1;
 
-	if (!appctx->ctx.ssl.old_cafile_entry) {
+	if (!ctx->old_cafile_entry) {
 		if (cafile_transaction.old_cafile_entry) {
 			chunk_appendf(trash, "# transaction\n");
 			chunk_appendf(trash, "*%s", cafile_transaction.old_cafile_entry->path);
@@ -3104,12 +3217,12 @@ static int cli_io_handler_show_cafile(struct appctx *appctx)
 	}
 
 	/* First time in this io_handler. */
-	if (!appctx->ctx.cli.p0) {
+	if (!ctx->cur_cafile_entry) {
 		chunk_appendf(trash, "# filename\n");
 		node = ebmb_first(&cafile_tree);
 	} else {
 		/* We yielded during a previous call. */
-		node = &((struct cafile_entry*)appctx->ctx.cli.p0)->node;
+		node = &ctx->cur_cafile_entry->node;
 	}
 
 	while (node) {
@@ -3127,13 +3240,13 @@ static int cli_io_handler_show_cafile(struct appctx *appctx)
 		}
 	}
 
-	appctx->ctx.cli.p0 = NULL;
+	ctx->cur_cafile_entry = NULL;
 	free_trash_chunk(trash);
 	return 1;
 yield:
 
 	free_trash_chunk(trash);
-	appctx->ctx.cli.p0 = cafile_entry;
+	ctx->cur_cafile_entry = cafile_entry;
 	return 0; /* should come back */
 }
 
@@ -3199,7 +3312,7 @@ static int cli_parse_new_crlfile(char **args, char *payload, struct appctx *appc
 	/* The operations on the CKCH architecture are locked so we can
 	 * manipulate ckch_store and ckch_inst */
 	if (HA_SPIN_TRYLOCK(CKCH_LOCK, &ckch_lock))
-		return cli_err(appctx, "Can't create a CA file!\nOperations on certificates are currently locked!\n");
+		return cli_err(appctx, "Can't create a CRL file!\nOperations on certificates are currently locked!\n");
 
 	cafile_entry = ssl_store_get_cafile_entry(path, 0);
 	if (cafile_entry) {
@@ -3230,6 +3343,7 @@ error:
 /* Parsing function of `set ssl crl-file` */
 static int cli_parse_set_crlfile(char **args, char *payload, struct appctx *appctx, void *private)
 {
+	struct set_crlfile_ctx *ctx = applet_reserve_svcctx(appctx, sizeof(*ctx));
 	char *err = NULL;
 	int errcode = 0;
 	struct buffer *buf;
@@ -3238,7 +3352,7 @@ static int cli_parse_set_crlfile(char **args, char *payload, struct appctx *appc
 		return 1;
 
 	if (!*args[3] || !payload)
-		return cli_err(appctx, "'set ssl crl-file expects a filename and CAs as a payload\n");
+		return cli_err(appctx, "'set ssl crl-file expects a filename and CRLs as a payload\n");
 
 	/* The operations on the CKCH architecture are locked so we can
 	 * manipulate ckch_store and ckch_inst */
@@ -3257,8 +3371,8 @@ static int cli_parse_set_crlfile(char **args, char *payload, struct appctx *appc
 		goto end;
 	}
 
-	appctx->ctx.ssl.old_crlfile_entry = NULL;
-	appctx->ctx.ssl.new_crlfile_entry = NULL;
+	ctx->old_crlfile_entry = NULL;
+	ctx->new_crlfile_entry = NULL;
 
 	/* if there is an ongoing transaction */
 	if (crlfile_transaction.path) {
@@ -3268,43 +3382,43 @@ static int cli_parse_set_crlfile(char **args, char *payload, struct appctx *appc
 			errcode |= ERR_ALERT | ERR_FATAL;
 			goto end;
 		}
-		appctx->ctx.ssl.old_crlfile_entry = crlfile_transaction.old_crlfile_entry;
+		ctx->old_crlfile_entry = crlfile_transaction.old_crlfile_entry;
 	}
 	else {
 		/* lookup for the certificate in the tree */
-		appctx->ctx.ssl.old_crlfile_entry = ssl_store_get_cafile_entry(buf->area, 0);
+		ctx->old_crlfile_entry = ssl_store_get_cafile_entry(buf->area, 0);
 	}
 
-	if (!appctx->ctx.ssl.old_crlfile_entry) {
+	if (!ctx->old_crlfile_entry) {
 		memprintf(&err, "%sCan't replace a CRL file which is not referenced by the configuration!\n",
 		          err ? err : "");
 		errcode |= ERR_ALERT | ERR_FATAL;
 		goto end;
 	}
 
-	if (!appctx->ctx.ssl.path) {
+	if (!ctx->path) {
 		/* this is a new transaction, set the path of the transaction */
-		appctx->ctx.ssl.path = strdup(appctx->ctx.ssl.old_crlfile_entry->path);
-		if (!appctx->ctx.ssl.path) {
+		ctx->path = strdup(ctx->old_crlfile_entry->path);
+		if (!ctx->path) {
 			memprintf(&err, "%sCan't allocate memory\n", err ? err : "");
 			errcode |= ERR_ALERT | ERR_FATAL;
 			goto end;
 		}
 	}
 
-	if (appctx->ctx.ssl.new_crlfile_entry)
-		ssl_store_delete_cafile_entry(appctx->ctx.ssl.new_crlfile_entry);
+	if (ctx->new_crlfile_entry)
+		ssl_store_delete_cafile_entry(ctx->new_crlfile_entry);
 
 	/* Create a new cafile_entry without adding it to the cafile tree. */
-	appctx->ctx.ssl.new_crlfile_entry = ssl_store_create_cafile_entry(appctx->ctx.ssl.path, NULL, CAFILE_CRL);
-	if (!appctx->ctx.ssl.new_crlfile_entry) {
+	ctx->new_crlfile_entry = ssl_store_create_cafile_entry(ctx->path, NULL, CAFILE_CRL);
+	if (!ctx->new_crlfile_entry) {
 		memprintf(&err, "%sCannot allocate memory!\n", err ? err : "");
 		errcode |= ERR_ALERT | ERR_FATAL;
 		goto end;
 	}
 
 	/* Fill the new entry with the new CRL. */
-	if (ssl_store_load_ca_from_buf(appctx->ctx.ssl.new_crlfile_entry, payload)) {
+	if (ssl_store_load_ca_from_buf(ctx->new_crlfile_entry, payload)) {
 		memprintf(&err, "%sInvalid payload\n", err ? err : "");
 		errcode |= ERR_ALERT | ERR_FATAL;
 		goto end;
@@ -3312,19 +3426,19 @@ static int cli_parse_set_crlfile(char **args, char *payload, struct appctx *appc
 
 	/* we succeed, we can save the crl in the transaction */
 
-	/* if there wasn't a transaction, update the old CA */
+	/* if there wasn't a transaction, update the old CRL */
 	if (!crlfile_transaction.old_crlfile_entry) {
-		crlfile_transaction.old_crlfile_entry = appctx->ctx.ssl.old_crlfile_entry;
-		crlfile_transaction.path = appctx->ctx.ssl.path;
-		err = memprintf(&err, "transaction created for CA %s!\n", crlfile_transaction.path);
+		crlfile_transaction.old_crlfile_entry = ctx->old_crlfile_entry;
+		crlfile_transaction.path = ctx->path;
+		err = memprintf(&err, "transaction created for CRL %s!\n", crlfile_transaction.path);
 	} else {
-		err = memprintf(&err, "transaction updated for CA %s!\n", crlfile_transaction.path);
+		err = memprintf(&err, "transaction updated for CRL %s!\n", crlfile_transaction.path);
 	}
 
 	/* free the previous CRL file if there was a transaction */
 	ssl_store_delete_cafile_entry(crlfile_transaction.new_crlfile_entry);
 
-	crlfile_transaction.new_crlfile_entry = appctx->ctx.ssl.new_crlfile_entry;
+	crlfile_transaction.new_crlfile_entry = ctx->new_crlfile_entry;
 
 	/* creates the SNI ctxs later in the IO handler */
 
@@ -3332,12 +3446,10 @@ end:
 	free_trash_chunk(buf);
 
 	if (errcode & ERR_CODE) {
-		ssl_store_delete_cafile_entry(appctx->ctx.ssl.new_crlfile_entry);
-		appctx->ctx.ssl.new_crlfile_entry = NULL;
-		appctx->ctx.ssl.old_crlfile_entry = NULL;
-
-		ha_free(&appctx->ctx.ssl.path);
-
+		ssl_store_delete_cafile_entry(ctx->new_crlfile_entry);
+		ctx->new_crlfile_entry = NULL;
+		ctx->old_crlfile_entry = NULL;
+		ha_free(&ctx->path);
 		HA_SPIN_UNLOCK(CKCH_LOCK, &ckch_lock);
 		return cli_dynerr(appctx, memprintf(&err, "%sCan't update %s!\n", err ? err : "", args[3]));
 	} else {
@@ -3347,9 +3459,12 @@ end:
 	}
 }
 
-/* Parsing function of 'commit ssl crl-file' */
+/* Parsing function of 'commit ssl crl-file'.
+ * It uses a commit_cacrlfile_ctx that's also shared with "commit ssl ca-file".
+ */
 static int cli_parse_commit_crlfile(char **args, char *payload, struct appctx *appctx, void *private)
 {
+	struct commit_cacrlfile_ctx *ctx = applet_reserve_svcctx(appctx, sizeof(*ctx));
 	char *err = NULL;
 
 	if (!cli_has_level(appctx, ACCESS_LVL_ADMIN))
@@ -3373,11 +3488,11 @@ static int cli_parse_commit_crlfile(char **args, char *payload, struct appctx *a
 		goto error;
 	}
 	/* init the appctx structure */
-	appctx->st2 = SETCERT_ST_INIT;
-	appctx->ctx.ssl.next_ckchi = NULL;
-	appctx->ctx.ssl.old_crlfile_entry = crlfile_transaction.old_crlfile_entry;
-	appctx->ctx.ssl.new_crlfile_entry = crlfile_transaction.new_crlfile_entry;
-	appctx->ctx.ssl.cafile_type = CAFILE_CRL;
+	ctx->state = CACRL_ST_INIT;
+	ctx->next_ckchi = NULL;
+	ctx->old_crlfile_entry = crlfile_transaction.old_crlfile_entry;
+	ctx->new_crlfile_entry = crlfile_transaction.new_crlfile_entry;
+	ctx->cafile_type = CAFILE_CRL;
 
 	return 0;
 
@@ -3390,11 +3505,15 @@ error:
 }
 
 
-/* release function of the `commit ssl crl-file' command, free things and unlock the spinlock */
+/* release function of the `commit ssl crl-file' command, free things and unlock the spinlock.
+ * it uses a commit_cacrlfile_ctx that's the same as for "commit ssl ca-file".
+ */
 static void cli_release_commit_crlfile(struct appctx *appctx)
 {
-	if (appctx->st2 != SETCERT_ST_FIN) {
-		struct cafile_entry *new_crlfile_entry = appctx->ctx.ssl.new_crlfile_entry;
+	struct commit_cacrlfile_ctx *ctx = appctx->svcctx;
+
+	if (ctx->state != CACRL_ST_FIN) {
+		struct cafile_entry *new_crlfile_entry = ctx->new_crlfile_entry;
 
 		/* Remove the uncommitted cafile_entry from the tree. */
 		ebmb_delete(&new_crlfile_entry->node);
@@ -3591,17 +3710,21 @@ end:
 	return 0;
 }
 
-/* IO handler of details "show ssl crl-file <filename[:index]>" */
+/* IO handler of details "show ssl crl-file <filename[:index]>".
+ * It uses show_crlfile_ctx and the global
+ * crlfile_transaction.new_cafile_entry in read-only.
+ */
 static int cli_io_handler_show_crlfile_detail(struct appctx *appctx)
 {
-	struct conn_stream *cs = appctx->owner;
-	struct cafile_entry *cafile_entry = appctx->ctx.cli.p0;
+	struct show_crlfile_ctx *ctx = appctx->svcctx;
+	struct conn_stream *cs = appctx_cs(appctx);
+	struct cafile_entry *cafile_entry = ctx->cafile_entry;
 	struct buffer *out = alloc_trash_chunk();
 	int i;
 	X509_CRL *crl;
 	STACK_OF(X509_OBJECT) *objs;
 	int retval = 0;
-	long index = (long)appctx->ctx.cli.p1;
+	int index = ctx->index;
 
 	if (!out)
 		goto end_no_putchk;
@@ -3654,9 +3777,13 @@ yield:
 	return 0; /* should come back */
 }
 
-/* parsing function for 'show ssl crl-file [crlfile[:index]]' */
+/* parsing function for 'show ssl crl-file [crlfile[:index]]'.
+ * It sets the context to a show_crlfile_ctx, and the global
+ * cafile_transaction.new_crlfile_entry under the ckch_lock.
+ */
 static int cli_parse_show_crlfile(char **args, char *payload, struct appctx *appctx, void *private)
 {
+	struct show_crlfile_ctx *ctx = applet_reserve_svcctx(appctx, sizeof(*ctx));
 	struct cafile_entry *cafile_entry;
 	long index = 0;
 	char *colons;
@@ -3703,8 +3830,8 @@ static int cli_parse_show_crlfile(char **args, char *payload, struct appctx *app
 				goto error;
 		}
 
-		appctx->ctx.cli.p0 = cafile_entry;
-		appctx->ctx.cli.p1 = (void*)index;
+		ctx->cafile_entry = cafile_entry;
+		ctx->index = index;
 		/* use the IO handler that shows details */
 		appctx->io_handler = cli_io_handler_show_crlfile_detail;
 	}
@@ -3715,22 +3842,23 @@ error:
 	HA_SPIN_UNLOCK(CKCH_LOCK, &ckch_lock);
 	if (err)
 		return cli_dynerr(appctx, err);
-	return cli_err(appctx, "Can't display the CA file : Not found!\n");
+	return cli_err(appctx, "Can't display the CRL file : Not found!\n");
 }
 
 /* IO handler of "show ssl crl-file". The command taking a specific CRL file name
  * is managed in cli_io_handler_show_crlfile_detail. */
 static int cli_io_handler_show_crlfile(struct appctx *appctx)
 {
+	struct show_crlfile_ctx *ctx = appctx->svcctx;
 	struct buffer *trash = alloc_trash_chunk();
 	struct ebmb_node *node;
-	struct conn_stream *cs = appctx->owner;
+	struct conn_stream *cs = appctx_cs(appctx);
 	struct cafile_entry *cafile_entry;
 
 	if (trash == NULL)
 		return 1;
 
-	if (!appctx->ctx.ssl.old_crlfile_entry) {
+	if (!ctx->old_crlfile_entry) {
 		if (crlfile_transaction.old_crlfile_entry) {
 			chunk_appendf(trash, "# transaction\n");
 			chunk_appendf(trash, "*%s\n", crlfile_transaction.old_crlfile_entry->path);
@@ -3738,12 +3866,12 @@ static int cli_io_handler_show_crlfile(struct appctx *appctx)
 	}
 
 	/* First time in this io_handler. */
-	if (!appctx->ctx.cli.p0) {
+	if (!ctx->cafile_entry) {
 		chunk_appendf(trash, "# filename\n");
 		node = ebmb_first(&cafile_tree);
 	} else {
 		/* We yielded during a previous call. */
-		node = &((struct cafile_entry*)appctx->ctx.cli.p0)->node;
+		node = &ctx->cafile_entry->node;
 	}
 
 	while (node) {
@@ -3759,13 +3887,13 @@ static int cli_io_handler_show_crlfile(struct appctx *appctx)
 		}
 	}
 
-	appctx->ctx.cli.p0 = NULL;
+	ctx->cafile_entry = NULL;
 	free_trash_chunk(trash);
 	return 1;
 yield:
 
 	free_trash_chunk(trash);
-	appctx->ctx.cli.p0 = cafile_entry;
+	ctx->cafile_entry = cafile_entry;
 	return 0; /* should come back */
 }
 

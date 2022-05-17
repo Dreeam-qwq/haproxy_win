@@ -86,6 +86,7 @@ void cs_endpoint_init(struct cs_endpoint *endp)
 {
 	endp->target = NULL;
 	endp->ctx = NULL;
+	endp->cs = NULL;
 	endp->flags = CS_EP_NONE;
 }
 
@@ -112,7 +113,7 @@ void cs_endpoint_free(struct cs_endpoint *endp)
 
 /* Tries to allocate a new conn_stream and initialize its main fields. On
  * failure, nothing is allocated and NULL is returned. It is an internal
- * function. The caller must, at least, set the CS_EP_ORPHAN or CS_EP_DETAC§HED
+ * function. The caller must, at least, set the CS_EP_ORPHAN or CS_EP_DETACHED
  * flag.
  */
 static struct conn_stream *cs_new(struct cs_endpoint *endp)
@@ -142,6 +143,7 @@ static struct conn_stream *cs_new(struct cs_endpoint *endp)
 			goto alloc_error;
 	}
 	cs->endp = endp;
+	endp->cs = cs;
 
 	return cs;
 
@@ -154,35 +156,13 @@ static struct conn_stream *cs_new(struct cs_endpoint *endp)
  * defined. It returns NULL on error. On success, the new conn-stream is
  * returned. In this case, CS_EP_ORPHAN flag is removed.
  */
-struct conn_stream *cs_new_from_mux(struct cs_endpoint *endp, struct session *sess, struct buffer *input)
+struct conn_stream *cs_new_from_endp(struct cs_endpoint *endp, struct session *sess, struct buffer *input)
 {
 	struct conn_stream *cs;
 
 	cs = cs_new(endp);
 	if (unlikely(!cs))
 		return NULL;
-	if (unlikely(!stream_new(sess, cs, input))) {
-		pool_free(pool_head_connstream, cs);
-		cs = NULL;
-	}
-	endp->flags &= ~CS_EP_ORPHAN;
-	return cs;
-}
-
-/* Creates a new conn-stream and its associated stream from an applet. <endp>
- * must be defined. It returns NULL on error. On success, the new conn-stream is
- * returned. In this case, CS_EP_ORPHAN flag is removed. The created CS is used
- * to set the appctx owner.
- */
-struct conn_stream *cs_new_from_applet(struct cs_endpoint *endp, struct session *sess, struct buffer *input)
-{
-	struct conn_stream *cs;
-	struct appctx *appctx = endp->ctx;
-
-	cs = cs_new(endp);
-	if (unlikely(!cs))
-		return NULL;
-	appctx->owner = cs;
 	if (unlikely(!stream_new(sess, cs, input))) {
 		pool_free(pool_head_connstream, cs);
 		cs = NULL;
@@ -296,15 +276,11 @@ int cs_attach_mux(struct conn_stream *cs, void *target, void *ctx)
  * removed. This function is called by a stream when a backend applet is
  * registered.
  */
-static void cs_attach_applet(struct conn_stream *cs, void *target, void *ctx)
+static void cs_attach_applet(struct conn_stream *cs, void *target)
 {
-	struct appctx *appctx = target;
-
 	cs->endp->target = target;
-	cs->endp->ctx = ctx;
 	cs->endp->flags |= CS_EP_T_APPLET;
 	cs->endp->flags &= ~CS_EP_DETACHED;
-	appctx->owner = cs;
 	if (cs_strm(cs)) {
 		cs->ops = &cs_app_applet_ops;
 		cs->data_cb = &cs_data_applet_cb;
@@ -361,14 +337,16 @@ static void cs_detach_endp(struct conn_stream **csp)
 
 	if (cs->endp->flags & CS_EP_T_MUX) {
 		struct connection *conn = __cs_conn(cs);
+		struct cs_endpoint *endp = cs->endp;
 
 		if (conn->mux) {
 			/* TODO: handle unsubscribe for healthchecks too */
-			cs->endp->flags |= CS_EP_ORPHAN;
 			if (cs->wait_event.events != 0)
 				conn->mux->unsubscribe(cs, cs->wait_event.events, &cs->wait_event);
-			conn->mux->detach(cs);
+			endp->flags |= CS_EP_ORPHAN;
+			endp->cs = NULL;
 			cs->endp = NULL;
+			conn->mux->detach(endp);
 		}
 		else {
 			/* It's too early to have a mux, let's just destroy
@@ -385,15 +363,17 @@ static void cs_detach_endp(struct conn_stream **csp)
 		struct appctx *appctx = __cs_appctx(cs);
 
 		cs->endp->flags |= CS_EP_ORPHAN;
-		cs_applet_shut(cs);
-		appctx_free(appctx);
+		cs->endp->cs = NULL;
 		cs->endp = NULL;
+		appctx_shut(appctx);
+		appctx_free(appctx);
 	}
 
 	if (cs->endp) {
 		/* the cs is the only one one the endpoint */
 		cs->endp->target = NULL;
 		cs->endp->ctx = NULL;
+		cs->endp->flags &= CS_EP_APP_MASK;
 		cs->endp->flags |= CS_EP_DETACHED;
 	}
 
@@ -471,12 +451,13 @@ int cs_reset_endp(struct conn_stream *cs)
 		cs->endp->flags |= CS_EP_ERROR;
 		return -1;
 	}
-	new_endp->flags = cs->endp->flags;
+	new_endp->flags = (cs->endp->flags & CS_EP_APP_MASK);
 
 	/* The app is still attached, the cs will not be released */
 	cs_detach_endp(&cs);
 	BUG_ON(cs->endp);
 	cs->endp = new_endp;
+	cs->endp->cs = cs;
 	cs->endp->flags |= CS_EP_DETACHED;
 	return 0;
 }
@@ -494,31 +475,16 @@ struct appctx *cs_applet_create(struct conn_stream *cs, struct applet *app)
 
 	DPRINTF(stderr, "registering handler %p for cs %p (was %p)\n", app, cs, cs_strm_task(cs));
 
-	appctx = appctx_new(app, cs->endp);
+	appctx = appctx_new_here(app, cs->endp);
 	if (!appctx)
 		return NULL;
-	cs_attach_applet(cs, appctx, appctx);
-	appctx->owner = cs;
+	cs_attach_applet(cs, appctx);
 	appctx->t->nice = __cs_strm(cs)->task->nice;
 	cs_cant_get(cs);
 	appctx_wakeup(appctx);
 
 	cs->state = CS_ST_RDY;
 	return appctx;
-}
-
-/* call the applet's release function if any. Needs to be called upon close() */
-void cs_applet_shut(struct conn_stream *cs)
-{
-	struct appctx *appctx = __cs_appctx(cs);
-
-	if (cs->endp->flags & (CS_EP_SHR|CS_EP_SHW))
-		return;
-
-	if (appctx->applet->release)
-		appctx->applet->release(appctx);
-
-	cs->endp->flags |= CS_EP_SHRR | CS_EP_SHWN;
 }
 
 /*
@@ -915,7 +881,7 @@ static void cs_app_shutr_applet(struct conn_stream *cs)
 		return;
 
 	if (cs_oc(cs)->flags & CF_SHUTW) {
-		cs_applet_shut(cs);
+		appctx_shut(__cs_appctx(cs));
 		cs->state = CS_ST_DIS;
 		__cs_strm(cs)->conn_exp = TICK_ETERNITY;
 	}
@@ -973,7 +939,7 @@ static void cs_app_shutw_applet(struct conn_stream *cs)
 	case CS_ST_QUE:
 	case CS_ST_TAR:
 		/* Note that none of these states may happen with applets */
-		cs_applet_shut(cs);
+		appctx_shut(__cs_appctx(cs));
 		cs->state = CS_ST_DIS;
 		/* fall through */
 	default:

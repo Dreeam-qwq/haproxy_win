@@ -33,6 +33,7 @@
 
 #include <haproxy/buf.h>
 #include <haproxy/chunk.h>
+#include <haproxy/ncbuf-t.h>
 #include <haproxy/net_helper.h>
 #include <haproxy/openssl-compat.h>
 #include <haproxy/ticks.h>
@@ -137,7 +138,7 @@ static inline void free_quic_conn_cids(struct quic_conn *conn)
 	while (node) {
 		struct quic_connection_id *cid;
 
-		cid = eb64_entry(&node->node, struct quic_connection_id, seq_num);
+		cid = eb64_entry(node, struct quic_connection_id, seq_num);
 
 		/* remove the CID from the receiver tree */
 		ebmb_delete(&cid->node);
@@ -177,49 +178,6 @@ static inline unsigned long quic_get_cid_tid(const unsigned char *cid)
 static inline void quic_pin_cid_to_tid(unsigned char *cid, int target_tid)
 {
 	cid[0] = cid[0] - (cid[0] % global.nbthread) + target_tid;
-}
-
-/* Allocate a new CID with <seq_num> as sequence number and attach it to <root>
- * ebtree.
- *
- * The CID is randomly generated in part with the result altered to be
- * associated with the current thread ID. This means this function must only
- * be called by the quic_conn thread.
- *
- * Returns the new CID if succeeded, NULL if not.
- */
-static inline struct quic_connection_id *new_quic_cid(struct eb_root *root,
-                                                      struct quic_conn *qc,
-                                                      int seq_num)
-{
-	struct quic_connection_id *cid;
-
-	cid = pool_alloc(pool_head_quic_connection_id);
-	if (!cid)
-		return NULL;
-
-	cid->cid.len = QUIC_HAP_CID_LEN;
-	if (RAND_bytes(cid->cid.data, cid->cid.len) != 1 ||
-	    RAND_bytes(cid->stateless_reset_token,
-	               sizeof cid->stateless_reset_token) != 1) {
-		fprintf(stderr, "Could not generate %d random bytes\n", cid->cid.len);
-		goto err;
-	}
-
-	quic_pin_cid_to_tid(cid->cid.data, tid);
-
-	cid->qc = qc;
-
-	cid->seq_num.key = seq_num;
-	cid->retire_prior_to = 0;
-	/* insert the allocated CID in the quic_conn tree */
-	eb64_insert(root, &cid->seq_num);
-
-	return cid;
-
- err:
-	pool_free(pool_head_quic_connection_id, cid);
-	return NULL;
 }
 
 /* The maximum size of a variable-length QUIC integer encoded with 1 byte */
@@ -467,13 +425,23 @@ static inline int quic_packet_number_encode(unsigned char **buf,
 	return 1;
 }
 
-/* Returns the <ack_delay> field value from <ack_frm> ACK frame for
- * <conn> QUIC connection.
+/* Returns the <ack_delay> field value in milliseconds from <ack_frm> ACK frame for
+ * <conn> QUIC connection. Note that the value of <ack_delay> coming from
+ * ACK frame is in microseconds.
  */
 static inline unsigned int quic_ack_delay_ms(struct quic_ack *ack_frm,
                                              struct quic_conn *conn)
 {
-	return ack_frm->ack_delay << conn->tx.params.ack_delay_exponent;
+	return (ack_frm->ack_delay << conn->tx.params.ack_delay_exponent) / 1000;
+}
+
+/* Returns the <ack_delay> field value in microsecond to be set in an ACK frame
+ * depending on the time the packet with a new largest packet number was received.
+ */
+static inline uint64_t quic_compute_ack_delay_us(unsigned int time_received,
+                                                 struct quic_conn *conn)
+{
+	return ((now_ms - time_received) * 1000) >> conn->tx.params.ack_delay_exponent;
 }
 
 /* Initialize <dst> transport parameters with default values (when absent)
@@ -496,17 +464,21 @@ static inline void quic_dflt_transport_params_cpy(struct quic_transport_params *
 static inline void quic_transport_params_init(struct quic_transport_params *p,
                                               int server)
 {
+	const uint64_t ncb_size = global.tune.bufsize - NCB_RESERVED_SZ;
+	const int max_streams_bidi = 100;
+	const int max_streams_uni = 3;
+
 	/* Default values (when absent) */
 	quic_dflt_transport_params_cpy(p);
 
 	p->max_idle_timeout                    = 30000;
 
-	p->initial_max_data                    = 1 * 1024 * 1024;
-	p->initial_max_stream_data_bidi_local  = 256 * 1024;
-	p->initial_max_stream_data_bidi_remote = 256 * 1024;
-	p->initial_max_stream_data_uni         = 256 * 1024;
-	p->initial_max_streams_bidi            = 100;
-	p->initial_max_streams_uni             = 3;
+	p->initial_max_streams_bidi            = max_streams_bidi;
+	p->initial_max_streams_uni             = max_streams_uni;
+	p->initial_max_stream_data_bidi_local  = ncb_size;
+	p->initial_max_stream_data_bidi_remote = ncb_size;
+	p->initial_max_stream_data_uni         = ncb_size;
+	p->initial_max_data = (max_streams_bidi + max_streams_uni) * ncb_size;
 
 	if (server)
 		p->with_stateless_reset_token      = 1;
@@ -607,7 +579,6 @@ static inline int quic_transport_param_decode(struct quic_transport_params *p,
 {
 	const unsigned char *end = *buf + len;
 
-	quic_dflt_transport_params_cpy(p);
 	switch (type) {
 	case QUIC_TP_ORIGINAL_DESTINATION_CONNECTION_ID:
 		if (!server || len >= sizeof p->original_destination_connection_id.data)
@@ -981,6 +952,7 @@ static inline void quic_pktns_init(struct quic_pktns *pktns)
 	pktns->tx.time_of_last_eliciting = 0;
 	pktns->tx.loss_time = TICK_ETERNITY;
 	pktns->tx.in_flight = 0;
+	pktns->tx.ack_delay = 0;
 
 	pktns->rx.largest_pn = -1;
 	pktns->rx.largest_acked_pn = -1;
@@ -988,6 +960,7 @@ static inline void quic_pktns_init(struct quic_pktns *pktns)
 	pktns->rx.arngs.sz = 0;
 	pktns->rx.arngs.enc_sz = 0;
 	pktns->rx.nb_aepkts_since_last_ack = 0;
+	pktns->rx.largest_time_received = 0;
 
 	pktns->flags = 0;
 }
@@ -1000,7 +973,7 @@ static inline int64_t quic_pktns_get_largest_acked_pn(struct quic_pktns *pktns)
 	if (!ar)
 		return -1;
 
-	return eb64_entry(&ar->node, struct quic_arng_node, first)->last;
+	return eb64_entry(ar, struct quic_arng_node, first)->last;
 }
 
 /* Increment the reference counter of <pkt> */
@@ -1027,7 +1000,7 @@ static inline void quic_pktns_tx_pkts_release(struct quic_pktns *pktns)
 		struct quic_tx_packet *pkt;
 		struct quic_frame *frm, *frmbak;
 
-		pkt = eb64_entry(&node->node, struct quic_tx_packet, pn_node);
+		pkt = eb64_entry(node, struct quic_tx_packet, pn_node);
 		node = eb64_next(node);
 		list_for_each_entry_safe(frm, frmbak, &pkt->frms, list) {
 			LIST_DELETE(&frm->list);
@@ -1203,7 +1176,7 @@ static inline void qc_el_rx_pkts_del(struct quic_enc_level *qel)
 	node = eb64_first(&qel->rx.pkts);
 	while (node) {
 		struct quic_rx_packet *pkt =
-			eb64_entry(&node->node, struct quic_rx_packet, pn_node);
+			eb64_entry(node, struct quic_rx_packet, pn_node);
 
 		node = eb64_next(node);
 		eb64_delete(&pkt->pn_node);
@@ -1221,7 +1194,7 @@ static inline void qc_list_qel_rx_pkts(struct quic_enc_level *qel)
 	while (node) {
 		struct quic_rx_packet *pkt;
 
-		pkt = eb64_entry(&node->node, struct quic_rx_packet, pn_node);
+		pkt = eb64_entry(node, struct quic_rx_packet, pn_node);
 		fprintf(stderr, "pkt@%p type=%d pn=%llu\n",
 		        pkt, pkt->type, (ull)pkt->pn_node.key);
 		node = eb64_next(node);

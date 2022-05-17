@@ -234,6 +234,7 @@ int sink_announce_dropped(struct sink *sink, int facility)
 static int cli_parse_show_events(char **args, char *payload, struct appctx *appctx, void *private)
 {
 	struct sink *sink;
+	uint ring_flags;
 	int arg;
 
 	args++; // make args[1] the 1st arg
@@ -264,17 +265,18 @@ static int cli_parse_show_events(char **args, char *payload, struct appctx *appc
 	if (sink->type != SINK_TYPE_BUFFER)
 		return cli_msg(appctx, LOG_NOTICE, "Nothing to report for this sink");
 
+	ring_flags = 0;
 	for (arg = 2; *args[arg]; arg++) {
 		if (strcmp(args[arg], "-w") == 0)
-			appctx->ctx.cli.i0 |= 1; // wait mode
+			ring_flags |= RING_WF_WAIT_MODE;
 		else if (strcmp(args[arg], "-n") == 0)
-			appctx->ctx.cli.i0 |= 2; // seek to new
+			ring_flags |= RING_WF_SEEK_NEW;
 		else if (strcmp(args[arg], "-nw") == 0 || strcmp(args[arg], "-wn") == 0)
-			appctx->ctx.cli.i0 |= 3; // seek to new + wait
+			ring_flags |= RING_WF_WAIT_MODE | RING_WF_SEEK_NEW;
 		else
 			return cli_err(appctx, "unknown option");
 	}
-	return ring_attach_cli(sink->ctx.ring, appctx);
+	return ring_attach_cli(sink->ctx.ring, appctx, ring_flags);
 }
 
 /* Pre-configures a ring proxy to emit connections */
@@ -292,14 +294,15 @@ void sink_setup_proxy(struct proxy *px)
 }
 
 /*
- * IO Handler to handle message push to syslog tcp server
+ * IO Handler to handle message push to syslog tcp server.
+ * It takes its context from appctx->svcctx.
  */
 static void sink_forward_io_handler(struct appctx *appctx)
 {
-	struct conn_stream *cs = appctx->owner;
+	struct conn_stream *cs = appctx_cs(appctx);
 	struct stream *s = __cs_strm(cs);
 	struct sink *sink = strm_fe(s)->parent;
-	struct sink_forward_target *sft = appctx->ctx.sft.ptr;
+	struct sink_forward_target *sft = appctx->svcctx;
 	struct ring *ring = sink->ctx.ring;
 	struct buffer *buf = &ring->buf;
 	uint64_t msg_len;
@@ -432,13 +435,14 @@ close:
 /*
  * IO Handler to handle message push to syslog tcp server
  * using octet counting frames
+ * It takes its context from appctx->svcctx.
  */
 static void sink_forward_oc_io_handler(struct appctx *appctx)
 {
-	struct conn_stream *cs = appctx->owner;
+	struct conn_stream *cs = appctx_cs(appctx);
 	struct stream *s = __cs_strm(cs);
 	struct sink *sink = strm_fe(s)->parent;
-	struct sink_forward_target *sft = appctx->ctx.sft.ptr;
+	struct sink_forward_target *sft = appctx->svcctx;
 	struct ring *ring = sink->ctx.ring;
 	struct buffer *buf = &ring->buf;
 	uint64_t msg_len;
@@ -575,7 +579,7 @@ close:
 
 void __sink_forward_session_deinit(struct sink_forward_target *sft)
 {
-	struct stream *s = __cs_strm(sft->appctx->owner);
+	struct stream *s = appctx_strm(sft->appctx);
 	struct sink *sink;
 
 	sink = strm_fe(s)->parent;
@@ -590,72 +594,19 @@ void __sink_forward_session_deinit(struct sink_forward_target *sft)
 	task_wakeup(sink->forward_task, TASK_WOKEN_MSG);
 }
 
-
-static void sink_forward_session_release(struct appctx *appctx)
+static int sink_forward_session_init(struct appctx *appctx)
 {
-	struct sink_forward_target *sft = appctx->ctx.sft.ptr;
-
-	if (!sft)
-		return;
-
-	HA_SPIN_LOCK(SFT_LOCK, &sft->lock);
-	if (sft->appctx == appctx)
-		__sink_forward_session_deinit(sft);
-	HA_SPIN_UNLOCK(SFT_LOCK, &sft->lock);
-}
-
-static struct applet sink_forward_applet = {
-	.obj_type = OBJ_TYPE_APPLET,
-	.name = "<SINKFWD>", /* used for logging */
-	.fct = sink_forward_io_handler,
-	.release = sink_forward_session_release,
-};
-
-static struct applet sink_forward_oc_applet = {
-	.obj_type = OBJ_TYPE_APPLET,
-	.name = "<SINKFWDOC>", /* used for logging */
-	.fct = sink_forward_oc_io_handler,
-	.release = sink_forward_session_release,
-};
-
-/*
- * Create a new peer session in assigned state (connect will start automatically)
- */
-static struct appctx *sink_forward_session_create(struct sink *sink, struct sink_forward_target *sft)
-{
-	struct proxy *p = sink->forward_px;
-	struct appctx *appctx;
-	struct session *sess;
-	struct conn_stream *cs;
+	struct sink_forward_target *sft = appctx->svcctx;
 	struct stream *s;
-	struct applet *applet = &sink_forward_applet;
 	struct sockaddr_storage *addr = NULL;
 
-	if (sft->srv->log_proto == SRV_LOG_PROTO_OCTET_COUNTING)
-		applet = &sink_forward_oc_applet;
-
-	appctx = appctx_new(applet, NULL);
-	if (!appctx)
-		goto out_close;
-
-	appctx->ctx.sft.ptr = (void *)sft;
-
-	sess = session_new(p, NULL, &appctx->obj_type);
-	if (!sess) {
-		ha_alert("out of memory in sink_forward_session_create().\n");
-		goto out_free_appctx;
-	}
-
 	if (!sockaddr_alloc(&addr, &sft->srv->addr, sizeof(sft->srv->addr)))
-		goto out_free_sess;
+		goto out_error;
 
-	cs = cs_new_from_applet(appctx->endp, sess, &BUF_NULL);
-	if (!cs) {
-		ha_alert("Failed to initialize stream in sink_forward_session_create().\n");
+	if (appctx_finalize_startup(appctx, sft->sink->forward_px, &BUF_NULL) == -1)
 		goto out_free_addr;
-	}
-	s = DISGUISE(cs_strm(cs));
 
+	s = appctx_strm(appctx);
 	s->csb->dst = addr;
 	s->csb->flags |= CS_FL_NOLINGER;
 
@@ -672,15 +623,69 @@ static struct appctx *sink_forward_session_create(struct sink *sink, struct sink
 	s->res.rto = TICK_ETERNITY;
 	s->res.rex = TICK_ETERNITY;
 	sft->appctx = appctx;
+
+	return 0;
+
+ out_free_addr:
+	sockaddr_free(&addr);
+ out_error:
+	return -1;
+}
+
+static void sink_forward_session_release(struct appctx *appctx)
+{
+	struct sink_forward_target *sft = appctx->svcctx;
+
+	if (!sft)
+		return;
+
+	HA_SPIN_LOCK(SFT_LOCK, &sft->lock);
+	if (sft->appctx == appctx)
+		__sink_forward_session_deinit(sft);
+	HA_SPIN_UNLOCK(SFT_LOCK, &sft->lock);
+}
+
+static struct applet sink_forward_applet = {
+	.obj_type = OBJ_TYPE_APPLET,
+	.name = "<SINKFWD>", /* used for logging */
+	.fct = sink_forward_io_handler,
+	.init = sink_forward_session_init,
+	.release = sink_forward_session_release,
+};
+
+static struct applet sink_forward_oc_applet = {
+	.obj_type = OBJ_TYPE_APPLET,
+	.name = "<SINKFWDOC>", /* used for logging */
+	.fct = sink_forward_oc_io_handler,
+	.init = sink_forward_session_init,
+	.release = sink_forward_session_release,
+};
+
+/*
+ * Create a new peer session in assigned state (connect will start automatically)
+ * It sets its context into appctx->svcctx.
+ */
+static struct appctx *sink_forward_session_create(struct sink *sink, struct sink_forward_target *sft)
+{
+	struct appctx *appctx;
+	struct applet *applet = &sink_forward_applet;
+
+	if (sft->srv->log_proto == SRV_LOG_PROTO_OCTET_COUNTING)
+		applet = &sink_forward_oc_applet;
+
+	appctx = appctx_new_here(applet, NULL);
+	if (!appctx)
+		goto out_close;
+	appctx->svcctx = (void *)sft;
+
+	if (appctx_init(appctx) == -1)
+		goto out_free_appctx;
+
 	return appctx;
 
 	/* Error unrolling */
- out_free_addr:
-	sockaddr_free(&addr);
- out_free_sess:
-	session_free(sess);
  out_free_appctx:
-	appctx_free(appctx);
+	appctx_free_on_early_error(appctx);
  out_close:
 	return NULL;
 }
@@ -1001,6 +1006,7 @@ struct sink *sink_new_from_logsrv(struct logsrv *logsrv)
 	/* insert into sink_forward_targets
 	 * list into sink
 	 */
+	sft->sink = sink;
 	sft->next = sink->sft;
 	sink->sft = sft;
 

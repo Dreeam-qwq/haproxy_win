@@ -80,6 +80,7 @@ struct peer {
 	struct shared_table *tables;
 	struct server *srv;
 	struct dcache *dcache;        /* dictionary cache */
+	struct peers *peers;          /* associated peer section */
 	struct peer *next;            /* next peer in the list */
 };
 
@@ -101,6 +102,7 @@ struct peers {
 	unsigned int resync_timeout;    /* resync timeout timer */
 	int count;                      /* total of peers */
 	int disabled;                   /* peers proxy disabled if >0 */
+	int applet_count[MAX_THREADS];  /* applet count per thread */
 };
 
 /* LRU cache for dictionaies */

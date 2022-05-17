@@ -650,6 +650,7 @@ static struct peer *cfg_peers_add_peer(struct peers *peers,
 
 	/* the peers are linked backwards first */
 	peers->count++;
+	p->peers = peers;
 	p->next = peers->remote;
 	peers->remote = p;
 	p->conf.file = strdup(file);
@@ -2450,6 +2451,7 @@ int check_config_validity()
 	struct cfg_postparser *postparser;
 	struct resolvers *curr_resolvers = NULL;
 	int i;
+	int diag_no_cluster_secret = 0;
 
 	bind_conf = NULL;
 	/*
@@ -3775,6 +3777,23 @@ out_uri_auth_compat:
 		list_for_each_entry(bind_conf, &curproxy->conf.bind, by_fe) {
 			int mode = (1 << (curproxy->mode == PR_MODE_HTTP));
 			const struct mux_proto_list *mux_ent;
+			const struct listener *l;
+			int types = 0;
+
+			/* check that the mux is compatible with all listeners'
+			 * protocol types (dgram or stream).
+			 */
+			list_for_each_entry(l, &bind_conf->listeners, by_bind)
+				types |= 1 << l->rx.proto->proto_type;
+
+			if (atleast2(types)) {
+				ha_alert("%s '%s' : cannot mix datagram and stream protocols "
+					 "for 'bind %s' at [%s:%d].\n",
+					 proxy_type_str(curproxy), curproxy->id,
+					 bind_conf->arg, bind_conf->file, bind_conf->line);
+				cfgerr++;
+				continue;
+			}
 
 			if (!bind_conf->mux_proto)
 				continue;
@@ -3947,6 +3966,8 @@ out_uri_auth_compat:
 #ifdef USE_QUIC
 			/* override the accept callback for QUIC listeners. */
 			if (listener->flags & LI_F_QUIC_LISTENER) {
+				if (!global.cluster_secret)
+					diag_no_cluster_secret = 1;
 				listener->accept = quic_session_accept;
 				li_init_per_thr(listener);
 			}
@@ -3986,6 +4007,10 @@ out_uri_auth_compat:
 			cfgerr++;
 		}
 	}
+
+	if (diag_no_cluster_secret)
+		ha_diag_warning("No cluster secret was set. The stateless reset feature"
+		                " is disabled for all QUIC bindings.\n");
 
 	/*
 	 * Recount currently required checks.

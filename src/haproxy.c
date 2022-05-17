@@ -1507,19 +1507,6 @@ static void init_early(int argc, char **argv)
 		exit(EXIT_FAILURE);
 	}
 
-	/* Initialize the random generators */
-#ifdef USE_OPENSSL
-	/* Initialize SSL random generator. Must be called before chroot for
-	 * access to /dev/urandom, and before ha_random_boot() which may use
-	 * RAND_bytes().
-	 */
-	if (!ssl_initialize_random()) {
-		ha_alert("OpenSSL random data generator initialization failed.\n");
-		exit(EXIT_FAILURE);
-	}
-#endif
-	ha_random_boot(argv); // the argv pointer brings some kernel-fed entropy
-
 	/* Some CPU affinity stuff may have to be initialized */
 #ifdef USE_CPU_AFFINITY
 	{
@@ -1943,9 +1930,13 @@ static void init(int argc, char **argv)
 
 		char *args[MAX_LINE_ARGS+1];
 		int arg = sizeof(args) / sizeof(*args);
-		size_t outlen = strlen(check_condition) + 1;
+		size_t outlen;
 		char *w;
 
+		if (!check_condition)
+			usage(progname);
+
+		outlen = strlen(check_condition) + 1;
 		err = parse_line(check_condition, check_condition, &outlen, args, &arg,
 		                 PARSE_OPT_ENV | PARSE_OPT_WORD_EXPAND | PARSE_OPT_DQUOTE | PARSE_OPT_SQUOTE | PARSE_OPT_BKSLASH,
 		                 &errptr);
@@ -2224,6 +2215,19 @@ static void init(int argc, char **argv)
 	if (global.mode & MODE_DIAG) {
 		cfg_run_diagnostics();
 	}
+
+	/* Initialize the random generators */
+#ifdef USE_OPENSSL
+	/* Initialize SSL random generator. Must be called before chroot for
+	 * access to /dev/urandom, and before ha_random_boot() which may use
+	 * RAND_bytes().
+	 */
+	if (!ssl_initialize_random()) {
+		ha_alert("OpenSSL random data generator initialization failed.\n");
+		exit(EXIT_FAILURE);
+	}
+#endif
+	ha_random_boot(argv); // the argv pointer brings some kernel-fed entropy
 
 	/* now we know the buffer size, we can initialize the channels and buffers */
 	init_buffer();
@@ -2660,6 +2664,7 @@ void deinit(void)
 	ha_free(&global.log_send_hostname);
 	chunk_destroy(&global.log_tag);
 	ha_free(&global.chroot);
+	ha_free(&global.cluster_secret);
 	ha_free(&global.pidfile);
 	ha_free(&global.node);
 	ha_free(&global.desc);

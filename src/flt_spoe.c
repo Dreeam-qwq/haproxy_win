@@ -63,7 +63,7 @@
 #define FRAME_HDR_SIZE     32
 
 /* Helper to get SPOE ctx inside an appctx */
-#define SPOE_APPCTX(appctx) ((struct spoe_appctx *)((appctx)->ctx.spoe.ptr))
+#define SPOE_APPCTX(appctx) ((struct spoe_appctx *)((appctx)->svcctx))
 
 /* SPOE filter id. Used to identify SPOE filters */
 const char *spoe_filter_id = "SPOE filter";
@@ -1073,7 +1073,7 @@ spoe_prepare_healthcheck_request(char **req, int *len)
 	memset(&spoe_appctx, 0, sizeof(spoe_appctx));
 	memset(buf, 0, sizeof(buf));
 
-	appctx.ctx.spoe.ptr = &spoe_appctx;
+	appctx.svcctx = &spoe_appctx;
 	SPOE_APPCTX(&appctx)->max_frame_size = MAX_FRAME_SIZE;
 
 	frame = buf+4; /* Reserved the 4 first bytes for the frame size */
@@ -1112,7 +1112,7 @@ spoe_handle_healthcheck_response(char *frame, size_t size, char *err, int errlen
 	memset(&appctx, 0, sizeof(appctx));
 	memset(&spoe_appctx, 0, sizeof(spoe_appctx));
 
-	appctx.ctx.spoe.ptr = &spoe_appctx;
+	appctx.svcctx = &spoe_appctx;
 	SPOE_APPCTX(&appctx)->max_frame_size = MAX_FRAME_SIZE;
 
 	if (*frame == SPOE_FRM_T_AGENT_DISCON) {
@@ -1137,7 +1137,7 @@ spoe_handle_healthcheck_response(char *frame, size_t size, char *err, int errlen
 static int
 spoe_send_frame(struct appctx *appctx, char *buf, size_t framesz)
 {
-	struct conn_stream *cs = appctx->owner;
+	struct conn_stream *cs = appctx_cs(appctx);
 	int      ret;
 	uint32_t netint;
 
@@ -1163,7 +1163,7 @@ spoe_send_frame(struct appctx *appctx, char *buf, size_t framesz)
 static int
 spoe_recv_frame(struct appctx *appctx, char *buf, size_t framesz)
 {
-	struct conn_stream *cs = appctx->owner;
+	struct conn_stream *cs = appctx_cs(appctx);
 	int      ret;
 	uint32_t netint;
 
@@ -1192,8 +1192,8 @@ spoe_recv_frame(struct appctx *appctx, char *buf, size_t framesz)
 static int
 spoe_wakeup_appctx(struct appctx *appctx)
 {
-	cs_want_get(appctx->owner);
-	cs_rx_endp_more(appctx->owner);
+	cs_want_get(appctx_cs(appctx));
+	cs_rx_endp_more(appctx_cs(appctx));
 	appctx_wakeup(appctx);
 	return 1;
 }
@@ -1214,12 +1214,58 @@ spoe_process_appctx(struct task * task, void *context, unsigned int state)
 	return task;
 }
 
+static int
+spoe_init_appctx(struct appctx *appctx)
+{
+	struct spoe_appctx *spoe_appctx = SPOE_APPCTX(appctx);
+	struct spoe_agent *agent = spoe_appctx->agent;
+	struct task *task;
+	struct stream *s;
+
+	if ((task = task_new_here()) == NULL)
+		goto out_free_task;
+	task->process = spoe_process_appctx;
+	task->context = appctx;
+
+	if (appctx_finalize_startup(appctx, &agent->spoe_conf->agent_fe, &BUF_NULL) == -1)
+		goto out_error;
+
+	spoe_appctx->owner = appctx;
+	spoe_appctx->task  = task;
+
+	LIST_INIT(&spoe_appctx->buffer_wait.list);
+	spoe_appctx->buffer_wait.target = appctx;
+	spoe_appctx->buffer_wait.wakeup_cb = (int (*)(void *))spoe_wakeup_appctx;
+
+	s = appctx_strm(appctx);
+	stream_set_backend(s, agent->b.be);
+
+	/* applet is waiting for data */
+	cs_cant_get(s->csf);
+
+	s->do_log = NULL;
+	s->res.flags |= CF_READ_DONTWAIT;
+
+	HA_SPIN_LOCK(SPOE_APPLET_LOCK, &agent->rt[tid].lock);
+	LIST_APPEND(&agent->rt[tid].applets, &spoe_appctx->list);
+	HA_SPIN_UNLOCK(SPOE_APPLET_LOCK, &agent->rt[tid].lock);
+	_HA_ATOMIC_INC(&agent->counters.applets);
+
+	appctx->st0 = SPOE_APPCTX_ST_CONNECT;
+	task_wakeup(spoe_appctx->task, TASK_WOKEN_INIT);
+	return 0;
+  out_free_task:
+	task_destroy(task);
+  out_error:
+	return -1;
+}
+
 /* Callback function that releases a SPOE applet. This happens when the
  * connection with the agent is closed. */
 static void
 spoe_release_appctx(struct appctx *appctx)
 {
-	struct conn_stream  *cs          = appctx->owner;
+	struct conn_stream  *cs          = appctx_cs(appctx);
 	struct spoe_appctx  *spoe_appctx = SPOE_APPCTX(appctx);
 	struct spoe_agent   *agent;
 	struct spoe_context *ctx, *back;
@@ -1227,7 +1273,7 @@ spoe_release_appctx(struct appctx *appctx)
 	if (spoe_appctx == NULL)
 		return;
 
-	appctx->ctx.spoe.ptr = NULL;
+	appctx->svcctx = NULL;
 	agent = spoe_appctx->agent;
 
 	SPOE_PRINTF(stderr, "%d.%06d [SPOE/%-15s] %s: appctx=%p\n",
@@ -1339,7 +1385,7 @@ spoe_release_appctx(struct appctx *appctx)
 static int
 spoe_handle_connect_appctx(struct appctx *appctx)
 {
-	struct conn_stream *cs    = appctx->owner;
+	struct conn_stream *cs    = appctx_cs(appctx);
 	struct spoe_agent  *agent = SPOE_APPCTX(appctx)->agent;
 	char *frame, *buf;
 	int   ret;
@@ -1405,7 +1451,7 @@ spoe_handle_connect_appctx(struct appctx *appctx)
 static int
 spoe_handle_connecting_appctx(struct appctx *appctx)
 {
-	struct conn_stream *cs     = appctx->owner;
+	struct conn_stream *cs     = appctx_cs(appctx);
 	struct spoe_agent  *agent  = SPOE_APPCTX(appctx)->agent;
 	char  *frame;
 	int    ret;
@@ -1650,7 +1696,7 @@ spoe_handle_receiving_frame_appctx(struct appctx *appctx, int *skip)
 
 	/* Do not forget to remove processed frame from the output buffer */
 	if (trash.data)
-		co_skip(cs_oc(appctx->owner), trash.data);
+		co_skip(cs_oc(appctx_cs(appctx)), trash.data);
   end:
 	return ret;
 }
@@ -1658,7 +1704,7 @@ spoe_handle_receiving_frame_appctx(struct appctx *appctx, int *skip)
 static int
 spoe_handle_processing_appctx(struct appctx *appctx)
 {
-	struct conn_stream      *cs    = appctx->owner;
+	struct conn_stream      *cs    = appctx_cs(appctx);
 	struct server           *srv   = objt_server(__cs_strm(cs)->target);
 	struct spoe_agent       *agent = SPOE_APPCTX(appctx)->agent;
 	int ret, skip_sending = 0, skip_receiving = 0, active_s = 0, active_r = 0, close_asap = 0;
@@ -1781,7 +1827,7 @@ spoe_handle_processing_appctx(struct appctx *appctx)
 static int
 spoe_handle_disconnect_appctx(struct appctx *appctx)
 {
-	struct conn_stream *cs    = appctx->owner;
+	struct conn_stream *cs    = appctx_cs(appctx);
 	struct spoe_agent  *agent = SPOE_APPCTX(appctx)->agent;
 	char *frame, *buf;
 	int   ret;
@@ -1834,7 +1880,7 @@ spoe_handle_disconnect_appctx(struct appctx *appctx)
 static int
 spoe_handle_disconnecting_appctx(struct appctx *appctx)
 {
-	struct conn_stream *cs = appctx->owner;
+	struct conn_stream *cs = appctx_cs(appctx);
 	char  *frame;
 	int    ret;
 
@@ -1899,7 +1945,7 @@ spoe_handle_disconnecting_appctx(struct appctx *appctx)
 static void
 spoe_handle_appctx(struct appctx *appctx)
 {
-	struct conn_stream *cs = appctx->owner;
+	struct conn_stream *cs = appctx_cs(appctx);
 	struct spoe_agent  *agent;
 
 	if (SPOE_APPCTX(appctx) == NULL)
@@ -1980,6 +2026,7 @@ struct applet spoe_applet = {
 	.obj_type = OBJ_TYPE_APPLET,
 	.name = "<SPOE>", /* used for logging */
 	.fct = spoe_handle_appctx,
+	.init = spoe_init_appctx,
 	.release = spoe_release_appctx,
 };
 
@@ -1988,75 +2035,39 @@ struct applet spoe_applet = {
 static struct appctx *
 spoe_create_appctx(struct spoe_config *conf)
 {
-	struct appctx      *appctx;
-	struct session     *sess;
-	struct conn_stream *cs;
-	struct stream      *strm;
+	struct spoe_appctx *spoe_appctx;
+	struct appctx *appctx;
 
-	if ((appctx = appctx_new(&spoe_applet, NULL)) == NULL)
+	spoe_appctx = pool_zalloc(pool_head_spoe_appctx);
+	if (spoe_appctx == NULL)
 		goto out_error;
 
-	appctx->ctx.spoe.ptr = pool_zalloc(pool_head_spoe_appctx);
-	if (SPOE_APPCTX(appctx) == NULL)
-		goto out_free_appctx;
+	spoe_appctx->agent           = conf->agent;
+	spoe_appctx->version         = 0;
+	spoe_appctx->max_frame_size  = conf->agent->max_frame_size;
+	spoe_appctx->flags           = 0;
+	spoe_appctx->status_code     = SPOE_FRM_ERR_NONE;
+	spoe_appctx->buffer          = BUF_NULL;
+	spoe_appctx->cur_fpa         = 0;
+	LIST_INIT(&spoe_appctx->list);
+	LIST_INIT(&spoe_appctx->waiting_queue);
 
-	appctx->st0 = SPOE_APPCTX_ST_CONNECT;
-	if ((SPOE_APPCTX(appctx)->task = task_new_here()) == NULL)
+
+	if ((appctx = appctx_new_here(&spoe_applet, NULL)) == NULL)
 		goto out_free_spoe_appctx;
 
-	SPOE_APPCTX(appctx)->owner           = appctx;
-	SPOE_APPCTX(appctx)->task->process   = spoe_process_appctx;
-	SPOE_APPCTX(appctx)->task->context   = appctx;
-	SPOE_APPCTX(appctx)->agent           = conf->agent;
-	SPOE_APPCTX(appctx)->version         = 0;
-	SPOE_APPCTX(appctx)->max_frame_size  = conf->agent->max_frame_size;
-	SPOE_APPCTX(appctx)->flags           = 0;
-	SPOE_APPCTX(appctx)->status_code     = SPOE_FRM_ERR_NONE;
-	SPOE_APPCTX(appctx)->buffer          = BUF_NULL;
-	SPOE_APPCTX(appctx)->cur_fpa         = 0;
+	appctx->svcctx = spoe_appctx;
+	if (appctx_init(appctx) == -1)
+		goto out_free_appctx;
 
-	LIST_INIT(&SPOE_APPCTX(appctx)->buffer_wait.list);
-	SPOE_APPCTX(appctx)->buffer_wait.target = appctx;
-	SPOE_APPCTX(appctx)->buffer_wait.wakeup_cb = (int (*)(void *))spoe_wakeup_appctx;
-
-	LIST_INIT(&SPOE_APPCTX(appctx)->list);
-	LIST_INIT(&SPOE_APPCTX(appctx)->waiting_queue);
-
-	sess = session_new(&conf->agent_fe, NULL, &appctx->obj_type);
-	if (!sess)
-		goto out_free_spoe;
-
-	cs = cs_new_from_applet(appctx->endp, sess, &BUF_NULL);
-	if (!cs)
-		goto out_free_sess;
-
-	strm = DISGUISE(cs_strm(cs));
-	stream_set_backend(strm, conf->agent->b.be);
-
-	/* applet is waiting for data */
-	cs_cant_get(strm->csf);
 	appctx_wakeup(appctx);
-
-	strm->do_log = NULL;
-	strm->res.flags |= CF_READ_DONTWAIT;
-
-	HA_SPIN_LOCK(SPOE_APPLET_LOCK, &conf->agent->rt[tid].lock);
-	LIST_APPEND(&conf->agent->rt[tid].applets, &SPOE_APPCTX(appctx)->list);
-	HA_SPIN_UNLOCK(SPOE_APPLET_LOCK, &conf->agent->rt[tid].lock);
-	_HA_ATOMIC_INC(&conf->agent->counters.applets);
-
-	task_wakeup(SPOE_APPCTX(appctx)->task, TASK_WOKEN_INIT);
 	return appctx;
 
 	/* Error unrolling */
- out_free_sess:
-	session_free(sess);
- out_free_spoe:
-	task_destroy(SPOE_APPCTX(appctx)->task);
- out_free_spoe_appctx:
-	pool_free(pool_head_spoe_appctx, SPOE_APPCTX(appctx));
  out_free_appctx:
-	appctx_free(appctx);
+	appctx_free_on_early_error(appctx);
+ out_free_spoe_appctx:
+	pool_free(pool_head_spoe_appctx, spoe_appctx);
  out_error:
 	return NULL;
 }

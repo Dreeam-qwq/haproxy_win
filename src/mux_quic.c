@@ -8,6 +8,7 @@
 #include <haproxy/dynbuf.h>
 #include <haproxy/htx.h>
 #include <haproxy/list.h>
+#include <haproxy/ncbuf.h>
 #include <haproxy/pool.h>
 #include <haproxy/quic_stream.h>
 #include <haproxy/sink.h>
@@ -114,7 +115,7 @@ struct qcs *qcs_new(struct qcc *qcc, uint64_t id, enum qcs_type type)
 
 	qcs->stream = NULL;
 	qcs->qcc = qcc;
-	qcs->cs = NULL;
+	qcs->endp = NULL;
 	qcs->flags = QC_SF_NONE;
 	qcs->ctx = NULL;
 
@@ -152,10 +153,9 @@ struct qcs *qcs_new(struct qcc *qcc, uint64_t id, enum qcs_type type)
 	qcs->tx.msd = quic_stream_is_local(qcc, id) ? qcc->rfctl.msd_bidi_r :
 	                                              qcc->rfctl.msd_bidi_l;
 
-	qcs->rx.buf = BUF_NULL;
+	qcs->rx.ncbuf = NCBUF_NULL;
 	qcs->rx.app_buf = BUF_NULL;
 	qcs->rx.offset = 0;
-	qcs->rx.frms = EB_ROOT_UNIQUE;
 
 	/* TODO use uni limit for unidirectional streams */
 	qcs->rx.msd = quic_stream_is_local(qcc, id) ? qcc->lfctl.msd_bidi_l :
@@ -184,13 +184,23 @@ struct qcs *qcs_new(struct qcc *qcc, uint64_t id, enum qcs_type type)
 	return NULL;
 }
 
+static void qc_free_ncbuf(struct qcs *qcs, struct ncbuf *ncbuf)
+{
+	struct buffer buf;
+
+	buf = b_make(ncbuf->area, ncbuf->size, 0, 0);
+	b_free(&buf);
+
+	*ncbuf = NCBUF_NULL;
+}
+
 /* Free a qcs. This function must only be done to remove a stream on allocation
  * error or connection shutdown. Else use qcs_destroy which handle all the
  * QUIC connection mechanism.
  */
 void qcs_free(struct qcs *qcs)
 {
-	b_free(&qcs->rx.buf);
+	qc_free_ncbuf(qcs, &qcs->rx.ncbuf);
 	b_free(&qcs->tx.buf);
 
 	BUG_ON(!qcs->qcc->strms[qcs_id_type(qcs->id)].nb_streams);
@@ -213,6 +223,21 @@ struct buffer *qc_get_buf(struct qcs *qcs, struct buffer *bptr)
 	struct buffer *buf = b_alloc(bptr);
 	BUG_ON(!buf);
 	return buf;
+}
+
+struct ncbuf *qc_get_ncbuf(struct qcs *qcs, struct ncbuf *ncbuf)
+{
+	struct buffer buf = BUF_NULL;
+
+	if (ncb_is_null(ncbuf)) {
+		b_alloc(&buf);
+		BUG_ON(b_is_null(&buf));
+
+		*ncbuf = ncb_make(buf.area, buf.size, 0);
+		ncb_init(ncbuf, 0);
+	}
+
+	return ncbuf;
 }
 
 int qcs_subscribe(struct qcs *qcs, int event_type, struct wait_event *es)
@@ -344,22 +369,17 @@ struct qcs *qcc_get_qcs(struct qcc *qcc, uint64_t id)
  * <out_qcs>. In case of success, the caller can immediatly call qcc_decode_qcs
  * to process the frame content.
  *
- * Returns a code indicating how the frame was handled.
- * - 0: frame received completely and can be dropped.
- * - 1: frame not received but can be dropped.
- * - 2: frame cannot be handled, either partially or not at all. <done>
- *   indicated the number of bytes handled. The rest should be buffered.
+ * Returns 0 on success else non-zero.
  */
 int qcc_recv(struct qcc *qcc, uint64_t id, uint64_t len, uint64_t offset,
-             char fin, char *data, struct qcs **out_qcs, size_t *done)
+             char fin, char *data, struct qcs **out_qcs)
 {
 	struct qcs *qcs;
-	size_t total, diff;
+	enum ncb_ret ret;
 
 	TRACE_ENTER(QMUX_EV_QCC_RECV, qcc->conn);
 
 	*out_qcs = NULL;
-	*done = 0;
 
 	qcs = qcc_get_qcs(qcc, id);
 	if (!qcs) {
@@ -375,44 +395,46 @@ int qcc_recv(struct qcc *qcc, uint64_t id, uint64_t len, uint64_t offset,
 
 	*out_qcs = qcs;
 
-	if (offset > qcs->rx.offset)
-		return 2;
-
 	if (offset + len <= qcs->rx.offset) {
 		TRACE_DEVEL("leaving on already received offset", QMUX_EV_QCC_RECV|QMUX_EV_QCS_RECV, qcc->conn, qcs);
 		return 0;
 	}
 
-	/* Last frame already handled for this stream. */
-	BUG_ON(qcs->flags & QC_SF_FIN_RECV);
+	/* TODO if last frame already received, stream size must not change.
+	 * Else send FINAL_SIZE_ERROR.
+	 */
+
 	/* TODO initial max-stream-data overflow. Implement FLOW_CONTROL_ERROR emission. */
 	BUG_ON(offset + len > qcs->rx.msd);
 
-	if (!qc_get_buf(qcs, &qcs->rx.buf) || b_full(&qcs->rx.buf)) {
+	if (!qc_get_ncbuf(qcs, &qcs->rx.ncbuf) || ncb_is_null(&qcs->rx.ncbuf)) {
 		/* TODO should mark qcs as full */
-		return 2;
+		ABORT_NOW();
+		return 1;
 	}
 
 	TRACE_DEVEL("newly received offset", QMUX_EV_QCC_RECV|QMUX_EV_QCS_RECV, qcc->conn, qcs);
-	diff = qcs->rx.offset - offset;
+	if (offset < qcs->rx.offset) {
+		len -= qcs->rx.offset - offset;
+		offset = qcs->rx.offset;
+	}
 
-	len -= diff;
-	data += diff;
-
-	/* TODO handle STREAM frames larger than RX buffer. */
-	BUG_ON(len > b_size(&qcs->rx.buf));
-
-	total = b_putblk(&qcs->rx.buf, data, len);
-	qcs->rx.offset += total;
-	*done = total;
+	ret = ncb_add(&qcs->rx.ncbuf, offset - qcs->rx.offset, data, len, NCB_ADD_COMPARE);
+	if (ret != NCB_RET_OK) {
+		if (ret == NCB_RET_DATA_REJ) {
+			/* TODO generate PROTOCOL_VIOLATION error */
+			TRACE_DEVEL("leaving on data rejected", QMUX_EV_QCC_RECV|QMUX_EV_QCS_RECV,
+			            qcc->conn, qcs);
+		}
+		else if (ret == NCB_RET_GAP_SIZE) {
+			TRACE_DEVEL("cannot bufferize frame due to gap size limit", QMUX_EV_QCC_RECV|QMUX_EV_QCS_RECV,
+			            qcc->conn, qcs);
+		}
+		return 1;
+	}
 
 	/* TODO initial max-stream-data reached. Implement MAX_STREAM_DATA emission. */
-	BUG_ON(qcs->rx.offset == qcs->rx.msd);
-
-	if (total < len) {
-		TRACE_DEVEL("leaving on partially received offset", QMUX_EV_QCC_RECV|QMUX_EV_QCS_RECV, qcc->conn, qcs);
-		return 2;
-	}
+	BUG_ON(offset + len == qcs->rx.msd);
 
 	if (fin)
 		qcs->flags |= QC_SF_FIN_RECV;
@@ -1220,14 +1242,13 @@ static void qc_destroy(void *ctx)
 	TRACE_LEAVE(QMUX_EV_QCC_END);
 }
 
-static void qc_detach(struct conn_stream *cs)
+static void qc_detach(struct cs_endpoint *endp)
 {
-	struct qcs *qcs = __cs_mux(cs);
+	struct qcs *qcs = endp->target;
 	struct qcc *qcc = qcs->qcc;
 
 	TRACE_ENTER(QMUX_EV_STRM_END, qcc->conn, qcs);
 
-	qcs->cs = NULL;
 	--qcc->nb_cs;
 
 	if ((b_data(&qcs->tx.buf) || qcs->tx.offset > qcs->tx.sent_offset) &&
@@ -1298,15 +1319,15 @@ static size_t qc_rcv_buf(struct conn_stream *cs, struct buffer *buf,
 
  end:
 	if (b_data(&qcs->rx.app_buf)) {
-		cs->endp->flags |= (CS_EP_RCV_MORE | CS_EP_WANT_ROOM);
+		qcs->endp->flags |= (CS_EP_RCV_MORE | CS_EP_WANT_ROOM);
 	}
 	else {
-		cs->endp->flags &= ~(CS_EP_RCV_MORE | CS_EP_WANT_ROOM);
-		if (cs->endp->flags & CS_EP_ERR_PENDING)
-			cs->endp->flags |= CS_EP_ERROR;
+		qcs->endp->flags &= ~(CS_EP_RCV_MORE | CS_EP_WANT_ROOM);
+		if (qcs->endp->flags & CS_EP_ERR_PENDING)
+			qcs->endp->flags |= CS_EP_ERROR;
 
 		if (fin)
-			cs->endp->flags |= CS_EP_EOI;
+			qcs->endp->flags |= CS_EP_EOI;
 
 		if (b_size(&qcs->rx.app_buf)) {
 			b_free(&qcs->rx.app_buf);
@@ -1384,7 +1405,7 @@ static int qc_wake_some_streams(struct qcc *qcc)
 	     node = eb64_next(node)) {
 		qcs = eb64_entry(node, struct qcs, by_id);
 
-		if (!qcs->cs)
+		if (!qcs->endp->cs)
 			continue;
 
 		if (qcc->conn->flags & CO_FL_ERROR) {
@@ -1396,8 +1417,8 @@ static int qc_wake_some_streams(struct qcc *qcc)
 				qcs_notify_recv(qcs);
 				qcs_notify_send(qcs);
 			}
-			else if (qcs->cs->data_cb->wake) {
-				qcs->cs->data_cb->wake(qcs->cs);
+			else if (qcs->endp->cs->data_cb->wake) {
+				qcs->endp->cs->data_cb->wake(qcs->endp->cs);
 			}
 		}
 	}

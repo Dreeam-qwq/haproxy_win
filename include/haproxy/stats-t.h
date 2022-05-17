@@ -122,13 +122,25 @@ enum {
 
 
 /* data transmission states for the stats responses */
-enum {
-	STAT_ST_INIT = 0,
-	STAT_ST_HEAD,
-	STAT_ST_INFO,
-	STAT_ST_LIST,
-	STAT_ST_END,
-	STAT_ST_FIN,
+enum stat_state {
+	STAT_STATE_INIT = 0,
+	STAT_STATE_HEAD,
+	STAT_STATE_INFO,
+	STAT_STATE_LIST,
+	STAT_STATE_END,
+	STAT_STATE_FIN,
+};
+
+/* kept in 2.6 only for compatibility with legacy code. Will be removed in 2.7,
+ * please do not use these values anymore and defined your own!
+ */
+enum obsolete_stat_state {
+	STAT_ST_INIT ENUM_ATTRIBUTE((deprecated)) = 0,
+	STAT_ST_HEAD ENUM_ATTRIBUTE((deprecated)),
+	STAT_ST_INFO ENUM_ATTRIBUTE((deprecated)),
+	STAT_ST_LIST ENUM_ATTRIBUTE((deprecated)),
+	STAT_ST_END  ENUM_ATTRIBUTE((deprecated)),
+	STAT_ST_FIN  ENUM_ATTRIBUTE((deprecated)),
 };
 
 /* data transmission states for the stats responses inside a proxy */
@@ -516,6 +528,20 @@ enum stats_domain_px_cap {
 	STATS_PX_CAP_LI   = 0x08,
 
 	STATS_PX_CAP_MASK = 0xff
+};
+
+/* the context of a "show stat" command in progress on the CLI or the stats applet */
+struct show_stat_ctx {
+	void *obj1;             /* context pointer used in stats dump */
+	void *obj2;             /* context pointer used in stats dump */
+	uint32_t domain;        /* set the stats to used, for now only proxy stats are supported */
+	int scope_str;		/* limit scope to a frontend/backend substring */
+	int scope_len;		/* length of the string above in the buffer */
+	int px_st;		/* STAT_PX_ST* */
+	unsigned int flags;	/* STAT_* from stats-t.h */
+	int iid, type, sid;	/* proxy id, type and service id if bounding of stats is enabled */
+	int st_code;		/* the status code returned by an action */
+	enum stat_state state;  /* phase of output production */
 };
 
 extern THREAD_LOCAL void *trash_counters;

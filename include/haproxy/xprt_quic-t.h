@@ -183,6 +183,8 @@ enum quic_pkt_type {
 #define QUIC_CONN_MAX_PACKET  64
 
 #define QUIC_STATELESS_RESET_TOKEN_LEN 16
+#define QUIC_STATELESS_RESET_PACKET_HEADER_LEN 5
+#define QUIC_STATELESS_RESET_PACKET_MINLEN     (22 + QUIC_HAP_CID_LEN)
 
 #define           QUIC_EV_CONN_NEW       (1ULL << 0)
 #define           QUIC_EV_CONN_INIT      (1ULL << 1)
@@ -227,6 +229,7 @@ enum quic_pkt_type {
 #define           QUIC_EV_CONN_CLOSE     (1ULL << 40)
 #define           QUIC_EV_CONN_ACKSTRM   (1ULL << 41)
 #define           QUIC_EV_CONN_FRMLIST   (1ULL << 42)
+#define           QUIC_EV_STATELESS_RST  (1ULL << 43)
 
 /* Similar to kernel min()/max() definitions. */
 #define QUIC_MIN(a, b) ({ \
@@ -395,6 +398,10 @@ struct quic_arngs {
 #define QUIC_FL_PKTNS_ACK_REQUIRED  (1UL << 1)
 /* Flag the packet number space as needing probing */
 #define QUIC_FL_PKTNS_PROBE_NEEDED  (1UL << 2)
+/* Flag the packet number space as having received a packet with a new largest
+ * packet number, to be acknowledege
+ */
+#define QUIC_FL_PKTNS_NEW_LARGEST_PN (1UL << 3)
 
 /* The maximum number of dgrams which may be sent upon PTO expirations. */
 #define QUIC_MAX_NB_PTO_DGRAMS         2
@@ -416,6 +423,8 @@ struct quic_pktns {
 		unsigned int pto_probe;
 		/* In flight bytes for this packet number space. */
 		size_t in_flight;
+		/* The acknowledgement delay of the packet with the largest packet number */
+		uint64_t ack_delay;
 	} tx;
 	struct {
 		/* Largest packet number */
@@ -424,6 +433,8 @@ struct quic_pktns {
 		int64_t largest_acked_pn;
 		struct quic_arngs arngs;
 		unsigned int nb_aepkts_since_last_ack;
+		/* The time the packet with the largest packet number was received */
+		uint64_t largest_time_received;
 	} rx;
 	unsigned int flags;
 };
@@ -483,6 +494,7 @@ struct quic_rx_packet {
 	/* Source address of this packet. */
 	struct sockaddr_storage saddr;
 	unsigned int flags;
+	unsigned int time_received;
 };
 
 /* QUIC datagram handler */
@@ -498,15 +510,6 @@ struct quic_rx_crypto_frm {
 	struct eb64_node offset_node;
 	uint64_t len;
 	const unsigned char *data;
-	struct quic_rx_packet *pkt;
-};
-
-/* Structure to store information about RX STREAM frames. */
-struct quic_rx_strm_frm {
-	struct eb64_node offset_node;
-	uint64_t len;
-	const unsigned char *data;
-	int fin;
 	struct quic_rx_packet *pkt;
 };
 
@@ -778,6 +781,7 @@ struct quic_conn {
 	unsigned int nb_pkt_since_cc;
 
 	const struct qcc_app_ops *app_ops;
+	unsigned int sendto_err;
 };
 
 #endif /* USE_QUIC */

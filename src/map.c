@@ -14,7 +14,7 @@
 #include <syslog.h>
 
 #include <haproxy/api.h>
-#include <haproxy/applet-t.h>
+#include <haproxy/applet.h>
 #include <haproxy/arg.h>
 #include <haproxy/cli.h>
 #include <haproxy/conn_stream.h>
@@ -321,57 +321,66 @@ struct pattern_expr *pat_expr_get_next(struct pattern_expr *getnext, struct list
 	return expr;
 }
 
-/* expects the current generation ID in appctx->cli.cli.i0 */
+/* appctx context for the "{show|get|add|del|*} {map|acl}" commands. This is
+ * used even by commands that only have a parser and no I/O handler because
+ * it provides a unified way to manipulate some fields and will allow to
+ * expand some of them more easily later if needed.
+ */
+struct show_map_ctx {
+	struct pat_ref *ref;
+	struct bref bref;	/* back-reference from the pat_ref_elt being dumped */
+	struct pattern_expr *expr;
+	struct buffer chunk;
+	unsigned int display_flags;
+	unsigned int curr_gen;  /* current/latest generation, for show/clear */
+	unsigned int prev_gen;  /* prev generation, for clear */
+	enum {
+		STATE_INIT = 0, /* initialize list and backrefs */
+		STATE_LIST,     /* list entries */
+		STATE_DONE,     /* finished */
+	} state;                /* state of the dump */
+};
+
+/* expects the current generation ID in ctx->curr_gen */
 static int cli_io_handler_pat_list(struct appctx *appctx)
 {
-	struct conn_stream *cs = appctx->owner;
+	struct show_map_ctx *ctx = appctx->svcctx;
+	struct conn_stream *cs = appctx_cs(appctx);
 	struct pat_ref_elt *elt;
 
 	if (unlikely(cs_ic(cs)->flags & (CF_WRITE_ERROR|CF_SHUTW))) {
 		/* If we're forced to shut down, we might have to remove our
 		 * reference to the last ref_elt being dumped.
 		 */
-		if (appctx->st2 == STAT_ST_LIST) {
-			if (!LIST_ISEMPTY(&appctx->ctx.map.bref.users)) {
-				LIST_DELETE(&appctx->ctx.map.bref.users);
-				LIST_INIT(&appctx->ctx.map.bref.users);
-			}
+		if (!LIST_ISEMPTY(&ctx->bref.users)) {
+			HA_SPIN_LOCK(PATREF_LOCK, &ctx->ref->lock);
+			LIST_DEL_INIT(&ctx->bref.users);
+			HA_SPIN_UNLOCK(PATREF_LOCK, &ctx->ref->lock);
 		}
 		return 1;
 	}
 
-	switch (appctx->st2) {
-
-	case STAT_ST_INIT:
-		/* the function had not been called yet, let's prepare the
-		 * buffer for a response. We initialize the current stream
-		 * pointer to the first in the global list. When a target
-		 * stream is being destroyed, it is responsible for updating
-		 * this pointer. We know we have reached the end when this
-		 * pointer points back to the head of the streams list.
-		 */
-		HA_SPIN_LOCK(PATREF_LOCK, &appctx->ctx.map.ref->lock);
-		LIST_INIT(&appctx->ctx.map.bref.users);
-		appctx->ctx.map.bref.ref = appctx->ctx.map.ref->head.n;
-		HA_SPIN_UNLOCK(PATREF_LOCK, &appctx->ctx.map.ref->lock);
-		appctx->st2 = STAT_ST_LIST;
+	switch (ctx->state) {
+	case STATE_INIT:
+		ctx->state = STATE_LIST;
 		/* fall through */
 
-	case STAT_ST_LIST:
+	case STATE_LIST:
+		HA_SPIN_LOCK(PATREF_LOCK, &ctx->ref->lock);
 
-		HA_SPIN_LOCK(PATREF_LOCK, &appctx->ctx.map.ref->lock);
-
-		if (!LIST_ISEMPTY(&appctx->ctx.map.bref.users)) {
-			LIST_DELETE(&appctx->ctx.map.bref.users);
-			LIST_INIT(&appctx->ctx.map.bref.users);
+		if (!LIST_ISEMPTY(&ctx->bref.users)) {
+			LIST_DELETE(&ctx->bref.users);
+			LIST_INIT(&ctx->bref.users);
+		} else {
+			ctx->bref.ref = ctx->ref->head.n;
 		}
 
-		while (appctx->ctx.map.bref.ref != &appctx->ctx.map.ref->head) {
+		while (ctx->bref.ref != &ctx->ref->head) {
 			chunk_reset(&trash);
 
-			elt = LIST_ELEM(appctx->ctx.map.bref.ref, struct pat_ref_elt *, list);
+			elt = LIST_ELEM(ctx->bref.ref, struct pat_ref_elt *, list);
 
-			if (elt->gen_id != appctx->ctx.cli.i0)
+			if (elt->gen_id != ctx->curr_gen)
 				goto skip;
 
 			/* build messages */
@@ -387,33 +396,34 @@ static int cli_io_handler_pat_list(struct appctx *appctx)
 				/* let's try again later from this stream. We add ourselves into
 				 * this stream's users so that it can remove us upon termination.
 				 */
-				LIST_APPEND(&elt->back_refs, &appctx->ctx.map.bref.users);
-				HA_SPIN_UNLOCK(PATREF_LOCK, &appctx->ctx.map.ref->lock);
+				LIST_APPEND(&elt->back_refs, &ctx->bref.users);
+				HA_SPIN_UNLOCK(PATREF_LOCK, &ctx->ref->lock);
 				cs_rx_room_blk(cs);
 				return 0;
 			}
 		skip:
 			/* get next list entry and check the end of the list */
-			appctx->ctx.map.bref.ref = elt->list.n;
+			ctx->bref.ref = elt->list.n;
 		}
-		HA_SPIN_UNLOCK(PATREF_LOCK, &appctx->ctx.map.ref->lock);
+		HA_SPIN_UNLOCK(PATREF_LOCK, &ctx->ref->lock);
 		/* fall through */
 
 	default:
-		appctx->st2 = STAT_ST_FIN;
+		ctx->state = STATE_DONE;
 		return 1;
 	}
 }
 
 static int cli_io_handler_pats_list(struct appctx *appctx)
 {
-	struct conn_stream *cs = appctx->owner;
+	struct show_map_ctx *ctx = appctx->svcctx;
+	struct conn_stream *cs = appctx_cs(appctx);
 
-	switch (appctx->st2) {
-	case STAT_ST_INIT:
+	switch (ctx->state) {
+	case STATE_INIT:
 		/* Display the column headers. If the message cannot be sent,
 		 * quit the function with returning 0. The function is called
-		 * later and restarted at the state "STAT_ST_INIT".
+		 * later and restarted at the state "STATE_INIT".
 		 */
 		chunk_reset(&trash);
 		chunk_appendf(&trash, "# id (file) description\n");
@@ -427,23 +437,23 @@ static int cli_io_handler_pats_list(struct appctx *appctx)
 		 * available field of this pointer is <list>. It is used with the function
 		 * pat_list_get_next() for returning the first available entry
 		 */
-		appctx->ctx.map.ref = LIST_ELEM(&pattern_reference, struct pat_ref *, list);
-		appctx->ctx.map.ref = pat_list_get_next(appctx->ctx.map.ref, &pattern_reference,
-		                                        appctx->ctx.map.display_flags);
-		appctx->st2 = STAT_ST_LIST;
+		ctx->ref = LIST_ELEM(&pattern_reference, struct pat_ref *, list);
+		ctx->ref = pat_list_get_next(ctx->ref, &pattern_reference,
+		                                        ctx->display_flags);
+		ctx->state = STATE_LIST;
 		/* fall through */
 
-	case STAT_ST_LIST:
-		while (appctx->ctx.map.ref) {
+	case STATE_LIST:
+		while (ctx->ref) {
 			chunk_reset(&trash);
 
 			/* Build messages. If the reference is used by another category than
 			 * the listed categories, display the information in the message.
 			 */
-			chunk_appendf(&trash, "%d (%s) %s. curr_ver=%u next_ver=%u entry_cnt=%llu\n", appctx->ctx.map.ref->unique_id,
-			              appctx->ctx.map.ref->reference ? appctx->ctx.map.ref->reference : "",
-			              appctx->ctx.map.ref->display, appctx->ctx.map.ref->curr_gen, appctx->ctx.map.ref->next_gen,
-			              appctx->ctx.map.ref->entry_cnt);
+			chunk_appendf(&trash, "%d (%s) %s. curr_ver=%u next_ver=%u entry_cnt=%llu\n", ctx->ref->unique_id,
+			              ctx->ref->reference ? ctx->ref->reference : "",
+			              ctx->ref->display, ctx->ref->curr_gen, ctx->ref->next_gen,
+			              ctx->ref->entry_cnt);
 
 			if (ci_putchk(cs_ic(cs), &trash) == -1) {
 				/* let's try again later from this stream. We add ourselves into
@@ -454,14 +464,14 @@ static int cli_io_handler_pats_list(struct appctx *appctx)
 			}
 
 			/* get next list entry and check the end of the list */
-			appctx->ctx.map.ref = pat_list_get_next(appctx->ctx.map.ref, &pattern_reference,
-			                                        appctx->ctx.map.display_flags);
+			ctx->ref = pat_list_get_next(ctx->ref, &pattern_reference,
+			                                        ctx->display_flags);
 		}
 
 		/* fall through */
 
 	default:
-		appctx->st2 = STAT_ST_FIN;
+		ctx->state = STATE_DONE;
 		return 1;
 	}
 	return 0;
@@ -469,56 +479,57 @@ static int cli_io_handler_pats_list(struct appctx *appctx)
 
 static int cli_io_handler_map_lookup(struct appctx *appctx)
 {
-	struct conn_stream *cs = appctx->owner;
+	struct show_map_ctx *ctx = appctx->svcctx;
+	struct conn_stream *cs = appctx_cs(appctx);
 	struct sample sample;
 	struct pattern *pat;
 	int match_method;
 
-	switch (appctx->st2) {
-	case STAT_ST_INIT:
+	switch (ctx->state) {
+	case STATE_INIT:
 		/* Init to the first entry. The list cannot be change */
-		appctx->ctx.map.expr = LIST_ELEM(&appctx->ctx.map.ref->pat, struct pattern_expr *, list);
-		appctx->ctx.map.expr = pat_expr_get_next(appctx->ctx.map.expr, &appctx->ctx.map.ref->pat);
-		appctx->st2 = STAT_ST_LIST;
+		ctx->expr = LIST_ELEM(&ctx->ref->pat, struct pattern_expr *, list);
+		ctx->expr = pat_expr_get_next(ctx->expr, &ctx->ref->pat);
+		ctx->state = STATE_LIST;
 		/* fall through */
 
-	case STAT_ST_LIST:
-		HA_SPIN_LOCK(PATREF_LOCK, &appctx->ctx.map.ref->lock);
+	case STATE_LIST:
+		HA_SPIN_LOCK(PATREF_LOCK, &ctx->ref->lock);
 		/* for each lookup type */
-		while (appctx->ctx.map.expr) {
+		while (ctx->expr) {
 			/* initialise chunk to build new message */
 			chunk_reset(&trash);
 
 			/* execute pattern matching */
 			sample.data.type = SMP_T_STR;
 			sample.flags = SMP_F_CONST;
-			sample.data.u.str.data = appctx->ctx.map.chunk.data;
-			sample.data.u.str.area = appctx->ctx.map.chunk.area;
+			sample.data.u.str.data = ctx->chunk.data;
+			sample.data.u.str.area = ctx->chunk.area;
 
-			if (appctx->ctx.map.expr->pat_head->match &&
-			    sample_convert(&sample, appctx->ctx.map.expr->pat_head->expect_type))
-				pat = appctx->ctx.map.expr->pat_head->match(&sample, appctx->ctx.map.expr, 1);
+			if (ctx->expr->pat_head->match &&
+			    sample_convert(&sample, ctx->expr->pat_head->expect_type))
+				pat = ctx->expr->pat_head->match(&sample, ctx->expr, 1);
 			else
 				pat = NULL;
 
 			/* build return message: set type of match */
 			for (match_method=0; match_method<PAT_MATCH_NUM; match_method++)
-				if (appctx->ctx.map.expr->pat_head->match == pat_match_fcts[match_method])
+				if (ctx->expr->pat_head->match == pat_match_fcts[match_method])
 					break;
 			if (match_method >= PAT_MATCH_NUM)
-				chunk_appendf(&trash, "type=unknown(%p)", appctx->ctx.map.expr->pat_head->match);
+				chunk_appendf(&trash, "type=unknown(%p)", ctx->expr->pat_head->match);
 			else
 				chunk_appendf(&trash, "type=%s", pat_match_names[match_method]);
 
 			/* case sensitive */
-			if (appctx->ctx.map.expr->mflags & PAT_MF_IGNORE_CASE)
+			if (ctx->expr->mflags & PAT_MF_IGNORE_CASE)
 				chunk_appendf(&trash, ", case=insensitive");
 			else
 				chunk_appendf(&trash, ", case=sensitive");
 
 			/* Display no match, and set default value */
 			if (!pat) {
-				if (appctx->ctx.map.display_flags == PAT_REF_MAP)
+				if (ctx->display_flags == PAT_REF_MAP)
 					chunk_appendf(&trash, ", found=no");
 				else
 					chunk_appendf(&trash, ", match=no");
@@ -527,7 +538,7 @@ static int cli_io_handler_map_lookup(struct appctx *appctx)
 			/* Display match and match info */
 			else {
 				/* display match */
-				if (appctx->ctx.map.display_flags == PAT_REF_MAP)
+				if (ctx->display_flags == PAT_REF_MAP)
 					chunk_appendf(&trash, ", found=yes");
 				else
 					chunk_appendf(&trash, ", match=yes");
@@ -539,7 +550,7 @@ static int cli_io_handler_map_lookup(struct appctx *appctx)
 					chunk_appendf(&trash, ", idx=list");
 
 				/* display pattern */
-				if (appctx->ctx.map.display_flags == PAT_REF_MAP) {
+				if (ctx->display_flags == PAT_REF_MAP) {
 					if (pat->ref && pat->ref->pattern)
 						chunk_appendf(&trash, ", key=\"%s\"", pat->ref->pattern);
 					else
@@ -553,7 +564,7 @@ static int cli_io_handler_map_lookup(struct appctx *appctx)
 				}
 
 				/* display return value */
-				if (appctx->ctx.map.display_flags == PAT_REF_MAP) {
+				if (ctx->display_flags == PAT_REF_MAP) {
 					if (pat->data && pat->ref && pat->ref->sample)
 						chunk_appendf(&trash, ", value=\"%s\", type=\"%s\"", pat->ref->sample,
 						              smp_to_type[pat->data->type]);
@@ -569,51 +580,55 @@ static int cli_io_handler_map_lookup(struct appctx *appctx)
 				/* let's try again later from this stream. We add ourselves into
 				 * this stream's users so that it can remove us upon termination.
 				 */
-				HA_SPIN_UNLOCK(PATREF_LOCK, &appctx->ctx.map.ref->lock);
+				HA_SPIN_UNLOCK(PATREF_LOCK, &ctx->ref->lock);
 				cs_rx_room_blk(cs);
 				return 0;
 			}
 
 			/* get next entry */
-			appctx->ctx.map.expr = pat_expr_get_next(appctx->ctx.map.expr,
-			                                         &appctx->ctx.map.ref->pat);
+			ctx->expr = pat_expr_get_next(ctx->expr,
+			                                         &ctx->ref->pat);
 		}
-		HA_SPIN_UNLOCK(PATREF_LOCK, &appctx->ctx.map.ref->lock);
+		HA_SPIN_UNLOCK(PATREF_LOCK, &ctx->ref->lock);
 		/* fall through */
 
 	default:
-		appctx->st2 = STAT_ST_FIN;
+		ctx->state = STATE_DONE;
 		return 1;
 	}
 }
 
 static void cli_release_mlook(struct appctx *appctx)
 {
-	ha_free(&appctx->ctx.map.chunk.area);
+	struct show_map_ctx *ctx = appctx->svcctx;
+
+	ha_free(&ctx->chunk.area);
 }
 
 
 static int cli_parse_get_map(char **args, char *payload, struct appctx *appctx, void *private)
 {
+	struct show_map_ctx *ctx = applet_reserve_svcctx(appctx, sizeof(*ctx));
+
 	if (strcmp(args[1], "map") == 0 || strcmp(args[1], "acl") == 0) {
 		/* Set flags. */
 		if (args[1][0] == 'm')
-			appctx->ctx.map.display_flags = PAT_REF_MAP;
+			ctx->display_flags = PAT_REF_MAP;
 		else
-			appctx->ctx.map.display_flags = PAT_REF_ACL;
+			ctx->display_flags = PAT_REF_ACL;
 
 		/* No parameter. */
 		if (!*args[2] || !*args[3]) {
-			if (appctx->ctx.map.display_flags == PAT_REF_MAP)
+			if (ctx->display_flags == PAT_REF_MAP)
 				return cli_err(appctx, "Missing map identifier and/or key.\n");
 			else
 				return cli_err(appctx, "Missing ACL identifier and/or key.\n");
 		}
 
 		/* lookup into the maps */
-		appctx->ctx.map.ref = pat_ref_lookup_ref(args[2]);
-		if (!appctx->ctx.map.ref) {
-			if (appctx->ctx.map.display_flags == PAT_REF_MAP)
+		ctx->ref = pat_ref_lookup_ref(args[2]);
+		if (!ctx->ref) {
+			if (ctx->display_flags == PAT_REF_MAP)
 				return cli_err(appctx, "Unknown map identifier. Please use #<id> or <file>.\n");
 			else
 				return cli_err(appctx, "Unknown ACL identifier. Please use #<id> or <file>.\n");
@@ -623,10 +638,10 @@ static int cli_parse_get_map(char **args, char *payload, struct appctx *appctx, 
 		 * it may be used over multiple iterations. It's released
 		 * at the end and upon abort anyway.
 		 */
-		appctx->ctx.map.chunk.data = strlen(args[3]);
-		appctx->ctx.map.chunk.size = appctx->ctx.map.chunk.data + 1;
-		appctx->ctx.map.chunk.area = strdup(args[3]);
-		if (!appctx->ctx.map.chunk.area)
+		ctx->chunk.data = strlen(args[3]);
+		ctx->chunk.size = ctx->chunk.data + 1;
+		ctx->chunk.area = strdup(args[3]);
+		if (!ctx->chunk.area)
 			return cli_err(appctx,  "Out of memory error.\n");
 
 		return 0;
@@ -636,6 +651,8 @@ static int cli_parse_get_map(char **args, char *payload, struct appctx *appctx, 
 
 static int cli_parse_prepare_map(char **args, char *payload, struct appctx *appctx, void *private)
 {
+	struct show_map_ctx *ctx = applet_reserve_svcctx(appctx, sizeof(*ctx));
+
 	if (strcmp(args[1], "map") == 0 ||
 	    strcmp(args[1], "acl") == 0) {
 		uint next_gen;
@@ -643,20 +660,20 @@ static int cli_parse_prepare_map(char **args, char *payload, struct appctx *appc
 
 		/* Set ACL or MAP flags. */
 		if (args[1][0] == 'm')
-			appctx->ctx.map.display_flags = PAT_REF_MAP;
+			ctx->display_flags = PAT_REF_MAP;
 		else
-			appctx->ctx.map.display_flags = PAT_REF_ACL;
+			ctx->display_flags = PAT_REF_ACL;
 
 		/* lookup into the refs and check the map flag */
-		appctx->ctx.map.ref = pat_ref_lookup_ref(args[2]);
-		if (!appctx->ctx.map.ref ||
-		    !(appctx->ctx.map.ref->flags & appctx->ctx.map.display_flags)) {
-			if (appctx->ctx.map.display_flags == PAT_REF_MAP)
+		ctx->ref = pat_ref_lookup_ref(args[2]);
+		if (!ctx->ref ||
+		    !(ctx->ref->flags & ctx->display_flags)) {
+			if (ctx->display_flags == PAT_REF_MAP)
 				return cli_err(appctx, "Unknown map identifier. Please use #<id> or <file>.\n");
 			else
 				return cli_err(appctx, "Unknown ACL identifier. Please use #<id> or <file>.\n");
 		}
-		next_gen = pat_ref_newgen(appctx->ctx.map.ref);
+		next_gen = pat_ref_newgen(ctx->ref);
 		return cli_dynmsg(appctx, LOG_INFO, memprintf(&msg, "New version created: %u\n", next_gen));
 	}
 
@@ -665,25 +682,28 @@ static int cli_parse_prepare_map(char **args, char *payload, struct appctx *appc
 
 static void cli_release_show_map(struct appctx *appctx)
 {
-	if (appctx->st2 == STAT_ST_LIST) {
-		HA_SPIN_LOCK(PATREF_LOCK, &appctx->ctx.map.ref->lock);
-		if (!LIST_ISEMPTY(&appctx->ctx.map.bref.users))
-			LIST_DELETE(&appctx->ctx.map.bref.users);
-		HA_SPIN_UNLOCK(PATREF_LOCK, &appctx->ctx.map.ref->lock);
+	struct show_map_ctx *ctx = appctx->svcctx;
+
+	if (!LIST_ISEMPTY(&ctx->bref.users)) {
+		HA_SPIN_LOCK(PATREF_LOCK, &ctx->ref->lock);
+		LIST_DEL_INIT(&ctx->bref.users);
+		HA_SPIN_UNLOCK(PATREF_LOCK, &ctx->ref->lock);
 	}
 }
 
 static int cli_parse_show_map(char **args, char *payload, struct appctx *appctx, void *private)
 {
+	struct show_map_ctx *ctx = applet_reserve_svcctx(appctx, sizeof(*ctx));
+
 	if (strcmp(args[1], "map") == 0 ||
 	    strcmp(args[1], "acl") == 0) {
 		const char *gen = NULL;
 
 		/* Set ACL or MAP flags. */
 		if (args[1][0] == 'm')
-			appctx->ctx.map.display_flags = PAT_REF_MAP;
+			ctx->display_flags = PAT_REF_MAP;
 		else
-			appctx->ctx.map.display_flags = PAT_REF_ACL;
+			ctx->display_flags = PAT_REF_ACL;
 
 		/* no parameter: display all map available */
 		if (!*args[2]) {
@@ -701,21 +721,22 @@ static int cli_parse_show_map(char **args, char *payload, struct appctx *appctx,
 		}
 
 		/* lookup into the refs and check the map flag */
-		appctx->ctx.map.ref = pat_ref_lookup_ref(args[2]);
-		if (!appctx->ctx.map.ref ||
-		    !(appctx->ctx.map.ref->flags & appctx->ctx.map.display_flags)) {
-			if (appctx->ctx.map.display_flags == PAT_REF_MAP)
+		ctx->ref = pat_ref_lookup_ref(args[2]);
+		if (!ctx->ref ||
+		    !(ctx->ref->flags & ctx->display_flags)) {
+			if (ctx->display_flags == PAT_REF_MAP)
 				return cli_err(appctx, "Unknown map identifier. Please use #<id> or <file>.\n");
 			else
 				return cli_err(appctx, "Unknown ACL identifier. Please use #<id> or <file>.\n");
 		}
 
-		/* set the desired generation id in cli.i0 */
+		/* set the desired generation id in curr_gen */
 		if (gen)
-			appctx->ctx.cli.i0 = str2uic(gen);
+			ctx->curr_gen = str2uic(gen);
 		else
-			appctx->ctx.cli.i0 = appctx->ctx.map.ref->curr_gen;
+			ctx->curr_gen = ctx->ref->curr_gen;
 
+		LIST_INIT(&ctx->bref.users);
 		appctx->io_handler = cli_io_handler_pat_list;
 		appctx->io_release = cli_release_show_map;
 		return 0;
@@ -726,19 +747,21 @@ static int cli_parse_show_map(char **args, char *payload, struct appctx *appctx,
 
 static int cli_parse_set_map(char **args, char *payload, struct appctx *appctx, void *private)
 {
+	struct show_map_ctx *ctx = applet_reserve_svcctx(appctx, sizeof(*ctx));
+
 	if (strcmp(args[1], "map") == 0) {
 		char *err;
 
 		/* Set flags. */
-		appctx->ctx.map.display_flags = PAT_REF_MAP;
+		ctx->display_flags = PAT_REF_MAP;
 
 		/* Expect three parameters: map name, key and new value. */
 		if (!*args[2] || !*args[3] || !*args[4])
 			return cli_err(appctx, "'set map' expects three parameters: map identifier, key and value.\n");
 
 		/* Lookup the reference in the maps. */
-		appctx->ctx.map.ref = pat_ref_lookup_ref(args[2]);
-		if (!appctx->ctx.map.ref)
+		ctx->ref = pat_ref_lookup_ref(args[2]);
+		if (!ctx->ref)
 			return cli_err(appctx, "Unknown map identifier. Please use #<id> or <file>.\n");
 
 		/* If the entry identifier start with a '#', it is considered as
@@ -761,30 +784,30 @@ static int cli_parse_set_map(char **args, char *payload, struct appctx *appctx, 
 
 			/* Try to modify the entry. */
 			err = NULL;
-			HA_SPIN_LOCK(PATREF_LOCK, &appctx->ctx.map.ref->lock);
-			if (!pat_ref_set_by_id(appctx->ctx.map.ref, ref, args[4], &err)) {
-				HA_SPIN_UNLOCK(PATREF_LOCK, &appctx->ctx.map.ref->lock);
+			HA_SPIN_LOCK(PATREF_LOCK, &ctx->ref->lock);
+			if (!pat_ref_set_by_id(ctx->ref, ref, args[4], &err)) {
+				HA_SPIN_UNLOCK(PATREF_LOCK, &ctx->ref->lock);
 				if (err)
 					return cli_dynerr(appctx, memprintf(&err, "%s.\n", err));
 				else
 					return cli_err(appctx, "Failed to update an entry.\n");
 			}
-			HA_SPIN_UNLOCK(PATREF_LOCK, &appctx->ctx.map.ref->lock);
+			HA_SPIN_UNLOCK(PATREF_LOCK, &ctx->ref->lock);
 		}
 		else {
 			/* Else, use the entry identifier as pattern
 			 * string, and update the value.
 			 */
 			err = NULL;
-			HA_SPIN_LOCK(PATREF_LOCK, &appctx->ctx.map.ref->lock);
-			if (!pat_ref_set(appctx->ctx.map.ref, args[3], args[4], &err)) {
-				HA_SPIN_UNLOCK(PATREF_LOCK, &appctx->ctx.map.ref->lock);
+			HA_SPIN_LOCK(PATREF_LOCK, &ctx->ref->lock);
+			if (!pat_ref_set(ctx->ref, args[3], args[4], &err)) {
+				HA_SPIN_UNLOCK(PATREF_LOCK, &ctx->ref->lock);
 				if (err)
 					return cli_dynerr(appctx, memprintf(&err, "%s.\n", err));
 				else
 					return cli_err(appctx, "Failed to update an entry.\n");
 			}
-			HA_SPIN_UNLOCK(PATREF_LOCK, &appctx->ctx.map.ref->lock);
+			HA_SPIN_UNLOCK(PATREF_LOCK, &ctx->ref->lock);
 		}
 
 		/* The set is done, send message. */
@@ -796,6 +819,8 @@ static int cli_parse_set_map(char **args, char *payload, struct appctx *appctx, 
 
 static int cli_parse_add_map(char **args, char *payload, struct appctx *appctx, void *private)
 {
+	struct show_map_ctx *ctx = applet_reserve_svcctx(appctx, sizeof(*ctx));
+
 	if (strcmp(args[1], "map") == 0 ||
 	    strcmp(args[1], "acl") == 0) {
 		const char *gen = NULL;
@@ -805,9 +830,9 @@ static int cli_parse_add_map(char **args, char *payload, struct appctx *appctx, 
 
 		/* Set flags. */
 		if (args[1][0] == 'm')
-			appctx->ctx.map.display_flags = PAT_REF_MAP;
+			ctx->display_flags = PAT_REF_MAP;
 		else
-			appctx->ctx.map.display_flags = PAT_REF_ACL;
+			ctx->display_flags = PAT_REF_ACL;
 
 		/* For both "map" and "acl" we may have an optional generation
 		 * number specified using a "@" character before the pattern
@@ -823,7 +848,7 @@ static int cli_parse_add_map(char **args, char *payload, struct appctx *appctx, 
 		 *   - one parameter if there is a payload
 		 * If it is "acl", we expect only two parameters
 		 */
-		if (appctx->ctx.map.display_flags == PAT_REF_MAP) {
+		if (ctx->display_flags == PAT_REF_MAP) {
 			if ((!payload && (!*args[2] || !*args[3] || !*args[4])) ||
 			    (payload && !*args[2]))
 				return cli_err(appctx,
@@ -834,9 +859,9 @@ static int cli_parse_add_map(char **args, char *payload, struct appctx *appctx, 
 			return cli_err(appctx, "'add acl' expects two parameters: ACL identifier and pattern.\n");
 
 		/* Lookup for the reference. */
-		appctx->ctx.map.ref = pat_ref_lookup_ref(args[2]);
-		if (!appctx->ctx.map.ref) {
-			if (appctx->ctx.map.display_flags == PAT_REF_MAP)
+		ctx->ref = pat_ref_lookup_ref(args[2]);
+		if (!ctx->ref) {
+			if (ctx->display_flags == PAT_REF_MAP)
 				return cli_err(appctx, "Unknown map identifier. Please use #<id> or <file>.\n");
 			else
 				return cli_err(appctx, "Unknown ACL identifier. Please use #<id> or <file>.\n");
@@ -844,8 +869,8 @@ static int cli_parse_add_map(char **args, char *payload, struct appctx *appctx, 
 
 		if (gen) {
 			genid = str2uic(gen);
-			if ((int)(genid - appctx->ctx.map.ref->next_gen) > 0) {
-				if (appctx->ctx.map.display_flags == PAT_REF_MAP)
+			if ((int)(genid - ctx->ref->next_gen) > 0) {
+				if (ctx->display_flags == PAT_REF_MAP)
 					return cli_err(appctx, "Version number in the future, please use 'prepare map' before.\n");
 				else
 					return cli_err(appctx, "Version number in the future, please use 'prepare acl' before.\n");
@@ -855,8 +880,8 @@ static int cli_parse_add_map(char **args, char *payload, struct appctx *appctx, 
 		/* The command "add acl" is prohibited if the reference
 		 * use samples.
 		 */
-		if ((appctx->ctx.map.display_flags & PAT_REF_ACL) &&
-		    (appctx->ctx.map.ref->flags & PAT_REF_SMP)) {
+		if ((ctx->display_flags & PAT_REF_ACL) &&
+		    (ctx->ref->flags & PAT_REF_SMP)) {
 			return cli_err(appctx,
 				       "This ACL is shared with a map containing samples. "
 				       "You must use the command 'add map' to add values.\n");
@@ -883,7 +908,7 @@ static int cli_parse_add_map(char **args, char *payload, struct appctx *appctx, 
 				l = strcspn(key, " \t");
 				payload += l;
 
-				if (!*payload && appctx->ctx.map.display_flags == PAT_REF_MAP)
+				if (!*payload && ctx->display_flags == PAT_REF_MAP)
 					return cli_dynerr(appctx, memprintf(&err, "Missing value for key '%s'.\n", key));
 
 				key[l] = 0;
@@ -899,12 +924,12 @@ static int cli_parse_add_map(char **args, char *payload, struct appctx *appctx, 
 				value[l] = 0;
 			}
 
-			if (appctx->ctx.map.display_flags != PAT_REF_MAP)
+			if (ctx->display_flags != PAT_REF_MAP)
 				value = NULL;
 
-			HA_SPIN_LOCK(PATREF_LOCK, &appctx->ctx.map.ref->lock);
-			ret = !!pat_ref_load(appctx->ctx.map.ref, gen ? genid : appctx->ctx.map.ref->curr_gen, key, value, -1, &err);
-			HA_SPIN_UNLOCK(PATREF_LOCK, &appctx->ctx.map.ref->lock);
+			HA_SPIN_LOCK(PATREF_LOCK, &ctx->ref->lock);
+			ret = !!pat_ref_load(ctx->ref, gen ? genid : ctx->ref->curr_gen, key, value, -1, &err);
+			HA_SPIN_UNLOCK(PATREF_LOCK, &ctx->ref->lock);
 
 			if (!ret) {
 				if (err)
@@ -924,23 +949,25 @@ static int cli_parse_add_map(char **args, char *payload, struct appctx *appctx, 
 
 static int cli_parse_del_map(char **args, char *payload, struct appctx *appctx, void *private)
 {
+	struct show_map_ctx *ctx = applet_reserve_svcctx(appctx, sizeof(*ctx));
+
 	if (args[1][0] == 'm')
-		appctx->ctx.map.display_flags = PAT_REF_MAP;
+		ctx->display_flags = PAT_REF_MAP;
 	else
-		appctx->ctx.map.display_flags = PAT_REF_ACL;
+		ctx->display_flags = PAT_REF_ACL;
 
 	/* Expect two parameters: map name and key. */
 	if (!*args[2] || !*args[3]) {
-		if (appctx->ctx.map.display_flags == PAT_REF_MAP)
+		if (ctx->display_flags == PAT_REF_MAP)
 			return cli_err(appctx, "This command expects two parameters: map identifier and key.\n");
 		else
 			return cli_err(appctx, "This command expects two parameters: ACL identifier and key.\n");
 	}
 
 	/* Lookup the reference in the maps. */
-	appctx->ctx.map.ref = pat_ref_lookup_ref(args[2]);
-	if (!appctx->ctx.map.ref ||
-	    !(appctx->ctx.map.ref->flags & appctx->ctx.map.display_flags))
+	ctx->ref = pat_ref_lookup_ref(args[2]);
+	if (!ctx->ref ||
+	    !(ctx->ref->flags & ctx->display_flags))
 		return cli_err(appctx, "Unknown map identifier. Please use #<id> or <file>.\n");
 
 	/* If the entry identifier start with a '#', it is considered as
@@ -962,25 +989,25 @@ static int cli_parse_del_map(char **args, char *payload, struct appctx *appctx, 
 			return cli_err(appctx, "Malformed identifier. Please use #<id> or <file>.\n");
 
 		/* Try to delete the entry. */
-		HA_SPIN_LOCK(PATREF_LOCK, &appctx->ctx.map.ref->lock);
-		if (!pat_ref_delete_by_id(appctx->ctx.map.ref, ref)) {
-			HA_SPIN_UNLOCK(PATREF_LOCK, &appctx->ctx.map.ref->lock);
+		HA_SPIN_LOCK(PATREF_LOCK, &ctx->ref->lock);
+		if (!pat_ref_delete_by_id(ctx->ref, ref)) {
+			HA_SPIN_UNLOCK(PATREF_LOCK, &ctx->ref->lock);
 			/* The entry is not found, send message. */
 			return cli_err(appctx, "Key not found.\n");
 		}
-		HA_SPIN_UNLOCK(PATREF_LOCK, &appctx->ctx.map.ref->lock);
+		HA_SPIN_UNLOCK(PATREF_LOCK, &ctx->ref->lock);
 	}
 	else {
 		/* Else, use the entry identifier as pattern
 		 * string and try to delete the entry.
 		 */
-		HA_SPIN_LOCK(PATREF_LOCK, &appctx->ctx.map.ref->lock);
-		if (!pat_ref_delete(appctx->ctx.map.ref, args[3])) {
-			HA_SPIN_UNLOCK(PATREF_LOCK, &appctx->ctx.map.ref->lock);
+		HA_SPIN_LOCK(PATREF_LOCK, &ctx->ref->lock);
+		if (!pat_ref_delete(ctx->ref, args[3])) {
+			HA_SPIN_UNLOCK(PATREF_LOCK, &ctx->ref->lock);
 			/* The entry is not found, send message. */
 			return cli_err(appctx, "Key not found.\n");
 		}
-		HA_SPIN_UNLOCK(PATREF_LOCK, &appctx->ctx.map.ref->lock);
+		HA_SPIN_UNLOCK(PATREF_LOCK, &ctx->ref->lock);
 	}
 
 	/* The deletion is done, send message. */
@@ -989,39 +1016,42 @@ static int cli_parse_del_map(char **args, char *payload, struct appctx *appctx, 
 }
 
 /* continue to clear a map which was started in the parser. The range of
- * generations this applies to is taken from appctx->ctx.cli.i0 for the oldest
- * and appctx->ctx.cli.i1 for the latest.
+ * generations this applies to is taken from ctx->curr_gen for the oldest
+ * and ctx->prev_gen for the latest.
  */
 static int cli_io_handler_clear_map(struct appctx *appctx)
 {
+	struct show_map_ctx *ctx = appctx->svcctx;
 	int finished;
 
-	HA_SPIN_LOCK(PATREF_LOCK, &appctx->ctx.map.ref->lock);
-	finished = pat_ref_purge_range(appctx->ctx.map.ref, appctx->ctx.cli.i0, appctx->ctx.cli.i1, 100);
-	HA_SPIN_UNLOCK(PATREF_LOCK, &appctx->ctx.map.ref->lock);
+	HA_SPIN_LOCK(PATREF_LOCK, &ctx->ref->lock);
+	finished = pat_ref_purge_range(ctx->ref, ctx->curr_gen, ctx->prev_gen, 100);
+	HA_SPIN_UNLOCK(PATREF_LOCK, &ctx->ref->lock);
 
 	if (!finished) {
 		/* let's come back later */
-		cs_rx_endp_more(appctx->owner);
+		cs_rx_endp_more(appctx_cs(appctx));
 		return 0;
 	}
 	return 1;
 }
 
-/* note: sets appctx->ctx.cli.i0 and appctx->ctx.cli.i1 to the oldest and
+/* note: sets ctx->curr_gen and ctx->prev_gen to the oldest and
  * latest generations to clear, respectively, and will call the clear_map
  * handler.
  */
 static int cli_parse_clear_map(char **args, char *payload, struct appctx *appctx, void *private)
 {
+	struct show_map_ctx *ctx = applet_reserve_svcctx(appctx, sizeof(*ctx));
+
 	if (strcmp(args[1], "map") == 0 || strcmp(args[1], "acl") == 0) {
 		const char *gen = NULL;
 
 		/* Set ACL or MAP flags. */
 		if (args[1][0] == 'm')
-			appctx->ctx.map.display_flags = PAT_REF_MAP;
+			ctx->display_flags = PAT_REF_MAP;
 		else
-			appctx->ctx.map.display_flags = PAT_REF_ACL;
+			ctx->display_flags = PAT_REF_ACL;
 
 		/* For both "map" and "acl" we may have an optional generation
 		 * number specified using a "@" character before the pattern
@@ -1034,27 +1064,27 @@ static int cli_parse_clear_map(char **args, char *payload, struct appctx *appctx
 
 		/* no parameter */
 		if (!*args[2]) {
-			if (appctx->ctx.map.display_flags == PAT_REF_MAP)
+			if (ctx->display_flags == PAT_REF_MAP)
 				return cli_err(appctx, "Missing map identifier.\n");
 			else
 				return cli_err(appctx, "Missing ACL identifier.\n");
 		}
 
 		/* lookup into the refs and check the map flag */
-		appctx->ctx.map.ref = pat_ref_lookup_ref(args[2]);
-		if (!appctx->ctx.map.ref ||
-		    !(appctx->ctx.map.ref->flags & appctx->ctx.map.display_flags)) {
-			if (appctx->ctx.map.display_flags == PAT_REF_MAP)
+		ctx->ref = pat_ref_lookup_ref(args[2]);
+		if (!ctx->ref ||
+		    !(ctx->ref->flags & ctx->display_flags)) {
+			if (ctx->display_flags == PAT_REF_MAP)
 				return cli_err(appctx, "Unknown map identifier. Please use #<id> or <file>.\n");
 			else
 				return cli_err(appctx, "Unknown ACL identifier. Please use #<id> or <file>.\n");
 		}
 
-		/* set the desired generation id in cli.i0/i1 */
+		/* set the desired generation id in curr_gen/prev_gen */
 		if (gen)
-			appctx->ctx.cli.i1 = appctx->ctx.cli.i0 = str2uic(gen);
+			ctx->prev_gen = ctx->curr_gen = str2uic(gen);
 		else
-			appctx->ctx.cli.i1 = appctx->ctx.cli.i0 = appctx->ctx.map.ref->curr_gen;
+			ctx->prev_gen = ctx->curr_gen = ctx->ref->curr_gen;
 
 		/* delegate the clearing to the I/O handler which can yield */
 		return 0;
@@ -1062,12 +1092,14 @@ static int cli_parse_clear_map(char **args, char *payload, struct appctx *appctx
 	return 1;
 }
 
-/* note: sets appctx->ctx.cli.i0 and appctx->ctx.cli.i1 to the oldest and
+/* note: sets ctx->curr_gen and ctx->prev_gen to the oldest and
  * latest generations to clear, respectively, and will call the clear_map
  * handler.
  */
 static int cli_parse_commit_map(char **args, char *payload, struct appctx *appctx, void *private)
 {
+	struct show_map_ctx *ctx = applet_reserve_svcctx(appctx, sizeof(*ctx));
+
 	if (strcmp(args[1], "map") == 0 || strcmp(args[1], "acl") == 0) {
 		const char *gen = NULL;
 		uint genid;
@@ -1075,9 +1107,9 @@ static int cli_parse_commit_map(char **args, char *payload, struct appctx *appct
 
 		/* Set ACL or MAP flags. */
 		if (args[1][0] == 'm')
-			appctx->ctx.map.display_flags = PAT_REF_MAP;
+			ctx->display_flags = PAT_REF_MAP;
 		else
-			appctx->ctx.map.display_flags = PAT_REF_ACL;
+			ctx->display_flags = PAT_REF_ACL;
 
 		if (*args[2] != '@')
 			return cli_err(appctx, "Missing version number.\n");
@@ -1088,34 +1120,34 @@ static int cli_parse_commit_map(char **args, char *payload, struct appctx *appct
 		 */
 		gen = args[2] + 1;
 		genid = str2uic(gen);
-		appctx->ctx.cli.i1 = genid - 1;
-		appctx->ctx.cli.i0 = appctx->ctx.cli.i1 - ((~0U) >> 1);
+		ctx->prev_gen = genid - 1;
+		ctx->curr_gen = ctx->prev_gen - ((~0U) >> 1);
 
 		/* no parameter */
 		if (!*args[3]) {
-			if (appctx->ctx.map.display_flags == PAT_REF_MAP)
+			if (ctx->display_flags == PAT_REF_MAP)
 				return cli_err(appctx, "Missing map identifier.\n");
 			else
 				return cli_err(appctx, "Missing ACL identifier.\n");
 		}
 
 		/* lookup into the refs and check the map flag */
-		appctx->ctx.map.ref = pat_ref_lookup_ref(args[3]);
-		if (!appctx->ctx.map.ref ||
-		    !(appctx->ctx.map.ref->flags & appctx->ctx.map.display_flags)) {
-			if (appctx->ctx.map.display_flags == PAT_REF_MAP)
+		ctx->ref = pat_ref_lookup_ref(args[3]);
+		if (!ctx->ref ||
+		    !(ctx->ref->flags & ctx->display_flags)) {
+			if (ctx->display_flags == PAT_REF_MAP)
 				return cli_err(appctx, "Unknown map identifier. Please use #<id> or <file>.\n");
 			else
 				return cli_err(appctx, "Unknown ACL identifier. Please use #<id> or <file>.\n");
 		}
 
-		HA_SPIN_LOCK(PATREF_LOCK, &appctx->ctx.map.ref->lock);
-		if (genid - (appctx->ctx.map.ref->curr_gen + 1) <
-		    appctx->ctx.map.ref->next_gen - appctx->ctx.map.ref->curr_gen)
-			ret = pat_ref_commit(appctx->ctx.map.ref, genid);
+		HA_SPIN_LOCK(PATREF_LOCK, &ctx->ref->lock);
+		if (genid - (ctx->ref->curr_gen + 1) <
+		    ctx->ref->next_gen - ctx->ref->curr_gen)
+			ret = pat_ref_commit(ctx->ref, genid);
 		else
 			ret = 1;
-		HA_SPIN_UNLOCK(PATREF_LOCK, &appctx->ctx.map.ref->lock);
+		HA_SPIN_UNLOCK(PATREF_LOCK, &ctx->ref->lock);
 
 		if (ret != 0)
 			return cli_err(appctx, "Version number out of range.\n");

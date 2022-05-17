@@ -180,6 +180,65 @@ add_engine:
 }
 #endif
 
+#ifdef HAVE_SSL_PROVIDERS
+/* parse the "ssl-propquery" keyword in global section.
+ * Returns <0 on alert, >0 on warning, 0 on success.
+ */
+static int ssl_parse_global_ssl_propquery(char **args, int section_type, struct proxy *curpx,
+					  const struct proxy *defpx, const char *file, int line,
+					  char **err)
+{
+	int ret = -1;
+
+	if (*(args[1]) == 0) {
+		memprintf(err, "global statement '%s' expects a property string as an argument.", args[0]);
+		return ret;
+	}
+
+	if (EVP_set_default_properties(NULL, args[1]))
+		ret = 0;
+
+	return ret;
+}
+
+/* parse the "ssl-provider" keyword in global section.
+ * Returns <0 on alert, >0 on warning, 0 on success.
+ */
+static int ssl_parse_global_ssl_provider(char **args, int section_type, struct proxy *curpx,
+					 const struct proxy *defpx, const char *file, int line,
+					 char **err)
+{
+	int ret = -1;
+
+	if (*(args[1]) == 0) {
+		memprintf(err, "global statement '%s' expects a valid engine provider name as an argument.", args[0]);
+		return ret;
+	}
+
+	if (ssl_init_provider(args[1]) == 0)
+		ret = 0;
+
+	return ret;
+}
+
+/* parse the "ssl-provider-path" keyword in global section.
+ * Returns <0 on alert, >0 on warning, 0 on success.
+ */
+static int ssl_parse_global_ssl_provider_path(char **args, int section_type, struct proxy *curpx,
+					      const struct proxy *defpx, const char *file, int line,
+					      char **err)
+{
+	if (*(args[1]) == 0) {
+		memprintf(err, "global statement '%s' expects a directory path as an argument.", args[0]);
+		return -1;
+	}
+
+	OSSL_PROVIDER_set_default_search_path(NULL, args[1]);
+
+	return 0;
+}
+#endif
+
 /* parse the "ssl-default-bind-ciphers" / "ssl-default-server-ciphers" keywords
  * in global section. Returns <0 on alert, >0 on warning, 0 on success.
  */
@@ -659,11 +718,11 @@ static int bind_parse_crt(char **args, int cur_arg, struct proxy *px, struct bin
 	}
 
 	if ((*args[cur_arg + 1] != '/' ) && global_ssl.crt_base) {
-		if ((strlen(global_ssl.crt_base) + 1 + strlen(args[cur_arg + 1]) + 1) > MAXPATHLEN) {
+		if ((strlen(global_ssl.crt_base) + 1 + strlen(args[cur_arg + 1]) + 1) > sizeof(path) ||
+		    snprintf(path, sizeof(path), "%s/%s",  global_ssl.crt_base, args[cur_arg + 1]) > sizeof(path)) {
 			memprintf(err, "'%s' : path too long", args[cur_arg]);
 			return ERR_ALERT | ERR_FATAL;
 		}
-		snprintf(path, sizeof(path), "%s/%s",  global_ssl.crt_base, args[cur_arg + 1]);
 		return ssl_sock_load_cert(path, conf, err);
 	}
 
@@ -1935,6 +1994,11 @@ static struct cfg_kw_list cfg_kws = {ILH, {
 	{ CFG_GLOBAL, "ssl-mode-async",  ssl_parse_global_ssl_async },
 #if defined(USE_ENGINE) && !defined(OPENSSL_NO_ENGINE)
 	{ CFG_GLOBAL, "ssl-engine",  ssl_parse_global_ssl_engine },
+#endif
+#ifdef HAVE_SSL_PROVIDERS
+	{ CFG_GLOBAL, "ssl-propquery",  ssl_parse_global_ssl_propquery },
+	{ CFG_GLOBAL, "ssl-provider",  ssl_parse_global_ssl_provider },
+	{ CFG_GLOBAL, "ssl-provider-path",  ssl_parse_global_ssl_provider_path },
 #endif
 	{ CFG_GLOBAL, "ssl-skip-self-issued-ca", ssl_parse_skip_self_issued_ca },
 	{ CFG_GLOBAL, "tune.ssl.cachesize", ssl_parse_global_int },

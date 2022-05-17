@@ -118,7 +118,6 @@ struct h1c {
 /* H1 stream descriptor */
 struct h1s {
 	struct h1c *h1c;
-	struct conn_stream *cs;
 	struct cs_endpoint *endp;
 	uint32_t flags;                /* Connection flags: H1S_F_* */
 
@@ -149,7 +148,7 @@ struct h1_hdr_entry  {
 
 /* Declare the headers map */
 static struct h1_hdrs_map hdrs_map = { .name = NULL, .map  = EB_ROOT };
-
+static int accept_payload_with_any_method = 0;
 
 /* trace source and events */
 static void h1_trace(enum trace_level level, uint64_t mask,
@@ -430,8 +429,8 @@ static void h1_trace(enum trace_level level, uint64_t mask, const struct trace_s
 		chunk_appendf(&trace_buf, " h1s=%p(0x%08x)", h1s, h1s->flags);
 		if (h1s->endp)
 			chunk_appendf(&trace_buf, " endp=%p(0x%08x)", h1s->endp, h1s->endp->flags);
-		if (h1s->cs)
-			chunk_appendf(&trace_buf, " cs=%p(0x%08x)", h1s->cs, h1s->cs->flags);
+		if (h1s->endp && h1s->endp->cs)
+			chunk_appendf(&trace_buf, " cs=%p(0x%08x)", h1s->endp->cs, h1s->endp->cs->flags);
 	}
 
 	if (src->verbosity == H1_VERB_MINIMAL)
@@ -727,8 +726,7 @@ static struct conn_stream *h1s_new_cs(struct h1s *h1s, struct buffer *input)
 	if (h1s->req.flags & H1_MF_UPG_WEBSOCKET)
 		h1s->endp->flags |= CS_EP_WEBSOCKET;
 
-	h1s->cs = cs_new_from_mux(h1s->endp, h1c->conn->owner, input);
-	if (!h1s->cs) {
+	if (!cs_new_from_endp(h1s->endp, h1c->conn->owner, input)) {
 		TRACE_ERROR("CS allocation failure", H1_EV_STRM_NEW|H1_EV_STRM_END|H1_EV_STRM_ERR, h1c->conn, h1s);
 		goto err;
 	}
@@ -738,7 +736,7 @@ static struct conn_stream *h1s_new_cs(struct h1s *h1s, struct buffer *input)
 
 	h1c->flags = (h1c->flags & ~H1C_F_ST_EMBRYONIC) | H1C_F_ST_ATTACHED | H1C_F_ST_READY;
 	TRACE_LEAVE(H1_EV_STRM_NEW, h1c->conn, h1s);
-	return h1s->cs;
+	return h1s->endp->cs;
 
   err:
 	TRACE_DEVEL("leaving on error", H1_EV_STRM_NEW|H1_EV_STRM_ERR, h1c->conn, h1s);
@@ -749,14 +747,14 @@ static struct conn_stream *h1s_upgrade_cs(struct h1s *h1s, struct buffer *input)
 {
 	TRACE_ENTER(H1_EV_STRM_NEW, h1s->h1c->conn, h1s);
 
-	if (stream_upgrade_from_cs(h1s->cs, input) < 0) {
+	if (stream_upgrade_from_cs(h1s->endp->cs, input) < 0) {
 		TRACE_ERROR("stream upgrade failure", H1_EV_STRM_NEW|H1_EV_STRM_END|H1_EV_STRM_ERR, h1s->h1c->conn, h1s);
 		goto err;
 	}
 
 	h1s->h1c->flags |= H1C_F_ST_READY;
 	TRACE_LEAVE(H1_EV_STRM_NEW, h1s->h1c->conn, h1s);
-	return h1s->cs;
+	return h1s->endp->cs;
 
   err:
 	TRACE_DEVEL("leaving on error", H1_EV_STRM_NEW|H1_EV_STRM_ERR, h1s->h1c->conn, h1s);
@@ -777,7 +775,6 @@ static struct h1s *h1s_new(struct h1c *h1c)
 	h1s->h1c = h1c;
 	h1c->h1s = h1s;
 	h1s->sess = NULL;
-	h1s->cs = NULL;
 	h1s->endp = NULL;
 	h1s->flags = H1S_F_WANT_KAL;
 	h1s->subs = NULL;
@@ -818,7 +815,6 @@ static struct h1s *h1c_frt_stream_new(struct h1c *h1c, struct conn_stream *cs, s
 	if (cs) {
 		if (cs_attach_mux(cs, h1s, h1c->conn) < 0)
 			goto fail;
-		h1s->cs = cs;
 		h1s->endp = cs->endp;
 	}
 	else {
@@ -860,7 +856,6 @@ static struct h1s *h1c_bck_stream_new(struct h1c *h1c, struct conn_stream *cs, s
 		goto fail;
 
 	h1s->flags |= H1S_F_RX_BLK;
-	h1s->cs = cs;
 	h1s->endp = cs->endp;
 	h1s->sess = sess;
 
@@ -1417,11 +1412,11 @@ static void h1_capture_bad_message(struct h1c *h1c, struct h1s *h1s,
 	struct proxy *other_end;
 	union error_snapshot_ctx ctx;
 
-	if ((h1c->flags & H1C_F_ST_ATTACHED) && cs_strm(h1s->cs)) {
+	if ((h1c->flags & H1C_F_ST_ATTACHED) && cs_strm(h1s->endp->cs)) {
 		if (sess == NULL)
-			sess = __cs_strm(h1s->cs)->sess;
+			sess = __cs_strm(h1s->endp->cs)->sess;
 		if (!(h1m->flags & H1_MF_RESP))
-			other_end = __cs_strm(h1s->cs)->be;
+			other_end = __cs_strm(h1s->endp->cs)->be;
 		else
 			other_end = sess->fe;
 	} else
@@ -1602,12 +1597,14 @@ static size_t h1_handle_headers(struct h1s *h1s, struct h1m *h1m, struct htx *ht
 	}
 
 
-	/* Reject HTTP/1.0 GET/HEAD/DELETE requests with a payload. There is a
-	 * payload if the c-l is not null or the the payload is chunk-encoded.
-	 * A parsing error is reported but a A 413-Payload-Too-Large is returned
-	 * instead of a 400-Bad-Request.
+	/* Reject HTTP/1.0 GET/HEAD/DELETE requests with a payload except if
+	 * accept_payload_with_any_method global option is set.
+	 *There is a payload if the c-l is not null or the the payload is
+	 * chunk-encoded.  A parsing error is reported but a A
+	 * 413-Payload-Too-Large is returned instead of a 400-Bad-Request.
 	 */
-	if (!(h1m->flags & (H1_MF_RESP|H1_MF_VER_11)) &&
+	if (!accept_payload_with_any_method &&
+	    !(h1m->flags & (H1_MF_RESP|H1_MF_VER_11)) &&
 	    (((h1m->flags & H1_MF_CLEN) && h1m->body_len) || (h1m->flags & H1_MF_CHNK)) &&
 	    (h1sl.rq.meth == HTTP_METH_GET || h1sl.rq.meth == HTTP_METH_HEAD || h1sl.rq.meth == HTTP_METH_DELETE)) {
 		h1s->flags |= H1S_F_PARSING_ERROR;
@@ -1889,7 +1886,7 @@ static size_t h1_process_demux(struct h1c *h1c, struct buffer *buf, size_t count
 
 		if (!(h1c->flags & H1C_F_ST_ATTACHED)) {
 			TRACE_DEVEL("request headers fully parsed, create and attach the CS", H1_EV_RX_DATA, h1c->conn, h1s);
-			BUG_ON(h1s->cs);
+			BUG_ON(h1s->endp->cs);
 			if (!h1s_new_cs(h1s, buf)) {
 				h1c->flags |= H1C_F_ST_ERROR;
 				goto err;
@@ -1897,7 +1894,7 @@ static size_t h1_process_demux(struct h1c *h1c, struct buffer *buf, size_t count
 		}
 		else {
 			TRACE_DEVEL("request headers fully parsed, upgrade the inherited CS", H1_EV_RX_DATA, h1c->conn, h1s);
-			BUG_ON(h1s->cs == NULL);
+			BUG_ON(h1s->endp->cs == NULL);
 			if (!h1s_upgrade_cs(h1s, buf)) {
 				h1c->flags |= H1C_F_ST_ERROR;
 				TRACE_ERROR("H1S upgrade failure", H1_EV_RX_DATA|H1_EV_H1S_ERR, h1c->conn, h1s);
@@ -1906,7 +1903,7 @@ static size_t h1_process_demux(struct h1c *h1c, struct buffer *buf, size_t count
 		}
 	}
 
-	/* Here h1s->cs is always defined */
+	/* Here h1s->endp->cs is always defined */
 	if (!(h1m->flags & H1_MF_CHNK) && (h1m->state == H1_MSG_DATA || (h1m->state == H1_MSG_TUNNEL))) {
 		TRACE_STATE("notify the mux can use splicing", H1_EV_RX_DATA|H1_EV_RX_BODY, h1c->conn, h1s);
 		h1s->endp->flags |= CS_EP_MAY_SPLICE;
@@ -2464,13 +2461,8 @@ static size_t h1_process_mux(struct h1c *h1c, struct buffer *buf, size_t count)
 			  trailers:
 				h1m->state = H1_MSG_TRAILERS;
 
-				/* If the message is not chunked, ignore
-				 * trailers. It may happen with H2 messages. */
-				if (!(h1m->flags & H1_MF_CHNK)) {
-					if (type == HTX_BLK_EOT)
-						goto done;
-					break;
-				}
+				if (!(h1m->flags & H1_MF_CHNK))
+					goto done;
 
 				if ((h1m->flags & H1_MF_RESP) && (h1s->flags & H1S_F_BODYLESS_RESP)) {
 					TRACE_PROTO("Skip trailers for bodyless response", H1_EV_TX_DATA|H1_EV_TX_BODY, h1c->conn, h1s, chn_htx);
@@ -2499,15 +2491,15 @@ static size_t h1_process_mux(struct h1c *h1c, struct buffer *buf, size_t count)
 				break;
 
 			case H1_MSG_DONE:
+				/* If the message is not chunked, ignore
+				 * trailers. It may happen with H2 messages. */
+				if ((type == HTX_BLK_TLR || type == HTX_BLK_EOT) && !(h1m->flags & H1_MF_CHNK))
+					break;
+
 				TRACE_STATE("unexpected data xferred in done state", H1_EV_TX_DATA|H1_EV_H1C_ERR|H1_EV_H1S_ERR, h1c->conn, h1s);
 				goto error; /* For now return an error */
 
 			  done:
-				if (!(chn_htx->flags & HTX_FL_EOM) && (!(h1m->flags & H1_MF_CLEN) || h1m->curr_len)) {
-					TRACE_STATE("No EOM flags in done state", H1_EV_TX_DATA|H1_EV_H1C_ERR|H1_EV_H1S_ERR, h1c->conn, h1s);
-					goto error; /* For now return an error */
-				}
-
 				h1m->state = H1_MSG_DONE;
 				if (!(h1m->flags & H1_MF_RESP) && h1s->meth == HTTP_METH_CONNECT) {
 					h1s->flags |= H1S_F_TX_BLK;
@@ -2627,9 +2619,9 @@ static void h1_alert(struct h1s *h1s)
 		h1_wake_stream_for_recv(h1s);
 		h1_wake_stream_for_send(h1s);
 	}
-	else if (h1s->cs && h1s->cs->data_cb->wake != NULL) {
+	else if (h1s->endp->cs && h1s->endp->cs->data_cb->wake != NULL) {
 		TRACE_POINT(H1_EV_STRM_WAKE, h1s->h1c->conn, h1s);
-		h1s->cs->data_cb->wake(h1s->cs);
+		h1s->endp->cs->data_cb->wake(h1s->endp->cs);
 	}
 }
 
@@ -3311,7 +3303,7 @@ struct task *h1_timeout_task(struct task *t, void *context, unsigned int state)
  * Attach a new stream to a connection
  * (Used for outgoing connections)
  */
-static int h1_attach(struct connection *conn, struct conn_stream *cs, struct session *sess)
+static int h1_attach(struct connection *conn, struct cs_endpoint *endp, struct session *sess)
 {
 	struct h1c *h1c = conn->ctx;
 	struct h1s *h1s;
@@ -3322,7 +3314,7 @@ static int h1_attach(struct connection *conn, struct conn_stream *cs, struct ses
 		goto err;
 	}
 
-	h1s = h1c_bck_stream_new(h1c, cs, sess);
+	h1s = h1c_bck_stream_new(h1c, endp->cs, sess);
 	if (h1s == NULL) {
 		TRACE_ERROR("h1s creation failure", H1_EV_STRM_NEW|H1_EV_STRM_END|H1_EV_STRM_ERR, conn);
 		goto err;
@@ -3348,7 +3340,7 @@ static struct conn_stream *h1_get_first_cs(const struct connection *conn)
 	struct h1s *h1s = h1c->h1s;
 
 	if (h1s)
-		return h1s->cs;
+		return h1s->endp->cs;
 
 	return NULL;
 }
@@ -3365,9 +3357,9 @@ static void h1_destroy(void *ctx)
 /*
  * Detach the stream from the connection and possibly release the connection.
  */
-static void h1_detach(struct conn_stream *cs)
+static void h1_detach(struct cs_endpoint *endp)
 {
-	struct h1s *h1s = __cs_mux(cs);
+	struct h1s *h1s = endp->target;
 	struct h1c *h1c;
 	struct session *sess;
 	int is_not_first;
@@ -3381,7 +3373,6 @@ static void h1_detach(struct conn_stream *cs)
 
 	sess = h1s->sess;
 	h1c = h1s->h1c;
-	h1s->cs = NULL;
 
 	sess->accept_date = date;
 	sess->tv_accept   = now;
@@ -3484,9 +3475,9 @@ static void h1_shutr(struct conn_stream *cs, enum co_shr_mode mode)
 
 	TRACE_ENTER(H1_EV_STRM_SHUT, h1c->conn, h1s, 0, (size_t[]){mode});
 
-	if (cs->endp->flags & CS_EP_SHR)
+	if (h1s->endp->flags & CS_EP_SHR)
 		goto end;
-	if (cs->endp->flags & CS_EP_KILL_CONN) {
+	if (h1s->endp->flags & CS_EP_KILL_CONN) {
 		TRACE_STATE("stream wants to kill the connection", H1_EV_STRM_SHUT, h1c->conn, h1s);
 		goto do_shutr;
 	}
@@ -3507,7 +3498,7 @@ static void h1_shutr(struct conn_stream *cs, enum co_shr_mode mode)
 
   do_shutr:
 	/* NOTE: Be sure to handle abort (cf. h2_shutr) */
-	if (cs->endp->flags & CS_EP_SHR)
+	if (h1s->endp->flags & CS_EP_SHR)
 		goto end;
 
 	if (conn_xprt_ready(h1c->conn) && h1c->conn->xprt->shutr)
@@ -3527,9 +3518,9 @@ static void h1_shutw(struct conn_stream *cs, enum co_shw_mode mode)
 
 	TRACE_ENTER(H1_EV_STRM_SHUT, h1c->conn, h1s, 0, (size_t[]){mode});
 
-	if (cs->endp->flags & CS_EP_SHW)
+	if (h1s->endp->flags & CS_EP_SHW)
 		goto end;
-	if (cs->endp->flags & CS_EP_KILL_CONN) {
+	if (h1s->endp->flags & CS_EP_KILL_CONN) {
 		TRACE_STATE("stream wants to kill the connection", H1_EV_STRM_SHUT, h1c->conn, h1s);
 		goto do_shutw;
 	}
@@ -3920,7 +3911,7 @@ static int h1_show_fd(struct buffer *msg, struct connection *conn)
 			chunk_appendf(msg, " .endp.flg=0x%08x", h1s->endp->flags);
 			if (!(h1s->endp->flags & CS_EP_ORPHAN))
 				chunk_appendf(msg, " .cs.flg=0x%08x .cs.app=%p",
-					      h1s->cs->flags, h1s->cs->app);
+					      h1s->endp->cs->flags, h1s->endp->cs->app);
 		}
 		chunk_appendf(&trash, " .subs=%p", h1s->subs);
 		if (h1s->subs) {
@@ -4072,7 +4063,7 @@ static int cfg_h1_headers_case_adjust_postparser()
 
 	file = fopen(hdrs_map.name, "r");
 	if (!file) {
-		ha_alert("h1-outgoing-headers-case-adjust-file '%s': failed to open file.\n",
+		ha_alert("h1-headers-case-adjust-file '%s': failed to open file.\n",
 			 hdrs_map.name);
                 err_code |= ERR_ALERT | ERR_FATAL;
 		goto end;
@@ -4121,14 +4112,14 @@ static int cfg_h1_headers_case_adjust_postparser()
 		err = NULL;
 		rc = add_hdr_case_adjust(key_beg, value_beg, &err);
 		if (rc < 0) {
-			ha_alert("h1-outgoing-headers-case-adjust-file '%s' : %s at line %d.\n",
+			ha_alert("h1-headers-case-adjust-file '%s' : %s at line %d.\n",
 				 hdrs_map.name, err, line);
 			err_code |= ERR_ALERT | ERR_FATAL;
 			free(err);
 			goto end;
 		}
 		if (rc > 0) {
-			ha_warning("h1-outgoing-headers-case-adjust-file '%s' : %s at line %d.\n",
+			ha_warning("h1-headers-case-adjust-file '%s' : %s at line %d.\n",
 				   hdrs_map.name, err, line);
 			err_code |= ERR_WARN;
 			free(err);
@@ -4142,8 +4133,19 @@ static int cfg_h1_headers_case_adjust_postparser()
 	return err_code;
 }
 
+/* config parser for global "h1-accept-payload_=-with-any-method" */
+static int cfg_parse_h1_accept_payload_with_any_method(char **args, int section_type, struct proxy *curpx,
+						       const struct proxy *defpx, const char *file, int line,
+						       char **err)
+{
+        if (too_many_args(0, args, err, NULL))
+                return -1;
+	accept_payload_with_any_method = 1;
+	return 0;
+}
 
-/* config parser for global "h1-outgoing-header-case-adjust" */
+
+/* config parser for global "h1-header-case-adjust" */
 static int cfg_parse_h1_header_case_adjust(char **args, int section_type, struct proxy *curpx,
 					   const struct proxy *defpx, const char *file, int line,
 					   char **err)
@@ -4157,7 +4159,7 @@ static int cfg_parse_h1_header_case_adjust(char **args, int section_type, struct
 	return add_hdr_case_adjust(args[1], args[2], err);
 }
 
-/* config parser for global "h1-outgoing-headers-case-adjust-file" */
+/* config parser for global "h1-headers-case-adjust-file" */
 static int cfg_parse_h1_headers_case_adjust_file(char **args, int section_type, struct proxy *curpx,
 						 const struct proxy *defpx, const char *file, int line,
 						 char **err)
@@ -4173,9 +4175,9 @@ static int cfg_parse_h1_headers_case_adjust_file(char **args, int section_type, 
         return 0;
 }
 
-
 /* config keyword parsers */
 static struct cfg_kw_list cfg_kws = {{ }, {
+		{ CFG_GLOBAL, "h1-accept-payload-with-any-method", cfg_parse_h1_accept_payload_with_any_method },
 		{ CFG_GLOBAL, "h1-case-adjust", cfg_parse_h1_header_case_adjust },
 		{ CFG_GLOBAL, "h1-case-adjust-file", cfg_parse_h1_headers_case_adjust_file },
 		{ 0, NULL, NULL },

@@ -15,6 +15,7 @@
 
 #include <haproxy/action-t.h>
 #include <haproxy/api.h>
+#include <haproxy/applet.h>
 #include <haproxy/cfgparse.h>
 #include <haproxy/channel.h>
 #include <haproxy/cli.h>
@@ -56,6 +57,17 @@ struct cache {
 	char id[33];             /* cache name */
 };
 
+/* the appctx context of a cache applet, stored in appctx->svcctx */
+struct cache_appctx {
+	struct cache_entry *entry;       /* Entry to be sent from cache. */
+	unsigned int sent;               /* The number of bytes already sent for this cache entry. */
+	unsigned int offset;             /* start offset of remaining data relative to beginning of the next block */
+	unsigned int rem_data;           /* Remaining bytes for the last data block (HTX only, 0 means process next block) */
+	unsigned int send_notmodified:1; /* In case of conditional request, we might want to send a "304 Not Modified" response instead of the stored data. */
+	unsigned int unused:31;
+	struct shared_block *next;       /* The next block of data to be sent for this cache entry. */
+};
+
 /* cache config for filters */
 struct cache_flt_conf {
 	union {
@@ -63,6 +75,12 @@ struct cache_flt_conf {
 		char *name;          /* cache name used during conf parsing */
 	} c;
 	unsigned int flags;   /* CACHE_FLT_F_* */
+};
+
+/* CLI context used during "show cache" */
+struct show_cache_ctx {
+	struct cache *cache;
+	uint next_key;
 };
 
 
@@ -1252,8 +1270,9 @@ out:
 
 static void http_cache_applet_release(struct appctx *appctx)
 {
+	struct cache_appctx *ctx = appctx->svcctx;
 	struct cache_flt_conf *cconf = appctx->rule->arg.act.p[0];
-	struct cache_entry *cache_ptr = appctx->ctx.cache.entry;
+	struct cache_entry *cache_ptr = ctx->entry;
 	struct cache *cache = cconf->c.cache;
 	struct shared_block *first = block_ptr(cache_ptr);
 
@@ -1266,6 +1285,7 @@ static void http_cache_applet_release(struct appctx *appctx)
 static unsigned int htx_cache_dump_blk(struct appctx *appctx, struct htx *htx, enum htx_blk_type type,
 				       uint32_t info, struct shared_block *shblk, unsigned int offset)
 {
+	struct cache_appctx *ctx = appctx->svcctx;
 	struct cache_flt_conf *cconf = appctx->rule->arg.act.p[0];
 	struct shared_context *shctx = shctx_ptr(cconf->c.cache);
 	struct htx_blk *blk;
@@ -1273,7 +1293,8 @@ static unsigned int htx_cache_dump_blk(struct appctx *appctx, struct htx *htx, e
 	unsigned int max, total;
 	uint32_t blksz;
 
-	max = htx_get_max_blksz(htx, channel_htx_recv_max(cs_ic(appctx->owner), htx));
+	max = htx_get_max_blksz(htx,
+				channel_htx_recv_max(cs_ic(appctx_cs(appctx)), htx));
 	if (!max)
 		return 0;
 	blksz = ((type == HTX_BLK_HDR || type == HTX_BLK_TLR)
@@ -1301,28 +1322,29 @@ static unsigned int htx_cache_dump_blk(struct appctx *appctx, struct htx *htx, e
 			offset = 0;
 		}
 	}
-	appctx->ctx.cache.offset = offset;
-	appctx->ctx.cache.next   = shblk;
-	appctx->ctx.cache.sent  += total;
+	ctx->offset = offset;
+	ctx->next   = shblk;
+	ctx->sent  += total;
 	return total;
 }
 
 static unsigned int htx_cache_dump_data_blk(struct appctx *appctx, struct htx *htx,
 					    uint32_t info, struct shared_block *shblk, unsigned int offset)
 {
-
+	struct cache_appctx *ctx = appctx->svcctx;
 	struct cache_flt_conf *cconf = appctx->rule->arg.act.p[0];
 	struct shared_context *shctx = shctx_ptr(cconf->c.cache);
 	unsigned int max, total, rem_data;
 	uint32_t blksz;
 
-	max = htx_get_max_blksz(htx, channel_htx_recv_max(cs_ic(appctx->owner), htx));
+	max = htx_get_max_blksz(htx,
+				channel_htx_recv_max(cs_ic(appctx_cs(appctx)), htx));
 	if (!max)
 		return 0;
 
 	rem_data = 0;
-	if (appctx->ctx.cache.rem_data) {
-		blksz = appctx->ctx.cache.rem_data;
+	if (ctx->rem_data) {
+		blksz = ctx->rem_data;
 		total = 0;
 	}
 	else {
@@ -1350,16 +1372,17 @@ static unsigned int htx_cache_dump_data_blk(struct appctx *appctx, struct htx *h
 		}
 	}
 
-	appctx->ctx.cache.offset   = offset;
-	appctx->ctx.cache.next     = shblk;
-	appctx->ctx.cache.sent    += total;
-	appctx->ctx.cache.rem_data = rem_data + blksz;
+	ctx->offset   = offset;
+	ctx->next     = shblk;
+	ctx->sent    += total;
+	ctx->rem_data = rem_data + blksz;
 	return total;
 }
 
 static size_t htx_cache_dump_msg(struct appctx *appctx, struct htx *htx, unsigned int len,
 				 enum htx_blk_type mark)
 {
+	struct cache_appctx *ctx = appctx->svcctx;
 	struct cache_flt_conf *cconf = appctx->rule->arg.act.p[0];
 	struct shared_context *shctx = shctx_ptr(cconf->c.cache);
 	struct shared_block   *shblk;
@@ -1370,9 +1393,9 @@ static size_t htx_cache_dump_msg(struct appctx *appctx, struct htx *htx, unsigne
 		enum htx_blk_type type;
 		uint32_t info;
 
-		shblk  = appctx->ctx.cache.next;
-		offset = appctx->ctx.cache.offset;
-		if (appctx->ctx.cache.rem_data) {
+		shblk  = ctx->next;
+		offset = ctx->offset;
+		if (ctx->rem_data) {
 			type = HTX_BLK_DATA;
 			info = 0;
 			goto add_data_blk;
@@ -1402,7 +1425,7 @@ static size_t htx_cache_dump_msg(struct appctx *appctx, struct htx *htx, unsigne
 		total += ret;
 		len   -= ret;
 
-		if (appctx->ctx.cache.rem_data || type == mark)
+		if (ctx->rem_data || type == mark)
 			break;
 	}
 
@@ -1411,7 +1434,8 @@ static size_t htx_cache_dump_msg(struct appctx *appctx, struct htx *htx, unsigne
 
 static int htx_cache_add_age_hdr(struct appctx *appctx, struct htx *htx)
 {
-	struct cache_entry *cache_ptr = appctx->ctx.cache.entry;
+	struct cache_appctx *ctx = appctx->svcctx;
+	struct cache_entry *cache_ptr = ctx->entry;
 	unsigned int age;
 	char *end;
 
@@ -1428,9 +1452,10 @@ static int htx_cache_add_age_hdr(struct appctx *appctx, struct htx *htx)
 
 static void http_cache_io_handler(struct appctx *appctx)
 {
-	struct cache_entry *cache_ptr = appctx->ctx.cache.entry;
+	struct cache_appctx *ctx = appctx->svcctx;
+	struct cache_entry *cache_ptr = ctx->entry;
 	struct shared_block *first = block_ptr(cache_ptr);
-	struct conn_stream *cs = appctx->owner;
+	struct conn_stream *cs = appctx_cs(appctx);
 	struct channel *req = cs_oc(cs);
 	struct channel *res = cs_ic(cs);
 	struct htx *req_htx, *res_htx;
@@ -1454,16 +1479,16 @@ static void http_cache_io_handler(struct appctx *appctx)
 		appctx->st0 = HTX_CACHE_END;
 
 	if (appctx->st0 == HTX_CACHE_INIT) {
-		appctx->ctx.cache.next = block_ptr(cache_ptr);
-		appctx->ctx.cache.offset = sizeof(*cache_ptr);
-		appctx->ctx.cache.sent = 0;
-		appctx->ctx.cache.rem_data = 0;
+		ctx->next = block_ptr(cache_ptr);
+		ctx->offset = sizeof(*cache_ptr);
+		ctx->sent = 0;
+		ctx->rem_data = 0;
 		appctx->st0 = HTX_CACHE_HEADER;
 	}
 
 	if (appctx->st0 == HTX_CACHE_HEADER) {
 		/* Headers must be dump at once. Otherwise it is an error */
-		len = first->len - sizeof(*cache_ptr) - appctx->ctx.cache.sent;
+		len = first->len - sizeof(*cache_ptr) - ctx->sent;
 		ret = htx_cache_dump_msg(appctx, res_htx, len, HTX_BLK_EOH);
 		if (!ret || (htx_get_tail_type(res_htx) != HTX_BLK_EOH) ||
 		    !htx_cache_add_age_hdr(appctx, res_htx))
@@ -1471,23 +1496,23 @@ static void http_cache_io_handler(struct appctx *appctx)
 
 		/* In case of a conditional request, we might want to send a
 		 * "304 Not Modified" response instead of the stored data. */
-		if (appctx->ctx.cache.send_notmodified) {
+		if (ctx->send_notmodified) {
 			if (!http_replace_res_status(res_htx, ist("304"), ist("Not Modified"))) {
 				/* If replacing the status code fails we need to send the full response. */
-				appctx->ctx.cache.send_notmodified = 0;
+				ctx->send_notmodified = 0;
 			}
 		}
 
 		/* Skip response body for HEAD requests or in case of "304 Not
 		 * Modified" response. */
-		if (__cs_strm(cs)->txn->meth == HTTP_METH_HEAD || appctx->ctx.cache.send_notmodified)
+		if (__cs_strm(cs)->txn->meth == HTTP_METH_HEAD || ctx->send_notmodified)
 			appctx->st0 = HTX_CACHE_EOM;
 		else
 			appctx->st0 = HTX_CACHE_DATA;
 	}
 
 	if (appctx->st0 == HTX_CACHE_DATA) {
-		len = first->len - sizeof(*cache_ptr) - appctx->ctx.cache.sent;
+		len = first->len - sizeof(*cache_ptr) - ctx->sent;
 		if (len) {
 			ret = htx_cache_dump_msg(appctx, res_htx, len, HTX_BLK_UNUSED);
 			if (ret < len) {
@@ -1501,8 +1526,8 @@ static void http_cache_io_handler(struct appctx *appctx)
 	if (appctx->st0 == HTX_CACHE_EOM) {
 		 /* no more data are expected. */
 		res_htx->flags |= HTX_FL_EOM;
-		cs->endp->flags |= CS_EP_EOI;
 		res->flags |= CF_EOI;
+		appctx->endp->flags |= CS_EP_EOI;
 		appctx->st0 = HTX_CACHE_END;
 	}
 
@@ -1816,12 +1841,14 @@ enum act_return http_action_req_cache_use(struct act_rule *rule, struct proxy *p
 
 		s->target = &http_cache_applet.obj_type;
 		if ((appctx = cs_applet_create(s->csb, objt_applet(s->target)))) {
+			struct cache_appctx *ctx = applet_reserve_svcctx(appctx, sizeof(*ctx));
+
 			appctx->st0 = HTX_CACHE_INIT;
 			appctx->rule = rule;
-			appctx->ctx.cache.entry = res;
-			appctx->ctx.cache.next = NULL;
-			appctx->ctx.cache.sent = 0;
-			appctx->ctx.cache.send_notmodified =
+			ctx->entry = res;
+			ctx->next = NULL;
+			ctx->sent = 0;
+			ctx->send_notmodified =
                                 should_send_notmodified_response(cache, htxbuf(&s->req.buf), res);
 
 			if (px == strm_fe(s))
@@ -2556,22 +2583,24 @@ parse_cache_flt(char **args, int *cur_arg, struct proxy *px,
 	return -1;
 }
 
+/* It reserves a struct show_cache_ctx for the local variables */
 static int cli_parse_show_cache(char **args, char *payload, struct appctx *appctx, void *private)
 {
+	struct show_cache_ctx *ctx = applet_reserve_svcctx(appctx, sizeof(*ctx));
+
 	if (!cli_has_level(appctx, ACCESS_LVL_ADMIN))
 		return 1;
 
+	ctx->cache = LIST_ELEM((caches).n, typeof(struct cache *), list);
 	return 0;
 }
 
+/* It uses a struct show_cache_ctx for the local variables */
 static int cli_io_handler_show_cache(struct appctx *appctx)
 {
-	struct cache* cache = appctx->ctx.cli.p0;
-	struct conn_stream *cs = appctx->owner;
-
-	if (cache == NULL) {
-		cache = LIST_ELEM((caches).n, typeof(struct cache *), list);
-	}
+	struct show_cache_ctx *ctx = appctx->svcctx;
+	struct cache* cache = ctx->cache;
+	struct conn_stream *cs = appctx_cs(appctx);
 
 	list_for_each_entry_from(cache, &caches, list) {
 		struct eb32_node *node = NULL;
@@ -2579,7 +2608,7 @@ static int cli_io_handler_show_cache(struct appctx *appctx)
 		struct cache_entry *entry;
 		unsigned int i;
 
-		next_key = appctx->ctx.cli.i0;
+		next_key = ctx->next_key;
 		if (!next_key) {
 			chunk_printf(&trash, "%p: %s (shctx:%p, available blocks:%d)\n", cache, cache->id, shctx_ptr(cache), shctx_ptr(cache)->nbav);
 			if (ci_putchk(cs_ic(cs), &trash) == -1) {
@@ -2588,7 +2617,7 @@ static int cli_io_handler_show_cache(struct appctx *appctx)
 			}
 		}
 
-		appctx->ctx.cli.p0 = cache;
+		ctx->cache = cache;
 
 		while (1) {
 
@@ -2596,7 +2625,7 @@ static int cli_io_handler_show_cache(struct appctx *appctx)
 			node = eb32_lookup_ge(&cache->entries, next_key);
 			if (!node) {
 				shctx_unlock(shctx_ptr(cache));
-				appctx->ctx.cli.i0 = 0;
+				ctx->next_key = 0;
 				break;
 			}
 
@@ -2616,7 +2645,7 @@ static int cli_io_handler_show_cache(struct appctx *appctx)
 				entry->eb.key = 0;
 			}
 
-			appctx->ctx.cli.i0 = next_key;
+			ctx->next_key = next_key;
 
 			shctx_unlock(shctx_ptr(cache));
 

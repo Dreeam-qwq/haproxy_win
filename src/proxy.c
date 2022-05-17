@@ -21,7 +21,7 @@
 
 #include <haproxy/acl.h>
 #include <haproxy/api.h>
-#include <haproxy/applet-t.h>
+#include <haproxy/applet.h>
 #include <haproxy/capture-t.h>
 #include <haproxy/cfgparse.h>
 #include <haproxy/cli.h>
@@ -58,6 +58,18 @@ struct eb_root used_proxy_id = EB_ROOT;	/* list of proxy IDs in use */
 struct eb_root proxy_by_name = EB_ROOT; /* tree of proxies sorted by name */
 struct eb_root defproxy_by_name = EB_ROOT; /* tree of default proxies sorted by name (dups possible) */
 unsigned int error_snapshot_id = 0;     /* global ID assigned to each error then incremented */
+
+/* CLI context used during "show servers {state|conn}" */
+struct show_srv_ctx {
+	struct proxy *px;       /* current proxy to dump or NULL */
+	struct server *sv;      /* current server to dump or NULL */
+	uint only_pxid;         /* dump only this proxy ID when explicit */
+	int show_conn;          /* non-zero = "conn" otherwise "state" */
+	enum {
+		SHOW_SRV_HEAD = 0,
+		SHOW_SRV_LIST,
+	} state;
+};
 
 /* proxy->options */
 const struct cfg_opt cfg_opts[] =
@@ -2647,14 +2659,15 @@ struct proxy *cli_find_backend(struct appctx *appctx, const char *arg)
 
 /* parse a "show servers [state|conn]" CLI line, returns 0 if it wants to start
  * the dump or 1 if it stops immediately. If an argument is specified, it will
- * set the proxy pointer into cli.p0 and its ID into cli.i0. It sets cli.o0 to
- * 0 for "state", or 1 for "conn".
+ * reserve a show_srv_ctx context and set the proxy pointer into ->px, its ID
+ * into ->only_pxid, and ->show_conn to 0 for "state", or 1 for "conn".
  */
 static int cli_parse_show_servers(char **args, char *payload, struct appctx *appctx, void *private)
 {
+	struct show_srv_ctx *ctx = applet_reserve_svcctx(appctx, sizeof(*ctx));
 	struct proxy *px;
 
-	appctx->ctx.cli.o0 = *args[2] == 'c'; // "conn" vs "state"
+	ctx->show_conn = *args[2] == 'c'; // "conn" vs "state"
 
 	/* check if a backend name has been provided */
 	if (*args[3]) {
@@ -2664,8 +2677,8 @@ static int cli_parse_show_servers(char **args, char *payload, struct appctx *app
 		if (!px)
 			return cli_err(appctx, "Can't find backend.\n");
 
-		appctx->ctx.cli.p0 = px;
-		appctx->ctx.cli.i0 = px->uuid;
+		ctx->px = px;
+		ctx->only_pxid = px->uuid;
 	}
 	return 0;
 }
@@ -2687,15 +2700,17 @@ static void dump_server_addr(const struct sockaddr_storage *addr, char *addr_str
 
 /* dumps server state information for all the servers found in backend cli.p0.
  * These information are all the parameters which may change during HAProxy runtime.
- * By default, we only export to the last known server state file format.
- * These information can be used at next startup to recover same level of server state.
- * It uses the proxy pointer from cli.p0, the proxy's id from cli.i0 and the server's
- * pointer from cli.p1.
+ * By default, we only export to the last known server state file format. These
+ * information can be used at next startup to recover same level of server
+ * state. It takes its context from show_srv_ctx, with the proxy pointer from
+ * ->px, the proxy's id ->only_pxid, the server's pointer from ->sv, and the
+ * choice of what to dump from ->show_conn.
  */
 static int dump_servers_state(struct conn_stream *cs)
 {
 	struct appctx *appctx = __cs_appctx(cs);
-	struct proxy *px = appctx->ctx.cli.p0;
+	struct show_srv_ctx *ctx = appctx->svcctx;
+	struct proxy *px = ctx->px;
 	struct server *srv;
 	char srv_addr[INET6_ADDRSTRLEN + 1];
 	char srv_agent_addr[INET6_ADDRSTRLEN + 1];
@@ -2704,11 +2719,11 @@ static int dump_servers_state(struct conn_stream *cs)
 	int bk_f_forced_id, srv_f_forced_id;
 	char *srvrecord;
 
-	if (!appctx->ctx.cli.p1)
-		appctx->ctx.cli.p1 = px->srv;
+	if (!ctx->sv)
+		ctx->sv = px->srv;
 
-	for (; appctx->ctx.cli.p1 != NULL; appctx->ctx.cli.p1 = srv->next) {
-		srv = appctx->ctx.cli.p1;
+	for (; ctx->sv != NULL; ctx->sv = srv->next) {
+		srv = ctx->sv;
 
 		dump_server_addr(&srv->addr, srv_addr);
 		dump_server_addr(&srv->check.addr, srv_check_addr);
@@ -2722,7 +2737,7 @@ static int dump_servers_state(struct conn_stream *cs)
 		if (srv->srvrq && srv->srvrq->name)
 			srvrecord = srv->srvrq->name;
 
-		if (appctx->ctx.cli.o0 == 0) {
+		if (ctx->show_conn == 0) {
 			/* show servers state */
 			chunk_printf(&trash,
 			             "%d %s "
@@ -2766,24 +2781,17 @@ static int dump_servers_state(struct conn_stream *cs)
 }
 
 /* Parses backend list or simply use backend name provided by the user to return
- * states of servers to stdout. It dumps proxy <cli.p0> and stops if <cli.i0> is
- * non-null.
+ * states of servers to stdout. It takes its context from show_srv_ctx and dumps
+ * proxy ->px and stops if ->only_pxid is non-null.
  */
 static int cli_io_handler_servers_state(struct appctx *appctx)
 {
-	struct conn_stream *cs = appctx->owner;
+	struct show_srv_ctx *ctx = appctx->svcctx;
+	struct conn_stream *cs = appctx_cs(appctx);
 	struct proxy *curproxy;
 
-	chunk_reset(&trash);
-
-	if (appctx->st2 == STAT_ST_INIT) {
-		if (!appctx->ctx.cli.p0)
-			appctx->ctx.cli.p0 = proxies_list;
-		appctx->st2 = STAT_ST_HEAD;
-	}
-
-	if (appctx->st2 == STAT_ST_HEAD) {
-		if (appctx->ctx.cli.o0 == 0)
+	if (ctx->state == SHOW_SRV_HEAD) {
+		if (ctx->show_conn == 0)
 			chunk_printf(&trash, "%d\n# %s\n", SRV_STATE_FILE_VERSION, SRV_STATE_FILE_FIELD_NAMES);
 		else
 			chunk_printf(&trash,
@@ -2794,19 +2802,21 @@ static int cli_io_handler_servers_state(struct appctx *appctx)
 			cs_rx_room_blk(cs);
 			return 0;
 		}
-		appctx->st2 = STAT_ST_INFO;
+		ctx->state = SHOW_SRV_LIST;
+
+		if (!ctx->px)
+			ctx->px = proxies_list;
 	}
 
-	/* STAT_ST_INFO */
-	for (; appctx->ctx.cli.p0 != NULL; appctx->ctx.cli.p0 = curproxy->next) {
-		curproxy = appctx->ctx.cli.p0;
+	for (; ctx->px != NULL; ctx->px = curproxy->next) {
+		curproxy = ctx->px;
 		/* servers are only in backends */
 		if ((curproxy->cap & PR_CAP_BE) && !(curproxy->cap & PR_CAP_INT)) {
 			if (!dump_servers_state(cs))
 				return 0;
 		}
 		/* only the selected proxy is dumped */
-		if (appctx->ctx.cli.i0)
+		if (ctx->only_pxid)
 			break;
 	}
 
@@ -2814,29 +2824,29 @@ static int cli_io_handler_servers_state(struct appctx *appctx)
 }
 
 /* Parses backend list and simply report backend names. It keeps the proxy
- * pointer in cli.p0.
+ * pointer in svcctx since there's nothing else to store there.
  */
 static int cli_io_handler_show_backend(struct appctx *appctx)
 {
-	struct conn_stream *cs = appctx->owner;
+	struct conn_stream *cs = appctx_cs(appctx);
 	struct proxy *curproxy;
 
 	chunk_reset(&trash);
 
-	if (!appctx->ctx.cli.p0) {
+	if (!appctx->svcctx) {
 		chunk_printf(&trash, "# name\n");
 		if (ci_putchk(cs_ic(cs), &trash) == -1) {
 			cs_rx_room_blk(cs);
 			return 0;
 		}
-		appctx->ctx.cli.p0 = proxies_list;
+		appctx->svcctx = proxies_list;
 	}
 
-	for (; appctx->ctx.cli.p0 != NULL; appctx->ctx.cli.p0 = curproxy->next) {
-		curproxy = appctx->ctx.cli.p0;
+	for (; appctx->svcctx != NULL; appctx->svcctx = curproxy->next) {
+		curproxy = appctx->svcctx;
 
-		/* looking for backends only */
-		if (!(curproxy->cap & PR_CAP_BE))
+		/* looking for non-internal backends only */
+		if ((curproxy->cap & (PR_CAP_BE|PR_CAP_INT)) != PR_CAP_BE)
 			continue;
 
 		chunk_appendf(&trash, "%s\n", curproxy->id);
@@ -3083,11 +3093,23 @@ static int cli_parse_enable_frontend(char **args, char *payload, struct appctx *
 	return 1;
 }
 
+/* appctx context used during "show errors" */
+struct show_errors_ctx {
+	struct proxy *px;	/* current proxy being dumped, NULL = not started yet. */
+	unsigned int flag;	/* bit0: buffer being dumped, 0 = req, 1 = resp ; bit1=skip req ; bit2=skip resp. */
+	unsigned int ev_id;	/* event ID of error being dumped */
+	int iid;		/* if >= 0, ID of the proxy to filter on */
+	int ptr;		/* <0: headers, >=0 : text pointer to restart from */
+	int bol;		/* pointer to beginning of current line */
+};
+
 /* "show errors" handler for the CLI. Returns 0 if wants to continue, 1 to stop
  * now.
  */
 static int cli_parse_show_errors(char **args, char *payload, struct appctx *appctx, void *private)
 {
+	struct show_errors_ctx *ctx = applet_reserve_svcctx(appctx, sizeof(*ctx));
+
 	if (!cli_has_level(appctx, ACCESS_LVL_OPER))
 		return 1;
 
@@ -3096,22 +3118,22 @@ static int cli_parse_show_errors(char **args, char *payload, struct appctx *appc
 
 		px = proxy_find_by_name(args[2], 0, 0);
 		if (px)
-			appctx->ctx.errors.iid = px->uuid;
+			ctx->iid = px->uuid;
 		else
-			appctx->ctx.errors.iid = atoi(args[2]);
+			ctx->iid = atoi(args[2]);
 
-		if (!appctx->ctx.errors.iid)
+		if (!ctx->iid)
 			return cli_err(appctx, "No such proxy.\n");
 	}
 	else
-		appctx->ctx.errors.iid	= -1; // dump all proxies
+		ctx->iid	= -1; // dump all proxies
 
-	appctx->ctx.errors.flag = 0;
+	ctx->flag = 0;
 	if (strcmp(args[3], "request") == 0)
-		appctx->ctx.errors.flag |= 4; // ignore response
+		ctx->flag |= 4; // ignore response
 	else if (strcmp(args[3], "response") == 0)
-		appctx->ctx.errors.flag |= 2; // ignore request
-	appctx->ctx.errors.px = NULL;
+		ctx->flag |= 2; // ignore request
+	ctx->px = NULL;
 	return 0;
 }
 
@@ -3121,7 +3143,8 @@ static int cli_parse_show_errors(char **args, char *payload, struct appctx *appc
  */
 static int cli_io_handler_show_errors(struct appctx *appctx)
 {
-	struct conn_stream *cs = appctx->owner;
+	struct show_errors_ctx *ctx = appctx->svcctx;
+	struct conn_stream *cs = appctx_cs(appctx);
 	extern const char *monthname[12];
 
 	if (unlikely(cs_ic(cs)->flags & (CF_WRITE_ERROR|CF_SHUTW)))
@@ -3129,7 +3152,7 @@ static int cli_io_handler_show_errors(struct appctx *appctx)
 
 	chunk_reset(&trash);
 
-	if (!appctx->ctx.errors.px) {
+	if (!ctx->px) {
 		/* the function had not been called yet, let's prepare the
 		 * buffer for a response.
 		 */
@@ -3144,39 +3167,39 @@ static int cli_io_handler_show_errors(struct appctx *appctx)
 		if (ci_putchk(cs_ic(cs), &trash) == -1)
 			goto cant_send;
 
-		appctx->ctx.errors.px = proxies_list;
-		appctx->ctx.errors.bol = 0;
-		appctx->ctx.errors.ptr = -1;
+		ctx->px = proxies_list;
+		ctx->bol = 0;
+		ctx->ptr = -1;
 	}
 
 	/* we have two inner loops here, one for the proxy, the other one for
 	 * the buffer.
 	 */
-	while (appctx->ctx.errors.px) {
+	while (ctx->px) {
 		struct error_snapshot *es;
 
-		HA_RWLOCK_RDLOCK(PROXY_LOCK, &appctx->ctx.errors.px->lock);
+		HA_RWLOCK_RDLOCK(PROXY_LOCK, &ctx->px->lock);
 
-		if ((appctx->ctx.errors.flag & 1) == 0) {
-			es = appctx->ctx.errors.px->invalid_req;
-			if (appctx->ctx.errors.flag & 2) // skip req
+		if ((ctx->flag & 1) == 0) {
+			es = ctx->px->invalid_req;
+			if (ctx->flag & 2) // skip req
 				goto next;
 		}
 		else {
-			es = appctx->ctx.errors.px->invalid_rep;
-			if (appctx->ctx.errors.flag & 4) // skip resp
+			es = ctx->px->invalid_rep;
+			if (ctx->flag & 4) // skip resp
 				goto next;
 		}
 
 		if (!es)
 			goto next;
 
-		if (appctx->ctx.errors.iid >= 0 &&
-		    appctx->ctx.errors.px->uuid != appctx->ctx.errors.iid &&
-		    (!es->oe || es->oe->uuid != appctx->ctx.errors.iid))
+		if (ctx->iid >= 0 &&
+		    ctx->px->uuid != ctx->iid &&
+		    (!es->oe || es->oe->uuid != ctx->iid))
 			goto next;
 
-		if (appctx->ctx.errors.ptr < 0) {
+		if (ctx->ptr < 0) {
 			/* just print headers now */
 
 			char pn[INET6_ADDRSTRLEN];
@@ -3197,12 +3220,12 @@ static int cli_io_handler_show_errors(struct appctx *appctx)
 				port = 0;
 			}
 
-			switch (appctx->ctx.errors.flag & 1) {
+			switch (ctx->flag & 1) {
 			case 0:
 				chunk_appendf(&trash,
 					     " frontend %s (#%d): invalid request\n"
 					     "  backend %s (#%d)",
-					     appctx->ctx.errors.px->id, appctx->ctx.errors.px->uuid,
+					     ctx->px->id, ctx->px->uuid,
 					     (es->oe && es->oe->cap & PR_CAP_BE) ? es->oe->id : "<NONE>",
 					     (es->oe && es->oe->cap & PR_CAP_BE) ? es->oe->uuid : -1);
 				break;
@@ -3210,7 +3233,7 @@ static int cli_io_handler_show_errors(struct appctx *appctx)
 				chunk_appendf(&trash,
 					     " backend %s (#%d): invalid response\n"
 					     "  frontend %s (#%d)",
-					     appctx->ctx.errors.px->id, appctx->ctx.errors.px->uuid,
+					     ctx->px->id, ctx->px->uuid,
 					     es->oe ? es->oe->id : "<NONE>" , es->oe ? es->oe->uuid : -1);
 				break;
 			}
@@ -3234,11 +3257,11 @@ static int cli_io_handler_show_errors(struct appctx *appctx)
 			if (ci_putchk(cs_ic(cs), &trash) == -1)
 				goto cant_send_unlock;
 
-			appctx->ctx.errors.ptr = 0;
-			appctx->ctx.errors.ev_id = es->ev_id;
+			ctx->ptr = 0;
+			ctx->ev_id = es->ev_id;
 		}
 
-		if (appctx->ctx.errors.ev_id != es->ev_id) {
+		if (ctx->ev_id != es->ev_id) {
 			/* the snapshot changed while we were dumping it */
 			chunk_appendf(&trash,
 				     "  WARNING! update detected on this snapshot, dump interrupted. Please re-check!\n");
@@ -3249,35 +3272,35 @@ static int cli_io_handler_show_errors(struct appctx *appctx)
 		}
 
 		/* OK, ptr >= 0, so we have to dump the current line */
-		while (appctx->ctx.errors.ptr < es->buf_len && appctx->ctx.errors.ptr < global.tune.bufsize) {
+		while (ctx->ptr < es->buf_len && ctx->ptr < global.tune.bufsize) {
 			int newptr;
 			int newline;
 
-			newline = appctx->ctx.errors.bol;
-			newptr = dump_text_line(&trash, es->buf, global.tune.bufsize, es->buf_len, &newline, appctx->ctx.errors.ptr);
-			if (newptr == appctx->ctx.errors.ptr)
+			newline = ctx->bol;
+			newptr = dump_text_line(&trash, es->buf, global.tune.bufsize, es->buf_len, &newline, ctx->ptr);
+			if (newptr == ctx->ptr)
 				goto cant_send_unlock;
 
 			if (ci_putchk(cs_ic(cs), &trash) == -1)
 				goto cant_send_unlock;
 
-			appctx->ctx.errors.ptr = newptr;
-			appctx->ctx.errors.bol = newline;
+			ctx->ptr = newptr;
+			ctx->bol = newline;
 		};
 	next:
-		HA_RWLOCK_RDUNLOCK(PROXY_LOCK, &appctx->ctx.errors.px->lock);
-		appctx->ctx.errors.bol = 0;
-		appctx->ctx.errors.ptr = -1;
-		appctx->ctx.errors.flag ^= 1;
-		if (!(appctx->ctx.errors.flag & 1))
-			appctx->ctx.errors.px = appctx->ctx.errors.px->next;
+		HA_RWLOCK_RDUNLOCK(PROXY_LOCK, &ctx->px->lock);
+		ctx->bol = 0;
+		ctx->ptr = -1;
+		ctx->flag ^= 1;
+		if (!(ctx->flag & 1))
+			ctx->px = ctx->px->next;
 	}
 
 	/* dump complete */
 	return 1;
 
  cant_send_unlock:
-	HA_RWLOCK_RDUNLOCK(PROXY_LOCK, &appctx->ctx.errors.px->lock);
+	HA_RWLOCK_RDUNLOCK(PROXY_LOCK, &ctx->px->lock);
  cant_send:
 	cs_rx_room_blk(cs);
 	return 0;
