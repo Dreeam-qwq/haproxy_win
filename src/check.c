@@ -1024,6 +1024,9 @@ static int wake_srv_chk(struct conn_stream *cs)
 	int ret = 0;
 
 	TRACE_ENTER(CHK_EV_HCHK_WAKE, check);
+	if (check->result != CHK_RES_UNKNOWN)
+		goto end;
+
 	if (check->server)
 		HA_SPIN_LOCK(SERVER_LOCK, &check->server->lock);
 	else
@@ -1048,21 +1051,9 @@ static int wake_srv_chk(struct conn_stream *cs)
 	}
 
 	if (check->result != CHK_RES_UNKNOWN || ret == -1) {
-		/* Check complete or aborted. If connection not yet closed do it
-		 * now and wake the check task up to be sure the result is
-		 * handled ASAP. */
+		/* Check complete or aborted. Wake the check task up to be sure
+		 * the result is handled ASAP. */
 		ret = -1;
-		if (conn)  {
-			cs_conn_drain_and_shut(cs);
-			if (check->wait_list.events)
-				conn->mux->unsubscribe(cs, check->wait_list.events, &check->wait_list);
-		}
-
-		/* We may have been scheduled to run, and the
-		 * I/O handler expects to have a cs, so remove
-		 * the tasklet
-		 */
-		tasklet_remove_from_tasklet_list(check->wait_list.tasklet);
 		task_wakeup(check->task, TASK_WOKEN_IO);
 	}
 
@@ -1071,15 +1062,15 @@ static int wake_srv_chk(struct conn_stream *cs)
 	else
 		HA_SPIN_UNLOCK(EMAIL_ALERTS_LOCK, &q->lock);
 
+  end:
 	TRACE_LEAVE(CHK_EV_HCHK_WAKE, check);
 	return ret;
 }
 
 /* This function checks if any I/O is wanted, and if so, attempts to do so */
-struct task *event_srv_chk_io(struct task *t, void *ctx, unsigned int state)
+struct task *srv_chk_io_cb(struct task *t, void *ctx, unsigned int state)
 {
-	struct check *check = ctx;
-	struct conn_stream *cs = check->cs;
+	struct conn_stream *cs = ctx;
 
 	wake_srv_chk(cs);
 	return NULL;
@@ -1196,13 +1187,6 @@ struct task *process_chk_conn(struct task *t, void *context, unsigned int state)
 	}
 
 	if (cs) {
-		if (conn && check->wait_list.events)
-			conn->mux->unsubscribe(cs, check->wait_list.events, &check->wait_list);
-		/* We may have been scheduled to run, and the
-		 * I/O handler expects to have a cs, so remove
-		 * the tasklet
-		 */
-		tasklet_remove_from_tasklet_list(check->wait_list.tasklet);
 		cs_destroy(cs);
 		cs = check->cs = NULL;
 		conn = NULL;
@@ -1232,6 +1216,10 @@ struct task *process_chk_conn(struct task *t, void *context, unsigned int state)
 			check_notify_success(check);
 		}
 	}
+
+        if (LIST_INLIST(&check->buf_wait.list))
+                LIST_DEL_INIT(&check->buf_wait.list);
+
 	task_set_affinity(t, MAX_THREADS_MASK);
 	check_release_buf(check, &check->bi);
 	check_release_buf(check, &check->bo);
@@ -1284,16 +1272,18 @@ int check_buf_available(void *target)
 {
 	struct check *check = target;
 
+	BUG_ON(!check->cs);
+
 	if ((check->state & CHK_ST_IN_ALLOC) && b_alloc(&check->bi)) {
 		TRACE_STATE("unblocking check, input buffer allocated", CHK_EV_TCPCHK_EXP|CHK_EV_RX_BLK, check);
 		check->state &= ~CHK_ST_IN_ALLOC;
-		tasklet_wakeup(check->wait_list.tasklet);
+		tasklet_wakeup(check->cs->wait_event.tasklet);
 		return 1;
 	}
 	if ((check->state & CHK_ST_OUT_ALLOC) && b_alloc(&check->bo)) {
 		TRACE_STATE("unblocking check, output buffer allocated", CHK_EV_TCPCHK_SND|CHK_EV_TX_BLK, check);
 		check->state &= ~CHK_ST_OUT_ALLOC;
-		tasklet_wakeup(check->wait_list.tasklet);
+		tasklet_wakeup(check->cs->wait_event.tasklet);
 		return 1;
 	}
 
@@ -1335,13 +1325,6 @@ const char *init_check(struct check *check, int type)
 	check->bi = BUF_NULL;
 	check->bo = BUF_NULL;
 	LIST_INIT(&check->buf_wait.list);
-
-	check->wait_list.tasklet = tasklet_new();
-	if (!check->wait_list.tasklet)
-		return "out of memory while allocating check tasklet";
-	check->wait_list.events = 0;
-	check->wait_list.tasklet->process = event_srv_chk_io;
-	check->wait_list.tasklet->context = check;
 	return NULL;
 }
 
@@ -1361,8 +1344,6 @@ void free_check(struct check *check)
 	}
 
 	task_destroy(check->task);
-	if (check->wait_list.tasklet)
-		tasklet_free(check->wait_list.tasklet);
 
 	check_release_buf(check, &check->bi);
 	check_release_buf(check, &check->bo);

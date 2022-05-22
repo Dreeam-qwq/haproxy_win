@@ -490,6 +490,69 @@ int quic_tls_decrypt(unsigned char *buf, size_t len,
 	return 1;
 }
 
+/* Similar to quic_tls_decrypt(), except that this function does not decrypt
+ * in place its ciphertest if <out> output buffer ciphertest with <len> as length
+ * is different from <in> input buffer. This is the responbality of the caller
+ * to check that the output buffer has at least the same size as the input buffer.
+ * Note that for CCM mode, we must set the the ciphertext length if AAD data
+ * are provided from <aad> buffer with <aad_len> as length. This is always the
+ * case here. So the caller of this function must provide <aad>. Also note that
+ * there is no need to call EVP_DecryptFinal_ex for CCM mode.
+ *
+ * https://wiki.openssl.org/index.php/EVP_Authenticated_Encryption_and_Decryption
+ *
+ * Return 1 if succeeded, 0 if not.
+ */
+int quic_tls_decrypt2(unsigned char *out,
+                      unsigned char *in, size_t len,
+                      unsigned char *aad, size_t aad_len,
+                      EVP_CIPHER_CTX *ctx, const EVP_CIPHER *aead,
+                      const unsigned char *key, const unsigned char *iv)
+{
+	int outlen;
+	int aead_nid = EVP_CIPHER_nid(aead);
+
+	len -= QUIC_TLS_TAG_LEN;
+	if (!EVP_DecryptInit_ex(ctx, NULL, NULL, NULL, iv) ||
+	    !EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_TAG, QUIC_TLS_TAG_LEN, in + len) ||
+	    (aead_nid == NID_aes_128_ccm &&
+	     !EVP_DecryptUpdate(ctx, NULL, &outlen, NULL, len)) ||
+	    !EVP_DecryptUpdate(ctx, NULL, &outlen, aad, aad_len) ||
+	    !EVP_DecryptUpdate(ctx, out, &outlen, in, len) ||
+	    (aead_nid != NID_aes_128_ccm &&
+	     !EVP_DecryptFinal_ex(ctx, out + outlen, &outlen)))
+		return 0;
+
+	return 1;
+}
+
+/* Derive <key> and <iv> key and IV to be used to encrypt a retry token
+ * with <secret> which is not pseudo-random.
+ * Return 1 if succeeded, 0 if not.
+ */
+int quic_tls_derive_retry_token_secret(const EVP_MD *md,
+                                       unsigned char *key, size_t keylen,
+                                       unsigned char *iv, size_t ivlen,
+                                       const unsigned char *salt, size_t saltlen,
+                                       const unsigned char *secret, size_t secretlen)
+{
+	unsigned char tmpkey[QUIC_TLS_KEY_LEN];
+	const unsigned char tmpkey_label[] = "retry token";
+	const unsigned char key_label[] = "retry token key";
+	const unsigned char iv_label[] = "retry token iv";
+
+	if (!quic_hkdf_extract_and_expand(md, tmpkey, sizeof tmpkey,
+	                                  secret, secretlen, salt, saltlen,
+	                                  tmpkey_label, sizeof tmpkey_label - 1) ||
+	    !quic_hkdf_expand(md, key, keylen, tmpkey, sizeof tmpkey,
+	                      key_label, sizeof key_label - 1) ||
+	    !quic_hkdf_expand(md, iv, ivlen, secret, secretlen,
+	                      iv_label, sizeof iv_label - 1))
+		return 0;
+
+	return 1;
+}
+
 /* Generate the AEAD tag for the Retry packet <pkt> of <pkt_len> bytes and
  * write it to <tag>. The tag is written just after the <pkt> area. It should
  * be at least 16 bytes longs. <odcid> is the CID of the Initial packet

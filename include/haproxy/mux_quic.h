@@ -23,12 +23,12 @@ struct ncbuf *qc_get_ncbuf(struct qcs *qcs, struct ncbuf *ncbuf);
 int qcs_subscribe(struct qcs *qcs, int event_type, struct wait_event *es);
 void qcs_notify_recv(struct qcs *qcs);
 void qcs_notify_send(struct qcs *qcs);
+void qcs_consume(struct qcs *qcs, uint64_t bytes);
 
 int qcc_recv(struct qcc *qcc, uint64_t id, uint64_t len, uint64_t offset,
-             char fin, char *data, struct qcs **out_qcs);
+             char fin, char *data);
 int qcc_recv_max_data(struct qcc *qcc, uint64_t max);
 int qcc_recv_max_stream_data(struct qcc *qcc, uint64_t id, uint64_t max);
-int qcc_decode_qcs(struct qcc *qcc, struct qcs *qcs);
 void qcc_streams_sent_done(struct qcs *qcs, uint64_t data, uint64_t offset);
 
 /* Bit shift to get the stream sub ID for internal use which is obtained
@@ -92,10 +92,22 @@ static inline int qcc_install_app_ops(struct qcc *qcc,
 
 static inline struct conn_stream *qc_attach_cs(struct qcs *qcs, struct buffer *buf)
 {
-	if (!cs_new_from_endp(qcs->endp, qcs->qcc->conn->owner, buf))
+	struct session *sess = qcs->qcc->conn->owner;
+
+	/* TODO duplicated from mux_h2 */
+	sess->t_idle = tv_ms_elapsed(&sess->tv_accept, &now) - sess->t_handshake;
+
+	if (!cs_new_from_endp(qcs->endp, sess, buf))
 		return NULL;
 
 	++qcs->qcc->nb_cs;
+
+	/* TODO duplicated from mux_h2 */
+	sess->accept_date = date;
+	sess->tv_accept   = now;
+	sess->t_handshake = 0;
+	sess->t_idle = 0;
+
 	return qcs->endp->cs;
 }
 

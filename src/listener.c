@@ -36,6 +36,7 @@
 #include <haproxy/task.h>
 #include <haproxy/ticks.h>
 #include <haproxy/tools.h>
+#include <haproxy/xprt_quic.h>
 
 
 /* List head of all known bind keywords */
@@ -152,7 +153,7 @@ struct task *accept_queue_process(struct task *t, void *context, unsigned int st
 		if (!(li->options & LI_O_UNLIMITED)) {
 			HA_ATOMIC_UPDATE_MAX(&global.sps_max,
 			                     update_freq_ctr(&global.sess_per_sec, 1));
-			if (li->bind_conf && li->bind_conf->is_ssl) {
+			if (li->bind_conf && li->bind_conf->options & BC_O_USE_SSL) {
 				HA_ATOMIC_UPDATE_MAX(&global.ssl_max,
 				                     update_freq_ctr(&global.ssl_per_sec, 1));
 			}
@@ -843,7 +844,8 @@ void listener_accept(struct listener *l)
 			max_accept = max;
 	}
 #ifdef USE_OPENSSL
-	if (!(l->options & LI_O_UNLIMITED) && global.ssl_lim && l->bind_conf && l->bind_conf->is_ssl) {
+	if (!(l->options & LI_O_UNLIMITED) && global.ssl_lim &&
+	    l->bind_conf && l->bind_conf->options & BC_O_USE_SSL) {
 		int max = freq_ctr_remain(&global.ssl_per_sec, global.ssl_lim, 0);
 
 		if (unlikely(!max)) {
@@ -1126,7 +1128,8 @@ void listener_accept(struct listener *l)
 			HA_ATOMIC_UPDATE_MAX(&global.sps_max, count);
 		}
 #ifdef USE_OPENSSL
-		if (!(l->options & LI_O_UNLIMITED) && l->bind_conf && l->bind_conf->is_ssl) {
+		if (!(l->options & LI_O_UNLIMITED) &&
+		    l->bind_conf && l->bind_conf->options & BC_O_USE_SSL) {
 			count = update_freq_ctr(&global.ssl_per_sec, 1);
 			HA_ATOMIC_UPDATE_MAX(&global.ssl_max, count);
 		}
@@ -1563,6 +1566,107 @@ static int bind_parse_id(char **args, int cur_arg, struct proxy *px, struct bind
 
 	eb32_insert(&px->conf.used_listener_id, &new->conf.id);
 	return 0;
+}
+
+/* Complete a bind_conf by parsing the args after the address. <args> is the
+ * arguments array, <cur_arg> is the first one to be considered. <section> is
+ * the section name to report in error messages, and <file> and <linenum> are
+ * the file name and line number respectively. Note that args[0..1] are used
+ * in error messages to provide some context. The return value is an error
+ * code, zero on success or an OR of ERR_{FATAL,ABORT,ALERT,WARN}.
+ */
+int bind_parse_args_list(struct bind_conf *bind_conf, char **args, int cur_arg, const char *section, const char *file, int linenum)
+{
+	int err_code = 0;
+
+	while (*(args[cur_arg])) {
+		struct bind_kw *kw;
+		const char *best;
+
+		kw = bind_find_kw(args[cur_arg]);
+		if (kw) {
+			char *err = NULL;
+			int code;
+
+			if (!kw->parse) {
+				ha_alert("parsing [%s:%d] : '%s %s' in section '%s' : '%s' option is not implemented in this version (check build options).\n",
+					 file, linenum, args[0], args[1], section, args[cur_arg]);
+				cur_arg += 1 + kw->skip ;
+				err_code |= ERR_ALERT | ERR_FATAL;
+				goto out;
+			}
+
+			code = kw->parse(args, cur_arg, bind_conf->frontend, bind_conf, &err);
+			err_code |= code;
+
+			if (code) {
+				if (err && *err) {
+					indent_msg(&err, 2);
+					if (((code & (ERR_WARN|ERR_ALERT)) == ERR_WARN))
+						ha_warning("parsing [%s:%d] : '%s %s' in section '%s' : %s\n", file, linenum, args[0], args[1], section, err);
+					else
+						ha_alert("parsing [%s:%d] : '%s %s' in section '%s' : %s\n", file, linenum, args[0], args[1], section, err);
+				}
+				else
+					ha_alert("parsing [%s:%d] : '%s %s' in section '%s' : error encountered while processing '%s'.\n",
+						 file, linenum, args[0], args[1], section, args[cur_arg]);
+				if (code & ERR_FATAL) {
+					free(err);
+					cur_arg += 1 + kw->skip;
+					goto out;
+				}
+			}
+			free(err);
+			cur_arg += 1 + kw->skip;
+			continue;
+		}
+
+		best = bind_find_best_kw(args[cur_arg]);
+		if (best)
+			ha_alert("parsing [%s:%d] : '%s %s' in section '%s': unknown keyword '%s'; did you mean '%s' maybe ?\n",
+				 file, linenum, args[0], args[1], section, args[cur_arg], best);
+		else
+			ha_alert("parsing [%s:%d] : '%s %s' in section '%s': unknown keyword '%s'.\n",
+				 file, linenum, args[0], args[1], section, args[cur_arg]);
+
+		err_code |= ERR_ALERT | ERR_FATAL;
+		goto out;
+	}
+
+	if ((bind_conf->options & (BC_O_USE_SOCK_DGRAM|BC_O_USE_SOCK_STREAM)) == (BC_O_USE_SOCK_DGRAM|BC_O_USE_SOCK_STREAM) ||
+	    (bind_conf->options & (BC_O_USE_XPRT_DGRAM|BC_O_USE_XPRT_STREAM)) == (BC_O_USE_XPRT_DGRAM|BC_O_USE_XPRT_STREAM)) {
+		ha_alert("parsing [%s:%d] : '%s %s' in section '%s' : cannot mix datagram and stream protocols.\n",
+			 file, linenum, args[0], args[1], section);
+		err_code |= ERR_ALERT | ERR_FATAL;
+		goto out;
+	}
+
+	/* The transport layer automatically switches to QUIC when QUIC is
+	 * selected, regardless of bind_conf settings. We then need to
+	 * initialize QUIC params.
+	 */
+	if ((bind_conf->options & (BC_O_USE_SOCK_DGRAM|BC_O_USE_XPRT_STREAM)) == (BC_O_USE_SOCK_DGRAM|BC_O_USE_XPRT_STREAM)) {
+#ifdef USE_QUIC
+		bind_conf->xprt = xprt_get(XPRT_QUIC);
+		if (!(bind_conf->options & BC_O_USE_SSL)) {
+			bind_conf->options |= BC_O_USE_SSL;
+			ha_warning("parsing [%s:%d] : '%s %s' in section '%s' : QUIC protocol detected, enabling ssl. Use 'ssl' to shut this warning.\n",
+				 file, linenum, args[0], args[1], section);
+		}
+		quic_transport_params_init(&bind_conf->quic_params, 1);
+#else
+		ha_alert("parsing [%s:%d] : '%s %s' in section '%s' : QUIC protocol selected but support not compiled in (check build options).\n",
+			 file, linenum, args[0], args[1], section);
+		err_code |= ERR_ALERT | ERR_FATAL;
+		goto out;
+#endif
+	}
+	else if (bind_conf->options & BC_O_USE_SSL) {
+		bind_conf->xprt = xprt_get(XPRT_SSL);
+	}
+
+ out:
+	return err_code;
 }
 
 /* parse the "maxconn" bind keyword */

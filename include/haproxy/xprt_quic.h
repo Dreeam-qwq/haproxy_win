@@ -74,6 +74,39 @@ static inline void quic_cid_cpy(struct quic_cid *dst, const struct quic_cid *src
 	dst->len = src->len;
 }
 
+/* Copy <saddr> socket address data into <buf> buffer.
+ * This is the responsability of the caller to check the output buffer is big
+ * enough to contain these socket address data.
+ * Return the number of bytes copied.
+ */
+static inline size_t quic_saddr_cpy(unsigned char *buf,
+                                    const struct sockaddr_storage *saddr)
+{
+	void *port, *addr;
+	unsigned char *p;
+	size_t port_len, addr_len;
+
+	p = buf;
+	if (saddr->ss_family == AF_INET6) {
+		port = &((struct sockaddr_in6 *)saddr)->sin6_port;
+		addr = &((struct sockaddr_in6 *)saddr)->sin6_addr;
+		port_len = sizeof ((struct sockaddr_in6 *)saddr)->sin6_port;
+		addr_len = sizeof ((struct sockaddr_in6 *)saddr)->sin6_addr;
+	}
+	else {
+		port = &((struct sockaddr_in *)saddr)->sin_port;
+		addr = &((struct sockaddr_in *)saddr)->sin_addr;
+		port_len = sizeof ((struct sockaddr_in *)saddr)->sin_port;
+		addr_len = sizeof ((struct sockaddr_in *)saddr)->sin_addr;
+	}
+	memcpy(p, port, port_len);
+	p += port_len;
+	memcpy(p, addr, addr_len);
+	p += addr_len;
+
+	return p - buf;
+}
+
 /* Concatenate the port and address of <saddr> to <cid> QUIC connection ID. The
  * <addrlen> field of <cid> will be updated with the size of the concatenated
  * address.
@@ -445,7 +478,7 @@ static inline uint64_t quic_compute_ack_delay_us(unsigned int time_received,
 }
 
 /* Initialize <dst> transport parameters with default values (when absent)
- * from <quic_dflt_trasports_params>.
+ * from <quic_dflt_transport_params>.
  * Never fails.
  */
 static inline void quic_dflt_transport_params_cpy(struct quic_transport_params *dst)
@@ -456,9 +489,13 @@ static inline void quic_dflt_transport_params_cpy(struct quic_transport_params *
 	dst->active_connection_id_limit = quic_dflt_transport_params.active_connection_id_limit;
 }
 
-/* Initialize <p> transport parameters depending <server> boolean value which
- * must be set to 1 for a server (haproxy listener), 0 for a client (connection
- * to haproxy server).
+/* Initialize <p> transport parameters. <server> is a boolean, set if TPs are
+ * used by a server (haproxy frontend) else this is for a client (haproxy
+ * backend).
+ *
+ * This must only be used for haproxy local parameters. To initialize peer
+ * parameters, see quic_dflt_transport_params_cpy().
+ *
  * Never fails.
  */
 static inline void quic_transport_params_init(struct quic_transport_params *p,
@@ -468,7 +505,7 @@ static inline void quic_transport_params_init(struct quic_transport_params *p,
 	const int max_streams_bidi = 100;
 	const int max_streams_uni = 3;
 
-	/* Default values (when absent) */
+	/* Set RFC default values for unspecified parameters. */
 	quic_dflt_transport_params_cpy(p);
 
 	p->max_idle_timeout                    = 30000;
@@ -481,11 +518,11 @@ static inline void quic_transport_params_init(struct quic_transport_params *p,
 	p->initial_max_data = (max_streams_bidi + max_streams_uni) * ncb_size;
 
 	if (server)
-		p->with_stateless_reset_token      = 1;
+		p->with_stateless_reset_token  = 1;
+
 	p->active_connection_id_limit          = 8;
 
 	p->retry_source_connection_id.len = 0;
-
 }
 
 /* Encode <addr> preferred address transport parameter in <buf> without its
@@ -885,7 +922,6 @@ static inline int quic_transport_params_decode(struct quic_transport_params *p, 
 
 	pos = buf;
 
-	quic_transport_params_init(p, server);
 	while (pos != end) {
 		uint64_t type, len;
 
@@ -924,6 +960,9 @@ static inline int quic_transport_params_store(struct quic_conn *conn, int server
 {
 	struct quic_transport_params *tx_params = &conn->tx.params;
 	struct quic_transport_params *rx_params = &conn->rx.params;
+
+	/* initialize peer TPs to RFC default value */
+	quic_dflt_transport_params_cpy(tx_params);
 
 	if (!quic_transport_params_decode(tx_params, server, buf, end))
 		return 0;
@@ -1149,6 +1188,9 @@ static inline void quic_rx_pkts_del(struct quic_conn *qc)
 		LIST_DELETE(&pkt->qc_rx_pkt_list);
 		pool_free(pool_head_quic_rx_packet, pkt);
 	}
+
+	/* In frequent cases the buffer will be emptied at this stage. */
+	b_realign_if_empty(&qc->rx.buf);
 }
 
 /* Increment the reference counter of <pkt> */
@@ -1213,12 +1255,12 @@ static inline void qc_list_all_rx_pkts(struct quic_conn *qc)
 
 void chunk_frm_appendf(struct buffer *buf, const struct quic_frame *frm);
 
+void quic_set_connection_close(struct quic_conn *qc, int err);
 void quic_set_tls_alert(struct quic_conn *qc, int alert);
 int quic_set_app_ops(struct quic_conn *qc, const unsigned char *alpn, size_t alpn_len);
 struct task *quic_lstnr_dghdlr(struct task *t, void *ctx, unsigned int state);
-int quic_lstnr_dgram_dispatch(unsigned char *buf, size_t len, void *owner,
-                              struct sockaddr_storage *saddr,
-                              struct quic_dgram *new_dgram, struct list *dgrams);
+int quic_get_dgram_dcid(unsigned char *buf, const unsigned char *end,
+                        unsigned char **dcid, size_t *dcid_len);
 int qc_send_app_pkts(struct quic_conn *qc, int old_data, struct list *frms);
 
 void qc_notify_close(struct quic_conn *qc);

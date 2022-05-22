@@ -83,6 +83,18 @@ typedef unsigned long long ull;
 #define QUIC_PACKET_LONG_HEADER_BIT  0x80 /* Long header format if set, short if not. */
 #define QUIC_PACKET_FIXED_BIT        0x40 /* Must always be set for all the headers. */
 
+/* Tokens formats */
+/* Format for Retry tokens sent by a QUIC server */
+#define QUIC_TOKEN_FMT_RETRY 0x9c
+/* Format for token sent for new connections after a Retry token was sent */
+#define  QUIC_TOKEN_FMT_NEW  0xb7
+/* Salt length used to derive retry token secret */
+#define QUIC_RETRY_TOKEN_SALTLEN       16 /* bytes */
+/* Retry token duration */
+#define QUIC_RETRY_DURATION_MS      10000
+/* Default Retry threshold */
+#define QUIC_DFLT_RETRY_THRESHOLD     100 /* in connection openings */
+
 /*
  *  0                   1                   2                   3
  *  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
@@ -675,6 +687,7 @@ enum qc_mux_state {
 #define QUIC_FL_CONN_IDLE_TIMER_RESTARTED_AFTER_READ (1U << 6)
 #define QUIC_FL_CONN_RETRANS_NEEDED              (1U << 7)
 #define QUIC_FL_CONN_RETRANS_OLD_DATA            (1U << 8)
+#define QUIC_FL_CONN_TLS_ALERT                   (1U << 9)
 #define QUIC_FL_CONN_NOTIFY_CLOSE                (1U << 27) /* MUX notified about quic-conn imminent closure (idle-timeout or CONNECTION_CLOSE emission/reception) */
 #define QUIC_FL_CONN_EXP_TIMER                   (1U << 28) /* timer has expired, quic-conn can be freed */
 #define QUIC_FL_CONN_CLOSING                     (1U << 29)
@@ -782,6 +795,7 @@ struct quic_conn {
 
 	const struct qcc_app_ops *app_ops;
 	unsigned int sendto_err;
+	struct quic_counters *prx_counters;
 };
 
 #endif /* USE_QUIC */

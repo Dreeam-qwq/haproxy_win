@@ -1115,10 +1115,7 @@ static int bind_parse_alpn(char **args, int cur_arg, struct proxy *px, struct bi
 /* parse the "ssl" bind keyword */
 static int bind_parse_ssl(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
 {
-	/* Do not change the xprt for QUIC. */
-	if (conf->xprt != xprt_get(XPRT_QUIC))
-		conf->xprt = &ssl_sock;
-	conf->is_ssl = 1;
+	conf->options |= BC_O_USE_SSL;
 
 	if (global_ssl.listen_default_ciphers && !conf->ssl_conf.ciphers)
 		conf->ssl_conf.ciphers = strdup(global_ssl.listen_default_ciphers);
@@ -1151,7 +1148,7 @@ static int bind_parse_pcc(char **args, int cur_arg, struct proxy *px, struct bin
 static int bind_parse_generate_certs(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
 {
 #if (defined SSL_CTRL_SET_TLSEXT_HOSTNAME && !defined SSL_NO_GENERATE_CERTIFICATES)
-	conf->generate_certs = 1;
+	conf->options |= BC_O_GENERATE_CERTS;
 #else
 	memprintf(err, "%sthis version of openssl cannot generate SSL certificates.\n",
 		  err && *err ? *err : "");

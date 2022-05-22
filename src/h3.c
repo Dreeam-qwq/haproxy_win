@@ -235,13 +235,21 @@ static int h3_data_to_htx(struct qcs *qcs, struct ncbuf *buf, uint64_t len,
 	if (head + len > ncb_wrap(buf)) {
 		size_t contig = ncb_wrap(buf) - head;
 		htx_sent = htx_add_data(htx, ist2(ncb_head(buf), contig));
-		head = ncb_orig(buf);
+		if (htx_sent < contig) {
+			qcs->flags |= QC_SF_DEM_FULL;
+			goto out;
+		}
+
 		len -= contig;
+		head = ncb_orig(buf);
 		goto retry;
 	}
 
 	htx_sent += htx_add_data(htx, ist2(head, len));
-	BUG_ON(htx_sent < len);
+	if (htx_sent < len) {
+		qcs->flags |= QC_SF_DEM_FULL;
+		goto out;
+	}
 
 	if (fin && len == htx_sent)
 		htx->flags |= HTX_FL_EOM;
@@ -280,16 +288,18 @@ static int h3_decode_qcs(struct qcs *qcs, int fin, void *ctx)
 			h3_debug_printf(stderr, "%s: ftype: %lu, flen: %lu\n",
 			                __func__, ftype, flen);
 
-			ncb_advance(rxbuf, hlen);
 			h3s->demux_frame_type = ftype;
 			h3s->demux_frame_len = flen;
-			qcs->rx.offset += hlen;
+			qcs_consume(qcs, hlen);
 		}
 
 		flen = h3s->demux_frame_len;
 		ftype = h3s->demux_frame_type;
-		if (flen > b_data(&b) && !ncb_is_full(rxbuf))
+		/* Do not demux HEADERS if frame incomplete. */
+		if (ftype == H3_FT_HEADERS && flen > b_data(&b)) {
+			BUG_ON(ncb_is_full(rxbuf)); /* TODO should define SETTINGS for max header size */
 			break;
+		}
 		last_stream_frame = (fin && flen == ncb_total_data(rxbuf));
 
 		switch (ftype) {
@@ -316,10 +326,9 @@ static int h3_decode_qcs(struct qcs *qcs, int fin, void *ctx)
 		}
 
 		if (ret) {
-			ncb_advance(rxbuf, ret);
 			BUG_ON(h3s->demux_frame_len < ret);
 			h3s->demux_frame_len -= ret;
-			qcs->rx.offset += ret;
+			qcs_consume(qcs, ret);
 		}
 	}
 
@@ -399,8 +408,7 @@ static int h3_control_recv(struct h3_uqs *h3_uqs, void *ctx)
 		if (flen > b_data(&b))
 			break;
 
-		ncb_advance(rxbuf, hlen);
-		h3_uqs->qcs->rx.offset += hlen;
+		qcs_consume(h3_uqs->qcs, hlen);
 		/* From here, a frame must not be truncated */
 		switch (ftype) {
 		case H3_FT_CANCEL_PUSH:
@@ -424,8 +432,7 @@ static int h3_control_recv(struct h3_uqs *h3_uqs, void *ctx)
 			h3->err = H3_FRAME_UNEXPECTED;
 			return 0;
 		}
-		ncb_advance(rxbuf, flen);
-		h3_uqs->qcs->rx.offset += flen;
+		qcs_consume(h3_uqs->qcs, flen);
 	}
 
 	/* Handle the case where remaining data are present in the buffer. This
@@ -785,8 +792,7 @@ static int h3_attach_ruqs(struct qcs *qcs, void *ctx)
 	if (!b_quic_dec_int(&strm_type, &b, &len) || strm_type > H3_UNI_STRM_TP_MAX)
 		return 0;
 
-	ncb_advance(rxbuf, len);
-	qcs->rx.offset += len;
+	qcs_consume(qcs, len);
 
 	/* Note that for all the uni-streams below, this is an error to receive two times the
 	 * same type of uni-stream (even for Push stream which is not supported at this time.

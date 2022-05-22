@@ -155,17 +155,16 @@ int str2listener(char *str, struct proxy *curproxy, struct bind_conf *bind_conf,
 			goto fail;
 
 		/* OK the address looks correct */
+		if (proto->proto_type == PROTO_TYPE_DGRAM)
+			bind_conf->options |= BC_O_USE_SOCK_DGRAM;
+		else
+			bind_conf->options |= BC_O_USE_SOCK_STREAM;
 
-#ifdef USE_QUIC
-		/* The transport layer automatically switches to QUIC when QUIC
-		 * is selected, regardless of bind_conf settings. We then need
-		 * to initialize QUIC params.
-		 */
-		if (proto->proto_type == PROTO_TYPE_DGRAM && proto->ctrl_type == SOCK_STREAM) {
-			bind_conf->xprt = xprt_get(XPRT_QUIC);
-			quic_transport_params_init(&bind_conf->quic_params, 1);
-		}
-#endif
+		if (proto->xprt_type == PROTO_TYPE_DGRAM)
+			bind_conf->options |= BC_O_USE_XPRT_DGRAM;
+		else
+			bind_conf->options |= BC_O_USE_XPRT_STREAM;
+
 		if (!create_listeners(bind_conf, ss2, port, end, fd, proto, err)) {
 			memprintf(err, "%s for address '%s'.\n", *err, str);
 			goto fail;
@@ -693,7 +692,7 @@ int cfg_parse_peers(const char *file, int linenum, char **args, int kwm)
 	if (strcmp(args[0], "bind") == 0 || strcmp(args[0], "default-bind") == 0) {
 		int cur_arg;
 		struct bind_conf *bind_conf;
-		struct bind_kw *kw;
+		int ret;
 
 		cur_arg = 1;
 
@@ -720,7 +719,7 @@ int cfg_parse_peers(const char *file, int linenum, char **args, int kwm)
 				}
 				else
 					ha_alert("parsing [%s:%d] : '%s %s' : error encountered while parsing listening address %s.\n",
-							 file, linenum, args[0], args[1], args[2]);
+							 file, linenum, args[0], args[1], args[1]);
 				err_code |= ERR_FATAL;
 				goto out;
 			}
@@ -752,35 +751,10 @@ int cfg_parse_peers(const char *file, int linenum, char **args, int kwm)
 			cur_arg++;
 		}
 
-		while (*args[cur_arg] && (kw = bind_find_kw(args[cur_arg]))) {
-			int ret;
-
-			ret = kw->parse(args, cur_arg, curpeers->peers_fe, bind_conf, &errmsg);
-			err_code |= ret;
-			if (ret) {
-				if (errmsg && *errmsg) {
-					indent_msg(&errmsg, 2);
-					ha_alert("parsing [%s:%d] : %s\n", file, linenum, errmsg);
-				}
-				else
-					ha_alert("parsing [%s:%d]: error encountered while processing '%s'\n",
-					         file, linenum, args[cur_arg]);
-				if (ret & ERR_FATAL)
-					goto out;
-			}
-			cur_arg += 1 + kw->skip;
-		}
-		if (*args[cur_arg] != 0) {
-			const char *best = bind_find_best_kw(args[cur_arg]);
-			if (best)
-				ha_alert("parsing [%s:%d] : unknown keyword '%s' in '%s' section; did you mean '%s' maybe ?\n",
-					 file, linenum, args[cur_arg], cursection, best);
-			else
-				ha_alert("parsing [%s:%d] : unknown keyword '%s' in '%s' section.\n",
-					 file, linenum, args[cur_arg], cursection);
-			err_code |= ERR_ALERT | ERR_FATAL;
+		ret = bind_parse_args_list(bind_conf, args, cur_arg, cursection, file, linenum);
+		err_code |= ret;
+		if (ret != 0)
 			goto out;
-		}
 	}
 	else if (strcmp(args[0], "default-server") == 0) {
 		if (init_peers_frontend(file, -1, NULL, curpeers) != 0) {
@@ -1860,9 +1834,10 @@ next_line:
 				if (outline == NULL) {
 					ha_alert("parsing [%s:%d]: line too long, cannot allocate memory.\n",
 						 file, linenum);
-					err_code |= ERR_ALERT | ERR_FATAL;
+					err_code |= ERR_ALERT | ERR_FATAL | ERR_ABORT;
 					fatal++;
-					goto next_line;
+					outlinesize = 0;
+					goto err;
 				}
 				/* try again */
 				continue;
@@ -3777,22 +3752,14 @@ out_uri_auth_compat:
 		list_for_each_entry(bind_conf, &curproxy->conf.bind, by_fe) {
 			int mode = (1 << (curproxy->mode == PR_MODE_HTTP));
 			const struct mux_proto_list *mux_ent;
-			const struct listener *l;
-			int types = 0;
 
-			/* check that the mux is compatible with all listeners'
-			 * protocol types (dgram or stream).
-			 */
-			list_for_each_entry(l, &bind_conf->listeners, by_bind)
-				types |= 1 << l->rx.proto->proto_type;
-
-			if (atleast2(types)) {
-				ha_alert("%s '%s' : cannot mix datagram and stream protocols "
-					 "for 'bind %s' at [%s:%d].\n",
-					 proxy_type_str(curproxy), curproxy->id,
-					 bind_conf->arg, bind_conf->file, bind_conf->line);
-				cfgerr++;
-				continue;
+			if (!bind_conf->mux_proto) {
+				/* No protocol was specified. If we're using QUIC at the transport
+				 * layer, we'll instantiate it as a mux as well. If QUIC is not
+				 * compiled in, this wil remain NULL.
+				 */
+				if (bind_conf->xprt && bind_conf->xprt == xprt_get(XPRT_QUIC))
+					bind_conf->mux_proto = get_mux_proto(ist("quic"));
 			}
 
 			if (!bind_conf->mux_proto)
@@ -3811,6 +3778,23 @@ out_uri_auth_compat:
 					 bind_conf->mux_proto->token.ptr,
 					 bind_conf->arg, bind_conf->file, bind_conf->line);
 				cfgerr++;
+			} else {
+				if ((mux_ent->mux->flags & MX_FL_FRAMED) && !(bind_conf->options & BC_O_USE_SOCK_DGRAM)) {
+					ha_alert("%s '%s' : frame-based MUX protocol '%.*s' is incompatible with stream transport of 'bind %s' at [%s:%d].\n",
+						 proxy_type_str(curproxy), curproxy->id,
+						 (int)bind_conf->mux_proto->token.len,
+						 bind_conf->mux_proto->token.ptr,
+						 bind_conf->arg, bind_conf->file, bind_conf->line);
+					cfgerr++;
+				}
+				else if (!(mux_ent->mux->flags & MX_FL_FRAMED) && !(bind_conf->options & BC_O_USE_SOCK_STREAM)) {
+					ha_alert("%s '%s' : stream-based MUX protocol '%.*s' is incompatible with framed transport of 'bind %s' at [%s:%d].\n",
+						 proxy_type_str(curproxy), curproxy->id,
+						 (int)bind_conf->mux_proto->token.len,
+						 bind_conf->mux_proto->token.ptr,
+						 bind_conf->arg, bind_conf->file, bind_conf->line);
+					cfgerr++;
+				}
 			}
 
 			/* update the mux */
@@ -3984,14 +3968,14 @@ out_uri_auth_compat:
 
 			/* smart accept mode is automatic in HTTP mode */
 			if ((curproxy->options2 & PR_O2_SMARTACC) ||
-			    ((curproxy->mode == PR_MODE_HTTP || listener->bind_conf->is_ssl) &&
+			    ((curproxy->mode == PR_MODE_HTTP || (listener->bind_conf->options & BC_O_USE_SSL)) &&
 			     !(curproxy->no_options2 & PR_O2_SMARTACC)))
 				listener->options |= LI_O_NOQUICKACK;
 		}
 
 		/* Release unused SSL configs */
 		list_for_each_entry(bind_conf, &curproxy->conf.bind, by_fe) {
-			if (!bind_conf->is_ssl && bind_conf->xprt->destroy_bind_conf)
+			if (!(bind_conf->options & BC_O_USE_SSL) && bind_conf->xprt->destroy_bind_conf)
 				bind_conf->xprt->destroy_bind_conf(bind_conf);
 		}
 
@@ -4009,8 +3993,8 @@ out_uri_auth_compat:
 	}
 
 	if (diag_no_cluster_secret)
-		ha_diag_warning("No cluster secret was set. The stateless reset feature"
-		                " is disabled for all QUIC bindings.\n");
+		ha_diag_warning("No cluster secret was set. The stateless reset and Retry"
+		                " features are disabled for all QUIC bindings.\n");
 
 	/*
 	 * Recount currently required checks.

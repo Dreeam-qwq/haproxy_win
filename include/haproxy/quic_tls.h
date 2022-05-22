@@ -64,6 +64,12 @@ int quic_tls_encrypt(unsigned char *buf, size_t len,
                      EVP_CIPHER_CTX *ctx, const EVP_CIPHER *aead,
                      const unsigned char *key, const unsigned char *iv);
 
+int quic_tls_decrypt2(unsigned char *out,
+                      unsigned char *in, size_t ilen,
+                      unsigned char *aad, size_t aad_len,
+                      EVP_CIPHER_CTX *ctx, const EVP_CIPHER *aead,
+                      const unsigned char *key, const unsigned char *iv);
+
 int quic_tls_decrypt(unsigned char *buf, size_t len,
                      unsigned char *aad, size_t aad_len,
                      EVP_CIPHER_CTX *tls_ctx, const EVP_CIPHER *aead,
@@ -78,6 +84,12 @@ int quic_tls_derive_keys(const EVP_CIPHER *aead, const EVP_CIPHER *hp,
                          unsigned char *iv, size_t ivlen,
                          unsigned char *hp_key, size_t hp_keylen,
                          const unsigned char *secret, size_t secretlen);
+
+int quic_tls_derive_retry_token_secret(const EVP_MD *md,
+                                       unsigned char *key, size_t keylen,
+                                       unsigned char *iv, size_t ivlen,
+                                       const unsigned char *salt, size_t saltlen,
+                                       const unsigned char *secret, size_t secretlen);
 
 int quic_hkdf_extract_and_expand(const EVP_MD *md,
                                  unsigned char *buf, size_t buflen,
@@ -537,7 +549,7 @@ static inline int qc_new_isecs(struct quic_conn *qc,
 		goto err;
 
 	ctx->flags |= QUIC_FL_TLS_SECRETS_SET;
-	TRACE_LEAVE(QUIC_EV_CONN_ISEC, NULL, rx_init_sec, tx_init_sec);
+	TRACE_LEAVE(QUIC_EV_CONN_ISEC, qc, rx_init_sec, tx_init_sec);
 
 	return 1;
 

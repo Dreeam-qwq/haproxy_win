@@ -45,6 +45,7 @@
 #include <haproxy/quic_frame.h>
 #include <haproxy/quic_loss.h>
 #include <haproxy/quic_sock.h>
+#include <haproxy/quic_stats-t.h>
 #include <haproxy/quic_stream.h>
 #include <haproxy/cbuf.h>
 #include <haproxy/proto_quic.h>
@@ -178,6 +179,9 @@ static struct quic_tx_packet *qc_build_pkt(unsigned char **pos, const unsigned c
 static struct task *quic_conn_app_io_cb(struct task *t, void *context, unsigned int state);
 static void qc_idle_timer_do_rearm(struct quic_conn *qc);
 static void qc_idle_timer_rearm(struct quic_conn *qc, int read);
+static int qc_conn_alloc_ssl_ctx(struct quic_conn *qc);
+static int quic_conn_init_timer(struct quic_conn *qc);
+static int quic_conn_init_idle_timer_task(struct quic_conn *qc);
 
 /* Only for debug purpose */
 struct enc_debug_info {
@@ -1103,12 +1107,24 @@ static int quic_crypto_data_cpy(struct quic_enc_level *qel,
 	return len == 0;
 }
 
+/* Prepare the emission of CONNECTION_CLOSE with error <err>. All send/receive
+ * activity for <qc> will be interrupted.
+ */
+void quic_set_connection_close(struct quic_conn *qc, int err)
+{
+	if (qc->flags & QUIC_FL_CONN_IMMEDIATE_CLOSE)
+		return;
+
+	qc->err_code = err;
+	qc->flags |= QUIC_FL_CONN_IMMEDIATE_CLOSE;
+}
 
 /* Set <alert> TLS alert as QUIC CRYPTO_ERROR error */
 void quic_set_tls_alert(struct quic_conn *qc, int alert)
 {
-	qc->err_code = QC_ERR_CRYPTO_ERROR | alert;
-	qc->flags |= QUIC_FL_CONN_IMMEDIATE_CLOSE;
+	HA_ATOMIC_DEC(&qc->prx_counters->conn_opening);
+	quic_set_connection_close(qc, QC_ERR_CRYPTO_ERROR | alert);
+	qc->flags |= QUIC_FL_CONN_TLS_ALERT;
 	TRACE_PROTO("Alert set", QUIC_EV_CONN_SSLDATA, qc);
 }
 
@@ -2094,6 +2110,8 @@ static inline int qc_provide_cdata(struct quic_enc_level *el,
 				goto out;
 			}
 
+			HA_ATOMIC_INC(&qc->prx_counters->hdshk_fail);
+			HA_ATOMIC_DEC(&qc->prx_counters->conn_opening);
 			TRACE_DEVEL("SSL handshake error",
 			            QUIC_EV_CONN_IO_CB, qc, &state, &ssl_err);
 			qc_ssl_dump_errors(ctx->conn);
@@ -2110,6 +2128,7 @@ static inline int qc_provide_cdata(struct quic_enc_level *el,
 			goto err;
 		}
 
+		HA_ATOMIC_DEC(&qc->prx_counters->conn_opening);
 		/* I/O callback switch */
 		ctx->wait_event.tasklet->process = quic_conn_app_io_cb;
 		if (qc_is_listener(ctx->qc)) {
@@ -2158,19 +2177,16 @@ static int qc_handle_bidi_strm_frm(struct quic_rx_packet *pkt,
                                    struct quic_stream *strm_frm,
                                    struct quic_conn *qc)
 {
-	struct qcs *qcs = NULL;
 	int ret;
 
 	ret = qcc_recv(qc->qcc, strm_frm->id, strm_frm->len,
 	               strm_frm->offset.key, strm_frm->fin,
-	               (char *)strm_frm->data, &qcs);
+	               (char *)strm_frm->data);
 
 	/* frame rejected - packet must not be acknowledeged */
 	if (ret)
 		return 0;
 
-	if (qcs)
-		qcc_decode_qcs(qc->qcc, qcs);
 	return 1;
 }
 
@@ -2590,10 +2606,18 @@ static int qc_parse_pkt_frms(struct quic_rx_packet *pkt, struct ssl_sock_ctx *ct
 			break;
 		case QUIC_FT_MAX_STREAMS_BIDI:
 		case QUIC_FT_MAX_STREAMS_UNI:
+			break;
 		case QUIC_FT_DATA_BLOCKED:
+			HA_ATOMIC_INC(&qc->prx_counters->data_blocked);
+			break;
 		case QUIC_FT_STREAM_DATA_BLOCKED:
+			HA_ATOMIC_INC(&qc->prx_counters->stream_data_blocked);
+			break;
 		case QUIC_FT_STREAMS_BLOCKED_BIDI:
+			HA_ATOMIC_INC(&qc->prx_counters->streams_data_blocked_bidi);
+			break;
 		case QUIC_FT_STREAMS_BLOCKED_UNI:
+			HA_ATOMIC_INC(&qc->prx_counters->streams_data_blocked_uni);
 			break;
 		case QUIC_FT_NEW_CONNECTION_ID:
 		case QUIC_FT_RETIRE_CONNECTION_ID:
@@ -2602,6 +2626,13 @@ static int qc_parse_pkt_frms(struct quic_rx_packet *pkt, struct ssl_sock_ctx *ct
 		case QUIC_FT_CONNECTION_CLOSE:
 		case QUIC_FT_CONNECTION_CLOSE_APP:
 			if (!(qc->flags & QUIC_FL_CONN_DRAINING)) {
+				/* If the connection did not reached the handshake complete state,
+				 * the <conn_opening> counter was not decremented. Note that if
+				 * a TLS alert was received from the TLS stack, this counter
+				 * has already been decremented.
+				 */
+				if (qc->state < QUIC_HS_ST_COMPLETE && !(qc->flags & QUIC_FL_CONN_TLS_ALERT))
+					HA_ATOMIC_DEC(&qc->prx_counters->conn_opening);
 				TRACE_PROTO("Entering draining state", QUIC_EV_CONN_PRSHPKT, qc);
 				/* RFC 9000 10.2. Immediate Close:
 				 * The closing and draining connection states exist to ensure
@@ -4224,20 +4255,35 @@ static struct task *process_timer(struct task *task, void *ctx, unsigned int sta
 	return task;
 }
 
-/* Parse the Retry token from buffer <token> whose size is <token_len>. This
- * will extract the parameters stored in the token : <odcid>.
+/* Parse the Retry token from buffer <token> with <end> a pointer to
+ * one byte past the end of this buffer. This will extract the ODCID
+ * which will be stored into <odcid>
  *
  * Returns 0 on success else non-zero.
  */
-static int parse_retry_token(const unsigned char *token, uint64_t token_len,
+static int parse_retry_token(const unsigned char *token, const unsigned char *end,
                              struct quic_cid *odcid)
 {
 	uint64_t odcid_len;
+	uint32_t timestamp;
 
-	if (!quic_dec_int(&odcid_len, &token, token + token_len))
+	if (!quic_dec_int(&odcid_len, &token, end))
 		return 1;
 
-	if (odcid_len > QUIC_CID_MAXLEN)
+	/* RFC 9000 7.2. Negotiating Connection IDs:
+	 * When an Initial packet is sent by a client that has not previously
+	 * received an Initial or Retry packet from the server, the client
+	 * populates the Destination Connection ID field with an unpredictable
+	 * value. This Destination Connection ID MUST be at least 8 bytes in length.
+	 */
+	if (odcid_len < QUIC_ODCID_MINLEN || odcid_len > QUIC_CID_MAXLEN)
+		return 1;
+
+	if (end - token < odcid_len + sizeof timestamp)
+		return 1;
+
+	timestamp = ntohl(read_u32(token + odcid_len));
+	if (timestamp + MS_TO_TICKS(QUIC_RETRY_DURATION_MS) <= now_ms)
 		return 1;
 
 	memcpy(odcid->data, token, odcid_len);
@@ -4253,9 +4299,9 @@ static int parse_retry_token(const unsigned char *token, uint64_t token_len,
 static int qc_lstnr_params_init(struct quic_conn *qc, struct listener *l,
                                 const unsigned char *token, size_t token_len,
                                 const struct quic_connection_id *icid,
-                                const struct quic_cid *dcid)
+                                const struct quic_cid *dcid, const struct quic_cid *odcid)
 {
-	struct quic_cid *odcid = &qc->rx.params.original_destination_connection_id;
+	struct quic_cid *odcid_param = &qc->rx.params.original_destination_connection_id;
 
 	/* Copy the transport parameters. */
 	qc->rx.params = l->bind_conf->quic_params;
@@ -4264,16 +4310,14 @@ static int qc_lstnr_params_init(struct quic_conn *qc, struct listener *l,
 	       sizeof qc->rx.params.stateless_reset_token);
 	/* Copy original_destination_connection_id transport parameter. */
 	if (token_len) {
-		if (parse_retry_token(token, token_len, odcid)) {
-			TRACE_PROTO("Error during Initial token parsing", QUIC_EV_CONN_LPKT, qc);
-			return 0;
-		}
+		memcpy(odcid_param->data, odcid->data, odcid->len);
+		odcid_param->len = odcid->len;
 		/* Copy retry_source_connection_id transport parameter. */
 		quic_cid_cpy(&qc->rx.params.retry_source_connection_id, dcid);
 	}
 	else {
-		memcpy(odcid->data, dcid->data, dcid->len);
-		odcid->len = dcid->len;
+		memcpy(odcid_param->data, dcid->data, dcid->len);
+		odcid_param->len = dcid->len;
 	}
 
 	/* Copy the initial source connection ID. */
@@ -4292,6 +4336,7 @@ static int qc_lstnr_params_init(struct quic_conn *qc, struct listener *l,
  */
 static struct quic_conn *qc_new_conn(unsigned int version, int ipv4,
                                      struct quic_cid *dcid, struct quic_cid *scid,
+                                     const struct quic_cid *odcid,
                                      struct sockaddr_storage *saddr,
                                      const unsigned char *token, size_t token_len,
                                      int server, void *owner)
@@ -4302,6 +4347,8 @@ static struct quic_conn *qc_new_conn(unsigned int version, int ipv4,
 	struct quic_connection_id *icid;
 	char *buf_area = NULL;
 	struct listener *l = NULL;
+	const unsigned char *salt = initial_salt_v1;
+	size_t salt_len = sizeof initial_salt_v1;
 
 	TRACE_ENTER(QUIC_EV_CONN_INIT);
 	qc = pool_zalloc(pool_head_quic_conn);
@@ -4319,8 +4366,13 @@ static struct quic_conn *qc_new_conn(unsigned int version, int ipv4,
 	qc->cids = EB_ROOT;
 	/* QUIC Server (or listener). */
 	if (server) {
-		l = owner;
+		struct proxy *prx;
 
+		l = owner;
+		prx = l->bind_conf->frontend;
+
+		qc->prx_counters = EXTRA_COUNTERS_GET(prx->extra_counters_fe,
+		                                      &quic_stats_module);
 		qc->flags |= QUIC_FL_CONN_LISTENER;
 		qc->state = QUIC_HS_ST_SERVER_INITIAL;
 		/* Copy the initial DCID with the address. */
@@ -4409,7 +4461,27 @@ static struct quic_conn *qc_new_conn(unsigned int version, int ipv4,
 	qc->sendto_err = 0;
 	memcpy(&qc->peer_addr, saddr, sizeof qc->peer_addr);
 
-	if (server && !qc_lstnr_params_init(qc, l, token, token_len, icid, dcid))
+	if (server && !qc_lstnr_params_init(qc, l, token, token_len, icid, dcid, odcid))
+		goto err;
+
+	qc->enc_params_len =
+		quic_transport_params_encode(qc->enc_params,
+		                             qc->enc_params + sizeof qc->enc_params,
+		                             &qc->rx.params, 1);
+	if (!qc->enc_params_len)
+		goto err;
+
+	if (qc_conn_alloc_ssl_ctx(qc) ||
+	    !quic_conn_init_timer(qc) ||
+	    !quic_conn_init_idle_timer_task(qc))
+		goto err;
+
+	if (version == QUIC_PROTOCOL_VERSION_DRAFT_29) {
+		salt = initial_salt_draft_29;
+		salt_len = sizeof initial_salt_draft_29;
+	}
+
+	if (!qc_new_isecs(qc, salt, salt_len, dcid->data, dcid->len, 1))
 		goto err;
 
 	TRACE_LEAVE(QUIC_EV_CONN_INIT, qc);
@@ -4469,6 +4541,9 @@ static void qc_idle_timer_rearm(struct quic_conn *qc, int read)
 static struct task *qc_idle_timer_task(struct task *t, void *ctx, unsigned int state)
 {
 	struct quic_conn *qc = ctx;
+	struct quic_counters *prx_counters = qc->prx_counters;
+	int qc_state = qc->state;
+	unsigned int qc_flags = qc->flags;
 
 	/* Notify the MUX before settings QUIC_FL_CONN_EXP_TIMER or the MUX
 	 * might free the quic-conn too early via quic_close().
@@ -4485,6 +4560,14 @@ static struct task *qc_idle_timer_task(struct task *t, void *ctx, unsigned int s
 	/* TODO if the quic-conn cannot be freed because of the MUX, we may at
 	 * least clean some parts of it such as the tasklet.
 	 */
+
+	/* If the connection did not reached the handshake complete state,
+	 * the <conn_opening> counter was not decremented. Note that if
+	 * a TLS alert was received from the TLS stack, this counter
+	 * has already been decremented.
+	 */
+	if (qc_state < QUIC_HS_ST_COMPLETE && !(qc_flags & QUIC_FL_CONN_TLS_ALERT))
+		HA_ATOMIC_DEC(&prx_counters->conn_opening);
 
 	return NULL;
 }
@@ -4775,31 +4858,154 @@ static int send_stateless_reset(int fd, struct sockaddr_storage *dstaddr,
 	return 1;
 }
 
-/* Generate the token to be used in Retry packets. The token is written to
- * <buf> which is expected to be <len> bytes.
- *
- * Various parameters are expected to be encoded in the token. For now, only
- * the DCID from <pkt> is stored. This is useful to implement a stateless Retry
- * as this CID must be repeated by the server in the transport parameters.
- *
- * TODO add the client address to validate the token origin.
- *
+/* QUIC server only function.
+ * Add AAD to <add> buffer from <cid> connection ID and <addr> socket address.
+ * This is the responsability of the caller to check <aad> size is big enough
+ * to contain these data.
+ * Return the number of bytes copied to <aad>.
+ */
+static int quic_generate_retry_token_aad(unsigned char *aad,
+                                         uint32_t version,
+                                         const struct quic_cid *cid,
+                                         const struct sockaddr_storage *addr)
+{
+	unsigned char *p;
+
+	p = aad;
+	memcpy(p, &version, sizeof version);
+	p += sizeof version;
+	p += quic_saddr_cpy(p, addr);
+	memcpy(p, cid->data, cid->len);
+	p += cid->len;
+
+	return p - aad;
+}
+
+/* QUIC server only function.
+ * Generate the token to be used in Retry packets. The token is written to
+ * <buf> whith <len> as length. <odcid> is the original destination connection
+ * ID and <dcid> is our side destination connection ID (or client source
+ * connection ID).
  * Returns the length of the encoded token or 0 on error.
  */
-static int generate_retry_token(unsigned char *buf, unsigned char len,
-                                struct quic_rx_packet *pkt)
+static int quic_generate_retry_token(unsigned char *buf, size_t len,
+                                     const uint32_t version,
+                                     const struct quic_cid *odcid,
+                                     const struct quic_cid *dcid,
+                                     struct sockaddr_storage *addr)
 {
-	const size_t token_len = 1 + pkt->dcid.len;
-	unsigned char i = 0;
+	unsigned char *p;
+	unsigned char aad[sizeof(uint32_t) + sizeof(in_port_t) +
+		sizeof(struct in6_addr) + QUIC_HAP_CID_LEN];
+	size_t aadlen;
+	unsigned char salt[QUIC_RETRY_TOKEN_SALTLEN];
+	unsigned char key[QUIC_TLS_KEY_LEN];
+	unsigned char iv[QUIC_TLS_IV_LEN];
+	const unsigned char *sec = (const unsigned char *)global.cluster_secret;
+	size_t seclen = strlen(global.cluster_secret);
+	EVP_CIPHER_CTX *ctx = NULL;
+	const EVP_CIPHER *aead = EVP_aes_128_gcm();
+	uint32_t timestamp = now_ms;
 
-	if (token_len > len)
+	/* We copy the odcid into the token, prefixed by its one byte
+	 * length, the format token byte. It is followed by an AEAD TAG, and finally
+	 * the random bytes used to derive the secret to encrypt the token.
+	 */
+	if (1 + dcid->len + 1 + QUIC_TLS_TAG_LEN + sizeof salt > len)
 		return 0;
 
-	buf[i++] = pkt->dcid.len;
-	memcpy(&buf[i], pkt->dcid.data, pkt->dcid.len);
-	i += pkt->dcid.len;
+	aadlen = quic_generate_retry_token_aad(aad, version, dcid, addr);
+	if (RAND_bytes(salt, sizeof salt) != 1)
+		goto err;
 
-	return i;
+	if (!quic_tls_derive_retry_token_secret(EVP_sha256(), key, sizeof key, iv, sizeof iv,
+	                                        salt, sizeof salt, sec, seclen))
+		goto err;
+
+	if (!quic_tls_tx_ctx_init(&ctx, aead, key))
+		goto err;
+
+	/* Token build */
+	p = buf;
+	*p++ = QUIC_TOKEN_FMT_RETRY,
+	*p++ = odcid->len;
+	memcpy(p, odcid->data, odcid->len);
+	p += odcid->len;
+	write_u32(p, htonl(timestamp));
+	p += sizeof timestamp;
+
+	/* Do not encrypt the QUIC_TOKEN_FMT_RETRY byte */
+	if (!quic_tls_encrypt(buf + 1, p - buf - 1, aad, aadlen, ctx, aead, key, iv))
+		goto err;
+
+	p += QUIC_TLS_TAG_LEN;
+	memcpy(p, salt, sizeof salt);
+	p += sizeof salt;
+	EVP_CIPHER_CTX_free(ctx);
+
+	return p - buf;
+
+ err:
+	if (ctx)
+		EVP_CIPHER_CTX_free(ctx);
+	return 0;
+}
+
+/* QUIC server only function.
+ * Check the validity of the Retry token from <token> buffer with <tokenlen>
+ * as length. If valid, the ODCID of <qc> QUIC connection will be put
+ * into <odcid> connection ID. <dcid> is our side destination connection ID
+ * of client source connection ID.
+ * Return 1 if succeeded, 0 if not.
+ */
+static int quic_retry_token_check(unsigned char *token, size_t tokenlen,
+                                  const uint32_t version,
+                                  struct quic_cid *odcid,
+                                  const struct quic_cid *dcid,
+                                  struct quic_conn *qc,
+                                  struct sockaddr_storage *addr)
+{
+	unsigned char buf[128];
+	unsigned char aad[sizeof(uint32_t) + sizeof(in_port_t) +
+		sizeof(struct in6_addr) + QUIC_HAP_CID_LEN];
+	size_t aadlen;
+	unsigned char *salt;
+	unsigned char key[QUIC_TLS_KEY_LEN];
+	unsigned char iv[QUIC_TLS_IV_LEN];
+	const unsigned char *sec = (const unsigned char *)global.cluster_secret;
+	size_t seclen = strlen(global.cluster_secret);
+	EVP_CIPHER_CTX *ctx = NULL;
+	const EVP_CIPHER *aead = EVP_aes_128_gcm();
+
+	if (sizeof buf < tokenlen)
+		return 0;
+
+	aadlen = quic_generate_retry_token_aad(aad, version, dcid, addr);
+	salt = token + tokenlen - QUIC_RETRY_TOKEN_SALTLEN;
+	if (!quic_tls_derive_retry_token_secret(EVP_sha256(), key, sizeof key, iv, sizeof iv,
+	                                        salt, QUIC_RETRY_TOKEN_SALTLEN, sec, seclen))
+		return 0;
+
+	if (!quic_tls_rx_ctx_init(&ctx, aead, key))
+		goto err;
+
+	/* Do not decrypt the QUIC_TOKEN_FMT_RETRY byte */
+	if (!quic_tls_decrypt2(buf, token + 1, tokenlen - QUIC_RETRY_TOKEN_SALTLEN - 1, aad, aadlen,
+	                       ctx, aead, key, iv))
+		goto err;
+
+	if (parse_retry_token(buf, buf + tokenlen - QUIC_RETRY_TOKEN_SALTLEN - 1, odcid)) {
+		TRACE_PROTO("Error during Initial token parsing", QUIC_EV_CONN_LPKT, qc);
+		goto err;
+	}
+
+	EVP_CIPHER_CTX_free(ctx);
+	return 1;
+
+ err:
+	if (ctx)
+		EVP_CIPHER_CTX_free(ctx);
+	return 0;
 }
 
 /* Generate a Retry packet and send it on <fd> socket to <addr> in response to
@@ -4838,7 +5044,8 @@ static int send_retry(int fd, struct sockaddr_storage *addr,
 	i += scid.len;
 
 	/* token */
-	if (!(token_len = generate_retry_token(&buf[i], sizeof(buf) - i, pkt)))
+	if (!(token_len = quic_generate_retry_token(&buf[i], sizeof(buf) - i, pkt->version,
+	                                            &pkt->dcid, &pkt->scid, addr)))
 		return 1;
 
 	i += token_len;
@@ -4961,7 +5168,7 @@ static int qc_ssl_sess_init(struct quic_conn *qc, SSL_CTX *ssl_ctx, SSL **ssl,
  *
  * Returns 0 on success else non-zero.
  */
-int qc_conn_alloc_ssl_ctx(struct quic_conn *qc)
+static int qc_conn_alloc_ssl_ctx(struct quic_conn *qc)
 {
 	struct bind_conf *bc = qc->li->bind_conf;
 	struct ssl_sock_ctx *ctx = NULL;
@@ -5031,8 +5238,10 @@ static void qc_lstnr_pkt_rcv(unsigned char *buf, const unsigned char *end,
 	unsigned char *beg, *payload;
 	struct quic_conn *qc, *qc_to_purge = NULL;
 	struct listener *l;
+	struct proxy *prx;
+	struct quic_counters *prx_counters;
 	struct ssl_sock_ctx *conn_ctx;
-	int long_header = 0, io_cb_wakeup = 0;
+	int drop_no_conn = 0, long_header = 0, io_cb_wakeup = 0;
 	size_t b_cspace;
 	struct quic_enc_level *qel;
 
@@ -5041,40 +5250,44 @@ static void qc_lstnr_pkt_rcv(unsigned char *buf, const unsigned char *end,
 	conn_ctx = NULL;
 	qel = NULL;
 	TRACE_ENTER(QUIC_EV_CONN_LPKT);
+	l = dgram->owner;
+	prx = l->bind_conf->frontend;
+	prx_counters = EXTRA_COUNTERS_GET(prx->extra_counters_fe, &quic_stats_module);
 	/* This ist only to please to traces and distinguish the
 	 * packet with parsed packet number from others.
 	 */
 	pkt->pn_node.key = (uint64_t)-1;
-	if (end <= buf)
-		goto err;
+	if (end <= buf) {
+		TRACE_PROTO("Packet dropped", QUIC_EV_CONN_LPKT);
+		goto drop;
+	}
 
 	/* Fixed bit */
 	if (!(*buf & QUIC_PACKET_FIXED_BIT)) {
 		/* XXX TO BE DISCARDED */
 		TRACE_PROTO("Packet dropped", QUIC_EV_CONN_LPKT);
-		goto err;
+		goto drop;
 	}
 
-	l = dgram->owner;
 	/* Header form */
 	qc_parse_hd_form(pkt, *buf++, &long_header);
 	if (long_header) {
 		uint64_t len;
-		int drop_no_con = 0;
+		struct quic_cid odcid;
 
 		if (!quic_packet_read_long_header(&buf, end, pkt)) {
 			TRACE_PROTO("Packet dropped", QUIC_EV_CONN_LPKT);
-			goto err;
+			goto drop;
 		}
 
 		if (pkt->type == QUIC_PACKET_TYPE_0RTT && !l->bind_conf->ssl_conf.early_data) {
 			TRACE_PROTO("0-RTT packet not supported", QUIC_EV_CONN_LPKT, qc);
-			drop_no_con = 1;
+			drop_no_conn = 1;
 		}
 		else if (pkt->type == QUIC_PACKET_TYPE_INITIAL &&
 		         dgram->len < QUIC_INITIAL_PACKET_MINLEN) {
 			TRACE_PROTO("Too short datagram with an Initial packet", QUIC_EV_CONN_LPKT, qc);
-			drop_no_con = 1;
+			drop_no_conn = 1;
 		}
 
 		/* When multiple QUIC packets are coalesced on the same UDP datagram,
@@ -5084,13 +5297,13 @@ static void qc_lstnr_pkt_rcv(unsigned char *buf, const unsigned char *end,
 		    (pkt->dcid.len != dgram->dcid_len ||
 		     memcmp(dgram->dcid, pkt->dcid.data, pkt->dcid.len))) {
 			TRACE_PROTO("Packet dropped", QUIC_EV_CONN_LPKT, qc);
-			goto err;
+			goto drop;
 		}
 
 		/* Retry of Version Negotiation packets are only sent by servers */
 		if (pkt->type == QUIC_PACKET_TYPE_RETRY || !pkt->version) {
 			TRACE_PROTO("Packet dropped", QUIC_EV_CONN_LPKT);
-			goto err;
+			goto drop;
 		}
 
 		/* RFC9000 6. Version Negotiation */
@@ -5114,102 +5327,110 @@ static void qc_lstnr_pkt_rcv(unsigned char *buf, const unsigned char *end,
 			if (!quic_dec_int(&token_len, (const unsigned char **)&buf, end) ||
 				end - buf < token_len) {
 				TRACE_PROTO("Packet dropped", QUIC_EV_CONN_LPKT);
-				goto err;
+				goto drop;
 			}
-
-			/* The token may be provided in a Retry packet or NEW_TOKEN frame
-			 * only by the QUIC server.
-			 */
-			pkt->token_len = token_len;
 
 			/* TODO Retry should be automatically activated if
 			 * suspect network usage is detected.
 			 */
-			if (!token_len && l->bind_conf->quic_force_retry) {
-				TRACE_PROTO("Initial without token, sending retry", QUIC_EV_CONN_LPKT);
-				if (send_retry(l->rx.fd, &dgram->saddr, pkt)) {
-					TRACE_PROTO("Error during Retry generation", QUIC_EV_CONN_LPKT);
-					goto err;
-				}
+			if (global.cluster_secret) {
+				if (!token_len) {
+					if (l->bind_conf->options & BC_O_QUIC_FORCE_RETRY) {
+						TRACE_PROTO("Initial without token, sending retry", QUIC_EV_CONN_LPKT);
+						if (send_retry(l->rx.fd, &dgram->saddr, pkt)) {
+							TRACE_PROTO("Error during Retry generation", QUIC_EV_CONN_LPKT);
+							goto err;
+						}
 
-				goto err;
+						HA_ATOMIC_INC(&prx_counters->retry_sent);
+						goto err;
+					}
+				}
+				else {
+					if (*buf == QUIC_TOKEN_FMT_RETRY) {
+						if (!quic_retry_token_check(buf, token_len, pkt->version, &odcid,
+						                            &pkt->scid, qc, &dgram->saddr)) {
+							HA_ATOMIC_INC(&prx_counters->retry_error);
+							TRACE_PROTO("Wrong retry token", QUIC_EV_CONN_LPKT);
+							/* TODO: RFC 9000 8.1.2 A server SHOULD immediately close the connection
+							 * with an INVALID_TOKEN error.
+							 */
+							goto drop;
+						}
+
+						HA_ATOMIC_INC(&prx_counters->retry_validated);
+					}
+					else {
+						/* TODO: New token check */
+						TRACE_PROTO("Packet dropped", QUIC_EV_CONN_LPKT);
+						goto drop;
+					}
+				}
 			}
-			else {
-				pkt->token = buf;
-				buf += pkt->token_len;
-			}
+
+			pkt->token = buf;
+			pkt->token_len = token_len;
+			buf += pkt->token_len;
 		}
 		else if (pkt->type != QUIC_PACKET_TYPE_0RTT) {
 			if (pkt->dcid.len != QUIC_HAP_CID_LEN) {
 				TRACE_PROTO("Packet dropped", QUIC_EV_CONN_LPKT);
-				goto err;
+				goto drop;
 			}
 		}
 
 		if (!quic_dec_int(&len, (const unsigned char **)&buf, end) ||
 			end - buf < len) {
 			TRACE_PROTO("Packet dropped", QUIC_EV_CONN_LPKT);
-			goto err;
+			goto drop;
 		}
 
 		payload = buf;
 		pkt->len = len + payload - beg;
-		if (drop_no_con)
-			goto drop_no_con;
+		if (drop_no_conn)
+			goto drop_no_conn;
 
 		qc = retrieve_qc_conn_from_cid(pkt, l, &dgram->saddr);
 		if (!qc) {
 			int ipv4;
 			struct ebmb_node *n = NULL;
-			const unsigned char *salt = initial_salt_v1;
-			size_t salt_len = sizeof initial_salt_v1;
 
 			if (pkt->type != QUIC_PACKET_TYPE_INITIAL) {
 				TRACE_PROTO("Non Initial packet", QUIC_EV_CONN_LPKT);
+				goto drop;
+			}
+
+			if (global.cluster_secret && !pkt->token_len && !(l->bind_conf->options & BC_O_QUIC_FORCE_RETRY) &&
+			    HA_ATOMIC_LOAD(&prx_counters->conn_opening) >= global.tune.quic_retry_threshold) {
+				TRACE_PROTO("Initial without token, sending retry", QUIC_EV_CONN_LPKT);
+				if (send_retry(l->rx.fd, &dgram->saddr, pkt)) {
+					TRACE_PROTO("Error during Retry generation", QUIC_EV_CONN_LPKT);
+					goto err;
+				}
+
+				HA_ATOMIC_INC(&prx_counters->retry_sent);
 				goto err;
 			}
 
+			/* RFC 9000 7.2. Negotiating Connection IDs:
+			 * When an Initial packet is sent by a client that has not previously
+			 * received an Initial or Retry packet from the server, the client
+			 * populates the Destination Connection ID field with an unpredictable
+			 * value. This Destination Connection ID MUST be at least 8 bytes in length.
+			 */
 			if (pkt->dcid.len < QUIC_ODCID_MINLEN) {
 				TRACE_PROTO("dropped packet", QUIC_EV_CONN_LPKT);
-				goto err;
+				goto drop;
 			}
 
 			pkt->saddr = dgram->saddr;
 			ipv4 = dgram->saddr.ss_family == AF_INET;
-			qc = qc_new_conn(pkt->version, ipv4, &pkt->dcid, &pkt->scid, &pkt->saddr,
+			qc = qc_new_conn(pkt->version, ipv4, &pkt->dcid, &pkt->scid, &odcid, &pkt->saddr,
 			                 pkt->token, pkt->token_len, 1, l);
 			if (qc == NULL)
-				goto err;
+				goto drop;
 
-			qc->enc_params_len =
-				quic_transport_params_encode(qc->enc_params,
-				                             qc->enc_params + sizeof qc->enc_params,
-				                             &qc->rx.params, 1);
-			if (!qc->enc_params_len)
-				goto err;
-
-			if (qc_conn_alloc_ssl_ctx(qc))
-				goto err;
-
-			if (!quic_conn_init_timer(qc))
-				goto err;
-
-			if (!quic_conn_init_idle_timer_task(qc))
-				goto err;
-
-			/* NOTE: the socket address has been concatenated to the destination ID
-			 * chosen by the client for Initial packets.
-			 */
-			if (pkt->version == QUIC_PROTOCOL_VERSION_DRAFT_29) {
-				salt = initial_salt_draft_29;
-				salt_len = sizeof initial_salt_draft_29;
-			}
-			if (!qc_new_isecs(qc, salt, salt_len,
-			                  pkt->dcid.data, pkt->dcid.len, 1)) {
-				TRACE_PROTO("Packet dropped", QUIC_EV_CONN_LPKT, qc);
-				goto err;
-			}
-
+			HA_ATOMIC_INC(&prx_counters->conn_opening);
 			/* Insert the DCID the QUIC client has chosen (only for listeners) */
 			n = ebmb_insert(&quic_dghdlrs[tid].odcids, &qc->odcid_node,
 			                qc->odcid.len + qc->odcid.addrlen);
@@ -5240,7 +5461,7 @@ static void qc_lstnr_pkt_rcv(unsigned char *buf, const unsigned char *end,
 	else {
 		if (end - buf < QUIC_HAP_CID_LEN) {
 			TRACE_PROTO("Packet dropped", QUIC_EV_CONN_LPKT);
-			goto err;
+			goto drop;
 		}
 
 		memcpy(pkt->dcid.data, buf, QUIC_HAP_CID_LEN);
@@ -5253,7 +5474,7 @@ static void qc_lstnr_pkt_rcv(unsigned char *buf, const unsigned char *end,
 		    (pkt->dcid.len != dgram->dcid_len ||
 		     memcmp(dgram->dcid, pkt->dcid.data, pkt->dcid.len))) {
 			TRACE_PROTO("Packet dropped", QUIC_EV_CONN_LPKT, qc);
-			goto err;
+			goto drop;
 		}
 
 		buf += QUIC_HAP_CID_LEN;
@@ -5268,7 +5489,7 @@ static void qc_lstnr_pkt_rcv(unsigned char *buf, const unsigned char *end,
 			TRACE_PROTO("Packet dropped", QUIC_EV_CONN_LPKT, NULL, pkt, &pktlen);
 			if (global.cluster_secret && !send_stateless_reset(l->rx.fd, &dgram->saddr, pkt))
 				TRACE_PROTO("stateless reset not sent", QUIC_EV_CONN_LPKT, qc);
-			goto err;
+			goto drop;
 		}
 
 		pkt->qc = qc;
@@ -5283,7 +5504,7 @@ static void qc_lstnr_pkt_rcv(unsigned char *buf, const unsigned char *end,
 		/* Skip the entire datagram */
 		pkt->len = end - beg;
 		TRACE_PROTO("Closing state connection", QUIC_EV_CONN_LPKT, pkt->qc);
-		goto out;
+		goto drop;
 	}
 
 	/* When multiple QUIC packets are coalesced on the same UDP datagram,
@@ -5315,6 +5536,12 @@ static void qc_lstnr_pkt_rcv(unsigned char *buf, const unsigned char *end,
 	quic_rx_pkts_del(qc);
 	b_cspace = b_contig_space(&qc->rx.buf);
 	if (b_cspace < pkt->len) {
+		/* Do not consume buf if space not at the end. */
+		if (b_tail(&qc->rx.buf) + b_cspace < b_wrap(&qc->rx.buf)) {
+			TRACE_PROTO("Packet dropped", QUIC_EV_CONN_LPKT, qc);
+			goto err;
+		}
+
 		/* Let us consume the remaining contiguous space. */
 		if (b_cspace) {
 			b_putchr(&qc->rx.buf, 0x00);
@@ -5324,13 +5551,13 @@ static void qc_lstnr_pkt_rcv(unsigned char *buf, const unsigned char *end,
 		if (b_contig_space(&qc->rx.buf) < pkt->len) {
 			TRACE_PROTO("Too big packet", QUIC_EV_CONN_LPKT, qc, pkt, &pkt->len);
 			qc_list_all_rx_pkts(qc);
-			goto err;
+			goto drop;
 		}
 	}
 
 	if (!qc_try_rm_hp(qc, pkt, payload, beg, end, &qel)) {
 		TRACE_PROTO("Packet dropped", QUIC_EV_CONN_LPKT, qc);
-		goto err;
+		goto drop;
 	}
 
 	TRACE_PROTO("New packet", QUIC_EV_CONN_LPKT, qc, pkt);
@@ -5347,11 +5574,15 @@ static void qc_lstnr_pkt_rcv(unsigned char *buf, const unsigned char *end,
 	if (conn_ctx)
 		tasklet_wakeup(conn_ctx->wait_event.tasklet);
 
- drop_no_con:
+ drop_no_conn:
+	if (drop_no_conn)
+		HA_ATOMIC_INC(&prx_counters->dropped_pkt);
 	TRACE_LEAVE(QUIC_EV_CONN_LPKT, qc ? qc : NULL, pkt);
 
 	return;
 
+ drop:
+	HA_ATOMIC_INC(&prx_counters->dropped_pkt);
  err:
 	/* Wakeup the I/O handler callback if the PTO timer must be armed.
 	 * This cannot be done by this thread.
@@ -6249,8 +6480,8 @@ struct task *quic_lstnr_dghdlr(struct task *t, void *ctx, unsigned int state)
 /* Retreive the DCID from a QUIC datagram or packet with <buf> as first octet.
  * Returns 1 if succeeded, 0 if not.
  */
-static int quic_get_dgram_dcid(unsigned char *buf, const unsigned char *end,
-                               unsigned char **dcid, size_t *dcid_len)
+int quic_get_dgram_dcid(unsigned char *buf, const unsigned char *end,
+                        unsigned char **dcid, size_t *dcid_len)
 {
 	int long_header;
 	size_t minlen, skip;
@@ -6276,47 +6507,6 @@ static int quic_get_dgram_dcid(unsigned char *buf, const unsigned char *end,
 
  err:
 	TRACE_PROTO("wrong datagram", QUIC_EV_CONN_LPKT);
-	return 0;
-}
-
-/* Retrieve the DCID from the datagram found in <buf> and deliver it to the
- * correct datagram handler.
- * Return 1 if a correct datagram could be found, 0 if not.
- */
-int quic_lstnr_dgram_dispatch(unsigned char *buf, size_t len, void *owner,
-                              struct sockaddr_storage *saddr,
-                              struct quic_dgram *new_dgram, struct list *dgrams)
-{
-	struct quic_dgram *dgram;
-	unsigned char *dcid;
-	size_t dcid_len;
-	int cid_tid;
-
-	if (!len || !quic_get_dgram_dcid(buf, buf + len, &dcid, &dcid_len))
-		goto err;
-
-	dgram = new_dgram ? new_dgram : pool_alloc(pool_head_quic_dgram);
-	if (!dgram)
-		goto err;
-
-	cid_tid = quic_get_cid_tid(dcid);
-
-	/* All the members must be initialized! */
-	dgram->owner = owner;
-	dgram->buf = buf;
-	dgram->len = len;
-	dgram->dcid = dcid;
-	dgram->dcid_len = dcid_len;
-	dgram->saddr = *saddr;
-	dgram->qc = NULL;
-	LIST_APPEND(dgrams, &dgram->list);
-	MT_LIST_APPEND(&quic_dghdlrs[cid_tid].dgrams, &dgram->mt_list);
-
-	tasklet_wakeup(quic_dghdlrs[cid_tid].task);
-
-	return 1;
-
- err:
 	return 0;
 }
 

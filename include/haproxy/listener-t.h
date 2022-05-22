@@ -113,6 +113,17 @@ enum li_status {
  * maxconn setting to the global.maxsock value so that its resources are reserved.
  */
 
+/* flags used with bind_conf->options */
+#define BC_O_USE_SSL            0x00000001 /* SSL is being used on this bind_conf */
+#define BC_O_GENERATE_CERTS     0x00000002 /* 1 if generate-certificates option is set, else 0 */
+#define BC_O_QUIC_FORCE_RETRY   0x00000004 /* always send Retry on reception of Initial without token */
+#define BC_O_USE_SOCK_DGRAM     0x00000008 /* at least one datagram-type listener is used */
+#define BC_O_USE_SOCK_STREAM    0x00000010 /* at least one stream-type listener is used */
+#define BC_O_USE_XPRT_DGRAM     0x00000020 /* at least one dgram-only xprt listener is used */
+#define BC_O_USE_XPRT_STREAM    0x00000040 /* at least one stream-only xprt listener is used */
+
+
+/* flags used with bind_conf->ssl_options */
 #ifdef USE_OPENSSL
 #define BC_SSL_O_NONE           0x0000
 #define BC_SSL_O_NO_TLS_TICKETS 0x0100	/* disable session resumption tickets */
@@ -170,13 +181,11 @@ struct bind_conf {
 #endif
 #ifdef USE_QUIC
 	struct quic_transport_params quic_params; /* QUIC transport parameters. */
-	unsigned int quic_force_retry:1;          /* always send Retry on reception of Initial without token */
 #endif
 	struct proxy *frontend;    /* the frontend all these listeners belong to, or NULL */
 	const struct mux_proto_list *mux_proto; /* the mux to use for all incoming connections (specified by the "proto" keyword) */
 	struct xprt_ops *xprt;     /* transport-layer operations for all listeners */
-	int is_ssl;                /* SSL is required for these listeners */
-	int generate_certs;        /* 1 if generate-certificates option is set, else 0 */
+	uint options;              /* set of BC_O_* flags */
 	int level;                 /* stats access level (ACCESS_LVL_*) */
 	int severity_output;       /* default severity output format in cli feedback messages */
 	struct list listeners;     /* list of listeners using this bind config */
