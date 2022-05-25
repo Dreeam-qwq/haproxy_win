@@ -1305,13 +1305,14 @@ struct sockaddr_storage *str2sa_range(const char *str, int *port, int *low, int 
 				  (proto_type == PROTO_TYPE_DGRAM) ? "datagram" : "stream",
 				  ss.ss_family,
 				  str,
-				  (ctrl_type == SOCK_STREAM && proto_type == PROTO_TYPE_DGRAM) ?
 #ifndef USE_QUIC
-				  "; QUIC is not compiled in if this is what you were looking for."
+				  (ctrl_type == SOCK_STREAM && proto_type == PROTO_TYPE_DGRAM)
+				  ? "; QUIC is not compiled in if this is what you were looking for."
+				  : ""
 #else
 				  ""
 #endif
-				  :"");
+				);
 			goto out;
 		}
 
@@ -1374,7 +1375,10 @@ char * sa2str(const struct sockaddr_storage *addr, int port, int map_ports)
 	default:
 		return NULL;
 	}
-	inet_ntop(addr->ss_family, ptr, buffer, get_addr_len(addr));
+	if (inet_ntop(addr->ss_family, ptr, buffer, sizeof(buffer)) == NULL) {
+		BUG_ON(errno == ENOSPC);
+		return NULL;
+	}
 	if (map_ports)
 		return memprintf(&out, "%s:%+d", buffer, port);
 	else

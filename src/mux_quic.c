@@ -11,7 +11,6 @@
 #include <haproxy/ncbuf.h>
 #include <haproxy/pool.h>
 #include <haproxy/quic_stream.h>
-#include <haproxy/sink.h>
 #include <haproxy/ssl_sock-t.h>
 #include <haproxy/trace.h>
 #include <haproxy/xprt_quic.h>
@@ -1566,12 +1565,15 @@ static int qc_wake(struct connection *conn)
 	TRACE_ENTER(QMUX_EV_QCC_WAKE, conn);
 
 	/* Check if a soft-stop is in progress.
-	 * Release idling front connection if this is the case.
 	 *
 	 * TODO this is revelant for frontend connections only.
+	 *
+	 * TODO Client should be notified with a H3 GOAWAY and then a
+	 * CONNECTION_CLOSE. However, quic-conn uses the listener socket for
+	 * sending which at this stage is already closed.
 	 */
 	if (unlikely(prx->flags & (PR_FL_DISABLED|PR_FL_STOPPED)))
-		goto release;
+		qcc->conn->flags |= (CO_FL_SOCK_RD_SH|CO_FL_SOCK_WR_SH);
 
 	if (conn->handle.qc->flags & QUIC_FL_CONN_NOTIFY_CLOSE)
 		qcc->conn->flags |= (CO_FL_SOCK_RD_SH|CO_FL_SOCK_WR_SH);
@@ -1652,21 +1654,6 @@ static void qmux_trace(enum trace_level level, uint64_t mask,
 		}
 	}
 }
-
-/* Function to automatically activate QUIC MUX traces on stdout.
- * Activated via the compilation flag -DENABLE_QUIC_STDOUT_TRACES.
- * Main use for now is in the docker image for QUIC interop testing.
- */
-static void qmux_init_stdout_traces(void)
-{
-#ifdef ENABLE_QUIC_STDOUT_TRACES
-	trace_qmux.sink = sink_find("stdout");
-	trace_qmux.level = TRACE_LEVEL_DEVELOPER;
-	trace_qmux.state = TRACE_STATE_RUNNING;
-	trace_qmux.verbosity = QMUX_VERB_MINIMAL;
-#endif
-}
-INITCALL0(STG_INIT, qmux_init_stdout_traces);
 
 
 static const struct mux_ops qc_ops = {
