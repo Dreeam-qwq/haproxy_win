@@ -102,11 +102,11 @@ struct trace_source trace_qmux = {
 INITCALL1(STG_REGISTER, trace_register_source, TRACE_SOURCE);
 
 /* Emit a CONNECTION_CLOSE with error <err>. This will interrupt all future
- * send operations.
+ * send/receive operations.
  */
 static void qcc_emit_cc(struct qcc *qcc, int err)
 {
-	quic_set_connection_close(qcc->conn->handle.qc, err);
+	quic_set_connection_close(qcc->conn->handle.qc, err, 0);
 	qcc->flags |= QC_CF_CC_EMIT;
 	tasklet_wakeup(qcc->wait_event.tasklet);
 }
@@ -128,30 +128,20 @@ struct qcs *qcs_new(struct qcc *qcc, uint64_t id, enum qcs_type type)
 	qcs->flags = QC_SF_NONE;
 	qcs->ctx = NULL;
 
-	/* allocate transport layer stream descriptor
-	 *
-	 * TODO qc_stream_desc is only useful for Tx buffering. It should not
-	 * be required for unidirectional remote streams.
-	 */
-	qcs->stream = qc_stream_desc_new(id, type, qcs, qcc->conn->handle.qc);
-	if (!qcs->stream)
-		goto err;
+	/* Allocate transport layer stream descriptor. Only needed for TX. */
+	if (!quic_stream_is_uni(id) || !quic_stream_is_remote(qcc, id)) {
+		struct quic_conn *qc = qcc->conn->handle.qc;
+		qcs->stream = qc_stream_desc_new(id, type, qcs, qc);
+		if (!qcs->stream)
+			goto err;
+	}
 
+	qcs->id = qcs->by_id.key = id;
 	if (qcc->app_ops->attach) {
 		if (qcc->app_ops->attach(qcs))
 			goto err;
 	}
 
-	qcs->endp = cs_endpoint_new();
-	if (!qcs->endp) {
-		pool_free(pool_head_qcs, qcs);
-		goto err;
-	}
-	qcs->endp->target = qcs;
-	qcs->endp->ctx = qcc->conn;
-	qcs->endp->flags |= (CS_EP_T_MUX|CS_EP_ORPHAN|CS_EP_NOT_FIRST);
-
-	qcs->id = qcs->by_id.key = id;
 	/* store transport layer stream descriptor in qcc tree */
 	eb64_insert(&qcc->streams_by_id, &qcs->by_id);
 
@@ -187,9 +177,7 @@ struct qcs *qcs_new(struct qcc *qcc, uint64_t id, enum qcs_type type)
 	if (qcs->ctx && qcc->app_ops->detach)
 		qcc->app_ops->detach(qcs);
 
-	if (qcs->stream)
-		qc_stream_desc_release(qcs->stream);
-
+	qc_stream_desc_release(qcs->stream);
 	pool_free(pool_head_qcs, qcs);
 	return NULL;
 }
@@ -445,7 +433,7 @@ static int qcc_decode_qcs(struct qcc *qcc, struct qcs *qcs)
 {
 	TRACE_ENTER(QMUX_EV_QCS_RECV, qcc->conn, qcs);
 
-	if (qcc->app_ops->decode_qcs(qcs, qcs->flags & QC_SF_FIN_RECV, qcc->ctx) < 0) {
+	if (qcc->app_ops->decode_qcs(qcs, qcs->flags & QC_SF_FIN_RECV, qcc->ctx)) {
 		TRACE_DEVEL("leaving on decoding error", QMUX_EV_QCS_RECV, qcc->conn, qcs);
 		return 1;
 	}
@@ -455,6 +443,16 @@ static int qcc_decode_qcs(struct qcc *qcc, struct qcs *qcs)
 	TRACE_LEAVE(QMUX_EV_QCS_RECV, qcc->conn, qcs);
 
 	return 0;
+}
+
+/* Emit a CONNECTION_CLOSE_APP with error <err>. Reserved for application error
+ * code. This will interrupt all future send/receive operations.
+ */
+void qcc_emit_cc_app(struct qcc *qcc, int err)
+{
+	quic_set_connection_close(qcc->conn->handle.qc, err, 1);
+	qcc->flags |= QC_CF_CC_EMIT;
+	tasklet_wakeup(qcc->wait_event.tasklet);
 }
 
 /* Handle a new STREAM frame for stream with id <id>. Payload is pointed by
@@ -471,6 +469,24 @@ int qcc_recv(struct qcc *qcc, uint64_t id, uint64_t len, uint64_t offset,
 
 	TRACE_ENTER(QMUX_EV_QCC_RECV, qcc->conn);
 
+	if (qcc->flags & QC_CF_CC_EMIT) {
+		TRACE_DEVEL("leaving on error", QMUX_EV_QCC_RECV, qcc->conn);
+		return 0;
+	}
+
+	/* RFC 9000 19.8. STREAM Frames
+	 *
+	 * An endpoint MUST terminate the connection with error
+	 * STREAM_STATE_ERROR if it receives a STREAM frame for a locally
+	 * initiated stream that has not yet been created, or for a send-only
+	 * stream.
+	 */
+	if (quic_stream_is_local(qcc, id) && quic_stream_is_uni(id)) {
+		qcc_emit_cc(qcc, QC_ERR_STREAM_STATE_ERROR);
+		TRACE_DEVEL("leaving on invalid reception for a send-only stream", QMUX_EV_QCC_RECV|QMUX_EV_QCC_NQCS, qcc->conn, NULL, &id);
+		return 1;
+	}
+
 	qcs = qcc_get_qcs(qcc, id);
 	if (!qcs) {
 		if ((id >> QCS_ID_TYPE_SHIFT) <= qcc->strms[qcs_id_type(id)].largest_id) {
@@ -478,8 +494,22 @@ int qcc_recv(struct qcc *qcc, uint64_t id, uint64_t len, uint64_t offset,
 			return 0;
 		}
 		else {
-			TRACE_DEVEL("leaving on stream not found", QMUX_EV_QCC_RECV|QMUX_EV_QCC_NQCS, qcc->conn, NULL, &id);
-			return 1;
+			/* RFC 9000 19.8. STREAM Frames
+			 *
+			 * An endpoint MUST terminate the connection with error
+			 * STREAM_STATE_ERROR if it receives a STREAM frame for a locally
+			 * initiated stream that has not yet been created, or for a send-only
+			 * stream.
+			 */
+			if (quic_stream_is_local(qcc, id)) {
+				TRACE_DEVEL("leaving on locally initiated stream not yet created", QMUX_EV_QCC_RECV|QMUX_EV_QCC_NQCS, qcc->conn, NULL, &id);
+				qcc_emit_cc(qcc, QC_ERR_STREAM_STATE_ERROR);
+				return 1;
+			}
+			else {
+				TRACE_DEVEL("leaving on stream not found", QMUX_EV_QCC_RECV|QMUX_EV_QCC_NQCS, qcc->conn, NULL, &id);
+				return 1;
+			}
 		}
 	}
 
@@ -553,6 +583,11 @@ int qcc_recv(struct qcc *qcc, uint64_t id, uint64_t len, uint64_t offset,
 
 	if (ncb_data(&qcs->rx.ncbuf, 0) && !(qcs->flags & QC_SF_DEM_FULL))
 		qcc_decode_qcs(qcc, qcs);
+
+	if (qcs->flags & QC_SF_READ_ABORTED) {
+		/* TODO should send a STOP_SENDING */
+		qcs_free(qcs);
+	}
 
 	TRACE_LEAVE(QMUX_EV_QCC_RECV, qcc->conn);
 	return 0;
@@ -1074,14 +1109,12 @@ static int qc_send(struct qcc *qcc)
 	node = eb64_first(&qcc->streams_by_id);
 	while (node) {
 		int ret;
-		qcs = eb64_entry(node, struct qcs, by_id);
+		uint64_t id;
 
-		/* TODO
-		 * for the moment, unidirectional streams have their own
-		 * mechanism for sending. This should be unified in the future,
-		 * in this case the next check will be removed.
-		 */
-		if (quic_stream_is_uni(qcs->id)) {
+		qcs = eb64_entry(node, struct qcs, by_id);
+		id = qcs->id;
+
+		if (quic_stream_is_uni(id) && quic_stream_is_remote(qcc, id)) {
 			node = eb64_next(node);
 			continue;
 		}
@@ -1138,27 +1171,40 @@ static int qc_recv(struct qcc *qcc)
 	struct eb64_node *node;
 	struct qcs *qcs;
 
+	TRACE_ENTER(QMUX_EV_QCC_RECV);
+
+	if (qcc->flags & QC_CF_CC_EMIT) {
+		TRACE_DEVEL("leaving on error", QMUX_EV_QCC_RECV, qcc->conn);
+		return 0;
+	}
+
 	node = eb64_first(&qcc->streams_by_id);
 	while (node) {
-		qcs = eb64_entry(node, struct qcs, by_id);
+		uint64_t id;
 
-		/* TODO unidirectional streams have their own mechanism for Rx.
-		 * This should be unified.
-		 */
-		if (quic_stream_is_uni(qcs->id)) {
-			node = eb64_next(node);
-			continue;
-		}
+		qcs = eb64_entry(node, struct qcs, by_id);
+		id = qcs->id;
 
 		if (!ncb_data(&qcs->rx.ncbuf, 0) || (qcs->flags & QC_SF_DEM_FULL)) {
 			node = eb64_next(node);
 			continue;
 		}
 
+		if (quic_stream_is_uni(id) && quic_stream_is_local(qcc, id)) {
+			node = eb64_next(node);
+			continue;
+		}
+
 		qcc_decode_qcs(qcc, qcs);
 		node = eb64_next(node);
+
+		if (qcs->flags & QC_SF_READ_ABORTED) {
+			/* TODO should send a STOP_SENDING */
+			qcs_free(qcs);
+		}
 	}
 
+	TRACE_LEAVE(QMUX_EV_QCC_RECV);
 	return 0;
 }
 
@@ -1536,7 +1582,7 @@ static int qc_wake_some_streams(struct qcc *qcc)
 	     node = eb64_next(node)) {
 		qcs = eb64_entry(node, struct qcs, by_id);
 
-		if (!qcs->endp->cs)
+		if (!qcs->endp || !qcs->endp->cs)
 			continue;
 
 		if (qcc->conn->flags & CO_FL_ERROR) {

@@ -100,6 +100,7 @@ struct qcc {
 #define QC_SF_DETACH            0x00000008  /* cs is detached but there is remaining data to send */
 #define QC_SF_BLK_SFCTL         0x00000010  /* stream blocked due to stream flow control limit */
 #define QC_SF_DEM_FULL          0x00000020  /* demux blocked on request channel buffer full */
+#define QC_SF_READ_ABORTED      0x00000040  /* stream rejected by app layer */
 
 struct qcs {
 	struct qcc *qcc;
@@ -136,7 +137,6 @@ struct qcs {
 struct qcc_app_ops {
 	int (*init)(struct qcc *qcc);
 	int (*attach)(struct qcs *qcs);
-	int (*attach_ruqs)(struct qcs *qcs, void *ctx);
 	int (*decode_qcs)(struct qcs *qcs, int fin, void *ctx);
 	size_t (*snd_buf)(struct conn_stream *cs, struct buffer *buf, size_t count, int flags);
 	void (*detach)(struct qcs *qcs);

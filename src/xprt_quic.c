@@ -1109,20 +1109,23 @@ static int quic_crypto_data_cpy(struct quic_enc_level *qel,
 /* Prepare the emission of CONNECTION_CLOSE with error <err>. All send/receive
  * activity for <qc> will be interrupted.
  */
-void quic_set_connection_close(struct quic_conn *qc, int err)
+void quic_set_connection_close(struct quic_conn *qc, int err, int app)
 {
 	if (qc->flags & QUIC_FL_CONN_IMMEDIATE_CLOSE)
 		return;
 
 	qc->err_code = err;
 	qc->flags |= QUIC_FL_CONN_IMMEDIATE_CLOSE;
+
+	if (app)
+		qc->flags |= QUIC_FL_CONN_APP_ALERT;
 }
 
 /* Set <alert> TLS alert as QUIC CRYPTO_ERROR error */
 void quic_set_tls_alert(struct quic_conn *qc, int alert)
 {
 	HA_ATOMIC_DEC(&qc->prx_counters->conn_opening);
-	quic_set_connection_close(qc, QC_ERR_CRYPTO_ERROR | alert);
+	quic_set_connection_close(qc, QC_ERR_CRYPTO_ERROR | alert, 0);
 	qc->flags |= QUIC_FL_CONN_TLS_ALERT;
 	TRACE_PROTO("Alert set", QUIC_EV_CONN_SSLDATA, qc);
 }
@@ -2166,18 +2169,25 @@ static inline int qc_provide_cdata(struct quic_enc_level *el,
 	return 0;
 }
 
-/* Handle <strm_frm> bidirectional STREAM frame. Depending on its ID, several
- * streams may be open. The data are copied to the stream RX buffer if possible.
- * If not, the STREAM frame is stored to be treated again later.
- * We rely on the flow control so that not to store too much STREAM frames.
- * Return 1 if succeeded, 0 if not.
+/* Parse a STREAM frame <strm_frm>
+ *
+ * Return 1 on success. On error, 0 is returned. In this case, the packet
+ * containing the frame must not be acknowledged.
  */
-static int qc_handle_bidi_strm_frm(struct quic_rx_packet *pkt,
-                                   struct quic_stream *strm_frm,
-                                   struct quic_conn *qc)
+static inline int qc_handle_strm_frm(struct quic_rx_packet *pkt,
+                                     struct quic_stream *strm_frm,
+                                     struct quic_conn *qc)
 {
 	int ret;
 
+	/* RFC9000 13.1.  Packet Processing
+	 *
+	 * A packet MUST NOT be acknowledged until packet protection has been
+	 * successfully removed and all frames contained in the packet have
+	 * been processed. For STREAM frames, this means the data has been
+	 * enqueued in preparation to be received by the application protocol,
+	 * but it does not require that data be delivered and consumed.
+	 */
 	ret = qcc_recv(qc->qcc, strm_frm->id, strm_frm->len,
 	               strm_frm->offset.key, strm_frm->fin,
 	               (char *)strm_frm->data);
@@ -2187,84 +2197,6 @@ static int qc_handle_bidi_strm_frm(struct quic_rx_packet *pkt,
 		return 0;
 
 	return 1;
-}
-
-/* Handle <strm_frm> unidirectional STREAM frame. Depending on its ID, several
- * streams may be open. The data are copied to the stream RX buffer if possible.
- * If not, the STREAM frame is stored to be treated again later.
- * We rely on the flow control so that not to store too much STREAM frames.
- * Return 1 if succeeded, 0 if not.
- */
-static int qc_handle_uni_strm_frm(struct quic_rx_packet *pkt,
-                                  struct quic_stream *strm_frm,
-                                  struct quic_conn *qc)
-{
-	struct qcs *strm;
-	enum ncb_ret ret;
-
-	strm = qcc_get_qcs(qc->qcc, strm_frm->id);
-	if (!strm) {
-		TRACE_PROTO("Stream not found", QUIC_EV_CONN_PSTRM, qc);
-		return 0;
-	}
-
-	if (strm_frm->offset.key < strm->rx.offset) {
-		size_t diff;
-
-		if (strm_frm->offset.key + strm_frm->len <= strm->rx.offset) {
-			TRACE_PROTO("Already received STREAM data",
-			            QUIC_EV_CONN_PSTRM, qc);
-			goto out;
-		}
-
-		TRACE_PROTO("Partially already received STREAM data", QUIC_EV_CONN_PSTRM, qc);
-		diff = strm->rx.offset - strm_frm->offset.key;
-		strm_frm->offset.key = strm->rx.offset;
-		strm_frm->len -= diff;
-		strm_frm->data += diff;
-	}
-
-	qc_get_ncbuf(strm, &strm->rx.ncbuf);
-	if (ncb_is_null(&strm->rx.ncbuf))
-		return 0;
-
-	ret = ncb_add(&strm->rx.ncbuf, strm_frm->offset.key - strm->rx.offset,
-	               (char *)strm_frm->data, strm_frm->len, NCB_ADD_COMPARE);
-	if (ret != NCB_RET_OK)
-		return 0;
-
-	/* Inform the application of the arrival of this new stream */
-	if (!strm->rx.offset && !qc->qcc->app_ops->attach_ruqs(strm, qc->qcc->ctx)) {
-		TRACE_PROTO("Could not set an uni-stream", QUIC_EV_CONN_PSTRM, qc);
-		return 0;
-	}
-
-	qcs_notify_recv(strm);
-
- out:
-	return 1;
-}
-
-/* Returns 1 on success or 0 on error. On error, the packet containing the
- * frame must not be acknowledged.
- */
-static inline int qc_handle_strm_frm(struct quic_rx_packet *pkt,
-                                     struct quic_stream *strm_frm,
-                                     struct quic_conn *qc)
-{
-	/* RFC9000 13.1.  Packet Processing
-	 *
-	 * A packet MUST NOT be acknowledged until packet protection has been
-	 * successfully removed and all frames contained in the packet have
-	 * been processed. For STREAM frames, this means the data has been
-	 * enqueued in preparation to be received by the application protocol,
-	 * but it does not require that data be delivered and consumed.
-	 */
-
-	if (strm_frm->id & QCS_ID_DIR_BIT)
-		return qc_handle_uni_strm_frm(pkt, strm_frm, qc);
-	else
-		return qc_handle_bidi_strm_frm(pkt, strm_frm, qc);
 }
 
 /* Duplicate all frames from <pkt_frm_list> list into <out_frm_list> list
@@ -5985,7 +5917,7 @@ static int qc_do_build_pkt(unsigned char *pos, const unsigned char *end,
 	size_t len, len_sz, len_frms, padding_len;
 	struct quic_frame frm = { .type = QUIC_FT_CRYPTO, };
 	struct quic_frame ack_frm = { .type = QUIC_FT_ACK, };
-	struct quic_frame cc_frm = { . type = QUIC_FT_CONNECTION_CLOSE, };
+	struct quic_frame cc_frm = { };
 	size_t ack_frm_len, head_len;
 	int64_t rx_largest_acked_pn;
 	int add_ping_frm;
@@ -6084,9 +6016,10 @@ static int qc_do_build_pkt(unsigned char *pos, const unsigned char *end,
 		len += QUIC_TLS_TAG_LEN;
 	/* CONNECTION_CLOSE frame */
 	if (cc) {
-		struct quic_connection_close *cc = &cc_frm.connection_close;
+		cc_frm.type = qc->flags & QUIC_FL_CONN_APP_ALERT ?
+		  QUIC_FT_CONNECTION_CLOSE_APP : QUIC_FT_CONNECTION_CLOSE;
 
-		cc->error_code = qc->err_code;
+		cc_frm.connection_close.error_code = qc->err_code;
 		len += qc_frm_len(&cc_frm);
 	}
 	add_ping_frm = 0;

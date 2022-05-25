@@ -615,9 +615,10 @@ static struct bind_conf *bind_conf_uniq_alloc(struct proxy *p,
 
 	if (!LIST_ISEMPTY(&p->conf.bind)) {
 		bind_conf = LIST_ELEM((&p->conf.bind)->n, typeof(bind_conf), by_fe);
-		free(bind_conf->file);
-		bind_conf->file = strdup(file);
-		bind_conf->line = line;
+		/*
+		 * We keep bind_conf->file and bind_conf->line unchanged
+		 * to make them available for error messages
+		 */
 		if (arg) {
 			free(bind_conf->arg);
 			bind_conf->arg = strdup(arg);
@@ -712,6 +713,11 @@ int cfg_parse_peers(const char *file, int linenum, char **args, int kwm)
 				goto out;
 			}
 
+			if (!LIST_ISEMPTY(&bind_conf->listeners)) {
+				ha_alert("parsing [%s:%d] : One listener per \"peers\" section is authorized but another is already configured at [%s:%d].\n", file, linenum, bind_conf->file, bind_conf->line);
+				err_code |= ERR_FATAL;
+			}
+
 			if (!str2listener(args[1], curpeers->peers_fe, bind_conf, file, linenum, &errmsg)) {
 				if (errmsg && *errmsg) {
 					indent_msg(&errmsg, 2);
@@ -723,7 +729,10 @@ int cfg_parse_peers(const char *file, int linenum, char **args, int kwm)
 				err_code |= ERR_FATAL;
 				goto out;
 			}
-			l = LIST_ELEM(bind_conf->listeners.n, typeof(l), by_bind);
+			/*
+			 * Newly allocated listener is at the end of the list
+			 */
+			l = LIST_ELEM(bind_conf->listeners.p, typeof(l), by_bind);
 			l->maxaccept = 1;
 			l->accept = session_accept_fd;
 			l->analysers |=  curpeers->peers_fe->fe_req_ana;
@@ -910,6 +919,11 @@ int cfg_parse_peers(const char *file, int linenum, char **args, int kwm)
 
 		bind_conf = bind_conf_uniq_alloc(curpeers->peers_fe, file, linenum, args[2], xprt_get(XPRT_RAW));
 
+		if (!LIST_ISEMPTY(&bind_conf->listeners)) {
+			ha_alert("parsing [%s:%d] : One listener per \"peers\" section is authorized but another is already configured at [%s:%d].\n", file, linenum, bind_conf->file, bind_conf->line);
+			err_code |= ERR_FATAL;
+		}
+
 		if (!str2listener(args[2], curpeers->peers_fe, bind_conf, file, linenum, &errmsg)) {
 			if (errmsg && *errmsg) {
 				indent_msg(&errmsg, 2);
@@ -922,7 +936,10 @@ int cfg_parse_peers(const char *file, int linenum, char **args, int kwm)
 			goto out;
 		}
 
-		l = LIST_ELEM(bind_conf->listeners.n, typeof(l), by_bind);
+		/*
+		 * Newly allocated listener is at the end of the list
+		 */
+		l = LIST_ELEM(bind_conf->listeners.p, typeof(l), by_bind);
 		l->maxaccept = 1;
 		l->accept = session_accept_fd;
 		l->analysers |=  curpeers->peers_fe->fe_req_ana;

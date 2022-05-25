@@ -23,6 +23,7 @@
 #include <haproxy/h3.h>
 #include <haproxy/http.h>
 #include <haproxy/htx.h>
+#include <haproxy/intops.h>
 #include <haproxy/istbuf.h>
 #include <haproxy/mux_quic.h>
 #include <haproxy/ncbuf.h>
@@ -41,45 +42,152 @@
 #define h3_debug_hexdump(...) do { } while (0)
 #endif
 
-#define H3_CF_SETTINGS_SENT  0x00000001
+#define H3_CF_SETTINGS_SENT     0x00000001  /* SETTINGS frame already sent on local control stream */
+#define H3_CF_SETTINGS_RECV     0x00000002  /* SETTINGS frame already received on remote control stream */
+#define H3_CF_UNI_CTRL_SET      0x00000004  /* Remote H3 Control stream opened */
+#define H3_CF_UNI_QPACK_DEC_SET 0x00000008  /* Remote QPACK decoder stream opened */
+#define H3_CF_UNI_QPACK_ENC_SET 0x00000010  /* Remote QPACK encoder stream opened */
 
 /* Default settings */
 static uint64_t h3_settings_qpack_max_table_capacity = 0;
 static uint64_t h3_settings_qpack_blocked_streams = 4096;
 static uint64_t h3_settings_max_field_section_size = QUIC_VARINT_8_BYTE_MAX; /* Unlimited */
 
-struct h3 {
+struct h3c {
 	struct qcc *qcc;
 	enum h3_err err;
 	uint32_t flags;
-	/* Locally initiated uni-streams */
-	struct h3_uqs lqpack_enc;
-	struct h3_uqs lqpack_dec;
-	struct h3_uqs lctrl;
-	/* Remotely initiated uni-streams */
-	struct h3_uqs rqpack_enc;
-	struct h3_uqs rqpack_dec;
-	struct h3_uqs rctrl;
+
 	/* Settings */
 	uint64_t qpack_max_table_capacity;
 	uint64_t qpack_blocked_streams;
 	uint64_t max_field_section_size;
+
 	struct buffer_wait buf_wait; /* wait list for buffer allocations */
 };
 
-DECLARE_STATIC_POOL(pool_head_h3, "h3", sizeof(struct h3));
+DECLARE_STATIC_POOL(pool_head_h3c, "h3c", sizeof(struct h3c));
+
+#define H3_SF_UNI_INIT  0x00000001  /* stream type not parsed for unidirectional stream */
+#define H3_SF_UNI_NO_H3 0x00000002  /* unidirectional stream does not carry H3 frames */
 
 struct h3s {
+	enum h3s_t type;
 	int demux_frame_len;
 	int demux_frame_type;
+
+	int flags;
 };
 
 DECLARE_STATIC_POOL(pool_head_h3s, "h3s", sizeof(struct h3s));
 
 /* Simple function to duplicate a buffer */
-static inline struct buffer h3_b_dup(struct ncbuf *b)
+static inline struct buffer h3_b_dup(const struct ncbuf *b)
 {
 	return b_make(ncb_orig(b), b->size, b->head, ncb_data(b, 0));
+}
+
+/* Initialize an uni-stream <qcs> by reading its type from <rxbuf>.
+ *
+ * Returns 0 on success else non-zero.
+ */
+static int h3_init_uni_stream(struct h3c *h3c, struct qcs *qcs,
+                              struct ncbuf *rxbuf)
+{
+	/* decode unidirectional stream type */
+	struct h3s *h3s = qcs->ctx;
+	struct buffer b;
+	uint64_t type;
+	size_t len = 0, ret;
+
+	BUG_ON_HOT(!quic_stream_is_uni(qcs->id) ||
+	           h3s->flags & H3_SF_UNI_INIT);
+
+	b = h3_b_dup(rxbuf);
+	ret = b_quic_dec_int(&type, &b, &len);
+	if (!ret) {
+		ABORT_NOW();
+	}
+
+	switch (type) {
+	case H3_UNI_S_T_CTRL:
+		if (h3c->flags & H3_CF_UNI_CTRL_SET) {
+			qcc_emit_cc_app(qcs->qcc, H3_STREAM_CREATION_ERROR);
+			return 1;
+		}
+		h3c->flags |= H3_CF_UNI_CTRL_SET;
+		h3s->type = H3S_T_CTRL;
+		break;
+
+	case H3_UNI_S_T_PUSH:
+		/* TODO not supported for the moment */
+		h3s->type = H3S_T_PUSH;
+		break;
+
+	case H3_UNI_S_T_QPACK_DEC:
+		if (h3c->flags & H3_CF_UNI_QPACK_DEC_SET) {
+			qcc_emit_cc_app(qcs->qcc, H3_STREAM_CREATION_ERROR);
+			return 1;
+		}
+		h3c->flags |= H3_CF_UNI_QPACK_DEC_SET;
+		h3s->type = H3S_T_QPACK_DEC;
+		h3s->flags |= H3_SF_UNI_NO_H3;
+		break;
+
+	case H3_UNI_S_T_QPACK_ENC:
+		if (h3c->flags & H3_CF_UNI_QPACK_ENC_SET) {
+			qcc_emit_cc_app(qcs->qcc, H3_STREAM_CREATION_ERROR);
+			return 1;
+		}
+		h3c->flags |= H3_CF_UNI_QPACK_ENC_SET;
+		h3s->type = H3S_T_QPACK_ENC;
+		h3s->flags |= H3_SF_UNI_NO_H3;
+		break;
+
+	default:
+		/* draft-ietf-quic-http34 9. Extensions to HTTP/3
+		 *
+		 * Implementations MUST [...] abort reading on unidirectional
+		 * streams that have unknown or unsupported types.
+		 */
+		qcs->flags |= QC_SF_READ_ABORTED;
+		return 1;
+	};
+
+	h3s->flags |= H3_SF_UNI_INIT;
+	qcs_consume(qcs, len);
+
+	return 0;
+}
+
+/* Parse an uni-stream <qcs> from <rxbuf> which does not contains H3 frames.
+ * This may be used for QPACK encoder/decoder streams for example.
+ *
+ * Returns 0 on success else non-zero.
+ */
+static int h3_parse_uni_stream_no_h3(struct qcs *qcs, struct ncbuf *rxbuf)
+{
+	struct h3s *h3s = qcs->ctx;
+
+	BUG_ON_HOT(!quic_stream_is_uni(qcs->id) ||
+	           !(h3s->flags & H3_SF_UNI_NO_H3));
+
+	switch (h3s->type) {
+	case H3S_T_QPACK_DEC:
+		if (!qpack_decode_dec(qcs, NULL))
+			return 1;
+		break;
+	case H3S_T_QPACK_ENC:
+		if (!qpack_decode_enc(qcs, NULL))
+			return 1;
+		break;
+	case H3S_T_UNKNOWN:
+	default:
+		/* Unknown stream should be flagged with QC_SF_READ_ABORTED. */
+		ABORT_NOW();
+	}
+
+	return 0;
 }
 
 /* Decode a h3 frame header made of two QUIC varints from <b> buffer.
@@ -97,6 +205,56 @@ static inline size_t h3_decode_frm_header(uint64_t *ftype, uint64_t *flen,
 		return 0;
 
 	return hlen;
+}
+
+/* Check if H3 frame of type <ftype> is valid when received on stream <qcs>.
+ *
+ * Returns a boolean. If false, a connection error H3_FRAME_UNEXPECTED should
+ * be reported.
+ */
+static int h3_is_frame_valid(struct h3c *h3c, struct qcs *qcs, uint64_t ftype)
+{
+	struct h3s *h3s = qcs->ctx;
+	const uint64_t id = qcs->id;
+
+	BUG_ON_HOT(h3s->type == H3S_T_UNKNOWN);
+
+	switch (ftype) {
+	case H3_FT_DATA:
+	case H3_FT_HEADERS:
+		return h3s->type != H3S_T_CTRL;
+
+	case H3_FT_CANCEL_PUSH:
+	case H3_FT_GOAWAY:
+	case H3_FT_MAX_PUSH_ID:
+		/* Only allowed for control stream. First frame of control
+		 * stream MUST be SETTINGS.
+		 */
+		return h3s->type == H3S_T_CTRL &&
+		       (h3c->flags & H3_CF_SETTINGS_RECV);
+
+	case H3_FT_SETTINGS:
+		/* draft-ietf-quic-http34 7.2.4. SETTINGS
+		 *
+		 * If an endpoint receives a second SETTINGS frame on the control
+		 * stream, the endpoint MUST respond with a connection error of type
+		 * H3_FRAME_UNEXPECTED.
+		 */
+		return h3s->type == H3S_T_CTRL &&
+		       !(h3c->flags & H3_CF_SETTINGS_RECV);
+
+	case H3_FT_PUSH_PROMISE:
+		return h3s->type != H3S_T_CTRL &&
+		       (id & QCS_ID_SRV_INTIATOR_BIT);
+
+	default:
+		/* draft-ietf-quic-http34 9. Extensions to HTTP/3
+		 *
+		 * Implementations MUST discard frames [...] that have unknown
+		 * or unsupported types.
+		 */
+		return h3s->type != H3S_T_CTRL || (h3c->flags & H3_CF_SETTINGS_RECV);
+	}
 }
 
 /* Parse from buffer <buf> a H3 HEADERS frame of length <len>. Data are copied
@@ -259,19 +417,108 @@ static int h3_data_to_htx(struct qcs *qcs, struct ncbuf *buf, uint64_t len,
 	return htx_sent;
 }
 
+/* Parse a SETTINGS frame of length <len> of payload <rxbuf>.
+ *
+ * Returns the number of bytes handled or a negative error code.
+ */
+static size_t h3_parse_settings_frm(struct h3c *h3c, const struct ncbuf *rxbuf,
+                                    size_t len)
+{
+	struct buffer b;
+	uint64_t id, value;
+	size_t ret = 0;
+	long mask = 0;   /* used to detect duplicated settings identifier */
+
+	b = h3_b_dup(rxbuf);
+	b_set_data(&b, len);
+
+	while (b_data(&b)) {
+		if (!b_quic_dec_int(&id, &b, &ret) || !b_quic_dec_int(&value, &b, &ret)) {
+			h3c->err = H3_FRAME_ERROR;
+			return -1;
+		}
+
+		h3_debug_printf(stderr, "%s id: %llu value: %llu\n",
+		                __func__, (unsigned long long)id, (unsigned long long)value);
+
+		/* draft-ietf-quic-http34 7.2.4. SETTINGS
+		 *
+		 * The same setting identifier MUST NOT occur more than once in the
+		 * SETTINGS frame.  A receiver MAY treat the presence of duplicate
+		 * setting identifiers as a connection error of type H3_SETTINGS_ERROR.
+		 */
+
+		/* Ignore duplicate check for ID too big used for GREASE. */
+		if (id < sizeof(mask)) {
+			if (ha_bit_test(id, &mask)) {
+				h3c->err = H3_SETTINGS_ERROR;
+				return -1;
+			}
+			ha_bit_set(id, &mask);
+		}
+
+		switch (id) {
+		case H3_SETTINGS_QPACK_MAX_TABLE_CAPACITY:
+			h3c->qpack_max_table_capacity = value;
+			break;
+		case H3_SETTINGS_MAX_FIELD_SECTION_SIZE:
+			h3c->max_field_section_size = value;
+			break;
+		case H3_SETTINGS_QPACK_BLOCKED_STREAMS:
+			h3c->qpack_blocked_streams = value;
+			break;
+
+		case H3_SETTINGS_RESERVED_0:
+		case H3_SETTINGS_RESERVED_2:
+		case H3_SETTINGS_RESERVED_3:
+		case H3_SETTINGS_RESERVED_4:
+		case H3_SETTINGS_RESERVED_5:
+			/* draft-ietf-quic-http34 7.2.4.1. Defined SETTINGS Parameters
+			 *
+			 * Setting identifiers which were defined in [HTTP2] where there is no
+			 * corresponding HTTP/3 setting have also been reserved
+			 * (Section 11.2.2).  These reserved settings MUST NOT be sent, and
+			 * their receipt MUST be treated as a connection error of type
+			 * H3_SETTINGS_ERROR.
+			 */
+			h3c->err = H3_SETTINGS_ERROR;
+			return -1;
+		default:
+			/* MUST be ignored */
+			break;
+		}
+	}
+
+	return ret;
+}
+
 /* Decode <qcs> remotely initiated bidi-stream. <fin> must be set to indicate
  * that we received the last data of the stream.
- * Returns <0 on error else 0.
+ *
+ * Returns 0 on success else non-zero.
  */
 static int h3_decode_qcs(struct qcs *qcs, int fin, void *ctx)
 {
 	struct ncbuf *rxbuf = &qcs->rx.ncbuf;
+	struct h3c *h3c = ctx;
 	struct h3s *h3s = qcs->ctx;
 	ssize_t ret;
 
 	h3_debug_printf(stderr, "%s: STREAM ID: %lu\n", __func__, qcs->id);
 	if (!ncb_data(rxbuf, 0))
 		return 0;
+
+	if (quic_stream_is_uni(qcs->id) && !(h3s->flags & H3_SF_UNI_INIT)) {
+		if (h3_init_uni_stream(h3c, qcs, rxbuf))
+			return 1;
+	}
+
+	if (quic_stream_is_uni(qcs->id) && (h3s->flags & H3_SF_UNI_NO_H3)) {
+		/* For non-h3 STREAM, parse it and return immediately. */
+		if (h3_parse_uni_stream_no_h3(qcs, rxbuf))
+			return 1;
+		return 0;
+	}
 
 	while (ncb_data(rxbuf, 0) && !(qcs->flags & QC_SF_DEM_FULL)) {
 		uint64_t ftype, flen;
@@ -295,11 +542,29 @@ static int h3_decode_qcs(struct qcs *qcs, int fin, void *ctx)
 
 		flen = h3s->demux_frame_len;
 		ftype = h3s->demux_frame_type;
-		/* Do not demux HEADERS if frame incomplete. */
-		if (ftype == H3_FT_HEADERS && flen > b_data(&b)) {
-			BUG_ON(ncb_is_full(rxbuf)); /* TODO should define SETTINGS for max header size */
+
+		if (!h3_is_frame_valid(h3c, qcs, ftype)) {
+			qcc_emit_cc_app(qcs->qcc, H3_FRAME_UNEXPECTED);
+			return 1;
+		}
+
+		/* Do not demux incomplete frames except H3 DATA which can be
+		 * fragmented in multiple HTX blocks.
+		 */
+		if (flen > b_data(&b) && ftype != H3_FT_DATA) {
+			/* Reject frames bigger than bufsize.
+			 *
+			 * TODO HEADERS should in complement be limited with H3
+			 * SETTINGS_MAX_FIELD_SECTION_SIZE parameter to prevent
+			 * excessive decompressed size.
+			 */
+			if (flen > ncb_size(rxbuf)) {
+				qcc_emit_cc_app(qcs->qcc, H3_EXCESSIVE_LOAD);
+				return 1;
+			}
 			break;
 		}
+
 		last_stream_frame = (fin && flen == ncb_total_data(rxbuf));
 
 		switch (ftype) {
@@ -313,16 +578,30 @@ static int h3_decode_qcs(struct qcs *qcs, int fin, void *ctx)
 			/* TODO handle error reporting. Stream closure required. */
 			if (ret < 0) { ABORT_NOW(); }
 			break;
+		case H3_FT_CANCEL_PUSH:
 		case H3_FT_PUSH_PROMISE:
+		case H3_FT_MAX_PUSH_ID:
+		case H3_FT_GOAWAY:
 			/* Not supported */
-			ret = MIN(ncb_data(rxbuf, 0), flen);
+			ret = flen;
+			break;
+		case H3_FT_SETTINGS:
+			ret = h3_parse_settings_frm(qcs->qcc->ctx, rxbuf, flen);
+			if (ret < 0) {
+				qcc_emit_cc_app(qcs->qcc, h3c->err);
+				return 1;
+			}
+			h3c->flags |= H3_CF_SETTINGS_RECV;
 			break;
 		default:
 			/* draft-ietf-quic-http34 9. Extensions to HTTP/3
-			 * unknown frame types MUST be ignored
+			 *
+			 * Implementations MUST discard frames [...] that have unknown
+			 * or unsupported types.
 			 */
 			h3_debug_printf(stderr, "ignore unknown frame type 0x%lx\n", ftype);
-			ret = MIN(ncb_data(rxbuf, 0), flen);
+			ret = flen;
+			break;
 		}
 
 		if (ret) {
@@ -339,112 +618,6 @@ static int h3_decode_qcs(struct qcs *qcs, int fin, void *ctx)
 	return 0;
 }
 
-/* Parse a SETTINGS frame which must not be truncated with <flen> as length from
- * <rxbuf> buffer. This function does not update this buffer.
- * Returns 0 if something wrong happened, 1 if not.
- */
-static int h3_parse_settings_frm(struct h3 *h3, const struct ncbuf *rxbuf, size_t flen)
-{
-	uint64_t id, value;
-	const unsigned char *buf, *end;
-
-	buf = (const unsigned char *)ncb_head(rxbuf);
-	end = buf + flen;
-
-	while (buf <= end) {
-		if (!quic_dec_int(&id, &buf, end) || !quic_dec_int(&value, &buf, end))
-			return 0;
-
-		h3_debug_printf(stderr, "%s id: %llu value: %llu\n",
-		                __func__, (unsigned long long)id, (unsigned long long)value);
-		switch (id) {
-		case H3_SETTINGS_QPACK_MAX_TABLE_CAPACITY:
-			h3->qpack_max_table_capacity = value;
-			break;
-		case H3_SETTINGS_MAX_FIELD_SECTION_SIZE:
-			h3->max_field_section_size = value;
-			break;
-		case H3_SETTINGS_QPACK_BLOCKED_STREAMS:
-			h3->qpack_blocked_streams = value;
-			break;
-		case H3_SETTINGS_RESERVED_2 ... H3_SETTINGS_RESERVED_5:
-			h3->err = H3_SETTINGS_ERROR;
-			return 0;
-		default:
-			/* MUST be ignored */
-			break;
-		}
-	}
-
-	return 1;
-}
-
-/* Decode <qcs> remotely initiated uni-stream. We stop parsing a frame as soon as
- * there is not enough received data.
- * Returns 0 if something wrong happened, 1 if not.
- */
-static int h3_control_recv(struct h3_uqs *h3_uqs, void *ctx)
-{
-	struct ncbuf *rxbuf = &h3_uqs->qcs->rx.ncbuf;
-	struct h3 *h3 = ctx;
-
-	h3_debug_printf(stderr, "%s STREAM ID: %lu\n", __func__,  h3_uqs->qcs->id);
-	if (!ncb_data(rxbuf, 0))
-		return 1;
-
-	while (ncb_data(rxbuf, 0)) {
-		size_t hlen;
-		uint64_t ftype, flen;
-		struct buffer b;
-
-		/* Work on a copy of <rxbuf> */
-		b = h3_b_dup(rxbuf);
-		hlen = h3_decode_frm_header(&ftype, &flen, &b);
-		if (!hlen)
-			break;
-
-		h3_debug_printf(stderr, "%s: ftype: %llu, flen: %llu\n", __func__,
-		        (unsigned long long)ftype, (unsigned long long)flen);
-		if (flen > b_data(&b))
-			break;
-
-		qcs_consume(h3_uqs->qcs, hlen);
-		/* From here, a frame must not be truncated */
-		switch (ftype) {
-		case H3_FT_CANCEL_PUSH:
-			/* XXX TODO XXX */
-			ABORT_NOW();
-			break;
-		case H3_FT_SETTINGS:
-			if (!h3_parse_settings_frm(h3, rxbuf, flen))
-				return 0;
-			break;
-		case H3_FT_GOAWAY:
-			/* XXX TODO XXX */
-			ABORT_NOW();
-			break;
-		case H3_FT_MAX_PUSH_ID:
-			/* XXX TODO XXX */
-			ABORT_NOW();
-			break;
-		default:
-			/* Error */
-			h3->err = H3_FRAME_UNEXPECTED;
-			return 0;
-		}
-		qcs_consume(h3_uqs->qcs, flen);
-	}
-
-	/* Handle the case where remaining data are present in the buffer. This
-	 * can happen if there is an incomplete frame. In this case, subscribe
-	 * on the lower layer to restart receive operation.
-	 */
-	if (ncb_data(rxbuf, 0))
-		qcs_subscribe(h3_uqs->qcs, SUB_RETRY_RECV, &h3_uqs->wait_event);
-
-	return 1;
-}
-
 /* Returns buffer for data sending.
  * May be NULL if the allocation failed.
  */
@@ -456,55 +629,54 @@ static struct buffer *mux_get_buf(struct qcs *qcs)
 	return &qcs->tx.buf;
 }
 
-/* Function used to emit stream data from <h3_uqs> control uni-stream */
-static int h3_control_send(struct h3_uqs *h3_uqs, void *ctx)
+/* Function used to emit stream data from <qcs> control uni-stream */
+static int h3_control_send(struct qcs *qcs, void *ctx)
 {
 	int ret;
-	struct h3 *h3 = ctx;
+	struct h3c *h3c = ctx;
 	unsigned char data[(2 + 3) * 2 * QUIC_VARINT_MAX_SIZE]; /* enough for 3 settings */
 	struct buffer pos, *res;
+	size_t frm_len;
+
+	BUG_ON_HOT(h3c->flags & H3_CF_SETTINGS_SENT);
 
 	ret = 0;
 	pos = b_make((char *)data, sizeof(data), 0, 0);
-	if (!(h3->flags & H3_CF_SETTINGS_SENT)) {
-		struct qcs *qcs = h3_uqs->qcs;
-		size_t frm_len;
 
-		frm_len = quic_int_getsize(H3_SETTINGS_QPACK_MAX_TABLE_CAPACITY) +
-			quic_int_getsize(h3_settings_qpack_max_table_capacity) +
-			quic_int_getsize(H3_SETTINGS_QPACK_BLOCKED_STREAMS) +
-			quic_int_getsize(h3_settings_qpack_blocked_streams);
-		if (h3_settings_max_field_section_size) {
-			frm_len += quic_int_getsize(H3_SETTINGS_MAX_FIELD_SECTION_SIZE) +
-			quic_int_getsize(h3_settings_max_field_section_size);
-		}
+	frm_len = quic_int_getsize(H3_SETTINGS_QPACK_MAX_TABLE_CAPACITY) +
+		quic_int_getsize(h3_settings_qpack_max_table_capacity) +
+		quic_int_getsize(H3_SETTINGS_QPACK_BLOCKED_STREAMS) +
+		quic_int_getsize(h3_settings_qpack_blocked_streams);
+	if (h3_settings_max_field_section_size) {
+		frm_len += quic_int_getsize(H3_SETTINGS_MAX_FIELD_SECTION_SIZE) +
+		quic_int_getsize(h3_settings_max_field_section_size);
+	}
 
-		b_quic_enc_int(&pos, H3_UNI_STRM_TP_CONTROL_STREAM);
-		/* Build a SETTINGS frame */
-		b_quic_enc_int(&pos, H3_FT_SETTINGS);
-		b_quic_enc_int(&pos, frm_len);
-		b_quic_enc_int(&pos, H3_SETTINGS_QPACK_MAX_TABLE_CAPACITY);
-		b_quic_enc_int(&pos, h3_settings_qpack_max_table_capacity);
-		b_quic_enc_int(&pos, H3_SETTINGS_QPACK_BLOCKED_STREAMS);
-		b_quic_enc_int(&pos, h3_settings_qpack_blocked_streams);
-		if (h3_settings_max_field_section_size) {
-			b_quic_enc_int(&pos, H3_SETTINGS_MAX_FIELD_SECTION_SIZE);
-			b_quic_enc_int(&pos, h3_settings_max_field_section_size);
-		}
+	b_quic_enc_int(&pos, H3_UNI_S_T_CTRL);
+	/* Build a SETTINGS frame */
+	b_quic_enc_int(&pos, H3_FT_SETTINGS);
+	b_quic_enc_int(&pos, frm_len);
+	b_quic_enc_int(&pos, H3_SETTINGS_QPACK_MAX_TABLE_CAPACITY);
+	b_quic_enc_int(&pos, h3_settings_qpack_max_table_capacity);
+	b_quic_enc_int(&pos, H3_SETTINGS_QPACK_BLOCKED_STREAMS);
+	b_quic_enc_int(&pos, h3_settings_qpack_blocked_streams);
+	if (h3_settings_max_field_section_size) {
+		b_quic_enc_int(&pos, H3_SETTINGS_MAX_FIELD_SECTION_SIZE);
+		b_quic_enc_int(&pos, h3_settings_max_field_section_size);
+	}
 
-		res = mux_get_buf(qcs);
-		if (b_room(res) < b_data(&pos)) {
-			// TODO the mux should be put in blocked state, with
-			// the stream in state waiting for settings to be sent
-			ABORT_NOW();
-		}
+	res = mux_get_buf(qcs);
+	if (b_room(res) < b_data(&pos)) {
+		// TODO the mux should be put in blocked state, with
+		// the stream in state waiting for settings to be sent
+		ABORT_NOW();
+	}
 
-		ret = b_force_xfer(res, &pos, b_data(&pos));
-		if (ret > 0) {
-			h3->flags |= H3_CF_SETTINGS_SENT;
-			if (!(qcs->qcc->wait_event.events & SUB_RETRY_SEND))
-				tasklet_wakeup(qcs->qcc->wait_event.tasklet);
-		}
+	ret = b_force_xfer(res, &pos, b_data(&pos));
+	if (ret > 0) {
+		h3c->flags |= H3_CF_SETTINGS_SENT;
+		if (!(qcs->qcc->wait_event.events & SUB_RETRY_SEND))
+			tasklet_wakeup(qcs->qcc->wait_event.tasklet);
 	}
 
 	return ret;
@@ -770,74 +942,17 @@ static int h3_attach(struct qcs *qcs)
 	qcs->ctx = h3s;
 	h3s->demux_frame_len = 0;
 	h3s->demux_frame_type = 0;
+	h3s->flags = 0;
 
-	return 0;
-}
-
-/* Finalize the initialization of remotely initiated uni-stream <qcs>.
- * Return 1 if succeeded, 0 if not. In this latter case, set the ->err h3 error
- * to inform the QUIC mux layer of the encountered error.
- */
-static int h3_attach_ruqs(struct qcs *qcs, void *ctx)
-{
-	uint64_t strm_type;
-	struct h3 *h3 = ctx;
-	struct ncbuf *rxbuf = &qcs->rx.ncbuf;
-	struct buffer b;
-	size_t len = 0;
-
-	b = h3_b_dup(rxbuf);
-
-	/* First octets: the uni-stream type */
-	if (!b_quic_dec_int(&strm_type, &b, &len) || strm_type > H3_UNI_STRM_TP_MAX)
-		return 0;
-
-	qcs_consume(qcs, len);
-
-	/* Note that for all the uni-streams below, this is an error to receive two times the
-	 * same type of uni-stream (even for Push stream which is not supported at this time.
-	 */
-	switch (strm_type) {
-	case H3_UNI_STRM_TP_CONTROL_STREAM:
-		if (h3->rctrl.qcs) {
-			h3->err = H3_STREAM_CREATION_ERROR;
-			return 0;
-		}
-
-		h3->rctrl.qcs = qcs;
-		h3->rctrl.cb = h3_control_recv;
-		qcs_subscribe(qcs, SUB_RETRY_RECV, &h3->rctrl.wait_event);
-		break;
-	case H3_UNI_STRM_TP_PUSH_STREAM:
-		/* NOT SUPPORTED */
-		break;
-	case H3_UNI_STRM_TP_QPACK_ENCODER:
-		if (h3->rqpack_enc.qcs) {
-			h3->err = H3_STREAM_CREATION_ERROR;
-			return 0;
-		}
-
-		h3->rqpack_enc.qcs = qcs;
-		h3->rqpack_enc.cb = qpack_decode_enc;
-		qcs_subscribe(qcs, SUB_RETRY_RECV, &h3->rqpack_enc.wait_event);
-		break;
-	case H3_UNI_STRM_TP_QPACK_DECODER:
-		if (h3->rqpack_dec.qcs) {
-			h3->err = H3_STREAM_CREATION_ERROR;
-			return 0;
-		}
-
-		h3->rqpack_dec.qcs = qcs;
-		h3->rqpack_dec.cb = qpack_decode_dec;
-		qcs_subscribe(qcs, SUB_RETRY_RECV, &h3->rqpack_dec.wait_event);
-		break;
-	default:
-		/* Error */
-		h3->err = H3_STREAM_CREATION_ERROR;
-		return 0;
+	if (quic_stream_is_bidi(qcs->id)) {
+		h3s->type = H3S_T_REQ;
+	}
+	else {
+		/* stream type must be decoded for unidirectional streams */
+		h3s->type = H3S_T_UNKNOWN;
 	}
 
-	return 1;
+	return 0;
 }
 
 static void h3_detach(struct qcs *qcs)
@@ -849,87 +964,16 @@ static void h3_detach(struct qcs *qcs)
 
 static int h3_finalize(void *ctx)
 {
-	struct h3 *h3 = ctx;
+	struct h3c *h3c = ctx;
+	struct qcs *qcs;
 
-	h3->lctrl.qcs = qcs_new(h3->qcc, 0x3, QCS_SRV_UNI);
-	if (!h3->lctrl.qcs)
+	qcs = qcs_new(h3c->qcc, 0x3, QCS_SRV_UNI);
+	if (!qcs)
 		return 0;
 
-	/* Wakeup ->lctrl uni-stream */
-	h3_control_send(&h3->lctrl, h3);
+	h3_control_send(qcs, h3c);
 
 	return 1;
-}
-
-/* Tasklet dedicated to h3 incoming uni-streams */
-static struct task *h3_uqs_task(struct task *t, void *ctx, unsigned int state)
-{
-	struct h3_uqs *h3_uqs = ctx;
-	struct h3 *h3 = h3_uqs->qcs->qcc->ctx;
-
-	h3_uqs->cb(h3_uqs, h3);
-	return NULL;
-}
-
-/* Release all the tasklet attached to <h3_uqs> uni-stream */
-static inline void h3_uqs_tasklet_release(struct h3_uqs *h3_uqs)
-{
-	struct tasklet *t = h3_uqs->wait_event.tasklet;
-
-	if (t)
-		tasklet_free(t);
-}
-
-/* Release all the tasklet attached to <h3> uni-streams */
-static void h3_uqs_tasklets_release(struct h3 *h3)
-{
-	h3_uqs_tasklet_release(&h3->rqpack_enc);
-	h3_uqs_tasklet_release(&h3->rqpack_dec);
-	h3_uqs_tasklet_release(&h3->rctrl);
-}
-
-/* Tasklet dedicated to h3 outgoing uni-streams */
-__maybe_unused
-static struct task *h3_uqs_send_task(struct task *t, void *ctx, unsigned int state)
-{
-	struct h3_uqs *h3_uqs = ctx;
-	struct h3 *h3 = h3_uqs->qcs->qcc->ctx;
-
-	h3_uqs->cb(h3_uqs, h3);
-	return NULL;
-}
-
-/* Initialize <h3_uqs> uni-stream with <t> as tasklet */
-static int h3_uqs_init(struct h3_uqs *h3_uqs, struct h3 *h3,
-                       int (*cb)(struct h3_uqs *h3_uqs, void *ctx),
-                       struct task *(*t)(struct task *, void *, unsigned int))
-{
-	h3_uqs->qcs = NULL;
-	h3_uqs->cb = cb;
-	h3_uqs->wait_event.tasklet = tasklet_new();
-	if (!h3_uqs->wait_event.tasklet)
-		return 0;
-
-	h3_uqs->wait_event.tasklet->process = t;
-	h3_uqs->wait_event.tasklet->context = h3_uqs;
-	h3_uqs->wait_event.events = 0;
-	return 1;
-}
-
-static inline void h3_uqs_release(struct h3_uqs *h3_uqs)
-{
-	if (h3_uqs->qcs)
-		qcs_free(h3_uqs->qcs);
-}
-
-static inline void h3_uqs_release_all(struct h3 *h3)
-{
-	h3_uqs_tasklet_release(&h3->lctrl);
-	h3_uqs_release(&h3->lctrl);
-	h3_uqs_tasklet_release(&h3->lqpack_enc);
-	h3_uqs_release(&h3->lqpack_enc);
-	h3_uqs_tasklet_release(&h3->lqpack_dec);
-	h3_uqs_release(&h3->lqpack_dec);
 }
 
 /* Initialize the HTTP/3 context for <qcc> mux.
@@ -937,47 +981,29 @@ static inline void h3_uqs_release_all(struct h3 *h3)
  */
 static int h3_init(struct qcc *qcc)
 {
-	struct h3 *h3;
+	struct h3c *h3c;
 
-	h3 = pool_alloc(pool_head_h3);
-	if (!h3)
+	h3c = pool_alloc(pool_head_h3c);
+	if (!h3c)
 		goto fail_no_h3;
 
-	h3->qcc = qcc;
-	h3->err = H3_NO_ERROR;
-	h3->flags = 0;
+	h3c->qcc = qcc;
+	h3c->err = H3_NO_ERROR;
+	h3c->flags = 0;
 
-	if (!h3_uqs_init(&h3->rqpack_enc, h3, NULL, h3_uqs_task) ||
-	    !h3_uqs_init(&h3->rqpack_dec, h3, NULL, h3_uqs_task) ||
-	    !h3_uqs_init(&h3->rctrl, h3, h3_control_recv, h3_uqs_task))
-		goto fail_no_h3_ruqs;
-
-	if (!h3_uqs_init(&h3->lctrl, h3, h3_control_send, h3_uqs_task) ||
-	    !h3_uqs_init(&h3->lqpack_enc, h3, NULL, h3_uqs_task) ||
-	    !h3_uqs_init(&h3->lqpack_dec, h3, NULL, h3_uqs_task))
-		goto fail_no_h3_luqs;
-
-	qcc->ctx = h3;
-	LIST_INIT(&h3->buf_wait.list);
+	qcc->ctx = h3c;
+	LIST_INIT(&h3c->buf_wait.list);
 
 	return 1;
 
- fail_no_h3_ruqs:
-	h3_uqs_release_all(h3);
- fail_no_h3_luqs:
-	h3_uqs_tasklets_release(h3);
-	pool_free(pool_head_h3, h3);
  fail_no_h3:
 	return 0;
 }
 
 static void h3_release(void *ctx)
 {
-	struct h3 *h3 = ctx;
-
-	h3_uqs_release_all(h3);
-	h3_uqs_tasklets_release(h3);
-	pool_free(pool_head_h3, h3);
+	struct h3c *h3c = ctx;
+	pool_free(pool_head_h3c, h3c);
 }
 
 /* Check if the H3 connection can still be considered as active.
@@ -996,7 +1022,6 @@ static int h3_is_active(const struct qcc *qcc, void *ctx)
 const struct qcc_app_ops h3_ops = {
 	.init        = h3_init,
 	.attach      = h3_attach,
-	.attach_ruqs = h3_attach_ruqs,
 	.decode_qcs  = h3_decode_qcs,
 	.snd_buf     = h3_snd_buf,
 	.detach      = h3_detach,
