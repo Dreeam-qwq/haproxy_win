@@ -17,9 +17,9 @@
 #include <haproxy/clock.h>
 #include <haproxy/channel.h>
 #include <haproxy/cli.h>
-#include <haproxy/conn_stream.h>
-#include <haproxy/cs_utils.h>
 #include <haproxy/freq_ctr.h>
+#include <haproxy/sc_strm.h>
+#include <haproxy/stconn.h>
 #include <haproxy/tools.h>
 #include <haproxy/xxhash.h>
 
@@ -621,13 +621,13 @@ static int cli_io_handler_show_profiling(struct appctx *appctx)
 	unsigned long long tot_alloc_calls, tot_free_calls;
 	unsigned long long tot_alloc_bytes, tot_free_bytes;
 #endif
-	struct conn_stream *cs = appctx_cs(appctx);
+	struct stconn *sc = appctx_sc(appctx);
 	struct buffer *name_buffer = get_trash_chunk();
 	const char *str;
 	int max_lines;
 	int i, max;
 
-	if (unlikely(cs_ic(cs)->flags & (CF_WRITE_ERROR|CF_SHUTW)))
+	if (unlikely(sc_ic(sc)->flags & (CF_WRITE_ERROR|CF_SHUTW)))
 		return 1;
 
 	chunk_reset(&trash);
@@ -647,9 +647,8 @@ static int cli_io_handler_show_profiling(struct appctx *appctx)
 	             "Memory usage profiling              : %-8s      # set profiling memory {on|off}\n",
 	             str, (profiling & HA_PROF_MEMORY) ? "on" : "off");
 
-	if (ci_putchk(cs_ic(cs), &trash) == -1) {
+	if (applet_putchk(appctx, &trash) == -1) {
 		/* failed, try again */
-		cs_rx_room_blk(cs);
 		return 0;
 	}
 
@@ -697,16 +696,14 @@ static int cli_io_handler_show_profiling(struct appctx *appctx)
 		print_time_short(&trash, "   ", tmp_activity[i].lat_time, "");
 		print_time_short(&trash, "   ", tmp_activity[i].lat_time / tmp_activity[i].calls, "\n");
 
-		if (ci_putchk(cs_ic(cs), &trash) == -1) {
+		if (applet_putchk(appctx, &trash) == -1) {
 			/* failed, try again */
-			cs_rx_room_blk(cs);
 			return 0;
 		}
 	}
 
-	if (ci_putchk(cs_ic(cs), &trash) == -1) {
+	if (applet_putchk(appctx, &trash) == -1) {
 		/* failed, try again */
-		cs_rx_room_blk(cs);
 		return 0;
 	}
 
@@ -762,16 +759,12 @@ static int cli_io_handler_show_profiling(struct appctx *appctx)
 
 		chunk_appendf(&trash, "\n");
 
-		if (ci_putchk(cs_ic(cs), &trash) == -1) {
-			cs_rx_room_blk(cs);
+		if (applet_putchk(appctx, &trash) == -1)
 			return 0;
-		}
 	}
 
-	if (ci_putchk(cs_ic(cs), &trash) == -1) {
-		cs_rx_room_blk(cs);
+	if (applet_putchk(appctx, &trash) == -1)
 		return 0;
-	}
 
 	tot_alloc_calls = tot_free_calls = tot_alloc_bytes = tot_free_bytes = 0;
 	for (i = 0; i < max_lines; i++) {
@@ -789,10 +782,8 @@ static int cli_io_handler_show_profiling(struct appctx *appctx)
 		      tot_alloc_calls - tot_free_calls,
 		      tot_alloc_bytes - tot_free_bytes);
 
-	if (ci_putchk(cs_ic(cs), &trash) == -1) {
-		cs_rx_room_blk(cs);
+	if (applet_putchk(appctx, &trash) == -1)
 		return 0;
-	}
 
 	ctx->linenum = 0; // reset first line to dump
 	if ((ctx->dump_step & 4) == 0)
@@ -849,7 +840,7 @@ static int cli_parse_show_profiling(char **args, char *payload, struct appctx *a
 static int cli_io_handler_show_tasks(struct appctx *appctx)
 {
 	struct sched_activity tmp_activity[256] __attribute__((aligned(64)));
-	struct conn_stream *cs = appctx_cs(appctx);
+	struct stconn *sc = appctx_sc(appctx);
 	struct buffer *name_buffer = get_trash_chunk();
 	struct sched_activity *entry;
 	const struct tasklet *tl;
@@ -860,7 +851,7 @@ static int cli_io_handler_show_tasks(struct appctx *appctx)
 	int thr, queue;
 	int i, max;
 
-	if (unlikely(cs_ic(cs)->flags & (CF_WRITE_ERROR|CF_SHUTW)))
+	if (unlikely(sc_ic(sc)->flags & (CF_WRITE_ERROR|CF_SHUTW)))
 		return 1;
 
 	/* It's not possible to scan queues in small chunks and yield in the
@@ -976,9 +967,8 @@ static int cli_io_handler_show_tasks(struct appctx *appctx)
 		print_time_short(&trash, "   ", tmp_activity[i].lat_time / tmp_activity[i].calls, "\n");
 	}
 
-	if (ci_putchk(cs_ic(cs), &trash) == -1) {
+	if (applet_putchk(appctx, &trash) == -1) {
 		/* failed, try again */
-		cs_rx_room_blk(cs);
 		return 0;
 	}
 	return 1;

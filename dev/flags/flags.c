@@ -3,7 +3,7 @@
 
 #include <haproxy/channel-t.h>
 #include <haproxy/connection-t.h>
-#include <haproxy/conn_stream-t.h>
+#include <haproxy/stconn-t.h>
 #include <haproxy/http_ana-t.h>
 #include <haproxy/stream-t.h>
 #include <haproxy/task-t.h>
@@ -12,16 +12,16 @@
 #define SHOW_AS_ANA   0x00000001
 #define SHOW_AS_CHN   0x00000002
 #define SHOW_AS_CONN  0x00000004
-#define SHOW_AS_CS    0x00000008
+#define SHOW_AS_SC    0x00000008
 #define SHOW_AS_SET   0x00000010
 #define SHOW_AS_STRM  0x00000020
 #define SHOW_AS_TASK  0x00000040
 #define SHOW_AS_TXN   0x00000080
-#define SHOW_AS_ENDP  0x00000100
+#define SHOW_AS_SD    0x00000100
 
 // command line names, must be in exact same order as the SHOW_AS_* flags above
 // so that show_as_words[i] matches flag 1U<<i.
-const char *show_as_words[] = { "ana", "chn", "conn", "cs", "siet", "strm", "task", "txn", "endp", };
+const char *show_as_words[] = { "ana", "chn", "conn", "sc", "stet", "strm", "task", "txn", "sd", };
 
 #define SHOW_FLAG(f,n)					\
 	do {				 		\
@@ -176,59 +176,58 @@ void show_conn_flags(unsigned int f)
 	putchar('\n');
 }
 
-void show_endp_flags(unsigned int f)
+void show_sd_flags(unsigned int f)
 {
-	printf("endp->flags = ");
+	printf("sd->flags   = ");
 	if (!f) {
 		printf("0\n");
 		return;
 	}
 
-	SHOW_FLAG(f, CS_EP_RXBLK_CHAN);
-	SHOW_FLAG(f, CS_EP_RXBLK_BUFF);
-	SHOW_FLAG(f, CS_EP_RXBLK_ROOM);
-	SHOW_FLAG(f, CS_EP_RXBLK_SHUT);
-	SHOW_FLAG(f, CS_EP_RXBLK_CONN);
-	SHOW_FLAG(f, CS_EP_RX_WAIT_EP);
-	SHOW_FLAG(f, CS_EP_WANT_GET);
-	SHOW_FLAG(f, CS_EP_WAIT_DATA);
-	SHOW_FLAG(f, CS_EP_KILL_CONN);
-	SHOW_FLAG(f, CS_EP_WAIT_FOR_HS);
-	SHOW_FLAG(f, CS_EP_WANT_ROOM);
-	SHOW_FLAG(f, CS_EP_ERROR);
-	SHOW_FLAG(f, CS_EP_ERR_PENDING);
-	SHOW_FLAG(f, CS_EP_EOS);
-	SHOW_FLAG(f, CS_EP_EOI);
-	SHOW_FLAG(f, CS_EP_RCV_MORE);
-	SHOW_FLAG(f, CS_EP_MAY_SPLICE);
-	SHOW_FLAG(f, CS_EP_WEBSOCKET);
-	SHOW_FLAG(f, CS_EP_NOT_FIRST);
-	SHOW_FLAG(f, CS_EP_SHWS);
-	SHOW_FLAG(f, CS_EP_SHWN);
-	SHOW_FLAG(f, CS_EP_SHRR);
-	SHOW_FLAG(f, CS_EP_SHRD);
-	SHOW_FLAG(f, CS_EP_ORPHAN);
-	SHOW_FLAG(f, CS_EP_DETACHED);
-	SHOW_FLAG(f, CS_EP_T_APPLET);
-	SHOW_FLAG(f, CS_EP_T_MUX);
+	SHOW_FLAG(f, SE_FL_APPLET_NEED_CONN);
+	SHOW_FLAG(f, SE_FL_HAVE_NO_DATA);
+	SHOW_FLAG(f, SE_FL_WONT_CONSUME);
+	SHOW_FLAG(f, SE_FL_WAIT_DATA);
+	SHOW_FLAG(f, SE_FL_KILL_CONN);
+	SHOW_FLAG(f, SE_FL_WAIT_FOR_HS);
+	SHOW_FLAG(f, SE_FL_WANT_ROOM);
+	SHOW_FLAG(f, SE_FL_RCV_MORE);
+	SHOW_FLAG(f, SE_FL_MAY_SPLICE);
+	SHOW_FLAG(f, SE_FL_ERR_PENDING);
+	SHOW_FLAG(f, SE_FL_ERROR);
+	SHOW_FLAG(f, SE_FL_EOS);
+	SHOW_FLAG(f, SE_FL_EOI);
+	SHOW_FLAG(f, SE_FL_WEBSOCKET);
+	SHOW_FLAG(f, SE_FL_NOT_FIRST);
+	SHOW_FLAG(f, SE_FL_SHWS);
+	SHOW_FLAG(f, SE_FL_SHWN);
+	SHOW_FLAG(f, SE_FL_SHRR);
+	SHOW_FLAG(f, SE_FL_SHRD);
+	SHOW_FLAG(f, SE_FL_ORPHAN);
+	SHOW_FLAG(f, SE_FL_DETACHED);
+	SHOW_FLAG(f, SE_FL_T_APPLET);
+	SHOW_FLAG(f, SE_FL_T_MUX);
 
 	if (f) {
 		printf("EXTRA(0x%08x)", f);
 	}
 	putchar('\n');
 }
-void show_cs_flags(unsigned int f)
+void show_sc_flags(unsigned int f)
 {
-	printf("cs->flags = ");
+	printf("sc->flags   = ");
 	if (!f) {
 		printf("0\n");
 		return;
 	}
-	SHOW_FLAG(f, CS_FL_INDEP_STR);
-	SHOW_FLAG(f, CS_FL_DONT_WAKE);
-	SHOW_FLAG(f, CS_FL_NOLINGER);
-	SHOW_FLAG(f, CS_FL_NOHALF);
-	SHOW_FLAG(f, CS_FL_ISBACK);
+	SHOW_FLAG(f, SC_FL_NEED_ROOM);
+	SHOW_FLAG(f, SC_FL_NEED_BUFF);
+	SHOW_FLAG(f, SC_FL_WONT_READ);
+	SHOW_FLAG(f, SC_FL_INDEP_STR);
+	SHOW_FLAG(f, SC_FL_DONT_WAKE);
+	SHOW_FLAG(f, SC_FL_NOHALF);
+	SHOW_FLAG(f, SC_FL_NOLINGER);
+	SHOW_FLAG(f, SC_FL_ISBACK);
 
 	if (f) {
 		printf("EXTRA(0x%08x)", f);
@@ -409,7 +408,7 @@ void show_strm_flags(unsigned int f)
 
 void usage_exit(const char *name)
 {
-	fprintf(stderr, "Usage: %s [ana|chn|conn|cs|si|sierr|strm|task|txn]* { [+-][0x]value* | - }\n", name);
+	fprintf(stderr, "Usage: %s [ana|chn|conn|sc|si|sierr|strm|task|txn]* { [+-][0x]value* | - }\n", name);
 	exit(1);
 }
 
@@ -478,8 +477,8 @@ int main(int argc, char **argv)
 		if (show_as & SHOW_AS_ANA)   show_chn_ana(flags);
 		if (show_as & SHOW_AS_CHN)   show_chn_flags(flags);
 		if (show_as & SHOW_AS_CONN)  show_conn_flags(flags);
-		if (show_as & SHOW_AS_CS)    show_cs_flags(flags);
-		if (show_as & SHOW_AS_ENDP)  show_endp_flags(flags);
+		if (show_as & SHOW_AS_SC)    show_sc_flags(flags);
+		if (show_as & SHOW_AS_SD)    show_sd_flags(flags);
 		if (show_as & SHOW_AS_SET)   show_strm_et(flags);
 		if (show_as & SHOW_AS_STRM)  show_strm_flags(flags);
 		if (show_as & SHOW_AS_TASK)  show_task_state(flags);

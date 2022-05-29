@@ -24,13 +24,13 @@
 
 #include <haproxy/action-t.h>
 #include <haproxy/api.h>
-#include <haproxy/conn_stream.h>
 #include <haproxy/fd.h>
 #include <haproxy/freq_ctr.h>
 #include <haproxy/obj_type.h>
 #include <haproxy/pool-t.h>
 #include <haproxy/queue.h>
 #include <haproxy/session.h>
+#include <haproxy/stconn.h>
 #include <haproxy/stick_table.h>
 #include <haproxy/stream-t.h>
 #include <haproxy/task-t.h>
@@ -59,9 +59,9 @@ extern struct pool_head *pool_head_uniqueid;
 
 extern struct data_cb sess_conn_cb;
 
-struct stream *stream_new(struct session *sess, struct conn_stream *cs, struct buffer *input);
+struct stream *stream_new(struct session *sess, struct stconn *sc, struct buffer *input);
 void stream_free(struct stream *s);
-int stream_upgrade_from_cs(struct conn_stream *cs, struct buffer *input);
+int stream_upgrade_from_sc(struct stconn *sc, struct buffer *input);
 int stream_set_http_mode(struct stream *s, const struct mux_proto_list *mux_proto);
 
 /* kill a stream and set the termination flags to <why> (one of SF_ERR_*) */
@@ -74,7 +74,7 @@ struct ist stream_generate_unique_id(struct stream *strm, struct list *format);
 void stream_process_counters(struct stream *s);
 void sess_change_server(struct stream *strm, struct server *newsrv);
 struct task *process_stream(struct task *t, void *context, unsigned int state);
-void default_srv_error(struct stream *s, struct conn_stream *cs);
+void default_srv_error(struct stream *s, struct stconn *sc);
 
 /* Update the stream's backend and server time stats */
 void stream_update_time_stats(struct stream *s);
@@ -339,14 +339,14 @@ static inline void stream_choose_redispatch(struct stream *s)
 		if (may_dequeue_tasks(objt_server(s->target), s->be))
 			process_srv_queue(objt_server(s->target));
 
-		sockaddr_free(&s->csb->dst);
+		sockaddr_free(&s->scb->dst);
 		s->flags &= ~(SF_DIRECT | SF_ASSIGNED);
-		s->csb->state = CS_ST_REQ;
+		s->scb->state = SC_ST_REQ;
 	} else {
 		if (objt_server(s->target))
 			_HA_ATOMIC_INC(&__objt_server(s->target)->counters.retries);
 		_HA_ATOMIC_INC(&s->be->be_counters.retries);
-		s->csb->state = CS_ST_ASS;
+		s->scb->state = SC_ST_ASS;
 	}
 
 }

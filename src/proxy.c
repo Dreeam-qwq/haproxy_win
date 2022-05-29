@@ -25,8 +25,6 @@
 #include <haproxy/capture-t.h>
 #include <haproxy/cfgparse.h>
 #include <haproxy/cli.h>
-#include <haproxy/conn_stream.h>
-#include <haproxy/cs_utils.h>
 #include <haproxy/errors.h>
 #include <haproxy/fd.h>
 #include <haproxy/filters.h>
@@ -41,9 +39,11 @@
 #include <haproxy/protocol.h>
 #include <haproxy/proto_tcp.h>
 #include <haproxy/proxy.h>
+#include <haproxy/sc_strm.h>
 #include <haproxy/server-t.h>
 #include <haproxy/signal.h>
 #include <haproxy/stats-t.h>
+#include <haproxy/stconn.h>
 #include <haproxy/stream.h>
 #include <haproxy/task.h>
 #include <haproxy/tcpcheck.h>
@@ -2358,12 +2358,12 @@ int stream_set_backend(struct stream *s, struct proxy *be)
 	proxy_inc_be_ctr(be);
 
 	/* assign new parameters to the stream from the new backend */
-	s->csb->flags &= ~CS_FL_INDEP_STR;
+	s->scb->flags &= ~SC_FL_INDEP_STR;
 	if (be->options2 & PR_O2_INDEPSTR)
-		s->csb->flags |= CS_FL_INDEP_STR;
+		s->scb->flags |= SC_FL_INDEP_STR;
 
 	if (tick_isset(be->timeout.serverfin))
-		s->csb->hcto = be->timeout.serverfin;
+		s->scb->hcto = be->timeout.serverfin;
 
 	/* We want to enable the backend-specific analysers except those which
 	 * were already run as part of the frontend/listener. Note that it would
@@ -2706,9 +2706,9 @@ static void dump_server_addr(const struct sockaddr_storage *addr, char *addr_str
  * ->px, the proxy's id ->only_pxid, the server's pointer from ->sv, and the
  * choice of what to dump from ->show_conn.
  */
-static int dump_servers_state(struct conn_stream *cs)
+static int dump_servers_state(struct stconn *sc)
 {
-	struct appctx *appctx = __cs_appctx(cs);
+	struct appctx *appctx = __sc_appctx(sc);
 	struct show_srv_ctx *ctx = appctx->svcctx;
 	struct proxy *px = ctx->px;
 	struct server *srv;
@@ -2772,8 +2772,7 @@ static int dump_servers_state(struct conn_stream *cs)
 			chunk_appendf(&trash, "\n");
 		}
 
-		if (ci_putchk(cs_ic(cs), &trash) == -1) {
-			cs_rx_room_blk(cs);
+		if (applet_putchk(appctx, &trash) == -1) {
 			return 0;
 		}
 	}
@@ -2787,7 +2786,7 @@ static int dump_servers_state(struct conn_stream *cs)
 static int cli_io_handler_servers_state(struct appctx *appctx)
 {
 	struct show_srv_ctx *ctx = appctx->svcctx;
-	struct conn_stream *cs = appctx_cs(appctx);
+	struct stconn *sc = appctx_sc(appctx);
 	struct proxy *curproxy;
 
 	if (ctx->state == SHOW_SRV_HEAD) {
@@ -2798,10 +2797,9 @@ static int cli_io_handler_servers_state(struct appctx *appctx)
 			             "# bkname/svname bkid/svid addr port - purge_delay used_cur used_max need_est unsafe_nb safe_nb idle_lim idle_cur idle_per_thr[%d]\n",
 			             global.nbthread);
 
-		if (ci_putchk(cs_ic(cs), &trash) == -1) {
-			cs_rx_room_blk(cs);
+		if (applet_putchk(appctx, &trash) == -1)
 			return 0;
-		}
+
 		ctx->state = SHOW_SRV_LIST;
 
 		if (!ctx->px)
@@ -2812,7 +2810,7 @@ static int cli_io_handler_servers_state(struct appctx *appctx)
 		curproxy = ctx->px;
 		/* servers are only in backends */
 		if ((curproxy->cap & PR_CAP_BE) && !(curproxy->cap & PR_CAP_INT)) {
-			if (!dump_servers_state(cs))
+			if (!dump_servers_state(sc))
 				return 0;
 		}
 		/* only the selected proxy is dumped */
@@ -2828,17 +2826,15 @@ static int cli_io_handler_servers_state(struct appctx *appctx)
  */
 static int cli_io_handler_show_backend(struct appctx *appctx)
 {
-	struct conn_stream *cs = appctx_cs(appctx);
 	struct proxy *curproxy;
 
 	chunk_reset(&trash);
 
 	if (!appctx->svcctx) {
 		chunk_printf(&trash, "# name\n");
-		if (ci_putchk(cs_ic(cs), &trash) == -1) {
-			cs_rx_room_blk(cs);
+		if (applet_putchk(appctx, &trash) == -1)
 			return 0;
-		}
+
 		appctx->svcctx = proxies_list;
 	}
 
@@ -2850,10 +2846,8 @@ static int cli_io_handler_show_backend(struct appctx *appctx)
 			continue;
 
 		chunk_appendf(&trash, "%s\n", curproxy->id);
-		if (ci_putchk(cs_ic(cs), &trash) == -1) {
-			cs_rx_room_blk(cs);
+		if (applet_putchk(appctx, &trash) == -1)
 			return 0;
-		}
 	}
 
 	return 1;
@@ -3137,17 +3131,17 @@ static int cli_parse_show_errors(char **args, char *payload, struct appctx *appc
 	return 0;
 }
 
-/* This function dumps all captured errors onto the conn-stream's
+/* This function dumps all captured errors onto the stream connector's
  * read buffer. It returns 0 if the output buffer is full and it needs
  * to be called again, otherwise non-zero.
  */
 static int cli_io_handler_show_errors(struct appctx *appctx)
 {
 	struct show_errors_ctx *ctx = appctx->svcctx;
-	struct conn_stream *cs = appctx_cs(appctx);
+	struct stconn *sc = appctx_sc(appctx);
 	extern const char *monthname[12];
 
-	if (unlikely(cs_ic(cs)->flags & (CF_WRITE_ERROR|CF_SHUTW)))
+	if (unlikely(sc_ic(sc)->flags & (CF_WRITE_ERROR|CF_SHUTW)))
 		return 1;
 
 	chunk_reset(&trash);
@@ -3164,7 +3158,7 @@ static int cli_io_handler_show_errors(struct appctx *appctx)
 			     tm.tm_hour, tm.tm_min, tm.tm_sec, (int)(date.tv_usec/1000),
 			     error_snapshot_id);
 
-		if (ci_putchk(cs_ic(cs), &trash) == -1)
+		if (applet_putchk(appctx, &trash) == -1)
 			goto cant_send;
 
 		ctx->px = proxies_list;
@@ -3254,7 +3248,7 @@ static int cli_io_handler_show_errors(struct appctx *appctx)
 
 			chunk_appendf(&trash, "  \n");
 
-			if (ci_putchk(cs_ic(cs), &trash) == -1)
+			if (applet_putchk(appctx, &trash) == -1)
 				goto cant_send_unlock;
 
 			ctx->ptr = 0;
@@ -3265,7 +3259,7 @@ static int cli_io_handler_show_errors(struct appctx *appctx)
 			/* the snapshot changed while we were dumping it */
 			chunk_appendf(&trash,
 				     "  WARNING! update detected on this snapshot, dump interrupted. Please re-check!\n");
-			if (ci_putchk(cs_ic(cs), &trash) == -1)
+			if (applet_putchk(appctx, &trash) == -1)
 				goto cant_send_unlock;
 
 			goto next;
@@ -3281,7 +3275,7 @@ static int cli_io_handler_show_errors(struct appctx *appctx)
 			if (newptr == ctx->ptr)
 				goto cant_send_unlock;
 
-			if (ci_putchk(cs_ic(cs), &trash) == -1)
+			if (applet_putchk(appctx, &trash) == -1)
 				goto cant_send_unlock;
 
 			ctx->ptr = newptr;
@@ -3302,7 +3296,7 @@ static int cli_io_handler_show_errors(struct appctx *appctx)
  cant_send_unlock:
 	HA_RWLOCK_RDUNLOCK(PROXY_LOCK, &ctx->px->lock);
  cant_send:
-	cs_rx_room_blk(cs);
+	sc_need_room(sc);
 	return 0;
 }
 

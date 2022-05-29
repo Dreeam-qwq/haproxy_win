@@ -51,8 +51,6 @@
 #include <haproxy/chunk.h>
 #include <haproxy/cli.h>
 #include <haproxy/connection.h>
-#include <haproxy/conn_stream.h>
-#include <haproxy/cs_utils.h>
 #include <haproxy/dynbuf.h>
 #include <haproxy/errors.h>
 #include <haproxy/fd.h>
@@ -65,14 +63,16 @@
 #include <haproxy/pattern-t.h>
 #include <haproxy/proto_tcp.h>
 #include <haproxy/proxy.h>
+#include <haproxy/sample.h>
+#include <haproxy/sc_strm.h>
 #include <haproxy/server.h>
 #include <haproxy/shctx.h>
 #include <haproxy/ssl_ckch.h>
 #include <haproxy/ssl_crtlist.h>
 #include <haproxy/ssl_sock.h>
 #include <haproxy/ssl_utils.h>
-#include <haproxy/sample.h>
 #include <haproxy/stats.h>
+#include <haproxy/stconn.h>
 #include <haproxy/stream-t.h>
 #include <haproxy/task.h>
 #include <haproxy/ticks.h>
@@ -7259,7 +7259,6 @@ struct tls_keys_ref *tlskeys_ref_lookup_ref(const char *reference)
 static int cli_io_handler_tlskeys_files(struct appctx *appctx)
 {
 	struct show_keys_ctx *ctx = appctx->svcctx;
-	struct conn_stream *cs = appctx_cs(appctx);
 
 	switch (ctx->state) {
 	case SHOW_KEYS_INIT:
@@ -7274,10 +7273,8 @@ static int cli_io_handler_tlskeys_files(struct appctx *appctx)
 		else
 			chunk_appendf(&trash, "# id (file)\n");
 
-		if (ci_putchk(cs_ic(cs), &trash) == -1) {
-			cs_rx_room_blk(cs);
+		if (applet_putchk(appctx, &trash) == -1)
 			return 0;
-		}
 
 		/* Now, we start the browsing of the references lists.
 		 * Note that the following call to LIST_ELEM return bad pointer. The only
@@ -7330,12 +7327,11 @@ static int cli_io_handler_tlskeys_files(struct appctx *appctx)
 						chunk_appendf(&trash, "%d.%d <unknown>\n", ref->unique_id, ctx->next_index);
 					}
 
-					if (ci_putchk(cs_ic(cs), &trash) == -1) {
+					if (applet_putchk(appctx, &trash) == -1) {
 						/* let's try again later from this stream. We add ourselves into
 						 * this stream's users so that it can remove us upon termination.
 						 */
 						HA_RWLOCK_RDUNLOCK(TLSKEYS_REF_LOCK, &ref->lock);
-						cs_rx_room_blk(cs);
 						return 0;
 					}
 					ctx->next_index++;
@@ -7343,11 +7339,10 @@ static int cli_io_handler_tlskeys_files(struct appctx *appctx)
 				HA_RWLOCK_RDUNLOCK(TLSKEYS_REF_LOCK, &ref->lock);
 				ctx->next_index = 0;
 			}
-			if (ci_putchk(cs_ic(cs), &trash) == -1) {
+			if (applet_putchk(appctx, &trash) == -1) {
 				/* let's try again later from this stream. We add ourselves into
 				 * this stream's users so that it can remove us upon termination.
 				 */
-				cs_rx_room_blk(cs);
 				return 0;
 			}
 
@@ -7538,7 +7533,6 @@ static int cli_io_handler_show_ocspresponse(struct appctx *appctx)
 	struct buffer *trash = alloc_trash_chunk();
 	struct buffer *tmp = NULL;
 	struct ebmb_node *node;
-	struct conn_stream *cs = appctx_cs(appctx);
 	struct certificate_ocsp *ocsp = NULL;
 	BIO *bio = NULL;
 	int write = -1;
@@ -7593,10 +7587,8 @@ static int cli_io_handler_show_ocspresponse(struct appctx *appctx)
 		chunk_appendf(trash, "%s\n", tmp->area);
 
 		node = ebmb_next(node);
-		if (ci_putchk(cs_ic(cs), trash) == -1) {
-			cs_rx_room_blk(cs);
+		if (applet_putchk(appctx, trash) == -1)
 			goto yield;
-		}
 	}
 
 end:
@@ -7674,7 +7666,6 @@ static void ssl_provider_clear_name_list(struct list *provider_names)
 static int cli_io_handler_show_providers(struct appctx *appctx)
 {
 	struct buffer *trash = get_trash_chunk();
-	struct conn_stream *cs = appctx_cs(appctx);
 	struct list provider_names;
 	struct provider_name *name;
 
@@ -7690,10 +7681,8 @@ static int cli_io_handler_show_providers(struct appctx *appctx)
 
 	ssl_provider_clear_name_list(&provider_names);
 
-	if (ci_putchk(cs_ic(cs), trash) == -1) {
-		cs_rx_room_blk(cs);
+	if (applet_putchk(appctx, trash) == -1)
 		goto yield;
-	}
 
 	return 1;
 
@@ -7805,7 +7794,6 @@ static int cli_io_handler_show_ocspresponse_detail(struct appctx *appctx)
 {
 	struct buffer *trash = alloc_trash_chunk();
 	struct certificate_ocsp *ocsp = appctx->svcctx;
-	struct conn_stream *cs = appctx_cs(appctx);
 
 	if (trash == NULL)
 		return 1;
@@ -7815,10 +7803,8 @@ static int cli_io_handler_show_ocspresponse_detail(struct appctx *appctx)
 		return 1;
 	}
 
-	if (ci_putchk(cs_ic(cs), trash) == -1) {
-		cs_rx_room_blk(cs);
+	if (applet_putchk(appctx, trash) == -1)
 		goto yield;
-	}
 
 	appctx->svcctx = NULL;
 	if (trash)
@@ -7882,14 +7868,12 @@ enum act_return ssl_action_wait_for_hs(struct act_rule *rule, struct proxy *px,
                                        struct session *sess, struct stream *s, int flags)
 {
 	struct connection *conn;
-	struct conn_stream *cs;
 
 	conn = objt_conn(sess->origin);
-	cs = s->csf;
 
-	if (conn && cs) {
+	if (conn) {
 		if (conn->flags & (CO_FL_EARLY_SSL_HS | CO_FL_SSL_WAIT_HS)) {
-			cs->endp->flags |= CS_EP_WAIT_FOR_HS;
+			sc_ep_set(s->scf, SE_FL_WAIT_FOR_HS);
 			s->req.flags |= CF_READ_NULL;
 			return ACT_RET_YIELD;
 		}

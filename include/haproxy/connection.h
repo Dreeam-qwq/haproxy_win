@@ -27,7 +27,7 @@
 #include <haproxy/api.h>
 #include <haproxy/buf.h>
 #include <haproxy/connection-t.h>
-#include <haproxy/conn_stream-t.h>
+#include <haproxy/stconn-t.h>
 #include <haproxy/fd.h>
 #include <haproxy/list.h>
 #include <haproxy/listener-t.h>
@@ -491,6 +491,24 @@ static inline int conn_install_mux(struct connection *conn, const struct mux_ops
 		conn->ctx = NULL;
 	}
 	return ret;
+}
+
+/* Retrieves any valid stream connector from this connection, preferably the first
+ * valid one. The purpose is to be able to figure one other end of a private
+ * connection for purposes like source binding or proxy protocol header
+ * emission. In such cases, any stream connector is expected to be valid so the
+ * mux is encouraged to return the first one it finds. If the connection has
+ * no mux or the mux has no get_first_sc() method or the mux has no valid
+ * stream connector, NULL is returned. The output pointer is purposely marked
+ * const to discourage the caller from modifying anything there.
+ */
+static inline struct stconn *conn_get_first_sc(const struct connection *conn)
+{
+	BUG_ON(!conn || !conn->mux);
+
+	if (!conn->mux->get_first_sc)
+		return NULL;
+	return conn->mux->get_first_sc(conn);
 }
 
 int conn_update_alpn(struct connection *conn, const struct ist alpn, int force);

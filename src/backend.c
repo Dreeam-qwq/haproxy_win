@@ -27,8 +27,6 @@
 #include <haproxy/backend.h>
 #include <haproxy/channel.h>
 #include <haproxy/check.h>
-#include <haproxy/conn_stream.h>
-#include <haproxy/cs_utils.h>
 #include <haproxy/frontend.h>
 #include <haproxy/global.h>
 #include <haproxy/hash.h>
@@ -50,9 +48,11 @@
 #include <haproxy/proxy.h>
 #include <haproxy/queue.h>
 #include <haproxy/sample.h>
+#include <haproxy/sc_strm.h>
 #include <haproxy/server.h>
 #include <haproxy/session.h>
 #include <haproxy/ssl_sock.h>
+#include <haproxy/stconn.h>
 #include <haproxy/stream.h>
 #include <haproxy/task.h>
 #include <haproxy/ticks.h>
@@ -733,7 +733,7 @@ int assign_server(struct stream *s)
 				const struct sockaddr_storage *src;
 
 			case BE_LB_HASH_SRC:
-				src = cs_src(s->csf);
+				src = sc_src(s->scf);
 				if (src && src->ss_family == AF_INET) {
 					srv = get_server_sh(s->be,
 							    (void *)&((struct sockaddr_in *)src)->sin_addr,
@@ -894,7 +894,7 @@ static int alloc_dst_address(struct sockaddr_storage **ss,
 			 * locally on multiple addresses at once. Nothing is done
 			 * for AF_UNIX addresses.
 			 */
-			dst = cs_dst(s->csf);
+			dst = sc_dst(s->scf);
 			if (dst && dst->ss_family == AF_INET) {
 				((struct sockaddr_in *)*ss)->sin_family = AF_INET;
 				((struct sockaddr_in *)*ss)->sin_addr =
@@ -911,7 +911,7 @@ static int alloc_dst_address(struct sockaddr_storage **ss,
 		if ((srv->flags & SRV_F_MAPPORTS)) {
 			int base_port;
 
-			dst = cs_dst(s->csf);
+			dst = sc_dst(s->scf);
 			if (dst) {
 				/* First, retrieve the port from the incoming connection */
 				base_port = get_host_port(dst);
@@ -934,7 +934,7 @@ static int alloc_dst_address(struct sockaddr_storage **ss,
 			return SRV_STATUS_INTERNAL;
 
 		/* in transparent mode, use the original dest addr if no dispatch specified */
-		dst = cs_dst(s->csf);
+		dst = sc_dst(s->scf);
 		if (dst && (dst->ss_family == AF_INET || dst->ss_family == AF_INET6))
 			**ss = *dst;
 	}
@@ -1111,7 +1111,7 @@ static int alloc_bind_address(struct sockaddr_storage **ss,
 	case CO_SRC_TPROXY_CLI:
 	case CO_SRC_TPROXY_CIP:
 		/* FIXME: what can we do if the client connects in IPv6 or unix socket ? */
-		addr = cs_src(s->csf);
+		addr = sc_src(s->scf);
 		if (!addr)
 			return SRV_STATUS_INTERNAL;
 
@@ -1294,7 +1294,7 @@ static int do_connect_server(struct stream *s, struct connection *conn)
 			return ret;
 
 		/* we're in the process of establishing a connection */
-		s->csb->state = CS_ST_CON;
+		s->scb->state = SC_ST_CON;
 	}
 	else {
 		/* try to reuse the existing connection, it will be
@@ -1302,9 +1302,9 @@ static int do_connect_server(struct stream *s, struct connection *conn)
 		 */
 		/* Is the connection really ready ? */
 		if (conn->mux->ctl(conn, MUX_STATUS, NULL) & MUX_STATUS_READY)
-			s->csb->state = CS_ST_RDY;
+			s->scb->state = SC_ST_RDY;
 		else
-			s->csb->state = CS_ST_CON;
+			s->scb->state = SC_ST_CON;
 	}
 
 	/* needs src ip/port for logging */
@@ -1316,7 +1316,7 @@ static int do_connect_server(struct stream *s, struct connection *conn)
 
 /*
  * This function initiates a connection to the server assigned to this stream
- * (s->target, (s->csb)->addr.to). It will assign a server if none
+ * (s->target, (s->scb)->addr.to). It will assign a server if none
  * is assigned yet.
  * It can return one of :
  *  - SF_ERR_NONE if everything's OK
@@ -1326,7 +1326,7 @@ static int do_connect_server(struct stream *s, struct connection *conn)
  *  - SF_ERR_RESOURCE if a system resource is lacking (eg: fd limits, ports, ...)
  *  - SF_ERR_INTERNAL for any other purely internal errors
  * Additionally, in the case of SF_ERR_RESOURCE, an emergency log will be emitted.
- * The server-facing conn-stream is expected to hold a pre-allocated connection.
+ * The server-facing stream connector is expected to hold a pre-allocated connection.
  */
 static int connect_server(struct stream *s)
 {
@@ -1349,7 +1349,7 @@ static int connect_server(struct stream *s)
 	 * it can be NULL for dispatch mode or transparent backend */
 	srv = objt_server(s->target);
 
-	err = alloc_dst_address(&s->csb->dst, srv, s);
+	err = alloc_dst_address(&s->scb->dst, srv, s);
 	if (err != SRV_STATUS_OK)
 		return SF_ERR_INTERNAL;
 
@@ -1401,7 +1401,7 @@ static int connect_server(struct stream *s)
 
 	/* 3. destination address */
 	if (srv && (!is_addr(&srv->addr) || srv->flags & SRV_F_MAPPORTS))
-		hash_params.dst_addr = s->csb->dst;
+		hash_params.dst_addr = s->scb->dst;
 
 	/* 4. source address */
 	hash_params.src_addr = bind_addr;
@@ -1574,11 +1574,11 @@ static int connect_server(struct stream *s)
 			}
 
 			if (avail >= 1) {
-				if (srv_conn->mux->attach(srv_conn, s->csb->endp, s->sess) == -1) {
+				if (srv_conn->mux->attach(srv_conn, s->scb->sedesc, s->sess) == -1) {
 					srv_conn = NULL;
-					if (cs_reset_endp(s->csb) < 0)
+					if (sc_reset_endp(s->scb) < 0)
 						return SF_ERR_INTERNAL;
-					s->csb->endp->flags &= CS_EP_DETACHED;
+					sc_ep_clr(s->scb, ~SE_FL_DETACHED);
 				}
 			}
 			else
@@ -1624,13 +1624,13 @@ skip_reuse:
 		return SF_ERR_RESOURCE;
 
 	/* copy the target address into the connection */
-	*srv_conn->dst = *s->csb->dst;
+	*srv_conn->dst = *s->scb->dst;
 
 	/* Copy network namespace from client connection */
 	srv_conn->proxy_netns = cli_conn ? cli_conn->proxy_netns : NULL;
 
 	if (!srv_conn->xprt) {
-		/* set the correct protocol on the output conn-stream */
+		/* set the correct protocol on the output stream connector */
 		if (srv) {
 			if (conn_prepare(srv_conn, protocol_lookup(srv_conn->dst->ss_family, PROTO_TYPE_STREAM, 0), srv->xprt)) {
 				conn_free(srv_conn);
@@ -1651,11 +1651,11 @@ skip_reuse:
 			return SF_ERR_INTERNAL;  /* how did we get there ? */
 		}
 
-		if (cs_attach_mux(s->csb, NULL, srv_conn) < 0) {
+		if (sc_attach_mux(s->scb, NULL, srv_conn) < 0) {
 			conn_free(srv_conn);
 			return SF_ERR_INTERNAL;  /* how did we get there ? */
 		}
-		srv_conn->ctx = s->csb;
+		srv_conn->ctx = s->scb;
 
 #if defined(USE_OPENSSL) && defined(TLSEXT_TYPE_application_layer_protocol_negotiation)
 		if (!srv ||
@@ -1722,7 +1722,7 @@ skip_reuse:
 
 	/* disable lingering */
 	if (s->be->options & PR_O_TCP_NOLING)
-		s->csb->flags |= CS_FL_NOLINGER;
+		s->scb->flags |= SC_FL_NOLINGER;
 
 	if (s->flags & SF_SRV_REUSED) {
 		_HA_ATOMIC_INC(&s->be->be_counters.reuse);
@@ -1764,7 +1764,7 @@ skip_reuse:
 	if (init_mux) {
 		const struct mux_ops *alt_mux =
 		  likely(!(s->flags & SF_WEBSOCKET)) ? NULL : srv_get_ws_proto(srv);
-		if (conn_install_mux_be(srv_conn, s->csb, s->sess, alt_mux) < 0) {
+		if (conn_install_mux_be(srv_conn, s->scb, s->sess, alt_mux) < 0) {
 			conn_full_close(srv_conn);
 			return SF_ERR_INTERNAL;
 		}
@@ -1802,7 +1802,7 @@ skip_reuse:
 	     */
 	    ((cli_conn->flags & CO_FL_EARLY_DATA) ||
 	     ((s->be->retry_type & PR_RE_EARLY_ERROR) && !s->conn_retries)) &&
-	    !channel_is_empty(cs_oc(s->csb)) &&
+	    !channel_is_empty(sc_oc(s->scb)) &&
 	    srv_conn->flags & CO_FL_SSL_WAIT_HS)
 		srv_conn->flags &= ~(CO_FL_SSL_WAIT_HS | CO_FL_WAIT_L6_CONN);
 #endif
@@ -1820,13 +1820,13 @@ skip_reuse:
 			s->be->lbprm.server_take_conn(srv);
 	}
 
-	/* Now handle synchronously connected sockets. We know the conn-stream
-	 * is at least in state CS_ST_CON. These ones typically are UNIX
+	/* Now handle synchronously connected sockets. We know the stream connector
+	 * is at least in state SC_ST_CON. These ones typically are UNIX
 	 * sockets, socket pairs, andoccasionally TCP connections on the
 	 * loopback on a heavily loaded system.
 	 */
 	if (srv_conn->flags & CO_FL_ERROR)
-		s->csb->endp->flags |= CS_EP_ERROR;
+		sc_ep_set(s->scb, SE_FL_ERROR);
 
 	/* If we had early data, and the handshake ended, then
 	 * we can remove the flag, and attempt to wake the task up,
@@ -1834,14 +1834,14 @@ skip_reuse:
 	 * the handshake.
 	 */
 	if (!(srv_conn->flags & (CO_FL_WAIT_XPRT | CO_FL_EARLY_SSL_HS)))
-		s->csb->endp->flags &= ~CS_EP_WAIT_FOR_HS;
+		sc_ep_clr(s->scb, SE_FL_WAIT_FOR_HS);
 
-	if (!cs_state_in(s->csb->state, CS_SB_EST|CS_SB_DIS|CS_SB_CLO) &&
+	if (!sc_state_in(s->scb->state, SC_SB_EST|SC_SB_DIS|SC_SB_CLO) &&
 	    (srv_conn->flags & CO_FL_WAIT_XPRT) == 0) {
 		s->conn_exp = TICK_ETERNITY;
-		cs_oc(s->csb)->flags |= CF_WRITE_NULL;
-		if (s->csb->state == CS_ST_CON)
-			s->csb->state = CS_ST_RDY;
+		sc_oc(s->scb)->flags |= CF_WRITE_NULL;
+		if (s->scb->state == SC_ST_CON)
+			s->scb->state = SC_ST_RDY;
 	}
 
 	/* Report EOI on the channel if it was reached from the mux point of
@@ -1851,8 +1851,8 @@ skip_reuse:
 	 *       wake callback. Otherwise si_cs_recv()/si_cs_send() already take
 	 *       care of it.
 	 */
-	if ((s->csb->endp->flags & CS_EP_EOI) && !(cs_ic(s->csb)->flags & CF_EOI))
-		cs_ic(s->csb)->flags |= (CF_EOI|CF_READ_PARTIAL);
+	if (sc_ep_test(s->scb, SE_FL_EOI) && !(sc_ic(s->scb)->flags & CF_EOI))
+		sc_ic(s->scb)->flags |= (CF_EOI|CF_READ_PARTIAL);
 
 	/* catch all sync connect while the mux is not already installed */
 	if (!srv_conn->mux && !(srv_conn->flags & CO_FL_WAIT_XPRT)) {
@@ -1901,7 +1901,7 @@ int srv_redispatch_connect(struct stream *s)
 		if (((s->flags & (SF_DIRECT|SF_FORCE_PRST)) == SF_DIRECT) &&
 		    (s->be->options & PR_O_REDISP)) {
 			s->flags &= ~(SF_DIRECT | SF_ASSIGNED);
-			sockaddr_free(&s->csb->dst);
+			sockaddr_free(&s->scb->dst);
 			goto redispatch;
 		}
 
@@ -1924,7 +1924,7 @@ int srv_redispatch_connect(struct stream *s)
 
 	case SRV_STATUS_QUEUED:
 		s->conn_exp = tick_add_ifset(now_ms, s->be->timeout.queue);
-		s->csb->state = CS_ST_QUE;
+		s->scb->state = SC_ST_QUE;
 		/* do nothing else and do not wake any other stream up */
 		return 1;
 
@@ -1961,21 +1961,21 @@ static int back_may_abort_req(struct channel *req, struct stream *s)
 	         (channel_is_empty(req) || (s->be->options & PR_O_ABRT_CLOSE))));
 }
 
-/* Update back conn-stream status for input states CS_ST_ASS, CS_ST_QUE,
- * CS_ST_TAR. Other input states are simply ignored.
- * Possible output states are CS_ST_CLO, CS_ST_TAR, CS_ST_ASS, CS_ST_REQ, CS_ST_CON
- * and CS_ST_EST. Flags must have previously been updated for timeouts and other
+/* Update back stream connector status for input states SC_ST_ASS, SC_ST_QUE,
+ * SC_ST_TAR. Other input states are simply ignored.
+ * Possible output states are SC_ST_CLO, SC_ST_TAR, SC_ST_ASS, SC_ST_REQ, SC_ST_CON
+ * and SC_ST_EST. Flags must have previously been updated for timeouts and other
  * conditions.
  */
 void back_try_conn_req(struct stream *s)
 {
 	struct server *srv = objt_server(s->target);
-	struct conn_stream *cs = s->csb;
+	struct stconn *sc = s->scb;
 	struct channel *req = &s->req;
 
 	DBG_TRACE_ENTER(STRM_EV_STRM_PROC|STRM_EV_CS_ST, s);
 
-	if (cs->state == CS_ST_ASS) {
+	if (sc->state == SC_ST_ASS) {
 		/* Server assigned to connection request, we have to try to connect now */
 		int conn_err;
 
@@ -1992,7 +1992,7 @@ void back_try_conn_req(struct stream *s)
 		srv = objt_server(s->target);
 
 		if (conn_err == SF_ERR_NONE) {
-			/* state = CS_ST_CON or CS_ST_EST now */
+			/* state = SC_ST_CON or SC_ST_EST now */
 			if (srv)
 				srv_inc_sess_ctr(srv);
 			if (srv)
@@ -2023,8 +2023,8 @@ void back_try_conn_req(struct stream *s)
 				process_srv_queue(srv);
 
 			/* Failed and not retryable. */
-			cs_shutr(cs);
-			cs_shutw(cs);
+			sc_shutr(sc);
+			sc_shutw(sc);
 			req->flags |= CF_WRITE_ERROR;
 
 			s->logs.t_queue = tv_ms_elapsed(&s->logs.tv_accept, &now);
@@ -2033,9 +2033,9 @@ void back_try_conn_req(struct stream *s)
 			pendconn_cond_unlink(s->pend_pos);
 
 			/* no stream was ever accounted for this server */
-			cs->state = CS_ST_CLO;
+			sc->state = SC_ST_CLO;
 			if (s->srv_error)
-				s->srv_error(s, cs);
+				s->srv_error(s, sc);
 			DBG_TRACE_STATE("internal error during connection", STRM_EV_STRM_PROC|STRM_EV_CS_ST|STRM_EV_STRM_ERR, s);
 			goto end;
 		}
@@ -2044,14 +2044,14 @@ void back_try_conn_req(struct stream *s)
 		 * turn-around now, as the problem is likely a source port
 		 * allocation problem, so we want to retry now.
 		 */
-		cs->state = CS_ST_CER;
-		cs->endp->flags &= ~CS_EP_ERROR;
+		sc->state = SC_ST_CER;
+		sc_ep_clr(sc, SE_FL_ERROR);
 		back_handle_st_cer(s);
 
 		DBG_TRACE_STATE("connection error, retry", STRM_EV_STRM_PROC|STRM_EV_CS_ST|STRM_EV_STRM_ERR, s);
-		/* now cs->state is one of CS_ST_CLO, CS_ST_TAR, CS_ST_ASS, CS_ST_REQ */
+		/* now sc->state is one of SC_ST_CLO, SC_ST_TAR, SC_ST_ASS, SC_ST_REQ */
 	}
-	else if (cs->state == CS_ST_QUE) {
+	else if (sc->state == SC_ST_QUE) {
 		/* connection request was queued, check for any update */
 		if (!pendconn_dequeue(s)) {
 			/* The connection is not in the queue anymore. Either
@@ -2061,10 +2061,10 @@ void back_try_conn_req(struct stream *s)
 			 */
 			s->conn_exp = TICK_ETERNITY;
 			if (unlikely(!(s->flags & SF_ASSIGNED)))
-				cs->state = CS_ST_REQ;
+				sc->state = SC_ST_REQ;
 			else {
 				s->logs.t_queue = tv_ms_elapsed(&s->logs.tv_accept, &now);
-				cs->state = CS_ST_ASS;
+				sc->state = SC_ST_ASS;
 			}
 			DBG_TRACE_STATE("dequeue connection request", STRM_EV_STRM_PROC|STRM_EV_CS_ST, s);
 			goto end;
@@ -2083,14 +2083,14 @@ void back_try_conn_req(struct stream *s)
 			if (srv)
 				_HA_ATOMIC_INC(&srv->counters.failed_conns);
 			_HA_ATOMIC_INC(&s->be->be_counters.failed_conns);
-			cs_shutr(cs);
-			cs_shutw(cs);
+			sc_shutr(sc);
+			sc_shutw(sc);
 			req->flags |= CF_WRITE_TIMEOUT;
 			if (!s->conn_err_type)
 				s->conn_err_type = STRM_ET_QUEUE_TO;
-			cs->state = CS_ST_CLO;
+			sc->state = SC_ST_CLO;
 			if (s->srv_error)
-				s->srv_error(s, cs);
+				s->srv_error(s, sc);
 			DBG_TRACE_STATE("connection request still queued", STRM_EV_STRM_PROC|STRM_EV_CS_ST, s);
 			goto end;
 		}
@@ -2109,7 +2109,7 @@ void back_try_conn_req(struct stream *s)
 
 		/* Nothing changed */
 	}
-	else if (cs->state == CS_ST_TAR) {
+	else if (sc->state == SC_ST_TAR) {
 		/* Connection request might be aborted */
 		if (back_may_abort_req(req, s)) {
 			s->conn_err_type |= STRM_ET_CONN_ABRT;
@@ -2128,9 +2128,9 @@ void back_try_conn_req(struct stream *s)
 		 * FIXME: Should we force a redispatch attempt when the server is down ?
 		 */
 		if (s->flags & SF_ASSIGNED)
-			cs->state = CS_ST_ASS;
+			sc->state = SC_ST_ASS;
 		else
-			cs->state = CS_ST_REQ;
+			sc->state = SC_ST_REQ;
 
 		DBG_TRACE_STATE("retry connection now", STRM_EV_STRM_PROC|STRM_EV_CS_ST, s);
 	}
@@ -2143,26 +2143,26 @@ abort_connection:
 	/* give up */
 	s->conn_exp = TICK_ETERNITY;
 	s->flags &= ~SF_CONN_EXP;
-	cs_shutr(cs);
-	cs_shutw(cs);
-	cs->state = CS_ST_CLO;
+	sc_shutr(sc);
+	sc_shutw(sc);
+	sc->state = SC_ST_CLO;
 	if (s->srv_error)
-		s->srv_error(s, cs);
+		s->srv_error(s, sc);
 	DBG_TRACE_DEVEL("leaving on error", STRM_EV_STRM_PROC|STRM_EV_CS_ST|STRM_EV_STRM_ERR, s);
 	return;
 }
 
-/* This function initiates a server connection request on a conn-stream
- * already in CS_ST_REQ state. Upon success, the state goes to CS_ST_ASS for
+/* This function initiates a server connection request on a stream connector
+ * already in SC_ST_REQ state. Upon success, the state goes to SC_ST_ASS for
  * a real connection to a server, indicating that a server has been assigned,
- * or CS_ST_RDY for a successful connection to an applet. It may also return
- * CS_ST_QUE, or CS_ST_CLO upon error.
+ * or SC_ST_RDY for a successful connection to an applet. It may also return
+ * SC_ST_QUE, or SC_ST_CLO upon error.
  */
 void back_handle_st_req(struct stream *s)
 {
-	struct conn_stream *cs = s->csb;
+	struct stconn *sc = s->scb;
 
-	if (cs->state != CS_ST_REQ)
+	if (sc->state != SC_ST_REQ)
 		return;
 
 	DBG_TRACE_ENTER(STRM_EV_STRM_PROC|STRM_EV_CS_ST, s);
@@ -2170,12 +2170,12 @@ void back_handle_st_req(struct stream *s)
 	if (unlikely(obj_type(s->target) == OBJ_TYPE_APPLET)) {
 		struct appctx *appctx;
 
-		/* The target is an applet but the CS is in CS_ST_REQ. Thus it
-		 * means no appctx are attached to the CS. Otherwise, it will be
-		 * in CS_ST_RDY state. So, try to create the appctx now.
+		/* The target is an applet but the SC is in SC_ST_REQ. Thus it
+		 * means no appctx are attached to the SC. Otherwise, it will be
+		 * in SC_ST_RDY state. So, try to create the appctx now.
 		 */
-		BUG_ON(cs_appctx(cs));
-		appctx = cs_applet_create(cs, objt_applet(s->target));
+		BUG_ON(sc_appctx(sc));
+		appctx = sc_applet_create(sc, objt_applet(s->target));
 		if (!appctx) {
 			/* No more memory, let's immediately abort. Force the
 			 * error code to ignore the ERR_LOCAL which is not a
@@ -2183,13 +2183,13 @@ void back_handle_st_req(struct stream *s)
 			 */
 			s->flags &= ~(SF_ERR_MASK | SF_FINST_MASK);
 
-			cs_shutr(cs);
-			cs_shutw(cs);
+			sc_shutr(sc);
+			sc_shutw(sc);
 			s->req.flags |= CF_WRITE_ERROR;
 			s->conn_err_type = STRM_ET_CONN_RES;
-			cs->state = CS_ST_CLO;
+			sc->state = SC_ST_CLO;
 			if (s->srv_error)
-				s->srv_error(s, cs);
+				s->srv_error(s, sc);
 			DBG_TRACE_STATE("failed to register applet", STRM_EV_STRM_PROC|STRM_EV_CS_ST|STRM_EV_STRM_ERR, s);
 			goto end;
 		}
@@ -2203,27 +2203,27 @@ void back_handle_st_req(struct stream *s)
 		/* We did not get a server. Either we queued the
 		 * connection request, or we encountered an error.
 		 */
-		if (cs->state == CS_ST_QUE) {
+		if (sc->state == SC_ST_QUE) {
 			DBG_TRACE_STATE("connection request queued", STRM_EV_STRM_PROC|STRM_EV_CS_ST, s);
 			goto end;
 		}
 
 		/* we did not get any server, let's check the cause */
-		cs_shutr(cs);
-		cs_shutw(cs);
+		sc_shutr(sc);
+		sc_shutw(sc);
 		s->req.flags |= CF_WRITE_ERROR;
 		if (!s->conn_err_type)
 			s->conn_err_type = STRM_ET_CONN_OTHER;
-		cs->state = CS_ST_CLO;
+		sc->state = SC_ST_CLO;
 		if (s->srv_error)
-			s->srv_error(s, cs);
+			s->srv_error(s, sc);
 		DBG_TRACE_STATE("connection request failed", STRM_EV_STRM_PROC|STRM_EV_CS_ST|STRM_EV_STRM_ERR, s);
 		goto end;
 	}
 
 	/* The server is assigned */
 	s->logs.t_queue = tv_ms_elapsed(&s->logs.tv_accept, &now);
-	cs->state = CS_ST_ASS;
+	sc->state = SC_ST_ASS;
 	be_set_sess_last(s->be);
 	DBG_TRACE_STATE("connection request assigned to a server", STRM_EV_STRM_PROC|STRM_EV_CS_ST, s);
 
@@ -2231,16 +2231,16 @@ void back_handle_st_req(struct stream *s)
 	DBG_TRACE_LEAVE(STRM_EV_STRM_PROC|STRM_EV_CS_ST, s);
 }
 
-/* This function is called with (cs->state == CS_ST_CON) meaning that a
+/* This function is called with (sc->state == SC_ST_CON) meaning that a
  * connection was attempted and that the file descriptor is already allocated.
  * We must check for timeout, error and abort. Possible output states are
- * CS_ST_CER (error), CS_ST_DIS (abort), and CS_ST_CON (no change). This only
+ * SC_ST_CER (error), SC_ST_DIS (abort), and SC_ST_CON (no change). This only
  * works with connection-based streams. We know that there were no I/O event
  * when reaching this function. Timeouts and errors are *not* cleared.
  */
 void back_handle_st_con(struct stream *s)
 {
-	struct conn_stream *cs = s->csb;
+	struct stconn *sc = s->scb;
 	struct channel *req = &s->req;
 	struct channel *rep = &s->res;
 
@@ -2250,27 +2250,27 @@ void back_handle_st_con(struct stream *s)
 	if ((rep->flags & CF_SHUTW) ||
 	    ((req->flags & CF_SHUTW_NOW) &&
 	     (channel_is_empty(req) || (s->be->options & PR_O_ABRT_CLOSE)))) {
-		cs->flags |= CS_FL_NOLINGER;
-		cs_shutw(cs);
+		sc->flags |= SC_FL_NOLINGER;
+		sc_shutw(sc);
 		s->conn_err_type |= STRM_ET_CONN_ABRT;
 		if (s->srv_error)
-			s->srv_error(s, cs);
-		/* Note: state = CS_ST_DIS now */
+			s->srv_error(s, sc);
+		/* Note: state = SC_ST_DIS now */
 		DBG_TRACE_STATE("client abort during connection attempt", STRM_EV_STRM_PROC|STRM_EV_CS_ST|STRM_EV_STRM_ERR, s);
 		goto end;
 	}
 
  done:
 	/* retryable error ? */
-	if ((s->flags & SF_CONN_EXP) || (cs->endp->flags & CS_EP_ERROR)) {
+	if ((s->flags & SF_CONN_EXP) || sc_ep_test(sc, SE_FL_ERROR)) {
 		if (!s->conn_err_type) {
-			if (cs->endp->flags & CS_EP_ERROR)
+			if (sc_ep_test(sc, SE_FL_ERROR))
 				s->conn_err_type = STRM_ET_CONN_ERR;
 			else
 				s->conn_err_type = STRM_ET_CONN_TO;
 		}
 
-		cs->state  = CS_ST_CER;
+		sc->state  = SC_ST_CER;
 		DBG_TRACE_STATE("connection failed, retry", STRM_EV_STRM_PROC|STRM_EV_CS_ST|STRM_EV_STRM_ERR, s);
 	}
 
@@ -2278,19 +2278,19 @@ void back_handle_st_con(struct stream *s)
 	DBG_TRACE_LEAVE(STRM_EV_STRM_PROC|STRM_EV_CS_ST, s);
 }
 
-/* This function is called with (cs->state == CS_ST_CER) meaning that a
+/* This function is called with (sc->state == SC_ST_CER) meaning that a
  * previous connection attempt has failed and that the file descriptor
  * has already been released. Possible causes include asynchronous error
- * notification and time out. Possible output states are CS_ST_CLO when
- * retries are exhausted, CS_ST_TAR when a delay is wanted before a new
- * connection attempt, CS_ST_ASS when it's wise to retry on the same server,
- * and CS_ST_REQ when an immediate redispatch is wanted. The buffers are
+ * notification and time out. Possible output states are SC_ST_CLO when
+ * retries are exhausted, SC_ST_TAR when a delay is wanted before a new
+ * connection attempt, SC_ST_ASS when it's wise to retry on the same server,
+ * and SC_ST_REQ when an immediate redispatch is wanted. The buffers are
  * marked as in error state. Timeouts and errors are cleared before retrying.
  */
 void back_handle_st_cer(struct stream *s)
 {
-	struct conn_stream *cs = s->csb;
-	int must_tar = (cs->endp->flags & CS_EP_ERROR);
+	struct stconn *sc = s->scb;
+	int must_tar = sc_ep_test(sc, SE_FL_ERROR);
 
 	DBG_TRACE_ENTER(STRM_EV_STRM_PROC|STRM_EV_CS_ST, s);
 
@@ -2301,7 +2301,7 @@ void back_handle_st_cer(struct stream *s)
 
 	/* we probably have to release last stream from the server */
 	if (objt_server(s->target)) {
-		struct connection *conn = cs_conn(cs);
+		struct connection *conn = sc_conn(sc);
 
 		health_adjust(__objt_server(s->target), HANA_STATUS_L4_ERR);
 
@@ -2310,7 +2310,7 @@ void back_handle_st_cer(struct stream *s)
 			_HA_ATOMIC_DEC(&__objt_server(s->target)->cur_sess);
 		}
 
-		if ((cs->endp->flags & CS_EP_ERROR) &&
+		if (sc_ep_test(sc, SE_FL_ERROR) &&
 		    conn && conn->err_code == CO_ER_SSL_MISMATCH_SNI) {
 			/* We tried to connect to a server which is configured
 			 * with "verify required" and which doesn't have the
@@ -2347,13 +2347,13 @@ void back_handle_st_cer(struct stream *s)
 			process_srv_queue(objt_server(s->target));
 
 		/* shutw is enough to stop a connecting socket */
-		cs_shutw(cs);
+		sc_shutw(sc);
 		s->req.flags |= CF_WRITE_ERROR;
 		s->res.flags |= CF_READ_ERROR;
 
-		cs->state = CS_ST_CLO;
+		sc->state = SC_ST_CLO;
 		if (s->srv_error)
-			s->srv_error(s, cs);
+			s->srv_error(s, sc);
 
 		DBG_TRACE_STATE("connection failed", STRM_EV_STRM_PROC|STRM_EV_CS_ST|STRM_EV_STRM_ERR, s);
 		goto end;
@@ -2366,10 +2366,10 @@ void back_handle_st_cer(struct stream *s)
 	 * resources as soon as possible and to not catch errors from the lower
 	 * layers in an unexpected state (i.e < ST_CONN).
 	 *
-	 * Note: the conn-stream will be switched to ST_REQ, ST_ASS or
-	 * ST_TAR and CS_EP_ERROR and SF_CONN_EXP flags will be unset.
+	 * Note: the stream connector will be switched to ST_REQ, ST_ASS or
+	 * ST_TAR and SE_FL_ERROR and SF_CONN_EXP flags will be unset.
 	 */
-	if (cs_reset_endp(cs) < 0) {
+	if (sc_reset_endp(sc) < 0) {
 		if (!s->conn_err_type)
 			s->conn_err_type = STRM_ET_CONN_OTHER;
 
@@ -2381,13 +2381,13 @@ void back_handle_st_cer(struct stream *s)
 			process_srv_queue(objt_server(s->target));
 
 		/* shutw is enough to stop a connecting socket */
-		cs_shutw(cs);
+		sc_shutw(sc);
 		s->req.flags |= CF_WRITE_ERROR;
 		s->res.flags |= CF_READ_ERROR;
 
-		cs->state = CS_ST_CLO;
+		sc->state = SC_ST_CLO;
 		if (s->srv_error)
-			s->srv_error(s, cs);
+			s->srv_error(s, sc);
 
 		DBG_TRACE_STATE("error resetting endpoint", STRM_EV_STRM_PROC|STRM_EV_CS_ST|STRM_EV_STRM_ERR, s);
 		goto end;
@@ -2415,10 +2415,10 @@ void back_handle_st_cer(struct stream *s)
 			s->conn_err_type = STRM_ET_CONN_ERR;
 
 		/* only wait when we're retrying on the same server */
-		if ((cs->state == CS_ST_ASS ||
+		if ((sc->state == SC_ST_ASS ||
 		     (s->be->lbprm.algo & BE_LB_KIND) != BE_LB_KIND_RR ||
 		     (s->be->srv_act <= 1)) && !reused) {
-			cs->state = CS_ST_TAR;
+			sc->state = SC_ST_TAR;
 			s->conn_exp = tick_add(now_ms, MS_TO_TICKS(delay));
 		}
 		DBG_TRACE_STATE("retry a new connection", STRM_EV_STRM_PROC|STRM_EV_CS_ST, s);
@@ -2428,26 +2428,26 @@ void back_handle_st_cer(struct stream *s)
 	DBG_TRACE_LEAVE(STRM_EV_STRM_PROC|STRM_EV_CS_ST, s);
 }
 
-/* This function is called with (cs->state == CS_ST_RDY) meaning that a
+/* This function is called with (sc->state == SC_ST_RDY) meaning that a
  * connection was attempted, that the file descriptor is already allocated,
  * and that it has succeeded. We must still check for errors and aborts.
- * Possible output states are CS_ST_EST (established), CS_ST_CER (error),
- * and CS_ST_DIS (abort). This only works with connection-based streams.
+ * Possible output states are SC_ST_EST (established), SC_ST_CER (error),
+ * and SC_ST_DIS (abort). This only works with connection-based streams.
  * Timeouts and errors are *not* cleared.
  */
 void back_handle_st_rdy(struct stream *s)
 {
-	struct conn_stream *cs = s->csb;
+	struct stconn *sc = s->scb;
 	struct channel *req = &s->req;
 	struct channel *rep = &s->res;
 
 	DBG_TRACE_ENTER(STRM_EV_STRM_PROC|STRM_EV_CS_ST, s);
 
 	if (unlikely(obj_type(s->target) == OBJ_TYPE_APPLET)) {
-		/* Here the appctx must exists because the CS was set to
-		 * CS_ST_RDY state when the appctx was created.
+		/* Here the appctx must exists because the SC was set to
+		 * SC_ST_RDY state when the appctx was created.
 		 */
-		BUG_ON(!cs_appctx(s->csb));
+		BUG_ON(!sc_appctx(s->scb));
 
 		if (tv_iszero(&s->logs.tv_request))
 			s->logs.tv_request = now;
@@ -2463,7 +2463,7 @@ void back_handle_st_rdy(struct stream *s)
 	 *   - an I/O error might have been reported after a successful transfer,
 	 *     which is not retryable and needs to be logged correctly, and needs
 	 *     established as well
-	 *   - CS_ST_CON implies !CF_WROTE_DATA but not conversely as we could
+	 *   - SC_ST_CON implies !CF_WROTE_DATA but not conversely as we could
 	 *     have validated a connection with incoming data (e.g. TCP with a
 	 *     banner protocol), or just a successful connect() probe.
 	 *   - the client might have requested a connection abort, this needs to
@@ -2479,20 +2479,20 @@ void back_handle_st_rdy(struct stream *s)
 		    ((req->flags & CF_SHUTW_NOW) &&
 		     (channel_is_empty(req) || (s->be->options & PR_O_ABRT_CLOSE)))) {
 			/* give up */
-			cs->flags |= CS_FL_NOLINGER;
-			cs_shutw(cs);
+			sc->flags |= SC_FL_NOLINGER;
+			sc_shutw(sc);
 			s->conn_err_type |= STRM_ET_CONN_ABRT;
 			if (s->srv_error)
-				s->srv_error(s, cs);
+				s->srv_error(s, sc);
 			DBG_TRACE_STATE("client abort during connection attempt", STRM_EV_STRM_PROC|STRM_EV_CS_ST|STRM_EV_STRM_ERR, s);
 			goto end;
 		}
 
 		/* retryable error ? */
-		if (cs->endp->flags & CS_EP_ERROR) {
+		if (sc_ep_test(sc, SE_FL_ERROR)) {
 			if (!s->conn_err_type)
 				s->conn_err_type = STRM_ET_CONN_ERR;
-			cs->state = CS_ST_CER;
+			sc->state = SC_ST_CER;
 			DBG_TRACE_STATE("connection failed, retry", STRM_EV_STRM_PROC|STRM_EV_CS_ST|STRM_EV_STRM_ERR, s);
 			goto end;
 		}
@@ -2503,7 +2503,7 @@ void back_handle_st_rdy(struct stream *s)
 	 */
 	DBG_TRACE_STATE("connection established", STRM_EV_STRM_PROC|STRM_EV_CS_ST, s);
 	s->conn_err_type = STRM_ET_NONE;
-	cs->state = CS_ST_EST;
+	sc->state = SC_ST_EST;
 
   end:
 	DBG_TRACE_LEAVE(STRM_EV_STRM_PROC|STRM_EV_CS_ST, s);

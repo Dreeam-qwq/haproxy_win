@@ -115,7 +115,7 @@ static const struct name_desc check_trace_decoding[] = {
 #define CHK_VERB_CLEAN    1
 	{ .name="clean",    .desc="only user-friendly stuff, generally suitable for level \"user\"" },
 #define CHK_VERB_MINIMAL  2
-	{ .name="minimal",  .desc="report info on stream and conn-streams" },
+	{ .name="minimal",  .desc="report info on streams and connectors" },
 #define CHK_VERB_SIMPLE   3
 	{ .name="simple",   .desc="add info on request and response channels" },
 #define CHK_VERB_ADVANCED 4
@@ -138,13 +138,6 @@ struct trace_source trace_check = {
 
 #define TRACE_SOURCE &trace_check
 INITCALL1(STG_REGISTER, trace_register_source, TRACE_SOURCE);
-
-
-static int wake_srv_chk(struct conn_stream *cs);
-struct data_cb check_conn_cb = {
-	.wake = wake_srv_chk,
-	.name = "CHCK",
-};
 
 
 /* Dummy frontend used to create all checks sessions. */
@@ -230,11 +223,11 @@ static void check_trace(enum trace_level level, uint64_t mask,
 		return;
 
 
-	if (check->cs) {
-		struct connection *conn = cs_conn(check->cs);
+	if (check->sc) {
+		struct connection *conn = sc_conn(check->sc);
 
 		chunk_appendf(&trace_buf, " - conn=%p(0x%08x)", conn, conn ? conn->flags : 0);
-		chunk_appendf(&trace_buf, " cs=%p(0x%08x)", check->cs, check->cs->flags);
+		chunk_appendf(&trace_buf, " sc=%p(0x%08x)", check->sc, check->sc->flags);
 	}
 
 	if (mask & CHK_EV_TCPCHK) {
@@ -778,8 +771,8 @@ static int retrieve_errno_from_socket(struct connection *conn)
  */
 void chk_report_conn_err(struct check *check, int errno_bck, int expired)
 {
-	struct conn_stream *cs = check->cs;
-	struct connection *conn = cs_conn(cs);
+	struct stconn *sc = check->sc;
+	struct connection *conn = sc_conn(sc);
 	const char *err_msg;
 	struct buffer *chk;
 	int step;
@@ -793,7 +786,7 @@ void chk_report_conn_err(struct check *check, int errno_bck, int expired)
 		retrieve_errno_from_socket(conn);
 
 	if (conn && !(conn->flags & CO_FL_ERROR) &&
-	    cs && !(cs->endp->flags & CS_EP_ERROR) && !expired)
+	    sc && !sc_ep_test(sc, SE_FL_ERROR) && !expired)
 		return;
 
 	TRACE_ENTER(CHK_EV_HCHK_END|CHK_EV_HCHK_ERR, check, 0, 0, (size_t[]){expired});
@@ -906,13 +899,13 @@ void chk_report_conn_err(struct check *check, int errno_bck, int expired)
 		set_server_check_status(check, HCHK_STATUS_SOCKERR, err_msg);
 	}
 
-	if (!cs || !conn || !conn->ctrl) {
+	if (!sc || !conn || !conn->ctrl) {
 		/* error before any connection attempt (connection allocation error or no control layer) */
 		set_server_check_status(check, HCHK_STATUS_SOCKERR, err_msg);
 	}
 	else if (conn->flags & CO_FL_WAIT_L4_CONN) {
 		/* L4 not established (yet) */
-		if (conn->flags & CO_FL_ERROR || cs->endp->flags & CS_EP_ERROR)
+		if (conn->flags & CO_FL_ERROR || sc_ep_test(sc, SE_FL_ERROR))
 			set_server_check_status(check, HCHK_STATUS_L4CON, err_msg);
 		else if (expired)
 			set_server_check_status(check, HCHK_STATUS_L4TOUT, err_msg);
@@ -927,12 +920,12 @@ void chk_report_conn_err(struct check *check, int errno_bck, int expired)
 	}
 	else if (conn->flags & CO_FL_WAIT_L6_CONN) {
 		/* L6 not established (yet) */
-		if (conn->flags & CO_FL_ERROR || cs->endp->flags & CS_EP_ERROR)
+		if (conn->flags & CO_FL_ERROR || sc_ep_test(sc, SE_FL_ERROR))
 			set_server_check_status(check, HCHK_STATUS_L6RSP, err_msg);
 		else if (expired)
 			set_server_check_status(check, HCHK_STATUS_L6TOUT, err_msg);
 	}
-	else if (conn->flags & CO_FL_ERROR || cs->endp->flags & CS_EP_ERROR) {
+	else if (conn->flags & CO_FL_ERROR || sc_ep_test(sc, SE_FL_ERROR)) {
 		/* I/O error after connection was established and before we could diagnose */
 		set_server_check_status(check, HCHK_STATUS_SOCKERR, err_msg);
 	}
@@ -1016,10 +1009,10 @@ int httpchk_build_status_header(struct server *s, struct buffer *buf)
  * It returns 0 on normal cases, <0 if at least one close() has happened on the
  * connection (eg: reconnect). It relies on tcpcheck_main().
  */
-static int wake_srv_chk(struct conn_stream *cs)
+int wake_srv_chk(struct stconn *sc)
 {
 	struct connection *conn;
-	struct check *check = __cs_check(cs);
+	struct check *check = __sc_check(sc);
 	struct email_alertq *q = container_of(check, typeof(*q), check);
 	int ret = 0;
 
@@ -1035,10 +1028,10 @@ static int wake_srv_chk(struct conn_stream *cs)
 	/* we may have to make progress on the TCP checks */
 	ret = tcpcheck_main(check);
 
-	cs = check->cs;
-	conn = cs_conn(cs);
+	sc = check->sc;
+	conn = sc_conn(sc);
 
-	if (unlikely(!conn || !cs || conn->flags & CO_FL_ERROR || cs->endp->flags & CS_EP_ERROR)) {
+	if (unlikely(!conn || !sc || conn->flags & CO_FL_ERROR || sc_ep_test(sc, SE_FL_ERROR))) {
 		/* We may get error reports bypassing the I/O handlers, typically
 		 * the case when sending a pure TCP check which fails, then the I/O
 		 * handlers above are not called. This is completely handled by the
@@ -1070,9 +1063,9 @@ static int wake_srv_chk(struct conn_stream *cs)
 /* This function checks if any I/O is wanted, and if so, attempts to do so */
 struct task *srv_chk_io_cb(struct task *t, void *ctx, unsigned int state)
 {
-	struct conn_stream *cs = ctx;
+	struct stconn *sc = ctx;
 
-	wake_srv_chk(cs);
+	wake_srv_chk(sc);
 	return NULL;
 }
 
@@ -1086,7 +1079,7 @@ struct task *process_chk_conn(struct task *t, void *context, unsigned int state)
 {
 	struct check *check = context;
 	struct proxy *proxy = check->proxy;
-	struct conn_stream *cs;
+	struct stconn *sc;
 	struct connection *conn;
 	int rv;
 	int expired = tick_is_expired(t->expire, now_ms);
@@ -1126,8 +1119,8 @@ struct task *process_chk_conn(struct task *t, void *context, unsigned int state)
 
 		check->current_step = NULL;
 
-		check->cs = cs_new_from_check(check, CS_FL_NONE);
-		if (!check->cs) {
+		check->sc = sc_new_from_check(check, SC_FL_NONE);
+		if (!check->sc) {
 			set_server_check_status(check, HCHK_STATUS_SOCKERR, NULL);
 			goto end;
 		}
@@ -1140,13 +1133,13 @@ struct task *process_chk_conn(struct task *t, void *context, unsigned int state)
 	 * which can happen on connect timeout or error.
 	 */
 	if (check->result == CHK_RES_UNKNOWN && likely(!(check->state & CHK_ST_PURGE))) {
-		cs = check->cs;
-		conn = (cs ? cs_conn(cs) : NULL);
+		sc = check->sc;
+		conn = (sc ? sc_conn(sc) : NULL);
 
 		/* Here the connection must be defined. Otherwise the
 		 * error would have already been detected
 		 */
-		if ((conn && ((conn->flags & CO_FL_ERROR) || (cs->endp->flags & CS_EP_ERROR))) || expired) {
+		if ((conn && ((conn->flags & CO_FL_ERROR) || sc_ep_test(sc, SE_FL_ERROR))) || expired) {
 			TRACE_ERROR("report connection error", CHK_EV_TASK_WAKE|CHK_EV_HCHK_END|CHK_EV_HCHK_ERR, check);
 			chk_report_conn_err(check, 0, expired);
 		}
@@ -1155,11 +1148,11 @@ struct task *process_chk_conn(struct task *t, void *context, unsigned int state)
 				TRACE_DEVEL("closing current connection", CHK_EV_TASK_WAKE|CHK_EV_HCHK_RUN, check);
 				check->state &= ~CHK_ST_CLOSE_CONN;
 				conn = NULL;
-				if (!cs_reset_endp(check->cs)) {
+				if (!sc_reset_endp(check->sc)) {
 					/* error will be handled by tcpcheck_main().
-					 * On success, remove all flags except CS_EP_DETACHED
+					 * On success, remove all flags except SE_FL_DETACHED
 					 */
-					check->cs->endp->flags &= CS_EP_DETACHED;
+					sc_ep_clr(check->sc, ~SE_FL_DETACHED);
 				}
 				tcpcheck_main(check);
 			}
@@ -1174,8 +1167,8 @@ struct task *process_chk_conn(struct task *t, void *context, unsigned int state)
 	TRACE_STATE("health-check complete or aborted", CHK_EV_TASK_WAKE|CHK_EV_HCHK_END, check);
 
 	check->current_step = NULL;
-	cs = check->cs;
-	conn = (cs ? cs_conn(cs) : NULL);
+	sc = check->sc;
+	conn = (sc ? sc_conn(sc) : NULL);
 
 	if (conn && conn->xprt) {
 		/* The check was aborted and the connection was not yet closed.
@@ -1183,12 +1176,12 @@ struct task *process_chk_conn(struct task *t, void *context, unsigned int state)
 		 * as a failed response coupled with "observe layer7" caused the
 		 * server state to be suddenly changed.
 		 */
-		cs_conn_drain_and_shut(cs);
+		sc_conn_drain_and_shut(sc);
 	}
 
-	if (cs) {
-		cs_destroy(cs);
-		cs = check->cs = NULL;
+	if (sc) {
+		sc_destroy(sc);
+		sc = check->sc = NULL;
 		conn = NULL;
 	}
 
@@ -1272,18 +1265,18 @@ int check_buf_available(void *target)
 {
 	struct check *check = target;
 
-	BUG_ON(!check->cs);
+	BUG_ON(!check->sc);
 
 	if ((check->state & CHK_ST_IN_ALLOC) && b_alloc(&check->bi)) {
 		TRACE_STATE("unblocking check, input buffer allocated", CHK_EV_TCPCHK_EXP|CHK_EV_RX_BLK, check);
 		check->state &= ~CHK_ST_IN_ALLOC;
-		tasklet_wakeup(check->cs->wait_event.tasklet);
+		tasklet_wakeup(check->sc->wait_event.tasklet);
 		return 1;
 	}
 	if ((check->state & CHK_ST_OUT_ALLOC) && b_alloc(&check->bo)) {
 		TRACE_STATE("unblocking check, output buffer allocated", CHK_EV_TCPCHK_SND|CHK_EV_TX_BLK, check);
 		check->state &= ~CHK_ST_OUT_ALLOC;
-		tasklet_wakeup(check->cs->wait_event.tasklet);
+		tasklet_wakeup(check->sc->wait_event.tasklet);
 		return 1;
 	}
 
@@ -1347,9 +1340,9 @@ void free_check(struct check *check)
 
 	check_release_buf(check, &check->bi);
 	check_release_buf(check, &check->bo);
-	if (check->cs) {
-		cs_destroy(check->cs);
-		check->cs = NULL;
+	if (check->sc) {
+		sc_destroy(check->sc);
+		check->sc = NULL;
 	}
 }
 

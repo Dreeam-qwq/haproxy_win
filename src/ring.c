@@ -23,9 +23,9 @@
 #include <haproxy/applet.h>
 #include <haproxy/buf.h>
 #include <haproxy/cli.h>
-#include <haproxy/conn_stream.h>
-#include <haproxy/cs_utils.h>
 #include <haproxy/ring.h>
+#include <haproxy/sc_strm.h>
+#include <haproxy/stconn.h>
 #include <haproxy/thread.h>
 
 /* context used to dump the contents of a ring via "show events" or "show errors" */
@@ -290,7 +290,7 @@ int ring_attach_cli(struct ring *ring, struct appctx *appctx, uint flags)
 int cli_io_handler_show_ring(struct appctx *appctx)
 {
 	struct show_ring_ctx *ctx = appctx->svcctx;
-	struct conn_stream *cs = appctx_cs(appctx);
+	struct stconn *sc = appctx_sc(appctx);
 	struct ring *ring = ctx->ring;
 	struct buffer *buf = &ring->buf;
 	size_t ofs = ctx->ofs;
@@ -298,7 +298,7 @@ int cli_io_handler_show_ring(struct appctx *appctx)
 	size_t len, cnt;
 	int ret;
 
-	if (unlikely(cs_ic(cs)->flags & (CF_WRITE_ERROR|CF_SHUTW)))
+	if (unlikely(sc_ic(sc)->flags & (CF_WRITE_ERROR|CF_SHUTW)))
 		return 1;
 
 	HA_RWLOCK_WRLOCK(LOGSRV_LOCK, &ring->lock);
@@ -357,8 +357,7 @@ int cli_io_handler_show_ring(struct appctx *appctx)
 		trash.data += len;
 		trash.area[trash.data++] = '\n';
 
-		if (ci_putchk(cs_ic(cs), &trash) == -1) {
-			cs_rx_room_blk(cs);
+		if (applet_putchk(appctx, &trash) == -1) {
 			ret = 0;
 			break;
 		}
@@ -374,16 +373,16 @@ int cli_io_handler_show_ring(struct appctx *appctx)
 		/* we've drained everything and are configured to wait for more
 		 * data or an event (keypress, close)
 		 */
-		if (!cs_oc(cs)->output && !(cs_oc(cs)->flags & CF_SHUTW)) {
+		if (!sc_oc(sc)->output && !(sc_oc(sc)->flags & CF_SHUTW)) {
 			/* let's be woken up once new data arrive */
 			HA_RWLOCK_WRLOCK(LOGSRV_LOCK, &ring->lock);
 			LIST_APPEND(&ring->waiters, &appctx->wait_entry);
 			HA_RWLOCK_WRUNLOCK(LOGSRV_LOCK, &ring->lock);
-			cs_rx_endp_done(cs);
+			applet_have_no_more_data(appctx);
 			ret = 0;
 		}
 		/* always drain all the request */
-		co_skip(cs_oc(cs), cs_oc(cs)->output);
+		co_skip(sc_oc(sc), sc_oc(sc)->output);
 	}
 	return ret;
 }

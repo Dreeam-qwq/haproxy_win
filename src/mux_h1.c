@@ -1,5 +1,5 @@
 /*
- * HTT/1 mux-demux for connections
+ * HTTP/1 mux-demux for connections
  *
  * Copyright 2018 Christopher Faulet <cfaulet@haproxy.com>
  *
@@ -15,7 +15,6 @@
 #include <haproxy/api.h>
 #include <haproxy/cfgparse.h>
 #include <haproxy/connection.h>
-#include <haproxy/conn_stream.h>
 #include <haproxy/dynbuf.h>
 #include <haproxy/h1.h>
 #include <haproxy/h1_htx.h>
@@ -28,6 +27,7 @@
 #include <haproxy/proxy.h>
 #include <haproxy/session-t.h>
 #include <haproxy/stats.h>
+#include <haproxy/stconn.h>
 #include <haproxy/stream.h>
 #include <haproxy/trace.h>
 
@@ -47,13 +47,13 @@
 #define H1C_F_IN_SALLOC      0x00000040 /* mux is blocked on lack of stream's request buffer */
 
 /* Flags indicating the connection state */
-#define H1C_F_ST_EMBRYONIC   0x00000100 /* Set when a H1 stream with no conn-stream is attached to the connection */
-#define H1C_F_ST_ATTACHED    0x00000200 /* Set when a H1 stream with a conn-stream is attached to the connection (may be not READY) */
+#define H1C_F_ST_EMBRYONIC   0x00000100 /* Set when a H1 stream with no stream connector is attached to the connection */
+#define H1C_F_ST_ATTACHED    0x00000200 /* Set when a H1 stream with a stream connector is attached to the connection (may be not READY) */
 #define H1C_F_ST_IDLE        0x00000400 /* connection is idle and may be reused
 					 * (exclusive to all H1C_F_ST flags and never set when an h1s is attached) */
-#define H1C_F_ST_ERROR       0x00000800 /* connection must be closed ASAP because an error occurred (conn-stream may still be attached) */
-#define H1C_F_ST_SHUTDOWN    0x00001000 /* connection must be shut down ASAP flushing output first (conn-stream may still be attached) */
-#define H1C_F_ST_READY       0x00002000 /* Set in ATTACHED state with a READY conn-stream. A conn-stream is not ready when
+#define H1C_F_ST_ERROR       0x00000800 /* connection must be closed ASAP because an error occurred (stream connector may still be attached) */
+#define H1C_F_ST_SHUTDOWN    0x00001000 /* connection must be shut down ASAP flushing output first (stream connector may still be attached) */
+#define H1C_F_ST_READY       0x00002000 /* Set in ATTACHED state with a READY stream connector. A stream connector is not ready when
 					 * a TCP>H1 upgrade is in progress Thus this flag is only set if ATTACHED is also set */
 #define H1C_F_ST_ALIVE       (H1C_F_ST_IDLE|H1C_F_ST_EMBRYONIC|H1C_F_ST_ATTACHED)
 #define H1C_F_ST_SILENT_SHUT 0x00004000 /* silent (or dirty) shutdown must be performed (implied ST_SHUTDOWN) */
@@ -118,10 +118,10 @@ struct h1c {
 /* H1 stream descriptor */
 struct h1s {
 	struct h1c *h1c;
-	struct cs_endpoint *endp;
+	struct sedesc *sd;
 	uint32_t flags;                /* Connection flags: H1S_F_* */
 
-	struct wait_event *subs;      /* Address of the wait_event the conn_stream associated is waiting on */
+	struct wait_event *subs;      /* Address of the wait_event the stream connector associated is waiting on */
 
 	struct session *sess;         /* Associated session */
 	struct buffer rxbuf;          /* receive buffer, always valid (buf_empty or real buffer) */
@@ -364,6 +364,12 @@ static void h1_shutw_conn(struct connection *conn);
 static void h1_wake_stream_for_recv(struct h1s *h1s);
 static void h1_wake_stream_for_send(struct h1s *h1s);
 
+/* returns the stconn associated to the H1 stream */
+static forceinline struct stconn *h1s_sc(const struct h1s *h1s)
+{
+	return h1s->sd->sc;
+}
+
 /* the H1 traces always expect that arg1, if non-null, is of type connection
  * (from which we can derive h1c), that arg2, if non-null, is of type h1s, and
  * that arg3, if non-null, is a htx for rx/tx headers.
@@ -427,10 +433,10 @@ static void h1_trace(enum trace_level level, uint64_t mask, const struct trace_s
 		chunk_appendf(&trace_buf, " conn=%p(0x%08x)", h1c->conn, h1c->conn->flags);
 	if (h1s) {
 		chunk_appendf(&trace_buf, " h1s=%p(0x%08x)", h1s, h1s->flags);
-		if (h1s->endp)
-			chunk_appendf(&trace_buf, " endp=%p(0x%08x)", h1s->endp, h1s->endp->flags);
-		if (h1s->endp && h1s->endp->cs)
-			chunk_appendf(&trace_buf, " cs=%p(0x%08x)", h1s->endp->cs, h1s->endp->cs->flags);
+		if (h1s->sd)
+			chunk_appendf(&trace_buf, " sd=%p(0x%08x)", h1s->sd, se_fl_get(h1s->sd));
+		if (h1s->sd && h1s_sc(h1s))
+			chunk_appendf(&trace_buf, " sc=%p(0x%08x)", h1s_sc(h1s), h1s_sc(h1s)->flags);
 	}
 
 	if (src->verbosity == H1_VERB_MINIMAL)
@@ -620,9 +626,9 @@ static void h1_refresh_timeout(struct h1c *h1c)
 			is_idle_conn = 1;
 		}
 		else  {
-			/* alive back connections of front connections with a conn-stream attached */
+			/* alive back connections of front connections with a stream connector attached */
 			h1c->task->expire = TICK_ETERNITY;
-			TRACE_DEVEL("no connection timeout (alive back h1c or front h1c with a CS)", H1_EV_H1C_SEND|H1_EV_H1C_RECV, h1c->conn);
+			TRACE_DEVEL("no connection timeout (alive back h1c or front h1c with an SC)", H1_EV_H1C_SEND|H1_EV_H1C_RECV, h1c->conn);
 		}
 
 		/* Finally set the idle expiration date if shorter */
@@ -690,7 +696,7 @@ static void h1_set_idle_expiration(struct h1c *h1c)
 			TRACE_DEVEL("set idle expiration (http-request timeout)", H1_EV_H1C_RECV, h1c->conn);
 		}
 	}
-	else { // CS_ATTACHED or SHUTDOWN
+	else { // ST_ATTACHED or SHUTDOWN
 		h1c->idle_exp = TICK_ETERNITY;
 		TRACE_DEVEL("unset idle expiration (attached || shutdown)", H1_EV_H1C_RECV, h1c->conn);
 	}
@@ -708,26 +714,26 @@ static inline size_t h1s_data_pending(const struct h1s *h1s)
 	return ((h1m->state == H1_MSG_DONE) ? 0 : b_data(&h1s->h1c->ibuf));
 }
 
-/* Creates a new conn-stream and the associate stream. <input> is used as input
+/* Creates a new stream connector and the associate stream. <input> is used as input
  * buffer for the stream. On success, it is transferred to the stream and the
  * mux is no longer responsible of it. On error, <input> is unchanged, thus the
  * mux must still take care of it. However, there is nothing special to do
  * because, on success, <input> is updated to points on BUF_NULL. Thus, calling
- * b_free() on it is always safe. This function returns the conn-stream on
+ * b_free() on it is always safe. This function returns the stream connector on
  * success or NULL on error. */
-static struct conn_stream *h1s_new_cs(struct h1s *h1s, struct buffer *input)
+static struct stconn *h1s_new_sc(struct h1s *h1s, struct buffer *input)
 {
 	struct h1c *h1c = h1s->h1c;
 
 	TRACE_ENTER(H1_EV_STRM_NEW, h1c->conn, h1s);
 
 	if (h1s->flags & H1S_F_NOT_FIRST)
-		h1s->endp->flags |= CS_EP_NOT_FIRST;
+		se_fl_set(h1s->sd, SE_FL_NOT_FIRST);
 	if (h1s->req.flags & H1_MF_UPG_WEBSOCKET)
-		h1s->endp->flags |= CS_EP_WEBSOCKET;
+		se_fl_set(h1s->sd, SE_FL_WEBSOCKET);
 
-	if (!cs_new_from_endp(h1s->endp, h1c->conn->owner, input)) {
-		TRACE_ERROR("CS allocation failure", H1_EV_STRM_NEW|H1_EV_STRM_END|H1_EV_STRM_ERR, h1c->conn, h1s);
+	if (!sc_new_from_endp(h1s->sd, h1c->conn->owner, input)) {
+		TRACE_ERROR("SC allocation failure", H1_EV_STRM_NEW|H1_EV_STRM_END|H1_EV_STRM_ERR, h1c->conn, h1s);
 		goto err;
 	}
 
@@ -736,25 +742,25 @@ static struct conn_stream *h1s_new_cs(struct h1s *h1s, struct buffer *input)
 
 	h1c->flags = (h1c->flags & ~H1C_F_ST_EMBRYONIC) | H1C_F_ST_ATTACHED | H1C_F_ST_READY;
 	TRACE_LEAVE(H1_EV_STRM_NEW, h1c->conn, h1s);
-	return h1s->endp->cs;
+	return h1s_sc(h1s);
 
   err:
 	TRACE_DEVEL("leaving on error", H1_EV_STRM_NEW|H1_EV_STRM_ERR, h1c->conn, h1s);
 	return NULL;
 }
 
-static struct conn_stream *h1s_upgrade_cs(struct h1s *h1s, struct buffer *input)
+static struct stconn *h1s_upgrade_sc(struct h1s *h1s, struct buffer *input)
 {
 	TRACE_ENTER(H1_EV_STRM_NEW, h1s->h1c->conn, h1s);
 
-	if (stream_upgrade_from_cs(h1s->endp->cs, input) < 0) {
+	if (stream_upgrade_from_sc(h1s_sc(h1s), input) < 0) {
 		TRACE_ERROR("stream upgrade failure", H1_EV_STRM_NEW|H1_EV_STRM_END|H1_EV_STRM_ERR, h1s->h1c->conn, h1s);
 		goto err;
 	}
 
 	h1s->h1c->flags |= H1C_F_ST_READY;
 	TRACE_LEAVE(H1_EV_STRM_NEW, h1s->h1c->conn, h1s);
-	return h1s->endp->cs;
+	return h1s_sc(h1s);
 
   err:
 	TRACE_DEVEL("leaving on error", H1_EV_STRM_NEW|H1_EV_STRM_ERR, h1s->h1c->conn, h1s);
@@ -775,7 +781,7 @@ static struct h1s *h1s_new(struct h1c *h1c)
 	h1s->h1c = h1c;
 	h1c->h1s = h1s;
 	h1s->sess = NULL;
-	h1s->endp = NULL;
+	h1s->sd = NULL;
 	h1s->flags = H1S_F_WANT_KAL;
 	h1s->subs = NULL;
 	h1s->rxbuf = BUF_NULL;
@@ -802,7 +808,7 @@ static struct h1s *h1s_new(struct h1c *h1c)
 	return NULL;
 }
 
-static struct h1s *h1c_frt_stream_new(struct h1c *h1c, struct conn_stream *cs, struct session *sess)
+static struct h1s *h1c_frt_stream_new(struct h1c *h1c, struct stconn *sc, struct session *sess)
 {
 	struct h1s *h1s;
 
@@ -812,18 +818,18 @@ static struct h1s *h1c_frt_stream_new(struct h1c *h1c, struct conn_stream *cs, s
 	if (!h1s)
 		goto fail;
 
-	if (cs) {
-		if (cs_attach_mux(cs, h1s, h1c->conn) < 0)
+	if (sc) {
+		if (sc_attach_mux(sc, h1s, h1c->conn) < 0)
 			goto fail;
-		h1s->endp = cs->endp;
+		h1s->sd = sc->sedesc;
 	}
 	else {
-		h1s->endp = cs_endpoint_new();
-		if (!h1s->endp)
+		h1s->sd = sedesc_new();
+		if (!h1s->sd)
 			goto fail;
-		h1s->endp->target = h1s;
-		h1s->endp->ctx = h1c->conn;
-		h1s->endp->flags |= (CS_EP_T_MUX|CS_EP_ORPHAN);
+		h1s->sd->se     = h1s;
+		h1s->sd->conn   = h1c->conn;
+		se_fl_set(h1s->sd, SE_FL_T_MUX | SE_FL_ORPHAN);
 	}
 
 	h1s->sess = sess;
@@ -842,7 +848,7 @@ static struct h1s *h1c_frt_stream_new(struct h1c *h1c, struct conn_stream *cs, s
 	return NULL;
 }
 
-static struct h1s *h1c_bck_stream_new(struct h1c *h1c, struct conn_stream *cs, struct session *sess)
+static struct h1s *h1c_bck_stream_new(struct h1c *h1c, struct stconn *sc, struct session *sess)
 {
 	struct h1s *h1s;
 
@@ -852,11 +858,11 @@ static struct h1s *h1c_bck_stream_new(struct h1c *h1c, struct conn_stream *cs, s
 	if (!h1s)
 		goto fail;
 
-	if (cs_attach_mux(cs, h1s, h1c->conn) < 0)
+	if (sc_attach_mux(sc, h1s, h1c->conn) < 0)
 		goto fail;
 
 	h1s->flags |= H1S_F_RX_BLK;
-	h1s->endp = cs->endp;
+	h1s->sd = sc->sedesc;
 	h1s->sess = sess;
 
 	h1c->flags = (h1c->flags & ~H1C_F_ST_EMBRYONIC) | H1C_F_ST_ATTACHED | H1C_F_ST_READY;
@@ -911,16 +917,16 @@ static void h1s_destroy(struct h1s *h1s)
 		}
 
 		HA_ATOMIC_DEC(&h1c->px_counters->open_streams);
-		BUG_ON(h1s->endp && !(h1s->endp->flags & CS_EP_ORPHAN));
-		cs_endpoint_free(h1s->endp);
+		BUG_ON(h1s->sd && !se_fl_test(h1s->sd, SE_FL_ORPHAN));
+		sedesc_free(h1s->sd);
 		pool_free(pool_head_h1s, h1s);
 	}
 }
 
 /*
  * Initialize the mux once it's attached. It is expected that conn->ctx points
- * to the existing conn_stream (for outgoing connections or for incoming ones
- * during a mux upgrade) or NULL (for incoming ones during the connection
+ * to the existing stream connector (for outgoing connections or for incoming
+ * ones during a mux upgrade) or NULL (for incoming ones during the connection
  * establishment). <input> is always used as Input buffer and may contain
  * data. It is the caller responsibility to not reuse it anymore. Returns < 0 on
  * error.
@@ -1003,9 +1009,9 @@ static int h1_init(struct connection *conn, struct proxy *proxy, struct session 
 		if (!h1c_frt_stream_new(h1c, conn_ctx, h1c->conn->owner))
 			goto fail;
 
-		/* Attach the CS but Not ready yet */
+		/* Attach the SC but Not ready yet */
 		h1c->flags = (h1c->flags & ~H1C_F_ST_EMBRYONIC) | H1C_F_ST_ATTACHED;
-		TRACE_DEVEL("Inherit the CS from TCP connection to perform an upgrade",
+		TRACE_DEVEL("Inherit the SC from TCP connection to perform an upgrade",
 			    H1_EV_H1C_NEW|H1_EV_STRM_NEW, h1c->conn, h1c->h1s);
 	}
 
@@ -1412,11 +1418,11 @@ static void h1_capture_bad_message(struct h1c *h1c, struct h1s *h1s,
 	struct proxy *other_end;
 	union error_snapshot_ctx ctx;
 
-	if ((h1c->flags & H1C_F_ST_ATTACHED) && cs_strm(h1s->endp->cs)) {
+	if ((h1c->flags & H1C_F_ST_ATTACHED) && sc_strm(h1s_sc(h1s))) {
 		if (sess == NULL)
-			sess = __cs_strm(h1s->endp->cs)->sess;
+			sess = __sc_strm(h1s_sc(h1s))->sess;
 		if (!(h1m->flags & H1_MF_RESP))
-			other_end = __cs_strm(h1s->endp->cs)->be;
+			other_end = __sc_strm(h1s_sc(h1s))->be;
 		else
 			other_end = sess->fe;
 	} else
@@ -1872,7 +1878,7 @@ static size_t h1_process_demux(struct h1c *h1c, struct buffer *buf, size_t count
 		h1_release_buf(h1c, &h1c->ibuf);
 
 	if (!(h1c->flags & H1C_F_ST_READY)) {
-		/* The H1 connection is not ready. Most of time, there is no CS
+		/* The H1 connection is not ready. Most of time, there is no SC
 		 * attached, except for TCP>H1 upgrade, from a TCP frontend. In both
 		 * cases, it is only possible on the client side.
 		 */
@@ -1885,17 +1891,17 @@ static size_t h1_process_demux(struct h1c *h1c, struct buffer *buf, size_t count
 		}
 
 		if (!(h1c->flags & H1C_F_ST_ATTACHED)) {
-			TRACE_DEVEL("request headers fully parsed, create and attach the CS", H1_EV_RX_DATA, h1c->conn, h1s);
-			BUG_ON(h1s->endp->cs);
-			if (!h1s_new_cs(h1s, buf)) {
+			TRACE_DEVEL("request headers fully parsed, create and attach the SC", H1_EV_RX_DATA, h1c->conn, h1s);
+			BUG_ON(h1s_sc(h1s));
+			if (!h1s_new_sc(h1s, buf)) {
 				h1c->flags |= H1C_F_ST_ERROR;
 				goto err;
 			}
 		}
 		else {
-			TRACE_DEVEL("request headers fully parsed, upgrade the inherited CS", H1_EV_RX_DATA, h1c->conn, h1s);
-			BUG_ON(h1s->endp->cs == NULL);
-			if (!h1s_upgrade_cs(h1s, buf)) {
+			TRACE_DEVEL("request headers fully parsed, upgrade the inherited SC", H1_EV_RX_DATA, h1c->conn, h1s);
+			BUG_ON(h1s_sc(h1s) == NULL);
+			if (!h1s_upgrade_sc(h1s, buf)) {
 				h1c->flags |= H1C_F_ST_ERROR;
 				TRACE_ERROR("H1S upgrade failure", H1_EV_RX_DATA|H1_EV_H1S_ERR, h1c->conn, h1s);
 				goto err;
@@ -1903,17 +1909,17 @@ static size_t h1_process_demux(struct h1c *h1c, struct buffer *buf, size_t count
 		}
 	}
 
-	/* Here h1s->endp->cs is always defined */
+	/* Here h1s_sc(h1s) is always defined */
 	if (!(h1m->flags & H1_MF_CHNK) && (h1m->state == H1_MSG_DATA || (h1m->state == H1_MSG_TUNNEL))) {
 		TRACE_STATE("notify the mux can use splicing", H1_EV_RX_DATA|H1_EV_RX_BODY, h1c->conn, h1s);
-		h1s->endp->flags |= CS_EP_MAY_SPLICE;
+		se_fl_set(h1s->sd, SE_FL_MAY_SPLICE);
 	}
 	else {
 		TRACE_STATE("notify the mux can't use splicing anymore", H1_EV_RX_DATA|H1_EV_RX_BODY, h1c->conn, h1s);
-		h1s->endp->flags &= ~CS_EP_MAY_SPLICE;
+		se_fl_clr(h1s->sd, SE_FL_MAY_SPLICE);
 	}
 
-	/* Set EOI on conn-stream in DONE state iff:
+	/* Set EOI on stream connector in DONE state iff:
 	 *  - it is a response
 	 *  - it is a request but no a protocol upgrade nor a CONNECT
 	 *
@@ -1922,7 +1928,7 @@ static size_t h1_process_demux(struct h1c *h1c, struct buffer *buf, size_t count
 	 */
 	if (((h1m->state == H1_MSG_DONE) && (h1m->flags & H1_MF_RESP)) ||
 	    ((h1m->state == H1_MSG_DONE) && (h1s->meth != HTTP_METH_CONNECT) && !(h1m->flags & H1_MF_CONN_UPG)))
-		h1s->endp->flags |= CS_EP_EOI;
+		se_fl_set(h1s->sd, SE_FL_EOI);
 
   out:
 	/* When Input data are pending for this message, notify upper layer that
@@ -1932,21 +1938,21 @@ static size_t h1_process_demux(struct h1c *h1c, struct buffer *buf, size_t count
 	 *   - Headers or trailers are pending to be copied.
 	 */
 	if (h1s->flags & (H1S_F_RX_CONGESTED)) {
-		h1s->endp->flags |= CS_EP_RCV_MORE | CS_EP_WANT_ROOM;
+		se_fl_set(h1s->sd, SE_FL_RCV_MORE | SE_FL_WANT_ROOM);
 		TRACE_STATE("waiting for more room", H1_EV_RX_DATA|H1_EV_H1S_BLK, h1c->conn, h1s);
 	}
 	else {
-		h1s->endp->flags &= ~(CS_EP_RCV_MORE | CS_EP_WANT_ROOM);
+		se_fl_clr(h1s->sd, SE_FL_RCV_MORE | SE_FL_WANT_ROOM);
 		if (h1s->flags & H1S_F_REOS) {
-			h1s->endp->flags |= CS_EP_EOS;
+			se_fl_set(h1s->sd, SE_FL_EOS);
 			if (h1m->state >= H1_MSG_DONE || !(h1m->flags & H1_MF_XFER_LEN)) {
 				/* DONE or TUNNEL or SHUTR without XFER_LEN, set
-				 * EOI on the conn-stream */
-				h1s->endp->flags |= CS_EP_EOI;
+				 * EOI on the stream connector */
+				se_fl_set(h1s->sd, SE_FL_EOI);
 			}
 			else if (h1m->state > H1_MSG_LAST_LF && h1m->state < H1_MSG_DONE) {
-				h1s->endp->flags |= CS_EP_ERROR;
-				TRACE_ERROR("message aborted, set error on CS", H1_EV_RX_DATA|H1_EV_H1S_ERR, h1c->conn, h1s);
+				se_fl_set(h1s->sd, SE_FL_ERROR);
+				TRACE_ERROR("message aborted, set error on SC", H1_EV_RX_DATA|H1_EV_H1S_ERR, h1c->conn, h1s);
 			}
 
 			if (h1s->flags & H1S_F_TX_BLK) {
@@ -1963,7 +1969,7 @@ static size_t h1_process_demux(struct h1c *h1c, struct buffer *buf, size_t count
 
   err:
 	htx_to_buf(htx, buf);
-	h1s->endp->flags |= CS_EP_EOI;
+	se_fl_set(h1s->sd, SE_FL_EOI);
 	TRACE_DEVEL("leaving on error", H1_EV_RX_DATA|H1_EV_STRM_ERR, h1c->conn, h1s);
 	return 0;
 }
@@ -2563,7 +2569,7 @@ static size_t h1_process_mux(struct h1c *h1c, struct buffer *buf, size_t count)
 	}
   end:
 	/* Both the request and the response reached the DONE state. So set EOI
-	 * flag on the conn-stream. Most of time, the flag will already be set,
+	 * flag on the stream connector. Most of time, the flag will already be set,
 	 * except for protocol upgrades. Report an error if data remains blocked
 	 * in the output buffer.
 	 */
@@ -2572,7 +2578,7 @@ static size_t h1_process_mux(struct h1c *h1c, struct buffer *buf, size_t count)
 			h1c->flags |= H1C_F_ST_ERROR;
 			TRACE_ERROR("txn done but data waiting to be sent, set error on h1c", H1_EV_H1C_ERR, h1c->conn, h1s);
 		}
-		h1s->endp->flags |= CS_EP_EOI;
+		se_fl_set(h1s->sd, SE_FL_EOI);
 	}
 
 	TRACE_LEAVE(H1_EV_TX_DATA, h1c->conn, h1s, chn_htx, (size_t[]){total});
@@ -2619,9 +2625,9 @@ static void h1_alert(struct h1s *h1s)
 		h1_wake_stream_for_recv(h1s);
 		h1_wake_stream_for_send(h1s);
 	}
-	else if (h1s->endp->cs && h1s->endp->cs->data_cb->wake != NULL) {
+	else if (h1s_sc(h1s) && h1s_sc(h1s)->app_ops->wake != NULL) {
 		TRACE_POINT(H1_EV_STRM_WAKE, h1s->h1c->conn, h1s);
-		h1s->endp->cs->data_cb->wake(h1s->endp->cs);
+		h1s_sc(h1s)->app_ops->wake(h1s_sc(h1s));
 	}
 }
 
@@ -2956,7 +2962,7 @@ static int h1_process(struct h1c * h1c)
 			if (b_isteq(&h1c->ibuf, 0, b_data(&h1c->ibuf), ist(H2_CONN_PREFACE)) > 0) {
 				h1c->flags |= H1C_F_UPG_H2C;
 				if (h1c->flags & H1C_F_ST_ATTACHED) {
-					/* Force the REOS here to be sure to release the CS.
+					/* Force the REOS here to be sure to release the SC.
 					   Here ATTACHED implies !READY, and h1s defined
 					*/
 					BUG_ON(!h1s ||  (h1c->flags & H1C_F_ST_READY));
@@ -3022,7 +3028,7 @@ static int h1_process(struct h1c * h1c)
 	    (h1c->flags & H1C_F_ST_ERROR) ||
 	    ((h1c->flags & H1C_F_ST_SILENT_SHUT) && !b_data(&h1c->obuf))) {
 		if (!(h1c->flags & H1C_F_ST_READY)) {
-			/* No conn-stream or not ready */
+			/* No stream connector or not ready */
 			/* shutdown for reads and error on the frontend connection: Send an error */
 			if (!(h1c->flags & (H1C_F_IS_BACK|H1C_F_ST_ERROR|H1C_F_ST_SHUTDOWN))) {
 				if (h1_handle_parsing_error(h1c))
@@ -3045,7 +3051,7 @@ static int h1_process(struct h1c * h1c)
 			goto release;
 		}
 		else {
-			/* Here there is still a H1 stream with a conn-stream.
+			/* Here there is still a H1 stream with a stream connector.
 			 * Report the connection state at the stream level
 			 */
 			if (conn_xprt_read0_pending(conn)) {
@@ -3053,7 +3059,7 @@ static int h1_process(struct h1c * h1c)
 				TRACE_STATE("read0 on connection", H1_EV_H1C_RECV, conn, h1s);
 			}
 			if ((h1c->flags & H1C_F_ST_ERROR) || ((conn->flags & CO_FL_ERROR) && !b_data(&h1c->ibuf)))
-				h1s->endp->flags |= CS_EP_ERROR;
+				se_fl_set(h1s->sd, SE_FL_ERROR);
 			TRACE_POINT(H1_EV_STRM_WAKE, h1c->conn, h1s);
 			h1_alert(h1s);
 		}
@@ -3105,15 +3111,15 @@ static int h1_process(struct h1c * h1c)
   release:
 	if (h1c->flags & H1C_F_ST_ATTACHED) {
 		/* Don't release the H1 connection right now, we must destroy the
-		 * attached CS first. Here, the H1C must not be READY */
+		 * attached SC first. Here, the H1C must not be READY */
 		BUG_ON(!h1s || h1c->flags & H1C_F_ST_READY);
 
 		if (conn_xprt_read0_pending(conn) || (h1s->flags & H1S_F_REOS))
-			h1s->endp->flags |= CS_EP_EOS;
+			se_fl_set(h1s->sd, SE_FL_EOS);
 		if ((h1c->flags & H1C_F_ST_ERROR) || (conn->flags & CO_FL_ERROR))
-			h1s->endp->flags |= CS_EP_ERROR;
+			se_fl_set(h1s->sd, SE_FL_ERROR);
 		h1_alert(h1s);
-		TRACE_DEVEL("waiting to release the CS before releasing the connection", H1_EV_H1C_WAKE);
+		TRACE_DEVEL("waiting to release the SC before releasing the connection", H1_EV_H1C_WAKE);
 	}
 	else {
 		h1_release(h1c);
@@ -3237,13 +3243,13 @@ struct task *h1_timeout_task(struct task *t, void *context, unsigned int state)
 			return t;
 		}
 
-		/* If a conn-stream is still attached and ready to the mux, wait for the
+		/* If a stream connector is still attached and ready to the mux, wait for the
 		 * stream's timeout
 		 */
 		if (h1c->flags & H1C_F_ST_READY) {
 			HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
 			t->expire = TICK_ETERNITY;
-			TRACE_DEVEL("leaving (CS still attached)", H1_EV_H1C_WAKE, h1c->conn, h1c->h1s);
+			TRACE_DEVEL("leaving (SC still attached)", H1_EV_H1C_WAKE, h1c->conn, h1c->h1s);
 			return t;
 		}
 
@@ -3262,12 +3268,12 @@ struct task *h1_timeout_task(struct task *t, void *context, unsigned int state)
 
 		if (h1c->flags & H1C_F_ST_ATTACHED) {
 			/* Don't release the H1 connection right now, we must destroy the
-			 * attached CS first. Here, the H1C must not be READY */
-			h1c->h1s->endp->flags |= (CS_EP_EOS|CS_EP_ERROR);
+			 * attached SC first. Here, the H1C must not be READY */
+			se_fl_set(h1c->h1s->sd, SE_FL_EOS | SE_FL_ERROR);
 			h1_alert(h1c->h1s);
 			h1_refresh_timeout(h1c);
 			HA_SPIN_UNLOCK(OTHER_LOCK, &idle_conns[tid].idle_conns_lock);
-			TRACE_DEVEL("waiting to release the CS before releasing the connection", H1_EV_H1C_WAKE);
+			TRACE_DEVEL("waiting to release the SC before releasing the connection", H1_EV_H1C_WAKE);
 			return t;
 		}
 
@@ -3303,7 +3309,7 @@ struct task *h1_timeout_task(struct task *t, void *context, unsigned int state)
  * Attach a new stream to a connection
  * (Used for outgoing connections)
  */
-static int h1_attach(struct connection *conn, struct cs_endpoint *endp, struct session *sess)
+static int h1_attach(struct connection *conn, struct sedesc *sd, struct session *sess)
 {
 	struct h1c *h1c = conn->ctx;
 	struct h1s *h1s;
@@ -3314,7 +3320,7 @@ static int h1_attach(struct connection *conn, struct cs_endpoint *endp, struct s
 		goto err;
 	}
 
-	h1s = h1c_bck_stream_new(h1c, endp->cs, sess);
+	h1s = h1c_bck_stream_new(h1c, sd->sc, sess);
 	if (h1s == NULL) {
 		TRACE_ERROR("h1s creation failure", H1_EV_STRM_NEW|H1_EV_STRM_END|H1_EV_STRM_ERR, conn);
 		goto err;
@@ -3331,16 +3337,16 @@ static int h1_attach(struct connection *conn, struct cs_endpoint *endp, struct s
 	return -1;
 }
 
-/* Retrieves a valid conn_stream from this connection, or returns NULL. For
- * this mux, it's easy as we can only store a single conn_stream.
+/* Retrieves a valid stream connector from this connection, or returns NULL.
+ * For this mux, it's easy as we can only store a single stream connector.
  */
-static struct conn_stream *h1_get_first_cs(const struct connection *conn)
+static struct stconn *h1_get_first_sc(const struct connection *conn)
 {
 	struct h1c *h1c = conn->ctx;
 	struct h1s *h1s = h1c->h1s;
 
 	if (h1s)
-		return h1s->endp->cs;
+		return h1s_sc(h1s);
 
 	return NULL;
 }
@@ -3357,9 +3363,9 @@ static void h1_destroy(void *ctx)
 /*
  * Detach the stream from the connection and possibly release the connection.
  */
-static void h1_detach(struct cs_endpoint *endp)
+static void h1_detach(struct sedesc *sd)
 {
-	struct h1s *h1s = endp->target;
+	struct h1s *h1s = sd->se;
 	struct h1c *h1c;
 	struct session *sess;
 	int is_not_first;
@@ -3464,9 +3470,9 @@ static void h1_detach(struct cs_endpoint *endp)
 }
 
 
-static void h1_shutr(struct conn_stream *cs, enum co_shr_mode mode)
+static void h1_shutr(struct stconn *sc, enum co_shr_mode mode)
 {
-	struct h1s *h1s = __cs_mux(cs);
+	struct h1s *h1s = __sc_mux_strm(sc);
 	struct h1c *h1c;
 
 	if (!h1s)
@@ -3475,9 +3481,9 @@ static void h1_shutr(struct conn_stream *cs, enum co_shr_mode mode)
 
 	TRACE_ENTER(H1_EV_STRM_SHUT, h1c->conn, h1s, 0, (size_t[]){mode});
 
-	if (h1s->endp->flags & CS_EP_SHR)
+	if (se_fl_test(h1s->sd, SE_FL_SHR))
 		goto end;
-	if (h1s->endp->flags & CS_EP_KILL_CONN) {
+	if (se_fl_test(h1s->sd, SE_FL_KILL_CONN)) {
 		TRACE_STATE("stream wants to kill the connection", H1_EV_STRM_SHUT, h1c->conn, h1s);
 		goto do_shutr;
 	}
@@ -3487,7 +3493,7 @@ static void h1_shutr(struct conn_stream *cs, enum co_shr_mode mode)
 	}
 
 	if (!(h1c->flags & (H1C_F_ST_READY|H1C_F_ST_ERROR))) {
-		/* Here attached is implicit because there is CS */
+		/* Here attached is implicit because there is SC */
 		TRACE_STATE("keep connection alive (ALIVE but not READY nor ERROR)", H1_EV_STRM_SHUT, h1c->conn, h1s);
 		goto end;
 	}
@@ -3498,7 +3504,7 @@ static void h1_shutr(struct conn_stream *cs, enum co_shr_mode mode)
 
   do_shutr:
 	/* NOTE: Be sure to handle abort (cf. h2_shutr) */
-	if (h1s->endp->flags & CS_EP_SHR)
+	if (se_fl_test(h1s->sd, SE_FL_SHR))
 		goto end;
 
 	if (conn_xprt_ready(h1c->conn) && h1c->conn->xprt->shutr)
@@ -3507,9 +3513,9 @@ static void h1_shutr(struct conn_stream *cs, enum co_shr_mode mode)
 	TRACE_LEAVE(H1_EV_STRM_SHUT, h1c->conn, h1s);
 }
 
-static void h1_shutw(struct conn_stream *cs, enum co_shw_mode mode)
+static void h1_shutw(struct stconn *sc, enum co_shw_mode mode)
 {
-	struct h1s *h1s = __cs_mux(cs);
+	struct h1s *h1s = __sc_mux_strm(sc);
 	struct h1c *h1c;
 
 	if (!h1s)
@@ -3518,9 +3524,9 @@ static void h1_shutw(struct conn_stream *cs, enum co_shw_mode mode)
 
 	TRACE_ENTER(H1_EV_STRM_SHUT, h1c->conn, h1s, 0, (size_t[]){mode});
 
-	if (h1s->endp->flags & CS_EP_SHW)
+	if (se_fl_test(h1s->sd, SE_FL_SHW))
 		goto end;
-	if (h1s->endp->flags & CS_EP_KILL_CONN) {
+	if (se_fl_test(h1s->sd, SE_FL_KILL_CONN)) {
 		TRACE_STATE("stream wants to kill the connection", H1_EV_STRM_SHUT, h1c->conn, h1s);
 		goto do_shutw;
 	}
@@ -3530,7 +3536,7 @@ static void h1_shutw(struct conn_stream *cs, enum co_shw_mode mode)
 	}
 
 	if (!(h1c->flags & (H1C_F_ST_READY|H1C_F_ST_ERROR))) {
-		/* Here attached is implicit because there is CS */
+		/* Here attached is implicit because there is SC */
 		TRACE_STATE("keep connection alive (ALIVE but not READY nor ERROR)", H1_EV_STRM_SHUT, h1c->conn, h1s);
 		goto end;
 	}
@@ -3567,9 +3573,9 @@ static void h1_shutw_conn(struct connection *conn)
  * The <es> pointer is not allowed to differ from the one passed to the
  * subscribe() call. It always returns zero.
  */
-static int h1_unsubscribe(struct conn_stream *cs, int event_type, struct wait_event *es)
+static int h1_unsubscribe(struct stconn *sc, int event_type, struct wait_event *es)
 {
-	struct h1s *h1s = __cs_mux(cs);
+	struct h1s *h1s = __sc_mux_strm(sc);
 
 	if (!h1s)
 		return 0;
@@ -3594,11 +3600,12 @@ static int h1_unsubscribe(struct conn_stream *cs, int event_type, struct wait_ev
  * event subscriber <es> is not allowed to change from a previous call as long
  * as at least one event is still subscribed. The <event_type> must only be a
  * combination of SUB_RETRY_RECV and SUB_RETRY_SEND. It always returns 0, unless
- * the conn_stream <cs> was already detached, in which case it will return -1.
+ * the stream connector <sc> was already detached, in which case it will return
+ * -1.
  */
-static int h1_subscribe(struct conn_stream *cs, int event_type, struct wait_event *es)
+static int h1_subscribe(struct stconn *sc, int event_type, struct wait_event *es)
 {
-	struct h1s *h1s = __cs_mux(cs);
+	struct h1s *h1s = __sc_mux_strm(sc);
 	struct h1c *h1c;
 
 	if (!h1s)
@@ -3617,7 +3624,7 @@ static int h1_subscribe(struct conn_stream *cs, int event_type, struct wait_even
 	if (event_type & SUB_RETRY_SEND) {
 		TRACE_DEVEL("subscribe(send)", H1_EV_STRM_SEND, h1s->h1c->conn, h1s);
 		/*
-		 * If the conn_stream attempt to subscribe, and the
+		 * If the stconn attempts to subscribe, and the
 		 * mux isn't subscribed to the connection, then it
 		 * probably means the connection wasn't established
 		 * yet, so we have to subscribe.
@@ -3644,9 +3651,9 @@ static int h1_subscribe(struct conn_stream *cs, int event_type, struct wait_even
  * mux it may optimize the data copy to <buf> if necessary. Otherwise, it should
  * copy as much data as possible.
  */
-static size_t h1_rcv_buf(struct conn_stream *cs, struct buffer *buf, size_t count, int flags)
+static size_t h1_rcv_buf(struct stconn *sc, struct buffer *buf, size_t count, int flags)
 {
-	struct h1s *h1s = __cs_mux(cs);
+	struct h1s *h1s = __sc_mux_strm(sc);
 	struct h1c *h1c = h1s->h1c;
 	struct h1m *h1m = (!(h1c->flags & H1C_F_IS_BACK) ? &h1s->req : &h1s->res);
 	size_t ret = 0;
@@ -3664,7 +3671,7 @@ static size_t h1_rcv_buf(struct conn_stream *cs, struct buffer *buf, size_t coun
 	else
 		TRACE_DEVEL("h1c ibuf not allocated", H1_EV_H1C_RECV|H1_EV_H1C_BLK, h1c->conn);
 
-	if ((flags & CO_RFL_BUF_FLUSH) && (h1s->endp->flags & CS_EP_MAY_SPLICE)) {
+	if ((flags & CO_RFL_BUF_FLUSH) && se_fl_test(h1s->sd, SE_FL_MAY_SPLICE)) {
 		h1c->flags |= H1C_F_WANT_SPLICE;
 		TRACE_STATE("Block xprt rcv_buf to flush stream's buffer (want_splice)", H1_EV_STRM_RECV, h1c->conn, h1s);
 	}
@@ -3680,9 +3687,9 @@ static size_t h1_rcv_buf(struct conn_stream *cs, struct buffer *buf, size_t coun
 
 
 /* Called from the upper layer, to send data */
-static size_t h1_snd_buf(struct conn_stream *cs, struct buffer *buf, size_t count, int flags)
+static size_t h1_snd_buf(struct stconn *sc, struct buffer *buf, size_t count, int flags)
 {
-	struct h1s *h1s = __cs_mux(cs);
+	struct h1s *h1s = __sc_mux_strm(sc);
 	struct h1c *h1c;
 	size_t total = 0;
 
@@ -3702,7 +3709,7 @@ static size_t h1_snd_buf(struct conn_stream *cs, struct buffer *buf, size_t coun
 	}
 
 	if (h1c->flags & H1C_F_ST_ERROR) {
-		h1s->endp->flags |= CS_EP_ERROR;
+		se_fl_set(h1s->sd, SE_FL_ERROR);
 		TRACE_ERROR("H1C on error, leaving in error", H1_EV_STRM_SEND|H1_EV_H1C_ERR|H1_EV_H1S_ERR|H1_EV_STRM_ERR, h1c->conn, h1s);
 		return 0;
 	}
@@ -3734,7 +3741,7 @@ static size_t h1_snd_buf(struct conn_stream *cs, struct buffer *buf, size_t coun
 	}
 
 	if (h1c->flags & H1C_F_ST_ERROR) {
-		h1s->endp->flags |= CS_EP_ERROR;
+		se_fl_set(h1s->sd, SE_FL_ERROR);
 		TRACE_ERROR("reporting error to the app-layer stream", H1_EV_STRM_SEND|H1_EV_H1S_ERR|H1_EV_STRM_ERR, h1c->conn, h1s);
 	}
 
@@ -3745,9 +3752,9 @@ static size_t h1_snd_buf(struct conn_stream *cs, struct buffer *buf, size_t coun
 
 #if defined(USE_LINUX_SPLICE)
 /* Send and get, using splicing */
-static int h1_rcv_pipe(struct conn_stream *cs, struct pipe *pipe, unsigned int count)
+static int h1_rcv_pipe(struct stconn *sc, struct pipe *pipe, unsigned int count)
 {
-	struct h1s *h1s = __cs_mux(cs);
+	struct h1s *h1s = __sc_mux_strm(sc);
 	struct h1c *h1c = h1s->h1c;
 	struct h1m *h1m = (!(h1c->flags & H1C_F_IS_BACK) ? &h1s->req : &h1s->res);
 	int ret = 0;
@@ -3779,7 +3786,7 @@ static int h1_rcv_pipe(struct conn_stream *cs, struct pipe *pipe, unsigned int c
 			if (ret > h1m->curr_len) {
 				h1s->flags |= H1S_F_PARSING_ERROR;
 				h1c->flags |= H1C_F_ST_ERROR;
-				h1s->endp->flags  |= CS_EP_ERROR;
+				se_fl_set(h1s->sd, SE_FL_ERROR);
 				TRACE_ERROR("too much payload, more than announced",
 					    H1_EV_RX_DATA|H1_EV_STRM_ERR|H1_EV_H1C_ERR|H1_EV_H1S_ERR, h1c->conn, h1s);
 				goto end;
@@ -3804,7 +3811,7 @@ static int h1_rcv_pipe(struct conn_stream *cs, struct pipe *pipe, unsigned int c
 
 	if (!(h1c->flags & H1C_F_WANT_SPLICE)) {
 		TRACE_STATE("notify the mux can't use splicing anymore", H1_EV_STRM_RECV, h1c->conn, h1s);
-		h1s->endp->flags &= ~CS_EP_MAY_SPLICE;
+		se_fl_clr(h1s->sd, SE_FL_MAY_SPLICE);
 		if (!(h1c->wait_event.events & SUB_RETRY_RECV)) {
 			TRACE_STATE("restart receiving data, subscribing", H1_EV_STRM_RECV, h1c->conn, h1s);
 			h1c->conn->xprt->subscribe(h1c->conn, h1c->conn->xprt_ctx, SUB_RETRY_RECV, &h1c->wait_event);
@@ -3815,9 +3822,9 @@ static int h1_rcv_pipe(struct conn_stream *cs, struct pipe *pipe, unsigned int c
 	return ret;
 }
 
-static int h1_snd_pipe(struct conn_stream *cs, struct pipe *pipe)
+static int h1_snd_pipe(struct stconn *sc, struct pipe *pipe)
 {
-	struct h1s *h1s = __cs_mux(cs);
+	struct h1s *h1s = __sc_mux_strm(sc);
 	struct h1c *h1c = h1s->h1c;
 	struct h1m *h1m = (!(h1c->flags & H1C_F_IS_BACK) ? &h1s->res : &h1s->req);
 	int ret = 0;
@@ -3837,7 +3844,7 @@ static int h1_snd_pipe(struct conn_stream *cs, struct pipe *pipe)
 		if (ret > h1m->curr_len) {
 			h1s->flags |= H1S_F_PROCESSING_ERROR;
 			h1c->flags |= H1C_F_ST_ERROR;
-			h1s->endp->flags  |= CS_EP_ERROR;
+			se_fl_set(h1s->sd, SE_FL_ERROR);
 			TRACE_ERROR("too much payload, more than announced",
 				    H1_EV_TX_DATA|H1_EV_STRM_ERR|H1_EV_H1C_ERR|H1_EV_H1S_ERR, h1c->conn, h1s);
 			goto end;
@@ -3902,16 +3909,17 @@ static int h1_show_fd(struct buffer *msg, struct connection *conn)
 			method = http_known_methods[h1s->meth].ptr;
 		else
 			method = "UNKNOWN";
-		chunk_appendf(msg, " h1s=%p h1s.flg=0x%x .endp.flg=0x%x .req.state=%s .res.state=%s"
+		chunk_appendf(msg, " h1s=%p h1s.flg=0x%x .sd.flg=0x%x .req.state=%s .res.state=%s"
 		    " .meth=%s status=%d",
-			      h1s, h1s->flags, h1s->endp->flags,
+			      h1s, h1s->flags, se_fl_get(h1s->sd),
 			      h1m_state_str(h1s->req.state),
 			      h1m_state_str(h1s->res.state), method, h1s->status);
-		if (h1s->endp) {
-			chunk_appendf(msg, " .endp.flg=0x%08x", h1s->endp->flags);
-			if (!(h1s->endp->flags & CS_EP_ORPHAN))
-				chunk_appendf(msg, " .cs.flg=0x%08x .cs.app=%p",
-					      h1s->endp->cs->flags, h1s->endp->cs->app);
+		if (h1s->sd) {
+			chunk_appendf(msg, " .sd.flg=0x%08x",
+				      se_fl_get(h1s->sd));
+			if (!se_fl_test(h1s->sd, SE_FL_ORPHAN))
+				chunk_appendf(msg, " .sc.flg=0x%08x .sc.app=%p",
+					      h1s_sc(h1s)->flags, h1s_sc(h1s)->app);
 		}
 		chunk_appendf(&trash, " .subs=%p", h1s->subs);
 		if (h1s->subs) {
@@ -4197,7 +4205,7 @@ static const struct mux_ops mux_http_ops = {
 	.init        = h1_init,
 	.wake        = h1_wake,
 	.attach      = h1_attach,
-	.get_first_cs = h1_get_first_cs,
+	.get_first_sc = h1_get_first_sc,
 	.detach      = h1_detach,
 	.destroy     = h1_destroy,
 	.avail_streams = h1_avail_streams,
@@ -4223,7 +4231,7 @@ static const struct mux_ops mux_h1_ops = {
 	.init        = h1_init,
 	.wake        = h1_wake,
 	.attach      = h1_attach,
-	.get_first_cs = h1_get_first_cs,
+	.get_first_sc = h1_get_first_sc,
 	.detach      = h1_detach,
 	.destroy     = h1_destroy,
 	.avail_streams = h1_avail_streams,

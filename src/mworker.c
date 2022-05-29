@@ -25,8 +25,6 @@
 #include <haproxy/api.h>
 #include <haproxy/cfgparse.h>
 #include <haproxy/cli.h>
-#include <haproxy/conn_stream.h>
-#include <haproxy/cs_utils.h>
 #include <haproxy/errors.h>
 #include <haproxy/fd.h>
 #include <haproxy/global.h>
@@ -35,7 +33,9 @@
 #include <haproxy/mworker.h>
 #include <haproxy/peers.h>
 #include <haproxy/proxy.h>
+#include <haproxy/sc_strm.h>
 #include <haproxy/signal.h>
+#include <haproxy/stconn.h>
 #include <haproxy/stream.h>
 #include <haproxy/tools.h>
 #include <haproxy/version.h>
@@ -509,14 +509,14 @@ void mworker_cleanup_proc()
 /*  Displays workers and processes  */
 static int cli_io_handler_show_proc(struct appctx *appctx)
 {
-	struct conn_stream *cs = appctx_cs(appctx);
+	struct stconn *sc = appctx_sc(appctx);
 	struct mworker_proc *child;
 	int old = 0;
 	int up = now.tv_sec - proc_self->timestamp;
 	char *uptime = NULL;
 	char *reloadtxt = NULL;
 
-	if (unlikely(cs_ic(cs)->flags & (CF_WRITE_ERROR|CF_SHUTW)))
+	if (unlikely(sc_ic(sc)->flags & (CF_WRITE_ERROR|CF_SHUTW)))
 		return 1;
 
 	chunk_reset(&trash);
@@ -603,10 +603,8 @@ static int cli_io_handler_show_proc(struct appctx *appctx)
 
 
 
-	if (ci_putchk(cs_ic(cs), &trash) == -1) {
-		cs_rx_room_blk(cs);
+	if (applet_putchk(appctx, &trash) == -1)
 		return 0;
-	}
 
 	/* dump complete */
 	return 1;

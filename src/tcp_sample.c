@@ -32,13 +32,13 @@
 #include <haproxy/api.h>
 #include <haproxy/arg.h>
 #include <haproxy/connection.h>
-#include <haproxy/cs_utils.h>
 #include <haproxy/errors.h>
 #include <haproxy/global.h>
 #include <haproxy/listener-t.h>
 #include <haproxy/namespace.h>
 #include <haproxy/proxy-t.h>
 #include <haproxy/sample.h>
+#include <haproxy/sc_strm.h>
 #include <haproxy/session.h>
 #include <haproxy/tools.h>
 
@@ -52,8 +52,8 @@ smp_fetch_src(const struct arg *args, struct sample *smp, const char *kw, void *
 
 	if (kw[0] == 'b') { /* bc_src */
 		struct connection *conn = ((obj_type(smp->sess->origin) == OBJ_TYPE_CHECK)
-					   ? cs_conn(__objt_check(smp->sess->origin)->cs)
-					   : (smp->strm ? cs_conn(smp->strm->csb): NULL));
+					   ? sc_conn(__objt_check(smp->sess->origin)->sc)
+					   : (smp->strm ? sc_conn(smp->strm->scb): NULL));
 		if (conn && conn_get_src(conn))
 			src = conn_src(conn);
 	}
@@ -64,7 +64,7 @@ smp_fetch_src(const struct arg *args, struct sample *smp, const char *kw, void *
 			src = conn_src(conn);
 	}
         else /* src */
-		src = (smp->strm ? cs_src(smp->strm->csf) : sess_src(smp->sess));
+		src = (smp->strm ? sc_src(smp->strm->scf) : sess_src(smp->sess));
 
 	if (!src)
 		return 0;
@@ -96,8 +96,8 @@ smp_fetch_sport(const struct arg *args, struct sample *smp, const char *kw, void
 
 	if (kw[0] == 'b') { /* bc_src_port */
 		struct connection *conn = ((obj_type(smp->sess->origin) == OBJ_TYPE_CHECK)
-					   ? cs_conn(__objt_check(smp->sess->origin)->cs)
-					   : (smp->strm ? cs_conn(smp->strm->csb): NULL));
+					   ? sc_conn(__objt_check(smp->sess->origin)->sc)
+					   : (smp->strm ? sc_conn(smp->strm->scb): NULL));
 		if (conn && conn_get_src(conn))
 			src = conn_src(conn);
 	}
@@ -108,7 +108,7 @@ smp_fetch_sport(const struct arg *args, struct sample *smp, const char *kw, void
 			src = conn_src(conn);
 	}
         else /* src_port */
-		src = (smp->strm ? cs_src(smp->strm->csf) : sess_src(smp->sess));
+		src = (smp->strm ? sc_src(smp->strm->scf) : sess_src(smp->sess));
 
 	if (!src)
 		return 0;
@@ -131,8 +131,8 @@ smp_fetch_dst(const struct arg *args, struct sample *smp, const char *kw, void *
 
 	if (kw[0] == 'b') { /* bc_dst */
 		struct connection *conn = ((obj_type(smp->sess->origin) == OBJ_TYPE_CHECK)
-					   ? cs_conn(__objt_check(smp->sess->origin)->cs)
-					   : (smp->strm ? cs_conn(smp->strm->csb): NULL));
+					   ? sc_conn(__objt_check(smp->sess->origin)->sc)
+					   : (smp->strm ? sc_conn(smp->strm->scb): NULL));
 		if (conn && conn_get_dst(conn))
 			dst = conn_dst(conn);
 	}
@@ -143,7 +143,7 @@ smp_fetch_dst(const struct arg *args, struct sample *smp, const char *kw, void *
 			dst = conn_dst(conn);
 	}
         else /* dst */
-		dst = (smp->strm ? cs_dst(smp->strm->csf) : sess_dst(smp->sess));
+		dst = (smp->strm ? sc_dst(smp->strm->scf) : sess_dst(smp->sess));
 
 	if (!dst)
 		return 0;
@@ -180,7 +180,7 @@ int smp_fetch_dst_is_local(const struct arg *args, struct sample *smp, const cha
 			dst = conn_dst(conn);
 	}
 	else /* dst_is_local */
-		dst = (smp->strm ? cs_dst(smp->strm->csf) : sess_dst(smp->sess));
+		dst = (smp->strm ? sc_dst(smp->strm->scf) : sess_dst(smp->sess));
 
 	if (!dst)
 		return 0;
@@ -206,7 +206,7 @@ int smp_fetch_src_is_local(const struct arg *args, struct sample *smp, const cha
 			src = conn_src(conn);
 	}
 	else /* src_is_local */
-		src = (smp->strm ? cs_src(smp->strm->csf) : sess_src(smp->sess));
+		src = (smp->strm ? sc_src(smp->strm->scf) : sess_src(smp->sess));
 
 	if (!src)
 		return 0;
@@ -227,8 +227,8 @@ smp_fetch_dport(const struct arg *args, struct sample *smp, const char *kw, void
 
 	if (kw[0] == 'b') { /* bc_dst_port */
 		struct connection *conn = ((obj_type(smp->sess->origin) == OBJ_TYPE_CHECK)
-					   ? cs_conn(__objt_check(smp->sess->origin)->cs)
-					   : (smp->strm ? cs_conn(smp->strm->csb): NULL));
+					   ? sc_conn(__objt_check(smp->sess->origin)->sc)
+					   : (smp->strm ? sc_conn(smp->strm->scb): NULL));
 		if (conn && conn_get_dst(conn))
 			dst = conn_dst(conn);
 	}
@@ -239,7 +239,7 @@ smp_fetch_dport(const struct arg *args, struct sample *smp, const char *kw, void
 			dst = conn_dst(conn);
 	}
         else /* dst_port */
-		dst = (smp->strm ? cs_dst(smp->strm->csf) : sess_dst(smp->sess));
+		dst = (smp->strm ? sc_dst(smp->strm->scf) : sess_dst(smp->sess));
 
 	if (!dst)
 		return 0;
@@ -321,10 +321,11 @@ static inline int get_tcp_info(const struct arg *args, struct sample *smp,
 	if (!smp->strm)
 		return 0;
 
-	/* get the object associated with the conn-stream.The
+	/* get the object associated with the stream connector.The
 	 * object can be other thing than a connection. For example,
-	 * it be a appctx. */
-	conn = (dir == 0 ? cs_conn(smp->strm->csf) : cs_conn(smp->strm->csb));
+	 * it be a appctx.
+	 */
+	conn = (dir == 0 ? sc_conn(smp->strm->scf) : sc_conn(smp->strm->scb));
 	if (!conn)
 		return 0;
 

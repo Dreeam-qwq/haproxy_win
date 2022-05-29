@@ -25,14 +25,14 @@
 #include <haproxy/channel.h>
 #include <haproxy/check.h>
 #include <haproxy/cli.h>
-#include <haproxy/conn_stream.h>
-#include <haproxy/cs_utils.h>
 #include <haproxy/dgram.h>
 #include <haproxy/dns.h>
 #include <haproxy/errors.h>
 #include <haproxy/fd.h>
 #include <haproxy/log.h>
 #include <haproxy/ring.h>
+#include <haproxy/sc_strm.h>
+#include <haproxy/stconn.h>
 #include <haproxy/stream.h>
 #include <haproxy/tools.h>
 
@@ -438,7 +438,7 @@ out:
  */
 static void dns_session_io_handler(struct appctx *appctx)
 {
-	struct conn_stream *cs = appctx_cs(appctx);
+	struct stconn *sc = appctx_sc(appctx);
 	struct dns_session *ds = appctx->svcctx;
 	struct ring *ring = &ds->ring;
 	struct buffer *buf = &ring->buf;
@@ -460,21 +460,21 @@ static void dns_session_io_handler(struct appctx *appctx)
 		goto close;
 
 	/* an error was detected */
-	if (unlikely(cs_ic(cs)->flags & (CF_WRITE_ERROR|CF_SHUTW)))
+	if (unlikely(sc_ic(sc)->flags & (CF_WRITE_ERROR|CF_SHUTW)))
 		goto close;
 
 	/* con closed by server side, we will skip data write and drain data from channel */
-	if ((cs_oc(cs)->flags & CF_SHUTW)) {
+	if ((sc_oc(sc)->flags & CF_SHUTW)) {
 		goto read;
 	}
 
 	/* if the connection is not established, inform the stream that we want
 	 * to be notified whenever the connection completes.
 	 */
-	if (cs_opposite(cs)->state < CS_ST_EST) {
-		cs_cant_get(cs);
-		cs_rx_conn_blk(cs);
-		cs_rx_endp_more(cs);
+	if (sc_opposite(sc)->state < SC_ST_EST) {
+		applet_need_more_data(appctx);
+		se_need_remote_conn(appctx->sedesc);
+		applet_have_more_data(appctx);
 		return;
 	}
 
@@ -506,7 +506,7 @@ static void dns_session_io_handler(struct appctx *appctx)
 	 * the message so that we can take our reference there if we have to
 	 * stop before the end (ret=0).
 	 */
-	if (cs_opposite(cs)->state == CS_ST_EST) {
+	if (sc_opposite(sc)->state == SC_ST_EST) {
 		/* we were already there, adjust the offset to be relative to
 		 * the buffer's head and remove us from the counter.
 		 */
@@ -528,7 +528,7 @@ static void dns_session_io_handler(struct appctx *appctx)
 			BUG_ON(msg_len + ofs + cnt + 1 > b_data(buf));
 
 			/* retrieve available room on output channel */
-			available_room = channel_recv_max(cs_ic(cs));
+			available_room = channel_recv_max(sc_ic(sc));
 
 			/* tx_msg_offset null means we are at the start of a new message */
 			if (!ds->tx_msg_offset) {
@@ -536,7 +536,7 @@ static void dns_session_io_handler(struct appctx *appctx)
 
 				/* check if there is enough room to put message len and query id */
 				if (available_room < sizeof(slen) + sizeof(new_qid)) {
-					cs_rx_room_blk(cs);
+					sc_need_room(sc);
 					ret = 0;
 					break;
 				}
@@ -544,7 +544,7 @@ static void dns_session_io_handler(struct appctx *appctx)
 				/* put msg len into then channel */
 				slen = (uint16_t)msg_len;
 				slen = htons(slen);
-				ci_putblk(cs_ic(cs), (char *)&slen, sizeof(slen));
+				applet_putblk(appctx, (char *)&slen, sizeof(slen));
 				available_room -= sizeof(slen);
 
 				/* backup original query id */
@@ -562,7 +562,7 @@ static void dns_session_io_handler(struct appctx *appctx)
 				new_qid = htons(new_qid);
 
 				/* put new query id into the channel */
-				ci_putblk(cs_ic(cs), (char *)&new_qid, sizeof(new_qid));
+				applet_putblk(appctx, (char *)&new_qid, sizeof(new_qid));
 				available_room -= sizeof(new_qid);
 
 				/* keep query id mapping */
@@ -594,7 +594,7 @@ static void dns_session_io_handler(struct appctx *appctx)
 
 			/* check if it remains available room on output chan */
 			if (unlikely(!available_room)) {
-				cs_rx_room_blk(cs);
+				sc_need_room(sc);
 				ret = 0;
 				break;
 			}
@@ -617,12 +617,11 @@ static void dns_session_io_handler(struct appctx *appctx)
 			}
 			trash.data += len;
 
-			if (ci_putchk(cs_ic(cs), &trash) == -1) {
+			if (applet_putchk(appctx, &trash) == -1) {
 				/* should never happen since we
 				 * check available_room is large
 				 * enough here.
 				 */
-				cs_rx_room_blk(cs);
 				ret = 0;
 				break;
 			}
@@ -630,7 +629,7 @@ static void dns_session_io_handler(struct appctx *appctx)
 			if (ds->tx_msg_offset) {
 				/* msg was not fully processed, we must  be awake to drain pending data */
 
-				cs_rx_room_blk(cs);
+				sc_need_room(sc);
 				ret = 0;
 				break;
 			}
@@ -650,7 +649,7 @@ static void dns_session_io_handler(struct appctx *appctx)
 		BUG_ON(LIST_INLIST(&appctx->wait_entry));
 		LIST_APPEND(&ring->waiters, &appctx->wait_entry);
 		HA_RWLOCK_WRUNLOCK(DNS_LOCK, &ring->lock);
-		cs_rx_endp_done(cs);
+		applet_have_no_more_data(appctx);
 	}
 
 read:
@@ -670,35 +669,35 @@ read:
 
 			if (!ds->rx_msg.len) {
 				/* next message len is not fully available into the channel */
-				if (co_data(cs_oc(cs)) < 2)
+				if (co_data(sc_oc(sc)) < 2)
 					break;
 
 				/* retrieve message len */
-				co_getblk(cs_oc(cs), (char *)&msg_len, 2, 0);
+				co_getblk(sc_oc(sc), (char *)&msg_len, 2, 0);
 
 				/* mark as consumed */
-				co_skip(cs_oc(cs), 2);
+				co_skip(sc_oc(sc), 2);
 
 				/* store message len */
 				ds->rx_msg.len = ntohs(msg_len);
 			}
 
-			if (!co_data(cs_oc(cs))) {
+			if (!co_data(sc_oc(sc))) {
 				/* we need more data but nothing is available */
 				break;
 			}
 
-			if (co_data(cs_oc(cs)) + ds->rx_msg.offset < ds->rx_msg.len) {
+			if (co_data(sc_oc(sc)) + ds->rx_msg.offset < ds->rx_msg.len) {
 				/* message only partially available */
 
 				/* read available data */
-				co_getblk(cs_oc(cs), ds->rx_msg.area + ds->rx_msg.offset, co_data(cs_oc(cs)), 0);
+				co_getblk(sc_oc(sc), ds->rx_msg.area + ds->rx_msg.offset, co_data(sc_oc(sc)), 0);
 
 				/* update message offset */
-				ds->rx_msg.offset += co_data(cs_oc(cs));
+				ds->rx_msg.offset += co_data(sc_oc(sc));
 
 				/* consume all pending data from the channel */
-				co_skip(cs_oc(cs), co_data(cs_oc(cs)));
+				co_skip(sc_oc(sc), co_data(sc_oc(sc)));
 
 				/* we need to wait for more data */
 				break;
@@ -707,10 +706,10 @@ read:
 			/* enough data is available into the channel to read the message until the end */
 
 			/* read from the channel until the end of the message */
-			co_getblk(cs_oc(cs), ds->rx_msg.area + ds->rx_msg.offset, ds->rx_msg.len - ds->rx_msg.offset, 0);
+			co_getblk(sc_oc(sc), ds->rx_msg.area + ds->rx_msg.offset, ds->rx_msg.len - ds->rx_msg.offset, 0);
 
 			/* consume all data until the end of the message from the channel */
-			co_skip(cs_oc(cs), ds->rx_msg.len - ds->rx_msg.offset);
+			co_skip(sc_oc(sc), ds->rx_msg.len - ds->rx_msg.offset);
 
 			/* reset reader offset to 0 for next message reand */
 			ds->rx_msg.offset = 0;
@@ -756,7 +755,7 @@ read:
 
 		if (!LIST_INLIST(&ds->waiter)) {
 			/* there is no more pending data to read and the con was closed by the server side */
-			if (!co_data(cs_oc(cs)) && (cs_oc(cs)->flags & CF_SHUTW)) {
+			if (!co_data(sc_oc(sc)) && (sc_oc(sc)->flags & CF_SHUTW)) {
 				goto close;
 			}
 		}
@@ -765,9 +764,9 @@ read:
 
 	return;
 close:
-	cs_shutw(cs);
-	cs_shutr(cs);
-	cs_ic(cs)->flags |= CF_READ_NULL;
+	sc_shutw(sc);
+	sc_shutr(sc);
+	sc_ic(sc)->flags |= CF_READ_NULL;
 }
 
 void dns_queries_flush(struct dns_session *ds)
@@ -828,8 +827,8 @@ static int dns_session_init(struct appctx *appctx)
 		goto error;
 
 	s = appctx_strm(appctx);
-	s->csb->dst = addr;
-	s->csb->flags |= CS_FL_NOLINGER;
+	s->scb->dst = addr;
+	s->scb->flags |= SC_FL_NOLINGER;
 	s->target = &ds->dss->srv->obj_type;
 	s->flags = SF_ASSIGNED;
 

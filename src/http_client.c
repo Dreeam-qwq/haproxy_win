@@ -18,8 +18,6 @@
 #include <haproxy/ssl_ckch.h>
 #include <haproxy/dynbuf.h>
 #include <haproxy/cfgparse.h>
-#include <haproxy/conn_stream.h>
-#include <haproxy/cs_utils.h>
 #include <haproxy/global.h>
 #include <haproxy/istbuf.h>
 #include <haproxy/h1_htx.h>
@@ -32,9 +30,11 @@
 #include <haproxy/log.h>
 #include <haproxy/proxy.h>
 #include <haproxy/resolvers.h>
+#include <haproxy/sc_strm.h>
 #include <haproxy/server.h>
 #include <haproxy/ssl_sock-t.h>
 #include <haproxy/sock_inet.h>
+#include <haproxy/stconn.h>
 #include <haproxy/tools.h>
 
 #include <string.h>
@@ -195,7 +195,7 @@ err:
 static int hc_cli_io_handler(struct appctx *appctx)
 {
 	struct hcli_svc_ctx *ctx = appctx->svcctx;
-	struct conn_stream *cs = appctx_cs(appctx);
+	struct stconn *sc = appctx_sc(appctx);
 	struct buffer *trash = alloc_trash_chunk();
 	struct httpclient *hc = ctx->hc;
 	struct http_hdr *hdrs, *hdr;
@@ -206,8 +206,7 @@ static int hc_cli_io_handler(struct appctx *appctx)
 	if (ctx->flags & HC_CLI_F_RES_STLINE) {
 		chunk_appendf(trash, "%.*s %d %.*s\n", (unsigned int)istlen(hc->res.vsn), istptr(hc->res.vsn),
 			      hc->res.status, (unsigned int)istlen(hc->res.reason), istptr(hc->res.reason));
-		if (ci_putchk(cs_ic(cs), trash) == -1)
-			cs_rx_room_blk(cs);
+		applet_putchk(appctx, trash);
 		ctx->flags &= ~HC_CLI_F_RES_STLINE;
 		goto out;
 	}
@@ -220,8 +219,7 @@ static int hc_cli_io_handler(struct appctx *appctx)
 		}
 		if (!chunk_memcat(trash, "\r\n", 2))
 			goto out;
-		if (ci_putchk(cs_ic(cs), trash) == -1)
-			cs_rx_room_blk(cs);
+		applet_putchk(appctx, trash);
 		ctx->flags &= ~HC_CLI_F_RES_HDR;
 		goto out;
 	}
@@ -229,8 +227,8 @@ static int hc_cli_io_handler(struct appctx *appctx)
 	if (ctx->flags & HC_CLI_F_RES_BODY) {
 		int ret;
 
-		ret = httpclient_res_xfer(hc, cs_ib(cs));
-		channel_add_input(cs_ic(cs), ret); /* forward what we put in the buffer channel */
+		ret = httpclient_res_xfer(hc, sc_ib(sc));
+		channel_add_input(sc_ic(sc), ret); /* forward what we put in the buffer channel */
 
 		if (!httpclient_data(hc)) {/* remove the flag if the buffer was emptied */
 			ctx->flags &= ~HC_CLI_F_RES_BODY;
@@ -240,8 +238,8 @@ static int hc_cli_io_handler(struct appctx *appctx)
 
 	/* we must close only if F_END is the last flag */
 	if (ctx->flags ==  HC_CLI_F_RES_END) {
-		cs_shutw(cs);
-		cs_shutr(cs);
+		sc_shutw(sc);
+		sc_shutr(sc);
 		ctx->flags &= ~HC_CLI_F_RES_END;
 		goto out;
 	}
@@ -249,7 +247,7 @@ static int hc_cli_io_handler(struct appctx *appctx)
 out:
 	/* we didn't clear every flags, we should come back to finish things */
 	if (ctx->flags)
-		cs_rx_room_blk(cs);
+		sc_need_room(sc);
 
 	free_trash_chunk(trash);
 	return 0;
@@ -638,8 +636,8 @@ err:
 static void httpclient_applet_io_handler(struct appctx *appctx)
 {
 	struct httpclient *hc = appctx->svcctx;
-	struct conn_stream *cs = appctx_cs(appctx);
-	struct stream *s = __cs_strm(cs);
+	struct stconn *sc = appctx_sc(appctx);
+	struct stream *s = __sc_strm(sc);
 	struct channel *req = &s->req;
 	struct channel *res = &s->res;
 	struct htx_blk *blk = NULL;
@@ -732,7 +730,7 @@ static void httpclient_applet_io_handler(struct appctx *appctx)
 					/* if the request contains the HTX_FL_EOM, we finished the request part. */
 					if (htx->flags & HTX_FL_EOM) {
 						req->flags |= CF_EOI;
-						appctx->endp->flags |= CS_EP_EOI;
+						se_fl_set(appctx->sedesc, SE_FL_EOI);
 						appctx->st0 = HTTPCLIENT_S_RES_STLINE;
 					}
 
@@ -913,13 +911,13 @@ static void httpclient_applet_io_handler(struct appctx *appctx)
 
 process_data:
 
-	cs_rx_chan_rdy(cs);
+	sc_will_read(sc);
 
 	return;
 more:
 	/* There was not enough data in the response channel */
 
-	cs_rx_room_blk(cs);
+	sc_need_room(sc);
 
 	if (appctx->st0 == HTTPCLIENT_S_RES_END)
 		goto end;
@@ -935,8 +933,8 @@ more:
 	return;
 
 end:
-	cs_shutw(cs);
-	cs_shutr(cs);
+	sc_shutw(sc);
+	sc_shutr(sc);
 	return;
 }
 
@@ -1007,20 +1005,20 @@ static int httpclient_applet_init(struct appctx *appctx)
 
 	if (doresolve) {
 		/* in order to do the set-dst we need to put the address on the front */
-		s->csf->dst = addr;
+		s->scf->dst = addr;
 	} else {
 		/* in cases we don't use the resolve we already have the address
 		 * and must put it on the backend side, some of the cases are
 		 * not meant to be used on the frontend (sockpair, unix socket etc.) */
-		s->csb->dst = addr;
+		s->scb->dst = addr;
 	}
 
-	s->csb->flags |= CS_FL_NOLINGER;
+	s->scb->flags |= SC_FL_NOLINGER;
 	s->flags |= SF_ASSIGNED;
 	s->res.flags |= CF_READ_DONTWAIT;
 
 	/* applet is waiting for data */
-	cs_cant_get(s->csf);
+	applet_need_more_data(appctx);
 	appctx_wakeup(appctx);
 
 	hc->appctx = appctx;

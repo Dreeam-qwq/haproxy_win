@@ -17,13 +17,13 @@
 #include <haproxy/applet.h>
 #include <haproxy/arg.h>
 #include <haproxy/cli.h>
-#include <haproxy/conn_stream.h>
-#include <haproxy/cs_utils.h>
 #include <haproxy/map.h>
 #include <haproxy/pattern.h>
 #include <haproxy/regex.h>
 #include <haproxy/sample.h>
+#include <haproxy/sc_strm.h>
 #include <haproxy/stats-t.h>
+#include <haproxy/stconn.h>
 #include <haproxy/tools.h>
 
 
@@ -345,10 +345,10 @@ struct show_map_ctx {
 static int cli_io_handler_pat_list(struct appctx *appctx)
 {
 	struct show_map_ctx *ctx = appctx->svcctx;
-	struct conn_stream *cs = appctx_cs(appctx);
+	struct stconn *sc = appctx_sc(appctx);
 	struct pat_ref_elt *elt;
 
-	if (unlikely(cs_ic(cs)->flags & (CF_WRITE_ERROR|CF_SHUTW))) {
+	if (unlikely(sc_ic(sc)->flags & (CF_WRITE_ERROR|CF_SHUTW))) {
 		/* If we're forced to shut down, we might have to remove our
 		 * reference to the last ref_elt being dumped.
 		 */
@@ -392,13 +392,12 @@ static int cli_io_handler_pat_list(struct appctx *appctx)
 				chunk_appendf(&trash, "%p %s\n",
 				              elt, elt->pattern);
 
-			if (ci_putchk(cs_ic(cs), &trash) == -1) {
+			if (applet_putchk(appctx, &trash) == -1) {
 				/* let's try again later from this stream. We add ourselves into
 				 * this stream's users so that it can remove us upon termination.
 				 */
 				LIST_APPEND(&elt->back_refs, &ctx->bref.users);
 				HA_SPIN_UNLOCK(PATREF_LOCK, &ctx->ref->lock);
-				cs_rx_room_blk(cs);
 				return 0;
 			}
 		skip:
@@ -417,7 +416,6 @@ static int cli_io_handler_pat_list(struct appctx *appctx)
 static int cli_io_handler_pats_list(struct appctx *appctx)
 {
 	struct show_map_ctx *ctx = appctx->svcctx;
-	struct conn_stream *cs = appctx_cs(appctx);
 
 	switch (ctx->state) {
 	case STATE_INIT:
@@ -427,10 +425,8 @@ static int cli_io_handler_pats_list(struct appctx *appctx)
 		 */
 		chunk_reset(&trash);
 		chunk_appendf(&trash, "# id (file) description\n");
-		if (ci_putchk(cs_ic(cs), &trash) == -1) {
-			cs_rx_room_blk(cs);
+		if (applet_putchk(appctx, &trash) == -1)
 			return 0;
-		}
 
 		/* Now, we start the browsing of the references lists.
 		 * Note that the following call to LIST_ELEM returns a bad pointer. The only
@@ -455,11 +451,10 @@ static int cli_io_handler_pats_list(struct appctx *appctx)
 			              ctx->ref->display, ctx->ref->curr_gen, ctx->ref->next_gen,
 			              ctx->ref->entry_cnt);
 
-			if (ci_putchk(cs_ic(cs), &trash) == -1) {
+			if (applet_putchk(appctx, &trash) == -1) {
 				/* let's try again later from this stream. We add ourselves into
 				 * this stream's users so that it can remove us upon termination.
 				 */
-				cs_rx_room_blk(cs);
 				return 0;
 			}
 
@@ -480,7 +475,6 @@ static int cli_io_handler_pats_list(struct appctx *appctx)
 static int cli_io_handler_map_lookup(struct appctx *appctx)
 {
 	struct show_map_ctx *ctx = appctx->svcctx;
-	struct conn_stream *cs = appctx_cs(appctx);
 	struct sample sample;
 	struct pattern *pat;
 	int match_method;
@@ -576,12 +570,11 @@ static int cli_io_handler_map_lookup(struct appctx *appctx)
 			chunk_appendf(&trash, "\n");
 
 			/* display response */
-			if (ci_putchk(cs_ic(cs), &trash) == -1) {
+			if (applet_putchk(appctx, &trash) == -1) {
 				/* let's try again later from this stream. We add ourselves into
 				 * this stream's users so that it can remove us upon termination.
 				 */
 				HA_SPIN_UNLOCK(PATREF_LOCK, &ctx->ref->lock);
-				cs_rx_room_blk(cs);
 				return 0;
 			}
 
@@ -1030,7 +1023,7 @@ static int cli_io_handler_clear_map(struct appctx *appctx)
 
 	if (!finished) {
 		/* let's come back later */
-		cs_rx_endp_more(appctx_cs(appctx));
+		applet_have_more_data(appctx);
 		return 0;
 	}
 	return 1;

@@ -19,8 +19,6 @@
 #include <haproxy/cfgparse.h>
 #include <haproxy/channel.h>
 #include <haproxy/cli.h>
-#include <haproxy/conn_stream.h>
-#include <haproxy/cs_utils.h>
 #include <haproxy/errors.h>
 #include <haproxy/filters.h>
 #include <haproxy/hash.h>
@@ -32,7 +30,9 @@
 #include <haproxy/net_helper.h>
 #include <haproxy/proxy.h>
 #include <haproxy/sample.h>
+#include <haproxy/sc_strm.h>
 #include <haproxy/shctx.h>
+#include <haproxy/stconn.h>
 #include <haproxy/stream.h>
 #include <haproxy/tools.h>
 
@@ -1294,7 +1294,7 @@ static unsigned int htx_cache_dump_blk(struct appctx *appctx, struct htx *htx, e
 	uint32_t blksz;
 
 	max = htx_get_max_blksz(htx,
-				channel_htx_recv_max(cs_ic(appctx_cs(appctx)), htx));
+				channel_htx_recv_max(sc_ic(appctx_sc(appctx)), htx));
 	if (!max)
 		return 0;
 	blksz = ((type == HTX_BLK_HDR || type == HTX_BLK_TLR)
@@ -1338,7 +1338,7 @@ static unsigned int htx_cache_dump_data_blk(struct appctx *appctx, struct htx *h
 	uint32_t blksz;
 
 	max = htx_get_max_blksz(htx,
-				channel_htx_recv_max(cs_ic(appctx_cs(appctx)), htx));
+				channel_htx_recv_max(sc_ic(appctx_sc(appctx)), htx));
 	if (!max)
 		return 0;
 
@@ -1455,9 +1455,9 @@ static void http_cache_io_handler(struct appctx *appctx)
 	struct cache_appctx *ctx = appctx->svcctx;
 	struct cache_entry *cache_ptr = ctx->entry;
 	struct shared_block *first = block_ptr(cache_ptr);
-	struct conn_stream *cs = appctx_cs(appctx);
-	struct channel *req = cs_oc(cs);
-	struct channel *res = cs_ic(cs);
+	struct stconn *sc = appctx_sc(appctx);
+	struct channel *req = sc_oc(sc);
+	struct channel *res = sc_ic(sc);
 	struct htx *req_htx, *res_htx;
 	struct buffer *errmsg;
 	unsigned int len;
@@ -1466,12 +1466,12 @@ static void http_cache_io_handler(struct appctx *appctx)
 	res_htx = htx_from_buf(&res->buf);
 	total = res_htx->data;
 
-	if (unlikely(cs->state == CS_ST_DIS || cs->state == CS_ST_CLO))
+	if (unlikely(sc->state == SC_ST_DIS || sc->state == SC_ST_CLO))
 		goto out;
 
 	/* Check if the input buffer is available. */
 	if (!b_size(&res->buf)) {
-		cs_rx_room_blk(cs);
+		sc_need_room(sc);
 		goto out;
 	}
 
@@ -1505,7 +1505,7 @@ static void http_cache_io_handler(struct appctx *appctx)
 
 		/* Skip response body for HEAD requests or in case of "304 Not
 		 * Modified" response. */
-		if (__cs_strm(cs)->txn->meth == HTTP_METH_HEAD || ctx->send_notmodified)
+		if (__sc_strm(sc)->txn->meth == HTTP_METH_HEAD || ctx->send_notmodified)
 			appctx->st0 = HTX_CACHE_EOM;
 		else
 			appctx->st0 = HTX_CACHE_DATA;
@@ -1516,7 +1516,7 @@ static void http_cache_io_handler(struct appctx *appctx)
 		if (len) {
 			ret = htx_cache_dump_msg(appctx, res_htx, len, HTX_BLK_UNUSED);
 			if (ret < len) {
-				cs_rx_room_blk(cs);
+				sc_need_room(sc);
 				goto out;
 			}
 		}
@@ -1527,14 +1527,14 @@ static void http_cache_io_handler(struct appctx *appctx)
 		 /* no more data are expected. */
 		res_htx->flags |= HTX_FL_EOM;
 		res->flags |= CF_EOI;
-		appctx->endp->flags |= CS_EP_EOI;
+		se_fl_set(appctx->sedesc, SE_FL_EOI);
 		appctx->st0 = HTX_CACHE_END;
 	}
 
   end:
 	if (!(res->flags & CF_SHUTR) && appctx->st0 == HTX_CACHE_END) {
 		res->flags |= CF_READ_NULL;
-		cs_shutr(cs);
+		sc_shutr(sc);
 	}
 
   out:
@@ -1840,7 +1840,7 @@ enum act_return http_action_req_cache_use(struct act_rule *rule, struct proxy *p
 		}
 
 		s->target = &http_cache_applet.obj_type;
-		if ((appctx = cs_applet_create(s->csb, objt_applet(s->target)))) {
+		if ((appctx = sc_applet_create(s->scb, objt_applet(s->target)))) {
 			struct cache_appctx *ctx = applet_reserve_svcctx(appctx, sizeof(*ctx));
 
 			appctx->st0 = HTX_CACHE_INIT;
@@ -2600,7 +2600,6 @@ static int cli_io_handler_show_cache(struct appctx *appctx)
 {
 	struct show_cache_ctx *ctx = appctx->svcctx;
 	struct cache* cache = ctx->cache;
-	struct conn_stream *cs = appctx_cs(appctx);
 
 	list_for_each_entry_from(cache, &caches, list) {
 		struct eb32_node *node = NULL;
@@ -2611,10 +2610,8 @@ static int cli_io_handler_show_cache(struct appctx *appctx)
 		next_key = ctx->next_key;
 		if (!next_key) {
 			chunk_printf(&trash, "%p: %s (shctx:%p, available blocks:%d)\n", cache, cache->id, shctx_ptr(cache), shctx_ptr(cache)->nbav);
-			if (ci_putchk(cs_ic(cs), &trash) == -1) {
-				cs_rx_room_blk(cs);
+			if (applet_putchk(appctx, &trash) == -1)
 				return 0;
-			}
 		}
 
 		ctx->cache = cache;
@@ -2649,10 +2646,8 @@ static int cli_io_handler_show_cache(struct appctx *appctx)
 
 			shctx_unlock(shctx_ptr(cache));
 
-			if (ci_putchk(cs_ic(cs), &trash) == -1) {
-				cs_rx_room_blk(cs);
+			if (applet_putchk(appctx, &trash) == -1)
 				return 0;
-			}
 		}
 
 	}
@@ -2690,8 +2685,8 @@ smp_fetch_res_cache_name(const struct arg *args, struct sample *smp,
 	if (!smp->strm || smp->strm->target != &http_cache_applet.obj_type)
 		return 0;
 
-	/* Get appctx from the conn-stream. */
-	appctx = cs_appctx(smp->strm->csb);
+	/* Get appctx from the stream connector. */
+	appctx = sc_appctx(smp->strm->scb);
 	if (appctx && appctx->rule) {
 		cconf = appctx->rule->arg.act.p[0];
 		if (cconf) {

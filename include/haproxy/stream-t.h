@@ -26,7 +26,7 @@
 
 #include <haproxy/api-t.h>
 #include <haproxy/channel-t.h>
-#include <haproxy/conn_stream-t.h>
+#include <haproxy/stconn-t.h>
 #include <haproxy/dynbuf-t.h>
 #include <haproxy/filters-t.h>
 #include <haproxy/obj_type-t.h>
@@ -160,7 +160,7 @@ struct stream {
 	int conn_retries;               /* number of connect retries performed */
 	unsigned int conn_exp;          /* wake up time for connect, queue, turn-around, ... */
 	unsigned int conn_err_type;     /* first error detected, one of STRM_ET_* */
-	enum cs_state prev_conn_state;  /* CS_ST*, copy of previous state of the server conn-stream */
+	enum sc_state prev_conn_state;  /* CS_ST*, copy of previous state of the server stream connector */
 
 	struct list list;               /* position in the thread's streams list */
 	struct mt_list by_srv;          /* position in server stream list */
@@ -187,14 +187,14 @@ struct stream {
 	struct vars vars_txn;                   /* list of variables for the txn scope. */
 	struct vars vars_reqres;                /* list of variables for the request and resp scope. */
 
-	struct conn_stream *csf;                /* frontend conn-stream */
-	struct conn_stream *csb;                /* backend conn-stream */
+	struct stconn *scf;                     /* frontend stream connector */
+	struct stconn *scb;                     /* backend stream connector */
 
 	struct strm_logs logs;                  /* logs for this stream */
 
 	void (*do_log)(struct stream *s);       /* the function to call in order to log (or NULL) */
 	void (*srv_error)(struct stream *s,     /* the function to call upon unrecoverable server errors (or NULL) */
-			  struct conn_stream *cs);
+			  struct stconn *sc);
 
 	int pcli_next_pid;                      /* next target PID to use for the CLI proxy */
 	int pcli_flags;                         /* flags for CLI proxy */

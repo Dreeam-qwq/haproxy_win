@@ -26,7 +26,6 @@
 #include <haproxy/arg.h>
 #include <haproxy/chunk.h>
 #include <haproxy/connection.h>
-#include <haproxy/cs_utils.h>
 #include <haproxy/fd.h>
 #include <haproxy/frontend.h>
 #include <haproxy/global.h>
@@ -35,6 +34,7 @@
 #include <haproxy/proto_tcp.h>
 #include <haproxy/proxy.h>
 #include <haproxy/sample.h>
+#include <haproxy/sc_strm.h>
 #include <haproxy/stream.h>
 #include <haproxy/task.h>
 #include <haproxy/ticks.h>
@@ -62,7 +62,7 @@ int frontend_accept(struct stream *s)
 					s->do_log(s);
 		}
 		else if (conn) {
-			src = cs_src(s->csf);
+			src = sc_src(s->scf);
 			if (!src)
 				send_log(fe, LOG_INFO, "Connect from unknown source to listener %d (%s/%s)\n",
 					 l->luid, fe->id, (fe->mode == PR_MODE_HTTP) ? "HTTP" : "TCP");
@@ -73,7 +73,7 @@ int frontend_accept(struct stream *s)
 				switch (addr_to_str(src, pn, sizeof(pn))) {
 				case AF_INET:
 				case AF_INET6:
-					dst = cs_dst(s->csf);
+					dst = sc_dst(s->scf);
 					if (dst) {
 						addr_to_str(dst, sn, sizeof(sn));
 						port = get_host_port(dst);
@@ -105,7 +105,7 @@ int frontend_accept(struct stream *s)
 		int alpn_len;
 
 		/* try to report the ALPN value when available (also works for NPN) */
-		if (conn == cs_conn(s->csf)) {
+		if (conn == sc_conn(s->scf)) {
 			if (conn_get_alpn(conn, &alpn_str, &alpn_len) && alpn_str) {
 				int len = MIN(alpn_len, sizeof(alpn) - 1);
 				memcpy(alpn, alpn_str, len);
@@ -113,7 +113,7 @@ int frontend_accept(struct stream *s)
 			}
 		}
 
-		src = cs_src(s->csf);
+		src = sc_src(s->scf);
 		if (!src) {
 			chunk_printf(&trash, "%08x:%s.accept(%04x)=%04x from [listener:%d] ALPN=%s\n",
 			             s->uniq_id, fe->id, (unsigned short)l->rx.fd, (unsigned short)conn->handle.fd,

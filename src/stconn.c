@@ -1,5 +1,5 @@
 /*
- * Conn-stream management functions
+ * stream connector management functions
  *
  * Copyright 2021 Christopher Faulet <cfaulet@haproxy.com>
  *
@@ -13,349 +13,348 @@
 #include <haproxy/api.h>
 #include <haproxy/applet.h>
 #include <haproxy/connection.h>
-#include <haproxy/conn_stream.h>
-#include <haproxy/cs_utils.h>
 #include <haproxy/check.h>
 #include <haproxy/http_ana.h>
 #include <haproxy/pipe.h>
 #include <haproxy/pool.h>
+#include <haproxy/sc_strm.h>
+#include <haproxy/stconn.h>
 
-DECLARE_POOL(pool_head_connstream, "conn_stream", sizeof(struct conn_stream));
-DECLARE_POOL(pool_head_cs_endpoint, "cs_endpoint", sizeof(struct cs_endpoint));
+DECLARE_POOL(pool_head_connstream, "stconn", sizeof(struct stconn));
+DECLARE_POOL(pool_head_sedesc, "sedesc", sizeof(struct sedesc));
 
-/* functions used by default on a detached conn-stream */
-static void cs_app_shutr(struct conn_stream *cs);
-static void cs_app_shutw(struct conn_stream *cs);
-static void cs_app_chk_rcv(struct conn_stream *cs);
-static void cs_app_chk_snd(struct conn_stream *cs);
+/* functions used by default on a detached stream connector */
+static void sc_app_shutr(struct stconn *sc);
+static void sc_app_shutw(struct stconn *sc);
+static void sc_app_chk_rcv(struct stconn *sc);
+static void sc_app_chk_snd(struct stconn *sc);
 
-/* functions used on a mux-based conn-stream */
-static void cs_app_shutr_conn(struct conn_stream *cs);
-static void cs_app_shutw_conn(struct conn_stream *cs);
-static void cs_app_chk_rcv_conn(struct conn_stream *cs);
-static void cs_app_chk_snd_conn(struct conn_stream *cs);
+/* functions used on a mux-based stream connector */
+static void sc_app_shutr_conn(struct stconn *sc);
+static void sc_app_shutw_conn(struct stconn *sc);
+static void sc_app_chk_rcv_conn(struct stconn *sc);
+static void sc_app_chk_snd_conn(struct stconn *sc);
 
-/* functions used on an applet-based conn-stream */
-static void cs_app_shutr_applet(struct conn_stream *cs);
-static void cs_app_shutw_applet(struct conn_stream *cs);
-static void cs_app_chk_rcv_applet(struct conn_stream *cs);
-static void cs_app_chk_snd_applet(struct conn_stream *cs);
+/* functions used on an applet-based stream connector */
+static void sc_app_shutr_applet(struct stconn *sc);
+static void sc_app_shutw_applet(struct stconn *sc);
+static void sc_app_chk_rcv_applet(struct stconn *sc);
+static void sc_app_chk_snd_applet(struct stconn *sc);
 
-/* conn-stream operations for connections */
-struct cs_app_ops cs_app_conn_ops = {
-	.chk_rcv = cs_app_chk_rcv_conn,
-	.chk_snd = cs_app_chk_snd_conn,
-	.shutr   = cs_app_shutr_conn,
-	.shutw   = cs_app_shutw_conn,
-};
+static int sc_conn_process(struct stconn *sc);
+static int sc_conn_recv(struct stconn *sc);
+static int sc_conn_send(struct stconn *sc);
+static int sc_applet_process(struct stconn *sc);
 
-/* conn-stream operations for embedded tasks */
-struct cs_app_ops cs_app_embedded_ops = {
-	.chk_rcv = cs_app_chk_rcv,
-	.chk_snd = cs_app_chk_snd,
-	.shutr   = cs_app_shutr,
-	.shutw   = cs_app_shutw,
-};
-
-/* conn-stream operations for connections */
-struct cs_app_ops cs_app_applet_ops = {
-	.chk_rcv = cs_app_chk_rcv_applet,
-	.chk_snd = cs_app_chk_snd_applet,
-	.shutr   = cs_app_shutr_applet,
-	.shutw   = cs_app_shutw_applet,
-};
-
-static int cs_conn_process(struct conn_stream *cs);
-static int cs_conn_recv(struct conn_stream *cs);
-static int cs_conn_send(struct conn_stream *cs);
-static int cs_applet_process(struct conn_stream *cs);
-
-struct data_cb cs_data_conn_cb = {
-	.wake    = cs_conn_process,
+/* stream connector operations for connections */
+struct sc_app_ops sc_app_conn_ops = {
+	.chk_rcv = sc_app_chk_rcv_conn,
+	.chk_snd = sc_app_chk_snd_conn,
+	.shutr   = sc_app_shutr_conn,
+	.shutw   = sc_app_shutw_conn,
+	.wake    = sc_conn_process,
 	.name    = "STRM",
 };
 
-struct data_cb cs_data_applet_cb = {
-	.wake    = cs_applet_process,
+/* stream connector operations for embedded tasks */
+struct sc_app_ops sc_app_embedded_ops = {
+	.chk_rcv = sc_app_chk_rcv,
+	.chk_snd = sc_app_chk_snd,
+	.shutr   = sc_app_shutr,
+	.shutw   = sc_app_shutw,
+	.wake    = NULL,   /* may never be used */
+	.name    = "NONE", /* may never be used */
+};
+
+/* stream connector operations for applets */
+struct sc_app_ops sc_app_applet_ops = {
+	.chk_rcv = sc_app_chk_rcv_applet,
+	.chk_snd = sc_app_chk_snd_applet,
+	.shutr   = sc_app_shutr_applet,
+	.shutw   = sc_app_shutw_applet,
+	.wake    = sc_applet_process,
 	.name    = "STRM",
 };
 
+/* stream connector for health checks on connections */
+struct sc_app_ops sc_app_check_ops = {
+	.chk_rcv = NULL,
+	.chk_snd = NULL,
+	.shutr   = NULL,
+	.shutw   = NULL,
+	.wake    = wake_srv_chk,
+	.name    = "CHCK",
+};
 
 /* Initializes an endpoint */
-void cs_endpoint_init(struct cs_endpoint *endp)
+void sedesc_init(struct sedesc *sedesc)
 {
-	endp->target = NULL;
-	endp->ctx = NULL;
-	endp->cs = NULL;
-	endp->flags = CS_EP_NONE;
+	sedesc->se = NULL;
+	sedesc->conn = NULL;
+	sedesc->sc = NULL;
+	se_fl_setall(sedesc, SE_FL_NONE);
 }
 
 /* Tries to alloc an endpoint and initialize it. Returns NULL on failure. */
-struct cs_endpoint *cs_endpoint_new()
+struct sedesc *sedesc_new()
 {
-	struct cs_endpoint *endp;
+	struct sedesc *sedesc;
 
-	endp = pool_alloc(pool_head_cs_endpoint);
-	if (unlikely(!endp))
+	sedesc = pool_alloc(pool_head_sedesc);
+	if (unlikely(!sedesc))
 		return NULL;
 
-	cs_endpoint_init(endp);
-	return endp;
+	sedesc_init(sedesc);
+	return sedesc;
 }
 
 /* Releases an endpoint. It is the caller responsibility to be sure it is safe
  * and it is not shared with another entity
  */
-void cs_endpoint_free(struct cs_endpoint *endp)
+void sedesc_free(struct sedesc *sedesc)
 {
-	pool_free(pool_head_cs_endpoint, endp);
+	pool_free(pool_head_sedesc, sedesc);
 }
 
-/* Tries to allocate a new conn_stream and initialize its main fields. On
+/* Tries to allocate a new stconn and initialize its main fields. On
  * failure, nothing is allocated and NULL is returned. It is an internal
- * function. The caller must, at least, set the CS_EP_ORPHAN or CS_EP_DETACHED
+ * function. The caller must, at least, set the SE_FL_ORPHAN or SE_FL_DETACHED
  * flag.
  */
-static struct conn_stream *cs_new(struct cs_endpoint *endp)
+static struct stconn *sc_new(struct sedesc *sedesc)
 {
-	struct conn_stream *cs;
+	struct stconn *sc;
 
-	cs = pool_alloc(pool_head_connstream);
+	sc = pool_alloc(pool_head_connstream);
 
-	if (unlikely(!cs))
+	if (unlikely(!sc))
 		goto alloc_error;
 
-	cs->obj_type = OBJ_TYPE_CS;
-	cs->flags = CS_FL_NONE;
-	cs->state = CS_ST_INI;
-	cs->hcto = TICK_ETERNITY;
-	cs->app = NULL;
-	cs->data_cb = NULL;
-	cs->src = NULL;
-	cs->dst = NULL;
-	cs->wait_event.tasklet = NULL;
-	cs->wait_event.events = 0;
+	sc->obj_type = OBJ_TYPE_SC;
+	sc->flags = SC_FL_NONE;
+	sc->state = SC_ST_INI;
+	sc->hcto = TICK_ETERNITY;
+	sc->app = NULL;
+	sc->app_ops = NULL;
+	sc->src = NULL;
+	sc->dst = NULL;
+	sc->wait_event.tasklet = NULL;
+	sc->wait_event.events = 0;
 
 	/* If there is no endpoint, allocate a new one now */
-	if (!endp) {
-		endp = cs_endpoint_new();
-		if (unlikely(!endp))
+	if (!sedesc) {
+		sedesc = sedesc_new();
+		if (unlikely(!sedesc))
 			goto alloc_error;
 	}
-	cs->endp = endp;
-	endp->cs = cs;
+	sc->sedesc = sedesc;
+	sedesc->sc = sc;
 
-	return cs;
+	return sc;
 
   alloc_error:
-	pool_free(pool_head_connstream, cs);
+	pool_free(pool_head_connstream, sc);
 	return NULL;
 }
 
-/* Creates a new conn-stream and its associated stream from a mux. <endp> must be
- * defined. It returns NULL on error. On success, the new conn-stream is
- * returned. In this case, CS_EP_ORPHAN flag is removed.
+/* Creates a new stream connector and its associated stream from a mux. <sd> must
+ * be defined. It returns NULL on error. On success, the new stream connector is
+ * returned. In this case, SE_FL_ORPHAN flag is removed.
  */
-struct conn_stream *cs_new_from_endp(struct cs_endpoint *endp, struct session *sess, struct buffer *input)
+struct stconn *sc_new_from_endp(struct sedesc *sd, struct session *sess, struct buffer *input)
 {
-	struct conn_stream *cs;
+	struct stconn *sc;
 
-	cs = cs_new(endp);
-	if (unlikely(!cs))
+	sc = sc_new(sd);
+	if (unlikely(!sc))
 		return NULL;
-	if (unlikely(!stream_new(sess, cs, input))) {
-		pool_free(pool_head_connstream, cs);
-		cs = NULL;
+	if (unlikely(!stream_new(sess, sc, input))) {
+		pool_free(pool_head_connstream, sc);
+		sc = NULL;
 	}
-	endp->flags &= ~CS_EP_ORPHAN;
-	return cs;
+	se_fl_clr(sd, SE_FL_ORPHAN);
+	return sc;
 }
 
-/* Creates a new conn-stream from an stream. There is no endpoint here, thus it
- * will be created by cs_new(). So the CS_EP_DETACHED flag is set. It returns
- * NULL on error. On success, the new conn-stream is returned.
+/* Creates a new stream connector from an stream. There is no endpoint here, thus it
+ * will be created by sc_new(). So the SE_FL_DETACHED flag is set. It returns
+ * NULL on error. On success, the new stream connector is returned.
  */
-struct conn_stream *cs_new_from_strm(struct stream *strm, unsigned int flags)
+struct stconn *sc_new_from_strm(struct stream *strm, unsigned int flags)
 {
-	struct conn_stream *cs;
+	struct stconn *sc;
 
-	cs = cs_new(NULL);
-	if (unlikely(!cs))
+	sc = sc_new(NULL);
+	if (unlikely(!sc))
 		return NULL;
-	cs->flags |= flags;
-	cs->endp->flags |=  CS_EP_DETACHED;
-	cs->app = &strm->obj_type;
-	cs->ops = &cs_app_embedded_ops;
-	cs->data_cb = NULL;
-	return cs;
+	sc->flags |= flags;
+	sc_ep_set(sc, SE_FL_DETACHED);
+	sc->app = &strm->obj_type;
+	sc->app_ops = &sc_app_embedded_ops;
+	return sc;
 }
 
-/* Creates a new conn-stream from an health-check. There is no endpoint here,
- * thus it will be created by cs_new(). So the CS_EP_DETACHED flag is set. It
- * returns NULL on error. On success, the new conn-stream is returned.
+/* Creates a new stream connector from an health-check. There is no endpoint here,
+ * thus it will be created by sc_new(). So the SE_FL_DETACHED flag is set. It
+ * returns NULL on error. On success, the new stream connector is returned.
  */
-struct conn_stream *cs_new_from_check(struct check *check, unsigned int flags)
+struct stconn *sc_new_from_check(struct check *check, unsigned int flags)
 {
-	struct conn_stream *cs;
+	struct stconn *sc;
 
-	cs = cs_new(NULL);
-	if (unlikely(!cs))
+	sc = sc_new(NULL);
+	if (unlikely(!sc))
 		return NULL;
-	cs->flags |= flags;
-	cs->endp->flags |=  CS_EP_DETACHED;
-	cs->app = &check->obj_type;
-	cs->data_cb = &check_conn_cb;
-	return cs;
+	sc->flags |= flags;
+	sc_ep_set(sc, SE_FL_DETACHED);
+	sc->app = &check->obj_type;
+	sc->app_ops = &sc_app_check_ops;
+	return sc;
 }
 
-/* Releases a conn_stream previously allocated by cs_new(), as well as its
+/* Releases a stconn previously allocated by sc_new(), as well as its
  * endpoint, if it exists. This function is called internally or on error path.
  */
-void cs_free(struct conn_stream *cs)
+void sc_free(struct stconn *sc)
 {
-	sockaddr_free(&cs->src);
-	sockaddr_free(&cs->dst);
-	if (cs->endp) {
-		BUG_ON(!(cs->endp->flags & CS_EP_DETACHED));
-		cs_endpoint_free(cs->endp);
+	sockaddr_free(&sc->src);
+	sockaddr_free(&sc->dst);
+	if (sc->sedesc) {
+		BUG_ON(!sc_ep_test(sc, SE_FL_DETACHED));
+		sedesc_free(sc->sedesc);
 	}
-	if (cs->wait_event.tasklet)
-		tasklet_free(cs->wait_event.tasklet);
-	pool_free(pool_head_connstream, cs);
+	if (sc->wait_event.tasklet)
+		tasklet_free(sc->wait_event.tasklet);
+	pool_free(pool_head_connstream, sc);
 }
 
-/* Conditionally removes a conn-stream if it is detached and if there is no app
+/* Conditionally removes a stream connector if it is detached and if there is no app
  * layer defined. Except on error path, this one must be used. if release, the
- * pointer on the CS is set to NULL.
+ * pointer on the SC is set to NULL.
  */
-static void cs_free_cond(struct conn_stream **csp)
+static void sc_free_cond(struct stconn **scp)
 {
-	struct conn_stream *cs = *csp;
+	struct stconn *sc = *scp;
 
-	if (!cs->app && (!cs->endp || (cs->endp->flags & CS_EP_DETACHED))) {
-		cs_free(cs);
-		*csp = NULL;
+	if (!sc->app && (!sc->sedesc || sc_ep_test(sc, SE_FL_DETACHED))) {
+		sc_free(sc);
+		*scp = NULL;
 	}
 }
 
 
-/* Attaches a conn_stream to a mux endpoint and sets the endpoint ctx. Returns
- * -1 on error and 0 on sucess. CS_EP_DETACHED flag is removed. This function is
+/* Attaches a stconn to a mux endpoint and sets the endpoint ctx. Returns
+ * -1 on error and 0 on sucess. SE_FL_DETACHED flag is removed. This function is
  * called from a mux when it is attached to a stream or a health-check.
  */
-int cs_attach_mux(struct conn_stream *cs, void *target, void *ctx)
+int sc_attach_mux(struct stconn *sc, void *sd, void *ctx)
 {
 	struct connection *conn = ctx;
+	struct sedesc *sedesc = sc->sedesc;
 
-	cs->endp->target = target;
-	cs->endp->ctx = ctx;
-	cs->endp->flags |= CS_EP_T_MUX;
-	cs->endp->flags &= ~CS_EP_DETACHED;
+	sedesc->se = sd;
+	sedesc->conn = ctx;
+	se_fl_set(sedesc, SE_FL_T_MUX);
+	se_fl_clr(sedesc, SE_FL_DETACHED);
 	if (!conn->ctx)
-		conn->ctx = cs;
-	if (cs_strm(cs)) {
-		if (!cs->wait_event.tasklet) {
-			cs->wait_event.tasklet = tasklet_new();
-			if (!cs->wait_event.tasklet)
+		conn->ctx = sc;
+	if (sc_strm(sc)) {
+		if (!sc->wait_event.tasklet) {
+			sc->wait_event.tasklet = tasklet_new();
+			if (!sc->wait_event.tasklet)
 				return -1;
-			cs->wait_event.tasklet->process = cs_conn_io_cb;
-			cs->wait_event.tasklet->context = cs;
-			cs->wait_event.events = 0;
+			sc->wait_event.tasklet->process = sc_conn_io_cb;
+			sc->wait_event.tasklet->context = sc;
+			sc->wait_event.events = 0;
 		}
 
-		cs->ops = &cs_app_conn_ops;
-		cs->data_cb = &cs_data_conn_cb;
+		sc->app_ops = &sc_app_conn_ops;
 	}
-	else if (cs_check(cs)) {
-		if (!cs->wait_event.tasklet) {
-			cs->wait_event.tasklet = tasklet_new();
-			if (!cs->wait_event.tasklet)
+	else if (sc_check(sc)) {
+		if (!sc->wait_event.tasklet) {
+			sc->wait_event.tasklet = tasklet_new();
+			if (!sc->wait_event.tasklet)
 				return -1;
-			cs->wait_event.tasklet->process = srv_chk_io_cb;
-			cs->wait_event.tasklet->context = cs;
-			cs->wait_event.events = 0;
+			sc->wait_event.tasklet->process = srv_chk_io_cb;
+			sc->wait_event.tasklet->context = sc;
+			sc->wait_event.events = 0;
 		}
 
-		cs->data_cb = &check_conn_cb;
+		sc->app_ops = &sc_app_check_ops;
 	}
 	return 0;
 }
 
-/* Attaches a conn_stream to an applet endpoint and sets the endpoint
- * ctx. Returns -1 on error and 0 on sucess. CS_EP_DETACHED flag is
+/* Attaches a stconn to an applet endpoint and sets the endpoint
+ * ctx. Returns -1 on error and 0 on sucess. SE_FL_DETACHED flag is
  * removed. This function is called by a stream when a backend applet is
  * registered.
  */
-static void cs_attach_applet(struct conn_stream *cs, void *target)
+static void sc_attach_applet(struct stconn *sc, void *sd)
 {
-	cs->endp->target = target;
-	cs->endp->flags |= CS_EP_T_APPLET;
-	cs->endp->flags &= ~CS_EP_DETACHED;
-	if (cs_strm(cs)) {
-		cs->ops = &cs_app_applet_ops;
-		cs->data_cb = &cs_data_applet_cb;
-	}
+	sc->sedesc->se = sd;
+	sc_ep_set(sc, SE_FL_T_APPLET);
+	sc_ep_clr(sc, SE_FL_DETACHED);
+	if (sc_strm(sc))
+		sc->app_ops = &sc_app_applet_ops;
 }
 
-/* Attaches a conn_stream to a app layer and sets the relevant
- * callbacks. Returns -1 on error and 0 on success. CS_EP_ORPHAN flag is
+/* Attaches a stconn to a app layer and sets the relevant
+ * callbacks. Returns -1 on error and 0 on success. SE_FL_ORPHAN flag is
  * removed. This function is called by a stream when it is created to attach it
- * on the conn-stream on the client side.
+ * on the stream connector on the client side.
  */
-int cs_attach_strm(struct conn_stream *cs, struct stream *strm)
+int sc_attach_strm(struct stconn *sc, struct stream *strm)
 {
-	cs->app = &strm->obj_type;
-	cs->endp->flags &= ~CS_EP_ORPHAN;
-	if (cs->endp->flags & CS_EP_T_MUX) {
-		cs->wait_event.tasklet = tasklet_new();
-		if (!cs->wait_event.tasklet)
+	sc->app = &strm->obj_type;
+	sc_ep_clr(sc, SE_FL_ORPHAN);
+	if (sc_ep_test(sc, SE_FL_T_MUX)) {
+		sc->wait_event.tasklet = tasklet_new();
+		if (!sc->wait_event.tasklet)
 			return -1;
-		cs->wait_event.tasklet->process = cs_conn_io_cb;
-		cs->wait_event.tasklet->context = cs;
-		cs->wait_event.events = 0;
+		sc->wait_event.tasklet->process = sc_conn_io_cb;
+		sc->wait_event.tasklet->context = sc;
+		sc->wait_event.events = 0;
 
-		cs->ops = &cs_app_conn_ops;
-		cs->data_cb = &cs_data_conn_cb;
+		sc->app_ops = &sc_app_conn_ops;
 	}
-	else if (cs->endp->flags & CS_EP_T_APPLET) {
-		cs->ops = &cs_app_applet_ops;
-		cs->data_cb = &cs_data_applet_cb;
+	else if (sc_ep_test(sc, SE_FL_T_APPLET)) {
+		sc->app_ops = &sc_app_applet_ops;
 	}
 	else {
-		cs->ops = &cs_app_embedded_ops;
-		cs->data_cb = NULL;
+		sc->app_ops = &sc_app_embedded_ops;
 	}
 	return 0;
 }
 
-/* Detaches the conn_stream from the endpoint, if any. For a connecrion, if a
+/* Detaches the stconn from the endpoint, if any. For a connecrion, if a
  * mux owns the connection ->detach() callback is called. Otherwise, it means
- * the conn-stream owns the connection. In this case the connection is closed
+ * the stream connector owns the connection. In this case the connection is closed
  * and released. For an applet, the appctx is released. If still allocated, the
  * endpoint is reset and flag as detached. If the app layer is also detached,
- * the conn-stream is released.
+ * the stream connector is released.
  */
-static void cs_detach_endp(struct conn_stream **csp)
+static void sc_detach_endp(struct stconn **scp)
 {
-	struct conn_stream *cs = *csp;
+	struct stconn *sc = *scp;
 
-	if (!cs)
+	if (!sc)
 		return;
 
-	if (!cs->endp)
+	if (!sc->sedesc)
 		goto reset_cs;
 
-	if (cs->endp->flags & CS_EP_T_MUX) {
-		struct connection *conn = __cs_conn(cs);
-		struct cs_endpoint *endp = cs->endp;
+	if (sc_ep_test(sc, SE_FL_T_MUX)) {
+		struct connection *conn = __sc_conn(sc);
+		struct sedesc *sedesc = sc->sedesc;
 
 		if (conn->mux) {
-			if (cs->wait_event.events != 0)
-				conn->mux->unsubscribe(cs, cs->wait_event.events, &cs->wait_event);
-			endp->flags |= CS_EP_ORPHAN;
-			endp->cs = NULL;
-			cs->endp = NULL;
-			conn->mux->detach(endp);
+			if (sc->wait_event.events != 0)
+				conn->mux->unsubscribe(sc, sc->wait_event.events, &sc->wait_event);
+			se_fl_set(sedesc, SE_FL_ORPHAN);
+			sedesc->sc = NULL;
+			sc->sedesc = NULL;
+			conn->mux->detach(sedesc);
 		}
 		else {
 			/* It's too early to have a mux, let's just destroy
@@ -368,356 +367,351 @@ static void cs_detach_endp(struct conn_stream **csp)
 			conn_free(conn);
 		}
 	}
-	else if (cs->endp->flags & CS_EP_T_APPLET) {
-		struct appctx *appctx = __cs_appctx(cs);
+	else if (sc_ep_test(sc, SE_FL_T_APPLET)) {
+		struct appctx *appctx = __sc_appctx(sc);
 
-		cs->endp->flags |= CS_EP_ORPHAN;
-		cs->endp->cs = NULL;
-		cs->endp = NULL;
+		sc_ep_set(sc, SE_FL_ORPHAN);
+		sc->sedesc->sc = NULL;
+		sc->sedesc = NULL;
 		appctx_shut(appctx);
 		appctx_free(appctx);
 	}
 
-	if (cs->endp) {
-		/* the cs is the only one one the endpoint */
-		cs->endp->target = NULL;
-		cs->endp->ctx = NULL;
-		cs->endp->flags &= CS_EP_APP_MASK;
-		cs->endp->flags |= CS_EP_DETACHED;
+	if (sc->sedesc) {
+		/* the SD wasn't used and can be recycled */
+		sc->sedesc->se     = NULL;
+		sc->sedesc->conn   = NULL;
+		sc->sedesc->flags  = 0;
+		sc_ep_set(sc, SE_FL_DETACHED);
 	}
 
   reset_cs:
-	/* FIXME: Rest CS for now but must be reviewed. CS flags are only
+	/* FIXME: Rest SC for now but must be reviewed. SC flags are only
 	 *        connection related for now but this will evolved
 	 */
-	cs->flags &= CS_FL_ISBACK;
-	if (cs_strm(cs))
-		cs->ops = &cs_app_embedded_ops;
-	cs->data_cb = NULL;
-	cs_free_cond(csp);
+	sc->flags &= SC_FL_ISBACK;
+	if (sc_strm(sc))
+		sc->app_ops = &sc_app_embedded_ops;
+	else
+		sc->app_ops = NULL;
+	sc_free_cond(scp);
 }
 
-/* Detaches the conn_stream from the app layer. If there is no endpoint attached
- * to the conn_stream
+/* Detaches the stconn from the app layer. If there is no endpoint attached
+ * to the stconn
  */
-static void cs_detach_app(struct conn_stream **csp)
+static void sc_detach_app(struct stconn **scp)
 {
-	struct conn_stream *cs = *csp;
+	struct stconn *sc = *scp;
 
-	if (!cs)
+	if (!sc)
 		return;
 
-	cs->app = NULL;
-	cs->data_cb = NULL;
-	sockaddr_free(&cs->src);
-	sockaddr_free(&cs->dst);
+	sc->app = NULL;
+	sc->app_ops = NULL;
+	sockaddr_free(&sc->src);
+	sockaddr_free(&sc->dst);
 
-	if (cs->wait_event.tasklet)
-		tasklet_free(cs->wait_event.tasklet);
-	cs->wait_event.tasklet = NULL;
-	cs->wait_event.events = 0;
-	cs_free_cond(csp);
+	if (sc->wait_event.tasklet)
+		tasklet_free(sc->wait_event.tasklet);
+	sc->wait_event.tasklet = NULL;
+	sc->wait_event.events = 0;
+	sc_free_cond(scp);
 }
 
-/* Destroy the conn_stream. It is detached from its endpoint and its
- * application. After this call, the conn_stream must be considered as released.
+/* Destroy the stconn. It is detached from its endpoint and its
+ * application. After this call, the stconn must be considered as released.
  */
-void cs_destroy(struct conn_stream *cs)
+void sc_destroy(struct stconn *sc)
 {
-	cs_detach_endp(&cs);
-	cs_detach_app(&cs);
-	BUG_ON_HOT(cs);
+	sc_detach_endp(&sc);
+	sc_detach_app(&sc);
+	BUG_ON_HOT(sc);
 }
 
-/* Resets the conn-stream endpoint. It happens when the app layer want to renew
+/* Resets the stream connector endpoint. It happens when the app layer want to renew
  * its endpoint. For a connection retry for instance. If a mux or an applet is
  * attached, a new endpoint is created. Returns -1 on error and 0 on sucess.
  *
- * Only CS_EP_ERROR flag is removed on the endpoint. Orther flags are preserved.
+ * Only SE_FL_ERROR flag is removed on the endpoint. Orther flags are preserved.
  * It is the caller responsibility to remove other flags if needed.
  */
-int cs_reset_endp(struct conn_stream *cs)
+int sc_reset_endp(struct stconn *sc)
 {
-	struct cs_endpoint *new_endp;
+	struct sedesc *new_sd;
 
-	BUG_ON(!cs->app);
+	BUG_ON(!sc->app);
 
-	cs->endp->flags &= ~CS_EP_ERROR;
-	if (!__cs_endp_target(cs)) {
+	sc_ep_clr(sc, SE_FL_ERROR);
+	if (!__sc_endp(sc)) {
 		/* endpoint not attached or attached to a mux with no
 		 * target. Thus the endpoint will not be release but just
-		 * reset. The app is still attached, the cs will not be
+		 * reset. The app is still attached, the sc will not be
 		 * released.
 		 */
-		cs_detach_endp(&cs);
+		sc_detach_endp(&sc);
 		return 0;
 	}
 
 	/* allocate the new endpoint first to be able to set error if it
 	 * fails */
-	new_endp = cs_endpoint_new();
-	if (!unlikely(new_endp)) {
-		cs->endp->flags |= CS_EP_ERROR;
+	new_sd = sedesc_new();
+	if (!unlikely(new_sd)) {
+		sc_ep_set(sc, SE_FL_ERROR);
 		return -1;
 	}
-	new_endp->flags = (cs->endp->flags & CS_EP_APP_MASK);
 
-	/* The app is still attached, the cs will not be released */
-	cs_detach_endp(&cs);
-	BUG_ON(cs->endp);
-	cs->endp = new_endp;
-	cs->endp->cs = cs;
-	cs->endp->flags |= CS_EP_DETACHED;
+	/* The app is still attached, the sc will not be released */
+	sc_detach_endp(&sc);
+	BUG_ON(sc->sedesc);
+	sc->sedesc = new_sd;
+	sc->sedesc->sc = sc;
+	sc_ep_set(sc, SE_FL_DETACHED);
 	return 0;
 }
 
 
-/* Create an applet to handle a conn-stream as a new appctx. The CS will
+/* Create an applet to handle a stream connector as a new appctx. The SC will
  * wake it up every time it is solicited. The appctx must be deleted by the task
- * handler using cs_detach_endp(), possibly from within the function itself.
+ * handler using sc_detach_endp(), possibly from within the function itself.
  * It also pre-initializes the applet's context and returns it (or NULL in case
  * it could not be allocated).
  */
-struct appctx *cs_applet_create(struct conn_stream *cs, struct applet *app)
+struct appctx *sc_applet_create(struct stconn *sc, struct applet *app)
 {
 	struct appctx *appctx;
 
-	DPRINTF(stderr, "registering handler %p for cs %p (was %p)\n", app, cs, cs_strm_task(cs));
+	DPRINTF(stderr, "registering handler %p for sc %p (was %p)\n", app, sc, sc_strm_task(sc));
 
-	appctx = appctx_new_here(app, cs->endp);
+	appctx = appctx_new_here(app, sc->sedesc);
 	if (!appctx)
 		return NULL;
-	cs_attach_applet(cs, appctx);
-	appctx->t->nice = __cs_strm(cs)->task->nice;
-	cs_cant_get(cs);
+	sc_attach_applet(sc, appctx);
+	appctx->t->nice = __sc_strm(sc)->task->nice;
+	applet_need_more_data(appctx);
 	appctx_wakeup(appctx);
 
-	cs->state = CS_ST_RDY;
+	sc->state = SC_ST_RDY;
 	return appctx;
 }
 
 /*
- * This function performs a shutdown-read on a detached conn-stream in a
+ * This function performs a shutdown-read on a detached stream connector in a
  * connected or init state (it does nothing for other states). It either shuts
  * the read side or marks itself as closed. The buffer flags are updated to
- * reflect the new state. If the conn-stream has CS_FL_NOHALF, we also
+ * reflect the new state. If the stream connector has SC_FL_NOHALF, we also
  * forward the close to the write side. The owner task is woken up if it exists.
  */
-static void cs_app_shutr(struct conn_stream *cs)
+static void sc_app_shutr(struct stconn *sc)
 {
-	struct channel *ic = cs_ic(cs);
+	struct channel *ic = sc_ic(sc);
 
-	cs_rx_shut_blk(cs);
 	if (ic->flags & CF_SHUTR)
 		return;
 	ic->flags |= CF_SHUTR;
 	ic->rex = TICK_ETERNITY;
 
-	if (!cs_state_in(cs->state, CS_SB_CON|CS_SB_RDY|CS_SB_EST))
+	if (!sc_state_in(sc->state, SC_SB_CON|SC_SB_RDY|SC_SB_EST))
 		return;
 
-	if (cs_oc(cs)->flags & CF_SHUTW) {
-		cs->state = CS_ST_DIS;
-		__cs_strm(cs)->conn_exp = TICK_ETERNITY;
+	if (sc_oc(sc)->flags & CF_SHUTW) {
+		sc->state = SC_ST_DIS;
+		__sc_strm(sc)->conn_exp = TICK_ETERNITY;
 	}
-	else if (cs->flags & CS_FL_NOHALF) {
+	else if (sc->flags & SC_FL_NOHALF) {
 		/* we want to immediately forward this close to the write side */
-		return cs_app_shutw(cs);
+		return sc_app_shutw(sc);
 	}
 
 	/* note that if the task exists, it must unregister itself once it runs */
-	if (!(cs->flags & CS_FL_DONT_WAKE))
-		task_wakeup(cs_strm_task(cs), TASK_WOKEN_IO);
+	if (!(sc->flags & SC_FL_DONT_WAKE))
+		task_wakeup(sc_strm_task(sc), TASK_WOKEN_IO);
 }
 
 /*
- * This function performs a shutdown-write on a detached conn-stream in a
+ * This function performs a shutdown-write on a detached stream connector in a
  * connected or init state (it does nothing for other states). It either shuts
  * the write side or marks itself as closed. The buffer flags are updated to
- * reflect the new state. It does also close everything if the CS was marked as
+ * reflect the new state. It does also close everything if the SC was marked as
  * being in error state. The owner task is woken up if it exists.
  */
-static void cs_app_shutw(struct conn_stream *cs)
+static void sc_app_shutw(struct stconn *sc)
 {
-	struct channel *ic = cs_ic(cs);
-	struct channel *oc = cs_oc(cs);
+	struct channel *ic = sc_ic(sc);
+	struct channel *oc = sc_oc(sc);
 
 	oc->flags &= ~CF_SHUTW_NOW;
 	if (oc->flags & CF_SHUTW)
 		return;
 	oc->flags |= CF_SHUTW;
 	oc->wex = TICK_ETERNITY;
-	cs_done_get(cs);
 
-	if (tick_isset(cs->hcto)) {
-		ic->rto = cs->hcto;
+	if (tick_isset(sc->hcto)) {
+		ic->rto = sc->hcto;
 		ic->rex = tick_add(now_ms, ic->rto);
 	}
 
-	switch (cs->state) {
-	case CS_ST_RDY:
-	case CS_ST_EST:
+	switch (sc->state) {
+	case SC_ST_RDY:
+	case SC_ST_EST:
 		/* we have to shut before closing, otherwise some short messages
 		 * may never leave the system, especially when there are remaining
 		 * unread data in the socket input buffer, or when nolinger is set.
-		 * However, if CS_FL_NOLINGER is explicitly set, we know there is
+		 * However, if SC_FL_NOLINGER is explicitly set, we know there is
 		 * no risk so we close both sides immediately.
 		 */
-		if (!(cs->endp->flags & CS_EP_ERROR) && !(cs->flags & CS_FL_NOLINGER) &&
+		if (!sc_ep_test(sc, SE_FL_ERROR) && !(sc->flags & SC_FL_NOLINGER) &&
 		    !(ic->flags & (CF_SHUTR|CF_DONT_READ)))
 			return;
 
 		/* fall through */
-	case CS_ST_CON:
-	case CS_ST_CER:
-	case CS_ST_QUE:
-	case CS_ST_TAR:
+	case SC_ST_CON:
+	case SC_ST_CER:
+	case SC_ST_QUE:
+	case SC_ST_TAR:
 		/* Note that none of these states may happen with applets */
-		cs->state = CS_ST_DIS;
+		sc->state = SC_ST_DIS;
 		/* fall through */
 	default:
-		cs->flags &= ~CS_FL_NOLINGER;
-		cs_rx_shut_blk(cs);
+		sc->flags &= ~SC_FL_NOLINGER;
 		ic->flags |= CF_SHUTR;
 		ic->rex = TICK_ETERNITY;
-		__cs_strm(cs)->conn_exp = TICK_ETERNITY;
+		__sc_strm(sc)->conn_exp = TICK_ETERNITY;
 	}
 
 	/* note that if the task exists, it must unregister itself once it runs */
-	if (!(cs->flags & CS_FL_DONT_WAKE))
-		task_wakeup(cs_strm_task(cs), TASK_WOKEN_IO);
+	if (!(sc->flags & SC_FL_DONT_WAKE))
+		task_wakeup(sc_strm_task(sc), TASK_WOKEN_IO);
 }
 
 /* default chk_rcv function for scheduled tasks */
-static void cs_app_chk_rcv(struct conn_stream *cs)
+static void sc_app_chk_rcv(struct stconn *sc)
 {
-	struct channel *ic = cs_ic(cs);
+	struct channel *ic = sc_ic(sc);
 
-	DPRINTF(stderr, "%s: cs=%p, cs->state=%d ic->flags=%08x oc->flags=%08x\n",
+	DPRINTF(stderr, "%s: sc=%p, sc->state=%d ic->flags=%08x oc->flags=%08x\n",
 		__FUNCTION__,
-		cs, cs->state, ic->flags, cs_oc(cs)->flags);
+		sc, sc->state, ic->flags, sc_oc(sc)->flags);
 
 	if (ic->pipe) {
 		/* stop reading */
-		cs_rx_room_blk(cs);
+		sc_need_room(sc);
 	}
 	else {
 		/* (re)start reading */
-		if (!(cs->flags & CS_FL_DONT_WAKE))
-			task_wakeup(cs_strm_task(cs), TASK_WOKEN_IO);
+		if (!(sc->flags & SC_FL_DONT_WAKE))
+			task_wakeup(sc_strm_task(sc), TASK_WOKEN_IO);
 	}
 }
 
 /* default chk_snd function for scheduled tasks */
-static void cs_app_chk_snd(struct conn_stream *cs)
+static void sc_app_chk_snd(struct stconn *sc)
 {
-	struct channel *oc = cs_oc(cs);
+	struct channel *oc = sc_oc(sc);
 
-	DPRINTF(stderr, "%s: cs=%p, cs->state=%d ic->flags=%08x oc->flags=%08x\n",
+	DPRINTF(stderr, "%s: sc=%p, sc->state=%d ic->flags=%08x oc->flags=%08x\n",
 		__FUNCTION__,
-		cs, cs->state, cs_ic(cs)->flags, oc->flags);
+		sc, sc->state, sc_ic(sc)->flags, oc->flags);
 
-	if (unlikely(cs->state != CS_ST_EST || (oc->flags & CF_SHUTW)))
+	if (unlikely(sc->state != SC_ST_EST || (oc->flags & CF_SHUTW)))
 		return;
 
-	if (!(cs->endp->flags & CS_EP_WAIT_DATA) ||  /* not waiting for data */
+	if (!sc_ep_test(sc, SE_FL_WAIT_DATA) ||  /* not waiting for data */
 	    channel_is_empty(oc))                  /* called with nothing to send ! */
 		return;
 
 	/* Otherwise there are remaining data to be sent in the buffer,
 	 * so we tell the handler.
 	 */
-	cs->endp->flags &= ~CS_EP_WAIT_DATA;
+	sc_ep_clr(sc, SE_FL_WAIT_DATA);
 	if (!tick_isset(oc->wex))
 		oc->wex = tick_add_ifset(now_ms, oc->wto);
 
-	if (!(cs->flags & CS_FL_DONT_WAKE))
-		task_wakeup(cs_strm_task(cs), TASK_WOKEN_IO);
+	if (!(sc->flags & SC_FL_DONT_WAKE))
+		task_wakeup(sc_strm_task(sc), TASK_WOKEN_IO);
 }
 
 /*
- * This function performs a shutdown-read on a conn-stream attached to
+ * This function performs a shutdown-read on a stream connector attached to
  * a connection in a connected or init state (it does nothing for other
  * states). It either shuts the read side or marks itself as closed. The buffer
- * flags are updated to reflect the new state. If the conn-stream has
- * CS_FL_NOHALF, we also forward the close to the write side. If a control
+ * flags are updated to reflect the new state. If the stream connector has
+ * SC_FL_NOHALF, we also forward the close to the write side. If a control
  * layer is defined, then it is supposed to be a socket layer and file
  * descriptors are then shutdown or closed accordingly. The function
  * automatically disables polling if needed.
  */
-static void cs_app_shutr_conn(struct conn_stream *cs)
+static void sc_app_shutr_conn(struct stconn *sc)
 {
-	struct channel *ic = cs_ic(cs);
+	struct channel *ic = sc_ic(sc);
 
-	BUG_ON(!cs_conn(cs));
+	BUG_ON(!sc_conn(sc));
 
-	cs_rx_shut_blk(cs);
 	if (ic->flags & CF_SHUTR)
 		return;
 	ic->flags |= CF_SHUTR;
 	ic->rex = TICK_ETERNITY;
 
-	if (!cs_state_in(cs->state, CS_SB_CON|CS_SB_RDY|CS_SB_EST))
+	if (!sc_state_in(sc->state, SC_SB_CON|SC_SB_RDY|SC_SB_EST))
 		return;
 
-	if (cs_oc(cs)->flags & CF_SHUTW) {
-		cs_conn_shut(cs);
-		cs->state = CS_ST_DIS;
-		__cs_strm(cs)->conn_exp = TICK_ETERNITY;
+	if (sc_oc(sc)->flags & CF_SHUTW) {
+		sc_conn_shut(sc);
+		sc->state = SC_ST_DIS;
+		__sc_strm(sc)->conn_exp = TICK_ETERNITY;
 	}
-	else if (cs->flags & CS_FL_NOHALF) {
+	else if (sc->flags & SC_FL_NOHALF) {
 		/* we want to immediately forward this close to the write side */
-		return cs_app_shutw_conn(cs);
+		return sc_app_shutw_conn(sc);
 	}
 }
 
 /*
- * This function performs a shutdown-write on a conn-stream attached to
+ * This function performs a shutdown-write on a stream connector attached to
  * a connection in a connected or init state (it does nothing for other
  * states). It either shuts the write side or marks itself as closed. The
  * buffer flags are updated to reflect the new state.  It does also close
- * everything if the CS was marked as being in error state. If there is a
+ * everything if the SC was marked as being in error state. If there is a
  * data-layer shutdown, it is called.
  */
-static void cs_app_shutw_conn(struct conn_stream *cs)
+static void sc_app_shutw_conn(struct stconn *sc)
 {
-	struct channel *ic = cs_ic(cs);
-	struct channel *oc = cs_oc(cs);
+	struct channel *ic = sc_ic(sc);
+	struct channel *oc = sc_oc(sc);
 
-	BUG_ON(!cs_conn(cs));
+	BUG_ON(!sc_conn(sc));
 
 	oc->flags &= ~CF_SHUTW_NOW;
 	if (oc->flags & CF_SHUTW)
 		return;
 	oc->flags |= CF_SHUTW;
 	oc->wex = TICK_ETERNITY;
-	cs_done_get(cs);
 
-	if (tick_isset(cs->hcto)) {
-		ic->rto = cs->hcto;
+	if (tick_isset(sc->hcto)) {
+		ic->rto = sc->hcto;
 		ic->rex = tick_add(now_ms, ic->rto);
 	}
 
-	switch (cs->state) {
-	case CS_ST_RDY:
-	case CS_ST_EST:
+	switch (sc->state) {
+	case SC_ST_RDY:
+	case SC_ST_EST:
 		/* we have to shut before closing, otherwise some short messages
 		 * may never leave the system, especially when there are remaining
 		 * unread data in the socket input buffer, or when nolinger is set.
-		 * However, if CS_FL_NOLINGER is explicitly set, we know there is
+		 * However, if SC_FL_NOLINGER is explicitly set, we know there is
 		 * no risk so we close both sides immediately.
 		 */
 
-		if (cs->endp->flags & CS_EP_ERROR) {
+		if (sc_ep_test(sc, SE_FL_ERROR)) {
 			/* quick close, the socket is already shut anyway */
 		}
-		else if (cs->flags & CS_FL_NOLINGER) {
+		else if (sc->flags & SC_FL_NOLINGER) {
 			/* unclean data-layer shutdown, typically an aborted request
 			 * or a forwarded shutdown from a client to a server due to
 			 * option abortonclose. No need for the TLS layer to try to
 			 * emit a shutdown message.
 			 */
-			cs_conn_shutw(cs, CO_SHW_SILENT);
+			sc_conn_shutw(sc, CO_SHW_SILENT);
 		}
 		else {
 			/* clean data-layer shutdown. This only happens on the
@@ -726,61 +720,60 @@ static void cs_app_shutw_conn(struct conn_stream *cs)
 			 * while option abortonclose is set. We want the TLS
 			 * layer to try to signal it to the peer before we close.
 			 */
-			cs_conn_shutw(cs, CO_SHW_NORMAL);
+			sc_conn_shutw(sc, CO_SHW_NORMAL);
 
 			if (!(ic->flags & (CF_SHUTR|CF_DONT_READ)))
 				return;
 		}
 
 		/* fall through */
-	case CS_ST_CON:
+	case SC_ST_CON:
 		/* we may have to close a pending connection, and mark the
 		 * response buffer as shutr
 		 */
-		cs_conn_shut(cs);
+		sc_conn_shut(sc);
 		/* fall through */
-	case CS_ST_CER:
-	case CS_ST_QUE:
-	case CS_ST_TAR:
-		cs->state = CS_ST_DIS;
+	case SC_ST_CER:
+	case SC_ST_QUE:
+	case SC_ST_TAR:
+		sc->state = SC_ST_DIS;
 		/* fall through */
 	default:
-		cs->flags &= ~CS_FL_NOLINGER;
-		cs_rx_shut_blk(cs);
+		sc->flags &= ~SC_FL_NOLINGER;
 		ic->flags |= CF_SHUTR;
 		ic->rex = TICK_ETERNITY;
-		__cs_strm(cs)->conn_exp = TICK_ETERNITY;
+		__sc_strm(sc)->conn_exp = TICK_ETERNITY;
 	}
 }
 
-/* This function is used for inter-conn-stream calls. It is called by the
+/* This function is used for inter-stream connector calls. It is called by the
  * consumer to inform the producer side that it may be interested in checking
  * for free space in the buffer. Note that it intentionally does not update
  * timeouts, so that we can still check them later at wake-up. This function is
- * dedicated to connection-based conn-streams.
+ * dedicated to connection-based stream connectors.
  */
-static void cs_app_chk_rcv_conn(struct conn_stream *cs)
+static void sc_app_chk_rcv_conn(struct stconn *sc)
 {
-	BUG_ON(!cs_conn(cs));
+	BUG_ON(!sc_conn(sc));
 
 	/* (re)start reading */
-	if (cs_state_in(cs->state, CS_SB_CON|CS_SB_RDY|CS_SB_EST))
-		tasklet_wakeup(cs->wait_event.tasklet);
+	if (sc_state_in(sc->state, SC_SB_CON|SC_SB_RDY|SC_SB_EST))
+		tasklet_wakeup(sc->wait_event.tasklet);
 }
 
 
-/* This function is used for inter-conn-stream calls. It is called by the
+/* This function is used for inter-stream connector calls. It is called by the
  * producer to inform the consumer side that it may be interested in checking
  * for data in the buffer. Note that it intentionally does not update timeouts,
  * so that we can still check them later at wake-up.
  */
-static void cs_app_chk_snd_conn(struct conn_stream *cs)
+static void sc_app_chk_snd_conn(struct stconn *sc)
 {
-	struct channel *oc = cs_oc(cs);
+	struct channel *oc = sc_oc(sc);
 
-	BUG_ON(!cs_conn(cs));
+	BUG_ON(!sc_conn(sc));
 
-	if (unlikely(!cs_state_in(cs->state, CS_SB_RDY|CS_SB_EST) ||
+	if (unlikely(!sc_state_in(sc->state, SC_SB_RDY|SC_SB_EST) ||
 	    (oc->flags & CF_SHUTW)))
 		return;
 
@@ -788,16 +781,16 @@ static void cs_app_chk_snd_conn(struct conn_stream *cs)
 		return;
 
 	if (!oc->pipe &&                          /* spliced data wants to be forwarded ASAP */
-	    !(cs->endp->flags & CS_EP_WAIT_DATA))       /* not waiting for data */
+	    !sc_ep_test(sc, SE_FL_WAIT_DATA))       /* not waiting for data */
 		return;
 
-	if (!(cs->wait_event.events & SUB_RETRY_SEND) && !channel_is_empty(cs_oc(cs)))
-		cs_conn_send(cs);
+	if (!(sc->wait_event.events & SUB_RETRY_SEND) && !channel_is_empty(sc_oc(sc)))
+		sc_conn_send(sc);
 
-	if (cs->endp->flags & (CS_EP_ERROR|CS_EP_ERR_PENDING) || cs_is_conn_error(cs)) {
+	if (sc_ep_test(sc, SE_FL_ERROR | SE_FL_ERR_PENDING) || sc_is_conn_error(sc)) {
 		/* Write error on the file descriptor */
-		if (cs->state >= CS_ST_CON)
-			cs->endp->flags |= CS_EP_ERROR;
+		if (sc->state >= SC_ST_CON)
+			sc_ep_set(sc, SE_FL_ERROR);
 		goto out_wakeup;
 	}
 
@@ -812,33 +805,33 @@ static void cs_app_chk_snd_conn(struct conn_stream *cs)
 		 */
 		if (((oc->flags & (CF_SHUTW|CF_AUTO_CLOSE|CF_SHUTW_NOW)) ==
 		     (CF_AUTO_CLOSE|CF_SHUTW_NOW)) &&
-		    cs_state_in(cs->state, CS_SB_RDY|CS_SB_EST)) {
-			cs_shutw(cs);
+		    sc_state_in(sc->state, SC_SB_RDY|SC_SB_EST)) {
+			sc_shutw(sc);
 			goto out_wakeup;
 		}
 
 		if ((oc->flags & (CF_SHUTW|CF_SHUTW_NOW)) == 0)
-			cs->endp->flags |= CS_EP_WAIT_DATA;
+			sc_ep_set(sc, SE_FL_WAIT_DATA);
 		oc->wex = TICK_ETERNITY;
 	}
 	else {
 		/* Otherwise there are remaining data to be sent in the buffer,
 		 * which means we have to poll before doing so.
 		 */
-		cs->endp->flags &= ~CS_EP_WAIT_DATA;
+		sc_ep_clr(sc, SE_FL_WAIT_DATA);
 		if (!tick_isset(oc->wex))
 			oc->wex = tick_add_ifset(now_ms, oc->wto);
 	}
 
 	if (likely(oc->flags & CF_WRITE_ACTIVITY)) {
-		struct channel *ic = cs_ic(cs);
+		struct channel *ic = sc_ic(sc);
 
 		/* update timeout if we have written something */
 		if ((oc->flags & (CF_SHUTW|CF_WRITE_PARTIAL)) == CF_WRITE_PARTIAL &&
 		    !channel_is_empty(oc))
 			oc->wex = tick_add_ifset(now_ms, oc->wto);
 
-		if (tick_isset(ic->rex) && !(cs->flags & CS_FL_INDEP_STR)) {
+		if (tick_isset(ic->rex) && !(sc->flags & SC_FL_INDEP_STR)) {
 			/* Note: to prevent the client from expiring read timeouts
 			 * during writes, we refresh it. We only do this if the
 			 * interface is not configured for "independent streams",
@@ -857,28 +850,27 @@ static void cs_app_chk_snd_conn(struct conn_stream *cs)
 	if (likely((oc->flags & (CF_WRITE_NULL|CF_WRITE_ERROR|CF_SHUTW)) ||
 	          ((oc->flags & CF_WAKE_WRITE) &&
 	           ((channel_is_empty(oc) && !oc->to_forward) ||
-	            !cs_state_in(cs->state, CS_SB_EST))))) {
+	            !sc_state_in(sc->state, SC_SB_EST))))) {
 	out_wakeup:
-		if (!(cs->flags & CS_FL_DONT_WAKE))
-			task_wakeup(cs_strm_task(cs), TASK_WOKEN_IO);
+		if (!(sc->flags & SC_FL_DONT_WAKE))
+			task_wakeup(sc_strm_task(sc), TASK_WOKEN_IO);
 	}
 }
 
 /*
- * This function performs a shutdown-read on a conn-stream attached to an
+ * This function performs a shutdown-read on a stream connector attached to an
  * applet in a connected or init state (it does nothing for other states). It
  * either shuts the read side or marks itself as closed. The buffer flags are
- * updated to reflect the new state. If the conn-stream has CS_FL_NOHALF,
+ * updated to reflect the new state. If the stream connector has SC_FL_NOHALF,
  * we also forward the close to the write side. The owner task is woken up if
  * it exists.
  */
-static void cs_app_shutr_applet(struct conn_stream *cs)
+static void sc_app_shutr_applet(struct stconn *sc)
 {
-	struct channel *ic = cs_ic(cs);
+	struct channel *ic = sc_ic(sc);
 
-	BUG_ON(!cs_appctx(cs));
+	BUG_ON(!sc_appctx(sc));
 
-	cs_rx_shut_blk(cs);
 	if (ic->flags & CF_SHUTR)
 		return;
 	ic->flags |= CF_SHUTR;
@@ -886,114 +878,112 @@ static void cs_app_shutr_applet(struct conn_stream *cs)
 
 	/* Note: on shutr, we don't call the applet */
 
-	if (!cs_state_in(cs->state, CS_SB_CON|CS_SB_RDY|CS_SB_EST))
+	if (!sc_state_in(sc->state, SC_SB_CON|SC_SB_RDY|SC_SB_EST))
 		return;
 
-	if (cs_oc(cs)->flags & CF_SHUTW) {
-		appctx_shut(__cs_appctx(cs));
-		cs->state = CS_ST_DIS;
-		__cs_strm(cs)->conn_exp = TICK_ETERNITY;
+	if (sc_oc(sc)->flags & CF_SHUTW) {
+		appctx_shut(__sc_appctx(sc));
+		sc->state = SC_ST_DIS;
+		__sc_strm(sc)->conn_exp = TICK_ETERNITY;
 	}
-	else if (cs->flags & CS_FL_NOHALF) {
+	else if (sc->flags & SC_FL_NOHALF) {
 		/* we want to immediately forward this close to the write side */
-		return cs_app_shutw_applet(cs);
+		return sc_app_shutw_applet(sc);
 	}
 }
 
 /*
- * This function performs a shutdown-write on a conn-stream attached to an
+ * This function performs a shutdown-write on a stream connector attached to an
  * applet in a connected or init state (it does nothing for other states). It
  * either shuts the write side or marks itself as closed. The buffer flags are
  * updated to reflect the new state. It does also close everything if the SI
  * was marked as being in error state. The owner task is woken up if it exists.
  */
-static void cs_app_shutw_applet(struct conn_stream *cs)
+static void sc_app_shutw_applet(struct stconn *sc)
 {
-	struct channel *ic = cs_ic(cs);
-	struct channel *oc = cs_oc(cs);
+	struct channel *ic = sc_ic(sc);
+	struct channel *oc = sc_oc(sc);
 
-	BUG_ON(!cs_appctx(cs));
+	BUG_ON(!sc_appctx(sc));
 
 	oc->flags &= ~CF_SHUTW_NOW;
 	if (oc->flags & CF_SHUTW)
 		return;
 	oc->flags |= CF_SHUTW;
 	oc->wex = TICK_ETERNITY;
-	cs_done_get(cs);
 
-	if (tick_isset(cs->hcto)) {
-		ic->rto = cs->hcto;
+	if (tick_isset(sc->hcto)) {
+		ic->rto = sc->hcto;
 		ic->rex = tick_add(now_ms, ic->rto);
 	}
 
 	/* on shutw we always wake the applet up */
-	appctx_wakeup(__cs_appctx(cs));
+	appctx_wakeup(__sc_appctx(sc));
 
-	switch (cs->state) {
-	case CS_ST_RDY:
-	case CS_ST_EST:
+	switch (sc->state) {
+	case SC_ST_RDY:
+	case SC_ST_EST:
 		/* we have to shut before closing, otherwise some short messages
 		 * may never leave the system, especially when there are remaining
 		 * unread data in the socket input buffer, or when nolinger is set.
-		 * However, if CS_FL_NOLINGER is explicitly set, we know there is
+		 * However, if SC_FL_NOLINGER is explicitly set, we know there is
 		 * no risk so we close both sides immediately.
 		 */
-		if (!(cs->endp->flags & CS_EP_ERROR) && !(cs->flags & CS_FL_NOLINGER) &&
+		if (!sc_ep_test(sc, SE_FL_ERROR) && !(sc->flags & SC_FL_NOLINGER) &&
 		    !(ic->flags & (CF_SHUTR|CF_DONT_READ)))
 			return;
 
 		/* fall through */
-	case CS_ST_CON:
-	case CS_ST_CER:
-	case CS_ST_QUE:
-	case CS_ST_TAR:
+	case SC_ST_CON:
+	case SC_ST_CER:
+	case SC_ST_QUE:
+	case SC_ST_TAR:
 		/* Note that none of these states may happen with applets */
-		appctx_shut(__cs_appctx(cs));
-		cs->state = CS_ST_DIS;
+		appctx_shut(__sc_appctx(sc));
+		sc->state = SC_ST_DIS;
 		/* fall through */
 	default:
-		cs->flags &= ~CS_FL_NOLINGER;
-		cs_rx_shut_blk(cs);
+		sc->flags &= ~SC_FL_NOLINGER;
 		ic->flags |= CF_SHUTR;
 		ic->rex = TICK_ETERNITY;
-		__cs_strm(cs)->conn_exp = TICK_ETERNITY;
+		__sc_strm(sc)->conn_exp = TICK_ETERNITY;
 	}
 }
 
 /* chk_rcv function for applets */
-static void cs_app_chk_rcv_applet(struct conn_stream *cs)
+static void sc_app_chk_rcv_applet(struct stconn *sc)
 {
-	struct channel *ic = cs_ic(cs);
+	struct channel *ic = sc_ic(sc);
 
-	BUG_ON(!cs_appctx(cs));
+	BUG_ON(!sc_appctx(sc));
 
-	DPRINTF(stderr, "%s: cs=%p, cs->state=%d ic->flags=%08x oc->flags=%08x\n",
+	DPRINTF(stderr, "%s: sc=%p, sc->state=%d ic->flags=%08x oc->flags=%08x\n",
 		__FUNCTION__,
-		cs, cs->state, ic->flags, cs_oc(cs)->flags);
+		sc, sc->state, ic->flags, sc_oc(sc)->flags);
 
 	if (!ic->pipe) {
 		/* (re)start reading */
-		appctx_wakeup(__cs_appctx(cs));
+		appctx_wakeup(__sc_appctx(sc));
 	}
 }
 
 /* chk_snd function for applets */
-static void cs_app_chk_snd_applet(struct conn_stream *cs)
+static void sc_app_chk_snd_applet(struct stconn *sc)
 {
-	struct channel *oc = cs_oc(cs);
+	struct channel *oc = sc_oc(sc);
 
-	BUG_ON(!cs_appctx(cs));
+	BUG_ON(!sc_appctx(sc));
 
-	DPRINTF(stderr, "%s: cs=%p, cs->state=%d ic->flags=%08x oc->flags=%08x\n",
+	DPRINTF(stderr, "%s: sc=%p, sc->state=%d ic->flags=%08x oc->flags=%08x\n",
 		__FUNCTION__,
-		cs, cs->state, cs_ic(cs)->flags, oc->flags);
+		sc, sc->state, sc_ic(sc)->flags, oc->flags);
 
-	if (unlikely(cs->state != CS_ST_EST || (oc->flags & CF_SHUTW)))
+	if (unlikely(sc->state != SC_ST_EST || (oc->flags & CF_SHUTW)))
 		return;
 
 	/* we only wake the applet up if it was waiting for some data */
 
-	if (!(cs->endp->flags & CS_EP_WAIT_DATA))
+	if (!sc_ep_test(sc, SE_FL_WAIT_DATA))
 		return;
 
 	if (!tick_isset(oc->wex))
@@ -1001,13 +991,13 @@ static void cs_app_chk_snd_applet(struct conn_stream *cs)
 
 	if (!channel_is_empty(oc)) {
 		/* (re)start sending */
-		appctx_wakeup(__cs_appctx(cs));
+		appctx_wakeup(__sc_appctx(sc));
 	}
 }
 
 
 /* This function is designed to be called from within the stream handler to
- * update the input channel's expiration timer and the conn-stream's
+ * update the input channel's expiration timer and the stream connector's
  * Rx flags based on the channel's flags. It needs to be called only once
  * after the channel's flags have settled down, and before they are cleared,
  * though it doesn't harm to call it as often as desired (it just slightly
@@ -1015,24 +1005,22 @@ static void cs_app_chk_snd_applet(struct conn_stream *cs)
  * handler, as what it does will be used to compute the stream task's
  * expiration.
  */
-void cs_update_rx(struct conn_stream *cs)
+void sc_update_rx(struct stconn *sc)
 {
-	struct channel *ic = cs_ic(cs);
+	struct channel *ic = sc_ic(sc);
 
-	if (ic->flags & CF_SHUTR) {
-		cs_rx_shut_blk(cs);
+	if (ic->flags & CF_SHUTR)
 		return;
-	}
 
 	/* Read not closed, update FD status and timeout for reads */
 	if (ic->flags & CF_DONT_READ)
-		cs_rx_chan_blk(cs);
+		sc_wont_read(sc);
 	else
-		cs_rx_chan_rdy(cs);
+		sc_will_read(sc);
 
 	if (!channel_is_empty(ic) || !channel_may_recv(ic)) {
 		/* stop reading, imposed by channel's policy or contents */
-		cs_rx_room_blk(cs);
+		sc_need_room(sc);
 	}
 	else {
 		/* (re)start reading and update timeout. Note: we don't recompute the timeout
@@ -1040,18 +1028,18 @@ void cs_update_rx(struct conn_stream *cs)
 		 * update it if is was not yet set. The stream socket handler will already
 		 * have updated it if there has been a completed I/O.
 		 */
-		cs_rx_room_rdy(cs);
+		sc_have_room(sc);
 	}
-	if (cs->endp->flags & CS_EP_RXBLK_ANY & ~CS_EP_RX_WAIT_EP)
+	if (sc->flags & (SC_FL_WONT_READ|SC_FL_NEED_BUFF|SC_FL_NEED_ROOM))
 		ic->rex = TICK_ETERNITY;
 	else if (!(ic->flags & CF_READ_NOEXP) && !tick_isset(ic->rex))
 		ic->rex = tick_add_ifset(now_ms, ic->rto);
 
-	cs_chk_rcv(cs);
+	sc_chk_rcv(sc);
 }
 
 /* This function is designed to be called from within the stream handler to
- * update the output channel's expiration timer and the conn-stream's
+ * update the output channel's expiration timer and the stream connector's
  * Tx flags based on the channel's flags. It needs to be called only once
  * after the channel's flags have settled down, and before they are cleared,
  * though it doesn't harm to call it as often as desired (it just slightly
@@ -1059,10 +1047,10 @@ void cs_update_rx(struct conn_stream *cs)
  * handler, as what it does will be used to compute the stream task's
  * expiration.
  */
-void cs_update_tx(struct conn_stream *cs)
+void sc_update_tx(struct stconn *sc)
 {
-	struct channel *oc = cs_oc(cs);
-	struct channel *ic = cs_ic(cs);
+	struct channel *oc = sc_oc(sc);
+	struct channel *ic = sc_ic(sc);
 
 	if (oc->flags & CF_SHUTW)
 		return;
@@ -1070,9 +1058,9 @@ void cs_update_tx(struct conn_stream *cs)
 	/* Write not closed, update FD status and timeout for writes */
 	if (channel_is_empty(oc)) {
 		/* stop writing */
-		if (!(cs->endp->flags & CS_EP_WAIT_DATA)) {
+		if (!sc_ep_test(sc, SE_FL_WAIT_DATA)) {
 			if ((oc->flags & CF_SHUTW_NOW) == 0)
-				cs->endp->flags |= CS_EP_WAIT_DATA;
+				sc_ep_set(sc, SE_FL_WAIT_DATA);
 			oc->wex = TICK_ETERNITY;
 		}
 		return;
@@ -1083,10 +1071,10 @@ void cs_update_tx(struct conn_stream *cs)
 	 * update it if is was not yet set. The stream socket handler will already
 	 * have updated it if there has been a completed I/O.
 	 */
-	cs->endp->flags &= ~CS_EP_WAIT_DATA;
+	sc_ep_clr(sc, SE_FL_WAIT_DATA);
 	if (!tick_isset(oc->wex)) {
 		oc->wex = tick_add_ifset(now_ms, oc->wto);
-		if (tick_isset(ic->rex) && !(cs->flags & CS_FL_INDEP_STR)) {
+		if (tick_isset(ic->rex) && !(sc->flags & SC_FL_INDEP_STR)) {
 			/* Note: depending on the protocol, we don't know if we're waiting
 			 * for incoming data or not. So in order to prevent the socket from
 			 * expiring read timeouts during writes, we refresh the read timeout,
@@ -1098,30 +1086,30 @@ void cs_update_tx(struct conn_stream *cs)
 	}
 }
 
-/* This function is the equivalent to cs_update() except that it's
+/* This function is the equivalent to sc_update() except that it's
  * designed to be called from outside the stream handlers, typically the lower
  * layers (applets, connections) after I/O completion. After updating the stream
  * interface and timeouts, it will try to forward what can be forwarded, then to
  * wake the associated task up if an important event requires special handling.
- * It may update CS_EP_WAIT_DATA and/or CS_EP_RXBLK_ROOM, that the callers are
+ * It may update SE_FL_WAIT_DATA and/or SC_FL_NEED_ROOM, that the callers are
  * encouraged to watch to take appropriate action.
- * It should not be called from within the stream itself, cs_update()
+ * It should not be called from within the stream itself, sc_update()
  * is designed for this.
  */
-static void cs_notify(struct conn_stream *cs)
+static void sc_notify(struct stconn *sc)
 {
-	struct channel *ic = cs_ic(cs);
-	struct channel *oc = cs_oc(cs);
-	struct conn_stream *cso = cs_opposite(cs);
-	struct task *task = cs_strm_task(cs);
+	struct channel *ic = sc_ic(sc);
+	struct channel *oc = sc_oc(sc);
+	struct stconn *sco = sc_opposite(sc);
+	struct task *task = sc_strm_task(sc);
 
 	/* process consumer side */
 	if (channel_is_empty(oc)) {
-		struct connection *conn = cs_conn(cs);
+		struct connection *conn = sc_conn(sc);
 
 		if (((oc->flags & (CF_SHUTW|CF_SHUTW_NOW)) == CF_SHUTW_NOW) &&
-		    (cs->state == CS_ST_EST) && (!conn || !(conn->flags & (CO_FL_WAIT_XPRT | CO_FL_EARLY_SSL_HS))))
-			cs_shutw(cs);
+		    (sc->state == SC_ST_EST) && (!conn || !(conn->flags & (CO_FL_WAIT_XPRT | CO_FL_EARLY_SSL_HS))))
+			sc_shutw(sc);
 		oc->wex = TICK_ETERNITY;
 	}
 
@@ -1129,9 +1117,9 @@ static void cs_notify(struct conn_stream *cs)
 	 * we're about to close and can't expect more data if SHUTW_NOW is there.
 	 */
 	if (!(oc->flags & (CF_SHUTW|CF_SHUTW_NOW)))
-		cs->endp->flags |= CS_EP_WAIT_DATA;
+		sc_ep_set(sc, SE_FL_WAIT_DATA);
 	else if ((oc->flags & (CF_SHUTW|CF_SHUTW_NOW)) == CF_SHUTW_NOW)
-		cs->endp->flags &= ~CS_EP_WAIT_DATA;
+		sc_ep_clr(sc, SE_FL_WAIT_DATA);
 
 	/* update OC timeouts and wake the other side up if it's waiting for room */
 	if (oc->flags & CF_WRITE_ACTIVITY) {
@@ -1140,29 +1128,30 @@ static void cs_notify(struct conn_stream *cs)
 			if (tick_isset(oc->wex))
 				oc->wex = tick_add_ifset(now_ms, oc->wto);
 
-		if (!(cs->flags & CS_FL_INDEP_STR))
+		if (!(sc->flags & SC_FL_INDEP_STR))
 			if (tick_isset(ic->rex))
 				ic->rex = tick_add_ifset(now_ms, ic->rto);
 	}
 
 	if (oc->flags & CF_DONT_READ)
-		cs_rx_chan_blk(cso);
+		sc_wont_read(sco);
 	else
-		cs_rx_chan_rdy(cso);
+		sc_will_read(sco);
 
 	/* Notify the other side when we've injected data into the IC that
 	 * needs to be forwarded. We can do fast-forwarding as soon as there
 	 * are output data, but we avoid doing this if some of the data are
 	 * not yet scheduled for being forwarded, because it is very likely
 	 * that it will be done again immediately afterwards once the following
-	 * data are parsed (eg: HTTP chunking). We only CS_EP_RXBLK_ROOM once
-	 * we've emptied *some* of the output buffer, and not just when there
-	 * is available room, because applets are often forced to stop before
-	 * the buffer is full. We must not stop based on input data alone because
-	 * an HTTP parser might need more data to complete the parsing.
+	 * data are parsed (eg: HTTP chunking). We only clear SC_FL_NEED_ROOM
+	 * once we've emptied *some* of the output buffer, and not just when
+	 * there is available room, because applets are often forced to stop
+	 * before the buffer is full. We must not stop based on input data
+	 * alone because an HTTP parser might need more data to complete the
+	 * parsing.
 	 */
 	if (!channel_is_empty(ic) &&
-	    (cso->endp->flags & CS_EP_WAIT_DATA) &&
+	    sc_ep_test(sco, SE_FL_WAIT_DATA) &&
 	    (!(ic->flags & CF_EXPECT_MORE) || c_full(ic) || ci_data(ic) == 0 || ic->pipe)) {
 		int new_len, last_len;
 
@@ -1170,7 +1159,7 @@ static void cs_notify(struct conn_stream *cs)
 		if (ic->pipe)
 			last_len += ic->pipe->data;
 
-		cs_chk_snd(cso);
+		sc_chk_snd(sco);
 
 		new_len = co_data(ic);
 		if (ic->pipe)
@@ -1180,20 +1169,21 @@ static void cs_notify(struct conn_stream *cs)
 		 * buffer or in the pipe.
 		 */
 		if (new_len < last_len)
-			cs_rx_room_rdy(cs);
+			sc_have_room(sc);
 	}
 
 	if (!(ic->flags & CF_DONT_READ))
-		cs_rx_chan_rdy(cs);
+		sc_will_read(sc);
 
-	cs_chk_rcv(cs);
-	cs_chk_rcv(cso);
+	sc_chk_rcv(sc);
+	sc_chk_rcv(sco);
 
-	if (cs_rx_blocked(cs)) {
+	if (ic->flags & CF_SHUTR || sc_ep_test(sc, SE_FL_APPLET_NEED_CONN) ||
+	    (sc->flags & (SC_FL_WONT_READ|SC_FL_NEED_BUFF|SC_FL_NEED_ROOM))) {
 		ic->rex = TICK_ETERNITY;
 	}
 	else if ((ic->flags & (CF_SHUTR|CF_READ_PARTIAL)) == CF_READ_PARTIAL) {
-		/* we must re-enable reading if cs_chk_snd() has freed some space */
+		/* we must re-enable reading if sc_chk_snd() has freed some space */
 		if (!(ic->flags & CF_READ_NOEXP) && tick_isset(ic->rex))
 			ic->rex = tick_add_ifset(now_ms, ic->rto);
 	}
@@ -1201,10 +1191,10 @@ static void cs_notify(struct conn_stream *cs)
 	/* wake the task up only when needed */
 	if (/* changes on the production side */
 	    (ic->flags & (CF_READ_NULL|CF_READ_ERROR)) ||
-	    !cs_state_in(cs->state, CS_SB_CON|CS_SB_RDY|CS_SB_EST) ||
-	    (cs->endp->flags & CS_EP_ERROR) ||
+	    !sc_state_in(sc->state, SC_SB_CON|SC_SB_RDY|SC_SB_EST) ||
+	    sc_ep_test(sc, SE_FL_ERROR) ||
 	    ((ic->flags & CF_READ_PARTIAL) &&
-	     ((ic->flags & CF_EOI) || !ic->to_forward || cso->state != CS_ST_EST)) ||
+	     ((ic->flags & CF_EOI) || !ic->to_forward || sco->state != SC_ST_EST)) ||
 
 	    /* changes on the consumption side */
 	    (oc->flags & (CF_WRITE_NULL|CF_WRITE_ERROR)) ||
@@ -1212,7 +1202,7 @@ static void cs_notify(struct conn_stream *cs)
 	     ((oc->flags & CF_SHUTW) ||
 	      (((oc->flags & CF_WAKE_WRITE) ||
 		!(oc->flags & (CF_AUTO_CLOSE|CF_SHUTW_NOW|CF_SHUTW))) &&
-	       (cso->state != CS_ST_EST ||
+	       (sco->state != SC_ST_EST ||
 	        (channel_is_empty(oc) && !oc->to_forward)))))) {
 		task_wakeup(task, TASK_WOKEN_IO);
 	}
@@ -1224,7 +1214,7 @@ static void cs_notify(struct conn_stream *cs)
 
 		task->expire = tick_first(task->expire, ic->analyse_exp);
 		task->expire = tick_first(task->expire, oc->analyse_exp);
-		task->expire = tick_first(task->expire, __cs_strm(cs)->conn_exp);
+		task->expire = tick_first(task->expire, __sc_strm(sc)->conn_exp);
 
 		task_queue(task);
 	}
@@ -1234,32 +1224,31 @@ static void cs_notify(struct conn_stream *cs)
 
 /*
  * This function propagates a null read received on a socket-based connection.
- * It updates the conn-stream. If the conn-stream has CS_FL_NOHALF,
+ * It updates the stream connector. If the stream connector has SC_FL_NOHALF,
  * the close is also forwarded to the write side as an abort.
  */
-static void cs_conn_read0(struct conn_stream *cs)
+static void sc_conn_read0(struct stconn *sc)
 {
-	struct channel *ic = cs_ic(cs);
-	struct channel *oc = cs_oc(cs);
+	struct channel *ic = sc_ic(sc);
+	struct channel *oc = sc_oc(sc);
 
-	BUG_ON(!cs_conn(cs));
+	BUG_ON(!sc_conn(sc));
 
-	cs_rx_shut_blk(cs);
 	if (ic->flags & CF_SHUTR)
 		return;
 	ic->flags |= CF_SHUTR;
 	ic->rex = TICK_ETERNITY;
 
-	if (!cs_state_in(cs->state, CS_SB_CON|CS_SB_RDY|CS_SB_EST))
+	if (!sc_state_in(sc->state, SC_SB_CON|SC_SB_RDY|SC_SB_EST))
 		return;
 
 	if (oc->flags & CF_SHUTW)
 		goto do_close;
 
-	if (cs->flags & CS_FL_NOHALF) {
+	if (sc->flags & SC_FL_NOHALF) {
 		/* we want to immediately forward this close to the write side */
 		/* force flag on ssl to keep stream in cache */
-		cs_conn_shutw(cs, CO_SHW_SILENT);
+		sc_conn_shutw(sc, CO_SHW_SILENT);
 		goto do_close;
 	}
 
@@ -1267,17 +1256,15 @@ static void cs_conn_read0(struct conn_stream *cs)
 	return;
 
  do_close:
-	/* OK we completely close the socket here just as if we went through cs_shut[rw]() */
-	cs_conn_shut(cs);
+	/* OK we completely close the socket here just as if we went through sc_shut[rw]() */
+	sc_conn_shut(sc);
 
 	oc->flags &= ~CF_SHUTW_NOW;
 	oc->flags |= CF_SHUTW;
 	oc->wex = TICK_ETERNITY;
 
-	cs_done_get(cs);
-
-	cs->state = CS_ST_DIS;
-	__cs_strm(cs)->conn_exp = TICK_ETERNITY;
+	sc->state = SC_ST_DIS;
+	__sc_strm(sc)->conn_exp = TICK_ETERNITY;
 	return;
 }
 
@@ -1286,22 +1273,22 @@ static void cs_conn_read0(struct conn_stream *cs)
  * into the buffer from the connection. It iterates over the mux layer's
  * rcv_buf function.
  */
-static int cs_conn_recv(struct conn_stream *cs)
+static int sc_conn_recv(struct stconn *sc)
 {
-	struct connection *conn = __cs_conn(cs);
-	struct channel *ic = cs_ic(cs);
+	struct connection *conn = __sc_conn(sc);
+	struct channel *ic = sc_ic(sc);
 	int ret, max, cur_read = 0;
 	int read_poll = MAX_READ_POLL_LOOPS;
 	int flags = 0;
 
 	/* If not established yet, do nothing. */
-	if (cs->state != CS_ST_EST)
+	if (sc->state != SC_ST_EST)
 		return 0;
 
-	/* If another call to cs_conn_recv() failed, and we subscribed to
+	/* If another call to sc_conn_recv() failed, and we subscribed to
 	 * recv events already, give up now.
 	 */
-	if (cs->wait_event.events & SUB_RETRY_RECV)
+	if (sc->wait_event.events & SUB_RETRY_RECV)
 		return 0;
 
 	/* maybe we were called immediately after an asynchronous shutr */
@@ -1313,7 +1300,7 @@ static int cs_conn_recv(struct conn_stream *cs)
 		return 0;
 
 	/* stop here if we reached the end of data */
-	if (cs->endp->flags & CS_EP_EOS)
+	if (sc_ep_test(sc, SE_FL_EOS))
 		goto end_recv;
 
 	/* stop immediately on errors. Note that we DON'T want to stop on
@@ -1322,15 +1309,15 @@ static int cs_conn_recv(struct conn_stream *cs)
 	 * happens when we send too large a request to a backend server
 	 * which rejects it before reading it all.
 	 */
-	if (!(cs->endp->flags & CS_EP_RCV_MORE)) {
+	if (!sc_ep_test(sc, SE_FL_RCV_MORE)) {
 		if (!conn_xprt_ready(conn))
 			return 0;
-		if (cs->endp->flags & CS_EP_ERROR)
+		if (sc_ep_test(sc, SE_FL_ERROR))
 			goto end_recv;
 	}
 
 	/* prepare to detect if the mux needs more room */
-	cs->endp->flags &= ~CS_EP_WANT_ROOM;
+	sc_ep_clr(sc, SE_FL_WANT_ROOM);
 
 	if ((ic->flags & (CF_STREAMER | CF_STREAMER_FAST)) && !co_data(ic) &&
 	    global.tune.idle_timer &&
@@ -1347,7 +1334,7 @@ static int cs_conn_recv(struct conn_stream *cs)
 	/* First, let's see if we may splice data across the channel without
 	 * using a buffer.
 	 */
-	if (cs->endp->flags & CS_EP_MAY_SPLICE &&
+	if (sc_ep_test(sc, SE_FL_MAY_SPLICE) &&
 	    (ic->pipe || ic->to_forward >= MIN_SPLICE_FORWARD) &&
 	    ic->flags & CF_KERN_SPLICING) {
 		if (c_data(ic)) {
@@ -1367,7 +1354,7 @@ static int cs_conn_recv(struct conn_stream *cs)
 			}
 		}
 
-		ret = conn->mux->rcv_pipe(cs, ic->pipe, ic->to_forward);
+		ret = conn->mux->rcv_pipe(sc, ic->pipe, ic->to_forward);
 		if (ret < 0) {
 			/* splice not supported on this end, let's disable it */
 			ic->flags &= ~CF_KERN_SPLICING;
@@ -1382,14 +1369,14 @@ static int cs_conn_recv(struct conn_stream *cs)
 			ic->flags |= CF_READ_PARTIAL;
 		}
 
-		if (cs->endp->flags & (CS_EP_EOS|CS_EP_ERROR))
+		if (sc_ep_test(sc, SE_FL_EOS | SE_FL_ERROR))
 			goto end_recv;
 
 		if (conn->flags & CO_FL_WAIT_ROOM) {
 			/* the pipe is full or we have read enough data that it
 			 * could soon be full. Let's stop before needing to poll.
 			 */
-			cs_rx_room_blk(cs);
+			sc_need_room(sc);
 			goto done_recv;
 		}
 
@@ -1402,7 +1389,7 @@ static int cs_conn_recv(struct conn_stream *cs)
 		ic->pipe = NULL;
 	}
 
-	if (ic->pipe && ic->to_forward && !(flags & CO_RFL_BUF_FLUSH) && cs->endp->flags & CS_EP_MAY_SPLICE) {
+	if (ic->pipe && ic->to_forward && !(flags & CO_RFL_BUF_FLUSH) && sc_ep_test(sc, SE_FL_MAY_SPLICE)) {
 		/* don't break splicing by reading, but still call rcv_buf()
 		 * to pass the flag.
 		 */
@@ -1410,7 +1397,7 @@ static int cs_conn_recv(struct conn_stream *cs)
 	}
 
 	/* now we'll need a input buffer for the stream */
-	if (!cs_alloc_ibuf(cs, &(__cs_strm(cs)->buffer_wait)))
+	if (!sc_alloc_ibuf(sc, &(__sc_strm(sc)->buffer_wait)))
 		goto end_recv;
 
 	/* For an HTX stream, if the buffer is stuck (no output data with some
@@ -1422,7 +1409,7 @@ static int cs_conn_recv(struct conn_stream *cs)
 	 * NOTE: A possible optim may be to let the mux decides if defrag is
 	 *       required or not, depending on amount of data to be xferred.
 	 */
-	if (IS_HTX_STRM(__cs_strm(cs)) && !co_data(ic)) {
+	if (IS_HTX_STRM(__sc_strm(sc)) && !co_data(ic)) {
 		struct htx *htx = htxbuf(&ic->buf);
 
 		if (htx_is_not_empty(htx) && ((htx->flags & HTX_FL_FRAGMENTED) || htx_space_wraps(htx)))
@@ -1430,16 +1417,16 @@ static int cs_conn_recv(struct conn_stream *cs)
 	}
 
 	/* Instruct the mux it must subscribed for read events */
-	flags |= ((!conn_is_back(conn) && (__cs_strm(cs)->be->options & PR_O_ABRT_CLOSE)) ? CO_RFL_KEEP_RECV : 0);
+	flags |= ((!conn_is_back(conn) && (__sc_strm(sc)->be->options & PR_O_ABRT_CLOSE)) ? CO_RFL_KEEP_RECV : 0);
 
 	/* Important note : if we're called with POLL_IN|POLL_HUP, it means the read polling
 	 * was enabled, which implies that the recv buffer was not full. So we have a guarantee
 	 * that if such an event is not handled above in splice, it will be handled here by
 	 * recv().
 	 */
-	while ((cs->endp->flags & CS_EP_RCV_MORE) ||
+	while (sc_ep_test(sc, SE_FL_RCV_MORE) ||
 	       (!(conn->flags & CO_FL_HANDSHAKE) &&
-	       (!(cs->endp->flags & (CS_EP_ERROR|CS_EP_EOS))) && !(ic->flags & CF_SHUTR))) {
+	       (!sc_ep_test(sc, SE_FL_ERROR | SE_FL_EOS)) && !(ic->flags & CF_SHUTR))) {
 		int cur_flags = flags;
 
 		/* Compute transient CO_RFL_* flags */
@@ -1448,18 +1435,18 @@ static int cs_conn_recv(struct conn_stream *cs)
 		}
 
 		/* <max> may be null. This is the mux responsibility to set
-		 * CS_EP_RCV_MORE on the CS if more space is needed.
+		 * SE_FL_RCV_MORE on the SC if more space is needed.
 		 */
 		max = channel_recv_max(ic);
-		ret = conn->mux->rcv_buf(cs, &ic->buf, max, cur_flags);
+		ret = conn->mux->rcv_buf(sc, &ic->buf, max, cur_flags);
 
-		if (cs->endp->flags & CS_EP_WANT_ROOM) {
-			/* CS_EP_WANT_ROOM must not be reported if the channel's
+		if (sc_ep_test(sc, SE_FL_WANT_ROOM)) {
+			/* SE_FL_WANT_ROOM must not be reported if the channel's
 			 * buffer is empty.
 			 */
 			BUG_ON(c_empty(ic));
 
-			cs_rx_room_blk(cs);
+			sc_need_room(sc);
 			/* Add READ_PARTIAL because some data are pending but
 			 * cannot be xferred to the channel
 			 */
@@ -1473,7 +1460,7 @@ static int cs_conn_recv(struct conn_stream *cs)
 			 * here to proceed.
 			 */
 			if (flags & CO_RFL_BUF_FLUSH)
-				cs_rx_room_blk(cs);
+				sc_need_room(sc);
 			break;
 		}
 
@@ -1494,16 +1481,16 @@ static int cs_conn_recv(struct conn_stream *cs)
 		ic->total += ret;
 
 		/* End-of-input reached, we can leave. In this case, it is
-		 * important to break the loop to not block the CS because of
+		 * important to break the loop to not block the SC because of
 		 * the channel's policies.This way, we are still able to receive
 		 * shutdowns.
 		 */
-		if (cs->endp->flags & CS_EP_EOI)
+		if (sc_ep_test(sc, SE_FL_EOI))
 			break;
 
 		if ((ic->flags & CF_READ_DONTWAIT) || --read_poll <= 0) {
 			/* we're stopped by the channel's policy */
-			cs_rx_chan_blk(cs);
+			sc_wont_read(sc);
 			break;
 		}
 
@@ -1518,7 +1505,7 @@ static int cs_conn_recv(struct conn_stream *cs)
 			 */
 			if (ic->flags & CF_STREAMER) {
 				/* we're stopped by the channel's policy */
-				cs_rx_chan_blk(cs);
+				sc_wont_read(sc);
 				break;
 			}
 
@@ -1527,7 +1514,7 @@ static int cs_conn_recv(struct conn_stream *cs)
 			 */
 			if (ret >= global.tune.recv_enough) {
 				/* we're stopped by the channel's policy */
-				cs_rx_chan_blk(cs);
+				sc_wont_read(sc);
 				break;
 			}
 		}
@@ -1535,7 +1522,7 @@ static int cs_conn_recv(struct conn_stream *cs)
 		/* if we are waiting for more space, don't try to read more data
 		 * right now.
 		 */
-		if (cs_rx_blocked(cs))
+		if (sc->flags & (SC_FL_WONT_READ|SC_FL_NEED_BUFF|SC_FL_NEED_ROOM))
 			break;
 	} /* while !flags */
 
@@ -1584,54 +1571,55 @@ static int cs_conn_recv(struct conn_stream *cs)
 
 	/* Report EOI on the channel if it was reached from the mux point of
 	 * view. */
-	if ((cs->endp->flags & CS_EP_EOI) && !(ic->flags & CF_EOI)) {
+	if (sc_ep_test(sc, SE_FL_EOI) && !(ic->flags & CF_EOI)) {
 		ic->flags |= (CF_EOI|CF_READ_PARTIAL);
 		ret = 1;
 	}
 
-	if (cs->endp->flags & CS_EP_ERROR)
+	if (sc_ep_test(sc, SE_FL_ERROR))
 		ret = 1;
-	else if (cs->endp->flags & CS_EP_EOS) {
+	else if (sc_ep_test(sc, SE_FL_EOS)) {
 		/* we received a shutdown */
 		ic->flags |= CF_READ_NULL;
 		if (ic->flags & CF_AUTO_CLOSE)
 			channel_shutw_now(ic);
-		cs_conn_read0(cs);
+		sc_conn_read0(sc);
 		ret = 1;
 	}
-	else if (!cs_rx_blocked(cs)) {
+	else if (!(sc->flags & (SC_FL_WONT_READ|SC_FL_NEED_BUFF|SC_FL_NEED_ROOM)) &&
+		 !(ic->flags & CF_SHUTR)) {
 		/* Subscribe to receive events if we're blocking on I/O */
-		conn->mux->subscribe(cs, SUB_RETRY_RECV, &cs->wait_event);
-		cs_rx_endp_done(cs);
+		conn->mux->subscribe(sc, SUB_RETRY_RECV, &sc->wait_event);
+		se_have_no_more_data(sc->sedesc);
 	} else {
-		cs_rx_endp_more(cs);
+		se_have_more_data(sc->sedesc);
 		ret = 1;
 	}
 	return ret;
 }
 
-/* This tries to perform a synchronous receive on the conn-stream to
+/* This tries to perform a synchronous receive on the stream connector to
  * try to collect last arrived data. In practice it's only implemented on
- * conn_streams. Returns 0 if nothing was done, non-zero if new data or a
+ * stconns. Returns 0 if nothing was done, non-zero if new data or a
  * shutdown were collected. This may result on some delayed receive calls
  * to be programmed and performed later, though it doesn't provide any
  * such guarantee.
  */
-int cs_conn_sync_recv(struct conn_stream *cs)
+int sc_conn_sync_recv(struct stconn *sc)
 {
-	if (!cs_state_in(cs->state, CS_SB_RDY|CS_SB_EST))
+	if (!sc_state_in(sc->state, SC_SB_RDY|SC_SB_EST))
 		return 0;
 
-	if (!cs_conn_mux(cs))
-		return 0; // only conn_streams are supported
+	if (!sc_mux_ops(sc))
+		return 0; // only stconns are supported
 
-	if (cs->wait_event.events & SUB_RETRY_RECV)
+	if (sc->wait_event.events & SUB_RETRY_RECV)
 		return 0; // already subscribed
 
-	if (!cs_rx_endp_ready(cs) || cs_rx_blocked(cs))
+	if (!sc_is_recv_allowed(sc))
 		return 0; // already failed
 
-	return cs_conn_recv(cs);
+	return sc_conn_recv(sc);
 }
 
 /*
@@ -1640,29 +1628,29 @@ int cs_conn_sync_recv(struct conn_stream *cs)
  * caller to commit polling changes. The caller should check conn->flags
  * for errors.
  */
-static int cs_conn_send(struct conn_stream *cs)
+static int sc_conn_send(struct stconn *sc)
 {
-	struct connection *conn = __cs_conn(cs);
-	struct stream *s = __cs_strm(cs);
-	struct channel *oc = cs_oc(cs);
+	struct connection *conn = __sc_conn(sc);
+	struct stream *s = __sc_strm(sc);
+	struct channel *oc = sc_oc(sc);
 	int ret;
 	int did_send = 0;
 
-	if (cs->endp->flags & (CS_EP_ERROR|CS_EP_ERR_PENDING) || cs_is_conn_error(cs)) {
+	if (sc_ep_test(sc, SE_FL_ERROR | SE_FL_ERR_PENDING) || sc_is_conn_error(sc)) {
 		/* We're probably there because the tasklet was woken up,
 		 * but process_stream() ran before, detected there were an
-		 * error and put the CS back to CS_ST_TAR. There's still
+		 * error and put the SC back to SC_ST_TAR. There's still
 		 * CO_FL_ERROR on the connection but we don't want to add
-		 * CS_EP_ERROR back, so give up
+		 * SE_FL_ERROR back, so give up
 		 */
-		if (cs->state < CS_ST_CON)
+		if (sc->state < SC_ST_CON)
 			return 0;
-		cs->endp->flags |= CS_EP_ERROR;
+		sc_ep_set(sc, SE_FL_ERROR);
 		return 1;
 	}
 
 	/* We're already waiting to be able to send, give up */
-	if (cs->wait_event.events & SUB_RETRY_SEND)
+	if (sc->wait_event.events & SUB_RETRY_SEND)
 		return 0;
 
 	/* we might have been called just after an asynchronous shutw */
@@ -1674,7 +1662,7 @@ static int cs_conn_send(struct conn_stream *cs)
 		return 0;
 
 	if (oc->pipe && conn->xprt->snd_pipe && conn->mux->snd_pipe) {
-		ret = conn->mux->snd_pipe(cs, oc->pipe);
+		ret = conn->mux->snd_pipe(sc, oc->pipe);
 		if (ret > 0)
 			did_send = 1;
 
@@ -1745,7 +1733,7 @@ static int cs_conn_send(struct conn_stream *cs)
 			}
 		}
 
-		ret = conn->mux->snd_buf(cs, &oc->buf, co_data(oc), send_flag);
+		ret = conn->mux->snd_buf(sc, &oc->buf, co_data(oc), send_flag);
 		if (ret > 0) {
 			did_send = 1;
 			c_rew(oc, ret);
@@ -1764,30 +1752,30 @@ static int cs_conn_send(struct conn_stream *cs)
  end:
 	if (did_send) {
 		oc->flags |= CF_WRITE_PARTIAL | CF_WROTE_DATA;
-		if (cs->state == CS_ST_CON)
-			cs->state = CS_ST_RDY;
+		if (sc->state == SC_ST_CON)
+			sc->state = SC_ST_RDY;
 
-		cs_rx_room_rdy(cs_opposite(cs));
+		sc_have_room(sc_opposite(sc));
 	}
 
-	if (cs->endp->flags & (CS_EP_ERROR|CS_EP_ERR_PENDING)) {
-		cs->endp->flags |= CS_EP_ERROR;
+	if (sc_ep_test(sc, SE_FL_ERROR | SE_FL_ERR_PENDING)) {
+		sc_ep_set(sc, SE_FL_ERROR);
 		return 1;
 	}
 
 	/* We couldn't send all of our data, let the mux know we'd like to send more */
 	if (!channel_is_empty(oc))
-		conn->mux->subscribe(cs, SUB_RETRY_SEND, &cs->wait_event);
+		conn->mux->subscribe(sc, SUB_RETRY_SEND, &sc->wait_event);
 	return did_send;
 }
 
-/* perform a synchronous send() for the conn-stream. The CF_WRITE_NULL and
+/* perform a synchronous send() for the stream connector. The CF_WRITE_NULL and
  * CF_WRITE_PARTIAL flags are cleared prior to the attempt, and will possibly
  * be updated in case of success.
  */
-void cs_conn_sync_send(struct conn_stream *cs)
+void sc_conn_sync_send(struct stconn *sc)
 {
-	struct channel *oc = cs_oc(cs);
+	struct channel *oc = sc_oc(sc);
 
 	oc->flags &= ~(CF_WRITE_NULL|CF_WRITE_PARTIAL);
 
@@ -1797,49 +1785,49 @@ void cs_conn_sync_send(struct conn_stream *cs)
 	if (channel_is_empty(oc))
 		return;
 
-	if (!cs_state_in(cs->state, CS_SB_CON|CS_SB_RDY|CS_SB_EST))
+	if (!sc_state_in(sc->state, SC_SB_CON|SC_SB_RDY|SC_SB_EST))
 		return;
 
-	if (!cs_conn_mux(cs))
+	if (!sc_mux_ops(sc))
 		return;
 
-	cs_conn_send(cs);
+	sc_conn_send(sc);
 }
 
 /* Called by I/O handlers after completion.. It propagates
- * connection flags to the conn-stream, updates the stream (which may or
+ * connection flags to the stream connector, updates the stream (which may or
  * may not take this opportunity to try to forward data), then update the
- * connection's polling based on the channels and conn-stream's final
+ * connection's polling based on the channels and stream connector's final
  * states. The function always returns 0.
  */
-static int cs_conn_process(struct conn_stream *cs)
+static int sc_conn_process(struct stconn *sc)
 {
-	struct connection *conn = __cs_conn(cs);
-	struct channel *ic = cs_ic(cs);
-	struct channel *oc = cs_oc(cs);
+	struct connection *conn = __sc_conn(sc);
+	struct channel *ic = sc_ic(sc);
+	struct channel *oc = sc_oc(sc);
 
 	BUG_ON(!conn);
 
 	/* If we have data to send, try it now */
-	if (!channel_is_empty(oc) && !(cs->wait_event.events & SUB_RETRY_SEND))
-		cs_conn_send(cs);
+	if (!channel_is_empty(oc) && !(sc->wait_event.events & SUB_RETRY_SEND))
+		sc_conn_send(sc);
 
-	/* First step, report to the conn-stream what was detected at the
+	/* First step, report to the stream connector what was detected at the
 	 * connection layer : errors and connection establishment.
-	 * Only add CS_EP_ERROR if we're connected, or we're attempting to
+	 * Only add SE_FL_ERROR if we're connected, or we're attempting to
 	 * connect, we may get there because we got woken up, but only run
 	 * after process_stream() noticed there were an error, and decided
 	 * to retry to connect, the connection may still have CO_FL_ERROR,
-	 * and we don't want to add CS_EP_ERROR back
+	 * and we don't want to add SE_FL_ERROR back
 	 *
-	 * Note: This test is only required because cs_conn_process is also the SI
-	 *       wake callback. Otherwise cs_conn_recv()/cs_conn_send() already take
+	 * Note: This test is only required because sc_conn_process is also the SI
+	 *       wake callback. Otherwise sc_conn_recv()/sc_conn_send() already take
 	 *       care of it.
 	 */
 
-	if (cs->state >= CS_ST_CON) {
-		if (cs_is_conn_error(cs))
-			cs->endp->flags |= CS_EP_ERROR;
+	if (sc->state >= SC_ST_CON) {
+		if (sc_is_conn_error(sc))
+			sc_ep_set(sc, SE_FL_ERROR);
 	}
 
 	/* If we had early data, and the handshake ended, then
@@ -1848,111 +1836,111 @@ static int cs_conn_process(struct conn_stream *cs)
 	 * the handshake.
 	 */
 	if (!(conn->flags & (CO_FL_WAIT_XPRT | CO_FL_EARLY_SSL_HS)) &&
-	    (cs->endp->flags & CS_EP_WAIT_FOR_HS)) {
-		cs->endp->flags &= ~CS_EP_WAIT_FOR_HS;
-		task_wakeup(cs_strm_task(cs), TASK_WOKEN_MSG);
+	    sc_ep_test(sc, SE_FL_WAIT_FOR_HS)) {
+		sc_ep_clr(sc, SE_FL_WAIT_FOR_HS);
+		task_wakeup(sc_strm_task(sc), TASK_WOKEN_MSG);
 	}
 
-	if (!cs_state_in(cs->state, CS_SB_EST|CS_SB_DIS|CS_SB_CLO) &&
+	if (!sc_state_in(sc->state, SC_SB_EST|SC_SB_DIS|SC_SB_CLO) &&
 	    (conn->flags & CO_FL_WAIT_XPRT) == 0) {
-		__cs_strm(cs)->conn_exp = TICK_ETERNITY;
+		__sc_strm(sc)->conn_exp = TICK_ETERNITY;
 		oc->flags |= CF_WRITE_NULL;
-		if (cs->state == CS_ST_CON)
-			cs->state = CS_ST_RDY;
+		if (sc->state == SC_ST_CON)
+			sc->state = SC_ST_RDY;
 	}
 
 	/* Report EOS on the channel if it was reached from the mux point of
 	 * view.
 	 *
-	 * Note: This test is only required because cs_conn_process is also the SI
-	 *       wake callback. Otherwise cs_conn_recv()/cs_conn_send() already take
+	 * Note: This test is only required because sc_conn_process is also the SI
+	 *       wake callback. Otherwise sc_conn_recv()/sc_conn_send() already take
 	 *       care of it.
 	 */
-	if (cs->endp->flags & CS_EP_EOS && !(ic->flags & CF_SHUTR)) {
+	if (sc_ep_test(sc, SE_FL_EOS) && !(ic->flags & CF_SHUTR)) {
 		/* we received a shutdown */
 		ic->flags |= CF_READ_NULL;
 		if (ic->flags & CF_AUTO_CLOSE)
 			channel_shutw_now(ic);
-		cs_conn_read0(cs);
+		sc_conn_read0(sc);
 	}
 
 	/* Report EOI on the channel if it was reached from the mux point of
 	 * view.
 	 *
-	 * Note: This test is only required because cs_conn_process is also the SI
-	 *       wake callback. Otherwise cs_conn_recv()/cs_conn_send() already take
+	 * Note: This test is only required because sc_conn_process is also the SI
+	 *       wake callback. Otherwise sc_conn_recv()/sc_conn_send() already take
 	 *       care of it.
 	 */
-	if ((cs->endp->flags & CS_EP_EOI) && !(ic->flags & CF_EOI))
+	if (sc_ep_test(sc, SE_FL_EOI) && !(ic->flags & CF_EOI))
 		ic->flags |= (CF_EOI|CF_READ_PARTIAL);
 
-	/* Second step : update the conn-stream and channels, try to forward any
+	/* Second step : update the stream connector and channels, try to forward any
 	 * pending data, then possibly wake the stream up based on the new
-	 * conn-stream status.
+	 * stream connector status.
 	 */
-	cs_notify(cs);
-	stream_release_buffers(__cs_strm(cs));
+	sc_notify(sc);
+	stream_release_buffers(__sc_strm(sc));
 	return 0;
 }
 
-/* This is the ->process() function for any conn-stream's wait_event task.
- * It's assigned during the conn-stream's initialization, for any type of
- * conn-stream. Thus it is always safe to perform a tasklet_wakeup() on a
- * conn-stream, as the presence of the CS is checked there.
+/* This is the ->process() function for any stream connector's wait_event task.
+ * It's assigned during the stream connector's initialization, for any type of
+ * stream connector. Thus it is always safe to perform a tasklet_wakeup() on a
+ * stream connector, as the presence of the SC is checked there.
  */
-struct task *cs_conn_io_cb(struct task *t, void *ctx, unsigned int state)
+struct task *sc_conn_io_cb(struct task *t, void *ctx, unsigned int state)
 {
-	struct conn_stream *cs = ctx;
+	struct stconn *sc = ctx;
 	int ret = 0;
 
-	if (!cs_conn(cs))
+	if (!sc_conn(sc))
 		return t;
 
-	if (!(cs->wait_event.events & SUB_RETRY_SEND) && !channel_is_empty(cs_oc(cs)))
-		ret = cs_conn_send(cs);
-	if (!(cs->wait_event.events & SUB_RETRY_RECV))
-		ret |= cs_conn_recv(cs);
+	if (!(sc->wait_event.events & SUB_RETRY_SEND) && !channel_is_empty(sc_oc(sc)))
+		ret = sc_conn_send(sc);
+	if (!(sc->wait_event.events & SUB_RETRY_RECV))
+		ret |= sc_conn_recv(sc);
 	if (ret != 0)
-		cs_conn_process(cs);
+		sc_conn_process(sc);
 
-	stream_release_buffers(__cs_strm(cs));
+	stream_release_buffers(__sc_strm(sc));
 	return t;
 }
 
 /* Callback to be used by applet handlers upon completion. It updates the stream
  * (which may or may not take this opportunity to try to forward data), then
- * may re-enable the applet's based on the channels and conn-stream's final
+ * may re-enable the applet's based on the channels and stream connector's final
  * states.
  */
-static int cs_applet_process(struct conn_stream *cs)
+static int sc_applet_process(struct stconn *sc)
 {
-	struct channel *ic = cs_ic(cs);
+	struct channel *ic = sc_ic(sc);
 
-	BUG_ON(!cs_appctx(cs));
+	BUG_ON(!sc_appctx(sc));
 
 	/* If the applet wants to write and the channel is closed, it's a
 	 * broken pipe and it must be reported.
 	 */
-	if (!(cs->endp->flags & CS_EP_RX_WAIT_EP) && (ic->flags & CF_SHUTR))
-		cs->endp->flags |= CS_EP_ERROR;
+	if (!sc_ep_test(sc, SE_FL_HAVE_NO_DATA) && (ic->flags & CF_SHUTR))
+		sc_ep_set(sc, SE_FL_ERROR);
 
 	/* automatically mark the applet having data available if it reported
 	 * begin blocked by the channel.
 	 */
-	if (cs_rx_blocked(cs))
-		cs_rx_endp_more(cs);
+	if ((sc->flags & (SC_FL_WONT_READ|SC_FL_NEED_BUFF|SC_FL_NEED_ROOM)) ||
+	    sc_ep_test(sc, SE_FL_APPLET_NEED_CONN))
+		applet_have_more_data(__sc_appctx(sc));
 
-	/* update the conn-stream, channels, and possibly wake the stream up */
-	cs_notify(cs);
-	stream_release_buffers(__cs_strm(cs));
+	/* update the stream connector, channels, and possibly wake the stream up */
+	sc_notify(sc);
+	stream_release_buffers(__sc_strm(sc));
 
-	/* cs_notify may have passed through chk_snd and released some
-	 * RXBLK flags. Process_stream will consider those flags to wake up the
+	/* sc_notify may have passed through chk_snd and released some blocking
+	 * flags. Process_stream will consider those flags to wake up the
 	 * appctx but in the case the task is not in runqueue we may have to
 	 * wakeup the appctx immediately.
 	 */
-	if ((cs_rx_endp_ready(cs) && !cs_rx_blocked(cs)) ||
-	    (cs_tx_endp_ready(cs) && !cs_tx_blocked(cs)))
-		appctx_wakeup(__cs_appctx(cs));
+	if (sc_is_recv_allowed(sc) || sc_is_send_allowed(sc))
+		appctx_wakeup(__sc_appctx(sc));
 	return 0;
 }

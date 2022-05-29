@@ -16,9 +16,9 @@
 #include <haproxy/api.h>
 #include <haproxy/applet.h>
 #include <haproxy/channel.h>
-#include <haproxy/conn_stream.h>
-#include <haproxy/cs_utils.h>
 #include <haproxy/list.h>
+#include <haproxy/sc_strm.h>
+#include <haproxy/stconn.h>
 #include <haproxy/stream.h>
 #include <haproxy/task.h>
 
@@ -31,12 +31,12 @@ DECLARE_POOL(pool_head_appctx,  "appctx",  sizeof(struct appctx));
  * appctx_free(). <applet> is assigned as the applet, but it can be NULL. The
  * applet's task is always created on the current thread.
  */
-struct appctx *appctx_new(struct applet *applet, struct cs_endpoint *endp, unsigned long thread_mask)
+struct appctx *appctx_new(struct applet *applet, struct sedesc *sedesc, unsigned long thread_mask)
 {
 	struct appctx *appctx;
 
 	/* Backend appctx cannot be started on another thread than the local one */
-	BUG_ON(thread_mask != tid_bit && endp);
+	BUG_ON(thread_mask != tid_bit && sedesc);
 
 	appctx = pool_zalloc(pool_head_appctx);
 	if (unlikely(!appctx))
@@ -46,14 +46,14 @@ struct appctx *appctx_new(struct applet *applet, struct cs_endpoint *endp, unsig
 	appctx->obj_type = OBJ_TYPE_APPCTX;
 	appctx->applet = applet;
 	appctx->sess = NULL;
-	if (!endp) {
-		endp = cs_endpoint_new();
-		if (!endp)
+	if (!sedesc) {
+		sedesc = sedesc_new();
+		if (!sedesc)
 			goto fail_endp;
-		endp->target = appctx;
-		endp->flags |= (CS_EP_T_APPLET|CS_EP_ORPHAN);
+		sedesc->se = appctx;
+		se_fl_set(sedesc, SE_FL_T_APPLET | SE_FL_ORPHAN);
 	}
-	appctx->endp = endp;
+	appctx->sedesc = sedesc;
 
 	appctx->t = task_new(thread_mask);
 	if (unlikely(!appctx->t))
@@ -69,7 +69,7 @@ struct appctx *appctx_new(struct applet *applet, struct cs_endpoint *endp, unsig
 	return appctx;
 
   fail_task:
-	cs_endpoint_free(appctx->endp);
+	sedesc_free(appctx->sedesc);
   fail_endp:
 	pool_free(pool_head_appctx, appctx);
   fail_appctx:
@@ -78,7 +78,7 @@ struct appctx *appctx_new(struct applet *applet, struct cs_endpoint *endp, unsig
 
 /* Finalize the frontend appctx startup. It must not be called for a backend
  * appctx. This function is responsible to create the appctx's session and the
- * frontend conn-stream. By transitivity, the stream is also created.
+ * frontend stream connector. By transitivity, the stream is also created.
  *
  * It returns 0 on success and -1 on error. In this case, it is the caller
  * responsibility to release the appctx. However, the session is released if it
@@ -93,12 +93,12 @@ int appctx_finalize_startup(struct appctx *appctx, struct proxy *px, struct buff
 	/* async startup is only possible for frontend appctx. Thus for orphan
 	 * appctx. Because no backend appctx can be orphan.
 	 */
-	BUG_ON(!(appctx->endp->flags & CS_EP_ORPHAN));
+	BUG_ON(!se_fl_test(appctx->sedesc, SE_FL_ORPHAN));
 
 	sess = session_new(px, NULL, &appctx->obj_type);
 	if (!sess)
 		return -1;
-	if (!cs_new_from_endp(appctx->endp, sess, input)) {
+	if (!sc_new_from_endp(appctx->sedesc, sess, input)) {
 		session_free(sess);
 		return -1;
 	}
@@ -111,10 +111,10 @@ int appctx_finalize_startup(struct appctx *appctx, struct proxy *px, struct buff
  */
 void appctx_free_on_early_error(struct appctx *appctx)
 {
-	/* If a frontend apctx is attached to a conn-stream, release the stream
+	/* If a frontend appctx is attached to a stream connector, release the stream
 	 * instead of the appctx.
 	 */
-	if (!(appctx->endp->flags & CS_EP_ORPHAN) && !(appctx_cs(appctx)->flags & CS_FL_ISBACK)) {
+	if (!se_fl_test(appctx->sedesc, SE_FL_ORPHAN) && !(appctx_sc(appctx)->flags & SC_FL_ISBACK)) {
 		stream_free(appctx_strm(appctx));
 		return;
 	}
@@ -140,23 +140,23 @@ void *applet_reserve_svcctx(struct appctx *appctx, size_t size)
 	return appctx->svcctx;
 }
 
-/* call the applet's release() function if any, and marks the endp as shut.
+/* call the applet's release() function if any, and marks the sedesc as shut.
  * Needs to be called upon close().
  */
 void appctx_shut(struct appctx *appctx)
 {
-	if (appctx->endp->flags & (CS_EP_SHR|CS_EP_SHW))
+	if (se_fl_test(appctx->sedesc, SE_FL_SHR | SE_FL_SHW))
 		return;
 
 	if (appctx->applet->release)
 		appctx->applet->release(appctx);
 
-	appctx->endp->flags |= CS_EP_SHRR | CS_EP_SHWN;
+	se_fl_set(appctx->sedesc, SE_FL_SHRR | SE_FL_SHWN);
 }
 
 /* Callback used to wake up an applet when a buffer is available. The applet
  * <appctx> is woken up if an input buffer was requested for the associated
- * conn-stream. In this case the buffer is immediately allocated and the
+ * stream connector. In this case the buffer is immediately allocated and the
  * function returns 1. Otherwise it returns 0. Note that this automatically
  * covers multiple wake-up attempts by ensuring that the same buffer will not
  * be accounted for multiple times.
@@ -164,21 +164,21 @@ void appctx_shut(struct appctx *appctx)
 int appctx_buf_available(void *arg)
 {
 	struct appctx *appctx = arg;
-	struct conn_stream *cs = appctx_cs(appctx);
+	struct stconn *sc = appctx_sc(appctx);
 
 	/* allocation requested ? */
-	if (!(appctx->endp->flags & CS_EP_RXBLK_BUFF))
+	if (!(sc->flags & SC_FL_NEED_BUFF))
 		return 0;
 
-	cs_rx_buff_rdy(cs);
+	sc_have_buff(sc);
 
 	/* was already allocated another way ? if so, don't take this one */
-	if (c_size(cs_ic(cs)) || cs_ic(cs)->pipe)
+	if (c_size(sc_ic(sc)) || sc_ic(sc)->pipe)
 		return 0;
 
 	/* allocation possible now ? */
-	if (!b_alloc(&cs_ic(cs)->buf)) {
-		cs_rx_buff_blk(cs);
+	if (!b_alloc(&sc_ic(sc)->buf)) {
+		sc_need_buff(sc);
 		return 0;
 	}
 
@@ -190,7 +190,7 @@ int appctx_buf_available(void *arg)
 struct task *task_run_applet(struct task *t, void *context, unsigned int state)
 {
 	struct appctx *app = context;
-	struct conn_stream *cs;
+	struct stconn *sc;
 	unsigned int rate;
 	size_t count;
 
@@ -199,7 +199,7 @@ struct task *task_run_applet(struct task *t, void *context, unsigned int state)
 		return NULL;
 	}
 
-	if (app->endp->flags & CS_EP_ORPHAN) {
+	if (se_fl_test(app->sedesc, SE_FL_ORPHAN)) {
 		/* Finalize init of orphan appctx. .init callback function must
 		 * be defined and it must finalize appctx startup.
 		 */
@@ -209,17 +209,17 @@ struct task *task_run_applet(struct task *t, void *context, unsigned int state)
 			appctx_free_on_early_error(app);
 			return NULL;
 		}
-		BUG_ON(!app->sess || !appctx_cs(app) || !appctx_strm(app));
+		BUG_ON(!app->sess || !appctx_sc(app) || !appctx_strm(app));
 	}
 
-	cs = appctx_cs(app);
+	sc = appctx_sc(app);
 
 	/* We always pretend the applet can't get and doesn't want to
 	 * put, it's up to it to change this if needed. This ensures
 	 * that one applet which ignores any event will not spin.
 	 */
-	cs_cant_get(cs);
-	cs_rx_endp_done(cs);
+	applet_need_more_data(app);
+	applet_have_no_more_data(app);
 
 	/* Now we'll try to allocate the input buffer. We wake up the applet in
 	 * all cases. So this is the applet's responsibility to check if this
@@ -227,32 +227,32 @@ struct task *task_run_applet(struct task *t, void *context, unsigned int state)
 	 * some other processing if needed. The applet doesn't have anything to
 	 * do if it needs the buffer, it will be called again upon readiness.
 	 */
-	if (!cs_alloc_ibuf(cs, &app->buffer_wait))
-		cs_rx_endp_more(cs);
+	if (!sc_alloc_ibuf(sc, &app->buffer_wait))
+		applet_have_more_data(app);
 
-	count = co_data(cs_oc(cs));
+	count = co_data(sc_oc(sc));
 	app->applet->fct(app);
 
 	/* now check if the applet has released some room and forgot to
 	 * notify the other side about it.
 	 */
-	if (count != co_data(cs_oc(cs))) {
-		cs_oc(cs)->flags |= CF_WRITE_PARTIAL | CF_WROTE_DATA;
-		cs_rx_room_rdy(cs_opposite(cs));
+	if (count != co_data(sc_oc(sc))) {
+		sc_oc(sc)->flags |= CF_WRITE_PARTIAL | CF_WROTE_DATA;
+		sc_have_room(sc_opposite(sc));
 	}
 
 	/* measure the call rate and check for anomalies when too high */
 	rate = update_freq_ctr(&app->call_rate, 1);
 	if (rate >= 100000 && app->call_rate.prev_ctr && // looped more than 100k times over last second
-	    ((b_size(cs_ib(cs)) && app->endp->flags & CS_EP_RXBLK_BUFF) || // asks for a buffer which is present
-	     (b_size(cs_ib(cs)) && !b_data(cs_ib(cs)) && app->endp->flags & CS_EP_RXBLK_ROOM) || // asks for room in an empty buffer
-	     (b_data(cs_ob(cs)) && cs_tx_endp_ready(cs) && !cs_tx_blocked(cs)) || // asks for data already present
-	     (!b_data(cs_ib(cs)) && b_data(cs_ob(cs)) && // didn't return anything ...
-	      (cs_oc(cs)->flags & (CF_WRITE_PARTIAL|CF_SHUTW_NOW)) == CF_SHUTW_NOW))) { // ... and left data pending after a shut
+	    ((b_size(sc_ib(sc)) && sc->flags & SC_FL_NEED_ROOM) || // asks for a buffer which is present
+	     (b_size(sc_ib(sc)) && !b_data(sc_ib(sc)) && sc->flags & SC_FL_NEED_ROOM) || // asks for room in an empty buffer
+	     (b_data(sc_ob(sc)) && sc_is_send_allowed(sc)) || // asks for data already present
+	     (!b_data(sc_ib(sc)) && b_data(sc_ob(sc)) && // didn't return anything ...
+	      (sc_oc(sc)->flags & (CF_WRITE_PARTIAL|CF_SHUTW_NOW)) == CF_SHUTW_NOW))) { // ... and left data pending after a shut
 		stream_dump_and_crash(&app->obj_type, read_freq_ctr(&app->call_rate));
 	}
 
-	cs->data_cb->wake(cs);
-	channel_release_buffer(cs_ic(cs), &app->buffer_wait);
+	sc->app_ops->wake(sc);
+	channel_release_buffer(sc_ic(sc), &app->buffer_wait);
 	return t;
 }

@@ -23,8 +23,6 @@
 #include <haproxy/capture-t.h>
 #include <haproxy/cfgparse.h>
 #include <haproxy/chunk.h>
-#include <haproxy/conn_stream.h>
-#include <haproxy/cs_utils.h>
 #include <haproxy/global.h>
 #include <haproxy/http.h>
 #include <haproxy/http_ana.h>
@@ -35,6 +33,8 @@
 #include <haproxy/pool.h>
 #include <haproxy/regex.h>
 #include <haproxy/sample.h>
+#include <haproxy/sc_strm.h>
+#include <haproxy/stconn.h>
 #include <haproxy/tools.h>
 #include <haproxy/uri_auth-t.h>
 #include <haproxy/uri_normalizer.h>
@@ -719,7 +719,7 @@ static enum act_parse_ret parse_http_set_status(const char **args, int *orig_arg
 static enum act_return http_action_reject(struct act_rule *rule, struct proxy *px,
                                           struct session *sess, struct stream *s, int flags)
 {
-	cs_must_kill_conn(chn_prod(&s->req));
+	sc_must_kill_conn(chn_prod(&s->req));
 	channel_abort(&s->req);
 	channel_abort(&s->res);
 	s->req.analysers &= AN_REQ_FLT_END;

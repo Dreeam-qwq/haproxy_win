@@ -3,7 +3,7 @@
                           Configuration Manual
                          ----------------------
                               version 2.6
-                              2022/05/20
+                              2022/05/27
 
 
 This document covers the configuration language as implemented in the version
@@ -13872,6 +13872,13 @@ ca-file <cafile>
   CAs, in this case HAProxy will try to load every ".pem", ".crt", ".cer", and
   .crl" available in the directory, files starting with a dot are ignored.
 
+  Warning: The "@system-ca" parameter could be used in place of the cafile
+  in order to use the trusted CAs of your system, like its done with the server
+  directive. But you mustn't use it unless you know what you are doing.
+  Configuring it this way basically mean that the bind will accept any client
+  certificate generated from one of the CA present on your system, which is
+  extremely unsecure.
+
 ca-ignore-err [all|<errorID>,...]
   This setting is only available when support for OpenSSL was built in.
   Sets a comma separated list of errorIDs to ignore during verify at depth > 0.
@@ -18119,7 +18126,7 @@ ipv4(<ipv4>) : ipv4
 ipv6(<ipv6>) : ipv6
   Returns an ipv6.
 
-last_rule_file: string
+last_rule_file : string
   This returns the name of the configuration file containing the last final
   rule that was matched during stream analysis. A final rule is one that
   terminates the evaluation of the rule set (like an "accept", "deny" or
@@ -18133,7 +18140,7 @@ last_rule_file: string
   logs where was the rule that gave the final verdict, in order to help
   figure why a request was denied for example. See also "last_rule_line".
 
-last_rule_line: integer
+last_rule_line : integer
   This returns the line number in the configuration file where is located the
   last final rule that was matched during stream analysis. A final rule is one
   that terminates the evaluation of the rule set (like an "accept", "deny" or

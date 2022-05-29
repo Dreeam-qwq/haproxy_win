@@ -27,8 +27,6 @@
 #include <haproxy/channel.h>
 #include <haproxy/check.h>
 #include <haproxy/cli.h>
-#include <haproxy/conn_stream.h>
-#include <haproxy/cs_utils.h>
 #include <haproxy/dns.h>
 #include <haproxy/errors.h>
 #include <haproxy/fd.h>
@@ -40,8 +38,10 @@
 #include <haproxy/resolvers.h>
 #include <haproxy/ring.h>
 #include <haproxy/sample.h>
+#include <haproxy/sc_strm.h>
 #include <haproxy/server.h>
 #include <haproxy/stats.h>
+#include <haproxy/stconn.h>
 #include <haproxy/task.h>
 #include <haproxy/tcp_rules.h>
 #include <haproxy/ticks.h>
@@ -2587,13 +2587,13 @@ static int resolvers_finalize_config(void)
 
 }
 
-static int stats_dump_resolv_to_buffer(struct conn_stream *cs,
+static int stats_dump_resolv_to_buffer(struct stconn *sc,
                                     struct dns_nameserver *ns,
                                     struct field *stats, size_t stats_count,
                                     struct list *stat_modules)
 {
-	struct appctx *appctx = __cs_appctx(cs);
-	struct channel *rep = cs_ic(cs);
+	struct appctx *appctx = __sc_appctx(sc);
+	struct channel *rep = sc_ic(sc);
 	struct stats_module *mod;
 	size_t idx = 0;
 
@@ -2615,20 +2615,20 @@ static int stats_dump_resolv_to_buffer(struct conn_stream *cs,
 	return 1;
 
   full:
-	cs_rx_room_rdy(cs);
+	sc_have_room(sc);
 	return 0;
 }
 
 /* Uses <appctx.ctx.stats.obj1> as a pointer to the current resolver and <obj2>
  * as a pointer to the current nameserver.
  */
-int stats_dump_resolvers(struct conn_stream *cs,
+int stats_dump_resolvers(struct stconn *sc,
                          struct field *stats, size_t stats_count,
                          struct list *stat_modules)
 {
-	struct appctx *appctx = __cs_appctx(cs);
+	struct appctx *appctx = __sc_appctx(sc);
 	struct show_stat_ctx *ctx = appctx->svcctx;
-	struct channel *rep = cs_ic(cs);
+	struct channel *rep = sc_ic(sc);
 	struct resolvers *resolver = ctx->obj1;
 	struct dns_nameserver *ns = ctx->obj2;
 
@@ -2649,7 +2649,7 @@ int stats_dump_resolvers(struct conn_stream *cs,
 			if (buffer_almost_full(&rep->buf))
 				goto full;
 
-			if (!stats_dump_resolv_to_buffer(cs, ns,
+			if (!stats_dump_resolv_to_buffer(sc, ns,
 			                                 stats, stats_count,
 			                                 stat_modules)) {
 				return 0;
@@ -2662,7 +2662,7 @@ int stats_dump_resolvers(struct conn_stream *cs,
 	return 1;
 
   full:
-	cs_rx_room_blk(cs);
+	sc_need_room(sc);
 	return 0;
 }
 
@@ -2757,14 +2757,13 @@ static int cli_parse_stat_resolvers(char **args, char *payload, struct appctx *a
 static int cli_io_handler_dump_resolvers_to_buffer(struct appctx *appctx)
 {
 	struct show_resolvers_ctx *ctx = appctx->svcctx;
-	struct conn_stream *cs = appctx_cs(appctx);
 	struct resolvers    *resolvers = ctx->resolvers;
 	struct dns_nameserver   *ns;
 
 	chunk_reset(&trash);
 
 	if (LIST_ISEMPTY(&sec_resolvers)) {
-		if (ci_putstr(cs_ic(cs), "No resolvers found\n") == -1)
+		if (applet_putstr(appctx, "No resolvers found\n") == -1)
 			goto full;
 	}
 	else {
@@ -2780,7 +2779,7 @@ static int cli_io_handler_dump_resolvers_to_buffer(struct appctx *appctx)
 
 			if (!ns) {
 				chunk_printf(&trash, "Resolvers section %s\n", resolvers->id);
-				if (ci_putchk(cs_ic(cs), &trash) == -1)
+				if (applet_putchk(appctx, &trash) == -1)
 					goto full;
 
 				ns = LIST_ELEM(resolvers->nameservers.n, typeof(ns), list);
@@ -2805,7 +2804,7 @@ static int cli_io_handler_dump_resolvers_to_buffer(struct appctx *appctx)
 				chunk_appendf(&trash, "  too_big:     %lld\n", ns->counters->app.resolver.too_big);
 				chunk_appendf(&trash, "  truncated:   %lld\n", ns->counters->app.resolver.truncated);
 				chunk_appendf(&trash, "  outdated:    %lld\n",  ns->counters->app.resolver.outdated);
-				if (ci_putchk(cs_ic(cs), &trash) == -1)
+				if (applet_putchk(appctx, &trash) == -1)
 					goto full;
 				ctx->ns = ns;
 			}
@@ -2822,7 +2821,6 @@ static int cli_io_handler_dump_resolvers_to_buffer(struct appctx *appctx)
 	return 1;
  full:
 	/* the output buffer is full, retry later */
-	cs_rx_room_blk(cs);
 	return 0;
 }
 

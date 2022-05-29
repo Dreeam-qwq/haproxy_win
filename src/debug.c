@@ -30,8 +30,6 @@
 #include <haproxy/applet.h>
 #include <haproxy/buf.h>
 #include <haproxy/cli.h>
-#include <haproxy/conn_stream.h>
-#include <haproxy/cs_utils.h>
 #include <haproxy/clock.h>
 #include <haproxy/debug.h>
 #include <haproxy/fd.h>
@@ -40,6 +38,8 @@
 #include <haproxy/http_ana.h>
 #include <haproxy/log.h>
 #include <haproxy/net_helper.h>
+#include <haproxy/sc_strm.h>
+#include <haproxy/stconn.h>
 #include <haproxy/task.h>
 #include <haproxy/thread.h>
 #include <haproxy/time.h>
@@ -251,9 +251,9 @@ void ha_task_dump(struct buffer *buf, const struct task *task, const char *pfx)
 	if (task->process == process_stream && task->context)
 		s = (struct stream *)task->context;
 	else if (task->process == task_run_applet && task->context)
-		s = cs_strm(appctx_cs((struct appctx *)task->context));
-	else if (task->process == cs_conn_io_cb && task->context)
-		s = cs_strm(((struct conn_stream *)task->context));
+		s = sc_strm(appctx_sc((struct appctx *)task->context));
+	else if (task->process == sc_conn_io_cb && task->context)
+		s = sc_strm(((struct stconn *)task->context));
 
 	if (s)
 		stream_dump(buf, s, pfx, '\n');
@@ -290,10 +290,10 @@ void ha_task_dump(struct buffer *buf, const struct task *task, const char *pfx)
  */
 static int cli_io_handler_show_threads(struct appctx *appctx)
 {
-	struct conn_stream *cs = appctx_cs(appctx);
+	struct stconn *sc = appctx_sc(appctx);
 	int thr;
 
-	if (unlikely(cs_ic(cs)->flags & (CF_WRITE_ERROR|CF_SHUTW)))
+	if (unlikely(sc_ic(sc)->flags & (CF_WRITE_ERROR|CF_SHUTW)))
 		return 1;
 
 	if (appctx->st0)
@@ -304,9 +304,8 @@ static int cli_io_handler_show_threads(struct appctx *appctx)
 	chunk_reset(&trash);
 	ha_thread_dump_all_to_trash();
 
-	if (ci_putchk(cs_ic(cs), &trash) == -1) {
+	if (applet_putchk(appctx, &trash) == -1) {
 		/* failed, try again */
-		cs_rx_room_blk(cs);
 		appctx->st1 = thr;
 		return 0;
 	}
@@ -694,7 +693,7 @@ static int debug_parse_cli_stream(char **args, char *payload, struct appctx *app
 	if (!*args[3]) {
 		return cli_err(appctx,
 			       "Usage: debug dev stream { <obj> <op> <value> | wake }*\n"
-			       "     <obj>   = {strm | strm.f | strm.x | csf.s | csb.s |\n"
+			       "     <obj>   = {strm | strm.f | strm.x | scf.s | scb.s |\n"
 			       "                txn.f | req.f | req.r | req.w | res.f | res.r | res.w}\n"
 			       "     <op>    = {'' (show) | '=' (assign) | '^' (xor) | '+' (or) | '-' (andnot)}\n"
 			       "     <value> = 'now' | 64-bit dec/hex integer (0x prefix supported)\n"
@@ -729,10 +728,10 @@ static int debug_parse_cli_stream(char **args, char *payload, struct appctx *app
 			ptr = (!s || !may_access(s)) ? NULL : &s->req.wex; size = sizeof(s->req.wex);
 		} else if (isteq(name, ist("res.w"))) {
 			ptr = (!s || !may_access(s)) ? NULL : &s->res.wex; size = sizeof(s->res.wex);
-		} else if (isteq(name, ist("csf.s"))) {
-			ptr = (!s || !may_access(s)) ? NULL : &s->csf->state; size = sizeof(s->csf->state);
-		} else if (isteq(name, ist("csb.s"))) {
-			ptr = (!s || !may_access(s)) ? NULL : &s->csf->state; size = sizeof(s->csb->state);
+		} else if (isteq(name, ist("scf.s"))) {
+			ptr = (!s || !may_access(s)) ? NULL : &s->scf->state; size = sizeof(s->scf->state);
+		} else if (isteq(name, ist("scb.s"))) {
+			ptr = (!s || !may_access(s)) ? NULL : &s->scf->state; size = sizeof(s->scb->state);
 		} else if (isteq(name, ist("wake"))) {
 			if (s && may_access(s) && may_access((void *)s + sizeof(*s) - 1))
 				task_wakeup(s->task, TASK_WOKEN_TIMER|TASK_WOKEN_IO|TASK_WOKEN_MSG);
@@ -1044,7 +1043,7 @@ static int debug_parse_cli_fd(char **args, char *payload, struct appctx *appctx,
 static int debug_iohandler_fd(struct appctx *appctx)
 {
 	struct dev_fd_ctx *ctx = appctx->svcctx;
-	struct conn_stream *cs = appctx_cs(appctx);
+	struct stconn *sc = appctx_sc(appctx);
 	struct sockaddr_storage sa;
 	struct stat statbuf;
 	socklen_t salen, vlen;
@@ -1053,7 +1052,7 @@ static int debug_iohandler_fd(struct appctx *appctx)
 	int ret = 1;
 	int i, fd;
 
-	if (unlikely(cs_ic(cs)->flags & (CF_WRITE_ERROR|CF_SHUTW)))
+	if (unlikely(sc_ic(sc)->flags & (CF_WRITE_ERROR|CF_SHUTW)))
 		goto end;
 
 	chunk_reset(&trash);
@@ -1177,8 +1176,7 @@ static int debug_iohandler_fd(struct appctx *appctx)
 
 		chunk_appendf(&trash, "\n");
 
-		if (ci_putchk(cs_ic(cs), &trash) == -1) {
-			cs_rx_room_blk(cs);
+		if (applet_putchk(appctx, &trash) == -1) {
 			ctx->start_fd = fd;
 			ret = 0;
 			break;
@@ -1239,11 +1237,11 @@ static int debug_parse_cli_memstats(char **args, char *payload, struct appctx *a
 static int debug_iohandler_memstats(struct appctx *appctx)
 {
 	struct dev_mem_ctx *ctx = appctx->svcctx;
-	struct conn_stream *cs = appctx_cs(appctx);
+	struct stconn *sc = appctx_sc(appctx);
 	struct mem_stats *ptr = ctx->start;
 	int ret = 1;
 
-	if (unlikely(cs_ic(cs)->flags & (CF_WRITE_ERROR|CF_SHUTW)))
+	if (unlikely(sc_ic(sc)->flags & (CF_WRITE_ERROR|CF_SHUTW)))
 		goto end;
 
 	chunk_reset(&trash);
@@ -1288,8 +1286,7 @@ static int debug_iohandler_memstats(struct appctx *appctx)
 			     (unsigned long)ptr->size, (unsigned long)ptr->calls,
 			     (unsigned long)(ptr->calls ? (ptr->size / ptr->calls) : 0));
 
-		if (ci_putchk(cs_ic(cs), &trash) == -1) {
-			cs_rx_room_blk(cs);
+		if (applet_putchk(appctx, &trash) == -1) {
 			ctx->start = ptr;
 			ret = 0;
 			break;

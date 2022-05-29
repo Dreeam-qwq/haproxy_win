@@ -91,26 +91,26 @@ static inline int qcc_install_app_ops(struct qcc *qcc,
 	return 0;
 }
 
-static inline struct conn_stream *qc_attach_cs(struct qcs *qcs, struct buffer *buf)
+static inline struct stconn *qc_attach_sc(struct qcs *qcs, struct buffer *buf)
 {
 	struct qcc *qcc = qcs->qcc;
 	struct session *sess = qcc->conn->owner;
 
-	qcs->endp = cs_endpoint_new();
-	if (!qcs->endp)
+	qcs->sd = sedesc_new();
+	if (!qcs->sd)
 		return NULL;
 
-	qcs->endp->target = qcs;
-	qcs->endp->ctx = qcc->conn;
-	qcs->endp->flags |= (CS_EP_T_MUX|CS_EP_ORPHAN|CS_EP_NOT_FIRST);
+	qcs->sd->se   = qcs;
+	qcs->sd->conn = qcc->conn;
+	se_fl_set(qcs->sd, SE_FL_T_MUX | SE_FL_ORPHAN | SE_FL_NOT_FIRST);
 
 	/* TODO duplicated from mux_h2 */
 	sess->t_idle = tv_ms_elapsed(&sess->tv_accept, &now) - sess->t_handshake;
 
-	if (!cs_new_from_endp(qcs->endp, sess, buf))
+	if (!sc_new_from_endp(qcs->sd, sess, buf))
 		return NULL;
 
-	++qcc->nb_cs;
+	++qcc->nb_sc;
 
 	/* TODO duplicated from mux_h2 */
 	sess->accept_date = date;
@@ -118,7 +118,7 @@ static inline struct conn_stream *qc_attach_cs(struct qcs *qcs, struct buffer *b
 	sess->t_handshake = 0;
 	sess->t_idle = 0;
 
-	return qcs->endp->cs;
+	return qcs->sd->sc;
 }
 
 #endif /* USE_QUIC */

@@ -17,8 +17,6 @@
 #include <haproxy/api.h>
 #include <haproxy/cfgparse.h>
 #include <haproxy/connection.h>
-#include <haproxy/conn_stream.h>
-#include <haproxy/cs_utils.h>
 #include <haproxy/fd.h>
 #include <haproxy/frontend.h>
 #include <haproxy/hash.h>
@@ -28,8 +26,10 @@
 #include <haproxy/net_helper.h>
 #include <haproxy/proto_tcp.h>
 #include <haproxy/sample.h>
+#include <haproxy/sc_strm.h>
 #include <haproxy/session.h>
 #include <haproxy/ssl_sock.h>
+#include <haproxy/stconn.h>
 #include <haproxy/tools.h>
 #include <haproxy/xxhash.h>
 
@@ -61,7 +61,7 @@ int conn_create_mux(struct connection *conn)
 {
 	if (conn_is_back(conn)) {
 		struct server *srv;
-		struct conn_stream *cs = conn->ctx;
+		struct stconn *sc = conn->ctx;
 		struct session *sess = conn->owner;
 
 		if (conn->flags & CO_FL_ERROR)
@@ -91,7 +91,7 @@ int conn_create_mux(struct connection *conn)
 		return 0;
 fail:
 		/* let the upper layer know the connection failed */
-		cs->data_cb->wake(cs);
+		sc->app_ops->wake(sc);
 		return -1;
 	} else
 		return conn_complete_session(conn);
@@ -1157,7 +1157,7 @@ int conn_recv_proxy(struct connection *conn, int flag)
  * flags (the bit is provided in <flag> by the caller). It is designed to be
  * called by the connection handler and relies on it to commit polling changes.
  * Note that it can emit a PROXY line by relying on the other end's address
- * when the connection is attached to a conn-stream, or by resolving the
+ * when the connection is attached to a stream connector, or by resolving the
  * local address otherwise (also called a LOCAL line).
  */
 int conn_send_proxy(struct connection *conn, unsigned int flag)
@@ -1170,13 +1170,13 @@ int conn_send_proxy(struct connection *conn, unsigned int flag)
 	 * we've sent the whole proxy line. Otherwise we use connect().
 	 */
 	if (conn->send_proxy_ofs) {
-		struct conn_stream *cs;
+		struct stconn *sc;
 		int ret;
 
 		/* If there is no mux attached to the connection, it means the
-		 * connection context is a conn-stream.
+		 * connection context is a stream connector.
 		 */
-		cs = (conn->mux ? cs_conn_get_first(conn) : conn->ctx);
+		sc = conn->mux ? conn_get_first_sc(conn) : conn->ctx;
 
 		/* The target server expects a PROXY line to be sent first.
 		 * If the send_proxy_ofs is negative, it corresponds to the
@@ -1184,15 +1184,15 @@ int conn_send_proxy(struct connection *conn, unsigned int flag)
 		 * (which is recomputed every time since it's constant). If
 		 * it is positive, it means we have to send from the start.
 		 * We can only send a "normal" PROXY line when the connection
-		 * is attached to a conn-stream. Otherwise we can only
+		 * is attached to a stream connector. Otherwise we can only
 		 * send a LOCAL line (eg: for use with health checks).
 		 */
 
-		if (cs && cs_strm(cs)) {
+		if (sc && sc_strm(sc)) {
 			ret = make_proxy_line(trash.area, trash.size,
 					      objt_server(conn->target),
-					      cs_conn(cs_opposite(cs)),
-					      __cs_strm(cs));
+					      sc_conn(sc_opposite(sc)),
+					      __sc_strm(sc));
 		}
 		else {
 			/* The target server expects a LOCAL line to be sent first. Retrieving
@@ -1826,8 +1826,8 @@ static int make_proxy_line_v2(char *buf, int buf_len, struct server *srv, struct
 	memcpy(hdr->sig, pp2_signature, PP2_SIGNATURE_LEN);
 
 	if (strm) {
-		src = cs_src(strm->csf);
-		dst = cs_dst(strm->csf);
+		src = sc_src(strm->scf);
+		dst = sc_dst(strm->scf);
 	}
 	else if (remote && conn_get_src(remote) && conn_get_dst(remote)) {
 		src = conn_src(remote);
@@ -2025,8 +2025,8 @@ int make_proxy_line(char *buf, int buf_len, struct server *srv, struct connectio
 		const struct sockaddr_storage *dst = NULL;
 
 		if (strm) {
-			src = cs_src(strm->csf);
-			dst = cs_dst(strm->csf);
+			src = sc_src(strm->scf);
+			dst = sc_dst(strm->scf);
 		}
 		else if (remote && conn_get_src(remote) && conn_get_dst(remote)) {
 			src = conn_src(remote);
@@ -2103,10 +2103,10 @@ smp_fetch_fc_http_major(const struct arg *args, struct sample *smp, const char *
 	struct connection *conn = NULL;
 
 	if (obj_type(smp->sess->origin) == OBJ_TYPE_CHECK)
-                conn = (kw[0] == 'b') ? cs_conn(__objt_check(smp->sess->origin)->cs) : NULL;
+                conn = (kw[0] == 'b') ? sc_conn(__objt_check(smp->sess->origin)->sc) : NULL;
         else
                 conn = (kw[0] != 'b') ? objt_conn(smp->sess->origin) :
-			smp->strm ? cs_conn(smp->strm->csb) : NULL;
+			smp->strm ? sc_conn(smp->strm->scb) : NULL;
 
 	/* No connection or a connection with a RAW muxx */
 	if (!conn || (conn->mux && !(conn->mux->flags & MX_FL_HTX)))
@@ -2200,10 +2200,10 @@ int smp_fetch_fc_err(const struct arg *args, struct sample *smp, const char *kw,
 	struct connection *conn;
 
 	if (obj_type(smp->sess->origin) == OBJ_TYPE_CHECK)
-                conn = (kw[0] == 'b') ? cs_conn(__objt_check(smp->sess->origin)->cs) : NULL;
+                conn = (kw[0] == 'b') ? sc_conn(__objt_check(smp->sess->origin)->sc) : NULL;
         else
                 conn = (kw[0] != 'b') ? objt_conn(smp->sess->origin) :
-			smp->strm ? cs_conn(smp->strm->csb) : NULL;
+			smp->strm ? sc_conn(smp->strm->scb) : NULL;
 
 	if (!conn)
 		return 0;
@@ -2227,10 +2227,10 @@ int smp_fetch_fc_err_str(const struct arg *args, struct sample *smp, const char 
 	const char *err_code_str;
 
 	if (obj_type(smp->sess->origin) == OBJ_TYPE_CHECK)
-                conn = (kw[0] == 'b') ? cs_conn(__objt_check(smp->sess->origin)->cs) : NULL;
+                conn = (kw[0] == 'b') ? sc_conn(__objt_check(smp->sess->origin)->sc) : NULL;
         else
                 conn = (kw[0] != 'b') ? objt_conn(smp->sess->origin) :
-			smp->strm ? cs_conn(smp->strm->csb) : NULL;
+			smp->strm ? sc_conn(smp->strm->scb) : NULL;
 
 	if (!conn)
 		return 0;

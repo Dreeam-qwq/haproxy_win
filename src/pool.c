@@ -19,13 +19,13 @@
 #include <haproxy/cfgparse.h>
 #include <haproxy/channel.h>
 #include <haproxy/cli.h>
-#include <haproxy/conn_stream.h>
-#include <haproxy/cs_utils.h>
 #include <haproxy/errors.h>
 #include <haproxy/global.h>
 #include <haproxy/list.h>
 #include <haproxy/pool.h>
+#include <haproxy/sc_strm.h>
 #include <haproxy/stats-t.h>
+#include <haproxy/stconn.h>
 #include <haproxy/thread.h>
 #include <haproxy/tools.h>
 
@@ -1005,19 +1005,15 @@ int pool_parse_debugging(const char *str, char **err)
 	return 1;
 }
 
-/* This function dumps memory usage information onto the conn-stream's
+/* This function dumps memory usage information onto the stream connector's
  * read buffer. It returns 0 as long as it does not complete, non-zero upon
  * completion. No state is used.
  */
 static int cli_io_handler_dump_pools(struct appctx *appctx)
 {
-	struct conn_stream *cs = appctx_cs(appctx);
-
 	dump_pools_to_trash();
-	if (ci_putchk(cs_ic(cs), &trash) == -1) {
-		cs_rx_room_blk(cs);
+	if (applet_putchk(appctx, &trash) == -1)
 		return 0;
-	}
 	return 1;
 }
 

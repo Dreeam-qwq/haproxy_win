@@ -25,8 +25,6 @@
 #include <haproxy/check.h>
 #include <haproxy/cli.h>
 #include <haproxy/connection.h>
-#include <haproxy/conn_stream.h>
-#include <haproxy/cs_utils.h>
 #include <haproxy/dict-t.h>
 #include <haproxy/errors.h>
 #include <haproxy/global.h>
@@ -39,8 +37,10 @@
 #include <haproxy/queue.h>
 #include <haproxy/resolvers.h>
 #include <haproxy/sample.h>
+#include <haproxy/sc_strm.h>
 #include <haproxy/server.h>
 #include <haproxy/stats.h>
+#include <haproxy/stconn.h>
 #include <haproxy/stream.h>
 #include <haproxy/task.h>
 #include <haproxy/tcpcheck.h>
@@ -4315,7 +4315,6 @@ static int cli_parse_set_server(char **args, char *payload, struct appctx *appct
 
 static int cli_parse_get_weight(char **args, char *payload, struct appctx *appctx, void *private)
 {
-	struct conn_stream *cs = appctx_cs(appctx);
 	struct proxy *px;
 	struct server *sv;
 	char *line;
@@ -4337,10 +4336,8 @@ static int cli_parse_get_weight(char **args, char *payload, struct appctx *appct
 	/* return server's effective weight at the moment */
 	snprintf(trash.area, trash.size, "%d (initial %d)\n", sv->uweight,
 		 sv->iweight);
-	if (ci_putstr(cs_ic(cs), trash.area) == -1) {
-		cs_rx_room_blk(cs);
+	if (applet_putstr(appctx, trash.area) == -1)
 		return 0;
-	}
 	return 1;
 }
 

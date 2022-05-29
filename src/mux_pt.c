@@ -13,14 +13,14 @@
 #include <haproxy/api.h>
 #include <haproxy/buf.h>
 #include <haproxy/connection.h>
-#include <haproxy/conn_stream.h>
 #include <haproxy/pipe-t.h>
+#include <haproxy/stconn.h>
 #include <haproxy/stream.h>
 #include <haproxy/task.h>
 #include <haproxy/trace.h>
 
 struct mux_pt_ctx {
-	struct cs_endpoint *endp;
+	struct sedesc *sd;
 	struct connection *conn;
 	struct wait_event wait_event;
 };
@@ -91,6 +91,12 @@ static struct trace_source trace_pt __read_mostly = {
 #define TRACE_SOURCE &trace_pt
 INITCALL1(STG_REGISTER, trace_register_source, TRACE_SOURCE);
 
+/* returns the stconn associated to the stream */
+static forceinline struct stconn *pt_sc(const struct mux_pt_ctx *pt)
+{
+	return pt->sd->sc;
+}
+
 static inline void pt_trace_buf(const struct buffer *buf, size_t ofs, size_t len)
 {
 	size_t block1, block2;
@@ -124,7 +130,7 @@ static inline void pt_trace_buf(const struct buffer *buf, size_t ofs, size_t len
 
 /* the PT traces always expect that arg1, if non-null, is of type connection
  * (from which we can derive the pt context), that arg2, if non-null, is a
- * conn-stream, and that arg3, if non-null, is a buffer.
+ * stream connector, and that arg3, if non-null, is a buffer.
  */
 static void pt_trace(enum trace_level level, uint64_t mask, const struct trace_source *src,
                      const struct ist where, const struct ist func,
@@ -132,7 +138,7 @@ static void pt_trace(enum trace_level level, uint64_t mask, const struct trace_s
 {
 	const struct connection *conn = a1;
 	const struct mux_pt_ctx *ctx = conn ? conn->ctx : NULL;
-	const struct conn_stream *cs = a2;
+	const struct stconn *sc = a2;
 	const struct buffer *buf = a3;
 	const size_t *val = a4;
 
@@ -145,18 +151,18 @@ static void pt_trace(enum trace_level level, uint64_t mask, const struct trace_s
 	if (src->verbosity == PT_VERB_CLEAN)
 		return;
 
-	if (!cs)
-		cs = ctx->endp->cs;
+	if (!sc)
+		sc = pt_sc(ctx);
 
 	/* Display the value to the 4th argument (level > STATE) */
 	if (src->level > TRACE_LEVEL_STATE && val)
 		chunk_appendf(&trace_buf, " - VAL=%lu", (long)*val);
 
-	/* Display conn and cs info, if defined (pointer + flags) */
+	/* Display conn and sc info, if defined (pointer + flags) */
 	chunk_appendf(&trace_buf, " - conn=%p(0x%08x)", conn, conn->flags);
-	chunk_appendf(&trace_buf, " endp=%p(0x%08x)", ctx->endp, ctx->endp->flags);
-	if (cs)
-		chunk_appendf(&trace_buf, " cs=%p(0x%08x)", cs, cs->flags);
+	chunk_appendf(&trace_buf, " sd=%p(0x%08x)", ctx->sd, se_fl_get(ctx->sd));
+	if (sc)
+		chunk_appendf(&trace_buf, " sc=%p(0x%08x)", sc, sc->flags);
 
 	if (src->verbosity == PT_VERB_MINIMAL)
 		return;
@@ -208,8 +214,8 @@ static void mux_pt_destroy(struct mux_pt_ctx *ctx)
 	if (conn && ctx->wait_event.events != 0)
 		conn->xprt->unsubscribe(conn, conn->xprt_ctx, ctx->wait_event.events,
 					&ctx->wait_event);
-	BUG_ON(ctx->endp && !(ctx->endp->flags & CS_EP_ORPHAN));
-	cs_endpoint_free(ctx->endp);
+	BUG_ON(ctx->sd && !se_fl_test(ctx->sd, SE_FL_ORPHAN));
+	sedesc_free(ctx->sd);
 	pool_free(pool_head_pt_ctx, ctx);
 
 	if (conn) {
@@ -233,7 +239,7 @@ struct task *mux_pt_io_cb(struct task *t, void *tctx, unsigned int status)
 	struct mux_pt_ctx *ctx = tctx;
 
 	TRACE_ENTER(PT_EV_CONN_WAKE, ctx->conn);
-	if (!(ctx->endp->flags & CS_EP_ORPHAN)) {
+	if (!se_fl_test(ctx->sd, SE_FL_ORPHAN)) {
 		/* There's a small race condition.
 		 * mux_pt_io_cb() is only supposed to be called if we have no
 		 * stream attached. However, maybe the tasklet got woken up,
@@ -246,9 +252,9 @@ struct task *mux_pt_io_cb(struct task *t, void *tctx, unsigned int status)
 			ctx->conn->subs->events = 0;
 			tasklet_wakeup(ctx->conn->subs->tasklet);
 			ctx->conn->subs = NULL;
-		} else if (ctx->endp->cs->data_cb->wake)
-			ctx->endp->cs->data_cb->wake(ctx->endp->cs);
-		TRACE_DEVEL("leaving waking up CS", PT_EV_CONN_WAKE, ctx->conn);
+		} else if (pt_sc(ctx)->app_ops->wake)
+			pt_sc(ctx)->app_ops->wake(pt_sc(ctx));
+		TRACE_DEVEL("leaving waking up SC", PT_EV_CONN_WAKE, ctx->conn);
 		return t;
 	}
 	conn_ctrl_drain(ctx->conn);
@@ -266,15 +272,15 @@ struct task *mux_pt_io_cb(struct task *t, void *tctx, unsigned int status)
 	return t;
 }
 
-/* Initialize the mux once it's attached. It is expected that conn->ctx
- * points to the existing conn_stream (for outgoing connections) or NULL (for
+/* Initialize the mux once it's attached. It is expected that conn->ctx points
+ * to the existing stream connector (for outgoing connections) or NULL (for
  * incoming ones, in which case one will be allocated and a new stream will be
  * instantiated). Returns < 0 on error.
  */
 static int mux_pt_init(struct connection *conn, struct proxy *prx, struct session *sess,
 		       struct buffer *input)
 {
-	struct conn_stream *cs = conn->ctx;
+	struct stconn *sc = conn->ctx;
 	struct mux_pt_ctx *ctx = pool_alloc(pool_head_pt_ctx);
 
 	TRACE_ENTER(PT_EV_CONN_NEW);
@@ -292,38 +298,38 @@ static int mux_pt_init(struct connection *conn, struct proxy *prx, struct sessio
 	ctx->wait_event.events = 0;
 	ctx->conn = conn;
 
-	if (!cs) {
-		ctx->endp = cs_endpoint_new();
-		if (!ctx->endp) {
-			TRACE_ERROR("CS allocation failure", PT_EV_STRM_NEW|PT_EV_STRM_END|PT_EV_STRM_ERR, conn);
+	if (!sc) {
+		ctx->sd = sedesc_new();
+		if (!ctx->sd) {
+			TRACE_ERROR("SC allocation failure", PT_EV_STRM_NEW|PT_EV_STRM_END|PT_EV_STRM_ERR, conn);
 			goto fail_free_ctx;
 		}
-		ctx->endp->target = ctx;
-		ctx->endp->ctx = conn;
-		ctx->endp->flags |= (CS_EP_T_MUX|CS_EP_ORPHAN);
+		ctx->sd->se     = ctx;
+		ctx->sd->conn   = conn;
+		se_fl_set(ctx->sd, SE_FL_T_MUX | SE_FL_ORPHAN);
 
-		cs = cs_new_from_endp(ctx->endp, sess, input);
-		if (!cs) {
-			TRACE_ERROR("CS allocation failure", PT_EV_STRM_NEW|PT_EV_STRM_END|PT_EV_STRM_ERR, conn);
-			goto fail_free_endp;
+		sc = sc_new_from_endp(ctx->sd, sess, input);
+		if (!sc) {
+			TRACE_ERROR("SC allocation failure", PT_EV_STRM_NEW|PT_EV_STRM_END|PT_EV_STRM_ERR, conn);
+			goto fail_free_sd;
 		}
-		TRACE_POINT(PT_EV_STRM_NEW, conn, cs);
+		TRACE_POINT(PT_EV_STRM_NEW, conn, sc);
 	}
 	else {
-		if (cs_attach_mux(cs, ctx, conn) < 0)
+		if (sc_attach_mux(sc, ctx, conn) < 0)
 			goto fail_free_ctx;
-		ctx->endp = cs->endp;
+		ctx->sd = sc->sedesc;
 	}
 	conn->ctx = ctx;
-	ctx->endp->flags |= CS_EP_RCV_MORE;
+	se_fl_set(ctx->sd, SE_FL_RCV_MORE);
 	if (global.tune.options & GTUNE_USE_SPLICE)
-		ctx->endp->flags |= CS_EP_MAY_SPLICE;
+		se_fl_set(ctx->sd, SE_FL_MAY_SPLICE);
 
 	TRACE_LEAVE(PT_EV_CONN_NEW, conn);
 	return 0;
 
- fail_free_endp:
-	cs_endpoint_free(ctx->endp);
+ fail_free_sd:
+	sedesc_free(ctx->sd);
  fail_free_ctx:
 	if (ctx->wait_event.tasklet)
 		tasklet_free(ctx->wait_event.tasklet);
@@ -342,11 +348,11 @@ static int mux_pt_wake(struct connection *conn)
 	int ret = 0;
 
 	TRACE_ENTER(PT_EV_CONN_WAKE, ctx->conn);
-	if (!(ctx->endp->flags & CS_EP_ORPHAN)) {
-		ret = ctx->endp->cs->data_cb->wake ? ctx->endp->cs->data_cb->wake(ctx->endp->cs) : 0;
+	if (!se_fl_test(ctx->sd, SE_FL_ORPHAN)) {
+		ret = pt_sc(ctx)->app_ops->wake ? pt_sc(ctx)->app_ops->wake(pt_sc(ctx)) : 0;
 
 		if (ret < 0) {
-			TRACE_DEVEL("leaving waking up CS", PT_EV_CONN_WAKE, ctx->conn);
+			TRACE_DEVEL("leaving waking up SC", PT_EV_CONN_WAKE, ctx->conn);
 			return ret;
 		}
 	} else {
@@ -373,30 +379,30 @@ static int mux_pt_wake(struct connection *conn)
  * Attach a new stream to a connection
  * (Used for outgoing connections)
  */
-static int mux_pt_attach(struct connection *conn, struct cs_endpoint *endp, struct session *sess)
+static int mux_pt_attach(struct connection *conn, struct sedesc *sd, struct session *sess)
 {
 	struct mux_pt_ctx *ctx = conn->ctx;
 
 	TRACE_ENTER(PT_EV_STRM_NEW, conn);
 	if (ctx->wait_event.events)
 		conn->xprt->unsubscribe(ctx->conn, conn->xprt_ctx, SUB_RETRY_RECV, &ctx->wait_event);
-	if (cs_attach_mux(endp->cs, ctx, conn) < 0)
+	if (sc_attach_mux(sd->sc, ctx, conn) < 0)
 		return -1;
-	ctx->endp = endp;
-	ctx->endp->flags |= CS_EP_RCV_MORE;
+	ctx->sd = sd;
+	se_fl_set(ctx->sd, SE_FL_RCV_MORE);
 
-	TRACE_LEAVE(PT_EV_STRM_NEW, conn, endp->cs);
+	TRACE_LEAVE(PT_EV_STRM_NEW, conn, sd->sc);
 	return 0;
 }
 
-/* Retrieves a valid conn_stream from this connection, or returns NULL. For
- * this mux, it's easy as we can only store a single conn_stream.
+/* Retrieves a valid stream connector from this connection, or returns NULL.
+ * For this mux, it's easy as we can only store a single stream connector.
  */
-static struct conn_stream *mux_pt_get_first_cs(const struct connection *conn)
+static struct stconn *mux_pt_get_first_sc(const struct connection *conn)
 {
 	struct mux_pt_ctx *ctx = conn->ctx;
 
-	return ctx->endp->cs;
+	return pt_sc(ctx);
 }
 
 /* Destroy the mux and the associated connection if still attached to this mux
@@ -405,10 +411,10 @@ static void mux_pt_destroy_meth(void *ctx)
 {
 	struct mux_pt_ctx *pt = ctx;
 
-	TRACE_POINT(PT_EV_CONN_END, pt->conn, pt->endp->cs);
-	if ((pt->endp->flags & CS_EP_ORPHAN) || pt->conn->ctx != pt) {
+	TRACE_POINT(PT_EV_CONN_END, pt->conn, pt_sc(pt));
+	if (se_fl_test(pt->sd, SE_FL_ORPHAN) || pt->conn->ctx != pt) {
 		if (pt->conn->ctx != pt) {
-			pt->endp = NULL;
+			pt->sd = NULL;
 		}
 		mux_pt_destroy(pt);
 	}
@@ -417,12 +423,12 @@ static void mux_pt_destroy_meth(void *ctx)
 /*
  * Detach the stream from the connection and possibly release the connection.
  */
-static void mux_pt_detach(struct cs_endpoint *endp)
+static void mux_pt_detach(struct sedesc *sd)
 {
-	struct connection *conn = endp->ctx;
+	struct connection *conn = sd->conn;
 	struct mux_pt_ctx *ctx;
 
-	TRACE_ENTER(PT_EV_STRM_END, conn, endp->cs);
+	TRACE_ENTER(PT_EV_STRM_END, conn, sd->sc);
 
 	ctx = conn->ctx;
 
@@ -432,7 +438,7 @@ static void mux_pt_detach(struct cs_endpoint *endp)
 		conn->xprt->subscribe(conn, conn->xprt_ctx, SUB_RETRY_RECV, &ctx->wait_event);
 	} else {
 		/* There's no session attached to that connection, destroy it */
-		TRACE_DEVEL("killing dead connection", PT_EV_STRM_END, conn, endp->cs);
+		TRACE_DEVEL("killing dead connection", PT_EV_STRM_END, conn, sd->sc);
 		mux_pt_destroy(ctx);
 	}
 
@@ -444,7 +450,7 @@ static int mux_pt_used_streams(struct connection *conn)
 {
 	struct mux_pt_ctx *ctx = conn->ctx;
 
-	return (!(ctx->endp->flags & CS_EP_ORPHAN) ? 1 : 0);
+	return (!se_fl_test(ctx->sd, SE_FL_ORPHAN) ? 1 : 0);
 }
 
 /* returns the number of streams still available on a connection */
@@ -453,45 +459,45 @@ static int mux_pt_avail_streams(struct connection *conn)
 	return 1 - mux_pt_used_streams(conn);
 }
 
-static void mux_pt_shutr(struct conn_stream *cs, enum co_shr_mode mode)
+static void mux_pt_shutr(struct stconn *sc, enum co_shr_mode mode)
 {
-	struct connection *conn = __cs_conn(cs);
+	struct connection *conn = __sc_conn(sc);
 	struct mux_pt_ctx *ctx = conn->ctx;
 
-	TRACE_ENTER(PT_EV_STRM_SHUT, conn, cs);
+	TRACE_ENTER(PT_EV_STRM_SHUT, conn, sc);
 
-	if (ctx->endp->flags & CS_EP_SHR)
+	if (se_fl_test(ctx->sd, SE_FL_SHR))
 		return;
-	ctx->endp->flags &= ~(CS_EP_RCV_MORE | CS_EP_WANT_ROOM);
+	se_fl_clr(ctx->sd, SE_FL_RCV_MORE | SE_FL_WANT_ROOM);
 	if (conn_xprt_ready(conn) && conn->xprt->shutr)
 		conn->xprt->shutr(conn, conn->xprt_ctx,
 		    (mode == CO_SHR_DRAIN));
 	else if (mode == CO_SHR_DRAIN)
 		conn_ctrl_drain(conn);
-	if (ctx->endp->flags & CS_EP_SHW)
+	if (se_fl_test(ctx->sd, SE_FL_SHW))
 		conn_full_close(conn);
 
-	TRACE_LEAVE(PT_EV_STRM_SHUT, conn, cs);
+	TRACE_LEAVE(PT_EV_STRM_SHUT, conn, sc);
 }
 
-static void mux_pt_shutw(struct conn_stream *cs, enum co_shw_mode mode)
+static void mux_pt_shutw(struct stconn *sc, enum co_shw_mode mode)
 {
-	struct connection *conn = __cs_conn(cs);
+	struct connection *conn = __sc_conn(sc);
 	struct mux_pt_ctx *ctx = conn->ctx;
 
-	TRACE_ENTER(PT_EV_STRM_SHUT, conn, cs);
+	TRACE_ENTER(PT_EV_STRM_SHUT, conn, sc);
 
-	if (ctx->endp->flags & CS_EP_SHW)
+	if (se_fl_test(ctx->sd, SE_FL_SHW))
 		return;
 	if (conn_xprt_ready(conn) && conn->xprt->shutw)
 		conn->xprt->shutw(conn, conn->xprt_ctx,
 		    (mode == CO_SHW_NORMAL));
-	if (!(ctx->endp->flags & CS_EP_SHR))
+	if (!se_fl_test(ctx->sd, SE_FL_SHR))
 		conn_sock_shutw(conn, (mode == CO_SHW_NORMAL));
 	else
 		conn_full_close(conn);
 
-	TRACE_LEAVE(PT_EV_STRM_SHUT, conn, cs);
+	TRACE_LEAVE(PT_EV_STRM_SHUT, conn, sc);
 }
 
 /*
@@ -507,43 +513,43 @@ static void mux_pt_shutw(struct conn_stream *cs, enum co_shw_mode mode)
  * mux it may optimize the data copy to <buf> if necessary. Otherwise, it should
  * copy as much data as possible.
  */
-static size_t mux_pt_rcv_buf(struct conn_stream *cs, struct buffer *buf, size_t count, int flags)
+static size_t mux_pt_rcv_buf(struct stconn *sc, struct buffer *buf, size_t count, int flags)
 {
-	struct connection *conn = __cs_conn(cs);
+	struct connection *conn = __sc_conn(sc);
 	struct mux_pt_ctx *ctx = conn->ctx;
 	size_t ret = 0;
 
-	TRACE_ENTER(PT_EV_RX_DATA, conn, cs, buf, (size_t[]){count});
+	TRACE_ENTER(PT_EV_RX_DATA, conn, sc, buf, (size_t[]){count});
 
 	if (!count) {
-		ctx->endp->flags |= (CS_EP_RCV_MORE | CS_EP_WANT_ROOM);
+		se_fl_set(ctx->sd, SE_FL_RCV_MORE | SE_FL_WANT_ROOM);
 		goto end;
 	}
 	b_realign_if_empty(buf);
 	ret = conn->xprt->rcv_buf(conn, conn->xprt_ctx, buf, count, flags);
 	if (conn_xprt_read0_pending(conn)) {
-		ctx->endp->flags &= ~(CS_EP_RCV_MORE | CS_EP_WANT_ROOM);
-		ctx->endp->flags |= CS_EP_EOS;
-		TRACE_DEVEL("read0 on connection", PT_EV_RX_DATA, conn, cs);
+		se_fl_clr(ctx->sd, SE_FL_RCV_MORE | SE_FL_WANT_ROOM);
+		se_fl_set(ctx->sd, SE_FL_EOS);
+		TRACE_DEVEL("read0 on connection", PT_EV_RX_DATA, conn, sc);
 	}
 	if (conn->flags & CO_FL_ERROR) {
-		ctx->endp->flags &= ~(CS_EP_RCV_MORE | CS_EP_WANT_ROOM);
-		ctx->endp->flags |= CS_EP_ERROR;
-		TRACE_DEVEL("error on connection", PT_EV_RX_DATA|PT_EV_CONN_ERR, conn, cs);
+		se_fl_clr(ctx->sd, SE_FL_RCV_MORE | SE_FL_WANT_ROOM);
+		se_fl_set(ctx->sd, SE_FL_ERROR);
+		TRACE_DEVEL("error on connection", PT_EV_RX_DATA|PT_EV_CONN_ERR, conn, sc);
 	}
   end:
-	TRACE_LEAVE(PT_EV_RX_DATA, conn, cs, buf, (size_t[]){ret});
+	TRACE_LEAVE(PT_EV_RX_DATA, conn, sc, buf, (size_t[]){ret});
 	return ret;
 }
 
 /* Called from the upper layer, to send data */
-static size_t mux_pt_snd_buf(struct conn_stream *cs, struct buffer *buf, size_t count, int flags)
+static size_t mux_pt_snd_buf(struct stconn *sc, struct buffer *buf, size_t count, int flags)
 {
-	struct connection *conn = __cs_conn(cs);
+	struct connection *conn = __sc_conn(sc);
 	struct mux_pt_ctx *ctx = conn->ctx;
 	size_t ret;
 
-	TRACE_ENTER(PT_EV_TX_DATA, conn, cs, buf, (size_t[]){count});
+	TRACE_ENTER(PT_EV_TX_DATA, conn, sc, buf, (size_t[]){count});
 
 	ret = conn->xprt->snd_buf(conn, conn->xprt_ctx, buf, count, flags);
 
@@ -551,11 +557,11 @@ static size_t mux_pt_snd_buf(struct conn_stream *cs, struct buffer *buf, size_t 
 		b_del(buf, ret);
 
 	if (conn->flags & CO_FL_ERROR) {
-		ctx->endp->flags |= CS_EP_ERROR;
-		TRACE_DEVEL("error on connection", PT_EV_TX_DATA|PT_EV_CONN_ERR, conn, cs);
+		se_fl_set(ctx->sd, SE_FL_ERROR);
+		TRACE_DEVEL("error on connection", PT_EV_TX_DATA|PT_EV_CONN_ERR, conn, sc);
 	}
 
-	TRACE_LEAVE(PT_EV_TX_DATA, conn, cs, buf, (size_t[]){ret});
+	TRACE_LEAVE(PT_EV_TX_DATA, conn, sc, buf, (size_t[]){ret});
 	return ret;
 }
 
@@ -564,11 +570,11 @@ static size_t mux_pt_snd_buf(struct conn_stream *cs, struct buffer *buf, size_t 
  * as at least one event is still subscribed. The <event_type> must only be a
  * combination of SUB_RETRY_RECV and SUB_RETRY_SEND. It always returns 0.
  */
-static int mux_pt_subscribe(struct conn_stream *cs, int event_type, struct wait_event *es)
+static int mux_pt_subscribe(struct stconn *sc, int event_type, struct wait_event *es)
 {
-	struct connection *conn = __cs_conn(cs);
+	struct connection *conn = __sc_conn(sc);
 
-	TRACE_POINT(PT_EV_RX_DATA|PT_EV_TX_DATA, conn, cs, 0, (size_t[]){event_type});
+	TRACE_POINT(PT_EV_RX_DATA|PT_EV_TX_DATA, conn, sc, 0, (size_t[]){event_type});
 	return conn->xprt->subscribe(conn, conn->xprt_ctx, event_type, es);
 }
 
@@ -576,54 +582,54 @@ static int mux_pt_subscribe(struct conn_stream *cs, int event_type, struct wait_
  * The <es> pointer is not allowed to differ from the one passed to the
  * subscribe() call. It always returns zero.
  */
-static int mux_pt_unsubscribe(struct conn_stream *cs, int event_type, struct wait_event *es)
+static int mux_pt_unsubscribe(struct stconn *sc, int event_type, struct wait_event *es)
 {
-	struct connection *conn = __cs_conn(cs);
+	struct connection *conn = __sc_conn(sc);
 
-	TRACE_POINT(PT_EV_RX_DATA|PT_EV_TX_DATA, conn, cs, 0, (size_t[]){event_type});
+	TRACE_POINT(PT_EV_RX_DATA|PT_EV_TX_DATA, conn, sc, 0, (size_t[]){event_type});
 	return conn->xprt->unsubscribe(conn, conn->xprt_ctx, event_type, es);
 }
 
 #if defined(USE_LINUX_SPLICE)
 /* Send and get, using splicing */
-static int mux_pt_rcv_pipe(struct conn_stream *cs, struct pipe *pipe, unsigned int count)
+static int mux_pt_rcv_pipe(struct stconn *sc, struct pipe *pipe, unsigned int count)
 {
-	struct connection *conn = __cs_conn(cs);
+	struct connection *conn = __sc_conn(sc);
 	struct mux_pt_ctx *ctx = conn->ctx;
 	int ret;
 
-	TRACE_ENTER(PT_EV_RX_DATA, conn, cs, 0, (size_t[]){count});
+	TRACE_ENTER(PT_EV_RX_DATA, conn, sc, 0, (size_t[]){count});
 
 	ret = conn->xprt->rcv_pipe(conn, conn->xprt_ctx, pipe, count);
 	if (conn_xprt_read0_pending(conn))  {
-		ctx->endp->flags |= CS_EP_EOS;
-		TRACE_DEVEL("read0 on connection", PT_EV_RX_DATA, conn, cs);
+		se_fl_set(ctx->sd, SE_FL_EOS);
+		TRACE_DEVEL("read0 on connection", PT_EV_RX_DATA, conn, sc);
 	}
 	if (conn->flags & CO_FL_ERROR) {
-		ctx->endp->flags |= CS_EP_ERROR;
-		TRACE_DEVEL("error on connection", PT_EV_RX_DATA|PT_EV_CONN_ERR, conn, cs);
+		se_fl_set(ctx->sd, SE_FL_ERROR);
+		TRACE_DEVEL("error on connection", PT_EV_RX_DATA|PT_EV_CONN_ERR, conn, sc);
 	}
 
-	TRACE_LEAVE(PT_EV_RX_DATA, conn, cs, 0, (size_t[]){ret});
+	TRACE_LEAVE(PT_EV_RX_DATA, conn, sc, 0, (size_t[]){ret});
 	return (ret);
 }
 
-static int mux_pt_snd_pipe(struct conn_stream *cs, struct pipe *pipe)
+static int mux_pt_snd_pipe(struct stconn *sc, struct pipe *pipe)
 {
-	struct connection *conn = __cs_conn(cs);
+	struct connection *conn = __sc_conn(sc);
 	struct mux_pt_ctx *ctx = conn->ctx;
 	int ret;
 
-	TRACE_ENTER(PT_EV_TX_DATA, conn, cs, 0, (size_t[]){pipe->data});
+	TRACE_ENTER(PT_EV_TX_DATA, conn, sc, 0, (size_t[]){pipe->data});
 
 	ret = conn->xprt->snd_pipe(conn, conn->xprt_ctx, pipe);
 
 	if (conn->flags & CO_FL_ERROR) {
-		ctx->endp->flags |= CS_EP_ERROR;
-		TRACE_DEVEL("error on connection", PT_EV_TX_DATA|PT_EV_CONN_ERR, conn, cs);
+		se_fl_set(ctx->sd, SE_FL_ERROR);
+		TRACE_DEVEL("error on connection", PT_EV_TX_DATA|PT_EV_CONN_ERR, conn, sc);
 	}
 
-	TRACE_LEAVE(PT_EV_TX_DATA, conn, cs, 0, (size_t[]){ret});
+	TRACE_LEAVE(PT_EV_TX_DATA, conn, sc, 0, (size_t[]){ret});
 	return ret;
 }
 #endif
@@ -656,7 +662,7 @@ const struct mux_ops mux_tcp_ops = {
 	.snd_pipe = mux_pt_snd_pipe,
 #endif
 	.attach = mux_pt_attach,
-	.get_first_cs = mux_pt_get_first_cs,
+	.get_first_sc = mux_pt_get_first_sc,
 	.detach = mux_pt_detach,
 	.avail_streams = mux_pt_avail_streams,
 	.used_streams = mux_pt_used_streams,
@@ -681,7 +687,7 @@ const struct mux_ops mux_pt_ops = {
 	.snd_pipe = mux_pt_snd_pipe,
 #endif
 	.attach = mux_pt_attach,
-	.get_first_cs = mux_pt_get_first_cs,
+	.get_first_sc = mux_pt_get_first_sc,
 	.detach = mux_pt_detach,
 	.avail_streams = mux_pt_avail_streams,
 	.used_streams = mux_pt_used_streams,
