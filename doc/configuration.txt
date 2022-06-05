@@ -2,8 +2,8 @@
                                 HAProxy
                           Configuration Manual
                          ----------------------
-                              version 2.6
-                              2022/05/27
+                              version 2.7
+                              2022/05/31
 
 
 This document covers the configuration language as implemented in the version
@@ -188,11 +188,17 @@ correctly support pipelining since there is no way to associate a response with
 the corresponding request in HTTP. For this reason, it is mandatory for the
 server to reply in the exact same order as the requests were received.
 
-The next improvement is the multiplexed mode, as implemented in HTTP/2. This
-time, each transaction is assigned a single stream identifier, and all streams
-are multiplexed over an existing connection. Many requests can be sent in
+The next improvement is the multiplexed mode, as implemented in HTTP/2 and HTTP/3.
+This time, each transaction is assigned a single stream identifier, and all
+streams are multiplexed over an existing connection. Many requests can be sent in
 parallel by the client, and responses can arrive in any order since they also
 carry the stream identifier.
+
+
+HTTP/3 is implemented over QUIC, itself implemented over UDP. QUIC solves the
+head of line blocking at transport level by means of independently treated
+streams. Indeed, when experiencing loss, an impacted stream does not affect the
+other streams.
 
 By default HAProxy operates in keep-alive mode with regards to persistent
 connections: for each connection it processes each request and response, and
@@ -1118,7 +1124,10 @@ The following keywords are supported in the "global" section :
    - tune.pipesize
    - tune.pool-high-fd-ratio
    - tune.pool-low-fd-ratio
-   - tune.quic.conn-buf-limit
+   - tune.quic.frontend.conn-tx-buffers.limit
+   - tune.quic.frontend.max-idle-timeout
+   - tune.quic.frontend.max-streams-bidi
+   - tune.quic.retry-threshold
    - tune.rcvbuf.client
    - tune.rcvbuf.server
    - tune.recv_enough
@@ -2082,16 +2091,19 @@ ssl-provider <name>
   might be used by HAProxy. Multiple 'ssl-provider' options can be specified in
   a configuration file. The providers will be loaded in their order of
   appearance.
-  Please note that loading a provider explicitely prevents OpenSSL from loading
+
+  Please note that loading a provider explicitly prevents OpenSSL from loading
   the 'default' provider automatically. OpenSSL also allows to define the
   providers that should be loaded directly in its configuration file
   (openssl.cnf for instance) so it is not necessary to use this 'ssl-provider'
   option to load providers. The "show ssl providers" CLI command can be used to
   show all the providers that were successfully loaded.
+
   The default search path of OpenSSL provider can be found in the output of the
   "openssl version -a" command. If the provider is in another directory, you
   can set the OPENSSL_MODULES environment variable, which takes the directory
   where your provider can be found.
+
   See also "ssl-propquery" and "ssl-provider-path".
 
 ssl-provider-path <path>
@@ -2928,7 +2940,7 @@ tune.pool-low-fd-ratio <number>
   use before we stop putting connection into the idle pool for reuse. The
   default is 20.
 
-tune.quic.conn-buf-limit <number>
+tune.quic.frontend.conn-tx-buffers.limit <number>
   Warning: QUIC support in HAProxy is currently experimental. Configuration may
   change without deprecation in the future.
 
@@ -2936,7 +2948,49 @@ tune.quic.conn-buf-limit <number>
   connection on data emission. By default, it is set to 30. QUIC buffers are
   drained on ACK reception. This setting has a direct impact on the throughput
   and memory consumption and can be adjusted according to an estimated round
-  time-trip.
+  time-trip. Each buffer is tune.bufsize.
+
+tune.quic.frontend.max-idle-timeout <timeout>
+  Warning: QUIC support in HAProxy is currently experimental. Configuration may
+  change without deprecation in the future.
+
+  Sets the QUIC max_idle_timeout transport parameters in milliseconds for
+  frontends which determines the period of time after which a connection silently
+  closes if it has remained inactive during an effective period of time deduced
+  from the two max_idle_timeout values announced by the two endpoints:
+    - the minimum of the two values if both are not null,
+    - the maximum if only one of them is not null,
+    - if both values are null, this feature is disabled.
+
+  The default value is 30000.
+
+tune.quic.frontend.max-streams-bidi <number>
+  Warning: QUIC support in HAProxy is currently experimental. Configuration may
+  change without deprecation in the future.
+
+  Sets the QUIC initial_max_streams_bidi transport parameter for frontends.
+  This is the initial maximum number of bidirectional streams the remote peer
+  will be authorized to open. This determines the number of concurrent client
+  requests.
+
+  The default value is 100.
+
+tune.quic.retry-threshold <number>
+  Warning: QUIC support in HAProxy is currently experimental. Configuration may
+  change without deprecation in the future.
+
+  Dynamically enables the Retry feature for all the configured QUIC listeners
+  as soon as this number of half open connections is reached. A half open
+  connection is a connection whose handshake has not already successfully
+  completed or failed. To be functional this setting needs a cluster secret to
+  be set, if not it will be silently ignored (see "cluster-secret" setting).
+  This setting will be also silently ignored if the use of QUIC Retry was
+  forced (see "quic-force-retry").
+
+  The default value is 100.
+
+  See https://www.rfc-editor.org/rfc/rfc9000.html#section-8.1.2 for more
+  information about QUIC retry.
 
 tune.rcvbuf.client <number>
 tune.rcvbuf.server <number>
@@ -3256,9 +3310,10 @@ default-server [param*]
   Arguments:
     <param*>  is a list of parameters for this server. The "default-server"
               keyword accepts an important number of options and has a complete
-              section dedicated to it. Please refer to section 5 for more
-              details.
-
+              section dedicated to it. In a peers section, the transport
+              parameters of a "default-server" line are supported. Please refer
+              to section 5 for more details, and the "server" keyword below in
+              this section for some of the restrictions.
 
   See also: "server" and section 5 about server options
 
@@ -3297,12 +3352,16 @@ peer <peername> <ip>:<port> [param*]
 
 server <peername> [<ip>:<port>] [param*]
   As previously mentioned, "peer" keyword may be replaced by "server" keyword
-  with a support for all "server" parameters found in 5.2 paragraph.
-  If the underlying peer is local, <ip>:<port> parameters must not be present.
-  These parameters must be provided on a "bind" line (see "bind" keyword
-  of this "peers" section).
-  Some of these parameters are irrelevant for "peers" sections.
+  with a support for all "server" parameters found in 5.2 paragraph that are
+  related to transport settings. If the underlying peer is local, <ip>:<port>
+  parameters must not be present; these parameters must be provided on a "bind"
+  line (see "bind" keyword of this "peers" section).
 
+  A number of "server" parameters are irrelevant for "peers" sections. Peers by
+  nature do not support dynamic host name resolution nor health checks, hence
+  parameters like "init_addr", "resolvers", "check", "agent-check", or "track"
+  are not supported. Similarly, there is no load balancing nor stickiness, thus
+  parameters such as "weight" or "cookie" have no effect.
 
   Example:
     # The old way.
@@ -3322,10 +3381,11 @@ server <peername> [<ip>:<port>] [param*]
 
    Example:
      peers mypeers
-         bind 127.0.0.11:10001 ssl crt mycerts/pem
-         default-server ssl verify none
-         server hostA  127.0.0.10:10000
-         server hostB  #local peer
+        bind 192.168.0.1:1024 ssl crt mycerts/pem
+        default-server ssl verify none
+        server haproxy1 #local peer
+        server haproxy2 192.168.0.2:1024
+        server haproxy3 10.2.0.1:1024
 
 
 table <tablename> type {ip | integer | string [len <length>] | binary [len <length>]}
@@ -4357,7 +4417,11 @@ bind /<path> [, ...] [param*]
                   address, or '*'. It designates the address the frontend will
                   listen on. If unset, all IPv4 addresses of the system will be
                   listened on. The same will apply for '*' or the system's
-                  special address "0.0.0.0". The IPv6 equivalent is '::'.
+                  special address "0.0.0.0". The IPv6 equivalent is '::'. Note
+                  that if you bind a frontend to multiple UDP addresses you have
+                  no guarantee about the address which will be used to respond.
+                  This is why "0.0.0.0" addresses and lists of comma-separated
+                  IP addresses have been forbidden to bind QUIC addresses.
                   Optionally, an address family prefix may be used before the
                   address to force the family regardless of the address format,
                   which can be useful to specify a path to a unix socket with
@@ -4382,6 +4446,11 @@ bind /<path> [, ...] [param*]
                       connected unix socket or of a socketpair. The bind waits
                       to receive a FD over the unix socket and uses it as if it
                       was the FD of an accept(). Should be used carefully.
+                    - 'quicv4@' -> address is resolved as IPv4 and protocol
+                      UDP is used.
+                    - 'quicv6@' -> address is resolved as IPv6 and protocol
+                      UDP is used.
+
                   You may want to reference some environment variables in the
                   address parameter, see section 2.3 about environment
                   variables.
@@ -4443,6 +4512,9 @@ bind /<path> [, ...] [param*]
 
         listen external_bind_app1
             bind "fd@${FD_APP1}"
+
+        listen h3_quic_proxy
+            bind quic@10.0.0.1:8888 ssl crt /etc/mycrt alpn h3
 
   Note: regarding Linux's abstract namespace sockets, HAProxy uses the whole
         sun_path length is used for the address length. Some other programs
@@ -11548,13 +11620,16 @@ stick-table type {ip | integer | string [len <length>] | binary [len <length>]}
                soft restart.
 
     <expire>   defines the maximum duration of an entry in the table since it
-               was last created, refreshed or matched. The expiration delay is
+               was last created, refreshed using 'track-sc' or matched using
+               'stick match' or 'stick on' rule. The expiration delay is
                defined using the standard time format, similarly as the various
                timeouts. The maximum duration is slightly above 24 days. See
                section 2.5 for more information. If this delay is not specified,
                the session won't automatically expire, but older entries will
                be removed once full. Be sure not to use the "nopurge" parameter
                if not expiration delay is specified.
+               Note: 'table_*' converters performs lookups but won't update touch
+               expire since they don't require 'track-sc'.
 
     <srvkey>   specifies how each server is identified for the purposes of the
                stick table. The valid values are "name" and "addr". If "name" is
@@ -11608,9 +11683,12 @@ stick-table type {ip | integer | string [len <length>] | binary [len <length>]}
       of keeping a cumulative number, they maintain the rate at which the
       counter is incremented. Most of the time it will be used to measure the
       frequency of occurrence of certain events (e.g. requests to a specific
-      URL). This array is limited to a maximum of 100 elements: gpc0 to gpc99,
-      to ensure that the build of a peer update message can fit into the
-      buffer. Users should take in consideration that a large amount of
+      URL). This array is limited to a maximum of 100 elements: gpt(100)
+      allowing the storage of gpc0 to gpc99, to ensure that the build of a peer
+      update message can fit into the buffer.
+      The array cannot contain less than 1 element: use gpc(1) if you want to
+      store only the counter gpc0.
+      Users should take in consideration that a large amount of
       counters will increase the data size and the traffic load using peers
       protocol since all data/counters are pushed each time any of them is
       updated.
@@ -11648,11 +11726,13 @@ stick-table type {ip | integer | string [len <length>] | binary [len <length>]}
       Most of the time they will be used to put a special tags on some entries,
       for instance to note that a specific behavior was detected and must be
       known for future matches. This array is limited to a maximum of 100
-      elements: gpt0 to gpt99, to ensure that the build of a peer update
-      message can fit into the buffer. Users should take in consideration
-      that a large amount of counters will increase the data size and the
-      traffic load using peers protocol since all data/counters are pushed
-      each time any of them is updated.
+      elements: gpt(100) allowing the storage of gpt0 to gpt99, to ensure that
+      the build of a peer update message can fit into the buffer.
+      The array cannot contain less than 1 element: use gpt(1) if you want to
+      to store only the tag gpt0.
+      Users should take in consideration that a large amount of counters will
+      increase the data size and the traffic load using peers protocol since
+      all data/counters are pushed each time any of them is updated.
       This data_type will exclude the usage of the legacy data_type 'gpt0'
       on the same table. Using the 'gpt' array data_type, all 'gpt0' related
       fetches and actions will apply to the first element of this array.
@@ -13848,6 +13928,9 @@ alpn <protocols>
 
        bind :443 ssl crt pub.pem alpn h2,http/1.1
 
+  QUIC supports only h3 and hq-interop as ALPN. h3 is for HTTP/3 and hq-interop
+  is used for http/0.9 and QUIC interop runner (see https://interop.seemann.io).
+
 backlog <backlog>
   Sets the socket's backlog to this value. If unspecified or 0, the frontend's
   backlog is used instead, which generally defaults to the maxconn value.
@@ -14343,6 +14426,24 @@ proto <name>
   instance, it is possible to force the http/2 on clear TCP by specifying "proto
   h2" on the bind line.
 
+quic-force-retry
+  Warning: QUIC support in HAProxy is currently experimental. Configuration may
+  change without deprecation in the future.
+
+  This is a QUIC specific setting which forces the use of the QUIC Retry feature
+  for all the connection attempts to the configured QUIC listeners. It consists
+  in veryfying the peers are able to receive packets at the transport address
+  they used to initiate a new connection, sending them a Retry packet which
+  contains a token. This token must be sent back to the Retry packet sender,
+  this latter being the only one to be able to validate the token. Note that QUIC
+  Retry will always be used even if a Retry threshold was set (see
+  "tune.quic.retry-threshold" setting). To be functional this setting needs a
+  cluster secret to be set, if not it will be silently ignored (see "cluster-secret"
+  setting).
+
+  See https://www.rfc-editor.org/rfc/rfc9000.html#section-8.1.2 for more
+  information about QUIC retry.
+
 shards <number> | by-thread
   In multi-threaded mode, on operating systems supporting multiple listeners on
   the same IP:port, this will automatically create this number of multiple
@@ -14697,7 +14798,7 @@ check
   connection headers, "check-ssl" to use SSL/TLS.
 
   Note that the implicit configuration of ssl and PROXY protocol is not
-  performed for dynamic servers. In this case, it is required to explicitely
+  performed for dynamic servers. In this case, it is required to explicitly
   use "check-ssl" and "check-send-proxy" when wanted, even if the check port is
   not overridden.
 

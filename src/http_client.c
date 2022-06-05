@@ -196,32 +196,29 @@ static int hc_cli_io_handler(struct appctx *appctx)
 {
 	struct hcli_svc_ctx *ctx = appctx->svcctx;
 	struct stconn *sc = appctx_sc(appctx);
-	struct buffer *trash = alloc_trash_chunk();
 	struct httpclient *hc = ctx->hc;
 	struct http_hdr *hdrs, *hdr;
 
-	if (!trash)
-		goto out;
-
 	if (ctx->flags & HC_CLI_F_RES_STLINE) {
-		chunk_appendf(trash, "%.*s %d %.*s\n", (unsigned int)istlen(hc->res.vsn), istptr(hc->res.vsn),
-			      hc->res.status, (unsigned int)istlen(hc->res.reason), istptr(hc->res.reason));
-		applet_putchk(appctx, trash);
+		chunk_printf(&trash, "%.*s %d %.*s\n", (unsigned int)istlen(hc->res.vsn), istptr(hc->res.vsn),
+			     hc->res.status, (unsigned int)istlen(hc->res.reason), istptr(hc->res.reason));
+		if (applet_putchk(appctx, &trash) == -1)
+			goto more;
 		ctx->flags &= ~HC_CLI_F_RES_STLINE;
-		goto out;
 	}
 
 	if (ctx->flags & HC_CLI_F_RES_HDR) {
+		chunk_reset(&trash);
 		hdrs = hc->res.hdrs;
 		for (hdr = hdrs; isttest(hdr->v); hdr++) {
-			if (!h1_format_htx_hdr(hdr->n, hdr->v, trash))
-				goto out;
+			if (!h1_format_htx_hdr(hdr->n, hdr->v, &trash))
+				goto too_many_hdrs;
 		}
-		if (!chunk_memcat(trash, "\r\n", 2))
-			goto out;
-		applet_putchk(appctx, trash);
+		if (!chunk_memcat(&trash, "\r\n", 2))
+			goto too_many_hdrs;
+		if (applet_putchk(appctx, &trash) == -1)
+			goto more;
 		ctx->flags &= ~HC_CLI_F_RES_HDR;
-		goto out;
 	}
 
 	if (ctx->flags & HC_CLI_F_RES_BODY) {
@@ -230,27 +227,27 @@ static int hc_cli_io_handler(struct appctx *appctx)
 		ret = httpclient_res_xfer(hc, sc_ib(sc));
 		channel_add_input(sc_ic(sc), ret); /* forward what we put in the buffer channel */
 
-		if (!httpclient_data(hc)) {/* remove the flag if the buffer was emptied */
-			ctx->flags &= ~HC_CLI_F_RES_BODY;
-		}
-		goto out;
+		/* remove the flag if the buffer was emptied */
+		if (httpclient_data(hc))
+			goto more;
+		ctx->flags &= ~HC_CLI_F_RES_BODY;
 	}
 
 	/* we must close only if F_END is the last flag */
 	if (ctx->flags ==  HC_CLI_F_RES_END) {
-		sc_shutw(sc);
-		sc_shutr(sc);
 		ctx->flags &= ~HC_CLI_F_RES_END;
-		goto out;
+		goto end;
 	}
 
-out:
-	/* we didn't clear every flags, we should come back to finish things */
-	if (ctx->flags)
-		sc_need_room(sc);
-
-	free_trash_chunk(trash);
+more:
+	if (!ctx->flags)
+		applet_have_no_more_data(appctx);
 	return 0;
+end:
+	return 1;
+
+too_many_hdrs:
+	return cli_err(appctx, "Too many headers.\n");
 }
 
 static void hc_cli_release(struct appctx *appctx)
@@ -792,11 +789,8 @@ static void httpclient_applet_io_handler(struct appctx *appctx)
 						uint32_t sz = htx_get_blksz(blk);
 
 						c_rew(res, sz);
-						blk = htx_remove_blk(htx, blk);
 
-						if (type == HTX_BLK_UNUSED)
-							continue;
-						else if (type == HTX_BLK_HDR) {
+						if (type == HTX_BLK_HDR) {
 							hdrs[hdr_num].n = istdup(htx_get_blk_name(htx, blk));
 							hdrs[hdr_num].v = istdup(htx_get_blk_value(htx, blk));
 							hdr_num++;
@@ -805,8 +799,10 @@ static void httpclient_applet_io_handler(struct appctx *appctx)
 							/* create a NULL end of array and leave the loop */
 							hdrs[hdr_num].n = IST_NULL;
 							hdrs[hdr_num].v = IST_NULL;
+							htx_remove_blk(htx, blk);
 							break;
 						}
+						blk = htx_remove_blk(htx, blk);
 					}
 
 					if (hdr_num) {

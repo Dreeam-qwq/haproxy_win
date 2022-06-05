@@ -20,6 +20,7 @@
 #include <haproxy/connection.h>
 #include <haproxy/dynbuf.h>
 #include <haproxy/h3.h>
+#include <haproxy/h3_stats.h>
 #include <haproxy/http.h>
 #include <haproxy/htx.h>
 #include <haproxy/intops.h>
@@ -32,7 +33,65 @@
 #include <haproxy/quic_enc.h>
 #include <haproxy/stconn.h>
 #include <haproxy/tools.h>
+#include <haproxy/trace.h>
 #include <haproxy/xprt_quic.h>
+
+/* trace source and events */
+static void h3_trace(enum trace_level level, uint64_t mask,
+                     const struct trace_source *src,
+                     const struct ist where, const struct ist func,
+                     const void *a1, const void *a2, const void *a3, const void *a4);
+
+static const struct trace_event h3_trace_events[] = {
+#define           H3_EV_RX_FRAME      (1ULL <<  0)
+	{ .mask = H3_EV_RX_FRAME,     .name = "rx_frame",    .desc = "receipt of any H3 frame" },
+#define           H3_EV_RX_DATA       (1ULL <<  1)
+	{ .mask = H3_EV_RX_DATA,      .name = "rx_data",     .desc = "receipt of H3 DATA frame" },
+#define           H3_EV_RX_HDR        (1ULL <<  2)
+	{ .mask = H3_EV_RX_HDR,       .name = "rx_hdr",      .desc = "receipt of H3 HEADERS frame" },
+#define           H3_EV_RX_SETTINGS   (1ULL <<  3)
+	{ .mask = H3_EV_RX_SETTINGS,  .name = "rx_settings", .desc = "receipt of H3 SETTINGS frame" },
+#define           H3_EV_TX_DATA       (1ULL <<  4)
+	{ .mask = H3_EV_TX_DATA,      .name = "tx_data",     .desc = "transmission of H3 DATA frame" },
+#define           H3_EV_TX_HDR        (1ULL <<  5)
+	{ .mask = H3_EV_TX_HDR,       .name = "tx_hdr",      .desc = "transmission of H3 HEADERS frame" },
+#define           H3_EV_TX_SETTINGS   (1ULL <<  6)
+	{ .mask = H3_EV_TX_SETTINGS,  .name = "tx_settings", .desc = "transmission of H3 SETTINGS frame" },
+#define           H3_EV_H3S_NEW       (1ULL <<  7)
+	{ .mask = H3_EV_H3S_NEW,      .name = "h3s_new",     .desc = "new H3 stream" },
+#define           H3_EV_H3S_END       (1ULL <<  8)
+	{ .mask = H3_EV_H3S_END,      .name = "h3s_end",     .desc = "H3 stream terminated" },
+	{ }
+};
+
+static const struct name_desc h3_trace_lockon_args[4] = {
+	/* arg1 */ { /* already used by the connection */ },
+	/* arg2 */ { .name="qcs", .desc="QUIC stream" },
+	/* arg3 */ { },
+	/* arg4 */ { }
+};
+
+static const struct name_desc h3_trace_decoding[] = {
+#define H3_VERB_CLEAN    1
+	{ .name="clean",    .desc="only user-friendly stuff, generally suitable for level \"user\"" },
+#define H3_VERB_MINIMAL  2
+	{ .name="minimal",  .desc="report only qcc/qcs state and flags, no real decoding" },
+	{ /* end */ }
+};
+
+struct trace_source trace_h3 = {
+	.name = IST("h3"),
+	.desc = "HTTP/3 transcoder",
+	.arg_def = TRC_ARG1_CONN,  /* TRACE()'s first argument is always a connection */
+	.default_cb = h3_trace,
+	.known_events = h3_trace_events,
+	.lockon_args = h3_trace_lockon_args,
+	.decoding = h3_trace_decoding,
+	.report_events = ~0,  /* report everything by default */
+};
+
+#define TRACE_SOURCE    &trace_h3
+INITCALL1(STG_REGISTER, trace_register_source, TRACE_SOURCE);
 
 #if defined(DEBUG_H3)
 #define h3_debug_printf fprintf
@@ -64,6 +123,8 @@ struct h3c {
 	uint64_t max_field_section_size;
 
 	struct buffer_wait buf_wait; /* wait list for buffer allocations */
+	/* Stats counters */
+	struct h3_counters *prx_counters;
 };
 
 DECLARE_STATIC_POOL(pool_head_h3c, "h3c", sizeof(struct h3c));
@@ -99,6 +160,8 @@ static int h3_init_uni_stream(struct h3c *h3c, struct qcs *qcs,
 	struct buffer b;
 	uint64_t type;
 	size_t len = 0, ret;
+
+	TRACE_ENTER(H3_EV_H3S_NEW, qcs->qcc->conn, qcs);
 
 	BUG_ON_HOT(!quic_stream_is_uni(qcs->id) ||
 	           h3s->flags & H3_SF_UNI_INIT);
@@ -157,6 +220,7 @@ static int h3_init_uni_stream(struct h3c *h3c, struct qcs *qcs,
 	h3s->flags |= H3_SF_UNI_INIT;
 	qcs_consume(qcs, len);
 
+	TRACE_LEAVE(H3_EV_H3S_NEW, qcs->qcc->conn, qcs);
 	return 0;
 }
 
@@ -174,11 +238,11 @@ static int h3_parse_uni_stream_no_h3(struct qcs *qcs, struct ncbuf *rxbuf)
 
 	switch (h3s->type) {
 	case H3S_T_QPACK_DEC:
-		if (!qpack_decode_dec(qcs, NULL))
+		if (qpack_decode_dec(qcs, NULL))
 			return 1;
 		break;
 	case H3S_T_QPACK_ENC:
-		if (!qpack_decode_enc(qcs, NULL))
+		if (qpack_decode_enc(qcs, NULL))
 			return 1;
 		break;
 	case H3S_T_UNKNOWN:
@@ -190,19 +254,23 @@ static int h3_parse_uni_stream_no_h3(struct qcs *qcs, struct ncbuf *rxbuf)
 	return 0;
 }
 
-/* Decode a h3 frame header made of two QUIC varints from <b> buffer.
- * Returns the number of bytes consumed if there was enough data in <b>, 0 if not.
- * Note that this function update <b> buffer to reflect the number of bytes consumed
- * to decode the h3 frame header.
+/* Decode a H3 frame header from <rxbuf> buffer. The frame type is stored in
+ * <ftype> and length in <flen>.
+ *
+ * Returns the size of the H3 frame header. Note that the input buffer is not
+ * consumed.
  */
 static inline size_t h3_decode_frm_header(uint64_t *ftype, uint64_t *flen,
-                                          struct buffer *b)
+                                          struct ncbuf *rxbuf)
 {
 	size_t hlen;
+	struct buffer b = h3_b_dup(rxbuf);
 
 	hlen = 0;
-	if (!b_quic_dec_int(ftype, b, &hlen) || !b_quic_dec_int(flen, b, &hlen))
+	if (!b_quic_dec_int(ftype, &b, &hlen) ||
+	    !b_quic_dec_int(flen, &b, &hlen)) {
 		return 0;
+	}
 
 	return hlen;
 }
@@ -277,6 +345,8 @@ static int h3_headers_to_htx(struct qcs *qcs, struct ncbuf *buf, uint64_t len,
 	struct ist authority = IST_NULL;
 	int hdr_idx;
 
+	TRACE_ENTER(H3_EV_RX_FRAME|H3_EV_RX_HDR, qcs->qcc->conn, qcs);
+
 	/* TODO support buffer wrapping */
 	BUG_ON(ncb_head(buf) + len >= ncb_wrap(buf));
 	if (qpack_decode_fs((const unsigned char *)ncb_head(buf), len, tmp, list) < 0)
@@ -318,7 +388,6 @@ static int h3_headers_to_htx(struct qcs *qcs, struct ncbuf *buf, uint64_t len,
 		sl->flags |= HTX_SL_F_BODYLESS;
 
 	sl->info.req.meth = find_http_meth(meth.ptr, meth.len);
-	BUG_ON(sl->info.req.meth == HTTP_METH_OTHER);
 
 	if (isttest(authority))
 		htx_add_header(htx, ist("host"), authority);
@@ -350,6 +419,7 @@ static int h3_headers_to_htx(struct qcs *qcs, struct ncbuf *buf, uint64_t len,
 	b_free(&htx_buf);
 	offer_buffers(NULL, 1);
 
+	TRACE_LEAVE(H3_EV_RX_FRAME|H3_EV_RX_HDR, qcs->qcc->conn, qcs);
 	return len;
 }
 
@@ -367,6 +437,8 @@ static int h3_data_to_htx(struct qcs *qcs, struct ncbuf *buf, uint64_t len,
 	size_t htx_sent = 0;
 	int htx_space;
 	char *head;
+
+	TRACE_ENTER(H3_EV_RX_FRAME|H3_EV_RX_DATA, qcs->qcc->conn, qcs);
 
 	appbuf = qc_get_buf(qcs, &qcs->rx.app_buf);
 	BUG_ON(!appbuf);
@@ -414,6 +486,8 @@ static int h3_data_to_htx(struct qcs *qcs, struct ncbuf *buf, uint64_t len,
 
  out:
 	htx_to_buf(htx, appbuf);
+
+	TRACE_LEAVE(H3_EV_RX_FRAME|H3_EV_RX_DATA, qcs->qcc->conn, qcs);
 	return htx_sent;
 }
 
@@ -428,6 +502,8 @@ static size_t h3_parse_settings_frm(struct h3c *h3c, const struct ncbuf *rxbuf,
 	uint64_t id, value;
 	size_t ret = 0;
 	long mask = 0;   /* used to detect duplicated settings identifier */
+
+	TRACE_ENTER(H3_EV_RX_FRAME|H3_EV_RX_SETTINGS, h3c->qcc->conn);
 
 	b = h3_b_dup(rxbuf);
 	b_set_data(&b, len);
@@ -489,6 +565,7 @@ static size_t h3_parse_settings_frm(struct h3c *h3c, const struct ncbuf *rxbuf,
 		}
 	}
 
+	TRACE_LEAVE(H3_EV_RX_FRAME|H3_EV_RX_SETTINGS);
 	return ret;
 }
 
@@ -522,13 +599,11 @@ static int h3_decode_qcs(struct qcs *qcs, int fin, void *ctx)
 
 	while (ncb_data(rxbuf, 0) && !(qcs->flags & QC_SF_DEM_FULL)) {
 		uint64_t ftype, flen;
-		struct buffer b;
 		char last_stream_frame = 0;
 
 		/* Work on a copy of <rxbuf> */
-		b = h3_b_dup(rxbuf);
 		if (!h3s->demux_frame_len) {
-			size_t hlen = h3_decode_frm_header(&ftype, &flen, &b);
+			size_t hlen = h3_decode_frm_header(&ftype, &flen, rxbuf);
 			if (!hlen)
 				break;
 
@@ -537,21 +612,24 @@ static int h3_decode_qcs(struct qcs *qcs, int fin, void *ctx)
 
 			h3s->demux_frame_type = ftype;
 			h3s->demux_frame_len = flen;
+
+			if (!h3_is_frame_valid(h3c, qcs, ftype)) {
+				qcc_emit_cc_app(qcs->qcc, H3_FRAME_UNEXPECTED);
+				return 1;
+			}
+
 			qcs_consume(qcs, hlen);
+			if (!ncb_data(rxbuf, 0))
+				break;
 		}
 
 		flen = h3s->demux_frame_len;
 		ftype = h3s->demux_frame_type;
 
-		if (!h3_is_frame_valid(h3c, qcs, ftype)) {
-			qcc_emit_cc_app(qcs->qcc, H3_FRAME_UNEXPECTED);
-			return 1;
-		}
-
 		/* Do not demux incomplete frames except H3 DATA which can be
 		 * fragmented in multiple HTX blocks.
 		 */
-		if (flen > b_data(&b) && ftype != H3_FT_DATA) {
+		if (flen > ncb_data(rxbuf, 0) && ftype != H3_FT_DATA) {
 			/* Reject frames bigger than bufsize.
 			 *
 			 * TODO HEADERS should in complement be limited with H3
@@ -567,6 +645,7 @@ static int h3_decode_qcs(struct qcs *qcs, int fin, void *ctx)
 
 		last_stream_frame = (fin && flen == ncb_total_data(rxbuf));
 
+		h3_inc_frame_type_cnt(h3c->prx_counters, ftype);
 		switch (ftype) {
 		case H3_FT_DATA:
 			ret = h3_data_to_htx(qcs, rxbuf, flen, last_stream_frame);
@@ -638,6 +717,8 @@ static int h3_control_send(struct qcs *qcs, void *ctx)
 	struct buffer pos, *res;
 	size_t frm_len;
 
+	TRACE_ENTER(H3_EV_TX_SETTINGS, qcs->qcc->conn, qcs);
+
 	BUG_ON_HOT(h3c->flags & H3_CF_SETTINGS_SENT);
 
 	ret = 0;
@@ -679,6 +760,7 @@ static int h3_control_send(struct qcs *qcs, void *ctx)
 			tasklet_wakeup(qcs->qcc->wait_event.tasklet);
 	}
 
+	TRACE_LEAVE(H3_EV_TX_SETTINGS, qcs->qcc->conn, qcs);
 	return ret;
 }
 
@@ -695,6 +777,8 @@ static int h3_resp_headers_send(struct qcs *qcs, struct htx *htx)
 	int ret = 0;
 	int hdr;
 	int status = 0;
+
+	TRACE_ENTER(H3_EV_TX_HDR, qcs->qcc->conn, qcs);
 
 	sl = NULL;
 	hdr = 0;
@@ -781,9 +865,11 @@ static int h3_resp_headers_send(struct qcs *qcs, struct htx *htx)
 			break;
 	}
 
+	TRACE_LEAVE(H3_EV_TX_HDR, qcs->qcc->conn, qcs);
 	return ret;
 
  err:
+	TRACE_DEVEL("leaving on error", H3_EV_TX_HDR, qcs->qcc->conn, qcs);
 	return 0;
 }
 
@@ -797,6 +883,8 @@ static int h3_resp_data_send(struct qcs *qcs, struct buffer *buf, size_t count)
 	int bsize, fsize, hsize;
 	struct htx_blk *blk;
 	enum htx_blk_type type;
+
+	TRACE_ENTER(H3_EV_TX_DATA, qcs->qcc->conn, qcs);
 
 	htx = htx_from_buf(buf);
 
@@ -857,6 +945,7 @@ static int h3_resp_data_send(struct qcs *qcs, struct buffer *buf, size_t count)
 	goto new_frame;
 
  end:
+	TRACE_LEAVE(H3_EV_TX_DATA, qcs->qcc->conn, qcs);
 	return total;
 }
 
@@ -935,6 +1024,8 @@ static int h3_attach(struct qcs *qcs)
 {
 	struct h3s *h3s;
 
+	TRACE_ENTER(H3_EV_H3S_NEW, qcs->qcc->conn, qcs);
+
 	h3s = pool_alloc(pool_head_h3s);
 	if (!h3s)
 		return 1;
@@ -952,14 +1043,20 @@ static int h3_attach(struct qcs *qcs)
 		h3s->type = H3S_T_UNKNOWN;
 	}
 
+	TRACE_LEAVE(H3_EV_H3S_NEW, qcs->qcc->conn, qcs);
 	return 0;
 }
 
 static void h3_detach(struct qcs *qcs)
 {
 	struct h3s *h3s = qcs->ctx;
+
+	TRACE_ENTER(H3_EV_H3S_END, qcs->qcc->conn, qcs);
+
 	pool_free(pool_head_h3s, h3s);
 	qcs->ctx = NULL;
+
+	TRACE_LEAVE(H3_EV_H3S_END, qcs->qcc->conn, qcs);
 }
 
 static int h3_finalize(void *ctx)
@@ -982,6 +1079,7 @@ static int h3_finalize(void *ctx)
 static int h3_init(struct qcc *qcc)
 {
 	struct h3c *h3c;
+	struct quic_conn *qc = qcc->conn->handle.qc;
 
 	h3c = pool_alloc(pool_head_h3c);
 	if (!h3c)
@@ -992,6 +1090,9 @@ static int h3_init(struct qcc *qcc)
 	h3c->flags = 0;
 
 	qcc->ctx = h3c;
+	h3c->prx_counters =
+		EXTRA_COUNTERS_GET(qc->li->bind_conf->frontend->extra_counters_fe,
+		                   &h3_stats_module);
 	LIST_INIT(&h3c->buf_wait.list);
 
 	return 1;
@@ -1018,6 +1119,32 @@ static int h3_is_active(const struct qcc *qcc, void *ctx)
 	return 0;
 }
 
+/* Increment the h3 error code counters for <error_code> value */
+static void h3_stats_inc_err_cnt(void *ctx, int err_code)
+{
+	struct h3c *h3c = ctx;
+
+	h3_inc_err_cnt(h3c->prx_counters, err_code);
+}
+
+/* h3 trace handler */
+static void h3_trace(enum trace_level level, uint64_t mask,
+                     const struct trace_source *src,
+                     const struct ist where, const struct ist func,
+                     const void *a1, const void *a2, const void *a3, const void *a4)
+{
+	const struct connection *conn = a1;
+	const struct qcc *qcc   = conn ? conn->ctx : NULL;
+	const struct qcs *qcs   = a2;
+
+	if (src->verbosity > H3_VERB_CLEAN) {
+		chunk_appendf(&trace_buf, " : qcc=%p(F)", qcc);
+
+		if (qcs)
+			chunk_appendf(&trace_buf, " qcs=%p(%lu)", qcs, qcs->id);
+	}
+}
+
 /* HTTP/3 application layer operations */
 const struct qcc_app_ops h3_ops = {
 	.init        = h3_init,
@@ -1028,4 +1155,5 @@ const struct qcc_app_ops h3_ops = {
 	.finalize    = h3_finalize,
 	.is_active   = h3_is_active,
 	.release     = h3_release,
+	.inc_err_cnt = h3_stats_inc_err_cnt,
 };
