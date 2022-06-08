@@ -7,20 +7,18 @@
 #include <haproxy/htx.h>
 #include <haproxy/http.h>
 #include <haproxy/mux_quic.h>
-#include <haproxy/ncbuf.h>
 
-static int hq_interop_decode_qcs(struct qcs *qcs, int fin, void *ctx)
+static ssize_t hq_interop_decode_qcs(struct qcs *qcs, struct buffer *b, int fin)
 {
-	struct ncbuf *rxbuf = &qcs->rx.ncbuf;
 	struct htx *htx;
 	struct htx_sl *sl;
 	struct stconn *sc;
 	struct buffer htx_buf = BUF_NULL;
 	struct ist path;
-	char *ptr = ncb_head(rxbuf);
-	char *end = ncb_wrap(rxbuf);
-	size_t size = ncb_size(rxbuf);
-	size_t data = ncb_data(rxbuf, 0);
+	char *ptr = b_head(b);
+	char *end = b_wrap(b);
+	size_t size = b_size(b);
+	size_t data = b_data(b);
 
 	b_alloc(&htx_buf);
 	htx = htx_from_buf(&htx_buf);
@@ -64,7 +62,7 @@ static int hq_interop_decode_qcs(struct qcs *qcs, int fin, void *ctx)
 
 	sl = htx_add_stline(htx, HTX_BLK_REQ_SL, 0, ist("GET"), path, ist("HTTP/1.0"));
 	if (!sl)
-		return 1;
+		return -1;
 
 	sl->flags |= HTX_SL_F_BODYLESS;
 	sl->info.req.meth = find_http_meth("GET", 3);
@@ -74,15 +72,14 @@ static int hq_interop_decode_qcs(struct qcs *qcs, int fin, void *ctx)
 
 	sc = qc_attach_sc(qcs, &htx_buf);
 	if (!sc)
-		return 1;
+		return -1;
 
-	qcs_consume(qcs, ncb_data(rxbuf, 0));
 	b_free(&htx_buf);
 
 	if (fin)
 		htx->flags |= HTX_FL_EOM;
 
-	return 0;
+	return b_data(b);
 }
 
 static struct buffer *mux_get_buf(struct qcs *qcs)

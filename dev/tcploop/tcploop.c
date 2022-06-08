@@ -72,6 +72,8 @@ static struct timeval start_time;
 static int showtime;
 static int verbose;
 static int pid;
+static int sock_type = SOCK_STREAM;
+static int sock_proto = IPPROTO_TCP;
 
 
 /* display the message and exit with the code */
@@ -95,33 +97,36 @@ __attribute__((noreturn)) void usage(int code, const char *arg0)
 	    "\n"
 	    "options :\n"
 	    "  -v           : verbose\n"
+	    "  -u           : use UDP instead of TCP (limited)\n"
 	    "  -t|-tt|-ttt  : show time (msec / relative / absolute)\n"
 	    "actions :\n"
-	    "  L[<backlog>] : Listens to ip:port and optionally sets backlog\n"
-	    "                 Note: fd=socket,bind(fd),listen(fd)\n"
-	    "  C            : Connects to ip:port\n"
-	    "                 Note: fd=socket,connect(fd)\n"
-	    "  D            : Disconnect (connect to AF_UNSPEC)\n"
 	    "  A[<count>]   : Accepts <count> incoming sockets and closes count-1\n"
 	    "                 Note: fd=accept(fd)\n"
+	    "  B[[ip]:port] : Bind a new socket to ip:port or default one if unspecified.\n"
+	    "                 Note: fd=socket,bind(fd)\n"
+	    "  C[[ip]:port] : Connects to ip:port or default ones if unspecified.\n"
+	    "                 Note: fd=socket,connect(fd)\n"
+	    "  D            : Disconnect (connect to AF_UNSPEC)\n"
+	    "  E[<size>]    : Echo this amount of bytes. 0=infinite. unset=any amount.\n"
+	    "  F            : FIN : shutdown(SHUT_WR)\n"
+	    "  G            : disable lingering\n"
+	    "  I            : wait for Input data to be present (POLLIN)\n"
 	    "  J            : Jump back to oldest post-fork/post-accept action\n"
 	    "  K            : kill the connection and go on with next operation\n"
-	    "  G            : disable lingering\n"
-	    "  T            : set TCP_NODELAY\n"
+	    "  L[<backlog>] : Listens to ip:port and optionally sets backlog\n"
+	    "                 Note: fd=socket,bind(fd),listen(fd)\n"
+	    "  N<max>       : fork New process, limited to <max> concurrent (default 1)\n"
+	    "  O            : wait for Output queue to be empty (POLLOUT + TIOCOUTQ)\n"
+	    "  P[<time>]    : Pause for <time> ms (100 by default)\n"
 	    "  Q            : disable TCP Quick-ack\n"
 	    "  R[<size>]    : Read this amount of bytes. 0=infinite. unset=any amount.\n"
 	    "  S[<size>]    : Send this amount of bytes. 0=infinite. unset=any amount.\n"
 	    "  S:<string>   : Send this exact string. \\r, \\n, \\t, \\\\ supported.\n"
-	    "  E[<size>]    : Echo this amount of bytes. 0=infinite. unset=any amount.\n"
+	    "  T            : set TCP_NODELAY\n"
 	    "  W[<time>]    : Wait for any event on the socket, maximum <time> ms\n"
-	    "  P[<time>]    : Pause for <time> ms (100 by default)\n"
-	    "  I            : wait for Input data to be present (POLLIN)\n"
-	    "  O            : wait for Output queue to be empty (POLLOUT + TIOCOUTQ)\n"
-	    "  F            : FIN : shutdown(SHUT_WR)\n"
-	    "  r            : shutr : shutdown(SHUT_RD) (pauses a listener or ends recv)\n"
-	    "  N<max>       : fork New process, limited to <max> concurrent (default 1)\n"
 	    "  X[i|o|e]* ** : execvp() next args passing socket as stdin/stdout/stderr.\n"
 	    "                 If i/o/e present, only stdin/out/err are mapped to socket.\n"
+	    "  r            : shutr : shutdown(SHUT_RD) (pauses a listener or ends recv)\n"
 	    "\n"
 	    "It's important to note that a single FD is used at once and that Accept\n"
 	    "replaces the listening FD with the accepted one. Thus always do it after\n"
@@ -236,7 +241,7 @@ void sig_handler(int sig)
 /* converts str in the form [[<ipv4>|<ipv6>|<hostname>]:]port to struct sockaddr_storage.
  * Returns < 0 with err set in case of error.
  */
-int addr_to_ss(char *str, struct sockaddr_storage *ss, struct err_msg *err)
+int addr_to_ss(const char *str, struct sockaddr_storage *ss, struct err_msg *err)
 {
 	char *port_str;
 	int port;
@@ -248,7 +253,7 @@ int addr_to_ss(char *str, struct sockaddr_storage *ss, struct err_msg *err)
 	 */
 	if ((port_str = strrchr(str, ':')) == NULL) {
 		port = atoi(str);
-		if (port <= 0 || port > 65535) {
+		if (port < 0 || port > 65535) {
 			err->len = snprintf(err->msg, err->size, "Missing/invalid port number: '%s'\n", str);
 			return -1;
 		}
@@ -331,26 +336,40 @@ int tcp_set_noquickack(int sock, const char *arg)
 #endif
 }
 
-/* Try to listen to address <sa>. Return the fd or -1 in case of error */
-int tcp_listen(const struct sockaddr_storage *sa, const char *arg)
+/* Create a new TCP socket for either listening or connecting */
+int tcp_socket()
 {
 	int sock;
-	int backlog;
 
-	if (arg[1])
-		backlog = atoi(arg + 1);
-	else
-		backlog = 1000;
-
-	if (backlog < 0 || backlog > 65535) {
-		fprintf(stderr, "backlog must be between 0 and 65535 inclusive (was %d)\n", backlog);
-		return -1;
-	}
-
-	sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+	sock = socket(AF_INET, sock_type, sock_proto);
 	if (sock < 0) {
 		perror("socket()");
 		return -1;
+	}
+
+	return sock;
+}
+
+/* Try to bind to local address <sa>. Return the fd or -1 in case of error.
+ * Supports being passed NULL for arg if none has to be passed.
+ */
+int tcp_bind(int sock, const struct sockaddr_storage *sa, const char *arg)
+{
+	struct sockaddr_storage conn_addr;
+
+	if (arg && arg[1]) {
+		struct err_msg err;
+
+		if (addr_to_ss(arg + 1, &conn_addr, &err) < 0)
+			die(1, "%s\n", err.msg);
+		sa = &conn_addr;
+	}
+
+
+	if (sock < 0) {
+		sock = tcp_socket();
+		if (sock < 0)
+			return sock;
 	}
 
 	if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) == -1) {
@@ -367,6 +386,33 @@ int tcp_listen(const struct sockaddr_storage *sa, const char *arg)
 	if (bind(sock, (struct sockaddr *)sa, sa->ss_family == AF_INET6 ?
 		 sizeof(struct sockaddr_in6) : sizeof(struct sockaddr_in)) == -1) {
 		perror("bind");
+		goto fail;
+	}
+
+	return sock;
+ fail:
+	close(sock);
+	return -1;
+}
+
+/* Try to listen to address <sa>. Return the fd or -1 in case of error */
+int tcp_listen(int sock, const struct sockaddr_storage *sa, const char *arg)
+{
+	int backlog;
+
+	if (sock < 0) {
+		sock = tcp_bind(sock, sa, NULL);
+		if (sock < 0)
+			return sock;
+	}
+
+	if (arg[1])
+		backlog = atoi(arg + 1);
+	else
+		backlog = 1000;
+
+	if (backlog < 0 || backlog > 65535) {
+		fprintf(stderr, "backlog must be between 0 and 65535 inclusive (was %d)\n", backlog);
 		goto fail;
 	}
 
@@ -416,13 +462,23 @@ int tcp_accept(int sock, const char *arg)
 }
 
 /* Try to establish a new connection to <sa>. Return the fd or -1 in case of error */
-int tcp_connect(const struct sockaddr_storage *sa, const char *arg)
+int tcp_connect(int sock, const struct sockaddr_storage *sa, const char *arg)
 {
-	int sock;
+	struct sockaddr_storage conn_addr;
 
-	sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-	if (sock < 0)
-		return -1;
+	if (arg[1]) {
+		struct err_msg err;
+
+		if (addr_to_ss(arg + 1, &conn_addr, &err) < 0)
+			die(1, "%s\n", err.msg);
+		sa = &conn_addr;
+	}
+
+	if (sock < 0) {
+		sock = tcp_socket();
+		if (sock < 0)
+			return sock;
+	}
 
 	if (fcntl(sock, F_SETFL, O_NONBLOCK) == -1)
 		goto fail;
@@ -732,7 +788,7 @@ int tcp_fork(int sock, const char *arg)
 
 int main(int argc, char **argv)
 {
-	struct sockaddr_storage ss;
+	struct sockaddr_storage default_addr;
 	struct err_msg err;
 	const char *arg0;
 	int loop_arg;
@@ -753,6 +809,10 @@ int main(int argc, char **argv)
 			showtime += 3;
 		else if (strcmp(argv[0], "-v") == 0)
 			verbose ++;
+		else if (strcmp(argv[0], "-u") == 0) {
+			sock_type = SOCK_DGRAM;
+			sock_proto = IPPROTO_UDP;
+		}
 		else if (strcmp(argv[0], "--") == 0)
 			break;
 		else
@@ -765,7 +825,7 @@ int main(int argc, char **argv)
 	pid = getpid();
 	signal(SIGCHLD, sig_handler);
 
-	if (addr_to_ss(argv[1], &ss, &err) < 0)
+	if (addr_to_ss(argv[1], &default_addr, &err) < 0)
 		die(1, "%s\n", err.msg);
 
 	gettimeofday(&start_time, NULL);
@@ -775,17 +835,21 @@ int main(int argc, char **argv)
 	for (arg = loop_arg; arg < argc; arg++) {
 		switch (argv[arg][0]) {
 		case 'L':
-			/* silently ignore existing connections */
-			if (sock == -1)
-				sock = tcp_listen(&ss, argv[arg]);
+			sock = tcp_listen(sock, &default_addr, argv[arg]);
 			if (sock < 0)
 				die(1, "Fatal: tcp_listen() failed.\n");
 			break;
 
-		case 'C':
+		case 'B':
 			/* silently ignore existing connections */
-			if (sock == -1)
-				sock = tcp_connect(&ss, argv[arg]);
+			sock = tcp_bind(sock, &default_addr, argv[arg]);
+			if (sock < 0)
+				die(1, "Fatal: tcp_connect() failed.\n");
+			dolog("connect\n");
+			break;
+
+		case 'C':
+			sock = tcp_connect(sock, &default_addr, argv[arg]);
 			if (sock < 0)
 				die(1, "Fatal: tcp_connect() failed.\n");
 			dolog("connect\n");
