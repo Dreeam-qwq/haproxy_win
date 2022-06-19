@@ -341,9 +341,6 @@ static void sc_detach_endp(struct stconn **scp)
 	if (!sc)
 		return;
 
-	if (!sc->sedesc)
-		goto reset_cs;
-
 	if (sc_ep_test(sc, SE_FL_T_MUX)) {
 		struct connection *conn = __sc_conn(sc);
 		struct sedesc *sedesc = sc->sedesc;
@@ -385,7 +382,6 @@ static void sc_detach_endp(struct stconn **scp)
 		sc_ep_set(sc, SE_FL_DETACHED);
 	}
 
-  reset_cs:
 	/* FIXME: Rest SC for now but must be reviewed. SC flags are only
 	 *        connection related for now but this will evolved
 	 */
@@ -981,9 +977,8 @@ static void sc_app_chk_snd_applet(struct stconn *sc)
 	if (unlikely(sc->state != SC_ST_EST || (oc->flags & CF_SHUTW)))
 		return;
 
-	/* we only wake the applet up if it was waiting for some data */
-
-	if (!sc_ep_test(sc, SE_FL_WAIT_DATA))
+	/* we only wake the applet up if it was waiting for some data  and is ready to consume it */
+	if (!sc_ep_test(sc, SE_FL_WAIT_DATA) || sc_ep_test(sc, SE_FL_WONT_CONSUME))
 		return;
 
 	if (!tick_isset(oc->wex))
@@ -1943,4 +1938,36 @@ static int sc_applet_process(struct stconn *sc)
 	if (sc_is_recv_allowed(sc) || sc_is_send_allowed(sc))
 		appctx_wakeup(__sc_appctx(sc));
 	return 0;
+}
+
+
+/* Prepares an endpoint upgrade. We don't now at this stage if the upgrade will
+ * succeed or not and if the stconn will be reused by the new endpoint. Thus,
+ * for now, only pretend the stconn is detached.
+ */
+void sc_conn_prepare_endp_upgrade(struct stconn *sc)
+{
+	BUG_ON(!sc_conn(sc) || !sc->app);
+	sc_ep_clr(sc, SE_FL_T_MUX);
+	sc_ep_set(sc, SE_FL_DETACHED);
+}
+
+/* Endpoint upgrade failed. Retore the stconn state. */
+void sc_conn_abort_endp_upgrade(struct stconn *sc)
+{
+	sc_ep_set(sc, SE_FL_T_MUX);
+	sc_ep_clr(sc, SE_FL_DETACHED);
+}
+
+/* Commit the endpoint upgrade. If stconn is attached, it means the new endpoint
+ * use it. So we do nothing. Otherwise, the stconn will be destroy with the
+ * overlying stream. So, it means we must commit the detach.
+*/
+void sc_conn_commit_endp_upgrade(struct stconn *sc)
+{
+	if (!sc_ep_test(sc, SE_FL_DETACHED))
+		return;
+	sc_detach_endp(&sc);
+	/* Because it was already set as detached, the sedesc must be preserved */
+	BUG_ON(!sc->sedesc);
 }

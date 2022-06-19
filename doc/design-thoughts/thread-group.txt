@@ -60,10 +60,11 @@ Task creation currently takes a thread mask of either tid_bit, a specific
 mask, or MAX_THREADS_MASK. How to create a task able to run anywhere
 (checks, Lua, ...) ?
 
-Profiling
+Profiling -> completed
 ---------
 There should be one task_profiling_mask per thread group. Enabling or
 disabling profiling should be made per group (possibly by iterating).
+-> not needed anymore, one flag per thread in each thread's context.
 
 Thread isolation
 ----------------
@@ -381,14 +382,23 @@ the FD, and all those with a bit in it ought to do it.
 2021-09-13 - tid / tgroups etc.
 ==========
 
-  - tid currently is the thread's global ID. It's essentially used as an index
+  * tid currently is the thread's global ID. It's essentially used as an index
     for arrays. It must be clearly stated that it works this way.
+
+  * tasklets use the global thread id, and __tasklet_wakeup_on() must use a
+    global ID as well. It's capital that tinfo[] provides instant access to
+    local/global bits/indexes/arrays
 
   - tid_bit makes no sense process-wide, so it must be redefined to represent
     the thread's tid within its group. The name is not much welcome though, but
     there are 286 of it that are not going to be changed that fast.
+    => now we have ltid and ltid_bit in thread_info. thread-local tid_bit still
+       not changed though. If renamed we must make sure the older one vanishes.
+       Why not rename "ptid, ptid_bit" for the process-wide tid and "gtid,
+       gtid_bit" for the group-wide ones ? This removes the ambiguity on "tid"
+       which is half the time not the one we expect.
 
-  - just like "ti" is the thread_info, we need to have "tg" pointing to the
+  * just like "ti" is the thread_info, we need to have "tg" pointing to the
     thread_group.
 
   - other less commonly used elements should be retrieved from ti->xxx. E.g.
@@ -396,8 +406,13 @@ the FD, and all those with a bit in it ought to do it.
 
   - lock debugging must reproduce tgid
 
-  - an offset might be placed in the tgroup so that even with 64 threads max
+  * task profiling must be made per-group (annoying), unless we want to add a
+    per-thread TH_FL_* flag and have the rare places where the bit is changed
+    iterate over all threads if needed. Sounds preferable overall.
+
+  * an offset might be placed in the tgroup so that even with 64 threads max
     we could have completely separate tid_bits over several groups.
+    => base and count now
 
 2021-09-15 - bind + listen() + rx
 ==========
@@ -454,6 +469,57 @@ And others to the global wait queue:
   struct eb_root timers;      /* sorted timers tree, global, accessed under wq_lock */
   __decl_aligned_rwlock(wq_lock);   /* RW lock related to the wait queue */
   struct eb_root timers;      /* sorted timers tree, global, accessed under wq_lock */
+
+
+2022-06-14 - progress on task affinity
+==========
+
+The particularity of the current global run queue is to be usable for remote
+wakeups because it's protected by a lock. There is no need for a global run
+queue beyond this, and there could already be a locked queue per thread for
+remote wakeups, with a random selection at wakeup time. It's just that picking
+a pending task in a run queue among a number is convenient (though it
+introduces some excessive locking). A task will either be tied to a single
+group or will be allowed to run on any group. As such it's pretty clear that we
+don't need a global run queue. When a run-anywhere task expires, either it runs
+on the current group's runqueue with any thread, or a target thread is selected
+during the wakeup and it's directly assigned.
+
+A global wait queue seems important for scheduled repetitive tasks however. But
+maybe it's more a task for a cron-like job and there's no need for the task
+itself to wake up anywhere, because once the task wakes up, it must be tied to
+one (or a set of) thread(s). One difficulty if the task is temporarily assigned
+a thread group is that it's impossible to know where it's running when trying
+to perform a second wakeup or when trying to kill it. Maybe we'll need to have
+two tgid for a task (desired, effective). Or maybe we can restrict the ability
+of such a task to stay in wait queue in case of wakeup, though that sounds
+difficult. Other approaches would be to set the GID to the current one when
+waking up the task, and to have a flag (or sign on the GID) indicating that the
+task is still queued in the global timers queue. We already have TASK_SHARED_WQ
+so it seems that antoher similar flag such as TASK_WAKE_ANYWHERE could make
+sense. But when is TASK_SHARED_WQ really used, except for the "anywhere" case ?
+All calls to task_new() use either 1<<thr, tid_bit, all_threads_mask, or come
+from appctx_new which does exactly the same. The only real user of non-global,
+non-unique task_new() call is debug_parse_cli_sched() which purposely allows to
+use an arbitrary mask.
+
+ +----------------------------------------------------------------------------+
+ | => we don't need one WQ per group, only a global and N local ones, hence   |
+ |    the TASK_SHARED_WQ flag can continue to be used for this purpose.       |
+ +----------------------------------------------------------------------------+
+
+Having TASK_SHARED_WQ should indicate that a task will always be queued to the
+shared queue and will always have a temporary gid and thread mask in the run
+queue.
+
+Going further, as we don't have any single case of a task bound to a small set
+of threads, we could decide to wake up only expired tasks for ourselves by
+looking them up using eb32sc and adopting them. Thus, there's no more need for
+a shared runqueue nor a global_runqueue_ticks counter, and we can simply have
+the ability to wake up a remote task. The task's thread_mask will then change
+so that it's only a thread ID, except when the task has TASK_SHARED_WQ, in
+which case it corresponds to the running thread. That's very close to what is
+already done with tasklets in fact.
 
 
 2021-09-29 - group designation and masks
@@ -521,7 +587,7 @@ broadcast it to any group.
 
 Right now in the code we have:
   - 18 calls of task_new(tid_bit)
-  - 18 calls of task_new(MAX_THREADS_MASK)
+  - 17 calls of task_new_anywhere()
   - 2 calls with a single bit
 
 Thus it looks like "task_new_anywhere()", "task_new_on()" and

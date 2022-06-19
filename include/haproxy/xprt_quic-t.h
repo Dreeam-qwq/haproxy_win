@@ -45,9 +45,9 @@
 
 typedef unsigned long long ull;
 
-#define QUIC_PROTOCOL_VERSION_DRAFT_28   0xff00001c /* draft-28 */
 #define QUIC_PROTOCOL_VERSION_DRAFT_29   0xff00001d /* draft-29 */
 #define QUIC_PROTOCOL_VERSION_1          0x00000001 /* V1 */
+#define QUIC_PROTOCOL_VERSION_2_DRAFT    0x709a50c4 /* V2 draft */
 
 #define QUIC_INITIAL_IPV4_MTU      1252 /* (bytes) */
 #define QUIC_INITIAL_IPV6_MTU      1232
@@ -269,6 +269,27 @@ extern struct pool_head *pool_head_quic_tx_packet;
 extern struct pool_head *pool_head_quic_frame;
 extern struct pool_head *pool_head_quic_dgram;
 
+struct quic_version {
+	uint32_t num;
+	const unsigned char *initial_salt;
+	size_t initial_salt_len;
+	const unsigned char *key_label;
+	size_t key_label_len;
+	const unsigned char *iv_label;
+	size_t iv_label_len;
+	const unsigned char *hp_label;
+	size_t hp_label_len;
+	const unsigned char *ku_label;
+	size_t ku_label_len;
+	/* Retry tag */
+	const unsigned char *retry_tag_key;
+	const unsigned char *retry_tag_nonce;
+};
+
+extern const struct quic_version quic_versions[];
+extern const size_t quic_versions_nb;
+extern const struct quic_version *preferred_version;
+
 /* QUIC connection id data.
  *
  * This struct is used by ebmb_node structs as last member of flexible arrays.
@@ -397,7 +418,6 @@ struct quic_rx_packet {
 	struct list qc_rx_pkt_list;
 	struct quic_conn *qc;
 	unsigned char type;
-	uint32_t version;
 	/* Initial desctination connection ID. */
 	struct quic_cid dcid;
 	struct quic_cid scid;
@@ -609,7 +629,10 @@ enum qc_mux_state {
 #define QUIC_FL_CONN_DRAINING                    (1U << 30)
 #define QUIC_FL_CONN_IMMEDIATE_CLOSE             (1U << 31)
 struct quic_conn {
-	uint32_t version;
+	const struct quic_version *original_version;
+	const struct quic_version *negotiated_version;
+	/* Negotiated version Initial TLS context */
+	struct quic_tls_ctx negotiated_ictx;
 	/* QUIC transport parameters TLS extension */
 	int tps_tls_ext;
 	/* Thread ID this connection is attached to */

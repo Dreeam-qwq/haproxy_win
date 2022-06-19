@@ -21,19 +21,19 @@
 #ifndef _HAPROXY_QPACK_DEC_H
 #define _HAPROXY_QPACK_DEC_H
 
-#include <haproxy/mux_quic-t.h>
-
+struct buffer;
 struct http_hdr;
 
 /* Internal QPACK processing errors.
  *Nothing to see with the RFC.
  */
 enum {
-	QPACK_ERR_NONE = 0,
-	QPACK_ERR_RIC,
-	QPACK_ERR_DB,
-	QPACK_ERR_TRUNCATED,
-	QPACK_ERR_HUFFMAN,
+	QPACK_ERR_NONE = 0,  /* no error */
+	QPACK_ERR_RIC,       /* cannot decode Required Insert Count prefix field */
+	QPACK_ERR_DB,        /* cannot decode Delta Base prefix field */
+	QPACK_ERR_TRUNCATED, /* truncated stream */
+	QPACK_ERR_HUFFMAN,   /* huffman decoding error */
+	QPACK_ERR_TOO_LARGE, /* decoded request/response is too large */
 };
 
 struct qpack_dec {
@@ -44,8 +44,8 @@ struct qpack_dec {
 };
 
 int qpack_decode_fs(const unsigned char *buf, uint64_t len, struct buffer *tmp,
-                    struct http_hdr *list);
-int qpack_decode_enc(struct qcs *qcs, void *ctx);
-int qpack_decode_dec(struct qcs *qcs, void *ctx);
+                    struct http_hdr *list, int list_size);
+int qpack_decode_enc(struct buffer *buf, void *ctx);
+int qpack_decode_dec(struct buffer *buf, void *ctx);
 
 #endif /* _HAPROXY_QPACK_DEC_H */

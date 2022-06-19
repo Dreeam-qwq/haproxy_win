@@ -27,7 +27,6 @@
 #include <haproxy/buf.h>
 #include <haproxy/chunk.h>
 #include <haproxy/h3.h>
-#include <haproxy/ncbuf.h>
 #include <haproxy/qpack-t.h>
 #include <haproxy/qpack-dec.h>
 #include <haproxy/qpack-tbl.h>
@@ -97,22 +96,20 @@ static uint64_t qpack_get_varint(const unsigned char **buf, uint64_t *len_in, in
  *
  * Returns 0 on success else non-zero.
  */
-int qpack_decode_enc(struct qcs *qcs, void *ctx)
+int qpack_decode_enc(struct buffer *buf, void *ctx)
 {
 	size_t len;
-	struct ncbuf *rxbuf;
 	unsigned char inst;
 
-	rxbuf = &qcs->rx.ncbuf;
-	len = ncb_data(rxbuf, 0);
-	qpack_debug_hexdump(stderr, "[QPACK-DEC-ENC] ", ncb_head(rxbuf), 0, len);
+	len = b_data(buf);
+	qpack_debug_hexdump(stderr, "[QPACK-DEC-ENC] ", b_head(buf), 0, len);
 
 	if (!len) {
 		qpack_debug_printf(stderr, "[QPACK-DEC-ENC] empty stream\n");
 		return 0;
 	}
 
-	inst = (unsigned char)*ncb_head(rxbuf) & QPACK_ENC_INST_BITMASK;
+	inst = (unsigned char)*b_head(buf) & QPACK_ENC_INST_BITMASK;
 	if (inst == QPACK_ENC_INST_DUP) {
 		/* Duplicate */
 	}
@@ -133,22 +130,20 @@ int qpack_decode_enc(struct qcs *qcs, void *ctx)
  *
  * Returns 0 on success else non-zero.
  */
-int qpack_decode_dec(struct qcs *qcs, void *ctx)
+int qpack_decode_dec(struct buffer *buf, void *ctx)
 {
 	size_t len;
-	struct ncbuf *rxbuf;
 	unsigned char inst;
 
-	rxbuf = &qcs->rx.ncbuf;
-	len = ncb_data(rxbuf, 0);
-	qpack_debug_hexdump(stderr, "[QPACK-DEC-DEC] ", ncb_head(rxbuf), 0, len);
+	len = b_data(buf);
+	qpack_debug_hexdump(stderr, "[QPACK-DEC-DEC] ", b_head(buf), 0, len);
 
 	if (!len) {
 		qpack_debug_printf(stderr, "[QPACK-DEC-DEC] empty stream\n");
 		return 0;
 	}
 
-	inst = (unsigned char)*ncb_head(rxbuf) & QPACK_DEC_INST_BITMASK;
+	inst = (unsigned char)*b_head(buf) & QPACK_DEC_INST_BITMASK;
 	if (inst == QPACK_DEC_INST_ICINC) {
 		/* Insert count increment */
 	}
@@ -181,12 +176,18 @@ static int qpack_decode_fs_pfx(uint64_t *enc_ric, uint64_t *db, int *sign_bit,
 	return 0;
 }
 
-/* Decode a field section from <len> bytes length <raw> buffer.
- * Produces the output into <tmp> buffer.
+/* Decode a field section from the <raw> buffer of <len> bytes. Each parsed
+ * header is inserted into <list> of <list_size> entries max and uses <tmp> as
+ * a storage for some elements pointing into it. An end marker is inserted at
+ * the end of the list with empty strings as name/value.
+ *
+ * Returns the number of headers inserted into list excluding the end marker.
+ * In case of error, a negative code QPACK_ERR_* is returned.
  */
 int qpack_decode_fs(const unsigned char *raw, size_t len, struct buffer *tmp,
-                    struct http_hdr *list)
+                    struct http_hdr *list, int list_size)
 {
+	struct ist name, value;
 	uint64_t enc_ric, db;
 	int s;
 	unsigned int efl_type;
@@ -195,6 +196,7 @@ int qpack_decode_fs(const unsigned char *raw, size_t len, struct buffer *tmp,
 
 	qpack_debug_hexdump(stderr, "[QPACK-DEC-FS] ", (const char *)raw, 0, len);
 
+	/* parse field section prefix */
 	ret = qpack_decode_fs_pfx(&enc_ric, &db, &s, &raw, &len);
 	if (ret < 0) {
 		qpack_debug_printf(stderr, "##ERR@%d(%d)\n", __LINE__, ret);
@@ -206,11 +208,26 @@ int qpack_decode_fs(const unsigned char *raw, size_t len, struct buffer *tmp,
 	                   (unsigned long long)enc_ric, (unsigned long long)db, !!s);
 	/* Decode field lines */
 	while (len) {
-		qpack_debug_hexdump(stderr, "raw ", (const char *)raw, 0, len);
+		if (hdr_idx >= list_size) {
+			qpack_debug_printf(stderr, "##ERR@%d\n", __LINE__);
+			ret = -QPACK_ERR_TOO_LARGE;
+			goto out;
+		}
+
+		/* parse field line representation */
 		efl_type = *raw & QPACK_EFL_BITMASK;
 		qpack_debug_printf(stderr, "efl_type=0x%02x\n", efl_type);
+
 		if (efl_type == QPACK_LFL_WPBNM) {
-			/* Literal field line with post-base name reference */
+			/* Literal field line with post-base name reference
+			 *
+			 * TODO not implemented
+			 *
+			 * For the moment, this should never happen as
+			 * currently we do not support dynamic table insertion
+			 * and specify an empty table size.
+			 */
+#if 0
 			uint64_t index __maybe_unused, length;
 			unsigned int n __maybe_unused, h __maybe_unused;
 
@@ -240,12 +257,21 @@ int qpack_decode_fs(const unsigned char *raw, size_t len, struct buffer *tmp,
 				goto out;
 			}
 
-			/* XXX Value string XXX */
 			raw += length;
 			len -= length;
+#endif
+			ABORT_NOW(); /* dynamic table not supported */
 		}
 		else if (efl_type == QPACK_IFL_WPBI) {
-			/* Indexed field line with post-base index */
+			/* Indexed field line with post-base index
+			 *
+			 * TODO not implemented
+			 *
+			 * For the moment, this should never happen as
+			 * currently we do not support dynamic table insertion
+			 * and specify an empty table size.
+			 */
+#if 0
 			uint64_t index __maybe_unused;
 
 			qpack_debug_printf(stderr, "indexed field line with post-base index:");
@@ -257,6 +283,8 @@ int qpack_decode_fs(const unsigned char *raw, size_t len, struct buffer *tmp,
 			}
 
 			qpack_debug_printf(stderr, " index=%llu", (unsigned long long)index);
+#endif
+			ABORT_NOW(); /* dynamic table not supported */
 		}
 		else if (efl_type & QPACK_IFL_BIT) {
 			/* Indexed field line */
@@ -272,8 +300,10 @@ int qpack_decode_fs(const unsigned char *raw, size_t len, struct buffer *tmp,
 				goto out;
 			}
 
-			if (t)
-				list[hdr_idx++] = qpack_sht[index];
+			if (t) {
+				name = qpack_sht[index].n;
+				value = qpack_sht[index].v;
+			}
 
 			qpack_debug_printf(stderr,  " t=%d index=%llu", !!t, (unsigned long long)index);
 		}
@@ -293,7 +323,7 @@ int qpack_decode_fs(const unsigned char *raw, size_t len, struct buffer *tmp,
 			}
 
 			if (t)
-				list[hdr_idx] = qpack_sht[index];
+				name = qpack_sht[index].n;
 
 			qpack_debug_printf(stderr, " n=%d t=%d index=%llu", !!n, !!t, (unsigned long long)index);
 			h = *raw & 0x80;
@@ -325,10 +355,10 @@ int qpack_decode_fs(const unsigned char *raw, size_t len, struct buffer *tmp,
 				qpack_debug_printf(stderr, " [name huff %d->%d '%s']", (int)length, (int)nlen, trash);
 				/* makes an ist from tmp storage */
 				b_add(tmp, nlen);
-				list[hdr_idx].v = ist2(trash, nlen);
+				value = ist2(trash, nlen);
 			}
 			else {
-				list[hdr_idx].v = ist2(raw, length);
+				value = ist2(raw, length);
 			}
 
 			if (len < length) {
@@ -339,11 +369,10 @@ int qpack_decode_fs(const unsigned char *raw, size_t len, struct buffer *tmp,
 
 			raw += length;
 			len -= length;
-			++hdr_idx;
 		}
 		else if (efl_type & QPACK_LFL_WLN_BIT) {
 			/* Literal field line with literal name */
-			unsigned int n __maybe_unused, hname __maybe_unused, hvalue __maybe_unused;
+			unsigned int n __maybe_unused, hname, hvalue;
 			uint64_t name_len, value_len;
 
 			qpack_debug_printf(stderr, "Literal field line with literal name:");
@@ -365,8 +394,35 @@ int qpack_decode_fs(const unsigned char *raw, size_t len, struct buffer *tmp,
 				goto out;
 			}
 
+			if (hname) {
+				char *trash;
+				int nlen;
+
+				trash = chunk_newstr(tmp);
+				if (!trash) {
+					qpack_debug_printf(stderr, "##ERR@%d\n", __LINE__);
+					ret = -QPACK_DECOMPRESSION_FAILED;
+					goto out;
+				}
+				nlen = huff_dec(raw, name_len, trash, tmp->size - tmp->data);
+				if (nlen == (uint32_t)-1) {
+					qpack_debug_printf(stderr, " can't decode huffman.\n");
+					ret = -QPACK_ERR_HUFFMAN;
+					goto out;
+				}
+
+				qpack_debug_printf(stderr, " [name huff %d->%d '%s']", (int)name_len, (int)nlen, trash);
+				/* makes an ist from tmp storage */
+				b_add(tmp, nlen);
+				name = ist2(trash, nlen);
+			}
+			else {
+				name = ist2(raw, name_len);
+			}
+
 			raw += name_len;
 			len -= name_len;
+
 			hvalue = *raw & 0x80;
 			value_len = qpack_get_varint(&raw, &len, 7);
 			if (len == (uint64_t)-1) {
@@ -383,15 +439,52 @@ int qpack_decode_fs(const unsigned char *raw, size_t len, struct buffer *tmp,
 				goto out;
 			}
 
-			/* XXX Value string XXX */
+			if (hvalue) {
+				char *trash;
+				int nlen;
+
+				trash = chunk_newstr(tmp);
+				if (!trash) {
+					qpack_debug_printf(stderr, "##ERR@%d\n", __LINE__);
+					ret = -QPACK_DECOMPRESSION_FAILED;
+					goto out;
+				}
+				nlen = huff_dec(raw, value_len, trash, tmp->size - tmp->data);
+				if (nlen == (uint32_t)-1) {
+					qpack_debug_printf(stderr, " can't decode huffman.\n");
+					ret = -QPACK_ERR_HUFFMAN;
+					goto out;
+				}
+
+				qpack_debug_printf(stderr, " [name huff %d->%d '%s']", (int)value_len, (int)nlen, trash);
+				/* makes an ist from tmp storage */
+				b_add(tmp, nlen);
+				value = ist2(trash, nlen);
+			}
+			else {
+				value = ist2(raw, value_len);
+			}
+
 			raw += value_len;
 			len -= value_len;
 		}
+
+		list[hdr_idx].n = name;
+		list[hdr_idx].v = value;
+		++hdr_idx;
+
 		qpack_debug_printf(stderr, "\n");
+	}
+
+	if (hdr_idx >= list_size) {
+		qpack_debug_printf(stderr, "##ERR@%d\n", __LINE__);
+		ret = -QPACK_ERR_TOO_LARGE;
+		goto out;
 	}
 
 	/* put an end marker */
 	list[hdr_idx].n = list[hdr_idx].v = IST_NULL;
+	ret = hdr_idx;
 
  out:
 	qpack_debug_printf(stderr, "-- done: ret=%d\n", ret);

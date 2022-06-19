@@ -752,7 +752,7 @@ static void qc_release(struct qcc *qcc)
 	}
 
 	while (!LIST_ISEMPTY(&qcc->lfctl.frms)) {
-		struct quic_frame *frm = LIST_ELEM(&qcc->lfctl.frms, struct quic_frame *, list);
+		struct quic_frame *frm = LIST_ELEM(qcc->lfctl.frms.n, struct quic_frame *, list);
 		LIST_DELETE(&frm->list);
 		pool_free(pool_head_quic_frame, frm);
 	}
@@ -778,13 +778,12 @@ static void qc_release(struct qcc *qcc)
 	TRACE_LEAVE(QMUX_EV_QCC_END);
 }
 
-/* Transfer as much as possible data on <qcs> from <in> to <out>. <max_data> is
- * the current flow-control limit on the connection which must not be exceeded.
+/* Transfer as much as possible data on <qcs> from <in> to <out>. This is done
+ * in respect with available flow-control at stream and connection level.
  *
  * Returns the total bytes of transferred data.
  */
-static int qcs_xfer_data(struct qcs *qcs, struct buffer *out,
-                         struct buffer *in, uint64_t max_data)
+static int qcs_xfer_data(struct qcs *qcs, struct buffer *out, struct buffer *in)
 {
 	struct qcc *qcc = qcs->qcc;
 	int left, to_xfer;
@@ -810,6 +809,7 @@ static int qcs_xfer_data(struct qcs *qcs, struct buffer *out,
 
 	BUG_ON_HOT(qcs->tx.sent_offset < qcs->stream->ack_offset);
 	BUG_ON_HOT(qcs->tx.offset < qcs->tx.sent_offset);
+	BUG_ON_HOT(qcc->tx.offsets < qcc->tx.sent_offsets);
 
 	left = qcs->tx.offset - qcs->tx.sent_offset;
 	to_xfer = QUIC_MIN(b_data(in), b_room(out));
@@ -819,10 +819,10 @@ static int qcs_xfer_data(struct qcs *qcs, struct buffer *out,
 	if (qcs->tx.offset + to_xfer > qcs->tx.msd)
 		to_xfer = qcs->tx.msd - qcs->tx.offset;
 
-	BUG_ON_HOT(max_data > qcc->rfctl.md);
+	BUG_ON_HOT(qcc->tx.offsets > qcc->rfctl.md);
 	/* do not overcome flow control limit on connection */
-	if (max_data + to_xfer > qcc->rfctl.md)
-		to_xfer = qcc->rfctl.md - max_data;
+	if (qcc->tx.offsets + to_xfer > qcc->rfctl.md)
+		to_xfer = qcc->rfctl.md - qcc->tx.offsets;
 
 	if (!left && !to_xfer)
 		goto out;
@@ -871,6 +871,7 @@ static int qcs_build_stream_frm(struct qcs *qcs, struct buffer *out, char fin,
 	}
 	BUG_ON(qcs->tx.sent_offset >= qcs->tx.offset);
 	BUG_ON(qcs->tx.sent_offset + total > qcs->tx.offset);
+	BUG_ON(qcc->tx.sent_offsets + total > qcc->rfctl.md);
 
 	frm = pool_zalloc(pool_head_quic_frame);
 	if (!frm)
@@ -924,7 +925,7 @@ void qcc_streams_sent_done(struct qcs *qcs, uint64_t data, uint64_t offset)
 	uint64_t diff;
 
 	BUG_ON(offset > qcs->tx.sent_offset);
-	BUG_ON(offset >= qcs->tx.offset);
+	BUG_ON(offset + data > qcs->tx.offset);
 
 	/* check if the STREAM frame has already been notified. It can happen
 	 * for retransmission.
@@ -1033,14 +1034,12 @@ static int qc_send_frames(struct qcc *qcc, struct list *frms)
 
 /* Used internally by qc_send function. Proceed to send for <qcs>. This will
  * transfer data from qcs buffer to its quic_stream counterpart. A STREAM frame
- * is then generated and inserted in <frms> list. <qcc_max_data> is the current
- * flow-control max-data at the connection level which must not be surpassed.
+ * is then generated and inserted in <frms> list.
  *
  * Returns the total bytes transferred between qcs and quic_stream buffers. Can
  * be null if out buffer cannot be allocated.
  */
-static int _qc_send_qcs(struct qcs *qcs, struct list *frms,
-                        uint64_t qcc_max_data)
+static int _qc_send_qcs(struct qcs *qcs, struct list *frms)
 {
 	struct qcc *qcc = qcs->qcc;
 	struct buffer *buf = &qcs->tx.buf;
@@ -1061,13 +1060,16 @@ static int _qc_send_qcs(struct qcs *qcs, struct list *frms,
 
 	/* Transfer data from <buf> to <out>. */
 	if (b_data(buf)) {
-		xfer = qcs_xfer_data(qcs, out, buf, qcc_max_data);
+		xfer = qcs_xfer_data(qcs, out, buf);
 		if (xfer > 0) {
 			qcs_notify_send(qcs);
 			qcs->flags &= ~QC_SF_BLK_MROOM;
 		}
 
 		qcs->tx.offset += xfer;
+		BUG_ON_HOT(qcs->tx.offset > qcs->tx.msd);
+		qcc->tx.offsets += xfer;
+		BUG_ON_HOT(qcc->tx.offsets > qcc->rfctl.md);
 	}
 
 	/* out buffer cannot be emptied if qcs offsets differ. */
@@ -1144,7 +1146,7 @@ static int qc_send(struct qcc *qcc)
 			continue;
 		}
 
-		ret = _qc_send_qcs(qcs, &frms, qcc->tx.sent_offsets + total);
+		ret = _qc_send_qcs(qcs, &frms);
 		total += ret;
 		node = eb64_next(node);
 	}
@@ -1161,7 +1163,7 @@ static int qc_send(struct qcc *qcc)
 		BUG_ON(!b_data(&qcs->tx.buf));
 		BUG_ON(qc_stream_buf_get(qcs->stream));
 
-		ret = _qc_send_qcs(qcs, &frms, qcc->tx.sent_offsets + tmp_total);
+		ret = _qc_send_qcs(qcs, &frms);
 		tmp_total += ret;
 		LIST_DELETE(&qcs->el);
 	}
@@ -1171,6 +1173,15 @@ static int qc_send(struct qcc *qcc)
 		goto retry;
 
  out:
+	/* Deallocate frames that the transport layer has rejected. */
+	if (!LIST_ISEMPTY(&frms)) {
+		struct quic_frame *frm, *frm2;
+		list_for_each_entry_safe(frm, frm2, &frms, list) {
+			LIST_DELETE(&frm->list);
+			pool_free(pool_head_quic_frame, frm);
+		}
+	}
+
 	TRACE_LEAVE(QMUX_EV_QCC_SEND);
 
 	return total;
@@ -1342,7 +1353,7 @@ static int qc_init(struct connection *conn, struct proxy *prx,
 	lparams = &conn->handle.qc->rx.params;
 
 	qcc->rx.max_data = lparams->initial_max_data;
-	qcc->tx.sent_offsets = 0;
+	qcc->tx.sent_offsets = qcc->tx.offsets = 0;
 
 	/* Client initiated streams must respect the server flow control. */
 	qcc->strms[QCS_CLT_BIDI].max_streams = lparams->initial_max_streams_bidi;

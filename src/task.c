@@ -126,7 +126,7 @@ void tasklet_kill(struct tasklet *t)
 		 * as soon as possible.
 		 */
 		if (_HA_ATOMIC_CAS(&t->state, &state, state | TASK_IN_LIST | TASK_KILLED)) {
-			thr = t->tid > 0 ? t->tid: tid;
+			thr = t->tid >= 0 ? t->tid : tid;
 			MT_LIST_APPEND(&ha_thread_ctx[thr].shared_tasklet_list,
 			               list_to_mt_list(&t->list));
 			_HA_ATOMIC_INC(&ha_thread_ctx[thr].rq_total);
@@ -218,7 +218,7 @@ void __task_wakeup(struct task *t)
 		t->rq.key += offset;
 	}
 
-	if (task_profiling_mask & tid_bit)
+	if (th_ctx->flags & TH_FL_TASK_PROFILING)
 		t->call_date = now_mono_time();
 
 	eb32sc_insert(root, &t->rq, t->thread_mask);
@@ -297,8 +297,10 @@ void wake_expired_tasks()
 	struct eb32_node *eb;
 	__decl_thread(int key);
 
-	while (max_processed-- > 0) {
-  lookup_next_local:
+	while (1) {
+		if (max_processed-- <= 0)
+			goto leave;
+
 		eb = eb32_lookup_ge(&tt->timers, now_ms - TIMER_LOOK_BACK);
 		if (!eb) {
 			/* we might have reached the end of the tree, typically because
@@ -562,7 +564,7 @@ unsigned int run_tasks_from_lists(unsigned int budgets[])
 			LIST_DEL_INIT(&((struct tasklet *)t)->list);
 			__ha_barrier_store();
 
-			if (unlikely(task_profiling_mask & tid_bit)) {
+			if (unlikely(th_ctx->flags & TH_FL_TASK_PROFILING)) {
 				profile_entry = sched_activity_entry(sched_activity, t->process);
 				before = now_mono_time();
 #ifdef DEBUG_TASK
@@ -587,7 +589,7 @@ unsigned int run_tasks_from_lists(unsigned int budgets[])
 				continue;
 			}
 
-			if (unlikely(task_profiling_mask & tid_bit)) {
+			if (unlikely(th_ctx->flags & TH_FL_TASK_PROFILING)) {
 				HA_ATOMIC_INC(&profile_entry->calls);
 				HA_ATOMIC_ADD(&profile_entry->cpu_time, now_mono_time() - before);
 			}
@@ -902,10 +904,10 @@ void mworker_cleantasks()
 
 #ifdef USE_THREAD
 	/* cleanup the global run queue */
-	tmp_rq = eb32sc_first(&rqueue, MAX_THREADS_MASK);
+	tmp_rq = eb32sc_first(&rqueue, ~0UL);
 	while (tmp_rq) {
 		t = eb32sc_entry(tmp_rq, struct task, rq);
-		tmp_rq = eb32sc_next(tmp_rq, MAX_THREADS_MASK);
+		tmp_rq = eb32sc_next(tmp_rq, ~0UL);
 		task_destroy(t);
 	}
 	/* cleanup the timers queue */
@@ -918,10 +920,10 @@ void mworker_cleantasks()
 #endif
 	/* clean the per thread run queue */
 	for (i = 0; i < global.nbthread; i++) {
-		tmp_rq = eb32sc_first(&ha_thread_ctx[i].rqueue, MAX_THREADS_MASK);
+		tmp_rq = eb32sc_first(&ha_thread_ctx[i].rqueue, ~0UL);
 		while (tmp_rq) {
 			t = eb32sc_entry(tmp_rq, struct task, rq);
-			tmp_rq = eb32sc_next(tmp_rq, MAX_THREADS_MASK);
+			tmp_rq = eb32sc_next(tmp_rq, ~0UL);
 			task_destroy(t);
 		}
 		/* cleanup the per thread timers queue */

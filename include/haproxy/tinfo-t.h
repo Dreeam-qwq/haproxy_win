@@ -37,6 +37,7 @@ enum {
 
 /* thread_ctx flags, for ha_thread_ctx[].flags */
 #define TH_FL_STUCK             0x00000001
+#define TH_FL_TASK_PROFILING    0x00000002
 
 /* Thread group information. This defines a base and a count of global thread
  * IDs which belong to it, and which can be looked up into thread_info/ctx. It
@@ -61,7 +62,7 @@ struct tgroup_info {
 struct thread_info {
 	const struct tgroup_info *tg;     /* config of the thread-group this thread belongs to */
 	uint tid, ltid;                   /* process-wide and group-wide thread ID (start at 0) */
-	ulong tid_bit, ltid_bit;          /* bit masks for the tid/ltid */
+	ulong ltid_bit;                   /* bit masks for the tid/ltid */
 
 	/* pad to cache line (64B) */
 	char __pad[0];                    /* unused except to check remaining room */

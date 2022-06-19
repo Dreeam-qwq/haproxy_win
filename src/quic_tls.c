@@ -2,16 +2,11 @@
 
 #include <openssl/ssl.h>
 
-#if defined(OPENSSL_IS_BORINGSSL)
-#include <openssl/hkdf.h>
-#else
 #include <openssl/evp.h>
 #include <openssl/kdf.h>
-#endif
 
 #include <haproxy/buf.h>
 #include <haproxy/chunk.h>
-//#include <haproxy/quic_tls-t.h>
 #include <haproxy/xprt_quic.h>
 
 
@@ -53,23 +48,6 @@ void quic_tls_secret_hexdump(struct buffer *buf,
 		chunk_appendf(buf, "%02x", secret[i]);
 }
 
-#if defined(OPENSSL_IS_BORINGSSL)
-int quic_hkdf_extract(const EVP_MD *md,
-                      unsigned char *buf, size_t *buflen,
-                      const unsigned char *key, size_t keylen,
-                      const unsigned char *salt, size_t saltlen)
-{
-	return HKDF_extract(buf, buflen, md, key, keylen, salt, saltlen);
-}
-
-int quic_hkdf_expand(const EVP_MD *md,
-                     unsigned char *buf, size_t buflen,
-                     const unsigned char *key, size_t keylen,
-                     const unsigned char *label, size_t labellen)
-{
-	return HKDF_expand(buf, buflen, md, key, keylen, label, labellen);
-}
-#else
 int quic_hkdf_extract(const EVP_MD *md,
                       unsigned char *buf, size_t buflen,
                       const unsigned char *key, size_t keylen,
@@ -161,8 +139,6 @@ int quic_hkdf_extract_and_expand(const EVP_MD *md,
 	return 0;
 }
 
-#endif
-
 /* https://quicwg.org/base-drafts/draft-ietf-quic-tls.html#protection-keys
  * refers to:
  *
@@ -220,7 +196,7 @@ int quic_hkdf_expand_label(const EVP_MD *md,
  * Obviouly these keys have the same size becaused derived with the same TLS cryptographic context.
  */
 int quic_tls_derive_keys(const EVP_CIPHER *aead, const EVP_CIPHER *hp,
-                         const EVP_MD *md,
+                         const EVP_MD *md, const struct quic_version *qv,
                          unsigned char *key, size_t keylen,
                          unsigned char *iv, size_t ivlen,
                          unsigned char *hp_key, size_t hp_keylen,
@@ -229,19 +205,16 @@ int quic_tls_derive_keys(const EVP_CIPHER *aead, const EVP_CIPHER *hp,
 	size_t aead_keylen = (size_t)EVP_CIPHER_key_length(aead);
 	size_t aead_ivlen = (size_t)EVP_CIPHER_iv_length(aead);
 	size_t hp_len = hp ? (size_t)EVP_CIPHER_key_length(hp) : 0;
-	const unsigned char    key_label[] = "quic key";
-	const unsigned char     iv_label[] = "quic iv";
-	const unsigned char hp_key_label[] = "quic hp";
 
 	if (aead_keylen > keylen || aead_ivlen > ivlen || hp_len > hp_keylen)
 		return 0;
 
 	if (!quic_hkdf_expand_label(md, key, aead_keylen, secret, secretlen,
-	                            key_label, sizeof key_label - 1) ||
+	                            qv->key_label,qv->key_label_len) ||
 	    !quic_hkdf_expand_label(md, iv, aead_ivlen, secret, secretlen,
-	                            iv_label, sizeof iv_label - 1) ||
+	                            qv->iv_label, qv->iv_label_len) ||
 	    (hp_key && !quic_hkdf_expand_label(md, hp_key, hp_len, secret, secretlen,
-	                                       hp_key_label, sizeof hp_key_label - 1)))
+	                                       qv->hp_label, qv->hp_label_len)))
 		return 0;
 
 	return 1;
@@ -303,14 +276,12 @@ int quic_tls_derive_initial_secrets(const EVP_MD *md,
 /* Update <sec> secret key into <new_sec> according to RFC 9001 6.1.
  * Always succeeds.
  */
-int quic_tls_sec_update(const EVP_MD *md,
+int quic_tls_sec_update(const EVP_MD *md, const struct quic_version *qv,
                         unsigned char *new_sec, size_t new_seclen,
                         const unsigned char *sec, size_t seclen)
 {
-	const unsigned char ku_label[] = "quic ku";
-
 	return quic_hkdf_expand_label(md, new_sec, new_seclen, sec, seclen,
-	                              ku_label, sizeof ku_label - 1);
+	                              qv->ku_label, qv->ku_label_len);
 }
 
 /*
@@ -560,21 +531,12 @@ int quic_tls_derive_retry_token_secret(const EVP_MD *md,
  *
  * Returns non-zero on success else zero.
  */
-int quic_tls_generate_retry_integrity_tag(unsigned char *odcid,
-                                          unsigned char odcid_len,
-                                          unsigned char *pkt, size_t pkt_len)
+int quic_tls_generate_retry_integrity_tag(unsigned char *odcid, unsigned char odcid_len,
+                                          unsigned char *pkt, size_t pkt_len,
+                                          const struct quic_version *qv)
 {
 	const EVP_CIPHER *evp = EVP_aes_128_gcm();
 	EVP_CIPHER_CTX *ctx;
-
-	/* key/nonce from rfc9001 5.8. Retry Packet Integrity */
-	const unsigned char key[] = {
-	  0xbe, 0x0c, 0x69, 0x0b, 0x9f, 0x66, 0x57, 0x5a,
-	  0x1d, 0x76, 0x6b, 0x54, 0xe3, 0x68, 0xc8, 0x4e,
-	};
-	const unsigned char nonce[] = {
-	  0x46, 0x15, 0x99, 0xd3, 0x5d, 0x63, 0x2b, 0xf2, 0x23, 0x98, 0x25, 0xbb,
-	};
 
 	/* encryption buffer - not used as only AEAD tag generation is proceed */
 	unsigned char *out = NULL;
@@ -591,7 +553,7 @@ int quic_tls_generate_retry_integrity_tag(unsigned char *odcid,
 	 * AEAD is proceed over a pseudo-Retry packet used as AAD. It contains
 	 * the ODCID len + data and the Retry packet itself.
 	 */
-	if (!EVP_EncryptInit_ex(ctx, evp, NULL, key, nonce) ||
+	if (!EVP_EncryptInit_ex(ctx, evp, NULL, qv->retry_tag_key, qv->retry_tag_nonce) ||
 	    /* specify pseudo-Retry as AAD */
 	    !EVP_EncryptUpdate(ctx, NULL, &outlen, &odcid_len, sizeof(odcid_len)) ||
 	    !EVP_EncryptUpdate(ctx, NULL, &outlen, odcid, odcid_len) ||

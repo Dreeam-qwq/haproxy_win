@@ -230,11 +230,11 @@ static ssize_t h3_parse_uni_stream_no_h3(struct qcs *qcs, struct buffer *b)
 
 	switch (h3s->type) {
 	case H3S_T_QPACK_DEC:
-		if (qpack_decode_dec(qcs, NULL))
+		if (qpack_decode_dec(b, NULL))
 			return -1;
 		break;
 	case H3S_T_QPACK_ENC:
-		if (qpack_decode_enc(qcs, NULL))
+		if (qpack_decode_enc(b, NULL))
 			return -1;
 		break;
 	case H3S_T_UNKNOWN:
@@ -341,8 +341,10 @@ static ssize_t h3_headers_to_htx(struct qcs *qcs, const struct buffer *buf,
 
 	/* TODO support buffer wrapping */
 	BUG_ON(b_head(buf) + len >= b_wrap(buf));
-	if (qpack_decode_fs((const unsigned char *)b_head(buf), len, tmp, list) < 0)
+	if (qpack_decode_fs((const unsigned char *)b_head(buf), len, tmp,
+	                    list, sizeof(list) / sizeof(list[0])) < 0) {
 		return -1;
+	}
 
 	qc_get_buf(qcs, &htx_buf);
 	BUG_ON(!b_size(&htx_buf));
@@ -498,10 +500,7 @@ static ssize_t h3_parse_settings_frm(struct h3c *h3c, const struct buffer *buf,
 	TRACE_ENTER(H3_EV_RX_FRAME|H3_EV_RX_SETTINGS, h3c->qcc->conn);
 
 	/* Work on a copy of <buf>. */
-	b = b_make(b_orig(buf), b_size(buf), b_head_ofs(buf), b_data(buf));
-
-	/* TODO handle incomplete SETTINGS frame */
-	BUG_ON(len < b_data(&b));
+	b = b_make(b_orig(buf), b_size(buf), b_head_ofs(buf), len);
 
 	while (b_data(&b)) {
 		if (!b_quic_dec_int(&id, &b, &ret) || !b_quic_dec_int(&value, &b, &ret)) {
@@ -798,6 +797,8 @@ static int h3_resp_headers_send(struct qcs *qcs, struct htx *htx)
 			status = sl->info.res.status;
 		}
 		else if (type == HTX_BLK_HDR) {
+			if (unlikely(hdr >= sizeof(list) / sizeof(list[0]) - 1))
+				goto err;
 			list[hdr].n = htx_get_blk_name(htx, blk);
 			list[hdr].v = htx_get_blk_value(htx, blk);
 			hdr++;
