@@ -672,16 +672,15 @@ void stream_free(struct stream *s)
 			struct cap_hdr *h;
 			for (h = fe->req_cap; h; h = h->next)
 				pool_free(h->pool, s->req_cap[h->index]);
+			pool_free(fe->req_cap_pool, s->req_cap);
 		}
 
 		if (s->res_cap) {
 			struct cap_hdr *h;
 			for (h = fe->rsp_cap; h; h = h->next)
 				pool_free(h->pool, s->res_cap[h->index]);
+			pool_free(fe->rsp_cap_pool, s->res_cap);
 		}
-
-		pool_free(fe->rsp_cap_pool, s->res_cap);
-		pool_free(fe->req_cap_pool, s->req_cap);
 	}
 
 	/* Cleanup all variable contexts. */
@@ -3285,7 +3284,7 @@ static int stats_dump_full_strm_to_buffer(struct stconn *sc, struct stream *strm
 		}
 
 		chunk_appendf(&trash,
-			     "  task=%p (state=0x%02x nice=%d calls=%u rate=%u exp=%s tmask=0x%lx%s",
+			     "  task=%p (state=0x%02x nice=%d calls=%u rate=%u exp=%s tid=%d%s",
 			     strm->task,
 			     strm->task->state,
 			     strm->task->nice, strm->task->calls, read_freq_ctr(&strm->call_rate),
@@ -3293,7 +3292,7 @@ static int stats_dump_full_strm_to_buffer(struct stconn *sc, struct stream *strm
 			             tick_is_expired(strm->task->expire, now_ms) ? "<PAST>" :
 			                     human_time(TICKS_TO_MS(strm->task->expire - now_ms),
 			                     TICKS_TO_MS(1000)) : "<NEVER>",
-			     strm->task->thread_mask,
+		             strm->task->tid,
 			     task_in_rq(strm->task) ? ", running" : "");
 
 		chunk_appendf(&trash,
@@ -3335,13 +3334,13 @@ static int stats_dump_full_strm_to_buffer(struct stconn *sc, struct stream *strm
 		}
 		else if ((tmpctx = sc_appctx(scf)) != NULL) {
 			chunk_appendf(&trash,
-			              "      app0=%p st0=%d st1=%d st2=%d applet=%s tmask=0x%lx nice=%d calls=%u rate=%u cpu=%llu lat=%llu\n",
+			              "      app0=%p st0=%d st1=%d st2=%d applet=%s tid=%d nice=%d calls=%u rate=%u cpu=%llu lat=%llu\n",
 				      tmpctx,
 				      tmpctx->st0,
 				      tmpctx->st1,
 				      tmpctx->_st2,
 			              tmpctx->applet->name,
-			              tmpctx->t->thread_mask,
+			              tmpctx->t->tid,
 			              tmpctx->t->nice, tmpctx->t->calls, read_freq_ctr(&tmpctx->call_rate),
 			              (unsigned long long)tmpctx->t->cpu_time, (unsigned long long)tmpctx->t->lat_time);
 		}
@@ -3374,13 +3373,13 @@ static int stats_dump_full_strm_to_buffer(struct stconn *sc, struct stream *strm
 		}
 		else if ((tmpctx = sc_appctx(scb)) != NULL) {
 			chunk_appendf(&trash,
-			              "      app1=%p st0=%d st1=%d st2=%d applet=%s tmask=0x%lx nice=%d calls=%u rate=%u cpu=%llu lat=%llu\n",
+			              "      app1=%p st0=%d st1=%d st2=%d applet=%s tid=%d nice=%d calls=%u rate=%u cpu=%llu lat=%llu\n",
 				      tmpctx,
 				      tmpctx->st0,
 				      tmpctx->st1,
 				      tmpctx->_st2,
 			              tmpctx->applet->name,
-			              tmpctx->t->thread_mask,
+			              tmpctx->t->tid,
 			              tmpctx->t->nice, tmpctx->t->calls, read_freq_ctr(&tmpctx->call_rate),
 			              (unsigned long long)tmpctx->t->cpu_time, (unsigned long long)tmpctx->t->lat_time);
 		}

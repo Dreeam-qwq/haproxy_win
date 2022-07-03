@@ -53,7 +53,8 @@ int wdt_ping(int thr)
 void wdt_handler(int sig, siginfo_t *si, void *arg)
 {
 	unsigned long long n, p;
-	int thr;
+	ulong thr_bit;
+	int thr, tgrp;
 
 	switch (si->si_code) {
 	case SI_TIMER:
@@ -71,6 +72,8 @@ void wdt_handler(int sig, siginfo_t *si, void *arg)
 		if (thr < 0 || thr >= global.nbthread)
 			break;
 
+		tgrp = ha_thread_info[thr].tgid;
+		thr_bit = ha_thread_info[thr].ltid_bit;
 		p = ha_thread_ctx[thr].prev_cpu_time;
 		n = now_cpu_time_thread(thr);
 
@@ -80,7 +83,8 @@ void wdt_handler(int sig, siginfo_t *si, void *arg)
 		if (!p || n - p < 1000000000UL)
 			goto update_and_leave;
 
-		if ((threads_harmless_mask|sleeping_thread_mask|threads_to_dump) & (1UL << thr)) {
+		if ((_HA_ATOMIC_LOAD(&th_ctx->flags) & TH_FL_SLEEPING) &&
+		    (_HA_ATOMIC_LOAD(&ha_tgroup_ctx[tgrp-1].threads_harmless) & thr_bit)) {
 			/* This thread is currently doing exactly nothing
 			 * waiting in the poll loop (unlikely but possible),
 			 * waiting for all other threads to join the rendez-vous
@@ -99,7 +103,7 @@ void wdt_handler(int sig, siginfo_t *si, void *arg)
 		 * If it's already set, then it's our second call with no
 		 * progress and the thread is dead.
 		 */
-		if (!(ha_thread_ctx[thr].flags & TH_FL_STUCK)) {
+		if (!(_HA_ATOMIC_LOAD(&ha_thread_ctx[thr].flags) & TH_FL_STUCK)) {
 			_HA_ATOMIC_OR(&ha_thread_ctx[thr].flags, TH_FL_STUCK);
 			goto update_and_leave;
 		}

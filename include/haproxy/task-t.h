@@ -32,10 +32,9 @@
 /* values for task->state (32 bits) */
 #define TASK_SLEEPING     0x00000000  /* task sleeping */
 #define TASK_RUNNING      0x00000001  /* the task is currently running */
-#define TASK_GLOBAL       0x00000002  /* The task is currently in the global runqueue */
+/* unused                 0x00000002 */
 #define TASK_QUEUED       0x00000004  /* The task has been (re-)added to the run queue */
-#define TASK_SHARED_WQ    0x00000008  /* The task's expiration may be updated by other
-                                       * threads, must be set before first queue/wakeup */
+/* unused                 0x00000008 */
 #define TASK_SELF_WAKING  0x00000010  /* task/tasklet found waking itself */
 #define TASK_KILLED       0x00000020  /* task/tasklet killed, may now be freed */
 #define TASK_IN_LIST      0x00000040  /* tasklet is in a tasklet list */
@@ -59,7 +58,7 @@
 /* unused: 0x20000..0x80000000 */
 
 /* These flags are persistent across scheduler calls */
-#define TASK_PERSISTENT   (TASK_SHARED_WQ | TASK_SELF_WAKING | TASK_KILLED | \
+#define TASK_PERSISTENT   (TASK_SELF_WAKING | TASK_KILLED | \
                            TASK_HEAVY | TASK_F_TASKLET | TASK_F_USR1)
 
 struct notification {
@@ -103,7 +102,7 @@ struct notification {
 /* The base for all tasks */
 struct task {
 	TASK_COMMON;			/* must be at the beginning! */
-	struct eb32sc_node rq;		/* ebtree node used to hold the task in the run queue */
+	struct eb32_node rq;		/* ebtree node used to hold the task in the run queue */
 	/* WARNING: the struct task is often aliased as a struct tasklet when
 	 * it is NOT in the run queue. The tasklet has its struct list here
 	 * where rq starts and this works because both are exclusive. Never
@@ -112,8 +111,7 @@ struct task {
 	struct eb32_node wq;		/* ebtree node used to hold the task in the wait queue */
 	int expire;			/* next expiration date for this task, in ticks */
 	short nice;                     /* task prio from -1024 to +1024 */
-	/* 16-bit hole here */
-	unsigned long thread_mask;	/* mask of thread IDs authorized to process the task */
+	short tid;                      /* TID where it's allowed to run, <0 if anywhere */
 	uint64_t call_date;		/* date of the last task wakeup or call */
 	uint64_t lat_time;		/* total latency time experienced */
 	uint64_t cpu_time;              /* total CPU time consumed */

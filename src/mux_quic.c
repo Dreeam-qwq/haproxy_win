@@ -380,9 +380,8 @@ static inline struct buffer qcs_b_dup(const struct ncbuf *b)
 	return b_make(ncb_orig(b), b->size, b->head, ncb_data(b, 0));
 }
 
-/* Remove <bytes> from <qcs> Rx buffer. This must be called by transcoders
- * after STREAM parsing. Flow-control for received offsets may be allocated for
- * the peer if needed.
+/* Remove <bytes> from <qcs> Rx buffer. Flow-control for received offsets may
+ * be allocated for the peer if needed.
  */
 static void qcs_consume(struct qcs *qcs, uint64_t bytes)
 {
@@ -440,11 +439,19 @@ static int qcc_decode_qcs(struct qcc *qcc, struct qcs *qcs)
 {
 	struct buffer b;
 	ssize_t ret;
+	int fin = 0;
 
 	TRACE_ENTER(QMUX_EV_QCS_RECV, qcc->conn, qcs);
 
 	b = qcs_b_dup(&qcs->rx.ncbuf);
-	ret = qcc->app_ops->decode_qcs(qcs, &b, qcs->flags & QC_SF_FIN_RECV);
+
+	/* Signal FIN to application if STREAM FIN received and there is no gap
+	 * in the Rx buffer.
+	 */
+	if (qcs->flags & QC_SF_FIN_RECV && !ncb_is_fragmented(&qcs->rx.ncbuf))
+		fin = 1;
+
+	ret = qcc->app_ops->decode_qcs(qcs, &b, fin);
 	if (ret < 0) {
 		TRACE_DEVEL("leaving on decoding error", QMUX_EV_QCS_RECV, qcc->conn, qcs);
 		return 1;
@@ -1672,13 +1679,13 @@ static void qmux_trace_frm(const struct quic_frame *frm)
 {
 	switch (frm->type) {
 	case QUIC_FT_MAX_STREAMS_BIDI:
-		chunk_appendf(&trace_buf, " max_streams=%lu",
-		              frm->max_streams_bidi.max_streams);
+		chunk_appendf(&trace_buf, " max_streams=%llu",
+		              (ull)frm->max_streams_bidi.max_streams);
 		break;
 
 	case QUIC_FT_MAX_STREAMS_UNI:
-		chunk_appendf(&trace_buf, " max_streams=%lu",
-		              frm->max_streams_uni.max_streams);
+		chunk_appendf(&trace_buf, " max_streams=%llu",
+		              (ull)frm->max_streams_uni.max_streams);
 		break;
 
 	default:
@@ -1703,11 +1710,11 @@ static void qmux_trace(enum trace_level level, uint64_t mask,
 		chunk_appendf(&trace_buf, " : qcc=%p(F)", qcc);
 
 		if (qcs)
-			chunk_appendf(&trace_buf, " qcs=%p(%lu)", qcs, qcs->id);
+			chunk_appendf(&trace_buf, " qcs=%p(%llu)", qcs, (ull)qcs->id);
 
 		if (mask & QMUX_EV_QCC_NQCS) {
 			const uint64_t *id = a3;
-			chunk_appendf(&trace_buf, " id=%lu", *id);
+			chunk_appendf(&trace_buf, " id=%llu", (ull)*id);
 		}
 
 		if (mask & QMUX_EV_SEND_FRM)
@@ -1715,14 +1722,14 @@ static void qmux_trace(enum trace_level level, uint64_t mask,
 
 		if (mask & QMUX_EV_QCS_XFER_DATA) {
 			const struct qcs_xfer_data_trace_arg *arg = a3;
-			chunk_appendf(&trace_buf, " prep=%lu xfer=%d",
-			              arg->prep, arg->xfer);
+			chunk_appendf(&trace_buf, " prep=%llu xfer=%d",
+			              (ull)arg->prep, arg->xfer);
 		}
 
 		if (mask & QMUX_EV_QCS_BUILD_STRM) {
 			const struct qcs_build_stream_trace_arg *arg = a3;
-			chunk_appendf(&trace_buf, " len=%lu fin=%d offset=%lu",
-			              arg->len, arg->fin, arg->offset);
+			chunk_appendf(&trace_buf, " len=%llu fin=%d offset=%llu",
+			              (ull)arg->len, arg->fin, (ull)arg->offset);
 		}
 	}
 }

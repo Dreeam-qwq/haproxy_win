@@ -79,6 +79,7 @@ ssize_t fd_write_frag_line(int fd, size_t maxlen, const struct ist pfx[], size_t
 void my_closefrom(int start);
 
 int compute_poll_timeout(int next);
+void fd_leaving_poll(int wait_time, int status);
 
 /* disable the specified poller */
 void disable_poller(const char *poller_name);
@@ -369,11 +370,15 @@ static inline unsigned int hap_fd_isset(int fd, unsigned int *evts)
 	return evts[fd / (8*sizeof(*evts))] & (1U << (fd & (8*sizeof(*evts) - 1)));
 }
 
-static inline void wake_thread(int tid)
+/* send a wake-up event to this thread, only if it's asleep and not notified yet */
+static inline void wake_thread(int thr)
 {
-	char c = 'c';
+	struct thread_ctx *ctx = &ha_thread_ctx[thr];
 
-	DISGUISE(write(poller_wr_pipe[tid], &c, 1));
+	if ((_HA_ATOMIC_FETCH_OR(&ctx->flags, TH_FL_NOTIFIED) & (TH_FL_SLEEPING|TH_FL_NOTIFIED)) == TH_FL_SLEEPING) {
+		char c = 'c';
+		DISGUISE(write(poller_wr_pipe[thr], &c, 1));
+	}
 }
 
 

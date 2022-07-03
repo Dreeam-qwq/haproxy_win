@@ -257,10 +257,8 @@ enum quic_pkt_type {
 
 /* Size of the internal buffer of QUIC TX ring buffers (must be a power of 2) */
 #define QUIC_TX_RING_BUFSZ  (1UL << 12)
-/* Size of the internal buffer of QUIC RX buffer. */
-#define QUIC_RX_BUFSZ  (1UL << 18)
 /* Size of the QUIC RX buffer for the connections */
-#define QUIC_CONN_RX_BUFSZ (1UL << 14)
+#define QUIC_CONN_RX_BUFSZ (1UL << 16)
 
 extern struct trace_source trace_quic;
 extern struct pool_head *pool_head_quic_tx_ring;
@@ -623,6 +621,7 @@ enum qc_mux_state {
 #define QUIC_FL_CONN_RETRANS_OLD_DATA            (1U << 8)
 #define QUIC_FL_CONN_TLS_ALERT                   (1U << 9)
 #define QUIC_FL_CONN_APP_ALERT                   (1U << 10) /* A connection error of type CONNECTION_CLOSE_APP must be emitted. */
+#define QUIC_FL_CONN_HALF_OPEN_CNT_DECREMENTED   (1U << 11) /* The half-open connection counter was decremented */
 #define QUIC_FL_CONN_NOTIFY_CLOSE                (1U << 27) /* MUX notified about quic-conn imminent closure (idle-timeout or CONNECTION_CLOSE emission/reception) */
 #define QUIC_FL_CONN_EXP_TIMER                   (1U << 28) /* timer has expired, quic-conn can be freed */
 #define QUIC_FL_CONN_CLOSING                     (1U << 29)

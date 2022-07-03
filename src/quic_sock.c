@@ -273,11 +273,13 @@ void quic_sock_fd_iocb(int fd)
 	struct sockaddr_storage saddr = {0};
 	size_t max_sz, cspace;
 	socklen_t saddrlen;
-	struct quic_dgram *dgram, *dgramp, *new_dgram;
+	struct quic_dgram *new_dgram;
 	unsigned char *dgram_buf;
+	int max_dgrams;
 
 	BUG_ON(!l);
 
+	new_dgram = NULL;
 	if (!l)
 		return;
 
@@ -290,18 +292,21 @@ void quic_sock_fd_iocb(int fd)
 
 	buf = &rxbuf->buf;
 
-	new_dgram = NULL;
-	/* Remove all consumed datagrams of this buffer */
-	list_for_each_entry_safe(dgram, dgramp, &rxbuf->dgrams, list) {
-		if (HA_ATOMIC_LOAD(&dgram->buf))
-			break;
+	max_dgrams = global.tune.maxpollevents;
+ start:
+	/* Try to reuse an existing dgram. Note that there is alway at
+	 * least one datagram to pick, except the first time we enter
+	 * this function for this <rxbuf> buffer.
+	 */
+	if (!LIST_ISEMPTY(&rxbuf->dgrams)) {
+		struct quic_dgram *dg =
+			LIST_ELEM(rxbuf->dgrams.n, struct quic_dgram *, list);
 
-		LIST_DELETE(&dgram->list);
-		b_del(buf, dgram->len);
-		if (!new_dgram)
-			new_dgram = dgram;
-		else
-			pool_free(pool_head_quic_dgram, dgram);
+		if (!dg->buf) {
+			LIST_DELETE(&dg->list);
+			b_del(buf, dg->len);
+			new_dgram = dg;
+		}
 	}
 
 	params = &l->bind_conf->quic_params;
@@ -309,6 +314,12 @@ void quic_sock_fd_iocb(int fd)
 	cspace = b_contig_space(buf);
 	if (cspace < max_sz) {
 		struct quic_dgram *dgram;
+
+		/* Do no mark <buf> as full, and do not try to consume it
+		 * if the contiguous remmaining space is not at the end
+		 */
+		if (b_tail(buf) + cspace < b_wrap(buf))
+			goto out;
 
 		/* Allocate a fake datagram, without data to locate
 		 * the end of the RX buffer (required during purging).
@@ -319,11 +330,11 @@ void quic_sock_fd_iocb(int fd)
 
 		dgram->len = cspace;
 		LIST_APPEND(&rxbuf->dgrams, &dgram->list);
+
 		/* Consume the remaining space */
 		b_add(buf, cspace);
 		if (b_contig_space(buf) < max_sz)
 			goto out;
-
 	}
 
 	dgram_buf = (unsigned char *)b_tail(buf);
@@ -343,7 +354,11 @@ void quic_sock_fd_iocb(int fd)
 		/* If wrong, consume this datagram */
 		b_del(buf, ret);
 	}
+	new_dgram = NULL;
+	if (--max_dgrams > 0)
+		goto start;
  out:
+	pool_free(pool_head_quic_dgram, new_dgram);
 	MT_LIST_APPEND(&l->rx.rxbuf_list, &rxbuf->mt_list);
 }
 

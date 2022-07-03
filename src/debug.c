@@ -47,10 +47,14 @@
 #include <import/ist.h>
 
 
-/* mask of threads still having to dump, used to respect ordering. Only used
- * when USE_THREAD_DUMP is set.
+/* The dump state is madee of:
+ *   - num_thread+1 on the lowest 16 bits
+ *   - a counter of done on the 16 high bits
+ * Initiating a dump consists in setting it to 1. A thread finished dumping
+ * adds 1<<16 and sets the lowest 15 bits to the ID of the next thread to
+ * dump + 1. Only used when USE_THREAD_DUMP is set.
  */
-volatile unsigned long threads_to_dump = 0;
+volatile unsigned int thread_dump_state = 0;
 unsigned int debug_commands_issued = 0;
 
 /* dumps a backtrace of the current thread that is appended to buffer <buf>.
@@ -154,13 +158,15 @@ void ha_backtrace_to_stderr(void)
  * The calling thread ID needs to be passed in <calling_tid> to display a star
  * in front of the calling thread's line (usually it's tid). Any stuck thread
  * is also prefixed with a '>'.
+ * It must be called under thread isolation.
  */
 void ha_thread_dump(struct buffer *buf, int thr, int calling_tid)
 {
-	unsigned long thr_bit = 1UL << thr;
+	unsigned long thr_bit = ha_thread_info[thr].ltid_bit;
 	unsigned long long p = ha_thread_ctx[thr].prev_cpu_time;
 	unsigned long long n = now_cpu_time_thread(thr);
 	int stuck = !!(ha_thread_ctx[thr].flags & TH_FL_STUCK);
+	int tgrp  = ha_thread_info[thr].tgid;
 
 	chunk_appendf(buf,
 	              "%c%cThread %-2u: id=0x%llx act=%d glob=%d wq=%d rq=%d tl=%d tlsz=%d rqsz=%d\n"
@@ -168,7 +174,7 @@ void ha_thread_dump(struct buffer *buf, int thr, int calling_tid)
 	              (thr == calling_tid) ? '*' : ' ', stuck ? '>' : ' ', thr + 1,
 		      ha_get_pthread_id(thr),
 		      thread_has_tasks(),
-	              !!(global_tasks_mask & thr_bit),
+	              !eb_is_empty(&ha_thread_ctx[thr].rqueue_shared),
 	              !eb_is_empty(&ha_thread_ctx[thr].timers),
 	              !eb_is_empty(&ha_thread_ctx[thr].rqueue),
 	              !(LIST_ISEMPTY(&ha_thread_ctx[thr].tasklets[TL_URGENT]) &&
@@ -177,13 +183,13 @@ void ha_thread_dump(struct buffer *buf, int thr, int calling_tid)
 			MT_LIST_ISEMPTY(&ha_thread_ctx[thr].shared_tasklet_list)),
 	              ha_thread_ctx[thr].tasks_in_list,
 	              ha_thread_ctx[thr].rq_total,
-		      ha_thread_info[thr].tg->tgid, ha_thread_info[thr].ltid + 1,
+		      ha_thread_info[thr].tgid, ha_thread_info[thr].ltid + 1,
 	              stuck,
 	              !!(th_ctx->flags & TH_FL_TASK_PROFILING));
 
 	chunk_appendf(buf,
 	              " harmless=%d wantrdv=%d",
-	              !!(threads_harmless_mask & thr_bit),
+	              !!(_HA_ATOMIC_LOAD(&ha_tgroup_ctx[tgrp-1].threads_harmless) & thr_bit),
 	              !!(th_ctx->flags & TH_FL_TASK_PROFILING));
 
 	chunk_appendf(buf, "\n");
@@ -868,24 +874,21 @@ static int debug_parse_cli_sched(char **args, char *payload, struct appctx *appc
 	char *endarg;
 	unsigned long long new;
 	unsigned long count = 0;
-	unsigned long thrid = 0;
+	unsigned long thrid = tid;
 	unsigned int inter = 0;
-	unsigned long mask, tmask;
 	unsigned long i;
 	int mode = 0; // 0 = tasklet; 1 = task
-	int single = 0;
 	unsigned long *tctx; // [0] = #tasks, [1] = inter, [2+] = { tl | (tsk+1) }
 
 	if (!cli_has_level(appctx, ACCESS_LVL_ADMIN))
 		return 1;
 
 	ptr = NULL; size = 0;
-	mask = all_threads_mask;
 
 	if (strcmp(args[3], "task") != 0 && strcmp(args[3], "tasklet") != 0) {
 		return cli_err(appctx,
 			       "Usage: debug dev sched {task|tasklet} { <obj> = <value> }*\n"
-			       "     <obj>   = {count | mask | inter | single }\n"
+			       "     <obj>   = {count | tid | inter }\n"
 			       "     <value> = 64-bit dec/hex integer (0x prefix supported)\n"
 			       );
 	}
@@ -900,14 +903,10 @@ static int debug_parse_cli_sched(char **args, char *payload, struct appctx *appc
 		name = ist2(word, end - word);
 		if (isteq(name, ist("count"))) {
 			ptr = &count; size = sizeof(count);
-		} else if (isteq(name, ist("mask"))) {
-			ptr = &mask; size = sizeof(mask);
 		} else if (isteq(name, ist("tid"))) {
 			ptr = &thrid; size = sizeof(thrid);
 		} else if (isteq(name, ist("inter"))) {
 			ptr = &inter; size = sizeof(inter);
-		} else if (isteq(name, ist("single"))) {
-			ptr = &single; size = sizeof(single);
 		} else
 			return cli_dynerr(appctx, memprintf(&msg, "Unsupported setting: '%s'.\n", word));
 
@@ -938,25 +937,10 @@ static int debug_parse_cli_sched(char **args, char *payload, struct appctx *appc
 	tctx[0] = (unsigned long)count;
 	tctx[1] = (unsigned long)inter;
 
-	mask &= all_threads_mask;
-	if (!mask)
-		mask = tid_bit;
+	if (thrid >= global.nbthread)
+		thrid = tid;
 
-	tmask = 0;
 	for (i = 0; i < count; i++) {
-		if (single || mode == 0) {
-			/* look for next bit matching a bit in mask or loop back to zero */
-			for (tmask <<= 1; !(mask & tmask); ) {
-				if (!(mask & -tmask))
-					tmask = 1;
-				else
-					tmask <<= 1;
-			}
-		} else {
-			/* multi-threaded task */
-			tmask = mask;
-		}
-
 		/* now, if poly or mask was set, tmask corresponds to the
 		 * valid thread mask to use, otherwise it remains zero.
 		 */
@@ -967,13 +951,12 @@ static int debug_parse_cli_sched(char **args, char *payload, struct appctx *appc
 			if (!tl)
 				goto fail;
 
-			if (tmask)
-				tl->tid = my_ffsl(tmask) - 1;
+			tl->tid = thrid;
 			tl->process = debug_tasklet_handler;
 			tl->context = tctx;
 			tctx[i + 2] = (unsigned long)tl;
 		} else {
-			struct task *task = task_new(tmask ? tmask : tid_bit);
+			struct task *task = task_new_on(thrid);
 
 			if (!task)
 				goto fail;
@@ -1269,6 +1252,8 @@ static int debug_iohandler_memstats(struct appctx *appctx)
 		case MEM_STATS_TYPE_MALLOC:  type = "MALLOC";  break;
 		case MEM_STATS_TYPE_REALLOC: type = "REALLOC"; break;
 		case MEM_STATS_TYPE_STRDUP:  type = "STRDUP";  break;
+		case MEM_STATS_TYPE_P_ALLOC: type = "P_ALLOC"; break;
+		case MEM_STATS_TYPE_P_FREE:  type = "P_FREE";  break;
 		default:                     type = "UNSET";   break;
 		}
 
@@ -1323,13 +1308,14 @@ static unsigned int thread_dump_tid;
  */
 struct buffer *thread_dump_buffer = NULL;
 
+/* initiates a thread dump */
 void ha_thread_dump_all_to_trash()
 {
-	unsigned long old;
+	unsigned int old;
 
 	while (1) {
 		old = 0;
-		if (HA_ATOMIC_CAS(&threads_to_dump, &old, all_threads_mask))
+		if (HA_ATOMIC_CAS(&thread_dump_state, &old, 1))
 			break;
 		ha_thread_relax();
 	}
@@ -1342,10 +1328,14 @@ void ha_thread_dump_all_to_trash()
 /* handles DEBUGSIG to dump the state of the thread it's working on */
 void debug_handler(int sig, siginfo_t *si, void *arg)
 {
+	int harmless = is_thread_harmless();
+	uint next;
+	uint done;
+
 	/* first, let's check it's really for us and that we didn't just get
 	 * a spurious DEBUGSIG.
 	 */
-	if (!(threads_to_dump & tid_bit))
+	if (!_HA_ATOMIC_LOAD(&thread_dump_state))
 		return;
 
 	/* There are 4 phases in the dump process:
@@ -1357,36 +1347,61 @@ void debug_handler(int sig, siginfo_t *si, void *arg)
 	 */
 
 	/* wait for all previous threads to finish first */
-	while (threads_to_dump & (tid_bit - 1))
+	if (!harmless)
+		thread_harmless_now();
+
+	while ((_HA_ATOMIC_LOAD(&thread_dump_state) & 0xFFFF) < (tid + 1))
 		ha_thread_relax();
+
+	if (!harmless)
+		thread_harmless_end();
 
 	/* dump if needed */
-	if (threads_to_dump & tid_bit) {
-		if (thread_dump_buffer)
-			ha_thread_dump(thread_dump_buffer, tid, thread_dump_tid);
-		if ((threads_to_dump & all_threads_mask) == tid_bit) {
-			/* last one */
-			HA_ATOMIC_STORE(&threads_to_dump, all_threads_mask);
-			thread_dump_buffer = NULL;
+	if (thread_dump_buffer)
+		ha_thread_dump(thread_dump_buffer, tid, thread_dump_tid);
+
+	/* figure which is the next thread ID to dump among enabled ones */
+	for (next = tid + 1; next < global.nbthread; next++) {
+		if (unlikely(next >= MAX_THREADS)) {
+			/* just to please gcc 6.5 who guesses the ranges wrong. */
+			continue;
 		}
-		else
-			HA_ATOMIC_AND(&threads_to_dump, ~tid_bit);
+
+		if (ha_thread_info[next].tg &&
+		    ha_thread_info[next].tg->threads_enabled & ha_thread_info[next].ltid_bit)
+			break;
 	}
 
-	/* now wait for all others to finish dumping. The last one will set all
-	 * bits again to broadcast the leaving condition so we'll see ourselves
-	 * present again. This way the threads_to_dump variable never passes to
-	 * zero until all visitors have stopped waiting.
+	/* atomically set the next to next+1 or 0, and increment the done counter */
+	done = (HA_ATOMIC_LOAD(&thread_dump_state) >> 16) + 1;
+	done <<= 16;
+	if (next < global.nbthread)
+		done += next + 1;
+	else
+		thread_dump_buffer = NULL; // was the last one
+
+	HA_ATOMIC_STORE(&thread_dump_state, done);
+
+	/* now wait for all others to finish dumping: the lowest part will turn
+	 * to zero. Then all others decrement the done part.
 	 */
-	while (!(threads_to_dump & tid_bit))
+	if (!harmless)
+		thread_harmless_now();
+
+	while ((_HA_ATOMIC_LOAD(&thread_dump_state) & 0xFFFF) != 0)
 		ha_thread_relax();
-	HA_ATOMIC_AND(&threads_to_dump, ~tid_bit);
+
+	if (!harmless)
+		thread_harmless_end();
+
+	HA_ATOMIC_SUB(&thread_dump_state, 0x10000);
 
 	/* mark the current thread as stuck to detect it upon next invocation
 	 * if it didn't move.
 	 */
-	if (!((threads_harmless_mask|sleeping_thread_mask) & tid_bit))
-		th_ctx->flags |= TH_FL_STUCK;
+	if (!harmless &&
+	    !(_HA_ATOMIC_LOAD(&th_ctx->flags) & TH_FL_SLEEPING))
+		_HA_ATOMIC_OR(&th_ctx->flags, TH_FL_STUCK);
 }
 
 static int init_debug_per_thread()

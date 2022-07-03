@@ -25,7 +25,6 @@
 
 #include <sys/time.h>
 
-#include <import/eb32sctree.h>
 #include <import/eb32tree.h>
 
 #include <haproxy/activity.h>
@@ -89,8 +88,6 @@
 
 
 /* a few exported variables */
-extern volatile unsigned long global_tasks_mask; /* Mask of threads with tasks in the global runqueue */
-extern unsigned int grq_total;    /* total number of entries in the global run queue, atomic */
 extern unsigned int niced_tasks;  /* number of niced tasks in the run queue */
 
 extern struct pool_head *pool_head_task;
@@ -99,13 +96,12 @@ extern struct pool_head *pool_head_notification;
 
 #ifdef USE_THREAD
 extern struct eb_root timers;      /* sorted timers tree, global */
-extern struct eb_root rqueue;      /* tree constituting the run queue */
 #endif
 
-__decl_thread(extern HA_SPINLOCK_T rq_lock);  /* spin lock related to run queue */
 __decl_thread(extern HA_RWLOCK_T wq_lock);    /* RW lock related to the wait queue */
 
 void __tasklet_wakeup_on(struct tasklet *tl, int thr);
+struct list *__tasklet_wakeup_after(struct list *head, struct tasklet *tl);
 void task_kill(struct task *t);
 void tasklet_kill(struct tasklet *t);
 void __task_wakeup(struct task *t);
@@ -148,9 +144,6 @@ static inline int total_run_queues()
 {
 	int thr, ret = 0;
 
-#ifdef USE_THREAD
-	ret = _HA_ATOMIC_LOAD(&grq_total);
-#endif
 	for (thr = 0; thr < global.nbthread; thr++)
 		ret += _HA_ATOMIC_LOAD(&ha_thread_ctx[thr].rq_total);
 	return ret;
@@ -187,8 +180,8 @@ static inline int task_in_wq(struct task *t)
 /* returns true if the current thread has some work to do */
 static inline int thread_has_tasks(void)
 {
-	return ((int)!!(global_tasks_mask & tid_bit) |
-		(int)!eb_is_empty(&th_ctx->rqueue) |
+	return ((int)!eb_is_empty(&th_ctx->rqueue) |
+	        (int)!eb_is_empty(&th_ctx->rqueue_shared) |
 	        (int)!!th_ctx->tl_class_mask |
 		(int)!MT_LIST_ISEMPTY(&th_ctx->shared_tasklet_list));
 }
@@ -277,8 +270,8 @@ static inline struct task *task_unlink_wq(struct task *t)
 	unsigned long locked;
 
 	if (likely(task_in_wq(t))) {
-		locked = t->state & TASK_SHARED_WQ;
-		BUG_ON(!locked && t->thread_mask != tid_bit);
+		locked = t->tid < 0;
+		BUG_ON(t->tid >= 0 && t->tid != tid);
 		if (locked)
 			HA_RWLOCK_WRLOCK(TASK_WQ_LOCK, &wq_lock);
 		__task_unlink_wq(t);
@@ -309,7 +302,7 @@ static inline void task_queue(struct task *task)
 		return;
 
 #ifdef USE_THREAD
-	if (task->state & TASK_SHARED_WQ) {
+	if (task->tid < 0) {
 		HA_RWLOCK_WRLOCK(TASK_WQ_LOCK, &wq_lock);
 		if (!task_in_wq(task) || tick_is_lt(task->expire, task->wq.key))
 			__task_queue(task, &timers);
@@ -317,63 +310,36 @@ static inline void task_queue(struct task *task)
 	} else
 #endif
 	{
-		BUG_ON(task->thread_mask != tid_bit); // should have TASK_SHARED_WQ
+		BUG_ON(task->tid != tid);
 		if (!task_in_wq(task) || tick_is_lt(task->expire, task->wq.key))
 			__task_queue(task, &th_ctx->timers);
 	}
 }
 
-/* change the thread affinity of a task to <thread_mask>.
+/* Change the thread affinity of a task to <thr>, which may either be a valid
+ * thread number from 0 to nbthread-1, or a negative value to allow the task
+ * to run on any thread.
+ *
  * This may only be done from within the running task itself or during its
  * initialization. It will unqueue and requeue the task from the wait queue
  * if it was in it. This is safe against a concurrent task_queue() call because
  * task_queue() itself will unlink again if needed after taking into account
  * the new thread_mask.
  */
-static inline void task_set_affinity(struct task *t, unsigned long thread_mask)
+static inline void task_set_thread(struct task *t, int thr)
 {
+#ifndef USE_THREAD
+	/* no shared queue without threads */
+	thr = 0;
+#endif
 	if (unlikely(task_in_wq(t))) {
 		task_unlink_wq(t);
-		t->thread_mask = thread_mask;
+		t->tid = thr;
 		task_queue(t);
 	}
-	else
-		t->thread_mask = thread_mask;
-}
-
-/*
- * Unlink the task <t> from the run queue if it's in it. The run queue size and
- * number of niced tasks are updated too. A pointer to the task itself is
- * returned. If the task is in the global run queue, the global run queue's
- * lock will be used during the operation.
- */
-static inline struct task *task_unlink_rq(struct task *t)
-{
-	int is_global = t->state & TASK_GLOBAL;
-	int done = 0;
-
-	if (is_global)
-		HA_SPIN_LOCK(TASK_RQ_LOCK, &rq_lock);
-
-	if (likely(task_in_rq(t))) {
-		eb32sc_delete(&t->rq);
-		done = 1;
+	else {
+		t->tid = thr;
 	}
-
-	if (is_global)
-		HA_SPIN_UNLOCK(TASK_RQ_LOCK, &rq_lock);
-
-	if (done) {
-		if (is_global) {
-			_HA_ATOMIC_AND(&t->state, ~TASK_GLOBAL);
-			_HA_ATOMIC_DEC(&grq_total);
-		}
-		else
-			_HA_ATOMIC_DEC(&th_ctx->rq_total);
-		if (t->nice)
-			_HA_ATOMIC_DEC(&niced_tasks);
-	}
-	return t;
 }
 
 /* schedules tasklet <tl> to run onto thread <thr> or the current thread if
@@ -401,7 +367,7 @@ static inline void _tasklet_wakeup_on(struct tasklet *tl, int thr, const char *f
 	tl->debug.caller_idx = !tl->debug.caller_idx;
 	tl->debug.caller_file[tl->debug.caller_idx] = file;
 	tl->debug.caller_line[tl->debug.caller_idx] = line;
-	if (th_ctx->flags & TH_FL_TASK_PROFILING)
+	if (_HA_ATOMIC_LOAD(&th_ctx->flags) & TH_FL_TASK_PROFILING)
 		tl->call_date = now_mono_time();
 #endif
 	__tasklet_wakeup_on(tl, thr);
@@ -427,8 +393,11 @@ static inline void _tasklet_wakeup_on(struct tasklet *tl, int thr, const char *f
 static inline void _task_instant_wakeup(struct task *t, unsigned int f, const char *file, int line)
 {
 	struct tasklet *tl = (struct tasklet *)t;
-	int thr = my_ffsl(t->thread_mask) - 1;
+	int thr = t->tid;
 	unsigned int state;
+
+	if (thr < 0)
+		thr = tid;
 
 	/* first, let's update the task's state with the wakeup condition */
 	state = _HA_ATOMIC_OR_FETCH(&tl->state, f);
@@ -452,10 +421,44 @@ static inline void _task_instant_wakeup(struct task *t, unsigned int f, const ch
 	tl->debug.caller_idx = !tl->debug.caller_idx;
 	tl->debug.caller_file[tl->debug.caller_idx] = file;
 	tl->debug.caller_line[tl->debug.caller_idx] = line;
-	if (th_ctx->flags & TH_FL_TASK_PROFILING)
+	if (_HA_ATOMIC_LOAD(&th_ctx->flags) & TH_FL_TASK_PROFILING)
 		tl->call_date = now_mono_time();
 #endif
 	__tasklet_wakeup_on(tl, thr);
+}
+
+/* schedules tasklet <tl> to run immediately after the current one is done
+ * <tl> will be queued after entry <head>, or at the head of the task list. Return
+ * the new head to be used to queue future tasks. This is used to insert multiple entries
+ * at the head of the tasklet list, typically to transfer processing from a tasklet
+ * to another one or a set of other ones. If <head> is NULL, the tasklet list of <thr>
+ * thread will be used.
+ * With DEBUG_TASK, the <file>:<line> from the call place are stored into the tasklet
+ * for tracing purposes.
+ */
+#define tasklet_wakeup_after(head, tl) _tasklet_wakeup_after(head, tl, __FILE__, __LINE__)
+static inline struct list *_tasklet_wakeup_after(struct list *head, struct tasklet *tl,
+                                                 const char *file, int line)
+{
+	unsigned int state = tl->state;
+
+	do {
+		/* do nothing if someone else already added it */
+		if (state & TASK_IN_LIST)
+			return head;
+	} while (!_HA_ATOMIC_CAS(&tl->state, &state, state | TASK_IN_LIST));
+
+	/* at this point we're the first one to add this task to the list */
+#ifdef DEBUG_TASK
+	if ((unsigned int)tl->debug.caller_idx > 1)
+		ABORT_NOW();
+	tl->debug.caller_idx = !tl->debug.caller_idx;
+	tl->debug.caller_file[tl->debug.caller_idx] = file;
+	tl->debug.caller_line[tl->debug.caller_idx] = line;
+	if (th_ctx->flags & TH_FL_TASK_PROFILING)
+		tl->call_date = now_mono_time();
+#endif
+	return __tasklet_wakeup_after(head, tl);
 }
 
 /* This macro shows the current function name and the last known caller of the
@@ -489,17 +492,18 @@ static inline void tasklet_remove_from_tasklet_list(struct tasklet *t)
 /*
  * Initialize a new task. The bare minimum is performed (queue pointers and
  * state).  The task is returned. This function should not be used outside of
- * task_new(). If the thread mask contains more than one thread, TASK_SHARED_WQ
- * is set.
+ * task_new(). If the thread ID is < 0, the task may run on any thread.
  */
-static inline struct task *task_init(struct task *t, unsigned long thread_mask)
+static inline struct task *task_init(struct task *t, int tid)
 {
 	t->wq.node.leaf_p = NULL;
 	t->rq.node.leaf_p = NULL;
 	t->state = TASK_SLEEPING;
-	t->thread_mask = thread_mask;
-	if (atleast2(thread_mask))
-		t->state |= TASK_SHARED_WQ;
+#ifndef USE_THREAD
+	/* no shared wq without threads */
+	tid = 0;
+#endif
+	t->tid = tid;
 	t->nice = 0;
 	t->calls = 0;
 	t->call_date = 0;
@@ -542,29 +546,20 @@ static inline struct tasklet *tasklet_new(void)
 }
 
 /*
- * Allocate and initialise a new task. The new task is returned, or NULL in
- * case of lack of memory. The task count is incremented. This API might change
- * in the near future, so prefer one of the task_new_*() wrappers below which
- * are usually more suitable. Tasks must be freed using task_free().
+ * Allocate and initialize a new task, to run on global thread <thr>, or any
+ * thread if negative. The task count is incremented. The new task is returned,
+ * or NULL in case of lack of memory. It's up to the caller to pass a valid
+ * thread number (in tid space, 0 to nbthread-1, or <0 for any). Tasks created
+ * this way must be freed using task_destroy().
  */
-static inline struct task *task_new(unsigned long thread_mask)
+static inline struct task *task_new_on(int thr)
 {
 	struct task *t = pool_alloc(pool_head_task);
 	if (t) {
 		th_ctx->nb_tasks++;
-		task_init(t, thread_mask);
+		task_init(t, thr);
 	}
 	return t;
-}
-
-/* Allocate and initialize a new task, to run on global thread <thr>. The new
- * task is returned, or NULL in case of lack of memory. It's up to the caller
- * to pass a valid thread number (in tid space, 0 to nbthread-1). The task
- * count is incremented.
- */
-static inline struct task *task_new_on(uint thr)
-{
-	return task_new(1UL << thr);
 }
 
 /* Allocate and initialize a new task, to run on the calling thread. The new
@@ -573,7 +568,7 @@ static inline struct task *task_new_on(uint thr)
  */
 static inline struct task *task_new_here()
 {
-	return task_new(tid_bit);
+	return task_new_on(tid);
 }
 
 /* Allocate and initialize a new task, to run on any thread. The new task is
@@ -581,7 +576,7 @@ static inline struct task *task_new_here()
  */
 static inline struct task *task_new_anywhere()
 {
-	return task_new(all_threads_mask);
+	return task_new_on(-1);
 }
 
 /*
@@ -669,7 +664,7 @@ static inline void task_schedule(struct task *task, int when)
 		return;
 
 #ifdef USE_THREAD
-	if (task->state & TASK_SHARED_WQ) {
+	if (task->tid < 0) {
 		/* FIXME: is it really needed to lock the WQ during the check ? */
 		HA_RWLOCK_WRLOCK(TASK_WQ_LOCK, &wq_lock);
 		if (task_in_wq(task))
@@ -682,7 +677,7 @@ static inline void task_schedule(struct task *task, int when)
 	} else
 #endif
 	{
-		BUG_ON((task->thread_mask & tid_bit) == 0); // should have TASK_SHARED_WQ
+		BUG_ON(task->tid != tid);
 		if (task_in_wq(task))
 			when = tick_first(when, task->expire);
 

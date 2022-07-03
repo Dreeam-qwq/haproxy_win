@@ -505,11 +505,6 @@ __LJMP const char *hlua_traceback(lua_State *L, const char* sep)
 	struct buffer *msg = get_trash_chunk();
 
 	while (lua_getstack(L, level++, &ar)) {
-
-		/* Add separator */
-		if (b_data(msg))
-			chunk_appendf(msg, "%s", sep);
-
 		/* Fill fields:
 		 * 'S': fills in the fields source, short_src, linedefined, lastlinedefined, and what;
 		 * 'l': fills in the field currentline;
@@ -517,6 +512,14 @@ __LJMP const char *hlua_traceback(lua_State *L, const char* sep)
 		 * 't': fills in the field istailcall;
 		 */
 		lua_getinfo(L, "Slnt", &ar);
+
+		/* skip these empty entries, usually they come from deep C functions */
+		if (ar.currentline < 0 && *ar.what == 'C' && !*ar.namewhat && !ar.name)
+			continue;
+
+		/* Add separator */
+		if (b_data(msg))
+			chunk_appendf(msg, "%s", sep);
 
 		/* Append code localisation */
 		if (ar.currentline > 0)
@@ -1119,6 +1122,31 @@ static inline void hlua_sethlua(struct hlua *hlua)
 {
 	struct hlua **hlua_store = lua_getextraspace(hlua->T);
 	*hlua_store = hlua;
+}
+
+/* Will return a non-NULL string indicating the Lua call trace if the caller
+ * currently is executing from within a Lua function. One line per entry will
+ * be emitted, and each extra line will be prefixed with <pfx>. If a current
+ * Lua function is not detected, NULL is returned.
+ */
+const char *hlua_show_current_location(const char *pfx)
+{
+	lua_State *L;
+	lua_Debug ar;
+
+	/* global or per-thread stack initializing ? */
+	if (hlua_state_id != -1 && (L = hlua_states[hlua_state_id]) && lua_getstack(L, 0, &ar))
+		return hlua_traceback(L, pfx);
+
+	/* per-thread stack running ? */
+	if (hlua_states[tid + 1] && (L = hlua_states[tid + 1]) && lua_getstack(L, 0, &ar))
+		return hlua_traceback(L, pfx);
+
+	/* global stack running ? */
+	if (hlua_states[0] && (L = hlua_states[0]) && lua_getstack(L, 0, &ar))
+		return hlua_traceback(L, pfx);
+
+	return NULL;
 }
 
 /* This function is used to send logs. It try to send on screen (stderr)
@@ -8434,8 +8462,8 @@ struct task *hlua_process_task(struct task *task, void *context, unsigned int st
 	struct hlua *hlua = context;
 	enum hlua_exec status;
 
-	if (atleast2(task->thread_mask))
-		task_set_affinity(task, tid_bit);
+	if (task->tid < 0)
+		task->tid = tid;
 
 	/* If it is the first call to the task, we must initialize the
 	 * execution timeouts.

@@ -3156,6 +3156,60 @@ void mask_prep_rank_map(unsigned long m,
 	*d = (*c + (*c >> 8)) & ~0UL/0x101;
 }
 
+/* Returns the position of one bit set in <v>, starting at position <bit>, and
+ * searching in other halves if not found. This is intended to be used to
+ * report the position of one bit set among several based on a counter or a
+ * random generator while preserving a relatively good distribution so that
+ * values made of holes in the middle do not see one of the bits around the
+ * hole being returned much more often than the other one. It can be seen as a
+ * disturbed ffsl() where the initial search starts at bit <bit>. The look up
+ * is performed in O(logN) time for N bit words, yielding a bit among 64 in
+ * about 16 cycles. Its usage differs from the rank find function in that the
+ * bit passed doesn't need to be limited to the value's popcount, making the
+ * function easier to use for random picking, and twice as fast. Passing value
+ * 0 for <v> makes no sense and -1 is returned in this case.
+ */
+int one_among_mask(unsigned long v, int bit)
+{
+	/* note, these masks may be produced by ~0UL/((1UL<<scale)+1) but
+	 * that's more expensive.
+	 */
+	static const unsigned long halves[] = {
+		(unsigned long)0x5555555555555555ULL,
+		(unsigned long)0x3333333333333333ULL,
+		(unsigned long)0x0F0F0F0F0F0F0F0FULL,
+		(unsigned long)0x00FF00FF00FF00FFULL,
+		(unsigned long)0x0000FFFF0000FFFFULL,
+		(unsigned long)0x00000000FFFFFFFFULL
+	};
+	unsigned long halfword = ~0UL;
+	int scope = 0;
+	int mirror;
+	int scale;
+
+	if (!v)
+		return -1;
+
+	/* we check if the exact bit is set or if it's present in a mirror
+	 * position based on the current scale we're checking, in which case
+	 * it's returned with its current (or mirrored) value. Otherwise we'll
+	 * make sure there's at least one bit in the half we're in, and will
+	 * scale down to a smaller scope and try again, until we find the
+	 * closest bit.
+	 */
+	for (scale = (sizeof(long) > 4) ? 5 : 4; scale >= 0; scale--) {
+		halfword >>= (1UL << scale);
+		scope |= (1UL << scale);
+		mirror = bit ^ (1UL << scale);
+		if (v & ((1UL << bit) | (1UL << mirror)))
+			return (v & (1UL << bit)) ? bit : mirror;
+
+		if (!((v >> (bit & scope)) & halves[scale] & halfword))
+			bit = mirror;
+	}
+	return bit;
+}
+
 /* Return non-zero if IPv4 address is part of the network,
  * otherwise zero. Note that <addr> may not necessarily be aligned
  * while the two other ones must.
@@ -5801,6 +5855,79 @@ int openssl_compare_current_name(const char *name)
 #endif
 	return 1;
 }
+
+#if defined(RTLD_DEFAULT) || defined(RTLD_NEXT)
+/* redefine dlopen() so that we can detect unexpected replacement of some
+ * critical symbols, typically init/alloc/free functions coming from alternate
+ * libraries. When called, a tainted flag is set (TAINTED_SHARED_LIBS).
+ */
+void *dlopen(const char *filename, int flags)
+{
+	static void *(*_dlopen)(const char *filename, int flags);
+	struct {
+		const char *name;
+		void *curr, *next;
+	} check_syms[] = {
+		{ .name = "malloc", },
+		{ .name = "free", },
+		{ .name = "SSL_library_init", },
+		{ .name = "X509_free", },
+		/* insert only above, 0 must be the last one */
+		{ 0 },
+	};
+	const char *trace;
+	void *addr;
+	void *ret;
+	int sym = 0;
+
+	if (!_dlopen) {
+		_dlopen = get_sym_next_addr("dlopen");
+		if (!_dlopen || _dlopen == dlopen) {
+			_dlopen = NULL;
+			return NULL;
+		}
+	}
+
+	/* save a few pointers to critical symbols. We keep a copy of both the
+	 * current and the next value, because we might already have replaced
+	 * some of them (e.g. malloc/free with DEBUG_MEM_STATS), and we're only
+	 * interested in verifying that a loaded library doesn't come with a
+	 * completely different definition that would be incompatible.
+	 */
+	for (sym = 0; check_syms[sym].name; sym++) {
+		check_syms[sym].curr = get_sym_curr_addr(check_syms[sym].name);
+		check_syms[sym].next = get_sym_next_addr(check_syms[sym].name);
+	}
+
+	/* now open the requested lib */
+	ret = _dlopen(filename, flags);
+	if (!ret)
+		return ret;
+
+	mark_tainted(TAINTED_SHARED_LIBS);
+
+	/* and check that critical symbols didn't change */
+	for (sym = 0; check_syms[sym].name; sym++) {
+		if (!check_syms[sym].curr && !check_syms[sym].next)
+			continue;
+
+		addr = dlsym(ret, check_syms[sym].name);
+		if (!addr || addr == check_syms[sym].curr || addr == check_syms[sym].next)
+			continue;
+
+		/* OK it's clear that this symbol was redefined */
+		mark_tainted(TAINTED_REDEFINITION);
+
+		trace = hlua_show_current_location("\n    ");
+		ha_warning("dlopen(): shared library '%s' brings a different definition of symbol '%s'. The process cannot be trusted anymore!%s%s\n",
+		           filename, check_syms[sym].name,
+		           trace ? " Suspected call location: \n    " : "",
+		           trace ? trace : "");
+	}
+
+	return ret;
+}
+#endif
 
 static int init_tools_per_thread()
 {

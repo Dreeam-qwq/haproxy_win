@@ -383,7 +383,7 @@ void activity_count_runtime(uint32_t run_time)
 	 * profiling to "on" when automatic, and going back below the "down"
 	 * threshold switches to off. The forced modes don't check the load.
 	 */
-	if (!(th_ctx->flags & TH_FL_TASK_PROFILING)) {
+	if (!(_HA_ATOMIC_LOAD(&th_ctx->flags) & TH_FL_TASK_PROFILING)) {
 		if (unlikely((profiling & HA_PROF_TASKS_MASK) == HA_PROF_TASKS_ON ||
 		             ((profiling & HA_PROF_TASKS_MASK) == HA_PROF_TASKS_AON &&
 		             swrate_avg(run_time, TIME_STATS_SAMPLES) >= up)))
@@ -845,7 +845,7 @@ static int cli_io_handler_show_tasks(struct appctx *appctx)
 	const struct tasklet *tl;
 	const struct task *t;
 	uint64_t now_ns, lat;
-	struct eb32sc_node *rqnode;
+	struct eb32_node *rqnode;
 	uint64_t tot_calls;
 	int thr, queue;
 	int i, max;
@@ -873,25 +873,11 @@ static int cli_io_handler_show_tasks(struct appctx *appctx)
 	/* 1. global run queue */
 
 #ifdef USE_THREAD
-	rqnode = eb32sc_first(&rqueue, ~0UL);
-	while (rqnode) {
-		t = eb32sc_entry(rqnode, struct task, rq);
-		entry = sched_activity_entry(tmp_activity, t->process);
-		if (t->call_date) {
-			lat = now_ns - t->call_date;
-			if ((int64_t)lat > 0)
-				entry->lat_time += lat;
-		}
-		entry->calls++;
-		rqnode = eb32sc_next(rqnode, ~0UL);
-	}
-#endif
-	/* 2. all threads's local run queues */
 	for (thr = 0; thr < global.nbthread; thr++) {
 		/* task run queue */
-		rqnode = eb32sc_first(&ha_thread_ctx[thr].rqueue, ~0UL);
+		rqnode = eb32_first(&ha_thread_ctx[thr].rqueue_shared);
 		while (rqnode) {
-			t = eb32sc_entry(rqnode, struct task, rq);
+			t = eb32_entry(rqnode, struct task, rq);
 			entry = sched_activity_entry(tmp_activity, t->process);
 			if (t->call_date) {
 				lat = now_ns - t->call_date;
@@ -899,7 +885,24 @@ static int cli_io_handler_show_tasks(struct appctx *appctx)
 					entry->lat_time += lat;
 			}
 			entry->calls++;
-			rqnode = eb32sc_next(rqnode, ~0UL);
+			rqnode = eb32_next(rqnode);
+		}
+	}
+#endif
+	/* 2. all threads's local run queues */
+	for (thr = 0; thr < global.nbthread; thr++) {
+		/* task run queue */
+		rqnode = eb32_first(&ha_thread_ctx[thr].rqueue);
+		while (rqnode) {
+			t = eb32_entry(rqnode, struct task, rq);
+			entry = sched_activity_entry(tmp_activity, t->process);
+			if (t->call_date) {
+				lat = now_ns - t->call_date;
+				if ((int64_t)lat > 0)
+					entry->lat_time += lat;
+			}
+			entry->calls++;
+			rqnode = eb32_next(rqnode);
 		}
 
 		/* shared tasklet list */

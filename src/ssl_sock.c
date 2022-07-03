@@ -137,9 +137,9 @@ struct global_ssl global_ssl = {
 
 static BIO_METHOD *ha_meth;
 
-DECLARE_STATIC_POOL(ssl_sock_ctx_pool, "ssl_sock_ctx_pool", sizeof(struct ssl_sock_ctx));
+DECLARE_STATIC_POOL(ssl_sock_ctx_pool, "ssl_sock_ctx", sizeof(struct ssl_sock_ctx));
 
-DECLARE_STATIC_POOL(ssl_sock_client_sni_pool, "ssl_sock_client_sni_pool", TLSEXT_MAXLEN_host_name + 1);
+DECLARE_STATIC_POOL(ssl_sock_client_sni_pool, "ssl_sock_client_sni", TLSEXT_MAXLEN_host_name + 1);
 
 /* ssl stats module */
 enum {
@@ -776,8 +776,14 @@ void ssl_async_fd_free(int fd)
 	}
 
 	SSL_get_all_async_fds(ssl, all_fd, &num_all_fds);
-	for (i=0 ; i < num_all_fds ; i++)
-		fd_stop_both(all_fd[i]);
+	for (i=0 ; i < num_all_fds ; i++) {
+		/* We want to remove the fd from the fdtab
+		 * but we flag it to disown because the
+		 * close is performed by the engine itself
+		 */
+		fdtab[all_fd[i]].state |= FD_DISOWN;
+		fd_delete(all_fd[i]);
+	}
 
 	/* Now we can safely call SSL_free, no more pending job in engines */
 	SSL_free(ssl);
@@ -807,8 +813,14 @@ static inline void ssl_async_process_fds(struct ssl_sock_ctx *ctx)
 	SSL_get_changed_async_fds(ssl, add_fd, &num_add_fds, del_fd, &num_del_fds);
 
 	/* We remove unused fds from the fdtab */
-	for (i=0 ; i < num_del_fds ; i++)
-		fd_stop_both(del_fd[i]);
+	for (i=0 ; i < num_del_fds ; i++) {
+		/* We want to remove the fd from the fdtab
+		 * but we flag it to disown because the
+		 * close is performed by the engine itself
+		 */
+		fdtab[del_fd[i]].state |= FD_DISOWN;
+		fd_delete(del_fd[i]);
+	}
 
 	/* We add new fds to the fdtab */
 	for (i=0 ; i < num_add_fds ; i++) {
@@ -6796,8 +6808,14 @@ void ssl_sock_close(struct connection *conn, void *xprt_ctx) {
 			 * because the fd is  owned by the engine.
 			 * the engine is responsible to close
 			 */
-			for (i=0 ; i < num_all_fds ; i++)
-				fd_stop_both(all_fd[i]);
+			for (i=0 ; i < num_all_fds ; i++) {
+				/* We want to remove the fd from the fdtab
+				 * but we flag it to disown because the
+				 * close is performed by the engine itself
+				 */
+				fdtab[all_fd[i]].state |= FD_DISOWN;
+				fd_delete(all_fd[i]);
+			}
 		}
 #endif
 		SSL_free(ctx->ssl);

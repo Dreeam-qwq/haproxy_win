@@ -55,16 +55,18 @@ THREAD_LOCAL const struct tgroup_info *tg = &ha_tgroup_info[0];
 struct thread_info ha_thread_info[MAX_THREADS] = { };
 THREAD_LOCAL const struct thread_info *ti = &ha_thread_info[0];
 
+struct tgroup_ctx ha_tgroup_ctx[MAX_TGROUPS] = { };
+THREAD_LOCAL struct tgroup_ctx *tg_ctx = &ha_tgroup_ctx[0];
+
 struct thread_ctx ha_thread_ctx[MAX_THREADS] = { };
 THREAD_LOCAL struct thread_ctx *th_ctx = &ha_thread_ctx[0];
 
 #ifdef USE_THREAD
 
-volatile unsigned long threads_want_rdv_mask __read_mostly = 0;
-volatile unsigned long threads_harmless_mask = 0;
-volatile unsigned long threads_idle_mask = 0;
-volatile unsigned long threads_sync_mask = 0;
 volatile unsigned long all_threads_mask __read_mostly  = 1; // nbthread 1 assumed by default
+volatile unsigned long all_tgroups_mask __read_mostly  = 1; // nbtgroup 1 assumed by default
+volatile unsigned int rdv_requests       = 0;  // total number of threads requesting RDV
+volatile unsigned int isolated_thread    = ~0; // ID of the isolated thread, or ~0 when none
 THREAD_LOCAL unsigned int  tgid          = 1; // thread ID starts at 1
 THREAD_LOCAL unsigned int  tid           = 0;
 THREAD_LOCAL unsigned long tid_bit       = (1UL << 0);
@@ -72,15 +74,14 @@ int thread_cpus_enabled_at_boot          = 1;
 static pthread_t ha_pthread[MAX_THREADS] = { };
 
 /* Marks the thread as harmless until the last thread using the rendez-vous
- * point quits, excluding the current one. Thus an isolated thread may be safely
- * marked as harmless. Given that we can wait for a long time, sched_yield() is
+ * point quits. Given that we can wait for a long time, sched_yield() is
  * used when available to offer the CPU resources to competing threads if
  * needed.
  */
 void thread_harmless_till_end()
 {
-	_HA_ATOMIC_OR(&threads_harmless_mask, tid_bit);
-	while (threads_want_rdv_mask & all_threads_mask & ~tid_bit) {
+	_HA_ATOMIC_OR(&tg_ctx->threads_harmless, ti->ltid_bit);
+	while (_HA_ATOMIC_LOAD(&rdv_requests) != 0) {
 		ha_thread_relax();
 	}
 }
@@ -88,37 +89,54 @@ void thread_harmless_till_end()
 /* Isolates the current thread : request the ability to work while all other
  * threads are harmless, as defined by thread_harmless_now() (i.e. they're not
  * going to touch any visible memory area). Only returns once all of them are
- * harmless, with the current thread's bit in threads_harmless_mask cleared.
+ * harmless, with the current thread's bit in &tg_ctx->threads_harmless cleared.
  * Needs to be completed using thread_release().
  */
 void thread_isolate()
 {
-	unsigned long old;
+	uint tgrp, thr;
 
-	_HA_ATOMIC_OR(&threads_harmless_mask, tid_bit);
+	_HA_ATOMIC_OR(&tg_ctx->threads_harmless, ti->ltid_bit);
 	__ha_barrier_atomic_store();
-	_HA_ATOMIC_OR(&threads_want_rdv_mask, tid_bit);
+	_HA_ATOMIC_INC(&rdv_requests);
 
-	/* wait for all threads to become harmless */
-	old = threads_harmless_mask;
+	/* wait for all threads to become harmless. They cannot change their
+	 * mind once seen thanks to rdv_requests above, unless they pass in
+	 * front of us.
+	 */
 	while (1) {
-		if (unlikely((old & all_threads_mask) != all_threads_mask))
-			old = threads_harmless_mask;
-		else if (_HA_ATOMIC_CAS(&threads_harmless_mask, &old, old & ~tid_bit))
-			break;
+		for (tgrp = 0; tgrp < global.nbtgroups; tgrp++) {
+			while ((_HA_ATOMIC_LOAD(&ha_tgroup_ctx[tgrp].threads_harmless) &
+				ha_tgroup_info[tgrp].threads_enabled) != ha_tgroup_info[tgrp].threads_enabled)
+				ha_thread_relax();
+		}
 
+		/* Now we've seen all threads marked harmless, we can try to run
+		 * by competing with other threads to win the race of the isolated
+		 * thread. It eventually converges since winners will enventually
+		 * relax their request and go back to wait for this to be over.
+		 * Competing on this only after seeing all threads harmless limits
+		 * the write contention.
+		 */
+		thr = _HA_ATOMIC_LOAD(&isolated_thread);
+		if (thr == ~0U && _HA_ATOMIC_CAS(&isolated_thread, &thr, tid))
+			break; // we won!
 		ha_thread_relax();
 	}
-	/* one thread gets released at a time here, with its harmess bit off.
-	 * The loss of this bit makes the other one continue to spin while the
-	 * thread is working alone.
+
+	/* the thread is no longer harmless as it runs */
+	_HA_ATOMIC_AND(&tg_ctx->threads_harmless, ~ti->ltid_bit);
+
+	/* the thread is isolated until it calls thread_release() which will
+	 * 1) reset isolated_thread to ~0;
+	 * 2) decrement rdv_requests.
 	 */
 }
 
 /* Isolates the current thread : request the ability to work while all other
  * threads are idle, as defined by thread_idle_now(). It only returns once
  * all of them are both harmless and idle, with the current thread's bit in
- * threads_harmless_mask and idle_mask cleared. Needs to be completed using
+ * &tg_ctx->threads_harmless and idle_mask cleared. Needs to be completed using
  * thread_release(). By doing so the thread also engages in being safe against
  * any actions that other threads might be about to start under the same
  * conditions. This specifically targets destruction of any internal structure,
@@ -131,70 +149,56 @@ void thread_isolate()
  */
 void thread_isolate_full()
 {
-	unsigned long old;
+	uint tgrp, thr;
 
-	_HA_ATOMIC_OR(&threads_idle_mask, tid_bit);
-	_HA_ATOMIC_OR(&threads_harmless_mask, tid_bit);
+	_HA_ATOMIC_OR(&tg_ctx->threads_idle, ti->ltid_bit);
+	_HA_ATOMIC_OR(&tg_ctx->threads_harmless, ti->ltid_bit);
 	__ha_barrier_atomic_store();
-	_HA_ATOMIC_OR(&threads_want_rdv_mask, tid_bit);
+	_HA_ATOMIC_INC(&rdv_requests);
 
-	/* wait for all threads to become harmless */
-	old = threads_harmless_mask;
+	/* wait for all threads to become harmless. They cannot change their
+	 * mind once seen thanks to rdv_requests above, unless they pass in
+	 * front of us.
+	 */
 	while (1) {
-		unsigned long idle = _HA_ATOMIC_LOAD(&threads_idle_mask);
+		for (tgrp = 0; tgrp < global.nbtgroups; tgrp++) {
+			while ((_HA_ATOMIC_LOAD(&ha_tgroup_ctx[tgrp].threads_harmless) &
+				_HA_ATOMIC_LOAD(&ha_tgroup_ctx[tgrp].threads_idle) &
+				ha_tgroup_info[tgrp].threads_enabled) != ha_tgroup_info[tgrp].threads_enabled)
+				ha_thread_relax();
+		}
 
-		if (unlikely((old & all_threads_mask) != all_threads_mask))
-			old = _HA_ATOMIC_LOAD(&threads_harmless_mask);
-		else if ((idle & all_threads_mask) == all_threads_mask &&
-			 _HA_ATOMIC_CAS(&threads_harmless_mask, &old, old & ~tid_bit))
-			break;
-
+		/* Now we've seen all threads marked harmless and idle, we can
+		 * try to run by competing with other threads to win the race
+		 * of the isolated thread. It eventually converges since winners
+		 * will enventually relax their request and go back to wait for
+		 * this to be over. Competing on this only after seeing all
+		 * threads harmless+idle limits the write contention.
+		 */
+		thr = _HA_ATOMIC_LOAD(&isolated_thread);
+		if (thr == ~0U && _HA_ATOMIC_CAS(&isolated_thread, &thr, tid))
+			break; // we won!
 		ha_thread_relax();
 	}
 
-	/* we're not idle anymore at this point. Other threads waiting on this
-	 * condition will need to wait until out next pass to the poller, or
-	 * our next call to thread_isolate_full().
+	/* we're not idle nor harmless anymore at this point. Other threads
+	 * waiting on this condition will need to wait until out next pass to
+	 * the poller, or our next call to thread_isolate_full().
 	 */
-	_HA_ATOMIC_AND(&threads_idle_mask, ~tid_bit);
+	_HA_ATOMIC_AND(&tg_ctx->threads_idle, ~ti->ltid_bit);
+	_HA_ATOMIC_AND(&tg_ctx->threads_harmless, ~ti->ltid_bit);
 }
 
-/* Cancels the effect of thread_isolate() by releasing the current thread's bit
- * in threads_want_rdv_mask. This immediately allows other threads to expect be
- * executed, though they will first have to wait for this thread to become
- * harmless again (possibly by reaching the poller again).
+/* Cancels the effect of thread_isolate() by resetting the ID of the isolated
+ * thread and decrementing the number of RDV requesters. This immediately allows
+ * other threads to expect to be executed, though they will first have to wait
+ * for this thread to become harmless again (possibly by reaching the poller
+ * again).
  */
 void thread_release()
 {
-	_HA_ATOMIC_AND(&threads_want_rdv_mask, ~tid_bit);
-}
-
-/* Cancels the effect of thread_isolate() by releasing the current thread's bit
- * in threads_want_rdv_mask and by marking this thread as harmless until the
- * last worker finishes. The difference with thread_release() is that this one
- * will not leave the function before others are notified to do the same, so it
- * guarantees that the current thread will not pass through a subsequent call
- * to thread_isolate() before others finish.
- */
-void thread_sync_release()
-{
-	_HA_ATOMIC_OR(&threads_sync_mask, tid_bit);
-	__ha_barrier_atomic_store();
-	_HA_ATOMIC_AND(&threads_want_rdv_mask, ~tid_bit);
-
-	while (threads_want_rdv_mask & all_threads_mask) {
-		_HA_ATOMIC_OR(&threads_harmless_mask, tid_bit);
-		while (threads_want_rdv_mask & all_threads_mask)
-			ha_thread_relax();
-		HA_ATOMIC_AND(&threads_harmless_mask, ~tid_bit);
-	}
-
-	/* the current thread is not harmless anymore, thread_isolate()
-	 * is forced to wait till all waiters finish.
-	 */
-	_HA_ATOMIC_AND(&threads_sync_mask, ~tid_bit);
-	while (threads_sync_mask & all_threads_mask)
-		ha_thread_relax();
+	HA_ATOMIC_STORE(&isolated_thread, ~0U);
+	HA_ATOMIC_DEC(&rdv_requests);
 }
 
 /* Sets up threads, signals and masks, and starts threads 2 and above.
@@ -315,7 +319,7 @@ void ha_tkillall(int sig)
 	unsigned int thr;
 
 	for (thr = 0; thr < global.nbthread; thr++) {
-		if (!(all_threads_mask & (1UL << thr)))
+		if (!(tg->threads_enabled & ha_thread_info[thr].ltid_bit))
 			continue;
 		if (thr == tid)
 			continue;
@@ -1008,6 +1012,7 @@ int thread_map_to_groups()
 {
 	int t, g, ut, ug;
 	int q, r;
+	ulong m __maybe_unused;
 
 	ut = ug = 0; // unassigned threads & groups
 
@@ -1019,7 +1024,7 @@ int thread_map_to_groups()
 	for (g = 0; g < global.nbtgroups; g++) {
 		if (!ha_tgroup_info[g].count)
 			ug++;
-		ha_tgroup_info[g].tgid = g + 1;
+		ha_tgroup_info[g].tgid_bit = 1UL << g;
 	}
 
 	if (ug > ut) {
@@ -1061,7 +1066,9 @@ int thread_map_to_groups()
 			}
 
 			ha_tgroup_info[g].count++;
+			ha_thread_info[t].tgid = g + 1;
 			ha_thread_info[t].tg = &ha_tgroup_info[g];
+			ha_thread_info[t].tg_ctx = &ha_tgroup_ctx[g];
 
 			ut--;
 			/* switch to next unassigned thread */
@@ -1081,6 +1088,18 @@ int thread_map_to_groups()
 		ha_thread_info[t].ltid_bit = 1UL << ha_thread_info[t].ltid;
 	}
 
+	m = 0;
+	for (g = 0; g < global.nbtgroups; g++) {
+		ha_tgroup_info[g].threads_enabled = nbits(ha_tgroup_info[g].count);
+		if (!ha_tgroup_info[g].count)
+			continue;
+		m |= 1UL << g;
+
+	}
+
+#ifdef USE_THREAD
+	all_tgroups_mask = m;
+#endif
 	return 0;
 }
 
@@ -1119,11 +1138,11 @@ int thread_resolve_group_mask(uint igid, ulong imask, uint *ogid, ulong *omask, 
 			imask &= all_threads_mask;
 			for (t = 0; t < global.nbthread; t++) {
 				if (imask & (1UL << t)) {
-					if (ha_thread_info[t].tg->tgid != igid) {
+					if (ha_thread_info[t].tgid != igid) {
 						if (!igid)
-							igid = ha_thread_info[t].tg->tgid;
+							igid = ha_thread_info[t].tgid;
 						else {
-							memprintf(err, "'thread' directive spans multiple groups (at least %u and %u)", igid, ha_thread_info[t].tg->tgid);
+							memprintf(err, "'thread' directive spans multiple groups (at least %u and %u)", igid, ha_thread_info[t].tgid);
 							return -1;
 						}
 					}
@@ -1259,8 +1278,11 @@ static int cfg_parse_thread_group(char **args, int section_type, struct proxy *c
 		for (tnum = ha_tgroup_info[tgroup-1].base;
 		     tnum < ha_tgroup_info[tgroup-1].base + ha_tgroup_info[tgroup-1].count;
 		     tnum++) {
-			if (ha_thread_info[tnum-1].tg == &ha_tgroup_info[tgroup-1])
+			if (ha_thread_info[tnum-1].tg == &ha_tgroup_info[tgroup-1]) {
 				ha_thread_info[tnum-1].tg = NULL;
+				ha_thread_info[tnum-1].tgid = 0;
+				ha_thread_info[tnum-1].tg_ctx = NULL;
+			}
 		}
 		ha_tgroup_info[tgroup-1].count = ha_tgroup_info[tgroup-1].base = 0;
 	}
@@ -1299,7 +1321,9 @@ static int cfg_parse_thread_group(char **args, int section_type, struct proxy *c
 				ha_tgroup_info[tgroup-1].base = tnum - 1;
 			}
 
+			ha_thread_info[tnum-1].tgid = tgroup;
 			ha_thread_info[tnum-1].tg = &ha_tgroup_info[tgroup-1];
+			ha_thread_info[tnum-1].tg_ctx = &ha_tgroup_ctx[tgroup-1];
 			tot++;
 		}
 	}

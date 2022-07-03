@@ -200,6 +200,8 @@ enum tainted_flags {
 	TAINTED_CLI_EXPERIMENTAL_MODE  = 0x00000008,
 	TAINTED_WARN                   = 0x00000010, /* a WARN_ON triggered */
 	TAINTED_BUG                    = 0x00000020, /* a BUG_ON triggered */
+	TAINTED_SHARED_LIBS            = 0x00000040, /* a shared library was loaded */
+	TAINTED_REDEFINITION           = 0x00000080, /* symbol redefinition detected */
 };
 
 /* this is a bit field made of TAINTED_*, and is declared in haproxy.c */
@@ -231,6 +233,8 @@ enum {
 	MEM_STATS_TYPE_MALLOC,
 	MEM_STATS_TYPE_REALLOC,
 	MEM_STATS_TYPE_STRDUP,
+	MEM_STATS_TYPE_P_ALLOC,
+	MEM_STATS_TYPE_P_FREE,
 };
 
 struct mem_stats {

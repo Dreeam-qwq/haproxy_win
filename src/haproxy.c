@@ -165,8 +165,7 @@ const char *build_features = "";
 static struct list cfg_cfgfiles = LIST_HEAD_INIT(cfg_cfgfiles);
 int  pid;			/* current process id */
 
-volatile unsigned long sleeping_thread_mask = 0; /* Threads that are about to sleep in poll() */
-volatile unsigned long stopping_thread_mask = 0; /* Threads acknowledged stopping */
+static unsigned long stopping_tgroup_mask; /* Thread groups acknowledging stopping */
 
 /* global options */
 struct global global = {
@@ -2244,6 +2243,10 @@ static void init(int argc, char **argv)
 			exit(1);
 	}
 
+	/* set the default maxconn in the master, but let it be rewritable with -n */
+	if (global.mode & MODE_MWORKER_WAIT)
+		global.maxconn = DEFAULT_MAXCONN;
+
 	if (cfg_maxconn > 0)
 		global.maxconn = cfg_maxconn;
 
@@ -2800,11 +2803,12 @@ void run_poll_loop()
 		if (thread_has_tasks())
 			activity[tid].wake_tasks++;
 		else {
-			_HA_ATOMIC_OR(&sleeping_thread_mask, tid_bit);
+			_HA_ATOMIC_OR(&th_ctx->flags, TH_FL_SLEEPING);
+			_HA_ATOMIC_AND(&th_ctx->flags, ~TH_FL_NOTIFIED);
 			__ha_barrier_atomic_store();
 			if (thread_has_tasks()) {
 				activity[tid].wake_tasks++;
-				_HA_ATOMIC_AND(&sleeping_thread_mask, ~tid_bit);
+				_HA_ATOMIC_AND(&th_ctx->flags, ~TH_FL_SLEEPING);
 			} else
 				wake = 0;
 		}
@@ -2814,27 +2818,39 @@ void run_poll_loop()
 
 			if (stopping) {
 				/* stop muxes before acknowledging stopping */
-				if (!(stopping_thread_mask & tid_bit)) {
+				if (!(tg_ctx->stopping_threads & tid_bit)) {
 					task_wakeup(mux_stopping_data[tid].task, TASK_WOKEN_OTHER);
 					wake = 1;
 				}
 
-				if (_HA_ATOMIC_OR_FETCH(&stopping_thread_mask, tid_bit) == tid_bit) {
-					/* notify all threads that stopping was just set */
-					for (i = 0; i < global.nbthread; i++)
-						if (((all_threads_mask & ~stopping_thread_mask) >> i) & 1)
+				if (_HA_ATOMIC_OR_FETCH(&tg_ctx->stopping_threads, ti->ltid_bit) == ti->ltid_bit &&
+				    _HA_ATOMIC_OR_FETCH(&stopping_tgroup_mask, tg->tgid_bit) == tg->tgid_bit) {
+					/* first one to detect it, notify all threads that stopping was just set */
+					for (i = 0; i < global.nbthread; i++) {
+						if (ha_thread_info[i].tg->threads_enabled &
+						    ha_thread_info[i].ltid_bit &
+						    ~_HA_ATOMIC_LOAD(&ha_thread_info[i].tg_ctx->stopping_threads))
 							wake_thread(i);
+					}
 				}
 			}
 
 			/* stop when there's nothing left to do */
 			if ((jobs - unstoppable_jobs) == 0 &&
-			    (stopping_thread_mask & all_threads_mask) == all_threads_mask) {
-				/* wake all threads waiting on jobs==0 */
-				for (i = 0; i < global.nbthread; i++)
-					if (((all_threads_mask & ~tid_bit) >> i) & 1)
-						wake_thread(i);
-				break;
+			    (_HA_ATOMIC_LOAD(&stopping_tgroup_mask) & all_tgroups_mask) == all_tgroups_mask) {
+				/* check that all threads are aware of the stopping status */
+				for (i = 0; i < global.nbtgroups; i++)
+					if (_HA_ATOMIC_LOAD(&ha_tgroup_ctx[i].stopping_threads) != ha_tgroup_info[i].threads_enabled)
+						break;
+#ifdef USE_THREAD
+				if (i == global.nbtgroups) {
+					/* all are OK, let's wake them all and stop */
+					for (i = 0; i < global.nbthread; i++)
+						if (i != tid && ha_thread_info[i].tg->threads_enabled & ha_thread_info[i].ltid_bit)
+							wake_thread(i);
+					break;
+				}
+#endif
 			}
 		}
 
@@ -2969,6 +2985,8 @@ static void *run_thread_poll_loop(void *data)
 		ptff->fct();
 
 #ifdef USE_THREAD
+	if (!_HA_ATOMIC_AND_FETCH(&ha_tgroup_info[ti->tgid].threads_enabled, ~ti->ltid_bit))
+		_HA_ATOMIC_AND(&all_tgroups_mask, ~tg->tgid_bit);
 	_HA_ATOMIC_AND(&all_threads_mask, ~tid_bit);
 	if (tid > 0)
 		pthread_exit(NULL);

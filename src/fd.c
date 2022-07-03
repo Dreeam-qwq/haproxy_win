@@ -306,6 +306,9 @@ done:
  */
 void _fd_delete_orphan(int fd)
 {
+	uint fd_disown;
+
+	fd_disown = fdtab[fd].state & FD_DISOWN;
 	if (fdtab[fd].state & FD_LINGER_RISK) {
 		/* this is generally set when connecting to servers */
 		DISGUISE(setsockopt(fd, SOL_SOCKET, SO_LINGER,
@@ -327,7 +330,8 @@ void _fd_delete_orphan(int fd)
 	/* perform the close() call last as it's what unlocks the instant reuse
 	 * of this FD by any other thread.
 	 */
-	close(fd);
+	if (!fd_disown)
+		close(fd);
 	_HA_ATOMIC_DEC(&ha_used_fds);
 }
 
@@ -444,13 +448,12 @@ void updt_fd_polling(const int fd)
 
 		fd_add_to_fd_list(&update_list, fd, offsetof(struct fdtab, update));
 
-		if (fd_active(fd) &&
-		    !(fdtab[fd].thread_mask & tid_bit) &&
-		    (fdtab[fd].thread_mask & ~tid_bit & all_threads_mask & ~sleeping_thread_mask) == 0) {
-			/* we need to wake up one thread to handle it immediately */
-			int thr = my_ffsl(fdtab[fd].thread_mask & ~tid_bit & all_threads_mask) - 1;
-
-			_HA_ATOMIC_AND(&sleeping_thread_mask, ~(1UL << thr));
+		if (fd_active(fd) && !(fdtab[fd].thread_mask & tid_bit)) {
+			/* we need to wake up another thread to handle it immediately, any will fit,
+			 * so let's pick a random one so that it doesn't always end up on the same.
+			 */
+			int thr = one_among_mask(fdtab[fd].thread_mask & all_threads_mask,
+			                         statistical_prng_range(MAX_THREADS));
 			wake_thread(thr);
 		}
 	}
@@ -469,7 +472,7 @@ int fd_update_events(int fd, uint evts)
 	uint new_flags, must_stop;
 	ulong rmask, tmask;
 
-	th_ctx->flags &= ~TH_FL_STUCK; // this thread is still running
+	_HA_ATOMIC_AND(&th_ctx->flags, ~TH_FL_STUCK); // this thread is still running
 
 	/* do nothing if the FD was taken over under us */
 	do {
@@ -754,6 +757,20 @@ int compute_poll_timeout(int next)
 			wait_time = MAX_DELAY_MS;
 	}
 	return wait_time;
+}
+
+/* Handle the return of the poller, which consists in calculating the idle
+ * time, saving a few clocks, marking the thread harmful again etc. All that
+ * is some boring stuff that all pollers have to do anyway.
+ */
+void fd_leaving_poll(int wait_time, int status)
+{
+	clock_leaving_poll(wait_time, status);
+
+	thread_harmless_end();
+	thread_idle_end();
+
+	_HA_ATOMIC_AND(&th_ctx->flags, ~TH_FL_SLEEPING);
 }
 
 /* disable the specified poller */

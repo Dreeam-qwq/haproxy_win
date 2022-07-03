@@ -12,7 +12,6 @@
 
 #include <string.h>
 
-#include <import/eb32sctree.h>
 #include <import/eb32tree.h>
 
 #include <haproxy/api.h>
@@ -35,17 +34,12 @@ DECLARE_POOL(pool_head_tasklet, "tasklet", sizeof(struct tasklet));
  */
 DECLARE_POOL(pool_head_notification, "notification", sizeof(struct notification));
 
-volatile unsigned long global_tasks_mask = 0; /* Mask of threads with tasks in the global runqueue */
 unsigned int niced_tasks = 0;      /* number of niced tasks in the run queue */
 
-__decl_aligned_spinlock(rq_lock); /* spin lock related to run queue */
 __decl_aligned_rwlock(wq_lock);   /* RW lock related to the wait queue */
 
 #ifdef USE_THREAD
 struct eb_root timers;      /* sorted timers tree, global, accessed under wq_lock */
-struct eb_root rqueue;      /* tree constituting the global run queue, accessed under rq_lock */
-unsigned int grq_total;     /* total number of entries in the global run queue, atomic */
-static unsigned int global_rqueue_ticks;  /* insertion count in the grq, use rq_lock */
 #endif
 
 
@@ -85,17 +79,14 @@ void task_kill(struct task *t)
 			 * Note: that's a task so it must be accounted for as such. Pick
 			 * the task's first thread for the job.
 			 */
-			thr = my_ffsl(t->thread_mask) - 1;
+			thr = t->tid >= 0 ? t->tid : tid;
 
 			/* Beware: tasks that have never run don't have their ->list empty yet! */
 			MT_LIST_APPEND(&ha_thread_ctx[thr].shared_tasklet_list,
 			               list_to_mt_list(&((struct tasklet *)t)->list));
 			_HA_ATOMIC_INC(&ha_thread_ctx[thr].rq_total);
 			_HA_ATOMIC_INC(&ha_thread_ctx[thr].tasks_in_list);
-			if (sleeping_thread_mask & (1UL << thr)) {
-				_HA_ATOMIC_AND(&sleeping_thread_mask, ~(1UL << thr));
-				wake_thread(thr);
-			}
+			wake_thread(thr);
 			return;
 		}
 	}
@@ -130,10 +121,7 @@ void tasklet_kill(struct tasklet *t)
 			MT_LIST_APPEND(&ha_thread_ctx[thr].shared_tasklet_list,
 			               list_to_mt_list(&t->list));
 			_HA_ATOMIC_INC(&ha_thread_ctx[thr].rq_total);
-			if (sleeping_thread_mask & (1UL << thr)) {
-				_HA_ATOMIC_AND(&sleeping_thread_mask, ~(1UL << thr));
-				wake_thread(thr);
-			}
+			wake_thread(thr);
 			return;
 		}
 	}
@@ -174,11 +162,46 @@ void __tasklet_wakeup_on(struct tasklet *tl, int thr)
 		/* this tasklet runs on a specific thread. */
 		MT_LIST_APPEND(&ha_thread_ctx[thr].shared_tasklet_list, list_to_mt_list(&tl->list));
 		_HA_ATOMIC_INC(&ha_thread_ctx[thr].rq_total);
-		if (sleeping_thread_mask & (1UL << thr)) {
-			_HA_ATOMIC_AND(&sleeping_thread_mask, ~(1UL << thr));
-			wake_thread(thr);
+		wake_thread(thr);
+	}
+}
+
+/* Do not call this one, please use tasklet_wakeup_after_on() instead, as this one is
+ * the slow path of tasklet_wakeup_after() which performs some preliminary checks
+ * and sets TASK_IN_LIST before calling this one.
+ */
+struct list *__tasklet_wakeup_after(struct list *head, struct tasklet *tl)
+{
+	BUG_ON(tid != tl->tid);
+	/* this tasklet runs on the caller thread */
+	if (!head) {
+		if (tl->state & TASK_HEAVY) {
+			LIST_INSERT(&th_ctx->tasklets[TL_HEAVY], &tl->list);
+			th_ctx->tl_class_mask |= 1 << TL_HEAVY;
+		}
+		else if (tl->state & TASK_SELF_WAKING) {
+			LIST_INSERT(&th_ctx->tasklets[TL_BULK], &tl->list);
+			th_ctx->tl_class_mask |= 1 << TL_BULK;
+		}
+		else if ((struct task *)tl == th_ctx->current) {
+			_HA_ATOMIC_OR(&tl->state, TASK_SELF_WAKING);
+			LIST_INSERT(&th_ctx->tasklets[TL_BULK], &tl->list);
+			th_ctx->tl_class_mask |= 1 << TL_BULK;
+		}
+		else if (th_ctx->current_queue < 0) {
+			LIST_INSERT(&th_ctx->tasklets[TL_URGENT], &tl->list);
+			th_ctx->tl_class_mask |= 1 << TL_URGENT;
+		}
+		else {
+			LIST_INSERT(&th_ctx->tasklets[th_ctx->current_queue], &tl->list);
+			th_ctx->tl_class_mask |= 1 << th_ctx->current_queue;
 		}
 	}
+	else {
+		LIST_APPEND(head, &tl->list);
+	}
+	_HA_ATOMIC_INC(&th_ctx->rq_total);
+	return &tl->list;
 }
 
 /* Puts the task <t> in run queue at a position depending on t->nice. <t> is
@@ -192,22 +215,22 @@ void __tasklet_wakeup_on(struct tasklet *tl, int thr)
 void __task_wakeup(struct task *t)
 {
 	struct eb_root *root = &th_ctx->rqueue;
+	int thr __maybe_unused = t->tid >= 0 ? t->tid : tid;
 
 #ifdef USE_THREAD
-	if (t->thread_mask != tid_bit && global.nbthread != 1) {
-		root = &rqueue;
+	if (thr != tid) {
+		root = &ha_thread_ctx[thr].rqueue_shared;
 
-		_HA_ATOMIC_INC(&grq_total);
-		HA_SPIN_LOCK(TASK_RQ_LOCK, &rq_lock);
+		_HA_ATOMIC_INC(&ha_thread_ctx[thr].rq_total);
+		HA_SPIN_LOCK(TASK_RQ_LOCK, &ha_thread_ctx[thr].rqsh_lock);
 
-		global_tasks_mask |= t->thread_mask;
-		t->rq.key = ++global_rqueue_ticks;
+		t->rq.key = _HA_ATOMIC_ADD_FETCH(&ha_thread_ctx[thr].rqueue_ticks, 1);
 		__ha_barrier_store();
 	} else
 #endif
 	{
 		_HA_ATOMIC_INC(&th_ctx->rq_total);
-		t->rq.key = ++th_ctx->rqueue_ticks;
+		t->rq.key = _HA_ATOMIC_ADD_FETCH(&th_ctx->rqueue_ticks, 1);
 	}
 
 	if (likely(t->nice)) {
@@ -218,27 +241,19 @@ void __task_wakeup(struct task *t)
 		t->rq.key += offset;
 	}
 
-	if (th_ctx->flags & TH_FL_TASK_PROFILING)
+	if (_HA_ATOMIC_LOAD(&th_ctx->flags) & TH_FL_TASK_PROFILING)
 		t->call_date = now_mono_time();
 
-	eb32sc_insert(root, &t->rq, t->thread_mask);
+	eb32_insert(root, &t->rq);
 
 #ifdef USE_THREAD
-	if (root == &rqueue) {
-		_HA_ATOMIC_OR(&t->state, TASK_GLOBAL);
-		HA_SPIN_UNLOCK(TASK_RQ_LOCK, &rq_lock);
+	if (thr != tid) {
+		HA_SPIN_UNLOCK(TASK_RQ_LOCK, &ha_thread_ctx[thr].rqsh_lock);
 
 		/* If all threads that are supposed to handle this task are sleeping,
 		 * wake one.
 		 */
-		if ((((t->thread_mask & all_threads_mask) & sleeping_thread_mask) ==
-		     (t->thread_mask & all_threads_mask))) {
-			unsigned long m = (t->thread_mask & all_threads_mask) &~ tid_bit;
-
-			m = (m & (m - 1)) ^ m; // keep lowest bit set
-			_HA_ATOMIC_AND(&sleeping_thread_mask, ~m);
-			wake_thread(my_ffsl(m) - 1);
-		}
+		wake_thread(thr);
 	}
 #endif
 	return;
@@ -262,8 +277,8 @@ void __task_wakeup(struct task *t)
 void __task_queue(struct task *task, struct eb_root *wq)
 {
 #ifdef USE_THREAD
-	BUG_ON((wq == &timers && !(task->state & TASK_SHARED_WQ)) ||
-	       (wq == &th_ctx->timers && (task->state & TASK_SHARED_WQ)) ||
+	BUG_ON((wq == &timers && task->tid >= 0) ||
+	       (wq == &th_ctx->timers && task->tid < 0) ||
 	       (wq != &timers && wq != &th_ctx->timers));
 #endif
 	/* if this happens the process is doomed anyway, so better catch it now
@@ -527,8 +542,7 @@ unsigned int run_tasks_from_lists(unsigned int budgets[])
 
 			if (unlikely(queue > TL_NORMAL &&
 				     budget_mask & (1 << TL_NORMAL) &&
-				     (!eb_is_empty(&th_ctx->rqueue) ||
-				      (global_tasks_mask & tid_bit)))) {
+				     (!eb_is_empty(&th_ctx->rqueue) || !eb_is_empty(&th_ctx->rqueue_shared)))) {
 				/* a task was woken up by a bulk tasklet or another thread */
 				break;
 			}
@@ -554,7 +568,7 @@ unsigned int run_tasks_from_lists(unsigned int budgets[])
 		process = t->process;
 		t->calls++;
 		th_ctx->current = t;
-		th_ctx->flags &= ~TH_FL_STUCK; // this thread is still running
+		_HA_ATOMIC_AND(&th_ctx->flags, ~TH_FL_STUCK); // this thread is still running
 
 		_HA_ATOMIC_DEC(&th_ctx->rq_total);
 
@@ -564,7 +578,7 @@ unsigned int run_tasks_from_lists(unsigned int budgets[])
 			LIST_DEL_INIT(&((struct tasklet *)t)->list);
 			__ha_barrier_store();
 
-			if (unlikely(th_ctx->flags & TH_FL_TASK_PROFILING)) {
+			if (unlikely(_HA_ATOMIC_LOAD(&th_ctx->flags) & TH_FL_TASK_PROFILING)) {
 				profile_entry = sched_activity_entry(sched_activity, t->process);
 				before = now_mono_time();
 #ifdef DEBUG_TASK
@@ -589,7 +603,7 @@ unsigned int run_tasks_from_lists(unsigned int budgets[])
 				continue;
 			}
 
-			if (unlikely(th_ctx->flags & TH_FL_TASK_PROFILING)) {
+			if (unlikely(_HA_ATOMIC_LOAD(&th_ctx->flags) & TH_FL_TASK_PROFILING)) {
 				HA_ATOMIC_INC(&profile_entry->calls);
 				HA_ATOMIC_ADD(&profile_entry->cpu_time, now_mono_time() - before);
 			}
@@ -702,8 +716,8 @@ unsigned int run_tasks_from_lists(unsigned int budgets[])
 void process_runnable_tasks()
 {
 	struct thread_ctx * const tt = th_ctx;
-	struct eb32sc_node *lrq; // next local run queue entry
-	struct eb32sc_node *grq; // next global run queue entry
+	struct eb32_node *lrq; // next local run queue entry
+	struct eb32_node *grq; // next global run queue entry
 	struct task *t;
 	const unsigned int default_weights[TL_CLASSES] = {
 		[TL_URGENT] = 64, // ~50% of CPU bandwidth for I/O
@@ -720,7 +734,7 @@ void process_runnable_tasks()
 	int heavy_queued = 0;
 	int budget;
 
-	th_ctx->flags &= ~TH_FL_STUCK; // this thread is still running
+	_HA_ATOMIC_AND(&th_ctx->flags, ~TH_FL_STUCK); // this thread is still running
 
 	if (!thread_has_tasks()) {
 		activity[tid].empty_rq++;
@@ -749,7 +763,7 @@ void process_runnable_tasks()
 
 	/* normal tasklets list gets a default weight of ~37% */
 	if ((tt->tl_class_mask & (1 << TL_NORMAL)) ||
-	    !eb_is_empty(&th_ctx->rqueue) || (global_tasks_mask & tid_bit))
+	    !eb_is_empty(&th_ctx->rqueue) || !eb_is_empty(&th_ctx->rqueue_shared))
 		max[TL_NORMAL] = default_weights[TL_NORMAL];
 
 	/* bulk tasklets list gets a default weight of ~13% */
@@ -796,16 +810,14 @@ void process_runnable_tasks()
 	lpicked = gpicked = 0;
 	budget = max[TL_NORMAL] - tt->tasks_in_list;
 	while (lpicked + gpicked < budget) {
-		if ((global_tasks_mask & tid_bit) && !grq) {
+		if (!eb_is_empty(&th_ctx->rqueue_shared) && !grq) {
 #ifdef USE_THREAD
-			HA_SPIN_LOCK(TASK_RQ_LOCK, &rq_lock);
-			grq = eb32sc_lookup_ge(&rqueue, global_rqueue_ticks - TIMER_LOOK_BACK, tid_bit);
+			HA_SPIN_LOCK(TASK_RQ_LOCK, &th_ctx->rqsh_lock);
+			grq = eb32_lookup_ge(&th_ctx->rqueue_shared, _HA_ATOMIC_LOAD(&tt->rqueue_ticks) - TIMER_LOOK_BACK);
 			if (unlikely(!grq)) {
-				grq = eb32sc_first(&rqueue, tid_bit);
-				if (!grq) {
-					global_tasks_mask &= ~tid_bit;
-					HA_SPIN_UNLOCK(TASK_RQ_LOCK, &rq_lock);
-				}
+				grq = eb32_first(&th_ctx->rqueue_shared);
+				if (!grq)
+					HA_SPIN_UNLOCK(TASK_RQ_LOCK, &th_ctx->rqsh_lock);
 			}
 #endif
 		}
@@ -815,33 +827,30 @@ void process_runnable_tasks()
 		 */
 
 		if (!lrq) {
-			lrq = eb32sc_lookup_ge(&tt->rqueue, tt->rqueue_ticks - TIMER_LOOK_BACK, tid_bit);
+			lrq = eb32_lookup_ge(&tt->rqueue, _HA_ATOMIC_LOAD(&tt->rqueue_ticks) - TIMER_LOOK_BACK);
 			if (unlikely(!lrq))
-				lrq = eb32sc_first(&tt->rqueue, tid_bit);
+				lrq = eb32_first(&tt->rqueue);
 		}
 
 		if (!lrq && !grq)
 			break;
 
 		if (likely(!grq || (lrq && (int)(lrq->key - grq->key) <= 0))) {
-			t = eb32sc_entry(lrq, struct task, rq);
-			lrq = eb32sc_next(lrq, tid_bit);
-			eb32sc_delete(&t->rq);
+			t = eb32_entry(lrq, struct task, rq);
+			lrq = eb32_next(lrq);
+			eb32_delete(&t->rq);
 			lpicked++;
 		}
 #ifdef USE_THREAD
 		else {
-			t = eb32sc_entry(grq, struct task, rq);
-			grq = eb32sc_next(grq, tid_bit);
-			_HA_ATOMIC_AND(&t->state, ~TASK_GLOBAL);
-			eb32sc_delete(&t->rq);
+			t = eb32_entry(grq, struct task, rq);
+			grq = eb32_next(grq);
+			eb32_delete(&t->rq);
 
 			if (unlikely(!grq)) {
-				grq = eb32sc_first(&rqueue, tid_bit);
-				if (!grq) {
-					global_tasks_mask &= ~tid_bit;
-					HA_SPIN_UNLOCK(TASK_RQ_LOCK, &rq_lock);
-				}
+				grq = eb32_first(&th_ctx->rqueue_shared);
+				if (!grq)
+					HA_SPIN_UNLOCK(TASK_RQ_LOCK, &th_ctx->rqsh_lock);
 			}
 			gpicked++;
 		}
@@ -855,19 +864,13 @@ void process_runnable_tasks()
 
 	/* release the rqueue lock */
 	if (grq) {
-		HA_SPIN_UNLOCK(TASK_RQ_LOCK, &rq_lock);
+		HA_SPIN_UNLOCK(TASK_RQ_LOCK, &th_ctx->rqsh_lock);
 		grq = NULL;
 	}
 
 	if (lpicked + gpicked) {
 		tt->tl_class_mask |= 1 << TL_NORMAL;
 		_HA_ATOMIC_ADD(&tt->tasks_in_list, lpicked + gpicked);
-#ifdef USE_THREAD
-		if (gpicked) {
-			_HA_ATOMIC_SUB(&grq_total, gpicked);
-			_HA_ATOMIC_ADD(&tt->rq_total, gpicked);
-		}
-#endif
 		activity[tid].tasksw += lpicked + gpicked;
 	}
 
@@ -900,14 +903,14 @@ void mworker_cleantasks()
 	struct task *t;
 	int i;
 	struct eb32_node *tmp_wq = NULL;
-	struct eb32sc_node *tmp_rq = NULL;
+	struct eb32_node *tmp_rq = NULL;
 
 #ifdef USE_THREAD
 	/* cleanup the global run queue */
-	tmp_rq = eb32sc_first(&rqueue, ~0UL);
+	tmp_rq = eb32_first(&th_ctx->rqueue_shared);
 	while (tmp_rq) {
-		t = eb32sc_entry(tmp_rq, struct task, rq);
-		tmp_rq = eb32sc_next(tmp_rq, ~0UL);
+		t = eb32_entry(tmp_rq, struct task, rq);
+		tmp_rq = eb32_next(tmp_rq);
 		task_destroy(t);
 	}
 	/* cleanup the timers queue */
@@ -920,10 +923,10 @@ void mworker_cleantasks()
 #endif
 	/* clean the per thread run queue */
 	for (i = 0; i < global.nbthread; i++) {
-		tmp_rq = eb32sc_first(&ha_thread_ctx[i].rqueue, ~0UL);
+		tmp_rq = eb32_first(&ha_thread_ctx[i].rqueue);
 		while (tmp_rq) {
-			t = eb32sc_entry(tmp_rq, struct task, rq);
-			tmp_rq = eb32sc_next(tmp_rq, ~0UL);
+			t = eb32_entry(tmp_rq, struct task, rq);
+			tmp_rq = eb32_next(tmp_rq);
 			task_destroy(t);
 		}
 		/* cleanup the per thread timers queue */
@@ -943,7 +946,6 @@ static void init_task()
 
 #ifdef USE_THREAD
 	memset(&timers, 0, sizeof(timers));
-	memset(&rqueue, 0, sizeof(rqueue));
 #endif
 	for (i = 0; i < MAX_THREADS; i++) {
 		for (q = 0; q < TL_CLASSES; q++)
