@@ -37,7 +37,6 @@ struct qcc {
 
 	struct {
 		uint64_t max_streams; /* maximum number of concurrent streams */
-		uint64_t largest_id;  /* Largest ID of the open streams */
 		uint64_t nb_streams;  /* Number of open streams */
 		struct {
 			uint64_t max_data; /* Maximum number of bytes which may be received */
@@ -54,9 +53,10 @@ struct qcc {
 		struct list frms; /* prepared frames related to flow-control  */
 		uint64_t ms_bidi_init; /* max initial sub-ID of bidi stream allowed for the peer */
 		uint64_t ms_bidi; /* max sub-ID of bidi stream allowed for the peer */
+		uint64_t cl_bidi_r; /* total count of closed remote bidi stream since last MAX_STREAMS emission */
+
 		uint64_t msd_bidi_l; /* initial max-stream-data on local streams */
 		uint64_t msd_bidi_r; /* initial max-stream-data on remote streams */
-		uint64_t cl_bidi_r; /* total count of closed remote bidi stream since last MAX_STREAMS emission */
 
 		uint64_t md; /* current max-data allowed for the peer */
 		uint64_t md_init; /* initial max-data */
@@ -79,6 +79,11 @@ struct qcc {
 		uint64_t sent_offsets; /* sum of all offset sent */
 	} tx;
 
+	uint64_t largest_bidi_r; /* largest remote bidi stream ID opened. */
+	uint64_t largest_uni_r;  /* largest remote uni stream ID opened. */
+	uint64_t next_bidi_l; /* next stream ID to use for local bidi stream */
+	uint64_t next_uni_l;  /* next stream ID to use for local uni stream */
+
 	struct eb_root streams_by_id; /* all active streams by their ID */
 
 	struct list send_retry_list; /* list of qcs eligible to send retry */
@@ -95,7 +100,7 @@ struct qcc {
 };
 
 #define QC_SF_NONE              0x00000000
-#define QC_SF_FIN_RECV          0x00000001  /* last frame received for this stream */
+#define QC_SF_SIZE_KNOWN        0x00000001  /* last frame received for this stream */
 #define QC_SF_FIN_STREAM        0x00000002  /* FIN bit must be set for last frame of the stream */
 #define QC_SF_BLK_MROOM         0x00000004  /* app layer is blocked waiting for room in the qcs.tx.buf */
 #define QC_SF_DETACH            0x00000008  /* sc is detached but there is remaining data to send */

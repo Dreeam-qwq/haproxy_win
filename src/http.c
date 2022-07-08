@@ -478,6 +478,38 @@ const char *http_get_reason(unsigned int status)
 	}
 }
 
+/* Returns the ist string corresponding to port part (without ':') in the host
+ * <host> or IST_NULL if not found.
+*/
+struct ist http_get_host_port(const struct ist host)
+{
+	char *start, *end, *ptr;
+
+	start = istptr(host);
+	end = istend(host);
+	for (ptr = end; ptr > start && isdigit((unsigned char)*--ptr););
+
+	/* no port found */
+	if (likely(*ptr != ':' || ptr+1 == end || ptr == start))
+		return IST_NULL;
+
+	return istnext(ist2(ptr, end - ptr));
+}
+
+
+/* Return non-zero if the port <port> is a default port. If the scheme <schm> is
+ * set, it is used to detect default ports (HTTP => 80 and HTTPS => 443)
+ * port. Otherwise, both are considered as default ports.
+ */
+int http_is_default_port(const struct ist schm, const struct ist port)
+{
+	if (!isttest(schm))
+		return (isteq(port, ist("443")) || isteq(port, ist("80")));
+	else
+		return (isteq(port, ist("443")) && isteqi(schm, ist("https://"))) ||
+			(isteq(port, ist("80")) && isteqi(schm, ist("http://")));
+}
+
 /* Returns non-zero if the scheme <schm> is syntactically correct according to
  * RFC3986#3.1, otherwise zero. It expects only the scheme and nothing else
  * (particularly not the following "://").

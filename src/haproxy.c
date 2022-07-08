@@ -682,10 +682,6 @@ static void mworker_reexec()
 	struct mworker_proc *current_child = NULL;
 
 	mworker_block_signals();
-#if defined(USE_SYSTEMD)
-	if (global.tune.options & GTUNE_USE_SYSTEMD)
-		sd_notify(0, "RELOADING=1");
-#endif
 	setenv("HAPROXY_MWORKER_REEXEC", "1", 1);
 
 	mworker_cleanup_proc();
@@ -802,16 +798,16 @@ void mworker_reload()
 		child->reloads++;
 	}
 
+#if defined(USE_SYSTEMD)
+	if (global.tune.options & GTUNE_USE_SYSTEMD)
+		sd_notify(0, "RELOADING=1\nSTATUS=Reloading Configuration.\n");
+#endif
 	mworker_reexec();
 }
 
 static void mworker_loop()
 {
 
-#if defined(USE_SYSTEMD)
-	if (global.tune.options & GTUNE_USE_SYSTEMD)
-		sd_notifyf(0, "READY=1\nMAINPID=%lu", (unsigned long)getpid());
-#endif
 	/* Busy polling makes no sense in the master :-) */
 	global.tune.options &= ~GTUNE_BUSY_POLLING;
 
@@ -877,6 +873,13 @@ void reexec_on_failure()
 
 	usermsgs_clr(NULL);
 	ha_warning("Loading failure!\n");
+#if defined(USE_SYSTEMD)
+	/* the sd_notify API is not able to send a reload failure signal. So
+	 * the READY=1 signal still need to be sent */
+	if (global.tune.options & GTUNE_USE_SYSTEMD)
+		sd_notify(0, "READY=1\nSTATUS=Reload failed!\n");
+#endif
+
 	mworker_reexec_waitmode();
 }
 
@@ -2818,7 +2821,7 @@ void run_poll_loop()
 
 			if (stopping) {
 				/* stop muxes before acknowledging stopping */
-				if (!(tg_ctx->stopping_threads & tid_bit)) {
+				if (!(tg_ctx->stopping_threads & ti->ltid_bit)) {
 					task_wakeup(mux_stopping_data[tid].task, TASK_WOKEN_OTHER);
 					wake = 1;
 				}
@@ -2840,7 +2843,8 @@ void run_poll_loop()
 			    (_HA_ATOMIC_LOAD(&stopping_tgroup_mask) & all_tgroups_mask) == all_tgroups_mask) {
 				/* check that all threads are aware of the stopping status */
 				for (i = 0; i < global.nbtgroups; i++)
-					if (_HA_ATOMIC_LOAD(&ha_tgroup_ctx[i].stopping_threads) != ha_tgroup_info[i].threads_enabled)
+					if ((_HA_ATOMIC_LOAD(&ha_tgroup_ctx[i].stopping_threads) & ha_tgroup_info[i].threads_enabled) !=
+					    ha_tgroup_info[i].threads_enabled)
 						break;
 #ifdef USE_THREAD
 				if (i == global.nbtgroups) {
@@ -2985,8 +2989,10 @@ static void *run_thread_poll_loop(void *data)
 		ptff->fct();
 
 #ifdef USE_THREAD
-	if (!_HA_ATOMIC_AND_FETCH(&ha_tgroup_info[ti->tgid].threads_enabled, ~ti->ltid_bit))
+	if (!_HA_ATOMIC_AND_FETCH(&ha_tgroup_info[ti->tgid-1].threads_enabled, ~ti->ltid_bit))
 		_HA_ATOMIC_AND(&all_tgroups_mask, ~tg->tgid_bit);
+	if (!_HA_ATOMIC_AND_FETCH(&tg_ctx->stopping_threads, ~ti->ltid_bit))
+		_HA_ATOMIC_AND(&stopping_tgroup_mask, ~tg->tgid_bit);
 	_HA_ATOMIC_AND(&all_threads_mask, ~tid_bit);
 	if (tid > 0)
 		pthread_exit(NULL);
@@ -3437,6 +3443,10 @@ int main(int argc, char **argv)
 					mworker_loop();
 				} else {
 
+#if defined(USE_SYSTEMD)
+					if (global.tune.options & GTUNE_USE_SYSTEMD)
+						sd_notifyf(0, "READY=1\nMAINPID=%lu\nSTATUS=Ready.\n", (unsigned long)getpid());
+#endif
 					/* if not in wait mode, reload in wait mode to free the memory */
 					ha_notice("Loading success.\n");
 					proc_self->failedreloads = 0; /* reset the number of failure */
