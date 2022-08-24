@@ -74,7 +74,7 @@ static int dns_connect_nameserver(struct dns_nameserver *ns)
 
 	/* Add the fd in the fd list and update its parameters */
 	dgram->t.sock.fd = fd;
-	fd_insert(fd, dgram, dgram_fd_handler, all_threads_mask);
+	fd_insert(fd, dgram, dgram_fd_handler, tgid, tg->threads_enabled);
 	fd_want_recv(fd);
 	return 0;
 }
@@ -1049,7 +1049,7 @@ struct dns_session *dns_session_new(struct dns_stream_server *dss)
 	if (dss->maxconn && (dss->maxconn <= dss->cur_conns))
 		return NULL;
 
-	ds = pool_alloc(dns_session_pool);
+	ds = pool_zalloc(dns_session_pool);
 	if (!ds)
 		return NULL;
 

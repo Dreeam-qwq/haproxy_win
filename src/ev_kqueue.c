@@ -36,46 +36,48 @@ static int _update_fd(int fd, int start)
 {
 	int en;
 	int changes = start;
+	ulong pr, ps;
 
 	en = fdtab[fd].state;
+	pr = _HA_ATOMIC_LOAD(&polled_mask[fd].poll_recv);
+	ps = _HA_ATOMIC_LOAD(&polled_mask[fd].poll_send);
 
-	if (!(fdtab[fd].thread_mask & tid_bit) || !(en & FD_EV_ACTIVE_RW)) {
-		if (!(polled_mask[fd].poll_recv & tid_bit) &&
-		    !(polled_mask[fd].poll_send & tid_bit)) {
+	if (!(fdtab[fd].thread_mask & ti->ltid_bit) || !(en & FD_EV_ACTIVE_RW)) {
+		if (!((pr | ps) & ti->ltid_bit)) {
 			/* fd was not watched, it's still not */
 			return changes;
 		}
 		/* fd totally removed from poll list */
 		EV_SET(&kev[changes++], fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
 		EV_SET(&kev[changes++], fd, EVFILT_WRITE, EV_DELETE, 0, 0, NULL);
-		if (polled_mask[fd].poll_recv & tid_bit)
-			_HA_ATOMIC_AND(&polled_mask[fd].poll_recv, ~tid_bit);
-		if (polled_mask[fd].poll_send & tid_bit)
-			_HA_ATOMIC_AND(&polled_mask[fd].poll_send, ~tid_bit);
+		if (pr & ti->ltid_bit)
+			_HA_ATOMIC_AND(&polled_mask[fd].poll_recv, ~ti->ltid_bit);
+		if (ps & ti->ltid_bit)
+			_HA_ATOMIC_AND(&polled_mask[fd].poll_send, ~ti->ltid_bit);
 	}
 	else {
 		/* OK fd has to be monitored, it was either added or changed */
 
 		if (en & FD_EV_ACTIVE_R) {
-			if (!(polled_mask[fd].poll_recv & tid_bit)) {
+			if (!(pr & ti->ltid_bit)) {
 				EV_SET(&kev[changes++], fd, EVFILT_READ, EV_ADD, 0, 0, NULL);
-				_HA_ATOMIC_OR(&polled_mask[fd].poll_recv, tid_bit);
+				_HA_ATOMIC_OR(&polled_mask[fd].poll_recv, ti->ltid_bit);
 			}
 		}
-		else if (polled_mask[fd].poll_recv & tid_bit) {
+		else if (pr & ti->ltid_bit) {
 			EV_SET(&kev[changes++], fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
-			HA_ATOMIC_AND(&polled_mask[fd].poll_recv, ~tid_bit);
+			HA_ATOMIC_AND(&polled_mask[fd].poll_recv, ~ti->ltid_bit);
 		}
 
 		if (en & FD_EV_ACTIVE_W) {
-			if (!(polled_mask[fd].poll_send & tid_bit)) {
+			if (!(ps & ti->ltid_bit)) {
 				EV_SET(&kev[changes++], fd, EVFILT_WRITE, EV_ADD, 0, 0, NULL);
-				_HA_ATOMIC_OR(&polled_mask[fd].poll_send, tid_bit);
+				_HA_ATOMIC_OR(&polled_mask[fd].poll_send, ti->ltid_bit);
 			}
 		}
-		else if (polled_mask[fd].poll_send & tid_bit) {
+		else if (ps & ti->ltid_bit) {
 			EV_SET(&kev[changes++], fd, EVFILT_WRITE, EV_DELETE, 0, 0, NULL);
-			_HA_ATOMIC_AND(&polled_mask[fd].poll_send, ~tid_bit);
+			_HA_ATOMIC_AND(&polled_mask[fd].poll_send, ~ti->ltid_bit);
 		}
 
 	}
@@ -100,15 +102,23 @@ static void _do_poll(struct poller *p, int exp, int wake)
 	for (updt_idx = 0; updt_idx < fd_nbupdt; updt_idx++) {
 		fd = fd_updt[updt_idx];
 
-		_HA_ATOMIC_AND(&fdtab[fd].update_mask, ~tid_bit);
-		if (!fdtab[fd].owner) {
+		if (!fd_grab_tgid(fd, tgid)) {
+			/* was reassigned */
 			activity[tid].poll_drop_fd++;
 			continue;
 		}
-		changes = _update_fd(fd, changes);
+
+		_HA_ATOMIC_AND(&fdtab[fd].update_mask, ~ti->ltid_bit);
+
+		if (fdtab[fd].owner)
+			changes = _update_fd(fd, changes);
+		else
+			activity[tid].poll_drop_fd++;
+
+		fd_drop_tgid(fd);
 	}
 	/* Scan the global update list */
-	for (old_fd = fd = update_list.first; fd != -1; fd = fdtab[fd].update.next) {
+	for (old_fd = fd = update_list[tgid - 1].first; fd != -1; fd = fdtab[fd].update.next) {
 		if (fd == -2) {
 			fd = old_fd;
 			continue;
@@ -117,13 +127,26 @@ static void _do_poll(struct poller *p, int exp, int wake)
 			fd = -fd -4;
 		if (fd == -1)
 			break;
-		if (fdtab[fd].update_mask & tid_bit)
-			done_update_polling(fd);
+
+		if (!fd_grab_tgid(fd, tgid)) {
+			/* was reassigned */
+			activity[tid].poll_drop_fd++;
+			continue;
+		}
+
+		if (!(fdtab[fd].update_mask & ti->ltid_bit)) {
+			fd_drop_tgid(fd);
+			continue;
+		}
+
+		done_update_polling(fd);
+
+		if (fdtab[fd].owner)
+			changes = _update_fd(fd, changes);
 		else
-			continue;
-		if (!fdtab[fd].owner)
-			continue;
-		changes = _update_fd(fd, changes);
+			activity[tid].poll_drop_fd++;
+
+		fd_drop_tgid(fd);
 	}
 
 	thread_idle_now();
@@ -178,7 +201,6 @@ static void _do_poll(struct poller *p, int exp, int wake)
 
 	for (count = 0; count < status; count++) {
 		unsigned int n = 0;
-		int ret;
 
 		fd = kev[count].ident;
 
@@ -197,21 +219,13 @@ static void _do_poll(struct poller *p, int exp, int wake)
 				n |= FD_EV_ERR_RW;
 		}
 
-		ret = fd_update_events(fd, n);
-
-		if (ret == FD_UPDT_MIGRATED) {
-			/* FD was migrated, let's stop polling it */
-			if (!HA_ATOMIC_BTS(&fdtab[fd].update_mask, tid))
-				fd_updt[fd_nbupdt++] = fd;
-		}
+		fd_update_events(fd, n);
 	}
 }
 
 
 static int init_kqueue_per_thread()
 {
-	int fd;
-
 	/* we can have up to two events per fd, so allocate enough to store
 	 * 2*fd event, and an extra one, in case EV_RECEIPT isn't defined,
 	 * so that we can add an invalid entry and get an error, to avoid
@@ -232,8 +246,7 @@ static int init_kqueue_per_thread()
 	 * fd for this thread. Let's just mark them as updated, the poller will
 	 * do the rest.
 	 */
-	for (fd = 0; fd < global.maxsock; fd++)
-		updt_fd_polling(fd);
+	fd_reregister_all(tgid, ti->ltid_bit);
 
 	return 1;
  fail_fd:

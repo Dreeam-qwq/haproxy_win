@@ -49,6 +49,7 @@ extern void *__elf_aux_vector;
 
 #include <import/eb32sctree.h>
 #include <import/eb32tree.h>
+#include <import/ebmbtree.h>
 
 #include <haproxy/api.h>
 #include <haproxy/applet.h>
@@ -97,6 +98,9 @@ THREAD_LOCAL int quoted_idx = 0;
  * statistical values as it's 100% predictable.
  */
 THREAD_LOCAL unsigned int statistical_prng_state = 2463534242U;
+
+/* set to true if this is a static build */
+int build_is_static = 0;
 
 /*
  * unsigned long long ASCII representation
@@ -2759,6 +2763,76 @@ void eb32sc_to_file(FILE *file, struct eb_root *root, const struct eb32sc_node *
 	fprintf(file, "}\n");
 }
 
+/* dump the full tree to <file> in DOT format for debugging purposes. Will
+ * optionally highlight node <subj> if found, depending on operation <op> :
+ *    0 : nothing
+ *   >0 : insertion, node/leaf are surrounded in red
+ *   <0 : removal, node/leaf are dashed with no background
+ * Will optionally add "desc" as a label on the graph if set and non-null. The
+ * key is printed as a u32 hex value. A full-sized hex dump would be better but
+ * is left to be implemented.
+ */
+void ebmb_to_file(FILE *file, struct eb_root *root, const struct ebmb_node *subj, int op, const char *desc)
+{
+	struct ebmb_node *node;
+
+	fprintf(file, "digraph ebtree {\n");
+
+	if (desc && *desc) {
+		fprintf(file,
+			"  fontname=\"fixed\";\n"
+			"  fontsize=8;\n"
+			"  label=\"%s\";\n", desc);
+	}
+
+	fprintf(file,
+		"  node [fontname=\"fixed\" fontsize=8 shape=\"box\" style=\"filled\" color=\"black\" fillcolor=\"white\"];\n"
+		"  edge [fontname=\"fixed\" fontsize=8 style=\"solid\" color=\"magenta\" dir=\"forward\"];\n"
+		"  \"%lx_n\" [label=\"root\\n%lx\"]\n", (long)eb_root_to_node(root), (long)root
+		);
+
+	fprintf(file, "  \"%lx_n\" -> \"%lx_%c\" [taillabel=\"L\"];\n",
+		(long)eb_root_to_node(root),
+		(long)eb_root_to_node(eb_clrtag(root->b[0])),
+		eb_gettag(root->b[0]) == EB_LEAF ? 'l' : 'n');
+
+	node = ebmb_first(root);
+	while (node) {
+		if (node->node.node_p) {
+			/* node part is used */
+			fprintf(file, "  \"%lx_n\" [label=\"%lx\\nkey=%#x\\nbit=%d\" fillcolor=\"lightskyblue1\" %s];\n",
+				(long)node, (long)node, read_u32(node->key), node->node.bit,
+				(node == subj) ? (op < 0 ? "color=\"red\" style=\"dashed\"" : op > 0 ? "color=\"red\"" : "") : "");
+
+			fprintf(file, "  \"%lx_n\" -> \"%lx_n\" [taillabel=\"%c\"];\n",
+				(long)node,
+				(long)eb_root_to_node(eb_clrtag(node->node.node_p)),
+				eb_gettag(node->node.node_p) ? 'R' : 'L');
+
+			fprintf(file, "  \"%lx_n\" -> \"%lx_%c\" [taillabel=\"L\"];\n",
+				(long)node,
+				(long)eb_root_to_node(eb_clrtag(node->node.branches.b[0])),
+				eb_gettag(node->node.branches.b[0]) == EB_LEAF ? 'l' : 'n');
+
+			fprintf(file, "  \"%lx_n\" -> \"%lx_%c\" [taillabel=\"R\"];\n",
+				(long)node,
+				(long)eb_root_to_node(eb_clrtag(node->node.branches.b[1])),
+				eb_gettag(node->node.branches.b[1]) == EB_LEAF ? 'l' : 'n');
+		}
+
+		fprintf(file, "  \"%lx_l\" [label=\"%lx\\nkey=%#x\\npfx=%u\" fillcolor=\"yellow\" %s];\n",
+			(long)node, (long)node, read_u32(node->key), node->node.pfx,
+			(node == subj) ? (op < 0 ? "color=\"red\" style=\"dashed\"" : op > 0 ? "color=\"red\"" : "") : "");
+
+		fprintf(file, "  \"%lx_l\" -> \"%lx_n\" [taillabel=\"%c\"];\n",
+			(long)node,
+			(long)eb_root_to_node(eb_clrtag(node->node.leaf_p)),
+			eb_gettag(node->node.leaf_p) ? 'R' : 'L');
+		node = ebmb_next(node);
+	}
+	fprintf(file, "}\n");
+}
+
 /* This function compares a sample word possibly followed by blanks to another
  * clean word. The compare is case-insensitive. 1 is returned if both are equal,
  * otherwise zero. This intends to be used when checking HTTP headers for some
@@ -4920,6 +4994,26 @@ static int dladdr_and_size(const void *addr, Dl_info *dli, size_t *size)
 	return ret;
 }
 
+/* Sets build_is_static to true if we detect a static build. Some older glibcs
+ * tend to crash inside dlsym() in static builds, but tests show that at least
+ * dladdr() still works (and will fail to resolve anything of course). Thus we
+ * try to determine if we're on a static build to avoid calling dlsym() in this
+ * case.
+ */
+void check_if_static_build()
+{
+	Dl_info dli = { };
+	size_t size = 0;
+
+	/* Now let's try to be smarter */
+	if (!dladdr_and_size(&main, &dli, &size))
+		build_is_static = 1;
+	else
+		build_is_static = 0;
+}
+
+INITCALL0(STG_PREPARE, check_if_static_build);
+
 /* Tries to retrieve the address of the first occurrence symbol <name>.
  * Note that NULL in return is not always an error as a symbol may have that
  * address in special situations.
@@ -4929,7 +5023,8 @@ void *get_sym_curr_addr(const char *name)
 	void *ptr = NULL;
 
 #ifdef RTLD_DEFAULT
-	ptr = dlsym(RTLD_DEFAULT, name);
+	if (!build_is_static)
+		ptr = dlsym(RTLD_DEFAULT, name);
 #endif
 	return ptr;
 }
@@ -4944,7 +5039,8 @@ void *get_sym_next_addr(const char *name)
 	void *ptr = NULL;
 
 #ifdef RTLD_NEXT
-	ptr = dlsym(RTLD_NEXT, name);
+	if (!build_is_static)
+		ptr = dlsym(RTLD_NEXT, name);
 #endif
 	return ptr;
 }

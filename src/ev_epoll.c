@@ -43,12 +43,26 @@ static int epoll_fd[MAX_THREADS] __read_mostly; // per-thread epoll_fd
 static void __fd_clo(int fd)
 {
 	if (unlikely(fdtab[fd].state & FD_CLONED)) {
-		unsigned long m = polled_mask[fd].poll_recv | polled_mask[fd].poll_send;
+		unsigned long m = _HA_ATOMIC_LOAD(&polled_mask[fd].poll_recv) | _HA_ATOMIC_LOAD(&polled_mask[fd].poll_send);
+		int tgrp = fd_tgid(fd);
 		struct epoll_event ev;
 		int i;
 
-		for (i = global.nbthread - 1; i >= 0; i--)
-			if (m & (1UL << i))
+		if (!m)
+			return;
+
+		/* since FDs may only be shared per group and are only closed
+		 * once entirely reset, it should never happen that we have to
+		 * close an FD for another group, unless we're stopping from the
+		 * wrong thread or during startup, which is what we're checking
+		 * for. Regardless, it is not a problem to do so.
+		 */
+		if (unlikely(!(global.mode & MODE_STARTING))) {
+			CHECK_IF(tgid != tgrp && !thread_isolated());
+		}
+
+		for (i = ha_tgroup_info[tgrp-1].base; i < ha_tgroup_info[tgrp-1].base + ha_tgroup_info[tgrp-1].count; i++)
+			if (m & ha_thread_info[i].ltid_bit)
 				epoll_ctl(epoll_fd[i], EPOLL_CTL_DEL, fd, &ev);
 	}
 }
@@ -57,18 +71,21 @@ static void _update_fd(int fd)
 {
 	int en, opcode;
 	struct epoll_event ev = { };
+	ulong pr, ps;
 
 	en = fdtab[fd].state;
+	pr = _HA_ATOMIC_LOAD(&polled_mask[fd].poll_recv);
+	ps = _HA_ATOMIC_LOAD(&polled_mask[fd].poll_send);
 
 	/* Try to force EPOLLET on FDs that support it */
 	if (fdtab[fd].state & FD_ET_POSSIBLE) {
 		/* already done ? */
-		if (polled_mask[fd].poll_recv & polled_mask[fd].poll_send & tid_bit)
+		if (pr & ps & ti->ltid_bit)
 			return;
 
 		/* enable ET polling in both directions */
-		_HA_ATOMIC_OR(&polled_mask[fd].poll_recv, tid_bit);
-		_HA_ATOMIC_OR(&polled_mask[fd].poll_send, tid_bit);
+		_HA_ATOMIC_OR(&polled_mask[fd].poll_recv, ti->ltid_bit);
+		_HA_ATOMIC_OR(&polled_mask[fd].poll_send, ti->ltid_bit);
 		opcode = EPOLL_CTL_ADD;
 		ev.events = EPOLLIN | EPOLLRDHUP | EPOLLOUT | EPOLLET;
 		goto done;
@@ -79,50 +96,47 @@ static void _update_fd(int fd)
 	 * needlessly unsubscribe then re-subscribe it.
 	 */
 	if (!(en & FD_EV_READY_R) &&
-	    ((en & FD_EV_ACTIVE_W) ||
-	     ((polled_mask[fd].poll_send | polled_mask[fd].poll_recv) & tid_bit)))
+	    ((en & FD_EV_ACTIVE_W) || ((ps | pr) & ti->ltid_bit)))
 		en |= FD_EV_ACTIVE_R;
 
-	if ((polled_mask[fd].poll_send | polled_mask[fd].poll_recv) & tid_bit) {
-		if (!(fdtab[fd].thread_mask & tid_bit) || !(en & FD_EV_ACTIVE_RW)) {
+	if ((ps | pr) & ti->ltid_bit) {
+		if (!(fdtab[fd].thread_mask & ti->ltid_bit) || !(en & FD_EV_ACTIVE_RW)) {
 			/* fd removed from poll list */
 			opcode = EPOLL_CTL_DEL;
-			if (polled_mask[fd].poll_recv & tid_bit)
-				_HA_ATOMIC_AND(&polled_mask[fd].poll_recv, ~tid_bit);
-			if (polled_mask[fd].poll_send & tid_bit)
-				_HA_ATOMIC_AND(&polled_mask[fd].poll_send, ~tid_bit);
+			if (pr & ti->ltid_bit)
+				_HA_ATOMIC_AND(&polled_mask[fd].poll_recv, ~ti->ltid_bit);
+			if (ps & ti->ltid_bit)
+				_HA_ATOMIC_AND(&polled_mask[fd].poll_send, ~ti->ltid_bit);
 		}
 		else {
-			if (((en & FD_EV_ACTIVE_R) != 0) ==
-			    ((polled_mask[fd].poll_recv & tid_bit) != 0) &&
-			    ((en & FD_EV_ACTIVE_W) != 0) ==
-			    ((polled_mask[fd].poll_send & tid_bit) != 0))
+			if (((en & FD_EV_ACTIVE_R) != 0) == ((pr & ti->ltid_bit) != 0) &&
+			    ((en & FD_EV_ACTIVE_W) != 0) == ((ps & ti->ltid_bit) != 0))
 				return;
 			if (en & FD_EV_ACTIVE_R) {
-				if (!(polled_mask[fd].poll_recv & tid_bit))
-					_HA_ATOMIC_OR(&polled_mask[fd].poll_recv, tid_bit);
+				if (!(pr & ti->ltid_bit))
+					_HA_ATOMIC_OR(&polled_mask[fd].poll_recv, ti->ltid_bit);
 			} else {
-				if (polled_mask[fd].poll_recv & tid_bit)
-					_HA_ATOMIC_AND(&polled_mask[fd].poll_recv, ~tid_bit);
+				if (pr & ti->ltid_bit)
+					_HA_ATOMIC_AND(&polled_mask[fd].poll_recv, ~ti->ltid_bit);
 			}
 			if (en & FD_EV_ACTIVE_W) {
-				if (!(polled_mask[fd].poll_send & tid_bit))
-					_HA_ATOMIC_OR(&polled_mask[fd].poll_send, tid_bit);
+				if (!(ps & ti->ltid_bit))
+					_HA_ATOMIC_OR(&polled_mask[fd].poll_send, ti->ltid_bit);
 			} else {
-				if (polled_mask[fd].poll_send & tid_bit)
-					_HA_ATOMIC_AND(&polled_mask[fd].poll_send, ~tid_bit);
+				if (ps & ti->ltid_bit)
+					_HA_ATOMIC_AND(&polled_mask[fd].poll_send, ~ti->ltid_bit);
 			}
 			/* fd status changed */
 			opcode = EPOLL_CTL_MOD;
 		}
 	}
-	else if ((fdtab[fd].thread_mask & tid_bit) && (en & FD_EV_ACTIVE_RW)) {
+	else if ((fdtab[fd].thread_mask & ti->ltid_bit) && (en & FD_EV_ACTIVE_RW)) {
 		/* new fd in the poll list */
 		opcode = EPOLL_CTL_ADD;
 		if (en & FD_EV_ACTIVE_R)
-			_HA_ATOMIC_OR(&polled_mask[fd].poll_recv, tid_bit);
+			_HA_ATOMIC_OR(&polled_mask[fd].poll_recv, ti->ltid_bit);
 		if (en & FD_EV_ACTIVE_W)
-			_HA_ATOMIC_OR(&polled_mask[fd].poll_send, tid_bit);
+			_HA_ATOMIC_OR(&polled_mask[fd].poll_send, ti->ltid_bit);
 	}
 	else {
 		return;
@@ -156,17 +170,25 @@ static void _do_poll(struct poller *p, int exp, int wake)
 	for (updt_idx = 0; updt_idx < fd_nbupdt; updt_idx++) {
 		fd = fd_updt[updt_idx];
 
-		_HA_ATOMIC_AND(&fdtab[fd].update_mask, ~tid_bit);
-		if (!fdtab[fd].owner) {
+		if (!fd_grab_tgid(fd, tgid)) {
+			/* was reassigned */
 			activity[tid].poll_drop_fd++;
 			continue;
 		}
 
-		_update_fd(fd);
+		_HA_ATOMIC_AND(&fdtab[fd].update_mask, ~ti->ltid_bit);
+
+		if (fdtab[fd].owner)
+			_update_fd(fd);
+		else
+			activity[tid].poll_drop_fd++;
+
+		fd_drop_tgid(fd);
 	}
 	fd_nbupdt = 0;
-	/* Scan the global update list */
-	for (old_fd = fd = update_list.first; fd != -1; fd = fdtab[fd].update.next) {
+
+	/* Scan the shared update list */
+	for (old_fd = fd = update_list[tgid - 1].first; fd != -1; fd = fdtab[fd].update.next) {
 		if (fd == -2) {
 			fd = old_fd;
 			continue;
@@ -175,13 +197,26 @@ static void _do_poll(struct poller *p, int exp, int wake)
 			fd = -fd -4;
 		if (fd == -1)
 			break;
-		if (fdtab[fd].update_mask & tid_bit)
-			done_update_polling(fd);
+
+		if (!fd_grab_tgid(fd, tgid)) {
+			/* was reassigned */
+			activity[tid].poll_drop_fd++;
+			continue;
+		}
+
+		if (!(fdtab[fd].update_mask & ti->ltid_bit)) {
+			fd_drop_tgid(fd);
+			continue;
+		}
+
+		done_update_polling(fd);
+
+		if (fdtab[fd].owner)
+			_update_fd(fd);
 		else
-			continue;
-		if (!fdtab[fd].owner)
-			continue;
-		_update_fd(fd);
+			activity[tid].poll_drop_fd++;
+
+		fd_drop_tgid(fd);
 	}
 
 	thread_idle_now();
@@ -213,9 +248,7 @@ static void _do_poll(struct poller *p, int exp, int wake)
 	/* process polled events */
 
 	for (count = 0; count < status; count++) {
-		struct epoll_event ev;
 		unsigned int n, e;
-		int ret;
 
 		e = epoll_events[count].events;
 		fd = epoll_events[count].data.fd;
@@ -232,22 +265,13 @@ static void _do_poll(struct poller *p, int exp, int wake)
 		    ((e & EPOLLHUP)   ? FD_EV_SHUT_RW : 0) |
 		    ((e & EPOLLERR)   ? FD_EV_ERR_RW  : 0);
 
-		ret = fd_update_events(fd, n);
-
-		if (ret == FD_UPDT_MIGRATED) {
-			/* FD has been migrated */
-			epoll_ctl(epoll_fd[tid], EPOLL_CTL_DEL, fd, &ev);
-			_HA_ATOMIC_AND(&polled_mask[fd].poll_recv, ~tid_bit);
-			_HA_ATOMIC_AND(&polled_mask[fd].poll_send, ~tid_bit);
-		}
+		fd_update_events(fd, n);
 	}
 	/* the caller will take care of cached events */
 }
 
 static int init_epoll_per_thread()
 {
-	int fd;
-
 	epoll_events = calloc(1, sizeof(struct epoll_event) * global.tune.maxpollevents);
 	if (epoll_events == NULL)
 		goto fail_alloc;
@@ -263,8 +287,7 @@ static int init_epoll_per_thread()
 	 * fd for this thread. Let's just mark them as updated, the poller will
 	 * do the rest.
 	 */
-	for (fd = 0; fd < global.maxsock; fd++)
-		updt_fd_polling(fd);
+	fd_reregister_all(tgid, ti->ltid_bit);
 
 	return 1;
  fail_fd:

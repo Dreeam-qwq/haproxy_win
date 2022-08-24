@@ -86,6 +86,11 @@ extern const char *stat_status_codes[];
 
 struct proxy *mworker_proxy; /* CLI proxy of the master */
 
+/* CLI context for the "show activity" command */
+struct show_activity_ctx {
+	int thr;         /* thread ID to show or -1 for all */
+};
+
 /* CLI context for the "show env" command */
 struct show_env_ctx {
 	char **var;      /* first variable to show */
@@ -487,6 +492,7 @@ static int cli_parse_global(char **args, int section_type, struct proxy *curpx,
 		}
 		bind_conf->level &= ~ACCESS_LVL_MASK;
 		bind_conf->level |= ACCESS_LVL_OPER; /* default access level */
+		bind_conf->bind_tgroup = 1; // bind to a single group in any case
 
 		if (!str2listener(args[2], global.cli_fe, bind_conf, file, line, err)) {
 			memprintf(err, "parsing [%s:%d] : '%s %s' : %s\n",
@@ -598,28 +604,9 @@ static int cli_parse_global(char **args, int section_type, struct proxy *curpx,
 		}
 		global.cli_fe->maxconn = maxconn;
 	}
-	else if (strcmp(args[1], "bind-process") == 0) {  /* enable the socket only on some processes */
-		int cur_arg = 2;
-		unsigned long set = 0;
-
-		if (!global.cli_fe) {
-			if ((global.cli_fe = cli_alloc_fe("GLOBAL", file, line)) == NULL) {
-				memprintf(err, "'%s %s' : out of memory trying to allocate a frontend", args[0], args[1]);
-				return -1;
-			}
-		}
-
-		while (*args[cur_arg]) {
-			if (strcmp(args[cur_arg], "all") == 0) {
-				set = 0;
-				break;
-			}
-			if (parse_process_number(args[cur_arg], &set, 1, NULL, err)) {
-				memprintf(err, "'%s %s' : %s", args[0], args[1], *err);
-				return -1;
-			}
-			cur_arg++;
-		}
+	else if (strcmp(args[1], "bind-process") == 0) {
+		memprintf(err, "'%s' is not supported anymore.", args[0]);
+		return -1;
 	}
 	else {
 		memprintf(err, "'%s' only supports 'socket', 'maxconn', 'bind-process' and 'timeout' (got '%s')", args[0], args[1]);
@@ -741,16 +728,6 @@ static int cli_parse_request(struct appctx *appctx)
 	char *args[MAX_CLI_ARGS + 1], *p, *end, *payload = NULL;
 	int i = 0;
 	struct cli_kw *kw;
-
-	appctx->_st2 = 0;
-
-	/* temporary for 2.6: let's make sure we clean the whole shared
-	 * context.
-	 */
-	if (sizeof(appctx->ctx) > sizeof(appctx->svc))
-		memset(&appctx->ctx, 0, sizeof(appctx->ctx));
-	else
-		memset(&appctx->svc, 0, sizeof(appctx->svc));
 
 	p = appctx->chunk->area;
 	end = p + appctx->chunk->data;
@@ -917,10 +894,9 @@ static void cli_io_handler(struct appctx *appctx)
 
 	while (1) {
 		if (appctx->st0 == CLI_ST_INIT) {
-			/* CLI/stats not initialized yet */
-			memset(&appctx->ctx, 0, sizeof(appctx->ctx));
 			/* reset severity to default at init */
 			appctx->cli_severity_output = bind_conf->severity_output;
+			applet_reset_svcctx(appctx);
 			appctx->st0 = CLI_ST_GETREQ;
 			appctx->cli_level = bind_conf->level;
 		}
@@ -1131,8 +1107,10 @@ static void cli_io_handler(struct appctx *appctx)
 						prompt = "\n";
 				}
 
-				if (applet_putstr(appctx, prompt) != -1)
+				if (applet_putstr(appctx, prompt) != -1) {
+					applet_reset_svcctx(appctx);
 					appctx->st0 = CLI_ST_GETREQ;
+				}
 			}
 
 			/* If the output functions are still there, it means they require more room. */
@@ -1153,6 +1131,7 @@ static void cli_io_handler(struct appctx *appctx)
 			}
 
 			/* switch state back to GETREQ to read next requests */
+			applet_reset_svcctx(appctx);
 			appctx->st0 = CLI_ST_GETREQ;
 			applet_will_consume(appctx);
 
@@ -1329,7 +1308,7 @@ static int cli_io_handler_show_fd(struct appctx *appctx)
 			suspicious = 1;
 
 		chunk_printf(&trash,
-			     "  %5d : st=0x%06x(%c%c %c%c%c%c%c W:%c%c%c R:%c%c%c) tmask=0x%lx umask=0x%lx owner=%p iocb=%p(",
+			     "  %5d : st=0x%06x(%c%c %c%c%c%c%c W:%c%c%c R:%c%c%c) ref=%#x gid=%d tmask=0x%lx umask=0x%lx owner=%p iocb=%p(",
 			     fd,
 			     fdt.state,
 			     (fdt.state & FD_CLONED) ? 'C' : 'c',
@@ -1345,6 +1324,8 @@ static int cli_io_handler_show_fd(struct appctx *appctx)
 			     (fdt.state & FD_EV_SHUT_R) ? 'S' : 's',
 			     (fdt.state & FD_EV_READY_R)  ? 'R' : 'r',
 			     (fdt.state & FD_EV_ACTIVE_R) ? 'A' : 'a',
+			     (fdt.refc_tgid >> 4) & 0xffff,
+			     (fdt.refc_tgid) & 0xffff,
 			     fdt.thread_mask, fdt.update_mask,
 			     fdt.owner,
 			     fdt.iocb);
@@ -1463,6 +1444,8 @@ static int cli_io_handler_show_fd(struct appctx *appctx)
 static int cli_io_handler_show_activity(struct appctx *appctx)
 {
 	struct stconn *sc = appctx_sc(appctx);
+	struct show_activity_ctx *actctx = appctx->svcctx;
+	int tgt = actctx->thr; // target thread, -1 for all, 0 for total only
 	int thr;
 
 	if (unlikely(sc_ic(sc)->flags & (CF_WRITE_ERROR|CF_SHUTW)))
@@ -1484,10 +1467,15 @@ static int cli_io_handler_show_activity(struct appctx *appctx)
 			chunk_appendf(&trash, " %u\n", _tot);		\
 			break;						\
 		}							\
-		chunk_appendf(&trash, " %u [", _tot);			\
-		for (t = 0; t < _nbt; t++)				\
-			chunk_appendf(&trash, " %u", _v[t]);		\
-		chunk_appendf(&trash, " ]\n");				\
+		if (tgt == -1) {					\
+			chunk_appendf(&trash, " %u [", _tot);		\
+			for (t = 0; t < _nbt; t++)			\
+				chunk_appendf(&trash, " %u", _v[t]);	\
+			chunk_appendf(&trash, " ]\n");			\
+		} else if (tgt == 0)					\
+				chunk_appendf(&trash, " %u\n", _tot);	\
+			else						\
+				chunk_appendf(&trash, " %u\n", _v[tgt-1]);\
 	} while (0)
 
 #undef SHOW_AVG
@@ -1504,10 +1492,15 @@ static int cli_io_handler_show_activity(struct appctx *appctx)
 			chunk_appendf(&trash, " %u\n", _tot);		\
 			break;						\
 		}							\
-		chunk_appendf(&trash, " %u [", (_tot + _nbt/2) / _nbt); \
-		for (t = 0; t < _nbt; t++)				\
-			chunk_appendf(&trash, " %u", _v[t]);		\
-		chunk_appendf(&trash, " ]\n");				\
+		if (tgt == -1) {					\
+			chunk_appendf(&trash, " %u [", (_tot + _nbt/2) / _nbt); \
+			for (t = 0; t < _nbt; t++)			\
+				chunk_appendf(&trash, " %u", _v[t]);	\
+			chunk_appendf(&trash, " ]\n");			\
+		} else if (tgt == 0)					\
+				chunk_appendf(&trash, " %u\n", (_tot + _nbt/2) / _nbt);	\
+			else						\
+				chunk_appendf(&trash, " %u\n", _v[tgt-1]);\
 	} while (0)
 
 	chunk_appendf(&trash, "thread_id: %u (%u..%u)\n", tid + 1, 1, global.nbthread);
@@ -1635,6 +1628,28 @@ static int cli_io_handler_show_cli_sock(struct appctx *appctx)
 	return 0;
 }
 
+
+/* parse a "show activity" CLI request. Returns 0 if it needs to continue, 1 if it
+ * wants to stop here. It sets a show_activity_ctx context where, if a specific
+ * thread is requested, it puts the thread number into ->thr otherwise sets it to
+ * -1.
+ */
+static int cli_parse_show_activity(char **args, char *payload, struct appctx *appctx, void *private)
+{
+	struct show_activity_ctx *ctx = applet_reserve_svcctx(appctx, sizeof(*ctx));
+
+	if (!cli_has_level(appctx, ACCESS_LVL_OPER))
+		return 1;
+
+	ctx->thr = -1; // show all by default
+	if (*args[2])
+		ctx->thr = atoi(args[2]);
+
+	if (ctx->thr < -1 || ctx->thr > global.nbthread)
+		return cli_err(appctx, "Thread ID number must be between -1 and nbthread\n");
+
+	return 0;
+}
 
 /* parse a "show env" CLI request. Returns 0 if it needs to continue, 1 if it
  * wants to stop here. It reserves a sohw_env_ctx where it puts the variable to
@@ -1970,6 +1985,7 @@ static int bind_parse_severity_output(char **args, int cur_arg, struct proxy *px
 /* Send all the bound sockets, always returns 1 */
 static int _getsocks(char **args, char *payload, struct appctx *appctx, void *private)
 {
+	static int already_sent = 0;
 	char *cmsgbuf = NULL;
 	unsigned char *tmpbuf = NULL;
 	struct cmsghdr *cmsg;
@@ -2025,8 +2041,11 @@ static int _getsocks(char **args, char *payload, struct appctx *appctx, void *pr
 	for (cur_fd = 0;cur_fd < global.maxsock; cur_fd++)
 		tot_fd_nb += !!(fdtab[cur_fd].state & FD_EXPORTED);
 
-	if (tot_fd_nb == 0)
+	if (tot_fd_nb == 0) {
+		if (already_sent)
+			ha_warning("_getsocks: attempt to get sockets but they were already sent and closed in this process!\n");
 		goto out;
+	}
 
 	/* First send the total number of file descriptors, so that the
 	 * receiving end knows what to expect.
@@ -2132,6 +2151,8 @@ static int _getsocks(char **args, char *payload, struct appctx *appctx, void *pr
 			nb_queued = 0;
 		}
 	}
+
+	already_sent = 1;
 
 	/* flush pending stuff */
 	if (nb_queued) {
@@ -2282,6 +2303,9 @@ static int pcli_prefix_to_pid(const char *prefix)
 
 		if (proc_pid == 0) /* return the master */
 			return 0;
+
+		if (proc_pid != 1) /* only the "@1" relative PID is supported */
+			return -1;
 
 		/* chose the right process, the current one is the one with the
 		 least number of reloads */
@@ -3001,6 +3025,7 @@ int mworker_cli_proxy_new_listener(char *line)
 	bind_conf->level &= ~ACCESS_LVL_MASK;
 	bind_conf->level |= ACCESS_LVL_ADMIN;
 	bind_conf->level |= ACCESS_MASTER | ACCESS_MASTER_ONLY;
+	bind_conf->bind_tgroup = 1; // bind to a single group in any case
 
 	if (!str2listener(args[0], mworker_proxy, bind_conf, "master-socket", 0, &err)) {
 		ha_alert("Cannot create the listener of the master CLI\n");
@@ -3098,6 +3123,7 @@ int mworker_cli_sockpair_new(struct mworker_proc *mworker_proc, int proc)
 	bind_conf->level &= ~ACCESS_LVL_MASK;
 	bind_conf->level |= ACCESS_LVL_ADMIN; /* TODO: need to lower the rights with a CLI keyword*/
 	bind_conf->level |= ACCESS_FD_LISTENERS;
+	bind_conf->bind_tgroup = 1; // bind to a single group in any case
 
 	if (!memprintf(&path, "sockpair@%d", mworker_proc->ipc_fd[1])) {
 		ha_alert("Cannot allocate listener.\n");
@@ -3164,7 +3190,7 @@ static struct cli_kw_list cli_kws = {{ },{
 	{ { "show", "cli", "sockets",  NULL },   "show cli sockets                        : dump list of cli sockets",                                cli_parse_default, cli_io_handler_show_cli_sock, NULL, NULL, ACCESS_MASTER },
 	{ { "show", "cli", "level", NULL },      "show cli level                          : display the level of the current CLI session",            cli_parse_show_lvl, NULL, NULL, NULL, ACCESS_MASTER},
 	{ { "show", "fd", NULL },                "show fd [num]                           : dump list of file descriptors in use or a specific one",  cli_parse_show_fd, cli_io_handler_show_fd, NULL },
-	{ { "show", "activity", NULL },          "show activity                           : show per-thread activity stats (for support/developers)", cli_parse_default, cli_io_handler_show_activity, NULL },
+	{ { "show", "activity", NULL },          "show activity [-1|0|thread_num]         : show per-thread activity stats (for support/developers)", cli_parse_show_activity, cli_io_handler_show_activity, NULL },
 	{ { "show", "version", NULL },           "show version                            : show version of the current process",                     cli_parse_show_version, NULL, NULL, NULL, ACCESS_MASTER },
 	{ { "operator", NULL },                  "operator                                : lower the level of the current CLI session to operator",  cli_parse_set_lvl, NULL, NULL, NULL, ACCESS_MASTER},
 	{ { "user", NULL },                      "user                                    : lower the level of the current CLI session to user",      cli_parse_set_lvl, NULL, NULL, NULL, ACCESS_MASTER},

@@ -45,7 +45,9 @@ static inline __attribute((always_inline)) void ha_crash_now(void)
 #if __GNUC_PREREQ__(5, 0)
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Warray-bounds"
+#if __GNUC_PREREQ__(6, 0)
 #pragma GCC diagnostic ignored "-Wnull-dereference"
+#endif
 #endif
 	*(volatile char *)1 = 0;
 #if __GNUC_PREREQ__(5, 0)
@@ -240,17 +242,20 @@ enum {
 struct mem_stats {
 	size_t calls;
 	size_t size;
+	const char *func;
 	const char *file;
 	int line;
 	int type;
-};
+	const void *extra; // extra info specific to this call (e.g. pool ptr)
+} __attribute__((aligned(sizeof(void*))));
 
 #undef calloc
 #define calloc(x,y)  ({							\
 	size_t __x = (x); size_t __y = (y);				\
-	static struct mem_stats _ __attribute__((used,__section__("mem_stats"))) = { \
+	static struct mem_stats _ __attribute__((used,__section__("mem_stats"),__aligned__(sizeof(void*)))) = { \
 		.file = __FILE__, .line = __LINE__,			\
 		.type = MEM_STATS_TYPE_CALLOC,				\
+		.func = __func__,					\
 	};								\
 	HA_WEAK("__start_mem_stats");					\
 	HA_WEAK("__stop_mem_stats");					\
@@ -260,28 +265,34 @@ struct mem_stats {
 })
 
 /* note: we can't redefine free() because we have a few variables and struct
- * members called like this.
+ * members called like this. This one may be used before a call to free(),
+ * and when known, the size should be indicated, otherwise pass zero. The
+ * pointer is used to know whether the call should be accounted for (null is
+ * ignored).
  */
-#undef __free
-#define __free(x)  ({							\
-	void *__x = (x);						\
-	static struct mem_stats _ __attribute__((used,__section__("mem_stats"))) = { \
+#undef will_free
+#define will_free(x, y)  ({						\
+	void *__x = (x); size_t __y = (y);				\
+	static struct mem_stats _ __attribute__((used,__section__("mem_stats"),__aligned__(sizeof(void*)))) = { \
 		.file = __FILE__, .line = __LINE__,			\
 		.type = MEM_STATS_TYPE_FREE,				\
+		.func = __func__,					\
 	};								\
 	HA_WEAK("__start_mem_stats");					\
 	HA_WEAK("__stop_mem_stats");					\
-	if (__x)							\
+	if (__x) {							\
 		_HA_ATOMIC_INC(&_.calls);				\
-	free(__x);							\
+		_HA_ATOMIC_ADD(&_.size, __y);				\
+	}								\
 })
 
 #undef ha_free
 #define ha_free(x)  ({							\
 	typeof(x) __x = (x);						\
-	static struct mem_stats _ __attribute__((used,__section__("mem_stats"))) = { \
+	static struct mem_stats _ __attribute__((used,__section__("mem_stats"),__aligned__(sizeof(void*)))) = { \
 		.file = __FILE__, .line = __LINE__,			\
 		.type = MEM_STATS_TYPE_FREE,				\
+		.func = __func__,					\
 	};								\
 	HA_WEAK("__start_mem_stats");					\
 	HA_WEAK("__stop_mem_stats");					\
@@ -297,9 +308,10 @@ struct mem_stats {
 #undef malloc
 #define malloc(x)  ({							\
 	size_t __x = (x);						\
-	static struct mem_stats _ __attribute__((used,__section__("mem_stats"))) = { \
+	static struct mem_stats _ __attribute__((used,__section__("mem_stats"),__aligned__(sizeof(void*)))) = { \
 		.file = __FILE__, .line = __LINE__,			\
 		.type = MEM_STATS_TYPE_MALLOC,				\
+		.func = __func__,					\
 	};								\
 	HA_WEAK("__start_mem_stats");					\
 	HA_WEAK("__stop_mem_stats");					\
@@ -311,9 +323,10 @@ struct mem_stats {
 #undef realloc
 #define realloc(x,y)  ({						\
 	void *__x = (x); size_t __y = (y);				\
-	static struct mem_stats _ __attribute__((used,__section__("mem_stats"))) = { \
+	static struct mem_stats _ __attribute__((used,__section__("mem_stats"),__aligned__(sizeof(void*)))) = { \
 		.file = __FILE__, .line = __LINE__,			\
 		.type = MEM_STATS_TYPE_REALLOC,				\
+		.func = __func__,					\
 	};								\
 	HA_WEAK("__start_mem_stats");					\
 	HA_WEAK("__stop_mem_stats");					\
@@ -325,9 +338,10 @@ struct mem_stats {
 #undef strdup
 #define strdup(x)  ({							\
 	const char *__x = (x); size_t __y = strlen(__x); 		\
-	static struct mem_stats _ __attribute__((used,__section__("mem_stats"))) = { \
+	static struct mem_stats _ __attribute__((used,__section__("mem_stats"),__aligned__(sizeof(void*)))) = { \
 		.file = __FILE__, .line = __LINE__,			\
 		.type = MEM_STATS_TYPE_STRDUP,				\
+		.func = __func__,					\
 	};								\
 	HA_WEAK("__start_mem_stats");					\
 	HA_WEAK("__stop_mem_stats");					\
@@ -335,6 +349,10 @@ struct mem_stats {
 	_HA_ATOMIC_ADD(&_.size, __y);					\
 	strdup(__x);							\
 })
+#else // DEBUG_MEM_STATS
+
+#define will_free(x, y) do { } while (0)
+
 #endif /* DEBUG_MEM_STATS*/
 
 #endif /* _HAPROXY_BUG_H */

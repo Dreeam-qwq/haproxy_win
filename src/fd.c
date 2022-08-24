@@ -108,7 +108,7 @@ struct poller pollers[MAX_POLLERS] __read_mostly;
 struct poller cur_poller           __read_mostly;
 int nbpollers = 0;
 
-volatile struct fdlist update_list; // Global update list
+volatile struct fdlist update_list[MAX_TGROUPS]; // Global update list
 
 THREAD_LOCAL int *fd_updt  = NULL;  // FD updates list
 THREAD_LOCAL int  fd_nbupdt = 0;   // number of updates in the list
@@ -118,10 +118,8 @@ int poller_wr_pipe[MAX_THREADS] __read_mostly; // Pipe to wake the threads
 volatile int ha_used_fds = 0; // Number of FD we're currently using
 static struct fdtab *fdtab_addr;  /* address of the allocated area containing fdtab */
 
-#define _GET_NEXT(fd, off) ((volatile struct fdlist_entry *)(void *)((char *)(&fdtab[fd]) + off))->next
-#define _GET_PREV(fd, off) ((volatile struct fdlist_entry *)(void *)((char *)(&fdtab[fd]) + off))->prev
 /* adds fd <fd> to fd list <list> if it was not yet in it */
-void fd_add_to_fd_list(volatile struct fdlist *list, int fd, int off)
+void fd_add_to_fd_list(volatile struct fdlist *list, int fd)
 {
 	int next;
 	int new;
@@ -129,13 +127,13 @@ void fd_add_to_fd_list(volatile struct fdlist *list, int fd, int off)
 	int last;
 
 redo_next:
-	next = _GET_NEXT(fd, off);
+	next = fdtab[fd].update.next;
 	/* Check that we're not already in the cache, and if not, lock us. */
 	if (next > -2)
 		goto done;
 	if (next == -2)
 		goto redo_next;
-	if (!_HA_ATOMIC_CAS(&_GET_NEXT(fd, off), &next, -2))
+	if (!_HA_ATOMIC_CAS(&fdtab[fd].update.next, &next, -2))
 		goto redo_next;
 	__ha_barrier_atomic_store();
 
@@ -145,7 +143,7 @@ redo_last:
 	last = list->last;
 	old = -1;
 
-	_GET_PREV(fd, off) = -2;
+	fdtab[fd].update.prev = -2;
 	/* Make sure the "prev" store is visible before we update the last entry */
 	__ha_barrier_store();
 
@@ -161,7 +159,7 @@ redo_last:
 		 * The CAS will only succeed if its next is -1,
 		 * which means it's in the cache, and the last element.
 		 */
-		if (unlikely(!_HA_ATOMIC_CAS(&_GET_NEXT(last, off), &old, new)))
+		if (unlikely(!_HA_ATOMIC_CAS(&fdtab[last].update.next, &old, new)))
 			goto redo_last;
 
 		/* Then, update the last entry */
@@ -171,15 +169,15 @@ redo_last:
 	/* since we're alone at the end of the list and still locked(-2),
 	 * we know no one tried to add past us. Mark the end of list.
 	 */
-	_GET_PREV(fd, off) = last;
-	_GET_NEXT(fd, off) = -1;
+	fdtab[fd].update.prev = last;
+	fdtab[fd].update.next = -1;
 	__ha_barrier_store();
 done:
 	return;
 }
 
 /* removes fd <fd> from fd list <list> */
-void fd_rm_from_fd_list(volatile struct fdlist *list, int fd, int off)
+void fd_rm_from_fd_list(volatile struct fdlist *list, int fd)
 {
 #if defined(HA_HAVE_CAS_DW) || defined(HA_CAS_IS_8B)
 	volatile union {
@@ -196,7 +194,7 @@ void fd_rm_from_fd_list(volatile struct fdlist *list, int fd, int off)
 lock_self:
 #if (defined(HA_CAS_IS_8B) || defined(HA_HAVE_CAS_DW))
 	next_list.ent.next = next_list.ent.prev = -2;
-	cur_list.ent = *(volatile struct fdlist_entry *)(((char *)&fdtab[fd]) + off);
+	cur_list.ent = fdtab[fd].update;
 	/* First, attempt to lock our own entries */
 	do {
 		/* The FD is not in the FD cache, give up */
@@ -206,9 +204,9 @@ lock_self:
 			goto lock_self;
 	} while (
 #ifdef HA_CAS_IS_8B
-		 unlikely(!_HA_ATOMIC_CAS(((uint64_t *)&_GET_NEXT(fd, off)), (uint64_t *)&cur_list.u64, next_list.u64))
+		 unlikely(!_HA_ATOMIC_CAS(((uint64_t *)&fdtab[fd].update), (uint64_t *)&cur_list.u64, next_list.u64))
 #else
-		 unlikely(!_HA_ATOMIC_DWCAS(((long *)&_GET_NEXT(fd, off)), (uint32_t *)&cur_list.u32, &next_list.u32))
+		 unlikely(!_HA_ATOMIC_DWCAS(((long *)&fdtab[fd].update), (uint32_t *)&cur_list.u32, &next_list.u32))
 #endif
 	    );
 	next = cur_list.ent.next;
@@ -216,18 +214,18 @@ lock_self:
 
 #else
 lock_self_next:
-	next = _GET_NEXT(fd, off);
+	next = fdtab[fd].update.next;
 	if (next == -2)
 		goto lock_self_next;
 	if (next <= -3)
 		goto done;
-	if (unlikely(!_HA_ATOMIC_CAS(&_GET_NEXT(fd, off), &next, -2)))
+	if (unlikely(!_HA_ATOMIC_CAS(&fdtab[fd].update.next, &next, -2)))
 		goto lock_self_next;
 lock_self_prev:
-	prev = _GET_PREV(fd, off);
+	prev = fdtab[fd].update.prev;
 	if (prev == -2)
 		goto lock_self_prev;
-	if (unlikely(!_HA_ATOMIC_CAS(&_GET_PREV(fd, off), &prev, -2)))
+	if (unlikely(!_HA_ATOMIC_CAS(&fdtab[fd].update.prev, &prev, -2)))
 		goto lock_self_prev;
 #endif
 	__ha_barrier_atomic_store();
@@ -237,14 +235,14 @@ lock_self_prev:
 redo_prev:
 		old = fd;
 
-		if (unlikely(!_HA_ATOMIC_CAS(&_GET_NEXT(prev, off), &old, new))) {
+		if (unlikely(!_HA_ATOMIC_CAS(&fdtab[prev].update.next, &old, new))) {
 			if (unlikely(old == -2)) {
 				/* Neighbour already locked, give up and
 				 * retry again once he's done
 				 */
-				_GET_PREV(fd, off) = prev;
+				fdtab[fd].update.prev = prev;
 				__ha_barrier_store();
-				_GET_NEXT(fd, off) = next;
+				fdtab[fd].update.next = next;
 				__ha_barrier_store();
 				goto lock_self;
 			}
@@ -254,18 +252,18 @@ redo_prev:
 	if (likely(next != -1)) {
 redo_next:
 		old = fd;
-		if (unlikely(!_HA_ATOMIC_CAS(&_GET_PREV(next, off), &old, new))) {
+		if (unlikely(!_HA_ATOMIC_CAS(&fdtab[next].update.prev, &old, new))) {
 			if (unlikely(old == -2)) {
 				/* Neighbour already locked, give up and
 				 * retry again once he's done
 				 */
 				if (prev != -1) {
-					_GET_NEXT(prev, off) = fd;
+					fdtab[prev].update.next = fd;
 					__ha_barrier_store();
 				}
-				_GET_PREV(fd, off) = prev;
+				fdtab[fd].update.prev = prev;
 				__ha_barrier_store();
-				_GET_NEXT(fd, off) = next;
+				fdtab[fd].update.next = next;
 				__ha_barrier_store();
 				goto lock_self;
 			}
@@ -283,20 +281,17 @@ redo_next:
 	 */
 	__ha_barrier_store();
 	if (likely(prev != -1))
-		_GET_NEXT(prev, off) = next;
+		fdtab[prev].update.next = next;
 	__ha_barrier_store();
 	if (likely(next != -1))
-		_GET_PREV(next, off) = prev;
+		fdtab[next].update.prev = prev;
 	__ha_barrier_store();
 	/* Ok, now we're out of the fd cache */
-	_GET_NEXT(fd, off) = -(next + 4);
+	fdtab[fd].update.next = -(next + 4);
 	__ha_barrier_store();
 done:
 	return;
 }
-
-#undef _GET_NEXT
-#undef _GET_PREV
 
 /* deletes the FD once nobody uses it anymore, as detected by the caller by its
  * thread_mask being zero and its running mask turning to zero. There is no
@@ -314,19 +309,34 @@ void _fd_delete_orphan(int fd)
 		DISGUISE(setsockopt(fd, SOL_SOCKET, SO_LINGER,
 			   (struct linger *) &nolinger, sizeof(struct linger)));
 	}
+
+	/* It's expected that a close() will result in the FD disappearing from
+	 * pollers, but some pollers may have some internal bookkeeping to be
+	 * done prior to the call (e.g. remove references from internal tables).
+	 */
 	if (cur_poller.clo)
 		cur_poller.clo(fd);
+
+	/* we don't want this FD anymore in the global list */
+	fd_rm_from_fd_list(&update_list[tgid - 1], fd);
+
+	/* no more updates on this FD are relevant anymore */
+	HA_ATOMIC_STORE(&fdtab[fd].update_mask, 0);
+	if (fd_nbupdt > 0 && fd_updt[fd_nbupdt - 1] == fd)
+		fd_nbupdt--;
 
 	port_range_release_port(fdinfo[fd].port_range, fdinfo[fd].local_port);
 	polled_mask[fd].poll_recv = polled_mask[fd].poll_send = 0;
 
 	fdtab[fd].state = 0;
+	fd_reset_tgid(fd);
 
 #ifdef DEBUG_FD
 	fdtab[fd].event_count = 0;
 #endif
 	fdinfo[fd].port_range = NULL;
 	fdtab[fd].owner = NULL;
+
 	/* perform the close() call last as it's what unlocks the instant reuse
 	 * of this FD by any other thread.
 	 */
@@ -345,6 +355,19 @@ void fd_delete(int fd)
 	 */
 	BUG_ON(fd < 0 || fd >= global.maxsock);
 
+	/* NOTE: The master when going into reexec mode re-closes all FDs after
+	 * they were already dispatched. But we know we didn't start the polling
+	 * threads so we can still close them. The masks will probably not match
+	 * however so we force the value and erase the refcount if any.
+	 */
+	if (unlikely(global.mode & MODE_STARTING))
+		fdtab[fd].refc_tgid = ti->tgid;
+
+	/* the tgid cannot change before a complete close so we should never
+	 * face the situation where we try to close an fd that was reassigned.
+	 */
+	BUG_ON(fd_tgid(fd) != ti->tgid && !thread_isolated());
+
 	/* we must postpone removal of an FD that may currently be in use
 	 * by another thread. This can happen in the following two situations:
 	 *   - after a takeover, the owning thread closes the connection but
@@ -361,9 +384,9 @@ void fd_delete(int fd)
 	 * safely delete the FD. Most of the time it will be the current thread.
 	 */
 
-	HA_ATOMIC_OR(&fdtab[fd].running_mask, tid_bit);
+	HA_ATOMIC_OR(&fdtab[fd].running_mask, ti->ltid_bit);
 	HA_ATOMIC_STORE(&fdtab[fd].thread_mask, 0);
-	if (fd_clr_running(fd) == 0)
+	if (fd_clr_running(fd) == ti->ltid_bit)
 		_fd_delete_orphan(fd);
 }
 
@@ -412,14 +435,20 @@ int fd_takeover(int fd, void *expected_owner)
 	/* we must be alone to work on this idle FD. If not, it means that its
 	 * poller is currently waking up and is about to use it, likely to
 	 * close it on shut/error, but maybe also to process any unexpectedly
-	 * pending data.
+	 * pending data. It's also possible that the FD was closed and
+	 * reassigned to another thread group, so let's be careful.
 	 */
-	old = 0;
-	if (!HA_ATOMIC_CAS(&fdtab[fd].running_mask, &old, tid_bit))
+	if (unlikely(!fd_grab_tgid(fd, ti->tgid)))
 		return -1;
 
+	old = 0;
+	if (!HA_ATOMIC_CAS(&fdtab[fd].running_mask, &old, ti->ltid_bit)) {
+		fd_drop_tgid(fd);
+		return -1;
+	}
+
 	/* success, from now on it's ours */
-	HA_ATOMIC_STORE(&fdtab[fd].thread_mask, tid_bit);
+	HA_ATOMIC_STORE(&fdtab[fd].thread_mask, ti->ltid_bit);
 
 	/* Make sure the FD doesn't have the active bit. It is possible that
 	 * the fd is polled by the thread that used to own it, the new thread
@@ -428,32 +457,66 @@ int fd_takeover(int fd, void *expected_owner)
 	fd_stop_recv(fd);
 
 	/* we're done with it */
-	HA_ATOMIC_AND(&fdtab[fd].running_mask, ~tid_bit);
+	HA_ATOMIC_AND(&fdtab[fd].running_mask, ~ti->ltid_bit);
+
+	/* no more changes planned */
+	fd_drop_tgid(fd);
 	return 0;
 }
 
 void updt_fd_polling(const int fd)
 {
-	if (all_threads_mask == 1UL || (fdtab[fd].thread_mask & all_threads_mask) == tid_bit) {
-		if (HA_ATOMIC_BTS(&fdtab[fd].update_mask, tid))
+	uint tgrp = fd_take_tgid(fd);
+
+	/* closed ? may happen */
+	if (!tgrp)
+		return;
+
+	if (unlikely(tgrp != tgid && tgrp <= MAX_TGROUPS)) {
+		/* Hmmm delivered an update for another group... That may
+		 * happen on suspend/resume of a listener for example when
+		 * the FD was not even marked for running. Let's broadcast
+		 * the update.
+		 */
+		unsigned long update_mask = fdtab[fd].update_mask;
+		int thr;
+
+		while (!_HA_ATOMIC_CAS(&fdtab[fd].update_mask, &update_mask, ha_tgroup_info[tgrp - 1].threads_enabled))
+			__ha_cpu_relax();
+
+		fd_add_to_fd_list(&update_list[tgrp - 1], fd);
+
+		thr = one_among_mask(fdtab[fd].thread_mask & tg->threads_enabled, statistical_prng_range(tg->count));
+		thr += ha_tgroup_info[tgrp - 1].base;
+		wake_thread(thr);
+
+		fd_drop_tgid(fd);
+		return;
+	}
+
+	fd_drop_tgid(fd);
+
+	if (tg->threads_enabled == 1UL || (fdtab[fd].thread_mask & tg->threads_enabled) == ti->ltid_bit) {
+		if (HA_ATOMIC_BTS(&fdtab[fd].update_mask, ti->ltid))
 			return;
 
 		fd_updt[fd_nbupdt++] = fd;
 	} else {
 		unsigned long update_mask = fdtab[fd].update_mask;
 		do {
-			if (update_mask == fdtab[fd].thread_mask)
+			if (update_mask == fdtab[fd].thread_mask) // FIXME: this works only on thread-groups 1
 				return;
 		} while (!_HA_ATOMIC_CAS(&fdtab[fd].update_mask, &update_mask, fdtab[fd].thread_mask));
 
-		fd_add_to_fd_list(&update_list, fd, offsetof(struct fdtab, update));
+		fd_add_to_fd_list(&update_list[tgid - 1], fd);
 
-		if (fd_active(fd) && !(fdtab[fd].thread_mask & tid_bit)) {
+		if (fd_active(fd) && !(fdtab[fd].thread_mask & ti->ltid_bit)) {
 			/* we need to wake up another thread to handle it immediately, any will fit,
 			 * so let's pick a random one so that it doesn't always end up on the same.
 			 */
-			int thr = one_among_mask(fdtab[fd].thread_mask & all_threads_mask,
+			int thr = one_among_mask(fdtab[fd].thread_mask & tg->threads_enabled,
 			                         statistical_prng_range(MAX_THREADS));
+			thr += ha_tgroup_info[tgid - 1].base;
 			wake_thread(thr);
 		}
 	}
@@ -474,6 +537,17 @@ int fd_update_events(int fd, uint evts)
 
 	_HA_ATOMIC_AND(&th_ctx->flags, ~TH_FL_STUCK); // this thread is still running
 
+	if (unlikely(!fd_grab_tgid(fd, ti->tgid))) {
+		/* the FD changed to another tgid, we can't safely
+		 * check it anymore. The bits in the masks are not
+		 * ours anymore and we're not allowed to touch them.
+		 * Ours have already been cleared and the FD was
+		 * closed in between so we can safely leave now.
+		 */
+		activity[tid].poll_drop_fd++;
+		return FD_UPDT_CLOSED;
+	}
+
 	/* do nothing if the FD was taken over under us */
 	do {
 		/* make sure we read a synchronous copy of rmask and tmask
@@ -485,14 +559,23 @@ int fd_update_events(int fd, uint evts)
 			tmask = _HA_ATOMIC_LOAD(&fdtab[fd].thread_mask);
 		} while (rmask & ~tmask);
 
-		if (!(tmask & tid_bit)) {
+		if (!(tmask & ti->ltid_bit)) {
 			/* a takeover has started */
 			activity[tid].poll_skip_fd++;
+
+			/* Let the poller know this FD was lost */
+			if (!HA_ATOMIC_BTS(&fdtab[fd].update_mask, ti->ltid))
+				fd_updt[fd_nbupdt++] = fd;
+
+			fd_drop_tgid(fd);
 			return FD_UPDT_MIGRATED;
 		}
-	} while (!HA_ATOMIC_CAS(&fdtab[fd].running_mask, &rmask, rmask | tid_bit));
+	} while (!HA_ATOMIC_CAS(&fdtab[fd].running_mask, &rmask, rmask | ti->ltid_bit));
 
-	locked = (tmask != tid_bit);
+	/* with running we're safe now, we can drop the reference */
+	fd_drop_tgid(fd);
+
+	locked = (tmask != ti->ltid_bit);
 
 	/* OK now we are guaranteed that our thread_mask was present and
 	 * that we're allowed to update the FD.
@@ -545,13 +628,52 @@ int fd_update_events(int fd, uint evts)
 		fdtab[fd].iocb(fd);
 	}
 
+	/*
+	 * We entered iocb with running set and with the valid tgid.
+	 * Since then, this is what could have happened:
+	 *   - another thread tried to close the FD (e.g. timeout task from
+	 *     another one that owns it). We still have running set, but not
+	 *     tmask. We must call fd_clr_running() then _fd_delete_orphan()
+	 *     if we were the last one.
+	 *
+	 *   - the iocb tried to close the FD => bit no more present in running,
+	 *     nothing to do. If it managed to close it, the poller's ->clo()
+	 *     has already been called.
+	 *
+	 *   - after we closed, the FD was reassigned to another thread in
+	 *     another group => running not present, tgid differs, nothing to
+	 *     do because if it got reassigned it indicates it was already
+	 *     closed.
+	 *
+	 * There's no risk of takeover of the valid FD here during this period.
+	 * Also if we still have running, immediately after we release it, the
+	 * events above might instantly happen due to another thread taking
+	 * over.
+	 *
+	 * As such, the only cases where the FD is still relevant are:
+	 *   - tgid still set and running still set (most common)
+	 *   - tgid still valid but running cleared due to fd_delete(): we may
+	 *     still need to stop polling otherwise we may keep it enabled
+	 *     while waiting for other threads to close it.
+	 * And given that we may need to program a tentative update in case we
+	 * don't immediately close, it's easier to grab the tgid during the
+	 * whole check.
+	 */
+
+	if (!fd_grab_tgid(fd, tgid))
+		return FD_UPDT_CLOSED;
+
+	tmask = _HA_ATOMIC_LOAD(&fdtab[fd].thread_mask);
+
 	/* another thread might have attempted to close this FD in the mean
 	 * time (e.g. timeout task) striking on a previous thread and closing.
 	 * This is detected by both thread_mask and running_mask being 0 after
-	 * we remove ourselves last.
+	 * we remove ourselves last. There is no risk the FD gets reassigned
+	 * to a different group since it's not released until the real close()
+	 * in _fd_delete_orphan().
 	 */
-	if ((fdtab[fd].running_mask & tid_bit) &&
-	    fd_clr_running(fd) == 0 && !fdtab[fd].thread_mask) {
+	if (fd_clr_running(fd) == ti->ltid_bit && !tmask) {
+		fd_drop_tgid(fd);
 		_fd_delete_orphan(fd);
 		return FD_UPDT_CLOSED;
 	}
@@ -559,14 +681,42 @@ int fd_update_events(int fd, uint evts)
 	/* we had to stop this FD and it still must be stopped after the I/O
 	 * cb's changes, so let's program an update for this.
 	 */
-	if (must_stop && !(fdtab[fd].update_mask & tid_bit)) {
+	if (must_stop && !(fdtab[fd].update_mask & ti->ltid_bit)) {
 		if (((must_stop & FD_POLL_IN)  && !fd_recv_active(fd)) ||
 		    ((must_stop & FD_POLL_OUT) && !fd_send_active(fd)))
-			if (!HA_ATOMIC_BTS(&fdtab[fd].update_mask, tid))
+			if (!HA_ATOMIC_BTS(&fdtab[fd].update_mask, ti->ltid))
 				fd_updt[fd_nbupdt++] = fd;
 	}
 
+	fd_drop_tgid(fd);
 	return FD_UPDT_DONE;
+}
+
+/* This is used by pollers at boot time to re-register desired events for
+ * all FDs after new pollers have been created. It doesn't do much, it checks
+ * that their thread group matches the one in argument, and that the thread
+ * mask matches at least one of the bits in the mask, and if so, marks the FD
+ * as updated.
+ */
+void fd_reregister_all(int tgrp, ulong mask)
+{
+	int fd;
+
+	for (fd = 0; fd < global.maxsock; fd++) {
+		if (!fdtab[fd].owner)
+			continue;
+
+		/* make sure we don't register other tgroups' FDs. We just
+		 * avoid needlessly taking the lock if not needed.
+		 */
+		if (!(_HA_ATOMIC_LOAD(&fdtab[fd].thread_mask) & mask) ||
+		    !fd_grab_tgid(fd, tgrp))
+			continue;  // was not for us anyway
+
+		if (_HA_ATOMIC_LOAD(&fdtab[fd].thread_mask) & mask)
+			updt_fd_polling(fd);
+		fd_drop_tgid(fd);
+	}
 }
 
 /* Tries to send <npfx> parts from <prefix> followed by <nmsg> parts from <msg>
@@ -811,8 +961,8 @@ static int init_pollers_per_thread()
 	poller_rd_pipe = mypipe[0];
 	poller_wr_pipe[tid] = mypipe[1];
 	fd_set_nonblock(poller_rd_pipe);
-	fd_insert(poller_rd_pipe, poller_pipe_io_handler, poller_pipe_io_handler, tid_bit);
-	fd_insert(poller_wr_pipe[tid], poller_pipe_io_handler, poller_pipe_io_handler, tid_bit);
+	fd_insert(poller_rd_pipe, poller_pipe_io_handler, poller_pipe_io_handler, tgid, ti->ltid_bit);
+	fd_insert(poller_wr_pipe[tid], poller_pipe_io_handler, poller_pipe_io_handler, tgid, ti->ltid_bit);
 	fd_want_recv(poller_rd_pipe);
 	fd_stop_both(poller_wr_pipe[tid]);
 	return 1;
@@ -824,9 +974,9 @@ static void deinit_pollers_per_thread()
 	/* rd and wr are init at the same place, but only rd is init to -1, so
 	  we rely to rd to close.   */
 	if (poller_rd_pipe > -1) {
-		close(poller_rd_pipe);
+		fd_delete(poller_rd_pipe);
 		poller_rd_pipe = -1;
-		close(poller_wr_pipe[tid]);
+		fd_delete(poller_wr_pipe[tid]);
 		poller_wr_pipe[tid] = -1;
 	}
 }
@@ -834,6 +984,7 @@ static void deinit_pollers_per_thread()
 /* Release the pollers per thread, to be called late */
 static void free_pollers_per_thread()
 {
+	fd_nbupdt = 0;
 	ha_free(&fd_updt);
 }
 
@@ -864,7 +1015,8 @@ int init_pollers()
 		goto fail_info;
 	}
 
-	update_list.first = update_list.last = -1;
+	for (p = 0; p < MAX_TGROUPS; p++)
+		update_list[p].first = update_list[p].last = -1;
 
 	for (p = 0; p < global.maxsock; p++) {
 		/* Mark the fd as out of the fd cache */

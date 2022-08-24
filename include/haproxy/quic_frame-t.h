@@ -29,12 +29,15 @@
 #include <inttypes.h>
 #include <stdlib.h>
 
-#include <haproxy/list.h>
-
 #include <import/ebtree-t.h>
+#include <haproxy/buf-t.h>
+#include <haproxy/list.h>
+#include <haproxy/quic_stream-t.h>
 
-#include <haproxy/mux_quic-t.h>
-#include <haproxy/xprt_quic-t.h>
+/* forward declarations from xprt-quic */
+struct quic_arngs;
+struct quic_enc_level;
+struct quic_tx_packet;
 
 /* QUIC frame types. */
 enum quic_frame_type {
@@ -269,6 +272,34 @@ struct quic_frame {
 	struct list ref;
 	unsigned int flags;
 };
+
+
+/* QUIC error codes */
+struct quic_err {
+	uint64_t code;  /* error code */
+	int app;        /* set for Application error code */
+};
+
+/* Transport level error codes. */
+#define QC_ERR_NO_ERROR                     0x00
+#define QC_ERR_INTERNAL_ERROR               0x01
+#define QC_ERR_CONNECTION_REFUSED           0x02
+#define QC_ERR_FLOW_CONTROL_ERROR           0x03
+#define QC_ERR_STREAM_LIMIT_ERROR           0x04
+#define QC_ERR_STREAM_STATE_ERROR           0x05
+#define QC_ERR_FINAL_SIZE_ERROR             0x06
+#define QC_ERR_FRAME_ENCODING_ERROR         0x07
+#define QC_ERR_TRANSPORT_PARAMETER_ERROR    0x08
+#define QC_ERR_CONNECTION_ID_LIMIT_ERROR    0x09
+#define QC_ERR_PROTOCOL_VIOLATION           0x0a
+#define QC_ERR_INVALID_TOKEN                0x0b
+#define QC_ERR_APPLICATION_ERROR            0x0c
+#define QC_ERR_CRYPTO_BUFFER_EXCEEDED       0x0d
+#define QC_ERR_KEY_UPDATE_ERROR             0x0e
+#define QC_ERR_AEAD_LIMIT_REACHED           0x0f
+#define QC_ERR_NO_VIABLE_PATH               0x10
+/* 256 TLS reserved errors 0x100-0x1ff. */
+#define QC_ERR_CRYPTO_ERROR                0x100
 
 #endif /* USE_QUIC */
 #endif /* _TYPES_QUIC_FRAME_H */

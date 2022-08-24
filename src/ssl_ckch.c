@@ -1076,6 +1076,67 @@ struct cafile_entry *ssl_store_create_cafile_entry(char *path, X509_STORE *store
 	return ca_e;
 }
 
+
+/* Duplicate a cafile_entry
+ * Allocate the X509_STORE and copy the X509 and CRL inside.
+ *
+ * Return the newly allocated cafile_entry or NULL.
+ *
+ */
+struct cafile_entry *ssl_store_dup_cafile_entry(struct cafile_entry *src)
+{
+	struct cafile_entry *dst = NULL;
+	X509_STORE *store = NULL;
+	STACK_OF(X509_OBJECT) *objs;
+	int i;
+
+	if (!src)
+		return NULL;
+
+	if (src->ca_store) {
+		/* if there was a store in the src, copy it */
+		store = X509_STORE_new();
+		if (!store)
+			goto err;
+
+		objs = X509_STORE_get0_objects(src->ca_store);
+		for (i = 0; i < sk_X509_OBJECT_num(objs); i++) {
+			X509 *cert;
+			X509_CRL *crl;
+
+			cert = X509_OBJECT_get0_X509(sk_X509_OBJECT_value(objs, i));
+			if (cert) {
+				if (X509_STORE_add_cert(store, cert) == 0) {
+					/* only exits on error if the error is not about duplicate certificates */
+					if (!(ERR_GET_REASON(ERR_get_error()) == X509_R_CERT_ALREADY_IN_HASH_TABLE)) {
+						goto err;
+					}
+				}
+
+			}
+			crl = X509_OBJECT_get0_X509_CRL(sk_X509_OBJECT_value(objs, i));
+			if (crl) {
+				if (X509_STORE_add_crl(store, crl) == 0) {
+					/* only exits on error if the error is not about duplicate certificates */
+					if (!(ERR_GET_REASON(ERR_get_error()) == X509_R_CERT_ALREADY_IN_HASH_TABLE)) {
+						goto err;
+					}
+				}
+
+			}
+		}
+	}
+	dst = ssl_store_create_cafile_entry(src->path, store, src->type);
+
+	return dst;
+
+err:
+	X509_STORE_free(store);
+	ha_free(&dst);
+
+	return NULL;
+}
+
 /* Delete a cafile_entry. The caller is responsible from removing this entry
  * from the cafile_tree first if is was previously added into it. */
 void ssl_store_delete_cafile_entry(struct cafile_entry *ca_e)
@@ -1104,54 +1165,77 @@ void ssl_store_delete_cafile_entry(struct cafile_entry *ca_e)
 }
 
 /*
- * Build a cafile_entry out of a buffer instead of out of a file.
- * This function is used when the "commit ssl ca-file" cli command is used.
+ * Fill a cafile_entry <ca_e> X509_STORE ca_e->store out of a buffer <cert_buf>
+ * instead of out of a file. The <append> field should be set to 1 if you want
+ * to keep the existing X509_STORE and append data to it.
+ *
+ * This function is used when the "set ssl ca-file" cli command is used.
  * It can parse CERTIFICATE sections as well as CRL ones.
  * Returns 0 in case of success, 1 otherwise.
+ *
+ * /!\ Warning: If there was an error the X509_STORE could have been modified so it's
+ * better to not use it after a return 1.
  */
-int ssl_store_load_ca_from_buf(struct cafile_entry *ca_e, char *cert_buf)
+int ssl_store_load_ca_from_buf(struct cafile_entry *ca_e, char *cert_buf, int append)
 {
-	int retval = 0;
+	BIO *bio = NULL;
+	STACK_OF(X509_INFO) *infos;
+	X509_INFO *info;
+	int i;
+	int retval = 1;
+	int retcert = 0;
 
 	if (!ca_e)
 		return 1;
 
-	if (!ca_e->ca_store) {
-		ca_e->ca_store = X509_STORE_new();
-		if (ca_e->ca_store) {
-			BIO *bio = BIO_new_mem_buf(cert_buf, strlen(cert_buf));
-			if (bio) {
-				X509_INFO *info;
-				int i;
-				STACK_OF(X509_INFO) *infos = PEM_X509_INFO_read_bio(bio, NULL, NULL, NULL);
-				if (!infos)
-				{
-					BIO_free(bio);
-					return 1;
-				}
-
-				for (i = 0; i < sk_X509_INFO_num(infos) && !retval; i++) {
-					info = sk_X509_INFO_value(infos, i);
-					/* X509_STORE_add_cert and X509_STORE_add_crl return 1 on success */
-					if (info->x509) {
-						retval = !X509_STORE_add_cert(ca_e->ca_store, info->x509);
-					}
-					if (!retval && info->crl) {
-						retval = !X509_STORE_add_crl(ca_e->ca_store, info->crl);
-					}
-				}
-				retval = retval || (i != sk_X509_INFO_num(infos));
-
-				/* Cleanup */
-				sk_X509_INFO_pop_free(infos, X509_INFO_free);
-				BIO_free(bio);
-			}
-		}
+	if (!append) {
+		X509_STORE_free(ca_e->ca_store);
+		ca_e->ca_store = NULL;
 	}
+
+	if (!ca_e->ca_store)
+		ca_e->ca_store = X509_STORE_new();
+
+	if (!ca_e->ca_store)
+		goto end;
+
+	bio = BIO_new_mem_buf(cert_buf, strlen(cert_buf));
+	if (!bio)
+		goto end;
+
+	infos = PEM_X509_INFO_read_bio(bio, NULL, NULL, NULL);
+	if (!infos)
+		goto end;
+
+	for (i = 0; i < sk_X509_INFO_num(infos) && !retcert; i++) {
+		info = sk_X509_INFO_value(infos, i);
+
+		/* X509_STORE_add_cert and X509_STORE_add_crl return 1 on success */
+		if (info->x509)
+			retcert = !X509_STORE_add_cert(ca_e->ca_store, info->x509);
+		if (!retcert && info->crl)
+			retcert = !X509_STORE_add_crl(ca_e->ca_store, info->crl);
+	}
+
+	/* return an error if we didn't compute all the X509_INFO or if there was none
+	 * set to 0 if everything was right */
+	if (!(retcert || (i != sk_X509_INFO_num(infos)) || (sk_X509_INFO_num(infos) == 0)))
+		retval = 0;
+
+	/* Cleanup */
+	sk_X509_INFO_pop_free(infos, X509_INFO_free);
+
+end:
+	BIO_free(bio);
 
 	return retval;
 }
 
+/*
+ * Try to load a ca-file from disk into the ca-file cache.
+ *
+ *  Return 0 upon error
+ */
 int ssl_store_load_locations_file(char *path, int create_if_none, enum cafile_type type)
 {
 	X509_STORE *store = ssl_store_get0_locations_file(path);
@@ -1166,16 +1250,27 @@ int ssl_store_load_locations_file(char *path, int create_if_none, enum cafile_ty
 		struct cafile_entry *ca_e;
 		const char *file = NULL;
 		const char *dir = NULL;
+		unsigned long e;
 
 		store = X509_STORE_new();
+		if (!store) {
+			ha_alert("Cannot allocate memory!");
+			goto err;
+		}
 
 		if (strcmp(path, "@system-ca") == 0) {
 			dir = X509_get_default_cert_dir();
+			if (!dir) {
+				ha_alert("Couldn't get the system CA directory from X509_get_default_cert_dir().");
+				goto err;
+			}
 
 		} else {
 
-			if (stat(path, &buf))
+			if (stat(path, &buf) == -1) {
+				ha_alert("Couldn't open the ca-file '%s' (%s).", path, strerror(errno));
 				goto err;
+			}
 
 			if (S_ISDIR(buf.st_mode))
 				dir = path;
@@ -1185,6 +1280,8 @@ int ssl_store_load_locations_file(char *path, int create_if_none, enum cafile_ty
 
 		if (file) {
 			if (!X509_STORE_load_locations(store, file, NULL)) {
+				e = ERR_get_error();
+				ha_alert("Couldn't open the ca-file '%s' (%s).", path, ERR_reason_error_string(e));
 				goto err;
 			}
 		} else if (dir) {
@@ -1200,6 +1297,8 @@ int ssl_store_load_locations_file(char *path, int create_if_none, enum cafile_ty
 				struct dirent *de = de_list[i];
 				BIO *in = NULL;
 				X509 *ca = NULL;;
+
+				ERR_clear_error();
 
 				/* we try to load the files that would have
 				 * been loaded in an hashed directory loaded by
@@ -1229,8 +1328,12 @@ int ssl_store_load_locations_file(char *path, int create_if_none, enum cafile_ty
 				if (PEM_read_bio_X509_AUX(in, &ca, NULL, NULL) == NULL)
 					goto scandir_err;
 
-				if (X509_STORE_add_cert(store, ca) == 0)
-					goto scandir_err;
+				if (X509_STORE_add_cert(store, ca) == 0) {
+					/* only exits on error if the error is not about duplicate certificates */
+					 if (!(ERR_GET_REASON(ERR_get_error()) == X509_R_CERT_ALREADY_IN_HASH_TABLE)) {
+						 goto scandir_err;
+					 }
+				}
 
 				X509_free(ca);
 				BIO_free(in);
@@ -1238,10 +1341,12 @@ int ssl_store_load_locations_file(char *path, int create_if_none, enum cafile_ty
 				continue;
 
 scandir_err:
+				e = ERR_get_error();
 				X509_free(ca);
 				BIO_free(in);
 				free(de);
-				ha_warning("ca-file: '%s' couldn't load '%s'\n", path, trash.area);
+				/* warn if it can load one of the files, but don't abort */
+				ha_warning("ca-file: '%s' couldn't load '%s' (%s)\n", path, trash.area, ERR_reason_error_string(e));
 
 			}
 			free(de_list);
@@ -1252,12 +1357,14 @@ scandir_err:
 
 		objs = X509_STORE_get0_objects(store);
 		cert_count = sk_X509_OBJECT_num(objs);
-		if (cert_count == 0)
+		if (cert_count == 0) {
 			ha_warning("ca-file: 0 CA were loaded from '%s'\n", path);
-
+		}
 		ca_e = ssl_store_create_cafile_entry(path, store, type);
-		if (!ca_e)
+		if (!ca_e) {
+			ha_alert("Cannot allocate memory!\n");
 			goto err;
+		}
 		ebst_insert(&cafile_tree, &ca_e->node);
 	}
 	return (store != NULL);
@@ -2538,9 +2645,14 @@ static int cli_parse_set_cafile(char **args, char *payload, struct appctx *appct
 	char *err = NULL;
 	int errcode = 0;
 	struct buffer *buf;
+	int add_cmd = 0;
 
 	if (!cli_has_level(appctx, ACCESS_LVL_ADMIN))
 		return 1;
+
+	/* this is "add ssl ca-file" */
+	if (*args[0] == 'a')
+		add_cmd = 1;
 
 	if (!*args[3] || !payload)
 		return cli_err(appctx, "'set ssl ca-file expects a filename and CAs as a payload\n");
@@ -2574,8 +2686,7 @@ static int cli_parse_set_cafile(char **args, char *payload, struct appctx *appct
 			goto end;
 		}
 		old_cafile_entry = cafile_transaction.old_cafile_entry;
-	}
-	else {
+	} else {
 		/* lookup for the certificate in the tree */
 		old_cafile_entry = ssl_store_get_cafile_entry(buf->area, 0);
 	}
@@ -2587,17 +2698,21 @@ static int cli_parse_set_cafile(char **args, char *payload, struct appctx *appct
 		goto end;
 	}
 
-	/* Create a new cafile_entry without adding it to the cafile tree. */
-	new_cafile_entry = ssl_store_create_cafile_entry(old_cafile_entry->path, NULL, CAFILE_CERT);
+	/* if the transaction is new, duplicate the old_ca_file_entry, otherwise duplicate the cafile in the current transaction */
+	if (cafile_transaction.new_cafile_entry)
+		new_cafile_entry = ssl_store_dup_cafile_entry(cafile_transaction.new_cafile_entry);
+	else
+		new_cafile_entry = ssl_store_dup_cafile_entry(old_cafile_entry);
+
 	if (!new_cafile_entry) {
-		memprintf(&err, "%sCannot allocate memory!\n",
-			  err ? err : "");
+		memprintf(&err, "%sCan't allocate memory\n", err ? err : "");
 		errcode |= ERR_ALERT | ERR_FATAL;
 		goto end;
 	}
 
-	/* Fill the new entry with the new CAs. */
-	if (ssl_store_load_ca_from_buf(new_cafile_entry, payload)) {
+	/* Fill the new entry with the new CAs. The add_cmd variable determine
+	   if we flush the X509_STORE or not */
+	if (ssl_store_load_ca_from_buf(new_cafile_entry, payload, add_cmd)) {
 		memprintf(&err, "%sInvalid payload\n", err ? err : "");
 		errcode |= ERR_ALERT | ERR_FATAL;
 		goto end;
@@ -3287,7 +3402,7 @@ static int cli_parse_set_crlfile(char **args, char *payload, struct appctx *appc
 	}
 
 	/* Fill the new entry with the new CRL. */
-	if (ssl_store_load_ca_from_buf(new_crlfile_entry, payload)) {
+	if (ssl_store_load_ca_from_buf(new_crlfile_entry, payload, 0)) {
 		memprintf(&err, "%sInvalid payload\n", err ? err : "");
 		errcode |= ERR_ALERT | ERR_FATAL;
 		goto end;
@@ -3807,6 +3922,7 @@ static struct cli_kw_list cli_kws = {{ },{
 	{ { "show", "ssl", "cert", NULL },      "show ssl cert [<certfile>]              : display the SSL certificates used in memory, or the details of a file", cli_parse_show_cert, cli_io_handler_show_cert, cli_release_show_cert },
 
 	{ { "new", "ssl", "ca-file", NULL },    "new ssl ca-file <cafile>                : create a new CA file to be used in a crt-list",                         cli_parse_new_cafile, NULL, NULL },
+	{ { "add", "ssl", "ca-file", NULL },    "add ssl ca-file <cafile> <payload>      : add a certificate into the CA file",                                    cli_parse_set_cafile, NULL, NULL },
 	{ { "set", "ssl", "ca-file", NULL },    "set ssl ca-file <cafile> <payload>      : replace a CA file",                                                     cli_parse_set_cafile, NULL, NULL },
 	{ { "commit", "ssl", "ca-file", NULL }, "commit ssl ca-file <cafile>             : commit a CA file",                                                      cli_parse_commit_cafile, cli_io_handler_commit_cafile_crlfile, cli_release_commit_cafile },
 	{ { "abort", "ssl", "ca-file", NULL },  "abort ssl ca-file <cafile>              : abort a transaction for a CA file",                                     cli_parse_abort_cafile, NULL, NULL },

@@ -90,7 +90,7 @@ static inline void quic_cid_cpy(struct quic_cid *dst, const struct quic_cid *src
 }
 
 /* Copy <saddr> socket address data into <buf> buffer.
- * This is the responsability of the caller to check the output buffer is big
+ * This is the responsibility of the caller to check the output buffer is big
  * enough to contain these socket address data.
  * Return the number of bytes copied.
  */
@@ -542,7 +542,7 @@ static inline void quic_tx_packet_refdec(struct quic_tx_packet *pkt)
 	}
 }
 
-static inline void quic_pktns_tx_pkts_release(struct quic_pktns *pktns)
+static inline void quic_pktns_tx_pkts_release(struct quic_pktns *pktns, struct quic_conn *qc)
 {
 	struct eb64_node *node;
 
@@ -553,6 +553,8 @@ static inline void quic_pktns_tx_pkts_release(struct quic_pktns *pktns)
 
 		pkt = eb64_entry(node, struct quic_tx_packet, pn_node);
 		node = eb64_next(node);
+		if (pkt->flags & QUIC_FL_TX_PACKET_ACK_ELICITING)
+			qc->path->ifae_pkts--;
 		list_for_each_entry_safe(frm, frmbak, &pkt->frms, list) {
 			LIST_DELETE(&frm->list);
 			quic_tx_packet_refdec(frm->pkt);
@@ -581,7 +583,7 @@ static inline void quic_pktns_discard(struct quic_pktns *pktns,
 	pktns->tx.loss_time = TICK_ETERNITY;
 	pktns->tx.pto_probe = 0;
 	pktns->tx.in_flight = 0;
-	quic_pktns_tx_pkts_release(pktns);
+	quic_pktns_tx_pkts_release(pktns, qc);
 }
 
 /* Initialize <p> QUIC network path depending on <ipv4> boolean
@@ -665,9 +667,7 @@ static inline int qc_el_rx_pkts(struct quic_enc_level *qel)
 {
 	int ret;
 
-	HA_RWLOCK_RDLOCK(QUIC_LOCK, &qel->rx.pkts_rwlock);
 	ret = !eb_is_empty(&qel->rx.pkts);
-	HA_RWLOCK_RDUNLOCK(QUIC_LOCK, &qel->rx.pkts_rwlock);
 
 	return ret;
 }
@@ -726,7 +726,6 @@ static inline void qc_el_rx_pkts_del(struct quic_enc_level *qel)
 {
 	struct eb64_node *node;
 
-	HA_RWLOCK_WRLOCK(QUIC_LOCK, &qel->rx.pkts_rwlock);
 	node = eb64_first(&qel->rx.pkts);
 	while (node) {
 		struct quic_rx_packet *pkt =
@@ -736,14 +735,12 @@ static inline void qc_el_rx_pkts_del(struct quic_enc_level *qel)
 		eb64_delete(&pkt->pn_node);
 		quic_rx_packet_refdec(pkt);
 	}
-	HA_RWLOCK_WRUNLOCK(QUIC_LOCK, &qel->rx.pkts_rwlock);
 }
 
 static inline void qc_list_qel_rx_pkts(struct quic_enc_level *qel)
 {
 	struct eb64_node *node;
 
-	HA_RWLOCK_RDLOCK(QUIC_LOCK, &qel->rx.pkts_rwlock);
 	node = eb64_first(&qel->rx.pkts);
 	while (node) {
 		struct quic_rx_packet *pkt;
@@ -753,7 +750,6 @@ static inline void qc_list_qel_rx_pkts(struct quic_enc_level *qel)
 		        pkt, pkt->type, (ull)pkt->pn_node.key);
 		node = eb64_next(node);
 	}
-	HA_RWLOCK_RDUNLOCK(QUIC_LOCK, &qel->rx.pkts_rwlock);
 }
 
 static inline void qc_list_all_rx_pkts(struct quic_conn *qc)
@@ -767,13 +763,13 @@ static inline void qc_list_all_rx_pkts(struct quic_conn *qc)
 
 void chunk_frm_appendf(struct buffer *buf, const struct quic_frame *frm);
 
-void quic_set_connection_close(struct quic_conn *qc, int err, int app);
+void quic_set_connection_close(struct quic_conn *qc, const struct quic_err err);
 void quic_set_tls_alert(struct quic_conn *qc, int alert);
 int quic_set_app_ops(struct quic_conn *qc, const unsigned char *alpn, size_t alpn_len);
 struct task *quic_lstnr_dghdlr(struct task *t, void *ctx, unsigned int state);
 int quic_get_dgram_dcid(unsigned char *buf, const unsigned char *end,
                         unsigned char **dcid, size_t *dcid_len);
-int qc_send_app_pkts(struct quic_conn *qc, int old_data, struct list *frms);
+int qc_send_mux(struct quic_conn *qc, struct list *frms);
 
 void qc_notify_close(struct quic_conn *qc);
 

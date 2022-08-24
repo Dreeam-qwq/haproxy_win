@@ -1631,7 +1631,7 @@ static int proxy_defproxy_cpy(struct proxy *curproxy, const struct proxy *defpro
 	char *tmpmsg = NULL;
 
 	/* set default values from the specified default proxy */
-	memcpy(&curproxy->defsrv, &defproxy->defsrv, sizeof(curproxy->defsrv));
+	srv_settings_cpy(&curproxy->defsrv, &defproxy->defsrv, 0);
 
 	curproxy->flags = (defproxy->flags & PR_FL_DISABLED); /* Only inherit from disabled flag */
 	curproxy->options = defproxy->options;
@@ -2198,8 +2198,13 @@ static void do_soft_stop_now()
 		}
 	}
 
+	/* we isolate so that we have a chance of stopping listeners in other groups */
+	thread_isolate();
+
 	/* stop all stoppable listeners */
 	protocol_stop_now();
+
+	thread_release();
 
 	/* signal zero is used to broadcast the "stopping" event */
 	signal_handler(0);

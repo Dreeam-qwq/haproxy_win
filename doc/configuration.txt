@@ -3,7 +3,7 @@
                           Configuration Manual
                          ----------------------
                               version 2.7
-                              2022/06/24
+                              2022/08/20
 
 
 This document covers the configuration language as implemented in the version
@@ -1122,6 +1122,7 @@ The following keywords are supported in the "global" section :
    - tune.maxpollevents
    - tune.maxrewrite
    - tune.pattern.cache-size
+   - tune.peers.max-updates-at-once
    - tune.pipesize
    - tune.pool-high-fd-ratio
    - tune.pool-low-fd-ratio
@@ -1210,58 +1211,57 @@ close-spread-time <time>
 
   See also: grace, hard-stop-after, idle-close-on-response
 
-cpu-map [auto:]<process-set>[/<thread-set>] <cpu-set>...
-  On some operating systems, it is possible to bind a process or a thread to a
-  specific CPU set. This means that the process or the thread will never run on
-  other CPUs. The "cpu-map" directive specifies CPU sets for process or thread
-  sets. The first argument is a process set, eventually followed by a thread
-  set. These sets have the format
+cpu-map [auto:]<thread-group>[/<thread-set>] <cpu-set>...
+  On some operating systems, it is possible to bind a thread group or a thread
+  to a specific CPU set. This means that the designated threads will never run
+  on other CPUs. The "cpu-map" directive specifies CPU sets for individual
+  threads or thread groups. The first argument is a thread group range,
+  optionally followed by a thread set. These ranges have the following format:
 
       all | odd | even | number[-[number]]
 
   <number> must be a number between 1 and 32 or 64, depending on the machine's
-  word size. Any process IDs above 1 and any thread IDs above nbthread are
-  ignored. It is possible to specify a range with two such number delimited by
-  a dash ('-'). It also is possible to specify all thraeds at once using
-  "all", only odd numbers using "odd" or even numbers using "even", just like
-  with the "bind-process" directive. The second and forthcoming arguments are
-  CPU sets. Each CPU set is either a unique number starting at 0 for the first
-  CPU or a range with two such numbers delimited by a dash ('-'). Outside of
-  Linux and BSDs, there may be a limitation on the maximum CPU index to either
-  31 or 63. Multiple CPU numbers or ranges may be specified, and the processes
-  or threads will be allowed to bind to all of them. Obviously, multiple
-  "cpu-map" directives may be specified. Each "cpu-map" directive will replace
-  the previous ones when they overlap. A thread will be bound on the
-  intersection of its mapping and the one of the process on which it is
-  attached. If the intersection is null, no specific binding will be set for
-  the thread.
+  word size. Any group IDs above 'thread-groups' and any thread IDs above the
+  machine's word size are ignored. All thread numbers are relative to the group
+  they belong to. It is possible to specify a range with two such number
+  delimited by a dash ('-'). It also is possible to specify all threads at once
+  using "all", only odd numbers using "odd" or even numbers using "even", just
+  like with the "thread" bind directive. The second and forthcoming arguments
+  are CPU sets. Each CPU set is either a unique number starting at 0 for the
+  first CPU or a range with two such numbers delimited by a dash ('-'). Outside
+  of Linux and BSDs, there may be a limitation on the maximum CPU index to
+  either 31 or 63. Multiple CPU numbers or ranges may be specified, and the
+  processes or threads will be allowed to bind to all of them. Obviously,
+  multiple "cpu-map" directives may be specified. Each "cpu-map" directive will
+  replace the previous ones when they overlap.
 
   Ranges can be partially defined. The higher bound can be omitted. In such
   case, it is replaced by the corresponding maximum value, 32 or 64 depending
   on the machine's word size.
 
-  The prefix "auto:" can be added before the process set to let HAProxy
-  automatically bind a process or a thread to a CPU by incrementing threads and
+  The prefix "auto:" can be added before the thread set to let HAProxy
+  automatically bind a set of threads to a CPU by incrementing threads and
   CPU sets. To be valid, both sets must have the same size. No matter the
   declaration order of the CPU sets, it will be bound from the lowest to the
-  highest bound. Having both a process and a thread range with the "auto:"
+  highest bound. Having both a group and a thread range with the "auto:"
   prefix is not supported. Only one range is supported, the other one must be
   a fixed number.
 
-  Note that process ranges are supported for historical reasons. Nowadays, a
-  lone number designates a process and must be 1, and specifying a thread range
-  or number requires to prepend "1/" in front of it. Finally, "1" is strictly
-  equivalent to "1/all" and designates all threads on the process.
+  Note that group ranges are supported for historical reasons. Nowadays, a lone
+  number designates a thread group and must be 1 if thread-groups are not used,
+  and specifying a thread range or number requires to prepend "1/" in front of
+  it if thread groups are not used. Finally, "1" is strictly equivalent to
+  "1/all" and designates all threads in the group.
 
   Examples:
-      cpu-map 1/all 0-3 # bind all threads of the first process on the
+      cpu-map 1/all 0-3 # bind all threads of the first group on the
                         # first 4 CPUs
 
       cpu-map 1/1- 0-   # will be replaced by "cpu-map 1/1-64 0-63"
                         # or "cpu-map 1/1-32 0-31" depending on the machine's
                         # word size.
 
-      # all these lines bind the thread 1 to the cpu 0, the thread 2 to cpu 1
+      # all these lines bind thread 1 to the cpu 0, the thread 2 to cpu 1
       # and so on.
       cpu-map auto:1/1-4   0-3
       cpu-map auto:1/1-4   0-1 2-3
@@ -1275,6 +1275,21 @@ cpu-map [auto:]<process-set>[/<thread-set>] <cpu-set>...
       # invalid cpu-map because thread and CPU sets have different sizes.
       cpu-map auto:1/1-4   0    # invalid
       cpu-map auto:1/1     0-3  # invalid
+
+      # map 40 threads of those 4 groups to individual CPUs
+      cpu-map auto:1/1-10   0-9
+      cpu-map auto:2/1-10   10-19
+      cpu-map auto:3/1-10   20-29
+      cpu-map auto:4/1-10   30-39
+
+      # Map 80 threads to one physical socket and 80 others to another socket
+      # without forcing assignment. These are split into 4 groups since no
+      # group may have more than 64 threads.
+      cpu-map 1/1-40   0-39 80-119    # node0, siblings 0 & 1
+      cpu-map 2/1-40   0-39 80-119
+      cpu-map 3/1-40   40-79 120-159  # node1, siblings 0 & 1
+      cpu-map 4/1-40   40-79 120-159
+
 
 crt-base <dir>
   Assigns a default directory to fetch SSL certificates from when a relative
@@ -1909,11 +1924,6 @@ resetenv [<name> ...]
   next line in the configuration file sees the new environment. See also
   "setenv", "presetenv", and "unsetenv".
 
-stats bind-process [ all | odd | even | <process_num>[-[process_num>]] ] ...
-  Deprecated. Before threads were supported, this was used to force some stats
-  instances on certain processes only. The default and only accepted value is
-  "1" (along with "all" and "odd" which alias it). Do not use this setting.
-
 server-state-base <directory>
   Specifies the directory prefix to be prepended in front of all servers state
   file names which do not start with a '/'. See also "server-state-file",
@@ -2258,7 +2268,11 @@ thread-group <group> [<thread-range>...]
 thread-groups <number>
   This setting is only available when support for threads was built in. It
   makes HAProxy split its threads into <number> independent groups. At the
-  moment, the limit is 1 and is also the default value. See also "nbthread".
+  moment, the default value is 1. Thread groups make it possible to reduce
+  sharing between threads to limit contention, at the expense of some extra
+  configuration efforts. It is also the only way to use more than 64 threads
+  since up to 64 threads per group may be configured. The maximum number of
+  groups is configured at compile time and defaults to 16. See also "nbthread".
 
 uid <number>
   Changes the process's user ID to <number>. It is recommended that the user ID
@@ -2918,6 +2932,15 @@ tune.pattern.cache-size <number>
   aging components. If this is not acceptable, the cache can be disabled by
   setting this parameter to 0.
 
+tune.peers.max-updates-at-once <number>
+  Sets the maximum number of stick-table updates that haproxy will try to
+  process at once when sending messages. Retrieving the data for these updates
+  requires some locking operations which can be CPU intensive on highly
+  threaded machines if unbound, and may also increase the traffic latency
+  during the initial batched transfer between an older and a newer process.
+  Conversely low values may also incur higher CPU overhead, and take longer
+  to complete. The default value is 200 and it is suggested not to change it.
+
 tune.pipesize <number>
   Sets the kernel pipe buffer size to this size (in bytes). By default, pipes
   are the default size for the system. But sometimes when using TCP splicing,
@@ -3567,6 +3590,38 @@ servers or traces.
 ring <ringname>
   Creates a new ring-buffer with name <ringname>.
 
+backing-file <path>
+  This replaces the regular memory allocation by a RAM-mapped file to store the
+  ring. This can be useful for collecting traces or logs for post-mortem
+  analysis, without having to attach a slow client to the CLI. Newer contents
+  will automatically replace older ones so that the latest contents are always
+  available. The contents written to the ring will be visible in that file once
+  the process stops (most often they will even be seen very soon after but
+  there is no such guarantee since writes are not synchronous).
+
+  When this option is used, the total storage area is reduced by the size of
+  the "struct ring" that starts at the beginning of the area, and that is
+  required to recover the area's contents. The file will be created with the
+  starting user's ownership, with mode 0600 and will be of the size configured
+  by the "size" directive. Any previously existing file will be renamed with
+  the extra suffix ".bak", and any previously existing file with suffix ".bak"
+  will be removed. This ensures that instant restart of the process will not
+  wipe precious debugging information, and will leave time for an admin to spot
+  this new ".bak" file and to archive it if needed. This means that the total
+  storage capacity required will be double of the ring size.
+
+  WARNING: there are stability and security implications in using this feature.
+  First, backing the ring to a slow device (e.g. physical hard drive) may cause
+  perceptible slowdowns during accesses, and possibly even panics if too many
+  threads compete for accesses. Second, an external process modifying the area
+  could cause the haproxy process to crash or to overwrite some of its own
+  memory with traces. Third, if the file system fills up before the ring,
+  writes to the ring may cause the process to crash.
+
+  The information present in this ring are structured and are NOT directly
+  readable using a text editor (even though most of it looks barely readable).
+  The output of this file is only intended for developers.
+
 description <text>
   The description is an optional description string of the ring. It will
   appear on CLI. By default, <name> is reused to fill this field.
@@ -3903,7 +3958,6 @@ acl                                       X (!)      X         X         X
 backlog                                   X          X         X         -
 balance                                   X          -         X         X
 bind                                      -          X         X         -
-bind-process                              X          X         X         X
 capture cookie                            -          X         X         -
 capture request header                    -          X         X         -
 capture response header                   -          X         X         -
@@ -4525,20 +4579,6 @@ bind /<path> [, ...] [param*]
 
   See also : "source", "option forwardfor", "unix-bind" and the PROXY protocol
              documentation, and section 5 about bind options.
-
-
-bind-process [ all | odd | even | <process_num>[-[<process_num>]] ] ...
-  May be used in sections :   defaults | frontend | listen | backend
-                                 yes   |    yes   |   yes  |   yes
-
-  Deprecated. Before threads were supported, this was used to force some
-  frontends on certain processes only, or to adjust backends so that they
-  could match the frontends that used them. The default and only accepted
-  value is "1" (along with "all" and "odd" which alias it). Do not use this
-  setting. Threads can still be bound per-socket using the "process" bind
-  keyword.
-
-  See also : "process" in section 5.1.
 
 
 capture cookie <name> len <length>
@@ -14436,26 +14476,6 @@ prefer-client-ciphers
   (without setting this option), if a ChaCha20-Poly1305 cipher is at the top of
   the client cipher list.
 
-process <process-set>[/<thread-set>]
-  This restricts the list of threads on which this listener is allowed to run.
-  It does not enforce any of them but eliminates those which do not match. Note
-  that only process number 1 is permitted. If a thread set is specified, it
-  limits the threads allowed to process incoming connections for this listener.
-  For the unlikely case where several ranges are needed, this directive may be
-  repeated. <process-set> and <thread-set> must use the format
-
-      all | odd | even | number[-[number]]
-
-  Ranges can be partially defined. The higher bound can be omitted. In such a
-  case, it is replaced by the corresponding maximum value. The main purpose is
-  to have multiple bind lines sharing the same IP:port but not the same thread
-  in a listener, so that the system can distribute the incoming connections
-  into multiple queues, bypassing haproxy's internal queue load balancing.
-  Currently Linux 3.9 and above is known for supporting this.
-
-  This directive is deprecated in favor of the more suited "thread" directive
-  below, and will be removed in 2.7.
-
 proto <name>
   Forces the multiplexer's protocol to use for the incoming connections. It
   must be compatible with the mode of the frontend (TCP or HTTP). It must also
@@ -14478,6 +14498,15 @@ proto <name>
   protocol for all connections instantiated from this listening socket. For
   instance, it is possible to force the http/2 on clear TCP by specifying "proto
   h2" on the bind line.
+
+quic-cc-algo [ cubic | newreno ]
+  Warning: QUIC support in HAProxy is currently experimental. Configuration may
+
+  This is a QUIC specific setting to select the congestion control algorithm
+  for any connection attempts to the configured QUIC listeners. They are similar
+  to those used by TCP.
+
+  Default value: cubic
 
 quic-force-retry
   Warning: QUIC support in HAProxy is currently experimental. Configuration may
@@ -17691,6 +17720,14 @@ table_conn_rate(<table>)
   rate associated with the input sample in the designated table. See also the
   sc_conn_rate sample fetch keyword.
 
+table_expire(<table>[,<default_value>])
+  Uses the input sample to perform a look up in the specified table. If the key
+  is not found in the table, the converter fails except if <default_value> is
+  set: this makes the converter succeed and return <default_value>. If the key
+  is found the converter returns the key expiration delay associated with the
+  input sample in the designated table.
+  See also the table_idle sample fetch keyword.
+
 table_gpt(<idx>,<table>)
   Uses the string representation of the input sample to perform a lookup in
   the specified table. If the key is not found in the table, boolean value zero
@@ -17808,6 +17845,15 @@ table_http_req_rate(<table>)
   input sample in the designated table, measured in amount of requests over the
   period configured in the table. See also the sc_http_req_rate sample fetch
   keyword.
+
+table_idle(<table>)
+  Uses the input sample to perform a look up in the specified table. If the key
+  is not found in the table, the converter fails except if <default_value> is
+  set: this makes the converter succeed and return <default_value>. If the key
+  is found the converter returns the time the key entry associated with the
+  input sample in the designated table remained idle since the last time it was
+  updated.
+  See also the table_expire sample fetch keyword.
 
 table_kbytes_in(<table>)
   Uses the string representation of the input sample to perform a look up in
@@ -23104,7 +23150,7 @@ filter bwlim-out <name> limit <size> key <pattern> [table <table>] [min-size <sz
                 be specified for shared bandwidth limitation filters only.
 
     <time>      is the default time period used to evaluate the bandwidth
-                limitation rate. It can be speficied for per-stream bandwidth
+                limitation rate. It can be specified for per-stream bandwidth
                 limitation filters only. It follows the HAProxy time format and
                 is expressed in milliseconds.
 
@@ -23179,7 +23225,7 @@ some experimentations.
         # of 10m/s with all other streams with the same source address.
         filter bwlim-out limit-by-src key src table limit-by-src limit 10m
 
-        # If this filter is enalbed, the stream will be limited to download at 1m/s,
+        # If this filter is enabled, the stream will be limited to download at 1m/s,
         # independently of all other streams.
         filter bwlim-out limit-by-strm default-limit 1m default-period 1s
 

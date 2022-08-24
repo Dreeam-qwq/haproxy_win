@@ -88,17 +88,9 @@
 
 
 /* a few exported variables */
-extern unsigned int niced_tasks;  /* number of niced tasks in the run queue */
-
 extern struct pool_head *pool_head_task;
 extern struct pool_head *pool_head_tasklet;
 extern struct pool_head *pool_head_notification;
-
-#ifdef USE_THREAD
-extern struct eb_root timers;      /* sorted timers tree, global */
-#endif
-
-__decl_thread(extern HA_RWLOCK_T wq_lock);    /* RW lock related to the wait queue */
 
 void __tasklet_wakeup_on(struct tasklet *tl, int thr);
 struct list *__tasklet_wakeup_after(struct list *head, struct tasklet *tl);
@@ -217,7 +209,7 @@ static inline void _task_wakeup(struct task *t, unsigned int f, const char *file
  * happened since the flag was set will result in the task being queued (if
  * it wasn't already). This is used to safely drop the flag from within the
  * scheduler. The flag <f> is combined with existing flags before the test so
- * that it's possible to inconditionally wakeup the task and drop the RUNNING
+ * that it's possible to unconditionally wakeup the task and drop the RUNNING
  * flag if needed.
  */
 #define task_drop_running(t, f) _task_drop_running(t, f, __FILE__, __LINE__)
@@ -271,12 +263,12 @@ static inline struct task *task_unlink_wq(struct task *t)
 
 	if (likely(task_in_wq(t))) {
 		locked = t->tid < 0;
-		BUG_ON(t->tid >= 0 && t->tid != tid);
+		BUG_ON(t->tid >= 0 && t->tid != tid && !(global.mode & MODE_STOPPING));
 		if (locked)
-			HA_RWLOCK_WRLOCK(TASK_WQ_LOCK, &wq_lock);
+			HA_RWLOCK_WRLOCK(TASK_WQ_LOCK, &tg_ctx->wq_lock);
 		__task_unlink_wq(t);
 		if (locked)
-			HA_RWLOCK_WRUNLOCK(TASK_WQ_LOCK, &wq_lock);
+			HA_RWLOCK_WRUNLOCK(TASK_WQ_LOCK, &tg_ctx->wq_lock);
 	}
 	return t;
 }
@@ -303,10 +295,10 @@ static inline void task_queue(struct task *task)
 
 #ifdef USE_THREAD
 	if (task->tid < 0) {
-		HA_RWLOCK_WRLOCK(TASK_WQ_LOCK, &wq_lock);
+		HA_RWLOCK_WRLOCK(TASK_WQ_LOCK, &tg_ctx->wq_lock);
 		if (!task_in_wq(task) || tick_is_lt(task->expire, task->wq.key))
-			__task_queue(task, &timers);
-		HA_RWLOCK_WRUNLOCK(TASK_WQ_LOCK, &wq_lock);
+			__task_queue(task, &tg_ctx->timers);
+		HA_RWLOCK_WRUNLOCK(TASK_WQ_LOCK, &tg_ctx->wq_lock);
 	} else
 #endif
 	{
@@ -666,14 +658,14 @@ static inline void task_schedule(struct task *task, int when)
 #ifdef USE_THREAD
 	if (task->tid < 0) {
 		/* FIXME: is it really needed to lock the WQ during the check ? */
-		HA_RWLOCK_WRLOCK(TASK_WQ_LOCK, &wq_lock);
+		HA_RWLOCK_WRLOCK(TASK_WQ_LOCK, &tg_ctx->wq_lock);
 		if (task_in_wq(task))
 			when = tick_first(when, task->expire);
 
 		task->expire = when;
 		if (!task_in_wq(task) || tick_is_lt(task->expire, task->wq.key))
-			__task_queue(task, &timers);
-		HA_RWLOCK_WRUNLOCK(TASK_WQ_LOCK, &wq_lock);
+			__task_queue(task, &tg_ctx->timers);
+		HA_RWLOCK_WRUNLOCK(TASK_WQ_LOCK, &tg_ctx->wq_lock);
 	} else
 #endif
 	{

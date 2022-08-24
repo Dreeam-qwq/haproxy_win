@@ -22,6 +22,7 @@
 #include <haproxy/h3.h>
 #include <haproxy/h3_stats.h>
 #include <haproxy/http.h>
+#include <haproxy/http_htx.h>
 #include <haproxy/htx.h>
 #include <haproxy/intops.h>
 #include <haproxy/istbuf.h>
@@ -113,6 +114,7 @@ static uint64_t h3_settings_max_field_section_size = QUIC_VARINT_8_BYTE_MAX; /* 
 
 struct h3c {
 	struct qcc *qcc;
+	struct qcs *ctrl_strm; /* Control stream */
 	enum h3_err err;
 	uint32_t flags;
 
@@ -120,6 +122,8 @@ struct h3c {
 	uint64_t qpack_max_table_capacity;
 	uint64_t qpack_blocked_streams;
 	uint64_t max_field_section_size;
+
+	uint64_t id_goaway; /* stream ID used for a GOAWAY frame */
 
 	struct buffer_wait buf_wait; /* wait list for buffer allocations */
 	/* Stats counters */
@@ -135,6 +139,7 @@ struct h3s {
 	struct h3c *h3c;
 
 	enum h3s_t type;
+	enum h3s_st_req st_req; /* only used for request streams */
 	int demux_frame_len;
 	int demux_frame_type;
 
@@ -168,7 +173,7 @@ static ssize_t h3_init_uni_stream(struct h3c *h3c, struct qcs *qcs,
 	switch (type) {
 	case H3_UNI_S_T_CTRL:
 		if (h3c->flags & H3_CF_UNI_CTRL_SET) {
-			qcc_emit_cc_app(qcs->qcc, H3_STREAM_CREATION_ERROR);
+			qcc_emit_cc_app(qcs->qcc, H3_STREAM_CREATION_ERROR, 1);
 			return -1;
 		}
 		h3c->flags |= H3_CF_UNI_CTRL_SET;
@@ -182,7 +187,7 @@ static ssize_t h3_init_uni_stream(struct h3c *h3c, struct qcs *qcs,
 
 	case H3_UNI_S_T_QPACK_DEC:
 		if (h3c->flags & H3_CF_UNI_QPACK_DEC_SET) {
-			qcc_emit_cc_app(qcs->qcc, H3_STREAM_CREATION_ERROR);
+			qcc_emit_cc_app(qcs->qcc, H3_STREAM_CREATION_ERROR, 1);
 			return -1;
 		}
 		h3c->flags |= H3_CF_UNI_QPACK_DEC_SET;
@@ -192,7 +197,7 @@ static ssize_t h3_init_uni_stream(struct h3c *h3c, struct qcs *qcs,
 
 	case H3_UNI_S_T_QPACK_ENC:
 		if (h3c->flags & H3_CF_UNI_QPACK_ENC_SET) {
-			qcc_emit_cc_app(qcs->qcc, H3_STREAM_CREATION_ERROR);
+			qcc_emit_cc_app(qcs->qcc, H3_STREAM_CREATION_ERROR, 1);
 			return -1;
 		}
 		h3c->flags |= H3_CF_UNI_QPACK_ENC_SET;
@@ -216,12 +221,13 @@ static ssize_t h3_init_uni_stream(struct h3c *h3c, struct qcs *qcs,
 	return len;
 }
 
-/* Parse an uni-stream <qcs> from <rxbuf> which does not contains H3 frames.
- * This may be used for QPACK encoder/decoder streams for example.
+/* Parse a buffer <b> for a <qcs> uni-stream which does not contains H3 frames.
+ * This may be used for QPACK encoder/decoder streams for example. <fin> is set
+ * if this is the last frame of the stream.
  *
  * Returns the number of consumed bytes or a negative error code.
  */
-static ssize_t h3_parse_uni_stream_no_h3(struct qcs *qcs, struct buffer *b)
+static ssize_t h3_parse_uni_stream_no_h3(struct qcs *qcs, struct buffer *b, int fin)
 {
 	struct h3s *h3s = qcs->ctx;
 
@@ -230,11 +236,11 @@ static ssize_t h3_parse_uni_stream_no_h3(struct qcs *qcs, struct buffer *b)
 
 	switch (h3s->type) {
 	case H3S_T_QPACK_DEC:
-		if (qpack_decode_dec(b, NULL))
+		if (qpack_decode_dec(b, fin, qcs))
 			return -1;
 		break;
 	case H3S_T_QPACK_ENC:
-		if (qpack_decode_enc(b, NULL))
+		if (qpack_decode_enc(b, fin, qcs))
 			return -1;
 		break;
 	case H3S_T_UNKNOWN:
@@ -281,8 +287,11 @@ static int h3_is_frame_valid(struct h3c *h3c, struct qcs *qcs, uint64_t ftype)
 
 	switch (ftype) {
 	case H3_FT_DATA:
+		return h3s->type != H3S_T_CTRL && (h3s->st_req == H3S_ST_REQ_HEADERS ||
+		                                   h3s->st_req == H3S_ST_REQ_DATA);
+
 	case H3_FT_HEADERS:
-		return h3s->type != H3S_T_CTRL;
+		return h3s->type != H3S_T_CTRL && h3s->st_req != H3S_ST_REQ_TRAILERS;
 
 	case H3_FT_CANCEL_PUSH:
 	case H3_FT_GOAWAY:
@@ -338,8 +347,11 @@ static ssize_t h3_headers_to_htx(struct qcs *qcs, const struct buffer *buf,
 	//struct ist scheme = IST_NULL, authority = IST_NULL;
 	struct ist authority = IST_NULL;
 	int hdr_idx, ret;
+	int cookie = -1, last_cookie = -1;
 
 	TRACE_ENTER(H3_EV_RX_FRAME|H3_EV_RX_HDR, qcs->qcc->conn, qcs);
+
+	/* TODO support trailer parsing in this function */
 
 	/* TODO support buffer wrapping */
 	BUG_ON(b_head(buf) + len >= b_wrap(buf));
@@ -399,10 +411,22 @@ static ssize_t h3_headers_to_htx(struct qcs *qcs, const struct buffer *buf,
 		if (isteq(list[hdr_idx].n, ist("")))
 			break;
 
+		if (isteq(list[hdr_idx].n, ist("cookie"))) {
+			http_cookie_register(list, hdr_idx, &cookie, &last_cookie);
+			continue;
+		}
+
 		if (!istmatch(list[hdr_idx].n, ist(":")))
 			htx_add_header(htx, list[hdr_idx].n, list[hdr_idx].v);
 
 		++hdr_idx;
+	}
+
+	if (cookie >= 0) {
+		if (http_cookie_merge(htx, list, cookie)) {
+			h3c->err = H3_INTERNAL_ERROR;
+			return -1;
+		}
 	}
 
 	htx_add_endof(htx, HTX_BLK_EOH);
@@ -415,6 +439,19 @@ static ssize_t h3_headers_to_htx(struct qcs *qcs, const struct buffer *buf,
 		h3c->err = H3_INTERNAL_ERROR;
 		return -1;
 	}
+
+	/* RFC 9114 5.2. Connection Shutdown
+	 *
+	 * The GOAWAY frame contains an identifier that
+	 * indicates to the receiver the range of requests or pushes that were
+	 * or might be processed in this connection.  The server sends a client-
+	 * initiated bidirectional stream ID; the client sends a push ID.
+	 * Requests or pushes with the indicated identifier or greater are
+	 * rejected (Section 4.1.1) by the sender of the GOAWAY.  This
+	 * identifier MAY be zero if no requests or pushes were processed.
+	 */
+	if (qcs->id >= h3c->id_goaway)
+		h3c->id_goaway = qcs->id + 4;
 
 	/* buffer is transferred to the stream connector and set to NULL
 	 * except on stream creation error.
@@ -596,11 +633,23 @@ static ssize_t h3_decode_qcs(struct qcs *qcs, struct buffer *b, int fin)
 
 	if (quic_stream_is_uni(qcs->id) && (h3s->flags & H3_SF_UNI_NO_H3)) {
 		/* For non-h3 STREAM, parse it and return immediately. */
-		if ((ret = h3_parse_uni_stream_no_h3(qcs, b)) < 0)
+		if ((ret = h3_parse_uni_stream_no_h3(qcs, b, fin)) < 0)
 			return -1;
 
 		total += ret;
 		return total;
+	}
+
+	/* RFC 9114 6.2.1. Control Streams
+	 *
+	 * The sender MUST NOT close the control stream, and the receiver MUST NOT
+	 * request that the sender close the control stream.  If either control
+	 * stream is closed at any point, this MUST be treated as a connection
+	 * error of type H3_CLOSED_CRITICAL_STREAM.
+	 */
+	if (h3s->type == H3S_T_CTRL && fin) {
+		qcc_emit_cc_app(qcs->qcc, H3_CLOSED_CRITICAL_STREAM, 1);
+		return -1;
 	}
 
 	while (b_data(b) && !(qcs->flags & QC_SF_DEM_FULL)) {
@@ -621,7 +670,7 @@ static ssize_t h3_decode_qcs(struct qcs *qcs, struct buffer *b, int fin)
 			total += hlen;
 
 			if (!h3_is_frame_valid(h3c, qcs, ftype)) {
-				qcc_emit_cc_app(qcs->qcc, H3_FRAME_UNEXPECTED);
+				qcc_emit_cc_app(qcs->qcc, H3_FRAME_UNEXPECTED, 1);
 				return -1;
 			}
 
@@ -643,7 +692,7 @@ static ssize_t h3_decode_qcs(struct qcs *qcs, struct buffer *b, int fin)
 			 * excessive decompressed size.
 			 */
 			if (flen > QC_S_RX_BUF_SZ) {
-				qcc_emit_cc_app(qcs->qcc, H3_EXCESSIVE_LOAD);
+				qcc_emit_cc_app(qcs->qcc, H3_EXCESSIVE_LOAD, 1);
 				return -1;
 			}
 			break;
@@ -657,6 +706,7 @@ static ssize_t h3_decode_qcs(struct qcs *qcs, struct buffer *b, int fin)
 			ret = h3_data_to_htx(qcs, b, flen, last_stream_frame);
 			/* TODO handle error reporting. Stream closure required. */
 			if (ret < 0) { ABORT_NOW(); }
+			h3s->st_req = H3S_ST_REQ_DATA;
 			break;
 		case H3_FT_HEADERS:
 			ret = h3_headers_to_htx(qcs, b, flen, last_stream_frame);
@@ -665,9 +715,11 @@ static ssize_t h3_decode_qcs(struct qcs *qcs, struct buffer *b, int fin)
 				 * only close the stream once RESET_STREAM is
 				 * supported.
 				 */
-				qcc_emit_cc_app(qcs->qcc, h3c->err);
+				qcc_emit_cc_app(qcs->qcc, h3c->err, 1);
 				return -1;
 			}
+			h3s->st_req = (h3s->st_req == H3S_ST_REQ_BEFORE) ?
+			                H3S_ST_REQ_HEADERS : H3S_ST_REQ_TRAILERS;
 			break;
 		case H3_FT_CANCEL_PUSH:
 		case H3_FT_PUSH_PROMISE:
@@ -679,7 +731,7 @@ static ssize_t h3_decode_qcs(struct qcs *qcs, struct buffer *b, int fin)
 		case H3_FT_SETTINGS:
 			ret = h3_parse_settings_frm(qcs->qcc->ctx, b, flen);
 			if (ret < 0) {
-				qcc_emit_cc_app(qcs->qcc, h3c->err);
+				qcc_emit_cc_app(qcs->qcc, h3c->err, 1);
 				return -1;
 			}
 			h3c->flags |= H3_CF_SETTINGS_RECV;
@@ -1054,6 +1106,8 @@ static int h3_attach(struct qcs *qcs, void *conn_ctx)
 
 	if (quic_stream_is_bidi(qcs->id)) {
 		h3s->type = H3S_T_REQ;
+		h3s->st_req = H3S_ST_REQ_BEFORE;
+		qcs_wait_http_req(qcs);
 	}
 	else {
 		/* stream type must be decoded for unidirectional streams */
@@ -1081,13 +1135,45 @@ static int h3_finalize(void *ctx)
 	struct h3c *h3c = ctx;
 	struct qcs *qcs;
 
-	qcs = qcc_open_stream_local(h3c->qcc, 0);
+	qcs = qcc_init_stream_local(h3c->qcc, 0);
 	if (!qcs)
 		return 0;
 
 	h3_control_send(qcs, h3c);
+	h3c->ctrl_strm = qcs;
 
 	return 1;
+}
+
+/* Generate a GOAWAY frame for <h3c> connection on the control stream.
+ *
+ * Returns 0 on success else non-zero.
+ */
+static int h3_send_goaway(struct h3c *h3c)
+{
+	struct qcs *qcs = h3c->ctrl_strm;
+	struct buffer pos, *res;
+	unsigned char data[3 * QUIC_VARINT_MAX_SIZE];
+	size_t frm_len = quic_int_getsize(h3c->id_goaway);
+
+	if (!qcs)
+		return 1;
+
+	pos = b_make((char *)data, sizeof(data), 0, 0);
+
+	b_quic_enc_int(&pos, H3_FT_GOAWAY);
+	b_quic_enc_int(&pos, frm_len);
+	b_quic_enc_int(&pos, h3c->id_goaway);
+
+	res = mux_get_buf(qcs);
+	if (!res || b_room(res) < b_data(&pos)) {
+		/* Do not try forcefully to emit GOAWAY if no space left. */
+		return 1;
+	}
+
+	b_force_xfer(res, &pos, b_data(&pos));
+
+	return 0;
 }
 
 /* Initialize the HTTP/3 context for <qcc> mux.
@@ -1103,8 +1189,10 @@ static int h3_init(struct qcc *qcc)
 		goto fail_no_h3;
 
 	h3c->qcc = qcc;
+	h3c->ctrl_strm = NULL;
 	h3c->err = H3_NO_ERROR;
 	h3c->flags = 0;
+	h3c->id_goaway = 0;
 
 	qcc->ctx = h3c;
 	h3c->prx_counters =
@@ -1121,19 +1209,25 @@ static int h3_init(struct qcc *qcc)
 static void h3_release(void *ctx)
 {
 	struct h3c *h3c = ctx;
+
+	/* RFC 9114 5.2. Connection Shutdown
+	 *
+	 * Even when a connection is not idle, either endpoint can decide to
+	 * stop using the connection and initiate a graceful connection close.
+	 * Endpoints initiate the graceful shutdown of an HTTP/3 connection by
+	 * sending a GOAWAY frame.
+	 */
+	h3_send_goaway(h3c);
+
+	/* RFC 9114 5.2. Connection Shutdown
+	 *
+	 * An endpoint that completes a
+	 * graceful shutdown SHOULD use the H3_NO_ERROR error code when closing
+	 * the connection.
+	 */
+	qcc_emit_cc_app(h3c->qcc, H3_NO_ERROR, 0);
+
 	pool_free(pool_head_h3c, h3c);
-}
-
-/* Check if the H3 connection can still be considered as active.
- *
- * Return true if active else false.
- */
-static int h3_is_active(const struct qcc *qcc, void *ctx)
-{
-	if (qcc->strms[QCS_CLT_BIDI].nb_streams)
-		return 1;
-
-	return 0;
 }
 
 /* Increment the h3 error code counters for <error_code> value */
@@ -1170,7 +1264,6 @@ const struct qcc_app_ops h3_ops = {
 	.snd_buf     = h3_snd_buf,
 	.detach      = h3_detach,
 	.finalize    = h3_finalize,
-	.is_active   = h3_is_active,
 	.release     = h3_release,
 	.inc_err_cnt = h3_stats_inc_err_cnt,
 };

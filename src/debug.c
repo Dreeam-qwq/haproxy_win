@@ -47,14 +47,27 @@
 #include <import/ist.h>
 
 
-/* The dump state is madee of:
- *   - num_thread+1 on the lowest 16 bits
- *   - a counter of done on the 16 high bits
- * Initiating a dump consists in setting it to 1. A thread finished dumping
- * adds 1<<16 and sets the lowest 15 bits to the ID of the next thread to
- * dump + 1. Only used when USE_THREAD_DUMP is set.
+/* The dump state is made of:
+ *   - num_thread on the lowest 15 bits
+ *   - a SYNC flag on bit 15 (waiting for sync start)
+ *   - number of participating threads on bits 16-30
+ * Initiating a dump consists in setting it to SYNC and incrementing the
+ * num_thread part when entering the function. The first thread periodically
+ * recounts active threads and compares it to the ready ones, and clears SYNC
+ * and sets the number of participants to the value found, which serves as a
+ * start signal. A thread finished dumping looks up the TID of the next active
+ * thread after it and writes it in the lowest part. If there's none, it sets
+ * the thread counter to the number of participants and resets that part,
+ * which serves as an end-of-dump signal. All threads decrement the num_thread
+ * part. Then all threads wait for the value to reach zero. Only used when
+ * USE_THREAD_DUMP is set.
  */
+#define THREAD_DUMP_TMASK     0x00007FFFU
+#define THREAD_DUMP_FSYNC     0x00008000U
+#define THREAD_DUMP_PMASK     0x7FFF0000U
+
 volatile unsigned int thread_dump_state = 0;
+unsigned int panic_started = 0;
 unsigned int debug_commands_issued = 0;
 
 /* dumps a backtrace of the current thread that is appended to buffer <buf>.
@@ -226,6 +239,7 @@ void ha_task_dump(struct buffer *buf, const struct task *task, const char *pfx)
 	const struct stream *s = NULL;
 	const struct appctx __maybe_unused *appctx = NULL;
 	struct hlua __maybe_unused *hlua = NULL;
+	const struct stconn *sc;
 
 	if (!task) {
 		chunk_appendf(buf, "0\n");
@@ -256,8 +270,8 @@ void ha_task_dump(struct buffer *buf, const struct task *task, const char *pfx)
 
 	if (task->process == process_stream && task->context)
 		s = (struct stream *)task->context;
-	else if (task->process == task_run_applet && task->context)
-		s = sc_strm(appctx_sc((struct appctx *)task->context));
+	else if (task->process == task_run_applet && task->context && (sc = appctx_sc((struct appctx *)task->context)))
+		s = sc_strm(sc);
 	else if (task->process == sc_conn_io_cb && task->context)
 		s = sc_strm(((struct stconn *)task->context));
 
@@ -336,6 +350,14 @@ static int debug_parse_cli_show_libs(char **args, char *payload, struct appctx *
 /* dumps a state of all threads into the trash and on fd #2, then aborts. */
 void ha_panic()
 {
+	if (HA_ATOMIC_FETCH_ADD(&panic_started, 1) != 0) {
+		/* a panic dump is already in progress, let's not disturb it,
+		 * we'll be called via signal DEBUGSIG. By returning we may be
+		 * able to leave a current signal handler (e.g. WDT) so that
+		 * this will ensure more reliable signal delivery.
+		 */
+		return;
+	}
 	chunk_reset(&trash);
 	chunk_appendf(&trash, "Thread %u is about to kill the process.\n", tid + 1);
 	ha_thread_dump_all_to_trash();
@@ -432,6 +454,36 @@ static int debug_parse_cli_close(char **args, char *payload, struct appctx *appc
 
 	_HA_ATOMIC_INC(&debug_commands_issued);
 	fd_delete(fd);
+	return 1;
+}
+
+/* this is meant to cause a deadlock when more than one task is running it or when run twice */
+static struct task *debug_run_cli_deadlock(struct task *task, void *ctx, unsigned int state)
+{
+	static HA_SPINLOCK_T lock __maybe_unused;
+
+	HA_SPIN_LOCK(OTHER_LOCK, &lock);
+	return NULL;
+}
+
+/* parse a "debug dev deadlock" command. It always returns 1. */
+static int debug_parse_cli_deadlock(char **args, char *payload, struct appctx *appctx, void *private)
+{
+	int tasks;
+
+	if (!cli_has_level(appctx, ACCESS_LVL_ADMIN))
+		return 1;
+
+	_HA_ATOMIC_INC(&debug_commands_issued);
+	for (tasks = atoi(args[3]); tasks > 0; tasks--) {
+		struct task *t = task_new_on(tasks % global.nbthread);
+		if (!t)
+			continue;
+		t->process = debug_run_cli_deadlock;
+		t->context = NULL;
+		task_wakeup(t, TASK_WOKEN_INIT);
+	}
+
 	return 1;
 }
 
@@ -1177,6 +1229,7 @@ static int debug_iohandler_fd(struct appctx *appctx)
 struct dev_mem_ctx {
 	struct mem_stats *start, *stop; /* begin/end of dump */
 	int show_all;                   /* show all entries if non-null */
+	int width;
 };
 
 /* CLI parser for the "debug dev memstats" command. Sets a dev_mem_ctx shown above. */
@@ -1209,6 +1262,7 @@ static int debug_parse_cli_memstats(char **args, char *payload, struct appctx *a
 	/* otherwise proceed with the dump from p0 to p1 */
 	ctx->start = &__start_mem_stats;
 	ctx->stop  = &__stop_mem_stats;
+	ctx->width = 0;
 	return 0;
 }
 
@@ -1221,21 +1275,49 @@ static int debug_iohandler_memstats(struct appctx *appctx)
 {
 	struct dev_mem_ctx *ctx = appctx->svcctx;
 	struct stconn *sc = appctx_sc(appctx);
-	struct mem_stats *ptr = ctx->start;
+	struct mem_stats *ptr;
 	int ret = 1;
 
 	if (unlikely(sc_ic(sc)->flags & (CF_WRITE_ERROR|CF_SHUTW)))
 		goto end;
 
-	chunk_reset(&trash);
+	if (!ctx->width) {
+		/* we don't know the first column's width, let's compute it
+		 * now based on a first pass on printable entries and their
+		 * expected width (approximated).
+		 */
+		for (ptr = ctx->start; ptr != ctx->stop; ptr++) {
+			const char *p, *name;
+			int w = 0;
+			char tmp;
+
+			if (!ptr->size && !ptr->calls && !ctx->show_all)
+				continue;
+
+			for (p = name = ptr->file; *p; p++) {
+				if (*p == '/')
+					name = p + 1;
+			}
+
+			if (ctx->show_all)
+				w = snprintf(&tmp, 0, "%s(%s:%d) ", ptr->func, name, ptr->line);
+			else
+				w = snprintf(&tmp, 0, "%s:%d ", name, ptr->line);
+
+			if (w > ctx->width)
+				ctx->width = w;
+		}
+	}
 
 	/* we have two inner loops here, one for the proxy, the other one for
 	 * the buffer.
 	 */
-	for (; ptr != ctx->stop; ptr++) {
+	for (ptr = ctx->start; ptr != ctx->stop; ptr++) {
 		const char *type;
 		const char *name;
 		const char *p;
+		const char *info = NULL;
+		const char *func = NULL;
 
 		if (!ptr->size && !ptr->calls && !ctx->show_all)
 			continue;
@@ -1246,14 +1328,16 @@ static int debug_iohandler_memstats(struct appctx *appctx)
 				name = p + 1;
 		}
 
+		func = ptr->func;
+
 		switch (ptr->type) {
 		case MEM_STATS_TYPE_CALLOC:  type = "CALLOC";  break;
 		case MEM_STATS_TYPE_FREE:    type = "FREE";    break;
 		case MEM_STATS_TYPE_MALLOC:  type = "MALLOC";  break;
 		case MEM_STATS_TYPE_REALLOC: type = "REALLOC"; break;
 		case MEM_STATS_TYPE_STRDUP:  type = "STRDUP";  break;
-		case MEM_STATS_TYPE_P_ALLOC: type = "P_ALLOC"; break;
-		case MEM_STATS_TYPE_P_FREE:  type = "P_FREE";  break;
+		case MEM_STATS_TYPE_P_ALLOC: type = "P_ALLOC"; if (ptr->extra) info = ((const struct pool_head *)ptr->extra)->name; break;
+		case MEM_STATS_TYPE_P_FREE:  type = "P_FREE";  if (ptr->extra) info = ((const struct pool_head *)ptr->extra)->name; break;
 		default:                     type = "UNSET";   break;
 		}
 
@@ -1263,13 +1347,23 @@ static int debug_iohandler_memstats(struct appctx *appctx)
 		//	     (unsigned long)ptr->size, (unsigned long)ptr->calls,
 		//	     (unsigned long)(ptr->calls ? (ptr->size / ptr->calls) : 0));
 
-		chunk_printf(&trash, "%s:%d", name, ptr->line);
-		while (trash.data < 25)
+		chunk_reset(&trash);
+		if (ctx->show_all)
+			chunk_appendf(&trash, "%s(", func);
+
+		chunk_appendf(&trash, "%s:%d", name, ptr->line);
+
+		if (ctx->show_all)
+			chunk_appendf(&trash, ")");
+
+		while (trash.data < ctx->width)
 			trash.area[trash.data++] = ' ';
-		chunk_appendf(&trash, "%7s  size: %12lu  calls: %9lu  size/call: %6lu\n",
+
+		chunk_appendf(&trash, "%7s  size: %12lu  calls: %9lu  size/call: %6lu %s\n",
 			     type,
 			     (unsigned long)ptr->size, (unsigned long)ptr->calls,
-			     (unsigned long)(ptr->calls ? (ptr->size / ptr->calls) : 0));
+		             (unsigned long)(ptr->calls ? (ptr->size / ptr->calls) : 0),
+			     info ? info : "");
 
 		if (applet_putchk(appctx, &trash) == -1) {
 			ctx->start = ptr;
@@ -1313,24 +1407,35 @@ void ha_thread_dump_all_to_trash()
 {
 	unsigned int old;
 
+	/* initiate a dump starting from first thread. Use a CAS so that we do
+	 * not wait if we're not the first one, but we wait for a previous dump
+	 * to finish.
+	 */
 	while (1) {
 		old = 0;
-		if (HA_ATOMIC_CAS(&thread_dump_state, &old, 1))
+		if (HA_ATOMIC_CAS(&thread_dump_state, &old, THREAD_DUMP_FSYNC))
 			break;
 		ha_thread_relax();
 	}
-
 	thread_dump_buffer = &trash;
 	thread_dump_tid = tid;
 	ha_tkillall(DEBUGSIG);
+
+	/* the call above contains a raise() so we're certain to return after
+	 * returning from the sighandler, hence when the dump is complete.
+	 */
 }
 
-/* handles DEBUGSIG to dump the state of the thread it's working on */
+/* handles DEBUGSIG to dump the state of the thread it's working on. This is
+ * appended at the end of thread_dump_buffer which must be protected against
+ * reentrance from different threads (a thread-local buffer works fine).
+ */
 void debug_handler(int sig, siginfo_t *si, void *arg)
 {
 	int harmless = is_thread_harmless();
+	int running = 0;
+	uint prev;
 	uint next;
-	uint done;
 
 	/* first, let's check it's really for us and that we didn't just get
 	 * a spurious DEBUGSIG.
@@ -1338,20 +1443,64 @@ void debug_handler(int sig, siginfo_t *si, void *arg)
 	if (!_HA_ATOMIC_LOAD(&thread_dump_state))
 		return;
 
-	/* There are 4 phases in the dump process:
-	 *   1- wait for our turn, i.e. when all lower bits are gone.
-	 *   2- perform the action if our bit is set
-	 *   3- remove our bit to let the next one go, unless we're
-	 *      the last one and have to put them all as a signal
-	 *   4- wait out bit to re-appear, then clear it and quit.
+	/* There are 5 phases in the dump process:
+	 *   1- wait for all threads to sync or the first one to start
+	 *   2- wait for our turn, i.e. when tid appears in lower bits.
+	 *   3- perform the action if our tid is there
+	 *   4- pass tid to the number of the next thread to dump or
+	 *      reset running counter if we're last one.
+	 *   5- wait for running to be zero and decrement the count
 	 */
 
 	/* wait for all previous threads to finish first */
 	if (!harmless)
 		thread_harmless_now();
 
-	while ((_HA_ATOMIC_LOAD(&thread_dump_state) & 0xFFFF) < (tid + 1))
+	if (HA_ATOMIC_FETCH_ADD(&thread_dump_state, 1) == THREAD_DUMP_FSYNC) {
+		/* the first one which lands here is responsible for constantly
+		 * recounting the number of active theads and switching from
+		 * SYNC to DUMP.
+		 */
+		while (1) {
+			int first = -1; // first tid to dump
+			int thr;
+
+			running = 0;
+			for (thr = 0; thr < global.nbthread; thr++) {
+				if (ha_thread_info[thr].tg->threads_enabled & ha_thread_info[thr].ltid_bit) {
+					running++;
+					if (first < 0)
+						first = thr;
+				}
+			}
+
+			if ((HA_ATOMIC_LOAD(&thread_dump_state) & THREAD_DUMP_TMASK) == running) {
+				/* all threads are there, let's try to start */
+				prev = THREAD_DUMP_FSYNC | running;
+				next = (running << 16) | first;
+				if (HA_ATOMIC_CAS(&thread_dump_state, &prev, next))
+					break;
+				/* it failed! maybe a thread appeared late (e.g. during boot), let's
+				 * recount.
+				 */
+			}
+			ha_thread_relax();
+		}
+	}
+
+	/* all threads: let's wait for the SYNC flag to disappear; tid is reset at
+	 * the same time to the first valid tid to dump and pmask will reflect the
+	 * number of participants.
+	 */
+	while (HA_ATOMIC_LOAD(&thread_dump_state) & THREAD_DUMP_FSYNC)
 		ha_thread_relax();
+
+	/* wait for our turn */
+	while ((HA_ATOMIC_LOAD(&thread_dump_state) & THREAD_DUMP_TMASK) != tid)
+		ha_thread_relax();
+
+	/* make sure we don't count all that wait time against us */
+	HA_ATOMIC_AND(&th_ctx->flags, ~TH_FL_STUCK);
 
 	if (!harmless)
 		thread_harmless_end();
@@ -1360,7 +1509,11 @@ void debug_handler(int sig, siginfo_t *si, void *arg)
 	if (thread_dump_buffer)
 		ha_thread_dump(thread_dump_buffer, tid, thread_dump_tid);
 
-	/* figure which is the next thread ID to dump among enabled ones */
+	/* figure which is the next thread ID to dump among enabled ones. Note
+	 * that this relies on the fact that we're not creating new threads in
+	 * the middle of a dump, which is normally granted by the harmless bits
+	 * anyway.
+	 */
 	for (next = tid + 1; next < global.nbthread; next++) {
 		if (unlikely(next >= MAX_THREADS)) {
 			/* just to please gcc 6.5 who guesses the ranges wrong. */
@@ -1372,15 +1525,18 @@ void debug_handler(int sig, siginfo_t *si, void *arg)
 			break;
 	}
 
-	/* atomically set the next to next+1 or 0, and increment the done counter */
-	done = (HA_ATOMIC_LOAD(&thread_dump_state) >> 16) + 1;
-	done <<= 16;
-	if (next < global.nbthread)
-		done += next + 1;
-	else
+	/* if there are threads left to dump, we atomically set the next one,
+	 * otherwise we'll clear dump and set the thread part to the number of
+	 * threads that need to disappear.
+	 */
+	if (next < global.nbthread) {
+		next = (HA_ATOMIC_LOAD(&thread_dump_state) & THREAD_DUMP_PMASK) | next;
+		HA_ATOMIC_STORE(&thread_dump_state, next);
+	} else {
 		thread_dump_buffer = NULL; // was the last one
-
-	HA_ATOMIC_STORE(&thread_dump_state, done);
+		running = (HA_ATOMIC_LOAD(&thread_dump_state) & THREAD_DUMP_PMASK) >> 16;
+		HA_ATOMIC_STORE(&thread_dump_state, running);
+	}
 
 	/* now wait for all others to finish dumping: the lowest part will turn
 	 * to zero. Then all others decrement the done part.
@@ -1388,13 +1544,21 @@ void debug_handler(int sig, siginfo_t *si, void *arg)
 	if (!harmless)
 		thread_harmless_now();
 
-	while ((_HA_ATOMIC_LOAD(&thread_dump_state) & 0xFFFF) != 0)
+	/* wait for everyone to finish*/
+	while (HA_ATOMIC_LOAD(&thread_dump_state) & THREAD_DUMP_PMASK)
 		ha_thread_relax();
+
+	/* make sure we don't count all that wait time against us */
+	HA_ATOMIC_AND(&th_ctx->flags, ~TH_FL_STUCK);
 
 	if (!harmless)
 		thread_harmless_end();
 
-	HA_ATOMIC_SUB(&thread_dump_state, 0x10000);
+	/* we're gone. Past this point anything can happen including another
+	 * thread trying to re-trigger a dump, so thread_dump_buffer and
+	 * thread_dump_tid may become invalid immediately after this call.
+	 */
+	HA_ATOMIC_SUB(&thread_dump_state, 1);
 
 	/* mark the current thread as stuck to detect it upon next invocation
 	 * if it didn't move.
@@ -1443,6 +1607,7 @@ static struct cli_kw_list cli_kws = {{ },{
 	{{ "debug", "dev", "bug", NULL },      "debug dev bug                           : call BUG_ON() and crash",                 debug_parse_cli_bug,   NULL, NULL, NULL, ACCESS_EXPERT },
 	{{ "debug", "dev", "check", NULL },    "debug dev check                         : call CHECK_IF() and possibly crash",      debug_parse_cli_check, NULL, NULL, NULL, ACCESS_EXPERT },
 	{{ "debug", "dev", "close", NULL },    "debug dev close  <fd>                   : close this file descriptor",              debug_parse_cli_close, NULL, NULL, NULL, ACCESS_EXPERT },
+	{{ "debug", "dev", "deadlock", NULL }, "debug dev deadlock [nbtask]             : deadlock between this number of tasks",   debug_parse_cli_deadlock, NULL, NULL, NULL, ACCESS_EXPERT },
 	{{ "debug", "dev", "delay", NULL },    "debug dev delay  [ms]                   : sleep this long",                         debug_parse_cli_delay, NULL, NULL, NULL, ACCESS_EXPERT },
 #if defined(DEBUG_DEV)
 	{{ "debug", "dev", "exec",  NULL },    "debug dev exec   [cmd] ...              : show this command's output",              debug_parse_cli_exec,  NULL, NULL, NULL, ACCESS_EXPERT },

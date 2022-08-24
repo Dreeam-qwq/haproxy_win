@@ -165,29 +165,6 @@ enum quic_pkt_type {
 
 #define QUIC_PACKET_KEY_PHASE_BIT    0x04 /* (protected) */
 
-/*
- * Transport level error codes.
- */
-#define QC_ERR_NO_ERROR                     0x00
-#define QC_ERR_INTERNAL_ERROR               0x01
-#define QC_ERR_CONNECTION_REFUSED           0x02
-#define QC_ERR_FLOW_CONTROL_ERROR           0x03
-#define QC_ERR_STREAM_LIMIT_ERROR           0x04
-#define QC_ERR_STREAM_STATE_ERROR           0x05
-#define QC_ERR_FINAL_SIZE_ERROR             0x06
-#define QC_ERR_FRAME_ENCODING_ERROR         0x07
-#define QC_ERR_TRANSPORT_PARAMETER_ERROR    0x08
-#define QC_ERR_CONNECTION_ID_LIMIT_ERROR    0x09
-#define QC_ERR_PROTOCOL_VIOLATION           0x0a
-#define QC_ERR_INVALID_TOKEN                0x0b
-#define QC_ERR_APPLICATION_ERROR            0x0c
-#define QC_ERR_CRYPTO_BUFFER_EXCEEDED       0x0d
-#define QC_ERR_KEY_UPDATE_ERROR             0x0e
-#define QC_ERR_AEAD_LIMIT_REACHED           0x0f
-#define QC_ERR_NO_VIABLE_PATH               0x10
-/* 256 TLS reserved errors 0x100-0x1ff. */
-#define QC_ERR_CRYPTO_ERROR                0x100
-
 /* The maximum number of QUIC packets stored by the fd I/O handler by QUIC
  * connection. Must be a power of two.
  */
@@ -205,7 +182,7 @@ enum quic_pkt_type {
 #define           QUIC_EV_CONN_LPKT      (1ULL << 6)
 #define           QUIC_EV_CONN_SPKT      (1ULL << 7)
 #define           QUIC_EV_CONN_ENCPKT    (1ULL << 8)
-#define           QUIC_EV_CONN_HPKT      (1ULL << 9)
+#define           QUIC_EV_CONN_TXPKT     (1ULL << 9)
 #define           QUIC_EV_CONN_PAPKT     (1ULL << 10)
 #define           QUIC_EV_CONN_PAPKTS    (1ULL << 11)
 #define           QUIC_EV_CONN_IO_CB     (1ULL << 12)
@@ -218,7 +195,7 @@ enum quic_pkt_type {
 #define           QUIC_EV_CONN_PHPKTS    (1ULL << 19)
 #define           QUIC_EV_CONN_TRMHP     (1ULL << 20)
 #define           QUIC_EV_CONN_ELRMHP    (1ULL << 21)
-#define           QUIC_EV_CONN_ELRXPKTS  (1ULL << 22)
+#define           QUIC_EV_CONN_RXPKT     (1ULL << 22)
 #define           QUIC_EV_CONN_SSLDATA   (1ULL << 23)
 #define           QUIC_EV_CONN_RXCDATA   (1ULL << 24)
 #define           QUIC_EV_CONN_ADDDATA   (1ULL << 25)
@@ -241,6 +218,8 @@ enum quic_pkt_type {
 #define           QUIC_EV_CONN_FRMLIST   (1ULL << 42)
 #define           QUIC_EV_STATELESS_RST  (1ULL << 43)
 #define           QUIC_EV_TRANSP_PARAMS  (1ULL << 44)
+#define           QUIC_EV_CONN_IDLE_TIMER (1ULL << 45)
+#define           QUIC_EV_CONN_SUB       (1ULL << 46)
 
 /* Similar to kernel min()/max() definitions. */
 #define QUIC_MIN(a, b) ({ \
@@ -411,7 +390,7 @@ struct quic_dgram {
 #define QUIC_FL_RX_PACKET_ACK_ELICITING (1UL << 0)
 
 struct quic_rx_packet {
-	struct mt_list list;
+	struct list list;
 	struct mt_list rx_list;
 	struct list qc_rx_pkt_list;
 	struct quic_conn *qc;
@@ -463,9 +442,9 @@ struct quic_rx_crypto_frm {
 #define QUIC_FL_TX_PACKET_PADDING       (1UL << 1)
 /* Flag a sent packet as being in flight. */
 #define QUIC_FL_TX_PACKET_IN_FLIGHT     (QUIC_FL_TX_PACKET_ACK_ELICITING | QUIC_FL_TX_PACKET_PADDING)
-/* Flag a sent packet as containg a CONNECTION_CLOSE frame */
+/* Flag a sent packet as containing a CONNECTION_CLOSE frame */
 #define QUIC_FL_TX_PACKET_CC            (1UL << 2)
-/* Flag a sent packet as containg an ACK frame */
+/* Flag a sent packet as containing an ACK frame */
 #define QUIC_FL_TX_PACKET_ACK           (1UL << 3)
 /* Flag a sent packet as being coalesced to another one in the same datagram */
 #define QUIC_FL_TX_PACKET_COALESCED     (1UL << 4)
@@ -538,10 +517,8 @@ struct quic_enc_level {
 		/* The packets received by the listener I/O handler
 		   with header protection removed. */
 		struct eb_root pkts;
-		/* <pkts> root must be protected from concurrent accesses */
-		__decl_thread(HA_RWLOCK_T pkts_rwlock);
 		/* Liste of QUIC packets with protected header. */
-		struct mt_list pqpkts;
+		struct list pqpkts;
 		/* Crypto frames */
 		struct {
 			uint64_t offset;
@@ -615,12 +592,12 @@ enum qc_mux_state {
 #define QUIC_FL_CONN_POST_HANDSHAKE_FRAMES_BUILT (1U << 2)
 #define QUIC_FL_CONN_LISTENER                    (1U << 3)
 #define QUIC_FL_CONN_ACCEPT_REGISTERED           (1U << 4)
-/* gap here */
+#define QUIC_FL_CONN_TX_MUX_CONTEXT              (1U << 5) /* sending in progress from the MUX layer */
 #define QUIC_FL_CONN_IDLE_TIMER_RESTARTED_AFTER_READ (1U << 6)
 #define QUIC_FL_CONN_RETRANS_NEEDED              (1U << 7)
-#define QUIC_FL_CONN_RETRANS_OLD_DATA            (1U << 8)
+#define QUIC_FL_CONN_RETRANS_OLD_DATA            (1U << 8) /* retransmission in progress for probing with already sent data */
 #define QUIC_FL_CONN_TLS_ALERT                   (1U << 9)
-#define QUIC_FL_CONN_APP_ALERT                   (1U << 10) /* A connection error of type CONNECTION_CLOSE_APP must be emitted. */
+/* gap here */
 #define QUIC_FL_CONN_HALF_OPEN_CNT_DECREMENTED   (1U << 11) /* The half-open connection counter was decremented */
 #define QUIC_FL_CONN_NOTIFY_CLOSE                (1U << 27) /* MUX notified about quic-conn imminent closure (idle-timeout or CONNECTION_CLOSE emission/reception) */
 #define QUIC_FL_CONN_EXP_TIMER                   (1U << 28) /* timer has expired, quic-conn can be freed */
@@ -638,7 +615,7 @@ struct quic_conn {
 	int tid;
 	int state;
 	enum qc_mux_state mux_state; /* status of the connection/mux layer */
-	uint64_t err_code;
+	struct quic_err err;
 	unsigned char enc_params[QUIC_TP_MAX_ENCLEN]; /* encoded QUIC transport parameters */
 	size_t enc_params_len;
 
@@ -680,8 +657,8 @@ struct quic_conn {
 		uint64_t prep_bytes;
 		/* Transport parameters sent by the peer */
 		struct quic_transport_params params;
-		/* A pointer to a list of TX ring buffers */
-		struct mt_list *qring_list;
+		/* Send buffer used to write datagrams. */
+		struct buffer buf;
 	} tx;
 	struct {
 		/* Number of received bytes. */
@@ -726,7 +703,6 @@ struct quic_conn {
 	unsigned int nb_pkt_since_cc;
 
 	const struct qcc_app_ops *app_ops;
-	unsigned int sendto_err;
 	struct quic_counters *prx_counters;
 };
 

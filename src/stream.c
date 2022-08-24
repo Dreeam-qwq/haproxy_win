@@ -3284,7 +3284,7 @@ static int stats_dump_full_strm_to_buffer(struct stconn *sc, struct stream *strm
 		}
 
 		chunk_appendf(&trash,
-			     "  task=%p (state=0x%02x nice=%d calls=%u rate=%u exp=%s tid=%d%s",
+			     "  task=%p (state=0x%02x nice=%d calls=%u rate=%u exp=%s tid=%d(%d/%d)%s",
 			     strm->task,
 			     strm->task->state,
 			     strm->task->nice, strm->task->calls, read_freq_ctr(&strm->call_rate),
@@ -3293,6 +3293,8 @@ static int stats_dump_full_strm_to_buffer(struct stconn *sc, struct stream *strm
 			                     human_time(TICKS_TO_MS(strm->task->expire - now_ms),
 			                     TICKS_TO_MS(1000)) : "<NEVER>",
 		             strm->task->tid,
+		             ha_thread_info[strm->task->tid].tgid,
+		             ha_thread_info[strm->task->tid].ltid,
 			     task_in_rq(strm->task) ? ", running" : "");
 
 		chunk_appendf(&trash,
@@ -3328,17 +3330,16 @@ static int stats_dump_full_strm_to_buffer(struct stconn *sc, struct stream *strm
 			              conn->flags,
 			              conn_fd(conn),
 			              conn_fd(conn) >= 0 ? fdtab[conn->handle.fd].state : 0,
-			              conn_fd(conn) >= 0 ? !!(fdtab[conn->handle.fd].update_mask & tid_bit) : 0,
+			              conn_fd(conn) >= 0 ? !!(fdtab[conn->handle.fd].update_mask & ti->ltid_bit) : 0,
 				      conn_fd(conn) >= 0 ? fdtab[conn->handle.fd].thread_mask: 0);
 
 		}
 		else if ((tmpctx = sc_appctx(scf)) != NULL) {
 			chunk_appendf(&trash,
-			              "      app0=%p st0=%d st1=%d st2=%d applet=%s tid=%d nice=%d calls=%u rate=%u cpu=%llu lat=%llu\n",
+			              "      app0=%p st0=%d st1=%d applet=%s tid=%d nice=%d calls=%u rate=%u cpu=%llu lat=%llu\n",
 				      tmpctx,
 				      tmpctx->st0,
 				      tmpctx->st1,
-				      tmpctx->_st2,
 			              tmpctx->applet->name,
 			              tmpctx->t->tid,
 			              tmpctx->t->nice, tmpctx->t->calls, read_freq_ctr(&tmpctx->call_rate),
@@ -3367,17 +3368,16 @@ static int stats_dump_full_strm_to_buffer(struct stconn *sc, struct stream *strm
 			              conn->flags,
 			              conn_fd(conn),
 			              conn_fd(conn) >= 0 ? fdtab[conn->handle.fd].state : 0,
-			              conn_fd(conn) >= 0 ? !!(fdtab[conn->handle.fd].update_mask & tid_bit) : 0,
+			              conn_fd(conn) >= 0 ? !!(fdtab[conn->handle.fd].update_mask & ti->ltid_bit) : 0,
 				      conn_fd(conn) >= 0 ? fdtab[conn->handle.fd].thread_mask: 0);
 
 		}
 		else if ((tmpctx = sc_appctx(scb)) != NULL) {
 			chunk_appendf(&trash,
-			              "      app1=%p st0=%d st1=%d st2=%d applet=%s tid=%d nice=%d calls=%u rate=%u cpu=%llu lat=%llu\n",
+			              "      app1=%p st0=%d st1=%d applet=%s tid=%d nice=%d calls=%u rate=%u cpu=%llu lat=%llu\n",
 				      tmpctx,
 				      tmpctx->st0,
 				      tmpctx->st1,
-				      tmpctx->_st2,
 			              tmpctx->applet->name,
 			              tmpctx->t->tid,
 			              tmpctx->t->nice, tmpctx->t->calls, read_freq_ctr(&tmpctx->call_rate),

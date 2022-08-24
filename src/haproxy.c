@@ -833,13 +833,6 @@ static void mworker_loop()
 	mworker_catch_sigchld(NULL); /* ensure we clean the children in case
 				     some SIGCHLD were lost */
 
-	global.nbthread = 1;
-
-#ifdef USE_THREAD
-	tid_bit = 1;
-	all_threads_mask = 1;
-#endif
-
 	jobs++; /* this is the "master" job, we want to take care of the
 		signals even if there is no listener so the poll loop don't
 		leave */
@@ -1518,11 +1511,14 @@ static void init_early(int argc, char **argv)
 	/* Some CPU affinity stuff may have to be initialized */
 #ifdef USE_CPU_AFFINITY
 	{
-		int i;
-		ha_cpuset_zero(&cpu_map.proc);
-		ha_cpuset_zero(&cpu_map.proc_t1);
-		for (i = 0; i < MAX_THREADS; ++i) {
-			ha_cpuset_zero(&cpu_map.thread[i]);
+		int g, i;
+
+		for (g = 0; g < MAX_TGROUPS; g++) {
+			ha_cpuset_zero(&cpu_map[g].proc);
+			ha_cpuset_zero(&cpu_map[g].proc_t1);
+			for (i = 0; i < MAX_THREADS_PER_GROUP; ++i) {
+				ha_cpuset_zero(&cpu_map[g].thread[i]);
+			}
 		}
 	}
 #endif
@@ -2078,6 +2074,16 @@ static void init(int argc, char **argv)
 
 		LIST_APPEND(&proc_list, &tmproc->list);
 	}
+
+	if (global.mode & MODE_MWORKER_WAIT) {
+		/* in exec mode, there's always exactly one thread. Failure to
+		 * set these ones now will result in nbthread being detected
+		 * automatically.
+		 */
+		global.nbtgroups = 1;
+		global.nbthread = 1;
+	}
+
 	if (global.mode & (MODE_MWORKER|MODE_MWORKER_WAIT)) {
 		struct wordlist *it, *c;
 
@@ -2224,8 +2230,10 @@ static void init(int argc, char **argv)
 		cfg_run_diagnostics();
 	}
 
-	/* Initialize the random generators */
 #ifdef USE_OPENSSL
+	/* Initialize the error strings of OpenSSL */
+	SSL_load_error_strings();
+
 	/* Initialize SSL random generator. Must be called before chroot for
 	 * access to /dev/urandom, and before ha_random_boot() which may use
 	 * RAND_bytes().
@@ -2533,7 +2541,8 @@ static void init(int argc, char **argv)
 
 	if (!init_pollers()) {
 		ha_alert("No polling mechanism available.\n"
-			 "  It is likely that haproxy was built with TARGET=generic and that FD_SETSIZE\n"
+			 "  This may happen when using thread-groups with old pollers (poll/select), or\n"
+			 "  it is possible that haproxy was built with TARGET=generic and that FD_SETSIZE\n"
 			 "  is too low on this platform to support maxconn and the number of listeners\n"
 			 "  and servers. You should rebuild haproxy specifying your system using TARGET=\n"
 			 "  in order to support other polling systems (poll, epoll, kqueue) or reduce the\n"
@@ -2993,7 +3002,6 @@ static void *run_thread_poll_loop(void *data)
 		_HA_ATOMIC_AND(&all_tgroups_mask, ~tg->tgid_bit);
 	if (!_HA_ATOMIC_AND_FETCH(&tg_ctx->stopping_threads, ~ti->ltid_bit))
 		_HA_ATOMIC_AND(&stopping_tgroup_mask, ~tg->tgid_bit);
-	_HA_ATOMIC_AND(&all_threads_mask, ~tid_bit);
 	if (tid > 0)
 		pthread_exit(NULL);
 #endif
@@ -3029,34 +3037,49 @@ int main(int argc, char **argv)
 	int pidfd = -1;
 	int intovf = (unsigned char)argc + 1; /* let the compiler know it's strictly positive */
 
-	/* Catch forced CFLAGS that miss 2-complement integer overflow */
-	if (intovf + 0x7FFFFFFF >= intovf) {
+	/* Catch broken toolchains */
+	if (sizeof(long) != sizeof(void *) || (intovf + 0x7FFFFFFF >= intovf)) {
+		const char *msg;
+
+		if (sizeof(long) != sizeof(void *))
+			/* Apparently MingW64 was not made for us and can also break openssl */
+			msg = "The compiler this program was built with uses unsupported integral type sizes.\n"
+			      "Most likely it follows the unsupported LLP64 model. Never try to link HAProxy\n"
+			      "against libraries built with that compiler either! Please only use a compiler\n"
+			      "producing ILP32 or LP64 programs for both programs and libraries.\n";
+		else if (intovf + 0x7FFFFFFF >= intovf)
+			/* Catch forced CFLAGS that miss 2-complement integer overflow */
+			msg = "The source code was miscompiled by the compiler, which usually indicates that\n"
+			      "some of the CFLAGS needed to work around overzealous compiler optimizations\n"
+			      "were overwritten at build time. Please do not force CFLAGS, and read Makefile\n"
+			      "and INSTALL files to decide on the best way to pass your local build options.\n";
+		else
+			msg = "Bug in the compiler bug detection code, please report it to developers!\n";
+
 		fprintf(stderr,
 		        "FATAL ERROR: invalid code detected -- cannot go further, please recompile!\n"
-			"The source code was miscompiled by the compiler, which usually indicates that\n"
-			"some of the CFLAGS needed to work around overzealous compiler optimizations\n"
-			"were overwritten at build time. Please do not force CFLAGS, and read Makefile\n"
-			"and INSTALL files to decide on the best way to pass your local build options.\n"
-		        "\nBuild options :"
+		        "%s"
+			"\nBuild options :"
 #ifdef BUILD_TARGET
-		       "\n  TARGET  = " BUILD_TARGET
+		        "\n  TARGET  = " BUILD_TARGET
 #endif
 #ifdef BUILD_CPU
-		       "\n  CPU     = " BUILD_CPU
+		        "\n  CPU     = " BUILD_CPU
 #endif
 #ifdef BUILD_CC
-		       "\n  CC      = " BUILD_CC
+		        "\n  CC      = " BUILD_CC
 #endif
 #ifdef BUILD_CFLAGS
-		       "\n  CFLAGS  = " BUILD_CFLAGS
+		        "\n  CFLAGS  = " BUILD_CFLAGS
 #endif
 #ifdef BUILD_OPTIONS
-		       "\n  OPTIONS = " BUILD_OPTIONS
+		        "\n  OPTIONS = " BUILD_OPTIONS
 #endif
 #ifdef BUILD_DEBUG
-		       "\n  DEBUG   = " BUILD_DEBUG
+		        "\n  DEBUG   = " BUILD_DEBUG
 #endif
-		       "\n\n");
+		        "\n\n", msg);
+
 		return 1;
 	}
 
@@ -3388,7 +3411,9 @@ int main(int argc, char **argv)
 					ha_notice("New worker (%d) forked\n", ret);
 					/* find the right mworker_proc */
 					list_for_each_entry(child, &proc_list, list) {
-						if (child->reloads == 0 && child->options & PROC_O_TYPE_WORKER) {
+						if (child->reloads == 0 &&
+						    child->options & PROC_O_TYPE_WORKER &&
+						    child->pid == -1) {
 							child->timestamp = now.tv_sec;
 							child->pid = ret;
 							child->version = strdup(haproxy_version);
@@ -3404,13 +3429,13 @@ int main(int argc, char **argv)
 		}
 
 #ifdef USE_CPU_AFFINITY
-		if (!in_parent && ha_cpuset_count(&cpu_map.proc)) {   /* only do this if the process has a CPU map */
+		if (!in_parent && ha_cpuset_count(&cpu_map[0].proc)) {   /* only do this if the process has a CPU map */
 
 #if defined(CPUSET_USE_CPUSET) || defined(__DragonFly__)
-			struct hap_cpuset *set = &cpu_map.proc;
+			struct hap_cpuset *set = &cpu_map[0].proc;
 			sched_setaffinity(0, sizeof(set->cpuset), &set->cpuset);
 #elif defined(__FreeBSD__)
-			struct hap_cpuset *set = &cpu_map.proc;
+			struct hap_cpuset *set = &cpu_map[0].proc;
 			ret = cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_PID, -1, sizeof(set->cpuset), &set->cpuset);
 #endif
 		}
@@ -3482,7 +3507,8 @@ int main(int argc, char **argv)
 					child->ipc_fd[0] = -1;
 				}
 				if (child->options & PROC_O_TYPE_WORKER &&
-				    child->reloads == 0) {
+				    child->reloads == 0 &&
+				    child->pid == -1) {
 					/* keep this struct if this is our pid */
 					proc_self = child;
 					continue;

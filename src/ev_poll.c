@@ -47,15 +47,18 @@ static void __fd_clo(int fd)
 static void _update_fd(int fd, int *max_add_fd)
 {
 	int en;
+	ulong pr, ps;
 
 	en = fdtab[fd].state;
+	pr = _HA_ATOMIC_LOAD(&polled_mask[fd].poll_recv);
+	ps = _HA_ATOMIC_LOAD(&polled_mask[fd].poll_send);
 
 	/* we have a single state for all threads, which is why we
 	 * don't check the tid_bit. First thread to see the update
 	 * takes it for every other one.
 	 */
 	if (!(en & FD_EV_ACTIVE_RW)) {
-		if (!(polled_mask[fd].poll_recv | polled_mask[fd].poll_send)) {
+		if (!(pr | ps)) {
 			/* fd was not watched, it's still not */
 			return;
 		}
@@ -69,22 +72,22 @@ static void _update_fd(int fd, int *max_add_fd)
 		/* OK fd has to be monitored, it was either added or changed */
 		if (!(en & FD_EV_ACTIVE_R)) {
 			hap_fd_clr(fd, fd_evts[DIR_RD]);
-			if (polled_mask[fd].poll_recv & tid_bit)
-				_HA_ATOMIC_AND(&polled_mask[fd].poll_recv, ~tid_bit);
+			if (pr & ti->ltid_bit)
+				_HA_ATOMIC_AND(&polled_mask[fd].poll_recv, ~ti->ltid_bit);
 		} else {
 			hap_fd_set(fd, fd_evts[DIR_RD]);
-			if (!(polled_mask[fd].poll_recv & tid_bit))
-				_HA_ATOMIC_OR(&polled_mask[fd].poll_recv, tid_bit);
+			if (!(pr & ti->ltid_bit))
+				_HA_ATOMIC_OR(&polled_mask[fd].poll_recv, ti->ltid_bit);
 		}
 
 		if (!(en & FD_EV_ACTIVE_W)) {
 			hap_fd_clr(fd, fd_evts[DIR_WR]);
-			if (polled_mask[fd].poll_send & tid_bit)
-				_HA_ATOMIC_AND(&polled_mask[fd].poll_send, ~tid_bit);
-		}else {
+			if (ps & ti->ltid_bit)
+				_HA_ATOMIC_AND(&polled_mask[fd].poll_send, ~ti->ltid_bit);
+		} else {
 			hap_fd_set(fd, fd_evts[DIR_WR]);
-			if (!(polled_mask[fd].poll_send & tid_bit))
-				_HA_ATOMIC_OR(&polled_mask[fd].poll_send, tid_bit);
+			if (!(ps & ti->ltid_bit))
+				_HA_ATOMIC_OR(&polled_mask[fd].poll_send, ti->ltid_bit);
 		}
 
 		if (fd > *max_add_fd)
@@ -113,7 +116,7 @@ static void _do_poll(struct poller *p, int exp, int wake)
 	for (updt_idx = 0; updt_idx < fd_nbupdt; updt_idx++) {
 		fd = fd_updt[updt_idx];
 
-		_HA_ATOMIC_AND(&fdtab[fd].update_mask, ~tid_bit);
+		_HA_ATOMIC_AND(&fdtab[fd].update_mask, ~ti->ltid_bit);
 		if (!fdtab[fd].owner) {
 			activity[tid].poll_drop_fd++;
 			continue;
@@ -122,7 +125,7 @@ static void _do_poll(struct poller *p, int exp, int wake)
 	}
 
 	/* Now scan the global update list */
-	for (old_fd = fd = update_list.first; fd != -1; fd = fdtab[fd].update.next) {
+	for (old_fd = fd = update_list[tgid - 1].first; fd != -1; fd = fdtab[fd].update.next) {
 		if (fd == -2) {
 			fd = old_fd;
 			continue;
@@ -131,12 +134,12 @@ static void _do_poll(struct poller *p, int exp, int wake)
 			fd = -fd -4;
 		if (fd == -1)
 			break;
-		if (fdtab[fd].update_mask & tid_bit) {
+		if (fdtab[fd].update_mask & ti->ltid_bit) {
 			/* Cheat a bit, as the state is global to all pollers
 			 * we don't need every thread to take care of the
 			 * update.
 			 */
-			_HA_ATOMIC_AND(&fdtab[fd].update_mask, ~all_threads_mask);
+			_HA_ATOMIC_AND(&fdtab[fd].update_mask, ~tg->threads_enabled);
 			done_update_polling(fd);
 		} else
 			continue;
@@ -189,7 +192,7 @@ static void _do_poll(struct poller *p, int exp, int wake)
 					continue;
 				}
 
-				if (!(fdtab[fd].thread_mask & tid_bit)) {
+				if (!(fdtab[fd].thread_mask & ti->ltid_bit)) {
 					continue;
 				}
 
@@ -213,8 +216,8 @@ static void _do_poll(struct poller *p, int exp, int wake)
 
 	for (count = 0; status > 0 && count < nbfd; count++) {
 		unsigned int n;
-		int ret;
 		int e = poll_events[count].revents;
+
 		fd = poll_events[count].fd;
 
 		if ((e & POLLRDHUP) && !(cur_poller.flags & HAP_POLL_F_RDHUP))
@@ -235,13 +238,7 @@ static void _do_poll(struct poller *p, int exp, int wake)
 		    ((e & POLLHUP)   ? FD_EV_SHUT_RW : 0) |
 		    ((e & POLLERR)   ? FD_EV_ERR_RW  : 0);
 
-		ret = fd_update_events(fd, n);
-
-		if (ret == FD_UPDT_MIGRATED) {
-			/* FD was migrated, let's stop polling it */
-			if (!HA_ATOMIC_BTS(&fdtab[fd].update_mask, tid))
-				fd_updt[fd_nbupdt++] = fd;
-		}
+		fd_update_events(fd, n);
 	}
 }
 
@@ -270,6 +267,13 @@ static int _do_init(struct poller *p)
 	int fd_evts_bytes;
 
 	p->private = NULL;
+
+	/* this old poller uses a process-wide FD list that cannot work with
+	 * groups.
+	 */
+	if (global.nbtgroups > 1)
+		goto fail_srevt;
+
 	fd_evts_bytes = (global.maxsock + sizeof(**fd_evts) * 8 - 1) / (sizeof(**fd_evts) * 8) * sizeof(**fd_evts);
 
 	if ((fd_evts[DIR_RD] = calloc(1, fd_evts_bytes)) == NULL)

@@ -75,6 +75,30 @@ struct ring *ring_new(size_t size)
 	return NULL;
 }
 
+/* Creates a unified ring + storage area at address <area> for <size> bytes.
+ * If <area> is null, then it's allocated of the requested size. The ring
+ * struct is part of the area so the usable area is slightly reduced. However
+ * the ring storage is immediately adjacent to the struct. ring_free() will
+ * ignore such rings, so the caller is responsible for releasing them.
+ */
+struct ring *ring_make_from_area(void *area, size_t size)
+{
+	struct ring *ring = NULL;
+
+	if (size < sizeof(ring))
+		return NULL;
+
+	if (!area)
+		area = malloc(size);
+	if (!area)
+		return NULL;
+
+	ring = area;
+	area += sizeof(*ring);
+	ring_init(ring, area, size - sizeof(*ring));
+	return ring;
+}
+
 /* Resizes existing ring <ring> to <size> which must be larger, without losing
  * its contents. The new size must be at least as large as the previous one or
  * no change will be performed. The pointer to the ring is returned on success,
@@ -113,6 +137,11 @@ void ring_free(struct ring *ring)
 {
 	if (!ring)
 		return;
+
+	/* make sure it was not allocated by ring_make_from_area */
+	if (ring->buf.area == (void *)ring + sizeof(*ring))
+		return;
+
 	free(ring->buf.area);
 	free(ring);
 }
@@ -294,6 +323,7 @@ int cli_io_handler_show_ring(struct appctx *appctx)
 	struct ring *ring = ctx->ring;
 	struct buffer *buf = &ring->buf;
 	size_t ofs = ctx->ofs;
+	size_t last_ofs;
 	uint64_t msg_len;
 	size_t len, cnt;
 	int ret;
@@ -366,6 +396,7 @@ int cli_io_handler_show_ring(struct appctx *appctx)
 
 	HA_ATOMIC_INC(b_peek(buf, ofs));
 	ofs += ring->ofs;
+	last_ofs = ring->ofs;
 	ctx->ofs = ofs;
 	HA_RWLOCK_RDUNLOCK(LOGSRV_LOCK, &ring->lock);
 
@@ -377,8 +408,16 @@ int cli_io_handler_show_ring(struct appctx *appctx)
 			/* let's be woken up once new data arrive */
 			HA_RWLOCK_WRLOCK(LOGSRV_LOCK, &ring->lock);
 			LIST_APPEND(&ring->waiters, &appctx->wait_entry);
+			ofs = ring->ofs;
 			HA_RWLOCK_WRUNLOCK(LOGSRV_LOCK, &ring->lock);
-			applet_have_no_more_data(appctx);
+			if (ofs != last_ofs) {
+				/* more data was added into the ring between the
+				 * unlock and the lock, and the writer might not
+				 * have seen us. We need to reschedule a read.
+				 */
+				applet_have_more_data(appctx);
+			} else
+				applet_have_no_more_data(appctx);
 			ret = 0;
 		}
 		/* always drain all the request */

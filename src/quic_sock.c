@@ -251,11 +251,13 @@ static int quic_lstnr_dgram_dispatch(unsigned char *buf, size_t len, void *owner
 	LIST_APPEND(dgrams, &dgram->list);
 	MT_LIST_APPEND(&quic_dghdlrs[cid_tid].dgrams, &dgram->mt_list);
 
+	/* typically quic_lstnr_dghdlr() */
 	tasklet_wakeup(quic_dghdlrs[cid_tid].task);
 
 	return 1;
 
  err:
+	pool_free(pool_head_quic_dgram, new_dgram);
 	return 0;
 }
 
@@ -294,7 +296,7 @@ void quic_sock_fd_iocb(int fd)
 
 	max_dgrams = global.tune.maxpollevents;
  start:
-	/* Try to reuse an existing dgram. Note that there is alway at
+	/* Try to reuse an existing dgram. Note that there is always at
 	 * least one datagram to pick, except the first time we enter
 	 * this function for this <rxbuf> buffer.
 	 */
@@ -316,7 +318,7 @@ void quic_sock_fd_iocb(int fd)
 		struct quic_dgram *dgram;
 
 		/* Do no mark <buf> as full, and do not try to consume it
-		 * if the contiguous remmaining space is not at the end
+		 * if the contiguous remaining space is not at the end
 		 */
 		if (b_tail(buf) + cspace < b_wrap(buf))
 			goto out;
@@ -324,11 +326,16 @@ void quic_sock_fd_iocb(int fd)
 		/* Allocate a fake datagram, without data to locate
 		 * the end of the RX buffer (required during purging).
 		 */
-		dgram = pool_zalloc(pool_head_quic_dgram);
+		dgram = pool_alloc(pool_head_quic_dgram);
 		if (!dgram)
 			goto out;
 
+		/* Initialize only the useful members of this fake datagram. */
+		dgram->buf = NULL;
 		dgram->len = cspace;
+		/* Append this datagram only to the RX buffer list. It will
+		 * not be treated by any datagram handler.
+		 */
 		LIST_APPEND(&rxbuf->dgrams, &dgram->list);
 
 		/* Consume the remaining space */
@@ -362,64 +369,55 @@ void quic_sock_fd_iocb(int fd)
 	MT_LIST_APPEND(&l->rx.rxbuf_list, &rxbuf->mt_list);
 }
 
-/* TODO standardize this function for a generic UDP sendto wrapper. This can be
+/* Send a datagram stored into <buf> buffer with <sz> as size.
+ * The caller must ensure there is at least <sz> bytes in this buffer.
+ *
+ * Returns 0 on success else non-zero.
+ *
+ * TODO standardize this function for a generic UDP sendto wrapper. This can be
  * done by removing the <qc> arg and replace it with address/port.
  */
-size_t qc_snd_buf(struct quic_conn *qc, const struct buffer *buf, size_t count,
-                  int flags)
+int qc_snd_buf(struct quic_conn *qc, const struct buffer *buf, size_t sz,
+               int flags)
 {
 	ssize_t ret;
-	size_t try, done;
-	int send_flag;
 
-	done = 0;
-	/* send the largest possible block. For this we perform only one call
-	 * to send() unless the buffer wraps and we exactly fill the first hunk,
-	 * in which case we accept to do it once again.
-	 */
-	while (count) {
-		try = b_contig_data(buf, done);
-		if (try > count)
-			try = count;
-
-		send_flag = MSG_DONTWAIT | MSG_NOSIGNAL;
-		if (try < count || flags & CO_SFL_MSG_MORE)
-			send_flag |= MSG_MORE;
-
-		ret = sendto(qc->li->rx.fd, b_peek(buf, done), try, send_flag,
+	do {
+		ret = sendto(qc->li->rx.fd, b_peek(buf, b_head_ofs(buf)), sz,
+		             MSG_DONTWAIT | MSG_NOSIGNAL,
 		             (struct sockaddr *)&qc->peer_addr, get_addr_len(&qc->peer_addr));
-		if (ret > 0) {
-			/* TODO remove partial sending support for UDP */
-			count -= ret;
-			done += ret;
+	} while (ret < 0 && errno == EINTR);
 
-			if (ret < try)
-				break;
-		}
-		else if (errno == EINTR) {
-			/* try again */
-			continue;
-		}
-		else if (ret == 0 || errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOTCONN || errno == EINPROGRESS || errno == EBADF) {
-			/* TODO must be handle properly. It is justified for UDP ? */
-			qc->sendto_err++;
-			break;
+	if (ret < 0 || ret != sz) {
+		/* TODO adjust errno for UDP context. */
+		if (errno == EAGAIN || errno == EWOULDBLOCK ||
+		    errno == ENOTCONN || errno == EINPROGRESS || errno == EBADF) {
+			struct proxy *prx = qc->li->bind_conf->frontend;
+			struct quic_counters *prx_counters =
+			  EXTRA_COUNTERS_GET(prx->extra_counters_fe,
+			                     &quic_stats_module);
+
+			if (errno == EAGAIN || errno == EWOULDBLOCK)
+				HA_ATOMIC_INC(&prx_counters->socket_full);
+			else
+				HA_ATOMIC_INC(&prx_counters->sendto_err);
 		}
 		else if (errno) {
-			/* TODO unlisted errno : handle it explicitely. */
+			/* TODO unlisted errno : handle it explicitly. */
 			ABORT_NOW();
 		}
+
+		return 1;
 	}
 
-	if (done > 0) {
-		/* we count the total bytes sent, and the send rate for 32-byte
-		 * blocks. The reason for the latter is that freq_ctr are
-		 * limited to 4GB and that it's not enough per second.
-		 */
-		_HA_ATOMIC_ADD(&global.out_bytes, done);
-		update_freq_ctr(&global.out_32bps, (done + 16) / 32);
-	}
-	return done;
+	/* we count the total bytes sent, and the send rate for 32-byte blocks.
+	 * The reason for the latter is that freq_ctr are limited to 4GB and
+	 * that it's not enough per second.
+	 */
+	_HA_ATOMIC_ADD(&global.out_bytes, ret);
+	update_freq_ctr(&global.out_32bps, (ret + 16) / 32);
+
+	return 0;
 }
 
 

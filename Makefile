@@ -56,6 +56,7 @@
 #   USE_OT               : enable the OpenTracing filter
 #   USE_MEMORY_PROFILING : enable the memory profiler. Linux-glibc only.
 #   USE_LIBATOMIC        : force to link with/without libatomic. Automatic.
+#   USE_PTHREAD_EMULATION: replace pthread's rwlocks with ours
 #
 # Options can be forced by specifying "USE_xxx=1" or can be disabled by using
 # "USE_xxx=" (empty string). The list of enabled and disabled options for a
@@ -81,6 +82,9 @@
 #   DESTDIR is not set by default and is used for installation only.
 #           It might be useful to set DESTDIR if you want to install haproxy
 #           in a sandbox.
+#   INSTALL is set to "install" by default and is used to provide the name of
+#           the install binary used by the install targets and any additional
+#           flags.
 #   PREFIX  is set to "/usr/local" by default and is used for installation only.
 #   SBINDIR is set to "$(PREFIX)/sbin" by default and is used for installation
 #           only.
@@ -170,6 +174,7 @@ cc-nowarn = $(if $(cc-anywno),-Wno-$(1),$(shell set -e; if $(CC) -Werror -W$(1) 
 
 #### Installation options.
 DESTDIR =
+INSTALL = install
 PREFIX = /usr/local
 SBINDIR = $(PREFIX)/sbin
 MANDIR = $(PREFIX)/share/man
@@ -333,7 +338,7 @@ LDFLAGS = $(ARCH_FLAGS) -g
 # the reported build options.
 use_opts = USE_EPOLL USE_KQUEUE USE_NETFILTER                                 \
            USE_PCRE USE_PCRE_JIT USE_PCRE2 USE_PCRE2_JIT USE_POLL             \
-           USE_THREAD USE_BACKTRACE                                           \
+           USE_THREAD USE_PTHREAD_EMULATION USE_BACKTRACE                     \
            USE_STATIC_PCRE USE_STATIC_PCRE2 USE_TPROXY USE_LINUX_TPROXY       \
            USE_LINUX_SPLICE USE_LIBCRYPT USE_CRYPT_H USE_ENGINE               \
            USE_GETADDRINFO USE_OPENSSL USE_LUA USE_ACCEPT4                    \
@@ -378,6 +383,7 @@ ifeq ($(TARGET),linux-glibc)
     USE_CPU_AFFINITY USE_THREAD USE_EPOLL USE_LINUX_TPROXY                    \
     USE_ACCEPT4 USE_LINUX_SPLICE USE_PRCTL USE_THREAD_DUMP USE_NS USE_TFO     \
     USE_GETADDRINFO USE_BACKTRACE)
+  INSTALL = install -v
 endif
 
 # For linux >= 2.6.28, glibc without new features
@@ -386,6 +392,7 @@ ifeq ($(TARGET),linux-glibc-legacy)
     USE_POLL USE_TPROXY USE_LIBCRYPT USE_DL USE_RT USE_CRYPT_H USE_NETFILTER  \
     USE_CPU_AFFINITY USE_THREAD USE_EPOLL USE_LINUX_TPROXY                    \
     USE_ACCEPT4 USE_LINUX_SPLICE USE_PRCTL USE_THREAD_DUMP USE_GETADDRINFO)
+  INSTALL = install -v
 endif
 
 # For linux >= 2.6.28 and musl
@@ -395,6 +402,7 @@ ifeq ($(TARGET),linux-musl)
     USE_CPU_AFFINITY USE_THREAD USE_EPOLL USE_LINUX_TPROXY                    \
     USE_ACCEPT4 USE_LINUX_SPLICE USE_PRCTL USE_THREAD_DUMP USE_NS USE_TFO     \
     USE_GETADDRINFO)
+  INSTALL = install -v
 endif
 
 # Solaris 10 and above
@@ -637,7 +645,8 @@ OPTIONS_OBJS += src/quic_sock.o src/proto_quic.o src/xprt_quic.o src/quic_tls.o 
                 src/quic_frame.o src/quic_cc.o src/quic_cc_newreno.o src/mux_quic.o \
                 src/cbuf.o src/qpack-dec.o src/qpack-tbl.o src/h3.o src/qpack-enc.o \
                 src/hq_interop.o src/cfgparse-quic.o src/quic_loss.o \
-                src/quic_tp.o src/quic_stream.o src/quic_stats.o src/h3_stats.o
+                src/quic_tp.o src/quic_stream.o src/quic_stats.o src/h3_stats.o \
+                src/quic_cc_cubic.o
 endif
 
 ifneq ($(USE_LUA),)
@@ -1012,6 +1021,9 @@ admin/dyncookie/dyncookie: admin/dyncookie/dyncookie.o
 dev/flags/flags: dev/flags/flags.o
 	$(cmd_LD) $(LDFLAGS) -o $@ $^ $(LDOPTS)
 
+dev/haring/haring: dev/haring/haring.o
+	$(cmd_LD) $(LDFLAGS) -o $@ $^ $(LDOPTS)
+
 dev/hpack/%: dev/hpack/%.o
 	$(cmd_LD) $(LDFLAGS) -o $@ $^ $(LDOPTS)
 
@@ -1043,16 +1055,16 @@ src/haproxy.o:	src/haproxy.c $(DEP)
 	       -c -o $@ $<
 
 install-man:
-	$(Q)install -v -d "$(DESTDIR)$(MANDIR)"/man1
-	$(Q)install -v -m 644 doc/haproxy.1 "$(DESTDIR)$(MANDIR)"/man1
+	$(Q)$(INSTALL) -d "$(DESTDIR)$(MANDIR)"/man1
+	$(Q)$(INSTALL) -m 644 doc/haproxy.1 "$(DESTDIR)$(MANDIR)"/man1
 
 EXCLUDE_DOCUMENTATION = lgpl gpl coding-style
 DOCUMENTATION = $(filter-out $(EXCLUDE_DOCUMENTATION),$(patsubst doc/%.txt,%,$(wildcard doc/*.txt)))
 
 install-doc:
-	$(Q)install -v -d "$(DESTDIR)$(DOCDIR)"
+	$(Q)$(INSTALL) -d "$(DESTDIR)$(DOCDIR)"
 	$(Q)for x in $(DOCUMENTATION); do \
-		install -v -m 644 doc/$$x.txt "$(DESTDIR)$(DOCDIR)" ; \
+		$(INSTALL) -m 644 doc/$$x.txt "$(DESTDIR)$(DOCDIR)" ; \
 	done
 
 install-bin:
@@ -1062,8 +1074,8 @@ install-bin:
 			exit 1; \
 		fi; \
 	done
-	$(Q)install -v -d "$(DESTDIR)$(SBINDIR)"
-	$(Q)install -v haproxy $(EXTRA) "$(DESTDIR)$(SBINDIR)"
+	$(Q)$(INSTALL) -d "$(DESTDIR)$(SBINDIR)"
+	$(Q)$(INSTALL) haproxy $(EXTRA) "$(DESTDIR)$(SBINDIR)"
 
 install: install-bin install-man install-doc
 
@@ -1089,7 +1101,7 @@ clean:
 	$(Q)rm -f admin/iprange/iprange admin/iprange/ip6range admin/halog/halog
 	$(Q)rm -f admin/dyncookie/dyncookie
 	$(Q)rm -f dev/*/*.[oas]
-	$(Q)rm -f dev/flags/flags dev/poll/poll dev/tcploop/tcploop
+	$(Q)rm -f dev/flags/flags dev/haring/haring dev/poll/poll dev/tcploop/tcploop
 	$(Q)rm -f dev/hpack/decode dev/hpack/gen-enc dev/hpack/gen-rht
 	$(Q)rm -f dev/qpack/decode
 

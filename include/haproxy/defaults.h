@@ -34,17 +34,27 @@
 #define MAX_THREADS_PER_GROUP 1
 
 #else
-/* threads enabled, max_threads defaults to long bits */
-#ifndef MAX_THREADS
-#define MAX_THREADS LONGBITS
+
+/* theoretical limit is 64, though we'd rather not push it too far for now
+ * as some structures might be enlarged to be indexed per group. Let's start
+ * with 16 groups max, allowing to experiment with dual-socket machines
+ * suffering from up to 8 loosely coupled L3 caches. It's a good start and
+ * doesn't engage us too far.
+ */
+#ifndef MAX_TGROUPS
+#define MAX_TGROUPS 16
 #endif
 
-/* still limited to 1 group for now by default (note: group ids start at 1) */
-#ifndef MAX_TGROUPS
-#define MAX_TGROUPS 1
-#endif
 #define MAX_THREADS_PER_GROUP LONGBITS
+
+/* threads enabled, max_threads defaults to long bits for 1 tgroup or 4 times
+ * long bits if more tgroups are enabled.
+ */
+#ifndef MAX_THREADS
+#define MAX_THREADS ((((MAX_TGROUPS) > 1) ? 4 : 1) * (MAX_THREADS_PER_GROUP))
 #endif
+
+#endif // USE_THREAD
 
 /*
  * BUFSIZE defines the size of a read and write buffer. It is the maximum

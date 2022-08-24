@@ -142,6 +142,15 @@ void *applet_reserve_svcctx(struct appctx *appctx, size_t size)
 	return appctx->svcctx;
 }
 
+/* This is used to reset an svcctx and the svc.storage without releasing the
+ * appctx. In fact this is only used by the CLI applet between commands.
+ */
+void applet_reset_svcctx(struct appctx *appctx)
+{
+	memset(&appctx->svc.storage, 0, APPLET_MAX_SVCCTX);
+	appctx->svcctx = NULL;
+}
+
 /* call the applet's release() function if any, and marks the sedesc as shut.
  * Needs to be called upon close().
  */
@@ -244,14 +253,14 @@ struct task *task_run_applet(struct task *t, void *context, unsigned int state)
 	}
 
 	/* measure the call rate and check for anomalies when too high */
-	rate = update_freq_ctr(&app->call_rate, 1);
-	if (rate >= 100000 && app->call_rate.prev_ctr && // looped more than 100k times over last second
-	    ((b_size(sc_ib(sc)) && sc->flags & SC_FL_NEED_ROOM) || // asks for a buffer which is present
+	if (((b_size(sc_ib(sc)) && sc->flags & SC_FL_NEED_BUFF) || // asks for a buffer which is present
 	     (b_size(sc_ib(sc)) && !b_data(sc_ib(sc)) && sc->flags & SC_FL_NEED_ROOM) || // asks for room in an empty buffer
 	     (b_data(sc_ob(sc)) && sc_is_send_allowed(sc)) || // asks for data already present
 	     (!b_data(sc_ib(sc)) && b_data(sc_ob(sc)) && // didn't return anything ...
 	      (sc_oc(sc)->flags & (CF_WRITE_PARTIAL|CF_SHUTW_NOW)) == CF_SHUTW_NOW))) { // ... and left data pending after a shut
-		stream_dump_and_crash(&app->obj_type, read_freq_ctr(&app->call_rate));
+		rate = update_freq_ctr(&app->call_rate, 1);
+		if (rate >= 100000 && app->call_rate.prev_ctr) // looped like this more than 100k times over last second
+			stream_dump_and_crash(&app->obj_type, read_freq_ctr(&app->call_rate));
 	}
 
 	sc->app_ops->wake(sc);

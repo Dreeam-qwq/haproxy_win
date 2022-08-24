@@ -25,6 +25,7 @@
 
 #include <haproxy/api.h>
 #include <haproxy/applet.h>
+#include <haproxy/cfgparse.h>
 #include <haproxy/channel.h>
 #include <haproxy/cli.h>
 #include <haproxy/dict.h>
@@ -102,7 +103,11 @@
 
 #define PEER_RESYNC_TIMEOUT         5000 /* 5 seconds */
 #define PEER_RECONNECT_TIMEOUT      5000 /* 5 seconds */
+#define PEER_LOCAL_RECONNECT_TIMEOUT 500 /* 500ms */
 #define PEER_HEARTBEAT_TIMEOUT      3000 /* 3 seconds */
+
+/* default maximum of updates sent at once */
+#define PEER_DEF_MAX_UPDATES_AT_ONCE      200
 
 /* flags for "show peers" */
 #define PEERS_SHOW_F_DICT           0x00000001 /* also show the contents of the dictionary */
@@ -301,6 +306,7 @@ enum {
 
 static size_t proto_len = sizeof(PEER_SESSION_PROTO_NAME) - 1;
 struct peers *cfg_peers = NULL;
+static int peers_max_updates_at_once = PEER_DEF_MAX_UPDATES_AT_ONCE;
 static void peer_session_forceshutdown(struct peer *peer);
 
 static struct ebpt_node *dcache_tx_insert(struct dcache *dc,
@@ -1558,6 +1564,7 @@ static inline int peer_send_teachmsgs(struct appctx *appctx, struct peer *p,
                                       struct shared_table *st, int locked)
 {
 	int ret, new_pushed, use_timed;
+	int updates_sent = 0;
 
 	ret = 1;
 	use_timed = 0;
@@ -1584,8 +1591,10 @@ static inline int peer_send_teachmsgs(struct appctx *appctx, struct peer *p,
 
 		/* push local updates */
 		ts = peer_stksess_lookup(st);
-		if (!ts)
+		if (!ts) {
+			ret = 1; // done
 			break;
+		}
 
 		updateid = ts->upd.key;
 		ts->ref_cnt++;
@@ -1595,9 +1604,7 @@ static inline int peer_send_teachmsgs(struct appctx *appctx, struct peer *p,
 		if (ret <= 0) {
 			HA_SPIN_LOCK(STK_TABLE_LOCK, &st->table->lock);
 			ts->ref_cnt--;
-			if (!locked)
-				HA_SPIN_UNLOCK(STK_TABLE_LOCK, &st->table->lock);
-			return ret;
+			break;
 		}
 
 		HA_SPIN_LOCK(STK_TABLE_LOCK, &st->table->lock);
@@ -1610,12 +1617,22 @@ static inline int peer_send_teachmsgs(struct appctx *appctx, struct peer *p,
 
 		/* identifier may not needed in next update message */
 		new_pushed = 0;
+
+		updates_sent++;
+		if (updates_sent >= peers_max_updates_at_once) {
+			/* pretend we're full so that we get back ASAP */
+			struct stconn *sc = appctx_sc(appctx);
+
+			sc_need_room(sc);
+			ret = -1;
+			break;
+		}
 	}
 
  out:
 	if (!locked)
 		HA_SPIN_UNLOCK(STK_TABLE_LOCK, &st->table->lock);
-	return 1;
+	return ret;
 }
 
 /*
@@ -2547,6 +2564,7 @@ static inline int peer_send_msgs(struct appctx *appctx,
 	if (peer->tables) {
 		struct shared_table *st;
 		struct shared_table *last_local_table;
+		int updates_sent = 0;
 
 		last_local_table = peer->last_local_table;
 		if (!last_local_table)
@@ -2596,6 +2614,15 @@ static inline int peer_send_msgs(struct appctx *appctx,
 			if (st == last_local_table)
 				break;
 			st = st->next;
+
+			updates_sent++;
+			if (updates_sent >= peers_max_updates_at_once) {
+				/* pretend we're full so that we get back ASAP */
+				struct stconn *sc = appctx_sc(appctx);
+
+				sc_need_room(sc);
+				return -1;
+			}
 		}
 	}
 
@@ -2997,7 +3024,7 @@ switchstate:
 					}
 				}
 
-				if (sc_ic(sc)->flags & CF_WRITE_PARTIAL)
+				if (sc_ic(sc)->flags & CF_WROTE_DATA)
 					curpeer->statuscode = PEER_SESS_SC_CONNECTEDCODE;
 
 				reql = peer_getline(appctx);
@@ -3200,7 +3227,7 @@ static struct appctx *peer_session_create(struct peers *peers, struct peer *peer
 	int idx;
 
 	peer->new_conn++;
-	peer->reconnect = tick_add(now_ms, MS_TO_TICKS(PEER_RECONNECT_TIMEOUT));
+	peer->reconnect = tick_add(now_ms, (stopping ? MS_TO_TICKS(PEER_LOCAL_RECONNECT_TIMEOUT) : MS_TO_TICKS(PEER_RECONNECT_TIMEOUT)));
 	peer->heartbeat = TICK_ETERNITY;
 	peer->statuscode = PEER_SESS_SC_CONNECTCODE;
 	peer->last_hdshk = now_ms;
@@ -3420,6 +3447,10 @@ struct task *process_peer_sync(struct task * task, void *context, unsigned int s
 						peer_session_forceshutdown(ps);
 					}
 				}
+
+				/* Set resync timeout for the local peer and request a immediate reconnect */
+				peers->resync_timeout = tick_add(now_ms, MS_TO_TICKS(PEER_RESYNC_TIMEOUT));
+				peers->local->reconnect = now_ms;
 			}
 		}
 
@@ -3435,18 +3466,26 @@ struct task *process_peer_sync(struct task * task, void *context, unsigned int s
 		}
 		else if (!ps->appctx) {
 			/* If there's no active peer connection */
-			if (ps->statuscode == 0 ||
-			    ps->statuscode == PEER_SESS_SC_SUCCESSCODE ||
-			    ps->statuscode == PEER_SESS_SC_CONNECTEDCODE ||
-			    ps->statuscode == PEER_SESS_SC_TRYAGAIN) {
-				/* connection never tried
-				 * or previous peer connection was successfully established
-				 * or previous tcp connect succeeded but init state incomplete
-				 * or during previous connect, peer replies a try again statuscode */
+			if (!tick_is_expired(peers->resync_timeout, now_ms) &&
+			    (ps->statuscode == 0 ||
+			     ps->statuscode == PEER_SESS_SC_SUCCESSCODE ||
+			     ps->statuscode == PEER_SESS_SC_CONNECTEDCODE ||
+			     ps->statuscode == PEER_SESS_SC_TRYAGAIN)) {
+				/* The resync timeout is not expired and
+				 *   connection never tried
+				 *   or previous peer connection was successfully established
+				 *   or previous tcp connect succeeded but init state incomplete
+				 *   or during previous connect, peer replies a try again statuscode */
 
-				/* connect to the local peer if we must push a local sync */
-				if (peers->flags & PEERS_F_DONOTSTOP) {
-					peer_session_create(peers, ps);
+				if (!tick_is_expired(ps->reconnect, now_ms)) {
+					/* reconnection timer is not expired. reschedule task for reconnect */
+					task->expire = tick_first(task->expire, ps->reconnect);
+				}
+				else  {
+					/* connect to the local peer if we must push a local sync */
+					if (peers->flags & PEERS_F_DONOTSTOP) {
+						peer_session_create(peers, ps);
+					}
 				}
 			}
 			else {
@@ -3983,6 +4022,36 @@ static int cli_io_handler_show_peers(struct appctx *appctx)
 	thread_release();
 	return ret;
 }
+
+/* config parser for global "tune.peers.max-updates-at-once" */
+static int cfg_parse_max_updt_at_once(char **args, int section_type, struct proxy *curpx,
+                                      const struct proxy *defpx, const char *file, int line,
+                                      char **err)
+{
+	int arg = -1;
+
+	if (too_many_args(1, args, err, NULL))
+		return -1;
+
+	if (*(args[1]) != 0)
+		arg = atoi(args[1]);
+
+	if (arg < 1) {
+		memprintf(err, "'%s' expects an integer argument greater than 0.", args[0]);
+		return -1;
+	}
+
+	peers_max_updates_at_once = arg;
+	return 0;
+}
+
+/* config keyword parsers */
+static struct cfg_kw_list cfg_kws = {ILH, {
+	{ CFG_GLOBAL, "tune.peers.max-updates-at-once",  cfg_parse_max_updt_at_once },
+	{ 0, NULL, NULL }
+}};
+
+INITCALL1(STG_REGISTER, cfg_register_keywords, &cfg_kws);
 
 /*
  * CLI keywords.

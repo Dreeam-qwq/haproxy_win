@@ -63,6 +63,7 @@ static const struct h2s *h2_idle_stream;
                                             // (SHORT_READ is also excluded)
 
 #define H2_CF_DEM_SHORT_READ    0x00000200  // demux blocked on incomplete frame
+#define H2_CF_DEM_IN_PROGRESS   0x00000400  // demux in progress (dsi,dfl,dft are valid)
 
 /* other flags */
 #define H2_CF_GOAWAY_SENT       0x00001000  // a GOAWAY frame was successfully sent
@@ -207,6 +208,7 @@ enum h2_ss {
 #define H2_SF_EXT_CONNECT_RCVD  0x00080000  // rfc 8441 an Extended CONNECT has been received and parsed
 
 #define H2_SF_TUNNEL_ABRT       0x00100000  // A tunnel attempt was aborted
+#define H2_SF_MORE_HTX_DATA     0x00200000  // more data expected from HTX
 
 /* H2 stream descriptor, describing the stream as it appears in the H2C, and as
  * it is being processed in the internal HTTP representation (HTX).
@@ -646,7 +648,7 @@ static void h2_trace(enum trace_level level, uint64_t mask, const struct trace_s
 		if (h2c->errcode)
 			chunk_appendf(&trace_buf, " err=%s/%02x", h2_err_str(h2c->errcode), h2c->errcode);
 
-		if (h2c->dsi >= 0 &&
+		if (h2c->flags & H2_CF_DEM_IN_PROGRESS && // frame processing has started, type and length are valid
 		    (mask & (H2_EV_RX_FRAME|H2_EV_RX_FHDR)) == (H2_EV_RX_FRAME|H2_EV_RX_FHDR)) {
 			chunk_appendf(&trace_buf, " dft=%s/%02x dfl=%d", h2_ft_str(h2c->dft), h2c->dff, h2c->dfl);
 		}
@@ -3311,8 +3313,8 @@ static void h2_process_demux(struct h2c *h2c)
 			TRACE_PROTO("received preface", H2_EV_RX_PREFACE, h2c->conn);
 
 			h2c->max_id = 0;
-			h2c->st0 = H2_CS_SETTINGS1;
 			TRACE_STATE("switching to SETTINGS1", H2_EV_RX_PREFACE, h2c->conn);
+			h2c->st0 = H2_CS_SETTINGS1;
 		}
 
 		if (h2c->st0 == H2_CS_SETTINGS1) {
@@ -3458,6 +3460,7 @@ static void h2_process_demux(struct h2c *h2c)
 			h2c->dft = hdr.ft;
 			h2c->dff = hdr.ff;
 			h2c->dpl = padlen;
+			h2c->flags |= H2_CF_DEM_IN_PROGRESS;
 			TRACE_STATE("rcvd H2 frame header, switching to FRAME_P state", H2_EV_RX_FRAME|H2_EV_RX_FHDR, h2c->conn);
 			h2c->st0 = H2_CS_FRAME_P;
 
@@ -3640,9 +3643,9 @@ static void h2_process_demux(struct h2c *h2c)
 			b_del(&h2c->dbuf, ret);
 			h2c->dfl -= ret;
 			if (!h2c->dfl) {
+				h2c->flags &= ~H2_CF_DEM_IN_PROGRESS;
 				TRACE_STATE("switching to FRAME_H", H2_EV_RX_FRAME|H2_EV_RX_FHDR, h2c->conn);
 				h2c->st0 = H2_CS_FRAME_H;
-				h2c->dsi = -1;
 			}
 		}
 	}
@@ -4601,9 +4604,11 @@ static void h2_do_shutw(struct h2s *h2s)
 
 	TRACE_ENTER(H2_EV_STRM_SHUT, h2c->conn, h2s);
 
-	if (h2s->st != H2_SS_ERROR && (h2s->flags & H2_SF_HEADERS_SENT)) {
-		/* we can cleanly close using an empty data frame only after headers */
-
+	if (h2s->st != H2_SS_ERROR &&
+	    (h2s->flags & (H2_SF_HEADERS_SENT | H2_SF_MORE_HTX_DATA)) == H2_SF_HEADERS_SENT) {
+		/* we can cleanly close using an empty data frame only after headers
+		 * and if no more data is expected to be sent.
+		 */
 		if (!(h2s->flags & (H2_SF_ES_SENT|H2_SF_RST_SENT)) &&
 		    h2_send_empty_data_es(h2s) <= 0)
 			goto add_to_list;
@@ -4623,6 +4628,13 @@ static void h2_do_shutw(struct h2s *h2s)
 			TRACE_STATE("stream wants to kill the connection", H2_EV_STRM_SHUT, h2c->conn, h2s);
 			h2c_error(h2c, H2_ERR_ENHANCE_YOUR_CALM);
 			h2s_error(h2s, H2_ERR_ENHANCE_YOUR_CALM);
+		}
+		else if (h2s->flags & H2_SF_MORE_HTX_DATA) {
+			/* some unsent data were pending (e.g. abort during an upload),
+			 * let's send a CANCEL.
+			 */
+			TRACE_STATE("shutw before end of data, sending CANCEL", H2_EV_STRM_SHUT, h2c->conn, h2s);
+			h2s_error(h2s, H2_ERR_CANCEL);
 		}
 		else {
 			/* Nothing was never sent for this stream, so reset with
@@ -6587,6 +6599,11 @@ static size_t h2_snd_buf(struct stconn *sc, struct buffer *buf, size_t count, in
 
 	if (!(h2s->flags & H2_SF_OUTGOING_DATA) && count)
 		h2s->flags |= H2_SF_OUTGOING_DATA;
+
+	if (htx->extra)
+		h2s->flags |= H2_SF_MORE_HTX_DATA;
+	else
+		h2s->flags &= ~H2_SF_MORE_HTX_DATA;
 
 	if (h2s->id == 0) {
 		int32_t id = h2c_get_next_sid(h2s->h2c);

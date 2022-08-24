@@ -14,18 +14,20 @@
 #include <haproxy/stream.h>
 #include <haproxy/xprt_quic-t.h>
 
-struct qcs *qcc_open_stream_local(struct qcc *qcc, int bidi);
+struct qcs *qcc_init_stream_local(struct qcc *qcc, int bidi);
 struct buffer *qc_get_buf(struct qcs *qcs, struct buffer *bptr);
 
 int qcs_subscribe(struct qcs *qcs, int event_type, struct wait_event *es);
 void qcs_notify_recv(struct qcs *qcs);
 void qcs_notify_send(struct qcs *qcs);
 
-void qcc_emit_cc_app(struct qcc *qcc, int err);
+void qcc_emit_cc_app(struct qcc *qcc, int err, int immediate);
+void qcc_reset_stream(struct qcs *qcs, int err);
 int qcc_recv(struct qcc *qcc, uint64_t id, uint64_t len, uint64_t offset,
              char fin, char *data);
 int qcc_recv_max_data(struct qcc *qcc, uint64_t max);
 int qcc_recv_max_stream_data(struct qcc *qcc, uint64_t id, uint64_t max);
+int qcc_recv_stop_sending(struct qcc *qcc, uint64_t id, uint64_t err);
 void qcc_streams_sent_done(struct qcs *qcs, uint64_t data, uint64_t offset);
 
 /* Bit shift to get the stream sub ID for internal use which is obtained
@@ -69,21 +71,7 @@ static inline int quic_stream_is_bidi(uint64_t id)
 	return !quic_stream_is_uni(id);
 }
 
-/* Install the <app_ops> applicative layer of a QUIC connection on mux <qcc>.
- * Returns 0 on success else non-zero.
- */
-static inline int qcc_install_app_ops(struct qcc *qcc,
-                                      const struct qcc_app_ops *app_ops)
-{
-	qcc->app_ops = app_ops;
-	if (qcc->app_ops->init && !qcc->app_ops->init(qcc))
-		return 1;
-
-	if (qcc->app_ops->finalize)
-		qcc->app_ops->finalize(qcc->ctx);
-
-	return 0;
-}
+int qcc_install_app_ops(struct qcc *qcc, const struct qcc_app_ops *app_ops);
 
 static inline struct stconn *qc_attach_sc(struct qcs *qcs, struct buffer *buf)
 {
@@ -105,6 +93,7 @@ static inline struct stconn *qc_attach_sc(struct qcs *qcs, struct buffer *buf)
 		return NULL;
 
 	++qcc->nb_sc;
+	++qcc->nb_hreq;
 
 	/* TODO duplicated from mux_h2 */
 	sess->accept_date = date;
@@ -112,7 +101,34 @@ static inline struct stconn *qc_attach_sc(struct qcs *qcs, struct buffer *buf)
 	sess->t_handshake = 0;
 	sess->t_idle = 0;
 
+	/* A stream must have been registered for HTTP wait before attaching
+	 * it to sedesc. See <qcs_wait_http_req> for more info.
+	 */
+	BUG_ON_HOT(!LIST_INLIST(&qcs->el_opening));
+	LIST_DELETE(&qcs->el_opening);
+
 	return qcs->sd->sc;
+}
+
+/* Register <qcs> stream for http-request timeout. If the stream is not yet
+ * attached in the configured delay, qcc timeout task will be triggered. This
+ * means the full header section was not received in time.
+ *
+ * This function should be called by the application protocol layer on request
+ * streams initialization.
+ */
+static inline void qcs_wait_http_req(struct qcs *qcs)
+{
+	struct qcc *qcc = qcs->qcc;
+
+	/* A stream cannot be registered several times. */
+	BUG_ON_HOT(tick_isset(qcs->start));
+	qcs->start = now_ms;
+
+	/* qcc.opening_list size is limited by flow-control so no custom
+	 * restriction is needed here.
+	 */
+	LIST_APPEND(&qcc->opening_list, &qcs->el_opening);
 }
 
 #endif /* USE_QUIC */

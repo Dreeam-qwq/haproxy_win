@@ -33,6 +33,7 @@ enum qcs_type {
 struct qcc {
 	struct connection *conn;
 	uint64_t nb_sc; /* number of attached stream connectors */
+	uint64_t nb_hreq; /* number of in-progress http requests */
 	uint32_t flags; /* QC_CF_* */
 
 	struct {
@@ -51,9 +52,12 @@ struct qcc {
 	/* flow-control fields set by us enforced on our side. */
 	struct {
 		struct list frms; /* prepared frames related to flow-control  */
+
 		uint64_t ms_bidi_init; /* max initial sub-ID of bidi stream allowed for the peer */
 		uint64_t ms_bidi; /* max sub-ID of bidi stream allowed for the peer */
 		uint64_t cl_bidi_r; /* total count of closed remote bidi stream since last MAX_STREAMS emission */
+
+		uint64_t ms_uni; /* max sub-ID of uni stream allowed for the peer */
 
 		uint64_t msd_bidi_l; /* initial max-stream-data on local streams */
 		uint64_t msd_bidi_r; /* initial max-stream-data on remote streams */
@@ -91,9 +95,13 @@ struct qcc {
 	struct wait_event wait_event;  /* To be used if we're waiting for I/Os */
 	struct wait_event *subs;
 
+	struct proxy *proxy;
+
 	/* haproxy timeout management */
 	struct task *task;
+	struct list opening_list; /* list of not already attached streams (http-request timeout) */
 	int timeout;
+	int idle_start; /* base time for http-keep-alive timeout */
 
 	const struct qcc_app_ops *app_ops;
 	void *ctx; /* Application layer context */
@@ -107,14 +115,38 @@ struct qcc {
 #define QC_SF_BLK_SFCTL         0x00000010  /* stream blocked due to stream flow control limit */
 #define QC_SF_DEM_FULL          0x00000020  /* demux blocked on request channel buffer full */
 #define QC_SF_READ_ABORTED      0x00000040  /* stream rejected by app layer */
+#define QC_SF_TO_RESET          0x00000080  /* a RESET_STREAM must be sent */
 
 /* Maximum size of stream Rx buffer. */
 #define QC_S_RX_BUF_SZ   (global.tune.bufsize - NCB_RESERVED_SZ)
+
+/* QUIC stream states
+ *
+ * On initialization a stream is put on idle state. It is opened as soon as
+ * data has been successfully sent or received on it.
+ *
+ * A bidirectional stream has two channels which can be closed separately. The
+ * local channel is closed when the STREAM frame with FIN or a RESET_STREAM has
+ * been emitted. The remote channel is closed as soon as all data from the peer
+ * has been received. The stream goes instantely to the close state once both
+ * channels are closed.
+ *
+ * A unidirectional stream has only one channel of communication. Thus, it does
+ * not use half closed states and transition directly from open to close state.
+ */
+enum qcs_state {
+	QC_SS_IDLE = 0, /* initial state */
+	QC_SS_OPEN,     /* opened */
+	QC_SS_HLOC,     /* half-closed local */
+	QC_SS_HREM,     /* half-closed remote */
+	QC_SS_CLO,      /* closed */
+} __attribute__((packed));
 
 struct qcs {
 	struct qcc *qcc;
 	struct sedesc *sd;
 	uint32_t flags;      /* QC_SF_* */
+	enum qcs_state st;   /* QC_SS_* state */
 	void *ctx;           /* app-ops context */
 
 	struct {
@@ -137,9 +169,14 @@ struct qcs {
 	struct qc_stream_desc *stream;
 
 	struct list el; /* element of qcc.send_retry_list */
+	struct list el_opening; /* element of qcc.opening_list */
 
 	struct wait_event wait_event;
 	struct wait_event *subs;
+
+	uint64_t err; /* error code to transmit via RESET_STREAM */
+
+	int start; /* base timestamp for http-request timeout */
 };
 
 /* QUIC application layer operations */
@@ -150,7 +187,6 @@ struct qcc_app_ops {
 	size_t (*snd_buf)(struct stconn *sc, struct buffer *buf, size_t count, int flags);
 	void (*detach)(struct qcs *qcs);
 	int (*finalize)(void *ctx);
-	int (*is_active)(const struct qcc *qcc, void *ctx);
 	void (*release)(void *ctx);
 	void (*inc_err_cnt)(void *ctx, int err_code);
 };

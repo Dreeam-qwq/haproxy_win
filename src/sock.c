@@ -322,7 +322,7 @@ int sock_get_old_sockets(const char *unixsocket)
 		}
 
 		if (send_fd_uxst(dst_fd, sv[0]) == -1) {
-			ha_alert("socketpair: cannot transfer socket.\n");
+			ha_alert("socketpair: Cannot transfer the fd %d over sockpair@%d. Giving up.\n", sv[0], dst_fd);
 			close(sv[0]);
 			close(sv[1]);
 			goto out;
@@ -703,7 +703,7 @@ void sock_accept_iocb(int fd)
 void sock_conn_ctrl_init(struct connection *conn)
 {
 	BUG_ON(conn->flags & CO_FL_FDLESS);
-	fd_insert(conn->handle.fd, conn, sock_conn_iocb, tid_bit);
+	fd_insert(conn->handle.fd, conn, sock_conn_iocb, tgid, ti->ltid_bit);
 }
 
 /* This completes the release of connection <conn> by removing its FD from the

@@ -244,7 +244,7 @@ static void sc_free_cond(struct stconn **scp)
 
 
 /* Attaches a stconn to a mux endpoint and sets the endpoint ctx. Returns
- * -1 on error and 0 on sucess. SE_FL_DETACHED flag is removed. This function is
+ * -1 on error and 0 on success. SE_FL_DETACHED flag is removed. This function is
  * called from a mux when it is attached to a stream or a health-check.
  */
 int sc_attach_mux(struct stconn *sc, void *sd, void *ctx)
@@ -286,7 +286,7 @@ int sc_attach_mux(struct stconn *sc, void *sd, void *ctx)
 }
 
 /* Attaches a stconn to an applet endpoint and sets the endpoint
- * ctx. Returns -1 on error and 0 on sucess. SE_FL_DETACHED flag is
+ * ctx. Returns -1 on error and 0 on success. SE_FL_DETACHED flag is
  * removed. This function is called by a stream when a backend applet is
  * registered.
  */
@@ -427,7 +427,7 @@ void sc_destroy(struct stconn *sc)
 
 /* Resets the stream connector endpoint. It happens when the app layer want to renew
  * its endpoint. For a connection retry for instance. If a mux or an applet is
- * attached, a new endpoint is created. Returns -1 on error and 0 on sucess.
+ * attached, a new endpoint is created. Returns -1 on error and 0 on success.
  *
  * Only SE_FL_ERROR flag is removed on the endpoint. Orther flags are preserved.
  * It is the caller responsibility to remove other flags if needed.
@@ -459,6 +459,7 @@ int sc_reset_endp(struct stconn *sc)
 
 	/* The app is still attached, the sc will not be released */
 	sc_detach_endp(&sc);
+	BUG_ON(!sc);
 	BUG_ON(sc->sedesc);
 	sc->sedesc = new_sd;
 	sc->sedesc->sc = sc;
@@ -512,7 +513,8 @@ static void sc_app_shutr(struct stconn *sc)
 
 	if (sc_oc(sc)->flags & CF_SHUTW) {
 		sc->state = SC_ST_DIS;
-		__sc_strm(sc)->conn_exp = TICK_ETERNITY;
+		if (sc->flags & SC_FL_ISBACK)
+			__sc_strm(sc)->conn_exp = TICK_ETERNITY;
 	}
 	else if (sc->flags & SC_FL_NOHALF) {
 		/* we want to immediately forward this close to the write side */
@@ -572,7 +574,8 @@ static void sc_app_shutw(struct stconn *sc)
 		sc->flags &= ~SC_FL_NOLINGER;
 		ic->flags |= CF_SHUTR;
 		ic->rex = TICK_ETERNITY;
-		__sc_strm(sc)->conn_exp = TICK_ETERNITY;
+		if (sc->flags & SC_FL_ISBACK)
+			__sc_strm(sc)->conn_exp = TICK_ETERNITY;
 	}
 
 	/* note that if the task exists, it must unregister itself once it runs */
@@ -654,7 +657,8 @@ static void sc_app_shutr_conn(struct stconn *sc)
 	if (sc_oc(sc)->flags & CF_SHUTW) {
 		sc_conn_shut(sc);
 		sc->state = SC_ST_DIS;
-		__sc_strm(sc)->conn_exp = TICK_ETERNITY;
+		if (sc->flags & SC_FL_ISBACK)
+			__sc_strm(sc)->conn_exp = TICK_ETERNITY;
 	}
 	else if (sc->flags & SC_FL_NOHALF) {
 		/* we want to immediately forward this close to the write side */
@@ -738,7 +742,8 @@ static void sc_app_shutw_conn(struct stconn *sc)
 		sc->flags &= ~SC_FL_NOLINGER;
 		ic->flags |= CF_SHUTR;
 		ic->rex = TICK_ETERNITY;
-		__sc_strm(sc)->conn_exp = TICK_ETERNITY;
+		if (sc->flags & SC_FL_ISBACK)
+			__sc_strm(sc)->conn_exp = TICK_ETERNITY;
 	}
 }
 
@@ -880,7 +885,8 @@ static void sc_app_shutr_applet(struct stconn *sc)
 	if (sc_oc(sc)->flags & CF_SHUTW) {
 		appctx_shut(__sc_appctx(sc));
 		sc->state = SC_ST_DIS;
-		__sc_strm(sc)->conn_exp = TICK_ETERNITY;
+		if (sc->flags & SC_FL_ISBACK)
+			__sc_strm(sc)->conn_exp = TICK_ETERNITY;
 	}
 	else if (sc->flags & SC_FL_NOHALF) {
 		/* we want to immediately forward this close to the write side */
@@ -942,7 +948,8 @@ static void sc_app_shutw_applet(struct stconn *sc)
 		sc->flags &= ~SC_FL_NOLINGER;
 		ic->flags |= CF_SHUTR;
 		ic->rex = TICK_ETERNITY;
-		__sc_strm(sc)->conn_exp = TICK_ETERNITY;
+		if (sc->flags & SC_FL_ISBACK)
+			__sc_strm(sc)->conn_exp = TICK_ETERNITY;
 	}
 }
 
@@ -1259,7 +1266,8 @@ static void sc_conn_read0(struct stconn *sc)
 	oc->wex = TICK_ETERNITY;
 
 	sc->state = SC_ST_DIS;
-	__sc_strm(sc)->conn_exp = TICK_ETERNITY;
+	if (sc->flags & SC_FL_ISBACK)
+		__sc_strm(sc)->conn_exp = TICK_ETERNITY;
 	return;
 }
 
@@ -1838,7 +1846,8 @@ static int sc_conn_process(struct stconn *sc)
 
 	if (!sc_state_in(sc->state, SC_SB_EST|SC_SB_DIS|SC_SB_CLO) &&
 	    (conn->flags & CO_FL_WAIT_XPRT) == 0) {
-		__sc_strm(sc)->conn_exp = TICK_ETERNITY;
+		if (sc->flags & SC_FL_ISBACK)
+			__sc_strm(sc)->conn_exp = TICK_ETERNITY;
 		oc->flags |= CF_WRITE_NULL;
 		if (sc->state == SC_ST_CON)
 			sc->state = SC_ST_RDY;
@@ -1952,7 +1961,7 @@ void sc_conn_prepare_endp_upgrade(struct stconn *sc)
 	sc_ep_set(sc, SE_FL_DETACHED);
 }
 
-/* Endpoint upgrade failed. Retore the stconn state. */
+/* Endpoint upgrade failed. Restore the stconn state. */
 void sc_conn_abort_endp_upgrade(struct stconn *sc)
 {
 	sc_ep_set(sc, SE_FL_T_MUX);
@@ -1969,5 +1978,6 @@ void sc_conn_commit_endp_upgrade(struct stconn *sc)
 		return;
 	sc_detach_endp(&sc);
 	/* Because it was already set as detached, the sedesc must be preserved */
+	BUG_ON(!sc);
 	BUG_ON(!sc->sedesc);
 }

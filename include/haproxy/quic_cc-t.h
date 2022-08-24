@@ -31,10 +31,13 @@
 
 #include <haproxy/buf-t.h>
 
-#define QUIC_CC_INFINITE_SSTHESH ((uint64_t)-1)
+#define QUIC_CC_INFINITE_SSTHESH ((uint32_t)-1)
 
 extern struct quic_cc_algo quic_cc_algo_nr;
+extern struct quic_cc_algo quic_cc_algo_cubic;
 extern struct quic_cc_algo *default_quic_cc_algo;
+
+extern unsigned long long last_ts;
 
 enum quic_cc_algo_state_type {
 	/* Slow start. */
@@ -67,27 +70,19 @@ struct quic_cc_event {
 
 enum quic_cc_algo_type {
 	QUIC_CC_ALGO_TP_NEWRENO,
-};
-
-union quic_cc_algo_state {
-	/* NewReno */
-	struct nr {
-		enum quic_cc_algo_state_type state;
-		uint64_t ssthresh;
-		uint64_t recovery_start_time;
-		uint64_t remain_acked;
-	} nr;
+	QUIC_CC_ALGO_TP_CUBIC,
 };
 
 struct quic_cc {
 	/* <conn> is there only for debugging purpose. */
 	struct quic_conn *qc;
 	struct quic_cc_algo *algo;
-	union quic_cc_algo_state algo_state;
+	uint32_t priv[16];
 };
 
 struct quic_cc_algo {
 	enum quic_cc_algo_type type;
+	enum quic_cc_algo_state_type state;
 	int (*init)(struct quic_cc *cc);
 	void (*event)(struct quic_cc *cc, struct quic_cc_event *ev);
 	void (*slow_start)(struct quic_cc *cc);

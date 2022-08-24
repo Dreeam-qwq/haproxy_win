@@ -10,10 +10,10 @@
  *
  */
 
-#ifdef USE_LIBCRYPT
-/* This is to have crypt() defined on Linux */
+/* This is to have crypt() and sched_setaffinity() defined on Linux */
 #define _GNU_SOURCE
 
+#ifdef USE_LIBCRYPT
 #ifdef USE_CRYPT_H
 /* some platforms such as Solaris need this */
 #include <crypt.h>
@@ -29,6 +29,9 @@
 #include <pwd.h>
 #include <grp.h>
 #include <errno.h>
+#ifdef USE_CPU_AFFINITY
+#include <sched.h>
+#endif
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -566,12 +569,13 @@ unsigned long parse_cpu_set(const char **args, struct hap_cpuset *cpu_set,
 #endif
 
 /* Allocate and initialize the frontend of a "peers" section found in
- * file <file> at line <linenum> for section <peers>.
+ * file <file> at line <linenum> with <id> as ID.
  * Return 0 if succeeded, -1 if not.
  * Note that this function may be called from "default-server"
  * or "peer" lines.
  */
-static int init_peers_frontend(const char *file, int linenum, struct peers *peers)
+static int init_peers_frontend(const char *file, int linenum,
+                               const char *id, struct peers *peers)
 {
 	struct proxy *p;
 
@@ -593,9 +597,8 @@ static int init_peers_frontend(const char *file, int linenum, struct peers *peer
 	peers->peers_fe = p;
 
  out:
-	if (!p->id && peers->id)
-		p->id = strdup(peers->id);
-
+	if (id && !p->id)
+		p->id = strdup(id);
 	free(p->conf.file);
 	p->conf.args.file = p->conf.file = strdup(file);
 	if (linenum != -1)
@@ -697,7 +700,7 @@ int cfg_parse_peers(const char *file, int linenum, char **args, int kwm)
 
 		cur_arg = 1;
 
-		if (init_peers_frontend(file, linenum, curpeers) != 0) {
+		if (init_peers_frontend(file, linenum, NULL, curpeers) != 0) {
 			err_code |= ERR_ALERT | ERR_ABORT;
 			goto out;
 		}
@@ -771,7 +774,7 @@ int cfg_parse_peers(const char *file, int linenum, char **args, int kwm)
 			goto out;
 	}
 	else if (strcmp(args[0], "default-server") == 0) {
-		if (init_peers_frontend(file, -1, curpeers) != 0) {
+		if (init_peers_frontend(file, -1, NULL, curpeers) != 0) {
 			err_code |= ERR_ALERT | ERR_ABORT;
 			goto out;
 		}
@@ -779,7 +782,7 @@ int cfg_parse_peers(const char *file, int linenum, char **args, int kwm)
 		                         SRV_PARSE_DEFAULT_SERVER|SRV_PARSE_IN_PEER_SECTION|SRV_PARSE_INITIAL_RESOLVE);
 	}
 	else if (strcmp(args[0], "log") == 0) {
-		if (init_peers_frontend(file, linenum, curpeers) != 0) {
+		if (init_peers_frontend(file, linenum, NULL, curpeers) != 0) {
 			err_code |= ERR_ALERT | ERR_ABORT;
 			goto out;
 		}
@@ -876,6 +879,7 @@ int cfg_parse_peers(const char *file, int linenum, char **args, int kwm)
 		/* Line number and peer ID are updated only if this peer is the local one. */
 		if (init_peers_frontend(file,
 		                        newpeer->local ? linenum: -1,
+		                        newpeer->local ? newpeer->id : NULL,
 		                        curpeers) != 0) {
 			err_code |= ERR_ALERT | ERR_ABORT;
 			goto out;
@@ -968,7 +972,7 @@ int cfg_parse_peers(const char *file, int linenum, char **args, int kwm)
 		size_t prefix_len;
 
 		/* Line number and peer ID are updated only if this peer is the local one. */
-		if (init_peers_frontend(file, -1, curpeers) != 0) {
+		if (init_peers_frontend(file, -1, NULL, curpeers) != 0) {
 			err_code |= ERR_ALERT | ERR_ABORT;
 			goto out;
 		}
@@ -2449,6 +2453,7 @@ int check_config_validity()
 {
 	int cfgerr = 0;
 	struct proxy *curproxy = NULL;
+	struct proxy *init_proxies_list = NULL;
 	struct stktable *t;
 	struct server *newsrv = NULL;
 	int err_code = 0;
@@ -2495,7 +2500,6 @@ int check_config_validity()
 			global.nbthread = numa_cores ? numa_cores :
 			                               thread_cpus_enabled_at_boot;
 		}
-		all_threads_mask = nbits(global.nbthread);
 #endif
 	}
 
@@ -2529,7 +2533,11 @@ int check_config_validity()
 		proxies_list = next;
 	}
 
-	for (curproxy = proxies_list; curproxy; curproxy = curproxy->next) {
+	/* starting to initialize the main proxies list */
+	init_proxies_list = proxies_list;
+
+init_proxies_list_stage1:
+	for (curproxy = init_proxies_list; curproxy; curproxy = curproxy->next) {
 		struct switching_rule *rule;
 		struct server_rule *srule;
 		struct sticking_rule *mrule;
@@ -2645,17 +2653,19 @@ int check_config_validity()
 					   curproxy->id, err, bind_conf->arg, bind_conf->file, bind_conf->line);
 				free(err);
 				cfgerr++;
-			} else if (!((mask = bind_conf->bind_thread) & all_threads_mask)) {
+			} else if (!((mask = bind_conf->bind_thread) & ha_tgroup_info[bind_conf->bind_tgroup-1].threads_enabled)) {
 				unsigned long new_mask = 0;
+				ulong thr_mask = ha_tgroup_info[bind_conf->bind_tgroup-1].threads_enabled;
 
 				while (mask) {
-					new_mask |= mask & all_threads_mask;
-					mask >>= global.nbthread;
+					new_mask |= mask & thr_mask;
+					mask >>= ha_tgroup_info[bind_conf->bind_tgroup-1].count;
 				}
 
 				bind_conf->bind_thread = new_mask;
-				ha_warning("Proxy '%s': the thread range specified on the 'thread' directive of 'bind %s' at [%s:%d] only refers to thread numbers out of the range defined by the global 'nbthread' directive. The thread numbers were remapped to existing threads instead (mask 0x%lx).\n",
-					   curproxy->id, bind_conf->arg, bind_conf->file, bind_conf->line, new_mask);
+				ha_warning("Proxy '%s': the thread range specified on the 'thread' directive of 'bind %s' at [%s:%d] only refers to thread numbers out of the range supported by thread group %d (%d). The thread numbers were remapped to existing threads instead (mask 0x%lx).\n",
+					   curproxy->id, bind_conf->arg, bind_conf->file, bind_conf->line,
+					   bind_conf->bind_tgroup, ha_tgroup_info[bind_conf->bind_tgroup-1].count, new_mask);
 			}
 
 			/* apply thread masks and groups to all receivers */
@@ -2723,11 +2733,16 @@ int check_config_validity()
 		case PR_MODE_CLI:
 			cfgerr += proxy_cfg_ensure_no_http(curproxy);
 			break;
+
 		case PR_MODE_SYSLOG:
+			/* this mode is initialized as the classic tcp proxy */
+			cfgerr += proxy_cfg_ensure_no_http(curproxy);
+			break;
+
 		case PR_MODE_PEERS:
 		case PR_MODES:
 			/* should not happen, bug gcc warn missing switch statement */
-			ha_alert("%s '%s' cannot use peers or syslog mode for this proxy. NOTE: PLEASE REPORT THIS TO DEVELOPERS AS YOU'RE NOT SUPPOSED TO BE ABLE TO CREATE A CONFIGURATION TRIGGERING THIS!\n",
+			ha_alert("%s '%s' cannot initialize this proxy mode (peers) in this way. NOTE: PLEASE REPORT THIS TO DEVELOPERS AS YOU'RE NOT SUPPOSED TO BE ABLE TO CREATE A CONFIGURATION TRIGGERING THIS!\n",
 				 proxy_type_str(curproxy), curproxy->id);
 			cfgerr++;
 			break;
@@ -3788,7 +3803,7 @@ out_uri_auth_compat:
 			if (!bind_conf->mux_proto) {
 				/* No protocol was specified. If we're using QUIC at the transport
 				 * layer, we'll instantiate it as a mux as well. If QUIC is not
-				 * compiled in, this wil remain NULL.
+				 * compiled in, this will remain NULL.
 				 */
 				if (bind_conf->xprt && bind_conf->xprt == xprt_get(XPRT_QUIC))
 					bind_conf->mux_proto = get_mux_proto(ist("quic"));
@@ -3885,6 +3900,17 @@ out_uri_auth_compat:
 		}
 	}
 
+	/*
+	 * We have just initialized the main proxies list
+	 * we must also configure the log-forward proxies list
+	 */
+	if (init_proxies_list == proxies_list) {
+		init_proxies_list = cfg_log_forward;
+		/* check if list is not null to avoid infinite loop */
+		if (init_proxies_list)
+			goto init_proxies_list_stage1;
+	}
+
 	/***********************************************************/
 	/* At this point, target names have already been resolved. */
 	/***********************************************************/
@@ -3938,7 +3964,11 @@ out_uri_auth_compat:
 
 	/* perform the final checks before creating tasks */
 
-	for (curproxy = proxies_list; curproxy; curproxy = curproxy->next) {
+	/* starting to initialize the main proxies list */
+	init_proxies_list = proxies_list;
+
+init_proxies_list_stage2:
+	for (curproxy = init_proxies_list; curproxy; curproxy = curproxy->next) {
 		struct listener *listener;
 		unsigned int next_id;
 
@@ -4024,6 +4054,17 @@ out_uri_auth_compat:
 		}
 	}
 
+	/*
+	 * We have just initialized the main proxies list
+	 * we must also configure the log-forward proxies list
+	 */
+	if (init_proxies_list == proxies_list) {
+		init_proxies_list = cfg_log_forward;
+		/* check if list is not null to avoid infinite loop */
+		if (init_proxies_list)
+			goto init_proxies_list_stage2;
+	}
+
 	if (diag_no_cluster_secret)
 		ha_diag_warning("No cluster secret was set. The stateless reset and Retry"
 		                " features are disabled for all QUIC bindings.\n");
@@ -4095,6 +4136,17 @@ out_uri_auth_compat:
 					l = &curpeers->peers_fe->conf.bind;
 					bind_conf = LIST_ELEM(l->n, typeof(bind_conf), by_fe);
 
+					if (curpeers->local->srv) {
+						if (curpeers->local->srv->use_ssl == 1 && !(bind_conf->options & BC_O_USE_SSL)) {
+							ha_warning("Peers section '%s': local peer have a non-SSL listener and a SSL server configured at line %s:%d.\n",
+								   curpeers->peers_fe->id, curpeers->local->conf.file, curpeers->local->conf.line);
+						}
+						else if (curpeers->local->srv->use_ssl != 1 && (bind_conf->options & BC_O_USE_SSL)) {
+							ha_warning("Peers section '%s': local peer have a SSL listener and a non-SSL server configured at line %s:%d.\n",
+								   curpeers->peers_fe->id, curpeers->local->conf.file, curpeers->local->conf.line);
+						}
+					}
+
 					err = NULL;
 					if (thread_resolve_group_mask(bind_conf->bind_tgroup, bind_conf->bind_thread,
 								      &bind_conf->bind_tgroup, &bind_conf->bind_thread, &err) < 0) {
@@ -4102,17 +4154,19 @@ out_uri_auth_compat:
 							 curpeers->peers_fe->id, err, bind_conf->arg, bind_conf->file, bind_conf->line);
 						free(err);
 						cfgerr++;
-					} else if (!((mask = bind_conf->bind_thread) & all_threads_mask)) {
+					} else if (!((mask = bind_conf->bind_thread) & ha_tgroup_info[bind_conf->bind_tgroup-1].threads_enabled)) {
 						unsigned long new_mask = 0;
+						ulong thr_mask = ha_tgroup_info[bind_conf->bind_tgroup-1].threads_enabled;
 
 						while (mask) {
-							new_mask |= mask & all_threads_mask;
-							mask >>= global.nbthread;
+							new_mask |= mask & thr_mask;
+							mask >>= ha_tgroup_info[bind_conf->bind_tgroup-1].count;
 						}
 
 						bind_conf->bind_thread = new_mask;
-						ha_warning("Peers section '%s': the thread range specified on the 'thread' directive of 'bind %s' at [%s:%d] only refers to thread numbers out of the range defined by the global 'nbthread' directive. The thread numbers were remapped to existing threads instead (mask 0x%lx).\n",
-							   curpeers->peers_fe->id, bind_conf->arg, bind_conf->file, bind_conf->line, new_mask);
+						ha_warning("Peers section '%s': the thread range specified on the 'thread' directive of 'bind %s' at [%s:%d] only refers to thread numbers out of the range supported by thread group %d (%d). The thread numbers were remapped to existing threads instead (mask 0x%lx).\n",
+							   curpeers->peers_fe->id, bind_conf->arg, bind_conf->file, bind_conf->line,
+							   bind_conf->bind_tgroup, ha_tgroup_info[bind_conf->bind_tgroup-1].count, new_mask);
 					}
 
 					/* apply thread masks and groups to all receivers */

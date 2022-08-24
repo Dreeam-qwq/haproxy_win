@@ -18,6 +18,10 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
  */
 
+#include <sys/mman.h>
+#include <errno.h>
+#include <fcntl.h>
+
 #include <import/ist.h>
 #include <haproxy/api.h>
 #include <haproxy/applet.h>
@@ -306,7 +310,7 @@ static void sink_forward_io_handler(struct appctx *appctx)
 	struct ring *ring = sink->ctx.ring;
 	struct buffer *buf = &ring->buf;
 	uint64_t msg_len;
-	size_t len, cnt, ofs;
+	size_t len, cnt, ofs, last_ofs;
 	int ret = 0;
 
 	/* if stopping was requested, close immediately */
@@ -409,6 +413,7 @@ static void sink_forward_io_handler(struct appctx *appctx)
 		HA_ATOMIC_INC(b_peek(buf, ofs));
 		ofs += ring->ofs;
 		sft->ofs = ofs;
+		last_ofs = ring->ofs;
 	}
 	HA_RWLOCK_RDUNLOCK(LOGSRV_LOCK, &ring->lock);
 
@@ -416,8 +421,16 @@ static void sink_forward_io_handler(struct appctx *appctx)
 		/* let's be woken up once new data arrive */
 		HA_RWLOCK_WRLOCK(LOGSRV_LOCK, &ring->lock);
 		LIST_APPEND(&ring->waiters, &appctx->wait_entry);
+		ofs = ring->ofs;
 		HA_RWLOCK_WRUNLOCK(LOGSRV_LOCK, &ring->lock);
-		applet_have_no_more_data(appctx);
+		if (ofs != last_ofs) {
+			/* more data was added into the ring between the
+			 * unlock and the lock, and the writer might not
+			 * have seen us. We need to reschedule a read.
+			 */
+			applet_have_more_data(appctx);
+		} else
+			applet_have_no_more_data(appctx);
 	}
 	HA_SPIN_UNLOCK(SFT_LOCK, &sft->lock);
 
@@ -751,7 +764,7 @@ int cfg_parse_ring(const char *file, int linenum, char **args, int kwm)
 	size_t size = BUFSIZE;
 	struct proxy *p;
 
-	if (strcmp(args[0], "ring") == 0) { /* new peers section */
+	if (strcmp(args[0], "ring") == 0) { /* new ring section */
 		if (!*args[1]) {
 			ha_alert("parsing [%s:%d] : missing ring name.\n", file, linenum);
 			err_code |= ERR_ALERT | ERR_FATAL;
@@ -795,6 +808,12 @@ int cfg_parse_ring(const char *file, int linenum, char **args, int kwm)
 		cfg_sink->forward_px = p;
 	}
 	else if (strcmp(args[0], "size") == 0) {
+		if (!cfg_sink || (cfg_sink->type != SINK_TYPE_BUFFER)) {
+			ha_alert("parsing [%s:%d] : 'size' directive not usable with this type of sink.\n", file, linenum);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto err;
+		}
+
 		size = atol(args[1]);
 		if (!size) {
 			ha_alert("parsing [%s:%d] : invalid size '%s' for new sink buffer.\n", file, linenum, args[1]);
@@ -802,12 +821,91 @@ int cfg_parse_ring(const char *file, int linenum, char **args, int kwm)
 			goto err;
 		}
 
-		if (!cfg_sink || (cfg_sink->type != SINK_TYPE_BUFFER)
-		              || !ring_resize(cfg_sink->ctx.ring, size)) {
-			ha_alert("parsing [%s:%d] : fail to set sink buffer size '%s'.\n", file, linenum, args[1]);
+		if (cfg_sink->store) {
+			ha_alert("parsing [%s:%d] : cannot resize an already mapped file, please specify 'size' before 'backing-file'.\n", file, linenum);
 			err_code |= ERR_ALERT | ERR_FATAL;
 			goto err;
 		}
+
+		if (size < cfg_sink->ctx.ring->buf.size) {
+			ha_warning("parsing [%s:%d] : ignoring new size '%llu' that is smaller than current size '%llu' for ring '%s'.\n",
+				   file, linenum, (ullong)size, (ullong)cfg_sink->ctx.ring->buf.size, cfg_sink->name);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto err;
+		}
+
+		if (!ring_resize(cfg_sink->ctx.ring, size)) {
+			ha_alert("parsing [%s:%d] : fail to set sink buffer size '%llu' for ring '%s'.\n", file, linenum,
+				 (ullong)cfg_sink->ctx.ring->buf.size, cfg_sink->name);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto err;
+		}
+	}
+	else if (strcmp(args[0], "backing-file") == 0) {
+		/* This tries to mmap file <file> for size <size> and to use it as a backing store
+		 * for ring <ring>. Existing data are delete. NULL is returned on error.
+		 */
+		const char *backing = args[1];
+		char *oldback;
+		size_t size;
+		void *area;
+		int fd;
+
+		if (!cfg_sink || (cfg_sink->type != SINK_TYPE_BUFFER)) {
+			ha_alert("parsing [%s:%d] : 'backing-file' only usable with existing rings.\n", file, linenum);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto err;
+		}
+
+		if (cfg_sink->store) {
+			ha_alert("parsing [%s:%d] : 'backing-file' already specified for ring '%s' (was '%s').\n", file, linenum, cfg_sink->name, cfg_sink->store);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto err;
+		}
+
+		oldback = NULL;
+		memprintf(&oldback, "%s.bak", backing);
+		if (oldback) {
+			/* try to rename any possibly existing ring file to
+			 * ".bak" and delete remains of older ones. This will
+			 * ensure we don't wipe useful debug info upon restart.
+			 */
+			unlink(oldback);
+			if (rename(backing, oldback) < 0)
+				unlink(oldback);
+			ha_free(&oldback);
+		}
+
+		fd = open(backing, O_RDWR | O_CREAT, 0600);
+		if (fd < 0) {
+			ha_alert("parsing [%s:%d] : cannot open backing-file '%s' for ring '%s': %s.\n", file, linenum, backing, cfg_sink->name, strerror(errno));
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto err;
+		}
+
+		size = (cfg_sink->ctx.ring->buf.size + 4095UL) & -4096UL;
+		if (ftruncate(fd, size) != 0) {
+			close(fd);
+			ha_alert("parsing [%s:%d] : could not adjust size of backing-file for ring '%s': %s.\n", file, linenum, cfg_sink->name, strerror(errno));
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto err;
+		}
+
+		area = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+		if (area == MAP_FAILED) {
+			close(fd);
+			ha_alert("parsing [%s:%d] : failed to use '%s' as a backing file for ring '%s': %s.\n", file, linenum, backing, cfg_sink->name, strerror(errno));
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto err;
+		}
+
+		/* we don't need the file anymore */
+		close(fd);
+		cfg_sink->store = strdup(backing);
+
+		/* never fails */
+		ring_free(cfg_sink->ctx.ring);
+		cfg_sink->ctx.ring = ring_make_from_area(area, size);
 	}
 	else if (strcmp(args[0],"server") == 0) {
 		err_code |= parse_server(file, linenum, args, cfg_sink->forward_px, NULL,
@@ -1102,6 +1200,7 @@ int cfg_post_parse_ring()
 				sft->srv = srv;
 				sft->appctx = NULL;
 				sft->ofs = ~0; /* init ring offset */
+				sft->sink = cfg_sink;
 				sft->next = cfg_sink->sft;
 				HA_SPIN_INIT(&sft->lock);
 
@@ -1244,8 +1343,12 @@ static void sink_deinit()
 	struct sink *sink, *sb;
 
 	list_for_each_entry_safe(sink, sb, &sink_list, sink_list) {
-		if (sink->type == SINK_TYPE_BUFFER)
-			ring_free(sink->ctx.ring);
+		if (sink->type == SINK_TYPE_BUFFER) {
+			if (sink->store)
+				munmap(sink->ctx.ring->buf.area, sink->ctx.ring->buf.size);
+			else
+				ring_free(sink->ctx.ring);
+		}
 		LIST_DELETE(&sink->sink_list);
 		free(sink->name);
 		free(sink->desc);

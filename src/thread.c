@@ -63,13 +63,11 @@ THREAD_LOCAL struct thread_ctx *th_ctx = &ha_thread_ctx[0];
 
 #ifdef USE_THREAD
 
-volatile unsigned long all_threads_mask __read_mostly  = 1; // nbthread 1 assumed by default
 volatile unsigned long all_tgroups_mask __read_mostly  = 1; // nbtgroup 1 assumed by default
 volatile unsigned int rdv_requests       = 0;  // total number of threads requesting RDV
 volatile unsigned int isolated_thread    = ~0; // ID of the isolated thread, or ~0 when none
 THREAD_LOCAL unsigned int  tgid          = 1; // thread ID starts at 1
 THREAD_LOCAL unsigned int  tid           = 0;
-THREAD_LOCAL unsigned long tid_bit       = (1UL << 0);
 int thread_cpus_enabled_at_boot          = 1;
 static pthread_t ha_pthread[MAX_THREADS] = { };
 
@@ -249,13 +247,13 @@ void set_thread_cpu_affinity()
 		return;
 
 	/* Now the CPU affinity for all threads */
-	if (ha_cpuset_count(&cpu_map.proc))
-		ha_cpuset_and(&cpu_map.thread[tid], &cpu_map.proc);
+	if (ha_cpuset_count(&cpu_map[tgid - 1].proc))
+		ha_cpuset_and(&cpu_map[tgid - 1].thread[ti->ltid], &cpu_map[tgid - 1].proc);
 
-	if (ha_cpuset_count(&cpu_map.thread[tid])) {/* only do this if the thread has a THREAD map */
+	if (ha_cpuset_count(&cpu_map[tgid - 1].thread[ti->ltid])) {/* only do this if the thread has a THREAD map */
 #  if defined(__APPLE__)
 		/* Note: this API is limited to the first 32/64 CPUs */
-		unsigned long set = cpu_map.thread[tid].cpuset;
+		unsigned long set = cpu_map[tgid - 1].thread[ti->ltid].cpuset;
 		int j;
 
 		while ((j = ffsl(set)) > 0) {
@@ -267,7 +265,7 @@ void set_thread_cpu_affinity()
 			set &= ~(1UL << (j - 1));
 		}
 #  else
-		struct hap_cpuset *set = &cpu_map.thread[tid];
+		struct hap_cpuset *set = &cpu_map[tgid - 1].thread[ti->ltid];
 
 		pthread_setaffinity_np(ha_pthread[tid], sizeof(set->cpuset), &set->cpuset);
 #  endif
@@ -319,7 +317,7 @@ void ha_tkillall(int sig)
 	unsigned int thr;
 
 	for (thr = 0; thr < global.nbthread; thr++) {
-		if (!(tg->threads_enabled & ha_thread_info[thr].ltid_bit))
+		if (!(ha_thread_info[thr].tg->threads_enabled & ha_thread_info[thr].ltid_bit))
 			continue;
 		if (thr == tid)
 			continue;
@@ -518,12 +516,14 @@ void __ha_rwlock_destroy(struct ha_rwlock *l)
 void __ha_rwlock_wrlock(enum lock_label lbl, struct ha_rwlock *l,
                         const char *func, const char *file, int line)
 {
+	ulong tbit = (ti && ti->ltid_bit) ? ti->ltid_bit : 1;
+	struct ha_rwlock_state *st = &l->info.st[tgid-1];
 	uint64_t start_time;
 
-	if ((l->info.cur_readers | l->info.cur_seeker | l->info.cur_writer) & tid_bit)
+	if ((st->cur_readers | st->cur_seeker | st->cur_writer) & tbit)
 		abort();
 
-	HA_ATOMIC_OR(&l->info.wait_writers, tid_bit);
+	HA_ATOMIC_OR(&st->wait_writers, tbit);
 
 	start_time = now_mono_time();
 	__RWLOCK_WRLOCK(&l->lock);
@@ -531,41 +531,43 @@ void __ha_rwlock_wrlock(enum lock_label lbl, struct ha_rwlock *l,
 
 	HA_ATOMIC_INC(&lock_stats[lbl].num_write_locked);
 
-	l->info.cur_writer             = tid_bit;
+	st->cur_writer                 = tbit;
 	l->info.last_location.function = func;
 	l->info.last_location.file     = file;
 	l->info.last_location.line     = line;
 
-	HA_ATOMIC_AND(&l->info.wait_writers, ~tid_bit);
+	HA_ATOMIC_AND(&st->wait_writers, ~tbit);
 }
 
 int __ha_rwlock_trywrlock(enum lock_label lbl, struct ha_rwlock *l,
                           const char *func, const char *file, int line)
 {
+	ulong tbit = (ti && ti->ltid_bit) ? ti->ltid_bit : 1;
+	struct ha_rwlock_state *st = &l->info.st[tgid-1];
 	uint64_t start_time;
 	int r;
 
-	if ((l->info.cur_readers | l->info.cur_seeker | l->info.cur_writer) & tid_bit)
+	if ((st->cur_readers | st->cur_seeker | st->cur_writer) & tbit)
 		abort();
 
 	/* We set waiting writer because trywrlock could wait for readers to quit */
-	HA_ATOMIC_OR(&l->info.wait_writers, tid_bit);
+	HA_ATOMIC_OR(&st->wait_writers, tbit);
 
 	start_time = now_mono_time();
 	r = __RWLOCK_TRYWRLOCK(&l->lock);
 	HA_ATOMIC_ADD(&lock_stats[lbl].nsec_wait_for_write, (now_mono_time() - start_time));
 	if (unlikely(r)) {
-		HA_ATOMIC_AND(&l->info.wait_writers, ~tid_bit);
+		HA_ATOMIC_AND(&st->wait_writers, ~tbit);
 		return r;
 	}
 	HA_ATOMIC_INC(&lock_stats[lbl].num_write_locked);
 
-	l->info.cur_writer             = tid_bit;
+	st->cur_writer                 = tbit;
 	l->info.last_location.function = func;
 	l->info.last_location.file     = file;
 	l->info.last_location.line     = line;
 
-	HA_ATOMIC_AND(&l->info.wait_writers, ~tid_bit);
+	HA_ATOMIC_AND(&st->wait_writers, ~tbit);
 
 	return 0;
 }
@@ -573,12 +575,15 @@ int __ha_rwlock_trywrlock(enum lock_label lbl, struct ha_rwlock *l,
 void __ha_rwlock_wrunlock(enum lock_label lbl,struct ha_rwlock *l,
                           const char *func, const char *file, int line)
 {
-	if (unlikely(!(l->info.cur_writer & tid_bit))) {
+	ulong tbit = (ti && ti->ltid_bit) ? ti->ltid_bit : 1;
+	struct ha_rwlock_state *st = &l->info.st[tgid-1];
+
+	if (unlikely(!(st->cur_writer & tbit))) {
 		/* the thread is not owning the lock for write */
 		abort();
 	}
 
-	l->info.cur_writer             = 0;
+	st->cur_writer                 = 0;
 	l->info.last_location.function = func;
 	l->info.last_location.file     = file;
 	l->info.last_location.line     = line;
@@ -590,28 +595,32 @@ void __ha_rwlock_wrunlock(enum lock_label lbl,struct ha_rwlock *l,
 
 void __ha_rwlock_rdlock(enum lock_label lbl,struct ha_rwlock *l)
 {
+	ulong tbit = (ti && ti->ltid_bit) ? ti->ltid_bit : 1;
+	struct ha_rwlock_state *st = &l->info.st[tgid-1];
 	uint64_t start_time;
 
-	if ((l->info.cur_readers | l->info.cur_seeker | l->info.cur_writer) & tid_bit)
+	if ((st->cur_readers | st->cur_seeker | st->cur_writer) & tbit)
 		abort();
 
-	HA_ATOMIC_OR(&l->info.wait_readers, tid_bit);
+	HA_ATOMIC_OR(&st->wait_readers, tbit);
 
 	start_time = now_mono_time();
 	__RWLOCK_RDLOCK(&l->lock);
 	HA_ATOMIC_ADD(&lock_stats[lbl].nsec_wait_for_read, (now_mono_time() - start_time));
 	HA_ATOMIC_INC(&lock_stats[lbl].num_read_locked);
 
-	HA_ATOMIC_OR(&l->info.cur_readers, tid_bit);
+	HA_ATOMIC_OR(&st->cur_readers, tbit);
 
-	HA_ATOMIC_AND(&l->info.wait_readers, ~tid_bit);
+	HA_ATOMIC_AND(&st->wait_readers, ~tbit);
 }
 
 int __ha_rwlock_tryrdlock(enum lock_label lbl,struct ha_rwlock *l)
 {
+	ulong tbit = (ti && ti->ltid_bit) ? ti->ltid_bit : 1;
+	struct ha_rwlock_state *st = &l->info.st[tgid-1];
 	int r;
 
-	if ((l->info.cur_readers | l->info.cur_seeker | l->info.cur_writer) & tid_bit)
+	if ((st->cur_readers | st->cur_seeker | st->cur_writer) & tbit)
 		abort();
 
 	/* try read should never wait */
@@ -620,19 +629,22 @@ int __ha_rwlock_tryrdlock(enum lock_label lbl,struct ha_rwlock *l)
 		return r;
 	HA_ATOMIC_INC(&lock_stats[lbl].num_read_locked);
 
-	HA_ATOMIC_OR(&l->info.cur_readers, tid_bit);
+	HA_ATOMIC_OR(&st->cur_readers, tbit);
 
 	return 0;
 }
 
 void __ha_rwlock_rdunlock(enum lock_label lbl,struct ha_rwlock *l)
 {
-	if (unlikely(!(l->info.cur_readers & tid_bit))) {
+	ulong tbit = (ti && ti->ltid_bit) ? ti->ltid_bit : 1;
+	struct ha_rwlock_state *st = &l->info.st[tgid-1];
+
+	if (unlikely(!(st->cur_readers & tbit))) {
 		/* the thread is not owning the lock for read */
 		abort();
 	}
 
-	HA_ATOMIC_AND(&l->info.cur_readers, ~tid_bit);
+	HA_ATOMIC_AND(&st->cur_readers, ~tbit);
 
 	__RWLOCK_RDUNLOCK(&l->lock);
 
@@ -642,15 +654,17 @@ void __ha_rwlock_rdunlock(enum lock_label lbl,struct ha_rwlock *l)
 void __ha_rwlock_wrtord(enum lock_label lbl, struct ha_rwlock *l,
                         const char *func, const char *file, int line)
 {
+	ulong tbit = (ti && ti->ltid_bit) ? ti->ltid_bit : 1;
+	struct ha_rwlock_state *st = &l->info.st[tgid-1];
 	uint64_t start_time;
 
-	if ((l->info.cur_readers | l->info.cur_seeker) & tid_bit)
+	if ((st->cur_readers | st->cur_seeker) & tbit)
 		abort();
 
-	if (!(l->info.cur_writer & tid_bit))
+	if (!(st->cur_writer & tbit))
 		abort();
 
-	HA_ATOMIC_OR(&l->info.wait_readers, tid_bit);
+	HA_ATOMIC_OR(&st->wait_readers, tbit);
 
 	start_time = now_mono_time();
 	__RWLOCK_WRTORD(&l->lock);
@@ -658,27 +672,29 @@ void __ha_rwlock_wrtord(enum lock_label lbl, struct ha_rwlock *l,
 
 	HA_ATOMIC_INC(&lock_stats[lbl].num_read_locked);
 
-	HA_ATOMIC_OR(&l->info.cur_readers, tid_bit);
-	HA_ATOMIC_AND(&l->info.cur_writer, ~tid_bit);
+	HA_ATOMIC_OR(&st->cur_readers, tbit);
+	HA_ATOMIC_AND(&st->cur_writer, ~tbit);
 	l->info.last_location.function = func;
 	l->info.last_location.file     = file;
 	l->info.last_location.line     = line;
 
-	HA_ATOMIC_AND(&l->info.wait_readers, ~tid_bit);
+	HA_ATOMIC_AND(&st->wait_readers, ~tbit);
 }
 
 void __ha_rwlock_wrtosk(enum lock_label lbl, struct ha_rwlock *l,
                         const char *func, const char *file, int line)
 {
+	ulong tbit = (ti && ti->ltid_bit) ? ti->ltid_bit : 1;
+	struct ha_rwlock_state *st = &l->info.st[tgid-1];
 	uint64_t start_time;
 
-	if ((l->info.cur_readers | l->info.cur_seeker) & tid_bit)
+	if ((st->cur_readers | st->cur_seeker) & tbit)
 		abort();
 
-	if (!(l->info.cur_writer & tid_bit))
+	if (!(st->cur_writer & tbit))
 		abort();
 
-	HA_ATOMIC_OR(&l->info.wait_seekers, tid_bit);
+	HA_ATOMIC_OR(&st->wait_seekers, tbit);
 
 	start_time = now_mono_time();
 	__RWLOCK_WRTOSK(&l->lock);
@@ -686,24 +702,26 @@ void __ha_rwlock_wrtosk(enum lock_label lbl, struct ha_rwlock *l,
 
 	HA_ATOMIC_INC(&lock_stats[lbl].num_seek_locked);
 
-	HA_ATOMIC_OR(&l->info.cur_seeker, tid_bit);
-	HA_ATOMIC_AND(&l->info.cur_writer, ~tid_bit);
+	HA_ATOMIC_OR(&st->cur_seeker, tbit);
+	HA_ATOMIC_AND(&st->cur_writer, ~tbit);
 	l->info.last_location.function = func;
 	l->info.last_location.file     = file;
 	l->info.last_location.line     = line;
 
-	HA_ATOMIC_AND(&l->info.wait_seekers, ~tid_bit);
+	HA_ATOMIC_AND(&st->wait_seekers, ~tbit);
 }
 
 void __ha_rwlock_sklock(enum lock_label lbl, struct ha_rwlock *l,
                         const char *func, const char *file, int line)
 {
+	ulong tbit = (ti && ti->ltid_bit) ? ti->ltid_bit : 1;
+	struct ha_rwlock_state *st = &l->info.st[tgid-1];
 	uint64_t start_time;
 
-	if ((l->info.cur_readers | l->info.cur_seeker | l->info.cur_writer) & tid_bit)
+	if ((st->cur_readers | st->cur_seeker | st->cur_writer) & tbit)
 		abort();
 
-	HA_ATOMIC_OR(&l->info.wait_seekers, tid_bit);
+	HA_ATOMIC_OR(&st->wait_seekers, tbit);
 
 	start_time = now_mono_time();
 	__RWLOCK_SKLOCK(&l->lock);
@@ -711,26 +729,28 @@ void __ha_rwlock_sklock(enum lock_label lbl, struct ha_rwlock *l,
 
 	HA_ATOMIC_INC(&lock_stats[lbl].num_seek_locked);
 
-	HA_ATOMIC_OR(&l->info.cur_seeker, tid_bit);
+	HA_ATOMIC_OR(&st->cur_seeker, tbit);
 	l->info.last_location.function = func;
 	l->info.last_location.file     = file;
 	l->info.last_location.line     = line;
 
-	HA_ATOMIC_AND(&l->info.wait_seekers, ~tid_bit);
+	HA_ATOMIC_AND(&st->wait_seekers, ~tbit);
 }
 
 void __ha_rwlock_sktowr(enum lock_label lbl, struct ha_rwlock *l,
                         const char *func, const char *file, int line)
 {
+	ulong tbit = (ti && ti->ltid_bit) ? ti->ltid_bit : 1;
+	struct ha_rwlock_state *st = &l->info.st[tgid-1];
 	uint64_t start_time;
 
-	if ((l->info.cur_readers | l->info.cur_writer) & tid_bit)
+	if ((st->cur_readers | st->cur_writer) & tbit)
 		abort();
 
-	if (!(l->info.cur_seeker & tid_bit))
+	if (!(st->cur_seeker & tbit))
 		abort();
 
-	HA_ATOMIC_OR(&l->info.wait_writers, tid_bit);
+	HA_ATOMIC_OR(&st->wait_writers, tbit);
 
 	start_time = now_mono_time();
 	__RWLOCK_SKTOWR(&l->lock);
@@ -738,27 +758,29 @@ void __ha_rwlock_sktowr(enum lock_label lbl, struct ha_rwlock *l,
 
 	HA_ATOMIC_INC(&lock_stats[lbl].num_write_locked);
 
-	HA_ATOMIC_OR(&l->info.cur_writer, tid_bit);
-	HA_ATOMIC_AND(&l->info.cur_seeker, ~tid_bit);
+	HA_ATOMIC_OR(&st->cur_writer, tbit);
+	HA_ATOMIC_AND(&st->cur_seeker, ~tbit);
 	l->info.last_location.function = func;
 	l->info.last_location.file     = file;
 	l->info.last_location.line     = line;
 
-	HA_ATOMIC_AND(&l->info.wait_writers, ~tid_bit);
+	HA_ATOMIC_AND(&st->wait_writers, ~tbit);
 }
 
 void __ha_rwlock_sktord(enum lock_label lbl, struct ha_rwlock *l,
                         const char *func, const char *file, int line)
 {
+	ulong tbit = (ti && ti->ltid_bit) ? ti->ltid_bit : 1;
+	struct ha_rwlock_state *st = &l->info.st[tgid-1];
 	uint64_t start_time;
 
-	if ((l->info.cur_readers | l->info.cur_writer) & tid_bit)
+	if ((st->cur_readers | st->cur_writer) & tbit)
 		abort();
 
-	if (!(l->info.cur_seeker & tid_bit))
+	if (!(st->cur_seeker & tbit))
 		abort();
 
-	HA_ATOMIC_OR(&l->info.wait_readers, tid_bit);
+	HA_ATOMIC_OR(&st->wait_readers, tbit);
 
 	start_time = now_mono_time();
 	__RWLOCK_SKTORD(&l->lock);
@@ -766,22 +788,24 @@ void __ha_rwlock_sktord(enum lock_label lbl, struct ha_rwlock *l,
 
 	HA_ATOMIC_INC(&lock_stats[lbl].num_read_locked);
 
-	HA_ATOMIC_OR(&l->info.cur_readers, tid_bit);
-	HA_ATOMIC_AND(&l->info.cur_seeker, ~tid_bit);
+	HA_ATOMIC_OR(&st->cur_readers, tbit);
+	HA_ATOMIC_AND(&st->cur_seeker, ~tbit);
 	l->info.last_location.function = func;
 	l->info.last_location.file     = file;
 	l->info.last_location.line     = line;
 
-	HA_ATOMIC_AND(&l->info.wait_readers, ~tid_bit);
+	HA_ATOMIC_AND(&st->wait_readers, ~tbit);
 }
 
 void __ha_rwlock_skunlock(enum lock_label lbl,struct ha_rwlock *l,
                           const char *func, const char *file, int line)
 {
-	if (!(l->info.cur_seeker & tid_bit))
+	ulong tbit = (ti && ti->ltid_bit) ? ti->ltid_bit : 1;
+	struct ha_rwlock_state *st = &l->info.st[tgid-1];
+	if (!(st->cur_seeker & tbit))
 		abort();
 
-	HA_ATOMIC_AND(&l->info.cur_seeker, ~tid_bit);
+	HA_ATOMIC_AND(&st->cur_seeker, ~tbit);
 	l->info.last_location.function = func;
 	l->info.last_location.file     = file;
 	l->info.last_location.line     = line;
@@ -794,13 +818,15 @@ void __ha_rwlock_skunlock(enum lock_label lbl,struct ha_rwlock *l,
 int __ha_rwlock_trysklock(enum lock_label lbl, struct ha_rwlock *l,
                           const char *func, const char *file, int line)
 {
+	ulong tbit = (ti && ti->ltid_bit) ? ti->ltid_bit : 1;
+	struct ha_rwlock_state *st = &l->info.st[tgid-1];
 	uint64_t start_time;
 	int r;
 
-	if ((l->info.cur_readers | l->info.cur_seeker | l->info.cur_writer) & tid_bit)
+	if ((st->cur_readers | st->cur_seeker | st->cur_writer) & tbit)
 		abort();
 
-	HA_ATOMIC_OR(&l->info.wait_seekers, tid_bit);
+	HA_ATOMIC_OR(&st->wait_seekers, tbit);
 
 	start_time = now_mono_time();
 	r = __RWLOCK_TRYSKLOCK(&l->lock);
@@ -809,29 +835,31 @@ int __ha_rwlock_trysklock(enum lock_label lbl, struct ha_rwlock *l,
 	if (likely(!r)) {
 		/* got the lock ! */
 		HA_ATOMIC_INC(&lock_stats[lbl].num_seek_locked);
-		HA_ATOMIC_OR(&l->info.cur_seeker, tid_bit);
+		HA_ATOMIC_OR(&st->cur_seeker, tbit);
 		l->info.last_location.function = func;
 		l->info.last_location.file     = file;
 		l->info.last_location.line     = line;
 	}
 
-	HA_ATOMIC_AND(&l->info.wait_seekers, ~tid_bit);
+	HA_ATOMIC_AND(&st->wait_seekers, ~tbit);
 	return r;
 }
 
 int __ha_rwlock_tryrdtosk(enum lock_label lbl, struct ha_rwlock *l,
                           const char *func, const char *file, int line)
 {
+	ulong tbit = (ti && ti->ltid_bit) ? ti->ltid_bit : 1;
+	struct ha_rwlock_state *st = &l->info.st[tgid-1];
 	uint64_t start_time;
 	int r;
 
-	if ((l->info.cur_writer | l->info.cur_seeker) & tid_bit)
+	if ((st->cur_writer | st->cur_seeker) & tbit)
 		abort();
 
-	if (!(l->info.cur_readers & tid_bit))
+	if (!(st->cur_readers & tbit))
 		abort();
 
-	HA_ATOMIC_OR(&l->info.wait_seekers, tid_bit);
+	HA_ATOMIC_OR(&st->wait_seekers, tbit);
 
 	start_time = now_mono_time();
 	r = __RWLOCK_TRYRDTOSK(&l->lock);
@@ -840,14 +868,14 @@ int __ha_rwlock_tryrdtosk(enum lock_label lbl, struct ha_rwlock *l,
 	if (likely(!r)) {
 		/* got the lock ! */
 		HA_ATOMIC_INC(&lock_stats[lbl].num_seek_locked);
-		HA_ATOMIC_OR(&l->info.cur_seeker, tid_bit);
-		HA_ATOMIC_AND(&l->info.cur_readers, ~tid_bit);
+		HA_ATOMIC_OR(&st->cur_seeker, tbit);
+		HA_ATOMIC_AND(&st->cur_readers, ~tbit);
 		l->info.last_location.function = func;
 		l->info.last_location.file     = file;
 		l->info.last_location.line     = line;
 	}
 
-	HA_ATOMIC_AND(&l->info.wait_seekers, ~tid_bit);
+	HA_ATOMIC_AND(&st->wait_seekers, ~tbit);
 	return r;
 }
 
@@ -866,14 +894,16 @@ void __spin_destroy(struct ha_spinlock *l)
 void __spin_lock(enum lock_label lbl, struct ha_spinlock *l,
                  const char *func, const char *file, int line)
 {
+	ulong tbit = (ti && ti->ltid_bit) ? ti->ltid_bit : 1;
+	struct ha_spinlock_state *st = &l->info.st[tgid-1];
 	uint64_t start_time;
 
-	if (unlikely(l->info.owner & tid_bit)) {
+	if (unlikely(st->owner & tbit)) {
 		/* the thread is already owning the lock */
 		abort();
 	}
 
-	HA_ATOMIC_OR(&l->info.waiters, tid_bit);
+	HA_ATOMIC_OR(&st->waiters, tbit);
 
 	start_time = now_mono_time();
 	__SPIN_LOCK(&l->lock);
@@ -882,20 +912,22 @@ void __spin_lock(enum lock_label lbl, struct ha_spinlock *l,
 	HA_ATOMIC_INC(&lock_stats[lbl].num_write_locked);
 
 
-	l->info.owner                  = tid_bit;
+	st->owner                  = tbit;
 	l->info.last_location.function = func;
 	l->info.last_location.file     = file;
 	l->info.last_location.line     = line;
 
-	HA_ATOMIC_AND(&l->info.waiters, ~tid_bit);
+	HA_ATOMIC_AND(&st->waiters, ~tbit);
 }
 
 int __spin_trylock(enum lock_label lbl, struct ha_spinlock *l,
                    const char *func, const char *file, int line)
 {
+	ulong tbit = (ti && ti->ltid_bit) ? ti->ltid_bit : 1;
+	struct ha_spinlock_state *st = &l->info.st[tgid-1];
 	int r;
 
-	if (unlikely(l->info.owner & tid_bit)) {
+	if (unlikely(st->owner & tbit)) {
 		/* the thread is already owning the lock */
 		abort();
 	}
@@ -906,7 +938,7 @@ int __spin_trylock(enum lock_label lbl, struct ha_spinlock *l,
 		return r;
 	HA_ATOMIC_INC(&lock_stats[lbl].num_write_locked);
 
-	l->info.owner                  = tid_bit;
+	st->owner                      = tbit;
 	l->info.last_location.function = func;
 	l->info.last_location.file     = file;
 	l->info.last_location.line     = line;
@@ -917,12 +949,15 @@ int __spin_trylock(enum lock_label lbl, struct ha_spinlock *l,
 void __spin_unlock(enum lock_label lbl, struct ha_spinlock *l,
                    const char *func, const char *file, int line)
 {
-	if (unlikely(!(l->info.owner & tid_bit))) {
+	ulong tbit = (ti && ti->ltid_bit) ? ti->ltid_bit : 1;
+	struct ha_spinlock_state *st = &l->info.st[tgid-1];
+
+	if (unlikely(!(st->owner & tbit))) {
 		/* the thread is not owning the lock */
 		abort();
 	}
 
-	l->info.owner                  = 0;
+	st->owner                      = 0;
 	l->info.last_location.function = func;
 	l->info.last_location.file     = file;
 	l->info.last_location.line     = line;
@@ -932,6 +967,75 @@ void __spin_unlock(enum lock_label lbl, struct ha_spinlock *l,
 }
 
 #endif // defined(DEBUG_THREAD) || defined(DEBUG_FULL)
+
+
+#if defined(USE_PTHREAD_EMULATION)
+
+/* pthread rwlock emulation using plocks (to avoid expensive futexes).
+ * these are a direct mapping on Progressive Locks, with the exception that
+ * since there's a common unlock operation in pthreads, we need to know if
+ * we need to unlock for reads or writes, so we set the topmost bit to 1 when
+ * a write lock is acquired to indicate that a write unlock needs to be
+ * performed. It's not a problem since this bit will never be used given that
+ * haproxy won't support as many threads as the plocks.
+ *
+ * The storage is the pthread_rwlock_t cast as an ulong
+ */
+
+int pthread_rwlock_init(pthread_rwlock_t *restrict rwlock, const pthread_rwlockattr_t *restrict attr)
+{
+	ulong *lock = (ulong *)rwlock;
+
+	*lock = 0;
+	return 0;
+}
+
+int pthread_rwlock_destroy(pthread_rwlock_t *rwlock)
+{
+	ulong *lock = (ulong *)rwlock;
+
+	*lock = 0;
+	return 0;
+}
+
+int pthread_rwlock_rdlock(pthread_rwlock_t *rwlock)
+{
+	pl_lorw_rdlock((unsigned long *)rwlock);
+	return 0;
+}
+
+int pthread_rwlock_tryrdlock(pthread_rwlock_t *rwlock)
+{
+	return !!pl_cmpxchg((unsigned long *)rwlock, 0, PLOCK_LORW_SHR_BASE);
+}
+
+int pthread_rwlock_timedrdlock(pthread_rwlock_t *restrict rwlock, const struct timespec *restrict abstime)
+{
+	return pthread_rwlock_tryrdlock(rwlock);
+}
+
+int pthread_rwlock_wrlock(pthread_rwlock_t *rwlock)
+{
+	pl_lorw_wrlock((unsigned long *)rwlock);
+	return 0;
+}
+
+int pthread_rwlock_trywrlock(pthread_rwlock_t *rwlock)
+{
+	return !!pl_cmpxchg((unsigned long *)rwlock, 0, PLOCK_LORW_EXC_BASE);
+}
+
+int pthread_rwlock_timedwrlock(pthread_rwlock_t *restrict rwlock, const struct timespec *restrict abstime)
+{
+	return pthread_rwlock_trywrlock(rwlock);
+}
+
+int pthread_rwlock_unlock(pthread_rwlock_t *rwlock)
+{
+	pl_lorw_unlock((unsigned long *)rwlock);
+	return 0;
+}
+#endif // defined(USE_PTHREAD_EMULATION)
 
 /* Depending on the platform and how libpthread was built, pthread_exit() may
  * involve some code in libgcc_s that would be loaded on exit for the first
@@ -958,19 +1062,12 @@ static void __thread_init(void)
 {
 	char *ptr = NULL;
 
-	if (MAX_THREADS < 1 || MAX_THREADS > LONGBITS) {
-		ha_alert("MAX_THREADS value must be between 1 and %d inclusive; "
-		         "HAProxy was built with value %d, please fix it and rebuild.\n",
-			 LONGBITS, MAX_THREADS);
-		exit(1);
-	}
-
 	preload_libgcc_s();
 
 	thread_cpus_enabled_at_boot = thread_cpus_enabled();
 
-	memprintf(&ptr, "Built with multi-threading support (MAX_THREADS=%d, default=%d).",
-		  MAX_THREADS, thread_cpus_enabled_at_boot);
+	memprintf(&ptr, "Built with multi-threading support (MAX_TGROUPS=%d, MAX_THREADS=%d, default=%d).",
+		  MAX_TGROUPS, MAX_THREADS, thread_cpus_enabled_at_boot);
 	hap_register_build_opts(ptr, 1);
 
 #if defined(DEBUG_THREAD) || defined(DEBUG_FULL)
@@ -1103,16 +1200,17 @@ int thread_map_to_groups()
 	return 0;
 }
 
-/* converts a configuration thread group+mask to a global group+mask depending on
- * the configured thread group id. This is essentially for use with the "thread"
- * directive on "bind" lines, where "thread 2/1-3" might be turned to "4-6" for
- * the global ID. It cannot be used before the thread mapping above was completed
- * and the thread group number configured. Possible options:
+/* converts a configuration thread num or group+mask to a global group+mask
+ * depending on the configured thread group id. This is essentially for use
+ * with the "thread" directive on "bind" lines, where "thread 4-6" might be
+ * turned to "2/1-3". It cannot be used before the thread mapping above was
+ * completed and the thread group number configured. Possible options:
  *  - igid == 0: imask represents global IDs. We have to check that all
  *    configured threads in the mask belong to the same group. If imask is zero
  *    it means everything, so for now we only support this with a single group.
- *  - igid > 0, imask = 0: convert local values to global values for this thread
- *  - igid > 0, imask > 0: convert local values to global values
+ *  - igid > 0, imask = 0: convert global values to local values for this thread
+ *  - igid > 0, imask > 0: convert global values to local values
+ * Note that the output mask is always local to the group.
  *
  * Returns <0 on failure, >=0 on success.
  */
@@ -1129,13 +1227,11 @@ int thread_resolve_group_mask(uint igid, ulong imask, uint *ogid, ulong *omask, 
 				memprintf(err, "'thread' directive spans multiple groups");
 				return -1;
 			}
-			mask = 0;
 			*ogid = 1; // first and only group
-			*omask = all_threads_mask;
+			*omask = ha_tgroup_info[0].threads_enabled;
 			return 0;
 		} else {
 			/* some global threads */
-			imask &= all_threads_mask;
 			for (t = 0; t < global.nbthread; t++) {
 				if (imask & (1UL << t)) {
 					if (ha_thread_info[t].tgid != igid) {
@@ -1156,7 +1252,9 @@ int thread_resolve_group_mask(uint igid, ulong imask, uint *ogid, ulong *omask, 
 
 			/* we have a valid group, convert this to global thread IDs */
 			*ogid = igid;
-			*omask = imask << ha_tgroup_info[igid - 1].base;
+			imask = imask >> ha_tgroup_info[igid - 1].base;
+			imask &= ha_tgroup_info[igid - 1].threads_enabled;
+			*omask = imask;
 			return 0;
 		}
 	} else {
@@ -1169,15 +1267,12 @@ int thread_resolve_group_mask(uint igid, ulong imask, uint *ogid, ulong *omask, 
 		if (!imask) {
 			/* all threads of this groups. Let's make a mask from their count and base. */
 			*ogid = igid;
-			mask = 1UL << (ha_tgroup_info[igid - 1].count - 1);
-			mask |= mask - 1;
-			*omask = mask << ha_tgroup_info[igid - 1].base;
+			*omask = nbits(ha_tgroup_info[igid - 1].count);
 			return 0;
 		} else {
 			/* some local threads. Keep only existing ones for this group */
 
-			mask = 1UL << (ha_tgroup_info[igid - 1].count - 1);
-			mask |= mask - 1;
+			mask = nbits(ha_tgroup_info[igid - 1].count);
 
 			if (!(mask & imask)) {
 				/* no intersection between the thread group's
@@ -1197,8 +1292,7 @@ int thread_resolve_group_mask(uint igid, ulong imask, uint *ogid, ulong *omask, 
 #endif
 			}
 
-			mask &= imask;
-			*omask = mask << ha_tgroup_info[igid - 1].base;
+			*omask = mask & imask;
 			*ogid = igid;
 			return 0;
 		}
@@ -1234,8 +1328,6 @@ static int cfg_parse_nbthread(char **args, int section_type, struct proxy *curpx
 		memprintf(err, "'%s' value must be between 1 and %d (was %ld)", args[0], MAX_THREADS, nbthread);
 		return -1;
 	}
-
-	all_threads_mask = nbits(nbthread);
 #endif
 
 	HA_DIAG_WARNING_COND(global.nbthread,

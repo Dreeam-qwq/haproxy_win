@@ -2403,64 +2403,72 @@ static struct task *process_resolvers(struct task *t, void *context, unsigned in
 	return t;
 }
 
+
+/* destroy a resolvers */
+static void resolvers_destroy(struct resolvers *resolvers)
+{
+	struct dns_nameserver *ns, *nsback;
+	struct resolv_resolution *res, *resback;
+	struct resolv_requester  *req, *reqback;
+
+	list_for_each_entry_safe(ns, nsback, &resolvers->nameservers, list) {
+		free(ns->id);
+		free((char *)ns->conf.file);
+		if (ns->dgram) {
+			if (ns->dgram->conn.t.sock.fd != -1) {
+				fd_delete(ns->dgram->conn.t.sock.fd);
+				close(ns->dgram->conn.t.sock.fd);
+			}
+			if (ns->dgram->ring_req)
+				ring_free(ns->dgram->ring_req);
+			free(ns->dgram);
+		}
+		if (ns->stream) {
+			if (ns->stream->ring_req)
+				ring_free(ns->stream->ring_req);
+			if (ns->stream->task_req)
+				task_destroy(ns->stream->task_req);
+			if (ns->stream->task_rsp)
+				task_destroy(ns->stream->task_rsp);
+			free(ns->stream);
+		}
+		LIST_DEL_INIT(&ns->list);
+		EXTRA_COUNTERS_FREE(ns->extra_counters);
+		free(ns);
+	}
+
+	list_for_each_entry_safe(res, resback, &resolvers->resolutions.curr, list) {
+		list_for_each_entry_safe(req, reqback, &res->requesters, list) {
+			LIST_DEL_INIT(&req->list);
+			pool_free(resolv_requester_pool, req);
+		}
+		resolv_free_resolution(res);
+	}
+
+	list_for_each_entry_safe(res, resback, &resolvers->resolutions.wait, list) {
+		list_for_each_entry_safe(req, reqback, &res->requesters, list) {
+			LIST_DEL_INIT(&req->list);
+			pool_free(resolv_requester_pool, req);
+		}
+		resolv_free_resolution(res);
+	}
+
+	free_proxy(resolvers->px);
+	free(resolvers->id);
+	free((char *)resolvers->conf.file);
+	task_destroy(resolvers->t);
+	LIST_DEL_INIT(&resolvers->list);
+	free(resolvers);
+}
+
 /* Release memory allocated by DNS */
 static void resolvers_deinit(void)
 {
 	struct resolvers  *resolvers, *resolversback;
-	struct dns_nameserver *ns, *nsback;
-	struct resolv_resolution *res, *resback;
-	struct resolv_requester  *req, *reqback;
 	struct resolv_srvrq    *srvrq, *srvrqback;
 
 	list_for_each_entry_safe(resolvers, resolversback, &sec_resolvers, list) {
-		list_for_each_entry_safe(ns, nsback, &resolvers->nameservers, list) {
-			free(ns->id);
-			free((char *)ns->conf.file);
-			if (ns->dgram) {
-				if (ns->dgram->conn.t.sock.fd != -1) {
-					fd_delete(ns->dgram->conn.t.sock.fd);
-					close(ns->dgram->conn.t.sock.fd);
-				}
-				if (ns->dgram->ring_req)
-					ring_free(ns->dgram->ring_req);
-				free(ns->dgram);
-			}
-			if (ns->stream) {
-				if (ns->stream->ring_req)
-					ring_free(ns->stream->ring_req);
-				if (ns->stream->task_req)
-					task_destroy(ns->stream->task_req);
-				if (ns->stream->task_rsp)
-					task_destroy(ns->stream->task_rsp);
-				free(ns->stream);
-			}
-			LIST_DEL_INIT(&ns->list);
-			EXTRA_COUNTERS_FREE(ns->extra_counters);
-			free(ns);
-		}
-
-		list_for_each_entry_safe(res, resback, &resolvers->resolutions.curr, list) {
-			list_for_each_entry_safe(req, reqback, &res->requesters, list) {
-				LIST_DEL_INIT(&req->list);
-				pool_free(resolv_requester_pool, req);
-			}
-			resolv_free_resolution(res);
-		}
-
-		list_for_each_entry_safe(res, resback, &resolvers->resolutions.wait, list) {
-			list_for_each_entry_safe(req, reqback, &res->requesters, list) {
-				LIST_DEL_INIT(&req->list);
-				pool_free(resolv_requester_pool, req);
-			}
-			resolv_free_resolution(res);
-		}
-
-		free_proxy(resolvers->px);
-		free(resolvers->id);
-		free((char *)resolvers->conf.file);
-		task_destroy(resolvers->t);
-		LIST_DEL_INIT(&resolvers->list);
-		free(resolvers);
+		resolvers_destroy(resolvers);
 	}
 
 	list_for_each_entry_safe(srvrq, srvrqback, &resolv_srvrq_list, list) {
@@ -2501,10 +2509,10 @@ static int resolvers_finalize_config(void)
 					continue;
 				}
 				if (connect(fd, (struct sockaddr*)&ns->dgram->conn.addr.to, get_addr_len(&ns->dgram->conn.addr.to)) == -1) {
-					ha_alert("resolvers '%s': can't connect socket for nameserver '%s'.\n",
+					ha_warning("resolvers '%s': can't connect socket for nameserver '%s'.\n",
 						 resolvers->id, ns->id);
 					close(fd);
-					err_code |= (ERR_ALERT|ERR_ABORT);
+					err_code |= ERR_WARN;
 					continue;
 				}
 				close(fd);
@@ -3663,13 +3671,31 @@ int resolvers_create_default()
 {
 	int err_code = 0;
 
+	/* if the section already exists, do nothing */
 	if (find_resolvers_by_id("default"))
 		return 0;
 
+	curr_resolvers = NULL;
 	err_code |= resolvers_new(&curr_resolvers, "default", "<internal>", 0);
-	if (!(err_code & ERR_CODE))
-		err_code |= parse_resolve_conf(NULL, NULL);
+	if (err_code & ERR_CODE)
+		goto err;
+	err_code |= parse_resolve_conf(NULL, NULL);
+	if (err_code & ERR_CODE)
+		goto err;
+	/* check if there was any nameserver in the resolvconf file */
+	if (LIST_ISEMPTY(&curr_resolvers->nameservers)) {
+		err_code |= ERR_FATAL;
+		goto err;
+	}
 
+err:
+	if (err_code & ERR_CODE) {
+		resolvers_destroy(curr_resolvers);
+		curr_resolvers = NULL;
+	}
+
+	/* we never return an error there, we only try to create this section
+	 * if that's possible */
 	return 0;
 }
 
