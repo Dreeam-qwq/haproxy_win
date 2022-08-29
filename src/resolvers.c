@@ -2481,7 +2481,7 @@ static void resolvers_deinit(void)
 
 /* Finalizes the DNS configuration by allocating required resources and checking
  * live parameters.
- * Returns 0 on success, ERR_* flags otherwise.
+ * Returns 0 on success, 1 on error.
  */
 static int resolvers_finalize_config(void)
 {
@@ -2509,8 +2509,10 @@ static int resolvers_finalize_config(void)
 					continue;
 				}
 				if (connect(fd, (struct sockaddr*)&ns->dgram->conn.addr.to, get_addr_len(&ns->dgram->conn.addr.to)) == -1) {
-					ha_warning("resolvers '%s': can't connect socket for nameserver '%s'.\n",
-						 resolvers->id, ns->id);
+					if (!resolvers->conf.implicit) { /* emit a warning only if it was configured manually */
+						ha_warning("resolvers '%s': can't connect socket for nameserver '%s'.\n",
+						            resolvers->id, ns->id);
+					}
 					close(fd);
 					err_code |= ERR_WARN;
 					continue;
@@ -2594,11 +2596,11 @@ static int resolvers_finalize_config(void)
 		goto err;
 
 	leave_resolver_code();
-	return err_code;
+	return 0;
   err:
 	leave_resolver_code();
 	resolvers_deinit();
-	return err_code;
+	return 1;
 
 }
 
@@ -3671,6 +3673,9 @@ int resolvers_create_default()
 {
 	int err_code = 0;
 
+	if (global.mode & MODE_MWORKER_WAIT) /* does not create the section if in wait mode */
+		return 0;
+
 	/* if the section already exists, do nothing */
 	if (find_resolvers_by_id("default"))
 		return 0;
@@ -3679,6 +3684,9 @@ int resolvers_create_default()
 	err_code |= resolvers_new(&curr_resolvers, "default", "<internal>", 0);
 	if (err_code & ERR_CODE)
 		goto err;
+
+	curr_resolvers->conf.implicit = 1;
+
 	err_code |= parse_resolve_conf(NULL, NULL);
 	if (err_code & ERR_CODE)
 		goto err;

@@ -1480,7 +1480,6 @@ static void qc_frm_unref(struct quic_conn *qc, struct quic_frame *frm)
 			            QUIC_EV_CONN_PRSAFRM, qc, f, &f->pkt->pn_node.key);
 		}
 		else {
-			/* XXX TODO: what must be done for such a frame */
 			TRACE_DEVEL("remove frame reference for unsent frame",
 			            QUIC_EV_CONN_PRSAFRM, qc, f);
 		}
@@ -1515,8 +1514,7 @@ void qc_release_frm(struct quic_conn *qc, struct quic_frame *frm)
 			            QUIC_EV_CONN_PRSAFRM, qc, f, &pn);
 		}
 		else {
-			/* XXX TODO: what must be done for such a frame */
-			TRACE_DEVEL("mark frame as acked for unsent frame",
+			TRACE_DEVEL("mark unsend frame as acked",
 			            QUIC_EV_CONN_PRSAFRM, qc, f);
 		}
 		f->flags |= QUIC_FL_TX_FRAME_ACKED;
@@ -1960,16 +1958,16 @@ static inline void qc_release_lost_pkts(struct quic_conn *qc,
                                         uint64_t now_us)
 {
 	struct quic_tx_packet *pkt, *tmp, *oldest_lost, *newest_lost;
-	uint64_t lost_bytes;
 
 	TRACE_ENTER(QUIC_EV_CONN_PRSAFRM, qc);
 
-	lost_bytes = 0;
+	if (LIST_ISEMPTY(pkts))
+		goto leave;
+
 	oldest_lost = newest_lost = NULL;
 	list_for_each_entry_safe(pkt, tmp, pkts, list) {
 		struct list tmp = LIST_HEAD_INIT(tmp);
 
-		lost_bytes += pkt->in_flight_len;
 		pkt->pktns->tx.in_flight -= pkt->in_flight_len;
 		qc->path->prep_in_flight -= pkt->in_flight_len;
 		qc->path->in_flight -= pkt->in_flight_len;
@@ -2011,12 +2009,11 @@ static inline void qc_release_lost_pkts(struct quic_conn *qc,
 			qc->path->cc.algo->slow_start(&qc->path->cc);
 	}
 
-	if (lost_bytes) {
-		quic_tx_packet_refdec(oldest_lost);
-		if (newest_lost != oldest_lost)
-			quic_tx_packet_refdec(newest_lost);
-	}
+	quic_tx_packet_refdec(oldest_lost);
+	if (newest_lost != oldest_lost)
+		quic_tx_packet_refdec(newest_lost);
 
+ leave:
 	TRACE_LEAVE(QUIC_EV_CONN_PRSAFRM, qc);
 }
 
@@ -2124,8 +2121,7 @@ static inline int qc_parse_ack_frm(struct quic_conn *qc,
 	if (!LIST_ISEMPTY(&newly_acked_pkts)) {
 		if (!eb_is_empty(&qel->pktns->tx.pkts)) {
 			qc_packet_loss_lookup(qel->pktns, qc, &lost_pkts);
-			if (!LIST_ISEMPTY(&lost_pkts))
-				qc_release_lost_pkts(qc, qel->pktns, &lost_pkts, now_ms);
+			qc_release_lost_pkts(qc, qel->pktns, &lost_pkts, now_ms);
 		}
 		qc_treat_newly_acked_pkts(qc, &newly_acked_pkts);
 		if (quic_peer_validated_addr(qc))
@@ -2359,8 +2355,13 @@ static void qc_dup_pkt_frms(struct quic_conn *qc,
 		 */
 		origin = frm->origin ? frm->origin : frm;
 		TRACE_DEVEL("built probing frame", QUIC_EV_CONN_PRSAFRM, qc, origin);
-		TRACE_DEVEL("duplicated from packet", QUIC_EV_CONN_PRSAFRM,
-		            qc, NULL, &origin->pkt->pn_node.key);
+		if (origin->pkt)
+			TRACE_DEVEL("duplicated from packet", QUIC_EV_CONN_PRSAFRM,
+			            qc, NULL, &origin->pkt->pn_node.key);
+		else {
+			/* <origin> is a frame which was sent from a packet detected as lost. */
+			TRACE_DEVEL("duplicated from lost packet", QUIC_EV_CONN_PRSAFRM, qc);
+		}
 		*dup_frm = *origin;
 		dup_frm->pkt = NULL;
 		dup_frm->origin = origin;
@@ -3202,6 +3203,7 @@ int qc_send_ppkts(struct buffer *buf, struct ssl_sock_ctx *ctx)
 		tmpbuf.area = (char *)pos;
 		tmpbuf.size = tmpbuf.data = dglen;
 
+		TRACE_DATA("send dgram", QUIC_EV_CONN_SPPKTS, qc);
 		/* If sendto is on error just skip the call to it for the rest
 		 * of the loop but continue to purge the buffer. Data will be
 		 * transmitted when QUIC packets are detected as lost on our
@@ -3253,21 +3255,12 @@ int qc_send_ppkts(struct buffer *buf, struct ssl_sock_ctx *ctx)
 			}
 			qc->path->in_flight += pkt->in_flight_len;
 			pkt->pktns->tx.in_flight += pkt->in_flight_len;
-			next_pkt = pkt->next;
-			TRACE_DATA("sent pkt", QUIC_EV_CONN_SPPKTS, qc, pkt);
-			if (pkt->in_flight_len) {
-				/* Ack-eliciting packets or packets with a PADDING frame */
-				quic_tx_packet_refinc(pkt);
-				eb64_insert(&pkt->pktns->tx.pkts, &pkt->pn_node);
+			if (pkt->in_flight_len)
 				qc_set_timer(qc);
-			}
-			else {
-				/* Note that we can safely free this packet: There is no
-				 * ack-eliciting frame attached to it. This may be an ACK
-				 * or CONNECTION_CLOSE only packet for instance.
-				 */
-				pool_free(pool_head_quic_tx_packet, pkt);
-			}
+			TRACE_DATA("sent pkt", QUIC_EV_CONN_SPPKTS, qc, pkt);
+			next_pkt = pkt->next;
+			quic_tx_packet_refinc(pkt);
+			eb64_insert(&pkt->pktns->tx.pkts, &pkt->pn_node);
 		}
 	}
 
@@ -4557,7 +4550,8 @@ static struct task *process_timer(struct task *task, void *ctx, unsigned int sta
 
 		qc_packet_loss_lookup(pktns, qc, &lost_pkts);
 		if (!LIST_ISEMPTY(&lost_pkts))
-			qc_release_lost_pkts(qc, pktns, &lost_pkts, now_ms);
+		    tasklet_wakeup(conn_ctx->wait_event.tasklet);
+		qc_release_lost_pkts(qc, pktns, &lost_pkts, now_ms);
 		qc_set_timer(qc);
 		goto out;
 	}
@@ -4808,10 +4802,6 @@ static struct quic_conn *qc_new_conn(const struct quic_version *qv, int ipv4,
 	ictx = &qc->els[QUIC_TLS_ENC_LEVEL_INITIAL].tls_ctx;
 	if (!qc_new_isecs(qc, ictx,qc->original_version, dcid->data, dcid->len, 1))
 		goto err;
-
-	if (!quic_tls_dec_aes_ctx_init(&ictx->rx.hp_ctx, ictx->rx.hp, ictx->rx.hp_key) ||
-	    !quic_tls_enc_aes_ctx_init(&ictx->tx.hp_ctx, ictx->tx.hp, ictx->tx.hp_key))
-	    goto err;
 
 	TRACE_LEAVE(QUIC_EV_CONN_INIT, qc);
 
@@ -5795,7 +5785,7 @@ static void qc_lstnr_pkt_rcv(unsigned char *buf, const unsigned char *end,
                              struct quic_dgram *dgram, struct list **tasklist_head)
 {
 	unsigned char *beg, *payload;
-	struct quic_conn *qc, *qc_to_purge = NULL;
+	struct quic_conn *qc;
 	struct listener *l;
 	struct proxy *prx;
 	struct quic_counters *prx_counters;
@@ -5986,7 +5976,6 @@ static void qc_lstnr_pkt_rcv(unsigned char *buf, const unsigned char *end,
 		}
 		if (!qc) {
 			int ipv4;
-			struct ebmb_node *n = NULL;
 
 			if (pkt->type != QUIC_PACKET_TYPE_INITIAL) {
 				TRACE_PROTO("Non Initial packet", QUIC_EV_CONN_LPKT, NULL, NULL, NULL, qv);
@@ -6029,31 +6018,11 @@ static void qc_lstnr_pkt_rcv(unsigned char *buf, const unsigned char *end,
 
 			HA_ATOMIC_INC(&prx_counters->half_open_conn);
 			/* Insert the DCID the QUIC client has chosen (only for listeners) */
-			n = ebmb_insert(&quic_dghdlrs[tid].odcids, &qc->odcid_node,
-			                qc->odcid.len + qc->odcid.addrlen);
-
-			/* If the insertion failed, it means that another
-			 * thread has already allocated a QUIC connection for
-			 * the same CID. Liberate our allocated connection.
-			 */
-			if (unlikely(n != &qc->odcid_node)) {
-				qc_to_purge = qc;
-
-				qc = ebmb_entry(n, struct quic_conn, odcid_node);
-				pkt->qc = qc;
-			}
-
-			if (likely(!qc_to_purge)) {
-				/* Enqueue this packet. */
-				pkt->qc = qc;
-			}
-			else {
-				quic_conn_release(qc_to_purge);
-			}
+			ebmb_insert(&quic_dghdlrs[tid].odcids, &qc->odcid_node,
+			            qc->odcid.len + qc->odcid.addrlen);
 		}
-		else {
-			pkt->qc = qc;
-		}
+
+		pkt->qc = qc;
 	}
 	else {
 		TRACE_PROTO("short header packet received", QUIC_EV_CONN_LPKT, qc);
@@ -6834,14 +6803,12 @@ static int qc_do_build_pkt(unsigned char *pos, const unsigned char *end,
 				ssize_t room = end - pos;
 				TRACE_DEVEL("Not enough room", QUIC_EV_CONN_TXPKT,
 				            qc, NULL, NULL, &room);
-				/* TODO: this should not have happened except if we
-				 * are limited by the congestion control.
-				 * Note that <cf> was added from <frm_list> to <frms> list by
+				/* Note that <cf> was added from <frms> to <frm_list> list by
 				 * qc_build_frms().
 				 */
 				LIST_DELETE(&cf->list);
 				LIST_INSERT(frms, &cf->list);
-				break;
+				continue;
 			}
 
 			quic_tx_packet_refinc(pkt);
