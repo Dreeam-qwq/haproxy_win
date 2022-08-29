@@ -6,7 +6,7 @@
 # as published by the Free Software Foundation; either version
 # 2 of the License, or (at your option) any later version.
 
-name: Haproxy Windows
+name: Build Haproxy Windows
 
 on:
   push:
@@ -61,7 +61,7 @@ jobs:
           DEBUG="-DDEBUG_STRICT -DDEBUG_MEMORY_POOLS -DDEBUG_POOL_INTEGRITY" \
           ${{ join(matrix.FLAGS, ' ') }}
     - name: Upload a Build Artifact
-      uses: actions/upload-artifact@v2.3.0
+      uses: actions/upload-artifact@v3
       with:
         name: haproxy_win
         path: ./**.exe
