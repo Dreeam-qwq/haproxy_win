@@ -256,8 +256,8 @@ void ha_task_dump(struct buffer *buf, const struct task *task, const char *pfx)
 		              "%p (task) calls=%u last=%llu%s\n",
 		              task,
 		              task->calls,
-		              task->call_date ? (unsigned long long)(now_mono_time() - task->call_date) : 0,
-		              task->call_date ? " ns ago" : "");
+		              task->wake_date ? (unsigned long long)(now_mono_time() - task->wake_date) : 0,
+		              task->wake_date ? " ns ago" : "");
 
 	chunk_appendf(buf, "%s  fct=%p(", pfx, task->process);
 	resolve_sym_name(buf, NULL, task->process);
@@ -698,6 +698,15 @@ static int debug_parse_cli_tkill(char **args, char *payload, struct appctx *appc
 		ha_tkill(thr - 1, sig);
 	else
 		raise(sig);
+	return 1;
+}
+
+/* hashes 'word' in "debug dev hash 'word' ". */
+static int debug_parse_cli_hash(char **args, char *payload, struct appctx *appctx, void *private)
+{
+	char *msg = NULL;
+
+	cli_dynmsg(appctx, LOG_INFO, memprintf(&msg, "%s\n", HA_ANON_CLI(args[3])));
 	return 1;
 }
 
@@ -1294,15 +1303,15 @@ static int debug_iohandler_memstats(struct appctx *appctx)
 			if (!ptr->size && !ptr->calls && !ctx->show_all)
 				continue;
 
-			for (p = name = ptr->file; *p; p++) {
+			for (p = name = ptr->caller.file; *p; p++) {
 				if (*p == '/')
 					name = p + 1;
 			}
 
 			if (ctx->show_all)
-				w = snprintf(&tmp, 0, "%s(%s:%d) ", ptr->func, name, ptr->line);
+				w = snprintf(&tmp, 0, "%s(%s:%d) ", ptr->caller.func, name, ptr->caller.line);
 			else
-				w = snprintf(&tmp, 0, "%s:%d ", name, ptr->line);
+				w = snprintf(&tmp, 0, "%s:%d ", name, ptr->caller.line);
 
 			if (w > ctx->width)
 				ctx->width = w;
@@ -1323,14 +1332,14 @@ static int debug_iohandler_memstats(struct appctx *appctx)
 			continue;
 
 		/* basename only */
-		for (p = name = ptr->file; *p; p++) {
+		for (p = name = ptr->caller.file; *p; p++) {
 			if (*p == '/')
 				name = p + 1;
 		}
 
-		func = ptr->func;
+		func = ptr->caller.func;
 
-		switch (ptr->type) {
+		switch (ptr->caller.what) {
 		case MEM_STATS_TYPE_CALLOC:  type = "CALLOC";  break;
 		case MEM_STATS_TYPE_FREE:    type = "FREE";    break;
 		case MEM_STATS_TYPE_MALLOC:  type = "MALLOC";  break;
@@ -1351,7 +1360,7 @@ static int debug_iohandler_memstats(struct appctx *appctx)
 		if (ctx->show_all)
 			chunk_appendf(&trash, "%s(", func);
 
-		chunk_appendf(&trash, "%s:%d", name, ptr->line);
+		chunk_appendf(&trash, "%s:%d", name, ptr->caller.line);
 
 		if (ctx->show_all)
 			chunk_appendf(&trash, ")");
@@ -1627,6 +1636,8 @@ static struct cli_kw_list cli_kws = {{ },{
 	{{ "debug", "dev", "tkill", NULL },    "debug dev tkill  [thr] [sig]            : send signal to thread",                   debug_parse_cli_tkill, NULL, NULL, NULL, ACCESS_EXPERT },
 	{{ "debug", "dev", "warn",  NULL },    "debug dev warn                          : call WARN_ON() and possibly crash",       debug_parse_cli_warn,  NULL, NULL, NULL, ACCESS_EXPERT },
 	{{ "debug", "dev", "write", NULL },    "debug dev write  [size]                 : write that many bytes in return",         debug_parse_cli_write, NULL, NULL, NULL, ACCESS_EXPERT },
+	{{ "debug", "dev", "hash", NULL },     "debug dev hash  [msg]                   : return msg hashed",                       debug_parse_cli_hash, NULL, NULL, NULL, ACCESS_EXPERT },
+
 #if defined(HA_HAVE_DUMP_LIBS)
 	{{ "show", "libs", NULL, NULL },       "show libs                               : show loaded object files and libraries", debug_parse_cli_show_libs, NULL, NULL },
 #endif

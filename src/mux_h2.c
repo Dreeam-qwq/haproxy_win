@@ -24,6 +24,7 @@
 #include <haproxy/htx.h>
 #include <haproxy/istbuf.h>
 #include <haproxy/log.h>
+#include <haproxy/mux_h2-t.h>
 #include <haproxy/net_helper.h>
 #include <haproxy/session-t.h>
 #include <haproxy/stats.h>
@@ -38,64 +39,8 @@ static const struct h2s *h2_error_stream;
 static const struct h2s *h2_refused_stream;
 static const struct h2s *h2_idle_stream;
 
-/* Connection flags (32 bit), in h2c->flags */
-#define H2_CF_NONE              0x00000000
 
-/* Flags indicating why writing to the mux is blocked. */
-#define H2_CF_MUX_MALLOC        0x00000001  // mux blocked on lack of connection's mux buffer
-#define H2_CF_MUX_MFULL         0x00000002  // mux blocked on connection's mux buffer full
-#define H2_CF_MUX_BLOCK_ANY     0x00000003  // aggregate of the mux flags above
-
-/* Flags indicating why writing to the demux is blocked.
- * The first two ones directly affect the ability for the mux to receive data
- * from the connection. The other ones affect the mux's ability to demux
- * received data.
- */
-#define H2_CF_DEM_DALLOC        0x00000004  // demux blocked on lack of connection's demux buffer
-#define H2_CF_DEM_DFULL         0x00000008  // demux blocked on connection's demux buffer full
-
-#define H2_CF_DEM_MBUSY         0x00000010  // demux blocked on connection's mux side busy
-#define H2_CF_DEM_MROOM         0x00000020  // demux blocked on lack of room in mux buffer
-#define H2_CF_DEM_SALLOC        0x00000040  // demux blocked on lack of stream's request buffer
-#define H2_CF_DEM_SFULL         0x00000080  // demux blocked on stream request buffer full
-#define H2_CF_DEM_TOOMANY       0x00000100  // demux blocked waiting for some stream connectors to leave
-#define H2_CF_DEM_BLOCK_ANY     0x000001F0  // aggregate of the demux flags above except DALLOC/DFULL
-                                            // (SHORT_READ is also excluded)
-
-#define H2_CF_DEM_SHORT_READ    0x00000200  // demux blocked on incomplete frame
-#define H2_CF_DEM_IN_PROGRESS   0x00000400  // demux in progress (dsi,dfl,dft are valid)
-
-/* other flags */
-#define H2_CF_GOAWAY_SENT       0x00001000  // a GOAWAY frame was successfully sent
-#define H2_CF_GOAWAY_FAILED     0x00002000  // a GOAWAY frame failed to be sent
-#define H2_CF_WAIT_FOR_HS       0x00004000  // We did check that at least a stream was waiting for handshake
-#define H2_CF_IS_BACK           0x00008000  // this is an outgoing connection
-#define H2_CF_WINDOW_OPENED     0x00010000  // demux increased window already advertised
-#define H2_CF_RCVD_SHUT         0x00020000  // a recv() attempt already failed on a shutdown
-#define H2_CF_END_REACHED       0x00040000  // pending data too short with RCVD_SHUT present
-
-#define H2_CF_RCVD_RFC8441      0x00100000  // settings from RFC8441 has been received indicating support for Extended CONNECT
-#define H2_CF_SHTS_UPDATED      0x00200000  // SETTINGS_HEADER_TABLE_SIZE updated
-#define H2_CF_DTSU_EMITTED      0x00400000  // HPACK Dynamic Table Size Update opcode emitted
-
-/* H2 connection state, in h2c->st0 */
-enum h2_cs {
-	H2_CS_PREFACE,   // init done, waiting for connection preface
-	H2_CS_SETTINGS1, // preface OK, waiting for first settings frame
-	H2_CS_FRAME_H,   // first settings frame ok, waiting for frame header
-	H2_CS_FRAME_P,   // frame header OK, waiting for frame payload
-	H2_CS_FRAME_A,   // frame payload OK, trying to send ACK frame
-	H2_CS_FRAME_E,   // frame payload OK, trying to send RST frame
-	H2_CS_ERROR,     // send GOAWAY(errcode) and close the connection ASAP
-	H2_CS_ERROR2,    // GOAWAY(errcode) sent, close the connection ASAP
-	H2_CS_ENTRIES    // must be last
-} __attribute__((packed));
-
-
-/* 32 buffers: one for the ring's root, rest for the mbuf itself */
-#define H2C_MBUF_CNT 32
-
-/* H2 connection descriptor */
+/**** H2 connection descriptor ****/
 struct h2c {
 	struct connection *conn;
 
@@ -151,64 +96,6 @@ struct h2c {
 	struct wait_event wait_event;  /* To be used if we're waiting for I/Os */
 };
 
-/* H2 stream state, in h2s->st */
-enum h2_ss {
-	H2_SS_IDLE = 0, // idle
-	H2_SS_RLOC,     // reserved(local)
-	H2_SS_RREM,     // reserved(remote)
-	H2_SS_OPEN,     // open
-	H2_SS_HREM,     // half-closed(remote)
-	H2_SS_HLOC,     // half-closed(local)
-	H2_SS_ERROR,    // an error needs to be sent using RST_STREAM
-	H2_SS_CLOSED,   // closed
-	H2_SS_ENTRIES   // must be last
-} __attribute__((packed));
-
-#define H2_SS_MASK(state) (1UL << (state))
-#define H2_SS_IDLE_BIT    (1UL << H2_SS_IDLE)
-#define H2_SS_RLOC_BIT    (1UL << H2_SS_RLOC)
-#define H2_SS_RREM_BIT    (1UL << H2_SS_RREM)
-#define H2_SS_OPEN_BIT    (1UL << H2_SS_OPEN)
-#define H2_SS_HREM_BIT    (1UL << H2_SS_HREM)
-#define H2_SS_HLOC_BIT    (1UL << H2_SS_HLOC)
-#define H2_SS_ERROR_BIT   (1UL << H2_SS_ERROR)
-#define H2_SS_CLOSED_BIT  (1UL << H2_SS_CLOSED)
-
-/* HTTP/2 stream flags (32 bit), in h2s->flags */
-#define H2_SF_NONE              0x00000000
-#define H2_SF_ES_RCVD           0x00000001
-#define H2_SF_ES_SENT           0x00000002
-
-#define H2_SF_RST_RCVD          0x00000004 // received RST_STREAM
-#define H2_SF_RST_SENT          0x00000008 // sent RST_STREAM
-
-/* stream flags indicating the reason the stream is blocked */
-#define H2_SF_BLK_MBUSY         0x00000010 // blocked waiting for mux access (transient)
-#define H2_SF_BLK_MROOM         0x00000020 // blocked waiting for room in the mux (must be in send list)
-#define H2_SF_BLK_MFCTL         0x00000040 // blocked due to mux fctl (must be in fctl list)
-#define H2_SF_BLK_SFCTL         0x00000080 // blocked due to stream fctl (must be in blocked list)
-#define H2_SF_BLK_ANY           0x000000F0 // any of the reasons above
-
-/* stream flags indicating how data is supposed to be sent */
-#define H2_SF_DATA_CLEN         0x00000100 // data sent using content-length
-#define H2_SF_BODYLESS_RESP     0x00000200 /* Bodyless response message */
-#define H2_SF_BODY_TUNNEL       0x00000400 // Attempt to establish a Tunnelled stream (the result depends on the status code)
-
-
-#define H2_SF_NOTIFIED          0x00000800  // a paused stream was notified to try to send again
-#define H2_SF_HEADERS_SENT      0x00001000  // a HEADERS frame was sent for this stream
-#define H2_SF_OUTGOING_DATA     0x00002000  // set whenever we've seen outgoing data
-
-#define H2_SF_HEADERS_RCVD      0x00004000  // a HEADERS frame was received for this stream
-
-#define H2_SF_WANT_SHUTR        0x00008000  // a stream couldn't shutr() (mux full/busy)
-#define H2_SF_WANT_SHUTW        0x00010000  // a stream couldn't shutw() (mux full/busy)
-
-#define H2_SF_EXT_CONNECT_SENT  0x00040000  // rfc 8441 an Extended CONNECT has been sent
-#define H2_SF_EXT_CONNECT_RCVD  0x00080000  // rfc 8441 an Extended CONNECT has been received and parsed
-
-#define H2_SF_TUNNEL_ABRT       0x00100000  // A tunnel attempt was aborted
-#define H2_SF_MORE_HTX_DATA     0x00200000  // more data expected from HTX
 
 /* H2 stream descriptor, describing the stream as it appears in the H2C, and as
  * it is being processed in the internal HTTP representation (HTX).
@@ -581,38 +468,6 @@ static int h2_frt_transfer_data(struct h2s *h2s);
 struct task *h2_deferred_shut(struct task *t, void *ctx, unsigned int state);
 static struct h2s *h2c_bck_stream_new(struct h2c *h2c, struct stconn *sc, struct session *sess);
 static void h2s_alert(struct h2s *h2s);
-
-/* returns a h2c state as an abbreviated 3-letter string, or "???" if unknown */
-static inline const char *h2c_st_to_str(enum h2_cs st)
-{
-	switch (st) {
-	case H2_CS_PREFACE:   return "PRF";
-	case H2_CS_SETTINGS1: return "STG";
-	case H2_CS_FRAME_H:   return "FRH";
-	case H2_CS_FRAME_P:   return "FRP";
-	case H2_CS_FRAME_A:   return "FRA";
-	case H2_CS_FRAME_E:   return "FRE";
-	case H2_CS_ERROR:     return "ERR";
-	case H2_CS_ERROR2:    return "ER2";
-	default:              return "???";
-	}
-}
-
-/* returns a h2s state as an abbreviated 3-letter string, or "???" if unknown */
-static inline const char *h2s_st_to_str(enum h2_ss st)
-{
-	switch (st) {
-	case H2_SS_IDLE:   return "IDL"; // idle
-	case H2_SS_RLOC:   return "RSL"; // reserved local
-	case H2_SS_RREM:   return "RSR"; // reserved remote
-	case H2_SS_OPEN:   return "OPN"; // open
-	case H2_SS_HREM:   return "HCR"; // half-closed remote
-	case H2_SS_HLOC:   return "HCL"; // half-closed local
-	case H2_SS_ERROR : return "ERR"; // error
-	case H2_SS_CLOSED: return "CLO"; // closed
-	default:           return "???";
-	}
-}
 
 /* returns the stconn associated to the H2 stream */
 static forceinline struct stconn *h2s_sc(const struct h2s *h2s)
@@ -6737,17 +6592,65 @@ static size_t h2_snd_buf(struct stconn *sc, struct buffer *buf, size_t count, in
 	return total;
 }
 
-/* for debugging with CLI's "show fd" command */
-static int h2_show_fd(struct buffer *msg, struct connection *conn)
+/* appends some info about stream <h2s> to buffer <msg>, or does nothing if
+ * <h2s> is NULL. Returns non-zero if the stream is considered suspicious. May
+ * emit multiple lines, each new one being prefixed with <pfx>, if <pfx> is not
+ * NULL, otherwise a single line is used.
+ */
+static int h2_dump_h2s_info(struct buffer *msg, const struct h2s *h2s, const char *pfx)
 {
-	struct h2c *h2c = conn->ctx;
-	struct h2s *h2s = NULL;
+	int ret = 0;
+
+	if (!h2s)
+		return ret;
+
+	chunk_appendf(msg, " h2s.id=%d .st=%s .flg=0x%04x .rxbuf=%u@%p+%u/%u",
+		      h2s->id, h2s_st_to_str(h2s->st), h2s->flags,
+		      (unsigned int)b_data(&h2s->rxbuf), b_orig(&h2s->rxbuf),
+		      (unsigned int)b_head_ofs(&h2s->rxbuf), (unsigned int)b_size(&h2s->rxbuf));
+
+	if (pfx)
+		chunk_appendf(msg, "\n%s", pfx);
+
+	chunk_appendf(msg, " .sc=%p", h2s_sc(h2s));
+	if (h2s_sc(h2s))
+		chunk_appendf(msg, "(.flg=0x%08x .app=%p)",
+			      h2s_sc(h2s)->flags, h2s_sc(h2s)->app);
+
+	chunk_appendf(msg, " .sd=%p", h2s->sd);
+	chunk_appendf(msg, "(.flg=0x%08x)", se_fl_get(h2s->sd));
+
+	if (pfx)
+		chunk_appendf(msg, "\n%s", pfx);
+
+	chunk_appendf(msg, " .subs=%p", h2s->subs);
+	if (h2s->subs) {
+		chunk_appendf(msg, "(ev=%d tl=%p", h2s->subs->events, h2s->subs->tasklet);
+		chunk_appendf(msg, " tl.calls=%d tl.ctx=%p tl.fct=",
+			      h2s->subs->tasklet->calls,
+			      h2s->subs->tasklet->context);
+		if (h2s->subs->tasklet->calls >= 1000000)
+			ret = 1;
+		resolve_sym_name(msg, NULL, h2s->subs->tasklet->process);
+		chunk_appendf(msg, ")");
+	}
+	return ret;
+}
+
+/* appends some info about connection <h2c> to buffer <msg>, or does nothing if
+ * <h2c> is NULL. Returns non-zero if the connection is considered suspicious.
+ * May emit multiple lines, each new one being prefixed with <pfx>, if <pfx> is
+ * not NULL, otherwise a single line is used.
+ */
+static int h2_dump_h2c_info(struct buffer *msg, struct h2c *h2c, const char *pfx)
+{
+	const struct buffer *hmbuf, *tmbuf;
+	const struct h2s *h2s = NULL;
 	struct eb32_node *node;
 	int fctl_cnt = 0;
 	int send_cnt = 0;
 	int tree_cnt = 0;
 	int orph_cnt = 0;
-	struct buffer *hmbuf, *tmbuf;
 	int ret = 0;
 
 	if (!h2c)
@@ -6759,7 +6662,6 @@ static int h2_show_fd(struct buffer *msg, struct connection *conn)
 	list_for_each_entry(h2s, &h2c->send_list, list)
 		send_cnt++;
 
-	h2s = NULL;
 	node = eb32_first(&h2c->streams_by_id);
 	while (node) {
 		h2s = container_of(node, struct h2s, by_id);
@@ -6772,14 +6674,25 @@ static int h2_show_fd(struct buffer *msg, struct connection *conn)
 	hmbuf = br_head(h2c->mbuf);
 	tmbuf = br_tail(h2c->mbuf);
 	chunk_appendf(msg, " h2c.st0=%s .err=%d .maxid=%d .lastid=%d .flg=0x%04x"
-		      " .nbst=%u .nbcs=%u .fctl_cnt=%d .send_cnt=%d .tree_cnt=%d"
-		      " .orph_cnt=%d .sub=%d .dsi=%d .dbuf=%u@%p+%u/%u .msi=%d"
-		      " .mbuf=[%u..%u|%u],h=[%u@%p+%u/%u],t=[%u@%p+%u/%u]",
+		      " .nbst=%u .nbsc=%u",
 		      h2c_st_to_str(h2c->st0), h2c->errcode, h2c->max_id, h2c->last_sid, h2c->flags,
-		      h2c->nb_streams, h2c->nb_sc, fctl_cnt, send_cnt, tree_cnt, orph_cnt,
+		      h2c->nb_streams, h2c->nb_sc);
+
+	if (pfx)
+		chunk_appendf(msg, "\n%s", pfx);
+
+	chunk_appendf(msg, " .fctl_cnt=%d .send_cnt=%d .tree_cnt=%d"
+		      " .orph_cnt=%d .sub=%d .dsi=%d .dbuf=%u@%p+%u/%u",
+		      fctl_cnt, send_cnt, tree_cnt, orph_cnt,
 		      h2c->wait_event.events, h2c->dsi,
 		      (unsigned int)b_data(&h2c->dbuf), b_orig(&h2c->dbuf),
-		      (unsigned int)b_head_ofs(&h2c->dbuf), (unsigned int)b_size(&h2c->dbuf),
+		      (unsigned int)b_head_ofs(&h2c->dbuf), (unsigned int)b_size(&h2c->dbuf));
+
+	if (pfx)
+		chunk_appendf(msg, "\n%s", pfx);
+
+	chunk_appendf(msg, " .msi=%d"
+		      " .mbuf=[%u..%u|%u],h=[%u@%p+%u/%u],t=[%u@%p+%u/%u]",
 		      h2c->msi,
 		      br_head_idx(h2c->mbuf), br_tail_idx(h2c->mbuf), br_size(h2c->mbuf),
 		      (unsigned int)b_data(hmbuf), b_orig(hmbuf),
@@ -6787,31 +6700,52 @@ static int h2_show_fd(struct buffer *msg, struct connection *conn)
 		      (unsigned int)b_data(tmbuf), b_orig(tmbuf),
 		      (unsigned int)b_head_ofs(tmbuf), (unsigned int)b_size(tmbuf));
 
-	if (h2s) {
-		chunk_appendf(msg, " last_h2s=%p .id=%d .st=%s .flg=0x%04x .rxbuf=%u@%p+%u/%u .sc=%p",
-			      h2s, h2s->id, h2s_st_to_str(h2s->st), h2s->flags,
-			      (unsigned int)b_data(&h2s->rxbuf), b_orig(&h2s->rxbuf),
-			      (unsigned int)b_head_ofs(&h2s->rxbuf), (unsigned int)b_size(&h2s->rxbuf),
-			      h2s_sc(h2s));
-		if (h2s_sc(h2s))
-			chunk_appendf(msg, "(.flg=0x%08x .app=%p)",
-				      h2s_sc(h2s)->flags, h2s_sc(h2s)->app);
 
-		chunk_appendf(msg, "sd=%p", h2s->sd);
-		chunk_appendf(msg, "(.flg=0x%08x)", se_fl_get(h2s->sd));
+	return ret;
+}
 
-		chunk_appendf(&trash, " .subs=%p", h2s->subs);
-		if (h2s->subs) {
-			chunk_appendf(&trash, "(ev=%d tl=%p", h2s->subs->events, h2s->subs->tasklet);
-			chunk_appendf(&trash, " tl.calls=%d tl.ctx=%p tl.fct=",
-				      h2s->subs->tasklet->calls,
-				      h2s->subs->tasklet->context);
-			if (h2s->subs->tasklet->calls >= 1000000)
-				ret = 1;
-			resolve_sym_name(&trash, NULL, h2s->subs->tasklet->process);
-			chunk_appendf(&trash, ")");
-		}
+/* for debugging with CLI's "show fd" command */
+static int h2_show_fd(struct buffer *msg, struct connection *conn)
+{
+	struct h2c *h2c = conn->ctx;
+	const struct h2s *h2s;
+	struct eb32_node *node;
+	int ret = 0;
+
+	if (!h2c)
+		return ret;
+
+	ret |= h2_dump_h2c_info(msg, h2c, NULL);
+
+	node = eb32_last(&h2c->streams_by_id);
+	if (node) {
+		h2s = container_of(node, struct h2s, by_id);
+		chunk_appendf(msg, " last_h2s=%p", h2s);
+		ret |= h2_dump_h2s_info(msg, h2s, NULL);
 	}
+
+	return ret;
+}
+
+/* for debugging with CLI's "show sess" command. May emit multiple lines, each
+ * new one being prefixed with <pfx>, if <pfx> is not NULL, otherwise a single
+ * line is used. Each field starts with a space so it's safe to print it after
+ * existing fields.
+ */
+static int h2_show_sd(struct buffer *msg, struct sedesc *sd, const char *pfx)
+{
+	struct h2s *h2s = sd->se;
+	int ret = 0;
+
+	if (!h2s)
+		return ret;
+
+	chunk_appendf(msg, " h2s=%p", h2s);
+	ret |= h2_dump_h2s_info(msg, h2s, pfx);
+	if (pfx)
+		chunk_appendf(msg, "\n%s", pfx);
+	chunk_appendf(msg, " h2c=%p", h2s->h2c);
+	ret |= h2_dump_h2c_info(msg, h2s->h2c, pfx);
 	return ret;
 }
 
@@ -6966,6 +6900,7 @@ static const struct mux_ops h2_ops = {
 	.shutw = h2_shutw,
 	.ctl = h2_ctl,
 	.show_fd = h2_show_fd,
+	.show_sd = h2_show_sd,
 	.takeover = h2_takeover,
 	.flags = MX_FL_HTX|MX_FL_HOL_RISK|MX_FL_NO_UPG,
 	.name = "H2",

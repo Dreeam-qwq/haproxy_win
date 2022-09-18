@@ -23,6 +23,7 @@
 #include <haproxy/htx.h>
 #include <haproxy/istbuf.h>
 #include <haproxy/log.h>
+#include <haproxy/mux_h1-t.h>
 #include <haproxy/pipe-t.h>
 #include <haproxy/proxy.h>
 #include <haproxy/session-t.h>
@@ -30,70 +31,6 @@
 #include <haproxy/stconn.h>
 #include <haproxy/stream.h>
 #include <haproxy/trace.h>
-
-/*
- *  H1 Connection flags (32 bits)
- */
-#define H1C_F_NONE           0x00000000
-
-/* Flags indicating why writing output data are blocked */
-#define H1C_F_OUT_ALLOC      0x00000001 /* mux is blocked on lack of output buffer */
-#define H1C_F_OUT_FULL       0x00000002 /* mux is blocked on output buffer full */
-/* 0x00000004 - 0x00000008 unused */
-
-/* Flags indicating why reading input data are blocked. */
-#define H1C_F_IN_ALLOC       0x00000010 /* mux is blocked on lack of input buffer */
-#define H1C_F_IN_FULL        0x00000020 /* mux is blocked on input buffer full */
-#define H1C_F_IN_SALLOC      0x00000040 /* mux is blocked on lack of stream's request buffer */
-
-/* Flags indicating the connection state */
-#define H1C_F_ST_EMBRYONIC   0x00000100 /* Set when a H1 stream with no stream connector is attached to the connection */
-#define H1C_F_ST_ATTACHED    0x00000200 /* Set when a H1 stream with a stream connector is attached to the connection (may be not READY) */
-#define H1C_F_ST_IDLE        0x00000400 /* connection is idle and may be reused
-					 * (exclusive to all H1C_F_ST flags and never set when an h1s is attached) */
-#define H1C_F_ST_ERROR       0x00000800 /* connection must be closed ASAP because an error occurred (stream connector may still be attached) */
-#define H1C_F_ST_SHUTDOWN    0x00001000 /* connection must be shut down ASAP flushing output first (stream connector may still be attached) */
-#define H1C_F_ST_READY       0x00002000 /* Set in ATTACHED state with a READY stream connector. A stream connector is not ready when
-					 * a TCP>H1 upgrade is in progress Thus this flag is only set if ATTACHED is also set */
-#define H1C_F_ST_ALIVE       (H1C_F_ST_IDLE|H1C_F_ST_EMBRYONIC|H1C_F_ST_ATTACHED)
-#define H1C_F_ST_SILENT_SHUT 0x00004000 /* silent (or dirty) shutdown must be performed (implied ST_SHUTDOWN) */
-/* 0x00008000 unused */
-
-#define H1C_F_WANT_SPLICE    0x00010000 /* Don't read into a buffer because we want to use or we are using splicing */
-#define H1C_F_ERR_PENDING    0x00020000 /* Send an error and close the connection ASAP (implies H1C_F_ST_ERROR) */
-#define H1C_F_WAIT_NEXT_REQ  0x00040000 /*  waiting for the next request to start, use keep-alive timeout */
-#define H1C_F_UPG_H2C        0x00080000 /* set if an upgrade to h2 should be done */
-#define H1C_F_CO_MSG_MORE    0x00100000 /* set if CO_SFL_MSG_MORE must be set when calling xprt->snd_buf() */
-#define H1C_F_CO_STREAMER    0x00200000 /* set if CO_SFL_STREAMER must be set when calling xprt->snd_buf() */
-
-/* 0x00400000 - 0x40000000 unusued*/
-#define H1C_F_IS_BACK        0x80000000 /* Set on outgoing connection */
-
-/*
- * H1 Stream flags (32 bits)
- */
-#define H1S_F_NONE           0x00000000
-
-#define H1S_F_RX_BLK         0x00100000 /* Don't process more input data, waiting sync with output side */
-#define H1S_F_TX_BLK         0x00200000 /* Don't process more output data, waiting sync with input side */
-#define H1S_F_RX_CONGESTED   0x00000004 /* Cannot process input data RX path is congested (waiting for more space in channel's buffer) */
-
-#define H1S_F_REOS           0x00000008 /* End of input stream seen even if not delivered yet */
-#define H1S_F_WANT_KAL       0x00000010
-#define H1S_F_WANT_TUN       0x00000020
-#define H1S_F_WANT_CLO       0x00000040
-#define H1S_F_WANT_MSK       0x00000070
-#define H1S_F_NOT_FIRST      0x00000080 /* The H1 stream is not the first one */
-#define H1S_F_BODYLESS_RESP  0x00000100 /* Bodyless response message */
-
-/* 0x00000200 unused */
-#define H1S_F_NOT_IMPL_ERROR 0x00000400 /* Set when a feature is not implemented during the message parsing */
-#define H1S_F_PARSING_ERROR  0x00000800 /* Set when an error occurred during the message parsing */
-#define H1S_F_PROCESSING_ERROR 0x00001000 /* Set when an error occurred during the message xfer */
-#define H1S_F_ERROR          0x00001800 /* stream error mask */
-
-#define H1S_F_HAVE_SRV_NAME  0x00002000 /* Set during output process if the server name header was added to the request */
-#define H1S_F_HAVE_O_CONN    0x00004000 /* Set during output process to know connection mode was processed */
 
 /* H1 connection descriptor */
 struct h1c {
@@ -737,9 +674,6 @@ static struct stconn *h1s_new_sc(struct h1s *h1s, struct buffer *input)
 		goto err;
 	}
 
-	HA_ATOMIC_INC(&h1c->px_counters->open_streams);
-	HA_ATOMIC_INC(&h1c->px_counters->total_streams);
-
 	h1c->flags = (h1c->flags & ~H1C_F_ST_EMBRYONIC) | H1C_F_ST_ATTACHED | H1C_F_ST_READY;
 	TRACE_LEAVE(H1_EV_STRM_NEW, h1c->conn, h1s);
 	return h1s_sc(h1s);
@@ -836,6 +770,9 @@ static struct h1s *h1c_frt_stream_new(struct h1c *h1c, struct stconn *sc, struct
 
 	if (h1c->px->options2 & PR_O2_REQBUG_OK)
 		h1s->req.err_pos = -1;
+
+	HA_ATOMIC_INC(&h1c->px_counters->open_streams);
+	HA_ATOMIC_INC(&h1c->px_counters->total_streams);
 
 	h1c->idle_exp = TICK_ETERNITY;
 	h1_set_idle_expiration(h1c);
@@ -3315,6 +3252,9 @@ static int h1_attach(struct connection *conn, struct sedesc *sd, struct session 
 	struct h1c *h1c = conn->ctx;
 	struct h1s *h1s;
 
+	/* this connection is no more idle (if it was at all) */
+	h1c->flags &= ~H1C_F_ST_SILENT_SHUT;
+
 	TRACE_ENTER(H1_EV_STRM_NEW, conn);
 	if (h1c->flags & H1C_F_ST_ERROR) {
 		TRACE_ERROR("h1c on error", H1_EV_STRM_NEW|H1_EV_STRM_END|H1_EV_STRM_ERR, conn);
@@ -3390,6 +3330,11 @@ static void h1_detach(struct sedesc *sd)
 	h1s_destroy(h1s);
 
 	if ((h1c->flags & (H1C_F_IS_BACK|H1C_F_ST_IDLE)) == (H1C_F_IS_BACK|H1C_F_ST_IDLE)) {
+		/* this connection may be killed at any moment, we want it to
+		 * die "cleanly" (i.e. only an RST).
+		 */
+		h1c->flags |= H1C_F_ST_SILENT_SHUT;
+
 		/* If there are any excess server data in the input buffer,
 		 * release it and close the connection ASAP (some data may
 		 * remain in the output buffer). This happens if a server sends
@@ -3893,6 +3838,77 @@ static int h1_ctl(struct connection *conn, enum mux_ctl_type mux_ctl, void *outp
 	}
 }
 
+/* appends some info about connection <h1c> to buffer <msg>, or does nothing if
+ * <h1c> is NULL. Returns non-zero if the connection is considered suspicious.
+ * May emit multiple lines, each new one being prefixed with <pfx>, if <pfx> is
+ * not NULL, otherwise a single line is used.
+ */
+static int h1_dump_h1c_info(struct buffer *msg, struct h1c *h1c, const char *pfx)
+{
+	int ret = 0;
+
+	if (!h1c)
+		return ret;
+
+	chunk_appendf(msg, " h1c.flg=0x%x .sub=%d .ibuf=%u@%p+%u/%u .obuf=%u@%p+%u/%u",
+		      h1c->flags,  h1c->wait_event.events,
+		      (unsigned int)b_data(&h1c->ibuf), b_orig(&h1c->ibuf),
+		      (unsigned int)b_head_ofs(&h1c->ibuf), (unsigned int)b_size(&h1c->ibuf),
+		      (unsigned int)b_data(&h1c->obuf), b_orig(&h1c->obuf),
+		      (unsigned int)b_head_ofs(&h1c->obuf), (unsigned int)b_size(&h1c->obuf));
+	return ret;
+}
+
+/* appends some info about stream <h1s> to buffer <msg>, or does nothing if
+ * <h1s> is NULL. Returns non-zero if the stream is considered suspicious. May
+ * emit multiple lines, each new one being prefixed with <pfx>, if <pfx> is not
+ * NULL, otherwise a single line is used.
+ */
+static int h1_dump_h1s_info(struct buffer *msg, const struct h1s *h1s, const char *pfx)
+{
+	const char *method;
+	int ret = 0;
+
+	if (!h1s)
+		return ret;
+
+	if (h1s->meth < HTTP_METH_OTHER)
+		method = http_known_methods[h1s->meth].ptr;
+	else
+		method = "UNKNOWN";
+
+	chunk_appendf(msg, " h1s=%p h1s.flg=0x%x .sd.flg=0x%x .req.state=%s .res.state=%s",
+		      h1s, h1s->flags, se_fl_get(h1s->sd),
+		      h1m_state_str(h1s->req.state), h1m_state_str(h1s->res.state));
+
+	if (pfx)
+		chunk_appendf(msg, "\n%s", pfx);
+
+	chunk_appendf(msg, " .meth=%s status=%d",
+		      method, h1s->status);
+
+	chunk_appendf(msg, " .sd.flg=0x%08x", se_fl_get(h1s->sd));
+	if (!se_fl_test(h1s->sd, SE_FL_ORPHAN))
+		chunk_appendf(msg, " .sc.flg=0x%08x .sc.app=%p",
+			      h1s_sc(h1s)->flags, h1s_sc(h1s)->app);
+
+	if (pfx && h1s->subs)
+		chunk_appendf(msg, "\n%s", pfx);
+
+	chunk_appendf(msg, " .subs=%p", h1s->subs);
+	if (h1s->subs) {
+		chunk_appendf(msg, "(ev=%d tl=%p", h1s->subs->events, h1s->subs->tasklet);
+		chunk_appendf(msg, " tl.calls=%d tl.ctx=%p tl.fct=",
+			      h1s->subs->tasklet->calls,
+			      h1s->subs->tasklet->context);
+		if (h1s->subs->tasklet->calls >= 1000000)
+			ret = 1;
+		resolve_sym_name(msg, NULL, h1s->subs->tasklet->process);
+		chunk_appendf(msg, ")");
+	}
+	return ret;
+}
+
 /* for debugging with CLI's "show fd" command */
 static int h1_show_fd(struct buffer *msg, struct connection *conn)
 {
@@ -3900,43 +3916,32 @@ static int h1_show_fd(struct buffer *msg, struct connection *conn)
 	struct h1s *h1s = h1c->h1s;
 	int ret = 0;
 
-	chunk_appendf(msg, " h1c.flg=0x%x .sub=%d .ibuf=%u@%p+%u/%u .obuf=%u@%p+%u/%u",
-		      h1c->flags,  h1c->wait_event.events,
-		      (unsigned int)b_data(&h1c->ibuf), b_orig(&h1c->ibuf),
-		      (unsigned int)b_head_ofs(&h1c->ibuf), (unsigned int)b_size(&h1c->ibuf),
-		       (unsigned int)b_data(&h1c->obuf), b_orig(&h1c->obuf),
-		      (unsigned int)b_head_ofs(&h1c->obuf), (unsigned int)b_size(&h1c->obuf));
+	ret |= h1_dump_h1c_info(msg, h1c, NULL);
 
-	if (h1s) {
-		char *method;
+	if (h1s)
+		ret |= h1_dump_h1s_info(msg, h1s, NULL);
 
-		if (h1s->meth < HTTP_METH_OTHER)
-			method = http_known_methods[h1s->meth].ptr;
-		else
-			method = "UNKNOWN";
-		chunk_appendf(msg, " h1s=%p h1s.flg=0x%x .sd.flg=0x%x .req.state=%s .res.state=%s"
-		    " .meth=%s status=%d",
-			      h1s, h1s->flags, se_fl_get(h1s->sd),
-			      h1m_state_str(h1s->req.state),
-			      h1m_state_str(h1s->res.state), method, h1s->status);
+	return ret;
+}
 
-		chunk_appendf(msg, " .sd.flg=0x%08x", se_fl_get(h1s->sd));
-		if (!se_fl_test(h1s->sd, SE_FL_ORPHAN))
-			chunk_appendf(msg, " .sc.flg=0x%08x .sc.app=%p",
-				      h1s_sc(h1s)->flags, h1s_sc(h1s)->app);
+/* for debugging with CLI's "show sess" command. May emit multiple lines, each
+ * new one being prefixed with <pfx>, if <pfx> is not NULL, otherwise a single
+ * line is used. Each field starts with a space so it's safe to print it after
+ * existing fields.
+ */
+static int h1_show_sd(struct buffer *msg, struct sedesc *sd, const char *pfx)
+{
+	struct h1s *h1s = sd->se;
+	int ret = 0;
 
-		chunk_appendf(&trash, " .subs=%p", h1s->subs);
-		if (h1s->subs) {
-			chunk_appendf(&trash, "(ev=%d tl=%p", h1s->subs->events, h1s->subs->tasklet);
-			chunk_appendf(&trash, " tl.calls=%d tl.ctx=%p tl.fct=",
-				      h1s->subs->tasklet->calls,
-				      h1s->subs->tasklet->context);
-			if (h1s->subs->tasklet->calls >= 1000000)
-				ret = 1;
-			resolve_sym_name(&trash, NULL, h1s->subs->tasklet->process);
-			chunk_appendf(&trash, ")");
-		}
-	}
+	if (!h1s)
+		return ret;
+
+	ret |= h1_dump_h1s_info(msg, h1s, pfx);
+	if (pfx)
+		chunk_appendf(msg, "\n%s", pfx);
+	chunk_appendf(msg, " h1c=%p", h1s->h1c);
+	ret |= h1_dump_h1c_info(msg, h1s->h1c, pfx);
 	return ret;
 }
 
@@ -4225,6 +4230,7 @@ static const struct mux_ops mux_http_ops = {
 	.shutr       = h1_shutr,
 	.shutw       = h1_shutw,
 	.show_fd     = h1_show_fd,
+	.show_sd     = h1_show_sd,
 	.ctl         = h1_ctl,
 	.takeover    = h1_takeover,
 	.flags       = MX_FL_HTX,
@@ -4251,6 +4257,7 @@ static const struct mux_ops mux_h1_ops = {
 	.shutr       = h1_shutr,
 	.shutw       = h1_shutw,
 	.show_fd     = h1_show_fd,
+	.show_sd     = h1_show_sd,
 	.ctl         = h1_ctl,
 	.takeover    = h1_takeover,
 	.flags       = MX_FL_HTX|MX_FL_NO_UPG,

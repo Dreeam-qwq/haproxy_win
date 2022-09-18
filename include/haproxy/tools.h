@@ -45,6 +45,8 @@
 #include <haproxy/namespace-t.h>
 #include <haproxy/protocol-t.h>
 #include <haproxy/tools-t.h>
+#include <haproxy/xxhash.h>
+#include <haproxy/cli.h>
 
 /****** string-specific macros and functions ******/
 /* if a > max, then bound <a> to <max>. The macro returns the new <a> */
@@ -54,6 +56,22 @@
 #define LBOUND(a, min)	({ typeof(a) b = (min); if ((a) < b) (a) = b; (a); })
 
 #define SWAP(a, b) do { typeof(a) t; t = a; a = b; b = t; } while(0)
+
+/* return the hash of a string and length for a given key. All keys are valid. */
+#define HA_ANON(key, str, len) (XXH32(str, len, key) & 0xFFFFFF)
+
+/* use if you want to return a simple hash. Key 0 doesn't hash. */
+#define HA_ANON_STR(key, str) hash_anon(key, str, "", "")
+
+/* use if you want to return a hash like : IP('hash'). Key 0 doesn't hash. */
+#define HA_ANON_ID(key, str) hash_anon(key, str, "ID(", ")")
+
+/* use if you want to return a hash like : PATH('hash'). Key 0 doesn't hash. */
+#define HA_ANON_PATH(key, str) hash_anon(key, str, "PATH(", ")")
+
+/* use only in a function that contains an appctx (key comes from appctx). */
+#define HA_ANON_CLI(str) hash_anon(appctx->cli_anon_key, str, "", "")
+
 
 /*
  * copies at most <size-1> chars from <src> to <dst>. Last char is always
@@ -479,6 +497,12 @@ int url_decode(char *string, int in_form);
 unsigned int inetaddr_host(const char *text);
 unsigned int inetaddr_host_lim(const char *text, const char *stop);
 unsigned int inetaddr_host_lim_ret(char *text, char *stop, char **ret);
+
+/* Function that hashes or not a string according to the anonymizing key (scramble). */
+const char *hash_anon(uint32_t scramble, const char *string2hash, const char *prefix, const char *suffix);
+
+/* Function that hashes or not an ip according to the ipstring entered */
+const char * hash_ipanon(uint32_t scramble, char *ipstring);
 
 static inline char *cut_crlf(char *s) {
 
@@ -1069,6 +1093,47 @@ static inline uint statistical_prng_range(uint range)
 {
 	return mul32hi(statistical_prng(), range ? range - 1 : 0);
 }
+
+/* returns a hash on <bits> bits of pointer <p> that is suitable for being used
+ * to compute statistic buckets, in that it's fast and reasonably distributed
+ * thanks to mixing the bits via a multiplication by a prime number and using
+ * the middle bits on 64-bit platforms or remixing the topmost with lowest ones
+ * on 32-bit. It provides ~2588 unique values (~1510 non-colliding) at 100%
+ * fill ratio for 12 bits, ~1296 (~756 non-colliding) at 100% fill ratio for 11
+ * bits, ~648 (~378 non-colliding) at 100% fill ratio for 10 bits, ~163 (95 non
+ * colliding) at 100% fill ratio for 8 bits, hence 1-1/e and 1/e respectively.
+ * It must be inlined so that <bits> is always a compile-time constant.
+ */
+static forceinline uint ptr_hash(const void *p, const int bits)
+{
+	unsigned long long x = (unsigned long)p;
+
+	x *= 0xc1da9653U;
+	if (sizeof(long) == 4)
+		x ^= x >> 32;
+	else
+		x >>= 33 - bits / 2;
+	return x & (~0U >> (-bits & 31));
+}
+
+/* Same as above but works on two pointers. It will return the same values
+ * if the second pointer is NULL.
+ */
+static forceinline uint ptr2_hash(const void *p1, const void *p2, const int bits)
+{
+	unsigned long long x = (unsigned long)p1;
+	unsigned long long y = (unsigned long)p2;
+
+	x *= 0xc1da9653U;
+	y *= 0x96531cadU;
+	x ^= y;
+	if (sizeof(long) == 4)
+		x ^= x >> 32;
+	else
+		x >>= 33 - bits / 2;
+	return x & (~0U >> (-bits & 31));
+}
+
 
 /* Update array <fp> with the character transition <prev> to <curr>. If <prev>
  * is zero, it's assumed that <curr> is the first character. If <curr> is zero

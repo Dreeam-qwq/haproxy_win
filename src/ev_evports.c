@@ -178,9 +178,7 @@ static void _do_poll(struct poller *p, int exp, int wake)
 	thread_idle_now();
 	thread_harmless_now();
 
-	/*
-	 * Determine how long to wait for events to materialise on the port.
-	 */
+	/* Now let's wait for polled events. */
 	wait_time = wake ? 0 : compute_poll_timeout(exp);
 	clock_entering_poll();
 
@@ -218,8 +216,6 @@ static void _do_poll(struct poller *p, int exp, int wake)
 		if (nevlist || interrupted)
 			break;
 		if (timeout || !wait_time)
-			break;
-		if (signal_queue_len || wake)
 			break;
 		if (tick_isset(exp) && tick_is_expired(exp, now_ms))
 			break;

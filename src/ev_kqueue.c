@@ -166,7 +166,7 @@ static void _do_poll(struct poller *p, int exp, int wake)
 	}
 	fd_nbupdt = 0;
 
-	/* now let's wait for events */
+	/* Now let's wait for polled events. */
 	wait_time = wake ? 0 : compute_poll_timeout(exp);
 	fd = global.tune.maxpollevents;
 	clock_entering_poll();
@@ -190,8 +190,6 @@ static void _do_poll(struct poller *p, int exp, int wake)
 			break;
 		}
 		if (timeout || !wait_time)
-			break;
-		if (signal_queue_len || wake)
 			break;
 		if (tick_isset(exp) && tick_is_expired(exp, now_ms))
 			break;

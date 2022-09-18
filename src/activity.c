@@ -21,14 +21,14 @@
 #include <haproxy/sc_strm.h>
 #include <haproxy/stconn.h>
 #include <haproxy/tools.h>
-#include <haproxy/xxhash.h>
 
 /* CLI context for the "show profiling" command */
 struct show_prof_ctx {
 	int dump_step;  /* 0,1,2,4,5,6; see cli_iohandler_show_profiling() */
 	int linenum;    /* next line to be dumped (starts at 0) */
 	int maxcnt;     /* max line count per step (0=not set)  */
-	int by_addr;    /* 0=sort by usage, 1=sort by address   */
+	int by_what;    /* 0=sort by usage, 1=sort by address, 2=sort by time */
+	int aggr;       /* 0=dump raw, 1=aggregate on callee    */
 };
 
 #if defined(DEBUG_MEM_STATS)
@@ -46,8 +46,8 @@ unsigned int profiling __read_mostly = HA_PROF_TASKS_AOFF;
 /* One struct per thread containing all collected measurements */
 struct activity activity[MAX_THREADS] __attribute__((aligned(64))) = { };
 
-/* One struct per function pointer hash entry (256 values, 0=collision) */
-struct sched_activity sched_activity[256] __attribute__((aligned(64))) = { };
+/* One struct per function pointer hash entry (SCHED_ACT_HASH_BUCKETS values, 0=collision) */
+struct sched_activity sched_activity[SCHED_ACT_HASH_BUCKETS] __attribute__((aligned(64))) = { };
 
 
 #ifdef USE_MEMORY_PROFILING
@@ -61,21 +61,6 @@ struct memprof_stats memprof_stats[MEMPROF_HASH_BUCKETS + 1] = { };
 
 /* used to detect recursive calls */
 static THREAD_LOCAL int in_memprof = 0;
-
-/* perform a pointer hash by scrambling its bits and retrieving the most
- * mixed ones (topmost ones in 32-bit, middle ones in 64-bit).
- */
-static unsigned int memprof_hash_ptr(const void *p)
-{
-	unsigned long long x = (unsigned long)p;
-
-	x = 0xcbda9653U * x;
-	if (sizeof(long) == 4)
-		x >>= 32;
-	else
-		x >>= 33 - MEMPROF_HASH_BITS / 2;
-	return x & (MEMPROF_HASH_BUCKETS - 1);
-}
 
 /* These ones are used by glibc and will be called early. They are in charge of
  * initializing the handlers with the original functions.
@@ -186,7 +171,7 @@ struct memprof_stats *memprof_get_bin(const void *ra, enum memprof_method meth)
 	const void *old;
 	unsigned int bin;
 
-	bin = memprof_hash_ptr(ra);
+	bin = ptr_hash(ra, MEMPROF_HASH_BITS);
 	for (; memprof_stats[bin].caller != ra; bin = (bin + 1) & (MEMPROF_HASH_BUCKETS - 1)) {
 		if (!--retries) {
 			bin = MEMPROF_HASH_BUCKETS;
@@ -456,11 +441,12 @@ static int cli_parse_set_profiling(char **args, char *payload, struct appctx *ap
 		while (!_HA_ATOMIC_CAS(&profiling, &old, (old & ~HA_PROF_TASKS_MASK) | HA_PROF_TASKS_ON))
 			;
 		/* also flush current profiling stats */
-		for (i = 0; i < 256; i++) {
+		for (i = 0; i < SCHED_ACT_HASH_BUCKETS; i++) {
 			HA_ATOMIC_STORE(&sched_activity[i].calls, 0);
 			HA_ATOMIC_STORE(&sched_activity[i].cpu_time, 0);
 			HA_ATOMIC_STORE(&sched_activity[i].lat_time, 0);
 			HA_ATOMIC_STORE(&sched_activity[i].func, NULL);
+			HA_ATOMIC_STORE(&sched_activity[i].caller, NULL);
 		}
 	}
 	else if (strcmp(args[3], "auto") == 0) {
@@ -498,6 +484,7 @@ static int cmp_sched_activity_calls(const void *a, const void *b)
 		return 0;
 }
 
+/* sort by address first, then by call count */
 static int cmp_sched_activity_addr(const void *a, const void *b)
 {
 	const struct sched_activity *l = (const struct sched_activity *)a;
@@ -506,6 +493,28 @@ static int cmp_sched_activity_addr(const void *a, const void *b)
 	if (l->func > r->func)
 		return -1;
 	else if (l->func < r->func)
+		return 1;
+	else if (l->calls > r->calls)
+		return -1;
+	else if (l->calls < r->calls)
+		return 1;
+	else
+		return 0;
+}
+
+/* sort by cpu time first, then by inverse call count (to spot highest offenders) */
+static int cmp_sched_activity_cpu(const void *a, const void *b)
+{
+	const struct sched_activity *l = (const struct sched_activity *)a;
+	const struct sched_activity *r = (const struct sched_activity *)b;
+
+	if (l->cpu_time > r->cpu_time)
+		return -1;
+	else if (l->cpu_time < r->cpu_time)
+		return 1;
+	else if (l->calls < r->calls)
+		return -1;
+	else if (l->calls > r->calls)
 		return 1;
 	else
 		return 0;
@@ -540,28 +549,40 @@ static int cmp_memprof_addr(const void *a, const void *b)
 }
 #endif // USE_MEMORY_PROFILING
 
-/* Computes the index of function pointer <func> for use with sched_activity[]
- * or any other similar array passed in <array>, and returns a pointer to the
- * entry after having atomically assigned it to this function pointer. Note
- * that in case of collision, the first entry is returned instead ("other").
+/* Computes the index of function pointer <func> and caller <caller> for use
+ * with sched_activity[] or any other similar array passed in <array>, and
+ * returns a pointer to the entry after having atomically assigned it to this
+ * function pointer and caller combination. Note that in case of collision,
+ * the first entry is returned instead ("other").
  */
-struct sched_activity *sched_activity_entry(struct sched_activity *array, const void *func)
+struct sched_activity *sched_activity_entry(struct sched_activity *array, const void *func, const void *caller)
 {
-	uint64_t hash = XXH64_avalanche(XXH64_mergeRound((size_t)func, (size_t)func));
+	uint32_t hash = ptr2_hash(func, caller, SCHED_ACT_HASH_BITS);
 	struct sched_activity *ret;
-	const void *old = NULL;
+	const void *old;
+	int tries = 16;
 
-	hash ^= (hash >> 32);
-	hash ^= (hash >> 16);
-	hash ^= (hash >> 8);
-	hash &= 0xff;
-	ret = &array[hash];
+	for (tries = 16; tries > 0; tries--, hash++) {
+		ret = &array[hash];
 
-	if (likely(ret->func == func))
-		return ret;
+		while (1) {
+			if (likely(ret->func)) {
+				if (likely(ret->func == func && ret->caller == caller))
+					return ret;
+				break;
+			}
 
-	if (HA_ATOMIC_CAS(&ret->func, &old, func))
-		return ret;
+			/* try to create the new entry. Func is sufficient to
+			 * reserve the node.
+			 */
+			old = NULL;
+			if (HA_ATOMIC_CAS(&ret->func, &old, func)) {
+				ret->caller = caller;
+				return ret;
+			}
+			/* changed in parallel, check again */
+		}
+	}
 
 	return array;
 }
@@ -584,7 +605,7 @@ struct sched_activity *sched_activity_entry(struct sched_activity *array, const 
 static int cli_io_handler_show_profiling(struct appctx *appctx)
 {
 	struct show_prof_ctx *ctx = appctx->svcctx;
-	struct sched_activity tmp_activity[256] __attribute__((aligned(64)));
+	struct sched_activity tmp_activity[SCHED_ACT_HASH_BUCKETS] __attribute__((aligned(64)));
 #ifdef USE_MEMORY_PROFILING
 	struct memprof_stats tmp_memstats[MEMPROF_HASH_BUCKETS + 1];
 	unsigned long long tot_alloc_calls, tot_free_calls;
@@ -592,9 +613,10 @@ static int cli_io_handler_show_profiling(struct appctx *appctx)
 #endif
 	struct stconn *sc = appctx_sc(appctx);
 	struct buffer *name_buffer = get_trash_chunk();
+	const struct ha_caller *caller;
 	const char *str;
 	int max_lines;
-	int i, max;
+	int i, j, max;
 
 	if (unlikely(sc_ic(sc)->flags & (CF_WRITE_ERROR|CF_SHUTW)))
 		return 1;
@@ -630,10 +652,26 @@ static int cli_io_handler_show_profiling(struct appctx *appctx)
 		goto skip_tasks;
 
 	memcpy(tmp_activity, sched_activity, sizeof(tmp_activity));
-	if (ctx->by_addr)
-		qsort(tmp_activity, 256, sizeof(tmp_activity[0]), cmp_sched_activity_addr);
-	else
-		qsort(tmp_activity, 256, sizeof(tmp_activity[0]), cmp_sched_activity_calls);
+	/* for addr sort and for callee aggregation we have to first sort by address */
+	if (ctx->aggr || ctx->by_what == 1) // sort by addr
+		qsort(tmp_activity, SCHED_ACT_HASH_BUCKETS, sizeof(tmp_activity[0]), cmp_sched_activity_addr);	
+
+	if (ctx->aggr) {
+		/* merge entries for the same callee and reset their count */
+		for (i = j = 0; i < SCHED_ACT_HASH_BUCKETS; i = j) {
+			for (j = i + 1; j < SCHED_ACT_HASH_BUCKETS && tmp_activity[j].func == tmp_activity[i].func; j++) {
+				tmp_activity[i].calls    += tmp_activity[j].calls;
+				tmp_activity[i].cpu_time += tmp_activity[j].cpu_time;
+				tmp_activity[i].lat_time += tmp_activity[j].lat_time;
+				tmp_activity[j].calls = 0;
+			}
+		}
+	}
+
+	if (!ctx->by_what) // sort by usage
+		qsort(tmp_activity, SCHED_ACT_HASH_BUCKETS, sizeof(tmp_activity[0]), cmp_sched_activity_calls);
+	else if (ctx->by_what == 2) // by cpu_tot
+		qsort(tmp_activity, SCHED_ACT_HASH_BUCKETS, sizeof(tmp_activity[0]), cmp_sched_activity_cpu);
 
 	if (!ctx->linenum)
 		chunk_appendf(&trash, "Tasks activity:\n"
@@ -641,11 +679,15 @@ static int cli_io_handler_show_profiling(struct appctx *appctx)
 
 	max_lines = ctx->maxcnt;
 	if (!max_lines)
-		max_lines = 256;
+		max_lines = SCHED_ACT_HASH_BUCKETS;
 
-	for (i = ctx->linenum; i < max_lines && tmp_activity[i].calls; i++) {
+	for (i = ctx->linenum; i < max_lines; i++) {
+		if (!tmp_activity[i].calls)
+			continue; // skip aggregated or empty entries
+
 		ctx->linenum = i;
 		chunk_reset(name_buffer);
+		caller = HA_ATOMIC_LOAD(&tmp_activity[i].caller);
 
 		if (!tmp_activity[i].func)
 			chunk_printf(name_buffer, "other");
@@ -663,7 +705,14 @@ static int cli_io_handler_show_profiling(struct appctx *appctx)
 		print_time_short(&trash, "   ", tmp_activity[i].cpu_time, "");
 		print_time_short(&trash, "   ", tmp_activity[i].cpu_time / tmp_activity[i].calls, "");
 		print_time_short(&trash, "   ", tmp_activity[i].lat_time, "");
-		print_time_short(&trash, "   ", tmp_activity[i].lat_time / tmp_activity[i].calls, "\n");
+		print_time_short(&trash, "   ", tmp_activity[i].lat_time / tmp_activity[i].calls, "");
+
+		if (caller && !ctx->aggr && caller->what <= WAKEUP_TYPE_APPCTX_WAKEUP)
+			chunk_appendf(&trash, " <- %s@%s:%d %s",
+				      caller->func, caller->file, caller->line,
+				      task_wakeup_type_str(caller->what));
+
+		b_putchr(&trash, '\n');
 
 		if (applet_putchk(appctx, &trash) == -1) {
 			/* failed, try again */
@@ -687,7 +736,7 @@ static int cli_io_handler_show_profiling(struct appctx *appctx)
 		goto skip_mem;
 
 	memcpy(tmp_memstats, memprof_stats, sizeof(tmp_memstats));
-	if (ctx->by_addr)
+	if (ctx->by_what)
 		qsort(tmp_memstats, MEMPROF_HASH_BUCKETS+1, sizeof(tmp_memstats[0]), cmp_memprof_addr);
 	else
 		qsort(tmp_memstats, MEMPROF_HASH_BUCKETS+1, sizeof(tmp_memstats[0]), cmp_memprof_stats);
@@ -797,13 +846,19 @@ static int cli_parse_show_profiling(char **args, char *payload, struct appctx *a
 			ctx->dump_step = 6; // will visit memory only
 		}
 		else if (strcmp(args[arg], "byaddr") == 0) {
-			ctx->by_addr = 1; // sort output by address instead of usage
+			ctx->by_what = 1; // sort output by address instead of usage
+		}
+		else if (strcmp(args[arg], "bytime") == 0) {
+			ctx->by_what = 2; // sort output by total time instead of usage
+		}
+		else if (strcmp(args[arg], "aggr") == 0) {
+			ctx->aggr = 1;    // aggregate output by callee
 		}
 		else if (isdigit((unsigned char)*args[arg])) {
 			ctx->maxcnt = atoi(args[arg]); // number of entries to dump
 		}
 		else
-			return cli_err(appctx, "Expects either 'all', 'status', 'tasks', 'memory', 'byaddr' or a max number of output lines.\n");
+			return cli_err(appctx, "Expects either 'all', 'status', 'tasks', 'memory', 'byaddr', 'bytime', 'aggr' or a max number of output lines.\n");
 	}
 	return 0;
 }
@@ -814,7 +869,7 @@ static int cli_parse_show_profiling(char **args, char *payload, struct appctx *a
  */
 static int cli_io_handler_show_tasks(struct appctx *appctx)
 {
-	struct sched_activity tmp_activity[256] __attribute__((aligned(64)));
+	struct sched_activity tmp_activity[SCHED_ACT_HASH_BUCKETS] __attribute__((aligned(64)));
 	struct stconn *sc = appctx_sc(appctx);
 	struct buffer *name_buffer = get_trash_chunk();
 	struct sched_activity *entry;
@@ -854,9 +909,9 @@ static int cli_io_handler_show_tasks(struct appctx *appctx)
 		rqnode = eb32_first(&ha_thread_ctx[thr].rqueue_shared);
 		while (rqnode) {
 			t = eb32_entry(rqnode, struct task, rq);
-			entry = sched_activity_entry(tmp_activity, t->process);
-			if (t->call_date) {
-				lat = now_ns - t->call_date;
+			entry = sched_activity_entry(tmp_activity, t->process, NULL);
+			if (t->wake_date) {
+				lat = now_ns - t->wake_date;
 				if ((int64_t)lat > 0)
 					entry->lat_time += lat;
 			}
@@ -871,9 +926,9 @@ static int cli_io_handler_show_tasks(struct appctx *appctx)
 		rqnode = eb32_first(&ha_thread_ctx[thr].rqueue);
 		while (rqnode) {
 			t = eb32_entry(rqnode, struct task, rq);
-			entry = sched_activity_entry(tmp_activity, t->process);
-			if (t->call_date) {
-				lat = now_ns - t->call_date;
+			entry = sched_activity_entry(tmp_activity, t->process, NULL);
+			if (t->wake_date) {
+				lat = now_ns - t->wake_date;
 				if ((int64_t)lat > 0)
 					entry->lat_time += lat;
 			}
@@ -884,9 +939,9 @@ static int cli_io_handler_show_tasks(struct appctx *appctx)
 		/* shared tasklet list */
 		list_for_each_entry(tl, mt_list_to_list(&ha_thread_ctx[thr].shared_tasklet_list), list) {
 			t = (const struct task *)tl;
-			entry = sched_activity_entry(tmp_activity, t->process);
-			if (!TASK_IS_TASKLET(t) && t->call_date) {
-				lat = now_ns - t->call_date;
+			entry = sched_activity_entry(tmp_activity, t->process, NULL);
+			if (!TASK_IS_TASKLET(t) && t->wake_date) {
+				lat = now_ns - t->wake_date;
 				if ((int64_t)lat > 0)
 					entry->lat_time += lat;
 			}
@@ -897,9 +952,9 @@ static int cli_io_handler_show_tasks(struct appctx *appctx)
 		for (queue = 0; queue < TL_CLASSES; queue++) {
 			list_for_each_entry(tl, &ha_thread_ctx[thr].tasklets[queue], list) {
 				t = (const struct task *)tl;
-				entry = sched_activity_entry(tmp_activity, t->process);
-				if (!TASK_IS_TASKLET(t) && t->call_date) {
-					lat = now_ns - t->call_date;
+				entry = sched_activity_entry(tmp_activity, t->process, NULL);
+				if (!TASK_IS_TASKLET(t) && t->wake_date) {
+					lat = now_ns - t->wake_date;
 					if ((int64_t)lat > 0)
 						entry->lat_time += lat;
 				}
@@ -914,16 +969,16 @@ static int cli_io_handler_show_tasks(struct appctx *appctx)
 	chunk_reset(&trash);
 
 	tot_calls = 0;
-	for (i = 0; i < 256; i++)
+	for (i = 0; i < SCHED_ACT_HASH_BUCKETS; i++)
 		tot_calls += tmp_activity[i].calls;
 
-	qsort(tmp_activity, 256, sizeof(tmp_activity[0]), cmp_sched_activity_calls);
+	qsort(tmp_activity, SCHED_ACT_HASH_BUCKETS, sizeof(tmp_activity[0]), cmp_sched_activity_calls);
 
 	chunk_appendf(&trash, "Running tasks: %d (%d threads)\n"
 		      "  function                     places     %%    lat_tot   lat_avg\n",
 		      (int)tot_calls, global.nbthread);
 
-	for (i = 0; i < 256 && tmp_activity[i].calls; i++) {
+	for (i = 0; i < SCHED_ACT_HASH_BUCKETS && tmp_activity[i].calls; i++) {
 		chunk_reset(name_buffer);
 
 		if (!tmp_activity[i].func)
@@ -966,7 +1021,7 @@ INITCALL1(STG_REGISTER, cfg_register_keywords, &cfg_kws);
 /* register cli keywords */
 static struct cli_kw_list cli_kws = {{ },{
 	{ { "set",  "profiling", NULL }, "set profiling <what> {auto|on|off}      : enable/disable resource profiling (tasks,memory)", cli_parse_set_profiling,  NULL },
-	{ { "show", "profiling", NULL }, "show profiling [<what>|<#lines>|byaddr]*: show profiling state (all,status,tasks,memory)",   cli_parse_show_profiling, cli_io_handler_show_profiling, NULL },
+	{ { "show", "profiling", NULL }, "show profiling [<what>|<#lines>|<opts>]*: show profiling state (all,status,tasks,memory)",   cli_parse_show_profiling, cli_io_handler_show_profiling, NULL },
 	{ { "show", "tasks", NULL },     "show tasks                              : show running tasks",                               NULL, cli_io_handler_show_tasks,     NULL },
 	{{},}
 }};

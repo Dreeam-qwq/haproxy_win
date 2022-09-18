@@ -140,9 +140,9 @@ static inline __attribute((always_inline)) void ha_crash_now(void)
 #  define CHECK_IF(cond)     _BUG_ON_ONCE(cond, __FILE__, __LINE__, 1, "FATAL: check ",   "")
 # endif
 #else
-#  define BUG_ON(cond)
-#  define WARN_ON(cond)
-#  define CHECK_IF(cond)
+#  define BUG_ON(cond)       do { } while (0)
+#  define WARN_ON(cond)      do { } while (0)
+#  define CHECK_IF(cond)     do { } while (0)
 #endif
 
 /* These macros are only for hot paths and remain disabled unless DEBUG_STRICT is 2 or above.
@@ -164,8 +164,8 @@ static inline __attribute((always_inline)) void ha_crash_now(void)
 #  define CHECK_IF_HOT(cond) _BUG_ON_ONCE(cond, __FILE__, __LINE__, 1, "FATAL: check ",   "")
 # endif
 #else
-#  define BUG_ON_HOT(cond)
-#  define CHECK_IF_HOT(cond)
+#  define BUG_ON_HOT(cond)   do { } while (0)
+#  define CHECK_IF_HOT(cond) do { } while (0)
 #endif
 
 
@@ -193,6 +193,23 @@ static inline __attribute((always_inline)) void ha_crash_now(void)
 		*__x = NULL;						\
 	} while (0)
 
+/* describes a call place in the code, for example for tracing memory
+ * allocations or task wakeups. These must be declared static const.
+ */
+struct ha_caller {
+	const char *func;  // function name
+	const char *file;  // file name
+	uint16_t line;     // line number
+	uint8_t what;      // description of the call, usage specific
+	uint8_t arg8;      // optional argument, usage specific
+	uint32_t arg32;    // optional argument, usage specific
+};
+
+#define MK_CALLER(_what, _arg8, _arg32)					\
+	({ static const struct ha_caller _ = {				\
+		.func = __func__, .file = __FILE__, .line = __LINE__,	\
+		.what = _what, .arg8 = _arg8, .arg32 = _arg32 };	\
+		&_; })
 
 /* handle 'tainted' status */
 enum tainted_flags {
@@ -242,10 +259,7 @@ enum {
 struct mem_stats {
 	size_t calls;
 	size_t size;
-	const char *func;
-	const char *file;
-	int line;
-	int type;
+	struct ha_caller caller;
 	const void *extra; // extra info specific to this call (e.g. pool ptr)
 } __attribute__((aligned(sizeof(void*))));
 
@@ -253,9 +267,11 @@ struct mem_stats {
 #define calloc(x,y)  ({							\
 	size_t __x = (x); size_t __y = (y);				\
 	static struct mem_stats _ __attribute__((used,__section__("mem_stats"),__aligned__(sizeof(void*)))) = { \
-		.file = __FILE__, .line = __LINE__,			\
-		.type = MEM_STATS_TYPE_CALLOC,				\
-		.func = __func__,					\
+		.caller = {						\
+			.file = __FILE__, .line = __LINE__,		\
+			.what = MEM_STATS_TYPE_CALLOC,			\
+			.func = __func__,				\
+		},							\
 	};								\
 	HA_WEAK("__start_mem_stats");					\
 	HA_WEAK("__stop_mem_stats");					\
@@ -274,9 +290,11 @@ struct mem_stats {
 #define will_free(x, y)  ({						\
 	void *__x = (x); size_t __y = (y);				\
 	static struct mem_stats _ __attribute__((used,__section__("mem_stats"),__aligned__(sizeof(void*)))) = { \
-		.file = __FILE__, .line = __LINE__,			\
-		.type = MEM_STATS_TYPE_FREE,				\
-		.func = __func__,					\
+		.caller = {						\
+			.file = __FILE__, .line = __LINE__,		\
+			.what = MEM_STATS_TYPE_FREE,			\
+			.func = __func__,				\
+		},							\
 	};								\
 	HA_WEAK("__start_mem_stats");					\
 	HA_WEAK("__stop_mem_stats");					\
@@ -290,9 +308,11 @@ struct mem_stats {
 #define ha_free(x)  ({							\
 	typeof(x) __x = (x);						\
 	static struct mem_stats _ __attribute__((used,__section__("mem_stats"),__aligned__(sizeof(void*)))) = { \
-		.file = __FILE__, .line = __LINE__,			\
-		.type = MEM_STATS_TYPE_FREE,				\
-		.func = __func__,					\
+		.caller = {						\
+			.file = __FILE__, .line = __LINE__,		\
+			.what = MEM_STATS_TYPE_FREE,			\
+			.func = __func__,				\
+		},							\
 	};								\
 	HA_WEAK("__start_mem_stats");					\
 	HA_WEAK("__stop_mem_stats");					\
@@ -309,9 +329,11 @@ struct mem_stats {
 #define malloc(x)  ({							\
 	size_t __x = (x);						\
 	static struct mem_stats _ __attribute__((used,__section__("mem_stats"),__aligned__(sizeof(void*)))) = { \
-		.file = __FILE__, .line = __LINE__,			\
-		.type = MEM_STATS_TYPE_MALLOC,				\
-		.func = __func__,					\
+		.caller = {						\
+			.file = __FILE__, .line = __LINE__,		\
+			.what = MEM_STATS_TYPE_MALLOC,			\
+			.func = __func__,				\
+		},							\
 	};								\
 	HA_WEAK("__start_mem_stats");					\
 	HA_WEAK("__stop_mem_stats");					\
@@ -324,9 +346,11 @@ struct mem_stats {
 #define realloc(x,y)  ({						\
 	void *__x = (x); size_t __y = (y);				\
 	static struct mem_stats _ __attribute__((used,__section__("mem_stats"),__aligned__(sizeof(void*)))) = { \
-		.file = __FILE__, .line = __LINE__,			\
-		.type = MEM_STATS_TYPE_REALLOC,				\
-		.func = __func__,					\
+		.caller = {						\
+			.file = __FILE__, .line = __LINE__,		\
+			.what = MEM_STATS_TYPE_REALLOC,			\
+			.func = __func__,				\
+		},							\
 	};								\
 	HA_WEAK("__start_mem_stats");					\
 	HA_WEAK("__stop_mem_stats");					\
@@ -339,9 +363,11 @@ struct mem_stats {
 #define strdup(x)  ({							\
 	const char *__x = (x); size_t __y = strlen(__x); 		\
 	static struct mem_stats _ __attribute__((used,__section__("mem_stats"),__aligned__(sizeof(void*)))) = { \
-		.file = __FILE__, .line = __LINE__,			\
-		.type = MEM_STATS_TYPE_STRDUP,				\
-		.func = __func__,					\
+		.caller = {						\
+			.file = __FILE__, .line = __LINE__,		\
+			.what = MEM_STATS_TYPE_STRDUP,			\
+			.func = __func__,				\
+		},							\
 	};								\
 	HA_WEAK("__start_mem_stats");					\
 	HA_WEAK("__stop_mem_stats");					\

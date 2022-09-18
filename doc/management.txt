@@ -204,6 +204,15 @@ list of options is :
     in foreground and to show incoming and outgoing events. It must never be
     used in an init script.
 
+  -dC[key] : dump the configuration file. It is performed after the lines are
+    tokenized, so comments are stripped and indenting is forced. If a non-zero
+    key is specified, lines are truncated before sensitive/confidential fields,
+    and identifiers and addresses are emitted hashed with this key using the
+    same algorithmm as the one used by the anonymized mode on the CLI. This
+    means that the output may safely be shared with a developer who needs it
+    to figure what's happening in a dump that was anonymized using the same
+    key. Please also see the CLI's "set anon" command.
+
   -dD : enable diagnostic mode. This mode will output extra warnings about
     suspicious configuration statements. This will never prevent startup even in
     "zero-warning" mode nor change the exit status code.
@@ -2191,9 +2200,30 @@ prompt
 quit
   Close the connection when in interactive mode.
 
+set anon [on|off] [<key>]
+  This command enables or disables the "anonymized mode" for the current CLI
+  session, which replaces certain fields considered sensitive or confidential
+  in command outputs with hashes that preserve sufficient consistency between
+  elements to help developers identify relations between elements when trying
+  to spot bugs, but a low enough bit count (24) to make them non-reversible due
+  to the high number of possible matches. When turned on, if no key is
+  specified, the global key will be used (either specified in the configuration
+  file by "anonkey" or set via the CLI command "set global-key"). If no such
+  key was set, a random one will be generated. Otherwise it's possible to
+  specify the 32-bit key to be used for the current session, for example, to
+  reuse the key that was used in a previous dump to help compare outputs.
+  Developers will never need this key and it's recommended never to share it as
+  it could allow to confirm/infirm some guesses about what certain hashes could
+  be hiding.
+
 set dynamic-cookie-key backend <backend> <value>
   Modify the secret key used to generate the dynamic persistent cookies.
   This will break the existing sessions.
+
+set global-key <key>
+  This sets the global anonymizing key to <key>, which must be a 32-bit
+  integer between 0 and 4294967295 (0 disables the global key). This command
+  requires admin privilege.
 
 set map <map> [<key>|#<ref>] <value>
   Modify the value corresponding to each key <key> in a map <map>. <map> is the
@@ -2473,6 +2503,10 @@ show acl [[@<ver>] <acl>]
   these patterns can be shared with maps. The 'entry_cnt' value represents the
   count of all the ACL entries, not just the active ones, which means that it
   also includes entries currently being added.
+
+show anon
+  Display the current state of the anonymized mode (enabled or disabled) and
+  the current session's key.
 
 show backend
   Dump the list of backends available in the running process
@@ -2866,7 +2900,7 @@ show pools
   as the SIGQUIT when running in foreground except that it does not flush
   the pools.
 
-show profiling [{all | status | tasks | memory}] [byaddr] [<max_lines>]
+show profiling [{all | status | tasks | memory}] [byaddr|bytime|aggr|<max_lines>]*
   Dumps the current profiling settings, one per line, as well as the command
   needed to change them. When tasks profiling is enabled, some per-function
   statistics collected by the scheduler will also be emitted, with a summary
@@ -2877,8 +2911,10 @@ show profiling [{all | status | tasks | memory}] [byaddr] [<max_lines>]
   profiling by specifying the respective keywords; by default all profiling
   information are dumped. It is also possible to limit the number of lines
   of output of each category by specifying a numeric limit. If is possible to
-  request that the output is sorted by address instead of usage, e.g. to ease
-  comparisons between subsequent calls. Please note that profiling is
+  request that the output is sorted by address or by total execution time
+  instead of usage, e.g. to ease comparisons between subsequent calls or to
+  check what needs to be optimized, and to aggregate task activity by called
+  function instead of seeing the details. Please note that profiling is
   essentially aimed at developers since it gives hints about where CPU cycles
   or memory are wasted in the code. There is nothing useful to monitor there.
 

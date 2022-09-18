@@ -41,6 +41,9 @@
 
 struct list sink_list = LIST_HEAD_INIT(sink_list);
 
+/* sink proxies list */
+struct proxy *sink_proxies_list;
+
 struct sink *cfg_sink;
 
 struct sink *sink_find(const char *name)
@@ -287,7 +290,7 @@ static int cli_parse_show_events(char **args, char *payload, struct appctx *appc
 void sink_setup_proxy(struct proxy *px)
 {
 	px->last_change = now.tv_sec;
-	px->cap = PR_CAP_FE | PR_CAP_BE;
+	px->cap = PR_CAP_FE | PR_CAP_BE | PR_CAP_INT;
 	px->maxconn = 0;
 	px->conn_retries = 1;
 	px->timeout.server = TICK_ETERNITY;
@@ -295,6 +298,8 @@ void sink_setup_proxy(struct proxy *px)
 	px->timeout.connect = TICK_ETERNITY;
 	px->accept = NULL;
 	px->options2 |= PR_O2_INDEPSTR | PR_O2_SMARTCON | PR_O2_SMARTACC;
+	px->next = sink_proxies_list;
+	sink_proxies_list = px;
 }
 
 /*
@@ -751,6 +756,54 @@ int sink_init_forward(struct sink *sink)
 	task_wakeup(sink->forward_task, TASK_WOKEN_INIT);
 	return 1;
 }
+
+/* This tries to rotate a file-backed ring, but only if it contains contents.
+ * This way empty rings will not cause backups to be overwritten and it's safe
+ * to reload multiple times. That's only best effort, failures are silently
+ * ignored.
+ */
+void sink_rotate_file_backed_ring(const char *name)
+{
+	struct ring ring;
+	char *oldback;
+	int ret;
+	int fd;
+
+	fd = open(name, O_RDONLY);
+	if (fd < 0)
+		return;
+
+	/* check for contents validity */
+	ret = read(fd, &ring, sizeof(ring));
+	close(fd);
+
+	if (ret != sizeof(ring))
+		goto rotate;
+
+	/* contents are present, we want to keep them => rotate. Note that
+	 * an empty ring buffer has one byte (the marker).
+	 */
+	if (ring.buf.data > 1)
+		goto rotate;
+
+	/* nothing to keep, let's scratch the file and preserve the backup */
+	return;
+
+ rotate:
+	oldback = NULL;
+	memprintf(&oldback, "%s.bak", name);
+	if (oldback) {
+		/* try to rename any possibly existing ring file to
+		 * ".bak" and delete remains of older ones. This will
+		 * ensure we don't wipe useful debug info upon restart.
+		 */
+		unlink(oldback);
+		if (rename(name, oldback) < 0)
+			unlink(oldback);
+		ha_free(&oldback);
+	}
+}
+
 /*
  * Parse "ring" section and create corresponding sink buffer.
  *
@@ -846,7 +899,6 @@ int cfg_parse_ring(const char *file, int linenum, char **args, int kwm)
 		 * for ring <ring>. Existing data are delete. NULL is returned on error.
 		 */
 		const char *backing = args[1];
-		char *oldback;
 		size_t size;
 		void *area;
 		int fd;
@@ -863,18 +915,12 @@ int cfg_parse_ring(const char *file, int linenum, char **args, int kwm)
 			goto err;
 		}
 
-		oldback = NULL;
-		memprintf(&oldback, "%s.bak", backing);
-		if (oldback) {
-			/* try to rename any possibly existing ring file to
-			 * ".bak" and delete remains of older ones. This will
-			 * ensure we don't wipe useful debug info upon restart.
-			 */
-			unlink(oldback);
-			if (rename(backing, oldback) < 0)
-				unlink(oldback);
-			ha_free(&oldback);
-		}
+		/* let's check if the file exists and is not empty. That's the
+		 * only condition under which we'll trigger a rotate, so that
+		 * config checks, reloads, or restarts that don't emit anything
+		 * do not rotate it again.
+		 */
+		sink_rotate_file_backed_ring(backing);
 
 		fd = open(backing, O_RDWR | O_CREAT, 0600);
 		if (fd < 0) {
@@ -1182,13 +1228,6 @@ int cfg_post_parse_ring()
 			srv = cfg_sink->forward_px->srv;
 			while (srv) {
 				struct sink_forward_target *sft;
-				/* init ssl if needed */
-				if (srv->use_ssl == 1 && xprt_get(XPRT_SSL) && xprt_get(XPRT_SSL)->prepare_srv) {
-					if (xprt_get(XPRT_SSL)->prepare_srv(srv)) {
-						ha_alert("unable to prepare SSL for server '%s' in ring '%s'.\n", srv->id, cfg_sink->name);
-						err_code |= ERR_ALERT | ERR_FATAL;
-					}
-				}
 
 				/* allocate sink_forward_target descriptor */
 				sft = calloc(1, sizeof(*sft));

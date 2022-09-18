@@ -638,7 +638,8 @@ SSL *ssl_sock_get_ssl_object(struct connection *conn)
  * if the debug mode and the verbose mode are activated. It dump all
  * the SSL error until the stack was empty.
  */
-static forceinline void ssl_sock_dump_errors(struct connection *conn)
+static forceinline void ssl_sock_dump_errors(struct connection *conn,
+                                             struct quic_conn *qc)
 {
 	unsigned long ret;
 
@@ -650,9 +651,18 @@ static forceinline void ssl_sock_dump_errors(struct connection *conn)
 			ret = ERR_get_error();
 			if (ret == 0)
 				return;
-			fprintf(stderr, "fd[%#x] OpenSSL error[0x%lx] %s: %s\n",
-			        conn_fd(conn), ret,
-			        func, ERR_reason_error_string(ret));
+			if (conn) {
+				fprintf(stderr, "fd[%#x] OpenSSL error[0x%lx] %s: %s\n",
+				        conn_fd(conn), ret,
+				        func, ERR_reason_error_string(ret));
+			}
+#ifdef USE_QUIC
+			else {
+				/* TODO: we are not sure <conn> is always initialized for QUIC connections */
+				fprintf(stderr, "qc @%p OpenSSL error[0x%lx] %s: %s\n", qc, ret,
+				        func, ERR_reason_error_string(ret));
+			}
+#endif
 		}
 	}
 }
@@ -1154,15 +1164,28 @@ static int ssl_hmac_init(MAC_CTX *hctx, unsigned char *key, int key_len, const E
 
 static int ssl_tlsext_ticket_key_cb(SSL *s, unsigned char key_name[16], unsigned char *iv, EVP_CIPHER_CTX *ectx, MAC_CTX *hctx, int enc)
 {
-	struct tls_keys_ref *ref;
+	struct tls_keys_ref *ref = NULL;
 	union tls_sess_key *keys;
-	struct connection *conn;
 	int head;
 	int i;
 	int ret = -1; /* error by default */
+	struct connection *conn = SSL_get_ex_data(s, ssl_app_data_index);
+#ifdef USE_QUIC
+	struct quic_conn *qc = SSL_get_ex_data(s, ssl_qc_app_data_index);
+#endif
 
-	conn = SSL_get_ex_data(s, ssl_app_data_index);
-	ref  = __objt_listener(conn->target)->bind_conf->keys_ref;
+	if (conn)
+		ref  = __objt_listener(conn->target)->bind_conf->keys_ref;
+#ifdef USE_QUIC
+	else if (qc)
+		ref =  qc->li->bind_conf->keys_ref;
+#endif
+
+	if (!ref) {
+		/* must never happen */
+		ABORT_NOW();
+	}
+
 	HA_RWLOCK_RDLOCK(TLSKEYS_REF_LOCK, &ref->lock);
 
 	keys = ref->tlskeys;
@@ -1686,16 +1709,36 @@ int ssl_sock_bind_verifycbk(int ok, X509_STORE_CTX *x_store)
 {
 	SSL *ssl;
 	struct connection *conn;
-	struct ssl_sock_ctx *ctx;
+	struct ssl_sock_ctx *ctx = NULL;
 	int err, depth;
 	X509 *client_crt;
 	STACK_OF(X509) *certs;
+	struct bind_conf *bind_conf;
+	struct quic_conn *qc = NULL;
 
 	ssl = X509_STORE_CTX_get_ex_data(x_store, SSL_get_ex_data_X509_STORE_CTX_idx());
 	conn = SSL_get_ex_data(ssl, ssl_app_data_index);
 	client_crt = SSL_get_ex_data(ssl, ssl_client_crt_ref_index);
 
-	ctx = __conn_get_ssl_sock_ctx(conn);
+	if (conn) {
+		bind_conf = __objt_listener(conn->target)->bind_conf;
+		ctx = __conn_get_ssl_sock_ctx(conn);
+	}
+#ifdef USE_QUIC
+	else {
+		qc = SSL_get_ex_data(ssl, ssl_qc_app_data_index);
+		if (qc) {
+			bind_conf = qc->li->bind_conf;
+			ctx = qc->xprt_ctx;
+		}
+	}
+#endif
+
+	if (!ctx || !bind_conf) {
+		/* Must never happen */
+		ABORT_NOW();
+	}
+
 	ctx->xprt_st |= SSL_SOCK_ST_FL_VERIFY_DONE;
 
 	depth = X509_STORE_CTX_get_error_depth(x_store);
@@ -1738,13 +1781,12 @@ int ssl_sock_bind_verifycbk(int ok, X509_STORE_CTX *x_store)
 			ctx->xprt_st |= SSL_SOCK_CAEDEPTH_TO_ST(depth);
 		}
 
-		if (err < 64 && __objt_listener(conn->target)->bind_conf->ca_ignerr & (1ULL << err)) {
-			ssl_sock_dump_errors(conn);
-			ERR_clear_error();
-			return 1;
-		}
+		if (err < 64 && bind_conf->ca_ignerr & (1ULL << err))
+			goto err_ignored;
 
-		conn->err_code = CO_ER_SSL_CA_FAIL;
+		/* TODO: for QUIC connection, this error code is lost */
+		if (conn)
+			conn->err_code = CO_ER_SSL_CA_FAIL;
 		return 0;
 	}
 
@@ -1752,14 +1794,18 @@ int ssl_sock_bind_verifycbk(int ok, X509_STORE_CTX *x_store)
 		ctx->xprt_st |= SSL_SOCK_CRTERROR_TO_ST(err);
 
 	/* check if certificate error needs to be ignored */
-	if (err < 64 && __objt_listener(conn->target)->bind_conf->crt_ignerr & (1ULL << err)) {
-		ssl_sock_dump_errors(conn);
-		ERR_clear_error();
-		return 1;
-	}
+	if (err < 64 && bind_conf->crt_ignerr & (1ULL << err))
+		goto err_ignored;
 
-	conn->err_code = CO_ER_SSL_CRT_FAIL;
+	/* TODO: for QUIC connection, this error code is lost */
+	if (conn)
+		conn->err_code = CO_ER_SSL_CRT_FAIL;
 	return 0;
+
+ err_ignored:
+	ssl_sock_dump_errors(conn, qc);
+	ERR_clear_error();
+	return 1;
 }
 
 #ifdef TLS1_RT_HEARTBEAT
@@ -2131,7 +2177,7 @@ static int ssl_sock_advertise_alpn_protos(SSL *s, const unsigned char **out,
 #ifdef SSL_CTRL_SET_TLSEXT_HOSTNAME
 #ifndef SSL_NO_GENERATE_CERTIFICATES
 
-/* Configure a DNS SAN extenion on a certificate. */
+/* Configure a DNS SAN extension on a certificate. */
 int ssl_sock_add_san_ext(X509V3_CTX* ctx, X509* cert, const char *servername) {
 	int failure = 0;
 	X509_EXTENSION *san_ext = NULL;
@@ -2899,14 +2945,42 @@ allow_early:
  * warning when no match is found, which implies the default (first) cert
  * will keep being used.
  */
-static int ssl_sock_switchctx_cbk(SSL *ssl, int *al, void *priv)
+int ssl_sock_switchctx_cbk(SSL *ssl, int *al, void *priv)
 {
 	const char *servername;
 	const char *wildp = NULL;
 	struct ebmb_node *node, *n;
 	struct bind_conf *s = priv;
+#ifdef USE_QUIC
+	const uint8_t *extension_data;
+	size_t extension_len;
+	struct quic_conn *qc = SSL_get_ex_data(ssl, ssl_qc_app_data_index);
+#endif /* USE_QUIC */
 	int i;
 	(void)al; /* shut gcc stupid warning */
+
+#ifdef USE_QUIC
+	if (qc) {
+
+		/* Look for the QUIC transport parameters. */
+		SSL_get_peer_quic_transport_params(ssl, &extension_data, &extension_len);
+		if (extension_len == 0) {
+			/* This is not redundant. It we only return 0 without setting
+			 * <*al>, this has as side effect to generate another TLS alert
+			 * which would be set after calling quic_set_tls_alert().
+			 */
+			*al = SSL_AD_MISSING_EXTENSION;
+			quic_set_tls_alert(qc, SSL_AD_MISSING_EXTENSION);
+			return SSL_TLSEXT_ERR_NOACK;
+		}
+
+		if (!quic_transport_params_store(qc, 0, extension_data,
+		                                 extension_data + extension_len) ||
+		    !qc_conn_finalize(qc, 0)) {
+			return SSL_TLSEXT_ERR_NOACK;
+		}
+	}
+#endif /* USE_QUIC */
 
 	servername = SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name);
 	if (!servername) {
@@ -4373,19 +4447,21 @@ ssl_sock_initial_ctx(struct bind_conf *bind_conf)
 		SSL_CTX_set_timeout(ctx, global_ssl.life_time);
 
 #ifdef SSL_CTRL_SET_TLSEXT_HOSTNAME
-#ifdef OPENSSL_IS_BORINGSSL
+# ifdef OPENSSL_IS_BORINGSSL
 	SSL_CTX_set_select_certificate_cb(ctx, ssl_sock_switchctx_cbk);
 	SSL_CTX_set_tlsext_servername_callback(ctx, ssl_sock_switchctx_err_cbk);
-#elif defined(SSL_OP_NO_ANTI_REPLAY)
+# elif defined(HAVE_SSL_CLIENT_HELLO_CB)
+#  if defined(SSL_OP_NO_ANTI_REPLAY)
 	if (bind_conf->ssl_conf.early_data)
 		SSL_CTX_set_options(ctx, SSL_OP_NO_ANTI_REPLAY);
+#  endif /* ! SSL_OP_NO_ANTI_REPLAY */
 	SSL_CTX_set_client_hello_cb(ctx, ssl_sock_switchctx_cbk, NULL);
 	SSL_CTX_set_tlsext_servername_callback(ctx, ssl_sock_switchctx_err_cbk);
-#else
+# else /* ! OPENSSL_IS_BORINGSSL && ! HAVE_SSL_CLIENT_HELLO_CB */
 	SSL_CTX_set_tlsext_servername_callback(ctx, ssl_sock_switchctx_cbk);
-#endif
+# endif
 	SSL_CTX_set_tlsext_servername_arg(ctx, bind_conf);
-#endif
+#endif /* ! SSL_CTRL_SET_TLSEXT_HOSTNAME */
 	return cfgerr;
 }
 
@@ -6216,7 +6292,7 @@ reneg_ok:
 
  out_error:
 	/* Clear openssl global errors stack */
-	ssl_sock_dump_errors(conn);
+	ssl_sock_dump_errors(conn, NULL);
 	ERR_clear_error();
 
 	/* free resumed session if exists */
@@ -6581,7 +6657,7 @@ static size_t ssl_sock_to_buf(struct connection *conn, void *xprt_ctx, struct bu
 
  clear_ssl_error:
 	/* Clear openssl global errors stack */
-	ssl_sock_dump_errors(conn);
+	ssl_sock_dump_errors(conn, NULL);
 	ERR_clear_error();
  read0:
 	conn_sock_read0(conn);
@@ -6590,7 +6666,7 @@ static size_t ssl_sock_to_buf(struct connection *conn, void *xprt_ctx, struct bu
  out_error:
 	conn->flags |= CO_FL_ERROR;
 	/* Clear openssl global errors stack */
-	ssl_sock_dump_errors(conn);
+	ssl_sock_dump_errors(conn, NULL);
 	ERR_clear_error();
 	goto leave;
 }
@@ -6746,7 +6822,7 @@ static size_t ssl_sock_from_buf(struct connection *conn, void *xprt_ctx, const s
 
  out_error:
 	/* Clear openssl global errors stack */
-	ssl_sock_dump_errors(conn);
+	ssl_sock_dump_errors(conn, NULL);
 	ERR_clear_error();
 
 	conn->flags |= CO_FL_ERROR;
@@ -6845,7 +6921,7 @@ static void ssl_sock_shutw(struct connection *conn, void *xprt_ctx, int clean)
 	/* no handshake was in progress, try a clean ssl shutdown */
 	if (SSL_shutdown(ctx->ssl) <= 0) {
 		/* Clear openssl global errors stack */
-		ssl_sock_dump_errors(conn);
+		ssl_sock_dump_errors(conn, NULL);
 		ERR_clear_error();
 	}
 }

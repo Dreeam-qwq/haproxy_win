@@ -27,9 +27,12 @@
 #include <import/ebtree-t.h>
 
 #include <haproxy/api-t.h>
+#include <haproxy/show_flags-t.h>
 #include <haproxy/thread-t.h>
 
-/* values for task->state (32 bits) */
+/* values for task->state (32 bits).
+ * Please also update the task_show_state() function below in case of changes.
+ */
 #define TASK_SLEEPING     0x00000000  /* task sleeping */
 #define TASK_RUNNING      0x00000001  /* the task is currently running */
 /* unused                 0x00000002 */
@@ -61,6 +64,40 @@
 #define TASK_PERSISTENT   (TASK_SELF_WAKING | TASK_KILLED | \
                            TASK_HEAVY | TASK_F_TASKLET | TASK_F_USR1)
 
+/* This function is used to report state in debugging tools. Please reflect
+ * below any single-bit flag addition above in the same order via the
+ * __APPEND_FLAG macro. The new end of the buffer is returned.
+ */
+static forceinline char *task_show_state(char *buf, size_t len, const char *delim, uint flg)
+{
+#define _(f, ...) __APPEND_FLAG(buf, len, delim, flg, f, #f, __VA_ARGS__)
+	/* prologue */
+	_(0);
+	/* flags */
+	_(TASK_RUNNING, _(TASK_QUEUED, _(TASK_SELF_WAKING,
+	_(TASK_KILLED, _(TASK_IN_LIST, _(TASK_HEAVY, _(TASK_WOKEN_INIT,
+	_(TASK_WOKEN_TIMER, _(TASK_WOKEN_IO, _(TASK_WOKEN_SIGNAL,
+	_(TASK_WOKEN_MSG, _(TASK_WOKEN_RES, _(TASK_WOKEN_OTHER,
+	_(TASK_F_TASKLET, _(TASK_F_USR1)))))))))))))));
+	/* epilogue */
+	_(~0U);
+	return buf;
+#undef _
+}
+
+/* these wakeup types are used to indicate how a task/tasklet was woken up, for
+ * debugging purposes.
+ */
+enum {
+	WAKEUP_TYPE_UNSET = 0,
+	WAKEUP_TYPE_TASK_WAKEUP,
+	WAKEUP_TYPE_TASK_INSTANT_WAKEUP,
+	WAKEUP_TYPE_TASKLET_WAKEUP,
+	WAKEUP_TYPE_TASKLET_WAKEUP_AFTER,
+	WAKEUP_TYPE_TASK_DROP_RUNNING,
+	WAKEUP_TYPE_APPCTX_WAKEUP,
+};
+
 struct notification {
 	struct list purge_me; /* Part of the list of signals to be purged in the
 	                         case of the LUA execution stack crash. */
@@ -71,11 +108,10 @@ struct notification {
 };
 
 #ifdef DEBUG_TASK
+/* prev_caller keeps a copy of the previous value of the <caller> field. */
 #define TASK_DEBUG_STORAGE                   \
 	struct {                             \
-		const char *caller_file[2];  \
-		int caller_line[2];          \
-		int caller_idx;              \
+		const struct ha_caller *prev_caller; \
 	} debug
 #else
 #define TASK_DEBUG_STORAGE
@@ -92,10 +128,12 @@ struct notification {
 #define TASK_COMMON							\
 	struct {							\
 		unsigned int state; /* task state : bitfield of TASK_	*/ \
-		/* 16-bit hole here */ \
-		unsigned int calls; /* number of times process was called */ \
+		int tid;            /* tid of task/tasklet. <0 = local for tasklet, unbound for task */ \
 		struct task *(*process)(struct task *t, void *ctx, unsigned int state); /* the function which processes the task */ \
 		void *context; /* the task's context */			\
+		const struct ha_caller *caller;	 /* call place of last wakeup(); 0 on init, -1 on free */ \
+		uint32_t wake_date;              /* date of the last task wakeup */ \
+		unsigned int calls;              /* number of times process was called */ \
 		TASK_DEBUG_STORAGE;					\
 	}
 
@@ -111,10 +149,7 @@ struct task {
 	struct eb32_node wq;		/* ebtree node used to hold the task in the wait queue */
 	int expire;			/* next expiration date for this task, in ticks */
 	short nice;                     /* task prio from -1024 to +1024 */
-	short tid;                      /* TID where it's allowed to run, <0 if anywhere */
-	uint64_t call_date;		/* date of the last task wakeup or call */
-	uint64_t lat_time;		/* total latency time experienced */
-	uint64_t cpu_time;              /* total CPU time consumed */
+	/* 16-bit hole here */
 };
 
 /* lightweight tasks, without priority, mainly used for I/Os */
@@ -126,10 +161,6 @@ struct tasklet {
 	 * list starts and this works because both are exclusive. Never ever
 	 * reorder these fields without taking this into account!
 	 */
-#ifdef DEBUG_TASK
-	uint64_t call_date;		/* date of the last tasklet wakeup or call */
-#endif
-	int tid;                        /* TID of the tasklet owner, <0 if local */
 };
 
 /*

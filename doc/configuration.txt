@@ -3,7 +3,7 @@
                           Configuration Manual
                          ----------------------
                               version 2.7
-                              2022/08/20
+                              2022/09/17
 
 
 This document covers the configuration language as implemented in the version
@@ -1156,6 +1156,7 @@ The following keywords are supported in the "global" section :
    - tune.zlib.windowsize
 
  * Debugging
+   - anonkey
    - quiet
    - zero-warning
 
@@ -3221,6 +3222,13 @@ tune.zlib.windowsize <number>
 3.3. Debugging
 --------------
 
+anonkey <key>
+  This sets the global anonymizing key to <key>, which must be a 32-bit number
+  between 0 and 4294967295. This is the key that will be used by default by CLI
+  commands when anonymized mode is enabled. This key may also be set at runtime
+  from the CLI command "set global-key". See also command line argument "-dC"
+  in the management manual.
+
 quiet
   Do not display any message during startup. It is equivalent to the command-
   line argument "-q".
@@ -3603,12 +3611,18 @@ backing-file <path>
   the "struct ring" that starts at the beginning of the area, and that is
   required to recover the area's contents. The file will be created with the
   starting user's ownership, with mode 0600 and will be of the size configured
-  by the "size" directive. Any previously existing file will be renamed with
-  the extra suffix ".bak", and any previously existing file with suffix ".bak"
-  will be removed. This ensures that instant restart of the process will not
-  wipe precious debugging information, and will leave time for an admin to spot
-  this new ".bak" file and to archive it if needed. This means that the total
-  storage capacity required will be double of the ring size.
+  by the "size" directive. When the directive is parsed (thus even during
+  config checks), any existing non-empty file will first be renamed with the
+  extra suffix ".bak", and any previously existing file with suffix ".bak" will
+  be removed. This ensures that instant reload or restart of the process will
+  not wipe precious debugging information, and will leave time for an admin to
+  spot this new ".bak" file and to archive it if needed. As such, after a crash
+  the file designated by <path> will contain the freshest information, and if
+  the service is restarted, the "<path>.bak" file will have it instead. This
+  means that the total storage capacity required will be double of the ring
+  size. Failures to rotate the file are silently ignored, so placing the file
+  into a directory without write permissions will be sufficient to avoid the
+  backup file if not desired.
 
   WARNING: there are stability and security implications in using this feature.
   First, backing the ring to a slow device (e.g. physical hard drive) may cause
@@ -9240,11 +9254,6 @@ option httpchk <method> <uri> <version>
   bound to some dedicated ports using the inetd daemon. However, it will always
   internally relies on an HTX multiplexer. Thus, it means the request
   formatting and the response parsing will be strict.
-
-  Note : For a while, there was no way to add headers or body in the request
-         used for HTTP health checks. So a workaround was to hide it at the end
-         of the version string with a "\r\n" after the version. It is now
-	 deprecated. The directive "http-check send" must be used instead.
 
   Examples :
         # Relay HTTPS traffic to Apache instance and check service availability

@@ -30,11 +30,14 @@
 #include <haproxy/dynbuf-t.h>
 #include <haproxy/filters-t.h>
 #include <haproxy/obj_type-t.h>
+#include <haproxy/show_flags-t.h>
 #include <haproxy/stick_table-t.h>
 #include <haproxy/vars-t.h>
 
 
-/* Various Stream Flags, bits values 0x01 to 0x100 (shift 0) */
+/* Various Stream Flags, bits values 0x01 to 0x100 (shift 0).
+ * Please also update the txn_show_flags() function below in case of changes.
+ */
 #define SF_DIRECT	0x00000001	/* connection made on the server matching the client cookie */
 #define SF_ASSIGNED	0x00000002	/* no need to assign a server to this stream */
 /* unused: 0x00000004 */
@@ -84,6 +87,45 @@
 #define SF_WEBSOCKET    0x00400000	/* websocket stream */ // TODO: must be removed
 #define SF_SRC_ADDR     0x00800000	/* get the source ip/port with getsockname */
 
+/* This function is used to report flags in debugging tools. Please reflect
+ * below any single-bit flag addition above in the same order via the
+ * __APPEND_FLAG and __APPEND_ENUM macros. The new end of the buffer is
+ * returned.
+ */
+static forceinline char *strm_show_flags(char *buf, size_t len, const char *delim, uint flg)
+{
+#define _(f, ...)     __APPEND_FLAG(buf, len, delim, flg, f, #f, __VA_ARGS__)
+#define _e(m, e, ...) __APPEND_ENUM(buf, len, delim, flg, m, e, #e, __VA_ARGS__)
+	/* prologue */
+	_(0);
+	/* flags & enums */
+	_(SF_IGNORE_PRST, _(SF_SRV_REUSED, _(SF_SRV_REUSED_ANTICIPATED,
+	_(SF_WEBSOCKET, _(SF_SRC_ADDR)))));
+
+	_e(SF_FINST_MASK, SF_FINST_R,    _e(SF_FINST_MASK, SF_FINST_C,
+	_e(SF_FINST_MASK, SF_FINST_H,    _e(SF_FINST_MASK, SF_FINST_D,
+	_e(SF_FINST_MASK, SF_FINST_L,    _e(SF_FINST_MASK, SF_FINST_Q,
+	_e(SF_FINST_MASK, SF_FINST_T)))))));
+
+	_e(SF_ERR_MASK, SF_ERR_LOCAL,    _e(SF_ERR_MASK, SF_ERR_CLITO,
+	_e(SF_ERR_MASK, SF_ERR_CLICL,    _e(SF_ERR_MASK, SF_ERR_SRVTO,
+	_e(SF_ERR_MASK, SF_ERR_SRVCL,    _e(SF_ERR_MASK, SF_ERR_PRXCOND,
+	_e(SF_ERR_MASK, SF_ERR_RESOURCE, _e(SF_ERR_MASK, SF_ERR_INTERNAL,
+	_e(SF_ERR_MASK, SF_ERR_DOWN,     _e(SF_ERR_MASK, SF_ERR_KILLED,
+	_e(SF_ERR_MASK, SF_ERR_UP,       _e(SF_ERR_MASK, SF_ERR_CHK_PORT))))))))))));
+
+	_(SF_DIRECT, _(SF_ASSIGNED, _(SF_BE_ASSIGNED, _(SF_FORCE_PRST,
+	_(SF_MONITOR, _(SF_CURR_SESS, _(SF_CONN_EXP, _(SF_REDISP,
+	_(SF_IGNORE, _(SF_REDIRECTABLE, _(SF_HTX)))))))))));
+
+	/* epilogue */
+	_(~0U);
+	return buf;
+#undef _e
+#undef _
+}
+
+
 /* flags for the proxy of the master CLI */
 /* 0x0001.. to 0x8000 are reserved for ACCESS_* flags from cli-t.h */
 
@@ -91,7 +133,9 @@
 #define PCLI_F_PAYLOAD  0x20000
 
 
-/* error types reported on the streams for more accurate reporting */
+/* error types reported on the streams for more accurate reporting.
+ * Please also update the strm_et_show_flags() function below in case of changes.
+ */
 enum {
 	STRM_ET_NONE       = 0x0000,  /* no error yet, leave it to zero */
 	STRM_ET_QUEUE_TO   = 0x0001,  /* queue timeout */
@@ -106,6 +150,26 @@ enum {
 	STRM_ET_DATA_ERR   = 0x0200,  /* error during data phase */
 	STRM_ET_DATA_ABRT  = 0x0400,  /* data phase aborted by external cause */
 };
+
+/* This function is used to report flags in debugging tools. Please reflect
+ * below any single-bit flag addition above in the same order via the
+ * __APPEND_FLAG macro. The new end of the buffer is returned.
+ */
+static forceinline char *strm_et_show_flags(char *buf, size_t len, const char *delim, uint flg)
+{
+#define _(f, ...) __APPEND_FLAG(buf, len, delim, flg, f, #f, __VA_ARGS__)
+	/* prologue */
+	_(0);
+	/* flags */
+	_(STRM_ET_QUEUE_TO, _(STRM_ET_QUEUE_ERR, _(STRM_ET_QUEUE_ABRT,
+	_(STRM_ET_CONN_TO, _(STRM_ET_CONN_ERR, _(STRM_ET_CONN_ABRT,
+	_(STRM_ET_CONN_RES, _(STRM_ET_CONN_OTHER, _(STRM_ET_DATA_TO,
+	_(STRM_ET_DATA_ERR, _(STRM_ET_DATA_ABRT)))))))))));
+	/* epilogue */
+	_(~0U);
+	return buf;
+#undef _
+}
 
 struct hlua;
 struct proxy;
@@ -135,16 +199,22 @@ struct strm_logs {
 };
 
 struct stream {
+	enum obj_type obj_type;         /* object type == OBJ_TYPE_STREAM */
+	enum sc_state prev_conn_state;  /* CS_ST*, copy of previous state of the server stream connector */
+
+	int16_t priority_class;         /* priority class of the stream for the pending queue */
+	int32_t priority_offset;        /* priority offset of the stream for the pending queue */
+
 	int flags;                      /* some flags describing the stream */
 	unsigned int uniq_id;           /* unique ID used for the traces */
 	enum obj_type *target;          /* target to use for this stream */
+
+	struct session *sess;           /* the session this stream is attached to */
 
 	struct channel req;             /* request channel */
 	struct channel res;             /* response channel */
 
 	struct proxy *be;               /* the proxy this stream depends on for the server side */
-
-	struct session *sess;           /* the session this stream is attached to */
 
 	struct server *srv_conn;        /* stream already has a slot on a server and is not in queue */
 	struct pendconn *pend_pos;      /* if not NULL, points to the pending position in the pending queue */
@@ -154,24 +224,20 @@ struct stream {
 	struct task *task;              /* the task associated with this stream */
 	unsigned int pending_events;	/* the pending events not yet processed by the stream.
 					 * This is a bit field of TASK_WOKEN_* */
-	int16_t priority_class;         /* priority class of the stream for the pending queue */
-	int32_t priority_offset;        /* priority offset of the stream for the pending queue */
-
 	int conn_retries;               /* number of connect retries performed */
 	unsigned int conn_exp;          /* wake up time for connect, queue, turn-around, ... */
 	unsigned int conn_err_type;     /* first error detected, one of STRM_ET_* */
-	enum sc_state prev_conn_state;  /* CS_ST*, copy of previous state of the server stream connector */
-
 	struct list list;               /* position in the thread's streams list */
 	struct mt_list by_srv;          /* position in server stream list */
 	struct list back_refs;          /* list of users tracking this stream */
 	struct buffer_wait buffer_wait; /* position in the list of objects waiting for a buffer */
 
+	uint64_t lat_time;		/* total latency time experienced */
+	uint64_t cpu_time;              /* total CPU time consumed */
 	struct freq_ctr call_rate;      /* stream task call rate without making progress */
 
 	short store_count;
-	enum obj_type obj_type;         /* object type == OBJ_TYPE_STREAM */
-	/* 1 unused bytes here */
+	/* 2 unused bytes here */
 
 	struct {
 		struct stksess *ts;
@@ -205,6 +271,7 @@ struct stream {
 	struct list *current_rule_list;         /* this is used to store the current executed rule list. */
 	void *current_rule;                     /* this is used to store the current rule to be resumed. */
 	int rules_exp;                          /* expiration date for current rules execution */
+	int tunnel_timeout;
 	const char *last_rule_file;             /* last evaluated final rule's file (def: NULL) */
 	int last_rule_line;                     /* last evaluated final rule's line (def: 0) */
 
@@ -214,13 +281,11 @@ struct stream {
 	/* Context */
 	struct {
 		struct resolv_requester *requester; /* owner of the resolution */
+		struct act_rule *parent;        /* rule which requested this resolution */
 		char *hostname_dn;              /* hostname being resolve, in domain name format */
 		int hostname_dn_len;            /* size of hostname_dn */
-		/* 4 unused bytes here */
-		struct act_rule *parent;        /* rule which requested this resolution */
+		/* 4 unused bytes here, recoverable via packing if needed */
 	} resolv_ctx;                           /* context information for DNS resolution */
-
-	int tunnel_timeout;
 };
 
 #endif /* _HAPROXY_STREAM_T_H */

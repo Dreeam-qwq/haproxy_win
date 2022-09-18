@@ -29,6 +29,7 @@ enum qcs_type {
 #define QC_CF_CC_EMIT   0x00000001 /* A CONNECTION_CLOSE is set by the MUX */
 #define QC_CF_BLK_MFCTL 0x00000002 /* sending blocked due to connection flow-control */
 #define QC_CF_CONN_FULL 0x00000004 /* no stream buffers available on connection */
+#define QC_CF_APP_FINAL 0x00000008 /* The application layer was finalized */
 
 struct qcc {
 	struct connection *conn;
@@ -184,9 +185,10 @@ struct qcc_app_ops {
 	int (*init)(struct qcc *qcc);
 	int (*attach)(struct qcs *qcs, void *conn_ctx);
 	ssize_t (*decode_qcs)(struct qcs *qcs, struct buffer *b, int fin);
-	size_t (*snd_buf)(struct stconn *sc, struct buffer *buf, size_t count, int flags);
+	size_t (*snd_buf)(struct qcs *qcs, struct buffer *buf, size_t count, int flags);
 	void (*detach)(struct qcs *qcs);
 	int (*finalize)(void *ctx);
+	void (*shutdown)(void *ctx);                    /* Close a connection. */
 	void (*release)(void *ctx);
 	void (*inc_err_cnt)(void *ctx, int err_code);
 };

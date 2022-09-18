@@ -818,10 +818,8 @@ static int qcc_decode_qcs(struct qcc *qcc, struct qcs *qcs)
 
 	b = qcs_b_dup(&qcs->rx.ncbuf);
 
-	/* Signal FIN to application if STREAM FIN received and there is no gap
-	 * in the Rx buffer.
-	 */
-	if (qcs->flags & QC_SF_SIZE_KNOWN && !ncb_is_fragmented(&qcs->rx.ncbuf))
+	/* Signal FIN to application if STREAM FIN received with all data. */
+	if (qcs_is_close_remote(qcs))
 		fin = 1;
 
 	ret = qcc->app_ops->decode_qcs(qcs, &b, fin);
@@ -897,9 +895,6 @@ int qcc_install_app_ops(struct qcc *qcc, const struct qcc_app_ops *app_ops)
 
 	TRACE_PROTO("application layer initialized", QMUX_EV_QCC_NEW, qcc->conn);
 
-	if (qcc->app_ops->finalize)
-		qcc->app_ops->finalize(qcc->ctx);
-
 	TRACE_LEAVE(QMUX_EV_QCC_NEW, qcc->conn);
 	return 0;
 
@@ -961,6 +956,10 @@ int qcc_recv(struct qcc *qcc, uint64_t id, uint64_t len, uint64_t offset,
 	}
 
 	if (offset + len <= qcs->rx.offset) {
+		/* TODO offset may have been received without FIN first and now
+		 * with it. In this case, it must be notified to be able to
+		 * close the stream.
+		 */
 		TRACE_DATA("already received offset", QMUX_EV_QCC_RECV|QMUX_EV_QCS_RECV, qcc->conn, qcs);
 		goto out;
 	}
@@ -1030,8 +1029,10 @@ int qcc_recv(struct qcc *qcc, uint64_t id, uint64_t len, uint64_t offset,
 	if (fin)
 		qcs->flags |= QC_SF_SIZE_KNOWN;
 
-	if (qcs->flags & QC_SF_SIZE_KNOWN && !ncb_is_fragmented(&qcs->rx.ncbuf))
+	if (qcs->flags & QC_SF_SIZE_KNOWN &&
+	    qcs->rx.offset_max == qcs->rx.offset + ncb_data(&qcs->rx.ncbuf, 0)) {
 		qcs_close_remote(qcs);
+	}
 
 	if (ncb_data(&qcs->rx.ncbuf, 0) && !(qcs->flags & QC_SF_DEM_FULL)) {
 		qcc_decode_qcs(qcc, qcs);
@@ -1609,6 +1610,15 @@ static int qc_send(struct qcc *qcc)
 	if (qcc->flags & QC_CF_BLK_MFCTL)
 		return 0;
 
+	if (!(qcc->flags & QC_CF_APP_FINAL) && !eb_is_empty(&qcc->streams_by_id) &&
+	    qcc->app_ops->finalize) {
+		/* Finalize the application layer before sending any stream.
+		 * For h3 this consists in preparing the control stream data (SETTINGS h3).
+		 */
+		qcc->app_ops->finalize(qcc->ctx);
+		qcc->flags |= QC_CF_APP_FINAL;
+	}
+
 	/* loop through all streams, construct STREAM frames if data available.
 	 * TODO optimize the loop to favor streams which are not too heavy.
 	 */
@@ -1790,11 +1800,11 @@ static void qc_release(struct qcc *qcc)
 
 	TRACE_ENTER(QMUX_EV_QCC_END, conn);
 
-	if (qcc->app_ops && qcc->app_ops->release) {
+	if (qcc->app_ops && qcc->app_ops->shutdown) {
 		/* Application protocol with dedicated connection closing
 		 * procedure.
 		 */
-		qcc->app_ops->release(qcc->ctx);
+		qcc->app_ops->shutdown(qcc->ctx);
 
 		/* useful if application protocol should emit some closing
 		 * frames. For example HTTP/3 GOAWAY frame.
@@ -1804,7 +1814,6 @@ static void qc_release(struct qcc *qcc)
 	else {
 		qcc_emit_cc_app(qcc, QC_ERR_NO_ERROR, 0);
 	}
-	TRACE_PROTO("application layer released", QMUX_EV_QCC_END, conn);
 
 	if (qcc->task) {
 		task_destroy(qcc->task);
@@ -1833,6 +1842,10 @@ static void qc_release(struct qcc *qcc)
 		pool_free(pool_head_quic_frame, frm);
 	}
 
+	if (qcc->app_ops && qcc->app_ops->release)
+		qcc->app_ops->release(qcc->ctx);
+	TRACE_PROTO("application layer released", QMUX_EV_QCC_END, conn);
+
 	pool_free(pool_head_qcc, qcc);
 
 	if (conn) {
@@ -1854,7 +1867,7 @@ static void qc_release(struct qcc *qcc)
 	TRACE_LEAVE(QMUX_EV_QCC_END);
 }
 
-static struct task *qc_io_cb(struct task *t, void *ctx, unsigned int status)
+struct task *qc_io_cb(struct task *t, void *ctx, unsigned int status)
 {
 	struct qcc *qcc = ctx;
 
@@ -2216,7 +2229,7 @@ static size_t qc_snd_buf(struct stconn *sc, struct buffer *buf,
 		goto end;
 	}
 
-	ret = qcs->qcc->app_ops->snd_buf(sc, buf, count, flags);
+	ret = qcs->qcc->app_ops->snd_buf(qcs, buf, count, flags);
 
  end:
 	TRACE_LEAVE(QMUX_EV_STRM_SEND, qcs->qcc->conn, qcs);
@@ -2290,7 +2303,7 @@ static int qc_wake(struct connection *conn)
 
 	/* Check if a soft-stop is in progress.
 	 *
-	 * TODO this is revelant for frontend connections only.
+	 * TODO this is relevant for frontend connections only.
 	 *
 	 * TODO Client should be notified with a H3 GOAWAY and then a
 	 * CONNECTION_CLOSE. However, quic-conn uses the listener socket for
@@ -2333,6 +2346,33 @@ static char *qcs_st_to_str(enum qcs_state st)
 	default:         return "???";
 	}
 }
+
+/* for debugging with CLI's "show sess" command. May emit multiple lines, each
+ * new one being prefixed with <pfx>, if <pfx> is not NULL, otherwise a single
+ * line is used. Each field starts with a space so it's safe to print it after
+ * existing fields.
+ */
+static int qc_show_sd(struct buffer *msg, struct sedesc *sd, const char *pfx)
+{
+	struct qcs *qcs = sd->se;
+	struct qcc *qcc;
+	int ret = 0;
+
+	if (!qcs)
+		return ret;
+
+	chunk_appendf(msg, " qcs=%p .flg=%#x .id=%llu .st=%s .ctx=%p, .err=%#llx",
+		      qcs, qcs->flags, (ull)qcs->id, qcs_st_to_str(qcs->st), qcs->ctx, (ull)qcs->err);
+
+	if (pfx)
+		chunk_appendf(msg, "\n%s", pfx);
+
+	qcc = qcs->qcc;
+	chunk_appendf(msg, " qcc=%p .flg=%#x .nbsc=%llu .nbhreq=%llu, .task=%p",
+		      qcc, qcc->flags, (ull)qcc->nb_sc, (ull)qcc->nb_hreq, qcc->task);
+	return ret;
+}
+
 
 static void qmux_trace_frm(const struct quic_frame *frm)
 {
@@ -2407,6 +2447,7 @@ static const struct mux_ops qc_ops = {
 	.subscribe = qc_subscribe,
 	.unsubscribe = qc_unsubscribe,
 	.wake = qc_wake,
+	.show_sd = qc_show_sd,
 	.flags = MX_FL_HTX|MX_FL_NO_UPG|MX_FL_FRAMED,
 	.name = "QUIC",
 };

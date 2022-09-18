@@ -193,7 +193,7 @@ int create_udp_listener(struct sockaddr_storage *addr, struct errmsg *err)
 		goto fail;
 	}
 #endif
-	if (bind(fd, (struct sockaddr *)&frt_addr, addr->ss_family == AF_INET6 ?
+	if (bind(fd, (struct sockaddr *)addr, addr->ss_family == AF_INET6 ?
 		 sizeof(struct sockaddr_in6) : sizeof(struct sockaddr_in)) == -1) {
 		err->len = snprintf(err->msg, err->size, "bind(): '%s'", strerror(errno));
 		goto fail;
@@ -275,6 +275,18 @@ int add_connection(struct sockaddr_storage *ss)
 	return -1;
 }
 
+/* Corrupt <buf> buffer with <buflen> as length if required */
+static void pktbuf_apply_corruption(char *buf, size_t buflen)
+{
+	if (corr_rate > 0 && prng(100) < corr_rate) {
+		unsigned int rnd = prng(corr_span * 256); // pos and value
+		unsigned int pos = corr_base + (rnd >> 8);
+
+		if (pos < buflen)
+			buf[pos] ^= rnd;
+	}
+}
+
 /* Handle a read operation on an front FD. Will either reuse the existing
  * connection if the source is found, or will allocate a new one, possibly
  * replacing the oldest one. Returns <0 on error or the number of bytes
@@ -297,6 +309,7 @@ int handle_frt(int fd, struct pollfd *pfd, struct conn *conns, int nbconn)
 		pktbuf = history[history_idx].buf;
 	}
 
+	addrlen = sizeof(addr);
 	ret = recvfrom(fd, pktbuf, MAXPKTSIZE, MSG_DONTWAIT | MSG_NOSIGNAL,
 		       (struct sockaddr *)&addr, &addrlen);
 
@@ -322,13 +335,7 @@ int handle_frt(int fd, struct pollfd *pfd, struct conn *conns, int nbconn)
 	if (ret < 0)
 		return errno == EAGAIN ? 0 : -1;
 
-	if (corr_rate > 0 && prng(100) < corr_rate) {
-		unsigned int rnd = prng(corr_span * 256); // pos and value
-		unsigned int pos = corr_base + (rnd >> 8);
-
-		if (pos < ret)
-			pktbuf[pos] ^= rnd;
-	}
+	pktbuf_apply_corruption(pktbuf, ret);
 
 	conn = NULL;
 	for (i = 0; i < nbconn; i++) {
@@ -409,6 +416,8 @@ int handle_bck(int fd, struct pollfd *pfd, struct conn *conns, int nbconn)
 
 	if (ret < 0)
 		return errno == EAGAIN ? 0 : -1;
+
+	pktbuf_apply_corruption(pktbuf, ret);
 
 	conn = conn_bck_lookup(conns, nbconn, fd);
 	if (!conn)

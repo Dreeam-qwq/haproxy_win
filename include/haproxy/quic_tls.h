@@ -135,8 +135,10 @@ static inline const EVP_CIPHER *tls_aead(const SSL_CIPHER *cipher)
 		return EVP_aes_128_gcm();
 	case TLS1_3_CK_AES_256_GCM_SHA384:
 		return EVP_aes_256_gcm();
+#if !defined(LIBRESSL_VERSION_NUMBER)
 	case TLS1_3_CK_CHACHA20_POLY1305_SHA256:
 		return EVP_chacha20_poly1305();
+#endif
 	case TLS1_3_CK_AES_128_CCM_SHA256:
 		return EVP_aes_128_ccm();
 	default:
@@ -259,12 +261,14 @@ static inline const char *ssl_error_str(int err)
 		return "WANT_CONNECT";
 	case SSL_ERROR_WANT_ACCEPT:
 		return "WANT_ACCEPT";
+#if !defined(LIBRESSL_VERSION_NUMBER)
 	case SSL_ERROR_WANT_ASYNC:
 		return "WANT_ASYNC";
 	case SSL_ERROR_WANT_ASYNC_JOB:
 		return "WANT_ASYNC_JOB";
 	case SSL_ERROR_WANT_CLIENT_HELLO_CB:
 		return "WANT_CLIENT_HELLO_CB";
+#endif
 	default:
 		return "UNKNOWN";
 	}
@@ -416,14 +420,24 @@ static inline void quic_tls_ctx_secs_free(struct quic_tls_ctx *ctx)
  */
 static inline int quic_tls_ctx_keys_alloc(struct quic_tls_ctx *ctx)
 {
+	if (ctx->rx.key)
+		goto write;
+
 	if (!(ctx->rx.iv = pool_alloc(pool_head_quic_tls_iv)) ||
-	    !(ctx->rx.key = pool_alloc(pool_head_quic_tls_key)) ||
-	    !(ctx->tx.iv = pool_alloc(pool_head_quic_tls_iv)) ||
+	    !(ctx->rx.key = pool_alloc(pool_head_quic_tls_key)))
+		goto err;
+
+ write:
+	if (ctx->tx.key)
+		goto out;
+
+	if (!(ctx->tx.iv = pool_alloc(pool_head_quic_tls_iv)) ||
 	    !(ctx->tx.key = pool_alloc(pool_head_quic_tls_key)))
 		goto err;
 
 	ctx->rx.ivlen = ctx->tx.ivlen = QUIC_TLS_IV_LEN;
 	ctx->rx.keylen = ctx->tx.keylen = QUIC_TLS_KEY_LEN;
+out:
 	return 1;
 
  err:

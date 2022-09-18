@@ -22,6 +22,7 @@
 #include <haproxy/clock.h>
 #include <haproxy/fd.h>
 #include <haproxy/global.h>
+#include <haproxy/signal.h>
 #include <haproxy/task.h>
 #include <haproxy/ticks.h>
 
@@ -203,7 +204,7 @@ static void _do_poll(struct poller *p, int exp, int wake)
 		}
 	}
 
-	/* now let's wait for events */
+	/* Now let's wait for polled events. */
 	wait_time = wake ? 0 : compute_poll_timeout(exp);
 	clock_entering_poll();
 	status = poll(poll_events, nbfd, wait_time);

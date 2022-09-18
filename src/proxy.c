@@ -122,8 +122,8 @@ const struct cfg_opt cfg_opts2[] =
 	{ "http-pretend-keepalive",       PR_O2_FAKE_KA,   PR_CAP_BE, 0, PR_MODE_HTTP },
 	{ "http-no-delay",                PR_O2_NODELAY,   PR_CAP_FE|PR_CAP_BE, 0, PR_MODE_HTTP },
 
-	{"h1-case-adjust-bogus-client",   PR_O2_H1_ADJ_BUGCLI, PR_CAP_FE, 0, PR_MODE_HTTP },
-	{"h1-case-adjust-bogus-server",   PR_O2_H1_ADJ_BUGSRV, PR_CAP_BE, 0, PR_MODE_HTTP },
+	{"h1-case-adjust-bogus-client",   PR_O2_H1_ADJ_BUGCLI, PR_CAP_FE, 0, 0 },
+	{"h1-case-adjust-bogus-server",   PR_O2_H1_ADJ_BUGSRV, PR_CAP_BE, 0, 0 },
 	{"disable-h2-upgrade",            PR_O2_NO_H2_UPGRADE, PR_CAP_FE, 0, PR_MODE_HTTP },
 	{ NULL, 0, 0, 0 }
 };
@@ -1915,6 +1915,26 @@ struct proxy *parse_new_proxy(const char *name, unsigned int cap,
 	return curproxy;
 }
 
+/* to be called under the proxy lock after pausing some listeners. This will
+ * automatically update the p->flags flag
+ */
+void proxy_cond_pause(struct proxy *p)
+{
+	if (p->li_ready)
+		return;
+	p->flags |= PR_FL_PAUSED;
+}
+
+/* to be called under the proxy lock after resuming some listeners. This will
+ * automatically update the p->flags flag
+ */
+void proxy_cond_resume(struct proxy *p)
+{
+	if (!p->li_ready)
+		return;
+	p->flags &= ~PR_FL_PAUSED;
+}
+
 /* to be called under the proxy lock after stopping some listeners. This will
  * automatically update the p->flags flag after stopping the last one, and
  * will emit a log indicating the proxy's condition. The function is idempotent
@@ -2252,22 +2272,29 @@ void soft_stop(void)
 /* Temporarily disables listening on all of the proxy's listeners. Upon
  * success, the proxy enters the PR_PAUSED state. The function returns 0
  * if it fails, or non-zero on success.
+ * The function takes the proxy's lock so it's safe to
+ * call from multiple places.
  */
 int pause_proxy(struct proxy *p)
 {
 	struct listener *l;
 
+	HA_RWLOCK_WRLOCK(PROXY_LOCK, &p->lock);
+
 	if (!(p->cap & PR_CAP_FE) || (p->flags & (PR_FL_DISABLED|PR_FL_STOPPED)) || !p->li_ready)
-		return 1;
+		goto end;
 
 	list_for_each_entry(l, &p->conf.listeners, by_fe)
-		pause_listener(l);
+		pause_listener(l, 1);
 
 	if (p->li_ready) {
 		ha_warning("%s %s failed to enter pause mode.\n", proxy_cap_str(p->cap), p->id);
 		send_log(p, LOG_WARNING, "%s %s failed to enter pause mode.\n", proxy_cap_str(p->cap), p->id);
+		HA_RWLOCK_WRUNLOCK(PROXY_LOCK, &p->lock);
 		return 0;
 	}
+end:
+	HA_RWLOCK_WRUNLOCK(PROXY_LOCK, &p->lock);
 	return 1;
 }
 
@@ -2276,7 +2303,8 @@ int pause_proxy(struct proxy *p)
  * to be called when going down in order to release the ports so that another
  * process may bind to them. It must also be called on disabled proxies at the
  * end of start-up. If all listeners are closed, the proxy is set to the
- * PR_STOPPED state. The function takes the proxy's lock so it's safe to
+ * PR_STOPPED state.
+ * The function takes the proxy's lock so it's safe to
  * call from multiple places.
  */
 void stop_proxy(struct proxy *p)
@@ -2286,7 +2314,7 @@ void stop_proxy(struct proxy *p)
 	HA_RWLOCK_WRLOCK(PROXY_LOCK, &p->lock);
 
 	list_for_each_entry(l, &p->conf.listeners, by_fe)
-		stop_listener(l, 1, 0, 0);
+		stop_listener(l, 1, 0);
 
 	if (!(p->flags & (PR_FL_DISABLED|PR_FL_STOPPED)) && !p->li_ready) {
 		/* might be just a backend */
@@ -2300,18 +2328,22 @@ void stop_proxy(struct proxy *p)
  * listeners and tries to enable them all. If any of them fails, the proxy is
  * put back to the paused state. It returns 1 upon success, or zero if an error
  * is encountered.
+ * The function takes the proxy's lock so it's safe to
+ * call from multiple places.
  */
 int resume_proxy(struct proxy *p)
 {
 	struct listener *l;
 	int fail;
 
+	HA_RWLOCK_WRLOCK(PROXY_LOCK, &p->lock);
+
 	if ((p->flags & (PR_FL_DISABLED|PR_FL_STOPPED)) || !p->li_paused)
-		return 1;
+		goto end;
 
 	fail = 0;
 	list_for_each_entry(l, &p->conf.listeners, by_fe) {
-		if (!resume_listener(l)) {
+		if (!resume_listener(l, 1)) {
 			int port;
 
 			port = get_host_port(&l->rx.addr);
@@ -2335,9 +2367,13 @@ int resume_proxy(struct proxy *p)
 	}
 
 	if (fail) {
+		HA_RWLOCK_WRUNLOCK(PROXY_LOCK, &p->lock);
+		/* pause_proxy will take PROXY_LOCK */
 		pause_proxy(p);
 		return 0;
 	}
+end:
+	HA_RWLOCK_WRUNLOCK(PROXY_LOCK, &p->lock);
 	return 1;
 }
 
@@ -2510,8 +2546,8 @@ void proxy_capture_error(struct proxy *proxy, int is_back,
 	} else {
 		es = HA_ATOMIC_XCHG(&proxy->invalid_req, es);
 	}
-	free(es);
 	HA_RWLOCK_WRUNLOCK(PROXY_LOCK, &proxy->lock);
+	ha_free(&es);
 }
 
 /* Configure all proxies which lack a maxconn setting to use the global one by
@@ -2753,10 +2789,12 @@ static int dump_servers_state(struct stconn *sc)
 				     "%s %d %d "
 				     "%s %s %d"
 			             "\n",
-			             px->uuid, px->id,
-			             srv->puid, srv->id, srv_addr,
-			             srv->cur_state, srv->cur_admin, srv->uweight, srv->iweight, (long int)srv_time_since_last_change,
-			             srv->check.status, srv->check.result, srv->check.health, srv->check.state, srv->agent.state,
+			             px->uuid, HA_ANON_CLI(px->id),
+			             srv->puid, HA_ANON_CLI(srv->id), HA_ANON_CLI(srv_addr),
+			             srv->cur_state, srv->cur_admin, srv->uweight, srv->iweight,
+				     (long int)srv_time_since_last_change,
+			             srv->check.status, srv->check.result, srv->check.health,
+				     srv->check.state, srv->agent.state,
 			             bk_f_forced_id, srv_f_forced_id, srv->hostname ? srv->hostname : "-", srv->svc_port,
 			             srvrecord ? srvrecord : "-", srv->use_ssl, srv->check.port,
 				     srv_check_addr, srv_agent_addr, srv->agent.port);
@@ -2766,8 +2804,9 @@ static int dump_servers_state(struct stconn *sc)
 
 			chunk_printf(&trash,
 			             "%s/%s %d/%d %s %u - %u %u %u %u %u %u %d %u",
-			             px->id, srv->id, px->uuid, srv->puid, srv_addr,srv->svc_port,
-			             srv->pool_purge_delay,
+			             HA_ANON_CLI(px->id), HA_ANON_CLI(srv->id),
+			             px->uuid, srv->puid, HA_ANON_CLI(srv_addr),
+			             srv->svc_port, srv->pool_purge_delay,
 			             srv->curr_used_conns, srv->max_used_conns, srv->est_need_conns,
 			             srv->curr_idle_nb, srv->curr_safe_nb, (int)srv->max_idle_conns, srv->curr_idle_conns);
 
@@ -2996,7 +3035,7 @@ static int cli_parse_set_maxconn_frontend(char **args, char *payload, struct app
 	px->maxconn = v;
 	list_for_each_entry(l, &px->conf.listeners, by_fe) {
 		if (l->state == LI_FULL)
-			resume_listener(l);
+			resume_listener(l, 1);
 	}
 
 	if (px->maxconn > px->feconn)
@@ -3051,9 +3090,8 @@ static int cli_parse_disable_frontend(char **args, char *payload, struct appctx 
 	if (!px->li_ready)
 		return cli_msg(appctx, LOG_NOTICE, "All sockets are already disabled.\n");
 
-	HA_RWLOCK_WRLOCK(PROXY_LOCK, &px->lock);
+	/* pause_proxy will take PROXY_LOCK */
 	ret = pause_proxy(px);
-	HA_RWLOCK_WRUNLOCK(PROXY_LOCK, &px->lock);
 
 	if (!ret)
 		return cli_err(appctx, "Failed to pause frontend, check logs for precise cause.\n");
@@ -3083,9 +3121,8 @@ static int cli_parse_enable_frontend(char **args, char *payload, struct appctx *
 	if (px->li_ready == px->li_all)
 		return cli_msg(appctx, LOG_NOTICE, "All sockets are already enabled.\n");
 
-	HA_RWLOCK_WRLOCK(PROXY_LOCK, &px->lock);
+	/* resume_proxy will take PROXY_LOCK */
 	ret = resume_proxy(px);
-	HA_RWLOCK_WRUNLOCK(PROXY_LOCK, &px->lock);
 
 	if (!ret)
 		return cli_err(appctx, "Failed to resume frontend, check logs for precise cause (port conflict?).\n");

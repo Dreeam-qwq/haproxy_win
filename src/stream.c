@@ -57,6 +57,7 @@
 #include <haproxy/task.h>
 #include <haproxy/tcp_rules.h>
 #include <haproxy/thread.h>
+#include <haproxy/tools.h>
 #include <haproxy/trace.h>
 #include <haproxy/vars.h>
 
@@ -407,6 +408,7 @@ struct stream *stream_new(struct session *sess, struct stconn *sc, struct buffer
 	s->buffer_wait.target = s;
 	s->buffer_wait.wakeup_cb = stream_buf_available;
 
+	s->lat_time = s->cpu_time = 0;
 	s->call_rate.curr_tick = s->call_rate.curr_ctr = s->call_rate.prev_ctr = 0;
 	s->pcli_next_pid = 0;
 	s->pcli_flags = 0;
@@ -1556,6 +1558,50 @@ static void stream_update_both_sc(struct stream *s)
 	}
 }
 
+/* if the current task's wake_date was set, it's being profiled, thus we may
+ * report latencies and CPU usages in logs, so it's desirable to update the
+ * latency when entering process_stream().
+ */
+static void stream_cond_update_cpu_latency(struct stream *s)
+{
+	uint32_t lat = th_ctx->sched_call_date - th_ctx->sched_wake_date;
+
+	s->lat_time += lat;
+}
+
+/* if the current task's wake_date was set, it's being profiled, thus we may
+ * report latencies and CPU usages in logs, so it's desirable to do that before
+ * logging in order to report accurate CPU usage. In this case we count that
+ * final part and reset the wake date so that the scheduler doesn't do it a
+ * second time, and by doing so we also avoid an extra call to clock_gettime().
+ * The CPU usage will be off by the little time needed to run over stream_free()
+ * but that's only marginal.
+ */
+static void stream_cond_update_cpu_usage(struct stream *s)
+{
+	uint32_t cpu;
+
+	/* stats are only registered for non-zero wake dates */
+	if (likely(!th_ctx->sched_wake_date))
+		return;
+
+	cpu = (uint32_t)now_mono_time() - th_ctx->sched_call_date;
+	s->cpu_time += cpu;
+	HA_ATOMIC_ADD(&th_ctx->sched_profile_entry->cpu_time, cpu);
+	th_ctx->sched_wake_date = 0;
+}
+
+/* this functions is called directly by the scheduler for tasks whose
+ * ->process points to process_stream(), and is used to keep latencies
+ * and CPU usage measurements accurate.
+ */
+void stream_update_timings(struct task *t, uint64_t lat, uint64_t cpu)
+{
+	struct stream *s = t->context;
+	s->lat_time += lat;
+	s->cpu_time += cpu;
+}
+
 
 /* This macro is very specific to the function below. See the comments in
  * process_stream() below to understand the logic and the tests.
@@ -1628,6 +1674,7 @@ struct task *process_stream(struct task *t, void *context, unsigned int state)
 	DBG_TRACE_ENTER(STRM_EV_STRM_PROC, s);
 
 	activity[tid].stream_calls++;
+	stream_cond_update_cpu_latency(s);
 
 	req = &s->req;
 	res = &s->res;
@@ -2562,6 +2609,8 @@ struct task *process_stream(struct task *t, void *context, unsigned int state)
 		    (!(sess->fe->options & PR_O_NULLNOLOG) || req->total)) {
 			/* we may need to know the position in the queue */
 			pendconn_free(s);
+
+			stream_cond_update_cpu_usage(s);
 			s->do_log(s);
 		}
 
@@ -2828,6 +2877,18 @@ void stream_dump_and_crash(enum obj_type *obj, int rate)
 		}
 	}
 	chunk_appendf(&trash, "}");
+
+	if (ptr != s) { // that's an appctx
+		const struct appctx *appctx = ptr;
+
+		chunk_appendf(&trash, " applet=%p(", appctx->applet);
+		resolve_sym_name(&trash, NULL, appctx->applet);
+		chunk_appendf(&trash, ")");
+
+		chunk_appendf(&trash, " handler=%p(", appctx->applet->fct);
+		resolve_sym_name(&trash, NULL, appctx->applet->fct);
+		chunk_appendf(&trash, ")");
+	}
 
 	memprintf(&msg,
 	          "A bogus %s [%p] is spinning at %d calls per second and refuses to die, "
@@ -3217,7 +3278,7 @@ static int stats_dump_full_strm_to_buffer(struct stconn *sc, struct stream *strm
 
 		chunk_appendf(&trash,
 			     "  frontend=%s (id=%u mode=%s), listener=%s (id=%u)",
-			     strm_fe(strm)->id, strm_fe(strm)->uuid, proxy_mode_str(strm_fe(strm)->mode),
+			     HA_ANON_CLI(strm_fe(strm)->id), strm_fe(strm)->uuid, proxy_mode_str(strm_fe(strm)->mode),
 			     strm_li(strm) ? strm_li(strm)->name ? strm_li(strm)->name : "?" : "?",
 			     strm_li(strm) ? strm_li(strm)->luid : 0);
 
@@ -3225,7 +3286,7 @@ static int stats_dump_full_strm_to_buffer(struct stconn *sc, struct stream *strm
 		case AF_INET:
 		case AF_INET6:
 			chunk_appendf(&trash, " addr=%s:%d\n",
-				     pn, get_host_port(conn->dst));
+				     HA_ANON_CLI(pn), get_host_port(conn->dst));
 			break;
 		case AF_UNIX:
 			chunk_appendf(&trash, " addr=unix:%d\n", strm_li(strm)->luid);
@@ -3239,7 +3300,7 @@ static int stats_dump_full_strm_to_buffer(struct stconn *sc, struct stream *strm
 		if (strm->be->cap & PR_CAP_BE)
 			chunk_appendf(&trash,
 				     "  backend=%s (id=%u mode=%s)",
-				     strm->be->id,
+				     HA_ANON_CLI(strm->be->id),
 				     strm->be->uuid, proxy_mode_str(strm->be->mode));
 		else
 			chunk_appendf(&trash, "  backend=<NONE> (id=-1 mode=-)");
@@ -3249,7 +3310,7 @@ static int stats_dump_full_strm_to_buffer(struct stconn *sc, struct stream *strm
 		case AF_INET:
 		case AF_INET6:
 			chunk_appendf(&trash, " addr=%s:%d\n",
-				     pn, get_host_port(conn->src));
+				     HA_ANON_CLI(pn), get_host_port(conn->src));
 			break;
 		case AF_UNIX:
 			chunk_appendf(&trash, " addr=unix\n");
@@ -3263,7 +3324,7 @@ static int stats_dump_full_strm_to_buffer(struct stconn *sc, struct stream *strm
 		if (strm->be->cap & PR_CAP_BE)
 			chunk_appendf(&trash,
 				     "  server=%s (id=%u)",
-				     objt_server(strm->target) ? __objt_server(strm->target)->id : "<none>",
+				     objt_server(strm->target) ? HA_ANON_CLI(__objt_server(strm->target)->id) : "<none>",
 				     objt_server(strm->target) ? __objt_server(strm->target)->puid : 0);
 		else
 			chunk_appendf(&trash, "  server=<NONE> (id=-1)");
@@ -3272,7 +3333,7 @@ static int stats_dump_full_strm_to_buffer(struct stconn *sc, struct stream *strm
 		case AF_INET:
 		case AF_INET6:
 			chunk_appendf(&trash, " addr=%s:%d\n",
-				     pn, get_host_port(conn->dst));
+				     HA_ANON_CLI(pn), get_host_port(conn->dst));
 			break;
 		case AF_UNIX:
 			chunk_appendf(&trash, " addr=unix\n");
@@ -3315,6 +3376,12 @@ static int stats_dump_full_strm_to_buffer(struct stconn *sc, struct stream *strm
 			      scf->sedesc->se, sc_ep_get(scf), scf->wait_event.events);
 
 		if ((conn = sc_conn(scf)) != NULL) {
+			if (conn->mux && conn->mux->show_sd) {
+				chunk_appendf(&trash, "     ");
+				conn->mux->show_sd(&trash, scf->sedesc, "     ");
+				chunk_appendf(&trash, "\n");
+			}
+
 			chunk_appendf(&trash,
 			              "      co0=%p ctrl=%s xprt=%s mux=%s data=%s target=%s:%p\n",
 				      conn,
@@ -3332,18 +3399,16 @@ static int stats_dump_full_strm_to_buffer(struct stconn *sc, struct stream *strm
 			              conn_fd(conn) >= 0 ? fdtab[conn->handle.fd].state : 0,
 			              conn_fd(conn) >= 0 ? !!(fdtab[conn->handle.fd].update_mask & ti->ltid_bit) : 0,
 				      conn_fd(conn) >= 0 ? fdtab[conn->handle.fd].thread_mask: 0);
-
 		}
 		else if ((tmpctx = sc_appctx(scf)) != NULL) {
 			chunk_appendf(&trash,
-			              "      app0=%p st0=%d st1=%d applet=%s tid=%d nice=%d calls=%u rate=%u cpu=%llu lat=%llu\n",
+			              "      app0=%p st0=%d st1=%d applet=%s tid=%d nice=%d calls=%u rate=%u\n",
 				      tmpctx,
 				      tmpctx->st0,
 				      tmpctx->st1,
 			              tmpctx->applet->name,
 			              tmpctx->t->tid,
-			              tmpctx->t->nice, tmpctx->t->calls, read_freq_ctr(&tmpctx->call_rate),
-			              (unsigned long long)tmpctx->t->cpu_time, (unsigned long long)tmpctx->t->lat_time);
+			              tmpctx->t->nice, tmpctx->t->calls, read_freq_ctr(&tmpctx->call_rate));
 		}
 
 		scb = strm->scb;
@@ -3353,6 +3418,12 @@ static int stats_dump_full_strm_to_buffer(struct stconn *sc, struct stream *strm
 			      scb->sedesc->se, sc_ep_get(scb), scb->wait_event.events);
 
 		if ((conn = sc_conn(scb)) != NULL) {
+			if (conn->mux && conn->mux->show_sd) {
+				chunk_appendf(&trash, "     ");
+				conn->mux->show_sd(&trash, scb->sedesc, "     ");
+				chunk_appendf(&trash, "\n");
+			}
+
 			chunk_appendf(&trash,
 			              "      co1=%p ctrl=%s xprt=%s mux=%s data=%s target=%s:%p\n",
 				      conn,
@@ -3370,18 +3441,16 @@ static int stats_dump_full_strm_to_buffer(struct stconn *sc, struct stream *strm
 			              conn_fd(conn) >= 0 ? fdtab[conn->handle.fd].state : 0,
 			              conn_fd(conn) >= 0 ? !!(fdtab[conn->handle.fd].update_mask & ti->ltid_bit) : 0,
 				      conn_fd(conn) >= 0 ? fdtab[conn->handle.fd].thread_mask: 0);
-
 		}
 		else if ((tmpctx = sc_appctx(scb)) != NULL) {
 			chunk_appendf(&trash,
-			              "      app1=%p st0=%d st1=%d applet=%s tid=%d nice=%d calls=%u rate=%u cpu=%llu lat=%llu\n",
+			              "      app1=%p st0=%d st1=%d applet=%s tid=%d nice=%d calls=%u rate=%u\n",
 				      tmpctx,
 				      tmpctx->st0,
 				      tmpctx->st1,
 			              tmpctx->applet->name,
 			              tmpctx->t->tid,
-			              tmpctx->t->nice, tmpctx->t->calls, read_freq_ctr(&tmpctx->call_rate),
-			              (unsigned long long)tmpctx->t->cpu_time, (unsigned long long)tmpctx->t->lat_time);
+			              tmpctx->t->nice, tmpctx->t->calls, read_freq_ctr(&tmpctx->call_rate));
 		}
 
 		chunk_appendf(&trash,
@@ -3614,20 +3683,20 @@ static int cli_io_handler_dump_sess(struct appctx *appctx)
 		case AF_INET6:
 			chunk_appendf(&trash,
 				     " src=%s:%d fe=%s be=%s srv=%s",
-				     pn,
+				     HA_ANON_CLI(pn),
 				     get_host_port(conn->src),
-				     strm_fe(curr_strm)->id,
-				     (curr_strm->be->cap & PR_CAP_BE) ? curr_strm->be->id : "<NONE>",
-				     objt_server(curr_strm->target) ? __objt_server(curr_strm->target)->id : "<none>"
+				     HA_ANON_CLI(strm_fe(curr_strm)->id),
+				     (curr_strm->be->cap & PR_CAP_BE) ? HA_ANON_CLI(curr_strm->be->id) : "<NONE>",
+				     objt_server(curr_strm->target) ? HA_ANON_CLI(__objt_server(curr_strm->target)->id) : "<none>"
 				     );
 			break;
 		case AF_UNIX:
 			chunk_appendf(&trash,
 				     " src=unix:%d fe=%s be=%s srv=%s",
 				     strm_li(curr_strm)->luid,
-				     strm_fe(curr_strm)->id,
-				     (curr_strm->be->cap & PR_CAP_BE) ? curr_strm->be->id : "<NONE>",
-				     objt_server(curr_strm->target) ? __objt_server(curr_strm->target)->id : "<none>"
+				     HA_ANON_CLI(strm_fe(curr_strm)->id),
+				     (curr_strm->be->cap & PR_CAP_BE) ? HA_ANON_CLI(curr_strm->be->id) : "<NONE>",
+				     objt_server(curr_strm->target) ? HA_ANON_CLI(__objt_server(curr_strm->target)->id) : "<none>"
 				     );
 			break;
 		}
@@ -3637,7 +3706,7 @@ static int cli_io_handler_dump_sess(struct appctx *appctx)
 		             curr_strm->task->state, curr_strm->stream_epoch,
 			     human_time(now.tv_sec - curr_strm->logs.tv_accept.tv_sec, 1),
 		             curr_strm->task->calls, read_freq_ctr(&curr_strm->call_rate),
-		             (unsigned long long)curr_strm->task->cpu_time, (unsigned long long)curr_strm->task->lat_time);
+		             (unsigned long long)curr_strm->cpu_time, (unsigned long long)curr_strm->lat_time);
 
 		chunk_appendf(&trash,
 			     " rq[f=%06xh,i=%u,an=%02xh,rx=%s",

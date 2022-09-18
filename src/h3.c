@@ -31,7 +31,6 @@
 #include <haproxy/qpack-dec.h>
 #include <haproxy/qpack-enc.h>
 #include <haproxy/quic_enc.h>
-#include <haproxy/stconn.h>
 #include <haproxy/tools.h>
 #include <haproxy/trace.h>
 #include <haproxy/xprt_quic.h>
@@ -605,7 +604,7 @@ static ssize_t h3_parse_settings_frm(struct h3c *h3c, const struct buffer *buf,
 		}
 	}
 
-	TRACE_LEAVE(H3_EV_RX_FRAME|H3_EV_RX_SETTINGS);
+	TRACE_LEAVE(H3_EV_RX_FRAME|H3_EV_RX_SETTINGS, h3c->qcc->conn);
 	return ret;
 }
 
@@ -819,11 +818,8 @@ static int h3_control_send(struct qcs *qcs, void *ctx)
 	}
 
 	ret = b_force_xfer(res, &pos, b_data(&pos));
-	if (ret > 0) {
+	if (ret > 0)
 		h3c->flags |= H3_CF_SETTINGS_SENT;
-		if (!(qcs->qcc->wait_event.events & SUB_RETRY_SEND))
-			tasklet_wakeup(qcs->qcc->wait_event.tasklet);
-	}
 
 	TRACE_LEAVE(H3_EV_TX_SETTINGS, qcs->qcc->conn, qcs);
 	return ret;
@@ -1016,10 +1012,9 @@ static int h3_resp_data_send(struct qcs *qcs, struct buffer *buf, size_t count)
 	return total;
 }
 
-size_t h3_snd_buf(struct stconn *sc, struct buffer *buf, size_t count, int flags)
+static size_t h3_snd_buf(struct qcs *qcs, struct buffer *buf, size_t count, int flags)
 {
 	size_t total = 0;
-	struct qcs *qcs = __sc_mux_strm(sc);
 	struct htx *htx;
 	enum htx_blk_type btype;
 	struct htx_blk *blk;
@@ -1206,7 +1201,8 @@ static int h3_init(struct qcc *qcc)
 	return 0;
 }
 
-static void h3_release(void *ctx)
+/* Send a HTTP/3 GOAWAY followed by a CONNECTION_CLOSE_APP. */
+static void h3_shutdown(void *ctx)
 {
 	struct h3c *h3c = ctx;
 
@@ -1226,7 +1222,11 @@ static void h3_release(void *ctx)
 	 * the connection.
 	 */
 	qcc_emit_cc_app(h3c->qcc, H3_NO_ERROR, 0);
+}
 
+static void h3_release(void *ctx)
+{
+	struct h3c *h3c = ctx;
 	pool_free(pool_head_h3c, h3c);
 }
 
@@ -1248,8 +1248,13 @@ static void h3_trace(enum trace_level level, uint64_t mask,
 	const struct qcc *qcc   = conn ? conn->ctx : NULL;
 	const struct qcs *qcs   = a2;
 
+	if (!qcc)
+		return;
+
 	if (src->verbosity > H3_VERB_CLEAN) {
 		chunk_appendf(&trace_buf, " : qcc=%p(F)", qcc);
+		if (qcc->conn->handle.qc)
+			chunk_appendf(&trace_buf, " qc=%p", qcc->conn->handle.qc);
 
 		if (qcs)
 			chunk_appendf(&trace_buf, " qcs=%p(%llu)", qcs, (ull)qcs->id);
@@ -1264,6 +1269,7 @@ const struct qcc_app_ops h3_ops = {
 	.snd_buf     = h3_snd_buf,
 	.detach      = h3_detach,
 	.finalize    = h3_finalize,
-	.release     = h3_release,
+	.shutdown    = h3_shutdown,
 	.inc_err_cnt = h3_stats_inc_err_cnt,
+	.release     = h3_release,
 };

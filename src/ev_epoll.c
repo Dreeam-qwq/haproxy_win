@@ -222,9 +222,10 @@ static void _do_poll(struct poller *p, int exp, int wake)
 	thread_idle_now();
 	thread_harmless_now();
 
-	/* now let's wait for polled events */
+	/* Now let's wait for polled events. */
 	wait_time = wake ? 0 : compute_poll_timeout(exp);
 	clock_entering_poll();
+
 	do {
 		int timeout = (global.tune.options & GTUNE_BUSY_POLLING) ? 0 : wait_time;
 
@@ -236,8 +237,6 @@ static void _do_poll(struct poller *p, int exp, int wake)
 			break;
 		}
 		if (timeout || !wait_time)
-			break;
-		if (signal_queue_len || wake)
 			break;
 		if (tick_isset(exp) && tick_is_expired(exp, now_ms))
 			break;
