@@ -1,6 +1,5 @@
 /*
- * include/haproxy/xprt_quic-t.h
- * This file contains applet function prototypes
+ * include/haproxy/quic_conn-t.h
  *
  * Copyright 2019 HAProxy Technologies, Frederic Lecaille <flecaille@haproxy.com>
  *
@@ -19,19 +18,20 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
  */
 
-#ifndef _HAPROXY_XPRT_QUIC_T_H
-#define _HAPROXY_XPRT_QUIC_T_H
+#ifndef _HAPROXY_QUIC_CONN_T_H
+#define _HAPROXY_QUIC_CONN_T_H
+
 #ifdef USE_QUIC
 #ifndef USE_OPENSSL
 #error "Must define USE_OPENSSL"
 #endif
 
 #include <sys/socket.h>
-#include <openssl/ssl.h>
 
 #include <haproxy/cbuf-t.h>
 #include <haproxy/list.h>
 
+#include <haproxy/openssl-compat.h>
 #include <haproxy/mux_quic-t.h>
 #include <haproxy/quic_cc-t.h>
 #include <haproxy/quic_frame-t.h>
@@ -220,6 +220,8 @@ enum quic_pkt_type {
 #define           QUIC_EV_TRANSP_PARAMS  (1ULL << 44)
 #define           QUIC_EV_CONN_IDLE_TIMER (1ULL << 45)
 #define           QUIC_EV_CONN_SUB       (1ULL << 46)
+#define           QUIC_EV_CONN_ELEVELSEL (1ULL << 47)
+#define           QUIC_EV_CONN_RCV       (1ULL << 48)
 
 /* Similar to kernel min()/max() definitions. */
 #define QUIC_MIN(a, b) ({ \
@@ -374,9 +376,11 @@ struct quic_dgram {
 	unsigned char *dcid;
 	size_t dcid_len;
 	struct sockaddr_storage saddr;
+	struct sockaddr_storage daddr;
 	struct quic_conn *qc;
-	struct list list;
-	struct mt_list mt_list;
+
+	struct list recv_list; /* elemt to quic_receiver_buf <dgram_list>. */
+	struct mt_list handler_list; /* elem to quic_dghdlr <dgrams>. */
 };
 
 /* The QUIC packet numbers are 62-bits integers */
@@ -388,22 +392,28 @@ struct quic_dgram {
 #define QUIC_MAX_RX_AEPKTS_SINCE_LAST_ACK       2
 /* Flag a received packet as being an ack-eliciting packet. */
 #define QUIC_FL_RX_PACKET_ACK_ELICITING (1UL << 0)
+/* Packet is the first one in the containing datagram. */
+#define QUIC_FL_RX_PACKET_DGRAM_FIRST   (1UL << 1)
 
 struct quic_rx_packet {
 	struct list list;
 	struct list qc_rx_pkt_list;
-	struct quic_conn *qc;
+
+	/* QUIC version used in packet. */
+	const struct quic_version *version;
+
 	unsigned char type;
 	/* Initial desctination connection ID. */
 	struct quic_cid dcid;
 	struct quic_cid scid;
+	/* Packet number offset : only valid for Initial/Handshake/0-RTT/1-RTT. */
 	size_t pn_offset;
 	/* Packet number */
 	int64_t pn;
 	/* Packet number length */
 	uint32_t pnl;
 	uint64_t token_len;
-	const unsigned char *token;
+	unsigned char *token;
 	/* Packet length */
 	uint64_t len;
 	/* Packet length before decryption */
@@ -473,6 +483,8 @@ struct quic_tx_packet {
 	int refcnt;
 	/* Next packet in the same datagram */
 	struct quic_tx_packet *next;
+	/* Previous packet in the same datagram */
+	struct quic_tx_packet *prev;
 	/* Largest acknowledged packet number if this packet contains an ACK frame */
 	int64_t largest_acked_pn;
 	unsigned char type;
@@ -509,6 +521,21 @@ struct q_buf {
 	struct list pkts;
 };
 
+/* Crypto data stream (one by encryption level) */
+struct quic_cstream {
+	struct {
+		uint64_t offset;       /* absolute current base offset of ncbuf */
+		struct ncbuf ncbuf;    /* receive buffer - can handle out-of-order offset frames */
+	} rx;
+	struct {
+		uint64_t offset;      /* last offset of data ready to be sent */
+		uint64_t sent_offset; /* last offset sent by transport layer */
+		struct buffer buf;    /* transmit buffer before sending via xprt */
+	} tx;
+
+	struct qc_stream_desc *desc;
+};
+
 struct quic_enc_level {
 	enum ssl_encryption_level_t level;
 	struct quic_tls_ctx tls_ctx;
@@ -518,11 +545,6 @@ struct quic_enc_level {
 		struct eb_root pkts;
 		/* Liste of QUIC packets with protected header. */
 		struct list pqpkts;
-		/* Crypto frames */
-		struct {
-			uint64_t offset;
-			struct eb_root frms;
-		} crypto;
 	} rx;
 	struct {
 		struct {
@@ -535,6 +557,8 @@ struct quic_enc_level {
 			uint64_t offset;
 		} crypto;
 	} tx;
+	/* Crypto data stream */
+	struct quic_cstream *cstream;
 	struct quic_pktns *pktns;
 };
 
@@ -561,13 +585,6 @@ struct quic_path {
 /* QUIC ring buffer */
 struct qring {
 	struct cbuf *cbuf;
-	struct mt_list mt_list;
-};
-
-/* QUIC RX buffer */
-struct rxbuf {
-	struct buffer buf;
-	struct list dgrams;
 	struct mt_list mt_list;
 };
 
@@ -609,6 +626,8 @@ struct quic_conn {
 	const struct quic_version *negotiated_version;
 	/* Negotiated version Initial TLS context */
 	struct quic_tls_ctx negotiated_ictx;
+	/* Connection owned socket FD. */
+	int fd;
 	/* QUIC transport parameters TLS extension */
 	int tps_tls_ext;
 	/* Thread ID this connection is attached to */
@@ -636,6 +655,7 @@ struct quic_conn {
 
 	struct ssl_sock_ctx *xprt_ctx;
 
+	struct sockaddr_storage local_addr;
 	struct sockaddr_storage peer_addr;
 
 	/* Used only to reach the tasklet for the I/O handler from this quic_conn object. */
@@ -689,6 +709,9 @@ struct quic_conn {
 	struct eb_root streams_by_id; /* qc_stream_desc tree */
 	int stream_buf_count; /* total count of allocated stream buffers for this connection */
 
+	struct wait_event wait_event;
+	struct wait_event *subs;
+
 	/* MUX */
 	struct qcc *qcc;
 	struct task *timer_task;
@@ -707,4 +730,4 @@ struct quic_conn {
 };
 
 #endif /* USE_QUIC */
-#endif /* _HAPROXY_XPRT_QUIC_T_H */
+#endif /* _HAPROXY_QUIC_CONN_T_H */

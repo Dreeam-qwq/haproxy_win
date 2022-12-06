@@ -32,6 +32,7 @@
 #include <haproxy/api.h>
 #include <haproxy/connection-t.h>
 #include <haproxy/listener-t.h>
+#include <haproxy/quic_conn-t.h>
 #include <haproxy/quic_sock-t.h>
 
 int quic_session_accept(struct connection *cli_conn);
@@ -39,9 +40,30 @@ int quic_sock_get_src(struct connection *conn, struct sockaddr *addr, socklen_t 
 int quic_sock_get_dst(struct connection *conn, struct sockaddr *addr, socklen_t len);
 int quic_sock_accepting_conn(const struct receiver *rx);
 struct connection *quic_sock_accept_conn(struct listener *l, int *status);
-void quic_sock_fd_iocb(int fd);
+
+struct task *quic_lstnr_dghdlr(struct task *t, void *ctx, unsigned int state);
+void quic_lstnr_sock_fd_iocb(int fd);
 int qc_snd_buf(struct quic_conn *qc, const struct buffer *buf, size_t count,
                int flags);
+int qc_rcv_buf(struct quic_conn *qc);
+
+/* Set default value for <qc> socket as uninitialized. */
+static inline void qc_init_fd(struct quic_conn *qc)
+{
+	qc->fd = -1;
+}
+
+/* Returns true if <qc> socket is initialized else false. */
+static inline char qc_test_fd(struct quic_conn *qc)
+{
+	/* quic-conn socket should not be accessed once it has been released. */
+	BUG_ON(qc->fd == DEAD_FD_MAGIC);
+	return qc->fd >= 0;
+}
+
+void qc_alloc_fd(struct quic_conn *qc, const struct sockaddr_storage *src,
+                 const struct sockaddr_storage *dst);
+void qc_release_fd(struct quic_conn *qc, int reinit);
 
 void quic_accept_push_qc(struct quic_conn *qc);
 

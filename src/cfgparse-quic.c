@@ -3,7 +3,7 @@
 #include <haproxy/api.h>
 #include <haproxy/cfgparse.h>
 #include <haproxy/errors.h>
-#include <haproxy/global-t.h>
+#include <haproxy/global.h>
 #include <haproxy/listener.h>
 #include <haproxy/proxy-t.h>
 #include <haproxy/quic_cc-t.h>
@@ -22,13 +22,13 @@ static int bind_parse_quic_cc_algo(char **args, int cur_arg, struct proxy *px,
 	struct quic_cc_algo *cc_algo;
 
 	if (!*args[cur_arg + 1]) {
-		memprintf(err, "'%s' : missing control congestion algorith", args[cur_arg]);
+		memprintf(err, "'%s' : missing control congestion algorithm", args[cur_arg]);
 		return ERR_ALERT | ERR_FATAL;
 	}
 
-	if (!strcmp(args[cur_arg + 1], "newreno"))
+	if (strcmp(args[cur_arg + 1], "newreno") == 0)
 	    cc_algo = &quic_cc_algo_nr;
-	else if (!strcmp(args[cur_arg + 1], "cubic"))
+	else if (strcmp(args[cur_arg + 1], "cubic") == 0)
 	    cc_algo = &quic_cc_algo_cubic;
 	else {
 		memprintf(err, "'%s' : unknown control congestion algorithm", args[cur_arg]);
@@ -46,6 +46,29 @@ static struct bind_kw_list bind_kws = { "QUIC", { }, {
 }};
 
 INITCALL1(STG_REGISTER, bind_register_keywords, &bind_kws);
+
+/* parse "tune.quic.socket-owner", accepts "listener" or "connection" */
+static int cfg_parse_quic_tune_socket_owner(char **args, int section_type,
+                                            struct proxy *curpx,
+                                            const struct proxy *defpx,
+                                            const char *file, int line, char **err)
+{
+	if (too_many_args(1, args, err, NULL))
+		return -1;
+
+	if (strcmp(args[1], "connection") == 0) {
+		global.tune.options |= GTUNE_QUIC_SOCK_PER_CONN;
+	}
+	else if (strcmp(args[1], "listener") == 0) {
+		global.tune.options &= ~GTUNE_QUIC_SOCK_PER_CONN;
+	}
+	else {
+		memprintf(err, "'%s' expects either 'listener' or 'connection' but got '%s'.", args[0], args[1]);
+		return -1;
+	}
+
+	return 0;
+}
 
 /* Must be used to parse tune.quic.* setting which requires a time
  * as value.
@@ -132,6 +155,7 @@ static int cfg_parse_quic_tune_setting(char **args, int section_type,
 }
 
 static struct cfg_kw_list cfg_kws = {ILH, {
+	{ CFG_GLOBAL, "tune.quic.socket-owner", cfg_parse_quic_tune_socket_owner },
 	{ CFG_GLOBAL, "tune.quic.backend.max-idle-timeou", cfg_parse_quic_time },
 	{ CFG_GLOBAL, "tune.quic.frontend.conn-tx-buffers.limit", cfg_parse_quic_tune_setting },
 	{ CFG_GLOBAL, "tune.quic.frontend.max-streams-bidi", cfg_parse_quic_tune_setting },

@@ -115,6 +115,7 @@
 #include <haproxy/namespace.h>
 #include <haproxy/net_helper.h>
 #include <haproxy/openssl-compat.h>
+#include <haproxy/quic_conn-t.h>
 #include <haproxy/quic_tp-t.h>
 #include <haproxy/pattern.h>
 #include <haproxy/peers.h>
@@ -139,7 +140,6 @@
 #include <haproxy/uri_auth-t.h>
 #include <haproxy/vars.h>
 #include <haproxy/version.h>
-#include <haproxy/xprt_quic-t.h>
 
 
 /* array of init calls for older platforms */
@@ -590,7 +590,7 @@ static void usage(char *name)
 		"        -N sets the default, per-proxy maximum # of connections (%d)\n"
 		"        -L set local peer name (default to hostname)\n"
 		"        -p writes pids of all children to this file\n"
-		"        -dC[key] display the configure file, if there is a key, the file will be anonymise\n"
+		"        -dC[[key],line] display the configuration file, if there is a key, the file will be anonymised\n"
 #if defined(USE_EPOLL)
 		"        -de disables epoll() usage even when available\n"
 #endif
@@ -709,8 +709,7 @@ static void mworker_reexec()
 	/* restore the initial FD limits */
 	limit.rlim_cur = rlim_fd_cur_at_boot;
 	limit.rlim_max = rlim_fd_max_at_boot;
-	if (setrlimit(RLIMIT_NOFILE, &limit) == -1) {
-		getrlimit(RLIMIT_NOFILE, &limit);
+	if (raise_rlim_nofile(&limit, &limit) != 0) {
 		ha_warning("Failed to restore initial FD limits (cur=%u max=%u), using cur=%u max=%u\n",
 			   rlim_fd_cur_at_boot, rlim_fd_max_at_boot,
 			   (unsigned int)limit.rlim_cur, (unsigned int)limit.rlim_max);
@@ -866,6 +865,7 @@ void reexec_on_failure()
 	sock_drop_unused_old_sockets();
 
 	usermsgs_clr(NULL);
+	setenv("HAPROXY_LOAD_SUCCESS", "0", 1);
 	ha_warning("Loading failure!\n");
 #if defined(USE_SYSTEMD)
 	/* the sd_notify API is not able to send a reload failure signal. So
@@ -1451,14 +1451,14 @@ static int check_if_maxsock_permitted(int maxsock)
 		return 1;
 
 	/* don't go further if we can't even set to what we have */
-	if (setrlimit(RLIMIT_NOFILE, &orig_limit) != 0)
+	if (raise_rlim_nofile(NULL, &orig_limit) != 0)
 		return 1;
 
 	test_limit.rlim_max = MAX(maxsock, orig_limit.rlim_max);
 	test_limit.rlim_cur = test_limit.rlim_max;
-	ret = setrlimit(RLIMIT_NOFILE, &test_limit);
+	ret = raise_rlim_nofile(NULL, &test_limit);
 
-	if (setrlimit(RLIMIT_NOFILE, &orig_limit) != 0)
+	if (raise_rlim_nofile(NULL, &orig_limit) != 0)
 		return 1;
 
 	return ret == 0;
@@ -1578,6 +1578,9 @@ static void init_args(int argc, char **argv)
 #ifdef USE_THREAD
 	global.tune.options |= GTUNE_IDLE_POOL_SHARED;
 #endif
+#ifdef USE_QUIC
+	global.tune.options |= GTUNE_QUIC_SOCK_PER_CONN;
+#endif
 	global.tune.options |= GTUNE_STRICT_LIMITS;
 
 	/* keep a copy of original arguments for the master process */
@@ -1635,6 +1638,19 @@ static void init_args(int argc, char **argv)
 			else if (*flag == 'V')
 				arg_mode |= MODE_VERBOSE;
 			else if (*flag == 'd' && flag[1] == 'C') {
+				char *end;
+				char *key;
+
+				key = flag + 2;
+				for (;key && *key; key = end) {
+					end = strchr(key, ',');
+					if (end)
+						*(end++) = 0;
+
+					if (strcmp(key, "line") == 0)
+						arg_mode |= MODE_DUMP_NB_L;
+
+				}
 				arg_mode |= MODE_DUMP_CFG;
 				HA_ATOMIC_STORE(&global.anon_key, atoll(flag + 2));
 			}
@@ -1882,6 +1898,26 @@ static void dump_registered_keywords(void)
 	}
 }
 
+/* Generate a random cluster-secret in case the setting is not provided in the
+ * configuration. This allows to use features which rely on it albeit with some
+ * limitations.
+ */
+static void generate_random_cluster_secret()
+{
+	/* used as a default random cluster-secret if none defined. */
+	uint64_t rand = ha_random64();
+
+	/* The caller must not overwrite an already defined secret. */
+	BUG_ON(global.cluster_secret);
+
+	global.cluster_secret = malloc(8);
+	if (!global.cluster_secret)
+		return;
+
+	memcpy(global.cluster_secret, &rand, sizeof(rand));
+	global.cluster_secret[7] = '\0';
+}
+
 /*
  * This function initializes all the necessary variables. It only returns
  * if everything is OK. If something fails, it exits.
@@ -1896,6 +1932,22 @@ static void init(int argc, char **argv)
 	struct pre_check_fct *prcf;
 	int ideal_maxconn;
 
+#ifdef USE_OPENSSL
+#ifdef USE_OPENSSL_WOLFSSL
+        wolfSSL_Init();
+        wolfSSL_Debugging_ON();
+#endif
+#if (HA_OPENSSL_VERSION_NUMBER < 0x1010000fL)
+	/* Initialize the error strings of OpenSSL
+	 * It only needs to be done explicitly with older versions of the SSL
+	 * library. On newer versions, errors strings are loaded during start
+	 * up. */
+	SSL_load_error_strings();
+#endif
+#endif
+
+	startup_logs_init();
+
 	if (!init_trash_buffers(1)) {
 		ha_alert("failed to initialize trash buffers.\n");
 		exit(1);
@@ -1909,7 +1961,8 @@ static void init(int argc, char **argv)
 
 	global.mode |= (arg_mode & (MODE_DAEMON | MODE_MWORKER | MODE_FOREGROUND | MODE_VERBOSE
 				    | MODE_QUIET | MODE_CHECK | MODE_DEBUG | MODE_ZERO_WARNING
-				    | MODE_DIAG | MODE_CHECK_CONDITION | MODE_DUMP_LIBS | MODE_DUMP_KWD | MODE_DUMP_CFG));
+				    | MODE_DIAG | MODE_CHECK_CONDITION | MODE_DUMP_LIBS | MODE_DUMP_KWD
+				    | MODE_DUMP_CFG | MODE_DUMP_NB_L));
 
 	if (getenv("HAPROXY_MWORKER_WAIT_ONLY")) {
 		unsetenv("HAPROXY_MWORKER_WAIT_ONLY");
@@ -2061,6 +2114,19 @@ static void init(int argc, char **argv)
 			tmproc->options |= PROC_O_TYPE_MASTER; /* master */
 			tmproc->pid = pid;
 			tmproc->timestamp = start_date.tv_sec;
+
+			/* Creates the mcli_reload listener, which is the listener used
+			 * to retrieve the master CLI session which asked for the reload.
+			 *
+			 * ipc_fd[1] will be used as a listener, and ipc_fd[0]
+			 * will be used to send the FD of the session.
+			 *
+			 * Both FDs will be kept in the master.
+			 */
+			if (socketpair(AF_UNIX, SOCK_STREAM, 0, tmproc->ipc_fd) < 0) {
+				ha_alert("cannot create the mcli_reload socketpair.\n");
+				exit(EXIT_FAILURE);
+			}
 			proc_self = tmproc;
 
 			LIST_APPEND(&proc_list, &tmproc->list);
@@ -2098,6 +2164,7 @@ static void init(int argc, char **argv)
 		}
 
 		if (!LIST_ISEMPTY(&mworker_cli_conf)) {
+			char *path = NULL;
 
 			if (mworker_cli_proxy_create() < 0) {
 				ha_alert("Can't create the master's CLI.\n");
@@ -2106,7 +2173,7 @@ static void init(int argc, char **argv)
 
 			list_for_each_entry_safe(c, it, &mworker_cli_conf, list) {
 
-				if (mworker_cli_proxy_new_listener(c->s) < 0) {
+				if (mworker_cli_proxy_new_listener(c->s) == NULL) {
 					ha_alert("Can't create the master's CLI.\n");
 					exit(EXIT_FAILURE);
 				}
@@ -2114,6 +2181,14 @@ static void init(int argc, char **argv)
 				free(c->s);
 				free(c);
 			}
+			/* Create the mcli_reload listener from the proc_self struct */
+			memprintf(&path, "sockpair@%d", proc_self->ipc_fd[1]);
+			mcli_reload_bind_conf = mworker_cli_proxy_new_listener(path);
+			if (mcli_reload_bind_conf == NULL) {
+				ha_alert("Cannot create the mcli_reload listener.\n");
+				exit(EXIT_FAILURE);
+			}
+			ha_free(&path);
 		}
 	}
 
@@ -2239,8 +2314,6 @@ static void init(int argc, char **argv)
 	}
 
 #ifdef USE_OPENSSL
-	/* Initialize the error strings of OpenSSL */
-	SSL_load_error_strings();
 
 	/* Initialize SSL random generator. Must be called before chroot for
 	 * access to /dev/urandom, and before ha_random_boot() which may use
@@ -2519,6 +2592,9 @@ static void init(int argc, char **argv)
 		exit(1);
 	}
 
+	if (!global.cluster_secret)
+		generate_random_cluster_secret();
+
 	/*
 	 * Note: we could register external pollers here.
 	 * Built-in pollers have been registered before main().
@@ -2598,6 +2674,10 @@ void deinit(void)
 	struct pre_check_fct *prcf, *prcfb;
 	struct cfg_postparser *pprs, *pprsb;
 	int cur_fd;
+
+	/* the user may want to skip this phase */
+	if (global.tune.options & GTUNE_QUICK_EXIT)
+		return;
 
 	/* At this point the listeners state is weird:
 	 *  - most listeners are still bound and referenced in their protocol
@@ -3143,7 +3223,7 @@ int main(int argc, char **argv)
 		limit.rlim_max = MAX(rlim_fd_max_at_boot, limit.rlim_cur);
 
 		if ((global.fd_hard_limit && limit.rlim_cur > global.fd_hard_limit) ||
-		    setrlimit(RLIMIT_NOFILE, &limit) == -1) {
+		    raise_rlim_nofile(NULL, &limit) != 0) {
 			getrlimit(RLIMIT_NOFILE, &limit);
 			if (global.fd_hard_limit && limit.rlim_cur > global.fd_hard_limit)
 				limit.rlim_cur = global.fd_hard_limit;
@@ -3159,7 +3239,7 @@ int main(int argc, char **argv)
 				if (global.fd_hard_limit && limit.rlim_cur > global.fd_hard_limit)
 					limit.rlim_cur = global.fd_hard_limit;
 
-				if (setrlimit(RLIMIT_NOFILE, &limit) != -1)
+				if (raise_rlim_nofile(&limit, &limit) == 0)
 					getrlimit(RLIMIT_NOFILE, &limit);
 
 				ha_warning("[%s.main()] Cannot raise FD limit to %d, limit is %d.\n",
@@ -3395,9 +3475,13 @@ int main(int argc, char **argv)
 
 		/* the father launches the required number of processes */
 		if (!(global.mode & MODE_MWORKER_WAIT)) {
+			struct ring *tmp_startup_logs = NULL;
+
 			if (global.mode & MODE_MWORKER)
 				mworker_ext_launch_all();
 
+			/* at this point the worker must have his own startup_logs buffer */
+			tmp_startup_logs = startup_logs_dup(startup_logs);
 			ret = fork();
 			if (ret < 0) {
 				ha_alert("[%s.main()] Cannot fork.\n", argv[0]);
@@ -3405,6 +3489,8 @@ int main(int argc, char **argv)
 				exit(1); /* there has been an error */
 			}
 			else if (ret == 0) { /* child breaks here */
+				startup_logs_free(startup_logs);
+				startup_logs = tmp_startup_logs;
 				/* This one must not be exported, it's internal! */
 				unsetenv("HAPROXY_MWORKER_REEXEC");
 				ha_random_jump96(1);
@@ -3485,6 +3571,7 @@ int main(int argc, char **argv)
 						sd_notifyf(0, "READY=1\nMAINPID=%lu\nSTATUS=Ready.\n", (unsigned long)getpid());
 #endif
 					/* if not in wait mode, reload in wait mode to free the memory */
+					setenv("HAPROXY_LOAD_SUCCESS", "1", 1);
 					ha_notice("Loading success.\n");
 					proc_self->failedreloads = 0; /* reset the number of failure */
 					mworker_reexec_waitmode();

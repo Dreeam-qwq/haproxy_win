@@ -1201,7 +1201,7 @@ static struct connection *conn_backend_get(struct stream *s, struct server *srv,
 	/* Lookup all other threads for an idle connection, starting from last
 	 * unvisited thread, but always staying in the same group.
 	 */
-	stop = srv->next_takeover;
+	stop = srv->per_tgrp[tgid - 1].next_takeover;
 	if (stop >= tg->count)
 		stop %= tg->count;
 
@@ -1246,7 +1246,7 @@ static struct connection *conn_backend_get(struct stream *s, struct server *srv,
 		conn = NULL;
  done:
 	if (conn) {
-		_HA_ATOMIC_STORE(&srv->next_takeover, (i + 1 == tg->base + tg->count) ? tg->base : i + 1);
+		_HA_ATOMIC_STORE(&srv->per_tgrp[tgid - 1].next_takeover, (i + 1 == tg->base + tg->count) ? tg->base : i + 1);
 
 		srv_use_conn(srv, conn);
 
@@ -1264,9 +1264,8 @@ static struct connection *conn_backend_get(struct stream *s, struct server *srv,
 			session_add_conn(s->sess, conn, conn->target);
 		}
 		else {
-			ebmb_insert(&srv->per_thr[tid].avail_conns,
-			            &conn->hash_node->node,
-			            sizeof(conn->hash_node->hash));
+			eb64_insert(&srv->per_thr[tid].avail_conns,
+			            &conn->hash_node->node);
 		}
 	}
 	return conn;
@@ -1610,7 +1609,7 @@ skip_reuse:
 				return SF_ERR_RESOURCE;
 			}
 
-			srv_conn->hash_node->hash = hash;
+			srv_conn->hash_node->node.key = hash;
 		}
 	}
 
@@ -1778,7 +1777,7 @@ skip_reuse:
 			if (srv && reuse_mode == PR_O_REUSE_ALWS &&
 			    !(srv_conn->flags & CO_FL_PRIVATE) &&
 			    srv_conn->mux->avail_streams(srv_conn) > 0) {
-				ebmb_insert(&srv->per_thr[tid].avail_conns, &srv_conn->hash_node->node, sizeof(srv_conn->hash_node->hash));
+				eb64_insert(&srv->per_thr[tid].avail_conns, &srv_conn->hash_node->node);
 			}
 			else if (srv_conn->flags & CO_FL_PRIVATE ||
 			         (reuse_mode == PR_O_REUSE_SAFE &&
@@ -2413,7 +2412,6 @@ void back_handle_st_cer(struct stream *s)
 
 		/* only wait when we're retrying on the same server */
 		if ((sc->state == SC_ST_ASS ||
-		     (s->be->lbprm.algo & BE_LB_KIND) != BE_LB_KIND_RR ||
 		     (s->be->srv_act <= 1)) && !reused) {
 			sc->state = SC_ST_TAR;
 			s->conn_exp = tick_add(now_ms, MS_TO_TICKS(delay));

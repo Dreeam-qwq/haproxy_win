@@ -22,6 +22,11 @@
 #ifndef _HAPROXY_COMPILER_H
 #define _HAPROXY_COMPILER_H
 
+/* leave a chance to the compiler to bring its own definitions first; this
+ * will cause cdefs.h to be included on systems which have it.
+ */
+#include <inttypes.h>
+
 #ifdef DEBUG_USE_ABORT
 #include <stdlib.h>
 #endif
@@ -35,6 +40,43 @@
 #else
 #define VAR_ARRAY
 #endif
+#endif
+
+/* This is used to test if a macro is defined and equals 1. The principle is
+ * that the macro is passed as a value and its value concatenated to the word
+ * "comma_for_one" to form a new macro name. The macro "comma_for_one1" equals
+ * one comma, which, once used in an argument, will shift all of them by one,
+ * so that we can use this to concatenate both a 1 and a 0 and always pick the
+ * second one.
+ */
+#define comma_for_one1 ,
+#define ____equals_1(x, y, ...) (y)
+#define ___equals_1(x, ...) ____equals_1(x, 0)
+#define __equals_1(x) ___equals_1(comma_for_one ## x 1)
+
+/* gcc 5 and clang 3 brought __has_attribute(), which is not well documented in
+ * the case of gcc, but is convenient since handled at the preprocessor level.
+ * In both cases it's possible to test for __has_attribute() using ifdef. When
+ * not defined we remap this to the __has_attribute_<name> macro so that we'll
+ * later be able to implement on a per-compiler basis those which are missing,
+ * by defining __has_attribute_<name> to 1.
+ */
+#ifndef __has_attribute
+#define __has_attribute(x) __equals_1(__has_attribute_ ## x)
+#endif
+
+/* The fallthrough attribute arrived with gcc 7, the same version that started
+ * to emit the fallthrough warnings and to parse the comments. Comments do not
+ * manage to stop the warning when preprocessing is split from compiling (e.g.
+ * when building under distcc). Better encourage the use of a __fallthrough
+ * statement instead. There are still limitations in that clang doesn't accept
+ * it after a label; this is the reason why we're always preceding it with an
+ * empty do-while.
+ */
+#if __has_attribute(fallthrough)
+#  define __fallthrough do { } while (0); __attribute__((fallthrough))
+#else
+#  define __fallthrough do { } while (0)
 #endif
 
 #if !defined(__GNUC__)

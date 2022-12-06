@@ -1,7 +1,7 @@
                              ------------------------
                              HAProxy Management Guide
                              ------------------------
-                                   version 2.7
+                                   version 2.8
 
 
 This document describes how to start, stop, manage, and troubleshoot HAProxy,
@@ -2145,8 +2145,11 @@ help [<command>]
 httpclient <method> <URI>
   Launch an HTTP client request and print the response on the CLI. Only
   supported on a CLI connection running in expert mode (see "expert-mode on").
-  It's only meant for debugging. It currently can't resolve FQDN so your URI must
-  contains an IP.
+  It's only meant for debugging. The httpclient is able to resolve a server
+  name in the URL using the "default" resolvers section, which is populated
+  with the DNS servers of your /etc/resolv.conf by default. However it won't be
+  able to resolve an host from /etc/hosts if you don't use a local dns daemon
+  which can resolve those.
 
 new ssl ca-file <cafile>
   Create a new empty CA file tree entry to be filled with a set of CA
@@ -2208,7 +2211,7 @@ set anon [on|off] [<key>]
   to spot bugs, but a low enough bit count (24) to make them non-reversible due
   to the high number of possible matches. When turned on, if no key is
   specified, the global key will be used (either specified in the configuration
-  file by "anonkey" or set via the CLI command "set global-key"). If no such
+  file by "anonkey" or set via the CLI command "set anon global-key"). If no such
   key was set, a random one will be generated. Otherwise it's possible to
   specify the 32-bit key to be used for the current session, for example, to
   reuse the key that was used in a previous dump to help compare outputs.
@@ -2220,7 +2223,7 @@ set dynamic-cookie-key backend <backend> <value>
   Modify the secret key used to generate the dynamic persistent cookies.
   This will break the existing sessions.
 
-set global-key <key>
+set anon global-key <key>
   This sets the global anonymizing key to <key>, which must be a 32-bit
   integer between 0 and 4294967295 (0 disables the global key). This command
   requires admin privilege.
@@ -2894,11 +2897,37 @@ show peers [dict|-] [<peers section>]
             table:0x55871b5b46a0 id=stkt update=1 localupdate=0 \
               commitupdate=0 syncing=0
 
-show pools
+show pools [byname|bysize|byusage] [match <pfx>] [<nb>]
   Dump the status of internal memory pools. This is useful to track memory
   usage when suspecting a memory leak for example. It does exactly the same
-  as the SIGQUIT when running in foreground except that it does not flush
-  the pools.
+  as the SIGQUIT when running in foreground except that it does not flush the
+  pools. The output is not sorted by default. If "byname" is specified, it is
+  sorted by pool name; if "bysize" is specified, it is sorted by item size in
+  reverse order; if "byusage" is specified, it is sorted by total usage in
+  reverse order, and only used entries are shown. It is also possible to limit
+  the output to the <nb> first entries (e.g. when sorting by usage). Finally,
+  if "match" followed by a prefix is specified, then only pools whose name
+  starts with this prefix will be shown. The reported total only concerns pools
+  matching the filtering criteria. Example:
+
+    $ socat - /tmp/haproxy.sock <<< "show pools match quic byusage"
+    Dumping pools usage. Use SIGQUIT to flush them.
+      - Pool quic_conn_r (65560 bytes) : 1337 allocated (87653720 bytes), ...
+      - Pool quic_crypto (1048 bytes) : 6685 allocated (7005880 bytes), ...
+      - Pool quic_conn (4056 bytes) : 1337 allocated (5422872 bytes), ...
+      - Pool quic_rxbuf (262168 bytes) : 8 allocated (2097344 bytes), ...
+      - Pool quic_connne (184 bytes) : 9359 allocated (1722056 bytes), ...
+      - Pool quic_frame (184 bytes) : 7938 allocated (1460592 bytes), ...
+      - Pool quic_tx_pac (152 bytes) : 6454 allocated (981008 bytes), ...
+      - Pool quic_tls_ke (56 bytes) : 12033 allocated (673848 bytes), ...
+      - Pool quic_rx_pac (408 bytes) : 1596 allocated (651168 bytes), ...
+      - Pool quic_tls_se (88 bytes) : 6685 allocated (588280 bytes), ...
+      - Pool quic_cstrea (88 bytes) : 4011 allocated (352968 bytes), ...
+      - Pool quic_tls_iv (24 bytes) : 12033 allocated (288792 bytes), ...
+      - Pool quic_dgram (344 bytes) : 732 allocated (251808 bytes), ...
+      - Pool quic_arng (56 bytes) : 4011 allocated (224616 bytes), ...
+      - Pool quic_conn_c (152 bytes) : 1337 allocated (203224 bytes), ...
+    Total: 15 pools, 109578176 bytes allocated, 109578176 used ...
 
 show profiling [{all | status | tasks | memory}] [byaddr|bytime|aggr|<max_lines>]*
   Dumps the current profiling settings, one per line, as well as the command
@@ -3432,6 +3461,13 @@ show ssl providers
         - fips
         - base
 
+show startup-logs
+  Dump all messages emitted during the startup of the current haproxy process,
+  each startup-logs buffer is unique to its haproxy worker.
+
+  This keyword also exists on the master CLI, which shows the latest startup or
+  reload tentative.
+
 show table
   Dump general information on all known stick-tables. Their name is returned
   (the name of the proxy which holds them), their type (currently zero, always
@@ -3507,6 +3543,16 @@ show table <name> [ data.<type> <operator> <value> [data.<type> ...]] | [ key <k
           | socat stdio /tmp/sock1 \
           | fgrep 'key=' | cut -d' ' -f2 | cut -d= -f2 > abusers-ip.txt
           ( or | awk '/key/{ print a[split($2,a,"=")]; }' )
+
+  When the stick-table is synchronized to a peers section supporting sharding,
+  the shard number will be displayed for each key (otherwise '0' is reported).
+  This allows to know which peers will receive this key.
+  Example:
+        $ echo "show table http_proxy" | socat stdio /tmp/sock1 | fgrep shard=
+          0x7f23b0c822a8: key=10.0.0.2 use=0 exp=296398 shard=9 gpc0=0
+          0x7f23a063f948: key=10.0.0.6 use=0 exp=296075 shard=12 gpc0=0
+          0x7f23b03920b8: key=10.0.0.8 use=0 exp=296766 shard=1 gpc0=0
+          0x7f23a43c09e8: key=10.0.0.12 use=0 exp=295368 shard=8 gpc0=0
 
 show tasks
   Dumps the number of tasks currently in the run queue, with the number of
@@ -3886,11 +3932,42 @@ reload
   does the same as a `kill -USR2` on the master process, provided that the user
   has at least "operator" or "admin" privileges.
 
+  This command allows you to perform a synchronous reload, the command will
+  return a reload status, once the reload was performed. Be careful with the
+  timeout if a tool is used to parse it, it is only returned once the
+  configuration is parsed and the new worker is forked. The "socat" command uses
+  a timeout of 0.5s by default so it will quits before showing the message if
+  the reload is too long. "ncat" does not have a timeout by default.
+  When compiled with USE_SHM_OPEN=1, the reload command is also able to dump
+  the startup-logs of the master.
+
   Example:
 
-    $ echo "reload" | socat /var/run/haproxy-master.sock stdin
+    $ echo "reload" | socat -t300 /var/run/haproxy-master.sock stdin
+    Success=1
+    --
+    [NOTICE]   (482713) : haproxy version is 2.7-dev7-4827fb-69
+    [NOTICE]   (482713) : path to executable is ./haproxy
+    [WARNING]  (482713) : config : 'http-request' rules ignored for proxy 'frt1' as they require HTTP mode.
+    [NOTICE]   (482713) : New worker (482720) forked
+    [NOTICE]   (482713) : Loading success.
 
-  Note that a reload will close the connection to the master CLI.
+    $ echo "reload" | socat -t300 /var/run/haproxy-master.sock stdin
+    Success=0
+    --
+    [NOTICE]   (482886) : haproxy version is 2.7-dev7-4827fb-69
+    [NOTICE]   (482886) : path to executable is ./haproxy
+    [ALERT]    (482886) : config : parsing [test3.cfg:1]: unknown keyword 'Aglobal' out of section.
+    [ALERT]    (482886) : config : Fatal errors found in configuration.
+    [WARNING]  (482886) : Loading failure!
+
+    $
+
+  The reload command is the last executed on the master CLI, every other
+  command after it are ignored. Once the reload command returns its status, it
+  will close the connection to the CLI.
+
+  Note that a reload will close all connections to the master CLI.
 
 show proc
   The master CLI introduces a 'show proc' command to surpervise the
@@ -3912,6 +3989,18 @@ show proc
   In this example, the master has been reloaded 5 times but one of the old
   worker is still running and survived 3 reloads. You could access the CLI of
   this worker to understand what's going on.
+
+show startup-logs
+  HAProxy needs to be compiled with USE_SHM_OPEN=1 to be used correctly on the
+  master CLI or all messages won't be visible.
+
+  Like its counterpart on the stats socket, this command is able to show the
+  startup messages of HAProxy. However it does not dump the startup messages
+  of the current worker, but the startup messages of the latest startup or
+  reload, which means it is able to dump the parsing messages of a failed
+  reload.
+
+  Those messages are also dumped with the "reload" command.
 
 10. Tricks for easier configuration management
 ----------------------------------------------

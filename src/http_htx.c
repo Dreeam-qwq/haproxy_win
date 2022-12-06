@@ -389,6 +389,9 @@ int http_replace_req_uri(struct htx *htx, const struct ist uri)
 		goto fail;
 
 	sl = http_get_stline(htx);
+	ALREADY_CHECKED(sl); /* the stline exists because http_replace_stline() succeeded */
+
+	sl->flags &= ~HTX_SL_F_NORMALIZED_URI;
 	if (!http_update_host(htx, sl, uri))
 		goto fail;
 
@@ -1571,6 +1574,7 @@ struct http_reply *http_parse_http_reply(const char **args, int *orig_arg, struc
 			fd = -1;
 			obj[objlen] = '\0';
 			reply->type = HTTP_REPLY_LOGFMT;
+			LIST_INIT(&reply->body.fmt);
 			cur_arg++;
 		}
 		else if (strcmp(args[cur_arg], "lf-string") == 0) {
@@ -1587,6 +1591,7 @@ struct http_reply *http_parse_http_reply(const char **args, int *orig_arg, struc
 			obj = strdup(args[cur_arg]);
 			objlen = strlen(args[cur_arg]);
 			reply->type = HTTP_REPLY_LOGFMT;
+			LIST_INIT(&reply->body.fmt);
 			cur_arg++;
 		}
 		else if (strcmp(args[cur_arg], "hdr") == 0) {
@@ -1765,7 +1770,7 @@ int http_scheme_based_normalize(struct htx *htx)
 	}
 	host = isttrim(authority, istlen(authority) - istlen(port) - 1);
 
-	if (istlen(port) && http_is_default_port(scheme, port)) {
+	if (http_is_default_port(scheme, port)) {
 		/* reconstruct the uri with removal of the port */
 		struct buffer *temp = get_trash_chunk();
 		struct ist meth, vsn;

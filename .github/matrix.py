@@ -12,6 +12,7 @@ import json
 import sys
 import urllib.request
 import re
+from os import environ
 
 if len(sys.argv) == 2:
     build_type = sys.argv[1]
@@ -42,7 +43,7 @@ def determine_latest_openssl(ssl):
         if "openssl-" in name:
             if name > latest_tag:
                latest_tag = name
-    return "OPENSSL={}".format(latest_tag[8:])
+    return "OPENSSL_VERSION={}".format(latest_tag[8:])
 
 def determine_latest_libressl(ssl):
     libressl_download_list = urllib.request.urlopen("http://ftp.openbsd.org/pub/OpenBSD/LibreSSL/")
@@ -50,7 +51,7 @@ def determine_latest_libressl(ssl):
         decoded_line = line.decode("utf-8")
         if "libressl-" in decoded_line and ".tar.gz.asc" in decoded_line:
              l = re.split("libressl-|.tar.gz.asc", decoded_line)[1]
-    return "LIBRESSL={}".format(l)
+    return "LIBRESSL_VERSION={}".format(l)
 
 def clean_compression(compression):
     return compression.replace("USE_", "").lower()
@@ -133,7 +134,7 @@ for CC in ["gcc", "clang"]:
 #        "BORINGSSL=yes",
     ]:
         flags = ["USE_OPENSSL=1"]
-        if ssl == "BORINGSSL=yes" or ssl == "QUICTLS=yes":
+        if ssl == "BORINGSSL=yes" or ssl == "QUICTLS=yes" or "LIBRESSL" in ssl:
             flags.append("USE_QUIC=1")
         if ssl != "stock":
             flags.append("SSL_LIB=${HOME}/opt/lib")
@@ -208,4 +209,6 @@ for CC in ["clang"]:
 
 print(json.dumps(matrix, indent=4, sort_keys=True))
 
-print("::set-output name=matrix::{}".format(json.dumps({"include": matrix})))
+if environ.get('GITHUB_OUTPUT') is not None:
+    with open(environ.get('GITHUB_OUTPUT'), 'a') as f:
+        print("matrix={}".format(json.dumps({"include": matrix})), file=f)

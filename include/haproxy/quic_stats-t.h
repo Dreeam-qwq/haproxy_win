@@ -9,11 +9,13 @@
 extern struct stats_module quic_stats_module;
 
 enum {
+	QUIC_ST_RXBUF_FULL,
 	QUIC_ST_DROPPED_PACKET,
 	QUIC_ST_DROPPED_PACKET_BUFOVERRUN,
 	QUIC_ST_DROPPED_PARSING,
 	QUIC_ST_SOCKET_FULL,
 	QUIC_ST_SENDTO_ERR,
+	QUIC_ST_SENDTO_ERR_UNKNWN,
 	QUIC_ST_LOST_PACKET,
 	QUIC_ST_TOO_SHORT_INITIAL_DGRAM,
 	QUIC_ST_RETRY_SENT,
@@ -22,6 +24,8 @@ enum {
 	QUIC_ST_HALF_OPEN_CONN,
 	QUIC_ST_HDSHK_FAIL,
 	QUIC_ST_STATELESS_RESET_SENT,
+	/* Special events of interest */
+	QUIC_ST_CONN_MIGRATION_DONE,
 	/* Transport errors */
 	QUIC_ST_TRANSP_ERR_NO_ERROR,
 	QUIC_ST_TRANSP_ERR_INTERNAL_ERROR,
@@ -51,11 +55,13 @@ enum {
 };
 
 struct quic_counters {
+	long long rxbuf_full;        /* receive operation cancelled due to full buffer */
 	long long dropped_pkt;       /* total number of dropped packets */
 	long long dropped_pkt_bufoverrun;/* total number of dropped packets because of buffer overrun */
 	long long dropped_parsing;   /* total number of dropped packets upon parsing errors */
 	long long socket_full;       /* total number of EAGAIN errors on sendto() calls */
 	long long sendto_err;        /* total number of errors on sendto() calls, EAGAIN excepted */
+	long long sendto_err_unknown; /* total number of errors on sendto() calls which are currently not supported */
 	long long lost_pkt;          /* total number of lost packets */
 	long long too_short_initial_dgram; /* total number of too short datagrams with Initial packets */
 	long long retry_sent;        /* total number of Retry sent */
@@ -64,6 +70,8 @@ struct quic_counters {
 	long long half_open_conn;    /* total number of half open connections */
 	long long hdshk_fail;        /* total number of handshake failures */
 	long long stateless_reset_sent; /* total number of handshake failures */
+	/* Special events of interest */
+	long long conn_migration_done; /* total number of connection migration handled */
 	/* Transport errors */
 	long long quic_transp_err_no_error; /* total number of NO_ERROR connection errors */
 	long long quic_transp_err_internal_error; /* total number of INTERNAL_ERROR connection errors */

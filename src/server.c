@@ -47,6 +47,7 @@
 #include <haproxy/time.h>
 #include <haproxy/tools.h>
 #include <haproxy/xxhash.h>
+#include <haproxy/event_hdl.h>
 
 
 static void srv_update_status(struct server *s);
@@ -71,6 +72,31 @@ __decl_thread(HA_SPINLOCK_T idle_conn_srv_lock);
 struct eb_root idle_conn_srv = EB_ROOT;
 struct task *idle_conn_task __read_mostly = NULL;
 struct list servers_list = LIST_HEAD_INIT(servers_list);
+
+/* SERVER DELETE(n)->ADD global tracker:
+ * This is meant to provide srv->rid (revision id) value.
+ * Revision id allows to differentiate between a previously existing
+ * deleted server and a new server reusing deleted server name/id.
+ *
+ * start value is 0 (even value)
+ * LSB is used to specify that one or multiple srv delete in a row
+ * were performed.
+ * When adding a new server, increment by 1 if current
+ * value is odd (odd = LSB set),
+ * because adding a new server after one or
+ * multiple deletions means we could potentially be reusing old names:
+ * Increase the revision id to prevent mixups between old and new names.
+ *
+ * srv->rid is calculated from cnt even values only.
+ * sizeof(srv_id_reuse_cnt) must be twice sizeof(srv->rid)
+ *
+ * Wraparound is expected and should not cause issues
+ * (with current design we allow up to 4 billion unique revisions)
+ *
+ * Counter is only used under thread_isolate (cli_add/cli_del),
+ * no need for atomic ops.
+ */
+static uint64_t srv_id_reuse_cnt = 0;
 
 /* The server names dictionary */
 struct dict server_key_dict = {
@@ -105,6 +131,35 @@ int srv_getinter(const struct check *check)
 		return (check->downinter)?(check->downinter):(check->inter);
 
 	return (check->fastinter)?(check->fastinter):(check->inter);
+}
+
+/*
+ * Use this to publish EVENT_HDL_SUB_SERVER family type event
+ * from srv facility
+ * Event will be published in both global subscription list and
+ * server dedicated subscription list
+ * server ptr must be valid
+ * must be called with srv lock or under thread_isolate
+ */
+static inline void srv_event_hdl_publish(struct event_hdl_sub_type event, struct server *srv, uint8_t thread_isolate)
+{
+	struct event_hdl_cb_data_server cb_data;
+
+	/* safe data assignments */
+	cb_data.safe.puid = srv->puid;
+	cb_data.safe.rid = srv->rid;
+	cb_data.safe.flags = srv->flags;
+	snprintf(cb_data.safe.name, sizeof(cb_data.safe.name), "%s", srv->id);
+	if (srv->proxy)
+		snprintf(cb_data.safe.proxy_name, sizeof(cb_data.safe.proxy_name), "%s", srv->proxy->id);
+	/* unsafe data assignments */
+	cb_data.unsafe.ptr = srv;
+	cb_data.unsafe.thread_isolate = thread_isolate;
+	cb_data.unsafe.srv_lock = !thread_isolate;
+	/* publish in server dedicated sub list */
+	event_hdl_publish(&srv->e_subs, event, EVENT_HDL_CB_DATA(&cb_data));
+	/* publish in global subscription list */
+	event_hdl_publish(NULL, event, EVENT_HDL_CB_DATA(&cb_data));
 }
 
 /*
@@ -805,6 +860,14 @@ static int srv_parse_no_send_proxy_v2(char **args, int *cur_arg,
                                       struct proxy *curproxy, struct server *newsrv, char **err)
 {
 	return srv_disable_pp_flags(newsrv, SRV_PP_V2);
+}
+
+/* Parse the "shard" server keyword */
+static int srv_parse_shard(char **args, int *cur_arg,
+                           struct proxy *curproxy, struct server *newsrv, char **err)
+{
+	newsrv->shard = atol(args[*cur_arg + 1]);
+	return 0;
 }
 
 /* Parse the "no-tfo" server keyword */
@@ -1791,6 +1854,7 @@ static struct srv_kw_list srv_kws = { "ALL", { }, {
 	{ "resolvers",           srv_parse_resolvers,           1,  1,  0 }, /* Configure the resolver to use for name resolution */
 	{ "send-proxy",          srv_parse_send_proxy,          0,  1,  1 }, /* Enforce use of PROXY V1 protocol */
 	{ "send-proxy-v2",       srv_parse_send_proxy_v2,       0,  1,  1 }, /* Enforce use of PROXY V2 protocol */
+	{ "shard",               srv_parse_shard,               1,  1,  1 }, /* Server shard (only in peers protocol context) */
 	{ "slowstart",           srv_parse_slowstart,           1,  1,  1 }, /* Set the warm-up timer for a previously failed server */
 	{ "source",              srv_parse_source,             -1,  1,  1 }, /* Set the source address to be used to connect to the server */
 	{ "stick",               srv_parse_stick,               0,  1,  0 }, /* Enable stick-table persistence */
@@ -2303,6 +2367,7 @@ struct server *new_server(struct proxy *proxy)
 	LIST_APPEND(&servers_list, &srv->global_list);
 	LIST_INIT(&srv->srv_rec_item);
 	LIST_INIT(&srv->ip_rec_item);
+	event_hdl_sub_list_init(&srv->e_subs);
 
 	srv->next_state = SRV_ST_RUNNING; /* early server setup */
 	srv->last_change = now.tv_sec;
@@ -2372,6 +2437,7 @@ struct server *srv_drop(struct server *srv)
 	free(srv->hostname_dn);
 	free((char*)srv->conf.file);
 	free(srv->per_thr);
+	free(srv->per_tgrp);
 	free(srv->curr_idle_thr);
 	free(srv->resolvers_id);
 	free(srv->addr_node.key);
@@ -2384,6 +2450,7 @@ struct server *srv_drop(struct server *srv)
 	HA_SPIN_DESTROY(&srv->lock);
 
 	LIST_DELETE(&srv->global_list);
+	event_hdl_sub_list_destroy(&srv->e_subs);
 
 	EXTRA_COUNTERS_FREE(srv->extra_counters);
 
@@ -2624,6 +2691,9 @@ static int _srv_parse_init(struct server **srv, char **args, int *cur_arg,
 			newsrv->id = strdup(args[1]);
 		else
 			newsrv->tmpl_info.prefix = strdup(args[1]);
+
+		/* revision defaults to 0 */
+		newsrv->rid = 0;
 
 		/* several ways to check the port component :
 		 *  - IP    => port=+0, relative (IPv4 only)
@@ -3304,7 +3374,7 @@ const char *srv_update_addr_port(struct server *s, const char *addr, const char 
 		/* applying ADDR changes if required and allowed
 		 * ipcmp returns 0 when both ADDR are the same
 		 */
-		if (ipcmp(&s->addr, &sa) == 0) {
+		if (ipcmp(&s->addr, &sa, 0) == 0) {
 			chunk_appendf(msg, "no need to change the addr");
 			goto port;
 		}
@@ -4641,7 +4711,8 @@ int srv_init_per_thr(struct server *srv)
 	int i;
 
 	srv->per_thr = calloc(global.nbthread, sizeof(*srv->per_thr));
-	if (!srv->per_thr)
+	srv->per_tgrp = calloc(global.nbtgroups, sizeof(*srv->per_tgrp));
+	if (!srv->per_thr || !srv->per_tgrp)
 		return -1;
 
 	for (i = 0; i < global.nbthread; i++) {
@@ -4843,6 +4914,22 @@ static int cli_parse_add_server(char **args, char *payload, struct appctx *appct
 	if (srv->addr_node.key)
 		ebis_insert(&be->used_server_addr, &srv->addr_node);
 
+	/* check if LSB bit (odd bit) is set for reuse_cnt */
+	if (srv_id_reuse_cnt & 1) {
+		/* cnt must be increased */
+		srv_id_reuse_cnt++;
+	}
+	/* srv_id_reuse_cnt is always even at this stage, divide by 2 to
+	 * save some space
+	 * (sizeof(srv->rid) is half of sizeof(srv_id_reuse_cnt))
+	 */
+	srv->rid = (srv_id_reuse_cnt) ? (srv_id_reuse_cnt / 2) : 0;
+
+	/* adding server cannot fail when we reach this:
+	 * publishing EVENT_HDL_SUB_SERVER_ADD
+	 */
+	srv_event_hdl_publish(EVENT_HDL_SUB_SERVER_ADD, srv, 1);
+
 	thread_release();
 
 	/* Start the check task. The server must be fully initialized.
@@ -4860,7 +4947,7 @@ static int cli_parse_add_server(char **args, char *payload, struct appctx *appct
 	}
 
 	ha_notice("New server registered.\n");
-	cli_msg(appctx, LOG_INFO, usermsgs_str());
+	cli_umsg(appctx, LOG_INFO);
 
 	return 0;
 
@@ -4891,7 +4978,7 @@ out:
 	thread_release();
 
 	if (!usermsgs_empty())
-		cli_err(appctx, usermsgs_str());
+		cli_umsgerr(appctx);
 
 	if (srv)
 		srv_drop(srv);
@@ -4970,6 +5057,11 @@ static int cli_parse_delete_server(char **args, char *payload, struct appctx *ap
 		goto out;
 	}
 
+	/* removing cannot fail anymore when we reach this:
+	 * publishing EVENT_HDL_SUB_SERVER_DEL
+	 */
+	srv_event_hdl_publish(EVENT_HDL_SUB_SERVER_DEL, srv, 1);
+
 	/* remove srv from tracking list */
 	if (srv->track)
 		release_server_track(srv);
@@ -5010,6 +5102,9 @@ static int cli_parse_delete_server(char **args, char *payload, struct appctx *ap
 
 	/* remove srv from idle_node tree for idle conn cleanup */
 	eb32_delete(&srv->idle_node);
+
+	/* set LSB bit (odd bit) for reuse_cnt */
+	srv_id_reuse_cnt |= 1;
 
 	thread_release();
 
@@ -5166,6 +5261,9 @@ static void srv_update_status(struct server *s)
 		s->next_admin = s->cur_admin;
 
 		if ((s->cur_state != SRV_ST_STOPPED) && (s->next_state == SRV_ST_STOPPED)) {
+			/* no maintenance + server DOWN: publish event SERVER DOWN */
+			srv_event_hdl_publish(EVENT_HDL_SUB_SERVER_DOWN, s, 0);
+
 			s->last_change = now.tv_sec;
 			if (s->proxy->lbprm.set_server_status_down)
 				s->proxy->lbprm.set_server_status_down(s);
@@ -5233,6 +5331,9 @@ static void srv_update_status(struct server *s)
 		}
 		else if (((s->cur_state != SRV_ST_RUNNING) && (s->next_state == SRV_ST_RUNNING))
 			 || ((s->cur_state != SRV_ST_STARTING) && (s->next_state == SRV_ST_STARTING))) {
+			/* no maintenance + server going UP: publish event SERVER UP */
+			srv_event_hdl_publish(EVENT_HDL_SUB_SERVER_UP, s, 0);
+
 			if (s->proxy->srv_bck == 0 && s->proxy->srv_act == 0) {
 				if (s->proxy->last_change < now.tv_sec)		// ignore negative times
 					s->proxy->down_time += now.tv_sec - s->proxy->last_change;
@@ -5359,6 +5460,9 @@ static void srv_update_status(struct server *s)
 			if (s->onmarkeddown & HANA_ONMARKEDDOWN_SHUTDOWNSESSIONS)
 				srv_shutdown_streams(s, SF_ERR_DOWN);
 
+			/* maintenance on previously running server: publish event SERVER DOWN */
+			srv_event_hdl_publish(EVENT_HDL_SUB_SERVER_DOWN, s, 0);
+
 			/* force connection cleanup on the given server */
 			srv_cleanup_connections(s);
 			/* we might have streams queued on this server and waiting for
@@ -5430,6 +5534,12 @@ static void srv_update_status(struct server *s)
 					s->next_state = SRV_ST_RUNNING;
 			}
 
+		}
+
+		/* ignore if server stays down when leaving maintenance mode */
+		if (s->next_state != SRV_ST_STOPPED) {
+			/* leaving maintenance + server UP: publish event SERVER UP */
+			srv_event_hdl_publish(EVENT_HDL_SUB_SERVER_UP, s, 0);
 		}
 
 		tmptrash = alloc_trash_chunk();
@@ -5779,11 +5889,11 @@ void srv_release_conn(struct server *srv, struct connection *conn)
  */
 struct connection *srv_lookup_conn(struct eb_root *tree, uint64_t hash)
 {
-	struct ebmb_node *node = NULL;
+	struct eb64_node *node = NULL;
 	struct connection *conn = NULL;
 	struct conn_hash_node *hash_node = NULL;
 
-	node = ebmb_lookup(tree, &hash, sizeof(hash_node->hash));
+	node = eb64_lookup(tree, hash);
 	if (node) {
 		hash_node = ebmb_entry(node, struct conn_hash_node, node);
 		conn = hash_node->conn;
@@ -5797,13 +5907,13 @@ struct connection *srv_lookup_conn(struct eb_root *tree, uint64_t hash)
  */
 struct connection *srv_lookup_conn_next(struct connection *conn)
 {
-	struct ebmb_node *node = NULL;
+	struct eb64_node *node = NULL;
 	struct connection *next_conn = NULL;
 	struct conn_hash_node *hash_node = NULL;
 
-	node = ebmb_next_dup(&conn->hash_node->node);
+	node = eb64_next_dup(&conn->hash_node->node);
 	if (node) {
-		hash_node = ebmb_entry(node, struct conn_hash_node, node);
+		hash_node = eb64_entry(node, struct conn_hash_node, node);
 		next_conn = hash_node->conn;
 	}
 
@@ -5846,11 +5956,11 @@ int srv_add_to_idle_list(struct server *srv, struct connection *conn, int is_saf
 
 		if (is_safe) {
 			conn->flags = (conn->flags & ~CO_FL_LIST_MASK) | CO_FL_SAFE_LIST;
-			ebmb_insert(&srv->per_thr[tid].safe_conns, &conn->hash_node->node, sizeof(conn->hash_node->hash));
+			eb64_insert(&srv->per_thr[tid].safe_conns, &conn->hash_node->node);
 			_HA_ATOMIC_INC(&srv->curr_safe_nb);
 		} else {
 			conn->flags = (conn->flags & ~CO_FL_LIST_MASK) | CO_FL_IDLE_LIST;
-			ebmb_insert(&srv->per_thr[tid].idle_conns, &conn->hash_node->node, sizeof(conn->hash_node->hash));
+			eb64_insert(&srv->per_thr[tid].idle_conns, &conn->hash_node->node);
 			_HA_ATOMIC_INC(&srv->curr_idle_nb);
 		}
 		HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
@@ -5924,7 +6034,7 @@ struct task *srv_cleanup_idle_conns(struct task *task, void *context, unsigned i
 		if (srv->est_need_conns < srv->max_used_conns)
 			srv->est_need_conns = srv->max_used_conns;
 
-		srv->max_used_conns = srv->curr_used_conns;
+		HA_ATOMIC_STORE(&srv->max_used_conns, srv->curr_used_conns);
 
 		if (exceed_conns <= 0)
 			goto remove;

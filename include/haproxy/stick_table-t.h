@@ -145,6 +145,7 @@ struct stksess {
 	unsigned int expire;      /* session expiration date */
 	unsigned int ref_cnt;     /* reference count, can only purge when zero */
 	__decl_thread(HA_RWLOCK_T lock); /* lock related to the table entry */
+	int shard;                /* shard */
 	struct eb32_node exp;     /* ebtree node used to hold the session in expiration tree */
 	struct eb32_node upd;     /* ebtree node used to hold the update sequence tree */
 	struct ebmb_node key;     /* ebtree node used to hold the session in table */
@@ -155,6 +156,7 @@ struct stksess {
 /* stick table */
 struct stktable {
 	char *id;		  /* local table id name. */
+	size_t idlen;	  /* local table id name length. */
 	char *nid;		  /* table id name sent over the network with peers protocol. */
 	struct stktable *next;    /* The stick-table may be linked when belonging to
 	                           * the same configuration section.
@@ -172,18 +174,18 @@ struct stktable {
 				     pending for sync */
 	unsigned int refcnt;     /* number of local peer over all peers sections
 				    attached to this table */
+	uint64_t hash_seed;      /* hash seed used by shards */
 	union {
 		struct peers *p; /* sync peers */
 		char *name;
 	} peers;
 
 	unsigned long type;       /* type of table (determines key format) */
-	unsigned int server_key_type; /* What type of key is used to identify servers */
 	size_t key_size;          /* size of a key, maximum size in case of string */
+	unsigned int server_key_type; /* What type of key is used to identify servers */
 	unsigned int size;        /* maximum number of sticky sessions in table */
 	unsigned int current;     /* number of sticky sessions currently in table */
 	int nopurge;              /* if non-zero, don't purge sticky sessions when full */
-	int exp_next;             /* next expiration date (ticks) */
 	int expire;               /* time to live for sticky sessions (milliseconds) */
 	int data_size;            /* the size of the data that is prepended *before* stksess */
 	int data_ofs[STKTABLE_DATA_TYPES]; /* negative offsets of present data types, or 0 if absent */
@@ -199,7 +201,7 @@ struct stktable {
 		const char *file;     /* The file where the stick-table is declared. */
 		int line;             /* The line in this <file> the stick-table is declared. */
 	} conf;
-	__decl_thread(HA_SPINLOCK_T lock); /* spin lock related to the table */
+	__decl_thread(HA_RWLOCK_T lock); /* lock related to the table */
 };
 
 extern struct stktable_data_type stktable_data_types[STKTABLE_DATA_TYPES];

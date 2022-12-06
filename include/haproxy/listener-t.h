@@ -29,11 +29,11 @@
 
 #include <haproxy/api-t.h>
 #include <haproxy/obj_type-t.h>
+#include <haproxy/quic_cc-t.h>
+#include <haproxy/quic_tp-t.h>
 #include <haproxy/receiver-t.h>
 #include <haproxy/stats-t.h>
 #include <haproxy/thread.h>
-
-#include <haproxy/xprt_quic-t.h>
 
 /* Some pointer types reference below */
 struct task;
@@ -158,12 +158,21 @@ struct ssl_bind_conf {
 #endif
 };
 
+/*
+ * In OpenSSL 3.0.0, the biggest verify error code's value is 94 and on the
+ * latest 1.1.1 it already reaches 79 so we need to size the ca/crt-ignore-err
+ * arrays accordingly. If the max error code increases, the arrays might need to
+ * be resized.
+ */
+#define SSL_MAX_VFY_ERROR_CODE 94
+#define IGNERR_BF_SIZE ((SSL_MAX_VFY_ERROR_CODE >> 6) + 1)
+
 /* "bind" line settings */
 struct bind_conf {
 #ifdef USE_OPENSSL
 	struct ssl_bind_conf ssl_conf; /* ssl conf for ctx setting */
-	unsigned long long ca_ignerr;  /* ignored verify errors in handshake if depth > 0 */
-	unsigned long long crt_ignerr; /* ignored verify errors in handshake if depth == 0 */
+	unsigned long long ca_ignerr_bitfield[IGNERR_BF_SIZE];   /* ignored verify errors in handshake if depth > 0 */
+	unsigned long long crt_ignerr_bitfield[IGNERR_BF_SIZE];  /* ignored verify errors in handshake if depth == 0 */
 	void *initial_ctx;             /* SSL context for initial negotiation */
 	void *default_ctx;             /* SSL context of first/default certificate */
 	struct ckch_inst *default_inst;
@@ -177,7 +186,7 @@ struct bind_conf {
 	char *ca_sign_file;        /* CAFile used to generate and sign server certificates */
 	char *ca_sign_pass;        /* CAKey passphrase */
 
-	struct cert_key_and_chain * ca_sign_ckch;	/* CA and possible certificate chain for ca generation */
+	struct ckch_data *ca_sign_ckch;	/* CA and possible certificate chain for ca generation */
 #endif
 #ifdef USE_QUIC
 	struct quic_transport_params quic_params; /* QUIC transport parameters. */

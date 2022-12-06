@@ -1,6 +1,5 @@
 /*
- * include/haproxy/xprt_quic.h
- * This file contains QUIC xprt function prototypes
+ * include/haproxy/quic_conn.h
  *
  * Copyright 2020 HAProxy Technologies, Frederic Lecaille <flecaille@haproxy.com>
  *
@@ -19,8 +18,8 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
  */
 
-#ifndef _HAPROXY_XPRT_QUIC_H
-#define _HAPROXY_XPRT_QUIC_H
+#ifndef _HAPROXY_QUIC_CONN_H
+#define _HAPROXY_QUIC_CONN_H
 #ifdef USE_QUIC
 #ifndef USE_OPENSSL
 #error "Must define USE_OPENSSL"
@@ -40,11 +39,11 @@
 
 #include <haproxy/listener.h>
 #include <haproxy/quic_cc.h>
+#include <haproxy/quic_conn-t.h>
 #include <haproxy/quic_enc.h>
 #include <haproxy/quic_frame.h>
 #include <haproxy/quic_loss.h>
 #include <haproxy/mux_quic.h>
-#include <haproxy/xprt_quic-t.h>
 
 #include <openssl/rand.h>
 
@@ -214,38 +213,49 @@ static inline void quic_connection_id_to_frm_cpy(struct quic_frame *dst,
 	to->stateless_reset_token = src->stateless_reset_token;
 }
 
-/* Retrieve the associated thread ID for <cid>. */
-static inline unsigned long quic_get_cid_tid(const unsigned char *cid)
+/* extract a TID from a CID for bind_conf <bc>, from 0 to global.nbthread-1 and
+ * in any case no more than 4095. It takes into account the bind_conf's thread
+ * group and the bind_conf's thread mask. The algorithm is the following: most
+ * packets contain a valid thread ID for the bind_conf, which means that the
+ * retrieved ID directly maps to a bound thread ID. If that's not the case,
+ * then we have to remap it. The resulting thread ID will then differ but will
+ * be correctly encoded and decoded.
+ */
+static inline uint quic_get_cid_tid(const unsigned char *cid, const struct bind_conf *bc)
 {
-	return *cid % global.nbthread;
+	uint id, grp;
+	uint base, count;
+
+	id = read_n16(cid) & 4095;
+	grp = bc->bind_tgroup;
+	base  = ha_tgroup_info[grp - 1].base;
+	count = ha_tgroup_info[grp - 1].count;
+
+	if (base <= id && id < base + count &&
+	    bc->bind_thread & ha_thread_info[id].ltid_bit)
+		return id; // part of the group and bound: valid
+
+	/* The thread number isn't valid, it doesn't map to a thread bound on
+	 * this receiver. Let's reduce it to one of the thread(s) valid for
+	 * that receiver.
+	 */
+	count = my_popcountl(bc->bind_thread);
+	id = count - 1 - id % count;
+	id = mask_find_rank_bit(id, bc->bind_thread);
+	id += base;
+	return id;
 }
 
-/* Modify <cid> to have a CID linked to the thread ID <target_tid>. This is
- * based on quic_get_cid_tid.
+/* Modify <cid> to have a CID linked to the thread ID <target_tid> that
+ * quic_get_cid_tid() will be able to extract return.
  */
-static inline void quic_pin_cid_to_tid(unsigned char *cid, int target_tid)
+static inline void quic_pin_cid_to_tid(unsigned char *cid, uint target_tid)
 {
-	cid[0] = MIN(cid[0], 255 - target_tid);
-	cid[0] = cid[0] - (cid[0] % global.nbthread) + target_tid;
+	uint16_t prev_id;
+
+	prev_id = read_n16(cid);
+	write_n16(cid, (prev_id & ~4095) | target_tid);
 }
-
-/* The maximum size of a variable-length QUIC integer encoded with 1 byte */
-#define QUIC_VARINT_1_BYTE_MAX       ((1UL <<  6) - 1)
-/* The maximum size of a variable-length QUIC integer encoded with 2 bytes */
-#define QUIC_VARINT_2_BYTE_MAX       ((1UL <<  14) - 1)
-/* The maximum size of a variable-length QUIC integer encoded with 4 bytes */
-#define QUIC_VARINT_4_BYTE_MAX       ((1UL <<  30) - 1)
-/* The maximum size of a variable-length QUIC integer encoded with 8 bytes */
-#define QUIC_VARINT_8_BYTE_MAX       ((1ULL <<  62) - 1)
-
-/* The maximum size of a variable-length QUIC integer */
-#define QUIC_VARINT_MAX_SIZE       8
-
-/* The two most significant bits of byte #0 from a QUIC packet gives the 2 
- * logarithm of the length of a variable length encoded integer.
- */
-#define QUIC_VARINT_BYTE_0_BITMASK 0x3f
-#define QUIC_VARINT_BYTE_0_SHIFT   6
 
 /* Return a 32-bits integer in <val> from QUIC packet with <buf> as address.
  * Makes <buf> point to the data after this 32-bits value if succeeded.
@@ -282,57 +292,6 @@ static inline int quic_write_uint32(unsigned char **buf,
 	return 1;
 }
 
-/* Return the difference between the encoded length of <val> and the encoded
- * length of <val+1>.
- */
-static inline size_t quic_incint_size_diff(uint64_t val)
-{
-	switch (val) {
-	case QUIC_VARINT_1_BYTE_MAX:
-		return 1;
-	case QUIC_VARINT_2_BYTE_MAX:
-		return 2;
-	case QUIC_VARINT_4_BYTE_MAX:
-		return 4;
-	default:
-		return 0;
-	}
-}
-
-/* Return the difference between the encoded length of <val> and the encoded
- * length of <val-1>.
- */
-static inline size_t quic_decint_size_diff(uint64_t val)
-{
-	switch (val) {
-	case QUIC_VARINT_1_BYTE_MAX + 1:
-		return 1;
-	case QUIC_VARINT_2_BYTE_MAX + 1:
-		return 2;
-	case QUIC_VARINT_4_BYTE_MAX + 1:
-		return 4;
-	default:
-		return 0;
-	}
-}
-
-
-/* Returns the maximum value of a QUIC variable-length integer with <sz> as size */
-static inline uint64_t quic_max_int(size_t sz)
-{
-	switch (sz) {
-	case 1:
-		return QUIC_VARINT_1_BYTE_MAX;
-	case 2:
-		return QUIC_VARINT_2_BYTE_MAX;
-	case 4:
-		return QUIC_VARINT_4_BYTE_MAX;
-	case 8:
-		return QUIC_VARINT_8_BYTE_MAX;
-	}
-
-	return -1;
-}
 
 /* Return the maximum number of bytes we must use to completely fill a
  * buffer with <sz> as size for a data field of bytes prefixed by its QUIC
@@ -363,7 +322,7 @@ static inline size_t max_available_room(size_t sz, size_t *len_sz)
 		 *  +---------------------------+-----------....
 		 *  <--------------------------------> <sz>
 		 */
-		size_t max_int = quic_max_int_by_size(*len_sz);
+		size_t max_int = quic_max_int(*len_sz);
 
 		if (max_int + *len_sz <= sz)
 			ret = max_int;
@@ -528,6 +487,19 @@ static inline int64_t quic_pktns_get_largest_acked_pn(struct quic_pktns *pktns)
 	return eb64_entry(ar, struct quic_arng_node, first)->last;
 }
 
+/* The TX packets sent in the same datagram are linked to each others in
+ * the order they are built. This function detach a packet from its successor
+ * and predecessor in the same datagram.
+ */
+static inline void quic_tx_packet_dgram_detach(struct quic_tx_packet *pkt)
+{
+	if (pkt->prev)
+		pkt->prev->next = pkt->next;
+	if (pkt->next)
+		pkt->next->prev = pkt->prev;
+}
+
+
 /* Increment the reference counter of <pkt> */
 static inline void quic_tx_packet_refinc(struct quic_tx_packet *pkt)
 {
@@ -539,6 +511,10 @@ static inline void quic_tx_packet_refdec(struct quic_tx_packet *pkt)
 {
 	if (!HA_ATOMIC_SUB_FETCH(&pkt->refcnt, 1)) {
 		BUG_ON(!LIST_ISEMPTY(&pkt->frms));
+		/* If there are others packet in the same datagram <pkt> is attached to,
+		 * detach the previous one and the next one from <pkt>.
+		 */
+		quic_tx_packet_dgram_detach(pkt);
 		pool_free(pool_head_quic_tx_packet, pkt);
 	}
 }
@@ -767,7 +743,7 @@ void chunk_frm_appendf(struct buffer *buf, const struct quic_frame *frm);
 void quic_set_connection_close(struct quic_conn *qc, const struct quic_err err);
 void quic_set_tls_alert(struct quic_conn *qc, int alert);
 int quic_set_app_ops(struct quic_conn *qc, const unsigned char *alpn, size_t alpn_len);
-struct task *quic_lstnr_dghdlr(struct task *t, void *ctx, unsigned int state);
+int qc_check_dcid(struct quic_conn *qc, unsigned char *dcid, size_t dcid_len);
 int quic_get_dgram_dcid(unsigned char *buf, const unsigned char *end,
                         unsigned char **dcid, size_t *dcid_len);
 int qc_send_mux(struct quic_conn *qc, struct list *frms);
@@ -776,5 +752,12 @@ void qc_notify_close(struct quic_conn *qc);
 
 void qc_release_frm(struct quic_conn *qc, struct quic_frame *frm);
 
+void qc_check_close_on_released_mux(struct quic_conn *qc);
+
+void quic_conn_release(struct quic_conn *qc);
+
+int quic_dgram_parse(struct quic_dgram *dgram, struct quic_conn *qc,
+                     struct listener *li);
+
 #endif /* USE_QUIC */
-#endif /* _HAPROXY_XPRT_QUIC_H */
+#endif /* _HAPROXY_QUIC_CONN_H */

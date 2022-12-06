@@ -45,8 +45,6 @@
 #include <haproxy/namespace-t.h>
 #include <haproxy/protocol-t.h>
 #include <haproxy/tools-t.h>
-#include <haproxy/xxhash.h>
-#include <haproxy/cli.h>
 
 /****** string-specific macros and functions ******/
 /* if a > max, then bound <a> to <max>. The macro returns the new <a> */
@@ -57,13 +55,10 @@
 
 #define SWAP(a, b) do { typeof(a) t; t = a; a = b; b = t; } while(0)
 
-/* return the hash of a string and length for a given key. All keys are valid. */
-#define HA_ANON(key, str, len) (XXH32(str, len, key) & 0xFFFFFF)
-
 /* use if you want to return a simple hash. Key 0 doesn't hash. */
 #define HA_ANON_STR(key, str) hash_anon(key, str, "", "")
 
-/* use if you want to return a hash like : IP('hash'). Key 0 doesn't hash. */
+/* use if you want to return a hash like : ID('hash'). Key 0 doesn't hash. */
 #define HA_ANON_ID(key, str) hash_anon(key, str, "ID(", ")")
 
 /* use if you want to return a hash like : PATH('hash'). Key 0 doesn't hash. */
@@ -424,7 +419,8 @@ char *encode_chunk(char *start, char *stop,
 
 /*
  * Tries to prefix characters tagged in the <map> with the <escape>
- * character. The input <string> must be zero-terminated. The result will
+ * character. The input <string> is processed until string_stop
+ * is reached or NULL-byte is encountered. The result will
  * be stored between <start> (included) and <stop> (excluded). This
  * function will always try to terminate the resulting string with a '\0'
  * before <stop>, and will return its position if the conversion
@@ -432,19 +428,7 @@ char *encode_chunk(char *start, char *stop,
  */
 char *escape_string(char *start, char *stop,
 		    const char escape, const long *map,
-		    const char *string);
-
-/*
- * Tries to prefix characters tagged in the <map> with the <escape>
- * character. <chunk> contains the input to be escaped. The result will be
- * stored between <start> (included) and <stop> (excluded). The function
- * will always try to terminate the resulting string with a '\0' before
- * <stop>, and will return its position if the conversion completes.
- */
-char *escape_chunk(char *start, char *stop,
-                   const char escape, const long *map,
-                   const struct buffer *chunk);
-
+		    const char *string, const char *string_stop);
 
 /* Check a string for using it in a CSV output format. If the string contains
  * one of the following four char <">, <,>, CR or LF, the string is
@@ -502,7 +486,7 @@ unsigned int inetaddr_host_lim_ret(char *text, char *stop, char **ret);
 const char *hash_anon(uint32_t scramble, const char *string2hash, const char *prefix, const char *suffix);
 
 /* Function that hashes or not an ip according to the ipstring entered */
-const char * hash_ipanon(uint32_t scramble, char *ipstring);
+const char * hash_ipanon(uint32_t scramble, char *ipstring, int hasport);
 
 static inline char *cut_crlf(char *s) {
 
@@ -791,11 +775,13 @@ extern void v4tov6(struct in6_addr *sin6_addr, struct in_addr *sin_addr);
  */
 extern int v6tov4(struct in_addr *sin_addr, struct in6_addr *sin6_addr);
 
-/* compare two struct sockaddr_storage and return:
+/* compare two struct sockaddr_storage, including port if <check_port> is true,
+ * and return:
  *  0 (true)  if the addr is the same in both
  *  1 (false) if the addr is not the same in both
+ *  -1 (unable) if one of the addr is not AF_INET*
  */
-int ipcmp(struct sockaddr_storage *ss1, struct sockaddr_storage *ss2);
+int ipcmp(struct sockaddr_storage *ss1, struct sockaddr_storage *ss2, int check_port);
 
 /* compare a struct sockaddr_storage to a struct net_addr and return :
  *  0 (true)  if <addr> is matching <net>

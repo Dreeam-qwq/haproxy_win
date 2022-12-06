@@ -65,6 +65,7 @@
 #include <haproxy/proxy.h>
 #include <haproxy/sample.h>
 #include <haproxy/sc_strm.h>
+#include <haproxy/quic_conn.h>
 #include <haproxy/quic_tp.h>
 #include <haproxy/server.h>
 #include <haproxy/shctx.h>
@@ -80,7 +81,6 @@
 #include <haproxy/time.h>
 #include <haproxy/tools.h>
 #include <haproxy/vars.h>
-#include <haproxy/xprt_quic.h>
 #include <haproxy/xxhash.h>
 #include <haproxy/istbuf.h>
 
@@ -1430,7 +1430,7 @@ int ssl_sock_ocsp_stapling_cbk(SSL *ssl, void *arg)
 		return SSL_TLSEXT_ERR_NOACK;
 
 	memcpy(ssl_buf, ocsp->response.area, ocsp->response.data);
-	SSL_set_tlsext_status_ocsp_resp(ssl, ssl_buf, ocsp->response.data);
+	SSL_set_tlsext_status_ocsp_resp(ssl, (unsigned char*)ssl_buf, ocsp->response.data);
 
 	return SSL_TLSEXT_ERR_OK;
 }
@@ -1472,7 +1472,7 @@ static void ssl_sock_free_ocsp(struct certificate_ocsp *ocsp)
  * Returns 1 if no ".ocsp" file found, 0 if OCSP status extension is
  * successfully enabled, or -1 in other error case.
  */
-static int ssl_sock_load_ocsp(SSL_CTX *ctx, const struct cert_key_and_chain *ckch, STACK_OF(X509) *chain)
+static int ssl_sock_load_ocsp(SSL_CTX *ctx, const struct ckch_data *data, STACK_OF(X509) *chain)
 {
 	X509 *x, *issuer;
 	OCSP_CERTID *cid = NULL;
@@ -1480,14 +1480,18 @@ static int ssl_sock_load_ocsp(SSL_CTX *ctx, const struct cert_key_and_chain *ckc
 	struct certificate_ocsp *ocsp = NULL, *iocsp;
 	char *warn = NULL;
 	unsigned char *p;
+#ifndef USE_OPENSSL_WOLFSSL
 	void (*callback) (void);
+#else
+	tlsextStatusCb callback;
+#endif
 
 
-	x = ckch->cert;
+	x = data->cert;
 	if (!x)
 		goto out;
 
-	issuer = ckch->ocsp_issuer;
+	issuer = data->ocsp_issuer;
 	/* take issuer from chain over ocsp_issuer, is what is done historicaly */
 	if (chain) {
 		/* check if one of the certificate of the chain is the issuer */
@@ -1584,7 +1588,7 @@ static int ssl_sock_load_ocsp(SSL_CTX *ctx, const struct cert_key_and_chain *ckc
 	ret = 0;
 
 	warn = NULL;
-	if (ssl_sock_load_ocsp_response(ckch->ocsp_response, iocsp, cid, &warn)) {
+	if (ssl_sock_load_ocsp_response(data->ocsp_response, iocsp, cid, &warn)) {
 		memprintf(&warn, "Loading: %s. Content will be ignored", warn ? warn : "failure");
 		ha_warning("%s.\n", warn);
 	}
@@ -1594,7 +1598,7 @@ out:
 		OCSP_CERTID_free(cid);
 
 	if (ocsp)
-		free(ocsp);
+		ssl_sock_free_ocsp(ocsp);
 
 	if (warn)
 		free(warn);
@@ -1604,7 +1608,7 @@ out:
 #endif
 
 #ifdef OPENSSL_IS_BORINGSSL
-static int ssl_sock_load_ocsp(SSL_CTX *ctx, const struct cert_key_and_chain *ckch, STACK_OF(X509) *chain)
+static int ssl_sock_load_ocsp(SSL_CTX *ctx, const struct ckch_data *data, STACK_OF(X509) *chain)
 {
 	return SSL_CTX_set_ocsp_response(ctx, (const uint8_t *)ckch->ocsp_response->area, ckch->ocsp_response->data);
 }
@@ -1713,7 +1717,7 @@ int ssl_sock_bind_verifycbk(int ok, X509_STORE_CTX *x_store)
 	int err, depth;
 	X509 *client_crt;
 	STACK_OF(X509) *certs;
-	struct bind_conf *bind_conf;
+	struct bind_conf *bind_conf = NULL;
 	struct quic_conn *qc = NULL;
 
 	ssl = X509_STORE_CTX_get_ex_data(x_store, SSL_get_ex_data_X509_STORE_CTX_idx());
@@ -1727,17 +1731,15 @@ int ssl_sock_bind_verifycbk(int ok, X509_STORE_CTX *x_store)
 #ifdef USE_QUIC
 	else {
 		qc = SSL_get_ex_data(ssl, ssl_qc_app_data_index);
-		if (qc) {
-			bind_conf = qc->li->bind_conf;
-			ctx = qc->xprt_ctx;
-		}
+		BUG_ON(!qc); /* Must never happen */
+		bind_conf = qc->li->bind_conf;
+		ctx = qc->xprt_ctx;
 	}
 #endif
 
-	if (!ctx || !bind_conf) {
-		/* Must never happen */
-		ABORT_NOW();
-	}
+	BUG_ON(!ctx || !bind_conf);
+	ALREADY_CHECKED(ctx);
+	ALREADY_CHECKED(bind_conf);
 
 	ctx->xprt_st |= SSL_SOCK_ST_FL_VERIFY_DONE;
 
@@ -1781,7 +1783,8 @@ int ssl_sock_bind_verifycbk(int ok, X509_STORE_CTX *x_store)
 			ctx->xprt_st |= SSL_SOCK_CAEDEPTH_TO_ST(depth);
 		}
 
-		if (err < 64 && bind_conf->ca_ignerr & (1ULL << err))
+		if (err <= SSL_MAX_VFY_ERROR_CODE &&
+		    cert_ignerr_bitfield_get(bind_conf->ca_ignerr_bitfield, err))
 			goto err_ignored;
 
 		/* TODO: for QUIC connection, this error code is lost */
@@ -1794,7 +1797,8 @@ int ssl_sock_bind_verifycbk(int ok, X509_STORE_CTX *x_store)
 		ctx->xprt_st |= SSL_SOCK_CRTERROR_TO_ST(err);
 
 	/* check if certificate error needs to be ignored */
-	if (err < 64 && bind_conf->crt_ignerr & (1ULL << err))
+	if (err <= SSL_MAX_VFY_ERROR_CODE &&
+	    cert_ignerr_bitfield_get(bind_conf->crt_ignerr_bitfield, err))
 		goto err_ignored;
 
 	/* TODO: for QUIC connection, this error code is lost */
@@ -3077,6 +3081,8 @@ end:
 	EVP_PKEY_CTX_free(ctx);
 	OSSL_PARAM_free(params);
 	OSSL_PARAM_BLD_free(tmpl);
+	BN_free(p);
+	BN_free(g);
 	return pkey;
 #else
 
@@ -3549,14 +3555,14 @@ struct eb_root crtlists_tree = EB_ROOT_UNIQUE;
  * the operation succeed.
  */
 #ifndef OPENSSL_NO_DH
-static int ssl_sock_load_dh_params(SSL_CTX *ctx, const struct cert_key_and_chain *ckch,
+static int ssl_sock_load_dh_params(SSL_CTX *ctx, const struct ckch_data *data,
                                    const char *path, char **err)
 {
 	int ret = 0;
 	HASSL_DH *dh = NULL;
 
-	if (ckch && ckch->dh) {
-		dh = ckch->dh;
+	if (data && data->dh) {
+		dh = data->dh;
 		if (!ssl_sock_set_tmp_dh(ctx, dh)) {
 			memprintf(err, "%sunable to load the DH parameter specified in '%s'",
 				  err && *err ? *err : "", path);
@@ -3615,7 +3621,7 @@ static int ssl_sock_load_dh_params(SSL_CTX *ctx, const struct cert_key_and_chain
 #if (HA_OPENSSL_VERSION_NUMBER < 0x3000000fL)
 				SSL_CTX_set_tmp_dh_callback(ctx, ssl_get_tmp_dh_cbk);
 #else
-				ssl_sock_set_tmp_dh_from_pkey(ctx, ckch ? ckch->key : NULL);
+				ssl_sock_set_tmp_dh_from_pkey(ctx, data ? data->key : NULL);
 #endif
 			}
 		}
@@ -3636,29 +3642,33 @@ end:
  * The value 0 means there is no error nor warning and
  * the operation succeed.
  */
-static int ssl_sock_load_cert_chain(const char *path, const struct cert_key_and_chain *ckch,
+static int ssl_sock_load_cert_chain(const char *path, const struct ckch_data *data,
 				    SSL_CTX *ctx, STACK_OF(X509) **find_chain, char **err)
 {
 	int errcode = 0;
+	int ret;
+
+	ERR_clear_error();
 
 	if (find_chain == NULL) {
 		errcode |= ERR_FATAL;
 		goto end;
 	}
 
-	if (!SSL_CTX_use_certificate(ctx, ckch->cert)) {
-		memprintf(err, "%sunable to load SSL certificate into SSL Context '%s'.\n",
-				err && *err ? *err : "", path);
+	if (!SSL_CTX_use_certificate(ctx, data->cert)) {
+		ret = ERR_get_error();
+		memprintf(err, "%sunable to load SSL certificate into SSL Context '%s': %s.\n",
+				err && *err ? *err : "", path, ERR_reason_error_string(ret));
 		errcode |= ERR_ALERT | ERR_FATAL;
 		goto end;
 	}
 
-	if (ckch->chain) {
-		*find_chain = ckch->chain;
+	if (data->chain) {
+		*find_chain = data->chain;
 	} else {
 		/* Find Certificate Chain in global */
 		struct issuer_chain *issuer;
-		issuer = ssl_get0_issuer_chain(ckch->cert);
+		issuer = ssl_get0_issuer_chain(data->cert);
 		if (issuer)
 			*find_chain = issuer->chain;
 	}
@@ -3669,11 +3679,12 @@ static int ssl_sock_load_cert_chain(const char *path, const struct cert_key_and_
 		*find_chain = sk_X509_new_null();
 	}
 
-	/* Load all certs in the ckch into the ctx_chain for the ssl_ctx */
+	/* Load all certs in the data into the ctx_chain for the ssl_ctx */
 #ifdef SSL_CTX_set1_chain
 	if (!SSL_CTX_set1_chain(ctx, *find_chain)) {
-		memprintf(err, "%sunable to load chain certificate into SSL Context '%s'. Make sure you are linking against Openssl >= 1.0.2.\n",
-			  err && *err ? *err : "", path);
+		ret = ERR_get_error();
+		memprintf(err, "%sunable to load chain certificate into SSL Context '%s': %s. Make sure you are linking against Openssl >= 1.0.2.\n",
+			  err && *err ? *err : "", path,  ERR_reason_error_string(ret));
 		errcode |= ERR_ALERT | ERR_FATAL;
 		goto end;
 	}
@@ -3719,20 +3730,25 @@ end:
  * The value 0 means there is no error nor warning and
  * the operation succeed.
  */
-static int ssl_sock_put_ckch_into_ctx(const char *path, const struct cert_key_and_chain *ckch, SSL_CTX *ctx, char **err)
+static int ssl_sock_put_ckch_into_ctx(const char *path, const struct ckch_data *data, SSL_CTX *ctx, char **err)
 {
 	int errcode = 0;
 	STACK_OF(X509) *find_chain = NULL;
 
-	if (SSL_CTX_use_PrivateKey(ctx, ckch->key) <= 0) {
-		memprintf(err, "%sunable to load SSL private key into SSL Context '%s'.\n",
-				err && *err ? *err : "", path);
+	ERR_clear_error();
+
+	if (SSL_CTX_use_PrivateKey(ctx, data->key) <= 0) {
+		int ret;
+
+		ret = ERR_get_error();
+		memprintf(err, "%sunable to load SSL private key into SSL Context '%s': %s.\n",
+				err && *err ? *err : "", path, ERR_reason_error_string(ret));
 		errcode |= ERR_ALERT | ERR_FATAL;
 		return errcode;
 	}
 
 	/* Load certificate chain */
-	errcode |= ssl_sock_load_cert_chain(path, ckch, ctx, &find_chain, err);
+	errcode |= ssl_sock_load_cert_chain(path, data, ctx, &find_chain, err);
 	if (errcode & ERR_CODE)
 		goto end;
 
@@ -3743,7 +3759,7 @@ static int ssl_sock_put_ckch_into_ctx(const char *path, const struct cert_key_an
 		SSL_CTX_set_ex_data(ctx, ssl_dh_ptr_index, NULL);
 	}
 
-	errcode |= ssl_sock_load_dh_params(ctx, ckch, path, err);
+	errcode |= ssl_sock_load_dh_params(ctx, data, path, err);
 	if (errcode & ERR_CODE) {
 		memprintf(err, "%sunable to load DH parameters from file '%s'.\n",
 		          err && *err ? *err : "", path);
@@ -3752,8 +3768,8 @@ static int ssl_sock_put_ckch_into_ctx(const char *path, const struct cert_key_an
 #endif
 
 #ifdef HAVE_SSL_CTX_ADD_SERVER_CUSTOM_EXT
-	if (sctl_ex_index >= 0 && ckch->sctl) {
-		if (ssl_sock_load_sctl(ctx, ckch->sctl) < 0) {
+	if (sctl_ex_index >= 0 && data->sctl) {
+		if (ssl_sock_load_sctl(ctx, data->sctl) < 0) {
 			memprintf(err, "%s '%s.sctl' is present but cannot be read or parsed'.\n",
 			          err && *err ? *err : "", path);
 			errcode |= ERR_ALERT | ERR_FATAL;
@@ -3764,8 +3780,8 @@ static int ssl_sock_put_ckch_into_ctx(const char *path, const struct cert_key_an
 
 #if ((defined SSL_CTRL_SET_TLSEXT_STATUS_REQ_CB && !defined OPENSSL_NO_OCSP) || defined OPENSSL_IS_BORINGSSL)
 	/* Load OCSP Info into context */
-	if (ckch->ocsp_response) {
-		if (ssl_sock_load_ocsp(ctx, ckch, find_chain) < 0) {
+	if (data->ocsp_response) {
+		if (ssl_sock_load_ocsp(ctx, data, find_chain) < 0) {
 			memprintf(err, "%s '%s.ocsp' is present and activates OCSP but it is impossible to compute the OCSP certificate ID (maybe the issuer could not be found)'.\n",
 			          err && *err ? *err : "", path);
 			errcode |= ERR_ALERT | ERR_FATAL;
@@ -3787,21 +3803,21 @@ static int ssl_sock_put_ckch_into_ctx(const char *path, const struct cert_key_an
  * The value 0 means there is no error nor warning and
  * the operation succeed.
  */
-static int ssl_sock_put_srv_ckch_into_ctx(const char *path, const struct cert_key_and_chain *ckch,
+static int ssl_sock_put_srv_ckch_into_ctx(const char *path, const struct ckch_data *data,
 					  SSL_CTX *ctx, char **err)
 {
 	int errcode = 0;
 	STACK_OF(X509) *find_chain = NULL;
 
 	/* Load the private key */
-	if (SSL_CTX_use_PrivateKey(ctx, ckch->key) <= 0) {
+	if (SSL_CTX_use_PrivateKey(ctx, data->key) <= 0) {
 		memprintf(err, "%sunable to load SSL private key into SSL Context '%s'.\n",
 				err && *err ? *err : "", path);
 		errcode |= ERR_ALERT | ERR_FATAL;
 	}
 
 	/* Load certificate chain */
-	errcode |= ssl_sock_load_cert_chain(path, ckch, ctx, &find_chain, err);
+	errcode |= ssl_sock_load_cert_chain(path, data, ctx, &find_chain, err);
 	if (errcode & ERR_CODE)
 		goto end;
 
@@ -3837,16 +3853,16 @@ int ckch_inst_new_load_store(const char *path, struct ckch_store *ckchs, struct 
 #ifdef SSL_CTRL_SET_TLSEXT_HOSTNAME
 	STACK_OF(GENERAL_NAME) *names;
 #endif
-	struct cert_key_and_chain *ckch;
+	struct ckch_data *data;
 	struct ckch_inst *ckch_inst = NULL;
 	int errcode = 0;
 
 	*ckchi = NULL;
 
-	if (!ckchs || !ckchs->ckch)
+	if (!ckchs || !ckchs->data)
 		return ERR_FATAL;
 
-	ckch = ckchs->ckch;
+	data = ckchs->data;
 
 	ctx = SSL_CTX_new(SSLv23_server_method());
 	if (!ctx) {
@@ -3856,7 +3872,7 @@ int ckch_inst_new_load_store(const char *path, struct ckch_store *ckchs, struct 
 		goto error;
 	}
 
-	errcode |= ssl_sock_put_ckch_into_ctx(path, ckch, ctx, err);
+	errcode |= ssl_sock_put_ckch_into_ctx(path, data, ctx, err);
 	if (errcode & ERR_CODE)
 		goto error;
 
@@ -3868,7 +3884,7 @@ int ckch_inst_new_load_store(const char *path, struct ckch_store *ckchs, struct 
 		goto error;
 	}
 
-	pkey = X509_get_pubkey(ckch->cert);
+	pkey = X509_get_pubkey(data->cert);
 	if (pkey) {
 		kinfo.bits = EVP_PKEY_bits(pkey);
 		switch(EVP_PKEY_base_id(pkey)) {
@@ -3897,7 +3913,7 @@ int ckch_inst_new_load_store(const char *path, struct ckch_store *ckchs, struct 
 	}
 	else {
 #ifdef SSL_CTRL_SET_TLSEXT_HOSTNAME
-		names = X509_get_ext_d2i(ckch->cert, NID_subject_alt_name, NULL, NULL);
+		names = X509_get_ext_d2i(data->cert, NID_subject_alt_name, NULL, NULL);
 		if (names) {
 			for (i = 0; i < sk_GENERAL_NAME_num(names); i++) {
 				GENERAL_NAME *name = sk_GENERAL_NAME_value(names, i);
@@ -3916,7 +3932,7 @@ int ckch_inst_new_load_store(const char *path, struct ckch_store *ckchs, struct 
 			sk_GENERAL_NAME_pop_free(names, GENERAL_NAME_free);
 		}
 #endif /* SSL_CTRL_SET_TLSEXT_HOSTNAME */
-		xname = X509_get_subject_name(ckch->cert);
+		xname = X509_get_subject_name(data->cert);
 		i = -1;
 		while ((i = X509_NAME_get_index_by_NID(xname, NID_commonName, i)) != -1) {
 			X509_NAME_ENTRY *entry = X509_NAME_get_entry(xname, i);
@@ -3998,16 +4014,16 @@ int ckch_inst_new_load_srv_store(const char *path, struct ckch_store *ckchs,
 				 struct ckch_inst **ckchi, char **err)
 {
 	SSL_CTX *ctx;
-	struct cert_key_and_chain *ckch;
+	struct ckch_data *data;
 	struct ckch_inst *ckch_inst = NULL;
 	int errcode = 0;
 
 	*ckchi = NULL;
 
-	if (!ckchs || !ckchs->ckch)
+	if (!ckchs || !ckchs->data)
 		return ERR_FATAL;
 
-	ckch = ckchs->ckch;
+	data = ckchs->data;
 
 	ctx = SSL_CTX_new(SSLv23_client_method());
 	if (!ctx) {
@@ -4017,7 +4033,7 @@ int ckch_inst_new_load_srv_store(const char *path, struct ckch_store *ckchs,
 		goto error;
 	}
 
-	errcode |= ssl_sock_put_srv_ckch_into_ctx(path, ckch, ctx, err);
+	errcode |= ssl_sock_put_srv_ckch_into_ctx(path, data, ctx, err);
 	if (errcode & ERR_CODE)
 		goto error;
 
@@ -4969,7 +4985,9 @@ static int ssl_sock_prepare_ctx(struct bind_conf *bind_conf, struct ssl_bind_con
 	SSL_CTX_set_msg_callback(ctx, ssl_sock_msgcbk);
 #endif
 #ifdef HAVE_SSL_KEYLOG
-	SSL_CTX_set_keylog_callback(ctx, SSL_CTX_keylog);
+	/* only activate the keylog callback if it was required to prevent performance loss */
+	if (global_ssl.keylog > 0)
+		SSL_CTX_set_keylog_callback(ctx, SSL_CTX_keylog);
 #endif
 
 #if defined(OPENSSL_NPN_NEGOTIATED) && !defined(OPENSSL_NO_NEXTPROTONEG)
@@ -5696,7 +5714,7 @@ int
 ssl_sock_load_ca(struct bind_conf *bind_conf)
 {
 	struct proxy *px = bind_conf->frontend;
-	struct cert_key_and_chain *ckch = NULL;
+	struct ckch_data *data = NULL;
 	int ret = 0;
 	char *err = NULL;
 
@@ -5719,15 +5737,15 @@ ssl_sock_load_ca(struct bind_conf *bind_conf)
 	}
 
 	/* Allocate cert structure */
-	ckch = calloc(1, sizeof(*ckch));
-	if (!ckch) {
+	data = calloc(1, sizeof(*data));
+	if (!data) {
 		ha_alert("Proxy '%s': Failed to read CA certificate file '%s' at [%s:%d]. Chain allocation failure\n",
 			px->id, bind_conf->ca_sign_file, bind_conf->file, bind_conf->line);
 		goto failed;
 	}
 
 	/* Try to parse file */
-	if (ssl_sock_load_files_into_ckch(bind_conf->ca_sign_file, ckch, &err)) {
+	if (ssl_sock_load_files_into_ckch(bind_conf->ca_sign_file, data, &err)) {
 		ha_alert("Proxy '%s': Failed to read CA certificate file '%s' at [%s:%d]. Chain loading failed: %s\n",
 			px->id, bind_conf->ca_sign_file, bind_conf->file, bind_conf->line, err);
 		free(err);
@@ -5735,20 +5753,20 @@ ssl_sock_load_ca(struct bind_conf *bind_conf)
 	}
 
 	/* Fail if missing cert or pkey */
-	if ((!ckch->cert) || (!ckch->key)) {
+	if ((!data->cert) || (!data->key)) {
 		ha_alert("Proxy '%s': Failed to read CA certificate file '%s' at [%s:%d]. Chain missing certificate or private key\n",
 			px->id, bind_conf->ca_sign_file, bind_conf->file, bind_conf->line);
 		goto failed;
 	}
 
 	/* Final assignment to bind */
-	bind_conf->ca_sign_ckch = ckch;
+	bind_conf->ca_sign_ckch = data;
 	return ret;
 
  failed:
-	if (ckch) {
-		ssl_sock_free_cert_key_and_chain_contents(ckch);
-		free(ckch);
+	if (data) {
+		ssl_sock_free_cert_key_and_chain_contents(data);
+		free(data);
 	}
 
 	bind_conf->options &= ~BC_O_GENERATE_CERTS;
@@ -6539,9 +6557,9 @@ leave:
 
 		HA_SPIN_LOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
 		if (conn_in_list == CO_FL_SAFE_LIST)
-			ebmb_insert(&srv->per_thr[tid].safe_conns, &conn->hash_node->node, sizeof(conn->hash_node->hash));
+			eb64_insert(&srv->per_thr[tid].safe_conns, &conn->hash_node->node);
 		else
-			ebmb_insert(&srv->per_thr[tid].idle_conns, &conn->hash_node->node, sizeof(conn->hash_node->hash));
+			eb64_insert(&srv->per_thr[tid].idle_conns, &conn->hash_node->node);
 		HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
 	}
 	return t;
@@ -7228,8 +7246,8 @@ int ssl_load_global_issuer_from_BIO(BIO *in, char *fp, char **err)
 				break;
 			}
 		}
-		AUTHORITY_KEYID_free(akid);
 	}
+	AUTHORITY_KEYID_free(akid);
 	return issuer;
 }
 
@@ -7385,7 +7403,7 @@ static int cli_io_handler_tlskeys_files(struct appctx *appctx)
 			ctx->next_ref = tlskeys_list_get_next(&tlskeys_reference, &tlskeys_reference);
 
 		ctx->state = SHOW_KEYS_LIST;
-		/* fall through */
+		__fallthrough;
 
 	case SHOW_KEYS_LIST:
 		while (ctx->next_ref) {
@@ -7453,7 +7471,7 @@ static int cli_io_handler_tlskeys_files(struct appctx *appctx)
 			ctx->next_ref = tlskeys_list_get_next(&ref->list, &tlskeys_reference);
 		}
 		ctx->state = SHOW_KEYS_DONE;
-		/* fall through */
+		__fallthrough;
 
 	default:
 		return 1;
@@ -7612,9 +7630,17 @@ static inline int ocsp_certid_print(BIO *bp, OCSP_CERTID *certid, int indent)
 		BIO_printf(bp, "%*sCertificate ID:\n", indent, "");
 		indent += 2;
 		BIO_printf(bp, "%*sIssuer Name Hash: ", indent, "");
+#ifndef USE_OPENSSL_WOLFSSL
 		i2a_ASN1_STRING(bp, piNameHash, 0);
+#else
+        wolfSSL_ASN1_STRING_print(bp, piNameHash);
+#endif
 		BIO_printf(bp, "\n%*sIssuer Key Hash: ", indent, "");
+#ifndef USE_OPENSSL_WOLFSSL
 		i2a_ASN1_STRING(bp, piKeyHash, 0);
+#else
+		wolfSSL_ASN1_STRING_print(bp, piNameHash);
+#endif
 		BIO_printf(bp, "\n%*sSerial Number: ", indent, "");
 		i2a_ASN1_INTEGER(bp, pSerial);
 	}
@@ -7820,7 +7846,11 @@ int ssl_ocsp_response_print(struct buffer *ocsp_response, struct buffer *out)
 		goto end;
 	}
 
-	if (OCSP_RESPONSE_print(bio, resp, 0) != 0) {
+#ifndef USE_OPENSSL_WOLFSSL
+   if (OCSP_RESPONSE_print(bio, resp, 0) != 0) {
+#else
+   if (wolfSSL_d2i_OCSP_RESPONSE_bio(bio, &resp) != 0) {
+#endif
 		struct buffer *trash = get_trash_chunk();
 		struct ist ist_block = IST_NULL;
 		struct ist ist_double_lf = IST_NULL;

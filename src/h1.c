@@ -169,7 +169,7 @@ static int h1_validate_connect_authority(struct ist authority, struct ist *host_
 		goto invalid_authority;
 	uri_host = authority;
 	uri_port = http_get_host_port(authority);
-	if (!isttest(uri_port))
+	if (!istlen(uri_port))
 		goto invalid_authority;
 	uri_host.len -= (istlen(uri_port) + 1);
 
@@ -179,8 +179,10 @@ static int h1_validate_connect_authority(struct ist authority, struct ist *host_
 	/* Get the port of the host header value, if any */
 	host = *host_hdr;
 	host_port = http_get_host_port(*host_hdr);
-	if (isttest(host_port)) {
+	if (isttest(host_port))
 		host.len -= (istlen(host_port) + 1);
+
+	if (istlen(host_port)) {
 		if (!isteqi(host, uri_host) || !isteq(host_port, uri_port))
 			goto invalid_host;
 		if (http_is_default_port(IST_NULL, uri_port))
@@ -200,6 +202,63 @@ static int h1_validate_connect_authority(struct ist authority, struct ist *host_
   invalid_host:
 	return -2;
 }
+
+
+/* Validate the authority and the host header value for non-CONNECT method, when
+ * an absolute-URI is detected but when it does not exactly match the host
+ * value. The idea is to detect default port (http or https). authority and host
+ * are defined here. 0 is returned on success, -1 if the host is does not match
+ * the authority.
+ */
+static int h1_validate_mismatch_authority(struct ist scheme, struct ist authority, struct ist host_hdr)
+{
+	struct ist uri_host, uri_port, host, host_port;
+
+	if (!isttest(scheme))
+		goto mismatch;
+
+	uri_host = authority;
+	uri_port = http_get_host_port(authority);
+	if (isttest(uri_port))
+		uri_host.len -= (istlen(uri_port) + 1);
+
+	host = host_hdr;
+	host_port = http_get_host_port(host_hdr);
+	if (isttest(host_port))
+	    host.len -= (istlen(host_port) + 1);
+
+	if (!isttest(uri_port) && !isttest(host_port)) {
+		/* No port on both: we already know the authority does not match
+		 * the host value
+		 */
+		goto mismatch;
+	}
+	else if (isttest(uri_port) && !http_is_default_port(scheme, uri_port)) {
+		/* here there is no port for the host value and the port for the
+		 * authority is not the default one
+		 */
+		goto mismatch;
+	}
+	else if (isttest(host_port) && !http_is_default_port(scheme, host_port)) {
+		/* here there is no port for the authority and the port for the
+		 * host value is not the default one
+		 */
+		goto mismatch;
+	}
+	else {
+		/* the authority or the host value contain a default port and
+		 * there is no port on the other value
+		 */
+		if (!isteqi(uri_host, host))
+			goto mismatch;
+	}
+
+	return 0;
+
+  mismatch:
+	return -1;
+}
+
 
 /* Parse the Connection: header of an HTTP/1 request, looking for "close",
  * "keep-alive", and "upgrade" values, and updating h1m->flags according to
@@ -1002,17 +1061,23 @@ int h1_headers_to_hdr_list(char *start, const char *stop,
 
 		if (!(h1m->flags & (H1_MF_HDRS_ONLY|H1_MF_RESP))) {
 			struct http_uri_parser parser = http_uri_parser_init(sl.rq.u);
-			struct ist authority;
+			struct ist scheme, authority;
+			int ret;
 
+			scheme = http_parse_scheme(&parser);
 			authority = http_parse_authority(&parser, 1);
 			if (sl.rq.meth == HTTP_METH_CONNECT) {
 				struct ist *host = ((host_idx != -1) ? &hdr[host_idx].v : NULL);
-				int ret;
 
 				ret = h1_validate_connect_authority(authority, host);
 				if (ret < 0) {
 					if (h1m->err_pos < -1) {
 						state = H1_MSG_LAST_LF;
+						/* WT: gcc seems to see a path where sl.rq.u.ptr was used
+						 * uninitialized, but it doesn't know that the function is
+						 * called with initial states making this impossible.
+						 */
+						ALREADY_CHECKED(sl.rq.u.ptr);
 						ptr = ((ret == -1) ? sl.rq.u.ptr : host->ptr); /* Set ptr on the error */
 						goto http_msg_invalid;
 					}
@@ -1025,15 +1090,17 @@ int h1_headers_to_hdr_list(char *start, const char *stop,
 
 				/* For non-CONNECT method, the authority must match the host header value */
 				if (!isteqi(authority, host)) {
-					if (h1m->err_pos < -1) {
-						state = H1_MSG_LAST_LF;
-						ptr = host.ptr; /* Set ptr on the error */
-						goto http_msg_invalid;
+					ret = h1_validate_mismatch_authority(scheme, authority, host);
+					if (ret < 0) {
+						if (h1m->err_pos < -1) {
+							state = H1_MSG_LAST_LF;
+							ptr = host.ptr; /* Set ptr on the error */
+							goto http_msg_invalid;
+						}
+						if (h1m->err_pos == -1) /* capture the error pointer */
+							h1m->err_pos = v.ptr - start + skip; /* >= 0 now */
 					}
-					if (h1m->err_pos == -1) /* capture the error pointer */
-						h1m->err_pos = v.ptr - start + skip; /* >= 0 now */
 				}
-
 			}
 		}
 

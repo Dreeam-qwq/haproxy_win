@@ -27,14 +27,14 @@
 
 /* cert_key_and_chain functions */
 
-int ssl_sock_load_files_into_ckch(const char *path, struct cert_key_and_chain *ckch, char **err);
-int ssl_sock_load_pem_into_ckch(const char *path, char *buf, struct cert_key_and_chain *ckch , char **err);
-void ssl_sock_free_cert_key_and_chain_contents(struct cert_key_and_chain *ckch);
+int ssl_sock_load_files_into_ckch(const char *path, struct ckch_data *data, char **err);
+int ssl_sock_load_pem_into_ckch(const char *path, char *buf, struct ckch_data *datackch , char **err);
+void ssl_sock_free_cert_key_and_chain_contents(struct ckch_data *data);
 
-int ssl_sock_load_key_into_ckch(const char *path, char *buf, struct cert_key_and_chain *ckch , char **err);
-int ssl_sock_load_ocsp_response_from_file(const char *ocsp_path, char *buf, struct cert_key_and_chain *ckch, char **err);
-int ssl_sock_load_sctl_from_file(const char *sctl_path, char *buf, struct cert_key_and_chain *ckch, char **err);
-int ssl_sock_load_issuer_file_into_ckch(const char *path, char *buf, struct cert_key_and_chain *ckch, char **err);
+int ssl_sock_load_key_into_ckch(const char *path, char *buf, struct ckch_data *data , char **err);
+int ssl_sock_load_ocsp_response_from_file(const char *ocsp_path, char *buf, struct ckch_data *data, char **err);
+int ssl_sock_load_sctl_from_file(const char *sctl_path, char *buf, struct ckch_data *data, char **err);
+int ssl_sock_load_issuer_file_into_ckch(const char *path, char *buf, struct ckch_data *data, char **err);
 
 /* ckch_store functions */
 struct ckch_store *ckchs_load_cert_file(char *path, char **err);
@@ -67,6 +67,7 @@ struct cafile_entry *ssl_store_dup_cafile_entry(struct cafile_entry *src);
 void ssl_store_delete_cafile_entry(struct cafile_entry *ca_e);
 int ssl_store_load_ca_from_buf(struct cafile_entry *ca_e, char *cert_buf, int append);
 int ssl_store_load_locations_file(char *path, int create_if_none, enum cafile_type type);
+int __ssl_store_load_locations_file(char *path, int create_if_none, enum cafile_type type, int shuterror);
 
 extern struct cert_exts cert_exts[];
 

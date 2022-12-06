@@ -2,6 +2,11 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+
+#ifdef __linux__
+#include <sys/epoll.h>
+#endif
+
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <errno.h>
@@ -32,8 +37,21 @@ int one  = 1;
 int lfd = -1;
 int cfd = -1;
 int sfd = -1;
+int connected = 0;
+int use_epoll = 0;
 struct sockaddr_in saddr, caddr;
 socklen_t salen, calen;
+
+static inline const char *side(int fd)
+{
+	if (fd == lfd)
+		return "l";
+	if (fd == sfd)
+		return "s";
+	if (fd == cfd)
+		return "c";
+	return "?";
+}
 
 void usage(const char *arg0)
 {
@@ -41,11 +59,13 @@ void usage(const char *arg0)
 	       "args:\n"
 	       "    -h            display this help\n"
 	       "    -v            verbose mode (shows ret values)\n"
+	       "    -e            use epoll instead of poll\n"
 	       "    -c <actions>  perform <action> on client side socket\n"
 	       "    -s <actions>  perform <action> on server side socket\n"
 	       "    -l <actions>  perform <action> on listening socket\n"
 	       "\n"
 	       "actions for -c/-s/-l (multiple may be delimited by commas) :\n"
+	       "    con           connect to listener, implicit before first -c/-s\n"
 	       "    acc           accept on listener, implicit before first -s\n"
 	       "    snd           send a few bytes of data\n"
 	       "    mor           send a few bytes of data with MSG_MORE\n"
@@ -87,7 +107,17 @@ void do_acc(int fd)
 	if (sfd < 0)
 		sfd = ret;
 	if (verbose)
-		printf("cmd #%d stp #%d: %s(%d): ret=%d%s\n", cmd, cmdstep, __FUNCTION__, fd, ret, get_errno(ret));
+		printf("cmd #%d stp #%d: %s(%s=%d): ret=%d%s\n", cmd, cmdstep, __FUNCTION__ + 3, side(fd), fd, ret, get_errno(ret));
+}
+
+void do_con(int fd)
+{
+	int ret;
+
+        ret = connect(cfd, (const struct sockaddr*)&saddr, salen);
+	if (verbose)
+		printf("cmd #%d stp #%d: %s(%s=%d): ret=%d%s\n", cmd, cmdstep, __FUNCTION__ + 3, side(fd), fd, ret, get_errno(ret));
+	connected = 1;
 }
 
 void do_snd(int fd)
@@ -96,7 +126,7 @@ void do_snd(int fd)
 
 	ret = send(fd, "foo", 3, MSG_NOSIGNAL|MSG_DONTWAIT);
 	if (verbose)
-		printf("cmd #%d stp #%d: %s(%d): ret=%d%s\n", cmd, cmdstep, __FUNCTION__, fd, ret, get_errno(ret));
+		printf("cmd #%d stp #%d: %s(%s=%d): ret=%d%s\n", cmd, cmdstep, __FUNCTION__ + 3, side(fd), fd, ret, get_errno(ret));
 }
 
 void do_mor(int fd)
@@ -105,7 +135,7 @@ void do_mor(int fd)
 
 	ret = send(fd, "foo", 3, MSG_NOSIGNAL|MSG_DONTWAIT|MSG_MORE);
 	if (verbose)
-		printf("cmd #%d stp #%d: %s(%d): ret=%d%s\n", cmd, cmdstep, __FUNCTION__, fd, ret, get_errno(ret));
+		printf("cmd #%d stp #%d: %s(%s=%d): ret=%d%s\n", cmd, cmdstep, __FUNCTION__ + 3, side(fd), fd, ret, get_errno(ret));
 }
 
 void do_rcv(int fd)
@@ -115,7 +145,7 @@ void do_rcv(int fd)
 
 	ret = recv(fd, buf, sizeof(buf), MSG_DONTWAIT);
 	if (verbose)
-		printf("cmd #%d stp #%d: %s(%d): ret=%d%s\n", cmd, cmdstep, __FUNCTION__, fd, ret, get_errno(ret));
+		printf("cmd #%d stp #%d: %s(%s=%d): ret=%d%s\n", cmd, cmdstep, __FUNCTION__ + 3, side(fd), fd, ret, get_errno(ret));
 }
 
 void do_drn(int fd)
@@ -134,7 +164,7 @@ void do_drn(int fd)
 	}
 
 	if (verbose)
-		printf("cmd #%d stp #%d: %s(%d): ret=%d%s\n", cmd, cmdstep, __FUNCTION__, fd, total, get_errno(ret));
+		printf("cmd #%d stp #%d: %s(%s=%d): ret=%d%s\n", cmd, cmdstep, __FUNCTION__ + 3, side(fd), fd, total, get_errno(ret));
 }
 
 void do_shr(int fd)
@@ -143,7 +173,7 @@ void do_shr(int fd)
 
 	ret = shutdown(fd, SHUT_RD);
 	if (verbose)
-		printf("cmd #%d stp #%d: %s(%d): ret=%d%s\n", cmd, cmdstep, __FUNCTION__, fd, ret, get_errno(ret));
+		printf("cmd #%d stp #%d: %s(%s=%d): ret=%d%s\n", cmd, cmdstep, __FUNCTION__ + 3, side(fd), fd, ret, get_errno(ret));
 }
 
 void do_shw(int fd)
@@ -152,7 +182,7 @@ void do_shw(int fd)
 
 	ret = shutdown(fd, SHUT_WR);
 	if (verbose)
-		printf("cmd #%d stp #%d: %s(%d): ret=%d%s\n", cmd, cmdstep, __FUNCTION__, fd, ret, get_errno(ret));
+		printf("cmd #%d stp #%d: %s(%s=%d): ret=%d%s\n", cmd, cmdstep, __FUNCTION__ + 3, side(fd), fd, ret, get_errno(ret));
 }
 
 void do_shb(int fd)
@@ -161,7 +191,7 @@ void do_shb(int fd)
 
 	ret = shutdown(fd, SHUT_RDWR);
 	if (verbose)
-		printf("cmd #%d stp #%d: %s(%d): ret=%d%s\n", cmd, cmdstep, __FUNCTION__, fd, ret, get_errno(ret));
+		printf("cmd #%d stp #%d: %s(%s=%d): ret=%d%s\n", cmd, cmdstep, __FUNCTION__ + 3, side(fd), fd, ret, get_errno(ret));
 }
 
 void do_lin(int fd)
@@ -171,7 +201,7 @@ void do_lin(int fd)
 
 	ret = setsockopt(fd, SOL_SOCKET, SO_LINGER, &nolinger, sizeof(nolinger));
 	if (verbose)
-		printf("cmd #%d stp #%d: %s(%d): ret=%d%s\n", cmd, cmdstep, __FUNCTION__, fd, ret, get_errno(ret));
+		printf("cmd #%d stp #%d: %s(%s=%d): ret=%d%s\n", cmd, cmdstep, __FUNCTION__ + 3, side(fd), fd, ret, get_errno(ret));
 }
 
 void do_clo(int fd)
@@ -180,19 +210,62 @@ void do_clo(int fd)
 
 	ret = close(fd);
 	if (verbose)
-		printf("cmd #%d stp #%d: %s(%d): ret=%d%s\n", cmd, cmdstep, __FUNCTION__, fd, ret, get_errno(ret));
+		printf("cmd #%d stp #%d: %s(%s=%d): ret=%d%s\n", cmd, cmdstep, __FUNCTION__ + 3, side(fd), fd, ret, get_errno(ret));
 }
 
 void do_pol(int fd)
 {
 	struct pollfd fds = { .fd = fd, .events = POLLIN|POLLOUT|POLLRDHUP, .revents=0 };
+	int flags, flag;
 	int ret;
 
+#ifdef __linux__
+	while (use_epoll) {
+		struct epoll_event evt;
+		static int epoll_fd = -1;
+
+		if (epoll_fd == -1)
+			epoll_fd = epoll_create(1024);
+		if (epoll_fd == -1)
+			break;
+		evt.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP;
+		evt.data.fd = fd;
+		epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &evt);
+		ret = epoll_wait(epoll_fd, &evt, 1, 0);
+
+		if (verbose) {
+			printf("cmd #%d stp #%d: %s(%s=%d): ret=%d%s ev=%#x ", cmd, cmdstep, __FUNCTION__ + 3, side(fd), fd, ret, get_errno(ret), ret > 0 ? evt.events : 0);
+			if (ret > 0 && evt.events) {
+				putchar('(');
+
+				for (flags = evt.events; flags; flags ^= flag) {
+					flag = flags ^ (flags & (flags - 1)); // keep lowest bit only
+					switch (flag) {
+					case EPOLLIN: printf("IN"); break;
+					case EPOLLOUT: printf("OUT"); break;
+					case EPOLLPRI: printf("PRI"); break;
+					case EPOLLHUP: printf("HUP"); break;
+					case EPOLLERR: printf("ERR"); break;
+					case EPOLLRDHUP: printf("RDHUP"); break;
+					default: printf("???[%#x]", flag); break;
+					}
+					if (flags ^ flag)
+						putchar(' ');
+				}
+				putchar(')');
+			}
+			putchar('\n');
+		}
+
+		evt.data.fd = fd;
+		epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, &evt);
+		return;
+	}
+#endif
 	ret = poll(&fds, 1, 0);
 	if (verbose) {
-		printf("cmd #%d stp #%d: %s(%d): ret=%d%s ev=%#x ", cmd, cmdstep, __FUNCTION__, fd, ret, get_errno(ret), ret > 0 ? fds.revents : 0);
+		printf("cmd #%d stp #%d: %s(%s=%d): ret=%d%s ev=%#x ", cmd, cmdstep, __FUNCTION__ + 3, side(fd), fd, ret, get_errno(ret), ret > 0 ? fds.revents : 0);
 		if (ret > 0 && fds.revents) {
-			int flags, flag;
 			putchar('(');
 
 			for (flags = fds.revents; flags; flags ^= flag) {
@@ -251,13 +324,6 @@ int main(int argc, char **argv)
 	if (cfd < 0)
 		die("socket(c)");
 
-        if (connect(cfd, (const struct sockaddr*)&saddr, salen) == -1)
-		die("connect()");
-
-	/* connection is pending in accept queue, accept() will either be
-	 * explicit with "-l acc" below, or implicit on "-s <cmd>"
-	 */
-
 	arg0 = argv[0];
 	if (argc < 2) {
 		usage(arg0);
@@ -282,12 +348,23 @@ int main(int argc, char **argv)
 		case 'v' :
 			verbose++;
 			break;
+		case 'e' :
+			use_epoll = 1;
+			break;
 		case 'c' :
 			cmd++; cmdstep = 0;
+			if (!connected) {
+				do_con(cfd);
+				/* connection is pending in accept queue, accept() will either be
+				 * explicit with "-l acc" below, or implicit on "-s <cmd>"
+				 */
+			}
 			fd = cfd;
 			break;
 		case 's' :
 			cmd++; cmdstep = 0;
+			if (!connected)
+				do_con(cfd);
 			if (sfd < 0)
 				do_acc(lfd);
 			if (sfd < 0)
@@ -314,6 +391,9 @@ int main(int argc, char **argv)
 				cmdstep++;
 				if (strcmp(word, "acc") == 0) {
 					do_acc(fd);
+				}
+				else if (strcmp(word, "con") == 0) {
+					do_con(fd);
 				}
 				else if (strcmp(word, "snd") == 0) {
 					do_snd(fd);

@@ -260,6 +260,7 @@ const struct name_desc stat_fields[ST_F_TOTAL_FIELDS] = {
 	[ST_F_NEED_CONN_EST]                 = { .name = "need_conn_est",               .desc = "Estimated needed number of connections"},
 	[ST_F_UWEIGHT]                       = { .name = "uweight",                     .desc = "Server's user weight, or sum of active servers' user weights for a backend" },
 	[ST_F_AGG_SRV_CHECK_STATUS]          = { .name = "agg_server_check_status",     .desc = "Backend's aggregated gauge of servers' state check status" },
+	[ST_F_SRID]                          = { .name = "srid",                        .desc = "Server id revision, to prevent server id reuse mixups" },
 };
 
 /* one line of info */
@@ -1153,7 +1154,7 @@ static int stats_dump_fields_html(struct buffer *out,
 				chunk_appendf(out, "%s, ", field_str(stats, ST_F_ADDR));
 
 			/* id */
-			chunk_appendf(out, "id: %d", stats[ST_F_SID].u.u32);
+			chunk_appendf(out, "id: %d, rid: %d", stats[ST_F_SID].u.u32, stats[ST_F_SRID].u.u32);
 
 			/* cookie */
 			if (stats[ST_F_COOKIE].type) {
@@ -2283,6 +2284,9 @@ int stats_fill_sv_stats(struct proxy *px, struct server *sv, int flags,
 			case ST_F_SID:
 				metric = mkf_u32(FO_KEY|FS_SERVICE, sv->puid);
 				break;
+			case ST_F_SRID:
+				metric = mkf_u32(FN_COUNTER, sv->rid);
+				break;
 			case ST_F_THROTTLE:
 				if (sv->cur_state == SRV_ST_STARTING && !server_is_draining(sv))
 					metric = mkf_u32(FN_AVG, server_throttle_rate(sv));
@@ -3077,7 +3081,7 @@ int stats_dump_proxy_to_buffer(struct stconn *sc, struct htx *htx,
 			return 1;
 
 		ctx->px_st = STAT_PX_ST_TH;
-		/* fall through */
+		__fallthrough;
 
 	case STAT_PX_ST_TH:
 		if (ctx->flags & STAT_FMT_HTML) {
@@ -3087,7 +3091,7 @@ int stats_dump_proxy_to_buffer(struct stconn *sc, struct htx *htx,
 		}
 
 		ctx->px_st = STAT_PX_ST_FE;
-		/* fall through */
+		__fallthrough;
 
 	case STAT_PX_ST_FE:
 		/* print the frontend */
@@ -3098,7 +3102,7 @@ int stats_dump_proxy_to_buffer(struct stconn *sc, struct htx *htx,
 
 		ctx->obj2 = px->conf.listeners.n;
 		ctx->px_st = STAT_PX_ST_LI;
-		/* fall through */
+		__fallthrough;
 
 	case STAT_PX_ST_LI:
 		/* obj2 points to listeners list as initialized above */
@@ -3133,7 +3137,7 @@ int stats_dump_proxy_to_buffer(struct stconn *sc, struct htx *htx,
 
 		ctx->obj2 = px->srv; /* may be NULL */
 		ctx->px_st = STAT_PX_ST_SV;
-		/* fall through */
+		__fallthrough;
 
 	case STAT_PX_ST_SV:
 		/* obj2 points to servers list as initialized above.
@@ -3194,7 +3198,7 @@ int stats_dump_proxy_to_buffer(struct stconn *sc, struct htx *htx,
 		} /* for sv */
 
 		ctx->px_st = STAT_PX_ST_BE;
-		/* fall through */
+		__fallthrough;
 
 	case STAT_PX_ST_BE:
 		/* print the backend */
@@ -3204,7 +3208,7 @@ int stats_dump_proxy_to_buffer(struct stconn *sc, struct htx *htx,
 		}
 
 		ctx->px_st = STAT_PX_ST_END;
-		/* fall through */
+		__fallthrough;
 
 	case STAT_PX_ST_END:
 		if (ctx->flags & STAT_FMT_HTML) {
@@ -3214,7 +3218,7 @@ int stats_dump_proxy_to_buffer(struct stconn *sc, struct htx *htx,
 		}
 
 		ctx->px_st = STAT_PX_ST_FIN;
-		/* fall through */
+		__fallthrough;
 
 	case STAT_PX_ST_FIN:
 		return 1;
@@ -3744,7 +3748,7 @@ static int stats_dump_stat_to_buffer(struct stconn *sc, struct htx *htx,
 	switch (ctx->state) {
 	case STAT_STATE_INIT:
 		ctx->state = STAT_STATE_HEAD; /* let's start producing data */
-		/* fall through */
+		__fallthrough;
 
 	case STAT_STATE_HEAD:
 		if (ctx->flags & STAT_FMT_HTML)
@@ -3764,7 +3768,7 @@ static int stats_dump_stat_to_buffer(struct stconn *sc, struct htx *htx,
 			return 1;
 		}
 		ctx->state = STAT_STATE_INFO;
-		/* fall through */
+		__fallthrough;
 
 	case STAT_STATE_INFO:
 		if (ctx->flags & STAT_FMT_HTML) {
@@ -3778,7 +3782,7 @@ static int stats_dump_stat_to_buffer(struct stconn *sc, struct htx *htx,
 
 		ctx->px_st = STAT_PX_ST_INIT;
 		ctx->state = STAT_STATE_LIST;
-		/* fall through */
+		__fallthrough;
 
 	case STAT_STATE_LIST:
 		switch (domain) {
@@ -3799,7 +3803,7 @@ static int stats_dump_stat_to_buffer(struct stconn *sc, struct htx *htx,
 		}
 
 		ctx->state = STAT_STATE_END;
-		/* fall through */
+		__fallthrough;
 
 	case STAT_STATE_END:
 		if (ctx->flags & (STAT_FMT_HTML|STAT_FMT_JSON)) {
@@ -3812,7 +3816,7 @@ static int stats_dump_stat_to_buffer(struct stconn *sc, struct htx *htx,
 		}
 
 		ctx->state = STAT_STATE_FIN;
-		/* fall through */
+		__fallthrough;
 
 	case STAT_STATE_FIN:
 		return 1;

@@ -1,7 +1,10 @@
+#include <haproxy/quic_frame-t.h>
 #include <haproxy/quic_stats-t.h>
 #include <haproxy/stats.h>
 
 static struct name_desc quic_stats[] = {
+	[QUIC_ST_RXBUF_FULL]          = { .name = "quic_rxbuf_full",
+	                                  .desc = "Total number of cancelled reception due to full receiver buffer" },
 	[QUIC_ST_DROPPED_PACKET]      = { .name = "quic_dropped_pkt",
 	                                  .desc = "Total number of dropped packets" },
 	[QUIC_ST_DROPPED_PACKET_BUFOVERRUN] = { .name = "quic_dropped_pkt_bufoverrun",
@@ -12,6 +15,8 @@ static struct name_desc quic_stats[] = {
 	                                  .desc = "Total number of EAGAIN error on sendto() calls" },
 	[QUIC_ST_SENDTO_ERR]          = { .name = "quic_sendto_err",
 	                                  .desc = "Total number of error on sendto() calls, EAGAIN excepted" },
+	[QUIC_ST_SENDTO_ERR_UNKNWN]   = { .name = "quic_sendto_err_unknwn",
+	                                  .desc = "Total number of error on sendto() calls not explicitly listed" },
 	[QUIC_ST_LOST_PACKET]         = { .name = "quic_lost_pkt",
 	                                  .desc = "Total number of lost sent packets" },
 	[QUIC_ST_TOO_SHORT_INITIAL_DGRAM] = { .name = "quic_too_short_dgram",
@@ -28,6 +33,9 @@ static struct name_desc quic_stats[] = {
 	                                  .desc = "Total number of handshake failures" },
 	[QUIC_ST_STATELESS_RESET_SENT] = { .name = "quic_stless_rst_sent",
 	                                  .desc = "Total number of stateless reset packet sent" },
+	/* Special events of interest */
+	[QUIC_ST_CONN_MIGRATION_DONE] = { .name = "quic_conn_migration_done",
+	                                  .desc = "Total number of connection migration proceeded" },
 	/* Transport errors */
 	[QUIC_ST_TRANSP_ERR_NO_ERROR] = { .name = "quic_transp_err_no_error",
 	                                  .desc = "Total number of NO_ERROR errors received" },
@@ -84,11 +92,13 @@ static void quic_fill_stats(void *data, struct field *stats)
 {
 	struct quic_counters *counters = data;
 
+	stats[QUIC_ST_RXBUF_FULL]        = mkf_u64(FN_COUNTER, counters->rxbuf_full);
 	stats[QUIC_ST_DROPPED_PACKET]    = mkf_u64(FN_COUNTER, counters->dropped_pkt);
 	stats[QUIC_ST_DROPPED_PACKET_BUFOVERRUN] = mkf_u64(FN_COUNTER, counters->dropped_pkt_bufoverrun);
 	stats[QUIC_ST_DROPPED_PARSING]   = mkf_u64(FN_COUNTER, counters->dropped_parsing);
 	stats[QUIC_ST_SOCKET_FULL]       = mkf_u64(FN_COUNTER, counters->socket_full);
 	stats[QUIC_ST_SENDTO_ERR]        = mkf_u64(FN_COUNTER, counters->sendto_err);
+	stats[QUIC_ST_SENDTO_ERR_UNKNWN] = mkf_u64(FN_COUNTER, counters->sendto_err_unknown);
 	stats[QUIC_ST_LOST_PACKET]       = mkf_u64(FN_COUNTER, counters->lost_pkt);
 	stats[QUIC_ST_TOO_SHORT_INITIAL_DGRAM] = mkf_u64(FN_COUNTER, counters->too_short_initial_dgram);
 	stats[QUIC_ST_RETRY_SENT]        = mkf_u64(FN_COUNTER, counters->retry_sent);
@@ -97,6 +107,8 @@ static void quic_fill_stats(void *data, struct field *stats)
 	stats[QUIC_ST_HALF_OPEN_CONN]    = mkf_u64(FN_GAUGE, counters->half_open_conn);
 	stats[QUIC_ST_HDSHK_FAIL]        = mkf_u64(FN_COUNTER, counters->hdshk_fail);
 	stats[QUIC_ST_STATELESS_RESET_SENT] = mkf_u64(FN_COUNTER, counters->stateless_reset_sent);
+	/* Special events of interest */
+	stats[QUIC_ST_CONN_MIGRATION_DONE] = mkf_u64(FN_COUNTER, counters->conn_migration_done);
 	/* Transport errors */
 	stats[QUIC_ST_TRANSP_ERR_NO_ERROR]           = mkf_u64(FN_COUNTER, counters->quic_transp_err_no_error);
 	stats[QUIC_ST_TRANSP_ERR_INTERNAL_ERROR]     = mkf_u64(FN_COUNTER, counters->quic_transp_err_internal_error);

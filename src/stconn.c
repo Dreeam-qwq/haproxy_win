@@ -170,7 +170,9 @@ struct stconn *sc_new_from_endp(struct sedesc *sd, struct session *sess, struct 
 		return NULL;
 	if (unlikely(!stream_new(sess, sc, input))) {
 		pool_free(pool_head_connstream, sc);
-		sc = NULL;
+		sd->sc = NULL;
+		se_fl_set(sd, SE_FL_ORPHAN);
+		return NULL;
 	}
 	se_fl_clr(sd, SE_FL_ORPHAN);
 	return sc;
@@ -516,7 +518,7 @@ static void sc_app_shutr(struct stconn *sc)
 		if (sc->flags & SC_FL_ISBACK)
 			__sc_strm(sc)->conn_exp = TICK_ETERNITY;
 	}
-	else if (sc->flags & SC_FL_NOHALF) {
+	else if ((sc->flags & SC_FL_NOHALF) && channel_is_empty(ic)) {
 		/* we want to immediately forward this close to the write side */
 		return sc_app_shutw(sc);
 	}
@@ -562,14 +564,14 @@ static void sc_app_shutw(struct stconn *sc)
 		    !(ic->flags & (CF_SHUTR|CF_DONT_READ)))
 			return;
 
-		/* fall through */
+		__fallthrough;
 	case SC_ST_CON:
 	case SC_ST_CER:
 	case SC_ST_QUE:
 	case SC_ST_TAR:
 		/* Note that none of these states may happen with applets */
 		sc->state = SC_ST_DIS;
-		/* fall through */
+		__fallthrough;
 	default:
 		sc->flags &= ~SC_FL_NOLINGER;
 		ic->flags |= CF_SHUTR;
@@ -660,7 +662,7 @@ static void sc_app_shutr_conn(struct stconn *sc)
 		if (sc->flags & SC_FL_ISBACK)
 			__sc_strm(sc)->conn_exp = TICK_ETERNITY;
 	}
-	else if (sc->flags & SC_FL_NOHALF) {
+	else if ((sc->flags & SC_FL_NOHALF) && channel_is_empty(ic)) {
 		/* we want to immediately forward this close to the write side */
 		return sc_app_shutw_conn(sc);
 	}
@@ -726,18 +728,18 @@ static void sc_app_shutw_conn(struct stconn *sc)
 				return;
 		}
 
-		/* fall through */
+		__fallthrough;
 	case SC_ST_CON:
 		/* we may have to close a pending connection, and mark the
 		 * response buffer as shutr
 		 */
 		sc_conn_shut(sc);
-		/* fall through */
+		__fallthrough;
 	case SC_ST_CER:
 	case SC_ST_QUE:
 	case SC_ST_TAR:
 		sc->state = SC_ST_DIS;
-		/* fall through */
+		__fallthrough;
 	default:
 		sc->flags &= ~SC_FL_NOLINGER;
 		ic->flags |= CF_SHUTR;
@@ -790,7 +792,7 @@ static void sc_app_chk_snd_conn(struct stconn *sc)
 
 	if (sc_ep_test(sc, SE_FL_ERROR | SE_FL_ERR_PENDING) || sc_is_conn_error(sc)) {
 		/* Write error on the file descriptor */
-		if (sc->state >= SC_ST_CON)
+		if (sc->state >= SC_ST_CON && sc_ep_test(sc, SE_FL_EOS))
 			sc_ep_set(sc, SE_FL_ERROR);
 		goto out_wakeup;
 	}
@@ -888,7 +890,7 @@ static void sc_app_shutr_applet(struct stconn *sc)
 		if (sc->flags & SC_FL_ISBACK)
 			__sc_strm(sc)->conn_exp = TICK_ETERNITY;
 	}
-	else if (sc->flags & SC_FL_NOHALF) {
+	else if ((sc->flags & SC_FL_NOHALF) && channel_is_empty(ic)) {
 		/* we want to immediately forward this close to the write side */
 		return sc_app_shutw_applet(sc);
 	}
@@ -935,7 +937,7 @@ static void sc_app_shutw_applet(struct stconn *sc)
 		    !(ic->flags & (CF_SHUTR|CF_DONT_READ)))
 			return;
 
-		/* fall through */
+		__fallthrough;
 	case SC_ST_CON:
 	case SC_ST_CER:
 	case SC_ST_QUE:
@@ -943,7 +945,7 @@ static void sc_app_shutw_applet(struct stconn *sc)
 		/* Note that none of these states may happen with applets */
 		appctx_shut(__sc_appctx(sc));
 		sc->state = SC_ST_DIS;
-		/* fall through */
+		__fallthrough;
 	default:
 		sc->flags &= ~SC_FL_NOLINGER;
 		ic->flags |= CF_SHUTR;
@@ -1247,7 +1249,7 @@ static void sc_conn_read0(struct stconn *sc)
 	if (oc->flags & CF_SHUTW)
 		goto do_close;
 
-	if (sc->flags & SC_FL_NOHALF) {
+	if ((sc->flags & SC_FL_NOHALF) && channel_is_empty(ic)) {
 		/* we want to immediately forward this close to the write side */
 		/* force flag on ssl to keep stream in cache */
 		sc_conn_shutw(sc, CO_SHW_SILENT);
@@ -1648,7 +1650,8 @@ static int sc_conn_send(struct stconn *sc)
 		 */
 		if (sc->state < SC_ST_CON)
 			return 0;
-		sc_ep_set(sc, SE_FL_ERROR);
+		if (sc_ep_test(sc, SE_FL_EOS))
+		    sc_ep_set(sc, SE_FL_ERROR);
 		return 1;
 	}
 
@@ -1762,7 +1765,8 @@ static int sc_conn_send(struct stconn *sc)
 	}
 
 	if (sc_ep_test(sc, SE_FL_ERROR | SE_FL_ERR_PENDING)) {
-		sc_ep_set(sc, SE_FL_ERROR);
+		if (sc_ep_test(sc, SE_FL_EOS))
+		    sc_ep_set(sc, SE_FL_ERROR);
 		return 1;
 	}
 

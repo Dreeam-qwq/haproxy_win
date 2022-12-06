@@ -20,33 +20,14 @@
 #define TRACE_SOURCE &trace_quic
 
 #include <stdlib.h>
-#include <openssl/ssl.h>
+#include <string.h>
 
 #include <haproxy/dynbuf.h>
+#include <haproxy/pool.h>
+#include <haproxy/openssl-compat.h>
+#include <haproxy/quic_conn-t.h>
 #include <haproxy/quic_tls-t.h>
 #include <haproxy/trace.h>
-#include <haproxy/xprt_quic.h>
-
-/* Initial salt depending on QUIC version to derive client/server initial secrets.
- * This one is for draft-29 QUIC version.
- */
-const unsigned char initial_salt_draft_29[20] = {
-	0xaf, 0xbf, 0xec, 0x28, 0x99, 0x93, 0xd2, 0x4c,
-	0x9e, 0x97, 0x86, 0xf1, 0x9c, 0x61, 0x11, 0xe0,
-	0x43, 0x90, 0xa8, 0x99
-};
-
-const unsigned char initial_salt_v1[20] = {
-	0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3,
-	0x4d, 0x17, 0x9a, 0xe6, 0xa4, 0xc8, 0x0c, 0xad,
-	0xcc, 0xbb, 0x7f, 0x0a
-};
-
-const unsigned char initial_salt_v2_draft[20] = {
-	0xa7, 0x07, 0xc2, 0x03, 0xa5, 0x9b, 0x47, 0x18,
-	0x4a, 0x1d, 0x62, 0xca, 0x57, 0x04, 0x06, 0xea,
-	0x7a, 0xe3, 0xe5, 0xd3
-};
 
 void quic_tls_keys_hexdump(struct buffer *buf,
                            const struct quic_tls_secrets *secs);
@@ -71,7 +52,7 @@ int quic_tls_encrypt(unsigned char *buf, size_t len,
                      const unsigned char *key, const unsigned char *iv);
 
 int quic_tls_decrypt2(unsigned char *out,
-                      const unsigned char *in, size_t ilen,
+                      unsigned char *in, size_t ilen,
                       unsigned char *aad, size_t aad_len,
                       EVP_CIPHER_CTX *ctx, const EVP_CIPHER *aead,
                       const unsigned char *key, const unsigned char *iv);
@@ -81,7 +62,7 @@ int quic_tls_decrypt(unsigned char *buf, size_t len,
                      EVP_CIPHER_CTX *tls_ctx, const EVP_CIPHER *aead,
                      const unsigned char *key, const unsigned char *iv);
 
-int quic_tls_generate_retry_integrity_tag(unsigned char *odcid, size_t odcid_len,
+int quic_tls_generate_retry_integrity_tag(unsigned char *odcid, unsigned char odcid_len,
                                           unsigned char *buf, size_t len,
                                           const struct quic_version *qv);
 
@@ -139,8 +120,10 @@ static inline const EVP_CIPHER *tls_aead(const SSL_CIPHER *cipher)
 	case TLS1_3_CK_CHACHA20_POLY1305_SHA256:
 		return EVP_chacha20_poly1305();
 #endif
+#ifndef USE_OPENSSL_WOLFSSL
 	case TLS1_3_CK_AES_128_CCM_SHA256:
 		return EVP_aes_128_ccm();
+#endif
 	default:
 		return NULL;
 	}
@@ -261,7 +244,7 @@ static inline const char *ssl_error_str(int err)
 		return "WANT_CONNECT";
 	case SSL_ERROR_WANT_ACCEPT:
 		return "WANT_ACCEPT";
-#if !defined(LIBRESSL_VERSION_NUMBER)
+#if !defined(LIBRESSL_VERSION_NUMBER) && !defined(USE_OPENSSL_WOLFSSL)
 	case SSL_ERROR_WANT_ASYNC:
 		return "WANT_ASYNC";
 	case SSL_ERROR_WANT_ASYNC_JOB:
@@ -445,6 +428,48 @@ out:
 	return 0;
 }
 
+/* Release the memory allocated for <secs> secrets */
+static inline void quic_tls_secrets_keys_free(struct quic_tls_secrets *secs)
+{
+	if (secs->iv) {
+		memset(secs->iv, 0, secs->ivlen);
+		secs->ivlen = 0;
+	}
+
+	if (secs->key) {
+		memset(secs->key, 0, secs->keylen);
+		secs->keylen = 0;
+	}
+
+	/* HP protection */
+	EVP_CIPHER_CTX_free(secs->hp_ctx);
+	/* AEAD decryption */
+	EVP_CIPHER_CTX_free(secs->ctx);
+	pool_free(pool_head_quic_tls_iv,  secs->iv);
+	pool_free(pool_head_quic_tls_key, secs->key);
+
+	secs->iv = secs->key = NULL;
+}
+
+/* Allocate the memory for the <secs> secrets.
+ * Return 1 if succeeded, 0 if not.
+ */
+static inline int quic_tls_secrets_keys_alloc(struct quic_tls_secrets *secs)
+{
+	if (!(secs->iv = pool_alloc(pool_head_quic_tls_iv)) ||
+	    !(secs->key = pool_alloc(pool_head_quic_tls_key)))
+		goto err;
+
+	secs->ivlen = QUIC_TLS_IV_LEN;
+	secs->keylen = QUIC_TLS_KEY_LEN;
+
+	return 1;
+
+ err:
+	quic_tls_secrets_keys_free(secs);
+	return 0;
+}
+
 /* Initialize a TLS cryptographic context for the Initial encryption level. */
 static inline int quic_initial_tls_ctx_init(struct quic_tls_ctx *ctx)
 {
@@ -474,8 +499,12 @@ static inline int quic_tls_level_pkt_type(enum quic_tls_enc_level level)
 /* Set <*level> and <*next_level> depending on <state> QUIC handshake state. */
 static inline int quic_get_tls_enc_levels(enum quic_tls_enc_level *level,
                                           enum quic_tls_enc_level *next_level,
+                                          struct quic_conn *qc,
                                           enum quic_handshake_state state, int zero_rtt)
 {
+	int ret = 0;
+
+	TRACE_ENTER(QUIC_EV_CONN_ELEVELSEL, qc, &state, level, next_level);
 	switch (state) {
 	case QUIC_HS_ST_SERVER_INITIAL:
 	case QUIC_HS_ST_CLIENT_INITIAL:
@@ -496,10 +525,13 @@ static inline int quic_get_tls_enc_levels(enum quic_tls_enc_level *level,
 		*next_level = QUIC_TLS_ENC_LEVEL_NONE;
 		break;
 	default:
-		return 0;
+		goto leave;
 	}
 
-	return 1;
+	ret = 1;
+ leave:
+	TRACE_LEAVE(QUIC_EV_CONN_ELEVELSEL, qc, NULL, level, next_level);
+	return ret;
 }
 
 /* Flag the keys at <qel> encryption level as discarded.
@@ -571,7 +603,6 @@ static inline int qc_new_isecs(struct quic_conn *qc,
 	if (!quic_tls_enc_aes_ctx_init(&tx_ctx->hp_ctx, tx_ctx->hp, tx_ctx->hp_key))
 		goto err;
 
-	ctx->flags |= QUIC_FL_TLS_SECRETS_SET;
 	TRACE_LEAVE(QUIC_EV_CONN_ISEC, qc, rx_init_sec, tx_init_sec);
 
 	return 1;
@@ -641,6 +672,18 @@ static inline int quic_tls_ku_init(struct quic_conn *qc)
  err:
 	quic_tls_ku_free(qc);
 	return 0;
+}
+
+/* Return 1 if <qel> has RX secrets, 0 if not. */
+static inline int quic_tls_has_rx_sec(const struct quic_enc_level *qel)
+{
+	return !!qel->tls_ctx.rx.key;
+}
+
+/* Return 1 if <qel> has TX secrets, 0 if not. */
+static inline int quic_tls_has_tx_sec(const struct quic_enc_level *qel)
+{
+	return !!qel->tls_ctx.tx.key;
 }
 
 #endif /* USE_QUIC */

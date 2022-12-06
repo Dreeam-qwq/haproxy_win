@@ -7,8 +7,9 @@ in production, unless you're an experienced user and are willing to follow
 weekly updates. If you are not used to build from sources or if you are not
 used to follow updates then it is recommended that instead you use the packages
 provided by your software vendor or Linux distribution. Most of them are taking
-this task seriously and are doing a good job at backporting important fixes. If
-for any reason you'd prefer to use a different version than the one packaged
+this task seriously and are doing a good job at backporting important fixes.
+
+If for any reason you'd prefer to use a different version than the one packaged
 for your system, you want to be certain to have all the fixes or to get some
 commercial support, other choices are available at http://www.haproxy.com/.
 

@@ -24,6 +24,7 @@
  * OTHER DEALINGS IN THE SOFTWARE.
  */
 
+#define _GNU_SOURCE     // for POLLRDHUP
 #include <sys/resource.h>
 #include <sys/select.h>
 #include <sys/types.h>
@@ -32,6 +33,11 @@
 #include <sys/time.h>
 #include <sys/ioctl.h>
 #include <sys/wait.h>
+
+#ifdef __linux__
+#include <sys/epoll.h>
+#endif
+
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -49,6 +55,11 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+
+/* for OSes which don't have it */
+#ifndef POLLRDHUP
+#define POLLRDHUP 0
+#endif
 
 #ifndef MSG_MORE
 #define MSG_MORE 0
@@ -71,6 +82,7 @@ volatile int nbproc = 0;
 static struct timeval start_time;
 static int showtime;
 static int verbose;
+static int use_epoll;
 static int pid;
 static int sock_type = SOCK_STREAM;
 static int sock_proto = IPPROTO_TCP;
@@ -99,6 +111,7 @@ __attribute__((noreturn)) void usage(int code, const char *arg0)
 	    "  -v           : verbose\n"
 	    "  -u           : use UDP instead of TCP (limited)\n"
 	    "  -t|-tt|-ttt  : show time (msec / relative / absolute)\n"
+	    "  -e           : use epoll instead of poll on Linux\n"
 	    "actions :\n"
 	    "  A[<count>]   : Accepts <count> incoming sockets and closes count-1\n"
 	    "                 Note: fd=accept(fd)\n"
@@ -299,18 +312,43 @@ int addr_to_ss(const char *str, struct sockaddr_storage *ss, struct err_msg *err
 	return 0;
 }
 
-/* waits up to one second on fd <fd> for events <events> (POLLIN|POLLOUT).
+/* waits up to <ms> milliseconds on fd <fd> for events <events> (POLLIN|POLLRDHUP|POLLOUT).
  * returns poll's status.
  */
-int wait_on_fd(int fd, int events)
+int wait_on_fd(int fd, int events, int ms)
 {
 	struct pollfd pollfd;
 	int ret;
 
+#ifdef __linux__
+	while (use_epoll) {
+		struct epoll_event evt;
+		static int epoll_fd = -1;
+
+		if (epoll_fd == -1)
+			epoll_fd = epoll_create(1024);
+		if (epoll_fd == -1)
+			break;
+		evt.events = ((events & POLLIN) ? EPOLLIN : 0)      |
+		             ((events & POLLOUT) ? EPOLLOUT : 0)    |
+		             ((events & POLLRDHUP) ? EPOLLRDHUP : 0);
+		evt.data.fd = fd;
+		epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &evt);
+
+		do {
+			ret = epoll_wait(epoll_fd, &evt, 1, ms);
+		} while (ret == -1 && errno == EINTR);
+
+		evt.data.fd = fd;
+		epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, &evt);
+		return ret;
+	}
+#endif
+
 	do {
 		pollfd.fd = fd;
 		pollfd.events = events;
-		ret = poll(&pollfd, 1, 1000);
+		ret = poll(&pollfd, 1, ms);
 	} while (ret == -1 && errno == EINTR);
 
 	return ret;
@@ -536,7 +574,7 @@ int tcp_recv(int sock, const char *arg)
 				dolog("recv %d\n", ret);
 				return -1;
 			}
-			while (!wait_on_fd(sock, POLLIN));
+			while (!wait_on_fd(sock, POLLIN | POLLRDHUP, 1000));
 			continue;
 		}
 		dolog("recv %d\n", ret);
@@ -589,7 +627,7 @@ int tcp_send(int sock, const char *arg)
 				dolog("send %d\n", ret);
 				return -1;
 			}
-			while (!wait_on_fd(sock, POLLOUT));
+			while (!wait_on_fd(sock, POLLOUT, 1000));
 			continue;
 		}
 		dolog("send %d\n", ret);
@@ -634,7 +672,7 @@ int tcp_echo(int sock, const char *arg)
 					dolog("recv %d\n", rcvd);
 					return -1;
 				}
-				while (!wait_on_fd(sock, POLLIN));
+				while (!wait_on_fd(sock, POLLIN | POLLRDHUP, 1000));
 				continue;
 			}
 			dolog("recv %d\n", rcvd);
@@ -651,7 +689,7 @@ int tcp_echo(int sock, const char *arg)
 					dolog("send %d\n", ret);
 					return -1;
 				}
-				while (!wait_on_fd(sock, POLLOUT));
+				while (!wait_on_fd(sock, POLLOUT, 1000));
 				continue;
 			}
 			dolog("send %d\n", ret);
@@ -676,7 +714,6 @@ int tcp_echo(int sock, const char *arg)
  */
 int tcp_wait(int sock, const char *arg)
 {
-	struct pollfd pollfd;
 	int delay = -1; // wait forever
 	int ret;
 
@@ -689,14 +726,9 @@ int tcp_wait(int sock, const char *arg)
 	}
 
 	/* FIXME: this doesn't take into account delivered signals */
-	do {
-		pollfd.fd = sock;
-		pollfd.events = POLLIN | POLLOUT;
-		ret = poll(&pollfd, 1, delay);
-	} while (ret == -1 && errno == EINTR);
-
-	if (ret > 0 && pollfd.revents & POLLERR)
-		return -1;
+	ret = wait_on_fd(sock, POLLIN | POLLRDHUP | POLLOUT, delay);
+	if (ret < 0)
+		return ret;
 
 	return 0;
 }
@@ -704,17 +736,11 @@ int tcp_wait(int sock, const char *arg)
 /* waits for the input data to be present */
 int tcp_wait_in(int sock, const char *arg)
 {
-	struct pollfd pollfd;
 	int ret;
 
-	do {
-		pollfd.fd = sock;
-		pollfd.events = POLLIN;
-		ret = poll(&pollfd, 1, 1000);
-	} while (ret == -1 && errno == EINTR);
-
-	if (ret > 0 && pollfd.revents & POLLERR)
-		return -1;
+	ret = wait_on_fd(sock, POLLIN | POLLRDHUP, 1000);
+	if (ret < 0)
+		return ret;
 
 	return 0;
 }
@@ -722,17 +748,11 @@ int tcp_wait_in(int sock, const char *arg)
 /* waits for the output queue to be empty */
 int tcp_wait_out(int sock, const char *arg)
 {
-	struct pollfd pollfd;
 	int ret;
 
-	do {
-		pollfd.fd = sock;
-		pollfd.events = POLLOUT;
-		ret = poll(&pollfd, 1, 1000);
-	} while (ret == -1 && errno == EINTR);
-
-	if (ret > 0 && pollfd.revents & POLLERR)
-		return -1;
+	ret = wait_on_fd(sock, POLLOUT, 1000);
+	if (ret < 0)
+		return ret;
 
 	/* Now wait for data to leave the socket */
 	do {
@@ -807,6 +827,8 @@ int main(int argc, char **argv)
 			showtime += 2;
 		else if (strcmp(argv[0], "-ttt") == 0)
 			showtime += 3;
+		else if (strcmp(argv[0], "-e") == 0)
+			use_epoll = 1;
 		else if (strcmp(argv[0], "-v") == 0)
 			verbose ++;
 		else if (strcmp(argv[0], "-u") == 0) {

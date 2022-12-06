@@ -1,10 +1,13 @@
+#include <arpa/inet.h>
+#include <string.h>
+
 #include <haproxy/global.h>
 #include <haproxy/ncbuf-t.h>
 #include <haproxy/net_helper.h>
+#include <haproxy/quic_conn-t.h>
 #include <haproxy/quic_enc.h>
 #include <haproxy/quic_tp.h>
 #include <haproxy/trace.h>
-#include <haproxy/xprt_quic-t.h>
 
 #define QUIC_MAX_UDP_PAYLOAD_SIZE     2048
 
@@ -170,15 +173,15 @@ static int quic_transport_param_dec_version_info(struct tp_version_information *
 	const uint32_t *ver;
 
 	/* <tp_len> must be a multiple of sizeof(uint32_t) */
-	if (tp_len < sizeof tp->choosen || (tp_len & 0x3))
+	if (tp_len < sizeof tp->chosen || (tp_len & 0x3))
 		return 0;
 
-	tp->choosen = ntohl(*(uint32_t *)*buf);
+	tp->chosen = ntohl(*(uint32_t *)*buf);
 	/* Must not be null */
-	if (!tp->choosen)
+	if (!tp->chosen)
 		return 0;
 
-	*buf += sizeof tp->choosen;
+	*buf += sizeof tp->chosen;
 	tp->others = (const uint32_t *)*buf;
 
 	/* Others versions must not be null */
@@ -415,20 +418,20 @@ static int quic_transport_param_enc_pref_addr(unsigned char **buf,
 	return 1;
 }
 
-/* Encode version information transport parameters with <choosen_version> as choosen
+/* Encode version information transport parameters with <chosen_version> as chosen
  * version.
  * Return 1 if succeeded, 0 if not.
  */
 static int quic_transport_param_enc_version_info(unsigned char **buf,
                                                  const unsigned char *end,
-                                                 const struct quic_version *choosen_version,
+                                                 const struct quic_version *chosen_version,
                                                  int server)
 {
 	int i;
 	uint64_t tp_len;
 	uint32_t ver;
 
-	tp_len = sizeof choosen_version->num + quic_versions_nb * sizeof(uint32_t);
+	tp_len = sizeof chosen_version->num + quic_versions_nb * sizeof(uint32_t);
 	if (!quic_transport_param_encode_type_len(buf, end,
 	                                          QUIC_TP_DRAFT_VERSION_INFORMATION,
 	                                          tp_len))
@@ -437,11 +440,11 @@ static int quic_transport_param_enc_version_info(unsigned char **buf,
 	if (end - *buf < tp_len)
 		return 0;
 
-	/* First: choosen version */
-	ver = htonl(choosen_version->num);
+	/* First: chosen version */
+	ver = htonl(chosen_version->num);
 	memcpy(*buf, &ver, sizeof ver);
 	*buf += sizeof ver;
-	/* For servers: all supported version, choosen included */
+	/* For servers: all supported version, chosen included */
 	for (i = 0; i < quic_versions_nb; i++) {
 		ver = htonl(quic_versions[i].num);
 		memcpy(*buf, &ver, sizeof ver);
@@ -459,7 +462,7 @@ static int quic_transport_param_enc_version_info(unsigned char **buf,
 int quic_transport_params_encode(unsigned char *buf,
                                  const unsigned char *end,
                                  struct quic_transport_params *p,
-                                 const struct quic_version *choosen_version,
+                                 const struct quic_version *chosen_version,
                                  int server)
 {
 	unsigned char *head;
@@ -565,7 +568,7 @@ int quic_transport_params_encode(unsigned char *buf,
 	                                  p->active_connection_id_limit))
 	    return 0;
 
-	if (!quic_transport_param_enc_version_info(&pos, end, choosen_version, server))
+	if (!quic_transport_param_enc_version_info(&pos, end, chosen_version, server))
 		return 0;
 
 	return pos - head;
@@ -581,12 +584,11 @@ static int quic_transport_params_decode(struct quic_transport_params *p, int ser
                                         const unsigned char *end)
 {
 	const unsigned char *pos;
+	uint64_t type, len = 0;
 
 	pos = buf;
 
 	while (pos != end) {
-		uint64_t type, len;
-
 		if (!quic_transport_param_decode_type_len(&type, &len, &pos, end))
 			return 0;
 
@@ -633,8 +635,8 @@ int quic_transport_params_store(struct quic_conn *qc, int server,
 
 /* QUIC server (or haproxy listener) only function.
  * Initialize the local transport parameters <rx_params> from <listener_params>
- * coming from configuration and Initial packet information (destintation
- * connection ID, source connection ID, original destination connection ID from
+ * coming from configuration and Initial packet information (destination
+ * connection ID, source connection ID, original destination connection ID) from
  * client token.
  * Returns 1 if succeeded, 0 if not.
  */
@@ -654,7 +656,7 @@ int qc_lstnr_params_init(struct quic_conn *qc,
 	memcpy(rx_params->stateless_reset_token, stateless_reset_token,
 	       sizeof rx_params->stateless_reset_token);
 	/* Copy original_destination_connection_id transport parameter. */
-	if (token_odcid) {
+	if (token_odcid->len) {
 		memcpy(odcid_param->data, token_odcid->data, token_odcid->len);
 		odcid_param->len = token_odcid->len;
 		/* Copy retry_source_connection_id transport parameter. */

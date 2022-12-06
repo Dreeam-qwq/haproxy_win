@@ -1,6 +1,424 @@
 ChangeLog :
 ===========
 
+2022/12/01 : 2.8-dev0
+    - MINOR: version: mention that it's development again
+
+2022/12/01 : 2.7.0
+    - MINOR: ssl: forgotten newline in error messages on ca-file
+    - BUG/MINOR: ssl: shut the ca-file errors emitted during httpclient init
+    - DOC: config: provide some configuration hints for "http-reuse"
+    - DOC: config: refer to section about quoting in the "add_item" converter
+    - DOC: halog: explain how to use -ac and -ad in the help message
+    - DOC: config: clarify the fact that SNI should not be used in HTTP scenarios
+    - DOC: config: mention that a single monitor-uri rule is supported
+    - DOC: config: explain how default matching method for ACL works
+    - DOC: config: clarify the fact that "retries" is not just for connections
+    - BUILD: halog: fix missing double-quote at end of help line
+    - DOC: config: clarify the -m dir and -m dom pattern matching methods
+    - MINOR: activity: report uptime in "show activity"
+    - REORG: activity/cli: move the "show activity" handler to activity.c
+    - DEV: poll: add support for epoll
+    - DEV: tcploop: centralize the polling code into wait_for_fd()
+    - DEV: tcploop: add support for POLLRDHUP when supported
+    - DEV: tcploop: do not report an error on POLLERR
+    - DEV: tcploop: add optional support for epoll
+    - SCRIPTS: announce-release: add a link to the data plane API
+    - CLEANUP: stick-table: fill alignment holes in the stktable struct
+    - MINOR: stick-table: store a per-table hash seed and use it
+    - MINOR: stick-table: show the shard number in each entry's "show table" output
+    - CLEANUP: ncbuf: remove ncb_blk args by value
+    - CLEANUP: ncbuf: inline small functions
+    - CLEANUP: ncbuf: use standard BUG_ON with DEBUG_STRICT
+    - BUG/MINOR: quic: Endless loop during retransmissions
+    - MINOR: mux-h2: add the expire task and its expiration date in "show fd"
+    - BUG/MINOR: peers: always initialize the stksess shard value
+    - REGTESTS: fix peers-related regtests regarding "show table"
+    - BUG/MEDIUM: mux-h1: Close client H1C on EOS when there is no output data
+    - MINOR: stick-table: change the API of the function used to calculate the shard
+    - CLEANUP: peers: factor out the key len calculation in received updates
+    - BUG/MINOR: peers: always update the stksess shard number on incoming updates
+    - CLEANUP: assorted typo fixes in the code and comments
+    - MINOR: mux-h1: add the expire task and its expiration date in "show fd"
+    - MINOR: debug: improve error handling on the memstats command parser
+    - BUILD: quic: allow build with USE_QUIC and USE_OPENSSL_WOLFSSL
+    - CLEANUP: anon: clarify the help message on "debug dev hash"
+    - MINOR: debug: relax access restrictions on "debug dev hash" and "memstats"
+    - SCRIPTS: run-regtests: add a version check
+    - MINOR: version: mention that it's stable now
+
+2022/11/24 : 2.7-dev10
+    - MEDIUM: tcp-act: add parameter rst-ttl to silent-drop
+    - BUG/MAJOR: quic: Crash upon retransmission of dgrams with several packets
+    - MINOR: cli: print parsed command when not found
+    - BUG/MAJOR: quic: Crash after discarding packet number spaces
+    - CLEANUP: quic: replace "choosen" with "chosen" all over the code
+    - MINOR: cli/pools: store "show pools" results into a temporary array
+    - MINOR: cli/pools: add sorting capabilities to "show pools"
+    - MINOR: cli/pools: add pool name filtering capability to "show pools"
+    - DOC: configuration: fix quic prefix typo
+    - MINOR: quic: report error if force-retry without cluster-secret
+    - MINOR: global: generate random cluster.secret if not defined
+    - BUG/MINOR: resolvers: do not run the timeout task when there's no resolution
+    - BUG/MINOR: server/idle: at least use atomic stores when updating max_used_conns
+    - MINOR: server/idle: make the next_takeover index per-tgroup
+    - BUILD: listener: fix build warning on global_listener_rwlock without threads
+    - BUG/MAJOR: sched: protect task during removal from wait queue
+    - BUILD: sched: fix build with DEBUG_THREAD with the previous commit
+    - DOC: quic: add note on performance issue with listener contention
+    - BUG/MINOR: cfgparse-listen: fix ebpt_next_dup pointer dereference on proxy "from" inheritance
+    - BUG/MINOR: log: fix parse_log_message rfc5424 size check
+    - CLEANUP: arg: remove extra check in make_arg_list arg escaping
+    - CLEANUP: tools: extra check in utoa_pad
+    - MINOR: h1: Consider empty port as invalid in authority for CONNECT
+    - MINOR: http: Considere empty ports as valid default ports
+    - BUG/MINOR: http-htx: Normalized absolute URIs with an empty port
+    - BUG/MINOR: h1: Replace authority validation to conform RFC3986
+    - REG-TESTS: http: Add more tests about authority/host matching
+    - BUG/MINOR: http-htx: Don't consider an URI as normalized after a set-uri action
+    - BUG/MEDIUM: mux-h1: Don't release H1C on timeout if there is a SC attached
+    - BUG/MEDIUM: mux-h1: Subscribe for reads on error on sending path
+    - BUILD: http-htx: Silent build error about a possible NULL start-line
+    - DOC: configuration.txt: add default_value for table_idle signature
+    - BUILD: ssl-sock: Silent error about NULL deref in ssl_sock_bind_verifycbk()
+    - BUG/MEDIUM: mux-h1: Remove H1C_F_WAIT_NEXT_REQ flag on a next request
+    - BUG/MINOR: mux-h1: Fix handling of 408-Request-Time-Out
+    - MINOR: mux-h1: Remove H1C_F_WAIT_NEXT_REQ in functions handling errors
+    - MINOR: mux-h1: Avoid useless call to h1_send() if no error is sent
+    - DOC: configuration.txt: fix typo in table_idle signature
+    - BUILD: stick-tables: fix build breakage in xxhash on older compilers
+    - BUILD: compiler: include compiler's definitions before ours
+    - BUILD: quic: global.h is needed in cfgparse-quic
+    - CLEANUP: tools: do not needlessly include xxhash nor cli from tools.h
+    - BUILD: flags: really restrict the cases where flags are exposed
+    - BUILD: makefile: minor reordering of objects by build time
+    - BUILD: quic: silence two invalid build warnings at -O1 with gcc-6.5
+    - BUILD: quic: use openssl-compat.h instead of openssl/ssl.h
+    - MEDIUM: ssl: add minimal WolfSSL support with OpenSSL compatibility mode
+    - MINOR: sample: make the rand() sample fetch function use the statistical_prng
+    - MINOR: auth: silence null dereference warning in check_user()
+    - CLEANUP: peers: fix format string for status messages (int signedness)
+    - CLEANUP: qpack: fix format string in debugging code (int signedness)
+    - CLEANUP: qpack: properly use the QPACK macros not HPACK ones in debug code
+    - BUG/MEDIUM: quic: fix datagram dropping on queueing failed
+
+2022/11/18 : 2.7-dev9
+    - BUILD: quic: QUIC mux build fix for 32-bit build
+    - BUILD: scripts: disable tests build on QuicTLS build
+    - BUG/MEDIUM: httpclient: segfault when the httpclient parser fails
+    - BUILD: ssl_sock: fix null dereference for QUIC build
+    - BUILD: quic: Fix build for m68k cross-compilation
+    - BUG/MINOR: quic: fix buffer overflow on retry token generation
+    - MINOR: quic: add version field on quic_rx_packet
+    - MINOR: quic: extend pn_offset field from quic_rx_packet
+    - MINOR: quic: define first packet flag
+    - MINOR: quic: extract connection retrieval
+    - MINOR: quic: split and rename qc_lstnr_pkt_rcv()
+    - MINOR: quic: refactor packet drop on reception
+    - MINOR: quic: extend Retry token check function
+    - BUG/MINOR: log: Preserve message facility when the log target is a ring buffer
+    - BUG/MINOR: ring: Properly parse connect timeout
+    - BUG/MEDIUM: httpclient/lua: crash when the lua task timeout before the httpclient
+    - BUG/MEDIUM: httpclient: check if the httpclient was released in the IO handler
+    - REGTESTS: httpclient/lua: test the lua task timeout with the httpclient
+    - CI: github: dump the backtrace of coredumps in the alpine container
+    - BUILD: Makefile: add "USE_SHM_OPEN" on the linux-musl target
+    - DOC: lua: add a note about compression w/ httpclient
+    - CLEANUP: mworker/cli: rename the status function to loadstatus
+    - MINOR: mworker/cli: does no try to dump the startup-logs w/o USE_SHM_OPEN
+    - MINOR: list: fixing typo in MT_LIST_LOCK_ELT
+    - DOC/MINOR: list: fixing MT_LIST_LOCK_ELT macro documentation
+    - MINOR: list: adding MT_LIST_APPEND_LOCKED macro
+    - BUG/MINOR: mux-quic: complete flow-control for uni streams
+    - BUG/MEDIUM: compression: handle rewrite errors when updating response headers
+    - MINOR: quic: do not crash on unhandled sendto error
+    - MINOR: quic: display unknown error sendto counter on stat page
+    - MINOR: peers: Support for peer shards
+    - MINOR: peers: handle multiple resync requests using shards
+    - BUG/MINOR: sink: Only use backend capability for the sink proxies
+    - BUG/MINOR: sink: Set default connect/server timeout for implicit ring buffers
+    - MINOR: ssl: add the SSL error string when failing to load a certificate
+    - MINOR: ssl: add the SSL error string before the chain
+    - MEDIUM: ssl: be stricter about chain error
+    - BUG/MAJOR: stick-table: don't process store-response rules for applets
+    - MINOR: quic: remove unnecessary quic_session_accept()
+    - BUG/MINOR: quic: fix subscribe operation
+    - BUG/MINOR: log: fixing bug in tcp syslog_io_handler Octet-Counting
+    - MINOR: ssl: dump the SSL string error when SSL_CTX_use_PrivateKey() failed.
+    - MINOR: quic: add counter for interrupted reception
+    - BUG/MINOR: quic: fix race condition on datagram purging
+    - CI: add monthly gcc cross compile jobs
+    - CLEANUP: assorted typo fixes in the code and comments
+    - CLEANUP: ssl: remove dead code in ssl_sock_load_pem_into_ckch()
+    - BUG/MINOR: httpclient: fixed memory allocation for the SSL ca_file
+    - BUG/MINOR: ssl: Memory leak of DH BIGNUM fields
+    - BUG/MINOR: ssl: Memory leak of AUTHORITY_KEYID struct when loading issuer
+    - BUG/MINOR: ssl: ocsp structure not freed properly in case of error
+    - CI: switch to the "latest" LibreSSL
+    - CI: enable QUIC for LibreSSL builds
+    - BUG/MEDIUM: ssl: Verify error codes can exceed 63
+    - MEDIUM: ssl: {ca,crt}-ignore-err can now use error constant name
+    - MINOR: ssl: x509_v_err_str converter transforms an integer to a X509_V_ERR name
+    - CLEANUP: cli: rename dynamic error printing state
+    - MINOR: cli: define usermsgs print context
+    - MINOR: server: clear prefix on stderr logs after add server
+    - BUG/MINOR: ssl: bind_conf is uncorrectly accessed when using QUIC
+    - BUILD: ssl_utils: fix build on gcc versions before 8
+    - BUILD: debug: remove unnecessary quotes in HA_WEAK() calls
+    - CI: emit the compiler's version in the build reports
+    - IMPORT: xxhash: update xxHash to version 0.8.1
+    - IMPORT: slz: declare len to fix debug build when optimal match is enabled
+    - IMPORT: slz: mention the potential header in slz_finish()
+    - IMPORT: slz: define and use a __fallthrough statement for switch/case
+    - BUILD: compiler: add a macro to detect if another one is set and equals 1
+    - BUILD: compiler: add a default definition for __has_attribute()
+    - BUILD: compiler: define a __fallthrough statement for switch/case
+    - BUILD: sample: use __fallthrough in smp_is_rw() and smp_dup()
+    - BUILD: quic: use __fallthrough in quic_connect_server()
+    - BUILD: ssl/crt-list: use __fallthrough in cli_io_handler_add_crtlist()
+    - BUILD: ssl: use __fallthrough in cli_io_handler_commit_{cert,cafile_crlfile}()
+    - BUILD: ssl: use __fallthrough in cli_io_handler_tlskeys_files()
+    - BUILD: hlua: use __fallthrough in hlua_post_init_state()
+    - BUILD: stream: use __fallthrough in stats_dump_full_strm_to_buffer()
+    - BUILD: tcpcheck: use __fallthrough in check_proxy_tcpcheck()
+    - BUILD: stats: use __fallthrough in stats_dump_proxy_to_buffer()
+    - BUILD: peers: use __fallthrough in peer_io_handler()
+    - BUILD: hash: use __fallthrough in hash_djb2()
+    - BUILD: tools: use __fallthrough in url_decode()
+    - BUILD: args: use __fallthrough in make_arg_list()
+    - BUILD: acl: use __fallthrough in parse_acl_expr()
+    - BUILD: spoe: use __fallthrough in spoe_handle_appctx()
+    - BUILD: logs: use __fallthrough in build_log_header()
+    - BUILD: check: use __fallthrough in __health_adjust()
+    - BUILD: http_act: use __fallthrough in parse_http_del_header()
+    - BUILD: h1_htx: use __fallthrough in h1_parse_chunk()
+    - BUILD: vars: use __fallthrough in var_accounting_{diff,add}()
+    - BUILD: map: use __fallthrough in cli_io_handler_*()
+    - BUILD: compression: use __fallthrough in comp_http_payload()
+    - BUILD: stconn: use __fallthrough in various shutw() functions
+    - BUILD: prometheus: use __fallthrough in promex_dump_metrics() and IO handler()
+    - CLEANUP: ssl: remove printf in bind_parse_ignore_err
+    - BUG/MINOR: ssl:  crt-ignore-err memory leak with 'all' parameter
+    - BUG/MINOR: ssl: Fix potential overflow
+    - CLEANUP: stick-table: remove the unused table->exp_next
+    - OPTIM: stick-table: avoid atomic ops in stktable_requeue_exp() when possible
+    - BUG/MEDIUM: stick-table: fix a race condition when updating the expiration task
+    - MEDIUM: http-ana: remove set-cookie2 support
+    - BUG/MEDIUM: wdt/clock: properly handle early task hangs
+    - MINOR: deinit: add a "quick-exit" option to bypass the deinit step
+    - OPTIM: ebtree: make ebmb_insert_prefix() keep a copy the new node's pfx
+    - OPTIM: ebtree: make ebmb_insert_prefix() keep a copy the new node's key
+    - MINOR: ssl: ssl_sock_load_cert_chain() display error strings
+    - MINOR: ssl: reintroduce ERR_GET_LIB(ret) == ERR_LIB_PEM in ssl_sock_load_pem_into_ckch()
+    - BUG/MINOR: http-htx: Fix error handling during parsing http replies
+    - BUG/MINOR: resolvers: Don't wait periodic resolution on healthcheck failure
+    - BUG/MINOR: resolvers: Set port before IP address when processing SRV records
+    - BUG/MINOR: mux-fcgi: Be sure to send empty STDING record in case of zero-copy
+    - BUG/MEDIUM: mux-fcgi: Avoid value length overflow when it doesn't fit at once
+    - BUG/MINOR: ssl: SSL_load_error_strings might not be defined
+    - MINOR: pool/debug: create a new pool_alloc_flag() macro
+    - MINOR: dynbuf: switch allocation and release to macros to better track users
+    - BUG/MINOR: mux-h1: Do not send a last null chunk on body-less answers
+    - REG-TESTS: cache: Remove T-E header for 304-Not-Modified responses
+    - DOC: config: fix alphabetical ordering of global section
+    - MINOR: trace: split the CLI "trace" parser in CLI vs statement
+    - MEDIUM: trace: create a new "trace" statement in the "global" section
+    - BUG/MEDIUM: ring: fix creation of server in uninitialized ring
+    - BUILD: quic: fix dubious 0-byte overflow on qc_release_lost_pkts
+    - BUILD: makefile: mark poll and tcploop targets as phony
+    - BUILD: makefile: properly pass CC to sub-projects
+    - BUILD: makefile: move default verbosity settings to include/make/verbose.mk
+    - BUILD: makefile: use $(cmd_MAKE) in quiet mode
+    - BUILD: makefile: move the compiler option detection stuff to compiler.mk
+    - DEV: poll: make the connect() step an action as well
+    - DEV: poll: strip the "do_" prefix from reported function names
+    - DEV: poll: indicate the FD's side in front of its value
+    - BUG/MINOR: pool/cli: use ullong to report total pool usage in bytes
+    - MINOR: mux-h1: Remove usless code inside shutr callback
+    - CLEANUP: mux-h1; Rename H1S_F_ERROR flag into H1S_F_ERROR_MASK
+    - REORG: mux-h1: Reorg the H1C structure
+    - CLEANUP: mux-h1: Rename H1C_F_ST_ERROR and H1C_F_ST_SILENT_SHUT flags
+    - MINOR: mux-h1: Add a dedicated enum to deal with H1 connection state
+    - MEDIUM: mux-h1: Handle H1C states via its state field instead of H1C_F_ST_*
+    - MINOR: mux-h1: Don't handle subscribe for reads in h1_process_demux()
+    - CLEANUP: mux-h1: Rename H1C_F_ERR_PENDING into H1C_F_ABRT_PENDING
+    - MINOR: mux-h1: Add flag on H1 stream to deal with internal errors
+    - MEDIUM: mux-h1: Rely on the H1C to deal with shutdown for reads
+    - CLEANUP: mux-h1: Reorder H1 connection flags to avoid holes
+    - MEDIUM: mux-h1: Don't report a final error whe a message is aborted
+    - MEDIUM: mux-pt: Don't always set a final error on SE on the sending path
+    - MEDIUM: mux-h2: Introduce flags to deal with connection read/write errors
+    - CLEANUP: mux-h2: Remove unused fields in h2c structures
+    - MEDIUM: mux-fcgi: Introduce flags to deal with connection read/write errors
+    - MINOR: sconn: Set SE_FL_ERROR only when there is no more data to read
+    - MINOR: mux-h1: Rely on a H1S flag to know a WS key was found or not
+    - DOC: lua-api: Remove warning about the lua filters
+    - BUG/MEDIUM: listener: Fix race condition when updating the global mngmt task
+    - CLEANUP: listener: Remove useless task_queue from manage_global_listener_queue
+    - BUG/MINOR: mux-h1: Fix error handling when H1S allocation failed on client side
+    - DOC: internal: commit notes about polling states and flags
+    - DOC: internal: commit notes about polling states and flags on connect()
+    - CLEANUP: mux-h1: Don't test h1c in h1_shutw_conn()
+    - BUG/MINOR: http_ana/txn: don't re-initialize txn and req var lists
+    - BUG/MEDIUM: raw-sock: Don't report connection error if something was received
+    - BUG/MINOR: ssl: don't initialize the keylog callback when not required
+    - BUILD: Makefile: enable USE_SHM_OPEN by default on freebsd
+    - BUG/MEDIUM: peers: messages about unkown tables not correctly ignored
+    - MINOR: cfgparse: Always check the section position
+    - MEDIUM: thread: Restric nbthread/thread-group(s) to very first global sections
+    - BUILD: peers: Remove unused variables
+    - MINOR: ncbuf: complete doc for ncb_advance()
+    - BUG/MEDIUM: quic: fix unsuccessful handshakes on ncb_advance error
+    - BUG/MEDIUM: quic: fix memleak for out-of-order crypto data
+    - MINOR: quic: complete traces/debug for handshake
+
+2022/10/14 : 2.7-dev8
+    - BUG/MINOR: checks: update pgsql regex on auth packet
+    - DOC: config: Fix pgsql-check documentation to make user param mandatory
+    - CLEANUP: mux-quic: remove usage of non-standard ull type
+    - CLEANUP: quic: remove global var definition in quic_tls header
+    - BUG/MINOR: quic: adjust quic_tls prototypes
+    - CLEANUP: quic: fix headers
+    - CLEANUP: quic: remove unused function prototype
+    - CLEANUP: quic: remove duplicated varint code from xprt_quic.h
+    - CLEANUP: quic: create a dedicated quic_conn module
+    - BUG/MINOR: mux-quic: ignore STOP_SENDING for locally closed stream
+    - BUG/MEDIUM: lua: Don't crash in hlua_lua2arg_check on failure
+    - BUG/MEDIUM: lua: handle stick table implicit arguments right.
+    - BUILD: h1: silence an initiialized warning with gcc-4.7 and -Os
+    - MINOR: fd: add a new function to only raise RLIMIT_NOFILE
+    - MINOR: init: do not try to shrink existing RLIMIT_NOFIlE
+    - BUG/MINOR: http-fetch: Update method after a prefetch in smp_fetch_meth()
+    - BUILD: http_fetch: silence an uninitiialized warning with gcc-4/5/6 at -Os
+    - BUG/MINOR: hlua: hlua_channel_insert_data() behavior conflicts with documentation
+    - MINOR: quic: limit usage of ssl_sock_ctx in favor of quic_conn
+    - MINOR: mux-quic: check quic-conn return code on Tx
+    - CLEANUP: quic: fix indentation
+    - MEDIUM: quic: retrieve frontend destination address
+    - CLEANUP: Reapply ist.cocci (2)
+    - CLEANUP: Reapply strcmp.cocci
+    - CLEANUP: quic/receiver: remove the now unused tx_qring list
+    - BUG/MINOR: quic: set IP_PKTINFO socket option for QUIC receivers only
+    - MINOR: hlua: some luaL_checktype() calls were not guarded with MAY_LJMP
+    - DOC: configuration: missing 'if' in tcp-request content example
+    - MINOR: hlua: removing ambiguous lua_pushvalue with 0 index
+    - BUG/MAJOR: stick-tables: do not try to index a server name for applets
+    - MINOR: plock: support disabling exponential back-off
+    - MINOR: freq_ctr: use the thread's local time whenever possible
+    - MEDIUM: stick-table: switch the table lock to rwlock
+    - MINOR: stick-table: do not take an exclusive lock when downing ref_cnt
+    - MINOR: stick-table: move the write lock inside stktable_touch_with_exp()
+    - MEDIUM: stick-table: only take the lock when needed in stktable_touch_with_exp()
+    - MEDIUM: stick-table: make stksess_kill_if_expired() avoid the exclusive lock
+    - MEDIUM: stick-table: return inserted entry in __stktable_store()
+    - MEDIUM: stick-table: free newly allocated stkess if it couldn't be inserted
+    - MEDIUM: stick-table: switch to rdlock in stktable_lookup() and lookup_key()
+    - MEDIUM: stick-table: make stktable_get_entry() look up under a read lock
+    - MEDIUM: stick-table: do not take a lock to update t->current anymore.
+    - MEDIUM: stick-table: make stktable_set_entry() look up under a read lock
+    - MEDIUM: stick-table: requeue the expiration task out of the exclusive lock
+    - MINOR: stick-table: split stktable_store() between key and requeue
+    - MEDIUM: stick-table: always use atomic ops to requeue the table's task
+    - MEDIUM: stick-table: requeue the wakeup task out of the write lock
+    - BUG/MINOR: stick-table: fix build with DEBUG_THREAD
+    - REORG: mux-fcgi: Extract flags and enums into mux_fcgi-t.h
+    - MINOR: flags/mux-fcgi: Decode FCGI connection and stream flags
+    - BUG/MEDIUM: mux-h1: Add connection error handling when reading/sending on a pipe
+    - BUG/MEDIUM: mux-h1: Handle abort with an incomplete message during parsing
+    - BUG/MINOR: server: make sure "show servers state" hides private bits
+    - MINOR: checks: use the lighter PRNG for spread checks
+    - MEDIUM: checks: spread the checks load over random threads
+    - CI: SSL: use proper version generating when "latest" semantic is used
+    - CI: SSL: temporarily stick to LibreSSL=3.5.3
+    - MINOR: quic: New quic_cstream object implementation
+    - MINOR: quic: Extract CRYPTO frame parsing from qc_parse_pkt_frms()
+    - MINOR: quic: Use a non-contiguous buffer for RX CRYPTO data
+    - BUG/MINOR: quic: Stalled 0RTT connections with big ClientHello TLS message
+    - MINOR: quic: Split the secrets key allocation in two parts
+    - CLEANUP: quic: remove unused rxbufs member in receiver
+    - CLEANUP: quic: improve naming for rxbuf/datagrams handling
+    - MINOR: quic: implement datagram cleanup for quic_receiver_buf
+    - MINOR: ring: ring_cast_from_area() cast from an allocated area
+    - MINOR: buffers: split b_force_xfer() into b_cpy() and b_force_xfer()
+    - MINOR: logs: startup-logs can use a shm for logging the reload
+    - MINOR: mworker/cli: reload command displays the startup-logs
+    - MEDIUM: quic: respect the threads assigned to a bind line
+    - DOC: management: update the "reload" command of the master CLI
+    - BUILD: ssl_sock: bind_conf uninitialized in ssl_sock_bind_verifycbk()
+    - BUG/MEDIUM: httpclient: Don't set EOM flag on an empty HTX message
+    - MINOR: httpclient/lua: Don't set req_payload callback if body is empty
+    - DOC/CLEANUP: lua-api: some minor corrections
+    - DOC: lua-api: updating toolbox link
+    - DOC/CLEANUP: lua-api: removing duplicate core.proxies attribute
+    - DOC: management: add forgotten "show startup-logs"
+    - DOC: management: "show startup-logs" for master CLI
+    - CI: Replace the deprecated `::set-output` command by writing to $GITHUB_OUTPUT in matrix.py
+    - CI: Replace the deprecated `::set-output` command by writing to $GITHUB_OUTPUT in workflow definition
+
+2022/10/03 : 2.7-dev7
+    - BUG/MEDIUM: mux-quic: fix nb_hreq decrement
+    - CLEANUP: httpclient: deleted unused variables
+    - MINOR: httpclient: enabled the use of SNI presets
+    - OPTIM: hpack-huff: reduce the cache footprint of the huffman decoder
+    - BUG/MINOR: mux-quic: do not keep detached qcs with empty Tx buffers
+    - REORG: mux-quic: extract traces in a dedicated source file
+    - REORG: mux-quic: export HTTP related function in a dedicated file
+    - MINOR: mux-quic: refactor snd_buf
+    - BUG/MEDIUM: mux-quic: properly trim HTX buffer on snd_buf reset
+    - BUG/MINOR: mux-h1: Account consumed output data on synchronous connection error
+    - BUG/MINOR: log: improper behavior when escaping log data
+    - CLEANUP: tools: removing escape_chunk() function
+    - MINOR: clock: split local and global date updates
+    - MINOR: pollers: only update the local date during busy polling
+    - MINOR: clock: do not update the global date too often
+    - REGTESTS: 4be_1srv_smtpchk_httpchk_layer47errors: Return valid SMTP replies
+    - MINOR: smtpchk: Update expect rule to fully match replies to EHLO commands
+    - BUG/MINOR: smtpchk: SMTP Service check should gracefully close SMTP transaction
+    - MINOR: list: documenting mt_list_for_each_entry_safe() macro
+    - CLEANUP: list: Fix mt_list_for_each_entry_safe indentation
+    - BUG/MINOR: hlua: Remove \n in Lua error message built with memprintf
+    - MINOR: hlua: Allow argument on lua-lod(-per-thread) directives
+    - BUG/MINOR: anon: memory illegal accesses in tools.c with hash_anon and hash_ipanon
+    - MEDIUM: mworker/cli: keep the connection of the FD that ask for a reload
+    - BUG/MINOR: hlua: fixing ambiguous sizeof in hlua_load_per_thread
+    - MINOR: mworker/cli: replace close() by fd_delete()
+    - MINOR: mworker: store and shows loading status
+    - MINOR: mworker: mworker_cli_proxy_new_listener() returns a bind_conf
+    - MINOR: mworker: stores the mcli_reload bind_conf
+    - MINOR: mworker/cli: the mcli_reload bind_conf only send the reload status
+    - DOC: management: describe the new reload command behavior
+    - CLEANUP: list: fix again some style issues in the recent comments
+    - BUG/MINOR: stream: Perform errors handling in right order in stream_new()
+    - BUG/MEDIUM: stconn: Reset SE descriptor when we fail to create a stream
+    - BUG/MEDIUM: resolvers: Remove aborted resolutions from query_ids tree
+    - DOC: management: add timeout on the "reload" command
+    - BUG/MINOR: ring: fix the size check in ring_make_from_area()
+    - BUG/MINOR: config: don't count trailing spaces as empty arg
+    - Revert "BUG/MINOR: config: don't count trailing spaces as empty arg"
+    - BUG/MINOR: hlua: fixing hlua_http_msg_del_data behavior
+    - BUG/MINOR: hlua: fixing hlua_http_msg_insert_data behavior
+    - MINOR: cli: Add anonymization on a missed element for 'show sess all'
+    - MINOR: cli: remove error message with 'set anon on|off'
+    - MINOR: tools: modify hash_ipanon in order to use it in cli
+    - MINOR: cli: use hash_ipanon to anonymized address
+    - MINOR: cli: Add an anonymization on a missed element in 'show server state'
+    - MINOR: config: correct errors about argument number in condition in cfgparse.c
+    - MINOR: config: Add other keywords when dump the anonymized configuration file
+    - MINOR: config: Add option line when the configuration file is dumped
+    - MINOR: cli: correct commentary and replace 'set global-key' name
+    - MINOR: tools: Impprove hash_ipanon to support dgram sockets and port offsets
+    - MINOR: tools: Impprove hash_ipanon to not hash FD-based addresses
+    - BUG/MINOR: hlua: _hlua_http_msg_delete incorrect behavior when offset is used
+    - DOC: management: httpclient can resolve server names in URLs
+    - BUG/MINOR: hlua: prevent crash when loading numerous arguments using lua-load(per-thread)
+    - DOC/CLEANUP: lua-api: removing duplicate date functions doc
+    - MINOR: hlua: ambiguous lua_pushvalue with 0 index
+    - BUG/MINOR: config: don't count trailing spaces as empty arg (v2)
+    - BUG/MEDIUM: config: count line arguments without dereferencing the output
+    - BUG/MAJOR: conn-idle: fix hash indexing issues on idle conns
+    - BUG/MINOR: config: insufficient syntax check of the global "maxconn" value
+    - BUG/MINOR: backend: only enforce turn-around state when not redispatching
+
 2022/09/17 : 2.7-dev6
     - MINOR: Revert part of clarifying samples support per os commit
     - BUILD: makefile: enable crypt(3) for NetBSD
