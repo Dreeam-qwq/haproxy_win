@@ -147,14 +147,10 @@ int clock_setup_signal_timer(void *tmr, int sig, int val)
  * values for the tv_sec and tv_usec parts. The offset is made of two signed
  * ints so that the clock can be adjusted in the two directions.
  */
-void clock_update_date(int max_wait, int interrupted)
+void clock_update_local_date(int max_wait, int interrupted)
 {
-	struct timeval min_deadline, max_deadline, tmp_now;
-	uint old_now_ms;
-	ullong old_now;
-	ullong new_now;
-	ullong ofs, ofs_new;
-	uint sec_ofs, usec_ofs;
+	struct timeval min_deadline, max_deadline;
+	ullong ofs;
 
 	gettimeofday(&date, NULL);
 
@@ -194,6 +190,17 @@ void clock_update_date(int max_wait, int interrupted)
 			now.tv_sec  += 1;
 		}
 	}
+	now_ms = __tv_to_ms(&now);
+}
+
+void clock_update_global_date()
+{
+	struct timeval tmp_now;
+	uint old_now_ms;
+	ullong old_now;
+	ullong new_now;
+	ullong ofs_new;
+	uint sec_ofs, usec_ofs;
 
 	/* now that we have bounded the local time, let's check if it's
 	 * realistic regarding the global date, which only moves forward,
@@ -210,15 +217,28 @@ void clock_update_date(int max_wait, int interrupted)
 			now = tmp_now;
 
 		/* now <now> is expected to be the most accurate date,
-		 * equal to <global_now> or newer.
+		 * equal to <global_now> or newer. Updating the global
+		 * date too often causes extreme contention and is not
+		 * needed: it's only used to help threads run at the
+		 * same date in case of local drift, and the global date,
+		 * which changes, is only used by freq counters (a choice
+		 * which is debatable by the way since it changes under us).
+		 * Tests have seen that the contention can be reduced from
+		 * 37% in this function to almost 0% when keeping clocks
+		 * synchronized no better than 32 microseconds, so that's
+		 * what we're doing here.
 		 */
+
 		new_now = ((ullong)now.tv_sec << 32) + (uint)now.tv_usec;
 		now_ms = __tv_to_ms(&now);
+
+		if (!((new_now ^ old_now) & ~0x1FULL))
+			return;
 
 		/* let's try to update the global <now> (both in timeval
 		 * and ms forms) or loop again.
 		 */
-	} while (((new_now != old_now    && !_HA_ATOMIC_CAS(&global_now, &old_now, new_now)) ||
+	} while ((!_HA_ATOMIC_CAS(&global_now, &old_now, new_now) ||
 		  (now_ms  != old_now_ms && !_HA_ATOMIC_CAS(&global_now_ms, &old_now_ms, now_ms))) &&
 		 __ha_cpu_relax());
 
@@ -235,8 +255,7 @@ void clock_update_date(int max_wait, int interrupted)
 		sec_ofs  -= 1;
 	}
 	ofs_new = ((ullong)sec_ofs << 32) + usec_ofs;
-	if (ofs_new != ofs)
-		HA_ATOMIC_STORE(&now_offset, ofs_new);
+	HA_ATOMIC_STORE(&now_offset, ofs_new);
 }
 
 /* must be called once at boot to initialize some global variables */
@@ -265,6 +284,7 @@ void clock_init_thread_date(void)
 	now.tv_sec = old_now >> 32;
 	now.tv_usec = (uint)old_now;
 	th_ctx->idle_pct = 100;
+	th_ctx->prev_cpu_time  = now_cpu_time();
 	clock_update_date(0, 1);
 }
 
@@ -329,7 +349,7 @@ void clock_leaving_poll(int timeout, int interrupted)
 
 /* Collect date and time information before calling poll(). This will be used
  * to count the run time of the past loop and the sleep time of the next poll.
- * It also compares the elasped and cpu times during the activity period to
+ * It also compares the elapsed and cpu times during the activity period to
  * estimate the amount of stolen time, which is reported if higher than half
  * a millisecond.
  */

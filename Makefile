@@ -32,6 +32,7 @@
 #   USE_CRYPT_H          : set it if your system requires including crypt.h
 #   USE_GETADDRINFO      : use getaddrinfo() to resolve IPv6 host names.
 #   USE_OPENSSL          : enable use of OpenSSL. Recommended, but see below.
+#   USE_OPENSSL_WOLFSSL  : enable use of wolfSSL with the OpenSSL API
 #   USE_ENGINE           : enable use of OpenSSL Engine.
 #   USE_LUA              : enable Lua support.
 #   USE_ACCEPT4          : enable use of accept4() on linux. Automatic.
@@ -49,6 +50,7 @@
 #   USE_PROMEX           : enable the Prometheus exporter
 #   USE_DEVICEATLAS      : enable DeviceAtlas api.
 #   USE_51DEGREES        : enable third party device detection library from 51Degrees
+#   USE_51DEGREES_V4     : enable use of 51Degrees V4 engine with Hash algorithm
 #   USE_WURFL            : enable WURFL detection library from Scientiamobile
 #   USE_SYSTEMD          : enable sd_notify() support.
 #   USE_OBSOLETE_LINKER  : use when the linker fails to emit __start_init/__stop_init
@@ -57,6 +59,7 @@
 #   USE_MEMORY_PROFILING : enable the memory profiler. Linux-glibc only.
 #   USE_LIBATOMIC        : force to link with/without libatomic. Automatic.
 #   USE_PTHREAD_EMULATION: replace pthread's rwlocks with ours
+#   USE_SHM_OPEN         : use shm_open() for the startup-logs
 #
 # Options can be forced by specifying "USE_xxx=1" or can be disabled by using
 # "USE_xxx=" (empty string). The list of enabled and disabled options for a
@@ -105,6 +108,8 @@
 #                                                               pcre2-config)
 #   SSL_LIB        : force the lib path to libssl/libcrypto
 #   SSL_INC        : force the include path to libssl/libcrypto
+#   WOLFSSL_INC    : force the include path to wolfSSL
+#   WOLFSSL_LIB    : force the lib path to wolfSSL
 #   LUA_LIB        : force the lib path to lua
 #   LUA_INC        : force the include path to lua
 #   LUA_LIB_NAME   : force the lib name (or automatically evaluated, by order of
@@ -122,55 +127,8 @@
 #   VTEST_PROGRAM  : location of the vtest program to run reg-tests.
 #   DEBUG_USE_ABORT: use abort() for program termination, see include/haproxy/bug.h for details
 
-# verbosity: pass V=1 for verbose shell invocation
-V = 0
-Q = @
-ifeq ($V,1)
-Q=
-endif
-
-# WARNING: Do not change cc-opt, cc-opt-alt or cc-warning without checking if
-#          clang bug #49364 is fixed. stderr is redirected to /dev/null on
-#          purpose, to work around a clang 11 bug that crashes if stderr is
-#          redirected to stdin.
-#
-# Function used to detect support of a given option by the compiler.
-# Usage: CFLAGS += $(call cc-opt,option). Eg: $(call cc-opt,-fwrapv)
-# Note: ensure the referencing variable is assigned using ":=" and not "=" to
-#       call it only once.
-cc-opt = $(shell set -e; if $(CC) -Werror $(1) -E -xc - -o /dev/null </dev/null >&0 2>/dev/null; then echo "$(1)"; fi;)
-
-# same but tries with $2 if $1 is not supported
-cc-opt-alt = $(if $(shell set -e; if $(CC) -Werror $(1) -E -xc - -o /dev/null </dev/null >&0 2>/dev/null; then echo 1;fi),$(1),$(call cc-opt,$(2)))
-
-# validate a list of options one at a time
-cc-all-opts  = $(foreach a,$(1),$(call cc-opt,$(a)))
-
-# try to pass plenty of options at once, take them on success or try them
-# one at a time on failure and keep successful ones. This is handy to quickly
-# validate most common options.
-cc-all-fast = $(if $(call cc-opt,$(1)),$(1),$(call cc-all-opts,$(1)))
-
-# Below we verify that the compiler supports any -Wno-something option to
-# disable any warning, or if a special option is needed to achieve that. This
-# will allow to get rid of testing when the compiler doesn't care. The result
-# is made of two variables:
-#  - cc-anywno that's non-empty if the compiler supports disabling anything
-#  - cc-wnouwo that may contain an option needed to enable this behavior
-# Gcc 4.x and above do not need any option but will still complain about unknown
-# options if another warning or error happens, and as such they're not testable.
-# Clang needs a special option -Wno-unknown-warning-option. Compilers not
-# supporting this option will check all warnings individually.
-cc-anywno := $(call cc-opt,-Wno-haproxy-warning)
-cc-wnouwo := $(if $(cc-anywno),,$(call cc-opt,-Wno-unknown-warning-option))
-cc-anywno := $(if $(cc-anywno)$(cc-wnouwo),1)
-
-# Disable a warning when supported by the compiler. Don't put spaces around the
-# warning! And don't use cc-opt which doesn't always report an error until
-# another one is also returned. If "cc-anywno" is set, the compiler supports
-# -Wno- followed by anything so we don't even need to start the compiler.
-# Usage: CFLAGS += $(call cc-nowarn,warning). Eg: $(call cc-opt,format-truncation)
-cc-nowarn = $(if $(cc-anywno),-Wno-$(1),$(shell set -e; if $(CC) -Werror -W$(1) -E -xc - -o /dev/null </dev/null >&0 2>/dev/null; then echo "-Wno-$(1)"; fi;))
+include include/make/verbose.mk
+include include/make/compiler.mk
 
 #### Installation options.
 DESTDIR =
@@ -341,11 +299,13 @@ use_opts = USE_EPOLL USE_KQUEUE USE_NETFILTER                                 \
            USE_THREAD USE_PTHREAD_EMULATION USE_BACKTRACE                     \
            USE_STATIC_PCRE USE_STATIC_PCRE2 USE_TPROXY USE_LINUX_TPROXY       \
            USE_LINUX_SPLICE USE_LIBCRYPT USE_CRYPT_H USE_ENGINE               \
-           USE_GETADDRINFO USE_OPENSSL USE_LUA USE_ACCEPT4                    \
-           USE_CLOSEFROM USE_ZLIB USE_SLZ USE_CPU_AFFINITY USE_TFO USE_NS     \
-           USE_DL USE_RT USE_DEVICEATLAS USE_51DEGREES USE_WURFL USE_SYSTEMD  \
-           USE_OBSOLETE_LINKER USE_PRCTL USE_PROCCTL USE_THREAD_DUMP          \
-           USE_EVPORTS USE_OT USE_QUIC USE_PROMEX USE_MEMORY_PROFILING
+           USE_GETADDRINFO USE_OPENSSL USE_OPENSSL_WOLFSSL USE_LUA            \
+           USE_ACCEPT4 USE_CLOSEFROM USE_ZLIB USE_SLZ USE_CPU_AFFINITY        \
+           USE_TFO USE_NS USE_DL USE_RT                                       \
+           USE_DEVICEATLAS USE_51DEGREES USE_51DEGREES_V4                     \
+           USE_WURFL USE_SYSTEMD USE_OBSOLETE_LINKER USE_PRCTL USE_PROCCTL    \
+           USE_THREAD_DUMP USE_EVPORTS USE_OT USE_QUIC USE_PROMEX             \
+           USE_MEMORY_PROFILING USE_SHM_OPEN
 
 #### Target system options
 # Depending on the target platform, some options are set, as well as some
@@ -382,7 +342,7 @@ ifeq ($(TARGET),linux-glibc)
     USE_POLL USE_TPROXY USE_LIBCRYPT USE_DL USE_RT USE_CRYPT_H USE_NETFILTER  \
     USE_CPU_AFFINITY USE_THREAD USE_EPOLL USE_LINUX_TPROXY                    \
     USE_ACCEPT4 USE_LINUX_SPLICE USE_PRCTL USE_THREAD_DUMP USE_NS USE_TFO     \
-    USE_GETADDRINFO USE_BACKTRACE)
+    USE_GETADDRINFO USE_BACKTRACE USE_SHM_OPEN)
   INSTALL = install -v
 endif
 
@@ -401,7 +361,7 @@ ifeq ($(TARGET),linux-musl)
     USE_POLL USE_TPROXY USE_LIBCRYPT USE_DL USE_RT USE_CRYPT_H USE_NETFILTER  \
     USE_CPU_AFFINITY USE_THREAD USE_EPOLL USE_LINUX_TPROXY                    \
     USE_ACCEPT4 USE_LINUX_SPLICE USE_PRCTL USE_THREAD_DUMP USE_NS USE_TFO     \
-    USE_GETADDRINFO)
+    USE_GETADDRINFO USE_SHM_OPEN)
   INSTALL = install -v
 endif
 
@@ -418,7 +378,7 @@ endif
 ifeq ($(TARGET),freebsd)
   set_target_defaults = $(call default_opts, \
     USE_POLL USE_TPROXY USE_LIBCRYPT USE_THREAD USE_CPU_AFFINITY USE_KQUEUE   \
-    USE_ACCEPT4 USE_CLOSEFROM USE_GETADDRINFO USE_PROCCTL)
+    USE_ACCEPT4 USE_CLOSEFROM USE_GETADDRINFO USE_PROCCTL USE_SHM_OPEN)
 endif
 
 # kFreeBSD glibc
@@ -625,11 +585,25 @@ SSL_LIB =
 # pass it in the "ADDLIB" variable if needed. If your SSL libraries are not
 # in the usual path, use SSL_INC=/path/to/inc and SSL_LIB=/path/to/lib.
 OPTIONS_CFLAGS  += $(if $(SSL_INC),-I$(SSL_INC))
+ifeq ($(USE_OPENSSL_WOLFSSL),)
 OPTIONS_LDFLAGS += $(if $(SSL_LIB),-L$(SSL_LIB)) -lssl -lcrypto
+endif
 ifneq ($(USE_DL),)
 OPTIONS_LDFLAGS += -ldl
 endif
-OPTIONS_OBJS  += src/ssl_sample.o src/ssl_sock.o src/ssl_crtlist.o src/ssl_ckch.o src/ssl_utils.o src/cfgparse-ssl.o src/jwt.o
+OPTIONS_OBJS  += src/ssl_sock.o src/ssl_ckch.o src/ssl_sample.o src/ssl_crtlist.o src/cfgparse-ssl.o src/ssl_utils.o src/jwt.o
+endif
+
+ifneq ($(USE_OPENSSL_WOLFSSL),)
+ifneq ($(WOLFSSL_INC),)
+OPTIONS_CFLAGS  += -I$(WOLFSSL_INC) -I$(WOLFSSL_INC)/wolfssl
+else
+OPTIONS_CFLAGS  += -I/usr/local/include/wolfssl -I/usr/local/include/wolfssl/openssl -I/usr/local/include
+endif
+ifneq ($(WOLFSSL_LIB),)
+OPTIONS_LDFLAGS  += -L$(WOLFSSL_LIB)
+endif
+OPTIONS_LDFLAGS  += -lwolfssl
 endif
 
 ifneq ($(USE_ENGINE),)
@@ -641,12 +615,14 @@ OPTIONS_CFLAGS += -DOPENSSL_SUPPRESS_DEPRECATED
 endif
 
 ifneq ($(USE_QUIC),)
-OPTIONS_OBJS += src/quic_sock.o src/proto_quic.o src/xprt_quic.o src/quic_tls.o \
-                src/quic_frame.o src/quic_cc.o src/quic_cc_newreno.o src/mux_quic.o \
-                src/cbuf.o src/qpack-dec.o src/qpack-tbl.o src/h3.o src/qpack-enc.o \
-                src/hq_interop.o src/cfgparse-quic.o src/quic_loss.o \
-                src/quic_tp.o src/quic_stream.o src/quic_stats.o src/h3_stats.o \
-                src/quic_cc_cubic.o
+OPTIONS_OBJS += src/quic_conn.o src/mux_quic.o src/h3.o src/xprt_quic.o    \
+                src/quic_frame.o src/quic_tls.o src/quic_tp.o              \
+                src/quic_stats.o src/quic_sock.o src/proto_quic.o          \
+                src/qmux_trace.o src/quic_loss.o src/qpack-enc.o           \
+                src/quic_cc_newreno.o src/quic_cc_cubic.o src/qpack-tbl.o  \
+                src/qpack-dec.o src/hq_interop.o src/quic_stream.o         \
+                src/h3_stats.o src/qmux_http.o src/cfgparse-quic.o         \
+                src/cbuf.o src/quic_cc.o
 endif
 
 ifneq ($(USE_LUA),)
@@ -714,22 +690,44 @@ OPTIONS_CFLAGS += $(if $(DEVICEATLAS_INC),-I$(DEVICEATLAS_INC))
 endif
 
 ifneq ($(USE_51DEGREES),)
+ifneq ($(USE_51DEGREES_V4),)
+$(error cannot compile both 51Degrees V3 and V4 engine support)
+endif
+endif
+
+ifneq ($(USE_51DEGREES)$(USE_51DEGREES_V4),)
 # Use 51DEGREES_SRC and possibly 51DEGREES_INC and 51DEGREES_LIB to force path
 # to 51degrees headers and libraries if needed.
 51DEGREES_SRC =
 51DEGREES_INC = $(51DEGREES_SRC)
 51DEGREES_LIB = $(51DEGREES_SRC)
+ifneq ($(USE_51DEGREES_V4),)
+_51DEGREES_SRC   = $(shell find $(51DEGREES_LIB) -maxdepth 2 -name '*.c')
+OPTIONS_OBJS    += $(_51DEGREES_SRC:%.c=%.o)
+else
 OPTIONS_OBJS    += $(51DEGREES_LIB)/../cityhash/city.o
 OPTIONS_OBJS    += $(51DEGREES_LIB)/51Degrees.o
+endif
 OPTIONS_OBJS    += addons/51degrees/51d.o
 OPTIONS_CFLAGS  += $(if $(51DEGREES_INC),-I$(51DEGREES_INC))
+ifneq ($(USE_51DEGREES_V4),)
+OPTIONS_CFLAGS  += -DUSE_51DEGREES_V4
+endif
 ifeq ($(USE_THREAD),)
 OPTIONS_CFLAGS  += -DFIFTYONEDEGREES_NO_THREADING
+ifneq ($(USE_51DEGREES_V4),)
+OPTIONS_CFLAGS  += -DFIFTYONE_DEGREES_NO_THREADING
+endif
 else
+ifeq ($(USE_51DEGREES_V4),)
 OPTIONS_OBJS    += $(51DEGREES_LIB)/../threading.o
+endif
 endif
 
 OPTIONS_LDFLAGS += $(if $(51DEGREES_LIB),-L$(51DEGREES_LIB)) -lm
+ifneq ($(USE_51DEGREES_V4),)
+OPTIONS_LDFLAGS += -latomic
+endif
 endif
 
 ifneq ($(USE_WURFL),)
@@ -862,24 +860,6 @@ endif
 # add options at the beginning of the "ld" command line if needed.
 LDOPTS = $(TARGET_LDFLAGS) $(OPTIONS_LDFLAGS) $(ADDLIB)
 
-ifeq ($V,1)
-cmd_CC = $(CC)
-cmd_LD = $(LD)
-cmd_AR = $(AR)
-else
-ifeq (3.81,$(firstword $(sort $(MAKE_VERSION) 3.81)))
-# 3.81 or above
-cmd_CC = $(info $   CC      $@) $(Q)$(CC)
-cmd_LD = $(info $   LD      $@) $(Q)$(LD)
-cmd_AR = $(info $   AR      $@) $(Q)$(AR)
-else
-# 3.80 or older
-cmd_CC = $(Q)echo "  CC      $@";$(CC)
-cmd_LD = $(Q)echo "  LD      $@";$(LD)
-cmd_AR = $(Q)echo "  AR      $@";$(AR)
-endif
-endif
-
 ifeq ($(TARGET),)
 all:
 	@echo "Building HAProxy without specifying a TARGET is not supported."
@@ -949,13 +929,13 @@ OBJS += src/mux_h2.o src/mux_fcgi.o src/mux_h1.o src/tcpcheck.o               \
         src/acl.o src/sock.o src/mworker.o src/tcp_act.o src/ring.o           \
         src/session.o src/proto_tcp.o src/fd.o src/channel.o src/activity.o   \
         src/queue.o src/lb_fas.o src/http_rules.o src/extcheck.o              \
-        src/thread.o src/http.o src/lb_chash.o src/applet.o                   \
+        src/flt_bwlim.o src/thread.o src/http.o src/lb_chash.o src/applet.o   \
         src/compression.o src/raw_sock.o src/ncbuf.o src/frontend.o           \
         src/errors.o src/uri_normalizer.o src/http_conv.o src/lb_fwrr.o       \
         src/sha1.o src/proto_sockpair.o src/mailers.o src/lb_fwlc.o           \
         src/ebmbtree.o src/cfgcond.o src/action.o src/xprt_handshake.o        \
         src/protocol.o src/proto_uxst.o src/proto_udp.o src/lb_map.o          \
-        src/fix.o src/ev_select.o src/arg.o src/sock_inet.o                   \
+        src/fix.o src/ev_select.o src/arg.o src/sock_inet.o src/event_hdl.o   \
         src/mworker-prog.o src/hpack-dec.o src/cfgparse-tcp.o                 \
         src/sock_unix.o src/shctx.o src/proto_uxdg.o src/fcgi.o               \
         src/eb64tree.o src/clock.o src/chunk.o src/cfgdiag.o src/signal.o     \
@@ -964,7 +944,7 @@ OBJS += src/mux_h2.o src/mux_fcgi.o src/mux_h1.o src/tcpcheck.o               \
         src/base64.o src/auth.o src/uri_auth.o src/time.o src/ebistree.o      \
         src/dynbuf.o src/wdt.o src/pipe.o src/init.o src/http_acl.o           \
         src/hpack-huff.o src/hpack-enc.o src/dict.o src/freq_ctr.o            \
-        src/ebtree.o src/hash.o src/dgram.o src/version.o src/flt_bwlim.o
+        src/ebtree.o src/hash.o src/dgram.o src/version.o
 
 ifneq ($(TRACE),)
 OBJS += src/calltrace.o
@@ -1028,19 +1008,19 @@ dev/hpack/%: dev/hpack/%.o
 	$(cmd_LD) $(LDFLAGS) -o $@ $^ $(LDOPTS)
 
 dev/poll/poll:
-	$(Q)$(MAKE) -C dev/poll poll CC='$(cmd_CC)' OPTIMIZE='$(COPTS)'
+	$(cmd_MAKE) -C dev/poll poll CC='$(CC)' OPTIMIZE='$(COPTS)' V='$(V)'
 
 dev/qpack/decode: dev/qpack/decode.o
 	$(cmd_LD) $(LDFLAGS) -o $@ $^ $(LDOPTS)
 
 dev/tcploop/tcploop:
-	$(Q)$(MAKE) -C dev/tcploop tcploop CC='$(cmd_CC)' OPTIMIZE='$(COPTS)'
+	$(cmd_MAKE) -C dev/tcploop tcploop CC='$(CC)' OPTIMIZE='$(COPTS)' V='$(V)'
 
 dev/udp/udp-perturb: dev/udp/udp-perturb.o
 	$(cmd_LD) $(LDFLAGS) -o $@ $^ $(LDOPTS)
 
 # rebuild it every time
-.PHONY: src/version.c
+.PHONY: src/version.c dev/poll/poll dev/tcploop/tcploop
 
 src/calltrace.o: src/calltrace.c $(DEP)
 	$(cmd_CC) $(TRACE_COPTS) -c -o $@ $<

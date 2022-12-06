@@ -27,6 +27,7 @@
 #include <haproxy/htx.h>
 #include <haproxy/list.h>
 #include <haproxy/log.h>
+#include <haproxy/mux_fcgi-t.h>
 #include <haproxy/net_helper.h>
 #include <haproxy/proxy.h>
 #include <haproxy/regex.h>
@@ -36,47 +37,6 @@
 #include <haproxy/stream.h>
 #include <haproxy/trace.h>
 #include <haproxy/version.h>
-
-
-/* FCGI Connection flags (32 bits) */
-#define FCGI_CF_NONE           0x00000000
-
-/* Flags indicating why writing to the mux is blockes */
-#define FCGI_CF_MUX_MALLOC      0x00000001 /* mux is blocked on lack connection's mux buffer */
-#define FCGI_CF_MUX_MFULL       0x00000002 /* mux is blocked on connection's mux buffer full */
-#define FCGI_CF_MUX_BLOCK_ANY   0x00000003 /* mux is blocked on connection's mux buffer full */
-
-/* Flags indicating why writing to the demux is blocked.
- * The first two ones directly affect the ability for the mux to receive data
- * from the connection. The other ones affect the mux's ability to demux
- * received data.
- */
-#define FCGI_CF_DEM_DALLOC      0x00000004  /* demux blocked on lack of connection's demux buffer */
-#define FCGI_CF_DEM_DFULL       0x00000008  /* demux blocked on connection's demux buffer full */
-#define FCGI_CF_DEM_MROOM       0x00000010  /* demux blocked on lack of room in mux buffer */
-#define FCGI_CF_DEM_SALLOC      0x00000020  /* demux blocked on lack of stream's rx buffer */
-#define FCGI_CF_DEM_SFULL       0x00000040  /* demux blocked on stream request buffer full */
-#define FCGI_CF_DEM_TOOMANY     0x00000080  /* demux blocked waiting for some stream connectors to leave */
-#define FCGI_CF_DEM_BLOCK_ANY   0x000000F0  /* aggregate of the demux flags above except DALLOC/DFULL */
-
-/* Other flags */
-#define FCGI_CF_MPXS_CONNS      0x00000100  /* connection multiplexing is supported */
-#define FCGI_CF_ABRTS_SENT      0x00000200  /* a record ABORT was successfully sent to all active streams */
-#define FCGI_CF_ABRTS_FAILED    0x00000400  /* failed to abort processing of all streams */
-#define FCGI_CF_WAIT_FOR_HS     0x00000800  /* We did check that at least a stream was waiting for handshake */
-#define FCGI_CF_KEEP_CONN       0x00001000  /* HAProxy is responsible to close the connection */
-#define FCGI_CF_GET_VALUES      0x00002000  /* retrieve settings */
-
-/* FCGI connection state (fcgi_conn->state) */
-enum fcgi_conn_st {
-	FCGI_CS_INIT = 0,    /* init done, waiting for sending GET_VALUES record */
-	FCGI_CS_SETTINGS,    /* GET_VALUES sent, waiting for the GET_VALUES_RESULT record */
-	FCGI_CS_RECORD_H,    /* GET_VALUES_RESULT received, waiting for a record header */
-	FCGI_CS_RECORD_D,    /* Record header OK, waiting for a record data */
-	FCGI_CS_RECORD_P,    /* Record processed, remains the padding */
-	FCGI_CS_CLOSED,      /* abort requests if necessary and  close the connection ASAP */
-	FCGI_CS_ENTRIES
-} __attribute__((packed));
 
 /* 32 buffers: one for the ring's root, rest for the mbuf itself */
 #define FCGI_C_MBUF_CNT 32
@@ -118,38 +78,6 @@ struct fcgi_conn {
 	struct buffer_wait buf_wait;         /* Wait list for buffer allocation */
 	struct wait_event wait_event;        /* To be used if we're waiting for I/Os */
 };
-
-
-/* FCGI stream state, in fcgi_strm->state */
-enum fcgi_strm_st {
-	FCGI_SS_IDLE = 0,
-	FCGI_SS_OPEN,
-	FCGI_SS_HREM,     // half-closed(remote)
-	FCGI_SS_HLOC,     // half-closed(local)
-	FCGI_SS_ERROR,
-	FCGI_SS_CLOSED,
-	FCGI_SS_ENTRIES
-} __attribute__((packed));
-
-
-/* FCGI stream flags (32 bits) */
-#define FCGI_SF_NONE           0x00000000
-#define FCGI_SF_ES_RCVD        0x00000001 /* end-of-stream received (empty STDOUT or EDN_REQUEST record) */
-#define FCGI_SF_ES_SENT        0x00000002 /* end-of-stream sent (empty STDIN record) */
-#define FCGI_SF_EP_SENT        0x00000004 /* end-of-param sent (empty PARAMS  record) */
-#define FCGI_SF_ABRT_SENT      0x00000008 /* abort sent (ABORT_REQUEST record) */
-
-/* Stream flags indicating the reason the stream is blocked */
-#define FCGI_SF_BLK_MBUSY      0x00000010 /* blocked waiting for mux access (transient) */
-#define FCGI_SF_BLK_MROOM      0x00000020 /* blocked waiting for room in the mux */
-#define FCGI_SF_BLK_ANY        0x00000030 /* any of the reasons above */
-
-#define FCGI_SF_BEGIN_SENT     0x00000100  /* a BEGIN_REQUEST record was sent for this stream */
-#define FCGI_SF_OUTGOING_DATA  0x00000200  /* set whenever we've seen outgoing data */
-#define FCGI_SF_NOTIFIED       0x00000400  /* a paused stream was notified to try to send again */
-
-#define FCGI_SF_WANT_SHUTR     0x00001000  /* a stream couldn't shutr() (mux full/busy) */
-#define FCGI_SF_WANT_SHUTW     0x00002000  /* a stream couldn't shutw() (mux full/busy) */
 
 
 /* FCGI stream descriptor */
@@ -394,34 +322,6 @@ static const struct fcgi_strm *fcgi_unknown_stream = &(const struct fcgi_strm){
 	.id        = 0,
 };
 
-/* returns a fconn state as an abbreviated 3-letter string, or "???" if unknown */
-static inline const char *fconn_st_to_str(enum fcgi_conn_st st)
-{
-	switch (st) {
-		case FCGI_CS_INIT     : return "INI";
-		case FCGI_CS_SETTINGS : return "STG";
-		case FCGI_CS_RECORD_H : return "RDH";
-		case FCGI_CS_RECORD_D : return "RDD";
-		case FCGI_CS_RECORD_P : return "RDP";
-		case FCGI_CS_CLOSED   : return "CLO";
-		default               : return "???";
-	}
-}
-
-/* returns a fstrm state as an abbreviated 3-letter string, or "???" if unknown */
-static inline const char *fstrm_st_to_str(enum fcgi_strm_st st)
-{
-	switch (st) {
-		case FCGI_SS_IDLE   : return "IDL";
-		case FCGI_SS_OPEN   : return "OPN";
-		case FCGI_SS_HREM   : return "RCL";
-		case FCGI_SS_HLOC   : return "HCL";
-		case FCGI_SS_ERROR  : return "ERR";
-		case FCGI_SS_CLOSED : return "CLO";
-		default             : return "???";
-	}
-}
-
 /* returns the stconn associated to the FCGI stream */
 static forceinline struct stconn *fcgi_strm_sc(const struct fcgi_strm *fstrm)
 {
@@ -552,10 +452,10 @@ static void fcgi_trace(enum trace_level level, uint64_t mask, const struct trace
  */
 static inline int fcgi_recv_allowed(const struct fcgi_conn *fconn)
 {
-	if (b_data(&fconn->dbuf) == 0 &&
-	    (fconn->state == FCGI_CS_CLOSED ||
-	     fconn->conn->flags & CO_FL_ERROR ||
-	     conn_xprt_read0_pending(fconn->conn)))
+	if (fconn->flags & (FCGI_CF_EOS|FCGI_CF_ERROR))
+		return 0;
+
+	if (b_data(&fconn->dbuf) == 0 && fconn->state == FCGI_CS_CLOSED)
 		return 0;
 
 	if (!(fconn->flags & FCGI_CF_DEM_DALLOC) &&
@@ -893,7 +793,7 @@ static void fcgi_release(struct fcgi_conn *fconn)
  */
 static int fcgi_conn_read0_pending(struct fcgi_conn *fconn)
 {
-	if (conn_xprt_read0_pending(fconn->conn) && !b_data(&fconn->dbuf))
+	if ((fconn->flags & FCGI_CF_EOS) && !b_data(&fconn->dbuf))
 		return 1;
 	return 0;
 }
@@ -904,12 +804,12 @@ static inline int fcgi_conn_is_dead(struct fcgi_conn *fconn)
 {
 	if (eb_is_empty(&fconn->streams_by_id) &&               /* don't close if streams exist */
 	    (!(fconn->flags & FCGI_CF_KEEP_CONN) ||             /* don't keep the connection alive */
-	     (fconn->conn->flags & CO_FL_ERROR) ||              /* errors close immediately */
+	     (fconn->flags & FCGI_CF_ERROR) ||                  /* errors close immediately */
 	     (fconn->state == FCGI_CS_CLOSED && !fconn->task) ||/* a timeout stroke earlier */
 	     (!(fconn->conn->owner)) ||                         /* Nobody's left to take care of the connection, drop it now */
 	     (!br_data(fconn->mbuf) &&                          /* mux buffer empty, also process clean events below */
-	      conn_xprt_read0_pending(fconn->conn))))
-		return 1;
+	      (fconn->flags & FCGI_CF_EOS))))
+	      return 1;
 	return 0;
 }
 
@@ -1177,10 +1077,8 @@ static void fcgi_strm_wake_one_stream(struct fcgi_strm *fstrm)
 			fcgi_strm_close(fstrm);
 	}
 
-	if ((fconn->state == FCGI_CS_CLOSED || fconn->conn->flags & CO_FL_ERROR)) {
-		se_fl_set(fstrm->sd, SE_FL_ERR_PENDING);
-		if (se_fl_test(fstrm->sd, SE_FL_EOS))
-			se_fl_set(fstrm->sd, SE_FL_ERROR);
+	if (fconn->state == FCGI_CS_CLOSED || (fconn->flags & (FCGI_CF_ERR_PENDING|FCGI_CF_ERROR))) {
+		se_fl_set_error(fstrm->sd);
 
 		if (fstrm->state < FCGI_SS_ERROR) {
 			fstrm->state = FCGI_SS_ERROR;
@@ -2200,9 +2098,10 @@ static size_t fcgi_strm_send_stdin(struct fcgi_conn *fconn, struct fcgi_strm *fs
 	size = htx_get_blksz(blk);
 	if (unlikely(size == count && htx_nbblks(htx) == 1 && type == HTX_BLK_DATA)) {
 		void *old_area = mbuf->area;
+		int eom = (htx->flags & HTX_FL_EOM);
 
 		 /* Last block of the message: Reserve the size for the empty stdin record */
-		if (htx->flags & HTX_FL_EOM)
+		if (eom)
 			extra_bytes = FCGI_RECORD_HEADER_SZ;
 
 		if (b_data(mbuf)) {
@@ -2238,6 +2137,8 @@ static size_t fcgi_strm_send_stdin(struct fcgi_conn *fconn, struct fcgi_strm *fs
 
 		htx = (struct htx *)buf->area;
 		htx_reset(htx);
+		if (eom)
+			goto empty_stdin;
 		goto end;
 	}
 
@@ -2287,7 +2188,9 @@ static size_t fcgi_strm_send_stdin(struct fcgi_conn *fconn, struct fcgi_strm *fs
 					    b_data(&outbuf) + v.len + extra_bytes <= b_room(mbuf) &&
 					    b_data(mbuf) <= MAX_DATA_REALIGN)
 						goto realign_again;
-					v.len = b_room(&outbuf) - FCGI_RECORD_HEADER_SZ - extra_bytes;
+					v.len = (FCGI_RECORD_HEADER_SZ + extra_bytes > b_room(&outbuf)
+						 ? 0
+						 : b_room(&outbuf) - FCGI_RECORD_HEADER_SZ - extra_bytes);
 				}
 				if (!v.len || !chunk_memcat(&outbuf, v.ptr, v.len)) {
 					if (outbuf.data == FCGI_RECORD_HEADER_SZ)
@@ -2318,6 +2221,7 @@ static size_t fcgi_strm_send_stdin(struct fcgi_conn *fconn, struct fcgi_strm *fs
 
 	/* Send the empty stding here to finish the message */
 	if (htx_is_empty(htx) && (htx->flags & HTX_FL_EOM)) {
+	  empty_stdin:
 		TRACE_PROTO("sending FCGI STDIN record", FCGI_EV_TX_RECORD|FCGI_EV_TX_STDIN, fconn->conn, fstrm, htx);
 		if (!fcgi_strm_send_empty_stdin(fconn, fstrm)) {
 			/* bytes already reserved for this record. It should not fail */
@@ -2849,10 +2753,18 @@ static int fcgi_recv(struct fcgi_conn *fconn)
 	else
 		TRACE_DATA("recv data", FCGI_EV_FCONN_RECV, conn, 0, 0, (size_t[]){ret});
 
+	if (conn_xprt_read0_pending(conn)) {
+		TRACE_DATA("received read0", FCGI_EV_FCONN_RECV, conn);
+		fconn->flags |= FCGI_CF_EOS;
+	}
+	if (conn->flags & CO_FL_ERROR) {
+		TRACE_DATA("connection error", FCGI_EV_FCONN_RECV, conn);
+		fconn->flags |= FCGI_CF_ERROR;
+	}
+
 	if (!b_data(buf)) {
 		fcgi_release_buf(fconn, &fconn->dbuf);
-		TRACE_LEAVE(FCGI_EV_FCONN_RECV, conn);
-		return (conn->flags & CO_FL_ERROR || conn_xprt_read0_pending(conn));
+		goto end;
 	}
 
 	if (ret == max) {
@@ -2860,8 +2772,9 @@ static int fcgi_recv(struct fcgi_conn *fconn)
 		fconn->flags |= FCGI_CF_DEM_DFULL;
 	}
 
+end:
 	TRACE_LEAVE(FCGI_EV_FCONN_RECV, conn);
-	return !!ret || (conn->flags & CO_FL_ERROR) || conn_xprt_read0_pending(conn);
+	return !!ret || (fconn->flags & (FCGI_CF_EOS|FCGI_CF_ERROR));
 }
 
 
@@ -2876,8 +2789,11 @@ static int fcgi_send(struct fcgi_conn *fconn)
 
 	TRACE_ENTER(FCGI_EV_FCONN_SEND, conn);
 
-	if (conn->flags & CO_FL_ERROR) {
+	if (fconn->flags & (FCGI_CF_ERROR|FCGI_CF_ERR_PENDING)) {
 		TRACE_DEVEL("leaving on connection error", FCGI_EV_FCONN_SEND, conn);
+		if (fconn->flags & FCGI_CF_EOS)
+			fconn->flags |= FCGI_CF_ERROR;
+		b_reset(br_tail(fconn->mbuf));
 		return 1;
 	}
 
@@ -2955,10 +2871,13 @@ static int fcgi_send(struct fcgi_conn *fconn)
 		fconn->flags &= ~(FCGI_CF_MUX_MFULL | FCGI_CF_DEM_MROOM);
 	}
 
-	if (conn->flags & CO_FL_SOCK_WR_SH) {
-		/* output closed, nothing to send, clear the buffer to release it */
+	if (conn->flags & CO_FL_ERROR) {
+		fconn->flags |= FCGI_CF_ERR_PENDING;
+		if (fconn->flags & FCGI_CF_EOS)
+			fconn->flags |= FCGI_CF_ERROR;
 		b_reset(br_tail(fconn->mbuf));
 	}
+
 	/* We're not full anymore, so we can wake any task that are waiting
 	 * for us.
 	 */
@@ -2999,7 +2918,7 @@ static int fcgi_send(struct fcgi_conn *fconn)
 	/* We're done, no more to send */
 	if (!br_data(fconn->mbuf)) {
 		TRACE_DEVEL("leaving with everything sent", FCGI_EV_FCONN_SEND, conn);
-		return sent;
+		goto end;
 	}
 schedule:
 	if (!(conn->flags & CO_FL_ERROR) && !(fconn->wait_event.events & SUB_RETRY_SEND)) {
@@ -3008,7 +2927,8 @@ schedule:
 	}
 
 	TRACE_DEVEL("leaving with some data left to send", FCGI_EV_FCONN_SEND, conn);
-	return sent;
+end:
+	return sent || (fconn->flags & (FCGI_CF_ERR_PENDING|FCGI_CF_ERROR));
 }
 
 /* this is the tasklet referenced in fconn->wait_event.tasklet */
@@ -3069,9 +2989,9 @@ struct task *fcgi_io_cb(struct task *t, void *ctx, unsigned int state)
 
 		HA_SPIN_LOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
 		if (conn_in_list == CO_FL_SAFE_LIST)
-			ebmb_insert(&srv->per_thr[tid].safe_conns, &conn->hash_node->node, sizeof(conn->hash_node->hash));
+			eb64_insert(&srv->per_thr[tid].safe_conns, &conn->hash_node->node);
 		else
-			ebmb_insert(&srv->per_thr[tid].idle_conns, &conn->hash_node->node, sizeof(conn->hash_node->hash));
+			eb64_insert(&srv->per_thr[tid].idle_conns, &conn->hash_node->node);
 		HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
 	}
 	return t;
@@ -3090,7 +3010,7 @@ static int fcgi_process(struct fcgi_conn *fconn)
 	if (b_data(&fconn->dbuf) && !(fconn->flags & FCGI_CF_DEM_BLOCK_ANY)) {
 		fcgi_process_demux(fconn);
 
-		if (fconn->state == FCGI_CS_CLOSED || conn->flags & CO_FL_ERROR)
+		if (fconn->state == FCGI_CS_CLOSED || (fconn->flags & FCGI_CF_ERROR))
 			b_reset(&fconn->dbuf);
 
 		if (buf_room_for_htx_data(&fconn->dbuf))
@@ -3130,7 +3050,7 @@ static int fcgi_process(struct fcgi_conn *fconn)
 		}
 	}
 
-	if ((conn->flags & CO_FL_ERROR) || fcgi_conn_read0_pending(fconn) ||
+	if ((fconn->flags & FCGI_CF_ERROR) || fcgi_conn_read0_pending(fconn) ||
 	    fconn->state == FCGI_CS_CLOSED || (fconn->flags & FCGI_CF_ABRTS_FAILED) ||
 	    eb_is_empty(&fconn->streams_by_id)) {
 		fcgi_wake_some_streams(fconn, 0);
@@ -3146,8 +3066,7 @@ static int fcgi_process(struct fcgi_conn *fconn)
 	if (!b_data(&fconn->dbuf))
 		fcgi_release_buf(fconn, &fconn->dbuf);
 
-	if ((conn->flags & CO_FL_SOCK_WR_SH) ||
-	    fconn->state == FCGI_CS_CLOSED  || (fconn->flags & FCGI_CF_ABRTS_FAILED) ||
+	if (fconn->state == FCGI_CS_CLOSED  || (fconn->flags & FCGI_CF_ABRTS_FAILED) ||
 	    (!br_data(fconn->mbuf) && ((fconn->flags & FCGI_CF_MUX_BLOCK_ANY) || LIST_ISEMPTY(&fconn->send_list))))
 		fcgi_release_mbuf(fconn);
 
@@ -3620,7 +3539,7 @@ static void fcgi_detach(struct sedesc *sd)
 	/* this stream may be blocked waiting for some data to leave, so orphan
 	 * it in this case.
 	 */
-	if (!(fconn->conn->flags & CO_FL_ERROR) &&
+	if (!(fconn->flags & (FCGI_CF_ERR_PENDING|FCGI_CF_ERROR)) && // FIXME: Be sure for ERR_PENDING
 	    (fconn->state != FCGI_CS_CLOSED) &&
 	    (fstrm->flags & (FCGI_SF_BLK_MBUSY|FCGI_SF_BLK_MROOM)) &&
 	    (fstrm->subs || (fstrm->flags & (FCGI_SF_WANT_SHUTR|FCGI_SF_WANT_SHUTW)))) {
@@ -3636,7 +3555,7 @@ static void fcgi_detach(struct sedesc *sd)
 
 	fcgi_strm_destroy(fstrm);
 
-	if (!(fconn->conn->flags & (CO_FL_ERROR|CO_FL_SOCK_RD_SH|CO_FL_SOCK_WR_SH)) &&
+	if (!(fconn->flags & (FCGI_CF_EOS|FCGI_CF_ERR_PENDING|FCGI_CF_ERROR)) &&
 	    (fconn->flags & FCGI_CF_KEEP_CONN)) {
 		if (fconn->conn->flags & CO_FL_PRIVATE) {
 			/* Add the connection in the session serverlist, if not already done */
@@ -3689,9 +3608,8 @@ static void fcgi_detach(struct sedesc *sd)
 			else if (!fconn->conn->hash_node->node.node.leaf_p &&
 				 fcgi_avail_streams(fconn->conn) > 0 && objt_server(fconn->conn->target) &&
 				 !LIST_INLIST(&fconn->conn->session_list)) {
-				ebmb_insert(&__objt_server(fconn->conn->target)->per_thr[tid].avail_conns,
-				            &fconn->conn->hash_node->node,
-				            sizeof(fconn->conn->hash_node->hash));
+				eb64_insert(&__objt_server(fconn->conn->target)->per_thr[tid].avail_conns,
+				            &fconn->conn->hash_node->node);
 			}
 		}
 	}

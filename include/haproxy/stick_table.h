@@ -43,6 +43,7 @@ struct stksess *stksess_new(struct stktable *t, struct stktable_key *key);
 void stksess_setkey(struct stktable *t, struct stksess *ts, struct stktable_key *key);
 void stksess_free(struct stktable *t, struct stksess *ts);
 int stksess_kill(struct stktable *t, struct stksess *ts, int decrefcount);
+int stktable_get_key_shard(struct stktable *t, const void *key, size_t len);
 
 int stktable_init(struct stktable *t);
 int stktable_parse_type(char **args, int *idx, unsigned long *type, size_t *key_size);
@@ -50,7 +51,8 @@ int parse_stick_table(const char *file, int linenum, char **args,
                       struct stktable *t, char *id, char *nid, struct peers *peers);
 struct stksess *stktable_get_entry(struct stktable *table, struct stktable_key *key);
 struct stksess *stktable_set_entry(struct stktable *table, struct stksess *nts);
-void stktable_touch_with_exp(struct stktable *t, struct stksess *ts, int decrefcount, int expire);
+void stktable_requeue_exp(struct stktable *t, const struct stksess *ts);
+void stktable_touch_with_exp(struct stktable *t, struct stksess *ts, int decrefcount, int expire, int decrefcnt);
 void stktable_touch_remote(struct stktable *t, struct stksess *ts, int decrefcnt);
 void stktable_touch_local(struct stktable *t, struct stksess *ts, int decrefccount);
 struct stksess *stktable_lookup(struct stktable *t, struct stksess *ts);
@@ -198,15 +200,22 @@ static inline int __stksess_kill_if_expired(struct stktable *t, struct stksess *
 
 static inline void stksess_kill_if_expired(struct stktable *t, struct stksess *ts, int decrefcnt)
 {
-	HA_SPIN_LOCK(STK_TABLE_LOCK, &t->lock);
 
-	if (decrefcnt)
-		ts->ref_cnt--;
+	if (t->expire != TICK_ETERNITY && tick_is_expired(ts->expire, now_ms)) {
+		HA_RWLOCK_WRLOCK(STK_TABLE_LOCK, &t->lock);
+		if (decrefcnt)
+			ts->ref_cnt--;
 
-	if (t->expire != TICK_ETERNITY && tick_is_expired(ts->expire, now_ms))
 		__stksess_kill_if_expired(t, ts);
-
-	HA_SPIN_UNLOCK(STK_TABLE_LOCK, &t->lock);
+		HA_RWLOCK_WRUNLOCK(STK_TABLE_LOCK, &t->lock);
+	}
+	else {
+		if (decrefcnt) {
+			HA_RWLOCK_RDLOCK(STK_TABLE_LOCK, &t->lock);
+			HA_ATOMIC_DEC(&ts->ref_cnt);
+			HA_RWLOCK_RDUNLOCK(STK_TABLE_LOCK, &t->lock);
+		}
+	}
 }
 
 /* sets the stick counter's entry pointer */

@@ -2790,12 +2790,14 @@ static int dump_servers_state(struct stconn *sc)
 				     "%s %s %d"
 			             "\n",
 			             px->uuid, HA_ANON_CLI(px->id),
-			             srv->puid, HA_ANON_CLI(srv->id), HA_ANON_CLI(srv_addr),
+			             srv->puid, HA_ANON_CLI(srv->id),
+				     hash_ipanon(appctx->cli_anon_key, srv_addr, 0),
 			             srv->cur_state, srv->cur_admin, srv->uweight, srv->iweight,
 				     (long int)srv_time_since_last_change,
 			             srv->check.status, srv->check.result, srv->check.health,
-				     srv->check.state, srv->agent.state,
-			             bk_f_forced_id, srv_f_forced_id, srv->hostname ? srv->hostname : "-", srv->svc_port,
+				     srv->check.state & 0x0F, srv->agent.state & 0x1F,
+			             bk_f_forced_id, srv_f_forced_id,
+				     srv->hostname ? HA_ANON_CLI(srv->hostname) : "-", srv->svc_port,
 			             srvrecord ? srvrecord : "-", srv->use_ssl, srv->check.port,
 				     srv_check_addr, srv_agent_addr, srv->agent.port);
 		} else {
@@ -2805,7 +2807,7 @@ static int dump_servers_state(struct stconn *sc)
 			chunk_printf(&trash,
 			             "%s/%s %d/%d %s %u - %u %u %u %u %u %u %d %u",
 			             HA_ANON_CLI(px->id), HA_ANON_CLI(srv->id),
-			             px->uuid, srv->puid, HA_ANON_CLI(srv_addr),
+			             px->uuid, srv->puid, hash_ipanon(appctx->cli_anon_key, srv_addr, 0),
 			             srv->svc_port, srv->pool_purge_delay,
 			             srv->curr_used_conns, srv->max_used_conns, srv->est_need_conns,
 			             srv->curr_idle_nb, srv->curr_safe_nb, (int)srv->max_idle_conns, srv->curr_idle_conns);

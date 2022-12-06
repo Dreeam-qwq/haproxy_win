@@ -10,6 +10,7 @@
 
 #include <haproxy/buf-t.h>
 #include <haproxy/connection-t.h>
+#include <haproxy/htx-t.h>
 #include <haproxy/list-t.h>
 #include <haproxy/ncbuf-t.h>
 #include <haproxy/quic_stream-t.h>
@@ -60,8 +61,9 @@ struct qcc {
 
 		uint64_t ms_uni; /* max sub-ID of uni stream allowed for the peer */
 
-		uint64_t msd_bidi_l; /* initial max-stream-data on local streams */
-		uint64_t msd_bidi_r; /* initial max-stream-data on remote streams */
+		uint64_t msd_bidi_l; /* initial max-stream-data on local bidi streams */
+		uint64_t msd_bidi_r; /* initial max-stream-data on remote bidi streams */
+		uint64_t msd_uni_r; /* initial max-stream-data on remote uni streams */
 
 		uint64_t md; /* current max-data allowed for the peer */
 		uint64_t md_init; /* initial max-data */
@@ -72,8 +74,9 @@ struct qcc {
 	/* flow-control fields set by the peer which we must respect. */
 	struct {
 		uint64_t md; /* connection flow control limit updated on MAX_DATA frames reception */
-		uint64_t msd_bidi_l; /* initial max-stream-data for peer local streams */
-		uint64_t msd_bidi_r; /* initial max-stream-data for peer remote streams */
+		uint64_t msd_bidi_l; /* initial max-stream-data from peer on local bidi streams */
+		uint64_t msd_bidi_r; /* initial max-stream-data from peer on remote bidi streams */
+		uint64_t msd_uni_l; /* initial max-stream-data from peer on local uni streams */
 	} rfctl;
 
 	struct {
@@ -94,7 +97,6 @@ struct qcc {
 	struct list send_retry_list; /* list of qcs eligible to send retry */
 
 	struct wait_event wait_event;  /* To be used if we're waiting for I/Os */
-	struct wait_event *subs;
 
 	struct proxy *proxy;
 
@@ -117,6 +119,7 @@ struct qcc {
 #define QC_SF_DEM_FULL          0x00000020  /* demux blocked on request channel buffer full */
 #define QC_SF_READ_ABORTED      0x00000040  /* stream rejected by app layer */
 #define QC_SF_TO_RESET          0x00000080  /* a RESET_STREAM must be sent */
+#define QC_SF_HREQ_RECV         0x00000100  /* a full HTTP request has been received */
 
 /* Maximum size of stream Rx buffer. */
 #define QC_S_RX_BUF_SZ   (global.tune.bufsize - NCB_RESERVED_SZ)
@@ -185,7 +188,7 @@ struct qcc_app_ops {
 	int (*init)(struct qcc *qcc);
 	int (*attach)(struct qcs *qcs, void *conn_ctx);
 	ssize_t (*decode_qcs)(struct qcs *qcs, struct buffer *b, int fin);
-	size_t (*snd_buf)(struct qcs *qcs, struct buffer *buf, size_t count, int flags);
+	size_t (*snd_buf)(struct qcs *qcs, struct htx *htx, size_t count);
 	void (*detach)(struct qcs *qcs);
 	int (*finalize)(void *ctx);
 	void (*shutdown)(void *ctx);                    /* Close a connection. */

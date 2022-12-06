@@ -111,7 +111,7 @@ static inline struct ebmb_node *ebmb_lookup_shorter(struct ebmb_node *start)
 	eb_troot_t *t = start->node.leaf_p;
 	struct ebmb_node *node;
 
-	/* first, chcek for duplicates */
+	/* first, check for duplicates */
 	node = ebmb_next_dup(start);
 	if (node)
 		return node;
@@ -618,6 +618,9 @@ __ebmb_insert_prefix(struct eb_root *root, struct ebmb_node *new, unsigned int l
 	eb_troot_t *new_left, *new_rght;
 	eb_troot_t *new_leaf;
 	int old_node_bit;
+	unsigned int npfx = new->node.pfx;
+	unsigned int npfx1 = npfx << 1;
+	const unsigned char *nkey = new->key;
 
 	side = EB_LEFT;
 	troot = root->b[EB_LEFT];
@@ -631,8 +634,8 @@ __ebmb_insert_prefix(struct eb_root *root, struct ebmb_node *new, unsigned int l
 	}
 
 	len <<= 3;
-	if (len > new->node.pfx)
-		len = new->node.pfx;
+	if (len > npfx)
+		len = npfx;
 
 	/* The tree descent is fairly easy :
 	 *  - first, check if we have reached a leaf node
@@ -677,24 +680,24 @@ __ebmb_insert_prefix(struct eb_root *root, struct ebmb_node *new, unsigned int l
 			/* No need to compare everything if the leaves are shorter than the new one. */
 			if (len > old->node.pfx)
 				len = old->node.pfx;
-			bit = equal_bits(new->key, old->key, bit, len);
+			bit = equal_bits(nkey, old->key, bit, len);
 			break;
 		}
 
 		/* WARNING: for the two blocks below, <bit> is counted in half-bits */
 
-		bit = equal_bits(new->key, old->key, bit, old_node_bit >> 1);
+		bit = equal_bits(nkey, old->key, bit, old_node_bit >> 1);
 		bit = (bit << 1) + 1; // assume comparisons with normal nodes
 
 		/* we must always check that our prefix is larger than the nodes
 		 * we visit, otherwise we have to stop going down. The following
 		 * test is able to stop before both normal and cover nodes.
 		 */
-		if (bit >= (new->node.pfx << 1) && (new->node.pfx << 1) < old_node_bit) {
+		if (bit >= npfx1 && npfx1 < old_node_bit) {
 			/* insert cover node here on the left */
 			new->node.node_p = old->node.node_p;
 			up_ptr = &old->node.node_p;
-			new->node.bit = new->node.pfx << 1;
+			new->node.bit = npfx1;
 			diff = -1;
 			goto insert_above;
 		}
@@ -708,7 +711,7 @@ __ebmb_insert_prefix(struct eb_root *root, struct ebmb_node *new, unsigned int l
 			new->node.node_p = old->node.node_p;
 			up_ptr = &old->node.node_p;
 			new->node.bit = bit;
-			diff = cmp_bits(new->key, old->key, bit >> 1);
+			diff = cmp_bits(nkey, old->key, bit >> 1);
 			goto insert_above;
 		}
 
@@ -718,7 +721,7 @@ __ebmb_insert_prefix(struct eb_root *root, struct ebmb_node *new, unsigned int l
 			 * the left. For that, we go down on the left and the leaf detection
 			 * code will finish the job.
 			 */
-			if ((new->node.pfx << 1) == old_node_bit) {
+			if (npfx1 == old_node_bit) {
 				root = &old->node.branches;
 				side = EB_LEFT;
 				troot = root->b[side];
@@ -744,7 +747,7 @@ __ebmb_insert_prefix(struct eb_root *root, struct ebmb_node *new, unsigned int l
 		root = &old->node.branches;
 		side = old_node_bit & 7;
 		side ^= 7;
-		side = (new->key[old_node_bit >> 3] >> side) & 1;
+		side = (nkey[old_node_bit >> 3] >> side) & 1;
 		troot = root->b[side];
 	}
 
@@ -774,8 +777,8 @@ __ebmb_insert_prefix(struct eb_root *root, struct ebmb_node *new, unsigned int l
 	/* first we want to ensure that we compare the correct bit, which means
 	 * the largest common to both nodes.
 	 */
-	if (bit > new->node.pfx)
-		bit = new->node.pfx;
+	if (bit > npfx)
+		bit = npfx;
 	if (bit > old->node.pfx)
 		bit = old->node.pfx;
 
@@ -786,8 +789,8 @@ __ebmb_insert_prefix(struct eb_root *root, struct ebmb_node *new, unsigned int l
 	 * node insertion.
 	 */
 	diff = 0;
-	if (bit < old->node.pfx && bit < new->node.pfx)
-		diff = cmp_bits(new->key, old->key, bit);
+	if (bit < old->node.pfx && bit < npfx)
+		diff = cmp_bits(nkey, old->key, bit);
 
 	if (diff == 0) {
 		/* Both keys match. Either it's a duplicate entry or we have to
@@ -796,7 +799,7 @@ __ebmb_insert_prefix(struct eb_root *root, struct ebmb_node *new, unsigned int l
 		 * on the right.
 		 */
 		new->node.bit--; /* anticipate cover node insertion */
-		if (new->node.pfx == old->node.pfx) {
+		if (npfx == old->node.pfx) {
 			new->node.bit = -1; /* mark as new dup tree, just in case */
 
 			if (unlikely(eb_gettag(root_right))) {
@@ -815,7 +818,7 @@ __ebmb_insert_prefix(struct eb_root *root, struct ebmb_node *new, unsigned int l
 			/* otherwise fall through to insert first duplicate */
 		}
 		/* otherwise we just rely on the tests below to select the right side */
-		else if (new->node.pfx < old->node.pfx)
+		else if (npfx < old->node.pfx)
 			diff = -1; /* force insertion to left side */
 	}
 

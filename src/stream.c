@@ -437,8 +437,17 @@ struct stream *stream_new(struct session *sess, struct stconn *sc, struct buffer
 	s->req_cap = NULL;
 	s->res_cap = NULL;
 
-	/* Initialise all the variables contexts even if not used.
+	/* Initialize all the variables contexts even if not used.
 	 * This permits to prune these contexts without errors.
+	 *
+	 * We need to make sure that those lists are not re-initialized
+	 * by stream-dependant underlying code because we could lose
+	 * track of already defined variables, leading to data inconsistency
+	 * and memory leaks...
+	 *
+	 * For reference: we had a very old bug caused by vars_txn and
+	 * vars_reqres being accidentally re-initialized in http_create_txn()
+	 * (https://github.com/haproxy/haproxy/issues/1935)
 	 */
 	vars_init_head(&s->vars_txn,    SCOPE_TXN);
 	vars_init_head(&s->vars_reqres, SCOPE_REQ);
@@ -568,9 +577,9 @@ struct stream *stream_new(struct session *sess, struct stconn *sc, struct buffer
  out_fail_accept:
 	flt_stream_release(s, 0);
 	LIST_DELETE(&s->list);
- out_fail_attach_scf:
-	sc_free(s->scb);
  out_fail_alloc_scb:
+	sc_free(s->scb);
+ out_fail_attach_scf:
 	task_destroy(t);
  out_fail_alloc:
 	pool_free(pool_head_stream, s);
@@ -1411,7 +1420,7 @@ static int process_store_rules(struct stream *s, struct channel *rep, int an_bit
 		struct dict_entry *de;
 		struct stktable *t = s->store[i].table;
 
-		if (objt_server(s->target) && __objt_server(s->target)->flags & SRV_F_NON_STICK) {
+		if (!objt_server(s->target) || (__objt_server(s->target)->flags & SRV_F_NON_STICK)) {
 			stksess_free(s->store[i].table, s->store[i].ts);
 			s->store[i].ts = NULL;
 			continue;
@@ -1424,24 +1433,25 @@ static int process_store_rules(struct stream *s, struct channel *rep, int an_bit
 		}
 		s->store[i].ts = NULL;
 
-		HA_RWLOCK_WRLOCK(STK_SESS_LOCK, &ts->lock);
-		ptr = __stktable_data_ptr(t, ts, STKTABLE_DT_SERVER_ID);
-		stktable_data_cast(ptr, std_t_sint) = __objt_server(s->target)->puid;
-		HA_RWLOCK_WRUNLOCK(STK_SESS_LOCK, &ts->lock);
-
 		if (t->server_key_type == STKTABLE_SRV_NAME)
 			key = __objt_server(s->target)->id;
 		else if (t->server_key_type == STKTABLE_SRV_ADDR)
 			key = __objt_server(s->target)->addr_node.key;
 		else
-			continue;
+			key = NULL;
 
 		HA_RWLOCK_WRLOCK(STK_SESS_LOCK, &ts->lock);
-		de = dict_insert(&server_key_dict, key);
-		if (de) {
-			ptr = __stktable_data_ptr(t, ts, STKTABLE_DT_SERVER_KEY);
-			stktable_data_cast(ptr, std_t_dict) = de;
+		ptr = __stktable_data_ptr(t, ts, STKTABLE_DT_SERVER_ID);
+		stktable_data_cast(ptr, std_t_sint) = __objt_server(s->target)->puid;
+
+		if (key) {
+			de = dict_insert(&server_key_dict, key);
+			if (de) {
+				ptr = __stktable_data_ptr(t, ts, STKTABLE_DT_SERVER_KEY);
+				stktable_data_cast(ptr, std_t_dict) = de;
+			}
 		}
+
 		HA_RWLOCK_WRUNLOCK(STK_SESS_LOCK, &ts->lock);
 
 		stktable_touch_local(t, ts, 1);
@@ -3238,7 +3248,7 @@ static int stats_dump_full_strm_to_buffer(struct stconn *sc, struct stream *strm
 	case 0: /* main status of the stream */
 		ctx->uid = strm->uniq_id;
 		ctx->section = 1;
-		/* fall through */
+		__fallthrough;
 
 	case 1:
 		get_localtime(strm->logs.accept_date.tv_sec, &tm);
@@ -3255,7 +3265,7 @@ static int stats_dump_full_strm_to_buffer(struct stconn *sc, struct stream *strm
 		case AF_INET:
 		case AF_INET6:
 			chunk_appendf(&trash, " source=%s:%d\n",
-			              pn, get_host_port(conn->src));
+			              HA_ANON_CLI(pn), get_host_port(conn->src));
 			break;
 		case AF_UNIX:
 			chunk_appendf(&trash, " source=unix:%d\n", strm_li(strm)->luid);

@@ -26,7 +26,6 @@
 
 #include <net/if.h>
 
-#include <haproxy/activity.h>
 #include <haproxy/api.h>
 #include <haproxy/applet.h>
 #include <haproxy/base64.h>
@@ -85,11 +84,7 @@ static struct cli_kw_list cli_keywords = {
 extern const char *stat_status_codes[];
 
 struct proxy *mworker_proxy; /* CLI proxy of the master */
-
-/* CLI context for the "show activity" command */
-struct show_activity_ctx {
-	int thr;         /* thread ID to show or -1 for all */
-};
+struct bind_conf *mcli_reload_bind_conf;
 
 /* CLI context for the "show env" command */
 struct show_env_ctx {
@@ -169,10 +164,17 @@ static char *cli_gen_usage_msg(struct appctx *appctx, char * const *args)
 	chunk_reset(tmp);
 	if (ishelp) // this is the help message.
 		chunk_strcat(tmp, "The following commands are valid at this level:\n");
-	else if (!length && (!args || !*args || !**args)) // no match
-		chunk_strcat(tmp, "Unknown command. Please enter one of the following commands only:\n");
-	else // partial match
-		chunk_strcat(tmp, "Unknown command, but maybe one of the following ones is a better match:\n");
+	else {
+		chunk_strcat(tmp, "Unknown command: '");
+		if (args && *args)
+			chunk_strcat(tmp, *args);
+		chunk_strcat(tmp, "'");
+
+		if (!length && (!args || !*args || !**args)) // no match
+			chunk_strcat(tmp, ". Please enter one of the following commands only:\n");
+		else // partial match
+			chunk_strcat(tmp, ", but maybe one of the following ones is a better match:\n");
+	}
 
 	for (idx = 0; idx < CLI_MAX_MATCHES; idx++) {
 		matches[idx].kw = NULL;
@@ -1040,7 +1042,9 @@ static void cli_io_handler(struct appctx *appctx)
 			case CLI_ST_PRINT:       /* print const message in msg */
 			case CLI_ST_PRINT_ERR:   /* print const error in msg */
 			case CLI_ST_PRINT_DYN:   /* print dyn message in msg, free */
-			case CLI_ST_PRINT_FREE:  /* print dyn error in err, free */
+			case CLI_ST_PRINT_DYNERR: /* print dyn error in err, free */
+			case CLI_ST_PRINT_UMSG:  /* print usermsgs_ctx and reset it */
+			case CLI_ST_PRINT_UMSGERR: /* print usermsgs_ctx as error and reset it */
 				/* the message is in the svcctx */
 				ctx = applet_reserve_svcctx(appctx, sizeof(*ctx));
 				if (appctx->st0 == CLI_ST_PRINT || appctx->st0 == CLI_ST_PRINT_ERR) {
@@ -1048,8 +1052,8 @@ static void cli_io_handler(struct appctx *appctx)
 						LOG_ERR : ctx->severity;
 					msg = ctx->msg;
 				}
-				else if (appctx->st0 == CLI_ST_PRINT_DYN || appctx->st0 == CLI_ST_PRINT_FREE) {
-					sev = appctx->st0 == CLI_ST_PRINT_FREE ?
+				else if (appctx->st0 == CLI_ST_PRINT_DYN || appctx->st0 == CLI_ST_PRINT_DYNERR) {
+					sev = appctx->st0 == CLI_ST_PRINT_DYNERR ?
 						LOG_ERR : ctx->severity;
 					msg = ctx->err;
 					if (!msg) {
@@ -1057,15 +1061,25 @@ static void cli_io_handler(struct appctx *appctx)
 						msg = "Out of memory.\n";
 					}
 				}
+				else if (appctx->st0 == CLI_ST_PRINT_UMSG ||
+				         appctx->st0 == CLI_ST_PRINT_UMSGERR) {
+					sev = appctx->st0 == CLI_ST_PRINT_UMSGERR ?
+					        LOG_ERR : ctx->severity;
+					msg = usermsgs_str();
+				}
 				else {
 					sev = LOG_ERR;
 					msg = "Internal error.\n";
 				}
 
 				if (cli_output_msg(res, msg, sev, cli_get_severity_output(appctx)) != -1) {
-					if (appctx->st0 == CLI_ST_PRINT_FREE ||
-					    appctx->st0 == CLI_ST_PRINT_DYN) {
+					if (appctx->st0 == CLI_ST_PRINT_DYN ||
+					    appctx->st0 == CLI_ST_PRINT_DYNERR) {
 						ha_free(&ctx->err);
+					}
+					else if (appctx->st0 == CLI_ST_PRINT_UMSG ||
+					         appctx->st0 == CLI_ST_PRINT_UMSGERR) {
+						usermsgs_clr(NULL);
 					}
 					appctx->st0 = CLI_ST_PROMPT;
 				}
@@ -1192,10 +1206,13 @@ static void cli_release_handler(struct appctx *appctx)
 		appctx->io_release(appctx);
 		appctx->io_release = NULL;
 	}
-	else if (appctx->st0 == CLI_ST_PRINT_FREE || appctx->st0 == CLI_ST_PRINT_DYN) {
+	else if (appctx->st0 == CLI_ST_PRINT_DYN || appctx->st0 == CLI_ST_PRINT_DYNERR) {
 		struct cli_print_ctx *ctx = applet_reserve_svcctx(appctx, sizeof(*ctx));
 
 		ha_free(&ctx->err);
+	}
+	else if (appctx->st0 == CLI_ST_PRINT_UMSG || appctx->st0 == CLI_ST_PRINT_UMSGERR) {
+		usermsgs_clr(NULL);
 	}
 }
 
@@ -1435,121 +1452,6 @@ static int cli_io_handler_show_fd(struct appctx *appctx)
 	return ret;
 }
 
-/* This function dumps some activity counters used by developers and support to
- * rule out some hypothesis during bug reports. It returns 0 if the output
- * buffer is full and it needs to be called again, otherwise non-zero. It dumps
- * everything at once in the buffer and is not designed to do it in multiple
- * passes.
- */
-static int cli_io_handler_show_activity(struct appctx *appctx)
-{
-	struct stconn *sc = appctx_sc(appctx);
-	struct show_activity_ctx *actctx = appctx->svcctx;
-	int tgt = actctx->thr; // target thread, -1 for all, 0 for total only
-	int thr;
-
-	if (unlikely(sc_ic(sc)->flags & (CF_WRITE_ERROR|CF_SHUTW)))
-		return 1;
-
-	chunk_reset(&trash);
-
-#undef SHOW_TOT
-#define SHOW_TOT(t, x)							\
-	do {								\
-		unsigned int _v[MAX_THREADS];				\
-		unsigned int _tot;					\
-		const unsigned int _nbt = global.nbthread;		\
-		_tot = t = 0;						\
-		do {							\
-			_tot += _v[t] = (x);				\
-		} while (++t < _nbt);					\
-		if (_nbt == 1) {					\
-			chunk_appendf(&trash, " %u\n", _tot);		\
-			break;						\
-		}							\
-		if (tgt == -1) {					\
-			chunk_appendf(&trash, " %u [", _tot);		\
-			for (t = 0; t < _nbt; t++)			\
-				chunk_appendf(&trash, " %u", _v[t]);	\
-			chunk_appendf(&trash, " ]\n");			\
-		} else if (tgt == 0)					\
-				chunk_appendf(&trash, " %u\n", _tot);	\
-			else						\
-				chunk_appendf(&trash, " %u\n", _v[tgt-1]);\
-	} while (0)
-
-#undef SHOW_AVG
-#define SHOW_AVG(t, x)							\
-	do {								\
-		unsigned int _v[MAX_THREADS];				\
-		unsigned int _tot;					\
-		const unsigned int _nbt = global.nbthread;		\
-		_tot = t = 0;						\
-		do {							\
-			_tot += _v[t] = (x);				\
-		} while (++t < _nbt);					\
-		if (_nbt == 1) {					\
-			chunk_appendf(&trash, " %u\n", _tot);		\
-			break;						\
-		}							\
-		if (tgt == -1) {					\
-			chunk_appendf(&trash, " %u [", (_tot + _nbt/2) / _nbt); \
-			for (t = 0; t < _nbt; t++)			\
-				chunk_appendf(&trash, " %u", _v[t]);	\
-			chunk_appendf(&trash, " ]\n");			\
-		} else if (tgt == 0)					\
-				chunk_appendf(&trash, " %u\n", (_tot + _nbt/2) / _nbt);	\
-			else						\
-				chunk_appendf(&trash, " %u\n", _v[tgt-1]);\
-	} while (0)
-
-	chunk_appendf(&trash, "thread_id: %u (%u..%u)\n", tid + 1, 1, global.nbthread);
-	chunk_appendf(&trash, "date_now: %lu.%06lu\n", (long)now.tv_sec, (long)now.tv_usec);
-	chunk_appendf(&trash, "ctxsw:");        SHOW_TOT(thr, activity[thr].ctxsw);
-	chunk_appendf(&trash, "tasksw:");       SHOW_TOT(thr, activity[thr].tasksw);
-	chunk_appendf(&trash, "empty_rq:");     SHOW_TOT(thr, activity[thr].empty_rq);
-	chunk_appendf(&trash, "long_rq:");      SHOW_TOT(thr, activity[thr].long_rq);
-	chunk_appendf(&trash, "loops:");        SHOW_TOT(thr, activity[thr].loops);
-	chunk_appendf(&trash, "wake_tasks:");   SHOW_TOT(thr, activity[thr].wake_tasks);
-	chunk_appendf(&trash, "wake_signal:");  SHOW_TOT(thr, activity[thr].wake_signal);
-	chunk_appendf(&trash, "poll_io:");      SHOW_TOT(thr, activity[thr].poll_io);
-	chunk_appendf(&trash, "poll_exp:");     SHOW_TOT(thr, activity[thr].poll_exp);
-	chunk_appendf(&trash, "poll_drop_fd:"); SHOW_TOT(thr, activity[thr].poll_drop_fd);
-	chunk_appendf(&trash, "poll_skip_fd:"); SHOW_TOT(thr, activity[thr].poll_skip_fd);
-	chunk_appendf(&trash, "conn_dead:");    SHOW_TOT(thr, activity[thr].conn_dead);
-	chunk_appendf(&trash, "stream_calls:"); SHOW_TOT(thr, activity[thr].stream_calls);
-	chunk_appendf(&trash, "pool_fail:");    SHOW_TOT(thr, activity[thr].pool_fail);
-	chunk_appendf(&trash, "buf_wait:");     SHOW_TOT(thr, activity[thr].buf_wait);
-	chunk_appendf(&trash, "cpust_ms_tot:"); SHOW_TOT(thr, activity[thr].cpust_total / 2);
-	chunk_appendf(&trash, "cpust_ms_1s:");  SHOW_TOT(thr, read_freq_ctr(&activity[thr].cpust_1s) / 2);
-	chunk_appendf(&trash, "cpust_ms_15s:"); SHOW_TOT(thr, read_freq_ctr_period(&activity[thr].cpust_15s, 15000) / 2);
-	chunk_appendf(&trash, "avg_loop_us:");  SHOW_AVG(thr, swrate_avg(activity[thr].avg_loop_us, TIME_STATS_SAMPLES));
-	chunk_appendf(&trash, "accepted:");     SHOW_TOT(thr, activity[thr].accepted);
-	chunk_appendf(&trash, "accq_pushed:");  SHOW_TOT(thr, activity[thr].accq_pushed);
-	chunk_appendf(&trash, "accq_full:");    SHOW_TOT(thr, activity[thr].accq_full);
-#ifdef USE_THREAD
-	chunk_appendf(&trash, "accq_ring:");    SHOW_TOT(thr, (accept_queue_rings[thr].tail - accept_queue_rings[thr].head + ACCEPT_QUEUE_SIZE) % ACCEPT_QUEUE_SIZE);
-	chunk_appendf(&trash, "fd_takeover:");  SHOW_TOT(thr, activity[thr].fd_takeover);
-#endif
-
-#if defined(DEBUG_DEV)
-	/* keep these ones at the end */
-	chunk_appendf(&trash, "ctr0:");         SHOW_TOT(thr, activity[thr].ctr0);
-	chunk_appendf(&trash, "ctr1:");         SHOW_TOT(thr, activity[thr].ctr1);
-	chunk_appendf(&trash, "ctr2:");         SHOW_TOT(thr, activity[thr].ctr2);
-#endif
-
-	if (applet_putchk(appctx, &trash) == -1) {
-		chunk_reset(&trash);
-		chunk_printf(&trash, "[output too large, cannot dump]\n");
-	}
-
-#undef SHOW_AVG
-#undef SHOW_TOT
-	/* dump complete */
-	return 1;
-}
-
 /*
  * CLI IO handler for `show cli sockets`.
  * Uses the svcctx as a show_sock_ctx to store/retrieve the bind_conf and the
@@ -1628,28 +1530,6 @@ static int cli_io_handler_show_cli_sock(struct appctx *appctx)
 	return 0;
 }
 
-
-/* parse a "show activity" CLI request. Returns 0 if it needs to continue, 1 if it
- * wants to stop here. It sets a show_activity_ctx context where, if a specific
- * thread is requested, it puts the thread number into ->thr otherwise sets it to
- * -1.
- */
-static int cli_parse_show_activity(char **args, char *payload, struct appctx *appctx, void *private)
-{
-	struct show_activity_ctx *ctx = applet_reserve_svcctx(appctx, sizeof(*ctx));
-
-	if (!cli_has_level(appctx, ACCESS_LVL_OPER))
-		return 1;
-
-	ctx->thr = -1; // show all by default
-	if (*args[2])
-		ctx->thr = atoi(args[2]);
-
-	if (ctx->thr < -1 || ctx->thr > global.nbthread)
-		return cli_err(appctx, "Thread ID number must be between -1 and nbthread\n");
-
-	return 0;
-}
 
 /* parse a "show env" CLI request. Returns 0 if it needs to continue, 1 if it
  * wants to stop here. It reserves a sohw_env_ctx where it puts the variable to
@@ -1881,28 +1761,24 @@ static int cli_parse_set_anon(char **args, char *payload, struct appctx *appctx,
 	long long key;
 
 	if (strcmp(args[2], "on") == 0) {
-		if (appctx->cli_anon_key != 0)
-			return cli_err(appctx, "Mode already enabled\n");
+
+		if (*args[3]) {
+			key = atoll(args[3]);
+			if (key < 1 || key > UINT_MAX)
+				return cli_err(appctx, "Value out of range (1 to 4294967295 expected).\n");
+			appctx->cli_anon_key = key;
+		}
 		else {
-			if (*args[3]) {
-				key = atoll(args[3]);
-				if (key < 1 || key > UINT_MAX)
-					return cli_err(appctx, "Value out of range (1 to 4294967295 expected).\n");
-				appctx->cli_anon_key = key;
-			}
-			else {
-				tmp = HA_ATOMIC_LOAD(&global.anon_key);
-				if (tmp != 0)
-					appctx->cli_anon_key = tmp;
-				else
-					appctx->cli_anon_key = ha_random32();
-			}
+			tmp = HA_ATOMIC_LOAD(&global.anon_key);
+			if (tmp != 0)
+				appctx->cli_anon_key = tmp;
+			else
+				appctx->cli_anon_key = ha_random32();
 		}
 	}
 	else if (strcmp(args[2], "off") == 0) {
-		if (appctx->cli_anon_key == 0)
-			return cli_err(appctx, "Mode already disabled\n");
-		else if (*args[3]) {
+
+		if (*args[3]) {
 			return cli_err(appctx, "Key can't be added while disabling anonymized mode\n");
 		}
 		else {
@@ -2681,6 +2557,13 @@ int pcli_wait_for_request(struct stream *s, struct channel *req, int an_bit)
 	if ((s->pcli_flags & ACCESS_LVL_MASK) == ACCESS_LVL_NONE)
 		s->pcli_flags |= strm_li(s)->bind_conf->level & ACCESS_LVL_MASK;
 
+	/* stream that comes from the reload listener only responses the reload
+	 * status and quits */
+	if (!(s->pcli_flags & PCLI_F_RELOAD)
+	    && strm_li(s)->bind_conf == mcli_reload_bind_conf)
+		goto send_status;
+
+
 read_again:
 	/* if the channel is closed for read, we won't receive any more data
 	   from the client, but we don't want to forward this close to the
@@ -2752,6 +2635,13 @@ read_again:
 send_help:
 	b_reset(&req->buf);
 	b_putblk(&req->buf, "help\n", 5);
+	goto read_again;
+
+send_status:
+	s->pcli_flags |= PCLI_F_RELOAD;
+	/* dont' use ci_putblk here because SHUTW could have been sent */
+	b_reset(&req->buf);
+	b_putblk(&req->buf, "_loadstatus;quit\n", 17);
 	goto read_again;
 
 missing_data:
@@ -3076,7 +2966,7 @@ error_proxy:
 /*
  * Create a new listener for the master CLI proxy
  */
-int mworker_cli_proxy_new_listener(char *line)
+struct bind_conf *mworker_cli_proxy_new_listener(char *line)
 {
 	struct bind_conf *bind_conf;
 	struct listener *l;
@@ -3165,13 +3055,13 @@ int mworker_cli_proxy_new_listener(char *line)
 	}
 	global.maxsock += mworker_proxy->maxconn;
 
-	return 0;
+	return bind_conf;
 
 err:
 	ha_alert("%s\n", err);
 	free(err);
 	free(bind_conf);
-	return -1;
+	return NULL;
 
 }
 
@@ -3267,7 +3157,7 @@ static struct cli_kw_list cli_kws = {{ },{
 	{ { "experimental-mode", NULL },         NULL,                                                                                                cli_parse_expert_experimental_mode, NULL, NULL, NULL, ACCESS_MASTER }, // not listed
 	{ { "mcli-debug-mode", NULL },         NULL,                                                                                                  cli_parse_expert_experimental_mode, NULL, NULL, NULL, ACCESS_MASTER_ONLY }, // not listed
 	{ { "set", "anon", NULL },               "set anon <setting> [value]              : change the anonymized mode setting",                      cli_parse_set_anon, NULL, NULL },
-	{ { "set", "global-key", NULL },         "set global-key <value>                  : change the global anonymizing key",                       cli_parse_set_global_key, NULL, NULL },
+	{ { "set", "anon", "global-key", NULL }, "set anon global-key <value>             : change the global anonymizing key",                       cli_parse_set_global_key, NULL, NULL },
 	{ { "set", "maxconn", "global",  NULL }, "set maxconn global <value>              : change the per-process maxconn setting",                  cli_parse_set_maxconn_global, NULL },
 	{ { "set", "rate-limit", NULL },         "set rate-limit <setting> <value>        : change a rate limiting value",                            cli_parse_set_ratelimit, NULL },
 	{ { "set", "severity-output",  NULL },   "set severity-output [none|number|string]: set presence of severity level in feedback information",  cli_parse_set_severity_output, NULL, NULL },
@@ -3277,7 +3167,6 @@ static struct cli_kw_list cli_kws = {{ },{
 	{ { "show", "cli", "sockets",  NULL },   "show cli sockets                        : dump list of cli sockets",                                cli_parse_default, cli_io_handler_show_cli_sock, NULL, NULL, ACCESS_MASTER },
 	{ { "show", "cli", "level", NULL },      "show cli level                          : display the level of the current CLI session",            cli_parse_show_lvl, NULL, NULL, NULL, ACCESS_MASTER},
 	{ { "show", "fd", NULL },                "show fd [num]                           : dump list of file descriptors in use or a specific one",  cli_parse_show_fd, cli_io_handler_show_fd, NULL },
-	{ { "show", "activity", NULL },          "show activity [-1|0|thread_num]         : show per-thread activity stats (for support/developers)", cli_parse_show_activity, cli_io_handler_show_activity, NULL },
 	{ { "show", "version", NULL },           "show version                            : show version of the current process",                     cli_parse_show_version, NULL, NULL, NULL, ACCESS_MASTER },
 	{ { "operator", NULL },                  "operator                                : lower the level of the current CLI session to operator",  cli_parse_set_lvl, NULL, NULL, NULL, ACCESS_MASTER},
 	{ { "user", NULL },                      "user                                    : lower the level of the current CLI session to user",      cli_parse_set_lvl, NULL, NULL, NULL, ACCESS_MASTER},

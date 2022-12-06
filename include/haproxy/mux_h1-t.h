@@ -37,28 +37,21 @@
 #define H1C_F_IN_ALLOC       0x00000010 /* mux is blocked on lack of input buffer */
 #define H1C_F_IN_FULL        0x00000020 /* mux is blocked on input buffer full */
 #define H1C_F_IN_SALLOC      0x00000040 /* mux is blocked on lack of stream's request buffer */
+/* 0x00000080 unused */
 
-/* Flags indicating the connection state */
-#define H1C_F_ST_EMBRYONIC   0x00000100 /* Set when a H1 stream with no stream connector is attached to the connection */
-#define H1C_F_ST_ATTACHED    0x00000200 /* Set when a H1 stream with a stream connector is attached to the connection (may be not READY) */
-#define H1C_F_ST_IDLE        0x00000400 /* connection is idle and may be reused
-					 * (exclusive to all H1C_F_ST flags and never set when an h1s is attached) */
-#define H1C_F_ST_ERROR       0x00000800 /* connection must be closed ASAP because an error occurred (stream connector may still be attached) */
-#define H1C_F_ST_SHUTDOWN    0x00001000 /* connection must be shut down ASAP flushing output first (stream connector may still be attached) */
-#define H1C_F_ST_READY       0x00002000 /* Set in ATTACHED state with a READY stream connector. A stream connector is not ready when
-					 * a TCP>H1 upgrade is in progress Thus this flag is only set if ATTACHED is also set */
-#define H1C_F_ST_ALIVE       (H1C_F_ST_IDLE|H1C_F_ST_EMBRYONIC|H1C_F_ST_ATTACHED)
-#define H1C_F_ST_SILENT_SHUT 0x00004000 /* silent (or dirty) shutdown must be performed (implied ST_SHUTDOWN) */
-/* 0x00008000 unused */
+#define H1C_F_EOS            0x00000100 /* End-of-stream seen on the H1 connection (read0 detected) */
+#define H1C_F_ERR_PENDING    0x00000200 /* A write error was detected (block sends but not reads) */
+#define H1C_F_ERROR          0x00000400 /* A read error was detected (handled has an abort) */
+#define H1C_F_SILENT_SHUT    0x00000800 /* if H1C is closed closed, silent (or dirty) shutdown must be performed */
+#define H1C_F_ABRT_PENDING   0x00001000 /* An error must be sent (previous attempt failed) and H1 connection must be closed ASAP */
+#define H1C_F_ABRTED         0x00002000 /* An error must be sent (previous attempt failed) and H1 connection must be closed ASAP */
+#define H1C_F_WANT_SPLICE    0x00004000 /* Don't read into a buffer because we want to use or we are using splicing */
+#define H1C_F_WAIT_NEXT_REQ  0x00008000 /*  waiting for the next request to start, use keep-alive timeout */
+#define H1C_F_UPG_H2C        0x00010000 /* set if an upgrade to h2 should be done */
+#define H1C_F_CO_MSG_MORE    0x00020000 /* set if CO_SFL_MSG_MORE must be set when calling xprt->snd_buf() */
+#define H1C_F_CO_STREAMER    0x00040000 /* set if CO_SFL_STREAMER must be set when calling xprt->snd_buf() */
 
-#define H1C_F_WANT_SPLICE    0x00010000 /* Don't read into a buffer because we want to use or we are using splicing */
-#define H1C_F_ERR_PENDING    0x00020000 /* Send an error and close the connection ASAP (implies H1C_F_ST_ERROR) */
-#define H1C_F_WAIT_NEXT_REQ  0x00040000 /*  waiting for the next request to start, use keep-alive timeout */
-#define H1C_F_UPG_H2C        0x00080000 /* set if an upgrade to h2 should be done */
-#define H1C_F_CO_MSG_MORE    0x00100000 /* set if CO_SFL_MSG_MORE must be set when calling xprt->snd_buf() */
-#define H1C_F_CO_STREAMER    0x00200000 /* set if CO_SFL_STREAMER must be set when calling xprt->snd_buf() */
-
-/* 0x00400000 - 0x40000000 unusued*/
+/* 0x00040000 - 0x40000000 unused */
 #define H1C_F_IS_BACK        0x80000000 /* Set on outgoing connection */
 
 
@@ -74,11 +67,10 @@ static forceinline char *h1c_show_flags(char *buf, size_t len, const char *delim
 	/* flags */
 	_(H1C_F_OUT_ALLOC, _(H1C_F_OUT_FULL,
 	_(H1C_F_IN_ALLOC, _(H1C_F_IN_FULL, _(H1C_F_IN_SALLOC,
-	_(H1C_F_ST_EMBRYONIC, _(H1C_F_ST_ATTACHED, _(H1C_F_ST_IDLE,
-	_(H1C_F_ST_ERROR, _(H1C_F_ST_SHUTDOWN, _(H1C_F_ST_READY,
-	_(H1C_F_ST_SILENT_SHUT, _(H1C_F_WANT_SPLICE, _(H1C_F_ERR_PENDING,
-	_(H1C_F_WAIT_NEXT_REQ, _(H1C_F_UPG_H2C, _(H1C_F_CO_MSG_MORE,
-	_(H1C_F_CO_STREAMER, _(H1C_F_IS_BACK)))))))))))))))))));
+	_(H1C_F_EOS, _(H1C_F_ERR_PENDING, _(H1C_F_ERROR,
+	_(H1C_F_SILENT_SHUT, _(H1C_F_ABRT_PENDING, _(H1C_F_ABRTED,
+	_(H1C_F_WANT_SPLICE, _(H1C_F_WAIT_NEXT_REQ, _(H1C_F_UPG_H2C, _(H1C_F_CO_MSG_MORE,
+	_(H1C_F_CO_STREAMER, _(H1C_F_IS_BACK)))))))))))))))));
 	/* epilogue */
 	_(~0U);
 	return buf;
@@ -93,7 +85,7 @@ static forceinline char *h1c_show_flags(char *buf, size_t len, const char *delim
 #define H1S_F_TX_BLK         0x00200000 /* Don't process more output data, waiting sync with input side */
 #define H1S_F_RX_CONGESTED   0x00000004 /* Cannot process input data RX path is congested (waiting for more space in channel's buffer) */
 
-#define H1S_F_REOS           0x00000008 /* End of input stream seen even if not delivered yet */
+/* 0x00000008 unused */
 #define H1S_F_WANT_KAL       0x00000010
 #define H1S_F_WANT_TUN       0x00000020
 #define H1S_F_WANT_CLO       0x00000040
@@ -101,14 +93,15 @@ static forceinline char *h1c_show_flags(char *buf, size_t len, const char *delim
 #define H1S_F_NOT_FIRST      0x00000080 /* The H1 stream is not the first one */
 #define H1S_F_BODYLESS_RESP  0x00000100 /* Bodyless response message */
 
-/* 0x00000200 unused */
+#define H1S_F_INTERNAL_ERROR 0x00000200 /* Set when an internal error occurred during the message parsing */
 #define H1S_F_NOT_IMPL_ERROR 0x00000400 /* Set when a feature is not implemented during the message parsing */
 #define H1S_F_PARSING_ERROR  0x00000800 /* Set when an error occurred during the message parsing */
 #define H1S_F_PROCESSING_ERROR 0x00001000 /* Set when an error occurred during the message xfer */
-#define H1S_F_ERROR          0x00001800 /* stream error mask */
+#define H1S_F_ERROR_MASK     0x00003800 /* stream error mask */
 
 #define H1S_F_HAVE_SRV_NAME  0x00002000 /* Set during output process if the server name header was added to the request */
 #define H1S_F_HAVE_O_CONN    0x00004000 /* Set during output process to know connection mode was processed */
+#define H1S_F_HAVE_WS_KEY    0x00008000 /* Set during output process to know WS key was found or generated */
 
 /* This function is used to report flags in debugging tools. Please reflect
  * below any single-bit flag addition above in the same order via the
@@ -121,14 +114,42 @@ static forceinline char *h1s_show_flags(char *buf, size_t len, const char *delim
 	_(0);
 	/* flags */
 	_(H1S_F_RX_BLK, _(H1S_F_TX_BLK, _(H1S_F_RX_CONGESTED,
-	_(H1S_F_REOS, _(H1S_F_WANT_KAL, _(H1S_F_WANT_TUN, _(H1S_F_WANT_CLO,
+	_(H1S_F_WANT_KAL, _(H1S_F_WANT_TUN, _(H1S_F_WANT_CLO,
 	_(H1S_F_NOT_FIRST, _(H1S_F_BODYLESS_RESP,
-	_(H1S_F_NOT_IMPL_ERROR, _(H1S_F_PARSING_ERROR, _(H1S_F_PROCESSING_ERROR,
-	_(H1S_F_HAVE_SRV_NAME, _(H1S_F_HAVE_O_CONN))))))))))))));
+	_(H1S_F_INTERNAL_ERROR, _(H1S_F_NOT_IMPL_ERROR, _(H1S_F_PARSING_ERROR, _(H1S_F_PROCESSING_ERROR,
+	_(H1S_F_HAVE_SRV_NAME, _(H1S_F_HAVE_O_CONN, _(H1S_F_HAVE_WS_KEY)))))))))))))));
 	/* epilogue */
 	_(~0U);
 	return buf;
 #undef _
+}
+
+/* H1 connection state, in h1c->state */
+enum h1_cs {
+	H1_CS_IDLE,        /* IDLE connection. A freashly open or a reusable connection (H1S is NULL) */
+	H1_CS_EMBRYONIC,   /* Connection is waiting for the message headers (H1S is not NULL, not attached to a SC - Frontend connection only) */
+	H1_CS_UPGRADING,   /* TCP>H1 upgrade in-progress (H1S is not NULL and attached to a SC - Frontend connection only) */
+	H1_CS_RUNNING,     /* Connection fully established and the H1S is processing data (H1S is not NULL and attached to a SC) */
+	H1_CS_CLOSING,     /* Send pending outgoing data and close the connection ASAP  (H1S may be NULL) */
+	H1_CS_CLOSED,      /* Connection must be closed now and H1C must be released (H1S is NULL) */
+	H1_CS_ENTRIES,
+} __attribute__((packed));
+
+
+/**** tiny state decoding functions for debug helpers ****/
+
+/* returns a h1c state as an abbreviated 3-letter string, or "???" if unknown */
+static inline const char *h1c_st_to_str(enum h1_cs st)
+{
+	switch (st) {
+	case H1_CS_IDLE:      return "IDL";
+	case H1_CS_EMBRYONIC: return "EMB";
+	case H1_CS_UPGRADING: return "UPG";
+	case H1_CS_RUNNING:   return "RUN";
+	case H1_CS_CLOSING:   return "CLI";
+	case H1_CS_CLOSED:    return "CLD";
+	default:              return "???";
+	}
 }
 
 

@@ -286,11 +286,11 @@ static inline int resolv_resolution_timeout(struct resolv_resolution *res)
 static void resolv_update_resolvers_timeout(struct resolvers *resolvers)
 {
 	struct resolv_resolution *res;
-	int next;
+	int next = TICK_ETERNITY;
 
-	next = tick_add(now_ms, resolvers->timeout.resolve);
 	if (!LIST_ISEMPTY(&resolvers->resolutions.curr)) {
 		res  = LIST_NEXT(&resolvers->resolutions.curr, struct resolv_resolution *, list);
+		next = tick_add(now_ms, resolvers->timeout.resolve);
 		next = MIN(next, tick_add(res->last_query, resolvers->timeout.retry));
 	}
 
@@ -460,8 +460,17 @@ void resolv_trigger_resolution(struct resolv_requester *req)
 	 * valid */
 	exp = tick_add(res->last_resolution, resolvers->hold.valid);
 	if (resolvers->t && (res->status != RSLV_STATUS_VALID ||
-	    !tick_isset(res->last_resolution) || tick_is_expired(exp, now_ms)))
+	    !tick_isset(res->last_resolution) || tick_is_expired(exp, now_ms))) {
+		/* If the resolution is not running and the requester is a
+		 * server, reset the resolution timer to force a quick
+		 * resolution.
+		 */
+		if (res->step == RSLV_STEP_NONE &&
+		    (obj_type(req->owner) == OBJ_TYPE_SERVER ||
+		     obj_type(req->owner) == OBJ_TYPE_SRVRQ))
+			res->last_resolution = TICK_ETERNITY;
 		task_wakeup(resolvers->t, TASK_WOKEN_OTHER);
+	}
 
 	leave_resolver_code();
 }
@@ -594,6 +603,11 @@ static void enter_resolver_code()
 /* Add a resolution to the death_row. */
 static void abort_resolution(struct resolv_resolution *res)
 {
+	/* Remove the resolution from query_ids tree and from any resolvers list */
+	eb32_delete(&res->qid);
+	res->query_id = 0;
+	res->qid.key   = 0;
+
 	LIST_DEL_INIT(&res->list);
 	LIST_APPEND(&death_row, &res->list);
 }
@@ -805,6 +819,9 @@ srv_found:
 				srv->flags &= ~SRV_F_NO_RESOLUTION;
 				srv->srvrq_check->expire = TICK_ETERNITY;
 
+				srv->svc_port = item->port;
+				srv->flags   &= ~SRV_F_MAPPORTS;
+
 				/* Check if an Additional Record is associated to this SRV record.
 				 * Perform some sanity checks too to ensure the record can be used.
 				 * If all fine, we simply pick up the IP address found and associate
@@ -858,9 +875,6 @@ srv_found:
 
 				/* Update the server status */
 				srvrq_update_srv_status(srv, (srv->addr.ss_family != AF_INET && srv->addr.ss_family != AF_INET6));
-
-				srv->svc_port = item->port;
-				srv->flags   &= ~SRV_F_MAPPORTS;
 
 				if (!srv->resolv_opts.ignore_weight) {
 					char weight[9];

@@ -5,106 +5,20 @@
 #include <haproxy/api.h>
 #include <haproxy/connection.h>
 #include <haproxy/dynbuf.h>
-#include <haproxy/htx.h>
 #include <haproxy/list.h>
 #include <haproxy/ncbuf.h>
 #include <haproxy/pool.h>
+#include <haproxy/qmux_http.h>
+#include <haproxy/qmux_trace.h>
+#include <haproxy/quic_conn.h>
 #include <haproxy/quic_stream.h>
 #include <haproxy/quic_tp-t.h>
 #include <haproxy/ssl_sock-t.h>
 #include <haproxy/stconn.h>
 #include <haproxy/trace.h>
-#include <haproxy/xprt_quic.h>
 
 DECLARE_POOL(pool_head_qcc, "qcc", sizeof(struct qcc));
 DECLARE_POOL(pool_head_qcs, "qcs", sizeof(struct qcs));
-
-/* trace source and events */
-static void qmux_trace(enum trace_level level, uint64_t mask,
-                       const struct trace_source *src,
-                       const struct ist where, const struct ist func,
-                       const void *a1, const void *a2, const void *a3, const void *a4);
-
-static const struct trace_event qmux_trace_events[] = {
-#define           QMUX_EV_QCC_NEW       (1ULL << 0)
-	{ .mask = QMUX_EV_QCC_NEW ,     .name = "qcc_new",     .desc = "new QUIC connection" },
-#define           QMUX_EV_QCC_RECV      (1ULL << 1)
-	{ .mask = QMUX_EV_QCC_RECV,     .name = "qcc_recv",     .desc = "Rx on QUIC connection" },
-#define           QMUX_EV_QCC_SEND      (1ULL << 2)
-	{ .mask = QMUX_EV_QCC_SEND,     .name = "qcc_send",     .desc = "Tx on QUIC connection" },
-#define           QMUX_EV_QCC_WAKE      (1ULL << 3)
-	{ .mask = QMUX_EV_QCC_WAKE,     .name = "qcc_wake",     .desc = "QUIC connection woken up" },
-#define           QMUX_EV_QCC_END       (1ULL << 4)
-	{ .mask = QMUX_EV_QCC_END,      .name = "qcc_end",      .desc = "QUIC connection terminated" },
-#define           QMUX_EV_QCC_NQCS      (1ULL << 5)
-	{ .mask = QMUX_EV_QCC_NQCS,     .name = "qcc_no_qcs",   .desc = "QUIC stream not found" },
-#define           QMUX_EV_QCS_NEW       (1ULL << 6)
-	{ .mask = QMUX_EV_QCS_NEW,      .name = "qcs_new",      .desc = "new QUIC stream" },
-#define           QMUX_EV_QCS_RECV      (1ULL << 7)
-	{ .mask = QMUX_EV_QCS_RECV,     .name = "qcs_recv",     .desc = "Rx on QUIC stream" },
-#define           QMUX_EV_QCS_SEND      (1ULL << 8)
-	{ .mask = QMUX_EV_QCS_SEND,     .name = "qcs_send",     .desc = "Tx on QUIC stream" },
-#define           QMUX_EV_QCS_END       (1ULL << 9)
-	{ .mask = QMUX_EV_QCS_END,      .name = "qcs_end",      .desc = "QUIC stream terminated" },
-#define           QMUX_EV_STRM_RECV     (1ULL << 10)
-	{ .mask = QMUX_EV_STRM_RECV,    .name = "strm_recv",    .desc = "receiving data for stream" },
-#define           QMUX_EV_STRM_SEND     (1ULL << 11)
-	{ .mask = QMUX_EV_STRM_SEND,    .name = "strm_send",    .desc = "sending data for stream" },
-#define           QMUX_EV_STRM_END      (1ULL << 12)
-	{ .mask = QMUX_EV_STRM_END,     .name = "strm_end",     .desc = "detaching app-layer stream" },
-#define           QMUX_EV_SEND_FRM      (1ULL << 13)
-	{ .mask = QMUX_EV_SEND_FRM,     .name = "send_frm",     .desc = "sending QUIC frame" },
-/* special event dedicated to qcs_xfer_data */
-#define           QMUX_EV_QCS_XFER_DATA  (1ULL << 14)
-	{ .mask = QMUX_EV_QCS_XFER_DATA,  .name = "qcs_xfer_data", .desc = "qcs_xfer_data" },
-/* special event dedicated to qcs_build_stream_frm */
-#define           QMUX_EV_QCS_BUILD_STRM (1ULL << 15)
-	{ .mask = QMUX_EV_QCS_BUILD_STRM, .name = "qcs_build_stream_frm", .desc = "qcs_build_stream_frm" },
-#define           QMUX_EV_PROTO_ERR     (1ULL << 16)
-	{ .mask = QMUX_EV_PROTO_ERR,    .name = "proto_err",    .desc = "protocol error" },
-	{ }
-};
-
-/* custom arg for QMUX_EV_QCS_XFER_DATA */
-struct qcs_xfer_data_trace_arg {
-	size_t prep;
-	int xfer;
-};
-/* custom arg for QMUX_EV_QCS_BUILD_STRM */
-struct qcs_build_stream_trace_arg {
-	size_t len;
-	char fin;
-	uint64_t offset;
-};
-
-static const struct name_desc qmux_trace_lockon_args[4] = {
-	/* arg1 */ { /* already used by the connection */ },
-	/* arg2 */ { .name="qcs", .desc="QUIC stream" },
-	/* arg3 */ { },
-	/* arg4 */ { }
-};
-
-static const struct name_desc qmux_trace_decoding[] = {
-#define QMUX_VERB_CLEAN    1
-	{ .name="clean",    .desc="only user-friendly stuff, generally suitable for level \"user\"" },
-#define QMUX_VERB_MINIMAL  2
-	{ .name="minimal",  .desc="report only qcc/qcs state and flags, no real decoding" },
-	{ /* end */ }
-};
-
-struct trace_source trace_qmux = {
-	.name = IST("qmux"),
-	.desc = "QUIC multiplexer",
-	.arg_def = TRC_ARG1_CONN,  /* TRACE()'s first argument is always a connection */
-	.default_cb = qmux_trace,
-	.known_events = qmux_trace_events,
-	.lockon_args = qmux_trace_lockon_args,
-	.decoding = qmux_trace_decoding,
-	.report_events = ~0,  /* report everything by default */
-};
-
-#define TRACE_SOURCE    &trace_qmux
-INITCALL1(STG_REGISTER, trace_register_source, TRACE_SOURCE);
 
 /* Emit a CONNECTION_CLOSE with error <err>. This will interrupt all future
  * send/receive operations.
@@ -171,17 +85,25 @@ static struct qcs *qcs_new(struct qcc *qcc, uint64_t id, enum qcs_type type)
 	qcc->strms[type].nb_streams++;
 
 	/* If stream is local, use peer remote-limit, or else the opposite. */
-	/* TODO use uni limit for unidirectional streams */
-	qcs->tx.msd = quic_stream_is_local(qcc, id) ? qcc->rfctl.msd_bidi_r :
-	                                              qcc->rfctl.msd_bidi_l;
+	if (quic_stream_is_bidi(id)) {
+		qcs->tx.msd = quic_stream_is_local(qcc, id) ? qcc->rfctl.msd_bidi_r :
+		                                              qcc->rfctl.msd_bidi_l;
+	}
+	else if (quic_stream_is_local(qcc, id)) {
+		qcs->tx.msd = qcc->rfctl.msd_uni_l;
+	}
 
 	qcs->rx.ncbuf = NCBUF_NULL;
 	qcs->rx.app_buf = BUF_NULL;
 	qcs->rx.offset = qcs->rx.offset_max = 0;
 
-	/* TODO use uni limit for unidirectional streams */
-	qcs->rx.msd = quic_stream_is_local(qcc, id) ? qcc->lfctl.msd_bidi_l :
-	                                              qcc->lfctl.msd_bidi_r;
+	if (quic_stream_is_bidi(id)) {
+		qcs->rx.msd = quic_stream_is_local(qcc, id) ? qcc->lfctl.msd_bidi_l :
+		                                              qcc->lfctl.msd_bidi_r;
+	}
+	else if (quic_stream_is_remote(qcc, id)) {
+		qcs->rx.msd = qcc->lfctl.msd_uni_r;
+	}
 	qcs->rx.msd_init = qcs->rx.msd;
 
 	qcs->tx.buf = BUF_NULL;
@@ -414,7 +336,9 @@ static void qcs_close_local(struct qcs *qcs)
 
 	if (quic_stream_is_bidi(qcs->id)) {
 		qcs->st = (qcs->st == QC_SS_HREM) ? QC_SS_CLO : QC_SS_HLOC;
-		qcc_rm_hreq(qcs->qcc);
+
+		if (qcs->flags & QC_SF_HREQ_RECV)
+			qcc_rm_hreq(qcs->qcc);
 	}
 	else {
 		/* Only local uni streams are valid for this operation. */
@@ -1151,6 +1075,27 @@ int qcc_recv_stop_sending(struct qcc *qcc, uint64_t id, uint64_t err)
 		goto out;
 
 	TRACE_PROTO("receiving STOP_SENDING", QMUX_EV_QCC_RECV|QMUX_EV_QCS_RECV, qcc->conn, qcs);
+
+	/* RFC 9000 3.5. Solicited State Transitions
+	 *
+	 * An endpoint is expected to send another STOP_SENDING frame if a
+	 * packet containing a previous STOP_SENDING is lost.  However, once
+	 * either all stream data or a RESET_STREAM frame has been received for
+	 * the stream -- that is, the stream is in any state other than "Recv"
+	 * or "Size Known" -- sending a STOP_SENDING frame is unnecessary.
+	 */
+
+	/* TODO thanks to previous RFC clause, STOP_SENDING is ignored if current stream
+	 * has already been closed locally. This is useful to not emit multiple
+	 * RESET_STREAM for a single stream. This is functional if stream is
+	 * locally closed due to all data transmitted, but in this case the RFC
+	 * advices to use an explicit RESET_STREAM.
+	 */
+	if (qcs_is_close_local(qcs)) {
+		TRACE_STATE("ignoring STOP_SENDING", QMUX_EV_QCC_RECV|QMUX_EV_QCS_RECV, qcc->conn, qcs);
+		goto out;
+	}
+
 	qcs_idle_open(qcs);
 
 	/* RFC 9000 3.5. Solicited State Transitions
@@ -1434,7 +1379,8 @@ void qcc_streams_sent_done(struct qcs *qcs, uint64_t data, uint64_t offset)
 		}
 	}
 
-	if (qcs->tx.offset == qcs->tx.sent_offset && qcs_stream_fin(qcs)) {
+	if (qcs->tx.offset == qcs->tx.sent_offset && !b_data(&qcs->tx.buf) &&
+	     qcs->flags & (QC_SF_FIN_STREAM|QC_SF_DETACH)) {
 		/* Close stream locally. */
 		qcs_close_local(qcs);
 		/* Reset flag to not emit multiple FIN STREAM frames. */
@@ -1461,7 +1407,8 @@ static int qc_send_frames(struct qcc *qcc, struct list *frms)
 
 	LIST_INIT(&qcc->send_retry_list);
 
-	qc_send_mux(qcc->conn->handle.qc, frms);
+	if (!qc_send_mux(qcc->conn->handle.qc, frms))
+		goto err;
 
 	/* If there is frames left at this stage, transport layer is blocked.
 	 * Subscribe on it to retry later.
@@ -1968,6 +1915,12 @@ static int qc_init(struct connection *conn, struct proxy *prx,
 	qcc->flags = 0;
 
 	qcc->app_ops = NULL;
+	if (qcc_install_app_ops(qcc, conn->handle.qc->app_ops)) {
+		TRACE_PROTO("Cannot install app layer", QMUX_EV_QCC_NEW, qcc->conn);
+		/* prepare a CONNECTION_CLOSE frame */
+		quic_set_connection_close(conn->handle.qc, quic_err_transport(QC_ERR_APPLICATION_ERROR));
+		goto fail_no_tasklet;
+	}
 
 	qcc->streams_by_id = EB_ROOT_UNIQUE;
 
@@ -2004,6 +1957,7 @@ static int qc_init(struct connection *conn, struct proxy *prx,
 	qcc->lfctl.ms_uni = lparams->initial_max_streams_uni;
 	qcc->lfctl.msd_bidi_l = lparams->initial_max_stream_data_bidi_local;
 	qcc->lfctl.msd_bidi_r = lparams->initial_max_stream_data_bidi_remote;
+	qcc->lfctl.msd_uni_r = lparams->initial_max_stream_data_uni;
 	qcc->lfctl.cl_bidi_r = 0;
 
 	qcc->lfctl.md = qcc->lfctl.md_init = lparams->initial_max_data;
@@ -2013,6 +1967,7 @@ static int qc_init(struct connection *conn, struct proxy *prx,
 	qcc->rfctl.md = rparams->initial_max_data;
 	qcc->rfctl.msd_bidi_l = rparams->initial_max_stream_data_bidi_local;
 	qcc->rfctl.msd_bidi_r = rparams->initial_max_stream_data_bidi_remote;
+	qcc->rfctl.msd_uni_l = rparams->initial_max_stream_data_uni;
 
 	if (conn_is_back(conn)) {
 		qcc->next_bidi_l    = 0x00;
@@ -2035,7 +1990,6 @@ static int qc_init(struct connection *conn, struct proxy *prx,
 
 	LIST_INIT(&qcc->send_retry_list);
 
-	qcc->subs = NULL;
 	qcc->wait_event.tasklet->process = qc_io_cb;
 	qcc->wait_event.tasklet->context = qcc;
 	qcc->wait_event.events = 0;
@@ -2075,6 +2029,8 @@ static int qc_init(struct connection *conn, struct proxy *prx,
  fail_no_timeout_task:
 	tasklet_free(qcc->wait_event.tasklet);
  fail_no_tasklet:
+	if (qcc->app_ops && qcc->app_ops->release)
+		qcc->app_ops->release(qcc->ctx);
 	pool_free(pool_head_qcc, qcc);
  fail_no_qcc:
 	TRACE_LEAVE(QMUX_EV_QCC_NEW);
@@ -2141,53 +2097,17 @@ static void qc_detach(struct sedesc *sd)
 }
 
 /* Called from the upper layer, to receive data */
-static size_t qc_rcv_buf(struct stconn *sc, struct buffer *buf,
-                         size_t count, int flags)
+static size_t qc_recv_buf(struct stconn *sc, struct buffer *buf,
+                          size_t count, int flags)
 {
 	struct qcs *qcs = __sc_mux_strm(sc);
-	struct htx *qcs_htx = NULL;
-	struct htx *cs_htx = NULL;
 	size_t ret = 0;
 	char fin = 0;
 
 	TRACE_ENTER(QMUX_EV_STRM_RECV, qcs->qcc->conn, qcs);
 
-	qcs_htx = htx_from_buf(&qcs->rx.app_buf);
-	if (htx_is_empty(qcs_htx)) {
-		/* Set buffer data to 0 as HTX is empty. */
-		htx_to_buf(qcs_htx, &qcs->rx.app_buf);
-		goto end;
-	}
+	ret = qcs_http_rcv_buf(qcs, buf, count, &fin);
 
-	ret = qcs_htx->data;
-
-	cs_htx = htx_from_buf(buf);
-	if (htx_is_empty(cs_htx) && htx_used_space(qcs_htx) <= count) {
-		/* EOM will be copied to cs_htx via b_xfer(). */
-		if (qcs_htx->flags & HTX_FL_EOM)
-			fin = 1;
-
-		htx_to_buf(cs_htx, buf);
-		htx_to_buf(qcs_htx, &qcs->rx.app_buf);
-		b_xfer(buf, &qcs->rx.app_buf, b_data(&qcs->rx.app_buf));
-		goto end;
-	}
-
-	htx_xfer_blks(cs_htx, qcs_htx, count, HTX_BLK_UNUSED);
-	BUG_ON(qcs_htx->flags & HTX_FL_PARSING_ERROR);
-
-	/* Copy EOM from src to dst buffer if all data copied. */
-	if (htx_is_empty(qcs_htx) && (qcs_htx->flags & HTX_FL_EOM)) {
-		cs_htx->flags |= HTX_FL_EOM;
-		fin = 1;
-	}
-
-	cs_htx->extra = qcs_htx->extra ? (qcs_htx->data + qcs_htx->extra) : 0;
-	htx_to_buf(cs_htx, buf);
-	htx_to_buf(qcs_htx, &qcs->rx.app_buf);
-	ret -= qcs_htx->data;
-
- end:
 	if (b_data(&qcs->rx.app_buf)) {
 		se_fl_set(qcs->sd, SE_FL_RCV_MORE | SE_FL_WANT_ROOM);
 	}
@@ -2216,20 +2136,31 @@ static size_t qc_rcv_buf(struct stconn *sc, struct buffer *buf,
 	return ret;
 }
 
-static size_t qc_snd_buf(struct stconn *sc, struct buffer *buf,
-                         size_t count, int flags)
+static size_t qc_send_buf(struct stconn *sc, struct buffer *buf,
+                          size_t count, int flags)
 {
 	struct qcs *qcs = __sc_mux_strm(sc);
 	size_t ret;
+	char fin;
 
 	TRACE_ENTER(QMUX_EV_STRM_SEND, qcs->qcc->conn, qcs);
 
+	/* stream layer has been detached so no transfer must occur after. */
+	BUG_ON_HOT(qcs->flags & QC_SF_DETACH);
+
 	if (qcs_is_close_local(qcs) || (qcs->flags & QC_SF_TO_RESET)) {
-		ret = count;
+		ret = qcs_http_reset_buf(qcs, buf, count);
 		goto end;
 	}
 
-	ret = qcs->qcc->app_ops->snd_buf(qcs, buf, count, flags);
+	ret = qcs_http_snd_buf(qcs, buf, count, &fin);
+	if (fin)
+		qcs->flags |= QC_SF_FIN_STREAM;
+
+	if (ret) {
+		if (!(qcs->qcc->wait_event.events & SUB_RETRY_SEND))
+			tasklet_wakeup(qcs->qcc->wait_event.tasklet);
+	}
 
  end:
 	TRACE_LEAVE(QMUX_EV_STRM_SEND, qcs->qcc->conn, qcs);
@@ -2335,18 +2266,6 @@ static int qc_wake(struct connection *conn)
 }
 
 
-static char *qcs_st_to_str(enum qcs_state st)
-{
-	switch (st) {
-	case QC_SS_IDLE: return "IDL";
-	case QC_SS_OPEN: return "OPN";
-	case QC_SS_HLOC: return "HCL";
-	case QC_SS_HREM: return "HCR";
-	case QC_SS_CLO:  return "CLO";
-	default:         return "???";
-	}
-}
-
 /* for debugging with CLI's "show sess" command. May emit multiple lines, each
  * new one being prefixed with <pfx>, if <pfx> is not NULL, otherwise a single
  * line is used. Each field starts with a space so it's safe to print it after
@@ -2374,76 +2293,12 @@ static int qc_show_sd(struct buffer *msg, struct sedesc *sd, const char *pfx)
 }
 
 
-static void qmux_trace_frm(const struct quic_frame *frm)
-{
-	switch (frm->type) {
-	case QUIC_FT_MAX_STREAMS_BIDI:
-		chunk_appendf(&trace_buf, " max_streams=%llu",
-		              (ull)frm->max_streams_bidi.max_streams);
-		break;
-
-	case QUIC_FT_MAX_STREAMS_UNI:
-		chunk_appendf(&trace_buf, " max_streams=%llu",
-		              (ull)frm->max_streams_uni.max_streams);
-		break;
-
-	default:
-		break;
-	}
-}
-
-/* quic-mux trace handler */
-static void qmux_trace(enum trace_level level, uint64_t mask,
-                       const struct trace_source *src,
-                       const struct ist where, const struct ist func,
-                       const void *a1, const void *a2, const void *a3, const void *a4)
-{
-	const struct connection *conn = a1;
-	const struct qcc *qcc   = conn ? conn->ctx : NULL;
-	const struct qcs *qcs   = a2;
-
-	if (!qcc)
-		return;
-
-	if (src->verbosity > QMUX_VERB_CLEAN) {
-		chunk_appendf(&trace_buf, " : qcc=%p(F)", qcc);
-		if (qcc->conn->handle.qc)
-			chunk_appendf(&trace_buf, " qc=%p", qcc->conn->handle.qc);
-
-		if (qcs)
-			chunk_appendf(&trace_buf, " qcs=%p .id=%llu .st=%s",
-			              qcs, (ull)qcs->id,
-			              qcs_st_to_str(qcs->st));
-
-		if (mask & QMUX_EV_QCC_NQCS) {
-			const uint64_t *id = a3;
-			chunk_appendf(&trace_buf, " id=%llu", (ull)*id);
-		}
-
-		if (mask & QMUX_EV_SEND_FRM)
-			qmux_trace_frm(a3);
-
-		if (mask & QMUX_EV_QCS_XFER_DATA) {
-			const struct qcs_xfer_data_trace_arg *arg = a3;
-			chunk_appendf(&trace_buf, " prep=%llu xfer=%d",
-			              (ull)arg->prep, arg->xfer);
-		}
-
-		if (mask & QMUX_EV_QCS_BUILD_STRM) {
-			const struct qcs_build_stream_trace_arg *arg = a3;
-			chunk_appendf(&trace_buf, " len=%llu fin=%d offset=%llu",
-			              (ull)arg->len, arg->fin, (ull)arg->offset);
-		}
-	}
-}
-
-
 static const struct mux_ops qc_ops = {
 	.init = qc_init,
 	.destroy = qc_destroy,
 	.detach = qc_detach,
-	.rcv_buf = qc_rcv_buf,
-	.snd_buf = qc_snd_buf,
+	.rcv_buf = qc_recv_buf,
+	.snd_buf = qc_send_buf,
 	.subscribe = qc_subscribe,
 	.unsubscribe = qc_unsubscribe,
 	.wake = qc_wake,

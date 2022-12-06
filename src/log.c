@@ -627,7 +627,7 @@ int parse_logformat_string(const char *fmt, struct proxy *curproxy, struct list 
 					cformat = LF_SEPARATOR;
 					break;
 				}
-				/* fall through */
+				__fallthrough;
 			default : cformat = LF_TEXT;      break;
 			}
 		}
@@ -1184,17 +1184,21 @@ char *lf_text_len(char *dst, const char *src, size_t len, size_t size, const str
 	}
 
 	if (src && len) {
-		if (++len > size)
-			len = size;
+		/* escape_string and strlcpy2 will both try to add terminating NULL-byte
+		 * to dst, so we need to make sure that extra byte will fit into dst
+		 * before calling them
+		 */
 		if (node->options & LOG_OPT_ESC) {
 			char *ret;
 
-			ret = escape_string(dst, dst + len, '\\', rfc5424_escape_map, src);
+			ret = escape_string(dst, (dst + size - 1), '\\', rfc5424_escape_map, src, src + len);
 			if (ret == NULL || *ret != '\0')
 				return NULL;
 			len = ret - dst;
 		}
 		else {
+			if (++len > size)
+				len = size;
 			len = strlcpy2(dst, src, len);
 		}
 
@@ -1205,6 +1209,7 @@ char *lf_text_len(char *dst, const char *src, size_t len, size_t size, const str
 		if (size < 2)
 			return NULL;
 		*(dst++) = '-';
+		size -= 1;
 	}
 
 	if (node->options & LOG_OPT_QUOTE) {
@@ -1378,7 +1383,7 @@ struct ist *build_log_header(enum log_fmt format, int level, int facility,
 		case LOG_FORMAT_PRIO:
 			fac_level = facility << 3;
 			/* further format ignore the facility */
-			/* fall through */
+			__fallthrough;
 		case LOG_FORMAT_TIMED:
 		case LOG_FORMAT_SHORT:
 			fac_level += level;
@@ -1471,7 +1476,7 @@ struct ist *build_log_header(enum log_fmt format, int level, int facility,
 				break;
 			}
 			/* let continue as 'timed' and 'iso' format for usual timestamp */
-			/* fall through */
+			__fallthrough;
 		case LOG_FORMAT_TIMED:
 		case LOG_FORMAT_ISO:
 			/* ISO format ex: '1900:01:01T12:00:00.123456Z'
@@ -1545,7 +1550,7 @@ struct ist *build_log_header(enum log_fmt format, int level, int facility,
 			}
 			else /* the caller MUST fill the hostname, this field is mandatory */
 				hdr_ctx.ist_vector[(*nbelem)++] = ist2("localhost ", 10);
-			/* fall through */
+			__fallthrough;
 		case LOG_FORMAT_LOCAL:
 			if (!metadata || !metadata[LOG_META_TAG].len)
 				break;
@@ -1679,7 +1684,7 @@ static inline void __do_send_log(struct logsrv *logsrv, int nblogger, int level,
 		msg = ist2(message, size);
 		msg = isttrim(msg, logsrv->maxlen);
 
-		sent = sink_write(logsrv->sink, &msg, 1, level, logsrv->facility, metadata);
+		sent = sink_write(logsrv->sink, &msg, 1, level, facility, metadata);
 	}
 	else if (logsrv->addr.ss_family == AF_CUST_EXISTING_FD) {
 		struct ist msg;
@@ -3229,6 +3234,7 @@ void parse_log_message(char *buf, size_t buflen, int *level, int *facility,
 		 */
 
 		p += 2;
+		*size -= 2;
 		/* timestamp is NILVALUE '-' */
 		if (*size > 2 && (p[0] == '-') && p[1] == ' ') {
 			metadata[LOG_META_TIME] = ist2(p, 1);
@@ -3621,7 +3627,7 @@ static void syslog_io_handler(struct appctx *appctx)
 			if (buf->area[to_skip - 1] != ' ')
 				goto parse_error;
 
-			msglen = strtol(trash.area, &p, 10);
+			msglen = strtol(buf->area, &p, 10);
 			if (!msglen || p != &buf->area[to_skip - 1])
 				goto parse_error;
 

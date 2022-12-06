@@ -41,12 +41,10 @@
 
 
 static struct proxy *httpclient_proxy;
-static struct server *httpclient_srv_raw;
 
 #ifdef USE_OPENSSL
 /* if the httpclient is not configured, error are ignored and features are limited */
 static int hard_error_ssl = 0;
-static struct server *httpclient_srv_ssl;
 static int httpclient_ssl_verify = SSL_SOCK_VERIFY_REQUIRED;
 static char *httpclient_ssl_ca_file = NULL;
 #endif
@@ -423,6 +421,16 @@ int httpclient_req_xfer(struct httpclient *hc, struct ist src, int end)
 
 	/* if we copied all the data and the end flag is set */
 	if ((istlen(src) == ret) && end) {
+		/* no more data are expected. If the HTX buffer is empty, be
+		 * sure to add something (EOT block in this case) to have
+		 * something to send. It is important to be sure the EOM flags
+		 * will be handled by the endpoint. Because the message is
+		 * empty, this should not fail. Otherwise it is an error
+		 */
+		if (htx_is_empty(htx)) {
+			if (!htx_add_endof(htx, HTX_BLK_EOT))
+				goto error;
+		}
 		htx->flags |= HTX_FL_EOM;
 	}
 	htx_to_buf(htx, &hc->req.buf);
@@ -468,10 +476,10 @@ int httpclient_set_dst(struct httpclient *hc, const char *dst)
 }
 
 /*
- * Return a split URL in <scheme>, <host>, <port>
+ * Split <url> in <scheme>, <host>, <port>
  */
-static void httpclient_spliturl(struct ist url, enum http_scheme *scheme,
-                                struct ist *host, int *port)
+static int httpclient_spliturl(struct ist url, enum http_scheme *scheme,
+                               struct ist *host, int *port)
 {
 	enum http_scheme scheme_tmp = SCH_HTTP;
 	int port_tmp = 0;
@@ -481,6 +489,9 @@ static void httpclient_spliturl(struct ist url, enum http_scheme *scheme,
 
 	parser = http_uri_parser_init(url);
 	scheme_ist = http_parse_scheme(&parser);
+	if (!isttest(scheme_ist)) {
+		return 0;
+	}
 
 	if (isteqi(scheme_ist, ist("http://"))){
 		scheme_tmp = SCH_HTTP;
@@ -491,6 +502,9 @@ static void httpclient_spliturl(struct ist url, enum http_scheme *scheme,
 	}
 
 	authority_ist = http_parse_authority(&parser, 1);
+	if (!isttest(authority_ist)) {
+		return 0;
+	}
 	p = end = istend(authority_ist);
 
 	/* look for a port at the end of the authority */
@@ -513,6 +527,7 @@ static void httpclient_spliturl(struct ist url, enum http_scheme *scheme,
 	if (port)
 		*port = port_tmp;
 
+	return 1;
 }
 
 /*
@@ -691,6 +706,11 @@ static void httpclient_applet_io_handler(struct appctx *appctx)
 	uint32_t hdr_num;
 	uint32_t sz;
 	int ret;
+
+	/* The IO handler could be called after the release, so we need to
+	 * check if hc is still there to run the IO handler */
+	if (!hc)
+		return;
 
 	while (1) {
 
@@ -998,7 +1018,8 @@ static int httpclient_applet_init(struct appctx *appctx)
 
 
 	/* parse the URL and  */
-	httpclient_spliturl(hc->req.url, &scheme, &host, &port);
+	if (!httpclient_spliturl(hc->req.url, &scheme, &host, &port))
+		goto out_error;
 
 	if (hc->dst) {
 		/* if httpclient_set_dst() was used, sets the alternative address */
@@ -1098,6 +1119,10 @@ static void httpclient_applet_release(struct appctx *appctx)
 	if (hc->flags & HTTPCLIENT_FA_AUTOKILL) {
 		httpclient_destroy(hc);
 	}
+
+	/* be sure not to use this ptr anymore if the IO handler is called a
+	 * last time */
+	appctx->svcctx = NULL;
 
 	return;
 }
@@ -1249,11 +1274,8 @@ struct proxy *httpclient_create_proxy(const char *id)
 	/* if the verify is required, try to load the system CA */
 	if (httpclient_ssl_verify == SSL_SOCK_VERIFY_REQUIRED) {
 
-		if (!httpclient_ssl_ca_file)
-			httpclient_ssl_ca_file = strdup("@system-ca");
-
-		srv_ssl->ssl_ctx.ca_file = httpclient_ssl_ca_file;
-		if (!ssl_store_load_locations_file(srv_ssl->ssl_ctx.ca_file, 1, CAFILE_CERT)) {
+		srv_ssl->ssl_ctx.ca_file = strdup(httpclient_ssl_ca_file ? httpclient_ssl_ca_file : "@system-ca");
+		if (!__ssl_store_load_locations_file(srv_ssl->ssl_ctx.ca_file, 1, CAFILE_CERT, !hard_error_ssl)) {
 			/* if we failed to load the ca-file, only quits in
 			 * error with hard_error, otherwise just disable the
 			 * feature. */
@@ -1314,31 +1336,11 @@ err:
  */
 static int httpclient_precheck()
 {
-	struct server *srv;
-
 	/* initialize the default httpclient_proxy which is used for the CLI and the lua */
 
 	httpclient_proxy = httpclient_create_proxy("<HTTPCLIENT>");
 	if (!httpclient_proxy)
 		return 1;
-
-	/* store the ptr of the 2 servers */
-	for (srv = httpclient_proxy->srv; srv != NULL; srv = srv->next) {
-		if (srv->xprt == xprt_get(XPRT_RAW)) {
-			httpclient_srv_raw = srv;
-#ifdef USE_OPENSSL
-		} else if (srv->xprt == xprt_get(XPRT_SSL)) {
-			httpclient_srv_ssl = srv;
-#endif
-		}
-	}
-
-	if (!httpclient_srv_raw)
-		return 1;
-#ifdef USE_OPENSSL
-	if (!httpclient_srv_ssl)
-		return 1;
-#endif
 
 	return 0;
 }
@@ -1400,7 +1402,7 @@ static int httpclient_postcheck()
 				srv_ssl = srv;
 			}
 		}
-		if (srv_ssl) {
+		if (srv_ssl && !srv_ssl->sni_expr) {
 			/* init the SNI expression */
 			/* always use the host header as SNI, without the port */
 			srv_ssl->sni_expr = strdup("req.hdr(host),field(1,:)");

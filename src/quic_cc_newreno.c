@@ -20,9 +20,12 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
  */
 
+#include <haproxy/api-t.h>
+#include <haproxy/buf.h>
+#include <haproxy/chunk.h>
 #include <haproxy/quic_cc.h>
+#include <haproxy/quic_conn-t.h>
 #include <haproxy/trace.h>
-#include <haproxy/xprt_quic.h>
 
 #define TRACE_SOURCE    &trace_quic
 

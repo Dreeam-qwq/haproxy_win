@@ -24,6 +24,8 @@
 #include <netinet/udp.h>
 #include <netinet/in.h>
 
+#include <import/ebtree-t.h>
+
 #include <haproxy/api.h>
 #include <haproxy/arg.h>
 #include <haproxy/cbuf.h>
@@ -40,11 +42,12 @@
 #include <haproxy/proto_quic.h>
 #include <haproxy/proto_udp.h>
 #include <haproxy/proxy-t.h>
-#include <haproxy/sock.h>
+#include <haproxy/quic_conn.h>
 #include <haproxy/quic_sock.h>
+#include <haproxy/sock.h>
 #include <haproxy/sock_inet.h>
+#include <haproxy/task.h>
 #include <haproxy/tools.h>
-#include <haproxy/xprt_quic.h>
 
 /* per-thread quic datagram handlers */
 struct quic_dghdlr *quic_dghdlrs;
@@ -93,7 +96,7 @@ struct protocol proto_quic4 = {
 	.rx_disable     = sock_disable,
 	.rx_unbind      = sock_unbind,
 	.rx_listening   = quic_sock_accepting_conn,
-	.default_iocb   = quic_sock_fd_iocb,
+	.default_iocb   = quic_lstnr_sock_fd_iocb,
 	.receivers      = LIST_HEAD_INIT(proto_quic4.receivers),
 	.nb_receivers   = 0,
 };
@@ -133,7 +136,7 @@ struct protocol proto_quic6 = {
 	.rx_disable     = sock_disable,
 	.rx_unbind      = sock_unbind,
 	.rx_listening   = quic_sock_accepting_conn,
-	.default_iocb   = quic_sock_fd_iocb,
+	.default_iocb   = quic_lstnr_sock_fd_iocb,
 	.receivers      = LIST_HEAD_INIT(proto_quic6.receivers),
 	.nb_receivers   = 0,
 };
@@ -364,7 +367,7 @@ int quic_connect_server(struct connection *conn, int flags)
 			switch (src->opts & CO_SRC_TPROXY_MASK) {
 			case CO_SRC_TPROXY_CLI:
 				conn_set_private(conn);
-				/* fall through */
+				__fallthrough;
 			case CO_SRC_TPROXY_ADDR:
 				flags = 3;
 				break;
@@ -529,74 +532,20 @@ static void quic_add_listener(struct protocol *proto, struct listener *listener)
 	default_add_listener(proto, listener);
 }
 
-/* Allocate the TX ring buffers for <l> listener.
- * Return 1 if succeeded, 0 if not.
- */
-static int quic_alloc_tx_rings_listener(struct listener *l)
-{
-	struct qring *qr;
-	int i;
-
-	l->rx.tx_qrings = calloc(global.nbthread, sizeof *l->rx.tx_qrings);
-	if (!l->rx.tx_qrings)
-		return 0;
-
-	MT_LIST_INIT(&l->rx.tx_qring_list);
-	for (i = 0; i < global.nbthread; i++) {
-		unsigned char *buf;
-		struct qring *qr;
-
-		qr = calloc(1, sizeof *qr);
-		if (!qr)
-			goto err;
-
-		buf = pool_alloc(pool_head_quic_tx_ring);
-		if (!buf) {
-			free(qr);
-			goto err;
-		}
-
-		qr->cbuf = cbuf_new(buf, QUIC_TX_RING_BUFSZ);
-		if (!qr->cbuf) {
-			pool_free(pool_head_quic_tx_ring, buf);
-			free(qr);
-			goto err;
-		}
-
-        l->rx.tx_qrings[i] = qr;
-		MT_LIST_APPEND(&l->rx.tx_qring_list, &qr->mt_list);
-	}
-
-	return 1;
-
- err:
-	while ((qr = MT_LIST_POP(&l->rx.tx_qring_list, typeof(qr), mt_list))) {
-		pool_free(pool_head_quic_tx_ring, qr->cbuf->buf);
-		cbuf_free(qr->cbuf);
-		free(qr);
-	}
-	free(l->rx.tx_qrings);
-	return 0;
-}
-
 /* Allocate the RX buffers for <l> listener.
  * Return 1 if succeeded, 0 if not.
  */
 static int quic_alloc_rxbufs_listener(struct listener *l)
 {
 	int i;
-	struct rxbuf *rxbuf;
-
-	l->rx.rxbufs = calloc(global.nbthread, sizeof *l->rx.rxbufs);
-	if (!l->rx.rxbufs)
-		return 0;
+	struct quic_receiver_buf *tmp;
 
 	MT_LIST_INIT(&l->rx.rxbuf_list);
 	for (i = 0; i < global.nbthread; i++) {
+		struct quic_receiver_buf *rxbuf;
 		char *buf;
-		struct rxbuf *rxbuf;
 
-		rxbuf = calloc(1, sizeof *rxbuf);
+		rxbuf = calloc(1, sizeof(*rxbuf));
 		if (!rxbuf)
 			goto err;
 
@@ -606,22 +555,62 @@ static int quic_alloc_rxbufs_listener(struct listener *l)
 			goto err;
 		}
 
-		l->rx.rxbufs[i] = rxbuf;
-
 		rxbuf->buf = b_make(buf, QUIC_RX_BUFSZ, 0, 0);
-		LIST_INIT(&rxbuf->dgrams);
-		MT_LIST_APPEND(&l->rx.rxbuf_list, &rxbuf->mt_list);
+		LIST_INIT(&rxbuf->dgram_list);
+		MT_LIST_APPEND(&l->rx.rxbuf_list, &rxbuf->rxbuf_el);
 	}
 
 	return 1;
 
  err:
-	while ((rxbuf = MT_LIST_POP(&l->rx.rxbuf_list, typeof(rxbuf), mt_list))) {
-		pool_free(pool_head_quic_rxbuf, rxbuf->buf.area);
-		free(rxbuf);
+	while ((tmp = MT_LIST_POP(&l->rx.rxbuf_list, typeof(tmp), rxbuf_el))) {
+		pool_free(pool_head_quic_rxbuf, tmp->buf.area);
+		free(tmp);
 	}
-	free(l->rx.rxbufs);
 	return 0;
+}
+
+/* Check if platform supports the required feature set for quic-conn owned
+ * socket. <l> listener must already be binded; a dummy socket will be opened
+ * on the same address as one of the support test.
+ *
+ * Returns true if platform is deemed compatible else false.
+ */
+static int quic_test_sock_per_conn_support(struct listener *l)
+{
+	const struct receiver *rx = &l->rx;
+	int ret = 1, fdtest;
+
+	/* Check if IP destination address can be retrieved on recvfrom()
+	 * operation.
+	 */
+#if !defined(IP_PKTINFO) && !defined(IP_RECVDSTADDR)
+	ha_alert("Your platform does not seem to support UDP source address retrieval through IP_PKTINFO or an alternative flag. "
+	         "QUIC connections will use listener socket.\n");
+	ret = 0;
+#endif
+
+	/* Check if platform support multiple UDP sockets bind on the same
+	 * local address. Create a dummy socket and bind it on the same address
+	 * as <l> listener. If bind system call fails, deactivate socket per
+	 * connection. All other errors are not taken into account.
+	 */
+	if (ret) {
+		fdtest = socket(rx->proto->fam->sock_domain,
+		                rx->proto->sock_type, rx->proto->sock_prot);
+		if (fdtest >= 0) {
+			if (setsockopt(fdtest, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) &&
+			    bind(fdtest, (struct sockaddr *)&rx->addr, rx->proto->fam->sock_addrlen) < 0) {
+				ha_alert("Your platform does not seem to support multiple UDP sockets binded on the same address. "
+				         "QUIC connections will use listener socket.\n");
+				ret = 0;
+			}
+
+			close(fdtest);
+		}
+	}
+
+	return ret;
 }
 
 /* This function tries to bind a QUIC4/6 listener. It may return a warning or
@@ -639,7 +628,8 @@ static int quic_alloc_rxbufs_listener(struct listener *l)
  */
 static int quic_bind_listener(struct listener *listener, char *errmsg, int errlen)
 {
-	int err = ERR_NONE;
+	const struct sockaddr_storage addr = listener->rx.addr;
+	int fd, err = ERR_NONE;
 	char *msg = NULL;
 
 	/* ensure we never return garbage */
@@ -654,11 +644,34 @@ static int quic_bind_listener(struct listener *listener, char *errmsg, int errle
 		goto udp_return;
 	}
 
-	if (!quic_alloc_tx_rings_listener(listener) ||
-	    !quic_alloc_rxbufs_listener(listener)) {
+	/* Set IP_PKTINFO to retrieve destination address on recv. */
+	fd = listener->rx.fd;
+	switch (addr.ss_family) {
+	case AF_INET:
+#if defined(IP_PKTINFO)
+		setsockopt(fd, IPPROTO_IP, IP_PKTINFO, &one, sizeof(one));
+#elif defined(IP_RECVDSTADDR)
+		setsockopt(fd, IPPROTO_IP, IP_RECVDSTADDR, &one, sizeof(one));
+#endif /* IP_PKTINFO || IP_RECVDSTADDR */
+		break;
+	case AF_INET6:
+#ifdef IPV6_RECVPKTINFO
+		setsockopt(fd, IPPROTO_IPV6, IPV6_RECVPKTINFO, &one, sizeof(one));
+#endif
+		break;
+	default:
+		break;
+	}
+
+	if (!quic_alloc_rxbufs_listener(listener)) {
 		msg = "could not initialize tx/rx rings";
 		err |= ERR_WARN;
 		goto udp_return;
+	}
+
+	if (global.tune.options & GTUNE_QUIC_SOCK_PER_CONN) {
+		if (!quic_test_sock_per_conn_support(listener))
+			global.tune.options &= ~GTUNE_QUIC_SOCK_PER_CONN;
 	}
 
 	listener_set_state(listener, LI_LISTEN);

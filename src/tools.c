@@ -69,6 +69,7 @@ extern void *__elf_aux_vector;
 #include <haproxy/stconn.h>
 #include <haproxy/task.h>
 #include <haproxy/tools.h>
+#include <haproxy/xxhash.h>
 
 /* This macro returns false if the test __x is false. Many
  * of the following parsing function must be abort the processing
@@ -77,7 +78,10 @@ extern void *__elf_aux_vector;
 #define RET0_UNLESS(__x) do { if (!(__x)) return 0; } while (0)
 
 /* Define the number of line of hash_word */
-#define NB_L_HASH_WORD 7
+#define NB_L_HASH_WORD 15
+
+/* return the hash of a string and length for a given key. All keys are valid. */
+#define HA_ANON(key, str, len) (XXH32(str, len, key) & 0xFFFFFF)
 
 /* enough to store NB_ITOA_STR integers of :
  *   2^64-1 = 18446744073709551615 or
@@ -421,8 +425,7 @@ char *utoa_pad(unsigned int n, char *dst, size_t size)
 	}
 	if (i + 2 > size) // (i + 1) + '\0'
 		return NULL;  // too long
-	if (i < size)
-		i = size - 2; // padding - '\0'
+	i = size - 2; // padding - '\0'
 
 	ret = dst + i + 1;
 	*ret = '\0';
@@ -1975,7 +1978,8 @@ char *encode_chunk(char *start, char *stop,
 
 /*
  * Tries to prefix characters tagged in the <map> with the <escape>
- * character. The input <string> must be zero-terminated. The result will
+ * character. The input <string> is processed until string_stop
+ * is reached or NULL-byte is encountered. The result will
  * be stored between <start> (included) and <stop> (excluded). This
  * function will always try to terminate the resulting string with a '\0'
  * before <stop>, and will return its position if the conversion
@@ -1983,11 +1987,11 @@ char *encode_chunk(char *start, char *stop,
  */
 char *escape_string(char *start, char *stop,
 		    const char escape, const long *map,
-		    const char *string)
+		    const char *string, const char *string_stop)
 {
 	if (start < stop) {
 		stop--; /* reserve one byte for the final '\0' */
-		while (start < stop && *string != '\0') {
+		while (start < stop && string < string_stop && *string != '\0') {
 			if (!ha_bit_test((unsigned char)(*string), map))
 				*start++ = *string;
 			else {
@@ -1997,38 +2001,6 @@ char *escape_string(char *start, char *stop,
 				*start++ = *string;
 			}
 			string++;
-		}
-		*start = '\0';
-	}
-	return start;
-}
-
-/*
- * Tries to prefix characters tagged in the <map> with the <escape>
- * character. <chunk> contains the input to be escaped. The result will be
- * stored between <start> (included) and <stop> (excluded). The function
- * will always try to terminate the resulting string with a '\0' before
- * <stop>, and will return its position if the conversion completes.
- */
-char *escape_chunk(char *start, char *stop,
-		   const char escape, const long *map,
-		   const struct buffer *chunk)
-{
-	char *str = chunk->area;
-	char *end = chunk->area + chunk->data;
-
-	if (start < stop) {
-		stop--; /* reserve one byte for the final '\0' */
-		while (start < stop && str < end) {
-			if (!ha_bit_test((unsigned char)(*str), map))
-				*start++ = *str;
-			else {
-				if (start + 2 >= stop)
-					break;
-				*start++ = escape;
-				*start++ = *str;
-			}
-			str++;
 		}
 		*start = '\0';
 	}
@@ -2130,7 +2102,7 @@ int url_decode(char *string, int in_form)
 			break;
 		case '?':
 			in_form = 1;
-			/* fall through */
+			__fallthrough;
 		default:
 			*out++ = *in;
 			break;
@@ -3351,12 +3323,13 @@ int v6tov4(struct in_addr *sin_addr, struct in6_addr *sin6_addr)
 	return 0;
 }
 
-/* compare two struct sockaddr_storage and return:
+/* compare two struct sockaddr_storage, including port if <check_port> is true,
+ * and return:
  *  0 (true)  if the addr is the same in both
  *  1 (false) if the addr is not the same in both
  *  -1 (unable) if one of the addr is not AF_INET*
  */
-int ipcmp(struct sockaddr_storage *ss1, struct sockaddr_storage *ss2)
+int ipcmp(struct sockaddr_storage *ss1, struct sockaddr_storage *ss2, int check_port)
 {
 	if ((ss1->ss_family != AF_INET) && (ss1->ss_family != AF_INET6))
 		return -1;
@@ -3369,13 +3342,15 @@ int ipcmp(struct sockaddr_storage *ss1, struct sockaddr_storage *ss2)
 
 	switch (ss1->ss_family) {
 		case AF_INET:
-			return memcmp(&((struct sockaddr_in *)ss1)->sin_addr,
+			return (memcmp(&((struct sockaddr_in *)ss1)->sin_addr,
 				      &((struct sockaddr_in *)ss2)->sin_addr,
-				      sizeof(struct in_addr)) != 0;
+				      sizeof(struct in_addr)) != 0) ||
+			       (check_port && get_net_port(ss1) != get_net_port(ss2));
 		case AF_INET6:
-			return memcmp(&((struct sockaddr_in6 *)ss1)->sin6_addr,
+			return (memcmp(&((struct sockaddr_in6 *)ss1)->sin6_addr,
 				      &((struct sockaddr_in6 *)ss2)->sin6_addr,
-				      sizeof(struct in6_addr)) != 0;
+				      sizeof(struct in6_addr)) != 0) ||
+			       (check_port && get_net_port(ss1) != get_net_port(ss2));
 	}
 
 	return 1;
@@ -5781,7 +5756,14 @@ uint32_t parse_line(char *in, char *out, size_t *outlen, char **args, int *nbarg
 
 	/* end of output string */
 	EMIT_CHAR(0);
-	arg++;
+
+	/* Don't add an empty arg after trailing spaces. Note that args[arg]
+	 * may contain some distances relative to NULL if <out> was NULL, or
+	 * pointers beyond the end of <out> in case <outlen> is too short, thus
+	 * we must not dereference it.
+	 */
+	if (arg < argsmax && args[arg] != out + outpos - 1)
+		arg++;
 
 	if (quote) {
 		/* unmatched quote */
@@ -5889,7 +5871,7 @@ void update_word_fingerprint(uint8_t *fp, const char *word)
 const char *hash_anon(uint32_t scramble, const char *string2hash, const char *prefix, const char *suffix)
 {
 	index_hash++;
-	if (index_hash > NB_L_HASH_WORD)
+	if (index_hash == NB_L_HASH_WORD)
 		index_hash = 0;
 
 	/* don't hash empty strings */
@@ -5907,70 +5889,92 @@ const char *hash_anon(uint32_t scramble, const char *string2hash, const char *pr
 
 /* This function hashes or not an ip address ipstring, scramble is the anonymizing
  * key, returns the hashed ip with his port or ipstring when there is nothing to hash.
+ * Put hasport equal 0 to point out ipstring has no port, else put an other int.
+ * Without port, return a simple hash or ipstring.
  */
-const char *hash_ipanon(uint32_t scramble, char *ipstring)
+const char *hash_ipanon(uint32_t scramble, char *ipstring, int hasport)
 {
 	char *errmsg = NULL;
 	struct sockaddr_storage *sa;
+	struct sockaddr_storage ss;
 	char addr[46];
 	int port;
 
 	index_hash++;
-        if (index_hash > NB_L_HASH_WORD) {
+        if (index_hash == NB_L_HASH_WORD) {
                 index_hash = 0;
 	}
 
-	if (strncmp(ipstring, "localhost", 1) == 0) {
+	if (scramble == 0) {
+		return ipstring;
+	}
+	if (strcmp(ipstring, "localhost") == 0 ||
+	    strcmp(ipstring, "stdout") == 0 ||
+	    strcmp(ipstring, "stderr") == 0 ||
+	    strncmp(ipstring, "fd@", 3) == 0 ||
+	    strncmp(ipstring, "sockpair@", 9) == 0) {
 		return ipstring;
 	}
 	else {
-		sa = str2sa_range(ipstring, NULL, NULL, NULL, NULL, NULL, &errmsg, NULL, NULL,
-				  PA_O_PORT_OK | PA_O_STREAM | PA_O_XPRT | PA_O_CONNECT | PA_O_PORT_RANGE);
-		if (sa == NULL) {
-			return ipstring;
+		if (hasport == 0) {
+			memset(&ss, 0, sizeof(ss));
+			if (str2ip2(ipstring, &ss, 1) == NULL) {
+				return HA_ANON_STR(scramble, ipstring);
+			}
+			sa = &ss;
 		}
 		else {
-			addr_to_str(sa, addr, sizeof(addr));
-			port = get_host_port(sa);
-
-			switch(sa->ss_family) {
-				case AF_INET:
-					if (strncmp(addr, "127", 3) == 0 || strncmp(addr, "255", 3) == 0 || strncmp(addr, "0", 1) == 0) {
-						return ipstring;
-					}
-					else {
-						if (port != 0) {
-							snprintf(hash_word[index_hash], sizeof(hash_word[index_hash]), "IPV4(%06x):%d", HA_ANON(scramble, addr, strlen(addr)), port);
-							return hash_word[index_hash];
-						}
-						else {
-							snprintf(hash_word[index_hash], sizeof(hash_word[index_hash]), "IPV4(%06x)", HA_ANON(scramble, addr, strlen(addr)));
-							return hash_word[index_hash];
-						}
-					}
-					break;
-
-				case AF_INET6:
-					if (strcmp(addr, "::1") == 0) {
-						return ipstring;
-					}
-					else {
-						if (port != 0) {
-							snprintf(hash_word[index_hash], sizeof(hash_word[index_hash]), "IPV6(%06x):%d", HA_ANON(scramble, addr, strlen(addr)), port);
-							return hash_word[index_hash];
-						}
-						else {
-							snprintf(hash_word[index_hash], sizeof(hash_word[index_hash]), "IPV6(%06x)", HA_ANON(scramble, addr, strlen(addr)));
-							return hash_word[index_hash];
-						}
-					}
-					break;
-
-				default:
-					return ipstring;
-					break;
-			};
+			sa = str2sa_range(ipstring, NULL, NULL, NULL, NULL, NULL, &errmsg, NULL, NULL,
+					  PA_O_PORT_OK | PA_O_STREAM | PA_O_DGRAM | PA_O_XPRT | PA_O_CONNECT |
+					  PA_O_PORT_RANGE | PA_O_PORT_OFS | PA_O_RESOLVE);
+			if (sa == NULL) {
+				return HA_ANON_STR(scramble, ipstring);
+			}
 		}
+		addr_to_str(sa, addr, sizeof(addr));
+		port = get_host_port(sa);
+
+		switch(sa->ss_family) {
+			case AF_INET:
+				if (strncmp(addr, "127", 3) == 0 || strncmp(addr, "255", 3) == 0 || strncmp(addr, "0", 1) == 0) {
+					return ipstring;
+				}
+				else {
+					if (port != 0) {
+						snprintf(hash_word[index_hash], sizeof(hash_word[index_hash]), "IPV4(%06x):%d", HA_ANON(scramble, addr, strlen(addr)), port);
+						return hash_word[index_hash];
+					}
+					else {
+						snprintf(hash_word[index_hash], sizeof(hash_word[index_hash]), "IPV4(%06x)", HA_ANON(scramble, addr, strlen(addr)));
+						return hash_word[index_hash];
+					}
+				}
+				break;
+
+			case AF_INET6:
+				if (strcmp(addr, "::1") == 0) {
+					return ipstring;
+				}
+				else {
+					if (port != 0) {
+						snprintf(hash_word[index_hash], sizeof(hash_word[index_hash]), "IPV6(%06x):%d", HA_ANON(scramble, addr, strlen(addr)), port);
+						return hash_word[index_hash];
+					}
+					else {
+						snprintf(hash_word[index_hash], sizeof(hash_word[index_hash]), "IPV6(%06x)", HA_ANON(scramble, addr, strlen(addr)));
+						return hash_word[index_hash];
+					}
+				}
+				break;
+
+			case AF_UNIX:
+				return HA_ANON_STR(scramble, ipstring);
+				break;
+
+			default:
+				return ipstring;
+				break;
+		};
 	}
 	return ipstring;
 }

@@ -42,9 +42,11 @@ int cli_parse_default(char **args, char *payload, struct appctx *appctx, void *p
 /* mworker proxy functions */
 
 int mworker_cli_proxy_create(void);
-int mworker_cli_proxy_new_listener(char *line);
+struct bind_conf *mworker_cli_proxy_new_listener(char *line);
 int mworker_cli_sockpair_new(struct mworker_proc *mworker_proc, int proc);
 void mworker_cli_proxy_stop(void);
+
+extern struct bind_conf *mcli_reload_bind_conf;
 
 /* proxy mode cli functions */
 
@@ -102,9 +104,35 @@ static inline int cli_dynerr(struct appctx *appctx, char *err)
 	struct cli_print_ctx *ctx = applet_reserve_svcctx(appctx, sizeof(*ctx));
 
 	ctx->err = err;
-	appctx->st0 = CLI_ST_PRINT_FREE;
+	appctx->st0 = CLI_ST_PRINT_DYNERR;
 	return 1;
 }
 
+/* updates the CLI's context to log messages stored in thread-local
+ * usermsgs_ctx at <severity> level. usermsgs_ctx will be reset when done.
+ * This is for use in CLI parsers to deal with quick response messages.
+ *
+ * Always returns 1.
+ */
+static inline int cli_umsg(struct appctx *appctx, int severity)
+{
+	struct cli_print_ctx *ctx = applet_reserve_svcctx(appctx, sizeof(*ctx));
+
+	ctx->severity = severity;
+	appctx->st0 = CLI_ST_PRINT_UMSG;
+	return 1;
+}
+
+/* updates the CLI's context to log messages stored in thread-local
+ * usermsgs_ctx using error level. usermsgs_ctx will be reset when done.
+ * This is for use in CLI parsers to deal with quick response messages.
+ *
+ * Always returns 1.
+ */
+static inline int cli_umsgerr(struct appctx *appctx)
+{
+	appctx->st0 = CLI_ST_PRINT_UMSGERR;
+	return 1;
+}
 
 #endif /* _HAPROXY_CLI_H */

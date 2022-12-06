@@ -616,7 +616,7 @@ static int peer_prepare_status_errormsg(char *msg, size_t size, struct peer_prep
 	unsigned int st1;
 
 	st1 = p->error_status.st1;
-	ret = snprintf(msg, size, "%d\n", st1);
+	ret = snprintf(msg, size, "%u\n", st1);
 	if (ret >= size)
 		return 0;
 
@@ -1583,7 +1583,7 @@ static inline int peer_send_teachmsgs(struct appctx *appctx, struct peer *p,
 	new_pushed = 1;
 
 	if (!locked)
-		HA_SPIN_LOCK(STK_TABLE_LOCK, &st->table->lock);
+		HA_RWLOCK_WRLOCK(STK_TABLE_LOCK, &st->table->lock);
 
 	while (1) {
 		struct stksess *ts;
@@ -1597,17 +1597,24 @@ static inline int peer_send_teachmsgs(struct appctx *appctx, struct peer *p,
 		}
 
 		updateid = ts->upd.key;
+		if (p->srv->shard && ts->shard != p->srv->shard) {
+			/* Skip this entry */
+			st->last_pushed = updateid;
+			new_pushed = 1;
+			continue;
+		}
+
 		ts->ref_cnt++;
-		HA_SPIN_UNLOCK(STK_TABLE_LOCK, &st->table->lock);
+		HA_RWLOCK_WRUNLOCK(STK_TABLE_LOCK, &st->table->lock);
 
 		ret = peer_send_updatemsg(st, appctx, ts, updateid, new_pushed, use_timed);
 		if (ret <= 0) {
-			HA_SPIN_LOCK(STK_TABLE_LOCK, &st->table->lock);
+			HA_RWLOCK_WRLOCK(STK_TABLE_LOCK, &st->table->lock);
 			ts->ref_cnt--;
 			break;
 		}
 
-		HA_SPIN_LOCK(STK_TABLE_LOCK, &st->table->lock);
+		HA_RWLOCK_WRLOCK(STK_TABLE_LOCK, &st->table->lock);
 		ts->ref_cnt--;
 		st->last_pushed = updateid;
 
@@ -1631,7 +1638,7 @@ static inline int peer_send_teachmsgs(struct appctx *appctx, struct peer *p,
 
  out:
 	if (!locked)
-		HA_SPIN_UNLOCK(STK_TABLE_LOCK, &st->table->lock);
+		HA_RWLOCK_WRUNLOCK(STK_TABLE_LOCK, &st->table->lock);
 	return ret;
 }
 
@@ -1698,12 +1705,12 @@ static inline int peer_send_teach_stage2_msgs(struct appctx *appctx, struct peer
 static int peer_treat_updatemsg(struct appctx *appctx, struct peer *p, int updt, int exp,
                                 char **msg_cur, char *msg_end, int msg_len, int totl)
 {
-	struct stconn *sc = appctx_sc(appctx);
 	struct shared_table *st = p->remote_table;
 	struct stksess *ts, *newts;
 	uint32_t update;
 	int expire;
 	unsigned int data_type;
+	size_t keylen;
 	void *data_ptr;
 
 	TRACE_ENTER(PEERS_EV_UPDTMSG, NULL, p);
@@ -1765,8 +1772,9 @@ static int peer_treat_updatemsg(struct appctx *appctx, struct peer *p, int updt,
 			goto malformed_free_newts;
 		}
 
-		memcpy(newts->key.key, *msg_cur, to_store);
-		newts->key.key[to_store] = 0;
+		keylen = to_store;
+		memcpy(newts->key.key, *msg_cur, keylen);
+		newts->key.key[keylen] = 0;
 		*msg_cur += to_read;
 	}
 	else if (st->table->type == SMP_T_SINT) {
@@ -1780,10 +1788,11 @@ static int peer_treat_updatemsg(struct appctx *appctx, struct peer *p, int updt,
 			goto malformed_free_newts;
 		}
 
-		memcpy(&netinteger, *msg_cur, sizeof(netinteger));
+		keylen = sizeof(netinteger);
+		memcpy(&netinteger, *msg_cur, keylen);
 		netinteger = ntohl(netinteger);
-		memcpy(newts->key.key, &netinteger, sizeof(netinteger));
-		*msg_cur += sizeof(netinteger);
+		memcpy(newts->key.key, &netinteger, keylen);
+		*msg_cur += keylen;
 	}
 	else {
 		if (*msg_cur + st->table->key_size > msg_end) {
@@ -1794,9 +1803,12 @@ static int peer_treat_updatemsg(struct appctx *appctx, struct peer *p, int updt,
 			goto malformed_free_newts;
 		}
 
-		memcpy(newts->key.key, *msg_cur, st->table->key_size);
-		*msg_cur += st->table->key_size;
+		keylen = st->table->key_size;
+		memcpy(newts->key.key, *msg_cur, keylen);
+		*msg_cur += keylen;
 	}
+
+	newts->shard = stktable_get_key_shard(st->table, newts->key.key, keylen);
 
 	/* lookup for existing entry */
 	ts = stktable_set_entry(st->table, newts);
@@ -2036,14 +2048,10 @@ static int peer_treat_updatemsg(struct appctx *appctx, struct peer *p, int updt,
 
 	HA_RWLOCK_WRUNLOCK(STK_SESS_LOCK, &ts->lock);
 	stktable_touch_remote(st->table, ts, 1);
-	TRACE_LEAVE(PEERS_EV_UPDTMSG, NULL, p);
-	return 1;
 
  ignore_msg:
-	/* skip consumed message */
-	co_skip(sc_oc(sc), totl);
-	TRACE_DEVEL("leaving in error", PEERS_EV_UPDTMSG);
-	return 0;
+	TRACE_LEAVE(PEERS_EV_UPDTMSG, NULL, p);
+	return 1;
 
  malformed_unlock:
 	/* malformed message */
@@ -2150,7 +2158,6 @@ static inline int peer_treat_switchmsg(struct appctx *appctx, struct peer *p,
 static inline int peer_treat_definemsg(struct appctx *appctx, struct peer *p,
                                       char **msg_cur, char *msg_end, int totl)
 {
-	struct stconn *sc = appctx_sc(appctx);
 	int table_id_len;
 	struct shared_table *st;
 	int table_type;
@@ -2321,11 +2328,9 @@ static inline int peer_treat_definemsg(struct appctx *appctx, struct peer *p,
 
 	p->remote_table->remote_data = table_data;
 	p->remote_table->remote_id = table_id;
-	return 1;
 
  ignore_msg:
-	co_skip(sc_oc(sc), totl);
-	return 0;
+	return 1;
 
  malformed_exit:
 	/* malformed message */
@@ -2447,13 +2452,47 @@ static inline int peer_treat_awaited_msg(struct appctx *appctx, struct peer *pee
 			TRACE_PROTO("received control message", PEERS_EV_CTRLMSG,
 			            NULL, &msg_head[1], peers->local->id, peer->id);
 			if (peer->flags & PEER_F_LEARN_ASSIGN) {
+				int commit_a_finish = 1;
+
 				peer->flags &= ~PEER_F_LEARN_ASSIGN;
 				peers->flags &= ~(PEERS_F_RESYNC_ASSIGN|PEERS_F_RESYNC_PROCESS);
-				peers->flags |= (PEERS_F_RESYNC_LOCAL|PEERS_F_RESYNC_REMOTE);
-				if (peer->local)
-					peers->flags |= PEERS_F_RESYNC_LOCALFINISHED;
-				else
-					peers->flags |= PEERS_F_RESYNC_REMOTEFINISHED;
+				if (peer->srv->shard) {
+					struct peer *ps;
+
+					peers->flags |= PEERS_F_RESYNC_REMOTEPARTIAL;
+					peer->flags |= PEER_F_LEARN_NOTUP2DATE;
+					for (ps = peers->remote; ps; ps = ps->next) {
+						if (ps->srv->shard == peer->srv->shard) {
+							/* flag all peers from same shard
+							 * notup2date to disable request
+							 * of a resync frm them
+							 */
+							ps->flags |= PEER_F_LEARN_NOTUP2DATE;
+						}
+						else if (ps->srv->shard && !(ps->flags & PEER_F_LEARN_NOTUP2DATE)) {
+							/* it remains some other shards not requested
+							 * we don't commit a resync finish to request
+							 * the other shards
+							 */
+							commit_a_finish = 0;
+						}
+					}
+
+					if (!commit_a_finish) {
+						/* it remains some shard to request, we schedule a new request
+						 */
+						peers->resync_timeout = tick_add(now_ms, MS_TO_TICKS(PEER_RESYNC_TIMEOUT));
+						task_wakeup(peers->sync_task, TASK_WOKEN_MSG);
+					}
+				}
+
+				if (commit_a_finish) {
+					peers->flags |= (PEERS_F_RESYNC_LOCAL|PEERS_F_RESYNC_REMOTE);
+					if (peer->local)
+						peers->flags |= PEERS_F_RESYNC_LOCALFINISHED;
+					else
+						peers->flags |= PEERS_F_RESYNC_REMOTEFINISHED;
+				}
 			}
 			peer->confirm++;
 		}
@@ -2585,17 +2624,17 @@ static inline int peer_send_msgs(struct appctx *appctx,
 			}
 
 			if (!(peer->flags & PEER_F_TEACH_PROCESS)) {
-				HA_SPIN_LOCK(STK_TABLE_LOCK, &st->table->lock);
+				HA_RWLOCK_WRLOCK(STK_TABLE_LOCK, &st->table->lock);
 				if (!(peer->flags & PEER_F_LEARN_ASSIGN) &&
 					(st->last_pushed != st->table->localupdate)) {
 
 					repl = peer_send_teach_process_msgs(appctx, peer, st);
 					if (repl <= 0) {
-						HA_SPIN_UNLOCK(STK_TABLE_LOCK, &st->table->lock);
+						HA_RWLOCK_WRUNLOCK(STK_TABLE_LOCK, &st->table->lock);
 						return repl;
 					}
 				}
-				HA_SPIN_UNLOCK(STK_TABLE_LOCK, &st->table->lock);
+				HA_RWLOCK_WRUNLOCK(STK_TABLE_LOCK, &st->table->lock);
 			}
 			else if (!(peer->flags & PEER_F_TEACH_FINISHED)) {
 				if (!(st->flags & SHTABLE_F_TEACH_STAGE1)) {
@@ -2774,11 +2813,11 @@ static inline void init_accepted_peer(struct peer *peer, struct peers *peers)
 	/* Init cursors */
 	for (st = peer->tables; st ; st = st->next) {
 		st->last_get = st->last_acked = 0;
-		HA_SPIN_LOCK(STK_TABLE_LOCK, &st->table->lock);
+		HA_RWLOCK_WRLOCK(STK_TABLE_LOCK, &st->table->lock);
 		/* if st->update appears to be in future it means
 		 * that the last acked value is very old and we
 		 * remain unconnected a too long time to use this
-		 * acknowlegement as a reset.
+		 * acknowledgement as a reset.
 		 * We should update the protocol to be able to
 		 * signal the remote peer that it needs a full resync.
 		 * Here a partial fix consist to set st->update at
@@ -2790,7 +2829,7 @@ static inline void init_accepted_peer(struct peer *peer, struct peers *peers)
 		st->flags = 0;
 		if ((int)(st->last_pushed - st->table->commitupdate) > 0)
 			st->table->commitupdate = st->last_pushed;
-		HA_SPIN_UNLOCK(STK_TABLE_LOCK, &st->table->lock);
+		HA_RWLOCK_WRUNLOCK(STK_TABLE_LOCK, &st->table->lock);
 	}
 
 	/* reset teaching and learning flags to 0 */
@@ -2829,11 +2868,11 @@ static inline void init_connected_peer(struct peer *peer, struct peers *peers)
 	/* Init cursors */
 	for (st = peer->tables; st ; st = st->next) {
 		st->last_get = st->last_acked = 0;
-		HA_SPIN_LOCK(STK_TABLE_LOCK, &st->table->lock);
+		HA_RWLOCK_WRLOCK(STK_TABLE_LOCK, &st->table->lock);
 		/* if st->update appears to be in future it means
 		 * that the last acked value is very old and we
 		 * remain unconnected a too long time to use this
-		 * acknowlegement as a reset.
+		 * acknowledgement as a reset.
 		 * We should update the protocol to be able to
 		 * signal the remote peer that it needs a full resync.
 		 * Here a partial fix consist to set st->update at
@@ -2845,7 +2884,7 @@ static inline void init_connected_peer(struct peer *peer, struct peers *peers)
 		st->flags = 0;
 		if ((int)(st->last_pushed - st->table->commitupdate) > 0)
 			st->table->commitupdate = st->last_pushed;
-		HA_SPIN_UNLOCK(STK_TABLE_LOCK, &st->table->lock);
+		HA_RWLOCK_WRUNLOCK(STK_TABLE_LOCK, &st->table->lock);
 	}
 
 	/* Init confirm counter */
@@ -2901,7 +2940,7 @@ switchstate:
 				prev_state = appctx->st0;
 				appctx->svcctx = NULL;
 				appctx->st0 = PEER_SESS_ST_GETVERSION;
-				/* fall through */
+				__fallthrough;
 			case PEER_SESS_ST_GETVERSION:
 				prev_state = appctx->st0;
 				reql = peer_getline_version(appctx, &maj_ver, &min_ver);
@@ -2912,7 +2951,7 @@ switchstate:
 				}
 
 				appctx->st0 = PEER_SESS_ST_GETHOST;
-				/* fall through */
+				__fallthrough;
 			case PEER_SESS_ST_GETHOST:
 				prev_state = appctx->st0;
 				reql = peer_getline_host(appctx);
@@ -2923,7 +2962,7 @@ switchstate:
 				}
 
 				appctx->st0 = PEER_SESS_ST_GETPEER;
-				/* fall through */
+				__fallthrough;
 			case PEER_SESS_ST_GETPEER: {
 				prev_state = appctx->st0;
 				reql = peer_getline_last(appctx, &curpeer);
@@ -2965,7 +3004,7 @@ switchstate:
 				appctx->st0 = PEER_SESS_ST_SENDSUCCESS;
 				_HA_ATOMIC_INC(&active_peers);
 			}
-			/* fall through */
+			__fallthrough;
 			case PEER_SESS_ST_SENDSUCCESS: {
 				prev_state = appctx->st0;
 				if (!curpeer) {
@@ -3012,7 +3051,7 @@ switchstate:
 				/* switch to the waiting statuscode state */
 				appctx->st0 = PEER_SESS_ST_GETSTATUS;
 			}
-			/* fall through */
+			__fallthrough;
 			case PEER_SESS_ST_GETSTATUS: {
 				prev_state = appctx->st0;
 				if (!curpeer) {
@@ -3055,7 +3094,7 @@ switchstate:
 				_HA_ATOMIC_INC(&connected_peers);
 				appctx->st0 = PEER_SESS_ST_WAITMSG;
 			}
-			/* fall through */
+			__fallthrough;
 			case PEER_SESS_ST_WAITMSG: {
 				uint32_t msg_len = 0;
 				char *msg_cur = trash.area;
@@ -3145,7 +3184,7 @@ send_msgs:
 				appctx->st0 = PEER_SESS_ST_END;
 				prev_state = appctx->st0;
 			}
-			/* fall through */
+			__fallthrough;
 			case PEER_SESS_ST_END: {
 				if (prev_state == PEER_SESS_ST_WAITMSG)
 					_HA_ATOMIC_DEC(&connected_peers);

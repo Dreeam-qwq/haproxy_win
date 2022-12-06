@@ -6,13 +6,11 @@
 #error "Must define USE_OPENSSL"
 #endif
 
-#include <import/eb64tree.h>
-
 #include <haproxy/api.h>
 #include <haproxy/connection.h>
+#include <haproxy/list.h>
 #include <haproxy/mux_quic-t.h>
 #include <haproxy/stream.h>
-#include <haproxy/xprt_quic-t.h>
 
 struct qcs *qcc_init_stream_local(struct qcc *qcc, int bidi);
 struct buffer *qc_get_buf(struct qcs *qcs, struct buffer *bptr);
@@ -71,6 +69,18 @@ static inline int quic_stream_is_bidi(uint64_t id)
 	return !quic_stream_is_uni(id);
 }
 
+static inline char *qcs_st_to_str(enum qcs_state st)
+{
+	switch (st) {
+	case QC_SS_IDLE: return "IDL";
+	case QC_SS_OPEN: return "OPN";
+	case QC_SS_HLOC: return "HCL";
+	case QC_SS_HREM: return "HCR";
+	case QC_SS_CLO:  return "CLO";
+	default:         return "???";
+	}
+}
+
 int qcc_install_app_ops(struct qcc *qcc, const struct qcc_app_ops *app_ops);
 
 static inline struct stconn *qc_attach_sc(struct qcs *qcs, struct buffer *buf)
@@ -92,6 +102,11 @@ static inline struct stconn *qc_attach_sc(struct qcs *qcs, struct buffer *buf)
 	if (!sc_new_from_endp(qcs->sd, sess, buf))
 		return NULL;
 
+	/* QC_SF_HREQ_RECV must be set once for a stream. Else, nb_hreq counter
+	 * will be incorrect for the connection.
+	 */
+	BUG_ON_HOT(qcs->flags & QC_SF_HREQ_RECV);
+	qcs->flags |= QC_SF_HREQ_RECV;
 	++qcc->nb_sc;
 	++qcc->nb_hreq;
 

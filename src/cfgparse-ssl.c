@@ -37,6 +37,7 @@
 #include <haproxy/listener.h>
 #include <haproxy/openssl-compat.h>
 #include <haproxy/ssl_sock.h>
+#include <haproxy/ssl_utils.h>
 #include <haproxy/tools.h>
 #include <haproxy/ssl_ckch.h>
 
@@ -824,8 +825,11 @@ static int bind_parse_ecdhe(char **args, int cur_arg, struct proxy *px, struct b
 static int bind_parse_ignore_err(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
 {
 	int code;
+	char *s1 = NULL, *s2 = NULL;
+	char *token = NULL;
 	char *p = args[cur_arg + 1];
-	unsigned long long *ignerr = &conf->crt_ignerr;
+	char *str;
+	unsigned long long *ignerr = conf->crt_ignerr_bitfield;
 
 	if (!*p) {
 		memprintf(err, "'%s' : missing error IDs list", args[cur_arg]);
@@ -833,26 +837,45 @@ static int bind_parse_ignore_err(char **args, int cur_arg, struct proxy *px, str
 	}
 
 	if (strcmp(args[cur_arg], "ca-ignore-err") == 0)
-		ignerr = &conf->ca_ignerr;
+		ignerr = conf->ca_ignerr_bitfield;
 
 	if (strcmp(p, "all") == 0) {
-		*ignerr = ~0ULL;
+		cert_ignerr_bitfield_set_all(ignerr);
 		return 0;
 	}
 
-	while (p) {
-		code = atoi(p);
-		if ((code <= 0) || (code > 63)) {
-			memprintf(err, "'%s' : ID '%d' out of range (1..63) in error IDs list '%s'",
-			          args[cur_arg], code, args[cur_arg + 1]);
-			return ERR_ALERT | ERR_FATAL;
-		}
-		*ignerr |= 1ULL << code;
-		p = strchr(p, ',');
-		if (p)
-			p++;
+	/* copy the string to be able to dump the complete one in case of
+	 * error, because strtok_r is writing \0 inside. */
+	str = strdup(p);
+	if (!str) {
+		memprintf(err, "'%s' : Could not allocate memory", args[cur_arg]);
+		return ERR_ALERT | ERR_FATAL;
 	}
 
+	s1 = str;
+	while ((token = strtok_r(s1, ",", &s2))) {
+		s1 = NULL;
+		if (isdigit((int)*token)) {
+			code = atoi(token);
+			if ((code <= 0) || (code > SSL_MAX_VFY_ERROR_CODE)) {
+				memprintf(err, "'%s' : ID '%d' out of range (1..%d) in error IDs list '%s'",
+				          args[cur_arg], code, SSL_MAX_VFY_ERROR_CODE, args[cur_arg + 1]);
+				free(str);
+				return ERR_ALERT | ERR_FATAL;
+			}
+		} else {
+			code = x509_v_err_str_to_int(token);
+			if (code < 0) {
+				memprintf(err, "'%s' : error constant '%s' unknown in error IDs list '%s'",
+					  args[cur_arg], token, args[cur_arg + 1]);
+				free(str);
+				return ERR_ALERT | ERR_FATAL;
+			}
+		}
+		cert_ignerr_bitfield_set(ignerr, code);
+	}
+
+	free(str);
 	return 0;
 }
 

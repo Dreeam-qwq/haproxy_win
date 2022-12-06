@@ -85,7 +85,7 @@ struct ring *ring_make_from_area(void *area, size_t size)
 {
 	struct ring *ring = NULL;
 
-	if (size < sizeof(ring))
+	if (size < sizeof(*ring))
 		return NULL;
 
 	if (!area)
@@ -96,6 +96,25 @@ struct ring *ring_make_from_area(void *area, size_t size)
 	ring = area;
 	area += sizeof(*ring);
 	ring_init(ring, area, size - sizeof(*ring));
+	return ring;
+}
+
+/* Cast an unified ring + storage area to a ring from <area>, without
+ * reinitializing the data buffer.
+ *
+ * Reinitialize the waiters and the lock.
+ */
+struct ring *ring_cast_from_area(void *area)
+{
+	struct ring *ring = NULL;
+
+	ring = area;
+	ring->buf.area = area + sizeof(*ring);
+
+	HA_RWLOCK_INIT(&ring->lock);
+	LIST_INIT(&ring->waiters);
+	ring->readers_count = 0;
+
 	return ring;
 }
 

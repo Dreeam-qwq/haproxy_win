@@ -35,11 +35,12 @@
 #include <haproxy/listener-t.h>
 #include <haproxy/obj_type-t.h>
 #include <haproxy/queue-t.h>
+#include <haproxy/quic_tp-t.h>
 #include <haproxy/resolvers-t.h>
 #include <haproxy/stats-t.h>
 #include <haproxy/task-t.h>
 #include <haproxy/thread-t.h>
-#include <haproxy/xprt_quic-t.h>
+#include <haproxy/event_hdl-t.h>
 
 
 /* server states. Only SRV_ST_STOPPED indicates a down server. */
@@ -212,6 +213,11 @@ struct srv_per_thread {
 	struct eb_root avail_conns;             /* Connections in use, but with still new streams available */
 };
 
+/* Each server will have one occurrence of this structure per thread group */
+struct srv_per_tgroup {
+	unsigned int next_takeover;             /* thread ID to try to steal connections from next time */
+};
+
 /* Configure the protocol selection for websocket */
 enum __attribute__((__packed__)) srv_ws_mode {
 	SRV_WS_AUTO = 0,
@@ -239,6 +245,7 @@ struct server {
 	const struct mux_proto_list *mux_proto;       /* the mux to use for all outgoing connections (specified by the "proto" keyword) */
 	unsigned maxconn, minconn;		/* max # of active sessions (0 = unlimited), min# for dynamic limit. */
 	struct srv_per_thread *per_thr;         /* array of per-thread stuff such as connections lists */
+	struct srv_per_tgroup *per_tgrp;        /* array of per-tgroup stuff such as idle conns */
 	unsigned int *curr_idle_thr;            /* Current number of orphan idling connections per thread */
 
 	unsigned int pool_purge_delay;          /* Delay before starting to purge the idle conns pool */
@@ -258,12 +265,14 @@ struct server {
 	int slowstart;				/* slowstart time in seconds (ms in the conf) */
 
 	char *id;				/* just for identification */
+	uint32_t rid;				/* revision: if id has been reused for a new server, rid won't match */
 	unsigned iweight,uweight, cur_eweight;	/* initial weight, user-specified weight, and effective weight */
 	unsigned wscore;			/* weight score, used during srv map computation */
 	unsigned next_eweight;			/* next pending eweight to commit */
 	unsigned rweight;			/* remainder of weight in the current LB tree */
 	unsigned cumulative_weight;		/* weight of servers prior to this one in the same group, for chash balancing */
 	int maxqueue;				/* maximum number of pending connections allowed */
+	int shard;				/* shard (in peers protocol context only) */
 
 	enum srv_ws_mode ws;                    /* configure the protocol selection for websocket */
 	/* 3 bytes hole here */
@@ -281,7 +290,6 @@ struct server {
 	unsigned int curr_used_conns;           /* Current number of used connections */
 	unsigned int max_used_conns;            /* Max number of used connections (the counter is reset at each connection purges */
 	unsigned int est_need_conns;            /* Estimate on the number of needed connections (max of curr and previous max_used) */
-	unsigned int next_takeover;             /* thread ID to try to steal connections from next time */
 
 	struct queue queue;			/* pending connections */
 
@@ -396,6 +404,8 @@ struct server {
 	} op_st_chg;				/* operational status change's reason */
 	char adm_st_chg_cause[48];		/* administrative status change's cause */
 
+	event_hdl_sub_list e_subs;		/* event_hdl: server's subscribers list (atomically updated) */
+
 	/* warning, these structs are huge, keep them at the bottom */
 	struct conn_src conn_src;               /* connection source settings */
 	struct sockaddr_storage addr;           /* the address to connect to, doesn't include the port */
@@ -404,6 +414,36 @@ struct server {
 	EXTRA_COUNTERS(extra_counters);
 };
 
+/* data provided to EVENT_HDL_SUB_SERVER handlers through event_hdl facility */
+struct event_hdl_cb_data_server {
+	/* provided by:
+	 *   EVENT_HDL_SUB_SERVER_ADD
+	 *   EVENT_HDL_SUB_SERVER_DOWN
+	 */
+	struct {
+		/* safe data can be safely used from both
+		 * sync and async handlers
+		 * data consistency is guaranteed
+		 */
+		char name[64];       /* server name/id */
+		char proxy_name[64]; /* id of proxy the server belongs to */
+		int puid;            /* proxy-unique server ID */
+		int rid;             /* server id revision */
+		unsigned int flags;  /* server flags */
+	} safe;
+	struct {
+		/* unsafe data may only be used from sync handlers:
+		 * in async mode, data consistency cannot be guaranteed
+		 * and unsafe data may already be stale, thus using
+		 * it is highly discouraged because it
+		 * could lead to undefined behavior (UAF, null dereference...)
+		 */
+		struct server *ptr;	/* server live ptr */
+		/* lock hints */
+		uint8_t thread_isolate;	/* 1 = thread_isolate is on, no locking required */
+		uint8_t srv_lock;       /* 1 = srv lock is held */
+	} unsafe;
+};
 
 /* Storage structure to load server-state lines from a flat file into
  * an ebtree, for faster processing

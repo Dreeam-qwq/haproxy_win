@@ -1237,14 +1237,18 @@ static int debug_iohandler_fd(struct appctx *appctx)
 /* CLI state for "debug dev memstats" */
 struct dev_mem_ctx {
 	struct mem_stats *start, *stop; /* begin/end of dump */
+	char *match;                    /* non-null if a name prefix is specified */
 	int show_all;                   /* show all entries if non-null */
-	int width;
+	int width;                      /* 1st column width */
+	long tot_size;                  /* sum of alloc-free */
+	ulong tot_calls;                /* sum of calls */
 };
 
 /* CLI parser for the "debug dev memstats" command. Sets a dev_mem_ctx shown above. */
 static int debug_parse_cli_memstats(char **args, char *payload, struct appctx *appctx, void *private)
 {
 	struct dev_mem_ctx *ctx = applet_reserve_svcctx(appctx, sizeof(*ctx));
+	int arg;
 
 	extern __attribute__((__weak__)) struct mem_stats __start_mem_stats;
 	extern __attribute__((__weak__)) struct mem_stats __stop_mem_stats;
@@ -1252,21 +1256,32 @@ static int debug_parse_cli_memstats(char **args, char *payload, struct appctx *a
 	if (!cli_has_level(appctx, ACCESS_LVL_OPER))
 		return 1;
 
-	if (strcmp(args[3], "reset") == 0) {
-		struct mem_stats *ptr;
+	for (arg = 3; *args[arg]; arg++) {
+		if (strcmp(args[arg], "reset") == 0) {
+			struct mem_stats *ptr;
 
-		if (!cli_has_level(appctx, ACCESS_LVL_ADMIN))
+			if (!cli_has_level(appctx, ACCESS_LVL_ADMIN))
+				return 1;
+
+			for (ptr = &__start_mem_stats; ptr < &__stop_mem_stats; ptr++) {
+				_HA_ATOMIC_STORE(&ptr->calls, 0);
+				_HA_ATOMIC_STORE(&ptr->size, 0);
+			}
 			return 1;
-
-		for (ptr = &__start_mem_stats; ptr < &__stop_mem_stats; ptr++) {
-			_HA_ATOMIC_STORE(&ptr->calls, 0);
-			_HA_ATOMIC_STORE(&ptr->size, 0);
 		}
-		return 1;
+		else if (strcmp(args[arg], "all") == 0) {
+			ctx->show_all = 1;
+			continue;
+		}
+		else if (strcmp(args[arg], "match") == 0 && *args[arg + 1]) {
+			ha_free(&ctx->match);
+			ctx->match = strdup(args[arg + 1]);
+			arg++;
+			continue;
+		}
+		else
+			return cli_err(appctx, "Expects either 'reset', 'all', or 'match <pfx>'.\n");
 	}
-
-	if (strcmp(args[3], "all") == 0)
-		ctx->show_all = 1;
 
 	/* otherwise proceed with the dump from p0 to p1 */
 	ctx->start = &__start_mem_stats;
@@ -1285,6 +1300,7 @@ static int debug_iohandler_memstats(struct appctx *appctx)
 	struct dev_mem_ctx *ctx = appctx->svcctx;
 	struct stconn *sc = appctx_sc(appctx);
 	struct mem_stats *ptr;
+	const char *pfx = ctx->match;
 	int ret = 1;
 
 	if (unlikely(sc_ic(sc)->flags & (CF_WRITE_ERROR|CF_SHUTW)))
@@ -1327,6 +1343,7 @@ static int debug_iohandler_memstats(struct appctx *appctx)
 		const char *p;
 		const char *info = NULL;
 		const char *func = NULL;
+		int direction = 0; // neither alloc nor free (e.g. realloc)
 
 		if (!ptr->size && !ptr->calls && !ctx->show_all)
 			continue;
@@ -1340,13 +1357,13 @@ static int debug_iohandler_memstats(struct appctx *appctx)
 		func = ptr->caller.func;
 
 		switch (ptr->caller.what) {
-		case MEM_STATS_TYPE_CALLOC:  type = "CALLOC";  break;
-		case MEM_STATS_TYPE_FREE:    type = "FREE";    break;
-		case MEM_STATS_TYPE_MALLOC:  type = "MALLOC";  break;
+		case MEM_STATS_TYPE_CALLOC:  type = "CALLOC";  direction =  1; break;
+		case MEM_STATS_TYPE_FREE:    type = "FREE";    direction = -1; break;
+		case MEM_STATS_TYPE_MALLOC:  type = "MALLOC";  direction =  1; break;
 		case MEM_STATS_TYPE_REALLOC: type = "REALLOC"; break;
-		case MEM_STATS_TYPE_STRDUP:  type = "STRDUP";  break;
-		case MEM_STATS_TYPE_P_ALLOC: type = "P_ALLOC"; if (ptr->extra) info = ((const struct pool_head *)ptr->extra)->name; break;
-		case MEM_STATS_TYPE_P_FREE:  type = "P_FREE";  if (ptr->extra) info = ((const struct pool_head *)ptr->extra)->name; break;
+		case MEM_STATS_TYPE_STRDUP:  type = "STRDUP";  direction =  1; break;
+		case MEM_STATS_TYPE_P_ALLOC: type = "P_ALLOC"; direction =  1; if (ptr->extra) info = ((const struct pool_head *)ptr->extra)->name; break;
+		case MEM_STATS_TYPE_P_FREE:  type = "P_FREE";  direction = -1; if (ptr->extra) info = ((const struct pool_head *)ptr->extra)->name; break;
 		default:                     type = "UNSET";   break;
 		}
 
@@ -1355,6 +1372,10 @@ static int debug_iohandler_memstats(struct appctx *appctx)
 		//	     name, ptr->line, type,
 		//	     (unsigned long)ptr->size, (unsigned long)ptr->calls,
 		//	     (unsigned long)(ptr->calls ? (ptr->size / ptr->calls) : 0));
+
+		/* only match requested prefixes */
+		if (pfx && (!info || strncmp(info, pfx, strlen(pfx)) != 0))
+			continue;
 
 		chunk_reset(&trash);
 		if (ctx->show_all)
@@ -1377,14 +1398,46 @@ static int debug_iohandler_memstats(struct appctx *appctx)
 		if (applet_putchk(appctx, &trash) == -1) {
 			ctx->start = ptr;
 			ret = 0;
-			break;
+			goto end;
+		}
+		if (direction > 0) {
+			ctx->tot_size  += (ulong)ptr->size;
+			ctx->tot_calls += (ulong)ptr->calls;
+		}
+		else if (direction < 0) {
+			ctx->tot_size  -= (ulong)ptr->size;
+			ctx->tot_calls += (ulong)ptr->calls;
 		}
 	}
 
+	/* now dump a summary */
+	chunk_reset(&trash);
+	chunk_appendf(&trash, "Total");
+	while (trash.data < ctx->width)
+		trash.area[trash.data++] = ' ';
+
+	chunk_appendf(&trash, "%7s  size: %12ld  calls: %9lu  size/call: %6ld %s\n",
+		      "BALANCE",
+		      ctx->tot_size, ctx->tot_calls,
+		      (long)(ctx->tot_calls ? (ctx->tot_size / ctx->tot_calls) : 0),
+		      "(excl. realloc)");
+
+	if (applet_putchk(appctx, &trash) == -1) {
+		ctx->start = ptr;
+		ret = 0;
+		goto end;
+	}
  end:
 	return ret;
 }
 
+/* release the "show pools" context */
+static void debug_release_memstats(struct appctx *appctx)
+{
+	struct dev_mem_ctx *ctx = appctx->svcctx;
+
+	ha_free(&ctx->match);
+}
 #endif
 
 #ifndef USE_THREAD_DUMP
@@ -1623,11 +1676,12 @@ static struct cli_kw_list cli_kws = {{ },{
 #endif
 	{{ "debug", "dev", "fd", NULL },       "debug dev fd                            : scan for rogue/unhandled FDs",            debug_parse_cli_fd,    debug_iohandler_fd, NULL, NULL, ACCESS_EXPERT },
 	{{ "debug", "dev", "exit",  NULL },    "debug dev exit   [code]                 : immediately exit the process",            debug_parse_cli_exit,  NULL, NULL, NULL, ACCESS_EXPERT },
+	{{ "debug", "dev", "hash", NULL },     "debug dev hash   [msg]                  : return msg hashed if anon is set",        debug_parse_cli_hash,  NULL, NULL, NULL, 0 },
 	{{ "debug", "dev", "hex",   NULL },    "debug dev hex    <addr> [len]           : dump a memory area",                      debug_parse_cli_hex,   NULL, NULL, NULL, ACCESS_EXPERT },
 	{{ "debug", "dev", "log",   NULL },    "debug dev log    [msg] ...              : send this msg to global logs",            debug_parse_cli_log,   NULL, NULL, NULL, ACCESS_EXPERT },
 	{{ "debug", "dev", "loop",  NULL },    "debug dev loop   [ms]                   : loop this long",                          debug_parse_cli_loop,  NULL, NULL, NULL, ACCESS_EXPERT },
 #if defined(DEBUG_MEM_STATS)
-	{{ "debug", "dev", "memstats", NULL }, "debug dev memstats [reset|all]          : dump/reset memory statistics",            debug_parse_cli_memstats, debug_iohandler_memstats, NULL, NULL, ACCESS_EXPERT },
+	{{ "debug", "dev", "memstats", NULL }, "debug dev memstats [reset|all|match ...]: dump/reset memory statistics",            debug_parse_cli_memstats, debug_iohandler_memstats, debug_release_memstats, NULL, 0 },
 #endif
 	{{ "debug", "dev", "panic", NULL },    "debug dev panic                         : immediately trigger a panic",             debug_parse_cli_panic, NULL, NULL, NULL, ACCESS_EXPERT },
 	{{ "debug", "dev", "sched", NULL },    "debug dev sched  {task|tasklet} [k=v]*  : stress the scheduler",                    debug_parse_cli_sched, NULL, NULL, NULL, ACCESS_EXPERT },
@@ -1636,7 +1690,6 @@ static struct cli_kw_list cli_kws = {{ },{
 	{{ "debug", "dev", "tkill", NULL },    "debug dev tkill  [thr] [sig]            : send signal to thread",                   debug_parse_cli_tkill, NULL, NULL, NULL, ACCESS_EXPERT },
 	{{ "debug", "dev", "warn",  NULL },    "debug dev warn                          : call WARN_ON() and possibly crash",       debug_parse_cli_warn,  NULL, NULL, NULL, ACCESS_EXPERT },
 	{{ "debug", "dev", "write", NULL },    "debug dev write  [size]                 : write that many bytes in return",         debug_parse_cli_write, NULL, NULL, NULL, ACCESS_EXPERT },
-	{{ "debug", "dev", "hash", NULL },     "debug dev hash  [msg]                   : return msg hashed",                       debug_parse_cli_hash, NULL, NULL, NULL, ACCESS_EXPERT },
 
 #if defined(HA_HAVE_DUMP_LIBS)
 	{{ "show", "libs", NULL, NULL },       "show libs                               : show loaded object files and libraries", debug_parse_cli_show_libs, NULL, NULL },
