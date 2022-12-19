@@ -10,7 +10,6 @@
  *
  */
 
-#include <sys/mman.h>
 #include <errno.h>
 
 #include <haproxy/activity.h>
@@ -23,6 +22,7 @@
 #include <haproxy/global.h>
 #include <haproxy/list.h>
 #include <haproxy/pool.h>
+#include <haproxy/pool-os.h>
 #include <haproxy/sc_strm.h>
 #include <haproxy/stats-t.h>
 #include <haproxy/stconn.h>
@@ -52,7 +52,7 @@ uint pool_debugging __read_mostly =               /* set of POOL_DBG_* flags */
 #ifdef CONFIG_HAP_NO_GLOBAL_POOLS
 	POOL_DBG_NO_GLOBAL  |
 #endif
-#ifndef CONFIG_HAP_POOLS
+#if defined(DEBUG_NO_POOLS) || defined(DEBUG_UAF)
 	POOL_DBG_NO_CACHE   |
 #endif
 #if defined(DEBUG_POOL_TRACING)
@@ -60,6 +60,9 @@ uint pool_debugging __read_mostly =               /* set of POOL_DBG_* flags */
 #endif
 #if defined(DEBUG_MEMORY_POOLS)
 	POOL_DBG_TAG        |
+#endif
+#if defined(DEBUG_UAF)
+	POOL_DBG_UAF        |
 #endif
 	0;
 
@@ -79,6 +82,7 @@ static const struct {
 	{ POOL_DBG_CALLER,     "caller",     "no-caller",    "save caller information in cache" },
 	{ POOL_DBG_TAG,        "tag",        "no-tag",       "add tag at end of allocated objects" },
 	{ POOL_DBG_POISON,     "poison",     "no-poison",    "poison newly allocated objects" },
+	{ POOL_DBG_UAF,        "uaf",        "no-uaf",       "enable use-after-free checks (slow)" },
 	{ 0 /* end */ }
 };
 
@@ -335,7 +339,12 @@ struct pool_head *create_pool(char *name, unsigned int size, unsigned int flags)
 void *pool_get_from_os(struct pool_head *pool)
 {
 	if (!pool->limit || pool->allocated < pool->limit) {
-		void *ptr = pool_alloc_area(pool->alloc_sz);
+		void *ptr;
+
+		if (pool_debugging & POOL_DBG_UAF)
+			ptr = pool_alloc_area_uaf(pool->alloc_sz);
+		else
+			ptr = pool_alloc_area(pool->alloc_sz);
 		if (ptr) {
 			_HA_ATOMIC_INC(&pool->allocated);
 			return ptr;
@@ -352,15 +361,10 @@ void *pool_get_from_os(struct pool_head *pool)
  */
 void pool_put_to_os(struct pool_head *pool, void *ptr)
 {
-#ifdef DEBUG_UAF
-	/* This object will be released for real in order to detect a use after
-	 * free. We also force a write to the area to ensure we crash on double
-	 * free or free of a const area.
-	 */
-	*(uint32_t *)ptr = 0xDEADADD4;
-#endif /* DEBUG_UAF */
-
-	pool_free_area(ptr, pool->alloc_sz);
+	if (pool_debugging & POOL_DBG_UAF)
+		pool_free_area_uaf(ptr, pool->alloc_sz);
+	else
+		pool_free_area(ptr, pool->alloc_sz);
 	_HA_ATOMIC_DEC(&pool->allocated);
 }
 
@@ -794,57 +798,6 @@ void __pool_free(struct pool_head *pool, void *ptr)
 	pool_put_to_cache(pool, ptr, caller);
 }
 
-
-#ifdef DEBUG_UAF
-
-/************* use-after-free allocator *************/
-
-/* allocates an area of size <size> and returns it. The semantics are similar
- * to those of malloc(). However the allocation is rounded up to 4kB so that a
- * full page is allocated. This ensures the object can be freed alone so that
- * future dereferences are easily detected. The returned object is always
- * 16-bytes aligned to avoid issues with unaligned structure objects. In case
- * some padding is added, the area's start address is copied at the end of the
- * padding to help detect underflows.
- */
-void *pool_alloc_area_uaf(size_t size)
-{
-	size_t pad = (4096 - size) & 0xFF0;
-	void *ret;
-
-	ret = mmap(NULL, (size + 4095) & -4096, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
-	if (ret != MAP_FAILED) {
-		/* let's dereference the page before returning so that the real
-		 * allocation in the system is performed without holding the lock.
-		 */
-		*(int *)ret = 0;
-		if (pad >= sizeof(void *))
-			*(void **)(ret + pad - sizeof(void *)) = ret + pad;
-		ret += pad;
-	} else {
-		ret = NULL;
-	}
-	return ret;
-}
-
-/* frees an area <area> of size <size> allocated by pool_alloc_area(). The
- * semantics are identical to free() except that the size must absolutely match
- * the one passed to pool_alloc_area(). In case some padding is added, the
- * area's start address is compared to the one at the end of the padding, and
- * a segfault is triggered if they don't match, indicating an underflow.
- */
-void pool_free_area_uaf(void *area, size_t size)
-{
-	size_t pad = (4096 - size) & 0xFF0;
-
-	if (pad >= sizeof(void *) && *(void **)(area - sizeof(void *)) != area)
-		ABORT_NOW();
-
-	munmap(area - pad, (size + 4095) & -4096);
-}
-
-#endif /* DEBUG_UAF */
-
 /*
  * This function destroys a pool by freeing it completely, unless it's still
  * in use. This should be called only under extreme circumstances. It always
@@ -1102,12 +1055,30 @@ int pool_parse_debugging(const char *str, char **err)
 					  dbg_options[v].clr,
 					  dbg_options[v].hlp);
 			}
+
+			memprintf(err,
+			          "%s  -----------------+-----------------+-----------------------------------------\n"
+				  "Examples:\n"
+				  "  Disable merging and enable poisonning with byte 'P': -dM0x50,no-merge\n"
+				  "  Randomly fail allocations: -dMfail\n"
+				  "  Detect out-of-bound corruptions: -dMno-merge,tag\n"
+				  "  Detect post-free cache corruptions: -dMno-merge,cold-first,integrity,caller\n"
+				  "  Detect all cache corruptions: -dMno-merge,cold-first,integrity,tag,caller\n"
+				  "  Detect UAF (disables cache, very slow): -dMuaf\n"
+				  "  Detect post-cache UAF: -dMuaf,cache,no-merge,cold-first,integrity,tag,caller\n"
+				  "  Detect post-free cache corruptions: -dMno-merge,cold-first,integrity,caller\n",
+			          *err);
 			return -1;
 		}
 
 		for (v = 0; dbg_options[v].flg; v++) {
 			if (isteq(feat, ist(dbg_options[v].set))) {
 				new_dbg |= dbg_options[v].flg;
+				/* UAF implicitly disables caching, but it's
+				 * still possible to forcefully re-enable it.
+				 */
+				if (dbg_options[v].flg == POOL_DBG_UAF)
+					new_dbg |= POOL_DBG_NO_CACHE;
 				break;
 			}
 			else if (isteq(feat, ist(dbg_options[v].clr))) {

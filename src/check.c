@@ -511,7 +511,7 @@ void set_server_check_status(struct check *check, short status, const char *desc
 
 		/* clear consecutive_errors if observing is enabled */
 		if (s->onerror)
-			s->consecutive_errors = 0;
+			HA_ATOMIC_STORE(&s->consecutive_errors, 0);
 		break;
 
 	default:
@@ -634,7 +634,6 @@ void check_notify_stopping(struct check *check)
 void __health_adjust(struct server *s, short status)
 {
 	int failed;
-	int expire;
 
 	if (s->observe >= HANA_OBS_SIZE)
 		return;
@@ -657,24 +656,22 @@ void __health_adjust(struct server *s, short status)
 
 	if (!failed) {
 		/* good: clear consecutive_errors */
-		s->consecutive_errors = 0;
+		HA_ATOMIC_STORE(&s->consecutive_errors, 0);
 		return;
 	}
 
-	_HA_ATOMIC_INC(&s->consecutive_errors);
-
-	if (s->consecutive_errors < s->consecutive_errors_limit)
+	if (HA_ATOMIC_ADD_FETCH(&s->consecutive_errors, 1) < s->consecutive_errors_limit)
 		return;
 
 	chunk_printf(&trash, "Detected %d consecutive errors, last one was: %s",
-	             s->consecutive_errors, get_analyze_status(status));
-
-	if (s->check.fastinter)
-		expire = tick_add(now_ms, MS_TO_TICKS(s->check.fastinter));
-	else
-		expire = TICK_ETERNITY;
+	             HA_ATOMIC_LOAD(&s->consecutive_errors), get_analyze_status(status));
 
 	HA_SPIN_LOCK(SERVER_LOCK, &s->lock);
+
+	/* force fastinter for upcoming check
+	 * (does nothing if fastinter is not enabled)
+	 */
+	s->check.state |= CHK_ST_FASTINTER;
 
 	switch (s->onerror) {
 		case HANA_ONERR_FASTINTER:
@@ -710,12 +707,15 @@ void __health_adjust(struct server *s, short status)
 
 	HA_SPIN_UNLOCK(SERVER_LOCK, &s->lock);
 
-	s->consecutive_errors = 0;
+	HA_ATOMIC_STORE(&s->consecutive_errors, 0);
 	_HA_ATOMIC_INC(&s->counters.failed_hana);
 
-	if (tick_isset(expire) && tick_is_lt(expire, s->check.task->expire)) {
-		/* requeue check task with new expire */
-		task_schedule(s->check.task, expire);
+	if (s->check.fastinter) {
+		/* timer might need to be advanced, it might also already be
+		 * running in another thread. Let's just wake the task up, it
+		 * will automatically adjust its timer.
+		 */
+		task_wakeup(s->check.task, TASK_WOKEN_MSG);
 	}
 }
 
@@ -1141,8 +1141,21 @@ struct task *process_chk_conn(struct task *t, void *context, unsigned int state)
 		TRACE_STATE("health-check state to purge", CHK_EV_TASK_WAKE, check);
 	}
 	else if (!(check->state & (CHK_ST_INPROGRESS))) {
-		/* no check currently running */
+		/* no check currently running, but we might have been woken up
+		 * before the timer's expiration to update it according to a
+		 * new state (e.g. fastinter), in which case we'll reprogram
+		 * the new timer.
+		 */
 		if (!expired) /* woke up too early */ {
+			if (check->server) {
+				int new_exp = tick_add(now_ms, MS_TO_TICKS(srv_getinter(check)));
+
+				if (tick_is_expired(new_exp, t->expire)) {
+					TRACE_STATE("health-check was advanced", CHK_EV_TASK_WAKE, check);
+					goto update_timer;
+				}
+			}
+
 			TRACE_STATE("health-check wake up too early", CHK_EV_TASK_WAKE, check);
 			goto out_unlock;
 		}
@@ -1267,6 +1280,7 @@ struct task *process_chk_conn(struct task *t, void *context, unsigned int state)
 	check->state &= ~(CHK_ST_INPROGRESS|CHK_ST_IN_ALLOC|CHK_ST_OUT_ALLOC);
 	check->state |= CHK_ST_SLEEPING;
 
+ update_timer:
 	if (check->server) {
 		rv = 0;
 		if (global.spread_checks > 0) {
@@ -1274,6 +1288,10 @@ struct task *process_chk_conn(struct task *t, void *context, unsigned int state)
 			rv -= (int) (2 * rv * (statistical_prng() / 4294967295.0));
 		}
 		t->expire = tick_add(now_ms, MS_TO_TICKS(srv_getinter(check) + rv));
+		/* reset fastinter flag (if set) so that srv_getinter()
+		 * only returns fastinter if server health is degraded
+		 */
+		check->state &= ~CHK_ST_FASTINTER;
 	}
 
  reschedule:
