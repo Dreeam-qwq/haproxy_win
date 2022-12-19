@@ -3639,6 +3639,8 @@ end:
  *     ERR_FATAL in any fatal error case
  *     ERR_ALERT if the reason of the error is available in err
  *     ERR_WARN if a warning is available into err
+ * The caller is responsible of freeing the newly built or newly refcounted
+ * find_chain element.
  * The value 0 means there is no error nor warning and
  * the operation succeed.
  */
@@ -3664,13 +3666,13 @@ static int ssl_sock_load_cert_chain(const char *path, const struct ckch_data *da
 	}
 
 	if (data->chain) {
-		*find_chain = data->chain;
+		*find_chain = X509_chain_up_ref(data->chain);
 	} else {
 		/* Find Certificate Chain in global */
 		struct issuer_chain *issuer;
 		issuer = ssl_get0_issuer_chain(data->cert);
 		if (issuer)
-			*find_chain = issuer->chain;
+			*find_chain = X509_chain_up_ref(issuer->chain);
 	}
 
 	if (!*find_chain) {
@@ -3691,14 +3693,11 @@ static int ssl_sock_load_cert_chain(const char *path, const struct ckch_data *da
 #else
 	{ /* legacy compat (< openssl 1.0.2) */
 		X509 *ca;
-		STACK_OF(X509) *chain;
-		chain = X509_chain_up_ref(*find_chain);
-		while ((ca = sk_X509_shift(chain)))
+		while ((ca = sk_X509_shift(*find_chain)))
 			if (!SSL_CTX_add_extra_chain_cert(ctx, ca)) {
 				memprintf(err, "%sunable to load chain certificate into SSL Context '%s'.\n",
 					  err && *err ? *err : "", path);
 				X509_free(ca);
-				sk_X509_pop_free(chain, X509_free);
 				errcode |= ERR_ALERT | ERR_FATAL;
 				goto end;
 			}
@@ -3791,6 +3790,7 @@ static int ssl_sock_put_ckch_into_ctx(const char *path, const struct ckch_data *
 #endif
 
  end:
+	sk_X509_pop_free(find_chain, X509_free);
 	return errcode;
 }
 
@@ -3828,6 +3828,7 @@ static int ssl_sock_put_srv_ckch_into_ctx(const char *path, const struct ckch_da
 	}
 
 end:
+	sk_X509_pop_free(find_chain, X509_free);
 	return errcode;
 }
 
@@ -5229,8 +5230,10 @@ int ssl_sock_prepare_srv_ctx(struct server *srv)
 {
 	int cfgerr = 0;
 	SSL_CTX *ctx;
-	/* Automatic memory computations need to know we use SSL there */
-	global.ssl_used_backend = 1;
+	/* Automatic memory computations need to know we use SSL there
+	 * If this is an internal proxy, don't use it for the computation */
+	if (!(srv->proxy->cap & PR_CAP_INT))
+		global.ssl_used_backend = 1;
 
 	/* Initiate SSL context for current server */
 	if (!srv->ssl_ctx.reused_sess) {
@@ -7581,22 +7584,19 @@ static int cli_parse_show_ocspresponse(char **args, char *payload, struct appctx
 #if ((defined SSL_CTRL_SET_TLSEXT_STATUS_REQ_CB && !defined OPENSSL_NO_OCSP) && !defined OPENSSL_IS_BORINGSSL)
 	if (*args[3]) {
 		struct certificate_ocsp *ocsp = NULL;
-		char *key = NULL;
-		int key_length = 0;
+		char key[OCSP_MAX_CERTID_ASN1_LENGTH] = {};
+		int key_length = OCSP_MAX_CERTID_ASN1_LENGTH;
+		char *key_ptr = key;
 
 		if (strlen(args[3]) > OCSP_MAX_CERTID_ASN1_LENGTH*2) {
 			return cli_err(appctx, "'show ssl ocsp-response' received a too big key.\n");
 		}
 
-		if (parse_binary(args[3], &key, &key_length, NULL)) {
-
-			char full_key[OCSP_MAX_CERTID_ASN1_LENGTH] = {};
-			memcpy(full_key, key, key_length);
-
-			ocsp = (struct certificate_ocsp *)ebmb_lookup(&cert_ocsp_tree, full_key, OCSP_MAX_CERTID_ASN1_LENGTH);
+		if (!parse_binary(args[3], &key_ptr, &key_length, NULL)) {
+			return cli_err(appctx, "'show ssl ocsp-response' received an invalid key.\n");
 		}
-		if (key)
-			ha_free(&key);
+
+		ocsp = (struct certificate_ocsp *)ebmb_lookup(&cert_ocsp_tree, key, OCSP_MAX_CERTID_ASN1_LENGTH);
 
 		if (!ocsp) {
 			return cli_err(appctx, "Certificate ID does not match any certificate.\n");
@@ -7922,30 +7922,18 @@ int ssl_get_ocspresponse_detail(unsigned char *ocsp_certid, struct buffer *out)
  */
 static int cli_io_handler_show_ocspresponse_detail(struct appctx *appctx)
 {
-	struct buffer *trash = alloc_trash_chunk();
+	struct buffer *trash = get_trash_chunk();
 	struct certificate_ocsp *ocsp = appctx->svcctx;
 
-	if (trash == NULL)
-		return 1;
-
-	if (ssl_ocsp_response_print(&ocsp->response, trash)) {
-		free_trash_chunk(trash);
-		return 1;
-	}
+	if (ssl_ocsp_response_print(&ocsp->response, trash))
+		goto end;
 
 	if (applet_putchk(appctx, trash) == -1)
-		goto yield;
+		return 0;
 
+end:
 	appctx->svcctx = NULL;
-	if (trash)
-		free_trash_chunk(trash);
 	return 1;
-
-yield:
-	if (trash)
-		free_trash_chunk(trash);
-
-	return 0;
 }
 #endif
 

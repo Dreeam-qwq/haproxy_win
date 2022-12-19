@@ -877,6 +877,17 @@ void reexec_on_failure()
 	mworker_reexec_waitmode();
 }
 
+/*
+ * Exit with an error message upon a wait-mode failure.
+ */
+void exit_on_waitmode_failure()
+{
+	if (!atexit_flag)
+		return;
+
+	ha_alert("Non-recoverable mworker wait-mode error, exiting.\n");
+}
+
 
 /*
  * upon SIGUSR1, let's have a soft stop. Note that soft_stop() broadcasts
@@ -1970,10 +1981,17 @@ static void init(int argc, char **argv)
 		global.mode &= ~MODE_MWORKER;
 	}
 
-	if ((global.mode & (MODE_MWORKER | MODE_CHECK | MODE_CHECK_CONDITION)) == MODE_MWORKER &&
-	    (getenv("HAPROXY_MWORKER_REEXEC") != NULL)) {
-		atexit_flag = 1;
-		atexit(reexec_on_failure);
+	/* set the atexit functions when not doing configuration check */
+	if (!(global.mode & (MODE_CHECK | MODE_CHECK_CONDITION))
+	    && (getenv("HAPROXY_MWORKER_REEXEC") != NULL)) {
+
+		if (global.mode & MODE_MWORKER) {
+			atexit_flag = 1;
+			atexit(reexec_on_failure);
+		} else if (global.mode & MODE_MWORKER_WAIT) {
+			atexit_flag = 1;
+			atexit(exit_on_waitmode_failure);
+		}
 	}
 
 	if (change_dir && chdir(change_dir) < 0) {
@@ -2114,19 +2132,6 @@ static void init(int argc, char **argv)
 			tmproc->options |= PROC_O_TYPE_MASTER; /* master */
 			tmproc->pid = pid;
 			tmproc->timestamp = start_date.tv_sec;
-
-			/* Creates the mcli_reload listener, which is the listener used
-			 * to retrieve the master CLI session which asked for the reload.
-			 *
-			 * ipc_fd[1] will be used as a listener, and ipc_fd[0]
-			 * will be used to send the FD of the session.
-			 *
-			 * Both FDs will be kept in the master.
-			 */
-			if (socketpair(AF_UNIX, SOCK_STREAM, 0, tmproc->ipc_fd) < 0) {
-				ha_alert("cannot create the mcli_reload socketpair.\n");
-				exit(EXIT_FAILURE);
-			}
 			proc_self = tmproc;
 
 			LIST_APPEND(&proc_list, &tmproc->list);
@@ -2181,6 +2186,21 @@ static void init(int argc, char **argv)
 				free(c->s);
 				free(c);
 			}
+			/* Creates the mcli_reload listener, which is the listener used
+			 * to retrieve the master CLI session which asked for the reload.
+			 *
+			 * ipc_fd[1] will be used as a listener, and ipc_fd[0]
+			 * will be used to send the FD of the session.
+			 *
+			 * Both FDs will be kept in the master. The sockets are
+			 * created only if they weren't inherited.
+			 */
+			if ((proc_self->ipc_fd[1] == -1) &&
+			     socketpair(AF_UNIX, SOCK_STREAM, 0, proc_self->ipc_fd) < 0) {
+				ha_alert("cannot create the mcli_reload socketpair.\n");
+				exit(EXIT_FAILURE);
+			}
+
 			/* Create the mcli_reload listener from the proc_self struct */
 			memprintf(&path, "sockpair@%d", proc_self->ipc_fd[1]);
 			mcli_reload_bind_conf = mworker_cli_proxy_new_listener(path);
@@ -2207,6 +2227,7 @@ static void init(int argc, char **argv)
 		exit(1);
 	}
 
+	/* Note: global.nbthread will be initialized as part of this call */
 	err_code |= check_config_validity();
 	for (px = proxies_list; px; px = px->next) {
 		struct server *srv;
@@ -2577,9 +2598,6 @@ static void init(int argc, char **argv)
 		ha_warning("<debug> mode incompatible with <quiet> and <daemon>. Keeping <debug> only.\n");
 		global.mode &= ~(MODE_DAEMON | MODE_QUIET);
 	}
-
-	if (global.nbthread < 1)
-		global.nbthread = 1;
 
 	/* Realloc trash buffers because global.tune.bufsize may have changed */
 	if (!init_trash_buffers(0)) {

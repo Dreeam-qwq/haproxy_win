@@ -15,21 +15,12 @@ import re
 from os import environ
 
 if len(sys.argv) == 2:
-    build_type = sys.argv[1]
+    ref_name = sys.argv[1]
 else:
-    print("Usage: {} <build_type>".format(sys.argv[0]), file=sys.stderr)
+    print("Usage: {} <ref_name>".format(sys.argv[0]), file=sys.stderr)
     sys.exit(1)
 
-print("Generating matrix for type '{}'.".format(build_type))
-
-
-def clean_os(os):
-    if os == "ubuntu-latest":
-        return "Ubuntu"
-    elif os == "macos-latest":
-        return "macOS"
-    return os.replace("-latest", "")
-
+print("Generating matrix for type '{}'.".format(ref_name))
 
 def clean_ssl(ssl):
     return ssl.replace("_VERSION", "").lower()
@@ -70,12 +61,12 @@ matrix = []
 
 # Ubuntu
 
-os = "ubuntu-latest"
+os = "ubuntu-latest" if "haproxy-" not in ref_name else "ubuntu-22.04"
 TARGET = "linux-glibc"
 for CC in ["gcc", "clang"]:
     matrix.append(
         {
-            "name": "{}, {}, no features".format(clean_os(os), CC),
+            "name": "{}, {}, no features".format(os, CC),
             "os": os,
             "TARGET": TARGET,
             "CC": CC,
@@ -85,7 +76,7 @@ for CC in ["gcc", "clang"]:
 
     matrix.append(
         {
-            "name": "{}, {}, all features".format(clean_os(os), CC),
+            "name": "{}, {}, all features".format(os, CC),
             "os": os,
             "TARGET": TARGET,
             "CC": CC,
@@ -112,57 +103,11 @@ for CC in ["gcc", "clang"]:
         }
     )
 
-    for compression in ["USE_ZLIB=1"]:
-        matrix.append(
-            {
-                "name": "{}, {}, gz={}".format(
-                    clean_os(os), CC, clean_compression(compression)
-                ),
-                "os": os,
-                "TARGET": TARGET,
-                "CC": CC,
-                "FLAGS": [compression],
-            }
-        )
-
-    for ssl in [
-        "stock",
-        "OPENSSL_VERSION=1.0.2u",
-        "OPENSSL_VERSION=latest",
-        "LIBRESSL_VERSION=latest",
-        "QUICTLS=yes",
-#        "BORINGSSL=yes",
-    ]:
-        flags = ["USE_OPENSSL=1"]
-        if ssl == "BORINGSSL=yes" or ssl == "QUICTLS=yes" or "LIBRESSL" in ssl:
-            flags.append("USE_QUIC=1")
-        if ssl != "stock":
-            flags.append("SSL_LIB=${HOME}/opt/lib")
-            flags.append("SSL_INC=${HOME}/opt/include")
-        if "LIBRESSL" in ssl and "latest" in ssl:
-            ssl = determine_latest_libressl(ssl)
-        if "OPENSSL" in ssl and "latest" in ssl:
-            ssl = determine_latest_openssl(ssl)
-
-        matrix.append(
-            {
-                "name": "{}, {}, ssl={}".format(clean_os(os), CC, clean_ssl(ssl)),
-                "os": os,
-                "TARGET": TARGET,
-                "CC": CC,
-                "ssl": ssl,
-                "FLAGS": flags,
-            }
-        )
-
 # ASAN
 
-os = "ubuntu-latest"
-TARGET = "linux-glibc"
-for CC in ["gcc","clang"]:
     matrix.append(
         {
-            "name": "{}, {}, ASAN, all features".format(clean_os(os), CC),
+            "name": "{}, {}, ASAN, all features".format(os, CC),
             "os": os,
             "TARGET": TARGET,
             "CC": CC,
@@ -190,14 +135,56 @@ for CC in ["gcc","clang"]:
         }
     )
 
+    for compression in ["USE_ZLIB=1"]:
+        matrix.append(
+            {
+                "name": "{}, {}, gz={}".format(
+                    os, CC, clean_compression(compression)
+                ),
+                "os": os,
+                "TARGET": TARGET,
+                "CC": CC,
+                "FLAGS": [compression],
+            }
+        )
+
+    for ssl in [
+        "stock",
+        "OPENSSL_VERSION=1.0.2u",
+        "OPENSSL_VERSION=1.1.1s",
+        "QUICTLS=yes",
+#        "BORINGSSL=yes",
+    ] + (["OPENSSL_VERSION=latest", "LIBRESSL_VERSION=latest"] if "haproxy-" not in ref_name else []):
+        flags = ["USE_OPENSSL=1"]
+        if ssl == "BORINGSSL=yes" or ssl == "QUICTLS=yes" or "LIBRESSL" in ssl:
+            flags.append("USE_QUIC=1")
+        if ssl != "stock":
+            flags.append("SSL_LIB=${HOME}/opt/lib")
+            flags.append("SSL_INC=${HOME}/opt/include")
+        if "LIBRESSL" in ssl and "latest" in ssl:
+            ssl = determine_latest_libressl(ssl)
+        if "OPENSSL" in ssl and "latest" in ssl:
+            ssl = determine_latest_openssl(ssl)
+
+        matrix.append(
+            {
+                "name": "{}, {}, ssl={}".format(os, CC, clean_ssl(ssl)),
+                "os": os,
+                "TARGET": TARGET,
+                "CC": CC,
+                "ssl": ssl,
+                "FLAGS": flags,
+            }
+        )
+
 # macOS
 
-os = "macos-latest"
+os = "macos-latest" if "haproxy-" not in ref_name else "macos-12"
 TARGET = "osx"
 for CC in ["clang"]:
     matrix.append(
         {
-            "name": "{}, {}, no features".format(clean_os(os), CC),
+            "name": "{}, {}, no features".format(os, CC),
             "os": os,
             "TARGET": TARGET,
             "CC": CC,

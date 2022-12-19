@@ -460,21 +460,22 @@ void mworker_cleanlisteners()
 	struct proxy *curproxy;
 	struct peers *curpeers;
 
-	/* we might have to unbind some peers sections from some processes */
+	/* peers proxies cleanup */
 	for (curpeers = cfg_peers; curpeers; curpeers = curpeers->next) {
 		if (!curpeers->peers_fe)
 			continue;
 
 		stop_proxy(curpeers->peers_fe);
 		/* disable this peer section so that it kills itself */
-		signal_unregister_handler(curpeers->sighandler);
-		task_destroy(curpeers->sync_task);
+		if (curpeers->sighandler)
+			signal_unregister_handler(curpeers->sighandler);
+		if (curpeers->sync_task)
+			task_destroy(curpeers->sync_task);
 		curpeers->sync_task = NULL;
-		task_destroy(curpeers->peers_fe->task);
-		curpeers->peers_fe->task = NULL;
 		curpeers->peers_fe = NULL;
 	}
 
+	/* main proxies cleanup */
 	for (curproxy = proxies_list; curproxy; curproxy = curproxy->next) {
 		int listen_in_master = 0;
 
