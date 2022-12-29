@@ -83,6 +83,7 @@
 #include <haproxy/vars.h>
 #include <haproxy/xxhash.h>
 #include <haproxy/istbuf.h>
+#include <haproxy/ssl_ocsp.h>
 
 
 /* ***** READ THIS before adding code here! *****
@@ -860,284 +861,6 @@ static inline void ssl_async_process_fds(struct ssl_sock_ctx *ctx)
 }
 #endif
 
-#if (defined SSL_CTRL_SET_TLSEXT_STATUS_REQ_CB && !defined OPENSSL_NO_OCSP && !defined HAVE_ASN1_TIME_TO_TM)
-/*
- *  This function returns the number of seconds  elapsed
- *  since the Epoch, 1970-01-01 00:00:00 +0000 (UTC) and the
- *  date presented un ASN1_GENERALIZEDTIME.
- *
- *  In parsing error case, it returns -1.
- */
-static long asn1_generalizedtime_to_epoch(ASN1_GENERALIZEDTIME *d)
-{
-	long epoch;
-	char *p, *end;
-	const unsigned short month_offset[12] = {
-		0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334
-	};
-	unsigned long year, month;
-
-	if (!d || (d->type != V_ASN1_GENERALIZEDTIME)) return -1;
-
-	p = (char *)d->data;
-	end = p + d->length;
-
-	if (end - p < 4) return -1;
-	year = 1000 * (p[0] - '0') + 100 * (p[1] - '0') + 10 * (p[2] - '0') + p[3] - '0';
-	p += 4;
-	if (end - p < 2) return -1;
-	month = 10 * (p[0] - '0') + p[1] - '0';
-	if (month < 1 || month > 12) return -1;
-	/* Compute the number of seconds since 1 jan 1970 and the beginning of current month
-	   We consider leap years and the current month (<marsh or not) */
-	epoch = (  ((year - 1970) * 365)
-		 + ((year - (month < 3)) / 4 - (year - (month < 3)) / 100 + (year - (month < 3)) / 400)
-		 - ((1970 - 1) / 4 - (1970 - 1) / 100 + (1970 - 1) / 400)
-		 + month_offset[month-1]
-		) * 24 * 60 * 60;
-	p += 2;
-	if (end - p < 2) return -1;
-	/* Add the number of seconds of completed days of current month */
-	epoch += (10 * (p[0] - '0') + p[1] - '0' - 1) * 24 * 60 * 60;
-	p += 2;
-	if (end - p < 2) return -1;
-	/* Add the completed hours of the current day */
-	epoch += (10 * (p[0] - '0') + p[1] - '0') * 60 * 60;
-	p += 2;
-	if (end - p < 2) return -1;
-	/* Add the completed minutes of the current hour */
-	epoch += (10 * (p[0] - '0') + p[1] - '0') * 60;
-	p += 2;
-	if (p == end) return -1;
-	/* Test if there is available seconds */
-	if (p[0] < '0' || p[0] > '9')
-		goto nosec;
-	if (end - p < 2) return -1;
-	/* Add the seconds of the current minute */
-	epoch += 10 * (p[0] - '0') + p[1] - '0';
-	p += 2;
-	if (p == end) return -1;
-	/* Ignore seconds float part if present */
-	if (p[0] == '.') {
-		do {
-			if (++p == end) return -1;
-		} while (p[0] >= '0' && p[0] <= '9');
-	}
-
-nosec:
-	if (p[0] == 'Z') {
-		if (end - p != 1) return -1;
-		return epoch;
-	}
-	else if (p[0] == '+') {
-		if (end - p != 5) return -1;
-		/* Apply timezone offset */
-		return epoch - ((10 * (p[1] - '0') + p[2] - '0') * 60 * 60 + (10 * (p[3] - '0') + p[4] - '0')) * 60;
-	}
-	else if (p[0] == '-') {
-		if (end - p != 5) return -1;
-		/* Apply timezone offset */
-		return epoch + ((10 * (p[1] - '0') + p[2] - '0') * 60 * 60 + (10 * (p[3] - '0') + p[4] - '0')) * 60;
-	}
-
-	return -1;
-}
-#endif
-
-#if (defined SSL_CTRL_SET_TLSEXT_STATUS_REQ_CB && !defined OPENSSL_NO_OCSP)
-/*
- * struct alignment works here such that the key.key is the same as key_data
- * Do not change the placement of key_data
- */
-struct certificate_ocsp {
-	struct ebmb_node key;
-	unsigned char key_data[OCSP_MAX_CERTID_ASN1_LENGTH];
-	unsigned int key_length;
-	struct buffer response;
-	int refcount;
-	long expire;
-};
-
-struct ocsp_cbk_arg {
-	int is_single;
-	int single_kt;
-	union {
-		struct certificate_ocsp *s_ocsp;
-		/*
-		 * m_ocsp will have multiple entries dependent on key type
-		 * Entry 0 - DSA
-		 * Entry 1 - ECDSA
-		 * Entry 2 - RSA
-		 */
-		struct certificate_ocsp *m_ocsp[SSL_SOCK_NUM_KEYTYPES];
-	};
-};
-
-static struct eb_root cert_ocsp_tree = EB_ROOT_UNIQUE;
-
-/* This function starts to check if the OCSP response (in DER format) contained
- * in chunk 'ocsp_response' is valid (else exits on error).
- * If 'cid' is not NULL, it will be compared to the OCSP certificate ID
- * contained in the OCSP Response and exits on error if no match.
- * If it's a valid OCSP Response:
- *  If 'ocsp' is not NULL, the chunk is copied in the OCSP response's container
- * pointed by 'ocsp'.
- *  If 'ocsp' is NULL, the function looks up into the OCSP response's
- * containers tree (using as index the ASN1 form of the OCSP Certificate ID extracted
- * from the response) and exits on error if not found. Finally, If an OCSP response is
- * already present in the container, it will be overwritten.
- *
- * Note: OCSP response containing more than one OCSP Single response is not
- * considered valid.
- *
- * Returns 0 on success, 1 in error case.
- */
-static int ssl_sock_load_ocsp_response(struct buffer *ocsp_response,
-				       struct certificate_ocsp *ocsp,
-				       OCSP_CERTID *cid, char **err)
-{
-	OCSP_RESPONSE *resp;
-	OCSP_BASICRESP *bs = NULL;
-	OCSP_SINGLERESP *sr;
-	OCSP_CERTID *id;
-	unsigned char *p = (unsigned char *) ocsp_response->area;
-	int rc , count_sr;
-	ASN1_GENERALIZEDTIME *revtime, *thisupd, *nextupd = NULL;
-	int reason;
-	int ret = 1;
-#ifdef HAVE_ASN1_TIME_TO_TM
-	struct tm nextupd_tm = {0};
-#endif
-
-	resp = d2i_OCSP_RESPONSE(NULL, (const unsigned char **)&p,
-				 ocsp_response->data);
-	if (!resp) {
-		memprintf(err, "Unable to parse OCSP response");
-		goto out;
-	}
-
-	rc = OCSP_response_status(resp);
-	if (rc != OCSP_RESPONSE_STATUS_SUCCESSFUL) {
-		memprintf(err, "OCSP response status not successful");
-		goto out;
-	}
-
-	bs = OCSP_response_get1_basic(resp);
-	if (!bs) {
-		memprintf(err, "Failed to get basic response from OCSP Response");
-		goto out;
-	}
-
-	count_sr = OCSP_resp_count(bs);
-	if (count_sr > 1) {
-		memprintf(err, "OCSP response ignored because contains multiple single responses (%d)", count_sr);
-		goto out;
-	}
-
-	sr = OCSP_resp_get0(bs, 0);
-	if (!sr) {
-		memprintf(err, "Failed to get OCSP single response");
-		goto out;
-	}
-
-	id = (OCSP_CERTID*)OCSP_SINGLERESP_get0_id(sr);
-
-	rc = OCSP_single_get0_status(sr, &reason, &revtime, &thisupd, &nextupd);
-	if (rc != V_OCSP_CERTSTATUS_GOOD && rc != V_OCSP_CERTSTATUS_REVOKED) {
-		memprintf(err, "OCSP single response: certificate status is unknown");
-		goto out;
-	}
-
-	if (!nextupd) {
-		memprintf(err, "OCSP single response: missing nextupdate");
-		goto out;
-	}
-
-	rc = OCSP_check_validity(thisupd, nextupd, OCSP_MAX_RESPONSE_TIME_SKEW, -1);
-	if (!rc) {
-		memprintf(err, "OCSP single response: no longer valid.");
-		goto out;
-	}
-
-	if (cid) {
-		if (OCSP_id_cmp(id, cid)) {
-			memprintf(err, "OCSP single response: Certificate ID does not match certificate and issuer");
-			goto out;
-		}
-	}
-
-	if (!ocsp) {
-		unsigned char key[OCSP_MAX_CERTID_ASN1_LENGTH];
-		unsigned char *p;
-
-		rc = i2d_OCSP_CERTID(id, NULL);
-		if (!rc) {
-			memprintf(err, "OCSP single response: Unable to encode Certificate ID");
-			goto out;
-		}
-
-		if (rc > OCSP_MAX_CERTID_ASN1_LENGTH) {
-			memprintf(err, "OCSP single response: Certificate ID too long");
-			goto out;
-		}
-
-		p = key;
-		memset(key, 0, OCSP_MAX_CERTID_ASN1_LENGTH);
-		i2d_OCSP_CERTID(id, &p);
-		ocsp = (struct certificate_ocsp *)ebmb_lookup(&cert_ocsp_tree, key, OCSP_MAX_CERTID_ASN1_LENGTH);
-		if (!ocsp) {
-			memprintf(err, "OCSP single response: Certificate ID does not match any certificate or issuer");
-			goto out;
-		}
-	}
-
-	/* According to comments on "chunk_dup", the
-	   previous chunk buffer will be freed */
-	if (!chunk_dup(&ocsp->response, ocsp_response)) {
-		memprintf(err, "OCSP response: Memory allocation error");
-		goto out;
-	}
-
-#ifdef HAVE_ASN1_TIME_TO_TM
-	if (ASN1_TIME_to_tm(nextupd, &nextupd_tm) == 0) {
-		memprintf(err, "OCSP single response: Invalid \"Next Update\" time");
-		goto out;
-	}
-	ocsp->expire = my_timegm(&nextupd_tm) - OCSP_MAX_RESPONSE_TIME_SKEW;
-#else
-	ocsp->expire = asn1_generalizedtime_to_epoch(nextupd) - OCSP_MAX_RESPONSE_TIME_SKEW;
-	if (ocsp->expire < 0) {
-		memprintf(err, "OCSP single response: Invalid \"Next Update\" time");
-		goto out;
-	}
-#endif
-
-	ret = 0;
-out:
-	ERR_clear_error();
-
-	if (bs)
-		 OCSP_BASICRESP_free(bs);
-
-	if (resp)
-		OCSP_RESPONSE_free(resp);
-
-	return ret;
-}
-/*
- * External function use to update the OCSP response in the OCSP response's
- * containers tree. The chunk 'ocsp_response' must contain the OCSP response
- * to update in DER format.
- *
- * Returns 0 on success, 1 in error case.
- */
-int ssl_sock_update_ocsp_response(struct buffer *ocsp_response, char **err)
-{
-	return ssl_sock_load_ocsp_response(ocsp_response, NULL, NULL, err);
-}
-
-#endif
-
 
 /*
  * Initialize an HMAC context <hctx> using the <key> and <md> parameters.
@@ -1360,104 +1083,8 @@ static int tlskeys_finalize_config(void)
 }
 #endif /* SSL_CTRL_SET_TLSEXT_TICKET_KEY_CB */
 
-#ifndef OPENSSL_NO_OCSP
-int ocsp_ex_index = -1;
-
-int ssl_sock_get_ocsp_arg_kt_index(int evp_keytype)
-{
-	switch (evp_keytype) {
-	case EVP_PKEY_RSA:
-		return 2;
-	case EVP_PKEY_DSA:
-		return 0;
-	case EVP_PKEY_EC:
-		return 1;
-	}
-
-	return -1;
-}
-
-/*
- * Callback used to set OCSP status extension content in server hello.
- */
-int ssl_sock_ocsp_stapling_cbk(SSL *ssl, void *arg)
-{
-	struct certificate_ocsp *ocsp;
-	struct ocsp_cbk_arg *ocsp_arg;
-	char *ssl_buf;
-	SSL_CTX *ctx;
-	EVP_PKEY *ssl_pkey;
-	int key_type;
-	int index;
-
-	ctx = SSL_get_SSL_CTX(ssl);
-	if (!ctx)
-		return SSL_TLSEXT_ERR_NOACK;
-
-	ocsp_arg = SSL_CTX_get_ex_data(ctx, ocsp_ex_index);
-	if (!ocsp_arg)
-		return SSL_TLSEXT_ERR_NOACK;
-
-	ssl_pkey = SSL_get_privatekey(ssl);
-	if (!ssl_pkey)
-		return SSL_TLSEXT_ERR_NOACK;
-
-	key_type = EVP_PKEY_base_id(ssl_pkey);
-
-	if (ocsp_arg->is_single && ocsp_arg->single_kt == key_type)
-		ocsp = ocsp_arg->s_ocsp;
-	else {
-		/* For multiple certs per context, we have to find the correct OCSP response based on
-		 * the certificate type
-		 */
-		index = ssl_sock_get_ocsp_arg_kt_index(key_type);
-
-		if (index < 0)
-			return SSL_TLSEXT_ERR_NOACK;
-
-		ocsp = ocsp_arg->m_ocsp[index];
-
-	}
-
-	if (!ocsp ||
-	    !ocsp->response.area ||
-	    !ocsp->response.data ||
-	    (ocsp->expire < now.tv_sec))
-		return SSL_TLSEXT_ERR_NOACK;
-
-	ssl_buf = OPENSSL_malloc(ocsp->response.data);
-	if (!ssl_buf)
-		return SSL_TLSEXT_ERR_NOACK;
-
-	memcpy(ssl_buf, ocsp->response.area, ocsp->response.data);
-	SSL_set_tlsext_status_ocsp_resp(ssl, (unsigned char*)ssl_buf, ocsp->response.data);
-
-	return SSL_TLSEXT_ERR_OK;
-}
-
-#endif
 
 #if ((defined SSL_CTRL_SET_TLSEXT_STATUS_REQ_CB && !defined OPENSSL_NO_OCSP) && !defined OPENSSL_IS_BORINGSSL)
-
-
-/*
- * Decrease the refcount of the struct ocsp_response and frees it if it's not
- * used anymore. Also removes it from the tree if free'd.
- */
-static void ssl_sock_free_ocsp(struct certificate_ocsp *ocsp)
-{
-	if (!ocsp)
-		return;
-
-	ocsp->refcount--;
-	if (ocsp->refcount <= 0) {
-		ebmb_delete(&ocsp->key);
-		chunk_destroy(&ocsp->response);
-		free(ocsp);
-	}
-}
-
-
 /*
  * This function enables the handling of OCSP status extension on 'ctx' if a
  * ocsp_response buffer was found in the cert_key_and_chain.  To enable OCSP
@@ -1472,10 +1099,9 @@ static void ssl_sock_free_ocsp(struct certificate_ocsp *ocsp)
  * Returns 1 if no ".ocsp" file found, 0 if OCSP status extension is
  * successfully enabled, or -1 in other error case.
  */
-static int ssl_sock_load_ocsp(SSL_CTX *ctx, const struct ckch_data *data, STACK_OF(X509) *chain)
+static int ssl_sock_load_ocsp(SSL_CTX *ctx, struct ckch_data *data, STACK_OF(X509) *chain)
 {
 	X509 *x, *issuer;
-	OCSP_CERTID *cid = NULL;
 	int i, ret = -1;
 	struct certificate_ocsp *ocsp = NULL, *iocsp;
 	char *warn = NULL;
@@ -1485,11 +1111,29 @@ static int ssl_sock_load_ocsp(SSL_CTX *ctx, const struct ckch_data *data, STACK_
 #else
 	tlsextStatusCb callback;
 #endif
+	struct buffer *ocsp_uri = get_trash_chunk();
 
 
 	x = data->cert;
 	if (!x)
 		goto out;
+
+	if (data->ocsp_update_mode == SSL_SOCK_OCSP_UPDATE_ON) {
+		ssl_ocsp_get_uri_from_cert(x, ocsp_uri, NULL);
+		/* We should have an "OCSP URI" field in order for auto update to work. */
+		if (b_data(ocsp_uri) == 0)
+			goto out;
+	}
+
+	/* In case of ocsp update mode set to 'on', this function might be
+	 * called with no known ocsp response. If no ocsp uri can be found in
+	 * the certificate, nothing needs to be done here. */
+	if (!data->ocsp_response) {
+		if (data->ocsp_update_mode != SSL_SOCK_OCSP_UPDATE_ON || b_data(ocsp_uri) == 0) {
+			ret = 0;
+			goto out;
+		}
+	}
 
 	issuer = data->ocsp_issuer;
 	/* take issuer from chain over ocsp_issuer, is what is done historicaly */
@@ -1506,11 +1150,11 @@ static int ssl_sock_load_ocsp(SSL_CTX *ctx, const struct ckch_data *data, STACK_
 	if (!issuer)
 		goto out;
 
-	cid = OCSP_cert_to_id(0, x, issuer);
-	if (!cid)
+	data->ocsp_cid = OCSP_cert_to_id(0, x, issuer);
+	if (!data->ocsp_cid)
 		goto out;
 
-	i = i2d_OCSP_CERTID(cid, NULL);
+	i = i2d_OCSP_CERTID(data->ocsp_cid, NULL);
 	if (!i || (i > OCSP_MAX_CERTID_ASN1_LENGTH))
 		goto out;
 
@@ -1519,8 +1163,9 @@ static int ssl_sock_load_ocsp(SSL_CTX *ctx, const struct ckch_data *data, STACK_
 		goto out;
 
 	p = ocsp->key_data;
-	ocsp->key_length = i2d_OCSP_CERTID(cid, &p);
+	ocsp->key_length = i2d_OCSP_CERTID(data->ocsp_cid, &p);
 
+	HA_SPIN_LOCK(OCSP_LOCK, &ocsp_tree_lock);
 	iocsp = (struct certificate_ocsp *)ebmb_insert(&cert_ocsp_tree, &ocsp->key, OCSP_MAX_CERTID_ASN1_LENGTH);
 	if (iocsp == ocsp)
 		ocsp = NULL;
@@ -1584,18 +1229,44 @@ static int ssl_sock_load_ocsp(SSL_CTX *ctx, const struct ckch_data *data, STACK_
 			iocsp->refcount++;
 		}
 	}
+	HA_SPIN_UNLOCK(OCSP_LOCK, &ocsp_tree_lock);
 
 	ret = 0;
 
 	warn = NULL;
-	if (ssl_sock_load_ocsp_response(data->ocsp_response, iocsp, cid, &warn)) {
+	if (data->ocsp_response && ssl_sock_load_ocsp_response(data->ocsp_response, iocsp, data->ocsp_cid, &warn)) {
 		memprintf(&warn, "Loading: %s. Content will be ignored", warn ? warn : "failure");
 		ha_warning("%s.\n", warn);
 	}
 
+	if (data->ocsp_update_mode == SSL_SOCK_OCSP_UPDATE_ON) {
+
+		/* Do not insert the same certificate_ocsp structure in the
+		 * update tree more than once. */
+		if (!ocsp) {
+			iocsp->issuer = issuer;
+			X509_up_ref(issuer);
+			if (data->chain)
+				iocsp->chain = X509_chain_up_ref(data->chain);
+
+			iocsp->uri = alloc_trash_chunk();
+			if (!iocsp->uri)
+				goto out;
+			if (!chunk_cpy(iocsp->uri, ocsp_uri))
+				goto out;
+
+			ssl_ocsp_update_insert(iocsp);
+		}
+	}
+
 out:
-	if (cid)
-		OCSP_CERTID_free(cid);
+	if (ret && data->ocsp_cid)
+		OCSP_CERTID_free(data->ocsp_cid);
+
+	if (!ret && data->ocsp_response) {
+		ha_free(&data->ocsp_response->area);
+		ha_free(&data->ocsp_response);
+	}
 
 	if (ocsp)
 		ssl_sock_free_ocsp(ocsp);
@@ -1605,10 +1276,11 @@ out:
 
 	return ret;
 }
+
 #endif
 
 #ifdef OPENSSL_IS_BORINGSSL
-static int ssl_sock_load_ocsp(SSL_CTX *ctx, const struct ckch_data *data, STACK_OF(X509) *chain)
+static int ssl_sock_load_ocsp(SSL_CTX *ctx, struct ckch_data *data, STACK_OF(X509) *chain)
 {
 	return SSL_CTX_set_ocsp_response(ctx, (const uint8_t *)ckch->ocsp_response->area, ckch->ocsp_response->data);
 }
@@ -3729,7 +3401,7 @@ end:
  * The value 0 means there is no error nor warning and
  * the operation succeed.
  */
-static int ssl_sock_put_ckch_into_ctx(const char *path, const struct ckch_data *data, SSL_CTX *ctx, char **err)
+static int ssl_sock_put_ckch_into_ctx(const char *path, struct ckch_data *data, SSL_CTX *ctx, char **err)
 {
 	int errcode = 0;
 	STACK_OF(X509) *find_chain = NULL;
@@ -3778,14 +3450,20 @@ static int ssl_sock_put_ckch_into_ctx(const char *path, const struct ckch_data *
 #endif
 
 #if ((defined SSL_CTRL_SET_TLSEXT_STATUS_REQ_CB && !defined OPENSSL_NO_OCSP) || defined OPENSSL_IS_BORINGSSL)
-	/* Load OCSP Info into context */
-	if (data->ocsp_response) {
-		if (ssl_sock_load_ocsp(ctx, data, find_chain) < 0) {
+	/* Load OCSP Info into context
+	 * If OCSP update mode is set to 'on', an entry will be created in the
+	 * ocsp tree even if no ocsp_response was known during init, unless the
+	 * frontend's conf disables ocsp update explicitely.
+	 */
+	if (ssl_sock_load_ocsp(ctx, data, find_chain) < 0) {
+		if (data->ocsp_response)
 			memprintf(err, "%s '%s.ocsp' is present and activates OCSP but it is impossible to compute the OCSP certificate ID (maybe the issuer could not be found)'.\n",
-			          err && *err ? *err : "", path);
-			errcode |= ERR_ALERT | ERR_FATAL;
-			goto end;
-		}
+				  err && *err ? *err : "", path);
+		else
+			memprintf(err, "%s '%s' has an OCSP URI and OCSP auto-update is set to 'on' but an error occurred (maybe the issuer could not be found)'.\n",
+				  err && *err ? *err : "", path);
+		errcode |= ERR_ALERT | ERR_FATAL;
+		goto end;
 	}
 #endif
 
@@ -7531,216 +7209,6 @@ static int cli_parse_set_tlskeys(char **args, char *payload, struct appctx *appc
 }
 #endif
 
-static int cli_parse_set_ocspresponse(char **args, char *payload, struct appctx *appctx, void *private)
-{
-#if (defined SSL_CTRL_SET_TLSEXT_STATUS_REQ_CB && !defined OPENSSL_NO_OCSP)
-	char *err = NULL;
-	int i, j, ret;
-
-	if (!payload)
-		payload = args[3];
-
-	/* Expect one parameter: the new response in base64 encoding */
-	if (!*payload)
-		return cli_err(appctx, "'set ssl ocsp-response' expects response in base64 encoding.\n");
-
-	/* remove \r and \n from the payload */
-	for (i = 0, j = 0; payload[i]; i++) {
-		if (payload[i] == '\r' || payload[i] == '\n')
-			continue;
-		payload[j++] = payload[i];
-	}
-	payload[j] = 0;
-
-	ret = base64dec(payload, j, trash.area, trash.size);
-	if (ret < 0)
-		return cli_err(appctx, "'set ssl ocsp-response' received invalid base64 encoded response.\n");
-
-	trash.data = ret;
-	if (ssl_sock_update_ocsp_response(&trash, &err)) {
-		if (err)
-			return cli_dynerr(appctx, memprintf(&err, "%s.\n", err));
-		else
-			return cli_err(appctx, "Failed to update OCSP response.\n");
-	}
-
-	return cli_msg(appctx, LOG_INFO, "OCSP Response updated!\n");
-#else
-	return cli_err(appctx, "HAProxy was compiled against a version of OpenSSL that doesn't support OCSP stapling.\n");
-#endif
-
-}
-
-
-#if ((defined SSL_CTRL_SET_TLSEXT_STATUS_REQ_CB && !defined OPENSSL_NO_OCSP) && !defined OPENSSL_IS_BORINGSSL)
-static int cli_io_handler_show_ocspresponse_detail(struct appctx *appctx);
-#endif
-
-/* parsing function for 'show ssl ocsp-response [id]'. If an entry is forced,
- * it's set into appctx->svcctx.
- */
-static int cli_parse_show_ocspresponse(char **args, char *payload, struct appctx *appctx, void *private)
-{
-#if ((defined SSL_CTRL_SET_TLSEXT_STATUS_REQ_CB && !defined OPENSSL_NO_OCSP) && !defined OPENSSL_IS_BORINGSSL)
-	if (*args[3]) {
-		struct certificate_ocsp *ocsp = NULL;
-		char key[OCSP_MAX_CERTID_ASN1_LENGTH] = {};
-		int key_length = OCSP_MAX_CERTID_ASN1_LENGTH;
-		char *key_ptr = key;
-
-		if (strlen(args[3]) > OCSP_MAX_CERTID_ASN1_LENGTH*2) {
-			return cli_err(appctx, "'show ssl ocsp-response' received a too big key.\n");
-		}
-
-		if (!parse_binary(args[3], &key_ptr, &key_length, NULL)) {
-			return cli_err(appctx, "'show ssl ocsp-response' received an invalid key.\n");
-		}
-
-		ocsp = (struct certificate_ocsp *)ebmb_lookup(&cert_ocsp_tree, key, OCSP_MAX_CERTID_ASN1_LENGTH);
-
-		if (!ocsp) {
-			return cli_err(appctx, "Certificate ID does not match any certificate.\n");
-		}
-
-		appctx->svcctx = ocsp;
-		appctx->io_handler = cli_io_handler_show_ocspresponse_detail;
-	}
-
-	return 0;
-
-#else
-	return cli_err(appctx, "HAProxy was compiled against a version of OpenSSL that doesn't support OCSP stapling.\n");
-#endif
-}
-
-
-#if ((defined SSL_CTRL_SET_TLSEXT_STATUS_REQ_CB && !defined OPENSSL_NO_OCSP) && !defined OPENSSL_IS_BORINGSSL)
-/*
- * This function dumps the details of an OCSP_CERTID. It is based on
- * ocsp_certid_print in OpenSSL.
- */
-static inline int ocsp_certid_print(BIO *bp, OCSP_CERTID *certid, int indent)
-{
-	ASN1_OCTET_STRING *piNameHash = NULL;
-	ASN1_OCTET_STRING *piKeyHash = NULL;
-	ASN1_INTEGER *pSerial = NULL;
-
-	if (OCSP_id_get0_info(&piNameHash, NULL, &piKeyHash, &pSerial, certid)) {
-
-		BIO_printf(bp, "%*sCertificate ID:\n", indent, "");
-		indent += 2;
-		BIO_printf(bp, "%*sIssuer Name Hash: ", indent, "");
-#ifndef USE_OPENSSL_WOLFSSL
-		i2a_ASN1_STRING(bp, piNameHash, 0);
-#else
-        wolfSSL_ASN1_STRING_print(bp, piNameHash);
-#endif
-		BIO_printf(bp, "\n%*sIssuer Key Hash: ", indent, "");
-#ifndef USE_OPENSSL_WOLFSSL
-		i2a_ASN1_STRING(bp, piKeyHash, 0);
-#else
-		wolfSSL_ASN1_STRING_print(bp, piNameHash);
-#endif
-		BIO_printf(bp, "\n%*sSerial Number: ", indent, "");
-		i2a_ASN1_INTEGER(bp, pSerial);
-	}
-	return 1;
-}
-#endif
-
-/*
- * IO handler of "show ssl ocsp-response". The command taking a specific ID
- * is managed in cli_io_handler_show_ocspresponse_detail.
- * The current entry is taken from appctx->svcctx.
- */
-static int cli_io_handler_show_ocspresponse(struct appctx *appctx)
-{
-#if ((defined SSL_CTRL_SET_TLSEXT_STATUS_REQ_CB && !defined OPENSSL_NO_OCSP) && !defined OPENSSL_IS_BORINGSSL)
-	struct buffer *trash = alloc_trash_chunk();
-	struct buffer *tmp = NULL;
-	struct ebmb_node *node;
-	struct certificate_ocsp *ocsp = NULL;
-	BIO *bio = NULL;
-	int write = -1;
-
-	if (trash == NULL)
-		return 1;
-
-	tmp = alloc_trash_chunk();
-	if (!tmp)
-		goto end;
-
-	if ((bio = BIO_new(BIO_s_mem())) == NULL)
-		goto end;
-
-	if (!appctx->svcctx) {
-		chunk_appendf(trash, "# Certificate IDs\n");
-		node = ebmb_first(&cert_ocsp_tree);
-	} else {
-		node = &((struct certificate_ocsp *)appctx->svcctx)->key;
-	}
-
-	while (node) {
-		OCSP_CERTID *certid = NULL;
-		const unsigned char *p = NULL;
-		int i;
-
-		ocsp = ebmb_entry(node, struct certificate_ocsp, key);
-
-		/* Dump the key in hexadecimal */
-		chunk_appendf(trash, "Certificate ID key : ");
-		for (i = 0; i < ocsp->key_length; ++i) {
-			chunk_appendf(trash, "%02x", ocsp->key_data[i]);
-		}
-		chunk_appendf(trash, "\n");
-
-		p = ocsp->key_data;
-
-		/* Decode the certificate ID (serialized into the key). */
-		d2i_OCSP_CERTID(&certid, &p, ocsp->key_length);
-		if (!certid)
-			goto end;
-
-		/* Dump the CERTID info */
-		ocsp_certid_print(bio, certid, 1);
-		OCSP_CERTID_free(certid);
-		write = BIO_read(bio, tmp->area, tmp->size-1);
-		/* strip trailing LFs */
-		while (write > 0 && tmp->area[write-1] == '\n')
-			write--;
-		tmp->area[write] = '\0';
-
-		chunk_appendf(trash, "%s\n", tmp->area);
-
-		node = ebmb_next(node);
-		if (applet_putchk(appctx, trash) == -1)
-			goto yield;
-	}
-
-end:
-	appctx->svcctx = NULL;
-	if (trash)
-		free_trash_chunk(trash);
-	if (tmp)
-		free_trash_chunk(tmp);
-	if (bio)
-		BIO_free(bio);
-	return 1;
-
-yield:
-
-	if (trash)
-		free_trash_chunk(trash);
-	if (tmp)
-		free_trash_chunk(tmp);
-	if (bio)
-		BIO_free(bio);
-	appctx->svcctx = ocsp;
-	return 0;
-#else
-	return cli_err(appctx, "HAProxy was compiled against a version of OpenSSL that doesn't support OCSP stapling.\n");
-#endif
-}
 
 #ifdef HAVE_SSL_PROVIDERS
 struct provider_name {
@@ -7818,134 +7286,12 @@ yield:
 #endif
 
 
-#if ((defined SSL_CTRL_SET_TLSEXT_STATUS_REQ_CB && !defined OPENSSL_NO_OCSP) && !defined OPENSSL_IS_BORINGSSL)
-/*
- * Dump the details about an OCSP response in DER format stored in
- * <ocsp_response> into buffer <out>.
- * Returns 0 in case of success.
- */
-int ssl_ocsp_response_print(struct buffer *ocsp_response, struct buffer *out)
-{
-	BIO *bio = NULL;
-	int write = -1;
-	OCSP_RESPONSE *resp;
-	const unsigned char *p;
-	int retval = -1;
-
-	if (!ocsp_response)
-		return -1;
-
-	if ((bio = BIO_new(BIO_s_mem())) == NULL)
-		return -1;
-
-	p = (const unsigned char*)ocsp_response->area;
-
-	resp = d2i_OCSP_RESPONSE(NULL, &p, ocsp_response->data);
-	if (!resp) {
-		chunk_appendf(out, "Unable to parse OCSP response");
-		goto end;
-	}
-
-#ifndef USE_OPENSSL_WOLFSSL
-   if (OCSP_RESPONSE_print(bio, resp, 0) != 0) {
-#else
-   if (wolfSSL_d2i_OCSP_RESPONSE_bio(bio, &resp) != 0) {
-#endif
-		struct buffer *trash = get_trash_chunk();
-		struct ist ist_block = IST_NULL;
-		struct ist ist_double_lf = IST_NULL;
-		static struct ist double_lf = IST("\n\n");
-
-		write = BIO_read(bio, trash->area, trash->size - 1);
-		if (write <= 0)
-			goto end;
-		trash->data = write;
-
-		/* Look for empty lines in the 'trash' buffer and add a space to
-		 * the beginning to avoid having empty lines in the output
-		 * (without changing the appearance of the information
-		 * displayed).
-		 */
-		ist_block = ist2(b_orig(trash), b_data(trash));
-
-		ist_double_lf = istist(ist_block, double_lf);
-
-		while (istlen(ist_double_lf)) {
-			/* istptr(ist_double_lf) points to the first \n of a
-			 * \n\n pattern.
-			 */
-			uint empty_line_offset = istptr(ist_double_lf) + 1 - istptr(ist_block);
-
-			/* Write up to the first '\n' of the "\n\n" pattern into
-			 * the output buffer.
-			 */
-			b_putblk(out, istptr(ist_block), empty_line_offset);
-			/* Add an extra space. */
-			b_putchr(out, ' ');
-
-			/* Keep looking for empty lines in the rest of the data. */
-			ist_block = istadv(ist_block, empty_line_offset);
-
-			ist_double_lf = istist(ist_block, double_lf);
-		}
-
-		retval = (b_istput(out, ist_block) <= 0);
-	}
-
-end:
-	if (bio)
-		BIO_free(bio);
-
-	OCSP_RESPONSE_free(resp);
-
-	return retval;
-}
-
-/*
- * Dump the details of the OCSP response of ID <ocsp_certid> into buffer <out>.
- * Returns 0 in case of success.
- */
-int ssl_get_ocspresponse_detail(unsigned char *ocsp_certid, struct buffer *out)
-{
-	struct certificate_ocsp *ocsp;
-
-	ocsp = (struct certificate_ocsp *)ebmb_lookup(&cert_ocsp_tree, ocsp_certid, OCSP_MAX_CERTID_ASN1_LENGTH);
-	if (!ocsp)
-		return -1;
-
-	return ssl_ocsp_response_print(&ocsp->response, out);
-}
-
-
-/* IO handler of details "show ssl ocsp-response <id>".
- * The current entry is taken from appctx->svcctx.
- */
-static int cli_io_handler_show_ocspresponse_detail(struct appctx *appctx)
-{
-	struct buffer *trash = get_trash_chunk();
-	struct certificate_ocsp *ocsp = appctx->svcctx;
-
-	if (ssl_ocsp_response_print(&ocsp->response, trash))
-		goto end;
-
-	if (applet_putchk(appctx, trash) == -1)
-		return 0;
-
-end:
-	appctx->svcctx = NULL;
-	return 1;
-}
-#endif
-
 /* register cli keywords */
 static struct cli_kw_list cli_kws = {{ },{
 #if (defined SSL_CTRL_SET_TLSEXT_TICKET_KEY_CB && TLS_TICKETS_NO > 0)
-	{ { "show", "tls-keys", NULL },            "show tls-keys [id|*]                    : show tls keys references or dump tls ticket keys when id specified", cli_parse_show_tlskeys, cli_io_handler_tlskeys_files },
-	{ { "set", "ssl", "tls-key", NULL },       "set ssl tls-key [id|file] <key>         : set the next TLS key for the <id> or <file> listener to <key>",      cli_parse_set_tlskeys, NULL },
+	{ { "show", "tls-keys", NULL },               "show tls-keys [id|*]                    : show tls keys references or dump tls ticket keys when id specified", cli_parse_show_tlskeys, cli_io_handler_tlskeys_files },
+	{ { "set", "ssl", "tls-key", NULL },          "set ssl tls-key [id|file] <key>         : set the next TLS key for the <id> or <file> listener to <key>",      cli_parse_set_tlskeys, NULL },
 #endif
-	{ { "set", "ssl", "ocsp-response", NULL }, "set ssl ocsp-response <resp|payload>    : update a certificate's OCSP Response from a base64-encode DER",      cli_parse_set_ocspresponse, NULL },
-
-	{ { "show", "ssl", "ocsp-response", NULL },"show ssl ocsp-response [id]             : display the IDs of the OCSP responses used in memory, or the details of a single OCSP response", cli_parse_show_ocspresponse, cli_io_handler_show_ocspresponse, NULL },
 #ifdef HAVE_SSL_PROVIDERS
 	{ { "show", "ssl", "providers", NULL },    "show ssl providers                      : show loaded SSL providers", NULL, cli_io_handler_show_providers },
 #endif
@@ -8025,29 +7371,6 @@ static void ssl_sock_sctl_free_func(void *parent, void *ptr, CRYPTO_EX_DATA *ad,
 
 #endif
 
-#if ((defined SSL_CTRL_SET_TLSEXT_STATUS_REQ_CB && !defined OPENSSL_NO_OCSP) && !defined OPENSSL_IS_BORINGSSL)
-static void ssl_sock_ocsp_free_func(void *parent, void *ptr, CRYPTO_EX_DATA *ad, int idx, long argl, void *argp)
-{
-	struct ocsp_cbk_arg *ocsp_arg;
-
-	if (ptr) {
-		ocsp_arg = ptr;
-
-		if (ocsp_arg->is_single) {
-			ssl_sock_free_ocsp(ocsp_arg->s_ocsp);
-			ocsp_arg->s_ocsp = NULL;
-		} else {
-			int i;
-
-			for (i = 0; i < SSL_SOCK_NUM_KEYTYPES; i++) {
-				ssl_sock_free_ocsp(ocsp_arg->m_ocsp[i]);
-				ocsp_arg->m_ocsp[i] = NULL;
-			}
-		}
-		free(ocsp_arg);
-	}
-}
-#endif
 
 static void ssl_sock_capture_free_func(void *parent, void *ptr, CRYPTO_EX_DATA *ad, int idx, long argl, void *argp)
 {
@@ -8178,6 +7501,8 @@ static void __ssl_sock_init(void)
 	BIO_meth_set_gets(ha_meth, ha_ssl_gets);
 
 	HA_SPIN_INIT(&ckch_lock);
+
+	HA_SPIN_INIT(&ocsp_tree_lock);
 
 	/* Try to register dedicated SSL/TLS protocol message callbacks for
 	 * heartbleed attack (CVE-2014-0160) and clienthello.
@@ -8320,6 +7645,10 @@ static void __ssl_sock_deinit(void)
         CRYPTO_cleanup_all_ex_data();
 #endif
 	BIO_meth_free(ha_meth);
+
+#if !defined OPENSSL_NO_OCSP
+	ssl_destroy_ocsp_update_task();
+#endif
 }
 REGISTER_POST_DEINIT(__ssl_sock_deinit);
 

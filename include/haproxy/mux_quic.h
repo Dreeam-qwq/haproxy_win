@@ -21,10 +21,12 @@ void qcs_notify_send(struct qcs *qcs);
 
 void qcc_emit_cc_app(struct qcc *qcc, int err, int immediate);
 void qcc_reset_stream(struct qcs *qcs, int err);
+void qcc_abort_stream_read(struct qcs *qcs);
 int qcc_recv(struct qcc *qcc, uint64_t id, uint64_t len, uint64_t offset,
              char fin, char *data);
 int qcc_recv_max_data(struct qcc *qcc, uint64_t max);
 int qcc_recv_max_stream_data(struct qcc *qcc, uint64_t id, uint64_t max);
+int qcc_recv_reset_stream(struct qcc *qcc, uint64_t id, uint64_t err, uint64_t final_size);
 int qcc_recv_stop_sending(struct qcc *qcc, uint64_t id, uint64_t err);
 void qcc_streams_sent_done(struct qcs *qcs, uint64_t data, uint64_t offset);
 
@@ -120,7 +122,7 @@ static inline struct stconn *qc_attach_sc(struct qcs *qcs, struct buffer *buf)
 	 * it to sedesc. See <qcs_wait_http_req> for more info.
 	 */
 	BUG_ON_HOT(!LIST_INLIST(&qcs->el_opening));
-	LIST_DELETE(&qcs->el_opening);
+	LIST_DEL_INIT(&qcs->el_opening);
 
 	return qcs->sd->sc;
 }

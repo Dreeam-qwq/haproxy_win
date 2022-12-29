@@ -39,7 +39,6 @@
 
 #include <string.h>
 
-
 static struct proxy *httpclient_proxy;
 
 #ifdef USE_OPENSSL
@@ -59,12 +58,6 @@ static char *resolvers_prefer = NULL;
  * The functions will be  starting by "hc_cli" for "httpclient cli"
  */
 
-/* What kind of data we need to read */
-#define HC_CLI_F_RES_STLINE     0x01
-#define HC_CLI_F_RES_HDR        0x02
-#define	HC_CLI_F_RES_BODY       0x04
-#define HC_CLI_F_RES_END        0x08
-
 /* the CLI context for the httpclient command */
 struct hcli_svc_ctx {
 	struct httpclient *hc;  /* the httpclient instance */
@@ -83,7 +76,7 @@ void hc_cli_res_stline_cb(struct httpclient *hc)
 		return;
 
 	ctx = appctx->svcctx;
-	ctx->flags |= HC_CLI_F_RES_STLINE;
+	ctx->flags |= HC_F_RES_STLINE;
 	appctx_wakeup(appctx);
 }
 
@@ -96,7 +89,7 @@ void hc_cli_res_headers_cb(struct httpclient *hc)
 		return;
 
 	ctx = appctx->svcctx;
-	ctx->flags |= HC_CLI_F_RES_HDR;
+	ctx->flags |= HC_F_RES_HDR;
 	appctx_wakeup(appctx);
 }
 
@@ -109,7 +102,7 @@ void hc_cli_res_body_cb(struct httpclient *hc)
 		return;
 
 	ctx = appctx->svcctx;
-	ctx->flags |= HC_CLI_F_RES_BODY;
+	ctx->flags |= HC_F_RES_BODY;
 	appctx_wakeup(appctx);
 }
 
@@ -122,7 +115,7 @@ void hc_cli_res_end_cb(struct httpclient *hc)
 		return;
 
 	ctx = appctx->svcctx;
-	ctx->flags |= HC_CLI_F_RES_END;
+	ctx->flags |= HC_F_RES_END;
 	appctx_wakeup(appctx);
 }
 
@@ -197,15 +190,15 @@ static int hc_cli_io_handler(struct appctx *appctx)
 	struct httpclient *hc = ctx->hc;
 	struct http_hdr *hdrs, *hdr;
 
-	if (ctx->flags & HC_CLI_F_RES_STLINE) {
+	if (ctx->flags & HC_F_RES_STLINE) {
 		chunk_printf(&trash, "%.*s %d %.*s\n", (unsigned int)istlen(hc->res.vsn), istptr(hc->res.vsn),
 			     hc->res.status, (unsigned int)istlen(hc->res.reason), istptr(hc->res.reason));
 		if (applet_putchk(appctx, &trash) == -1)
 			goto more;
-		ctx->flags &= ~HC_CLI_F_RES_STLINE;
+		ctx->flags &= ~HC_F_RES_STLINE;
 	}
 
-	if (ctx->flags & HC_CLI_F_RES_HDR) {
+	if (ctx->flags & HC_F_RES_HDR) {
 		chunk_reset(&trash);
 		hdrs = hc->res.hdrs;
 		for (hdr = hdrs; isttest(hdr->v); hdr++) {
@@ -216,10 +209,10 @@ static int hc_cli_io_handler(struct appctx *appctx)
 			goto too_many_hdrs;
 		if (applet_putchk(appctx, &trash) == -1)
 			goto more;
-		ctx->flags &= ~HC_CLI_F_RES_HDR;
+		ctx->flags &= ~HC_F_RES_HDR;
 	}
 
-	if (ctx->flags & HC_CLI_F_RES_BODY) {
+	if (ctx->flags & HC_F_RES_BODY) {
 		int ret;
 
 		ret = httpclient_res_xfer(hc, sc_ib(sc));
@@ -228,12 +221,12 @@ static int hc_cli_io_handler(struct appctx *appctx)
 		/* remove the flag if the buffer was emptied */
 		if (httpclient_data(hc))
 			goto more;
-		ctx->flags &= ~HC_CLI_F_RES_BODY;
+		ctx->flags &= ~HC_F_RES_BODY;
 	}
 
 	/* we must close only if F_END is the last flag */
-	if (ctx->flags ==  HC_CLI_F_RES_END) {
-		ctx->flags &= ~HC_CLI_F_RES_END;
+	if (ctx->flags ==  HC_F_RES_END) {
+		ctx->flags &= ~HC_F_RES_END;
 		goto end;
 	}
 
@@ -349,7 +342,7 @@ int httpclient_req_gen(struct httpclient *hc, const struct ist url, enum http_me
 	if (!htx_add_endof(htx, HTX_BLK_EOH))
 		goto error;
 
-	if (isttest(payload)) {
+	if (isttest(payload) && istlen(payload)) {
 		/* add the payload if it can feat in the buffer, no need to set
 		 * the Content-Length, the data will be sent chunked */
 		if (!htx_add_data_atonce(htx, payload))
@@ -1220,7 +1213,7 @@ struct proxy *httpclient_create_proxy(const char *id)
 	px->conn_retries = CONN_RETRIES;
 	px->timeout.client = TICK_ETERNITY;
 	/* The HTTP Client use the "option httplog" with the global log server */
-	px->conf.logformat_string = default_http_log_format;
+	px->conf.logformat_string = httpclient_log_format;
 	px->http_needed = 1;
 
 	/* clear HTTP server */
