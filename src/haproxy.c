@@ -1,6 +1,6 @@
 /*
  * HAProxy : High Availability-enabled HTTP/TCP proxy
- * Copyright 2000-2022 Willy Tarreau <willy@haproxy.org>.
+ * Copyright 2000-2023 Willy Tarreau <willy@haproxy.org>.
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License
@@ -204,6 +204,7 @@ struct global global = {
 #else
 		.idle_timer = 1000, /* 1 second */
 #endif
+		.nb_stk_ctr = MAX_SESS_STKCTR,
 #ifdef USE_QUIC
 		.quic_backend_max_idle_timeout = QUIC_TP_DFLT_BACK_MAX_IDLE_TIMEOUT,
 		.quic_frontend_max_idle_timeout = QUIC_TP_DFLT_FRONT_MAX_IDLE_TIMEOUT,
@@ -2073,7 +2074,13 @@ static void init(int argc, char **argv)
 		if (LIST_ISEMPTY(&cfg_cfgfiles))
 			usage(progname);
 
-
+		/* temporary create environment variables with default
+		 * values to ease user configuration. Do not forget to
+		 * unset them after the list_for_each_entry loop.
+		 */
+		setenv("HAPROXY_HTTP_LOG_FMT", default_http_log_format, 1);
+		setenv("HAPROXY_HTTPS_LOG_FMT", default_https_log_format, 1);
+		setenv("HAPROXY_TCP_LOG_FMT", default_tcp_log_format, 1);
 		list_for_each_entry(wl, &cfg_cfgfiles, list) {
 			int ret;
 
@@ -2099,6 +2106,10 @@ static void init(int argc, char **argv)
 				exit(1);
 			}
 		}
+		/* remove temporary environment variables. */
+		unsetenv("HAPROXY_HTTP_LOG_FMT");
+		unsetenv("HAPROXY_HTTPS_LOG_FMT");
+		unsetenv("HAPROXY_TCP_LOG_FMT");
 
 		/* do not try to resolve arguments nor to spot inconsistencies when
 		 * the configuration contains fatal errors caused by files not found
@@ -2812,10 +2823,10 @@ void deinit(void)
 	idle_conn_task = NULL;
 
 	list_for_each_entry_safe(log, logb, &global.logsrvs, list) {
-			LIST_DELETE(&log->list);
-			free(log->conf.file);
-			free(log);
-		}
+		LIST_DEL_INIT(&log->list);
+		free_logsrv(log);
+	}
+
 	list_for_each_entry_safe(wl, wlb, &cfg_cfgfiles, list) {
 		free(wl->s);
 		LIST_DELETE(&wl->list);
@@ -2957,7 +2968,7 @@ void run_poll_loop()
 				    _HA_ATOMIC_OR_FETCH(&stopping_tgroup_mask, tg->tgid_bit) == tg->tgid_bit) {
 					/* first one to detect it, notify all threads that stopping was just set */
 					for (i = 0; i < global.nbthread; i++) {
-						if (ha_thread_info[i].tg->threads_enabled &
+						if (_HA_ATOMIC_LOAD(&ha_thread_info[i].tg->threads_enabled) &
 						    ha_thread_info[i].ltid_bit &
 						    ~_HA_ATOMIC_LOAD(&ha_thread_info[i].tg_ctx->stopping_threads))
 							wake_thread(i);
@@ -2970,14 +2981,15 @@ void run_poll_loop()
 			    (_HA_ATOMIC_LOAD(&stopping_tgroup_mask) & all_tgroups_mask) == all_tgroups_mask) {
 				/* check that all threads are aware of the stopping status */
 				for (i = 0; i < global.nbtgroups; i++)
-					if ((_HA_ATOMIC_LOAD(&ha_tgroup_ctx[i].stopping_threads) & ha_tgroup_info[i].threads_enabled) !=
-					    ha_tgroup_info[i].threads_enabled)
+					if ((_HA_ATOMIC_LOAD(&ha_tgroup_ctx[i].stopping_threads) &
+					     _HA_ATOMIC_LOAD(&ha_tgroup_info[i].threads_enabled)) !=
+					    _HA_ATOMIC_LOAD(&ha_tgroup_info[i].threads_enabled))
 						break;
 #ifdef USE_THREAD
 				if (i == global.nbtgroups) {
 					/* all are OK, let's wake them all and stop */
 					for (i = 0; i < global.nbthread; i++)
-						if (i != tid && ha_thread_info[i].tg->threads_enabled & ha_thread_info[i].ltid_bit)
+						if (i != tid && _HA_ATOMIC_LOAD(&ha_thread_info[i].tg->threads_enabled) & ha_thread_info[i].ltid_bit)
 							wake_thread(i);
 					break;
 				}

@@ -378,7 +378,7 @@ static inline void channel_add_input(struct channel *chn, unsigned int len)
 	}
 	/* notify that some data was read */
 	chn->total += len;
-	chn->flags |= CF_READ_PARTIAL;
+	chn->flags |= CF_READ_EVENT;
 }
 
 static inline unsigned long long channel_htx_forward(struct channel *chn, struct htx *htx, unsigned long long bytes)
@@ -530,17 +530,17 @@ static inline int channel_output_closed(struct channel *chn)
  */
 static inline void channel_check_timeouts(struct channel *chn)
 {
-	if (likely(!(chn->flags & (CF_SHUTR|CF_READ_TIMEOUT|CF_READ_ACTIVITY|CF_READ_NOEXP))) &&
+	if (likely(!(chn->flags & (CF_SHUTR|CF_READ_TIMEOUT|CF_READ_EVENT|CF_READ_NOEXP))) &&
 	    unlikely(tick_is_expired(chn->rex, now_ms)))
 		chn->flags |= CF_READ_TIMEOUT;
 
-	if (likely(!(chn->flags & (CF_SHUTW|CF_WRITE_TIMEOUT|CF_WRITE_ACTIVITY))) &&
+	if (likely(!(chn->flags & (CF_SHUTW|CF_WRITE_TIMEOUT|CF_WRITE_EVENT))) &&
 	    unlikely(tick_is_expired(chn->wex, now_ms)))
 		chn->flags |= CF_WRITE_TIMEOUT;
 
-	if (likely(!(chn->flags & CF_ANA_TIMEOUT)) &&
+	if (likely(!(chn->flags & CF_READ_EVENT)) &&
 	    unlikely(tick_is_expired(chn->analyse_exp, now_ms)))
-		chn->flags |= CF_ANA_TIMEOUT;
+		chn->flags |= CF_READ_EVENT;
 }
 
 /* Erase any content from channel <buf> and adjusts flags accordingly. Note

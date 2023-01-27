@@ -79,6 +79,7 @@
 #define GTUNE_DISABLE_ACTIVE_CLOSE (1<<22)
 #define GTUNE_QUICK_EXIT         (1<<23)
 #define GTUNE_QUIC_SOCK_PER_CONN (1<<24)
+#define GTUNE_NO_QUIC            (1<<25)
 
 /* SSL server verify mode */
 enum {
@@ -162,6 +163,7 @@ struct global {
 		int pool_high_count;  /* max number of opened fd before we start killing idle connections when creating new connections */
 		size_t pool_cache_size;    /* per-thread cache size per pool (defaults to CONFIG_HAP_POOL_CACHE_SIZE) */
 		unsigned short idle_timer; /* how long before an empty buffer is considered idle (ms) */
+		int nb_stk_ctr;       /* number of stick counters, defaults to MAX_SESS_STKCTR */
 #ifdef USE_QUIC
 		unsigned int quic_backend_max_idle_timeout;
 		unsigned int quic_frontend_max_idle_timeout;
@@ -197,10 +199,7 @@ struct global {
 	struct freq_ctr ssl_be_keys_per_sec;
 	struct freq_ctr comp_bps_in;	/* bytes per second, before http compression */
 	struct freq_ctr comp_bps_out;	/* bytes per second, after http compression */
-	struct freq_ctr out_32bps;      /* #of 32-byte blocks emitted per second */
 	uint sslconns, totalsslconns;   /* active, total # of SSL conns */
-	unsigned long long out_bytes;   /* total #of bytes emitted */
-	unsigned long long spliced_out_bytes; /* total #of bytes emitted though a kernel pipe */
 	int cps_lim, cps_max;
 	int sps_lim, sps_max;
 	int ssl_lim, ssl_max;

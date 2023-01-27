@@ -330,8 +330,7 @@ static void sink_forward_io_handler(struct appctx *appctx)
 	/* rto should not change but it seems the case */
 	sc_oc(sc)->rto = TICK_ETERNITY;
 
-	/* an error was detected */
-	if (unlikely(sc_ic(sc)->flags & (CF_WRITE_ERROR|CF_SHUTW)))
+	if (unlikely(sc_ic(sc)->flags & CF_SHUTW))
 		goto close;
 
 	/* con closed by server side */
@@ -446,7 +445,7 @@ static void sink_forward_io_handler(struct appctx *appctx)
 close:
 	sc_shutw(sc);
 	sc_shutr(sc);
-	sc_ic(sc)->flags |= CF_READ_NULL;
+	sc_ic(sc)->flags |= CF_READ_EVENT;
 }
 
 /*
@@ -480,7 +479,7 @@ static void sink_forward_oc_io_handler(struct appctx *appctx)
 	sc_oc(sc)->rto = TICK_ETERNITY;
 
 	/* an error was detected */
-	if (unlikely(sc_ic(sc)->flags & (CF_WRITE_ERROR|CF_SHUTW)))
+	if (unlikely(sc_ic(sc)->flags & CF_SHUTW))
 		goto close;
 
 	/* con closed by server side */
@@ -590,7 +589,7 @@ static void sink_forward_oc_io_handler(struct appctx *appctx)
 close:
 	sc_shutw(sc);
 	sc_shutr(sc);
-	sc_ic(sc)->flags |= CF_READ_NULL;
+	sc_ic(sc)->flags |= CF_READ_EVENT;
 }
 
 void __sink_forward_session_deinit(struct sink_forward_target *sft)
@@ -1393,12 +1392,19 @@ static void sink_deinit()
 
 	list_for_each_entry_safe(sink, sb, &sink_list, sink_list) {
 		if (sink->type == SINK_TYPE_BUFFER) {
-			if (sink->store)
-				munmap(sink->ctx.ring->buf.area, sink->ctx.ring->buf.size);
+			if (sink->store) {
+				size_t size = (sink->ctx.ring->buf.size + 4095UL) & -4096UL;
+				void *area = (sink->ctx.ring->buf.area - sizeof(*sink->ctx.ring));
+
+				msync(area, size, MS_SYNC);
+				munmap(area, size);
+				ha_free(&sink->store);
+			}
 			else
 				ring_free(sink->ctx.ring);
 		}
 		LIST_DELETE(&sink->sink_list);
+		task_destroy(sink->forward_task);
 		free(sink->name);
 		free(sink->desc);
 		free(sink);

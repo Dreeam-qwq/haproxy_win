@@ -1564,9 +1564,13 @@ cfg_parse_track_sc_num(unsigned int *track_sc_num,
 		return -1;
 	}
 
-	if (num >= MAX_SESS_STKCTR) {
-		memprintf(errmsg, "%u track-sc number exceeding "
-		          "%d (MAX_SESS_STKCTR-1) value", num, MAX_SESS_STKCTR - 1);
+	if (num >= global.tune.nb_stk_ctr) {
+		if (!global.tune.nb_stk_ctr)
+			memprintf(errmsg, "%u track-sc number not usable, stick-counters "
+			          "are disabled by tune.stick-counters", num);
+		else
+			memprintf(errmsg, "%u track-sc number exceeding "
+			          "%d (tune.stick-counters-1) value", num, global.tune.nb_stk_ctr - 1);
 		return -1;
 	}
 
@@ -3958,20 +3962,6 @@ out_uri_auth_compat:
 				ha_warning("'redirect' rules ignored for %s '%s' as they require HTTP mode.\n",
 					   proxy_type_str(curproxy), curproxy->id);
 				err_code |= ERR_WARN;
-			}
-
-			if (curproxy->options & (PR_O_FWDFOR | PR_O_FF_ALWAYS)) {
-				ha_warning("'option %s' ignored for %s '%s' as it requires HTTP mode.\n",
-					   "forwardfor", proxy_type_str(curproxy), curproxy->id);
-				err_code |= ERR_WARN;
-				curproxy->options &= ~(PR_O_FWDFOR | PR_O_FF_ALWAYS);
-			}
-
-			if (curproxy->options & PR_O_ORGTO) {
-				ha_warning("'option %s' ignored for %s '%s' as it requires HTTP mode.\n",
-					   "originalto", proxy_type_str(curproxy), curproxy->id);
-				err_code |= ERR_WARN;
-				curproxy->options &= ~PR_O_ORGTO;
 			}
 
 			for (optnum = 0; cfg_opts[optnum].name; optnum++) {

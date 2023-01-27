@@ -366,7 +366,7 @@ void fd_delete(int fd)
 	/* the tgid cannot change before a complete close so we should never
 	 * face the situation where we try to close an fd that was reassigned.
 	 */
-	BUG_ON(fd_tgid(fd) != ti->tgid && !thread_isolated());
+	BUG_ON(fd_tgid(fd) != ti->tgid && !thread_isolated() && !(global.mode & MODE_STOPPING));
 
 	/* we must postpone removal of an FD that may currently be in use
 	 * by another thread. This can happen in the following two situations:
@@ -481,12 +481,14 @@ void updt_fd_polling(const int fd)
 		unsigned long update_mask = fdtab[fd].update_mask;
 		int thr;
 
-		while (!_HA_ATOMIC_CAS(&fdtab[fd].update_mask, &update_mask, ha_tgroup_info[tgrp - 1].threads_enabled))
+		while (!_HA_ATOMIC_CAS(&fdtab[fd].update_mask, &update_mask,
+		                       _HA_ATOMIC_LOAD(&ha_tgroup_info[tgrp - 1].threads_enabled)))
 			__ha_cpu_relax();
 
 		fd_add_to_fd_list(&update_list[tgrp - 1], fd);
 
-		thr = one_among_mask(fdtab[fd].thread_mask & tg->threads_enabled, statistical_prng_range(tg->count));
+		thr = one_among_mask(fdtab[fd].thread_mask & ha_tgroup_info[tgrp - 1].threads_enabled,
+		                     statistical_prng_range(ha_tgroup_info[tgrp - 1].count));
 		thr += ha_tgroup_info[tgrp - 1].base;
 		wake_thread(thr);
 
@@ -515,8 +517,8 @@ void updt_fd_polling(const int fd)
 			 * so let's pick a random one so that it doesn't always end up on the same.
 			 */
 			int thr = one_among_mask(fdtab[fd].thread_mask & tg->threads_enabled,
-			                         statistical_prng_range(MAX_THREADS));
-			thr += ha_tgroup_info[tgid - 1].base;
+			                         statistical_prng_range(tg->count));
+			thr += tg->base;
 			wake_thread(thr);
 		}
 	}

@@ -31,7 +31,7 @@
  *
  *   - pure status flags, reported by the data layer, which must be cleared
  *     before doing further I/O :
- *     CF_*_NULL, CF_*_PARTIAL
+ *     CF_*_EVENT, CF_*_PARTIAL
  *
  *   - pure status flags, reported by stream connector layer, which must also
  *     be cleared before doing further I/O :
@@ -53,22 +53,20 @@
  * Please also update the chn_show_flags() function below in case of changes.
  */
 
-#define CF_READ_NULL      0x00000001  /* last read detected on producer side */
-#define CF_READ_PARTIAL   0x00000002  /* some data were read from producer or a read exception occurred */
+#define CF_READ_EVENT     0x00000001  /* a read event detected on producer side */
+/* unused: 0x00000002 */
 #define CF_READ_TIMEOUT   0x00000004  /* timeout while waiting for producer */
 #define CF_READ_ERROR     0x00000008  /* unrecoverable error on producer side */
-#define CF_READ_ACTIVITY  (CF_READ_NULL|CF_READ_PARTIAL|CF_READ_ERROR)
 
 /* unused: 0x00000010 */
 #define CF_SHUTR          0x00000020  /* producer has already shut down */
 #define CF_SHUTR_NOW      0x00000040  /* the producer must shut down for reads ASAP */
 #define CF_READ_NOEXP     0x00000080  /* producer should not expire */
 
-#define CF_WRITE_NULL     0x00000100  /* write(0) or connect() succeeded on consumer side */
-#define CF_WRITE_PARTIAL  0x00000200  /* some data were written to the consumer */
+#define CF_WRITE_EVENT    0x00000100  /* a write event detected on consumer side */
+/* unused: 0x00000200 */
 #define CF_WRITE_TIMEOUT  0x00000400  /* timeout while waiting for consumer */
 #define CF_WRITE_ERROR    0x00000800  /* unrecoverable error on consumer side */
-#define CF_WRITE_ACTIVITY (CF_WRITE_NULL|CF_WRITE_PARTIAL|CF_WRITE_ERROR)
 
 #define CF_WAKE_WRITE     0x00001000  /* wake the task up when there's write activity */
 #define CF_SHUTW          0x00002000  /* consumer has already shut down */
@@ -106,8 +104,7 @@
 #define CF_STREAMER_FAST  0x00020000  /* the consumer seems to eat the stream very fast */
 
 #define CF_WROTE_DATA     0x00040000  /* some data were sent from this buffer */
-#define CF_ANA_TIMEOUT    0x00080000  /* the analyser timeout has expired */
-#define CF_READ_ATTACHED  0x00100000  /* the read side is attached for the first time */
+/* unused 0x00080000 - 0x00100000  */
 #define CF_KERN_SPLICING  0x00200000  /* kernel splicing desired for this channel */
 #define CF_READ_DONTWAIT  0x00400000  /* wake the task up after every read (eg: HTTP request) */
 #define CF_AUTO_CONNECT   0x00800000  /* consumer may attempt to establish a new connection */
@@ -123,7 +120,7 @@
 #define CF_ISRESP         0x80000000  /* 0 = request channel, 1 = response channel */
 
 /* Masks which define input events for stream analysers */
-#define CF_MASK_ANALYSER  (CF_READ_ATTACHED|CF_READ_ACTIVITY|CF_READ_TIMEOUT|CF_ANA_TIMEOUT|CF_WRITE_ACTIVITY|CF_WAKE_ONCE)
+#define CF_MASK_ANALYSER  (CF_READ_EVENT|CF_READ_ERROR|CF_READ_TIMEOUT|CF_WRITE_EVENT|CF_WRITE_ERROR|CF_WAKE_ONCE)
 
 /* Mask for static flags which cause analysers to be woken up when they change */
 #define CF_MASK_STATIC    (CF_SHUTR|CF_SHUTW|CF_SHUTR_NOW|CF_SHUTW_NOW)
@@ -138,15 +135,15 @@ static forceinline char *chn_show_flags(char *buf, size_t len, const char *delim
 	/* prologue */
 	_(0);
 	/* flags */
-	_(CF_READ_NULL, _(CF_READ_PARTIAL, _(CF_READ_TIMEOUT, _(CF_READ_ERROR,
-	_(CF_SHUTR, _(CF_SHUTR_NOW, _(CF_READ_NOEXP, _(CF_WRITE_NULL,
-	_(CF_WRITE_PARTIAL, _(CF_WRITE_TIMEOUT, _(CF_WRITE_ERROR,
+	_(CF_READ_EVENT, _(CF_READ_TIMEOUT, _(CF_READ_ERROR,
+	_(CF_SHUTR, _(CF_SHUTR_NOW, _(CF_READ_NOEXP, _(CF_WRITE_EVENT,
+	_(CF_WRITE_TIMEOUT, _(CF_WRITE_ERROR,
 	_(CF_WAKE_WRITE, _(CF_SHUTW, _(CF_SHUTW_NOW, _(CF_AUTO_CLOSE,
-	_(CF_STREAMER, _(CF_STREAMER_FAST, _(CF_WROTE_DATA, _(CF_ANA_TIMEOUT,
-	_(CF_READ_ATTACHED, _(CF_KERN_SPLICING, _(CF_READ_DONTWAIT,
+	_(CF_STREAMER, _(CF_STREAMER_FAST, _(CF_WROTE_DATA,
+	_(CF_KERN_SPLICING, _(CF_READ_DONTWAIT,
 	_(CF_AUTO_CONNECT, _(CF_DONT_READ, _(CF_EXPECT_MORE,
 	_(CF_SEND_DONTWAIT, _(CF_NEVER_WAIT, _(CF_WAKE_ONCE, _(CF_FLT_ANALYZE,
-	_(CF_EOI, _(CF_ISRESP)))))))))))))))))))))))))))))));
+	_(CF_EOI, _(CF_ISRESP)))))))))))))))))))))))))));
 	/* epilogue */
 	_(~0U);
 	return buf;

@@ -1184,7 +1184,7 @@ static void cli_io_handler(struct appctx *appctx)
 		 * on the response buffer.
 		 */
 		sc_shutr(sc);
-		res->flags |= CF_READ_NULL;
+		res->flags |= CF_READ_EVENT;
 	}
 
  out:
@@ -1227,7 +1227,7 @@ static int cli_io_handler_show_env(struct appctx *appctx)
 	struct stconn *sc = appctx_sc(appctx);
 	char **var = ctx->var;
 
-	if (unlikely(sc_ic(sc)->flags & (CF_WRITE_ERROR|CF_SHUTW)))
+	if (unlikely(sc_ic(sc)->flags & CF_SHUTW))
 		return 1;
 
 	chunk_reset(&trash);
@@ -1264,7 +1264,7 @@ static int cli_io_handler_show_fd(struct appctx *appctx)
 	int fd = fdctx->fd;
 	int ret = 1;
 
-	if (unlikely(sc_ic(sc)->flags & (CF_WRITE_ERROR|CF_SHUTW)))
+	if (unlikely(sc_ic(sc)->flags & CF_SHUTW))
 		goto end;
 
 	chunk_reset(&trash);
@@ -2694,7 +2694,7 @@ int pcli_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 		return 0;
 	}
 
-	if ((rep->flags & (CF_SHUTR|CF_READ_NULL))) {
+	if (rep->flags & CF_SHUTR) {
 		/* stream cleanup */
 
 		pcli_write_prompt(s);
@@ -2785,7 +2785,7 @@ int pcli_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 		sc_set_state(s->scb, SC_ST_INI);
 		s->scb->flags &= SC_FL_ISBACK | SC_FL_DONT_WAKE; /* we're in the context of process_stream */
 		s->req.flags &= ~(CF_SHUTW|CF_SHUTW_NOW|CF_AUTO_CONNECT|CF_WRITE_ERROR|CF_STREAMER|CF_STREAMER_FAST|CF_NEVER_WAIT|CF_WROTE_DATA);
-		s->res.flags &= ~(CF_SHUTR|CF_SHUTR_NOW|CF_READ_ATTACHED|CF_READ_ERROR|CF_READ_NOEXP|CF_STREAMER|CF_STREAMER_FAST|CF_WRITE_PARTIAL|CF_NEVER_WAIT|CF_WROTE_DATA|CF_READ_NULL);
+		s->res.flags &= ~(CF_SHUTR|CF_SHUTR_NOW|CF_READ_ERROR|CF_READ_NOEXP|CF_STREAMER|CF_STREAMER_FAST|CF_WRITE_EVENT|CF_NEVER_WAIT|CF_WROTE_DATA|CF_READ_EVENT);
 		s->flags &= ~(SF_DIRECT|SF_ASSIGNED|SF_BE_ASSIGNED|SF_FORCE_PRST|SF_IGNORE_PRST);
 		s->flags &= ~(SF_CURR_SESS|SF_REDIRECTABLE|SF_SRV_REUSED);
 		s->flags &= ~(SF_ERR_MASK|SF_FINST_MASK|SF_REDISP);

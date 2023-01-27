@@ -186,6 +186,7 @@ struct eb_root ocsp_update_tree = EB_ROOT; /* updatable ocsp responses sorted by
 #define SSL_OCSP_UPDATE_DELAY_MAX 60*60 /* 1H */
 #define SSL_OCSP_UPDATE_DELAY_MIN 5*60  /* 5 minutes */
 #define SSL_OCSP_UPDATE_MARGIN 60   /* 1 minute */
+#define SSL_OCSP_HTTP_ERR_REPLAY 60 /* 1 minute */
 
 /* This function starts to check if the OCSP response (in DER format) contained
  * in chunk 'ocsp_response' is valid (else exits on error).
@@ -363,6 +364,7 @@ void ssl_sock_free_ocsp(struct certificate_ocsp *ocsp)
 	if (!ocsp)
 		return;
 
+	HA_SPIN_LOCK(OCSP_LOCK, &ocsp_tree_lock);
 	ocsp->refcount--;
 	if (ocsp->refcount <= 0) {
 		ebmb_delete(&ocsp->key);
@@ -372,11 +374,14 @@ void ssl_sock_free_ocsp(struct certificate_ocsp *ocsp)
 		sk_X509_pop_free(ocsp->chain, X509_free);
 		ocsp->chain = NULL;
 		chunk_destroy(&ocsp->response);
-		free_trash_chunk(ocsp->uri);
-		ocsp->uri = NULL;
+		if (ocsp->uri) {
+			ha_free(&ocsp->uri->area);
+			ha_free(&ocsp->uri);
+		}
 
 		free(ocsp);
 	}
+	HA_SPIN_UNLOCK(OCSP_LOCK, &ocsp_tree_lock);
 }
 
 
@@ -640,8 +645,6 @@ int ssl_ocsp_create_request_details(const OCSP_CERTID *certid, struct buffer *re
 		goto end;
 	}
 
-	errcode = 0;
-
 	/* HTTP based OCSP requests can use either the GET or the POST method to
 	 * submit their requests. To enable HTTP caching, small requests (that
 	 * after encoding are less than 255 bytes), MAY be submitted using GET.
@@ -660,6 +663,7 @@ int ssl_ocsp_create_request_details(const OCSP_CERTID *certid, struct buffer *re
 
 		if (base64_ret < 0) {
 			memprintf(err, "%sa2base64() error\n", *err ? *err : "");
+			goto end;
 		}
 
 		b64buf->data = base64_ret;
@@ -668,11 +672,14 @@ int ssl_ocsp_create_request_details(const OCSP_CERTID *certid, struct buffer *re
 		                   query_encode_map, b64buf);
 		if (ret && *ret == '\0') {
 			req_url->data = ret - b_orig(req_url);
+			errcode = 0;
 		}
 	}
 	else {
 		chunk_cpy(req_body, bin_request);
+		errcode = 0;
 	}
+
 
 end:
 	OCSP_REQUEST_free(ocsp);
@@ -724,16 +731,30 @@ int ssl_ocsp_check_response(STACK_OF(X509) *chain, X509 *issuer,
 		goto end;
 	}
 
-	/* Add ocsp issuer certificate to a store in order verify the ocsp
-	 * response. */
+	/* Create a temporary store in which we add the certificate's chain
+	 * certificates. We assume that all those certificates can be trusted
+	 * because they were provided by the user.
+	 * The only ssl item that needs to be verified here is the OCSP
+	 * response.
+	 */
 	store = X509_STORE_new();
 	if (!store) {
 		memprintf(err, "X509_STORE_new() failed");
 		goto end;
 	}
-	X509_STORE_add_cert(store, issuer);
 
-	if (OCSP_basic_verify(basic, chain, store, 0) != 1) {
+	if (chain) {
+		int i = 0;
+		for (i = 0; i < sk_X509_num(chain); i++) {
+			X509 *cert = sk_X509_value(chain, i);
+			X509_STORE_add_cert(store, cert);
+		}
+	}
+
+	if (issuer)
+		X509_STORE_add_cert(store, issuer);
+
+	if (OCSP_basic_verify(basic, chain, store, OCSP_TRUSTOTHER) != 1) {
 		memprintf(err, "OCSP_basic_verify() failed");
 		goto end;
 	}
@@ -806,7 +827,6 @@ void ssl_sock_free_ocsp(struct certificate_ocsp *ocsp);
 void ssl_destroy_ocsp_update_task(void)
 {
 	struct eb64_node *node, *next;
-	struct certificate_ocsp *ocsp;
 	if (!ocsp_update_task)
 		return;
 
@@ -814,10 +834,8 @@ void ssl_destroy_ocsp_update_task(void)
 
 	node = eb64_first(&ocsp_update_tree);
 	while (node) {
-		ocsp = eb64_entry(node, struct certificate_ocsp, next_update);
 		next = eb64_next(node);
 		eb64_delete(node);
-		ssl_sock_free_ocsp(ocsp);
 		node = next;
 	}
 
@@ -825,6 +843,25 @@ void ssl_destroy_ocsp_update_task(void)
 
 	task_destroy(ocsp_update_task);
 	ocsp_update_task = NULL;
+
+	ssl_sock_free_ocsp(ssl_ocsp_task_ctx.cur_ocsp);
+	ssl_ocsp_task_ctx.cur_ocsp = NULL;
+}
+
+static inline void ssl_ocsp_set_next_update(struct certificate_ocsp *ocsp)
+{
+	int update_margin = (ocsp->expire >= SSL_OCSP_UPDATE_MARGIN) ? SSL_OCSP_UPDATE_MARGIN : 0;
+
+	ocsp->next_update.key = MIN(now.tv_sec + SSL_OCSP_UPDATE_DELAY_MAX,
+	                            ocsp->expire - update_margin);
+
+	/* An already existing valid OCSP response that expires within less than
+	 * SSL_OCSP_UPDATE_DELAY_MIN or has no 'Next Update' field should not be
+	 * updated more than once every 5 minutes in order to avoid continuous
+	 * update of the same response. */
+	if (b_data(&ocsp->response))
+		ocsp->next_update.key = MAX(ocsp->next_update.key,
+		                            now.tv_sec + SSL_OCSP_UPDATE_DELAY_MIN);
 }
 
 /*
@@ -839,17 +876,34 @@ void ssl_destroy_ocsp_update_task(void)
  */
 int ssl_ocsp_update_insert(struct certificate_ocsp *ocsp)
 {
-	int update_margin = (ocsp->expire >= SSL_OCSP_UPDATE_MARGIN) ? SSL_OCSP_UPDATE_MARGIN : 0;
+	/* Set next_update based on current time and the various OCSP
+	 * minimum/maximum update times.
+	 */
+	ssl_ocsp_set_next_update(ocsp);
 
-	ocsp->next_update.key = MIN(now.tv_sec + SSL_OCSP_UPDATE_DELAY_MAX,
-	                            ocsp->expire - update_margin);
+	HA_SPIN_LOCK(OCSP_LOCK, &ocsp_tree_lock);
+	eb64_insert(&ocsp_update_tree, &ocsp->next_update);
+	HA_SPIN_UNLOCK(OCSP_LOCK, &ocsp_tree_lock);
 
-	/* An already existing valid OCSP response that expires within less than
-	 * SSL_OCSP_UPDATE_DELAY_MIN or has no 'Next Update' field should not be
-	 * updated more than once every 5 minutes in order to avoid continuous
-	 * update of the same response. */
-	if (b_data(&ocsp->response))
-		ocsp->next_update.key = MAX(ocsp->next_update.key, SSL_OCSP_UPDATE_DELAY_MIN);
+	return 0;
+}
+
+/*
+ * Reinsert an entry in the update tree. The entry's next update time can not
+ * occur before now+SSL_OCSP_HTTP_ERR_REPLAY.
+ * This is supposed to be used in case of http error (ocsp responder unreachable
+ * for instance). This ensures that the entry does not get reinserted at the
+ * beginning of the tree every time.
+ */
+int ssl_ocsp_update_insert_after_error(struct certificate_ocsp *ocsp)
+{
+	/* Set next_update based on current time and the various OCSP
+	 * minimum/maximum update times.
+	 */
+	ssl_ocsp_set_next_update(ocsp);
+
+	if (ocsp->next_update.key < now.tv_sec + SSL_OCSP_HTTP_ERR_REPLAY)
+		ocsp->next_update.key = now.tv_sec + SSL_OCSP_HTTP_ERR_REPLAY;
 
 	HA_SPIN_LOCK(OCSP_LOCK, &ocsp_tree_lock);
 	eb64_insert(&ocsp_update_tree, &ocsp->next_update);
@@ -924,7 +978,7 @@ void ocsp_update_response_end_cb(struct httpclient *hc)
  */
 static struct task *ssl_ocsp_update_responses(struct task *task, void *context, unsigned int state)
 {
-	unsigned int next_wakeup;
+	unsigned int next_wakeup = 0;
 	struct eb64_node *eb;
 	struct certificate_ocsp *ocsp;
 	struct httpclient *hc = NULL;
@@ -932,10 +986,6 @@ static struct task *ssl_ocsp_update_responses(struct task *task, void *context, 
 	struct buffer *req_body = NULL;
 	OCSP_CERTID *certid = NULL;
 	struct ssl_ocsp_task_ctx *ctx = &ssl_ocsp_task_ctx;
-
-	/* This arbitrary 10s time should only be used when an error occurred
-	 * during an ocsp response processing. */
-	next_wakeup = 10000;
 
 	if (ctx->cur_ocsp) {
 		/* An update is in process */
@@ -990,6 +1040,8 @@ static struct task *ssl_ocsp_update_responses(struct task *task, void *context, 
 
 			/* Reinsert the entry into the update list so that it can be updated later */
 			ssl_ocsp_update_insert(ocsp);
+			/* Release the reference kept on the updated ocsp response. */
+			ssl_sock_free_ocsp(ctx->cur_ocsp);
 			ctx->cur_ocsp = NULL;
 
 			HA_SPIN_LOCK(OCSP_LOCK, &ocsp_tree_lock);
@@ -1017,7 +1069,7 @@ static struct task *ssl_ocsp_update_responses(struct task *task, void *context, 
 		eb = eb64_first(&ocsp_update_tree);
 		if (!eb) {
 			HA_SPIN_UNLOCK(OCSP_LOCK, &ocsp_tree_lock);
-			goto leave;
+			goto wait;
 		}
 
 		if (eb->key > now.tv_sec) {
@@ -1032,6 +1084,7 @@ static struct task *ssl_ocsp_update_responses(struct task *task, void *context, 
 		 * reinserted after the response is processed. */
 		eb64_delete(&ocsp->next_update);
 
+		++ocsp->refcount;
 		ctx->cur_ocsp = ocsp;
 
 		HA_SPIN_UNLOCK(OCSP_LOCK, &ocsp_tree_lock);
@@ -1093,6 +1146,8 @@ leave:
 	if (ctx->cur_ocsp) {
 		/* Something went wrong, reinsert the entry in the tree. */
 		ssl_ocsp_update_insert(ctx->cur_ocsp);
+		/* Release the reference kept on the updated ocsp response. */
+		ssl_sock_free_ocsp(ctx->cur_ocsp);
 		ctx->cur_ocsp = NULL;
 	}
 	if (hc)
@@ -1111,10 +1166,22 @@ wait:
 http_error:
 	/* Reinsert certificate into update list so that it can be updated later */
 	if (ocsp)
-		ssl_ocsp_update_insert(ocsp);
+		ssl_ocsp_update_insert_after_error(ocsp);
 
 	if (hc)
 		httpclient_stop_and_destroy(hc);
+	/* Release the reference kept on the updated ocsp response. */
+	ssl_sock_free_ocsp(ctx->cur_ocsp);
+	HA_SPIN_LOCK(OCSP_LOCK, &ocsp_tree_lock);
+	/* Set next_wakeup to the new first entry of the tree */
+	eb = eb64_first(&ocsp_update_tree);
+	if (eb) {
+		if (eb->key > now.tv_sec)
+			next_wakeup = (eb->key - now.tv_sec)*1000;
+		else
+			next_wakeup = 0;
+	}
+	HA_SPIN_UNLOCK(OCSP_LOCK, &ocsp_tree_lock);
 	ctx->cur_ocsp = NULL;
 	ctx->hc = NULL;
 	ctx->flags = 0;
@@ -1128,6 +1195,7 @@ http_error:
 struct ocsp_cli_ctx {
 	struct httpclient *hc;
 	struct ckch_data *ckch_data;
+	X509 *ocsp_issuer;
 	uint flags;
 	uint do_update;
 };
@@ -1227,7 +1295,7 @@ static int cli_parse_update_ocsp_response(char **args, char *payload, struct app
 	ckch_store = ckchs_lookup(args[3]);
 
 	if (!ckch_store) {
-		memprintf(&err, "%sCkch_store not found!\n", err ? err : "");
+		memprintf(&err, "%sUnknown certificate! 'update ssl ocsp-response' expects an already known certificate file name.\n", err ? err : "");
 		errcode |= ERR_ALERT | ERR_FATAL;
 		HA_SPIN_UNLOCK(CKCH_LOCK, &ckch_lock);
 		goto end;
@@ -1243,7 +1311,32 @@ static int cli_parse_update_ocsp_response(char **args, char *payload, struct app
 		goto end;
 	}
 
-	certid = OCSP_cert_to_id(NULL, ctx->ckch_data->cert, ctx->ckch_data->ocsp_issuer);
+	/* Look for the ocsp issuer in the ckch_data or in the certificate
+	 * chain, the same way it is done in ssl_sock_load_ocsp. */
+	ctx->ocsp_issuer = ctx->ckch_data->ocsp_issuer;
+
+	/* take issuer from chain over ocsp_issuer, is what is done historicaly */
+	if (ctx->ckch_data->chain) {
+		int i = 0;
+		/* check if one of the certificate of the chain is the issuer */
+		for (i = 0; i < sk_X509_num(ctx->ckch_data->chain); i++) {
+			X509 *ti = sk_X509_value(ctx->ckch_data->chain, i);
+			if (X509_check_issued(ti, cert) == X509_V_OK) {
+				ctx->ocsp_issuer = ti;
+				break;
+			}
+		}
+	}
+
+	if (!ctx->ocsp_issuer) {
+		memprintf(&err, "%sOCSP issuer not found\n", err ? err : "");
+		HA_SPIN_UNLOCK(CKCH_LOCK, &ckch_lock);
+		goto end;
+	}
+
+	X509_up_ref(ctx->ocsp_issuer);
+
+	certid = OCSP_cert_to_id(NULL, cert, ctx->ocsp_issuer);
 	if (certid == NULL) {
 		memprintf(&err, "%sOCSP_cert_to_id() error\n", err ? err : "");
 		HA_SPIN_UNLOCK(CKCH_LOCK, &ckch_lock);
@@ -1285,11 +1378,13 @@ static int cli_parse_update_ocsp_response(char **args, char *payload, struct app
 	}
 
 	free_trash_chunk(req_url);
+	free_trash_chunk(req_body);
 
 	return 0;
 
 end:
 	free_trash_chunk(req_url);
+	free_trash_chunk(req_body);
 
 	if (errcode & ERR_CODE) {
 		return cli_dynerr(appctx, memprintf(&err, "%sCan't send ocsp request for %s!\n", err ? err : "", args[3]));
@@ -1325,7 +1420,9 @@ static int cli_io_handler_update_ocsp_response(struct appctx *appctx)
 			}
 		}
 		if (!found) {
-			fprintf(stderr, "Missing 'Content-Type: application/ocsp-response' header\n");
+			chunk_printf(&trash, "Missing 'Content-Type: application/ocsp-response' header\n");
+			if (applet_putchk(appctx, &trash) == -1)
+				goto more;
 			goto end;
 		}
 		ctx->flags &= ~HC_F_RES_HDR;
@@ -1340,8 +1437,9 @@ static int cli_io_handler_update_ocsp_response(struct appctx *appctx)
 	if (ctx->flags & HC_F_RES_END) {
 		char *err = NULL;
 
-		if (ssl_ocsp_check_response(ctx->ckch_data->chain, ctx->ckch_data->ocsp_issuer, &hc->res.buf, &err)) {
+		if (ssl_ocsp_check_response(ctx->ckch_data->chain, ctx->ocsp_issuer, &hc->res.buf, &err)) {
 			chunk_printf(&trash, "%s", err);
+			free(err);
 			if (applet_putchk(appctx, &trash) == -1)
 				goto more;
 			goto end;
@@ -1349,11 +1447,13 @@ static int cli_io_handler_update_ocsp_response(struct appctx *appctx)
 
 		if (ssl_sock_update_ocsp_response(&hc->res.buf, &err) != 0) {
 			chunk_printf(&trash, "%s", err);
+			free(err);
 			if (applet_putchk(appctx, &trash) == -1)
 				goto more;
 			goto end;
 		}
 
+		free(err);
 		chunk_reset(&trash);
 
 		if (ssl_ocsp_response_print(&hc->res.buf, &trash))
@@ -1378,6 +1478,8 @@ static void cli_release_update_ocsp_response(struct appctx *appctx)
 {
 	struct ocsp_cli_ctx *ctx = appctx->svcctx;
 	struct httpclient *hc = ctx->hc;
+
+	X509_free(ctx->ocsp_issuer);
 
 	/* Everything possible was printed on the CLI, we can destroy the client */
 	httpclient_stop_and_destroy(hc);

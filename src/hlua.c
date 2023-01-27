@@ -1989,7 +1989,7 @@ static void hlua_socket_handler(struct appctx *appctx)
 	if (ctx->die) {
 		sc_shutw(sc);
 		sc_shutr(sc);
-		sc_ic(sc)->flags |= CF_READ_NULL;
+		sc_ic(sc)->flags |= CF_READ_EVENT;
 		notification_wake(&ctx->wake_on_read);
 		notification_wake(&ctx->wake_on_write);
 		stream_shutdown(__sc_strm(sc), SF_ERR_KILLED);
@@ -3242,11 +3242,22 @@ __LJMP static int hlua_channel_get_data_yield(lua_State *L, int status, lua_KCon
 		}
 	}
 
-	if (offset + len > output + input) {
+	/* Wait for more data if possible if no length was specified and there
+	 * is no data or not enough data was received.
+	 */
+	if (!len || offset + len > output + input) {
 		if (!HLUA_CANT_YIELD(hlua_gethlua(L)) && !channel_input_closed(chn) && channel_may_recv(chn)) {
 			/* Yield waiting for more data, as requested */
 			MAY_LJMP(hlua_yieldk(L, 0, 0, hlua_channel_get_data_yield, TICK_ETERNITY, 0));
 		}
+
+		/* Return 'nil' if there is no data and the channel can't receive more data */
+		if (!len) {
+			lua_pushnil(L);
+			return -1;
+		}
+
+		/* Otherwise, return all data */
 		len = output + input - offset;
 	}
 
@@ -3315,11 +3326,22 @@ __LJMP static int hlua_channel_get_line_yield(lua_State *L, int status, lua_KCon
 		}
 	}
 
-	if (offset + len > output + input) {
+	/* Wait for more data if possible if no line is found and no length was
+	 * specified or not enough data was received.
+	 */
+	if (lua_gettop(L) != 3 ||  offset + len > output + input) {
 		if (!HLUA_CANT_YIELD(hlua_gethlua(L)) && !channel_input_closed(chn) && channel_may_recv(chn)) {
 			/* Yield waiting for more data */
 			MAY_LJMP(hlua_yieldk(L, 0, 0, hlua_channel_get_line_yield, TICK_ETERNITY, 0));
 		}
+
+		/* Return 'nil' if there is no data and the channel can't receive more data */
+		if (!len) {
+			lua_pushnil(L);
+			return -1;
+		}
+
+		/* Otherwise, return all data */
 		len = output + input - offset;
 	}
 
@@ -4868,7 +4890,7 @@ static int hlua_applet_http_new(lua_State *L, struct appctx *ctx)
 		if (type == HTX_BLK_DATA)
 			len += htx_get_blksz(blk);
 	}
-	if (htx->extra != ULLONG_MAX)
+	if (htx->extra != HTX_UNKOWN_PAYLOAD_LENGTH)
 		len += htx->extra;
 
 	/* Stores the request path. */
@@ -9415,7 +9437,7 @@ void hlua_applet_tcp_fct(struct appctx *ctx)
 
 		/* eat the whole request */
 		co_skip(sc_oc(sc), co_data(sc_oc(sc)));
-		res->flags |= CF_READ_NULL;
+		res->flags |= CF_READ_EVENT;
 		sc_shutr(sc);
 		return;
 
@@ -9698,7 +9720,7 @@ void hlua_applet_http_fct(struct appctx *ctx)
   done:
 	if (http_ctx->flags & APPLET_DONE) {
 		if (!(res->flags & CF_SHUTR)) {
-			res->flags |= CF_READ_NULL;
+			res->flags |= CF_READ_EVENT;
 			sc_shutr(sc);
 		}
 

@@ -3,7 +3,7 @@
                           Configuration Manual
                          ----------------------
                               version 2.8
-                              2022/12/01
+                              2023/01/22
 
 
 This document covers the configuration language as implemented in the version
@@ -756,6 +756,20 @@ file, or could be inherited by a program (See 3.7. Programs):
   separated by semicolons. Can be useful in the case you specified a
   directory.
 
+* HAPROXY_HTTP_LOG_FMT: contains the value of the default HTTP log format as
+  defined in section 8.2.3 "HTTP log format". It can be used to override the
+  default log format without having to copy the whole original definition.
+
+  Example:
+    # Add the rule that gave the final verdict to the log
+    log-format "${HAPROXY_TCP_LOG_FMT} lr=last_rule_file:last_rule_line"
+
+* HAPROXY_HTTPS_LOG_FMT: similar to HAPROXY_HTTP_LOG_FMT but for HTTPS log
+  format as defined in section 8.2.4 "HTTPS log format".
+
+* HAPROXY_TCP_LOG_FMT: similar to HAPROXY_HTTP_LOG_FMT but for TCP log format
+  as defined in section 8.2.2 "TCP log format".
+
 * HAPROXY_MWORKER: In master-worker mode, this variable is set to 1.
 
 * HAPROXY_CLI: configured listeners addresses of the stats socket for every
@@ -1144,6 +1158,7 @@ The following keywords are supported in the "global" section :
    - tune.sched.low-latency
    - tune.sndbuf.client
    - tune.sndbuf.server
+   - tune.stick-counters
    - tune.ssl.cachesize
    - tune.ssl.capture-buffer-size
    - tune.ssl.capture-cipherlist-size (deprecated)
@@ -1966,6 +1981,14 @@ nbthread <number>
   adjusted from the calling process using commands like "taskset" or "cpuset".
   Otherwise, this value defaults to 1. The default value is reported in the
   output of "haproxy -vv".
+
+no-quic
+  Warning: QUIC support in HAProxy is currently experimental. Configuration may
+  change without deprecation in the future.
+
+  Disable QUIC transport protocol. All the QUIC listeners will still be created.
+  But they will not bind their addresses. Hence, no QUIC traffic will be
+  processed by haproxy. See also "quic_enabled" sample fetch.
 
 numa-cpu-mapping
   If running on a NUMA-aware platform, HAProxy inspects on startup the CPU
@@ -3291,6 +3314,21 @@ tune.ssl.ssl-ctx-cache-size <number>
   dynamically is expensive, they are cached. The default cache size is set to
   1000 entries.
 
+tune.stick-counters <number>
+  Sets the number of stick-counters that may be tracked at the same time by a
+  connection or a request via "track-sc*" actions in "tcp-request" or
+  "http-request" rules. The defaut value is set at build time by the macro
+  MAX_SESS_STK_CTR, and defaults to 3. With this setting it is possible to
+  change the value and ignore the one passed at build time. Increasing this
+  value may be needed when porting complex configurations to haproxy, but users
+  are warned against the costs: each entry takes 16 bytes per connection and
+  16 bytes per request, all of which need to be allocated and zeroed for all
+  requests even when not used. As such a value of 10 will inflate the memory
+  consumption per request by 320 bytes and will cause this memory to be erased
+  for each request, which does have measurable CPU impacts. Conversely, when
+  no "track-sc" rules are used, the value may be lowered (0 being valid to
+  entirely disable stick-counters).
+
 tune.vars.global-max-size <size>
 tune.vars.proc-max-size <size>
 tune.vars.reqres-max-size <size>
@@ -4139,7 +4177,7 @@ http-error                                X          X         X         X
 http-request                              X (!)      X         X         X
 http-response                             X (!)      X         X         X
 http-reuse                                X          -         X         X
-http-send-name-header                     -          -         X         X
+http-send-name-header                     X          -         X         X
 id                                        -          X         X         X
 ignore-persist                            -          -         X         X
 load-server-state-from-file               X          -         X         X
@@ -4164,6 +4202,7 @@ option dontlog-normal                (*)  X          X         X         -
 option dontlognull                   (*)  X          X         X         -
 -- keyword -------------------------- defaults - frontend - listen -- backend -
 option forwardfor                         X          X         X         X
+option forwarded                     (*)  X          -         X         X
 option h1-case-adjust-bogus-client   (*)  X          X         X         -
 option h1-case-adjust-bogus-server   (*)  X          -         X         X
 option http-buffer-request           (*)  X          X         X         X
@@ -4197,7 +4236,7 @@ option socket-stats                  (*)  X          X         X         -
 option splice-auto                   (*)  X          X         X         X
 option splice-request                (*)  X          X         X         X
 option splice-response               (*)  X          X         X         X
-option spop-check                         -          -         -         X
+option spop-check                         X          -         X         X
 option srvtcpka                      (*)  X          -         X         X
 option ssl-hello-chk                      X          -         X         X
 -- keyword -------------------------- defaults - frontend - listen -- backend -
@@ -5797,10 +5836,19 @@ http-after-response <action> <options...> [ { if | unless } <condition> ]
     - add-header <name> <fmt>
     - allow
     - capture <sample> id <id>
+    - del-acl(<file-name>) <key fmt>
     - del-header <name> [ -m <meth> ]
+    - del-map(<file-name>) <key fmt>
     - replace-header <name> <regex-match> <replace-fmt>
     - replace-value <name> <regex-match> <replace-fmt>
+    - sc-inc-gpc(<idx>,<sc-id>)
+    - sc-inc-gpc0(<sc-id>)
+    - sc-inc-gpc1(<sc-id>)
+    - sc-set-gpt(<idx>,<sc-id>) { <int> | <expr> }
+    - sc-set-gpt0(<sc-id>) { <int> | <expr> }
     - set-header <name> <fmt>
+    - set-log-level <level>
+    - set-map(<file-name>) <key fmt> <value fmt>
     - set-status <status> [reason <str>]
     - set-var(<var-name>[,<cond> ...]) <expr>
     - set-var-fmt(<var-name>[,<cond> ...]) <fmt>
@@ -5834,21 +5882,31 @@ http-after-response add-header <name> <fmt> [ { if | unless } <condition> ]
   value is defined by <fmt>. Please refer to "http-request add-header" for a
   complete description.
 
+http-after-response allow [ { if | unless } <condition> ]
+
+  This stops the evaluation of the rules and lets the response pass the check.
+  No further "http-after-response" rules are evaluated for the current section.
+
 http-after-response capture <sample> id <id> [ { if | unless } <condition> ]
 
   This captures sample expression <sample> from the response buffer, and
   converts it to a string. Please refer to "http-response capture" for a
   complete description.
 
-http-after-response allow [ { if | unless } <condition> ]
+http-after-response del-acl(<file-name>) <key fmt> [ { if | unless } <condition> ]
 
-  This stops the evaluation of the rules and lets the response pass the check.
-  No further "http-after-response" rules are evaluated for the current section.
+  This is used to delete an entry from an ACL. Please refer to "http-request
+  del-acl" for a complete description.
 
 http-after-response del-header <name> [ -m <meth> ] [ { if | unless } <condition> ]
 
   This removes all HTTP header fields whose name is specified in <name>. Please
   refer to "http-request del-header" for a complete description.
+
+http-after-response del-map(<file-name>) <key fmt> [ { if | unless } <condition> ]
+
+  This is used to delete an entry from a MAP. Please refer to "http-request
+  del-map" for a complete description.
 
 http-after-response replace-header <name> <regex-match> <replace-fmt>
                                    [ { if | unless } <condition> ]
@@ -5879,6 +5937,34 @@ http-after-response replace-value <name> <regex-match> <replace-fmt>
 
     # outputs:
     Cache-Control: max-age=3600, private
+
+http-after-response sc-inc-gpc(<idx>,<sc-id>) [ { if | unless } <condition> ]
+http-after-response sc-inc-gpc0(<sc-id>) [ { if | unless } <condition> ]
+http-after-response sc-inc-gpc1(<sc-id>) [ { if | unless } <condition> ]
+
+  These actions increment the General Purppose Counters according to the sticky
+  counter designated by <sc-id>. Please refer to "http-request sc-inc-gpc",
+  "http-request sc-inc-gpc0" and "http-request sc-inc-gpc1" for a complete
+  description.
+
+http-after-response sc-set-gpt(<idx>,<sc-id>) { <int> | <expr> }
+                                              [ { if | unless } <condition> ]
+http-after-response sc-set-gpt0(<sc-id>) { <int> | <expr> }
+                                         [ { if | unless } <condition> ]
+
+  These actions set the 32-bit unsigned General Purpose Tags according to the
+  sticky counter designated by <sc-id>. Please refer to "http-request
+  sc-inc-gpt" and "http-request sc-inc-gpt0" for a complete description.
+
+http-after-response set-log-level <level> [ { if | unless } <condition> ]
+
+  This is used to change the log level of the current response. Please refer to
+  "http-request set-log-level" for a complete description.
+
+http-after-response set-map(<file-name>) <key fmt> <value fmt>
+
+  This is used to add a new entry into a MAP. Please refer to "http-request
+  set-map" for a complete description.
 
 http-after-response set-header <name> <fmt> [ { if | unless } <condition> ]
 
@@ -6507,7 +6593,7 @@ http-request <action> [options...] [ { if | unless } <condition> ]
     - sc-inc-gpc1(<sc-id>)
     - sc-set-gpt(<idx>,<sc-id>) { <int> | <expr> }
     - sc-set-gpt0(<sc-id>) { <int> | <expr> }
-    - set-bandwidth-limit <name> [limit <expr>] [period <expr>]
+    - set-bandwidth-limit <name> [limit {<expr> | <size>}] [period {<expr> | <time>}]
     - set-dst <expr>
     - set-dst-port <expr>
     - set-header <name> <fmt>
@@ -7125,6 +7211,30 @@ http-request return [status <code>] [content-type <type>]
         lf-string "Access denied. IP %[src] is blacklisted."  \
         if { src -f /etc/haproxy/blacklist.lst }
 
+http-request sc-add-gpc(<idx>,<sc-id>) { <int> | <expr> }
+                                           [ { if | unless } <condition> ]
+
+  This action increments the General Purpose Counter at the index <idx> of the
+  array associated to the sticky counter designated by <sc-id> by the value of
+  either integer <int> or the integer evaluation of expression <expr>. Integers
+  and expressions are limited to unsigned 32-bit values. If an error occurs,
+  this action silently fails and the actions evaluation continues. <idx> is an
+  integer between 0 and 99 and <sc-id> is an integer between 0 and 2. It also
+  silently fails if the there is no GPC stored at this index. The entry in the
+  table is refreshed even if the value is zero. The 'gpc_rate' is automatically
+  adjusted to reflect the average growth rate of the gpc value.
+
+  This action applies only to the 'gpc' and 'gpc_rate' array data_types (and
+  not to the legacy 'gpc0', 'gpc1', 'gpc0_rate' nor 'gpc1_rate' data_types).
+  There is no equivalent function for legacy data types, but if the value is
+  always 1, please see 'sc-inc-gpc()', 'sc-inc-gpc0()' and 'sc-inc-gpc1()'.
+  There is no way to decrement the value either, but it is possible to store
+  exact values in a General Purpose Tag using 'sc-set-gpt()' instead.
+
+  The main use of this action is to count scores or total volumes (e.g.
+  estimated danger per source IP reported by the server or a WAF, total
+  uploaded bytes, etc).
+
 http-request sc-inc-gpc(<idx>,<sc-id>) [ { if | unless } <condition> ]
 
   This actions increments the General Purpose Counter at the index <idx>
@@ -7178,7 +7288,8 @@ http-request send-spoe-group <engine-name> <group-name>
     <group-name>   The SPOE group name as specified in the engine
                    configuration.
 
-http-request set-bandwidth-limit <name> [limit <expr>] [period <expr>] [ { if | unless } <condition> ]
+http-request set-bandwidth-limit <name> [limit { <expr> | <size> }]
+                 [period { <expr> | <time> }] [ { if | unless } <condition> ]
 
   This action is used to enable the bandwidth limitation filter <name>, either
   on the upload or download direction depending on the filter type. Custom
@@ -7198,6 +7309,12 @@ http-request set-bandwidth-limit <name> [limit <expr>] [period <expr>] [ { if | 
             by some converters. The result is converted to an integer. It is
             interpreted as a size in bytes for the "limit" parameter and as a
             duration in milliseconds for the "period" parameter.
+
+    <size>  Is a number. It follows the HAProxy size format and is expressed in
+            bytes.
+
+    <time>  Is a number. It follows the HAProxy time format and is expressed in
+            milliseconds.
 
   Example:
     http-request set-bandwidth-limit global-limit
@@ -7556,9 +7673,10 @@ http-request track-sc2 <key> [table <table>] [ { if | unless } <condition> ]
 
   This enables tracking of sticky counters from current request. These rules do
   not stop evaluation and do not change default action. The number of counters
-  that may be simultaneously tracked by the same connection is set in
-  MAX_SESS_STKCTR at build time (reported in haproxy -vv) which defaults to 3,
-  so the track-sc number is between 0 and (MAX_SESS_STKCTR-1). The first
+  that may be simultaneously tracked by the same connection is set by the
+  global "tune.stick-counters" setting, which defaults to MAX_SESS_STKCTR if
+  set at build time (it is reported in haproxy -vv) and which defaults to 3,
+  so the track-sc number is between 0 and (tune.stick-counters-1). The first
   "track-sc0" rule executed enables tracking of the counters of the specified
   table as the first set. The first "track-sc1" rule executed enables tracking
   of the counters of the specified table as the second set. The first
@@ -7681,7 +7799,7 @@ http-response <action> <options...> [ { if | unless } <condition> ]
     - sc-set-gpt(<idx>,<sc-id>) { <int> | <expr> }
     - sc-set-gpt0(<sc-id>) { <int> | <expr> }
     - send-spoe-group <engine-name> <group-name>
-    - set-bandwidth-limit <name> [limit <expr>] [period <expr>]
+    - set-bandwidth-limit <name> [limit {<expr> | <size>}] [period {<expr> | <time>}]
     - set-header <name> <fmt>
     - set-log-level <level>
     - set-map(<file-name>) <key fmt> <value fmt>
@@ -7691,7 +7809,7 @@ http-response <action> <options...> [ { if | unless } <condition> ]
     - set-tos <tos>
     - set-var(<var-name>[,<cond> ...]) <expr>
     - set-var-fmt(<var-name>[,<cond> ...]) <fmt>
-    - silent-drop
+    - silent-drop [ rst-ttl <ttl> ]
     - strict-mode { on | off }
     - track-sc0 <key> [table <table>]
     - track-sc1 <key> [table <table>]
@@ -7866,8 +7984,6 @@ http-response sc-set-gpt(<idx>,<sc-id>) { <int> | <expr> }
                                         [ { if | unless } <condition> ]
 http-response sc-set-gpt0(<sc-id>) { <int> | <expr> }
                                    [ { if | unless } <condition> ]
-http-response sc-set-gpt0(<sc-id>) { <int> | <expr> }
-                                   [ { if | unless } <condition> ]
 
   These actions set the 32-bit unsigned General Purpose Tags according to the
   sticky counter designated by <sc-id>. Please refer to "http-request
@@ -7879,7 +7995,8 @@ http-response send-spoe-group <engine-name> <group-name>
   This action is used to trigger sending of a group of SPOE messages. Please
   refer to "http-request send-spoe-group" for a complete description.
 
-http-response set-bandwidth-limit <name> [limit <expr>] [period <expr>] [ { if | unless } <condition> ]
+http-response set-bandwidth-limit <name> [limit { <expr> | <size> }]
+                 [period { <expr> | <time> }] [ { if | unless } <condition> ]
 
   This action is used to enable the bandwidth limitation filter <name>, either
   on the upload or download direction depending on the filter type. Please
@@ -8943,6 +9060,140 @@ no option dontlognull
   See also : "log", "http-ignore-probes", "monitor-uri", and
              section 8 about logging.
 
+option forwarded [ proto ]
+                 [ host | host-expr <host_expr> ]
+                 [ by | by-expr <by_expr> ] [ by_port | by_port-expr <by_port_expr>]
+                 [ for | for-expr <for_expr> ] [ for_port | for_port-expr <for_port_expr>]
+no option forwarded
+  Enable insertion of the rfc 7239 forwarded header in requests sent to servers
+  May be used in sections :   defaults | frontend | listen | backend
+                                 yes   |    no    |   yes  |   yes
+  Arguments :
+    <host_expr>     optional argument to specify a custom sample expression
+                    those result will be used as 'host' parameter value
+
+    <by_expr>       optional argument to specicy a custom sample expression
+                    those result will be used as 'by' parameter nodename value
+
+    <for_expr>      optional argument to specicy a custom sample expression
+                    those result will be used as 'for' parameter nodename value
+
+    <by_port_expr>  optional argument to specicy a custom sample expression
+                    those result will be used as 'by' parameter nodeport value
+
+    <for_port_expr> optional argument to specicy a custom sample expression
+                    those result will be used as 'for' parameter nodeport value
+
+
+  Since HAProxy works in reverse-proxy mode, servers are loosing some request
+  context (request origin: client ip address, protocol used...)
+
+  A common way to address this limitation is to use the well known
+  x-forward-for and x-forward-* friends to expose some of this context to the
+  underlying servers/applications.
+  While this use to work and is widely deployed, it is not officially supported
+  by the IETF and can be the root of some interoperability as well as security
+  issues.
+
+  To solve this, a new HTTP extension has been described by the IETF:
+  forwarded header (RFC7239).
+  More information here: https://www.rfc-editor.org/rfc/rfc7239.html
+
+  The use of this single header allow to convey multiple informations
+  within the same header, and most importantly, fixes the proxy chaining
+  issue. (the rfc allows for multiple chained proxies to append their own
+  values to an already existing header).
+
+  This option may be specified in defaults, listen or backend section, but it
+  will be ignored for frontend sections.
+
+  Setting option forwarded without arguments results in using default implicit
+  behavior.
+  Default behavior enables proto parameter and injects original client ip.
+
+  The equivalent explicit/manual configuration would be:
+	option forwarded proto for
+
+  The keyword 'by' is used to enable 'by' parameter ("nodename") in
+  forwarded header. It allows to embed request proxy information.
+  'by' value will be set to proxy ip (destination address)
+  If not available (ie: UNIX listener), 'by' will be set to
+  "unknown".
+
+  The keyword 'by-expr' is used to enable 'by' parameter ("nodename") in
+  forwarded header. It allows to embed request proxy information.
+  'by' value will be set to the result of the sample expression
+  <by_expr>, if valid, otherwise it will be set to "unknown".
+
+  The keyword 'for' is used to enable 'for' parameter ("nodename") in
+  forwarded header. It allows to embed request client information.
+  'for' value will be set to client ip (source address)
+  If not available (ie: UNIX listener), 'for' will be set to
+  "unknown".
+
+  The keyword 'for-expr' is used to enable 'for' parameter ("nodename") in
+  forwarded header. It allows to embed request client information.
+  'for' value will be set to the result of the sample expression
+  <for_expr>, if valid, otherwise it will be set to "unknown".
+
+  The keyword 'by_port' is used to provide "nodeport" info to
+  'by' parameter. 'by_port' requires 'by' or 'by-expr' to be set or
+  it will be ignored.
+  "nodeport" will be set to proxy (destination) port if available,
+  otherwise it will be ignored.
+
+  The keyword 'by_port-expr' is used to provide "nodeport" info to
+  'by' parameter. 'by_port-expr' requires 'by' or 'by-expr' to be set or
+  it will be ignored.
+  "nodeport" will be set to the result of the sample expression
+  <by_port_expr>, if valid, otherwise it will be ignored.
+
+  The keyword 'for_port' is used to provide "nodeport" info to
+  'for' parameter. 'for_port' requires 'for' or 'for-expr' to be set or
+  it will be ignored.
+  "nodeport" will be set to client (source) port if available,
+  otherwise it will be ignored.
+
+  The keyword 'for_port-expr' is used to provide "nodeport" info to
+  'for' parameter. 'for_port-expr' requires 'for' or 'for-expr' to be set or
+  it will be ignored.
+  "nodeport" will be set to the result of the sample expression
+  <for_port_expr>, if valid, otherwise it will be ignored.
+
+  Examples :
+    # Those servers want the ip address and protocol of the client request
+    # Resulting header would look like this:
+    #   forwarded: proto=http;for=127.0.0.1
+    backend www_default
+        mode http
+        option forwarded
+        #equivalent to: option forwarded proto for
+
+    # Those servers want the requested host and hashed client ip address
+    # as well as client source port (you should use seed for xxh32 if ensuring
+    # ip privacy is a concern)
+    # Resulting header would look like this:
+    #   forwarded: host="haproxy.org";for="_000000007F2F367E:60138"
+    backend www_host
+        mode http
+        option forwarded host for-expr src,xxh32,hex for_port
+
+    # Those servers want custom data in host, for and by parameters
+    # Resulting header would look like this:
+    #   forwarded: host="host.com";by=_haproxy;for="[::1]:10"
+    backend www_custom
+        mode http
+        option forwarded host-expr str(host.com) by-expr str(_haproxy) for for_port-expr int(10)
+
+    # Those servers want random 'for' obfuscated identifiers for request
+    # tracing purposes while protecting sensitive IP information
+    # Resulting header would look like this:
+    #   forwarded: for=_000000002B1F4D63
+    backend www_for_hide
+        mode http
+        option forwarded for-expr rand,hex
+
+  See also : "option forwardfor", "option originalto"
 
 option forwardfor [ except <network> ] [ header <name> ] [ if-none ]
   Enable insertion of the X-Forwarded-For header to requests sent to servers
@@ -10124,7 +10375,7 @@ no option splice-response
 option spop-check
   Use SPOP health checks for server testing
   May be used in sections :   defaults | frontend | listen | backend
-                                 no    |    no    |   no   |   yes
+                                 yes   |    no    |   yes  |   yes
   Arguments : none
 
   It is possible to test that the server correctly talks SPOP protocol instead
@@ -12627,7 +12878,7 @@ tcp-request connection <action> <options...> [ { if | unless } <condition> ]
     - set-tos <tos>
     - set-var(<var-name>[,<cond> ...]) <expr>
     - set-var-fmt(<var-name>[,<cond> ...]) <fmt>
-    - silent-drop
+    - silent-drop [ rst-ttl <ttl> ]
     - track-sc0 <key> [table <table>]
     - track-sc1 <key> [table <table>]
     - track-sc2 <key> [table <table>]
@@ -12831,7 +13082,7 @@ tcp-request content <action> [{if | unless} <condition>]
     - sc-set-gpt(<idx>,<sc-id>) { <int> | <expr> }
     - sc-set-gpt0(<sc-id>) { <int> | <expr> }
     - send-spoe-group <engine-name> <group-name>
-    - set-bandwidth-limit <name> [limit <expr>] [period <expr>]
+    - set-bandwidth-limit <name> [limit {<expr> | <size>}] [period {<expr> | <time>}]
     - set-dst <expr>
     - set-dst-port <expr>
     - set-log-level <level>
@@ -12844,7 +13095,7 @@ tcp-request content <action> [{if | unless} <condition>]
     - set-tos <tos>
     - set-var(<var-name>[,<cond> ...]) <expr>
     - set-var-fmt(<var-name>[,<cond> ...]) <fmt>
-    - silent-drop
+    - silent-drop [ rst-ttl <ttl> ]
     - switch-mode http [ proto <name> ]
     - track-sc0 <key> [table <table>]
     - track-sc1 <key> [table <table>]
@@ -13025,8 +13276,8 @@ tcp-request content send-spoe-group <engine-name> <group-name>
   Thaction is is used to trigger sending of a group of SPOE messages. Please
   refer to "http-request send-spoe-group" for a complete description.
 
-tcp-request content set-bandwidth-limit <name> [limit <expr>] [period <expr>]
-                    [ { if | unless } <condition> ]
+tcp-request content set-bandwidth-limit <name> [limit { <expr> | <size> }]
+                 [period { <expr> | <time> }] [ { if | unless } <condition> ]
 
   This action is used to enable the bandwidth limitation filter <name>, either
   on the upload or download direction depending on the filter type. Please
@@ -13234,7 +13485,7 @@ tcp-request session <action> [{if | unless} <condition>]
     - set-tos <tos>
     - set-var(<var-name>[,<cond> ...]) <expr>
     - set-var-fmt(<var-name>[,<cond> ...]) <fmt>
-    - silent-drop
+    - silent-drop [ rst-ttl <ttl> ]
     - track-sc0 <key> [table <table>]
     - track-sc1 <key> [table <table>]
     - track-sc2 <key> [table <table>]
@@ -13399,14 +13650,14 @@ tcp-response content <action> [{if | unless} <condition>]
     - sc-set-gpt(<idx>,<sc-id>) { <int> | <expr> }
     - sc-set-gpt0(<sc-id>) { <int> | <expr> }
     - send-spoe-group <engine-name> <group-name>
-    - set-bandwidth-limit <name> [limit <expr>] [period <expr>]
+    - set-bandwidth-limit <name> [limit {<expr> | <size>}] [period {<expr> | <time>}]
     - set-log-level <level>
     - set-mark <mark>
     - set-nice <nice>
     - set-tos <tos>
     - set-var(<var-name>[,<cond> ...]) <expr>
     - set-var-fmt(<var-name>[,<cond> ...]) <fmt>
-    - silent-drop
+    - silent-drop [ rst-ttl <ttl> ]
     - unset-var(<var-name>)
 
   The supported actions are described below.
@@ -13478,8 +13729,8 @@ tcp-response content send-spoe-group <engine-name> <group-name>
   refer to "http-request send-spoe-group" for a complete description.
 
 
-tcp-response content set-bandwidth-limit <name> [limit <expr>] [period <expr>]
-                     [ { if | unless } <condition> ]
+tcp-response content set-bandwidth-limit <name> [limit { <expr> | <size> }]
+                 [period { <expr> | <time> }] [ { if | unless } <condition> ]
 
   This action is used to enable the bandwidth limitation filter <name>, either
   on the upload or download direction depending on the filter type. Please
@@ -16966,6 +17217,72 @@ The currently available list of transformation keywords include :
       http-request set-header X-51D-DeviceTypeMobileTablet \
         %[req.fhdr(User-Agent),51d.single(DeviceType,IsMobile,IsTablet)]
 
+rfc7239_is_valid
+  Returns true if input header is RFC 7239 compliant header value and false
+  otherwise.
+
+  Example:
+    acl valid req.hdr(forwarded),rfc7239_is_valid
+    #input: "for=127.0.0.1;proto=http"
+    #  output: TRUE
+    #input: "proto=custom"
+    #  output: FALSE
+
+rfc7239_field(<field>)
+  Extracts a single field/parameter from RFC 7239 compliant header value input.
+
+  Supported fields are:
+    - proto: either 'http' or 'https'
+    - host: http compliant host
+    - for: RFC7239 node
+    - by: RFC7239 node
+
+  More info here:
+    https://www.rfc-editor.org/rfc/rfc7239.html#section-6
+
+  Example:
+    # extract host field from forwarded header and store it in req.fhost var
+    http-request set-var(req.fhost) req.hdr(forwarded),rfc7239_field(host)
+    #input: "proto=https;host=\"haproxy.org:80\""
+    #  output: "haproxy.org:80"
+
+    # extract for field from forwarded header and store it in req.ffor var
+    http-request set-var(req.ffor) req.hdr(forwarded),rfc7239_field(for)
+    #input: "proto=https;host=\"haproxy.org:80\";for=\"127.0.0.1:9999\""
+    #  output: "127.0.0.1:9999"
+
+rfc7239_n2nn
+  Converts RFC7239 node (provided by 'for' or 'by' 7239 header fields)
+  into its corresponding nodename final form:
+    - ipv4 address
+    - ipv6 address
+    - 'unknown'
+    - '_obfs' identifier
+
+  Example:
+    # extract 'for' field from forwarded header, extract nodename from
+    # resulting node identifier and store the result in req.fnn
+    http-request set-var(req.fnn) req.hdr(forwarded),rfc7239_field(for),rfc7239_n2nn
+    #input: "for=\"127.0.0.1:9999\""
+    #  output: 127.0.0.1
+    #input: "for=\"_name:_port\""
+    #  output: "_name"
+
+rfc7239_n2np
+  Converts RFC7239 node (provided by 'for' or 'by' 7239 header fields)
+  into its corresponding nodeport final form:
+    - unsigned integer
+    - '_obfs' identifier
+
+  Example:
+    # extract 'by' field from forwarded header, extract node port from
+    # resulting node identifier and store the result in req.fnp
+    http-request set-var(req.fnp) req.hdr(forwarded),rfc7239_field(by),rfc7239_n2np
+    #input: "by=\"127.0.0.1:9999\""
+    #  output: 9999
+    #input: "by=\"_name:_port\""
+    #  output: "_port"
+
 add(<value>)
   Adds <value> to the input value of type signed integer, and returns the
   result as a signed integer. <value> can be a numeric value or a variable
@@ -18738,6 +19055,14 @@ queue([<backend>]) : integer
   possible action could be to reject new users but still accept old ones. See
   also the "avg_queue", "be_conn", and "be_sess_rate" fetches.
 
+quic_enabled : boolean
+  Warning: QUIC support in HAProxy is currently experimental. Configuration may
+  change without deprecation in the future.
+
+  Return true when the support for QUIC transport protocol was compiled and
+  if this procotol was not disabled by "no-quic" global option. See also "no-quic"
+  global option.
+
 rand([<range>]) : integer
   Returns a random integer value within a range of <range> possible values,
   starting at zero. If the range is not specified, it defaults to 2^32, which
@@ -18865,12 +19190,12 @@ TCP/IP addresses and ports, as well as elements from stick-tables related to
 the incoming connection. For retrieving a value from a sticky counters, the
 counter number can be explicitly set as 0, 1, or 2 using the pre-defined
 "sc0_", "sc1_", or "sc2_" prefix. These three pre-defined prefixes can only be
-used if MAX_SESS_STKCTR value does not exceed 3, otherwise the counter number
-can be specified as the first integer argument when using the "sc_" prefix.
-Starting from "sc_0" to "sc_N" where N is (MAX_SESS_STKCTR-1). An optional
-table may be specified with the "sc*" form, in which case the currently
-tracked key will be looked up into this alternate table instead of the table
-currently being tracked.
+used if the global "tune.stick-counters" value does not exceed 3, otherwise the
+counter number can be specified as the first integer argument when using the
+"sc_" prefix starting from "sc_0" to "sc_N" where N is (tune.stick-counters-1).
+An optional table may be specified with the "sc*" form, in which case the
+currently tracked key will be looked up into this alternate table instead of
+the table currently being tracked.
 
 bc_dst : ip
   This is the destination ip address of the connection on the server side,
@@ -21747,11 +22072,14 @@ not be logged if "option dontlog-normal" is specified in the frontend.
 
 The TCP log format is internally declared as a custom log format based on the
 exact following string, which may also be used as a basis to extend the format
-if required. Refer to section 8.2.6 "Custom log format" to see how to use this:
+if required. Additionally the HAPROXY_TCP_LOG_FMT variable can be used instead.
+Refer to section 8.2.6 "Custom log format" to see how to use this:
 
     # strict equivalent of "option tcplog"
     log-format "%ci:%cp [%t] %ft %b/%s %Tw/%Tc/%Tt %B %ts \
                 %ac/%fc/%bc/%sc/%rc %sq/%bq"
+    # or using the HAPROXY_TCP_LOG_FMT variable
+    log-format "${HAPROXY_TCP_LOG_FMT}"
 
 A few fields may slightly vary depending on some configuration options, those
 are marked with a star ('*') after the field name below.
@@ -21930,7 +22258,8 @@ is specified in the frontend.
 
 The HTTP log format is internally declared as a custom log format based on the
 exact following string, which may also be used as a basis to extend the format
-if required. Refer to section 8.2.6 "Custom log format" to see how to use this:
+if required. Additionally the HAPROXY_HTTP_LOG_FMT variable can be used
+instead. Refer to section 8.2.6 "Custom log format" to see how to use this:
 
     # strict equivalent of "option httplog"
     log-format "%ci:%cp [%tr] %ft %b/%s %TR/%Tw/%Tc/%Tr/%Ta %ST %B %CC \
@@ -21943,6 +22272,8 @@ this exact string:
     log-format "%{+Q}o %{-Q}ci - - [%trg] %r %ST %B \"\" \"\" %cp \
                 %ms %ft %b %s %TR %Tw %Tc %Tr %Ta %tsc %ac %fc \
                 %bc %sc %rc %sq %bq %CC %CS %hrl %hsl"
+    # or using the HAPROXY_HTTP_LOG_FMT variable
+    log-format "${HAPROXY_HTTP_LOG_FMT}"
 
 Most fields are shared with the TCP log, some being different. A few fields may
 slightly vary depending on some configuration options. Those ones are marked
@@ -22194,13 +22525,16 @@ dontlognull" in the frontend. Successful connections will not be logged if
 
 The HTTPS log format is internally declared as a custom log format based on the
 exact following string, which may also be used as a basis to extend the format
-if required. Refer to section 8.2.6 "Custom log format" to see how to use this:
+if required. Additionally the HAPROXY_HTTPS_LOG_FMT variable can be used
+instead. Refer to section 8.2.6 "Custom log format" to see how to use this:
 
     # strict equivalent of "option httpslog"
     log-format "%ci:%cp [%tr] %ft %b/%s %TR/%Tw/%Tc/%Tr/%Ta %ST %B %CC \
                %CS %tsc %ac/%fc/%bc/%sc/%rc %sq/%bq %hr %hs %{+Q}r \
                %[fc_err]/%[ssl_fc_err,hex]/%[ssl_c_err]/\
                %[ssl_c_ca_err]/%[ssl_fc_is_resumed] %[ssl_fc_sni]/%sslv/%sslc"
+    # or using the HAPROXY_HTTPS_LOG_FMT variable
+    log-format "${HAPROXY_HTTPS_LOG_FMT}"
 
 This format is basically the HTTP one (see section 8.2.3) with new fields
 appended to it. The new fields (lines 17 and 18) will be detailed here. For the
@@ -23924,8 +24258,8 @@ Optionally, a prefix could be used to force the address family and/or the
 socket type and the transport method.
 
 
-11.1 Address family prefixes
-----------------------------
+11.1. Address family prefixes
+-----------------------------
 
 'abns@<name>' following <name> is an abstract namespace (Linux only).
 
@@ -23960,8 +24294,8 @@ socket type and the transport method.
                start by slash '/'.
 
 
-11.2 Socket type prefixes
--------------------------
+11.2. Socket type prefixes
+--------------------------
 
 Previous "Address family prefixes" can also be prefixed to force the socket
 type and the transport method. The default depends of the statement using
@@ -23969,8 +24303,11 @@ this address but in some cases the user may force it to a different one.
 This is the case for "log" statement where the default is syslog over UDP
 but we could force to use syslog over TCP.
 
-Those prefixes were designed for internal purpose and users should
-instead use aliases of the next section "11.5.3 Protocol prefixes".
+Those prefixes were designed for internal purpose and users should instead use
+use aliases of the next section "11.3 Protocol prefixes". However these can
+sometimes be convenient, for example in combination with inherited sockets
+known by their file descriptor number, in which case the address family is "fd"
+and the socket type must be declared.
 
 If users need one those prefixes to perform what they expect because
 they can not configure the same using the protocol prefixes, they should
@@ -23982,9 +24319,29 @@ report this to the maintainers.
 'dgram+<family>@<address>'  forces socket type and transport method
                             to "datagram".
 
+'quic+<family>@<address>'   forces socket type to "datagram" and transport
+                            method to "stream".
 
-11.3 Protocol prefixes
-----------------------
+
+
+11.3. Protocol prefixes
+-----------------------
+
+'quic4@<address>[:port1[-port2]]' following <address> is always considered as
+                                  an IPv4 address but socket type is forced to
+                                  "datagram" and the transport method is forced
+                                  to "stream". Depending on the statement using
+                                  this address, a UDP port or port range can or
+                                  must be specified. It is equivalent to
+                                  "quic+ipv4@".
+
+'quic6@<address>[:port1[-port2]]' following <address> is always considered as
+                                  an IPv6 address but socket type is forced to
+                                  "datagram" and the transport method is forced
+                                  to "stream". Depending on the statement using
+                                  this address, a UDP port or port range can or
+                                  must be specified. It is equivalent to
+                                  "quic+ipv6@".
 
 'tcp@<address>[:port1[-port2]]' following <address> is considered as an IPv4
                                 or IPv6 address depending of the syntax but
@@ -24021,14 +24378,14 @@ report this to the maintainers.
                                  method is forced to "datagram". Depending on
                                  the statement using this address, a port or
                                  port range can or must be specified.
-                                 It is considered as an alias of 'stream+ipv4@'.
+                                 It is considered as an alias of 'dgram+ipv4@'.
 
 'udp6@<address>[:port1[-port2]]' following <address> is always considered as
                                  an IPv6 address but socket type and transport
                                  method is forced to "datagram". Depending on
                                  the statement using this address, a port or
                                  port range can or must be specified.
-                                 It is considered as an alias of 'stream+ipv4@'.
+                                 It is considered as an alias of 'dgram+ipv4@'.
 
 'uxdg@<path>'    following string is considered as a unix socket <path> but
                  transport method is forced to "datagram". It is considered as

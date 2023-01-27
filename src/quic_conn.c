@@ -93,9 +93,9 @@ const struct quic_version quic_versions[] = {
 		.retry_tag_nonce  = (const unsigned char *)QUIC_TLS_RETRY_NONCE_V1,
 	},
 	{
-		.num              = QUIC_PROTOCOL_VERSION_2_DRAFT,
-		.initial_salt     = initial_salt_v2_draft,
-		.initial_salt_len = sizeof initial_salt_v2_draft,
+		.num              = QUIC_PROTOCOL_VERSION_2,
+		.initial_salt     = initial_salt_v2,
+		.initial_salt_len = sizeof initial_salt_v2,
 		.key_label        = (const unsigned char *)QUIC_HKDF_KEY_LABEL_V2,
 		.key_label_len    = sizeof(QUIC_HKDF_KEY_LABEL_V2) - 1,
 		.iv_label         = (const unsigned char *)QUIC_HKDF_IV_LABEL_V2,
@@ -104,8 +104,8 @@ const struct quic_version quic_versions[] = {
 		.hp_label_len     = sizeof(QUIC_HKDF_HP_LABEL_V2) - 1,
 		.ku_label         = (const unsigned char *)QUIC_HKDF_KU_LABEL_V2,
 		.ku_label_len     = sizeof(QUIC_HKDF_KU_LABEL_V2) - 1,
-		.retry_tag_key    = (const unsigned char *)QUIC_TLS_RETRY_KEY_V2_DRAFT,
-		.retry_tag_nonce  = (const unsigned char *)QUIC_TLS_RETRY_NONCE_V2_DRAFT,
+		.retry_tag_key    = (const unsigned char *)QUIC_TLS_RETRY_KEY_V2,
+		.retry_tag_nonce  = (const unsigned char *)QUIC_TLS_RETRY_NONCE_V2,
 	},
 };
 
@@ -2836,6 +2836,17 @@ static int qc_parse_pkt_frms(struct quic_conn *qc, struct quic_rx_packet *pkt,
 				}
 				else {
 					TRACE_DEVEL("No mux for new stream", QUIC_EV_CONN_PRSHPKT, qc);
+					if (qc->app_ops == &h3_ops && quic_stream_is_uni(stream->id)) {
+						/* Do not send STOP_SENDING frames for h3 unidirectional streams.
+						 * TODO: this test should be removed when the connection closure
+						 * will be more clean.
+						 * At quic_conn level there is no mean to know that an application
+						 * want to forbid stream closure requests to receivers. This is the
+						 * case for the Control and QPACK h3 unidirectional streams.
+						 */
+						goto leave;
+					}
+
 					if (!qc_stop_sending_frm_enqueue(qc, stream->id))
 						TRACE_ERROR("could not enqueue STOP_SENDING frame", QUIC_EV_CONN_PRSHPKT, qc);
 					/* This packet will not be acknowledged */
@@ -5341,7 +5352,7 @@ static inline int qc_parse_hd_form(struct quic_rx_packet *pkt,
 			goto out;
 		}
 
-		if (*version != QUIC_PROTOCOL_VERSION_2_DRAFT) {
+		if (*version != QUIC_PROTOCOL_VERSION_2) {
 			pkt->type = type;
 		}
 		else {
@@ -6359,6 +6370,19 @@ static int qc_handle_conn_migration(struct quic_conn *qc,
                                     const struct sockaddr_storage *local_addr)
 {
 	TRACE_ENTER(QUIC_EV_CONN_LPKT, qc);
+
+	/* RFC 9000. Connection Migration
+	 *
+	 * If the peer sent the disable_active_migration transport parameter,
+	 * an endpoint also MUST NOT send packets (including probing packets;
+	 * see Section 9.1) from a different local address to the address the peer
+	 * used during the handshake, unless the endpoint has acted on a
+	 * preferred_address transport parameter from the peer.
+	 */
+	if (qc->li->bind_conf->quic_params.disable_active_migration) {
+		TRACE_ERROR("Active migration was disabled, datagram dropped", QUIC_EV_CONN_LPKT, qc);
+		goto err;
+	}
 
 	/* RFC 9000 9. Connection Migration
 	 *
@@ -7406,8 +7430,7 @@ int quic_dgram_parse(struct quic_dgram *dgram, struct quic_conn *from_qc,
 		}
 
 		/* Detect QUIC connection migration. */
-		if (ipcmp(&qc->peer_addr, &dgram->saddr, 1) ||
-		    ipcmp(&qc->local_addr, &dgram->daddr, 1)) {
+		if (ipcmp(&qc->peer_addr, &dgram->saddr, 1)) {
 			if (qc_handle_conn_migration(qc, &dgram->saddr, &dgram->daddr)) {
 				/* Skip the entire datagram. */
 				TRACE_ERROR("error during connection migration, datagram dropped", QUIC_EV_CONN_LPKT, qc);

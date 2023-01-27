@@ -31,6 +31,7 @@
 #include <haproxy/global.h>
 #include <haproxy/http_ana.h>
 #include <haproxy/http_htx.h>
+#include <haproxy/http_ext.h>
 #include <haproxy/listener.h>
 #include <haproxy/log.h>
 #include <haproxy/obj_type-t.h>
@@ -244,6 +245,8 @@ void free_proxy(struct proxy *p)
 		free(rdr->rdr_str);
 		list_for_each_entry_safe(lf, lfb, &rdr->rdr_fmt, list) {
 			LIST_DELETE(&lf->list);
+			release_sample_expr(lf->expr);
+			free(lf->arg);
 			free(lf);
 		}
 		free(rdr);
@@ -349,7 +352,8 @@ void free_proxy(struct proxy *p)
 		pxdf->fct(p);
 
 	free(p->desc);
-	istfree(&p->fwdfor_hdr_name);
+
+	http_ext_clean(p);
 
 	task_destroy(p->task);
 
@@ -1460,9 +1464,9 @@ void proxy_free_defaults(struct proxy *defproxy)
 	istfree(&defproxy->monitor_uri);
 	ha_free(&defproxy->defbe.name);
 	ha_free(&defproxy->conn_src.iface_name);
-	istfree(&defproxy->fwdfor_hdr_name);
-	istfree(&defproxy->orgto_hdr_name);
 	istfree(&defproxy->server_id_hdr_name);
+
+	http_ext_clean(defproxy);
 
 	list_for_each_entry_safe(acl, aclb, &defproxy->acl, list) {
 		LIST_DELETE(&acl->list);
@@ -1639,17 +1643,12 @@ static int proxy_defproxy_cpy(struct proxy *curproxy, const struct proxy *defpro
 	curproxy->options2 = defproxy->options2;
 	curproxy->no_options = defproxy->no_options;
 	curproxy->no_options2 = defproxy->no_options2;
-	curproxy->except_xff_net = defproxy->except_xff_net;
-	curproxy->except_xot_net = defproxy->except_xot_net;
 	curproxy->retry_type = defproxy->retry_type;
 	curproxy->tcp_req.inspect_delay = defproxy->tcp_req.inspect_delay;
 	curproxy->tcp_rep.inspect_delay = defproxy->tcp_rep.inspect_delay;
 
-	if (isttest(defproxy->fwdfor_hdr_name))
-		curproxy->fwdfor_hdr_name = istdup(defproxy->fwdfor_hdr_name);
-
-	if (isttest(defproxy->orgto_hdr_name))
-		curproxy->orgto_hdr_name = istdup(defproxy->orgto_hdr_name);
+	http_ext_clean(curproxy);
+	http_ext_dup(defproxy, curproxy);
 
 	if (isttest(defproxy->server_id_hdr_name))
 		curproxy->server_id_hdr_name = istdup(defproxy->server_id_hdr_name);
@@ -1693,6 +1692,7 @@ static int proxy_defproxy_cpy(struct proxy *curproxy, const struct proxy *defpro
 		}
 
 		curproxy->ck_opts = defproxy->ck_opts;
+
 		if (defproxy->cookie_name)
 			curproxy->cookie_name = strdup(defproxy->cookie_name);
 		curproxy->cookie_len = defproxy->cookie_len;
@@ -2161,7 +2161,7 @@ struct task *hard_stop(struct task *t, void *context, unsigned int state)
 		send_log(NULL, LOG_WARNING, "Some tasks resisted to hard-stop, exiting now.\n");
 		killed = 2;
 		for (thr = 0; thr < global.nbthread; thr++)
-			if (ha_thread_info[thr].tg->threads_enabled & ha_thread_info[thr].ltid_bit)
+			if (_HA_ATOMIC_LOAD(&ha_thread_info[thr].tg->threads_enabled) & ha_thread_info[thr].ltid_bit)
 				wake_thread(thr);
 		t->expire = TICK_ETERNITY;
 		return t;
@@ -3186,7 +3186,7 @@ static int cli_io_handler_show_errors(struct appctx *appctx)
 	struct stconn *sc = appctx_sc(appctx);
 	extern const char *monthname[12];
 
-	if (unlikely(sc_ic(sc)->flags & (CF_WRITE_ERROR|CF_SHUTW)))
+	if (unlikely(sc_ic(sc)->flags & CF_SHUTW))
 		return 1;
 
 	chunk_reset(&trash);

@@ -294,9 +294,9 @@ int stream_upgrade_from_sc(struct stconn *sc, struct buffer *input)
 		s->req.buf = *input;
 		*input = BUF_NULL;
 		s->req.total = (IS_HTX_STRM(s) ? htxbuf(&s->req.buf)->data : b_data(&s->req.buf));
-		s->req.flags |= (s->req.total ? CF_READ_PARTIAL : 0);
 	}
 
+	s->req.flags |= CF_READ_EVENT; /* Always report a read event */
 	s->flags &= ~SF_IGNORE;
 
 	task_wakeup(s->task, TASK_WOKEN_INIT);
@@ -388,13 +388,20 @@ struct stream *stream_new(struct session *sess, struct stconn *sc, struct buffer
 	s->last_rule_file = NULL;
 	s->last_rule_line = 0;
 
-	/* Copy SC counters for the stream. We don't touch refcounts because
-	 * any reference we have is inherited from the session. Since the stream
-	 * doesn't exist without the session, the session's existence guarantees
-	 * we don't lose the entry. During the store operation, the stream won't
-	 * touch these ones.
-	 */
-	memcpy(s->stkctr, sess->stkctr, sizeof(s->stkctr));
+	s->stkctr = NULL;
+	if (pool_head_stk_ctr) {
+		s->stkctr = pool_alloc(pool_head_stk_ctr);
+		if (!s->stkctr)
+			goto out_fail_alloc;
+
+		/* Copy SC counters for the stream. We don't touch refcounts because
+		 * any reference we have is inherited from the session. Since the stream
+		 * doesn't exist without the session, the session's existence guarantees
+		 * we don't lose the entry. During the store operation, the stream won't
+		 * touch these ones.
+		 */
+		memcpy(s->stkctr, sess->stkctr, sizeof(s->stkctr[0]) * global.tune.nb_stk_ctr);
+	}
 
 	s->sess = sess;
 
@@ -494,7 +501,7 @@ struct stream *stream_new(struct session *sess, struct stconn *sc, struct buffer
 	s->store_count = 0;
 
 	channel_init(&s->req);
-	s->req.flags |= CF_READ_ATTACHED; /* the producer is already connected */
+	s->req.flags |= CF_READ_EVENT; /* the producer is already connected */
 	s->req.analysers = sess->listener ? sess->listener->analysers : sess->fe->fe_req_ana;
 
 	if (IS_HTX_STRM(s)) {
@@ -560,7 +567,6 @@ struct stream *stream_new(struct session *sess, struct stconn *sc, struct buffer
 		s->req.buf = *input;
 		*input = BUF_NULL;
 		s->req.total = (IS_HTX_STRM(s) ? htxbuf(&s->req.buf)->data : b_data(&s->req.buf));
-		s->req.flags |= (s->req.total ? CF_READ_PARTIAL : 0);
 	}
 
 	/* it is important not to call the wakeup function directly but to
@@ -582,6 +588,8 @@ struct stream *stream_new(struct session *sess, struct stconn *sc, struct buffer
  out_fail_attach_scf:
 	task_destroy(t);
  out_fail_alloc:
+	if (s)
+		pool_free(pool_head_stk_ctr, s->stkctr);
 	pool_free(pool_head_stream, s);
 	DBG_TRACE_DEVEL("leaving on error", STRM_EV_STRM_NEW|STRM_EV_STRM_ERR);
 	return NULL;
@@ -701,6 +709,7 @@ void stream_free(struct stream *s)
 		vars_prune(&s->vars_reqres, s->sess, s);
 
 	stream_store_counters(s);
+	pool_free(pool_head_stk_ctr, s->stkctr);
 
 	list_for_each_entry_safe(bref, back, &s->back_refs, users) {
 		/* we have to unlink all watchers. We must not relink them if
@@ -797,7 +806,7 @@ void stream_process_counters(struct stream *s)
 		if (sess->listener && sess->listener->counters)
 			_HA_ATOMIC_ADD(&sess->listener->counters->bytes_in, bytes);
 
-		for (i = 0; i < MAX_SESS_STKCTR; i++) {
+		for (i = 0; i < global.tune.nb_stk_ctr; i++) {
 			if (!stkctr_inc_bytes_in_ctr(&s->stkctr[i], bytes))
 				stkctr_inc_bytes_in_ctr(&sess->stkctr[i], bytes);
 		}
@@ -815,7 +824,7 @@ void stream_process_counters(struct stream *s)
 		if (sess->listener && sess->listener->counters)
 			_HA_ATOMIC_ADD(&sess->listener->counters->bytes_out, bytes);
 
-		for (i = 0; i < MAX_SESS_STKCTR; i++) {
+		for (i = 0; i < global.tune.nb_stk_ctr; i++) {
 			if (!stkctr_inc_bytes_out_ctr(&s->stkctr[i], bytes))
 				stkctr_inc_bytes_out_ctr(&sess->stkctr[i], bytes);
 		}
@@ -927,7 +936,7 @@ static void back_establish(struct stream *s)
 	rep->analysers |= strm_fe(s)->fe_rsp_ana | s->be->be_rsp_ana;
 
 	se_have_more_data(s->scb->sedesc);
-	rep->flags |= CF_READ_ATTACHED; /* producer is now attached */
+	rep->flags |= CF_READ_EVENT; /* producer is now attached */
 	if (conn) {
 		/* real connections have timeouts
 		 * if already defined, it means that a set-timeout rule has
@@ -1506,7 +1515,7 @@ int stream_set_http_mode(struct stream *s, const struct mux_proto_list *mux_prot
 		}
 		sc_conn_commit_endp_upgrade(sc);
 
-		s->req.flags &= ~(CF_READ_PARTIAL|CF_AUTO_CONNECT);
+		s->req.flags &= ~(CF_READ_EVENT|CF_AUTO_CONNECT);
 		s->req.total = 0;
 		s->flags |= SF_IGNORE;
 		if (sc_ep_test(sc, SE_FL_DETACHED)) {
@@ -1543,8 +1552,8 @@ static void stream_update_both_sc(struct stream *s)
 	struct channel *req = &s->req;
 	struct channel *res = &s->res;
 
-	req->flags &= ~(CF_READ_NULL|CF_READ_PARTIAL|CF_READ_ATTACHED|CF_WRITE_NULL|CF_WRITE_PARTIAL);
-	res->flags &= ~(CF_READ_NULL|CF_READ_PARTIAL|CF_READ_ATTACHED|CF_WRITE_NULL|CF_WRITE_PARTIAL);
+	req->flags &= ~(CF_READ_EVENT|CF_WRITE_EVENT);
+	res->flags &= ~(CF_READ_EVENT|CF_WRITE_EVENT);
 
 	s->prev_conn_state = scb->state;
 
@@ -1700,7 +1709,7 @@ struct task *process_stream(struct task *t, void *context, unsigned int state)
 	 * to a bogus analyser or the fact that we're ignoring a read0. The
 	 * call_rate counter only counts calls with no progress made.
 	 */
-	if (!((req->flags | res->flags) & (CF_READ_PARTIAL|CF_WRITE_PARTIAL))) {
+	if (!((req->flags | res->flags) & (CF_READ_EVENT|CF_WRITE_EVENT))) {
 		rate = update_freq_ctr(&s->call_rate, 1);
 		if (rate >= 100000 && s->call_rate.prev_ctr) // make sure to wait at least a full second
 			stream_dump_and_crash(&s->obj_type, read_freq_ctr(&s->call_rate));
@@ -1772,8 +1781,8 @@ struct task *process_stream(struct task *t, void *context, unsigned int state)
 		 * timeout needs to be refreshed.
 		 */
 		if (!((req->flags | res->flags) &
-		      (CF_SHUTR|CF_READ_ACTIVITY|CF_READ_TIMEOUT|CF_SHUTW|
-		       CF_WRITE_ACTIVITY|CF_WRITE_TIMEOUT|CF_ANA_TIMEOUT)) &&
+		      (CF_SHUTR|CF_READ_EVENT|CF_READ_TIMEOUT|CF_SHUTW|
+		       CF_WRITE_EVENT|CF_WRITE_TIMEOUT)) &&
 		    !(s->flags & SF_CONN_EXP) &&
 		    !((sc_ep_get(scf) | scb->flags) & SE_FL_ERROR) &&
 		    ((s->pending_events & TASK_WOKEN_ANY) == TASK_WOKEN_TIMER)) {
@@ -3617,7 +3626,7 @@ static int cli_io_handler_dump_sess(struct appctx *appctx)
 		goto done;
 	}
 
-	if (unlikely(sc_ic(sc)->flags & (CF_WRITE_ERROR|CF_SHUTW))) {
+	if (unlikely(sc_ic(sc)->flags & CF_SHUTW)) {
 		/* If we're forced to shut down, we might have to remove our
 		 * reference to the last stream being dumped.
 		 */
@@ -3941,6 +3950,13 @@ static struct action_kw_list stream_http_res_keywords = { ILH, {
 }};
 
 INITCALL1(STG_REGISTER, http_res_keywords_register, &stream_http_res_keywords);
+
+static struct action_kw_list stream_http_after_res_actions =  { ILH, {
+	{ "set-log-level", stream_parse_set_log_level },
+	{ /* END */ }
+}};
+
+INITCALL1(STG_REGISTER, http_after_res_keywords_register, &stream_http_after_res_actions);
 
 static int smp_fetch_cur_server_timeout(const struct arg *args, struct sample *smp, const char *km, void *private)
 {

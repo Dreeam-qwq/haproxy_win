@@ -3195,7 +3195,7 @@ send_msgs:
 				}
 				sc_shutw(sc);
 				sc_shutr(sc);
-				sc_ic(sc)->flags |= CF_READ_NULL;
+				sc_ic(sc)->flags |= CF_READ_EVENT;
 				goto out;
 			}
 		}
@@ -3898,6 +3898,14 @@ static int peers_dump_peer(struct buffer *msg, struct appctx *appctx, struct pee
 	              peer->appctx->t ? peer->appctx->t->calls : 0);
 
 	peer_cs = appctx_sc(peer->appctx);
+	if (!peer_cs) {
+		/* the appctx might exist but not yet be initialized due to
+		 * deferred initialization used to balance applets across
+		 * threads.
+		 */
+		goto table_info;
+	}
+
 	peer_s = __sc_strm(peer_cs);
 
 	chunk_appendf(&trash, " state=%s", sc_state_str(sc_opposite(peer_cs)->state));

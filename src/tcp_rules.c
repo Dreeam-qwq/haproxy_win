@@ -116,7 +116,7 @@ int tcp_inspect_request(struct stream *s, struct channel *req, int an_bit)
 	 * - if one rule returns KO, then return KO
 	 */
 
-	if ((req->flags & (CF_EOI|CF_SHUTR|CF_READ_ERROR)) || channel_full(req, global.tune.maxrewrite) ||
+	if ((req->flags & (CF_EOI|CF_SHUTR)) || channel_full(req, global.tune.maxrewrite) ||
 	    sc_waiting_room(chn_prod(req)) ||
 	    !s->be->tcp_req.inspect_delay || tick_is_expired(s->rules_exp, now_ms)) {
 		partial = SMP_OPT_FINAL;
@@ -299,7 +299,7 @@ int tcp_inspect_response(struct stream *s, struct channel *rep, int an_bit)
 	 * - if one rule returns OK, then return OK
 	 * - if one rule returns KO, then return KO
 	 */
-	if ((rep->flags & (CF_EOI|CF_SHUTR|CF_READ_ERROR)) || channel_full(rep, global.tune.maxrewrite) ||
+	if ((rep->flags & (CF_EOI|CF_SHUTR)) || channel_full(rep, global.tune.maxrewrite) ||
 	    sc_waiting_room(chn_prod(rep)) ||
 	    !s->be->tcp_rep.inspect_delay || tick_is_expired(s->rules_exp, now_ms)) {
 		partial = SMP_OPT_FINAL;
@@ -1058,7 +1058,7 @@ static int tcp_parse_request_rule(char **args, int arg, int section_type,
 			memprintf(err,
 			          "'%s %s' expects 'accept', 'reject', 'capture', 'expect-proxy', 'expect-netscaler-cip', 'track-sc0' ... 'track-sc%d', %s "
 			          "in %s '%s' (got '%s').%s%s%s\n",
-			          args[0], args[1], MAX_SESS_STKCTR-1,
+			          args[0], args[1], global.tune.nb_stk_ctr-1,
 			          trash.area, proxy_type_str(curpx),
 			          curpx->id, args[arg],
 			          best ? " Did you mean '" : "",

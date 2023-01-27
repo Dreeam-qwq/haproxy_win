@@ -458,7 +458,7 @@ static int h2_process(struct h2c *h2c);
 /* h2_io_cb is exported to see it resolved in "show fd" */
 struct task *h2_io_cb(struct task *t, void *ctx, unsigned int state);
 static inline struct h2s *h2c_st_by_id(struct h2c *h2c, int id);
-static int h2c_decode_headers(struct h2c *h2c, struct buffer *rxbuf, uint32_t *flags, unsigned long long *body_len, char *upgrade_protocol);
+static int h2c_dec_hdrs(struct h2c *h2c, struct buffer *rxbuf, uint32_t *flags, unsigned long long *body_len, char *upgrade_protocol);
 static int h2_frt_transfer_data(struct h2s *h2s);
 struct task *h2_deferred_shut(struct task *t, void *ctx, unsigned int state);
 static struct h2s *h2c_bck_stream_new(struct h2c *h2c, struct stconn *sc, struct session *sess);
@@ -840,6 +840,80 @@ static int h2_avail_streams(struct connection *conn)
 	return ret1;
 }
 
+/* inconditionally produce a trace of the header. Please do not call this one
+ * and use h2_trace_header() instead which first checks if traces are enabled.
+ */
+void _h2_trace_header(const struct ist hn, const struct ist hv,
+		      uint64_t mask, const struct ist trc_loc, const char *func,
+		      const struct h2c *h2c, const struct h2s *h2s)
+{
+	struct ist n_ist, v_ist;
+	const char *c_str, *s_str;
+
+	chunk_reset(&trash);
+	c_str = chunk_newstr(&trash);
+	if (h2c) {
+		chunk_appendf(&trash, "h2c=%p(%c,%s) ",
+			      h2c, (h2c->flags & H2_CF_IS_BACK) ? 'B' : 'F', h2c_st_to_str(h2c->st0));
+	}
+
+	s_str = chunk_newstr(&trash);
+	if (h2s) {
+		if (h2s->id <= 0)
+			chunk_appendf(&trash, "dsi=%d ", h2s->h2c->dsi);
+		chunk_appendf(&trash, "h2s=%p(%d,%s) ", h2s, h2s->id, h2s_st_to_str(h2s->st));
+	}
+	else if (h2c)
+		chunk_appendf(&trash, "dsi=%d ", h2c->dsi);
+
+	n_ist = ist2(chunk_newstr(&trash), 0);
+	istscpy(&n_ist, hn, 256);
+	trash.data += n_ist.len;
+	if (n_ist.len != hn.len)
+		chunk_appendf(&trash, " (... +%ld)", (long)(hn.len - n_ist.len));
+
+	v_ist = ist2(chunk_newstr(&trash), 0);
+	istscpy(&v_ist, hv, 1024);
+	trash.data += v_ist.len;
+	if (v_ist.len != hv.len)
+		chunk_appendf(&trash, " (... +%ld)", (long)(hv.len - v_ist.len));
+
+	TRACE_PRINTF_LOC(TRACE_LEVEL_USER, mask, trc_loc, func,
+	                 h2c->conn, 0, 0, 0,
+	                 "%s%s%s %s: %s", c_str, s_str,
+	                 (mask & H2_EV_TX_HDR) ? "sndh" : "rcvh",
+	                 n_ist.ptr, v_ist.ptr);
+}
+
+/* produce a trace of the header after checking that tracing is enabled */
+static inline void h2_trace_header(const struct ist hn, const struct ist hv,
+				   uint64_t mask, const struct ist trc_loc, const char *func,
+				   const struct h2c *h2c, const struct h2s *h2s)
+{
+	if ((TRACE_SOURCE)->verbosity >= H2_VERB_ADVANCED &&
+	    TRACE_ENABLED(TRACE_LEVEL_USER, mask, h2c ? h2c->conn : 0, h2s, 0, 0))
+		_h2_trace_header(hn, hv, mask, trc_loc, func, h2c, h2s);
+}
+
+/* hpack-encode header name <hn> and value <hv>, possibly emitting a trace if
+ * currently enabled. This is done on behalf of function <func> at <trc_loc>
+ * passed as ist(TRC_LOC), h2c <h2c>, and h2s <h2s>, all of which may be NULL.
+ * The trace is only emitted if the header is emitted (in which case non-zero
+ * is returned). The trash is modified. In the traces, the header's name will
+ * be truncated to 256 chars and the header's value to 1024 chars.
+ */
+static inline int h2_encode_header(struct buffer *buf, const struct ist hn, const struct ist hv,
+				   uint64_t mask, const struct ist trc_loc, const char *func,
+				   const struct h2c *h2c, const struct h2s *h2s)
+{
+	int ret;
+
+	ret = hpack_encode_header(buf, hn, hv);
+	if (ret)
+		h2_trace_header(hn, hv, mask, trc_loc, func, h2c, h2s);
+
+	return ret;
+}
 
 /*****************************************************************/
 /* functions below are dedicated to the mux setup and management */
@@ -2582,10 +2656,13 @@ static struct h2s *h2c_frt_handle_headers(struct h2c *h2c, struct h2s *h2s)
 	if (h2s->st != H2_SS_IDLE) {
 		/* The stream exists/existed, this must be a trailers frame */
 		if (h2s->st != H2_SS_CLOSED) {
-			error = h2c_decode_headers(h2c, &h2s->rxbuf, &h2s->flags, &body_len, NULL);
+			error = h2c_dec_hdrs(h2c, &h2s->rxbuf, &h2s->flags, &body_len, NULL);
 			/* unrecoverable error ? */
-			if (h2c->st0 >= H2_CS_ERROR)
+			if (h2c->st0 >= H2_CS_ERROR) {
+				TRACE_USER("Unrecoverable error decoding H2 trailers", H2_EV_RX_FRAME|H2_EV_RX_HDR|H2_EV_STRM_NEW|H2_EV_STRM_END, h2c->conn, 0, &rxbuf);
+				sess_log(h2c->conn->owner);
 				goto out;
+			}
 
 			if (error == 0) {
 				/* Demux not blocked because of the stream, it is an incomplete frame */
@@ -2598,7 +2675,9 @@ static struct h2s *h2c_frt_handle_headers(struct h2c *h2c, struct h2s *h2s)
 				/* Failed to decode this frame (e.g. too large request)
 				 * but the HPACK decompressor is still synchronized.
 				 */
+				sess_log(h2c->conn->owner);
 				h2s_error(h2s, H2_ERR_INTERNAL_ERROR);
+				TRACE_USER("Stream error decoding H2 trailers", H2_EV_RX_FRAME|H2_EV_RX_HDR|H2_EV_STRM_NEW|H2_EV_STRM_END, h2c->conn, 0, &rxbuf);
 				h2c->st0 = H2_CS_FRAME_E;
 				goto out;
 			}
@@ -2607,7 +2686,8 @@ static struct h2s *h2c_frt_handle_headers(struct h2c *h2c, struct h2s *h2s)
 		/* the connection was already killed by an RST, let's consume
 		 * the data and send another RST.
 		 */
-		error = h2c_decode_headers(h2c, &rxbuf, &flags, &body_len, NULL);
+		error = h2c_dec_hdrs(h2c, &rxbuf, &flags, &body_len, NULL);
+		sess_log(h2c->conn->owner);
 		h2s = (struct h2s*)h2_error_stream;
 		goto send_rst;
 	}
@@ -2622,11 +2702,14 @@ static struct h2s *h2c_frt_handle_headers(struct h2c *h2c, struct h2s *h2s)
 	else if (h2c->flags & H2_CF_DEM_TOOMANY)
 		goto out; // IDLE but too many sc still present
 
-	error = h2c_decode_headers(h2c, &rxbuf, &flags, &body_len, NULL);
+	error = h2c_dec_hdrs(h2c, &rxbuf, &flags, &body_len, NULL);
 
 	/* unrecoverable error ? */
-	if (h2c->st0 >= H2_CS_ERROR)
+	if (h2c->st0 >= H2_CS_ERROR) {
+		TRACE_USER("Unrecoverable error decoding H2 request", H2_EV_RX_FRAME|H2_EV_RX_HDR|H2_EV_STRM_NEW|H2_EV_STRM_END, h2c->conn, 0, &rxbuf);
+		sess_log(h2c->conn->owner);
 		goto out;
+	}
 
 	if (error <= 0) {
 		if (error == 0) {
@@ -2639,6 +2722,7 @@ static struct h2s *h2c_frt_handle_headers(struct h2c *h2c, struct h2s *h2s)
 		/* Failed to decode this stream (e.g. too large request)
 		 * but the HPACK decompressor is still synchronized.
 		 */
+		sess_log(h2c->conn->owner);
 		h2s = (struct h2s*)h2_error_stream;
 		goto send_rst;
 	}
@@ -2727,21 +2811,23 @@ static struct h2s *h2c_bck_handle_headers(struct h2c *h2c, struct h2s *h2s)
 	}
 
 	if (h2s->st != H2_SS_CLOSED) {
-		error = h2c_decode_headers(h2c, &h2s->rxbuf, &h2s->flags, &h2s->body_len, h2s->upgrade_protocol);
+		error = h2c_dec_hdrs(h2c, &h2s->rxbuf, &h2s->flags, &h2s->body_len, h2s->upgrade_protocol);
 	}
 	else {
 		/* the connection was already killed by an RST, let's consume
 		 * the data and send another RST.
 		 */
-		error = h2c_decode_headers(h2c, &rxbuf, &flags, &body_len, NULL);
+		error = h2c_dec_hdrs(h2c, &rxbuf, &flags, &body_len, NULL);
 		h2s = (struct h2s*)h2_error_stream;
 		h2c->st0 = H2_CS_FRAME_E;
 		goto send_rst;
 	}
 
 	/* unrecoverable error ? */
-	if (h2c->st0 >= H2_CS_ERROR)
+	if (h2c->st0 >= H2_CS_ERROR) {
+		TRACE_USER("Unrecoverable error decoding H2 HEADERS", H2_EV_RX_FRAME|H2_EV_RX_HDR, h2c->conn, h2s);
 		goto fail;
+	}
 
 	if (h2s->st != H2_SS_OPEN && h2s->st != H2_SS_HLOC) {
 		/* RFC7540#5.1 */
@@ -4577,7 +4663,7 @@ static void h2_shutw(struct stconn *sc, enum co_shw_mode mode)
  * decoding, in order to detect if we're dealing with a headers or a trailers
  * block (the trailers block appears after H2_SF_HEADERS_RCVD was seen).
  */
-static int h2c_decode_headers(struct h2c *h2c, struct buffer *rxbuf, uint32_t *flags, unsigned long long *body_len, char *upgrade_protocol)
+static int h2c_dec_hdrs(struct h2c *h2c, struct buffer *rxbuf, uint32_t *flags, unsigned long long *body_len, char *upgrade_protocol)
 {
 	const uint8_t *hdrs = (uint8_t *)b_head(&h2c->dbuf);
 	struct buffer *tmp = get_trash_chunk();
@@ -4717,6 +4803,26 @@ next_frame:
 	/* past this point we cannot roll back in case of error */
 	outlen = hpack_decode_frame(h2c->ddht, hdrs, flen, list,
 	                            sizeof(list)/sizeof(list[0]), tmp);
+
+	if (outlen > 0 &&
+	    (TRACE_SOURCE)->verbosity >= H2_VERB_ADVANCED &&
+	    TRACE_ENABLED(TRACE_LEVEL_USER, H2_EV_RX_FRAME|H2_EV_RX_HDR, h2c->conn, 0, 0, 0)) {
+		struct ist n;
+		int i;
+
+		for (i = 0; list[i].n.len; i++) {
+			n = list[i].n;
+
+			if (!isttest(n)) {
+				/* this is in fact a pseudo header whose number is in n.len */
+				n = h2_phdr_to_ist(n.len);
+			}
+
+			h2_trace_header(n, list[i].v, H2_EV_RX_FRAME|H2_EV_RX_HDR,
+			                ist(TRC_LOC), __FUNCTION__, h2c, NULL);
+		}
+	}
+
 	if (outlen < 0) {
 		TRACE_STATE("failed to decompress HPACK", H2_EV_RX_FRAME|H2_EV_RX_HDR|H2_EV_H2C_ERR|H2_EV_PROTO_ERR, h2c->conn);
 		h2c_error(h2c, H2_ERR_COMPRESSION_ERROR);
@@ -4968,7 +5074,7 @@ try_again:
  * header blocks and an end of header, otherwise an invalid frame could be
  * emitted and the resulting htx message could be left in an inconsistent state.
  */
-static size_t h2s_frt_make_resp_headers(struct h2s *h2s, struct htx *htx)
+static size_t h2s_snd_fhdrs(struct h2s *h2s, struct htx *htx)
 {
 	struct http_hdr list[global.tune.max_http_hdr];
 	struct h2c *h2c = h2s->h2c;
@@ -5101,6 +5207,14 @@ static size_t h2s_frt_make_resp_headers(struct h2s *h2s, struct htx *htx)
 		goto full;
 	}
 
+	if ((TRACE_SOURCE)->verbosity >= H2_VERB_ADVANCED) {
+		char sts[4];
+
+		h2_trace_header(ist(":status"), ist(ultoa_r(h2s->status, sts, sizeof(sts))),
+				    H2_EV_TX_FRAME|H2_EV_TX_HDR, ist(TRC_LOC), __FUNCTION__,
+				    h2c, h2s);
+	}
+
 	/* encode all headers, stop at empty name */
 	for (hdr = 0; hdr < sizeof(list)/sizeof(list[0]); hdr++) {
 		/* these ones do not exist in H2 and must be dropped. */
@@ -5118,7 +5232,8 @@ static size_t h2s_frt_make_resp_headers(struct h2s *h2s, struct htx *htx)
 		if (isteq(list[hdr].n, ist("")))
 			break; // end
 
-		if (!hpack_encode_header(&outbuf, list[hdr].n, list[hdr].v)) {
+		if (!h2_encode_header(&outbuf, list[hdr].n, list[hdr].v, H2_EV_TX_FRAME|H2_EV_TX_HDR,
+		                      ist(TRC_LOC), __FUNCTION__, h2c, h2s)) {
 			/* output full */
 			if (b_space_wraps(mbuf))
 				goto realign_again;
@@ -5223,7 +5338,7 @@ static size_t h2s_frt_make_resp_headers(struct h2s *h2s, struct htx *htx)
  * header blocks and an end of header, otherwise an invalid frame could be
  * emitted and the resulting htx message could be left in an inconsistent state.
  */
-static size_t h2s_bck_make_req_headers(struct h2s *h2s, struct htx *htx)
+static size_t h2s_snd_bhdrs(struct h2s *h2s, struct htx *htx)
 {
 	struct http_hdr list[global.tune.max_http_hdr];
 	struct h2c *h2c = h2s->h2c;
@@ -5378,6 +5493,8 @@ static size_t h2s_bck_make_req_headers(struct h2s *h2s, struct htx *htx)
 		goto full;
 	}
 
+	h2_trace_header(ist(":method"), meth, H2_EV_TX_FRAME|H2_EV_TX_HDR, ist(TRC_LOC), __FUNCTION__, h2c, h2s);
+
 	auth = ist(NULL);
 
 	/* RFC7540 #8.3: the CONNECT method must have :
@@ -5391,12 +5508,14 @@ static size_t h2s_bck_make_req_headers(struct h2s *h2s, struct htx *htx)
 	if (unlikely(sl->info.req.meth == HTTP_METH_CONNECT) && !extended_connect) {
 		auth = uri;
 
-		if (!hpack_encode_header(&outbuf, ist(":authority"), auth)) {
+		if (!h2_encode_header(&outbuf, ist(":authority"), auth, H2_EV_TX_FRAME|H2_EV_TX_HDR,
+		                      ist(TRC_LOC), __FUNCTION__, h2c, h2s)) {
 			/* output full */
 			if (b_space_wraps(mbuf))
 				goto realign_again;
 			goto full;
 		}
+
 		h2s->flags |= H2_SF_BODY_TUNNEL;
 	} else {
 		/* other methods need a :scheme. If an authority is known from
@@ -5456,7 +5575,9 @@ static size_t h2s_bck_make_req_headers(struct h2s *h2s, struct htx *htx)
 			goto full;
 		}
 
-		if (auth.len && !hpack_encode_header(&outbuf, ist(":authority"), auth)) {
+		if (auth.len &&
+		    !h2_encode_header(&outbuf, ist(":authority"), auth, H2_EV_TX_FRAME|H2_EV_TX_HDR,
+		                      ist(TRC_LOC), __FUNCTION__, h2c, h2s)) {
 			/* output full */
 			if (b_space_wraps(mbuf))
 				goto realign_again;
@@ -5480,15 +5601,16 @@ static size_t h2s_bck_make_req_headers(struct h2s *h2s, struct htx *htx)
 			goto full;
 		}
 
+		h2_trace_header(ist(":path"), uri, H2_EV_TX_FRAME|H2_EV_TX_HDR, ist(TRC_LOC), __FUNCTION__, h2c, h2s);
+
 		/* encode the pseudo-header protocol from rfc8441 if using
 		 * Extended CONNECT method.
 		 */
 		if (unlikely(extended_connect)) {
 			const struct ist protocol = ist(h2s->upgrade_protocol);
 			if (isttest(protocol)) {
-				if (!hpack_encode_header(&outbuf,
-				                         ist(":protocol"),
-				                         protocol)) {
+				if (!h2_encode_header(&outbuf, ist(":protocol"), protocol, H2_EV_TX_FRAME|H2_EV_TX_HDR,
+				                      ist(TRC_LOC), __FUNCTION__, h2c, h2s)) {
 					/* output full */
 					if (b_space_wraps(mbuf))
 						goto realign_again;
@@ -5531,7 +5653,7 @@ static size_t h2s_bck_make_req_headers(struct h2s *h2s, struct htx *htx)
 		if (isteq(n, ist("")))
 			break; // end
 
-		if (!hpack_encode_header(&outbuf, n, v)) {
+		if (!h2_encode_header(&outbuf, n, v, H2_EV_TX_FRAME|H2_EV_TX_HDR, ist(TRC_LOC), __FUNCTION__, h2c, h2s)) {
 			/* output full */
 			if (b_space_wraps(mbuf))
 				goto realign_again;
@@ -6079,7 +6201,8 @@ static size_t h2s_make_trailers(struct h2s *h2s, struct htx *htx)
 		if (*(list[idx].n.ptr) == ':')
 			continue;
 
-		if (!hpack_encode_header(&outbuf, list[idx].n, list[idx].v)) {
+		if (!h2_encode_header(&outbuf, list[idx].n, list[idx].v, H2_EV_TX_FRAME|H2_EV_TX_HDR,
+		                      ist(TRC_LOC), __FUNCTION__, h2c, h2s)) {
 			/* output full */
 			if (b_space_wraps(mbuf))
 				goto realign_again;
@@ -6356,7 +6479,7 @@ static size_t h2_snd_buf(struct stconn *sc, struct buffer *buf, size_t count, in
 	if (!(h2s->flags & H2_SF_OUTGOING_DATA) && count)
 		h2s->flags |= H2_SF_OUTGOING_DATA;
 
-	if (htx->extra)
+	if (htx->extra && htx->extra != HTX_UNKOWN_PAYLOAD_LENGTH)
 		h2s->flags |= H2_SF_MORE_HTX_DATA;
 	else
 		h2s->flags &= ~H2_SF_MORE_HTX_DATA;
@@ -6387,7 +6510,7 @@ static size_t h2_snd_buf(struct stconn *sc, struct buffer *buf, size_t count, in
 		switch (btype) {
 			case HTX_BLK_REQ_SL:
 				/* start-line before headers */
-				ret = h2s_bck_make_req_headers(h2s, htx);
+				ret = h2s_snd_bhdrs(h2s, htx);
 				if (ret > 0) {
 					total += ret;
 					count -= ret;
@@ -6398,7 +6521,7 @@ static size_t h2_snd_buf(struct stconn *sc, struct buffer *buf, size_t count, in
 
 			case HTX_BLK_RES_SL:
 				/* start-line before headers */
-				ret = h2s_frt_make_resp_headers(h2s, htx);
+				ret = h2s_snd_fhdrs(h2s, htx);
 				if (ret > 0) {
 					total += ret;
 					count -= ret;
@@ -6477,10 +6600,7 @@ static size_t h2_snd_buf(struct stconn *sc, struct buffer *buf, size_t count, in
 	    !b_data(&h2s->h2c->dbuf) &&
 	    (h2s->flags & (H2_SF_BLK_SFCTL | H2_SF_BLK_MFCTL))) {
 		TRACE_DEVEL("fctl with shutr, reporting error to app-layer", H2_EV_H2S_SEND|H2_EV_STRM_SEND|H2_EV_STRM_ERR, h2s->h2c->conn, h2s);
-		if (se_fl_test(h2s->sd, SE_FL_EOS))
-			se_fl_set(h2s->sd, SE_FL_ERROR);
-		else
-			se_fl_set(h2s->sd, SE_FL_ERR_PENDING);
+		se_fl_set_error(h2s->sd);
 	}
 
 	if (total > 0 && !(h2s->flags & H2_SF_BLK_SFCTL) &&

@@ -1150,7 +1150,8 @@ static int ssl_sock_load_ocsp(SSL_CTX *ctx, struct ckch_data *data, STACK_OF(X50
 	if (!issuer)
 		goto out;
 
-	data->ocsp_cid = OCSP_cert_to_id(0, x, issuer);
+	if (!data->ocsp_cid)
+		data->ocsp_cid = OCSP_cert_to_id(0, x, issuer);
 	if (!data->ocsp_cid)
 		goto out;
 
@@ -1244,16 +1245,21 @@ static int ssl_sock_load_ocsp(SSL_CTX *ctx, struct ckch_data *data, STACK_OF(X50
 		/* Do not insert the same certificate_ocsp structure in the
 		 * update tree more than once. */
 		if (!ocsp) {
-			iocsp->issuer = issuer;
-			X509_up_ref(issuer);
+			/* Issuer certificate is not included in the certificate
+			 * chain, it will have to be treated separately during
+			 * ocsp response validation. */
+			if (issuer == data->ocsp_issuer) {
+				iocsp->issuer = issuer;
+				X509_up_ref(issuer);
+			}
 			if (data->chain)
 				iocsp->chain = X509_chain_up_ref(data->chain);
 
-			iocsp->uri = alloc_trash_chunk();
-			if (!iocsp->uri)
+			iocsp->uri = calloc(1, sizeof(*iocsp->uri));
+			if (!chunk_dup(iocsp->uri, ocsp_uri)) {
+				ha_free(&iocsp->uri);
 				goto out;
-			if (!chunk_cpy(iocsp->uri, ocsp_uri))
-				goto out;
+			}
 
 			ssl_ocsp_update_insert(iocsp);
 		}
@@ -7338,7 +7344,7 @@ enum act_return ssl_action_wait_for_hs(struct act_rule *rule, struct proxy *px,
 	if (conn) {
 		if (conn->flags & (CO_FL_EARLY_SSL_HS | CO_FL_SSL_WAIT_HS)) {
 			sc_ep_set(s->scf, SE_FL_WAIT_FOR_HS);
-			s->req.flags |= CF_READ_NULL;
+			s->req.flags |= CF_READ_EVENT;
 			return ACT_RET_YIELD;
 		}
 	}

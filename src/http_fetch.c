@@ -226,7 +226,7 @@ struct htx *smp_prefetch_htx(struct sample *smp, struct channel *chn, struct che
 	if (IS_HTX_STRM(s)) {
 		htx = htxbuf(&chn->buf);
 
-		if (msg->msg_state == HTTP_MSG_ERROR || (htx->flags & HTX_FL_PARSING_ERROR))
+		if (htx->flags & HTX_FL_PARSING_ERROR)
 			return NULL;
 
 		if (msg->msg_state < HTTP_MSG_BODY) {
@@ -311,7 +311,7 @@ struct htx *smp_prefetch_htx(struct sample *smp, struct channel *chn, struct che
 			if (txn->meth == HTTP_METH_GET || txn->meth == HTTP_METH_HEAD)
 				s->flags |= SF_REDIRECTABLE;
 		}
-		else
+		else if (txn->status == -1)
 			txn->status = sl->info.res.status;
 		if (sl->flags & HTX_SL_F_VER_11)
 			msg->flags |= HTTP_MSGF_VER_11;
@@ -615,7 +615,7 @@ static int smp_fetch_body(const struct arg *args, struct sample *smp, const char
 	smp->flags = SMP_F_VOL_TEST;
 
 	if (!finished && (check || (chn && !channel_full(chn, global.tune.maxrewrite) &&
-				    !(chn->flags & (CF_EOI|CF_SHUTR|CF_READ_ERROR)))))
+				    !(chn->flags & (CF_EOI|CF_SHUTR)))))
 		smp->flags |= SMP_F_MAY_CHANGE;
 
 	return 1;
@@ -679,7 +679,7 @@ static int smp_fetch_body_size(const struct arg *args, struct sample *smp, const
 		if (type == HTX_BLK_DATA)
 			len += htx_get_blksz(blk);
 	}
-	if (htx->extra != ULLONG_MAX)
+	if (htx->extra != HTX_UNKOWN_PAYLOAD_LENGTH)
 		len += htx->extra;
 
 	smp->data.type = SMP_T_SINT;

@@ -313,7 +313,7 @@ static int cli_io_handler_show_threads(struct appctx *appctx)
 	struct stconn *sc = appctx_sc(appctx);
 	int thr;
 
-	if (unlikely(sc_ic(sc)->flags & (CF_WRITE_ERROR|CF_SHUTW)))
+	if (unlikely(sc_ic(sc)->flags & CF_SHUTW))
 		return 1;
 
 	if (appctx->st0)
@@ -1096,7 +1096,7 @@ static int debug_iohandler_fd(struct appctx *appctx)
 	int ret = 1;
 	int i, fd;
 
-	if (unlikely(sc_ic(sc)->flags & (CF_WRITE_ERROR|CF_SHUTW)))
+	if (unlikely(sc_ic(sc)->flags & CF_SHUTW))
 		goto end;
 
 	chunk_reset(&trash);
@@ -1303,7 +1303,7 @@ static int debug_iohandler_memstats(struct appctx *appctx)
 	const char *pfx = ctx->match;
 	int ret = 1;
 
-	if (unlikely(sc_ic(sc)->flags & (CF_WRITE_ERROR|CF_SHUTW)))
+	if (unlikely(sc_ic(sc)->flags & CF_SHUTW))
 		goto end;
 
 	if (!ctx->width) {
@@ -1561,11 +1561,8 @@ void debug_handler(int sig, siginfo_t *si, void *arg)
 	while ((HA_ATOMIC_LOAD(&thread_dump_state) & THREAD_DUMP_TMASK) != tid)
 		ha_thread_relax();
 
-	/* make sure we don't count all that wait time against us */
-	HA_ATOMIC_AND(&th_ctx->flags, ~TH_FL_STUCK);
-
 	if (!harmless)
-		thread_harmless_end();
+		thread_harmless_end_sig();
 
 	/* dump if needed */
 	if (thread_dump_buffer)
@@ -1601,20 +1598,16 @@ void debug_handler(int sig, siginfo_t *si, void *arg)
 	}
 
 	/* now wait for all others to finish dumping: the lowest part will turn
-	 * to zero. Then all others decrement the done part.
+	 * to zero. Then all others decrement the done part. We must not change
+	 * the harmless status anymore because one of the other threads might
+	 * have been interrupted in thread_isolate() waiting for all others to
+	 * become harmless, and changing the situation here would break that
+	 * promise.
 	 */
-	if (!harmless)
-		thread_harmless_now();
 
 	/* wait for everyone to finish*/
 	while (HA_ATOMIC_LOAD(&thread_dump_state) & THREAD_DUMP_PMASK)
 		ha_thread_relax();
-
-	/* make sure we don't count all that wait time against us */
-	HA_ATOMIC_AND(&th_ctx->flags, ~TH_FL_STUCK);
-
-	if (!harmless)
-		thread_harmless_end();
 
 	/* we're gone. Past this point anything can happen including another
 	 * thread trying to re-trigger a dump, so thread_dump_buffer and
