@@ -66,6 +66,8 @@ static const struct trace_event h3_trace_events[] = {
 	{ .mask = H3_EV_H3S_NEW,      .name = "h3s_new",     .desc = "new H3 stream" },
 #define           H3_EV_H3S_END       (1ULL <<  8)
 	{ .mask = H3_EV_H3S_END,      .name = "h3s_end",     .desc = "H3 stream terminated" },
+#define           H3_EV_H3C_END       (1ULL <<  9)
+	{ .mask = H3_EV_H3C_END,      .name = "h3c_end",     .desc = "H3 connection terminated" },
 	{ }
 };
 
@@ -1377,6 +1379,13 @@ static int h3_resp_trailers_send(struct qcs *qcs, struct htx *htx)
 		}
 	}
 
+	if (!hdr) {
+		/* No headers encoded here so no need to generate a H3 HEADERS
+		 * frame. Mux will send an empty QUIC STREAM frame with FIN.
+		 */
+		TRACE_DATA("skipping trailer", H3_EV_TX_HDR, qcs->qcc->conn, qcs);
+		goto end;
+	}
 	list[hdr].n = ist("");
 
 	res = mux_get_buf(qcs);
@@ -1393,8 +1402,10 @@ static int h3_resp_trailers_send(struct qcs *qcs, struct htx *htx)
 	/* Start the headers after frame type + length */
 	headers_buf = b_make(b_peek(res, b_data(res) + 9), b_contig_space(res) - 9, 0, 0);
 
-	if (qpack_encode_field_section_line(&headers_buf))
-		ABORT_NOW();
+	if (qpack_encode_field_section_line(&headers_buf)) {
+		qcs->flags |= QC_SF_BLK_MROOM;
+		goto err;
+	}
 
 	tail = b_tail(&headers_buf);
 	for (hdr = 0; hdr < sizeof(list) / sizeof(list[0]); ++hdr) {
@@ -1412,28 +1423,30 @@ static int h3_resp_trailers_send(struct qcs *qcs, struct htx *htx)
 			continue;
 		}
 
-		if (qpack_encode_header(&headers_buf, list[hdr].n, list[hdr].v))
-			ABORT_NOW();
+		if (qpack_encode_header(&headers_buf, list[hdr].n, list[hdr].v)) {
+			qcs->flags |= QC_SF_BLK_MROOM;
+			goto err;
+		}
+	}
+
+	/* Check that at least one header was encoded in buffer. */
+	if (b_tail(&headers_buf) == tail) {
+		/* No headers encoded here so no need to generate a H3 HEADERS
+		 * frame. Mux will send an empty QUIC STREAM frame with FIN.
+		 */
+		TRACE_DATA("skipping trailer", H3_EV_TX_HDR, qcs->qcc->conn, qcs);
+		goto end;
 	}
 
 	/* Now that all headers are encoded, we are certain that res buffer is
 	 * big enough.
 	 */
+	b_putchr(res, 0x01); /* h3 HEADERS frame type */
+	if (!b_quic_enc_int(res, b_data(&headers_buf), 8))
+		ABORT_NOW();
+	b_add(res, b_data(&headers_buf));
 
-	/* Check that at least one header was encoded in buffer. */
-	if (b_tail(&headers_buf) != tail) {
-		b_putchr(res, 0x01); /* h3 HEADERS frame type */
-		if (!b_quic_enc_int(res, b_data(&headers_buf), 8))
-			ABORT_NOW();
-		b_add(res, b_data(&headers_buf));
-	}
-	else  {
-		/* No headers encoded here so no need to generate a H3 HEADERS
-		 * frame. Mux will send an empty QUIC STREAM frame with FIN.
-		 */
-		TRACE_DATA("skipping trailer", H3_EV_TX_HDR, qcs->qcc->conn, qcs);
-	}
-
+ end:
 	ret = 0;
 	blk = htx_get_head_blk(htx);
 	while (blk) {
@@ -1590,6 +1603,40 @@ static size_t h3_snd_buf(struct qcs *qcs, struct htx *htx, size_t count)
 	return total;
 }
 
+/* Notify about a closure on <qcs> stream requested by the remote peer.
+ *
+ * Stream channel <side> is explained relative to our endpoint : WR for
+ * STOP_SENDING or RD for RESET_STREAM reception. Callback decode_qcs() is used
+ * instead for closure performed using a STREAM frame with FIN bit.
+ *
+ * The main objective of this function is to check if closure is valid
+ * according to HTTP/3 specification.
+ *
+ * Returns 0 on success else non-zero. A CONNECTION_CLOSE is generated on
+ * error.
+ */
+static int h3_close(struct qcs *qcs, enum qcc_app_ops_close_side side)
+{
+	struct h3s *h3s = qcs->ctx;
+	struct h3c *h3c = h3s->h3c;;
+
+	/* RFC 9114 6.2.1. Control Streams
+	 *
+	 * The sender
+	 * MUST NOT close the control stream, and the receiver MUST NOT
+	 * request that the sender close the control stream.  If either
+	 * control stream is closed at any point, this MUST be treated
+	 * as a connection error of type H3_CLOSED_CRITICAL_STREAM.
+	 */
+	if (qcs == h3c->ctrl_strm || h3s->type == H3S_T_CTRL) {
+		TRACE_ERROR("closure detected on control stream", H3_EV_H3S_END, qcs->qcc->conn, qcs);
+		qcc_emit_cc_app(qcs->qcc, H3_CLOSED_CRITICAL_STREAM, 1);
+		return 1;
+	}
+
+	return 0;
+}
+
 static int h3_attach(struct qcs *qcs, void *conn_ctx)
 {
 	struct h3s *h3s;
@@ -1666,8 +1713,12 @@ static int h3_send_goaway(struct h3c *h3c)
 	unsigned char data[3 * QUIC_VARINT_MAX_SIZE];
 	size_t frm_len = quic_int_getsize(h3c->id_goaway);
 
-	if (!qcs)
-		return 1;
+	TRACE_ENTER(H3_EV_H3C_END, h3c->qcc->conn);
+
+	if (!qcs) {
+		TRACE_ERROR("control stream not initialized", H3_EV_H3C_END, h3c->qcc->conn);
+		goto err;
+	}
 
 	pos = b_make((char *)data, sizeof(data), 0, 0);
 
@@ -1678,13 +1729,19 @@ static int h3_send_goaway(struct h3c *h3c)
 	res = mux_get_buf(qcs);
 	if (!res || b_room(res) < b_data(&pos)) {
 		/* Do not try forcefully to emit GOAWAY if no space left. */
-		return 1;
+		TRACE_ERROR("cannot send GOAWAY", H3_EV_H3C_END, h3c->qcc->conn, qcs);
+		goto err;
 	}
 
 	b_force_xfer(res, &pos, b_data(&pos));
 	qcc_send_stream(qcs, 1);
 
+	TRACE_LEAVE(H3_EV_H3C_END, h3c->qcc->conn);
 	return 0;
+
+ err:
+	TRACE_DEVEL("leaving in error", H3_EV_H3C_END, h3c->qcc->conn);
+	return 1;
 }
 
 /* Initialize the HTTP/3 context for <qcc> mux.
@@ -1723,6 +1780,8 @@ static void h3_shutdown(void *ctx)
 {
 	struct h3c *h3c = ctx;
 
+	TRACE_ENTER(H3_EV_H3C_END, h3c->qcc->conn);
+
 	/* RFC 9114 5.2. Connection Shutdown
 	 *
 	 * Even when a connection is not idle, either endpoint can decide to
@@ -1739,6 +1798,8 @@ static void h3_shutdown(void *ctx)
 	 * the connection.
 	 */
 	qcc_emit_cc_app(h3c->qcc, H3_NO_ERROR, 0);
+
+	TRACE_LEAVE(H3_EV_H3C_END, h3c->qcc->conn);
 }
 
 static void h3_release(void *ctx)
@@ -1784,6 +1845,7 @@ const struct qcc_app_ops h3_ops = {
 	.attach      = h3_attach,
 	.decode_qcs  = h3_decode_qcs,
 	.snd_buf     = h3_snd_buf,
+	.close       = h3_close,
 	.detach      = h3_detach,
 	.finalize    = h3_finalize,
 	.shutdown    = h3_shutdown,
