@@ -210,6 +210,7 @@ struct global global = {
 		.quic_frontend_max_idle_timeout = QUIC_TP_DFLT_FRONT_MAX_IDLE_TIMEOUT,
 		.quic_frontend_max_streams_bidi = QUIC_TP_DFLT_FRONT_MAX_STREAMS_BIDI,
 		.quic_retry_threshold = QUIC_DFLT_RETRY_THRESHOLD,
+		.quic_max_frame_loss = QUIC_DFLT_MAX_FRAME_LOSS,
 		.quic_streams_buf = 30,
 #endif /* USE_QUIC */
 	},
@@ -1503,7 +1504,8 @@ static void init_early(int argc, char **argv)
 	/* initialize date, time, and pid */
 	tzset();
 	clock_init_process_date();
-	start_date = now;
+	start_date = date;
+	start_time = now;
 	pid = getpid();
 
 	/* Set local host name and adjust some environment variables.
@@ -2142,7 +2144,7 @@ static void init(int argc, char **argv)
 			}
 			tmproc->options |= PROC_O_TYPE_MASTER; /* master */
 			tmproc->pid = pid;
-			tmproc->timestamp = start_date.tv_sec;
+			tmproc->timestamp = start_time.tv_sec;
 			proc_self = tmproc;
 
 			LIST_APPEND(&proc_list, &tmproc->list);

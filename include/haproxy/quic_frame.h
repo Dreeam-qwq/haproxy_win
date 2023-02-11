@@ -176,5 +176,83 @@ static inline struct quic_err quic_err_app(uint64_t code)
 	return (struct quic_err){ .code = code, .app = 1 };
 }
 
+/* Allocate a quic_frame with type <type>. Frame must be freed with
+ * qc_frm_free().
+ *
+ * Returns the allocated frame or NULL on failure.
+ */
+static inline struct quic_frame *qc_frm_alloc(int type)
+{
+	struct quic_frame *frm = NULL;
+
+	frm = pool_alloc(pool_head_quic_frame);
+	if (!frm)
+		return NULL;
+
+	frm->type = type;
+
+	LIST_INIT(&frm->list);
+	LIST_INIT(&frm->reflist);
+	LIST_INIT(&frm->ref);
+	frm->pkt = NULL;
+	frm->origin = NULL;
+	frm->flags = 0;
+	frm->loss_count = 0;
+
+	return frm;
+}
+
+/* Allocate a quic_frame by duplicating <origin> frame. This will create a new
+ * frame of the same type with the same content. Internal fields such as packet
+ * owner and flags are however resetted for the newly allocated frame except
+ * for the loss counter. Frame must be freed with qc_frm_free().
+ *
+ * Returns the allocated frame or NULL on failure.
+ */
+static inline struct quic_frame *qc_frm_dup(struct quic_frame *origin)
+{
+	struct quic_frame *frm = NULL;
+
+	frm = pool_alloc(pool_head_quic_frame);
+	if (!frm)
+		return NULL;
+
+	*frm = *origin;
+
+	/* Reinit all internal members except loss_count. */
+	LIST_INIT(&frm->list);
+	LIST_INIT(&frm->reflist);
+	frm->pkt = NULL;
+	frm->flags = 0;
+
+	/* Attach <frm> to <origin>. */
+	LIST_APPEND(&origin->reflist, &frm->ref);
+	frm->origin = origin;
+
+	return frm;
+}
+
+void qc_frm_unref(struct quic_frame *frm, struct quic_conn *qc);
+
+/* Free a <frm> quic_frame. Remove it from parent element if still attached. */
+static inline void qc_frm_free(struct quic_frame **frm)
+{
+
+	/* Caller must ensure that no other frame points to <frm>. Use
+	 * qc_frm_unref() to handle this properly.
+	 */
+	BUG_ON(!LIST_ISEMPTY(&((*frm)->reflist)));
+	BUG_ON(LIST_INLIST(&((*frm)->ref)));
+
+	/* TODO simplify frame deallocation. In some code paths, we must
+	 * manually call this LIST_DEL_INIT before using
+	 * quic_tx_packet_refdec() and freeing the frame.
+	 */
+	LIST_DEL_INIT(&((*frm)->list));
+
+	pool_free(pool_head_quic_frame, *frm);
+	*frm = NULL;
+}
+
 #endif /* USE_QUIC */
 #endif /* _HAPROXY_QUIC_FRAME_H */

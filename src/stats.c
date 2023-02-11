@@ -263,6 +263,14 @@ const struct name_desc stat_fields[ST_F_TOTAL_FIELDS] = {
 	[ST_F_AGG_SRV_STATUS ]               = { .name = "agg_server_status",           .desc = "Backend's aggregated gauge of servers' status" },
 	[ST_F_AGG_CHECK_STATUS]              = { .name = "agg_check_status",            .desc = "Backend's aggregated gauge of servers' state check status" },
 	[ST_F_SRID]                          = { .name = "srid",                        .desc = "Server id revision, to prevent server id reuse mixups" },
+	[ST_F_SESS_OTHER]                    = { .name = "sess_other",                  .desc = "Total number of sessions other than HTTP since process started" },
+	[ST_F_H1SESS]                        = { .name = "h1sess",                      .desc = "Total number of HTTP/1 sessions since process started" },
+	[ST_F_H2SESS]                        = { .name = "h2sess",                      .desc = "Total number of HTTP/2 sessions since process started" },
+	[ST_F_H3SESS]                        = { .name = "h3sess",                      .desc = "Total number of HTTP/3 sessions since process started" },
+	[ST_F_REQ_OTHER]                     = { .name = "req_other",                   .desc = "Total number of sessions other than HTTP processed by this object since the worker process started" },
+	[ST_F_H1REQ]                         = { .name = "h1req",                       .desc = "Total number of HTTP/1 sessions processed by this object since the worker process started" },
+	[ST_F_H2REQ]                         = { .name = "h2req",                       .desc = "Total number of hTTP/2 sessions processed by this object since the worker process started" },
+	[ST_F_H3REQ]                         = { .name = "h3req",                       .desc = "Total number of HTTP/3 sessions processed by this object since the worker process started" },
 };
 
 /* one line of info */
@@ -297,8 +305,10 @@ static inline enum stats_domain_px_cap stats_px_get_cap(uint32_t domain)
 
 static void stats_dump_json_schema(struct buffer *out);
 
-int stats_putchk(struct channel *chn, struct htx *htx, struct buffer *chk)
+int stats_putchk(struct channel *chn, struct htx *htx)
 {
+	struct buffer *chk = &trash_chunk;
+
 	if (htx) {
 		if (chk->data >= channel_htx_recv_max(chn, htx))
 			return 0;
@@ -917,7 +927,27 @@ static int stats_dump_fields_html(struct buffer *out,
 		/* http response (via hover): 1xx, 2xx, 3xx, 4xx, 5xx, other */
 		if (strcmp(field_str(stats, ST_F_MODE), "http") == 0) {
 			chunk_appendf(out,
+			              "<tr><th>- HTTP/1 sessions:</th><td>%s</td></tr>"
+			              "<tr><th>- HTTP/2 sessions:</th><td>%s</td></tr>"
+			              "<tr><th>- HTTP/3 sessions:</th><td>%s</td></tr>"
+			              "<tr><th>- other sessions:</th><td>%s</td></tr>"
 			              "<tr><th>Cum. HTTP requests:</th><td>%s</td></tr>"
+			              "<tr><th>- HTTP/1 requests:</th><td>%s</td></tr>"
+			              "<tr><th>- HTTP/2 requests:</th><td>%s</td></tr>"
+			              "<tr><th>- HTTP/3 requests:</th><td>%s</td></tr>"
+			              "<tr><th>- other requests:</th><td>%s</td></tr>"
+			              "",
+			              U2H(stats[ST_F_H1SESS].u.u64),
+			              U2H(stats[ST_F_H2SESS].u.u64),
+			              U2H(stats[ST_F_H3SESS].u.u64),
+			              U2H(stats[ST_F_SESS_OTHER].u.u64),
+			              U2H(stats[ST_F_REQ_TOT].u.u64),
+			              U2H(stats[ST_F_H1REQ].u.u64),
+			              U2H(stats[ST_F_H2REQ].u.u64),
+			              U2H(stats[ST_F_H3REQ].u.u64),
+			              U2H(stats[ST_F_REQ_OTHER].u.u64));
+
+			chunk_appendf(out,
 			              "<tr><th>- HTTP 1xx responses:</th><td>%s</td></tr>"
 			              "<tr><th>- HTTP 2xx responses:</th><td>%s</td></tr>"
 			              "<tr><th>&nbsp;&nbsp;Compressed 2xx:</th><td>%s</td><td>(%d%%)</td></tr>"
@@ -925,13 +955,7 @@ static int stats_dump_fields_html(struct buffer *out,
 			              "<tr><th>- HTTP 4xx responses:</th><td>%s</td></tr>"
 			              "<tr><th>- HTTP 5xx responses:</th><td>%s</td></tr>"
 			              "<tr><th>- other responses:</th><td>%s</td></tr>"
-			              "<tr><th>Intercepted requests:</th><td>%s</td></tr>"
-			              "<tr><th>Cache lookups:</th><td>%s</td></tr>"
-			              "<tr><th>Cache hits:</th><td>%s</td><td>(%d%%)</td></tr>"
-			              "<tr><th>Failed hdr rewrites:</th><td>%s</td></tr>"
-			              "<tr><th>Internal errors:</th><td>%s</td></tr>"
 			              "",
-			              U2H(stats[ST_F_REQ_TOT].u.u64),
 			              U2H(stats[ST_F_HRSP_1XX].u.u64),
 			              U2H(stats[ST_F_HRSP_2XX].u.u64),
 			              U2H(stats[ST_F_COMP_RSP].u.u64),
@@ -940,7 +964,15 @@ static int stats_dump_fields_html(struct buffer *out,
 			              U2H(stats[ST_F_HRSP_3XX].u.u64),
 			              U2H(stats[ST_F_HRSP_4XX].u.u64),
 			              U2H(stats[ST_F_HRSP_5XX].u.u64),
-			              U2H(stats[ST_F_HRSP_OTHER].u.u64),
+			              U2H(stats[ST_F_HRSP_OTHER].u.u64));
+
+			chunk_appendf(out,
+			              "<tr><th>Intercepted requests:</th><td>%s</td></tr>"
+			              "<tr><th>Cache lookups:</th><td>%s</td></tr>"
+			              "<tr><th>Cache hits:</th><td>%s</td><td>(%d%%)</td></tr>"
+			              "<tr><th>Failed hdr rewrites:</th><td>%s</td></tr>"
+			              "<tr><th>Internal errors:</th><td>%s</td></tr>"
+			              "",
 			              U2H(stats[ST_F_INTERCEPTED].u.u64),
 			              U2H(stats[ST_F_CACHE_LOOKUPS].u.u64),
 			              U2H(stats[ST_F_CACHE_HITS].u.u64),
@@ -1658,9 +1690,6 @@ int stats_dump_one_line(const struct field *stats, size_t stats_count,
 	else
 		ret = stats_dump_fields_csv(&trash_chunk, stats, stats_count, ctx);
 
-	if (ret)
-		ctx->flags |= STAT_STARTED;
-
 	return ret;
 }
 
@@ -1805,9 +1834,18 @@ int stats_fill_fe_stats(struct proxy *px, struct field *stats, int len,
 			case ST_F_REQ_RATE_MAX:
 				metric = mkf_u32(FN_MAX, px->fe_counters.p.http.rps_max);
 				break;
-			case ST_F_REQ_TOT:
-				metric = mkf_u64(FN_COUNTER, px->fe_counters.p.http.cum_req);
+			case ST_F_REQ_TOT: {
+				int i;
+				uint64_t total_req;
+				size_t nb_reqs =
+					sizeof(px->fe_counters.p.http.cum_req) / sizeof(*px->fe_counters.p.http.cum_req);
+
+				total_req = 0;
+				for (i = 0; i < nb_reqs; i++)
+					total_req += px->fe_counters.p.http.cum_req[i];
+				metric = mkf_u64(FN_COUNTER, total_req);
 				break;
+			}
 			case ST_F_COMP_IN:
 				metric = mkf_u64(FN_COUNTER, px->fe_counters.comp_in);
 				break;
@@ -1828,6 +1866,40 @@ int stats_fill_fe_stats(struct proxy *px, struct field *stats, int len,
 				break;
 			case ST_F_CONN_TOT:
 				metric = mkf_u64(FN_COUNTER, px->fe_counters.cum_conn);
+				break;
+			case ST_F_SESS_OTHER: {
+				int i;
+				uint64_t total_sess;
+				size_t nb_sess =
+					sizeof(px->fe_counters.cum_sess_ver) / sizeof(*px->fe_counters.cum_sess_ver);
+
+				total_sess = px->fe_counters.cum_sess;
+				for (i = 0; i < nb_sess; i++)
+					total_sess -= px->fe_counters.cum_sess_ver[i];
+				total_sess = (int64_t)total_sess < 0 ? 0 : total_sess;
+				metric = mkf_u64(FN_COUNTER, total_sess);
+				break;
+			}
+			case ST_F_H1SESS:
+				metric = mkf_u64(FN_COUNTER, px->fe_counters.cum_sess_ver[0]);
+				break;
+			case ST_F_H2SESS:
+				metric = mkf_u64(FN_COUNTER, px->fe_counters.cum_sess_ver[1]);
+				break;
+			case ST_F_H3SESS:
+				metric = mkf_u64(FN_COUNTER, px->fe_counters.cum_sess_ver[2]);
+				break;
+			case ST_F_REQ_OTHER:
+				metric = mkf_u64(FN_COUNTER, px->fe_counters.p.http.cum_req[0]);
+				break;
+			case ST_F_H1REQ:
+				metric = mkf_u64(FN_COUNTER, px->fe_counters.p.http.cum_req[1]);
+				break;
+			case ST_F_H2REQ:
+				metric = mkf_u64(FN_COUNTER, px->fe_counters.p.http.cum_req[2]);
+				break;
+			case ST_F_H3REQ:
+				metric = mkf_u64(FN_COUNTER, px->fe_counters.p.http.cum_req[3]);
 				break;
 			default:
 				/* not used for frontends. If a specific metric
@@ -1924,7 +1996,7 @@ int stats_fill_li_stats(struct proxy *px, struct listener *l, int flags,
 				metric = mkf_u32(FN_MAX, l->counters->conn_max);
 				break;
 			case ST_F_SLIM:
-				metric = mkf_u32(FO_CONFIG|FN_LIMIT, l->maxconn);
+				metric = mkf_u32(FO_CONFIG|FN_LIMIT, l->bind_conf->maxconn);
 				break;
 			case ST_F_STOT:
 				metric = mkf_u64(FN_COUNTER, l->counters->cum_conn);
@@ -3123,7 +3195,7 @@ more:
 	case STAT_PX_ST_TH:
 		if (ctx->flags & STAT_FMT_HTML) {
 			stats_dump_html_px_hdr(sc, px);
-			if (!stats_putchk(rep, htx, &trash_chunk))
+			if (!stats_putchk(rep, htx))
 				goto full;
 		}
 
@@ -3133,8 +3205,9 @@ more:
 	case STAT_PX_ST_FE:
 		/* print the frontend */
 		if (stats_dump_fe_stats(sc, px)) {
-			if (!stats_putchk(rep, htx, &trash_chunk))
+			if (!stats_putchk(rep, htx))
 				goto full;
+			ctx->flags |= STAT_STARTED;
 			if (ctx->field)
 				goto more;
 		}
@@ -3170,14 +3243,15 @@ more:
 
 			/* print the frontend */
 			if (stats_dump_li_stats(sc, px, l)) {
-				if (!stats_putchk(rep, htx, &trash_chunk))
+				if (!stats_putchk(rep, htx))
 					goto full;
+				ctx->flags |= STAT_STARTED;
 				if (ctx->field)
 					goto more;
 			}
+			current_field = 0;
 		}
 
-		current_field = 0;
 		ctx->obj2 = px->srv; /* may be NULL */
 		ctx->px_st = STAT_PX_ST_SV;
 		__fallthrough;
@@ -3235,9 +3309,13 @@ more:
 			}
 
 			if (stats_dump_sv_stats(sc, px, sv)) {
-				if (!stats_putchk(rep, htx, &trash_chunk))
+				if (!stats_putchk(rep, htx))
 					goto full;
+				ctx->flags |= STAT_STARTED;
+				if (ctx->field)
+					goto more;
 			}
+			current_field = 0;
 		} /* for sv */
 
 		ctx->px_st = STAT_PX_ST_BE;
@@ -3246,8 +3324,9 @@ more:
 	case STAT_PX_ST_BE:
 		/* print the backend */
 		if (stats_dump_be_stats(sc, px)) {
-			if (!stats_putchk(rep, htx, &trash_chunk))
+			if (!stats_putchk(rep, htx))
 				goto full;
+			ctx->flags |= STAT_STARTED;
 			if (ctx->field)
 				goto more;
 		}
@@ -3259,7 +3338,7 @@ more:
 	case STAT_PX_ST_END:
 		if (ctx->flags & STAT_FMT_HTML) {
 			stats_dump_html_px_end(sc, px);
-			if (!stats_putchk(rep, htx, &trash_chunk))
+			if (!stats_putchk(rep, htx))
 				goto full;
 		}
 
@@ -3458,7 +3537,7 @@ static void stats_dump_html_info(struct stconn *sc, struct uri_auth *uri)
 {
 	struct appctx *appctx = __sc_appctx(sc);
 	struct show_stat_ctx *ctx = appctx->svcctx;
-	unsigned int up = (now.tv_sec - start_date.tv_sec);
+	unsigned int up = (now.tv_sec - start_time.tv_sec);
 	char scope_txt[STAT_SCOPE_TXT_MAXLEN + sizeof STAT_SCOPE_PATTERN];
 	const char *scope_ptr = stats_scope_ptr(appctx, sc);
 	unsigned long long bps;
@@ -3814,7 +3893,7 @@ static int stats_dump_stat_to_buffer(struct stconn *sc, struct htx *htx,
 		else if (!(ctx->flags & STAT_FMT_TYPED))
 			stats_dump_csv_header(ctx->domain);
 
-		if (!stats_putchk(rep, htx, &trash_chunk))
+		if (!stats_putchk(rep, htx))
 			goto full;
 
 		if (ctx->flags & STAT_JSON_SCHM) {
@@ -3827,7 +3906,7 @@ static int stats_dump_stat_to_buffer(struct stconn *sc, struct htx *htx,
 	case STAT_STATE_INFO:
 		if (ctx->flags & STAT_FMT_HTML) {
 			stats_dump_html_info(sc, uri);
-			if (!stats_putchk(rep, htx, &trash_chunk))
+			if (!stats_putchk(rep, htx))
 				goto full;
 		}
 
@@ -3866,7 +3945,7 @@ static int stats_dump_stat_to_buffer(struct stconn *sc, struct htx *htx,
 				stats_dump_html_end();
 			else
 				stats_dump_json_end();
-			if (!stats_putchk(rep, htx, &trash_chunk))
+			if (!stats_putchk(rep, htx))
 				goto full;
 		}
 
@@ -4386,7 +4465,7 @@ static void http_stats_io_handler(struct appctx *appctx)
 	}
 
 	if (appctx->st0 == STAT_HTTP_DUMP) {
-		trash_chunk = b_make(trash.area, trash.size, 0, 0);
+		trash_chunk = b_make(trash.area, res->buf.size, 0, 0);
 		/* adjust buffer size to take htx overhead into account,
 		 * make sure to perform this call on an empty buffer
 		 */
@@ -4534,7 +4613,7 @@ int stats_fill_info(struct field *info, int len, uint flags)
 	}
 	glob_out_b32 *= 32; // values are 32-byte units
 
-	tv_remain(&start_date, &now, &up);
+	tv_remain(&start_time, &now, &up);
 
 	if (len < INF_TOTAL_FIELDS)
 		return 0;
@@ -4556,7 +4635,7 @@ int stats_fill_info(struct field *info, int len, uint flags)
 	chunk_appendf(out, "%ud %uh%02um%02us", (uint)up.tv_sec / 86400, ((uint)up.tv_sec % 86400) / 3600, ((uint)up.tv_sec % 3600) / 60, ((uint)up.tv_sec % 60));
 
 	info[INF_UPTIME_SEC]                     = (flags & STAT_USE_FLOAT) ? mkf_flt(FN_DURATION, up.tv_sec + up.tv_usec / 1000000.0) : mkf_u32(FN_DURATION, up.tv_sec);
-	info[INF_START_TIME_SEC]                 = (flags & STAT_USE_FLOAT) ? mkf_flt(FN_DURATION, start_date.tv_sec + start_date.tv_usec / 1000000.0) : mkf_u32(FN_DURATION, start_date.tv_sec);
+	info[INF_START_TIME_SEC]                 = (flags & STAT_USE_FLOAT) ? mkf_flt(FN_DURATION, start_time.tv_sec + start_time.tv_usec / 1000000.0) : mkf_u32(FN_DURATION, start_time.tv_sec);
 	info[INF_MEMMAX_MB]                      = mkf_u32(FO_CONFIG|FN_LIMIT, global.rlimit_memmax);
 	info[INF_MEMMAX_BYTES]                   = mkf_u32(FO_CONFIG|FN_LIMIT, global.rlimit_memmax * 1048576L);
 	info[INF_POOL_ALLOC_MB]                  = mkf_u32(0, (unsigned)(pool_total_allocated() / 1048576L));

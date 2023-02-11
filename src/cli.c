@@ -494,7 +494,6 @@ static int cli_parse_global(char **args, int section_type, struct proxy *curpx,
 		}
 		bind_conf->level &= ~ACCESS_LVL_MASK;
 		bind_conf->level |= ACCESS_LVL_OPER; /* default access level */
-		bind_conf->bind_tgroup = 1; // bind to a single group in any case
 
 		if (!str2listener(args[2], global.cli_fe, bind_conf, file, line, err)) {
 			memprintf(err, "parsing [%s:%d] : '%s %s' : %s\n",
@@ -551,11 +550,11 @@ static int cli_parse_global(char **args, int section_type, struct proxy *curpx,
 			return -1;
 		}
 
+		bind_conf->accept = session_accept_fd;
+		bind_conf->nice = -64;  /* we want to boost priority for local stats */
+		bind_conf->options |= BC_O_UNLIMITED; /* don't make the peers subject to global limits */
+
 		list_for_each_entry(l, &bind_conf->listeners, by_bind) {
-			l->accept = session_accept_fd;
-			l->default_target = global.cli_fe->default_target;
-			l->options |= LI_O_UNLIMITED; /* don't make the peers subject to global limits */
-			l->nice = -64;  /* we want to boost priority for local stats */
 			global.maxsock++; /* for the listening socket */
 		}
 	}
@@ -2999,7 +2998,6 @@ struct bind_conf *mworker_cli_proxy_new_listener(char *line)
 	bind_conf->level &= ~ACCESS_LVL_MASK;
 	bind_conf->level |= ACCESS_LVL_ADMIN;
 	bind_conf->level |= ACCESS_MASTER | ACCESS_MASTER_ONLY;
-	bind_conf->bind_tgroup = 1; // bind to a single group in any case
 
 	if (!str2listener(args[0], mworker_proxy, bind_conf, "master-socket", 0, &err)) {
 		ha_alert("Cannot create the listener of the master CLI\n");
@@ -3044,13 +3042,12 @@ struct bind_conf *mworker_cli_proxy_new_listener(char *line)
 	}
 
 
+	bind_conf->accept = session_accept_fd;
+	bind_conf->nice = -64;  /* we want to boost priority for local stats */
+	bind_conf->options |= BC_O_UNLIMITED; /* don't make the peers subject to global limits */
+
 	list_for_each_entry(l, &bind_conf->listeners, by_bind) {
-		l->accept = session_accept_fd;
-		l->default_target = mworker_proxy->default_target;
-		/* don't make the peers subject to global limits and don't close it in the master */
-		l->options  |= LI_O_UNLIMITED;
 		l->rx.flags |= RX_F_MWORKER; /* we are keeping this FD in the master */
-		l->nice = -64;  /* we want to boost priority for local stats */
 		global.maxsock++; /* for the listening socket */
 	}
 	global.maxsock += mworker_proxy->maxconn;
@@ -3097,7 +3094,6 @@ int mworker_cli_sockpair_new(struct mworker_proc *mworker_proc, int proc)
 	bind_conf->level &= ~ACCESS_LVL_MASK;
 	bind_conf->level |= ACCESS_LVL_ADMIN; /* TODO: need to lower the rights with a CLI keyword*/
 	bind_conf->level |= ACCESS_FD_LISTENERS;
-	bind_conf->bind_tgroup = 1; // bind to a single group in any case
 
 	if (!memprintf(&path, "sockpair@%d", mworker_proc->ipc_fd[1])) {
 		ha_alert("Cannot allocate listener.\n");
@@ -3111,14 +3107,14 @@ int mworker_cli_sockpair_new(struct mworker_proc *mworker_proc, int proc)
 	}
 	ha_free(&path);
 
+	bind_conf->accept = session_accept_fd;
+	bind_conf->nice = -64;  /* we want to boost priority for local stats */
+	bind_conf->options |= BC_O_UNLIMITED | BC_O_NOSTOP;
+
 	list_for_each_entry(l, &bind_conf->listeners, by_bind) {
-		l->accept = session_accept_fd;
-		l->default_target = global.cli_fe->default_target;
-		l->options |= (LI_O_UNLIMITED | LI_O_NOSTOP);
 		HA_ATOMIC_INC(&unstoppable_jobs);
 		/* it's a sockpair but we don't want to keep the fd in the master */
 		l->rx.flags &= ~RX_F_INHERITED;
-		l->nice = -64;  /* we want to boost priority for local stats */
 		global.maxsock++; /* for the listening socket */
 	}
 

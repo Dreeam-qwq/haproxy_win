@@ -49,7 +49,6 @@
 
 extern struct pool_head *pool_head_quic_connection_id;
 
-int qc_conn_finalize(struct quic_conn *qc, int server);
 int ssl_quic_initial_ctx(struct bind_conf *bind_conf);
 
 /* Return the long packet type matching with <qv> version and <type> */
@@ -197,7 +196,7 @@ static inline void free_quic_conn_cids(struct quic_conn *conn)
 	}
 }
 
-/* Copy <src> new connection ID information to <to> NEW_CONNECTION_ID frame data.
+/* Copy <src> new connection ID information to <dst> NEW_CONNECTION_ID frame.
  * Always succeeds.
  */
 static inline void quic_connection_id_to_frm_cpy(struct quic_frame *dst,
@@ -205,7 +204,6 @@ static inline void quic_connection_id_to_frm_cpy(struct quic_frame *dst,
 {
 	struct quic_new_connection_id *to = &dst->new_connection_id;
 
-	dst->type = QUIC_FT_NEW_CONNECTION_ID;
 	to->seq_num = src->seq_num.key;
 	to->retire_prior_to = src->retire_prior_to;
 	to->cid.len = src->cid.len;
@@ -503,13 +501,13 @@ static inline void quic_tx_packet_dgram_detach(struct quic_tx_packet *pkt)
 /* Increment the reference counter of <pkt> */
 static inline void quic_tx_packet_refinc(struct quic_tx_packet *pkt)
 {
-	HA_ATOMIC_ADD(&pkt->refcnt, 1);
+	pkt->refcnt++;
 }
 
 /* Decrement the reference counter of <pkt> */
 static inline void quic_tx_packet_refdec(struct quic_tx_packet *pkt)
 {
-	if (!HA_ATOMIC_SUB_FETCH(&pkt->refcnt, 1)) {
+	if (--pkt->refcnt == 0) {
 		BUG_ON(!LIST_ISEMPTY(&pkt->frms));
 		/* If there are others packet in the same datagram <pkt> is attached to,
 		 * detach the previous one and the next one from <pkt>.
@@ -533,9 +531,10 @@ static inline void quic_pktns_tx_pkts_release(struct quic_pktns *pktns, struct q
 		if (pkt->flags & QUIC_FL_TX_PACKET_ACK_ELICITING)
 			qc->path->ifae_pkts--;
 		list_for_each_entry_safe(frm, frmbak, &pkt->frms, list) {
-			LIST_DELETE(&frm->list);
+			qc_frm_unref(frm, qc);
+			LIST_DEL_INIT(&frm->list);
 			quic_tx_packet_refdec(frm->pkt);
-			pool_free(pool_head_quic_frame, frm);
+			qc_frm_free(&frm);
 		}
 		eb64_delete(&pkt->pn_node);
 		quic_tx_packet_refdec(pkt);
@@ -670,7 +669,7 @@ static inline void quic_rx_pkts_del(struct quic_conn *qc)
 			break;
 		}
 
-		if (HA_ATOMIC_LOAD(&pkt->refcnt))
+		if (pkt->refcnt)
 			break;
 
 		b_del(&qc->rx.buf, pkt->raw_len);
@@ -685,17 +684,14 @@ static inline void quic_rx_pkts_del(struct quic_conn *qc)
 /* Increment the reference counter of <pkt> */
 static inline void quic_rx_packet_refinc(struct quic_rx_packet *pkt)
 {
-	HA_ATOMIC_ADD(&pkt->refcnt, 1);
+	pkt->refcnt++;
 }
 
 /* Decrement the reference counter of <pkt> while remaining positive */
 static inline void quic_rx_packet_refdec(struct quic_rx_packet *pkt)
 {
-	unsigned int refcnt;
-
-	do {
-		refcnt = HA_ATOMIC_LOAD(&pkt->refcnt);
-	} while (refcnt && !HA_ATOMIC_CAS(&pkt->refcnt, &refcnt, refcnt - 1));
+	if (pkt->refcnt)
+		pkt->refcnt--;
 }
 
 /* Delete all RX packets for <qel> QUIC encryption level */
@@ -755,6 +751,8 @@ void qc_release_frm(struct quic_conn *qc, struct quic_frame *frm);
 void qc_check_close_on_released_mux(struct quic_conn *qc);
 
 void quic_conn_release(struct quic_conn *qc);
+
+void qc_kill_conn(struct quic_conn *qc);
 
 int quic_dgram_parse(struct quic_dgram *dgram, struct quic_conn *qc,
                      struct listener *li);

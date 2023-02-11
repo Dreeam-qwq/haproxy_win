@@ -142,16 +142,17 @@ struct task *accept_queue_process(struct task *t, void *context, unsigned int st
 
 		li = __objt_listener(conn->target);
 		_HA_ATOMIC_INC(&li->thr_conn[tid]);
-		ret = li->accept(conn);
+		ret = li->bind_conf->accept(conn);
 		if (ret <= 0) {
 			/* connection was terminated by the application */
 			continue;
 		}
 
 		/* increase the per-process number of cumulated sessions, this
-		 * may only be done once l->accept() has accepted the connection.
+		 * may only be done once l->bind_conf->accept() has accepted the
+		 * connection.
 		 */
-		if (!(li->options & LI_O_UNLIMITED)) {
+		if (!(li->bind_conf->options & BC_O_UNLIMITED)) {
 			HA_ATOMIC_UPDATE_MAX(&global.sps_max,
 			                     update_freq_ctr(&global.sess_per_sec, 1));
 			if (li->bind_conf && li->bind_conf->options & BC_O_USE_SSL) {
@@ -229,7 +230,7 @@ int li_init_per_thr(struct listener *li)
 /* helper to get listener status for stats */
 enum li_status get_li_status(struct listener *l)
 {
-	if (!l->maxconn || l->nbconn < l->maxconn) {
+	if (!l->bind_conf->maxconn || l->nbconn < l->bind_conf->maxconn) {
 		if (l->state == LI_LIMITED)
 			return LI_STATUS_WAITING;
 		else
@@ -319,7 +320,7 @@ void enable_listener(struct listener *listener)
 			 */
 			do_unbind_listener(listener);
 		}
-		else if (!listener->maxconn || listener->nbconn < listener->maxconn) {
+		else if (!listener->bind_conf->maxconn || listener->nbconn < listener->bind_conf->maxconn) {
 			listener->rx.proto->enable(listener);
 			listener_set_state(listener, LI_READY);
 		}
@@ -344,7 +345,7 @@ void stop_listener(struct listener *l, int lpx, int lpr)
 {
 	struct proxy *px = l->bind_conf->frontend;
 
-	if (l->options & LI_O_NOSTOP) {
+	if (l->bind_conf->options & BC_O_NOSTOP) {
 		/* master-worker sockpairs are never closed but don't count as a
 		 * job.
 		 */
@@ -537,7 +538,7 @@ int resume_listener(struct listener *l, int lpx)
 	if (l->rx.proto->resume)
 		ret = l->rx.proto->resume(l);
 
-	if (l->maxconn && l->nbconn >= l->maxconn) {
+	if (l->bind_conf->maxconn && l->nbconn >= l->bind_conf->maxconn) {
 		l->rx.proto->disable(l);
 		listener_set_state(l, LI_FULL);
 		goto done;
@@ -810,14 +811,14 @@ void delete_listener(struct listener *listener)
  */
 int listener_backlog(const struct listener *l)
 {
-	if (l->backlog)
-		return l->backlog;
+	if (l->bind_conf->backlog)
+		return l->bind_conf->backlog;
 
 	if (l->bind_conf->frontend->backlog)
 		return l->bind_conf->frontend->backlog;
 
-	if (l->maxconn)
-		return l->maxconn;
+	if (l->bind_conf->maxconn)
+		return l->bind_conf->maxconn;
 
 	if (l->bind_conf->frontend->maxconn)
 		return l->bind_conf->frontend->maxconn;
@@ -842,12 +843,12 @@ void listener_accept(struct listener *l)
 
 	p = l->bind_conf->frontend;
 
-	/* if l->maxaccept is -1, then max_accept is UINT_MAX. It is not really
-	 * illimited, but it is probably enough.
+	/* if l->bind_conf->maxaccept is -1, then max_accept is UINT_MAX. It is
+	 * not really illimited, but it is probably enough.
 	 */
-	max_accept = l->maxaccept ? l->maxaccept : 1;
+	max_accept = l->bind_conf->maxaccept ? l->bind_conf->maxaccept : 1;
 
-	if (!(l->options & LI_O_UNLIMITED) && global.sps_lim) {
+	if (!(l->bind_conf->options & BC_O_UNLIMITED) && global.sps_lim) {
 		int max = freq_ctr_remain(&global.sess_per_sec, global.sps_lim, 0);
 
 		if (unlikely(!max)) {
@@ -860,7 +861,7 @@ void listener_accept(struct listener *l)
 			max_accept = max;
 	}
 
-	if (!(l->options & LI_O_UNLIMITED) && global.cps_lim) {
+	if (!(l->bind_conf->options & BC_O_UNLIMITED) && global.cps_lim) {
 		int max = freq_ctr_remain(&global.conn_per_sec, global.cps_lim, 0);
 
 		if (unlikely(!max)) {
@@ -873,7 +874,7 @@ void listener_accept(struct listener *l)
 			max_accept = max;
 	}
 #ifdef USE_OPENSSL
-	if (!(l->options & LI_O_UNLIMITED) && global.ssl_lim &&
+	if (!(l->bind_conf->options & BC_O_UNLIMITED) && global.ssl_lim &&
 	    l->bind_conf && l->bind_conf->options & BC_O_USE_SSL) {
 		int max = freq_ctr_remain(&global.ssl_per_sec, global.ssl_lim, 0);
 
@@ -916,7 +917,7 @@ void listener_accept(struct listener *l)
 		 */
 		do {
 			count = l->nbconn;
-			if (unlikely(l->maxconn && count >= l->maxconn)) {
+			if (unlikely(l->bind_conf->maxconn && count >= l->bind_conf->maxconn)) {
 				/* the listener was marked full or another
 				 * thread is going to do it.
 				 */
@@ -942,7 +943,7 @@ void listener_accept(struct listener *l)
 			} while (!_HA_ATOMIC_CAS(&p->feconn, &count, next_feconn));
 		}
 
-		if (!(l->options & LI_O_UNLIMITED)) {
+		if (!(l->bind_conf->options & BC_O_UNLIMITED)) {
 			do {
 				count = actconn;
 				if (unlikely(count >= global.maxconn)) {
@@ -978,7 +979,7 @@ void listener_accept(struct listener *l)
 				_HA_ATOMIC_DEC(&l->nbconn);
 				if (p)
 					_HA_ATOMIC_DEC(&p->feconn);
-				if (!(l->options & LI_O_UNLIMITED))
+				if (!(l->bind_conf->options & BC_O_UNLIMITED))
 					_HA_ATOMIC_DEC(&actconn);
 				continue;
 
@@ -1000,14 +1001,14 @@ void listener_accept(struct listener *l)
 			proxy_inc_fe_conn_ctr(l, p);
 		}
 
-		if (!(l->options & LI_O_UNLIMITED)) {
+		if (!(l->bind_conf->options & BC_O_UNLIMITED)) {
 			count = update_freq_ctr(&global.conn_per_sec, 1);
 			HA_ATOMIC_UPDATE_MAX(&global.cps_max, count);
 		}
 
 		_HA_ATOMIC_INC(&activity[tid].accepted);
 
-		/* past this point, l->accept() will automatically decrement
+		/* past this point, l->bind_conf->accept() will automatically decrement
 		 * l->nbconn, feconn and actconn once done. Setting next_*conn=0
 		 * allows the error path not to rollback on nbconn. It's more
 		 * convenient than duplicating all exit labels.
@@ -1137,7 +1138,7 @@ void listener_accept(struct listener *l)
 
  local_accept:
 		_HA_ATOMIC_INC(&l->thr_conn[tid]);
-		ret = l->accept(cli_conn);
+		ret = l->bind_conf->accept(cli_conn);
 		if (unlikely(ret <= 0)) {
 			/* The connection was closed by stream_accept(). Either
 			 * we just have to ignore it (ret == 0) or it's a critical
@@ -1151,14 +1152,15 @@ void listener_accept(struct listener *l)
 		}
 
 		/* increase the per-process number of cumulated sessions, this
-		 * may only be done once l->accept() has accepted the connection.
+		 * may only be done once l->bind_conf->accept() has accepted the
+		 * connection.
 		 */
-		if (!(l->options & LI_O_UNLIMITED)) {
+		if (!(l->bind_conf->options & BC_O_UNLIMITED)) {
 			count = update_freq_ctr(&global.sess_per_sec, 1);
 			HA_ATOMIC_UPDATE_MAX(&global.sps_max, count);
 		}
 #ifdef USE_OPENSSL
-		if (!(l->options & LI_O_UNLIMITED) &&
+		if (!(l->bind_conf->options & BC_O_UNLIMITED) &&
 		    l->bind_conf && l->bind_conf->options & BC_O_USE_SSL) {
 			count = update_freq_ctr(&global.ssl_per_sec, 1);
 			HA_ATOMIC_UPDATE_MAX(&global.ssl_max, count);
@@ -1178,7 +1180,7 @@ void listener_accept(struct listener *l)
 	if (next_actconn)
 		_HA_ATOMIC_DEC(&actconn);
 
-	if ((l->state == LI_FULL && (!l->maxconn || l->nbconn < l->maxconn)) ||
+	if ((l->state == LI_FULL && (!l->bind_conf->maxconn || l->nbconn < l->bind_conf->maxconn)) ||
 	    (l->state == LI_LIMITED &&
 	     ((!p || p->feconn < p->maxconn) && (actconn < global.maxconn) &&
 	      (!tick_isset(global_listener_queue_task->expire) ||
@@ -1235,7 +1237,7 @@ void listener_release(struct listener *l)
 {
 	struct proxy *fe = l->bind_conf->frontend;
 
-	if (!(l->options & LI_O_UNLIMITED))
+	if (!(l->bind_conf->options & BC_O_UNLIMITED))
 		_HA_ATOMIC_DEC(&actconn);
 	if (fe)
 		_HA_ATOMIC_DEC(&fe->feconn);
@@ -1436,6 +1438,7 @@ struct bind_conf *bind_conf_alloc(struct proxy *fe, const char *file,
 	bind_conf->settings.shards = 1;
 	bind_conf->xprt = xprt;
 	bind_conf->frontend = fe;
+	bind_conf->analysers = fe->fe_req_ana;
 	bind_conf->severity_output = CLI_SEVERITY_NONE;
 #ifdef USE_OPENSSL
 	HA_RWLOCK_INIT(&bind_conf->sni_lock);
@@ -1503,18 +1506,13 @@ smp_fetch_so_name(const struct arg *args, struct sample *smp, const char *kw, vo
 /* parse the "accept-proxy" bind keyword */
 static int bind_parse_accept_proxy(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
 {
-	struct listener *l;
-
-	list_for_each_entry(l, &conf->listeners, by_bind)
-		l->options |= LI_O_ACC_PROXY;
-
+	conf->options |= BC_O_ACC_PROXY;
 	return 0;
 }
 
 /* parse the "accept-netscaler-cip" bind keyword */
 static int bind_parse_accept_netscaler_cip(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
 {
-	struct listener *l;
 	uint32_t val;
 
 	if (!*args[cur_arg + 1]) {
@@ -1528,18 +1526,14 @@ static int bind_parse_accept_netscaler_cip(char **args, int cur_arg, struct prox
 		return ERR_ALERT | ERR_FATAL;
 	}
 
-	list_for_each_entry(l, &conf->listeners, by_bind) {
-		l->options |= LI_O_ACC_CIP;
-		conf->ns_cip_magic = val;
-	}
-
+	conf->options |= BC_O_ACC_CIP;
+	conf->ns_cip_magic = val;
 	return 0;
 }
 
 /* parse the "backlog" bind keyword */
 static int bind_parse_backlog(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
 {
-	struct listener *l;
 	int val;
 
 	if (!*args[cur_arg + 1]) {
@@ -1553,9 +1547,7 @@ static int bind_parse_backlog(char **args, int cur_arg, struct proxy *px, struct
 		return ERR_ALERT | ERR_FATAL;
 	}
 
-	list_for_each_entry(l, &conf->listeners, by_bind)
-		l->backlog = val;
-
+	conf->backlog = val;
 	return 0;
 }
 
@@ -1706,7 +1698,6 @@ int bind_parse_args_list(struct bind_conf *bind_conf, char **args, int cur_arg, 
 /* parse the "maxconn" bind keyword */
 static int bind_parse_maxconn(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
 {
-	struct listener *l;
 	int val;
 
 	if (!*args[cur_arg + 1]) {
@@ -1720,9 +1711,7 @@ static int bind_parse_maxconn(char **args, int cur_arg, struct proxy *px, struct
 		return ERR_ALERT | ERR_FATAL;
 	}
 
-	list_for_each_entry(l, &conf->listeners, by_bind)
-		l->maxconn = val;
-
+	conf->maxconn = val;
 	return 0;
 }
 
@@ -1745,7 +1734,6 @@ static int bind_parse_name(char **args, int cur_arg, struct proxy *px, struct bi
 /* parse the "nice" bind keyword */
 static int bind_parse_nice(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
 {
-	struct listener *l;
 	int val;
 
 	if (!*args[cur_arg + 1]) {
@@ -1759,9 +1747,7 @@ static int bind_parse_nice(char **args, int cur_arg, struct proxy *px, struct bi
 		return ERR_ALERT | ERR_FATAL;
 	}
 
-	list_for_each_entry(l, &conf->listeners, by_bind)
-		l->nice = val;
-
+	conf->nice = val;
 	return 0;
 }
 
@@ -1815,41 +1801,15 @@ static int bind_parse_shards(char **args, int cur_arg, struct proxy *px, struct 
 	return 0;
 }
 
-/* parse the "thread" bind keyword */
+/* parse the "thread" bind keyword. This will replace any preset thread_set */
 static int bind_parse_thread(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
 {
-	char *sep = NULL;
-	ulong thread = 0;
-	long tgroup = 0;
-
-	tgroup = strtol(args[cur_arg + 1], &sep, 10);
-	if (*sep == '/') {
-		/* a thread group was present */
-		if (tgroup < 1 || tgroup > MAX_TGROUPS) {
-			memprintf(err, "'%s' thread-group number must be between 1 and %d (was %ld)", args[cur_arg + 1], MAX_TGROUPS, tgroup);
-			return ERR_ALERT | ERR_FATAL;
-		}
-		sep++;
-	}
-	else {
-		/* no thread group */
-		tgroup = 0;
-		sep = args[cur_arg + 1];
-	}
-
-	if ((conf->bind_tgroup || conf->bind_thread) &&
-	    conf->bind_tgroup != tgroup) {
-		memprintf(err, "'%s' multiple thread-groups are not supported", args[cur_arg + 1]);
+	/* note that the thread set is zeroed before first call, and we don't
+	 * want to reset it so that it remains possible to chain multiple
+	 * "thread" directives.
+	 */
+	if (parse_thread_set(args[cur_arg+1], &conf->thread_set, err) < 0)
 		return ERR_ALERT | ERR_FATAL;
-	}
-
-	if (parse_process_number(sep, &thread, LONGBITS, NULL, err)) {
-		memprintf(err, "'%s' : %s", sep, *err);
-		return ERR_ALERT | ERR_FATAL;
-	}
-
-	conf->bind_thread |= thread;
-	conf->bind_tgroup  = tgroup;
 	return 0;
 }
 

@@ -27,6 +27,7 @@
 #include <haproxy/sc_strm.h>
 #include <haproxy/ssl_ckch.h>
 #include <haproxy/ssl_crtlist.h>
+#include <haproxy/ssl_ocsp.h>
 #include <haproxy/ssl_sock.h>
 #include <haproxy/stconn.h>
 #include <haproxy/tools.h>
@@ -403,6 +404,11 @@ int crtlist_parse_line(char *line, char **crt_path, struct crtlist_entry *entry,
 	*crt_path = args[0];
 
 	if (ssl_b) {
+		if (ssl_b > 1) {
+			memprintf(err, "parsing [%s:%d]: malformated line, filters can't be between filename and options!", file, linenum);
+			cfgerr |= ERR_WARN;
+		}
+
 		ssl_conf = calloc(1, sizeof *ssl_conf);
 		if (!ssl_conf) {
 			memprintf(err, "not enough memory!");
@@ -613,13 +619,11 @@ int crtlist_parse_file(char *file, struct bind_conf *bind_conf, struct proxy *cu
 
 					entry_dup->node.key = ckchs;
 					entry_dup->crtlist = newlist;
-					if (ckchs->data->ocsp_update_mode != SSL_SOCK_OCSP_UPDATE_DFLT || entry->ssl_conf) {
-						if ((!entry->ssl_conf && ckchs->data->ocsp_update_mode == SSL_SOCK_OCSP_UPDATE_ON)
-						    || (entry->ssl_conf && ckchs->data->ocsp_update_mode != entry->ssl_conf->ocsp_update)) {
-							memprintf(err, "%sIncompatibilities found in OCSP update mode for certificate %s\n", err && *err ? *err : "", crt_path);
-							cfgerr |= ERR_ALERT | ERR_FATAL;
-						}
-					}
+
+					cfgerr |= ocsp_update_check_cfg_consistency(ckchs, entry, crt_path, err);
+					if (cfgerr & ERR_FATAL)
+						goto error;
+
 					if (entry->ssl_conf)
 						ckchs->data->ocsp_update_mode = entry->ssl_conf->ocsp_update;
 					ebpt_insert(&newlist->entries, &entry_dup->node);
@@ -645,13 +649,11 @@ int crtlist_parse_file(char *file, struct bind_conf *bind_conf, struct proxy *cu
 		} else {
 			entry->node.key = ckchs;
 			entry->crtlist = newlist;
-			if (ckchs->data->ocsp_update_mode != SSL_SOCK_OCSP_UPDATE_DFLT || entry->ssl_conf) {
-				if ((!entry->ssl_conf && ckchs->data->ocsp_update_mode == SSL_SOCK_OCSP_UPDATE_ON)
-				    || (entry->ssl_conf && ckchs->data->ocsp_update_mode != entry->ssl_conf->ocsp_update)) {
-					memprintf(err, "%sIncompatibilities found in OCSP update mode for certificate %s\n", err && *err ? *err : "", crt_path);
-					cfgerr |= ERR_ALERT | ERR_FATAL;
-				}
-			}
+
+			cfgerr |= ocsp_update_check_cfg_consistency(ckchs, entry, crt_path, err);
+			if (cfgerr & ERR_FATAL)
+				goto error;
+
 			if (entry->ssl_conf)
 				ckchs->data->ocsp_update_mode = entry->ssl_conf->ocsp_update;
 			ebpt_insert(&newlist->entries, &entry->node);

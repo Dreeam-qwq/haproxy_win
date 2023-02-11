@@ -10,6 +10,9 @@
 #include <string.h>
 
 #include <import/eb64tree.h>
+#include <haproxy/buf-t.h>
+#include <haproxy/chunk.h>
+#include <haproxy/pool.h>
 #include <haproxy/quic_conn-t.h>
 #include <haproxy/quic_enc.h>
 #include <haproxy/quic_frame.h>
@@ -507,6 +510,10 @@ static int quic_build_stream_frame(unsigned char **buf, const unsigned char *end
 	struct quic_stream *stream = &frm->stream;
 	const unsigned char *wrap;
 
+	/* Caller must set OFF bit if and only if a non-null offset is used. */
+	BUG_ON(!!(frm->type & QUIC_STREAM_FRAME_TYPE_OFF_BIT) !=
+	       !!stream->offset.key);
+
 	if (!quic_enc_int(buf, end, stream->id) ||
 	    ((frm->type & QUIC_STREAM_FRAME_TYPE_OFF_BIT) && !quic_enc_int(buf, end, stream->offset.key)) ||
 	    ((frm->type & QUIC_STREAM_FRAME_TYPE_LEN_BIT) &&
@@ -555,8 +562,6 @@ static int quic_parse_stream_frame(struct quic_frame *frm, struct quic_conn *qc,
 	}
 	else if (!quic_dec_int(&stream->len, buf, end) || end - *buf < stream->len)
 		return 0;
-
-	stream->fin = (frm->type & QUIC_STREAM_FRAME_TYPE_FIN_BIT);
 
 	stream->data = *buf;
 	*buf += stream->len;
@@ -1166,3 +1171,25 @@ int qc_build_frm(unsigned char **buf, const unsigned char *end,
 	return ret;
 }
 
+/* Detach all duplicated frames from <frm> reflist. */
+void qc_frm_unref(struct quic_frame *frm, struct quic_conn *qc)
+{
+	struct quic_frame *f, *tmp;
+
+	TRACE_ENTER(QUIC_EV_CONN_PRSAFRM, qc);
+
+	list_for_each_entry_safe(f, tmp, &frm->reflist, ref) {
+		f->origin = NULL;
+		LIST_DEL_INIT(&f->ref);
+		if (f->pkt) {
+			TRACE_DEVEL("remove frame reference",
+			            QUIC_EV_CONN_PRSAFRM, qc, f, &f->pkt->pn_node.key);
+		}
+		else {
+			TRACE_DEVEL("remove frame reference for unsent frame",
+			            QUIC_EV_CONN_PRSAFRM, qc, f);
+		}
+	}
+
+	TRACE_LEAVE(QUIC_EV_CONN_PRSAFRM, qc);
+}

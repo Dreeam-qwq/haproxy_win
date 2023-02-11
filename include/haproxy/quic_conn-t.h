@@ -93,6 +93,8 @@ typedef unsigned long long ull;
 #define QUIC_RETRY_DURATION_MS      10000
 /* Default Retry threshold */
 #define QUIC_DFLT_RETRY_THRESHOLD     100 /* in connection openings */
+/* Default limit of loss detection on a single frame. If exceeded, connection is closed. */
+#define QUIC_DFLT_MAX_FRAME_LOSS       10
 
 /*
  *  0                   1                   2                   3
@@ -616,11 +618,15 @@ enum qc_mux_state {
 /* gap here */
 #define QUIC_FL_CONN_HALF_OPEN_CNT_DECREMENTED   (1U << 11) /* The half-open connection counter was decremented */
 #define QUIC_FL_CONN_HANDSHAKE_SPEED_UP          (1U << 12) /* Handshake speeding up was done */
+#define QUIC_FL_CONN_TO_KILL                     (1U << 24) /* Unusable connection, to be killed */
+#define QUIC_FL_CONN_TX_TP_RECEIVED              (1U << 25) /* Peer transport parameters have been received (used for the transmitting part) */
+#define QUIC_FL_CONN_FINALIZED                   (1U << 26) /* QUIC connection finalized (functional, ready to send/receive) */
 #define QUIC_FL_CONN_NOTIFY_CLOSE                (1U << 27) /* MUX notified about quic-conn imminent closure (idle-timeout or CONNECTION_CLOSE emission/reception) */
 #define QUIC_FL_CONN_EXP_TIMER                   (1U << 28) /* timer has expired, quic-conn can be freed */
 #define QUIC_FL_CONN_CLOSING                     (1U << 29)
 #define QUIC_FL_CONN_DRAINING                    (1U << 30)
 #define QUIC_FL_CONN_IMMEDIATE_CLOSE             (1U << 31)
+
 struct quic_conn {
 	const struct quic_version *original_version;
 	const struct quic_version *negotiated_version;
@@ -727,6 +733,10 @@ struct quic_conn {
 
 	const struct qcc_app_ops *app_ops;
 	struct quic_counters *prx_counters;
+
+	struct list el_th_ctx; /* list elem in ha_thread_ctx */
+	struct list back_refs; /* list head of CLI context currently dumping this connection. */
+	unsigned int qc_epoch; /* delimiter for newer instances started after "show quic". */
 };
 
 #endif /* USE_QUIC */

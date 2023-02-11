@@ -28,6 +28,21 @@
 #include <haproxy/freq_ctr-t.h>
 #include <haproxy/thread-t.h>
 
+
+/* Threads sets are known either by a set of absolute thread numbers, or by a
+ * set of relative thread numbers within a group, for each group. The default
+ * is the absolute mode and corresponds to the case where no group is known
+ * (nbgrp == 0). The mode may only be changed when the set is empty (use
+ * thread_set_is_empty() for this).
+ */
+struct thread_set {
+	union {
+		ulong abs[(MAX_THREADS + LONGBITS - 1) / LONGBITS];
+		ulong rel[MAX_TGROUPS];
+	};
+	uint nbgrp; /* number of non-empty groups in this set, 0 for abs */
+};
+
 /* tasklet classes */
 enum {
 	TL_URGENT = 0,   /* urgent tasklets (I/O callbacks) */
@@ -115,6 +130,7 @@ struct thread_ctx {
 	struct list pool_lru_head;          /* oldest objects in thread-local pool caches */
 	struct list buffer_wq;              /* buffer waiters */
 	struct list streams;                /* list of streams attached to this thread */
+	struct list quic_conns;             /* list of quic-conns attached to this thread */
 
 	ALWAYS_ALIGN(2*sizeof(void*));
 	struct list tasklets[TL_CLASSES];   /* tasklets (and/or tasks) to run, by class */

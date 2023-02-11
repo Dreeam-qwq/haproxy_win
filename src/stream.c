@@ -434,7 +434,7 @@ struct stream *stream_new(struct session *sess, struct stconn *sc, struct buffer
 	t->context = s;
 	t->expire = TICK_ETERNITY;
 	if (sess->listener)
-		t->nice = sess->listener->nice;
+		t->nice = sess->listener->bind_conf->nice;
 
 	/* Note: initially, the stream's backend points to the frontend.
 	 * This changes later when switching rules are executed or
@@ -491,7 +491,7 @@ struct stream *stream_new(struct session *sess, struct stconn *sc, struct buffer
 	}
 
 	stream_init_srv_conn(s);
-	s->target = sess->listener ? sess->listener->default_target : NULL;
+	s->target = sess->fe->default_target;
 
 	s->pend_pos = NULL;
 	s->priority_class = 0;
@@ -502,7 +502,7 @@ struct stream *stream_new(struct session *sess, struct stconn *sc, struct buffer
 
 	channel_init(&s->req);
 	s->req.flags |= CF_READ_EVENT; /* the producer is already connected */
-	s->req.analysers = sess->listener ? sess->listener->analysers : sess->fe->fe_req_ana;
+	s->req.analysers = sess->listener ? sess->listener->bind_conf->analysers : sess->fe->fe_req_ana;
 
 	if (IS_HTX_STRM(s)) {
 		/* Be sure to have HTTP analysers because in case of

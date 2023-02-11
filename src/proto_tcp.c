@@ -605,7 +605,7 @@ int tcp_bind_listener(struct listener *listener, char *errmsg, int errlen)
 
 	fd = listener->rx.fd;
 
-	if (listener->options & LI_O_NOLINGER)
+	if (listener->bind_conf->options & BC_O_NOLINGER)
 		setsockopt(fd, SOL_SOCKET, SO_LINGER, &nolinger, sizeof(struct linger));
 	else {
 		struct linger tmplinger;
@@ -620,10 +620,10 @@ int tcp_bind_listener(struct listener *listener, char *errmsg, int errlen)
 	}
 
 #if defined(TCP_MAXSEG)
-	if (listener->maxseg > 0) {
+	if (listener->bind_conf->maxseg > 0) {
 		if (setsockopt(fd, IPPROTO_TCP, TCP_MAXSEG,
-			       &listener->maxseg, sizeof(listener->maxseg)) == -1) {
-			chunk_appendf(msg, "%scannot set MSS to %d", msg->data ? ", " : "", listener->maxseg);
+			       &listener->bind_conf->maxseg, sizeof(listener->bind_conf->maxseg)) == -1) {
+			chunk_appendf(msg, "%scannot set MSS to %d", msg->data ? ", " : "", listener->bind_conf->maxseg);
 			err |= ERR_WARN;
 		}
 	} else {
@@ -647,9 +647,9 @@ int tcp_bind_listener(struct listener *listener, char *errmsg, int errlen)
 	}
 #endif
 #if defined(TCP_USER_TIMEOUT)
-	if (listener->tcp_ut) {
+	if (listener->bind_conf->tcp_ut) {
 		if (setsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT,
-			       &listener->tcp_ut, sizeof(listener->tcp_ut)) == -1) {
+			       &listener->bind_conf->tcp_ut, sizeof(listener->bind_conf->tcp_ut)) == -1) {
 			chunk_appendf(msg, "%scannot set TCP User Timeout", msg->data ? ", " : "");
 			err |= ERR_WARN;
 		}
@@ -658,7 +658,7 @@ int tcp_bind_listener(struct listener *listener, char *errmsg, int errlen)
 		    sizeof(zero));
 #endif
 #if defined(TCP_DEFER_ACCEPT)
-	if (listener->options & LI_O_DEF_ACCEPT) {
+	if (listener->bind_conf->options & BC_O_DEF_ACCEPT) {
 		/* defer accept by up to one second */
 		int accept_delay = 1;
 		if (setsockopt(fd, IPPROTO_TCP, TCP_DEFER_ACCEPT, &accept_delay, sizeof(accept_delay)) == -1) {
@@ -670,7 +670,7 @@ int tcp_bind_listener(struct listener *listener, char *errmsg, int errlen)
 		    sizeof(zero));
 #endif
 #if defined(TCP_FASTOPEN)
-	if (listener->options & LI_O_TCP_FO) {
+	if (listener->bind_conf->options & BC_O_TCP_FO) {
 		/* TFO needs a queue length, let's use the configured backlog */
 		int qlen = listener_backlog(listener);
 		if (setsockopt(fd, IPPROTO_TCP, TCP_FASTOPEN, &qlen, sizeof(qlen)) == -1) {
@@ -706,7 +706,7 @@ int tcp_bind_listener(struct listener *listener, char *errmsg, int errlen)
 
 #if !defined(TCP_DEFER_ACCEPT) && defined(SO_ACCEPTFILTER)
 	/* the socket needs to listen first */
-	if (listener->options & LI_O_DEF_ACCEPT) {
+	if (listener->bind_conf->options & BC_O_DEF_ACCEPT) {
 		struct accept_filter_arg accept;
 		memset(&accept, 0, sizeof(accept));
 		strcpy(accept.af_name, "dataready");
@@ -717,7 +717,7 @@ int tcp_bind_listener(struct listener *listener, char *errmsg, int errlen)
 	}
 #endif
 #if defined(TCP_QUICKACK)
-	if (listener->options & LI_O_NOQUICKACK)
+	if (listener->bind_conf->options & BC_O_NOQUICKACK)
 		setsockopt(fd, IPPROTO_TCP, TCP_QUICKACK, &zero, sizeof(zero));
 	else
 		setsockopt(fd, IPPROTO_TCP, TCP_QUICKACK, &one, sizeof(one));

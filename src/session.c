@@ -169,11 +169,11 @@ int session_accept_fd(struct connection *cli_conn)
 	conn_ctrl_init(cli_conn);
 
 	/* wait for a PROXY protocol header */
-	if (l->options & LI_O_ACC_PROXY)
+	if (l->bind_conf->options & BC_O_ACC_PROXY)
 		cli_conn->flags |= CO_FL_ACCEPT_PROXY;
 
 	/* wait for a NetScaler client IP insertion protocol header */
-	if (l->options & LI_O_ACC_CIP)
+	if (l->bind_conf->options & BC_O_ACC_CIP)
 		cli_conn->flags |= CO_FL_ACCEPT_CIP;
 
 	/* Add the handshake pseudo-XPRT */
@@ -190,15 +190,22 @@ int session_accept_fd(struct connection *cli_conn)
 	/* now evaluate the tcp-request layer4 rules. We only need a session
 	 * and no stream for these rules.
 	 */
-	if ((l->options & LI_O_TCP_L4_RULES) && !tcp_exec_l4_rules(sess)) {
+	if (!LIST_ISEMPTY(&p->tcp_req.l4_rules) && !tcp_exec_l4_rules(sess)) {
 		/* let's do a no-linger now to close with a single RST. */
-		setsockopt(cfd, SOL_SOCKET, SO_LINGER, (struct linger *) &nolinger, sizeof(struct linger));
+		if (!(cli_conn->flags & CO_FL_FDLESS))
+			setsockopt(cfd, SOL_SOCKET, SO_LINGER, (struct linger *) &nolinger, sizeof(struct linger));
 		ret = 0; /* successful termination */
 		goto out_free_sess;
 	}
 	/* TCP rules may flag the connection as needing proxy protocol, now that it's done we can start ourxprt */
 	if (conn_xprt_start(cli_conn) < 0)
 		goto out_free_sess;
+
+	/* FIXME/WTA: we should implement the setsockopt() calls at the proto
+	 * level instead and let non-inet protocols implement their own equivalent.
+	 */
+	if (cli_conn->flags & CO_FL_FDLESS)
+		goto skip_fd_setup;
 
 	/* Adjust some socket options */
 	if (l->rx.addr.ss_family == AF_INET || l->rx.addr.ss_family == AF_INET6) {
@@ -227,12 +234,12 @@ int session_accept_fd(struct connection *cli_conn)
 			HA_ATOMIC_OR(&fdtab[cfd].state, FD_LINGER_RISK);
 
 #if defined(TCP_MAXSEG)
-		if (l->maxseg < 0) {
+		if (l->bind_conf->maxseg < 0) {
 			/* we just want to reduce the current MSS by that value */
 			int mss;
 			socklen_t mss_len = sizeof(mss);
 			if (getsockopt(cfd, IPPROTO_TCP, TCP_MAXSEG, &mss, &mss_len) == 0) {
-				mss += l->maxseg; /* remember, it's < 0 */
+				mss += l->bind_conf->maxseg; /* remember, it's < 0 */
 				setsockopt(cfd, IPPROTO_TCP, TCP_MAXSEG, &mss, sizeof(mss));
 			}
 		}
@@ -245,6 +252,7 @@ int session_accept_fd(struct connection *cli_conn)
 	if (global.tune.client_rcvbuf)
 		setsockopt(cfd, SOL_SOCKET, SO_RCVBUF, &global.tune.client_rcvbuf, sizeof(global.tune.client_rcvbuf));
 
+ skip_fd_setup:
 	/* OK, now either we have a pending handshake to execute with and then
 	 * we must return to the I/O layer, or we can proceed with the end of
 	 * the stream initialization. In case of handshake, we also set the I/O
@@ -266,7 +274,7 @@ int session_accept_fd(struct connection *cli_conn)
 			goto out_free_sess;
 
 		sess->task->context = sess;
-		sess->task->nice    = l->nice;
+		sess->task->nice    = l->bind_conf->nice;
 		sess->task->process = session_expire_embryonic;
 		sess->task->expire  = tick_add_ifset(now_ms, p->timeout.client);
 		task_queue(sess->task);
@@ -292,7 +300,8 @@ int session_accept_fd(struct connection *cli_conn)
 
  out_free_conn:
 	if (ret < 0 && l->bind_conf->xprt == xprt_get(XPRT_RAW) &&
-	    p->mode == PR_MODE_HTTP && l->bind_conf->mux_proto == NULL) {
+	    p->mode == PR_MODE_HTTP && l->bind_conf->mux_proto == NULL &&
+	    !(cli_conn->flags & CO_FL_FDLESS)) {
 		/* critical error, no more memory, try to emit a 500 response */
 		send(cfd, http_err_msgs[HTTP_ERR_500], strlen(http_err_msgs[HTTP_ERR_500]),
 		     MSG_DONTWAIT|MSG_NOSIGNAL);
@@ -433,7 +442,7 @@ int conn_complete_session(struct connection *conn)
 		conn->flags |= CO_FL_XPRT_TRACKED;
 
 	/* we may have some tcp-request-session rules */
-	if ((sess->listener->options & LI_O_TCP_L5_RULES) && !tcp_exec_l5_rules(sess))
+	if (!LIST_ISEMPTY(&sess->fe->tcp_req.l5_rules) && !tcp_exec_l5_rules(sess))
 		goto fail;
 
 	session_count_new(sess);

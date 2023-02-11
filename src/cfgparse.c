@@ -690,7 +690,6 @@ int cfg_parse_peers(const char *file, int linenum, char **args, int kwm)
 	struct peer *newpeer = NULL;
 	const char *err;
 	struct bind_conf *bind_conf;
-	struct listener *l;
 	int err_code = 0;
 	char *errmsg = NULL;
 	static int bind_line, peer_line;
@@ -714,6 +713,11 @@ int cfg_parse_peers(const char *file, int linenum, char **args, int kwm)
 			err_code |= ERR_FATAL;
 			goto out;
 		}
+
+		bind_conf->maxaccept = 1;
+		bind_conf->accept = session_accept_fd;
+		bind_conf->options |= BC_O_UNLIMITED; /* don't make the peers subject to global limits */
+
 		if (*args[0] == 'b') {
 			struct listener *l;
 
@@ -739,15 +743,12 @@ int cfg_parse_peers(const char *file, int linenum, char **args, int kwm)
 				err_code |= ERR_FATAL;
 				goto out;
 			}
+
 			/*
 			 * Newly allocated listener is at the end of the list
 			 */
 			l = LIST_ELEM(bind_conf->listeners.p, typeof(l), by_bind);
-			l->maxaccept = 1;
-			l->accept = session_accept_fd;
-			l->analysers |=  curpeers->peers_fe->fe_req_ana;
-			l->default_target = curpeers->peers_fe->default_target;
-			l->options |= LI_O_UNLIMITED; /* don't make the peers subject to global limits */
+
 			global.maxsock++; /* for the listening socket */
 
 			bind_line = 1;
@@ -947,6 +948,10 @@ int cfg_parse_peers(const char *file, int linenum, char **args, int kwm)
 			goto out;
 		}
 
+		bind_conf->maxaccept = 1;
+		bind_conf->accept = session_accept_fd;
+		bind_conf->options |= BC_O_UNLIMITED; /* don't make the peers subject to global limits */
+
 		if (!LIST_ISEMPTY(&bind_conf->listeners)) {
 			ha_alert("parsing [%s:%d] : One listener per \"peers\" section is authorized but another is already configured at [%s:%d].\n", file, linenum, bind_conf->file, bind_conf->line);
 			err_code |= ERR_FATAL;
@@ -964,15 +969,6 @@ int cfg_parse_peers(const char *file, int linenum, char **args, int kwm)
 			goto out;
 		}
 
-		/*
-		 * Newly allocated listener is at the end of the list
-		 */
-		l = LIST_ELEM(bind_conf->listeners.p, typeof(l), by_bind);
-		l->maxaccept = 1;
-		l->accept = session_accept_fd;
-		l->analysers |=  curpeers->peers_fe->fe_req_ana;
-		l->default_target = curpeers->peers_fe->default_target;
-		l->options |= LI_O_UNLIMITED; /* don't make the peers subject to global limits */
 		global.maxsock++; /* for the listening socket */
 	}
 	else if (strcmp(args[0], "shards") == 0) {
@@ -2930,7 +2926,6 @@ init_proxies_list_stage1:
 
 		/* check and reduce the bind-proc of each listener */
 		list_for_each_entry(bind_conf, &curproxy->conf.bind, by_fe) {
-			unsigned long mask;
 			struct listener *li;
 
 			/* HTTP frontends with "h2" as ALPN/NPN will work in
@@ -2959,75 +2954,84 @@ init_proxies_list_stage1:
 
 			/* detect and address thread affinity inconsistencies */
 			err = NULL;
-			if (thread_resolve_group_mask(bind_conf->bind_tgroup, bind_conf->bind_thread,
-			                              &bind_conf->bind_tgroup, &bind_conf->bind_thread, &err) < 0) {
+			if (thread_resolve_group_mask(&bind_conf->thread_set, (curproxy == global.cli_fe) ? 1 : 0, &err) < 0) {
 				ha_alert("Proxy '%s': %s in 'bind %s' at [%s:%d].\n",
 					   curproxy->id, err, bind_conf->arg, bind_conf->file, bind_conf->line);
 				free(err);
 				cfgerr++;
-			} else if (!((mask = bind_conf->bind_thread) & ha_tgroup_info[bind_conf->bind_tgroup-1].threads_enabled)) {
-				unsigned long new_mask = 0;
-				ulong thr_mask = ha_tgroup_info[bind_conf->bind_tgroup-1].threads_enabled;
-
-				while (mask) {
-					new_mask |= mask & thr_mask;
-					mask >>= ha_tgroup_info[bind_conf->bind_tgroup-1].count;
-				}
-
-				bind_conf->bind_thread = new_mask;
-				ha_warning("Proxy '%s': the thread range specified on the 'thread' directive of 'bind %s' at [%s:%d] only refers to thread numbers out of the range supported by thread group %d (%d). The thread numbers were remapped to existing threads instead (mask 0x%lx).\n",
-					   curproxy->id, bind_conf->arg, bind_conf->file, bind_conf->line,
-					   bind_conf->bind_tgroup, ha_tgroup_info[bind_conf->bind_tgroup-1].count, new_mask);
+				continue;
 			}
 
 			/* apply thread masks and groups to all receivers */
 			list_for_each_entry(li, &bind_conf->listeners, by_bind) {
-				if (bind_conf->settings.shards <= 1) {
-					li->rx.bind_thread = bind_conf->bind_thread;
-					li->rx.bind_tgroup = bind_conf->bind_tgroup;
-				} else {
-					struct listener *new_li;
-					int shard, shards, todo, done, bit;
-					ulong mask;
+				struct listener *new_li;
+				struct thread_set new_ts;
+				int shard, shards, todo, done, grp;
+				ulong mask, bit;
 
-					shards = bind_conf->settings.shards;
-					todo = my_popcountl(bind_conf->bind_thread);
+				shards = bind_conf->settings.shards;
+				todo = thread_set_count(&bind_conf->thread_set);
 
-					/* no more shards than total threads */
-					if (shards > todo)
-						shards = todo;
+				/* no more shards than total threads */
+				if (shards > todo)
+					shards = todo;
 
-					shard = done = bit = 0;
-					new_li = li;
+				shard = done = grp = bit = mask = 0;
+				new_li = li;
 
-					while (1) {
-						mask = 0;
-						while (done < todo) {
-							/* enlarge mask to cover next bit of bind_thread */
-							while (!(bind_conf->bind_thread & (1UL << bit)))
-								bit++;
-							mask |= (1UL << bit);
-							bit++;
-							done += shards;
+				while (shard < shards) {
+					memset(&new_ts, 0, sizeof(new_ts));
+					while (grp < global.nbtgroups && done < todo) {
+						/* enlarge mask to cover next bit of bind_thread till we
+						 * have enough bits for one shard. We restart from the
+						 * current grp+bit.
+						 */
+
+						/* first let's find the first non-empty group starting at <mask> */
+						if (!(bind_conf->thread_set.rel[grp] & ha_tgroup_info[grp].threads_enabled & ~mask)) {
+							grp++;
+							mask = 0;
+							continue;
 						}
 
-						new_li->rx.bind_thread = bind_conf->bind_thread & mask;
-						new_li->rx.bind_tgroup = bind_conf->bind_tgroup;
-						done -= todo;
+						/* take next unassigned bit */
+						bit = (bind_conf->thread_set.rel[grp] & ~mask) & -(bind_conf->thread_set.rel[grp] & ~mask);
+						new_ts.rel[grp] |= bit;
+						mask |= bit;
 
-						shard++;
-						if (shard >= shards)
-							break;
+						if (!atleast2(new_ts.rel[grp])) // first time we add a bit: new group
+							new_ts.nbgrp++;
 
-						/* create another listener for new shards */
-						new_li = clone_listener(li);
-						if (!new_li) {
-							ha_alert("Out of memory while trying to allocate extra listener for shard %d in %s %s\n",
-								 shard, proxy_type_str(curproxy), curproxy->id);
-							cfgerr++;
-							err_code |= ERR_FATAL | ERR_ALERT;
-							goto out;
-						}
+						done += shards;
+					};
+
+					BUG_ON(!new_ts.nbgrp); // no more bits left unassigned
+
+					if (new_ts.nbgrp > 1) {
+						ha_alert("Proxy '%s': shard number %d spans %d groups in 'bind %s' at [%s:%d]\n",
+							 curproxy->id, shard, new_ts.nbgrp, bind_conf->arg, bind_conf->file, bind_conf->line);
+						cfgerr++;
+						err_code |= ERR_FATAL | ERR_ALERT;
+						goto out;
+					}
+
+					/* assign the first (and only) thread and group */
+					new_li->rx.bind_thread = thread_set_first_tmask(&new_ts);
+					new_li->rx.bind_tgroup = thread_set_first_group(&new_ts);
+					done -= todo;
+
+					shard++;
+					if (shard >= shards)
+						break;
+
+					/* create another listener for new shards */
+					new_li = clone_listener(li);
+					if (!new_li) {
+						ha_alert("Out of memory while trying to allocate extra listener for shard %d in %s %s\n",
+							 shard, proxy_type_str(curproxy), curproxy->id);
+						cfgerr++;
+						err_code |= ERR_FATAL | ERR_ALERT;
+						goto out;
 					}
 				}
 			}
@@ -3814,16 +3818,7 @@ out_uri_auth_compat:
 		while (newsrv != NULL) {
 			set_usermsgs_ctx(newsrv->conf.file, newsrv->conf.line, &newsrv->obj_type);
 
-			if (newsrv->minconn > newsrv->maxconn) {
-				/* Only 'minconn' was specified, or it was higher than or equal
-				 * to 'maxconn'. Let's turn this into maxconn and clean it, as
-				 * this will avoid further useless expensive computations.
-				 */
-				newsrv->maxconn = newsrv->minconn;
-			} else if (newsrv->maxconn && !newsrv->minconn) {
-				/* minconn was not specified, so we set it to maxconn */
-				newsrv->minconn = newsrv->maxconn;
-			}
+			srv_minmax_conn_apply(newsrv);
 
 			/* this will also properly set the transport layer for
 			 * prod and checks
@@ -4285,6 +4280,18 @@ init_proxies_list_stage2:
 			if (bind_conf->xprt->prepare_bind_conf &&
 			    bind_conf->xprt->prepare_bind_conf(bind_conf) < 0)
 				cfgerr++;
+			bind_conf->analysers |= curproxy->fe_req_ana;
+			if (!bind_conf->maxaccept)
+				bind_conf->maxaccept = global.tune.maxaccept ? global.tune.maxaccept : MAX_ACCEPT;
+			bind_conf->accept = session_accept_fd;
+			if (curproxy->options & PR_O_TCP_NOLING)
+				bind_conf->options |= BC_O_NOLINGER;
+
+			/* smart accept mode is automatic in HTTP mode */
+			if ((curproxy->options2 & PR_O2_SMARTACC) ||
+			    ((curproxy->mode == PR_MODE_HTTP || (bind_conf->options & BC_O_USE_SSL)) &&
+			     !(curproxy->no_options2 & PR_O2_SMARTACC)))
+				bind_conf->options |= BC_O_NOQUICKACK;
 		}
 
 		/* adjust this proxy's listeners */
@@ -4307,16 +4314,8 @@ init_proxies_list_stage2:
 					memprintf(&listener->name, "sock-%d", listener->luid);
 			}
 
-			if (curproxy->options & PR_O_TCP_NOLING)
-				listener->options |= LI_O_NOLINGER;
-			if (!listener->maxaccept)
-				listener->maxaccept = global.tune.maxaccept ? global.tune.maxaccept : MAX_ACCEPT;
-
-			/* listener accept callback */
-			listener->accept = session_accept_fd;
 #ifdef USE_QUIC
-			/* override the accept callback for QUIC listeners. */
-			if (listener->flags & LI_F_QUIC_LISTENER) {
+			if (listener->bind_conf->xprt == xprt_get(XPRT_QUIC)) {
 				if (!global.cluster_secret) {
 					diag_no_cluster_secret = 1;
 					if (listener->bind_conf->options & BC_O_QUIC_FORCE_RETRY) {
@@ -4328,21 +4327,6 @@ init_proxies_list_stage2:
 				li_init_per_thr(listener);
 			}
 #endif
-
-			listener->analysers |= curproxy->fe_req_ana;
-			listener->default_target = curproxy->default_target;
-
-			if (!LIST_ISEMPTY(&curproxy->tcp_req.l4_rules))
-				listener->options |= LI_O_TCP_L4_RULES;
-
-			if (!LIST_ISEMPTY(&curproxy->tcp_req.l5_rules))
-				listener->options |= LI_O_TCP_L5_RULES;
-
-			/* smart accept mode is automatic in HTTP mode */
-			if ((curproxy->options2 & PR_O2_SMARTACC) ||
-			    ((curproxy->mode == PR_MODE_HTTP || (listener->bind_conf->options & BC_O_USE_SSL)) &&
-			     !(curproxy->no_options2 & PR_O2_SMARTACC)))
-				listener->options |= LI_O_NOQUICKACK;
 		}
 
 		/* Release unused SSL configs */
@@ -4444,7 +4428,6 @@ init_proxies_list_stage2:
 					struct list *l;
 					struct bind_conf *bind_conf;
 					struct listener *li;
-					unsigned long mask;
 
 					l = &curpeers->peers_fe->conf.bind;
 					bind_conf = LIST_ELEM(l->n, typeof(bind_conf), by_fe);
@@ -4461,31 +4444,22 @@ init_proxies_list_stage2:
 					}
 
 					err = NULL;
-					if (thread_resolve_group_mask(bind_conf->bind_tgroup, bind_conf->bind_thread,
-								      &bind_conf->bind_tgroup, &bind_conf->bind_thread, &err) < 0) {
+					if (thread_resolve_group_mask(&bind_conf->thread_set, 1, &err) < 0) {
 						ha_alert("Peers section '%s': %s in 'bind %s' at [%s:%d].\n",
 							 curpeers->peers_fe->id, err, bind_conf->arg, bind_conf->file, bind_conf->line);
 						free(err);
 						cfgerr++;
-					} else if (!((mask = bind_conf->bind_thread) & ha_tgroup_info[bind_conf->bind_tgroup-1].threads_enabled)) {
-						unsigned long new_mask = 0;
-						ulong thr_mask = ha_tgroup_info[bind_conf->bind_tgroup-1].threads_enabled;
-
-						while (mask) {
-							new_mask |= mask & thr_mask;
-							mask >>= ha_tgroup_info[bind_conf->bind_tgroup-1].count;
-						}
-
-						bind_conf->bind_thread = new_mask;
-						ha_warning("Peers section '%s': the thread range specified on the 'thread' directive of 'bind %s' at [%s:%d] only refers to thread numbers out of the range supported by thread group %d (%d). The thread numbers were remapped to existing threads instead (mask 0x%lx).\n",
-							   curpeers->peers_fe->id, bind_conf->arg, bind_conf->file, bind_conf->line,
-							   bind_conf->bind_tgroup, ha_tgroup_info[bind_conf->bind_tgroup-1].count, new_mask);
+					}
+					else if (bind_conf->thread_set.nbgrp > 1) {
+						ha_alert("Peers section '%s': 'thread' spans more than one group in 'bind %s' at [%s:%d].\n",
+							 curpeers->peers_fe->id, bind_conf->arg, bind_conf->file, bind_conf->line);
+						cfgerr++;
 					}
 
 					/* apply thread masks and groups to all receivers */
 					list_for_each_entry(li, &bind_conf->listeners, by_bind) {
-						li->rx.bind_thread = bind_conf->bind_thread;
-						li->rx.bind_tgroup = bind_conf->bind_tgroup;
+						li->rx.bind_thread = thread_set_first_tmask(&bind_conf->thread_set);
+						li->rx.bind_tgroup = thread_set_first_group(&bind_conf->thread_set);
 					}
 
 					if (bind_conf->xprt->prepare_bind_conf &&

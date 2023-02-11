@@ -90,26 +90,7 @@ enum li_status {
 	LI_STATE_COUNT /* must be last */
 };
 
-/* listener socket options */
-#define LI_O_NONE               0x0000
-#define LI_O_NOLINGER           0x0001  /* disable linger on this socket */
-/* unused                       0x0002  */
-#define LI_O_NOQUICKACK         0x0004  /* disable quick ack of immediate data (linux) */
-#define LI_O_DEF_ACCEPT         0x0008  /* wait up to 1 second for data before accepting */
-#define LI_O_TCP_L4_RULES       0x0010  /* run TCP L4 rules checks on the incoming connection */
-#define LI_O_TCP_L5_RULES       0x0020  /* run TCP L5 rules checks on the incoming session */
-/* unused                       0x0040  */
-#define LI_O_ACC_PROXY          0x0080  /* find the proxied address in the first request line */
-#define LI_O_UNLIMITED          0x0100  /* listener not subject to global limits (peers & stats socket) */
-#define LI_O_TCP_FO             0x0200  /* enable TCP Fast Open (linux >= 3.7) */
-/* unused                       0x0400  */
-/* unused                       0x0800  */
-#define LI_O_ACC_CIP            0x1000  /* find the proxied address in the NetScaler Client IP header */
-/* unused                       0x2000  */
-/* unused                       0x4000  */
-#define LI_O_NOSTOP             0x8000  /* keep the listener active even after a soft stop */
-
-/* Note: if a listener uses LI_O_UNLIMITED, it is highly recommended that it adds its own
+/* Note: if a bind_conf uses BC_O_UNLIMITED, it is highly recommended that it adds its own
  * maxconn setting to the global.maxsock value so that its resources are reserved.
  */
 
@@ -121,6 +102,14 @@ enum li_status {
 #define BC_O_USE_SOCK_STREAM    0x00000010 /* at least one stream-type listener is used */
 #define BC_O_USE_XPRT_DGRAM     0x00000020 /* at least one dgram-only xprt listener is used */
 #define BC_O_USE_XPRT_STREAM    0x00000040 /* at least one stream-only xprt listener is used */
+#define BC_O_NOLINGER           0x00000080 /* disable lingering on these listeners */
+#define BC_O_NOQUICKACK         0x00000100 /* disable quick ack of immediate data (linux) */
+#define BC_O_DEF_ACCEPT         0x00000200 /* wait up to 1 second for data before accepting */
+#define BC_O_TCP_FO             0x00000400 /* enable TCP Fast Open (linux >= 3.7) */
+#define BC_O_ACC_PROXY          0x00000800 /* find the proxied address in the first request line */
+#define BC_O_ACC_CIP            0x00001000 /* find the proxied address in the NetScaler Client IP header */
+#define BC_O_UNLIMITED          0x00002000 /* listeners not subject to global limits (peers & stats socket) */
+#define BC_O_NOSTOP             0x00004000 /* keep the listeners active even after a soft stop */
 
 
 /* flags used with bind_conf->ssl_options */
@@ -197,8 +186,17 @@ struct bind_conf {
 	const struct mux_proto_list *mux_proto; /* the mux to use for all incoming connections (specified by the "proto" keyword) */
 	struct xprt_ops *xprt;     /* transport-layer operations for all listeners */
 	uint options;              /* set of BC_O_* flags */
+	unsigned int analysers;    /* bitmap of required protocol analysers */
+	int maxseg;                /* for TCP, advertised MSS */
+	int tcp_ut;                /* for TCP, user timeout */
+	int maxaccept;             /* if set, max number of connections accepted at once (-1 when disabled) */
+	unsigned int backlog;      /* if set, listen backlog */
+	int maxconn;               /* maximum connections allowed on this listener */
+	int (*accept)(struct connection *conn); /* upper layer's accept() */
 	int level;                 /* stats access level (ACCESS_LVL_*) */
 	int severity_output;       /* default severity output format in cli feedback messages */
+	short int nice;            /* nice value to assign to the instantiated tasks */
+	/* 2-byte hole here */
 	struct list listeners;     /* list of listeners using this bind config */
 	uint32_t ns_cip_magic;     /* Excepted NetScaler Client IP magic number */
 	struct list by_fe;         /* next binding for the same frontend, or NULL */
@@ -206,8 +204,7 @@ struct bind_conf {
 	char *file;                /* file where the section appears */
 	int line;                  /* line where the section appears */
 	__decl_thread(HA_RWLOCK_T sni_lock); /* lock the SNI trees during add/del operations */
-	unsigned long bind_thread; /* bitmask of threads allowed on this bind_conf */
-	uint bind_tgroup;          /* thread group ID: 0=global IDs, non-zero=local IDs */
+	struct thread_set thread_set; /* entire set of the allowed threads (0=no restriction) */
 	struct rx_settings settings; /* all the settings needed for the listening socket */
 };
 
@@ -221,7 +218,6 @@ struct li_per_thread {
 	struct listener *li; /* back reference on the listener */
 };
 
-#define LI_F_QUIC_LISTENER       0x00000001  /* listener uses proto quic */
 
 /* The listener will be directly referenced by the fdtab[] which holds its
  * socket. The listener provides the protocol-specific accept() function to
@@ -230,31 +226,17 @@ struct li_per_thread {
 struct listener {
 	enum obj_type obj_type;         /* object type = OBJ_TYPE_LISTENER */
 	enum li_state state;            /* state: NEW, INIT, ASSIGNED, LISTEN, READY, FULL */
-	short int nice;                 /* nice value to assign to the instantiated tasks */
+	/* 2-byte hole here */
 	int luid;			/* listener universally unique ID, used for SNMP */
-	int options;			/* socket options : LI_O_* */
-	int flags;                      /* LI_F_* flags */
+	int nbconn;			/* current number of connections on this listener */
+	unsigned int thr_idx;           /* thread indexes for queue distribution : (t2<<16)+t1 */
 	__decl_thread(HA_RWLOCK_T lock);
 
 	struct fe_counters *counters;	/* statistics counters */
-	int nbconn;			/* current number of connections on this listener */
-	int maxconn;			/* maximum connections allowed on this listener */
-	unsigned int backlog;		/* if set, listen backlog */
-	int maxaccept;         /* if set, max number of connections accepted at once (-1 when disabled) */
-	int (*accept)(struct connection *conn); /* upper layer's accept() */
-	enum obj_type *default_target;  /* default target to use for accepted sessions or NULL */
-	/* cache line boundary */
 	struct mt_list wait_queue;	/* link element to make the listener wait for something (LI_LIMITED)  */
-	unsigned int thr_idx;           /* thread indexes for queue distribution : (t2<<16)+t1 */
-	unsigned int analysers;		/* bitmap of required protocol analysers */
-	int maxseg;			/* for TCP, advertised MSS */
-	int tcp_ut;                     /* for TCP, user timeout */
 	char *name;			/* listener's name */
 
-	/* cache line boundary */
 	unsigned int thr_conn[MAX_THREADS]; /* number of connections per thread */
-
-	/* cache line boundary */
 
 	struct list by_fe;              /* chaining in frontend's list of listeners */
 	struct list by_bind;            /* chaining in bind_conf's list of listeners */

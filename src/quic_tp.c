@@ -4,7 +4,7 @@
 #include <haproxy/global.h>
 #include <haproxy/ncbuf-t.h>
 #include <haproxy/net_helper.h>
-#include <haproxy/quic_conn-t.h>
+#include <haproxy/quic_conn.h>
 #include <haproxy/quic_enc.h>
 #include <haproxy/quic_tp.h>
 #include <haproxy/trace.h>
@@ -319,7 +319,7 @@ static int quic_transport_param_decode(struct quic_transport_params *p,
 		if (!quic_dec_int(&p->active_connection_id_limit, buf, end))
 			return 0;
 		break;
-	case QUIC_TP_DRAFT_VERSION_INFORMATION:
+	case QUIC_TP_VERSION_INFORMATION:
 		if (!quic_transport_param_dec_version_info(&p->version_information,
 		                                           buf, *buf + len, server))
 			return 0;
@@ -435,7 +435,7 @@ static int quic_transport_param_enc_version_info(unsigned char **buf,
 
 	tp_len = sizeof chosen_version->num + quic_versions_nb * sizeof(uint32_t);
 	if (!quic_transport_param_encode_type_len(buf, end,
-	                                          QUIC_TP_DRAFT_VERSION_INFORMATION,
+	                                          QUIC_TP_VERSION_INFORMATION,
 	                                          tp_len))
 		return 0;
 
@@ -625,12 +625,44 @@ int quic_transport_params_store(struct quic_conn *qc, int server,
                                 const unsigned char *end)
 {
 	struct quic_transport_params *tx_params = &qc->tx.params;
+	struct quic_transport_params *rx_params = &qc->rx.params;
+	/* Initial source connection ID */
+	struct tp_cid *iscid;
 
 	/* initialize peer TPs to RFC default value */
 	quic_dflt_transport_params_cpy(tx_params);
 
 	if (!quic_transport_params_decode(tx_params, server, buf, end))
 		return 0;
+
+	/* Update the connection from transport parameters received */
+	if (tx_params->version_information.negotiated_version &&
+	    tx_params->version_information.negotiated_version != qc->original_version)
+		qc->negotiated_version =
+			qc->tx.params.version_information.negotiated_version;
+
+	if (tx_params->max_ack_delay)
+		qc->max_ack_delay = tx_params->max_ack_delay;
+
+	if (tx_params->max_idle_timeout && rx_params->max_idle_timeout)
+		qc->max_idle_timeout =
+			QUIC_MIN(tx_params->max_idle_timeout, rx_params->max_idle_timeout);
+	else
+		qc->max_idle_timeout =
+			QUIC_MAX(tx_params->max_idle_timeout, rx_params->max_idle_timeout);
+	TRACE_PROTO("\nTX(remote) transp. params.", QUIC_EV_TRANSP_PARAMS, qc, tx_params);
+
+	/* Check that the "initial_source_connection_id" transport parameter matches
+	 * the SCID received which is also the DCID of the connection.
+	 */
+	iscid = &tx_params->initial_source_connection_id;
+	if (qc->dcid.len != iscid->len ||
+	    (qc->dcid.len && memcmp(qc->dcid.data, iscid->data, qc->dcid.len))) {
+		TRACE_PROTO("initial_source_connection_id transport parameter mismatch",
+		            QUIC_EV_TRANSP_PARAMS, qc);
+		/* Kill the connection as soon as possible */
+		qc_kill_conn(qc);
+	}
 
 	return 1;
 }
