@@ -501,13 +501,17 @@ static void quic_conn_sock_fd_iocb(int fd)
 /* Send a datagram stored into <buf> buffer with <sz> as size.
  * The caller must ensure there is at least <sz> bytes in this buffer.
  *
- * Returns 0 on success else non-zero.
+ * Returns 0 on success else non-zero. When failed, this function also
+ * sets <*syscall_errno> to the errno only when the send*() syscall failed.
+ * As the C library will never set errno to 0, the caller must set
+ * <*syscall_errno> to 0 before calling this function to be sure to get
+ * the correct errno in case a send*() syscall failure.
  *
  * TODO standardize this function for a generic UDP sendto wrapper. This can be
  * done by removing the <qc> arg and replace it with address/port.
  */
 int qc_snd_buf(struct quic_conn *qc, const struct buffer *buf, size_t sz,
-               int flags)
+               int flags, int *syscall_errno)
 {
 	ssize_t ret;
 
@@ -609,12 +613,13 @@ int qc_snd_buf(struct quic_conn *qc, const struct buffer *buf, size_t sz,
 		}
 	} while (ret < 0 && errno == EINTR);
 
-	if (ret < 0 || ret != sz) {
+	if (ret < 0) {
 		struct proxy *prx = qc->li->bind_conf->frontend;
 		struct quic_counters *prx_counters =
 		  EXTRA_COUNTERS_GET(prx->extra_counters_fe,
 		                     &quic_stats_module);
 
+		*syscall_errno = errno;
 		/* TODO adjust errno for UDP context. */
 		if (errno == EAGAIN || errno == EWOULDBLOCK ||
 		    errno == ENOTCONN || errno == EINPROGRESS || errno == EBADF) {
@@ -630,8 +635,15 @@ int qc_snd_buf(struct quic_conn *qc, const struct buffer *buf, size_t sz,
 			HA_ATOMIC_INC(&prx_counters->sendto_err_unknown);
 		}
 
+		/* Note that one must not consider that this macro will not modify errno. */
+		TRACE_PRINTF(TRACE_LEVEL_DEVELOPER, QUIC_EV_CONN_LPKT, qc, 0, 0, 0,
+		             "syscall error (errno=%d)", *syscall_errno);
+
 		return 1;
 	}
+
+	if (ret != sz)
+		return 1;
 
 	/* we count the total bytes sent, and the send rate for 32-byte blocks.
 	 * The reason for the latter is that freq_ctr are limited to 4GB and

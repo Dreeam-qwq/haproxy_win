@@ -941,7 +941,7 @@ int http_request_forward_body(struct stream *s, struct channel *req, int an_bit)
 	}
 	else {
 		c_adv(req, htx->data - co_data(req));
-		if (msg->flags & HTTP_MSGF_XFER_LEN)
+		if (!(global.tune.options & GTUNE_NO_FAST_FWD) && (msg->flags & HTTP_MSGF_XFER_LEN))
 			channel_htx_forward_forever(req, htx);
 	}
 
@@ -2044,7 +2044,7 @@ int http_response_forward_body(struct stream *s, struct channel *res, int an_bit
 	}
 	else {
 		c_adv(res, htx->data - co_data(res));
-		if (msg->flags & HTTP_MSGF_XFER_LEN)
+		if (!(global.tune.options & GTUNE_NO_FAST_FWD) && (msg->flags & HTTP_MSGF_XFER_LEN))
 			channel_htx_forward_forever(res, htx);
 	}
 
@@ -4229,9 +4229,10 @@ static void http_end_request(struct stream *s)
 		 */
 		chn->flags |= CF_NEVER_WAIT;
 
-		if (txn->rsp.msg_state < HTTP_MSG_DONE) {
-			/* The server has not finished to respond, so we
-			 * don't want to move in order not to upset it.
+		if (txn->rsp.msg_state < HTTP_MSG_DONE && s->scb->state != SC_ST_CLO) {
+			/* The server has not finished to respond and the
+			 * backend SC is not closed, so we don't want to move in
+			 * order not to upset it.
 			 */
 			DBG_TRACE_DEVEL("waiting end of the response", STRM_EV_HTTP_ANA, s, txn);
 			return;
@@ -4338,7 +4339,7 @@ static void http_end_response(struct stream *s)
 		 */
 		/* channel_dont_read(chn); */
 
-		if (txn->req.msg_state < HTTP_MSG_DONE) {
+		if (txn->req.msg_state < HTTP_MSG_DONE && s->scf->state != SC_ST_CLO) {
 			/* The client seems to still be sending data, probably
 			 * because we got an error response during an upload.
 			 * We have the choice of either breaking the connection
@@ -5079,8 +5080,8 @@ void http_set_term_flags(struct stream *s)
 				/* We are still processing the response headers */
 				s->flags |= SF_FINST_H;
 			}
-			// (res >= done) & (res->flags & shutw)
-			else if (s->txn->rsp.msg_state >= HTTP_MSG_DONE &&
+			// (res == (done|closing|closed)) & (res->flags & shutw)
+			else if (s->txn->rsp.msg_state >= HTTP_MSG_DONE && s->txn->rsp.msg_state < HTTP_MSG_TUNNEL &&
 				 (s->flags & (SF_ERR_CLITO|SF_ERR_CLICL))) {
 				/* A client error was reported and we are
 				 * transmitting the last block of data

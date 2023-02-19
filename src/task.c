@@ -765,16 +765,31 @@ void process_runnable_tasks()
 	 */
 	max_total = max[TL_URGENT] + max[TL_NORMAL] + max[TL_BULK] + max[TL_HEAVY];
 	if (!max_total)
-		return;
+		goto leave;
 
 	for (queue = 0; queue < TL_CLASSES; queue++)
 		max[queue]  = ((unsigned)max_processed * max[queue] + max_total - 1) / max_total;
 
-	/* The heavy queue must never process more than one task at once
-	 * anyway.
+	/* The heavy queue must never process more than very few tasks at once
+	 * anyway. We set the limit to 1 if running on low_latency scheduling,
+	 * given that we know that other values can have an impact on latency
+	 * (~500us end-to-end connection achieved at 130kcps in SSL), 1 + one
+	 * per 1024 tasks if there is at least one non-heavy task while still
+	 * respecting the ratios above, or 1 + one per 128 tasks if only heavy
+	 * tasks are present. This allows to drain excess SSL handshakes more
+	 * efficiently if the queue becomes congested.
 	 */
-	if (max[TL_HEAVY] > 1)
-		max[TL_HEAVY] = 1;
+	if (max[TL_HEAVY] > 1) {
+		if (global.tune.options & GTUNE_SCHED_LOW_LATENCY)
+			budget = 1;
+		else if (tt->tl_class_mask & ~(1 << TL_HEAVY))
+			budget = 1 + tt->rq_total / 1024;
+		else
+			budget = 1 + tt->rq_total / 128;
+
+		if (max[TL_HEAVY] > budget)
+			max[TL_HEAVY] = budget;
+	}
 
 	lrq = grq = NULL;
 
@@ -864,6 +879,7 @@ void process_runnable_tasks()
 	if (max_processed > 0 && thread_has_tasks())
 		goto not_done_yet;
 
+ leave:
 	if (tt->tl_class_mask)
 		activity[tid].long_rq++;
 }

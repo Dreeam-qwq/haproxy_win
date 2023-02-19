@@ -622,6 +622,7 @@ static void usage(char *name)
 		"        -dV disables SSL verify on servers side\n"
 		"        -dW fails if any warning is emitted\n"
 		"        -dD diagnostic mode : warn about suspicious configuration statements\n"
+		"        -dF disable fast-forward\n"
 		"        -sf/-st [pid ]* finishes/terminates old pids.\n"
 		"        -x <unix_socket> get listening sockets from a unix socket\n"
 		"        -S <bind>[,<bind options>...] new master CLI\n"
@@ -1647,6 +1648,8 @@ static void init_args(int argc, char **argv)
 			else if (*flag == 'd' && flag[1] == 'R')
 				global.tune.options &= ~GTUNE_USE_REUSEPORT;
 #endif
+			else if (*flag == 'd' && flag[1] == 'F')
+				global.tune.options |= GTUNE_NO_FAST_FWD;
 			else if (*flag == 'd' && flag[1] == 'V')
 				global.ssl_server_verify = SSL_SERVER_VERIFY_NONE;
 			else if (*flag == 'V')
@@ -2144,7 +2147,7 @@ static void init(int argc, char **argv)
 			}
 			tmproc->options |= PROC_O_TYPE_MASTER; /* master */
 			tmproc->pid = pid;
-			tmproc->timestamp = start_time.tv_sec;
+			tmproc->timestamp = start_date.tv_sec;
 			proc_self = tmproc;
 
 			LIST_APPEND(&proc_list, &tmproc->list);
@@ -2919,6 +2922,8 @@ void run_poll_loop()
 {
 	int next, wake;
 
+	_HA_ATOMIC_OR(&th_ctx->flags, TH_FL_IN_LOOP);
+
 	clock_update_date(0,1);
 	while (1) {
 		wake_expired_tasks();
@@ -3007,6 +3012,8 @@ void run_poll_loop()
 
 		activity[tid].loops++;
 	}
+
+	_HA_ATOMIC_AND(&th_ctx->flags, ~TH_FL_IN_LOOP);
 }
 
 static void *run_thread_poll_loop(void *data)
@@ -3025,6 +3032,7 @@ static void *run_thread_poll_loop(void *data)
 	/* thread is started, from now on it is not idle nor harmless */
 	thread_harmless_end();
 	thread_idle_end();
+	_HA_ATOMIC_OR(&th_ctx->flags, TH_FL_STARTED);
 
 	/* Now, initialize one thread init at a time. This is better since
 	 * some init code is a bit tricky and may release global resources
@@ -3555,7 +3563,7 @@ int main(int argc, char **argv)
 						if (child->reloads == 0 &&
 						    child->options & PROC_O_TYPE_WORKER &&
 						    child->pid == -1) {
-							child->timestamp = now.tv_sec;
+							child->timestamp = date.tv_sec;
 							child->pid = ret;
 							child->version = strdup(haproxy_version);
 							break;
