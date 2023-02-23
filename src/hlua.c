@@ -1248,7 +1248,7 @@ int hlua_ctx_init(struct hlua *lua, int state_id, struct task *task, int already
 	lua->wake_time = TICK_ETERNITY;
 	lua->state_id = state_id;
 	LIST_INIT(&lua->com);
-	LIST_INIT(&lua->hc_list);
+	MT_LIST_INIT(&lua->hc_list);
 	if (!already_safe) {
 		if (!SET_SAFE_LJMP_PARENT(lua)) {
 			lua->Tref = LUA_REFNIL;
@@ -1270,16 +1270,30 @@ int hlua_ctx_init(struct hlua *lua, int state_id, struct task *task, int already
 	return 1;
 }
 
-/* kill all associated httpclient to this hlua task */
+/* kill all associated httpclient to this hlua task
+ * We must take extra precautions as we're manipulating lua-exposed
+ * objects without the main lua lock.
+ */
 static void hlua_httpclient_destroy_all(struct hlua *hlua)
 {
-	struct hlua_httpclient *hlua_hc, *back;
+	struct hlua_httpclient *hlua_hc;
 
-	list_for_each_entry_safe(hlua_hc, back, &hlua->hc_list, by_hlua) {
-		if (hlua_hc->hc)
-			httpclient_stop_and_destroy(hlua_hc->hc);
+	/* use thread-safe accessors for hc_list since GC cycle initiated by
+	 * another thread sharing the same main lua stack (lua coroutine)
+	 * could execute hlua_httpclient_gc() on the hlua->hc_list items
+	 * in parallel: Lua GC applies on the main stack, it is not limited to
+	 * a single coroutine stack, see Github issue #2037 for reference.
+	 * Remember, coroutines created using lua_newthread() are not meant to
+	 * be thread safe in Lua. (From lua co-author:
+	 * http://lua-users.org/lists/lua-l/2011-07/msg00072.html)
+	 *
+	 * This security measure is superfluous when 'lua-load-per-thread' is used
+	 * since in this case coroutines exclusively run on the same thread
+	 * (main stack is not shared between OS threads).
+	 */
+	while ((hlua_hc = MT_LIST_POP(&hlua->hc_list, typeof(hlua_hc), by_hlua))) {
+		httpclient_stop_and_destroy(hlua_hc->hc);
 		hlua_hc->hc = NULL;
-		LIST_DEL_INIT(&hlua_hc->by_hlua);
 	}
 }
 
@@ -1989,7 +2003,6 @@ static void hlua_socket_handler(struct appctx *appctx)
 	if (ctx->die) {
 		sc_shutw(sc);
 		sc_shutr(sc);
-		sc_ic(sc)->flags |= CF_READ_EVENT;
 		notification_wake(&ctx->wake_on_read);
 		notification_wake(&ctx->wake_on_write);
 		stream_shutdown(__sc_strm(sc), SF_ERR_KILLED);
@@ -2510,9 +2523,6 @@ static int hlua_socket_write_yield(struct lua_State *L,int status, lua_KContext 
 	/* update buffers. */
 	appctx_wakeup(appctx);
 
-	s->req.rex = TICK_ETERNITY;
-	s->res.wex = TICK_ETERNITY;
-
 	/* Update length sent. */
 	lua_pop(L, 1);
 	lua_pushinteger(L, sent + len);
@@ -3002,14 +3012,8 @@ __LJMP static int hlua_socket_settimeout(struct lua_State *L)
 	s = appctx_strm(container_of(peer, struct hlua_csk_ctx, xref)->appctx);
 
 	s->sess->fe->timeout.connect = tmout;
-	s->req.rto = tmout;
-	s->req.wto = tmout;
-	s->res.rto = tmout;
-	s->res.wto = tmout;
-	s->req.rex = tick_add_ifset(now_ms, tmout);
-	s->req.wex = tick_add_ifset(now_ms, tmout);
-	s->res.rex = tick_add_ifset(now_ms, tmout);
-	s->res.wex = tick_add_ifset(now_ms, tmout);
+	s->scf->ioto = tmout;
+	s->scb->ioto = tmout;
 
 	s->task->expire = tick_add_ifset(now_ms, tmout);
 	task_queue(s->task);
@@ -7052,11 +7056,11 @@ __LJMP static int hlua_httpclient_gc(lua_State *L)
 
 	hlua_hc = MAY_LJMP(hlua_checkhttpclient(L, 1));
 
-	if (hlua_hc->hc)
+	if (MT_LIST_DELETE(&hlua_hc->by_hlua)) {
+		/* we won the race against hlua_httpclient_destroy_all() */
 		httpclient_stop_and_destroy(hlua_hc->hc);
-
-	hlua_hc->hc = NULL;
-	LIST_DEL_INIT(&hlua_hc->by_hlua);
+		hlua_hc->hc = NULL;
+	}
 
 	return 0;
 }
@@ -7087,7 +7091,7 @@ __LJMP static int hlua_httpclient_new(lua_State *L)
 	if (!hlua_hc->hc)
 		goto err;
 
-	LIST_APPEND(&hlua->hc_list, &hlua_hc->by_hlua);
+	MT_LIST_APPEND(&hlua->hc_list, &hlua_hc->by_hlua);
 
 	/* Pop a class stream metatable and affect it to the userdata. */
 	lua_rawgeti(L, LUA_REGISTRYINDEX, class_httpclient_ref);
@@ -7409,6 +7413,7 @@ __LJMP static int hlua_httpclient_send(lua_State *L, enum http_meth_t meth)
 
 	hlua_hc->sent = 0;
 
+	istfree(&hlua_hc->hc->req.url);
 	hlua_hc->hc->req.url = istdup(ist(url_str));
 	hlua_hc->hc->req.meth = meth;
 
@@ -8071,7 +8076,6 @@ __LJMP static int hlua_txn_done(lua_State *L)
 		channel_auto_close(req);
 		channel_erase(req);
 
-		res->wex = tick_add_ifset(now_ms, res->wto);
 		channel_auto_read(res);
 		channel_auto_close(res);
 		channel_shutr_now(res);
@@ -9413,7 +9417,6 @@ void hlua_applet_tcp_fct(struct appctx *ctx)
 	struct hlua_tcp_ctx *tcp_ctx = ctx->svcctx;
 	struct stconn *sc = appctx_sc(ctx);
 	struct stream *strm = __sc_strm(sc);
-	struct channel *res = sc_ic(sc);
 	struct act_rule *rule = ctx->rule;
 	struct proxy *px = strm->be;
 	struct hlua *hlua = tcp_ctx->hlua;
@@ -9437,7 +9440,6 @@ void hlua_applet_tcp_fct(struct appctx *ctx)
 
 		/* eat the whole request */
 		co_skip(sc_oc(sc), co_data(sc_oc(sc)));
-		res->flags |= CF_READ_EVENT;
 		sc_shutr(sc);
 		return;
 
@@ -9719,10 +9721,8 @@ void hlua_applet_http_fct(struct appctx *ctx)
 
   done:
 	if (http_ctx->flags & APPLET_DONE) {
-		if (!(res->flags & CF_SHUTR)) {
-			res->flags |= CF_READ_EVENT;
+		if (!(res->flags & CF_SHUTR))
 			sc_shutr(sc);
-		}
 
 		/* eat the whole request */
 		if (co_data(req)) {

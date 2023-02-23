@@ -1490,6 +1490,8 @@ static void init_early(int argc, char **argv)
 	char *tmp;
 	int len;
 
+	setenv("HAPROXY_STARTUP_VERSION", HAPROXY_VERSION, 0);
+
 	/* First, let's initialize most global variables */
 	totalconn = actconn = listeners = stopping = 0;
 	killed = pid = 0;
@@ -1598,6 +1600,8 @@ static void init_args(int argc, char **argv)
 #endif
 	global.tune.options |= GTUNE_STRICT_LIMITS;
 
+	global.tune.options |= GTUNE_USE_FAST_FWD; /* Use fast-forward by default */
+
 	/* keep a copy of original arguments for the master process */
 	old_argv = copy_argv(argc, argv);
 	if (!old_argv) {
@@ -1649,7 +1653,7 @@ static void init_args(int argc, char **argv)
 				global.tune.options &= ~GTUNE_USE_REUSEPORT;
 #endif
 			else if (*flag == 'd' && flag[1] == 'F')
-				global.tune.options |= GTUNE_NO_FAST_FWD;
+				global.tune.options &= ~GTUNE_USE_FAST_FWD;
 			else if (*flag == 'd' && flag[1] == 'V')
 				global.ssl_server_verify = SSL_SERVER_VERIFY_NONE;
 			else if (*flag == 'V')
@@ -3377,10 +3381,9 @@ int main(int argc, char **argv)
 	/* Note: protocol_bind_all() sends an alert when it fails. */
 	if ((err & ~ERR_WARN) != ERR_NONE) {
 		ha_alert("[%s.main()] Some protocols failed to start their listeners! Exiting.\n", argv[0]);
-		if (retry != MAX_START_RETRIES && nb_oldpids) {
-			protocol_unbind_all(); /* cleanup everything we can */
+		if (retry != MAX_START_RETRIES && nb_oldpids)
 			tell_old_pids(SIGTTIN);
-		}
+		protocol_unbind_all(); /* cleanup everything we can */
 		exit(1);
 	}
 

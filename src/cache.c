@@ -1101,7 +1101,7 @@ enum act_return http_action_store_cache(struct act_rule *rule, struct proxy *px,
 
 	http_check_response_for_cacheability(s, &s->res);
 
-	if (!(txn->flags & TX_CACHEABLE) || !(txn->flags & TX_CACHE_COOK) || (txn->flags & TX_CACHE_IGNORE))
+	if (!(txn->flags & TX_CACHEABLE) || !(txn->flags & TX_CACHE_COOK))
 		goto out;
 
 	shctx_lock(shctx);
@@ -1532,10 +1532,8 @@ static void http_cache_io_handler(struct appctx *appctx)
 	}
 
   end:
-	if (!(res->flags & CF_SHUTR) && appctx->st0 == HTX_CACHE_END) {
-		res->flags |= CF_READ_EVENT;
+	if (!(res->flags & CF_SHUTR) && appctx->st0 == HTX_CACHE_END)
 		sc_shutr(sc);
-	}
 
   out:
 	total = res_htx->data - total;
@@ -1802,8 +1800,10 @@ enum act_return http_action_req_cache_use(struct act_rule *rule, struct proxy *p
 
 	shctx_lock(shctx_ptr(cache));
 	res = entry_exist(cache, s->txn->cache_hash);
-	/* We must not use an entry that is not complete. */
-	if (res && res->complete) {
+	/* We must not use an entry that is not complete but the check will be
+	 * performed after we look for a potential secondary entry (in case of
+	 * Vary). */
+	if (res) {
 		struct appctx *appctx;
 		entry_block = block_ptr(res);
 		shctx_row_inc_hot(shctx_ptr(cache), entry_block);
@@ -1830,9 +1830,11 @@ enum act_return http_action_req_cache_use(struct act_rule *rule, struct proxy *p
 				res = NULL;
 		}
 
-		/* We looked for a valid secondary entry and could not find one,
-		 * the request must be forwarded to the server. */
-		if (!res) {
+		/* We either looked for a valid secondary entry and could not
+		 * find one, or the entry we want to use is not complete. We
+		 * can't use the cache's entry and must forward the request to
+		 * the server. */
+		if (!res || !res->complete) {
 			shctx_lock(shctx_ptr(cache));
 			shctx_row_dec_hot(shctx_ptr(cache), entry_block);
 			shctx_unlock(shctx_ptr(cache));

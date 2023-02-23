@@ -85,16 +85,6 @@ static inline struct stconn *sc_opposite(const struct stconn *sc)
 }
 
 
-/* to be called only when in SC_ST_DIS with SC_FL_ERR */
-static inline void sc_report_error(struct stconn *sc)
-{
-	if (!__sc_strm(sc)->conn_err_type)
-		__sc_strm(sc)->conn_err_type = STRM_ET_DATA_ERR;
-
-	sc_oc(sc)->flags |= CF_WRITE_ERROR;
-	sc_ic(sc)->flags |= CF_READ_ERROR;
-}
-
 /* sets the current and previous state of a stream connector to <state>. This is
  * mainly used to create one in the established state on incoming conncetions.
  */
@@ -319,8 +309,10 @@ static inline int sc_is_recv_allowed(const struct stconn *sc)
 static inline void sc_chk_rcv(struct stconn *sc)
 {
 	if (sc_ep_test(sc, SE_FL_APPLET_NEED_CONN) &&
-	    sc_state_in(sc_opposite(sc)->state, SC_SB_RDY|SC_SB_EST|SC_SB_DIS|SC_SB_CLO))
+	    sc_state_in(sc_opposite(sc)->state, SC_SB_RDY|SC_SB_EST|SC_SB_DIS|SC_SB_CLO)) {
 		sc_ep_clr(sc, SE_FL_APPLET_NEED_CONN);
+		sc_ep_report_read_activity(sc);
+	}
 
 	if (!sc_is_recv_allowed(sc))
 		return;
@@ -379,6 +371,49 @@ static inline int sc_is_send_allowed(const struct stconn *sc)
 		return 0;
 
 	return !sc_ep_test(sc, SE_FL_WAIT_DATA | SE_FL_WONT_CONSUME);
+}
+
+static inline int sc_rcv_may_expire(const struct stconn *sc)
+{
+	if (sc_ic(sc)->flags & (CF_EOI|CF_SHUTR|CF_READ_TIMEOUT|CF_READ_EVENT))
+		return 0;
+	if (sc->flags & (SC_FL_WONT_READ|SC_FL_NEED_BUFF|SC_FL_NEED_ROOM))
+		return 0;
+	if (sc_ep_test(sc, SE_FL_APPLET_NEED_CONN) || sc_ep_test(sc_opposite(sc), SE_FL_EXP_NO_DATA))
+		return 0;
+	return 1;
+}
+
+static inline int sc_snd_may_expire(const struct stconn *sc)
+{
+	if (sc_oc(sc)->flags & (CF_SHUTW|CF_WRITE_TIMEOUT|CF_WRITE_EVENT))
+		return 0;
+	if (sc_ep_test(sc, SE_FL_WONT_CONSUME))
+		return 0;
+	return 1;
+}
+
+static inline void sc_check_timeouts(const struct stconn *sc)
+{
+	if (likely(sc_rcv_may_expire(sc)) && unlikely(tick_is_expired(sc_ep_rcv_ex(sc), now_ms)))
+		sc_ic(sc)->flags |= CF_READ_TIMEOUT;
+	if (likely(sc_snd_may_expire(sc)) && unlikely(tick_is_expired(sc_ep_snd_ex(sc), now_ms)))
+		sc_oc(sc)->flags |= CF_WRITE_TIMEOUT;
+}
+
+static inline void sc_set_hcto(struct stconn *sc)
+{
+	struct stream *strm = __sc_strm(sc);
+
+	if (sc->flags & SC_FL_ISBACK) {
+		if ((strm->flags & SF_BE_ASSIGNED) && tick_isset(strm->be->timeout.serverfin))
+			sc->ioto = strm->be->timeout.serverfin;
+	}
+	else {
+		if (tick_isset(strm_fe(strm)->timeout.clientfin))
+			sc->ioto = strm_fe(strm)->timeout.clientfin;
+	}
+
 }
 
 #endif /* _HAPROXY_SC_STRM_H */

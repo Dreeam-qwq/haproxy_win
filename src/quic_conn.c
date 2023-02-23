@@ -2697,33 +2697,55 @@ static void qc_cc_err_count_inc(struct quic_conn *qc, struct quic_frame *frm)
 	TRACE_LEAVE(QUIC_EV_CONN_CLOSE, qc);
 }
 
-/* Enqueue a STOP_SENDING frame to send into 1RTT packet number space
- * frame list to send.
- * Return 1 if succeeded, 0 if not.
+/* Cancel a request on connection <qc> for stream id <id>. This is useful when
+ * the client opens a new stream but the MUX has already been released. A
+ * STOP_SENDING + RESET_STREAM frames are prepared for emission.
+ *
+ * TODO this function is closely related to H3. Its place should be in H3 layer
+ * instead of quic-conn but this requires an architecture adjustment.
+ *
+ * Returns 1 on sucess else 0.
  */
-static int qc_stop_sending_frm_enqueue(struct quic_conn *qc, uint64_t id)
+static int qc_h3_request_reject(struct quic_conn *qc, uint64_t id)
 {
 	int ret = 0;
-	struct quic_frame *frm;
+	struct quic_frame *ss, *rs;
 	struct quic_enc_level *qel = &qc->els[QUIC_TLS_ENC_LEVEL_APP];
-	uint64_t app_error_code;
+	const uint64_t app_error_code = H3_REQUEST_REJECTED;
 
 	TRACE_ENTER(QUIC_EV_CONN_PRSHPKT, qc);
 
-	/* TODO: the mux may be released, we cannot have more
-	 * information about the application error code to send
-	 * at this time.
+	/* Do not emit rejection for unknown unidirectional stream as it is
+	 * forbidden to close some of them (H3 control stream and QPACK
+	 * encoder/decoder streams).
 	 */
-	app_error_code = H3_REQUEST_REJECTED;
-	frm = qc_frm_alloc(QUIC_FT_STOP_SENDING);
-	if (!frm) {
+	if (quic_stream_is_uni(id)) {
+		ret = 1;
+		goto out;
+	}
+
+	ss = qc_frm_alloc(QUIC_FT_STOP_SENDING);
+	if (!ss) {
 		TRACE_ERROR("failed to allocate quic_frame", QUIC_EV_CONN_PRSHPKT, qc);
 		goto out;
 	}
 
-	frm->stop_sending.id = id;
-	frm->stop_sending.app_error_code = app_error_code;
-	LIST_APPEND(&qel->pktns->tx.frms, &frm->list);
+	ss->stop_sending.id = id;
+	ss->stop_sending.app_error_code = app_error_code;
+
+	rs = qc_frm_alloc(QUIC_FT_RESET_STREAM);
+	if (!rs) {
+		TRACE_ERROR("failed to allocate quic_frame", QUIC_EV_CONN_PRSHPKT, qc);
+		qc_frm_free(&ss);
+		goto out;
+	}
+
+	rs->reset_stream.id = id;
+	rs->reset_stream.app_error_code = app_error_code;
+	rs->reset_stream.final_size = 0;
+
+	LIST_APPEND(&qel->pktns->tx.frms, &ss->list);
+	LIST_APPEND(&qel->pktns->tx.frms, &rs->list);
 	ret = 1;
  out:
 	TRACE_LEAVE(QUIC_EV_CONN_PRSHPKT, qc);
@@ -2935,21 +2957,17 @@ static int qc_parse_pkt_frms(struct quic_conn *qc, struct quic_rx_packet *pkt,
 				}
 				else {
 					TRACE_DEVEL("No mux for new stream", QUIC_EV_CONN_PRSHPKT, qc);
-					if (qc->app_ops == &h3_ops && quic_stream_is_uni(stream->id)) {
-						/* Do not send STOP_SENDING frames for h3 unidirectional streams.
-						 * TODO: this test should be removed when the connection closure
-						 * will be more clean.
-						 * At quic_conn level there is no mean to know that an application
-						 * want to forbid stream closure requests to receivers. This is the
-						 * case for the Control and QPACK h3 unidirectional streams.
-						 */
+					if (qc->app_ops == &h3_ops) {
+						if (!qc_h3_request_reject(qc, stream->id)) {
+							TRACE_ERROR("error on request rejection", QUIC_EV_CONN_PRSHPKT, qc);
+							/* This packet will not be acknowledged */
+							goto leave;
+						}
+					}
+					else {
+						/* This packet will not be acknowledged */
 						goto leave;
 					}
-
-					if (!qc_stop_sending_frm_enqueue(qc, stream->id))
-						TRACE_ERROR("could not enqueue STOP_SENDING frame", QUIC_EV_CONN_PRSHPKT, qc);
-					/* This packet will not be acknowledged */
-					goto leave;
 				}
 			}
 
@@ -3014,8 +3032,8 @@ static int qc_parse_pkt_frms(struct quic_conn *qc, struct quic_rx_packet *pkt,
 				 * Rearm the idle timeout only one time when entering draining
 				 * state.
 				 */
-				qc_idle_timer_do_rearm(qc);
 				qc->flags |= QUIC_FL_CONN_DRAINING|QUIC_FL_CONN_IMMEDIATE_CLOSE;
+				qc_idle_timer_do_rearm(qc);
 				qc_notify_close(qc);
 			}
 			break;
@@ -3094,6 +3112,8 @@ static void qc_txb_release(struct quic_conn *qc)
 	/* For the moment sending function is responsible to purge the buffer
 	 * entirely. It may change in the future but this requires to be able
 	 * to reuse old data.
+	 * For the momemt we do not care to leave data in the buffer for
+	 * a connection which is supposed to be killed asap.
 	 */
 	BUG_ON_HOT(buf && b_data(buf));
 
@@ -3426,9 +3446,11 @@ static int qc_prep_pkts(struct quic_conn *qc, struct buffer *buf,
 
 /* Send datagrams stored in <buf>.
  *
- * This function always returns 1 for success. Even if sendto() syscall failed,
- * buffer is drained and packets are considered as emitted. QUIC loss detection
- * mechanism is used as a back door way to retry sending.
+ * This function returns 1 for success. Even if sendto() syscall failed,
+ * buffer is drained and packets are considered as emitted and this function returns 1
+ * There is a unique exception when sendto() fails with ECONNREFUSED as errno,
+ * this function returns 0.
+ * QUIC loss detection mechanism is used as a back door way to retry sending.
  */
 int qc_send_ppkts(struct buffer *buf, struct ssl_sock_ctx *ctx)
 {
@@ -3476,6 +3498,7 @@ int qc_send_ppkts(struct buffer *buf, struct ssl_sock_ctx *ctx)
 					/* Let's kill this connection asap. */
 					TRACE_PROTO("UDP port unreachable", QUIC_EV_CONN_SPPKTS, qc);
 					qc_kill_conn(qc);
+					b_del(buf, buf->data);
 					goto leave;
 				}
 
@@ -5004,6 +5027,12 @@ static struct quic_conn *qc_new_conn(const struct quic_version *qv, int ipv4,
 	    is_addr(local_addr)) {
 		TRACE_USER("Allocate a socket for QUIC connection", QUIC_EV_CONN_INIT, qc);
 		qc_alloc_fd(qc, local_addr, peer_addr);
+
+		/* haproxy soft-stop is supported only for QUIC connections
+		 * with their owned socket.
+		 */
+		if (qc_test_fd(qc))
+			_HA_ATOMIC_INC(&jobs);
 	}
 
 	/* insert the allocated CID in the receiver datagram handler tree */
@@ -5126,6 +5155,9 @@ void quic_conn_release(struct quic_conn *qc)
 	/* We must not free the quic-conn if the MUX is still allocated. */
 	BUG_ON(qc->mux_state == QC_MUX_READY);
 
+	if (qc_test_fd(qc))
+		_HA_ATOMIC_DEC(&jobs);
+
 	/* Close quic-conn socket fd. */
 	qc_release_fd(qc, 0);
 
@@ -5217,6 +5249,7 @@ void quic_conn_release(struct quic_conn *qc)
 
 	pool_free(pool_head_quic_conn_rxbuf, qc->rx.buf.area);
 	pool_free(pool_head_quic_conn, qc);
+
 	TRACE_PROTO("QUIC conn. freed", QUIC_EV_CONN_FREED, qc);
 
 	TRACE_LEAVE(QUIC_EV_CONN_CLOSE, qc);
@@ -5252,9 +5285,15 @@ static void qc_idle_timer_do_rearm(struct quic_conn *qc)
 {
 	unsigned int expire;
 
-	expire = QUIC_MAX(3 * quic_pto(qc), qc->max_idle_timeout);
-	qc->idle_timer_task->expire = tick_add(now_ms, MS_TO_TICKS(expire));
-	task_queue(qc->idle_timer_task);
+	if (stopping && qc->flags & (QUIC_FL_CONN_CLOSING|QUIC_FL_CONN_DRAINING)) {
+		TRACE_STATE("executing idle timer immediately on stopping", QUIC_EV_CONN_IDLE_TIMER, qc);
+		task_wakeup(qc->idle_timer_task, TASK_WOKEN_MSG);
+	}
+	else {
+		expire = QUIC_MAX(3 * quic_pto(qc), qc->max_idle_timeout);
+		qc->idle_timer_task->expire = tick_add(now_ms, MS_TO_TICKS(expire));
+		task_queue(qc->idle_timer_task);
+	}
 }
 
 /* Rearm the idle timer for <qc> QUIC connection depending on <read> boolean
@@ -6519,6 +6558,7 @@ static int qc_handle_conn_migration(struct quic_conn *qc,
 		/* TODO try to reuse socket instead of closing it and opening a new one. */
 		TRACE_STATE("Connection migration detected, allocate a new connection socket", QUIC_EV_CONN_LPKT, qc);
 		qc_release_fd(qc, 1);
+		/* TODO need to adjust <jobs> on socket allocation failure. */
 		qc_alloc_fd(qc, local_addr, peer_addr);
 	}
 

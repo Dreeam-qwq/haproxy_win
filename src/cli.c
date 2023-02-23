@@ -1183,7 +1183,6 @@ static void cli_io_handler(struct appctx *appctx)
 		 * on the response buffer.
 		 */
 		sc_shutr(sc);
-		res->flags |= CF_READ_EVENT;
 	}
 
  out:
@@ -1597,7 +1596,7 @@ static int cli_parse_set_timeout(char **args, char *payload, struct appctx *appc
 		if (res || timeout < 1)
 			return cli_err(appctx, "Invalid timeout value.\n");
 
-		s->req.rto = s->res.wto = 1 + MS_TO_TICKS(timeout*1000);
+		s->scf->ioto = 1 + MS_TO_TICKS(timeout*1000);
 		task_wakeup(s->task, TASK_WOKEN_MSG); // recompute timeouts
 		return 1;
 	}
@@ -2667,7 +2666,7 @@ int pcli_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 	struct proxy *fe = strm_fe(s);
 	struct proxy *be = s->be;
 
-	if ((rep->flags & (CF_READ_ERROR|CF_READ_TIMEOUT|CF_WRITE_ERROR|CF_WRITE_TIMEOUT)) ||
+	if (sc_ep_test(s->scb, SE_FL_ERR_PENDING|SE_FL_ERROR) || (rep->flags & (CF_READ_TIMEOUT|CF_WRITE_TIMEOUT)) ||
 	    ((rep->flags & CF_SHUTW) && (rep->to_forward || co_data(rep)))) {
 		pcli_reply_and_close(s, "Can't connect to the target CLI!\n");
 		s->req.analysers &= ~AN_REQ_WAIT_CLI;
@@ -2783,8 +2782,8 @@ int pcli_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 
 		sc_set_state(s->scb, SC_ST_INI);
 		s->scb->flags &= SC_FL_ISBACK | SC_FL_DONT_WAKE; /* we're in the context of process_stream */
-		s->req.flags &= ~(CF_SHUTW|CF_SHUTW_NOW|CF_AUTO_CONNECT|CF_WRITE_ERROR|CF_STREAMER|CF_STREAMER_FAST|CF_NEVER_WAIT|CF_WROTE_DATA);
-		s->res.flags &= ~(CF_SHUTR|CF_SHUTR_NOW|CF_READ_ERROR|CF_READ_NOEXP|CF_STREAMER|CF_STREAMER_FAST|CF_WRITE_EVENT|CF_NEVER_WAIT|CF_WROTE_DATA|CF_READ_EVENT);
+		s->req.flags &= ~(CF_SHUTW|CF_SHUTW_NOW|CF_AUTO_CONNECT|CF_STREAMER|CF_STREAMER_FAST|CF_NEVER_WAIT|CF_WROTE_DATA);
+		s->res.flags &= ~(CF_SHUTR|CF_SHUTR_NOW|CF_STREAMER|CF_STREAMER_FAST|CF_WRITE_EVENT|CF_NEVER_WAIT|CF_WROTE_DATA|CF_READ_EVENT);
 		s->flags &= ~(SF_DIRECT|SF_ASSIGNED|SF_BE_ASSIGNED|SF_FORCE_PRST|SF_IGNORE_PRST);
 		s->flags &= ~(SF_CURR_SESS|SF_REDIRECTABLE|SF_SRV_REUSED);
 		s->flags &= ~(SF_ERR_MASK|SF_FINST_MASK|SF_REDISP);
@@ -2825,19 +2824,11 @@ int pcli_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 		/* Now we can realign the response buffer */
 		c_realign_if_empty(&s->res);
 
-		s->req.rto = strm_fe(s)->timeout.client;
-		s->req.wto = TICK_ETERNITY;
+		s->scf->ioto = strm_fe(s)->timeout.client;
+		s->scb->ioto = TICK_ETERNITY;
 
-		s->res.rto = TICK_ETERNITY;
-		s->res.wto = strm_fe(s)->timeout.client;
-
-		s->req.rex = TICK_ETERNITY;
-		s->req.wex = TICK_ETERNITY;
 		s->req.analyse_exp = TICK_ETERNITY;
-		s->res.rex = TICK_ETERNITY;
-		s->res.wex = TICK_ETERNITY;
 		s->res.analyse_exp = TICK_ETERNITY;
-		s->scb->hcto = TICK_ETERNITY;
 
 		/* we're removing the analysers, we MUST re-enable events detection.
 		 * We don't enable close on the response channel since it's either

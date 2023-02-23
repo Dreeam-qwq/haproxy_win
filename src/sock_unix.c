@@ -93,7 +93,21 @@ int sock_unix_addrcmp(const struct sockaddr_storage *a, const struct sockaddr_st
 
 	/* Now we have a difference. It's OK if they are within or after a
 	 * sequence of digits following a dot, and are followed by ".tmp".
+	 *
+	 * make sure to perform the check against tempname if the compared
+	 * string is in "final" format (does not end with ".XXXX.tmp").
+	 *
+	 * Examples:
+	 *     /tmp/test matches with /tmp/test.1822.tmp
+	 *     /tmp/test.1822.tmp matches with /tmp/test.XXXX.tmp
 	 */
+	if (au->sun_path[idx] == 0 || bu->sun_path[idx] == 0) {
+		if (au->sun_path[idx] == '.' || bu->sun_path[idx] == '.')
+			dot = idx; /* try to match against temp path */
+		else
+			return -1; /* invalid temp path */
+	}
+
 	if (!dot)
 		return -1;
 
@@ -323,8 +337,13 @@ int sock_unix_bind_receiver(struct receiver *rx, char **errmsg)
 		unlink(backname);
  bind_return:
 	if (errmsg && *errmsg) {
-		if (!ext)
-			memprintf(errmsg, "%s [%s]", *errmsg, path);
+		if (!ext) {
+			char *path_str;
+
+			path_str = sa2str((struct sockaddr_storage *)&rx->addr, 0, 0);
+			memprintf(errmsg, "%s [%s]", *errmsg, ((path_str) ? path_str : ""));
+			ha_free(&path_str);
+		}
 		else
 			memprintf(errmsg, "%s [fd %d]", *errmsg, fd);
 	}

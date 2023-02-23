@@ -14,6 +14,7 @@
 #include <haproxy/qmux_trace.h>
 #include <haproxy/quic_conn.h>
 #include <haproxy/quic_frame.h>
+#include <haproxy/quic_sock.h>
 #include <haproxy/quic_stream.h>
 #include <haproxy/quic_tp-t.h>
 #include <haproxy/ssl_sock-t.h>
@@ -135,13 +136,6 @@ static struct qcs *qcs_new(struct qcc *qcc, uint64_t id, enum qcs_type type)
 		}
 	}
 
-	if (qcc->app_ops->attach) {
-		if (qcc->app_ops->attach(qcs, qcc->ctx)) {
-			TRACE_ERROR("app proto failure", QMUX_EV_QCS_NEW, qcc->conn, qcs);
-			goto err;
-		}
-	}
-
 	/* If stream is local, use peer remote-limit, or else the opposite. */
 	if (quic_stream_is_bidi(id)) {
 		qcs->tx.msd = quic_stream_is_local(qcc, id) ? qcc->rfctl.msd_bidi_r :
@@ -173,6 +167,11 @@ static struct qcs *qcs_new(struct qcc *qcc, uint64_t id, enum qcs_type type)
 	qcs->subs = NULL;
 
 	qcs->err = 0;
+
+	if (qcc->app_ops->attach && qcc->app_ops->attach(qcs, qcc->ctx)) {
+		TRACE_ERROR("app proto failure", QMUX_EV_QCS_NEW, qcc->conn, qcs);
+		goto err;
+	}
 
  out:
 	TRACE_LEAVE(QMUX_EV_QCS_NEW, qcc->conn, qcs);
@@ -260,26 +259,25 @@ static void qcc_refresh_timeout(struct qcc *qcc)
 		goto leave;
 	}
 
-	/* TODO if connection is idle on frontend and proxy is disabled, remove
-	 * it with global close_spread delay applied.
-	 */
-
-	/* TODO implement client/server-fin timeout for graceful shutdown */
-
 	/* Frontend timeout management
+	 * - shutdown done -> timeout client-fin
 	 * - detached streams with data left to send -> default timeout
 	 * - stream waiting on incomplete request or no stream yet activated -> timeout http-request
 	 * - idle after stream processing -> timeout http-keep-alive
+	 *
+	 * If proxy stop-stop in progress, immediate or spread close will be
+	 * processed if shutdown already one or connection is idle.
 	 */
 	if (!conn_is_back(qcc->conn)) {
-		if (qcc->nb_hreq) {
+		if (qcc->nb_hreq && !(qcc->flags & QC_CF_APP_SHUT)) {
 			TRACE_DEVEL("one or more requests still in progress", QMUX_EV_QCC_WAKE, qcc->conn);
 			qcc->task->expire = tick_add_ifset(now_ms, qcc->timeout);
 			task_queue(qcc->task);
 			goto leave;
 		}
 
-		if (!LIST_ISEMPTY(&qcc->opening_list) || unlikely(!qcc->largest_bidi_r)) {
+		if ((!LIST_ISEMPTY(&qcc->opening_list) || unlikely(!qcc->largest_bidi_r)) &&
+		    !(qcc->flags & QC_CF_APP_SHUT)) {
 			int timeout = px->timeout.httpreq;
 			struct qcs *qcs = NULL;
 			int base_time;
@@ -295,12 +293,53 @@ static void qcc_refresh_timeout(struct qcc *qcc)
 			qcc->task->expire = tick_add_ifset(base_time, timeout);
 		}
 		else {
-			/* Use http-request timeout if keep-alive timeout not set */
-			int timeout = tick_isset(px->timeout.httpka) ?
-			                px->timeout.httpka : px->timeout.httpreq;
+			if (qcc->flags & QC_CF_APP_SHUT) {
+				TRACE_DEVEL("connection in closing", QMUX_EV_QCC_WAKE, qcc->conn);
+				qcc->task->expire = tick_add_ifset(now_ms,
+				                                   qcc->shut_timeout);
+			}
+			else {
+				/* Use http-request timeout if keep-alive timeout not set */
+				int timeout = tick_isset(px->timeout.httpka) ?
+				              px->timeout.httpka : px->timeout.httpreq;
+				TRACE_DEVEL("at least one request achieved but none currently in progress", QMUX_EV_QCC_WAKE, qcc->conn);
+				qcc->task->expire = tick_add_ifset(qcc->idle_start, timeout);
+			}
 
-			TRACE_DEVEL("at least one request achieved but none currently in progress", QMUX_EV_QCC_WAKE, qcc->conn);
-			qcc->task->expire = tick_add_ifset(qcc->idle_start, timeout);
+			/* If proxy soft-stop in progress and connection is
+			 * inactive, close the connection immediately. If a
+			 * close-spread-time is configured, randomly spread the
+			 * timer over a closing window.
+			 */
+			if ((qcc->proxy->flags & (PR_FL_DISABLED|PR_FL_STOPPED)) &&
+			    !(global.tune.options & GTUNE_DISABLE_ACTIVE_CLOSE)) {
+
+				/* Wake timeout task immediately if window already expired. */
+				int remaining_window = tick_isset(global.close_spread_end) ?
+				  tick_remain(now_ms, global.close_spread_end) : 0;
+
+				TRACE_DEVEL("proxy disabled, prepare connection soft-stop", QMUX_EV_QCC_WAKE, qcc->conn);
+				if (remaining_window) {
+					/* We don't need to reset the expire if it would
+					 * already happen before the close window end.
+					 */
+					if (!tick_isset(qcc->task->expire) ||
+					    tick_is_le(global.close_spread_end, qcc->task->expire)) {
+						/* Set an expire value shorter than the current value
+						 * because the close spread window end comes earlier.
+						 */
+						qcc->task->expire = tick_add(now_ms,
+						                             statistical_prng_range(remaining_window));
+					}
+				}
+				else {
+					/* We are past the soft close window end, wake the timeout
+					 * task up immediately.
+					 */
+					qcc->task->expire = now_ms;
+					task_wakeup(qcc->task, TASK_WOKEN_TIMER);
+				}
+			}
 		}
 	}
 
@@ -1928,6 +1967,87 @@ static int qc_purge_streams(struct qcc *qcc)
 	return release;
 }
 
+/* Execute application layer shutdown. If this operation is not defined, a
+ * CONNECTION_CLOSE will be prepared as a fallback. This function is protected
+ * against multiple invocation with the flag QC_CF_APP_SHUT.
+ */
+static void qc_shutdown(struct qcc *qcc)
+{
+	TRACE_ENTER(QMUX_EV_QCC_END, qcc->conn);
+
+	if (qcc->flags & QC_CF_APP_SHUT)
+		goto out;
+
+	if (qcc->app_ops && qcc->app_ops->shutdown) {
+		qcc->app_ops->shutdown(qcc->ctx);
+		qc_send(qcc);
+	}
+	else {
+		qcc_emit_cc_app(qcc, QC_ERR_NO_ERROR, 0);
+	}
+
+ out:
+	qcc->flags |= QC_CF_APP_SHUT;
+	TRACE_LEAVE(QMUX_EV_QCC_END, qcc->conn);
+}
+
+/* Conduct operations which should be made for <qcc> connection after
+ * input/output. Most notably, closed streams are purged which may leave the
+ * connection has ready to be released.
+ *
+ * Returns 1 if <qcc> must be released else 0.
+ */
+
+static int qc_process(struct qcc *qcc)
+{
+	qc_purge_streams(qcc);
+
+	/* Check if a soft-stop is in progress.
+	 *
+	 * TODO this is relevant for frontend connections only.
+	 */
+	if (unlikely(qcc->proxy->flags & (PR_FL_DISABLED|PR_FL_STOPPED))) {
+		int close = 1;
+
+		/* If using listener socket, soft-stop is not supported. The
+		 * connection must be closed immediately.
+		 */
+		if (!qc_test_fd(qcc->conn->handle.qc)) {
+			TRACE_DEVEL("proxy disabled with listener socket, closing connection", QMUX_EV_QCC_WAKE, qcc->conn);
+			qcc->conn->flags |= (CO_FL_SOCK_RD_SH|CO_FL_SOCK_WR_SH);
+			qc_send(qcc);
+			goto out;
+		}
+
+		TRACE_DEVEL("proxy disabled, prepare connection soft-stop", QMUX_EV_QCC_WAKE, qcc->conn);
+
+		/* If a close-spread-time option is set, we want to avoid
+		 * closing all the active HTTP3 connections at once so we add a
+		 * random factor that will spread the closing.
+		 */
+		if (tick_isset(global.close_spread_end)) {
+			int remaining_window = tick_remain(now_ms, global.close_spread_end);
+			if (remaining_window) {
+				/* This should increase the closing rate the
+				 * further along the window we are. */
+				close = (remaining_window <= statistical_prng_range(global.close_spread_time));
+			}
+		}
+		else if (global.tune.options & GTUNE_DISABLE_ACTIVE_CLOSE) {
+			close = 0; /* let the client close his connection himself */
+		}
+
+		if (close)
+			qc_shutdown(qcc);
+	}
+
+ out:
+	if (qcc_is_dead(qcc))
+		return 1;
+
+	return 0;
+}
+
 /* release function. This one should be called to free all resources allocated
  * to the mux.
  */
@@ -1938,20 +2058,7 @@ static void qc_release(struct qcc *qcc)
 
 	TRACE_ENTER(QMUX_EV_QCC_END, conn);
 
-	if (qcc->app_ops && qcc->app_ops->shutdown) {
-		/* Application protocol with dedicated connection closing
-		 * procedure.
-		 */
-		qcc->app_ops->shutdown(qcc->ctx);
-
-		/* useful if application protocol should emit some closing
-		 * frames. For example HTTP/3 GOAWAY frame.
-		 */
-		qc_send(qcc);
-	}
-	else {
-		qcc_emit_cc_app(qcc, QC_ERR_NO_ERROR, 0);
-	}
+	qc_shutdown(qcc);
 
 	if (qcc->task) {
 		task_destroy(qcc->task);
@@ -2012,18 +2119,12 @@ struct task *qc_io_cb(struct task *t, void *ctx, unsigned int status)
 
 	qc_send(qcc);
 
-	if (qc_purge_streams(qcc)) {
-		if (qcc_is_dead(qcc)) {
-			TRACE_STATE("releasing dead connection", QMUX_EV_QCC_WAKE, qcc->conn);
-			goto release;
-		}
-	}
-
 	qc_recv(qcc);
 
-	/* TODO check if qcc proxy is disabled. If yes, use graceful shutdown
-	 * to close the connection.
-	 */
+	if (qc_process(qcc)) {
+		TRACE_STATE("releasing dead connection", QMUX_EV_QCC_WAKE, qcc->conn);
+		goto release;
+	}
 
 	qcc_refresh_timeout(qcc);
 
@@ -2181,8 +2282,17 @@ static int qc_init(struct connection *conn, struct proxy *prx,
 	qcc->proxy = prx;
 	/* haproxy timeouts */
 	qcc->task = NULL;
-	qcc->timeout = conn_is_back(qcc->conn) ? prx->timeout.server :
-	                                         prx->timeout.client;
+	if (conn_is_back(qcc->conn)) {
+		qcc->timeout = prx->timeout.server;
+		qcc->shut_timeout = tick_isset(prx->timeout.serverfin) ?
+		                    prx->timeout.serverfin : prx->timeout.server;
+	}
+	else {
+		qcc->timeout = prx->timeout.client;
+		qcc->shut_timeout = tick_isset(prx->timeout.clientfin) ?
+		                    prx->timeout.clientfin : prx->timeout.client;
+	}
+
 	if (tick_isset(qcc->timeout)) {
 		qcc->task = task_new_here();
 		if (!qcc->task) {
@@ -2422,30 +2532,20 @@ static int qc_wake_some_streams(struct qcc *qcc)
 static int qc_wake(struct connection *conn)
 {
 	struct qcc *qcc = conn->ctx;
-	struct proxy *prx = conn->handle.qc->li->bind_conf->frontend;
 
 	TRACE_ENTER(QMUX_EV_QCC_WAKE, conn);
-
-	/* Check if a soft-stop is in progress.
-	 *
-	 * TODO this is relevant for frontend connections only.
-	 *
-	 * TODO Client should be notified with a H3 GOAWAY and then a
-	 * CONNECTION_CLOSE. However, quic-conn uses the listener socket for
-	 * sending which at this stage is already closed.
-	 */
-	if (unlikely(prx->flags & (PR_FL_DISABLED|PR_FL_STOPPED)))
-		qcc->conn->flags |= (CO_FL_SOCK_RD_SH|CO_FL_SOCK_WR_SH);
 
 	if (conn->handle.qc->flags & QUIC_FL_CONN_NOTIFY_CLOSE)
 		qcc->conn->flags |= (CO_FL_SOCK_RD_SH|CO_FL_SOCK_WR_SH);
 
 	qc_send(qcc);
 
-	qc_wake_some_streams(qcc);
-
-	if (qcc_is_dead(qcc))
+	if (qc_process(qcc)) {
+		TRACE_STATE("releasing dead connection", QMUX_EV_QCC_WAKE, qcc->conn);
 		goto release;
+	}
+
+	qc_wake_some_streams(qcc);
 
 	qcc_refresh_timeout(qcc);
 
@@ -2453,7 +2553,6 @@ static int qc_wake(struct connection *conn)
 	return 0;
 
  release:
-	TRACE_STATE("releasing dead connection", QMUX_EV_QCC_WAKE, qcc->conn);
 	qc_release(qcc);
 	TRACE_LEAVE(QMUX_EV_QCC_WAKE);
 	return 1;

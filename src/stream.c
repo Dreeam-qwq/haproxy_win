@@ -199,17 +199,22 @@ static void strm_trace(enum trace_level level, uint64_t mask, const struct trace
 				      HTX_SL_P3_LEN(sl), HTX_SL_P3_PTR(sl));
 	}
 
+		chunk_appendf(&trace_buf, " - t=%p t.exp=%d s=(%p,0x%08x,0x%x)",
+			      task, tick_isset(task->expire) ? TICKS_TO_MS(task->expire - now_ms) : TICK_ETERNITY, s, s->flags, s->conn_err_type);
 
 	/* If txn defined info about HTTP msgs, otherwise info about SI. */
 	if (txn) {
-		chunk_appendf(&trace_buf, " - t=%p s=(%p,0x%08x,0x%x) txn.flags=0x%08x, http.flags=(0x%08x,0x%08x) status=%d",
-			      task, s, s->flags, s->conn_err_type, txn->flags, txn->req.flags, txn->rsp.flags, txn->status);
+		chunk_appendf(&trace_buf, " txn.flags=0x%08x, http.flags=(0x%08x,0x%08x) status=%d",
+			      txn->flags, txn->req.flags, txn->rsp.flags, txn->status);
 	}
 	else {
-		chunk_appendf(&trace_buf, " - t=%p s=(%p,0x%08x,0x%x) scf=(%p,%d,0x%08x) scb=(%p,%d,0x%08x) retries=%d",
-			      task, s, s->flags, s->conn_err_type,
-			      s->scf, s->scf->state, s->scf->flags,
-			      s->scb, s->scb->state, s->scb->flags,
+		chunk_appendf(&trace_buf, " scf=(%p,%d,0x%08x,0x%x) scb=(%p,%d,0x%08x,0x%x) scf.exp(r,w)=(%d,%d) scb.exp(r,w)=(%d,%d) retries=%d",
+			      s->scf, s->scf->state, s->scf->flags, s->scf->sedesc->flags,
+			      s->scb, s->scb->state, s->scb->flags, s->scb->sedesc->flags,
+			      tick_isset(sc_ep_rcv_ex(s->scf)) ? TICKS_TO_MS(sc_ep_rcv_ex(s->scf) - now_ms) : TICK_ETERNITY,
+			      tick_isset(sc_ep_snd_ex(s->scf)) ? TICKS_TO_MS(sc_ep_snd_ex(s->scf) - now_ms) : TICK_ETERNITY,
+			      tick_isset(sc_ep_rcv_ex(s->scb)) ? TICKS_TO_MS(sc_ep_rcv_ex(s->scb) - now_ms) : TICK_ETERNITY,
+			      tick_isset(sc_ep_snd_ex(s->scb)) ? TICKS_TO_MS(sc_ep_snd_ex(s->scb) - now_ms) : TICK_ETERNITY,
 			      s->conn_retries);
 	}
 
@@ -219,17 +224,17 @@ static void strm_trace(enum trace_level level, uint64_t mask, const struct trace
 
 	/* If txn defined, don't display all channel info */
 	if (src->verbosity == STRM_VERB_SIMPLE || txn) {
-		chunk_appendf(&trace_buf, " req=(%p .fl=0x%08x .exp(r,w,a)=(%u,%u,%u))",
-			      req, req->flags, req->rex, req->wex, req->analyse_exp);
-		chunk_appendf(&trace_buf, " res=(%p .fl=0x%08x .exp(r,w,a)=(%u,%u,%u))",
-			      res, res->flags, res->rex, res->wex, res->analyse_exp);
+		chunk_appendf(&trace_buf, " req=(%p .fl=0x%08x .exp=%d)",
+			      req, req->flags, tick_isset(req->analyse_exp) ? TICKS_TO_MS(req->analyse_exp - now_ms) : TICK_ETERNITY);
+		chunk_appendf(&trace_buf, " res=(%p .fl=0x%08x .exp=%d)",
+			      res, res->flags, tick_isset(res->analyse_exp) ? TICKS_TO_MS(res->analyse_exp - now_ms) : TICK_ETERNITY);
 	}
 	else {
-		chunk_appendf(&trace_buf, " req=(%p .fl=0x%08x .ana=0x%08x .exp(r,w,a)=(%u,%u,%u) .o=%lu .tot=%llu .to_fwd=%u)",
-			      req, req->flags, req->analysers, req->rex, req->wex, req->analyse_exp,
+		chunk_appendf(&trace_buf, " req=(%p .fl=0x%08x .ana=0x%08x .exp=%u .o=%lu .tot=%llu .to_fwd=%u)",
+			      req, req->flags, req->analysers, req->analyse_exp,
 			      (long)req->output, req->total, req->to_forward);
-		chunk_appendf(&trace_buf, " res=(%p .fl=0x%08x .ana=0x%08x .exp(r,w,a)=(%u,%u,%u) .o=%lu .tot=%llu .to_fwd=%u)",
-			      res, res->flags, res->analysers, res->rex, res->wex, res->analyse_exp,
+		chunk_appendf(&trace_buf, " res=(%p .fl=0x%08x .ana=0x%08x .exp=%u .o=%lu .tot=%llu .to_fwd=%u)",
+			      res, res->flags, res->analysers, res->analyse_exp,
 			      (long)res->output, res->total, res->to_forward);
 	}
 
@@ -294,6 +299,7 @@ int stream_upgrade_from_sc(struct stconn *sc, struct buffer *input)
 		s->req.buf = *input;
 		*input = BUF_NULL;
 		s->req.total = (IS_HTX_STRM(s) ? htxbuf(&s->req.buf)->data : b_data(&s->req.buf));
+		sc_ep_report_read_activity(s->scf);
 	}
 
 	s->req.flags |= CF_READ_EVENT; /* Always report a read event */
@@ -472,12 +478,10 @@ struct stream *stream_new(struct session *sess, struct stconn *sc, struct buffer
 		goto out_fail_alloc_scb;
 
 	sc_set_state(s->scf, SC_ST_EST);
-	s->scf->hcto = sess->fe->timeout.clientfin;
 
 	if (likely(sess->fe->options2 & PR_O2_INDEPSTR))
 		s->scf->flags |= SC_FL_INDEP_STR;
 
-	s->scb->hcto = TICK_ETERNITY;
 	if (likely(sess->fe->options2 & PR_O2_INDEPSTR))
 		s->scb->flags |= SC_FL_INDEP_STR;
 
@@ -517,10 +521,7 @@ struct stream *stream_new(struct session *sess, struct stconn *sc, struct buffer
 		channel_auto_close(&s->req);    /* let the producer forward close requests */
 	}
 
-	s->req.rto = sess->fe->timeout.client;
-	s->req.wto = TICK_ETERNITY;
-	s->req.rex = TICK_ETERNITY;
-	s->req.wex = TICK_ETERNITY;
+	s->scf->ioto = sess->fe->timeout.client;
 	s->req.analyse_exp = TICK_ETERNITY;
 
 	channel_init(&s->res);
@@ -532,10 +533,7 @@ struct stream *stream_new(struct session *sess, struct stconn *sc, struct buffer
 		s->res.flags |= CF_NEVER_WAIT;
 	}
 
-	s->res.wto = sess->fe->timeout.client;
-	s->res.rto = TICK_ETERNITY;
-	s->res.rex = TICK_ETERNITY;
-	s->res.wex = TICK_ETERNITY;
+	s->scb->ioto = TICK_ETERNITY;
 	s->res.analyse_exp = TICK_ETERNITY;
 
 	s->txn = NULL;
@@ -567,6 +565,7 @@ struct stream *stream_new(struct session *sess, struct stconn *sc, struct buffer
 		s->req.buf = *input;
 		*input = BUF_NULL;
 		s->req.total = (IS_HTX_STRM(s) ? htxbuf(&s->req.buf)->data : b_data(&s->req.buf));
+		sc_ep_report_read_activity(s->scf);
 	}
 
 	/* it is important not to call the wakeup function directly but to
@@ -854,7 +853,6 @@ void stream_retnclose(struct stream *s, const struct buffer *msg)
 	if (likely(msg && msg->data))
 		co_inject(oc, msg->area, msg->data);
 
-	oc->wex = tick_add_ifset(now_ms, oc->wto);
 	channel_auto_read(oc);
 	channel_auto_close(oc);
 	channel_shutr_now(oc);
@@ -864,8 +862,7 @@ int stream_set_timeout(struct stream *s, enum act_timeout_name name, int timeout
 {
 	switch (name) {
 	case ACT_TIMEOUT_SERVER:
-		s->req.wto = timeout;
-		s->res.rto = timeout;
+		s->scb->ioto = timeout;
 		return 1;
 
 	case ACT_TIMEOUT_TUNNEL:
@@ -905,14 +902,8 @@ static void back_establish(struct stream *s)
 
 	/* errors faced after sending data need to be reported */
 	if (sc_ep_test(s->scb, SE_FL_ERROR) && req->flags & CF_WROTE_DATA) {
-		/* Don't add CF_WRITE_ERROR if we're here because
-		 * early data were rejected by the server, or
-		 * http_wait_for_response() will never be called
-		 * to send a 425.
-		 */
-		if (conn && conn->err_code != CO_ER_SSL_EARLY_FAILED)
-			req->flags |= CF_WRITE_ERROR;
-		rep->flags |= CF_READ_ERROR;
+		s->req.flags |= CF_WRITE_EVENT;
+		s->res.flags |= CF_READ_EVENT;
 		s->conn_err_type = STRM_ET_DATA_ERR;
 		DBG_TRACE_STATE("read/write error", STRM_EV_STRM_PROC|STRM_EV_CS_ST|STRM_EV_STRM_ERR, s);
 	}
@@ -937,15 +928,14 @@ static void back_establish(struct stream *s)
 
 	se_have_more_data(s->scb->sedesc);
 	rep->flags |= CF_READ_EVENT; /* producer is now attached */
+	sc_ep_report_read_activity(s->scb);
 	if (conn) {
 		/* real connections have timeouts
 		 * if already defined, it means that a set-timeout rule has
 		 * been executed so do not overwrite them
 		 */
-		if (!tick_isset(req->wto))
-			req->wto = s->be->timeout.server;
-		if (!tick_isset(rep->rto))
-			rep->rto = s->be->timeout.server;
+		if (!tick_isset(s->scb->ioto))
+			s->scb->ioto = s->be->timeout.server;
 		if (!tick_isset(s->tunnel_timeout))
 			s->tunnel_timeout = s->be->timeout.tunnel;
 
@@ -956,7 +946,6 @@ static void back_establish(struct stream *s)
 		 */
 		sc_chk_rcv(s->scb);
 	}
-	req->wex = TICK_ETERNITY;
 	/* If we managed to get the whole response, and we don't have anything
 	 * left to send, or can't, switch to SC_ST_DIS now. */
 	if (rep->flags & (CF_SHUTR | CF_SHUTW)) {
@@ -1720,8 +1709,8 @@ struct task *process_stream(struct task *t, void *context, unsigned int state)
 		memset(&s->txn->auth, 0, sizeof(s->txn->auth));
 
 	/* This flag must explicitly be set every time */
-	req->flags &= ~(CF_READ_NOEXP|CF_WAKE_WRITE);
-	res->flags &= ~(CF_READ_NOEXP|CF_WAKE_WRITE);
+	req->flags &= ~CF_WAKE_WRITE;
+	res->flags &= ~CF_WAKE_WRITE;
 
 	/* Keep a copy of req/rep flags so that we can detect shutdowns */
 	rqf_last = req->flags & ~CF_MASK_ANALYSER;
@@ -1740,14 +1729,13 @@ struct task *process_stream(struct task *t, void *context, unsigned int state)
 	if (unlikely(s->pending_events & TASK_WOKEN_TIMER)) {
 		stream_check_conn_timeout(s);
 
-		/* check channel timeouts, and close the corresponding stream connectors
+		/* check SC and channel timeouts, and close the corresponding stream connectors
 		 * for future reads or writes. Note: this will also concern upper layers
 		 * but we do not touch any other flag. We must be careful and correctly
 		 * detect state changes when calling them.
 		 */
-
-		channel_check_timeouts(req);
-
+		sc_check_timeouts(scf);
+		channel_check_timeout(req);
 		if (unlikely((req->flags & (CF_SHUTW|CF_WRITE_TIMEOUT)) == CF_WRITE_TIMEOUT)) {
 			scb->flags |= SC_FL_NOLINGER;
 			sc_shutw(scb);
@@ -1759,8 +1747,8 @@ struct task *process_stream(struct task *t, void *context, unsigned int state)
 			sc_shutr(scf);
 		}
 
-		channel_check_timeouts(res);
-
+		sc_check_timeouts(scb);
+		channel_check_timeout(res);
 		if (unlikely((res->flags & (CF_SHUTW|CF_WRITE_TIMEOUT)) == CF_WRITE_TIMEOUT)) {
 			scf->flags |= SC_FL_NOLINGER;
 			sc_shutw(scf);
@@ -1826,7 +1814,7 @@ struct task *process_stream(struct task *t, void *context, unsigned int state)
 		if (sc_state_in(scf->state, SC_SB_EST|SC_SB_DIS)) {
 			sc_shutr(scf);
 			sc_shutw(scf);
-			sc_report_error(scf);
+			//sc_report_error(scf); TODO: Be sure it is useless
 			if (!(req->analysers) && !(res->analysers)) {
 				_HA_ATOMIC_INC(&s->be->be_counters.cli_aborts);
 				_HA_ATOMIC_INC(&sess->fe->fe_counters.cli_aborts);
@@ -1846,7 +1834,7 @@ struct task *process_stream(struct task *t, void *context, unsigned int state)
 		if (sc_state_in(scb->state, SC_SB_EST|SC_SB_DIS)) {
 			sc_shutr(scb);
 			sc_shutw(scb);
-			sc_report_error(scb);
+			//sc_report_error(scb); TODO: Be sure it is useless
 			_HA_ATOMIC_INC(&s->be->be_counters.failed_resp);
 			if (srv)
 				_HA_ATOMIC_INC(&srv->counters.failed_resp);
@@ -2131,10 +2119,10 @@ struct task *process_stream(struct task *t, void *context, unsigned int state)
 	 */
 	srv = objt_server(s->target);
 	if (unlikely(!(s->flags & SF_ERR_MASK))) {
-		if (req->flags & (CF_READ_ERROR|CF_READ_TIMEOUT|CF_WRITE_ERROR|CF_WRITE_TIMEOUT)) {
+		if (sc_ep_test(s->scf, SE_FL_ERROR) || req->flags & (CF_READ_TIMEOUT|CF_WRITE_TIMEOUT)) {
 			/* Report it if the client got an error or a read timeout expired */
 			req->analysers &= AN_REQ_FLT_END;
-			if (req->flags & CF_READ_ERROR) {
+			if (sc_ep_test(s->scf, SE_FL_ERROR)) {
 				_HA_ATOMIC_INC(&s->be->be_counters.cli_aborts);
 				_HA_ATOMIC_INC(&sess->fe->fe_counters.cli_aborts);
 				if (sess->listener && sess->listener->counters)
@@ -2151,15 +2139,6 @@ struct task *process_stream(struct task *t, void *context, unsigned int state)
 				if (srv)
 					_HA_ATOMIC_INC(&srv->counters.cli_aborts);
 				s->flags |= SF_ERR_CLITO;
-			}
-			else if (req->flags & CF_WRITE_ERROR) {
-				_HA_ATOMIC_INC(&s->be->be_counters.srv_aborts);
-				_HA_ATOMIC_INC(&sess->fe->fe_counters.srv_aborts);
-				if (sess->listener && sess->listener->counters)
-					_HA_ATOMIC_INC(&sess->listener->counters->srv_aborts);
-				if (srv)
-					_HA_ATOMIC_INC(&srv->counters.srv_aborts);
-				s->flags |= SF_ERR_SRVCL;
 			}
 			else {
 				_HA_ATOMIC_INC(&s->be->be_counters.srv_aborts);
@@ -2185,10 +2164,10 @@ struct task *process_stream(struct task *t, void *context, unsigned int state)
 					channel_erase(req);
 			}
 		}
-		else if (res->flags & (CF_READ_ERROR|CF_READ_TIMEOUT|CF_WRITE_ERROR|CF_WRITE_TIMEOUT)) {
+		else if (sc_ep_test(s->scb, SE_FL_ERROR) || res->flags & (CF_READ_TIMEOUT|CF_WRITE_TIMEOUT)) {
 			/* Report it if the server got an error or a read timeout expired */
 			res->analysers &= AN_RES_FLT_END;
-			if (res->flags & CF_READ_ERROR) {
+			if (sc_ep_test(s->scb, SE_FL_ERROR)) {
 				_HA_ATOMIC_INC(&s->be->be_counters.srv_aborts);
 				_HA_ATOMIC_INC(&sess->fe->fe_counters.srv_aborts);
 				if (sess->listener && sess->listener->counters)
@@ -2205,15 +2184,6 @@ struct task *process_stream(struct task *t, void *context, unsigned int state)
 				if (srv)
 					_HA_ATOMIC_INC(&srv->counters.srv_aborts);
 				s->flags |= SF_ERR_SRVTO;
-			}
-			else if (res->flags & CF_WRITE_ERROR) {
-				_HA_ATOMIC_INC(&s->be->be_counters.cli_aborts);
-				_HA_ATOMIC_INC(&sess->fe->fe_counters.cli_aborts);
-				if (sess->listener && sess->listener->counters)
-					_HA_ATOMIC_INC(&sess->listener->counters->cli_aborts);
-				if (srv)
-					_HA_ATOMIC_INC(&srv->counters.cli_aborts);
-				s->flags |= SF_ERR_CLICL;
 			}
 			else {
 				_HA_ATOMIC_INC(&s->be->be_counters.cli_aborts);
@@ -2258,7 +2228,7 @@ struct task *process_stream(struct task *t, void *context, unsigned int state)
 			 * to the consumer.
 			 */
 			co_set_data(req, htx->data);
-			if (!(global.tune.options & GTUNE_NO_FAST_FWD) && !(req->flags & (CF_SHUTR|CF_SHUTW_NOW)))
+			if ((global.tune.options & GTUNE_USE_FAST_FWD) && !(req->flags & (CF_SHUTR|CF_SHUTW_NOW)))
 				channel_htx_forward_forever(req, htx);
 		}
 		else {
@@ -2266,7 +2236,7 @@ struct task *process_stream(struct task *t, void *context, unsigned int state)
 			 * to the consumer (which might possibly not be connected yet).
 			 */
 			c_adv(req, ci_data(req));
-			if (!(global.tune.options & GTUNE_NO_FAST_FWD) && !(req->flags & (CF_SHUTR|CF_SHUTW_NOW)))
+			if ((global.tune.options & GTUNE_USE_FAST_FWD) && !(req->flags & (CF_SHUTR|CF_SHUTW_NOW)))
 				channel_forward_forever(req);
 		}
 	}
@@ -2376,7 +2346,7 @@ struct task *process_stream(struct task *t, void *context, unsigned int state)
 	/* shutdown(write) pending */
 	if (unlikely((req->flags & (CF_SHUTW|CF_SHUTW_NOW)) == CF_SHUTW_NOW &&
 		     channel_is_empty(req))) {
-		if (req->flags & CF_READ_ERROR)
+		if (sc_ep_test(s->scf, SE_FL_ERROR))
 			scb->flags |= SC_FL_NOLINGER;
 		sc_shutw(scb);
 	}
@@ -2429,7 +2399,7 @@ struct task *process_stream(struct task *t, void *context, unsigned int state)
 			 * to the consumer.
 			 */
 			co_set_data(res, htx->data);
-			if (!(global.tune.options & GTUNE_NO_FAST_FWD) && !(res->flags & (CF_SHUTR|CF_SHUTW_NOW)))
+			if ((global.tune.options & GTUNE_USE_FAST_FWD) && !(res->flags & (CF_SHUTR|CF_SHUTW_NOW)))
 				channel_htx_forward_forever(res, htx);
 		}
 		else {
@@ -2437,7 +2407,7 @@ struct task *process_stream(struct task *t, void *context, unsigned int state)
 			 * to the consumer.
 			 */
 			c_adv(res, ci_data(res));
-			if (!(global.tune.options & GTUNE_NO_FAST_FWD) && !(res->flags & (CF_SHUTR|CF_SHUTW_NOW)))
+			if ((global.tune.options & GTUNE_USE_FAST_FWD) && !(res->flags & (CF_SHUTR|CF_SHUTW_NOW)))
 				channel_forward_forever(res);
 		}
 
@@ -2446,22 +2416,12 @@ struct task *process_stream(struct task *t, void *context, unsigned int state)
 		 * the half-closed timeouts as well.
 		 */
 		if (!req->analysers && s->tunnel_timeout) {
-			req->rto = req->wto = res->rto = res->wto =
-				s->tunnel_timeout;
+			scf->ioto = scb->ioto = s->tunnel_timeout;
 
-			if ((req->flags & CF_SHUTR) && tick_isset(sess->fe->timeout.clientfin))
-				res->wto = sess->fe->timeout.clientfin;
-			if ((req->flags & CF_SHUTW) && tick_isset(s->be->timeout.serverfin))
-				res->rto = s->be->timeout.serverfin;
-			if ((res->flags & CF_SHUTR) && tick_isset(s->be->timeout.serverfin))
-				req->wto = s->be->timeout.serverfin;
-			if ((res->flags & CF_SHUTW) && tick_isset(sess->fe->timeout.clientfin))
-				req->rto = sess->fe->timeout.clientfin;
-
-			req->rex = tick_add(now_ms, req->rto);
-			req->wex = tick_add(now_ms, req->wto);
-			res->rex = tick_add(now_ms, res->rto);
-			res->wex = tick_add(now_ms, res->wto);
+			if ((req->flags & (CF_SHUTR|CF_SHUTW)) && tick_isset(sess->fe->timeout.clientfin))
+				scf->ioto = sess->fe->timeout.clientfin;
+			if ((req->flags & (CF_SHUTR|CF_SHUTW)) && tick_isset(s->be->timeout.serverfin))
+				scb->ioto = s->be->timeout.serverfin;
 		}
 	}
 
@@ -2544,28 +2504,22 @@ struct task *process_stream(struct task *t, void *context, unsigned int state)
 
 		stream_update_both_sc(s);
 
-		/* Trick: if a request is being waiting for the server to respond,
-		 * and if we know the server can timeout, we don't want the timeout
-		 * to expire on the client side first, but we're still interested
-		 * in passing data from the client to the server (eg: POST). Thus,
-		 * we can cancel the client's request timeout if the server's
-		 * request timeout is set and the server has not yet sent a response.
-		 */
-
-		if ((res->flags & (CF_AUTO_CLOSE|CF_SHUTR)) == 0 &&
-		    (tick_isset(req->wex) || tick_isset(res->rex))) {
-			req->flags |= CF_READ_NOEXP;
-			req->rex = TICK_ETERNITY;
-		}
-
 		/* Reset pending events now */
 		s->pending_events = 0;
 
 	update_exp_and_leave:
 		/* Note: please ensure that if you branch here you disable SC_FL_DONT_WAKE */
-		t->expire = tick_first((tick_is_expired(t->expire, now_ms) ? 0 : t->expire),
-				       tick_first(tick_first(req->rex, req->wex),
-						  tick_first(res->rex, res->wex)));
+		t->expire = (tick_is_expired(t->expire, now_ms) ? 0 : t->expire);
+
+		if (likely(sc_rcv_may_expire(scf)))
+			t->expire = tick_first(t->expire, sc_ep_rcv_ex(scf));
+		if (likely(sc_snd_may_expire(scf)))
+			t->expire = tick_first(t->expire, sc_ep_snd_ex(scf));
+		if (likely(sc_rcv_may_expire(scb)))
+			t->expire = tick_first(t->expire, sc_ep_rcv_ex(scb));
+		if (likely(sc_snd_may_expire(scb)))
+			t->expire = tick_first(t->expire, sc_ep_snd_ex(scb));
+
 		if (!req->analysers)
 			req->analyse_exp = TICK_ETERNITY;
 
@@ -2578,6 +2532,8 @@ struct task *process_stream(struct task *t, void *context, unsigned int state)
 		t->expire = tick_first(t->expire, res->analyse_exp);
 
 		t->expire = tick_first(t->expire, s->conn_exp);
+
+		BUG_ON(tick_is_expired(t->expire, now_ms));
 
 		s->pending_events &= ~(TASK_WOKEN_TIMER | TASK_WOKEN_RES);
 		stream_release_buffers(s);
@@ -3389,10 +3345,14 @@ static int stats_dump_full_strm_to_buffer(struct stconn *sc, struct stream *strm
 			      strm->txn->req.flags, strm->txn->rsp.flags);
 
 		scf = strm->scf;
-		chunk_appendf(&trash, "  scf=%p flags=0x%08x state=%s endp=%s,%p,0x%08x sub=%d\n",
+		chunk_appendf(&trash, "  scf=%p flags=0x%08x state=%s endp=%s,%p,0x%08x sub=%d",
 			      scf, scf->flags, sc_state_str(scf->state),
 			      (sc_ep_test(scf, SE_FL_T_MUX) ? "CONN" : (sc_ep_test(scf, SE_FL_T_APPLET) ? "APPCTX" : "NONE")),
 			      scf->sedesc->se, sc_ep_get(scf), scf->wait_event.events);
+		chunk_appendf(&trash, " rex=%s",
+			      sc_ep_rcv_ex(scf) ? human_time(TICKS_TO_MS(sc_ep_rcv_ex(scf) - now_ms), TICKS_TO_MS(1000)) : "<NEVER>");
+		chunk_appendf(&trash, " wex=%s\n",
+			      sc_ep_snd_ex(scf) ? human_time(TICKS_TO_MS(sc_ep_snd_ex(scf) - now_ms), TICKS_TO_MS(1000)) : "<NEVER>");
 
 		if ((conn = sc_conn(scf)) != NULL) {
 			if (conn->mux && conn->mux->show_sd) {
@@ -3431,10 +3391,14 @@ static int stats_dump_full_strm_to_buffer(struct stconn *sc, struct stream *strm
 		}
 
 		scb = strm->scb;
-		chunk_appendf(&trash, "  scb=%p flags=0x%08x state=%s endp=%s,%p,0x%08x sub=%d\n",
+		chunk_appendf(&trash, "  scb=%p flags=0x%08x state=%s endp=%s,%p,0x%08x sub=%d",
 			      scb, scb->flags, sc_state_str(scb->state),
 			      (sc_ep_test(scb, SE_FL_T_MUX) ? "CONN" : (sc_ep_test(scb, SE_FL_T_APPLET) ? "APPCTX" : "NONE")),
 			      scb->sedesc->se, sc_ep_get(scb), scb->wait_event.events);
+		chunk_appendf(&trash, " rex=%s",
+			      sc_ep_rcv_ex(scb) ? human_time(TICKS_TO_MS(sc_ep_rcv_ex(scb) - now_ms), TICKS_TO_MS(1000)) : "<NEVER>");
+		chunk_appendf(&trash, " wex=%s\n",
+			      sc_ep_snd_ex(scb) ? human_time(TICKS_TO_MS(sc_ep_snd_ex(scb) - now_ms), TICKS_TO_MS(1000)) : "<NEVER>");
 
 		if ((conn = sc_conn(scb)) != NULL) {
 			if (conn->mux && conn->mux->show_sd) {
@@ -3474,29 +3438,16 @@ static int stats_dump_full_strm_to_buffer(struct stconn *sc, struct stream *strm
 
 		chunk_appendf(&trash,
 			     "  req=%p (f=0x%06x an=0x%x pipe=%d tofwd=%d total=%lld)\n"
-			     "      an_exp=%s",
+			     "      an_exp=%s buf=%p data=%p o=%u p=%u i=%u size=%u\n",
 			     &strm->req,
 			     strm->req.flags, strm->req.analysers,
 			     strm->req.pipe ? strm->req.pipe->data : 0,
 			     strm->req.to_forward, strm->req.total,
 			     strm->req.analyse_exp ?
 			     human_time(TICKS_TO_MS(strm->req.analyse_exp - now_ms),
-					TICKS_TO_MS(1000)) : "<NEVER>");
-
-		chunk_appendf(&trash,
-			     " rex=%s",
-			     strm->req.rex ?
-			     human_time(TICKS_TO_MS(strm->req.rex - now_ms),
-					TICKS_TO_MS(1000)) : "<NEVER>");
-
-		chunk_appendf(&trash,
-			     " wex=%s\n"
-			     "      buf=%p data=%p o=%u p=%u i=%u size=%u\n",
-			     strm->req.wex ?
-			     human_time(TICKS_TO_MS(strm->req.wex - now_ms),
 					TICKS_TO_MS(1000)) : "<NEVER>",
 			     &strm->req.buf,
-		             b_orig(&strm->req.buf), (unsigned int)co_data(&strm->req),
+			     b_orig(&strm->req.buf), (unsigned int)co_data(&strm->req),
 			     (unsigned int)ci_head_ofs(&strm->req), (unsigned int)ci_data(&strm->req),
 			     (unsigned int)strm->req.buf.size);
 
@@ -3518,26 +3469,13 @@ static int stats_dump_full_strm_to_buffer(struct stconn *sc, struct stream *strm
 
 		chunk_appendf(&trash,
 			     "  res=%p (f=0x%06x an=0x%x pipe=%d tofwd=%d total=%lld)\n"
-			     "      an_exp=%s",
+			     "      an_exp=%s buf=%p data=%p o=%u p=%u i=%u size=%u\n",
 			     &strm->res,
 			     strm->res.flags, strm->res.analysers,
 			     strm->res.pipe ? strm->res.pipe->data : 0,
 			     strm->res.to_forward, strm->res.total,
 			     strm->res.analyse_exp ?
 			     human_time(TICKS_TO_MS(strm->res.analyse_exp - now_ms),
-					TICKS_TO_MS(1000)) : "<NEVER>");
-
-		chunk_appendf(&trash,
-			     " rex=%s",
-			     strm->res.rex ?
-			     human_time(TICKS_TO_MS(strm->res.rex - now_ms),
-					TICKS_TO_MS(1000)) : "<NEVER>");
-
-		chunk_appendf(&trash,
-			     " wex=%s\n"
-			     "      buf=%p data=%p o=%u p=%u i=%u size=%u\n",
-			     strm->res.wex ?
-			     human_time(TICKS_TO_MS(strm->res.wex - now_ms),
 					TICKS_TO_MS(1000)) : "<NEVER>",
 			     &strm->res.buf,
 		             b_orig(&strm->res.buf), (unsigned int)co_data(&strm->res),
@@ -3728,19 +3666,10 @@ static int cli_io_handler_dump_sess(struct appctx *appctx)
 		             (unsigned long long)curr_strm->cpu_time, (unsigned long long)curr_strm->lat_time);
 
 		chunk_appendf(&trash,
-			     " rq[f=%06xh,i=%u,an=%02xh,rx=%s",
+			     " rq[f=%06xh,i=%u,an=%02xh",
 			     curr_strm->req.flags,
 		             (unsigned int)ci_data(&curr_strm->req),
-			     curr_strm->req.analysers,
-			     curr_strm->req.rex ?
-			     human_time(TICKS_TO_MS(curr_strm->req.rex - now_ms),
-					TICKS_TO_MS(1000)) : "");
-
-		chunk_appendf(&trash,
-			     ",wx=%s",
-			     curr_strm->req.wex ?
-			     human_time(TICKS_TO_MS(curr_strm->req.wex - now_ms),
-					TICKS_TO_MS(1000)) : "");
+			     curr_strm->req.analysers);
 
 		chunk_appendf(&trash,
 			     ",ax=%s]",
@@ -3749,20 +3678,10 @@ static int cli_io_handler_dump_sess(struct appctx *appctx)
 					TICKS_TO_MS(1000)) : "");
 
 		chunk_appendf(&trash,
-			     " rp[f=%06xh,i=%u,an=%02xh,rx=%s",
+			     " rp[f=%06xh,i=%u,an=%02xh",
 			     curr_strm->res.flags,
 		             (unsigned int)ci_data(&curr_strm->res),
-			     curr_strm->res.analysers,
-			     curr_strm->res.rex ?
-			     human_time(TICKS_TO_MS(curr_strm->res.rex - now_ms),
-					TICKS_TO_MS(1000)) : "");
-
-		chunk_appendf(&trash,
-			     ",wx=%s",
-			     curr_strm->res.wex ?
-			     human_time(TICKS_TO_MS(curr_strm->res.wex - now_ms),
-					TICKS_TO_MS(1000)) : "");
-
+			     curr_strm->res.analysers);
 		chunk_appendf(&trash,
 			     ",ax=%s]",
 			     curr_strm->res.analyse_exp ?
@@ -3770,18 +3689,28 @@ static int cli_io_handler_dump_sess(struct appctx *appctx)
 					TICKS_TO_MS(1000)) : "");
 
 		conn = sc_conn(curr_strm->scf);
-		chunk_appendf(&trash,
-			     " scf=[%d,%1xh,fd=%d]",
-			      curr_strm->scf->state,
-			     curr_strm->scf->flags,
-			     conn_fd(conn));
+		chunk_appendf(&trash," scf=[%d,%1xh,fd=%d",
+			      curr_strm->scf->state, curr_strm->scf->flags, conn_fd(conn));
+		chunk_appendf(&trash, ",rex=%s",
+			      sc_ep_rcv_ex(curr_strm->scf) ?
+			      human_time(TICKS_TO_MS(sc_ep_rcv_ex(curr_strm->scf) - now_ms),
+					 TICKS_TO_MS(1000)) : "");
+		chunk_appendf(&trash,",wex=%s]",
+			      sc_ep_snd_ex(curr_strm->scf) ?
+			      human_time(TICKS_TO_MS(sc_ep_snd_ex(curr_strm->scf) - now_ms),
+					 TICKS_TO_MS(1000)) : "");
 
 		conn = sc_conn(curr_strm->scb);
-		chunk_appendf(&trash,
-			     " scb=[%d,%1xh,fd=%d]",
-			      curr_strm->scb->state,
-			     curr_strm->scb->flags,
-			     conn_fd(conn));
+		chunk_appendf(&trash, " scb=[%d,%1xh,fd=%d",
+			      curr_strm->scb->state, curr_strm->scb->flags, conn_fd(conn));
+		chunk_appendf(&trash, ",rex=%s",
+			      sc_ep_rcv_ex(curr_strm->scb) ?
+			      human_time(TICKS_TO_MS(sc_ep_rcv_ex(curr_strm->scb) - now_ms),
+					 TICKS_TO_MS(1000)) : "");
+		chunk_appendf(&trash, ",wex=%s]",
+			      sc_ep_snd_ex(curr_strm->scb) ?
+			      human_time(TICKS_TO_MS(sc_ep_snd_ex(curr_strm->scb) - now_ms),
+					 TICKS_TO_MS(1000)) : "");
 
 		chunk_appendf(&trash,
 			     " exp=%s rc=%d c_exp=%s",
@@ -3965,7 +3894,7 @@ static int smp_fetch_cur_server_timeout(const struct arg *args, struct sample *s
 	if (!smp->strm)
 		return 0;
 
-	smp->data.u.sint = TICKS_TO_MS(smp->strm->res.rto);
+	smp->data.u.sint = TICKS_TO_MS(smp->strm->scb->ioto);
 	return 1;
 }
 

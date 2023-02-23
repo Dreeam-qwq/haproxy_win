@@ -765,7 +765,6 @@ read:
 close:
 	sc_shutw(sc);
 	sc_shutr(sc);
-	sc_ic(sc)->flags |= CF_READ_EVENT;
 }
 
 void dns_queries_flush(struct dns_session *ds)
@@ -835,12 +834,7 @@ static int dns_session_init(struct appctx *appctx)
 	s->uniq_id = 0;
 
 	s->res.flags |= CF_READ_DONTWAIT;
-	/* for rto and rex to eternity to not expire on idle recv:
-	 * We are using a syslog server.
-	 */
-	s->res.rto = TICK_ETERNITY;
-	s->res.rex = TICK_ETERNITY;
-
+	applet_expect_no_data(appctx);
 	ds->appctx = appctx;
 	return 0;
 

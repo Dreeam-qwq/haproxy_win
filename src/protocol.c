@@ -99,8 +99,10 @@ int protocol_bind_all(int verbose)
 					ha_warning("Binding [%s:%d] for %s %s: %s\n",
 					           listener->bind_conf->file, listener->bind_conf->line,
 						   proxy_type_str(px), px->id, errmsg);
-				ha_free(&errmsg);
 			}
+			if (lerr != ERR_NONE)
+				ha_free(&errmsg);
+
 			if (lerr & ERR_ABORT)
 				break;
 
@@ -167,15 +169,15 @@ void protocol_stop_now(void)
 	HA_SPIN_LOCK(PROTO_LOCK, &proto_lock);
 	list_for_each_entry(proto, &protocols, list) {
 		list_for_each_entry_safe(listener, lback, &proto->receivers, rx.proto_list)
-			stop_listener(listener, 0, 1);
+			stop_listener(listener, 0, 1, 0);
 	}
 	HA_SPIN_UNLOCK(PROTO_LOCK, &proto_lock);
 }
 
-/* pauses all listeners of all registered protocols. This is typically
+/* suspends all listeners of all registered protocols. This is typically
  * used on SIG_TTOU to release all listening sockets for the time needed to
- * try to bind a new process. The listeners enter LI_PAUSED. It returns
- * ERR_NONE, with ERR_FATAL on failure.
+ * try to bind a new process. The listeners enter LI_PAUSED or LI_ASSIGNED.
+ * It returns ERR_NONE, with ERR_FATAL on failure.
  */
 int protocol_pause_all(void)
 {
@@ -187,7 +189,7 @@ int protocol_pause_all(void)
 	HA_SPIN_LOCK(PROTO_LOCK, &proto_lock);
 	list_for_each_entry(proto, &protocols, list) {
 		list_for_each_entry(listener, &proto->receivers, rx.proto_list)
-			if (!pause_listener(listener, 0))
+			if (!suspend_listener(listener, 0, 0))
 				err |= ERR_FATAL;
 	}
 	HA_SPIN_UNLOCK(PROTO_LOCK, &proto_lock);
@@ -209,7 +211,7 @@ int protocol_resume_all(void)
 	HA_SPIN_LOCK(PROTO_LOCK, &proto_lock);
 	list_for_each_entry(proto, &protocols, list) {
 		list_for_each_entry(listener, &proto->receivers, rx.proto_list)
-			if (!resume_listener(listener, 0))
+			if (!resume_listener(listener, 0, 0))
 				err |= ERR_FATAL;
 	}
 	HA_SPIN_UNLOCK(PROTO_LOCK, &proto_lock);

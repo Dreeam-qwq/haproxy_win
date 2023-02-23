@@ -67,17 +67,17 @@ enum se_flags {
 	SE_FL_MAY_SPLICE = 0x00040000,  /* The endpoint may use the kernel splicing to forward data to the other side (implies SE_FL_CAN_SPLICE) */
 	SE_FL_RCV_MORE   = 0x00080000,  /* Endpoint may have more bytes to transfer */
 	SE_FL_WANT_ROOM  = 0x00100000,  /* More bytes to transfer, but not enough room */
-	SE_FL_ENDP_MASK  = 0x001ff000,  /* Mask for flags set by the endpoint */
+	SE_FL_EXP_NO_DATA= 0x00200000,  /* No data expected by the endpoint */
+	SE_FL_ENDP_MASK  = 0x002ff000,  /* Mask for flags set by the endpoint */
 
 	/* following flags are supposed to be set by the app layer and read by
 	 * the endpoint :
 	 */
-	SE_FL_WAIT_FOR_HS   = 0x00200000,  /* This stream is waiting for handhskae */
-	SE_FL_KILL_CONN     = 0x00400000,  /* must kill the connection when the SC closes */
-	SE_FL_WAIT_DATA     = 0x00800000,  /* stream endpoint cannot work without more data from the stream's output */
-	SE_FL_WONT_CONSUME  = 0x01000000,  /* stream endpoint will not consume more data */
-	SE_FL_HAVE_NO_DATA  = 0x02000000,  /* the endpoint has no more data to deliver to the stream */
-	/* unused             0x04000000,*/
+	SE_FL_WAIT_FOR_HS   = 0x00400000,  /* This stream is waiting for handhskae */
+	SE_FL_KILL_CONN     = 0x00800000,  /* must kill the connection when the SC closes */
+	SE_FL_WAIT_DATA     = 0x01000000,  /* stream endpoint cannot work without more data from the stream's output */
+	SE_FL_WONT_CONSUME  = 0x02000000,  /* stream endpoint will not consume more data */
+	SE_FL_HAVE_NO_DATA  = 0x04000000,  /* the endpoint has no more data to deliver to the stream */
 	/* unused             0x08000000,*/
 	/* unused             0x10000000,*/
 	/* unused             0x20000000,*/
@@ -98,9 +98,9 @@ static forceinline char *se_show_flags(char *buf, size_t len, const char *delim,
 	_(SE_FL_SHRD, _(SE_FL_SHRR, _(SE_FL_SHWN, _(SE_FL_SHWS,
 	_(SE_FL_NOT_FIRST, _(SE_FL_WEBSOCKET, _(SE_FL_EOI, _(SE_FL_EOS,
 	_(SE_FL_ERROR, _(SE_FL_ERR_PENDING, _(SE_FL_MAY_SPLICE,
-	_(SE_FL_RCV_MORE, _(SE_FL_WANT_ROOM, _(SE_FL_WAIT_FOR_HS,
-	_(SE_FL_KILL_CONN, _(SE_FL_WAIT_DATA, _(SE_FL_WONT_CONSUME,
-	_(SE_FL_HAVE_NO_DATA, _(SE_FL_APPLET_NEED_CONN)))))))))))))))))))))));
+	_(SE_FL_RCV_MORE, _(SE_FL_WANT_ROOM, _(SE_FL_EXP_NO_DATA,
+	_(SE_FL_WAIT_FOR_HS, _(SE_FL_KILL_CONN, _(SE_FL_WAIT_DATA,
+	_(SE_FL_WONT_CONSUME, _(SE_FL_HAVE_NO_DATA, _(SE_FL_APPLET_NEED_CONN))))))))))))))))))))))));
 	/* epilogue */
 	_(~0U);
 	return buf;
@@ -199,13 +199,24 @@ struct stconn;
  * <se>     is the stream endpoint, i.e. the mux stream or the appctx
  * <conn>   is the connection for connection-based streams
  * <sc>     is the stream connector we're attached to, or NULL
+ * <lra>    is the last read activity
+ * <fsb>    is the first send blocked
  * <flags>  SE_FL_*
-*/
+ *
+ * <lra> should be updated when a read activity is detected. It can be a
+ *       sucessful receive, when a shutr is reported or when receives are
+ *       unblocked.
+
+ * <fsb> should be updated when the first send of a series is blocked and reset
+ *       when a successful send is reported.
+ */
 struct sedesc {
 	void *se;
 	struct connection *conn;
 	struct stconn *sc;
 	unsigned int flags;
+	unsigned int lra;
+	unsigned int fsb;
 };
 
 /* sc_app_ops describes the application layer's operations and notification
@@ -230,7 +241,7 @@ struct stconn {
 	/* 2 bytes hole here */
 
 	unsigned int flags;                  /* SC_FL_* */
-	unsigned int hcto;                   /* half-closed timeout (0 = unset) */
+	unsigned int ioto;                   /* I/O activity timeout */
 	struct wait_event wait_event;        /* We're in a wait list */
 	struct sedesc *sedesc;               /* points to the stream endpoint descriptor */
 	enum obj_type *app;                  /* points to the applicative point (stream or check) */

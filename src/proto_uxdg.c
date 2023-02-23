@@ -29,6 +29,7 @@
 #include <haproxy/protocol.h>
 #include <haproxy/sock.h>
 #include <haproxy/sock_unix.h>
+#include <haproxy/tools.h>
 
 static int uxdg_bind_listener(struct listener *listener, char *errmsg, int errlen);
 static void uxdg_enable_listener(struct listener *listener);
@@ -95,6 +96,7 @@ int uxdg_bind_listener(struct listener *listener, char *errmsg, int errlen)
 
 	if (!(listener->rx.flags & RX_F_BOUND)) {
 		msg = "receiving socket not bound";
+		err |= ERR_FATAL | ERR_ALERT;
 		goto uxdg_return;
 	}
 
@@ -102,8 +104,11 @@ int uxdg_bind_listener(struct listener *listener, char *errmsg, int errlen)
 
  uxdg_return:
 	if (msg && errlen) {
-		const char *path = ((struct sockaddr_un *)&listener->rx.addr)->sun_path;
-                snprintf(errmsg, errlen, "%s for [%s]", msg, path);
+		char *path_str;
+
+		path_str = sa2str((struct sockaddr_storage *)&listener->rx.addr, 0, 0);
+		snprintf(errmsg, errlen, "%s for [%s]", msg, ((path_str) ? path_str : ""));
+		ha_free(&path_str);
 	}
 	return err;
 }
@@ -125,17 +130,20 @@ static void uxdg_disable_listener(struct listener *l)
 }
 
 /* Suspend a receiver. Returns < 0 in case of failure, 0 if the receiver
- * was totally stopped, or > 0 if correctly suspended. Nothing is done for
- * plain unix sockets since currently it's the new process which handles
- * the renaming. Abstract sockets are completely unbound and closed so
- * there's no need to stop the poller.
+ * was totally stopped, or > 0 if correctly suspended. For plain unix sockets
+ * we only disable the listener to prevent data from being handled but nothing
+ * more is done since currently it's the new process which handles the renaming.
+ * Abstract sockets are completely unbound and closed so there's no need to stop
+ * the poller.
  */
 static int uxdg_suspend_receiver(struct receiver *rx)
 {
         struct listener *l = LIST_ELEM(rx, struct listener *, rx);
 
-        if (((struct sockaddr_un *)&rx->addr)->sun_path[0])
+        if (((struct sockaddr_un *)&rx->addr)->sun_path[0]) {
+		uxdg_disable_listener(l);
                 return 1;
+	}
 
         /* Listener's lock already held. Call lockless version of
          * unbind_listener. */

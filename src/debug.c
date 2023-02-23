@@ -760,8 +760,9 @@ static int debug_parse_cli_stream(char **args, char *payload, struct appctx *app
 	if (!*args[3]) {
 		return cli_err(appctx,
 			       "Usage: debug dev stream { <obj> <op> <value> | wake }*\n"
-			       "     <obj>   = {strm | strm.f | strm.x | scf.s | scb.s |\n"
-			       "                txn.f | req.f | req.r | req.w | res.f | res.r | res.w}\n"
+			       "     <obj>   = {strm | strm.f | strm.x |\n"
+			       "                scf.s | scb.s |\n"
+			       "                txn.f | req.f | res.f}\n"
 			       "     <op>    = {'' (show) | '=' (assign) | '^' (xor) | '+' (or) | '-' (andnot)}\n"
 			       "     <value> = 'now' | 64-bit dec/hex integer (0x prefix supported)\n"
 			       "     'wake' wakes the stream asssigned to 'strm' (default: current)\n"
@@ -787,14 +788,6 @@ static int debug_parse_cli_stream(char **args, char *payload, struct appctx *app
 			ptr = (!s || !may_access(s)) ? NULL : &s->req.flags; size = sizeof(s->req.flags);
 		} else if (isteq(name, ist("res.f"))) {
 			ptr = (!s || !may_access(s)) ? NULL : &s->res.flags; size = sizeof(s->res.flags);
-		} else if (isteq(name, ist("req.r"))) {
-			ptr = (!s || !may_access(s)) ? NULL : &s->req.rex; size = sizeof(s->req.rex);
-		} else if (isteq(name, ist("res.r"))) {
-			ptr = (!s || !may_access(s)) ? NULL : &s->res.rex; size = sizeof(s->res.rex);
-		} else if (isteq(name, ist("req.w"))) {
-			ptr = (!s || !may_access(s)) ? NULL : &s->req.wex; size = sizeof(s->req.wex);
-		} else if (isteq(name, ist("res.w"))) {
-			ptr = (!s || !may_access(s)) ? NULL : &s->res.wex; size = sizeof(s->res.wex);
 		} else if (isteq(name, ist("scf.s"))) {
 			ptr = (!s || !may_access(s)) ? NULL : &s->scf->state; size = sizeof(s->scf->state);
 		} else if (isteq(name, ist("scb.s"))) {
