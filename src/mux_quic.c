@@ -1603,8 +1603,13 @@ static int qc_send_frames(struct qcc *qcc, struct list *frms)
 		goto err;
 	}
 
-	if (!qc_send_mux(qcc->conn->handle.qc, frms))
+	if (!qc_send_mux(qcc->conn->handle.qc, frms)) {
+		/* TODO should subscribe only for a transient send error */
+		TRACE_DEVEL("error on send, subscribing", QMUX_EV_QCC_SEND, qcc->conn);
+		qcc->conn->xprt->subscribe(qcc->conn, qcc->conn->xprt_ctx,
+		                           SUB_RETRY_SEND, &qcc->wait_event);
 		goto err;
+	}
 
 	/* If there is frames left at this stage, transport layer is blocked.
 	 * Subscribe on it to retry later.
@@ -2423,8 +2428,14 @@ static size_t qc_recv_buf(struct stconn *sc, struct buffer *buf,
 			se_fl_set(qcs->sd, SE_FL_ERROR);
 
 		/* Set end-of-input if FIN received and all data extracted. */
-		if (fin)
+		if (fin) {
 			se_fl_set(qcs->sd, SE_FL_EOI);
+
+			/* If request EOM is reported to the upper layer, it means the
+			 * QCS now expects data from the opposite side.
+			 */
+			se_expect_data(qcs->sd);
+		}
 
 		if (b_size(&qcs->rx.app_buf)) {
 			b_free(&qcs->rx.app_buf);

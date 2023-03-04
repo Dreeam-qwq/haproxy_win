@@ -492,8 +492,17 @@ static void quic_conn_sock_fd_iocb(int fd)
 
 	TRACE_ENTER(QUIC_EV_CONN_RCV, qc);
 
-	tasklet_wakeup_after(NULL, qc->wait_event.tasklet);
-	fd_stop_recv(fd);
+	if (fd_send_active(fd) && fd_send_ready(fd)) {
+		TRACE_DEVEL("send ready", QUIC_EV_CONN_RCV, qc);
+		fd_stop_send(fd);
+		tasklet_wakeup_after(NULL, qc->wait_event.tasklet);
+		qc_notify_send(qc);
+	}
+
+	if (fd_recv_ready(fd)) {
+		tasklet_wakeup_after(NULL, qc->wait_event.tasklet);
+		fd_stop_recv(fd);
+	}
 
 	TRACE_LEAVE(QUIC_EV_CONN_RCV, qc);
 }
@@ -501,22 +510,24 @@ static void quic_conn_sock_fd_iocb(int fd)
 /* Send a datagram stored into <buf> buffer with <sz> as size.
  * The caller must ensure there is at least <sz> bytes in this buffer.
  *
- * Returns 0 on success else non-zero. When failed, this function also
- * sets <*syscall_errno> to the errno only when the send*() syscall failed.
- * As the C library will never set errno to 0, the caller must set
- * <*syscall_errno> to 0 before calling this function to be sure to get
- * the correct errno in case a send*() syscall failure.
+ * Returns the total bytes sent over the socket. 0 is returned if a transient
+ * error is encountered which allows send to be retry later. A negative value
+ * is used for a fatal error which guarantee that all future send operation for
+ * this connection will fail.
  *
  * TODO standardize this function for a generic UDP sendto wrapper. This can be
  * done by removing the <qc> arg and replace it with address/port.
  */
 int qc_snd_buf(struct quic_conn *qc, const struct buffer *buf, size_t sz,
-               int flags, int *syscall_errno)
+               int flags)
 {
 	ssize_t ret;
 
 	do {
 		if (qc_test_fd(qc)) {
+			if (!fd_send_ready(qc->fd))
+				return 0;
+
 			ret = send(qc->fd, b_peek(buf, b_head_ofs(buf)), sz,
 			           MSG_DONTWAIT | MSG_NOSIGNAL);
 		}
@@ -619,31 +630,31 @@ int qc_snd_buf(struct quic_conn *qc, const struct buffer *buf, size_t sz,
 		  EXTRA_COUNTERS_GET(prx->extra_counters_fe,
 		                     &quic_stats_module);
 
-		*syscall_errno = errno;
-		/* TODO adjust errno for UDP context. */
 		if (errno == EAGAIN || errno == EWOULDBLOCK ||
-		    errno == ENOTCONN || errno == EINPROGRESS || errno == EBADF) {
+		    errno == ENOTCONN || errno == EINPROGRESS) {
 			if (errno == EAGAIN || errno == EWOULDBLOCK)
 				HA_ATOMIC_INC(&prx_counters->socket_full);
 			else
 				HA_ATOMIC_INC(&prx_counters->sendto_err);
+
+			/* transient error */
+			fd_want_send(qc->fd);
+			fd_cant_send(qc->fd);
+			TRACE_PRINTF(TRACE_LEVEL_USER, QUIC_EV_CONN_SPPKTS, qc, 0, 0, 0,
+			             "UDP send failure errno=%d (%s)", errno, strerror(errno));
+			return 0;
 		}
-		else if (errno) {
-			/* TODO unlisted errno : handle it explicitly.
-			 * ECONNRESET may be encounter on quic-conn socket.
-			 */
+		else {
+			/* unrecoverable error */
 			HA_ATOMIC_INC(&prx_counters->sendto_err_unknown);
+			TRACE_PRINTF(TRACE_LEVEL_USER, QUIC_EV_CONN_SPPKTS, qc, 0, 0, 0,
+			             "UDP send failure errno=%d (%s)", errno, strerror(errno));
+			return -1;
 		}
-
-		/* Note that one must not consider that this macro will not modify errno. */
-		TRACE_PRINTF(TRACE_LEVEL_DEVELOPER, QUIC_EV_CONN_LPKT, qc, 0, 0, 0,
-		             "syscall error (errno=%d)", *syscall_errno);
-
-		return 1;
 	}
 
 	if (ret != sz)
-		return 1;
+		return 0;
 
 	/* we count the total bytes sent, and the send rate for 32-byte blocks.
 	 * The reason for the latter is that freq_ctr are limited to 4GB and
@@ -652,7 +663,7 @@ int qc_snd_buf(struct quic_conn *qc, const struct buffer *buf, size_t sz,
 	_HA_ATOMIC_ADD(&th_ctx->out_bytes, ret);
 	update_freq_ctr(&th_ctx->out_32bps, (ret + 16) / 32);
 
-	return 0;
+	return ret;
 }
 
 /* Receive datagram on <qc> FD-owned socket.

@@ -909,6 +909,13 @@ static void dump_crtlist_sslconf(struct buffer *buf, const struct ssl_bind_conf 
 		space++;
 	}
 
+	if (conf->ocsp_update != SSL_SOCK_OCSP_UPDATE_DFLT) {
+		if (space) chunk_appendf(buf, " ");
+		chunk_appendf(buf, "ocsp-update %s",
+		              conf->ocsp_update == SSL_SOCK_OCSP_UPDATE_OFF ? "off" : "on");
+		space++;
+	}
+
 	chunk_appendf(buf, "]");
 
 	return;
@@ -1314,6 +1321,16 @@ static int cli_parse_add_crtlist(char **args, char *payload, struct appctx *appc
 		memprintf(&err, "certificate '%s' is empty!", cert_path);
 		goto error;
 	}
+
+	/* No need to check 'ocsp-update' inconsistency on a store that is not
+	 * used yet (it was just added through the CLI for instance).
+	 */
+	if (!LIST_ISEMPTY(&store->ckch_inst) &&
+	    ocsp_update_check_cfg_consistency(store, entry, cert_path, &err))
+		goto error;
+
+	if (entry->ssl_conf)
+		store->data->ocsp_update_mode = entry->ssl_conf->ocsp_update;
 
 	/* check if it's possible to insert this new crtlist_entry */
 	entry->node.key = store;

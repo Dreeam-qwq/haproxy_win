@@ -1537,6 +1537,7 @@ static struct h2s *h2c_frt_stream_new(struct h2c *h2c, int id, struct buffer *in
 	h2s->sd->se   = h2s;
 	h2s->sd->conn = h2c->conn;
 	se_fl_set(h2s->sd, SE_FL_T_MUX | SE_FL_ORPHAN | SE_FL_NOT_FIRST);
+	se_expect_no_data(h2s->sd);
 
 	/* FIXME wrong analogy between ext-connect and websocket, this need to
 	 * be refine.
@@ -4030,6 +4031,7 @@ static int h2_process(struct h2c *h2c)
 		if (conn->flags & CO_FL_LIST_MASK) {
 			HA_SPIN_LOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
 			conn_delete_from_tree(&conn->hash_node->node);
+			conn->flags &= ~CO_FL_LIST_MASK;
 			HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
 		}
 	}
@@ -4038,6 +4040,7 @@ static int h2_process(struct h2c *h2c)
 		if (conn->flags & CO_FL_LIST_MASK) {
 			HA_SPIN_LOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
 			conn_delete_from_tree(&conn->hash_node->node);
+			conn->flags &= ~CO_FL_LIST_MASK;
 			HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
 		}
 	}
@@ -4117,8 +4120,10 @@ struct task *h2_timeout_task(struct task *t, void *context, unsigned int state)
 		/* We're about to destroy the connection, so make sure nobody attempts
 		 * to steal it from us.
 		 */
-		if (h2c->conn->flags & CO_FL_LIST_MASK)
+		if (h2c->conn->flags & CO_FL_LIST_MASK) {
 			conn_delete_from_tree(&h2c->conn->hash_node->node);
+			h2c->conn->flags &= ~CO_FL_LIST_MASK;
+		}
 
 		HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
 	}
@@ -4171,6 +4176,7 @@ do_leave:
 	if (h2c->conn->flags & CO_FL_LIST_MASK) {
 		HA_SPIN_LOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
 		conn_delete_from_tree(&h2c->conn->hash_node->node);
+		h2c->conn->flags &= ~CO_FL_LIST_MASK;
 		HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
 	}
 
@@ -6401,8 +6407,16 @@ static size_t h2_rcv_buf(struct stconn *sc, struct buffer *buf, size_t count, in
 		if (htx_is_empty(buf_htx))
 			se_fl_set(h2s->sd, SE_FL_EOI);
 	}
-	else if (htx_is_empty(h2s_htx))
+	else if (htx_is_empty(h2s_htx)) {
 		buf_htx->flags |= (h2s_htx->flags & HTX_FL_EOM);
+
+		if (!(h2c->flags & H2_CF_IS_BACK) && (buf_htx->flags & HTX_FL_EOM)) {
+			/* If request EOM is reported to the upper layer, it means the
+			 * H2S now expects data from the opposite side.
+			 */
+			se_expect_data(h2s->sd);
+		}
+	}
 
 	buf_htx->extra = (h2s_htx->extra ? (h2s_htx->data + h2s_htx->extra) : 0);
 	htx_to_buf(buf_htx, buf);

@@ -15,7 +15,6 @@
 #include <haproxy/quic_conn.h>
 
 #define _GNU_SOURCE
-#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -1700,11 +1699,8 @@ static int quic_stream_try_to_consume(struct quic_conn *qc,
 static inline void qc_treat_acked_tx_frm(struct quic_conn *qc,
                                          struct quic_frame *frm)
 {
-	int stream_acked;
-
 	TRACE_ENTER(QUIC_EV_CONN_PRSAFRM, qc, frm);
 
-	stream_acked = 0;
 	switch (frm->type) {
 	case QUIC_FT_STREAM_8 ... QUIC_FT_STREAM_F:
 	{
@@ -1733,7 +1729,6 @@ static inline void qc_treat_acked_tx_frm(struct quic_conn *qc,
 		TRACE_DEVEL("acked stream", QUIC_EV_CONN_ACKSTRM, qc, strm_frm, stream);
 		if (offset <= stream->ack_offset) {
 			if (qc_stream_desc_ack(&stream, offset, len)) {
-				stream_acked = 1;
 				TRACE_DEVEL("stream consumed", QUIC_EV_CONN_ACKSTRM,
 				            qc, strm_frm, stream);
 			}
@@ -1754,21 +1749,13 @@ static inline void qc_treat_acked_tx_frm(struct quic_conn *qc,
 			eb64_insert(&stream->acked_frms, &strm_frm->offset);
 		}
 
-		stream_acked |= quic_stream_try_to_consume(qc, stream);
+		quic_stream_try_to_consume(qc, stream);
 	}
 	break;
 	default:
 		qc_release_frm(qc, frm);
 	}
 
-	if (stream_acked) {
-		if (qc->subs && qc->subs->events & SUB_RETRY_SEND) {
-			tasklet_wakeup(qc->subs->tasklet);
-			qc->subs->events &= ~SUB_RETRY_SEND;
-			if (!qc->subs->events)
-				qc->subs = NULL;
-		}
-	}
  leave:
 	TRACE_LEAVE(QUIC_EV_CONN_PRSAFRM, qc);
 }
@@ -1898,12 +1885,6 @@ static inline int qc_requeue_nacked_pkt_tx_frms(struct quic_conn *qc,
 				close = 1;
 			}
 
-			if (QUIC_FT_STREAM_8 <= frm->type && frm->type <= QUIC_FT_STREAM_F) {
-				/* Mark this STREAM frame as lost. A look up their stream descriptor
-				 * will be performed to check the stream is not consumed or released.
-				 */
-				frm->flags |= QUIC_FL_TX_FRAME_LOST;
-			}
 			LIST_APPEND(&tmp, &frm->list);
 			TRACE_DEVEL("frame requeued", QUIC_EV_CONN_PRSAFRM, qc, frm);
 		}
@@ -2239,6 +2220,7 @@ static inline int qc_parse_ack_frm(struct quic_conn *qc,
 		if (quic_peer_validated_addr(qc))
 			qc->path->loss.pto_count = 0;
 		qc_set_timer(qc);
+		qc_notify_send(qc);
 	}
 
 	ret = 1;
@@ -2525,6 +2507,8 @@ static void qc_dup_pkt_frms(struct quic_conn *qc,
 				TRACE_DEVEL("updated partially acked frame",
 				            QUIC_EV_CONN_PRSAFRM, qc, frm);
 			}
+
+			strm_frm->dup = 1;
 			break;
 		}
 
@@ -3446,11 +3430,14 @@ static int qc_prep_pkts(struct quic_conn *qc, struct buffer *buf,
 
 /* Send datagrams stored in <buf>.
  *
- * This function returns 1 for success. Even if sendto() syscall failed,
- * buffer is drained and packets are considered as emitted and this function returns 1
- * There is a unique exception when sendto() fails with ECONNREFUSED as errno,
- * this function returns 0.
- * QUIC loss detection mechanism is used as a back door way to retry sending.
+ * This function returns 1 for success. On error, there is several behavior
+ * depending on underlying sendto() error :
+ * - for an unrecoverable error, 0 is returned and connection is killed.
+ * - a transient error is handled differently if connection has its owned
+ *   socket. If this is the case, 0 is returned and socket is subscribed on the
+ *   poller. The other case is assimilated to a success case with 1 returned.
+ *   Remaining data are purged from the buffer and will eventually be detected
+ *   as lost which gives the opportunity to retry sending.
  */
 int qc_send_ppkts(struct buffer *buf, struct ssl_sock_ctx *ctx)
 {
@@ -3490,18 +3477,21 @@ int qc_send_ppkts(struct buffer *buf, struct ssl_sock_ctx *ctx)
 		 * quic-conn fd management.
 		 */
 		if (!skip_sendto) {
-			int syscall_errno;
-
-			syscall_errno = 0;
-			if (qc_snd_buf(qc, &tmpbuf, tmpbuf.data, 0, &syscall_errno)) {
-				if (syscall_errno == ECONNREFUSED) {
-					/* Let's kill this connection asap. */
-					TRACE_PROTO("UDP port unreachable", QUIC_EV_CONN_SPPKTS, qc);
-					qc_kill_conn(qc);
-					b_del(buf, buf->data);
+			int ret = qc_snd_buf(qc, &tmpbuf, tmpbuf.data, 0);
+			if (ret < 0) {
+				TRACE_ERROR("sendto fatal error", QUIC_EV_CONN_SPPKTS, qc);
+				qc_kill_conn(qc);
+				b_del(buf, buf->data);
+				goto leave;
+			}
+			else if (!ret) {
+				/* Connection owned socket : poller will wake us up when transient error is cleared. */
+				if (qc_test_fd(qc)) {
+					TRACE_ERROR("sendto error, subscribe to poller", QUIC_EV_CONN_SPPKTS, qc);
 					goto leave;
 				}
 
+				/* No connection owned-socket : rely on retransmission to retry sending. */
 				skip_sendto = 1;
 				TRACE_ERROR("sendto error, simulate sending for the rest of data", QUIC_EV_CONN_SPPKTS, qc);
 			}
@@ -4199,6 +4189,34 @@ static int qc_qel_may_rm_hp(struct quic_conn *qc, struct quic_enc_level *qel)
 	return ret;
 }
 
+/* Flush txbuf for <qc> connection. This must be called prior to a packet
+ * preparation when txbuf contains older data. A send will be conducted for
+ * these data.
+ *
+ * Returns 1 on success : buffer is empty and can be use for packet
+ * preparation. On error 0 is returned.
+ */
+static int qc_purge_txbuf(struct quic_conn *qc, struct buffer *buf)
+{
+	TRACE_ENTER(QUIC_EV_CONN_TXPKT, qc);
+
+	/* This operation can only be conducted if txbuf is not empty. This
+	 * case only happens for connection with their owned socket due to an
+	 * older transient sendto() error.
+	 */
+	BUG_ON(!qc_test_fd(qc));
+
+	if (b_data(buf) && !qc_send_ppkts(buf, qc->xprt_ctx)) {
+		if (qc->flags & QUIC_FL_CONN_TO_KILL)
+			qc_txb_release(qc);
+		TRACE_DEVEL("leaving in error", QUIC_EV_CONN_TXPKT, qc);
+		return 0;
+	}
+
+	TRACE_LEAVE(QUIC_EV_CONN_TXPKT, qc);
+	return 1;
+}
+
 /* Try to send application frames from list <frms> on connection <qc>.
  *
  * Use qc_send_app_probing wrapper when probing with old data.
@@ -4221,8 +4239,11 @@ static int qc_send_app_pkts(struct quic_conn *qc, struct list *frms)
 	buf = qc_txb_alloc(qc);
 	if (!buf) {
 		TRACE_ERROR("buffer allocation failed", QUIC_EV_CONN_TXPKT, qc);
-		goto leave;
+		goto err;
 	}
+
+	if (b_data(buf) && !qc_purge_txbuf(qc, buf))
+		goto err;
 
 	/* Prepare and send packets until we could not further prepare packets. */
 	while (1) {
@@ -4236,25 +4257,29 @@ static int qc_send_app_pkts(struct quic_conn *qc, struct list *frms)
 		b_reset(buf);
 
 		ret = qc_prep_app_pkts(qc, buf, frms);
-		if (ret == -1)
+		if (ret == -1) {
+			qc_txb_release(qc);
 			goto err;
-		else if (ret == 0)
-			goto out;
+		}
 
-		if (!qc_send_ppkts(buf, qc->xprt_ctx))
+		if (!ret)
+			break;
+
+		if (!qc_send_ppkts(buf, qc->xprt_ctx)) {
+			if (qc->flags & QUIC_FL_CONN_TO_KILL)
+				qc_txb_release(qc);
 			goto err;
+		}
 	}
 
- out:
 	status = 1;
 	qc_txb_release(qc);
- leave:
 	TRACE_LEAVE(QUIC_EV_CONN_TXPKT, qc);
 	return status;
 
  err:
-	qc_txb_release(qc);
-	goto leave;
+	TRACE_DEVEL("leaving in error", QUIC_EV_CONN_TXPKT, qc);
+	return 0;
 }
 
 /* Try to send application frames from list <frms> on connection <qc>. Use this
@@ -4319,6 +4344,9 @@ int qc_send_hdshk_pkts(struct quic_conn *qc, int old_data,
 		goto leave;
 	}
 
+	if (b_data(buf) && !qc_purge_txbuf(qc, buf))
+		goto out;
+
 	/* Currently buf cannot be non-empty at this stage. Even if a previous
 	 * sendto() has failed it is emptied to simulate packet emission and
 	 * rely on QUIC lost detection to try to emit it.
@@ -4332,20 +4360,23 @@ int qc_send_hdshk_pkts(struct quic_conn *qc, int old_data,
 	}
 
 	ret = qc_prep_pkts(qc, buf, tel, tel_frms, next_tel, next_tel_frms);
-	if (ret == -1)
+	if (ret == -1) {
+		qc_txb_release(qc);
 		goto out;
-	else if (ret == 0)
-		goto skip_send;
+	}
 
-	if (!qc_send_ppkts(buf, qc->xprt_ctx))
+	if (ret && !qc_send_ppkts(buf, qc->xprt_ctx)) {
+		if (qc->flags & QUIC_FL_CONN_TO_KILL)
+			qc_txb_release(qc);
 		goto out;
+	}
 
- skip_send:
+	qc_txb_release(qc);
 	status = 1;
+
  out:
 	TRACE_STATE("no more need old data for probing", QUIC_EV_CONN_TXPKT, qc);
 	qc->flags &= ~QUIC_FL_CONN_RETRANS_OLD_DATA;
-	qc_txb_release(qc);
  leave:
 	TRACE_LEAVE(QUIC_EV_CONN_TXPKT, qc);
 	return status;
@@ -4624,6 +4655,9 @@ struct task *quic_conn_io_cb(struct task *t, void *context, unsigned int state)
 	if (!buf)
 		goto out;
 
+	if (b_data(buf) && !qc_purge_txbuf(qc, buf))
+		goto skip_send;
+
 	/* Currently buf cannot be non-empty at this stage. Even if a previous
 	 * sendto() has failed it is emptied to simulate packet emission and
 	 * rely on QUIC lost detection to try to emit it.
@@ -4633,13 +4667,18 @@ struct task *quic_conn_io_cb(struct task *t, void *context, unsigned int state)
 
 	ret = qc_prep_pkts(qc, buf, tel, &qc->els[tel].pktns->tx.frms,
 	                   next_tel, &qc->els[next_tel].pktns->tx.frms);
-	if (ret == -1)
+	if (ret == -1) {
+		qc_txb_release(qc);
 		goto out;
-	else if (ret == 0)
-		goto skip_send;
+	}
 
-	if (!qc_send_ppkts(buf, qc->xprt_ctx))
+	if (ret && !qc_send_ppkts(buf, qc->xprt_ctx)) {
+		if (qc->flags & QUIC_FL_CONN_TO_KILL)
+			qc_txb_release(qc);
 		goto out;
+	}
+
+	qc_txb_release(qc);
 
  skip_send:
 	/* Check if there is something to do for the next level.
@@ -4653,7 +4692,6 @@ struct task *quic_conn_io_cb(struct task *t, void *context, unsigned int state)
 	}
 
  out:
-	qc_txb_release(qc);
 	TRACE_LEAVE(QUIC_EV_CONN_IO_CB, qc, &st, &ssl_err);
 	return t;
 }
@@ -4815,14 +4853,7 @@ struct task *qc_process_timer(struct task *task, void *ctx, unsigned int state)
 
 	if (qc->path->in_flight) {
 		pktns = quic_pto_pktns(qc, qc->state >= QUIC_HS_ST_CONFIRMED, NULL);
-		if (qc->subs && qc->subs->events & SUB_RETRY_SEND) {
-			pktns->tx.pto_probe = QUIC_MAX_NB_PTO_DGRAMS;
-			tasklet_wakeup(qc->subs->tasklet);
-			qc->subs->events &= ~SUB_RETRY_SEND;
-			if (!qc->subs->events)
-				qc->subs = NULL;
-		}
-		else {
+		if (!qc_notify_send(qc)) {
 			if (pktns == &qc->pktns[QUIC_TLS_PKTNS_INITIAL]) {
 				if (qc_may_probe_ipktns(qc)) {
 					qc->flags |= QUIC_FL_CONN_RETRANS_NEEDED;
@@ -6952,7 +6983,7 @@ static inline int qc_build_frms(struct list *outlist, struct list *inlist,
 			break;
 
 		case QUIC_FT_STREAM_8 ... QUIC_FT_STREAM_F:
-			if (cf->flags & QUIC_FL_TX_FRAME_LOST) {
+			if (cf->stream.dup) {
 				struct eb64_node *node = NULL;
 				struct qc_stream_desc *stream_desc = NULL;
 				struct quic_stream *strm = &cf->stream;
@@ -7059,6 +7090,7 @@ static inline int qc_build_frms(struct list *outlist, struct list *inlist,
 				/* FIN bit reset */
 				new_cf->type &= ~QUIC_STREAM_FRAME_TYPE_FIN_BIT;
 				new_cf->stream.data = cf->stream.data;
+				new_cf->stream.dup = cf->stream.dup;
 				TRACE_DEVEL("split frame", QUIC_EV_CONN_PRSAFRM, qc, new_cf);
 				if (cf->origin) {
 					TRACE_DEVEL("duplicated frame", QUIC_EV_CONN_PRSAFRM, qc);
@@ -7765,6 +7797,27 @@ void qc_notify_close(struct quic_conn *qc)
 		            QUIC_FL_CONN_NOTIFY_CLOSE, qc);
  leave:
 	TRACE_LEAVE(QUIC_EV_CONN_CLOSE, qc);
+}
+
+/* Wake-up upper layer if waiting for send to be ready.
+ *
+ * Returns 1 if upper layer has been woken up else 0.
+ */
+int qc_notify_send(struct quic_conn *qc)
+{
+	if (qc->subs && qc->subs->events & SUB_RETRY_SEND) {
+		if (quic_path_prep_data(qc->path) &&
+		    (!qc_test_fd(qc) || !fd_send_active(qc->fd))) {
+			tasklet_wakeup(qc->subs->tasklet);
+			qc->subs->events &= ~SUB_RETRY_SEND;
+			if (!qc->subs->events)
+				qc->subs = NULL;
+
+			return 1;
+		}
+	}
+
+	return 0;
 }
 
 

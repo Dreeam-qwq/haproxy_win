@@ -127,7 +127,7 @@ void fd_add_to_fd_list(volatile struct fdlist *list, int fd)
 	int last;
 
 redo_next:
-	next = fdtab[fd].update.next;
+	next = HA_ATOMIC_LOAD(&fdtab[fd].update.next);
 	/* Check that we're not already in the cache, and if not, lock us. */
 	if (next > -2)
 		goto done;
@@ -194,7 +194,7 @@ void fd_rm_from_fd_list(volatile struct fdlist *list, int fd)
 lock_self:
 #if (defined(HA_CAS_IS_8B) || defined(HA_HAVE_CAS_DW))
 	next_list.ent.next = next_list.ent.prev = -2;
-	cur_list.ent = fdtab[fd].update;
+	cur_list.ent = *(volatile typeof(fdtab->update)*)&fdtab[fd].update;
 	/* First, attempt to lock our own entries */
 	do {
 		/* The FD is not in the FD cache, give up */
@@ -214,7 +214,7 @@ lock_self:
 
 #else
 lock_self_next:
-	next = fdtab[fd].update.next;
+	next = HA_ATOMIC_LOAD(&fdtab[fd].update.next);
 	if (next == -2)
 		goto lock_self_next;
 	if (next <= -3)
@@ -222,7 +222,7 @@ lock_self_next:
 	if (unlikely(!_HA_ATOMIC_CAS(&fdtab[fd].update.next, &next, -2)))
 		goto lock_self_next;
 lock_self_prev:
-	prev = fdtab[fd].update.prev;
+	prev = HA_ATOMIC_LOAD(&fdtab[fd].update.prev);
 	if (prev == -2)
 		goto lock_self_prev;
 	if (unlikely(!_HA_ATOMIC_CAS(&fdtab[fd].update.prev, &prev, -2)))
@@ -296,11 +296,13 @@ done:
 /* deletes the FD once nobody uses it anymore, as detected by the caller by its
  * thread_mask being zero and its running mask turning to zero. There is no
  * protection against concurrent accesses, it's up to the caller to make sure
- * only the last thread will call it. This is only for internal use, please use
- * fd_delete() instead.
+ * only the last thread will call it. If called under isolation, it is safe to
+ * call this from another group than the FD's. This is only for internal use,
+ * please use fd_delete() instead.
  */
 void _fd_delete_orphan(int fd)
 {
+	int tgrp = fd_tgid(fd);
 	uint fd_disown;
 
 	fd_disown = fdtab[fd].state & FD_DISOWN;
@@ -318,7 +320,7 @@ void _fd_delete_orphan(int fd)
 		cur_poller.clo(fd);
 
 	/* we don't want this FD anymore in the global list */
-	fd_rm_from_fd_list(&update_list[tgid - 1], fd);
+	fd_rm_from_fd_list(&update_list[tgrp - 1], fd);
 
 	/* no more updates on this FD are relevant anymore */
 	HA_ATOMIC_STORE(&fdtab[fd].update_mask, 0);
@@ -346,7 +348,11 @@ void _fd_delete_orphan(int fd)
 }
 
 /* Deletes an FD from the fdsets. The file descriptor is also closed, possibly
- * asynchronously. Only the owning thread may do this.
+ * asynchronously. It is safe to call it from another thread from the same
+ * group as the FD's or from a thread from a different group. However if called
+ * from a thread from another group, there is an extra cost involved because
+ * the operation is performed under thread isolation, so doing so must be
+ * reserved for ultra-rare cases (e.g. stopping a listener).
  */
 void fd_delete(int fd)
 {
@@ -365,8 +371,27 @@ void fd_delete(int fd)
 
 	/* the tgid cannot change before a complete close so we should never
 	 * face the situation where we try to close an fd that was reassigned.
+	 * However there is one corner case where this happens, it's when an
+	 * attempt to pause a listener fails (e.g. abns), leaving the listener
+	 * in fault state and it is forcefully stopped. This needs to be done
+	 * under isolation, and it's quite rare (i.e. once per such FD per
+	 * process). Since we'll be isolated we can clear the thread mask and
+	 * close the FD ourselves.
 	 */
-	BUG_ON(fd_tgid(fd) != ti->tgid && !thread_isolated() && !(global.mode & MODE_STOPPING));
+	if (unlikely(fd_tgid(fd) != ti->tgid)) {
+		int must_isolate = !thread_isolated() && !(global.mode & MODE_STOPPING);
+
+		if (must_isolate)
+			thread_isolate();
+
+		HA_ATOMIC_STORE(&fdtab[fd].thread_mask, 0);
+		HA_ATOMIC_STORE(&fdtab[fd].running_mask, 0);
+		_fd_delete_orphan(fd);
+
+		if (must_isolate)
+			thread_release();
+		return;
+	}
 
 	/* we must postpone removal of an FD that may currently be in use
 	 * by another thread. This can happen in the following two situations:

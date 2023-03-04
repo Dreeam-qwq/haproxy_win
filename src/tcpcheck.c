@@ -1412,7 +1412,7 @@ enum tcpcheck_eval_ret tcpcheck_eval_send(struct check *check, struct tcpcheck_r
 		    (istlen(vsn) == 8 && (*(vsn.ptr+5) > '1' || (*(vsn.ptr+5) == '1' && *(vsn.ptr+7) >= '1'))))
 			slflags |= HTX_SL_F_VER_11;
 		slflags |= (HTX_SL_F_XFER_LEN|HTX_SL_F_CLEN);
-		if (!isttest(send->http.body))
+		if (!(send->http.flags & TCPCHK_SND_HTTP_FL_BODY_FMT) && !isttest(send->http.body))
 			slflags |= HTX_SL_F_BODYLESS;
 
 		htx = htx_from_buf(&check->bo);
@@ -1459,12 +1459,18 @@ enum tcpcheck_eval_ret tcpcheck_eval_send(struct check *check, struct tcpcheck_r
 		}
 		else
 			body = send->http.body;
-		clen = ist((!istlen(body) ? "0" : ultoa(istlen(body))));
 
-		if ((!connection_hdr && !htx_add_header(htx, ist("Connection"), ist("close"))) ||
-		    !htx_add_header(htx, ist("Content-length"), clen))
+		if (!connection_hdr && !htx_add_header(htx, ist("Connection"), ist("close")))
 			goto error_htx;
 
+		if ((send->http.meth.meth != HTTP_METH_OPTIONS &&
+		     send->http.meth.meth != HTTP_METH_GET &&
+		     send->http.meth.meth != HTTP_METH_HEAD &&
+		     send->http.meth.meth != HTTP_METH_DELETE) || istlen(body)) {
+			clen = ist((!istlen(body) ? "0" : ultoa(istlen(body))));
+			if (!htx_add_header(htx, ist("Content-length"), clen))
+				goto error_htx;
+		}
 
 		if (!htx_add_endof(htx, HTX_BLK_EOH) ||
 		    (istlen(body) && !htx_add_data_atonce(htx, body)))

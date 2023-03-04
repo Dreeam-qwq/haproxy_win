@@ -160,7 +160,7 @@ int ssl_sock_ocsp_stapling_cbk(SSL *ssl, void *arg)
 	if (!ocsp ||
 	    !ocsp->response.area ||
 	    !ocsp->response.data ||
-	    (ocsp->expire < now.tv_sec))
+	    (ocsp->expire < date.tv_sec))
 		return SSL_TLSEXT_ERR_NOACK;
 
 	ssl_buf = OPENSSL_malloc(ocsp->response.data);
@@ -183,10 +183,6 @@ struct eb_root cert_ocsp_tree = EB_ROOT_UNIQUE;
 __decl_thread(HA_SPINLOCK_T ocsp_tree_lock);
 
 struct eb_root ocsp_update_tree = EB_ROOT; /* updatable ocsp responses sorted by next_update in absolute time */
-#define SSL_OCSP_UPDATE_DELAY_MAX 60*60 /* 1H */
-#define SSL_OCSP_UPDATE_DELAY_MIN 5*60  /* 5 minutes */
-#define SSL_OCSP_UPDATE_MARGIN 60   /* 1 minute */
-#define SSL_OCSP_HTTP_ERR_REPLAY 60 /* 1 minute */
 
 /* This function starts to check if the OCSP response (in DER format) contained
  * in chunk 'ocsp_response' is valid (else exits on error).
@@ -417,6 +413,18 @@ static inline int ocsp_certid_print(BIO *bp, OCSP_CERTID *certid, int indent)
 	return 1;
 }
 
+
+enum {
+	SHOW_OCSPRESP_FMT_DFLT,
+	SHOW_OCSPRESP_FMT_TEXT,
+	SHOW_OCSPRESP_FMT_B64
+};
+
+struct show_ocspresp_cli_ctx {
+	struct certificate_ocsp *ocsp;
+	int format;
+};
+
 /*
  * Dump the details about an OCSP response in DER format stored in
  * <ocsp_response> into buffer <out>.
@@ -500,6 +508,29 @@ end:
 }
 
 /*
+ * Dump the contents of an OCSP response in DER format stored in
+ * <ocsp_response> into buffer <out> after converting it to base64.
+ * Returns 0 in case of success.
+ */
+static int ssl_ocsp_response_print_base64(struct buffer *ocsp_response, struct buffer *out)
+{
+	int b64len = 0;
+
+	b64len = a2base64(b_orig(ocsp_response), b_data(ocsp_response),
+	                  b_orig(out), b_size(out));
+
+	if (b64len < 0)
+		return 1;
+
+	out->data = b64len;
+
+	/* Add empty line */
+	chunk_appendf(ocsp_response, "\n");
+
+	return 0;
+}
+
+/*
  * Dump the details of the OCSP response of ID <ocsp_certid> into buffer <out>.
  * Returns 0 in case of success.
  */
@@ -528,29 +559,31 @@ int ssl_get_ocspresponse_detail(unsigned char *ocsp_certid, struct buffer *out)
  */
 static int cli_io_handler_show_ocspresponse_detail(struct appctx *appctx)
 {
-	struct buffer *trash = alloc_trash_chunk();
-	struct certificate_ocsp *ocsp = appctx->svcctx;
+	struct buffer *trash = get_trash_chunk();
+	struct show_ocspresp_cli_ctx *ctx = appctx->svcctx;
+	struct certificate_ocsp *ocsp = ctx->ocsp;
+	int retval = 0;
 
-	if (trash == NULL)
-		return 1;
-
-	if (ssl_ocsp_response_print(&ocsp->response, trash)) {
-		free_trash_chunk(trash);
-		return 1;
+	switch (ctx->format) {
+	case SHOW_OCSPRESP_FMT_DFLT:
+	case SHOW_OCSPRESP_FMT_TEXT:
+		retval = ssl_ocsp_response_print(&ocsp->response, trash);
+		break;
+	case SHOW_OCSPRESP_FMT_B64:
+		retval = ssl_ocsp_response_print_base64(&ocsp->response, trash);
+		break;
 	}
+
+	if (retval)
+		return 1;
 
 	if (applet_putchk(appctx, trash) == -1)
 		goto yield;
 
 	appctx->svcctx = NULL;
-	if (trash)
-		free_trash_chunk(trash);
 	return 1;
 
 yield:
-	if (trash)
-		free_trash_chunk(trash);
-
 	return 0;
 }
 
@@ -774,16 +807,38 @@ end:
  */
 
 struct task *ocsp_update_task __read_mostly = NULL;
+static struct proxy *httpclient_ocsp_update_px;
 
 static struct ssl_ocsp_task_ctx {
 	struct certificate_ocsp *cur_ocsp;
 	struct httpclient *hc;
+	struct appctx *appctx;
 	int flags;
+	int update_status;
 } ssl_ocsp_task_ctx;
 
 const struct http_hdr ocsp_request_hdrs[] = {
 	{ IST("Content-Type"), IST("application/ocsp-request") },
 	{ IST_NULL, IST_NULL }
+};
+
+enum {
+	OCSP_UPDT_UNKNOWN = 0,
+	OCSP_UPDT_OK = 1,
+	OCSP_UPDT_ERR_HTTP_STATUS = 2,
+	OCSP_UPDT_ERR_HTTP_HDR = 3,
+	OCSP_UPDT_ERR_CHECK = 4,
+	OCSP_UPDT_ERR_INSERT = 5,
+	OCSP_UPDT_ERR_LAST	/* Must be last */
+};
+
+const struct ist ocsp_update_errors[] = {
+	[OCSP_UPDT_UNKNOWN] = IST("Unknown"),
+	[OCSP_UPDT_OK] = IST("Update successful"),
+	[OCSP_UPDT_ERR_HTTP_STATUS] = IST("HTTP error"),
+	[OCSP_UPDT_ERR_HTTP_HDR] = IST("Missing \"ocsp-response\" header"),
+	[OCSP_UPDT_ERR_CHECK] = IST("OCSP response check failure"),
+	[OCSP_UPDT_ERR_INSERT] = IST("Error during insertion")
 };
 
 static struct task *ssl_ocsp_update_responses(struct task *task, void *context, unsigned int state);
@@ -846,13 +901,18 @@ void ssl_destroy_ocsp_update_task(void)
 
 	ssl_sock_free_ocsp(ssl_ocsp_task_ctx.cur_ocsp);
 	ssl_ocsp_task_ctx.cur_ocsp = NULL;
+
+	if (ssl_ocsp_task_ctx.hc) {
+		httpclient_stop_and_destroy(ssl_ocsp_task_ctx.hc);
+		ssl_ocsp_task_ctx.hc = NULL;
+	}
 }
 
 static inline void ssl_ocsp_set_next_update(struct certificate_ocsp *ocsp)
 {
 	int update_margin = (ocsp->expire >= SSL_OCSP_UPDATE_MARGIN) ? SSL_OCSP_UPDATE_MARGIN : 0;
 
-	ocsp->next_update.key = MIN(now.tv_sec + SSL_OCSP_UPDATE_DELAY_MAX,
+	ocsp->next_update.key = MIN(date.tv_sec + global_ssl.ocsp_update.delay_max,
 	                            ocsp->expire - update_margin);
 
 	/* An already existing valid OCSP response that expires within less than
@@ -861,7 +921,7 @@ static inline void ssl_ocsp_set_next_update(struct certificate_ocsp *ocsp)
 	 * update of the same response. */
 	if (b_data(&ocsp->response))
 		ocsp->next_update.key = MAX(ocsp->next_update.key,
-		                            now.tv_sec + SSL_OCSP_UPDATE_DELAY_MIN);
+		                            date.tv_sec + global_ssl.ocsp_update.delay_min);
 }
 
 /*
@@ -881,6 +941,8 @@ int ssl_ocsp_update_insert(struct certificate_ocsp *ocsp)
 	 */
 	ssl_ocsp_set_next_update(ocsp);
 
+	ocsp->fail_count = 0;
+
 	HA_SPIN_LOCK(OCSP_LOCK, &ocsp_tree_lock);
 	eb64_insert(&ocsp_update_tree, &ocsp->next_update);
 	HA_SPIN_UNLOCK(OCSP_LOCK, &ocsp_tree_lock);
@@ -897,13 +959,27 @@ int ssl_ocsp_update_insert(struct certificate_ocsp *ocsp)
  */
 int ssl_ocsp_update_insert_after_error(struct certificate_ocsp *ocsp)
 {
-	/* Set next_update based on current time and the various OCSP
+	int replay_delay = 0;
+	/*
+	 * Set next_update based on current time and the various OCSP
 	 * minimum/maximum update times.
 	 */
 	ssl_ocsp_set_next_update(ocsp);
 
-	if (ocsp->next_update.key < now.tv_sec + SSL_OCSP_HTTP_ERR_REPLAY)
-		ocsp->next_update.key = now.tv_sec + SSL_OCSP_HTTP_ERR_REPLAY;
+	++ocsp->fail_count;
+
+	/*
+	 * The replay delay will be increased for every consecutive update
+	 * failure, up to the SSL_OCSP_UPDATE_DELAY_MAX delay. It will ensure
+	 * that the replay delay will be one minute for the first failure and
+	 * will be multiplied by 2 for every subsequent failures, while still
+	 * being at most 1 hour (with the current default values).
+	 */
+	replay_delay = MIN(SSL_OCSP_HTTP_ERR_REPLAY * (1 << ocsp->fail_count),
+	                   global_ssl.ocsp_update.delay_max);
+
+	if (ocsp->next_update.key < date.tv_sec + replay_delay)
+		ocsp->next_update.key = date.tv_sec + replay_delay;
 
 	HA_SPIN_LOCK(OCSP_LOCK, &ocsp_tree_lock);
 	eb64_insert(&ocsp_update_tree, &ocsp->next_update);
@@ -956,6 +1032,22 @@ void ocsp_update_response_end_cb(struct httpclient *hc)
 	task_wakeup(task, TASK_WOKEN_MSG);
 }
 
+
+/*
+ * Send a log line that will use the dedicated proxy's error_logformat string.
+ * It uses the sess_log function instead of app_log for instance in order to
+ * benefit from the "generic" items that can be added to a log format line such
+ * as the date and frontend name that can be found at the beginning of the
+ * ocspupdate_log_format line.
+ */
+static void ssl_ocsp_send_log()
+{
+	if (!ssl_ocsp_task_ctx.appctx)
+		return;
+
+	sess_log(ssl_ocsp_task_ctx.appctx->sess);
+}
+
 /*
  * This is the main function of the ocsp auto update mechanism. It has two
  * distinct parts and the branching to one or the other is completely based on
@@ -993,6 +1085,7 @@ static struct task *ssl_ocsp_update_responses(struct task *task, void *context, 
 		hc = ctx->hc;
 		if (ctx->flags & HC_F_RES_STLINE) {
 			if (hc->res.status != 200) {
+				ctx->update_status = OCSP_UPDT_ERR_HTTP_STATUS;
 				goto http_error;
 			}
 			ctx->flags &= ~HC_F_RES_STLINE;
@@ -1011,6 +1104,7 @@ static struct task *ssl_ocsp_update_responses(struct task *task, void *context, 
 				}
 			}
 			if (!found) {
+				ctx->update_status = OCSP_UPDT_ERR_HTTP_HDR;
 				goto http_error;
 			}
 			ctx->flags &= ~HC_F_RES_HDR;
@@ -1026,10 +1120,13 @@ static struct task *ssl_ocsp_update_responses(struct task *task, void *context, 
 			/* Process the body that must be complete since
 			 * HC_F_RES_END is set. */
 			if (ctx->flags & HC_F_RES_BODY) {
-				if (ssl_ocsp_check_response(ocsp->chain, ocsp->issuer, &hc->res.buf, NULL))
+				if (ssl_ocsp_check_response(ocsp->chain, ocsp->issuer, &hc->res.buf, NULL)) {
+					ctx->update_status = OCSP_UPDT_ERR_CHECK;
 					goto http_error;
+				}
 
 				if (ssl_sock_update_ocsp_response(&hc->res.buf, NULL) != 0) {
+					ctx->update_status = OCSP_UPDT_ERR_INSERT;
 					goto http_error;
 				}
 
@@ -1037,6 +1134,13 @@ static struct task *ssl_ocsp_update_responses(struct task *task, void *context, 
 			}
 
 			ctx->flags &= ~HC_F_RES_END;
+
+			++ocsp->num_success;
+			ocsp->last_update = date.tv_sec;
+			ctx->update_status = OCSP_UPDT_OK;
+			ocsp->last_update_status = ctx->update_status;
+
+			ssl_ocsp_send_log();
 
 			/* Reinsert the entry into the update list so that it can be updated later */
 			ssl_ocsp_update_insert(ocsp);
@@ -1048,8 +1152,8 @@ static struct task *ssl_ocsp_update_responses(struct task *task, void *context, 
 			/* Set next_wakeup to the new first entry of the tree */
 			eb = eb64_first(&ocsp_update_tree);
 			if (eb) {
-				if (eb->key > now.tv_sec)
-					next_wakeup = (eb->key - now.tv_sec)*1000;
+				if (eb->key > date.tv_sec)
+					next_wakeup = (eb->key - date.tv_sec)*1000;
 				else
 					next_wakeup = 0;
 			}
@@ -1072,8 +1176,8 @@ static struct task *ssl_ocsp_update_responses(struct task *task, void *context, 
 			goto wait;
 		}
 
-		if (eb->key > now.tv_sec) {
-			next_wakeup = (eb->key - now.tv_sec)*1000;
+		if (eb->key > date.tv_sec) {
+			next_wakeup = (eb->key - date.tv_sec)*1000;
 			HA_SPIN_UNLOCK(OCSP_LOCK, &ocsp_tree_lock);
 			goto leave;
 		}
@@ -1086,6 +1190,7 @@ static struct task *ssl_ocsp_update_responses(struct task *task, void *context, 
 
 		++ocsp->refcount;
 		ctx->cur_ocsp = ocsp;
+		ocsp->last_update_status = OCSP_UPDT_UNKNOWN;
 
 		HA_SPIN_UNLOCK(OCSP_LOCK, &ocsp_tree_lock);
 
@@ -1115,7 +1220,9 @@ static struct task *ssl_ocsp_update_responses(struct task *task, void *context, 
 		/* Depending on the processing that occurred in
 		 * ssl_ocsp_create_request_details we could either have to send
 		 * a GET or a POST request. */
-		hc = httpclient_new(task, b_data(req_body) ? HTTP_METH_POST : HTTP_METH_GET, ist2(b_orig(req_url), b_data(req_url)));
+		hc = httpclient_new_from_proxy(httpclient_ocsp_update_px, task,
+		                               b_data(req_body) ? HTTP_METH_POST : HTTP_METH_GET,
+		                               ist2(b_orig(req_url), b_data(req_url)));
 		if (!hc) {
 			goto leave;
 		}
@@ -1131,7 +1238,7 @@ static struct task *ssl_ocsp_update_responses(struct task *task, void *context, 
 		hc->ops.res_payload = ocsp_update_response_body_cb;
 		hc->ops.res_end = ocsp_update_response_end_cb;
 
-		if (!httpclient_start(hc)) {
+		if (!(ctx->appctx = httpclient_start(hc))) {
 			goto leave;
 		}
 
@@ -1145,7 +1252,8 @@ static struct task *ssl_ocsp_update_responses(struct task *task, void *context, 
 leave:
 	if (ctx->cur_ocsp) {
 		/* Something went wrong, reinsert the entry in the tree. */
-		ssl_ocsp_update_insert(ctx->cur_ocsp);
+		++ctx->cur_ocsp->num_failure;
+		ssl_ocsp_update_insert_after_error(ctx->cur_ocsp);
 		/* Release the reference kept on the updated ocsp response. */
 		ssl_sock_free_ocsp(ctx->cur_ocsp);
 		ctx->cur_ocsp = NULL;
@@ -1164,9 +1272,13 @@ wait:
 	return task;
 
 http_error:
+	ssl_ocsp_send_log();
 	/* Reinsert certificate into update list so that it can be updated later */
-	if (ocsp)
+	if (ocsp) {
+		++ocsp->num_failure;
+		ocsp->last_update_status = ctx->update_status;
 		ssl_ocsp_update_insert_after_error(ocsp);
+	}
 
 	if (hc)
 		httpclient_stop_and_destroy(hc);
@@ -1176,8 +1288,8 @@ http_error:
 	/* Set next_wakeup to the new first entry of the tree */
 	eb = eb64_first(&ocsp_update_tree);
 	if (eb) {
-		if (eb->key > now.tv_sec)
-			next_wakeup = (eb->key - now.tv_sec)*1000;
+		if (eb->key > date.tv_sec)
+			next_wakeup = (eb->key - date.tv_sec)*1000;
 		else
 			next_wakeup = 0;
 	}
@@ -1189,6 +1301,28 @@ http_error:
 	return task;
 }
 
+char ocspupdate_log_format[] = "%ci:%cp [%tr] %ft %[ssl_ocsp_certid] %[ssl_ocsp_status] %{+Q}[ssl_ocsp_status_str] %[ssl_ocsp_fail_cnt] %[ssl_ocsp_success_cnt]";
+
+/*
+ * Initialize the proxy for the OCSP update HTTP client with 2 servers, one for
+ * raw HTTP, the other for HTTPS.
+ */
+static int ssl_ocsp_update_precheck()
+{
+	/* initialize the OCSP update dedicated httpclient */
+	httpclient_ocsp_update_px = httpclient_create_proxy("<HC_OCSP>");
+	if (!httpclient_ocsp_update_px)
+		return 1;
+	httpclient_ocsp_update_px->conf.error_logformat_string = strdup(ocspupdate_log_format);
+	httpclient_ocsp_update_px->conf.logformat_string = httpclient_log_format;
+	httpclient_ocsp_update_px->options2 |= PR_O2_NOLOGNORM;
+
+	return 0;
+}
+
+/* initialize the proxy and servers for the HTTP client */
+
+REGISTER_PRE_CHECK(ssl_ocsp_update_precheck);
 
 
 
@@ -1352,7 +1486,9 @@ static int cli_parse_update_ocsp_response(char **args, char *payload, struct app
 		goto end;
 	}
 
-	hc = httpclient_new(appctx, b_data(req_body) ? HTTP_METH_POST : HTTP_METH_GET, ist2(b_orig(req_url), b_data(req_url)));
+	hc = httpclient_new_from_proxy(httpclient_ocsp_update_px, appctx,
+	                               b_data(req_body) ? HTTP_METH_POST : HTTP_METH_GET,
+	                               ist2(b_orig(req_url), b_data(req_url)));
 	if (!hc) {
 		memprintf(&err, "%sCan't allocate httpclient\n", err ? err : "");
 		goto end;
@@ -1540,17 +1676,32 @@ static int cli_parse_set_ocspresponse(char **args, char *payload, struct appctx 
 static int cli_parse_show_ocspresponse(char **args, char *payload, struct appctx *appctx, void *private)
 {
 #if ((defined SSL_CTRL_SET_TLSEXT_STATUS_REQ_CB && !defined OPENSSL_NO_OCSP) && !defined OPENSSL_IS_BORINGSSL)
+
+	struct show_ocspresp_cli_ctx *ctx = applet_reserve_svcctx(appctx, sizeof(*ctx));
+	int certid_arg_idx = 3;
+
 	if (*args[3]) {
 		struct certificate_ocsp *ocsp = NULL;
 		char key[OCSP_MAX_CERTID_ASN1_LENGTH] = {};
 		int key_length = OCSP_MAX_CERTID_ASN1_LENGTH;
 		char *key_ptr = key;
 
-		if (strlen(args[3]) > OCSP_MAX_CERTID_ASN1_LENGTH*2) {
+		if (strcmp(args[3], "text") == 0) {
+			ctx->format = SHOW_OCSPRESP_FMT_TEXT;
+			++certid_arg_idx;
+		} else if (strcmp(args[3], "base64") == 0) {
+			ctx->format = SHOW_OCSPRESP_FMT_B64;
+			++certid_arg_idx;
+		}
+
+		if (ctx->format != SHOW_OCSPRESP_FMT_DFLT && !*args[certid_arg_idx])
+			return cli_err(appctx, "'show ssl ocsp-response [text|base64]' expects a valid certid.\n");
+
+		if (strlen(args[certid_arg_idx]) > OCSP_MAX_CERTID_ASN1_LENGTH*2) {
 			return cli_err(appctx, "'show ssl ocsp-response' received a too big key.\n");
 		}
 
-		if (!parse_binary(args[3], &key_ptr, &key_length, NULL)) {
+		if (!parse_binary(args[certid_arg_idx], &key_ptr, &key_length, NULL)) {
 			return cli_err(appctx, "'show ssl ocsp-response' received an invalid key.\n");
 		}
 
@@ -1564,7 +1715,7 @@ static int cli_parse_show_ocspresponse(char **args, char *payload, struct appctx
 		++ocsp->refcount;
 		HA_SPIN_UNLOCK(OCSP_LOCK, &ocsp_tree_lock);
 
-		appctx->svcctx = ocsp;
+		ctx->ocsp = ocsp;
 		appctx->io_handler = cli_io_handler_show_ocspresponse_detail;
 	}
 
@@ -1589,6 +1740,7 @@ static int cli_io_handler_show_ocspresponse(struct appctx *appctx)
 	struct certificate_ocsp *ocsp = NULL;
 	BIO *bio = NULL;
 	int write = -1;
+	struct show_ocspresp_cli_ctx *ctx = appctx->svcctx;
 
 	if (trash == NULL)
 		return 1;
@@ -1602,11 +1754,11 @@ static int cli_io_handler_show_ocspresponse(struct appctx *appctx)
 	if ((bio = BIO_new(BIO_s_mem())) == NULL)
 		goto end;
 
-	if (!appctx->svcctx) {
+	if (!ctx->ocsp) {
 		chunk_appendf(trash, "# Certificate IDs\n");
 		node = ebmb_first(&cert_ocsp_tree);
 	} else {
-		node = &((struct certificate_ocsp *)appctx->svcctx)->key;
+		node = &ctx->ocsp->key;
 	}
 
 	while (node) {
@@ -1648,7 +1800,6 @@ static int cli_io_handler_show_ocspresponse(struct appctx *appctx)
 
 end:
 	HA_SPIN_UNLOCK(OCSP_LOCK, &ocsp_tree_lock);
-	appctx->svcctx = NULL;
 	free_trash_chunk(trash);
 	free_trash_chunk(tmp);
 	BIO_free(bio);
@@ -1660,7 +1811,7 @@ yield:
 	BIO_free(bio);
 
 	++ocsp->refcount;
-	appctx->svcctx = ocsp;
+	ctx->ocsp = ocsp;
 	HA_SPIN_UNLOCK(OCSP_LOCK, &ocsp_tree_lock);
 	return 0;
 #else
@@ -1683,17 +1834,266 @@ int ocsp_update_check_cfg_consistency(struct ckch_store *store, struct crtlist_e
 	return err_code;
 }
 
-static struct cli_kw_list cli_kws = {{ },{
-	{ { "set", "ssl", "ocsp-response", NULL }, "set ssl ocsp-response <resp|payload>    : update a certificate's OCSP Response from a base64-encode DER",      cli_parse_set_ocspresponse, NULL },
+struct show_ocsp_updates_ctx {
+	struct certificate_ocsp *cur_ocsp;
+};
 
-	{ { "show", "ssl", "ocsp-response", NULL },"show ssl ocsp-response [id]             : display the IDs of the OCSP responses used in memory, or the details of a single OCSP response", cli_parse_show_ocspresponse, cli_io_handler_show_ocspresponse, NULL },
+/*
+ * Parsing function for 'show ssl ocsp-updates [nb]'.
+ */
+static int cli_parse_show_ocsp_updates(char **args, char *payload, struct appctx *appctx, void *private)
+{
 #if ((defined SSL_CTRL_SET_TLSEXT_STATUS_REQ_CB && !defined OPENSSL_NO_OCSP) && !defined OPENSSL_IS_BORINGSSL)
-	{ { "update", "ssl", "ocsp-response", NULL }, "update ssl ocsp-response <certfile>  : send ocsp request and update stored ocsp response",                  cli_parse_update_ocsp_response, cli_io_handler_update_ocsp_response, cli_release_update_ocsp_response },
+	struct show_ocsp_updates_ctx *ctx = applet_reserve_svcctx(appctx, sizeof(*ctx));
+
+	HA_SPIN_LOCK(OCSP_LOCK, &ocsp_tree_lock);
+
+	return 0;
+#else
+	return cli_err(appctx, "HAProxy was compiled against a version of OpenSSL that doesn't support OCSP stapling.\n");
+#endif
+}
+
+/*
+ * Dump information about an ocsp response concerning ocsp auto update.
+ * It follows the following format :
+ * OCSP Certid | Path | Next Update | Last Update | Successes | Failures | Last Update Status | Last Update Status (str)
+ * Return 0 in case of success.
+ */
+static int dump_ocsp_update_info(struct certificate_ocsp *ocsp, struct buffer *out)
+{
+	struct tm tm = {};
+	char *ret;
+	int i;
+	time_t next_update;
+
+	/* Dump OCSP certid */
+	for (i = 0; i < ocsp->key_length; ++i) {
+		chunk_appendf(out, "%02x", ocsp->key_data[i]);
+	}
+
+	chunk_appendf(out, " | ");
+
+	/* Dump path */
+	chunk_appendf(out, "%s", ocsp->path);
+
+	chunk_appendf(out, " | ");
+
+	/* Dump next update time */
+	if (ocsp->next_update.key != 0) {
+		next_update = ocsp->next_update.key;
+		get_localtime(ocsp->next_update.key, &tm);
+	} else {
+		next_update = date.tv_sec;
+		get_localtime(date.tv_sec, &tm);
+	}
+	ret = localdate2str_log(b_orig(out)+b_data(out), next_update, &tm, b_size(out)-b_data(out));
+
+	if (ret == NULL)
+		return 1;
+
+	out->data = (ret - out->area);
+
+	chunk_appendf(out, " | ");
+
+	/* Dump last update time or "-" if no update occurred yet */
+	if (ocsp->last_update) {
+		get_localtime(ocsp->last_update, &tm);
+		ret = localdate2str_log(b_orig(out)+b_data(out), ocsp->last_update, &tm, b_size(out)-b_data(out));
+
+		if (ret == NULL)
+			return 1;
+
+		out->data = (ret - out->area);
+	} else
+		chunk_appendf(out, "-");
+
+	chunk_appendf(out, " | ");
+
+	/* Number of successful updates */
+	chunk_appendf(out, "%d", ocsp->num_success);
+
+	chunk_appendf(out, " | ");
+
+	/* Number of failed updates */
+	chunk_appendf(out, "%d", ocsp->num_failure);
+
+	chunk_appendf(out, " | ");
+
+	/* Last update status */
+	chunk_appendf(out, "%d", ocsp->last_update_status);
+
+	chunk_appendf(out, " | ");
+
+	/* Last update status str */
+	if (ocsp->last_update_status >= OCSP_UPDT_ERR_LAST)
+		chunk_appendf(out, "-");
+	else
+		chunk_appendf(out, "%s", istptr(ocsp_update_errors[ocsp->last_update_status]));
+
+	chunk_appendf(out, "\n");
+
+	return 0;
+}
+
+static int cli_io_handler_show_ocsp_updates(struct appctx *appctx)
+{
+	struct show_ocsp_updates_ctx *ctx = appctx->svcctx;
+	struct eb64_node *node;
+	struct certificate_ocsp *ocsp = NULL;
+	struct buffer *trash = get_trash_chunk();
+
+	if (!ctx->cur_ocsp) {
+		node = eb64_first(&ocsp_update_tree);
+		chunk_appendf(trash, "OCSP Certid | Path | Next Update | Last Update | Successes | Failures | Last Update Status | Last Update Status (str)\n");
+
+		/* Look for an entry currently being updated */
+		ocsp = ssl_ocsp_task_ctx.cur_ocsp;
+		if (ocsp) {
+			if (dump_ocsp_update_info(ocsp, trash))
+				goto end;
+		}
+
+		if (applet_putchk(appctx, trash) == -1)
+			goto yield;
+
+	} else {
+		node = &((struct certificate_ocsp*)ctx->cur_ocsp)->next_update;
+	}
+
+	while (node) {
+		ocsp = eb64_entry(node, struct certificate_ocsp, next_update);
+
+		chunk_reset(trash);
+		if (dump_ocsp_update_info(ocsp, trash))
+			goto end;
+
+		if (applet_putchk(appctx, trash) == -1) {
+			ctx->cur_ocsp = ocsp;
+			goto yield;
+		}
+
+		node = eb64_next(node);
+	}
+
+end:
+	return 1;
+
+yield:
+	return 0; /* should come back */
+}
+
+static void cli_release_show_ocsp_updates(struct appctx *appctx)
+{
+	HA_SPIN_UNLOCK(OCSP_LOCK, &ocsp_tree_lock);
+}
+
+
+static int
+smp_fetch_ssl_ocsp_certid(const struct arg *args, struct sample *smp, const char *kw, void *private)
+{
+	struct buffer *data = get_trash_chunk();
+	struct certificate_ocsp *ocsp = ssl_ocsp_task_ctx.cur_ocsp;
+
+	if (!ocsp)
+		return 0;
+
+	dump_binary(data, (char *)ocsp->key_data, ocsp->key_length);
+
+	smp->data.type = SMP_T_STR;
+	smp->data.u.str = *data;
+	return 1;
+}
+
+static int
+smp_fetch_ssl_ocsp_status(const struct arg *args, struct sample *smp, const char *kw, void *private)
+{
+	struct certificate_ocsp *ocsp = ssl_ocsp_task_ctx.cur_ocsp;
+
+	if (!ocsp)
+		return 0;
+
+	smp->data.type = SMP_T_SINT;
+	smp->data.u.sint = ssl_ocsp_task_ctx.update_status;
+	return 1;
+}
+
+static int
+smp_fetch_ssl_ocsp_status_str(const struct arg *args, struct sample *smp, const char *kw, void *private)
+{
+	struct certificate_ocsp *ocsp = ssl_ocsp_task_ctx.cur_ocsp;
+
+	if (!ocsp)
+		return 0;
+
+	if (ssl_ocsp_task_ctx.update_status >= OCSP_UPDT_ERR_LAST)
+		return 0;
+
+	smp->data.type = SMP_T_STR;
+	smp->data.u.str = ist2buf(ocsp_update_errors[ssl_ocsp_task_ctx.update_status]);
+
+	return 1;
+}
+
+static int
+smp_fetch_ssl_ocsp_fail_cnt(const struct arg *args, struct sample *smp, const char *kw, void *private)
+{
+	struct certificate_ocsp *ocsp = ssl_ocsp_task_ctx.cur_ocsp;
+
+	if (!ocsp)
+		return 0;
+
+	smp->data.type = SMP_T_SINT;
+	smp->data.u.sint = ocsp->num_failure;
+	return 1;
+}
+
+static int
+smp_fetch_ssl_ocsp_success_cnt(const struct arg *args, struct sample *smp, const char *kw, void *private)
+{
+	struct certificate_ocsp *ocsp = ssl_ocsp_task_ctx.cur_ocsp;
+
+	if (!ocsp)
+		return 0;
+
+	smp->data.type = SMP_T_SINT;
+	smp->data.u.sint = ocsp->num_success;
+	return 1;
+}
+
+
+static struct cli_kw_list cli_kws = {{ },{
+	{ { "set", "ssl", "ocsp-response", NULL }, "set ssl ocsp-response <resp|payload>       : update a certificate's OCSP Response from a base64-encode DER",      cli_parse_set_ocspresponse, NULL },
+
+	{ { "show", "ssl", "ocsp-response", NULL },"show ssl ocsp-response [[text|base64] id]  : display the IDs of the OCSP responses used in memory, or the details of a single OCSP response (in text or base64 format)", cli_parse_show_ocspresponse, cli_io_handler_show_ocspresponse, NULL },
+	{ { "show", "ssl", "ocsp-updates", NULL }, "show ssl ocsp-updates                      : display information about the next 'nb' ocsp responses that will be updated automatically", cli_parse_show_ocsp_updates, cli_io_handler_show_ocsp_updates, cli_release_show_ocsp_updates },
+#if ((defined SSL_CTRL_SET_TLSEXT_STATUS_REQ_CB && !defined OPENSSL_NO_OCSP) && !defined OPENSSL_IS_BORINGSSL)
+	{ { "update", "ssl", "ocsp-response", NULL }, "update ssl ocsp-response <certfile>     : send ocsp request and update stored ocsp response",                  cli_parse_update_ocsp_response, cli_io_handler_update_ocsp_response, cli_release_update_ocsp_response },
 #endif
 	{ { NULL }, NULL, NULL, NULL }
 }};
 
 INITCALL1(STG_REGISTER, cli_register_kw, &cli_kws);
+
+
+/* Note: must not be declared <const> as its list will be overwritten.
+ * Please take care of keeping this list alphabetically sorted.
+ *
+ * Those fetches only have a valid value during an OCSP update process so they
+ * can only be used in a log format of a log line built by the update process
+ * task itself.
+ */
+static struct sample_fetch_kw_list sample_fetch_keywords = {ILH, {
+	{ "ssl_ocsp_certid",                 smp_fetch_ssl_ocsp_certid,             0,                   NULL,    SMP_T_STR, SMP_USE_L5SRV },
+	{ "ssl_ocsp_status",                 smp_fetch_ssl_ocsp_status,             0,                   NULL,    SMP_T_SINT, SMP_USE_L5SRV },
+	{ "ssl_ocsp_status_str",             smp_fetch_ssl_ocsp_status_str,         0,                   NULL,    SMP_T_STR, SMP_USE_L5SRV },
+	{ "ssl_ocsp_fail_cnt",               smp_fetch_ssl_ocsp_fail_cnt,           0,                   NULL,    SMP_T_SINT, SMP_USE_L5SRV },
+	{ "ssl_ocsp_success_cnt",            smp_fetch_ssl_ocsp_success_cnt,        0,                   NULL,    SMP_T_SINT, SMP_USE_L5SRV },
+	{ NULL, NULL, 0, 0, 0 },
+}};
+
+INITCALL1(STG_REGISTER, sample_register_fetches, &sample_fetch_keywords);
+
 
 /*
  * Local variables:

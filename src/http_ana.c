@@ -1118,10 +1118,9 @@ static __inline int do_l7_retry(struct stream *s, struct stconn *sc)
 	struct channel *req, *res;
 	int co_data;
 
-	s->conn_retries++;
 	if (s->conn_retries >= s->be->conn_retries)
 		return -1;
-
+	s->conn_retries++;
 	if (objt_server(s->target)) {
 		if (s->flags & SF_CURR_SESS) {
 			s->flags &= ~SF_CURR_SESS;
@@ -1218,7 +1217,15 @@ int http_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 		if (sc_ep_test(s->scb, SE_FL_ERROR)) {
 			struct connection *conn = sc_conn(s->scb);
 
-			/* Perform a L7 retry because server refuses the early data. */
+
+			if ((txn->flags & TX_L7_RETRY) &&
+			    (s->be->retry_type & PR_RE_DISCONNECTED) &&
+			    (!conn || conn->err_code != CO_ER_SSL_EARLY_FAILED)) {
+				if (co_data(rep) || do_l7_retry(s, s->scb) == 0)
+					return 0;
+			}
+
+			/* Perform a L7 retry on empty response or because server refuses the early data. */
 			if ((txn->flags & TX_L7_RETRY) &&
 			    (s->be->retry_type & PR_RE_EARLY_ERROR) &&
 			    conn && conn->err_code == CO_ER_SSL_EARLY_FAILED &&
@@ -4228,7 +4235,8 @@ static void http_end_request(struct stream *s)
 		 */
 		chn->flags |= CF_NEVER_WAIT;
 
-		if (txn->rsp.msg_state < HTTP_MSG_DONE && s->scb->state != SC_ST_CLO) {
+		if (txn->rsp.msg_state < HTTP_MSG_BODY ||
+		    (txn->rsp.msg_state < HTTP_MSG_DONE && s->scb->state != SC_ST_CLO)) {
 			/* The server has not finished to respond and the
 			 * backend SC is not closed, so we don't want to move in
 			 * order not to upset it.

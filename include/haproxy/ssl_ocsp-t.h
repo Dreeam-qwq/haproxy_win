@@ -33,6 +33,11 @@
 extern int ocsp_ex_index;
 #endif
 
+#define SSL_OCSP_UPDATE_DELAY_MAX 60*60 /* 1H */
+#define SSL_OCSP_UPDATE_DELAY_MIN 5*60  /* 5 minutes */
+#define SSL_OCSP_UPDATE_MARGIN 60   /* 1 minute */
+#define SSL_OCSP_HTTP_ERR_REPLAY 60 /* 1 minute */
+
 #if (defined SSL_CTRL_SET_TLSEXT_STATUS_REQ_CB && !defined OPENSSL_NO_OCSP)
 /*
  * struct alignment works here such that the key.key is the same as key_data
@@ -42,13 +47,21 @@ struct certificate_ocsp {
 	struct ebmb_node key;
 	unsigned char key_data[OCSP_MAX_CERTID_ASN1_LENGTH];
 	unsigned int key_length;
-	struct buffer response;
 	int refcount;
+	struct buffer response;
 	long expire;
 	X509 *issuer;
 	STACK_OF(X509) *chain;
 	struct eb64_node next_update;	/* Key of items inserted in ocsp_update_tree (sorted by absolute date) */
 	struct buffer *uri;	/* First OCSP URI contained in the corresponding certificate */
+
+	/* OCSP update stats */
+	u64 last_update;		/* Time of last successful update */
+	unsigned int last_update_status;/* Status of the last OCSP update */
+	unsigned int num_success;	/* Number of successful updates */
+	unsigned int num_failure;	/* Number of failed updates */
+	unsigned int fail_count;	/* Number of successive failures */
+	char path[VAR_ARRAY];
 };
 
 struct ocsp_cbk_arg {
@@ -68,6 +81,7 @@ struct ocsp_cbk_arg {
 
 extern struct eb_root cert_ocsp_tree;
 extern struct eb_root ocsp_update_tree;
+extern struct task *ocsp_update_task;
 
 __decl_thread(extern HA_SPINLOCK_T ocsp_tree_lock);
 
