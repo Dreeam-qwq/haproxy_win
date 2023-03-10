@@ -31,7 +31,7 @@ const char *quic_frame_type_string(enum quic_frame_type ft)
 	case QUIC_FT_ACK:
 		return "ACK";
 	case QUIC_FT_ACK_ECN:
-		return "ACK_ENC";
+		return "ACK_ECN";
 	case QUIC_FT_RESET_STREAM:
 		return "RESET_STREAM";
 	case QUIC_FT_STOP_SENDING:
@@ -1155,7 +1155,7 @@ int qc_build_frm(unsigned char **buf, const unsigned char *end,
 		goto leave;
 	}
 
-	TRACE_PROTO("frame", QUIC_EV_CONN_BFRM, qc, frm);
+	TRACE_PROTO("TX frame", QUIC_EV_CONN_BFRM, qc, frm);
 	*pos++ = frm->type;
 	if (!quic_frame_builders[frm->type].func(&pos, end, frm, qc)) {
 		TRACE_DEVEL("frame building error", QUIC_EV_CONN_BFRM, qc, frm);

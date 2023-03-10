@@ -225,6 +225,7 @@ enum quic_pkt_type {
 #define           QUIC_EV_CONN_ELEVELSEL (1ULL << 47)
 #define           QUIC_EV_CONN_RCV       (1ULL << 48)
 #define           QUIC_EV_CONN_KILL      (1ULL << 49)
+#define           QUIC_EV_CONN_KP        (1ULL << 50)
 
 /* Similar to kernel min()/max() definitions. */
 #define QUIC_MIN(a, b) ({ \
@@ -397,6 +398,8 @@ struct quic_dgram {
 #define QUIC_FL_RX_PACKET_ACK_ELICITING (1UL << 0)
 /* Packet is the first one in the containing datagram. */
 #define QUIC_FL_RX_PACKET_DGRAM_FIRST   (1UL << 1)
+/* Spin bit set */
+#define QUIC_FL_RX_PACKET_SPIN_BIT   (1UL << 2)
 
 struct quic_rx_packet {
 	struct list list;
@@ -607,6 +610,7 @@ enum qc_mux_state {
 
 /* Flags at connection level */
 #define QUIC_FL_CONN_ANTI_AMPLIFICATION_REACHED  (1U << 0)
+#define QUIC_FL_CONN_SPIN_BIT                    (1U << 1) /* Spin bit set by remote peer */
 #define QUIC_FL_CONN_POST_HANDSHAKE_FRAMES_BUILT (1U << 2)
 #define QUIC_FL_CONN_LISTENER                    (1U << 3)
 #define QUIC_FL_CONN_ACCEPT_REGISTERED           (1U << 4)
@@ -655,6 +659,7 @@ struct quic_conn {
 	struct ebmb_node scid_node; /* used only for client side (backend) */
 	struct quic_cid scid; /* first SCID of our endpoint - not updated when a new SCID is used */
 	struct eb_root cids; /* tree of quic_connection_id - used to match a received packet DCID with a connection */
+	uint64_t next_cid_seq_num;
 
 	struct quic_enc_level els[QUIC_TLS_ENC_LEVEL_MAX];
 	struct quic_pktns pktns[QUIC_TLS_PKTNS_MAX];

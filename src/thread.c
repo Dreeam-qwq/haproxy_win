@@ -357,7 +357,9 @@ void ha_rwlock_init(HA_RWLOCK_T *l)
 	HA_RWLOCK_INIT(l);
 }
 
-/* returns the number of CPUs the current process is enabled to run on */
+/* returns the number of CPUs the current process is enabled to run on,
+ * regardless of any MAX_THREADS limitation.
+ */
 static int thread_cpus_enabled()
 {
 	int ret = 1;
@@ -378,7 +380,6 @@ static int thread_cpus_enabled()
 #endif
 #endif
 	ret = MAX(ret, 1);
-	ret = MIN(ret, MAX_THREADS);
 	return ret;
 }
 
@@ -1076,6 +1077,7 @@ static void __thread_init(void)
 	preload_libgcc_s();
 
 	thread_cpus_enabled_at_boot = thread_cpus_enabled();
+	thread_cpus_enabled_at_boot = MIN(thread_cpus_enabled_at_boot, MAX_THREADS);
 
 	memprintf(&ptr, "Built with multi-threading support (MAX_TGROUPS=%d, MAX_THREADS=%d, default=%d).",
 		  MAX_TGROUPS, MAX_THREADS, thread_cpus_enabled_at_boot);
@@ -1153,7 +1155,7 @@ int thread_map_to_groups()
 		q = ut / ug;
 		r = ut % ug;
 		if ((q + !!r) > MAX_THREADS_PER_GROUP) {
-			ha_alert("Too many remaining unassigned threads (%d) for thread groups (%d). Please increase thread-groups or make sure to keep thread numbers contiguous\n", ug, ut);
+			ha_alert("Too many remaining unassigned threads (%d) for thread groups (%d). Please increase thread-groups or make sure to keep thread numbers contiguous\n", ut, ug);
 			return -1;
 		}
 
