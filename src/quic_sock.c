@@ -486,7 +486,7 @@ void quic_lstnr_sock_fd_iocb(int fd)
 }
 
 /* FD-owned quic-conn socket callback. */
-static void quic_conn_sock_fd_iocb(int fd)
+void quic_conn_sock_fd_iocb(int fd)
 {
 	struct quic_conn *qc = fdtab[fd].owner;
 
@@ -918,7 +918,10 @@ struct task *quic_accept_run(struct task *t, void *ctx, unsigned int i)
 
 	mt_list_for_each_entry_safe(lthr, &queue->listeners, quic_accept.list, elt1, elt2) {
 		listener_accept(lthr->li);
-		MT_LIST_DELETE_SAFE(elt1);
+		if (!MT_LIST_ISEMPTY(&lthr->quic_accept.conns))
+			tasklet_wakeup((struct tasklet*)t);
+		else
+			MT_LIST_DELETE_SAFE(elt1);
 	}
 
 	return NULL;
