@@ -1930,6 +1930,11 @@ static size_t h1_process_demux(struct h1c *h1c, struct buffer *buf, size_t count
 				TRACE_STATE("Re-enable output processing", H1_EV_TX_DATA|H1_EV_H1S_BLK|H1_EV_STRM_WAKE, h1c->conn, h1s);
 			}
 		}
+		if (h1c->flags & H1C_F_ERROR) {
+			/* Report a terminal error to the SE if a previous read error was detected */
+			se_fl_set(h1s->sd, SE_FL_ERROR);
+			TRACE_STATE("report ERROR to SE", H1_EV_RX_DATA|H1_EV_H1S_ERR, h1c->conn, h1s);
+		}
 	}
 
   end:
@@ -3181,7 +3186,7 @@ struct task *h1_io_cb(struct task *t, void *ctx, unsigned int state)
 		/* Remove the connection from the list, to be sure nobody attempts
 		 * to use it while we handle the I/O events
 		 */
-		conn_in_list = conn->flags & CO_FL_LIST_MASK;
+		conn_in_list = conn_get_idle_flag(conn);
 		if (conn_in_list)
 			conn_delete_from_tree(&conn->hash_node->node);
 
@@ -3304,10 +3309,8 @@ struct task *h1_timeout_task(struct task *t, void *context, unsigned int state)
 		/* We're about to destroy the connection, so make sure nobody attempts
 		 * to steal it from us.
 		 */
-		if (h1c->conn->flags & CO_FL_LIST_MASK) {
+		if (h1c->conn->flags & CO_FL_LIST_MASK)
 			conn_delete_from_tree(&h1c->conn->hash_node->node);
-			h1c->conn->flags &= ~CO_FL_LIST_MASK;
-		}
 
 		HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
 	}

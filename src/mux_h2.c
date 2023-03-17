@@ -3813,6 +3813,16 @@ static int h2_send(struct h2c *h2c)
 		if (h2c->flags & (H2_CF_MUX_MFULL | H2_CF_DEM_MROOM))
 			flags |= CO_SFL_MSG_MORE;
 
+		if (!br_single(h2c->mbuf)) {
+			/* usually we want to emit small TLS records to speed
+			 * up the decoding on the client. That's what is being
+			 * done by default. However if there is more than one
+			 * buffer being allocated, we're streaming large data
+			 * so we stich to large records.
+			 */
+			flags |= CO_SFL_STREAMER;
+		}
+
 		for (buf = br_head(h2c->mbuf); b_size(buf); buf = br_del_head(h2c->mbuf)) {
 			if (b_data(buf)) {
 				int ret = conn->xprt->snd_buf(conn, conn->xprt_ctx, buf, b_data(buf), flags);
@@ -3835,8 +3845,17 @@ static int h2_send(struct h2c *h2c)
 		if (released)
 			offer_buffers(NULL, released);
 
-		/* wrote at least one byte, the buffer is not full anymore */
-		if (sent)
+		/* Normally if wrote at least one byte, the buffer is not full
+		 * anymore. However, if it was marked full because all of its
+		 * buffers were used, we don't want to instantly wake up many
+		 * streams because we'd create a thundering herd effect, notably
+		 * when data are flushed in small chunks. Instead we wait for
+		 * the buffer to be decongested again before allowing to send
+		 * again. It also has the added benefit of not pumping more
+		 * data from the other side when it's known that this one is
+		 * still congested.
+		 */
+		if (sent && br_single(h2c->mbuf))
 			h2c->flags &= ~(H2_CF_MUX_MFULL | H2_CF_DEM_MROOM);
 	}
 
@@ -3895,11 +3914,10 @@ struct task *h2_io_cb(struct task *t, void *ctx, unsigned int state)
 		conn = h2c->conn;
 		TRACE_ENTER(H2_EV_H2C_WAKE, conn);
 
-		conn_in_list = conn->flags & CO_FL_LIST_MASK;
-
 		/* Remove the connection from the list, to be sure nobody attempts
 		 * to use it while we handle the I/O events
 		 */
+		conn_in_list = conn_get_idle_flag(conn);
 		if (conn_in_list)
 			conn_delete_from_tree(&conn->hash_node->node);
 
@@ -4031,7 +4049,6 @@ static int h2_process(struct h2c *h2c)
 		if (conn->flags & CO_FL_LIST_MASK) {
 			HA_SPIN_LOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
 			conn_delete_from_tree(&conn->hash_node->node);
-			conn->flags &= ~CO_FL_LIST_MASK;
 			HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
 		}
 	}
@@ -4040,7 +4057,6 @@ static int h2_process(struct h2c *h2c)
 		if (conn->flags & CO_FL_LIST_MASK) {
 			HA_SPIN_LOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
 			conn_delete_from_tree(&conn->hash_node->node);
-			conn->flags &= ~CO_FL_LIST_MASK;
 			HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
 		}
 	}
@@ -4120,10 +4136,8 @@ struct task *h2_timeout_task(struct task *t, void *context, unsigned int state)
 		/* We're about to destroy the connection, so make sure nobody attempts
 		 * to steal it from us.
 		 */
-		if (h2c->conn->flags & CO_FL_LIST_MASK) {
+		if (h2c->conn->flags & CO_FL_LIST_MASK)
 			conn_delete_from_tree(&h2c->conn->hash_node->node);
-			h2c->conn->flags &= ~CO_FL_LIST_MASK;
-		}
 
 		HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
 	}
@@ -4176,7 +4190,6 @@ do_leave:
 	if (h2c->conn->flags & CO_FL_LIST_MASK) {
 		HA_SPIN_LOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
 		conn_delete_from_tree(&h2c->conn->hash_node->node);
-		h2c->conn->flags &= ~CO_FL_LIST_MASK;
 		HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
 	}
 
@@ -4318,7 +4331,7 @@ static void h2_detach(struct sedesc *sd)
 		/* refresh the timeout if none was active, so that the last
 		 * leaving stream may arm it.
 		 */
-		if (!tick_isset(h2c->task->expire))
+		if (h2c->task && !tick_isset(h2c->task->expire))
 			h2c_update_timeout(h2c);
 		return;
 	}

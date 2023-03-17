@@ -936,6 +936,12 @@ static inline void ssl_ocsp_set_next_update(struct certificate_ocsp *ocsp)
  */
 int ssl_ocsp_update_insert(struct certificate_ocsp *ocsp)
 {
+	/* This entry was only supposed to be updated once, it does not need to
+	 * be reinserted into the update tree.
+	 */
+	if (ocsp->update_once)
+		return 0;
+
 	/* Set next_update based on current time and the various OCSP
 	 * minimum/maximum update times.
 	 */
@@ -960,6 +966,13 @@ int ssl_ocsp_update_insert(struct certificate_ocsp *ocsp)
 int ssl_ocsp_update_insert_after_error(struct certificate_ocsp *ocsp)
 {
 	int replay_delay = 0;
+
+	/* This entry was only supposed to be updated once, it does not need to
+	 * be reinserted into the update tree.
+	 */
+	if (ocsp->update_once)
+		return 0;
+
 	/*
 	 * Set next_update based on current time and the various OCSP
 	 * minimum/maximum update times.
@@ -1260,6 +1273,7 @@ leave:
 	}
 	if (hc)
 		httpclient_stop_and_destroy(hc);
+	ctx->hc = NULL;
 	free_trash_chunk(req_url);
 	free_trash_chunk(req_body);
 	task->expire = tick_add(now_ms, next_wakeup);
@@ -1301,7 +1315,7 @@ http_error:
 	return task;
 }
 
-char ocspupdate_log_format[] = "%ci:%cp [%tr] %ft %[ssl_ocsp_certid] %[ssl_ocsp_status] %{+Q}[ssl_ocsp_status_str] %[ssl_ocsp_fail_cnt] %[ssl_ocsp_success_cnt]";
+char ocspupdate_log_format[] = "%ci:%cp [%tr] %ft %[ssl_ocsp_certname] %[ssl_ocsp_status] %{+Q}[ssl_ocsp_status_str] %[ssl_ocsp_fail_cnt] %[ssl_ocsp_success_cnt]";
 
 /*
  * Initialize the proxy for the OCSP update HTTP client with 2 servers, one for
@@ -1310,7 +1324,7 @@ char ocspupdate_log_format[] = "%ci:%cp [%tr] %ft %[ssl_ocsp_certid] %[ssl_ocsp_
 static int ssl_ocsp_update_precheck()
 {
 	/* initialize the OCSP update dedicated httpclient */
-	httpclient_ocsp_update_px = httpclient_create_proxy("<HC_OCSP>");
+	httpclient_ocsp_update_px = httpclient_create_proxy("<OCSP-UPDATE>");
 	if (!httpclient_ocsp_update_px)
 		return 1;
 	httpclient_ocsp_update_px->conf.error_logformat_string = strdup(ocspupdate_log_format);
@@ -1325,97 +1339,19 @@ static int ssl_ocsp_update_precheck()
 REGISTER_PRE_CHECK(ssl_ocsp_update_precheck);
 
 
-
-struct ocsp_cli_ctx {
-	struct httpclient *hc;
-	struct ckch_data *ckch_data;
-	X509 *ocsp_issuer;
-	uint flags;
-	uint do_update;
-};
-
-
-void cli_ocsp_res_stline_cb(struct httpclient *hc)
-{
-	struct appctx *appctx = hc->caller;
-	struct ocsp_cli_ctx *ctx;
-
-	if (!appctx)
-		return;
-
-	ctx = appctx->svcctx;
-	ctx->flags |= HC_F_RES_STLINE;
-	appctx_wakeup(appctx);
-}
-
-void cli_ocsp_res_headers_cb(struct httpclient *hc)
-{
-	struct appctx *appctx = hc->caller;
-	struct ocsp_cli_ctx *ctx;
-
-	if (!appctx)
-		return;
-
-	ctx = appctx->svcctx;
-	ctx->flags |= HC_F_RES_HDR;
-	appctx_wakeup(appctx);
-}
-
-void cli_ocsp_res_body_cb(struct httpclient *hc)
-{
-	struct appctx *appctx = hc->caller;
-	struct ocsp_cli_ctx *ctx;
-
-	if (!appctx)
-		return;
-
-	ctx = appctx->svcctx;
-	ctx->flags |= HC_F_RES_BODY;
-	appctx_wakeup(appctx);
-}
-
-void cli_ocsp_res_end_cb(struct httpclient *hc)
-{
-	struct appctx *appctx = hc->caller;
-	struct ocsp_cli_ctx *ctx;
-
-	if (!appctx)
-		return;
-
-	ctx = appctx->svcctx;
-	ctx->flags |= HC_F_RES_END;
-	appctx_wakeup(appctx);
-}
-
 static int cli_parse_update_ocsp_response(char **args, char *payload, struct appctx *appctx, void *private)
 {
 	int errcode = 0;
 	char *err = NULL;
 	struct ckch_store *ckch_store = NULL;
-	X509 *cert = NULL;
-	struct ocsp_cli_ctx *ctx = applet_reserve_svcctx(appctx, sizeof(*ctx));
-	struct httpclient *hc = NULL;
-	struct buffer *req_url = NULL;
-	struct buffer *req_body = NULL;
-	OCSP_CERTID *certid = NULL;
+	struct certificate_ocsp *ocsp = NULL;
+	int update_once = 0;
+	unsigned char key[OCSP_MAX_CERTID_ASN1_LENGTH] = {};
+	unsigned char *p;
 
 	if (!*args[3]) {
 		memprintf(&err, "'update ssl ocsp-response' expects a filename\n");
 		return cli_dynerr(appctx, err);
-	}
-
-	req_url = alloc_trash_chunk();
-	if (!req_url) {
-		memprintf(&err, "%sCan't allocate memory\n", err ? err : "");
-		errcode |= ERR_ALERT | ERR_FATAL;
-		goto end;
-	}
-
-	req_body = alloc_trash_chunk();
-	if (!req_body) {
-		memprintf(&err, "%sCan't allocate memory\n", err ? err : "");
-		errcode |= ERR_ALERT | ERR_FATAL;
-		goto end;
 	}
 
 	/* The operations on the CKCH architecture are locked so we can
@@ -1435,194 +1371,44 @@ static int cli_parse_update_ocsp_response(char **args, char *payload, struct app
 		goto end;
 	}
 
-	ctx->ckch_data = ckch_store->data;
+	p = key;
+	i2d_OCSP_CERTID(ckch_store->data->ocsp_cid, &p);
 
-	cert = ckch_store->data->cert;
-
-	if (ssl_ocsp_get_uri_from_cert(cert, req_url, &err)) {
-		errcode |= ERR_ALERT | ERR_FATAL;
-		HA_SPIN_UNLOCK(CKCH_LOCK, &ckch_lock);
-		goto end;
-	}
-
-	/* Look for the ocsp issuer in the ckch_data or in the certificate
-	 * chain, the same way it is done in ssl_sock_load_ocsp. */
-	ctx->ocsp_issuer = ctx->ckch_data->ocsp_issuer;
-
-	/* take issuer from chain over ocsp_issuer, is what is done historicaly */
-	if (ctx->ckch_data->chain) {
-		int i = 0;
-		/* check if one of the certificate of the chain is the issuer */
-		for (i = 0; i < sk_X509_num(ctx->ckch_data->chain); i++) {
-			X509 *ti = sk_X509_value(ctx->ckch_data->chain, i);
-			if (X509_check_issued(ti, cert) == X509_V_OK) {
-				ctx->ocsp_issuer = ti;
-				break;
-			}
-		}
-	}
-
-	if (!ctx->ocsp_issuer) {
-		memprintf(&err, "%sOCSP issuer not found\n", err ? err : "");
-		HA_SPIN_UNLOCK(CKCH_LOCK, &ckch_lock);
-		goto end;
-	}
-
-	X509_up_ref(ctx->ocsp_issuer);
-
-	certid = OCSP_cert_to_id(NULL, cert, ctx->ocsp_issuer);
-	if (certid == NULL) {
-		memprintf(&err, "%sOCSP_cert_to_id() error\n", err ? err : "");
-		HA_SPIN_UNLOCK(CKCH_LOCK, &ckch_lock);
-		goto end;
-	}
-
-	/* From here on the lock is not needed anymore. */
 	HA_SPIN_UNLOCK(CKCH_LOCK, &ckch_lock);
 
-	/* Create ocsp request */
-	if (ssl_ocsp_create_request_details(certid, req_url, req_body, &err) != 0) {
-		memprintf(&err, "%sCreate ocsp request error\n", err ? err : "");
+
+	HA_SPIN_LOCK(OCSP_LOCK, &ocsp_tree_lock);
+	ocsp = (struct certificate_ocsp *)ebmb_lookup(&cert_ocsp_tree, key, OCSP_MAX_CERTID_ASN1_LENGTH);
+	if (!ocsp) {
+		memprintf(&err, "%s'update ssl ocsp-response' only works on certificates that already have a known OCSP response.\n", err ? err : "");
+		errcode |= ERR_ALERT | ERR_FATAL;
+		HA_SPIN_UNLOCK(OCSP_LOCK, &ocsp_tree_lock);
 		goto end;
 	}
 
-	hc = httpclient_new_from_proxy(httpclient_ocsp_update_px, appctx,
-	                               b_data(req_body) ? HTTP_METH_POST : HTTP_METH_GET,
-	                               ist2(b_orig(req_url), b_data(req_url)));
-	if (!hc) {
-		memprintf(&err, "%sCan't allocate httpclient\n", err ? err : "");
-		goto end;
-	}
+	update_once = (ocsp->next_update.node.leaf_p == NULL);
+	eb64_delete(&ocsp->next_update);
 
-	if (httpclient_req_gen(hc, hc->req.url, hc->req.meth, b_data(req_body) ? ocsp_request_hdrs : NULL,
-	                       ist2(b_orig(req_body), b_data(req_body))) != ERR_NONE) {
-		memprintf(&err, "%shttpclient_req_gen() error\n", err ? err : "");
-		goto end;
-	}
+	/* Insert the entry at the beginning of the update tree. */
+	ocsp->next_update.key = 0;
+	eb64_insert(&ocsp_update_tree, &ocsp->next_update);
+	ocsp->update_once = update_once;
 
-	hc->ops.res_stline = cli_ocsp_res_stline_cb;
-	hc->ops.res_headers = cli_ocsp_res_headers_cb;
-	hc->ops.res_payload = cli_ocsp_res_body_cb;
-	hc->ops.res_end = cli_ocsp_res_end_cb;
+	HA_SPIN_UNLOCK(OCSP_LOCK, &ocsp_tree_lock);
 
-	ctx->hc = hc; /* store the httpclient ptr in the applet */
-	ctx->flags = 0;
+	if (!ocsp_update_task)
+		ssl_create_ocsp_update_task(&err);
 
-	if (!httpclient_start(hc)) {
-		memprintf(&err, "%shttpclient_start() error\n", err ? err : "");
-		goto end;
-	}
-
-	free_trash_chunk(req_url);
-	free_trash_chunk(req_body);
+	task_wakeup(ocsp_update_task, TASK_WOKEN_MSG);
 
 	return 0;
 
 end:
-	free_trash_chunk(req_url);
-	free_trash_chunk(req_body);
-
 	if (errcode & ERR_CODE) {
 		return cli_dynerr(appctx, memprintf(&err, "%sCan't send ocsp request for %s!\n", err ? err : "", args[3]));
 	}
 	return cli_dynmsg(appctx, LOG_NOTICE, err);
 }
-
-static int cli_io_handler_update_ocsp_response(struct appctx *appctx)
-{
-	struct ocsp_cli_ctx *ctx = appctx->svcctx;
-	struct httpclient *hc = ctx->hc;
-
-	if (ctx->flags & HC_F_RES_STLINE) {
-		if (hc->res.status != 200) {
-			chunk_printf(&trash, "OCSP response error (status %d)\n", hc->res.status);
-			if (applet_putchk(appctx, &trash) == -1)
-				goto more;
-			goto end;
-		}
-		ctx->flags &= ~HC_F_RES_STLINE;
-	}
-
-	if (ctx->flags & HC_F_RES_HDR) {
-		struct http_hdr *hdr;
-		int found = 0;
-		/* Look for "Content-Type" header which should have
-		 * "application/ocsp-response" value. */
-		for (hdr = hc->res.hdrs; isttest(hdr->v); hdr++) {
-			if (isteqi(hdr->n, ist("Content-Type")) &&
-			    isteqi(hdr->v, ist("application/ocsp-response"))) {
-				found = 1;
-				break;
-			}
-		}
-		if (!found) {
-			chunk_printf(&trash, "Missing 'Content-Type: application/ocsp-response' header\n");
-			if (applet_putchk(appctx, &trash) == -1)
-				goto more;
-			goto end;
-		}
-		ctx->flags &= ~HC_F_RES_HDR;
-	}
-
-	if (ctx->flags & HC_F_RES_BODY) {
-		/* Wait until the full body is received and HC_F_RES_END flag is
-		 * set. */
-	}
-
-	/* we must close only if F_END is the last flag */
-	if (ctx->flags & HC_F_RES_END) {
-		char *err = NULL;
-
-		if (ssl_ocsp_check_response(ctx->ckch_data->chain, ctx->ocsp_issuer, &hc->res.buf, &err)) {
-			chunk_printf(&trash, "%s", err);
-			free(err);
-			if (applet_putchk(appctx, &trash) == -1)
-				goto more;
-			goto end;
-		}
-
-		if (ssl_sock_update_ocsp_response(&hc->res.buf, &err) != 0) {
-			chunk_printf(&trash, "%s", err);
-			free(err);
-			if (applet_putchk(appctx, &trash) == -1)
-				goto more;
-			goto end;
-		}
-
-		free(err);
-		chunk_reset(&trash);
-
-		if (ssl_ocsp_response_print(&hc->res.buf, &trash))
-			goto end;
-
-		if (applet_putchk(appctx, &trash) == -1)
-			goto more;
-		ctx->flags &= ~HC_F_RES_BODY;
-		ctx->flags &= ~HC_F_RES_END;
-		goto end;
-	}
-
-more:
-	if (!ctx->flags)
-		applet_have_no_more_data(appctx);
-	return 0;
-end:
-	return 1;
-}
-
-static void cli_release_update_ocsp_response(struct appctx *appctx)
-{
-	struct ocsp_cli_ctx *ctx = appctx->svcctx;
-	struct httpclient *hc = ctx->hc;
-
-	X509_free(ctx->ocsp_issuer);
-
-	/* Everything possible was printed on the CLI, we can destroy the client */
-	httpclient_stop_and_destroy(hc);
-
-	return;
-}
-
 
 #endif  /* !defined OPENSSL_IS_BORINGSSL */
 
@@ -1678,31 +1464,52 @@ static int cli_parse_show_ocspresponse(char **args, char *payload, struct appctx
 #if ((defined SSL_CTRL_SET_TLSEXT_STATUS_REQ_CB && !defined OPENSSL_NO_OCSP) && !defined OPENSSL_IS_BORINGSSL)
 
 	struct show_ocspresp_cli_ctx *ctx = applet_reserve_svcctx(appctx, sizeof(*ctx));
-	int certid_arg_idx = 3;
+	int arg_idx = 3;
 
 	if (*args[3]) {
 		struct certificate_ocsp *ocsp = NULL;
 		char key[OCSP_MAX_CERTID_ASN1_LENGTH] = {};
 		int key_length = OCSP_MAX_CERTID_ASN1_LENGTH;
 		char *key_ptr = key;
+		unsigned char *p;
+		struct ckch_store *ckch_store = NULL;
 
 		if (strcmp(args[3], "text") == 0) {
 			ctx->format = SHOW_OCSPRESP_FMT_TEXT;
-			++certid_arg_idx;
+			++arg_idx;
 		} else if (strcmp(args[3], "base64") == 0) {
 			ctx->format = SHOW_OCSPRESP_FMT_B64;
-			++certid_arg_idx;
+			++arg_idx;
 		}
 
-		if (ctx->format != SHOW_OCSPRESP_FMT_DFLT && !*args[certid_arg_idx])
+		if (ctx->format != SHOW_OCSPRESP_FMT_DFLT && !*args[arg_idx])
 			return cli_err(appctx, "'show ssl ocsp-response [text|base64]' expects a valid certid.\n");
 
-		if (strlen(args[certid_arg_idx]) > OCSP_MAX_CERTID_ASN1_LENGTH*2) {
-			return cli_err(appctx, "'show ssl ocsp-response' received a too big key.\n");
+		/* Try to convert parameter into an OCSP certid first, and consider it
+		 * as a filename if it fails. */
+		if (strlen(args[arg_idx]) > OCSP_MAX_CERTID_ASN1_LENGTH*2 ||
+		    !parse_binary(args[arg_idx], &key_ptr, &key_length, NULL)) {
+
+			key_ptr = key;
+			key_length = 0;
+
+			/* The operations on the CKCH architecture are locked so we can
+			 * manipulate ckch_store and ckch_inst */
+			if (HA_SPIN_TRYLOCK(CKCH_LOCK, &ckch_lock)) {
+				return cli_err(appctx, "Operations on certificates are currently locked!\n");
+			}
+
+			ckch_store = ckchs_lookup(args[arg_idx]);
+
+			if (ckch_store) {
+				p = (unsigned char*)key;
+				key_length = i2d_OCSP_CERTID(ckch_store->data->ocsp_cid, &p);
+			}
+			HA_SPIN_UNLOCK(CKCH_LOCK, &ckch_lock);
 		}
 
-		if (!parse_binary(args[certid_arg_idx], &key_ptr, &key_length, NULL)) {
-			return cli_err(appctx, "'show ssl ocsp-response' received an invalid key.\n");
+		if (key_length == 0) {
+			return cli_err(appctx, "'show ssl ocsp-response' expects a valid certid or certificate path.\n");
 		}
 
 		HA_SPIN_LOCK(OCSP_LOCK, &ocsp_tree_lock);
@@ -1710,7 +1517,7 @@ static int cli_parse_show_ocspresponse(char **args, char *payload, struct appctx
 
 		if (!ocsp) {
 			HA_SPIN_UNLOCK(OCSP_LOCK, &ocsp_tree_lock);
-			return cli_err(appctx, "Certificate ID does not match any certificate.\n");
+			return cli_err(appctx, "Certificate ID or path does not match any certificate.\n");
 		}
 		++ocsp->refcount;
 		HA_SPIN_UNLOCK(OCSP_LOCK, &ocsp_tree_lock);
@@ -1774,6 +1581,9 @@ static int cli_io_handler_show_ocspresponse(struct appctx *appctx)
 			chunk_appendf(trash, "%02x", ocsp->key_data[i]);
 		}
 		chunk_appendf(trash, "\n");
+
+		/* Dump the certificate path */
+		chunk_appendf(trash, "Certificate path : %s\n", ocsp->path);
 
 		p = ocsp->key_data;
 
@@ -2006,6 +1816,20 @@ smp_fetch_ssl_ocsp_certid(const struct arg *args, struct sample *smp, const char
 }
 
 static int
+smp_fetch_ssl_ocsp_certname(const struct arg *args, struct sample *smp, const char *kw, void *private)
+{
+	struct certificate_ocsp *ocsp = ssl_ocsp_task_ctx.cur_ocsp;
+
+	if (!ocsp)
+		return 0;
+
+	smp->data.type = SMP_T_STR;
+	smp->data.u.str.area = ocsp->path;
+	smp->data.u.str.data = strlen(ocsp->path);
+	return 1;
+}
+
+static int
 smp_fetch_ssl_ocsp_status(const struct arg *args, struct sample *smp, const char *kw, void *private)
 {
 	struct certificate_ocsp *ocsp = ssl_ocsp_task_ctx.cur_ocsp;
@@ -2068,7 +1892,7 @@ static struct cli_kw_list cli_kws = {{ },{
 	{ { "show", "ssl", "ocsp-response", NULL },"show ssl ocsp-response [[text|base64] id]  : display the IDs of the OCSP responses used in memory, or the details of a single OCSP response (in text or base64 format)", cli_parse_show_ocspresponse, cli_io_handler_show_ocspresponse, NULL },
 	{ { "show", "ssl", "ocsp-updates", NULL }, "show ssl ocsp-updates                      : display information about the next 'nb' ocsp responses that will be updated automatically", cli_parse_show_ocsp_updates, cli_io_handler_show_ocsp_updates, cli_release_show_ocsp_updates },
 #if ((defined SSL_CTRL_SET_TLSEXT_STATUS_REQ_CB && !defined OPENSSL_NO_OCSP) && !defined OPENSSL_IS_BORINGSSL)
-	{ { "update", "ssl", "ocsp-response", NULL }, "update ssl ocsp-response <certfile>     : send ocsp request and update stored ocsp response",                  cli_parse_update_ocsp_response, cli_io_handler_update_ocsp_response, cli_release_update_ocsp_response },
+	{ { "update", "ssl", "ocsp-response", NULL }, "update ssl ocsp-response <certfile>     : send ocsp request and update stored ocsp response",                  cli_parse_update_ocsp_response, NULL, NULL },
 #endif
 	{ { NULL }, NULL, NULL, NULL }
 }};
@@ -2085,6 +1909,7 @@ INITCALL1(STG_REGISTER, cli_register_kw, &cli_kws);
  */
 static struct sample_fetch_kw_list sample_fetch_keywords = {ILH, {
 	{ "ssl_ocsp_certid",                 smp_fetch_ssl_ocsp_certid,             0,                   NULL,    SMP_T_STR, SMP_USE_L5SRV },
+	{ "ssl_ocsp_certname",               smp_fetch_ssl_ocsp_certname,           0,                   NULL,    SMP_T_STR, SMP_USE_L5SRV },
 	{ "ssl_ocsp_status",                 smp_fetch_ssl_ocsp_status,             0,                   NULL,    SMP_T_SINT, SMP_USE_L5SRV },
 	{ "ssl_ocsp_status_str",             smp_fetch_ssl_ocsp_status_str,         0,                   NULL,    SMP_T_STR, SMP_USE_L5SRV },
 	{ "ssl_ocsp_fail_cnt",               smp_fetch_ssl_ocsp_fail_cnt,           0,                   NULL,    SMP_T_SINT, SMP_USE_L5SRV },
