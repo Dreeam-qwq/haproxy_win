@@ -105,9 +105,10 @@ struct show_pools_ctx {
 };
 
 static int mem_fail_rate __read_mostly = 0;
-static int using_default_allocator __read_mostly = 1;
+static int using_default_allocator __read_mostly = 1; // linked-in allocator or LD_PRELOADed one ?
 static int disable_trim __read_mostly = 0;
 static int(*my_mallctl)(const char *, void *, size_t *, void *, size_t) = NULL;
+static int(*_malloc_trim)(size_t) = NULL;
 
 /* ask the allocator to trim memory pools.
  * This must run under thread isolation so that competing threads trying to
@@ -115,48 +116,14 @@ static int(*my_mallctl)(const char *, void *, size_t *, void *, size_t) = NULL;
  * its job. We just have to be careful as callers might already be isolated
  * themselves.
  */
-static void trim_all_pools(void)
+void trim_all_pools(void)
 {
 	int isolated = thread_isolated();
-
-	if (disable_trim)
-		return;
 
 	if (!isolated)
 		thread_isolate();
 
-	if (my_mallctl) {
-		unsigned int i, narenas = 0;
-		size_t len = sizeof(narenas);
-
-		if (my_mallctl("arenas.narenas", &narenas, &len, NULL, 0) == 0) {
-			for (i = 0; i < narenas; i ++) {
-				char mib[32] = {0};
-				snprintf(mib, sizeof(mib), "arena.%u.purge", i);
-				(void)my_mallctl(mib, NULL, NULL, NULL, 0);
-			}
-		}
-	} else {
-#if defined(HA_HAVE_MALLOC_TRIM)
-		if (using_default_allocator)
-			malloc_trim(0);
-#elif defined(HA_HAVE_MALLOC_ZONE)
-		if (using_default_allocator) {
-			vm_address_t *zones;
-			unsigned int i, nzones;
-
-			if (malloc_get_all_zones(0, NULL, &zones, &nzones) == KERN_SUCCESS) {
-				for (i = 0; i < nzones; i ++) {
-					malloc_zone_t *zone = (malloc_zone_t *)zones[i];
-
-					/* we cannot purge anonymous zones */
-					if (zone->zone_name)
-						malloc_zone_pressure_relief(zone, 0);
-				}
-			}
-		}
-#endif
-	}
+	malloc_trim(0);
 
 	if (!isolated)
 		thread_release();
@@ -177,8 +144,14 @@ static void detect_allocator(void)
 
 	my_mallctl = mallctl;
 #endif
-
 	if (!my_mallctl) {
+		/* trick: we won't enter here if mallctl() is known at link
+		 * time. This allows to detect if the symbol was changed since
+		 * the program was linked, indicating it's not running on the
+		 * expected allocator (due to an LD_PRELOAD) and that we must
+		 * be extra cautious and avoid some optimizations that are
+		 * known to break such as malloc_trim().
+		 */
 		my_mallctl = get_sym_curr_addr("mallctl");
 		using_default_allocator = (my_mallctl == NULL);
 	}
@@ -210,11 +183,68 @@ static void detect_allocator(void)
 		using_default_allocator = (malloc_default_zone() != NULL);
 #endif
 	}
+
+	/* detect presence of malloc_trim() */
+	_malloc_trim = get_sym_next_addr("malloc_trim");
 }
 
-static int is_trim_enabled(void)
+/* replace the libc's malloc_trim() so that we can also intercept the calls
+ * from child libraries when the allocator is not the default one.
+ */
+int malloc_trim(size_t pad)
 {
-	return using_default_allocator;
+	int ret = 0;
+
+	if (disable_trim)
+		return ret;
+
+	if (my_mallctl) {
+		/* here we're on jemalloc and malloc_trim() is called either
+		 * by haproxy or another dependency (the worst case that
+		 * normally crashes). Instead of just failing, we can actually
+		 * emulate it so let's do it now.
+		 */
+		unsigned int i, narenas = 0;
+		size_t len = sizeof(narenas);
+
+		if (my_mallctl("arenas.narenas", &narenas, &len, NULL, 0) == 0) {
+			for (i = 0; i < narenas; i ++) {
+				char mib[32] = {0};
+				snprintf(mib, sizeof(mib), "arena.%u.purge", i);
+				(void)my_mallctl(mib, NULL, NULL, NULL, 0);
+				ret = 1; // success
+			}
+		}
+	}
+	else if (!using_default_allocator) {
+		/* special allocators that can be LD_PRELOADed end here */
+		ret = 0; // did nothing
+	}
+	else if (_malloc_trim) {
+		/* we're typically on glibc and not overridden */
+		ret = _malloc_trim(pad);
+	}
+#if defined(HA_HAVE_MALLOC_ZONE)
+	else {
+		/* we're on MacOS, there's an equivalent mechanism */
+		vm_address_t *zones;
+		unsigned int i, nzones;
+
+		if (malloc_get_all_zones(0, NULL, &zones, &nzones) == KERN_SUCCESS) {
+			for (i = 0; i < nzones; i ++) {
+				malloc_zone_t *zone = (malloc_zone_t *)zones[i];
+
+				/* we cannot purge anonymous zones */
+				if (zone->zone_name) {
+					malloc_zone_pressure_relief(zone, 0);
+					ret = 1; // success
+				}
+			}
+		}
+	}
+#endif
+	/* here we have ret=0 if nothing was release, or 1 if some were */
+	return ret;
 }
 
 static int mem_should_fail(const struct pool_head *pool)
@@ -1080,10 +1110,16 @@ int pool_parse_debugging(const char *str, char **err)
 				 */
 				if (dbg_options[v].flg == POOL_DBG_UAF)
 					new_dbg |= POOL_DBG_NO_CACHE;
+				/* fail should preset the tune.fail-alloc ratio to 1%  */
+				if (dbg_options[v].flg == POOL_DBG_FAIL_ALLOC)
+					mem_fail_rate = 1;
 				break;
 			}
 			else if (isteq(feat, ist(dbg_options[v].clr))) {
 				new_dbg &= ~dbg_options[v].flg;
+				/* no-fail should reset the tune.fail-alloc ratio */
+				if (dbg_options[v].flg == POOL_DBG_FAIL_ALLOC)
+					mem_fail_rate = 0;
 				break;
 			}
 		}
@@ -1180,10 +1216,11 @@ INITCALL0(STG_PREPARE, init_pools);
 /* Report in build options if trim is supported */
 static void pools_register_build_options(void)
 {
-	if (is_trim_enabled()) {
+	if (!using_default_allocator) {
 		char *ptr = NULL;
-		memprintf(&ptr, "Support for malloc_trim() is enabled.");
+		memprintf(&ptr, "Running with a replaced memory allocator (e.g. via LD_PRELOAD).");
 		hap_register_build_opts(ptr, 1);
+		mark_tainted(TAINTED_REPLACED_MEM_ALLOCATOR);
 	}
 }
 INITCALL0(STG_REGISTER, pools_register_build_options);

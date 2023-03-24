@@ -962,6 +962,7 @@ static int h2_init(struct connection *conn, struct proxy *prx, struct session *s
 
 	h2c->proxy = prx;
 	h2c->task = NULL;
+	h2c->wait_event.tasklet = NULL;
 	h2c->idle_start = now_ms;
 	if (tick_isset(h2c->timeout)) {
 		t = task_new_here();
@@ -1397,7 +1398,9 @@ static int h2_fragment_headers(struct buffer *b, uint32_t mfs)
 
 /* marks stream <h2s> as CLOSED and decrement the number of active streams for
  * its connection if the stream was not yet closed. Please use this exclusively
- * before closing a stream to ensure stream count is well maintained.
+ * before closing a stream to ensure stream count is well maintained. Note that
+ * it does explicitly support being called with a partially initialized h2s
+ * (e.g. sd==NULL).
  */
 static inline void h2s_close(struct h2s *h2s)
 {
@@ -1406,7 +1409,7 @@ static inline void h2s_close(struct h2s *h2s)
 		h2s->h2c->nb_streams--;
 		if (!h2s->id)
 			h2s->h2c->nb_reserved--;
-		if (h2s_sc(h2s)) {
+		if (h2s->sd && h2s_sc(h2s)) {
 			if (!se_fl_test(h2s->sd, SE_FL_EOS) && !b_data(&h2s->rxbuf))
 				h2s_notify_recv(h2s);
 		}
@@ -3798,6 +3801,7 @@ static int h2_send(struct h2c *h2c)
 		unsigned int flags = 0;
 		unsigned int released = 0;
 		struct buffer *buf;
+		uint to_send;
 
 		/* fill as much as we can into the current buffer */
 		while (((h2c->flags & (H2_CF_MUX_MFULL|H2_CF_MUX_MALLOC)) == 0) && !done)
@@ -3813,7 +3817,8 @@ static int h2_send(struct h2c *h2c)
 		if (h2c->flags & (H2_CF_MUX_MFULL | H2_CF_DEM_MROOM))
 			flags |= CO_SFL_MSG_MORE;
 
-		if (!br_single(h2c->mbuf)) {
+		to_send = br_count(h2c->mbuf);
+		if (to_send > 1) {
 			/* usually we want to emit small TLS records to speed
 			 * up the decoding on the client. That's what is being
 			 * done by default. However if there is more than one
@@ -3825,12 +3830,14 @@ static int h2_send(struct h2c *h2c)
 
 		for (buf = br_head(h2c->mbuf); b_size(buf); buf = br_del_head(h2c->mbuf)) {
 			if (b_data(buf)) {
-				int ret = conn->xprt->snd_buf(conn, conn->xprt_ctx, buf, b_data(buf), flags);
+				int ret = conn->xprt->snd_buf(conn, conn->xprt_ctx, buf, b_data(buf),
+							      flags | (to_send > 1 ? CO_SFL_MSG_MORE : 0));
 				if (!ret) {
 					done = 1;
 					break;
 				}
 				sent = 1;
+				to_send--;
 				TRACE_DATA("sent data", H2_EV_H2C_SEND, h2c->conn, 0, buf, (void*)(long)ret);
 				b_del(buf, ret);
 				if (b_data(buf)) {

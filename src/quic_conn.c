@@ -1809,23 +1809,29 @@ static inline void qc_treat_acked_tx_frm(struct quic_conn *qc,
 
 /* Remove <largest> down to <smallest> node entries from <pkts> tree of TX packet,
  * deallocating them, and their TX frames.
- * Returns the last node reached to be used for the next range.
  * May be NULL if <largest> node could not be found.
  */
-static inline struct eb64_node *qc_ackrng_pkts(struct quic_conn *qc,
-                                               struct eb_root *pkts,
-                                               unsigned int *pkt_flags,
-                                               struct list *newly_acked_pkts,
-                                               struct eb64_node *largest_node,
-                                               uint64_t largest, uint64_t smallest)
+static inline void qc_ackrng_pkts(struct quic_conn *qc,
+                                  struct eb_root *pkts,
+                                  unsigned int *pkt_flags,
+                                  struct list *newly_acked_pkts,
+                                  struct eb64_node *largest_node,
+                                  uint64_t largest, uint64_t smallest)
 {
 	struct eb64_node *node;
 	struct quic_tx_packet *pkt;
 
 	TRACE_ENTER(QUIC_EV_CONN_PRSAFRM, qc);
 
-	node = largest_node ? largest_node : eb64_lookup_le(pkts, largest);
-	while (node && node->key >= smallest) {
+	node = eb64_lookup_ge(pkts, smallest);
+	if (!node)
+		goto leave;
+
+	largest_node = largest_node ? largest_node : eb64_lookup_le(pkts, largest);
+	if (!largest_node)
+		goto leave;
+
+	while (node && node->key <= largest_node->key) {
 		struct quic_frame *frm, *frmbak;
 
 		pkt = eb64_entry(node, struct quic_tx_packet, pn_node);
@@ -1838,12 +1844,12 @@ static inline struct eb64_node *qc_ackrng_pkts(struct quic_conn *qc,
 		 * detach the previous one and the next one from <pkt>.
 		 */
 		quic_tx_packet_dgram_detach(pkt);
-		node = eb64_prev(node);
+		node = eb64_next(node);
 		eb64_delete(&pkt->pn_node);
 	}
 
+ leave:
 	TRACE_LEAVE(QUIC_EV_CONN_PRSAFRM, qc);
-	return node;
 }
 
 /* Remove all frames from <pkt_frm_list> and reinsert them in the same order
@@ -5152,37 +5158,39 @@ struct task *qc_process_timer(struct task *task, void *ctx, unsigned int state)
 
 	if (qc->path->in_flight) {
 		pktns = quic_pto_pktns(qc, qc->state >= QUIC_HS_ST_CONFIRMED, NULL);
-		if (!qc_notify_send(qc)) {
-			if (pktns == &qc->pktns[QUIC_TLS_PKTNS_INITIAL]) {
+		if (pktns == &qc->pktns[QUIC_TLS_PKTNS_INITIAL]) {
+			if (qc_may_probe_ipktns(qc)) {
+				qc->flags |= QUIC_FL_CONN_RETRANS_NEEDED;
+				pktns->flags |= QUIC_FL_PKTNS_PROBE_NEEDED;
+				TRACE_STATE("needs to probe Initial packet number space", QUIC_EV_CONN_TXPKT, qc);
+			}
+			else {
+				TRACE_STATE("Cannot probe Initial packet number space", QUIC_EV_CONN_TXPKT, qc);
+			}
+			if (qc->pktns[QUIC_TLS_PKTNS_HANDSHAKE].tx.in_flight) {
+				qc->flags |= QUIC_FL_CONN_RETRANS_NEEDED;
+				qc->pktns[QUIC_TLS_PKTNS_HANDSHAKE].flags |= QUIC_FL_PKTNS_PROBE_NEEDED;
+				TRACE_STATE("needs to probe Handshake packet number space", QUIC_EV_CONN_TXPKT, qc);
+			}
+		}
+		else if (pktns == &qc->pktns[QUIC_TLS_PKTNS_HANDSHAKE]) {
+			TRACE_STATE("needs to probe Handshake packet number space", QUIC_EV_CONN_TXPKT, qc);
+			qc->flags |= QUIC_FL_CONN_RETRANS_NEEDED;
+			pktns->flags |= QUIC_FL_PKTNS_PROBE_NEEDED;
+			if (qc->pktns[QUIC_TLS_PKTNS_INITIAL].tx.in_flight) {
 				if (qc_may_probe_ipktns(qc)) {
-					qc->flags |= QUIC_FL_CONN_RETRANS_NEEDED;
-					pktns->flags |= QUIC_FL_PKTNS_PROBE_NEEDED;
+					qc->pktns[QUIC_TLS_PKTNS_INITIAL].flags |= QUIC_FL_PKTNS_PROBE_NEEDED;
 					TRACE_STATE("needs to probe Initial packet number space", QUIC_EV_CONN_TXPKT, qc);
 				}
 				else {
 					TRACE_STATE("Cannot probe Initial packet number space", QUIC_EV_CONN_TXPKT, qc);
 				}
-				if (qc->pktns[QUIC_TLS_PKTNS_HANDSHAKE].tx.in_flight) {
-					qc->flags |= QUIC_FL_CONN_RETRANS_NEEDED;
-					qc->pktns[QUIC_TLS_PKTNS_HANDSHAKE].flags |= QUIC_FL_PKTNS_PROBE_NEEDED;
-					TRACE_STATE("needs to probe Handshake packet number space", QUIC_EV_CONN_TXPKT, qc);
-				}
 			}
-			else if (pktns == &qc->pktns[QUIC_TLS_PKTNS_HANDSHAKE]) {
-				TRACE_STATE("needs to probe Handshake packet number space", QUIC_EV_CONN_TXPKT, qc);
-				qc->flags |= QUIC_FL_CONN_RETRANS_NEEDED;
-				pktns->flags |= QUIC_FL_PKTNS_PROBE_NEEDED;
-				if (qc->pktns[QUIC_TLS_PKTNS_INITIAL].tx.in_flight) {
-					if (qc_may_probe_ipktns(qc)) {
-						qc->pktns[QUIC_TLS_PKTNS_INITIAL].flags |= QUIC_FL_PKTNS_PROBE_NEEDED;
-						TRACE_STATE("needs to probe Initial packet number space", QUIC_EV_CONN_TXPKT, qc);
-					}
-					else {
-						TRACE_STATE("Cannot probe Initial packet number space", QUIC_EV_CONN_TXPKT, qc);
-					}
-				}
-			}
-			else if (pktns == &qc->pktns[QUIC_TLS_PKTNS_01RTT]) {
+		}
+		else if (pktns == &qc->pktns[QUIC_TLS_PKTNS_01RTT]) {
+			pktns->tx.pto_probe = QUIC_MAX_NB_PTO_DGRAMS;
+			/* Wake up upper layer if waiting to send new data. */
+			if (!qc_notify_send(qc)) {
 				TRACE_STATE("needs to probe 01RTT packet number space", QUIC_EV_CONN_TXPKT, qc);
 				qc->flags |= QUIC_FL_CONN_RETRANS_NEEDED;
 				pktns->flags |= QUIC_FL_PKTNS_PROBE_NEEDED;
@@ -8100,14 +8108,22 @@ void qc_notify_close(struct quic_conn *qc)
 	TRACE_LEAVE(QUIC_EV_CONN_CLOSE, qc);
 }
 
-/* Wake-up upper layer if waiting for send to be ready.
+/* Wake-up upper layer for sending if all conditions are met :
+ * - room in congestion window or probe packet to sent
+ * - socket FD ready to sent or listener socket used
  *
  * Returns 1 if upper layer has been woken up else 0.
  */
 int qc_notify_send(struct quic_conn *qc)
 {
+	const struct quic_pktns *pktns = &qc->pktns[QUIC_TLS_PKTNS_01RTT];
+
 	if (qc->subs && qc->subs->events & SUB_RETRY_SEND) {
-		if (quic_path_prep_data(qc->path) &&
+		/* RFC 9002 7.5. Probe Timeout
+		 *
+		 * Probe packets MUST NOT be blocked by the congestion controller.
+		 */
+		if ((quic_path_prep_data(qc->path) || pktns->tx.pto_probe) &&
 		    (!qc_test_fd(qc) || !fd_send_active(qc->fd))) {
 			tasklet_wakeup(qc->subs->tasklet);
 			qc->subs->events &= ~SUB_RETRY_SEND;

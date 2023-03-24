@@ -31,6 +31,9 @@ static void qcc_emit_cc(struct qcc *qcc, int err)
 {
 	TRACE_ENTER(QMUX_EV_QCC_END, qcc->conn);
 
+	/* This function must not be called multiple times. */
+	BUG_ON(qcc->flags & QC_CF_CC_EMIT);
+
 	TRACE_STATE("set CONNECTION_CLOSE on quic-conn", QMUX_EV_QCC_WAKE, qcc->conn);
 	quic_set_connection_close(qcc->conn->handle.qc, quic_err_transport(err));
 	qcc->flags |= QC_CF_CC_EMIT;
@@ -535,6 +538,7 @@ struct qcs *qcc_init_stream_local(struct qcc *qcc, int bidi)
 	qcs = qcs_new(qcc, *next, type);
 	if (!qcs) {
 		TRACE_LEAVE(QMUX_EV_QCS_NEW, qcc->conn);
+		qcc_emit_cc(qcc, QC_ERR_INTERNAL_ERROR);
 		return NULL;
 	}
 
@@ -594,8 +598,8 @@ static struct qcs *qcc_init_stream_remote(struct qcc *qcc, uint64_t id)
 
 		qcs = qcs_new(qcc, *largest, type);
 		if (!qcs) {
-			/* TODO emit RESET_STREAM */
 			TRACE_ERROR("stream fallocation failure", QMUX_EV_QCS_NEW, qcc->conn);
+			qcc_emit_cc(qcc, QC_ERR_INTERNAL_ERROR);
 			goto err;
 		}
 
@@ -747,7 +751,10 @@ static void qcs_consume(struct qcs *qcs, uint64_t bytes)
 	if (qcs->rx.msd - qcs->rx.offset < qcs->rx.msd_init / 2) {
 		TRACE_DATA("increase stream credit via MAX_STREAM_DATA", QMUX_EV_QCS_RECV, qcc->conn, qcs);
 		frm = qc_frm_alloc(QUIC_FT_MAX_STREAM_DATA);
-		BUG_ON(!frm); /* TODO handle this properly */
+		if (!frm) {
+			qcc_emit_cc(qcc, QC_ERR_INTERNAL_ERROR);
+			return;
+		}
 
 		qcs->rx.msd = qcs->rx.offset + qcs->rx.msd_init;
 
@@ -763,7 +770,10 @@ static void qcs_consume(struct qcs *qcs, uint64_t bytes)
 	if (qcc->lfctl.md - qcc->lfctl.offsets_consume < qcc->lfctl.md_init / 2) {
 		TRACE_DATA("increase conn credit via MAX_DATA", QMUX_EV_QCS_RECV, qcc->conn, qcs);
 		frm = qc_frm_alloc(QUIC_FT_MAX_DATA);
-		BUG_ON(!frm); /* TODO handle this properly */
+		if (!frm) {
+			qcc_emit_cc(qcc, QC_ERR_INTERNAL_ERROR);
+			return;
+		}
 
 		qcc->lfctl.md = qcc->lfctl.offsets_consume + qcc->lfctl.md_init;
 
@@ -832,6 +842,9 @@ void qcc_emit_cc_app(struct qcc *qcc, int err, int immediate)
 {
 	TRACE_ENTER(QMUX_EV_QCC_END, qcc->conn);
 
+	/* This function must not be called multiple times after immediate is set. */
+	BUG_ON(qcc->flags & QC_CF_CC_EMIT);
+
 	if (immediate) {
 		quic_set_connection_close(qcc->conn->handle.qc, quic_err_app(err));
 		qcc->flags |= QC_CF_CC_EMIT;
@@ -856,6 +869,15 @@ void qcc_reset_stream(struct qcs *qcs, int err)
 	TRACE_STATE("reset stream", QMUX_EV_QCS_END, qcc->conn, qcs);
 	qcs->flags |= QC_SF_TO_RESET;
 	qcs->err = err;
+
+	/* Remove prepared stream data from connection flow-control calcul. */
+	if (qcs->tx.offset > qcs->tx.sent_offset) {
+		const uint64_t diff = qcs->tx.offset - qcs->tx.sent_offset;
+		BUG_ON(qcc->tx.offsets - diff < qcc->tx.sent_offsets);
+		qcc->tx.offsets -= diff;
+		/* Reset qcs offset to prevent BUG_ON() on qcs_destroy(). */
+		qcs->tx.offset = qcs->tx.sent_offset;
+	}
 
 	qcc_send_stream(qcs, 1);
 	tasklet_wakeup(qcc->wait_event.tasklet);
@@ -1108,7 +1130,7 @@ int qcc_recv_max_data(struct qcc *qcc, uint64_t max)
 	TRACE_PROTO("receiving MAX_DATA", QMUX_EV_QCC_RECV, qcc->conn);
 	if (qcc->rfctl.md < max) {
 		qcc->rfctl.md = max;
-		TRACE_DEVEL("increase remote max-data", QMUX_EV_QCC_RECV, qcc->conn);
+		TRACE_DATA("increase remote max-data", QMUX_EV_QCC_RECV, qcc->conn);
 
 		if (qcc->flags & QC_CF_BLK_MFCTL) {
 			qcc->flags &= ~QC_CF_BLK_MFCTL;
@@ -1132,6 +1154,11 @@ int qcc_recv_max_stream_data(struct qcc *qcc, uint64_t id, uint64_t max)
 
 	TRACE_ENTER(QMUX_EV_QCC_RECV, qcc->conn);
 
+	if (qcc->flags & QC_CF_CC_EMIT) {
+		TRACE_DATA("connection closed", QMUX_EV_QCC_RECV, qcc->conn);
+		goto err;
+	}
+
 	/* RFC 9000 19.10. MAX_STREAM_DATA Frames
 	 *
 	 * Receiving a MAX_STREAM_DATA frame for a locally
@@ -1140,16 +1167,14 @@ int qcc_recv_max_stream_data(struct qcc *qcc, uint64_t id, uint64_t max)
 	 * receives a MAX_STREAM_DATA frame for a receive-only stream MUST
 	 * terminate the connection with error STREAM_STATE_ERROR.
 	 */
-	if (qcc_get_qcs(qcc, id, 0, 1, &qcs)) {
-		TRACE_LEAVE(QMUX_EV_QCC_RECV, qcc->conn);
-		return 1;
-	}
+	if (qcc_get_qcs(qcc, id, 0, 1, &qcs))
+		goto err;
 
 	if (qcs) {
 		TRACE_PROTO("receiving MAX_STREAM_DATA", QMUX_EV_QCC_RECV|QMUX_EV_QCS_RECV, qcc->conn, qcs);
 		if (max > qcs->tx.msd) {
 			qcs->tx.msd = max;
-			TRACE_DEVEL("increase remote max-stream-data", QMUX_EV_QCC_RECV|QMUX_EV_QCS_RECV, qcc->conn, qcs);
+			TRACE_DATA("increase remote max-stream-data", QMUX_EV_QCC_RECV|QMUX_EV_QCS_RECV, qcc->conn, qcs);
 
 			if (qcs->flags & QC_SF_BLK_SFCTL) {
 				qcs->flags &= ~QC_SF_BLK_SFCTL;
@@ -1164,6 +1189,10 @@ int qcc_recv_max_stream_data(struct qcc *qcc, uint64_t id, uint64_t max)
 
 	TRACE_LEAVE(QMUX_EV_QCC_RECV, qcc->conn);
 	return 0;
+
+ err:
+	TRACE_DEVEL("leaving on error", QMUX_EV_QCC_RECV, qcc->conn);
+	return 1;
 }
 
 /* Handle a new RESET_STREAM frame from stream ID <id> with error code <err>
@@ -1177,6 +1206,11 @@ int qcc_recv_reset_stream(struct qcc *qcc, uint64_t id, uint64_t err, uint64_t f
 	struct qcs *qcs;
 
 	TRACE_ENTER(QMUX_EV_QCC_RECV, qcc->conn);
+
+	if (qcc->flags & QC_CF_CC_EMIT) {
+		TRACE_DATA("connection closed", QMUX_EV_QCC_RECV, qcc->conn);
+		goto err;
+	}
 
 	/* RFC 9000 19.4. RESET_STREAM Frames
 	 *
@@ -1239,6 +1273,11 @@ int qcc_recv_stop_sending(struct qcc *qcc, uint64_t id, uint64_t err)
 
 	TRACE_ENTER(QMUX_EV_QCC_RECV, qcc->conn);
 
+	if (qcc->flags & QC_CF_CC_EMIT) {
+		TRACE_DATA("connection closed", QMUX_EV_QCC_RECV, qcc->conn);
+		goto err;
+	}
+
 	/* RFC 9000 19.5. STOP_SENDING Frames
 	 *
 	 * Receiving a STOP_SENDING frame for a
@@ -1247,10 +1286,8 @@ int qcc_recv_stop_sending(struct qcc *qcc, uint64_t id, uint64_t err)
 	 * endpoint that receives a STOP_SENDING frame for a receive-only stream
 	 * MUST terminate the connection with error STREAM_STATE_ERROR.
 	 */
-	if (qcc_get_qcs(qcc, id, 0, 1, &qcs)) {
-		TRACE_LEAVE(QMUX_EV_QCC_RECV, qcc->conn);
-		return 1;
-	}
+	if (qcc_get_qcs(qcc, id, 0, 1, &qcs))
+		goto err;
 
 	if (!qcs)
 		goto out;
@@ -1308,6 +1345,10 @@ int qcc_recv_stop_sending(struct qcc *qcc, uint64_t id, uint64_t err)
  out:
 	TRACE_LEAVE(QMUX_EV_QCC_RECV, qcc->conn);
 	return 0;
+
+ err:
+	TRACE_DEVEL("leaving on error", QMUX_EV_QCC_RECV, qcc->conn);
+	return 1;
 }
 
 /* Signal the closing of remote stream with id <id>. Flow-control for new
@@ -1324,7 +1365,10 @@ static int qcc_release_remote_stream(struct qcc *qcc, uint64_t id)
 		if (qcc->lfctl.cl_bidi_r > qcc->lfctl.ms_bidi_init / 2) {
 			TRACE_DATA("increase max stream limit with MAX_STREAMS_BIDI", QMUX_EV_QCC_SEND, qcc->conn);
 			frm = qc_frm_alloc(QUIC_FT_MAX_STREAMS_BIDI);
-			BUG_ON(!frm); /* TODO handle this properly */
+			if (!frm) {
+				qcc_emit_cc(qcc, QC_ERR_INTERNAL_ERROR);
+				goto err;
+			}
 
 			frm->max_streams_bidi.max_streams = qcc->lfctl.ms_bidi +
 			                                    qcc->lfctl.cl_bidi_r;
@@ -1346,18 +1390,30 @@ static int qcc_release_remote_stream(struct qcc *qcc, uint64_t id)
 	TRACE_LEAVE(QMUX_EV_QCS_END, qcc->conn);
 
 	return 0;
+
+ err:
+	TRACE_DEVEL("leaving on error", QMUX_EV_QCS_END, qcc->conn);
+	return 1;
 }
 
 /* detaches the QUIC stream from its QCC and releases it to the QCS pool. */
 static void qcs_destroy(struct qcs *qcs)
 {
-	struct connection *conn = qcs->qcc->conn;
+	struct qcc *qcc = qcs->qcc;
+	struct connection *conn = qcc->conn;
 	const uint64_t id = qcs->id;
 
 	TRACE_ENTER(QMUX_EV_QCS_END, conn, qcs);
 
-	if (quic_stream_is_remote(qcs->qcc, id))
-		qcc_release_remote_stream(qcs->qcc, id);
+	/* MUST not removed a stream with sending prepared data left. This is
+	 * to ensure consistency on connection flow-control calculation.
+	 */
+	BUG_ON(qcs->tx.offset < qcs->tx.sent_offset);
+
+	if (!(qcc->flags & QC_CF_CC_EMIT)) {
+		if (quic_stream_is_remote(qcc, id))
+			qcc_release_remote_stream(qcc, id);
+	}
 
 	qcs_free(qcs);
 
@@ -1402,13 +1458,17 @@ static int qcs_xfer_data(struct qcs *qcs, struct buffer *out, struct buffer *in)
 
 	BUG_ON_HOT(qcs->tx.offset > qcs->tx.msd);
 	/* do not exceed flow control limit */
-	if (qcs->tx.offset + to_xfer > qcs->tx.msd)
+	if (qcs->tx.offset + to_xfer > qcs->tx.msd) {
+		TRACE_DATA("do not exceed stream flow control", QMUX_EV_QCS_SEND, qcc->conn, qcs);
 		to_xfer = qcs->tx.msd - qcs->tx.offset;
+	}
 
 	BUG_ON_HOT(qcc->tx.offsets > qcc->rfctl.md);
 	/* do not overcome flow control limit on connection */
-	if (qcc->tx.offsets + to_xfer > qcc->rfctl.md)
+	if (qcc->tx.offsets + to_xfer > qcc->rfctl.md) {
+		TRACE_DATA("do not exceed conn flow control", QMUX_EV_QCS_SEND, qcc->conn, qcs);
 		to_xfer = qcc->rfctl.md - qcc->tx.offsets;
+	}
 
 	if (!left && !to_xfer)
 		goto out;
@@ -1735,18 +1795,21 @@ static int _qc_send_qcs(struct qcs *qcs, struct list *frms)
 	int xfer = 0;
 	char fin = 0;
 
+	TRACE_ENTER(QMUX_EV_QCS_SEND, qcc->conn, qcs);
+
 	/* Cannot send STREAM on remote unidirectional streams. */
 	BUG_ON(quic_stream_is_uni(qcs->id) && quic_stream_is_remote(qcc, qcs->id));
 
 	/* Allocate <out> buffer if necessary. */
 	if (!out) {
 		if (qcc->flags & QC_CF_CONN_FULL)
-			return 0;
+			goto out;
 
 		out = qc_stream_buf_alloc(qcs->stream, qcs->tx.offset);
 		if (!out) {
+			TRACE_STATE("cannot allocate stream desc buffer", QMUX_EV_QCS_SEND, qcc->conn, qcs);
 			qcc->flags |= QC_CF_CONN_FULL;
-			return 0;
+			goto out;
 		}
 	}
 
@@ -1777,6 +1840,8 @@ static int _qc_send_qcs(struct qcs *qcs, struct list *frms)
 		if (ret < 0) { ABORT_NOW(); /* TODO handle this properly */ }
 	}
 
+ out:
+	TRACE_LEAVE(QMUX_EV_QCS_SEND, qcc->conn, qcs);
 	return xfer;
 }
 
@@ -1981,8 +2046,10 @@ static void qc_shutdown(struct qcc *qcc)
 {
 	TRACE_ENTER(QMUX_EV_QCC_END, qcc->conn);
 
-	if (qcc->flags & QC_CF_APP_SHUT)
+	if (qcc->flags & (QC_CF_APP_SHUT|QC_CF_CC_EMIT)) {
+		TRACE_DATA("connection closed", QMUX_EV_QCC_END, qcc->conn);
 		goto out;
+	}
 
 	if (qcc->app_ops && qcc->app_ops->shutdown) {
 		qcc->app_ops->shutdown(qcc->ctx);
