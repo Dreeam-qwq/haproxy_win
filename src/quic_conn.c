@@ -1905,7 +1905,7 @@ static inline int qc_requeue_nacked_pkt_tx_frms(struct quic_conn *qc,
 			else if (strm_frm->offset.key < stream_desc->ack_offset) {
 				uint64_t diff = stream_desc->ack_offset - strm_frm->offset.key;
 
-				qc_stream_frm_mv_fwd(strm_frm, diff);
+				qc_stream_frm_mv_fwd(frm, diff);
 				TRACE_DEVEL("updated partially acked frame",
 				            QUIC_EV_CONN_PRSAFRM, qc, frm);
 			}
@@ -2562,7 +2562,7 @@ static void qc_dup_pkt_frms(struct quic_conn *qc,
 			else if (strm_frm->offset.key < stream_desc->ack_offset) {
 				uint64_t diff = stream_desc->ack_offset - strm_frm->offset.key;
 
-				qc_stream_frm_mv_fwd(strm_frm, diff);
+				qc_stream_frm_mv_fwd(frm, diff);
 				TRACE_DEVEL("updated partially acked frame",
 				            QUIC_EV_CONN_PRSAFRM, qc, frm);
 			}
@@ -7301,7 +7301,7 @@ static inline int qc_build_frms(struct list *outlist, struct list *inlist,
 				else if (strm->offset.key < stream_desc->ack_offset) {
 					uint64_t diff = stream_desc->ack_offset - strm->offset.key;
 
-					qc_stream_frm_mv_fwd(strm, diff);
+					qc_stream_frm_mv_fwd(cf, diff);
 					TRACE_DEVEL("updated partially acked frame",
 					            QUIC_EV_CONN_PRSAFRM, qc, cf);
 				}
@@ -7659,10 +7659,17 @@ static int qc_do_build_pkt(unsigned char *pos, const unsigned char *end,
 			 * is not coalesced to an Handshake packet. We must directly
 			 * pad the datragram.
 			 */
-			if (pkt->type == QUIC_PACKET_TYPE_INITIAL && dglen < QUIC_INITIAL_PACKET_MINLEN) {
-				padding_len = QUIC_INITIAL_PACKET_MINLEN - dglen;
-				padding_len -= quic_int_getsize(len + padding_len) - len_sz;
-				len += padding_len;
+			if (pkt->type == QUIC_PACKET_TYPE_INITIAL) {
+				if (dglen < QUIC_INITIAL_PACKET_MINLEN) {
+					padding_len = QUIC_INITIAL_PACKET_MINLEN - dglen;
+					padding_len -= quic_int_getsize(len + padding_len) - len_sz;
+					len += padding_len;
+				}
+			}
+			else {
+				/* Note that +1 is for the PING frame */
+				if (*pn_len + 1 < QUIC_PACKET_PN_MAXLEN)
+					len += padding_len = QUIC_PACKET_PN_MAXLEN - *pn_len - 1;
 			}
 		}
 		else {
