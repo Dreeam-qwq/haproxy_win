@@ -487,8 +487,6 @@ struct appctx *sc_applet_create(struct stconn *sc, struct applet *app)
 {
 	struct appctx *appctx;
 
-	DPRINTF(stderr, "registering handler %p for sc %p (was %p)\n", app, sc, sc_strm_task(sc));
-
 	appctx = appctx_new_here(app, sc->sedesc);
 	if (!appctx)
 		return NULL;
@@ -501,15 +499,15 @@ struct appctx *sc_applet_create(struct stconn *sc, struct applet *app)
 	return appctx;
 }
 
-/* Conditionnaly forward the close to the wirte side. It return 1 if it can be
+/* Conditionally forward the close to the write side. It return 1 if it can be
  * forwarded. It is the caller responsibility to forward the close to the write
- * side. Otherwise, 0 is returned. In this case, CF_SHUTW_NOW flag may be set on
- * the channel if we are only waiting for the outgoing data to be flushed.
+ * side. Otherwise, 0 is returned. In this case, SC_FL_SHUTW_NOW flag may be set on
+ * the consumer SC if we are only waiting for the outgoing data to be flushed.
  */
 static inline int sc_cond_forward_shutw(struct stconn *sc)
 {
 	/* The close must not be forwarded */
-	if (!(sc_ic(sc)->flags & CF_SHUTR) || !(sc->flags & SC_FL_NOHALF))
+	if (!(sc->flags & SC_FL_SHUTR) || !(sc->flags & SC_FL_NOHALF))
 		return 0;
 
 	if (!channel_is_empty(sc_ic(sc))) {
@@ -536,15 +534,17 @@ static void sc_app_shutr(struct stconn *sc)
 {
 	struct channel *ic = sc_ic(sc);
 
-	if (ic->flags & CF_SHUTR)
+	if (sc->flags & SC_FL_SHUTR)
+		return;
 
-	ic->flags |= CF_SHUTR|CF_READ_EVENT;
+	sc->flags |= SC_FL_SHUTR;
+	ic->flags |= CF_READ_EVENT;
 	sc_ep_report_read_activity(sc);
 
 	if (!sc_state_in(sc->state, SC_SB_CON|SC_SB_RDY|SC_SB_EST))
 		return;
 
-	if (sc_oc(sc)->flags & CF_SHUTW) {
+	if (sc->flags & SC_FL_SHUTW) {
 		sc->state = SC_ST_DIS;
 		if (sc->flags & SC_FL_ISBACK)
 			__sc_strm(sc)->conn_exp = TICK_ETERNITY;
@@ -569,10 +569,11 @@ static void sc_app_shutw(struct stconn *sc)
 	struct channel *ic = sc_ic(sc);
 	struct channel *oc = sc_oc(sc);
 
-	oc->flags &= ~CF_SHUTW_NOW;
-	if (oc->flags & CF_SHUTW)
+	sc->flags &= ~SC_FL_SHUTW_NOW;
+	if (sc->flags & SC_FL_SHUTW)
 		return;
-	oc->flags |= CF_SHUTW|CF_WRITE_EVENT;
+	sc->flags |= SC_FL_SHUTW;
+	oc->flags |= CF_WRITE_EVENT;
 	sc_set_hcto(sc);
 
 	switch (sc->state) {
@@ -585,7 +586,7 @@ static void sc_app_shutw(struct stconn *sc)
 		 * no risk so we close both sides immediately.
 		 */
 		if (!sc_ep_test(sc, SE_FL_ERROR) && !(sc->flags & SC_FL_NOLINGER) &&
-		    !(ic->flags & (CF_SHUTR|CF_DONT_READ)))
+		    !(sc->flags & SC_FL_SHUTR) && !(ic->flags & CF_DONT_READ))
 			return;
 
 		__fallthrough;
@@ -598,7 +599,7 @@ static void sc_app_shutw(struct stconn *sc)
 		__fallthrough;
 	default:
 		sc->flags &= ~SC_FL_NOLINGER;
-		ic->flags |= CF_SHUTR;
+		sc->flags |= SC_FL_SHUTR;
 		if (sc->flags & SC_FL_ISBACK)
 			__sc_strm(sc)->conn_exp = TICK_ETERNITY;
 	}
@@ -612,10 +613,6 @@ static void sc_app_shutw(struct stconn *sc)
 static void sc_app_chk_rcv(struct stconn *sc)
 {
 	struct channel *ic = sc_ic(sc);
-
-	DPRINTF(stderr, "%s: sc=%p, sc->state=%d ic->flags=%08x oc->flags=%08x\n",
-		__FUNCTION__,
-		sc, sc->state, ic->flags, sc_oc(sc)->flags);
 
 	if (ic->pipe) {
 		/* stop reading */
@@ -633,11 +630,7 @@ static void sc_app_chk_snd(struct stconn *sc)
 {
 	struct channel *oc = sc_oc(sc);
 
-	DPRINTF(stderr, "%s: sc=%p, sc->state=%d ic->flags=%08x oc->flags=%08x\n",
-		__FUNCTION__,
-		sc, sc->state, sc_ic(sc)->flags, oc->flags);
-
-	if (unlikely(sc->state != SC_ST_EST || (oc->flags & CF_SHUTW)))
+	if (unlikely(sc->state != SC_ST_EST || (sc->flags & SC_FL_SHUTW)))
 		return;
 
 	if (!sc_ep_test(sc, SE_FL_WAIT_DATA) ||  /* not waiting for data */
@@ -668,14 +661,15 @@ static void sc_app_shutr_conn(struct stconn *sc)
 
 	BUG_ON(!sc_conn(sc));
 
-	if (ic->flags & CF_SHUTR)
+	if (sc->flags & SC_FL_SHUTR)
 		return;
-	ic->flags |= CF_SHUTR|CF_READ_EVENT;
+	sc->flags |= SC_FL_SHUTR;
+	ic->flags |= CF_READ_EVENT;
 
 	if (!sc_state_in(sc->state, SC_SB_CON|SC_SB_RDY|SC_SB_EST))
 		return;
 
-	if (sc_oc(sc)->flags & CF_SHUTW) {
+	if (sc->flags & SC_FL_SHUTW) {
 		sc_conn_shut(sc);
 		sc->state = SC_ST_DIS;
 		if (sc->flags & SC_FL_ISBACK)
@@ -700,10 +694,11 @@ static void sc_app_shutw_conn(struct stconn *sc)
 
 	BUG_ON(!sc_conn(sc));
 
-	oc->flags &= ~CF_SHUTW_NOW;
-	if (oc->flags & CF_SHUTW)
+	sc->flags &= ~SC_FL_SHUTW_NOW;
+	if (sc->flags & SC_FL_SHUTW)
 		return;
-	oc->flags |= CF_SHUTW|CF_WRITE_EVENT;
+	sc->flags |= SC_FL_SHUTW;
+	oc->flags |= CF_WRITE_EVENT;
 	sc_set_hcto(sc);
 
 	switch (sc->state) {
@@ -736,7 +731,7 @@ static void sc_app_shutw_conn(struct stconn *sc)
 			 */
 			sc_conn_shutw(sc, CO_SHW_NORMAL);
 
-			if (!(ic->flags & (CF_SHUTR|CF_DONT_READ)))
+			if (!(sc->flags & SC_FL_SHUTR) && !(ic->flags & CF_DONT_READ))
 				return;
 		}
 
@@ -754,7 +749,7 @@ static void sc_app_shutw_conn(struct stconn *sc)
 		__fallthrough;
 	default:
 		sc->flags &= ~SC_FL_NOLINGER;
-		ic->flags |= CF_SHUTR;
+		sc->flags |= SC_FL_SHUTR;
 		if (sc->flags & SC_FL_ISBACK)
 			__sc_strm(sc)->conn_exp = TICK_ETERNITY;
 	}
@@ -788,7 +783,7 @@ static void sc_app_chk_snd_conn(struct stconn *sc)
 	BUG_ON(!sc_conn(sc));
 
 	if (unlikely(!sc_state_in(sc->state, SC_SB_RDY|SC_SB_EST) ||
-	    (oc->flags & CF_SHUTW)))
+		     (sc->flags & SC_FL_SHUTW)))
 		return;
 
 	if (unlikely(channel_is_empty(oc)))  /* called with nothing to send ! */
@@ -817,14 +812,14 @@ static void sc_app_chk_snd_conn(struct stconn *sc)
 		 * ->o limit was reached. Maybe we just wrote the last
 		 * chunk and need to close.
 		 */
-		if (((oc->flags & (CF_SHUTW|CF_AUTO_CLOSE|CF_SHUTW_NOW)) ==
-		     (CF_AUTO_CLOSE|CF_SHUTW_NOW)) &&
+		if ((oc->flags & CF_AUTO_CLOSE) &&
+		    ((sc->flags & (SC_FL_SHUTW|SC_FL_SHUTW_NOW)) == SC_FL_SHUTW_NOW) &&
 		    sc_state_in(sc->state, SC_SB_RDY|SC_SB_EST)) {
 			sc_shutw(sc);
 			goto out_wakeup;
 		}
 
-		if ((oc->flags & (CF_SHUTW|CF_SHUTW_NOW)) == 0)
+		if ((sc->flags & (SC_FL_SHUTW|SC_FL_SHUTW_NOW)) == 0)
 			sc_ep_set(sc, SE_FL_WAIT_DATA);
 	}
 	else {
@@ -837,7 +832,7 @@ static void sc_app_chk_snd_conn(struct stconn *sc)
 	/* in case of special condition (error, shutdown, end of write...), we
 	 * have to notify the task.
 	 */
-	if (likely((oc->flags & CF_SHUTW) ||
+	if (likely((sc->flags & SC_FL_SHUTW) ||
 		   ((oc->flags & CF_WRITE_EVENT) && sc->state < SC_ST_EST) ||
 		   ((oc->flags & CF_WAKE_WRITE) &&
 		    ((channel_is_empty(oc) && !oc->to_forward) ||
@@ -862,16 +857,17 @@ static void sc_app_shutr_applet(struct stconn *sc)
 
 	BUG_ON(!sc_appctx(sc));
 
-	if (ic->flags & CF_SHUTR)
+	if (sc->flags & SC_FL_SHUTR)
 		return;
-	ic->flags |= CF_SHUTR|CF_READ_EVENT;
+	sc->flags |= SC_FL_SHUTR;
+	ic->flags |= CF_READ_EVENT;
 
 	/* Note: on shutr, we don't call the applet */
 
 	if (!sc_state_in(sc->state, SC_SB_CON|SC_SB_RDY|SC_SB_EST))
 		return;
 
-	if (sc_oc(sc)->flags & CF_SHUTW) {
+	if (sc->flags & SC_FL_SHUTW) {
 		appctx_shut(__sc_appctx(sc));
 		sc->state = SC_ST_DIS;
 		if (sc->flags & SC_FL_ISBACK)
@@ -895,10 +891,11 @@ static void sc_app_shutw_applet(struct stconn *sc)
 
 	BUG_ON(!sc_appctx(sc));
 
-	oc->flags &= ~CF_SHUTW_NOW;
-	if (oc->flags & CF_SHUTW)
+	sc->flags &= ~SC_FL_SHUTW_NOW;
+	if (sc->flags & SC_FL_SHUTW)
 		return;
-	oc->flags |= CF_SHUTW|CF_WRITE_EVENT;
+	sc->flags |= SC_FL_SHUTW;
+	oc->flags |= CF_WRITE_EVENT;
 	sc_set_hcto(sc);
 
 	/* on shutw we always wake the applet up */
@@ -914,7 +911,8 @@ static void sc_app_shutw_applet(struct stconn *sc)
 		 * no risk so we close both sides immediately.
 		 */
 		if (!sc_ep_test(sc, SE_FL_ERROR) && !(sc->flags & SC_FL_NOLINGER) &&
-		    !(ic->flags & (CF_SHUTR|CF_DONT_READ)))
+		    !(sc->flags & SC_FL_SHUTR) &&
+		    !(ic->flags & CF_DONT_READ))
 			return;
 
 		__fallthrough;
@@ -928,7 +926,7 @@ static void sc_app_shutw_applet(struct stconn *sc)
 		__fallthrough;
 	default:
 		sc->flags &= ~SC_FL_NOLINGER;
-		ic->flags |= CF_SHUTR;
+		sc->flags |= SC_FL_SHUTR;
 		if (sc->flags & SC_FL_ISBACK)
 			__sc_strm(sc)->conn_exp = TICK_ETERNITY;
 	}
@@ -940,10 +938,6 @@ static void sc_app_chk_rcv_applet(struct stconn *sc)
 	struct channel *ic = sc_ic(sc);
 
 	BUG_ON(!sc_appctx(sc));
-
-	DPRINTF(stderr, "%s: sc=%p, sc->state=%d ic->flags=%08x oc->flags=%08x\n",
-		__FUNCTION__,
-		sc, sc->state, ic->flags, sc_oc(sc)->flags);
 
 	if (!ic->pipe) {
 		/* (re)start reading */
@@ -958,11 +952,7 @@ static void sc_app_chk_snd_applet(struct stconn *sc)
 
 	BUG_ON(!sc_appctx(sc));
 
-	DPRINTF(stderr, "%s: sc=%p, sc->state=%d ic->flags=%08x oc->flags=%08x\n",
-		__FUNCTION__,
-		sc, sc->state, sc_ic(sc)->flags, oc->flags);
-
-	if (unlikely(sc->state != SC_ST_EST || (oc->flags & CF_SHUTW)))
+	if (unlikely(sc->state != SC_ST_EST || (sc->flags & SC_FL_SHUTW)))
 		return;
 
 	/* we only wake the applet up if it was waiting for some data  and is ready to consume it */
@@ -989,7 +979,7 @@ void sc_update_rx(struct stconn *sc)
 {
 	struct channel *ic = sc_ic(sc);
 
-	if (ic->flags & CF_SHUTR)
+	if (sc->flags & SC_FL_SHUTR)
 		return;
 
 	/* Read not closed, update FD status and timeout for reads */
@@ -1014,14 +1004,14 @@ void sc_update_tx(struct stconn *sc)
 {
 	struct channel *oc = sc_oc(sc);
 
-	if (oc->flags & CF_SHUTW)
+	if (sc->flags & SC_FL_SHUTW)
 		return;
 
 	/* Write not closed, update FD status and timeout for writes */
 	if (channel_is_empty(oc)) {
 		/* stop writing */
 		if (!sc_ep_test(sc, SE_FL_WAIT_DATA)) {
-			if ((oc->flags & CF_SHUTW_NOW) == 0)
+			if ((sc->flags & SC_FL_SHUTW_NOW) == 0)
 				sc_ep_set(sc, SE_FL_WAIT_DATA);
 		}
 		return;
@@ -1052,17 +1042,17 @@ static void sc_notify(struct stconn *sc)
 	if (channel_is_empty(oc)) {
 		struct connection *conn = sc_conn(sc);
 
-		if (((oc->flags & (CF_SHUTW|CF_SHUTW_NOW)) == CF_SHUTW_NOW) &&
+		if (((sc->flags & (SC_FL_SHUTW|SC_FL_SHUTW_NOW)) == SC_FL_SHUTW_NOW) &&
 		    (sc->state == SC_ST_EST) && (!conn || !(conn->flags & (CO_FL_WAIT_XPRT | CO_FL_EARLY_SSL_HS))))
 			sc_shutw(sc);
 	}
 
 	/* indicate that we may be waiting for data from the output channel or
-	 * we're about to close and can't expect more data if SHUTW_NOW is there.
+	 * we're about to close and can't expect more data if SC_FL_SHUTW_NOW is there.
 	 */
-	if (!(oc->flags & (CF_SHUTW|CF_SHUTW_NOW)))
+	if (!(sc->flags & (SC_FL_SHUTW|SC_FL_SHUTW_NOW)))
 		sc_ep_set(sc, SE_FL_WAIT_DATA);
-	else if ((oc->flags & (CF_SHUTW|CF_SHUTW_NOW)) == CF_SHUTW_NOW)
+	else if ((sc->flags & (SC_FL_SHUTW|SC_FL_SHUTW_NOW)) == SC_FL_SHUTW_NOW)
 		sc_ep_clr(sc, SE_FL_WAIT_DATA);
 
 	if (oc->flags & CF_DONT_READ)
@@ -1084,7 +1074,7 @@ static void sc_notify(struct stconn *sc)
 	 */
 	if (!channel_is_empty(ic) &&
 	    sc_ep_test(sco, SE_FL_WAIT_DATA) &&
-	    (!(ic->flags & CF_EXPECT_MORE) || c_full(ic) || ci_data(ic) == 0 || ic->pipe)) {
+	    (!(sc->flags & SC_FL_SND_EXP_MORE) || c_full(ic) || ci_data(ic) == 0 || ic->pipe)) {
 		int new_len, last_len;
 
 		last_len = co_data(ic);
@@ -1114,27 +1104,28 @@ static void sc_notify(struct stconn *sc)
 	if (/* changes on the production side that must be handled:
 	     *  - An error on receipt: SE_FL_ERROR
 	     *  - A read event: shutdown for reads (CF_READ_EVENT + SHUTR)
-	     *                  end of input (CF_READ_EVENT + CF_EOI)
+	     *                  end of input (CF_READ_EVENT + SC_FL_EOI)
 	     *                  data received and no fast-forwarding (CF_READ_EVENT + !to_forward)
 	     *                  read event while consumer side is not established (CF_READ_EVENT + sco->state != SC_ST_EST)
 	     */
-	    ((ic->flags & CF_READ_EVENT) && ((ic->flags & (CF_SHUTR|CF_EOI)) || !ic->to_forward || sco->state != SC_ST_EST)) ||
+		((ic->flags & CF_READ_EVENT) && ((sc->flags & SC_FL_EOI) || (sc->flags & SC_FL_SHUTR) || !ic->to_forward || sco->state != SC_ST_EST)) ||
 	    sc_ep_test(sc, SE_FL_ERROR) ||
 
 	    /* changes on the consumption side */
 	    sc_ep_test(sc, SE_FL_ERR_PENDING) ||
 	    ((oc->flags & CF_WRITE_EVENT) &&
 	     ((sc->state < SC_ST_EST) ||
-	      (oc->flags & CF_SHUTW) ||
+	      (sc->flags & SC_FL_SHUTW) ||
 	      (((oc->flags & CF_WAKE_WRITE) ||
-	       !(oc->flags & (CF_AUTO_CLOSE|CF_SHUTW_NOW|CF_SHUTW))) &&
-	      (sco->state != SC_ST_EST ||
-	       (channel_is_empty(oc) && !oc->to_forward)))))) {
+		(!(oc->flags & CF_AUTO_CLOSE) &&
+		 !(sc->flags & (SC_FL_SHUTW_NOW|SC_FL_SHUTW)))) &&
+	       (sco->state != SC_ST_EST ||
+		(channel_is_empty(oc) && !oc->to_forward)))))) {
 		task_wakeup(task, TASK_WOKEN_IO);
 	}
 
 	if (ic->flags & CF_READ_EVENT)
-		ic->flags &= ~CF_READ_DONTWAIT;
+		sc->flags &= ~SC_FL_RCV_ONCE;
 }
 
 /*
@@ -1145,19 +1136,19 @@ static void sc_notify(struct stconn *sc)
 static void sc_conn_read0(struct stconn *sc)
 {
 	struct channel *ic = sc_ic(sc);
-	struct channel *oc = sc_oc(sc);
 
 	BUG_ON(!sc_conn(sc));
 
-	if (ic->flags & CF_SHUTR)
+	if (sc->flags & SC_FL_SHUTR)
 		return;
-	ic->flags |= CF_SHUTR|CF_READ_EVENT;
+	sc->flags |= SC_FL_SHUTR;
+	ic->flags |= CF_READ_EVENT;
 	sc_ep_report_read_activity(sc);
 
 	if (!sc_state_in(sc->state, SC_SB_CON|SC_SB_RDY|SC_SB_EST))
 		return;
 
-	if (oc->flags & CF_SHUTW)
+	if (sc->flags & SC_FL_SHUTW)
 		goto do_close;
 
 	if (sc_cond_forward_shutw(sc)) {
@@ -1174,8 +1165,8 @@ static void sc_conn_read0(struct stconn *sc)
 	/* OK we completely close the socket here just as if we went through sc_shut[rw]() */
 	sc_conn_shut(sc);
 
-	oc->flags &= ~CF_SHUTW_NOW;
-	oc->flags |= CF_SHUTW;
+	sc->flags &= ~SC_FL_SHUTW_NOW;
+	sc->flags |= SC_FL_SHUTW;
 
 	sc->state = SC_ST_DIS;
 	if (sc->flags & SC_FL_ISBACK)
@@ -1207,16 +1198,12 @@ static int sc_conn_recv(struct stconn *sc)
 		return 0;
 
 	/* maybe we were called immediately after an asynchronous shutr */
-	if (ic->flags & CF_SHUTR)
+	if (sc->flags & SC_FL_SHUTR)
 		return 1;
 
 	/* we must wait because the mux is not installed yet */
 	if (!conn->mux)
 		return 0;
-
-	/* stop here if we reached the end of data */
-	if (sc_ep_test(sc, SE_FL_EOS))
-		goto end_recv;
 
 	/* stop immediately on errors. Note that we DON'T want to stop on
 	 * POLL_ERR, as the poller might report a write error while there
@@ -1342,7 +1329,7 @@ static int sc_conn_recv(struct stconn *sc)
 	 */
 	while (sc_ep_test(sc, SE_FL_RCV_MORE) ||
 	       (!(conn->flags & CO_FL_HANDSHAKE) &&
-	       (!sc_ep_test(sc, SE_FL_ERROR | SE_FL_EOS)) && !(ic->flags & CF_SHUTR))) {
+		(!sc_ep_test(sc, SE_FL_ERROR | SE_FL_EOS)) && !(sc->flags & SC_FL_SHUTR))) {
 		int cur_flags = flags;
 
 		/* Compute transient CO_RFL_* flags */
@@ -1383,7 +1370,7 @@ static int sc_conn_recv(struct stconn *sc)
 		cur_read += ret;
 
 		/* if we're allowed to directly forward data, we must update ->o */
-		if (ic->to_forward && !(ic->flags & (CF_SHUTW|CF_SHUTW_NOW))) {
+		if (ic->to_forward && !(chn_cons(ic)->flags & (SC_FL_SHUTW|SC_FL_SHUTW_NOW))) {
 			unsigned long fwd = ret;
 			if (ic->to_forward != CHN_INFINITE_FORWARD) {
 				if (fwd > ic->to_forward)
@@ -1404,8 +1391,8 @@ static int sc_conn_recv(struct stconn *sc)
 		if (sc_ep_test(sc, SE_FL_EOI))
 			break;
 
-		if ((ic->flags & CF_READ_DONTWAIT) || --read_poll <= 0) {
-			/* we're stopped by the channel's policy */
+		if ((sc->flags & SC_FL_RCV_ONCE) || --read_poll <= 0) {
+			/* we don't expect to read more data */
 			sc_wont_read(sc);
 			break;
 		}
@@ -1488,30 +1475,35 @@ static int sc_conn_recv(struct stconn *sc)
 
 	/* Report EOI on the channel if it was reached from the mux point of
 	 * view. */
-	if (sc_ep_test(sc, SE_FL_EOI) && !(ic->flags & CF_EOI)) {
+	if (sc_ep_test(sc, SE_FL_EOI) && !(sc->flags & SC_FL_EOI)) {
 		sc_ep_report_read_activity(sc);
-		ic->flags |= (CF_EOI|CF_READ_EVENT);
+		sc->flags |= SC_FL_EOI;
+		ic->flags |= CF_READ_EVENT;
 		ret = 1;
 	}
 
-	if (sc_ep_test(sc, SE_FL_ERROR))
-		ret = 1;
-	else if (sc_ep_test(sc, SE_FL_EOS)) {
+	if (sc_ep_test(sc, SE_FL_EOS)) {
 		/* we received a shutdown */
 		if (ic->flags & CF_AUTO_CLOSE)
 			channel_shutw_now(ic);
 		sc_conn_read0(sc);
 		ret = 1;
 	}
+
+	if (sc_ep_test(sc, SE_FL_ERROR))
+		ret = 1;
 	else if (!(sc->flags & (SC_FL_WONT_READ|SC_FL_NEED_BUFF|SC_FL_NEED_ROOM)) &&
-		 !(ic->flags & CF_SHUTR)) {
+		 !(sc->flags & SC_FL_SHUTR)) {
 		/* Subscribe to receive events if we're blocking on I/O */
 		conn->mux->subscribe(sc, SUB_RETRY_RECV, &sc->wait_event);
 		se_have_no_more_data(sc->sedesc);
-	} else {
+	}
+	else {
 		se_have_more_data(sc->sedesc);
 		ret = 1;
 	}
+
+	BUG_ON_HOT((sc_ep_get(sc) & (SE_FL_EOI|SE_FL_EOS|SE_FL_ERROR)) == SE_FL_EOS);
 	return ret;
 }
 
@@ -1548,6 +1540,7 @@ int sc_conn_sync_recv(struct stconn *sc)
 static int sc_conn_send(struct stconn *sc)
 {
 	struct connection *conn = __sc_conn(sc);
+	struct stconn *sco = sc_opposite(sc);
 	struct stream *s = __sc_strm(sc);
 	struct channel *oc = sc_oc(sc);
 	int ret;
@@ -1572,7 +1565,7 @@ static int sc_conn_send(struct stconn *sc)
 		return 0;
 
 	/* we might have been called just after an asynchronous shutw */
-	if (oc->flags & CF_SHUTW)
+	if (sc->flags & SC_FL_SHUTW)
 		return 1;
 
 	/* we must wait because the mux is not installed yet */
@@ -1613,13 +1606,14 @@ static int sc_conn_send(struct stconn *sc)
 		 */
 		unsigned int send_flag = 0;
 
-		if ((!(oc->flags & (CF_NEVER_WAIT|CF_SEND_DONTWAIT)) &&
+		if ((!(sc->flags & (SC_FL_SND_ASAP|SC_FL_SND_NEVERWAIT)) &&
 		     ((oc->to_forward && oc->to_forward != CHN_INFINITE_FORWARD) ||
-		      (oc->flags & CF_EXPECT_MORE) ||
+		      (sc->flags & SC_FL_SND_EXP_MORE) ||
 		      (IS_HTX_STRM(s) &&
-		       (!(oc->flags & (CF_EOI|CF_SHUTR)) && htx_expect_more(htxbuf(&oc->buf)))))) ||
+		       (!(sco->flags & (SC_FL_EOI|SC_FL_SHUTR)) && htx_expect_more(htxbuf(&oc->buf)))))) ||
 		    ((oc->flags & CF_ISRESP) &&
-		     ((oc->flags & (CF_AUTO_CLOSE|CF_SHUTW_NOW)) == (CF_AUTO_CLOSE|CF_SHUTW_NOW))))
+		     (oc->flags & CF_AUTO_CLOSE) &&
+		     (sc->flags & SC_FL_SHUTW_NOW)))
 			send_flag |= CO_SFL_MSG_MORE;
 
 		if (oc->flags & CF_STREAMER)
@@ -1659,7 +1653,7 @@ static int sc_conn_send(struct stconn *sc)
 
 			if (!co_data(oc)) {
 				/* Always clear both flags once everything has been sent, they're one-shot */
-				oc->flags &= ~(CF_EXPECT_MORE | CF_SEND_DONTWAIT);
+				sc->flags &= ~(SC_FL_SND_ASAP|SC_FL_SND_EXP_MORE);
 			}
 			/* if some data remain in the buffer, it's only because the
 			 * system buffers are full, we will try next time.
@@ -1703,7 +1697,7 @@ void sc_conn_sync_send(struct stconn *sc)
 
 	oc->flags &= ~CF_WRITE_EVENT;
 
-	if (oc->flags & CF_SHUTW)
+	if (sc->flags & SC_FL_SHUTW)
 		return;
 
 	if (channel_is_empty(oc))
@@ -1781,7 +1775,7 @@ static int sc_conn_process(struct stconn *sc)
 	 *       wake callback. Otherwise sc_conn_recv()/sc_conn_send() already take
 	 *       care of it.
 	 */
-	if (sc_ep_test(sc, SE_FL_EOS) && !(ic->flags & CF_SHUTR)) {
+	if (sc_ep_test(sc, SE_FL_EOS) && !(sc->flags & SC_FL_SHUTR)) {
 		/* we received a shutdown */
 		if (ic->flags & CF_AUTO_CLOSE)
 			channel_shutw_now(ic);
@@ -1795,8 +1789,10 @@ static int sc_conn_process(struct stconn *sc)
 	 *       wake callback. Otherwise sc_conn_recv()/sc_conn_send() already take
 	 *       care of it.
 	 */
-	if (sc_ep_test(sc, SE_FL_EOI) && !(ic->flags & CF_EOI))
-		ic->flags |= (CF_EOI|CF_READ_EVENT);
+	if (sc_ep_test(sc, SE_FL_EOI) && !(sc->flags & SC_FL_EOI)) {
+		sc->flags |= SC_FL_EOI;
+		ic->flags |= CF_READ_EVENT;
+	}
 
 	/* Second step : update the stream connector and channels, try to forward any
 	 * pending data, then possibly wake the stream up based on the new
@@ -1842,10 +1838,23 @@ static int sc_applet_process(struct stconn *sc)
 
 	BUG_ON(!sc_appctx(sc));
 
+	/* Report EOI on the channel if it was reached from the applet point of
+	 * view. */
+	if (sc_ep_test(sc, SE_FL_EOI) && !(sc->flags & SC_FL_EOI)) {
+		sc_ep_report_read_activity(sc);
+		sc->flags |= SC_FL_EOI;
+		ic->flags |= CF_READ_EVENT;
+	}
+
+	if (sc_ep_test(sc, SE_FL_EOS)) {
+		/* we received a shutdown */
+		sc_shutr(sc);
+	}
+
 	/* If the applet wants to write and the channel is closed, it's a
 	 * broken pipe and it must be reported.
 	 */
-	if (!sc_ep_test(sc, SE_FL_HAVE_NO_DATA) && (ic->flags & CF_SHUTR))
+	if (!sc_ep_test(sc, SE_FL_HAVE_NO_DATA) && (sc->flags & SC_FL_SHUTR))
 		sc_ep_set(sc, SE_FL_ERROR);
 
 	/* automatically mark the applet having data available if it reported

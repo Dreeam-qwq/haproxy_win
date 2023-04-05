@@ -93,9 +93,20 @@ struct show_env_ctx {
 };
 
 /* CLI context for the "show fd" command */
+/* flags for show_fd_ctx->show_mask */
+#define CLI_SHOWFD_F_PI  0x00000001   /* pipes             */
+#define CLI_SHOWFD_F_LI  0x00000002   /* listeners         */
+#define CLI_SHOWFD_F_FE  0x00000004   /* frontend conns    */
+#define CLI_SHOWFD_F_SV  0x00000010   /* server-only conns */
+#define CLI_SHOWFD_F_PX  0x00000020   /* proxy-only conns  */
+#define CLI_SHOWFD_F_BE  0x00000030   /* backend: srv+px   */
+#define CLI_SHOWFD_F_CO  0x00000034   /* conn: be+fe       */
+#define CLI_SHOWFD_F_ANY 0x0000003f   /* any type          */
+
 struct show_fd_ctx {
 	int fd;          /* first FD to show */
 	int show_one;    /* stop after showing one FD */
+	uint show_mask;  /* CLI_SHOWFD_F_xxx */
 };
 
 /* CLI context for the "show cli sockets" command */
@@ -882,14 +893,12 @@ static void cli_io_handler(struct appctx *appctx)
 	int reql;
 	int len;
 
-	if (unlikely(sc->state == SC_ST_DIS || sc->state == SC_ST_CLO))
+	if (unlikely(se_fl_test(appctx->sedesc, (SE_FL_EOS|SE_FL_ERROR|SE_FL_SHR|SE_FL_SHW))))
 		goto out;
 
 	/* Check if the input buffer is available. */
-	if (res->buf.size == 0) {
-		/* buf.size==0 means we failed to get a buffer and were
-		 * already subscribed to a wait list to get a buffer.
-		 */
+	if (!b_size(&res->buf)) {
+		sc_need_room(sc);
 		goto out;
 	}
 
@@ -902,10 +911,7 @@ static void cli_io_handler(struct appctx *appctx)
 			appctx->cli_level = bind_conf->level;
 		}
 		else if (appctx->st0 == CLI_ST_END) {
-			/* Let's close for real now. We just close the request
-			 * side, the conditions below will complete if needed.
-			 */
-			sc_shutw(sc);
+			se_fl_set(appctx->sedesc, SE_FL_EOS);
 			free_trash_chunk(appctx->chunk);
 			appctx->chunk = NULL;
 			break;
@@ -917,6 +923,7 @@ static void cli_io_handler(struct appctx *appctx)
 			if (!appctx->chunk) {
 				appctx->chunk = alloc_trash_chunk();
 				if (!appctx->chunk) {
+					se_fl_set(appctx->sedesc, SE_FL_ERROR);
 					appctx->st0 = CLI_ST_END;
 					continue;
 				}
@@ -949,6 +956,7 @@ static void cli_io_handler(struct appctx *appctx)
 			if (reql <= 0) { /* closed or EOL not found */
 				if (reql == 0)
 					break;
+				se_fl_set(appctx->sedesc, SE_FL_ERROR);
 				appctx->st0 = CLI_ST_END;
 				continue;
 			}
@@ -976,6 +984,7 @@ static void cli_io_handler(struct appctx *appctx)
 			 */
 			len = reql - 1;
 			if (str[len] != '\n') {
+				se_fl_set(appctx->sedesc, SE_FL_ERROR);
 				appctx->st0 = CLI_ST_END;
 				continue;
 			}
@@ -1028,7 +1037,7 @@ static void cli_io_handler(struct appctx *appctx)
 
 			/* re-adjust req buffer */
 			co_skip(sc_oc(sc), reql);
-			req->flags |= CF_READ_DONTWAIT; /* we plan to read small requests */
+			sc_opposite(sc)->flags |= SC_FL_RCV_ONCE; /* we plan to read small requests */
 		}
 		else {	/* output functions */
 			struct cli_print_ctx *ctx;
@@ -1132,13 +1141,13 @@ static void cli_io_handler(struct appctx *appctx)
 				break;
 			}
 
-			/* Now we close the output if one of the writers did so,
-			 * or if we're not in interactive mode and the request
-			 * buffer is empty. This still allows pipelined requests
-			 * to be sent in non-interactive mode.
+			/* Now we close the output if we're not in interactive
+			 * mode and the request buffer is empty. This still
+			 * allows pipelined requests to be sent in
+			 * non-interactive mode.
 			 */
-			if (((res->flags & (CF_SHUTW|CF_SHUTW_NOW))) ||
-			   (!(appctx->st1 & APPCTX_CLI_ST1_PROMPT) && !co_data(req) && (!(appctx->st1 & APPCTX_CLI_ST1_PAYLOAD)))) {
+			if (!(appctx->st1 & APPCTX_CLI_ST1_PROMPT) && !co_data(req) && (!(appctx->st1 & APPCTX_CLI_ST1_PAYLOAD))) {
+				se_fl_set(appctx->sedesc, SE_FL_EOI);
 				appctx->st0 = CLI_ST_END;
 				continue;
 			}
@@ -1162,27 +1171,6 @@ static void cli_io_handler(struct appctx *appctx)
 				goto out;
 			}
 		}
-	}
-
-	if ((res->flags & CF_SHUTR) && (sc->state == SC_ST_EST)) {
-		DPRINTF(stderr, "%s@%d: sc to buf closed. req=%08x, res=%08x, st=%d\n",
-			__FUNCTION__, __LINE__, req->flags, res->flags, sc->state);
-		/* Other side has closed, let's abort if we have no more processing to do
-		 * and nothing more to consume. This is comparable to a broken pipe, so
-		 * we forward the close to the request side so that it flows upstream to
-		 * the client.
-		 */
-		sc_shutw(sc);
-	}
-
-	if ((req->flags & CF_SHUTW) && (sc->state == SC_ST_EST) && (appctx->st0 < CLI_ST_OUTPUT)) {
-		DPRINTF(stderr, "%s@%d: buf to sc closed. req=%08x, res=%08x, st=%d\n",
-			__FUNCTION__, __LINE__, req->flags, res->flags, sc->state);
-		/* We have no more processing to do, and nothing more to send, and
-		 * the client side has closed. So we'll forward this state downstream
-		 * on the response buffer.
-		 */
-		sc_shutr(sc);
 	}
 
  out:
@@ -1225,7 +1213,8 @@ static int cli_io_handler_show_env(struct appctx *appctx)
 	struct stconn *sc = appctx_sc(appctx);
 	char **var = ctx->var;
 
-	if (unlikely(sc_ic(sc)->flags & CF_SHUTW))
+	/* FIXME: Don't watch the other side !*/
+	if (unlikely(sc_opposite(sc)->flags & SC_FL_SHUTW))
 		return 1;
 
 	chunk_reset(&trash);
@@ -1259,10 +1248,12 @@ static int cli_io_handler_show_fd(struct appctx *appctx)
 {
 	struct stconn *sc = appctx_sc(appctx);
 	struct show_fd_ctx *fdctx = appctx->svcctx;
+	uint match = fdctx->show_mask;
 	int fd = fdctx->fd;
 	int ret = 1;
 
-	if (unlikely(sc_ic(sc)->flags & CF_SHUTW))
+	/* FIXME: Don't watch the other side !*/
+	if (unlikely(sc_opposite(sc)->flags & SC_FL_SHUTW))
 		goto end;
 
 	chunk_reset(&trash);
@@ -1320,6 +1311,17 @@ static int cli_io_handler_show_fd(struct appctx *appctx)
 		}
 		else if (fdt.iocb == sock_accept_iocb)
 			li = fdt.owner;
+
+		if (!((conn &&
+		       ((match & CLI_SHOWFD_F_SV && sv) ||
+			(match & CLI_SHOWFD_F_PX && px) ||
+			(match & CLI_SHOWFD_F_FE && li))) ||
+		      (!conn &&
+		       ((match & CLI_SHOWFD_F_LI && li) ||
+			(match & CLI_SHOWFD_F_PI && !li /* only pipes match this */))))) {
+			/* not a desired type */
+			goto skip;
+		}
 
 		if (!fdt.thread_mask)
 			suspicious = 1;
@@ -1573,14 +1575,52 @@ static int cli_parse_show_env(char **args, char *payload, struct appctx *appctx,
 static int cli_parse_show_fd(char **args, char *payload, struct appctx *appctx, void *private)
 {
 	struct show_fd_ctx *ctx = applet_reserve_svcctx(appctx, sizeof(*ctx));
+	const char *c;
+	int arg;
 
 	if (!cli_has_level(appctx, ACCESS_LVL_OPER))
 		return 1;
 
-	if (*args[2]) {
+	arg = 2;
+
+	/* when starting with an inversion we preset every flag */
+	if (*args[arg] == '!' || *args[arg] == '-')
+		ctx->show_mask = CLI_SHOWFD_F_ANY;
+
+	while (*args[arg] && !isdigit((uchar)*args[arg])) {
+		uint flag = 0, inv = 0;
+		c = args[arg];
+		while (*c) {
+			switch (*c) {
+			case '!': inv = !inv; break;
+			case '-': inv = !inv; break;
+			case 'p': flag = CLI_SHOWFD_F_PI;  break;
+			case 'l': flag = CLI_SHOWFD_F_LI;  break;
+			case 'c': flag = CLI_SHOWFD_F_CO; break;
+			case 'f': flag = CLI_SHOWFD_F_FE;  break;
+			case 'b': flag = CLI_SHOWFD_F_BE; break;
+			case 's': flag = CLI_SHOWFD_F_SV;  break;
+			case 'd': flag = CLI_SHOWFD_F_PX;  break;
+			default: return cli_err(appctx, "Invalid FD type\n");
+			}
+			c++;
+			if (!inv)
+				ctx->show_mask |= flag;
+			else
+				ctx->show_mask &= ~flag;
+		}
+		arg++;
+	}
+
+	/* default mask is to show everything */
+	if (!ctx->show_mask)
+		ctx->show_mask = CLI_SHOWFD_F_ANY;
+
+	if (*args[arg]) {
 		ctx->fd = atoi(args[2]);
 		ctx->show_one = 1;
 	}
+
 	return 0;
 }
 
@@ -2575,7 +2615,7 @@ read_again:
 	/* We don't know yet to which server we will connect */
 	channel_dont_connect(req);
 
-	req->flags |= CF_READ_DONTWAIT;
+	s->scf->flags |= SC_FL_RCV_ONCE;
 
 	/* need more data */
 	if (!ci_data(req))
@@ -2647,7 +2687,7 @@ send_status:
 	goto read_again;
 
 missing_data:
-        if (req->flags & CF_SHUTR) {
+        if (chn_prod(req)->flags & SC_FL_SHUTR) {
                 /* There is no more request or a only a partial one and we
                  * receive a close from the client, we can leave */
                 channel_shutw_now(&s->res);
@@ -2671,14 +2711,14 @@ int pcli_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 	struct proxy *be = s->be;
 
 	if (sc_ep_test(s->scb, SE_FL_ERR_PENDING|SE_FL_ERROR) || (rep->flags & (CF_READ_TIMEOUT|CF_WRITE_TIMEOUT)) ||
-	    ((rep->flags & CF_SHUTW) && (rep->to_forward || co_data(rep)))) {
+	    ((chn_cons(rep)->flags & SC_FL_SHUTW) && (rep->to_forward || co_data(rep)))) {
 		pcli_reply_and_close(s, "Can't connect to the target CLI!\n");
 		s->req.analysers &= ~AN_REQ_WAIT_CLI;
 		s->res.analysers &= ~AN_RES_WAIT_CLI;
 		return 0;
 	}
-	rep->flags |= CF_READ_DONTWAIT; /* try to get back here ASAP */
-	rep->flags |= CF_NEVER_WAIT;
+	s->scb->flags |= SC_FL_RCV_ONCE; /* try to get back here ASAP */
+	s->scf->flags |= SC_FL_SND_NEVERWAIT;
 
 	/* don't forward the close */
 	channel_dont_close(&s->res);
@@ -2696,7 +2736,7 @@ int pcli_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 		return 0;
 	}
 
-	if (rep->flags & CF_SHUTR) {
+	if (chn_prod(rep)->flags & SC_FL_SHUTR) {
 		/* stream cleanup */
 
 		pcli_write_prompt(s);
@@ -2785,9 +2825,11 @@ int pcli_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 		sockaddr_free(&s->scb->dst);
 
 		sc_set_state(s->scb, SC_ST_INI);
+		s->scb->flags &= ~(SC_FL_SHUTW|SC_FL_SHUTW_NOW);
 		s->scb->flags &= SC_FL_ISBACK | SC_FL_DONT_WAKE; /* we're in the context of process_stream */
-		s->req.flags &= ~(CF_SHUTW|CF_SHUTW_NOW|CF_AUTO_CONNECT|CF_STREAMER|CF_STREAMER_FAST|CF_NEVER_WAIT|CF_WROTE_DATA);
-		s->res.flags &= ~(CF_SHUTR|CF_SHUTR_NOW|CF_STREAMER|CF_STREAMER_FAST|CF_WRITE_EVENT|CF_NEVER_WAIT|CF_WROTE_DATA|CF_READ_EVENT);
+
+		s->req.flags &= ~(CF_AUTO_CONNECT|CF_STREAMER|CF_STREAMER_FAST|CF_WROTE_DATA);
+		s->res.flags &= ~(CF_STREAMER|CF_STREAMER_FAST|CF_WRITE_EVENT|CF_WROTE_DATA|CF_READ_EVENT);
 		s->flags &= ~(SF_DIRECT|SF_ASSIGNED|SF_BE_ASSIGNED|SF_FORCE_PRST|SF_IGNORE_PRST);
 		s->flags &= ~(SF_CURR_SESS|SF_REDIRECTABLE|SF_SRV_REUSED);
 		s->flags &= ~(SF_ERR_MASK|SF_FINST_MASK|SF_REDISP);
@@ -2808,7 +2850,9 @@ int pcli_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 		s->store_count = 0;
 		s->uniq_id = global.req_count++;
 
-		s->req.flags |= CF_READ_DONTWAIT; /* one read is usually enough */
+		s->scf->flags &= ~(SC_FL_SHUTR|SC_FL_SHUTR_NOW);
+		s->scf->flags &= ~SC_FL_SND_NEVERWAIT;
+		s->scf->flags |= SC_FL_RCV_ONCE; /* one read is usually enough */
 
 		s->req.flags |= CF_WAKE_ONCE; /* need to be called again if there is some command left in the request */
 
@@ -3158,7 +3202,7 @@ static struct cli_kw_list cli_kws = {{ },{
 	{ { "show", "env",  NULL },              "show env [var]                          : dump environment variables known to the process",         cli_parse_show_env, cli_io_handler_show_env, NULL },
 	{ { "show", "cli", "sockets",  NULL },   "show cli sockets                        : dump list of cli sockets",                                cli_parse_default, cli_io_handler_show_cli_sock, NULL, NULL, ACCESS_MASTER },
 	{ { "show", "cli", "level", NULL },      "show cli level                          : display the level of the current CLI session",            cli_parse_show_lvl, NULL, NULL, NULL, ACCESS_MASTER},
-	{ { "show", "fd", NULL },                "show fd [num]                           : dump list of file descriptors in use or a specific one",  cli_parse_show_fd, cli_io_handler_show_fd, NULL },
+	{ { "show", "fd", NULL },                "show fd [-!plcfbsd]* [num]              : dump list of file descriptors in use or a specific one",  cli_parse_show_fd, cli_io_handler_show_fd, NULL },
 	{ { "show", "version", NULL },           "show version                            : show version of the current process",                     cli_parse_show_version, NULL, NULL, NULL, ACCESS_MASTER },
 	{ { "operator", NULL },                  "operator                                : lower the level of the current CLI session to operator",  cli_parse_set_lvl, NULL, NULL, NULL, ACCESS_MASTER},
 	{ { "user", NULL },                      "user                                    : lower the level of the current CLI session to user",      cli_parse_set_lvl, NULL, NULL, NULL, ACCESS_MASTER},

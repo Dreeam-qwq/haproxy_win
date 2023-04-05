@@ -1486,7 +1486,6 @@ static int promex_parse_uri(struct appctx *appctx, struct stconn *sc)
 	memcpy(res->buf.area, b_head(err), b_data(err));
 	res_htx = htx_from_buf(&res->buf);
 	channel_add_input(res, res_htx->data);
-	appctx->st0 = PROMEX_ST_END;
 	return -1;
 }
 
@@ -1539,7 +1538,8 @@ static void promex_appctx_handle_io(struct appctx *appctx)
 	int ret;
 
 	res_htx = htx_from_buf(&res->buf);
-	if (unlikely(sc->state == SC_ST_DIS || sc->state == SC_ST_CLO))
+
+	if (unlikely(se_fl_test(appctx->sedesc, (SE_FL_EOS|SE_FL_ERROR|SE_FL_SHR|SE_FL_SHW))))
 		goto out;
 
 	/* Check if the input buffer is available. */
@@ -1591,15 +1591,12 @@ static void promex_appctx_handle_io(struct appctx *appctx)
 				channel_add_input(res, 1);
 			}
 		        res_htx->flags |= HTX_FL_EOM;
-			res->flags |= CF_EOI;
 			se_fl_set(appctx->sedesc, SE_FL_EOI);
 			appctx->st0 = PROMEX_ST_END;
 			__fallthrough;
 
 		case PROMEX_ST_END:
-			if (!(res->flags & CF_SHUTR)) {
-				sc_shutr(sc);
-			}
+			se_fl_set(appctx->sedesc, SE_FL_EOS);
 	}
 
   out:
@@ -1613,8 +1610,7 @@ static void promex_appctx_handle_io(struct appctx *appctx)
 	return;
 
   error:
-	sc_shutr(sc);
-	sc_shutw(sc);
+	se_fl_set(appctx->sedesc, SE_FL_ERROR);
 	goto out;
 }
 

@@ -20,7 +20,7 @@ is the **initialisation mode**, and the second is the **runtime mode**.
   the Lua code seems to be run in blocking, but it is not the case.
 
 The Lua code is loaded in one or more files. These files contains main code and
-functions. Lua have 7 execution context.
+functions. Lua has 8 execution contexts.
 
 1. The Lua file **body context**. It is executed during the load of the Lua file
    in the HAProxy `[global]` section with the directive `lua-load`. It is
@@ -71,6 +71,9 @@ functions. Lua have 7 execution context.
    callback functions. Lua filters are registered using
    `core.register_filter()`. Each declared filter is prefixed by the string
    "lua.".
+
+8. The **event context**: Inside a function that handles events subscribed
+   through `core.event_sub()` or `Server.event_sub()`.
 
 
 HAProxy Lua Hello world
@@ -510,6 +513,7 @@ Core class
   frontend http_frt
     mode http
     http-request lua.hello-world
+
 ..
 
   A second example using arguments
@@ -520,6 +524,7 @@ Core class
      txn:Info("Hello world for " .. arg)
   end
   core.register_action("hello-world", { "tcp-req", "http-req" }, hello_world, 2)
+
 ..
 
   This example code is used in HAProxy configuration like this:
@@ -529,6 +534,7 @@ Core class
   frontend tcp_frt
     mode tcp
     tcp-request content lua.hello-world everybody
+
 ..
 
 .. js:function:: core.register_converters(name, func)
@@ -644,6 +650,7 @@ Core class
   frontend http
     mode http
     filter lua.my-filter arg1 arg2 arg3
+
 ..
 
   :see: :js:class:`Filter`
@@ -720,24 +727,27 @@ Core class
 
   It takes no input, and no output is expected.
 
-.. js:function:: core.register_task(func)
+.. js:function:: core.register_task(func[, arg1[, arg2[, ...[, arg4]]]])
 
-  **context**: body, init, task, action, sample-fetch, converter
+  **context**: body, init, task, action, sample-fetch, converter, event
 
   Register and start independent task. The task is started when the HAProxy
   main scheduler starts. For example this type of tasks can be executed to
   perform complex health checks.
 
-  :param function func: is the Lua function called to work as initializer.
+  :param function func: is the Lua function called to work as an async task.
+
+  Up to 4 optional arguments (all types supported) may be passed to the function.
+  (They will be passed as-is to the task function)
 
   The prototype of the Lua function used as argument is:
 
 .. code-block:: lua
 
-    function()
+    function([arg1[, arg2[, ...[, arg4]]]])
 ..
 
-  It takes no input, and no output is expected.
+  It takes up to 4 optional arguments (provided when registering), and no output is expected.
 
 .. js:function:: core.register_cli([path], usage, func)
 
@@ -905,6 +915,71 @@ Core class
 	]
 ..
 
+.. js:function:: core.event_sub(event_types, func)
+
+  **context**: body, init, task, action, sample-fetch, converter
+
+  Register a function that will be called on specific system events.
+
+  :param array event_types: array of string containing the event types you want to subscribe to
+  :param function func: is the Lua function called when one of the subscribed events occur.
+  :returns: A :ref:`event_sub_class` object.
+  :see: :js:func:`Server.event_sub()`.
+
+  List of available event types :
+
+   **SERVER** Family:
+
+    * **SERVER_ADD**: when a server is added
+    * **SERVER_DEL**: when a server is removed
+    * **SERVER_DOWN**: when a server state goes from UP to DOWN
+    * **SERVER_UP**: when a server state goes from DOWN to UP
+
+   .. Note::
+     You may also use **SERVER** in **event_types** to subscribe to all server events types at once.
+
+  The prototype of the Lua function used as argument is:
+
+.. code-block:: lua
+
+    function(event, event_data, sub)
+..
+
+  * **event** (*string*): the event type (one of the **event_types** you specified when subscribing)
+  * **event_data**: specific to each event family (For **SERVER** family, a :ref:`server_event_class` object)
+  * **sub**: class to manage the subscription from within the event (a :ref:`event_sub_class` object)
+
+  .. Warning::
+    The callback function will only be scheduled on the very same thread that
+    performed the subscription.
+
+    Moreover, each thread treats events sequentially. It means that if you have,
+    let's say SERVER_UP followed by a SERVER_DOWN in a short timelapse, then
+    the cb function will first be called with SERVER_UP, and once it's done
+    handling the event, the cb function will be called again with SERVER_DOWN.
+
+    This is to ensure event consistency when it comes to logging / triggering logic
+    from lua.
+
+    Your lua cb function may yield if needed, but you're pleased to process the
+    event as fast as possible to prevent the event queue from growing up, depending
+    on the event flow that is expected for the given subscription.
+
+    To prevent abuses, if the event queue for the current subscription goes over
+    a certain amount of unconsumed events, the subscription will pause itself
+    automatically for as long as it takes for your handler to catch up. This would
+    lead to events being missed, so an error will be reported in the logs to warn
+    you about that.
+    This is not something you want to let happen too often, it may indicate that
+    you subscribed to an event that is occurring too frequently or/and that your
+    callback function is too slow to keep up the pace and you should review it.
+
+    If you want to do some parallel processing because your callback functions are
+    slow: you might want to create subtasks from lua using
+    :js:func:`core.register_task()` from within your callback function to perform
+    the heavy job in a dedicated task and allow remaining events to be processed
+    more quickly.
+
 .. _proxy_class:
 
 Proxy class
@@ -919,9 +994,25 @@ Proxy class
 
   Contain the name of the proxy.
 
+  .. warning::
+     This attribute is now deprecated and will eventually be removed.
+     Please use :js:func:`Proxy.get_name()` function instead.
+
+.. js:function:: Proxy.get_name()
+
+  Returns the name of the proxy.
+
 .. js:attribute:: Proxy.uuid
 
   Contain the unique identifier of the proxy.
+
+  .. warning::
+     This attribute is now deprecated and will eventually be removed.
+     Please use :js:func:`Proxy.get_uuid()` function instead.
+
+.. js:function:: Proxy.get_uuid()
+
+  Returns the unique identifier of the proxy.
 
 .. js:attribute:: Proxy.servers
 
@@ -1006,9 +1097,36 @@ Server class
 
   Contain the name of the server.
 
+  .. warning::
+     This attribute is now deprecated and will eventually be removed.
+     Please use :js:func:`Server.get_name()` function instead.
+
+.. js:function:: Server.get_name(sv)
+
+  Returns the name of the server.
+
 .. js:attribute:: Server.puid
 
   Contain the proxy unique identifier of the server.
+
+  .. warning::
+     This attribute is now deprecated and will eventually be removed.
+     Please use :js:func:`Server.get_puid()` function instead.
+
+.. js:function:: Server.get_puid(sv)
+
+  Returns the proxy unique identifier of the server.
+
+.. js:function:: Server.get_rid(sv)
+
+  Returns the rid (revision ID) of the server.
+  It is an unsigned integer that is set upon server creation. Value is derived
+  from a global counter that starts at 0 and is incremented each time one or
+  multiple server deletions are followed by a server addition (meaning that
+  old name/id reuse could occur).
+
+  Combining server name/id with server rid yields a process-wide unique
+  identifier.
 
 .. js:function:: Server.is_draining(sv)
 
@@ -1181,6 +1299,69 @@ Server class
   :param class_server sv: A :ref:`server_class` which indicates the manipulated
     server.
 
+.. js:function:: Server.event_sub(sv, event_types, func)
+
+  Register a function that will be called on specific server events.
+  It works exactly like :js:func:`core.event_sub()` except that the subscription
+  will be performed within the server dedicated subscription list instead of the
+  global one.
+  (Your callback function will only be called for server events affecting sv)
+
+  See :js:func:`core.event_sub()` for function usage.
+
+  A key advantage to using :js:func:`Server.event_sub()` over
+  :js:func:`core.event_sub()` for servers is that :js:func:`Server.event_sub()`
+  allows you to be notified for servers events of a single server only.
+  It removes the needs for extra filtering in your callback function if you only
+  care about a single server, and also prevents useless wakeups.
+
+  For instance, if you want to be notified for UP/DOWN events on a given set of
+  servers, it is recommended to peform multiple per-server subscriptions since
+  it will be more efficient that doing a single global subscription that will
+  filter the received events.
+  Unless you really want to be notified for servers events of ALL servers of
+  course, which could make sense given you setup but should be avoided if you
+  have an important number of servers as it will add a significant load on your
+  haproxy process in case of multiple servers state change in a short amount of
+  time.
+
+  .. Note::
+     You may also combine :js:func:`core.event_sub()` with
+     :js:func:`Server.event_sub()`.
+
+     Also, don't forget that you can use :js:func:`core.register_task()` from
+     your callback function if needed. (ie: parallel work)
+
+  Here is a working example combining :js:func:`core.event_sub()` with
+  :js:func:`Server.event_sub()` and :js:func:`core.register_task()`
+  (This only serves as a demo, this is not necessarily useful to do so)
+
+.. code-block:: lua
+
+  core.event_sub({"SERVER_ADD"}, function(event, data, sub)
+    -- in the global event handler
+    if data["reference"] ~= nil then
+      print("Tracking new server: ", data["name"])
+      data["reference"]:event_sub({"SERVER_UP", "SERVER_DOWN"}, function(event, data, sub)
+        -- in the per-server event handler
+	if data["reference"] ~= nil then
+          core.register_task(function(server)
+            -- subtask to perform some async work (e.g.: HTTP API calls, sending emails...)
+            print("ASYNC: SERVER ", server:get_name(), " is ", event == "SERVER_UP" and "UP" or "DOWN")
+          end, data["reference"])
+        end
+      end)
+    end
+  end)
+
+..
+
+  In this example, we will first track global server addition events.
+  For each newly added server ("add server" on the cli), we will register a
+  UP/DOWN server subscription.
+  Then, the callback function will schedule the event handling in an async
+  subtask which will receive the server reference as an argument.
+
 .. _listener_class:
 
 Listener class
@@ -1193,6 +1374,44 @@ Listener class
   :param class_listener ls: A :ref:`listener_class` which indicates the
     manipulated listener.
   :returns: a key/value table containing stats
+
+.. _event_sub_class:
+
+EventSub class
+==============
+
+.. js:function:: EventSub.unsub()
+
+  End the subscription, the callback function will not be called again.
+
+.. _server_event_class:
+
+ServerEvent class
+=================
+
+.. js:attribute:: ServerEvent.name
+
+  Contains the name of the server.
+
+.. js:attribute:: ServerEvent.puid
+
+  Contains the proxy-unique uid of the server
+
+.. js:attribute:: ServerEvent.rid
+
+  Contains the revision ID of the server
+
+.. js:attribute:: ServerEvent.proxy_name
+
+  Contains the name of the proxy to which the server belongs
+
+.. js:attribute:: ServerEvent.reference
+
+  Reference to the live server (A :ref:`server_class`).
+
+  .. Warning::
+     Not available if the server was removed in the meantime.
+     (Will never be set for SERVER_DEL event since the server does not exist anymore)
 
 .. _concat_class:
 
@@ -2905,7 +3124,7 @@ AppletHTTP class
                           will only be set if it was defined elsewhere (i.e. used
                           within the configuration). For global variables (using the
                           "proc" scope), they will only be updated and never created.
-                           It is highly recommended to always set this to true.
+                          It is highly recommended to always set this to true.
 
   :see: :js:func:`AppletHTTP.unset_var`
   :see: :js:func:`AppletHTTP.get_var`
@@ -3022,7 +3241,7 @@ AppletTCP class
                           will only be set if it was defined elsewhere (i.e. used
                           within the configuration). For global variables (using the
                           "proc" scope), they will only be updated and never created.
-                           It is highly recommended to always set this to true.
+                          It is highly recommended to always set this to true.
 
   :see: :js:func:`AppletTCP.unset_var`
   :see: :js:func:`AppletTCP.get_var`
@@ -3094,6 +3313,7 @@ StickTable class
    comparison operators as keys followed by data type name and value pairs.
    Check out the HAProxy docs for "show table" for more details. For the
    reference, the supported operators are:
+
      "eq", "ne", "le", "lt", "ge", "gt"
 
    For large tables, execution of this function can take a long time (for

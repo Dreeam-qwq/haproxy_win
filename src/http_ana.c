@@ -114,7 +114,7 @@ int http_wait_for_request(struct stream *s, struct channel *req, int an_bit)
 		/* A SHUTR at this stage means we are performing a "destructive"
 		 * HTTP upgrade (TCP>H2). In this case, we can leave.
 		 */
-		if (req->flags & CF_SHUTR) {
+		if (chn_prod(req)->flags & SC_FL_SHUTR) {
 			s->logs.logwait = 0;
                         s->logs.level = 0;
 			channel_abort(&s->req);
@@ -484,7 +484,7 @@ int http_process_req_common(struct stream *s, struct channel *req, int an_bit, s
 		req->analysers &= ~AN_REQ_FLT_XFER_DATA;
 		req->analysers |= AN_REQ_HTTP_XFER_BODY;
 
-		req->flags |= CF_SEND_DONTWAIT;
+		s->scb->flags |= SC_FL_SND_ASAP;
 		s->flags |= SF_ASSIGNED;
 		goto done;
 	}
@@ -510,10 +510,10 @@ int http_process_req_common(struct stream *s, struct channel *req, int an_bit, s
 	 * If this happens, then the data will not come immediately, so we must
 	 * send all what we have without waiting. Note that due to the small gain
 	 * in waiting for the body of the request, it's easier to simply put the
-	 * CF_SEND_DONTWAIT flag any time. It's a one-shot flag so it will remove
-	 * itself once used.
+	 * SC_FL_SND_ASAP flag on the back SC any time. It's a one-shot flag so it
+	 * will remove itself once used.
 	 */
-	req->flags |= CF_SEND_DONTWAIT;
+	s->scb->flags |= SC_FL_SND_ASAP;
 
  done:	/* done with this analyser, continue with next ones that the calling
 	 * points will have set, if any.
@@ -767,7 +767,7 @@ int http_process_tarpit(struct stream *s, struct channel *req, int an_bit)
 	 * there and that the timeout has not expired.
 	 */
 	channel_dont_connect(req);
-	if (!(req->flags & CF_SHUTR) &&
+	if (!(chn_prod(req)->flags & SC_FL_SHUTR) &&
 	    !tick_is_expired(req->analyse_exp, now_ms)) {
 		/* Be sure to drain all data from the request channel */
 		channel_htx_erase(req, htxbuf(&req->buf));
@@ -797,9 +797,8 @@ int http_process_tarpit(struct stream *s, struct channel *req, int an_bit)
  * reached the buffer. It must only be called after the standard HTTP request
  * processing has occurred, because it expects the request to be parsed and will
  * look for the Expect header. It may send a 100-Continue interim response. It
- * takes in input any state starting from HTTP_MSG_BODY and leaves with one of
- * HTTP_MSG_CHK_SIZE, HTTP_MSG_DATA or HTTP_MSG_TRAILERS. It returns zero if it
- * needs to read more data, or 1 once it has completed its analysis.
+ * returns zero if it needs to read more data, or 1 once it has completed its
+ * analysis.
  */
 int http_wait_for_request_body(struct stream *s, struct channel *req, int an_bit)
 {
@@ -911,7 +910,7 @@ int http_request_forward_body(struct stream *s, struct channel *req, int an_bit)
 
 	if (req->to_forward) {
 		if (req->to_forward == CHN_INFINITE_FORWARD) {
-			if (req->flags & CF_EOI)
+			if (s->scf->flags & SC_FL_EOI)
 				msg->msg_state = HTTP_MSG_ENDING;
 		}
 		else {
@@ -958,7 +957,7 @@ int http_request_forward_body(struct stream *s, struct channel *req, int an_bit)
 	msg->msg_state = HTTP_MSG_ENDING;
 
   ending:
-	req->flags &= ~CF_EXPECT_MORE; /* no more data are expected */
+	s->scb->flags &= ~SC_FL_SND_EXP_MORE; /* no more data are expected to be send */
 
 	/* other states, ENDING...TUNNEL */
 	if (msg->msg_state >= HTTP_MSG_DONE)
@@ -985,7 +984,7 @@ int http_request_forward_body(struct stream *s, struct channel *req, int an_bit)
 	if (!(txn->flags & TX_CON_WANT_TUN))
 		channel_dont_close(req);
 
-	if ((req->flags & CF_SHUTW) && co_data(req)) {
+	if ((chn_cons(req)->flags & SC_FL_SHUTW) && co_data(req)) {
 		/* request errors are most likely due to the server aborting the
 		 * transfer. */
 		goto return_srv_abort;
@@ -1004,7 +1003,7 @@ int http_request_forward_body(struct stream *s, struct channel *req, int an_bit)
 	 * it can be abused to exhaust source ports. */
 	if (s->be->options & PR_O_ABRT_CLOSE) {
 		channel_auto_read(req);
-		if ((req->flags & CF_SHUTR) && !(txn->flags & TX_CON_WANT_TUN))
+		if ((chn_prod(req)->flags & SC_FL_SHUTR) && !(txn->flags & TX_CON_WANT_TUN))
 			s->scb->flags |= SC_FL_NOLINGER;
 		channel_auto_close(req);
 	}
@@ -1020,12 +1019,12 @@ int http_request_forward_body(struct stream *s, struct channel *req, int an_bit)
 
  missing_data_or_waiting:
 	/* stop waiting for data if the input is closed before the end */
-	if (msg->msg_state < HTTP_MSG_ENDING && req->flags & CF_SHUTR)
+	if (msg->msg_state < HTTP_MSG_ENDING && chn_prod(req)->flags & SC_FL_SHUTR)
 		goto return_cli_abort;
 
  waiting:
 	/* waiting for the last bits to leave the buffer */
-	if (req->flags & CF_SHUTW)
+	if (chn_cons(req)->flags & SC_FL_SHUTW)
 		goto return_srv_abort;
 
 	/* When TE: chunked is used, we need to get there again to parse remaining
@@ -1040,7 +1039,7 @@ int http_request_forward_body(struct stream *s, struct channel *req, int an_bit)
 		channel_dont_close(req);
 
 	/* We know that more data are expected, but we couldn't send more that
-	 * what we did. So we always set the CF_EXPECT_MORE flag so that the
+	 * what we did. So we always set the SC_FL_SND_EXP_MORE flag so that the
 	 * system knows it must not set a PUSH on this first part. Interactive
 	 * modes are already handled by the stream sock layer. We must not do
 	 * this in content-length mode because it could present the MSG_MORE
@@ -1048,7 +1047,7 @@ int http_request_forward_body(struct stream *s, struct channel *req, int an_bit)
 	 * additional delay to be observed by the receiver.
 	 */
 	if (HAS_REQ_DATA_FILTERS(s))
-		req->flags |= CF_EXPECT_MORE;
+		s->scb->flags |= SC_FL_SND_EXP_MORE;
 
 	DBG_TRACE_DEVEL("waiting for more data to forward",
 			STRM_EV_STRM_ANA|STRM_EV_HTTP_ANA, s, txn);
@@ -1132,9 +1131,11 @@ static __inline int do_l7_retry(struct stream *s, struct stconn *sc)
 
 	req = &s->req;
 	res = &s->res;
+
 	/* Remove any write error from the request, and read error from the response */
-	req->flags &= ~(CF_WRITE_TIMEOUT | CF_SHUTW | CF_SHUTW_NOW);
-	res->flags &= ~(CF_READ_TIMEOUT | CF_SHUTR | CF_EOI | CF_READ_EVENT | CF_SHUTR_NOW);
+	s->scf->flags &= ~(SC_FL_SHUTR|SC_FL_SHUTR_NOW);
+	req->flags &= ~CF_WRITE_TIMEOUT;
+	res->flags &= ~(CF_READ_TIMEOUT | CF_READ_EVENT);
 	res->analysers &= AN_RES_FLT_END;
 	s->conn_err_type = STRM_ET_NONE;
 	s->flags &= ~(SF_CONN_EXP | SF_ERR_MASK | SF_FINST_MASK);
@@ -1144,6 +1145,7 @@ static __inline int do_l7_retry(struct stream *s, struct stconn *sc)
 	res->analyse_exp = TICK_ETERNITY;
 	res->total = 0;
 
+	s->scb->flags &= ~(SC_FL_SHUTW|SC_FL_SHUTW_NOW);
 	if (sc_reset_endp(s->scb) < 0) {
 		if (!(s->flags & SF_ERR_MASK))
 			s->flags |= SF_ERR_INTERNAL;
@@ -1293,7 +1295,9 @@ int http_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 		}
 
 		/* 3: client abort with an abortonclose */
-		else if ((rep->flags & CF_SHUTR) && ((s->req.flags & (CF_SHUTR|CF_SHUTW)) == (CF_SHUTR|CF_SHUTW))) {
+		else if ((chn_prod(rep)->flags & SC_FL_SHUTR) &&
+			 (chn_prod(&s->req)->flags & SC_FL_SHUTR) &&
+			 (chn_cons(&s->req)->flags & SC_FL_SHUTW)) {
 			_HA_ATOMIC_INC(&sess->fe->fe_counters.cli_aborts);
 			_HA_ATOMIC_INC(&s->be->be_counters.cli_aborts);
 			if (sess->listener && sess->listener->counters)
@@ -1315,7 +1319,7 @@ int http_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 		}
 
 		/* 4: close from server, capture the response if the server has started to respond */
-		else if (rep->flags & CF_SHUTR) {
+		else if (chn_prod(rep)->flags & SC_FL_SHUTR) {
 			if ((txn->flags & TX_L7_RETRY) &&
 			    (s->be->retry_type & PR_RE_DISCONNECTED)) {
 				if (co_data(rep) || do_l7_retry(s, s->scb) == 0) {
@@ -1368,7 +1372,7 @@ int http_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 		}
 
 		channel_dont_close(rep);
-		rep->flags |= CF_READ_DONTWAIT; /* try to get back here ASAP */
+		s->scb->flags |= SC_FL_RCV_ONCE; /* try to get back here ASAP */
 		DBG_TRACE_DEVEL("waiting for more data",
 				STRM_EV_STRM_ANA|STRM_EV_HTTP_ANA, s, txn);
 		return 0;
@@ -1479,7 +1483,7 @@ int http_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 		msg->flags = 0;
 		txn->status = 0;
 		s->logs.t_data = -1; /* was not a response yet */
-		rep->flags |= CF_SEND_DONTWAIT; /* Send ASAP informational messages */
+		s->scf->flags |= SC_FL_SND_ASAP; /* Send ASAP informational messages */
 		goto next_one;
 	}
 
@@ -1638,7 +1642,7 @@ int http_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 	txn->status = 0;
 	s->logs.logwait = 0;
 	s->logs.level = 0;
-	s->res.flags &= ~CF_EXPECT_MORE; /* speed up sending a previous response */
+	s->scf->flags &= ~SC_FL_SND_EXP_MORE; /* speed up sending a previous response */
 	http_reply_and_close(s, txn->status, NULL);
 	DBG_TRACE_DEVEL("leaving by closing K/A connection",
 			STRM_EV_STRM_ANA|STRM_EV_HTTP_ANA, s, txn);
@@ -2019,7 +2023,7 @@ int http_response_forward_body(struct stream *s, struct channel *res, int an_bit
 
 	if (res->to_forward) {
 		if (res->to_forward == CHN_INFINITE_FORWARD) {
-			if (res->flags & CF_EOI)
+			if (s->scb->flags & SC_FL_EOI)
 				msg->msg_state = HTTP_MSG_ENDING;
 		}
 		else {
@@ -2057,7 +2061,7 @@ int http_response_forward_body(struct stream *s, struct channel *res, int an_bit
 	if (htx->data != co_data(res))
 		goto missing_data_or_waiting;
 
-	if (!(msg->flags & HTTP_MSGF_XFER_LEN) && res->flags & CF_SHUTR) {
+	if (!(msg->flags & HTTP_MSGF_XFER_LEN) && (chn_prod(res)->flags & SC_FL_SHUTR)) {
 		msg->msg_state = HTTP_MSG_ENDING;
 		goto ending;
 	}
@@ -2072,7 +2076,7 @@ int http_response_forward_body(struct stream *s, struct channel *res, int an_bit
 	msg->msg_state = HTTP_MSG_ENDING;
 
   ending:
-	res->flags &= ~CF_EXPECT_MORE; /* no more data are expected */
+	s->scf->flags &= ~SC_FL_SND_EXP_MORE; /* no more data are expected to be sent */
 
 	/* other states, ENDING...TUNNEL */
 	if (msg->msg_state >= HTTP_MSG_DONE)
@@ -2101,7 +2105,7 @@ int http_response_forward_body(struct stream *s, struct channel *res, int an_bit
 
 	channel_dont_close(res);
 
-	if ((res->flags & CF_SHUTW) && co_data(res)) {
+	if ((chn_cons(res)->flags & SC_FL_SHUTW) && co_data(res)) {
 		/* response errors are most likely due to the client aborting
 		 * the transfer. */
 		goto return_cli_abort;
@@ -2117,7 +2121,7 @@ int http_response_forward_body(struct stream *s, struct channel *res, int an_bit
 	return 0;
 
   missing_data_or_waiting:
-	if (res->flags & CF_SHUTW)
+	if (chn_cons(res)->flags & SC_FL_SHUTW)
 		goto return_cli_abort;
 
 	/* stop waiting for data if the input is closed before the end. If the
@@ -2125,8 +2129,9 @@ int http_response_forward_body(struct stream *s, struct channel *res, int an_bit
 	 * so we don't want to count this as a server abort. Otherwise it's a
 	 * server abort.
 	 */
-	if (msg->msg_state < HTTP_MSG_ENDING && res->flags & CF_SHUTR) {
-		if ((s->req.flags & (CF_SHUTR|CF_SHUTW)) == (CF_SHUTR|CF_SHUTW))
+	if (msg->msg_state < HTTP_MSG_ENDING && (chn_prod(res)->flags & SC_FL_SHUTR)) {
+		if ((chn_prod(&s->req)->flags & SC_FL_SHUTR) &&
+		    (chn_cons(&s->req)->flags & SC_FL_SHUTW))
 			goto return_cli_abort;
 		/* If we have some pending data, we continue the processing */
 		if (htx_is_empty(htx))
@@ -2143,7 +2148,7 @@ int http_response_forward_body(struct stream *s, struct channel *res, int an_bit
 		channel_dont_close(res);
 
 	/* We know that more data are expected, but we couldn't send more that
-	 * what we did. So we always set the CF_EXPECT_MORE flag so that the
+	 * what we did. So we always set the SC_FL_SND_EXP_MORE flag so that the
 	 * system knows it must not set a PUSH on this first part. Interactive
 	 * modes are already handled by the stream sock layer. We must not do
 	 * this in content-length mode because it could present the MSG_MORE
@@ -2151,7 +2156,7 @@ int http_response_forward_body(struct stream *s, struct channel *res, int an_bit
 	 * additional delay to be observed by the receiver.
 	 */
 	if (HAS_RSP_DATA_FILTERS(s))
-		res->flags |= CF_EXPECT_MORE;
+		s->scf->flags |= SC_FL_SND_EXP_MORE;
 
 	/* the stream handler will take care of timeouts and errors */
 	DBG_TRACE_DEVEL("waiting for more data to forward",
@@ -2670,7 +2675,7 @@ static enum rule_result http_req_get_intercept_rule(struct proxy *px, struct lis
 		/* Always call the action function if defined */
 		if (rule->action_ptr) {
 			if (sc_ep_test(s->scf, SE_FL_ERROR) ||
-			    ((s->req.flags & CF_SHUTR) &&
+			    ((chn_prod(&s->req)->flags & SC_FL_SHUTR) &&
 			     (px->options & PR_O_ABRT_CLOSE)))
 				act_opts |= ACT_OPT_FINAL;
 
@@ -2833,7 +2838,7 @@ resume_execution:
 		/* Always call the action function if defined */
 		if (rule->action_ptr) {
 			if (sc_ep_test(s->scf, SE_FL_ERROR) ||
-			    ((s->req.flags & CF_SHUTR) &&
+			    ((chn_prod(&s->req)->flags & SC_FL_SHUTR) &&
 			     (px->options & PR_O_ABRT_CLOSE)))
 				act_opts |= ACT_OPT_FINAL;
 
@@ -4043,17 +4048,15 @@ enum rule_result http_wait_for_msg_body(struct stream *s, struct channel *chn,
 	if (txn->meth == HTTP_METH_CONNECT || (msg->flags & HTTP_MSGF_BODYLESS))
 		goto end;
 
-	if (!(chn->flags & CF_ISRESP) && msg->msg_state < HTTP_MSG_DATA) {
+	if (!(chn->flags & CF_ISRESP)) {
 		if (http_handle_expect_hdr(s, htx, msg) == -1) {
 			ret = HTTP_RULE_RES_ERROR;
 			goto end;
 		}
 	}
 
-	msg->msg_state = HTTP_MSG_DATA;
-
-	/* Now we're in HTTP_MSG_DATA. We just need to know if all data have
-	 * been received or if the buffer is full.
+	/* Now we're are waiting for the payload. We just need to know if all
+	 * data have been received or if the buffer is full.
 	 */
 	if ((htx->flags & HTX_FL_EOM) ||
 	    htx_get_tail_type(htx) > HTX_BLK_DATA ||
@@ -4081,7 +4084,7 @@ enum rule_result http_wait_for_msg_body(struct stream *s, struct channel *chn,
 	}
 
 	/* we get here if we need to wait for more data */
-	if (!(chn->flags & CF_SHUTR)) {
+	if (!(chn_prod(chn)->flags & SC_FL_SHUTR)) {
 		if (!tick_isset(chn->analyse_exp))
 			chn->analyse_exp = tick_add_ifset(now_ms, time);
 		ret = HTTP_RULE_RES_YIELD;
@@ -4233,7 +4236,7 @@ static void http_end_request(struct stream *s)
 		 * to shut this side, and 2) the server is waiting for us to
 		 * send pending data.
 		 */
-		chn->flags |= CF_NEVER_WAIT;
+		s->scb->flags |= SC_FL_SND_NEVERWAIT;
 
 		if (txn->rsp.msg_state < HTTP_MSG_BODY ||
 		    (txn->rsp.msg_state < HTTP_MSG_DONE && s->scb->state != SC_ST_CLO)) {
@@ -4270,7 +4273,7 @@ static void http_end_request(struct stream *s)
 			    txn->rsp.msg_state != HTTP_MSG_CLOSED)
 				goto check_channel_flags;
 
-			if (!(chn->flags & (CF_SHUTW|CF_SHUTW_NOW))) {
+			if (!(chn_cons(chn)->flags & (SC_FL_SHUTW|SC_FL_SHUTW_NOW))) {
 				channel_shutr_now(chn);
 				channel_shutw_now(chn);
 			}
@@ -4304,7 +4307,7 @@ static void http_end_request(struct stream *s)
 
   check_channel_flags:
 	/* Here, we are in HTTP_MSG_DONE or HTTP_MSG_TUNNEL */
-	if (chn->flags & (CF_SHUTW|CF_SHUTW_NOW)) {
+	if (chn_cons(chn)->flags & (SC_FL_SHUTW|SC_FL_SHUTW_NOW)) {
 		/* if we've just closed an output, let's switch */
 		txn->req.msg_state = HTTP_MSG_CLOSING;
 		goto http_msg_closing;
@@ -4313,7 +4316,7 @@ static void http_end_request(struct stream *s)
   end:
 	chn->analysers &= AN_REQ_FLT_END;
 	if (txn->req.msg_state == HTTP_MSG_TUNNEL) {
-		chn->flags |= CF_NEVER_WAIT;
+		s->scb->flags |= SC_FL_SND_NEVERWAIT;
 		if (HAS_REQ_DATA_FILTERS(s))
 			chn->analysers |= AN_REQ_FLT_XFER_DATA;
 	}
@@ -4369,7 +4372,7 @@ static void http_end_response(struct stream *s)
 			/* we're not expecting any new data to come for this
 			 * transaction, so we can close it.
 			 */
-			if (!(chn->flags & (CF_SHUTW|CF_SHUTW_NOW))) {
+			if (!(chn_cons(chn)->flags & (SC_FL_SHUTW|SC_FL_SHUTW_NOW))) {
 				channel_shutr_now(chn);
 				channel_shutw_now(chn);
 			}
@@ -4400,7 +4403,7 @@ static void http_end_response(struct stream *s)
 
   check_channel_flags:
 	/* Here, we are in HTTP_MSG_DONE or HTTP_MSG_TUNNEL */
-	if (chn->flags & (CF_SHUTW|CF_SHUTW_NOW)) {
+	if (chn_cons(chn)->flags & (SC_FL_SHUTW|SC_FL_SHUTW_NOW)) {
 		/* if we've just closed an output, let's switch */
 		txn->rsp.msg_state = HTTP_MSG_CLOSING;
 		goto http_msg_closing;
@@ -4409,7 +4412,7 @@ static void http_end_response(struct stream *s)
   end:
 	chn->analysers &= AN_RES_FLT_END;
 	if (txn->rsp.msg_state == HTTP_MSG_TUNNEL) {
-		chn->flags |= CF_NEVER_WAIT;
+		s->scf->flags |= SC_FL_SND_NEVERWAIT;
 		if (HAS_RSP_DATA_FILTERS(s))
 			chn->analysers |= AN_RES_FLT_XFER_DATA;
 	}
@@ -4449,14 +4452,14 @@ int http_forward_proxy_resp(struct stream *s, int final)
 		channel_auto_read(res);
 		channel_auto_close(res);
 		channel_shutr_now(res);
-		res->flags |= CF_EOI; /* The response is terminated, add EOI */
+		s->scb->flags |= SC_FL_EOI; /* The response is terminated, add EOI */
 		htxbuf(&res->buf)->flags |= HTX_FL_EOM; /* no more data are expected */
 	}
 	else {
-		/* Send ASAP informational messages. Rely on CF_EOI for final
+		/* Send ASAP informational messages. Rely on SC_FL_EOI for final
 		 * response.
 		 */
-		res->flags |= CF_SEND_DONTWAIT;
+		s->scf->flags |= SC_FL_SND_ASAP;
 	}
 
 	data = htx->data - co_data(res);
@@ -4743,7 +4746,8 @@ static int http_handle_expect_hdr(struct stream *s, struct htx *htx, struct http
 	/* If we have HTTP/1.1 message with a body and Expect: 100-continue,
 	 * then we must send an HTTP/1.1 100 Continue intermediate response.
 	 */
-	if (msg->msg_state == HTTP_MSG_BODY && (msg->flags & HTTP_MSGF_VER_11) &&
+	if (!(msg->flags & HTTP_MSGF_EXPECT_CHECKED) &&
+	    (msg->flags & HTTP_MSGF_VER_11) &&
 	    (msg->flags & (HTTP_MSGF_CNT_LEN|HTTP_MSGF_TE_CHNK))) {
 		struct ist hdr = { .ptr = "Expect", .len = 6 };
 		struct http_hdr_ctx ctx;
@@ -4757,6 +4761,7 @@ static int http_handle_expect_hdr(struct stream *s, struct htx *htx, struct http
 			http_remove_header(htx, &ctx);
 		}
 	}
+	msg->flags |= HTTP_MSGF_EXPECT_CHECKED;
 	return 0;
 }
 

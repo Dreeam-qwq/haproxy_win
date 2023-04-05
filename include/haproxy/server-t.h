@@ -150,6 +150,7 @@ enum srv_initaddr {
 #define SRV_F_DYNAMIC      0x1000        /* dynamic server instantiated at runtime */
 #define SRV_F_NON_PURGEABLE 0x2000       /* this server cannot be removed at runtime */
 #define SRV_F_DEFSRV_USE_SSL 0x4000      /* default-server uses SSL */
+#define SRV_F_DELETED 0x8000             /* srv is deleted but not yet purged */
 
 /* configured server options for send-proxy (server->pp_opts) */
 #define SRV_PP_V1               0x0001   /* proxy protocol version 1 */
@@ -236,6 +237,7 @@ struct server {
 	unsigned int pp_opts;                   /* proxy protocol options (SRV_PP_*) */
 	struct list global_list;                /* attach point in the global servers_list */
 	struct server *next;
+	struct mt_list prev_deleted;            /* deleted servers with 'next' ptr pointing to us */
 	int cklen;				/* the len of the cookie, to speed up checks */
 	int rdr_len;				/* the length of the redirection prefix */
 	char *cookie;				/* the id set in the cookie */
@@ -428,7 +430,7 @@ struct event_hdl_cb_data_server {
 		char name[64];       /* server name/id */
 		char proxy_name[64]; /* id of proxy the server belongs to */
 		int puid;            /* proxy-unique server ID */
-		int rid;             /* server id revision */
+		uint32_t rid;        /* server id revision */
 		unsigned int flags;  /* server flags */
 	} safe;
 	struct {

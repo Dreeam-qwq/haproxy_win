@@ -3142,6 +3142,7 @@ int stats_dump_proxy_to_buffer(struct stconn *sc, struct htx *htx,
 	struct server *sv, *svs;	/* server and server-state, server-state=server or server->track */
 	struct listener *l;
 	int current_field;
+	int px_st = ctx->px_st;
 
 	chunk_reset(&trash_chunk);
 more:
@@ -3257,11 +3258,28 @@ more:
 		__fallthrough;
 
 	case STAT_PX_ST_SV:
+		/* check for dump resumption */
+		if (px_st == STAT_PX_ST_SV) {
+			struct server *cur = ctx->obj2;
+
+			/* re-entrant dump */
+			BUG_ON(!cur);
+			if (cur->flags & SRV_F_DELETED) {
+				/* the server could have been marked as deleted
+				 * between two dumping attempts, skip it.
+				 */
+				cur = cur->next;
+			}
+			srv_drop(ctx->obj2); /* drop old srv taken on last dumping attempt */
+			ctx->obj2 = cur; /* could be NULL */
+			/* back to normal */
+		}
+
 		/* obj2 points to servers list as initialized above.
 		 *
 		 * A server may be removed during the stats dumping.
 		 * Temporarily increment its refcount to prevent its
-		 * anticipated cleaning. Call free_server to release it.
+		 * anticipated cleaning. Call srv_drop() to release it.
 		 */
 		for (; ctx->obj2 != NULL;
 		       ctx->obj2 = srv_drop(sv)) {
@@ -4441,7 +4459,7 @@ static void http_stats_io_handler(struct appctx *appctx)
 
 	res_htx = htx_from_buf(&res->buf);
 
-	if (unlikely(sc->state == SC_ST_DIS || sc->state == SC_ST_CLO))
+	if (unlikely(se_fl_test(appctx->sedesc, (SE_FL_EOS|SE_FL_ERROR|SE_FL_SHR|SE_FL_SHW))))
 		goto out;
 
 	/* Check if the input buffer is available. */
@@ -4449,10 +4467,6 @@ static void http_stats_io_handler(struct appctx *appctx)
 		sc_need_room(sc);
 		goto out;
 	}
-
-	/* check that the output is not closed */
-	if (res->flags & (CF_SHUTW|CF_SHUTW_NOW|CF_SHUTR))
-		appctx->st0 = STAT_HTTP_END;
 
 	/* all states are processed in sequence */
 	if (appctx->st0 == STAT_HTTP_HEAD) {
@@ -4477,7 +4491,7 @@ static void http_stats_io_handler(struct appctx *appctx)
 	if (appctx->st0 == STAT_HTTP_POST) {
 		if (stats_process_http_post(sc))
 			appctx->st0 = STAT_HTTP_LAST;
-		else if (req->flags & CF_SHUTR)
+		else if (chn_prod(req)->flags & SC_FL_SHUTR)
 			appctx->st0 = STAT_HTTP_DONE;
 	}
 
@@ -4500,14 +4514,12 @@ static void http_stats_io_handler(struct appctx *appctx)
 			channel_add_input(res, 1);
 		}
 		res_htx->flags |= HTX_FL_EOM;
-		res->flags |= CF_EOI;
 		se_fl_set(appctx->sedesc, SE_FL_EOI);
 		appctx->st0 = STAT_HTTP_END;
 	}
 
 	if (appctx->st0 == STAT_HTTP_END) {
-		if (!(res->flags & CF_SHUTR))
-			sc_shutr(sc);
+		se_fl_set(appctx->sedesc, SE_FL_EOS);
 		applet_will_consume(appctx);
 	}
 

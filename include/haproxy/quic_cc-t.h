@@ -37,6 +37,10 @@ extern struct quic_cc_algo quic_cc_algo_nr;
 extern struct quic_cc_algo quic_cc_algo_cubic;
 extern struct quic_cc_algo *default_quic_cc_algo;
 
+/* Fake algorithm with its fixed window */
+extern struct quic_cc_algo quic_cc_algo_nocc;
+extern unsigned int quic_cc_nocc_fixed_cwnd;
+
 extern unsigned long long last_ts;
 
 enum quic_cc_algo_state_type {
@@ -44,6 +48,8 @@ enum quic_cc_algo_state_type {
 	QUIC_CC_ST_SS,
 	/* Congestion avoidance. */
 	QUIC_CC_ST_CA,
+	/* Recovery period. */
+	QUIC_CC_ST_RP,
 };
 
 enum quic_cc_event_type {
@@ -71,6 +77,7 @@ struct quic_cc_event {
 enum quic_cc_algo_type {
 	QUIC_CC_ALGO_TP_NEWRENO,
 	QUIC_CC_ALGO_TP_CUBIC,
+	QUIC_CC_ALGO_TP_NOCC,
 };
 
 struct quic_cc {
@@ -82,7 +89,6 @@ struct quic_cc {
 
 struct quic_cc_algo {
 	enum quic_cc_algo_type type;
-	enum quic_cc_algo_state_type state;
 	int (*init)(struct quic_cc *cc);
 	void (*event)(struct quic_cc *cc, struct quic_cc_event *ev);
 	void (*slow_start)(struct quic_cc *cc);

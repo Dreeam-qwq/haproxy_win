@@ -176,7 +176,7 @@ uint64_t event_hdl_id(const char *scope, const char *name);
  * to perform subscription lookup by id
  * <equeue>: pointer to event_hdl_async_event queue where the pending
  * events will be pushed. Cannot be NULL.
- * <task>: pointer to tasklet responsible for consuming the events.
+ * <task>: pointer to task(let) responsible for consuming the events.
 *  Cannot be NULL.
  * <_private>: pointer to private data that will be handled to <func>
  * <_private_free>: pointer to 'event_hdl_private_free' prototyped function
@@ -187,7 +187,7 @@ uint64_t event_hdl_id(const char *scope, const char *name);
 	(struct event_hdl){ .id = _id,						\
 			    .dorigin = _EVENT_HDL_CALLING_PLACE,		\
 			    .async = EVENT_HDL_ASYNC_MODE_ADVANCED,		\
-			    .async_task = task,					\
+			    .async_task = (struct tasklet *)task,		\
 			    .async_equeue = equeue,				\
 			    .private = _private,				\
 			    .private_free = _private_free }
@@ -201,7 +201,7 @@ uint64_t event_hdl_id(const char *scope, const char *name);
  *
  * <equeue>: pointer to event_hdl_async_event queue where the pending
  * events will be pushed. Cannot be NULL.
- * <task>: pointer to tasklet responsible for consuming the events
+ * <task>: pointer to task(let) responsible for consuming the events
  * Cannot be NULL.
  * <_private>: pointer to private data that will be handled to <func>
  * <_private_free>: pointer to 'event_hdl_private_free' prototyped function
@@ -220,6 +220,14 @@ uint64_t event_hdl_id(const char *scope, const char *name);
  *
  * If <sub_list> is not specified (equals NULL):
  * global subscription list (process wide) will be used.
+ *
+ * For identified subscriptions (EVENT_HDL_ID_*), the function is safe against
+ * concurrent subscriptions attempts with the same ID: the ID will only be
+ * inserted once in the list and subsequent attempts will yield an error.
+ * However, trying to register the same ID multiple times is considered as
+ * an error (no specific error code is returned in this case) so the check should
+ * be performed by the caller if it is expected. (The caller must ensure that the ID
+ * is unique to prevent the error from being raised)
  *
  * Returns 1 in case of success, 0 in case of failure (invalid argument / memory error)
  */
@@ -292,6 +300,35 @@ int event_hdl_lookup_resubscribe(event_hdl_sub_list *sub_list,
  */
 struct event_hdl_sub *event_hdl_lookup_take(event_hdl_sub_list *sub_list,
                                             uint64_t lookup_id);
+
+/* pause an existing subscription <sub>
+ * the subscription will no longer receive events (reversible)
+ * This can be reverted thanks to _resume() function
+ */
+void event_hdl_pause(struct event_hdl_sub *sub);
+
+/* resume an existing subscription <sub>
+ * that was previously paused using _pause() function
+ */
+void event_hdl_resume(struct event_hdl_sub *sub);
+
+/* Same as event_hdl_pause() for identified subscriptions:
+ * use this function to pause the subscription <lookup_ip>
+ * within <sub_list> list.
+ * If <sub_list> is NULL, global subscription list will be used.
+ * Returns 1 for SUCCESS and 0 if not found
+ */
+int event_hdl_lookup_pause(event_hdl_sub_list *sub_list,
+                           uint64_t lookup_id);
+
+/* Same as event_hdl_resume() for identified subscriptions:
+ * use this function to resume the subscription <lookup_ip>
+ * within <sub_list> list.
+ * If <sub_list> is NULL, global subscription list will be used.
+ * Returns 1 for SUCCESS and 0 if not found
+ */
+int event_hdl_lookup_resume(event_hdl_sub_list *sub_list,
+                            uint64_t lookup_id);
 
 /* ------ PUBLISHING FUNCTIONS ------ */
 
@@ -408,28 +445,40 @@ void event_hdl_async_free_event(struct event_hdl_async_event *e);
 /* use this for advanced async mode to initialize event queue */
 static inline void event_hdl_async_equeue_init(event_hdl_async_equeue *queue)
 {
-	MT_LIST_INIT(queue);
+	MT_LIST_INIT(&queue->head);
+	queue->size = 0;
 }
 
 /* use this for advanced async mode to pop an event from event queue */
 static inline struct event_hdl_async_event *event_hdl_async_equeue_pop(event_hdl_async_equeue *queue)
 {
-	return MT_LIST_POP(queue, struct event_hdl_async_event *, mt_list);
+	struct event_hdl_async_event *event;
+
+	event = MT_LIST_POP(&queue->head, struct event_hdl_async_event *, mt_list);
+	if (event)
+		HA_ATOMIC_DEC(&queue->size);
+	return event;
 }
 
-/* use this to initialize an event subscription list
- * (event_hdl_sub_list)
- */
-static inline void event_hdl_sub_list_init(event_hdl_sub_list *sub_list)
+/* use this for advanced async mode to check if the event queue is empty */
+static inline int event_hdl_async_equeue_isempty(event_hdl_async_equeue *queue)
 {
-	MT_LIST_INIT(sub_list);
+	return MT_LIST_ISEMPTY(&queue->head);
 }
+
+/* use this for advanced async mode to check if the event queue size */
+static inline uint32_t event_hdl_async_equeue_size(event_hdl_async_equeue *queue)
+{
+	return HA_ATOMIC_LOAD(&queue->size);
+}
+
+/* use this to initialize <sub_list> event subscription list */
+void event_hdl_sub_list_init(event_hdl_sub_list *sub_list);
 
 /* use this function when you need to destroy <sub_list>
- * subscription list
+ * event subscription list
  * All subscriptions will be removed and properly freed according
  * to their types
- * If <sub_list> is NULL, global subscription list will be used.
  */
 void event_hdl_sub_list_destroy(event_hdl_sub_list *sub_list);
 

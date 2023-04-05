@@ -24,7 +24,7 @@
 
 #include <stdint.h>
 
-#include <haproxy/list-t.h>
+#include <haproxy/api-t.h>
 
 /* event data struct are defined as followed */
 struct event_hdl_cb_data_template {
@@ -72,10 +72,21 @@ struct event_hdl_sub_type
 	uint16_t subtype;
 };
 
-/* event_hdl_sub_list is an alias to mt_list (please use this for portability) */
-typedef struct mt_list event_hdl_sub_list;
+struct event_hdl_sub_list_head {
+	struct mt_list head;
+	struct mt_list known; /* api uses this to track known subscription lists */
+};
+
+/* event_hdl_sub_list is an alias (please use this for portability) */
+typedef struct event_hdl_sub_list_head event_hdl_sub_list;
+
+struct event_hdl_async_equeue_head {
+	struct mt_list head;
+	uint32_t size; /* near realtime size, not fully synced with head (to be used as a hint) */
+};
+
 /* event_hdl_async_equeue is an alias to mt_list (please use this for portability) */
-typedef struct mt_list event_hdl_async_equeue;
+typedef struct event_hdl_async_equeue_head event_hdl_async_equeue;
 
 /* subscription mgmt from event */
 struct event_hdl_sub_mgmt
@@ -195,12 +206,16 @@ struct event_hdl {
 	void				*private;
 };
 
+/* flags for event_hdl_sub struct (32 bits) */
+#define EHDL_SUB_F_PAUSED        0x0001  /* subscription will temporarily ignore events */
+
 /* list elem: subscription (handler subscribed to specific events)
  */
 struct event_hdl_sub {
 	struct mt_list			mt_list;
 	/* event type subscription */
 	struct event_hdl_sub_type	sub;
+	uint32_t                        flags;
 	/* event handler */
 	struct event_hdl		hdl;
 	/* used to guarantee that END event will be delivered

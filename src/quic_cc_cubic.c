@@ -1,5 +1,6 @@
-#include <haproxy/trace.h>
 #include <haproxy/quic_cc.h>
+#include <haproxy/ticks.h>
+#include <haproxy/trace.h>
 
 /* This source file is highly inspired from Linux kernel source file
  * implementation for TCP Cubic. In fact, we have no choice if we do
@@ -22,6 +23,7 @@
 
 /* K cube factor: (1 - beta) / c */
 struct cubic {
+	uint32_t state;
 	uint32_t ssthresh;
 	uint32_t remaining_inc;
 	uint32_t remaining_tcp_inc;
@@ -37,8 +39,8 @@ static void quic_cc_cubic_reset(struct quic_cc *cc)
 {
 	struct cubic *c = quic_cc_priv(cc);
 
-	cc->algo->state = QUIC_CC_ST_SS;
-
+	TRACE_ENTER(QUIC_EV_CONN_CC, cc->qc);
+	c->state = QUIC_CC_ST_SS;
 	c->ssthresh = QUIC_CC_INFINITE_SSTHESH;
 	c->remaining_inc = 0;
 	c->remaining_tcp_inc = 0;
@@ -48,6 +50,7 @@ static void quic_cc_cubic_reset(struct quic_cc *cc)
 	c->last_w_max = 0;
 	c->tcp_wnd = 0;
 	c->recovery_start_time = 0;
+	TRACE_LEAVE(QUIC_EV_CONN_CC, cc->qc);
 }
 
 static int quic_cc_cubic_init(struct quic_cc *cc)
@@ -99,6 +102,7 @@ static inline void quic_cubic_update(struct quic_cc *cc, uint32_t acked)
 	uint32_t t, target, inc, inc_diff;
 	uint64_t delta, diff;
 
+	TRACE_ENTER(QUIC_EV_CONN_CC, cc->qc);
 	if (!c->epoch_start) {
 		c->epoch_start = now_ms;
 		if (c->last_w_max <= path->cwnd) {
@@ -132,7 +136,7 @@ static inline void quic_cubic_update(struct quic_cc *cc, uint32_t acked)
 		 * control algorithm reset.
 		 */
 		quic_cc_cubic_reset(cc);
-		return;
+		goto leave;
 	}
 
 	delta = path->mtu * ((CUBIC_C * diff * diff * diff) >> (10 + 3 * TIME_SCALE_FACTOR_SHIFT));
@@ -164,11 +168,15 @@ static inline void quic_cubic_update(struct quic_cc *cc, uint32_t acked)
 	}
 
 	path->cwnd += inc;
+ leave:
+	TRACE_LEAVE(QUIC_EV_CONN_CC, cc->qc);
 }
 
 static void quic_cc_cubic_slow_start(struct quic_cc *cc)
 {
+	TRACE_ENTER(QUIC_EV_CONN_CC, cc->qc);
 	quic_cc_cubic_reset(cc);
+	TRACE_LEAVE(QUIC_EV_CONN_CC, cc->qc);
 }
 
 static void quic_enter_recovery(struct quic_cc *cc)
@@ -177,6 +185,7 @@ static void quic_enter_recovery(struct quic_cc *cc)
 	struct cubic *c = quic_cc_priv(cc);
 	/* Current cwnd as number of packets */
 
+	TRACE_ENTER(QUIC_EV_CONN_CC, cc->qc);
 	c->epoch_start = 0;
 	c->recovery_start_time = now_ms;
 	/* Fast convergence */
@@ -189,6 +198,8 @@ static void quic_enter_recovery(struct quic_cc *cc)
 	}
 	path->cwnd = (CUBIC_BETA * path->cwnd) >> CUBIC_BETA_SCALE_SHIFT;
 	c->ssthresh =  QUIC_MAX(path->cwnd, path->min_cwnd);
+	c->state = QUIC_CC_ST_RP;
+	TRACE_LEAVE(QUIC_EV_CONN_CC, cc->qc, NULL, cc);
 }
 
 /* Congestion slow-start callback. */
@@ -197,27 +208,19 @@ static void quic_cc_cubic_ss_cb(struct quic_cc *cc, struct quic_cc_event *ev)
 	struct quic_path *path = container_of(cc, struct quic_path, cc);
 	struct cubic *c = quic_cc_priv(cc);
 
-	TRACE_ENTER(QUIC_EV_CONN_CC, cc->qc, ev);
+	TRACE_ENTER(QUIC_EV_CONN_CC, cc->qc);
+	TRACE_PROTO("CC cubic", QUIC_EV_CONN_CC, cc->qc, ev);
 	switch (ev->type) {
 	case QUIC_CC_EVT_ACK:
-		/* Do not increase the congestion window in recovery period. */
-		if (ev->ack.time_sent <= c->recovery_start_time)
-			goto out;
-
-		path->cwnd += ev->ack.acked;
+		if (path->cwnd < QUIC_CC_INFINITE_SSTHESH - ev->ack.acked)
+			path->cwnd += ev->ack.acked;
 		/* Exit to congestion avoidance if slow start threshold is reached. */
 		if (path->cwnd >= c->ssthresh)
-			cc->algo->state = QUIC_CC_ST_CA;
+			c->state = QUIC_CC_ST_CA;
 		break;
 
 	case QUIC_CC_EVT_LOSS:
-		/* Do not decrease the congestion window when already in recovery period. */
-		if (ev->loss.time_sent <= c->recovery_start_time)
-			goto out;
-
 		quic_enter_recovery(cc);
-		/* Exit to congestion avoidance. */
-		cc->algo->state = QUIC_CC_ST_CA;
 		break;
 
 	case QUIC_CC_EVT_ECN_CE:
@@ -226,28 +229,20 @@ static void quic_cc_cubic_ss_cb(struct quic_cc *cc, struct quic_cc_event *ev)
 	}
 
  out:
-	TRACE_LEAVE(QUIC_EV_CONN_CC, cc->qc, NULL, cc);
+	TRACE_PROTO("CC cubic", QUIC_EV_CONN_CC, cc->qc, NULL, cc);
+	TRACE_LEAVE(QUIC_EV_CONN_CC, cc->qc);
 }
 
 /* Congestion avoidance callback. */
 static void quic_cc_cubic_ca_cb(struct quic_cc *cc, struct quic_cc_event *ev)
 {
-	struct cubic *c = quic_cc_priv(cc);
-
-	TRACE_ENTER(QUIC_EV_CONN_CC, cc->qc, ev);
+	TRACE_ENTER(QUIC_EV_CONN_CC, cc->qc);
+	TRACE_PROTO("CC cubic", QUIC_EV_CONN_CC, cc->qc, ev);
 	switch (ev->type) {
 	case QUIC_CC_EVT_ACK:
-		/* Do not increase the congestion window when already in recovery period. */
-		if (ev->ack.time_sent <= c->recovery_start_time)
-			goto out;
-
 		quic_cubic_update(cc, ev->ack.acked);
 		break;
 	case QUIC_CC_EVT_LOSS:
-		/* Do not decrease the congestion window when already in recovery period. */
-		if (ev->loss.time_sent <= c->recovery_start_time)
-			goto out;
-
 		quic_enter_recovery(cc);
 		break;
 	case QUIC_CC_EVT_ECN_CE:
@@ -256,6 +251,41 @@ static void quic_cc_cubic_ca_cb(struct quic_cc *cc, struct quic_cc_event *ev)
 	}
 
  out:
+	TRACE_PROTO("CC cubic", QUIC_EV_CONN_CC, cc->qc, NULL, cc);
+	TRACE_LEAVE(QUIC_EV_CONN_CC, cc->qc);
+}
+
+/* Recovery period callback */
+static void quic_cc_cubic_rp_cb(struct quic_cc *cc, struct quic_cc_event *ev)
+{
+	struct cubic *c = quic_cc_priv(cc);
+
+	TRACE_ENTER(QUIC_EV_CONN_CC, cc->qc, ev);
+	TRACE_PROTO("CC cubic", QUIC_EV_CONN_CC, cc->qc, ev, cc);
+
+	switch (ev->type) {
+	case QUIC_CC_EVT_ACK:
+		/* RFC 9022 7.3.2. Recovery
+		 * A recovery period ends and the sender enters congestion avoidance when a
+		 * packet sent during the recovery period is acknowledged.
+		 */
+		if (tick_is_le(ev->ack.time_sent, c->recovery_start_time)) {
+			TRACE_PROTO("CC cubic (still in recov. period)", QUIC_EV_CONN_CC, cc->qc);
+			goto leave;
+		}
+
+		c->state = QUIC_CC_ST_CA;
+		c->recovery_start_time = TICK_ETERNITY;
+		break;
+	case QUIC_CC_EVT_LOSS:
+		break;
+	case QUIC_CC_EVT_ECN_CE:
+		/* TODO */
+		break;
+	}
+
+ leave:
+	TRACE_PROTO("CC cubic", QUIC_EV_CONN_CC, cc->qc, NULL, cc);
 	TRACE_LEAVE(QUIC_EV_CONN_CC, cc->qc, NULL, cc);
 }
 
@@ -263,15 +293,28 @@ static void (*quic_cc_cubic_state_cbs[])(struct quic_cc *cc,
                                       struct quic_cc_event *ev) = {
 	[QUIC_CC_ST_SS] = quic_cc_cubic_ss_cb,
 	[QUIC_CC_ST_CA] = quic_cc_cubic_ca_cb,
+	[QUIC_CC_ST_RP] = quic_cc_cubic_rp_cb,
 };
 
 static void quic_cc_cubic_event(struct quic_cc *cc, struct quic_cc_event *ev)
 {
-	return quic_cc_cubic_state_cbs[cc->algo->state](cc, ev);
+	struct cubic *c = quic_cc_priv(cc);
+
+	return quic_cc_cubic_state_cbs[c->state](cc, ev);
 }
 
 static void quic_cc_cubic_state_trace(struct buffer *buf, const struct quic_cc *cc)
 {
+	struct quic_path *path;
+	struct cubic *c = quic_cc_priv(cc);
+
+	path = container_of(cc, struct quic_path, cc);
+	chunk_appendf(buf, " state=%s cwnd=%llu ssthresh=%d rpst=%dms",
+	              quic_cc_state_str(c->state),
+	              (unsigned long long)path->cwnd,
+	              (int)c->ssthresh,
+	              !tick_isset(c->recovery_start_time) ? -1 :
+	              TICKS_TO_MS(tick_remain(c->recovery_start_time, now_ms)));
 }
 
 struct quic_cc_algo quic_cc_algo_cubic = {

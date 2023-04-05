@@ -1848,8 +1848,10 @@ skip_reuse:
 	 *       wake callback. Otherwise si_cs_recv()/si_cs_send() already take
 	 *       care of it.
 	 */
-	if (sc_ep_test(s->scb, SE_FL_EOI) && !(sc_ic(s->scb)->flags & CF_EOI))
-		sc_ic(s->scb)->flags |= (CF_EOI|CF_READ_EVENT);
+	if (sc_ep_test(s->scb, SE_FL_EOI) && !(s->scb->flags & SC_FL_EOI)) {
+		s->scb->flags |= SC_FL_EOI;
+		sc_ic(s->scb)->flags |= CF_READ_EVENT;
+	}
 
 	/* catch all sync connect while the mux is not already installed */
 	if (!srv_conn->mux && !(srv_conn->flags & CO_FL_WAIT_XPRT)) {
@@ -1954,7 +1956,7 @@ int srv_redispatch_connect(struct stream *s)
 static int back_may_abort_req(struct channel *req, struct stream *s)
 {
 	return (sc_ep_test(s->scf, SE_FL_ERROR) ||
-	        ((req->flags & (CF_SHUTW_NOW|CF_SHUTW)) &&  /* empty and client aborted */
+	        ((chn_cons(req)->flags & (SC_FL_SHUTW_NOW|SC_FL_SHUTW)) &&  /* empty and client aborted */
 	         (channel_is_empty(req) || (s->be->options & PR_O_ABRT_CLOSE))));
 }
 
@@ -2244,8 +2246,8 @@ void back_handle_st_con(struct stream *s)
 	DBG_TRACE_ENTER(STRM_EV_STRM_PROC|STRM_EV_CS_ST, s);
 
 	/* the client might want to abort */
-	if ((rep->flags & CF_SHUTW) ||
-	    ((req->flags & CF_SHUTW_NOW) &&
+	if ((chn_cons(rep)->flags & SC_FL_SHUTW) ||
+	    ((chn_cons(req)->flags & SC_FL_SHUTW_NOW) &&
 	     (channel_is_empty(req) || (s->be->options & PR_O_ABRT_CLOSE)))) {
 		sc->flags |= SC_FL_NOLINGER;
 		sc_shutw(sc);
@@ -2468,8 +2470,8 @@ void back_handle_st_rdy(struct stream *s)
 	 */
 	if (!(req->flags & CF_WROTE_DATA)) {
 		/* client abort ? */
-		if ((rep->flags & CF_SHUTW) ||
-		    ((req->flags & CF_SHUTW_NOW) &&
+		if ((chn_cons(rep)->flags & SC_FL_SHUTW) ||
+		    ((chn_cons(req)->flags & SC_FL_SHUTW_NOW) &&
 		     (channel_is_empty(req) || (s->be->options & PR_O_ABRT_CLOSE)))) {
 			/* give up */
 			sc->flags |= SC_FL_NOLINGER;

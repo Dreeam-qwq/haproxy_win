@@ -1285,6 +1285,50 @@ struct server *findserver(const struct proxy *px, const char *name) {
 	return target;
 }
 
+/*
+ * This function finds a server with matching "<puid> x <rid>" within
+ * selected proxy <px>.
+ * Using the combination of proxy-uid + revision id ensures that the function
+ * will either return the server we're expecting or NULL if it has been removed
+ * from the proxy.
+ */
+struct server *findserver_unique_id(const struct proxy *px, int puid, uint32_t rid) {
+
+	struct server *cursrv;
+
+	if (!px)
+		return NULL;
+
+	for (cursrv = px->srv; cursrv; cursrv = cursrv->next) {
+		if (cursrv->puid == puid && cursrv->rid == rid)
+			return cursrv;
+	}
+
+	return NULL;
+}
+
+/*
+ * This function finds a server with matching "<name> x <rid>" within
+ * selected proxy <px>.
+ * Using the combination of name + revision id ensures that the function will
+ * either return the server we're expecting or NULL if it has been removed
+ * from the proxy.
+ */
+struct server *findserver_unique_name(const struct proxy *px, const char *name, uint32_t rid) {
+
+	struct server *cursrv;
+
+	if (!px)
+		return NULL;
+
+	for (cursrv = px->srv; cursrv; cursrv = cursrv->next) {
+		if (!strcmp(cursrv->id, name) && cursrv->rid == rid)
+			return cursrv;
+	}
+
+	return NULL;
+}
+
 /* This function checks that the designated proxy has no http directives
  * enabled. It will output a warning if there are, and will fix some of them.
  * It returns the number of fatal errors encountered. This should be called
@@ -2003,11 +2047,40 @@ struct task *manage_proxy(struct task *t, void *context, unsigned int state)
 			 * to push to a new process and
 			 * we are free to flush the table.
 			 */
-			if (stktable_trash_oldest(p->table, p->table->current))
+			int budget;
+			int cleaned_up;
+
+			/* We purposely enforce a budget limitation since we don't want
+			 * to spend too much time purging old entries
+			 *
+			 * This is known to cause the watchdog to occasionnaly trigger if
+			 * the table is huge and all entries become available for purge
+			 * at the same time
+			 *
+			 * Moreover, we must also anticipate the pool_gc() call which
+			 * will also be much slower if there is too much work at once
+			 */
+			budget = MIN(p->table->current, (1 << 15)); /* max: 32K */
+			cleaned_up = stktable_trash_oldest(p->table, budget);
+			if (cleaned_up) {
+				/* immediately release freed memory since we are stopping */
 				pool_gc(NULL);
+				if (cleaned_up > (budget / 2)) {
+					/* most of the budget was used to purge entries,
+					 * it is very likely that there are still trashable
+					 * entries in the table, reschedule a new cleanup
+					 * attempt ASAP
+					 */
+					t->expire = TICK_ETERNITY;
+					task_wakeup(t, TASK_WOKEN_RES);
+					return t;
+				}
+			}
 		}
 		if (p->table->current) {
-			/* some entries still remain, let's recheck in one second */
+			/* some entries still remain but are not yet available
+			 * for cleanup, let's recheck in one second
+			 */
 			next = tick_first(next, tick_add(now_ms, 1000));
 		}
 	}
@@ -2444,8 +2517,8 @@ int stream_set_backend(struct stream *s, struct proxy *be)
 
 	s->flags |= SF_BE_ASSIGNED;
 	if (be->options2 & PR_O2_NODELAY) {
-		s->req.flags |= CF_NEVER_WAIT;
-		s->res.flags |= CF_NEVER_WAIT;
+		s->scf->flags |= SC_FL_SND_NEVERWAIT;
+		s->scb->flags |= SC_FL_SND_NEVERWAIT;
 	}
 
 	return 1;
@@ -3179,7 +3252,8 @@ static int cli_io_handler_show_errors(struct appctx *appctx)
 	struct stconn *sc = appctx_sc(appctx);
 	extern const char *monthname[12];
 
-	if (unlikely(sc_ic(sc)->flags & CF_SHUTW))
+	/* FIXME: Don't watch the other side !*/
+	if (unlikely(sc_opposite(sc)->flags & SC_FL_SHUTW))
 		return 1;
 
 	chunk_reset(&trash);

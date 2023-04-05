@@ -2368,6 +2368,7 @@ struct server *new_server(struct proxy *proxy)
 	LIST_APPEND(&servers_list, &srv->global_list);
 	LIST_INIT(&srv->srv_rec_item);
 	LIST_INIT(&srv->ip_rec_item);
+	MT_LIST_INIT(&srv->prev_deleted);
 	event_hdl_sub_list_init(&srv->e_subs);
 
 	srv->next_state = SRV_ST_RUNNING; /* early server setup */
@@ -2407,7 +2408,7 @@ void srv_take(struct server *srv)
 
 /* Deallocate a server <srv> and its member. <srv> must be allocated. For
  * dynamic servers, its refcount is decremented first. The free operations are
- * conducted only if the refcount is nul, unless the process is stopping.
+ * conducted only if the refcount is nul.
  *
  * As a convenience, <srv.next> is returned if srv is not NULL. It may be useful
  * when calling srv_drop on the list of servers.
@@ -2424,10 +2425,15 @@ struct server *srv_drop(struct server *srv)
 	/* For dynamic servers, decrement the reference counter. Only free the
 	 * server when reaching zero.
 	 */
-	if (likely(!(global.mode & MODE_STOPPING))) {
-		if (HA_ATOMIC_SUB_FETCH(&srv->refcount, 1))
-			goto end;
-	}
+	if (HA_ATOMIC_SUB_FETCH(&srv->refcount, 1))
+		goto end;
+
+	/* make sure we are removed from our 'next->prev_deleted' list
+	 * This doesn't require full thread isolation as we're using mt lists
+	 * However this could easily be turned into regular list if required
+	 * (with the proper use of thread isolation)
+	 */
+	MT_LIST_DELETE(&srv->prev_deleted);
 
 	task_destroy(srv->warmup);
 	task_destroy(srv->srvrq_check);
@@ -2444,10 +2450,8 @@ struct server *srv_drop(struct server *srv)
 	free(srv->addr_node.key);
 	free(srv->lb_nodes);
 
-	if (srv->use_ssl == 1 || srv->check.use_ssl == 1 || (srv->proxy->options & PR_O_TCPCHK_SSL)) {
-		if (xprt_get(XPRT_SSL) && xprt_get(XPRT_SSL)->destroy_srv)
-			xprt_get(XPRT_SSL)->destroy_srv(srv);
-	}
+	if (xprt_get(XPRT_SSL) && xprt_get(XPRT_SSL)->destroy_srv)
+		xprt_get(XPRT_SSL)->destroy_srv(srv);
 	HA_SPIN_DESTROY(&srv->lock);
 
 	LIST_DELETE(&srv->global_list);
@@ -4998,6 +5002,7 @@ static int cli_parse_delete_server(char **args, char *payload, struct appctx *ap
 	struct proxy *be;
 	struct server *srv;
 	char *be_name, *sv_name;
+	struct server *prev_del;
 
 	if (!cli_has_level(appctx, ACCESS_LVL_ADMIN))
 		return 1;
@@ -5098,6 +5103,25 @@ static int cli_parse_delete_server(char **args, char *payload, struct appctx *ap
 		next->next = srv->next;
 	}
 
+	/* Some deleted servers could still point to us using their 'next',
+	 * update them as needed
+	 * Please note the small race between the POP and APPEND, although in
+	 * this situation this is not an issue as we are under full thread
+	 * isolation
+	 */
+	while ((prev_del = MT_LIST_POP(&srv->prev_deleted, struct server *, prev_deleted))) {
+		/* update its 'next' ptr */
+		prev_del->next = srv->next;
+		if (srv->next) {
+			/* now it is our 'next' responsibility */
+			MT_LIST_APPEND(&srv->next->prev_deleted, &prev_del->prev_deleted);
+		}
+	}
+
+	/* we ourselves need to inform our 'next' that we will still point it */
+	if (srv->next)
+		MT_LIST_APPEND(&srv->next->prev_deleted, &srv->prev_deleted);
+
 	/* remove srv from addr_node tree */
 	eb32_delete(&srv->conf.id);
 	ebpt_delete(&srv->conf.name);
@@ -5106,6 +5130,15 @@ static int cli_parse_delete_server(char **args, char *payload, struct appctx *ap
 
 	/* remove srv from idle_node tree for idle conn cleanup */
 	eb32_delete(&srv->idle_node);
+
+	/* flag the server as deleted
+	 * (despite the server being removed from primary server list,
+	 * one could still access the server data from a valid ptr)
+	 * Deleted flag helps detecting when a server is in transient removal
+	 * state.
+	 * ie: removed from the list but not yet freed/purged from memory.
+	 */
+	srv->flags |= SRV_F_DELETED;
 
 	/* set LSB bit (odd bit) for reuse_cnt */
 	srv_id_reuse_cnt |= 1;

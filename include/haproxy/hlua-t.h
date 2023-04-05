@@ -34,6 +34,7 @@
 #include <haproxy/server-t.h>
 #include <haproxy/stick_table-t.h>
 #include <haproxy/xref-t.h>
+#include <haproxy/event_hdl-t.h>
 
 #define CLASS_CORE         "Core"
 #define CLASS_TXN          "TXN"
@@ -50,9 +51,12 @@
 #define CLASS_PROXY        "Proxy"
 #define CLASS_SERVER       "Server"
 #define CLASS_LISTENER     "Listener"
+#define CLASS_EVENT_SUB    "EventSub"
 #define CLASS_REGEX        "Regex"
 #define CLASS_STKTABLE     "StickTable"
 #define CLASS_CERTCACHE    "CertCache"
+#define CLASS_PROXY_LIST   "ProxyList"
+#define CLASS_SERVER_LIST  "ServerList"
 
 struct stream;
 
@@ -200,6 +204,24 @@ struct hlua_httpclient {
 	size_t sent; /* payload sent */
 	luaL_Buffer b; /* buffer used to prepare strings. */
 	struct mt_list by_hlua; /* linked in the current hlua task */
+};
+
+struct hlua_proxy_list {
+	char capabilities;
+};
+
+struct hlua_proxy_list_iterator_context {
+	struct proxy *next;
+	char capabilities;
+};
+
+struct hlua_server_list {
+	struct proxy *px;
+};
+
+struct hlua_server_list_iterator_context {
+	struct server *cur;
+	struct proxy *px;
 };
 
 #else /* USE_LUA */

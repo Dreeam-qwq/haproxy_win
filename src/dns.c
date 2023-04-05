@@ -444,6 +444,11 @@ static void dns_session_io_handler(struct appctx *appctx)
 	size_t len, cnt, ofs;
 	int ret = 0;
 
+	if (unlikely(se_fl_test(appctx->sedesc, (SE_FL_EOS|SE_FL_ERROR|SE_FL_SHR|SE_FL_SHW)))) {
+		co_skip(sc_oc(sc), co_data(sc_oc(sc)));
+		goto out;
+	}
+
 	/* if stopping was requested, close immediately */
 	if (unlikely(stopping))
 		goto close;
@@ -456,14 +461,6 @@ static void dns_session_io_handler(struct appctx *appctx)
 	if (ds->shutdown)
 		goto close;
 
-	if (unlikely(sc_ic(sc)->flags & CF_SHUTW))
-		goto close;
-
-	/* con closed by server side, we will skip data write and drain data from channel */
-	if ((sc_oc(sc)->flags & CF_SHUTW)) {
-		goto read;
-	}
-
 	/* if the connection is not established, inform the stream that we want
 	 * to be notified whenever the connection completes.
 	 */
@@ -471,7 +468,7 @@ static void dns_session_io_handler(struct appctx *appctx)
 		applet_need_more_data(appctx);
 		se_need_remote_conn(appctx->sedesc);
 		applet_have_more_data(appctx);
-		return;
+		goto out;
 	}
 
 	HA_RWLOCK_WRLOCK(DNS_LOCK, &ring->lock);
@@ -493,147 +490,146 @@ static void dns_session_io_handler(struct appctx *appctx)
 		HA_ATOMIC_INC(b_orig(buf) + ds->ofs);
 	}
 
-	/* in this loop, ofs always points to the counter byte that precedes
-	 * the message so that we can take our reference there if we have to
-	 * stop before the end (ret=0).
+	/* we were already there, adjust the offset to be relative to
+	 * the buffer's head and remove us from the counter.
 	 */
-	if (sc_opposite(sc)->state == SC_ST_EST) {
-		/* we were already there, adjust the offset to be relative to
-		 * the buffer's head and remove us from the counter.
-		 */
-		ofs = ds->ofs - b_head_ofs(buf);
-		if (ds->ofs < b_head_ofs(buf))
-			ofs += b_size(buf);
+	ofs = ds->ofs - b_head_ofs(buf);
+	if (ds->ofs < b_head_ofs(buf))
+		ofs += b_size(buf);
 
-		BUG_ON(ofs >= buf->size);
-		HA_ATOMIC_DEC(b_peek(buf, ofs));
+	BUG_ON(ofs >= buf->size);
+	HA_ATOMIC_DEC(b_peek(buf, ofs));
 
-		ret = 1;
-		while (ofs + 1 < b_data(buf)) {
-			struct dns_query *query;
-			uint16_t original_qid;
-			uint16_t new_qid;
+	/* in following loop, ofs always points to the counter byte that
+	 * precedes the message so that we can take our reference there if we
+	 * have to stop before the end (ret=0).
+	 */
+	ret = 1;
+	while (ofs + 1 < b_data(buf)) {
+		struct dns_query *query;
+		uint16_t original_qid;
+		uint16_t new_qid;
 
-			cnt = 1;
-			len = b_peek_varint(buf, ofs + cnt, &msg_len);
-			if (!len)
-				break;
-			cnt += len;
-			BUG_ON(msg_len + ofs + cnt + 1 > b_data(buf));
+		cnt = 1;
+		len = b_peek_varint(buf, ofs + cnt, &msg_len);
+		if (!len)
+			break;
+		cnt += len;
+		BUG_ON(msg_len + ofs + cnt + 1 > b_data(buf));
 
-			/* retrieve available room on output channel */
-			available_room = channel_recv_max(sc_ic(sc));
+		/* retrieve available room on output channel */
+		available_room = channel_recv_max(sc_ic(sc));
 
-			/* tx_msg_offset null means we are at the start of a new message */
-			if (!ds->tx_msg_offset) {
-				uint16_t slen;
+		/* tx_msg_offset null means we are at the start of a new message */
+		if (!ds->tx_msg_offset) {
+			uint16_t slen;
 
-				/* check if there is enough room to put message len and query id */
-				if (available_room < sizeof(slen) + sizeof(new_qid)) {
-					sc_need_room(sc);
-					ret = 0;
-					break;
-				}
-
-				/* put msg len into then channel */
-				slen = (uint16_t)msg_len;
-				slen = htons(slen);
-				applet_putblk(appctx, (char *)&slen, sizeof(slen));
-				available_room -= sizeof(slen);
-
-				/* backup original query id */
-				len = b_getblk(buf, (char *)&original_qid, sizeof(original_qid), ofs + cnt);
-				if (!len) {
-					/* should never happen since messages are atomically
-					 * written into ring
-					 */
-					ret = 0;
-					break;
-				}
-
-				/* generates new query id */
-				new_qid = ++ds->query_counter;
-				new_qid = htons(new_qid);
-
-				/* put new query id into the channel */
-				applet_putblk(appctx, (char *)&new_qid, sizeof(new_qid));
-				available_room -= sizeof(new_qid);
-
-				/* keep query id mapping */
-
-				query = pool_alloc(dns_query_pool);
-				if (query) {
-					query->qid.key = new_qid;
-					query->original_qid = original_qid;
-					query->expire = tick_add(now_ms, 5000);
-					LIST_INIT(&query->list);
-					if (LIST_ISEMPTY(&ds->queries)) {
-						/* enable task to handle expire */
-						ds->task_exp->expire = query->expire;
-						/* ensure this will be executed by the same
-						 * thread than ds_session_release
-						 * to ensure session_release is free
-						 * to destroy the task */
-						task_queue(ds->task_exp);
-					}
-					LIST_APPEND(&ds->queries, &query->list);
-					eb32_insert(&ds->query_ids, &query->qid);
-					ds->onfly_queries++;
-				}
-
-				/* update the tx_offset to handle output in 16k streams */
-				ds->tx_msg_offset = sizeof(original_qid);
-
-			}
-
-			/* check if it remains available room on output chan */
-			if (unlikely(!available_room)) {
+			/* check if there is enough room to put message len and query id */
+			if (available_room < sizeof(slen) + sizeof(new_qid)) {
 				sc_need_room(sc);
 				ret = 0;
 				break;
 			}
 
-			chunk_reset(&trash);
-			if ((msg_len - ds->tx_msg_offset) > available_room) {
-				/* remaining msg data is too large to be written in output channel at one time */
+			/* put msg len into then channel */
+			slen = (uint16_t)msg_len;
+			slen = htons(slen);
+			applet_putblk(appctx, (char *)&slen, sizeof(slen));
+			available_room -= sizeof(slen);
 
-				len = b_getblk(buf, trash.area, available_room, ofs + cnt + ds->tx_msg_offset);
-
-				/* update offset to complete mesg forwarding later */
-				ds->tx_msg_offset += len;
-			}
-			else {
-				/* remaining msg data can be written in output channel at one time */
-				len = b_getblk(buf, trash.area, msg_len - ds->tx_msg_offset, ofs + cnt + ds->tx_msg_offset);
-
-				/* reset tx_msg_offset to mark forward fully processed */
-				ds->tx_msg_offset = 0;
-			}
-			trash.data += len;
-
-			if (applet_putchk(appctx, &trash) == -1) {
-				/* should never happen since we
-				 * check available_room is large
-				 * enough here.
+			/* backup original query id */
+			len = b_getblk(buf, (char *)&original_qid, sizeof(original_qid), ofs + cnt);
+			if (!len) {
+				/* should never happen since messages are atomically
+				 * written into ring
 				 */
 				ret = 0;
 				break;
 			}
 
-			if (ds->tx_msg_offset) {
-				/* msg was not fully processed, we must  be awake to drain pending data */
+			/* generates new query id */
+			new_qid = ++ds->query_counter;
+			new_qid = htons(new_qid);
 
-				sc_need_room(sc);
-				ret = 0;
-				break;
+			/* put new query id into the channel */
+			applet_putblk(appctx, (char *)&new_qid, sizeof(new_qid));
+			available_room -= sizeof(new_qid);
+
+			/* keep query id mapping */
+
+			query = pool_alloc(dns_query_pool);
+			if (query) {
+				query->qid.key = new_qid;
+				query->original_qid = original_qid;
+				query->expire = tick_add(now_ms, 5000);
+				LIST_INIT(&query->list);
+				if (LIST_ISEMPTY(&ds->queries)) {
+					/* enable task to handle expire */
+					ds->task_exp->expire = query->expire;
+					/* ensure this will be executed by the same
+					 * thread than ds_session_release
+					 * to ensure session_release is free
+					 * to destroy the task */
+					task_queue(ds->task_exp);
+				}
+				LIST_APPEND(&ds->queries, &query->list);
+				eb32_insert(&ds->query_ids, &query->qid);
+				ds->onfly_queries++;
 			}
-			/* switch to next message */
-			ofs += cnt + msg_len;
+
+			/* update the tx_offset to handle output in 16k streams */
+			ds->tx_msg_offset = sizeof(original_qid);
+
 		}
 
-		HA_ATOMIC_INC(b_peek(buf, ofs));
-		ds->ofs = b_peek_ofs(buf, ofs);
+		/* check if it remains available room on output chan */
+		if (unlikely(!available_room)) {
+			sc_need_room(sc);
+			ret = 0;
+			break;
+		}
+
+		chunk_reset(&trash);
+		if ((msg_len - ds->tx_msg_offset) > available_room) {
+			/* remaining msg data is too large to be written in output channel at one time */
+
+			len = b_getblk(buf, trash.area, available_room, ofs + cnt + ds->tx_msg_offset);
+
+			/* update offset to complete mesg forwarding later */
+			ds->tx_msg_offset += len;
+		}
+		else {
+			/* remaining msg data can be written in output channel at one time */
+			len = b_getblk(buf, trash.area, msg_len - ds->tx_msg_offset, ofs + cnt + ds->tx_msg_offset);
+
+			/* reset tx_msg_offset to mark forward fully processed */
+			ds->tx_msg_offset = 0;
+		}
+		trash.data += len;
+
+		if (applet_putchk(appctx, &trash) == -1) {
+			/* should never happen since we
+			 * check available_room is large
+			 * enough here.
+			 */
+			ret = 0;
+			break;
+		}
+
+		if (ds->tx_msg_offset) {
+			/* msg was not fully processed, we must  be awake to drain pending data */
+
+			sc_need_room(sc);
+			ret = 0;
+			break;
+		}
+		/* switch to next message */
+		ofs += cnt + msg_len;
 	}
+
+	HA_ATOMIC_INC(b_peek(buf, ofs));
+	ds->ofs = b_peek_ofs(buf, ofs);
+
 	HA_RWLOCK_RDUNLOCK(DNS_LOCK, &ring->lock);
 
 	if (ret) {
@@ -645,14 +641,11 @@ static void dns_session_io_handler(struct appctx *appctx)
 		applet_have_no_more_data(appctx);
 	}
 
-read:
-
 	/* if session is not a waiter it means there is no committed
 	 * message into rx_buf and we are free to use it
 	 * Note: we need a load barrier here to not miss the
 	 * delete from the list
 	 */
-
 	__ha_barrier_load();
 	if (!LIST_INLIST_ATOMIC(&ds->waiter)) {
 		while (1) {
@@ -661,30 +654,35 @@ read:
 			struct dns_query *query;
 
 			if (!ds->rx_msg.len) {
-				/* next message len is not fully available into the channel */
-				if (co_data(sc_oc(sc)) < 2)
-					break;
-
 				/* retrieve message len */
-				co_getblk(sc_oc(sc), (char *)&msg_len, 2, 0);
+				ret = co_getblk(sc_oc(sc), (char *)&msg_len, 2, 0);
+				if (ret <= 0) {
+					if (ret == -1)
+						goto error;
+					applet_need_more_data(appctx);
+					break;
+				}
 
 				/* mark as consumed */
 				co_skip(sc_oc(sc), 2);
 
 				/* store message len */
 				ds->rx_msg.len = ntohs(msg_len);
-			}
-
-			if (!co_data(sc_oc(sc))) {
-				/* we need more data but nothing is available */
-				break;
+				if (!ds->rx_msg.len)
+					continue;
 			}
 
 			if (co_data(sc_oc(sc)) + ds->rx_msg.offset < ds->rx_msg.len) {
 				/* message only partially available */
 
 				/* read available data */
-				co_getblk(sc_oc(sc), ds->rx_msg.area + ds->rx_msg.offset, co_data(sc_oc(sc)), 0);
+				ret = co_getblk(sc_oc(sc), ds->rx_msg.area + ds->rx_msg.offset, co_data(sc_oc(sc)), 0);
+				if (ret <= 0) {
+					if (ret == -1)
+						goto error;
+					applet_need_more_data(appctx);
+					break;
+				}
 
 				/* update message offset */
 				ds->rx_msg.offset += co_data(sc_oc(sc));
@@ -693,13 +691,20 @@ read:
 				co_skip(sc_oc(sc), co_data(sc_oc(sc)));
 
 				/* we need to wait for more data */
+				applet_need_more_data(appctx);
 				break;
 			}
 
 			/* enough data is available into the channel to read the message until the end */
 
 			/* read from the channel until the end of the message */
-			co_getblk(sc_oc(sc), ds->rx_msg.area + ds->rx_msg.offset, ds->rx_msg.len - ds->rx_msg.offset, 0);
+			ret = co_getblk(sc_oc(sc), ds->rx_msg.area + ds->rx_msg.offset, ds->rx_msg.len - ds->rx_msg.offset, 0);
+			if (ret <= 0) {
+				if (ret == -1)
+					goto error;
+				applet_need_more_data(appctx);
+				break;
+			}
 
 			/* consume all data until the end of the message from the channel */
 			co_skip(sc_oc(sc), ds->rx_msg.len - ds->rx_msg.offset);
@@ -745,20 +750,18 @@ read:
 
 			break;
 		}
-
-		if (!LIST_INLIST(&ds->waiter)) {
-			/* there is no more pending data to read and the con was closed by the server side */
-			if (!co_data(sc_oc(sc)) && (sc_oc(sc)->flags & CF_SHUTW)) {
-				goto close;
-			}
-		}
-
 	}
 
+out:
 	return;
+
 close:
-	sc_shutw(sc);
-	sc_shutr(sc);
+	se_fl_set(appctx->sedesc, SE_FL_EOS|SE_FL_EOI);
+	goto out;
+
+error:
+	se_fl_set(appctx->sedesc, SE_FL_ERROR);
+	goto out;
 }
 
 void dns_queries_flush(struct dns_session *ds)
@@ -820,14 +823,13 @@ static int dns_session_init(struct appctx *appctx)
 
 	s = appctx_strm(appctx);
 	s->scb->dst = addr;
-	s->scb->flags |= SC_FL_NOLINGER;
+	s->scb->flags |= (SC_FL_RCV_ONCE|SC_FL_NOLINGER);
 	s->target = &ds->dss->srv->obj_type;
 	s->flags = SF_ASSIGNED;
 
 	s->do_log = NULL;
 	s->uniq_id = 0;
 
-	s->res.flags |= CF_READ_DONTWAIT;
 	applet_expect_no_data(appctx);
 	ds->appctx = appctx;
 	return 0;

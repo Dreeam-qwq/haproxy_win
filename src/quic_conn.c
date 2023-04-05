@@ -32,6 +32,7 @@
 #include <haproxy/debug.h>
 #include <haproxy/tools.h>
 #include <haproxy/ticks.h>
+#include <haproxy/xxhash.h>
 
 #include <haproxy/applet-t.h>
 #include <haproxy/cli.h>
@@ -221,15 +222,17 @@ DECLARE_POOL(pool_head_quic_frame, "quic_frame", sizeof(struct quic_frame));
 DECLARE_STATIC_POOL(pool_head_quic_arng, "quic_arng", sizeof(struct quic_arng_node));
 
 static struct quic_connection_id *new_quic_cid(struct eb_root *root,
-                                               struct quic_conn *qc);
+                                               struct quic_conn *qc,
+                                               const struct quic_cid *odcid,
+                                               const struct sockaddr_storage *saddr);
 static struct quic_tx_packet *qc_build_pkt(unsigned char **pos, const unsigned char *buf_end,
                                            struct quic_enc_level *qel, struct quic_tls_ctx *ctx,
                                            struct list *frms, struct quic_conn *qc,
                                            const struct quic_version *ver, size_t dglen, int pkt_type,
                                            int force_ack, int padding, int probe, int cc, int *err);
 struct task *quic_conn_app_io_cb(struct task *t, void *context, unsigned int state);
-static void qc_idle_timer_do_rearm(struct quic_conn *qc);
-static void qc_idle_timer_rearm(struct quic_conn *qc, int read);
+static void qc_idle_timer_do_rearm(struct quic_conn *qc, int arm_ack);
+static void qc_idle_timer_rearm(struct quic_conn *qc, int read, int arm_ack);
 static int qc_conn_alloc_ssl_ctx(struct quic_conn *qc);
 static int quic_conn_init_timer(struct quic_conn *qc);
 static int quic_conn_init_idle_timer_task(struct quic_conn *qc);
@@ -702,10 +705,8 @@ static void quic_trace(enum trace_level level, uint64_t mask, const struct trace
 		if (mask & QUIC_EV_CONN_PSTRM) {
 			const struct quic_frame *frm = a2;
 
-			if (frm) {
-				chunk_appendf(&trace_buf, " frm@%p", frm);
+			if (frm)
 				chunk_frm_appendf(&trace_buf, frm);
-			}
 		}
 
 		if (mask & QUIC_EV_CONN_ELEVELSEL) {
@@ -727,6 +728,18 @@ static void quic_trace(enum trace_level level, uint64_t mask, const struct trace
 
 			if (dgram)
 				chunk_appendf(&trace_buf, " dgram.len=%zu", dgram->len);
+		}
+
+		if (mask & QUIC_EV_CONN_IDLE_TIMER) {
+			if (tick_isset(qc->ack_expire))
+				chunk_appendf(&trace_buf, " ack_expire=%ums",
+				              TICKS_TO_MS(tick_remain(now_ms, qc->ack_expire)));
+			if (tick_isset(qc->idle_expire))
+				chunk_appendf(&trace_buf, " idle_expire=%ums",
+				              TICKS_TO_MS(tick_remain(now_ms, qc->idle_expire)));
+			if (qc->idle_timer_task && tick_isset(qc->idle_timer_task->expire))
+				chunk_appendf(&trace_buf, " expire=%ums",
+				              TICKS_TO_MS(tick_remain(now_ms, qc->idle_timer_task->expire)));
 		}
 	}
 	if (mask & QUIC_EV_CONN_LPKT) {
@@ -779,6 +792,7 @@ static inline int quic_peer_validated_addr(struct quic_conn *qc)
 void qc_kill_conn(struct quic_conn *qc)
 {
 	TRACE_ENTER(QUIC_EV_CONN_KILL, qc);
+	TRACE_PROTO("killing the connection", QUIC_EV_CONN_KILL, qc);
 	qc->flags |= QUIC_FL_CONN_TO_KILL;
 	task_wakeup(qc->idle_timer_task, TASK_WOKEN_OTHER);
 	TRACE_LEAVE(QUIC_EV_CONN_KILL, qc);
@@ -793,8 +807,8 @@ static inline void qc_set_timer(struct quic_conn *qc)
 	unsigned int pto;
 	int handshake_confirmed;
 
-	TRACE_ENTER(QUIC_EV_CONN_STIMER, qc,
-	            NULL, NULL, &qc->path->ifae_pkts);
+	TRACE_ENTER(QUIC_EV_CONN_STIMER, qc);
+	TRACE_PROTO("set timer", QUIC_EV_CONN_STIMER, qc, NULL, NULL, &qc->path->ifae_pkts);
 
 	pktns = NULL;
 	if (!qc->timer_task) {
@@ -842,7 +856,8 @@ static inline void qc_set_timer(struct quic_conn *qc)
 		task_schedule(qc->timer_task, qc->timer);
 	}
  leave:
-	TRACE_LEAVE(QUIC_EV_CONN_STIMER, qc, pktns);
+	TRACE_PROTO("set timer", QUIC_EV_CONN_STIMER, qc, pktns);
+	TRACE_LEAVE(QUIC_EV_CONN_STIMER, qc);
 }
 
 /* Derive new keys and ivs required for Key Update feature for <qc> QUIC
@@ -930,7 +945,8 @@ static int quic_tls_key_update(struct quic_conn *qc)
 
 	ret = 1;
  leave:
-	TRACE_LEAVE(QUIC_EV_CONN_KP, qc, &kp_trace);
+	TRACE_PROTO("key update", QUIC_EV_CONN_KP, qc, &kp_trace);
+	TRACE_LEAVE(QUIC_EV_CONN_KP, qc);
 	return ret;
 }
 
@@ -1746,7 +1762,8 @@ static int quic_stream_try_to_consume(struct quic_conn *qc,
 static inline void qc_treat_acked_tx_frm(struct quic_conn *qc,
                                          struct quic_frame *frm)
 {
-	TRACE_ENTER(QUIC_EV_CONN_PRSAFRM, qc, frm);
+	TRACE_ENTER(QUIC_EV_CONN_PRSAFRM, qc);
+	TRACE_PROTO("RX ack TX frm", QUIC_EV_CONN_PRSAFRM, qc, frm);
 
 	switch (frm->type) {
 	case QUIC_FT_STREAM_8 ... QUIC_FT_STREAM_F:
@@ -2215,7 +2232,7 @@ static inline int qc_parse_ack_frm(struct quic_conn *qc,
 		}
 	}
 
-	TRACE_PROTO("rcvd ack range", QUIC_EV_CONN_PRSAFRM,
+	TRACE_PROTO("RX ack range", QUIC_EV_CONN_PRSAFRM,
 	            qc, NULL, &largest, &smallest);
 	do {
 		uint64_t gap, ack_range;
@@ -2253,7 +2270,7 @@ static inline int qc_parse_ack_frm(struct quic_conn *qc,
 		/* Next range */
 		smallest = largest - ack_range;
 
-		TRACE_PROTO("rcvd next ack range", QUIC_EV_CONN_PRSAFRM,
+		TRACE_PROTO("RX next ack range", QUIC_EV_CONN_PRSAFRM,
 		            qc, NULL, &largest, &smallest);
 	} while (1);
 
@@ -2318,7 +2335,7 @@ int ssl_sock_get_alpn(const struct connection *conn, void *xprt_ctx,
  * MUST be called after having received the remote transport parameters which
  * are parsed when the TLS callback for the ClientHello message is called upon
  * SSL_do_handshake() calls, not necessarily at the first time as this TLS
- * message may be splitted between packets
+ * message may be split between packets
  * Return 1 if succeeded, 0 if not.
  */
 static int qc_conn_finalize(struct quic_conn *qc, int server)
@@ -2640,7 +2657,7 @@ static void qc_prep_fast_retrans(struct quic_conn *qc,
 		p = eb64_entry(node, struct quic_tx_packet, pn_node);
 		node = eb64_next(node);
 		/* Skip the empty and coalesced packets */
-		TRACE_PRINTF(TRACE_LEVEL_DEVELOPER, QUIC_EV_CONN_SPPKTS, qc, 0, 0, 0,
+		TRACE_PRINTF(TRACE_LEVEL_PROTO, QUIC_EV_CONN_SPPKTS, qc, 0, 0, 0,
 		             "--> pn=%llu (%d %d %d)", (ull)p->pn_node.key,
 		             LIST_ISEMPTY(&p->frms), !!(p->flags & QUIC_FL_TX_PACKET_COALESCED),
 		             qc_pkt_with_only_acked_frms(p));
@@ -2663,7 +2680,7 @@ static void qc_prep_fast_retrans(struct quic_conn *qc,
 		goto leave;
 	}
 
-	TRACE_DEVEL("duplicating packet", QUIC_EV_CONN_SPPKTS, qc, pkt);
+	TRACE_PROTO("duplicating packet", QUIC_EV_CONN_SPPKTS, qc, pkt);
 	qc_dup_pkt_frms(qc, &pkt->frms, frms);
 	if (frms == frms1 && frms2) {
 		frms = frms2;
@@ -2702,7 +2719,7 @@ static void qc_prep_hdshk_fast_retrans(struct quic_conn *qc,
 		struct quic_tx_packet *p;
 
 		p = eb64_entry(node, struct quic_tx_packet, pn_node);
-		TRACE_PRINTF(TRACE_LEVEL_DEVELOPER, QUIC_EV_CONN_SPPKTS, qc, 0, 0, 0,
+		TRACE_PRINTF(TRACE_LEVEL_PROTO, QUIC_EV_CONN_SPPKTS, qc, 0, 0, 0,
 		             "--> pn=%llu (%d %d)", (ull)p->pn_node.key,
 		             LIST_ISEMPTY(&p->frms), !!(p->flags & QUIC_FL_TX_PACKET_COALESCED));
 		if (!LIST_ISEMPTY(&p->frms) && !(p->flags & QUIC_FL_TX_PACKET_COALESCED) &&
@@ -2737,7 +2754,7 @@ static void qc_prep_hdshk_fast_retrans(struct quic_conn *qc,
 
 	/* No risk to loop here, #packet per datagram is bounded */
  requeue:
-	TRACE_DEVEL("duplicating packet", QUIC_EV_CONN_PRSAFRM, qc, NULL, &pkt->pn_node.key);
+	TRACE_PROTO("duplicating packet", QUIC_EV_CONN_PRSAFRM, qc, NULL, &pkt->pn_node.key);
 	qc_dup_pkt_frms(qc, &pkt->frms, tmp);
 	if (qel == iqel) {
 		if (pkt->next && pkt->next->type == QUIC_PACKET_TYPE_HANDSHAKE) {
@@ -2780,7 +2797,7 @@ static void qc_cc_err_count_inc(struct quic_conn *qc, struct quic_frame *frm)
  * TODO this function is closely related to H3. Its place should be in H3 layer
  * instead of quic-conn but this requires an architecture adjustment.
  *
- * Returns 1 on sucess else 0.
+ * Returns 1 on success else 0.
  */
 static int qc_h3_request_reject(struct quic_conn *qc, uint64_t id)
 {
@@ -3089,7 +3106,6 @@ static int qc_parse_pkt_frms(struct quic_conn *qc, struct quic_rx_packet *pkt,
 			goto leave;
 		}
 
-		TRACE_PROTO("RX frame", QUIC_EV_CONN_PSTRM, qc, &frm);
 		switch (frm.type) {
 		case QUIC_FT_PADDING:
 			break;
@@ -3223,7 +3239,7 @@ static int qc_parse_pkt_frms(struct quic_conn *qc, struct quic_rx_packet *pkt,
 			pool_free(pool_head_quic_connection_id, cid);
 			TRACE_PROTO("CID retired", QUIC_EV_CONN_PSTRM, qc);
 
-			cid = new_quic_cid(&qc->cids, qc);
+			cid = new_quic_cid(&qc->cids, qc, NULL, NULL);
 			if (!cid) {
 				TRACE_ERROR("CID allocation error", QUIC_EV_CONN_IO_CB, qc);
 			}
@@ -3255,7 +3271,7 @@ static int qc_parse_pkt_frms(struct quic_conn *qc, struct quic_rx_packet *pkt,
 				 */
 				qc->flags |= QUIC_FL_CONN_DRAINING|QUIC_FL_CONN_IMMEDIATE_CLOSE;
 				qc_detach_th_ctx_list(qc, 1);
-				qc_idle_timer_do_rearm(qc);
+				qc_idle_timer_do_rearm(qc, 0);
 				qc_notify_close(qc);
 			}
 			break;
@@ -3370,8 +3386,7 @@ static void qc_txb_store(struct buffer *buf, uint16_t length,
 static int qc_may_build_pkt(struct quic_conn *qc, struct list *frms,
                             struct quic_enc_level *qel, int cc, int probe, int force_ack)
 {
-	unsigned int must_ack = force_ack ||
-		(LIST_ISEMPTY(frms) && (qel->pktns->flags & QUIC_FL_PKTNS_ACK_REQUIRED));
+	unsigned int must_ack = force_ack || (qc->flags & QUIC_FL_CONN_ACK_TIMER_FIRED);
 
 	/* Do not build any more packet if the TX secrets are not available or
 	 * if there is nothing to send, i.e. if no CONNECTION_CLOSE or ACK are required
@@ -3523,7 +3538,7 @@ static int qc_prep_pkts(struct quic_conn *qc, struct buffer *buf,
 			(qel == &qc->els[QUIC_TLS_ENC_LEVEL_INITIAL] ||
 			 qel == &qc->els[QUIC_TLS_ENC_LEVEL_HANDSHAKE]);
 
-		TRACE_POINT(QUIC_EV_CONN_PHPKTS, qc, qel);
+		TRACE_PROTO("TX prep pks", QUIC_EV_CONN_PHPKTS, qc, qel);
 		probe = 0;
 		cc =  qc->flags & QUIC_FL_CONN_IMMEDIATE_CLOSE;
 		/* We do not probe if an immediate close was asked */
@@ -3724,7 +3739,7 @@ int qc_send_ppkts(struct buffer *buf, struct ssl_sock_ctx *ctx)
 		tmpbuf.area = (char *)pos;
 		tmpbuf.size = tmpbuf.data = dglen;
 
-		TRACE_DATA("send dgram", QUIC_EV_CONN_SPPKTS, qc);
+		TRACE_PROTO("TX dgram", QUIC_EV_CONN_SPPKTS, qc);
 		/* If sendto is on error just skip the call to it for the rest
 		 * of the loop but continue to purge the buffer. Data will be
 		 * transmitted when QUIC packets are detected as lost on our
@@ -3775,7 +3790,7 @@ int qc_send_ppkts(struct buffer *buf, struct ssl_sock_ctx *ctx)
 				pkt->pktns->tx.time_of_last_eliciting = time_sent;
 				qc->path->ifae_pkts++;
 				if (qc->flags & QUIC_FL_CONN_IDLE_TIMER_RESTARTED_AFTER_READ)
-					qc_idle_timer_rearm(qc, 0);
+					qc_idle_timer_rearm(qc, 0, 0);
 			}
 			if (!(qc->flags & QUIC_FL_CONN_CLOSING) &&
 			    (pkt->flags & QUIC_FL_TX_PACKET_CC)) {
@@ -3792,7 +3807,7 @@ int qc_send_ppkts(struct buffer *buf, struct ssl_sock_ctx *ctx)
 				 * Rearm the idle timeout only one time when entering closing
 				 * state.
 				 */
-				qc_idle_timer_do_rearm(qc);
+				qc_idle_timer_do_rearm(qc, 0);
 				if (qc->timer_task) {
 					task_destroy(qc->timer_task);
 					qc->timer_task = NULL;
@@ -3802,7 +3817,7 @@ int qc_send_ppkts(struct buffer *buf, struct ssl_sock_ctx *ctx)
 			pkt->pktns->tx.in_flight += pkt->in_flight_len;
 			if (pkt->in_flight_len)
 				qc_set_timer(qc);
-			TRACE_DATA("sent pkt", QUIC_EV_CONN_SPPKTS, qc, pkt);
+			TRACE_PROTO("TX pkt", QUIC_EV_CONN_SPPKTS, qc, pkt);
 			next_pkt = pkt->next;
 			quic_tx_packet_refinc(pkt);
 			eb64_insert(&pkt->pktns->tx.pkts, &pkt->pn_node);
@@ -3871,20 +3886,82 @@ static int quic_stateless_reset_token_init(struct quic_conn *qc,
 	return ret;
 }
 
+/* Generate a CID directly derived from <orig> CID and <addr> address. The CID
+ * is then marked with the current thread ID.
+ *
+ * Returns a new 64-bits CID value.
+ */
+static uint64_t quic_derive_cid(const struct quic_cid *orig,
+                                const struct sockaddr_storage *addr)
+{
+	const struct sockaddr_in *in;
+	const struct sockaddr_in6 *in6;
+	char *buf = trash.area;
+	size_t idx = 0;
+	uint64_t hash;
+
+	/* Prepare buffer for hash using original CID first. */
+	memcpy(buf, orig->data, orig->len);
+	idx += orig->len;
+
+	/* Concatenate client address. */
+	switch (addr->ss_family) {
+	case AF_INET:
+		in = (struct sockaddr_in *)addr;
+
+		memcpy(&buf[idx], &in->sin_addr, sizeof(in->sin_addr));
+		idx += sizeof(in->sin_addr);
+		memcpy(&buf[idx], &in->sin_port, sizeof(in->sin_port));
+		idx += sizeof(in->sin_port);
+		break;
+
+	case AF_INET6:
+		in6 = (struct sockaddr_in6 *)addr;
+
+		memcpy(&buf[idx], &in6->sin6_addr, sizeof(in6->sin6_addr));
+		idx += sizeof(in6->sin6_addr);
+		memcpy(&buf[idx], &in6->sin6_port, sizeof(in6->sin6_port));
+		idx += sizeof(in6->sin6_port);
+		break;
+
+	default:
+		/* TODO to implement */
+		ABORT_NOW();
+		return 0;
+	}
+
+	/* Avoid similar values between multiple haproxy process. */
+	memcpy(&buf[idx], boot_seed, sizeof(boot_seed));
+	idx += sizeof(boot_seed);
+
+	/* Hash the final buffer content. */
+	hash = XXH64(buf, idx, 0);
+
+	/* Mark the current thread id in the CID. */
+	quic_pin_cid_to_tid((uchar *)&hash, tid);
+
+	return hash;
+}
+
 /* Allocate a new CID and attach it to <root> ebtree.
  *
- * The CID is randomly generated in part with the result altered to be
- * associated with the current thread ID. This means this function must only
- * be called by the quic_conn thread.
+ * If <orig> and <addr> params are non null, the new CID value is directly
+ * derived from them. Else a random value is generated. The CID is then marked
+ * with the current thread ID.
  *
  * Returns the new CID if succeeded, NULL if not.
  */
 static struct quic_connection_id *new_quic_cid(struct eb_root *root,
-                                               struct quic_conn *qc)
+                                               struct quic_conn *qc,
+                                               const struct quic_cid *orig,
+                                               const struct sockaddr_storage *addr)
 {
 	struct quic_connection_id *cid;
 
 	TRACE_ENTER(QUIC_EV_CONN_TXPKT, qc);
+
+	/* Caller must set either none or both values. */
+	BUG_ON(!!orig != !!addr);
 
 	cid = pool_alloc(pool_head_quic_connection_id);
 	if (!cid) {
@@ -3893,13 +3970,21 @@ static struct quic_connection_id *new_quic_cid(struct eb_root *root,
 	}
 
 	cid->cid.len = QUIC_HAP_CID_LEN;
-	/* TODO: RAND_bytes() should be replaced */
-	if (RAND_bytes(cid->cid.data, cid->cid.len) != 1) {
-		TRACE_ERROR("RAND_bytes() failed", QUIC_EV_CONN_TXPKT, qc);
-		goto err;
+
+	if (!orig) {
+		/* TODO: RAND_bytes() should be replaced */
+		if (RAND_bytes(cid->cid.data, cid->cid.len) != 1) {
+			TRACE_ERROR("RAND_bytes() failed", QUIC_EV_CONN_TXPKT, qc);
+			goto err;
+		}
+		quic_pin_cid_to_tid(cid->cid.data, tid);
+	}
+	else {
+		/* Derive the new CID value from original CID. */
+		const uint64_t hash = quic_derive_cid(orig, addr);
+		memcpy(cid->cid.data, &hash, sizeof(hash));
 	}
 
-	quic_pin_cid_to_tid(cid->cid.data, tid);
 	if (quic_stateless_reset_token_init(qc, cid) != 1) {
 		TRACE_ERROR("quic_stateless_reset_token_init() failed", QUIC_EV_CONN_TXPKT, qc);
 		goto err;
@@ -3965,7 +4050,7 @@ static int quic_build_post_handshake_frames(struct quic_conn *qc)
 			goto err;
 		}
 
-		cid = new_quic_cid(&qc->cids, qc);
+		cid = new_quic_cid(&qc->cids, qc, NULL, NULL);
 		if (!cid) {
 			qc_frm_free(&frm);
 			TRACE_ERROR("CID allocation error", QUIC_EV_CONN_IO_CB, qc);
@@ -4278,7 +4363,7 @@ static inline void qc_rm_hp_pkts(struct quic_conn *qc, struct quic_enc_level *el
 	app_qel = &qc->els[QUIC_TLS_ENC_LEVEL_APP];
 	/* A server must not process incoming 1-RTT packets before the handshake is complete. */
 	if (el == app_qel && qc_is_listener(qc) && qc->state < QUIC_HS_ST_COMPLETE) {
-		TRACE_DEVEL("hp not removed (handshake not completed)",
+		TRACE_PROTO("RX hp not removed (handshake not completed)",
 		            QUIC_EV_CONN_ELRMHP, qc);
 		goto out;
 	}
@@ -4289,7 +4374,7 @@ static inline void qc_rm_hp_pkts(struct quic_conn *qc, struct quic_enc_level *el
 		tls_ctx = qc_select_tls_ctx(qc, el, pqpkt);
 		if (!qc_do_rm_hp(qc, pqpkt, tls_ctx, el->pktns->rx.largest_pn,
 		                 pqpkt->data + pqpkt->pn_offset, pqpkt->data)) {
-			TRACE_ERROR("hp removing error", QUIC_EV_CONN_ELRMHP, qc);
+			TRACE_ERROR("RX hp removing error", QUIC_EV_CONN_ELRMHP, qc);
 		}
 		else {
 			qc_handle_spin_bit(qc, pqpkt, el);
@@ -4299,7 +4384,7 @@ static inline void qc_rm_hp_pkts(struct quic_conn *qc, struct quic_enc_level *el
 			pqpkt->pn_node.key = pqpkt->pn;
 			eb64_insert(&el->rx.pkts, &pqpkt->pn_node);
 			quic_rx_packet_refinc(pqpkt);
-			TRACE_DEVEL("hp removed", QUIC_EV_CONN_ELRMHP, qc, pqpkt);
+			TRACE_PROTO("RX hp removed", QUIC_EV_CONN_ELRMHP, qc, pqpkt);
 		}
 		LIST_DELETE(&pqpkt->list);
 		quic_rx_packet_refdec(pqpkt);
@@ -4323,7 +4408,7 @@ static inline int qc_treat_rx_crypto_frms(struct quic_conn *qc,
 	struct quic_cstream *cstream = el->cstream;
 	ncb_sz_t data;
 
-	TRACE_ENTER(QUIC_EV_CONN_PHPKTS, qc, el);
+	TRACE_ENTER(QUIC_EV_CONN_PHPKTS, qc);
 
 	BUG_ON(!cstream);
 	ncbuf = &cstream->rx.ncbuf;
@@ -4398,7 +4483,7 @@ int qc_treat_rx_pkts(struct quic_conn *qc, struct quic_enc_level *cur_el,
 				if (pkt->flags & QUIC_FL_RX_PACKET_ACK_ELICITING) {
 					qel->pktns->flags |= QUIC_FL_PKTNS_ACK_REQUIRED;
 					qel->pktns->rx.nb_aepkts_since_last_ack++;
-					qc_idle_timer_rearm(qc, 1);
+					qc_idle_timer_rearm(qc, 1, 1);
 				}
 				if (pkt->pn > largest_pn) {
 					largest_pn = pkt->pn;
@@ -4461,24 +4546,24 @@ static int qc_qel_may_rm_hp(struct quic_conn *qc, struct quic_enc_level *qel)
 
 	/* check if tls secrets are available */
 	if (qel->tls_ctx.flags & QUIC_FL_TLS_SECRETS_DCD) {
-		TRACE_DEVEL("Discarded keys", QUIC_EV_CONN_TRMHP, qc);
+		TRACE_PROTO("Discarded keys", QUIC_EV_CONN_TRMHP, qc);
 		goto cant_rm_hp;
 	}
 
 	if (!quic_tls_has_rx_sec(qel)) {
-		TRACE_DEVEL("non available secrets", QUIC_EV_CONN_TRMHP, qc);
+		TRACE_PROTO("non available secrets", QUIC_EV_CONN_TRMHP, qc);
 		goto cant_rm_hp;
 	}
 
 	if (tel == QUIC_TLS_ENC_LEVEL_APP && qc->state < QUIC_HS_ST_COMPLETE) {
-		TRACE_DEVEL("handshake not complete", QUIC_EV_CONN_TRMHP, qc);
+		TRACE_PROTO("handshake not complete", QUIC_EV_CONN_TRMHP, qc);
 		goto cant_rm_hp;
 	}
 
 	/* check if the connection layer is ready before using app level */
 	if ((tel == QUIC_TLS_ENC_LEVEL_APP || tel == QUIC_TLS_ENC_LEVEL_EARLY_DATA) &&
 	    qc->mux_state == QC_MUX_NULL) {
-		TRACE_DEVEL("connection layer not ready", QUIC_EV_CONN_TRMHP, qc);
+		TRACE_PROTO("connection layer not ready", QUIC_EV_CONN_TRMHP, qc);
 		goto cant_rm_hp;
 	}
 
@@ -4997,7 +5082,8 @@ struct task *quic_conn_io_cb(struct task *t, void *context, unsigned int state)
 	}
 
  out:
-	TRACE_LEAVE(QUIC_EV_CONN_IO_CB, qc, &st, &ssl_err);
+	TRACE_PROTO("ssl error", QUIC_EV_CONN_IO_CB, qc, &st, &ssl_err);
+	TRACE_LEAVE(QUIC_EV_CONN_IO_CB, qc);
 	return t;
 }
 
@@ -5141,7 +5227,8 @@ struct task *qc_process_timer(struct task *task, void *ctx, unsigned int state)
 	struct quic_conn *qc = ctx;
 	struct quic_pktns *pktns;
 
-	TRACE_ENTER(QUIC_EV_CONN_PTIMER, qc,
+	TRACE_ENTER(QUIC_EV_CONN_PTIMER, qc);
+	TRACE_PROTO("process timer", QUIC_EV_CONN_PTIMER, qc,
 	            NULL, NULL, &qc->path->ifae_pkts);
 	task->expire = TICK_ETERNITY;
 	pktns = quic_loss_pktns(qc);
@@ -5211,7 +5298,8 @@ struct task *qc_process_timer(struct task *task, void *ctx, unsigned int state)
 	qc->path->loss.pto_count++;
 
  out:
-	TRACE_LEAVE(QUIC_EV_CONN_PTIMER, qc, pktns);
+	TRACE_PROTO("process timer", QUIC_EV_CONN_PTIMER, qc, pktns);
+	TRACE_LEAVE(QUIC_EV_CONN_PTIMER, qc);
 
 	return task;
 }
@@ -5333,10 +5421,9 @@ static struct quic_conn *qc_new_conn(const struct quic_version *qv, int ipv4,
 		                                      &quic_stats_module);
 		qc->flags |= QUIC_FL_CONN_LISTENER;
 		qc->state = QUIC_HS_ST_SERVER_INITIAL;
-		/* Copy the initial DCID with the address. */
+		/* Copy the client original DCID. */
 		qc->odcid.len = dcid->len;
-		qc->odcid.addrlen = dcid->addrlen;
-		memcpy(qc->odcid.data, dcid->data, dcid->len + dcid->addrlen);
+		memcpy(qc->odcid.data, dcid->data, dcid->len);
 
 		/* copy the packet SCID to reuse it as DCID for sending */
 		if (scid->len)
@@ -5357,8 +5444,13 @@ static struct quic_conn *qc_new_conn(const struct quic_version *qv, int ipv4,
 
 	/* Initialize the next CID sequence number to be used for this connection. */
 	qc->next_cid_seq_num = 0;
-	/* Insert the CID for this connection with 0 as sequence number. */
-	icid = new_quic_cid(&qc->cids, qc);
+	/* Generate the first connection CID. This is derived from the client
+	 * ODCID and address. This allows to retrieve the connection from the
+	 * ODCID without storing it in the CID tree. This is an interesting
+	 * optimization as the client is expected to stop using its ODCID in
+	 * favor of our generated value.
+	 */
+	icid = new_quic_cid(&qc->cids, qc, dcid, peer_addr);
 	if (!icid) {
 		TRACE_ERROR("Could not allocate a new connection ID", QUIC_EV_CONN_INIT, qc);
 		goto err;
@@ -5435,6 +5527,10 @@ static struct quic_conn *qc_new_conn(const struct quic_version *qv, int ipv4,
 	                                    qc->scid.data, qc->scid.len, token_odcid))
 		goto err;
 
+	/* Initialize the idle timeout of the connection at the "max_idle_timeout"
+	 * value from local transport parameters.
+	 */
+	qc->max_idle_timeout = qc->rx.params.max_idle_timeout;
 	qc->wait_event.tasklet = tasklet_new();
 	if (!qc->wait_event.tasklet) {
 		TRACE_ERROR("tasklet_new() failed", QUIC_EV_CONN_TXPKT);
@@ -5541,7 +5637,6 @@ void quic_conn_release(struct quic_conn *qc)
 		tasklet_free(qc->wait_event.tasklet);
 
 	/* remove the connection from receiver cids trees */
-	ebmb_delete(&qc->odcid_node);
 	ebmb_delete(&qc->scid_node);
 	free_quic_conn_cids(qc);
 
@@ -5602,26 +5697,43 @@ static int quic_conn_init_timer(struct quic_conn *qc)
 	return ret;
 }
 
-/* Rearm the idle timer for <qc> QUIC connection. */
-static void qc_idle_timer_do_rearm(struct quic_conn *qc)
+/* Rearm the idle timer or the ack timer (if not already armde) for <qc> QUIC
+ * connection. */
+static void qc_idle_timer_do_rearm(struct quic_conn *qc, int arm_ack)
 {
 	unsigned int expire;
 
 	if (stopping && qc->flags & (QUIC_FL_CONN_CLOSING|QUIC_FL_CONN_DRAINING)) {
-		TRACE_STATE("executing idle timer immediately on stopping", QUIC_EV_CONN_IDLE_TIMER, qc);
+		TRACE_PROTO("executing idle timer immediately on stopping", QUIC_EV_CONN_IDLE_TIMER, qc);
+		qc->ack_expire = TICK_ETERNITY;
 		task_wakeup(qc->idle_timer_task, TASK_WOKEN_MSG);
 	}
 	else {
 		expire = QUIC_MAX(3 * quic_pto(qc), qc->max_idle_timeout);
-		qc->idle_timer_task->expire = tick_add(now_ms, MS_TO_TICKS(expire));
-		task_queue(qc->idle_timer_task);
+		qc->idle_expire = tick_add(now_ms, MS_TO_TICKS(expire));
+		if (arm_ack) {
+			/* Arm the ack timer only if not already armed. */
+			if (!tick_isset(qc->ack_expire)) {
+				qc->ack_expire = tick_add(now_ms, MS_TO_TICKS(QUIC_ACK_DELAY));
+				qc->idle_timer_task->expire = qc->ack_expire;
+				task_queue(qc->idle_timer_task);
+				TRACE_PROTO("ack timer armed", QUIC_EV_CONN_IDLE_TIMER, qc);
+			}
+		}
+		else {
+			qc->idle_timer_task->expire = tick_first(qc->ack_expire, qc->idle_expire);
+			task_queue(qc->idle_timer_task);
+			TRACE_PROTO("idle timer armed", QUIC_EV_CONN_IDLE_TIMER, qc);
+		}
 	}
 }
 
-/* Rearm the idle timer for <qc> QUIC connection depending on <read> boolean
- * which is set to 1 when receiving a packet , and 0 when sending packet
+/* Rearm the idle timer or ack timer for <qc> QUIC connection depending on <read>
+ * and <arm_ack> booleans. The former is set to 1 when receiving a packet ,
+ * and 0 when sending packet. <arm_ack> is set to 1 if this is the ack timer
+ * which must be rearmed.
  */
-static void qc_idle_timer_rearm(struct quic_conn *qc, int read)
+static void qc_idle_timer_rearm(struct quic_conn *qc, int read, int arm_ack)
 {
 	TRACE_ENTER(QUIC_EV_CONN_IDLE_TIMER, qc);
 
@@ -5631,7 +5743,7 @@ static void qc_idle_timer_rearm(struct quic_conn *qc, int read)
 	else {
 		qc->flags &= ~QUIC_FL_CONN_IDLE_TIMER_RESTARTED_AFTER_READ;
 	}
-	qc_idle_timer_do_rearm(qc);
+	qc_idle_timer_do_rearm(qc, arm_ack);
 
 	TRACE_LEAVE(QUIC_EV_CONN_IDLE_TIMER, qc);
 }
@@ -5645,6 +5757,20 @@ struct task *qc_idle_timer_task(struct task *t, void *ctx, unsigned int state)
 
 	TRACE_ENTER(QUIC_EV_CONN_IDLE_TIMER, qc);
 
+	if ((state & TASK_WOKEN_ANY) == TASK_WOKEN_TIMER && !tick_is_expired(t->expire, now_ms))
+		goto requeue;
+
+	if (tick_is_expired(qc->ack_expire, now_ms)) {
+		TRACE_PROTO("ack timer expired", QUIC_EV_CONN_IDLE_TIMER, qc);
+		qc->ack_expire = TICK_ETERNITY;
+		/* Note that ->idle_expire is always set. */
+		t->expire = qc->idle_expire;
+		qc->flags |= QUIC_FL_CONN_ACK_TIMER_FIRED;
+		tasklet_wakeup(qc->wait_event.tasklet);
+		goto requeue;
+	}
+
+	TRACE_PROTO("idle timer task running", QUIC_EV_CONN_IDLE_TIMER, qc);
 	/* Notify the MUX before settings QUIC_FL_CONN_EXP_TIMER or the MUX
 	 * might free the quic-conn too early via quic_close().
 	 */
@@ -5654,8 +5780,10 @@ struct task *qc_idle_timer_task(struct task *t, void *ctx, unsigned int state)
 	 * responsible to call quic_close to release it.
 	 */
 	qc->flags |= QUIC_FL_CONN_EXP_TIMER;
-	if (qc->mux_state != QC_MUX_READY)
+	if (qc->mux_state != QC_MUX_READY) {
 		quic_conn_release(qc);
+		qc = NULL;
+	}
 
 	/* TODO if the quic-conn cannot be freed because of the MUX, we may at
 	 * least clean some parts of it such as the tasklet.
@@ -5663,12 +5791,17 @@ struct task *qc_idle_timer_task(struct task *t, void *ctx, unsigned int state)
 
 	if (!(qc_flags & QUIC_FL_CONN_HALF_OPEN_CNT_DECREMENTED)) {
 		qc_flags |= QUIC_FL_CONN_HALF_OPEN_CNT_DECREMENTED;
-		TRACE_DEVEL("dec half open counter", QUIC_EV_CONN_SSLALERT, qc);
+		TRACE_DEVEL("dec half open counter", QUIC_EV_CONN_IDLE_TIMER, qc);
 		HA_ATOMIC_DEC(&prx_counters->half_open_conn);
 	}
 
+ leave:
 	TRACE_LEAVE(QUIC_EV_CONN_IDLE_TIMER, qc);
 	return NULL;
+
+ requeue:
+	TRACE_LEAVE(QUIC_EV_CONN_IDLE_TIMER, qc);
+	return t;
 }
 
 /* Initialize the idle timeout task for <qc>.
@@ -5688,7 +5821,8 @@ static int quic_conn_init_idle_timer_task(struct quic_conn *qc)
 
 	qc->idle_timer_task->process = qc_idle_timer_task;
 	qc->idle_timer_task->context = qc;
-	qc_idle_timer_rearm(qc, 1);
+	qc->ack_expire = TICK_ETERNITY;
+	qc_idle_timer_rearm(qc, 1, 0);
 	task_queue(qc->idle_timer_task);
 
 	ret = 1;
@@ -5840,7 +5974,7 @@ static inline int qc_try_rm_hp(struct quic_conn *qc,
 			goto out;
 		}
 
-		TRACE_PROTO("hp not removed", QUIC_EV_CONN_TRMHP, qc, pkt);
+		TRACE_PROTO("RX hp not removed", QUIC_EV_CONN_TRMHP, qc, pkt);
 		LIST_APPEND(&qel->rx.pqpkts, &pkt->list);
 		quic_rx_packet_refinc(pkt);
 	}
@@ -6327,9 +6461,9 @@ static int send_retry(int fd, struct sockaddr_storage *addr,
 	return !ret;
 }
 
-/* Retrieve a quic_conn instance from the <pkt> DCID field. If the packet is of
- * type INITIAL, the ODCID tree is first used. In this case, <saddr> is
- * concatenated to the <pkt> DCID field.
+/* Retrieve a quic_conn instance from the <pkt> DCID field. If the packet is an
+ * INITIAL or 0RTT type, we may have to use client address <saddr> if an ODCID
+ * is used.
  *
  * Returns the instance or NULL if not found.
  */
@@ -6344,38 +6478,24 @@ static struct quic_conn *retrieve_qc_conn_from_cid(struct quic_rx_packet *pkt,
 
 	TRACE_ENTER(QUIC_EV_CONN_RXPKT);
 
-	/* Look first into ODCIDs tree for INITIAL/0-RTT packets. */
-	if (pkt->type == QUIC_PACKET_TYPE_INITIAL ||
-	    pkt->type == QUIC_PACKET_TYPE_0RTT) {
-		/* DCIDs of first packets coming from multiple clients may have
-		 * the same values. Let's distinguish them by concatenating the
-		 * socket addresses.
-		 */
-		quic_cid_saddr_cat(&pkt->dcid, saddr);
-		node = ebmb_lookup(&quic_dghdlrs[tid].odcids, pkt->dcid.data,
-		                   pkt->dcid.len + pkt->dcid.addrlen);
-		if (node) {
-			qc = ebmb_entry(node, struct quic_conn, odcid_node);
-			goto end;
-		}
+	/* First look into DCID tree. */
+	node = ebmb_lookup(&quic_dghdlrs[tid].cids, pkt->dcid.data, pkt->dcid.len);
+
+	/* If not found on an Initial/0-RTT packet, it could be because an
+	 * ODCID is reused by the client. Calculate the derived CID value to
+	 * retrieve it from the DCID tree.
+	 */
+	if (!node && (pkt->type == QUIC_PACKET_TYPE_INITIAL ||
+	     pkt->type == QUIC_PACKET_TYPE_0RTT)) {
+		uint64_t hash = quic_derive_cid(&pkt->dcid, saddr);
+		node = ebmb_lookup(&quic_dghdlrs[tid].cids, &hash, sizeof(hash));
 	}
 
-	/* Look into DCIDs tree for non-INITIAL/0-RTT packets. This may be used
-	 * also for INITIAL/0-RTT non-first packets with the final DCID in
-	 * used.
-	 */
-	node = ebmb_lookup(&quic_dghdlrs[tid].cids, pkt->dcid.data, pkt->dcid.len);
 	if (!node)
 		goto end;
 
 	id = ebmb_entry(node, struct quic_connection_id, node);
 	qc = id->qc;
-
-	/* If found in DCIDs tree, remove the quic_conn from the ODCIDs tree.
-	 * If already done, this is a noop.
-	 */
-	if (qc)
-		ebmb_delete(&qc->odcid_node);
 
  end:
 	TRACE_LEAVE(QUIC_EV_CONN_RXPKT, qc);
@@ -6565,13 +6685,10 @@ static struct quic_conn *quic_rx_pkt_retrieve_conn(struct quic_rx_packet *pkt,
 				goto err;
 
 			HA_ATOMIC_INC(&prx_counters->half_open_conn);
-			/* Insert the DCID the QUIC client has chosen (only for listeners) */
-			ebmb_insert(&quic_dghdlrs[tid].odcids, &qc->odcid_node,
-			            qc->odcid.len + qc->odcid.addrlen);
 		}
 	}
 	else if (!qc) {
-		TRACE_PROTO("No connection on a non Initial packet", QUIC_EV_CONN_LPKT, NULL, NULL, NULL, pkt->version);
+		TRACE_PROTO("RX non Initial pkt without connection", QUIC_EV_CONN_LPKT, NULL, NULL, NULL, pkt->version);
 		if (global.cluster_secret && !send_stateless_reset(l, &dgram->saddr, pkt))
 			TRACE_ERROR("stateless reset not sent", QUIC_EV_CONN_LPKT, qc);
 		goto err;
@@ -6755,7 +6872,7 @@ static int quic_rx_pkt_parse(struct quic_rx_packet *pkt,
 		 */
 		if (pkt->type == QUIC_PACKET_TYPE_INITIAL &&
 		    dgram->len < QUIC_INITIAL_PACKET_MINLEN) {
-			TRACE_PROTO("Too short datagram with an Initial packet", QUIC_EV_CONN_LPKT);
+			TRACE_PROTO("RX too short datagram with an Initial packet", QUIC_EV_CONN_LPKT);
 			HA_ATOMIC_INC(&prx_counters->too_short_initial_dgram);
 			goto drop;
 		}
@@ -6765,14 +6882,14 @@ static int quic_rx_pkt_parse(struct quic_rx_packet *pkt,
 		 * datagram.
 		 */
 		if (pkt->type == QUIC_PACKET_TYPE_0RTT && !l->bind_conf->ssl_conf.early_data) {
-			TRACE_PROTO("0-RTT packet not supported", QUIC_EV_CONN_LPKT);
+			TRACE_PROTO("RX 0-RTT packet not supported", QUIC_EV_CONN_LPKT);
 			goto drop;
 		}
 	}
 	else {
-		TRACE_PROTO("short header packet received", QUIC_EV_CONN_LPKT);
+		TRACE_PROTO("RX short header packet", QUIC_EV_CONN_LPKT);
 		if (end - buf < QUIC_HAP_CID_LEN) {
-			TRACE_PROTO("Packet dropped", QUIC_EV_CONN_LPKT);
+			TRACE_PROTO("RX pkt dropped", QUIC_EV_CONN_LPKT);
 			goto drop;
 		}
 
@@ -6785,7 +6902,7 @@ static int quic_rx_pkt_parse(struct quic_rx_packet *pkt,
 		if (!(pkt->flags & QUIC_FL_RX_PACKET_DGRAM_FIRST) &&
 		    (pkt->dcid.len != dgram->dcid_len ||
 		     memcmp(dgram->dcid, pkt->dcid.data, pkt->dcid.len))) {
-			TRACE_PROTO("Packet dropped", QUIC_EV_CONN_LPKT);
+			TRACE_PROTO("RX pkt dropped", QUIC_EV_CONN_LPKT);
 			goto drop;
 		}
 
@@ -6796,7 +6913,8 @@ static int quic_rx_pkt_parse(struct quic_rx_packet *pkt,
 		pkt->len = end - beg;
 	}
 
-	TRACE_LEAVE(QUIC_EV_CONN_LPKT, NULL, pkt, NULL, qv);
+	TRACE_PROTO("RX pkt parsed", QUIC_EV_CONN_LPKT, NULL, pkt, NULL, qv);
+	TRACE_LEAVE(QUIC_EV_CONN_LPKT);
 	return 0;
 
  drop:
@@ -6804,7 +6922,8 @@ static int quic_rx_pkt_parse(struct quic_rx_packet *pkt,
  drop_silent:
 	if (!pkt->len)
 		pkt->len = end - beg;
-	TRACE_LEAVE(QUIC_EV_CONN_LPKT, NULL, pkt, NULL, qv);
+	TRACE_PROTO("RX pkt parsing failed", QUIC_EV_CONN_LPKT, NULL, pkt, NULL, qv);
+	TRACE_LEAVE(QUIC_EV_CONN_LPKT);
 	return -1;
 }
 
@@ -6963,7 +7082,8 @@ static void qc_rx_pkt_handle(struct quic_conn *qc, struct quic_rx_packet *pkt,
 	struct quic_enc_level *qel = NULL;
 	size_t b_cspace;
 
-	TRACE_ENTER(QUIC_EV_CONN_LPKT, qc, pkt, NULL, qv);
+	TRACE_ENTER(QUIC_EV_CONN_LPKT, qc);
+	TRACE_PROTO("RX pkt", QUIC_EV_CONN_LPKT, qc, pkt, NULL, qv);
 
 	if (pkt->flags & QUIC_FL_RX_PACKET_DGRAM_FIRST &&
 	    qc->flags & QUIC_FL_CONN_ANTI_AMPLIFICATION_REACHED) {
@@ -7027,12 +7147,14 @@ static void qc_rx_pkt_handle(struct quic_conn *qc, struct quic_rx_packet *pkt,
 	                                      qc->wait_event.tasklet);
 
  drop_silent:
-	TRACE_LEAVE(QUIC_EV_CONN_LPKT, qc ? qc : NULL, pkt, NULL, qv);
+	TRACE_PROTO("RX pkt", QUIC_EV_CONN_LPKT, qc ? qc : NULL, pkt, NULL, qv);
+	TRACE_LEAVE(QUIC_EV_CONN_LPKT, qc ? qc : NULL);
 	return;
 
  drop:
 	HA_ATOMIC_INC(&qc->prx_counters->dropped_pkt);
-	TRACE_LEAVE(QUIC_EV_CONN_LPKT, qc ? qc : NULL, pkt, NULL, qv);
+	TRACE_PROTO("packet drop", QUIC_EV_CONN_LPKT, qc ? qc : NULL, pkt, NULL, qv);
+	TRACE_LEAVE(QUIC_EV_CONN_LPKT, qc ? qc : NULL);
 }
 
 /* This function builds into <buf> buffer a QUIC long packet header.
@@ -7204,7 +7326,7 @@ static inline int qc_build_frms(struct list *outlist, struct list *inlist,
 		room = QUIC_MIN(room, remain - headlen);
 	}
 
-	TRACE_PROTO("************** frames build (headlen)",
+	TRACE_PROTO("TX frms build (headlen)",
 	            QUIC_EV_CONN_BCFRMS, qc, &headlen);
 
 	/* NOTE: switch/case block inside a loop, a successful status must be
@@ -7814,7 +7936,8 @@ static struct quic_tx_packet *qc_build_pkt(unsigned char **pos,
 	size_t pn_len, payload_len, aad_len;
 	struct quic_tx_packet *pkt;
 
-	TRACE_ENTER(QUIC_EV_CONN_TXPKT, qc, NULL, qel);
+	TRACE_ENTER(QUIC_EV_CONN_TXPKT, qc);
+	TRACE_PROTO("TX pkt build", QUIC_EV_CONN_TXPKT, qc, NULL, qel);
 	*err = 0;
 	pkt = pool_alloc(pool_head_quic_tx_packet);
 	if (!pkt) {
@@ -7871,18 +7994,26 @@ static struct quic_tx_packet *qc_build_pkt(unsigned char **pos,
 		pkt->in_flight_len = pkt->len;
 		qc->path->prep_in_flight += pkt->len;
 	}
-	/* Always reset this flags */
+	/* Always reset this flag */
 	qc->flags &= ~QUIC_FL_CONN_IMMEDIATE_CLOSE;
 	if (pkt->flags & QUIC_FL_TX_PACKET_ACK) {
 		qel->pktns->flags &= ~QUIC_FL_PKTNS_ACK_REQUIRED;
 		qel->pktns->rx.nb_aepkts_since_last_ack = 0;
+		qc->flags &= ~QUIC_FL_CONN_ACK_TIMER_FIRED;
+		if (tick_isset(qc->ack_expire)) {
+		    qc->ack_expire = TICK_ETERNITY;
+		    qc->idle_timer_task->expire = qc->idle_expire;
+		    task_queue(qc->idle_timer_task);
+		    TRACE_PROTO("ack timer cancelled", QUIC_EV_CONN_IDLE_TIMER, qc);
+		}
 	}
 
 	pkt->pktns = qel->pktns;
 
 	ret_pkt = pkt;
  leave:
-	TRACE_LEAVE(QUIC_EV_CONN_TXPKT, qc, ret_pkt);
+	TRACE_PROTO("TX pkt built", QUIC_EV_CONN_TXPKT, qc, ret_pkt);
+	TRACE_LEAVE(QUIC_EV_CONN_TXPKT, qc);
 	return ret_pkt;
 
  err:
@@ -8033,9 +8164,6 @@ int qc_check_dcid(struct quic_conn *qc, unsigned char *dcid, size_t dcid_len)
 	struct ebmb_node *node;
 	struct quic_connection_id *id;
 
-	/* For ODCID, address is concatenated to it after qc.odcid.len so this
-	 * comparison is safe.
-	 */
 	if ((qc->scid.len == dcid_len &&
 	     memcmp(qc->scid.data, dcid, dcid_len) == 0) ||
 	    (qc->odcid.len == dcid_len &&
@@ -8179,7 +8307,7 @@ static int cli_io_handler_dump_quic(struct appctx *appctx)
 	struct show_quic_ctx *ctx = appctx->svcctx;
 	struct stconn *sc = appctx_sc(appctx);
 	struct quic_conn *qc;
-	struct quic_enc_level *qel;
+	struct quic_pktns *pktns;
 	struct eb64_node *node;
 	struct qc_stream_desc *stream;
 	char bufaddr[INET6_ADDRSTRLEN], bufport[6];
@@ -8191,7 +8319,8 @@ static int cli_io_handler_dump_quic(struct appctx *appctx)
 	if (ctx->thr >= global.nbthread)
 		goto done;
 
-	if (unlikely(sc_ic(sc)->flags & CF_SHUTW)) {
+	/* FIXME: Don't watch the other side !*/
+	if (unlikely(sc_opposite(sc)->flags & SC_FL_SHUTW)) {
 		/* If we're forced to shut down, we might have to remove our
 		 * reference to the last stream being dumped.
 		 */
@@ -8266,8 +8395,10 @@ static int cli_io_handler_dump_quic(struct appctx *appctx)
 
 		chunk_appendf(&trash, "  loc. TPs:");
 		quic_transport_params_dump(&trash, qc, &qc->rx.params);
+		chunk_appendf(&trash, "\n");
 		chunk_appendf(&trash, "  rem. TPs:");
 		quic_transport_params_dump(&trash, qc, &qc->tx.params);
+		chunk_appendf(&trash, "\n");
 
 		/* Connection state */
 		if (qc->flags & QUIC_FL_CONN_CLOSING)
@@ -8286,9 +8417,9 @@ static int cli_io_handler_dump_quic(struct appctx *appctx)
 		else
 			chunk_appendf(&trash, "mux=released                                  ");
 
-		expire = qc->idle_timer_task->expire;
+		expire = qc->idle_expire;
 		chunk_appendf(&trash, "expire=%02ds ",
-		              expire > now_ms ? (expire - now_ms) / 1000 : 0);
+		              TICKS_TO_MS(tick_remain(now_ms, expire)) / 1000);
 
 		chunk_appendf(&trash, "\n");
 
@@ -8307,21 +8438,21 @@ static int cli_io_handler_dump_quic(struct appctx *appctx)
 
 		chunk_appendf(&trash, "\n");
 
-		/* Encryption levels */
-		qel = &qc->els[QUIC_TLS_ENC_LEVEL_INITIAL];
+		/* Packet number spaces information */
+		pktns = &qc->pktns[QUIC_TLS_PKTNS_INITIAL];
 		chunk_appendf(&trash, "  [initl]             rx.ackrng=%-6zu tx.inflight=%-6zu",
-		              qel->pktns->rx.arngs.sz, qel->pktns->tx.in_flight);
-		qel = &qc->els[QUIC_TLS_ENC_LEVEL_HANDSHAKE];
+		              pktns->rx.arngs.sz, pktns->tx.in_flight);
+		pktns = &qc->pktns[QUIC_TLS_PKTNS_HANDSHAKE];
 		chunk_appendf(&trash, "           [hndshk] rx.ackrng=%-6zu tx.inflight=%-6zu\n",
-		              qel->pktns->rx.arngs.sz, qel->pktns->tx.in_flight);
-		qel = &qc->els[QUIC_TLS_ENC_LEVEL_EARLY_DATA];
-		chunk_appendf(&trash, "  [0-rtt]             rx.ackrng=%-6zu tx.inflight=%-6zu",
-		              qel->pktns->rx.arngs.sz, qel->pktns->tx.in_flight);
-		qel = &qc->els[QUIC_TLS_ENC_LEVEL_APP];
-		chunk_appendf(&trash, "           [1-rtt]  rx.ackrng=%-6zu tx.inflight=%-6zu",
-		              qel->pktns->rx.arngs.sz, qel->pktns->tx.in_flight);
+		              pktns->rx.arngs.sz, pktns->tx.in_flight);
+		pktns = &qc->pktns[QUIC_TLS_PKTNS_01RTT];
+		chunk_appendf(&trash, "  [01rtt]             rx.ackrng=%-6zu tx.inflight=%-6zu\n",
+		              pktns->rx.arngs.sz, pktns->tx.in_flight);
 
-		chunk_appendf(&trash, "\n");
+		chunk_appendf(&trash, "  srtt=%-4u rttvar=%-4u rttmin=%-4u ptoc=%-4u cwnd=%-6llu\n",
+		              qc->path->loss.srtt >> 3, qc->path->loss.rtt_var >> 2,
+		              qc->path->loss.rtt_min, qc->path->loss.pto_count, (ullong)qc->path->cwnd);
+
 
 		/* Streams */
 		node = eb64_first(&qc->streams_by_id);
