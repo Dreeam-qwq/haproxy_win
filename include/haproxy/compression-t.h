@@ -34,10 +34,23 @@
 
 #include <haproxy/buf-t.h>
 
+/* Direction index */
+
+#define COMP_DIR_REQ 0
+#define COMP_DIR_RES 1
+
+/* Compression flags */
+
+#define COMP_FL_OFFLOAD		0x00000001 /* Compression offload */
+#define COMP_FL_DIR_REQ		0x00000002 /* Compress requests */
+#define COMP_FL_DIR_RES		0x00000004 /* Compress responses */
+
 struct comp {
-	struct comp_algo *algos;
-	struct comp_type *types;
-	unsigned int offload;
+	struct comp_algo *algos_res; /* Algos available for response */
+	struct comp_algo *algo_req;  /* Algo to use for request */
+	struct comp_type *types_req; /* Types to be compressed for requests */
+	struct comp_type *types_res; /* Types to be compressed for responses */
+	unsigned int flags;
 };
 
 struct comp_ctx {

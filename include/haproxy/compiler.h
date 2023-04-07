@@ -50,9 +50,10 @@
  * second one.
  */
 #define comma_for_one1 ,
-#define ____equals_1(x, y, ...) (y)
-#define ___equals_1(x, ...) ____equals_1(x, 0)
-#define __equals_1(x) ___equals_1(comma_for_one ## x 1)
+#define _____equals_1(x, y, ...) (y)
+#define ____equals_1(x, ...) _____equals_1(x, 0)
+#define ___equals_1(x)       ____equals_1(comma_for_one ## x 1)
+#define __equals_1(x)        ___equals_1(x)
 
 /* gcc 5 and clang 3 brought __has_attribute(), which is not well documented in
  * the case of gcc, but is convenient since handled at the preprocessor level.
@@ -87,6 +88,25 @@
  */
 #undef __attribute__
 #define __attribute__(x) __attribute__(x)
+#endif
+
+/* attribute(warning) was added in gcc 4.3 */
+#if defined(__GNUC__) && (__GNUC__ > 4 || (__GNUC__ == 4 && __GNUC_MINOR__ >= 3))
+#  define __has_attribute_warning 1
+#endif
+
+/* __attribute__warning(x) does __attribute__((warning(x))) if supported by the
+ * compiler, otherwise __attribute__((deprecated)). Clang supports it since v14
+ * but is a bit capricious in that it refuses a redefinition with a warning
+ * attribute that wasn't there the first time. However it's OK with deprecated(x)
+ * so better use this one. See: https://github.com/llvm/llvm-project/issues/56519
+ */
+#if defined(__clang__)
+#  define __attribute__warning(x) __attribute__((deprecated(x)))
+#elif __has_attribute(warning)
+#  define __attribute__warning(x) __attribute__((warning(x)))
+#else
+#  define __attribute__warning(x) __attribute__((deprecated))
 #endif
 
 /* By default, gcc does not inline large chunks of code, but we want it to
