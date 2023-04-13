@@ -658,6 +658,8 @@ static void quic_trace(enum trace_level level, uint64_t mask, const struct trace
 			             (unsigned long long)qc->path->in_flight);
 			if (pkt) {
 				const struct quic_frame *frm;
+				if (pkt->flags & QUIC_FL_TX_PACKET_ACK)
+				    chunk_appendf(&trace_buf, " ack");
 				chunk_appendf(&trace_buf, " pn=%lu(%s) iflen=%llu",
 				              (unsigned long)pkt->pn_node.key,
 				              pkt->pktns == &qc->pktns[QUIC_TLS_PKTNS_INITIAL] ? "I" :
@@ -3433,7 +3435,7 @@ static int qc_prep_app_pkts(struct quic_conn *qc, struct buffer *buf,
 	while (b_contig_space(buf) >= (int)qc->path->mtu + dg_headlen) {
 		int err, probe, cc;
 
-		TRACE_POINT(QUIC_EV_CONN_PHPKTS, qc, qel);
+		TRACE_PROTO("TX prep app pkts", QUIC_EV_CONN_PHPKTS, qc, qel);
 		probe = 0;
 		cc =  qc->flags & QUIC_FL_CONN_IMMEDIATE_CLOSE;
 		/* We do not probe if an immediate close was asked */
@@ -3463,7 +3465,7 @@ static int qc_prep_app_pkts(struct quic_conn *qc, struct buffer *buf,
 			 * MTU, we are here because of the congestion control window. There is
 			 * no need to try to reuse this buffer.
 			 */
-			TRACE_DEVEL("could not prepare anymore packet", QUIC_EV_CONN_PHPKTS, qc);
+			TRACE_PROTO("could not prepare anymore packet", QUIC_EV_CONN_PHPKTS, qc, qel);
 			goto out;
 		default:
 			break;
@@ -3538,7 +3540,7 @@ static int qc_prep_pkts(struct quic_conn *qc, struct buffer *buf,
 			(qel == &qc->els[QUIC_TLS_ENC_LEVEL_INITIAL] ||
 			 qel == &qc->els[QUIC_TLS_ENC_LEVEL_HANDSHAKE]);
 
-		TRACE_PROTO("TX prep pks", QUIC_EV_CONN_PHPKTS, qc, qel);
+		TRACE_PROTO("TX prep pkts", QUIC_EV_CONN_PHPKTS, qc, qel);
 		probe = 0;
 		cc =  qc->flags & QUIC_FL_CONN_IMMEDIATE_CLOSE;
 		/* We do not probe if an immediate close was asked */
@@ -3619,7 +3621,7 @@ static int qc_prep_pkts(struct quic_conn *qc, struct buffer *buf,
 			 */
 			if (prv_pkt)
 				qc_txb_store(buf, dglen, first_pkt);
-			TRACE_DEVEL("could not prepare anymore packet", QUIC_EV_CONN_PHPKTS, qc);
+			TRACE_PROTO("could not prepare anymore packet", QUIC_EV_CONN_PHPKTS, qc, qel);
 			goto out;
 		default:
 			break;
@@ -5245,6 +5247,11 @@ struct task *qc_process_timer(struct task *task, void *ctx, unsigned int state)
 
 	if (qc->path->in_flight) {
 		pktns = quic_pto_pktns(qc, qc->state >= QUIC_HS_ST_CONFIRMED, NULL);
+		if (!pktns->tx.in_flight) {
+			TRACE_PROTO("No in flight packets to probe with", QUIC_EV_CONN_TXPKT, qc);
+			goto out;
+		}
+
 		if (pktns == &qc->pktns[QUIC_TLS_PKTNS_INITIAL]) {
 			if (qc_may_probe_ipktns(qc)) {
 				qc->flags |= QUIC_FL_CONN_RETRANS_NEEDED;
@@ -5927,9 +5934,7 @@ static inline int qc_try_rm_hp(struct quic_conn *qc,
 	enum quic_tls_enc_level tel;
 	struct quic_enc_level *qel;
 	/* Only for traces. */
-	struct quic_rx_packet *qpkt_trace;
 
-	qpkt_trace = NULL;
 	TRACE_ENTER(QUIC_EV_CONN_TRMHP, qc);
 	BUG_ON(!pkt->pn_offset);
 
@@ -5963,7 +5968,7 @@ static inline int qc_try_rm_hp(struct quic_conn *qc,
 			goto out;
 		}
 
-		qpkt_trace = pkt;
+		TRACE_PROTO("RX hp removed", QUIC_EV_CONN_TRMHP, qc, pkt);
 	}
 	else {
 		if (qel->tls_ctx.flags & QUIC_FL_TLS_SECRETS_DCD) {
@@ -5988,7 +5993,7 @@ static inline int qc_try_rm_hp(struct quic_conn *qc,
 	
 	ret = 1;
  out:
-	TRACE_LEAVE(QUIC_EV_CONN_TRMHP, qc, qpkt_trace);
+	TRACE_LEAVE(QUIC_EV_CONN_TRMHP, qc);
 	return ret;
 }
 
