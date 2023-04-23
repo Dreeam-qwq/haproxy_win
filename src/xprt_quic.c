@@ -31,6 +31,7 @@ static void quic_close(struct connection *conn, void *xprt_ctx)
 	/* If the quic-conn timer has already expired free the quic-conn. */
 	if (qc->flags & QUIC_FL_CONN_EXP_TIMER) {
 		quic_conn_release(qc);
+		qc = NULL;
 		goto leave;
 	}
 
@@ -108,7 +109,7 @@ static int qc_conn_init(struct connection *conn, void **xprt_ctx)
 {
 	struct quic_conn *qc = NULL;
 
-	TRACE_ENTER(QUIC_EV_CONN_NEW, conn);
+	TRACE_ENTER(QUIC_EV_CONN_NEW, qc);
 
 	/* do not store the context if already set */
 	if (*xprt_ctx)
@@ -131,10 +132,10 @@ static int qc_xprt_start(struct connection *conn, void *ctx)
 	qc = conn->handle.qc;
 	TRACE_ENTER(QUIC_EV_CONN_NEW, qc);
 
+	qc_finalize_affinity_rebind(qc);
+
 	/* mux-quic can now be considered ready. */
 	qc->mux_state = QC_MUX_READY;
-
-	tasklet_wakeup(qc->wait_event.tasklet);
 
 	ret = 1;
  out:

@@ -1023,7 +1023,7 @@ int hlua_server_get_name(lua_State *L)
 }
 
 /* __index metamethod for server class
- * support for additionnal keys that are missing from the main table
+ * support for additional keys that are missing from the main table
  * stack:1 = table (server class), stack:2 = requested key
  * Returns 1 if key is supported
  * else returns 0 to make lua return NIL value to the caller
@@ -1268,7 +1268,7 @@ int hlua_server_check_force_up(lua_State *L)
 	HA_SPIN_LOCK(SERVER_LOCK, &sv->lock);
 	if (!(sv->track)) {
 		sv->check.health = sv->check.rise + sv->check.fall - 1;
-		srv_set_running(sv, "changed from Lua script", NULL);
+		srv_set_running(sv, SRV_OP_STCHGC_LUA);
 	}
 	HA_SPIN_UNLOCK(SERVER_LOCK, &sv->lock);
 	return 0;
@@ -1285,7 +1285,7 @@ int hlua_server_check_force_nolb(lua_State *L)
 	HA_SPIN_LOCK(SERVER_LOCK, &sv->lock);
 	if (!(sv->track)) {
 		sv->check.health = sv->check.rise + sv->check.fall - 1;
-		srv_set_stopping(sv, "changed from Lua script", NULL);
+		srv_set_stopping(sv, SRV_OP_STCHGC_LUA);
 	}
 	HA_SPIN_UNLOCK(SERVER_LOCK, &sv->lock);
 	return 0;
@@ -1302,7 +1302,7 @@ int hlua_server_check_force_down(lua_State *L)
 	HA_SPIN_LOCK(SERVER_LOCK, &sv->lock);
 	if (!(sv->track)) {
 		sv->check.health = 0;
-		srv_set_stopped(sv, "changed from Lua script", NULL);
+		srv_set_stopped(sv, SRV_OP_STCHGC_LUA);
 	}
 	HA_SPIN_UNLOCK(SERVER_LOCK, &sv->lock);
 	return 0;
@@ -1351,7 +1351,7 @@ int hlua_server_agent_force_up(lua_State *L)
 	HA_SPIN_LOCK(SERVER_LOCK, &sv->lock);
 	if (sv->agent.state & CHK_ST_ENABLED) {
 		sv->agent.health = sv->agent.rise + sv->agent.fall - 1;
-		srv_set_running(sv, "changed from Lua script", NULL);
+		srv_set_running(sv, SRV_OP_STCHGC_LUA);
 	}
 	HA_SPIN_UNLOCK(SERVER_LOCK, &sv->lock);
 	return 0;
@@ -1368,7 +1368,7 @@ int hlua_server_agent_force_down(lua_State *L)
 	HA_SPIN_LOCK(SERVER_LOCK, &sv->lock);
 	if (sv->agent.state & CHK_ST_ENABLED) {
 		sv->agent.health = 0;
-		srv_set_stopped(sv, "changed from Lua script", NULL);
+		srv_set_stopped(sv, SRV_OP_STCHGC_LUA);
 	}
 	HA_SPIN_UNLOCK(SERVER_LOCK, &sv->lock);
 	return 0;
@@ -1567,7 +1567,7 @@ int hlua_proxy_get_uuid(lua_State *L)
 }
 
 /* __index metamethod for proxy class
- * support for additionnal keys that are missing from the main table
+ * support for additional keys that are missing from the main table
  * stack:1 = table (proxy class), stack:2 = requested key
  * Returns 1 if key is supported
  * else returns 0 to make lua return NIL value to the caller

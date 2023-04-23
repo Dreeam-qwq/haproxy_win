@@ -31,9 +31,9 @@
 
 /* Bit values for receiver->flags */
 #define RX_F_BOUND              0x00000001  /* receiver already bound */
-#define RX_F_INHERITED          0x00000002  /* inherited FD from the parent process (fd@) */
+#define RX_F_INHERITED          0x00000002  /* inherited FD from the parent process (fd@) or duped from another local receiver */
 #define RX_F_MWORKER            0x00000004  /* keep the FD open in the master but close it in the children */
-#define RX_F_LOCAL_ACCEPT       0x00000008  /* do not use a tasklet for accept, connections will be accepted on the current thread */
+#define RX_F_MUST_DUP           0x00000008  /* this receiver's fd must be dup() from a reference; ignore socket-level ops here */
 
 /* Bit values for rx_settings->options */
 #define RX_O_FOREIGN            0x00000001  /* receives on foreign addresses */
@@ -50,7 +50,18 @@ struct rx_settings {
 	char *interface;                  /* interface name or NULL */
 	const struct netns_entry *netns;  /* network namespace of the listener*/
 	unsigned int options;             /* receiver options (RX_O_*) */
-	uint shards;                      /* number of shards */
+	int shards;                       /* number of shards, 0=not set yet, -1="by-thread" */
+};
+
+/* info about a shard that is shared between multiple groups. Receivers that
+ * are alone in their shard do not have a shard_info.
+ */
+struct shard_info {
+	uint nbgroups;                         /* number of groups in this shard (=#rx); Zero = unused. */
+	uint nbthreads;                        /* number of threads in this shard (>=nbgroups) */
+	ulong tgroup_mask;                     /* bitmask of thread groups having a member here */
+	struct receiver *ref;                  /* first one, reference for FDs to duplicate */
+	struct receiver *members[MAX_TGROUPS]; /* all members of the shard (one per thread group) */
 };
 
 /* This describes a receiver with all its characteristics (address, options, etc) */
@@ -63,6 +74,7 @@ struct receiver {
 	unsigned long bind_thread;       /* bitmask of threads allowed on this receiver */
 	uint bind_tgroup;                /* thread group ID: 0=global IDs, non-zero=local IDs */
 	struct rx_settings *settings;    /* points to the settings used by this receiver */
+	struct shard_info *shard_info;   /* points to info about the owning shard, NULL if single rx */
 	struct list proto_list;          /* list in the protocol header */
 #ifdef USE_QUIC
 	struct mt_list rxbuf_list;       /* list of buffers to receive and dispatch QUIC datagrams. */

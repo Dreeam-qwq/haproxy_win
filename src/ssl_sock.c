@@ -3389,7 +3389,7 @@ static int ssl_sock_load_cert_chain(const char *path, const struct ckch_data *da
 #ifdef SSL_CTX_set1_chain
 	if (!SSL_CTX_set1_chain(ctx, *find_chain)) {
 		ret = ERR_get_error();
-		memprintf(err, "%sunable to load chain certificate into SSL Context '%s': %s. Make sure you are linking against Openssl >= 1.0.2.\n",
+		memprintf(err, "%sunable to load chain certificate into SSL Context '%s': %s.\n",
 			  err && *err ? *err : "", path,  ERR_reason_error_string(ret));
 		errcode |= ERR_ALERT | ERR_FATAL;
 		goto end;
@@ -4205,7 +4205,7 @@ static inline void sh_ssl_sess_free_blocks(struct shared_block *first, struct sh
 /* return first block from sh_ssl_sess  */
 static inline struct shared_block *sh_ssl_sess_first_block(struct sh_ssl_sess_hdr *sh_ssl_sess)
 {
-	return (struct shared_block *)((unsigned char *)sh_ssl_sess - ((struct shared_block *)NULL)->data);
+	return (struct shared_block *)((unsigned char *)sh_ssl_sess - offsetof(struct shared_block, data));
 
 }
 
@@ -4717,7 +4717,7 @@ static int ssl_sock_prepare_ctx(struct bind_conf *bind_conf, struct ssl_bind_con
 		ssl_conf_cur = ssl_conf;
 	else if (bind_conf->ssl_conf.alpn_str)
 		ssl_conf_cur = &bind_conf->ssl_conf;
-	if (ssl_conf_cur)
+	if (ssl_conf_cur && ssl_conf_cur->alpn_len)
 		SSL_CTX_set_alpn_select_cb(ctx, ssl_sock_advertise_alpn_protos, ssl_conf_cur);
 #endif
 #if defined(SSL_CTX_set1_curves_list)
@@ -5150,7 +5150,7 @@ static int ssl_sock_prepare_srv_ssl_ctx(const struct server *srv, SSL_CTX *ctx)
 		SSL_CTX_set_next_proto_select_cb(ctx, ssl_sock_srv_select_protos, (struct server*)srv);
 #endif
 #ifdef TLSEXT_TYPE_application_layer_protocol_negotiation
-	if (srv->ssl_ctx.alpn_str)
+	if (srv->ssl_ctx.alpn_str && srv->ssl_ctx.alpn_len)
 		SSL_CTX_set_alpn_protos(ctx, (unsigned char *)srv->ssl_ctx.alpn_str, srv->ssl_ctx.alpn_len);
 #endif
 

@@ -3,7 +3,7 @@
                           Configuration Manual
                          ----------------------
                               version 2.8
-                              2023/04/08
+                              2023/04/23
 
 
 This document covers the configuration language as implemented in the version
@@ -2885,6 +2885,52 @@ tune.fd.edge-triggered { on | off }  [ EXPERIMENTAL ]
   certain scenarios. This is still experimental, it may result in frozen
   connections if bugs are still present, and is disabled by default.
 
+tune.h2.be.initial-window-size <number>
+  Sets the HTTP/2 initial window size for outgoing connections, which is the
+  number of bytes the server can respond before waiting for an acknowledgment
+  from HAProxy. This setting only affects payload contents, not headers. When
+  not set, the common default value set by tune.h2.initial-window-size applies.
+  It can make sense to slightly increase this value to allow faster downloads
+  or to reduce CPU usage on the servers, at the expense of creating unfairness
+  between clients. It doesn't affect resource usage.
+  See also: tune.h2.initial-window-size.
+
+tune.h2.be.max-concurrent-streams <number>
+  Sets the HTTP/2 maximum number of concurrent streams per outgoing connection
+  (i.e. the number of outstanding requests on a single connection to a server).
+  When not set, the default set by tune.h2.max-concurrent-streams applies. A
+  smaller value than the default 100 may improve a site's responsiveness at the
+  expense of maintaining more established connections to the servers. When the
+  "http-reuse" setting is set to "always", it is recommended to reduce this
+  value so as not to mix too many different clients over the same connection,
+  because if a client is slower than others, a mechanism known as "head of
+  line blocking" tends to cause cascade effect on download speed for all
+  clients sharing a connection (keep tune.h2.be.initial-window-size low in this
+  case). It is highly recommended not to increase this value; some might find
+  it optimal to run at low values (1..5 typically).
+
+tune.h2.fe.initial-window-size <number>
+  Sets the HTTP/2 initial window size for incoming connections, which is the
+  number of bytes the client can upload before waiting for an acknowledgment
+  from HAProxy. This setting only affects payload contents (i.e. the body of
+  POST requests), not headers. When not set, the common default value set by
+  tune.h2.initial-window-size applies. It can make sense to increase this value
+  to allow faster uploads. The default value of 65536 allows up to 5 Mbps of
+  bandwidth per client over a 100 ms ping time, and 500 Mbps for 1 ms ping
+  time. It doesn't affect resource usage. Using too large values may cause
+  clients to experience a lack of responsiveness if pages are accessed in
+  parallel to large uploads. See also: tune.h2.initial-window-size.
+
+tune.h2.fe.max-concurrent-streams <number>
+  Sets the HTTP/2 maximum number of concurrent streams per incoming connection
+  (i.e. the number of outstanding requests on a single connection from a
+  client). When not set, the default set by tune.h2.max-concurrent-streams
+  applies. A larger value than the default 100 may sometimes slightly improve
+  the page load time for complex sites with lots of small objects over high
+  latency networks but can also result in using more memory by allowing a
+  client to allocate more resources at once. The default value of 100 is
+  generally good and it is recommended not to change this value.
+
 tune.h2.header-table-size <number>
   Sets the HTTP/2 dynamic header table size. It defaults to 4096 bytes and
   cannot be larger than 65536 bytes. A larger value may help certain clients
@@ -2893,23 +2939,27 @@ tune.h2.header-table-size <number>
   change it.
 
 tune.h2.initial-window-size <number>
-  Sets the HTTP/2 initial window size, which is the number of bytes the client
-  can upload before waiting for an acknowledgment from HAProxy. This setting
-  only affects payload contents (i.e. the body of POST requests), not headers.
-  The default value is 65536, which roughly allows up to 5 Mbps of upload
-  bandwidth per client over a network showing a 100 ms ping time, or 500 Mbps
-  over a 1-ms local network. It can make sense to increase this value to allow
-  faster uploads, or to reduce it to increase fairness when dealing with many
-  clients. It doesn't affect resource usage.
+  Sets the default value for the HTTP/2 initial window size, on both incoming
+  and outgoing connections. This value is used for incoming connections when
+  tune.h2.fe.initial-window-size is not set, and by outgoing connections when
+  tune.h2.be.initial-window-size is not set. The default value is 65536, which
+  for uploads roughly allows up to 5 Mbps of bandwidth per client over a
+  network showing a 100 ms ping time, or 500 Mbps over a 1-ms local network.
+  Given that changing the default value will both increase upload speeds and
+  cause more unfairness between clients on downloads, it is recommended to
+  instead use the side-specific settings tune.h2.fe.initial-window-size and
+  tune.h2.be.initial-window-size.
 
 tune.h2.max-concurrent-streams <number>
-  Sets the HTTP/2 maximum number of concurrent streams per connection (ie the
-  number of outstanding requests on a single connection). The default value is
-  100. A larger one may slightly improve page load time for complex sites when
-  visited over high latency networks, but increases the amount of resources a
-  single client may allocate. A value of zero disables the limit so a single
-  client may create as many streams as allocatable by HAProxy. It is highly
-  recommended not to change this value.
+  Sets the default HTTP/2 maximum number of concurrent streams per connection
+  (i.e. the number of outstanding requests on a single connection). Ths value
+  is used for incoming connections when tune.h2.fe.max-concurrent-streams is
+  not set, and for outgoing connections when tune.h2.be.max-concurrent-streams
+  is not set. The default value is 100. The impact varies depending on the side
+  so please see the two settings above for more details. It is recommended not
+  to use this setting and to switch to the per-side ones instead. A value of
+  zero disables the limit so a single client may create as many streams as
+  allocatable by HAProxy. It is highly recommended not to change this value.
 
 tune.h2.max-frame-size <number>
   Sets the HTTP/2 maximum frame size that HAProxy announces it is willing to
@@ -2973,16 +3023,48 @@ tune.idletimer <timeout>
   clicking). There should be no reason for changing this value. Please check
   tune.ssl.maxrecord below.
 
-tune.listener.multi-queue { on | off }
-  Enables ('on') or disables ('off') the listener's multi-queue accept which
-  spreads the incoming traffic to all threads a "bind" line is allowed to run
-  on instead of taking them for itself. This provides a smoother traffic
+tune.listener.default-shards { by-process | by-thread | by-group }
+  Normally, all "bind" lines will create a single shard, that is, a single
+  socket that all threads of the process will listen to. With many threads,
+  this is not very efficient, and may even induce some important overhead in
+  the kernel for updating the polling state or even distributing events to the
+  various threads. Modern operating systems support balancing of incoming
+  connections, a mechanism that will consist in permitting multiple sockets to
+  be bound to the same address and port, and to evenly distribute all incoming
+  connections to these sockets so that each thread only sees the connections
+  that are waiting in the socket it is bound to. This significantly reduces
+  kernel-side overhead and increases performance in the incoming connection
+  path. This is usually enabled in HAProxy using the "shards" setting on "bind"
+  lines, which defaults to 1, meaning that each listener will be unique in the
+  process. On systems with many processors, it may be more convenient to change
+  the default setting to "by-thread" in order to always create one listening
+  socket per thread, or "by-group" in order to always create one listening
+  socket per thread group. Be careful about the file descriptor usage with
+  "by-thread" as each listener will need as many sockets as there are threads.
+  Also some operating systems (e.g. FreeBSD) are limited to no more than 256
+  sockets on a same address. Note that "by-group" will remain equivalent to
+  "by-process" for default configurations involving a single thread group, and
+  will fall back to sharing the same socket on systems that do not support this
+  mechanism. The default is "by-group" with a fallback to "by-process" for
+  systems or socket families that do not support multiple bindings.
+
+tune.listener.multi-queue { on | fair | off }
+  Enables ('on' / 'fair') or disables ('off') the listener's multi-queue accept
+  which spreads the incoming traffic to all threads a "bind" line is allowed to
+  run on instead of taking them for itself. This provides a smoother traffic
   distribution and scales much better, especially in environments where threads
   may be unevenly loaded due to external activity (network interrupts colliding
-  with one thread for example). This option is enabled by default, but it may
-  be forcefully disabled for troubleshooting or for situations where it is
-  estimated that the operating system already provides a good enough
-  distribution and connections are extremely short-lived.
+  with one thread for example). The default mode, "on", optimizes the choice of
+  a thread by picking in a sample the one with the less connections. It is
+  often the best choice when connections are long-lived as it manages to keep
+  all threads busy. A second mode, "fair", instead cycles through all threads
+  regardless of their instant load level. It can be better suited for short-
+  lived connections, or on machines with very large numbers of threads where
+  the probability to find the least loaded thread with the first mode is low.
+  Finally it is possible to forcefully disable the redistribution mechanism
+  using "off" for troubleshooting, or for situations where connections are
+  short-lived and it is estimated that the operating system alredy provides a
+  good enough distribution. The default is "on".
 
 tune.lua.forced-yield <number>
   This directive forces the Lua engine to execute a yield each <number> of
@@ -3004,6 +3086,56 @@ tune.lua.session-timeout <timeout>
   preventing infinite loops or spending too much time in Lua. This timeout
   counts only the pure Lua runtime. If the Lua does a sleep, the sleep is
   not taken in account. The default timeout is 4s.
+
+tune.lua.burst-timeout <timeout>
+  The "burst" execution timeout applies to any Lua handler. If the handler
+  fails to finish or yield before timeout is reached, it will be aborted to
+  prevent thread contention, to prevent traffic from not being served for too
+  long, and ultimately to prevent the process from crashing because of the
+  watchdog kicking in. Unlike other lua timeouts which are yield-cumulative,
+  burst-timeout will ensure that the time spent in a single lua execution
+  window does not exceed the configured timeout.
+
+  Yielding here means that the lua execution is effectively interrupted
+  either through an explicit call to lua-yielding function such as
+  core.(m)sleep() or core.yield(), or following an automatic forced-yield
+  (see tune.lua.forced-yield) and that it will be resumed later when the
+  related task is set for rescheduling. Not all lua handlers may yield: we have
+  to make a distinction between yieldable handlers and unyieldable handlers.
+
+  For yieldable handlers (tasks, actions..), reaching the timeout means
+  "tune.lua.forced-yield" might be too high for the system, reducing it
+  could improve the situation, but it could also be a good idea to check if
+  adding manual yields at some key points within the lua function helps or not.
+  It may also indicate that the handler is spending too much time in a specific
+  lua library function that cannot be interrupted.
+
+  For unyieldable handlers (lua converters, sample fetches), it could simply
+  indicate that the handler is doing too much computation, which could result
+  from an improper design given that such handlers, which often block the
+  request execution flow, are expected to terminate quickly to allow the
+  request processing to go through. A common resolution approach here would be
+  to try to better optimize the lua function for speed since decreasing
+  "tune.lua.forced-yield" won't help.
+
+  This timeout only counts the pure Lua runtime. If the Lua does a core.sleep,
+  the sleeping time is not taken in account. The default timeout is 1000ms.
+
+  Note: if a lua GC cycle is initiated from the handler (either explicitly
+  requested or automatically triggered by lua after some time), the GC cycle
+  time will also be accounted for.
+
+  Indeed, there is no way to deduce the GC cycle time, so this could lead to
+  some false positives on saturated systems (where GC is having hard time to
+  catch up and consumes most of the available execution runtime). If it were
+  to be the case, here are some resolution leads:
+
+    - checking if the script could be optimized to reduce lua memory footprint
+    - fine-tuning lua GC parameters and / or requesting manual GC cycles
+      (see: https://www.lua.org/manual/5.4/manual.html#pdf-collectgarbage)
+    - increasing tune.lua.burst-timeout
+
+  Setting value to 0 completely disables this protection.
 
 tune.lua.service-timeout <timeout>
   This is the execution timeout for the Lua services. This is useful for
@@ -4825,7 +4957,7 @@ bind /<path> [, ...] [param*]
             bind "fd@${FD_APP1}"
 
         listen h3_quic_proxy
-            bind quic4@10.0.0.1:8888 ssl crt /etc/mycrt alpn h3
+            bind quic4@10.0.0.1:8888 ssl crt /etc/mycrt
 
   Note: regarding Linux's abstract namespace sockets, HAProxy uses the whole
         sun_path length is used for the address length. Some other programs
@@ -14556,18 +14688,29 @@ alpn <protocols>
   delimited list of protocol names, for instance: "http/1.1,http/1.0" (without
   quotes). This requires that the SSL library is built with support for TLS
   extensions enabled (check with haproxy -vv). The ALPN extension replaces the
-  initial NPN extension. ALPN is required to enable HTTP/2 on an HTTP frontend.
-  Versions of OpenSSL prior to 1.0.2 didn't support ALPN and only supposed the
-  now obsolete NPN extension. At the time of writing this, most browsers still
-  support both ALPN and NPN for HTTP/2 so a fallback to NPN may still work for
-  a while. But ALPN must be used whenever possible. If both HTTP/2 and HTTP/1.1
-  are expected to be supported, both versions can be advertised, in order of
-  preference, like below :
+  initial NPN extension. At the protocol layer, ALPN is required to enable
+  HTTP/2 on an HTTPS frontend and HTTP/3 on a QUIC frontend. However, when such
+  frontends have none of "npn", "alpn" and "no-alpn" set, a default value of
+  "h2,http/1.1" will be used for a regular HTTPS frontend, and "h3" for a QUIC
+  frontend. Versions of OpenSSL prior to 1.0.2 didn't support ALPN and only
+  supposed the now obsolete NPN extension. At the time of writing this, most
+  browsers still support both ALPN and NPN for HTTP/2 so a fallback to NPN may
+  still work for a while. But ALPN must be used whenever possible. Protocols
+  not advertised are not negotiated. For example it is possible to only accept
+  HTTP/2 connections with this:
 
-       bind :443 ssl crt pub.pem alpn h2,http/1.1
+       bind :443 ssl crt pub.pem alpn h2  # explicitly disable HTTP/1.1
 
   QUIC supports only h3 and hq-interop as ALPN. h3 is for HTTP/3 and hq-interop
   is used for http/0.9 and QUIC interop runner (see https://interop.seemann.io).
+  Each "alpn" statement will replace a previous one. In order to remove them,
+  use "no-alpn".
+
+  Note that some old browsers such as Firefox 88 used to experience issues with
+  WebSocket over H2, and in case such a setup is encountered, it may be needed
+  to either explicitly disable HTTP/2 in the "alpn" string by forcing it to
+  "http/1.1" or "no-alpn", or to enable "h2-workaround-bogus-websocket-clients"
+  globally.
 
 backlog <backlog>
   Sets the socket's backlog to this value. If unspecified or 0, the frontend's
@@ -14776,6 +14919,12 @@ crt-list <file>
   never match except if no other certificate matches. This way the first
   declared certificate act as a fallback.
 
+  When no ALPN is set, the "bind" line's default one is used. If a "bind" line
+  has no "no-alpn", "alpn" nor "npn" set, a default value will be used
+  depending on the protocol (see "alpn" above). However if the "bind" line has
+  a different default, or explicitly disables ALPN using "no-alpn", it is
+  possible to force a specific value for a certificate.
+
   crt-list file example:
         cert1.pem !*
         # comment
@@ -14956,6 +15105,16 @@ nice <nice>
   processing or bulk transfers which are less sensible to latency. For example,
   it may make sense to use a positive value for an SMTP socket and a negative
   one for an RDP socket.
+
+no-alpn
+  Disables ALPN processing (technically speaking this sets the ALPN string to
+  an empty string that will not be advertised). It permits to cancel a previous
+  occurrence of an "alpn" setting and to disable application protocol
+  negotiation. It may also be used to prevent a listener from negotiating ALPN
+  with a client on an HTTPS or QUIC listener; by default, HTTPS listeners will
+  advertise "h2,http/1.1" and QUIC listeners will advertise "h3". See also
+  "alpn" bove. Note that when using "crt-list", a certificate may override the
+  "alpn" setting and re-enable its processing.
 
 no-ca-names
   This setting is only available when support for OpenSSL was built in. It
@@ -15141,7 +15300,7 @@ quic-force-retry
   See https://www.rfc-editor.org/rfc/rfc9000.html#section-8.1.2 for more
   information about QUIC retry.
 
-shards <number> | by-thread
+shards <number> | by-thread | by-group
   In multi-threaded mode, on operating systems supporting multiple listeners on
   the same IP:port, this will automatically create this number of multiple
   identical listeners for the same line, all bound to a fair share of the number
@@ -15157,7 +15316,19 @@ shards <number> | by-thread
   thread). The special "by-thread" value also creates as many shards as there
   are threads on the "bind" line. Since the system will evenly distribute the
   incoming traffic between all these shards, it is important that this number
-  is an integral divisor of the number of threads.
+  is an integral divisor of the number of threads. Alternately, the other
+  special value "by-group" will create one shard per thread group. This can
+  be useful when dealing with many threads and not wanting to create too many
+  sockets. The load distribution will be a bit less optimal but the contention
+  (especially in the system) will still be lower than with a single socket.
+
+  On operating systems that do not support multiple sockets bound to the same
+  address, "by-thread" and "by-group" will automatically fall back to a single
+  shard. For "by-group" this is done without any warning since it doesn't
+  change anything for a single group, and will result in sockets being
+  duplicated for each group anyway. However, for "by-thread", a diagnostic
+  warning will be emitted if this happens since the resulting number of
+  listeners will not be the expected one.
 
 ssl
   This setting is only available when support for OpenSSL was built in. It
@@ -15256,10 +15427,21 @@ thread [<thread-group>/]<thread-set>[,...]
   an absolute notation or a relative one, as those not set will be resolved at
   the end of the parsing.
 
+  It is important to know that each listener described by a "bind" line creates
+  at least one socket represented by at least one file descriptor. Since file
+  descriptors cannot span multiple thread groups, if a "bind" line specifies a
+  thread range that covers more than one group, several file descriptors will
+  automatically be created so that there is at least one per group. Technically
+  speaking they all refer to the same socket in the kernel, but they will get a
+  distinct identifier in haproxy and will even have a dedicated stats entry if
+  "option socket-stats" is used.
+
   The main purpose is to have multiple bind lines sharing the same IP:port but
   not the same thread in a listener, so that the system can distribute the
   incoming connections into multiple queues, bypassing haproxy's internal queue
   load balancing. Currently Linux 3.9 and above is known for supporting this.
+  See also the "shards" keyword above that automates duplication of "bind"
+  lines and their assignment to multiple groups of threads.
 
 tls-ticket-keys <keyfile>
   Sets the TLS ticket keys file to load the keys from. The keys need to be 48

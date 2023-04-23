@@ -502,8 +502,7 @@ void mworker_cleanlisteners()
 		/* disable this peer section so that it kills itself */
 		if (curpeers->sighandler)
 			signal_unregister_handler(curpeers->sighandler);
-		if (curpeers->sync_task)
-			task_destroy(curpeers->sync_task);
+		task_destroy(curpeers->sync_task);
 		curpeers->sync_task = NULL;
 		curpeers->peers_fe = NULL;
 	}
@@ -568,7 +567,7 @@ static int cli_io_handler_show_proc(struct appctx *appctx)
 	char *reloadtxt = NULL;
 
 	/* FIXME: Don't watch the other side !*/
-	if (unlikely(sc_opposite(sc)->flags & SC_FL_SHUTW))
+	if (unlikely(sc_opposite(sc)->flags & SC_FL_SHUT_DONE))
 		return 1;
 
 	if (up < 0) /* must never be negative because of clock drift */
@@ -715,7 +714,7 @@ static int cli_io_handler_show_loadstatus(struct appctx *appctx)
 		return 1;
 
 	/* FIXME: Don't watch the other side !*/
-	if (unlikely(sc_opposite(sc)->flags & SC_FL_SHUTW))
+	if (unlikely(sc_opposite(sc)->flags & SC_FL_SHUT_DONE))
 		return 1;
 
 	env = getenv("HAPROXY_LOAD_SUCCESS");

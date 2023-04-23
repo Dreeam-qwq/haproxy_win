@@ -1466,8 +1466,7 @@ static int resolv_validate_dns_response(unsigned char *resp, unsigned char *bufe
 				    tmp_record->ar_item == NULL &&
 				    memcmp(tmp_record->data.target, answer_record->name, tmp_record->data_len) == 0) {
 					/* Always use the received additional record to refresh info */
-					if (tmp_record->ar_item)
-						pool_free(resolv_answer_item_pool, tmp_record->ar_item);
+					pool_free(resolv_answer_item_pool, tmp_record->ar_item);
 					tmp_record->ar_item = answer_record;
 					answer_record = NULL;
 					break;
@@ -2485,17 +2484,13 @@ static void resolvers_destroy(struct resolvers *resolvers)
 				fd_delete(ns->dgram->conn.t.sock.fd);
 				close(ns->dgram->conn.t.sock.fd);
 			}
-			if (ns->dgram->ring_req)
-				ring_free(ns->dgram->ring_req);
+			ring_free(ns->dgram->ring_req);
 			free(ns->dgram);
 		}
 		if (ns->stream) {
-			if (ns->stream->ring_req)
-				ring_free(ns->stream->ring_req);
-			if (ns->stream->task_req)
-				task_destroy(ns->stream->task_req);
-			if (ns->stream->task_rsp)
-				task_destroy(ns->stream->task_rsp);
+			ring_free(ns->stream->ring_req);
+			task_destroy(ns->stream->task_req);
+			task_destroy(ns->stream->task_rsp);
 			free(ns->stream);
 		}
 		LIST_DEL_INIT(&ns->list);

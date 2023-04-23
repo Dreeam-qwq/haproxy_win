@@ -617,7 +617,7 @@ static int cli_parse_global(char **args, int section_type, struct proxy *curpx,
 		global.cli_fe->maxconn = maxconn;
 	}
 	else if (strcmp(args[1], "bind-process") == 0) {
-		memprintf(err, "'%s' is not supported anymore.", args[0]);
+		memprintf(err, "'%s %s' is not supported anymore.", args[0], args[1]);
 		return -1;
 	}
 	else {
@@ -1176,9 +1176,7 @@ static void cli_io_handler(struct appctx *appctx)
 	}
 
  out:
-	DPRINTF(stderr, "%s@%d: st=%d, rqf=%x, rpf=%x, rqh=%lu, rqs=%lu, rh=%lu, rs=%lu\n",
-		__FUNCTION__, __LINE__,
-		sc->state, req->flags, res->flags, ci_data(req), co_data(req), ci_data(res), co_data(res));
+	return;
 }
 
 /* This is called when the stream connector is closed. For instance, upon an
@@ -1216,7 +1214,7 @@ static int cli_io_handler_show_env(struct appctx *appctx)
 	char **var = ctx->var;
 
 	/* FIXME: Don't watch the other side !*/
-	if (unlikely(sc_opposite(sc)->flags & SC_FL_SHUTW))
+	if (unlikely(sc_opposite(sc)->flags & SC_FL_SHUT_DONE))
 		return 1;
 
 	chunk_reset(&trash);
@@ -1255,7 +1253,7 @@ static int cli_io_handler_show_fd(struct appctx *appctx)
 	int ret = 1;
 
 	/* FIXME: Don't watch the other side !*/
-	if (unlikely(sc_opposite(sc)->flags & SC_FL_SHUTW))
+	if (unlikely(sc_opposite(sc)->flags & SC_FL_SHUT_DONE))
 		goto end;
 
 	chunk_reset(&trash);
@@ -2360,8 +2358,8 @@ int pcli_find_and_exec_kw(struct stream *s, char **args, int argl, char **errmsg
 		return argl; /* return the number of elements in the array */
 
 	} else if (strcmp("quit", args[0]) == 0) {
-		channel_shutr_now(&s->req);
-		channel_shutw_now(&s->res);
+		sc_schedule_abort(s->scf);
+		sc_schedule_shutdown(s->scf);
 		return argl; /* return the number of elements in the array */
 	} else if (strcmp(args[0], "operator") == 0) {
 		if (!pcli_has_level(s, ACCESS_LVL_OPER)) {
@@ -2640,7 +2638,7 @@ read_again:
 
 		if (!(s->pcli_flags & PCLI_F_PAYLOAD)) {
 			/* we send only 1 command per request, and we write close after it */
-			channel_shutw_now(req);
+			sc_schedule_shutdown(s->scb);
 		} else {
 			pcli_write_prompt(s);
 		}
@@ -2686,16 +2684,16 @@ send_help:
 
 send_status:
 	s->pcli_flags |= PCLI_F_RELOAD;
-	/* dont' use ci_putblk here because SHUTW could have been sent */
+	/* dont' use ci_putblk here because SHUT_DONE could have been sent */
 	b_reset(&req->buf);
 	b_putblk(&req->buf, "_loadstatus;quit\n", 17);
 	goto read_again;
 
 missing_data:
-        if (chn_prod(req)->flags & SC_FL_SHUTR) {
+        if (s->scf->flags & (SC_FL_ABRT_DONE|SC_FL_EOS)) {
                 /* There is no more request or a only a partial one and we
                  * receive a close from the client, we can leave */
-                channel_shutw_now(&s->res);
+		sc_schedule_shutdown(s->scf);
                 s->req.analysers &= ~AN_REQ_WAIT_CLI;
                 return 1;
         }
@@ -2715,8 +2713,8 @@ int pcli_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 	struct proxy *fe = strm_fe(s);
 	struct proxy *be = s->be;
 
-	if (sc_ep_test(s->scb, SE_FL_ERR_PENDING|SE_FL_ERROR) || (rep->flags & (CF_READ_TIMEOUT|CF_WRITE_TIMEOUT)) ||
-	    ((chn_cons(rep)->flags & SC_FL_SHUTW) && (rep->to_forward || co_data(rep)))) {
+	if ((s->scb->flags & SC_FL_ERROR) || (rep->flags & (CF_READ_TIMEOUT|CF_WRITE_TIMEOUT)) ||
+	    ((s->scf->flags & SC_FL_SHUT_DONE) && (rep->to_forward || co_data(rep)))) {
 		pcli_reply_and_close(s, "Can't connect to the target CLI!\n");
 		s->req.analysers &= ~AN_REQ_WAIT_CLI;
 		s->res.analysers &= ~AN_RES_WAIT_CLI;
@@ -2741,14 +2739,14 @@ int pcli_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 		return 0;
 	}
 
-	if (chn_prod(rep)->flags & SC_FL_SHUTR) {
+	if (s->scb->flags & (SC_FL_ABRT_DONE|SC_FL_EOS)) {
 		/* stream cleanup */
 
 		pcli_write_prompt(s);
 
 		s->scb->flags |= SC_FL_NOLINGER | SC_FL_NOHALF;
-		sc_shutr(s->scb);
-		sc_shutw(s->scb);
+		sc_abort(s->scb);
+		sc_shutdown(s->scb);
 
 		/*
 		 * starting from there this the same code as
@@ -2830,7 +2828,7 @@ int pcli_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 		sockaddr_free(&s->scb->dst);
 
 		sc_set_state(s->scb, SC_ST_INI);
-		s->scb->flags &= ~(SC_FL_SHUTW|SC_FL_SHUTW_NOW);
+		s->scb->flags &= ~(SC_FL_ERROR|SC_FL_SHUT_DONE|SC_FL_SHUT_WANTED);
 		s->scb->flags &= SC_FL_ISBACK | SC_FL_DONT_WAKE; /* we're in the context of process_stream */
 
 		s->req.flags &= ~(CF_AUTO_CONNECT|CF_STREAMER|CF_STREAMER_FAST|CF_WROTE_DATA);
@@ -2855,7 +2853,7 @@ int pcli_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 		s->store_count = 0;
 		s->uniq_id = global.req_count++;
 
-		s->scf->flags &= ~(SC_FL_SHUTR|SC_FL_SHUTR_NOW);
+		s->scf->flags &= ~(SC_FL_EOS|SC_FL_ERROR|SC_FL_ABRT_DONE|SC_FL_ABRT_WANTED);
 		s->scf->flags &= ~SC_FL_SND_NEVERWAIT;
 		s->scf->flags |= SC_FL_RCV_ONCE; /* one read is usually enough */
 

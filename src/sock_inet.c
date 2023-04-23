@@ -288,6 +288,30 @@ int sock_inet_bind_receiver(struct receiver *rx, char **errmsg)
 	if (rx->flags & RX_F_BOUND)
 		return ERR_NONE;
 
+	if (rx->flags & RX_F_MUST_DUP) {
+		/* this is a secondary receiver that is an exact copy of a
+		 * reference which must already be bound (or has failed).
+		 * We'll try to dup() the other one's FD and take it. We
+		 * try hard not to reconfigure the socket since it's shared.
+		 */
+		BUG_ON(!rx->shard_info);
+		if (!(rx->shard_info->ref->flags & RX_F_BOUND)) {
+			/* it's assumed that the first one has already reported
+			 * the error, let's not spam with another one, and do
+			 * not set ERR_ALERT.
+			 */
+			err |= ERR_RETRYABLE;
+			goto bind_ret_err;
+		}
+		/* taking the other one's FD will result in it being marked
+		 * extern and being dup()ed. Let's mark the receiver as
+		 * inherited so that it properly bypasses all second-stage
+		 * setup and avoids being passed to new processes.
+		 */
+		rx->flags |= RX_F_INHERITED;
+		rx->fd = rx->shard_info->ref->fd;
+	}
+
 	/* if no FD was assigned yet, we'll have to either find a compatible
 	 * one or create a new one.
 	 */
@@ -352,8 +376,16 @@ int sock_inet_bind_receiver(struct receiver *rx, char **errmsg)
 	/* OpenBSD and Linux 3.9 support this. As it's present in old libc versions of
 	 * Linux, it might return an error that we will silently ignore.
 	 */
-	if (!ext && (global.tune.options & GTUNE_USE_REUSEPORT))
+	if (!ext && (rx->proto->flags & PROTO_F_REUSEPORT_SUPPORTED))
 		setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one));
+#endif
+
+#ifdef SO_REUSEPORT_LB
+	/* FreeBSD 12 and above use this to load-balance incoming connections.
+	 * This is limited to 256 listeners per group however.
+	 */
+	if (!ext && (rx->proto->flags & PROTO_F_REUSEPORT_SUPPORTED))
+		setsockopt(fd, SOL_SOCKET, SO_REUSEPORT_LB, &one, sizeof(one));
 #endif
 
 	if (!ext && (rx->settings->options & RX_O_FOREIGN)) {
@@ -421,6 +453,7 @@ int sock_inet_bind_receiver(struct receiver *rx, char **errmsg)
 		addr_to_str(&addr_inet, pn, sizeof(pn));
 		memprintf(errmsg, "%s for [%s:%d]", *errmsg, pn, get_host_port(&addr_inet));
 	}
+ bind_ret_err:
 	return err;
 
  bind_close_return:

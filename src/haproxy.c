@@ -187,7 +187,7 @@ struct global global = {
 		 }
 	},
 	.tune = {
-		.options = GTUNE_LISTENER_MQ,
+		.options = GTUNE_LISTENER_MQ_OPT,
 		.bufsize = (BUFSIZE + 2*sizeof(void *) - 1) & -(2*sizeof(void *)),
 		.maxrewrite = MAXREWRITE,
 		.reserved_bufs = RESERVED_BUFS,
@@ -205,6 +205,7 @@ struct global global = {
 		.idle_timer = 1000, /* 1 second */
 #endif
 		.nb_stk_ctr = MAX_SESS_STKCTR,
+		.default_shards = -2, /* by-group */
 #ifdef USE_QUIC
 		.quic_backend_max_idle_timeout = QUIC_TP_DFLT_BACK_MAX_IDLE_TIMEOUT,
 		.quic_frontend_max_idle_timeout = QUIC_TP_DFLT_FRONT_MAX_IDLE_TIMEOUT,
@@ -1589,9 +1590,6 @@ static void init_args(int argc, char **argv)
 #if defined(USE_GETADDRINFO)
 	global.tune.options |= GTUNE_USE_GAI;
 #endif
-#if defined(SO_REUSEPORT)
-	global.tune.options |= GTUNE_USE_REUSEPORT;
-#endif
 #ifdef USE_THREAD
 	global.tune.options |= GTUNE_IDLE_POOL_SHARED;
 #endif
@@ -1650,7 +1648,7 @@ static void init_args(int argc, char **argv)
 #endif
 #if defined(SO_REUSEPORT)
 			else if (*flag == 'd' && flag[1] == 'R')
-				global.tune.options &= ~GTUNE_USE_REUSEPORT;
+				protocol_clrf_all(PROTO_F_REUSEPORT_SUPPORTED);
 #endif
 			else if (*flag == 'd' && flag[1] == 'F')
 				global.tune.options &= ~GTUNE_USE_FAST_FWD;

@@ -403,8 +403,12 @@ DECLARE_STATIC_POOL(pool_head_h2s, "h2s", sizeof(struct h2s));
 
 /* a few settings from the global section */
 static int h2_settings_header_table_size      =  4096; /* initial value */
-static int h2_settings_initial_window_size    = 65536; /* initial value */
-static unsigned int h2_settings_max_concurrent_streams = 100;
+static int h2_settings_initial_window_size    = 65536; /* default initial value */
+static int h2_be_settings_initial_window_size =     0; /* backend's default initial value */
+static int h2_fe_settings_initial_window_size =     0; /* frontend's default initial value */
+static unsigned int h2_settings_max_concurrent_streams    = 100; /* default value */
+static unsigned int h2_be_settings_max_concurrent_streams =   0; /* backend value */
+static unsigned int h2_fe_settings_max_concurrent_streams =   0; /* frontend value */
 static int h2_settings_max_frame_size         = 0;     /* unset */
 
 /* a dummy closed endpoint */
@@ -570,6 +574,23 @@ static inline int h2c_may_expire(const struct h2c *h2c)
 	return !h2c->nb_sc;
 }
 
+/* returns the number of max concurrent streams permitted on a connection,
+ * depending on its side (frontend or backend), falling back to the default
+ * h2_settings_max_concurrent_streams. It may even be zero.
+ */
+static inline int h2c_max_concurrent_streams(const struct h2c *h2c)
+{
+	int ret;
+
+	ret = (h2c->flags & H2_CF_IS_BACK) ?
+		h2_be_settings_max_concurrent_streams :
+		h2_fe_settings_max_concurrent_streams;
+
+	ret = ret ? ret : h2_settings_max_concurrent_streams;
+	return ret;
+}
+
+
 /* update h2c timeout if needed */
 static void h2c_update_timeout(struct h2c *h2c)
 {
@@ -713,7 +734,7 @@ static inline void h2c_restart_reading(const struct h2c *h2c, int consider_buffe
 /* returns true if the front connection has too many stream connectors attached */
 static inline int h2_frt_has_too_many_sc(const struct h2c *h2c)
 {
-	return h2c->nb_sc > h2_settings_max_concurrent_streams;
+	return h2c->nb_sc > h2c_max_concurrent_streams(h2c);
 }
 
 /* Tries to grab a buffer and to re-enable processing on mux <target>. The h2c
@@ -999,7 +1020,7 @@ static int h2_init(struct connection *conn, struct proxy *prx, struct session *s
 	/* Initialise the context. */
 	h2c->st0 = H2_CS_PREFACE;
 	h2c->conn = conn;
-	h2c->streams_limit = h2_settings_max_concurrent_streams;
+	h2c->streams_limit = h2c_max_concurrent_streams(h2c);
 	h2c->max_id = -1;
 	h2c->errcode = H2_ERR_NO_ERROR;
 	h2c->rcvd_c = 0;
@@ -1056,8 +1077,7 @@ static int h2_init(struct connection *conn, struct proxy *prx, struct session *s
 	hpack_dht_free(h2c->ddht);
   fail:
 	task_destroy(t);
-	if (h2c->wait_event.tasklet)
-		tasklet_free(h2c->wait_event.tasklet);
+	tasklet_free(h2c->wait_event.tasklet);
 	pool_free(pool_head_h2c, h2c);
   fail_no_h2c:
 	if (!conn_is_back(conn))
@@ -1119,8 +1139,7 @@ static void h2_release(struct h2c *h2c)
 		task_wakeup(h2c->task, TASK_WOKEN_OTHER);
 		h2c->task = NULL;
 	}
-	if (h2c->wait_event.tasklet)
-		tasklet_free(h2c->wait_event.tasklet);
+	tasklet_free(h2c->wait_event.tasklet);
 	if (conn && h2c->wait_event.events != 0)
 		conn->xprt->unsubscribe(conn, conn->xprt_ctx, h2c->wait_event.events,
 					&h2c->wait_event);
@@ -1526,7 +1545,7 @@ static struct h2s *h2c_frt_stream_new(struct h2c *h2c, int id, struct buffer *in
 
 	TRACE_ENTER(H2_EV_H2S_NEW, h2c->conn);
 
-	if (h2c->nb_streams >= h2_settings_max_concurrent_streams) {
+	if (h2c->nb_streams >= h2c_max_concurrent_streams(h2c)) {
 		TRACE_ERROR("HEADERS frame causing MAX_CONCURRENT_STREAMS to be exceeded", H2_EV_H2S_NEW|H2_EV_RX_FRAME|H2_EV_RX_HDR, h2c->conn);
 		goto out;
 	}
@@ -1641,7 +1660,9 @@ static int h2c_send_settings(struct h2c *h2c)
 	struct buffer *res;
 	char buf_data[100]; // enough for 15 settings
 	struct buffer buf;
+	int iws;
 	int mfs;
+	int mcs;
 	int ret = 0;
 
 	TRACE_ENTER(H2_EV_TX_FRAME|H2_EV_TX_SETTINGS, h2c->conn);
@@ -1670,20 +1691,26 @@ static int h2c_send_settings(struct h2c *h2c)
 		chunk_memcat(&buf, str, 6);
 	}
 
-	if (h2_settings_initial_window_size != 65535) {
+	iws = (h2c->flags & H2_CF_IS_BACK) ?
+	      h2_be_settings_initial_window_size:
+	      h2_fe_settings_initial_window_size;
+	iws = iws ? iws : h2_settings_initial_window_size;
+
+	if (iws != 65535) {
 		char str[6] = "\x00\x04"; /* initial_window_size */
 
-		write_n32(str + 2, h2_settings_initial_window_size);
+		write_n32(str + 2, iws);
 		chunk_memcat(&buf, str, 6);
 	}
 
-	if (h2_settings_max_concurrent_streams != 0) {
+	mcs = h2c_max_concurrent_streams(h2c);
+	if (mcs != 0) {
 		char str[6] = "\x00\x03"; /* max_concurrent_streams */
 
 		/* Note: 0 means "unlimited" for haproxy's config but not for
 		 * the protocol, so never send this value!
 		 */
-		write_n32(str + 2, h2_settings_max_concurrent_streams);
+		write_n32(str + 2, mcs);
 		chunk_memcat(&buf, str, 6);
 	}
 
@@ -2239,8 +2266,8 @@ static int h2c_handle_settings(struct h2c *h2c)
 		case H2_SETTINGS_MAX_CONCURRENT_STREAMS:
 			if (h2c->flags & H2_CF_IS_BACK) {
 				/* the limit is only for the backend; for the frontend it is our limit */
-				if ((unsigned int)arg > h2_settings_max_concurrent_streams)
-					arg = h2_settings_max_concurrent_streams;
+				if ((unsigned int)arg > h2c_max_concurrent_streams(h2c))
+					arg = h2c_max_concurrent_streams(h2c);
 				h2c->streams_limit = arg;
 			}
 			break;
@@ -6893,32 +6920,46 @@ static int h2_parse_header_table_size(char **args, int section_type, struct prox
 	return 0;
 }
 
-/* config parser for global "tune.h2.initial-window-size" */
+/* config parser for global "tune.h2.{be.,fe.,}initial-window-size" */
 static int h2_parse_initial_window_size(char **args, int section_type, struct proxy *curpx,
                                         const struct proxy *defpx, const char *file, int line,
                                         char **err)
 {
+	int *vptr;
+
 	if (too_many_args(1, args, err, NULL))
 		return -1;
 
-	h2_settings_initial_window_size = atoi(args[1]);
-	if (h2_settings_initial_window_size < 0) {
+	/* backend/frontend/default */
+	vptr = (args[0][8] == 'b') ? &h2_be_settings_initial_window_size :
+	       (args[0][8] == 'f') ? &h2_fe_settings_initial_window_size :
+	       &h2_settings_initial_window_size;
+
+	*vptr = atoi(args[1]);
+	if (*vptr < 0) {
 		memprintf(err, "'%s' expects a positive numeric value.", args[0]);
 		return -1;
 	}
 	return 0;
 }
 
-/* config parser for global "tune.h2.max-concurrent-streams" */
+/* config parser for global "tune.h2.{be.,fe.,}max-concurrent-streams" */
 static int h2_parse_max_concurrent_streams(char **args, int section_type, struct proxy *curpx,
                                            const struct proxy *defpx, const char *file, int line,
                                            char **err)
 {
+	uint *vptr;
+
 	if (too_many_args(1, args, err, NULL))
 		return -1;
 
-	h2_settings_max_concurrent_streams = atoi(args[1]);
-	if ((int)h2_settings_max_concurrent_streams < 0) {
+	/* backend/frontend/default */
+	vptr = (args[0][8] == 'b') ? &h2_be_settings_max_concurrent_streams :
+	       (args[0][8] == 'f') ? &h2_fe_settings_max_concurrent_streams :
+	       &h2_settings_max_concurrent_streams;
+
+	*vptr = atoi(args[1]);
+	if ((int)*vptr < 0) {
 		memprintf(err, "'%s' expects a positive numeric value.", args[0]);
 		return -1;
 	}
@@ -6977,6 +7018,10 @@ INITCALL1(STG_REGISTER, register_mux_proto, &mux_proto_h2);
 
 /* config keyword parsers */
 static struct cfg_kw_list cfg_kws = {ILH, {
+	{ CFG_GLOBAL, "tune.h2.be.initial-window-size", h2_parse_initial_window_size    },
+	{ CFG_GLOBAL, "tune.h2.be.max-concurrent-streams", h2_parse_max_concurrent_streams },
+	{ CFG_GLOBAL, "tune.h2.fe.initial-window-size", h2_parse_initial_window_size    },
+	{ CFG_GLOBAL, "tune.h2.fe.max-concurrent-streams", h2_parse_max_concurrent_streams },
 	{ CFG_GLOBAL, "tune.h2.header-table-size",      h2_parse_header_table_size      },
 	{ CFG_GLOBAL, "tune.h2.initial-window-size",    h2_parse_initial_window_size    },
 	{ CFG_GLOBAL, "tune.h2.max-concurrent-streams", h2_parse_max_concurrent_streams },

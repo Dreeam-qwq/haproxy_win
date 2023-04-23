@@ -58,7 +58,7 @@
 /* platform-specific options */
 #define GTUNE_USE_SPLICE         (1<<4)
 #define GTUNE_USE_GAI            (1<<5)
-#define GTUNE_USE_REUSEPORT      (1<<6)
+/* unused: (1<<6) */
 #define GTUNE_RESOLVE_DONTFAIL   (1<<7)
 
 #define GTUNE_SOCKET_TRANSFER	 (1<<8)
@@ -66,7 +66,7 @@
 #define GTUNE_USE_SYSTEMD        (1<<10)
 
 #define GTUNE_BUSY_POLLING       (1<<11)
-#define GTUNE_LISTENER_MQ        (1<<12)
+/* unused: (1<<12) */
 #define GTUNE_SET_DUMPABLE       (1<<13)
 #define GTUNE_USE_EVPORTS        (1<<14)
 #define GTUNE_STRICT_LIMITS      (1<<15)
@@ -81,6 +81,9 @@
 #define GTUNE_QUIC_SOCK_PER_CONN (1<<24)
 #define GTUNE_NO_QUIC            (1<<25)
 #define GTUNE_USE_FAST_FWD       (1<<26)
+#define GTUNE_LISTENER_MQ_FAIR   (1<<27)
+#define GTUNE_LISTENER_MQ_OPT    (1<<28)
+#define GTUNE_LISTENER_MQ_ANY    (GTUNE_LISTENER_MQ_FAIR | GTUNE_LISTENER_MQ_OPT)
 
 /* SSL server verify mode */
 enum {
@@ -165,6 +168,7 @@ struct global {
 		size_t pool_cache_size;    /* per-thread cache size per pool (defaults to CONFIG_HAP_POOL_CACHE_SIZE) */
 		unsigned short idle_timer; /* how long before an empty buffer is considered idle (ms) */
 		int nb_stk_ctr;       /* number of stick counters, defaults to MAX_SESS_STKCTR */
+		int default_shards; /* default shards for listeners, or -1 (by-thread) or -2 (by-group) */
 #ifdef USE_QUIC
 		unsigned int quic_backend_max_idle_timeout;
 		unsigned int quic_frontend_max_idle_timeout;

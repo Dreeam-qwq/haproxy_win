@@ -189,6 +189,30 @@ enum srv_log_proto {
         SRV_LOG_PROTO_OCTET_COUNTING, // TCP frames: MSGLEN SP MSG
 };
 
+/* srv administrative change causes */
+enum srv_adm_st_chg_cause {
+	SRV_ADM_STCHGC_NONE = 0,
+	SRV_ADM_STCHGC_DNS_NOENT,     /* entry removed from srv record */
+	SRV_ADM_STCHGC_DNS_NOIP,      /* no server ip in the srv record */
+	SRV_ADM_STCHGC_DNS_NX,        /* resolution spent too much time in NX state */
+	SRV_ADM_STCHGC_DNS_TIMEOUT,   /* resolution timeout */
+	SRV_ADM_STCHGC_DNS_REFUSED,   /* query refused by dns server */
+	SRV_ADM_STCHGC_DNS_UNSPEC,    /* unspecified dns error */
+	SRV_ADM_STCHGC_STATS_DISABLE, /* legacy disable from the stats */
+	SRV_ADM_STCHGC_STATS_STOP     /* legacy stop from the stats */
+};
+
+/* srv operational change causes */
+enum srv_op_st_chg_cause {
+	SRV_OP_STCHGC_NONE = 0,
+	SRV_OP_STCHGC_HEALTH,         /* changed from a health check */
+	SRV_OP_STCHGC_AGENT,          /* changed from an agent check */
+	SRV_OP_STCHGC_CLI,            /* changed from the cli */
+	SRV_OP_STCHGC_LUA,            /* changed from lua */
+	SRV_OP_STCHGC_STATS_WEB,      /* changed from the web interface */
+	SRV_OP_STCHGC_STATEFILE       /* changed from state file */
+};
+
 struct pid_list {
 	struct list list;
 	pid_t pid;
@@ -399,12 +423,6 @@ struct server {
 		int nb_low;
 		int nb_high;
 	} tmpl_info;
-	struct {
-		long duration;
-		short status, code;
-		char reason[128];
-	} op_st_chg;				/* operational status change's reason */
-	char adm_st_chg_cause[48];		/* administrative status change's cause */
 
 	event_hdl_sub_list e_subs;		/* event_hdl: server's subscribers list (atomically updated) */
 
@@ -420,6 +438,8 @@ struct server {
 struct event_hdl_cb_data_server {
 	/* provided by:
 	 *   EVENT_HDL_SUB_SERVER_ADD
+	 *   EVENT_HDL_SUB_SERVER_DEL
+	 *   EVENT_HDL_SUB_SERVER_UP
 	 *   EVENT_HDL_SUB_SERVER_DOWN
 	 */
 	struct {
@@ -429,6 +449,7 @@ struct event_hdl_cb_data_server {
 		 */
 		char name[64];       /* server name/id */
 		char proxy_name[64]; /* id of proxy the server belongs to */
+		int proxy_uuid;      /* uuid of the proxy the server belongs to */
 		int puid;            /* proxy-unique server ID */
 		uint32_t rid;        /* server id revision */
 		unsigned int flags;  /* server flags */

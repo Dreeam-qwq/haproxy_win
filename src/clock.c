@@ -60,6 +60,27 @@ uint64_t now_mono_time(void)
 	return ret;
 }
 
+/* Returns the system's monotonic time in nanoseconds.
+ * Uses the coarse clock source if supported (for fast but
+ * less precise queries with limited resource usage).
+ * Fallback to now_mono_time() if coarse source is not supported,
+ * which may itself return 0 if not supported either.
+ */
+uint64_t now_mono_time_fast(void)
+{
+#if defined(CLOCK_MONOTONIC_COARSE)
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC_COARSE, &ts);
+	return (ts.tv_sec * 1000000000ULL + ts.tv_nsec);
+#else
+	/* fallback to regular mono time,
+	 * returns 0 if not supported
+	 */
+	return now_mono_time();
+#endif
+}
+
 /* returns the current thread's cumulated CPU time in nanoseconds if supported, otherwise zero */
 uint64_t now_cpu_time(void)
 {
@@ -70,6 +91,32 @@ uint64_t now_cpu_time(void)
 	ret = ts.tv_sec * 1000000000ULL + ts.tv_nsec;
 #endif
 	return ret;
+}
+
+/* Returns the current thread's cumulated CPU time in nanoseconds.
+ *
+ * thread_local timer is cached so that call is less precise but also less
+ * expensive if heavily used.
+ * We use the mono time as a cache expiration hint since now_cpu_time() is
+ * known to be much more expensive than now_mono_time_fast() on systems
+ * supporting the COARSE clock source.
+ *
+ * Returns 0 if either now_mono_time_fast() or now_cpu_time() are not
+ * supported.
+ */
+uint64_t now_cpu_time_fast(void)
+{
+	static THREAD_LOCAL uint64_t mono_cache = 0;
+	static THREAD_LOCAL uint64_t cpu_cache = 0;
+	uint64_t mono_cur;
+
+	mono_cur = now_mono_time_fast();
+	if (unlikely(mono_cur !=  mono_cache)) {
+		/* global mono clock was updated: local cache is outdated */
+		cpu_cache = now_cpu_time();
+		mono_cache = mono_cur;
+	}
+	return cpu_cache;
 }
 
 /* returns another thread's cumulated CPU time in nanoseconds if supported, otherwise zero */

@@ -428,6 +428,31 @@ const char *get_analyze_status(short analyze_status) {
 		return analyze_statuses[HANA_STATUS_UNKNOWN].desc;
 }
 
+/* append check info to buffer msg */
+void check_append_info(struct buffer *msg, struct check *check)
+{
+	if (!check)
+		return;
+	chunk_appendf(msg, ", reason: %s", get_check_status_description(check->status));
+
+	if (check->status >= HCHK_STATUS_L57DATA)
+		chunk_appendf(msg, ", code: %d", check->code);
+
+	if (check->desc[0]) {
+		struct buffer src;
+
+		chunk_appendf(msg, ", info: \"");
+
+		chunk_initlen(&src, check->desc, 0, strlen(check->desc));
+		chunk_asciiencode(msg, &src, '"');
+
+		chunk_appendf(msg, "\"");
+	}
+
+	if (check->duration >= 0)
+		chunk_appendf(msg, ", check duration: %ldms", check->duration);
+}
+
 /* Sets check->status, update check->duration and fill check->result with an
  * adequate CHK_RES_* value. The new check->health is computed based on the
  * result.
@@ -528,7 +553,7 @@ void set_server_check_status(struct check *check, short status, const char *desc
 		             (check->result == CHK_RES_CONDPASS) ? "conditionally ":"",
 		             (check->result >= CHK_RES_PASSED)   ? "succeeded" : "failed");
 
-		srv_append_status(&trash, s, check, -1, 0);
+		check_append_info(&trash, check);
 
 		chunk_appendf(&trash, ", status: %d/%d %s",
 		             (check->health >= check->rise) ? check->health - check->rise + 1 : check->health,
@@ -539,6 +564,16 @@ void set_server_check_status(struct check *check, short status, const char *desc
 		send_log(s->proxy, LOG_NOTICE, "%s.\n", trash.area);
 		send_email_alert(s, LOG_INFO, "%s", trash.area);
 	}
+}
+
+static inline enum srv_op_st_chg_cause check_notify_cause(struct check *check)
+{
+	struct server *s = check->server;
+
+	/* We only report a cause for the check if we did not do so previously */
+	if (!s->track && !(s->proxy->options2 & PR_O2_LOGHCHKS))
+		return (check->state & CHK_ST_AGENT) ? SRV_OP_STCHGC_AGENT : SRV_OP_STCHGC_HEALTH;
+	return SRV_OP_STCHGC_NONE;
 }
 
 /* Marks the check <check>'s server down if the current check is already failed
@@ -561,8 +596,7 @@ void check_notify_failure(struct check *check)
 		return;
 
 	TRACE_STATE("health-check failed, set server DOWN", CHK_EV_HCHK_END|CHK_EV_HCHK_ERR, check);
-	/* We only report a reason for the check if we did not do so previously */
-	srv_set_stopped(s, NULL, (!s->track && !(s->proxy->options2 & PR_O2_LOGHCHKS)) ? check : NULL);
+	srv_set_stopped(s, check_notify_cause(check));
 }
 
 /* Marks the check <check> as valid and tries to set its server up, provided
@@ -596,7 +630,7 @@ void check_notify_success(struct check *check)
 		return;
 
 	TRACE_STATE("health-check succeeded, set server RUNNING", CHK_EV_HCHK_END|CHK_EV_HCHK_SUCC, check);
-	srv_set_running(s, NULL, (!s->track && !(s->proxy->options2 & PR_O2_LOGHCHKS)) ? check : NULL);
+	srv_set_running(s, check_notify_cause(check));
 }
 
 /* Marks the check <check> as valid and tries to set its server into stopping mode
@@ -625,7 +659,7 @@ void check_notify_stopping(struct check *check)
 		return;
 
 	TRACE_STATE("health-check condionnaly succeeded, set server STOPPING", CHK_EV_HCHK_END|CHK_EV_HCHK_SUCC, check);
-	srv_set_stopping(s, NULL, (!s->track && !(s->proxy->options2 & PR_O2_LOGHCHKS)) ? check : NULL);
+	srv_set_stopping(s, check_notify_cause(check));
 }
 
 /* note: use health_adjust() only, which first checks that the observe mode is

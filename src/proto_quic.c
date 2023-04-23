@@ -51,17 +51,22 @@
 
 /* per-thread quic datagram handlers */
 struct quic_dghdlr *quic_dghdlrs;
+struct eb_root *quic_cid_tree;
+
+/* global CID trees */
+#define QUIC_CID_TREES_CNT 256
+struct quic_cid_tree *quic_cid_trees;
 
 /* Size of the internal buffer of QUIC RX buffer at the fd level */
 #define QUIC_RX_BUFSZ  (1UL << 18)
 
 DECLARE_STATIC_POOL(pool_head_quic_rxbuf, "quic_rxbuf", QUIC_RX_BUFSZ);
 
-static void quic_add_listener(struct protocol *proto, struct listener *listener);
 static int quic_bind_listener(struct listener *listener, char *errmsg, int errlen);
 static int quic_connect_server(struct connection *conn, int flags);
 static void quic_enable_listener(struct listener *listener);
 static void quic_disable_listener(struct listener *listener);
+static int quic_set_affinity(struct connection *conn, int new_tid);
 
 /* Note: must not be declared <const> as its list will be overwritten */
 struct protocol proto_quic4 = {
@@ -72,7 +77,7 @@ struct protocol proto_quic4 = {
 	.listen         = quic_bind_listener,
 	.enable         = quic_enable_listener,
 	.disable        = quic_disable_listener,
-	.add            = quic_add_listener,
+	.add            = default_add_listener,
 	.unbind         = default_unbind_listener,
 	.suspend        = default_suspend_listener,
 	.resume         = default_resume_listener,
@@ -80,6 +85,7 @@ struct protocol proto_quic4 = {
 	.get_src        = quic_sock_get_src,
 	.get_dst        = quic_sock_get_dst,
 	.connect        = quic_connect_server,
+	.set_affinity   = quic_set_affinity,
 
 	/* binding layer */
 	.rx_suspend     = udp_suspend_receiver,
@@ -99,6 +105,9 @@ struct protocol proto_quic4 = {
 	.default_iocb   = quic_lstnr_sock_fd_iocb,
 	.receivers      = LIST_HEAD_INIT(proto_quic4.receivers),
 	.nb_receivers   = 0,
+#ifdef SO_REUSEPORT
+	.flags          = PROTO_F_REUSEPORT_SUPPORTED,
+#endif
 };
 
 INITCALL1(STG_REGISTER, protocol_register, &proto_quic4);
@@ -112,7 +121,7 @@ struct protocol proto_quic6 = {
 	.listen         = quic_bind_listener,
 	.enable         = quic_enable_listener,
 	.disable        = quic_disable_listener,
-	.add            = quic_add_listener,
+	.add            = default_add_listener,
 	.unbind         = default_unbind_listener,
 	.suspend        = default_suspend_listener,
 	.resume         = default_resume_listener,
@@ -120,6 +129,7 @@ struct protocol proto_quic6 = {
 	.get_src        = quic_sock_get_src,
 	.get_dst        = quic_sock_get_dst,
 	.connect        = quic_connect_server,
+	.set_affinity   = quic_set_affinity,
 
 	/* binding layer */
 	.rx_suspend     = udp_suspend_receiver,
@@ -139,6 +149,9 @@ struct protocol proto_quic6 = {
 	.default_iocb   = quic_lstnr_sock_fd_iocb,
 	.receivers      = LIST_HEAD_INIT(proto_quic6.receivers),
 	.nb_receivers   = 0,
+#ifdef SO_REUSEPORT
+	.flags          = PROTO_F_REUSEPORT_SUPPORTED,
+#endif
 };
 
 INITCALL1(STG_REGISTER, protocol_register, &proto_quic6);
@@ -520,17 +533,6 @@ int quic_connect_server(struct connection *conn, int flags)
 	return SF_ERR_NONE;  /* connection is OK */
 }
 
-/* Add listener <listener> to protocol <proto>. Technically speaking we just
- * initialize a few entries which should be doable during quic_bind_listener().
- * The end of the initialization goes on with the default function.
- */
-static void quic_add_listener(struct protocol *proto, struct listener *listener)
-{
-	listener->rx.flags |= RX_F_LOCAL_ACCEPT;
-
-	default_add_listener(proto, listener);
-}
-
 /* Allocate the RX buffers for <l> listener.
  * Return 1 if succeeded, 0 if not.
  */
@@ -711,6 +713,16 @@ static void quic_disable_listener(struct listener *l)
 		fd_stop_recv(l->rx.fd);
 }
 
+/* change the connection's thread to <new_tid>. For frontend connections, the
+ * target is a listener, and the caller is responsible for guaranteeing that
+ * the listener assigned to the connection is bound to the requested thread.
+ */
+static int quic_set_affinity(struct connection *conn, int new_tid)
+{
+	struct quic_conn *qc = conn->handle.qc;
+	return qc_set_tid_affinity(qc, new_tid, objt_listener(conn->target));
+}
+
 static int quic_alloc_dghdlrs(void)
 {
 	int i;
@@ -734,9 +746,18 @@ static int quic_alloc_dghdlrs(void)
 		dghdlr->task->context = dghdlr;
 		dghdlr->task->process = quic_lstnr_dghdlr;
 
-		dghdlr->cids = EB_ROOT_UNIQUE;
-
 		MT_LIST_INIT(&dghdlr->dgrams);
+	}
+
+	quic_cid_trees = calloc(QUIC_CID_TREES_CNT, sizeof(struct quic_cid_tree));
+	if (!quic_cid_trees) {
+		ha_alert("Failed to allocate global CIDs trees.\n");
+		return 0;
+	}
+
+	for (i = 0; i < QUIC_CID_TREES_CNT; ++i) {
+		HA_RWLOCK_INIT(&quic_cid_trees[i].lock);
+		quic_cid_trees[i].root = EB_ROOT_UNIQUE;
 	}
 
 	return 1;
@@ -752,6 +773,8 @@ static int quic_deallocate_dghdlrs(void)
 			tasklet_free(quic_dghdlrs[i].task);
 		free(quic_dghdlrs);
 	}
+
+	ha_free(&quic_cid_trees);
 
 	return 1;
 }

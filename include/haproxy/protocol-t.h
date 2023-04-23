@@ -64,6 +64,10 @@ enum proto_type {
 #define CONNECT_DELACK_ALWAYS                   0x00000004 /* Use a delayed ACK */
 #define CONNECT_CAN_USE_TFO                     0x00000008 /* We can use TFO for this connection */
 
+/* Flags for protocol->flags */
+#define PROTO_F_REUSEPORT_SUPPORTED             0x00000001 /* SO_REUSEPORT is supported */
+#define PROTO_F_REUSEPORT_TESTED                0x00000002 /* SO_REUSEPORT support was tested */
+
 /* protocol families define standard functions acting on a given address family
  * for a socket implementation, such as AF_INET/PF_INET for example.
  */
@@ -71,8 +75,9 @@ struct proto_fam {
 	char name[PROTO_NAME_LEN];                      /* family name, zero-terminated */
 	int sock_domain;				/* socket domain, as passed to socket()   */
 	sa_family_t sock_family;			/* socket family, for sockaddr */
+	ushort l3_addrlen;				/* layer3 address length, used by hashes */
 	socklen_t sock_addrlen;				/* socket address length, used by bind() */
-	int l3_addrlen;					/* layer3 address length, used by hashes */
+	/* 4-bytes hole here */
 	int (*addrcmp)(const struct sockaddr_storage *, const struct sockaddr_storage *); /* compare addresses (like memcmp) */
 	int (*bind)(struct receiver *rx, char **errmsg); /* bind a receiver */
 	int (*get_src)(int fd, struct sockaddr *, socklen_t, int dir); /* syscall used to retrieve connection's src addr */
@@ -113,6 +118,7 @@ struct protocol {
 	void (*ignore_events)(struct connection *conn, int event_type);  /* unsubscribe from socket events */
 	int (*get_src)(struct connection *conn, struct sockaddr *, socklen_t); /* retrieve connection's source address; -1=fail */
 	int (*get_dst)(struct connection *conn, struct sockaddr *, socklen_t); /* retrieve connection's dest address; -1=fail */
+	int (*set_affinity)(struct connection *conn, int new_tid);
 
 	/* functions acting on the receiver */
 	int (*rx_suspend)(struct receiver *rx);         /* temporarily suspend this receiver for a soft restart */
@@ -125,9 +131,9 @@ struct protocol {
 	/* default I/O handler */
 	void (*default_iocb)(int fd);                   /* generic I/O handler (typically accept callback) */
 
-
+	uint flags;                                     /* flags describing protocol support (PROTO_F_*) */
+	uint nb_receivers;                              /* number of receivers (under proto_lock) */
 	struct list receivers;				/* list of receivers using this protocol (under proto_lock) */
-	int nb_receivers;				/* number of receivers (under proto_lock) */
 	struct list list;				/* list of registered protocols (under proto_lock) */
 };
 

@@ -88,6 +88,9 @@ struct protocol proto_tcpv4 = {
 	.default_iocb   = sock_accept_iocb,
 	.receivers      = LIST_HEAD_INIT(proto_tcpv4.receivers),
 	.nb_receivers   = 0,
+#ifdef SO_REUSEPORT
+	.flags          = PROTO_F_REUSEPORT_SUPPORTED,
+#endif
 };
 
 INITCALL1(STG_REGISTER, protocol_register, &proto_tcpv4);
@@ -131,6 +134,9 @@ struct protocol proto_tcpv6 = {
 	.default_iocb   = sock_accept_iocb,
 	.receivers      = LIST_HEAD_INIT(proto_tcpv6.receivers),
 	.nb_receivers   = 0,
+#ifdef SO_REUSEPORT
+	.flags          = PROTO_F_REUSEPORT_SUPPORTED,
+#endif
 };
 
 INITCALL1(STG_REGISTER, protocol_register, &proto_tcpv6);
@@ -603,6 +609,9 @@ int tcp_bind_listener(struct listener *listener, char *errmsg, int errlen)
 		goto tcp_return;
 	}
 
+	if (listener->rx.flags & RX_F_MUST_DUP)
+		goto done;
+
 	fd = listener->rx.fd;
 
 	if (listener->bind_conf->options & BC_O_NOLINGER)
@@ -723,6 +732,7 @@ int tcp_bind_listener(struct listener *listener, char *errmsg, int errlen)
 		setsockopt(fd, IPPROTO_TCP, TCP_QUICKACK, &one, sizeof(one));
 #endif
 
+ done:
 	/* the socket is ready */
 	listener_set_state(listener, LI_LISTEN);
 	goto tcp_return;

@@ -627,8 +627,6 @@ int assign_server(struct stream *s)
 	struct server *srv = NULL, *prev_srv;
 	int err;
 
-	DPRINTF(stderr,"assign_server : s=%p\n",s);
-
 	err = SRV_STATUS_INTERNAL;
 	if (unlikely(s->pend_pos || s->flags & SF_ASSIGNED))
 		goto out_err;
@@ -1823,7 +1821,7 @@ skip_reuse:
 	 * loopback on a heavily loaded system.
 	 */
 	if (srv_conn->flags & CO_FL_ERROR)
-		sc_ep_set(s->scb, SE_FL_ERROR);
+		s->scb->flags |= SC_FL_ERROR;
 
 	/* If we had early data, and the handshake ended, then
 	 * we can remove the flag, and attempt to wake the task up,
@@ -1955,8 +1953,8 @@ int srv_redispatch_connect(struct stream *s)
 /* Check if the connection request is in such a state that it can be aborted. */
 static int back_may_abort_req(struct channel *req, struct stream *s)
 {
-	return (sc_ep_test(s->scf, SE_FL_ERROR) ||
-	        ((chn_cons(req)->flags & (SC_FL_SHUTW_NOW|SC_FL_SHUTW)) &&  /* empty and client aborted */
+	return ((s->scf->flags & SC_FL_ERROR) ||
+	        ((s->scb->flags & (SC_FL_SHUT_WANTED|SC_FL_SHUT_DONE)) &&  /* empty and client aborted */
 	         (channel_is_empty(req) || (s->be->options & PR_O_ABRT_CLOSE))));
 }
 
@@ -2022,9 +2020,9 @@ void back_try_conn_req(struct stream *s)
 				process_srv_queue(srv);
 
 			/* Failed and not retryable. */
-			sc_shutr(sc);
-			sc_shutw(sc);
-			sc_ep_set(sc, SE_FL_ERROR|SE_FL_EOS);
+			sc_abort(sc);
+			sc_shutdown(sc);
+			sc->flags |= SC_FL_ERROR;
 
 			s->logs.t_queue = tv_ms_elapsed(&s->logs.tv_accept, &now);
 
@@ -2044,7 +2042,7 @@ void back_try_conn_req(struct stream *s)
 		 * allocation problem, so we want to retry now.
 		 */
 		sc->state = SC_ST_CER;
-		sc_ep_clr(sc, SE_FL_ERROR);
+		sc->flags &= ~SC_FL_ERROR;
 		back_handle_st_cer(s);
 
 		DBG_TRACE_STATE("connection error, retry", STRM_EV_STRM_PROC|STRM_EV_CS_ST|STRM_EV_STRM_ERR, s);
@@ -2082,8 +2080,8 @@ void back_try_conn_req(struct stream *s)
 			if (srv)
 				_HA_ATOMIC_INC(&srv->counters.failed_conns);
 			_HA_ATOMIC_INC(&s->be->be_counters.failed_conns);
-			sc_shutr(sc);
-			sc_shutw(sc);
+			sc_abort(sc);
+			sc_shutdown(sc);
 			req->flags |= CF_WRITE_TIMEOUT;
 			if (!s->conn_err_type)
 				s->conn_err_type = STRM_ET_QUEUE_TO;
@@ -2142,8 +2140,8 @@ abort_connection:
 	/* give up */
 	s->conn_exp = TICK_ETERNITY;
 	s->flags &= ~SF_CONN_EXP;
-	sc_shutr(sc);
-	sc_shutw(sc);
+	sc_abort(sc);
+	sc_shutdown(sc);
 	sc->state = SC_ST_CLO;
 	if (s->srv_error)
 		s->srv_error(s, sc);
@@ -2182,9 +2180,9 @@ void back_handle_st_req(struct stream *s)
 			 */
 			s->flags &= ~(SF_ERR_MASK | SF_FINST_MASK);
 
-			sc_shutr(sc);
-			sc_shutw(sc);
-			sc_ep_set(sc, SE_FL_ERROR|SE_FL_EOS);
+			sc_abort(sc);
+			sc_shutdown(sc);
+			sc->flags |= SC_FL_ERROR;
 			s->conn_err_type = STRM_ET_CONN_RES;
 			sc->state = SC_ST_CLO;
 			if (s->srv_error)
@@ -2208,9 +2206,9 @@ void back_handle_st_req(struct stream *s)
 		}
 
 		/* we did not get any server, let's check the cause */
-		sc_shutr(sc);
-		sc_shutw(sc);
-		sc_ep_set(sc, SE_FL_ERROR|SE_FL_EOS);
+		sc_abort(sc);
+		sc_shutdown(sc);
+		sc->flags |= SC_FL_ERROR;
 		if (!s->conn_err_type)
 			s->conn_err_type = STRM_ET_CONN_OTHER;
 		sc->state = SC_ST_CLO;
@@ -2241,16 +2239,15 @@ void back_handle_st_con(struct stream *s)
 {
 	struct stconn *sc = s->scb;
 	struct channel *req = &s->req;
-	struct channel *rep = &s->res;
 
 	DBG_TRACE_ENTER(STRM_EV_STRM_PROC|STRM_EV_CS_ST, s);
 
 	/* the client might want to abort */
-	if ((chn_cons(rep)->flags & SC_FL_SHUTW) ||
-	    ((chn_cons(req)->flags & SC_FL_SHUTW_NOW) &&
+	if ((s->scf->flags & SC_FL_SHUT_DONE) ||
+	    ((s->scb->flags & SC_FL_SHUT_WANTED) &&
 	     (channel_is_empty(req) || (s->be->options & PR_O_ABRT_CLOSE)))) {
 		sc->flags |= SC_FL_NOLINGER;
-		sc_shutw(sc);
+		sc_shutdown(sc);
 		s->conn_err_type |= STRM_ET_CONN_ABRT;
 		if (s->srv_error)
 			s->srv_error(s, sc);
@@ -2261,9 +2258,9 @@ void back_handle_st_con(struct stream *s)
 
  done:
 	/* retryable error ? */
-	if ((s->flags & SF_CONN_EXP) || sc_ep_test(sc, SE_FL_ERROR)) {
+	if ((s->flags & SF_CONN_EXP) || (sc->flags & SC_FL_ERROR)) {
 		if (!s->conn_err_type) {
-			if (sc_ep_test(sc, SE_FL_ERROR))
+			if ((sc->flags & SC_FL_ERROR))
 				s->conn_err_type = STRM_ET_CONN_ERR;
 			else
 				s->conn_err_type = STRM_ET_CONN_TO;
@@ -2289,7 +2286,7 @@ void back_handle_st_con(struct stream *s)
 void back_handle_st_cer(struct stream *s)
 {
 	struct stconn *sc = s->scb;
-	int must_tar = sc_ep_test(sc, SE_FL_ERROR);
+	int must_tar = !!(sc->flags & SC_FL_ERROR);
 
 	DBG_TRACE_ENTER(STRM_EV_STRM_PROC|STRM_EV_CS_ST, s);
 
@@ -2307,7 +2304,7 @@ void back_handle_st_cer(struct stream *s)
 			_HA_ATOMIC_DEC(&__objt_server(s->target)->cur_sess);
 		}
 
-		if (sc_ep_test(sc, SE_FL_ERROR) &&
+		if ((sc->flags & SC_FL_ERROR) &&
 		    conn && conn->err_code == CO_ER_SSL_MISMATCH_SNI) {
 			/* We tried to connect to a server which is configured
 			 * with "verify required" and which doesn't have the
@@ -2344,8 +2341,8 @@ void back_handle_st_cer(struct stream *s)
 			process_srv_queue(objt_server(s->target));
 
 		/* shutw is enough to stop a connecting socket */
-		sc_shutw(sc);
-		sc_ep_set(sc, SE_FL_ERROR|SE_FL_EOS);
+		sc_shutdown(sc);
+		sc->flags |= SC_FL_ERROR;
 
 		sc->state = SC_ST_CLO;
 		if (s->srv_error)
@@ -2363,7 +2360,7 @@ void back_handle_st_cer(struct stream *s)
 	 * layers in an unexpected state (i.e < ST_CONN).
 	 *
 	 * Note: the stream connector will be switched to ST_REQ, ST_ASS or
-	 * ST_TAR and SE_FL_ERROR and SF_CONN_EXP flags will be unset.
+	 * ST_TAR and SC_FL_ERROR and SF_CONN_EXP flags will be unset.
 	 */
 	if (sc_reset_endp(sc) < 0) {
 		if (!s->conn_err_type)
@@ -2377,8 +2374,8 @@ void back_handle_st_cer(struct stream *s)
 			process_srv_queue(objt_server(s->target));
 
 		/* shutw is enough to stop a connecting socket */
-		sc_shutw(sc);
-		sc_ep_set(sc, SE_FL_ERROR|SE_FL_EOS);
+		sc_shutdown(sc);
+		sc->flags |= SC_FL_ERROR;
 
 		sc->state = SC_ST_CLO;
 		if (s->srv_error)
@@ -2434,7 +2431,6 @@ void back_handle_st_rdy(struct stream *s)
 {
 	struct stconn *sc = s->scb;
 	struct channel *req = &s->req;
-	struct channel *rep = &s->res;
 
 	DBG_TRACE_ENTER(STRM_EV_STRM_PROC|STRM_EV_CS_ST, s);
 
@@ -2470,12 +2466,12 @@ void back_handle_st_rdy(struct stream *s)
 	 */
 	if (!(req->flags & CF_WROTE_DATA)) {
 		/* client abort ? */
-		if ((chn_cons(rep)->flags & SC_FL_SHUTW) ||
-		    ((chn_cons(req)->flags & SC_FL_SHUTW_NOW) &&
+		if ((s->scf->flags & SC_FL_SHUT_DONE) ||
+		    ((s->scb->flags & SC_FL_SHUT_WANTED) &&
 		     (channel_is_empty(req) || (s->be->options & PR_O_ABRT_CLOSE)))) {
 			/* give up */
 			sc->flags |= SC_FL_NOLINGER;
-			sc_shutw(sc);
+			sc_shutdown(sc);
 			s->conn_err_type |= STRM_ET_CONN_ABRT;
 			if (s->srv_error)
 				s->srv_error(s, sc);
@@ -2484,7 +2480,7 @@ void back_handle_st_rdy(struct stream *s)
 		}
 
 		/* retryable error ? */
-		if (sc_ep_test(sc, SE_FL_ERROR)) {
+		if (sc->flags & SC_FL_ERROR) {
 			if (!s->conn_err_type)
 				s->conn_err_type = STRM_ET_CONN_ERR;
 			sc->state = SC_ST_CER;

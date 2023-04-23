@@ -71,6 +71,7 @@
 #include <haproxy/namespace.h>
 #include <haproxy/quic_sock.h>
 #include <haproxy/obj_type-t.h>
+#include <haproxy/openssl-compat.h>
 #include <haproxy/peers-t.h>
 #include <haproxy/peers.h>
 #include <haproxy/pool.h>
@@ -2700,6 +2701,9 @@ static int numa_detect_topology()
 	BUG_ON(ndomains > MAXMEMDOM);
 	ha_cpuset_zero(&node_cpu_set);
 
+	if (ndomains < 2)
+		goto leave;
+
 	/*
 	 * We retrieve the first active valid CPU domain
 	 * with active cpu and binding it, we returns
@@ -2725,7 +2729,7 @@ static int numa_detect_topology()
 		}
 		break;
 	}
-
+ leave:
 	return ha_cpuset_count(&node_cpu_set);
 }
 
@@ -2926,12 +2930,42 @@ init_proxies_list_stage1:
 
 		/* check and reduce the bind-proc of each listener */
 		list_for_each_entry(bind_conf, &curproxy->conf.bind, by_fe) {
-			struct listener *li;
+			int ret;
 
 			/* HTTP frontends with "h2" as ALPN/NPN will work in
 			 * HTTP/2 and absolutely require buffers 16kB or larger.
 			 */
 #ifdef USE_OPENSSL
+			/* no-alpn ? If so, it's the right moment to remove it */
+			if (bind_conf->ssl_conf.alpn_str && !bind_conf->ssl_conf.alpn_len) {
+				free(bind_conf->ssl_conf.alpn_str);
+				bind_conf->ssl_conf.alpn_str = NULL;
+			}
+#ifdef TLSEXT_TYPE_application_layer_protocol_negotiation
+			else if (!bind_conf->ssl_conf.alpn_str && !bind_conf->ssl_conf.npn_str &&
+				 ((bind_conf->options & BC_O_USE_SSL) || bind_conf->xprt == xprt_get(XPRT_QUIC)) &&
+				 curproxy->mode == PR_MODE_HTTP && global.tune.bufsize >= 16384) {
+
+				/* Neither ALPN nor NPN were explicitly set nor disabled, we're
+				 * in HTTP mode with an SSL or QUIC listener, we can enable ALPN.
+				 * Note that it's in binary form.
+				 */
+				if (bind_conf->xprt == xprt_get(XPRT_QUIC))
+					bind_conf->ssl_conf.alpn_str = strdup("\002h3");
+				else
+					bind_conf->ssl_conf.alpn_str = strdup("\002h2\010http/1.1");
+
+				if (!bind_conf->ssl_conf.alpn_str) {
+					ha_alert("Proxy '%s': out of memory while trying to allocate a default alpn string in 'bind %s' at [%s:%d].\n",
+						 curproxy->id, bind_conf->arg, bind_conf->file, bind_conf->line);
+					cfgerr++;
+					err_code |= ERR_FATAL | ERR_ALERT;
+					goto out;
+				}
+				bind_conf->ssl_conf.alpn_len = strlen(bind_conf->ssl_conf.alpn_str);
+			}
+#endif
+
 			if (curproxy->mode == PR_MODE_HTTP && global.tune.bufsize < 16384) {
 #ifdef OPENSSL_NPN_NEGOTIATED
 				/* check NPN */
@@ -2952,88 +2986,12 @@ init_proxies_list_stage1:
 			} /* HTTP && bufsize < 16384 */
 #endif
 
-			/* detect and address thread affinity inconsistencies */
-			err = NULL;
-			if (thread_resolve_group_mask(&bind_conf->thread_set, (curproxy == global.cli_fe) ? 1 : 0, &err) < 0) {
-				ha_alert("Proxy '%s': %s in 'bind %s' at [%s:%d].\n",
-					   curproxy->id, err, bind_conf->arg, bind_conf->file, bind_conf->line);
-				free(err);
-				cfgerr++;
-				continue;
-			}
-
-			/* apply thread masks and groups to all receivers */
-			list_for_each_entry(li, &bind_conf->listeners, by_bind) {
-				struct listener *new_li;
-				struct thread_set new_ts;
-				int shard, shards, todo, done, grp;
-				ulong mask, bit;
-
-				shards = bind_conf->settings.shards;
-				todo = thread_set_count(&bind_conf->thread_set);
-
-				/* no more shards than total threads */
-				if (shards > todo)
-					shards = todo;
-
-				shard = done = grp = bit = mask = 0;
-				new_li = li;
-
-				while (shard < shards) {
-					memset(&new_ts, 0, sizeof(new_ts));
-					while (grp < global.nbtgroups && done < todo) {
-						/* enlarge mask to cover next bit of bind_thread till we
-						 * have enough bits for one shard. We restart from the
-						 * current grp+bit.
-						 */
-
-						/* first let's find the first non-empty group starting at <mask> */
-						if (!(bind_conf->thread_set.rel[grp] & ha_tgroup_info[grp].threads_enabled & ~mask)) {
-							grp++;
-							mask = 0;
-							continue;
-						}
-
-						/* take next unassigned bit */
-						bit = (bind_conf->thread_set.rel[grp] & ~mask) & -(bind_conf->thread_set.rel[grp] & ~mask);
-						new_ts.rel[grp] |= bit;
-						mask |= bit;
-
-						if (!atleast2(new_ts.rel[grp])) // first time we add a bit: new group
-							new_ts.nbgrp++;
-
-						done += shards;
-					};
-
-					BUG_ON(!new_ts.nbgrp); // no more bits left unassigned
-
-					if (new_ts.nbgrp > 1) {
-						ha_alert("Proxy '%s': shard number %d spans %d groups in 'bind %s' at [%s:%d]\n",
-							 curproxy->id, shard, new_ts.nbgrp, bind_conf->arg, bind_conf->file, bind_conf->line);
-						cfgerr++;
-						err_code |= ERR_FATAL | ERR_ALERT;
-						goto out;
-					}
-
-					/* assign the first (and only) thread and group */
-					new_li->rx.bind_thread = thread_set_nth_tmask(&new_ts, 0);
-					new_li->rx.bind_tgroup = thread_set_nth_group(&new_ts, 0);
-					done -= todo;
-
-					shard++;
-					if (shard >= shards)
-						break;
-
-					/* create another listener for new shards */
-					new_li = clone_listener(li);
-					if (!new_li) {
-						ha_alert("Out of memory while trying to allocate extra listener for shard %d in %s %s\n",
-							 shard, proxy_type_str(curproxy), curproxy->id);
-						cfgerr++;
-						err_code |= ERR_FATAL | ERR_ALERT;
-						goto out;
-					}
-				}
+			/* finish the bind setup */
+			ret = bind_complete_thread_setup(bind_conf, &err_code);
+			if (ret != 0) {
+				cfgerr += ret;
+				if (err_code & ERR_FATAL)
+					goto out;
 			}
 		}
 
@@ -4427,7 +4385,7 @@ init_proxies_list_stage2:
 				if (!LIST_ISEMPTY(&curpeers->peers_fe->conf.bind)) {
 					struct list *l;
 					struct bind_conf *bind_conf;
-					struct listener *li;
+					int ret;
 
 					l = &curpeers->peers_fe->conf.bind;
 					bind_conf = LIST_ELEM(l->n, typeof(bind_conf), by_fe);
@@ -4443,23 +4401,12 @@ init_proxies_list_stage2:
 						}
 					}
 
-					err = NULL;
-					if (thread_resolve_group_mask(&bind_conf->thread_set, 1, &err) < 0) {
-						ha_alert("Peers section '%s': %s in 'bind %s' at [%s:%d].\n",
-							 curpeers->peers_fe->id, err, bind_conf->arg, bind_conf->file, bind_conf->line);
-						free(err);
-						cfgerr++;
-					}
-					else if (bind_conf->thread_set.nbgrp > 1) {
-						ha_alert("Peers section '%s': 'thread' spans more than one group in 'bind %s' at [%s:%d].\n",
-							 curpeers->peers_fe->id, bind_conf->arg, bind_conf->file, bind_conf->line);
-						cfgerr++;
-					}
-
-					/* apply thread masks and groups to all receivers */
-					list_for_each_entry(li, &bind_conf->listeners, by_bind) {
-						li->rx.bind_thread = thread_set_nth_tmask(&bind_conf->thread_set, 0);
-						li->rx.bind_tgroup = thread_set_nth_group(&bind_conf->thread_set, 0);
+					/* finish the bind setup */
+					ret = bind_complete_thread_setup(bind_conf, &err_code);
+					if (ret != 0) {
+						cfgerr += ret;
+						if (err_code & ERR_FATAL)
+							goto out;
 					}
 
 					if (bind_conf->xprt->prepare_bind_conf &&

@@ -147,10 +147,10 @@ int quic_sock_accepting_conn(const struct receiver *rx)
 struct connection *quic_sock_accept_conn(struct listener *l, int *status)
 {
 	struct quic_conn *qc;
-	struct li_per_thread *lthr = &l->per_thr[tid];
+	struct li_per_thread *lthr = &l->per_thr[ti->ltid];
 
 	qc = MT_LIST_POP(&lthr->quic_accept.conns, struct quic_conn *, accept_list);
-	if (!qc)
+	if (!qc || qc->flags & (QUIC_FL_CONN_CLOSING|QUIC_FL_CONN_DRAINING))
 		goto done;
 
 	if (!new_quic_cli_conn(qc, l, &qc->peer_addr))
@@ -209,7 +209,6 @@ static int quic_lstnr_dgram_dispatch(unsigned char *buf, size_t len, void *owner
                                      struct quic_dgram *new_dgram, struct list *dgrams)
 {
 	struct quic_dgram *dgram;
-	const struct listener *l = owner;
 	unsigned char *dcid;
 	size_t dcid_len;
 	int cid_tid;
@@ -221,7 +220,16 @@ static int quic_lstnr_dgram_dispatch(unsigned char *buf, size_t len, void *owner
 	if (!dgram)
 		goto err;
 
-	cid_tid = quic_get_cid_tid(dcid, &l->rx);
+	if ((cid_tid = quic_get_cid_tid(dcid, dcid_len, saddr, buf, len)) < 0) {
+		/* Use the current thread if CID not found. If a clients opens
+		 * a connection with multiple packets, it is possible that
+		 * several threads will deal with datagrams sharing the same
+		 * CID. For this reason, the CID tree insertion will be
+		 * conducted as an atomic operation and the datagram ultimately
+		 * redispatch by the late thread.
+		 */
+		cid_tid = tid;
+	}
 
 	/* All the members must be initialized! */
 	dgram->owner = owner;
@@ -270,8 +278,7 @@ static struct quic_dgram *quic_rxbuf_purge_dgrams(struct quic_receiver_buf *buf)
 		b_del(&buf->buf, cur->len);
 
 		/* Free last found unused datagram. */
-		if (prev)
-			pool_free(pool_head_quic_dgram, prev);
+		pool_free(pool_head_quic_dgram, prev);
 		prev = cur;
 	}
 
@@ -870,6 +877,15 @@ void qc_release_fd(struct quic_conn *qc, int reinit)
 	}
 }
 
+/* Wrapper for fd_want_recv(). Safe even if connection does not used its owned
+ * socket.
+ */
+void qc_want_recv(struct quic_conn *qc)
+{
+	if (qc_test_fd(qc))
+		fd_want_recv(qc->fd);
+}
+
 /*********************** QUIC accept queue management ***********************/
 /* per-thread accept queues */
 struct quic_accept_queue *quic_accept_queues;
@@ -879,8 +895,8 @@ struct quic_accept_queue *quic_accept_queues;
  */
 void quic_accept_push_qc(struct quic_conn *qc)
 {
-	struct quic_accept_queue *queue = &quic_accept_queues[qc->tid];
-	struct li_per_thread *lthr = &qc->li->per_thr[qc->tid];
+	struct quic_accept_queue *queue = &quic_accept_queues[tid];
+	struct li_per_thread *lthr = &qc->li->per_thr[ti->ltid];
 
 	/* early return if accept is already in progress/done for this
 	 * connection
@@ -904,7 +920,7 @@ void quic_accept_push_qc(struct quic_conn *qc)
 	MT_LIST_APPEND(&lthr->quic_accept.conns, &qc->accept_list);
 
 	/* 3. wake up the queue tasklet */
-	tasklet_wakeup(quic_accept_queues[qc->tid].tasklet);
+	tasklet_wakeup(quic_accept_queues[tid].tasklet);
 }
 
 /* Tasklet handler to accept QUIC connections. Call listener_accept on every

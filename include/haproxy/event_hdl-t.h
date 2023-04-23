@@ -23,6 +23,7 @@
 # define _HAPROXY_EVENT_HDL_T_H
 
 #include <stdint.h>
+#include <sys/time.h>
 
 #include <haproxy/api-t.h>
 
@@ -56,10 +57,15 @@ struct event_hdl_cb_data_template {
  * refcount is used to keep track of references so that
  * data can be freed when not used anymore
  */
+typedef void (*event_hdl_data_free)(const void *data);
 struct event_hdl_async_event_data
 {
 	/* internal storage */
 	char data[EVENT_HDL_ASYNC_EVENT_DATA];
+	/* user-provided free function if event data relies on
+	 * dynamic members that require specific cleanup
+	 */
+	event_hdl_data_free mfree;
 	uint32_t refcount;
 };
 
@@ -115,6 +121,7 @@ struct event_hdl_async_event
 	 */
 	void					*data;
 	void	 				*private;
+	struct timeval				when;
 	struct event_hdl_sub_mgmt		sub_mgmt;
 };
 
@@ -126,6 +133,10 @@ struct event_hdl_cb_data {
 	void *_ptr;
 	/* internal use: holds actual data size*/
 	size_t _size;
+	/* user specified freeing function for event_hdl_cb_data_type
+	 * struct members
+	 */
+	event_hdl_data_free _mfree;
 };
 
 /* struct provided to event_hdl_cb_* handlers
@@ -141,11 +152,12 @@ struct event_hdl_cb
 	/* manage the subscription responsible for handing the event to us */
 	const struct event_hdl_sub_mgmt	*sub_mgmt;
 
-	/* used for the function wants to make sure
+	/* may be used by sync event handler to ensure
 	 * it runs in sync mode, and thus is eligible to access unsafe data.
 	 * This could save the day when users are copy-pasting function
 	 * logic from a sync handler to an async handler without
 	 * taking appropriate precautions and unsafe accesses are performed.
+	 * (See EVENT_HDL_ASSERT_SYNC macro API helper)
 	 */
 	uint8_t				_sync;
 };
@@ -229,7 +241,7 @@ struct event_hdl_sub {
 	/* TODO: atomic_call_counter for stats?! */
 };
 
-#define ESUB_INDEX(n)				(1 << n)
+#define ESUB_INDEX(n)				(1 << (n - 1))
 
 #define EVENT_HDL_SUB_TYPE(_family, _type)	((struct event_hdl_sub_type){ .family = _family, .subtype = ESUB_INDEX(_type) })
 #define EVENT_HDL_SUB_FAMILY(_family)		((struct event_hdl_sub_type){ .family = _family, .subtype = ~0 })

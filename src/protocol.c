@@ -21,6 +21,7 @@
 #include <haproxy/proto_quic.h>
 #include <haproxy/protocol.h>
 #include <haproxy/proxy.h>
+#include <haproxy/sock.h>
 #include <haproxy/tools.h>
 
 
@@ -59,6 +60,58 @@ void protocol_unregister(struct protocol *proto)
 	LIST_DELETE(&proto->list);
 	LIST_INIT(&proto->list);
 	HA_SPIN_UNLOCK(PROTO_LOCK, &proto_lock);
+}
+
+/* clears flag <flag> on all protocols. */
+void protocol_clrf_all(uint flag)
+{
+	struct protocol *proto;
+
+	HA_SPIN_LOCK(PROTO_LOCK, &proto_lock);
+	list_for_each_entry(proto, &protocols, list)
+		proto->flags &= ~flag;
+	HA_SPIN_UNLOCK(PROTO_LOCK, &proto_lock);
+}
+
+/* sets flag <flag> on all protocols. */
+void protocol_setf_all(uint flag)
+{
+	struct protocol *proto;
+
+	HA_SPIN_LOCK(PROTO_LOCK, &proto_lock);
+	list_for_each_entry(proto, &protocols, list)
+		proto->flags |= flag;
+	HA_SPIN_UNLOCK(PROTO_LOCK, &proto_lock);
+}
+
+/* Checks if protocol <proto> supports PROTO_F flag <flag>. Returns zero if not,
+ * non-zero if supported. It may return a cached value from a previous test,
+ * and may run live tests then update the proto's flags to cache a result. It's
+ * better to call it only if needed so that it doesn't result in modules being
+ * loaded in case of a live test. It is only supposed to be used during boot.
+ */
+int protocol_supports_flag(struct protocol *proto, uint flag)
+{
+	if (flag == PROTO_F_REUSEPORT_SUPPORTED) {
+		int ret = 0;
+
+		/* check if the protocol supports SO_REUSEPORT */
+		if (!(_HA_ATOMIC_LOAD(&proto->flags) & PROTO_F_REUSEPORT_SUPPORTED))
+			return 0;
+
+		/* at least nobody said it was not supported */
+		if (_HA_ATOMIC_LOAD(&proto->flags) & PROTO_F_REUSEPORT_TESTED)
+			return 1;
+
+		/* run a live check */
+		ret = _sock_supports_reuseport(proto->fam, proto->sock_type, proto->sock_prot);
+		if (!ret)
+			_HA_ATOMIC_AND(&proto->flags, ~PROTO_F_REUSEPORT_SUPPORTED);
+
+		_HA_ATOMIC_OR(&proto->flags, PROTO_F_REUSEPORT_TESTED);
+		return ret;
+	}
+	return 0;
 }
 
 /* binds all listeners of all registered protocols. Returns a composition

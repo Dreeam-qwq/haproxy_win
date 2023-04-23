@@ -142,7 +142,7 @@ enum sc_flags {
 	SC_FL_ISBACK        = 0x00000001,  /* Set for SC on back-side */
 
 	SC_FL_EOI           = 0x00000002,  /* End of input was reached. no more data will be received from the endpoint */
-	/* not used: 0x00000004 */
+	SC_FL_ERROR         = 0x00000004,  /* A fatal error was reported */
 
 	SC_FL_NOLINGER      = 0x00000008,  /* may close without lingering. One-shot. */
 	SC_FL_NOHALF        = 0x00000010,  /* no half close, close both sides at once */
@@ -153,15 +153,17 @@ enum sc_flags {
 	SC_FL_NEED_BUFF     = 0x00000100,  /* SC waits for an rx buffer allocation to complete */
 	SC_FL_NEED_ROOM     = 0x00000200,  /* SC needs more room in the rx buffer to store incoming data */
 
-	SC_FL_RCV_ONCE      = 0x00000400,  /* Don't loop to receive data. cleared after a sucessful receive */
+	SC_FL_RCV_ONCE      = 0x00000400,  /* Don't loop to receive data. cleared after a successful receive */
 	SC_FL_SND_ASAP      = 0x00000800,  /* Don't wait for sending. cleared when all data were sent */
 	SC_FL_SND_NEVERWAIT = 0x00001000,  /* Never wait for sending (permanent) */
 	SC_FL_SND_EXP_MORE  = 0x00001000,  /* More data expected to be sent very soon. cleared when all data were sent */
 
-	SC_FL_SHUTR_NOW     = 0x00002000,  /* SC is shut down for reads */
-	SC_FL_SHUTW_NOW     = 0x00004000,  /* SC must shut down for reads ASAP */
-	SC_FL_SHUTR         = 0x00008000,  /* SC is shut down for writes */
-	SC_FL_SHUTW         = 0x00010000,  /* SC must shut down for writes ASAP */
+	SC_FL_ABRT_WANTED   = 0x00002000,  /* An abort was requested and must be performed ASAP (up side to down side) */
+	SC_FL_SHUT_WANTED   = 0x00004000,  /* A shutdown was requested and mux be performed ASAP (up side to down side) */
+	SC_FL_ABRT_DONE     = 0x00008000,  /* An abort was performed for the SC */
+	SC_FL_SHUT_DONE     = 0x00010000,  /* A shutdown was performed for the SC */
+
+	SC_FL_EOS           = 0x00020000,  /* End of stream was reached (from down side to up side) */
 };
 
 /* This function is used to report flags in debugging tools. Please reflect
@@ -174,11 +176,12 @@ static forceinline char *sc_show_flags(char *buf, size_t len, const char *delim,
 	/* prologue */
 	_(0);
 	/* flags */
-	_(SC_FL_ISBACK, _(SC_FL_EOI, _(SC_FL_NOLINGER, _(SC_FL_NOHALF,
+	_(SC_FL_ISBACK, _(SC_FL_EOI, _(SC_FL_ERROR, _(SC_FL_NOLINGER, _(SC_FL_NOHALF,
 	_(SC_FL_DONT_WAKE, _(SC_FL_INDEP_STR, _(SC_FL_WONT_READ,
 	_(SC_FL_NEED_BUFF, _(SC_FL_NEED_ROOM,
         _(SC_FL_RCV_ONCE, _(SC_FL_SND_ASAP, _(SC_FL_SND_NEVERWAIT, _(SC_FL_SND_EXP_MORE,
-	_(SC_FL_SHUTR_NOW, _(SC_FL_SHUTW_NOW, _(SC_FL_SHUTR, _(SC_FL_SHUTW)))))))))))))))));
+	_(SC_FL_ABRT_WANTED, _(SC_FL_SHUT_WANTED, _(SC_FL_ABRT_DONE, _(SC_FL_SHUT_DONE,
+	_(SC_FL_EOS)))))))))))))))))));
 	/* epilogue */
 	_(~0U);
 	return buf;
@@ -265,8 +268,8 @@ struct sedesc {
 struct sc_app_ops {
 	void (*chk_rcv)(struct stconn *);    /* chk_rcv function, may not be null */
 	void (*chk_snd)(struct stconn *);    /* chk_snd function, may not be null */
-	void (*shutr)(struct stconn *);      /* shut read function, may not be null */
-	void (*shutw)(struct stconn *);      /* shut write function, may not be null */
+	void (*abort)(struct stconn *);      /* abort function, may not be null */
+	void (*shutdown)(struct stconn *);   /* shutdown function, may not be null */
 	int  (*wake)(struct stconn *);       /* data-layer callback to report activity */
 	char name[8];                        /* data layer name, zero-terminated */
 };

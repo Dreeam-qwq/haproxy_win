@@ -229,7 +229,7 @@ struct listener {
 	uint16_t flags;                 /* listener flags: LI_F_* */
 	int luid;			/* listener universally unique ID, used for SNMP */
 	int nbconn;			/* current number of connections on this listener */
-	unsigned int thr_idx;           /* thread indexes for queue distribution : (t2<<16)+t1 */
+	unsigned long thr_idx;          /* thread indexes for queue distribution (see listener_accept()) */
 	__decl_thread(HA_RWLOCK_T lock);
 
 	struct fe_counters *counters;	/* statistics counters */
@@ -246,7 +246,7 @@ struct listener {
 		struct eb32_node id;	/* place in the tree of used IDs */
 	} conf;				/* config information */
 
-	struct li_per_thread *per_thr;  /* per-thread fields */
+	struct li_per_thread *per_thr;  /* per-thread fields (one per thread in the group) */
 
 	EXTRA_COUNTERS(extra_counters);
 };
@@ -289,9 +289,9 @@ struct bind_kw_list {
 /* The per-thread accept queue ring, must be a power of two minus 1 */
 #define ACCEPT_QUEUE_SIZE ((1<<10) - 1)
 
+/* head and tail are both 16 bits so that idx can be accessed atomically */
 struct accept_queue_ring {
-	unsigned int head;
-	unsigned int tail;
+	uint32_t idx;             /* (head << 16) | tail */
 	struct tasklet *tasklet;  /* tasklet of the thread owning this ring */
 	struct connection *entry[ACCEPT_QUEUE_SIZE] __attribute((aligned(64)));
 };

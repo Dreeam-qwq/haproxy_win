@@ -131,6 +131,9 @@ enum quic_pkt_type {
 	 * own convenience.
 	 */
 	QUIC_PACKET_TYPE_SHORT,
+
+	/* unknown type */
+	QUIC_PACKET_TYPE_UNKNOWN
 };
 
 /* Packet number field length. */
@@ -228,6 +231,7 @@ enum quic_pkt_type {
 #define           QUIC_EV_CONN_RCV       (1ULL << 48)
 #define           QUIC_EV_CONN_KILL      (1ULL << 49)
 #define           QUIC_EV_CONN_KP        (1ULL << 50)
+#define           QUIC_EV_CONN_SET_AFFINITY (1ULL << 52)
 
 /* Similar to kernel min()/max() definitions. */
 #define QUIC_MIN(a, b) ({ \
@@ -300,6 +304,7 @@ struct quic_connection_id {
 	struct quic_cid cid;   /* CID data */
 
 	struct quic_conn *qc;  /* QUIC connection using this CID */
+	uint tid;              /* Attached Thread ID for the connection. */
 };
 
 /* Structure to hold a range of ACKs sent in ACK frames. */
@@ -315,6 +320,9 @@ struct quic_arng_node {
 	struct eb64_node first;
 	uint64_t last;
 };
+
+/* The maximum number of ack ranges to be built in ACK frames */
+#define QUIC_MAX_ACK_RANGES   32
 
 /* Structure to maintain a set of ACK ranges to be used to build ACK frames. */
 struct quic_arngs {
@@ -441,7 +449,6 @@ struct quic_rx_packet {
 struct quic_dghdlr {
 	struct mt_list dgrams;
 	struct tasklet *task;
-	struct eb_root cids;
 };
 
 /* Structure to store enough information about the RX CRYPTO frames. */
@@ -579,6 +586,7 @@ struct quic_path {
 	size_t mtu;
 	/* Congestion window. */
 	uint64_t cwnd;
+	uint64_t mcwnd;
 	/* Minimum congestion window. */
 	uint64_t min_cwnd;
 	/* Prepared data to be sent (in bytes). */
@@ -612,7 +620,7 @@ enum qc_mux_state {
 /* Flags at connection level */
 #define QUIC_FL_CONN_ANTI_AMPLIFICATION_REACHED  (1U << 0)
 #define QUIC_FL_CONN_SPIN_BIT                    (1U << 1) /* Spin bit set by remote peer */
-#define QUIC_FL_CONN_POST_HANDSHAKE_FRAMES_BUILT (1U << 2)
+#define QUIC_FL_CONN_NEED_POST_HANDSHAKE_FRMS    (1U << 2) /* HANDSHAKE_DONE must be sent */
 #define QUIC_FL_CONN_LISTENER                    (1U << 3)
 #define QUIC_FL_CONN_ACCEPT_REGISTERED           (1U << 4)
 #define QUIC_FL_CONN_TX_MUX_CONTEXT              (1U << 5) /* sending in progress from the MUX layer */
@@ -624,6 +632,7 @@ enum qc_mux_state {
 #define QUIC_FL_CONN_HALF_OPEN_CNT_DECREMENTED   (1U << 11) /* The half-open connection counter was decremented */
 #define QUIC_FL_CONN_HANDSHAKE_SPEED_UP          (1U << 12) /* Handshake speeding up was done */
 #define QUIC_FL_CONN_ACK_TIMER_FIRED             (1U << 13) /* idle timer triggered for acknowledgements */
+#define QUIC_FL_CONN_IO_TO_REQUEUE               (1U << 14) /* IO handler must be requeued on new thread after connection migration */
 #define QUIC_FL_CONN_TO_KILL                     (1U << 24) /* Unusable connection, to be killed */
 #define QUIC_FL_CONN_TX_TP_RECEIVED              (1U << 25) /* Peer transport parameters have been received (used for the transmitting part) */
 #define QUIC_FL_CONN_FINALIZED                   (1U << 26) /* QUIC connection finalized (functional, ready to send/receive) */
@@ -642,8 +651,6 @@ struct quic_conn {
 	int fd;
 	/* QUIC transport parameters TLS extension */
 	int tps_tls_ext;
-	/* Thread ID this connection is attached to */
-	int tid;
 	int state;
 	enum qc_mux_state mux_state; /* status of the connection/mux layer */
 	struct quic_err err;
@@ -652,7 +659,6 @@ struct quic_conn {
 
 	struct quic_cid odcid; /* First DCID used by client on its Initial packet. */
 	struct quic_cid dcid; /* DCID of our endpoint - not updated when a new DCID is used */
-	struct ebmb_node scid_node; /* used only for client side (backend) */
 	struct quic_cid scid; /* first SCID of our endpoint - not updated when a new SCID is used */
 	struct eb_root cids; /* tree of quic_connection_id - used to match a received packet DCID with a connection */
 	uint64_t next_cid_seq_num;

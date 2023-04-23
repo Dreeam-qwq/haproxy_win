@@ -50,7 +50,7 @@
 #include <haproxy/event_hdl.h>
 
 
-static void srv_update_status(struct server *s);
+static void srv_update_status(struct server *s, int type, int cause);
 static int srv_apply_lastaddr(struct server *srv, int *err_code);
 static void srv_cleanup_connections(struct server *srv);
 
@@ -104,6 +104,38 @@ struct dict server_key_dict = {
 	.values = EB_ROOT_UNIQUE,
 };
 
+static const char *srv_adm_st_chg_cause_str[] = {
+	[SRV_ADM_STCHGC_NONE] = "",
+	[SRV_ADM_STCHGC_DNS_NOENT] = "entry removed from SRV record",
+	[SRV_ADM_STCHGC_DNS_NOIP] = "No IP for server ",
+	[SRV_ADM_STCHGC_DNS_NX] = "DNS NX status",
+	[SRV_ADM_STCHGC_DNS_TIMEOUT] = "DNS timeout status",
+	[SRV_ADM_STCHGC_DNS_REFUSED] = "DNS refused status",
+	[SRV_ADM_STCHGC_DNS_UNSPEC] = "unspecified DNS error",
+	[SRV_ADM_STCHGC_STATS_DISABLE] = "'disable' on stats page",
+	[SRV_ADM_STCHGC_STATS_STOP] = "'stop' on stats page"
+};
+
+const char *srv_adm_st_chg_cause(enum srv_adm_st_chg_cause cause)
+{
+	return srv_adm_st_chg_cause_str[cause];
+}
+
+static const char *srv_op_st_chg_cause_str[] = {
+	[SRV_OP_STCHGC_NONE] = "",
+	[SRV_OP_STCHGC_HEALTH] = "",
+	[SRV_OP_STCHGC_AGENT] = "",
+	[SRV_OP_STCHGC_CLI] = "changed from CLI",
+	[SRV_OP_STCHGC_LUA] = "changed from Lua script",
+	[SRV_OP_STCHGC_STATS_WEB] = "changed from Web interface",
+	[SRV_OP_STCHGC_STATEFILE] = "changed from server-state after a reload"
+};
+
+const char *srv_op_st_chg_cause(enum srv_op_st_chg_cause cause)
+{
+	return srv_op_st_chg_cause_str[cause];
+}
+
 int srv_downtime(const struct server *s)
 {
 	if ((s->cur_state != SRV_ST_STOPPED) || s->last_change >= now.tv_sec)		// ignore negative time
@@ -134,7 +166,30 @@ int srv_getinter(const struct check *check)
 	return (check->fastinter)?(check->fastinter):(check->inter);
 }
 
-/*
+/* fill common server event data members struct
+ * must be called with server lock or under thread isolate
+ */
+static inline void _srv_event_hdl_prepare(struct event_hdl_cb_data_server *cb_data,
+                                          struct server *srv, uint8_t thread_isolate)
+{
+	/* safe data assignments */
+	cb_data->safe.puid = srv->puid;
+	cb_data->safe.rid = srv->rid;
+	cb_data->safe.flags = srv->flags;
+	snprintf(cb_data->safe.name, sizeof(cb_data->safe.name), "%s", srv->id);
+	cb_data->safe.proxy_name[0] = '\0';
+	cb_data->safe.proxy_uuid = -1; /* default value */
+	if (srv->proxy) {
+		cb_data->safe.proxy_uuid = srv->proxy->uuid;
+		snprintf(cb_data->safe.proxy_name, sizeof(cb_data->safe.proxy_name), "%s", srv->proxy->id);
+	}
+	/* unsafe data assignments */
+	cb_data->unsafe.ptr = srv;
+	cb_data->unsafe.thread_isolate = thread_isolate;
+	cb_data->unsafe.srv_lock = !thread_isolate;
+}
+
+/* general server event publishing:
  * Use this to publish EVENT_HDL_SUB_SERVER family type event
  * from srv facility
  * Event will be published in both global subscription list and
@@ -142,21 +197,13 @@ int srv_getinter(const struct check *check)
  * server ptr must be valid
  * must be called with srv lock or under thread_isolate
  */
-static inline void srv_event_hdl_publish(struct event_hdl_sub_type event, struct server *srv, uint8_t thread_isolate)
+static void srv_event_hdl_publish(struct event_hdl_sub_type event,
+                                  struct server *srv, uint8_t thread_isolate)
 {
 	struct event_hdl_cb_data_server cb_data;
 
-	/* safe data assignments */
-	cb_data.safe.puid = srv->puid;
-	cb_data.safe.rid = srv->rid;
-	cb_data.safe.flags = srv->flags;
-	snprintf(cb_data.safe.name, sizeof(cb_data.safe.name), "%s", srv->id);
-	if (srv->proxy)
-		snprintf(cb_data.safe.proxy_name, sizeof(cb_data.safe.proxy_name), "%s", srv->proxy->id);
-	/* unsafe data assignments */
-	cb_data.unsafe.ptr = srv;
-	cb_data.unsafe.thread_isolate = thread_isolate;
-	cb_data.unsafe.srv_lock = !thread_isolate;
+	/* prepare event data */
+	_srv_event_hdl_prepare(&cb_data, srv, thread_isolate);
 	/* publish in server dedicated sub list */
 	event_hdl_publish(&srv->e_subs, event, EVENT_HDL_CB_DATA(&cb_data));
 	/* publish in global subscription list */
@@ -1490,57 +1537,42 @@ void srv_shutdown_backup_streams(struct proxy *px, int why)
 			srv_shutdown_streams(srv, why);
 }
 
-/* Appends some information to a message string related to a server going UP or
- * DOWN.  If both <forced> and <reason> are null and the server tracks another
- * one, a "via" information will be provided to know where the status came from.
- * If <check> is non-null, an entire string describing the check result will be
- * appended after a comma and a space (eg: to report some information from the
- * check that changed the state). In the other case, the string will be built
- * using the check results stored into the struct server if present.
+static void srv_append_op_chg_cause(struct buffer *msg, struct server *s, enum srv_op_st_chg_cause cause)
+{
+	switch (cause) {
+		case SRV_OP_STCHGC_NONE:
+			break; /* do nothing */
+		case SRV_OP_STCHGC_HEALTH:
+			check_append_info(msg, &s->check);
+			break;
+		case SRV_OP_STCHGC_AGENT:
+			check_append_info(msg, &s->agent);
+			break;
+		default:
+			chunk_appendf(msg, ", %s", srv_op_st_chg_cause(cause));
+			break;
+	}
+}
+
+static void srv_append_adm_chg_cause(struct buffer *msg, struct server *s, enum srv_adm_st_chg_cause cause)
+{
+	if (cause)
+		chunk_appendf(msg, " (%s)", srv_adm_st_chg_cause(cause));
+}
+
+/* Appends some information to a message string related to a server tracking
+ * or requeued connections info.
+ *
+ * If <forced> is null and the server tracks another one, a "via"
  * If <xferred> is non-negative, some information about requeued sessions are
  * provided.
  *
  * Must be called with the server lock held.
  */
-void srv_append_status(struct buffer *msg, struct server *s,
-		       struct check *check, int xferred, int forced)
+static void srv_append_more(struct buffer *msg, struct server *s,
+                            int xferred, int forced)
 {
-	short status = s->op_st_chg.status;
-	short code = s->op_st_chg.code;
-	long duration = s->op_st_chg.duration;
-	char *desc = s->op_st_chg.reason;
-
-	if (check) {
-		status = check->status;
-		code = check->code;
-		duration = check->duration;
-		desc = check->desc;
-	}
-
-	if (status != -1) {
-		chunk_appendf(msg, ", reason: %s", get_check_status_description(status));
-
-		if (status >= HCHK_STATUS_L57DATA)
-			chunk_appendf(msg, ", code: %d", code);
-
-		if (desc && *desc) {
-			struct buffer src;
-
-			chunk_appendf(msg, ", info: \"");
-
-			chunk_initlen(&src, desc, 0, strlen(desc));
-			chunk_asciiencode(msg, &src, '"');
-
-			chunk_appendf(msg, "\"");
-		}
-
-		if (duration >= 0)
-			chunk_appendf(msg, ", check duration: %ldms", duration);
-	}
-        else if (desc && *desc) {
-                chunk_appendf(msg, ", %s", desc);
-        }
-	else if (!forced && s->track) {
+	if (!forced && s->track) {
 		chunk_appendf(msg, " via %s/%s", s->track->proxy->id, s->track->id);
 	}
 
@@ -1560,16 +1592,13 @@ void srv_append_status(struct buffer *msg, struct server *s,
 	}
 }
 
-/* Marks server <s> down, regardless of its checks' statuses. The server is
- * registered in a list to postpone the counting of the remaining servers on
- * the proxy and transfers queued streams whenever possible to other servers at
- * a sync point. Maintenance servers are ignored. It stores the <reason> if
- * non-null as the reason for going down or the available data from the check
- * struct to recompute this reason later.
+/* Marks server <s> down, regardless of its checks' statuses. The server
+ * transfers queued streams whenever possible to other servers at a sync
+ * point. Maintenance servers are ignored.
  *
  * Must be called with the server lock held.
  */
-void srv_set_stopped(struct server *s, const char *reason, struct check *check)
+void srv_set_stopped(struct server *s, enum srv_op_st_chg_cause cause)
 {
 	struct server *srv;
 
@@ -1577,38 +1606,24 @@ void srv_set_stopped(struct server *s, const char *reason, struct check *check)
 		return;
 
 	s->next_state = SRV_ST_STOPPED;
-	*s->op_st_chg.reason = 0;
-	s->op_st_chg.status = -1;
-	if (reason) {
-		strlcpy2(s->op_st_chg.reason, reason, sizeof(s->op_st_chg.reason));
-	}
-	else if (check) {
-		strlcpy2(s->op_st_chg.reason, check->desc, sizeof(s->op_st_chg.reason));
-		s->op_st_chg.code = check->code;
-		s->op_st_chg.status = check->status;
-		s->op_st_chg.duration = check->duration;
-	}
 
 	/* propagate changes */
-	srv_update_status(s);
+	srv_update_status(s, 0, cause);
 
 	for (srv = s->trackers; srv; srv = srv->tracknext) {
 		HA_SPIN_LOCK(SERVER_LOCK, &srv->lock);
-		srv_set_stopped(srv, NULL, NULL);
+		srv_set_stopped(srv, SRV_OP_STCHGC_NONE);
 		HA_SPIN_UNLOCK(SERVER_LOCK, &srv->lock);
 	}
 }
 
 /* Marks server <s> up regardless of its checks' statuses and provided it isn't
- * in maintenance. The server is registered in a list to postpone the counting
- * of the remaining servers on the proxy and tries to grab requests from the
- * proxy at a sync point. Maintenance servers are ignored. It stores the
- * <reason> if non-null as the reason for going down or the available data
- * from the check struct to recompute this reason later.
+ * in maintenance. The server tries to grab requests from the proxy at a sync
+ * point. Maintenance servers are ignored.
  *
  * Must be called with the server lock held.
  */
-void srv_set_running(struct server *s, const char *reason, struct check *check)
+void srv_set_running(struct server *s, enum srv_op_st_chg_cause cause)
 {
 	struct server *srv;
 
@@ -1619,43 +1634,27 @@ void srv_set_running(struct server *s, const char *reason, struct check *check)
 		return;
 
 	s->next_state = SRV_ST_STARTING;
-	*s->op_st_chg.reason = 0;
-	s->op_st_chg.status = -1;
-	if (reason) {
-		strlcpy2(s->op_st_chg.reason, reason, sizeof(s->op_st_chg.reason));
-	}
-	else if (check) {
-		strlcpy2(s->op_st_chg.reason, check->desc, sizeof(s->op_st_chg.reason));
-		s->op_st_chg.code = check->code;
-		s->op_st_chg.status = check->status;
-		s->op_st_chg.duration = check->duration;
-	}
 
 	if (s->slowstart <= 0)
 		s->next_state = SRV_ST_RUNNING;
 
 	/* propagate changes */
-	srv_update_status(s);
+	srv_update_status(s, 0, cause);
 
 	for (srv = s->trackers; srv; srv = srv->tracknext) {
 		HA_SPIN_LOCK(SERVER_LOCK, &srv->lock);
-		srv_set_running(srv, NULL, NULL);
+		srv_set_running(srv, SRV_OP_STCHGC_NONE);
 		HA_SPIN_UNLOCK(SERVER_LOCK, &srv->lock);
 	}
 }
 
 /* Marks server <s> stopping regardless of its checks' statuses and provided it
- * isn't in maintenance. The server is registered in a list to postpone the
- * counting of the remaining servers on the proxy and tries to grab requests
- * from the proxy. Maintenance servers are ignored. It stores the
- * <reason> if non-null as the reason for going down or the available data
- * from the check struct to recompute this reason later.
- * up. Note that it makes use of the trash to build the log strings, so <reason>
- * must not be placed there.
+ * isn't in maintenance. The server tries to redispatch pending requests
+ * to the proxy. Maintenance servers are ignored.
  *
  * Must be called with the server lock held.
  */
-void srv_set_stopping(struct server *s, const char *reason, struct check *check)
+void srv_set_stopping(struct server *s, enum srv_op_st_chg_cause cause)
 {
 	struct server *srv;
 
@@ -1666,24 +1665,13 @@ void srv_set_stopping(struct server *s, const char *reason, struct check *check)
 		return;
 
 	s->next_state = SRV_ST_STOPPING;
-	*s->op_st_chg.reason = 0;
-	s->op_st_chg.status = -1;
-	if (reason) {
-		strlcpy2(s->op_st_chg.reason, reason, sizeof(s->op_st_chg.reason));
-	}
-	else if (check) {
-		strlcpy2(s->op_st_chg.reason, check->desc, sizeof(s->op_st_chg.reason));
-		s->op_st_chg.code = check->code;
-		s->op_st_chg.status = check->status;
-		s->op_st_chg.duration = check->duration;
-	}
 
 	/* propagate changes */
-	srv_update_status(s);
+	srv_update_status(s, 0, cause);
 
 	for (srv = s->trackers; srv; srv = srv->tracknext) {
 		HA_SPIN_LOCK(SERVER_LOCK, &srv->lock);
-		srv_set_stopping(srv, NULL, NULL);
+		srv_set_stopping(srv, SRV_OP_STCHGC_NONE);
 		HA_SPIN_UNLOCK(SERVER_LOCK, &srv->lock);
 	}
 }
@@ -1698,7 +1686,7 @@ void srv_set_stopping(struct server *s, const char *reason, struct check *check)
  *
  * Must be called with the server lock held.
  */
-void srv_set_admin_flag(struct server *s, enum srv_admin mode, const char *cause)
+void srv_set_admin_flag(struct server *s, enum srv_admin mode, enum srv_adm_st_chg_cause cause)
 {
 	struct server *srv;
 
@@ -1710,11 +1698,9 @@ void srv_set_admin_flag(struct server *s, enum srv_admin mode, const char *cause
 		return;
 
 	s->next_admin |= mode;
-	if (cause)
-		strlcpy2(s->adm_st_chg_cause, cause, sizeof(s->adm_st_chg_cause));
 
 	/* propagate changes */
-	srv_update_status(s);
+	srv_update_status(s, 1, cause);
 
 	/* stop going down if the equivalent flag was already present (forced or inherited) */
 	if (((mode & SRV_ADMF_MAINT) && (s->next_admin & ~mode & SRV_ADMF_MAINT)) ||
@@ -1756,7 +1742,7 @@ void srv_clr_admin_flag(struct server *s, enum srv_admin mode)
 	s->next_admin &= ~mode;
 
 	/* propagate changes */
-	srv_update_status(s);
+	srv_update_status(s, 1, SRV_ADM_STCHGC_NONE);
 
 	/* stop going down if the equivalent flag is still present (forced or inherited) */
 	if (((mode & SRV_ADMF_MAINT) && (s->next_admin & SRV_ADMF_MAINT)) ||
@@ -1788,10 +1774,10 @@ static void srv_propagate_admin_state(struct server *srv)
 	for (srv2 = srv->trackers; srv2; srv2 = srv2->tracknext) {
 		HA_SPIN_LOCK(SERVER_LOCK, &srv2->lock);
 		if (srv->next_admin & (SRV_ADMF_MAINT | SRV_ADMF_CMAINT))
-			srv_set_admin_flag(srv2, SRV_ADMF_IMAINT, NULL);
+			srv_set_admin_flag(srv2, SRV_ADMF_IMAINT, SRV_ADM_STCHGC_NONE);
 
 		if (srv->next_admin & SRV_ADMF_DRAIN)
-			srv_set_admin_flag(srv2, SRV_ADMF_IDRAIN, NULL);
+			srv_set_admin_flag(srv2, SRV_ADMF_IDRAIN, SRV_ADM_STCHGC_NONE);
 		HA_SPIN_UNLOCK(SERVER_LOCK, &srv2->lock);
 	}
 }
@@ -1899,7 +1885,7 @@ void server_recalc_eweight(struct server *sv, int must_update)
 
 	/* propagate changes only if needed (i.e. not recursively) */
 	if (must_update)
-		srv_update_status(sv);
+		srv_update_status(sv, 0, SRV_OP_STCHGC_NONE);
 }
 
 /*
@@ -3506,7 +3492,7 @@ int srvrq_update_srv_status(struct server *s, int has_no_ip)
 	if (s->next_admin & SRV_ADMF_RMAINT)
 		return 1;
 
-	srv_set_admin_flag(s, SRV_ADMF_RMAINT, "entry removed from SRV record");
+	srv_set_admin_flag(s, SRV_ADMF_RMAINT, SRV_ADM_STCHGC_DNS_NOENT);
 	return 0;
 }
 
@@ -3542,8 +3528,7 @@ int snr_update_srv_status(struct server *s, int has_no_ip)
 			if (has_no_ip) {
 				if (s->next_admin & SRV_ADMF_RMAINT)
 					return 1;
-				srv_set_admin_flag(s, SRV_ADMF_RMAINT,
-				    "No IP for server ");
+				srv_set_admin_flag(s, SRV_ADMF_RMAINT, SRV_ADM_STCHGC_DNS_NOIP);
 				return 0;
 			}
 
@@ -3565,7 +3550,7 @@ int snr_update_srv_status(struct server *s, int has_no_ip)
 
 			if (s->next_admin & SRV_ADMF_RMAINT)
 				return 1;
-			srv_set_admin_flag(s, SRV_ADMF_RMAINT, "DNS NX status");
+			srv_set_admin_flag(s, SRV_ADMF_RMAINT, SRV_ADM_STCHGC_DNS_NX);
 			return 0;
 
 		case RSLV_STATUS_TIMEOUT:
@@ -3576,7 +3561,7 @@ int snr_update_srv_status(struct server *s, int has_no_ip)
 
 			if (s->next_admin & SRV_ADMF_RMAINT)
 				return 1;
-			srv_set_admin_flag(s, SRV_ADMF_RMAINT, "DNS timeout status");
+			srv_set_admin_flag(s, SRV_ADMF_RMAINT, SRV_ADM_STCHGC_DNS_TIMEOUT);
 			return 0;
 
 		case RSLV_STATUS_REFUSED:
@@ -3587,7 +3572,7 @@ int snr_update_srv_status(struct server *s, int has_no_ip)
 
 			if (s->next_admin & SRV_ADMF_RMAINT)
 				return 1;
-			srv_set_admin_flag(s, SRV_ADMF_RMAINT, "DNS refused status");
+			srv_set_admin_flag(s, SRV_ADMF_RMAINT, SRV_ADM_STCHGC_DNS_REFUSED);
 			return 0;
 
 		default:
@@ -3598,7 +3583,7 @@ int snr_update_srv_status(struct server *s, int has_no_ip)
 
 			if (s->next_admin & SRV_ADMF_RMAINT)
 				return 1;
-			srv_set_admin_flag(s, SRV_ADMF_RMAINT, "unspecified DNS error");
+			srv_set_admin_flag(s, SRV_ADMF_RMAINT, SRV_ADM_STCHGC_DNS_UNSPEC);
 			return 0;
 	}
 
@@ -4017,7 +4002,7 @@ static int srv_iterate_initaddr(struct server *srv)
 			break;
 
 		case SRV_IADDR_NONE:
-			srv_set_admin_flag(srv, SRV_ADMF_RMAINT, NULL);
+			srv_set_admin_flag(srv, SRV_ADMF_RMAINT, SRV_ADM_STCHGC_NONE);
 			if (return_code) {
 				ha_warning("could not resolve address '%s', disabling server.\n",
 					   name);
@@ -4204,15 +4189,15 @@ static int cli_parse_set_server(char **args, char *payload, struct appctx *appct
 			cli_err(appctx, "cannot change health on a tracking server.\n");
 		else if (strcmp(args[4], "up") == 0) {
 			sv->check.health = sv->check.rise + sv->check.fall - 1;
-			srv_set_running(sv, "changed from CLI", NULL);
+			srv_set_running(sv, SRV_OP_STCHGC_CLI);
 		}
 		else if (strcmp(args[4], "stopping") == 0) {
 			sv->check.health = sv->check.rise + sv->check.fall - 1;
-			srv_set_stopping(sv, "changed from CLI", NULL);
+			srv_set_stopping(sv, SRV_OP_STCHGC_CLI);
 		}
 		else if (strcmp(args[4], "down") == 0) {
 			sv->check.health = 0;
-			srv_set_stopped(sv, "changed from CLI", NULL);
+			srv_set_stopped(sv, SRV_OP_STCHGC_CLI);
 		}
 		else
 			cli_err(appctx, "'set server <srv> health' expects 'up', 'stopping', or 'down'.\n");
@@ -4224,11 +4209,11 @@ static int cli_parse_set_server(char **args, char *payload, struct appctx *appct
 			cli_err(appctx, "agent checks are not enabled on this server.\n");
 		else if (strcmp(args[4], "up") == 0) {
 			sv->agent.health = sv->agent.rise + sv->agent.fall - 1;
-			srv_set_running(sv, "changed from CLI", NULL);
+			srv_set_running(sv, SRV_OP_STCHGC_CLI);
 		}
 		else if (strcmp(args[4], "down") == 0) {
 			sv->agent.health = 0;
-			srv_set_stopped(sv, "changed from CLI", NULL);
+			srv_set_stopped(sv, SRV_OP_STCHGC_CLI);
 		}
 		else
 			cli_err(appctx, "'set server <srv> agent' expects 'up' or 'down'.\n");
@@ -5269,210 +5254,177 @@ int srv_apply_track(struct server *srv, struct proxy *curproxy)
 	return 0;
 }
 
-/*
- * This function applies server's status changes, it is
- * is designed to be called asynchronously.
- *
- * Must be called with the server lock held. This may also be called at init
- * time as the result of parsing the state file, in which case no lock will be
- * held, and the server's warmup task can be null.
- */
-static void srv_update_status(struct server *s)
+/* This function propagates srv state change to lb algorithms */
+static void srv_lb_propagate(struct server *s)
 {
-	struct check *check = &s->check;
-	int xferred;
 	struct proxy *px = s->proxy;
-	int prev_srv_count = s->proxy->srv_bck + s->proxy->srv_act;
-	int srv_was_stopping = (s->cur_state == SRV_ST_STOPPING) || (s->cur_admin & SRV_ADMF_DRAIN);
-	int log_level;
-	struct buffer *tmptrash = NULL;
 
-	/* If currently main is not set we try to apply pending state changes */
-	if (!(s->cur_admin & SRV_ADMF_MAINT)) {
-		int next_admin;
-
-		/* Backup next admin */
-		next_admin = s->next_admin;
-
-		/* restore current admin state */
-		s->next_admin = s->cur_admin;
-
-		if ((s->cur_state != SRV_ST_STOPPED) && (s->next_state == SRV_ST_STOPPED)) {
-			/* no maintenance + server DOWN: publish event SERVER DOWN */
-			srv_event_hdl_publish(EVENT_HDL_SUB_SERVER_DOWN, s, 0);
-
-			s->last_change = now.tv_sec;
-			if (s->proxy->lbprm.set_server_status_down)
-				s->proxy->lbprm.set_server_status_down(s);
-
-			if (s->onmarkeddown & HANA_ONMARKEDDOWN_SHUTDOWNSESSIONS)
-				srv_shutdown_streams(s, SF_ERR_DOWN);
-
-			/* we might have streams queued on this server and waiting for
-			 * a connection. Those which are redispatchable will be queued
-			 * to another server or to the proxy itself.
-			 */
-			xferred = pendconn_redistribute(s);
-
-			tmptrash = alloc_trash_chunk();
-			if (tmptrash) {
-				chunk_printf(tmptrash,
-				             "%sServer %s/%s is DOWN", s->flags & SRV_F_BACKUP ? "Backup " : "",
-				             s->proxy->id, s->id);
-
-				srv_append_status(tmptrash, s, NULL, xferred, 0);
-				ha_warning("%s.\n", tmptrash->area);
-
-				/* we don't send an alert if the server was previously paused */
-				log_level = srv_was_stopping ? LOG_NOTICE : LOG_ALERT;
-				send_log(s->proxy, log_level, "%s.\n",
-					 tmptrash->area);
-				send_email_alert(s, log_level, "%s",
-						 tmptrash->area);
-				free_trash_chunk(tmptrash);
-				tmptrash = NULL;
-			}
-			if (prev_srv_count && s->proxy->srv_bck == 0 && s->proxy->srv_act == 0)
-				set_backend_down(s->proxy);
-
-			s->counters.down_trans++;
-		}
-		else if ((s->cur_state != SRV_ST_STOPPING) && (s->next_state == SRV_ST_STOPPING)) {
-			s->last_change = now.tv_sec;
-			if (s->proxy->lbprm.set_server_status_down)
-				s->proxy->lbprm.set_server_status_down(s);
-
-			/* we might have streams queued on this server and waiting for
-			 * a connection. Those which are redispatchable will be queued
-			 * to another server or to the proxy itself.
-			 */
-			xferred = pendconn_redistribute(s);
-
-			tmptrash = alloc_trash_chunk();
-			if (tmptrash) {
-				chunk_printf(tmptrash,
-				             "%sServer %s/%s is stopping", s->flags & SRV_F_BACKUP ? "Backup " : "",
-				             s->proxy->id, s->id);
-
-				srv_append_status(tmptrash, s, NULL, xferred, 0);
-
-				ha_warning("%s.\n", tmptrash->area);
-				send_log(s->proxy, LOG_NOTICE, "%s.\n",
-					 tmptrash->area);
-				free_trash_chunk(tmptrash);
-				tmptrash = NULL;
-			}
-
-			if (prev_srv_count && s->proxy->srv_bck == 0 && s->proxy->srv_act == 0)
-				set_backend_down(s->proxy);
-		}
-		else if (((s->cur_state != SRV_ST_RUNNING) && (s->next_state == SRV_ST_RUNNING))
-			 || ((s->cur_state != SRV_ST_STARTING) && (s->next_state == SRV_ST_STARTING))) {
-			/* no maintenance + server going UP: publish event SERVER UP */
-			srv_event_hdl_publish(EVENT_HDL_SUB_SERVER_UP, s, 0);
-
-			if (s->proxy->srv_bck == 0 && s->proxy->srv_act == 0) {
-				if (s->proxy->last_change < now.tv_sec)		// ignore negative times
-					s->proxy->down_time += now.tv_sec - s->proxy->last_change;
-				s->proxy->last_change = now.tv_sec;
-			}
-
-			if (s->cur_state == SRV_ST_STOPPED && s->last_change < now.tv_sec)	// ignore negative times
-				s->down_time += now.tv_sec - s->last_change;
-
-			s->last_change = now.tv_sec;
-			if (s->next_state == SRV_ST_STARTING && s->warmup)
-				task_schedule(s->warmup, tick_add(now_ms, MS_TO_TICKS(MAX(1000, s->slowstart / 20))));
-
-			server_recalc_eweight(s, 0);
-			/* now propagate the status change to any LB algorithms */
-			if (px->lbprm.update_server_eweight)
-				px->lbprm.update_server_eweight(s);
-			else if (srv_willbe_usable(s)) {
-				if (px->lbprm.set_server_status_up)
-					px->lbprm.set_server_status_up(s);
-			}
-			else {
-				if (px->lbprm.set_server_status_down)
-					px->lbprm.set_server_status_down(s);
-			}
-
-			/* If the server is set with "on-marked-up shutdown-backup-sessions",
-			 * and it's not a backup server and its effective weight is > 0,
-			 * then it can accept new connections, so we shut down all streams
-			 * on all backup servers.
-			 */
-			if ((s->onmarkedup & HANA_ONMARKEDUP_SHUTDOWNBACKUPSESSIONS) &&
-			    !(s->flags & SRV_F_BACKUP) && s->next_eweight)
-				srv_shutdown_backup_streams(s->proxy, SF_ERR_UP);
-
-			/* check if we can handle some connections queued at the proxy. We
-			 * will take as many as we can handle.
-			 */
-			xferred = pendconn_grab_from_px(s);
-
-			tmptrash = alloc_trash_chunk();
-			if (tmptrash) {
-				chunk_printf(tmptrash,
-				             "%sServer %s/%s is UP", s->flags & SRV_F_BACKUP ? "Backup " : "",
-				             s->proxy->id, s->id);
-
-				srv_append_status(tmptrash, s, NULL, xferred, 0);
-				ha_warning("%s.\n", tmptrash->area);
-				send_log(s->proxy, LOG_NOTICE, "%s.\n",
-					 tmptrash->area);
-				send_email_alert(s, LOG_NOTICE, "%s",
-						 tmptrash->area);
-				free_trash_chunk(tmptrash);
-				tmptrash = NULL;
-			}
-
-			if (prev_srv_count && s->proxy->srv_bck == 0 && s->proxy->srv_act == 0)
-				set_backend_down(s->proxy);
-		}
-		else if (s->cur_eweight != s->next_eweight) {
-			/* now propagate the status change to any LB algorithms */
-			if (px->lbprm.update_server_eweight)
-				px->lbprm.update_server_eweight(s);
-			else if (srv_willbe_usable(s)) {
-				if (px->lbprm.set_server_status_up)
-					px->lbprm.set_server_status_up(s);
-			}
-			else {
-				if (px->lbprm.set_server_status_down)
-					px->lbprm.set_server_status_down(s);
-			}
-
-			if (prev_srv_count && s->proxy->srv_bck == 0 && s->proxy->srv_act == 0)
-				set_backend_down(s->proxy);
-		}
-
-		s->next_admin = next_admin;
+	if (px->lbprm.update_server_eweight)
+		px->lbprm.update_server_eweight(s);
+	else if (srv_willbe_usable(s)) {
+		if (px->lbprm.set_server_status_up)
+			px->lbprm.set_server_status_up(s);
 	}
+	else {
+		if (px->lbprm.set_server_status_down)
+			px->lbprm.set_server_status_down(s);
+	}
+}
 
-	/* reset operational state change */
-	*s->op_st_chg.reason = 0;
-	s->op_st_chg.status = s->op_st_chg.code = -1;
-	s->op_st_chg.duration = 0;
+/* directly update server state based on an operational change
+ * (compare current and next state to know which transition to apply)
+ *
+ * The function returns the number of requeued sessions (either taken by
+ * the server or redispatched to others servers) due to the server state
+ * change.
+ */
+static int _srv_update_status_op(struct server *s, enum srv_op_st_chg_cause cause)
+{
+	struct buffer *tmptrash = NULL;
+	int log_level;
+	int srv_was_stopping = (s->cur_state == SRV_ST_STOPPING) || (s->cur_admin & SRV_ADMF_DRAIN);
+	int xferred = 0;
 
-	/* Now we try to apply pending admin changes */
+	if ((s->cur_state != SRV_ST_STOPPED) && (s->next_state == SRV_ST_STOPPED)) {
+		srv_lb_propagate(s);
+
+		if (s->onmarkeddown & HANA_ONMARKEDDOWN_SHUTDOWNSESSIONS)
+			srv_shutdown_streams(s, SF_ERR_DOWN);
+
+		/* we might have streams queued on this server and waiting for
+		 * a connection. Those which are redispatchable will be queued
+		 * to another server or to the proxy itself.
+		 */
+		xferred = pendconn_redistribute(s);
+
+		/* no maintenance + server DOWN: publish event SERVER DOWN */
+		srv_event_hdl_publish(EVENT_HDL_SUB_SERVER_DOWN, s, 0);
+
+		tmptrash = alloc_trash_chunk();
+		if (tmptrash) {
+			chunk_printf(tmptrash,
+			             "%sServer %s/%s is DOWN", s->flags & SRV_F_BACKUP ? "Backup " : "",
+			             s->proxy->id, s->id);
+
+			srv_append_op_chg_cause(tmptrash, s, cause);
+			srv_append_more(tmptrash, s, xferred, 0);
+
+			ha_warning("%s.\n", tmptrash->area);
+
+			/* we don't send an alert if the server was previously paused */
+			log_level = srv_was_stopping ? LOG_NOTICE : LOG_ALERT;
+			send_log(s->proxy, log_level, "%s.\n",
+				 tmptrash->area);
+			send_email_alert(s, log_level, "%s",
+					 tmptrash->area);
+		}
+	}
+	else if ((s->cur_state != SRV_ST_STOPPING) && (s->next_state == SRV_ST_STOPPING)) {
+		srv_lb_propagate(s);
+
+		/* we might have streams queued on this server and waiting for
+		 * a connection. Those which are redispatchable will be queued
+		 * to another server or to the proxy itself.
+		 */
+		xferred = pendconn_redistribute(s);
+
+		tmptrash = alloc_trash_chunk();
+		if (tmptrash) {
+			chunk_printf(tmptrash,
+			             "%sServer %s/%s is stopping", s->flags & SRV_F_BACKUP ? "Backup " : "",
+			             s->proxy->id, s->id);
+
+			srv_append_op_chg_cause(tmptrash, s, cause);
+			srv_append_more(tmptrash, s, xferred, 0);
+
+			ha_warning("%s.\n", tmptrash->area);
+			send_log(s->proxy, LOG_NOTICE, "%s.\n",
+				 tmptrash->area);
+			free_trash_chunk(tmptrash);
+			tmptrash = NULL;
+		}
+	}
+	else if (((s->cur_state != SRV_ST_RUNNING) && (s->next_state == SRV_ST_RUNNING))
+		 || ((s->cur_state != SRV_ST_STARTING) && (s->next_state == SRV_ST_STARTING))) {
+
+		if (s->next_state == SRV_ST_STARTING && s->warmup)
+			task_schedule(s->warmup, tick_add(now_ms, MS_TO_TICKS(MAX(1000, s->slowstart / 20))));
+
+		server_recalc_eweight(s, 0);
+		/* now propagate the status change to any LB algorithms */
+		srv_lb_propagate(s);
+
+		/* If the server is set with "on-marked-up shutdown-backup-sessions",
+		 * and it's not a backup server and its effective weight is > 0,
+		 * then it can accept new connections, so we shut down all streams
+		 * on all backup servers.
+		 */
+		if ((s->onmarkedup & HANA_ONMARKEDUP_SHUTDOWNBACKUPSESSIONS) &&
+		    !(s->flags & SRV_F_BACKUP) && s->next_eweight)
+			srv_shutdown_backup_streams(s->proxy, SF_ERR_UP);
+
+		/* check if we can handle some connections queued at the proxy. We
+		 * will take as many as we can handle.
+		 */
+		xferred = pendconn_grab_from_px(s);
+
+		/* no maintenance + server going UP: publish event SERVER UP */
+		srv_event_hdl_publish(EVENT_HDL_SUB_SERVER_UP, s, 0);
+
+		tmptrash = alloc_trash_chunk();
+		if (tmptrash) {
+			chunk_printf(tmptrash,
+			             "%sServer %s/%s is UP", s->flags & SRV_F_BACKUP ? "Backup " : "",
+			             s->proxy->id, s->id);
+
+			srv_append_op_chg_cause(tmptrash, s, cause);
+			srv_append_more(tmptrash, s, xferred, 0);
+
+			ha_warning("%s.\n", tmptrash->area);
+			send_log(s->proxy, LOG_NOTICE, "%s.\n",
+				 tmptrash->area);
+			send_email_alert(s, LOG_NOTICE, "%s",
+					 tmptrash->area);
+			free_trash_chunk(tmptrash);
+			tmptrash = NULL;
+		}
+	}
+	else if (s->cur_eweight != s->next_eweight) {
+		/* now propagate the status change to any LB algorithms */
+		srv_lb_propagate(s);
+	}
+	return xferred;
+}
+
+/* deduct and update server state from an administrative change
+ * (use current and next admin to deduct the administrative transition that
+ *  may result in server state update)
+ *
+ * The function returns the number of requeued sessions (either taken by
+ * the server or redispatched to others servers) due to the server state
+ * change.
+ */
+static int _srv_update_status_adm(struct server *s, enum srv_adm_st_chg_cause cause)
+{
+	struct buffer *tmptrash = NULL;
+	int srv_was_stopping = (s->cur_state == SRV_ST_STOPPING) || (s->cur_admin & SRV_ADMF_DRAIN);
+	int xferred = 0;
 
 	/* Maintenance must also disable health checks */
 	if (!(s->cur_admin & SRV_ADMF_MAINT) && (s->next_admin & SRV_ADMF_MAINT)) {
 		if (s->check.state & CHK_ST_ENABLED) {
 			s->check.state |= CHK_ST_PAUSED;
-			check->health = 0;
+			s->check.health = 0;
 		}
 
 		if (s->cur_state == SRV_ST_STOPPED) {	/* server was already down */
 			tmptrash = alloc_trash_chunk();
 			if (tmptrash) {
 				chunk_printf(tmptrash,
-				    "%sServer %s/%s was DOWN and now enters maintenance%s%s%s",
-				    s->flags & SRV_F_BACKUP ? "Backup " : "", s->proxy->id, s->id,
-				    *(s->adm_st_chg_cause) ? " (" : "", s->adm_st_chg_cause, *(s->adm_st_chg_cause) ? ")" : "");
-
-				srv_append_status(tmptrash, s, NULL, -1, (s->next_admin & SRV_ADMF_FMAINT));
+				    "%sServer %s/%s was DOWN and now enters maintenance",
+				    s->flags & SRV_F_BACKUP ? "Backup " : "", s->proxy->id, s->id);
+				srv_append_adm_chg_cause(tmptrash, s, cause);
+				srv_append_more(tmptrash, s, -1, (s->next_admin & SRV_ADMF_FMAINT));
 
 				if (!(global.mode & MODE_STARTING)) {
 					ha_warning("%s.\n", tmptrash->area);
@@ -5482,23 +5434,15 @@ static void srv_update_status(struct server *s)
 				free_trash_chunk(tmptrash);
 				tmptrash = NULL;
 			}
-			/* commit new admin status */
-
-			s->cur_admin = s->next_admin;
 		}
 		else {	/* server was still running */
-			check->health = 0; /* failure */
-			s->last_change = now.tv_sec;
+			s->check.health = 0; /* failure */
 
 			s->next_state = SRV_ST_STOPPED;
-			if (s->proxy->lbprm.set_server_status_down)
-				s->proxy->lbprm.set_server_status_down(s);
+			srv_lb_propagate(s);
 
 			if (s->onmarkeddown & HANA_ONMARKEDDOWN_SHUTDOWNSESSIONS)
 				srv_shutdown_streams(s, SF_ERR_DOWN);
-
-			/* maintenance on previously running server: publish event SERVER DOWN */
-			srv_event_hdl_publish(EVENT_HDL_SUB_SERVER_DOWN, s, 0);
 
 			/* force connection cleanup on the given server */
 			srv_cleanup_connections(s);
@@ -5508,15 +5452,17 @@ static void srv_update_status(struct server *s)
 			 */
 			xferred = pendconn_redistribute(s);
 
+			/* maintenance on previously running server: publish event SERVER DOWN */
+			srv_event_hdl_publish(EVENT_HDL_SUB_SERVER_DOWN, s, 0);
+
 			tmptrash = alloc_trash_chunk();
 			if (tmptrash) {
 				chunk_printf(tmptrash,
-				             "%sServer %s/%s is going DOWN for maintenance%s%s%s",
+				             "%sServer %s/%s is going DOWN for maintenance",
 				             s->flags & SRV_F_BACKUP ? "Backup " : "",
-				             s->proxy->id, s->id,
-				             *(s->adm_st_chg_cause) ? " (" : "", s->adm_st_chg_cause, *(s->adm_st_chg_cause) ? ")" : "");
-
-				srv_append_status(tmptrash, s, NULL, xferred, (s->next_admin & SRV_ADMF_FMAINT));
+				             s->proxy->id, s->id);
+				srv_append_adm_chg_cause(tmptrash, s, cause);
+				srv_append_more(tmptrash, s, xferred, (s->next_admin & SRV_ADMF_FMAINT));
 
 				if (!(global.mode & MODE_STARTING)) {
 					ha_warning("%s.\n", tmptrash->area);
@@ -5526,10 +5472,6 @@ static void srv_update_status(struct server *s)
 				free_trash_chunk(tmptrash);
 				tmptrash = NULL;
 			}
-			if (prev_srv_count && s->proxy->srv_bck == 0 && s->proxy->srv_act == 0)
-				set_backend_down(s->proxy);
-
-			s->counters.down_trans++;
 		}
 	}
 	else if ((s->cur_admin & SRV_ADMF_MAINT) && !(s->next_admin & SRV_ADMF_MAINT)) {
@@ -5548,10 +5490,9 @@ static void srv_update_status(struct server *s)
 		 * that the server might still be in drain mode, which is naturally dealt
 		 * with by the lower level functions.
 		 */
-
 		if (s->check.state & CHK_ST_ENABLED) {
 			s->check.state &= ~CHK_ST_PAUSED;
-			check->health = check->rise; /* start OK but check immediately */
+			s->check.health = s->check.rise; /* start OK but check immediately */
 		}
 
 		if ((!s->track || s->track->next_state != SRV_ST_STOPPED) &&
@@ -5561,7 +5502,6 @@ static void srv_update_status(struct server *s)
 				s->next_state = SRV_ST_STOPPING;
 			}
 			else {
-				s->last_change = now.tv_sec;
 				s->next_state = SRV_ST_STARTING;
 				if (s->slowstart > 0) {
 					if (s->warmup)
@@ -5614,21 +5554,7 @@ static void srv_update_status(struct server *s)
 
 		server_recalc_eweight(s, 0);
 		/* now propagate the status change to any LB algorithms */
-		if (px->lbprm.update_server_eweight)
-			px->lbprm.update_server_eweight(s);
-		else if (srv_willbe_usable(s)) {
-			if (px->lbprm.set_server_status_up)
-				px->lbprm.set_server_status_up(s);
-		}
-		else {
-			if (px->lbprm.set_server_status_down)
-				px->lbprm.set_server_status_down(s);
-		}
-
-		if (prev_srv_count && s->proxy->srv_bck == 0 && s->proxy->srv_act == 0)
-			set_backend_down(s->proxy);
-		else if (!prev_srv_count && (s->proxy->srv_bck || s->proxy->srv_act))
-			s->proxy->last_change = now.tv_sec;
+		srv_lb_propagate(s);
 
 		/* If the server is set with "on-marked-up shutdown-backup-sessions",
 		 * and it's not a backup server and its effective weight is > 0,
@@ -5699,17 +5625,13 @@ static void srv_update_status(struct server *s)
 			}
 		}
 		/* don't report anything when leaving drain mode and remaining in maintenance */
-
-		s->cur_admin = s->next_admin;
 	}
 
 	if (!(s->next_admin & SRV_ADMF_MAINT)) {
 		if (!(s->cur_admin & SRV_ADMF_DRAIN) && (s->next_admin & SRV_ADMF_DRAIN)) {
 			/* drain state is applied only if not yet in maint */
 
-			s->last_change = now.tv_sec;
-			if (px->lbprm.set_server_status_down)
-				px->lbprm.set_server_status_down(s);
+			srv_lb_propagate(s);
 
 			/* we might have streams queued on this server and waiting for
 			 * a connection. Those which are redispatchable will be queued
@@ -5719,11 +5641,10 @@ static void srv_update_status(struct server *s)
 
 			tmptrash = alloc_trash_chunk();
 			if (tmptrash) {
-				chunk_printf(tmptrash, "%sServer %s/%s enters drain state%s%s%s",
-					     s->flags & SRV_F_BACKUP ? "Backup " : "", s->proxy->id, s->id,
-				             *(s->adm_st_chg_cause) ? " (" : "", s->adm_st_chg_cause, *(s->adm_st_chg_cause) ? ")" : "");
-
-				srv_append_status(tmptrash, s, NULL, xferred, (s->next_admin & SRV_ADMF_FDRAIN));
+				chunk_printf(tmptrash, "%sServer %s/%s enters drain state",
+					     s->flags & SRV_F_BACKUP ? "Backup " : "", s->proxy->id, s->id);
+				srv_append_adm_chg_cause(tmptrash, s, cause);
+				srv_append_more(tmptrash, s, xferred, (s->next_admin & SRV_ADMF_FDRAIN));
 
 				if (!(global.mode & MODE_STARTING)) {
 					ha_warning("%s.\n", tmptrash->area);
@@ -5735,26 +5656,14 @@ static void srv_update_status(struct server *s)
 				free_trash_chunk(tmptrash);
 				tmptrash = NULL;
 			}
-
-			if (prev_srv_count && s->proxy->srv_bck == 0 && s->proxy->srv_act == 0)
-				set_backend_down(s->proxy);
 		}
 		else if ((s->cur_admin & SRV_ADMF_DRAIN) && !(s->next_admin & SRV_ADMF_DRAIN)) {
 			/* OK completely leaving drain mode */
-			if (s->proxy->srv_bck == 0 && s->proxy->srv_act == 0) {
-				if (s->proxy->last_change < now.tv_sec)         // ignore negative times
-					s->proxy->down_time += now.tv_sec - s->proxy->last_change;
-				s->proxy->last_change = now.tv_sec;
-			}
-
-			if (s->last_change < now.tv_sec)                        // ignore negative times
-				s->down_time += now.tv_sec - s->last_change;
-			s->last_change = now.tv_sec;
 			server_recalc_eweight(s, 0);
 
 			tmptrash = alloc_trash_chunk();
 			if (tmptrash) {
-				if (!(s->next_admin & SRV_ADMF_FDRAIN)) {
+				if (s->cur_admin & SRV_ADMF_FDRAIN) {
 					chunk_printf(tmptrash,
 						     "%sServer %s/%s is %s (leaving forced drain)",
 						     s->flags & SRV_F_BACKUP ? "Backup " : "",
@@ -5780,16 +5689,7 @@ static void srv_update_status(struct server *s)
 			}
 
 			/* now propagate the status change to any LB algorithms */
-			if (px->lbprm.update_server_eweight)
-				px->lbprm.update_server_eweight(s);
-			else if (srv_willbe_usable(s)) {
-				if (px->lbprm.set_server_status_up)
-					px->lbprm.set_server_status_up(s);
-			}
-			else {
-				if (px->lbprm.set_server_status_down)
-					px->lbprm.set_server_status_down(s);
-			}
+			srv_lb_propagate(s);
 		}
 		else if ((s->next_admin & SRV_ADMF_DRAIN)) {
 			/* remaining in drain mode after removing one of its flags */
@@ -5818,15 +5718,61 @@ static void srv_update_status(struct server *s)
 				free_trash_chunk(tmptrash);
 				tmptrash = NULL;
 			}
-
-			/* commit new admin status */
-
-			s->cur_admin = s->next_admin;
 		}
 	}
+	return xferred;
+}
 
-	/* Re-set log strings to empty */
-	*s->adm_st_chg_cause = 0;
+/*
+ * This function applies server's status changes.
+ *
+ * Must be called with the server lock held. This may also be called at init
+ * time as the result of parsing the state file, in which case no lock will be
+ * held, and the server's warmup task can be null.
+ * <type> should be 0 for operational and 1 for administrative
+ * <cause> must be srv_op_st_chg_cause enum for operational and
+ * srv_adm_st_chg_cause enum for administrative
+ */
+static void srv_update_status(struct server *s, int type, int cause)
+{
+	int prev_srv_count = s->proxy->srv_bck + s->proxy->srv_act;
+	enum srv_state srv_prev_state = s->cur_state;
+
+	if (type)
+		_srv_update_status_adm(s, cause);
+	else
+		_srv_update_status_op(s, cause);
+
+	/* explicitly commit state changes (even if it was already applied implicitly
+	 * by some lb state change function), so we don't miss anything
+	 */
+	srv_lb_commit_status(s);
+
+	/* check if server stats must be updated due the the server state change */
+	if (srv_prev_state != s->cur_state) {
+		if (srv_prev_state == SRV_ST_STOPPED) {
+			/* server was down and no longer is */
+			if (s->last_change < now.tv_sec)                        // ignore negative times
+				s->down_time += now.tv_sec - s->last_change;
+		}
+		else if (s->cur_state == SRV_ST_STOPPED) {
+			/* server was up and is currently down */
+			s->counters.down_trans++;
+		}
+		s->last_change = now.tv_sec;
+	}
+
+	/* check if backend stats must be updated due to the server state change */
+	if (prev_srv_count && s->proxy->srv_bck == 0 && s->proxy->srv_act == 0)
+		set_backend_down(s->proxy); /* backend going down */
+	else if (!prev_srv_count && (s->proxy->srv_bck || s->proxy->srv_act)) {
+		/* backend was down and is back up again:
+		 * no helper function, updating last_change and backend downtime stats
+		 */
+		if (s->proxy->last_change < now.tv_sec)         // ignore negative times
+			s->proxy->down_time += now.tv_sec - s->proxy->last_change;
+		s->proxy->last_change = now.tv_sec;
+	}
 }
 
 struct task *srv_cleanup_toremove_conns(struct task *task, void *context, unsigned int state)

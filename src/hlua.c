@@ -345,14 +345,103 @@ static int class_applet_tcp_ref;
 static int class_applet_http_ref;
 static int class_txn_reply_ref;
 
-/* Global Lua execution timeout. By default Lua, execution linked
- * with stream (actions, sample-fetches and converters) have a
- * short timeout. Lua linked with tasks doesn't have a timeout
- * because a task may remain alive during all the haproxy execution.
+/* Lua max execution timeouts. By default, stream-related
+ * lua coroutines (e.g.: actions) have a short timeout.
+ * On the other hand tasks coroutines don't have a timeout because
+ * a task may remain alive during all the haproxy execution.
+ *
+ * Timeouts are expressed in milliseconds, they are meant to be used
+ * with hlua timer's API exclusively.
+ * 0 means no timeout
  */
-static unsigned int hlua_timeout_session = 4000; /* session timeout. */
-static unsigned int hlua_timeout_task = TICK_ETERNITY; /* task timeout. */
-static unsigned int hlua_timeout_applet = 4000; /* applet timeout. */
+static uint32_t hlua_timeout_burst = 1000; /* burst timeout. */
+static uint32_t hlua_timeout_session = 4000; /* session timeout. */
+static uint32_t hlua_timeout_task = 0; /* task timeout. */
+static uint32_t hlua_timeout_applet = 4000; /* applet timeout. */
+
+/* hlua multipurpose timer:
+ *  used to compute burst lua time (within a single hlua_ctx_resume())
+ *  and cumulative lua time for a given coroutine, and to check
+ *  the lua coroutine against the configured timeouts
+ */
+
+/* fetch per-thread cpu_time with ms precision (may wrap) */
+static inline uint32_t _hlua_time_ms()
+{
+	/* We're interested in the current cpu time in ms, which will be returned
+	 * as a uint32_t to save some space.
+	 * We must take the following into account:
+	 *
+	 * - now_cpu_time_fast() which returns the time in nanoseconds as a uint64_t
+	 *   will wrap every 585 years.
+	 * - uint32_t may only contain 4294967295ms (~=49.7 days), so _hlua_time_ms()
+	 *   itself will also wrap every 49.7 days.
+	 *
+	 * While we can safely ignore the now_cpu_time_fast() wrap, we must
+	 * take care of the uint32_t wrap by making sure to exclusively
+	 * manipulate the time using uint32_t everywhere _hlua_time_ms()
+	 * is involved.
+	 */
+	return (uint32_t)(now_cpu_time_fast() / 1000000ULL);
+}
+
+/* computes time spent in a single lua execution (in ms) */
+static inline uint32_t _hlua_time_burst(const struct hlua_timer *timer)
+{
+	uint32_t burst_ms;
+
+	/* wrapping is expected and properly
+	 * handled thanks to _hlua_time_ms() and burst_ms
+	 * being of the same type
+	 */
+	burst_ms = _hlua_time_ms() - timer->start;
+	return burst_ms;
+}
+
+static inline void hlua_timer_init(struct hlua_timer *timer, unsigned int max)
+{
+	timer->cumulative = 0;
+	timer->burst = 0;
+	timer->max = max;
+}
+
+/* reset the timer ctx between 2 yields */
+static inline void hlua_timer_reset(struct hlua_timer *timer)
+{
+	timer->cumulative += timer->burst;
+	timer->burst = 0;
+}
+
+/* start the timer right before a new execution */
+static inline void hlua_timer_start(struct hlua_timer *timer)
+{
+	timer->start = _hlua_time_ms();
+}
+
+/* update hlua timer when finishing an execution */
+static inline void hlua_timer_stop(struct hlua_timer *timer)
+{
+	timer->burst += _hlua_time_burst(timer);
+}
+
+/* check the timers for current hlua context:
+ * - first check for burst timeout (max execution time for the current
+     hlua resume, ie: time between effective yields)
+ * - then check for yield cumulative timeout
+ *
+ * Returns 1 if the check succeeded and 0 if it failed
+ * (ie: timeout exceeded)
+ */
+static inline int hlua_timer_check(const struct hlua_timer *timer)
+{
+	uint32_t pburst = _hlua_time_burst(timer); /* pending burst time in ms */
+
+	if (hlua_timeout_burst && (timer->burst + pburst) > hlua_timeout_burst)
+		return 0; /* burst timeout exceeded */
+	if (timer->max && (timer->cumulative + timer->burst + pburst) > timer->max)
+		return 0; /* cumulative timeout exceeded */
+	return 1; /* ok */
+}
 
 /* Interrupts the Lua processing each "hlua_nb_instruction" instructions.
  * it is used for preventing infinite loops.
@@ -1280,6 +1369,7 @@ static inline void hlua_sendlog(struct proxy *px, int level, const char *msg)
 
 /* This function just ensure that the yield will be always
  * returned with a timeout and permit to set some flags
+ * <timeout> is a tick value
  */
 __LJMP void hlua_yieldk(lua_State *L, int nresults, int ctx,
                         lua_KFunction k, int timeout, unsigned int flags)
@@ -1323,6 +1413,7 @@ int hlua_ctx_init(struct hlua *lua, int state_id, struct task *task)
 	lua->gc_count = 0;
 	lua->wake_time = TICK_ETERNITY;
 	lua->state_id = state_id;
+	hlua_timer_init(&lua->timer, 0); /* default value, no timeout */
 	LIST_INIT(&lua->com);
 	MT_LIST_INIT(&lua->hc_list);
 	if (!SET_SAFE_LJMP_PARENT(lua)) {
@@ -1471,6 +1562,18 @@ void hlua_hook(lua_State *L, lua_Debug *ar)
 	if (!hlua)
 		return;
 
+	if (hlua->T != L) {
+		/* We don't want to enforce a yield on a sub coroutine, since
+		 * we have no guarantees that the yield will be handled properly.
+		 * Indeed, only the hlua->T coroutine is being handled through
+		 * hlua_ctx_resume() function.
+		 *
+		 * Instead, we simply check for timeouts and wait for the sub
+		 * coroutine to finish..
+		 */
+		goto check_timeout;
+	}
+
 	/* Lua cannot yield when its returning from a function,
 	 * so, we can fix the interrupt hook to 1 instruction,
 	 * expecting that the function is finished.
@@ -1505,16 +1608,12 @@ void hlua_hook(lua_State *L, lua_Debug *ar)
 		return;
 	}
 
-	/* If we cannot yield, update the clock and check the timeout. */
-	clock_update_date(0, 1);
-	hlua->run_time += now_ms - hlua->start_time;
-	if (hlua->max_time && hlua->run_time >= hlua->max_time) {
+ check_timeout:
+	/* If we cannot yield, check the timeout. */
+	if (!hlua_timer_check(&hlua->timer)) {
 		lua_pushfstring(L, "execution timeout");
 		WILL_LJMP(lua_error(L));
 	}
-
-	/* Update the start time. */
-	hlua->start_time = now_ms;
 
 	/* Try to interrupt the process at the end of the current
 	 * unyieldable function.
@@ -1546,14 +1645,16 @@ static enum hlua_exec hlua_ctx_resume(struct hlua *lua, int yield_allowed)
 	const char *msg;
 	const char *trace;
 
-	/* Initialise run time counter. */
-	if (!HLUA_IS_RUNNING(lua))
-		lua->run_time = 0;
-
 	/* Lock the whole Lua execution. This lock must be before the
 	 * label "resume_execution".
 	 */
 	hlua_lock(lua);
+
+	/* reset the timer as we might be re-entering the function to
+	 * resume the coroutine after a successful yield
+	 * (cumulative time will be updated)
+	 */
+	hlua_timer_reset(&lua->timer);
 
 resume_execution:
 
@@ -1571,9 +1672,11 @@ resume_execution:
 	if (!yield_allowed)
 		HLUA_SET_NOYIELD(lua);
 
-	/* Update the start time and reset wake_time. */
-	lua->start_time = now_ms;
+	/* reset wake_time. */
 	lua->wake_time = TICK_ETERNITY;
+
+	/* start the timer as we're about to start lua processing */
+	hlua_timer_start(&lua->timer);
 
 	/* Call the function. */
 #if defined(LUA_VERSION_NUM) && LUA_VERSION_NUM >= 504
@@ -1581,6 +1684,10 @@ resume_execution:
 #else
 	ret = lua_resume(lua->T, hlua_states[lua->state_id], lua->nargs);
 #endif
+
+	/* out of lua processing, stop the timer */
+	hlua_timer_stop(&lua->timer);
+
 	switch (ret) {
 
 	case LUA_OK:
@@ -1588,12 +1695,10 @@ resume_execution:
 		break;
 
 	case LUA_YIELD:
-		/* Check if the execution timeout is expired. It it is the case, we
+		/* Check if the execution timeout is expired. If it is the case, we
 		 * break the Lua execution.
 		 */
-		clock_update_date(0, 1);
-		lua->run_time += now_ms - lua->start_time;
-		if (lua->max_time && lua->run_time > lua->max_time) {
+		if (!hlua_timer_check(&lua->timer)) {
 			lua_settop(lua->T, 0); /* Empty the stack. */
 			ret = HLUA_E_ETMOUT;
 			break;
@@ -8158,12 +8263,11 @@ __LJMP static int hlua_txn_done(lua_State *L)
 
 		channel_auto_read(req);
 		channel_abort(req);
-		channel_auto_close(req);
 		channel_erase(req);
 
 		channel_auto_read(res);
 		channel_auto_close(res);
-		channel_shutr_now(res);
+		sc_schedule_abort(s->scb);
 
 		finst = ((htxn->dir == SMP_OPT_DIR_REQ) ? SF_FINST_R : SF_FINST_D);
 		goto done;
@@ -8537,7 +8641,7 @@ __LJMP static int hlua_sleep_yield(lua_State *L, int status, lua_KContext ctx)
 __LJMP static int hlua_sleep(lua_State *L)
 {
 	unsigned int delay;
-	unsigned int wakeup_ms;
+	int wakeup_ms; // tick value
 
 	MAY_LJMP(check_args(L, 1, "sleep"));
 
@@ -8552,7 +8656,7 @@ __LJMP static int hlua_sleep(lua_State *L)
 __LJMP static int hlua_msleep(lua_State *L)
 {
 	unsigned int delay;
-	unsigned int wakeup_ms;
+	int wakeup_ms; // tick value
 
 	MAY_LJMP(check_args(L, 1, "msleep"));
 
@@ -8607,6 +8711,41 @@ __LJMP static int hlua_set_nice(lua_State *L)
 	return 0;
 }
 
+/* safe lua coroutine.create() function:
+ *
+ * This is a simple wrapper for coroutine.create() that
+ * ensures the current hlua state ctx is available from
+ * the new subroutine state
+ */
+__LJMP static int hlua_coroutine_create(lua_State *L)
+{
+	lua_State *new; /* new coroutine state */
+	struct hlua **hlua_store;
+	struct hlua *hlua = hlua_gethlua(L);
+
+	new = lua_newthread(L);
+	if (!new)
+		return 0;
+
+	hlua_store = lua_getextraspace(new);
+	/* Expose current hlua ctx on new lua thread
+	 * (hlua_gethlua() will properly return the last "known"
+	 *  hlua ctx instead of NULL when it is called from such coroutines)
+	 */
+	*hlua_store = hlua;
+
+	/* new lua thread is on the top of the stack, we
+	 * need to duplicate first stack argument (<f> from coroutine.create(<f>))
+	 * on the top of the stack to be able to use xmove() to move it on the new
+	 * stack
+	 */
+	lua_pushvalue(L, 1);
+	/* move <f> function to the new stack */
+	lua_xmove(L, new, 1);
+	/* new lua thread is back at the top of the stack */
+	return 1;
+}
+
 /* This function is used as a callback of a task. It is called by the
  * HAProxy task subsystem when the task is awaked. The LUA runtime can
  * return an E_AGAIN signal, the emmiter of this signal must set a
@@ -8627,7 +8766,7 @@ struct task *hlua_process_task(struct task *task, void *context, unsigned int st
 	 * execution timeouts.
 	 */
 	if (!HLUA_IS_RUNNING(hlua))
-		hlua->max_time = hlua_timeout_task;
+		hlua_timer_init(&hlua->timer, hlua_timeout_task);
 
 	/* Execute the Lua code. */
 	status = hlua_ctx_resume(hlua, 1);
@@ -8850,9 +8989,8 @@ static void hlua_event_handler(struct hlua *hlua)
 	/* If it is the first call to the task, we must initialize the
 	 * execution timeouts.
 	 */
-	if (!HLUA_IS_RUNNING(hlua)) {
-		hlua->max_time = hlua_timeout_task;
-	}
+	if (!HLUA_IS_RUNNING(hlua))
+		hlua_timer_init(&hlua->timer, hlua_timeout_task);
 
 	/* make sure to reset the task expiry before each hlua_ctx_resume()
 	 * since the task is re-used for multiple cb function calls
@@ -8891,13 +9029,21 @@ static void hlua_event_handler(struct hlua *hlua)
 	}
 }
 
-__LJMP static int hlua_event_hdl_cb_data_push_args(struct hlua_event_sub *hlua_sub,
-                                                   struct event_hdl_sub_type event, void *data)
+/* This function pushes various arguments such as event type and event data to
+ * the lua function that will be called to consume the event.
+ */
+__LJMP static void hlua_event_hdl_cb_push_args(struct hlua_event_sub *hlua_sub,
+                                               struct event_hdl_async_event *e)
 {
 	struct hlua *hlua = hlua_sub->hlua;
+	struct event_hdl_sub_type event = e->type;
+	void *data = e->data;
 
+	/* push event type */
 	hlua->nargs = 1;
 	lua_pushstring(hlua->T, event_hdl_sub_type_to_string(event));
+
+	/* push event data (according to event type) */
 	if (event_hdl_sub_family_equal(EVENT_HDL_SUB_SERVER, event)) {
 		struct event_hdl_cb_data_server *e_server = data;
 		struct proxy *px;
@@ -8921,11 +9067,15 @@ __LJMP static int hlua_event_hdl_cb_data_push_args(struct hlua_event_sub *hlua_s
 		lua_pushstring(hlua->T, "proxy_name");
 		lua_pushstring(hlua->T, e_server->safe.proxy_name);
 		lua_settable(hlua->T, -3);
+		/* Add server proxy uuid */
+		lua_pushstring(hlua->T, "proxy_uuid");
+		lua_pushinteger(hlua->T, e_server->safe.proxy_uuid);
+		lua_settable(hlua->T, -3);
 
 		/* attempt to provide reference server object
 		 * (if it wasn't removed yet, SERVER_DEL will never succeed here)
 		 */
-		px = proxy_find_by_name(e_server->safe.proxy_name, PR_CAP_BE, 0);
+		px = proxy_find_by_id(e_server->safe.proxy_uuid, PR_CAP_BE, 0);
 		BUG_ON(!px);
 		server = findserver_unique_id(px, e_server->safe.puid, e_server->safe.rid);
 		if (server) {
@@ -8938,7 +9088,9 @@ __LJMP static int hlua_event_hdl_cb_data_push_args(struct hlua_event_sub *hlua_s
 	hlua->nargs += 1;
 	hlua_fcn_new_event_sub(hlua->T, hlua_sub->sub);
 
-	return 1;
+	/* when? */
+	hlua->nargs += 1;
+	lua_pushinteger(hlua->T, e->when.tv_sec);
 }
 
 /* events runner: if there's an ongoing hlua event handling process, finish it
@@ -8961,7 +9113,7 @@ static struct task *hlua_event_runner(struct task *task, void *context, unsigned
 
 		/* We reached the limit of pending events in the queue: we should
 		 * warn the user, and temporarily pause the subscription to give a chance
-		 * to the handler to catch up? (it also prevents ressource shortage since
+		 * to the handler to catch up? (it also prevents resource shortage since
 		 * the queue could grow indefinitely otherwise)
 		 * TODO: find a way to inform the handler that it missed some events
 		 * (example: stats within the subscription in event_hdl api exposed via lua api?)
@@ -9018,16 +9170,13 @@ static struct task *hlua_event_runner(struct task *task, void *context, unsigned
 
 		/* push args */
 		hlua_sub->hlua->nargs = 0;
-		if (!hlua_event_hdl_cb_data_push_args(hlua_sub, event->type, event->data)) {
-			RESET_SAFE_LJMP(hlua_sub->hlua);
-			goto skip_event;
-		}
+		MAY_LJMP(hlua_event_hdl_cb_push_args(hlua_sub, event));
 
 		/* At this point the execution is safe. */
 		RESET_SAFE_LJMP(hlua_sub->hlua);
 
 		/* At this point the event was successfully translated into hlua ctx,
-		 * or hlua error occured, so we can safely discard it
+		 * or hlua error occurred, so we can safely discard it
 		 */
 		event_hdl_async_free_event(event);
 		event = NULL;
@@ -9050,7 +9199,7 @@ static struct task *hlua_event_runner(struct task *task, void *context, unsigned
 			task_wakeup(task, TASK_WOKEN_OTHER);
 		}
 		else if (hlua_sub->paused) {
-			/* empty queue, the handler catched up: resume the subscription */
+			/* empty queue, the handler caught up: resume the subscription */
 			event_hdl_resume(hlua_sub->sub);
 			hlua_sub->paused = 0;
 		}
@@ -9108,8 +9257,7 @@ static struct event_hdl_sub *hlua_event_subscribe(event_hdl_sub_list *list, stru
 
  mem_error:
 	if (hlua_sub) {
-		if (hlua_sub->task)
-			task_destroy(hlua_sub->task);
+		task_destroy(hlua_sub->task);
 		if (hlua_sub->hlua)
 			hlua_ctx_destroy(hlua_sub->hlua);
 		pool_free(pool_head_hlua_event_sub, hlua_sub);
@@ -9159,7 +9307,7 @@ __LJMP static struct event_hdl_sub_type hlua_check_event_sub_types(lua_State *L,
 /* Wrapper for hlua_fcn_new_event_sub(): catch errors raised by
  * the function to prevent LJMP
  *
- * If no error occured, the function returns 1, else it returns 0 and
+ * If no error occurred, the function returns 1, else it returns 0 and
  * the error message is pushed at the top of the stack
  */
 __LJMP static int _hlua_new_event_sub_safe(lua_State *L)
@@ -9179,7 +9327,7 @@ static int hlua_new_event_sub_safe(lua_State *L, struct event_hdl_sub *sub)
 		case LUA_OK:
 			return 1;
 		default:
-			/* error was catched */
+			/* error was caught */
 			return 0;
 	}
 }
@@ -9354,7 +9502,7 @@ static int hlua_sample_conv_wrapper(const struct arg *arg_p, struct sample *smp,
 		}
 
 		/* We must initialize the execution timeouts. */
-		stream->hlua->max_time = hlua_timeout_session;
+		hlua_timer_init(&stream->hlua->timer, hlua_timeout_session);
 
 		/* At this point the execution is safe. */
 		RESET_SAFE_LJMP(stream->hlua);
@@ -9489,7 +9637,7 @@ static int hlua_sample_fetch_wrapper(const struct arg *arg_p, struct sample *smp
 		}
 
 		/* We must initialize the execution timeouts. */
-		stream->hlua->max_time = hlua_timeout_session;
+		hlua_timer_init(&stream->hlua->timer, hlua_timeout_session);
 
 		/* At this point the execution is safe. */
 		RESET_SAFE_LJMP(stream->hlua);
@@ -9725,7 +9873,7 @@ __LJMP static int hlua_set_wake_time(lua_State *L)
 {
 	struct hlua *hlua;
 	unsigned int delay;
-	unsigned int wakeup_ms;
+	int wakeup_ms; // tick value
 
 	/* Get hlua struct, or NULL if we execute from main lua state */
 	hlua = hlua_gethlua(L);
@@ -9838,7 +9986,7 @@ static enum act_return hlua_action(struct act_rule *rule, struct proxy *px,
 		RESET_SAFE_LJMP(s->hlua);
 
 		/* We must initialize the execution timeouts. */
-		s->hlua->max_time = hlua_timeout_session;
+		hlua_timer_init(&s->hlua->timer, hlua_timeout_session);
 	}
 
 	/* Execute the function. */
@@ -9975,7 +10123,7 @@ static int hlua_applet_tcp_init(struct appctx *ctx)
 	}
 
 	/* Set timeout according with the applet configuration. */
-	hlua->max_time = ctx->applet->timeout;
+	hlua_timer_init(&hlua->timer, ctx->applet->timeout);
 
 	/* The following Lua calls can fail. */
 	if (!SET_SAFE_LJMP(hlua)) {
@@ -10166,7 +10314,7 @@ static int hlua_applet_http_init(struct appctx *ctx)
 	}
 
 	/* Set timeout according with the applet configuration. */
-	hlua->max_time = ctx->applet->timeout;
+	hlua_timer_init(&hlua->timer, ctx->applet->timeout);
 
 	/* The following Lua calls can fail. */
 	if (!SET_SAFE_LJMP(hlua)) {
@@ -10843,7 +10991,7 @@ static int hlua_cli_parse_fct(char **args, char *payload, struct appctx *appctx,
 	}
 
 	/* We must initialize the execution timeouts. */
-	hlua->max_time = hlua_timeout_session;
+	hlua_timer_init(&hlua->timer, hlua_timeout_session);
 
 	/* At this point the execution is safe. */
 	RESET_SAFE_LJMP(hlua);
@@ -11309,7 +11457,7 @@ static int hlua_filter_new(struct stream *s, struct filter *filter)
 		s->hlua->nargs = 1;
 
 		/* We must initialize the execution timeouts. */
-		s->hlua->max_time = hlua_timeout_session;
+		hlua_timer_init(&s->hlua->timer, hlua_timeout_session);
 
 		/* At this point the execution is safe. */
 		RESET_SAFE_LJMP(s->hlua);
@@ -11479,7 +11627,7 @@ static int hlua_filter_callback(struct stream *s, struct filter *filter, const c
 		}
 
 		/* We must initialize the execution timeouts. */
-		flt_hlua->max_time = hlua_timeout_session;
+		hlua_timer_init(&flt_hlua->timer, hlua_timeout_session);
 
 		/* At this point the execution is safe. */
 		RESET_SAFE_LJMP(flt_hlua);
@@ -11885,6 +12033,14 @@ static int hlua_read_timeout(char **args, int section_type, struct proxy *curpx,
 	return 0;
 }
 
+static int hlua_burst_timeout(char **args, int section_type, struct proxy *curpx,
+                              const struct proxy *defpx, const char *file, int line,
+                              char **err)
+{
+	return hlua_read_timeout(args, section_type, curpx, defpx,
+	                         file, line, err, &hlua_timeout_burst);
+}
+
 static int hlua_session_timeout(char **args, int section_type, struct proxy *curpx,
                                 const struct proxy *defpx, const char *file, int line,
                                 char **err)
@@ -12187,6 +12343,7 @@ static struct cfg_kw_list cfg_kws = {{ },{
 	{ CFG_GLOBAL, "tune.lua.session-timeout", hlua_session_timeout },
 	{ CFG_GLOBAL, "tune.lua.task-timeout",    hlua_task_timeout },
 	{ CFG_GLOBAL, "tune.lua.service-timeout", hlua_applet_timeout },
+	{ CFG_GLOBAL, "tune.lua.burst-timeout",   hlua_burst_timeout },
 	{ CFG_GLOBAL, "tune.lua.forced-yield",    hlua_forced_yield },
 	{ CFG_GLOBAL, "tune.lua.maxmem",          hlua_parse_maxmem },
 	{ 0, NULL, NULL },
@@ -12728,6 +12885,16 @@ lua_State *hlua_init_state(int thread_num)
 	/* Apply configured prepend path */
 	list_for_each_entry(pp, &prepend_path_list, l)
 		hlua_prepend_path(L, pp->type, pp->path);
+
+	/*
+	 * Override some lua functions.
+	 *
+	 */
+
+	/* push our "safe" coroutine.create() function */
+	lua_getglobal(L, "coroutine");
+	lua_pushcclosure(L, hlua_coroutine_create, 0);
+	lua_setfield(L, -2, "create");
 
 	/*
 	 *
