@@ -1489,9 +1489,10 @@ static int qcs_xfer_data(struct qcs *qcs, struct buffer *out, struct buffer *in)
 
 /* Prepare a STREAM frame for <qcs> instance using <out> as payload. The frame
  * is appended in <frm_list>. Set <fin> if this is supposed to be the last
- * stream frame.
+ * stream frame. If <out> is NULL an empty STREAM frame is built : this may be
+ * useful if FIN needs to be sent without any data left.
  *
- * Returns the length of the STREAM frame or a negative error code.
+ * Returns the payload length of the STREAM frame or a negative error code.
  */
 static int qcs_build_stream_frm(struct qcs *qcs, struct buffer *out, char fin,
                                 struct list *frm_list)
@@ -1508,7 +1509,7 @@ static int qcs_build_stream_frm(struct qcs *qcs, struct buffer *out, char fin,
 	BUG_ON(qcs->tx.sent_offset < base_off);
 
 	head = qcs->tx.sent_offset - base_off;
-	total = b_data(out) - head;
+	total = out ? b_data(out) - head : 0;
 	BUG_ON(total < 0);
 
 	if (!total && !fin) {
@@ -1530,10 +1531,18 @@ static int qcs_build_stream_frm(struct qcs *qcs, struct buffer *out, char fin,
 
 	frm->stream.stream = qcs->stream;
 	frm->stream.id = qcs->id;
-	frm->stream.buf = out;
-	frm->stream.data = (unsigned char *)b_peek(out, head);
 	frm->stream.offset.key = 0;
 	frm->stream.dup = 0;
+
+	if (total) {
+		frm->stream.buf = out;
+		frm->stream.data = (unsigned char *)b_peek(out, head);
+	}
+	else {
+		/* Empty STREAM frame. */
+		frm->stream.buf = NULL;
+		frm->stream.data = NULL;
+	}
 
 	/* FIN is positioned only when the buffer has been totally emptied. */
 	if (fin)
@@ -1544,6 +1553,9 @@ static int qcs_build_stream_frm(struct qcs *qcs, struct buffer *out, char fin,
 		frm->stream.offset.key = qcs->tx.sent_offset;
 	}
 
+	/* Always set length bit as we do not know if there is remaining frames
+	 * in the final packet after this STREAM.
+	 */
 	frm->type |= QUIC_STREAM_FRAME_TYPE_LEN_BIT;
 	frm->stream.len = total;
 
@@ -1801,21 +1813,21 @@ static int _qc_send_qcs(struct qcs *qcs, struct list *frms)
 	/* Cannot send STREAM on remote unidirectional streams. */
 	BUG_ON(quic_stream_is_uni(qcs->id) && quic_stream_is_remote(qcc, qcs->id));
 
-	/* Allocate <out> buffer if necessary. */
-	if (!out) {
-		if (qcc->flags & QC_CF_CONN_FULL)
-			goto out;
-
-		out = qc_stream_buf_alloc(qcs->stream, qcs->tx.offset);
-		if (!out) {
-			TRACE_STATE("cannot allocate stream desc buffer", QMUX_EV_QCS_SEND, qcc->conn, qcs);
-			qcc->flags |= QC_CF_CONN_FULL;
-			goto out;
-		}
-	}
-
-	/* Transfer data from <buf> to <out>. */
 	if (b_data(buf)) {
+		/* Allocate <out> buffer if not already done. */
+		if (!out) {
+			if (qcc->flags & QC_CF_CONN_FULL)
+				goto out;
+
+			out = qc_stream_buf_alloc(qcs->stream, qcs->tx.offset);
+			if (!out) {
+				TRACE_STATE("cannot allocate stream desc buffer", QMUX_EV_QCS_SEND, qcc->conn, qcs);
+				qcc->flags |= QC_CF_CONN_FULL;
+				goto out;
+			}
+		}
+
+		/* Transfer data from <buf> to <out>. */
 		xfer = qcs_xfer_data(qcs, out, buf);
 		if (xfer > 0) {
 			qcs_notify_send(qcs);
@@ -1826,10 +1838,10 @@ static int _qc_send_qcs(struct qcs *qcs, struct list *frms)
 		BUG_ON_HOT(qcs->tx.offset > qcs->tx.msd);
 		qcc->tx.offsets += xfer;
 		BUG_ON_HOT(qcc->tx.offsets > qcc->rfctl.md);
-	}
 
-	/* out buffer cannot be emptied if qcs offsets differ. */
-	BUG_ON(!b_data(out) && qcs->tx.sent_offset != qcs->tx.offset);
+		/* out buffer cannot be emptied if qcs offsets differ. */
+		BUG_ON(!b_data(out) && qcs->tx.sent_offset != qcs->tx.offset);
+	}
 
 	/* FIN is set if all incoming data were transferred. */
 	fin = qcs_stream_fin(qcs);
@@ -1859,7 +1871,7 @@ static int qc_send(struct qcc *qcc)
 	struct list frms = LIST_HEAD_INIT(frms);
 	/* Temporary list for QCS on error. */
 	struct list qcs_failed = LIST_HEAD_INIT(qcs_failed);
-	struct qcs *qcs, *qcs_tmp;
+	struct qcs *qcs, *qcs_tmp, *first_qcs = NULL;
 	int ret, total = 0;
 
 	TRACE_ENTER(QMUX_EV_QCC_SEND, qcc->conn);
@@ -1882,6 +1894,10 @@ static int qc_send(struct qcc *qcc)
 
 	/* Send STREAM/STOP_SENDING/RESET_STREAM data for registered streams. */
 	list_for_each_entry_safe(qcs, qcs_tmp, &qcc->send_list, el_send) {
+		/* Check if all QCS were processed. */
+		if (qcs == first_qcs)
+			break;
+
 		/* Stream must not be present in send_list if it has nothing to send. */
 		BUG_ON(!(qcs->flags & (QC_SF_TO_STOP_SENDING|QC_SF_TO_RESET)) &&
 		       !qcs_need_sending(qcs));
@@ -1928,6 +1944,16 @@ static int qc_send(struct qcc *qcc)
 			}
 
 			total += ret;
+			if (ret) {
+				/* Move QCS with some bytes transferred at the
+				 * end of send-list for next iterations.
+				 */
+				LIST_DEL_INIT(&qcs->el_send);
+				LIST_APPEND(&qcc->send_list, &qcs->el_send);
+				/* Remember first moved QCS as checkpoint to interrupt loop */
+				if (!first_qcs)
+					first_qcs = qcs;
+			}
 		}
 	}
 
@@ -2567,8 +2593,10 @@ static size_t qc_send_buf(struct stconn *sc, struct buffer *buf,
 	}
 
 	ret = qcs_http_snd_buf(qcs, buf, count, &fin);
-	if (fin)
+	if (fin) {
+		TRACE_STATE("reached stream fin", QMUX_EV_STRM_SEND, qcs->qcc->conn, qcs);
 		qcs->flags |= QC_SF_FIN_STREAM;
+	}
 
 	if (ret || fin) {
 		qcc_send_stream(qcs, 0);
@@ -2668,21 +2696,30 @@ static int qc_wake(struct connection *conn)
 static void qc_shutw(struct stconn *sc, enum co_shw_mode mode)
 {
 	struct qcs *qcs = __sc_mux_strm(sc);
+	struct qcc *qcc = qcs->qcc;
 
-	TRACE_ENTER(QMUX_EV_STRM_SHUT, qcs->qcc->conn, qcs);
+	TRACE_ENTER(QMUX_EV_STRM_SHUT, qcc->conn, qcs);
 
-	/* If QC_SF_FIN_STREAM is not set and stream is not closed locally, it
-	 * means that upper layer reported an early closure. A RESET_STREAM is
-	 * necessary if not already scheduled.
-	 */
-
+	/* Early closure reported if QC_SF_FIN_STREAM not yet set. */
 	if (!qcs_is_close_local(qcs) &&
 	    !(qcs->flags & (QC_SF_FIN_STREAM|QC_SF_TO_RESET))) {
-		qcc_reset_stream(qcs, 0);
-		se_fl_set_error(qcs->sd);
+
+		if (qcs->flags & QC_SF_UNKNOWN_PL_LENGTH) {
+			/* Close stream with a FIN STREAM frame. */
+			TRACE_STATE("set FIN STREAM", QMUX_EV_STRM_SHUT, qcc->conn, qcs);
+			qcs->flags |= QC_SF_FIN_STREAM;
+			qcc_send_stream(qcs, 0);
+		}
+		else {
+			/* RESET_STREAM necessary. */
+			qcc_reset_stream(qcs, 0);
+			se_fl_set_error(qcs->sd);
+		}
+
+		tasklet_wakeup(qcc->wait_event.tasklet);
 	}
 
-	TRACE_LEAVE(QMUX_EV_STRM_SHUT, qcs->qcc->conn, qcs);
+	TRACE_LEAVE(QMUX_EV_STRM_SHUT, qcc->conn, qcs);
 }
 
 /* for debugging with CLI's "show sess" command. May emit multiple lines, each
