@@ -2010,15 +2010,15 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 		uniq_id = _HA_ATOMIC_FETCH_ADD(&global.req_count, 1);
 
 		/* prepare a valid log structure */
-		tmp_strm_log.tv_accept = sess->tv_accept;
+		tmp_strm_log.accept_ts = sess->accept_ts;
 		tmp_strm_log.accept_date = sess->accept_date;
 		tmp_strm_log.t_handshake = sess->t_handshake;
 		tmp_strm_log.t_idle = (sess->t_idle >= 0 ? sess->t_idle : 0);
-		tv_zero(&tmp_strm_log.tv_request);
+		tmp_strm_log.request_ts = 0;
 		tmp_strm_log.t_queue = -1;
 		tmp_strm_log.t_connect = -1;
 		tmp_strm_log.t_data = -1;
-		tmp_strm_log.t_close = tv_ms_elapsed(&sess->tv_accept, &now);
+		tmp_strm_log.t_close = ns_to_ms(now_ns - sess->accept_ts);
 		tmp_strm_log.bytes_in = 0;
 		tmp_strm_log.bytes_out = 0;
 		tmp_strm_log.prx_queue_pos = 0;
@@ -2058,8 +2058,8 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 	}
 
 	t_request = -1;
-	if (tv_isge(&logs->tv_request, &logs->tv_accept))
-		t_request = tv_ms_elapsed(&logs->tv_accept, &logs->tv_request);
+	if ((llong)(logs->request_ts - logs->accept_ts) >= 0)
+		t_request = ns_to_ms(logs->request_ts - logs->accept_ts);
 
 	tmplog = dst;
 
@@ -3760,7 +3760,7 @@ int cfg_parse_log_forward(const char *file, int linenum, char **args, int kwm)
 		px->conf.file = strdup(file);
 		px->conf.line = linenum;
 		px->mode = PR_MODE_SYSLOG;
-		px->last_change = now.tv_sec;
+		px->last_change = ns_to_sec(now_ns);
 		px->cap = PR_CAP_FE;
 		px->maxconn = 10;
 		px->timeout.client = TICK_ETERNITY;

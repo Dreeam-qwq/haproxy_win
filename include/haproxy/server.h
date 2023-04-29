@@ -183,7 +183,7 @@ static inline void srv_inc_sess_ctr(struct server *s)
 /* set the time of last session on the designated server */
 static inline void srv_set_sess_last(struct server *s)
 {
-	s->counters.last_sess = now.tv_sec;
+	s->counters.last_sess = ns_to_sec(now_ns);
 }
 
 /* returns the current server throttle rate between 0 and 100% */

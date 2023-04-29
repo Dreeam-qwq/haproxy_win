@@ -1643,6 +1643,11 @@ void qcc_streams_sent_done(struct qcs *qcs, uint64_t data, uint64_t offset)
 		    b_full(&qcs->stream->buf->buf)) {
 			qc_stream_buf_release(qcs->stream);
 		}
+
+		/* Add measurement for send rate. This is done at the MUX layer
+		 * to account only for STREAM frames without retransmission.
+		 */
+		increment_send_rate(diff, 0);
 	}
 
 	if (qcs->tx.offset == qcs->tx.sent_offset && !b_data(&qcs->tx.buf)) {

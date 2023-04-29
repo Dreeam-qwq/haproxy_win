@@ -2693,7 +2693,7 @@ static int stats_dump_resolv_to_buffer(struct stconn *sc,
 	return 1;
 
   full:
-	sc_have_room(sc);
+	sc_need_room(sc);
 	return 0;
 }
 
@@ -3234,7 +3234,7 @@ int check_action_do_resolve(struct act_rule *rule, struct proxy *px, char **err)
 
 void resolvers_setup_proxy(struct proxy *px)
 {
-	px->last_change = now.tv_sec;
+	px->last_change = ns_to_sec(now_ns);
 	px->cap = PR_CAP_FE | PR_CAP_BE;
 	px->maxconn = 0;
 	px->conn_retries = 1;

@@ -259,15 +259,15 @@ generate_pseudo_uuid()
 	return my_strndup(trash.area, trash.data);
 }
 
-
+/* set/add to <t> the elapsed time since <since> and now */
 static inline void
-spoe_update_stat_time(struct timeval *tv, long *t)
+spoe_update_stat_time(ullong *since, long *t)
 {
 	if (*t == -1)
-		*t = tv_ms_elapsed(tv, &now);
+		*t = ns_to_ms(now_ns - *since);
 	else
-		*t += tv_ms_elapsed(tv, &now);
-	tv_zero(tv);
+		*t += ns_to_ms(now_ns - *since);
+	*since = 0;
 }
 
 /********************************************************************
@@ -1010,7 +1010,7 @@ spoe_handle_agentack_frame(struct appctx *appctx, struct spoe_context **ctx,
 	SPOE_PRINTF(stderr, "%d.%06d [SPOE/%-15s] %s: appctx=%p"
 		    " - Ignore ACK frame"
 		    " - stream-id=%u - frame-id=%u\n",
-		    (int)now.tv_sec, (int)now.tv_usec, agent->id,
+		    (int)date.tv_sec, (int)date.tv_usec, agent->id,
 		    __FUNCTION__, appctx,
 		    (unsigned int)stream_id, (unsigned int)frame_id);
 
@@ -1051,7 +1051,7 @@ spoe_handle_agentack_frame(struct appctx *appctx, struct spoe_context **ctx,
 	SPOE_PRINTF(stderr, "%d.%06d [SPOE/%-15s] %s: appctx=%p"
 		    " - ACK frame received"
 		    " - ctx=%p - stream-id=%u - frame-id=%u - flags=0x%08x\n",
-		    (int)now.tv_sec, (int)now.tv_usec, agent->id,
+		    (int)date.tv_sec, (int)date.tv_usec, agent->id,
 		    __FUNCTION__, appctx, *ctx, (*ctx)->stream_id,
 		    (*ctx)->frame_id, flags);
 	return (p - frame);
@@ -1277,7 +1277,7 @@ spoe_release_appctx(struct appctx *appctx)
 	agent = spoe_appctx->agent;
 
 	SPOE_PRINTF(stderr, "%d.%06d [SPOE/%-15s] %s: appctx=%p\n",
-		    (int)now.tv_sec, (int)now.tv_usec, agent->id,
+		    (int)date.tv_sec, (int)date.tv_usec, agent->id,
 		    __FUNCTION__, appctx);
 
 	/* Remove applet from the list of running applets */
@@ -1294,6 +1294,7 @@ spoe_release_appctx(struct appctx *appctx)
 		if (appctx->st0 == SPOE_APPCTX_ST_IDLE) {
 			eb32_delete(&spoe_appctx->node);
 			_HA_ATOMIC_DEC(&agent->counters.idles);
+			agent->rt[tid].idles--;
 		}
 
 		appctx->st0 = SPOE_APPCTX_ST_END;
@@ -1309,7 +1310,7 @@ spoe_release_appctx(struct appctx *appctx)
 		LIST_DELETE(&ctx->list);
 		LIST_INIT(&ctx->list);
 		_HA_ATOMIC_DEC(&agent->counters.nb_waiting);
-		spoe_update_stat_time(&ctx->stats.tv_wait, &ctx->stats.t_waiting);
+		spoe_update_stat_time(&ctx->stats.wait_ts, &ctx->stats.t_waiting);
 		ctx->spoe_appctx = NULL;
 		ctx->state = SPOE_CTX_ST_ERROR;
 		ctx->status_code = (spoe_appctx->status_code + 0x100);
@@ -1361,7 +1362,7 @@ spoe_release_appctx(struct appctx *appctx)
 			LIST_DELETE(&ctx->list);
 			LIST_INIT(&ctx->list);
 			_HA_ATOMIC_DEC(&agent->counters.nb_sending);
-			spoe_update_stat_time(&ctx->stats.tv_queue, &ctx->stats.t_queue);
+			spoe_update_stat_time(&ctx->stats.queue_ts, &ctx->stats.t_queue);
 			ctx->spoe_appctx = NULL;
 			ctx->state = SPOE_CTX_ST_ERROR;
 			ctx->status_code = (spoe_appctx->status_code + 0x100);
@@ -1371,7 +1372,7 @@ spoe_release_appctx(struct appctx *appctx)
 			LIST_DELETE(&ctx->list);
 			LIST_INIT(&ctx->list);
 			_HA_ATOMIC_DEC(&agent->counters.nb_waiting);
-			spoe_update_stat_time(&ctx->stats.tv_wait, &ctx->stats.t_waiting);
+			spoe_update_stat_time(&ctx->stats.wait_ts, &ctx->stats.t_waiting);
 			ctx->spoe_appctx = NULL;
 			ctx->state = SPOE_CTX_ST_ERROR;
 			ctx->status_code = (spoe_appctx->status_code + 0x100);
@@ -1412,7 +1413,7 @@ spoe_handle_connect_appctx(struct appctx *appctx)
 	if (appctx->st1 == SPOE_APPCTX_ERR_TOUT) {
 		SPOE_PRINTF(stderr, "%d.%06d [SPOE/%-15s] %s: appctx=%p"
 			    " - Connection timed out\n",
-			    (int)now.tv_sec, (int)now.tv_usec, agent->id,
+			    (int)date.tv_sec, (int)date.tv_usec, agent->id,
 			    __FUNCTION__, appctx);
 		SPOE_APPCTX(appctx)->status_code = SPOE_FRM_ERR_TOUT;
 		goto exit;
@@ -1465,7 +1466,7 @@ spoe_handle_connecting_appctx(struct appctx *appctx)
 	if (appctx->st1 == SPOE_APPCTX_ERR_TOUT) {
 		SPOE_PRINTF(stderr, "%d.%06d [SPOE/%-15s] %s: appctx=%p"
 			    " - Connection timed out\n",
-			    (int)now.tv_sec, (int)now.tv_usec, agent->id,
+			    (int)date.tv_sec, (int)date.tv_usec, agent->id,
 			    __FUNCTION__, appctx);
 		SPOE_APPCTX(appctx)->status_code = SPOE_FRM_ERR_TOUT;
 		goto exit;
@@ -1494,6 +1495,7 @@ spoe_handle_connecting_appctx(struct appctx *appctx)
 
 		default:
 			_HA_ATOMIC_INC(&agent->counters.idles);
+			agent->rt[tid].idles++;
 			appctx->st0 = SPOE_APPCTX_ST_IDLE;
 			SPOE_APPCTX(appctx)->node.key = 0;
 			eb32_insert(&agent->rt[tid].idle_applets, &SPOE_APPCTX(appctx)->node);
@@ -1564,7 +1566,7 @@ spoe_handle_sending_frame_appctx(struct appctx *appctx, int *skip)
 			LIST_DELETE(&ctx->list);
 			LIST_INIT(&ctx->list);
 			_HA_ATOMIC_DEC(&agent->counters.nb_sending);
-			spoe_update_stat_time(&ctx->stats.tv_queue, &ctx->stats.t_queue);
+			spoe_update_stat_time(&ctx->stats.queue_ts, &ctx->stats.t_queue);
 			ctx->spoe_appctx = NULL;
 			ctx->state = SPOE_CTX_ST_ERROR;
 			ctx->status_code = (SPOE_APPCTX(appctx)->status_code + 0x100);
@@ -1584,7 +1586,7 @@ spoe_handle_sending_frame_appctx(struct appctx *appctx, int *skip)
 			LIST_DELETE(&ctx->list);
 			LIST_INIT(&ctx->list);
 			_HA_ATOMIC_DEC(&agent->counters.nb_sending);
-			spoe_update_stat_time(&ctx->stats.tv_queue, &ctx->stats.t_queue);
+			spoe_update_stat_time(&ctx->stats.queue_ts, &ctx->stats.t_queue);
 			ctx->spoe_appctx = SPOE_APPCTX(appctx);
 			if (!(ctx->flags & SPOE_CTX_FL_FRAGMENTED) ||
 			    (ctx->frag_ctx.flags & SPOE_FRM_FL_FIN))
@@ -1619,7 +1621,7 @@ spoe_handle_sending_frame_appctx(struct appctx *appctx, int *skip)
 		LIST_APPEND(&SPOE_APPCTX(appctx)->waiting_queue, &ctx->list);
 	}
 	_HA_ATOMIC_INC(&agent->counters.nb_waiting);
-	ctx->stats.tv_wait = now;
+	ctx->stats.wait_ts = now_ns;
 	SPOE_APPCTX(appctx)->frag_ctx.ctx    = NULL;
 	SPOE_APPCTX(appctx)->frag_ctx.cursid = 0;
 	SPOE_APPCTX(appctx)->frag_ctx.curfid = 0;
@@ -1675,8 +1677,8 @@ spoe_handle_receiving_frame_appctx(struct appctx *appctx, int *skip)
 			LIST_DELETE(&ctx->list);
 			LIST_INIT(&ctx->list);
 			_HA_ATOMIC_DEC(&agent->counters.nb_waiting);
-			spoe_update_stat_time(&ctx->stats.tv_wait, &ctx->stats.t_waiting);
-			ctx->stats.tv_response = now;
+			spoe_update_stat_time(&ctx->stats.wait_ts, &ctx->stats.t_waiting);
+			ctx->stats.response_ts = now_ns;
 			if (ctx->spoe_appctx) {
 				ctx->spoe_appctx->cur_fpa--;
 				ctx->spoe_appctx = NULL;
@@ -1718,7 +1720,7 @@ spoe_handle_processing_appctx(struct appctx *appctx)
 
 	SPOE_PRINTF(stderr, "%d.%06d [SPOE/%-15s] %s: appctx=%p"
 		    " - process: fpa=%u/%u - appctx-state=%s - weight=%u - flags=0x%08x\n",
-		    (int)now.tv_sec, (int)now.tv_usec, agent->id,
+		    (int)date.tv_sec, (int)date.tv_usec, agent->id,
 		    __FUNCTION__, appctx, SPOE_APPCTX(appctx)->cur_fpa,
 		    agent->max_fpa, spoe_appctx_state_str[appctx->st0],
 		    SPOE_APPCTX(appctx)->node.key, SPOE_APPCTX(appctx)->flags);
@@ -1803,6 +1805,7 @@ spoe_handle_processing_appctx(struct appctx *appctx)
 			goto next;
 		}
 		_HA_ATOMIC_INC(&agent->counters.idles);
+		agent->rt[tid].idles++;
 		appctx->st0 = SPOE_APPCTX_ST_IDLE;
 		eb32_insert(&agent->rt[tid].idle_applets, &SPOE_APPCTX(appctx)->node);
 	}
@@ -1844,7 +1847,7 @@ spoe_handle_disconnect_appctx(struct appctx *appctx)
 		default:
 			SPOE_PRINTF(stderr, "%d.%06d [SPOE/%-15s] %s: appctx=%p"
 				    " - disconnected by HAProxy (%d): %s\n",
-				    (int)now.tv_sec, (int)now.tv_usec, agent->id,
+				    (int)date.tv_sec, (int)date.tv_usec, agent->id,
 				    __FUNCTION__, appctx,
 				    SPOE_APPCTX(appctx)->status_code,
 				    spoe_frm_err_reasons[SPOE_APPCTX(appctx)->status_code]);
@@ -1888,7 +1891,7 @@ spoe_handle_disconnecting_appctx(struct appctx *appctx)
 		case -1: /* error  */
 			SPOE_PRINTF(stderr, "%d.%06d [SPOE/%-15s] %s: appctx=%p"
 				    " - error on frame (%s)\n",
-				    (int)now.tv_sec, (int)now.tv_usec,
+				    (int)date.tv_sec, (int)date.tv_usec,
 				    ((struct spoe_agent *)SPOE_APPCTX(appctx)->agent)->id,
 				    __FUNCTION__, appctx,
 				    spoe_frm_err_reasons[SPOE_APPCTX(appctx)->status_code]);
@@ -1903,7 +1906,7 @@ spoe_handle_disconnecting_appctx(struct appctx *appctx)
 		default:
 			SPOE_PRINTF(stderr, "%d.%06d [SPOE/%-15s] %s: appctx=%p"
 				    " - disconnected by peer (%d): %.*s\n",
-				    (int)now.tv_sec, (int)now.tv_usec,
+				    (int)date.tv_sec, (int)date.tv_usec,
 				    ((struct spoe_agent *)SPOE_APPCTX(appctx)->agent)->id,
 				    __FUNCTION__, appctx, SPOE_APPCTX(appctx)->status_code,
 				    SPOE_APPCTX(appctx)->rlen, SPOE_APPCTX(appctx)->reason);
@@ -1944,7 +1947,7 @@ spoe_handle_appctx(struct appctx *appctx)
   switchstate:
 	SPOE_PRINTF(stderr, "%d.%06d [SPOE/%-15s] %s: appctx=%p"
 		    " - appctx-state=%s\n",
-		    (int)now.tv_sec, (int)now.tv_usec, agent->id,
+		    (int)date.tv_sec, (int)date.tv_usec, agent->id,
 		    __FUNCTION__, appctx, spoe_appctx_state_str[appctx->st0]);
 
 	switch (appctx->st0) {
@@ -1960,6 +1963,7 @@ spoe_handle_appctx(struct appctx *appctx)
 
 		case SPOE_APPCTX_ST_IDLE:
 			_HA_ATOMIC_DEC(&agent->counters.idles);
+			agent->rt[tid].idles--;
 			eb32_delete(&SPOE_APPCTX(appctx)->node);
 			if (stopping &&
 			    LIST_ISEMPTY(&agent->rt[tid].sending_queue) &&
@@ -2066,13 +2070,13 @@ spoe_queue_context(struct spoe_context *ctx)
 	struct spoe_appctx *spoe_appctx;
 
 	/* Check if we need to create a new SPOE applet or not. */
-	if (!eb_is_empty(&agent->rt[tid].idle_applets) &&
-	    (agent->rt[tid].processing == 1 || agent->rt[tid].processing < read_freq_ctr(&agent->rt[tid].processing_per_sec)))
+	if (agent->rt[tid].processing < agent->rt[tid].idles  ||
+	    agent->rt[tid].processing < read_freq_ctr(&agent->rt[tid].processing_per_sec))
 		goto end;
 
 	SPOE_PRINTF(stderr, "%d.%06d [SPOE/%-15s] %s: stream=%p"
 		    " - try to create new SPOE appctx\n",
-		    (int)now.tv_sec, (int)now.tv_usec, agent->id, __FUNCTION__,
+		    (int)date.tv_sec, (int)date.tv_usec, agent->id, __FUNCTION__,
 		    ctx->strm);
 
 	/* Do not try to create a new applet if there is no server up for the
@@ -2080,7 +2084,7 @@ spoe_queue_context(struct spoe_context *ctx)
 	if (!agent->b.be->srv_act && !agent->b.be->srv_bck) {
 		SPOE_PRINTF(stderr, "%d.%06d [SPOE/%-15s] %s: stream=%p"
 			    " - cannot create SPOE appctx: no server up\n",
-			    (int)now.tv_sec, (int)now.tv_usec, agent->id,
+			    (int)date.tv_sec, (int)date.tv_usec, agent->id,
 			    __FUNCTION__, ctx->strm);
 		goto end;
 	}
@@ -2091,7 +2095,7 @@ spoe_queue_context(struct spoe_context *ctx)
 		if (!freq_ctr_remain(&agent->rt[tid].conn_per_sec, agent->cps_max, 0)) {
 			SPOE_PRINTF(stderr, "%d.%06d [SPOE/%-15s] %s: stream=%p"
 				    " - cannot create SPOE appctx: max CPS reached\n",
-				    (int)now.tv_sec, (int)now.tv_usec, agent->id,
+				    (int)date.tv_sec, (int)date.tv_usec, agent->id,
 				    __FUNCTION__, ctx->strm);
 			goto end;
 		}
@@ -2101,7 +2105,7 @@ spoe_queue_context(struct spoe_context *ctx)
 	if (appctx == NULL) {
 		SPOE_PRINTF(stderr, "%d.%06d [SPOE/%-15s] %s: stream=%p"
 			    " - failed to create SPOE appctx\n",
-			    (int)now.tv_sec, (int)now.tv_usec, agent->id,
+			    (int)date.tv_sec, (int)date.tv_usec, agent->id,
 			    __FUNCTION__, ctx->strm);
 		send_log(&conf->agent_fe, LOG_EMERG,
 			 "SPOE: [%s] failed to create SPOE applet\n",
@@ -2125,8 +2129,8 @@ spoe_queue_context(struct spoe_context *ctx)
 	 * already assigned and wakeup all idle applets. Otherwise, don't queue
 	 * it. */
 	_HA_ATOMIC_INC(&agent->counters.nb_sending);
-	spoe_update_stat_time(&ctx->stats.tv_request, &ctx->stats.t_request);
-	ctx->stats.tv_queue = now;
+	spoe_update_stat_time(&ctx->stats.request_ts, &ctx->stats.t_request);
+	ctx->stats.queue_ts = now_ns;
 	if (ctx->spoe_appctx)
 		return 1;
 	LIST_APPEND(&agent->rt[tid].sending_queue, &ctx->list);
@@ -2134,7 +2138,7 @@ spoe_queue_context(struct spoe_context *ctx)
 	SPOE_PRINTF(stderr, "%d.%06d [SPOE/%-15s] %s: stream=%p"
 		    " - Add stream in sending queue"
 		    " - applets=%u - idles=%u - processing=%u\n",
-		    (int)now.tv_sec, (int)now.tv_usec, agent->id, __FUNCTION__,
+		    (int)date.tv_sec, (int)date.tv_usec, agent->id, __FUNCTION__,
 		    ctx->strm, agent->counters.applets, agent->counters.idles,
 		    agent->rt[tid].processing);
 
@@ -2302,7 +2306,7 @@ spoe_encode_messages(struct stream *s, struct spoe_context *ctx,
 	SPOE_PRINTF(stderr, "%d.%06d [SPOE/%-15s] %s: stream=%p"
 		    " - encode %s messages - spoe_appctx=%p"
 		    "- max_size=%u - encoded=%ld\n",
-		    (int)now.tv_sec, (int)now.tv_usec,
+		    (int)date.tv_sec, (int)date.tv_usec,
 		    agent->id, __FUNCTION__, s,
 		    ((ctx->flags & SPOE_CTX_FL_FRAGMENTED) ? "last fragment of" : "unfragmented"),
 		    ctx->spoe_appctx, (agent->rt[tid].frame_size - FRAME_HDR_SIZE),
@@ -2328,7 +2332,7 @@ spoe_encode_messages(struct stream *s, struct spoe_context *ctx,
 		    " - encode fragmented messages - spoe_appctx=%p"
 		    " - curmsg=%p - curarg=%p - curoff=%u"
 		    " - max_size=%u - encoded=%ld\n",
-		    (int)now.tv_sec, (int)now.tv_usec,
+		    (int)date.tv_sec, (int)date.tv_usec,
 		    agent->id, __FUNCTION__, s, ctx->spoe_appctx,
 		    ctx->frag_ctx.curmsg, ctx->frag_ctx.curarg, ctx->frag_ctx.curoff,
 		    (agent->rt[tid].frame_size - FRAME_HDR_SIZE), p - b_head(&ctx->buffer));
@@ -2341,7 +2345,7 @@ spoe_encode_messages(struct stream *s, struct spoe_context *ctx,
   skip:
 	SPOE_PRINTF(stderr, "%d.%06d [SPOE/%-15s] %s: stream=%p"
 		    " - skip the frame because nothing has been encoded\n",
-		    (int)now.tv_sec, (int)now.tv_usec,
+		    (int)date.tv_sec, (int)date.tv_usec,
 		    agent->id, __FUNCTION__, s);
 	return 0;
 }
@@ -2419,7 +2423,7 @@ spoe_decode_action_set_var(struct stream *s, struct spoe_context *ctx,
 
 	SPOE_PRINTF(stderr, "%d.%06d [SPOE/%-15s] %s: stream=%p"
 		    " - set-var '%s.%s.%.*s'\n",
-		    (int)now.tv_sec, (int)now.tv_usec,
+		    (int)date.tv_sec, (int)date.tv_usec,
 		    ((struct spoe_config *)FLT_CONF(ctx->filter))->agent->id,
 		    __FUNCTION__, s, scope,
 		    ((struct spoe_config *)FLT_CONF(ctx->filter))->agent->var_pfx,
@@ -2469,7 +2473,7 @@ spoe_decode_action_unset_var(struct stream *s, struct spoe_context *ctx,
 
 	SPOE_PRINTF(stderr, "%d.%06d [SPOE/%-15s] %s: stream=%p"
 		    " - unset-var '%s.%s.%.*s'\n",
-		    (int)now.tv_sec, (int)now.tv_usec,
+		    (int)date.tv_sec, (int)date.tv_usec,
 		    ((struct spoe_config *)FLT_CONF(ctx->filter))->agent->id,
 		    __FUNCTION__, s, scope,
 		    ((struct spoe_config *)FLT_CONF(ctx->filter))->agent->var_pfx,
@@ -2529,13 +2533,13 @@ static void
 spoe_update_stats(struct stream *s, struct spoe_agent *agent,
 		  struct spoe_context *ctx, int dir)
 {
-	if (!tv_iszero(&ctx->stats.tv_start)) {
-		spoe_update_stat_time(&ctx->stats.tv_start, &ctx->stats.t_process);
-		ctx->stats.t_total  += ctx->stats.t_process;
-		tv_zero(&ctx->stats.tv_request);
-		tv_zero(&ctx->stats.tv_queue);
-		tv_zero(&ctx->stats.tv_wait);
-		tv_zero(&ctx->stats.tv_response);
+	if (ctx->stats.start_ts != 0) {
+		spoe_update_stat_time(&ctx->stats.start_ts, &ctx->stats.t_process);
+		ctx->stats.t_total    += ctx->stats.t_process;
+		ctx->stats.request_ts  = 0;
+		ctx->stats.queue_ts    = 0;
+		ctx->stats.wait_ts     = 0;
+		ctx->stats.response_ts = 0;
 	}
 
 	if (agent->var_t_process) {
@@ -2596,8 +2600,8 @@ spoe_start_processing(struct spoe_agent *agent, struct spoe_context *ctx, int di
 		return 0;
 
 	agent->rt[tid].processing++;
-	ctx->stats.tv_start   = now;
-	ctx->stats.tv_request = now;
+	ctx->stats.start_ts   = now_ns;
+	ctx->stats.request_ts = now_ns;
 	ctx->stats.t_request  = -1;
 	ctx->stats.t_queue    = -1;
 	ctx->stats.t_waiting  = -1;
@@ -2676,7 +2680,7 @@ spoe_process_messages(struct stream *s, struct spoe_context *ctx,
 	if (tick_is_expired(ctx->process_exp, now_ms) && ctx->state != SPOE_CTX_ST_DONE) {
 		SPOE_PRINTF(stderr, "%d.%06d [SPOE/%-15s] %s: stream=%p"
 			    " - failed to process messages: timeout\n",
-			    (int)now.tv_sec, (int)now.tv_usec,
+			    (int)date.tv_sec, (int)date.tv_usec,
 			    agent->id, __FUNCTION__, s);
 		ctx->status_code = SPOE_CTX_ERR_TOUT;
 		goto end;
@@ -2687,7 +2691,7 @@ spoe_process_messages(struct stream *s, struct spoe_context *ctx,
 			if (!freq_ctr_remain(&agent->rt[tid].err_per_sec, agent->eps_max, 0)) {
 				SPOE_PRINTF(stderr, "%d.%06d [SPOE/%-15s] %s: stream=%p"
 					    " - skip processing of messages: max EPS reached\n",
-					    (int)now.tv_sec, (int)now.tv_usec,
+					    (int)date.tv_sec, (int)date.tv_usec,
 					    agent->id, __FUNCTION__, s);
 				goto skip;
 			}
@@ -2707,8 +2711,8 @@ spoe_process_messages(struct stream *s, struct spoe_context *ctx,
 	}
 
 	if (ctx->state == SPOE_CTX_ST_ENCODING_MSGS) {
-		if (tv_iszero(&ctx->stats.tv_request))
-			ctx->stats.tv_request = now;
+		if (ctx->stats.request_ts == 0)
+			ctx->stats.request_ts = now_ns;
 		if (!spoe_acquire_buffer(&ctx->buffer, &ctx->buffer_wait))
 			goto out;
 		ret = spoe_encode_messages(s, ctx, messages, dir, type);
@@ -2738,7 +2742,7 @@ spoe_process_messages(struct stream *s, struct spoe_context *ctx,
 		ret = 1;
 		ctx->frame_id++;
 		ctx->state = SPOE_CTX_ST_READY;
-		spoe_update_stat_time(&ctx->stats.tv_response, &ctx->stats.t_response);
+		spoe_update_stat_time(&ctx->stats.response_ts, &ctx->stats.t_response);
 		goto end;
 	}
 
@@ -2746,7 +2750,7 @@ spoe_process_messages(struct stream *s, struct spoe_context *ctx,
 	return ret;
 
   skip:
-	tv_zero(&ctx->stats.tv_start);
+	ctx->stats.start_ts = 0;
 	ctx->state = SPOE_CTX_ST_READY;
 	spoe_stop_processing(agent, ctx);
 	return 1;
@@ -2774,7 +2778,7 @@ spoe_process_group(struct stream *s, struct spoe_context *ctx,
 
 	SPOE_PRINTF(stderr, "%d.%06d [SPOE/%-15s] %s: stream=%p"
 		    " - ctx-state=%s - Process messages for group=%s\n",
-		    (int)now.tv_sec, (int)now.tv_usec, agent->id,
+		    (int)date.tv_sec, (int)date.tv_usec, agent->id,
 		    __FUNCTION__, s, spoe_ctx_state_str[ctx->state],
 		    group->id);
 
@@ -2785,7 +2789,7 @@ spoe_process_group(struct stream *s, struct spoe_context *ctx,
 	if (ret && ctx->stats.t_process != -1) {
 		SPOE_PRINTF(stderr, "%d.%06d [SPOE/%-15s] %s: stream=%p"
 			    " - <GROUP:%s> sid=%u st=%u %ld/%ld/%ld/%ld/%ld %u/%u %u/%u %llu/%llu %u/%u\n",
-			    (int)now.tv_sec, (int)now.tv_usec, agent->id,
+			    (int)date.tv_sec, (int)date.tv_usec, agent->id,
 			    __FUNCTION__, s, group->id, s->uniq_id, ctx->status_code,
 			    ctx->stats.t_request, ctx->stats.t_queue, ctx->stats.t_waiting,
 			    ctx->stats.t_response, ctx->stats.t_process,
@@ -2818,7 +2822,7 @@ spoe_process_event(struct stream *s, struct spoe_context *ctx,
 
 	SPOE_PRINTF(stderr, "%d.%06d [SPOE/%-15s] %s: stream=%p"
 		    " - ctx-state=%s - Process messages for event=%s\n",
-		    (int)now.tv_sec, (int)now.tv_usec, agent->id,
+		    (int)date.tv_sec, (int)date.tv_usec, agent->id,
 		    __FUNCTION__, s, spoe_ctx_state_str[ctx->state],
 		    spoe_event_str[ev]);
 
@@ -2831,7 +2835,7 @@ spoe_process_event(struct stream *s, struct spoe_context *ctx,
 	if (ret && ctx->stats.t_process != -1) {
 		SPOE_PRINTF(stderr, "%d.%06d [SPOE/%-15s] %s: stream=%p"
 			    " - <EVENT:%s> sid=%u st=%u %ld/%ld/%ld/%ld/%ld %u/%u %u/%u %llu/%llu %u/%u\n",
-			    (int)now.tv_sec, (int)now.tv_usec, agent->id,
+			    (int)date.tv_sec, (int)date.tv_usec, agent->id,
 			    __FUNCTION__, s, spoe_event_str[ev], s->uniq_id, ctx->status_code,
 			    ctx->stats.t_request, ctx->stats.t_queue, ctx->stats.t_waiting,
 			    ctx->stats.t_response, ctx->stats.t_process,
@@ -2917,11 +2921,11 @@ spoe_create_context(struct stream *s, struct filter *filter)
 	ctx->frame_id    = 1;
 	ctx->process_exp = TICK_ETERNITY;
 
-	tv_zero(&ctx->stats.tv_start);
-	tv_zero(&ctx->stats.tv_request);
-	tv_zero(&ctx->stats.tv_queue);
-	tv_zero(&ctx->stats.tv_wait);
-	tv_zero(&ctx->stats.tv_response);
+	ctx->stats.start_ts   =  0;
+	ctx->stats.request_ts =  0;
+	ctx->stats.queue_ts   =  0;
+	ctx->stats.wait_ts    =  0;
+	ctx->stats.response_ts=  0;
 	ctx->stats.t_request  = -1;
 	ctx->stats.t_queue    = -1;
 	ctx->stats.t_waiting  = -1;
@@ -2956,11 +2960,11 @@ spoe_reset_context(struct spoe_context *ctx)
 	ctx->state  = SPOE_CTX_ST_READY;
 	ctx->flags &= ~(SPOE_CTX_FL_PROCESS|SPOE_CTX_FL_FRAGMENTED);
 
-	tv_zero(&ctx->stats.tv_start);
-	tv_zero(&ctx->stats.tv_request);
-	tv_zero(&ctx->stats.tv_queue);
-	tv_zero(&ctx->stats.tv_wait);
-	tv_zero(&ctx->stats.tv_response);
+	ctx->stats.start_ts   =  0;
+	ctx->stats.request_ts =  0;
+	ctx->stats.queue_ts   =  0;
+	ctx->stats.wait_ts    =  0;
+	ctx->stats.response_ts=  0;
 	ctx->stats.t_request  = -1;
 	ctx->stats.t_queue    = -1;
 	ctx->stats.t_waiting  = -1;
@@ -3015,7 +3019,7 @@ spoe_init(struct proxy *px, struct flt_conf *fconf)
 
 	/* conf->agent_fe was already initialized during the config
 	 * parsing. Finish initialization. */
-        conf->agent_fe.last_change = now.tv_sec;
+        conf->agent_fe.last_change = ns_to_sec(now_ns);
         conf->agent_fe.cap = PR_CAP_FE;
         conf->agent_fe.mode = PR_MODE_TCP;
         conf->agent_fe.maxconn = 0;
@@ -3107,6 +3111,7 @@ spoe_check(struct proxy *px, struct flt_conf *fconf)
 		conf->agent->rt[i].engine_id    = NULL;
 		conf->agent->rt[i].frame_size   = conf->agent->max_frame_size;
 		conf->agent->rt[i].processing   = 0;
+		conf->agent->rt[i].idles        = 0;
 		LIST_INIT(&conf->agent->rt[i].applets);
 		LIST_INIT(&conf->agent->rt[i].sending_queue);
 		LIST_INIT(&conf->agent->rt[i].waiting_queue);
@@ -3160,13 +3165,13 @@ spoe_start(struct stream *s, struct filter *filter)
 	struct spoe_context *ctx;
 
 	SPOE_PRINTF(stderr, "%d.%06d [SPOE/%-15s] %s: stream=%p\n",
-		    (int)now.tv_sec, (int)now.tv_usec, agent->id,
+		    (int)date.tv_sec, (int)date.tv_usec, agent->id,
 		    __FUNCTION__, s);
 
 	if ((ctx = spoe_create_context(s, filter)) == NULL) {
 		SPOE_PRINTF(stderr, "%d.%06d [SPOE/%-15s] %s: stream=%p"
 			    " - failed to create SPOE context\n",
-			    (int)now.tv_sec, (int)now.tv_usec, agent->id,
+			    (int)date.tv_sec, (int)date.tv_usec, agent->id,
 			    __FUNCTION__, s);
 		send_log(&conf->agent_fe, LOG_EMERG,
 			 "SPOE: [%s] failed to create SPOE context\n",
@@ -3201,7 +3206,7 @@ static void
 spoe_stop(struct stream *s, struct filter *filter)
 {
 	SPOE_PRINTF(stderr, "%d.%06d [SPOE/%-15s] %s: stream=%p\n",
-		    (int)now.tv_sec, (int)now.tv_usec,
+		    (int)date.tv_sec, (int)date.tv_usec,
 		    ((struct spoe_config *)FLT_CONF(filter))->agent->id,
 		    __FUNCTION__, s);
 	spoe_destroy_context(filter);
@@ -3229,7 +3234,7 @@ spoe_start_analyze(struct stream *s, struct filter *filter, struct channel *chn)
 
 	SPOE_PRINTF(stderr, "%d.%06d [SPOE/%-15s] %s: stream=%p - ctx-state=%s"
 		    " - ctx-flags=0x%08x\n",
-		    (int)now.tv_sec, (int)now.tv_usec,
+		    (int)date.tv_sec, (int)date.tv_usec,
 		    ((struct spoe_config *)FLT_CONF(filter))->agent->id,
 		    __FUNCTION__, s, spoe_ctx_state_str[ctx->state], ctx->flags);
 
@@ -3281,7 +3286,7 @@ spoe_chn_pre_analyze(struct stream *s, struct filter *filter,
 
 	SPOE_PRINTF(stderr, "%d.%06d [SPOE/%-15s] %s: stream=%p - ctx-state=%s"
 		    " - ctx-flags=0x%08x - ana=0x%08x\n",
-		    (int)now.tv_sec, (int)now.tv_usec,
+		    (int)date.tv_sec, (int)date.tv_usec,
 		    ((struct spoe_config *)FLT_CONF(filter))->agent->id,
 		    __FUNCTION__, s, spoe_ctx_state_str[ctx->state],
 		    ctx->flags, an_bit);
@@ -3326,7 +3331,7 @@ spoe_end_analyze(struct stream *s, struct filter *filter, struct channel *chn)
 
 	SPOE_PRINTF(stderr, "%d.%06d [SPOE/%-15s] %s: stream=%p - ctx-state=%s"
 		    " - ctx-flags=0x%08x\n",
-		    (int)now.tv_sec, (int)now.tv_usec,
+		    (int)date.tv_sec, (int)date.tv_usec,
 		    ((struct spoe_config *)FLT_CONF(filter))->agent->id,
 		    __FUNCTION__, s, spoe_ctx_state_str[ctx->state], ctx->flags);
 
@@ -4553,7 +4558,7 @@ spoe_send_group(struct act_rule *rule, struct proxy *px,
 		default:
 			SPOE_PRINTF(stderr, "%d.%06d [SPOE/%-15s] %s: stream=%p"
 				    " - internal error while execute spoe-send-group\n",
-				    (int)now.tv_sec, (int)now.tv_usec, agent->id,
+				    (int)date.tv_sec, (int)date.tv_usec, agent->id,
 				    __FUNCTION__, s);
 			send_log(px, LOG_ERR, "SPOE: [%s] internal error while execute spoe-send-group\n",
 				 agent->id);
@@ -4567,7 +4572,7 @@ spoe_send_group(struct act_rule *rule, struct proxy *px,
 		if (flags & ACT_OPT_FINAL) {
 			SPOE_PRINTF(stderr, "%d.%06d [SPOE/%-15s] %s: stream=%p"
 				    " - failed to process group '%s': interrupted by caller\n",
-				    (int)now.tv_sec, (int)now.tv_usec,
+				    (int)date.tv_sec, (int)date.tv_usec,
 				    agent->id, __FUNCTION__, s, group->id);
 			ctx->status_code = SPOE_CTX_ERR_INTERRUPT;
 			spoe_stop_processing(agent, ctx);

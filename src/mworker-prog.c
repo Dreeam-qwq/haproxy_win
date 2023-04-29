@@ -79,7 +79,7 @@ int mworker_ext_launch_all()
 				continue;
 			}
 
-			child->timestamp = now.tv_sec;
+			child->timestamp = ns_to_sec(now_ns);
 
 			ret = fork();
 			if (ret < 0) {

@@ -3,7 +3,7 @@
                           Configuration Manual
                          ----------------------
                               version 2.8
-                              2023/04/23
+                              2023/04/28
 
 
 This document covers the configuration language as implemented in the version
@@ -19641,6 +19641,22 @@ be_name : string
   Returns a string containing the current backend's name. It can be used in
   frontends with responses to check which backend processed the request. It can
   also be used in a tcp-check or an http-check ruleset.
+
+bc_rtt(<unit>) : integer
+  Returns the Round Trip Time (RTT) measured by the kernel for the backend
+  connection. <unit> is facultative, by default the unit is milliseconds. <unit>
+  can be set to "ms" for milliseconds or "us" for microseconds. If the server
+  connection is not established, if the connection is not TCP or if the
+  operating system does not support TCP_INFO, for example Linux kernels before
+  2.4, the sample fetch fails.
+
+bc_rttvar(<unit>) : integer
+  Returns the Round Trip Time (RTT) variance measured by the kernel for the
+  backend connection. <unit> is facultative, by default the unit is milliseconds.
+  <unit> can be set to "ms" for milliseconds or "us" for microseconds. If the
+  server connection is not established, if the connection is not TCP or if the
+  operating system does not support TCP_INFO, for example Linux kernels before
+  2.4, the sample fetch fails.
 
 be_server_timeout : integer
   Returns the configuration value in millisecond for the server timeout of the

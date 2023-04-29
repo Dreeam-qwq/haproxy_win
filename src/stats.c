@@ -2345,7 +2345,7 @@ int stats_fill_sv_stats(struct proxy *px, struct server *sv, int flags,
 				metric = mkf_str(FO_STATUS, fld_status);
 				break;
 			case ST_F_LASTCHG:
-				metric = mkf_u32(FN_AGE, now.tv_sec - sv->last_change);
+				metric = mkf_u32(FN_AGE, ns_to_sec(now_ns) - sv->last_change);
 				break;
 			case ST_F_WEIGHT:
 				metric = mkf_u32(FN_AVG, (sv->cur_eweight * px->lbprm.wmult + px->lbprm.wdiv - 1) / px->lbprm.wdiv);
@@ -2800,7 +2800,7 @@ int stats_fill_be_stats(struct proxy *px, int flags, struct field *stats, int le
 				metric = mkf_u64(FN_COUNTER, px->down_trans);
 				break;
 			case ST_F_LASTCHG:
-				metric = mkf_u32(FN_AGE, now.tv_sec - px->last_change);
+				metric = mkf_u32(FN_AGE, ns_to_sec(now_ns) - px->last_change);
 				break;
 			case ST_F_DOWNTIME:
 				if (px->srv)
@@ -3555,7 +3555,7 @@ static void stats_dump_html_info(struct stconn *sc, struct uri_auth *uri)
 {
 	struct appctx *appctx = __sc_appctx(sc);
 	struct show_stat_ctx *ctx = appctx->svcctx;
-	unsigned int up = (now.tv_sec - start_time.tv_sec);
+	unsigned int up = ns_to_sec(now_ns - start_time_ns);
 	char scope_txt[STAT_SCOPE_TXT_MAXLEN + sizeof STAT_SCOPE_PATTERN];
 	const char *scope_ptr = stats_scope_ptr(appctx, sc);
 	unsigned long long bps;
@@ -4604,9 +4604,10 @@ static int stats_dump_typed_info_fields(struct buffer *out,
  */
 int stats_fill_info(struct field *info, int len, uint flags)
 {
-	struct timeval up;
 	struct buffer *out = get_trash_chunk();
 	uint64_t glob_out_bytes, glob_spl_bytes, glob_out_b32;
+	uint up_sec, up_usec;
+	ullong up;
 	int thr;
 
 #ifdef USE_OPENSSL
@@ -4627,7 +4628,9 @@ int stats_fill_info(struct field *info, int len, uint flags)
 	}
 	glob_out_b32 *= 32; // values are 32-byte units
 
-	tv_remain(&start_time, &now, &up);
+	up = now_ns - start_time_ns;
+	up_sec = ns_to_sec(up);
+	up_usec = (up / 1000U) % 1000000U;
 
 	if (len < INF_TOTAL_FIELDS)
 		return 0;
@@ -4646,10 +4649,10 @@ int stats_fill_info(struct field *info, int len, uint flags)
 	info[INF_PID]                            = mkf_u32(FO_STATUS, pid);
 
 	info[INF_UPTIME]                         = mkf_str(FN_DURATION, chunk_newstr(out));
-	chunk_appendf(out, "%ud %uh%02um%02us", (uint)up.tv_sec / 86400, ((uint)up.tv_sec % 86400) / 3600, ((uint)up.tv_sec % 3600) / 60, ((uint)up.tv_sec % 60));
+	chunk_appendf(out, "%ud %uh%02um%02us", up_sec / 86400, (up_sec % 86400) / 3600, (up_sec % 3600) / 60, (up_sec % 60));
 
-	info[INF_UPTIME_SEC]                     = (flags & STAT_USE_FLOAT) ? mkf_flt(FN_DURATION, up.tv_sec + up.tv_usec / 1000000.0) : mkf_u32(FN_DURATION, up.tv_sec);
-	info[INF_START_TIME_SEC]                 = (flags & STAT_USE_FLOAT) ? mkf_flt(FN_DURATION, start_time.tv_sec + start_time.tv_usec / 1000000.0) : mkf_u32(FN_DURATION, start_time.tv_sec);
+	info[INF_UPTIME_SEC]                     = (flags & STAT_USE_FLOAT) ? mkf_flt(FN_DURATION, up_sec + up_usec / 1000000.0) : mkf_u32(FN_DURATION, up_sec);
+	info[INF_START_TIME_SEC]                 = (flags & STAT_USE_FLOAT) ? mkf_flt(FN_DURATION, start_date.tv_sec + start_date.tv_usec / 1000000.0) : mkf_u32(FN_DURATION, start_date.tv_sec);
 	info[INF_MEMMAX_MB]                      = mkf_u32(FO_CONFIG|FN_LIMIT, global.rlimit_memmax);
 	info[INF_MEMMAX_BYTES]                   = mkf_u32(FO_CONFIG|FN_LIMIT, global.rlimit_memmax * 1048576L);
 	info[INF_POOL_ALLOC_MB]                  = mkf_u32(0, (unsigned)(pool_total_allocated() / 1048576L));
