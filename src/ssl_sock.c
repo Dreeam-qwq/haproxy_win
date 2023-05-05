@@ -4569,6 +4569,13 @@ static int ssl_sock_prepare_ctx(struct bind_conf *bind_conf, struct ssl_bind_con
 	const char *conf_ciphersuites;
 #endif
 	const char *conf_curves = NULL;
+	X509_STORE *store = SSL_CTX_get_cert_store(ctx);
+#if defined(SSL_CTX_set1_sigalgs_list)
+	const char *conf_sigalgs = NULL;
+#endif
+#if defined(SSL_CTX_set1_client_sigalgs_list)
+	const char *conf_client_sigalgs = NULL;
+#endif
 
 	if (ssl_conf) {
 		struct tls_version_filter *conf_ssl_methods = &ssl_conf->ssl_methods;
@@ -4632,6 +4639,10 @@ static int ssl_sock_prepare_ctx(struct bind_conf *bind_conf, struct ssl_bind_con
 				/* set CA names for client cert request, function returns void */
 				SSL_CTX_set_client_CA_list(ctx, SSL_dup_CA_list(ssl_get_client_ca_file(ca_file)));
 			}
+#ifdef USE_OPENSSL_WOLFSSL
+			/* WolfSSL activates CRL checks by default so we need to disable it */
+			X509_STORE_set_flags(store, 0) ;
+#endif
 		}
 		else {
 			memprintf(err, "%sProxy '%s': verify is enabled but no CA file specified for bind '%s' at [%s:%d].\n",
@@ -4640,7 +4651,6 @@ static int ssl_sock_prepare_ctx(struct bind_conf *bind_conf, struct ssl_bind_con
 		}
 #ifdef X509_V_FLAG_CRL_CHECK
 		if (crl_file) {
-			X509_STORE *store = SSL_CTX_get_cert_store(ctx);
 
 			if (!ssl_set_cert_crl_file(store, crl_file)) {
 				memprintf(err, "%sProxy '%s': unable to configure CRL file '%s' for bind '%s' at [%s:%d].\n",
@@ -4767,6 +4777,28 @@ static int ssl_sock_prepare_ctx(struct bind_conf *bind_conf, struct ssl_bind_con
 #endif /* defined(SSL_CTX_set_tmp_ecdh) && !defined(OPENSSL_NO_ECDH) */
 #endif /* HA_OPENSSL_VERSION_NUMBER >= 0x10101000L */
 	}
+
+#if defined(SSL_CTX_set1_sigalgs_list)
+	conf_sigalgs = (ssl_conf && ssl_conf->sigalgs) ? ssl_conf->sigalgs : bind_conf->ssl_conf.sigalgs;
+	if (conf_sigalgs) {
+		if (!SSL_CTX_set1_sigalgs_list(ctx, conf_sigalgs)) {
+			memprintf(err, "%sProxy '%s': unable to set SSL Signature Algorithm list to '%s' for bind '%s' at [%s:%d].\n",
+			          err && *err ? *err : "", curproxy->id, conf_sigalgs, bind_conf->arg, bind_conf->file, bind_conf->line);
+			cfgerr |= ERR_ALERT | ERR_FATAL;
+		}
+	}
+#endif
+
+#if defined(SSL_CTX_set1_client_sigalgs_list)
+	conf_client_sigalgs = (ssl_conf && ssl_conf->client_sigalgs) ? ssl_conf->client_sigalgs : bind_conf->ssl_conf.client_sigalgs;
+	if (conf_client_sigalgs) {
+		if (!SSL_CTX_set1_client_sigalgs_list(ctx, conf_client_sigalgs)) {
+			memprintf(err, "%sProxy '%s': unable to set SSL Signature Algorithm list to '%s' for bind '%s' at [%s:%d].\n",
+			          err && *err ? *err : "", curproxy->id, conf_client_sigalgs, bind_conf->arg, bind_conf->file, bind_conf->line);
+			cfgerr |= ERR_ALERT | ERR_FATAL;
+		}
+	}
+#endif
 
 	return cfgerr;
 }

@@ -74,6 +74,12 @@ void ssl_sock_free_ssl_conf(struct ssl_bind_conf *conf)
 #endif
 		ha_free(&conf->curves);
 		ha_free(&conf->ecdhe);
+#if defined(SSL_CTX_set1_sigalgs_list)
+		ha_free(&conf->sigalgs);
+#endif
+#if defined(SSL_CTX_set1_client_sigalgs_list)
+		ha_free(&conf->client_sigalgs);
+#endif
 	}
 }
 
@@ -151,6 +157,20 @@ struct ssl_bind_conf *crtlist_dup_ssl_conf(struct ssl_bind_conf *src)
 	dst->ssl_methods.min = src->ssl_methods.min;
 	dst->ssl_methods.max = src->ssl_methods.max;
 
+#if defined(SSL_CTX_set1_sigalgs_list)
+	if (src->sigalgs) {
+		dst->sigalgs = strdup(src->sigalgs);
+		if (!dst->sigalgs)
+			goto error;
+	}
+#endif
+#if defined(SSL_CTX_set1_client_sigalgs_list)
+	if (src->client_sigalgs) {
+		dst->client_sigalgs = strdup(src->client_sigalgs);
+		if (!dst->client_sigalgs)
+			goto error;
+	}
+#endif
 	return dst;
 
 error:
