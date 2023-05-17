@@ -32,6 +32,7 @@
 #include <haproxy/http_ana.h>
 #include <haproxy/http_htx.h>
 #include <haproxy/http_ext.h>
+#include <haproxy/http_rules.h>
 #include <haproxy/listener.h>
 #include <haproxy/log.h>
 #include <haproxy/obj_type-t.h>
@@ -199,8 +200,7 @@ void free_proxy(struct proxy *p)
 
 	list_for_each_entry_safe(cond, condb, &p->mon_fail_cond, list) {
 		LIST_DELETE(&cond->list);
-		prune_acl_cond(cond);
-		free(cond);
+		free_acl_cond(cond);
 	}
 
 	EXTRA_COUNTERS_FREE(p->extra_counters_fe);
@@ -214,7 +214,7 @@ void free_proxy(struct proxy *p)
 
 	list_for_each_entry_safe(srule, sruleb, &p->server_rules, list) {
 		LIST_DELETE(&srule->list);
-		prune_acl_cond(srule->cond);
+		free_acl_cond(srule->cond);
 		list_for_each_entry_safe(lf, lfb, &srule->expr, list) {
 			LIST_DELETE(&lf->list);
 			release_sample_expr(lf->expr);
@@ -222,34 +222,19 @@ void free_proxy(struct proxy *p)
 			free(lf);
 		}
 		free(srule->file);
-		free(srule->cond);
 		free(srule);
 	}
 
 	list_for_each_entry_safe(rule, ruleb, &p->switching_rules, list) {
 		LIST_DELETE(&rule->list);
-		if (rule->cond) {
-			prune_acl_cond(rule->cond);
-			free(rule->cond);
-		}
+		free_acl_cond(rule->cond);
 		free(rule->file);
 		free(rule);
 	}
 
 	list_for_each_entry_safe(rdr, rdrb, &p->redirect_rules, list) {
 		LIST_DELETE(&rdr->list);
-		if (rdr->cond) {
-			prune_acl_cond(rdr->cond);
-			free(rdr->cond);
-		}
-		free(rdr->rdr_str);
-		list_for_each_entry_safe(lf, lfb, &rdr->rdr_fmt, list) {
-			LIST_DELETE(&lf->list);
-			release_sample_expr(lf->expr);
-			free(lf->arg);
-			free(lf);
-		}
-		free(rdr);
+		http_free_redirect_rule(rdr);
 	}
 
 	list_for_each_entry_safe(log, logb, &p->logsrvs, list) {
@@ -1905,6 +1890,7 @@ static int proxy_defproxy_cpy(struct proxy *curproxy, const struct proxy *defpro
 		curproxy->comp->algo_req = defproxy->comp->algo_req;
 		curproxy->comp->types_res = defproxy->comp->types_res;
 		curproxy->comp->types_req = defproxy->comp->types_req;
+		curproxy->comp->flags = defproxy->comp->flags;
 	}
 
 	if (defproxy->check_path)
@@ -2003,11 +1989,11 @@ void proxy_cond_disable(struct proxy *p)
 	 * peers, etc) we must not report them at all as they're not really on
 	 * the data plane but on the control plane.
 	 */
-	if (p->mode == PR_MODE_TCP || p->mode == PR_MODE_HTTP || p->mode == PR_MODE_SYSLOG)
+	if ((p->mode == PR_MODE_TCP || p->mode == PR_MODE_HTTP || p->mode == PR_MODE_SYSLOG) && !(p->cap & PR_CAP_INT))
 		ha_warning("Proxy %s stopped (cumulated conns: FE: %lld, BE: %lld).\n",
 			   p->id, p->fe_counters.cum_conn, p->be_counters.cum_conn);
 
-	if (p->mode == PR_MODE_TCP || p->mode == PR_MODE_HTTP)
+	if ((p->mode == PR_MODE_TCP || p->mode == PR_MODE_HTTP) && !(p->cap & PR_CAP_INT))
 		send_log(p, LOG_WARNING, "Proxy %s stopped (cumulated conns: FE: %lld, BE: %lld).\n",
 			 p->id, p->fe_counters.cum_conn, p->be_counters.cum_conn);
 
@@ -3386,8 +3372,10 @@ static int cli_io_handler_show_errors(struct appctx *appctx)
 
 			newline = ctx->bol;
 			newptr = dump_text_line(&trash, es->buf, global.tune.bufsize, es->buf_len, &newline, ctx->ptr);
-			if (newptr == ctx->ptr)
+			if (newptr == ctx->ptr) {
+				sc_need_room(sc, 0);
 				goto cant_send_unlock;
+			}
 
 			if (applet_putchk(appctx, &trash) == -1)
 				goto cant_send_unlock;
@@ -3410,7 +3398,6 @@ static int cli_io_handler_show_errors(struct appctx *appctx)
  cant_send_unlock:
 	HA_RWLOCK_RDUNLOCK(PROXY_LOCK, &ctx->px->lock);
  cant_send:
-	sc_need_room(sc);
 	return 0;
 }
 

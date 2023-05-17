@@ -47,6 +47,8 @@ struct bind_kw_list bind_keywords = {
 /* list of the temporarily limited listeners because of lack of resource */
 static struct mt_list global_listener_queue = MT_LIST_HEAD_INIT(global_listener_queue);
 static struct task *global_listener_queue_task;
+/* number of times an accepted connection resulted in maxconn being reached */
+ullong maxconn_reached = 0;
 __decl_thread(static HA_RWLOCK_T global_listener_rwlock);
 
 /* listener status for stats */
@@ -160,7 +162,7 @@ struct task *accept_queue_process(struct task *t, void *context, unsigned int st
 		if (!(li->bind_conf->options & BC_O_UNLIMITED)) {
 			HA_ATOMIC_UPDATE_MAX(&global.sps_max,
 			                     update_freq_ctr(&global.sess_per_sec, 1));
-			if (li->bind_conf && li->bind_conf->options & BC_O_USE_SSL) {
+			if (li->bind_conf->options & BC_O_USE_SSL) {
 				HA_ATOMIC_UPDATE_MAX(&global.ssl_max,
 				                     update_freq_ctr(&global.ssl_per_sec, 1));
 			}
@@ -1163,6 +1165,12 @@ void listener_accept(struct listener *l)
 		}
 
 		_HA_ATOMIC_INC(&activity[tid].accepted);
+
+		/* count the number of times an accepted connection resulted in
+		 * maxconn being reached.
+		 */
+		if (unlikely(_HA_ATOMIC_LOAD(&actconn) + 1 >= global.maxconn))
+			_HA_ATOMIC_INC(&maxconn_reached);
 
 		/* past this point, l->bind_conf->accept() will automatically decrement
 		 * l->nbconn, feconn and actconn once done. Setting next_*conn=0

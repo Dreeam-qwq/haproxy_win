@@ -459,7 +459,7 @@ void resolv_trigger_resolution(struct resolv_requester *req)
 	/* The resolution must not be triggered yet. Use the cached response, if
 	 * valid */
 	exp = tick_add(res->last_resolution, resolvers->hold.valid);
-	if (resolvers->t && (res->status != RSLV_STATUS_VALID ||
+	if (resolvers->t && (!tick_isset(resolvers->t->expire) || res->status != RSLV_STATUS_VALID ||
 	    !tick_isset(res->last_resolution) || tick_is_expired(exp, now_ms))) {
 		/* If the resolution is not running and the requester is a
 		 * server, reset the resolution timer to force a quick
@@ -2457,6 +2457,9 @@ struct task *process_resolvers(struct task *t, void *context, unsigned int state
 	if (unlikely(stopping)) {
 		struct dns_nameserver *ns;
 
+		if (LIST_ISEMPTY(&resolvers->resolutions.curr))
+			t->expire = TICK_ETERNITY;
+
 		list_for_each_entry(ns, &resolvers->nameservers, list) {
 			if (ns->stream)
 				task_wakeup(ns->stream->task_idle, TASK_WOKEN_MSG);
@@ -2671,7 +2674,6 @@ static int stats_dump_resolv_to_buffer(struct stconn *sc,
                                     struct list *stat_modules)
 {
 	struct appctx *appctx = __sc_appctx(sc);
-	struct channel *rep = sc_ic(sc);
 	struct stats_module *mod;
 	size_t idx = 0;
 
@@ -2687,13 +2689,12 @@ static int stats_dump_resolv_to_buffer(struct stconn *sc,
 	if (!stats_dump_one_line(stats, idx, appctx))
 		return 0;
 
-	if (!stats_putchk(rep, NULL))
+	if (!stats_putchk(appctx, NULL))
 		goto full;
 
 	return 1;
 
   full:
-	sc_need_room(sc);
 	return 0;
 }
 
@@ -2724,8 +2725,10 @@ int stats_dump_resolvers(struct stconn *sc,
 		list_for_each_entry_from(ns, &resolver->nameservers, list) {
 			ctx->obj2 = ns;
 
-			if (buffer_almost_full(&rep->buf))
+			if (buffer_almost_full(&rep->buf)) {
+				sc_need_room(sc, b_size(&rep->buf) / 2);
 				goto full;
+			}
 
 			if (!stats_dump_resolv_to_buffer(sc, ns,
 			                                 stats, stats_count,
@@ -2740,7 +2743,6 @@ int stats_dump_resolvers(struct stconn *sc,
 	return 1;
 
   full:
-	sc_need_room(sc);
 	return 0;
 }
 

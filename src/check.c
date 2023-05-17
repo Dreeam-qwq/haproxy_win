@@ -464,7 +464,7 @@ void set_server_check_status(struct check *check, short status, const char *desc
 {
 	struct server *s = check->server;
 	short prev_status = check->status;
-	int report = 0;
+	int report = (status != prev_status) ? 1 : 0;
 
 	TRACE_POINT(CHK_EV_HCHK_RUN, check);
 
@@ -505,8 +505,6 @@ void set_server_check_status(struct check *check, short status, const char *desc
 	 */
 	if (!s)
 	    return;
-	report = 0;
-
 
 	switch (check->result) {
 	case CHK_RES_FAILED:
@@ -543,8 +541,10 @@ void set_server_check_status(struct check *check, short status, const char *desc
 		break;
 	}
 
-	if (s->proxy->options2 & PR_O2_LOGHCHKS &&
-	    (status != prev_status || report)) {
+	if (report)
+		srv_event_hdl_publish_check(s, check);
+
+	if (s->proxy->options2 & PR_O2_LOGHCHKS && report) {
 		chunk_printf(&trash,
 		             "%s check for %sserver %s/%s %s%s",
 			     (check->state & CHK_ST_AGENT) ? "Agent" : "Health",
@@ -1242,7 +1242,6 @@ struct task *process_chk_conn(struct task *t, void *context, unsigned int state)
 			if (check->state & CHK_ST_CLOSE_CONN) {
 				TRACE_DEVEL("closing current connection", CHK_EV_TASK_WAKE|CHK_EV_HCHK_RUN, check);
 				check->state &= ~CHK_ST_CLOSE_CONN;
-				conn = NULL;
 				if (!sc_reset_endp(check->sc)) {
 					/* error will be handled by tcpcheck_main().
 					 * On success, remove all flags except SE_FL_DETACHED
@@ -1277,8 +1276,7 @@ struct task *process_chk_conn(struct task *t, void *context, unsigned int state)
 
 	if (sc) {
 		sc_destroy(sc);
-		sc = check->sc = NULL;
-		conn = NULL;
+		check->sc = NULL;
 	}
 
 	if (check->sess != NULL) {
@@ -1329,8 +1327,13 @@ struct task *process_chk_conn(struct task *t, void *context, unsigned int state)
 	}
 
  reschedule:
-	while (tick_is_expired(t->expire, now_ms))
-		t->expire = tick_add(t->expire, MS_TO_TICKS(check->inter));
+	if (proxy->flags & (PR_FL_DISABLED|PR_FL_STOPPED))
+		t->expire = TICK_ETERNITY;
+	else {
+		while (tick_is_expired(t->expire, now_ms))
+			t->expire = tick_add(t->expire, MS_TO_TICKS(check->inter));
+	}
+
  out_unlock:
 	if (check->server)
 		HA_SPIN_UNLOCK(SERVER_LOCK, &check->server->lock);
@@ -1493,6 +1496,14 @@ int start_check_task(struct check *check, int mininter,
 
 	if (mininter < srv_getinter(check))
 		mininter = srv_getinter(check);
+
+	if (global.spread_checks > 0) {
+		int rnd;
+
+		rnd  = srv_getinter(check) * global.spread_checks / 100;
+		rnd -= (int) (2 * rnd * (ha_random32() / 4294967295.0));
+		mininter += rnd;
+	}
 
 	if (global.max_spread_checks && mininter > global.max_spread_checks)
 		mininter = global.max_spread_checks;

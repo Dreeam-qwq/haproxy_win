@@ -39,9 +39,11 @@
 #include <haproxy/stream-t.h>
 #include <haproxy/time.h>
 #include <haproxy/tools.h>
+#include <haproxy/mailers.h>
 
 /* Contains the class reference of the concat object. */
 static int class_concat_ref;
+static int class_queue_ref;
 static int class_proxy_ref;
 static int class_server_ref;
 static int class_listener_ref;
@@ -498,6 +500,260 @@ static void hlua_concat_init(lua_State *L)
 	class_concat_ref = luaL_ref(L, LUA_REGISTRYINDEX);
 }
 
+/* C backing storage for lua Queue class */
+struct hlua_queue {
+	uint32_t size;
+	struct mt_list list;
+	struct mt_list wait_tasks;
+};
+
+/* used to store lua objects in queue->list */
+struct hlua_queue_item {
+	int ref; /* lua object reference id */
+	struct mt_list list;
+};
+
+/* used to store wait entries in queue->wait_tasks */
+struct hlua_queue_wait
+{
+	struct task *task;
+	struct mt_list entry;
+};
+
+/* This is the memory pool containing struct hlua_queue_item (queue items)
+ */
+DECLARE_STATIC_POOL(pool_head_hlua_queue, "hlua_queue", sizeof(struct hlua_queue_item));
+
+/* This is the memory pool containing struct hlua_queue_wait
+ * (queue waiting tasks)
+ */
+DECLARE_STATIC_POOL(pool_head_hlua_queuew, "hlua_queuew", sizeof(struct hlua_queue_wait));
+
+static struct hlua_queue *hlua_check_queue(lua_State *L, int ud)
+{
+	return hlua_checkudata(L, ud, class_queue_ref);
+}
+
+/* queue:size(): returns an integer containing the current number of queued
+ * items.
+ */
+static int hlua_queue_size(lua_State *L)
+{
+	struct hlua_queue *queue = hlua_check_queue(L, 1);
+
+	BUG_ON(!queue);
+	lua_pushinteger(L, queue->size);
+
+	return 1;
+}
+
+/* queue:push(): push an item (any type, except nil) at the end of the queue
+ *
+ * Returns boolean:true for success and boolean:false on error
+ */
+static int hlua_queue_push(lua_State *L)
+{
+	struct hlua_queue *queue = hlua_check_queue(L, 1);
+	struct hlua_queue_item *item;
+	struct mt_list *elt1, elt2;
+	struct hlua_queue_wait *waiter;
+
+	if (lua_gettop(L) != 2 || lua_isnoneornil(L, 2)) {
+		luaL_error(L, "unexpected argument");
+		/* not reached */
+		return 0;
+	}
+	BUG_ON(!queue);
+
+	item = pool_alloc(pool_head_hlua_queue);
+	if (!item) {
+		/* memory error */
+		lua_pushboolean(L, 0);
+		return 1;
+	}
+
+	/* get a reference from lua object at the top of the stack */
+	item->ref = hlua_ref(L);
+
+	/* push new entry to the queue */
+	MT_LIST_INIT(&item->list);
+	HA_ATOMIC_INC(&queue->size);
+	MT_LIST_APPEND(&queue->list, &item->list);
+
+	/* notify tasks waiting on queue:pop_wait() (if any) */
+	mt_list_for_each_entry_safe(waiter, &queue->wait_tasks, entry, elt1, elt2) {
+		task_wakeup(waiter->task, TASK_WOKEN_MSG);
+	}
+
+	lua_pushboolean(L, 1);
+	return 1;
+}
+
+/* internal queue pop helper, returns 1 if it successfuly popped an item
+ * from the queue and pushed it on lua stack.
+ *
+ * Else it returns 0 (nothing is pushed on the stack)
+ */
+static int _hlua_queue_pop(lua_State *L, struct hlua_queue *queue)
+{
+	struct hlua_queue_item *item;
+
+	item = MT_LIST_POP(&queue->list, typeof(item), list);
+	if (!item)
+		return 0; /* nothing in queue */
+
+	HA_ATOMIC_DEC(&queue->size);
+	/* push lua obj on the stack */
+	hlua_pushref(L, item->ref);
+
+	/* obj ref should be released right away since it was pushed
+	 * on the stack and will not be used anymore
+	 */
+	hlua_unref(L, item->ref);
+
+	/* free the queue item */
+	pool_free(pool_head_hlua_queue, item);
+
+	return 1;
+}
+
+/* queue:pop(): returns the first item at the top of que queue or nil if
+ * the queue is empty.
+ */
+static int hlua_queue_pop(lua_State *L)
+{
+	struct hlua_queue *queue = hlua_check_queue(L, 1);
+
+	BUG_ON(!queue);
+	if (!_hlua_queue_pop(L, queue)) {
+		/* nothing in queue, push nil */
+		lua_pushnil(L);
+	}
+	return 1; /* either item or nil is at the top of the stack */
+}
+
+/* queue:pop_wait(): same as queue:pop() but doesn't return on empty queue.
+ *
+ * Aborts if used incorrectly and returns nil in case of memory error.
+ */
+static int _hlua_queue_pop_wait(lua_State *L, int status, lua_KContext ctx)
+{
+	struct hlua_queue *queue = hlua_check_queue(L, 1);
+
+	/* new pop attempt */
+	if (!_hlua_queue_pop(L, queue))
+		hlua_yieldk(L, 0, 0, _hlua_queue_pop_wait, TICK_ETERNITY, 0); // wait retry
+	return 1; // success
+}
+static int hlua_queue_pop_wait(lua_State *L)
+{
+	struct hlua_queue *queue = hlua_check_queue(L, 1);
+	struct hlua_queue_wait *wait;
+	struct hlua *hlua;
+
+	BUG_ON(!queue);
+
+	/* Get hlua struct, or NULL if we execute from main lua state */
+	hlua = hlua_gethlua(L);
+
+	if (!hlua || HLUA_CANT_YIELD(hlua)) {
+		luaL_error(L, "pop_wait() may only be used within task context "
+			      "(requires yielding)");
+		return 0; /* not reached */
+	}
+
+	wait = pool_alloc(pool_head_hlua_queuew);
+	if (!wait) {
+		lua_pushnil(L);
+		return 1; /* memory error, return nil */
+	}
+
+	wait->task = hlua->task;
+	MT_LIST_INIT(&wait->entry);
+
+	/* add task to queue's wait list */
+	MT_LIST_TRY_APPEND(&queue->wait_tasks, &wait->entry);
+
+	/* push queue on the top of the stack */
+	lua_pushlightuserdata(L, queue);
+
+	/* try to pop without waiting (there could be already pending items) */
+	if (!_hlua_queue_pop(L, queue)) {
+		/* no item immediately available, go to waiting loop */
+		hlua_yieldk(L, 0, 0, _hlua_queue_pop_wait, TICK_ETERNITY, 0);
+	}
+
+	/* remove task from waiting list */
+	MT_LIST_DELETE(&wait->entry);
+	pool_free(pool_head_hlua_queuew, wait);
+
+	return 1;
+}
+
+static int hlua_queue_new(lua_State *L)
+{
+	struct hlua_queue *q;
+
+	lua_newtable(L);
+
+	/* set class metatable */
+	lua_rawgeti(L, LUA_REGISTRYINDEX, class_queue_ref);
+	lua_setmetatable(L, -2);
+
+	/* index:0 is queue userdata (c data) */
+	q = lua_newuserdata(L, sizeof(*q));
+	MT_LIST_INIT(&q->list);
+	MT_LIST_INIT(&q->wait_tasks);
+	q->size = 0;
+	lua_rawseti(L, -2, 0);
+
+	/* class methods */
+	hlua_class_function(L, "size", hlua_queue_size);
+	hlua_class_function(L, "pop", hlua_queue_pop);
+	hlua_class_function(L, "pop_wait", hlua_queue_pop_wait);
+	hlua_class_function(L, "push", hlua_queue_push);
+
+	return 1;
+}
+
+static int hlua_queue_gc(struct lua_State *L)
+{
+	struct hlua_queue *queue = hlua_check_queue(L, 1);
+	struct hlua_queue_wait *wait;
+	struct hlua_queue_item *item;
+
+	/* Purge waiting tasks (if any)
+	 *
+	 * It is normally not expected to have waiting tasks, except if such
+	 * task has been aborted while in the middle of a queue:pop_wait()
+	 * function call.
+	 */
+	while ((wait = MT_LIST_POP(&queue->wait_tasks, typeof(wait), entry))) {
+		/* free the wait entry */
+		pool_free(pool_head_hlua_queuew, wait);
+	}
+
+	/* purge remaining (unconsumed) items in the queue */
+	while ((item = MT_LIST_POP(&queue->list, typeof(item), list))) {
+		/* free the queue item */
+		pool_free(pool_head_hlua_queue, item);
+	}
+
+	/* queue (userdata) will automatically be freed by lua gc */
+
+	return 0;
+}
+
+static void hlua_queue_init(lua_State *L)
+{
+	/* Creates the queue object. */
+	lua_newtable(L);
+
+	hlua_class_function(L, "__gc", hlua_queue_gc);
+
+	class_queue_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+}
+
 int hlua_fcn_new_stktable(lua_State *L, struct stktable *tbl)
 {
 	lua_newtable(L);
@@ -941,6 +1197,25 @@ int hlua_server_get_stats(lua_State *L)
 
 }
 
+int hlua_server_get_proxy(lua_State *L)
+{
+	struct server *srv;
+
+	srv = hlua_check_server(L, 1);
+	if (srv == NULL) {
+		lua_pushnil(L);
+		return 1;
+	}
+
+	if (!srv->proxy) {
+		lua_pushnil(L);
+		return 1;
+	}
+
+	hlua_fcn_new_proxy(L, srv->proxy);
+	return 1;
+}
+
 int hlua_server_get_addr(lua_State *L)
 {
 	struct server *srv;
@@ -1068,7 +1343,63 @@ int hlua_server_is_draining(lua_State *L)
 		return 1;
 	}
 
-	lua_pushinteger(L, server_is_draining(srv));
+	lua_pushboolean(L, server_is_draining(srv));
+	return 1;
+}
+
+int hlua_server_is_backup(lua_State *L)
+{
+	struct server *srv;
+
+	srv = hlua_check_server(L, 1);
+	if (srv == NULL) {
+		lua_pushnil(L);
+		return 1;
+	}
+
+	lua_pushboolean(L, (srv->flags & SRV_F_BACKUP));
+	return 1;
+}
+
+int hlua_server_is_dynamic(lua_State *L)
+{
+	struct server *srv;
+
+	srv = hlua_check_server(L, 1);
+	if (srv == NULL) {
+		lua_pushnil(L);
+		return 1;
+	}
+
+	lua_pushboolean(L, (srv->flags & SRV_F_DYNAMIC));
+	return 1;
+}
+
+int hlua_server_get_cur_sess(lua_State *L)
+{
+	struct server *srv;
+
+	srv = hlua_check_server(L, 1);
+	if (srv == NULL) {
+		lua_pushnil(L);
+		return 1;
+	}
+
+	lua_pushinteger(L, srv->cur_sess);
+	return 1;
+}
+
+int hlua_server_get_pend_conn(lua_State *L)
+{
+	struct server *srv;
+
+	srv = hlua_check_server(L, 1);
+	if (srv == NULL) {
+		lua_pushnil(L);
+		return 1;
+	}
+
+	lua_pushinteger(L, srv->queue.length);
 	return 1;
 }
 
@@ -1382,6 +1713,50 @@ int hlua_server_agent_force_down(lua_State *L)
 	return 0;
 }
 
+/* returns the tracked server, if any */
+int hlua_server_tracking(lua_State *L)
+{
+	struct server *sv;
+	struct server *tracked;
+
+	sv = hlua_check_server(L, 1);
+	if (sv == NULL) {
+		return 0;
+	}
+
+	tracked = sv->track;
+	if (tracked == NULL)
+		lua_pushnil(L);
+	else
+		hlua_fcn_new_server(L, tracked);
+
+	return 1;
+}
+
+/* returns an array of servers tracking the current server */
+int hlua_server_get_trackers(lua_State *L)
+{
+	struct server *sv;
+	struct server *cur_tracker;
+	int index;
+
+	sv = hlua_check_server(L, 1);
+	if (sv == NULL) {
+		return 0;
+	}
+
+	lua_newtable(L);
+	cur_tracker = sv->trackers;
+	for (index = 1; cur_tracker; cur_tracker = cur_tracker->tracknext, index++) {
+		if (!lua_checkstack(L, 5))
+			luaL_error(L, "Lua out of memory error.");
+		hlua_fcn_new_server(L, cur_tracker);
+		/* array index starts at 1 in Lua */
+		lua_rawseti(L, -2, index);
+	}
+	return 1;
+}
+
 /* hlua_event_sub wrapper for per-server subscription:
  *
  * hlua_event_sub() is called with sv->e_subs subscription list and
@@ -1422,6 +1797,10 @@ int hlua_fcn_new_server(lua_State *L, struct server *srv)
 	hlua_class_function(L, "get_puid", hlua_server_get_puid);
 	hlua_class_function(L, "get_rid", hlua_server_get_rid);
 	hlua_class_function(L, "is_draining", hlua_server_is_draining);
+	hlua_class_function(L, "is_backup", hlua_server_is_backup);
+	hlua_class_function(L, "is_dynamic", hlua_server_is_dynamic);
+	hlua_class_function(L, "get_cur_sess", hlua_server_get_cur_sess);
+	hlua_class_function(L, "get_pend_conn", hlua_server_get_pend_conn);
 	hlua_class_function(L, "set_maxconn", hlua_server_set_maxconn);
 	hlua_class_function(L, "get_maxconn", hlua_server_get_maxconn);
 	hlua_class_function(L, "set_weight", hlua_server_set_weight);
@@ -1429,6 +1808,7 @@ int hlua_fcn_new_server(lua_State *L, struct server *srv)
 	hlua_class_function(L, "set_addr", hlua_server_set_addr);
 	hlua_class_function(L, "get_addr", hlua_server_get_addr);
 	hlua_class_function(L, "get_stats", hlua_server_get_stats);
+	hlua_class_function(L, "get_proxy", hlua_server_get_proxy);
 	hlua_class_function(L, "shut_sess", hlua_server_shut_sess);
 	hlua_class_function(L, "set_drain", hlua_server_set_drain);
 	hlua_class_function(L, "set_maint", hlua_server_set_maint);
@@ -1442,6 +1822,8 @@ int hlua_fcn_new_server(lua_State *L, struct server *srv)
 	hlua_class_function(L, "agent_disable", hlua_server_agent_disable);
 	hlua_class_function(L, "agent_force_up", hlua_server_agent_force_up);
 	hlua_class_function(L, "agent_force_down", hlua_server_agent_force_down);
+	hlua_class_function(L, "tracking", hlua_server_tracking);
+	hlua_class_function(L, "get_trackers", hlua_server_get_trackers);
 	hlua_class_function(L, "event_sub", hlua_server_event_sub);
 
 	return 1;
@@ -1682,6 +2064,94 @@ int hlua_proxy_shut_bcksess(lua_State *L)
 	return 0;
 }
 
+int hlua_proxy_get_srv_act(lua_State *L)
+{
+	struct proxy *px;
+
+	px = hlua_check_proxy(L, 1);
+	lua_pushinteger(L, px->srv_act);
+	return 1;
+}
+
+int hlua_proxy_get_srv_bck(lua_State *L)
+{
+	struct proxy *px;
+
+	px = hlua_check_proxy(L, 1);
+	lua_pushinteger(L, px->srv_bck);
+	return 1;
+}
+
+/* Get mailers config info, used to implement email alert sending
+ * according to mailers config from lua.
+ */
+int hlua_proxy_get_mailers(lua_State *L)
+{
+	struct proxy *px;
+	int it;
+	struct mailer *mailer;
+
+	px = hlua_check_proxy(L, 1);
+
+	if (!px->email_alert.mailers.m)
+		return 0; /* email-alert mailers not found on proxy */
+
+	lua_newtable(L);
+
+	/* option log-health-checks */
+	lua_pushstring(L, "track_server_health");
+	lua_pushboolean(L, (px->options2 & PR_O2_LOGHCHKS));
+	lua_settable(L, -3);
+
+	/* email-alert level */
+	lua_pushstring(L, "log_level");
+	lua_pushinteger(L, px->email_alert.level);
+	lua_settable(L, -3);
+
+	/* email-alert mailers */
+	lua_pushstring(L, "mailservers");
+	lua_newtable(L);
+	for (it = 0, mailer = px->email_alert.mailers.m->mailer_list;
+	     it < px->email_alert.mailers.m->count; it++, mailer = mailer->next) {
+		char *srv_address;
+
+		lua_pushstring(L, mailer->id);
+
+		/* For now, we depend on mailer->addr to restore mailer's address which
+		 * was converted using str2sa_range() on startup.
+		 *
+		 * FIXME?:
+		 * It could be a good idea to pass the raw address (unparsed) to allow fqdn
+		 * to be resolved at runtime, unless we consider this as a pure legacy mode
+		 * and mailers config support is going to be removed in the future?
+		 */
+		srv_address = sa2str(&mailer->addr, get_host_port(&mailer->addr), 0);
+		if (srv_address) {
+			lua_pushstring(L, srv_address);
+			ha_free(&srv_address);
+			lua_settable(L, -3);
+		}
+	}
+	lua_settable(L, -3);
+
+	/* email-alert myhostname */
+	lua_pushstring(L, "smtp_hostname");
+	lua_pushstring(L, px->email_alert.myhostname);
+	lua_settable(L, -3);
+
+	/* email-alert from */
+	lua_pushstring(L, "smtp_from");
+	lua_pushstring(L, px->email_alert.from);
+	lua_settable(L, -3);
+
+	/* email-alert to */
+	lua_pushstring(L, "smtp_to");
+	lua_pushstring(L, px->email_alert.to);
+	lua_settable(L, -3);
+
+	return 1;
+}
+
 int hlua_fcn_new_proxy(lua_State *L, struct proxy *px)
 {
 	struct listener *lst;
@@ -1706,7 +2176,10 @@ int hlua_fcn_new_proxy(lua_State *L, struct proxy *px)
 	hlua_class_function(L, "shut_bcksess", hlua_proxy_shut_bcksess);
 	hlua_class_function(L, "get_cap", hlua_proxy_get_cap);
 	hlua_class_function(L, "get_mode", hlua_proxy_get_mode);
+	hlua_class_function(L, "get_srv_act", hlua_proxy_get_srv_act);
+	hlua_class_function(L, "get_srv_bck", hlua_proxy_get_srv_bck);
 	hlua_class_function(L, "get_stats", hlua_proxy_get_stats);
+	hlua_class_function(L, "get_mailers", hlua_proxy_get_mailers);
 
 	/* Browse and register servers. */
 	lua_pushstring(L, "servers");
@@ -2121,6 +2594,7 @@ static int hlua_regex_free(struct lua_State *L)
 void hlua_fcn_reg_core_fcn(lua_State *L)
 {
 	hlua_concat_init(L);
+	hlua_queue_init(L);
 
 	hlua_class_function(L, "now", hlua_now);
 	hlua_class_function(L, "http_date", hlua_http_date);
@@ -2128,6 +2602,7 @@ void hlua_fcn_reg_core_fcn(lua_State *L)
 	hlua_class_function(L, "rfc850_date", hlua_rfc850_date);
 	hlua_class_function(L, "asctime_date", hlua_asctime_date);
 	hlua_class_function(L, "concat", hlua_concat_new);
+	hlua_class_function(L, "queue", hlua_queue_new);
 	hlua_class_function(L, "get_info", hlua_get_info);
 	hlua_class_function(L, "parse_addr", hlua_parse_addr);
 	hlua_class_function(L, "match_addr", hlua_match_addr);

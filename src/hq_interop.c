@@ -21,9 +21,20 @@ static ssize_t hq_interop_decode_qcs(struct qcs *qcs, struct buffer *b, int fin)
 	size_t data = b_data(b);
 
 	if (!data && fin) {
+		struct buffer *appbuf;
+		struct htx *htx;
+
 		/* FIN is notified with an empty STREAM frame. */
 		BUG_ON(!qcs->sd); /* sd must already be attached here */
-		qcs_http_handle_standalone_fin(qcs);
+
+		if (!(appbuf = qc_get_buf(qcs, &qcs->rx.app_buf)))
+			return -1;
+
+		htx = htx_from_buf(appbuf);
+		if (!htx_set_eom(htx))
+			return -1;
+		htx_to_buf(htx, appbuf);
+
 		return 0;
 	}
 
@@ -77,7 +88,7 @@ static ssize_t hq_interop_decode_qcs(struct qcs *qcs, struct buffer *b, int fin)
 	htx_add_endof(htx, HTX_BLK_EOH);
 	htx_to_buf(htx, &htx_buf);
 
-	if (!qc_attach_sc(qcs, &htx_buf))
+	if (!qc_attach_sc(qcs, &htx_buf, fin))
 		return -1;
 
 	b_free(&htx_buf);

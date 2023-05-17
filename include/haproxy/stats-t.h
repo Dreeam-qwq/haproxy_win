@@ -343,6 +343,9 @@ enum info_field {
 	INF_POOL_USED_BYTES,
 	INF_START_TIME_SEC,
 	INF_TAINTED,
+	INF_WARNINGS,
+	INF_MAXCONN_REACHED,
+	INF_BOOTTIME_MS,
 
 	/* must always be the last one */
 	INF_TOTAL_FIELDS
@@ -467,6 +470,7 @@ enum stat_field {
 	ST_F_H1REQ,
 	ST_F_H2REQ,
 	ST_F_H3REQ,
+	ST_F_PROTO,
 
 	/* must always be the last one */
 	ST_F_TOTAL_FIELDS

@@ -191,7 +191,7 @@ static ssize_t h3_init_uni_stream(struct h3c *h3c, struct qcs *qcs,
 	case H3_UNI_S_T_CTRL:
 		if (h3c->flags & H3_CF_UNI_CTRL_SET) {
 			TRACE_ERROR("duplicated control stream", H3_EV_H3S_NEW, qcs->qcc->conn, qcs);
-			qcc_set_error(qcs->qcc, H3_STREAM_CREATION_ERROR);
+			qcc_set_error(qcs->qcc, H3_STREAM_CREATION_ERROR, 1);
 			goto err;
 		}
 		h3c->flags |= H3_CF_UNI_CTRL_SET;
@@ -206,7 +206,7 @@ static ssize_t h3_init_uni_stream(struct h3c *h3c, struct qcs *qcs,
 	case H3_UNI_S_T_QPACK_DEC:
 		if (h3c->flags & H3_CF_UNI_QPACK_DEC_SET) {
 			TRACE_ERROR("duplicated qpack decoder stream", H3_EV_H3S_NEW, qcs->qcc->conn, qcs);
-			qcc_set_error(qcs->qcc, H3_STREAM_CREATION_ERROR);
+			qcc_set_error(qcs->qcc, H3_STREAM_CREATION_ERROR, 1);
 			goto err;
 		}
 		h3c->flags |= H3_CF_UNI_QPACK_DEC_SET;
@@ -217,7 +217,7 @@ static ssize_t h3_init_uni_stream(struct h3c *h3c, struct qcs *qcs,
 	case H3_UNI_S_T_QPACK_ENC:
 		if (h3c->flags & H3_CF_UNI_QPACK_ENC_SET) {
 			TRACE_ERROR("duplicated qpack encoder stream", H3_EV_H3S_NEW, qcs->qcc->conn, qcs);
-			qcc_set_error(qcs->qcc, H3_STREAM_CREATION_ERROR);
+			qcc_set_error(qcs->qcc, H3_STREAM_CREATION_ERROR, 1);
 			goto err;
 		}
 		h3c->flags |= H3_CF_UNI_QPACK_ENC_SET;
@@ -453,7 +453,12 @@ static ssize_t h3_headers_to_htx(struct qcs *qcs, const struct buffer *buf,
 		goto out;
 	}
 
-	qc_get_buf(qcs, &htx_buf);
+	if (!qc_get_buf(qcs, &htx_buf)) {
+		TRACE_ERROR("HTX buffer alloc failure", H3_EV_RX_FRAME|H3_EV_RX_HDR, qcs->qcc->conn, qcs);
+		h3c->err = H3_INTERNAL_ERROR;
+		len = -1;
+		goto out;
+	}
 	BUG_ON(!b_size(&htx_buf)); /* TODO */
 	htx = htx_from_buf(&htx_buf);
 
@@ -675,7 +680,7 @@ static ssize_t h3_headers_to_htx(struct qcs *qcs, const struct buffer *buf,
 	htx_to_buf(htx, &htx_buf);
 	htx = NULL;
 
-	if (!qc_attach_sc(qcs, &htx_buf)) {
+	if (!qc_attach_sc(qcs, &htx_buf, fin)) {
 		h3c->err = H3_INTERNAL_ERROR;
 		len = -1;
 		goto out;
@@ -746,7 +751,12 @@ static ssize_t h3_trailers_to_htx(struct qcs *qcs, const struct buffer *buf,
 		goto out;
 	}
 
-	qc_get_buf(qcs, &htx_buf);
+	if (!qc_get_buf(qcs, &htx_buf)) {
+		TRACE_ERROR("HTX buffer alloc failure", H3_EV_RX_FRAME|H3_EV_RX_HDR, qcs->qcc->conn, qcs);
+		h3c->err = H3_INTERNAL_ERROR;
+		len = -1;
+		goto out;
+	}
 	BUG_ON(!b_size(&htx_buf)); /* TODO */
 	htx = htx_from_buf(&htx_buf);
 
@@ -847,6 +857,8 @@ static ssize_t h3_trailers_to_htx(struct qcs *qcs, const struct buffer *buf,
 static ssize_t h3_data_to_htx(struct qcs *qcs, const struct buffer *buf,
                               uint64_t len, char fin)
 {
+	struct h3s *h3s = qcs->ctx;
+	struct h3c *h3c = h3s->h3c;
 	struct buffer *appbuf;
 	struct htx *htx = NULL;
 	size_t htx_sent = 0;
@@ -855,8 +867,13 @@ static ssize_t h3_data_to_htx(struct qcs *qcs, const struct buffer *buf,
 
 	TRACE_ENTER(H3_EV_RX_FRAME|H3_EV_RX_DATA, qcs->qcc->conn, qcs);
 
-	appbuf = qc_get_buf(qcs, &qcs->rx.app_buf);
-	BUG_ON(!appbuf);
+	if (!(appbuf = qc_get_buf(qcs, &qcs->rx.app_buf))) {
+		TRACE_ERROR("data buffer alloc failure", H3_EV_RX_FRAME|H3_EV_RX_DATA, qcs->qcc->conn, qcs);
+		h3c->err = H3_INTERNAL_ERROR;
+		len = -1;
+		goto out;
+	}
+
 	htx = htx_from_buf(appbuf);
 
 	if (len > b_data(buf)) {
@@ -900,7 +917,8 @@ static ssize_t h3_data_to_htx(struct qcs *qcs, const struct buffer *buf,
 		htx->flags |= HTX_FL_EOM;
 
  out:
-	htx_to_buf(htx, appbuf);
+	if (appbuf)
+		htx_to_buf(htx, appbuf);
 
 	TRACE_LEAVE(H3_EV_RX_FRAME|H3_EV_RX_DATA, qcs->qcc->conn, qcs);
 	return htx_sent;
@@ -1031,13 +1049,27 @@ static ssize_t h3_decode_qcs(struct qcs *qcs, struct buffer *b, int fin)
 	 */
 	if (h3s->type == H3S_T_CTRL && fin) {
 		TRACE_ERROR("control stream closed by remote peer", H3_EV_RX_FRAME, qcs->qcc->conn, qcs);
-		qcc_set_error(qcs->qcc, H3_CLOSED_CRITICAL_STREAM);
+		qcc_set_error(qcs->qcc, H3_CLOSED_CRITICAL_STREAM, 1);
 		goto err;
 	}
 
 	if (!b_data(b) && fin && quic_stream_is_bidi(qcs->id)) {
+		struct buffer *appbuf;
+		struct htx *htx;
+
 		TRACE_PROTO("received FIN without data", H3_EV_RX_FRAME, qcs->qcc->conn, qcs);
-		qcs_http_handle_standalone_fin(qcs);
+		if (!(appbuf = qc_get_buf(qcs, &qcs->rx.app_buf))) {
+			TRACE_ERROR("data buffer alloc failure", H3_EV_RX_FRAME, qcs->qcc->conn, qcs);
+			h3c->err = H3_INTERNAL_ERROR;
+			goto err;
+		}
+
+		htx = htx_from_buf(appbuf);
+		if (!htx_set_eom(htx)) {
+			TRACE_ERROR("cannot set EOM", H3_EV_RX_FRAME, qcs->qcc->conn, qcs);
+			h3c->err = H3_INTERNAL_ERROR;
+		}
+		htx_to_buf(htx, appbuf);
 		goto done;
 	}
 
@@ -1067,7 +1099,7 @@ static ssize_t h3_decode_qcs(struct qcs *qcs, struct buffer *b, int fin)
 
 			if (!h3_is_frame_valid(h3c, qcs, ftype)) {
 				TRACE_ERROR("received an invalid frame", H3_EV_RX_FRAME, qcs->qcc->conn, qcs);
-				qcc_set_error(qcs->qcc, H3_FRAME_UNEXPECTED);
+				qcc_set_error(qcs->qcc, H3_FRAME_UNEXPECTED, 1);
 				goto err;
 			}
 
@@ -1090,7 +1122,7 @@ static ssize_t h3_decode_qcs(struct qcs *qcs, struct buffer *b, int fin)
 			 */
 			if (flen > QC_S_RX_BUF_SZ) {
 				TRACE_ERROR("received a too big frame", H3_EV_RX_FRAME, qcs->qcc->conn, qcs);
-				qcc_set_error(qcs->qcc, H3_EXCESSIVE_LOAD);
+				qcc_set_error(qcs->qcc, H3_EXCESSIVE_LOAD, 1);
 				goto err;
 			}
 			break;
@@ -1129,7 +1161,7 @@ static ssize_t h3_decode_qcs(struct qcs *qcs, struct buffer *b, int fin)
 			ret = h3_parse_settings_frm(qcs->qcc->ctx, b, flen);
 			if (ret < 0) {
 				TRACE_ERROR("error on SETTINGS parsing", H3_EV_RX_FRAME, qcs->qcc->conn, qcs);
-				qcc_set_error(qcs->qcc, h3c->err);
+				qcc_set_error(qcs->qcc, h3c->err, 1);
 				goto err;
 			}
 			h3c->flags |= H3_CF_SETTINGS_RECV;
@@ -1163,7 +1195,7 @@ static ssize_t h3_decode_qcs(struct qcs *qcs, struct buffer *b, int fin)
 		return b_data(b);
 	}
 	else if (h3c->err) {
-		qcc_set_error(qcs->qcc, h3c->err);
+		qcc_set_error(qcs->qcc, h3c->err, 1);
 		return b_data(b);
 	}
 
@@ -1670,7 +1702,7 @@ static int h3_close(struct qcs *qcs, enum qcc_app_ops_close_side side)
 	 */
 	if (qcs == h3c->ctrl_strm || h3s->type == H3S_T_CTRL) {
 		TRACE_ERROR("closure detected on control stream", H3_EV_H3S_END, qcs->qcc->conn, qcs);
-		qcc_set_error(qcs->qcc, H3_CLOSED_CRITICAL_STREAM);
+		qcc_set_error(qcs->qcc, H3_CLOSED_CRITICAL_STREAM, 1);
 		return 1;
 	}
 

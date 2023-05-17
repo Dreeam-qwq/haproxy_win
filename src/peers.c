@@ -1205,7 +1205,6 @@ static inline int peer_send_msg(struct appctx *appctx,
                                 struct peer_prep_params *params)
 {
 	int ret, msglen;
-	struct stconn *sc = appctx_sc(appctx);
 
 	msglen = peer_prepare_msg(trash.area, trash.size, params);
 	if (!msglen) {
@@ -1215,14 +1214,10 @@ static inline int peer_send_msg(struct appctx *appctx,
 	}
 
 	/* message to buffer */
-	ret = ci_putblk(sc_ic(sc), trash.area, msglen);
+	ret = applet_putblk(appctx, trash.area, msglen);
 	if (ret <= 0) {
-		if (ret == -1) {
-			/* No more write possible */
-			sc_need_room(sc);
-			return -1;
-		}
-		appctx->st0 = PEER_SESS_ST_END;
+		if (ret != -1)
+			appctx->st0 = PEER_SESS_ST_END;
 	}
 
 	return ret;
@@ -1628,7 +1623,7 @@ static inline int peer_send_teachmsgs(struct appctx *appctx, struct peer *p,
 			/* pretend we're full so that we get back ASAP */
 			struct stconn *sc = appctx_sc(appctx);
 
-			sc_need_room(sc);
+			sc_need_room(sc, 0);
 			ret = -1;
 			break;
 		}
@@ -2657,7 +2652,7 @@ static inline int peer_send_msgs(struct appctx *appctx,
 				/* pretend we're full so that we get back ASAP */
 				struct stconn *sc = appctx_sc(appctx);
 
-				sc_need_room(sc);
+				sc_need_room(sc, 0);
 				return -1;
 			}
 		}
@@ -2930,7 +2925,7 @@ static void peer_io_handler(struct appctx *appctx)
 
 	/* Check if the input buffer is available. */
 	if (sc_ib(sc)->size == 0) {
-		sc_need_room(sc);
+		sc_need_room(sc, 0);
 		goto out;
 	}
 

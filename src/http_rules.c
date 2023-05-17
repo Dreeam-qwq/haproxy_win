@@ -317,6 +317,23 @@ struct act_rule *parse_http_after_res_cond(const char **args, const char *file, 
 	return NULL;
 }
 
+/* completely free redirect rule */
+void http_free_redirect_rule(struct redirect_rule *rdr)
+{
+	struct logformat_node *lf, *lfb;
+
+	free_acl_cond(rdr->cond);
+	free(rdr->rdr_str);
+	free(rdr->cookie_str);
+	list_for_each_entry_safe(lf, lfb, &rdr->rdr_fmt, list) {
+		LIST_DELETE(&lf->list);
+		release_sample_expr(lf->expr);
+		free(lf->arg);
+		free(lf);
+	}
+	free(rdr);
+}
+
 /* Parses a redirect rule. Returns the redirect rule on success or NULL on error,
  * with <err> filled with the error message. If <use_fmt> is not null, builds a
  * dynamic log-format rule instead of a static string. Parameter <dir> indicates
@@ -325,7 +342,7 @@ struct act_rule *parse_http_after_res_cond(const char **args, const char *file, 
 struct redirect_rule *http_parse_redirect_rule(const char *file, int linenum, struct proxy *curproxy,
                                                const char **args, char **errmsg, int use_fmt, int dir)
 {
-	struct redirect_rule *rule;
+	struct redirect_rule *rule = NULL;
 	int cur_arg;
 	int type = REDIRECT_TYPE_NONE;
 	int code = 302;
@@ -386,7 +403,7 @@ struct redirect_rule *http_parse_redirect_rule(const char *file, int linenum, st
 				memprintf(errmsg,
 				          "'%s': unsupported HTTP code '%s' (must be one of 301, 302, 303, 307 or 308)",
 				          args[cur_arg - 1], args[cur_arg]);
-				return NULL;
+				goto err;
 			}
 		}
 		else if (strcmp(args[cur_arg], "drop-query") == 0) {
@@ -403,7 +420,7 @@ struct redirect_rule *http_parse_redirect_rule(const char *file, int linenum, st
 			cond = build_acl_cond(file, linenum, &curproxy->acl, curproxy, (const char **)args + cur_arg, errmsg);
 			if (!cond) {
 				memprintf(errmsg, "error in condition: %s", *errmsg);
-				return NULL;
+				goto err;
 			}
 			break;
 		}
@@ -411,32 +428,32 @@ struct redirect_rule *http_parse_redirect_rule(const char *file, int linenum, st
 			memprintf(errmsg,
 			          "expects 'code', 'prefix', 'location', 'scheme', 'set-cookie', 'clear-cookie', 'drop-query', 'ignore-empty' or 'append-slash' (was '%s')",
 			          args[cur_arg]);
-			return NULL;
+			goto err;
 		}
 		cur_arg++;
 	}
 
 	if (type == REDIRECT_TYPE_NONE) {
 		memprintf(errmsg, "redirection type expected ('prefix', 'location', or 'scheme')");
-		return NULL;
+		goto err;
 	}
 
 	if (dir && type != REDIRECT_TYPE_LOCATION) {
 		memprintf(errmsg, "response only supports redirect type 'location'");
-		return NULL;
+		goto err;
 	}
 
 	rule = calloc(1, sizeof(*rule));
-	if (!rule) {
-		memprintf(errmsg, "parsing [%s:%d]: out of memory.", file, linenum);
-		return NULL;
-	}
+	if (!rule)
+		goto out_of_memory;
 	rule->cond = cond;
 	LIST_INIT(&rule->rdr_fmt);
 
 	if (!use_fmt) {
 		/* old-style static redirect rule */
 		rule->rdr_str = strdup(destination);
+		if (!rule->rdr_str)
+			goto out_of_memory;
 		rule->rdr_len = strlen(destination);
 	}
 	else {
@@ -454,7 +471,7 @@ struct redirect_rule *http_parse_redirect_rule(const char *file, int linenum, st
 			cap |= (dir ? SMP_VAL_BE_HRS_HDR : SMP_VAL_BE_HRQ_HDR);
 		if (!(type == REDIRECT_TYPE_PREFIX && destination[0] == '/' && destination[1] == '\0')) {
 			if (!parse_logformat_string(destination, curproxy, &rule->rdr_fmt, LOG_OPT_HTTP, cap, errmsg)) {
-				return  NULL;
+				goto err;
 			}
 			free(curproxy->conf.lfs_file);
 			curproxy->conf.lfs_file = strdup(curproxy->conf.args.file);
@@ -469,11 +486,15 @@ struct redirect_rule *http_parse_redirect_rule(const char *file, int linenum, st
 		rule->cookie_len = strlen(cookie);
 		if (cookie_set) {
 			rule->cookie_str = malloc(rule->cookie_len + 10);
+			if (!rule->cookie_str)
+				goto out_of_memory;
 			memcpy(rule->cookie_str, cookie, rule->cookie_len);
 			memcpy(rule->cookie_str + rule->cookie_len, "; path=/;", 10);
 			rule->cookie_len += 9;
 		} else {
 			rule->cookie_str = malloc(rule->cookie_len + 21);
+			if (!rule->cookie_str)
+				goto out_of_memory;
 			memcpy(rule->cookie_str, cookie, rule->cookie_len);
 			memcpy(rule->cookie_str + rule->cookie_len, "; path=/; Max-Age=0;", 21);
 			rule->cookie_len += 20;
@@ -487,6 +508,17 @@ struct redirect_rule *http_parse_redirect_rule(const char *file, int linenum, st
 
  missing_arg:
 	memprintf(errmsg, "missing argument for '%s'", args[cur_arg]);
+	goto err;
+ out_of_memory:
+	memprintf(errmsg, "parsing [%s:%d]: out of memory.", file, linenum);
+ err:
+	if (rule)
+		http_free_redirect_rule(rule);
+	else if (cond) {
+		/* rule not yet allocated, but cond already is */
+		free_acl_cond(cond);
+	}
+
 	return NULL;
 }
 

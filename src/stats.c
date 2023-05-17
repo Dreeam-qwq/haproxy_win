@@ -156,6 +156,9 @@ const struct name_desc info_fields[INF_TOTAL_FIELDS] = {
 	[INF_CUM_LOG_MSGS]                   = { .name = "CumRecvLogs",                 .desc = "Total number of log messages received by log-forwarding listeners on this worker process since started" },
 	[INF_BUILD_INFO]                     = { .name = "Build info",                  .desc = "Build info" },
 	[INF_TAINTED]                        = { .name = "Tainted",                     .desc = "Experimental features used" },
+	[INF_WARNINGS]                       = { .name = "TotalWarnings",               .desc = "Total warnings issued" },
+	[INF_MAXCONN_REACHED]                = { .name = "MaxconnReached",              .desc = "Number of times an accepted connection resulted in Maxconn being reached" },
+	[INF_BOOTTIME_MS]                    = { .name = "BootTime_ms",                 .desc = "How long ago it took to parse and process the config before being ready (milliseconds)" },
 };
 
 const struct name_desc stat_fields[ST_F_TOTAL_FIELDS] = {
@@ -305,20 +308,26 @@ static inline enum stats_domain_px_cap stats_px_get_cap(uint32_t domain)
 
 static void stats_dump_json_schema(struct buffer *out);
 
-int stats_putchk(struct channel *chn, struct htx *htx)
+int stats_putchk(struct appctx *appctx, struct htx *htx)
 {
+	struct stconn *sc = appctx_sc(appctx);
+	struct channel *chn = sc_ic(sc);
 	struct buffer *chk = &trash_chunk;
 
 	if (htx) {
-		if (chk->data >= channel_htx_recv_max(chn, htx))
+		if (chk->data >= channel_htx_recv_max(chn, htx)) {
+			sc_need_room(sc, chk->data);
 			return 0;
-		if (!htx_add_data_atonce(htx, ist2(chk->area, chk->data)))
+		}
+		if (!htx_add_data_atonce(htx, ist2(chk->area, chk->data))) {
+			sc_need_room(sc, 0);
 			return 0;
+		}
 		channel_add_input(chn, chk->data);
 		chk->data = 0;
 	}
 	else  {
-		if (ci_putchk(chn, chk) == -1)
+		if (applet_putchk(appctx, chk) == -1)
 			return 0;
 	}
 	return 1;
@@ -1077,6 +1086,8 @@ static int stats_dump_fields_html(struct buffer *out,
 				chunk_appendf(out, "IPv6: %s, ", field_str(stats, ST_F_ADDR));
 			else if (*field_str(stats, ST_F_ADDR))
 				chunk_appendf(out, "%s, ", field_str(stats, ST_F_ADDR));
+
+			chunk_appendf(out, "proto=%s, ", field_str(stats, ST_F_PROTO));
 
 			/* id */
 			chunk_appendf(out, "id: %d</div>", stats[ST_F_SID].u.u32);
@@ -2069,6 +2080,9 @@ int stats_fill_li_stats(struct proxy *px, struct listener *l, int flags,
 						break;
 					}
 				}
+				break;
+			case ST_F_PROTO:
+				metric = mkf_str(FO_STATUS, l->rx.proto->name);
 				break;
 			default:
 				/* not used for listen. If a specific metric
@@ -3196,7 +3210,7 @@ more:
 	case STAT_PX_ST_TH:
 		if (ctx->flags & STAT_FMT_HTML) {
 			stats_dump_html_px_hdr(sc, px);
-			if (!stats_putchk(rep, htx))
+			if (!stats_putchk(appctx, htx))
 				goto full;
 		}
 
@@ -3206,7 +3220,7 @@ more:
 	case STAT_PX_ST_FE:
 		/* print the frontend */
 		if (stats_dump_fe_stats(sc, px)) {
-			if (!stats_putchk(rep, htx))
+			if (!stats_putchk(appctx, htx))
 				goto full;
 			ctx->flags |= STAT_STARTED;
 			if (ctx->field)
@@ -3222,12 +3236,16 @@ more:
 		/* obj2 points to listeners list as initialized above */
 		for (; ctx->obj2 != &px->conf.listeners; ctx->obj2 = l->by_fe.n) {
 			if (htx) {
-				if (htx_almost_full(htx))
+				if (htx_almost_full(htx)) {
+					sc_need_room(sc, htx->size / 2);
 					goto full;
+				}
 			}
 			else {
-				if (buffer_almost_full(&rep->buf))
+				if (buffer_almost_full(&rep->buf)) {
+					sc_need_room(sc, b_size(&rep->buf) / 2);
 					goto full;
+				}
 			}
 
 			l = LIST_ELEM(ctx->obj2, struct listener *, by_fe);
@@ -3244,7 +3262,7 @@ more:
 
 			/* print the frontend */
 			if (stats_dump_li_stats(sc, px, l)) {
-				if (!stats_putchk(rep, htx))
+				if (!stats_putchk(appctx, htx))
 					goto full;
 				ctx->flags |= STAT_STARTED;
 				if (ctx->field)
@@ -3288,12 +3306,16 @@ more:
 			srv_take(sv);
 
 			if (htx) {
-				if (htx_almost_full(htx))
+				if (htx_almost_full(htx)) {
+					sc_need_room(sc, htx->size / 2);
 					goto full;
+				}
 			}
 			else {
-				if (buffer_almost_full(&rep->buf))
+				if (buffer_almost_full(&rep->buf)) {
+					sc_need_room(sc, b_size(&rep->buf) / 2);
 					goto full;
+				}
 			}
 
 			if (ctx->flags & STAT_BOUND) {
@@ -3327,7 +3349,7 @@ more:
 			}
 
 			if (stats_dump_sv_stats(sc, px, sv)) {
-				if (!stats_putchk(rep, htx))
+				if (!stats_putchk(appctx, htx))
 					goto full;
 				ctx->flags |= STAT_STARTED;
 				if (ctx->field)
@@ -3342,7 +3364,7 @@ more:
 	case STAT_PX_ST_BE:
 		/* print the backend */
 		if (stats_dump_be_stats(sc, px)) {
-			if (!stats_putchk(rep, htx))
+			if (!stats_putchk(appctx, htx))
 				goto full;
 			ctx->flags |= STAT_STARTED;
 			if (ctx->field)
@@ -3356,7 +3378,7 @@ more:
 	case STAT_PX_ST_END:
 		if (ctx->flags & STAT_FMT_HTML) {
 			stats_dump_html_px_end(sc, px);
-			if (!stats_putchk(rep, htx))
+			if (!stats_putchk(appctx, htx))
 				goto full;
 		}
 
@@ -3372,7 +3394,6 @@ more:
 	}
 
   full:
-	sc_need_room(sc);
 	/* restore previous field */
 	ctx->field = current_field;
 	return 0;
@@ -3587,9 +3608,9 @@ static void stats_dump_html_info(struct stconn *sc, struct uri_auth *uri)
 	              "<h3>&gt; General process information</h3>\n"
 	              "<table border=0><tr><td align=\"left\" nowrap width=\"1%%\">\n"
 	              "<p><b>pid = </b> %d (process #%d, nbproc = %d, nbthread = %d)<br>\n"
-	              "<b>uptime = </b> %dd %dh%02dm%02ds<br>\n"
+	              "<b>uptime = </b> %dd %dh%02dm%02ds; warnings = %u<br>\n"
 	              "<b>system limits:</b> memmax = %s%s; ulimit-n = %d<br>\n"
-	              "<b>maxsock = </b> %d; <b>maxconn = </b> %d; <b>maxpipes = </b> %d<br>\n"
+	              "<b>maxsock = </b> %d; <b>maxconn = </b> %d; <b>reached = </b> %llu; <b>maxpipes = </b> %d<br>\n"
 	              "current conns = %d; current pipes = %d/%d; conn rate = %d/sec; bit rate = %.3f %cbps<br>\n"
 	              "Running tasks: %d/%d; idle = %d %%<br>\n"
 	              "</td><td align=\"center\" nowrap>\n"
@@ -3623,10 +3644,11 @@ static void stats_dump_html_info(struct stconn *sc, struct uri_auth *uri)
 	              pid, 1, 1, global.nbthread,
 	              up / 86400, (up % 86400) / 3600,
 	              (up % 3600) / 60, (up % 60),
+	              HA_ATOMIC_LOAD(&tot_warnings),
 	              global.rlimit_memmax ? ultoa(global.rlimit_memmax) : "unlimited",
 	              global.rlimit_memmax ? " MB" : "",
 	              global.rlimit_nofile,
-	              global.maxsock, global.maxconn, global.maxpipes,
+	              global.maxsock, global.maxconn, HA_ATOMIC_LOAD(&maxconn_reached), global.maxpipes,
 	              actconn, pipes_used, pipes_used+pipes_free, read_freq_ctr(&global.conn_per_sec),
 		      bps >= 1000000000UL ? (bps / 1000000000.0) : bps >= 1000000UL ? (bps / 1000000.0) : (bps / 1000.0),
 		      bps >= 1000000000UL ? 'G' : bps >= 1000000UL ? 'M' : 'k',
@@ -3848,12 +3870,16 @@ static int stats_dump_proxies(struct stconn *sc,
 	/* dump proxies */
 	while (ctx->obj1) {
 		if (htx) {
-			if (htx_almost_full(htx))
+			if (htx_almost_full(htx)) {
+				sc_need_room(sc, htx->size / 2);
 				goto full;
+			}
 		}
 		else {
-			if (buffer_almost_full(&rep->buf))
+			if (buffer_almost_full(&rep->buf)) {
+				sc_need_room(sc, b_size(&rep->buf) / 2);
 				goto full;
+			}
 		}
 
 		px = ctx->obj1;
@@ -3875,7 +3901,6 @@ static int stats_dump_proxies(struct stconn *sc,
 	return 1;
 
   full:
-	sc_need_room(sc);
 	return 0;
 }
 
@@ -3891,7 +3916,6 @@ static int stats_dump_stat_to_buffer(struct stconn *sc, struct htx *htx,
 {
 	struct appctx *appctx = __sc_appctx(sc);
 	struct show_stat_ctx *ctx = appctx->svcctx;
-	struct channel *rep = sc_ic(sc);
 	enum stats_domain domain = ctx->domain;
 
 	chunk_reset(&trash_chunk);
@@ -3911,7 +3935,7 @@ static int stats_dump_stat_to_buffer(struct stconn *sc, struct htx *htx,
 		else if (!(ctx->flags & STAT_FMT_TYPED))
 			stats_dump_csv_header(ctx->domain);
 
-		if (!stats_putchk(rep, htx))
+		if (!stats_putchk(appctx, htx))
 			goto full;
 
 		if (ctx->flags & STAT_JSON_SCHM) {
@@ -3924,7 +3948,7 @@ static int stats_dump_stat_to_buffer(struct stconn *sc, struct htx *htx,
 	case STAT_STATE_INFO:
 		if (ctx->flags & STAT_FMT_HTML) {
 			stats_dump_html_info(sc, uri);
-			if (!stats_putchk(rep, htx))
+			if (!stats_putchk(appctx, htx))
 				goto full;
 		}
 
@@ -3963,7 +3987,7 @@ static int stats_dump_stat_to_buffer(struct stconn *sc, struct htx *htx,
 				stats_dump_html_end();
 			else
 				stats_dump_json_end();
-			if (!stats_putchk(rep, htx))
+			if (!stats_putchk(appctx, htx))
 				goto full;
 		}
 
@@ -3980,7 +4004,6 @@ static int stats_dump_stat_to_buffer(struct stconn *sc, struct htx *htx,
 	}
 
   full:
-	sc_need_room(sc);
 	return 0;
 
 }
@@ -4375,7 +4398,7 @@ static int stats_send_http_headers(struct stconn *sc, struct htx *htx)
 
   full:
 	htx_reset(htx);
-	sc_need_room(sc);
+	sc_need_room(sc, 0);
 	return 0;
 }
 
@@ -4435,7 +4458,7 @@ static int stats_send_http_redirect(struct stconn *sc, struct htx *htx)
 
 full:
 	htx_reset(htx);
-	sc_need_room(sc);
+	sc_need_room(sc, 0);
 	return 0;
 }
 
@@ -4466,7 +4489,7 @@ static void http_stats_io_handler(struct appctx *appctx)
 
 	/* Check if the input buffer is available. */
 	if (!b_size(&res->buf)) {
-		sc_need_room(sc);
+		sc_need_room(sc, 0);
 		goto out;
 	}
 
@@ -4510,7 +4533,7 @@ static void http_stats_io_handler(struct appctx *appctx)
 		 */
 		if (htx_is_empty(res_htx)) {
 			if (!htx_add_endof(res_htx, HTX_BLK_EOT)) {
-				sc_need_room(sc);
+				sc_need_room(sc, sizeof(struct htx_blk) + 1);
 				goto out;
 			}
 			channel_add_input(res, 1);
@@ -4608,6 +4631,7 @@ int stats_fill_info(struct field *info, int len, uint flags)
 	uint64_t glob_out_bytes, glob_spl_bytes, glob_out_b32;
 	uint up_sec, up_usec;
 	ullong up;
+	ulong boot;
 	int thr;
 
 #ifdef USE_OPENSSL
@@ -4631,6 +4655,8 @@ int stats_fill_info(struct field *info, int len, uint flags)
 	up = now_ns - start_time_ns;
 	up_sec = ns_to_sec(up);
 	up_usec = (up / 1000U) % 1000000U;
+
+	boot = tv_ms_remain(&start_date, &ready_date);
 
 	if (len < INF_TOTAL_FIELDS)
 		return 0;
@@ -4724,6 +4750,9 @@ int stats_fill_info(struct field *info, int len, uint flags)
 
 	info[INF_TAINTED]                        = mkf_str(FO_STATUS, chunk_newstr(out));
 	chunk_appendf(out, "%#x", get_tainted());
+	info[INF_WARNINGS]                       = mkf_u32(FN_COUNTER, HA_ATOMIC_LOAD(&tot_warnings));
+	info[INF_MAXCONN_REACHED]                = mkf_u32(FN_COUNTER, HA_ATOMIC_LOAD(&maxconn_reached));
+	info[INF_BOOTTIME_MS]                    = mkf_u32(FN_DURATION, boot);
 
 	return 1;
 }

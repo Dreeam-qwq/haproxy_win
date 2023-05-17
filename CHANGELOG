@@ -1,6 +1,198 @@
 ChangeLog :
 ===========
 
+2023/05/17 : 2.8-dev12
+    - BUILD: mjson: Fix warning about unused variables
+    - MINOR: spoe: Don't stop disabled proxies
+    - BUG/MEDIUM: filters: Don't deinit filters for disabled proxies during startup
+    - BUG/MINOR: hlua_fcn/queue: fix broken pop_wait()
+    - BUG/MINOR: hlua_fcn/queue: fix reference leak
+    - CLEANUP: hlua_fcn/queue: make queue:push() easier to read
+    - BUG/MINOR: quic: Buggy acknowlegments of acknowlegments function
+    - DEBUG: list: add DEBUG_LIST to purposely corrupt list heads after delete
+    - MINOR: stats: report the total number of warnings issued
+    - MINOR: stats: report the number of times the global maxconn was reached
+    - BUG/MINOR: mux-quic: do not prevent shutw on error
+    - BUG/MINOR: mux-quic: do not free frame already released by quic-conn
+    - BUG/MINOR: mux-quic: no need to subscribe for detach streams
+    - MINOR: mux-quic: add traces for stream wake
+    - MINOR: mux-quic: do not send STREAM frames if already subscribe
+    - MINOR: mux-quic: factorize send subscribing
+    - MINOR: mux-quic: simplify return path of qc_send()
+    - MEDIUM: quic: streamline error notification
+    - MEDIUM: mux-quic: adjust transport layer error handling
+    - MINOR: stats: report the listener's protocol along with the address in stats
+    - BUG/MEDIUM: mux-fcgi: Never set SE_FL_EOS without SE_FL_EOI or SE_FL_ERROR
+    - BUG/MEDIUM: mux-fcgi: Don't request more room if mux is waiting for more data
+    - MINOR: stconn: Add a cross-reference between SE descriptor
+    - BUG/MINOR: proxy: missing free in free_proxy for redirect rules
+    - MINOR: proxy: add http_free_redirect_rule() function
+    - BUG/MINOR: http_rules: fix errors paths in http_parse_redirect_rule()
+    - CLEANUP: http_act: use http_free_redirect_rule() to clean redirect act
+    - MINOR: tree-wide: use free_acl_cond() where relevant
+    - CLEANUP: acl: discard prune_acl_cond() function
+    - BUG/MINOR: cli: don't complain about empty command on empty lines
+    - MINOR: cli: add an option to display the uptime in the CLI's prompt
+    - MINOR: master/cli: also implement the timed prompt on the master CLI
+    - MINOR: cli: make "show fd" identify QUIC connections and listeners
+    - MINOR: httpclient: allow to disable the DNS resolvers of the httpclient
+    - BUILD: debug: fix build issue on 32-bit platforms in "debug dev task"
+    - MINOR: ncbuf: missing malloc checks in standalone code
+    - DOC: lua: fix core.{proxies,frontends,backends} visibility
+    - EXAMPLES: fix race condition in lua mailers script
+    - BUG/MINOR: errors: handle malloc failure in usermsgs_put()
+    - BUG/MINOR: log: fix memory error handling in parse_logsrv()
+    - BUG/MINOR: quic: Wrong redispatch for external data on connection socket
+    - MINOR: htx: add function to set EOM reliably
+    - MINOR: mux-quic: remove dedicated function to handle standalone FIN
+    - BUG/MINOR: mux-quic: properly handle buf alloc failure
+    - BUG/MINOR: mux-quic: handle properly recv ncbuf alloc failure
+    - BUG/MINOR: quic: do not alloc buf count on alloc failure
+    - BUG/MINOR: mux-quic: differentiate failure on qc_stream_desc alloc
+    - BUG/MINOR: mux-quic: free task on qc_init() app ops failure
+    - MEDIUM: session/ssl: return the SSL error string during a SSL handshake error
+    - CI: enable monthly Fedora Rawhide clang builds
+    - MEDIUM: mworker/cli: does not disconnect the master CLI upon error
+    - MINOR: stconn: Remove useless test on sedesc on detach to release the xref
+    - MEDIUM: proxy: stop emitting logs for internal proxies when stopping
+    - MINOR: ssl: add new sample ssl_c_r_dn
+    - BUG/MEDIUM: mux-h2: make sure control frames do not refresh the idle timeout
+    - BUILD: ssl: ssl_c_r_dn fetches uses  functiosn only available since 1.1.1
+    - BUG/MINOR: mux-quic: handle properly Tx buf exhaustion
+    - BUG/MINOR: h3: missing goto on buf alloc failure
+    - BUILD: ssl: get0_verified chain is available on libreSSL
+    - BUG/MINOR: makefile: use USE_LIBATOMIC instead of USE_ATOMIC
+    - MINOR: mux-quic: add trace to stream rcv_buf operation
+    - MINOR: mux-quic: properly report end-of-stream on recv
+    - MINOR: mux-quic: uninline qc_attach_sc()
+    - BUG/MEDIUM: mux-quic: fix EOI for request without payload
+    - MINOR: checks: make sure spread-checks is used also at boot time
+    - BUG/MINOR: tcp-rules: Don't shortened the inspect-delay when EOI is set
+    - REGTESTS: log: Reduce response inspect-delay for last_rule.vtc
+    - DOC: config: Clarify conditions to shorten the inspect-delay for TCP rules
+    - CLEANUP: server: remove useless tmptrash assigments in srv_update_status()
+    - BUG/MINOR: server: memory leak in _srv_update_status_op() on server DOWN
+    - CLEANUP: check; Remove some useless assignments to NULL
+    - CLEANUP: stats: update the trash chunk where it's used
+    - MINOR: clock: measure the total boot time
+    - MINOR: stats: report the boot time in "show info"
+    - BUG/MINOR: checks: postpone the startup of health checks by the boot time
+    - MINOR: clock: provide a function to automatically adjust now_offset
+    - BUG/MINOR: clock: automatically adjust the internal clock with the boot time
+    - CLEANUP: fcgi-app; Remove useless assignment to NULL
+    - REGTESTS: log: Reduce again response inspect-delay for last_rule.vtc
+    - CI: drop Fedora m32 pipeline in favour of cross matrix
+    - MEDIUM: checks: Stop scheduling healthchecks during stopping stage
+    - MEDIUM: resolvers: Stop scheduling resolution during stopping stage
+    - BUG/MINOR: hlua: SET_SAFE_LJMP misuse in hlua_event_runner()
+    - BUG/MINOR: debug: fix pointer check in debug_parse_cli_task()
+
+2023/05/11 : 2.8-dev11
+    - BUILD: debug: do not check the isolated_thread variable in non-threaded builds
+    - BUILD: quic: fix build warning when threads are disabled
+    - CI: more granular failure on generating build matrix
+    - CLEANUP: quic: No more used q_buf structure
+    - CLEANUP: quic: Rename several <buf> variables in quic_frame.(c|h)
+    - CLEANUP: quic: Typo fix for quic_connection_id pool
+    - BUG/MINOR: quic: Wrong key update cipher context initialization for encryption
+    - BUG/MEDIUM: cache: Don't request more room than the max allowed
+    - MEDIUM: stconn: Be sure to always be able to unblock a SC that needs room
+    - EXAMPLES: fix IPV6 support for lua mailers script
+    - BUILD: ssl: buggy -Werror=dangling-pointer since gcc 13.0
+    - DOC: stconn: Update comments about ABRT/SHUT for stconn structure
+    - BUG/MEDIUM: stats: Require more room if buffer is almost full
+    - DOC: configuration: add info about ssl-engine for 2.6
+    - BUG/MINOR: mux-quic: fix transport VS app CONNECTION_CLOSE
+    - BUG/MEDIUM: mux-quic: wakeup tasklet to close on error
+    - DEV: flags: add a script to decode most flags in the "show sess all" output
+    - BUG/MINOR: quic: Possible crash when dumping version information
+    - BUG/MINOR: config: make compression work again in defaults section
+    - BUG/MEDIUM: stream: Forward shutdowns when unhandled errors are caught
+    - MEDIUM: stream: Resync analyzers at the end of process_stream() on change
+    - DEV: flags: add missing stream flags to show-sess-to-flags
+    - DEV: flags/show-sess-to-flags: only retrieve hex digits from hex fields
+    - DEV: flags/show-sess-to-flags: add support for color output
+    - CLEANUP: src/listener.c: remove redundant NULL check
+
+2023/05/07 : 2.8-dev10
+    - BUG/MINOR: stats: fix typo in `TotalSplicedBytesOut` field name
+    - REGTESTS: add success test, "set server" via fqdn
+    - MINOR: ssl: disable CRL checks with WolfSSL when no CRL file
+    - BUG/MINOR: stream/cli: fix stream age calculation in "show sess"
+    - MINOR: debug: clarify "debug dev stream" help message
+    - DEBUG: cli: add "debug dev task" to show/wake/expire/kill tasks and tasklets
+    - BUG/MINOR: ssl/sample: x509_v_err_str converter output when not found
+    - REGTESTS: ssl: simplify X509_V code check in ssl_client_auth.vtc
+    - BUILD: cli: fix build on Windows due to isalnum() implemented as a macro
+    - MINOR: activity: use a single macro to iterate over all fields
+    - MINOR: activity: show the line header inside the SHOW_VAL macro
+    - MINOR: activity: iterate over all fields in a main loop for dumping
+    - MINOR: activity: allow "show activity" to restart dumping on any line
+    - MINOR: activity: allow "show activity" to restart in the middle of a line
+    - DEV: haring: automatically disable DEBUG_STRICT
+    - DEV: haring: update readme to suggest using the same build options for haring
+    - BUG/MINOR: debug: fix incorrect profiling status reporting in show threads
+    - MINOR: debug: permit the "debug dev loop" to run under isolation
+    - BUG/MEDIUM: mux-h2: Properly handle end of request to expect data from server
+    - BUG/MINOR: mux-quic: prevent quic_conn error code to be overwritten
+    - MINOR: mux-quic: add trace event for local error
+    - MINOR: mux-quic: wake up after recv only if avail data
+    - MINOR: mux-quic: adjust local error API
+    - MINOR: mux-quic: report local error on stream endpoint asap
+    - MINOR: mux-quic: close connection asap on local error
+    - BUG/MINOR: debug: do not emit empty lines in thread dumps
+    - BUG/MINOR: mux-h2: Also expect data when waiting for a tunnel establishment
+    - BUG/MINOR: time: fix NS_TO_TV macro
+    - MEDIUM: debug: simplify the thread dump mechanism
+    - MINOR: debug: write panic dump to stderr one thread at a time
+    - MINOR: debug: make "show threads" properly iterate over all threads
+    - CLEANUP: debug: remove the now unused ha_thread_dump_all_to_trash()
+    - MINOR: ssl: allow to change the server signature algorithm
+    - MINOR: ssl: allow to change the signature algorithm for client authentication
+    - MINOR: cli: Use applet API to write output message
+    - MINOR: stats: Use the applet API to write data
+    - MINOR: peers: Use the applet API to send message
+    - MINOR: stconn: Add a field to specify the room needed by the SC to progress
+    - MEDIUM: tree-wide: Change sc API to specify required free space to progress
+    - BUG/MEDIUM: stconn: Unblock SC from stream if there is enough room to progrees
+    - MEDIUM: applet: Check room needed to unblock opposite SC when data was consumed
+    - MEDIUM: stconn: Check room needed to unblock SC on fast-forward
+    - MEDIUM: stconn: Check room needed to unblock opposite SC when data was sent
+    - MINOR: hlua_fcn: fix Server.is_draining() return type
+    - MINOR: hlua_fcn: add Server.is_backup()
+    - MINOR: hlua_fcn: add Server.is_dynamic()
+    - MINOR: hlua_fcn: add Server.tracking()
+    - MINOR: hlua_fcn: add Server.get_trackers()
+    - MINOR: hlua_fcn: add Server.get_proxy()
+    - MINOR: hlua_fcn: add Server.get_pend_conn() and Server.get_cur_sess()
+    - MINOR: hlua_fcn: add Proxy.get_srv_act() and Proxy.get_srv_bck()
+    - DOC: lua/event: add ServerEvent class header
+    - MINOR: server/event_hdl: publish macro helper
+    - MINOR: server/event_hdl: add SERVER_STATE event
+    - OPTIM: server: publish UP/DOWN events from STATE change
+    - MINOR: hlua: expose SERVER_STATE event
+    - MINOR: server/event_hdl: add SERVER_ADMIN event
+    - MINOR: hlua: expose SERVER_ADMIN event
+    - MINOR: checks/event_hdl: SERVER_CHECK event
+    - MINOR: hlua/event_hdl: expose SERVER_CHECK event
+    - MINOR: mailers/hlua: disable email sending from lua
+    - MINOR: hlua: expose proxy mailers
+    - EXAMPLES: add lua mailers script to replace tcpcheck mailers
+    - BUG/MINOR: hlua: spinning loop in hlua_socket_handler()
+    - MINOR: server: fix message report when IDRAIN is set and MAINT is cleared
+    - CLEANUP: hlua: hlua_register_task() may longjmp
+    - REGTESTS: use lua mailer script for mailers tests
+    - MINOR: hlua: declare hlua_{ref,pushref,unref} functions
+    - MINOR: hlua: declare hlua_gethlua() function
+    - MINOR: hlua: declare hlua_yieldk() function
+    - MINOR: hlua_fcn: add Queue class
+    - EXAMPLES: mailqueue for lua mailers script
+    - MINOR: quic: add format argument for "show quic"
+    - MINOR: quic: implement oneline format for "show quic"
+    - MINOR: config: allow cpu-map to take commas in lists of ranges
+    - CLEANUP: fix a few reported typos in code comments
+    - DOC: fix a few reported typos in the config and install doc
+
 2023/04/28 : 2.8-dev9
     - MINOR: quic: Move traces at proto level
     - BUG/MINOR: quic: Possible memory leak from TX packets

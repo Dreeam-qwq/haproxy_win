@@ -125,10 +125,7 @@ static void fcgi_release_rule_conf(struct fcgi_rule_conf *rule)
 		return;
 	free(rule->name);
 	free(rule->value);
-	if (rule->cond) {
-		prune_acl_cond(rule->cond);
-		free(rule->cond);
-	}
+	free_acl_cond(rule->cond);
 	free(rule);
 }
 
@@ -273,7 +270,6 @@ static int fcgi_flt_check(struct proxy *px, struct flt_conf *fconf)
 			LIST_APPEND(&fcgi_conf->param_rules, &rule->list);
 		else /* FCGI_RULE_PASS_HDR/FCGI_RULE_HIDE_HDR */
 			LIST_APPEND(&fcgi_conf->hdr_rules, &rule->list);
-		rule = NULL;
 	}
 	return 0;
 
@@ -760,10 +756,7 @@ static int fcgi_app_add_rule(struct fcgi_app *curapp, enum fcgi_rule_type type, 
 		free(rule->value);
 		free(rule);
 	}
-	if (cond) {
-		prune_acl_cond(cond);
-		free(cond);
-	}
+	free_acl_cond(cond);
 	memprintf(err, "out of memory");
 	return 0;
 }

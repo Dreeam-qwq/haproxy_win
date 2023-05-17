@@ -3,7 +3,7 @@
                           Configuration Manual
                          ----------------------
                               version 2.8
-                              2023/04/28
+                              2023/05/17
 
 
 This document covers the configuration language as implemented in the version
@@ -42,7 +42,8 @@ Summary
 2.3.      Environment variables
 2.4.      Conditional blocks
 2.5.      Time format
-2.6.      Examples
+2.6.      Size format
+2.7.      Examples
 
 3.    Global parameters
 3.1.      Process management and security
@@ -980,7 +981,23 @@ for every keyword. Supported units are :
   - d  : days.    1d = 24h = 1440m = 86400s = 86400000ms
 
 
-2.6. Examples
+2.6. Size format
+----------------
+
+Some parameters involve values representing size, such as bandwidth limits.
+These values are generally expressed in bytes (unless explicitly stated
+otherwise) but may be expressed in any other unit by suffixing the unit to the
+numeric value. It is important to consider this because it will not be repeated
+for every keyword. Supported units are case insensitive :
+
+  - k : kilobytes. 1 kilobyte = 1024 bytes
+  - m : megabytes. 1 megabyte = 1048576 bytes
+  - g : gigabytes. 1 gigabyte = 1073741824 bytes
+
+Both time and size formats require integers, decimal notation is not allowed.
+
+
+2.7. Examples
 -------------
 
     # Simple configuration for an HTTP proxy listening on port 80 on all
@@ -1068,6 +1085,7 @@ The following keywords are supported in the "global" section :
    - h1-case-adjust-file
    - h2-workaround-bogus-websocket-clients
    - hard-stop-after
+   - httpclient.resolvers.disabled
    - httpclient.resolvers.id
    - httpclient.resolvers.prefer
    - httpclient.ssl.ca-file
@@ -1332,7 +1350,7 @@ cluster-secret <secret>
   startup. This allows to use features which rely on it, albeit with some
   limitations.
 
-cpu-map [auto:]<thread-group>[/<thread-set>] <cpu-set>...
+cpu-map [auto:]<thread-group>[/<thread-set>] <cpu-set>[,...] [...]
   On some operating systems, it is possible to bind a thread group or a thread
   to a specific CPU set. This means that the designated threads will never run
   on other CPUs. The "cpu-map" directive specifies CPU sets for individual
@@ -1349,12 +1367,12 @@ cpu-map [auto:]<thread-group>[/<thread-set>] <cpu-set>...
   using "all", only odd numbers using "odd" or even numbers using "even", just
   like with the "thread" bind directive. The second and forthcoming arguments
   are CPU sets. Each CPU set is either a unique number starting at 0 for the
-  first CPU or a range with two such numbers delimited by a dash ('-'). Outside
-  of Linux and BSDs, there may be a limitation on the maximum CPU index to
-  either 31 or 63. Multiple CPU numbers or ranges may be specified, and the
-  processes or threads will be allowed to bind to all of them. Obviously,
-  multiple "cpu-map" directives may be specified. Each "cpu-map" directive will
-  replace the previous ones when they overlap.
+  first CPU or a range with two such numbers delimited by a dash ('-'). These
+  CPU numbers and ranges may be repeated by delimiting them with commas or by
+  passing more ranges as new arguments on the same line. Outside of Linux and
+  BSD operating systems, there may be a limitation on the maximum CPU index to
+  either 31 or 63. Multiple "cpu-map" directives may be specified, but each
+  "cpu-map" directive will replace the previous ones when they overlap.
 
   Ranges can be partially defined. The higher bound can be omitted. In such
   case, it is replaced by the corresponding maximum value, 32 or 64 depending
@@ -1387,6 +1405,7 @@ cpu-map [auto:]<thread-group>[/<thread-set>] <cpu-set>...
       cpu-map auto:1/1-4   0-3
       cpu-map auto:1/1-4   0-1 2-3
       cpu-map auto:1/1-4   3 2 1 0
+      cpu-map auto:1/1-4   3,2,1,0
 
       # bind each thread to exactly one CPU using all/odd/even keyword
       cpu-map auto:1/all   0-63
@@ -1406,10 +1425,10 @@ cpu-map [auto:]<thread-group>[/<thread-set>] <cpu-set>...
       # Map 80 threads to one physical socket and 80 others to another socket
       # without forcing assignment. These are split into 4 groups since no
       # group may have more than 64 threads.
-      cpu-map 1/1-40   0-39 80-119    # node0, siblings 0 & 1
-      cpu-map 2/1-40   0-39 80-119
-      cpu-map 3/1-40   40-79 120-159  # node1, siblings 0 & 1
-      cpu-map 4/1-40   40-79 120-159
+      cpu-map 1/1-40   0-39,80-119    # node0, siblings 0 & 1
+      cpu-map 2/1-40   0-39,80-119
+      cpu-map 3/1-40   40-79,120-159  # node1, siblings 0 & 1
+      cpu-map 4/1-40   40-79,120-159
 
 
 crt-base <dir>
@@ -1679,6 +1698,12 @@ hard-stop-after <time>
       hard-stop-after 30s
 
   See also: grace
+
+httpclient.resolvers.disabled <on|off>
+  Disable the DNS resolution of the httpclient. Prevent the creation of the
+  "default" resolvers section.
+
+  Default value is off.
 
 httpclient.resolvers.id <resolvers id>
   This option defines the resolvers section with which the httpclient will try
@@ -2839,6 +2864,11 @@ ssl-engine <name> [algo <comma-separated list of algorithms>]
   openssl configuration file uses:
   https://www.openssl.org/docs/man1.0.2/apps/config.html
 
+  HAProxy Version 2.6 disabled the support for engines in the default build.
+  This option is only available when HAProxy has been built with support for
+  it.  In case the ssl-engine is required HAProxy can be rebuild with the
+  USE_ENGINE=1 flag.
+
 ssl-mode-async
   Adds SSL_MODE_ASYNC mode to the SSL context. This enables asynchronous TLS
   I/O operations if asynchronous capable SSL engines are used. The current
@@ -2985,7 +3015,7 @@ tune.h2.initial-window-size <number>
 
 tune.h2.max-concurrent-streams <number>
   Sets the default HTTP/2 maximum number of concurrent streams per connection
-  (i.e. the number of outstanding requests on a single connection). Ths value
+  (i.e. the number of outstanding requests on a single connection). This value
   is used for incoming connections when tune.h2.fe.max-concurrent-streams is
   not set, and for outgoing connections when tune.h2.be.max-concurrent-streams
   is not set. The default value is 100. The impact varies depending on the side
@@ -3096,7 +3126,7 @@ tune.listener.multi-queue { on | fair | off }
   the probability to find the least loaded thread with the first mode is low.
   Finally it is possible to forcefully disable the redistribution mechanism
   using "off" for troubleshooting, or for situations where connections are
-  short-lived and it is estimated that the operating system alredy provides a
+  short-lived and it is estimated that the operating system already provides a
   good enough distribution. The default is "on".
 
 tune.lua.forced-yield <number>
@@ -13686,6 +13716,9 @@ tcp-request inspect-delay <timeout>
   Obviously this is unlikely to be very useful and might even be racy, so such
   setups are not recommended.
 
+  Note the inspection delay is shortened if an connection error or shutdown is
+  experienced or if the request buffer appears as full.
+
   As soon as a rule matches, the request is released and continues as usual. If
   the timeout is reached and no rule matches, the default policy will be to let
   it pass through unaffected.
@@ -20754,6 +20787,20 @@ ssl_c_notbefore : string
   Returns the start date presented by the client as a formatted string
   YYMMDDhhmmss[Z] when the incoming connection was made over an SSL/TLS
   transport layer.
+
+ssl_c_r_dn([<entry>[,<occ>[,<format>]]]) : string
+  When the incoming connection was made over an SSL/TLS transport layer, and is
+  successfully validated with the configured ca-file, returns the full
+  distinguished name of the root CA of the certificate presented by the client
+  when no <entry> is specified, or the value of the first given entry found from
+  the beginning of the DN. If a positive/negative occurrence number is specified
+  as the optional second argument, it returns the value of the nth given entry
+  value from the beginning/end of the DN. For instance, "ssl_c_r_dn(OU,2)" the
+  second organization unit, and "ssl_c_r_dn(CN)" retrieves the common name. The
+  <format> parameter allows you to receive the DN suitable for consumption by
+  different protocols. Currently supported is rfc2253 for LDAP v3. If you'd like
+  to modify the format only you can specify an empty string and zero for the
+  first two parameters. Example: ssl_c_r_dn(,0,rfc2253)
 
 ssl_c_s_dn([<entry>[,<occ>[,<format>]]]) : string
   When the incoming connection was made over an SSL/TLS transport layer,

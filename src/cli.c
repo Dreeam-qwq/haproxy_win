@@ -50,6 +50,7 @@
 #include <haproxy/pipe.h>
 #include <haproxy/protocol.h>
 #include <haproxy/proxy.h>
+#include <haproxy/quic_sock.h>
 #include <haproxy/sample-t.h>
 #include <haproxy/sc_strm.h>
 #include <haproxy/server.h>
@@ -319,7 +320,7 @@ static char *cli_gen_usage_msg(struct appctx *appctx, char * const *args)
 	/* always show the prompt/help/quit commands */
 	chunk_strcat(tmp,
 	             "  help [<command>]                        : list matching or all commands\n"
-	             "  prompt                                  : toggle interactive mode with prompt\n"
+	             "  prompt [timed]                          : toggle interactive mode with prompt\n"
 	             "  quit                                    : disconnect\n");
 
 	chunk_init(&out, NULL, 0);
@@ -800,6 +801,9 @@ static int cli_parse_request(struct appctx *appctx)
 	for (; i < MAX_CLI_ARGS + 1; i++)
 		args[i] = p;
 
+	if (!**args)
+		return 0;
+
 	kw = cli_find_kw(args);
 	if (!kw ||
 	    (kw->level & ~appctx->cli_level & ACCESS_MASTER_ONLY) ||
@@ -845,12 +849,12 @@ fail:
 }
 
 /* prepends then outputs the argument msg with a syslog-type severity depending on severity_output value */
-static int cli_output_msg(struct channel *chn, const char *msg, int severity, int severity_output)
+static int cli_output_msg(struct appctx *appctx, const char *msg, int severity, int severity_output)
 {
 	struct buffer *tmp;
 
 	if (likely(severity_output == CLI_SEVERITY_NONE))
-		return ci_putblk(chn, msg, strlen(msg));
+		return applet_putstr(appctx, msg);
 
 	tmp = get_trash_chunk();
 	chunk_reset(tmp);
@@ -873,7 +877,7 @@ static int cli_output_msg(struct channel *chn, const char *msg, int severity, in
 	}
 	chunk_appendf(tmp, "%s", msg);
 
-	return ci_putblk(chn, tmp->area, strlen(tmp->area));
+	return applet_putchk(appctx, tmp);
 }
 
 /* This I/O handler runs as an applet embedded in a stream connector. It is
@@ -900,7 +904,7 @@ static void cli_io_handler(struct appctx *appctx)
 
 	/* Check if the input buffer is available. */
 	if (!b_size(&res->buf)) {
-		sc_need_room(sc);
+		sc_need_room(sc, 0);
 		goto out;
 	}
 
@@ -937,7 +941,7 @@ static void cli_io_handler(struct appctx *appctx)
 			 * would want to return some info right after parsing.
 			 */
 			if (buffer_almost_full(sc_ib(sc))) {
-				sc_need_room(sc);
+				sc_need_room(sc, b_size(&res->buf) / 2);
 				break;
 			}
 
@@ -1082,7 +1086,7 @@ static void cli_io_handler(struct appctx *appctx)
 					msg = "Internal error.\n";
 				}
 
-				if (cli_output_msg(res, msg, sev, cli_get_severity_output(appctx)) != -1) {
+				if (cli_output_msg(appctx, msg, sev, cli_get_severity_output(appctx)) != -1) {
 					if (appctx->st0 == CLI_ST_PRINT_DYN ||
 					    appctx->st0 == CLI_ST_PRINT_DYNERR) {
 						ha_free(&ctx->err);
@@ -1093,8 +1097,6 @@ static void cli_io_handler(struct appctx *appctx)
 					}
 					appctx->st0 = CLI_ST_PROMPT;
 				}
-				else
-					sc_need_room(sc);
 				break;
 
 			case CLI_ST_CALLBACK: /* use custom pointer */
@@ -1114,6 +1116,7 @@ static void cli_io_handler(struct appctx *appctx)
 
 			/* The post-command prompt is either LF alone or LF + '> ' in interactive mode */
 			if (appctx->st0 == CLI_ST_PROMPT) {
+				char prompt_buf[20];
 				const char *prompt = "";
 
 				if (appctx->st1 & APPCTX_CLI_ST1_PROMPT) {
@@ -1123,6 +1126,13 @@ static void cli_io_handler(struct appctx *appctx)
 					 */
 					if (appctx->chunk->data && appctx->st1 & APPCTX_CLI_ST1_PAYLOAD)
 						prompt = "+ ";
+					else if (appctx->st1 & APPCTX_CLI_ST1_TIMED) {
+						uint up = ns_to_sec(now_ns - start_time_ns);
+						snprintf(prompt_buf, sizeof(prompt_buf),
+							 "\n[%u:%02u:%02u:%02u]> ",
+							 (up / 86400), (up / 3600) % 24, (up / 60) % 60, up % 60);
+						prompt = prompt_buf;
+					}
 					else
 						prompt = "\n> ";
 				}
@@ -1276,6 +1286,7 @@ static int cli_io_handler_show_fd(struct appctx *appctx)
 		const struct xprt_ops *xprt = NULL;
 		const void *ctx = NULL;
 		const void *xprt_ctx = NULL;
+		const struct quic_conn *qc = NULL;
 		uint32_t conn_flags = 0;
 		uint8_t conn_err = 0;
 		int is_back = 0;
@@ -1309,10 +1320,26 @@ static int cli_io_handler_show_fd(struct appctx *appctx)
 			if (conn->handle.fd != fd)
 				suspicious = 1;
 		}
+#if defined(USE_QUIC)
+		else if (fdt.iocb == quic_conn_sock_fd_iocb) {
+			qc = fdtab[fd].owner;
+			li = qc ? qc->li : NULL;
+			xprt_ctx   = qc ? qc->xprt_ctx : NULL;
+			conn = qc ? qc->conn : NULL;
+			xprt = conn ? conn->xprt : NULL; // in fact it's &ssl_quic
+			mux = conn ? conn->mux : NULL;
+			/* quic_conns don't always have a connection but they
+			 * always have an xprt_ctx.
+			 */
+		}
+		else if (fdt.iocb == quic_lstnr_sock_fd_iocb) {
+			li = objt_listener(fdtab[fd].owner);
+		}
+#endif
 		else if (fdt.iocb == sock_accept_iocb)
 			li = fdt.owner;
 
-		if (!((conn &&
+		if (!(((conn || xprt_ctx) &&
 		       ((match & CLI_SHOWFD_F_SV && sv) ||
 			(match & CLI_SHOWFD_F_PX && px) ||
 			(match & CLI_SHOWFD_F_FE && li))) ||
@@ -1355,11 +1382,14 @@ static int cli_io_handler_show_fd(struct appctx *appctx)
 		if (!fdt.owner) {
 			chunk_appendf(&trash, ")");
 		}
-		else if (fdt.iocb == sock_conn_iocb) {
+		else if (conn) {
 			chunk_appendf(&trash, ") back=%d cflg=0x%08x cerr=%d", is_back, conn_flags, conn_err);
 
-			if (conn->handle.fd != fd) {
+			if (!(conn->flags & CO_FL_FDLESS) && conn->handle.fd != fd) {
 				chunk_appendf(&trash, " fd=%d(BOGUS)", conn->handle.fd);
+				suspicious = 1;
+			} else if ((conn->flags & CO_FL_FDLESS) && (qc != conn->handle.qc)) {
+				chunk_appendf(&trash, " qc=%p(BOGUS)", conn->handle.qc);
 				suspicious = 1;
 			} else {
 				struct sockaddr_storage sa;
@@ -1393,7 +1423,7 @@ static int cli_io_handler_show_fd(struct appctx *appctx)
 
 			if (mux) {
 				chunk_appendf(&trash, " mux=%s ctx=%p", mux->name, ctx);
-				if (!ctx)
+				if (!ctx && !qc)
 					suspicious = 1;
 				if (mux->show_fd)
 					suspicious |= mux->show_fd(&trash, fdt.owner);
@@ -1409,7 +1439,7 @@ static int cli_io_handler_show_fd(struct appctx *appctx)
 					suspicious |= xprt->show_fd(&trash, conn, xprt_ctx);
 			}
 		}
-		else if (fdt.iocb == sock_accept_iocb) {
+		else if (li && !xprt_ctx) {
 			struct sockaddr_storage sa;
 			socklen_t salen;
 
@@ -2186,7 +2216,12 @@ static int cli_parse_simple(char **args, char *payload, struct appctx *appctx, v
 		cli_gen_usage_msg(appctx, args);
 	else if (*args[0] == 'p')
 		/* prompt */
-		appctx->st1 ^= APPCTX_CLI_ST1_PROMPT;
+		if (strcmp(args[1], "timed") == 0) {
+			appctx->st1 |= APPCTX_CLI_ST1_PROMPT;
+			appctx->st1 ^= APPCTX_CLI_ST1_TIMED;
+		}
+		else
+			appctx->st1 ^= APPCTX_CLI_ST1_PROMPT;
 	else if (*args[0] == 'q') {
 		/* quit */
 		se_fl_set(appctx->sedesc, SE_FL_EOI);
@@ -2207,11 +2242,46 @@ void pcli_write_prompt(struct stream *s)
 	if (s->pcli_flags & PCLI_F_PAYLOAD) {
 		chunk_appendf(msg, "+ ");
 	} else {
-		if (s->pcli_next_pid == 0)
+		if (s->pcli_next_pid == 0) {
+			/* master's prompt */
+			if (s->pcli_flags & PCLI_F_TIMED) {
+				uint up = ns_to_sec(now_ns - start_time_ns);
+				chunk_appendf(msg, "[%u:%02u:%02u:%02u] ",
+				         (up / 86400), (up / 3600) % 24, (up / 60) % 60, up % 60);
+			}
+
 			chunk_appendf(msg, "master%s",
 			              (proc_self->failedreloads > 0) ? "[ReloadFailed]" : "");
-		else
+		}
+		else {
+			/* worker's prompt */
+			if (s->pcli_flags & PCLI_F_TIMED) {
+				const struct mworker_proc *tmp, *proc;
+				uint up;
+
+				/* set proc to the worker corresponding to pcli_next_pid or NULL */
+				proc = NULL;
+				list_for_each_entry(tmp, &proc_list, list) {
+					if (!(tmp->options & PROC_O_TYPE_WORKER))
+						continue;
+					if (tmp->pid == s->pcli_next_pid) {
+						proc = tmp;
+						break;
+					}
+				}
+
+				if (!proc)
+					chunk_appendf(msg, "[gone] ");
+				else {
+					up = date.tv_sec - proc->timestamp;
+					if ((int)up < 0) /* must never be negative because of clock drift */
+						up = 0;
+					chunk_appendf(msg, "[%u:%02u:%02u:%02u] ",
+						      (up / 86400), (up / 3600) % 24, (up / 60) % 60, up % 60);
+				}
+			}
 			chunk_appendf(msg, "%d", s->pcli_next_pid);
+		}
 
 		if (s->pcli_flags & (ACCESS_EXPERIMENTAL|ACCESS_EXPERT|ACCESS_MCLI_DEBUG)) {
 			chunk_appendf(msg, "(");
@@ -2235,9 +2305,26 @@ void pcli_write_prompt(struct stream *s)
 	co_inject(oc, msg->area, msg->data);
 }
 
-
 /* The pcli_* functions are used for the CLI proxy in the master */
 
+
+/* flush the input buffer and output an error */
+void pcli_error(struct stream *s, const char *msg)
+{
+	struct buffer *buf = get_trash_chunk();
+	struct channel *oc = &s->res;
+	struct channel *ic = &s->req;
+
+	chunk_initstr(buf, msg);
+
+	if (likely(buf && buf->data))
+		co_inject(oc, buf->area, buf->data);
+
+	channel_erase(ic);
+
+}
+
+/* flush the input buffer, output the error and close */
 void pcli_reply_and_close(struct stream *s, const char *msg)
 {
 	struct buffer *buf = get_trash_chunk();
@@ -2354,9 +2441,13 @@ int pcli_find_and_exec_kw(struct stream *s, char **args, int argl, char **errmsg
 			*next_pid = target_pid;
 		return 1;
 	} else if (strcmp("prompt", args[0]) == 0) {
-		s->pcli_flags ^= PCLI_F_PROMPT;
+		if (argl >= 2 && strcmp(args[1], "timed") == 0) {
+			s->pcli_flags |= PCLI_F_PROMPT;
+			s->pcli_flags ^= PCLI_F_TIMED;
+		}
+		else
+			s->pcli_flags ^= PCLI_F_PROMPT;
 		return argl; /* return the number of elements in the array */
-
 	} else if (strcmp("quit", args[0]) == 0) {
 		sc_schedule_abort(s->scf);
 		sc_schedule_shutdown(s->scf);
@@ -2666,13 +2757,12 @@ read_again:
 		pcli_write_prompt(s);
 		goto read_again;
 	} else if (to_forward == -1) {
-                if (errmsg) {
-                        /* there was an error during the parsing */
-                        pcli_reply_and_close(s, errmsg);
-                        s->req.analysers &= ~AN_REQ_WAIT_CLI;
-                        return 0;
-                }
-                goto missing_data;
+                if (!errmsg) /* no error means missing data */
+			goto missing_data;
+
+		/* there was an error during the parsing */
+		pcli_error(s, errmsg);
+		pcli_write_prompt(s);
 	}
 
 	return 0;
@@ -2684,7 +2774,7 @@ send_help:
 
 send_status:
 	s->pcli_flags |= PCLI_F_RELOAD;
-	/* dont' use ci_putblk here because SHUT_DONE could have been sent */
+	/* don't use ci_putblk here because SHUT_DONE could have been sent */
 	b_reset(&req->buf);
 	b_putblk(&req->buf, "_loadstatus;quit\n", 17);
 	goto read_again;

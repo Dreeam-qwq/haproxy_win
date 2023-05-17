@@ -92,6 +92,11 @@
 #define HAVE_SSL_KEYLOG
 #endif
 
+/* minimum OpenSSL 1.1.1 & libreSSL 3.3.6 */
+#if (defined(LIBRESSL_VERSION_NUMBER) && (LIBRESSL_VERSION_NUMBER >= 0x3030600L)) || (HA_OPENSSL_VERSION_NUMBER >= 0x10101000L)
+#define HAVE_SSL_get0_verified_chain
+#endif
+
 
 #if (HA_OPENSSL_VERSION_NUMBER >= 0x3000000fL)
 #define HAVE_OSSL_PARAM

@@ -268,6 +268,12 @@ struct event_hdl_sub {
 #define EVENT_HDL_SUB_SERVER_DEL                        EVENT_HDL_SUB_TYPE(1,2)
 #define EVENT_HDL_SUB_SERVER_UP                         EVENT_HDL_SUB_TYPE(1,3)
 #define EVENT_HDL_SUB_SERVER_DOWN                       EVENT_HDL_SUB_TYPE(1,4)
+/* server state change */
+#define EVENT_HDL_SUB_SERVER_STATE                      EVENT_HDL_SUB_TYPE(1,5)
+/* server admin change */
+#define EVENT_HDL_SUB_SERVER_ADMIN                      EVENT_HDL_SUB_TYPE(1,6)
+/* server check-related (agent or health) event */
+#define EVENT_HDL_SUB_SERVER_CHECK                      EVENT_HDL_SUB_TYPE(1,7)
 
 /*	---------------------------------------        */
 

@@ -3874,8 +3874,15 @@ static size_t fcgi_rcv_buf(struct stconn *sc, struct buffer *buf, size_t count, 
 	else
 		TRACE_STATE("fstrm rxbuf not allocated", FCGI_EV_STRM_RECV|FCGI_EV_FSTRM_BLK, fconn->conn, fstrm);
 
-	if (b_data(&fstrm->rxbuf))
-		se_fl_set(fstrm->sd, SE_FL_RCV_MORE | SE_FL_WANT_ROOM);
+	if (b_data(&fstrm->rxbuf)) {
+		/* If the channel buffer is not empty, consider the mux is
+		 * blocked because it needs more room. But if the channel buffer
+		 * is empty, it means partial data were received and the mux
+		 * needs to receive more data to be able to parse it.
+		 */
+		if (b_data(buf))
+			se_fl_set(fstrm->sd, SE_FL_RCV_MORE | SE_FL_WANT_ROOM);
+	}
 	else {
 		se_fl_clr(fstrm->sd, SE_FL_RCV_MORE | SE_FL_WANT_ROOM);
 		if (fstrm->state == FCGI_SS_ERROR || (fstrm->h1m.state == H1_MSG_DONE)) {
@@ -3883,8 +3890,11 @@ static size_t fcgi_rcv_buf(struct stconn *sc, struct buffer *buf, size_t count, 
 			if (!(fstrm->h1m.flags & (H1_MF_VER_11|H1_MF_XFER_LEN)))
 				se_fl_set(fstrm->sd, SE_FL_EOS);
 		}
-		if (fcgi_conn_read0_pending(fconn))
+		if (fcgi_conn_read0_pending(fconn)) {
 			se_fl_set(fstrm->sd, SE_FL_EOS);
+			if (!se_fl_test(fstrm->sd, SE_FL_EOI))
+				se_fl_set(fstrm->sd, SE_FL_ERROR);
+		}
 		if (se_fl_test(fstrm->sd, SE_FL_ERR_PENDING))
 			se_fl_set(fstrm->sd, SE_FL_ERROR);
 		fcgi_release_buf(fconn, &fstrm->rxbuf);

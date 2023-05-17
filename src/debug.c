@@ -183,11 +183,11 @@ void ha_backtrace_to_stderr(void)
 void ha_thread_dump_one(int thr, int from_signal)
 {
 	struct buffer *buf = HA_ATOMIC_LOAD(&ha_thread_ctx[thr].thread_dump_buffer);
-	unsigned long thr_bit = ha_thread_info[thr].ltid_bit;
+	unsigned long __maybe_unused thr_bit = ha_thread_info[thr].ltid_bit;
+	int __maybe_unused tgrp  = ha_thread_info[thr].tgid;
 	unsigned long long p = ha_thread_ctx[thr].prev_cpu_time;
 	unsigned long long n = now_cpu_time_thread(thr);
 	int stuck = !!(ha_thread_ctx[thr].flags & TH_FL_STUCK);
-	int tgrp  = ha_thread_info[thr].tgid;
 
 	chunk_appendf(buf,
 	              "%c%cThread %-2u: id=0x%llx act=%d glob=%d wq=%d rq=%d tl=%d tlsz=%d rqsz=%d\n"
@@ -208,10 +208,12 @@ void ha_thread_dump_one(int thr, int from_signal)
 	              stuck,
 	              !!(ha_thread_ctx[thr].flags & TH_FL_TASK_PROFILING));
 
+#if defined(USE_THREAD)
 	chunk_appendf(buf,
 	              " harmless=%d isolated=%d",
 	              !!(_HA_ATOMIC_LOAD(&ha_tgroup_ctx[tgrp-1].threads_harmless) & thr_bit),
 		      isolated_thread == thr);
+#endif
 
 	chunk_appendf(buf, "\n");
 	chunk_appendf(buf, "             cpu_ns: poll=%llu now=%llu diff=%llu\n", p, n, n-p);
@@ -980,7 +982,7 @@ static int debug_parse_cli_task(char **args, char *payload, struct appctx *appct
 		return 1;
 
 	/* parse the pointer value */
-	ptr = (void *)strtoll(args[3], &endarg, 0);
+	ptr = (void *)strtoul(args[3], &endarg, 0);
 	if (!*args[3] || *endarg)
 		goto usage;
 
@@ -1002,7 +1004,7 @@ static int debug_parse_cli_task(char **args, char *payload, struct appctx *appct
 	t = ptr;
 	caller = t->caller;
 	msg = NULL;
-	task_ok = may_access(t + sizeof(*t) - 1);
+	task_ok = may_access(ptr + sizeof(*t) - 1);
 
 	chunk_reset(&trash);
 	resolve_sym_name(&trash, NULL, (const void *)t->process);

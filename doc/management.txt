@@ -1497,6 +1497,32 @@ For this reason, when debugging by hand, it's quite common to start with the
    ...
    >
 
+Optionally the process' uptime may be displayed in the prompt. In order to
+enable this, the "prompt timed" command will enable the prompt and toggle the
+displaying of the time. The uptime is displayed in format "d:hh:mm:ss" where
+"d" is the number of days, and "hh", "mm", "ss" are respectively the number
+of hours, minutes and seconds on two digits each:
+
+   # socat /var/run/haproxy readline
+   prompt timed
+
+   [23:03:34:39]> show version
+   2.8-dev9-e5e622-18
+
+   [23:03:34:41]> quit
+
+When the timed prompt is set on the master CLI, the prompt will display the
+currently selected process' uptime, so this will work for the master, current
+worker or an older worker:
+
+  master> prompt timed
+  [0:00:00:50] master> show proc
+  (...)
+  [0:00:00:58] master> @!11955     <-- master, switch to current worker
+  [0:00:01:03] 11955> @!11942      <-- current worker, switch to older worker
+  [0:00:02:17] 11942> @            <-- older worker, switch back to master
+  [0:00:01:10] master>
+
 Since multiple commands may be issued at once, haproxy uses the empty line as a
 delimiter to mark an end of output for each command, and takes care of ensuring
 that no command can emit an empty line on output. A script can thus easily
@@ -2934,7 +2960,7 @@ show pools [byname|bysize|byusage] [match <pfx>] [<nb>]
       - Pool quic_crypto (1048 bytes) : 6685 allocated (7005880 bytes), ...
       - Pool quic_conn (4056 bytes) : 1337 allocated (5422872 bytes), ...
       - Pool quic_rxbuf (262168 bytes) : 8 allocated (2097344 bytes), ...
-      - Pool quic_connne (184 bytes) : 9359 allocated (1722056 bytes), ...
+      - Pool quic_conne (184 bytes) : 9359 allocated (1722056 bytes), ...
       - Pool quic_frame (184 bytes) : 7938 allocated (1460592 bytes), ...
       - Pool quic_tx_pac (152 bytes) : 6454 allocated (981008 bytes), ...
       - Pool quic_tls_ke (56 bytes) : 12033 allocated (673848 bytes), ...
@@ -2984,11 +3010,14 @@ show resolvers [<resolvers section id>]
     too_big: too big response
     outdated: number of response arrived too late (after another name server)
 
-show quic [all]
+show quic [<format>] [all]
   Dump information on all active QUIC frontend connections. This command is
   restricted and can only be issued on sockets configured for levels "operator"
-  or "admin". By default, connections on closing or draining state are not
-  displayed. Use the extra argument "all" to include them in the output.
+  or "admin". An optional format can be specified as first argument to control
+  the verbosity. Currently supported values are "oneline" which is the default
+  if format is unspecified or "full". By default, connections on closing or
+  draining state are not displayed. Use the extra argument "all" to include
+  them in the output.
 
 show servers conn [<backend>]
   Dump the current and idle connections state of the servers belonging to the

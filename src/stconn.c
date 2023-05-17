@@ -19,6 +19,7 @@
 #include <haproxy/pool.h>
 #include <haproxy/sc_strm.h>
 #include <haproxy/stconn.h>
+#include <haproxy/xref.h>
 
 DECLARE_POOL(pool_head_connstream, "stconn", sizeof(struct stconn));
 DECLARE_POOL(pool_head_sedesc, "sedesc", sizeof(struct sedesc));
@@ -94,6 +95,7 @@ void sedesc_init(struct sedesc *sedesc)
 	sedesc->sc = NULL;
 	sedesc->lra = TICK_ETERNITY;
 	sedesc->fsb = TICK_ETERNITY;
+	sedesc->xref.peer = NULL;
 	se_fl_setall(sedesc, SE_FL_NONE);
 }
 
@@ -136,6 +138,7 @@ static struct stconn *sc_new(struct sedesc *sedesc)
 	sc->flags = SC_FL_NONE;
 	sc->state = SC_ST_INI;
 	sc->ioto = TICK_ETERNITY;
+	sc->room_needed = 0;
 	sc->app = NULL;
 	sc->app_ops = NULL;
 	sc->src = NULL;
@@ -270,6 +273,7 @@ int sc_attach_mux(struct stconn *sc, void *sd, void *ctx)
 		}
 
 		sc->app_ops = &sc_app_conn_ops;
+		xref_create(&sc->sedesc->xref, &sc_opposite(sc)->sedesc->xref);
 	}
 	else if (sc_check(sc)) {
 		if (!sc->wait_event.tasklet) {
@@ -303,8 +307,10 @@ static void sc_attach_applet(struct stconn *sc, void *sd)
 	sc->sedesc->se = sd;
 	sc_ep_set(sc, SE_FL_T_APPLET);
 	sc_ep_clr(sc, SE_FL_DETACHED);
-	if (sc_strm(sc))
+	if (sc_strm(sc)) {
 		sc->app_ops = &sc_app_applet_ops;
+		xref_create(&sc->sedesc->xref, &sc_opposite(sc)->sedesc->xref);
+	}
 }
 
 /* Attaches a stconn to a app layer and sets the relevant
@@ -345,9 +351,16 @@ int sc_attach_strm(struct stconn *sc, struct stream *strm)
 static void sc_detach_endp(struct stconn **scp)
 {
 	struct stconn *sc = *scp;
+	struct xref *peer;
 
 	if (!sc)
 		return;
+
+
+	/* Remove my link in the original objects. */
+	peer = xref_get_peer_and_lock(&sc->sedesc->xref);
+	if (peer)
+		xref_disconnect(&sc->sedesc->xref, peer);
 
 	if (sc_ep_test(sc, SE_FL_T_MUX)) {
 		struct connection *conn = __sc_conn(sc);
@@ -608,7 +621,7 @@ static void sc_app_chk_rcv(struct stconn *sc)
 
 	if (ic->pipe) {
 		/* stop reading */
-		sc_need_room(sc);
+		sc_need_room(sc, -1);
 	}
 	else {
 		/* (re)start reading */
@@ -972,6 +985,13 @@ void sc_update_rx(struct stconn *sc)
 	if (sc->flags & (SC_FL_EOS|SC_FL_ABRT_DONE))
 		return;
 
+	/* Unblock the SC if it needs room and the free space is large enough (0
+	 * means it can always be unblocked). Do not unblock it if -1 was
+	 * specified.
+	 */
+	if (!sc->room_needed || (sc->room_needed > 0 && channel_recv_max(ic) >= sc->room_needed))
+		sc_have_room(sc);
+
 	/* Read not closed, update FD status and timeout for reads */
 	if (ic->flags & CF_DONT_READ)
 		sc_wont_read(sc);
@@ -1080,7 +1100,7 @@ static void sc_notify(struct stconn *sc)
 		/* check if the consumer has freed some space either in the
 		 * buffer or in the pipe.
 		 */
-		if (new_len < last_len)
+		if (!sc->room_needed || (new_len < last_len && (sc->room_needed < 0 || channel_recv_max(ic) >= sc->room_needed)))
 			sc_have_room(sc);
 	}
 
@@ -1268,7 +1288,7 @@ static int sc_conn_recv(struct stconn *sc)
 			/* the pipe is full or we have read enough data that it
 			 * could soon be full. Let's stop before needing to poll.
 			 */
-			sc_need_room(sc);
+			sc_need_room(sc, 0);
 			goto done_recv;
 		}
 
@@ -1338,7 +1358,7 @@ static int sc_conn_recv(struct stconn *sc)
 			 */
 			BUG_ON(c_empty(ic));
 
-			sc_need_room(sc);
+			sc_need_room(sc, channel_recv_max(ic) + 1);
 			/* Add READ_PARTIAL because some data are pending but
 			 * cannot be xferred to the channel
 			 */
@@ -1352,7 +1372,7 @@ static int sc_conn_recv(struct stconn *sc)
 			 * here to proceed.
 			 */
 			if (flags & CO_RFL_BUF_FLUSH)
-				sc_need_room(sc);
+				sc_need_room(sc, -1);
 			break;
 		}
 
@@ -1656,8 +1676,10 @@ static int sc_conn_send(struct stconn *sc)
 		oc->flags |= CF_WRITE_EVENT | CF_WROTE_DATA;
 		if (sc->state == SC_ST_CON)
 			sc->state = SC_ST_RDY;
-		sc_have_room(sc_opposite(sc));
 	}
+
+	if (!sco->room_needed || (did_send && (sco->room_needed < 0 || channel_recv_max(sc_oc(sc)) >= sco->room_needed)))
+		sc_have_room(sco);
 
 	if (sc_ep_test(sc, SE_FL_ERROR | SE_FL_ERR_PENDING)) {
 		oc->flags |= CF_WRITE_EVENT;

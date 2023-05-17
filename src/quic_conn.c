@@ -217,7 +217,7 @@ DECLARE_STATIC_POOL(pool_head_quic_conn_ctx,
                     "quic_conn_ctx", sizeof(struct ssl_sock_ctx));
 DECLARE_STATIC_POOL(pool_head_quic_conn, "quic_conn", sizeof(struct quic_conn));
 DECLARE_POOL(pool_head_quic_connection_id,
-             "quic_connnection_id", sizeof(struct quic_connection_id));
+             "quic_connection_id", sizeof(struct quic_connection_id));
 DECLARE_POOL(pool_head_quic_dgram, "quic_dgram", sizeof(struct quic_dgram));
 DECLARE_POOL(pool_head_quic_rx_packet, "quic_rx_packet", sizeof(struct quic_rx_packet));
 DECLARE_POOL(pool_head_quic_tx_packet, "quic_tx_packet", sizeof(struct quic_tx_packet));
@@ -814,6 +814,9 @@ void qc_kill_conn(struct quic_conn *qc)
 	TRACE_PROTO("killing the connection", QUIC_EV_CONN_KILL, qc);
 	qc->flags |= QUIC_FL_CONN_TO_KILL;
 	task_wakeup(qc->idle_timer_task, TASK_WOKEN_OTHER);
+
+	qc_notify_err(qc);
+
 	TRACE_LEAVE(QUIC_EV_CONN_KILL, qc);
 }
 
@@ -948,7 +951,7 @@ static int quic_tls_key_update(struct quic_conn *qc)
 	}
 
 	if (!quic_tls_rx_ctx_init(&nxt_rx->ctx, tls_ctx->rx.aead, nxt_rx->key)) {
-		TRACE_ERROR("could not initial RX TLS cipher context", QUIC_EV_CONN_KP, qc);
+		TRACE_ERROR("could not initialize RX TLS cipher context", QUIC_EV_CONN_KP, qc);
 		goto leave;
 	}
 
@@ -957,8 +960,8 @@ static int quic_tls_key_update(struct quic_conn *qc)
 		nxt_tx->ctx = NULL;
 	}
 
-	if (!quic_tls_rx_ctx_init(&nxt_tx->ctx, tls_ctx->tx.aead, nxt_tx->key)) {
-		TRACE_ERROR("could not initial RX TLS cipher context", QUIC_EV_CONN_KP, qc);
+	if (!quic_tls_tx_ctx_init(&nxt_tx->ctx, tls_ctx->tx.aead, nxt_tx->key)) {
+		TRACE_ERROR("could not initialize TX TLS cipher context", QUIC_EV_CONN_KP, qc);
 		goto leave;
 	}
 
@@ -1286,6 +1289,7 @@ void quic_set_connection_close(struct quic_conn *qc, const struct quic_err err)
 	qc->flags |= QUIC_FL_CONN_IMMEDIATE_CLOSE;
 	qc->err.code = err.code;
 	qc->err.app  = err.app;
+
  leave:
 	TRACE_LEAVE(QUIC_EV_CONN_CLOSE, qc);
 }
@@ -1972,6 +1976,7 @@ static inline int qc_requeue_nacked_pkt_tx_frms(struct quic_conn *qc,
 			if (++frm->loss_count >= global.tune.quic_max_frame_loss) {
 				TRACE_ERROR("retransmission limit reached, closing the connection", QUIC_EV_CONN_PRSAFRM, qc);
 				quic_set_connection_close(qc, quic_err_transport(QC_ERR_INTERNAL_ERROR));
+				qc_notify_err(qc);
 				close = 1;
 			}
 
@@ -2055,6 +2060,12 @@ static void qc_treat_ack_of_ack(struct quic_conn *qc,
 			eb64_insert(&arngs->root, ar);
 			break;
 		}
+
+		/* Do not empty the tree: the first ACK range contains the
+		 * largest acknowledged packet number.
+		 */
+		if (arngs->sz == 1)
+			break;
 
 		eb64_delete(ar);
 		pool_free(pool_head_quic_arng, ar_node);
@@ -2970,6 +2981,7 @@ static int qc_handle_crypto_frm(struct quic_conn *qc,
 		if (ncb_ret == NCB_RET_DATA_REJ) {
 			TRACE_ERROR("overlapping data rejected", QUIC_EV_CONN_PRSHPKT, qc);
 			quic_set_connection_close(qc, quic_err_transport(QC_ERR_PROTOCOL_VIOLATION));
+			qc_notify_err(qc);
 		}
 		else if (ncb_ret == NCB_RET_GAP_SIZE) {
 			TRACE_ERROR("cannot bufferize frame due to gap size limit",
@@ -3068,6 +3080,7 @@ static int qc_handle_retire_connection_id_frm(struct quic_conn *qc,
 	return ret;
  protocol_violation:
 	quic_set_connection_close(qc, quic_err_transport(QC_ERR_PROTOCOL_VIOLATION));
+	qc_notify_err(qc);
 	goto leave;
 }
 
@@ -3291,7 +3304,7 @@ static int qc_parse_pkt_frms(struct quic_conn *qc, struct quic_rx_packet *pkt,
 				qc->flags |= QUIC_FL_CONN_DRAINING|QUIC_FL_CONN_IMMEDIATE_CLOSE;
 				qc_detach_th_ctx_list(qc, 1);
 				qc_idle_timer_do_rearm(qc, 0);
-				qc_notify_close(qc);
+				qc_notify_err(qc);
 			}
 			break;
 		case QUIC_FT_HANDSHAKE_DONE:
@@ -3879,7 +3892,6 @@ int qc_send_ppkts(struct buffer *buf, struct ssl_sock_ctx *ctx)
 			    (pkt->flags & QUIC_FL_TX_PACKET_CC)) {
 				qc->flags |= QUIC_FL_CONN_CLOSING;
 				qc_detach_th_ctx_list(qc, 1);
-				qc_notify_close(qc);
 
 				/* RFC 9000 10.2. Immediate Close:
 				 * The closing and draining connection states exist to ensure
@@ -4804,6 +4816,12 @@ int qc_send_mux(struct quic_conn *qc, struct list *frms)
 
 	TRACE_ENTER(QUIC_EV_CONN_TXPKT, qc);
 	BUG_ON(qc->mux_state != QC_MUX_READY); /* Only MUX can uses this function so it must be ready. */
+
+	if (qc->conn->flags & CO_FL_SOCK_WR_SH) {
+		qc->conn->flags |= CO_FL_ERROR | CO_FL_SOCK_RD_SH;
+		TRACE_DEVEL("connection on error", QUIC_EV_CONN_TXPKT, qc);
+		return 0;
+	}
 
 	/* Try to send post handshake frames first unless on 0-RTT. */
 	if ((qc->flags & QUIC_FL_CONN_NEED_POST_HANDSHAKE_FRMS) &&
@@ -5897,7 +5915,7 @@ struct task *qc_idle_timer_task(struct task *t, void *ctx, unsigned int state)
 	/* Notify the MUX before settings QUIC_FL_CONN_EXP_TIMER or the MUX
 	 * might free the quic-conn too early via quic_close().
 	 */
-	qc_notify_close(qc);
+	qc_notify_err(qc);
 
 	/* If the MUX is still alive, keep the quic-conn. The MUX is
 	 * responsible to call quic_close to release it.
@@ -6131,7 +6149,7 @@ static inline const struct quic_version *qc_supported_version(uint32_t version)
 	return NULL;
 }
 
-/* Parse a QUIC packet header starting at <pos> postion without exceeding <end>.
+/* Parse a QUIC packet header starting at <pos> position without exceeding <end>.
  * Version and type are stored in <pkt> packet instance. Type is set to unknown
  * on two occasions : for unsupported version, in this case version field is
  * set to NULL; for Version Negotiation packet with version number set to 0.
@@ -8373,7 +8391,7 @@ int qc_check_dcid(struct quic_conn *qc, unsigned char *dcid, size_t dcid_len)
 	return 0;
 }
 
-/* Retrieve the DCID from a QUIC datagram or packet at <pos> postition,
+/* Retrieve the DCID from a QUIC datagram or packet at <pos> position,
  * <end> being at one byte past the end of this datagram.
  * Returns 1 if succeeded, 0 if not.
  */
@@ -8414,25 +8432,26 @@ int quic_get_dgram_dcid(unsigned char *pos, const unsigned char *end,
 	goto leave;
 }
 
-/* Notify the MUX layer if alive about an imminent close of <qc>. */
-void qc_notify_close(struct quic_conn *qc)
+/* Notify upper layer of a fatal error which forces to close the connection. */
+void qc_notify_err(struct quic_conn *qc)
 {
 	TRACE_ENTER(QUIC_EV_CONN_CLOSE, qc);
 
-	if (qc->flags & QUIC_FL_CONN_NOTIFY_CLOSE)
-		goto leave;
+	if (qc->mux_state == QC_MUX_READY) {
+		TRACE_STATE("error notified to mux", QUIC_EV_CONN_CLOSE, qc);
 
-	qc->flags |= QUIC_FL_CONN_NOTIFY_CLOSE;
-	/* wake up the MUX */
-	if (qc->mux_state == QC_MUX_READY && qc->conn->mux->wake) {
-		TRACE_STATE("connection closure notidfied to mux",
-		            QUIC_FL_CONN_NOTIFY_CLOSE, qc);
-		qc->conn->mux->wake(qc->conn);
+		/* Mark socket as closed. */
+		qc->conn->flags |= CO_FL_ERROR | CO_FL_SOCK_RD_SH | CO_FL_SOCK_WR_SH;
+
+		/* TODO quic-conn layer must stay active until MUX is released.
+		 * Thus, we have to wake up directly to ensure upper stream
+		 * layer will be notified of the error. If a proper separation
+		 * is made between MUX and quic-conn layer, wake up could be
+		 * conducted only with qc.subs.
+		 */
+		tasklet_wakeup(qc->qcc->wait_event.tasklet);
 	}
-	else
-		TRACE_STATE("connection closure not notidfied to mux",
-		            QUIC_FL_CONN_NOTIFY_CLOSE, qc);
- leave:
+
 	TRACE_LEAVE(QUIC_EV_CONN_CLOSE, qc);
 }
 
@@ -8595,12 +8614,18 @@ void qc_finalize_affinity_rebind(struct quic_conn *qc)
 	TRACE_LEAVE(QUIC_EV_CONN_SET_AFFINITY, qc);
 }
 
+enum quic_dump_format {
+	QUIC_DUMP_FMT_ONELINE,
+	QUIC_DUMP_FMT_FULL,
+};
+
 /* appctx context used by "show quic" command */
 struct show_quic_ctx {
 	unsigned int epoch;
 	struct bref bref; /* back-reference to the quic-conn being dumped */
 	unsigned int thr;
 	int flags;
+	enum quic_dump_format format;
 };
 
 #define QC_CLI_FL_SHOW_ALL 0x1 /* show closing/draining connections */
@@ -8608,6 +8633,7 @@ struct show_quic_ctx {
 static int cli_parse_show_quic(char **args, char *payload, struct appctx *appctx, void *private)
 {
 	struct show_quic_ctx *ctx = applet_reserve_svcctx(appctx, sizeof(*ctx));
+	int argc = 2;
 
 	if (!cli_has_level(appctx, ACCESS_LVL_OPER))
 		return 1;
@@ -8615,13 +8641,184 @@ static int cli_parse_show_quic(char **args, char *payload, struct appctx *appctx
 	ctx->epoch = _HA_ATOMIC_FETCH_ADD(&qc_epoch, 1);
 	ctx->thr = 0;
 	ctx->flags = 0;
+	ctx->format = QUIC_DUMP_FMT_ONELINE;
 
-	if (*args[2] && strcmp(args[2], "all") == 0)
-		ctx->flags |= QC_CLI_FL_SHOW_ALL;
+	if (strcmp(args[argc], "oneline") == 0) {
+		/* format already used as default value */
+		++argc;
+	}
+	else if (strcmp(args[argc], "full") == 0) {
+		ctx->format = QUIC_DUMP_FMT_FULL;
+		++argc;
+	}
+
+	while (*args[argc]) {
+		if (strcmp(args[argc], "all") == 0)
+			ctx->flags |= QC_CLI_FL_SHOW_ALL;
+
+		++argc;
+	}
 
 	LIST_INIT(&ctx->bref.users);
 
 	return 0;
+}
+
+/* Dump for "show quic" with "oneline" format. */
+static void dump_quic_oneline(struct show_quic_ctx *ctx, struct quic_conn *qc)
+{
+	char bufaddr[INET6_ADDRSTRLEN], bufport[6];
+	unsigned char cid_len;
+
+	chunk_appendf(&trash, "%p[%02u]/%-.12s ", qc, ctx->thr,
+	              qc->li->bind_conf->frontend->id);
+
+	/* State */
+	if (qc->flags & QUIC_FL_CONN_CLOSING)
+		chunk_appendf(&trash, "CLOSE   ");
+	else if (qc->flags & QUIC_FL_CONN_DRAINING)
+		chunk_appendf(&trash, "DRAIN   ");
+	else if (qc->state < QUIC_HS_ST_COMPLETE)
+		chunk_appendf(&trash, "HDSHK   ");
+	else
+		chunk_appendf(&trash, "ESTAB   ");
+
+	/* Bytes in flight / Lost packets */
+	chunk_appendf(&trash, "%9llu %6llu %6llu   ",
+	              (ullong)qc->path->in_flight,
+	              (ullong)qc->path->ifae_pkts,
+	              (ullong)qc->path->loss.nb_lost_pkt);
+
+	/* Socket */
+	if (qc->local_addr.ss_family == AF_INET ||
+	    qc->local_addr.ss_family == AF_INET6) {
+		addr_to_str(&qc->peer_addr, bufaddr, sizeof(bufaddr));
+		port_to_str(&qc->peer_addr, bufport, sizeof(bufport));
+		chunk_appendf(&trash, "%15s:%s ", bufaddr, bufport);
+
+		addr_to_str(&qc->local_addr, bufaddr, sizeof(bufaddr));
+		port_to_str(&qc->local_addr, bufport, sizeof(bufport));
+		chunk_appendf(&trash, "%15s:%s      ", bufaddr, bufport);
+	}
+
+	/* CIDs */
+	for (cid_len = 0; cid_len < qc->scid.len; ++cid_len)
+		chunk_appendf(&trash, "%02x", qc->scid.data[cid_len]);
+
+	chunk_appendf(&trash, " ");
+	for (cid_len = 0; cid_len < qc->dcid.len; ++cid_len)
+		chunk_appendf(&trash, "%02x", qc->dcid.data[cid_len]);
+
+	chunk_appendf(&trash, "\n");
+}
+
+/* Dump for "show quic" with "full" format. */
+static void dump_quic_full(struct show_quic_ctx *ctx, struct quic_conn *qc)
+{
+	struct quic_pktns *pktns;
+	struct eb64_node *node;
+	struct qc_stream_desc *stream;
+	char bufaddr[INET6_ADDRSTRLEN], bufport[6];
+	int expire, i;
+	unsigned char cid_len;
+
+	/* CIDs */
+	chunk_appendf(&trash, "* %p[%02u]: scid=", qc, ctx->thr);
+	for (cid_len = 0; cid_len < qc->scid.len; ++cid_len)
+		chunk_appendf(&trash, "%02x", qc->scid.data[cid_len]);
+	while (cid_len++ < 20)
+		chunk_appendf(&trash, "..");
+
+	chunk_appendf(&trash, " dcid=");
+	for (cid_len = 0; cid_len < qc->dcid.len; ++cid_len)
+		chunk_appendf(&trash, "%02x", qc->dcid.data[cid_len]);
+	while (cid_len++ < 20)
+		chunk_appendf(&trash, "..");
+
+	chunk_appendf(&trash, "\n");
+
+	chunk_appendf(&trash, "  loc. TPs:");
+	quic_transport_params_dump(&trash, qc, &qc->rx.params);
+	chunk_appendf(&trash, "\n");
+	chunk_appendf(&trash, "  rem. TPs:");
+	quic_transport_params_dump(&trash, qc, &qc->tx.params);
+	chunk_appendf(&trash, "\n");
+
+	/* Connection state */
+	if (qc->flags & QUIC_FL_CONN_CLOSING)
+		chunk_appendf(&trash, "  st=closing          ");
+	else if (qc->flags & QUIC_FL_CONN_DRAINING)
+		chunk_appendf(&trash, "  st=draining         ");
+	else if (qc->state < QUIC_HS_ST_CONFIRMED)
+		chunk_appendf(&trash, "  st=handshake        ");
+	else
+		chunk_appendf(&trash, "  st=opened           ");
+
+	if (qc->mux_state == QC_MUX_NULL)
+		chunk_appendf(&trash, "mux=null                                      ");
+	else if (qc->mux_state == QC_MUX_READY)
+		chunk_appendf(&trash, "mux=ready                                     ");
+	else
+		chunk_appendf(&trash, "mux=released                                  ");
+
+	expire = qc->idle_expire;
+	chunk_appendf(&trash, "expire=%02ds ",
+	              TICKS_TO_MS(tick_remain(now_ms, expire)) / 1000);
+
+	chunk_appendf(&trash, "\n");
+
+	/* Socket */
+	chunk_appendf(&trash, "  fd=%d", qc->fd);
+	if (qc->local_addr.ss_family == AF_INET ||
+	    qc->local_addr.ss_family == AF_INET6) {
+		addr_to_str(&qc->local_addr, bufaddr, sizeof(bufaddr));
+		port_to_str(&qc->local_addr, bufport, sizeof(bufport));
+		chunk_appendf(&trash, "               from=%s:%s", bufaddr, bufport);
+
+		addr_to_str(&qc->peer_addr, bufaddr, sizeof(bufaddr));
+		port_to_str(&qc->peer_addr, bufport, sizeof(bufport));
+		chunk_appendf(&trash, " to=%s:%s", bufaddr, bufport);
+	}
+
+	chunk_appendf(&trash, "\n");
+
+	/* Packet number spaces information */
+	pktns = &qc->pktns[QUIC_TLS_PKTNS_INITIAL];
+	chunk_appendf(&trash, "  [initl]             rx.ackrng=%-6zu tx.inflight=%-6zu",
+	              pktns->rx.arngs.sz, pktns->tx.in_flight);
+	pktns = &qc->pktns[QUIC_TLS_PKTNS_HANDSHAKE];
+	chunk_appendf(&trash, "           [hndshk] rx.ackrng=%-6zu tx.inflight=%-6zu\n",
+	              pktns->rx.arngs.sz, pktns->tx.in_flight);
+	pktns = &qc->pktns[QUIC_TLS_PKTNS_01RTT];
+	chunk_appendf(&trash, "  [01rtt]             rx.ackrng=%-6zu tx.inflight=%-6zu\n",
+	              pktns->rx.arngs.sz, pktns->tx.in_flight);
+
+	chunk_appendf(&trash, "  srtt=%-4u rttvar=%-4u rttmin=%-4u ptoc=%-4u cwnd=%-6llu"
+	                      " mcwnd=%-6llu lostpkts=%-6llu\n",
+	              qc->path->loss.srtt >> 3, qc->path->loss.rtt_var >> 2,
+	              qc->path->loss.rtt_min, qc->path->loss.pto_count, (ullong)qc->path->cwnd,
+	              (ullong)qc->path->mcwnd, (ullong)qc->path->loss.nb_lost_pkt);
+
+
+	/* Streams */
+	node = eb64_first(&qc->streams_by_id);
+	i = 0;
+	while (node) {
+		stream = eb64_entry(node, struct qc_stream_desc, by_id);
+		node = eb64_next(node);
+
+		chunk_appendf(&trash, "  | stream=%-8llu", (unsigned long long)stream->by_id.key);
+		chunk_appendf(&trash, " off=%-8llu ack=%-8llu",
+		              (unsigned long long)stream->buf_offset,
+		              (unsigned long long)stream->ack_offset);
+
+		if (!(++i % 3)) {
+			chunk_appendf(&trash, "\n");
+			i = 0;
+		}
+	}
+
+	chunk_appendf(&trash, "\n");
 }
 
 static int cli_io_handler_dump_quic(struct appctx *appctx)
@@ -8629,12 +8826,6 @@ static int cli_io_handler_dump_quic(struct appctx *appctx)
 	struct show_quic_ctx *ctx = appctx->svcctx;
 	struct stconn *sc = appctx_sc(appctx);
 	struct quic_conn *qc;
-	struct quic_pktns *pktns;
-	struct eb64_node *node;
-	struct qc_stream_desc *stream;
-	char bufaddr[INET6_ADDRSTRLEN], bufport[6];
-	int expire;
-	unsigned char cid_len;
 
 	thread_isolate();
 
@@ -8660,11 +8851,19 @@ static int cli_io_handler_dump_quic(struct appctx *appctx)
 	else if (!ctx->bref.ref) {
 		/* First invocation. */
 		ctx->bref.ref = ha_thread_ctx[ctx->thr].quic_conns.n;
+
+		/* Print legend for oneline format. */
+		if (ctx->format == QUIC_DUMP_FMT_ONELINE) {
+			chunk_appendf(&trash, "# conn/frontend       state   "
+				      "in_flight infl_p lost_p                    "
+				      "from                    to      "
+				      "local & remote CIDs\n");
+			applet_putchk(appctx, &trash);
+		}
 	}
 
 	while (1) {
 		int done = 0;
-		int i;
 
 		if (ctx->bref.ref == &ha_thread_ctx[ctx->thr].quic_conns) {
 			/* If closing connections requested through "all", move
@@ -8700,103 +8899,14 @@ static int cli_io_handler_dump_quic(struct appctx *appctx)
 			continue;
 		}
 
-		/* CIDs */
-		chunk_appendf(&trash, "* %p[%02u]: scid=", qc, ctx->thr);
-		for (cid_len = 0; cid_len < qc->scid.len; ++cid_len)
-			chunk_appendf(&trash, "%02x", qc->scid.data[cid_len]);
-		while (cid_len++ < 20)
-			chunk_appendf(&trash, "..");
-
-		chunk_appendf(&trash, " dcid=");
-		for (cid_len = 0; cid_len < qc->dcid.len; ++cid_len)
-			chunk_appendf(&trash, "%02x", qc->dcid.data[cid_len]);
-		while (cid_len++ < 20)
-			chunk_appendf(&trash, "..");
-
-		chunk_appendf(&trash, "\n");
-
-		chunk_appendf(&trash, "  loc. TPs:");
-		quic_transport_params_dump(&trash, qc, &qc->rx.params);
-		chunk_appendf(&trash, "\n");
-		chunk_appendf(&trash, "  rem. TPs:");
-		quic_transport_params_dump(&trash, qc, &qc->tx.params);
-		chunk_appendf(&trash, "\n");
-
-		/* Connection state */
-		if (qc->flags & QUIC_FL_CONN_CLOSING)
-			chunk_appendf(&trash, "  st=closing          ");
-		else if (qc->flags & QUIC_FL_CONN_DRAINING)
-			chunk_appendf(&trash, "  st=draining         ");
-		else if (qc->state < QUIC_HS_ST_CONFIRMED)
-			chunk_appendf(&trash, "  st=handshake        ");
-		else
-			chunk_appendf(&trash, "  st=opened           ");
-
-		if (qc->mux_state == QC_MUX_NULL)
-			chunk_appendf(&trash, "mux=null                                      ");
-		else if (qc->mux_state == QC_MUX_READY)
-			chunk_appendf(&trash, "mux=ready                                     ");
-		else
-			chunk_appendf(&trash, "mux=released                                  ");
-
-		expire = qc->idle_expire;
-		chunk_appendf(&trash, "expire=%02ds ",
-		              TICKS_TO_MS(tick_remain(now_ms, expire)) / 1000);
-
-		chunk_appendf(&trash, "\n");
-
-		/* Socket */
-		chunk_appendf(&trash, "  fd=%d", qc->fd);
-		if (qc->local_addr.ss_family == AF_INET ||
-		    qc->local_addr.ss_family == AF_INET6) {
-			addr_to_str(&qc->local_addr, bufaddr, sizeof(bufaddr));
-			port_to_str(&qc->local_addr, bufport, sizeof(bufport));
-			chunk_appendf(&trash, "               from=%s:%s", bufaddr, bufport);
-
-			addr_to_str(&qc->peer_addr, bufaddr, sizeof(bufaddr));
-			port_to_str(&qc->peer_addr, bufport, sizeof(bufport));
-			chunk_appendf(&trash, " to=%s:%s", bufaddr, bufport);
+		switch (ctx->format) {
+		case QUIC_DUMP_FMT_FULL:
+			dump_quic_full(ctx, qc);
+			break;
+		case QUIC_DUMP_FMT_ONELINE:
+			dump_quic_oneline(ctx, qc);
+			break;
 		}
-
-		chunk_appendf(&trash, "\n");
-
-		/* Packet number spaces information */
-		pktns = &qc->pktns[QUIC_TLS_PKTNS_INITIAL];
-		chunk_appendf(&trash, "  [initl]             rx.ackrng=%-6zu tx.inflight=%-6zu",
-		              pktns->rx.arngs.sz, pktns->tx.in_flight);
-		pktns = &qc->pktns[QUIC_TLS_PKTNS_HANDSHAKE];
-		chunk_appendf(&trash, "           [hndshk] rx.ackrng=%-6zu tx.inflight=%-6zu\n",
-		              pktns->rx.arngs.sz, pktns->tx.in_flight);
-		pktns = &qc->pktns[QUIC_TLS_PKTNS_01RTT];
-		chunk_appendf(&trash, "  [01rtt]             rx.ackrng=%-6zu tx.inflight=%-6zu\n",
-		              pktns->rx.arngs.sz, pktns->tx.in_flight);
-
-		chunk_appendf(&trash, "  srtt=%-4u rttvar=%-4u rttmin=%-4u ptoc=%-4u cwnd=%-6llu"
-		                      " mcwnd=%-6llu lostpkts=%-6llu\n",
-		              qc->path->loss.srtt >> 3, qc->path->loss.rtt_var >> 2,
-		              qc->path->loss.rtt_min, qc->path->loss.pto_count, (ullong)qc->path->cwnd,
-		              (ullong)qc->path->mcwnd, (ullong)qc->path->loss.nb_lost_pkt);
-
-
-		/* Streams */
-		node = eb64_first(&qc->streams_by_id);
-		i = 0;
-		while (node) {
-			stream = eb64_entry(node, struct qc_stream_desc, by_id);
-			node = eb64_next(node);
-
-			chunk_appendf(&trash, "  | stream=%-8llu", (unsigned long long)stream->by_id.key);
-			chunk_appendf(&trash, " off=%-8llu ack=%-8llu",
-			              (unsigned long long)stream->buf_offset,
-			              (unsigned long long)stream->ack_offset);
-
-			if (!(++i % 3)) {
-				chunk_appendf(&trash, "\n");
-				i = 0;
-			}
-		}
-
-		chunk_appendf(&trash, "\n");
 
 		if (applet_putchk(appctx, &trash) == -1) {
 			/* Register show_quic_ctx to quic_conn instance. */

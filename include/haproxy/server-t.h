@@ -441,6 +441,9 @@ struct event_hdl_cb_data_server {
 	 *   EVENT_HDL_SUB_SERVER_DEL
 	 *   EVENT_HDL_SUB_SERVER_UP
 	 *   EVENT_HDL_SUB_SERVER_DOWN
+	 *   EVENT_HDL_SUB_SERVER_STATE
+	 *   EVENT_HDL_SUB_SERVER_ADMIN
+	 *   EVENT_HDL_SUB_SERVER_CHECK
 	 */
 	struct {
 		/* safe data can be safely used from both
@@ -465,6 +468,98 @@ struct event_hdl_cb_data_server {
 		/* lock hints */
 		uint8_t thread_isolate;	/* 1 = thread_isolate is on, no locking required */
 		uint8_t srv_lock;       /* 1 = srv lock is held */
+	} unsafe;
+};
+
+/* check result snapshot provided through some event_hdl server events */
+struct event_hdl_cb_data_server_checkres {
+	uint8_t agent;                /* 1 = agent check, 0 = health check */
+	enum chk_result result;       /* failed, passed, condpass (CHK_RES_*) */
+	long duration;                /* total check duration in ms */
+	struct {
+		short status;         /* check status as in check->status */
+		short code;           /* provided with some check statuses */
+	} reason;
+	struct {
+		int cur;              /* dynamic (= check->health) */
+		int rise, fall;       /* config dependant */
+	} health;                     /* check's health, see check-t.h */
+};
+
+/* data provided to EVENT_HDL_SUB_SERVER_STATE handlers through
+ * event_hdl facility
+ *
+ * Note that this may be casted to regular event_hdl_cb_data_server if
+ * you don't care about state related optional info
+ */
+struct event_hdl_cb_data_server_state {
+	/* provided by:
+	 *   EVENT_HDL_SUB_SERVER_STATE
+	 */
+	struct event_hdl_cb_data_server server; /* must be at the beginning */
+	struct {
+		uint8_t type; /* 0 = operational, 1 = administrative */
+		enum srv_state old_state, new_state; /* updated by both operational and admin changes */
+		uint32_t requeued; /* requeued connections due to server state change */
+		union {
+			/* state change cause:
+			 *
+			 * look for op_st_chg for operational state change,
+			 * and adm_st_chg for administrative state change
+			 */
+			struct {
+				enum srv_op_st_chg_cause cause;
+				union {
+					/* check result is provided with
+					 * cause == SRV_OP_STCHGC_HEALTH or cause == SRV_OP_STCHGC_AGENT
+					 */
+					struct event_hdl_cb_data_server_checkres check;
+				};
+			} op_st_chg;
+			struct {
+				enum srv_adm_st_chg_cause cause;
+			} adm_st_chg;
+		};
+	} safe;
+	/* no unsafe data */
+};
+
+/* data provided to EVENT_HDL_SUB_SERVER_ADMIN handlers through
+ * event_hdl facility
+ *
+ * Note that this may be casted to regular event_hdl_cb_data_server if
+ * you don't care about admin related optional info
+ */
+struct event_hdl_cb_data_server_admin {
+	/* provided by:
+	 *   EVENT_HDL_SUB_SERVER_ADMIN
+	 */
+	struct event_hdl_cb_data_server server; /* must be at the beginning */
+	struct {
+		enum srv_admin old_admin, new_admin;
+		uint32_t requeued; /* requeued connections due to server admin change */
+		/* admin change cause */
+		enum srv_adm_st_chg_cause cause;
+	} safe;
+	/* no unsafe data */
+};
+
+/* data provided to EVENT_HDL_SUB_SERVER_CHECK handlers through
+ * event_hdl facility
+ *
+ * Note that this may be casted to regular event_hdl_cb_data_server if
+ * you don't care about check related optional info
+ */
+struct event_hdl_cb_data_server_check {
+	/* provided by:
+	 *   EVENT_HDL_SUB_SERVER_CHECK
+	 */
+	struct event_hdl_cb_data_server server;                 /* must be at the beginning */
+	struct {
+		struct event_hdl_cb_data_server_checkres res;   /* check result snapshot */
+	} safe;
+	struct {
+		struct check *ptr;                              /* check ptr */
 	} unsafe;
 };
 

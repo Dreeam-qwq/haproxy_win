@@ -141,10 +141,7 @@ spoe_release_message(struct spoe_message *msg)
 		prune_acl(acl);
 		free(acl);
 	}
-	if (msg->cond) {
-		prune_acl_cond(msg->cond);
-		free(msg->cond);
-	}
+	free_acl_cond(msg->cond);
 	free(msg);
 }
 
@@ -1147,9 +1144,9 @@ spoe_send_frame(struct appctx *appctx, char *buf, size_t framesz)
 	memcpy(buf, (char *)&netint, 4);
 	ret = applet_putblk(appctx, buf, framesz+4);
 	if (ret <= 0) {
-		if ((ret == -3 && b_is_null(&sc_ic(sc)->buf)) || ret == -1) {
+		if (ret == -3 && b_is_null(&sc_ic(sc)->buf)) {
 			/* WT: is this still needed for the case ret==-3 ? */
-			sc_need_room(sc);
+			sc_need_room(sc, 0);
 			return 1; /* retry */
 		}
 		SPOE_APPCTX(appctx)->status_code = SPOE_FRM_ERR_IO;
@@ -2986,6 +2983,14 @@ spoe_sig_stop(struct sig_handler *sh)
 	p = proxies_list;
 	while (p) {
 		struct flt_conf *fconf;
+
+		/* SPOE filter are not initialized for disabled proxoes. Move to
+		 * the next one
+		 */
+		if (p->flags & PR_FL_DISABLED) {
+			p = p->next;
+			continue;
+		}
 
 		list_for_each_entry(fconf, &p->filter_configs, list) {
 			struct spoe_config *conf;

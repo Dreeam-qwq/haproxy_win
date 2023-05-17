@@ -217,7 +217,7 @@ Core class
 
 .. js:attribute:: core.proxies
 
-  **context**: task, action, sample-fetch, converter
+  **context**: init, task, action, sample-fetch, converter
 
   This attribute is a table of declared proxies (frontend and backends). Each
   proxy give an access to his list of listeners and servers. The table is
@@ -232,7 +232,7 @@ Core class
 
 .. js:attribute:: core.backends
 
-  **context**: task, action, sample-fetch, converter
+  **context**: init, task, action, sample-fetch, converter
 
   This attribute is a table of declared proxies with backend capability. Each
   proxy give an access to his list of listeners and servers. The table is
@@ -243,7 +243,7 @@ Core class
 
 .. js:attribute:: core.frontends
 
-  **context**: task, action, sample-fetch, converter
+  **context**: init, task, action, sample-fetch, converter
 
   This attribute is a table of declared proxies with frontend capability. Each
   proxy give an access to his list of listeners and servers. The table is
@@ -758,6 +758,9 @@ Core class
   It takes up to 4 optional arguments (provided when registering), and no
   output is expected.
 
+  See also :js:func:`core.queue` to dynamically pass data between main context
+  and tasks or even between tasks.
+
 .. js:function:: core.register_cli([path], usage, func)
 
   **context**: body
@@ -848,6 +851,14 @@ Core class
   This function returns a new concat object.
 
   :returns: A :ref:`concat_class` object.
+
+.. js:function:: core.queue()
+
+  **context**: body, init, task, event, action, sample-fetch, converter
+
+  This function returns a new queue object.
+
+  :returns: A :ref:`queue_class` object.
 
 .. js:function:: core.done(data)
 
@@ -946,10 +957,18 @@ Core class
     * **SERVER_DEL**: when a server is removed
     * **SERVER_DOWN**: when a server state goes from UP to DOWN
     * **SERVER_UP**: when a server state goes from DOWN to UP
+    * **SERVER_STATE**: when a server state changes
+    * **SERVER_ADMIN**: when a server administrative state changes
+    * **SERVER_CHECK**: when a server's check status change is reported.
+      Be careful when subscribing to this type since many events might be
+      generated.
 
    .. Note::
-     You may also use **SERVER** in **event_types** to subscribe to all server
-     events types at once.
+     Use **SERVER** in **event_types** to subscribe to all server events types
+     at once. Note that this should only be used for testing purposes since a
+     single event source could result in multiple events types being generated.
+     (e.g.: SERVER_STATE will always be generated for each SERVER_DOWN or
+     SERVER_UP)
 
   The prototype of the Lua function used as argument is:
 
@@ -1001,6 +1020,19 @@ Core class
     :js:func:`core.register_task()` from within your callback function to
     perform the heavy job in a dedicated task and allow remaining events to be
     processed more quickly.
+
+.. js:function:: core.disable_legacy_mailers()
+
+  **LEGACY**
+
+  **context**: body, init
+
+  Disable the sending of email alerts through the legacy email sending
+  function when mailers are used in the configuration.
+
+  Use this when sending email alerts directly from lua.
+
+  :see: :js:func:`Proxy.get_mailers()`
 
 .. _proxy_class:
 
@@ -1097,6 +1129,24 @@ Proxy class
    proxy.
   :returns: a string "tcp", "http", "health" or "unknown"
 
+.. js:function:: Proxy.get_srv_act(px)
+
+  Returns the number of current active servers for the current proxy that are
+  eligible for LB.
+
+  :param class_proxy px: A :ref:`proxy_class` which indicates the manipulated
+   proxy.
+  :returns: an integer
+
+.. js:function:: Proxy.get_srv_bck(px)
+
+  Returns the number backup servers for the current proxy that are eligible
+  for LB.
+
+  :param class_proxy px: A :ref:`proxy_class` which indicates the manipulated
+   proxy.
+  :returns: an integer
+
 .. js:function:: Proxy.get_stats(px)
 
   Returns a table containing the proxy statistics. The statistics returned are
@@ -1105,6 +1155,63 @@ Proxy class
   :param class_proxy px: A :ref:`proxy_class` which indicates the manipulated
    proxy.
   :returns: a key/value table containing stats
+
+.. js:function:: Proxy.get_mailers(px)
+
+  **LEGACY**
+
+  Returns a table containing mailers config for the current proxy or nil
+  if mailers are not available for the proxy.
+
+  :param class_proxy px: A :ref:`proxy_class` which indicates the manipulated
+   proxy.
+  :returns: a :ref:`proxy_mailers_class` containing proxy mailers config
+
+.. _proxy_mailers_class:
+
+ProxyMailers class
+==================
+
+**LEGACY**
+
+.. js:class:: ProxyMailers
+
+  This class provides mailers config for a given proxy.
+
+  If sending emails directly from lua, please consider
+  :js:func:`core.disable_legacy_mailers()` to disable the email sending from
+  haproxy. (Or email alerts will be sent twice...)
+
+.. js:attribute:: ProxyMailers.track_server_health
+
+  Boolean set to true if the option "log-health-checks" is configured on
+  the proxy, meaning that all server checks event should trigger email alerts.
+
+.. js:attribute:: ProxyMailers.log_level
+
+  An integer, the maximum log level that triggers email alerts. It is a number
+  between 0 and 7 as defined by option "email-alert level".
+
+.. js:attribute:: ProxyMailers.mailservers
+
+  An array containing the list of mail servers that should receive email alerts.
+  Each array entry is a name:desc pair where desc represents the full server
+  address (including port) as described in haproxy's configuration file.
+
+.. js:attribute:: ProxyMailers.smtp_hostname
+
+  A string containing the hostname to use for the SMTP transaction.
+  (option "email-alert myhostname")
+
+.. js:attribute:: ProxyMailers.smtp_from
+
+  A string containing the "MAIL FROM" address to use for the SMTP transaction.
+  (option "email-alert from")
+
+.. js:attribute:: ProxyMailers.smtp_to
+
+  A string containing the "RCPT TO" address to use for the SMTP transaction.
+  (option "email-alert to")
 
 .. _server_class:
 
@@ -1157,6 +1264,38 @@ Server class
   :param class_server sv: A :ref:`server_class` which indicates the manipulated
    server.
   :returns: a boolean
+
+.. js:function:: Server.is_backup(sv)
+
+  Return true if the server is a backup server
+
+  :param class_server sv: A :ref:`server_class` which indicates the manipulated
+   server.
+  :returns: a boolean
+
+.. js:function:: Server.is_dynamic(sv)
+
+  Return true if the server was instantiated at runtime (e.g.: from the cli)
+
+  :param class_server sv: A :ref:`server_class` which indicates the manipulated
+   server.
+  :returns: a boolean
+
+.. js:function:: Server.get_cur_sess(sv)
+
+  Return the number of currently active sessions on the server
+
+  :param class_server sv: A :ref:`server_class` which indicates the manipulated
+   server.
+  :returns: an integer
+
+.. js:function:: Server.get_pend_conn(sv)
+
+  Return the number of pending connections to the server
+
+  :param class_server sv: A :ref:`server_class` which indicates the manipulated
+   server.
+  :returns: an integer
 
 .. js:function:: Server.set_maxconn(sv, weight)
 
@@ -1216,6 +1355,14 @@ Server class
   :param class_server sv: A :ref:`server_class` which indicates the manipulated
    server.
   :returns: a key/value table containing stats
+
+.. js:function:: Server.get_proxy(sv)
+
+  Returns the parent proxy to which the server belongs.
+
+  :param class_server sv: A :ref:`server_class` which indicates the manipulated
+   server.
+  :returns: a :ref:`proxy_class` or nil if not available
 
 .. js:function:: Server.shut_sess(sv)
 
@@ -1321,6 +1468,24 @@ Server class
   :param class_server sv: A :ref:`server_class` which indicates the manipulated
    server.
 
+.. js:function:: Server.tracking(sv)
+
+  Check if the current server is tracking another server.
+
+  :param class_server sv: A :ref:`server_class` which indicates the manipulated
+   server.
+  :returns: A :ref:`server_class` which indicates the tracked server or nil if
+   the server doesn't track another one.
+
+.. js:function:: Server.get_trackers(sv)
+
+  Check if the current server is being tracked by other servers.
+
+  :param class_server sv: A :ref:`server_class` which indicates the manipulated
+   server.
+  :returns: An array of :ref:`server_class` which indicates the tracking
+   servers (might be empty)
+
 .. js:function:: Server.event_sub(sv, event_types, func)
 
   Register a function that will be called on specific server events.
@@ -1411,6 +1576,12 @@ EventSub class
 ServerEvent class
 =================
 
+.. js:class:: ServerEvent
+
+This class is provided with every **SERVER** events.
+
+See :js:func:`core.event_sub()` for more info.
+
 .. js:attribute:: ServerEvent.name
 
   Contains the name of the server.
@@ -1439,6 +1610,241 @@ ServerEvent class
      Not available if the server was removed in the meantime.
      (Will never be set for SERVER_DEL event since the server does not exist
      anymore)
+
+.. js:attribute:: ServerEvent.state
+
+  A :ref:`server_event_state_class`
+
+  .. Note::
+     Only available for SERVER_STATE event
+
+.. js:attribute:: ServerEvent.admin
+
+  A :ref:`server_event_admin_class`
+
+  .. Note::
+     Only available for SERVER_ADMIN event
+
+.. js:attribute:: ServerEvent.check
+
+  A :ref:`server_event_checkres_class`
+
+  .. Note::
+     Only available for SERVER_CHECK event
+
+.. _server_event_checkres_class:
+
+ServerEventCheckRes class
+=========================
+
+.. js:class:: ServerEventCheckRes
+
+This class describes the result of a server's check.
+
+.. js:attribute:: ServerEventCheckRes.result
+
+  Effective check result.
+
+  Check result is a string and will be set to one of the following values:
+    - "FAILED": the check failed
+    - "PASSED": the check succeeded
+    - "CONDPASS": the check conditionally passed
+
+.. js:attribute:: ServerEventCheckRes.agent
+
+  Boolean set to true if the check is an agent check.
+  Else it is a health check.
+
+.. js:attribute:: ServerEventCheckRes.duration
+
+  Check's duration in milliseconds
+
+.. js:attribute:: ServerEventCheckRes.reason
+
+  Check's status. An array containing three fields:
+    - **short**: a string representing check status short name
+    - **desc**: a string representing check status description
+    - **code**: an integer, this extra information is provided for checks
+      that went through the data analysis stage (>= layer 5)
+
+.. js:attribute:: ServerEventCheckRes.health
+
+  An array containing values about check's health (integers):
+    - **cur**: current health counter:
+       - 0 to (**rise** - 1) = BAD
+       - **rise** to (**rise** + **fall** - 1) = GOOD
+    - **rise**: server will be considered as operational after **rise**
+      consecutive successful checks
+    - **fall**: server will be considered as dead after **fall** consecutive
+      unsuccessful checks
+
+.. _server_event_state_class:
+
+ServerEventState class
+======================
+
+.. js:class:: ServerEventState
+
+This class contains additional info related to **SERVER_STATE** event.
+
+.. js:attribute:: ServerEventState.admin
+
+  Boolean set to true if the server state change is due to an administrative
+  change. Else it is an operational change.
+
+.. js:attribute:: ServerEventState.check
+
+  A :ref:`server_event_checkres_class`, provided if the state change is
+  due to a server check (must be an operational change).
+
+.. js:attribute:: ServerEventState.cause
+
+  Printable state change cause. Might be empty.
+
+.. js:attribute:: ServerEventState.new_state
+
+  New server state due to operational or admin change.
+
+  It is a string that can be any of the following values:
+    - "STOPPED": The server is down
+    - "STOPPING": The server is up but soft-stopping
+    - "STARTING": The server is warming up
+    - "RUNNING": The server is fully up
+
+.. js:attribute:: ServerEventState.old_state
+
+  Previous server state prior to the operational or admin change.
+
+  Can be any value described in **new_state**, but they should differ.
+
+.. js:attribute:: ServerEventState.requeued
+
+  Number of connections that were requeued due to the server state change.
+
+  For a server going DOWN: it is the number of pending server connections
+  that are requeued to the backend (such connections will be redispatched
+  to any server that is suitable according to the configured load balancing
+  algorithm).
+
+  For a server doing UP: it is the number of pending connections on the
+  backend that may be redispatched to the server according to the load
+  balancing algorithm that is in use.
+
+.. _server_event_admin_class:
+
+ServerEventAdmin class
+======================
+
+.. js:class:: ServerEventAdmin
+
+This class contains additional info related to **SERVER_ADMIN** event.
+
+.. js:attribute:: ServerEventAdmin.cause
+
+  Printable admin state change cause. Might be empty.
+
+.. js:attribute:: ServerEventAdmin.new_admin
+
+  New server admin state due to the admin change.
+
+  It is an array of string containing a composition of following values:
+    - "**MAINT**": server is in maintenance mode
+    - "FMAINT": server is in forced maintenance mode (MAINT is also set)
+    - "IMAINT": server is in inherited maintenance mode (MAINT is also set)
+    - "RMAINT": server is in resolve maintenance mode (MAINT is also set)
+    - "CMAINT": server is in config maintenance mode (MAINT is also set)
+    - "**DRAIN**": server is in drain mode
+    - "FDRAIN": server is in forced drain mode (DRAIN is also set)
+    - "IDRAIN": server is in inherited drain mode (DRAIN is also set)
+
+.. js:attribute:: ServerEventAdmin.old_admin
+
+  Previous server admin state prior to the admin change.
+
+  Values are presented as in **new_admin**, but they should differ.
+  (Comparing old and new helps to find out the change(s))
+
+.. js:attribute:: ServerEventAdmin.requeued
+
+  Same as :js:attr:`ServerEventState.requeued` but when the requeue is due to
+  the server administrative state change.
+
+.. _queue_class:
+
+Queue class
+===========
+
+.. js:class:: Queue
+
+  This class provides a generic FIFO storage mechanism that may be shared
+  between multiple lua contexts to easily pass data between them, as stock
+  Lua doesn't provide easy methods for passing data between multiple coroutines.
+
+  inter-task example:
+
+.. code-block:: lua
+
+  -- script wide shared queue
+  local queue = core.queue()
+
+  -- master task
+  core.register_task(function()
+    -- send the date every second
+    while true do
+      queue:push(os.date("%c", core.now().sec))
+      core.sleep(1)
+    end
+  end)
+
+  -- worker task
+  core.register_task(function()
+    while true do
+      -- print the date sent by master
+      print(queue:pop_wait())
+    end
+  end)
+..
+
+  Of course, queue may also be used as a local storage mechanism.
+
+  Use :js:func:`core.queue` to get a new Queue object.
+
+.. js:function:: Queue.size(queue)
+
+  This function returns the number of items within the Queue.
+
+  :param class_queue queue: A :ref:`queue_class` to the current queue
+
+.. js:function:: Queue.push(queue, item)
+
+  This function pushes the item (may be of any type) to the queue.
+  Pushed item cannot be nil or invalid, or an error will be thrown.
+
+  :param class_queue queue: A :ref:`queue_class` to the current queue
+  :returns: boolean true for success and false for error
+
+.. js:function:: Queue.pop(queue)
+
+  This function immediately tries to pop an item from the queue.
+  It returns nil of no item is available at the time of the call.
+
+  :param class_queue queue: A :ref:`queue_class` to the current queue
+  :returns: the item at the top of the stack (any type) or nil if no items
+
+.. js:function:: Queue.pop_wait(queue)
+
+  **context**: task
+
+  This is an alternative to pop() that may be used within task contexts.
+
+  The call waits for data if no item is currently available. This may be
+  useful when used in a while loop to prevent cpu waste.
+
+  Note that this requires yielding, thus it is only available within contexts
+  that support yielding (mainly task context).
+
+  :param class_queue queue: A :ref:`queue_class` to the current queue
+  :returns: the item at the top of the stack (any type) or nil in case of error
 
 .. _concat_class:
 

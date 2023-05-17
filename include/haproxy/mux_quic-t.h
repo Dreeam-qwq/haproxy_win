@@ -33,6 +33,7 @@ enum qcs_type {
 #define QC_CF_BLK_MFCTL 0x00000004 /* sending blocked due to connection flow-control */
 #define QC_CF_CONN_FULL 0x00000008 /* no stream buffers available on connection */
 #define QC_CF_APP_SHUT  0x00000010 /* Application layer shutdown done. */
+#define QC_CF_ERR_CONN  0x00000020 /* fatal error reported by transport layer */
 
 struct qcc {
 	struct connection *conn;
@@ -127,6 +128,7 @@ struct qcc {
 #define QC_SF_HREQ_RECV         0x00000100  /* a full HTTP request has been received */
 #define QC_SF_TO_STOP_SENDING   0x00000200  /* a STOP_SENDING must be sent */
 #define QC_SF_UNKNOWN_PL_LENGTH 0x00000400  /* HTX EOM may be missing from the stream layer */
+#define QC_SF_RECV_RESET        0x00000800  /* a RESET_STREAM was received */
 
 /* Maximum size of stream Rx buffer. */
 #define QC_S_RX_BUF_SZ   (global.tune.bufsize - NCB_RESERVED_SZ)

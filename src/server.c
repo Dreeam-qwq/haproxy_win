@@ -189,13 +189,68 @@ static inline void _srv_event_hdl_prepare(struct event_hdl_cb_data_server *cb_da
 	cb_data->unsafe.srv_lock = !thread_isolate;
 }
 
-/* general server event publishing:
+/* take an event-check snapshot from a live check */
+void _srv_event_hdl_prepare_checkres(struct event_hdl_cb_data_server_checkres *checkres,
+                                     struct check *check)
+{
+	checkres->agent = !!(check->state & CHK_ST_AGENT);
+	checkres->result = check->result;
+	checkres->duration = check->duration;
+	checkres->reason.status = check->status;
+	checkres->reason.code = check->code;
+	checkres->health.cur = check->health;
+	checkres->health.rise = check->rise;
+	checkres->health.fall = check->fall;
+}
+
+/* Prepare SERVER_STATE event
+ *
+ * This special event will contain extra hints related to the state change
+ *
+ * Must be called with server lock held
+ */
+void _srv_event_hdl_prepare_state(struct event_hdl_cb_data_server_state *cb_data,
+                                  struct server *srv, int type, int cause,
+                                  enum srv_state prev_state, int requeued)
+{
+	/* state event provides additional info about the server state change */
+	cb_data->safe.type = type;
+	cb_data->safe.new_state = srv->cur_state;
+	cb_data->safe.old_state = prev_state;
+	cb_data->safe.requeued = requeued;
+	if (type) {
+		/* administrative */
+		cb_data->safe.adm_st_chg.cause = cause;
+	}
+	else {
+		/* operational */
+		cb_data->safe.op_st_chg.cause = cause;
+		if (cause == SRV_OP_STCHGC_HEALTH || cause == SRV_OP_STCHGC_AGENT) {
+			struct check *check = (cause == SRV_OP_STCHGC_HEALTH) ? &srv->check : &srv->agent;
+
+			/* provide additional check-related state change result */
+			_srv_event_hdl_prepare_checkres(&cb_data->safe.op_st_chg.check, check);
+		}
+	}
+}
+
+/* server event publishing helper: publish in both global and
+ * server dedicated subscription list.
+ */
+#define _srv_event_hdl_publish(e, d, s)                                 \
+        ({                                                              \
+                /* publish in server dedicated sub list */              \
+                event_hdl_publish(&s->e_subs, e, EVENT_HDL_CB_DATA(&d));\
+                /* publish in global subscription list */               \
+                event_hdl_publish(NULL, e, EVENT_HDL_CB_DATA(&d));      \
+        })
+
+/* General server event publishing:
  * Use this to publish EVENT_HDL_SUB_SERVER family type event
- * from srv facility
- * Event will be published in both global subscription list and
- * server dedicated subscription list
- * server ptr must be valid
- * must be called with srv lock or under thread_isolate
+ * from srv facility.
+ *
+ * server ptr must be valid.
+ * Must be called with srv lock or under thread_isolate.
  */
 static void srv_event_hdl_publish(struct event_hdl_sub_type event,
                                   struct server *srv, uint8_t thread_isolate)
@@ -204,10 +259,28 @@ static void srv_event_hdl_publish(struct event_hdl_sub_type event,
 
 	/* prepare event data */
 	_srv_event_hdl_prepare(&cb_data, srv, thread_isolate);
-	/* publish in server dedicated sub list */
-	event_hdl_publish(&srv->e_subs, event, EVENT_HDL_CB_DATA(&cb_data));
-	/* publish in global subscription list */
-	event_hdl_publish(NULL, event, EVENT_HDL_CB_DATA(&cb_data));
+	_srv_event_hdl_publish(event, cb_data, srv);
+}
+
+/* Publish SERVER_CHECK event
+ *
+ * This special event will contain extra hints related to the check itself
+ *
+ * Must be called with server lock held
+ */
+void srv_event_hdl_publish_check(struct server *srv, struct check *check)
+{
+	struct event_hdl_cb_data_server_check cb_data;
+
+	/* check event provides additional info about the server check */
+	_srv_event_hdl_prepare_checkres(&cb_data.safe.res, check);
+
+	cb_data.unsafe.ptr = check;
+
+	/* prepare event data (common server data) */
+	_srv_event_hdl_prepare((struct event_hdl_cb_data_server *)&cb_data, srv, 0);
+
+	_srv_event_hdl_publish(EVENT_HDL_SUB_SERVER_CHECK, cb_data, srv);
 }
 
 /*
@@ -5297,9 +5370,6 @@ static int _srv_update_status_op(struct server *s, enum srv_op_st_chg_cause caus
 		 */
 		xferred = pendconn_redistribute(s);
 
-		/* no maintenance + server DOWN: publish event SERVER DOWN */
-		srv_event_hdl_publish(EVENT_HDL_SUB_SERVER_DOWN, s, 0);
-
 		tmptrash = alloc_trash_chunk();
 		if (tmptrash) {
 			chunk_printf(tmptrash,
@@ -5317,6 +5387,7 @@ static int _srv_update_status_op(struct server *s, enum srv_op_st_chg_cause caus
 				 tmptrash->area);
 			send_email_alert(s, log_level, "%s",
 					 tmptrash->area);
+			free_trash_chunk(tmptrash);
 		}
 	}
 	else if ((s->cur_state != SRV_ST_STOPPING) && (s->next_state == SRV_ST_STOPPING)) {
@@ -5341,7 +5412,6 @@ static int _srv_update_status_op(struct server *s, enum srv_op_st_chg_cause caus
 			send_log(s->proxy, LOG_NOTICE, "%s.\n",
 				 tmptrash->area);
 			free_trash_chunk(tmptrash);
-			tmptrash = NULL;
 		}
 	}
 	else if (((s->cur_state != SRV_ST_RUNNING) && (s->next_state == SRV_ST_RUNNING))
@@ -5368,9 +5438,6 @@ static int _srv_update_status_op(struct server *s, enum srv_op_st_chg_cause caus
 		 */
 		xferred = pendconn_grab_from_px(s);
 
-		/* no maintenance + server going UP: publish event SERVER UP */
-		srv_event_hdl_publish(EVENT_HDL_SUB_SERVER_UP, s, 0);
-
 		tmptrash = alloc_trash_chunk();
 		if (tmptrash) {
 			chunk_printf(tmptrash,
@@ -5386,7 +5453,6 @@ static int _srv_update_status_op(struct server *s, enum srv_op_st_chg_cause caus
 			send_email_alert(s, LOG_NOTICE, "%s",
 					 tmptrash->area);
 			free_trash_chunk(tmptrash);
-			tmptrash = NULL;
 		}
 	}
 	else if (s->cur_eweight != s->next_eweight) {
@@ -5432,7 +5498,6 @@ static int _srv_update_status_adm(struct server *s, enum srv_adm_st_chg_cause ca
 						 tmptrash->area);
 				}
 				free_trash_chunk(tmptrash);
-				tmptrash = NULL;
 			}
 		}
 		else {	/* server was still running */
@@ -5452,9 +5517,6 @@ static int _srv_update_status_adm(struct server *s, enum srv_adm_st_chg_cause ca
 			 */
 			xferred = pendconn_redistribute(s);
 
-			/* maintenance on previously running server: publish event SERVER DOWN */
-			srv_event_hdl_publish(EVENT_HDL_SUB_SERVER_DOWN, s, 0);
-
 			tmptrash = alloc_trash_chunk();
 			if (tmptrash) {
 				chunk_printf(tmptrash,
@@ -5470,7 +5532,6 @@ static int _srv_update_status_adm(struct server *s, enum srv_adm_st_chg_cause ca
 						 tmptrash->area);
 				}
 				free_trash_chunk(tmptrash);
-				tmptrash = NULL;
 			}
 		}
 	}
@@ -5513,12 +5574,6 @@ static int _srv_update_status_adm(struct server *s, enum srv_adm_st_chg_cause ca
 
 		}
 
-		/* ignore if server stays down when leaving maintenance mode */
-		if (s->next_state != SRV_ST_STOPPED) {
-			/* leaving maintenance + server UP: publish event SERVER UP */
-			srv_event_hdl_publish(EVENT_HDL_SUB_SERVER_UP, s, 0);
-		}
-
 		tmptrash = alloc_trash_chunk();
 		if (tmptrash) {
 			if (!(s->next_admin & SRV_ADMF_FMAINT) && (s->cur_admin & SRV_ADMF_FMAINT)) {
@@ -5549,7 +5604,6 @@ static int _srv_update_status_adm(struct server *s, enum srv_adm_st_chg_cause ca
 			send_log(s->proxy, LOG_NOTICE, "%s.\n",
 				 tmptrash->area);
 			free_trash_chunk(tmptrash);
-			tmptrash = NULL;
 		}
 
 		server_recalc_eweight(s, 0);
@@ -5589,7 +5643,6 @@ static int _srv_update_status_adm(struct server *s, enum srv_adm_st_chg_cause ca
 				send_log(s->proxy, LOG_NOTICE, "%s.\n",
 					 tmptrash->area);
 				free_trash_chunk(tmptrash);
-				tmptrash = NULL;
 			}
 		}
 		if (!(s->next_admin & SRV_ADMF_RMAINT) && (s->cur_admin & SRV_ADMF_RMAINT)) {
@@ -5607,7 +5660,6 @@ static int _srv_update_status_adm(struct server *s, enum srv_adm_st_chg_cause ca
 				send_log(s->proxy, LOG_NOTICE, "%s.\n",
 					 tmptrash->area);
 				free_trash_chunk(tmptrash);
-				tmptrash = NULL;
 			}
 		}
 		else if (!(s->next_admin & SRV_ADMF_IMAINT) && (s->cur_admin & SRV_ADMF_IMAINT)) {
@@ -5621,7 +5673,6 @@ static int _srv_update_status_adm(struct server *s, enum srv_adm_st_chg_cause ca
 				send_log(s->proxy, LOG_NOTICE, "%s.\n",
 					 tmptrash->area);
 				free_trash_chunk(tmptrash);
-				tmptrash = NULL;
 			}
 		}
 		/* don't report anything when leaving drain mode and remaining in maintenance */
@@ -5654,7 +5705,6 @@ static int _srv_update_status_adm(struct server *s, enum srv_adm_st_chg_cause ca
 							 tmptrash->area);
 				}
 				free_trash_chunk(tmptrash);
-				tmptrash = NULL;
 			}
 		}
 		else if ((s->cur_admin & SRV_ADMF_DRAIN) && !(s->next_admin & SRV_ADMF_DRAIN)) {
@@ -5685,7 +5735,6 @@ static int _srv_update_status_adm(struct server *s, enum srv_adm_st_chg_cause ca
 				send_log(s->proxy, LOG_NOTICE, "%s.\n",
 					 tmptrash->area);
 				free_trash_chunk(tmptrash);
-				tmptrash = NULL;
 			}
 
 			/* now propagate the status change to any LB algorithms */
@@ -5698,7 +5747,7 @@ static int _srv_update_status_adm(struct server *s, enum srv_adm_st_chg_cause ca
 			if (tmptrash) {
 				if (!(s->next_admin & SRV_ADMF_FDRAIN)) {
 					chunk_printf(tmptrash,
-					             "%sServer %s/%s is leaving forced drain but remains in drain mode",
+					             "%sServer %s/%s remains in drain mode",
 					             s->flags & SRV_F_BACKUP ? "Backup " : "",
 					             s->proxy->id, s->id);
 
@@ -5716,7 +5765,6 @@ static int _srv_update_status_adm(struct server *s, enum srv_adm_st_chg_cause ca
 				send_log(s->proxy, LOG_NOTICE, "%s.\n",
 					 tmptrash->area);
 				free_trash_chunk(tmptrash);
-				tmptrash = NULL;
 			}
 		}
 	}
@@ -5737,11 +5785,27 @@ static void srv_update_status(struct server *s, int type, int cause)
 {
 	int prev_srv_count = s->proxy->srv_bck + s->proxy->srv_act;
 	enum srv_state srv_prev_state = s->cur_state;
+	union {
+		struct event_hdl_cb_data_server_state state;
+		struct event_hdl_cb_data_server_admin admin;
+		struct event_hdl_cb_data_server common;
+	} cb_data;
+	int requeued;
 
-	if (type)
-		_srv_update_status_adm(s, cause);
+	/* prepare common server event data */
+	_srv_event_hdl_prepare(&cb_data.common, s, 0);
+
+	if (type) {
+		cb_data.admin.safe.cause = cause;
+		cb_data.admin.safe.old_admin = s->cur_admin;
+		cb_data.admin.safe.new_admin = s->next_admin;
+		requeued = _srv_update_status_adm(s, cause);
+		cb_data.admin.safe.requeued = requeued;
+		/* publish admin change */
+		_srv_event_hdl_publish(EVENT_HDL_SUB_SERVER_ADMIN, cb_data.admin, s);
+	}
 	else
-		_srv_update_status_op(s, cause);
+		requeued = _srv_update_status_op(s, cause);
 
 	/* explicitly commit state changes (even if it was already applied implicitly
 	 * by some lb state change function), so we don't miss anything
@@ -5754,12 +5818,19 @@ static void srv_update_status(struct server *s, int type, int cause)
 			/* server was down and no longer is */
 			if (s->last_change < ns_to_sec(now_ns))                        // ignore negative times
 				s->down_time += ns_to_sec(now_ns) - s->last_change;
+			_srv_event_hdl_publish(EVENT_HDL_SUB_SERVER_UP, cb_data.common, s);
 		}
 		else if (s->cur_state == SRV_ST_STOPPED) {
 			/* server was up and is currently down */
 			s->counters.down_trans++;
+			_srv_event_hdl_publish(EVENT_HDL_SUB_SERVER_DOWN, cb_data.common, s);
 		}
 		s->last_change = ns_to_sec(now_ns);
+
+		/* publish the state change */
+		_srv_event_hdl_prepare_state(&cb_data.state,
+		                             s, type, cause, srv_prev_state, requeued);
+		_srv_event_hdl_publish(EVENT_HDL_SUB_SERVER_STATE, cb_data.state, s);
 	}
 
 	/* check if backend stats must be updated due to the server state change */

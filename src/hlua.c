@@ -66,6 +66,8 @@
 #include <haproxy/vars.h>
 #include <haproxy/xref.h>
 #include <haproxy/event_hdl.h>
+#include <haproxy/check.h>
+#include <haproxy/mailers.h>
 
 /* Lua uses longjmp to perform yield or throwing errors. This
  * macro is used only for identifying the function that can
@@ -1292,7 +1294,7 @@ __LJMP int hlua_lua2arg_check(lua_State *L, int first, struct arg *argp,
  *  - hlua_gethlua : return the hlua context associated with an lua_State.
  *  - hlua_sethlua : create the association between hlua context and lua_state.
  */
-static inline struct hlua *hlua_gethlua(lua_State *L)
+inline struct hlua *hlua_gethlua(lua_State *L)
 {
 	struct hlua **hlua = lua_getextraspace(L);
 	return *hlua;
@@ -1929,6 +1931,21 @@ static int hlua_set_map(lua_State *L)
 	return 0;
 }
 
+/* This function disables the sending of email through the
+ * legacy email sending function which is implemented using
+ * checks.
+ *
+ * It may not be used during runtime.
+ */
+__LJMP static int hlua_disable_legacy_mailers(lua_State *L)
+{
+	if (hlua_gethlua(L))
+		WILL_LJMP(luaL_error(L, "disable_legacy_mailers: "
+		                        "not available outside of init or body context"));
+	send_email_disabled = 1;
+	return 0;
+}
+
 /* A class is a lot of memory that contain data. This data can be a table,
  * an integer or user data. This data is associated with a metatable. This
  * metatable have an original version registered in the global context with
@@ -2192,6 +2209,7 @@ static void hlua_socket_handler(struct appctx *appctx)
 	struct stconn *sc = appctx_sc(appctx);
 
 	if (unlikely(se_fl_test(appctx->sedesc, (SE_FL_EOS|SE_FL_ERROR|SE_FL_SHR|SE_FL_SHW)))) {
+		co_skip(sc_oc(sc), co_data(sc_oc(sc)));
 		notification_wake(&ctx->wake_on_read);
 		notification_wake(&ctx->wake_on_write);
 		return;
@@ -4929,7 +4947,7 @@ __LJMP static int hlua_applet_tcp_send_yield(lua_State *L, int status, lua_KCont
 	 * applet, and returns a yield.
 	 */
 	if (l < len) {
-		sc_need_room(sc);
+		sc_need_room(sc, channel_recv_max(chn) + 1);
 		MAY_LJMP(hlua_yieldk(L, 0, 0, hlua_applet_tcp_send_yield, TICK_ETERNITY, 0));
 	}
 
@@ -5472,7 +5490,7 @@ __LJMP static int hlua_applet_http_send_yield(lua_State *L, int status, lua_KCon
 	if (l < len) {
 	  snd_yield:
 		htx_to_buf(htx, &res->buf);
-		sc_need_room(sc);
+		sc_need_room(sc, channel_recv_max(res) + 1);
 		MAY_LJMP(hlua_yieldk(L, 0, 0, hlua_applet_http_send_yield, TICK_ETERNITY, 0));
 	}
 
@@ -5776,7 +5794,7 @@ __LJMP static int hlua_applet_http_start_response_yield(lua_State *L, int status
 	struct channel *res = sc_ic(sc);
 
 	if (co_data(res)) {
-		sc_need_room(sc);
+		sc_need_room(sc, -1);
 		MAY_LJMP(hlua_yieldk(L, 0, 0, hlua_applet_http_start_response_yield, TICK_ETERNITY, 0));
 	}
 	return MAY_LJMP(hlua_applet_http_send_response(L));
@@ -8845,7 +8863,7 @@ __LJMP static int hlua_register_init(lua_State *L)
  *
  * <arg1..4> are optional arguments that will be provided to <function>
  */
-static int hlua_register_task(lua_State *L)
+__LJMP static int hlua_register_task(lua_State *L)
 {
 	struct hlua *hlua = NULL;
 	struct task *task = NULL;
@@ -9029,6 +9047,67 @@ static void hlua_event_handler(struct hlua *hlua)
 	}
 }
 
+__LJMP static void hlua_event_hdl_cb_push_event_checkres(lua_State *L,
+                                                         struct event_hdl_cb_data_server_checkres *check)
+{
+	lua_pushstring(L, "agent");
+	lua_pushboolean(L, check->agent);
+	lua_settable(L, -3);
+	lua_pushstring(L, "result");
+	switch (check->result) {
+		case CHK_RES_FAILED:
+			lua_pushstring(L, "FAILED");
+			break;
+		case CHK_RES_PASSED:
+			lua_pushstring(L, "PASSED");
+			break;
+		case CHK_RES_CONDPASS:
+			lua_pushstring(L, "CONDPASS");
+			break;
+		default:
+			lua_pushnil(L);
+			break;
+	}
+	lua_settable(L, -3);
+
+	lua_pushstring(L, "duration");
+	lua_pushinteger(L, check->duration);
+	lua_settable(L, -3);
+
+	lua_pushstring(L, "reason");
+	lua_newtable(L);
+
+	lua_pushstring(L, "short");
+	lua_pushstring(L, get_check_status_info(check->reason.status));
+	lua_settable(L, -3);
+	lua_pushstring(L, "desc");
+	lua_pushstring(L, get_check_status_description(check->reason.status));
+	lua_settable(L, -3);
+	if (check->reason.status >= HCHK_STATUS_L57DATA) {
+		/* code only available when the check reached data analysis stage */
+		lua_pushstring(L, "code");
+		lua_pushinteger(L, check->reason.code);
+		lua_settable(L, -3);
+	}
+
+	lua_settable(L, -3); /* reason table */
+
+	lua_pushstring(L, "health");
+	lua_newtable(L);
+
+	lua_pushstring(L, "cur");
+	lua_pushinteger(L, check->health.cur);
+	lua_settable(L, -3);
+	lua_pushstring(L, "rise");
+	lua_pushinteger(L, check->health.rise);
+	lua_settable(L, -3);
+	lua_pushstring(L, "fall");
+	lua_pushinteger(L, check->health.fall);
+	lua_settable(L, -3);
+
+	lua_settable(L, -3); /* health table */
+}
+
 /* This function pushes various arguments such as event type and event data to
  * the lua function that will be called to consume the event.
  */
@@ -9072,6 +9151,147 @@ __LJMP static void hlua_event_hdl_cb_push_args(struct hlua_event_sub *hlua_sub,
 		lua_pushinteger(hlua->T, e_server->safe.proxy_uuid);
 		lua_settable(hlua->T, -3);
 
+		/* special events, fetch additional info with explicit type casting */
+		if (event_hdl_sub_type_equal(EVENT_HDL_SUB_SERVER_STATE, event)) {
+			struct event_hdl_cb_data_server_state *state = data;
+			int it;
+
+			if (!lua_checkstack(hlua->T, 20))
+				WILL_LJMP(luaL_error(hlua->T, "Lua out of memory error."));
+
+			/* state subclass */
+			lua_pushstring(hlua->T, "state");
+			lua_newtable(hlua->T);
+
+			lua_pushstring(hlua->T, "admin");
+			lua_pushboolean(hlua->T, state->safe.type);
+			lua_settable(hlua->T, -3);
+
+			/* is it because of a check ? */
+			if (!state->safe.type &&
+			    (state->safe.op_st_chg.cause == SRV_OP_STCHGC_HEALTH ||
+			     state->safe.op_st_chg.cause == SRV_OP_STCHGC_AGENT)) {
+				/* yes, provide check result */
+				lua_pushstring(hlua->T, "check");
+				lua_newtable(hlua->T);
+				hlua_event_hdl_cb_push_event_checkres(hlua->T, &state->safe.op_st_chg.check);
+				lua_settable(hlua->T, -3); /* check table */
+			}
+
+			lua_pushstring(hlua->T, "cause");
+			if (state->safe.type)
+				lua_pushstring(hlua->T, srv_adm_st_chg_cause(state->safe.adm_st_chg.cause));
+			else
+				lua_pushstring(hlua->T, srv_op_st_chg_cause(state->safe.op_st_chg.cause));
+			lua_settable(hlua->T, -3);
+
+			/* old_state, new_state */
+			for (it = 0; it < 2; it++) {
+				enum srv_state srv_state = (!it) ? state->safe.old_state : state->safe.new_state;
+
+				lua_pushstring(hlua->T, (!it) ? "old_state" : "new_state");
+				switch (srv_state) {
+					case SRV_ST_STOPPED:
+						lua_pushstring(hlua->T, "STOPPED");
+						break;
+					case SRV_ST_STOPPING:
+						lua_pushstring(hlua->T, "STOPPING");
+						break;
+					case SRV_ST_STARTING:
+						lua_pushstring(hlua->T, "STARTING");
+						break;
+					case SRV_ST_RUNNING:
+						lua_pushstring(hlua->T, "RUNNING");
+						break;
+					default:
+						lua_pushnil(hlua->T);
+						break;
+				}
+				lua_settable(hlua->T, -3);
+			}
+
+			/* requeued */
+			lua_pushstring(hlua->T, "requeued");
+			lua_pushinteger(hlua->T, state->safe.requeued);
+			lua_settable(hlua->T, -3);
+
+			lua_settable(hlua->T, -3); /* state table */
+		}
+		else if (event_hdl_sub_type_equal(EVENT_HDL_SUB_SERVER_ADMIN, event)) {
+			struct event_hdl_cb_data_server_admin *admin = data;
+			int it;
+
+			if (!lua_checkstack(hlua->T, 20))
+				WILL_LJMP(luaL_error(hlua->T, "Lua out of memory error."));
+
+			/* admin subclass */
+			lua_pushstring(hlua->T, "admin");
+			lua_newtable(hlua->T);
+
+			lua_pushstring(hlua->T, "cause");
+			lua_pushstring(hlua->T, srv_adm_st_chg_cause(admin->safe.cause));
+			lua_settable(hlua->T, -3);
+
+			/* old_admin, new_admin */
+			for (it = 0; it < 2; it++) {
+				enum srv_admin srv_admin = (!it) ? admin->safe.old_admin : admin->safe.new_admin;
+
+				lua_pushstring(hlua->T, (!it) ? "old_admin" : "new_admin");
+
+				/* admin state matrix */
+				lua_newtable(hlua->T);
+
+				lua_pushstring(hlua->T, "MAINT");
+				lua_pushboolean(hlua->T, srv_admin & SRV_ADMF_MAINT);
+				lua_settable(hlua->T, -3);
+				lua_pushstring(hlua->T, "FMAINT");
+				lua_pushboolean(hlua->T, srv_admin & SRV_ADMF_FMAINT);
+				lua_settable(hlua->T, -3);
+				lua_pushstring(hlua->T, "IMAINT");
+				lua_pushboolean(hlua->T, srv_admin & SRV_ADMF_IMAINT);
+				lua_settable(hlua->T, -3);
+				lua_pushstring(hlua->T, "RMAINT");
+				lua_pushboolean(hlua->T, srv_admin & SRV_ADMF_RMAINT);
+				lua_settable(hlua->T, -3);
+				lua_pushstring(hlua->T, "CMAINT");
+				lua_pushboolean(hlua->T, srv_admin & SRV_ADMF_CMAINT);
+				lua_settable(hlua->T, -3);
+
+				lua_pushstring(hlua->T, "DRAIN");
+				lua_pushboolean(hlua->T, srv_admin & SRV_ADMF_DRAIN);
+				lua_settable(hlua->T, -3);
+				lua_pushstring(hlua->T, "FDRAIN");
+				lua_pushboolean(hlua->T, srv_admin & SRV_ADMF_FDRAIN);
+				lua_settable(hlua->T, -3);
+				lua_pushstring(hlua->T, "IDRAIN");
+				lua_pushboolean(hlua->T, srv_admin & SRV_ADMF_IDRAIN);
+				lua_settable(hlua->T, -3);
+
+				lua_settable(hlua->T, -3); /* matrix table */
+			}
+			/* requeued */
+			lua_pushstring(hlua->T, "requeued");
+			lua_pushinteger(hlua->T, admin->safe.requeued);
+			lua_settable(hlua->T, -3);
+
+			lua_settable(hlua->T, -3); /* admin table */
+		}
+		else if (event_hdl_sub_type_equal(EVENT_HDL_SUB_SERVER_CHECK, event)) {
+			struct event_hdl_cb_data_server_check *check = data;
+
+			if (!lua_checkstack(hlua->T, 20))
+				WILL_LJMP(luaL_error(hlua->T, "Lua out of memory error."));
+
+			/* check subclass */
+			lua_pushstring(hlua->T, "check");
+			lua_newtable(hlua->T);
+
+			/* check result snapshot */
+			hlua_event_hdl_cb_push_event_checkres(hlua->T, &check->safe.res);
+
+			lua_settable(hlua->T, -3); /* check table */
+		}
+
 		/* attempt to provide reference server object
 		 * (if it wasn't removed yet, SERVER_DEL will never succeed here)
 		 */
@@ -9109,7 +9329,7 @@ static struct task *hlua_event_runner(struct task *task, void *context, unsigned
 	const char *error = NULL;
 
 	if (!hlua_sub->paused && event_hdl_async_equeue_size(&hlua_sub->equeue) > 100) {
-		const char *trace;
+		const char *trace = NULL;
 
 		/* We reached the limit of pending events in the queue: we should
 		 * warn the user, and temporarily pause the subscription to give a chance
@@ -9125,14 +9345,19 @@ static struct task *hlua_event_runner(struct task *task, void *context, unsigned
 		event_hdl_pause(hlua_sub->sub);
 		hlua_sub->paused = 1;
 
-		/* The following Lua calls can fail. */
-		if (!SET_SAFE_LJMP(hlua_sub->hlua))
-			trace = NULL;
-		trace = hlua_traceback(hlua_sub->hlua->T, ", ");
-		/* At this point the execution is safe. */
-		RESET_SAFE_LJMP(hlua_sub->hlua);
-
-		ha_warning("Lua event_hdl: pausing the subscription because the function fails to keep up the pace (%u unconsumed events): %s\n", event_hdl_async_equeue_size(&hlua_sub->equeue), ((trace) ? trace : ""));
+		if (SET_SAFE_LJMP(hlua_sub->hlua)) {
+			/* The following Lua call may fail. */
+			trace = hlua_traceback(hlua_sub->hlua->T, ", ");
+			/* At this point the execution is safe. */
+			RESET_SAFE_LJMP(hlua_sub->hlua);
+		} else {
+			/* Lua error was raised while fetching lua trace from current ctx */
+			SEND_ERR(NULL, "Lua event_hdl: unexpected error (memory failure?).\n");
+		}
+		ha_warning("Lua event_hdl: pausing the subscription because the handler fails "
+			   "to keep up the pace (%u unconsumed events) from %s.\n",
+			   event_hdl_async_equeue_size(&hlua_sub->equeue),
+			   (trace) ? trace : "[unknown]");
 	}
 
 	if (HLUA_IS_RUNNING(hlua_sub->hlua)) {
@@ -10390,7 +10615,7 @@ void hlua_applet_http_fct(struct appctx *ctx)
 
 	/* Check if the input buffer is available. */
 	if (!b_size(&res->buf)) {
-		sc_need_room(sc);
+		sc_need_room(sc, 0);
 		goto out;
 	}
 
@@ -10463,7 +10688,7 @@ void hlua_applet_http_fct(struct appctx *ctx)
 		 */
 		if (htx_is_empty(res_htx) && (strm->txn->rsp.flags & (HTTP_MSGF_XFER_LEN|HTTP_MSGF_CNT_LEN)) == HTTP_MSGF_XFER_LEN) {
 			if (!htx_add_endof(res_htx, HTX_BLK_EOT)) {
-				sc_need_room(sc);
+				sc_need_room(sc, sizeof(struct htx_blk)+1);
 				goto out;
 			}
 			channel_add_input(res, 1);
@@ -11029,7 +11254,7 @@ static int hlua_cli_io_handler_fct(struct appctx *appctx)
 	case HLUA_E_AGAIN:
 		/* We want write. */
 		if (HLUA_IS_WAKERESWR(hlua))
-			sc_need_room(sc);
+			sc_need_room(sc, -1);
 		/* Set the timeout. */
 		if (hlua->wake_time != TICK_ETERNITY)
 			task_schedule(hlua->task, hlua->wake_time);
@@ -12938,6 +13163,7 @@ lua_State *hlua_init_state(int thread_num)
 	hlua_class_function(L, "Warning", hlua_log_warning);
 	hlua_class_function(L, "Alert", hlua_log_alert);
 	hlua_class_function(L, "done", hlua_done);
+	hlua_class_function(L, "disable_legacy_mailers", hlua_disable_legacy_mailers);
 	hlua_fcn_reg_core_fcn(L);
 
 	lua_setglobal(L, "core");
