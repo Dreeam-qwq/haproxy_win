@@ -183,7 +183,7 @@ static forceinline void qcc_reset_idle_start(struct qcc *qcc)
 /* Decrement <qcc> sc. */
 static forceinline void qcc_rm_sc(struct qcc *qcc)
 {
-	BUG_ON_HOT(!qcc->nb_sc);
+	BUG_ON(!qcc->nb_sc); /* Ensure sc count is always valid (ie >=0). */
 	--qcc->nb_sc;
 
 	/* Reset qcc idle start for http-keep-alive timeout. Timeout will be
@@ -196,7 +196,7 @@ static forceinline void qcc_rm_sc(struct qcc *qcc)
 /* Decrement <qcc> hreq. */
 static forceinline void qcc_rm_hreq(struct qcc *qcc)
 {
-	BUG_ON_HOT(!qcc->nb_hreq);
+	BUG_ON(!qcc->nb_hreq); /* Ensure http req count is always valid (ie >=0). */
 	--qcc->nb_hreq;
 
 	/* Reset qcc idle start for http-keep-alive timeout. Timeout will be
@@ -587,7 +587,8 @@ static struct qcs *qcc_init_stream_remote(struct qcc *qcc, uint64_t id)
 
 	TRACE_ENTER(QMUX_EV_QCS_NEW, qcc->conn);
 
-	BUG_ON_HOT(quic_stream_is_local(qcc, id));
+	/* Function reserved to remote stream IDs. */
+	BUG_ON(quic_stream_is_local(qcc, id));
 
 	if (quic_stream_is_bidi(id)) {
 		largest = &qcc->largest_bidi_r;
@@ -681,7 +682,7 @@ struct stconn *qc_attach_sc(struct qcs *qcs, struct buffer *buf, char fin)
 
 	if (fin) {
 		TRACE_STATE("report end-of-input", QMUX_EV_STRM_RECV, qcc->conn, qcs);
-		se_fl_set(qcs->sd, SE_FL_EOI);
+		se_fl_set(qcs->sd, SE_FL_EOI|SE_FL_EOS);
 	}
 
 	return qcs->sd->sc;
@@ -881,6 +882,13 @@ static int qcc_decode_qcs(struct qcc *qcc, struct qcs *qcs)
 		if (ret < 0) {
 			TRACE_ERROR("decoding error", QMUX_EV_QCS_RECV, qcc->conn, qcs);
 			goto err;
+		}
+
+		if (qcs->flags & QC_SF_TO_RESET) {
+			if (qcs_sc(qcs) && !se_fl_test(qcs->sd, SE_FL_ERROR|SE_FL_ERR_PENDING)) {
+				se_fl_set_error(qcs->sd);
+				qcs_alert(qcs);
+			}
 		}
 	}
 	else {
@@ -1306,7 +1314,7 @@ int qcc_recv_reset_stream(struct qcc *qcc, uint64_t id, uint64_t err, uint64_t f
 	qc_free_ncbuf(qcs, &qcs->rx.ncbuf);
 
 	if (qcs_sc(qcs)) {
-		se_fl_set_error(qcs->sd);
+		se_fl_set(qcs->sd, SE_FL_EOS);
 		qcs_alert(qcs);
 	}
 
@@ -1396,6 +1404,12 @@ int qcc_recv_stop_sending(struct qcc *qcc, uint64_t id, uint64_t err)
 	 * code.
 	 */
 	qcc_reset_stream(qcs, err);
+
+	/* Report send error to stream-endpoint layer. */
+	if (qcs_sc(qcs)) {
+		se_fl_set_error(qcs->sd);
+		qcs_alert(qcs);
+	}
 
 	if (qcc_may_expire(qcc) && !qcc->nb_hreq)
 		qcc_refresh_timeout(qcc);
@@ -1813,11 +1827,6 @@ static int qcs_send_reset(struct qcs *qcs)
 			qc_frm_free(&frm);
 		TRACE_DEVEL("cannot send RESET_STREAM", QMUX_EV_QCS_SEND, qcs->qcc->conn, qcs);
 		return 1;
-	}
-
-	if (qcs_sc(qcs)) {
-		se_fl_set_error(qcs->sd);
-		qcs_alert(qcs);
 	}
 
 	qcs_close_local(qcs);
@@ -2725,7 +2734,7 @@ static size_t qc_recv_buf(struct stconn *sc, struct buffer *buf,
 		/* Set end-of-input when full message properly received. */
 		if (fin) {
 			TRACE_STATE("report end-of-input", QMUX_EV_STRM_RECV, qcc->conn, qcs);
-			se_fl_set(qcs->sd, SE_FL_EOI);
+			se_fl_set(qcs->sd, SE_FL_EOI|SE_FL_EOS);
 
 			/* If request EOM is reported to the upper layer, it means the
 			 * QCS now expects data from the opposite side.

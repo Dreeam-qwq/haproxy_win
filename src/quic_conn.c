@@ -742,13 +742,6 @@ static void quic_trace(enum trace_level level, uint64_t mask, const struct trace
 
 		}
 
-		if (mask & QUIC_EV_CONN_RCV) {
-			const struct quic_dgram *dgram = a2;
-
-			if (dgram)
-				chunk_appendf(&trace_buf, " dgram.len=%zu", dgram->len);
-		}
-
 		if (mask & QUIC_EV_CONN_IDLE_TIMER) {
 			if (tick_isset(qc->ack_expire))
 				chunk_appendf(&trace_buf, " ack_expire=%ums",
@@ -761,6 +754,38 @@ static void quic_trace(enum trace_level level, uint64_t mask, const struct trace
 				              TICKS_TO_MS(tick_remain(now_ms, qc->idle_timer_task->expire)));
 		}
 	}
+
+	if (mask & QUIC_EV_CONN_RCV) {
+		int i;
+		const struct quic_dgram *dgram = a2;
+		char bufaddr[INET6_ADDRSTRLEN], bufport[6];
+
+		if (qc) {
+			addr_to_str(&qc->peer_addr, bufaddr, sizeof(bufaddr));
+			port_to_str(&qc->peer_addr, bufport, sizeof(bufport));
+			chunk_appendf(&trace_buf, " peer_addr=%s:%s ", bufaddr, bufport);
+		}
+
+		if (dgram) {
+			chunk_appendf(&trace_buf, " dgram.len=%zu", dgram->len);
+			/* Socket */
+			if (dgram->saddr.ss_family == AF_INET ||
+				dgram->saddr.ss_family == AF_INET6) {
+				addr_to_str(&dgram->saddr, bufaddr, sizeof(bufaddr));
+				port_to_str(&dgram->saddr, bufport, sizeof(bufport));
+				chunk_appendf(&trace_buf, "saddr=%s:%s ", bufaddr, bufport);
+
+				addr_to_str(&dgram->daddr, bufaddr, sizeof(bufaddr));
+				port_to_str(&dgram->daddr, bufport, sizeof(bufport));
+				chunk_appendf(&trace_buf, "daddr=%s:%s ", bufaddr, bufport);
+			}
+			/* DCID */
+			for (i = 0; i < dgram->dcid_len; ++i)
+				chunk_appendf(&trace_buf, "%02x", dgram->dcid[i]);
+
+		}
+	}
+
 	if (mask & QUIC_EV_CONN_LPKT) {
 		const struct quic_rx_packet *pkt = a2;
 		const uint64_t *len = a3;
@@ -1528,39 +1553,33 @@ static int qc_do_rm_hp(struct quic_conn *qc,
  * address, with <payload_len> as payload length, <aad> as address of
  * the ADD and <aad_len> as AAD length depending on the <tls_ctx> QUIC TLS
  * context.
- * Returns 1 if succeeded, 0 if not.
+ *
+ * TODO no error is expected as encryption is done in place but encryption
+ * manual is unclear. <fail> will be set to true if an error is detected.
  */
-static int quic_packet_encrypt(unsigned char *payload, size_t payload_len,
-                               unsigned char *aad, size_t aad_len, uint64_t pn,
-                               struct quic_tls_ctx *tls_ctx, struct quic_conn *qc)
+static void quic_packet_encrypt(unsigned char *payload, size_t payload_len,
+                                unsigned char *aad, size_t aad_len, uint64_t pn,
+                                struct quic_tls_ctx *tls_ctx, struct quic_conn *qc,
+                                int *fail)
 {
-	int ret = 0;
 	unsigned char iv[QUIC_TLS_IV_LEN];
 	unsigned char *tx_iv = tls_ctx->tx.iv;
 	size_t tx_iv_sz = tls_ctx->tx.ivlen;
 	struct enc_debug_info edi;
 
 	TRACE_ENTER(QUIC_EV_CONN_ENCPKT, qc);
+	*fail = 0;
 
-	if (!quic_aead_iv_build(iv, sizeof iv, tx_iv, tx_iv_sz, pn)) {
-		TRACE_ERROR("AEAD IV building for encryption failed", QUIC_EV_CONN_ENCPKT, qc);
-		goto err;
-	}
+	quic_aead_iv_build(iv, sizeof iv, tx_iv, tx_iv_sz, pn);
 
 	if (!quic_tls_encrypt(payload, payload_len, aad, aad_len,
 	                      tls_ctx->tx.ctx, tls_ctx->tx.aead, tls_ctx->tx.key, iv)) {
 		TRACE_ERROR("QUIC packet encryption failed", QUIC_EV_CONN_ENCPKT, qc);
-		goto err;
+		*fail = 1;
+		enc_debug_info_init(&edi, payload, payload_len, aad, aad_len, pn);
 	}
 
-	ret = 1;
- leave:
 	TRACE_LEAVE(QUIC_EV_CONN_ENCPKT, qc);
-	return ret;
-
- err:
-	enc_debug_info_init(&edi, payload, payload_len, aad, aad_len, pn);
-	goto leave;
 }
 
 /* Select the correct TLS cipher context to used to decipher <pkt> packet
@@ -1626,10 +1645,7 @@ static int qc_pkt_decrypt(struct quic_conn *qc, struct quic_enc_level *qel,
 		}
 	}
 
-	if (!quic_aead_iv_build(iv, sizeof iv, rx_iv, rx_iv_sz, pkt->pn)) {
-		TRACE_ERROR("quic_aead_iv_build() failed", QUIC_EV_CONN_RXPKT, qc);
-		goto leave;
-	}
+	quic_aead_iv_build(iv, sizeof iv, rx_iv, rx_iv_sz, pkt->pn);
 
 	ret = quic_tls_decrypt(pkt->data + pkt->aad_len, pkt->len - pkt->aad_len,
 	                       pkt->data, pkt->aad_len,
@@ -3243,16 +3259,16 @@ static int qc_parse_pkt_frms(struct quic_conn *qc, struct quic_rx_packet *pkt,
 		case QUIC_FT_MAX_STREAMS_UNI:
 			break;
 		case QUIC_FT_DATA_BLOCKED:
-			HA_ATOMIC_INC(&qc->prx_counters->data_blocked);
+			qc->cntrs.data_blocked++;
 			break;
 		case QUIC_FT_STREAM_DATA_BLOCKED:
-			HA_ATOMIC_INC(&qc->prx_counters->stream_data_blocked);
+			qc->cntrs.stream_data_blocked++;
 			break;
 		case QUIC_FT_STREAMS_BLOCKED_BIDI:
-			HA_ATOMIC_INC(&qc->prx_counters->streams_data_blocked_bidi);
+			qc->cntrs.streams_data_blocked_bidi++;
 			break;
 		case QUIC_FT_STREAMS_BLOCKED_UNI:
-			HA_ATOMIC_INC(&qc->prx_counters->streams_data_blocked_uni);
+			qc->cntrs.streams_data_blocked_uni++;
 			break;
 		case QUIC_FT_NEW_CONNECTION_ID:
 			/* XXX TO DO XXX */
@@ -3877,6 +3893,7 @@ int qc_send_ppkts(struct buffer *buf, struct ssl_sock_ctx *ctx)
 			 * Initial packets to at least the smallest allowed maximum datagram size of
 			 * 1200 bytes.
 			 */
+			qc->cntrs.sent_pkt++;
 			BUG_ON_HOT(pkt->type == QUIC_PACKET_TYPE_INITIAL &&
 			           (pkt->flags & QUIC_FL_TX_PACKET_ACK_ELICITING) &&
 			           dglen < QUIC_INITIAL_PACKET_MINLEN);
@@ -4589,7 +4606,7 @@ int qc_treat_rx_pkts(struct quic_conn *qc, struct quic_enc_level *cur_el,
 				/* Drop the packet */
 				TRACE_ERROR("packet parsing failed -> dropped",
 				            QUIC_EV_CONN_RXPKT, qc, pkt);
-				HA_ATOMIC_INC(&qc->prx_counters->dropped_parsing);
+				qc->cntrs.dropped_parsing++;
 			}
 			else {
 				struct quic_arng ar = { .first = pkt->pn, .last = pkt->pn };
@@ -4733,7 +4750,7 @@ static int qc_purge_txbuf(struct quic_conn *qc, struct buffer *buf)
  */
 static int qc_send_app_pkts(struct quic_conn *qc, struct list *frms)
 {
-	int status = 0;
+	int status = 0, ret;
 	struct buffer *buf;
 
 	TRACE_ENTER(QUIC_EV_CONN_TXPKT, qc);
@@ -4748,8 +4765,7 @@ static int qc_send_app_pkts(struct quic_conn *qc, struct list *frms)
 		goto err;
 
 	/* Prepare and send packets until we could not further prepare packets. */
-	while (1) {
-		int ret;
+	do {
 		/* Currently buf cannot be non-empty at this stage. Even if a
 		 * previous sendto() has failed it is emptied to simulate
 		 * packet emission and rely on QUIC lost detection to try to
@@ -4759,23 +4775,19 @@ static int qc_send_app_pkts(struct quic_conn *qc, struct list *frms)
 		b_reset(buf);
 
 		ret = qc_prep_app_pkts(qc, buf, frms);
-		if (ret == -1) {
-			qc_txb_release(qc);
-			goto err;
-		}
 
-		if (!ret)
-			break;
-
-		if (!qc_send_ppkts(buf, qc->xprt_ctx)) {
+		if (b_data(buf) && !qc_send_ppkts(buf, qc->xprt_ctx)) {
 			if (qc->flags & QUIC_FL_CONN_TO_KILL)
 				qc_txb_release(qc);
 			goto err;
 		}
-	}
+	} while (ret > 0);
+
+	qc_txb_release(qc);
+	if (ret < 0)
+		goto err;
 
 	status = 1;
-	qc_txb_release(qc);
 	TRACE_LEAVE(QUIC_EV_CONN_TXPKT, qc);
 	return status;
 
@@ -5691,6 +5703,9 @@ static struct quic_conn *qc_new_conn(const struct quic_version *qv, int ipv4,
 	if (!qc_new_isecs(qc, ictx,qc->original_version, dcid->data, dcid->len, 1))
 		goto err;
 
+	/* Counters initialization */
+	memset(&qc->cntrs, 0, sizeof qc->cntrs);
+
 	LIST_APPEND(&th_ctx->quic_conns, &qc->el_th_ctx);
 	qc->qc_epoch = HA_ATOMIC_LOAD(&qc_epoch);
 
@@ -5706,6 +5721,26 @@ static struct quic_conn *qc_new_conn(const struct quic_version *qv, int ipv4,
 	}
 	TRACE_LEAVE(QUIC_EV_CONN_INIT);
 	return NULL;
+}
+
+/* Update the proxy counters of <qc> QUIC connection from its counters */
+static inline void quic_conn_prx_cntrs_update(struct quic_conn *qc)
+{
+	BUG_ON(!qc->prx_counters);
+	HA_ATOMIC_ADD(&qc->prx_counters->dropped_pkt, qc->cntrs.dropped_pkt);
+	HA_ATOMIC_ADD(&qc->prx_counters->dropped_pkt_bufoverrun, qc->cntrs.dropped_pkt_bufoverrun);
+	HA_ATOMIC_ADD(&qc->prx_counters->dropped_parsing, qc->cntrs.dropped_parsing);
+	HA_ATOMIC_ADD(&qc->prx_counters->socket_full, qc->cntrs.socket_full);
+	HA_ATOMIC_ADD(&qc->prx_counters->sendto_err, qc->cntrs.sendto_err);
+	HA_ATOMIC_ADD(&qc->prx_counters->sendto_err_unknown, qc->cntrs.sendto_err_unknown);
+	HA_ATOMIC_ADD(&qc->prx_counters->sent_pkt, qc->cntrs.sent_pkt);
+	HA_ATOMIC_ADD(&qc->prx_counters->lost_pkt, qc->path->loss.nb_lost_pkt);
+	HA_ATOMIC_ADD(&qc->prx_counters->conn_migration_done, qc->cntrs.conn_migration_done);
+	/* Stream related counters */
+	HA_ATOMIC_ADD(&qc->prx_counters->data_blocked, qc->cntrs.data_blocked);
+	HA_ATOMIC_ADD(&qc->prx_counters->stream_data_blocked, qc->cntrs.stream_data_blocked);
+	HA_ATOMIC_ADD(&qc->prx_counters->streams_data_blocked_bidi, qc->cntrs.streams_data_blocked_bidi);
+	HA_ATOMIC_ADD(&qc->prx_counters->streams_data_blocked_uni, qc->cntrs.streams_data_blocked_uni);
 }
 
 /* Release the quic_conn <qc>. The connection is removed from the CIDs tree.
@@ -5798,6 +5833,7 @@ void quic_conn_release(struct quic_conn *qc)
 
 	qc_detach_th_ctx_list(qc, 0);
 
+	quic_conn_prx_cntrs_update(qc);
 	pool_free(pool_head_quic_conn_rxbuf, qc->rx.buf.area);
 	pool_free(pool_head_quic_conn, qc);
 	qc = NULL;
@@ -6385,11 +6421,11 @@ static int quic_generate_retry_token(unsigned char *token, size_t len,
 
 	TRACE_ENTER(QUIC_EV_CONN_TXPKT);
 
-	/* We copy the odcid into the token, prefixed by its one byte
-	 * length, the format token byte. It is followed by an AEAD TAG, and finally
+	/* The token is made of the token format byte, the ODCID prefixed by its one byte
+	 * length, the creation timestamp, an AEAD TAG, and finally
 	 * the random bytes used to derive the secret to encrypt the token.
 	 */
-	if (1 + dcid->len + 1 + QUIC_TLS_TAG_LEN + sizeof salt > len)
+	if (1 + odcid->len + 1 + sizeof(timestamp) + QUIC_TLS_TAG_LEN + QUIC_RETRY_TOKEN_SALTLEN > len)
 		goto err;
 
 	aadlen = quic_generate_retry_token_aad(aad, version, dcid, addr);
@@ -6497,6 +6533,16 @@ static int quic_retry_token_check(struct quic_rx_packet *pkt,
 		goto err;
 	}
 
+	/* The token is made of the token format byte, the ODCID prefixed by its one byte
+	 * length, the creation timestamp, an AEAD TAG, and finally
+	 * the random bytes used to derive the secret to encrypt the token.
+	 */
+	if (tokenlen < 2 + QUIC_ODCID_MINLEN + sizeof(uint32_t) + QUIC_TLS_TAG_LEN + QUIC_RETRY_TOKEN_SALTLEN ||
+	    tokenlen > 2 + QUIC_CID_MAXLEN + sizeof(uint32_t) + QUIC_TLS_TAG_LEN + QUIC_RETRY_TOKEN_SALTLEN) {
+		TRACE_ERROR("invalid token length", QUIC_EV_CONN_LPKT, qc);
+		goto err;
+	}
+
 	aadlen = quic_generate_retry_token_aad(aad, qv->num, &pkt->scid, &dgram->saddr);
 	salt = token + tokenlen - QUIC_RETRY_TOKEN_SALTLEN;
 	if (!quic_tls_derive_retry_token_secret(EVP_sha256(), key, sizeof key, iv, sizeof iv,
@@ -6510,7 +6556,7 @@ static int quic_retry_token_check(struct quic_rx_packet *pkt,
 		goto err;
 	}
 
-	/* Do not decrypt the QUIC_TOKEN_FMT_RETRY byte */
+	/* The token is prefixed by a one-byte length format which is not ciphered. */
 	if (!quic_tls_decrypt2(buf, token + 1, tokenlen - QUIC_RETRY_TOKEN_SALTLEN - 1, aad, aadlen,
 	                       ctx, aead, key, iv)) {
 		TRACE_ERROR("Could not decrypt retry token", QUIC_EV_CONN_LPKT, qc);
@@ -6811,7 +6857,7 @@ static struct quic_conn *quic_rx_pkt_retrieve_conn(struct quic_rx_packet *pkt,
 	qc = retrieve_qc_conn_from_cid(pkt, l, &dgram->saddr, new_tid);
 
 	/* If connection already created or rebinded on another thread. */
-        if (!qc && *new_tid != -1 && tid != *new_tid)
+	if (!qc && *new_tid != -1 && tid != *new_tid)
 		goto out;
 
 	if (pkt->type == QUIC_PACKET_TYPE_INITIAL) {
@@ -6902,7 +6948,10 @@ static struct quic_conn *quic_rx_pkt_retrieve_conn(struct quic_rx_packet *pkt,
 	return qc;
 
  err:
-	HA_ATOMIC_INC(&prx_counters->dropped_pkt);
+	if (qc)
+		qc->cntrs.dropped_pkt++;
+	else
+		HA_ATOMIC_INC(&prx_counters->dropped_pkt);
 	TRACE_LEAVE(QUIC_EV_CONN_LPKT);
 	return NULL;
 }
@@ -7209,7 +7258,7 @@ static int qc_handle_conn_migration(struct quic_conn *qc,
 
 	qc->local_addr = *local_addr;
 	qc->peer_addr = *peer_addr;
-	HA_ATOMIC_INC(&qc->prx_counters->conn_migration_done);
+	qc->cntrs.conn_migration_done++;
 
 	TRACE_LEAVE(QUIC_EV_CONN_LPKT, qc);
 	return 0;
@@ -7315,7 +7364,7 @@ static void qc_rx_pkt_handle(struct quic_conn *qc, struct quic_rx_packet *pkt,
 		if (b_tail(&qc->rx.buf) + b_cspace < b_wrap(&qc->rx.buf)) {
 			TRACE_PROTO("Packet dropped",
 			            QUIC_EV_CONN_LPKT, qc, NULL, NULL, qv);
-			HA_ATOMIC_INC(&qc->prx_counters->dropped_pkt_bufoverrun);
+			qc->cntrs.dropped_pkt_bufoverrun++;
 			goto drop_silent;
 		}
 
@@ -7328,7 +7377,7 @@ static void qc_rx_pkt_handle(struct quic_conn *qc, struct quic_rx_packet *pkt,
 		if (b_contig_space(&qc->rx.buf) < pkt->len) {
 			TRACE_PROTO("Too big packet",
 			            QUIC_EV_CONN_LPKT, qc, pkt, &pkt->len, qv);
-			HA_ATOMIC_INC(&qc->prx_counters->dropped_pkt_bufoverrun);
+			qc->cntrs.dropped_pkt_bufoverrun++;
 			goto drop_silent;
 		}
 	}
@@ -7351,9 +7400,9 @@ static void qc_rx_pkt_handle(struct quic_conn *qc, struct quic_rx_packet *pkt,
 	return;
 
  drop:
-	HA_ATOMIC_INC(&qc->prx_counters->dropped_pkt);
-	TRACE_PROTO("packet drop", QUIC_EV_CONN_LPKT, qc ? qc : NULL, pkt, NULL, qv);
-	TRACE_LEAVE(QUIC_EV_CONN_LPKT, qc ? qc : NULL);
+	qc->cntrs.dropped_pkt++;
+	TRACE_PROTO("packet drop", QUIC_EV_CONN_LPKT, qc, pkt, NULL, qv);
+	TRACE_LEAVE(QUIC_EV_CONN_LPKT, qc);
 }
 
 /* This function builds into a buffer at <pos> position a QUIC long packet header,
@@ -7435,14 +7484,16 @@ static int quic_build_packet_short_header(unsigned char **pos, const unsigned ch
 /* Apply QUIC header protection to the packet with <pos> as first byte address,
  * <pn> as address of the Packet number field, <pnlen> being this field length
  * with <aead> as AEAD cipher and <key> as secret key.
- * Returns 1 if succeeded or 0 if failed.
+ *
+ * TODO no error is expected as encryption is done in place but encryption
+ * manual is unclear. <fail> will be set to true if an error is detected.
  */
-static int quic_apply_header_protection(struct quic_conn *qc, unsigned char *pos,
+void quic_apply_header_protection(struct quic_conn *qc, unsigned char *pos,
                                         unsigned char *pn, size_t pnlen,
-                                        struct quic_tls_ctx *tls_ctx)
+                                        struct quic_tls_ctx *tls_ctx, int *fail)
 
 {
-	int i, ret = 0;
+	int i;
 	/* We need an IV of at least 5 bytes: one byte for bytes #0
 	 * and at most 4 bytes for the packet number
 	 */
@@ -7451,8 +7502,11 @@ static int quic_apply_header_protection(struct quic_conn *qc, unsigned char *pos
 
 	TRACE_ENTER(QUIC_EV_CONN_TXPKT, qc);
 
+	*fail = 0;
+
 	if (!quic_tls_aes_encrypt(mask, pn + QUIC_PACKET_PN_MAXLEN, sizeof mask, aes_ctx)) {
 		TRACE_ERROR("could not apply header protection", QUIC_EV_CONN_TXPKT, qc);
+		*fail = 1;
 		goto out;
 	}
 
@@ -7460,10 +7514,8 @@ static int quic_apply_header_protection(struct quic_conn *qc, unsigned char *pos
 	for (i = 0; i < pnlen; i++)
 		pn[i] ^= mask[i + 1];
 
-	ret = 1;
  out:
 	TRACE_LEAVE(QUIC_EV_CONN_TXPKT, qc);
-	return ret;
 }
 
 /* Prepare into <outlist> as most as possible ack-eliciting frame from their
@@ -8116,6 +8168,7 @@ static struct quic_tx_packet *qc_build_pkt(unsigned char **pos,
 	int64_t pn;
 	size_t pn_len, payload_len, aad_len;
 	struct quic_tx_packet *pkt;
+	int encrypt_failure = 0;
 
 	TRACE_ENTER(QUIC_EV_CONN_TXPKT, qc);
 	TRACE_PROTO("TX pkt build", QUIC_EV_CONN_TXPKT, qc, NULL, qel);
@@ -8145,16 +8198,20 @@ static struct quic_tx_packet *qc_build_pkt(unsigned char **pos,
 	payload_len = last_byte - payload;
 	aad_len = payload - first_byte;
 
-	if (!quic_packet_encrypt(payload, payload_len, first_byte, aad_len, pn, tls_ctx, qc)) {
-		// trace already emitted by function above
+	quic_packet_encrypt(payload, payload_len, first_byte, aad_len, pn, tls_ctx, qc, &encrypt_failure);
+	if (encrypt_failure) {
+		/* TODO Unrecoverable failure, unencrypted data should be returned to the caller. */
+		WARN_ON("quic_packet_encrypt failure");
 		*err = -2;
 		goto err;
 	}
 
 	last_byte += QUIC_TLS_TAG_LEN;
 	pkt->len += QUIC_TLS_TAG_LEN;
-	if (!quic_apply_header_protection(qc, first_byte, buf_pn, pn_len, tls_ctx)) {
-		// trace already emitted by function above
+	quic_apply_header_protection(qc, first_byte, buf_pn, pn_len, tls_ctx, &encrypt_failure);
+	if (encrypt_failure) {
+		/* TODO Unrecoverable failure, unencrypted data should be returned to the caller. */
+		WARN_ON("quic_apply_header_protection failure");
 		*err = -2;
 		goto err;
 	}
@@ -8668,10 +8725,12 @@ static int cli_parse_show_quic(char **args, char *payload, struct appctx *appctx
 static void dump_quic_oneline(struct show_quic_ctx *ctx, struct quic_conn *qc)
 {
 	char bufaddr[INET6_ADDRSTRLEN], bufport[6];
+	int ret;
 	unsigned char cid_len;
 
-	chunk_appendf(&trash, "%p[%02u]/%-.12s ", qc, ctx->thr,
-	              qc->li->bind_conf->frontend->id);
+	ret = chunk_appendf(&trash, "%p[%02u]/%-.12s ", qc, ctx->thr,
+	                    qc->li->bind_conf->frontend->id);
+	chunk_appendf(&trash, "%*s", 36 - ret, " "); /* align output */
 
 	/* State */
 	if (qc->flags & QUIC_FL_CONN_CLOSING)
@@ -8694,11 +8753,11 @@ static void dump_quic_oneline(struct show_quic_ctx *ctx, struct quic_conn *qc)
 	    qc->local_addr.ss_family == AF_INET6) {
 		addr_to_str(&qc->peer_addr, bufaddr, sizeof(bufaddr));
 		port_to_str(&qc->peer_addr, bufport, sizeof(bufport));
-		chunk_appendf(&trash, "%15s:%s ", bufaddr, bufport);
+		chunk_appendf(&trash, "%15s:%-5s ", bufaddr, bufport);
 
 		addr_to_str(&qc->local_addr, bufaddr, sizeof(bufaddr));
 		port_to_str(&qc->local_addr, bufport, sizeof(bufport));
-		chunk_appendf(&trash, "%15s:%s      ", bufaddr, bufport);
+		chunk_appendf(&trash, "%15s:%-5s   ", bufaddr, bufport);
 	}
 
 	/* CIDs */
@@ -8854,9 +8913,9 @@ static int cli_io_handler_dump_quic(struct appctx *appctx)
 
 		/* Print legend for oneline format. */
 		if (ctx->format == QUIC_DUMP_FMT_ONELINE) {
-			chunk_appendf(&trash, "# conn/frontend       state   "
-				      "in_flight infl_p lost_p                    "
-				      "from                    to      "
+			chunk_appendf(&trash, "# conn/frontend                     state   "
+				      "in_flight infl_p lost_p               "
+				      "from                    to          "
 				      "local & remote CIDs\n");
 			applet_putchk(appctx, &trash);
 		}
@@ -8939,7 +8998,7 @@ static void cli_release_show_quic(struct appctx *appctx)
 }
 
 static struct cli_kw_list cli_kws = {{ }, {
-	{ { "show", "quic", NULL }, "show quic : display quic connections status", cli_parse_show_quic, cli_io_handler_dump_quic, cli_release_show_quic },
+	{ { "show", "quic", NULL }, "show quic [<format>] [all]              : display quic connections status", cli_parse_show_quic, cli_io_handler_dump_quic, cli_release_show_quic },
 	{{},}
 }};
 
