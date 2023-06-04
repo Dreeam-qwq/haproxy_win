@@ -3265,10 +3265,10 @@ static int qc_parse_pkt_frms(struct quic_conn *qc, struct quic_rx_packet *pkt,
 			qc->cntrs.stream_data_blocked++;
 			break;
 		case QUIC_FT_STREAMS_BLOCKED_BIDI:
-			qc->cntrs.streams_data_blocked_bidi++;
+			qc->cntrs.streams_blocked_bidi++;
 			break;
 		case QUIC_FT_STREAMS_BLOCKED_UNI:
-			qc->cntrs.streams_data_blocked_uni++;
+			qc->cntrs.streams_blocked_uni++;
 			break;
 		case QUIC_FT_NEW_CONNECTION_ID:
 			/* XXX TO DO XXX */
@@ -5739,8 +5739,8 @@ static inline void quic_conn_prx_cntrs_update(struct quic_conn *qc)
 	/* Stream related counters */
 	HA_ATOMIC_ADD(&qc->prx_counters->data_blocked, qc->cntrs.data_blocked);
 	HA_ATOMIC_ADD(&qc->prx_counters->stream_data_blocked, qc->cntrs.stream_data_blocked);
-	HA_ATOMIC_ADD(&qc->prx_counters->streams_data_blocked_bidi, qc->cntrs.streams_data_blocked_bidi);
-	HA_ATOMIC_ADD(&qc->prx_counters->streams_data_blocked_uni, qc->cntrs.streams_data_blocked_uni);
+	HA_ATOMIC_ADD(&qc->prx_counters->streams_blocked_bidi, qc->cntrs.streams_blocked_bidi);
+	HA_ATOMIC_ADD(&qc->prx_counters->streams_blocked_uni, qc->cntrs.streams_blocked_uni);
 }
 
 /* Release the quic_conn <qc>. The connection is removed from the CIDs tree.
@@ -6733,7 +6733,7 @@ static int qc_ssl_sess_init(struct quic_conn *qc, SSL_CTX *ssl_ctx, SSL **ssl,
 	*ssl = SSL_new(ssl_ctx);
 	if (!*ssl) {
 		if (!retry--)
-			goto err;
+			goto leave;
 
 		pool_gc(NULL);
 		goto retry;
@@ -6744,7 +6744,7 @@ static int qc_ssl_sess_init(struct quic_conn *qc, SSL_CTX *ssl_ctx, SSL **ssl,
 		SSL_free(*ssl);
 		*ssl = NULL;
 		if (!retry--)
-			goto err;
+			goto leave;
 
 		pool_gc(NULL);
 		goto retry;
@@ -6754,10 +6754,6 @@ static int qc_ssl_sess_init(struct quic_conn *qc, SSL_CTX *ssl_ctx, SSL **ssl,
  leave:
 	TRACE_LEAVE(QUIC_EV_CONN_NEW, qc);
 	return ret;
-
- err:
-	qc->conn->err_code = CO_ER_SSL_NO_MEM;
-	goto leave;
 }
 
 /* Allocate the ssl_sock_ctx from connection <qc>. This creates the tasklet
@@ -8778,9 +8774,10 @@ static void dump_quic_full(struct show_quic_ctx *ctx, struct quic_conn *qc)
 	struct eb64_node *node;
 	struct qc_stream_desc *stream;
 	char bufaddr[INET6_ADDRSTRLEN], bufport[6];
-	int expire, i;
+	int expire, i, addnl;
 	unsigned char cid_len;
 
+	addnl = 0;
 	/* CIDs */
 	chunk_appendf(&trash, "* %p[%02u]: scid=", qc, ctx->thr);
 	for (cid_len = 0; cid_len < qc->scid.len; ++cid_len)
@@ -8853,11 +8850,57 @@ static void dump_quic_full(struct show_quic_ctx *ctx, struct quic_conn *qc)
 	              pktns->rx.arngs.sz, pktns->tx.in_flight);
 
 	chunk_appendf(&trash, "  srtt=%-4u rttvar=%-4u rttmin=%-4u ptoc=%-4u cwnd=%-6llu"
-	                      " mcwnd=%-6llu lostpkts=%-6llu\n",
+	                      " mcwnd=%-6llu sentpkts=%-6llu lostpkts=%-6llu\n",
 	              qc->path->loss.srtt >> 3, qc->path->loss.rtt_var >> 2,
 	              qc->path->loss.rtt_min, qc->path->loss.pto_count, (ullong)qc->path->cwnd,
-	              (ullong)qc->path->mcwnd, (ullong)qc->path->loss.nb_lost_pkt);
+	              (ullong)qc->path->mcwnd, (ullong)qc->cntrs.sent_pkt, (ullong)qc->path->loss.nb_lost_pkt);
 
+	if (qc->cntrs.dropped_pkt) {
+		chunk_appendf(&trash, " droppkts=%-6llu", qc->cntrs.dropped_pkt);
+		addnl = 1;
+	}
+	if (qc->cntrs.dropped_pkt_bufoverrun) {
+		chunk_appendf(&trash, " dropbuff=%-6llu", qc->cntrs.dropped_pkt_bufoverrun);
+		addnl = 1;
+	}
+	if (qc->cntrs.dropped_parsing) {
+		chunk_appendf(&trash, " droppars=%-6llu", qc->cntrs.dropped_parsing);
+		addnl = 1;
+	}
+	if (qc->cntrs.socket_full) {
+		chunk_appendf(&trash, " sockfull=%-6llu", qc->cntrs.socket_full);
+		addnl = 1;
+	}
+	if (qc->cntrs.sendto_err) {
+		chunk_appendf(&trash, " sendtoerr=%-6llu", qc->cntrs.sendto_err);
+		addnl = 1;
+	}
+	if (qc->cntrs.sendto_err_unknown) {
+		chunk_appendf(&trash, " sendtounknerr=%-6llu", qc->cntrs.sendto_err);
+		addnl = 1;
+	}
+	if (qc->cntrs.conn_migration_done) {
+		chunk_appendf(&trash, " migrdone=%-6llu", qc->cntrs.conn_migration_done);
+		addnl = 1;
+	}
+	if (qc->cntrs.data_blocked) {
+		chunk_appendf(&trash, " datablocked=%-6llu", qc->cntrs.data_blocked);
+		addnl = 1;
+	}
+	if (qc->cntrs.stream_data_blocked) {
+		chunk_appendf(&trash, " sdatablocked=%-6llu", qc->cntrs.stream_data_blocked);
+		addnl = 1;
+	}
+	if (qc->cntrs.streams_blocked_bidi) {
+		chunk_appendf(&trash, " sblockebidi=%-6llu", qc->cntrs.streams_blocked_bidi);
+		addnl = 1;
+	}
+	if (qc->cntrs.streams_blocked_uni) {
+		chunk_appendf(&trash, " sblockeduni=%-6llu", qc->cntrs.streams_blocked_uni);
+		addnl = 1;
+	}
+	if (addnl)
+		chunk_appendf(&trash, "\n");
 
 	/* Streams */
 	node = eb64_first(&qc->streams_by_id);
@@ -8998,7 +9041,7 @@ static void cli_release_show_quic(struct appctx *appctx)
 }
 
 static struct cli_kw_list cli_kws = {{ }, {
-	{ { "show", "quic", NULL }, "show quic [<format>] [all]              : display quic connections status", cli_parse_show_quic, cli_io_handler_dump_quic, cli_release_show_quic },
+	{ { "show", "quic", NULL }, "show quic [oneline|full] [all]          : display quic connections status", cli_parse_show_quic, cli_io_handler_dump_quic, cli_release_show_quic },
 	{{},}
 }};
 

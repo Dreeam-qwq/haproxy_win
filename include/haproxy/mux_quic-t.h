@@ -41,19 +41,6 @@ struct qcc {
 	uint64_t nb_hreq; /* number of in-progress http requests */
 	uint32_t flags; /* QC_CF_* */
 
-	struct {
-		uint64_t max_streams; /* maximum number of concurrent streams */
-		uint64_t nb_streams;  /* Number of open streams */
-		struct {
-			uint64_t max_data; /* Maximum number of bytes which may be received */
-			uint64_t bytes;    /* Number of bytes received */
-		} rx;
-		struct {
-			uint64_t max_data; /* Maximum number of bytes which may be sent */
-			uint64_t bytes;    /* Number of bytes sent */
-		} tx;
-	} strms[QCS_MAX_TYPES];
-
 	/* flow-control fields set by us enforced on our side. */
 	struct {
 		struct list frms; /* prepared frames related to flow-control  */
@@ -82,9 +69,6 @@ struct qcc {
 		uint64_t msd_uni_l; /* initial max-stream-data from peer on local uni streams */
 	} rfctl;
 
-	struct {
-		uint64_t max_data; /* Maximum number of bytes which may be received */
-	} rx;
 	struct {
 		uint64_t offsets; /* sum of all offsets prepared */
 		uint64_t sent_offsets; /* sum of all offset sent */

@@ -2,8 +2,8 @@
                                 HAProxy
                           Configuration Manual
                          ----------------------
-                              version 2.8
-                              2023/05/17
+                              version 2.9
+                              2023/05/31
 
 
 This document covers the configuration language as implemented in the version
@@ -1107,6 +1107,7 @@ The following keywords are supported in the "global" section :
    - pidfile
    - pp2-never-send-local
    - presetenv
+   - prealloc-fd
    - resetenv
    - set-dumpable
    - set-var
@@ -2040,9 +2041,6 @@ nbthread <number>
   output of "haproxy -vv".
 
 no-quic
-  Warning: QUIC support in HAProxy is currently experimental. Configuration may
-  change without deprecation in the future.
-
   Disable QUIC transport protocol. All the QUIC listeners will still be created.
   But they will not bind their addresses. Hence, no QUIC traffic will be
   processed by haproxy. See also "quic_enabled" sample fetch.
@@ -2083,6 +2081,12 @@ presetenv <name> <value>
   is NOT overwritten. The changes immediately take effect so that the next line
   in the configuration file sees the new value. See also "setenv", "resetenv",
   and "unsetenv".
+
+prealloc-fd
+  Performs a one-time open of the maximum file descriptor which results in a
+  pre-allocation of the kernel's data structures. This prevents short pauses
+  when nbthread>1 and HAProxy opens a file descriptor which requires the kernel
+  to expand its data structures.
 
 resetenv [<name> ...]
   Removes all environment variables except the ones specified in argument. It
@@ -3313,9 +3317,6 @@ tune.pool-low-fd-ratio <number>
   default is 20.
 
 tune.quic.frontend.conn-tx-buffers.limit <number>
-  Warning: QUIC support in HAProxy is currently experimental. Configuration may
-  change without deprecation in the future.
-
   This settings defines the maximum number of buffers allocated for a QUIC
   connection on data emission. By default, it is set to 30. QUIC buffers are
   drained on ACK reception. This setting has a direct impact on the throughput
@@ -3323,9 +3324,6 @@ tune.quic.frontend.conn-tx-buffers.limit <number>
   time-trip. Each buffer is tune.bufsize.
 
 tune.quic.frontend.max-idle-timeout <timeout>
-  Warning: QUIC support in HAProxy is currently experimental. Configuration may
-  change without deprecation in the future.
-
   Sets the QUIC max_idle_timeout transport parameters in milliseconds for
   frontends which determines the period of time after which a connection silently
   closes if it has remained inactive during an effective period of time deduced
@@ -3337,9 +3335,6 @@ tune.quic.frontend.max-idle-timeout <timeout>
   The default value is 30000.
 
 tune.quic.frontend.max-streams-bidi <number>
-  Warning: QUIC support in HAProxy is currently experimental. Configuration may
-  change without deprecation in the future.
-
   Sets the QUIC initial_max_streams_bidi transport parameter for frontends.
   This is the initial maximum number of bidirectional streams the remote peer
   will be authorized to open. This determines the number of concurrent client
@@ -3348,18 +3343,12 @@ tune.quic.frontend.max-streams-bidi <number>
   The default value is 100.
 
 tune.quic.max-frame-loss <number>
-  Warning: QUIC support in HAProxy is currently experimental. Configuration may
-  change without deprecation in the future.
-
   Sets the limit for which a single QUIC frame can be marked as lost. If
   exceeded, the connection is considered as failing and is closed immediately.
 
   The default value is 10.
 
 tune.quic.retry-threshold <number>
-  Warning: QUIC support in HAProxy is currently experimental. Configuration may
-  change without deprecation in the future.
-
   Dynamically enables the Retry feature for all the configured QUIC listeners
   as soon as this number of half open connections is reached. A half open
   connection is a connection whose handshake has not already successfully
@@ -3374,9 +3363,6 @@ tune.quic.retry-threshold <number>
   information about QUIC retry.
 
 tune.quic.socket-owner { listener | connection }
-  Warning: QUIC support in HAProxy is currently experimental. Configuration may
-  change without deprecation in the future.
-
   Specifies how QUIC connections will use socket for receive/send operations.
   Connections can share listener socket or each connection can allocate its
   own socket.
@@ -3746,7 +3732,8 @@ peers <peersect>
   Creates a new peer list with name <peersect>. It is an independent section,
   which is referenced by one or more stick-tables.
 
-bind [<address>]:<port_range> [, ...] [param*]
+bind [<address>]:port [param*]
+bind /<path> [param*]
   Defines the binding parameters of the local peer of this "peers" section.
   Such lines are not supported with "peer" line in the same "peers" section.
 
@@ -3781,16 +3768,17 @@ log <address> [len <length>] [format <format>] [sample <ranges>:<sample_size>]
   log information about the "peers" listener. See "log" option for proxies for
   more details.
 
-peer <peername> <ip>:<port> [param*]
+peer <peername> [<address>]:port [param*]
+peer <peername> /<path> [param*]
   Defines a peer inside a peers section.
   If <peername> is set to the local peer name (by default hostname, or forced
   using "-L" command line option or "localpeer" global configuration setting),
-  HAProxy will listen for incoming remote peer connection on <ip>:<port>.
-  Otherwise, <ip>:<port> defines where to connect to in order to join the
-  remote peer, and <peername> is used at the protocol level to identify and
+  HAProxy will listen for incoming remote peer connection on the provided
+  address.  Otherwise, the address defines where to connect to in order to join
+  the remote peer, and <peername> is used at the protocol level to identify and
   validate the remote peer on the server side.
 
-  During a soft restart, local peer <ip>:<port> is used by the old instance to
+  During a soft restart, local peer address is used by the old instance to
   connect the new one and initiate a complete replication (teaching process).
 
   It is strongly recommended to have the exact same peers declaration on all
@@ -3804,12 +3792,13 @@ peer <peername> <ip>:<port> [param*]
   Note: "peer" keyword may transparently be replaced by "server" keyword (see
   "server" keyword explanation below).
 
-server <peername> [<ip>:<port>] [param*]
+server <peername> [<address>:<port>] [param*]
+server <peername> [/<path>] [param*]
   As previously mentioned, "peer" keyword may be replaced by "server" keyword
   with a support for all "server" parameters found in 5.2 paragraph that are
-  related to transport settings. If the underlying peer is local, <ip>:<port>
-  parameters must not be present; these parameters must be provided on a "bind"
-  line (see "bind" keyword of this "peers" section).
+  related to transport settings. If the underlying peer is local, the address
+  parameter must not be present; it must be provided on a "bind" line (see
+  "bind" keyword of this "peers" section).
 
   A number of "server" parameters are irrelevant for "peers" sections. Peers by
   nature do not support dynamic host name resolution nor health checks, hence
@@ -15346,8 +15335,6 @@ proto <name>
   h2" on the bind line.
 
 quic-cc-algo [ cubic | newreno ]
-  Warning: QUIC support in HAProxy is currently experimental. Configuration may
-
   This is a QUIC specific setting to select the congestion control algorithm
   for any connection attempts to the configured QUIC listeners. They are similar
   to those used by TCP.
@@ -15355,9 +15342,6 @@ quic-cc-algo [ cubic | newreno ]
   Default value: cubic
 
 quic-force-retry
-  Warning: QUIC support in HAProxy is currently experimental. Configuration may
-  change without deprecation in the future.
-
   This is a QUIC specific setting which forces the use of the QUIC Retry feature
   for all the connection attempts to the configured QUIC listeners. It consists
   in veryfying the peers are able to receive packets at the transport address
@@ -17744,10 +17728,12 @@ rfc7239_n2nn
     # extract 'for' field from forwarded header, extract nodename from
     # resulting node identifier and store the result in req.fnn
     http-request set-var(req.fnn) req.hdr(forwarded),rfc7239_field(for),rfc7239_n2nn
-    #input: "for=\"127.0.0.1:9999\""
-    #  output: 127.0.0.1
-    #input: "for=\"_name:_port\""
-    #  output: "_name"
+    #input: "127.0.0.1:9999"
+    #  output: 127.0.0.1 (ipv4)
+    #input: "[ab:cd:ff:ff:ff:ff:ff:ff]:9998"
+    #  output: ab:cd:ff:ff:ff:ff:ff:ff (ipv6)
+    #input: "_name:_port"
+    #  output: "_name" (string)
 
 rfc7239_n2np
   Converts RFC7239 node (provided by 'for' or 'by' 7239 header fields)
@@ -17760,9 +17746,11 @@ rfc7239_n2np
     # resulting node identifier and store the result in req.fnp
     http-request set-var(req.fnp) req.hdr(forwarded),rfc7239_field(by),rfc7239_n2np
     #input: "by=\"127.0.0.1:9999\""
-    #  output: 9999
-    #input: "by=\"_name:_port\""
-    #  output: "_port"
+    #  output: 9999 (integer)
+    #input: "[ab:cd:ff:ff:ff:ff:ff:ff]:9998"
+    #  output: 9998 (integer)
+    #input: "_name:_port"
+    #  output: "_port" (string)
 
 add(<value>)
   Adds <value> to the input value of type signed integer, and returns the
@@ -19542,9 +19530,6 @@ queue([<backend>]) : integer
   also the "avg_queue", "be_conn", and "be_sess_rate" fetches.
 
 quic_enabled : boolean
-  Warning: QUIC support in HAProxy is currently experimental. Configuration may
-  change without deprecation in the future.
-
   Return true when the support for QUIC transport protocol was compiled and
   if this procotol was not disabled by "no-quic" global option. See also "no-quic"
   global option.
