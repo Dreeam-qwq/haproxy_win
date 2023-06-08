@@ -310,6 +310,11 @@ void free_proxy(struct proxy *p)
 		s = srv_drop(s);
 	}/* end while(s) */
 
+	/* also free default-server parameters since some of them might have
+	 * been dynamically allocated (e.g.: config hints, cookies, ssl..)
+	 */
+	srv_free_params(&p->defsrv);
+
 	list_for_each_entry_safe(l, l_next, &p->conf.listeners, by_fe) {
 		LIST_DELETE(&l->by_fe);
 		LIST_DELETE(&l->by_bind);
@@ -327,6 +332,7 @@ void free_proxy(struct proxy *p)
 			bind_conf->xprt->destroy_bind_conf(bind_conf);
 		free(bind_conf->file);
 		free(bind_conf->arg);
+		free(bind_conf->settings.interface);
 		LIST_DELETE(&bind_conf->by_fe);
 		free(bind_conf);
 	}

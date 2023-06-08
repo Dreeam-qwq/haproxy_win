@@ -4936,7 +4936,7 @@ bind /<path> [, ...] [param*]
                       was the FD of an accept(). Should be used carefully.
                     - 'quic4@' -> address is resolved as IPv4 and protocol UDP
                       is used. Note that to achieve the best performance with a
-                      large traffic you should keep "tune.quic.conn-owner" on
+                      large traffic you should keep "tune.quic.socket-owner" on
                       connection. Else QUIC connections will be multiplexed
                       over the listener socket. Another alternative would be to
                       duplicate QUIC listener instances over several threads,
@@ -17745,7 +17745,7 @@ rfc7239_n2np
     # extract 'by' field from forwarded header, extract node port from
     # resulting node identifier and store the result in req.fnp
     http-request set-var(req.fnp) req.hdr(forwarded),rfc7239_field(by),rfc7239_n2np
-    #input: "by=\"127.0.0.1:9999\""
+    #input: "127.0.0.1:9999"
     #  output: 9999 (integer)
     #input: "[ab:cd:ff:ff:ff:ff:ff:ff]:9998"
     #  output: 9998 (integer)
@@ -18258,7 +18258,7 @@ jwt_verify(<alg>,<key>)
      # JOSE header and use a public certificate to verify a signature
      http-request set-var(txn.bearer) http_auth_bearer
      http-request set-var(txn.jwt_alg) var(txn.bearer),jwt_header_query('$.alg')
-     http-request deny unless { var(txn.jwt_alg) "RS256" }
+     http-request deny unless { var(txn.jwt_alg) -m str "RS256" }
      http-request deny unless { var(txn.bearer),jwt_verify(txn.jwt_alg,"/path/to/crt.pem") 1 }
 
 language(<value>[,<default>])

@@ -2465,6 +2465,24 @@ void srv_take(struct server *srv)
 	HA_ATOMIC_INC(&srv->refcount);
 }
 
+/* deallocate common server parameters (may be used by default-servers) */
+void srv_free_params(struct server *srv)
+{
+	free(srv->cookie);
+	free(srv->hostname);
+	free(srv->hostname_dn);
+	free((char*)srv->conf.file);
+	free(srv->per_thr);
+	free(srv->per_tgrp);
+	free(srv->curr_idle_thr);
+	free(srv->resolvers_id);
+	free(srv->addr_node.key);
+	free(srv->lb_nodes);
+
+	if (xprt_get(XPRT_SSL) && xprt_get(XPRT_SSL)->destroy_srv)
+		xprt_get(XPRT_SSL)->destroy_srv(srv);
+}
+
 /* Deallocate a server <srv> and its member. <srv> must be allocated. For
  * dynamic servers, its refcount is decremented first. The free operations are
  * conducted only if the refcount is nul.
@@ -2498,19 +2516,8 @@ struct server *srv_drop(struct server *srv)
 	task_destroy(srv->srvrq_check);
 
 	free(srv->id);
-	free(srv->cookie);
-	free(srv->hostname);
-	free(srv->hostname_dn);
-	free((char*)srv->conf.file);
-	free(srv->per_thr);
-	free(srv->per_tgrp);
-	free(srv->curr_idle_thr);
-	free(srv->resolvers_id);
-	free(srv->addr_node.key);
-	free(srv->lb_nodes);
+	srv_free_params(srv);
 
-	if (xprt_get(XPRT_SSL) && xprt_get(XPRT_SSL)->destroy_srv)
-		xprt_get(XPRT_SSL)->destroy_srv(srv);
 	HA_SPIN_DESTROY(&srv->lock);
 
 	LIST_DELETE(&srv->global_list);
@@ -2771,7 +2778,9 @@ static int _srv_parse_init(struct server **srv, char **args, int *cur_arg,
 
 		sk = str2sa_range(args[*cur_arg], &port, &port1, &port2, NULL, NULL,
 		                  &errmsg, NULL, &fqdn,
-		                  (parse_flags & SRV_PARSE_INITIAL_RESOLVE ? PA_O_RESOLVE : 0) | PA_O_PORT_OK | PA_O_PORT_OFS | PA_O_STREAM | PA_O_XPRT | PA_O_CONNECT);
+		                  (parse_flags & SRV_PARSE_INITIAL_RESOLVE ? PA_O_RESOLVE : 0) | PA_O_PORT_OK |
+				  (parse_flags & SRV_PARSE_IN_PEER_SECTION ? PA_O_PORT_MAND : PA_O_PORT_OFS) |
+				  PA_O_STREAM | PA_O_XPRT | PA_O_CONNECT);
 		if (!sk) {
 			ha_alert("%s\n", errmsg);
 			err_code |= ERR_ALERT | ERR_FATAL;
