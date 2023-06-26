@@ -218,8 +218,12 @@ int mworker_env_to_proc_list()
 
 			} else if (strncmp(subtoken, "fd=", 3) == 0) {
 				child->ipc_fd[0] = atoi(subtoken+3);
+				if (child->ipc_fd[0] > -1)
+					global.maxsock++;
 			} else if (strncmp(subtoken, "cfd=", 4) == 0) {
 				child->ipc_fd[1] = atoi(subtoken+4);
+				if (child->ipc_fd[1] > -1)
+					global.maxsock++;
 			} else if (strncmp(subtoken, "pid=", 4) == 0) {
 				child->pid = atoi(subtoken+4);
 			} else if (strncmp(subtoken, "reloads=", 8) == 0) {
@@ -537,14 +541,11 @@ void mworker_cleanup_proc()
 	list_for_each_entry_safe(child, it, &proc_list, list) {
 
 		if (child->pid == -1) {
-			/* Close the socketpair master side.  We don't need to
-			 * close the worker side, because it's stored in the
-			 * GLOBAL cli listener which was supposed to be in the
-			 * worker and which will be closed in
-			 * mworker_cleanlisteners()
-			 */
+			/* Close the socketpairs. */
 			if (child->ipc_fd[0] > -1)
 				close(child->ipc_fd[0]);
+			if (child->ipc_fd[1] > -1)
+				close(child->ipc_fd[1]);
 			if (child->srv) {
 				/* only exists if we created a master CLI listener */
 				srv_drop(child->srv);

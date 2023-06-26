@@ -5513,8 +5513,12 @@ static int parse_retry_token(struct quic_conn *qc,
 /* Allocate a new QUIC connection with <version> as QUIC version. <ipv4>
  * boolean is set to 1 for IPv4 connection, 0 for IPv6. <server> is set to 1
  * for QUIC servers (or haproxy listeners).
- * <dcid> is the destination connection ID, <scid> is the source connection ID,
- * <token> the token found to be used for this connection with <token_len> as
+ * <dcid> is the destination connection ID, <scid> is the source connection ID.
+ * This latter <scid> CID as the same value on the wire as the one for <conn_id>
+ * which is the first CID of this connection but a different internal representation used to build
+ * NEW_CONNECTION_ID frames. This is the responsability of the caller to insert
+ * <conn_id> in the CIDs tree for this connection (qc->cids).
+ * <token> is the token found to be used for this connection with <token_len> as
  * length. Endpoints addresses are specified via <local_addr> and <peer_addr>.
  * Returns the connection if succeeded, NULL if not.
  */
@@ -5528,17 +5532,13 @@ static struct quic_conn *qc_new_conn(const struct quic_version *qv, int ipv4,
 {
 	int i;
 	struct quic_conn *qc;
-	/* Initial CID. */
-	char *buf_area = NULL;
 	struct listener *l = NULL;
 	struct quic_cc_algo *cc_algo = NULL;
-	struct quic_tls_ctx *ictx;
+	struct quic_tls_ctx *ictx, *app_ctx;
+
 	TRACE_ENTER(QUIC_EV_CONN_INIT);
-	/* TODO replace pool_zalloc by pool_alloc(). This requires special care
-	 * to properly initialized internal quic_conn members to safely use
-	 * quic_conn_release() on alloc failure.
-	 */
-	qc = pool_zalloc(pool_head_quic_conn);
+
+	qc = pool_alloc(pool_head_quic_conn);
 	if (!qc) {
 		TRACE_ERROR("Could not allocate a new connection", QUIC_EV_CONN_INIT);
 		goto err;
@@ -5546,25 +5546,81 @@ static struct quic_conn *qc_new_conn(const struct quic_version *qv, int ipv4,
 
 	/* Initialize in priority qc members required for a safe dealloc. */
 
+	/* Prevents these CID to be dumped by TRACE() calls */
+	qc->scid.len = qc->odcid.len = qc->dcid.len = 0;
 	/* required to use MTLIST_IN_LIST */
 	MT_LIST_INIT(&qc->accept_list);
 
 	LIST_INIT(&qc->rx.pkt_list);
 
+	qc->streams_by_id = EB_ROOT_UNIQUE;
+
+	/* Required to call free_quic_conn_cids() from quic_conn_release() */
+	qc->cids = EB_ROOT;
 	qc_init_fd(qc);
 
 	LIST_INIT(&qc->back_refs);
 	LIST_INIT(&qc->el_th_ctx);
 
-	/* Now proceeds to allocation of qc members. */
+	qc->wait_event.tasklet = NULL;
 
-	buf_area = pool_alloc(pool_head_quic_conn_rxbuf);
-	if (!buf_area) {
+	/* Required to destroy <qc> tasks from quic_conn_release() */
+	qc->timer_task = NULL;
+	qc->idle_timer_task = NULL;
+
+	qc->xprt_ctx = NULL;
+	qc->conn = NULL;
+	qc->qcc = NULL;
+	qc->app_ops = NULL;
+
+	/* Keyupdate: required to safely call quic_tls_ku_free() from
+	 * quic_conn_release().
+	 */
+	quic_tls_ku_reset(&qc->ku.prv_rx);
+	quic_tls_ku_reset(&qc->ku.nxt_rx);
+	quic_tls_ku_reset(&qc->ku.nxt_tx);
+
+	/* Encryption level: required to safely call quic_conn_enc_level_uninit()
+	 * from quic_conn_release().
+	 */
+	for (i = 0; i < QUIC_TLS_ENC_LEVEL_MAX; i++) {
+		struct quic_enc_level *qel = &qc->els[i];
+		struct quic_tls_ctx *ctx = &qel->tls_ctx;
+
+		quic_tls_ctx_reset(ctx);
+		qel->tx.crypto.nb_buf = 0;
+		qel->tx.crypto.bufs = NULL;
+		qel->cstream = NULL;
+		qel->pktns = NULL;
+	}
+
+	quic_tls_ctx_reset(&qc->negotiated_ictx);
+
+	app_ctx = &qc->els[QUIC_TLS_ENC_LEVEL_APP].tls_ctx;
+	app_ctx->rx.secret = NULL;
+	app_ctx->tx.secret = NULL;
+
+	/* Packet number spaces: required to safely call quic_pktns_tx_pkts_release()
+	 * from quic_conn_release().
+	 */
+	for (i = 0; i < QUIC_TLS_PKTNS_MAX; i++) {
+		struct quic_pktns *pktns = &qc->pktns[i];
+
+		LIST_INIT(&pktns->tx.frms);
+		pktns->tx.pkts = EB_ROOT_UNIQUE;
+		pktns->rx.arngs.root = EB_ROOT_UNIQUE;
+	}
+
+	/* Required to safely call quic_conn_prx_cntrs_update() from quic_conn_release(). */
+	qc->prx_counters = NULL;
+
+	/* Now proceeds to allocation of qc members. */
+	qc->rx.buf.area = pool_alloc(pool_head_quic_conn_rxbuf);
+	if (!qc->rx.buf.area) {
 		TRACE_ERROR("Could not allocate a new RX buffer", QUIC_EV_CONN_INIT, qc);
 		goto err;
 	}
 
-	qc->cids = EB_ROOT;
 	/* QUIC Server (or listener). */
 	if (server) {
 		struct proxy *prx;
@@ -5575,16 +5631,12 @@ static struct quic_conn *qc_new_conn(const struct quic_version *qv, int ipv4,
 
 		qc->prx_counters = EXTRA_COUNTERS_GET(prx->extra_counters_fe,
 		                                      &quic_stats_module);
-		qc->flags |= QUIC_FL_CONN_LISTENER;
+		qc->flags = QUIC_FL_CONN_LISTENER;
 		qc->state = QUIC_HS_ST_SERVER_INITIAL;
 		/* Copy the client original DCID. */
-		qc->odcid.len = dcid->len;
-		memcpy(qc->odcid.data, dcid->data, dcid->len);
-
-		/* copy the packet SCID to reuse it as DCID for sending */
-		if (scid->len)
-			memcpy(qc->dcid.data, scid->data, scid->len);
-		qc->dcid.len = scid->len;
+		qc->odcid = *dcid;
+		/* Copy the packet SCID to reuse it as DCID for sending */
+		qc->dcid = *scid;
 		qc->tx.buf = BUF_NULL;
 		qc->li = l;
 	}
@@ -5594,14 +5646,12 @@ static struct quic_conn *qc_new_conn(const struct quic_version *qv, int ipv4,
 		if (dcid->len)
 			memcpy(qc->dcid.data, dcid->data, dcid->len);
 		qc->dcid.len = dcid->len;
+		qc->li = NULL;
 	}
 	qc->mux_state = QC_MUX_NULL;
 	qc->err = quic_err_transport(QC_ERR_NO_ERROR);
 
 	conn_id->qc = qc;
-	eb64_insert(&qc->cids, &conn_id->seq_num);
-	/* Initialize the next CID sequence number to be used for this connection. */
-	qc->next_cid_seq_num = 1;
 
 	if ((global.tune.options & GTUNE_QUIC_SOCK_PER_CONN) &&
 	    is_addr(local_addr)) {
@@ -5632,6 +5682,7 @@ static struct quic_conn *qc_new_conn(const struct quic_version *qv, int ipv4,
 	}
 
 	qc->original_version = qv;
+	qc->negotiated_version = NULL;
 	qc->tps_tls_ext = (qc->original_version->num & 0xff000000) == 0xff000000 ?
 		TLS_EXTENSION_QUIC_TRANSPORT_PARAMETERS_DRAFT:
 		TLS_EXTENSION_QUIC_TRANSPORT_PARAMETERS;
@@ -5639,11 +5690,13 @@ static struct quic_conn *qc_new_conn(const struct quic_version *qv, int ipv4,
 	LIST_INIT(&qc->tx.frms_to_send);
 	qc->tx.nb_buf = QUIC_CONN_TX_BUFS_NB;
 	qc->tx.wbuf = qc->tx.rbuf = 0;
-	qc->tx.bytes = 0;
+	qc->tx.bytes = qc->tx.prep_bytes = 0;
+	memset(&qc->tx.params, 0, sizeof(qc->tx.params));
 	qc->tx.buf = BUF_NULL;
 	/* RX part. */
 	qc->rx.bytes = 0;
-	qc->rx.buf = b_make(buf_area, QUIC_CONN_RX_BUFSZ, 0, 0);
+	memset(&qc->rx.params, 0, sizeof(qc->rx.params));
+	qc->rx.buf = b_make(qc->rx.buf.area, QUIC_CONN_RX_BUFSZ, 0, 0);
 	for (i = 0; i < QCS_MAX_TYPES; i++)
 		qc->rx.strms[i].nb_streams = 0;
 
@@ -5655,11 +5708,11 @@ static struct quic_conn *qc_new_conn(const struct quic_version *qv, int ipv4,
 		goto err;
 	}
 
-	/* XXX TO DO: Only one path at this time. */
+	qc->max_ack_delay = 0;
+	/* Only one path at this time (multipath not supported) */
 	qc->path = &qc->paths[0];
 	quic_path_init(qc->path, ipv4, cc_algo ? cc_algo : default_quic_cc_algo, qc);
 
-	qc->streams_by_id = EB_ROOT_UNIQUE;
 	qc->stream_buf_count = 0;
 	memcpy(&qc->local_addr, local_addr, sizeof(qc->local_addr));
 	memcpy(&qc->peer_addr, peer_addr, sizeof qc->peer_addr);
@@ -5704,11 +5757,7 @@ static struct quic_conn *qc_new_conn(const struct quic_version *qv, int ipv4,
 	return qc;
 
  err:
-	pool_free(pool_head_quic_conn_rxbuf, buf_area);
-	if (qc) {
-		qc->rx.buf.area = NULL;
-		quic_conn_release(qc);
-	}
+	quic_conn_release(qc);
 	TRACE_LEAVE(QUIC_EV_CONN_INIT);
 	return NULL;
 }
@@ -5716,7 +5765,9 @@ static struct quic_conn *qc_new_conn(const struct quic_version *qv, int ipv4,
 /* Update the proxy counters of <qc> QUIC connection from its counters */
 static inline void quic_conn_prx_cntrs_update(struct quic_conn *qc)
 {
-	BUG_ON(!qc->prx_counters);
+	if (!qc->prx_counters)
+		return;
+
 	HA_ATOMIC_ADD(&qc->prx_counters->dropped_pkt, qc->cntrs.dropped_pkt);
 	HA_ATOMIC_ADD(&qc->prx_counters->dropped_pkt_bufoverrun, qc->cntrs.dropped_pkt_bufoverrun);
 	HA_ATOMIC_ADD(&qc->prx_counters->dropped_parsing, qc->cntrs.dropped_parsing);
@@ -5748,6 +5799,9 @@ void quic_conn_release(struct quic_conn *qc)
 	struct quic_rx_packet *pkt, *pktback;
 
 	TRACE_ENTER(QUIC_EV_CONN_CLOSE, qc);
+
+	if (!qc)
+		goto leave;
 
 	/* We must not free the quic-conn if the MUX is still allocated. */
 	BUG_ON(qc->mux_state == QC_MUX_READY);
@@ -5784,15 +5838,11 @@ void quic_conn_release(struct quic_conn *qc)
 		pool_free(pool_head_quic_rx_packet, pkt);
 	}
 
-	if (qc->idle_timer_task) {
-		task_destroy(qc->idle_timer_task);
-		qc->idle_timer_task = NULL;
-	}
+	task_destroy(qc->idle_timer_task);
+	qc->idle_timer_task = NULL;
 
-	if (qc->timer_task) {
-		task_destroy(qc->timer_task);
-		qc->timer_task = NULL;
-	}
+	task_destroy(qc->timer_task);
+	qc->timer_task = NULL;
 
 	tasklet_free(qc->wait_event.tasklet);
 
@@ -5825,11 +5875,12 @@ void quic_conn_release(struct quic_conn *qc)
 
 	quic_conn_prx_cntrs_update(qc);
 	pool_free(pool_head_quic_conn_rxbuf, qc->rx.buf.area);
+	qc->rx.buf.area = NULL;
 	pool_free(pool_head_quic_conn, qc);
 	qc = NULL;
 
 	TRACE_PROTO("QUIC conn. freed", QUIC_EV_CONN_FREED, qc);
-
+ leave:
 	TRACE_LEAVE(QUIC_EV_CONN_CLOSE, qc);
 }
 
@@ -6760,14 +6811,22 @@ static int qc_conn_alloc_ssl_ctx(struct quic_conn *qc)
 
 	TRACE_ENTER(QUIC_EV_CONN_NEW, qc);
 
-	ctx = pool_zalloc(pool_head_quic_conn_ctx);
+	ctx = pool_alloc(pool_head_quic_conn_ctx);
 	if (!ctx) {
 		TRACE_ERROR("SSL context allocation failed", QUIC_EV_CONN_TXPKT);
 		goto err;
 	}
 
-	ctx->subs = NULL;
+	ctx->conn = NULL;
+	ctx->bio = NULL;
+	ctx->xprt = NULL;
 	ctx->xprt_ctx = NULL;
+	memset(&ctx->wait_event, 0, sizeof(ctx->wait_event));
+	ctx->subs = NULL;
+	ctx->xprt_st = 0;
+	ctx->error_code = 0;
+	ctx->early_buf = BUF_NULL;
+	ctx->sent_early_data = 0;
 	ctx->qc = qc;
 
 	if (qc_is_listener(qc)) {
@@ -6899,6 +6958,14 @@ static struct quic_conn *quic_rx_pkt_retrieve_conn(struct quic_rx_packet *pkt,
 			if (!conn_id)
 				goto err;
 
+			qc = qc_new_conn(pkt->version, ipv4, &pkt->dcid, &pkt->scid, &token_odcid,
+			                 conn_id, &dgram->daddr, &pkt->saddr, 1,
+			                 !!pkt->token_len, l);
+			if (qc == NULL) {
+				pool_free(pool_head_quic_connection_id, conn_id);
+				goto err;
+			}
+
 			tree = &quic_cid_trees[quic_cid_tree_idx(&conn_id->cid)];
 			HA_RWLOCK_WRLOCK(QC_CID_LOCK, &tree->lock);
 			node = ebmb_insert(&tree->root, &conn_id->node, conn_id->cid.len);
@@ -6907,17 +6974,22 @@ static struct quic_conn *quic_rx_pkt_retrieve_conn(struct quic_rx_packet *pkt,
 
 				conn_id = ebmb_entry(node, struct quic_connection_id, node);
 				*new_tid = HA_ATOMIC_LOAD(&conn_id->tid);
+				quic_conn_release(qc);
+				qc = NULL;
+			}
+			else {
+				/* From here, <qc> is the correct connection for this <pkt> Initial
+				 * packet. <conn_id> must be inserted in the CIDs tree for this
+				 * connection.
+				 */
+				eb64_insert(&qc->cids, &conn_id->seq_num);
+				/* Initialize the next CID sequence number to be used for this connection. */
+				qc->next_cid_seq_num = 1;
 			}
 			HA_RWLOCK_WRUNLOCK(QC_CID_LOCK, &tree->lock);
 
 			if (*new_tid != -1)
 				goto out;
-
-			qc = qc_new_conn(pkt->version, ipv4, &pkt->dcid, &pkt->scid, &token_odcid,
-			                 conn_id, &dgram->daddr, &pkt->saddr, 1,
-			                 !!pkt->token_len, l);
-			if (qc == NULL)
-				goto err;
 
 			HA_ATOMIC_INC(&prx_counters->half_open_conn);
 		}
@@ -6964,10 +7036,7 @@ static int quic_rx_pkt_parse(struct quic_rx_packet *pkt,
 
 	prx = l->bind_conf->frontend;
 	prx_counters = EXTRA_COUNTERS_GET(prx->extra_counters_fe, &quic_stats_module);
-	/* This ist only to please to traces and distinguish the
-	 * packet with parsed packet number from others.
-	 */
-	pkt->pn_node.key = (uint64_t)-1;
+
 	if (end <= pos) {
 		TRACE_PROTO("Packet dropped", QUIC_EV_CONN_LPKT);
 		goto drop;
@@ -8291,22 +8360,31 @@ int quic_dgram_parse(struct quic_dgram *dgram, struct quic_conn *from_qc,
 	pos = dgram->buf;
 	end = pos + dgram->len;
 	do {
-		/* TODO replace zalloc -> alloc. */
-		pkt = pool_zalloc(pool_head_quic_rx_packet);
+		pkt = pool_alloc(pool_head_quic_rx_packet);
 		if (!pkt) {
 			TRACE_ERROR("RX packet allocation failed", QUIC_EV_CONN_LPKT);
 			goto err;
 		}
 
+		LIST_INIT(&pkt->qc_rx_pkt_list);
 		pkt->version = NULL;
+		pkt->type = QUIC_PACKET_TYPE_UNKNOWN;
 		pkt->pn_offset = 0;
+		pkt->len = 0;
+		pkt->raw_len = 0;
+		pkt->token = NULL;
+		pkt->token_len = 0;
+		pkt->aad_len = 0;
+		pkt->data = NULL;
+		pkt->pn_node.key = (uint64_t)-1;
+		pkt->refcnt = 0;
+		pkt->flags = 0;
+		pkt->time_received = now_ms;
 
 		/* Set flag if pkt is the first one in dgram. */
 		if (pos == dgram->buf)
 			pkt->flags |= QUIC_FL_RX_PACKET_DGRAM_FIRST;
 
-		LIST_INIT(&pkt->qc_rx_pkt_list);
-		pkt->time_received = now_ms;
 		quic_rx_packet_refinc(pkt);
 		if (quic_rx_pkt_parse(pkt, pos, end, dgram, li))
 			goto next;
