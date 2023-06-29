@@ -392,6 +392,8 @@ struct server {
 		char *ca_file;			/* CAfile to use on verify */
 		char *crl_file;			/* CRLfile to use on verify */
 		char *client_crt;		/* client certificate to send */
+		char *sigalgs;			/* Signature algorithms */
+		char *client_sigalgs;           /* Client Signature algorithms */
 		struct sample_expr *sni;        /* sample expression for SNI */
 		char *npn_str;                  /* NPN protocol string */
 		int npn_len;                    /* NPN protocol string length */
