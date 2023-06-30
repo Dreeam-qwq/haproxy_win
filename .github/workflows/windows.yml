@@ -8,8 +8,7 @@
 
 name: Build Haproxy Windows
 
-on:
-  push:
+on: [push]
 
 permissions:
   contents: read
