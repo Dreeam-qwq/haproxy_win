@@ -9,9 +9,11 @@
 #include <haproxy/buf.h>
 #include <haproxy/chunk.h>
 #include <haproxy/pool.h>
-#include <haproxy/quic_conn-t.h>
+#include <haproxy/quic_conn.h>
 
 
+DECLARE_POOL(pool_head_quic_enc_level,  "quic_enc_level",  sizeof(struct quic_enc_level));
+DECLARE_POOL(pool_head_quic_pktns,      "quic_pktns",      sizeof(struct quic_pktns));
 DECLARE_POOL(pool_head_quic_tls_secret, "quic_tls_secret", QUIC_TLS_SECRET_LEN);
 DECLARE_POOL(pool_head_quic_tls_iv,     "quic_tls_iv",     QUIC_TLS_IV_LEN);
 DECLARE_POOL(pool_head_quic_tls_key,    "quic_tls_key",    QUIC_TLS_KEY_LEN);
@@ -74,6 +76,19 @@ void quic_tls_kp_keys_hexdump(struct buffer *buf,
 		chunk_appendf(buf, "%02x", kp->iv[i]);
 }
 
+/* Release the memory of <pktns> packet number space attached to <qc> QUIC connection. */
+void quic_pktns_release(struct quic_conn *qc, struct quic_pktns **pktns)
+{
+	if (!*pktns)
+		return;
+
+	quic_pktns_tx_pkts_release(*pktns, qc);
+	quic_free_arngs(qc, &(*pktns)->rx.arngs);
+	LIST_DEL_INIT(&(*pktns)->list);
+	pool_free(pool_head_quic_pktns, *pktns);
+	*pktns = NULL;
+}
+
 /* Dump <secret> TLS secret. */
 void quic_tls_secret_hexdump(struct buffer *buf,
                              const unsigned char *secret, size_t secret_len)
@@ -83,6 +98,135 @@ void quic_tls_secret_hexdump(struct buffer *buf,
 	chunk_appendf(buf, " secret=");
 	for (i = 0; i < secret_len; i++)
 		chunk_appendf(buf, "%02x", secret[i]);
+}
+
+/* Uninitialize <qel> QUIC encryption level. Never fails. */
+void quic_conn_enc_level_uninit(struct quic_conn *qc, struct quic_enc_level *qel)
+{
+	int i;
+
+	TRACE_ENTER(QUIC_EV_CONN_CLOSE, qc);
+
+	for (i = 0; i < qel->tx.crypto.nb_buf; i++) {
+		if (qel->tx.crypto.bufs[i]) {
+			pool_free(pool_head_quic_crypto_buf, qel->tx.crypto.bufs[i]);
+			qel->tx.crypto.bufs[i] = NULL;
+		}
+	}
+	ha_free(&qel->tx.crypto.bufs);
+	quic_cstream_free(qel->cstream);
+
+	TRACE_LEAVE(QUIC_EV_CONN_CLOSE, qc);
+}
+
+/* Initialize QUIC TLS encryption level with <level<> as level for <qc> QUIC
+ * connection allocating everything needed.
+ *
+ * Returns 1 if succeeded, 0 if not. On error the caller is responsible to use
+ * quic_conn_enc_level_uninit() to cleanup partially allocated content.
+ */
+static int quic_conn_enc_level_init(struct quic_conn *qc,
+                                    struct quic_enc_level **el,
+                                    struct quic_pktns *pktns,
+                                    enum ssl_encryption_level_t level)
+{
+	int ret = 0;
+	struct quic_enc_level *qel;
+
+	TRACE_ENTER(QUIC_EV_CONN_CLOSE, qc);
+
+	qel = pool_alloc(pool_head_quic_enc_level);
+	if (!qel)
+		goto leave;
+
+	qel->tx.crypto.bufs = NULL;
+	qel->tx.crypto.nb_buf = 0;
+	qel->cstream = NULL;
+	qel->pktns = pktns;
+	qel->level = level;
+	quic_tls_ctx_reset(&qel->tls_ctx);
+
+	qel->rx.pkts = EB_ROOT;
+	LIST_INIT(&qel->rx.pqpkts);
+
+	/* Allocate only one buffer. */
+	/* TODO: use a pool */
+	qel->tx.crypto.bufs = malloc(sizeof *qel->tx.crypto.bufs);
+	if (!qel->tx.crypto.bufs)
+		goto err;
+
+	qel->tx.crypto.bufs[0] = pool_alloc(pool_head_quic_crypto_buf);
+	if (!qel->tx.crypto.bufs[0])
+		goto err;
+
+
+	qel->tx.crypto.bufs[0]->sz = 0;
+	qel->tx.crypto.nb_buf = 1;
+
+	qel->tx.crypto.sz = 0;
+	qel->tx.crypto.offset = 0;
+	/* No CRYPTO data for early data TLS encryption level */
+	if (level == ssl_encryption_early_data)
+		qel->cstream = NULL;
+	else {
+		qel->cstream = quic_cstream_new(qc);
+		if (!qel->cstream)
+			goto err;
+	}
+
+	LIST_APPEND(&qc->qel_list, &qel->list);
+	*el = qel;
+	ret = 1;
+ leave:
+	TRACE_LEAVE(QUIC_EV_CONN_CLOSE, qc);
+	return ret;
+
+ err:
+	quic_conn_enc_level_uninit(qc, qel);
+	pool_free(pool_head_quic_enc_level, qel);
+	goto leave;
+}
+
+/* Allocate a QUIC TLS encryption with <level> as TLS stack encryption to be
+ * attached to <qc> QUIC connection. Also allocate the associated packet number
+ * space object with <pktns> as address to be attached to <qc> if not already
+ * allocated.
+ * Return 1 if succeeded, 0 if not.
+ */
+int qc_enc_level_alloc(struct quic_conn *qc, struct quic_pktns **pktns,
+                       struct quic_enc_level **qel, enum ssl_encryption_level_t level)
+{
+	int ret = 0;
+
+	BUG_ON(!qel || !pktns);
+	BUG_ON(*qel && !*pktns);
+
+	if (!*pktns && !quic_pktns_init(qc, pktns))
+		goto leave;
+
+	if (!*qel && !quic_conn_enc_level_init(qc, qel, *pktns, level))
+	    goto leave;
+
+	ret = 1;
+ leave:
+	return ret;
+}
+
+/* Free the memory allocated to the encryption level attached to <qc> connection
+ * with <qel> as pointer address. Also remove it from the list of the encryption
+ * levels attached to this connection and reset its value to NULL.
+ * Never fails.
+ */
+void qc_enc_level_free(struct quic_conn *qc, struct quic_enc_level **qel)
+{
+	if (!*qel)
+		return;
+
+	quic_tls_ctx_secs_free(&(*qel)->tls_ctx);
+	quic_conn_enc_level_uninit(qc, *qel);
+	LIST_DEL_INIT(&(*qel)->list);
+	pool_free(pool_head_quic_enc_level, *qel);
+	*qel = NULL;
 }
 
 int quic_hkdf_extract(const EVP_MD *md,

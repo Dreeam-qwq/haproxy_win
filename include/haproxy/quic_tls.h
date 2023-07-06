@@ -25,15 +25,22 @@
 #include <haproxy/dynbuf.h>
 #include <haproxy/pool.h>
 #include <haproxy/openssl-compat.h>
-#include <haproxy/quic_conn-t.h>
+#include <haproxy/quic_conn.h>
+#include <haproxy/quic_frame.h>
 #include <haproxy/quic_tls-t.h>
 #include <haproxy/trace.h>
+
+void quic_pktns_release(struct quic_conn *qc, struct quic_pktns **pktns);
+int qc_enc_level_alloc(struct quic_conn *qc, struct quic_pktns **pktns,
+                       struct quic_enc_level **qel, enum ssl_encryption_level_t level);
+void qc_enc_level_free(struct quic_conn *qc, struct quic_enc_level **qel);
 
 void quic_tls_keys_hexdump(struct buffer *buf,
                            const struct quic_tls_secrets *secs);
 void quic_tls_kp_keys_hexdump(struct buffer *buf,
                               const struct quic_tls_kp *kp);
 
+void quic_conn_enc_level_uninit(struct quic_conn *qc, struct quic_enc_level *qel);
 void quic_tls_secret_hexdump(struct buffer *buf,
                              const unsigned char *secret, size_t secret_len);
 
@@ -160,6 +167,44 @@ static inline const EVP_CIPHER *tls_hp(const SSL_CIPHER *cipher)
 }
 
 /* These following functions map TLS implementation encryption level to ours */
+static inline struct quic_pktns **ssl_to_quic_pktns(struct quic_conn *qc,
+                                                    enum ssl_encryption_level_t level)
+{
+	switch (level) {
+	case ssl_encryption_initial:
+		return &qc->ipktns;
+	case ssl_encryption_early_data:
+		return &qc->apktns;
+	case ssl_encryption_handshake:
+		return &qc->hpktns;
+	case ssl_encryption_application:
+		return &qc->apktns;
+	default:
+		return NULL;
+	}
+}
+
+/* These following functions map TLS implementation encryption level to ours */
+static inline struct quic_pktns **qel_to_quic_pktns(struct quic_conn *qc,
+                                                    enum quic_tls_enc_level level)
+{
+	switch (level) {
+	case QUIC_TLS_ENC_LEVEL_INITIAL:
+		return &qc->ipktns;
+	case QUIC_TLS_ENC_LEVEL_EARLY_DATA:
+		return &qc->apktns;
+	case QUIC_TLS_ENC_LEVEL_HANDSHAKE:
+		return &qc->hpktns;
+	case QUIC_TLS_ENC_LEVEL_APP:
+		return &qc->apktns;
+	default:
+		return NULL;
+	}
+}
+
+/* Map <level> TLS stack encryption level to our internal QUIC TLS encryption level
+ * if succeded, or -1 if failed.
+ */
 static inline enum quic_tls_enc_level ssl_to_quic_enc_level(enum ssl_encryption_level_t level)
 {
 	switch (level) {
@@ -173,6 +218,68 @@ static inline enum quic_tls_enc_level ssl_to_quic_enc_level(enum ssl_encryption_
 		return QUIC_TLS_ENC_LEVEL_APP;
 	default:
 		return -1;
+	}
+}
+
+/* Return the address of the QUIC TLS encryption level associated to <level> TLS
+ * stack encryption level and attached to <qc> QUIC connection if succeeded, or
+ * NULL if failed.
+ */
+static inline struct quic_enc_level **ssl_to_qel_addr(struct quic_conn *qc,
+                                                      enum ssl_encryption_level_t level)
+{
+	switch (level) {
+	case ssl_encryption_initial:
+		return &qc->iel;
+	case ssl_encryption_early_data:
+		return &qc->eel;
+	case ssl_encryption_handshake:
+		return &qc->hel;
+	case ssl_encryption_application:
+		return &qc->ael;
+	default:
+		return NULL;
+	}
+}
+
+/* Return the address of the QUIC TLS encryption level associated to <level> internal
+ * encryption level and attached to <qc> QUIC connection if succeeded, or
+ * NULL if failed.
+ */
+static inline struct quic_enc_level **qel_to_qel_addr(struct quic_conn *qc,
+                                                      enum quic_tls_enc_level level)
+{
+	switch (level) {
+	case QUIC_TLS_ENC_LEVEL_INITIAL:
+		return &qc->iel;
+	case QUIC_TLS_ENC_LEVEL_EARLY_DATA:
+		return &qc->eel;
+	case QUIC_TLS_ENC_LEVEL_HANDSHAKE:
+		return &qc->hel;
+	case QUIC_TLS_ENC_LEVEL_APP:
+		return &qc->ael;
+	default:
+		return NULL;
+	}
+}
+
+/* Return the QUIC TLS encryption level associated to <level> internal encryption
+ * level attached to <qc> QUIC connection if succeeded, or NULL if failed.
+ */
+static inline struct quic_enc_level *qc_quic_enc_level(const struct quic_conn *qc,
+                                                       enum quic_tls_enc_level level)
+{
+	switch (level) {
+	case QUIC_TLS_ENC_LEVEL_INITIAL:
+		return qc->iel;
+	case QUIC_TLS_ENC_LEVEL_EARLY_DATA:
+		return qc->eel;
+	case QUIC_TLS_ENC_LEVEL_HANDSHAKE:
+		return qc->hel;
+	case QUIC_TLS_ENC_LEVEL_APP:
+		return qc->ael;
+	default:
+		return NULL;
 	}
 }
 
@@ -287,13 +394,13 @@ static inline char quic_enc_level_char(enum quic_tls_enc_level level)
 static inline char quic_enc_level_char_from_qel(const struct quic_enc_level *qel,
                                                 const struct quic_conn *qc)
 {
-	if (qel == &qc->els[QUIC_TLS_ENC_LEVEL_INITIAL])
+	if (qel == qc->iel)
 		return 'I';
-	else if (qel == &qc->els[QUIC_TLS_ENC_LEVEL_EARLY_DATA])
+	else if (qel == qc->eel)
 		return 'E';
-	else if (qel == &qc->els[QUIC_TLS_ENC_LEVEL_HANDSHAKE])
+	else if (qel == qc->hel)
 		return 'H';
-	else if (qel == &qc->els[QUIC_TLS_ENC_LEVEL_APP])
+	else if (qel == qc->ael)
 		return 'A';
 	return '-';
 }
@@ -317,6 +424,130 @@ static inline char quic_packet_type_enc_level_char(int packet_type)
 	default:
 		return '-';
 	}
+}
+
+/* Initialize a QUIC packet number space.
+ * Never fails.
+ */
+static inline int quic_pktns_init(struct quic_conn *qc, struct quic_pktns **p)
+{
+	struct quic_pktns *pktns;
+
+	pktns = pool_alloc(pool_head_quic_pktns);
+	if (!pktns)
+		return 0;
+
+	LIST_INIT(&pktns->tx.frms);
+	pktns->tx.next_pn = -1;
+	pktns->tx.pkts = EB_ROOT_UNIQUE;
+	pktns->tx.time_of_last_eliciting = 0;
+	pktns->tx.loss_time = TICK_ETERNITY;
+	pktns->tx.pto_probe = 0;
+	pktns->tx.in_flight = 0;
+	pktns->tx.ack_delay = 0;
+
+	pktns->rx.largest_pn = -1;
+	pktns->rx.largest_acked_pn = -1;
+	pktns->rx.arngs.root = EB_ROOT_UNIQUE;
+	pktns->rx.arngs.sz = 0;
+	pktns->rx.arngs.enc_sz = 0;
+	pktns->rx.nb_aepkts_since_last_ack = 0;
+	pktns->rx.largest_time_received = 0;
+
+	pktns->flags = 0;
+	if (p == &qc->hpktns && qc->apktns)
+		LIST_INSERT(&qc->ipktns->list, &pktns->list);
+	else
+		LIST_APPEND(&qc->pktns_list, &pktns->list);
+	*p = pktns;
+
+	return 1;
+}
+
+static inline void quic_pktns_tx_pkts_release(struct quic_pktns *pktns, struct quic_conn *qc)
+{
+	struct eb64_node *node;
+
+	node = eb64_first(&pktns->tx.pkts);
+	while (node) {
+		struct quic_tx_packet *pkt;
+		struct quic_frame *frm, *frmbak;
+
+		pkt = eb64_entry(node, struct quic_tx_packet, pn_node);
+		node = eb64_next(node);
+		if (pkt->flags & QUIC_FL_TX_PACKET_ACK_ELICITING)
+			qc->path->ifae_pkts--;
+		list_for_each_entry_safe(frm, frmbak, &pkt->frms, list) {
+			qc_frm_unref(frm, qc);
+			LIST_DEL_INIT(&frm->list);
+			quic_tx_packet_refdec(frm->pkt);
+			qc_frm_free(&frm);
+		}
+		eb64_delete(&pkt->pn_node);
+		quic_tx_packet_refdec(pkt);
+	}
+}
+
+/* Discard <pktns> packet number space attached to <qc> QUIC connection.
+ * Its loss information are reset. Deduce the outstanding bytes for this
+ * packet number space from the outstanding bytes for the path of this
+ * connection.
+ * Note that all the non acknowledged TX packets and their frames are freed.
+ * Always succeeds.
+ */
+static inline void quic_pktns_discard(struct quic_pktns *pktns,
+                                      struct quic_conn *qc)
+{
+	if (pktns == qc->ipktns)
+		qc->flags |= QUIC_FL_CONN_IPKTNS_DCD;
+	else if (pktns == qc->hpktns)
+		qc->flags |= QUIC_FL_CONN_HPKTNS_DCD;
+	qc->path->in_flight -= pktns->tx.in_flight;
+	qc->path->prep_in_flight -= pktns->tx.in_flight;
+	qc->path->loss.pto_count = 0;
+
+	pktns->tx.time_of_last_eliciting = 0;
+	pktns->tx.loss_time = TICK_ETERNITY;
+	pktns->tx.pto_probe = 0;
+	pktns->tx.in_flight = 0;
+	quic_pktns_tx_pkts_release(pktns, qc);
+}
+
+/* Return 1 if <pktns> matches with the Application packet number space of
+ * <conn> connection which is common to the 0-RTT and 1-RTT encryption levels, 0
+ * if not (handshake packets).
+ */
+static inline int quic_application_pktns(struct quic_pktns *pktns, struct quic_conn *qc)
+{
+	return pktns == qc->apktns;
+}
+
+/* Returns the current largest acknowledged packet number if exists, -1 if not */
+static inline int64_t quic_pktns_get_largest_acked_pn(struct quic_pktns *pktns)
+{
+	struct eb64_node *ar = eb64_last(&pktns->rx.arngs.root);
+
+	if (!ar)
+		return -1;
+
+	return eb64_entry(ar, struct quic_arng_node, first)->last;
+}
+
+/* Return a character to identify the packet number space <pktns> of <qc> QUIC
+ * connection. 'I' for Initial packet number space, 'H' for Handshake packet
+ * space, and 'A' for Application data number space, or '-' if not found.
+ */
+static inline char quic_pktns_char(const struct quic_conn *qc,
+                                   const struct quic_pktns *pktns)
+{
+	if (pktns == qc->apktns)
+		return 'A';
+	else if (pktns == qc->hpktns)
+		return 'H';
+	else if (pktns == qc->ipktns)
+		return 'I';
+
+	return '-';
 }
 
 /* Return the TLS encryption level to be used for <packet_type>
@@ -357,17 +588,52 @@ static inline enum quic_tls_pktns quic_tls_pktns(enum quic_tls_enc_level level)
 	}
 }
 
-/* Reset all members of <ctx> to default values. */
+/* Return 1 if <pktns> packet number space attached to <qc> connection has been discarded,
+ * 0 if not.
+ */
+static inline int quic_tls_pktns_is_dcd(struct quic_conn *qc, struct quic_pktns *pktns)
+{
+	if (pktns == qc->apktns)
+		return 0;
+
+	if ((pktns == qc->ipktns && (qc->flags & QUIC_FL_CONN_IPKTNS_DCD)) ||
+	    (pktns == qc->hpktns && (qc->flags & QUIC_FL_CONN_HPKTNS_DCD)))
+		return 1;
+
+	return 0;
+}
+
+/* Return 1 the packet number space attached to <qc> connection with <type> associated
+ * packet type has been discarded, 0 if not.
+ */
+static inline int quic_tls_pkt_type_pktns_dcd(struct quic_conn *qc, unsigned char type)
+{
+	if ((type == QUIC_PACKET_TYPE_INITIAL && (qc->flags & QUIC_FL_CONN_IPKTNS_DCD)) ||
+	    (type == QUIC_PACKET_TYPE_HANDSHAKE && (qc->flags & QUIC_FL_CONN_HPKTNS_DCD)))
+		return 1;
+
+	return 0;
+}
+
+/* Reset all members of <ctx> to default values, ->hp_key[] excepted */
 static inline void quic_tls_ctx_reset(struct quic_tls_ctx *ctx)
 {
 	ctx->rx.ctx = NULL;
+	ctx->rx.aead = NULL;
+	ctx->rx.md = NULL;
 	ctx->rx.hp_ctx = NULL;
+	ctx->rx.hp = NULL;
+	ctx->rx.secret = NULL;
 	ctx->rx.iv = NULL;
 	ctx->rx.key = NULL;
 	ctx->rx.pn = 0;
 
 	ctx->tx.ctx = NULL;
+	ctx->tx.aead = NULL;
+	ctx->tx.md = NULL;
 	ctx->tx.hp_ctx = NULL;
+	ctx->tx.hp = NULL;
+	ctx->tx.secret = NULL;
 	ctx->tx.iv = NULL;
 	ctx->tx.key = NULL;
 	/* Not used on the TX path. */
@@ -552,14 +818,6 @@ static inline int quic_get_tls_enc_levels(enum quic_tls_enc_level *level,
 	return ret;
 }
 
-/* Flag the keys at <qel> encryption level as discarded.
- * Note that this function is called only for Initial or Handshake encryption levels.
- */
-static inline void quic_tls_discard_keys(struct quic_enc_level *qel)
-{
-	qel->tls_ctx.flags |= QUIC_FL_TLS_SECRETS_DCD;
-}
-
 /* Derive the initial secrets with <ctx> as QUIC TLS context which is the
  * cryptographic context for the first encryption level (Initial) from
  * <cid> connection ID with <cidlen> as length (in bytes) for a server or not
@@ -708,13 +966,13 @@ static inline int quic_tls_ku_init(struct quic_conn *qc)
 /* Return 1 if <qel> has RX secrets, 0 if not. */
 static inline int quic_tls_has_rx_sec(const struct quic_enc_level *qel)
 {
-	return !!qel->tls_ctx.rx.key;
+	return qel && !!qel->tls_ctx.rx.key;
 }
 
 /* Return 1 if <qel> has TX secrets, 0 if not. */
 static inline int quic_tls_has_tx_sec(const struct quic_enc_level *qel)
 {
-	return !!qel->tls_ctx.tx.key;
+	return qel && !!qel->tls_ctx.tx.key;
 }
 
 #endif /* USE_QUIC */

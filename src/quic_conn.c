@@ -211,7 +211,6 @@ INITCALL1(STG_REGISTER, trace_register_source, TRACE_SOURCE);
 
 static BIO_METHOD *ha_quic_meth;
 
-DECLARE_POOL(pool_head_quic_tx_ring, "quic_tx_ring", QUIC_TX_RING_BUFSZ);
 DECLARE_POOL(pool_head_quic_conn_rxbuf, "quic_conn_rxbuf", QUIC_CONN_RX_BUFSZ);
 DECLARE_STATIC_POOL(pool_head_quic_conn_ctx,
                     "quic_conn_ctx", sizeof(struct ssl_sock_ctx));
@@ -221,8 +220,7 @@ DECLARE_POOL(pool_head_quic_connection_id,
 DECLARE_POOL(pool_head_quic_dgram, "quic_dgram", sizeof(struct quic_dgram));
 DECLARE_POOL(pool_head_quic_rx_packet, "quic_rx_packet", sizeof(struct quic_rx_packet));
 DECLARE_POOL(pool_head_quic_tx_packet, "quic_tx_packet", sizeof(struct quic_tx_packet));
-DECLARE_STATIC_POOL(pool_head_quic_rx_crypto_frm, "quic_rx_crypto_frm", sizeof(struct quic_rx_crypto_frm));
-DECLARE_STATIC_POOL(pool_head_quic_crypto_buf, "quic_crypto_buf", sizeof(struct quic_crypto_buf));
+DECLARE_POOL(pool_head_quic_crypto_buf, "quic_crypto_buf", sizeof(struct quic_crypto_buf));
 DECLARE_STATIC_POOL(pool_head_quic_cstream, "quic_cstream", sizeof(struct quic_cstream));
 DECLARE_POOL(pool_head_quic_frame, "quic_frame", sizeof(struct quic_frame));
 DECLARE_STATIC_POOL(pool_head_quic_arng, "quic_arng", sizeof(struct quic_arng_node));
@@ -317,16 +315,15 @@ static void quic_trace(enum trace_level level, uint64_t mask, const struct trace
 		}
 		if ((mask & QUIC_EV_CONN_ISEC) && qc) {
 			/* Initial read & write secrets. */
-			enum quic_tls_enc_level level = QUIC_TLS_ENC_LEVEL_INITIAL;
 			const unsigned char *rx_sec = a2;
 			const unsigned char *tx_sec = a3;
 
-			tls_ctx = &qc->els[level].tls_ctx;
-			chunk_appendf(&trace_buf, "\n  RX el=%c", quic_enc_level_char(level));
+			tls_ctx = &qc->iel->tls_ctx;
+			chunk_appendf(&trace_buf, "\n  RX el=I");
 			if (rx_sec)
 				quic_tls_secret_hexdump(&trace_buf, rx_sec, 32);
 			quic_tls_keys_hexdump(&trace_buf, &tls_ctx->rx);
-			chunk_appendf(&trace_buf, "\n  TX el=%c", quic_enc_level_char(level));
+			chunk_appendf(&trace_buf, "\n  TX el=I");
 			if (tx_sec)
 				quic_tls_secret_hexdump(&trace_buf, tx_sec, 32);
 			quic_tls_keys_hexdump(&trace_buf, &tls_ctx->tx);
@@ -357,12 +354,11 @@ static void quic_trace(enum trace_level level, uint64_t mask, const struct trace
 
 			if (level) {
 				enum quic_tls_enc_level lvl = ssl_to_quic_enc_level(*level);
+				struct quic_enc_level *qel = qc_quic_enc_level(qc, lvl);
 
 				chunk_appendf(&trace_buf, "\n  RX el=%c", quic_enc_level_char(lvl));
-				if (quic_tls_has_rx_sec(&qc->els[lvl])) {
-					tls_ctx = &qc->els[lvl].tls_ctx;
-					quic_tls_keys_hexdump(&trace_buf, &tls_ctx->rx);
-				}
+				if (quic_tls_has_rx_sec(qel))
+					quic_tls_keys_hexdump(&trace_buf, &qel->tls_ctx.rx);
 				else
 					chunk_appendf(&trace_buf, " (none)");
 			}
@@ -373,11 +369,11 @@ static void quic_trace(enum trace_level level, uint64_t mask, const struct trace
 
 			if (level) {
 				enum quic_tls_enc_level lvl = ssl_to_quic_enc_level(*level);
+				struct quic_enc_level *qel = qc_quic_enc_level(qc, lvl);
 
 				chunk_appendf(&trace_buf, "\n  TX el=%c", quic_enc_level_char(lvl));
-				if (quic_tls_has_tx_sec(&qc->els[lvl])) {
-					tls_ctx = &qc->els[lvl].tls_ctx;
-					quic_tls_keys_hexdump(&trace_buf, &tls_ctx->tx);
+				if (quic_tls_has_tx_sec(qel)) {
+					quic_tls_keys_hexdump(&trace_buf, &qel->tls_ctx.tx);
 				}
 				else
 					chunk_appendf(&trace_buf, " (none)");
@@ -614,9 +610,7 @@ static void quic_trace(enum trace_level level, uint64_t mask, const struct trace
 			const struct list *lost_pkts = a3;
 
 			if (pktns) {
-				chunk_appendf(&trace_buf, " pktns=%s",
-				              pktns == &qc->pktns[QUIC_TLS_PKTNS_INITIAL] ? "I" :
-				              pktns == &qc->pktns[QUIC_TLS_PKTNS_01RTT] ? "01RTT": "H");
+				chunk_appendf(&trace_buf, " pktns=%c", quic_pktns_char(qc, pktns));
 				if (pktns->tx.loss_time)
 				              chunk_appendf(&trace_buf, " loss_time=%dms",
 				                            TICKS_TO_MS(tick_remain(now_ms, pktns->tx.loss_time)));
@@ -639,9 +633,8 @@ static void quic_trace(enum trace_level level, uint64_t mask, const struct trace
 				chunk_appendf(&trace_buf, " ifae_pkts=%llu",
 				              (unsigned long long)*ifae_pkts);
 			if (pktns) {
-				chunk_appendf(&trace_buf, " pktns=%s pp=%d",
-				              pktns == &qc->pktns[QUIC_TLS_PKTNS_INITIAL] ? "I" :
-				              pktns == &qc->pktns[QUIC_TLS_PKTNS_01RTT] ? "01RTT": "H",
+				chunk_appendf(&trace_buf, " pktns=%c pp=%d",
+				              quic_pktns_char(qc, pktns),
 				              pktns->tx.pto_probe);
 				if (mask & (QUIC_EV_CONN_STIMER|QUIC_EV_CONN_SPTO)) {
 					if (pktns->tx.in_flight)
@@ -677,10 +670,9 @@ static void quic_trace(enum trace_level level, uint64_t mask, const struct trace
 				const struct quic_frame *frm;
 				if (pkt->flags & QUIC_FL_TX_PACKET_ACK)
 				    chunk_appendf(&trace_buf, " ack");
-				chunk_appendf(&trace_buf, " pn=%lu(%s) iflen=%llu",
+				chunk_appendf(&trace_buf, " pn=%lu(%c) iflen=%llu",
 				              (unsigned long)pkt->pn_node.key,
-				              pkt->pktns == &qc->pktns[QUIC_TLS_PKTNS_INITIAL] ? "I" :
-				              pkt->pktns == &qc->pktns[QUIC_TLS_PKTNS_01RTT] ? "01RTT": "H",
+				              quic_pktns_char(qc, pkt->pktns),
 				              (unsigned long long)pkt->in_flight_len);
 				chunk_appendf(&trace_buf, " rx.bytes=%llu tx.bytes=%llu",
 				              (unsigned long long)qc->rx.bytes,
@@ -817,15 +809,11 @@ static void quic_trace(enum trace_level level, uint64_t mask, const struct trace
 /* Returns 1 if the peer has validated <qc> QUIC connection address, 0 if not. */
 static inline int quic_peer_validated_addr(struct quic_conn *qc)
 {
-	struct quic_pktns *hdshk_pktns, *app_pktns;
-
 	if (!qc_is_listener(qc))
 		return 1;
 
-	hdshk_pktns = qc->els[QUIC_TLS_ENC_LEVEL_HANDSHAKE].pktns;
-	app_pktns = qc->els[QUIC_TLS_ENC_LEVEL_APP].pktns;
-	if ((hdshk_pktns->flags & QUIC_FL_PKTNS_PKT_RECEIVED) ||
-	    (app_pktns->flags & QUIC_FL_PKTNS_PKT_RECEIVED) ||
+	if ((qc->hpktns && (qc->hpktns->flags & QUIC_FL_PKTNS_PKT_RECEIVED)) ||
+	    (qc->apktns && (qc->apktns->flags & QUIC_FL_PKTNS_PKT_RECEIVED)) ||
 	    qc->state >= QUIC_HS_ST_COMPLETE)
 		return 1;
 
@@ -913,7 +901,7 @@ static inline void qc_set_timer(struct quic_conn *qc)
  */
 static int quic_tls_key_update(struct quic_conn *qc)
 {
-	struct quic_tls_ctx *tls_ctx = &qc->els[QUIC_TLS_ENC_LEVEL_APP].tls_ctx;
+	struct quic_tls_ctx *tls_ctx = &qc->ael->tls_ctx;
 	struct quic_tls_secrets *rx = &tls_ctx->rx;
 	struct quic_tls_secrets *tx = &tls_ctx->tx;
 	/* Used only for the traces */
@@ -1003,7 +991,7 @@ static int quic_tls_key_update(struct quic_conn *qc)
  */
 static void quic_tls_rotate_keys(struct quic_conn *qc)
 {
-	struct quic_tls_ctx *tls_ctx = &qc->els[QUIC_TLS_ENC_LEVEL_APP].tls_ctx;
+	struct quic_tls_ctx *tls_ctx = &qc->ael->tls_ctx;
 	unsigned char *curr_secret, *curr_iv, *curr_key;
 	EVP_CIPHER_CTX *curr_ctx;
 
@@ -1055,16 +1043,25 @@ int ha_quic_set_encryption_secrets(SSL *ssl, enum ssl_encryption_level_t level,
                                    const uint8_t *read_secret,
                                    const uint8_t *write_secret, size_t secret_len)
 {
+	int ret = 0;
 	struct quic_conn *qc = SSL_get_ex_data(ssl, ssl_qc_app_data_index);
-	struct quic_tls_ctx *tls_ctx = &qc->els[ssl_to_quic_enc_level(level)].tls_ctx;
+	struct quic_enc_level **qel = ssl_to_qel_addr(qc, level);
+	struct quic_pktns **pktns = ssl_to_quic_pktns(qc, level);
+	struct quic_tls_ctx *tls_ctx;
 	const SSL_CIPHER *cipher = SSL_get_current_cipher(ssl);
 	struct quic_tls_secrets *rx = NULL, *tx = NULL;
 	const struct quic_version *ver =
 		qc->negotiated_version ? qc->negotiated_version : qc->original_version;
-	int ret = 0;
 
 	TRACE_ENTER(QUIC_EV_CONN_RWSEC, qc);
 	BUG_ON(secret_len > QUIC_TLS_SECRET_LEN);
+
+	if (!*qel && !qc_enc_level_alloc(qc, pktns, qel, level)) {
+		TRACE_PROTO("Could not allocated an encryption level", QUIC_EV_CONN_ADDDATA, qc);
+		goto out;
+	}
+
+	tls_ctx = &(*qel)->tls_ctx;
 
 	if (qc->flags & QUIC_FL_CONN_TO_KILL) {
 		TRACE_PROTO("connection to be killed", QUIC_EV_CONN_ADDDATA, qc);
@@ -1358,12 +1355,11 @@ int quic_set_app_ops(struct quic_conn *qc, const unsigned char *alpn, size_t alp
 int ha_quic_add_handshake_data(SSL *ssl, enum ssl_encryption_level_t level,
                                const uint8_t *data, size_t len)
 {
-	struct quic_conn *qc;
-	enum quic_tls_enc_level tel;
-	struct quic_enc_level *qel;
 	int ret = 0;
+	struct quic_conn *qc = SSL_get_ex_data(ssl, ssl_qc_app_data_index);
+	struct quic_enc_level **qel = ssl_to_qel_addr(qc, level);
+	struct quic_pktns **pktns = ssl_to_quic_pktns(qc, level);
 
-	qc = SSL_get_ex_data(ssl, ssl_qc_app_data_index);
 	TRACE_ENTER(QUIC_EV_CONN_ADDDATA, qc);
 
 	if (qc->flags & QUIC_FL_CONN_TO_KILL) {
@@ -1376,14 +1372,10 @@ int ha_quic_add_handshake_data(SSL *ssl, enum ssl_encryption_level_t level,
 		goto out;
 	}
 
-	tel = ssl_to_quic_enc_level(level);
-	if (tel == -1) {
-		TRACE_ERROR("Wrong encryption level", QUIC_EV_CONN_ADDDATA, qc);
+	if (!*qel && !qc_enc_level_alloc(qc, pktns, qel, level))
 		goto leave;
-	}
 
-	qel = &qc->els[tel];
-	if (!quic_crypto_data_cpy(qc, qel, data, len)) {
+	if (!quic_crypto_data_cpy(qc, *qel, data, len)) {
 		TRACE_ERROR("Could not bufferize", QUIC_EV_CONN_ADDDATA, qc);
 		goto leave;
 	}
@@ -2683,10 +2675,10 @@ static inline int qc_pkt_with_only_acked_frms(struct quic_tx_packet *pkt)
 
 /* Prepare a fast retransmission from <qel> encryption level */
 static void qc_prep_fast_retrans(struct quic_conn *qc,
-                                 struct quic_enc_level *qel,
+                                 struct quic_pktns *pktns,
                                  struct list *frms1, struct list *frms2)
 {
-	struct eb_root *pkts = &qel->pktns->tx.pkts;
+	struct eb_root *pkts = &pktns->tx.pkts;
 	struct list *frms = frms1;
 	struct eb64_node *node;
 	struct quic_tx_packet *pkt;
@@ -2748,8 +2740,8 @@ static void qc_prep_hdshk_fast_retrans(struct quic_conn *qc,
 	struct list itmp = LIST_HEAD_INIT(itmp);
 	struct list htmp = LIST_HEAD_INIT(htmp);
 
-	struct quic_enc_level *iqel = &qc->els[QUIC_TLS_ENC_LEVEL_INITIAL];
-	struct quic_enc_level *hqel = &qc->els[QUIC_TLS_ENC_LEVEL_HANDSHAKE];
+	struct quic_enc_level *iqel = qc->iel;
+	struct quic_enc_level *hqel = qc->hel;
 	struct quic_enc_level *qel = iqel;
 	struct eb_root *pkts;
 	struct eb64_node *node;
@@ -2850,7 +2842,7 @@ static int qc_h3_request_reject(struct quic_conn *qc, uint64_t id)
 {
 	int ret = 0;
 	struct quic_frame *ss, *rs;
-	struct quic_enc_level *qel = &qc->els[QUIC_TLS_ENC_LEVEL_APP];
+	struct quic_enc_level *qel = qc->ael;
 	const uint64_t app_error_code = H3_REQUEST_REJECTED;
 
 	TRACE_ENTER(QUIC_EV_CONN_PRSHPKT, qc);
@@ -2944,11 +2936,6 @@ static int qc_handle_crypto_frm(struct quic_conn *qc,
 	struct ncbuf *ncbuf = &qel->cstream->rx.ncbuf;
 
 	TRACE_ENTER(QUIC_EV_CONN_PRSHPKT, qc);
-	if (unlikely(qel->tls_ctx.flags & QUIC_FL_TLS_SECRETS_DCD)) {
-		TRACE_PROTO("CRYPTO data discarded",
-					QUIC_EV_CONN_RXPKT, qc, pkt, &cfdebug);
-		goto done;
-	}
 
 	if (unlikely(crypto_frm->offset < cstream->rx.offset)) {
 		size_t diff;
@@ -2957,7 +2944,7 @@ static int qc_handle_crypto_frm(struct quic_conn *qc,
 			/* Nothing to do */
 			TRACE_PROTO("Already received CRYPTO data",
 						QUIC_EV_CONN_RXPKT, qc, pkt, &cfdebug);
-			if (qc_is_listener(qc) && qel == &qc->els[QUIC_TLS_ENC_LEVEL_INITIAL] &&
+			if (qc_is_listener(qc) && qel == qc->iel &&
 				!(qc->flags & QUIC_FL_CONN_HANDSHAKE_SPEED_UP))
 				*fast_retrans = 1;
 			goto done;
@@ -3026,7 +3013,7 @@ static int qc_build_new_connection_id_frm(struct quic_conn *qc,
 
 	TRACE_ENTER(QUIC_EV_CONN_PRSHPKT, qc);
 
-	qel = &qc->els[QUIC_TLS_ENC_LEVEL_APP];
+	qel = qc->ael;
 	frm = qc_frm_alloc(QUIC_FT_NEW_CONNECTION_ID);
 	if (!frm) {
 		TRACE_ERROR("frame allocation error", QUIC_EV_CONN_IO_CB, qc);
@@ -3342,8 +3329,8 @@ static int qc_parse_pkt_frms(struct quic_conn *qc, struct quic_rx_packet *pkt,
 	qel->pktns->flags |= QUIC_FL_PKTNS_PKT_RECEIVED;
 
 	if (fast_retrans) {
-		struct quic_enc_level *iqel = &qc->els[QUIC_TLS_ENC_LEVEL_INITIAL];
-		struct quic_enc_level *hqel = &qc->els[QUIC_TLS_ENC_LEVEL_HANDSHAKE];
+		struct quic_enc_level *iqel = qc->iel;
+		struct quic_enc_level *hqel = qc->hel;
 
 		TRACE_PROTO("speeding up handshake completion", QUIC_EV_CONN_PRSHPKT, qc);
 		qc_prep_hdshk_fast_retrans(qc, &iqel->pktns->tx.frms, &hqel->pktns->tx.frms);
@@ -3356,14 +3343,13 @@ static int qc_parse_pkt_frms(struct quic_conn *qc, struct quic_rx_packet *pkt,
 	 */
 	if (pkt->type == QUIC_PACKET_TYPE_HANDSHAKE && qc_is_listener(qc)) {
 	    if (qc->state >= QUIC_HS_ST_SERVER_INITIAL) {
-			if (!(qc->els[QUIC_TLS_ENC_LEVEL_INITIAL].tls_ctx.flags &
-			      QUIC_FL_TLS_SECRETS_DCD)) {
-				quic_tls_discard_keys(&qc->els[QUIC_TLS_ENC_LEVEL_INITIAL]);
+			if (qc->ipktns && !quic_tls_pktns_is_dcd(qc, qc->ipktns)) {
+				/* Discard the handshake packet number space. */
 				TRACE_PROTO("discarding Initial pktns", QUIC_EV_CONN_PRSHPKT, qc);
-				quic_pktns_discard(qc->els[QUIC_TLS_ENC_LEVEL_INITIAL].pktns, qc);
+				quic_pktns_discard(qc->ipktns, qc);
 				qc_set_timer(qc);
-				qc_el_rx_pkts_del(&qc->els[QUIC_TLS_ENC_LEVEL_INITIAL]);
-				qc_release_pktns_frms(qc, qc->els[QUIC_TLS_ENC_LEVEL_INITIAL].pktns);
+				qc_el_rx_pkts_del(qc->iel);
+				qc_release_pktns_frms(qc, qc->ipktns);
 			}
 		    if (qc->state < QUIC_HS_ST_SERVER_HANDSHAKE)
 			    qc->state = QUIC_HS_ST_SERVER_HANDSHAKE;
@@ -3435,9 +3421,7 @@ static int qc_may_build_pkt(struct quic_conn *qc, struct list *frms,
                             struct quic_enc_level *qel, int cc, int probe,
                             int *must_ack)
 {
-	int force_ack =
-		qel == &qc->els[QUIC_TLS_ENC_LEVEL_INITIAL] ||
-		qel == &qc->els[QUIC_TLS_ENC_LEVEL_HANDSHAKE];
+	int force_ack = qel == qc->iel || qel == qc->hel;
 	int nb_aepkts_since_last_ack = qel->pktns->rx.nb_aepkts_since_last_ack;
 
 	/* An acknowledgement must be sent if this has been forced by the caller,
@@ -3488,7 +3472,7 @@ static int qc_prep_app_pkts(struct quic_conn *qc, struct buffer *buf,
 
 	TRACE_ENTER(QUIC_EV_CONN_PHPKTS, qc);
 
-	qel = &qc->els[QUIC_TLS_ENC_LEVEL_APP];
+	qel = qc->ael;
 	total = 0;
 	pos = (unsigned char *)b_tail(buf);
 	while (b_contig_space(buf) >= (int)qc->path->mtu + dg_headlen) {
@@ -3584,12 +3568,14 @@ static int qc_prep_pkts(struct quic_conn *qc, struct buffer *buf,
 	BUG_ON_HOT(buf->head || buf->data);
 
 	total = 0;
-	qel = &qc->els[tel];
+	qel = qc_quic_enc_level(qc, tel);
 	frms = tel_frms;
 	dglen = 0;
 	padding = 0;
 	pos = (unsigned char *)b_head(buf);
 	first_pkt = prv_pkt = NULL;
+	end = pos; // just to let gcc know it will always be initialized
+
 	while (b_contig_space(buf) >= (int)qc->path->mtu + dg_headlen || prv_pkt) {
 		int err, probe, cc, must_ack;
 		enum quic_pkt_type pkt_type;
@@ -3610,7 +3596,7 @@ static int qc_prep_pkts(struct quic_conn *qc, struct buffer *buf,
 			if (tel != next_tel && next_tel != QUIC_TLS_ENC_LEVEL_NONE) {
 				tel = next_tel;
 				frms = next_tel_frms;
-				qel = &qc->els[tel];
+				qel = qc_quic_enc_level(qc, tel);
 				/* Build a new datagram */
 				prv_pkt = NULL;
 				TRACE_DEVEL("next encryption level selected", QUIC_EV_CONN_PHPKTS, qc);
@@ -3654,7 +3640,7 @@ static int qc_prep_pkts(struct quic_conn *qc, struct buffer *buf,
 
 		if (qc->negotiated_version) {
 			ver = qc->negotiated_version;
-			if (qel == &qc->els[QUIC_TLS_ENC_LEVEL_INITIAL])
+			if (qel == qc->iel)
 				tls_ctx = &qc->negotiated_ictx;
 			else
 				tls_ctx = &qel->tls_ctx;
@@ -3702,19 +3688,6 @@ static int qc_prep_pkts(struct quic_conn *qc, struct buffer *buf,
 		/* Let's say we have to build a new dgram */
 		prv_pkt = NULL;
 		dglen += cur_pkt->len;
-		/* Client: discard the Initial encryption keys as soon as
-		 * a handshake packet could be built.
-		 */
-		if (qc->state == QUIC_HS_ST_CLIENT_INITIAL &&
-		    pkt_type == QUIC_PACKET_TYPE_HANDSHAKE) {
-			quic_tls_discard_keys(&qc->els[QUIC_TLS_ENC_LEVEL_INITIAL]);
-			TRACE_PROTO("discarding Initial pktns", QUIC_EV_CONN_PHPKTS, qc);
-			quic_pktns_discard(qc->els[QUIC_TLS_ENC_LEVEL_INITIAL].pktns, qc);
-			qc_set_timer(qc);
-			qc_el_rx_pkts_del(&qc->els[QUIC_TLS_ENC_LEVEL_INITIAL]);
-			qc_release_pktns_frms(qc, qc->els[QUIC_TLS_ENC_LEVEL_INITIAL].pktns);
-			qc->state = QUIC_HS_ST_CLIENT_HANDSHAKE;
-		}
 		/* If the data for the current encryption level have all been sent,
 		 * select the next level.
 		 */
@@ -3724,11 +3697,19 @@ static int qc_prep_pkts(struct quic_conn *qc, struct buffer *buf,
 			if (tel == QUIC_TLS_ENC_LEVEL_HANDSHAKE && next_tel == tel)
 				next_tel = QUIC_TLS_ENC_LEVEL_APP;
 			tel = next_tel;
+			qel = qc_quic_enc_level(qc, tel);
+
+			/* This cannot happen. This is to please some compilers. */
+			if (!qel || !qel->pktns)
+				goto end_of_dgram;
+
+			/* Note that we cannot NULL as value for <qel> when for the Application
+			 * data encryption level. Furthermore this encryption is never released.
+			 */
 			if (tel == QUIC_TLS_ENC_LEVEL_APP)
-				frms = &qc->els[tel].pktns->tx.frms;
+				frms = &qel->pktns->tx.frms;
 			else
 				frms = next_tel_frms;
-			qel = &qc->els[tel];
 			if (!LIST_ISEMPTY(frms)) {
 				/* If there is data for the next level, do not
 				 * consume a datagram.
@@ -3737,6 +3718,7 @@ static int qc_prep_pkts(struct quic_conn *qc, struct buffer *buf,
 			}
 		}
 
+ end_of_dgram:
 		/* If we have to build a new datagram, set the current datagram as
 		 * prepared into <cbuf>.
 		 */
@@ -4169,7 +4151,7 @@ static int quic_build_post_handshake_frames(struct quic_conn *qc)
 
 	TRACE_ENTER(QUIC_EV_CONN_IO_CB, qc);
 
-	qel = &qc->els[QUIC_TLS_ENC_LEVEL_APP];
+	qel = qc->ael;
 	/* Only servers must send a HANDSHAKE_DONE frame. */
 	if (qc_is_listener(qc)) {
 		frm = qc_frm_alloc(QUIC_FT_HANDSHAKE_DONE);
@@ -4454,7 +4436,7 @@ static inline void qc_handle_spin_bit(struct quic_conn *qc, struct quic_rx_packe
 {
 	uint64_t largest_pn = qel->pktns->rx.largest_pn;
 
-	if (qel != &qc->els[QUIC_TLS_ENC_LEVEL_APP] || largest_pn == -1 ||
+	if (qel != qc->ael || largest_pn == -1 ||
 	    pkt->pn <= largest_pn)
 		return;
 
@@ -4478,12 +4460,10 @@ static inline void qc_handle_spin_bit(struct quic_conn *qc, struct quic_rx_packe
 static inline void qc_rm_hp_pkts(struct quic_conn *qc, struct quic_enc_level *el)
 {
 	struct quic_rx_packet *pqpkt, *pkttmp;
-	struct quic_enc_level *app_qel;
 
 	TRACE_ENTER(QUIC_EV_CONN_ELRMHP, qc);
-	app_qel = &qc->els[QUIC_TLS_ENC_LEVEL_APP];
 	/* A server must not process incoming 1-RTT packets before the handshake is complete. */
-	if (el == app_qel && qc_is_listener(qc) && qc->state < QUIC_HS_ST_COMPLETE) {
+	if (el == qc->ael && qc_is_listener(qc) && qc->state < QUIC_HS_ST_COMPLETE) {
 		TRACE_PROTO("RX hp not removed (handshake not completed)",
 		            QUIC_EV_CONN_ELRMHP, qc);
 		goto out;
@@ -4559,99 +4539,6 @@ static inline int qc_treat_rx_crypto_frms(struct quic_conn *qc,
 	return ret;
 }
 
-/* Process all the packets at <el> and <next_el> encryption level.
- * This is the caller responsibility to check that <cur_el> is different of <next_el>
- * as pointer value.
- * Return 1 if succeeded, 0 if not.
- */
-int qc_treat_rx_pkts(struct quic_conn *qc, struct quic_enc_level *cur_el,
-                     struct quic_enc_level *next_el)
-{
-	int ret = 0;
-	struct eb64_node *node;
-	int64_t largest_pn = -1;
-	unsigned int largest_pn_time_received = 0;
-	struct quic_enc_level *qel = cur_el;
-
-	TRACE_ENTER(QUIC_EV_CONN_RXPKT, qc);
-	qel = cur_el;
- next_tel:
-	if (!qel)
-		goto out;
-
-	node = eb64_first(&qel->rx.pkts);
-	while (node) {
-		struct quic_rx_packet *pkt;
-
-		pkt = eb64_entry(node, struct quic_rx_packet, pn_node);
-		TRACE_DATA("new packet", QUIC_EV_CONN_RXPKT,
-		            qc, pkt, NULL, qc->xprt_ctx->ssl);
-		if (!qc_pkt_decrypt(qc, qel, pkt)) {
-			/* Drop the packet */
-			TRACE_ERROR("packet decryption failed -> dropped",
-			            QUIC_EV_CONN_RXPKT, qc, pkt);
-		}
-		else {
-			if (!qc_parse_pkt_frms(qc, pkt, qel)) {
-				/* Drop the packet */
-				TRACE_ERROR("packet parsing failed -> dropped",
-				            QUIC_EV_CONN_RXPKT, qc, pkt);
-				qc->cntrs.dropped_parsing++;
-			}
-			else {
-				struct quic_arng ar = { .first = pkt->pn, .last = pkt->pn };
-
-				if (pkt->flags & QUIC_FL_RX_PACKET_ACK_ELICITING) {
-					int arm_ack_timer =
-						qc->state >= QUIC_HS_ST_COMPLETE &&
-						qel->pktns == &qc->pktns[QUIC_TLS_PKTNS_01RTT];
-
-					qel->pktns->flags |= QUIC_FL_PKTNS_ACK_REQUIRED;
-					qel->pktns->rx.nb_aepkts_since_last_ack++;
-					qc_idle_timer_rearm(qc, 1, arm_ack_timer);
-				}
-				if (pkt->pn > largest_pn) {
-					largest_pn = pkt->pn;
-					largest_pn_time_received = pkt->time_received;
-				}
-				/* Update the list of ranges to acknowledge. */
-				if (!quic_update_ack_ranges_list(qc, &qel->pktns->rx.arngs, &ar))
-					TRACE_ERROR("Could not update ack range list",
-					            QUIC_EV_CONN_RXPKT, qc);
-			}
-		}
-		node = eb64_next(node);
-		eb64_delete(&pkt->pn_node);
-		quic_rx_packet_refdec(pkt);
-	}
-
-	if (largest_pn != -1 && largest_pn > qel->pktns->rx.largest_pn) {
-		/* Update the largest packet number. */
-		qel->pktns->rx.largest_pn = largest_pn;
-		/* Update the largest acknowledged packet timestamps */
-		qel->pktns->rx.largest_time_received = largest_pn_time_received;
-		qel->pktns->flags |= QUIC_FL_PKTNS_NEW_LARGEST_PN;
-	}
-
-	if (qel->cstream && !qc_treat_rx_crypto_frms(qc, qel, qc->xprt_ctx)) {
-		// trace already emitted by function above
-		goto leave;
-	}
-
-	if (qel == cur_el) {
-		BUG_ON(qel == next_el);
-		qel = next_el;
-		largest_pn = -1;
-		goto next_tel;
-	}
-
- out:
-	ret = 1;
- leave:
-	TRACE_LEAVE(QUIC_EV_CONN_RXPKT, qc);
-	return ret;
-}
-
 /* Check if it's possible to remove header protection for packets related to
  * encryption level <qel>. If <qel> is NULL, assume it's false.
  *
@@ -4660,33 +4547,24 @@ int qc_treat_rx_pkts(struct quic_conn *qc, struct quic_enc_level *cur_el,
 static int qc_qel_may_rm_hp(struct quic_conn *qc, struct quic_enc_level *qel)
 {
 	int ret = 0;
-	enum quic_tls_enc_level tel;
 
 	TRACE_ENTER(QUIC_EV_CONN_TRMHP, qc);
 
 	if (!qel)
 		goto cant_rm_hp;
 
-	tel = ssl_to_quic_enc_level(qel->level);
-
-	/* check if tls secrets are available */
-	if (qel->tls_ctx.flags & QUIC_FL_TLS_SECRETS_DCD) {
-		TRACE_PROTO("Discarded keys", QUIC_EV_CONN_TRMHP, qc);
-		goto cant_rm_hp;
-	}
-
 	if (!quic_tls_has_rx_sec(qel)) {
 		TRACE_PROTO("non available secrets", QUIC_EV_CONN_TRMHP, qc);
 		goto cant_rm_hp;
 	}
 
-	if (tel == QUIC_TLS_ENC_LEVEL_APP && qc->state < QUIC_HS_ST_COMPLETE) {
+	if (qel == qc->ael && qc->state < QUIC_HS_ST_COMPLETE) {
 		TRACE_PROTO("handshake not complete", QUIC_EV_CONN_TRMHP, qc);
 		goto cant_rm_hp;
 	}
 
 	/* check if the connection layer is ready before using app level */
-	if ((tel == QUIC_TLS_ENC_LEVEL_APP || tel == QUIC_TLS_ENC_LEVEL_EARLY_DATA) &&
+	if ((qel == qc->ael || qel == qc->eel) &&
 	    qc->mux_state == QC_MUX_NULL) {
 		TRACE_PROTO("connection layer not ready", QUIC_EV_CONN_TRMHP, qc);
 		goto cant_rm_hp;
@@ -4695,6 +4573,99 @@ static int qc_qel_may_rm_hp(struct quic_conn *qc, struct quic_enc_level *qel)
 	ret = 1;
  cant_rm_hp:
 	TRACE_LEAVE(QUIC_EV_CONN_TRMHP, qc);
+	return ret;
+}
+
+/* Process all the packets for all the encryption levels listed in <qc> QUIC connection.
+ * Return 1 if succeeded, 0 if not.
+ */
+int qc_treat_rx_pkts(struct quic_conn *qc)
+{
+	int ret = 0;
+	struct eb64_node *node;
+	int64_t largest_pn = -1;
+	unsigned int largest_pn_time_received = 0;
+	struct quic_enc_level *qel, *qelbak;
+
+	TRACE_ENTER(QUIC_EV_CONN_RXPKT, qc);
+
+	list_for_each_entry_safe(qel, qelbak, &qc->qel_list, list) {
+		/* Treat packets waiting for header packet protection decryption */
+		if (!LIST_ISEMPTY(&qel->rx.pqpkts) && qc_qel_may_rm_hp(qc, qel))
+			qc_rm_hp_pkts(qc, qel);
+
+		node = eb64_first(&qel->rx.pkts);
+		while (node) {
+			struct quic_rx_packet *pkt;
+
+			pkt = eb64_entry(node, struct quic_rx_packet, pn_node);
+			TRACE_DATA("new packet", QUIC_EV_CONN_RXPKT,
+			           qc, pkt, NULL, qc->xprt_ctx->ssl);
+			if (!qc_pkt_decrypt(qc, qel, pkt)) {
+				/* Drop the packet */
+				TRACE_ERROR("packet decryption failed -> dropped",
+				            QUIC_EV_CONN_RXPKT, qc, pkt);
+			}
+			else {
+				if (!qc_parse_pkt_frms(qc, pkt, qel)) {
+					/* Drop the packet */
+					TRACE_ERROR("packet parsing failed -> dropped",
+					            QUIC_EV_CONN_RXPKT, qc, pkt);
+					qc->cntrs.dropped_parsing++;
+				}
+				else {
+					struct quic_arng ar = { .first = pkt->pn, .last = pkt->pn };
+
+					if (pkt->flags & QUIC_FL_RX_PACKET_ACK_ELICITING) {
+						int arm_ack_timer =
+							qc->state >= QUIC_HS_ST_COMPLETE &&
+							qel->pktns == qc->apktns;
+
+						qel->pktns->flags |= QUIC_FL_PKTNS_ACK_REQUIRED;
+						qel->pktns->rx.nb_aepkts_since_last_ack++;
+						qc_idle_timer_rearm(qc, 1, arm_ack_timer);
+					}
+					if (pkt->pn > largest_pn) {
+						largest_pn = pkt->pn;
+						largest_pn_time_received = pkt->time_received;
+					}
+					/* Update the list of ranges to acknowledge. */
+					if (!quic_update_ack_ranges_list(qc, &qel->pktns->rx.arngs, &ar))
+						TRACE_ERROR("Could not update ack range list",
+						            QUIC_EV_CONN_RXPKT, qc);
+				}
+			}
+			node = eb64_next(node);
+			eb64_delete(&pkt->pn_node);
+			quic_rx_packet_refdec(pkt);
+		}
+
+		if (largest_pn != -1 && largest_pn > qel->pktns->rx.largest_pn) {
+			/* Update the largest packet number. */
+			qel->pktns->rx.largest_pn = largest_pn;
+			/* Update the largest acknowledged packet timestamps */
+			qel->pktns->rx.largest_time_received = largest_pn_time_received;
+			qel->pktns->flags |= QUIC_FL_PKTNS_NEW_LARGEST_PN;
+		}
+
+		if (qel->cstream && !qc_treat_rx_crypto_frms(qc, qel, qc->xprt_ctx)) {
+			// trace already emitted by function above
+			goto leave;
+		}
+
+		/* Release the Initial encryption level and packet number space. */
+		if ((qc->flags & QUIC_FL_CONN_IPKTNS_DCD) && qel == qc->iel) {
+			qc_enc_level_free(qc, &qc->iel);
+			quic_pktns_release(qc, &qc->ipktns);
+		}
+
+		largest_pn = -1;
+	}
+
+ out:
+	ret = 1;
+ leave:
+	TRACE_LEAVE(QUIC_EV_CONN_RXPKT, qc);
 	return ret;
 }
 
@@ -4828,9 +4799,8 @@ int qc_send_mux(struct quic_conn *qc, struct list *frms)
 	/* Try to send post handshake frames first unless on 0-RTT. */
 	if ((qc->flags & QUIC_FL_CONN_NEED_POST_HANDSHAKE_FRMS) &&
 	    qc->state >= QUIC_HS_ST_COMPLETE) {
-		struct quic_enc_level *qel = &qc->els[QUIC_TLS_ENC_LEVEL_APP];
 		quic_build_post_handshake_frames(qc);
-		qc_send_app_pkts(qc, &qel->pktns->tx.frms);
+		qc_send_app_pkts(qc, &qc->ael->pktns->tx.frms);
 	}
 
 	TRACE_STATE("preparing data (from MUX)", QUIC_EV_CONN_TXPKT, qc);
@@ -4906,13 +4876,16 @@ int qc_send_hdshk_pkts(struct quic_conn *qc, int old_data,
 static int qc_dgrams_retransmit(struct quic_conn *qc)
 {
 	int ret = 0;
-	struct quic_enc_level *iqel = &qc->els[QUIC_TLS_ENC_LEVEL_INITIAL];
-	struct quic_enc_level *hqel = &qc->els[QUIC_TLS_ENC_LEVEL_HANDSHAKE];
-	struct quic_enc_level *aqel = &qc->els[QUIC_TLS_ENC_LEVEL_APP];
+	struct quic_pktns *ipktns = qc->ipktns;
+	struct quic_pktns *hpktns = qc->hpktns;
+	struct quic_pktns *apktns = qc->apktns;
 
 	TRACE_ENTER(QUIC_EV_CONN_TXPKT, qc);
 
-	if (iqel->pktns->flags & QUIC_FL_PKTNS_PROBE_NEEDED) {
+	/* Note that if the Initial packet number space is not discarded,
+	 * this is also the case for the Handshake packet number space.
+	 */
+	if (ipktns && (ipktns->flags & QUIC_FL_PKTNS_PROBE_NEEDED)) {
 		int i;
 
 		for (i = 0; i < QUIC_MAX_NB_PTO_DGRAMS; i++) {
@@ -4923,19 +4896,19 @@ static int qc_dgrams_retransmit(struct quic_conn *qc)
 			TRACE_DEVEL("Avail. ack eliciting frames", QUIC_EV_CONN_FRMLIST, qc, &ifrms);
 			TRACE_DEVEL("Avail. ack eliciting frames", QUIC_EV_CONN_FRMLIST, qc, &hfrms);
 			if (!LIST_ISEMPTY(&ifrms)) {
-				iqel->pktns->tx.pto_probe = 1;
+				ipktns->tx.pto_probe = 1;
 				if (!LIST_ISEMPTY(&hfrms))
-					hqel->pktns->tx.pto_probe = 1;
+					hpktns->tx.pto_probe = 1;
 				if (!qc_send_hdshk_pkts(qc, 1, QUIC_TLS_ENC_LEVEL_INITIAL, &ifrms,
 				                        QUIC_TLS_ENC_LEVEL_HANDSHAKE, &hfrms))
 					goto leave;
 				/* Put back unsent frames in their packet number spaces */
-				LIST_SPLICE(&iqel->pktns->tx.frms, &ifrms);
-				LIST_SPLICE(&hqel->pktns->tx.frms, &hfrms);
+				LIST_SPLICE(&ipktns->tx.frms, &ifrms);
+				LIST_SPLICE(&hpktns->tx.frms, &hfrms);
 			}
 			else {
 				if (!(qc->flags & QUIC_FL_CONN_ANTI_AMPLIFICATION_REACHED)) {
-					iqel->pktns->tx.pto_probe = 1;
+					ipktns->tx.pto_probe = 1;
 					if (!qc_send_hdshk_pkts(qc, 0, QUIC_TLS_ENC_LEVEL_INITIAL, &ifrms,
 					                        QUIC_TLS_ENC_LEVEL_NONE, NULL))
 						goto leave;
@@ -4944,61 +4917,61 @@ static int qc_dgrams_retransmit(struct quic_conn *qc)
 		}
 		TRACE_STATE("no more need to probe Initial packet number space",
 					QUIC_EV_CONN_TXPKT, qc);
-		iqel->pktns->flags &= ~QUIC_FL_PKTNS_PROBE_NEEDED;
-		hqel->pktns->flags &= ~QUIC_FL_PKTNS_PROBE_NEEDED;
+		ipktns->flags &= ~QUIC_FL_PKTNS_PROBE_NEEDED;
+		hpktns->flags &= ~QUIC_FL_PKTNS_PROBE_NEEDED;
 	}
 	else {
 		int i;
 
-		if (hqel->pktns->flags & QUIC_FL_PKTNS_PROBE_NEEDED) {
-			hqel->pktns->tx.pto_probe = 0;
+		if (hpktns && (hpktns->flags & QUIC_FL_PKTNS_PROBE_NEEDED)) {
+			hpktns->tx.pto_probe = 0;
 			for (i = 0; i < QUIC_MAX_NB_PTO_DGRAMS; i++) {
 				struct list frms1 = LIST_HEAD_INIT(frms1);
 
-				qc_prep_fast_retrans(qc, hqel, &frms1, NULL);
+				qc_prep_fast_retrans(qc, hpktns, &frms1, NULL);
 				TRACE_DEVEL("Avail. ack eliciting frames", QUIC_EV_CONN_FRMLIST, qc, &frms1);
 				if (!LIST_ISEMPTY(&frms1)) {
-					hqel->pktns->tx.pto_probe = 1;
+					hpktns->tx.pto_probe = 1;
 					if (!qc_send_hdshk_pkts(qc, 1, QUIC_TLS_ENC_LEVEL_HANDSHAKE, &frms1,
 					                        QUIC_TLS_ENC_LEVEL_NONE, NULL))
 						goto leave;
 
 					/* Put back unsent frames into their packet number spaces */
-					LIST_SPLICE(&hqel->pktns->tx.frms, &frms1);
+					LIST_SPLICE(&hpktns->tx.frms, &frms1);
 				}
 			}
 			TRACE_STATE("no more need to probe Handshake packet number space",
 			            QUIC_EV_CONN_TXPKT, qc);
-			hqel->pktns->flags &= ~QUIC_FL_PKTNS_PROBE_NEEDED;
+			hpktns->flags &= ~QUIC_FL_PKTNS_PROBE_NEEDED;
 		}
-		else if (aqel->pktns->flags & QUIC_FL_PKTNS_PROBE_NEEDED) {
+		else if (apktns && (apktns->flags & QUIC_FL_PKTNS_PROBE_NEEDED)) {
 			struct list frms2 = LIST_HEAD_INIT(frms2);
 			struct list frms1 = LIST_HEAD_INIT(frms1);
 
-			aqel->pktns->tx.pto_probe = 0;
-			qc_prep_fast_retrans(qc, aqel, &frms1, &frms2);
+			apktns->tx.pto_probe = 0;
+			qc_prep_fast_retrans(qc, apktns, &frms1, &frms2);
 			TRACE_PROTO("Avail. ack eliciting frames", QUIC_EV_CONN_FRMLIST, qc, &frms1);
 			TRACE_PROTO("Avail. ack eliciting frames", QUIC_EV_CONN_FRMLIST, qc, &frms2);
 			if (!LIST_ISEMPTY(&frms1)) {
-				aqel->pktns->tx.pto_probe = 1;
+				apktns->tx.pto_probe = 1;
 				if (!qc_send_app_probing(qc, &frms1)) {
 					qc_free_frm_list(&frms2);
 					goto leave;
 				}
 
 				/* Put back unsent frames into their packet number spaces */
-				LIST_SPLICE(&aqel->pktns->tx.frms, &frms1);
+				LIST_SPLICE(&apktns->tx.frms, &frms1);
 			}
 			if (!LIST_ISEMPTY(&frms2)) {
-				aqel->pktns->tx.pto_probe = 1;
+				apktns->tx.pto_probe = 1;
 				if (!qc_send_app_probing(qc, &frms2))
 					goto leave;
 				/* Put back unsent frames into their packet number spaces */
-				LIST_SPLICE(&aqel->pktns->tx.frms, &frms2);
+				LIST_SPLICE(&apktns->tx.frms, &frms2);
 			}
 			TRACE_STATE("no more need to probe 01RTT packet number space",
 			            QUIC_EV_CONN_TXPKT, qc);
-			aqel->pktns->flags &= ~QUIC_FL_PKTNS_PROBE_NEEDED;
+			apktns->flags &= ~QUIC_FL_PKTNS_PROBE_NEEDED;
 		}
 	}
 
@@ -5016,7 +4989,7 @@ struct task *quic_conn_app_io_cb(struct task *t, void *context, unsigned int sta
 
 	TRACE_ENTER(QUIC_EV_CONN_IO_CB, qc);
 
-	qel = &qc->els[QUIC_TLS_ENC_LEVEL_APP];
+	qel = qc->ael;
 	TRACE_STATE("connection handshake state", QUIC_EV_CONN_IO_CB, qc, &qc->state);
 
 	if (qc_test_fd(qc))
@@ -5039,10 +5012,7 @@ struct task *quic_conn_app_io_cb(struct task *t, void *context, unsigned int sta
 			goto out;
 	}
 
-	if (!LIST_ISEMPTY(&qel->rx.pqpkts) && qc_qel_may_rm_hp(qc, qel))
-		qc_rm_hp_pkts(qc, qel);
-
-	if (!qc_treat_rx_pkts(qc, qel, NULL)) {
+	if (!qc_treat_rx_pkts(qc)) {
 		TRACE_DEVEL("qc_treat_rx_pkts() failed", QUIC_EV_CONN_IO_CB, qc);
 		goto out;
 	}
@@ -5078,6 +5048,19 @@ static int qc_need_sending(struct quic_conn *qc, struct quic_enc_level *qel)
 	       !LIST_ISEMPTY(&qel->pktns->tx.frms);
 }
 
+static int qc_prep_hpkts(struct quic_conn *qc, struct buffer *buf,
+                         struct quic_enc_level *qel, struct quic_enc_level *next_qel)
+{
+	enum quic_tls_enc_level next_tel =
+		next_qel ? ssl_to_quic_enc_level(next_qel->level) : QUIC_TLS_ENC_LEVEL_NONE;
+	struct list *next_frms =
+		next_qel ? &next_qel->pktns->tx.frms : NULL;
+
+	return qc_prep_pkts(qc, buf,
+	                    ssl_to_quic_enc_level(qel->level), &qel->pktns->tx.frms,
+	                    next_tel, next_frms);
+}
+
 /* QUIC connection packet handler task. */
 struct task *quic_conn_io_cb(struct task *t, void *context, unsigned int state)
 {
@@ -5092,7 +5075,7 @@ struct task *quic_conn_io_cb(struct task *t, void *context, unsigned int state)
 
 	TRACE_ENTER(QUIC_EV_CONN_IO_CB, qc);
 
-	eqel = &qc->els[QUIC_TLS_ENC_LEVEL_EARLY_DATA];
+	eqel = qc->eel;
 	st = qc->state;
 	TRACE_PROTO("connection state", QUIC_EV_CONN_IO_CB, qc, &st);
 
@@ -5113,7 +5096,7 @@ struct task *quic_conn_io_cb(struct task *t, void *context, unsigned int state)
 		qc_rcv_buf(qc);
 
 	if (st >= QUIC_HS_ST_COMPLETE &&
-	    qc_el_rx_pkts(&qc->els[QUIC_TLS_ENC_LEVEL_HANDSHAKE])) {
+	    qc_el_rx_pkts(qc->hel)) {
 		TRACE_DEVEL("remaining Handshake packets", QUIC_EV_CONN_PHPKTS, qc);
 		/* There may be remaining Handshake packets to treat and acknowledge. */
 		tel = QUIC_TLS_ENC_LEVEL_HANDSHAKE;
@@ -5122,15 +5105,11 @@ struct task *quic_conn_io_cb(struct task *t, void *context, unsigned int state)
 	else if (!quic_get_tls_enc_levels(&tel, &next_tel, qc, st, zero_rtt))
 		goto out;
 
-	qel = &qc->els[tel];
-	next_qel = next_tel == QUIC_TLS_ENC_LEVEL_NONE ? NULL : &qc->els[next_tel];
+	qel = qc_quic_enc_level(qc, tel);
+	next_qel = next_tel == QUIC_TLS_ENC_LEVEL_NONE ? NULL : qc_quic_enc_level(qc, next_tel);
 
  next_level:
-	/* Treat packets waiting for header packet protection decryption */
-	if (!LIST_ISEMPTY(&qel->rx.pqpkts) && qc_qel_may_rm_hp(qc, qel))
-		qc_rm_hp_pkts(qc, qel);
-
-	if (!qc_treat_rx_pkts(qc, qel, next_qel))
+	if (!qc_treat_rx_pkts(qc))
 		goto out;
 
 	if (qc->flags & QUIC_FL_CONN_TO_KILL) {
@@ -5155,18 +5134,16 @@ struct task *quic_conn_io_cb(struct task *t, void *context, unsigned int state)
 
 	st = qc->state;
 	if (st >= QUIC_HS_ST_COMPLETE) {
-		if (!(qc->els[QUIC_TLS_ENC_LEVEL_HANDSHAKE].tls_ctx.flags &
-		           QUIC_FL_TLS_SECRETS_DCD)) {
-			/* Discard the Handshake keys. */
-			quic_tls_discard_keys(&qc->els[QUIC_TLS_ENC_LEVEL_HANDSHAKE]);
+		if (!(qc->flags & QUIC_FL_CONN_HPKTNS_DCD)) {
+			/* Discard the Handshake packet number space. */
 			TRACE_PROTO("discarding Handshake pktns", QUIC_EV_CONN_PHPKTS, qc);
-			quic_pktns_discard(qc->els[QUIC_TLS_ENC_LEVEL_HANDSHAKE].pktns, qc);
+			quic_pktns_discard(qc->hel->pktns, qc);
 			qc_set_timer(qc);
-			qc_el_rx_pkts_del(&qc->els[QUIC_TLS_ENC_LEVEL_HANDSHAKE]);
-			qc_release_pktns_frms(qc, qc->els[QUIC_TLS_ENC_LEVEL_HANDSHAKE].pktns);
+			qc_el_rx_pkts_del(qc->hel);
+			qc_release_pktns_frms(qc, qc->hel->pktns);
 		}
 
-		if (qc->els[QUIC_TLS_ENC_LEVEL_HANDSHAKE].pktns->flags & QUIC_FL_PKTNS_ACK_REQUIRED) {
+		if (qc->hel->pktns->flags & QUIC_FL_PKTNS_ACK_REQUIRED) {
 			/* There may be remaining handshake to build (acks) */
 			st = QUIC_HS_ST_SERVER_HANDSHAKE;
 		}
@@ -5197,8 +5174,9 @@ struct task *quic_conn_io_cb(struct task *t, void *context, unsigned int state)
 	BUG_ON_HOT(b_data(buf));
 	b_reset(buf);
 
-	ret = qc_prep_pkts(qc, buf, tel, &qc->els[tel].pktns->tx.frms,
-	                   next_tel, &qc->els[next_tel].pktns->tx.frms);
+	ret = qc_prep_hpkts(qc, buf,
+	                    DISGUISE(qc_quic_enc_level(qc, tel)),
+	                    qc_quic_enc_level(qc, next_tel));
 	if (ret == -1) {
 		qc_txb_release(qc);
 		goto out;
@@ -5224,6 +5202,21 @@ struct task *quic_conn_io_cb(struct task *t, void *context, unsigned int state)
 	}
 
  out:
+	/* Release the Handshake encryption level and packet number space if
+	 * the Handshake is confirmed and if there is no need to send
+	 * anymore Handshake packets.
+	 */
+	if (quic_tls_pktns_is_dcd(qc, qc->hpktns) &&
+	    !qc_need_sending(qc, qc->hel)) {
+		/* Ensure Initial packet encryption level and packet number space have
+		 * been released.
+		 */
+		qc_enc_level_free(qc, &qc->iel);
+		quic_pktns_release(qc, &qc->ipktns);
+		qc_enc_level_free(qc, &qc->hel);
+		quic_pktns_release(qc, &qc->hpktns);
+	}
+
 	TRACE_PROTO("ssl error", QUIC_EV_CONN_IO_CB, qc, &st, &ssl_err);
 	TRACE_LEAVE(QUIC_EV_CONN_IO_CB, qc);
 	return t;
@@ -5280,79 +5273,6 @@ struct quic_cstream *quic_cstream_new(struct quic_conn *qc)
 	goto leave;
 }
 
-/* Uninitialize <qel> QUIC encryption level. Never fails. */
-static void quic_conn_enc_level_uninit(struct quic_conn *qc, struct quic_enc_level *qel)
-{
-	int i;
-
-	TRACE_ENTER(QUIC_EV_CONN_CLOSE, qc);
-
-	for (i = 0; i < qel->tx.crypto.nb_buf; i++) {
-		if (qel->tx.crypto.bufs[i]) {
-			pool_free(pool_head_quic_crypto_buf, qel->tx.crypto.bufs[i]);
-			qel->tx.crypto.bufs[i] = NULL;
-		}
-	}
-	ha_free(&qel->tx.crypto.bufs);
-	quic_cstream_free(qel->cstream);
-
-	TRACE_LEAVE(QUIC_EV_CONN_CLOSE, qc);
-}
-
-/* Initialize QUIC TLS encryption level with <level<> as level for <qc> QUIC
- * connection allocating everything needed.
- *
- * Returns 1 if succeeded, 0 if not. On error the caller is responsible to use
- * quic_conn_enc_level_uninit() to cleanup partially allocated content.
- */
-static int quic_conn_enc_level_init(struct quic_conn *qc,
-                                    enum quic_tls_enc_level level)
-{
-	int ret = 0;
-	struct quic_enc_level *qel;
-
-	TRACE_ENTER(QUIC_EV_CONN_CLOSE, qc);
-
-	qel = &qc->els[level];
-	qel->level = quic_to_ssl_enc_level(level);
-	qel->tls_ctx.rx.aead = qel->tls_ctx.tx.aead = NULL;
-	qel->tls_ctx.rx.md   = qel->tls_ctx.tx.md = NULL;
-	qel->tls_ctx.rx.hp   = qel->tls_ctx.tx.hp = NULL;
-	qel->tls_ctx.flags = 0;
-
-	qel->rx.pkts = EB_ROOT;
-	LIST_INIT(&qel->rx.pqpkts);
-
-	/* Allocate only one buffer. */
-	/* TODO: use a pool */
-	qel->tx.crypto.bufs = malloc(sizeof *qel->tx.crypto.bufs);
-	if (!qel->tx.crypto.bufs)
-		goto leave;
-
-	qel->tx.crypto.bufs[0] = pool_alloc(pool_head_quic_crypto_buf);
-	if (!qel->tx.crypto.bufs[0])
-		goto leave;
-
-	qel->tx.crypto.bufs[0]->sz = 0;
-	qel->tx.crypto.nb_buf = 1;
-
-	qel->tx.crypto.sz = 0;
-	qel->tx.crypto.offset = 0;
-	/* No CRYPTO data for early data TLS encryption level */
-	if (level == QUIC_TLS_ENC_LEVEL_EARLY_DATA)
-		qel->cstream = NULL;
-	else {
-		qel->cstream = quic_cstream_new(qc);
-		if (!qel->cstream)
-			goto leave;
-	}
-
-	ret = 1;
- leave:
-	TRACE_LEAVE(QUIC_EV_CONN_CLOSE, qc);
-	return ret;
-}
-
 /* Return 1 if <qc> connection may probe the Initial packet number space, 0 if not.
  * This is not the case if the remote peer address is not validated and if
  * it cannot send at least QUIC_INITIAL_PACKET_MINLEN bytes.
@@ -5400,7 +5320,7 @@ struct task *qc_process_timer(struct task *task, void *ctx, unsigned int state)
 			goto out;
 		}
 
-		if (pktns == &qc->pktns[QUIC_TLS_PKTNS_INITIAL]) {
+		if (pktns == qc->ipktns) {
 			if (qc_may_probe_ipktns(qc)) {
 				qc->flags |= QUIC_FL_CONN_RETRANS_NEEDED;
 				pktns->flags |= QUIC_FL_PKTNS_PROBE_NEEDED;
@@ -5409,19 +5329,19 @@ struct task *qc_process_timer(struct task *task, void *ctx, unsigned int state)
 			else {
 				TRACE_STATE("Cannot probe Initial packet number space", QUIC_EV_CONN_TXPKT, qc);
 			}
-			if (qc->pktns[QUIC_TLS_PKTNS_HANDSHAKE].tx.in_flight) {
+			if (qc->hpktns->tx.in_flight) {
 				qc->flags |= QUIC_FL_CONN_RETRANS_NEEDED;
-				qc->pktns[QUIC_TLS_PKTNS_HANDSHAKE].flags |= QUIC_FL_PKTNS_PROBE_NEEDED;
+				qc->hpktns->flags |= QUIC_FL_PKTNS_PROBE_NEEDED;
 				TRACE_STATE("needs to probe Handshake packet number space", QUIC_EV_CONN_TXPKT, qc);
 			}
 		}
-		else if (pktns == &qc->pktns[QUIC_TLS_PKTNS_HANDSHAKE]) {
+		else if (pktns == qc->hpktns) {
 			TRACE_STATE("needs to probe Handshake packet number space", QUIC_EV_CONN_TXPKT, qc);
 			qc->flags |= QUIC_FL_CONN_RETRANS_NEEDED;
 			pktns->flags |= QUIC_FL_PKTNS_PROBE_NEEDED;
-			if (qc->pktns[QUIC_TLS_PKTNS_INITIAL].tx.in_flight) {
+			if (qc->ipktns && qc->ipktns->tx.in_flight) {
 				if (qc_may_probe_ipktns(qc)) {
-					qc->pktns[QUIC_TLS_PKTNS_INITIAL].flags |= QUIC_FL_PKTNS_PROBE_NEEDED;
+					qc->ipktns->flags |= QUIC_FL_PKTNS_PROBE_NEEDED;
 					TRACE_STATE("needs to probe Initial packet number space", QUIC_EV_CONN_TXPKT, qc);
 				}
 				else {
@@ -5429,7 +5349,7 @@ struct task *qc_process_timer(struct task *task, void *ctx, unsigned int state)
 				}
 			}
 		}
-		else if (pktns == &qc->pktns[QUIC_TLS_PKTNS_01RTT]) {
+		else if (pktns == qc->apktns) {
 			pktns->tx.pto_probe = QUIC_MAX_NB_PTO_DGRAMS;
 			/* Wake up upper layer if waiting to send new data. */
 			if (!qc_notify_send(qc)) {
@@ -5440,13 +5360,10 @@ struct task *qc_process_timer(struct task *task, void *ctx, unsigned int state)
 		}
 	}
 	else if (!qc_is_listener(qc) && qc->state <= QUIC_HS_ST_COMPLETE) {
-		struct quic_enc_level *iel = &qc->els[QUIC_TLS_ENC_LEVEL_INITIAL];
-		struct quic_enc_level *hel = &qc->els[QUIC_TLS_ENC_LEVEL_HANDSHAKE];
-
-		if (quic_tls_has_tx_sec(hel))
-			hel->pktns->tx.pto_probe = 1;
-		if (quic_tls_has_tx_sec(iel))
-			iel->pktns->tx.pto_probe = 1;
+		if (quic_tls_has_tx_sec(qc->hel))
+			qc->hel->pktns->tx.pto_probe = 1;
+		if (quic_tls_has_tx_sec(qc->iel))
+			qc->iel->pktns->tx.pto_probe = 1;
 	}
 
 	tasklet_wakeup(qc->wait_event.tasklet);
@@ -5534,7 +5451,6 @@ static struct quic_conn *qc_new_conn(const struct quic_version *qv, int ipv4,
 	struct quic_conn *qc;
 	struct listener *l = NULL;
 	struct quic_cc_algo *cc_algo = NULL;
-	struct quic_tls_ctx *ictx, *app_ctx;
 
 	TRACE_ENTER(QUIC_EV_CONN_INIT);
 
@@ -5572,6 +5488,7 @@ static struct quic_conn *qc_new_conn(const struct quic_version *qv, int ipv4,
 	qc->conn = NULL;
 	qc->qcc = NULL;
 	qc->app_ops = NULL;
+	qc->path = NULL;
 
 	/* Keyupdate: required to safely call quic_tls_ku_free() from
 	 * quic_conn_release().
@@ -5580,36 +5497,14 @@ static struct quic_conn *qc_new_conn(const struct quic_version *qv, int ipv4,
 	quic_tls_ku_reset(&qc->ku.nxt_rx);
 	quic_tls_ku_reset(&qc->ku.nxt_tx);
 
-	/* Encryption level: required to safely call quic_conn_enc_level_uninit()
-	 * from quic_conn_release().
-	 */
-	for (i = 0; i < QUIC_TLS_ENC_LEVEL_MAX; i++) {
-		struct quic_enc_level *qel = &qc->els[i];
-		struct quic_tls_ctx *ctx = &qel->tls_ctx;
-
-		quic_tls_ctx_reset(ctx);
-		qel->tx.crypto.nb_buf = 0;
-		qel->tx.crypto.bufs = NULL;
-		qel->cstream = NULL;
-		qel->pktns = NULL;
-	}
+	/* Encryption levels */
+	qc->iel = qc->eel = qc->hel = qc->ael = NULL;
+	LIST_INIT(&qc->qel_list);
+	/* Packet number spaces */
+	qc->ipktns = qc->hpktns = qc->apktns = NULL;
+	LIST_INIT(&qc->pktns_list);
 
 	quic_tls_ctx_reset(&qc->negotiated_ictx);
-
-	app_ctx = &qc->els[QUIC_TLS_ENC_LEVEL_APP].tls_ctx;
-	app_ctx->rx.secret = NULL;
-	app_ctx->tx.secret = NULL;
-
-	/* Packet number spaces: required to safely call quic_pktns_tx_pkts_release()
-	 * from quic_conn_release().
-	 */
-	for (i = 0; i < QUIC_TLS_PKTNS_MAX; i++) {
-		struct quic_pktns *pktns = &qc->pktns[i];
-
-		LIST_INIT(&pktns->tx.frms);
-		pktns->tx.pkts = EB_ROOT_UNIQUE;
-		pktns->rx.arngs.root = EB_ROOT_UNIQUE;
-	}
 
 	/* Required to safely call quic_conn_prx_cntrs_update() from quic_conn_release(). */
 	qc->prx_counters = NULL;
@@ -5668,17 +5563,9 @@ static struct quic_conn *qc_new_conn(const struct quic_version *qv, int ipv4,
 	/* Select our SCID which is the first CID with 0 as sequence number. */
 	qc->scid = conn_id->cid;
 
-	/* Packet number spaces initialization. */
-	for (i = 0; i < QUIC_TLS_PKTNS_MAX; i++)
-		quic_pktns_init(&qc->pktns[i]);
-	/* QUIC encryption level context initialization. */
-	for (i = 0; i < QUIC_TLS_ENC_LEVEL_MAX; i++) {
-		if (!quic_conn_enc_level_init(qc, i)) {
-			TRACE_ERROR("Could not initialize an encryption level", QUIC_EV_CONN_INIT, qc);
-			goto err;
-		}
-		/* Initialize the packet number space. */
-		qc->els[i].pktns = &qc->pktns[quic_tls_pktns(i)];
+	if (!qc_enc_level_alloc(qc, &qc->ipktns, &qc->iel, ssl_encryption_initial)) {
+		TRACE_ERROR("Could not initialize an encryption level", QUIC_EV_CONN_INIT, qc);
+		goto err;
 	}
 
 	qc->original_version = qv;
@@ -5742,8 +5629,7 @@ static struct quic_conn *qc_new_conn(const struct quic_version *qv, int ipv4,
 	    !quic_conn_init_idle_timer_task(qc))
 		goto err;
 
-	ictx = &qc->els[QUIC_TLS_ENC_LEVEL_INITIAL].tls_ctx;
-	if (!qc_new_isecs(qc, ictx,qc->original_version, dcid->data, dcid->len, 1))
+	if (!qc_new_isecs(qc, &qc->iel->tls_ctx, qc->original_version, dcid->data, dcid->len, 1))
 		goto err;
 
 	/* Counters initialization */
@@ -5775,7 +5661,11 @@ static inline void quic_conn_prx_cntrs_update(struct quic_conn *qc)
 	HA_ATOMIC_ADD(&qc->prx_counters->sendto_err, qc->cntrs.sendto_err);
 	HA_ATOMIC_ADD(&qc->prx_counters->sendto_err_unknown, qc->cntrs.sendto_err_unknown);
 	HA_ATOMIC_ADD(&qc->prx_counters->sent_pkt, qc->cntrs.sent_pkt);
-	HA_ATOMIC_ADD(&qc->prx_counters->lost_pkt, qc->path->loss.nb_lost_pkt);
+	/* It is possible that ->path was not initialized. For instance if a
+	 * QUIC connection allocation has failed.
+	 */
+	if (qc->path)
+		HA_ATOMIC_ADD(&qc->prx_counters->lost_pkt, qc->path->loss.nb_lost_pkt);
 	HA_ATOMIC_ADD(&qc->prx_counters->conn_migration_done, qc->cntrs.conn_migration_done);
 	/* Stream related counters */
 	HA_ATOMIC_ADD(&qc->prx_counters->data_blocked, qc->cntrs.data_blocked);
@@ -5792,10 +5682,8 @@ static inline void quic_conn_prx_cntrs_update(struct quic_conn *qc)
  */
 void quic_conn_release(struct quic_conn *qc)
 {
-	int i;
 	struct ssl_sock_ctx *conn_ctx;
 	struct eb64_node *node;
-	struct quic_tls_ctx *app_tls_ctx;
 	struct quic_rx_packet *pkt, *pktback;
 
 	TRACE_ENTER(QUIC_EV_CONN_CLOSE, qc);
@@ -5856,20 +5744,24 @@ void quic_conn_release(struct quic_conn *qc)
 	}
 
 	quic_tls_ku_free(qc);
-	for (i = 0; i < QUIC_TLS_ENC_LEVEL_MAX; i++) {
-		quic_tls_ctx_secs_free(&qc->els[i].tls_ctx);
-		quic_conn_enc_level_uninit(qc, &qc->els[i]);
+	if (qc->ael) {
+		struct quic_tls_ctx *actx = &qc->ael->tls_ctx;
+
+		/* Secrets used by keyupdate */
+		pool_free(pool_head_quic_tls_secret, actx->rx.secret);
+		pool_free(pool_head_quic_tls_secret, actx->tx.secret);
 	}
+
+	qc_enc_level_free(qc, &qc->iel);
+	qc_enc_level_free(qc, &qc->eel);
+	qc_enc_level_free(qc, &qc->hel);
+	qc_enc_level_free(qc, &qc->ael);
+
 	quic_tls_ctx_secs_free(&qc->negotiated_ictx);
 
-	app_tls_ctx = &qc->els[QUIC_TLS_ENC_LEVEL_APP].tls_ctx;
-	pool_free(pool_head_quic_tls_secret, app_tls_ctx->rx.secret);
-	pool_free(pool_head_quic_tls_secret, app_tls_ctx->tx.secret);
-
-	for (i = 0; i < QUIC_TLS_PKTNS_MAX; i++) {
-		quic_pktns_tx_pkts_release(&qc->pktns[i], qc);
-		quic_free_arngs(qc, &qc->pktns[i].rx.arngs);
-	}
+	quic_pktns_release(qc, &qc->ipktns);
+	quic_pktns_release(qc, &qc->hpktns);
+	quic_pktns_release(qc, &qc->apktns);
 
 	qc_detach_th_ctx_list(qc, 0);
 
@@ -6157,7 +6049,18 @@ static inline int qc_try_rm_hp(struct quic_conn *qc,
 	pn = beg + pkt->pn_offset;
 
 	tel = quic_packet_type_enc_level(pkt->type);
-	qel = &qc->els[tel];
+	qel = qc_quic_enc_level(qc, tel);
+	if (!qel) {
+		struct quic_enc_level **qc_qel = qel_to_qel_addr(qc, tel);
+		struct quic_pktns **qc_pktns = qel_to_quic_pktns(qc, tel);
+
+		if (!qc_enc_level_alloc(qc, qc_pktns, qc_qel, quic_to_ssl_enc_level(tel))) {
+			TRACE_PROTO("Could not allocated an encryption level", QUIC_EV_CONN_ADDDATA, qc);
+			goto out;
+		}
+
+		qel = *qc_qel;
+	}
 
 	if (qc_qel_may_rm_hp(qc, qel)) {
 		struct quic_tls_ctx *tls_ctx = qc_select_tls_ctx(qc, qel, pkt);
@@ -6183,14 +6086,6 @@ static inline int qc_try_rm_hp(struct quic_conn *qc,
 		TRACE_PROTO("RX hp removed", QUIC_EV_CONN_TRMHP, qc, pkt);
 	}
 	else {
-		if (qel->tls_ctx.flags & QUIC_FL_TLS_SECRETS_DCD) {
-			/* If the packet number space has been discarded, this packet
-			 * will be not parsed.
-			 */
-			TRACE_PROTO("Discarded pktns", QUIC_EV_CONN_TRMHP, qc, pkt);
-			goto out;
-		}
-
 		TRACE_PROTO("RX hp not removed", QUIC_EV_CONN_TRMHP, qc, pkt);
 		LIST_APPEND(&qel->rx.pqpkts, &pkt->list);
 		quic_rx_packet_refinc(pkt);
@@ -6424,7 +6319,7 @@ static int quic_generate_retry_token_aad(unsigned char *aad,
 	unsigned char *p;
 
 	p = aad;
-	memcpy(p, &version, sizeof version);
+	*(uint32_t *)p = htonl(version);
 	p += sizeof version;
 	p += quic_saddr_cpy(p, addr);
 	memcpy(p, cid->data, cid->len);
@@ -6641,14 +6536,13 @@ static int send_retry(int fd, struct sockaddr_storage *addr,
 
 	TRACE_ENTER(QUIC_EV_CONN_TXPKT);
 
-	/* long header + fixed bit + packet type QUIC_PACKET_TYPE_RETRY */
+	/* long header(1) | fixed bit(1) | packet type QUIC_PACKET_TYPE_RETRY(2) | unused random bits(4)*/
 	buf[i++] = (QUIC_PACKET_LONG_HEADER_BIT | QUIC_PACKET_FIXED_BIT) |
-		(quic_pkt_type(QUIC_PACKET_TYPE_RETRY, qv->num) << QUIC_PACKET_TYPE_SHIFT);
+		(quic_pkt_type(QUIC_PACKET_TYPE_RETRY, qv->num) << QUIC_PACKET_TYPE_SHIFT) |
+		statistical_prng_range(16);
 	/* version */
-	buf[i++] = *((unsigned char *)&qv->num + 3);
-	buf[i++] = *((unsigned char *)&qv->num + 2);
-	buf[i++] = *((unsigned char *)&qv->num + 1);
-	buf[i++] = *(unsigned char *)&qv->num;
+	*(uint32_t *)&buf[i] = htonl(qv->num);
+	i += sizeof(uint32_t);
 
 	/* Use the SCID from <pkt> for Retry DCID. */
 	buf[i++] = pkt->scid.len;
@@ -7403,6 +7297,12 @@ static void qc_rx_pkt_handle(struct quic_conn *qc, struct quic_rx_packet *pkt,
 			task_wakeup(qc->timer_task, TASK_WOKEN_MSG);
 	}
 
+	/* Drop asap packet whose packet number space is discarded. */
+	if (quic_tls_pkt_type_pktns_dcd(qc, pkt->type)) {
+		TRACE_PROTO("Discarded packet number space", QUIC_EV_CONN_TRMHP, qc);
+		goto drop_silent;
+	}
+
 	if (qc->flags & QUIC_FL_CONN_IMMEDIATE_CLOSE) {
 		TRACE_PROTO("Connection error",
 		            QUIC_EV_CONN_LPKT, qc, NULL, NULL, qv);
@@ -7868,8 +7768,7 @@ static void qc_build_cc_frm(struct quic_conn *qc, struct quic_enc_level *qel,
 
 
 	if (qc->err.app) {
-		if (unlikely(qel == &qc->els[QUIC_TLS_ENC_LEVEL_INITIAL] ||
-		             qel == &qc->els[QUIC_TLS_ENC_LEVEL_HANDSHAKE])) {
+		if (unlikely(qel == qc->iel || qel == qc->hel)) {
 			/* RFC 9000 10.2.3.  Immediate Close during the Handshake
 			 *
 			 * Sending a CONNECTION_CLOSE of type 0x1d in an Initial or Handshake
@@ -8584,7 +8483,7 @@ void qc_notify_err(struct quic_conn *qc)
  */
 int qc_notify_send(struct quic_conn *qc)
 {
-	const struct quic_pktns *pktns = &qc->pktns[QUIC_TLS_PKTNS_01RTT];
+	const struct quic_pktns *pktns = qc->apktns;
 
 	if (qc->subs && qc->subs->events & SUB_RETRY_SEND) {
 		/* RFC 9002 7.5. Probe Timeout
@@ -8908,15 +8807,23 @@ static void dump_quic_full(struct show_quic_ctx *ctx, struct quic_conn *qc)
 	chunk_appendf(&trash, "\n");
 
 	/* Packet number spaces information */
-	pktns = &qc->pktns[QUIC_TLS_PKTNS_INITIAL];
-	chunk_appendf(&trash, "  [initl]             rx.ackrng=%-6zu tx.inflight=%-6zu",
-	              pktns->rx.arngs.sz, pktns->tx.in_flight);
-	pktns = &qc->pktns[QUIC_TLS_PKTNS_HANDSHAKE];
-	chunk_appendf(&trash, "           [hndshk] rx.ackrng=%-6zu tx.inflight=%-6zu\n",
-	              pktns->rx.arngs.sz, pktns->tx.in_flight);
-	pktns = &qc->pktns[QUIC_TLS_PKTNS_01RTT];
-	chunk_appendf(&trash, "  [01rtt]             rx.ackrng=%-6zu tx.inflight=%-6zu\n",
-	              pktns->rx.arngs.sz, pktns->tx.in_flight);
+	pktns = qc->ipktns;
+	if (pktns) {
+		chunk_appendf(&trash, "  [initl]             rx.ackrng=%-6zu tx.inflight=%-6zu",
+		              pktns->rx.arngs.sz, pktns->tx.in_flight);
+	}
+
+	pktns = qc->hpktns;
+	if (pktns) {
+		chunk_appendf(&trash, "           [hndshk] rx.ackrng=%-6zu tx.inflight=%-6zu\n",
+		              pktns->rx.arngs.sz, pktns->tx.in_flight);
+	}
+
+	pktns = qc->apktns;
+	if (pktns) {
+		chunk_appendf(&trash, "  [01rtt]             rx.ackrng=%-6zu tx.inflight=%-6zu\n",
+		              pktns->rx.arngs.sz, pktns->tx.in_flight);
+	}
 
 	chunk_appendf(&trash, "  srtt=%-4u rttvar=%-4u rttmin=%-4u ptoc=%-4u cwnd=%-6llu"
 	                      " mcwnd=%-6llu sentpkts=%-6llu lostpkts=%-6llu\n",

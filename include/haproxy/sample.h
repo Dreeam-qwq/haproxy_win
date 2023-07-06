@@ -33,6 +33,8 @@ extern const unsigned int fetch_cap[SMP_SRC_ENTRIES];
 extern const char *smp_to_type[SMP_TYPES];
 
 struct sample_expr *sample_parse_expr(char **str, int *idx, const char *file, int line, char **err, struct arg_list *al, char **endptr);
+int sample_parse_expr_cnv(char **str, int *idx, char **endptr, char **err_msg, struct arg_list *al, const char *file, int line,
+                          struct sample_expr *expr, const char *start);
 struct sample_conv *find_sample_conv(const char *kw, int len);
 struct sample *sample_process(struct proxy *px, struct session *sess,
                               struct stream *strm, unsigned int opt,
@@ -57,6 +59,7 @@ int smp_resolve_args(struct proxy *p, char **err);
 int smp_check_date_unit(struct arg *args, char **err);
 int smp_expr_output_type(struct sample_expr *expr);
 int c_none(struct sample *smp);
+int c_pseudo(struct sample *smp);
 int smp_dup(struct sample *smp);
 
 /*

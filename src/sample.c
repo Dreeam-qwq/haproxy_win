@@ -49,6 +49,7 @@
 /* sample type names */
 const char *smp_to_type[SMP_TYPES] = {
 	[SMP_T_ANY]  = "any",
+	[SMP_T_SAME] = "same",
 	[SMP_T_BOOL] = "bool",
 	[SMP_T_SINT] = "sint",
 	[SMP_T_ADDR] = "addr",
@@ -331,20 +332,48 @@ static const char *fetch_ckp_names[SMP_CKP_ENTRIES] = {
 	[SMP_CKP_CLI_PARSER] = "CLI parser",
 };
 
-/* This function returns the type of the data returned by the sample_expr.
- * It assumes that the <expr> and all of its converters are properly
- * initialized.
+/* This function returns the most accurate expected type of the data returned
+ * by the sample_expr. It assumes that the <expr> and all of its converters are
+ * properly initialized.
  */
-inline
 int smp_expr_output_type(struct sample_expr *expr)
 {
-	struct sample_conv_expr *smp_expr;
+	struct sample_conv_expr *cur_smp = NULL;
+	int cur_type = SMP_T_ANY;  /* current type in the chain */
+	int next_type = SMP_T_ANY; /* next type in the chain */
 
 	if (!LIST_ISEMPTY(&expr->conv_exprs)) {
-		smp_expr = LIST_PREV(&expr->conv_exprs, struct sample_conv_expr *, list);
-		return smp_expr->conv->out_type;
+		/* Ignore converters that output SMP_T_SAME if switching to them is
+		 * conversion-free. (such converter's output match with input, thus only
+		 * their input is considered)
+		 *
+		 * We start looking at the end of conv list and then loop back until the
+		 * sample fetch for better performance (it is more likely to find the last
+		 * effective output type near the end of the chain)
+		 */
+		do {
+			struct list *cur_head = (cur_smp) ? &cur_smp->list : &expr->conv_exprs;
+
+			cur_smp = LIST_PREV(cur_head, struct sample_conv_expr *, list);
+			if (cur_smp->conv->out_type != SMP_T_SAME) {
+				/* current converter has effective out_type */
+				cur_type = cur_smp->conv->out_type;
+				goto out;
+			}
+			else if (sample_casts[cur_type][next_type] != c_none)
+				return next_type; /* switching to next type is not conversion-free */
+
+			next_type = cur_smp->conv->in_type;
+		} while (cur_smp != LIST_NEXT(&expr->conv_exprs, struct sample_conv_expr *, list));
 	}
-	return expr->fetch->out_type;
+	/* conv list empty or doesn't have effective out_type,
+	 * falling back to sample fetch out_type
+	 */
+	cur_type = expr->fetch->out_type;
+ out:
+	if (sample_casts[cur_type][next_type] != c_none)
+		return next_type; /* switching to next type is not conversion-free */
+	return cur_type;
 }
 
 
@@ -864,6 +893,22 @@ int c_none(struct sample *smp)
 	return 1;
 }
 
+/* special converter function used by pseudo types in the compatibility matrix
+ * to inform that the conversion is theorically allowed at parsing time.
+ *
+ * However, being a pseudo type, it may not be emitted by fetches or converters
+ * so this function should never be called. If this is the case, then it means
+ * that a pseudo type has been used as a final output type at runtime, which is
+ * considered as a bug and should be fixed. To help spot this kind of bug, the
+ * process will crash in this case.
+ */
+int c_pseudo(struct sample *smp)
+{
+	ABORT_NOW(); // die loudly
+	/* never reached */
+	return 0;
+}
+
 static int c_str2int(struct sample *smp)
 {
 	const char *str;
@@ -977,116 +1022,53 @@ static int c_bool2bin(struct sample *smp)
 /*****************************************************************/
 
 sample_cast_fct sample_casts[SMP_TYPES][SMP_TYPES] = {
-/*            to:  ANY     BOOL       SINT       ADDR        IPV4      IPV6        STR         BIN         METH */
-/* from:  ANY */ { c_none, c_none,    c_none,    c_none,     c_none,   c_none,     c_none,     c_none,     c_none,     },
-/*       BOOL */ { c_none, c_none,    c_none,    NULL,       NULL,     NULL,       c_int2str,  c_bool2bin, NULL,       },
-/*       SINT */ { c_none, c_none,    c_none,    c_int2ip,   c_int2ip, c_int2ipv6, c_int2str,  c_int2bin,  NULL,       },
-/*       ADDR */ { c_none, NULL,      NULL,      NULL,       NULL,     NULL,       NULL,       NULL,       NULL,       },
-/*       IPV4 */ { c_none, NULL,      c_ip2int,  c_none,     c_none,   c_ip2ipv6,  c_ip2str,   c_addr2bin, NULL,       },
-/*       IPV6 */ { c_none, NULL,      NULL,      c_none,     c_ipv62ip,c_none,     c_ipv62str, c_addr2bin, NULL,       },
-/*        STR */ { c_none, c_str2int, c_str2int, c_str2addr, c_str2ip, c_str2ipv6, c_none,     c_none,     c_str2meth, },
-/*        BIN */ { c_none, NULL,      NULL,      NULL,       NULL,     NULL,       c_bin2str,  c_none,     c_str2meth, },
-/*       METH */ { c_none, NULL,      NULL,      NULL,       NULL,     NULL,       c_meth2str, c_meth2str, c_none,     }
+/*            to:  ANY     SAME      BOOL       SINT       ADDR        IPV4       IPV6        STR         BIN         METH */
+/* from:  ANY */ { c_none, NULL,     c_pseudo,  c_pseudo,  c_pseudo,   c_pseudo,  c_pseudo,   c_pseudo,   c_pseudo,   c_pseudo   },
+/*       SAME */ { NULL,   NULL,     NULL,      NULL,      NULL,       NULL,      NULL,       NULL,       NULL,       NULL       },
+/*       BOOL */ { c_none, NULL,     c_none,    c_none,    NULL,       NULL,      NULL,       c_int2str,  c_bool2bin, NULL       },
+/*       SINT */ { c_none, NULL,     c_none,    c_none,    c_int2ip,   c_int2ip,  c_int2ipv6, c_int2str,  c_int2bin,  NULL       },
+/*       ADDR */ { c_none, NULL,     NULL,      NULL,      c_pseudo,   c_pseudo,  c_pseudo,   c_pseudo,   c_pseudo,   NULL       },
+/*       IPV4 */ { c_none, NULL,     NULL,      c_ip2int,  c_none,     c_none,    c_ip2ipv6,  c_ip2str,   c_addr2bin, NULL       },
+/*       IPV6 */ { c_none, NULL,     NULL,      NULL,      c_none,     c_ipv62ip, c_none,     c_ipv62str, c_addr2bin, NULL       },
+/*        STR */ { c_none, NULL,     c_str2int, c_str2int, c_str2addr, c_str2ip,  c_str2ipv6, c_none,     c_none,     c_str2meth },
+/*        BIN */ { c_none, NULL,     NULL,      NULL,      NULL,       NULL,      NULL,       c_bin2str,  c_none,     c_str2meth },
+/*       METH */ { c_none, NULL,     NULL,      NULL,      NULL,       NULL,      NULL,       c_meth2str, c_meth2str, c_none     }
 };
 
-/*
- * Parse a sample expression configuration:
- *        fetch keyword followed by format conversion keywords.
- * Returns a pointer on allocated sample expression structure.
- * <al> is an arg_list serving as a list head to report missing dependencies.
- * It may be NULL if such dependencies are not allowed. Otherwise, the caller
- * must have set al->ctx if al is set.
+/* Process the converters (if any) for a sample expr after the first fetch
+ * keyword. We have two supported syntaxes for the converters, which can be
+ * combined:
+ *  - comma-delimited list of converters just after the keyword and args ;
+ *  - one converter per keyword (if <idx> != NULL)
+ *    FIXME: should we continue to support this old syntax?
+ * The combination allows to have each keyword being a comma-delimited
+ * series of converters.
+ *
+ * We want to process the former first, then the latter. For this we start
+ * from the beginning of the supposed place in the exiting conv chain, which
+ * starts at the last comma (<start> which is then referred to as endt).
+ *
  * If <endptr> is non-nul, it will be set to the first unparsed character
  * (which may be the final '\0') on success. If it is nul, the expression
  * must be properly terminated by a '\0' otherwise an error is reported.
+ *
+ * <expr> should point the the sample expression that is already initialized
+ * with the sample fetch that precedes the converters chain.
+ *
+ * The function returns a positive value for success and 0 for failure, in which
+ * case <err_msg> will point to an allocated string that brings some info
+ * about the failure. It is the caller's responsibility to free it.
  */
-struct sample_expr *sample_parse_expr(char **str, int *idx, const char *file, int line, char **err_msg, struct arg_list *al, char **endptr)
+int sample_parse_expr_cnv(char **str, int *idx, char **endptr, char **err_msg, struct arg_list *al, const char *file, int line,
+                          struct sample_expr *expr, const char *start)
 {
-	const char *begw; /* beginning of word */
-	const char *endw; /* end of word */
-	const char *endt; /* end of term */
-	struct sample_expr *expr = NULL;
-	struct sample_fetch *fetch;
 	struct sample_conv *conv;
-	unsigned long prev_type;
-	char *fkw = NULL;
+	const char *endt = start; /* end of term */
+	const char *begw;         /* beginning of word */
+	const char *endw;         /* end of word */
 	char *ckw = NULL;
-	int err_arg;
-
-	begw = str[*idx];
-	for (endw = begw; is_idchar(*endw); endw++)
-		;
-
-	if (endw == begw) {
-		memprintf(err_msg, "missing fetch method");
-		goto out_error;
-	}
-
-	/* keep a copy of the current fetch keyword for error reporting */
-	fkw = my_strndup(begw, endw - begw);
-
-	fetch = find_sample_fetch(begw, endw - begw);
-	if (!fetch) {
-		memprintf(err_msg, "unknown fetch method '%s'", fkw);
-		goto out_error;
-	}
-
-	/* At this point, we have :
-	 *   - begw : beginning of the keyword
-	 *   - endw : end of the keyword, first character not part of keyword
-	 */
-
-	if (fetch->out_type >= SMP_TYPES) {
-		memprintf(err_msg, "returns type of fetch method '%s' is unknown", fkw);
-		goto out_error;
-	}
-	prev_type = fetch->out_type;
-
-	expr = calloc(1, sizeof(*expr));
-	if (!expr)
-		goto out_error;
-
-	LIST_INIT(&(expr->conv_exprs));
-	expr->fetch = fetch;
-	expr->arg_p = empty_arg_list;
-
-	/* Note that we call the argument parser even with an empty string,
-	 * this allows it to automatically create entries for mandatory
-	 * implicit arguments (eg: local proxy name).
-	 */
-	if (al) {
-		al->kw = expr->fetch->kw;
-		al->conv = NULL;
-	}
-	if (make_arg_list(endw, -1, fetch->arg_mask, &expr->arg_p, err_msg, &endt, &err_arg, al) < 0) {
-		memprintf(err_msg, "fetch method '%s' : %s", fkw, *err_msg);
-		goto out_error;
-	}
-
-	/* now endt is our first char not part of the arg list, typically the
-	 * comma after the sample fetch name or after the closing parenthesis,
-	 * or the NUL char.
-	 */
-
-	if (!expr->arg_p) {
-		expr->arg_p = empty_arg_list;
-	}
-	else if (fetch->val_args && !fetch->val_args(expr->arg_p, err_msg)) {
-		memprintf(err_msg, "invalid args in fetch method '%s' : %s", fkw, *err_msg);
-		goto out_error;
-	}
-
-	/* Now process the converters if any. We have two supported syntaxes
-	 * for the converters, which can be combined :
-	 *  - comma-delimited list of converters just after the keyword and args ;
-	 *  - one converter per keyword
-	 * The combination allows to have each keyword being a comma-delimited
-	 * series of converters.
-	 *
-	 * We want to process the former first, then the latter. For this we start
-	 * from the beginning of the supposed place in the exiting conv chain, which
-	 * starts at the last comma (endt).
-	 */
+	unsigned long prev_type = expr->fetch->out_type;
+	int success = 1;
 
 	while (1) {
 		struct sample_conv_expr *conv_expr;
@@ -1101,7 +1083,7 @@ struct sample_expr *sample_parse_expr(char **str, int *idx, const char *file, in
 			if (ckw)
 				memprintf(err_msg, "missing comma after converter '%s'", ckw);
 			else
-				memprintf(err_msg, "missing comma after fetch keyword '%s'", fkw);
+				memprintf(err_msg, "missing comma after fetch keyword");
 			goto out_error;
 		}
 
@@ -1114,7 +1096,9 @@ struct sample_expr *sample_parse_expr(char **str, int *idx, const char *file, in
 		begw = endt; /* start of converter */
 
 		if (!*begw) {
-			/* none ? skip to next string */
+			/* none ? skip to next string if idx is set */
+			if (!idx)
+				break; /* end of converters */
 			(*idx)++;
 			begw = str[*idx];
 			if (!begw || !*begw)
@@ -1124,13 +1108,13 @@ struct sample_expr *sample_parse_expr(char **str, int *idx, const char *file, in
 		for (endw = begw; is_idchar(*endw); endw++)
 			;
 
-		free(ckw);
+		ha_free(&ckw);
 		ckw = my_strndup(begw, endw - begw);
 
 		conv = find_sample_conv(begw, endw - begw);
 		if (!conv) {
 			/* we found an isolated keyword that we don't know, it's not ours */
-			if (begw == str[*idx]) {
+			if (idx && begw == str[*idx]) {
 				endt = begw;
 				break;
 			}
@@ -1139,7 +1123,7 @@ struct sample_expr *sample_parse_expr(char **str, int *idx, const char *file, in
 		}
 
 		if (conv->in_type >= SMP_TYPES || conv->out_type >= SMP_TYPES) {
-			memprintf(err_msg, "returns type of converter '%s' is unknown", ckw);
+			memprintf(err_msg, "return type of converter '%s' is unknown", ckw);
 			goto out_error;
 		}
 
@@ -1149,7 +1133,15 @@ struct sample_expr *sample_parse_expr(char **str, int *idx, const char *file, in
 			goto out_error;
 		}
 
-		prev_type = conv->out_type;
+		/* Ignore converters that output SMP_T_SAME if switching to them is
+		 * conversion-free. (such converter's output match with input, thus only
+		 * their input is considered)
+		 */
+		if (conv->out_type != SMP_T_SAME)
+			prev_type = conv->out_type;
+		else if (sample_casts[prev_type][conv->in_type] != c_none)
+			prev_type = conv->in_type;
+
 		conv_expr = calloc(1, sizeof(*conv_expr));
 		if (!conv_expr)
 			goto out_error;
@@ -1185,10 +1177,105 @@ struct sample_expr *sample_parse_expr(char **str, int *idx, const char *file, in
 		/* end found, let's stop here */
 		*endptr = (char *)endt;
 	}
+ out:
+	free(ckw);
+	return success;
+
+ out_error:
+	success = 0;
+	goto out;
+}
+
+/*
+ * Parse a sample expression configuration:
+ *        fetch keyword followed by format conversion keywords.
+ *
+ * <al> is an arg_list serving as a list head to report missing dependencies.
+ * It may be NULL if such dependencies are not allowed. Otherwise, the caller
+ * must have set al->ctx if al is set.
+ *
+ * Returns a pointer on allocated sample expression structure or NULL in case
+ * of error, in which case <err_msg> will point to an allocated string that
+ * brings some info about the failure. It is the caller's responsibility to
+ * free it.
+ */
+struct sample_expr *sample_parse_expr(char **str, int *idx, const char *file, int line, char **err_msg, struct arg_list *al, char **endptr)
+{
+	const char *begw; /* beginning of word */
+	const char *endw; /* end of word */
+	const char *endt; /* end of term */
+	struct sample_expr *expr = NULL;
+	struct sample_fetch *fetch;
+	char *fkw = NULL;
+	int err_arg;
+
+	begw = str[*idx];
+	for (endw = begw; is_idchar(*endw); endw++)
+		;
+
+	if (endw == begw) {
+		memprintf(err_msg, "missing fetch method");
+		goto out_error;
+	}
+
+	/* keep a copy of the current fetch keyword for error reporting */
+	fkw = my_strndup(begw, endw - begw);
+
+	fetch = find_sample_fetch(begw, endw - begw);
+	if (!fetch) {
+		memprintf(err_msg, "unknown fetch method '%s'", fkw);
+		goto out_error;
+	}
+
+	/* At this point, we have :
+	 *   - begw : beginning of the keyword
+	 *   - endw : end of the keyword, first character not part of keyword
+	 */
+
+	if (fetch->out_type >= SMP_TYPES) {
+		memprintf(err_msg, "returns type of fetch method '%s' is unknown", fkw);
+		goto out_error;
+	}
+
+	expr = calloc(1, sizeof(*expr));
+	if (!expr)
+		goto out_error;
+
+	LIST_INIT(&(expr->conv_exprs));
+	expr->fetch = fetch;
+	expr->arg_p = empty_arg_list;
+
+	/* Note that we call the argument parser even with an empty string,
+	 * this allows it to automatically create entries for mandatory
+	 * implicit arguments (eg: local proxy name).
+	 */
+	if (al) {
+		al->kw = expr->fetch->kw;
+		al->conv = NULL;
+	}
+	if (make_arg_list(endw, -1, fetch->arg_mask, &expr->arg_p, err_msg, &endt, &err_arg, al) < 0) {
+		memprintf(err_msg, "fetch method '%s' : %s", fkw, *err_msg);
+		goto out_error;
+	}
+
+	/* now endt is our first char not part of the arg list, typically the
+	 * comma after the sample fetch name or after the closing parenthesis,
+	 * or the NUL char.
+	 */
+
+	if (!expr->arg_p) {
+		expr->arg_p = empty_arg_list;
+	}
+	else if (fetch->val_args && !fetch->val_args(expr->arg_p, err_msg)) {
+		memprintf(err_msg, "invalid args in fetch method '%s' : %s", fkw, *err_msg);
+		goto out_error;
+	}
+
+	if (!sample_parse_expr_cnv(str, idx, endptr, err_msg, al, file, line, expr, endt))
+		goto out_error;
 
  out:
 	free(fkw);
-	free(ckw);
 	return expr;
 
 out_error:
@@ -4398,9 +4485,9 @@ static int smp_fetch_quic_enabled(const struct arg *args, struct sample *smp, co
 }
 
 /* Note: must not be declared <const> as its list will be overwritten.
- * Note: fetches that may return multiple types must be declared as the lowest
- * common denominator, the type that can be casted into all other ones. For
- * instance IPv4/IPv6 must be declared IPv4.
+ * Note: fetches that may return multiple types should be declared using the
+ * appropriate pseudo-type. If not available it must be declared as the lowest
+ * common denominator, the type that can be casted into all other ones.
  */
 static struct sample_fetch_kw_list smp_kws = {ILH, {
 	{ "always_false", smp_fetch_false, 0,            NULL, SMP_T_BOOL, SMP_USE_CONST },
@@ -4439,7 +4526,7 @@ INITCALL1(STG_REGISTER, sample_register_fetches, &smp_kws);
 /* Note: must not be declared <const> as its list will be overwritten */
 static struct sample_conv_kw_list sample_conv_kws = {ILH, {
 	{ "add_item",sample_conv_add_item,     ARG3(2,STR,STR,STR),   smp_check_add_item,       SMP_T_STR,  SMP_T_STR  },
-	{ "debug",   sample_conv_debug,        ARG2(0,STR,STR),       smp_check_debug,          SMP_T_ANY,  SMP_T_ANY  },
+	{ "debug",   sample_conv_debug,        ARG2(0,STR,STR),       smp_check_debug,          SMP_T_ANY,  SMP_T_SAME },
 	{ "b64dec",  sample_conv_base642bin,   0,                     NULL,                     SMP_T_STR,  SMP_T_BIN  },
 	{ "base64",  sample_conv_bin2base64,   0,                     NULL,                     SMP_T_BIN,  SMP_T_STR  },
 	{ "concat",  sample_conv_concat,       ARG3(1,STR,STR,STR),   smp_check_concat,         SMP_T_STR,  SMP_T_STR  },
@@ -4452,7 +4539,7 @@ static struct sample_conv_kw_list sample_conv_kws = {ILH, {
 	{ "be2hex",  sample_conv_be2hex,       ARG3(1,STR,SINT,SINT), sample_conv_be2hex_check, SMP_T_BIN,  SMP_T_STR  },
 	{ "hex",     sample_conv_bin2hex,      0,                     NULL,                     SMP_T_BIN,  SMP_T_STR  },
 	{ "hex2i",   sample_conv_hex2int,      0,                     NULL,                     SMP_T_STR,  SMP_T_SINT },
-	{ "ipmask",  sample_conv_ipmask,       ARG2(1,MSK4,MSK6),     NULL,                     SMP_T_ADDR, SMP_T_IPV4 },
+	{ "ipmask",  sample_conv_ipmask,       ARG2(1,MSK4,MSK6),     NULL,                     SMP_T_ADDR, SMP_T_ADDR },
 	{ "ltime",   sample_conv_ltime,        ARG2(1,STR,SINT),      NULL,                     SMP_T_SINT, SMP_T_STR  },
 	{ "utime",   sample_conv_utime,        ARG2(1,STR,SINT),      NULL,                     SMP_T_SINT, SMP_T_STR  },
 	{ "crc32",   sample_conv_crc32,        ARG1(0,SINT),          NULL,                     SMP_T_BIN,  SMP_T_SINT },

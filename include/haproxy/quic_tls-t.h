@@ -19,6 +19,10 @@
 
 #include <openssl/evp.h>
 
+#include <import/ebtree.h>
+
+#include <haproxy/openssl-compat.h>
+
 /* It seems TLS 1.3 ciphersuites macros differ between openssl and boringssl */
 
 #if defined(OPENSSL_IS_BORINGSSL)
@@ -40,7 +44,7 @@
 /* AEAD iv and secrete key lengths */
 #define QUIC_TLS_IV_LEN     12 /* bytes */
 #define QUIC_TLS_KEY_LEN    32 /* bytes */
-#define QUIC_TLS_SECRET_LEN 64 /* bytes */
+#define QUIC_TLS_SECRET_LEN 48 /* bytes */
 /* The ciphersuites for AEAD QUIC-TLS have 16-bytes authentication tags */
 #define QUIC_TLS_TAG_LEN    16 /* bytes */
 
@@ -48,6 +52,8 @@
 #define TLS_EXTENSION_QUIC_TRANSPORT_PARAMETERS       0x0039
 #define TLS_EXTENSION_QUIC_TRANSPORT_PARAMETERS_DRAFT 0xffa5
 
+extern struct pool_head *pool_head_quic_pktns;
+extern struct pool_head *pool_head_quic_enc_level;
 extern struct pool_head *pool_head_quic_tls_secret;
 extern struct pool_head *pool_head_quic_tls_iv;
 extern struct pool_head *pool_head_quic_tls_key;
@@ -116,6 +122,53 @@ extern const unsigned char initial_salt_draft_29[20];
 extern const unsigned char initial_salt_v1[20];
 extern const unsigned char initial_salt_v2[20];
 
+/* The maximum number of ack ranges to be built in ACK frames */
+#define QUIC_MAX_ACK_RANGES   32
+
+/* Structure to maintain a set of ACK ranges to be used to build ACK frames. */
+struct quic_arngs {
+	/* ebtree of ACK ranges organized by their first value. */
+	struct eb_root root;
+	/* The number of ACK ranges is this tree */
+	size_t sz;
+	/* The number of bytes required to encode this ACK ranges lists. */
+	size_t enc_sz;
+};
+
+/* QUIC packet number space */
+struct quic_pktns {
+	struct list list;
+	struct {
+		/* List of frames to send. */
+		struct list frms;
+		/* Next packet number to use for transmissions. */
+		int64_t next_pn;
+		/* The packet which has been sent. */
+		struct eb_root pkts;
+		/* The time the most recent ack-eliciting packer was sent. */
+		unsigned int time_of_last_eliciting;
+		/* The time this packet number space has experienced packet loss. */
+		unsigned int loss_time;
+		/* Boolean to denote if we must send probe packet. */
+		unsigned int pto_probe;
+		/* In flight bytes for this packet number space. */
+		size_t in_flight;
+		/* The acknowledgement delay of the packet with the largest packet number */
+		uint64_t ack_delay;
+	} tx;
+	struct {
+		/* Largest packet number */
+		int64_t largest_pn;
+		/* Largest acked sent packet. */
+		int64_t largest_acked_pn;
+		struct quic_arngs arngs;
+		unsigned int nb_aepkts_since_last_ack;
+		/* The time the packet with the largest packet number was received */
+		uint64_t largest_time_received;
+	} rx;
+	unsigned int flags;
+};
+
 /* Key phase used for Key Update */
 struct quic_tls_kp {
 	EVP_CIPHER_CTX *ctx;
@@ -132,8 +185,6 @@ struct quic_tls_kp {
 
 /* Key update phase bit */
 #define QUIC_FL_TLS_KP_BIT_SET   (1 << 0)
-/* Flag to be used when TLS secrets have been discarded. */
-#define QUIC_FL_TLS_SECRETS_DCD  (1 << 1)
 
 struct quic_tls_secrets {
 	EVP_CIPHER_CTX *ctx;
@@ -161,6 +212,43 @@ struct quic_tls_ctx {
 	struct quic_tls_secrets rx;
 	struct quic_tls_secrets tx;
 	unsigned char flags;
+};
+
+struct quic_enc_level {
+	struct list list;
+	/* Encryption level, as defined by the TLS stack. */
+	enum ssl_encryption_level_t level;
+	/* TLS encryption context (AEAD only) */
+	struct quic_tls_ctx tls_ctx;
+
+	/* RX part */
+	struct {
+		/* The packets received by the listener I/O handler
+		 * with header protection removed.
+		 */
+		struct eb_root pkts;
+		/* List of QUIC packets with protected header. */
+		struct list pqpkts;
+	} rx;
+
+	/* TX part */
+	struct {
+		struct {
+			/* Array of CRYPTO data buffers */
+			struct quic_crypto_buf **bufs;
+			/* The number of element in use in the previous array. */
+			size_t nb_buf;
+			/* The total size of the CRYPTO data stored in the CRYPTO buffers. */
+			size_t sz;
+			/* The offset of the CRYPT0 data stream. */
+			uint64_t offset;
+		} crypto;
+	} tx;
+
+	/* Crypto data stream */
+	struct quic_cstream *cstream;
+	/* Packet number space */
+	struct quic_pktns *pktns;
 };
 
 #endif /* USE_QUIC */

@@ -252,9 +252,9 @@ enum quic_pkt_type {
 #define QUIC_CONN_RX_BUFSZ (1UL << 16)
 
 extern struct trace_source trace_quic;
-extern struct pool_head *pool_head_quic_tx_ring;
 extern struct pool_head *pool_head_quic_rx_packet;
 extern struct pool_head *pool_head_quic_tx_packet;
+extern struct pool_head *pool_head_quic_crypto_buf;
 extern struct pool_head *pool_head_quic_frame;
 extern struct pool_head *pool_head_quic_dgram;
 
@@ -321,19 +321,6 @@ struct quic_arng_node {
 	uint64_t last;
 };
 
-/* The maximum number of ack ranges to be built in ACK frames */
-#define QUIC_MAX_ACK_RANGES   32
-
-/* Structure to maintain a set of ACK ranges to be used to build ACK frames. */
-struct quic_arngs {
-	/* ebtree of ACK ranges organized by their first value. */
-	struct eb_root root;
-	/* The number of ACK ranges is this tree */
-	size_t sz;
-	/* The number of bytes required to encode this ACK ranges lists. */
-	size_t enc_sz;
-};
-
 /* Flag the packet number space as having received a packet */
 #define QUIC_FL_PKTNS_PKT_RECEIVED  (1UL << 0)
 /* Flag the packet number space as requiring an ACK frame to be sent. */
@@ -347,39 +334,6 @@ struct quic_arngs {
 
 /* The maximum number of dgrams which may be sent upon PTO expirations. */
 #define QUIC_MAX_NB_PTO_DGRAMS         2
-
-/* QUIC packet number space */
-struct quic_pktns {
-	struct {
-		/* List of frames to send. */
-		struct list frms;
-		/* Next packet number to use for transmissions. */
-		int64_t next_pn;
-		/* The packet which has been sent. */
-		struct eb_root pkts;
-		/* The time the most recent ack-eliciting packer was sent. */
-		unsigned int time_of_last_eliciting;
-		/* The time this packet number space has experienced packet loss. */
-		unsigned int loss_time;
-		/* Boolean to denote if we must send probe packet. */
-		unsigned int pto_probe;
-		/* In flight bytes for this packet number space. */
-		size_t in_flight;
-		/* The acknowledgement delay of the packet with the largest packet number */
-		uint64_t ack_delay;
-	} tx;
-	struct {
-		/* Largest packet number */
-		int64_t largest_pn;
-		/* Largest acked sent packet. */
-		int64_t largest_acked_pn;
-		struct quic_arngs arngs;
-		unsigned int nb_aepkts_since_last_ack;
-		/* The time the packet with the largest packet number was received */
-		uint64_t largest_time_received;
-	} rx;
-	unsigned int flags;
-};
 
 /* QUIC datagram */
 struct quic_dgram {
@@ -536,32 +490,6 @@ struct quic_cstream {
 	struct qc_stream_desc *desc;
 };
 
-struct quic_enc_level {
-	enum ssl_encryption_level_t level;
-	struct quic_tls_ctx tls_ctx;
-	struct {
-		/* The packets received by the listener I/O handler
-		   with header protection removed. */
-		struct eb_root pkts;
-		/* Liste of QUIC packets with protected header. */
-		struct list pqpkts;
-	} rx;
-	struct {
-		struct {
-			struct quic_crypto_buf **bufs;
-			/* The number of element in use in the previous array. */
-			size_t nb_buf;
-			/* The total size of the CRYPTO data stored in the CRYPTO buffers. */
-			size_t sz;
-			/* The offset of the CRYPT0 data stream. */
-			uint64_t offset;
-		} crypto;
-	} tx;
-	/* Crypto data stream */
-	struct quic_cstream *cstream;
-	struct quic_pktns *pktns;
-};
-
 struct quic_path {
 	/* Control congestion. */
 	struct quic_cc cc;
@@ -638,6 +566,8 @@ struct quic_conn_cntrs {
 #define QUIC_FL_CONN_HANDSHAKE_SPEED_UP          (1U << 12) /* Handshake speeding up was done */
 #define QUIC_FL_CONN_ACK_TIMER_FIRED             (1U << 13) /* idle timer triggered for acknowledgements */
 #define QUIC_FL_CONN_IO_TO_REQUEUE               (1U << 14) /* IO handler must be requeued on new thread after connection migration */
+#define QUIC_FL_CONN_IPKTNS_DCD                  (1U << 15) /* Initial packet number space discarded  */
+#define QUIC_FL_CONN_HPKTNS_DCD                  (1U << 16) /* Handshake packet number space discarded  */
 #define QUIC_FL_CONN_TO_KILL                     (1U << 24) /* Unusable connection, to be killed */
 #define QUIC_FL_CONN_TX_TP_RECEIVED              (1U << 25) /* Peer transport parameters have been received (used for the transmitting part) */
 #define QUIC_FL_CONN_FINALIZED                   (1U << 26) /* QUIC connection finalized (functional, ready to send/receive) */
@@ -668,8 +598,22 @@ struct quic_conn {
 	struct eb_root cids; /* tree of quic_connection_id - used to match a received packet DCID with a connection */
 	uint64_t next_cid_seq_num;
 
-	struct quic_enc_level els[QUIC_TLS_ENC_LEVEL_MAX];
-	struct quic_pktns pktns[QUIC_TLS_PKTNS_MAX];
+	/* Initial encryption level */
+	struct quic_enc_level *iel;
+	/* 0-RTT encryption level */
+	struct quic_enc_level *eel;
+	/* Handshake encryption level */
+	struct quic_enc_level *hel;
+	/* 1-RTT encryption level */
+	struct quic_enc_level *ael;
+	/* List of allocated QUIC TLS encryption level */
+	struct list qel_list;
+
+	struct quic_pktns *ipktns;
+	struct quic_pktns *hpktns;
+	struct quic_pktns *apktns;
+	/* List of packet number spaces attached to this connection */
+	struct list pktns_list;
 
 	struct ssl_sock_ctx *xprt_ctx;
 
