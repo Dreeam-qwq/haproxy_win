@@ -36,6 +36,7 @@
 #include <haproxy/quic_cc-t.h>
 #include <haproxy/quic_frame-t.h>
 #include <haproxy/quic_loss-t.h>
+#include <haproxy/quic_openssl_compat-t.h>
 #include <haproxy/quic_stats-t.h>
 #include <haproxy/quic_tls-t.h>
 #include <haproxy/quic_tp-t.h>
@@ -92,7 +93,7 @@ typedef unsigned long long ull;
 /* Salt length used to derive retry token secret */
 #define QUIC_RETRY_TOKEN_SALTLEN       16 /* bytes */
 /* Retry token duration */
-#define QUIC_RETRY_DURATION_MS      10000
+#define QUIC_RETRY_DURATION_SEC       10
 /* Default Retry threshold */
 #define QUIC_DFLT_RETRY_THRESHOLD     100 /* in connection openings */
 /* Default limit of loss detection on a single frame. If exceeded, connection is closed. */
@@ -231,6 +232,7 @@ enum quic_pkt_type {
 #define           QUIC_EV_CONN_RCV       (1ULL << 48)
 #define           QUIC_EV_CONN_KILL      (1ULL << 49)
 #define           QUIC_EV_CONN_KP        (1ULL << 50)
+#define           QUIC_EV_CONN_SSL_COMPAT (1ULL << 51)
 #define           QUIC_EV_CONN_SET_AFFINITY (1ULL << 52)
 
 /* Similar to kernel min()/max() definitions. */
@@ -581,7 +583,7 @@ struct quic_conn {
 	const struct quic_version *original_version;
 	const struct quic_version *negotiated_version;
 	/* Negotiated version Initial TLS context */
-	struct quic_tls_ctx negotiated_ictx;
+	struct quic_tls_ctx *nictx;
 	/* Connection owned socket FD. */
 	int fd;
 	/* QUIC transport parameters TLS extension */
@@ -589,8 +591,10 @@ struct quic_conn {
 	int state;
 	enum qc_mux_state mux_state; /* status of the connection/mux layer */
 	struct quic_err err;
+#ifdef USE_QUIC_OPENSSL_COMPAT
 	unsigned char enc_params[QUIC_TP_MAX_ENCLEN]; /* encoded QUIC transport parameters */
 	size_t enc_params_len;
+#endif
 
 	struct quic_cid odcid; /* First DCID used by client on its Initial packet. */
 	struct quic_cid dcid; /* DCID of our endpoint - not updated when a new DCID is used */
@@ -616,6 +620,9 @@ struct quic_conn {
 	struct list pktns_list;
 
 	struct ssl_sock_ctx *xprt_ctx;
+#ifdef USE_QUIC_OPENSSL_COMPAT
+	struct quic_openssl_compat openssl_compat;
+#endif
 
 	struct sockaddr_storage local_addr;
 	struct sockaddr_storage peer_addr;

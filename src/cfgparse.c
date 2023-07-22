@@ -521,7 +521,7 @@ int parse_process_number(const char *arg, unsigned long *proc, int max, int *aut
  * distinct argument in <args>. On success, it returns 0, otherwise it returns
  * 1 with an error message in <err>.
  */
-unsigned long parse_cpu_set(const char **args, struct hap_cpuset *cpu_set, char **err)
+int parse_cpu_set(const char **args, struct hap_cpuset *cpu_set, char **err)
 {
 	int cur_arg = 0;
 	const char *arg;
@@ -535,7 +535,7 @@ unsigned long parse_cpu_set(const char **args, struct hap_cpuset *cpu_set, char 
 
 		if (!isdigit((unsigned char)*args[cur_arg])) {
 			memprintf(err, "'%s' is not a CPU range.", arg);
-			return -1;
+			return 1;
 		}
 
 		low = high = str2uic(arg);
@@ -1076,6 +1076,29 @@ int cfg_parse_peers(const char *file, int linenum, char **args, int kwm)
 		curpeers->disabled = 0;
 	}
 	else if (*args[0] != 0) {
+		struct peers_kw_list *pkwl;
+		int index;
+		int rc = -1;
+
+		list_for_each_entry(pkwl, &peers_keywords.list, list) {
+			for (index = 0; pkwl->kw[index].kw != NULL; index++) {
+				if (strcmp(pkwl->kw[index].kw, args[0]) == 0) {
+					rc = pkwl->kw[index].parse(args, curpeers, file, linenum, &errmsg);
+					if (rc < 0) {
+						ha_alert("parsing [%s:%d] : %s\n", file, linenum, errmsg);
+						err_code |= ERR_ALERT | ERR_FATAL;
+						goto out;
+					}
+					else if (rc > 0) {
+						ha_warning("parsing [%s:%d] : %s\n", file, linenum, errmsg);
+						err_code |= ERR_WARN;
+						goto out;
+					}
+					goto out;
+				}
+			}
+		}
+
 		ha_alert("parsing [%s:%d] : unknown keyword '%s' in '%s' section\n", file, linenum, args[0], cursection);
 		err_code |= ERR_ALERT | ERR_FATAL;
 		goto out;
@@ -2645,7 +2668,7 @@ static int numa_detect_topology()
 
 	parse_cpu_set_args[0] = trash.area;
 	parse_cpu_set_args[1] = "\0";
-	if (parse_cpu_set(parse_cpu_set_args, &active_cpus, &err)) {
+	if (parse_cpu_set(parse_cpu_set_args, &active_cpus, &err) != 0) {
 		ha_notice("Cannot read online CPUs list: '%s'. Will not try to refine binding\n", err);
 		free(err);
 		goto free_scandir_entries;
@@ -2801,7 +2824,7 @@ int check_config_validity()
 		{
 			int numa_cores = 0;
 #if defined(USE_CPU_AFFINITY)
-			if (global.numa_cpu_mapping && !thread_cpu_mask_forced())
+			if (global.numa_cpu_mapping && !thread_cpu_mask_forced() && !cpu_map_configured())
 				numa_cores = numa_detect_topology();
 #endif
 			global.nbthread = numa_cores ? numa_cores :
@@ -4809,6 +4832,23 @@ void cfg_dump_registered_keywords()
 			dump_act_rules(&http_req_keywords.list,       "\thttp-request ");
 			dump_act_rules(&http_res_keywords.list,       "\thttp-response ");
 			dump_act_rules(&http_after_res_keywords.list, "\thttp-after-response ");
+		}
+		if (section == CFG_PEERS) {
+			struct peers_kw_list *pkwl;
+			const struct peers_keyword *pkwp, *pkwn;
+			for (pkwn = pkwp = NULL;; pkwp = pkwn) {
+				list_for_each_entry(pkwl, &peers_keywords.list, list) {
+					for (index = 0; pkwl->kw[index].kw != NULL; index++) {
+						if (strordered(pkwp ? pkwp->kw : NULL,
+						               pkwl->kw[index].kw,
+						               pkwn != pkwp ? pkwn->kw : NULL))
+							pkwn = &pkwl->kw[index];
+					}
+				}
+				if (pkwn == pkwp)
+					break;
+				printf("\t%s\n", pkwn->kw);
+			}
 		}
 		if (section == CFG_CRTLIST) {
 			/* displays the keyword available for the crt-lists */

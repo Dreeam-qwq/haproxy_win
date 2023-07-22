@@ -1685,11 +1685,17 @@ static inline void __do_send_log(struct logsrv *logsrv, int nblogger, int level,
  send:
 	if (logsrv->type == LOG_TARGET_BUFFER) {
 		struct ist msg;
+		size_t maxlen = logsrv->maxlen;
 
 		msg = ist2(message, size);
 		msg = isttrim(msg, logsrv->maxlen);
 
-		sent = sink_write(logsrv->sink, &msg, 1, level, facility, metadata);
+		/* make room for the final '\n' which may be forcefully inserted
+		 * by tcp forwarder applet (sink_forward_io_handler)
+		 */
+		maxlen -= 1;
+
+		sent = sink_write(logsrv->sink, maxlen, &msg, 1, level, facility, metadata);
 	}
 	else if (logsrv->addr.ss_family == AF_CUST_EXISTING_FD) {
 		struct ist msg;
@@ -1701,7 +1707,7 @@ static inline void __do_send_log(struct logsrv *logsrv, int nblogger, int level,
 	}
 	else {
 		int i = 0;
-		int totlen = logsrv->maxlen;
+		int totlen = logsrv->maxlen - 1; /* save space for the final '\n' */
 
 		for (i = 0 ; i < nbelem ; i++ ) {
 			iovec[i].iov_base = msg_header[i].ptr;
@@ -3714,14 +3720,14 @@ static struct applet syslog_applet = {
  */
 int cfg_parse_log_forward(const char *file, int linenum, char **args, int kwm)
 {
-	int err_code = 0;
+	int err_code = ERR_NONE;
 	struct proxy *px;
 	char *errmsg = NULL;
 	const char *err = NULL;
 
 	if (strcmp(args[0], "log-forward") == 0) {
 		if (!*args[1]) {
-			ha_alert("parsing [%s:%d] : missing name for ip-forward section.\n", file, linenum);
+			ha_alert("parsing [%s:%d] : missing name for log-forward section.\n", file, linenum);
 			err_code |= ERR_ALERT | ERR_ABORT;
 			goto out;
 		}
@@ -3742,6 +3748,7 @@ int cfg_parse_log_forward(const char *file, int linenum, char **args, int kwm)
 			ha_alert("Parsing [%s:%d]: log-forward section '%s' has the same name as another log-forward section declared at %s:%d.\n",
 				 file, linenum, args[1], px->conf.file, px->conf.line);
 			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
 		}
 
 		px = proxy_find_by_name(args[1], 0, 0);
@@ -3750,6 +3757,7 @@ int cfg_parse_log_forward(const char *file, int linenum, char **args, int kwm)
 			         file, linenum, args[1], proxy_type_str(px),
 			         px->id, px->conf.file, px->conf.line);
 			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
 		}
 
 		px = calloc(1, sizeof *px);
@@ -3771,7 +3779,6 @@ int cfg_parse_log_forward(const char *file, int linenum, char **args, int kwm)
 		px->accept = frontend_accept;
 		px->default_target = &syslog_applet.obj_type;
 		px->id = strdup(args[1]);
-
 	}
 	else if (strcmp(args[0], "maxconn") == 0) {  /* maxconn */
 		if (warnifnotcap(cfg_log_forward, PR_CAP_FE, file, linenum, args[0], " Maybe you want 'fullconn' instead ?"))
@@ -3826,9 +3833,9 @@ int cfg_parse_log_forward(const char *file, int linenum, char **args, int kwm)
 			else {
 				ha_alert("parsing [%s:%d] : '%s %s' : error encountered while parsing listening address %s.\n",
 				         file, linenum, args[0], args[1], args[2]);
-				err_code |= ERR_ALERT | ERR_FATAL;
-				goto out;
 			}
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
 		}
 		list_for_each_entry(l, &bind_conf->listeners, by_bind) {
 			global.maxsock++;
@@ -3940,7 +3947,6 @@ int cfg_parse_log_forward(const char *file, int linenum, char **args, int kwm)
 		}
 		else if (res) {
 			memprintf(&errmsg, "unexpected character '%c' in 'timeout client'", *res);
-			return -1;
 		}
 
 		if (res) {
@@ -3956,6 +3962,7 @@ int cfg_parse_log_forward(const char *file, int linenum, char **args, int kwm)
 		goto out;
 	}
 out:
+	ha_free(&errmsg);
 	return err_code;
 }
 

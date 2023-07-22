@@ -3,7 +3,7 @@
                           Configuration Manual
                          ----------------------
                               version 2.9
-                              2023/07/02
+                              2023/07/21
 
 
 This document covers the configuration language as implemented in the version
@@ -1796,6 +1796,13 @@ issuers-chain-path <dir>
   chain if a file with IntermediateCA2+IntermediateCA1 is present in
   "issuers-chain-path" directory. All other certificates with the same issuer
   will share the chain in memory.
+
+limited-quic
+  This setting must be used to explicitly enable the QUIC listener bindings when
+  haproxy is compiled against a TLS/SSL stack without QUIC support, typically
+  OpenSSL. It has no effect when haproxy is compiled against a TLS/SSL stack
+  with QUIC support, quictls for instance. Note that QUIC 0-RTT is not supported
+  when this setting is set.
 
 localpeer <name>
   Sets the local instance's peer name. It will be ignored if the "-L"
@@ -20010,9 +20017,9 @@ fc_sacked : integer
   before 2.4, the sample fetch fails.
 
 fc_src : ip
-  This is the original destination IP address of the connection on the client
-  side. Only "tcp-request connection" rules may alter this address. See "src"
-  for details.
+  This is the original source IP address of the connection on the client side
+  Only "tcp-request connection" rules may alter this address. See "src" for
+  details.
 
 fc_src_is_local : boolean
   Returns true if the source address of incoming connection is local to the
@@ -20722,6 +20729,11 @@ ssl_bc_client_random : binary
   sent using ephemeral ciphers. This requires OpenSSL >= 1.1.0, or BoringSSL.
   It can be used in a tcp-check or an http-check ruleset.
 
+ssl_bc_curve : string
+  Returns the name of the curve used in the key agreement when the outgoing
+  connection was made over an SSL/TLS transport layer. This requires 
+  OpenSSL >= 3.0.0.
+
 ssl_bc_err : integer
   When the outgoing connection was made over an SSL/TLS transport layer,
   returns the ID of the last error of the first error stack raised on the
@@ -21056,6 +21068,11 @@ ssl_fc_cipherlist_xxh : integer
   Returns a xxh64 of the cipher list. This hash can return only if the value
   "tune.ssl.capture-buffer-size" is set greater than 0, however the hash take
   into account all the data of the cipher list.
+
+ssl_fc_curve : string
+  Returns the name of the curve used in the key agreement when the incoming
+  connection was made over an SSL/TLS transport layer. This requires
+  OpenSSL >= 3.0.0.
 
 ssl_fc_ecformats_bin : binary
   Return the binary form of the client hello supported elliptic curve point

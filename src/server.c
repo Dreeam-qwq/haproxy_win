@@ -2430,6 +2430,7 @@ struct server *new_server(struct proxy *proxy)
 	LIST_INIT(&srv->ip_rec_item);
 	MT_LIST_INIT(&srv->prev_deleted);
 	event_hdl_sub_list_init(&srv->e_subs);
+	srv->rid = 0; /* rid defaults to 0 */
 
 	srv->next_state = SRV_ST_RUNNING; /* early server setup */
 	srv->last_change = ns_to_sec(now_ns);
@@ -2763,9 +2764,6 @@ static int _srv_parse_init(struct server **srv, char **args, int *cur_arg,
 			newsrv->id = strdup(args[1]);
 		else
 			newsrv->tmpl_info.prefix = strdup(args[1]);
-
-		/* revision defaults to 0 */
-		newsrv->rid = 0;
 
 		/* several ways to check the port component :
 		 *  - IP    => port=+0, relative (IPv4 only)
@@ -4087,8 +4085,8 @@ static int srv_iterate_initaddr(struct server *srv)
 		case SRV_IADDR_NONE:
 			srv_set_admin_flag(srv, SRV_ADMF_RMAINT, SRV_ADM_STCHGC_NONE);
 			if (return_code) {
-				ha_warning("could not resolve address '%s', disabling server.\n",
-					   name);
+				ha_notice("could not resolve address '%s', disabling server.\n",
+					  name);
 			}
 			return return_code;
 

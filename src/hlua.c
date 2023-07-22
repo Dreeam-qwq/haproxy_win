@@ -1407,7 +1407,7 @@ static inline void hlua_sendlog(struct proxy *px, int level, const char *msg)
  * returned with a timeout and permit to set some flags
  * <timeout> is a tick value
  */
-__LJMP void hlua_yieldk(lua_State *L, int nresults, int ctx,
+__LJMP void hlua_yieldk(lua_State *L, int nresults, lua_KContext ctx,
                         lua_KFunction k, int timeout, unsigned int flags)
 {
 	struct hlua *hlua;
@@ -1963,6 +1963,33 @@ static int hlua_set_map(lua_State *L)
 		pat_ref_add(ref, key, value, NULL);
 	HA_SPIN_UNLOCK(PATREF_LOCK, &ref->lock);
 	return 0;
+}
+
+/* This function is an LUA binding. It provides a function
+ * for retrieving a var from the proc scope in core.
+ */
+ static int hlua_core_get_var(lua_State *L)
+{
+	const char *name;
+	size_t len;
+	struct sample smp;
+
+	MAY_LJMP(check_args(L, 1, "get_var"));
+
+	name = MAY_LJMP(luaL_checklstring(L, 1, &len));
+
+	/* We can only retrieve information from the proc. scope */
+	/* FIXME: I didn't want to expose vars_hash_name from vars.c */
+	if (len < 5 || strncmp(name, "proc.", 5) != 0)
+		WILL_LJMP(luaL_error(L, "'get_var': Only 'proc.' scope allowed to be retrieved in 'core.get_var()'."));
+
+	if (!vars_get_by_name(name, len, &smp, NULL)) {
+		lua_pushnil(L);
+		return 1;
+	}
+
+	return MAY_LJMP(hlua_smp2lua(L, &smp));
+	return 1;
 }
 
 /* This function disables the sending of email through the
@@ -13120,6 +13147,13 @@ lua_State *hlua_init_state(int thread_num)
 	/* Init main lua stack. */
 	L = lua_newstate(hlua_alloc, &hlua_global_allocator);
 
+	if (!L) {
+		fprintf(stderr,
+		        "Lua init: critical error: lua_newstate() returned NULL."
+		        " This may possibly be caused by a memory allocation error.\n");
+		exit(1);
+	}
+
 	/* Initialise Lua context to NULL */
 	context = lua_getextraspace(L);
 	*context = NULL;
@@ -13202,6 +13236,7 @@ lua_State *hlua_init_state(int thread_num)
 	hlua_class_function(L, "del_acl", hlua_del_acl);
 	hlua_class_function(L, "set_map", hlua_set_map);
 	hlua_class_function(L, "del_map", hlua_del_map);
+	hlua_class_function(L, "get_var", hlua_core_get_var);
 	hlua_class_function(L, "tcp", hlua_socket_new);
 	hlua_class_function(L, "httpclient", hlua_httpclient_new);
 	hlua_class_function(L, "event_sub", hlua_event_global_sub);

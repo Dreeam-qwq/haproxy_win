@@ -381,6 +381,16 @@ Core class
 
   :returns: an array of values.
 
+.. js:function:: core.get_var()
+
+  **context**: body, init, task, action, sample-fetch, converter
+
+  Returns data stored in the variable <var> converter in Lua type.
+  This is limited to "proc." scoped variables.
+
+  :param string var: The variable name in "proc." scope according with the
+  HAProxy variable syntax.
+
 .. js:function:: core.now()
 
   **context**: body, init, task, action
@@ -1197,6 +1207,12 @@ ProxyMailers class
   An array containing the list of mail servers that should receive email alerts.
   Each array entry is a name:desc pair where desc represents the full server
   address (including port) as described in haproxy's configuration file.
+
+.. js:attribute:: ProxyMailers.mailservers_timeout
+
+  An integer representing the maximum time in milliseconds to wait for the
+  email to be sent. See "timeout mail" directive from "mailers" section in
+  haproxy configuration file.
 
 .. js:attribute:: ProxyMailers.smtp_hostname
 

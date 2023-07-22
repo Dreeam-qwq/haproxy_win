@@ -14,6 +14,7 @@
 
 DECLARE_POOL(pool_head_quic_enc_level,  "quic_enc_level",  sizeof(struct quic_enc_level));
 DECLARE_POOL(pool_head_quic_pktns,      "quic_pktns",      sizeof(struct quic_pktns));
+DECLARE_POOL(pool_head_quic_tls_ctx,    "quic_tls_ctx",    sizeof(struct quic_tls_ctx));
 DECLARE_POOL(pool_head_quic_tls_secret, "quic_tls_secret", QUIC_TLS_SECRET_LEN);
 DECLARE_POOL(pool_head_quic_tls_iv,     "quic_tls_iv",     QUIC_TLS_IV_LEN);
 DECLARE_POOL(pool_head_quic_tls_key,    "quic_tls_key",    QUIC_TLS_KEY_LEN);
@@ -139,6 +140,8 @@ static int quic_conn_enc_level_init(struct quic_conn *qc,
 	if (!qel)
 		goto leave;
 
+	LIST_INIT(&qel->retrans);
+	qel->retrans_frms = NULL;
 	qel->tx.crypto.bufs = NULL;
 	qel->tx.crypto.nb_buf = 0;
 	qel->cstream = NULL;
@@ -671,7 +674,7 @@ int quic_tls_tx_ctx_init(EVP_CIPHER_CTX **tx_ctx,
 int quic_tls_encrypt(unsigned char *buf, size_t len,
                      const unsigned char *aad, size_t aad_len,
                      EVP_CIPHER_CTX *ctx, const EVP_CIPHER *aead,
-                     const unsigned char *key, const unsigned char *iv)
+                     const unsigned char *iv)
 {
 	int outlen;
 	int aead_nid = EVP_CIPHER_nid(aead);
@@ -766,16 +769,14 @@ int quic_tls_derive_retry_token_secret(const EVP_MD *md,
                                        const unsigned char *secret, size_t secretlen)
 {
 	unsigned char tmpkey[QUIC_TLS_KEY_LEN];
-	const unsigned char tmpkey_label[] = "retry token";
 	const unsigned char key_label[] = "retry token key";
 	const unsigned char iv_label[] = "retry token iv";
 
-	if (!quic_hkdf_extract_and_expand(md, tmpkey, sizeof tmpkey,
-	                                  secret, secretlen, salt, saltlen,
-	                                  tmpkey_label, sizeof tmpkey_label - 1) ||
+	if (!quic_hkdf_extract(md, tmpkey, sizeof tmpkey,
+	                       secret, secretlen, salt, saltlen) ||
 	    !quic_hkdf_expand(md, key, keylen, tmpkey, sizeof tmpkey,
 	                      key_label, sizeof key_label - 1) ||
-	    !quic_hkdf_expand(md, iv, ivlen, secret, secretlen,
+	    !quic_hkdf_expand(md, iv, ivlen, tmpkey, sizeof tmpkey,
 	                      iv_label, sizeof iv_label - 1))
 		return 0;
 

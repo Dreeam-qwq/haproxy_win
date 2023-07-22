@@ -58,7 +58,7 @@ int quic_tls_derive_initial_secrets(const EVP_MD *md,
 int quic_tls_encrypt(unsigned char *buf, size_t len,
                      const unsigned char *aad, size_t aad_len,
                      EVP_CIPHER_CTX *ctx, const EVP_CIPHER *aead,
-                     const unsigned char *key, const unsigned char *iv);
+                     const unsigned char *iv);
 
 int quic_tls_decrypt2(unsigned char *out,
                       unsigned char *in, size_t ilen,
@@ -87,6 +87,16 @@ int quic_tls_derive_retry_token_secret(const EVP_MD *md,
                                        unsigned char *iv, size_t ivlen,
                                        const unsigned char *salt, size_t saltlen,
                                        const unsigned char *secret, size_t secretlen);
+
+int quic_hkdf_expand(const EVP_MD *md,
+                     unsigned char *buf, size_t buflen,
+                     const unsigned char *key, size_t keylen,
+                     const unsigned char *label, size_t labellen);
+
+int quic_hkdf_expand_label(const EVP_MD *md,
+                           unsigned char *buf, size_t buflen,
+                           const unsigned char *key, size_t keylen,
+                           const unsigned char *label, size_t labellen);
 
 int quic_hkdf_extract_and_expand(const EVP_MD *md,
                                  unsigned char *buf, size_t buflen,
@@ -468,6 +478,8 @@ static inline void quic_pktns_tx_pkts_release(struct quic_pktns *pktns, struct q
 {
 	struct eb64_node *node;
 
+	TRACE_ENTER(QUIC_EV_CONN_PHPKTS, qc);
+
 	node = eb64_first(&pktns->tx.pkts);
 	while (node) {
 		struct quic_tx_packet *pkt;
@@ -478,14 +490,18 @@ static inline void quic_pktns_tx_pkts_release(struct quic_pktns *pktns, struct q
 		if (pkt->flags & QUIC_FL_TX_PACKET_ACK_ELICITING)
 			qc->path->ifae_pkts--;
 		list_for_each_entry_safe(frm, frmbak, &pkt->frms, list) {
+			TRACE_DEVEL("freeing frame from packet",
+			            QUIC_EV_CONN_PRSAFRM, qc, frm, &pkt->pn_node.key);
 			qc_frm_unref(frm, qc);
 			LIST_DEL_INIT(&frm->list);
 			quic_tx_packet_refdec(frm->pkt);
-			qc_frm_free(&frm);
+			qc_frm_free(qc, &frm);
 		}
 		eb64_delete(&pkt->pn_node);
 		quic_tx_packet_refdec(pkt);
 	}
+
+	TRACE_LEAVE(QUIC_EV_CONN_PHPKTS, qc);
 }
 
 /* Discard <pktns> packet number space attached to <qc> QUIC connection.
@@ -498,6 +514,8 @@ static inline void quic_pktns_tx_pkts_release(struct quic_pktns *pktns, struct q
 static inline void quic_pktns_discard(struct quic_pktns *pktns,
                                       struct quic_conn *qc)
 {
+	TRACE_ENTER(QUIC_EV_CONN_PHPKTS, qc);
+
 	if (pktns == qc->ipktns)
 		qc->flags |= QUIC_FL_CONN_IPKTNS_DCD;
 	else if (pktns == qc->hpktns)
@@ -511,6 +529,8 @@ static inline void quic_pktns_discard(struct quic_pktns *pktns,
 	pktns->tx.pto_probe = 0;
 	pktns->tx.in_flight = 0;
 	quic_pktns_tx_pkts_release(pktns, qc);
+
+	TRACE_LEAVE(QUIC_EV_CONN_PHPKTS, qc);
 }
 
 /* Return 1 if <pktns> matches with the Application packet number space of
@@ -648,6 +668,9 @@ static inline void quic_tls_ctx_reset(struct quic_tls_ctx *ctx)
  */
 static inline void quic_tls_ctx_secs_free(struct quic_tls_ctx *ctx)
 {
+	if (!ctx)
+		return;
+
 	if (ctx->rx.iv) {
 		memset(ctx->rx.iv, 0, ctx->rx.ivlen);
 		ctx->rx.ivlen = 0;
@@ -754,6 +777,16 @@ static inline int quic_tls_secrets_keys_alloc(struct quic_tls_secrets *secs)
 	return 0;
 }
 
+/* Release the memory allocated for the negotiated Initial QUIC TLS context
+ * attached to <qc> connection.
+ */
+static inline void quic_nictx_free(struct quic_conn *qc)
+{
+	quic_tls_ctx_secs_free(qc->nictx);
+	pool_free(pool_head_quic_tls_ctx, qc->nictx);
+	qc->nictx = NULL;
+}
+
 /* Initialize a TLS cryptographic context for the Initial encryption level. */
 static inline int quic_initial_tls_ctx_init(struct quic_tls_ctx *ctx)
 {
@@ -778,6 +811,24 @@ static inline int quic_tls_level_pkt_type(enum quic_tls_enc_level level)
 	default:
 		return -1;
 	}
+}
+
+/* Return the packet type associated to <qel> encryption for <qc> QUIC connection,
+ * or -1 if not found.
+ */
+static inline enum quic_pkt_type quic_enc_level_pkt_type(struct quic_conn *qc,
+                                                         struct quic_enc_level *qel)
+{
+	if (qel == qc->iel)
+		return QUIC_PACKET_TYPE_INITIAL;
+	else if (qel == qc->hel)
+		return QUIC_PACKET_TYPE_HANDSHAKE;
+	else if (qel == qc->eel)
+		return QUIC_PACKET_TYPE_0RTT;
+	else if (qel == qc->ael)
+		return QUIC_PACKET_TYPE_SHORT;
+	else
+		return -1;
 }
 
 /* Set <*level> and <*next_level> depending on <state> QUIC handshake state. */

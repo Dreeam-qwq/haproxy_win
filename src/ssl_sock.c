@@ -4486,6 +4486,9 @@ void SSL_CTX_keylog(const SSL *ssl, const char *line)
 	char *lastarg = NULL;
 	char *dst = NULL;
 
+#ifdef USE_QUIC_OPENSSL_COMPAT
+	quic_tls_compat_keylog_callback(ssl, line);
+#endif
 	keylog = SSL_get_ex_data(ssl, ssl_keylog_index);
 	if (!keylog)
 		return;
@@ -4797,6 +4800,11 @@ static int ssl_sock_prepare_ctx(struct bind_conf *bind_conf, struct ssl_bind_con
 			cfgerr |= ERR_ALERT | ERR_FATAL;
 		}
 	}
+#endif
+
+#ifdef USE_QUIC_OPENSSL_COMPAT
+	if (!quic_tls_compat_init(bind_conf, ctx))
+		cfgerr |= ERR_ALERT | ERR_FATAL;
 #endif
 
 	return cfgerr;

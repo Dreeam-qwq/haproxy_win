@@ -168,10 +168,13 @@ struct sink *sink_new_buf(const char *name, const char *desc, enum log_fmt fmt, 
  * array <msg> to sink <sink>. Formatting according to the sink's preference is
  * done here. Lost messages are NOT accounted for. It is preferable to call
  * sink_write() instead which will also try to emit the number of dropped
- * messages when there are any. It returns >0 if it could write anything,
- * <=0 otherwise.
+ * messages when there are any. It will stop writing at <maxlen> instead of
+ * sink->maxlen if <maxlen> is positive and inferior to sink->maxlen.
+ *
+ * It returns >0 if it could write anything, <=0 otherwise.
  */
- ssize_t __sink_write(struct sink *sink, const struct ist msg[], size_t nmsg,
+ ssize_t __sink_write(struct sink *sink, size_t maxlen,
+	             const struct ist msg[], size_t nmsg,
 	             int level, int facility, struct ist *metadata)
  {
 	struct ist *pfx = NULL;
@@ -183,11 +186,13 @@ struct sink *sink_new_buf(const char *name, const char *desc, enum log_fmt fmt, 
 	pfx = build_log_header(sink->fmt, level, facility, metadata, &npfx);
 
 send:
+	if (!maxlen)
+		maxlen = ~0;
 	if (sink->type == SINK_TYPE_FD) {
-		return fd_write_frag_line(sink->ctx.fd, sink->maxlen, pfx, npfx, msg, nmsg, 1);
+		return fd_write_frag_line(sink->ctx.fd, MIN(maxlen, sink->maxlen), pfx, npfx, msg, nmsg, 1);
 	}
 	else if (sink->type == SINK_TYPE_BUFFER) {
-		return ring_write(sink->ctx.ring, sink->maxlen, pfx, npfx, msg, nmsg);
+		return ring_write(sink->ctx.ring, MIN(maxlen, sink->maxlen), pfx, npfx, msg, nmsg);
 	}
 	return 0;
 }
@@ -229,7 +234,7 @@ int sink_announce_dropped(struct sink *sink, int facility)
 			metadata[LOG_META_PID] = ist2(pidstr, strlen(pidstr));
 		}
 
-		if (__sink_write(sink, msgvec, 1, LOG_NOTICE, facility, metadata) <= 0)
+		if (__sink_write(sink, 0, msgvec, 1, LOG_NOTICE, facility, metadata) <= 0)
 			return 0;
 		/* success! */
 		HA_ATOMIC_SUB(&sink->ctx.dropped, dropped);
@@ -845,7 +850,7 @@ int cfg_parse_ring(const char *file, int linenum, char **args, int kwm)
 		if (size < cfg_sink->ctx.ring->buf.size) {
 			ha_warning("parsing [%s:%d] : ignoring new size '%llu' that is smaller than current size '%llu' for ring '%s'.\n",
 				   file, linenum, (ullong)size, (ullong)cfg_sink->ctx.ring->buf.size, cfg_sink->name);
-			err_code |= ERR_ALERT | ERR_FATAL;
+			err_code |= ERR_WARN;
 			goto err;
 		}
 
@@ -1141,6 +1146,9 @@ struct sink *sink_new_from_logsrv(struct logsrv *logsrv)
 
 	return sink;
 error:
+	if (srv)
+		srv_drop(srv);
+
 	if (p) {
 		if (p->id)
 			free(p->id);
@@ -1148,16 +1156,6 @@ error:
 			free(p->conf.file);
 
 		free(p);
-	}
-
-	if (srv) {
-		if (srv->id)
-			free(srv->id);
-		if (srv->conf.file)
-			free((void *)srv->conf.file);
-		if (srv->per_thr)
-		       free(srv->per_thr);
-		free(srv);
 	}
 
 	if (sft)
@@ -1191,7 +1189,7 @@ int cfg_post_parse_ring()
 			ha_warning("ring '%s' event max length '%u' exceeds size, forced to size '%lu'.\n",
 			           cfg_sink->name, cfg_sink->maxlen, (unsigned long)b_size(&cfg_sink->ctx.ring->buf));
 			cfg_sink->maxlen = b_size(&cfg_sink->ctx.ring->buf);
-			err_code |= ERR_ALERT;
+			err_code |= ERR_WARN;
 		}
 
 		/* prepare forward server descriptors */
@@ -1218,11 +1216,16 @@ int cfg_post_parse_ring()
 				if (!ring_attach(cfg_sink->ctx.ring)) {
 					ha_alert("server '%s' sets too many watchers > 255 on ring '%s'.\n", srv->id, cfg_sink->name);
 					err_code |= ERR_ALERT | ERR_FATAL;
+					ha_free(&sft);
+					break;
 				}
 				cfg_sink->sft = sft;
 				srv = srv->next;
 			}
-			sink_init_forward(cfg_sink);
+			if (sink_init_forward(cfg_sink) == 0) {
+				ha_alert("error when trying to initialize sink buffer forwarding.\n");
+				err_code |= ERR_ALERT | ERR_FATAL;
+			}
 		}
 	}
 	cfg_sink = NULL;
@@ -1351,6 +1354,7 @@ static void sink_init()
 static void sink_deinit()
 {
 	struct sink *sink, *sb;
+	struct sink_forward_target *sft_next;
 
 	list_for_each_entry_safe(sink, sb, &sink_list, sink_list) {
 		if (sink->type == SINK_TYPE_BUFFER) {
@@ -1370,7 +1374,11 @@ static void sink_deinit()
 		free_proxy(sink->forward_px);
 		free(sink->name);
 		free(sink->desc);
-		free(sink->sft);
+		while (sink->sft) {
+			sft_next = sink->sft->next;
+			free(sink->sft);
+			sink->sft = sft_next;
+		}
 		free(sink);
 	}
 }
