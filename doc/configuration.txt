@@ -18566,6 +18566,56 @@ mqtt_is_valid
       acl data_in_buffer req.len ge 4
       tcp-request content reject unless { req.payload(0,0),mqtt_is_valid }
 
+ms_ltime(<format>[,<offset>])
+  This works like "ltime" but takes an input in milliseconds. It also supports
+  the %N conversion specifier inspired by date(1).
+  Converts an integer supposed to contain a date since epoch to a string
+  representing this date in local time using a format defined by the <format>
+  string using strftime(3). The purpose is to allow any date format to be used
+  in logs. An optional <offset> in milliseconds may be applied to the input date
+  (positive or negative). See the strftime() man page for the format supported
+  by your operating system.
+
+  The %N conversion specifier allows you to output the nanoseconds part of the
+  date, precision is limited since the input is milliseconds.
+  (000000000..999000000).  %N can take a width argument between % and N. It is
+  useful to display milliseconds (%3N) or microseconds (%6N). The default and
+  maximum width is 9 (%N = %9N).
+
+  See also the utime converter for UTC as well as "ltime" and "us_ltime"
+  converters.
+
+  Example :
+
+      # Emit 3 colons, the local time, the timezone and another with ip:port
+      # e.g. 2023/07/24/11:53:02.196 +0200 127.0.0.1:41530
+      log-format %[accept_date(ms),ms_ltime("%Y/%m/%d/%H:%M:%S.%3N %z")]\ %ci:%cp
+
+ms_utime(<format>[,<offset>])
+  This works like "utime" but takes an input in milliseconds. It also supports
+  the %N conversion specifier inspired by date(1).
+  Converts an integer supposed to contain a date since epoch to a string
+  representing this date in UTC time using a format defined by the <format>
+  string using strftime(3). The purpose is to allow any date format to be used
+  in logs. An optional <offset> in milliseconds may be applied to the input date
+  (positive or negative). See the strftime() man page for the format supported
+  by your operating system.
+
+  The %N conversion specifier allows you to output the nanoseconds part of the
+  date, precision is limited since the input is milliseconds.
+  (000000000..999000000).  %N can take a width argument between % and N. It is
+  useful to display milliseconds (%3N) or microseconds (%6N). The default and
+  maximum width is 9 (%N = %9N).
+
+  See also the ltime converter for local as well as "utime" and "us_utime"
+  converters.
+
+  Example :
+
+      # Emit 3 colons, the UTC time, the timezone and another with ip:port
+      # e.g. 2023/07/24/09:53:02.196 +0000 127.0.0.1:41530
+      log-format %[accept_date(ms),ms_utime("%Y/%m/%d/%H:%M:%S.%3N %z")]\ %ci:%cp
+
 mul(<value>)
   Multiplies the input value of type signed integer by <value>, and returns
   the product as an signed integer. In case of overflow, the largest possible
@@ -19172,13 +19222,64 @@ unset-var(<var>)
   This prefix is followed by a name. The separator is a '.'. The name may only
   contain characters 'a-z', 'A-Z', '0-9', '.' and '_'.
 
+us_ltime(<format>[,<offset>])
+  This works like "ltime" but takes an input in microseconds. It also supports
+  the %N conversion specifier inspired by date(1).
+  Converts an integer supposed to contain a date since epoch to a string
+  representing this date in local time using a format defined by the <format>
+  string using strftime(3). The purpose is to allow any date format to be used
+  in logs. An optional <offset> in microseconds may be applied to the input
+  date (positive or negative). See the strftime() man page for the format
+  supported by your operating system.
+
+  The %N conversion specifier allows you to output the nanoseconds part of the
+  date, precision is limited since the input is microseconds.
+  (000000000..999999000). %N can take a width argument between % and N. It is
+  useful to display milliseconds (%3N) or microseconds (%6N). The default and
+  maximum width is 9 (%N = %9N).
+
+  See also the "utime" converter for UTC as well as "ltime" and "ms_ltime"
+  converters.
+
+  Example :
+
+      # Emit 3 colons, the local time, the timezone and another with ip:port
+      # e.g. 2023/07/24/09:53:02.196234 +0000 127.0.0.1:41530
+      log-format %[accept_date(us),us_ltime("%Y/%m/%d/%H:%M:%S.%6N %z")]\ %ci:%cp
+
+us_utime(<format>[,<offset>])
+  This works like "utime" but takes an input in microseconds. It also supports
+  the %N conversion specifier inspired by date(1).
+  Converts an integer supposed to contain a date since epoch to a string
+  representing this date in UTC time using a format defined by the <format>
+  string using strftime(3). The purpose is to allow any date format to be used
+  in logs. An optional <offset> in microseconds may be applied to the input
+  date (positive or negative). See the strftime() man page for the format
+  supported by your operating system.
+
+  The %N conversion specifier allows you to output the nanoseconds part of the
+  date, precision is limited since the input is microseconds.
+  (000000000..999999000). %N can take a width argument between % and N. It is
+  useful to display milliseconds (%3N) or microseconds (%6N). The default and
+  maximum width is 9 (%N = %9N).
+
+  See also the "ltime" converter for local as well as "utime" and "ms_utime"
+  converters.
+
+  Example :
+
+      # Emit 3 colons, the UTC time, the timezone and another with ip:port
+      # e.g. 2023/07/24/09:53:02.196234 +0000 127.0.0.1:41530
+      log-format %[accept_date(us),us_utime("%Y/%m/%d/%H:%M:%S.%6N %z")]\ %ci:%cp
+
 utime(<format>[,<offset>])
   Converts an integer supposed to contain a date since epoch to a string
   representing this date in UTC time using a format defined by the <format>
   string using strftime(3). The purpose is to allow any date format to be used
   in logs. An optional <offset> in seconds may be applied to the input date
   (positive or negative). See the strftime() man page for the format supported
-  by your operating system. See also the ltime converter.
+  by your operating system. See also the "ltime" converter as well as "ms_utime"
+  and "us_utime".
 
   Example :
 
@@ -19288,6 +19389,9 @@ A first set of sample fetch methods applies to internal information which does
 not even relate to any client information. These ones are sometimes used with
 "monitor-fail" directives to report an internal status to external watchers.
 The sample fetch methods described in this section are usable anywhere.
+
+act_conn : integer
+  Returns the total number of active concurrent connections on the process.
 
 always_false : boolean
   Always returns the boolean "false" value. It may be used with ACLs as a
@@ -19600,6 +19704,10 @@ prio_offset : integer
   "http-request set-priority-offset" or "tcp-request content
   set-priority-offset".
 
+pid : integer
+  Return the PID of the current process. In most cases this is the PID of the
+  worker process.
+
 proc : integer
   Always returns value 1 (historically it would return the calling process
   number).
@@ -19753,6 +19861,28 @@ An optional table may be specified with the "sc*" form, in which case the
 currently tracked key will be looked up into this alternate table instead of
 the table currently being tracked.
 
+accept_date([<unit>]) : integer
+  This is the exact date when the connection was received by HAProxy
+  (which might be very slightly different from the date observed on the
+  network if there was some queuing in the system's backlog). This is usually
+  the same date which may appear in any upstream firewall's log. When used in
+  HTTP mode, the accept_date field will be reset to the first moment the
+  connection is ready to receive a new request (end of previous response for
+  HTTP/1, immediately after previous request for HTTP/2).
+
+  Returns a value in number of seconds since epoch.
+
+  <unit> is facultative, and can be set to "s" for seconds (default behavior),
+  "ms" for  milliseconds or "us" for microseconds.
+  If unit is set, return value is an integer reflecting either seconds,
+  milliseconds or microseconds since epoch.
+  It is useful when a time resolution of less than a second is needed.
+
+bc.timer.connect : integer
+  Total time to establish the TCP connection to the server.  This is the
+  equivalent of %Tc in the log-format. This is reported in milliseconds (ms).
+  For more information see Section 8.4 "Timing events"
+
 bc_dst : ip
   This is the destination ip address of the connection on the server side,
   which is the server address HAProxy connected to. It is of type IP and works
@@ -19875,6 +20005,18 @@ dst_port : integer
   transparent mode, when assigning dynamic ports to some clients for a whole
   application session, to stick all users to a same server, or to pass the
   destination port information to a server using an HTTP header.
+
+fc.timer.handshake : integer
+  Total time to accept tcp connection and execute handshakes for low level
+  protocols. Currently, these protocols are proxy-protocol and SSL. This is the
+  equivalent of %Th in the log-format.  This is reported in milliseconds (ms).
+  For more information see Section 8.4 "Timing events"
+
+fc.timer.total : integer
+  Total session duration time, between the moment the proxy accepted it and the
+  moment both ends were closed. This is the equivalent of %Tt in the log-format.
+  This is reported in milliseconds (ms). For more information see Section 8.4
+  "Timing events"
 
 fc_dst : ip
   This is the original destination IP address of the connection on the client
@@ -20056,6 +20198,12 @@ fe_name : string
 fe_client_timeout : integer
   Returns the configuration value in millisecond for the client timeout of the
   current frontend.
+
+res.timer.data : integer
+  this is the total transfer time of the response payload till the last byte
+  sent to the client. In HTTP it starts after the last response header (after
+  Tr). This is the equivalent of %Td in the log-format and is reported in
+  milliseconds (ms).  For more information see Section 8.4 "Timing events"
 
 sc_bytes_in_rate(<ctr>[,<table>]) : integer
 sc0_bytes_in_rate([<table>]) : integer
@@ -21404,6 +21552,12 @@ ssl_s_version : integer
   Returns the version of the certificate presented by the server when the
   outgoing connection was made over an SSL/TLS transport layer.
 
+txn.timer.user : integer
+  Total estimated time as seen from client, between the moment the proxy
+  accepted it and the moment both ends were closed, without idle time.
+  This is the equivalent of %Tu in the log-format and is reported in
+  milliseconds (ms). For more details see Section 8.4 "Timing events"
+
 7.3.5. Fetching samples from buffer contents (Layer 6)
 ------------------------------------------------------
 
@@ -21878,6 +22032,19 @@ hdr([<name>[,<occ>]]) : string
   Note that contrary to the hdr() sample fetch method, the hdr_* ACL keywords
   unambiguously apply to the request headers.
 
+request_date([<unit>]) : integer
+  This is the exact date when the first byte of the HTTP request was received
+  by HAProxy (log-format tag %tr). This is computed from accept_date +
+  handshake time (%Th) + idle time (%Ti).
+
+  Returns a value in number of seconds since epoch.
+
+  <unit> is facultative, and can be set to "s" for seconds (default behavior),
+  "ms" for  milliseconds or "us" for microseconds.
+  If unit is set, return value is an integer reflecting either seconds,
+  milliseconds or microseconds since epoch.
+  It is useful when a time resolution of less than a second is needed.
+
 req.fhdr(<name>[,<occ>]) : string
   This returns the full value of the last occurrence of header <name> in an
   HTTP request. It differs from req.hdr() in that any commas present in the
@@ -21985,6 +22152,37 @@ req.hdrs_bin : binary
 
   int:  refer to the SPOE documentation for the encoding
   str:  <int:length><bytes>
+
+req.timer.hdr : integer
+  Total time to get the client request (HTTP mode only). It's the time elapsed
+  between the first bytes received and the moment the proxy received the empty
+  line marking the end of the HTTP headers. This is reported in milliseconds
+  (ms) and is equivalent to %TR in log-format. See section 8.4 "Timing events"
+  for more details.
+
+req.timer.idle : integer
+  This is the idle time before the HTTP request (HTTP mode only). This timer
+  counts between the end of the handshakes and the first byte of the HTTP
+  request. This is reported in milliseconds and is equivalent to %Ti in
+  log-format. See section 8.4 "Timing events" for more details.
+
+req.timer.queue : integer
+  Total time spent in the queues waiting for a connection slot.
+  This is reported in milliseconds and is equivalent to %Tw in
+  log-format. See section 8.4 "Timing events" for more details.
+
+req.timer.tq : integer
+  total time to get the client request from the accept date or since the
+  emission of the last byte of the previous response.
+  This is reported in milliseconds and is equivalent to %Tq in
+  log-format. See section 8.4 "Timing events" for more details.
+
+res.timer.hdr : integer
+  It's the time elapsed between the moment the TCP connection was established
+  to the server and the moment the server sent its complete response headers.
+  This is reported in milliseconds and is equivalent to %Tr in log-format. See
+  section 8.4 "Timing events" for more details.
+
 
 http_auth(<userlist>) : boolean
   Returns a boolean indicating whether the authentication data received from
@@ -22293,6 +22491,13 @@ status : integer
   to remove any Location header if the response is not a 3xx.
 
   It may be used in tcp-check based expect rules.
+
+txn.timer.total : integer
+  Total active time for the HTTP request, between the moment the proxy received
+  the first byte of the request header and the emission of the last byte of the
+  response body. This is the equivalent of %Ta in the log-format and is
+  reported in milliseconds (ms).  For more information see Section 8.4 "Timing
+  events"
 
 unique-id : string
   Returns the unique-id attached to the request. The directive
@@ -23311,75 +23516,176 @@ Flags are :
 
 Please refer to the table below for currently defined variables :
 
-  +---+------+-----------------------------------------------+-------------+
-  | R | var  | field name (8.2.2 and 8.2.3 for description)  | type        |
-  +---+------+-----------------------------------------------+-------------+
-  |   | %o   | special variable, apply flags on all next var |             |
-  +---+------+-----------------------------------------------+-------------+
-  |   | %B   | bytes_read           (from server to client)  | numeric     |
-  | H | %CC  | captured_request_cookie                       | string      |
-  | H | %CS  | captured_response_cookie                      | string      |
-  |   | %H   | hostname                                      | string      |
-  | H | %HM  | HTTP method (ex: POST)                        | string      |
-  | H | %HP  | HTTP request URI without query string         | string      |
-  | H | %HPO | HTTP path only (without host nor query string)| string      |
-  | H | %HQ  | HTTP request URI query string (ex: ?bar=baz)  | string      |
-  | H | %HU  | HTTP request URI (ex: /foo?bar=baz)           | string      |
-  | H | %HV  | HTTP version (ex: HTTP/1.0)                   | string      |
-  |   | %ID  | unique-id                                     | string      |
-  |   | %ST  | status_code                                   | numeric     |
-  |   | %T   | gmt_date_time                                 | date        |
-  | H | %Ta  | Active time of the request (from TR to end)   | numeric     |
-  |   | %Tc  | Tc                                            | numeric     |
-  |   | %Td  | Td = Tt - (Tq + Tw + Tc + Tr)                 | numeric     |
-  |   | %Tl  | local_date_time                               | date        |
-  |   | %Th  | connection handshake time (SSL, PROXY proto)  | numeric     |
-  | H | %Ti  | idle time before the HTTP request             | numeric     |
-  | H | %Tq  | Th + Ti + TR                                  | numeric     |
-  | H | %TR  | time to receive the full request from 1st byte| numeric     |
-  | H | %Tr  | Tr (response time)                            | numeric     |
-  |   | %Ts  | timestamp                                     | numeric     |
-  |   | %Tt  | Tt                                            | numeric     |
-  |   | %Tu  | Tu                                            | numeric     |
-  |   | %Tw  | Tw                                            | numeric     |
-  |   | %U   | bytes_uploaded       (from client to server)  | numeric     |
-  |   | %ac  | actconn                                       | numeric     |
-  |   | %b   | backend_name                                  | string      |
-  |   | %bc  | beconn      (backend concurrent connections)  | numeric     |
-  |   | %bi  | backend_source_ip       (connecting address)  | IP          |
-  |   | %bp  | backend_source_port     (connecting address)  | numeric     |
-  |   | %bq  | backend_queue                                 | numeric     |
-  |   | %ci  | client_ip                 (accepted address)  | IP          |
-  |   | %cp  | client_port               (accepted address)  | numeric     |
-  |   | %f   | frontend_name                                 | string      |
-  |   | %fc  | feconn     (frontend concurrent connections)  | numeric     |
-  |   | %fi  | frontend_ip              (accepting address)  | IP          |
-  |   | %fp  | frontend_port            (accepting address)  | numeric     |
-  |   | %ft  | frontend_name_transport ('~' suffix for SSL)  | string      |
-  |   | %lc  | frontend_log_counter                          | numeric     |
-  |   | %hr  | captured_request_headers default style        | string      |
-  |   | %hrl | captured_request_headers CLF style            | string list |
-  |   | %hs  | captured_response_headers default style       | string      |
-  |   | %hsl | captured_response_headers CLF style           | string list |
-  |   | %ms  | accept date milliseconds (left-padded with 0) | numeric     |
-  |   | %pid | PID                                           | numeric     |
-  | H | %r   | http_request                                  | string      |
-  |   | %rc  | retries                                       | numeric     |
-  |   | %rt  | request_counter (HTTP req or TCP session)     | numeric     |
-  |   | %s   | server_name                                   | string      |
-  |   | %sc  | srv_conn     (server concurrent connections)  | numeric     |
-  |   | %si  | server_IP                   (target address)  | IP          |
-  |   | %sp  | server_port                 (target address)  | numeric     |
-  |   | %sq  | srv_queue                                     | numeric     |
-  | S | %sslc| ssl_ciphers (ex: AES-SHA)                     | string      |
-  | S | %sslv| ssl_version (ex: TLSv1)                       | string      |
-  |   | %t   | date_time      (with millisecond resolution)  | date        |
-  | H | %tr  | date_time of HTTP request                     | date        |
-  | H | %trg | gmt_date_time of start of HTTP request        | date        |
-  | H | %trl | local_date_time of start of HTTP request      | date        |
-  |   | %ts  | termination_state                             | string      |
-  | H | %tsc | termination_state with cookie status          | string      |
-  +---+------+-----------------------------------------------+-------------+
+  +---+------+------------------------------------------------------+---------+
+  | R | var  | field name (8.2.2 and 8.2.3 for description)         | type    |
+  |   |      | sample fetch alternative                             |         |
+  +===+======+======================================================+=========+
+  |   | %o   | special variable, apply flags on all next var        |         |
+  +---+------+------------------------------------------------------+---------+
+  |                          date formats                                     |
+  +---+------+------------------------------------------------------+---------+
+  |   | %T   | Accept date UTC + timezone                           |         |
+  |   |      | %[accept_date,utime("%d/%b/%Y:%H:%M:%S %z")]         | date    |
+  +---+------+------------------------------------------------------+---------+
+  |   | %Tl  | Accept date local + timezone                         |         |
+  |   |      | %[accept_date,ltime("%d/%b/%Y:%H:%M:%S %z")]         | date    |
+  +---+------+------------------------------------------------------+---------+
+  |   | %Ts  | Accept date as a UNIX timestamp                      | numeric |
+  +---+------+------------------------------------------------------+---------+
+  |   | %t   | Accept date local (with millisecond resolution)      |         |
+  |   |      | %[accept_date(ms),ms_ltime("%d/%b/%Y:%H:%M:%S.%3N")] | date    |
+  +---+------+------------------------------------------------------+---------+
+  |   | %ms  | Accept date milliseconds                             |         |
+  |   |      | %[accept_date(ms),ms_utime("%3N")                    | numeric |
+  +---+------+------------------------------------------------------+---------+
+  | H | %tr  | Request date local (with millisecond resolution)     |         |
+  |   |      | %[request_date(ms),ms_ltime("%d/%b/%Y:%H:%M:%S.%3N")]| date    |
+  +---+------+------------------------------------------------------+---------+
+  | H | %trg | Request date UTC + timezone                          |         |
+  |   |      | %[request_date,utime("%d/%b/%Y:%H:%M:%S %z")]        | date    |
+  +---+------+------------------------------------------------------+---------+
+  | H | %trl | Request date local + timezone                        |         |
+  |   |      | %[request_date,ltime("%d/%b/%Y:%H:%M:%S %z")]        | date    |
+  +---+------+------------------------------------------------------+---------+
+  |                          Timing events                                    |
+  +---+------+------------------------------------------------------+---------+
+  | H | %Ta  | Active time of the request (from TR to end)          |         |
+  |   |      | %[txn.timer.total]                                   | numeric |
+  +---+------+------------------------------------------------------+---------+
+  |   | %Tc  | Tc                                                   |         |
+  |   |      | %[bc.timer.connect]                                  | numeric |
+  +---+------+------------------------------------------------------+---------+
+  |   | %Td  | Td = Tt - (Tq + Tw + Tc + Tr)                        |         |
+  |   |      | %[res.timer.data]                                    | numeric |
+  +---+------+------------------------------------------------------+---------+
+  |   | %Th  | connection handshake time (SSL, PROXY proto)         |         |
+  |   |      | %[fc.timer.handshake]                                | numeric |
+  +---+------+------------------------------------------------------+---------+
+  | H | %Ti  | idle time before the HTTP request                    |         |
+  |   |      | %[req.timer.idle]                                    | numeric |
+  +---+------+------------------------------------------------------+---------+
+  | H | %Tq  | Th + Ti + TR                                         |         |
+  |   |      | %[req.timer.tq]                                      | numeric |
+  +---+------+------------------------------------------------------+---------+
+  | H | %TR  | time to receive the full request from 1st byte       |         |
+  |   |      | %[req.timer.hdr]                                     | numeric |
+  +---+------+------------------------------------------------------+---------+
+  | H | %Tr  | Tr (response time)                                   |         |
+  |   |      | %[res.timer.hdr]                                     | numeric |
+  +---+------+------------------------------------------------------+---------+
+  |   | %Tt  | Tt                                                   |         |
+  |   |      | %[fc.timer.total]                                    | numeric |
+  +---+------+------------------------------------------------------+---------+
+  |   | %Tu  | Tu                                                   |         |
+  |   |      | %[txn.timer.user]                                    | numeric |
+  +---+------+------------------------------------------------------+---------+
+  |   | %Tw  | Tw                                                   |         |
+  |   |      | %[req.timer.queue]                                   | numeric |
+  +---+------+------------------------------------------------------+---------+
+  |                          Others                                           |
+  +---+------+------------------------------------------------------+---------+
+  |   | %B   | bytes_read           (from server to client)         | numeric |
+  +---+------+------------------------------------------------------+---------+
+  | H | %CC  | captured_request_cookie                              | string  |
+  +---+------+------------------------------------------------------+---------+
+  | H | %CS  | captured_response_cookie                             | string  |
+  +---+------+------------------------------------------------------+---------+
+  |   | %H   | hostname                                             | string  |
+  +---+------+------------------------------------------------------+---------+
+  | H | %HM  | HTTP method (ex: POST)                               | string  |
+  +---+------+------------------------------------------------------+---------+
+  | H | %HP  | HTTP request URI without query string                | string  |
+  +---+------+------------------------------------------------------+---------+
+  | H | %HPO | HTTP path only (without host nor query string)       | string  |
+  +---+------+------------------------------------------------------+---------+
+  | H | %HQ  | HTTP request URI query string (ex: ?bar=baz)         | string  |
+  +---+------+------------------------------------------------------+---------+
+  | H | %HU  | HTTP request URI (ex: /foo?bar=baz)                  | string  |
+  +---+------+------------------------------------------------------+---------+
+  | H | %HV  | HTTP version (ex: HTTP/1.0)                          | string  |
+  +---+------+------------------------------------------------------+---------+
+  |   | %ID  | unique-id                                            | string  |
+  +---+------+------------------------------------------------------+---------+
+  |   | %ST  | status_code                                          | numeric |
+  +---+------+------------------------------------------------------+---------+
+  |   | %U   | bytes_uploaded       (from client to server)         | numeric |
+  +---+------+------------------------------------------------------+---------+
+  |   | %ac  | actconn                                              |         |
+  |   |      | %[act_conn]                                          | numeric |
+  +---+------+------------------------------------------------------+---------+
+  |   | %b   | backend_name                                         | string  |
+  +---+------+------------------------------------------------------+---------+
+  |   | %bc  | beconn      (backend concurrent connections)         | numeric |
+  +---+------+------------------------------------------------------+---------+
+  |   | %bi  | backend_source_ip       (connecting address)         |         |
+  |   |      | %[bc_src]                                            | IP      |
+  +---+------+------------------------------------------------------+---------+
+  |   | %bp  | backend_source_port     (connecting address)         |         |
+  |   |      | %[bc_src_port]                                       | numeric |
+  +---+------+------------------------------------------------------+---------+
+  |   | %bq  | backend_queue                                        | numeric |
+  +---+------+------------------------------------------------------+---------+
+  |   | %ci  | client_ip                 (accepted address)         |         |
+  |   |      | %[src]                                               | IP      |
+  +---+------+------------------------------------------------------+---------+
+  |   | %cp  | client_port               (accepted address)         |         |
+  |   |      | %[src_port]                                          | numeric |
+  +---+------+------------------------------------------------------+---------+
+  |   | %f   | frontend_name                                        | string  |
+  +---+------+------------------------------------------------------+---------+
+  |   | %fc  | feconn     (frontend concurrent connections)         | numeric |
+  +---+------+------------------------------------------------------+---------+
+  |   | %fi  | frontend_ip              (accepting address)         |         |
+  |   |      | %[dst]                                               | IP      |
+  +---+------+------------------------------------------------------+---------+
+  |   | %fp  | frontend_port            (accepting address)         |         |
+  |   |      | %[dst_port]                                          | numeric |
+  +---+------+------------------------------------------------------+---------+
+  |   | %ft  | frontend_name_transport ('~' suffix for SSL)         | string  |
+  +---+------+------------------------------------------------------+---------+
+  |   | %lc  | frontend_log_counter                                 | numeric |
+  +---+------+------------------------------------------------------+---------+
+  |   | %hr  | captured_request_headers default style               | string  |
+  +---+------+------------------------------------------------------+---------+
+  |   | %hrl | captured_request_headers CLF style                   | string  |
+  |   |      |                                                      | list    |
+  +---+------+------------------------------------------------------+---------+
+  |   | %hs  | captured_response_headers default style              | string  |
+  +---+------+------------------------------------------------------+---------+
+  |   | %hsl | captured_response_headers CLF style                  | string  |
+  |   |      |                                                      | list    |
+  +---+------+------------------------------------------------------+---------+
+  |   | %pid | PID                                                  |         |
+  |   |      | %[pid]                                               | numeric |
+  +---+------+------------------------------------------------------+---------+
+  | H | %r   | http_request                                         | string  |
+  +---+------+------------------------------------------------------+---------+
+  |   | %rc  | retries                                              | numeric |
+  +---+------+------------------------------------------------------+---------+
+  |   | %rt  | request_counter (HTTP req or TCP session)            | numeric |
+  +---+------+------------------------------------------------------+---------+
+  |   | %s   | server_name                                          | string  |
+  +---+------+------------------------------------------------------+---------+
+  |   | %sc  | srv_conn     (server concurrent connections)         | numeric |
+  +---+------+------------------------------------------------------+---------+
+  |   | %si  | server_IP                   (target address)         |         |
+  |   |      | %[bc_dst]                                            | IP      |
+  +---+------+------------------------------------------------------+---------+
+  |   | %sp  | server_port                 (target address)         |         |
+  |   |      | %[bc_dst_port]                                       | numeric |
+  +---+------+------------------------------------------------------+---------+
+  |   | %sq  | srv_queue                                            | numeric |
+  +---+------+------------------------------------------------------+---------+
+  | S | %sslc| ssl_ciphers (ex: AES-SHA)                            |         |
+  |   |      | %[ssl_fc_cipher]                                     | string  |
+  +---+------+------------------------------------------------------+---------+
+  | S | %sslv| ssl_version (ex: TLSv1)                              |         |
+  |   |      | %[ssl_fc_protocol]                                   | string  |
+  +---+------+------------------------------------------------------+---------+
+  |   | %ts  | termination_state                                    | string  |
+  +---+------+------------------------------------------------------+---------+
+  | H | %tsc | termination_state with cookie status                 | string  |
+  +---+------+------------------------------------------------------+---------+
 
     R = Restrictions : H = mode http only ; S = SSL only
 
@@ -23501,6 +23807,9 @@ Timings events in TCP mode:
     all request to calculate the amortized value. The second and subsequent
     request will always report zero here.
 
+    This timer is named %Th as a log-format tag, and fc.timer.handshake as a
+    sample fetch.
+
   - Ti: is the idle time before the HTTP request (HTTP mode only). This timer
     counts between the end of the handshakes and the first byte of the HTTP
     request. When dealing with a second request in keep-alive mode, it starts
@@ -23511,6 +23820,9 @@ Timings events in TCP mode:
     pending until they need it. This delay will be reported as the idle time. A
     value of -1 indicates that nothing was received on the connection.
 
+    This timer is named %Ti as a log-format tag, and req.timer.idle as a
+    sample fetch.
+
   - TR: total time to get the client request (HTTP mode only). It's the time
     elapsed between the first bytes received and the moment the proxy received
     the empty line marking the end of the HTTP headers. The value "-1"
@@ -23518,6 +23830,9 @@ Timings events in TCP mode:
     the client closes prematurely or times out. This time is usually very short
     since most requests fit in a single packet. A large time may indicate a
     request typed by hand during a test.
+
+    This timer is named %TR as a log-format tag, and req.timer.hdr as a
+    sample fetch.
 
   - Tq: total time to get the client request from the accept date or since the
     emission of the last byte of the previous response (HTTP mode only). It's
@@ -23527,17 +23842,26 @@ Timings events in TCP mode:
     it in favor of TR nowadays, as the idle time adds a lot of noise to the
     reports.
 
+    This timer is named %Tq as a log-format tag, and req.timer.tq as a
+    sample fetch.
+
   - Tw: total time spent in the queues waiting for a connection slot. It
     accounts for backend queue as well as the server queues, and depends on the
     queue size, and the time needed for the server to complete previous
     requests. The value "-1" means that the request was killed before reaching
     the queue, which is generally what happens with invalid or denied requests.
 
+    This timer is named %Tw as a log-format tag, and req.timer.queue as a
+    sample fetch.
+
   - Tc: total time to establish the TCP connection to the server. It's the time
     elapsed between the moment the proxy sent the connection request, and the
     moment it was acknowledged by the server, or between the TCP SYN packet and
     the matching SYN/ACK packet in return. The value "-1" means that the
     connection never established.
+
+    This timer is named %Tc as a log-format tag, and bc.timer.connect as a
+    sample fetch.
 
   - Tr: server response time (HTTP mode only). It's the time elapsed between
     the moment the TCP connection was established to the server and the moment
@@ -23551,6 +23875,19 @@ Timings events in TCP mode:
     header (empty line) was never seen, most likely because the server timeout
     stroke before the server managed to process the request.
 
+    This timer is named %Tr as a log-format tag, and res.timer.hdr as a
+    sample fetch.
+
+  - Td: this is the total transfer time of the response payload till the last
+    byte sent to the client. In HTTP it starts after the last response header
+    (after Tr).
+
+    The data sent are not guaranteed to be received by the client, they can be
+    stuck in either the kernel or the network.
+
+    This timer is named %Td as a log-format tag, and res.timer.data as a
+    sample fetch.
+
   - Ta: total active time for the HTTP request, between the moment the proxy
     received the first byte of the request header and the emission of the last
     byte of the response body. The exception is when the "logasap" option is
@@ -23562,6 +23899,9 @@ Timings events in TCP mode:
 
     Timers with "-1" values have to be excluded from this equation. Note that
     "Ta" can never be negative.
+
+    This timer is named %Ta as a log-format tag, and txn.timer.total as a
+    sample fetch.
 
   - Tt: total session duration time, between the moment the proxy accepted it
     and the moment both ends were closed. The exception is when the "logasap"
@@ -23575,6 +23915,9 @@ Timings events in TCP mode:
     mode, "Ti", "Tq" and "Tr" have to be excluded too. Note that "Tt" can never
     be negative and that for HTTP, Tt is simply equal to (Th+Ti+Ta).
 
+    This timer is named %Tt as a log-format tag, and fc.timer.total as a
+    sample fetch.
+
   - Tu: total estimated time as seen from client, between the moment the proxy
     accepted it and the moment both ends were closed, without idle time.
     This is useful to roughly measure end-to-end time as a user would see it,
@@ -23583,6 +23926,9 @@ Timings events in TCP mode:
     latency is the same in both directions. The exception is when the "logasap"
     option is specified. In this case, it only equals (Th+TR+Tw+Tc+Tr), and is
     prefixed with a '+' sign.
+
+    This timer is named %Tu as a log-format tag, and txn.timer.user as a
+    sample fetch.
 
 These timers provide precious indications on trouble causes. Since the TCP
 protocol defines retransmit delays of 3, 6, 12... seconds, we know for sure

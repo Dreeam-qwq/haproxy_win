@@ -28,8 +28,11 @@
 #include <haproxy/quic_conn.h>
 #include <haproxy/quic_frame.h>
 #include <haproxy/quic_tls-t.h>
+#include <haproxy/quic_tx.h>
 #include <haproxy/trace.h>
 
+int quic_tls_finalize(struct quic_conn *qc, int server);
+void quic_tls_ctx_free(struct quic_tls_ctx **ctx);
 void quic_pktns_release(struct quic_conn *qc, struct quic_pktns **pktns);
 int qc_enc_level_alloc(struct quic_conn *qc, struct quic_pktns **pktns,
                        struct quic_enc_level **qel, enum ssl_encryption_level_t level);
@@ -127,6 +130,9 @@ int quic_tls_aes_decrypt(unsigned char *out,
 int quic_tls_aes_encrypt(unsigned char *out,
                          const unsigned char *in, size_t inlen,
                          EVP_CIPHER_CTX *ctx);
+
+int quic_tls_key_update(struct quic_conn *qc);
+void quic_tls_rotate_keys(struct quic_conn *qc);
 
 static inline const EVP_CIPHER *tls_aead(const SSL_CIPHER *cipher)
 {
@@ -533,6 +539,21 @@ static inline void quic_pktns_discard(struct quic_pktns *pktns,
 	TRACE_LEAVE(QUIC_EV_CONN_PHPKTS, qc);
 }
 
+
+/* Release all the frames attached to <pktns> packet number space */
+static inline void qc_release_pktns_frms(struct quic_conn *qc,
+                                         struct quic_pktns *pktns)
+{
+	struct quic_frame *frm, *frmbak;
+
+	TRACE_ENTER(QUIC_EV_CONN_PHPKTS, qc);
+
+	list_for_each_entry_safe(frm, frmbak, &pktns->tx.frms, list)
+		qc_frm_free(qc, &frm);
+
+	TRACE_LEAVE(QUIC_EV_CONN_PHPKTS, qc);
+}
+
 /* Return 1 if <pktns> matches with the Application packet number space of
  * <conn> connection which is common to the 0-RTT and 1-RTT encryption levels, 0
  * if not (handshake packets).
@@ -633,6 +654,19 @@ static inline int quic_tls_pkt_type_pktns_dcd(struct quic_conn *qc, unsigned cha
 		return 1;
 
 	return 0;
+}
+
+/* Select the correct TLS cipher context to used to decipher an RX packet
+ * with <type> as type and <version> as version and attached to <qc>
+ * connection from <qel> encryption level.
+ */
+static inline struct quic_tls_ctx *qc_select_tls_ctx(struct quic_conn *qc,
+                                                     struct quic_enc_level *qel,
+                                                     unsigned char type,
+                                                     const struct quic_version *version)
+{
+	return type != QUIC_PACKET_TYPE_INITIAL ? &qel->tls_ctx :
+		version == qc->negotiated_version ? qc->nictx : &qel->tls_ctx;
 }
 
 /* Reset all members of <ctx> to default values, ->hp_key[] excepted */
@@ -829,44 +863,6 @@ static inline enum quic_pkt_type quic_enc_level_pkt_type(struct quic_conn *qc,
 		return QUIC_PACKET_TYPE_SHORT;
 	else
 		return -1;
-}
-
-/* Set <*level> and <*next_level> depending on <state> QUIC handshake state. */
-static inline int quic_get_tls_enc_levels(enum quic_tls_enc_level *level,
-                                          enum quic_tls_enc_level *next_level,
-                                          struct quic_conn *qc,
-                                          enum quic_handshake_state state, int zero_rtt)
-{
-	int ret = 0;
-
-	TRACE_ENTER(QUIC_EV_CONN_ELEVELSEL, qc, &state, level, next_level);
-	switch (state) {
-	case QUIC_HS_ST_SERVER_INITIAL:
-	case QUIC_HS_ST_CLIENT_INITIAL:
-		*level = QUIC_TLS_ENC_LEVEL_INITIAL;
-		if (zero_rtt)
-			*next_level = QUIC_TLS_ENC_LEVEL_EARLY_DATA;
-		else
-			*next_level = QUIC_TLS_ENC_LEVEL_HANDSHAKE;
-		break;
-	case QUIC_HS_ST_SERVER_HANDSHAKE:
-	case QUIC_HS_ST_CLIENT_HANDSHAKE:
-		*level = QUIC_TLS_ENC_LEVEL_HANDSHAKE;
-		*next_level = QUIC_TLS_ENC_LEVEL_APP;
-		break;
-	case QUIC_HS_ST_COMPLETE:
-	case QUIC_HS_ST_CONFIRMED:
-		*level = QUIC_TLS_ENC_LEVEL_APP;
-		*next_level = QUIC_TLS_ENC_LEVEL_NONE;
-		break;
-	default:
-		goto leave;
-	}
-
-	ret = 1;
- leave:
-	TRACE_LEAVE(QUIC_EV_CONN_ELEVELSEL, qc, NULL, level, next_level);
-	return ret;
 }
 
 /* Derive the initial secrets with <ctx> as QUIC TLS context which is the

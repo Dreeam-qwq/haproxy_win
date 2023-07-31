@@ -40,6 +40,7 @@
 #include <haproxy/sample.h>
 #include <haproxy/sink.h>
 #include <haproxy/stick_table.h>
+#include <haproxy/time.h>
 #include <haproxy/tools.h>
 #include <haproxy/uri_auth-t.h>
 #include <haproxy/vars.h>
@@ -2162,6 +2163,202 @@ static int sample_conv_ipmask(const struct arg *args, struct sample *smp, void *
 	return 1;
 }
 
+/*
+ * This function implement a conversion specifier seeker for %N so it could be
+ * replaced before doing strftime.
+ *
+ * <format> is the input format string which is used as a haystack
+ *
+ * The function fills multiple variables:
+ * <skip> is the len of the conversion specifier string which was found (ex: strlen(%N):2, strlen(%3N):3 strlen(%123N): 5)
+ * <width> is the width argument, default width is 9 (ex: %3N: 3, %4N: 4: %N: 9, %5N: 5)
+ *
+ * Returns a ptr to the first character of the conversion specifier or NULL if not found
+ */
+static const char *lookup_convspec_N(const char *format, int *skip, int *width)
+{
+	const char *p, *needle;
+	const char *digits;
+	int state;
+
+	p = format;
+
+	/* this looks for % in loop. The iteration stops when a %N conversion
+	 * specifier was found or there is no '%' anymore */
+lookagain:
+	while (p && *p) {
+		state = 0;
+		digits = NULL;
+
+		p = needle = strchr(p, '%');
+		/* Once we find a % we try to move forward in the string
+		 *
+		 * state 0: found %
+		 * state 1: digits (precision)
+		 * state 2: N
+		 */
+		while (p && *p) {
+			switch (state) {
+				case 0:
+					state = 1;
+					break;
+
+				case 1:
+					if (isdigit((unsigned char)*p) && !digits) /* set the start of the digits */
+						digits = p;
+
+					if (isdigit((unsigned char)*p))
+						break;
+					else
+						state = 2;
+					/* if this is not a number anymore, we
+					* don't want to increment p but try the
+					* next state directly */
+					__fallthrough;
+				case 2:
+					if (*p == 'N')
+						goto found;
+					else
+						/* this was not a %N, start again */
+						goto lookagain;
+					break;
+			}
+			p++;
+		}
+	}
+
+	*skip = 0;
+	*width = 0;
+	return NULL;
+
+found:
+	*skip = p - needle + 1;
+	if (digits)
+		*width = atoi(digits);
+	else
+		*width = 9;
+	return needle;
+}
+
+ /*
+  * strftime(3) does not implement nanoseconds, but we still want them in our
+  * date format.
+  *
+  * This function implements %N like in date(1) which gives you the nanoseconds part of the timetamp
+  * An optional field width can be specified, a maximum width of 9 is supported (ex: %3N %6N %9N)
+  *
+  * <format> is the format string
+  * <curr_date> in seconds since epoch
+  * <ns> only the nanoseconds part of the timestamp
+  * <local> chose the localtime instead of UTC time
+  *
+  * Return the results of strftime in the trash buffer
+  */
+static struct buffer *conv_time_common(const char *format, time_t curr_date, uint64_t ns, int local)
+{
+	struct buffer *tmp_format = NULL;
+	struct buffer *res = NULL;
+	struct tm tm;
+	const char *p;
+	char ns_str[10] = {};
+	int set = 0;
+
+	if (local)
+		get_localtime(curr_date, &tm);
+	else
+		get_gmtime(curr_date, &tm);
+
+
+	/* we need to iterate in order to replace all the %N in the string */
+
+	p = format;
+	while (*p) {
+		const char *needle;
+		int skip = 0;
+		int cpy = 0;
+		int width = 0;
+
+		/* look for the next %N onversion specifier */
+		if (!(needle = lookup_convspec_N(p, &skip, &width)))
+			break;
+
+		if (width > 9) /* we don't handle more that 9 */
+			width = 9;
+		cpy = needle - p;
+
+		if (!tmp_format)
+			tmp_format = alloc_trash_chunk();
+		if (!tmp_format)
+			goto error;
+
+		if (set != 9) /* if the snprintf wasn't done yet */
+			set = snprintf(ns_str, sizeof(ns_str), "%.9llu", (unsigned long long)ns);
+
+		if (chunk_istcat(tmp_format, ist2(p, cpy)) == 0) /* copy before the %N */
+			goto error;
+		if (chunk_istcat(tmp_format, ist2(ns_str, width)) == 0) /* copy the %N result with the right precison  */
+			goto error;
+
+		p += skip + cpy; /* skip the %N */
+	}
+
+
+	if (tmp_format) { /* %N was found */
+		if (chunk_strcat(tmp_format, p) == 0)  /* copy the end of the string if needed or just the \0 */
+			goto error;
+		res = get_trash_chunk();
+		res->data = strftime(res->area, res->size, tmp_format->area , &tm);
+	} else {
+		res = get_trash_chunk();
+		res->data = strftime(res->area, res->size, format, &tm);
+	}
+
+error:
+	free_trash_chunk(tmp_format);
+	return res;
+}
+
+
+
+/*
+ * same as sample_conv_ltime but input is us and %N is supported
+ */
+static int sample_conv_us_ltime(const struct arg *args, struct sample *smp, void *private)
+{
+	struct buffer *temp;
+	time_t curr_date = smp->data.u.sint / 1000000; /* convert us to s */
+	uint64_t ns = (smp->data.u.sint % 1000000) * 1000; /*  us part to ns */
+
+	/* add offset */
+	if (args[1].type == ARGT_SINT)
+		curr_date += args[1].data.sint;
+
+	temp = conv_time_common(args[0].data.str.area, curr_date, ns, 1);
+	smp->data.u.str = *temp;
+	smp->data.type = SMP_T_STR;
+	return 1;
+}
+
+/*
+ * same as sample_conv_ltime but input is ms and %N is supported
+ */
+static int sample_conv_ms_ltime(const struct arg *args, struct sample *smp, void *private)
+{
+	struct buffer *temp;
+	time_t curr_date = smp->data.u.sint / 1000; /* convert ms to s */
+	uint64_t ns = (smp->data.u.sint % 1000) * 1000000; /*  ms part to ns */
+
+	/* add offset */
+	if (args[1].type == ARGT_SINT)
+		curr_date += args[1].data.sint;
+
+	temp = conv_time_common(args[0].data.str.area, curr_date, ns, 1);
+	smp->data.u.str = *temp;
+	smp->data.type = SMP_T_STR;
+	return 1;
+}
+
+
 /* takes an UINT value on input supposed to represent the time since EPOCH,
  * adds an optional offset found in args[1] and emits a string representing
  * the local time in the format specified in args[1] using strftime().
@@ -2194,6 +2391,44 @@ static int sample_conv_sdbm(const struct arg *arg_p, struct sample *smp, void *p
 	if (arg_p->data.sint)
 		smp->data.u.sint = full_hash(smp->data.u.sint);
 	smp->data.type = SMP_T_SINT;
+	return 1;
+}
+
+/*
+ * same as sample_conv_utime but input is us and %N is supported
+ */
+static int sample_conv_us_utime(const struct arg *args, struct sample *smp, void *private)
+{
+	struct buffer *temp;
+	time_t curr_date = smp->data.u.sint / 1000000; /* convert us to s */
+	uint64_t ns = (smp->data.u.sint % 1000000) * 1000; /*  us part to ns */
+
+	/* add offset */
+	if (args[1].type == ARGT_SINT)
+		curr_date += args[1].data.sint;
+
+	temp = conv_time_common(args[0].data.str.area, curr_date, ns, 0);
+	smp->data.u.str = *temp;
+	smp->data.type = SMP_T_STR;
+	return 1;
+}
+
+/*
+ * same as sample_conv_utime but input is ms and %N is supported
+ */
+static int sample_conv_ms_utime(const struct arg *args, struct sample *smp, void *private)
+{
+	struct buffer *temp;
+	time_t curr_date = smp->data.u.sint / 1000; /* convert ms to s */
+	uint64_t ns = (smp->data.u.sint % 1000) * 1000000; /*  ms part to ns */
+
+	/* add offset */
+	if (args[1].type == ARGT_SINT)
+		curr_date += args[1].data.sint;
+
+	temp = conv_time_common(args[0].data.str.area, curr_date, ns, 0);
+	smp->data.u.str = *temp;
+	smp->data.type = SMP_T_STR;
 	return 1;
 }
 
@@ -4075,6 +4310,17 @@ static int sample_conv_jwt_payload_query(const struct arg *args, struct sample *
 /*       All supported sample fetch functions must be declared here     */
 /************************************************************************/
 
+
+/* returns the actconn */
+static int
+smp_fetch_actconn(const struct arg *args, struct sample *smp, const char *kw, void *private)
+{
+	smp->data.type = SMP_T_SINT;
+	smp->data.u.sint = actconn;
+	return 1;
+}
+
+
 /* force TRUE to be returned at the fetch level */
 static int
 smp_fetch_true(const struct arg *args, struct sample *smp, const char *kw, void *private)
@@ -4212,6 +4458,16 @@ smp_fetch_nbproc(const struct arg *args, struct sample *smp, const char *kw, voi
 	smp->data.u.sint = 1;
 	return 1;
 }
+
+/* returns the PID of the current process */
+static int
+smp_fetch_pid(const struct arg *args, struct sample *smp, const char *kw, void *private)
+{
+	smp->data.type = SMP_T_SINT;
+	smp->data.u.sint = pid;
+	return 1;
+}
+
 
 /* returns the number of the current process (between 1 and nbproc */
 static int
@@ -4484,12 +4740,199 @@ static int smp_fetch_quic_enabled(const struct arg *args, struct sample *smp, co
 	return smp->data.u.sint;
 }
 
+/* Timing events re{q,s}.timer.  */
+static int smp_fetch_reX_timers(const struct arg *args, struct sample *smp, const char *kw, void *private)
+{
+	struct strm_logs *logs;
+	int t_request = -1;
+
+	if (!smp->strm)
+		return 0;
+
+	smp->data.type = SMP_T_SINT;
+	smp->flags = 0;
+
+	logs = &smp->strm->logs;
+
+
+	if ((llong)(logs->request_ts - logs->accept_ts) >= 0)
+		t_request = ns_to_ms(logs->request_ts - logs->accept_ts);
+
+	/* req.timer. */
+	if (kw[2] == 'q') {
+
+		switch (kw[10]) {
+
+			/* req.timer.idle (%Ti)  */
+			case 'i':
+				smp->data.u.sint = logs->t_idle;
+				break;
+
+			/* req.timer.tq (%Tq) */
+			case 't':
+				smp->data.u.sint = t_request;
+				break;
+
+			/* req.timer.hdr (%TR) */
+			case 'h':
+				smp->data.u.sint = (t_request >= 0) ? t_request - logs->t_idle - logs->t_handshake : -1;
+				break;
+
+			/* req.timer.queue (%Tw) */
+			case 'q':
+				smp->data.u.sint = (logs->t_queue >= 0) ? logs->t_queue - t_request : -1;
+				break;
+
+			default:
+				goto error;
+
+		}
+	} else {
+		/* res.timer. */
+		switch (kw[10]) {
+			/* res.timer.hdr (%Tr) */
+			case 'h':
+				smp->data.u.sint = (logs->t_data >= 0) ? logs->t_data - logs->t_connect : -1;
+			break;
+
+			/* res.timer.data (%Td) */
+			case 'd':
+				smp->data.u.sint = (logs->t_data >= 0) ? logs->t_close - logs->t_data : -1;
+			break;
+
+			default:
+				goto error;
+
+		}
+
+	}
+
+		return 1;
+error:
+
+		return 0;
+	}
+
+
+/* Timing events  txn. */
+static int smp_fetch_txn_timers(const struct arg *args, struct sample *smp, const char *kw, void *private)
+{
+	struct strm_logs *logs;
+
+	if (!smp->strm)
+		return 0;
+
+	smp->data.type = SMP_T_SINT;
+	smp->flags = 0;
+
+	logs = &smp->strm->logs;
+
+	/* txn.timer. */
+	switch (kw[10]) {
+
+		/* txn.timer.total (%Ta) */
+		case 't':
+			smp->data.u.sint = logs->t_close - (logs->t_idle >= 0 ? logs->t_idle + logs->t_handshake : 0);
+		break;
+
+
+		/* txn.timer.user (%Tu) */
+		case 'u':
+			smp->data.u.sint = logs->t_close - (logs->t_idle >= 0 ? logs->t_idle : 0);
+		break;
+
+		default:
+			goto error;
+
+	}
+
+	return 1;
+error:
+
+	return 0;
+}
+
+/* Timing events {f,bc}.timer.  */
+static int smp_fetch_conn_timers(const struct arg *args, struct sample *smp, const char *kw, void *private)
+{
+	struct strm_logs *logs;
+
+	if (!smp->strm)
+		return 0;
+
+	smp->data.type = SMP_T_SINT;
+	smp->flags = 0;
+
+	logs = &smp->strm->logs;
+
+	if (kw[0] == 'b') {
+		/* fc.timer. */
+		switch (kw[9]) {
+
+			/* bc.timer.connect (%Tc) */
+			case 'c':
+				smp->data.u.sint = (logs->t_connect >= 0) ? logs->t_connect - logs->t_queue : -1;
+				break;
+
+			default:
+				goto error;
+		}
+
+	} else {
+
+		/* fc.timer. */
+		switch (kw[9]) {
+
+			/* fc.timer.handshake (%Th) */
+			case 'h':
+				smp->data.u.sint = logs->t_handshake;
+				break;
+
+			/* fc,timer.total (%Tt) */
+			case 't':
+				smp->data.u.sint = logs->t_close;
+				break;
+
+			default:
+				goto error;
+		}
+
+	}
+
+	return 1;
+error:
+
+	return 0;
+}
+
+
+
+static struct sample_fetch_kw_list smp_logs_kws = {ILH, {
+	{ "txn.timer.total",      smp_fetch_txn_timers,   0,         NULL, SMP_T_SINT, SMP_USE_TXFIN }, /* "Ta" */
+	{ "txn.timer.user",       smp_fetch_txn_timers,   0,         NULL, SMP_T_SINT, SMP_USE_TXFIN }, /* "Tu" */
+
+	{ "bc.timer.connect",     smp_fetch_conn_timers,  0,         NULL, SMP_T_SINT, SMP_USE_L4SRV }, /* "Tc" */
+	{ "fc.timer.handshake",   smp_fetch_conn_timers,  0,         NULL, SMP_T_SINT, SMP_USE_L4CLI }, /* "Th" */
+	{ "fc.timer.total",       smp_fetch_conn_timers,  0,         NULL, SMP_T_SINT, SMP_USE_SSFIN }, /* "Tt" */
+
+	{ "req.timer.idle",       smp_fetch_reX_timers,   0,         NULL, SMP_T_SINT, SMP_USE_HRQHV }, /* "Ti" */
+	{ "req.timer.tq",         smp_fetch_reX_timers,   0,         NULL, SMP_T_SINT, SMP_USE_HRQHV }, /* "Tq" */
+	{ "req.timer.hdr",        smp_fetch_reX_timers,   0,         NULL, SMP_T_SINT, SMP_USE_HRQHV }, /* "TR" */
+	{ "req.timer.queue",      smp_fetch_reX_timers,   0,         NULL, SMP_T_SINT, SMP_USE_L4SRV }, /* "Tw" */
+	{ "res.timer.data",       smp_fetch_reX_timers,   0,         NULL, SMP_T_SINT, SMP_USE_RSFIN }, /* "Td" */
+	{ "res.timer.hdr",        smp_fetch_reX_timers,   0,         NULL, SMP_T_SINT, SMP_USE_HRSHV }, /* "Tr" */
+	{ /* END */ },
+}};
+
+INITCALL1(STG_REGISTER, sample_register_fetches, &smp_logs_kws);
+
 /* Note: must not be declared <const> as its list will be overwritten.
  * Note: fetches that may return multiple types should be declared using the
  * appropriate pseudo-type. If not available it must be declared as the lowest
  * common denominator, the type that can be casted into all other ones.
  */
 static struct sample_fetch_kw_list smp_kws = {ILH, {
+	{ "act_conn",     smp_fetch_actconn, 0,          NULL, SMP_T_SINT, SMP_USE_CONST },
 	{ "always_false", smp_fetch_false, 0,            NULL, SMP_T_BOOL, SMP_USE_CONST },
 	{ "always_true",  smp_fetch_true,  0,            NULL, SMP_T_BOOL, SMP_USE_CONST },
 	{ "env",          smp_fetch_env,   ARG1(1,STR),  NULL, SMP_T_STR,  SMP_USE_CONST },
@@ -4497,6 +4940,7 @@ static struct sample_fetch_kw_list smp_kws = {ILH, {
 	{ "date_us",      smp_fetch_date_us,  0,         NULL, SMP_T_SINT, SMP_USE_CONST },
 	{ "hostname",     smp_fetch_hostname, 0,         NULL, SMP_T_STR,  SMP_USE_CONST },
 	{ "nbproc",       smp_fetch_nbproc,0,            NULL, SMP_T_SINT, SMP_USE_CONST },
+	{ "pid",          smp_fetch_pid,   0,            NULL, SMP_T_SINT, SMP_USE_CONST },
 	{ "proc",         smp_fetch_proc,  0,            NULL, SMP_T_SINT, SMP_USE_CONST },
 	{ "quic_enabled", smp_fetch_quic_enabled, 0,     NULL, SMP_T_BOOL, SMP_USE_CONST },
 	{ "thread",       smp_fetch_thread,  0,          NULL, SMP_T_SINT, SMP_USE_CONST },
@@ -4541,7 +4985,11 @@ static struct sample_conv_kw_list sample_conv_kws = {ILH, {
 	{ "hex2i",   sample_conv_hex2int,      0,                     NULL,                     SMP_T_STR,  SMP_T_SINT },
 	{ "ipmask",  sample_conv_ipmask,       ARG2(1,MSK4,MSK6),     NULL,                     SMP_T_ADDR, SMP_T_ADDR },
 	{ "ltime",   sample_conv_ltime,        ARG2(1,STR,SINT),      NULL,                     SMP_T_SINT, SMP_T_STR  },
+	{ "ms_ltime",   sample_conv_ms_ltime,        ARG2(1,STR,SINT),      NULL,                     SMP_T_SINT, SMP_T_STR  },
+	{ "us_ltime",   sample_conv_us_ltime,        ARG2(1,STR,SINT),      NULL,                     SMP_T_SINT, SMP_T_STR  },
 	{ "utime",   sample_conv_utime,        ARG2(1,STR,SINT),      NULL,                     SMP_T_SINT, SMP_T_STR  },
+	{ "ms_utime",   sample_conv_ms_utime,        ARG2(1,STR,SINT),      NULL,                     SMP_T_SINT, SMP_T_STR  },
+	{ "us_utime",   sample_conv_us_utime,        ARG2(1,STR,SINT),      NULL,                     SMP_T_SINT, SMP_T_STR  },
 	{ "crc32",   sample_conv_crc32,        ARG1(0,SINT),          NULL,                     SMP_T_BIN,  SMP_T_SINT },
 	{ "crc32c",  sample_conv_crc32c,       ARG1(0,SINT),          NULL,                     SMP_T_BIN,  SMP_T_SINT },
 	{ "djb2",    sample_conv_djb2,         ARG1(0,SINT),          NULL,                     SMP_T_BIN,  SMP_T_SINT },

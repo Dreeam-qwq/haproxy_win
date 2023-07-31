@@ -34,7 +34,6 @@
 #include <haproxy/openssl-compat.h>
 #include <haproxy/mux_quic-t.h>
 #include <haproxy/quic_cc-t.h>
-#include <haproxy/quic_frame-t.h>
 #include <haproxy/quic_loss-t.h>
 #include <haproxy/quic_openssl_compat-t.h>
 #include <haproxy/quic_stats-t.h>
@@ -248,17 +247,11 @@ enum quic_pkt_type {
     (void) (&_a == &_b);  \
     _a > _b ? _a : _b; })
 
-/* Size of the internal buffer of QUIC TX ring buffers (must be a power of 2) */
-#define QUIC_TX_RING_BUFSZ  (1UL << 12)
 /* Size of the QUIC RX buffer for the connections */
 #define QUIC_CONN_RX_BUFSZ (1UL << 16)
 
 extern struct trace_source trace_quic;
-extern struct pool_head *pool_head_quic_rx_packet;
-extern struct pool_head *pool_head_quic_tx_packet;
 extern struct pool_head *pool_head_quic_crypto_buf;
-extern struct pool_head *pool_head_quic_frame;
-extern struct pool_head *pool_head_quic_dgram;
 
 struct quic_version {
 	uint32_t num;
@@ -309,20 +302,6 @@ struct quic_connection_id {
 	uint tid;              /* Attached Thread ID for the connection. */
 };
 
-/* Structure to hold a range of ACKs sent in ACK frames. */
-struct quic_arng {
-	int64_t first;
-	int64_t last;
-};
-
-/* Structure to hold a range of ACKs to be store as a node in a tree of
- * ACK ranges.
- */
-struct quic_arng_node {
-	struct eb64_node first;
-	uint64_t last;
-};
-
 /* Flag the packet number space as having received a packet */
 #define QUIC_FL_PKTNS_PKT_RECEIVED  (1UL << 0)
 /* Flag the packet number space as requiring an ACK frame to be sent. */
@@ -355,52 +334,6 @@ struct quic_dgram {
 /* The QUIC packet numbers are 62-bits integers */
 #define QUIC_MAX_PACKET_NUM      ((1ULL << 62) - 1)
 
-/* Maximum number of ack-eliciting received packets since the last
- * ACK frame was sent
- */
-#define QUIC_MAX_RX_AEPKTS_SINCE_LAST_ACK       2
-#define QUIC_ACK_DELAY   (QUIC_TP_DFLT_MAX_ACK_DELAY - 5)
-/* Flag a received packet as being an ack-eliciting packet. */
-#define QUIC_FL_RX_PACKET_ACK_ELICITING (1UL << 0)
-/* Packet is the first one in the containing datagram. */
-#define QUIC_FL_RX_PACKET_DGRAM_FIRST   (1UL << 1)
-/* Spin bit set */
-#define QUIC_FL_RX_PACKET_SPIN_BIT   (1UL << 2)
-
-struct quic_rx_packet {
-	struct list list;
-	struct list qc_rx_pkt_list;
-
-	/* QUIC version used in packet. */
-	const struct quic_version *version;
-
-	unsigned char type;
-	/* Initial desctination connection ID. */
-	struct quic_cid dcid;
-	struct quic_cid scid;
-	/* Packet number offset : only valid for Initial/Handshake/0-RTT/1-RTT. */
-	size_t pn_offset;
-	/* Packet number */
-	int64_t pn;
-	/* Packet number length */
-	uint32_t pnl;
-	uint64_t token_len;
-	unsigned char *token;
-	/* Packet length */
-	uint64_t len;
-	/* Packet length before decryption */
-	uint64_t raw_len;
-	/* Additional authenticated data length */
-	size_t aad_len;
-	unsigned char *data;
-	struct eb64_node pn_node;
-	volatile unsigned int refcnt;
-	/* Source address of this packet. */
-	struct sockaddr_storage saddr;
-	unsigned int flags;
-	unsigned int time_received;
-};
-
 /* QUIC datagram handler */
 struct quic_dghdlr {
 	struct mt_list dgrams;
@@ -413,51 +346,6 @@ struct quic_rx_crypto_frm {
 	uint64_t len;
 	const unsigned char *data;
 	struct quic_rx_packet *pkt;
-};
-
-/* Flag a sent packet as being an ack-eliciting packet. */
-#define QUIC_FL_TX_PACKET_ACK_ELICITING (1UL << 0)
-/* Flag a sent packet as containing a PADDING frame. */
-#define QUIC_FL_TX_PACKET_PADDING       (1UL << 1)
-/* Flag a sent packet as being in flight. */
-#define QUIC_FL_TX_PACKET_IN_FLIGHT     (QUIC_FL_TX_PACKET_ACK_ELICITING | QUIC_FL_TX_PACKET_PADDING)
-/* Flag a sent packet as containing a CONNECTION_CLOSE frame */
-#define QUIC_FL_TX_PACKET_CC            (1UL << 2)
-/* Flag a sent packet as containing an ACK frame */
-#define QUIC_FL_TX_PACKET_ACK           (1UL << 3)
-/* Flag a sent packet as being coalesced to another one in the same datagram */
-#define QUIC_FL_TX_PACKET_COALESCED     (1UL << 4)
-/* Flag a sent packet as being probing with old data */
-#define QUIC_FL_TX_PACKET_PROBE_WITH_OLD_DATA (1UL << 5)
-
-/* Structure to store enough information about TX QUIC packets. */
-struct quic_tx_packet {
-	/* List entry point. */
-	struct list list;
-	/* Packet length */
-	size_t len;
-	/* This is not the packet length but the length of outstanding data
-	 * for in flight TX packet.
-	 */
-	size_t in_flight_len;
-	struct eb64_node pn_node;
-	/* The list of frames of this packet. */
-	struct list frms;
-	/* The time this packet was sent (ms). */
-	unsigned int time_sent;
-	/* Packet number spakce. */
-	struct quic_pktns *pktns;
-	/* Flags. */
-	unsigned int flags;
-	/* Reference counter */
-	int refcnt;
-	/* Next packet in the same datagram */
-	struct quic_tx_packet *next;
-	/* Previous packet in the same datagram */
-	struct quic_tx_packet *prev;
-	/* Largest acknowledged packet number if this packet contains an ACK frame */
-	int64_t largest_acked_pn;
-	unsigned char type;
 };
 
 #define QUIC_CRYPTO_BUF_SHIFT  10
@@ -513,12 +401,6 @@ struct quic_path {
 	uint64_t ifae_pkts;
 };
 
-/* QUIC ring buffer */
-struct qring {
-	struct cbuf *cbuf;
-	struct mt_list mt_list;
-};
-
 /* Status of the connection/mux layer. This defines how to handle app data.
  *
  * During a standard quic_conn lifetime it transitions like this :
@@ -547,9 +429,6 @@ struct quic_conn_cntrs {
 	long long streams_blocked_bidi;      /* total number of times STREAMS_BLOCKED_BIDI frame was received */
 	long long streams_blocked_uni;       /* total number of times STREAMS_BLOCKED_UNI frame was received */
 };
-
-/* The number of buffers for outgoing packets (must be a power of two). */
-#define QUIC_CONN_TX_BUFS_NB 8
 
 /* Flags at connection level */
 #define QUIC_FL_CONN_ANTI_AMPLIFICATION_REACHED  (1U << 0)
@@ -631,15 +510,6 @@ struct quic_conn {
 	struct connection *conn;
 
 	struct {
-		/* The remaining frames to send. */
-		struct list frms_to_send;
-
-		/* The size of the previous array. */
-		size_t nb_buf;
-		/* Writer index. */
-		int wbuf;
-		/* Reader index. */
-		int rbuf;
 		/* Number of sent bytes. */
 		uint64_t bytes;
 		/* Number of bytes for prepared packets */

@@ -613,6 +613,7 @@ static ssize_t h3_headers_to_htx(struct qcs *qcs, const struct buffer *buf,
 			}
 
 			h3s->flags |= H3_SF_HAVE_CLEN;
+			sl->flags |= HTX_SL_F_CLEN;
 			/* This will fail if current frame is the last one and
 			 * content-length is not null.
 			 */
@@ -1094,7 +1095,7 @@ static ssize_t h3_decode_qcs(struct qcs *qcs, struct buffer *b, int fin)
 			/* Check that content-length is not exceeded on a new DATA frame. */
 			if (ftype == H3_FT_DATA) {
 				h3s->data_len += flen;
-				if (h3s->flags & H3_SF_HAVE_CLEN && h3_check_body_size(qcs, fin))
+				if (h3s->flags & H3_SF_HAVE_CLEN && h3_check_body_size(qcs, (fin && flen == b_data(b))))
 					break;
 			}
 
@@ -1129,11 +1130,11 @@ static ssize_t h3_decode_qcs(struct qcs *qcs, struct buffer *b, int fin)
 			break;
 		}
 
-		/* Check content-length equality with DATA frames length on the last frame. */
-		if (fin && h3s->flags & H3_SF_HAVE_CLEN && h3_check_body_size(qcs, fin))
-			break;
-
 		last_stream_frame = (fin && flen == b_data(b));
+
+		/* Check content-length equality with DATA frames length on the last frame. */
+		if (last_stream_frame && h3s->flags & H3_SF_HAVE_CLEN && h3_check_body_size(qcs, last_stream_frame))
+			break;
 
 		h3_inc_frame_type_cnt(h3c->prx_counters, ftype);
 		switch (ftype) {
