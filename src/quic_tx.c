@@ -24,6 +24,7 @@
 #define TRACE_SOURCE &trace_quic
 
 DECLARE_POOL(pool_head_quic_tx_packet, "quic_tx_packet", sizeof(struct quic_tx_packet));
+DECLARE_POOL(pool_head_quic_cc_buf, "quic_cc_buf", QUIC_MAX_CC_BUFSIZE);
 
 static struct quic_tx_packet *qc_build_pkt(unsigned char **pos, const unsigned char *buf_end,
                                            struct quic_enc_level *qel, struct quic_tls_ctx *ctx,
@@ -233,7 +234,7 @@ static void qc_prep_fast_retrans(struct quic_conn *qc,
 	 * packet size is the packet number. And the maximum increase is 4 bytes.
 	 */
 	if (!quic_peer_validated_addr(qc) && qc_is_listener(qc) &&
-	    pkt->len + 4 > 3 * qc->rx.bytes - qc->tx.prep_bytes) {
+	    pkt->len + 4 > quic_may_send_bytes(qc)) {
 		qc->flags |= QUIC_FL_CONN_ANTI_AMPLIFICATION_REACHED;
 		TRACE_PROTO("anti-amplification limit would be reached", QUIC_EV_CONN_SPPKTS, qc, pkt);
 		goto leave;
@@ -298,8 +299,9 @@ void qc_prep_hdshk_fast_retrans(struct quic_conn *qc,
 	 */
 	if (!quic_peer_validated_addr(qc) && qc_is_listener(qc)) {
 		size_t dglen = pkt->len + 4;
-		size_t may_send = 3 * qc->rx.bytes - qc->tx.prep_bytes;
+		size_t may_send;
 
+		may_send = quic_may_send_bytes(qc);
 		dglen += pkt->next ? pkt->next->len + 4 : 0;
 		if (dglen > may_send) {
 			qc->flags |= QUIC_FL_CONN_ANTI_AMPLIFICATION_REACHED;
@@ -365,6 +367,37 @@ void qc_txb_release(struct quic_conn *qc)
 		b_free(buf);
 		offer_buffers(NULL, 1);
 	}
+}
+
+/* Return the TX buffer dedicated to the "connection close" datagram to be built
+ * if an immediate close is required after having allocated it or directly
+ * allocate a TX buffer if an immediate close is not required.
+ */
+struct buffer *qc_get_txb(struct quic_conn *qc)
+{
+	struct buffer *buf;
+
+	if (qc->flags & QUIC_FL_CONN_IMMEDIATE_CLOSE) {
+		TRACE_PROTO("Immediate close required", QUIC_EV_CONN_PHPKTS, qc);
+		buf = &qc->tx.cc_buf;
+		if (b_is_null(buf)) {
+			qc->tx.cc_buf_area = pool_alloc(pool_head_quic_cc_buf);
+			if (!qc->tx.cc_buf_area)
+				goto err;
+		}
+
+		/* In every case, initialize ->tx.cc_buf */
+		qc->tx.cc_buf = b_make(qc->tx.cc_buf_area, QUIC_MAX_CC_BUFSIZE, 0, 0);
+	}
+	else {
+		buf = qc_txb_alloc(qc);
+		if (!buf)
+			goto err;
+	}
+
+	return buf;
+ err:
+	return NULL;
 }
 
 /* Commit a datagram payload written into <buf> of length <length>. <first_pkt>
@@ -437,27 +470,27 @@ static int qc_may_build_pkt(struct quic_conn *qc, struct list *frms,
 static int qc_prep_app_pkts(struct quic_conn *qc, struct buffer *buf,
                             struct list *frms)
 {
-	int ret = -1;
+	int ret = -1, cc;
 	struct quic_enc_level *qel;
 	unsigned char *end, *pos;
 	struct quic_tx_packet *pkt;
 	size_t total;
-	/* Each datagram is prepended with its length followed by the address
-	 * of the first packet in the datagram.
-	 */
-	const size_t dg_headlen = sizeof(uint16_t) + sizeof(pkt);
 
 	TRACE_ENTER(QUIC_EV_CONN_PHPKTS, qc);
 
 	qel = qc->ael;
 	total = 0;
 	pos = (unsigned char *)b_tail(buf);
-	while (b_contig_space(buf) >= (int)qc->path->mtu + dg_headlen) {
-		int err, probe, cc, must_ack;
+	cc =  qc->flags & QUIC_FL_CONN_IMMEDIATE_CLOSE;
+	/* Each datagram is prepended with its length followed by the address
+	 * of the first packet in the datagram (QUIC_DGRAM_HEADLEN).
+	 */
+	while ((!cc && b_contig_space(buf) >= (int)qc->path->mtu + QUIC_DGRAM_HEADLEN) ||
+	        (cc && b_contig_space(buf) >= QUIC_MIN_CC_PKTSIZE + QUIC_DGRAM_HEADLEN)) {
+		int err, probe, must_ack;
 
 		TRACE_PROTO("TX prep app pkts", QUIC_EV_CONN_PHPKTS, qc, qel, frms);
 		probe = 0;
-		cc =  qc->flags & QUIC_FL_CONN_IMMEDIATE_CLOSE;
 		/* We do not probe if an immediate close was asked */
 		if (!cc)
 			probe = qel->pktns->tx.pto_probe;
@@ -466,9 +499,12 @@ static int qc_prep_app_pkts(struct quic_conn *qc, struct buffer *buf,
 			break;
 
 		/* Leave room for the datagram header */
-		pos += dg_headlen;
-		if (!quic_peer_validated_addr(qc) && qc_is_listener(qc)) {
-			end = pos + QUIC_MIN((uint64_t)qc->path->mtu, 3 * qc->rx.bytes - qc->tx.prep_bytes);
+		pos += QUIC_DGRAM_HEADLEN;
+		if (cc) {
+			end = pos + QUIC_MIN_CC_PKTSIZE;
+		}
+		else if (!quic_peer_validated_addr(qc) && qc_is_listener(qc)) {
+			end = pos + QUIC_MIN((uint64_t)qc->path->mtu, quic_may_send_bytes(qc));
 		}
 		else {
 			end = pos + qc->path->mtu;
@@ -501,9 +537,16 @@ static int qc_prep_app_pkts(struct quic_conn *qc, struct buffer *buf,
 
 		/* Write datagram header. */
 		qc_txb_store(buf, pkt->len, pkt);
+		/* Build only one datagram when an immediate close is required. */
+		if (cc)
+			break;
 	}
 
  out:
+	if (total && cc) {
+		BUG_ON(buf != &qc->tx.cc_buf);
+		qc->tx.cc_dgram_len = total;
+	}
 	ret = total;
  leave:
 	TRACE_LEAVE(QUIC_EV_CONN_PHPKTS, qc);
@@ -625,7 +668,7 @@ int qc_send_ppkts(struct buffer *buf, struct ssl_sock_ctx *ctx)
 		}
 
 		b_del(buf, dglen + headlen);
-		qc->tx.bytes += tmpbuf.data;
+		qc->bytes.tx += tmpbuf.data;
 		time_sent = now_ms;
 
 		for (pkt = first_pkt; pkt; pkt = next_pkt) {
@@ -728,7 +771,7 @@ int quic_build_post_handshake_frames(struct quic_conn *qc)
 			goto err;
 		}
 
-		conn_id = new_quic_cid(&qc->cids, qc, NULL, NULL);
+		conn_id = new_quic_cid(qc->cids, qc, NULL, NULL);
 		if (!conn_id) {
 			qc_frm_free(qc, &frm);
 			TRACE_ERROR("CID allocation error", QUIC_EV_CONN_IO_CB, qc);
@@ -760,7 +803,7 @@ int quic_build_post_handshake_frames(struct quic_conn *qc)
 	/* The first CID sequence number value used to allocated CIDs by this function is 1,
 	 * 0 being the sequence number of the CID for this connection.
 	 */
-	node = eb64_lookup_ge(&qc->cids, 1);
+	node = eb64_lookup_ge(qc->cids, 1);
 	while (node) {
 		struct quic_connection_id *conn_id;
 
@@ -824,9 +867,9 @@ int qc_send_app_pkts(struct quic_conn *qc, struct list *frms)
 
 	TRACE_ENTER(QUIC_EV_CONN_TXPKT, qc);
 
-	buf = qc_txb_alloc(qc);
+	buf = qc_get_txb(qc);
 	if (!buf) {
-		TRACE_ERROR("buffer allocation failed", QUIC_EV_CONN_TXPKT, qc);
+		TRACE_ERROR("could not get a buffer", QUIC_EV_CONN_TXPKT, qc);
 		goto err;
 	}
 
@@ -946,6 +989,37 @@ static inline int qc_qel_is_head(struct quic_enc_level *qel, struct list *l,
 	return !retrans ? &qel->list == l : &qel->retrans == l;
 }
 
+/* Select <*tls_ctx>, <*frms> and <*ver> for the encryption level <qel> of <qc> QUIC
+ * connection, depending on its state, especially the negotiated version and if
+ * retransmissions are required. If this the case <qels> is the list of encryption
+ * levels to used, or NULL if no retransmissions are required.
+ * Never fails.
+ */
+static inline void qc_select_tls_frms_ver(struct quic_conn *qc,
+                                          struct quic_enc_level *qel,
+                                          struct quic_tls_ctx **tls_ctx,
+                                          struct list **frms,
+                                          const struct quic_version **ver,
+                                          struct list *qels)
+{
+	if (qc->negotiated_version) {
+		*ver = qc->negotiated_version;
+		if (qel == qc->iel)
+			*tls_ctx = qc->nictx;
+		else
+			*tls_ctx = &qel->tls_ctx;
+	}
+	else {
+		*ver = qc->original_version;
+		*tls_ctx = &qel->tls_ctx;
+	}
+
+	if (!qels)
+		*frms = &qel->pktns->tx.frms;
+	else
+		*frms = qel->retrans_frms;
+}
+
 /* Prepare as much as possible QUIC datagrams/packets for sending from <qels>
  * list of encryption levels. Several packets can be coalesced into a single
  * datagram. The result is written into <buf>. Note that if <qels> is NULL,
@@ -960,10 +1034,9 @@ static inline int qc_qel_is_head(struct quic_enc_level *qel, struct list *l,
  */
 int qc_prep_hpkts(struct quic_conn *qc, struct buffer *buf, struct list *qels)
 {
-	int ret, retrans, padding;
+	int ret, cc, retrans, padding;
 	struct quic_tx_packet *first_pkt, *prv_pkt;
 	unsigned char *end, *pos;
-	const size_t dg_headlen = sizeof(uint16_t) + sizeof(first_pkt);
 	uint16_t dglen;
 	size_t total;
 	struct list *qel_list;
@@ -976,6 +1049,7 @@ int qc_prep_hpkts(struct quic_conn *qc, struct buffer *buf, struct list *qels)
 	BUG_ON_HOT(buf->head || buf->data);
 
 	ret = -1;
+	cc =  qc->flags & QUIC_FL_CONN_IMMEDIATE_CLOSE;
 	retrans = !!qels;
 	padding = 0;
 	first_pkt = prv_pkt = NULL;
@@ -997,43 +1071,35 @@ int qc_prep_hpkts(struct quic_conn *qc, struct buffer *buf, struct list *qels)
 			continue;
 		}
 
-		if (qc->negotiated_version) {
-			ver = qc->negotiated_version;
-			if (qel == qc->iel)
-				tls_ctx = qc->nictx;
-			else
-				tls_ctx = &qel->tls_ctx;
-		}
-		else {
-			ver = qc->original_version;
-			tls_ctx = &qel->tls_ctx;
-		}
-
-		if (!qels)
-			frms = &qel->pktns->tx.frms;
-		else
-			frms = qel->retrans_frms;
+		qc_select_tls_frms_ver(qc, qel, &tls_ctx, &frms, &ver, qels);
 
 		next_qel = qc_next_qel(qel, retrans);
 		next_frms = qc_qel_is_head(next_qel, qel_list, retrans) ? NULL :
 			!qels ? &next_qel->pktns->tx.frms : next_qel->retrans_frms;
 
-		/* Build as much as datagrams at <qel> encryption level. */
-		while (b_contig_space(buf) >= (int)qc->path->mtu + dg_headlen || prv_pkt) {
-			int err, probe, cc, must_ack;
+		/* Build as much as datagrams at <qel> encryption level.
+		 * Each datagram is prepended with its length followed by the address
+		 * of the first packet in the datagram (QUIC_DGRAM_HEADLEN).
+		 */
+		while ((!cc && b_contig_space(buf) >= (int)qc->path->mtu + QUIC_DGRAM_HEADLEN) ||
+		        (cc && b_contig_space(buf) >= QUIC_MIN_CC_PKTSIZE + QUIC_DGRAM_HEADLEN) || prv_pkt) {
+			int err, probe, must_ack;
 			enum quic_pkt_type pkt_type;
 			struct quic_tx_packet *cur_pkt;
 
 			TRACE_PROTO("TX prep pkts", QUIC_EV_CONN_PHPKTS, qc, qel);
 			probe = 0;
-			cc =  qc->flags & QUIC_FL_CONN_IMMEDIATE_CLOSE;
 			/* We do not probe if an immediate close was asked */
 			if (!cc)
 				probe = qel->pktns->tx.pto_probe;
 
 			if (!qc_may_build_pkt(qc, frms, qel, cc, probe, &must_ack)) {
-				if (prv_pkt && qc_qel_is_head(next_qel, qel_list, retrans))
+				if (prv_pkt && qc_qel_is_head(next_qel, qel_list, retrans)) {
 					qc_txb_store(buf, dglen, first_pkt);
+					/* Build only one datagram when an immediate close is required. */
+					if (cc)
+						goto out;
+				}
 
 				TRACE_DEVEL("next encryption level", QUIC_EV_CONN_PHPKTS, qc);
 				break;
@@ -1041,9 +1107,12 @@ int qc_prep_hpkts(struct quic_conn *qc, struct buffer *buf, struct list *qels)
 
 			if (!prv_pkt) {
 				/* Leave room for the datagram header */
-				pos += dg_headlen;
-				if (!quic_peer_validated_addr(qc) && qc_is_listener(qc)) {
-					end = pos + QUIC_MIN((uint64_t)qc->path->mtu, 3 * qc->rx.bytes - qc->tx.prep_bytes);
+				pos += QUIC_DGRAM_HEADLEN;
+				if (cc) {
+					end = pos + QUIC_MIN_CC_PKTSIZE;
+				}
+				else if (!quic_peer_validated_addr(qc) && qc_is_listener(qc)) {
+					end = pos + QUIC_MIN((uint64_t)qc->path->mtu, quic_may_send_bytes(qc));
 				}
 				else {
 					end = pos + qc->path->mtu;
@@ -1128,6 +1197,9 @@ int qc_prep_hpkts(struct quic_conn *qc, struct buffer *buf, struct list *qels)
 			}
 			else {
 				qc_txb_store(buf, dglen, first_pkt);
+				/* Build only one datagram when an immediate close is required. */
+				if (cc)
+					goto out;
 				first_pkt = NULL;
 				dglen = 0;
 				padding = 0;
@@ -1140,6 +1212,12 @@ int qc_prep_hpkts(struct quic_conn *qc, struct buffer *buf, struct list *qels)
 	}
 
  out:
+	if (cc && total) {
+		BUG_ON(buf != &qc->tx.cc_buf);
+		BUG_ON(dglen != total);
+		qc->tx.cc_dgram_len = dglen;
+	}
+
 	ret = total;
  leave:
 	TRACE_LEAVE(QUIC_EV_CONN_PHPKTS, qc);
@@ -1156,7 +1234,7 @@ int qc_send_hdshk_pkts(struct quic_conn *qc, int old_data,
                        struct quic_enc_level *qel1, struct quic_enc_level *qel2)
 {
 	int ret, status = 0;
-	struct buffer *buf = qc_txb_alloc(qc);
+	struct buffer *buf = qc_get_txb(qc);
 	struct list qels = LIST_HEAD_INIT(qels);
 
 	TRACE_ENTER(QUIC_EV_CONN_TXPKT, qc);
@@ -1357,7 +1435,7 @@ int qc_need_sending(struct quic_conn *qc, struct quic_enc_level *qel)
 int qc_may_probe_ipktns(struct quic_conn *qc)
 {
 	return quic_peer_validated_addr(qc) ||
-	       (int)(3 * qc->rx.bytes - qc->tx.prep_bytes) >= QUIC_INITIAL_PACKET_MINLEN;
+		quic_may_send_bytes(qc) >= QUIC_INITIAL_PACKET_MINLEN;
 }
 
 /*
@@ -2476,8 +2554,8 @@ static struct quic_tx_packet *qc_build_pkt(unsigned char **pos,
 
 	/* Consume a packet number */
 	qel->pktns->tx.next_pn++;
-	qc->tx.prep_bytes += pkt->len;
-	if (qc->tx.prep_bytes >= 3 * qc->rx.bytes && !quic_peer_validated_addr(qc)) {
+	qc->bytes.prep += pkt->len;
+	if (qc->bytes.prep >= 3 * qc->bytes.rx && !quic_peer_validated_addr(qc)) {
 		qc->flags |= QUIC_FL_CONN_ANTI_AMPLIFICATION_REACHED;
 		TRACE_PROTO("anti-amplification limit reached", QUIC_EV_CONN_TXPKT, qc);
 	}

@@ -4936,11 +4936,12 @@ next_frame:
 	if (h2c->flags & H2_CF_IS_BACK)
 		outlen = h2_make_htx_response(list, htx, &msgf, body_len, upgrade_protocol);
 	else
-		outlen = h2_make_htx_request(list, htx, &msgf, body_len);
+		outlen = h2_make_htx_request(list, htx, &msgf, body_len,
+					     !!(((const struct session *)h2c->conn->owner)->fe->options2 & PR_O2_REQBUG_OK));
 
 	if (outlen < 0 || htx_free_space(htx) < global.tune.maxrewrite) {
 		/* too large headers? this is a stream error only */
-		TRACE_STATE("message headers too large", H2_EV_RX_FRAME|H2_EV_RX_HDR|H2_EV_H2S_ERR|H2_EV_PROTO_ERR, h2c->conn);
+		TRACE_STATE("message headers too large or invalid", H2_EV_RX_FRAME|H2_EV_RX_HDR|H2_EV_H2S_ERR|H2_EV_PROTO_ERR, h2c->conn);
 		htx->flags |= HTX_FL_PARSING_ERROR;
 		goto fail;
 	}
@@ -5195,7 +5196,7 @@ static size_t h2s_snd_fhdrs(struct h2s *h2s, struct htx *htx)
 			BUG_ON(sl); /* Only one start-line expected */
 			sl = htx_get_blk_ptr(htx, blk);
 			h2s->status = sl->info.res.status;
-			if (h2s->status == 204 || h2s->status == 304)
+			if ((sl->flags & HTX_SL_F_BODYLESS_RESP) || h2s->status == 204 || h2s->status == 304)
 				h2s->flags |= H2_SF_BODYLESS_RESP;
 			if (h2s->status < 100 || h2s->status > 999) {
 				TRACE_ERROR("will not encode an invalid status code", H2_EV_TX_FRAME|H2_EV_TX_HDR|H2_EV_H2S_ERR, h2c->conn, h2s);
@@ -5507,7 +5508,7 @@ static size_t h2s_snd_bhdrs(struct h2s *h2s, struct htx *htx)
 			sl = htx_get_blk_ptr(htx, blk);
 			meth = htx_sl_req_meth(sl);
 			uri  = htx_sl_req_uri(sl);
-			if (sl->info.req.meth == HTTP_METH_HEAD)
+			if ((sl->flags & HTX_SL_F_BODYLESS_RESP) || sl->info.req.meth == HTTP_METH_HEAD)
 				h2s->flags |= H2_SF_BODYLESS_RESP;
 			if (unlikely(uri.len == 0)) {
 				TRACE_ERROR("no URI in HTX request", H2_EV_TX_FRAME|H2_EV_TX_HDR|H2_EV_H2S_ERR, h2c->conn, h2s);

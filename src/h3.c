@@ -418,6 +418,8 @@ static ssize_t h3_headers_to_htx(struct qcs *qcs, const struct buffer *buf,
 	struct ist scheme = IST_NULL, authority = IST_NULL;
 	int hdr_idx, ret;
 	int cookie = -1, last_cookie = -1, i;
+	const char *ctl;
+	int relaxed = !!(h3c->qcc->proxy->options2 & PR_O2_REQBUG_OK);
 
 	/* RFC 9114 4.1.2. Malformed Requests and Responses
 	 *
@@ -481,6 +483,25 @@ static ssize_t h3_headers_to_htx(struct qcs *qcs, const struct buffer *buf,
 		if (!istmatch(list[hdr_idx].n, ist(":")))
 			break;
 
+		/* RFC 9114 10.3 Intermediary-Encapsulation Attacks
+		 *
+		 * While most values that can be encoded will not alter field
+		 * parsing, carriage return (ASCII 0x0d), line feed (ASCII 0x0a),
+		 * and the null character (ASCII 0x00) might be exploited by an
+		 * attacker if they are translated verbatim. Any request or
+		 * response that contains a character not permitted in a field
+		 * value MUST be treated as malformed
+		 */
+
+		/* look for forbidden control characters in the pseudo-header value */
+		ctl = ist_find_ctl(list[hdr_idx].v);
+		if (unlikely(ctl) && http_header_has_forbidden_char(list[hdr_idx].v, ctl)) {
+			TRACE_ERROR("control character present in pseudo-header value", H3_EV_RX_FRAME|H3_EV_RX_HDR, qcs->qcc->conn, qcs);
+			h3s->err = H3_MESSAGE_ERROR;
+			len = -1;
+			goto out;
+		}
+
 		/* pseudo-header. Malformed name with uppercase character or
 		 * invalid token will be rejected in the else clause.
 		 */
@@ -500,6 +521,20 @@ static ssize_t h3_headers_to_htx(struct qcs *qcs, const struct buffer *buf,
 				len = -1;
 				goto out;
 			}
+
+			if (!relaxed) {
+				/* we need to reject any control chars or '#' from the path,
+				 * unless option accept-invalid-http-request is set.
+				 */
+				ctl = ist_find_range(list[hdr_idx].v, 0, '#');
+				if (unlikely(ctl) && http_path_has_forbidden_char(list[hdr_idx].v, ctl)) {
+					TRACE_ERROR("forbidden character in ':path' pseudo-header", H3_EV_RX_FRAME|H3_EV_RX_HDR, qcs->qcc->conn, qcs);
+					h3s->err = H3_MESSAGE_ERROR;
+					len = -1;
+					goto out;
+				}
+			}
+
 			path = list[hdr_idx].v;
 		}
 		else if (isteq(list[hdr_idx].n, ist(":scheme"))) {
@@ -589,6 +624,26 @@ static ssize_t h3_headers_to_htx(struct qcs *qcs, const struct buffer *buf,
 				len = -1;
 				goto out;
 			}
+		}
+
+
+		/* RFC 9114 10.3 Intermediary-Encapsulation Attacks
+		 *
+		 * While most values that can be encoded will not alter field
+		 * parsing, carriage return (ASCII 0x0d), line feed (ASCII 0x0a),
+		 * and the null character (ASCII 0x00) might be exploited by an
+		 * attacker if they are translated verbatim. Any request or
+		 * response that contains a character not permitted in a field
+		 * value MUST be treated as malformed
+		 */
+
+		/* look for forbidden control characters in the header value */
+		ctl = ist_find_ctl(list[hdr_idx].v);
+		if (unlikely(ctl) && http_header_has_forbidden_char(list[hdr_idx].v, ctl)) {
+			TRACE_ERROR("control character present in header value", H3_EV_RX_FRAME|H3_EV_RX_HDR, qcs->qcc->conn, qcs);
+			h3s->err = H3_MESSAGE_ERROR;
+			len = -1;
+			goto out;
 		}
 
 		if (isteq(list[hdr_idx].n, ist("cookie"))) {
@@ -738,6 +793,7 @@ static ssize_t h3_trailers_to_htx(struct qcs *qcs, const struct buffer *buf,
 	struct htx_sl *sl;
 	struct http_hdr list[global.tune.max_http_hdr];
 	int hdr_idx, ret;
+	const char *ctl;
 	int i;
 
 	TRACE_ENTER(H3_EV_RX_FRAME|H3_EV_RX_HDR, qcs->qcc->conn, qcs);
@@ -813,6 +869,25 @@ static ssize_t h3_trailers_to_htx(struct qcs *qcs, const struct buffer *buf,
 		    isteq(list[hdr_idx].n, ist("te")) ||
 		    isteq(list[hdr_idx].n, ist("transfer-encoding"))) {
 			TRACE_ERROR("forbidden HTTP/3 headers", H3_EV_RX_FRAME|H3_EV_RX_HDR, qcs->qcc->conn, qcs);
+			h3s->err = H3_MESSAGE_ERROR;
+			len = -1;
+			goto out;
+		}
+
+		/* RFC 9114 10.3 Intermediary-Encapsulation Attacks
+		 *
+		 * While most values that can be encoded will not alter field
+		 * parsing, carriage return (ASCII 0x0d), line feed (ASCII 0x0a),
+		 * and the null character (ASCII 0x00) might be exploited by an
+		 * attacker if they are translated verbatim. Any request or
+		 * response that contains a character not permitted in a field
+		 * value MUST be treated as malformed
+		 */
+
+		/* look for forbidden control characters in the trailer value */
+		ctl = ist_find_ctl(list[hdr_idx].v);
+		if (unlikely(ctl) && http_header_has_forbidden_char(list[hdr_idx].v, ctl)) {
+			TRACE_ERROR("control character present in trailer value", H3_EV_RX_FRAME|H3_EV_RX_HDR, qcs->qcc->conn, qcs);
 			h3s->err = H3_MESSAGE_ERROR;
 			len = -1;
 			goto out;
@@ -1671,6 +1746,31 @@ static size_t h3_snd_buf(struct qcs *qcs, struct htx *htx, size_t count)
 			count -= bsize;
 			break;
 		}
+	}
+
+	/* RFC 9114 4.1. HTTP Message Framing
+	 *
+	 * A server can send a complete response prior to the client sending an
+	 * entire request if the response does not depend on any portion of the
+	 * request that has not been sent and received. When the server does not
+	 * need to receive the remainder of the request, it MAY abort reading
+	 * the request stream, send a complete response, and cleanly close the
+	 * sending part of the stream. The error code H3_NO_ERROR SHOULD be used
+	 * when requesting that the client stop sending on the request stream.
+	 * Clients MUST NOT discard complete responses as a result of having
+	 * their request terminated abruptly, though clients can always discard
+	 * responses at their discretion for other reasons. If the server sends
+	 * a partial or complete response but does not abort reading the
+	 * request, clients SHOULD continue sending the content of the request
+	 * and close the stream normally.
+	 */
+	if (unlikely((htx->flags & HTX_FL_EOM) && htx_is_empty(htx)) &&
+	             !qcs_is_close_remote(qcs)) {
+	        /* Generate a STOP_SENDING if full response transferred before
+	         * receiving the full request.
+	         */
+	        qcs->err = H3_NO_ERROR;
+	        qcc_abort_stream_read(qcs);
 	}
 
  out:

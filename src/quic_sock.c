@@ -507,6 +507,7 @@ void quic_conn_sock_fd_iocb(int fd)
 	}
 
 	if (fd_recv_ready(fd)) {
+		TRACE_DEVEL("recv ready", QUIC_EV_CONN_RCV, qc);
 		tasklet_wakeup_after(NULL, qc->wait_event.tasklet);
 		fd_stop_recv(fd);
 	}
@@ -703,7 +704,9 @@ int qc_rcv_buf(struct quic_conn *qc)
 		                get_net_port(&qc->local_addr));
 		if (ret <= 0) {
 			/* Subscribe FD for future reception. */
-			fd_want_recv(qc->fd);
+			if (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOTCONN)
+				fd_want_recv(qc->fd);
+			/* TODO handle other error codes as fatal on the connection. */
 			break;
 		}
 
@@ -734,14 +737,33 @@ int qc_rcv_buf(struct quic_conn *qc)
 			struct quic_receiver_buf *rxbuf;
 			struct quic_dgram *tmp_dgram;
 			unsigned char *rxbuf_tail;
+			size_t cspace;
 
 			TRACE_STATE("datagram for other connection on quic-conn socket, requeue it", QUIC_EV_CONN_RCV, qc);
 
 			rxbuf = MT_LIST_POP(&l->rx.rxbuf_list, typeof(rxbuf), rxbuf_el);
+			ALREADY_CHECKED(rxbuf);
+			cspace = b_contig_space(&rxbuf->buf);
 
 			tmp_dgram = quic_rxbuf_purge_dgrams(rxbuf);
 			pool_free(pool_head_quic_dgram, tmp_dgram);
 
+			/* Insert a fake datagram if space wraps to consume it. */
+			if (cspace < new_dgram->len && b_space_wraps(&rxbuf->buf)) {
+				struct quic_dgram *fake_dgram = pool_alloc(pool_head_quic_dgram);
+				if (!fake_dgram) {
+					/* TODO count lost datagrams */
+					MT_LIST_APPEND(&l->rx.rxbuf_list, &rxbuf->rxbuf_el);
+					continue;
+				}
+
+				fake_dgram->buf = NULL;
+				fake_dgram->len = cspace;
+				LIST_APPEND(&rxbuf->dgram_list, &fake_dgram->recv_list);
+				b_add(&rxbuf->buf, cspace);
+			}
+
+			/* Recheck contig space after fake datagram insert. */
 			if (b_contig_space(&rxbuf->buf) < new_dgram->len) {
 				/* TODO count lost datagrams */
 				MT_LIST_APPEND(&l->rx.rxbuf_list, &rxbuf->rxbuf_el);

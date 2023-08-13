@@ -34,13 +34,20 @@ int h1_parse_cont_len_header(struct h1m *h1m, struct ist *value)
 	int not_first = !!(h1m->flags & H1_MF_CLEN);
 	struct ist word;
 
-	word.ptr = value->ptr - 1; // -1 for next loop's pre-increment
+	word.ptr = value->ptr;
 	e = value->ptr + value->len;
 
-	while (++word.ptr < e) {
+	while (1) {
+		if (word.ptr >= e) {
+			/* empty header or empty value */
+			goto fail;
+		}
+
 		/* skip leading delimiter and blanks */
-		if (unlikely(HTTP_IS_LWS(*word.ptr)))
+		if (unlikely(HTTP_IS_LWS(*word.ptr))) {
+			word.ptr++;
 			continue;
+		}
 
 		/* digits only now */
 		for (cl = 0, n = word.ptr; n < e; n++) {
@@ -51,6 +58,14 @@ int h1_parse_cont_len_header(struct h1m *h1m, struct ist *value)
 					goto fail;
 				break;
 			}
+
+			if (unlikely(!cl && n > word.ptr)) {
+				/* There was a leading zero before this digit,
+				 * let's trim it.
+				 */
+				word.ptr = n;
+			}
+
 			if (unlikely(cl > ULLONG_MAX / 10ULL))
 				goto fail; /* multiply overflow */
 			cl = cl * 10ULL;
@@ -79,6 +94,13 @@ int h1_parse_cont_len_header(struct h1m *h1m, struct ist *value)
 		h1m->flags |= H1_MF_CLEN;
 		h1m->curr_len = h1m->body_len = cl;
 		*value = word;
+
+		/* Now either n==e and we're done, or n points to the comma,
+		 * and we skip it and continue.
+		 */
+		if (n++ == e)
+			break;
+
 		word.ptr = n;
 	}
 	/* here we've reached the end with a single value or a series of
@@ -551,13 +573,13 @@ int h1_headers_to_hdr_list(char *start, const char *stop,
 	case H1_MSG_RQURI:
 	http_msg_rquri:
 #ifdef HA_UNALIGNED_LE
-		/* speedup: skip bytes not between 0x21 and 0x7e inclusive */
+		/* speedup: skip bytes not between 0x24 and 0x7e inclusive */
 		while (ptr <= end - sizeof(int)) {
-			int x = *(int *)ptr - 0x21212121;
+			int x = *(int *)ptr - 0x24242424;
 			if (x & 0x80808080)
 				break;
 
-			x -= 0x5e5e5e5e;
+			x -= 0x5b5b5b5b;
 			if (!(x & 0x80808080))
 				break;
 
@@ -569,8 +591,15 @@ int h1_headers_to_hdr_list(char *start, const char *stop,
 			goto http_msg_ood;
 		}
 	http_msg_rquri2:
-		if (likely((unsigned char)(*ptr - 33) <= 93)) /* 33 to 126 included */
+		if (likely((unsigned char)(*ptr - 33) <= 93)) { /* 33 to 126 included */
+			if (*ptr == '#') {
+				if (h1m->err_pos < -1) /* PR_O2_REQBUG_OK not set */
+					goto invalid_char;
+				if (h1m->err_pos == -1) /* PR_O2_REQBUG_OK set: just log */
+					h1m->err_pos = ptr - start + skip;
+			}
 			EAT_AND_JUMP_OR_RETURN(ptr, end, http_msg_rquri2, http_msg_ood, state, H1_MSG_RQURI);
+		}
 
 		if (likely(HTTP_IS_SPHT(*ptr))) {
 			sl.rq.u.len = ptr - sl.rq.u.ptr;

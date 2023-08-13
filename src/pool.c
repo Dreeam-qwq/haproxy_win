@@ -110,6 +110,24 @@ static int disable_trim __read_mostly = 0;
 static int(*my_mallctl)(const char *, void *, size_t *, void *, size_t) = NULL;
 static int(*_malloc_trim)(size_t) = NULL;
 
+/* returns the pool hash bucket an object should use based on its pointer.
+ * Objects will needed consistent bucket assignment so that they may be
+ * allocated on one thread and released on another one. Thus only the
+ * pointer is usable.
+ */
+static forceinline unsigned int pool_pbucket(const void *ptr)
+{
+	return ptr_hash(ptr, CONFIG_HAP_POOL_BUCKETS_BITS);
+}
+
+/* returns the pool hash bucket to use for the current thread. This should only
+ * be used when no pointer is available (e.g. count alloc failures).
+ */
+static forceinline unsigned int pool_tbucket(void)
+{
+	return tid % CONFIG_HAP_POOL_BUCKETS;
+}
+
 /* ask the allocator to trim memory pools.
  * This must run under thread isolation so that competing threads trying to
  * allocate or release memory do not prevent the allocator from completing
@@ -363,39 +381,37 @@ struct pool_head *create_pool(char *name, unsigned int size, unsigned int flags)
 }
 
 /* Tries to allocate an object for the pool <pool> using the system's allocator
- * and directly returns it. The pool's allocated counter is checked and updated,
- * but no other checks are performed.
+ * and directly returns it. The pool's allocated counter is checked but NOT
+ * updated, this is left to the caller, and but no other checks are performed.
  */
-void *pool_get_from_os(struct pool_head *pool)
+void *pool_get_from_os_noinc(struct pool_head *pool)
 {
-	if (!pool->limit || pool->allocated < pool->limit) {
+	if (!pool->limit || pool_allocated(pool) < pool->limit) {
 		void *ptr;
 
 		if (pool_debugging & POOL_DBG_UAF)
 			ptr = pool_alloc_area_uaf(pool->alloc_sz);
 		else
 			ptr = pool_alloc_area(pool->alloc_sz);
-		if (ptr) {
-			_HA_ATOMIC_INC(&pool->allocated);
+		if (ptr)
 			return ptr;
-		}
-		_HA_ATOMIC_INC(&pool->failed);
+		_HA_ATOMIC_INC(&pool->buckets[pool_tbucket()].failed);
 	}
 	activity[tid].pool_fail++;
 	return NULL;
 
 }
 
-/* Releases a pool item back to the operating system and atomically updates
- * the allocation counter.
+/* Releases a pool item back to the operating system but DOES NOT update
+ * the allocation counter, it's left to the caller to do it. It may be
+ * done before or after, it doesn't matter, the function does not use it.
  */
-void pool_put_to_os(struct pool_head *pool, void *ptr)
+void pool_put_to_os_nodec(struct pool_head *pool, void *ptr)
 {
 	if (pool_debugging & POOL_DBG_UAF)
 		pool_free_area_uaf(ptr, pool->alloc_sz);
 	else
 		pool_free_area(ptr, pool->alloc_sz);
-	_HA_ATOMIC_DEC(&pool->allocated);
 }
 
 /* Tries to allocate an object for the pool <pool> using the system's allocator
@@ -405,13 +421,16 @@ void pool_put_to_os(struct pool_head *pool, void *ptr)
 void *pool_alloc_nocache(struct pool_head *pool)
 {
 	void *ptr = NULL;
+	uint bucket;
 
-	ptr = pool_get_from_os(pool);
+	ptr = pool_get_from_os_noinc(pool);
 	if (!ptr)
 		return NULL;
 
-	swrate_add_scaled_opportunistic(&pool->needed_avg, POOL_AVG_SAMPLES, pool->used, POOL_AVG_SAMPLES/4);
-	_HA_ATOMIC_INC(&pool->used);
+	bucket = pool_pbucket(ptr);
+	swrate_add_scaled_opportunistic(&pool->buckets[bucket].needed_avg, POOL_AVG_SAMPLES, pool->buckets[bucket].used, POOL_AVG_SAMPLES/4);
+	_HA_ATOMIC_INC(&pool->buckets[bucket].allocated);
+	_HA_ATOMIC_INC(&pool->buckets[bucket].used);
 
 	/* keep track of where the element was allocated from */
 	POOL_DEBUG_SET_MARK(pool, ptr);
@@ -425,9 +444,13 @@ void *pool_alloc_nocache(struct pool_head *pool)
  */
 void pool_free_nocache(struct pool_head *pool, void *ptr)
 {
-	_HA_ATOMIC_DEC(&pool->used);
-	swrate_add_opportunistic(&pool->needed_avg, POOL_AVG_SAMPLES, pool->used);
-	pool_put_to_os(pool, ptr);
+	uint bucket = pool_pbucket(ptr);
+
+	_HA_ATOMIC_DEC(&pool->buckets[bucket].used);
+	_HA_ATOMIC_DEC(&pool->buckets[bucket].allocated);
+	swrate_add_opportunistic(&pool->buckets[bucket].needed_avg, POOL_AVG_SAMPLES, pool->buckets[bucket].used);
+
+	pool_put_to_os_nodec(pool, ptr);
 }
 
 
@@ -489,6 +512,7 @@ static void pool_evict_last_items(struct pool_head *pool, struct pool_cache_head
 	uint released = 0;
 	uint cluster = 0;
 	uint to_free_max;
+	uint bucket;
 
 	BUG_ON(pool_debugging & POOL_DBG_NO_CACHE);
 
@@ -503,6 +527,10 @@ static void pool_evict_last_items(struct pool_head *pool, struct pool_cache_head
 		LIST_DELETE(&item->by_pool);
 		LIST_DELETE(&item->by_lru);
 
+		bucket = pool_pbucket(item);
+		_HA_ATOMIC_DEC(&pool->buckets[bucket].used);
+		swrate_add_opportunistic(&pool->buckets[bucket].needed_avg, POOL_AVG_SAMPLES, pool->buckets[bucket].used);
+
 		if (to_free_max > released || cluster) {
 			/* will never match when global pools are disabled */
 			pi = (struct pool_item *)item;
@@ -512,19 +540,22 @@ static void pool_evict_last_items(struct pool_head *pool, struct pool_cache_head
 			cluster++;
 			if (cluster >= CONFIG_HAP_POOL_CLUSTER_SIZE) {
 				/* enough to make a cluster */
-				pool_put_to_shared_cache(pool, head, cluster);
+				pool_put_to_shared_cache(pool, head);
 				cluster = 0;
 				head = NULL;
 			}
-		} else
-			pool_free_nocache(pool, item);
+		} else {
+			/* does pool_free_nocache() with a known bucket */
+			_HA_ATOMIC_DEC(&pool->buckets[bucket].allocated);
+			pool_put_to_os_nodec(pool, item);
+		}
 
 		released++;
 	}
 
 	/* incomplete cluster left */
 	if (cluster)
-		pool_put_to_shared_cache(pool, head, cluster);
+		pool_put_to_shared_cache(pool, head);
 
 	ph->count -= released;
 	pool_cache_count -= released;
@@ -621,33 +652,41 @@ void pool_refill_local_from_shared(struct pool_head *pool, struct pool_cache_hea
 {
 	struct pool_cache_item *item;
 	struct pool_item *ret, *down;
+	uint bucket;
 	uint count;
 
 	BUG_ON(pool_debugging & POOL_DBG_NO_CACHE);
 
 	/* we'll need to reference the first element to figure the next one. We
 	 * must temporarily lock it so that nobody allocates then releases it,
-	 * or the dereference could fail.
+	 * or the dereference could fail. In order to limit the locking,
+	 * threads start from a bucket that depends on their ID.
 	 */
-	ret = _HA_ATOMIC_LOAD(&pool->free_list);
+
+	bucket = pool_tbucket();
+	ret = _HA_ATOMIC_LOAD(&pool->buckets[bucket].free_list);
 	do {
+		/* look for an apparently non-busy entry */
 		while (unlikely(ret == POOL_BUSY)) {
-			__ha_cpu_relax();
-			ret = _HA_ATOMIC_LOAD(&pool->free_list);
+			bucket = (bucket + 1) % CONFIG_HAP_POOL_BUCKETS;
+			ret = _HA_ATOMIC_LOAD(&pool->buckets[bucket].free_list);
 		}
 		if (ret == NULL)
 			return;
-	} while (unlikely((ret = _HA_ATOMIC_XCHG(&pool->free_list, POOL_BUSY)) == POOL_BUSY));
+	} while (unlikely((ret = _HA_ATOMIC_XCHG(&pool->buckets[bucket].free_list, POOL_BUSY)) == POOL_BUSY));
 
 	if (unlikely(ret == NULL)) {
-		HA_ATOMIC_STORE(&pool->free_list, NULL);
+		HA_ATOMIC_STORE(&pool->buckets[bucket].free_list, NULL);
 		return;
 	}
 
 	/* this releases the lock */
-	HA_ATOMIC_STORE(&pool->free_list, ret->next);
+	HA_ATOMIC_STORE(&pool->buckets[bucket].free_list, ret->next);
 
-	/* now store the retrieved object(s) into the local cache */
+	/* now store the retrieved object(s) into the local cache. Note that
+	 * they don't all have the same hash and that it doesn't necessarily
+	 * match the one from the pool.
+	 */
 	count = 0;
 	for (; ret; ret = down) {
 		down = ret->down;
@@ -655,11 +694,12 @@ void pool_refill_local_from_shared(struct pool_head *pool, struct pool_cache_hea
 		POOL_DEBUG_TRACE_CALLER(pool, item, NULL);
 		LIST_INSERT(&pch->list, &item->by_pool);
 		LIST_INSERT(&th_ctx->pool_lru_head, &item->by_lru);
+		_HA_ATOMIC_INC(&pool->buckets[pool_pbucket(item)].used);
 		count++;
 		if (unlikely(pool_debugging & POOL_DBG_INTEGRITY))
 			pool_fill_pattern(pch, item, pool->size);
+
 	}
-	HA_ATOMIC_ADD(&pool->used, count);
 	pch->count += count;
 	pool_cache_count += count;
 	pool_cache_bytes += count * pool->size;
@@ -670,22 +710,26 @@ void pool_refill_local_from_shared(struct pool_head *pool, struct pool_cache_hea
  * it's wise to add this series of objects there. Both the pool and the item's
  * head must be valid.
  */
-void pool_put_to_shared_cache(struct pool_head *pool, struct pool_item *item, uint count)
+void pool_put_to_shared_cache(struct pool_head *pool, struct pool_item *item)
 {
 	struct pool_item *free_list;
+	uint bucket = pool_pbucket(item);
 
-	_HA_ATOMIC_SUB(&pool->used, count);
-	free_list = _HA_ATOMIC_LOAD(&pool->free_list);
+	/* we prefer to put the item into the entry that corresponds to its own
+	 * hash so that on return it remains in the right place, but that's not
+	 * mandatory.
+	 */
+	free_list = _HA_ATOMIC_LOAD(&pool->buckets[bucket].free_list);
 	do {
+		/* look for an apparently non-busy entry */
 		while (unlikely(free_list == POOL_BUSY)) {
-			__ha_cpu_relax();
-			free_list = _HA_ATOMIC_LOAD(&pool->free_list);
+			bucket = (bucket + 1) % CONFIG_HAP_POOL_BUCKETS;
+			free_list = _HA_ATOMIC_LOAD(&pool->buckets[bucket].free_list);
 		}
 		_HA_ATOMIC_STORE(&item->next, free_list);
 		__ha_barrier_atomic_store();
-	} while (!_HA_ATOMIC_CAS(&pool->free_list, &free_list, item));
+	} while (!_HA_ATOMIC_CAS(&pool->buckets[bucket].free_list, &free_list, item));
 	__ha_barrier_atomic_store();
-	swrate_add_opportunistic(&pool->needed_avg, POOL_AVG_SAMPLES, pool->used);
 }
 
 /*
@@ -694,6 +738,7 @@ void pool_put_to_shared_cache(struct pool_head *pool, struct pool_item *item, ui
 void pool_flush(struct pool_head *pool)
 {
 	struct pool_item *next, *temp, *down;
+	uint bucket;
 
 	if (!pool || (pool_debugging & (POOL_DBG_NO_CACHE|POOL_DBG_NO_GLOBAL)))
 		return;
@@ -701,24 +746,30 @@ void pool_flush(struct pool_head *pool)
 	/* The loop below atomically detaches the head of the free list and
 	 * replaces it with a NULL. Then the list can be released.
 	 */
-	next = pool->free_list;
-	do {
-		while (unlikely(next == POOL_BUSY)) {
-			__ha_cpu_relax();
-			next = _HA_ATOMIC_LOAD(&pool->free_list);
-		}
-		if (next == NULL)
-			return;
-	} while (unlikely((next = _HA_ATOMIC_XCHG(&pool->free_list, POOL_BUSY)) == POOL_BUSY));
-	_HA_ATOMIC_STORE(&pool->free_list, NULL);
-	__ha_barrier_atomic_store();
+	for (bucket = 0; bucket < CONFIG_HAP_POOL_BUCKETS; bucket++) {
+		next = pool->buckets[bucket].free_list;
+		do {
+			while (unlikely(next == POOL_BUSY)) {
+				__ha_cpu_relax();
+				next = _HA_ATOMIC_LOAD(&pool->buckets[bucket].free_list);
+			}
+			if (next == NULL)
+				break;
+		} while (unlikely((next = _HA_ATOMIC_XCHG(&pool->buckets[bucket].free_list, POOL_BUSY)) == POOL_BUSY));
 
-	while (next) {
-		temp = next;
-		next = temp->next;
-		for (; temp; temp = down) {
-			down = temp->down;
-			pool_put_to_os(pool, temp);
+		if (next) {
+			_HA_ATOMIC_STORE(&pool->buckets[bucket].free_list, NULL);
+			__ha_barrier_atomic_store();
+		}
+
+		while (next) {
+			temp = next;
+			next = temp->next;
+			for (; temp; temp = down) {
+				down = temp->down;
+				_HA_ATOMIC_DEC(&pool->buckets[pool_pbucket(temp)].allocated);
+				pool_put_to_os_nodec(pool, temp);
+			}
 		}
 	}
 	/* here, we should have pool->allocated == pool->used */
@@ -739,14 +790,25 @@ void pool_gc(struct pool_head *pool_ctx)
 
 	list_for_each_entry(entry, &pools, list) {
 		struct pool_item *temp, *down;
+		uint allocated = pool_allocated(entry);
+		uint used = pool_used(entry);
+		int bucket = 0;
 
-		while (entry->free_list &&
-		       (int)(entry->allocated - entry->used) > (int)entry->minavail) {
-			temp = entry->free_list;
-			entry->free_list = temp->next;
+		while ((int)(allocated - used) > (int)entry->minavail) {
+			/* ok let's find next entry to evict */
+			while (!entry->buckets[bucket].free_list && bucket < CONFIG_HAP_POOL_BUCKETS)
+				bucket++;
+
+			if (bucket == CONFIG_HAP_POOL_BUCKETS)
+				break;
+
+			temp = entry->buckets[bucket].free_list;
+			entry->buckets[bucket].free_list = temp->next;
 			for (; temp; temp = down) {
 				down = temp->down;
-				pool_put_to_os(entry, temp);
+				allocated--;
+				_HA_ATOMIC_DEC(&entry->buckets[pool_pbucket(temp)].allocated);
+				pool_put_to_os_nodec(entry, temp);
 			}
 		}
 	}
@@ -843,7 +905,7 @@ void *pool_destroy(struct pool_head *pool)
 			pool_evict_from_local_cache(pool, 1);
 
 		pool_flush(pool);
-		if (pool->used)
+		if (pool_used(pool))
 			return pool;
 		pool->users--;
 		if (!pool->users) {
@@ -925,6 +987,7 @@ void dump_pools_to_trash(int by_what, int max, const char *pfx)
 	int nbpools, i;
 	unsigned long long cached_bytes = 0;
 	uint cached = 0;
+	uint alloc_items;
 
 	allocated = used = nbpools = 0;
 
@@ -932,8 +995,9 @@ void dump_pools_to_trash(int by_what, int max, const char *pfx)
 		if (nbpools >= POOLS_MAX_DUMPED_ENTRIES)
 			break;
 
+		alloc_items = pool_allocated(entry);
 		/* do not dump unused entries when sorting by usage */
-		if (by_what == 3 && !entry->allocated)
+		if (by_what == 3 && !alloc_items)
 			continue;
 
 		/* verify the pool name if a prefix is requested */
@@ -945,12 +1009,12 @@ void dump_pools_to_trash(int by_what, int max, const char *pfx)
 				cached += entry->cache[i].count;
 		}
 		pool_info[nbpools].entry = entry;
-		pool_info[nbpools].alloc_items = entry->allocated;
-		pool_info[nbpools].alloc_bytes = (ulong)entry->size * entry->allocated;
-		pool_info[nbpools].used_items = entry->used;
+		pool_info[nbpools].alloc_items = alloc_items;
+		pool_info[nbpools].alloc_bytes = (ulong)entry->size * alloc_items;
+		pool_info[nbpools].used_items = pool_used(entry);
 		pool_info[nbpools].cached_items = cached;
-		pool_info[nbpools].need_avg = swrate_avg(entry->needed_avg, POOL_AVG_SAMPLES);
-		pool_info[nbpools].failed_items = entry->failed;
+		pool_info[nbpools].need_avg = swrate_avg(pool_needed_avg(entry), POOL_AVG_SAMPLES);
+		pool_info[nbpools].failed_items = pool_failed(entry);
 		nbpools++;
 	}
 
@@ -1005,7 +1069,7 @@ int pool_total_failures()
 	int failed = 0;
 
 	list_for_each_entry(entry, &pools, list)
-		failed += entry->failed;
+		failed += pool_failed(entry);
 	return failed;
 }
 
@@ -1016,7 +1080,7 @@ unsigned long long pool_total_allocated()
 	unsigned long long allocated = 0;
 
 	list_for_each_entry(entry, &pools, list)
-		allocated += entry->allocated * (ullong)entry->size;
+		allocated += pool_allocated(entry) * (ullong)entry->size;
 	return allocated;
 }
 
@@ -1027,7 +1091,7 @@ unsigned long long pool_total_used()
 	unsigned long long used = 0;
 
 	list_for_each_entry(entry, &pools, list)
-		used += entry->used * (ullong)entry->size;
+		used += pool_used(entry) * (ullong)entry->size;
 	return used;
 }
 

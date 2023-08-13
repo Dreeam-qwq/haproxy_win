@@ -110,32 +110,38 @@ void stksess_free(struct stktable *t, struct stksess *ts)
 }
 
 /*
- * Kill an stksess (only if its ref_cnt is zero).
+ * Kill an stksess (only if its ref_cnt is zero). This must be called under the
+ * write lock. Returns zero if could not deleted, non-zero otherwise.
  */
 int __stksess_kill(struct stktable *t, struct stksess *ts)
 {
-	if (ts->ref_cnt)
+	if (HA_ATOMIC_LOAD(&ts->ref_cnt))
 		return 0;
 
 	eb32_delete(&ts->exp);
-	eb32_delete(&ts->upd);
+	if (ts->upd.node.leaf_p) {
+		HA_RWLOCK_WRLOCK(STK_TABLE_LOCK, &t->updt_lock);
+		eb32_delete(&ts->upd);
+		HA_RWLOCK_WRUNLOCK(STK_TABLE_LOCK, &t->updt_lock);
+	}
 	ebmb_delete(&ts->key);
 	__stksess_free(t, ts);
 	return 1;
 }
 
 /*
- * Decrease the refcount if decrefcnt is not 0.
- * and try to kill the stksess
+ * Decrease the refcount if decrefcnt is not 0, and try to kill the stksess.
+ * Returns non-zero if deleted, zero otherwise.
  * This function locks the table
  */
 int stksess_kill(struct stktable *t, struct stksess *ts, int decrefcnt)
 {
 	int ret;
 
+	if (decrefcnt && HA_ATOMIC_SUB_FETCH(&ts->ref_cnt, 1) != 0)
+		return 0;
+
 	HA_RWLOCK_WRLOCK(STK_TABLE_LOCK, &t->lock);
-	if (decrefcnt)
-		ts->ref_cnt--;
 	ret = __stksess_kill(t, ts);
 	HA_RWLOCK_WRUNLOCK(STK_TABLE_LOCK, &t->lock);
 
@@ -245,7 +251,7 @@ int __stktable_trash_oldest(struct stktable *t, int to_batch)
 		eb = eb32_next(eb);
 
 		/* don't delete an entry which is currently referenced */
-		if (ts->ref_cnt)
+		if (HA_ATOMIC_LOAD(&ts->ref_cnt) != 0)
 			continue;
 
 		eb32_delete(&ts->exp);
@@ -276,7 +282,11 @@ int __stktable_trash_oldest(struct stktable *t, int to_batch)
 
 		/* session expired, trash it */
 		ebmb_delete(&ts->key);
-		eb32_delete(&ts->upd);
+		if (ts->upd.node.leaf_p) {
+			HA_RWLOCK_WRLOCK(STK_TABLE_LOCK, &t->updt_lock);
+			eb32_delete(&ts->upd);
+			HA_RWLOCK_WRUNLOCK(STK_TABLE_LOCK, &t->updt_lock);
+		}
 		__stksess_free(t, ts);
 		batched++;
 	}
@@ -423,7 +433,8 @@ struct stksess *stktable_lookup(struct stktable *t, struct stksess *ts)
 void stktable_touch_with_exp(struct stktable *t, struct stksess *ts, int local, int expire, int decrefcnt)
 {
 	struct eb32_node * eb;
-	int locked = 0;
+	int use_wrlock = 0;
+	int do_wakeup = 0;
 
 	if (expire != HA_ATOMIC_LOAD(&ts->expire)) {
 		/* we'll need to set the expiration and to wake up the expiration timer .*/
@@ -433,16 +444,39 @@ void stktable_touch_with_exp(struct stktable *t, struct stksess *ts, int local, 
 
 	/* If sync is enabled */
 	if (t->sync_task) {
-		if (local) {
-			/* If this entry is not in the tree
-			 * or not scheduled for at least one peer.
-			 */
-			if (!locked++)
-				HA_RWLOCK_WRLOCK(STK_TABLE_LOCK, &t->lock);
+	try_lock_again:
+		/* We'll need to reliably check that the entry is in the tree.
+		 * It's only inserted/deleted using a write lock so a read lock
+		 * is sufficient to verify this. We may then need to upgrade it
+		 * to perform an update (which is rare under load), and if the
+		 * upgrade fails, we'll try again with a write lock directly.
+		 */
+		if (use_wrlock)
+			HA_RWLOCK_WRLOCK(STK_TABLE_LOCK, &t->updt_lock);
+		else
+			HA_RWLOCK_RDLOCK(STK_TABLE_LOCK, &t->updt_lock);
 
+		if (local) {
+			/* Check if this entry is not in the tree or not
+			 * scheduled for at least one peer.
+			 */
 			if (!ts->upd.node.leaf_p
 			    || (int)(t->commitupdate - ts->upd.key) >= 0
 			    || (int)(ts->upd.key - t->localupdate) >= 0) {
+				/* Time to upgrade the read lock to write lock if needed */
+				if (!use_wrlock) {
+					if (HA_RWLOCK_TRYRDTOSK(STK_TABLE_LOCK, &t->updt_lock) != 0) {
+						/* failed, try again */
+						HA_RWLOCK_RDUNLOCK(STK_TABLE_LOCK, &t->updt_lock);
+						use_wrlock = 1;
+						goto try_lock_again;
+					}
+					HA_RWLOCK_SKTOWR(STK_TABLE_LOCK, &t->updt_lock);
+					use_wrlock = 1;
+				}
+
+				/* here we're write-locked */
+
 				ts->upd.key = ++t->update;
 				t->localupdate = t->update;
 				eb32_delete(&ts->upd);
@@ -452,14 +486,26 @@ void stktable_touch_with_exp(struct stktable *t, struct stksess *ts, int local, 
 					eb32_insert(&t->updates, &ts->upd);
 				}
 			}
-			task_wakeup(t->sync_task, TASK_WOKEN_MSG);
+			do_wakeup = 1;
 		}
 		else {
 			/* If this entry is not in the tree */
-			if (!locked++)
-				HA_RWLOCK_WRLOCK(STK_TABLE_LOCK, &t->lock);
 
 			if (!ts->upd.node.leaf_p) {
+				/* Time to upgrade the read lock to write lock if needed */
+				if (!use_wrlock) {
+					if (HA_RWLOCK_TRYRDTOSK(STK_TABLE_LOCK, &t->updt_lock) != 0) {
+						/* failed, try again */
+						HA_RWLOCK_RDUNLOCK(STK_TABLE_LOCK, &t->updt_lock);
+						use_wrlock = 1;
+						goto try_lock_again;
+					}
+					HA_RWLOCK_SKTOWR(STK_TABLE_LOCK, &t->updt_lock);
+					use_wrlock = 1;
+				}
+
+				/* here we're write-locked */
+
 				ts->upd.key= (++t->update)+(2147483648U);
 				eb = eb32_insert(&t->updates, &ts->upd);
 				if (eb != &ts->upd) {
@@ -468,20 +514,19 @@ void stktable_touch_with_exp(struct stktable *t, struct stksess *ts, int local, 
 				}
 			}
 		}
+
+		/* drop the lock now */
+		if (use_wrlock)
+			HA_RWLOCK_WRUNLOCK(STK_TABLE_LOCK, &t->updt_lock);
+		else
+			HA_RWLOCK_RDUNLOCK(STK_TABLE_LOCK, &t->updt_lock);
 	}
 
-	if (decrefcnt) {
-		if (locked)
-			ts->ref_cnt--;
-		else {
-			HA_RWLOCK_RDLOCK(STK_TABLE_LOCK, &t->lock);
-			HA_ATOMIC_DEC(&ts->ref_cnt);
-			HA_RWLOCK_RDUNLOCK(STK_TABLE_LOCK, &t->lock);
-		}
-	}
+	if (decrefcnt)
+		HA_ATOMIC_DEC(&ts->ref_cnt);
 
-	if (locked)
-		HA_RWLOCK_WRUNLOCK(STK_TABLE_LOCK, &t->lock);
+	if (do_wakeup)
+		task_wakeup(t->sync_task, TASK_WOKEN_MSG);
 }
 
 /* Update the expiration timer for <ts> but do not touch its expiration node.
@@ -516,9 +561,7 @@ static void stktable_release(struct stktable *t, struct stksess *ts)
 {
 	if (!ts)
 		return;
-	HA_RWLOCK_RDLOCK(STK_TABLE_LOCK, &t->lock);
 	HA_ATOMIC_DEC(&ts->ref_cnt);
-	HA_RWLOCK_RDUNLOCK(STK_TABLE_LOCK, &t->lock);
 }
 
 /* Insert new sticky session <ts> in the table. It is assumed that it does not
@@ -565,9 +608,9 @@ void stktable_requeue_exp(struct stktable *t, const struct stksess *ts)
 		new_exp = tick_first(expire, old_exp);
 	}
 
-	task_queue(t->exp_task);
-
 	HA_RWLOCK_WRUNLOCK(STK_TABLE_LOCK, &t->lock);
+
+	task_queue(t->exp_task);
 }
 
 /* Returns a valid or initialized stksess for the specified stktable_key in the
@@ -605,6 +648,10 @@ struct stksess *stktable_get_entry(struct stktable *table, struct stktable_key *
 	HA_RWLOCK_WRLOCK(STK_TABLE_LOCK, &table->lock);
 
 	ts2 = __stktable_store(table, ts);
+
+	HA_ATOMIC_INC(&ts2->ref_cnt);
+	HA_RWLOCK_WRUNLOCK(STK_TABLE_LOCK, &table->lock);
+
 	if (unlikely(ts2 != ts)) {
 		/* another entry was added in the mean time, let's
 		 * switch to it.
@@ -612,9 +659,6 @@ struct stksess *stktable_get_entry(struct stktable *table, struct stktable_key *
 		__stksess_free(table, ts);
 		ts = ts2;
 	}
-
-	HA_ATOMIC_INC(&ts->ref_cnt);
-	HA_RWLOCK_WRUNLOCK(STK_TABLE_LOCK, &table->lock);
 
 	stktable_requeue_exp(table, ts);
 	return ts;
@@ -666,6 +710,7 @@ struct task *process_table_expire(struct task *task, void *context, unsigned int
 	struct stktable *t = context;
 	struct stksess *ts;
 	struct eb32_node *eb;
+	int updt_locked = 0;
 	int looped = 0;
 	int exp_next;
 
@@ -698,7 +743,7 @@ struct task *process_table_expire(struct task *task, void *context, unsigned int
 		eb = eb32_next(eb);
 
 		/* don't delete an entry which is currently referenced */
-		if (ts->ref_cnt)
+		if (HA_ATOMIC_LOAD(&ts->ref_cnt) != 0)
 			continue;
 
 		eb32_delete(&ts->exp);
@@ -728,7 +773,13 @@ struct task *process_table_expire(struct task *task, void *context, unsigned int
 
 		/* session expired, trash it */
 		ebmb_delete(&ts->key);
-		eb32_delete(&ts->upd);
+		if (ts->upd.node.leaf_p) {
+			if (!updt_locked) {
+				updt_locked = 1;
+				HA_RWLOCK_WRLOCK(STK_TABLE_LOCK, &t->updt_lock);
+			}
+			eb32_delete(&ts->upd);
+		}
 		__stksess_free(t, ts);
 	}
 
@@ -737,6 +788,8 @@ struct task *process_table_expire(struct task *task, void *context, unsigned int
 
 out_unlock:
 	task->expire = exp_next;
+	if (updt_locked)
+		HA_RWLOCK_WRUNLOCK(STK_TABLE_LOCK, &t->updt_lock);
 	HA_RWLOCK_WRUNLOCK(STK_TABLE_LOCK, &t->lock);
 	return task;
 }
@@ -2370,7 +2423,7 @@ static int sample_conv_table_trackers(const struct arg *arg_p, struct sample *sm
 	if (!ts)
 		return 1;
 
-	smp->data.u.sint = ts->ref_cnt;
+	smp->data.u.sint = HA_ATOMIC_LOAD(&ts->ref_cnt);
 
 	stktable_release(t, ts);
 	return 1;
@@ -4577,11 +4630,11 @@ smp_fetch_sc_trackers(const struct arg *args, struct sample *smp, const char *kw
 	smp->flags = SMP_F_VOL_TEST;
 	smp->data.type = SMP_T_SINT;
 	if (stkctr == &tmpstkctr) {
-		smp->data.u.sint = stkctr_entry(stkctr) ? (stkctr_entry(stkctr)->ref_cnt-1) : 0;
+		smp->data.u.sint = stkctr_entry(stkctr) ? (HA_ATOMIC_LOAD(&stkctr_entry(stkctr)->ref_cnt) - 1) : 0;
 		stktable_release(stkctr->table, stkctr_entry(stkctr));
 	}
 	else {
-		smp->data.u.sint = stkctr_entry(stkctr) ? stkctr_entry(stkctr)->ref_cnt : 0;
+		smp->data.u.sint = stkctr_entry(stkctr) ? HA_ATOMIC_LOAD(&stkctr_entry(stkctr)->ref_cnt) : 0;
 	}
 
 	return 1;
@@ -4659,7 +4712,7 @@ static int table_dump_entry_to_buffer(struct buffer *msg,
 		dump_binary(msg, (const char *)entry->key.key, t->key_size);
 	}
 
-	chunk_appendf(msg, " use=%d exp=%d shard=%d", entry->ref_cnt - 1, tick_remain(now_ms, entry->expire), entry->shard);
+	chunk_appendf(msg, " use=%d exp=%d shard=%d", HA_ATOMIC_LOAD(&entry->ref_cnt) - 1, tick_remain(now_ms, entry->expire), entry->shard);
 
 	for (dt = 0; dt < STKTABLE_DATA_TYPES; dt++) {
 		void *ptr;
@@ -5078,7 +5131,7 @@ static int cli_io_handler_table(struct appctx *appctx)
 					eb = ebmb_first(&ctx->t->keys);
 					if (eb) {
 						ctx->entry = ebmb_entry(eb, struct stksess, key);
-						ctx->entry->ref_cnt++;
+						HA_ATOMIC_INC(&ctx->entry->ref_cnt);
 						ctx->state = STATE_DUMP;
 						HA_RWLOCK_WRUNLOCK(STK_TABLE_LOCK, &ctx->t->lock);
 						break;
@@ -5152,7 +5205,7 @@ static int cli_io_handler_table(struct appctx *appctx)
 			HA_RWLOCK_RDUNLOCK(STK_SESS_LOCK, &ctx->entry->lock);
 
 			HA_RWLOCK_WRLOCK(STK_TABLE_LOCK, &ctx->t->lock);
-			ctx->entry->ref_cnt--;
+			HA_ATOMIC_DEC(&ctx->entry->ref_cnt);
 
 			eb = ebmb_next(&ctx->entry->key);
 			if (eb) {
@@ -5162,7 +5215,7 @@ static int cli_io_handler_table(struct appctx *appctx)
 					__stksess_kill_if_expired(ctx->t, old);
 				else if (!skip_entry && !ctx->entry->ref_cnt)
 					__stksess_kill(ctx->t, old);
-				ctx->entry->ref_cnt++;
+				HA_ATOMIC_INC(&ctx->entry->ref_cnt);
 				HA_RWLOCK_WRUNLOCK(STK_TABLE_LOCK, &ctx->t->lock);
 				break;
 			}
@@ -5170,7 +5223,7 @@ static int cli_io_handler_table(struct appctx *appctx)
 
 			if (show)
 				__stksess_kill_if_expired(ctx->t, ctx->entry);
-			else if (!skip_entry && !ctx->entry->ref_cnt)
+			else if (!skip_entry && !HA_ATOMIC_LOAD(&ctx->entry->ref_cnt))
 				__stksess_kill(ctx->t, ctx->entry);
 
 			HA_RWLOCK_WRUNLOCK(STK_TABLE_LOCK, &ctx->t->lock);

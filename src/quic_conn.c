@@ -129,6 +129,8 @@ const struct quic_version quic_version_VN_reserved = { .num = 0, };
 static BIO_METHOD *ha_quic_meth;
 
 DECLARE_STATIC_POOL(pool_head_quic_conn, "quic_conn", sizeof(struct quic_conn));
+DECLARE_STATIC_POOL(pool_head_quic_cc_conn, "quic_cc_conn", sizeof(struct quic_cc_conn));
+DECLARE_STATIC_POOL(pool_head_quic_cids, "quic_cids", sizeof(struct eb_root));
 DECLARE_POOL(pool_head_quic_connection_id,
              "quic_connection_id", sizeof(struct quic_connection_id));
 DECLARE_POOL(pool_head_quic_crypto_buf, "quic_crypto_buf", sizeof(struct quic_crypto_buf));
@@ -148,6 +150,8 @@ int quic_peer_validated_addr(struct quic_conn *qc)
 	    (qc->apktns && (qc->apktns->flags & QUIC_FL_PKTNS_PKT_RECEIVED)) ||
 	    qc->state >= QUIC_HS_ST_COMPLETE)
 		return 1;
+
+	BUG_ON(qc->bytes.prep > 3 * qc->bytes.rx);
 
 	return 0;
 }
@@ -739,8 +743,154 @@ struct task *quic_conn_app_io_cb(struct task *t, void *context, unsigned int sta
 	}
 
  out:
+	if ((qc->flags & QUIC_FL_CONN_CLOSING) && qc->mux_state != QC_MUX_READY) {
+		quic_conn_release(qc);
+		qc = NULL;
+	}
+
 	TRACE_LEAVE(QUIC_EV_CONN_IO_CB, qc);
 	return t;
+}
+
+static void quic_release_cc_conn(struct quic_cc_conn *cc_qc)
+{
+	struct quic_conn *qc = (struct quic_conn *)cc_qc;
+
+	TRACE_ENTER(QUIC_EV_CONN_IO_CB, cc_qc);
+
+	if (qc_test_fd(qc))
+		_HA_ATOMIC_DEC(&jobs);
+
+	/* Close quic-conn socket fd. */
+	qc_release_fd(qc, 0);
+
+	task_destroy(cc_qc->idle_timer_task);
+	cc_qc->idle_timer_task = NULL;
+	tasklet_free(qc->wait_event.tasklet);
+	free_quic_conn_cids(qc);
+	pool_free(pool_head_quic_cids, cc_qc->cids);
+	cc_qc->cids = NULL;
+	pool_free(pool_head_quic_cc_buf, cc_qc->cc_buf_area);
+	cc_qc->cc_buf_area = NULL;
+	/* free the SSL sock context */
+	qc_free_ssl_sock_ctx(&cc_qc->xprt_ctx);
+	pool_free(pool_head_quic_cc_conn, cc_qc);
+
+	TRACE_ENTER(QUIC_EV_CONN_IO_CB);
+}
+
+/* QUIC connection packet handler task used when in "closing connection" state. */
+static struct task *quic_cc_conn_io_cb(struct task *t, void *context, unsigned int state)
+{
+	struct quic_cc_conn *cc_qc = context;
+	struct quic_conn *qc = (struct quic_conn *)cc_qc;
+	struct buffer buf;
+	uint16_t dglen;
+	struct quic_tx_packet *first_pkt;
+	size_t headlen = sizeof dglen + sizeof first_pkt;
+
+	TRACE_ENTER(QUIC_EV_CONN_IO_CB, qc);
+
+	if (qc_test_fd(qc))
+		qc_rcv_buf(qc);
+
+	/* Do not send too much data if the peer address was not validated. */
+	if ((qc->flags & QUIC_FL_CONN_IMMEDIATE_CLOSE) &&
+	    !(qc->flags & QUIC_FL_CONN_PEER_VALIDATED_ADDR) &&
+	    quic_may_send_bytes(qc) < cc_qc->cc_dgram_len)
+		goto leave;
+
+	buf = b_make(cc_qc->cc_buf_area + headlen,
+	             QUIC_MAX_CC_BUFSIZE - headlen, 0, cc_qc->cc_dgram_len);
+	if (qc_snd_buf(qc, &buf, buf.data, 0) < 0) {
+		TRACE_ERROR("sendto fatal error", QUIC_EV_CONN_IO_CB, qc);
+		quic_release_cc_conn(cc_qc);
+		cc_qc = NULL;
+		qc = NULL;
+		t = NULL;
+		goto leave;
+	}
+
+	qc->flags &= ~QUIC_FL_CONN_IMMEDIATE_CLOSE;
+
+ leave:
+	TRACE_LEAVE(QUIC_EV_CONN_IO_CB, qc);
+
+	return t;
+}
+
+/* The task handling the idle timeout of a connection in "connection close" state */
+static struct task *qc_cc_idle_timer_task(struct task *t, void *ctx, unsigned int state)
+{
+	struct quic_cc_conn *cc_qc = ctx;
+
+	quic_release_cc_conn(cc_qc);
+
+	return NULL;
+}
+
+/* Allocate a new connection in "connection close" state and return it
+ * if succeeded, NULL if not. This function is also responsible of
+ * copying enough and the least possible information from <qc> original
+ * connection to the newly allocated connection so that to keep it
+ * functionnal until its idle timer expires.
+ */
+static struct quic_cc_conn *qc_new_cc_conn(struct quic_conn *qc)
+{
+	struct quic_cc_conn *cc_qc;
+
+	cc_qc = pool_alloc(pool_head_quic_cc_conn);
+	if (!cc_qc)
+		return NULL;
+
+	quic_conn_mv_cids_to_cc_conn(cc_qc, qc);
+
+	cc_qc->fd = qc->fd;
+	fdtab[cc_qc->fd].owner = cc_qc;
+	cc_qc->flags = qc->flags;
+	if (quic_peer_validated_addr(qc))
+	    cc_qc->flags |= QUIC_FL_CONN_PEER_VALIDATED_ADDR;
+	cc_qc->err = qc->err;
+
+	cc_qc->nb_pkt_for_cc = qc->nb_pkt_for_cc;
+	cc_qc->nb_pkt_since_cc = qc->nb_pkt_since_cc;
+
+	cc_qc->local_addr = qc->local_addr;
+	cc_qc->peer_addr = qc->peer_addr;
+
+	cc_qc->wait_event.tasklet = qc->wait_event.tasklet;
+	cc_qc->wait_event.tasklet->process = quic_cc_conn_io_cb;
+	cc_qc->wait_event.tasklet->context = cc_qc;
+	cc_qc->wait_event.events = 0;
+	cc_qc->subs = NULL;
+
+	cc_qc->bytes.prep = qc->bytes.prep;
+	cc_qc->bytes.tx = qc->bytes.tx;
+	cc_qc->bytes.rx = qc->bytes.rx;
+
+	cc_qc->odcid = qc->odcid;
+	cc_qc->dcid = qc->dcid;
+	cc_qc->scid = qc->scid;
+
+	cc_qc->li = qc->li;
+	cc_qc->cids = qc->cids;
+
+	cc_qc->idle_timer_task = qc->idle_timer_task;
+	cc_qc->idle_timer_task->process = qc_cc_idle_timer_task;
+	cc_qc->idle_timer_task->context = cc_qc;
+	cc_qc->idle_expire = qc->idle_expire;
+
+	cc_qc->xprt_ctx = qc->xprt_ctx;
+	qc->xprt_ctx = NULL;
+	cc_qc->conn = qc->conn;
+	qc->conn = NULL;
+
+	cc_qc->cc_buf_area = qc->tx.cc_buf_area;
+	cc_qc->cc_dgram_len = qc->tx.cc_dgram_len;
+	TRACE_PRINTF(TRACE_LEVEL_PROTO, QUIC_EV_CONN_IO_CB, qc, 0, 0, 0,
+	             "switch qc@%p to cc_qc@%p", qc, cc_qc);
+
+	return cc_qc;
 }
 
 /* QUIC connection packet handler task. */
@@ -791,7 +941,7 @@ struct task *quic_conn_io_cb(struct task *t, void *context, unsigned int state)
 		}
 	}
 
-	buf = qc_txb_alloc(qc);
+	buf = qc_get_txb(qc);
 	if (!buf)
 		goto out;
 
@@ -835,6 +985,11 @@ struct task *quic_conn_io_cb(struct task *t, void *context, unsigned int state)
 		quic_pktns_release(qc, &qc->hpktns);
 		/* Also release the negotiated Inital TLS context. */
 		quic_nictx_free(qc);
+	}
+
+	if ((qc->flags & QUIC_FL_CONN_CLOSING) && qc->mux_state != QC_MUX_READY) {
+		quic_conn_release(qc);
+		qc = NULL;
 	}
 
 	TRACE_PROTO("ssl error", QUIC_EV_CONN_IO_CB, qc, &st);
@@ -1031,7 +1186,7 @@ struct quic_conn *qc_new_conn(const struct quic_version *qv, int ipv4,
 	qc->streams_by_id = EB_ROOT_UNIQUE;
 
 	/* Required to call free_quic_conn_cids() from quic_conn_release() */
-	qc->cids = EB_ROOT;
+	qc->cids = NULL;
 	qc_init_fd(qc);
 
 	LIST_INIT(&qc->back_refs);
@@ -1073,6 +1228,13 @@ struct quic_conn *qc_new_conn(const struct quic_version *qv, int ipv4,
 		goto err;
 	}
 
+	qc->cids = pool_alloc(pool_head_quic_cids);
+	if (!qc->cids) {
+		TRACE_ERROR("Could not allocate a new CID tree", QUIC_EV_CONN_INIT, qc);
+		goto err;
+	}
+
+	*qc->cids = EB_ROOT;
 	/* QUIC Server (or listener). */
 	if (server) {
 		struct proxy *prx;
@@ -1131,11 +1293,14 @@ struct quic_conn *qc_new_conn(const struct quic_version *qv, int ipv4,
 		TLS_EXTENSION_QUIC_TRANSPORT_PARAMETERS_DRAFT:
 		TLS_EXTENSION_QUIC_TRANSPORT_PARAMETERS;
 	/* TX part. */
-	qc->tx.bytes = qc->tx.prep_bytes = 0;
+	qc->bytes.tx = qc->bytes.prep = 0;
 	memset(&qc->tx.params, 0, sizeof(qc->tx.params));
 	qc->tx.buf = BUF_NULL;
+	qc->tx.cc_buf = BUF_NULL;
+	qc->tx.cc_buf_area = NULL;
+	qc->tx.cc_dgram_len = 0;
 	/* RX part. */
-	qc->rx.bytes = 0;
+	qc->bytes.rx = 0;
 	memset(&qc->rx.params, 0, sizeof(qc->rx.params));
 	qc->rx.buf = b_make(qc->rx.buf.area, QUIC_CONN_RX_BUFSZ, 0, 0);
 	for (i = 0; i < QCS_MAX_TYPES; i++)
@@ -1238,6 +1403,7 @@ void quic_conn_release(struct quic_conn *qc)
 {
 	struct eb64_node *node;
 	struct quic_rx_packet *pkt, *pktback;
+	struct quic_cc_conn *cc_qc;
 
 	TRACE_ENTER(QUIC_EV_CONN_CLOSE, qc);
 
@@ -1247,11 +1413,29 @@ void quic_conn_release(struct quic_conn *qc)
 	/* We must not free the quic-conn if the MUX is still allocated. */
 	BUG_ON(qc->mux_state == QC_MUX_READY);
 
-	if (qc_test_fd(qc))
-		_HA_ATOMIC_DEC(&jobs);
+	cc_qc = NULL;
+	if ((qc->flags & QUIC_FL_CONN_CLOSING) && !(qc->flags & QUIC_FL_CONN_EXP_TIMER) &&
+	    qc->tx.cc_buf_area)
+		cc_qc = qc_new_cc_conn(qc);
 
-	/* Close quic-conn socket fd. */
-	qc_release_fd(qc, 0);
+	if (!cc_qc) {
+		if (qc_test_fd(qc))
+			_HA_ATOMIC_DEC(&jobs);
+
+		/* Close quic-conn socket fd. */
+		qc_release_fd(qc, 0);
+		task_destroy(qc->idle_timer_task);
+		qc->idle_timer_task = NULL;
+		tasklet_free(qc->wait_event.tasklet);
+		/* remove the connection from receiver cids trees */
+		free_quic_conn_cids(qc);
+		pool_free(pool_head_quic_cids, qc->cids);
+		qc->cids = NULL;
+		pool_free(pool_head_quic_cc_buf, qc->tx.cc_buf_area);
+		qc->tx.cc_buf_area = NULL;
+		/* free the SSL sock context */
+		qc_free_ssl_sock_ctx(&qc->xprt_ctx);
+	}
 
 	/* in the unlikely (but possible) case the connection was just added to
 	 * the accept_list we must delete it from there.
@@ -1279,19 +1463,8 @@ void quic_conn_release(struct quic_conn *qc)
 		pool_free(pool_head_quic_rx_packet, pkt);
 	}
 
-	task_destroy(qc->idle_timer_task);
-	qc->idle_timer_task = NULL;
-
 	task_destroy(qc->timer_task);
 	qc->timer_task = NULL;
-
-	tasklet_free(qc->wait_event.tasklet);
-
-	/* remove the connection from receiver cids trees */
-	free_quic_conn_cids(qc);
-
-	/* free the SSL sock context */
-	qc_free_ssl_sock_ctx(&qc->xprt_ctx);
 
 	quic_tls_ku_free(qc);
 	if (qc->ael) {
@@ -1689,7 +1862,7 @@ int qc_set_tid_affinity(struct quic_conn *qc, uint new_tid, struct listener *new
 	 */
 	qc_detach_th_ctx_list(qc, 0);
 
-	node = eb64_first(&qc->cids);
+	node = eb64_first(qc->cids);
 	BUG_ON(!node || eb64_next(node)); /* One and only one CID must be present before affinity rebind. */
 	conn_id = eb64_entry(node, struct quic_connection_id, seq_num);
 

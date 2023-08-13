@@ -1539,11 +1539,10 @@ static inline struct stksess *peer_teach_stage2_stksess_lookup(struct shared_tab
 /*
  * Generic function to emit update messages for <st> stick-table when a lesson must
  * be taught to the peer <p>.
- * <locked> must be set to 1 if the shared table <st> is already locked when entering
- * this function, 0 if not.
  *
  * This function temporary unlock/lock <st> when it sends stick-table updates or
  * when decrementing its refcount in case of any error when it sends this updates.
+ * It must be called with the stick-table lock released.
  *
  * Return 0 if any message could not be built modifying the appcxt st0 to PEER_SESS_ST_END value.
  * Returns -1 if there was not enough room left to send the message,
@@ -1554,7 +1553,7 @@ static inline struct stksess *peer_teach_stage2_stksess_lookup(struct shared_tab
  */
 static inline int peer_send_teachmsgs(struct appctx *appctx, struct peer *p,
                                       struct stksess *(*peer_stksess_lookup)(struct shared_table *),
-                                      struct shared_table *st, int locked)
+                                      struct shared_table *st)
 {
 	int ret, new_pushed, use_timed;
 	int updates_sent = 0;
@@ -1575,8 +1574,7 @@ static inline int peer_send_teachmsgs(struct appctx *appctx, struct peer *p,
 	/* We force new pushed to 1 to force identifier in update message */
 	new_pushed = 1;
 
-	if (!locked)
-		HA_RWLOCK_WRLOCK(STK_TABLE_LOCK, &st->table->lock);
+	HA_RWLOCK_RDLOCK(STK_TABLE_LOCK, &st->table->updt_lock);
 
 	while (1) {
 		struct stksess *ts;
@@ -1597,23 +1595,26 @@ static inline int peer_send_teachmsgs(struct appctx *appctx, struct peer *p,
 			continue;
 		}
 
-		ts->ref_cnt++;
-		HA_RWLOCK_WRUNLOCK(STK_TABLE_LOCK, &st->table->lock);
+		HA_ATOMIC_INC(&ts->ref_cnt);
+		HA_RWLOCK_RDUNLOCK(STK_TABLE_LOCK, &st->table->updt_lock);
 
 		ret = peer_send_updatemsg(st, appctx, ts, updateid, new_pushed, use_timed);
-		if (ret <= 0) {
-			HA_RWLOCK_WRLOCK(STK_TABLE_LOCK, &st->table->lock);
-			ts->ref_cnt--;
+		HA_RWLOCK_RDLOCK(STK_TABLE_LOCK, &st->table->updt_lock);
+		HA_ATOMIC_DEC(&ts->ref_cnt);
+		if (ret <= 0)
 			break;
-		}
 
-		HA_RWLOCK_WRLOCK(STK_TABLE_LOCK, &st->table->lock);
-		ts->ref_cnt--;
 		st->last_pushed = updateid;
 
-		if (peer_stksess_lookup == peer_teach_process_stksess_lookup &&
-		    (int)(st->last_pushed - st->table->commitupdate) > 0)
-			st->table->commitupdate = st->last_pushed;
+		if (peer_stksess_lookup == peer_teach_process_stksess_lookup) {
+			uint commitid = _HA_ATOMIC_LOAD(&st->table->commitupdate);
+
+			while ((int)(updateid - commitid) > 0) {
+				if (_HA_ATOMIC_CAS(&st->table->commitupdate, &commitid, updateid))
+					break;
+				__ha_cpu_relax();
+			}
+		}
 
 		/* identifier may not needed in next update message */
 		new_pushed = 0;
@@ -1630,8 +1631,7 @@ static inline int peer_send_teachmsgs(struct appctx *appctx, struct peer *p,
 	}
 
  out:
-	if (!locked)
-		HA_RWLOCK_WRUNLOCK(STK_TABLE_LOCK, &st->table->lock);
+	HA_RWLOCK_RDUNLOCK(STK_TABLE_LOCK, &st->table->updt_lock);
 	return ret;
 }
 
@@ -1639,7 +1639,8 @@ static inline int peer_send_teachmsgs(struct appctx *appctx, struct peer *p,
  * Function to emit update messages for <st> stick-table when a lesson must
  * be taught to the peer <p> (PEER_F_LEARN_ASSIGN flag set).
  *
- * Note that <st> shared stick-table is locked when calling this function.
+ * Note that <st> shared stick-table is locked when calling this function, and
+ * the lock is dropped then re-acquired.
  *
  * Return 0 if any message could not be built modifying the appcxt st0 to PEER_SESS_ST_END value.
  * Returns -1 if there was not enough room left to send the message,
@@ -1649,12 +1650,19 @@ static inline int peer_send_teachmsgs(struct appctx *appctx, struct peer *p,
 static inline int peer_send_teach_process_msgs(struct appctx *appctx, struct peer *p,
                                                struct shared_table *st)
 {
-	return peer_send_teachmsgs(appctx, p, peer_teach_process_stksess_lookup, st, 1);
+	int ret;
+
+	HA_RWLOCK_WRUNLOCK(STK_TABLE_LOCK, &st->table->lock);
+	ret = peer_send_teachmsgs(appctx, p, peer_teach_process_stksess_lookup, st);
+	HA_RWLOCK_WRLOCK(STK_TABLE_LOCK, &st->table->lock);
+
+	return ret;
 }
 
 /*
  * Function to emit update messages for <st> stick-table when a lesson must
- * be taught to the peer <p> during teach state 1 step.
+ * be taught to the peer <p> during teach state 1 step. It must be called with
+ * the stick-table lock released.
  *
  * Return 0 if any message could not be built modifying the appcxt st0 to PEER_SESS_ST_END value.
  * Returns -1 if there was not enough room left to send the message,
@@ -1664,12 +1672,13 @@ static inline int peer_send_teach_process_msgs(struct appctx *appctx, struct pee
 static inline int peer_send_teach_stage1_msgs(struct appctx *appctx, struct peer *p,
                                               struct shared_table *st)
 {
-	return peer_send_teachmsgs(appctx, p, peer_teach_stage1_stksess_lookup, st, 0);
+	return peer_send_teachmsgs(appctx, p, peer_teach_stage1_stksess_lookup, st);
 }
 
 /*
  * Function to emit update messages for <st> stick-table when a lesson must
- * be taught to the peer <p> during teach state 1 step.
+ * be taught to the peer <p> during teach state 1 step. It must be called with
+ * the stick-table lock released.
  *
  * Return 0 if any message could not be built modifying the appcxt st0 to PEER_SESS_ST_END value.
  * Returns -1 if there was not enough room left to send the message,
@@ -1679,7 +1688,7 @@ static inline int peer_send_teach_stage1_msgs(struct appctx *appctx, struct peer
 static inline int peer_send_teach_stage2_msgs(struct appctx *appctx, struct peer *p,
                                               struct shared_table *st)
 {
-	return peer_send_teachmsgs(appctx, p, peer_teach_stage2_stksess_lookup, st, 0);
+	return peer_send_teachmsgs(appctx, p, peer_teach_stage2_stksess_lookup, st);
 }
 
 
@@ -2805,6 +2814,8 @@ static inline void init_accepted_peer(struct peer *peer, struct peers *peers)
 
 	/* Init cursors */
 	for (st = peer->tables; st ; st = st->next) {
+		uint commitid, updateid;
+
 		st->last_get = st->last_acked = 0;
 		HA_RWLOCK_WRLOCK(STK_TABLE_LOCK, &st->table->lock);
 		/* if st->update appears to be in future it means
@@ -2820,8 +2831,16 @@ static inline void init_accepted_peer(struct peer *peer, struct peers *peers)
 			st->update = st->table->localupdate + (2147483648U);
 		st->teaching_origin = st->last_pushed = st->update;
 		st->flags = 0;
-		if ((int)(st->last_pushed - st->table->commitupdate) > 0)
-			st->table->commitupdate = st->last_pushed;
+
+		updateid = st->last_pushed;
+		commitid = _HA_ATOMIC_LOAD(&st->table->commitupdate);
+
+		while ((int)(updateid - commitid) > 0) {
+			if (_HA_ATOMIC_CAS(&st->table->commitupdate, &commitid, updateid))
+				break;
+			__ha_cpu_relax();
+		}
+
 		HA_RWLOCK_WRUNLOCK(STK_TABLE_LOCK, &st->table->lock);
 	}
 
@@ -2860,6 +2879,8 @@ static inline void init_connected_peer(struct peer *peer, struct peers *peers)
 	peer->heartbeat = tick_add(now_ms, MS_TO_TICKS(PEER_HEARTBEAT_TIMEOUT));
 	/* Init cursors */
 	for (st = peer->tables; st ; st = st->next) {
+		uint updateid, commitid;
+
 		st->last_get = st->last_acked = 0;
 		HA_RWLOCK_WRLOCK(STK_TABLE_LOCK, &st->table->lock);
 		/* if st->update appears to be in future it means
@@ -2875,8 +2896,16 @@ static inline void init_connected_peer(struct peer *peer, struct peers *peers)
 			st->update = st->table->localupdate + (2147483648U);
 		st->teaching_origin = st->last_pushed = st->update;
 		st->flags = 0;
-		if ((int)(st->last_pushed - st->table->commitupdate) > 0)
-			st->table->commitupdate = st->last_pushed;
+
+		updateid = st->last_pushed;
+		commitid = _HA_ATOMIC_LOAD(&st->table->commitupdate);
+
+		while ((int)(updateid - commitid) > 0) {
+			if (_HA_ATOMIC_CAS(&st->table->commitupdate, &commitid, updateid))
+				break;
+			__ha_cpu_relax();
+		}
+
 		HA_RWLOCK_WRUNLOCK(STK_TABLE_LOCK, &st->table->lock);
 	}
 
@@ -3966,7 +3995,7 @@ static int peers_dump_peer(struct buffer *msg, struct appctx *appctx, struct pee
 			              st->teaching_origin, st->update);
 			chunk_appendf(&trash, "\n              table:%p id=%s update=%u localupdate=%u"
 			              " commitupdate=%u refcnt=%u",
-			              t, t->id, t->update, t->localupdate, t->commitupdate, t->refcnt);
+			              t, t->id, t->update, t->localupdate, _HA_ATOMIC_LOAD(&t->commitupdate), t->refcnt);
 			if (flags & PEERS_SHOW_F_DICT) {
 				chunk_appendf(&trash, "\n        TX dictionary cache:");
 				count = 0;

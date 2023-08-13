@@ -45,7 +45,7 @@
 #define MAX_TGROUPS 16
 #endif
 
-#define MAX_THREADS_PER_GROUP LONGBITS
+#define MAX_THREADS_PER_GROUP __WORDSIZE
 
 /* threads enabled, max_threads defaults to long bits for 1 tgroup or 4 times
  * long bits if more tgroups are enabled.
@@ -250,6 +250,12 @@
 #define COOKIE_DELIM_DATE       '|'
 #endif
 
+// Max number of acl() sample fetch recursive evaluations, to avoid deep tree
+// loops.
+#ifndef ACL_MAX_RECURSE
+#define ACL_MAX_RECURSE 1000
+#endif
+
 #define CONN_RETRIES    3
 
 #define	CHK_CONNTIME    2000
@@ -447,6 +453,23 @@
 #ifndef CONFIG_HAP_POOL_CLUSTER_SIZE
 #define CONFIG_HAP_POOL_CLUSTER_SIZE 8
 #endif
+
+/* number of bits to encode the per-pool buckets for large setups */
+#ifndef CONFIG_HAP_POOL_BUCKETS_BITS
+# if defined(USE_THREAD) && MAX_THREADS >= 512
+#  define CONFIG_HAP_POOL_BUCKETS_BITS 6
+# elif defined(USE_THREAD) && MAX_THREADS >= 128
+#  define CONFIG_HAP_POOL_BUCKETS_BITS 5
+# elif defined(USE_THREAD) && MAX_THREADS >= 16
+#  define CONFIG_HAP_POOL_BUCKETS_BITS 4
+# elif defined(USE_THREAD)
+#  define CONFIG_HAP_POOL_BUCKETS_BITS 3
+# else
+#  define CONFIG_HAP_POOL_BUCKETS_BITS 0
+# endif
+#endif
+
+#define CONFIG_HAP_POOL_BUCKETS (1UL << (CONFIG_HAP_POOL_BUCKETS_BITS))
 
 /* Number of samples used to compute the times reported in stats. A power of
  * two is highly recommended, and this value multiplied by the largest response

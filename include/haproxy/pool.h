@@ -104,8 +104,8 @@ extern uint pool_debugging;
 int malloc_trim(size_t pad);
 void trim_all_pools(void);
 
-void *pool_get_from_os(struct pool_head *pool);
-void pool_put_to_os(struct pool_head *pool, void *ptr);
+void *pool_get_from_os_noinc(struct pool_head *pool);
+void pool_put_to_os_nodec(struct pool_head *pool, void *ptr);
 void *pool_alloc_nocache(struct pool_head *pool);
 void pool_free_nocache(struct pool_head *pool, void *ptr);
 void dump_pools(void);
@@ -134,7 +134,53 @@ void pool_put_to_cache(struct pool_head *pool, void *ptr, const void *caller);
 void pool_fill_pattern(struct pool_cache_head *pch, struct pool_cache_item *item, uint size);
 void pool_check_pattern(struct pool_cache_head *pch, struct pool_cache_item *item, uint size);
 void pool_refill_local_from_shared(struct pool_head *pool, struct pool_cache_head *pch);
-void pool_put_to_shared_cache(struct pool_head *pool, struct pool_item *item, uint count);
+void pool_put_to_shared_cache(struct pool_head *pool, struct pool_item *item);
+
+/* returns the total number of allocated entries for a pool across all buckets */
+static inline uint pool_allocated(const struct pool_head *pool)
+{
+	int bucket;
+	uint ret;
+
+	for (bucket = ret = 0; bucket < CONFIG_HAP_POOL_BUCKETS; bucket++)
+		ret += HA_ATOMIC_LOAD(&pool->buckets[bucket].allocated);
+	return ret;
+}
+
+/* returns the total number of used entries for a pool across all buckets */
+static inline uint pool_used(const struct pool_head *pool)
+{
+	int bucket;
+	uint ret;
+
+	for (bucket = ret = 0; bucket < CONFIG_HAP_POOL_BUCKETS; bucket++)
+		ret += HA_ATOMIC_LOAD(&pool->buckets[bucket].used);
+	return ret;
+}
+
+/* returns the raw total number needed entries across all buckets. It must
+ * be passed to swrate_avg() to get something usable.
+ */
+static inline uint pool_needed_avg(const struct pool_head *pool)
+{
+	int bucket;
+	uint ret;
+
+	for (bucket = ret = 0; bucket < CONFIG_HAP_POOL_BUCKETS; bucket++)
+		ret += HA_ATOMIC_LOAD(&pool->buckets[bucket].needed_avg);
+	return ret;
+}
+
+/* returns the total number of failed allocations for a pool across all buckets */
+static inline uint pool_failed(const struct pool_head *pool)
+{
+	int bucket;
+	uint ret;
+
+	for (bucket = ret = 0; bucket < CONFIG_HAP_POOL_BUCKETS; bucket++)
+		ret += HA_ATOMIC_LOAD(&pool->buckets[bucket].failed);
+	return ret;
+}
 
 /* Returns the max number of entries that may be brought back to the pool
  * before it's considered as full. Note that it is only usable for releasing
@@ -149,16 +195,18 @@ void pool_put_to_shared_cache(struct pool_head *pool, struct pool_item *item, ui
 static inline uint pool_releasable(const struct pool_head *pool)
 {
 	uint alloc, used;
+	uint needed_raw;
 
 	if (unlikely(pool_debugging & (POOL_DBG_NO_CACHE|POOL_DBG_NO_GLOBAL)))
 		return 0;
 
-	alloc = HA_ATOMIC_LOAD(&pool->allocated);
-	used = HA_ATOMIC_LOAD(&pool->used);
+	alloc = pool_allocated(pool);
+	used  = pool_used(pool);
 	if (used < alloc)
 		used = alloc;
 
-	if (alloc < swrate_avg(pool->needed_avg + pool->needed_avg / 4, POOL_AVG_SAMPLES))
+	needed_raw = pool_needed_avg(pool);
+	if (alloc < swrate_avg(needed_raw + needed_raw / 4, POOL_AVG_SAMPLES))
 		return used; // less than needed is allocated, can release everything
 
 	if ((uint)(alloc - used) < pool->minavail)

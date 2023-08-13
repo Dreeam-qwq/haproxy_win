@@ -118,7 +118,6 @@ struct acl {
 	struct list list;           /* chaining */
 	char *name;		    /* acl name */
 	struct list expr;	    /* list of acl_exprs */
-	int cache_idx;              /* ACL index in cache */
 	unsigned int use;           /* or'ed bit mask of all acl_expr's SMP_USE_* */
 	unsigned int val;           /* or'ed bit mask of all acl_expr's SMP_VAL_* */
 };
@@ -143,6 +142,12 @@ struct acl_cond {
 	unsigned int val;           /* or'ed bit mask of all suites's SMP_VAL_* */
 	const char *file;           /* config file where the condition is declared */
 	int line;                   /* line in the config file where the condition is declared */
+};
+
+struct acl_sample {
+	struct acl_cond cond;
+	struct acl_term_suite suite;
+	struct acl_term terms[];
 };
 
 #endif /* _HAPROXY_ACL_T_H */

@@ -209,7 +209,7 @@ static inline void free_quic_conn_cids(struct quic_conn *conn)
 {
 	struct eb64_node *node;
 
-	node = eb64_first(&conn->cids);
+	node = eb64_first(conn->cids);
 	while (node) {
 		struct quic_connection_id *conn_id;
 
@@ -223,6 +223,23 @@ static inline void free_quic_conn_cids(struct quic_conn *conn)
 		eb64_delete(&conn_id->seq_num);
 		pool_free(pool_head_quic_connection_id, conn_id);
 	}
+}
+
+/* Move all the connection IDs from <conn> QUIC connection to <cc_conn> */
+static inline void quic_conn_mv_cids_to_cc_conn(struct quic_cc_conn *cc_conn,
+                                                struct quic_conn *conn)
+{
+	struct eb64_node *node;
+
+	node = eb64_first(conn->cids);
+	while (node) {
+		struct quic_connection_id *conn_id;
+
+		conn_id = eb64_entry(node, struct quic_connection_id, seq_num);
+		conn_id->qc = (struct quic_conn *)cc_conn;
+		node = eb64_next(node);
+	}
+
 }
 
 /* Copy <src> new connection ID information to <dst> NEW_CONNECTION_ID frame.
@@ -455,17 +472,6 @@ static inline void quic_path_init(struct quic_path *path, int ipv4,
 	quic_cc_init(&path->cc, algo, qc);
 }
 
-/* Return the remaining <room> available on <path> QUIC path. In fact this this
- *the remaining number of bytes available in the congestion controller window.
- */
-static inline size_t quic_path_room(struct quic_path *path)
-{
-	if (path->in_flight > path->cwnd)
-		return 0;
-
-	return path->cwnd - path->in_flight;
-}
-
 /* Return the remaining <room> available on <path> QUIC path for prepared data
  * (before being sent). Almost the same that for the QUIC path room, except that
  * here this is the data which have been prepared which are taken into an account.
@@ -476,6 +482,16 @@ static inline size_t quic_path_prep_data(struct quic_path *path)
 		return 0;
 
 	return path->cwnd - path->prep_in_flight;
+}
+
+/* Return the number of bytes which may be sent from <qc> connection when
+ * it has not already been validated. Note that this is the responsability
+ * of the caller to check that the case with quic_peer_validated_addr().
+ * This latter BUG_ON() if 3 * qc->rx.bytes < qc->tx.prep_bytes.
+ */
+static inline size_t quic_may_send_bytes(struct quic_conn *qc)
+{
+	return 3 * qc->bytes.rx - qc->bytes.prep;
 }
 
 /* CRYPTO data buffer handling functions. */

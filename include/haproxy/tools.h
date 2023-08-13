@@ -1085,21 +1085,25 @@ static inline uint statistical_prng_range(uint range)
  * to compute statistic buckets, in that it's fast and reasonably distributed
  * thanks to mixing the bits via a multiplication by a prime number and using
  * the middle bits on 64-bit platforms or remixing the topmost with lowest ones
- * on 32-bit. It provides ~2588 unique values (~1510 non-colliding) at 100%
- * fill ratio for 12 bits, ~1296 (~756 non-colliding) at 100% fill ratio for 11
- * bits, ~648 (~378 non-colliding) at 100% fill ratio for 10 bits, ~163 (95 non
- * colliding) at 100% fill ratio for 8 bits, hence 1-1/e and 1/e respectively.
- * It must be inlined so that <bits> is always a compile-time constant.
+ * on 32-bit. The distribution is smooth enough for the hash to provide on
+ * average 1/e non-colliding entries per input, and use on average 1-1/e
+ * entries total. Thus for example hashing 1024 random valid pointers will
+ * result on average in ~647 distinct keys, 377 of which are unique. It was
+ * carefully selected to deliver optimal distribution for low bit counts so
+ * that hashing on 2,3,4 or 5 bits delivers good results.
  */
 static forceinline uint ptr_hash(const void *p, const int bits)
 {
 	unsigned long long x = (unsigned long)p;
 
-	x *= 0xc1da9653U;
+	if (!bits)
+		return 0;
+
+	x *= 0xacd1be85U;
 	if (sizeof(long) == 4)
 		x ^= x >> 32;
 	else
-		x >>= 33 - bits / 2;
+		x >>= 31 - (bits + 1) / 2;
 	return x & (~0U >> (-bits & 31));
 }
 
@@ -1111,8 +1115,11 @@ static forceinline uint ptr2_hash(const void *p1, const void *p2, const int bits
 	unsigned long long x = (unsigned long)p1;
 	unsigned long long y = (unsigned long)p2;
 
-	x *= 0xc1da9653U;
-	y *= 0x96531cadU;
+	if (!bits)
+		return 0;
+
+	x *= 0xacd1be85U;
+	y *= 0x9d28e4e9U;
 	x ^= y;
 	if (sizeof(long) == 4)
 		x ^= x >> 32;
