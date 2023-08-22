@@ -75,12 +75,8 @@
 		_r; /* return value */            \
 	})
 #else /* not PLOCK_DISABLE_EBO */
-# if defined(PLOCK_INLINE_EBO)
 __attribute__((unused,always_inline,no_instrument_function)) inline
-# else
-__attribute__((unused,noinline,no_instrument_function))
-# endif
-static unsigned long pl_wait_unlock_long(const unsigned long *lock, const unsigned long mask)
+static unsigned long __pl_wait_unlock_long(const unsigned long *lock, const unsigned long mask)
 {
 	unsigned long ret;
 	unsigned int m = 0;
@@ -113,6 +109,16 @@ static unsigned long pl_wait_unlock_long(const unsigned long *lock, const unsign
 
 	return ret;
 }
+
+# if defined(PLOCK_INLINE_EBO)
+__attribute__((unused,always_inline,no_instrument_function)) inline
+# else
+__attribute__((unused,noinline,no_instrument_function))
+# endif
+static unsigned long pl_wait_unlock_long(const unsigned long *lock, const unsigned long mask)
+{
+	return __pl_wait_unlock_long(lock, mask);
+}
 #endif /* PLOCK_DISABLE_EBO */
 
 /* This function waits for <lock> to release all bits covered by <mask>, and
@@ -138,8 +144,8 @@ static unsigned long pl_wait_unlock_long(const unsigned long *lock, const unsign
 		_r; /* return value */            \
 	})
 #else
-__attribute__((unused,noinline,no_instrument_function))
-static unsigned int pl_wait_unlock_int(const unsigned int *lock, const unsigned int mask)
+__attribute__((unused,always_inline,no_instrument_function)) inline
+static unsigned int __pl_wait_unlock_int(const unsigned int *lock, const unsigned int mask)
 {
 	unsigned int ret;
 	unsigned int m = 0;
@@ -171,6 +177,16 @@ static unsigned int pl_wait_unlock_int(const unsigned int *lock, const unsigned 
 	} while (1);
 
 	return ret;
+}
+
+# if defined(PLOCK_INLINE_EBO)
+__attribute__((unused,always_inline,no_instrument_function)) inline
+# else
+__attribute__((unused,noinline,no_instrument_function))
+# endif
+static unsigned int pl_wait_unlock_int(const unsigned int *lock, const unsigned int mask)
+{
+	return __pl_wait_unlock_int(lock, mask);
 }
 #endif /* PLOCK_DISABLE_EBO */
 
@@ -1302,14 +1318,22 @@ static inline void pl_lorw_rdlock(unsigned long *lock)
 	 * lock to be empty of visitors.
 	 */
 	if (lk & PLOCK_LORW_WRQ_MASK)
+#if defined(PLOCK_LORW_INLINE_WAIT) && !defined(PLOCK_DISABLE_EBO)
+		lk = __pl_wait_unlock_long(lock, PLOCK_LORW_WRQ_MASK);
+#else
 		lk = pl_wait_unlock_long(lock, PLOCK_LORW_WRQ_MASK);
+#endif
 
 	/* count us as visitor among others */
 	lk = pl_ldadd_acq(lock, PLOCK_LORW_SHR_BASE);
 
 	/* wait for end of exclusive access if any */
 	if (lk & PLOCK_LORW_EXC_MASK)
+#if defined(PLOCK_LORW_INLINE_WAIT) && !defined(PLOCK_DISABLE_EBO)
+		lk = __pl_wait_unlock_long(lock, PLOCK_LORW_EXC_MASK);
+#else
 		lk = pl_wait_unlock_long(lock, PLOCK_LORW_EXC_MASK);
+#endif
 }
 
 
@@ -1325,7 +1349,11 @@ static inline void pl_lorw_wrlock(unsigned long *lock)
 	 */
 	lk = pl_deref_long(lock);
 	if (__builtin_expect(lk & PLOCK_LORW_WRQ_MASK, 1))
+#if defined(PLOCK_LORW_INLINE_WAIT) && !defined(PLOCK_DISABLE_EBO)
+		lk = __pl_wait_unlock_long(lock, PLOCK_LORW_WRQ_MASK);
+#else
 		lk = pl_wait_unlock_long(lock, PLOCK_LORW_WRQ_MASK);
+#endif
 
 	do {
 		/* let's check for the two sources of contention at once */
@@ -1338,12 +1366,20 @@ static inline void pl_lorw_wrlock(unsigned long *lock)
 				/* note below, an OR is significantly cheaper than BTS or XADD */
 				if (!(lk & PLOCK_LORW_WRQ_MASK))
 					pl_or_noret(lock, PLOCK_LORW_WRQ_BASE);
+#if defined(PLOCK_LORW_INLINE_WAIT) && !defined(PLOCK_DISABLE_EBO)
+				lk = __pl_wait_unlock_long(lock, PLOCK_LORW_SHR_MASK);
+#else
 				lk = pl_wait_unlock_long(lock, PLOCK_LORW_SHR_MASK);
+#endif
 			}
 
 			/* And also wait for a previous writer to finish. */
 			if (lk & PLOCK_LORW_EXC_MASK)
+#if defined(PLOCK_LORW_INLINE_WAIT) && !defined(PLOCK_DISABLE_EBO)
+				lk = __pl_wait_unlock_long(lock, PLOCK_LORW_EXC_MASK);
+#else
 				lk = pl_wait_unlock_long(lock, PLOCK_LORW_EXC_MASK);
+#endif
 		}
 
 		/* A fresh new reader may appear right now if there were none
