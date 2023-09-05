@@ -60,6 +60,34 @@ void ha_cpuset_and(struct hap_cpuset *dst, struct hap_cpuset *src)
 #endif
 }
 
+void ha_cpuset_or(struct hap_cpuset *dst, struct hap_cpuset *src)
+{
+#if defined(CPUSET_USE_CPUSET)
+	CPU_OR(&dst->cpuset, &dst->cpuset, &src->cpuset);
+
+#elif defined(CPUSET_USE_FREEBSD_CPUSET)
+	CPU_OR(&dst->cpuset, &src->cpuset);
+
+#elif defined(CPUSET_USE_ULONG)
+	dst->cpuset |= src->cpuset;
+#endif
+}
+
+int ha_cpuset_isset(const struct hap_cpuset *set, int cpu)
+{
+	if (cpu >= ha_cpuset_size())
+		return 0;
+
+#if defined(CPUSET_USE_CPUSET) || defined(CPUSET_USE_FREEBSD_CPUSET)
+	return CPU_ISSET(cpu, &set->cpuset);
+
+#elif defined(CPUSET_USE_ULONG)
+	return !!(set->cpuset & (0x1 << cpu));
+#else
+	return 0;
+#endif
+}
+
 int ha_cpuset_count(const struct hap_cpuset *set)
 {
 #if defined(CPUSET_USE_CPUSET) || defined(CPUSET_USE_FREEBSD_CPUSET)
@@ -117,6 +145,30 @@ int ha_cpuset_size()
 	return LONGBITS;
 
 #endif
+}
+
+/* Detects CPUs that are bound to the current process. Returns the number of
+ * CPUs detected or 0 if the detection failed.
+ */
+int ha_cpuset_detect_bound(struct hap_cpuset *set)
+{
+	ha_cpuset_zero(set);
+
+	/* detect bound CPUs depending on the OS's API */
+	if (0
+#if defined(__linux__)
+	    || sched_getaffinity(0, sizeof(set->cpuset), &set->cpuset) != 0
+#elif defined(__FreeBSD__)
+	    || cpuset_getaffinity(CPU_LEVEL_CPUSET, CPU_WHICH_PID, -1, sizeof(set->cpuset), &set->cpuset) != 0
+#else
+	    || 1 // unhandled platform
+#endif
+	    ) {
+		/* detection failed */
+		return 0;
+	}
+
+	return ha_cpuset_count(set);
 }
 
 /* Returns true if at least one cpu-map directive was configured, otherwise

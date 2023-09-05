@@ -104,6 +104,7 @@ struct pat_ref {
 	char *reference; /* The reference name. */
 	char *display; /* String displayed to identify the pattern origin. */
 	struct list head; /* The head of the list of struct pat_ref_elt. */
+	struct eb_root ebpt_root; /* The tree where pattern reference elements are attached. */
 	struct list pat; /* The head of the list of struct pattern_expr. */
 	unsigned int flags; /* flags PAT_REF_*. */
 	unsigned int curr_gen; /* current generation number (anything below can be removed) */
@@ -111,7 +112,8 @@ struct pat_ref {
 	int unique_id; /* Each pattern reference have unique id. */
 	unsigned long long revision; /* updated for each update */
 	unsigned long long entry_cnt; /* the total number of entries */
-	__decl_thread(HA_SPINLOCK_T lock); /* Lock used to protect pat ref elements */
+	THREAD_ALIGN(64);
+	__decl_thread(HA_RWLOCK_T lock); /* Lock used to protect pat ref elements */
 };
 
 /* This is a part of struct pat_ref. Each entry contains one pattern and one
@@ -120,6 +122,7 @@ struct pat_ref {
  */
 struct pat_ref_elt {
 	struct list list; /* Used to chain elements. */
+	struct ebpt_node node; /* Node to attach this element to its <pat_ref> ebtree. */
 	struct list back_refs; /* list of users tracking this pat ref */
 	void *list_head; /* all &pattern_list->from_ref derived from this reference, ends with NULL */
 	void *tree_head; /* all &pattern_tree->from_ref derived from this reference, ends with NULL */
@@ -136,6 +139,7 @@ struct pattern_tree {
 	void *from_ref;    // pattern_tree linked from pat_ref_elt, ends with NULL
 	struct sample_data *data;
 	struct pat_ref_elt *ref;
+	struct pattern_expr *expr;
 	struct ebmb_node node;
 };
 
@@ -181,6 +185,7 @@ struct pattern_list {
 	void *from_ref;    // pattern_tree linked from pat_ref_elt, ends with NULL
 	struct list list;
 	struct pattern pat;
+	struct pattern_expr *expr;
 };
 
 /* Description of a pattern expression.

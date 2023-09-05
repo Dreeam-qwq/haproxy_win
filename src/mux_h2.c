@@ -684,7 +684,7 @@ h2c_is_dead(const struct h2c *h2c)
 	    ((h2c->flags & H2_CF_ERROR) ||          /* errors close immediately */
 	     (h2c->flags & H2_CF_ERR_PENDING && h2c->st0 < H2_CS_FRAME_H) || /* early error during connect */
 	     (h2c->st0 >= H2_CS_ERROR && !h2c->task) || /* a timeout stroke earlier */
-	     (!(h2c->conn->owner)) || /* Nobody's left to take care of the connection, drop it now */
+	     (!(h2c->conn->owner) && !conn_is_reverse(h2c->conn)) || /* Nobody's left to take care of the connection, drop it now */
 	     (!br_data(h2c->mbuf) &&  /* mux buffer empty, also process clean events below */
 	      ((h2c->flags & H2_CF_RCVD_SHUT) ||
 	       (h2c->last_sid >= 0 && h2c->max_id >= h2c->last_sid)))))
@@ -741,7 +741,8 @@ static inline void h2c_restart_reading(const struct h2c *h2c, int consider_buffe
 /* returns true if the front connection has too many stream connectors attached */
 static inline int h2_frt_has_too_many_sc(const struct h2c *h2c)
 {
-	return h2c->nb_sc > h2c_max_concurrent_streams(h2c);
+	return h2c->nb_sc > h2c_max_concurrent_streams(h2c) ||
+	       unlikely(conn_reverse_in_preconnect(h2c->conn));
 }
 
 /* Tries to grab a buffer and to re-enable processing on mux <target>. The h2c
@@ -1059,7 +1060,7 @@ static int h2_init(struct connection *conn, struct proxy *prx, struct session *s
 	if (t)
 		task_queue(t);
 
-	if (h2c->flags & H2_CF_IS_BACK) {
+	if (h2c->flags & H2_CF_IS_BACK && likely(!conn_is_reverse(h2c->conn))) {
 		/* FIXME: this is temporary, for outgoing connections we need
 		 * to immediately allocate a stream until the code is modified
 		 * so that the caller calls ->attach(). For now the outgoing sc
@@ -1072,7 +1073,8 @@ static int h2_init(struct connection *conn, struct proxy *prx, struct session *s
 			goto fail_stream;
 	}
 
-	proxy_inc_fe_cum_sess_ver_ctr(sess->listener, prx, 2);
+	if (sess)
+		proxy_inc_fe_cum_sess_ver_ctr(sess->listener, prx, 2);
 	HA_ATOMIC_INC(&h2c->px_counters->open_conns);
 	HA_ATOMIC_INC(&h2c->px_counters->total_conns);
 
@@ -1572,6 +1574,9 @@ static struct h2s *h2c_frt_stream_new(struct h2c *h2c, int id, struct buffer *in
 
 	TRACE_ENTER(H2_EV_H2S_NEW, h2c->conn);
 
+	/* Cannot handle stream if active reversed connection is not yet accepted. */
+	BUG_ON(conn_reverse_in_preconnect(h2c->conn));
+
 	if (h2c->nb_streams >= h2c_max_concurrent_streams(h2c)) {
 		TRACE_ERROR("HEADERS frame causing MAX_CONCURRENT_STREAMS to be exceeded", H2_EV_H2S_NEW|H2_EV_RX_FRAME|H2_EV_RX_HDR, h2c->conn);
 		goto out;
@@ -1646,6 +1651,9 @@ static struct h2s *h2c_bck_stream_new(struct h2c *h2c, struct stconn *sc, struct
 	struct h2s *h2s = NULL;
 
 	TRACE_ENTER(H2_EV_H2S_NEW, h2c->conn);
+
+	/* Cannot handle stream if connection waiting to be reversed. */
+	BUG_ON(conn_reverse_in_preconnect(h2c->conn));
 
 	if (h2c->nb_streams >= h2c->streams_limit) {
 		TRACE_ERROR("Aborting stream since negotiated limit is too low", H2_EV_H2S_NEW, h2c->conn);
@@ -3215,6 +3223,108 @@ static int h2_frame_check_vs_state(struct h2c *h2c, struct h2s *h2s)
 	return 1;
 }
 
+/* Reverse the connection <h2c>. Common operations are done for both active and
+ * passive reversal. Timeouts are inverted and H2_CF_IS_BACK is set or unset
+ * depending on the reversal direction.
+ *
+ * For active reversal, only minor steps are required. The connection should
+ * then be accepted by its listener before being able to use it for transfers.
+ *
+ * For passive reversal, connection is inserted in its targetted server idle
+ * pool. It can thus be reused immediately for future transfers on this server.
+ *
+ * Returns 1 on success else 0.
+ */
+static int h2_conn_reverse(struct h2c *h2c)
+{
+	struct connection *conn = h2c->conn;
+
+	TRACE_ENTER(H2_EV_H2C_WAKE, h2c->conn);
+
+	if (conn_reverse(conn)) {
+		TRACE_ERROR("reverse connection failed", H2_EV_H2C_WAKE, conn);
+		goto err;
+	}
+
+	TRACE_USER("reverse connection", H2_EV_H2C_WAKE, conn);
+
+	/* Check the connection new side after reversal. */
+	if (conn_is_back(conn)) {
+		struct server *srv = __objt_server(h2c->conn->target);
+		struct proxy *prx = srv->proxy;
+
+		h2c->flags |= H2_CF_IS_BACK;
+
+		h2c->shut_timeout = h2c->timeout = prx->timeout.server;
+		if (tick_isset(prx->timeout.serverfin))
+			h2c->shut_timeout = prx->timeout.serverfin;
+
+		h2c->px_counters = EXTRA_COUNTERS_GET(prx->extra_counters_be,
+		                                      &h2_stats_module);
+
+		HA_ATOMIC_OR(&h2c->wait_event.tasklet->state, TASK_F_USR1);
+		xprt_set_idle(conn, conn->xprt, conn->xprt_ctx);
+		srv_add_to_idle_list(srv, conn, 1);
+	}
+	else {
+		struct listener *l = __objt_listener(h2c->conn->target);
+		struct proxy *prx = l->bind_conf->frontend;
+
+		h2c->flags &= ~H2_CF_IS_BACK;
+
+		h2c->shut_timeout = h2c->timeout = prx->timeout.client;
+		if (tick_isset(prx->timeout.clientfin))
+			h2c->shut_timeout = prx->timeout.clientfin;
+
+		h2c->px_counters = EXTRA_COUNTERS_GET(prx->extra_counters_fe,
+		                                      &h2_stats_module);
+
+		proxy_inc_fe_cum_sess_ver_ctr(l, prx, 2);
+
+		BUG_ON(LIST_INLIST(&h2c->conn->stopping_list));
+		LIST_APPEND(&mux_stopping_data[tid].list,
+		            &h2c->conn->stopping_list);
+	}
+
+	/* Check if stream creation is initially forbidden. This is the case
+	 * for active preconnect until reversal is done.
+	 */
+	if (conn_reverse_in_preconnect(h2c->conn)) {
+		TRACE_DEVEL("prevent stream demux until accept is done", H2_EV_H2C_WAKE, conn);
+		h2c->flags |= H2_CF_DEM_TOOMANY;
+	}
+
+	/* If only the new side has a defined timeout, task must be allocated.
+	 * On the contrary, if only old side has a timeout, it must be freed.
+	 */
+	if (!h2c->task && tick_isset(h2c->timeout)) {
+		h2c->task = task_new_here();
+		if (!h2c->task)
+			goto err;
+
+		h2c->task->process = h2_timeout_task;
+		h2c->task->context = h2c;
+	}
+	else if (!tick_isset(h2c->timeout)) {
+		task_destroy(h2c->task);
+		h2c->task = NULL;
+	}
+
+	/* Requeue task if instantiated with the new timeout value. */
+	if (h2c->task) {
+		h2c->task->expire = tick_add(now_ms, h2c->timeout);
+		task_queue(h2c->task);
+	}
+
+	TRACE_LEAVE(H2_EV_H2C_WAKE, h2c->conn);
+	return 1;
+
+ err:
+	h2c_error(h2c, H2_ERR_INTERNAL_ERROR);
+	TRACE_DEVEL("leaving on error", H2_EV_H2C_WAKE);
+	return 0;
+}
+
 /* process Rx frames to be demultiplexed */
 static void h2_process_demux(struct h2c *h2c)
 {
@@ -3457,6 +3567,11 @@ static void h2_process_demux(struct h2c *h2c)
 			if (h2c->st0 == H2_CS_FRAME_A) {
 				TRACE_PROTO("sending H2 SETTINGS ACK frame", H2_EV_TX_FRAME|H2_EV_RX_SETTINGS, h2c->conn, h2s);
 				ret = h2c_ack_settings(h2c);
+
+				if (ret > 0 && conn_is_reverse(h2c->conn)) {
+					/* Initiate connection reversal after SETTINGS reception. */
+					ret = h2_conn_reverse(h2c);
+				}
 			}
 			break;
 
@@ -3979,7 +4094,7 @@ struct task *h2_io_cb(struct task *t, void *ctx, unsigned int state)
 		 */
 		conn_in_list = conn_get_idle_flag(conn);
 		if (conn_in_list)
-			conn_delete_from_tree(&conn->hash_node->node);
+			conn_delete_from_tree(conn);
 
 		HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
 	} else {
@@ -4008,10 +4123,7 @@ struct task *h2_io_cb(struct task *t, void *ctx, unsigned int state)
 		struct server *srv = objt_server(conn->target);
 
 		HA_SPIN_LOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
-		if (conn_in_list == CO_FL_SAFE_LIST)
-			eb64_insert(&srv->per_thr[tid].safe_conns, &conn->hash_node->node);
-		else
-			eb64_insert(&srv->per_thr[tid].idle_conns, &conn->hash_node->node);
+		_srv_add_idle(srv, conn, conn_in_list == CO_FL_SAFE_LIST);
 		HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
 	}
 
@@ -4108,7 +4220,7 @@ static int h2_process(struct h2c *h2c)
 		/* connections in error must be removed from the idle lists */
 		if (conn->flags & CO_FL_LIST_MASK) {
 			HA_SPIN_LOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
-			conn_delete_from_tree(&conn->hash_node->node);
+			conn_delete_from_tree(conn);
 			HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
 		}
 	}
@@ -4116,7 +4228,7 @@ static int h2_process(struct h2c *h2c)
 		/* connections in error must be removed from the idle lists */
 		if (conn->flags & CO_FL_LIST_MASK) {
 			HA_SPIN_LOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
-			conn_delete_from_tree(&conn->hash_node->node);
+			conn_delete_from_tree(conn);
 			HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
 		}
 	}
@@ -4145,8 +4257,20 @@ static int h2_wake(struct connection *conn)
 
 	TRACE_ENTER(H2_EV_H2C_WAKE, conn);
 	ret = h2_process(h2c);
-	if (ret >= 0)
+	if (ret >= 0) {
 		h2_wake_some_streams(h2c, 0);
+
+		/* For active reverse connection, an explicit check is required if an
+		 * error is pending to propagate the error as demux process is blocked
+		 * until reversal. This allows to quickly close the connection and
+		 * prepare a new one.
+		 */
+		if (unlikely(conn_reverse_in_preconnect(conn)) && h2c_is_dead(h2c)) {
+			TRACE_DEVEL("leaving and killing dead connection", H2_EV_STRM_END, h2c->conn);
+			h2_release(h2c);
+		}
+	}
+
 	TRACE_LEAVE(H2_EV_H2C_WAKE);
 	return ret;
 }
@@ -4197,7 +4321,7 @@ struct task *h2_timeout_task(struct task *t, void *context, unsigned int state)
 		 * to steal it from us.
 		 */
 		if (h2c->conn->flags & CO_FL_LIST_MASK)
-			conn_delete_from_tree(&h2c->conn->hash_node->node);
+			conn_delete_from_tree(h2c->conn);
 
 		HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
 	}
@@ -4249,7 +4373,7 @@ do_leave:
 	/* in any case this connection must not be considered idle anymore */
 	if (h2c->conn->flags & CO_FL_LIST_MASK) {
 		HA_SPIN_LOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
-		conn_delete_from_tree(&h2c->conn->hash_node->node);
+		conn_delete_from_tree(h2c->conn);
 		HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
 	}
 
@@ -4328,6 +4452,15 @@ static int h2_ctl(struct connection *conn, enum mux_ctl_type mux_ctl, void *outp
 		return ret;
 	case MUX_EXIT_STATUS:
 		return MUX_ES_UNKNOWN;
+
+	case MUX_REVERSE_CONN:
+		BUG_ON(h2c->flags & H2_CF_IS_BACK);
+
+		TRACE_DEVEL("connection reverse done, restart demux", H2_EV_H2C_WAKE, h2c->conn);
+		h2c->flags &= ~H2_CF_DEM_TOOMANY;
+		tasklet_wakeup(h2c->wait_event.tasklet);
+		return 0;
+
 	default:
 		return -1;
 	}

@@ -14,6 +14,8 @@
 #include <stdio.h>
 #include <errno.h>
 
+#include <import/ebistree.h>
+#include <import/ebpttree.h>
 #include <import/ebsttree.h>
 #include <import/lru.h>
 
@@ -491,7 +493,7 @@ struct pattern *pat_match_str(struct sample *smp, struct pattern_expr *expr, int
 	}
 
 	/* look in the list */
-	if (pat_lru_tree) {
+	if (pat_lru_tree && !LIST_ISEMPTY(&expr->patterns)) {
 		unsigned long long seed = pat_lru_seed ^ (long)expr;
 
 		lru = lru64_get(XXH3(smp->data.u.str.area, smp->data.u.str.data, seed),
@@ -534,7 +536,7 @@ struct pattern *pat_match_bin(struct sample *smp, struct pattern_expr *expr, int
 	struct pattern *ret = NULL;
 	struct lru64 *lru = NULL;
 
-	if (pat_lru_tree) {
+	if (pat_lru_tree && !LIST_ISEMPTY(&expr->patterns)) {
 		unsigned long long seed = pat_lru_seed ^ (long)expr;
 
 		lru = lru64_get(XXH3(smp->data.u.str.area, smp->data.u.str.data, seed),
@@ -603,7 +605,7 @@ struct pattern *pat_match_reg(struct sample *smp, struct pattern_expr *expr, int
 	struct pattern *ret = NULL;
 	struct lru64 *lru = NULL;
 
-	if (pat_lru_tree) {
+	if (pat_lru_tree && !LIST_ISEMPTY(&expr->patterns)) {
 		unsigned long long seed = pat_lru_seed ^ (long)expr;
 
 		lru = lru64_get(XXH3(smp->data.u.str.area, smp->data.u.str.data, seed),
@@ -686,7 +688,7 @@ struct pattern *pat_match_beg(struct sample *smp, struct pattern_expr *expr, int
 	}
 
 	/* look in the list */
-	if (pat_lru_tree) {
+	if (pat_lru_tree && !LIST_ISEMPTY(&expr->patterns)) {
 		unsigned long long seed = pat_lru_seed ^ (long)expr;
 
 		lru = lru64_get(XXH3(smp->data.u.str.area, smp->data.u.str.data, seed),
@@ -730,7 +732,7 @@ struct pattern *pat_match_end(struct sample *smp, struct pattern_expr *expr, int
 	struct pattern *ret = NULL;
 	struct lru64 *lru = NULL;
 
-	if (pat_lru_tree) {
+	if (pat_lru_tree && !LIST_ISEMPTY(&expr->patterns)) {
 		unsigned long long seed = pat_lru_seed ^ (long)expr;
 
 		lru = lru64_get(XXH3(smp->data.u.str.area, smp->data.u.str.data, seed),
@@ -778,7 +780,7 @@ struct pattern *pat_match_sub(struct sample *smp, struct pattern_expr *expr, int
 	struct pattern *ret = NULL;
 	struct lru64 *lru = NULL;
 
-	if (pat_lru_tree) {
+	if (pat_lru_tree && !LIST_ISEMPTY(&expr->patterns)) {
 		unsigned long long seed = pat_lru_seed ^ (long)expr;
 
 		lru = lru64_get(XXH3(smp->data.u.str.area, smp->data.u.str.data, seed),
@@ -1202,6 +1204,7 @@ int pat_idx_list_val(struct pattern_expr *expr, struct pattern *pat, char **err)
 
 	/* chain pattern in the expression */
 	LIST_APPEND(&expr->patterns, &patl->list);
+	patl->expr = expr;
 	/* and from the reference */
 	patl->from_ref = pat->ref->list_head;
 	pat->ref->list_head = &patl->from_ref;
@@ -1235,6 +1238,7 @@ int pat_idx_list_ptr(struct pattern_expr *expr, struct pattern *pat, char **err)
 
 	/* chain pattern in the expression */
 	LIST_APPEND(&expr->patterns, &patl->list);
+	patl->expr = expr;
 	/* and from the reference */
 	patl->from_ref = pat->ref->list_head;
 	pat->ref->list_head = &patl->from_ref;
@@ -1269,6 +1273,7 @@ int pat_idx_list_str(struct pattern_expr *expr, struct pattern *pat, char **err)
 
 	/* chain pattern in the expression */
 	LIST_APPEND(&expr->patterns, &patl->list);
+	patl->expr = expr;
 	/* and from the reference */
 	patl->from_ref = pat->ref->list_head;
 	pat->ref->list_head = &patl->from_ref;
@@ -1303,6 +1308,7 @@ int pat_idx_list_reg_cap(struct pattern_expr *expr, struct pattern *pat, int cap
 
 	/* chain pattern in the expression */
 	LIST_APPEND(&expr->patterns, &patl->list);
+	patl->expr = expr;
 	/* and from the reference */
 	patl->from_ref = pat->ref->list_head;
 	pat->ref->list_head = &patl->from_ref;
@@ -1356,6 +1362,8 @@ int pat_idx_tree_ip(struct pattern_expr *expr, struct pattern *pat, char **err)
 
 			/* Insert the entry. */
 			ebmb_insert_prefix(&expr->pattern_tree, &node->node, 4);
+
+			node->expr = expr;
 			node->from_ref = pat->ref->tree_head;
 			pat->ref->tree_head = &node->from_ref;
 			expr->ref->revision = rdtsc();
@@ -1387,6 +1395,8 @@ int pat_idx_tree_ip(struct pattern_expr *expr, struct pattern *pat, char **err)
 
 		/* Insert the entry. */
 		ebmb_insert_prefix(&expr->pattern_tree_2, &node->node, 16);
+
+		node->expr = expr;
 		node->from_ref = pat->ref->tree_head;
 		pat->ref->tree_head = &node->from_ref;
 		expr->ref->revision = rdtsc();
@@ -1434,6 +1444,8 @@ int pat_idx_tree_str(struct pattern_expr *expr, struct pattern *pat, char **err)
 
 	/* index the new node */
 	ebst_insert(&expr->pattern_tree, &node->node);
+
+	node->expr = expr;
 	node->from_ref = pat->ref->tree_head;
 	pat->ref->tree_head = &node->from_ref;
 	expr->ref->revision = rdtsc();
@@ -1479,6 +1491,8 @@ int pat_idx_tree_pfx(struct pattern_expr *expr, struct pattern *pat, char **err)
 
 	/* index the new node */
 	ebmb_insert_prefix(&expr->pattern_tree, &node->node, len);
+
+	node->expr = expr;
 	node->from_ref = pat->ref->tree_head;
 	pat->ref->tree_head = &node->from_ref;
 	expr->ref->revision = rdtsc();
@@ -1624,6 +1638,7 @@ void pat_ref_delete_by_ptr(struct pat_ref *ref, struct pat_ref_elt *elt)
 		HA_RWLOCK_WRUNLOCK(PATEXP_LOCK, &expr->lock);
 
 	LIST_DELETE(&elt->list);
+	ebpt_delete(&elt->node);
 	free(elt->sample);
 	free(elt->pattern);
 	free(elt);
@@ -1635,16 +1650,11 @@ void pat_ref_delete_by_ptr(struct pat_ref *ref, struct pat_ref_elt *elt)
  */
 int pat_ref_delete_by_id(struct pat_ref *ref, struct pat_ref_elt *refelt)
 {
-	struct pat_ref_elt *elt, *safe;
+	int ret = !!refelt->node.node.leaf_p;
 
-	/* delete pattern from reference */
-	list_for_each_entry_safe(elt, safe, &ref->head, list) {
-		if (elt == refelt) {
-			pat_ref_delete_by_ptr(ref, elt);
-			return 1;
-		}
-	}
-	return 0;
+	ebpt_delete(&refelt->node);
+
+	return ret;
 }
 
 /* This function removes all patterns matching <key> from the reference
@@ -1653,15 +1663,18 @@ int pat_ref_delete_by_id(struct pat_ref *ref, struct pat_ref_elt *refelt)
  */
 int pat_ref_delete(struct pat_ref *ref, const char *key)
 {
-	struct pat_ref_elt *elt, *safe;
+	struct ebpt_node *node;
 	int found = 0;
 
 	/* delete pattern from reference */
-	list_for_each_entry_safe(elt, safe, &ref->head, list) {
-		if (strcmp(key, elt->pattern) == 0) {
-			pat_ref_delete_by_ptr(ref, elt);
-			found = 1;
-		}
+	node = ebis_lookup(&ref->ebpt_root, key);
+	while (node) {
+		struct pat_ref_elt *elt;
+
+		elt = ebpt_entry(node, struct pat_ref_elt, node);
+		node = ebpt_next_dup(node);
+		pat_ref_delete_by_ptr(ref, elt);
+		found = 1;
 	}
 
 	return found;
@@ -1673,12 +1686,11 @@ int pat_ref_delete(struct pat_ref *ref, const char *key)
  */
 struct pat_ref_elt *pat_ref_find_elt(struct pat_ref *ref, const char *key)
 {
-	struct pat_ref_elt *elt;
+	struct ebpt_node *node;
 
-	list_for_each_entry(elt, &ref->head, list) {
-		if (strcmp(key, elt->pattern) == 0)
-			return elt;
-	}
+	node = ebis_lookup(&ref->ebpt_root, key);
+	if (node)
+		return ebpt_entry(node, struct pat_ref_elt, node);
 
 	return NULL;
 }
@@ -1695,6 +1707,10 @@ static inline int pat_ref_set_elt(struct pat_ref *ref, struct pat_ref_elt *elt,
 	struct sample_data **data;
 	char *sample;
 	struct sample_data test;
+	struct pattern_tree *tree;
+	struct pattern_list *pat;
+	void **node;
+
 
 	/* Try all needed converters. */
 	list_for_each_entry(expr, &ref->pat, list) {
@@ -1716,15 +1732,38 @@ static inline int pat_ref_set_elt(struct pat_ref *ref, struct pat_ref_elt *elt,
 	/* Load sample in each reference. All the conversions are tested
 	 * below, normally these calls don't fail.
 	 */
-	list_for_each_entry(expr, &ref->pat, list) {
+	for (node = elt->tree_head; node;) {
+		tree = container_of(node, struct pattern_tree, from_ref);
+		node = *node;
+		BUG_ON(tree->ref != elt);
+		expr = tree->expr;
 		if (!expr->pat_head->parse_smp)
 			continue;
 
-		HA_RWLOCK_WRLOCK(PATEXP_LOCK, &expr->lock);
-		data = pattern_find_smp(expr, elt);
-		if (data && *data && !expr->pat_head->parse_smp(sample, *data))
-			*data = NULL;
-		HA_RWLOCK_WRUNLOCK(PATEXP_LOCK, &expr->lock);
+		data = &tree->data;
+		if (data && *data) {
+			HA_RWLOCK_WRLOCK(PATEXP_LOCK, &expr->lock);
+			if (!expr->pat_head->parse_smp(sample, *data))
+				*data = NULL;
+			HA_RWLOCK_WRUNLOCK(PATEXP_LOCK, &expr->lock);
+		}
+	}
+
+	for (node = elt->list_head; node;) {
+		pat = container_of(node, struct pattern_list, from_ref);
+		node = *node;
+		BUG_ON(pat->pat.ref != elt);
+		expr = pat->expr;
+		if (!expr->pat_head->parse_smp)
+			continue;
+
+		data = &pat->pat.data;
+		if (data && *data) {
+			HA_RWLOCK_WRLOCK(PATEXP_LOCK, &expr->lock);
+			if (!expr->pat_head->parse_smp(sample, *data))
+				*data = NULL;
+			HA_RWLOCK_WRUNLOCK(PATEXP_LOCK, &expr->lock);
+		}
 	}
 
 	/* free old sample only when all exprs are updated */
@@ -1741,15 +1780,10 @@ static inline int pat_ref_set_elt(struct pat_ref *ref, struct pat_ref_elt *elt,
  */
 int pat_ref_set_by_id(struct pat_ref *ref, struct pat_ref_elt *refelt, const char *value, char **err)
 {
-	struct pat_ref_elt *elt;
-
-	/* Look for pattern in the reference. */
-	list_for_each_entry(elt, &ref->head, list) {
-		if (elt == refelt) {
-			if (!pat_ref_set_elt(ref, elt, value, err))
-				return 0;
-			return 1;
-		}
+	if (refelt->node.node.leaf_p) {
+		if (!pat_ref_set_elt(ref, refelt, value, err))
+			return 0;
+		return 1;
 	}
 
 	memprintf(err, "key or pattern not found");
@@ -1759,12 +1793,12 @@ int pat_ref_set_by_id(struct pat_ref *ref, struct pat_ref_elt *refelt, const cha
 /* This function modifies to <value> the sample of all patterns matching <key>
  * under <ref>.
  */
-int pat_ref_set(struct pat_ref *ref, const char *key, const char *value, char **err)
+int pat_ref_set(struct pat_ref *ref, const char *key, const char *value, char **err, struct pat_ref_elt *elt)
 {
-	struct pat_ref_elt *elt;
 	int found = 0;
 	char *_merr;
 	char **merr;
+	struct ebpt_node *node;
 
 	if (err) {
 		merr = &_merr;
@@ -1773,21 +1807,28 @@ int pat_ref_set(struct pat_ref *ref, const char *key, const char *value, char **
 	else
 		merr = NULL;
 
-	/* Look for pattern in the reference. */
-	list_for_each_entry(elt, &ref->head, list) {
-		if (strcmp(key, elt->pattern) == 0) {
-			if (!pat_ref_set_elt(ref, elt, value, merr)) {
-				if (err && merr) {
-					if (!found) {
-						*err = *merr;
-					} else {
-						memprintf(err, "%s, %s", *err, *merr);
-						ha_free(merr);
-					}
+	if (elt) {
+		node = &elt->node;
+	}
+	else {
+		/* Look for pattern in the reference. */
+		node = ebis_lookup(&ref->ebpt_root, key);
+	}
+
+	while (node) {
+		elt = ebpt_entry(node, struct pat_ref_elt, node);
+		node = ebpt_next_dup(node);
+		if (!pat_ref_set_elt(ref, elt, value, merr)) {
+			if (err && merr) {
+				if (!found) {
+					*err = *merr;
+				} else {
+					memprintf(err, "%s, %s", *err, *merr);
+					ha_free(merr);
 				}
 			}
-			found = 1;
 		}
+		found = 1;
 	}
 
 	if (!found) {
@@ -1832,8 +1873,9 @@ struct pat_ref *pat_ref_new(const char *reference, const char *display, unsigned
 	ref->entry_cnt = 0;
 
 	LIST_INIT(&ref->head);
+	ref->ebpt_root = EB_ROOT;
 	LIST_INIT(&ref->pat);
-	HA_SPIN_INIT(&ref->lock);
+	HA_RWLOCK_INIT(&ref->lock);
 	LIST_APPEND(&pattern_reference, &ref->list);
 
 	return ref;
@@ -1868,8 +1910,9 @@ struct pat_ref *pat_ref_newid(int unique_id, const char *display, unsigned int f
 	ref->next_gen = 0;
 	ref->unique_id = unique_id;
 	LIST_INIT(&ref->head);
+	ref->ebpt_root = EB_ROOT;
 	LIST_INIT(&ref->pat);
-	HA_SPIN_INIT(&ref->lock);
+	HA_RWLOCK_INIT(&ref->lock);
 	LIST_APPEND(&pattern_reference, &ref->list);
 
 	return ref;
@@ -1905,6 +1948,10 @@ struct pat_ref_elt *pat_ref_append(struct pat_ref *ref, const char *pattern, con
 	elt->list_head = NULL;
 	elt->tree_head = NULL;
 	LIST_APPEND(&ref->head, &elt->list);
+	/* Even if calloc()'ed, ensure this node is not linked to a tree. */
+	elt->node.node.leaf_p = NULL;
+	elt->node.key = elt->pattern;
+	ebis_insert(&ref->ebpt_root, &elt->node);
 	return elt;
  fail:
 	if (elt)
@@ -2075,6 +2122,7 @@ int pat_ref_purge_range(struct pat_ref *ref, uint from, uint to, int budget)
 		pat_delete_gen(ref, elt);
 
 		LIST_DELETE(&elt->list);
+		ebpt_delete(&elt->node);
 		free(elt->pattern);
 		free(elt->sample);
 		free(elt);
@@ -2374,6 +2422,7 @@ int pattern_read_from_file(struct pattern_head *head, unsigned int refflags,
 {
 	struct pat_ref *ref;
 	struct pattern_expr *expr;
+	struct ebpt_node *node;
 	struct pat_ref_elt *elt;
 	int reuse = 0;
 
@@ -2464,7 +2513,10 @@ int pattern_read_from_file(struct pattern_head *head, unsigned int refflags,
 		return 1;
 
 	/* Load reference content in the pattern expression. */
-	list_for_each_entry(elt, &ref->head, list) {
+	node = ebpt_first(&ref->ebpt_root);
+	while (node) {
+		elt = ebpt_entry(node, struct pat_ref_elt, node);
+		node = ebpt_next(node);
 		if (!pat_ref_push(elt, expr, patflags, err)) {
 			if (elt->line > 0)
 				memprintf(err, "%s at line %d of file '%s'",
@@ -2565,39 +2617,6 @@ void pattern_prune(struct pattern_head *head)
 		}
 		free(list);
 	}
-}
-
-/* This function searches occurrences of pattern reference element <ref> in
- * expression <expr> and returns a pointer to a pointer of the sample storage.
- * If <ref> is not found, NULL is returned.
- */
-struct sample_data **pattern_find_smp(struct pattern_expr *expr, struct pat_ref_elt *ref)
-{
-	struct ebmb_node *node;
-	struct pattern_tree *elt;
-	struct pattern_list *pat;
-
-	for (node = ebmb_first(&expr->pattern_tree);
-	     node;
-	     node = ebmb_next(node)) {
-		elt = container_of(node, struct pattern_tree, node);
-		if (elt->ref == ref)
-			return &elt->data;
-	}
-
-	for (node = ebmb_first(&expr->pattern_tree_2);
-	     node;
-	     node = ebmb_next(node)) {
-		elt = container_of(node, struct pattern_tree, node);
-		if (elt->ref == ref)
-			return &elt->data;
-	}
-
-	list_for_each_entry(pat, &expr->patterns, list)
-		if (pat->pat.ref == ref)
-			return &pat->pat.data;
-
-	return NULL;
 }
 
 /* This function compares two pat_ref** on their unique_id, and returns -1/0/1

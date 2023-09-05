@@ -173,6 +173,10 @@ int str2listener(char *str, struct proxy *curproxy, struct bind_conf *bind_conf,
 		else
 			bind_conf->options |= BC_O_USE_XPRT_STREAM;
 
+		if (ss2->ss_family == AF_CUST_REV_SRV) {
+			bind_conf->reverse_srvname = strdup(str + strlen("rev@"));
+		}
+
 		if (!create_listeners(bind_conf, ss2, port, end, fd, proto, err)) {
 			memprintf(err, "%s for address '%s'.\n", *err, str);
 			goto fail;
@@ -4014,6 +4018,14 @@ out_uri_auth_compat:
 
 			if ((curproxy->mode != PR_MODE_HTTP) && (curproxy->options & PR_O_REUSE_MASK) != PR_O_REUSE_NEVR)
 				curproxy->options &= ~PR_O_REUSE_MASK;
+
+			if ((curproxy->mode != PR_MODE_HTTP) && newsrv->flags & SRV_F_REVERSE) {
+				ha_alert("%s '%s' : server %s uses reverse addressing which can only be used with HTTP mode.\n",
+					   proxy_type_str(curproxy), curproxy->id, newsrv->id);
+				cfgerr++;
+				err_code |= ERR_FATAL | ERR_ALERT;
+				goto out;
+			}
 
 			newsrv = newsrv->next;
 		}

@@ -389,7 +389,7 @@ Core class
   This is limited to "proc." scoped variables.
 
   :param string var: The variable name in "proc." scope according with the
-  HAProxy variable syntax.
+   HAProxy variable syntax.
 
 .. js:function:: core.now()
 
@@ -490,11 +490,11 @@ Core class
   used in HAProxy with the prefix "lua.". An action gets a TXN object class as
   input.
 
-  :param string name: is the name of the converter.
-  :param table actions: is a table of string describing the HAProxy actions who
-   want to register to. The expected actions are 'tcp-req', 'tcp-res', 'http-req'
-   or 'http-res'.
-  :param function func: is the Lua function called to work as converter.
+  :param string name: is the name of the action.
+  :param table actions: is a table of string describing the HAProxy actions
+   facilities where to expose the new action. Expected facilities  are:
+   'tcp-req', 'tcp-res', 'http-req' or 'http-res'.
+  :param function func: is the Lua function called to work as an action.
   :param integer nb_args: is the expected number of argument for the action.
    By default the value is 0.
 

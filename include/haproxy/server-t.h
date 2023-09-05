@@ -141,6 +141,7 @@ enum srv_initaddr {
 #define SRV_F_NON_STICK    0x0004        /* never add connections allocated to this server to a stick table */
 #define SRV_F_USE_NS_FROM_PP 0x0008      /* use namespace associated with connection if present */
 #define SRV_F_FORCED_ID    0x0010        /* server's ID was forced in the configuration */
+#define SRV_F_REVERSE      0x0020        /* reverse connect server which requires idle connection for transfers */
 #define SRV_F_AGENTPORT    0x0040        /* this server has a agent port configured */
 #define SRV_F_AGENTADDR    0x0080        /* this server has a agent addr configured */
 #define SRV_F_COOKIESET    0x0100        /* this server has a cookie configured, so don't generate dynamic cookies */
@@ -236,6 +237,11 @@ struct srv_per_thread {
 	struct eb_root idle_conns;              /* Shareable idle connections */
 	struct eb_root safe_conns;              /* Safe idle connections */
 	struct eb_root avail_conns;             /* Connections in use, but with still new streams available */
+
+	/* Secondary idle conn storage used in parallel to idle/safe trees.
+	 * Used to sort them by last usage and purge them in reverse order.
+	 */
+	struct list idle_conn_list;
 };
 
 /* Each server will have one occurrence of this structure per thread group */
@@ -374,11 +380,17 @@ struct server {
 	struct {
 		void *ctx;
 		struct {
+			/* ptr/size may be shared R/O with other threads under read lock
+			 * "sess_lock", however only the owning thread may change them
+			 * (under write lock).
+			 */
 			unsigned char *ptr;
 			int size;
 			int allocated_size;
 			char *sni; /* SNI used for the session */
+			__decl_thread(HA_RWLOCK_T sess_lock);
 		} * reused_sess;
+		uint last_ssl_sess_tid;         /* last tid+1 having updated reused_sess (0=none, >0=tid+1) */
 
 		struct ckch_inst *inst; /* Instance of the ckch_store in which the certificate was loaded (might be null if server has no certificate) */
 		__decl_thread(HA_RWLOCK_T lock); /* lock the cache and SSL_CTX during commit operations */

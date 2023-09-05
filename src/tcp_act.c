@@ -32,12 +32,44 @@
 #include <haproxy/global.h>
 #include <haproxy/http_rules.h>
 #include <haproxy/proto_tcp.h>
-#include <haproxy/proxy-t.h>
+#include <haproxy/proxy.h>
 #include <haproxy/sample.h>
 #include <haproxy/sc_strm.h>
+#include <haproxy/server.h>
 #include <haproxy/session.h>
 #include <haproxy/tcp_rules.h>
 #include <haproxy/tools.h>
+
+static enum act_return tcp_action_attach_srv(struct act_rule *rule, struct proxy *px,
+                                             struct session *sess, struct stream *s, int flags)
+{
+	struct server *srv = rule->arg.attach_srv.srv;
+	struct sample *name_smp;
+	struct connection *conn = objt_conn(sess->origin);
+	if (!conn)
+		return ACT_RET_ABRT;
+
+	conn_set_reverse(conn, &srv->obj_type);
+
+	if (rule->arg.attach_srv.name) {
+		name_smp = sample_fetch_as_type(sess->fe, sess, s,
+		                                SMP_OPT_DIR_REQ | SMP_OPT_FINAL,
+		                                rule->arg.attach_srv.name, SMP_T_STR);
+		/* TODO strdup du buffer du sample */
+		if (name_smp) {
+			struct buffer *buf = &name_smp->data.u.str;
+			char *area = malloc(b_data(buf));
+
+			if (!area)
+				return ACT_RET_ERR;
+
+			conn->reverse.name = b_make(area, b_data(buf), 0, 0);
+			b_ncat(&conn->reverse.name, buf, b_data(buf));
+		}
+	}
+
+	return ACT_RET_CONT;
+}
 
 /*
  * Execute the "set-src" action. May be called from {tcp,http}request.
@@ -375,11 +407,129 @@ static enum act_return tcp_action_set_tos(struct act_rule *rule, struct proxy *p
 #endif
 
 /*
+ * Release the sample expr when releasing attach-srv action
+ */
+static void release_attach_srv_action(struct act_rule *rule)
+{
+	ha_free(&rule->arg.attach_srv.srvname);
+	release_sample_expr(rule->arg.attach_srv.name);
+}
+
+/*
  * Release the sample expr when releasing a set src/dst action
  */
 static void release_set_src_dst_action(struct act_rule *rule)
 {
 	release_sample_expr(rule->arg.expr);
+}
+
+static int tcp_check_attach_srv(struct act_rule *rule, struct proxy *px, char **err)
+{
+	struct proxy *be = NULL;
+	struct server *srv = NULL;
+	struct bind_conf *bind_conf;
+	char *name = rule->arg.attach_srv.srvname;
+	struct ist be_name, sv_name;
+
+	if (px->mode != PR_MODE_HTTP) {
+		memprintf(err, "attach-srv rule requires HTTP proxy mode");
+		return 0;
+	}
+
+	list_for_each_entry(bind_conf, &px->conf.bind, by_fe) {
+		if ((bind_conf->mux_proto && !isteqi(bind_conf->mux_proto->token, ist("h2")))
+#ifdef USE_OPENSSL
+		    || (bind_conf->ssl_conf.alpn_str && strcmp(bind_conf->ssl_conf.alpn_str, "\x02h2") != 0)
+#endif
+		) {
+			memprintf(err, "attach-srv rule: incompatible with listener on %s:%d which uses protocol other than HTTP/2",
+			          bind_conf->file, bind_conf->line);
+			return 0;
+		}
+	}
+
+	sv_name = ist(name);
+	be_name = istsplit(&sv_name, '/');
+	if (!istlen(sv_name)) {
+		memprintf(err, "attach-srv rule: invalid server name '%s'", name);
+		return 0;
+	}
+
+	if (!(be = proxy_be_by_name(ist0(be_name)))) {
+		memprintf(err, "attach-srv rule: no such backend '%s/%s'", ist0(be_name), ist0(sv_name));
+		return 0;
+	}
+	if (!(srv = server_find_by_name(be, ist0(sv_name)))) {
+		memprintf(err, "attach-srv rule: no such server '%s/%s'", ist0(be_name), ist0(sv_name));
+		return 0;
+	}
+
+	if ((srv->mux_proto && !isteqi(srv->mux_proto->token, ist("h2")))
+#ifdef USE_OPENSSL
+		    || (srv->ssl_ctx.alpn_str && strcmp(srv->ssl_ctx.alpn_str, "\x02h2") != 0)
+#endif
+	) {
+		memprintf(err, "attach-srv rule: incompatible with server '%s:%s' which uses protocol other than HTTP/2",
+		          ist0(be_name), ist0(sv_name));
+		return 0;
+	}
+
+	if ((rule->arg.attach_srv.name && (!srv->use_ssl || !srv->sni_expr)) ||
+	    (!rule->arg.attach_srv.name && srv->use_ssl && srv->sni_expr)) {
+		memprintf(err, "attach-srv rule: connection will never be used; either specify name argument in conjonction with defined SSL SNI on targetted server or none of these");
+		return 0;
+	}
+
+	rule->arg.attach_srv.srv = srv;
+
+	return 1;
+}
+
+static enum act_parse_ret tcp_parse_attach_srv(const char **args, int *cur_arg, struct proxy *px,
+                                               struct act_rule *rule, char **err)
+{
+	char *srvname;
+	struct sample_expr *expr;
+
+	rule->action      = ACT_CUSTOM;
+	rule->action_ptr  = tcp_action_attach_srv;
+	rule->release_ptr = release_attach_srv_action;
+	rule->check_ptr   = tcp_check_attach_srv;
+	rule->arg.attach_srv.srvname = NULL;
+	rule->arg.attach_srv.name = NULL;
+
+	srvname = my_strndup(args[*cur_arg], strlen(args[*cur_arg]));
+	if (!srvname)
+		goto err;
+	rule->arg.attach_srv.srvname = srvname;
+
+	++(*cur_arg);
+
+	while (args[*cur_arg] && args[*cur_arg][0] != '\0') {
+		if (strcmp(args[*cur_arg], "name") == 0) {
+			++(*cur_arg);
+
+			expr = sample_parse_expr((char **)args, cur_arg, px->conf.args.file, px->conf.args.line,
+			                         err, &px->conf.args, NULL);
+			if (!expr)
+				return ACT_RET_PRS_ERR;
+
+			rule->arg.attach_srv.name = expr;
+			rule->release_ptr = release_attach_srv_action;
+			++(*cur_arg);
+		}
+		else {
+			memprintf(err, "Unknown argument.");
+			return ACT_RET_PRS_ERR;
+		}
+	}
+
+	return ACT_RET_PRS_OK;
+
+ err:
+	ha_free(&rule->arg.attach_srv.srvname);
+	release_sample_expr(rule->arg.attach_srv.name);
+	return ACT_RET_PRS_ERR;
 }
 
 /* parse "set-{src,dst}[-port]" action */
@@ -551,6 +701,7 @@ static struct action_kw_list tcp_req_conn_actions = {ILH, {
 INITCALL1(STG_REGISTER, tcp_req_conn_keywords_register, &tcp_req_conn_actions);
 
 static struct action_kw_list tcp_req_sess_actions = {ILH, {
+	{ "attach-srv"  , tcp_parse_attach_srv  },
 	{ "set-dst"     , tcp_parse_set_src_dst },
 	{ "set-dst-port", tcp_parse_set_src_dst },
 	{ "set-mark",     tcp_parse_set_mark    },

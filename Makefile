@@ -28,10 +28,12 @@
 #   USE_TPROXY              : enable transparent proxy. Automatic.
 #   USE_LINUX_TPROXY        : enable full transparent proxy. Automatic.
 #   USE_LINUX_SPLICE        : enable kernel 2.6 splicing. Automatic.
+#   USE_LINUX_CAP           : enable Linux capabilities.
 #   USE_LIBCRYPT            : enable encrypted passwords using -lcrypt
 #   USE_CRYPT_H             : set it if your system requires including crypt.h
 #   USE_GETADDRINFO         : use getaddrinfo() to resolve IPv6 host names.
 #   USE_OPENSSL             : enable use of OpenSSL. Recommended, but see below.
+#   USE_OPENSSL_AWSLC       : enable use of AWS-LC
 #   USE_OPENSSL_WOLFSSL     : enable use of wolfSSL with the OpenSSL API
 #   USE_QUIC                : enable use of QUIC with the quictls API (quictls, libressl, boringssl)
 #   USE_QUIC_OPENSSL_COMPAT : enable use of QUIC with the standard openssl API (limited features)
@@ -305,12 +307,12 @@ LDFLAGS = $(ARCH_FLAGS) -g
 # specific entries if present before them.
 use_opts = USE_EPOLL USE_KQUEUE USE_NETFILTER USE_POLL                        \
            USE_THREAD USE_PTHREAD_EMULATION USE_BACKTRACE                     \
-           USE_TPROXY USE_LINUX_TPROXY                                        \
+           USE_TPROXY USE_LINUX_TPROXY USE_LINUX_CAP                          \
            USE_LINUX_SPLICE USE_LIBCRYPT USE_CRYPT_H USE_ENGINE               \
-           USE_GETADDRINFO USE_OPENSSL USE_OPENSSL_WOLFSSL USE_SSL USE_LUA    \
-           USE_ACCEPT4 USE_CLOSEFROM USE_ZLIB USE_SLZ USE_CPU_AFFINITY        \
-           USE_TFO USE_NS USE_DL USE_RT USE_LIBATOMIC USE_MATH                \
-           USE_DEVICEATLAS USE_51DEGREES                                      \
+           USE_GETADDRINFO USE_OPENSSL USE_OPENSSL_WOLFSSL USE_OPENSSL_AWSLC  \
+           USE_SSL USE_LUA USE_ACCEPT4 USE_CLOSEFROM USE_ZLIB USE_SLZ         \
+           USE_CPU_AFFINITY USE_TFO USE_NS USE_DL USE_RT USE_LIBATOMIC        \
+           USE_MATH USE_DEVICEATLAS USE_51DEGREES                             \
            USE_WURFL USE_SYSTEMD USE_OBSOLETE_LINKER USE_PRCTL USE_PROCCTL    \
            USE_THREAD_DUMP USE_EVPORTS USE_OT USE_QUIC USE_PROMEX             \
            USE_MEMORY_PROFILING USE_SHM_OPEN                                  \
@@ -347,7 +349,7 @@ endif
 ifeq ($(TARGET),linux-glibc)
   set_target_defaults = $(call default_opts, \
     USE_POLL USE_TPROXY USE_LIBCRYPT USE_DL USE_RT USE_CRYPT_H USE_NETFILTER  \
-    USE_CPU_AFFINITY USE_THREAD USE_EPOLL USE_LINUX_TPROXY                    \
+    USE_CPU_AFFINITY USE_THREAD USE_EPOLL USE_LINUX_TPROXY USE_LINUX_CAP      \
     USE_ACCEPT4 USE_LINUX_SPLICE USE_PRCTL USE_THREAD_DUMP USE_NS USE_TFO     \
     USE_GETADDRINFO USE_BACKTRACE USE_SHM_OPEN)
   INSTALL = install -v
@@ -357,7 +359,7 @@ endif
 ifeq ($(TARGET),linux-glibc-legacy)
   set_target_defaults = $(call default_opts, \
     USE_POLL USE_TPROXY USE_LIBCRYPT USE_DL USE_RT USE_CRYPT_H USE_NETFILTER  \
-    USE_CPU_AFFINITY USE_THREAD USE_EPOLL USE_LINUX_TPROXY                    \
+    USE_CPU_AFFINITY USE_THREAD USE_EPOLL USE_LINUX_TPROXY USE_LINUX_CAP      \
     USE_ACCEPT4 USE_LINUX_SPLICE USE_PRCTL USE_THREAD_DUMP USE_GETADDRINFO)
   INSTALL = install -v
 endif
@@ -366,7 +368,7 @@ endif
 ifeq ($(TARGET),linux-musl)
   set_target_defaults = $(call default_opts, \
     USE_POLL USE_TPROXY USE_LIBCRYPT USE_DL USE_RT USE_CRYPT_H USE_NETFILTER  \
-    USE_CPU_AFFINITY USE_THREAD USE_EPOLL USE_LINUX_TPROXY                    \
+    USE_CPU_AFFINITY USE_THREAD USE_EPOLL USE_LINUX_TPROXY USE_LINUX_CAP      \
     USE_ACCEPT4 USE_LINUX_SPLICE USE_PRCTL USE_THREAD_DUMP USE_NS USE_TFO     \
     USE_GETADDRINFO USE_SHM_OPEN)
   INSTALL = install -v
@@ -578,6 +580,13 @@ endif
 ifneq ($(USE_OPENSSL_WOLFSSL),)
   SSL_CFLAGS      := $(if $(SSL_INC),-I$(SSL_INC)/wolfssl -I$(SSL_INC))
   SSL_LDFLAGS     := $(if $(SSL_LIB),-L$(SSL_LIB)) -lwolfssl
+  # always automatically set USE_OPENSSL
+  USE_OPENSSL     := $(if $(USE_OPENSSL),$(USE_OPENSSL),implicit)
+endif
+
+# This is for the AWS-LC variant of the OpenSSL API. Setting it implies
+# OPENSSL so it's not necessary to set the latter.
+ifneq ($(USE_OPENSSL_AWSLC),)
   # always automatically set USE_OPENSSL
   USE_OPENSSL     := $(if $(USE_OPENSSL),$(USE_OPENSSL),implicit)
 endif
@@ -813,6 +822,10 @@ ifneq ($(USE_NS),)
   OPTIONS_OBJS  += src/namespace.o
 endif
 
+ifneq ($(USE_LINUX_CAP),)
+  OPTIONS_OBJS   += src/linuxcap.o
+endif
+
 ifneq ($(USE_OT),)
   include addons/ot/Makefile
 endif
@@ -947,7 +960,8 @@ OBJS += src/mux_h2.o src/mux_fcgi.o src/mux_h1.o src/tcpcheck.o               \
         src/base64.o src/auth.o src/uri_auth.o src/time.o src/ebistree.o      \
         src/dynbuf.o src/wdt.o src/pipe.o src/init.o src/http_acl.o           \
         src/hpack-huff.o src/hpack-enc.o src/dict.o src/freq_ctr.o            \
-        src/ebtree.o src/hash.o src/dgram.o src/version.o
+        src/ebtree.o src/hash.o src/dgram.o src/version.o                     \
+        src/proto_reverse_connect.o
 
 ifneq ($(TRACE),)
   OBJS += src/calltrace.o

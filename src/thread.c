@@ -1132,6 +1132,101 @@ REGISTER_BUILD_OPTS("Built without multi-threading support (USE_THREAD not set).
 #endif // USE_THREAD
 
 
+/* Returns non-zero on anomaly (bound vs unbound), and emits a warning in this
+ * case.
+ */
+int thread_detect_binding_discrepancies(void)
+{
+#if defined(USE_CPU_AFFINITY)
+	uint th, tg, id;
+	uint tot_b = 0, tot_u = 0;
+	int first_b = -1;
+	int first_u = -1;
+
+	for (th = 0; th < global.nbthread; th++) {
+		tg = ha_thread_info[th].tgid;
+		id = ha_thread_info[th].ltid;
+
+		if (ha_cpuset_count(&cpu_map[tg - 1].thread[id]) == 0) {
+			tot_u++;
+			if (first_u < 0)
+				first_u = th;
+		} else {
+			tot_b++;
+			if (first_b < 0)
+				first_b = th;
+		}
+	}
+
+	if (tot_u > 0 && tot_b > 0) {
+		ha_warning("Found %u thread(s) mapped to a CPU and %u thread(s) not mapped to any CPU. "
+			   "This will result in some threads being randomly assigned to the same CPU, "
+			   "which will occasionally cause severe performance degradation. First thread "
+			   "bound is %d and first thread not bound is %d. Please either bind all threads "
+			   "or none (maybe some cpu-map directives are missing?).\n",
+			   tot_b, tot_u, first_b, first_u);
+		return 1;
+	}
+#endif
+	return 0;
+}
+
+/* Returns non-zero on anomaly (more threads than CPUs), and emits a warning in
+ * this case. It checks against configured cpu-map if any, otherwise against
+ * the number of CPUs at boot if known. It's better to run it only after
+ * thread_detect_binding_discrepancies() so that mixed cases can be eliminated.
+ */
+int thread_detect_more_than_cpus(void)
+{
+#if defined(USE_CPU_AFFINITY)
+	struct hap_cpuset cpuset_map, cpuset_boot, cpuset_all;
+	uint th, tg, id;
+	int bound;
+	int tot_map, tot_all;
+
+	ha_cpuset_zero(&cpuset_boot);
+	ha_cpuset_zero(&cpuset_map);
+	ha_cpuset_zero(&cpuset_all);
+	bound = 0;
+	for (th = 0; th < global.nbthread; th++) {
+		tg = ha_thread_info[th].tgid;
+		id = ha_thread_info[th].ltid;
+		if (ha_cpuset_count(&cpu_map[tg - 1].thread[id])) {
+			ha_cpuset_or(&cpuset_map, &cpu_map[tg - 1].thread[id]);
+			bound++;
+		}
+	}
+
+	ha_cpuset_assign(&cpuset_all, &cpuset_map);
+	if (bound != global.nbthread) {
+		if (ha_cpuset_detect_bound(&cpuset_boot))
+			ha_cpuset_or(&cpuset_all, &cpuset_boot);
+	}
+
+	tot_map = ha_cpuset_count(&cpuset_map);
+	tot_all = ha_cpuset_count(&cpuset_all);
+
+	if (tot_map && bound > tot_map) {
+		ha_warning("This configuration binds %d threads to a total of %d CPUs via cpu-map "
+			   "directives. This means that some threads will compete for the same CPU, "
+			   "which will cause severe performance degradation. Please fix either the "
+			   "'cpu-map' directives or set the global 'nbthread' value accordingly.\n",
+			   bound, tot_map);
+		return 1;
+	}
+	else if (tot_all && global.nbthread > tot_all) {
+		ha_warning("This configuration enables %d threads running on a total of %d CPUs. "
+			   "This means that some threads will compete for the same CPU, which will cause "
+			   "severe performance degradation. Please either the 'cpu-map' directives to "
+			   "adjust the CPUs to use, or fix the global 'nbthread' value.\n",
+			   global.nbthread, tot_all);
+		return 1;
+	}
+#endif
+	return 0;
+}
+
+
 /* scans the configured thread mapping and establishes the final one. Returns <0
  * on failure, >=0 on success.
  */

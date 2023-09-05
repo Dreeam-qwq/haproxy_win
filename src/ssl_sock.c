@@ -1112,7 +1112,11 @@ static int ssl_sock_load_ocsp(const char *path, SSL_CTX *ctx, struct ckch_data *
 	char *warn = NULL;
 	unsigned char *p;
 #ifndef USE_OPENSSL_WOLFSSL
+#if (HA_OPENSSL_VERSION_NUMBER >= 0x10101000L)
+    int (*callback) (SSL *, void *);
+#else
 	void (*callback) (void);
+#endif
 #else
 	tlsextStatusCb callback;
 #endif
@@ -4261,32 +4265,61 @@ static int ssl_sess_new_srv_cb(SSL *ssl, SSL_SESSION *sess)
 {
 	struct connection *conn = SSL_get_ex_data(ssl, ssl_app_data_index);
 	struct server *s;
+	uint old_tid;
 
 	s = __objt_server(conn->target);
 
 	/* RWLOCK: only read lock the SSL cache even when writing in it because there is
 	 * one cache per thread, it only prevents to flush it from the CLI in
-	 * another thread */
+	 * another thread. However, we also write-lock our session element while
+	 * updating it to make sure no other thread is reading it while we're copying
+	 * or releasing it.
+	 */
 
 	if (!(s->ssl_ctx.options & SRV_SSL_O_NO_REUSE)) {
 		int len;
 		unsigned char *ptr;
 		const char *sni;
 
+		/* determine the required len to store this new session */
 		len = i2d_SSL_SESSION(sess, NULL);
 		sni = SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name);
 		HA_RWLOCK_RDLOCK(SSL_SERVER_LOCK, &s->ssl_ctx.lock);
-		if (s->ssl_ctx.reused_sess[tid].ptr && s->ssl_ctx.reused_sess[tid].allocated_size >= len) {
-			ptr = s->ssl_ctx.reused_sess[tid].ptr;
-		} else {
-			ptr = realloc(s->ssl_ctx.reused_sess[tid].ptr, len);
+
+		ptr = s->ssl_ctx.reused_sess[tid].ptr;
+
+		/* we're updating the possibly shared session right now */
+		HA_RWLOCK_WRLOCK(SSL_SERVER_LOCK, &s->ssl_ctx.reused_sess[tid].sess_lock);
+
+		if (!ptr || s->ssl_ctx.reused_sess[tid].allocated_size < len) {
+			/* insufficient storage, reallocate */
+			len = (len + 7) & -8; /* round to the nearest 8 bytes */
+			ptr = realloc(ptr, len);
+			if (!ptr)
+				free(s->ssl_ctx.reused_sess[tid].ptr);
 			s->ssl_ctx.reused_sess[tid].ptr = ptr;
 			s->ssl_ctx.reused_sess[tid].allocated_size = len;
 		}
-		if (s->ssl_ctx.reused_sess[tid].ptr) {
-			s->ssl_ctx.reused_sess[tid].size = i2d_SSL_SESSION(sess,
-			    &ptr);
+
+		if (ptr) {
+			/* store the new session into ptr and advance it; save the
+			 * resulting size. It's guaranteed to be equal to the returned
+			 * len above, and the pointer to be advanced by as much.
+			 */
+			s->ssl_ctx.reused_sess[tid].size = i2d_SSL_SESSION(sess, &ptr);
 		}
+
+		/* done updating the session */
+
+		/* Now we'll try to add or remove this entry as a valid one:
+		 *  - if no entry is set and we have one, let's share it
+		 *  - if our entry was set and we have no more, let's clear it
+		 */
+		old_tid = HA_ATOMIC_LOAD(&s->ssl_ctx.last_ssl_sess_tid); // 0=none, >0 = tid + 1
+		if (!s->ssl_ctx.reused_sess[tid].ptr && old_tid == tid + 1)
+			HA_ATOMIC_CAS(&s->ssl_ctx.last_ssl_sess_tid, &old_tid, 0); // no more valid
+		else if (s->ssl_ctx.reused_sess[tid].ptr && !old_tid)
+			HA_ATOMIC_CAS(&s->ssl_ctx.last_ssl_sess_tid, &old_tid, tid + 1);
 
 		if (s->ssl_ctx.reused_sess[tid].sni) {
 			/* if the new sni is empty or isn' t the same as the old one */
@@ -4299,10 +4332,21 @@ static int ssl_sess_new_srv_cb(SSL *ssl, SSL_SESSION *sess)
 			/* if there wasn't an old sni but there is a new one */
 			s->ssl_ctx.reused_sess[tid].sni = strdup(sni);
 		}
+		HA_RWLOCK_WRUNLOCK(SSL_SERVER_LOCK, &s->ssl_ctx.reused_sess[tid].sess_lock);
 		HA_RWLOCK_RDUNLOCK(SSL_SERVER_LOCK, &s->ssl_ctx.lock);
 	} else {
 		HA_RWLOCK_RDLOCK(SSL_SERVER_LOCK, &s->ssl_ctx.lock);
-		ha_free(&s->ssl_ctx.reused_sess[tid].ptr);
+
+		if (s->ssl_ctx.reused_sess[tid].ptr) {
+			HA_RWLOCK_WRLOCK(SSL_SERVER_LOCK, &s->ssl_ctx.reused_sess[tid].sess_lock);
+			ha_free(&s->ssl_ctx.reused_sess[tid].ptr);
+			HA_RWLOCK_WRUNLOCK(SSL_SERVER_LOCK, &s->ssl_ctx.reused_sess[tid].sess_lock);
+		}
+
+		old_tid = HA_ATOMIC_LOAD(&s->ssl_ctx.last_ssl_sess_tid); // 0=none, >0 = tid + 1
+		if (old_tid == tid + 1)
+			HA_ATOMIC_CAS(&s->ssl_ctx.last_ssl_sess_tid, &old_tid, 0); // no more valid
+
 		HA_RWLOCK_RDUNLOCK(SSL_SERVER_LOCK, &s->ssl_ctx.lock);
 	}
 
@@ -5693,23 +5737,74 @@ static int ssl_sock_init(struct connection *conn, void **xprt_ctx)
 	/* If it is in client mode initiate SSL session
 	   in connect state otherwise accept state */
 	if (objt_server(conn->target)) {
-		if (ssl_bio_and_sess_init(conn, __objt_server(conn->target)->ssl_ctx.ctx,
+		struct server *srv = __objt_server(conn->target);
+
+		if (ssl_bio_and_sess_init(conn, srv->ssl_ctx.ctx,
 		                          &ctx->ssl, &ctx->bio, ha_meth, ctx) == -1)
 			goto err;
 
 		SSL_set_connect_state(ctx->ssl);
-		HA_RWLOCK_RDLOCK(SSL_SERVER_LOCK, &(__objt_server(conn->target)->ssl_ctx.lock));
-		if (__objt_server(conn->target)->ssl_ctx.reused_sess[tid].ptr) {
-			const unsigned char *ptr = __objt_server(conn->target)->ssl_ctx.reused_sess[tid].ptr;
-			SSL_SESSION *sess = d2i_SSL_SESSION(NULL, &ptr, __objt_server(conn->target)->ssl_ctx.reused_sess[tid].size);
+		HA_RWLOCK_RDLOCK(SSL_SERVER_LOCK, &srv->ssl_ctx.lock);
+		if (srv->ssl_ctx.reused_sess[tid].ptr) {
+			/* let's recreate a session from (ptr,size) and assign
+			 * it to ctx->ssl. Its refcount will be updated by the
+			 * creation and by the assignment, so after assigning
+			 * it or failing to, we must always free it to decrement
+			 * the refcount.
+			 */
+			const unsigned char *ptr = srv->ssl_ctx.reused_sess[tid].ptr;
+			SSL_SESSION *sess = d2i_SSL_SESSION(NULL, &ptr, srv->ssl_ctx.reused_sess[tid].size);
+
 			if (sess && !SSL_set_session(ctx->ssl, sess)) {
+				uint old_tid = HA_ATOMIC_LOAD(&srv->ssl_ctx.last_ssl_sess_tid); // 0=none, >0 = tid + 1
+				if (old_tid == tid + 1)
+					HA_ATOMIC_CAS(&srv->ssl_ctx.last_ssl_sess_tid, &old_tid, 0); // no more valid
 				SSL_SESSION_free(sess);
-				ha_free(&__objt_server(conn->target)->ssl_ctx.reused_sess[tid].ptr);
+				HA_RWLOCK_WRLOCK(SSL_SERVER_LOCK, &srv->ssl_ctx.reused_sess[tid].sess_lock);
+				ha_free(&srv->ssl_ctx.reused_sess[tid].ptr);
+				HA_RWLOCK_WRTORD(SSL_SERVER_LOCK, &srv->ssl_ctx.reused_sess[tid].sess_lock);
+				if (srv->ssl_ctx.reused_sess[tid].sni)
+					SSL_set_tlsext_host_name(ctx->ssl, srv->ssl_ctx.reused_sess[tid].sni);
+				HA_RWLOCK_RDUNLOCK(SSL_SERVER_LOCK, &srv->ssl_ctx.reused_sess[tid].sess_lock);
 			} else if (sess) {
+				/* already assigned, not needed anymore */
 				SSL_SESSION_free(sess);
+				HA_RWLOCK_RDLOCK(SSL_SERVER_LOCK, &srv->ssl_ctx.reused_sess[tid].sess_lock);
+				if (srv->ssl_ctx.reused_sess[tid].sni)
+					SSL_set_tlsext_host_name(ctx->ssl, srv->ssl_ctx.reused_sess[tid].sni);
+				HA_RWLOCK_RDUNLOCK(SSL_SERVER_LOCK, &srv->ssl_ctx.reused_sess[tid].sess_lock);
+			}
+		} else {
+			/* No session available yet, let's see if we can pick one
+			 * from another thread. If old_tid is non-null, it designates
+			 * the index of a recently updated thread that might still have
+			 * a usable session. All threads are collectively responsible
+			 * for resetting the index if it fails.
+			 */
+			const unsigned char *ptr;
+			SSL_SESSION *sess;
+			uint old_tid = HA_ATOMIC_LOAD(&srv->ssl_ctx.last_ssl_sess_tid); // 0=none, >0 = tid + 1
+
+			if (old_tid) {
+				HA_RWLOCK_RDLOCK(SSL_SERVER_LOCK, &srv->ssl_ctx.reused_sess[old_tid-1].sess_lock);
+
+				ptr = srv->ssl_ctx.reused_sess[old_tid-1].ptr;
+				if (ptr) {
+					sess = d2i_SSL_SESSION(NULL, &ptr, srv->ssl_ctx.reused_sess[old_tid-1].size);
+					if (sess) {
+						if (!SSL_set_session(ctx->ssl, sess))
+							HA_ATOMIC_CAS(&srv->ssl_ctx.last_ssl_sess_tid, &old_tid, 0); // no more valid
+						SSL_SESSION_free(sess);
+					}
+				}
+
+				if (srv->ssl_ctx.reused_sess[old_tid-1].sni)
+					SSL_set_tlsext_host_name(ctx->ssl, srv->ssl_ctx.reused_sess[old_tid-1].sni);
+
+				HA_RWLOCK_RDUNLOCK(SSL_SERVER_LOCK, &srv->ssl_ctx.reused_sess[old_tid-1].sess_lock);
 			}
 		}
-		HA_RWLOCK_RDUNLOCK(SSL_SERVER_LOCK, &(__objt_server(conn->target)->ssl_ctx.lock));
+		HA_RWLOCK_RDUNLOCK(SSL_SERVER_LOCK, &srv->ssl_ctx.lock);
 
 		/* leave init state and start handshake */
 		conn->flags |= CO_FL_SSL_WAIT_HS | CO_FL_WAIT_L6_CONN;
@@ -6283,7 +6378,7 @@ struct task *ssl_sock_io_cb(struct task *t, void *context, unsigned int state)
 		conn = ctx->conn;
 		conn_in_list = conn_get_idle_flag(conn);
 		if (conn_in_list)
-			conn_delete_from_tree(&conn->hash_node->node);
+			conn_delete_from_tree(conn);
 		HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
 	} else {
 		conn = ctx->conn;
@@ -6343,10 +6438,7 @@ leave:
 		struct server *srv = objt_server(conn->target);
 
 		HA_SPIN_LOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
-		if (conn_in_list == CO_FL_SAFE_LIST)
-			eb64_insert(&srv->per_thr[tid].safe_conns, &conn->hash_node->node);
-		else
-			eb64_insert(&srv->per_thr[tid].idle_conns, &conn->hash_node->node);
+		_srv_add_idle(srv, conn, conn_in_list == CO_FL_SAFE_LIST);
 		HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
 	}
 	return t;
@@ -6821,7 +6913,6 @@ void ssl_sock_set_servername(struct connection *conn, const char *hostname)
 {
 #ifdef SSL_CTRL_SET_TLSEXT_HOSTNAME
 	struct ssl_sock_ctx *ctx = conn_get_ssl_sock_ctx(conn);
-	struct server *s;
 	char *prev_name;
 
 	if (!ctx)
@@ -6830,22 +6921,21 @@ void ssl_sock_set_servername(struct connection *conn, const char *hostname)
 	BUG_ON(!(conn->flags & CO_FL_WAIT_L6_CONN));
 	BUG_ON(!(conn->flags & CO_FL_SSL_WAIT_HS));
 
-	s = __objt_server(conn->target);
-
 	/* if the SNI changes, we must destroy the reusable context so that a
 	 * new connection will present a new SNI. compare with the SNI
-	 * previously stored in the reused_sess */
-	/* the RWLOCK is used to ensure that we are not trying to flush the
-	 * cache from the CLI */
+	 * previously stored in the reused_sess. If the session was reused,
+	 * the associated SNI (if any) has already been assigned to the SSL
+	 * during ssl_sock_init() so SSL_get_servername() will properly
+	 * retrieve the currently known hostname for the SSL.
+	 */
 
-	HA_RWLOCK_RDLOCK(SSL_SERVER_LOCK, &s->ssl_ctx.lock);
-	prev_name = s->ssl_ctx.reused_sess[tid].sni;
+	prev_name = (char *)SSL_get_servername(ctx->ssl, TLSEXT_NAMETYPE_host_name);
 	if ((!prev_name && hostname) ||
-	    (prev_name && (!hostname || strcmp(hostname, prev_name) != 0)))
+	    !hostname ||
+	    strcmp(hostname, prev_name) != 0) {
 		SSL_set_session(ctx->ssl, NULL);
-	HA_RWLOCK_RDUNLOCK(SSL_SERVER_LOCK, &s->ssl_ctx.lock);
-
-	SSL_set_tlsext_host_name(ctx->ssl, hostname);
+		SSL_set_tlsext_host_name(ctx->ssl, hostname);
+	}
 #endif
 }
 

@@ -40,7 +40,8 @@
 extern struct pool_head *pool_head_connection;
 extern struct pool_head *pool_head_conn_hash_node;
 extern struct pool_head *pool_head_sockaddr;
-extern struct pool_head *pool_head_authority;
+extern struct pool_head *pool_head_pp_tlv_128;
+extern struct pool_head *pool_head_pp_tlv_256;
 extern struct pool_head *pool_head_uniqueid;
 extern struct xprt_ops *registered_xprt[XPRT_ENTRIES];
 extern struct mux_proto_list mux_proto_list;
@@ -52,6 +53,7 @@ extern struct mux_stopping_data mux_stopping_data[MAX_THREADS];
 int conn_recv_proxy(struct connection *conn, int flag);
 int conn_send_proxy(struct connection *conn, unsigned int flag);
 int make_proxy_line(char *buf, int buf_len, struct server *srv, struct connection *remote, struct stream *strm);
+struct conn_tlv_list *conn_get_tlv(struct connection *conn, int type);
 
 int conn_append_debug_info(struct buffer *buf, const struct connection *conn, const char *pfx);
 
@@ -81,7 +83,7 @@ int conn_install_mux_be(struct connection *conn, void *ctx, struct session *sess
                         const struct mux_ops *force_mux_ops);
 int conn_install_mux_chk(struct connection *conn, void *ctx, struct session *sess);
 
-void conn_delete_from_tree(struct eb64_node *node);
+void conn_delete_from_tree(struct connection *conn);
 
 void conn_init(struct connection *conn, void *target);
 struct connection *conn_new(void *target);
@@ -100,6 +102,9 @@ void conn_hash_update(char *buf, size_t *idx,
                       enum conn_hash_params_t type);
 uint64_t conn_hash_digest(char *buf, size_t bufsize,
                           enum conn_hash_params_t flags);
+
+int conn_reverse(struct connection *conn);
+
 const char *conn_err_code_str(struct connection *c);
 int xprt_add_hs(struct connection *conn);
 void register_mux_proto(struct mux_proto_list *list);
@@ -692,6 +697,50 @@ static inline struct ssl_sock_ctx *conn_get_ssl_sock_ctx(struct connection *conn
 static inline int conn_is_ssl(struct connection *conn)
 {
 	return !!conn_get_ssl_sock_ctx(conn);
+}
+
+/* Returns true if connection must be reversed. */
+static inline int conn_is_reverse(const struct connection *conn)
+{
+	return !!(conn->reverse.target);
+}
+
+/* Returns true if connection must be actively reversed or waiting to be accepted. */
+static inline int conn_reverse_in_preconnect(const struct connection *conn)
+{
+	return conn_is_back(conn) ? !!(conn->reverse.target) :
+	                            !!(conn->flags & CO_FL_REVERSED);
+}
+
+/* Initialize <conn> as a reverse connection to <target>. */
+static inline void conn_set_reverse(struct connection *conn, enum obj_type *target)
+{
+	/* Ensure the correct target type is used depending on the connection side before reverse. */
+	BUG_ON((!conn_is_back(conn) && !objt_server(target)) ||
+	       (conn_is_back(conn) && !objt_listener(target)));
+
+	conn->reverse.target = target;
+}
+
+/* Returns the listener instance for connection used for active reverse. */
+static inline struct listener *conn_active_reverse_listener(const struct connection *conn)
+{
+	return conn_is_back(conn) ? __objt_listener(conn->reverse.target) :
+	                            __objt_listener(conn->target);
+}
+
+/*
+ * Prepare TLV argument for redirecting fetches.
+ * Note that it is not possible to use an argument check function
+ * as that would require us to allow arguments for functions
+ * that do not need it. Alternatively, the sample logic could be
+ * adjusted to perform checks for no arguments and allocate
+ * in the check function. However, this does not seem worth the trouble.
+ */
+static inline void set_tlv_arg(int tlv_type, struct arg *tlv_arg)
+{
+	tlv_arg->type = ARGT_SINT;
+	tlv_arg->data.sint = tlv_type;
 }
 
 #endif /* _HAPROXY_CONNECTION_H */

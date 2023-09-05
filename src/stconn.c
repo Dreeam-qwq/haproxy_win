@@ -958,8 +958,10 @@ static void sc_app_chk_snd_applet(struct stconn *sc)
 	if (unlikely(sc->state != SC_ST_EST || (sc->flags & SC_FL_SHUT_DONE)))
 		return;
 
-	/* we only wake the applet up if it was waiting for some data  and is ready to consume it */
-	if (!sc_ep_test(sc, SE_FL_WAIT_DATA) || sc_ep_test(sc, SE_FL_WONT_CONSUME))
+	/* we only wake the applet up if it was waiting for some data  and is ready to consume it
+	 * or if there is a pending shutdown
+	 */
+	if (!sc_ep_test(sc, SE_FL_WAIT_DATA|SE_FL_WONT_CONSUME) && !(sc->flags & SC_FL_SHUT_WANTED))
 		return;
 
 	if (!channel_is_empty(oc)) {
@@ -1133,7 +1135,6 @@ static void sc_notify(struct stconn *sc)
 		(channel_is_empty(oc) && !oc->to_forward)))))) {
 		task_wakeup(task, TASK_WOKEN_IO);
 	}
-
 	if (ic->flags & CF_READ_EVENT)
 		sc->flags &= ~SC_FL_RCV_ONCE;
 }
@@ -1693,7 +1694,11 @@ static int sc_conn_send(struct stconn *sc)
 	else {
 		/* We couldn't send all of our data, let the mux know we'd like to send more */
 		conn->mux->subscribe(sc, SUB_RETRY_SEND, &sc->wait_event);
-		sc_ep_report_blocked_send(sc);
+		if (sc_state_in(sc->state, SC_SB_EST|SC_SB_DIS|SC_SB_CLO)) {
+			sc_ep_report_blocked_send(sc);
+			s->task->expire = tick_first(s->task->expire, sc_ep_snd_ex(sc));
+			task_queue(s->task);
+		}
 	}
 
 	return did_send;

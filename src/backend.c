@@ -1163,7 +1163,7 @@ static struct connection *conn_backend_get(struct stream *s, struct server *srv,
 	HA_SPIN_LOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
 	conn = srv_lookup_conn(is_safe ? &srv->per_thr[tid].safe_conns : &srv->per_thr[tid].idle_conns, hash);
 	if (conn)
-		conn_delete_from_tree(&conn->hash_node->node);
+		conn_delete_from_tree(conn);
 
 	/* If we failed to pick a connection from the idle list, let's try again with
 	 * the safe list.
@@ -1171,7 +1171,7 @@ static struct connection *conn_backend_get(struct stream *s, struct server *srv,
 	if (!conn && !is_safe && srv->curr_safe_nb > 0) {
 		conn = srv_lookup_conn(&srv->per_thr[tid].safe_conns, hash);
 		if (conn) {
-			conn_delete_from_tree(&conn->hash_node->node);
+			conn_delete_from_tree(conn);
 			is_safe = 1;
 		}
 	}
@@ -1214,7 +1214,7 @@ static struct connection *conn_backend_get(struct stream *s, struct server *srv,
 		conn = srv_lookup_conn(is_safe ? &srv->per_thr[i].safe_conns : &srv->per_thr[i].idle_conns, hash);
 		while (conn) {
 			if (conn->mux->takeover && conn->mux->takeover(conn, i) == 0) {
-				conn_delete_from_tree(&conn->hash_node->node);
+				conn_delete_from_tree(conn);
 				_HA_ATOMIC_INC(&activity[tid].fd_takeover);
 				found = 1;
 				break;
@@ -1227,7 +1227,7 @@ static struct connection *conn_backend_get(struct stream *s, struct server *srv,
 			conn = srv_lookup_conn(&srv->per_thr[i].safe_conns, hash);
 			while (conn) {
 				if (conn->mux->takeover && conn->mux->takeover(conn, i) == 0) {
-					conn_delete_from_tree(&conn->hash_node->node);
+					conn_delete_from_tree(conn);
 					_HA_ATOMIC_INC(&activity[tid].fd_takeover);
 					found = 1;
 					is_safe = 1;
@@ -1326,7 +1326,7 @@ static int connect_server(struct stream *s)
 	struct connection *cli_conn = objt_conn(strm_orig(s));
 	struct connection *srv_conn = NULL;
 	struct server *srv;
-	const int reuse_mode = s->be->options & PR_O_REUSE_MASK;
+	int reuse_mode = s->be->options & PR_O_REUSE_MASK;
 	int reuse = 0;
 	int init_mux = 0;
 	int err;
@@ -1341,6 +1341,10 @@ static int connect_server(struct stream *s)
 	/* in standard configuration, srv will be valid
 	 * it can be NULL for dispatch mode or transparent backend */
 	srv = objt_server(s->target);
+
+	/* Override reuse-mode if reverse-connect is used. */
+	if (srv && srv->flags & SRV_F_REVERSE)
+		reuse_mode = PR_O_REUSE_ALWS;
 
 	err = alloc_dst_address(&s->scb->dst, srv, s);
 	if (err != SRV_STATUS_OK)
@@ -1393,7 +1397,7 @@ static int connect_server(struct stream *s)
 #endif /* USE_OPENSSL */
 
 	/* 3. destination address */
-	if (srv && (!is_addr(&srv->addr) || srv->flags & SRV_F_MAPPORTS))
+	if (srv && srv_is_transparent(srv))
 		hash_params.dst_addr = s->scb->dst;
 
 	/* 4. source address */
@@ -1488,19 +1492,14 @@ static int connect_server(struct stream *s)
 
 	if (ha_used_fds > global.tune.pool_high_count && srv) {
 		struct connection *tokill_conn = NULL;
-		struct conn_hash_node *conn_node = NULL;
-		struct ebmb_node *node = NULL;
-
 		/* We can't reuse a connection, and e have more FDs than deemd
 		 * acceptable, attempt to kill an idling connection
 		 */
 		/* First, try from our own idle list */
 		HA_SPIN_LOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
-		node = ebmb_first(&srv->per_thr[tid].idle_conns);
-		if (node) {
-			conn_node = ebmb_entry(node, struct conn_hash_node, node);
-			tokill_conn = conn_node->conn;
-			ebmb_delete(node);
+		if (!LIST_ISEMPTY(&srv->per_thr[tid].idle_conn_list)) {
+			tokill_conn = LIST_ELEM(&srv->per_thr[tid].idle_conn_list.n, struct connection *, idle_list);
+			conn_delete_from_tree(tokill_conn);
 			HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
 
 			/* Release the idle lock before calling mux->destroy.
@@ -1527,20 +1526,9 @@ static int connect_server(struct stream *s)
 				if (HA_SPIN_TRYLOCK(IDLE_CONNS_LOCK, &idle_conns[i].idle_conns_lock) != 0)
 					continue;
 
-				node = ebmb_first(&srv->per_thr[i].idle_conns);
-				if (node) {
-					conn_node = ebmb_entry(node, struct conn_hash_node, node);
-					tokill_conn = conn_node->conn;
-					ebmb_delete(node);
-				}
-
-				if (!tokill_conn) {
-					node = ebmb_first(&srv->per_thr[i].safe_conns);
-					if (node) {
-						conn_node = ebmb_entry(node, struct conn_hash_node, node);
-						tokill_conn = conn_node->conn;
-						ebmb_delete(node);
-					}
+				if (!LIST_ISEMPTY(&srv->per_thr[i].idle_conn_list)) {
+					tokill_conn = LIST_ELEM(&srv->per_thr[i].idle_conn_list.n, struct connection *, idle_list);
+					conn_delete_from_tree(tokill_conn);
 				}
 				HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[i].idle_conns_lock);
 
@@ -1548,7 +1536,7 @@ static int connect_server(struct stream *s)
 					/* We got one, put it into the concerned thread's to kill list, and wake it's kill task */
 
 					MT_LIST_APPEND(&idle_conns[i].toremove_conns,
-					    (struct mt_list *)&tokill_conn->toremove_list);
+					               &tokill_conn->toremove_list);
 					task_wakeup(idle_conns[i].cleanup_task, TASK_WOKEN_OTHER);
 					break;
 				}
@@ -1562,9 +1550,12 @@ static int connect_server(struct stream *s)
 			int avail = srv_conn->mux->avail_streams(srv_conn);
 
 			if (avail <= 1) {
+				/* connection cannot be in idle list if used as an avail idle conn. */
+				BUG_ON(LIST_INLIST(&srv_conn->idle_list));
+
 				/* No more streams available, remove it from the list */
 				HA_SPIN_LOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
-				conn_delete_from_tree(&srv_conn->hash_node->node);
+				conn_delete_from_tree(srv_conn);
 				HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
 			}
 
@@ -1587,6 +1578,12 @@ static int connect_server(struct stream *s)
 skip_reuse:
 	/* no reuse or failed to reuse the connection above, pick a new one */
 	if (!srv_conn) {
+		if (srv && (srv->flags & SRV_F_REVERSE)) {
+			DBG_TRACE_USER("cannot open a new connection for reverse server", STRM_EV_STRM_PROC|STRM_EV_CS_ST, s);
+			s->conn_err_type = STRM_ET_CONN_ERR;
+			return SF_ERR_INTERNAL;
+		}
+
 		srv_conn = conn_new(s->target);
 		if (srv_conn) {
 			DBG_TRACE_STATE("alloc new be connection", STRM_EV_STRM_PROC|STRM_EV_CS_ST, s);
@@ -1601,11 +1598,6 @@ skip_reuse:
 			/* assign bind_addr to srv_conn */
 			srv_conn->src = bind_addr;
 			bind_addr = NULL;
-
-			if (!sockaddr_alloc(&srv_conn->dst, 0, 0)) {
-				conn_free(srv_conn);
-				return SF_ERR_RESOURCE;
-			}
 
 			srv_conn->hash_node->node.key = hash;
 		}

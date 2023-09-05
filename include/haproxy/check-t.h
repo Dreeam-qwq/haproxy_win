@@ -56,8 +56,17 @@ enum chk_result {
 #define CHK_ST_OUT_ALLOC        0x0080  /* check blocked waiting for output buffer allocation */
 #define CHK_ST_CLOSE_CONN       0x0100  /* check is waiting that the connection gets closed */
 #define CHK_ST_PURGE            0x0200  /* check must be freed */
-#define CHK_ST_SLEEPING         0x0400  /* check was sleeping */
-#define CHK_ST_FASTINTER        0x0800  /* force fastinter check */
+#define CHK_ST_FASTINTER        0x0400  /* force fastinter check */
+#define CHK_ST_READY            0x0800  /* check ready to migrate or run, see below */
+#define CHK_ST_SLEEPING         0x1000  /* check was sleeping, i.e. not currently bound to a thread, see below */
+
+/* 4 possible states for CHK_ST_SLEEPING and CHK_ST_READY:
+ *   SLP  RDY   State      Description
+ *    0    0    QUEUED     Check is in queue due to concurrency limit
+ *    0    1    RUNNING    Check is bound to current thread and running
+ *    1    0    SLEEPING   Check is sleeping, not bound to a thread
+ *    1    1    MIGRATING  Check is migrating to another thread
+ */
 
 /* check status */
 enum healthcheck_status {
@@ -182,6 +191,7 @@ struct check {
 	char *alpn_str;                         /* ALPN to use for checks */
 	int alpn_len;                           /* ALPN string length */
 	const struct mux_proto_list *mux_proto; /* the mux to use for all outgoing connections (specified by the "proto" keyword) */
+	struct list check_queue;                /* entry in the check queue. Not empty = in queue. */
 	int via_socks4;                         /* check the connection via socks4 proxy */
 };
 

@@ -108,6 +108,9 @@
 #include <haproxy/global.h>
 #include <haproxy/hlua.h>
 #include <haproxy/http_rules.h>
+#if defined(USE_LINUX_CAP)
+#include <haproxy/linuxcap.h>
+#endif
 #include <haproxy/list.h>
 #include <haproxy/listener.h>
 #include <haproxy/log.h>
@@ -1954,6 +1957,15 @@ static void init(int argc, char **argv)
         wolfSSL_Init();
         wolfSSL_Debugging_ON();
 #endif
+
+#ifdef USE_OPENSSL_AWSLC
+        const char *version_str = OpenSSL_version(OPENSSL_VERSION);
+        if (strncmp(version_str, "AWS-LC", 6) != 0) {
+            ha_alert("HAPRoxy built with AWS-LC but running with %s.\n", version_str);
+		    exit(1);
+        }
+#endif
+
 #if (HA_OPENSSL_VERSION_NUMBER < 0x1010000fL)
 	/* Initialize the error strings of OpenSSL
 	 * It only needs to be done explicitly with older versions of the SSL
@@ -2297,6 +2309,9 @@ static void init(int argc, char **argv)
                 exit(1);
         }
 #endif
+
+	thread_detect_binding_discrepancies();
+	thread_detect_more_than_cpus();
 
 	/* Apply server states */
 	apply_server_state();
@@ -3184,6 +3199,8 @@ static void *run_thread_poll_loop(void *data)
 /* set uid/gid depending on global settings */
 static void set_identity(const char *program_name)
 {
+	int from_uid __maybe_unused = geteuid();
+
 	if (global.gid) {
 		if (getgroups(0, NULL) > 0 && setgroups(0, NULL) == -1)
 			ha_warning("[%s.main()] Failed to drop supplementary groups. Using 'gid'/'group'"
@@ -3196,11 +3213,27 @@ static void set_identity(const char *program_name)
 		}
 	}
 
+#if defined(USE_LINUX_CAP)
+	if (prepare_caps_for_setuid(from_uid, global.uid) < 0) {
+		ha_alert("[%s.main()] Cannot switch uid to %d.\n", program_name, global.uid);
+		protocol_unbind_all();
+		exit(1);
+	}
+#endif
+
 	if (global.uid && setuid(global.uid) == -1) {
 		ha_alert("[%s.main()] Cannot set uid %d.\n", program_name, global.uid);
 		protocol_unbind_all();
 		exit(1);
 	}
+
+#if defined(USE_LINUX_CAP)
+	if (finalize_caps_after_setuid(from_uid, global.uid) < 0) {
+		ha_alert("[%s.main()] Cannot switch uid to %d.\n", program_name, global.uid);
+		protocol_unbind_all();
+		exit(1);
+	}
+#endif
 }
 
 int main(int argc, char **argv)

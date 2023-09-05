@@ -33,6 +33,7 @@
 #include <haproxy/task.h>
 #include <haproxy/thread-t.h>
 #include <haproxy/time.h>
+#include <haproxy/tools.h>
 
 
 __decl_thread(extern HA_SPINLOCK_T idle_conn_srv_lock);
@@ -84,6 +85,7 @@ void srv_release_conn(struct server *srv, struct connection *conn);
 struct connection *srv_lookup_conn(struct eb_root *tree, uint64_t hash);
 struct connection *srv_lookup_conn_next(struct connection *conn);
 
+void _srv_add_idle(struct server *srv, struct connection *conn, int is_safe);
 int srv_add_to_idle_list(struct server *srv, struct connection *conn, int is_safe);
 struct task *srv_cleanup_toremove_conns(struct task *task, void *context, unsigned int state);
 
@@ -303,6 +305,16 @@ static inline void srv_minmax_conn_apply(struct server *srv)
 		/* minconn was not specified, so we set it to maxconn */
 		srv->minconn = srv->maxconn;
 	}
+}
+
+/* Returns true if server is used as transparent mode. */
+static inline int srv_is_transparent(const struct server *srv)
+{
+	/* A reverse server does not have any address but it is not used as a
+	 * transparent one.
+	 */
+	return (!is_addr(&srv->addr) && !(srv->flags & SRV_F_REVERSE)) ||
+	       (srv->flags & SRV_F_MAPPORTS);
 }
 
 #endif /* _HAPROXY_SERVER_H */

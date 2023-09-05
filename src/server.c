@@ -2765,6 +2765,22 @@ static int _srv_parse_init(struct server **srv, char **args, int *cur_arg,
 		else
 			newsrv->tmpl_info.prefix = strdup(args[1]);
 
+		/* special address specifier */
+		if (args[*cur_arg][0] == '@') {
+			if (strcmp(args[*cur_arg], "@reverse") == 0) {
+				newsrv->flags |= SRV_F_REVERSE;
+			}
+			else {
+				ha_alert("unknown server address specifier '%s'\n",
+				         args[*cur_arg]);
+				err_code |= ERR_ALERT | ERR_FATAL;
+				goto out;
+			}
+
+			(*cur_arg)++;
+			parse_flags &= ~SRV_PARSE_PARSE_ADDR;
+		}
+
 		/* several ways to check the port component :
 		 *  - IP    => port=+0, relative (IPv4 only)
 		 *  - IP:   => port=+0, relative
@@ -4204,22 +4220,20 @@ struct server *cli_find_server(struct appctx *appctx, char *arg)
 {
 	struct proxy *px;
 	struct server *sv;
-	char *line;
+	struct ist be_name, sv_name = ist(arg);
 
-	/* split "backend/server" and make <line> point to server */
-	for (line = arg; *line; line++)
-		if (*line == '/') {
-			*line++ = '\0';
-			break;
-		}
-
-	if (!*line || !*arg) {
-		cli_err(appctx, "Require 'backend/server'.\n");
+	be_name = istsplit(&sv_name, '/');
+	if (!istlen(sv_name)) {
+		cli_err(appctx, "Require 'backend/server'.");
 		return NULL;
 	}
 
-	if (!get_backend_server(arg, line, &px, &sv)) {
-		cli_err(appctx, px ? "No such server.\n" : "No such backend.\n");
+	if (!(px = proxy_be_by_name(ist0(be_name)))) {
+		cli_err(appctx, "No such backend.");
+		return NULL;
+	}
+	if (!(sv = server_find_by_name(px, ist0(sv_name)))) {
+		cli_err(appctx, "No such server.");
 		return NULL;
 	}
 
@@ -4459,23 +4473,18 @@ static int cli_parse_set_server(char **args, char *payload, struct appctx *appct
 
 static int cli_parse_get_weight(char **args, char *payload, struct appctx *appctx, void *private)
 {
-	struct proxy *px;
+	struct proxy *be;
 	struct server *sv;
-	char *line;
+	struct ist be_name, sv_name = ist(args[2]);
 
+	be_name = istsplit(&sv_name, '/');
+	if (!istlen(sv_name))
+		return cli_err(appctx, "Require 'backend/server'.");
 
-	/* split "backend/server" and make <line> point to server */
-	for (line = args[2]; *line; line++)
-		if (*line == '/') {
-			*line++ = '\0';
-			break;
-		}
-
-	if (!*line)
-		return cli_err(appctx, "Require 'backend/server'.\n");
-
-	if (!get_backend_server(args[2], line, &px, &sv))
-		return cli_err(appctx, px ? "No such server.\n" : "No such backend.\n");
+	if (!(be = proxy_be_by_name(ist0(be_name))))
+		return cli_err(appctx, "No such backend.");
+	if (!(sv = server_find_by_name(be, ist0(sv_name))))
+		return cli_err(appctx, "No such server.");
 
 	/* return server's effective weight at the moment */
 	snprintf(trash.area, trash.size, "%d (initial %d)\n", sv->uweight,
@@ -4791,6 +4800,8 @@ int srv_init_per_thr(struct server *srv)
 		srv->per_thr[i].safe_conns = EB_ROOT;
 		srv->per_thr[i].avail_conns = EB_ROOT;
 		MT_LIST_INIT(&srv->per_thr[i].streams);
+
+		LIST_INIT(&srv->per_thr[i].idle_conn_list);
 	}
 
 	return 0;
@@ -5067,26 +5078,13 @@ static int cli_parse_delete_server(char **args, char *payload, struct appctx *ap
 {
 	struct proxy *be;
 	struct server *srv;
-	char *be_name, *sv_name;
 	struct server *prev_del;
+	struct ist be_name, sv_name;
 
 	if (!cli_has_level(appctx, ACCESS_LVL_ADMIN))
 		return 1;
 
 	++args;
-
-	sv_name = be_name = args[1];
-	/* split backend/server arg */
-	while (*sv_name && *(++sv_name)) {
-		if (*sv_name == '/') {
-			*sv_name = '\0';
-			++sv_name;
-			break;
-		}
-	}
-
-	if (!*sv_name)
-		return cli_err(appctx, "Require 'backend/server'.");
 
 	/* The proxy servers list is currently not protected by a lock so this
 	 * requires thread isolation. In addition, any place referencing the
@@ -5096,13 +5094,18 @@ static int cli_parse_delete_server(char **args, char *payload, struct appctx *ap
 	 */
 	thread_isolate_full();
 
-	get_backend_server(be_name, sv_name, &be, &srv);
-	if (!be) {
-		cli_err(appctx, "No such backend.");
+	sv_name = ist(args[1]);
+	be_name = istsplit(&sv_name, '/');
+	if (!istlen(sv_name)) {
+		cli_err(appctx, "Require 'backend/server'.");
 		goto out;
 	}
 
-	if (!srv) {
+	if (!(be = proxy_be_by_name(ist0(be_name)))) {
+		cli_err(appctx, "No such backend.");
+		goto out;
+	}
+	if (!(srv = server_find_by_name(be, ist0(sv_name)))) {
 		cli_err(appctx, "No such server.");
 		goto out;
 	}
@@ -5866,31 +5869,28 @@ struct task *srv_cleanup_toremove_conns(struct task *task, void *context, unsign
 	return task;
 }
 
-/* Move toremove_nb connections from idle_tree to toremove_list, -1 means
- * moving them all.
+/* Move <toremove_nb> count connections from <list> storage to <toremove_list>
+ * list storage. -1 means moving all of them.
+ *
  * Returns the number of connections moved.
  *
  * Must be called with idle_conns_lock held.
  */
-static int srv_migrate_conns_to_remove(struct eb_root *idle_tree, struct mt_list *toremove_list, int toremove_nb)
+static int srv_migrate_conns_to_remove(struct list *list, struct mt_list *toremove_list, int toremove_nb)
 {
-	struct eb_node *node, *next;
-	struct conn_hash_node *hash_node;
+	struct connection *conn;
 	int i = 0;
 
-	node = eb_first(idle_tree);
-	while (node) {
-		next = eb_next(node);
+	while (!LIST_ISEMPTY(list)) {
 		if (toremove_nb != -1 && i >= toremove_nb)
 			break;
 
-		hash_node = ebmb_entry(node, struct conn_hash_node, node);
-		eb_delete(node);
-		MT_LIST_APPEND(toremove_list, &hash_node->conn->toremove_list);
+		conn = LIST_ELEM(list->n, struct connection *, toremove_list);
+		conn_delete_from_tree(conn);
+		MT_LIST_APPEND(toremove_list, &conn->toremove_list);
 		i++;
-
-		node = next;
 	}
+
 	return i;
 }
 /* cleanup connections for a given server
@@ -5909,9 +5909,7 @@ static void srv_cleanup_connections(struct server *srv)
 	for (i = tid;;) {
 		did_remove = 0;
 		HA_SPIN_LOCK(IDLE_CONNS_LOCK, &idle_conns[i].idle_conns_lock);
-		if (srv_migrate_conns_to_remove(&srv->per_thr[i].idle_conns, &idle_conns[i].toremove_conns, -1) > 0)
-			did_remove = 1;
-		if (srv_migrate_conns_to_remove(&srv->per_thr[i].safe_conns, &idle_conns[i].toremove_conns, -1) > 0)
+		if (srv_migrate_conns_to_remove(&srv->per_thr[i].idle_conn_list, &idle_conns[i].toremove_conns, -1) > 0)
 			did_remove = 1;
 		HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[i].idle_conns_lock);
 		if (did_remove)
@@ -5941,10 +5939,12 @@ void srv_release_conn(struct server *srv, struct connection *conn)
 	}
 
 	/* Remove the connection from any tree (safe, idle or available) */
-	HA_SPIN_LOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
-	conn_delete_from_tree(&conn->hash_node->node);
-	conn->flags &= ~CO_FL_LIST_MASK;
-	HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
+	if (conn->hash_node) {
+		HA_SPIN_LOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
+		conn_delete_from_tree(conn);
+		conn->flags &= ~CO_FL_LIST_MASK;
+		HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
+	}
 }
 
 /* retrieve a connection from its <hash> in <tree>
@@ -5983,6 +5983,28 @@ struct connection *srv_lookup_conn_next(struct connection *conn)
 	return next_conn;
 }
 
+/* Add <conn> in <srv> idle trees. Set <is_safe> if connection is deemed safe
+ * for reuse.
+ *
+ * This function is a simple wrapper for tree insert. It should only be used
+ * for internal usage or when removing briefly the connection to avoid takeover
+ * on it before reinserting it with this function. In other context, prefer to
+ * use the full feature srv_add_to_idle_list().
+ *
+ * Must be called with idle_conns_lock.
+ */
+void _srv_add_idle(struct server *srv, struct connection *conn, int is_safe)
+{
+	struct eb_root *tree = is_safe ? &srv->per_thr[tid].safe_conns :
+	                                 &srv->per_thr[tid].idle_conns;
+
+	/* first insert in idle or safe tree. */
+	eb64_insert(tree, &conn->hash_node->node);
+
+	/* insert in list sorted by connection usage. */
+	LIST_APPEND(&srv->per_thr[tid].idle_conn_list, &conn->idle_list);
+}
+
 /* This adds an idle connection to the server's list if the connection is
  * reusable, not held by any owner anymore, but still has available streams.
  */
@@ -6015,15 +6037,15 @@ int srv_add_to_idle_list(struct server *srv, struct connection *conn, int is_saf
 		_HA_ATOMIC_DEC(&srv->curr_used_conns);
 
 		HA_SPIN_LOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
-		conn_delete_from_tree(&conn->hash_node->node);
+		conn_delete_from_tree(conn);
 
 		if (is_safe) {
 			conn->flags = (conn->flags & ~CO_FL_LIST_MASK) | CO_FL_SAFE_LIST;
-			eb64_insert(&srv->per_thr[tid].safe_conns, &conn->hash_node->node);
+			_srv_add_idle(srv, conn, 1);
 			_HA_ATOMIC_INC(&srv->curr_safe_nb);
 		} else {
 			conn->flags = (conn->flags & ~CO_FL_LIST_MASK) | CO_FL_IDLE_LIST;
-			eb64_insert(&srv->per_thr[tid].idle_conns, &conn->hash_node->node);
+			_srv_add_idle(srv, conn, 0);
 			_HA_ATOMIC_INC(&srv->curr_idle_nb);
 		}
 		HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
@@ -6112,11 +6134,8 @@ struct task *srv_cleanup_idle_conns(struct task *task, void *context, unsigned i
 			           curr_idle + 1;
 
 			HA_SPIN_LOCK(IDLE_CONNS_LOCK, &idle_conns[i].idle_conns_lock);
-			j = srv_migrate_conns_to_remove(&srv->per_thr[i].idle_conns, &idle_conns[i].toremove_conns, max_conn);
+			j = srv_migrate_conns_to_remove(&srv->per_thr[i].idle_conn_list, &idle_conns[i].toremove_conns, max_conn);
 			if (j > 0)
-				did_remove = 1;
-			if (max_conn - j > 0 &&
-			    srv_migrate_conns_to_remove(&srv->per_thr[i].safe_conns, &idle_conns[i].toremove_conns, max_conn - j) > 0)
 				did_remove = 1;
 			HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[i].idle_conns_lock);
 
@@ -6173,7 +6192,7 @@ static void srv_close_idle_conns(struct server *srv)
 
 				if (conn->ctrl->ctrl_close)
 					conn->ctrl->ctrl_close(conn);
-				ebmb_delete(node);
+				conn_delete_from_tree(conn);
 			}
 		}
 	}

@@ -85,7 +85,8 @@ enum {
 	CO_FL_IDLE_LIST     = 0x00000002,  /* 2 = in idle_list, 3 = invalid */
 	CO_FL_LIST_MASK     = 0x00000003,  /* Is the connection in any server-managed list ? */
 
-	/* unused : 0x00000004, 0x00000008 */
+	CO_FL_REVERSED      = 0x00000004,  /* connection has been reversed but not yet accepted */
+	/* unused : 0x00000008 */
 
 	/* unused : 0x00000010 */
 	/* unused : 0x00000020 */
@@ -328,6 +329,7 @@ enum proto_proxy_side {
 enum mux_ctl_type {
 	MUX_STATUS, /* Expects an int as output, sets it to a combinaison of MUX_STATUS flags */
 	MUX_EXIT_STATUS, /* Expects an int as output, sets the mux exist/error/http status, if known or 0 */
+	MUX_REVERSE_CONN, /* Notify about an active reverse connection accepted. */
 };
 
 /* response for ctl MUX_STATUS */
@@ -501,6 +503,19 @@ struct conn_hash_params {
 	struct sockaddr_storage *dst_addr;
 };
 
+/*
+ * This structure describes an TLV entry consisting of its type
+ * and corresponding payload. This can be used to construct a list
+ * from which arbitrary TLV payloads can be fetched.
+ * It might be possible to embed the 'tlv struct' here in the future.
+ */
+struct conn_tlv_list {
+	struct list list;
+	unsigned short len; // 65535 should be more than enough!
+	unsigned char type;
+	char value[0];
+} __attribute__((packed));
+
 /* This structure describes a connection with its methods and data.
  * A connection may be performed to proxy or server via a local or remote
  * socket, and can also be made to an internal applet. It can support
@@ -524,7 +539,10 @@ struct connection {
 
 	/* second cache line */
 	struct wait_event *subs; /* Task to wake when awaited events are ready */
-	struct mt_list toremove_list; /* list for connection to clean up */
+	union {
+		struct list    idle_list; /* list element for idle connection in server idle list */
+		struct mt_list toremove_list; /* list element when idle connection is ready to be purged */
+	};
 	union {
 		struct list session_list;  /* used by backend conns, list of attached connections to a session */
 		struct list stopping_list; /* used by frontend conns, attach point in mux stopping list */
@@ -536,13 +554,18 @@ struct connection {
 	void (*destroy_cb)(struct connection *conn);  /* callback to notify of imminent death of the connection */
 	struct sockaddr_storage *src; /* source address (pool), when known, otherwise NULL */
 	struct sockaddr_storage *dst; /* destination address (pool), when known, otherwise NULL */
-	struct ist proxy_authority;   /* Value of the authority TLV received via PROXYv2 */
-	struct ist proxy_unique_id;   /* Value of the unique ID TLV received via PROXYv2 */
+	struct list tlv_list;         /* list of TLVs received via PROXYv2 */
 
 	/* used to identify a backend connection for http-reuse,
 	 * thus only present if conn.target is of type OBJ_TYPE_SERVER
 	 */
 	struct conn_hash_node *hash_node;
+
+	/* Members used if connection must be reversed. */
+	struct {
+		enum obj_type *target; /* Listener for active reverse, server for passive. */
+		struct buffer name;    /* Only used for passive reverse. Used as SNI when connection added to server idle pool. */
+	} reverse;
 };
 
 /* node for backend connection in the idle trees for http-reuse
@@ -615,10 +638,14 @@ struct mux_proto_list {
 #define PP2_CLIENT_CERT_CONN     0x02
 #define PP2_CLIENT_CERT_SESS     0x04
 
-/* Max length of the authority TLV */
-#define PP2_AUTHORITY_MAX 255
+#define PP2_CRC32C_LEN 4 /* Length of a CRC32C TLV value */
 
-#define TLV_HEADER_SIZE      3
+#define TLV_HEADER_SIZE 3
+
+#define HA_PP2_AUTHORITY_MAX 255  /* Maximum length of an authority TLV */
+#define HA_PP2_TLV_VALUE_128 128  /* E.g., accomodate unique IDs (128 B) */
+#define HA_PP2_TLV_VALUE_256 256  /* E.g., accomodate authority TLVs (currently, <= 255 B) */
+#define HA_PP2_MAX_ALLOC     1024 /* Maximum TLV value for PPv2 to prevent DoS */
 
 struct proxy_hdr_v2 {
 	uint8_t sig[12];   /* hex 0D 0A 0D 0A 00 0D 0A 51 55 49 54 0A */

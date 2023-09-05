@@ -23,6 +23,13 @@ int ha_cpuset_clr(struct hap_cpuset *set, int cpu);
  */
 void ha_cpuset_and(struct hap_cpuset *dst, struct hap_cpuset *src);
 
+/* Bitwise OR equivalent operation between <src> and <dst> stored in <dst>.
+ */
+void ha_cpuset_or(struct hap_cpuset *dst, struct hap_cpuset *src);
+
+/* returns non-zero if CPU index <cpu> is set in <set>, otherwise 0. */
+int ha_cpuset_isset(const struct hap_cpuset *set, int cpu);
+
 /* Returns the count of set index in <set>.
  */
 int ha_cpuset_count(const struct hap_cpuset *set);
@@ -40,6 +47,11 @@ void ha_cpuset_assign(struct hap_cpuset *dst, struct hap_cpuset *src);
 /* Returns the biggest index plus one usable on the platform.
  */
 int ha_cpuset_size(void);
+
+/* Detects CPUs that are bound to the current process. Returns the number of
+ * CPUs detected or 0 if the detection failed.
+ */
+int ha_cpuset_detect_bound(struct hap_cpuset *set);
 
 /* Returns true if at least one cpu-map directive was configured, otherwise
  * false.

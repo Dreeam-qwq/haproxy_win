@@ -1106,6 +1106,57 @@ struct task *srv_chk_io_cb(struct task *t, void *ctx, unsigned int state)
 	return NULL;
 }
 
+/* returns <0, 0, >0 if check thread 1 is respectively less loaded than,
+ * equally as, or more loaded than thread 2. This is made to decide on
+ * migrations so a margin is applied in either direction. For ease of
+ * remembering the direction, consider this returns load1 - load2.
+ */
+static inline int check_thread_cmp_load(int thr1, int thr2)
+{
+	uint t1_load = _HA_ATOMIC_LOAD(&ha_thread_ctx[thr1].rq_total);
+	uint t1_act  = _HA_ATOMIC_LOAD(&ha_thread_ctx[thr1].active_checks);
+	uint t2_load = _HA_ATOMIC_LOAD(&ha_thread_ctx[thr2].rq_total);
+	uint t2_act  = _HA_ATOMIC_LOAD(&ha_thread_ctx[thr2].active_checks);
+
+	/* twice as more active checks is a significant difference */
+	if (t1_act * 2 < t2_act)
+		return -1;
+
+	if (t2_act * 2 < t1_act)
+		return 1;
+
+	/* twice as more rqload with more checks is also a significant
+	 * difference.
+	 */
+	if (t1_act <= t2_act && t1_load * 2 < t2_load)
+		return -1;
+
+	if (t2_act <= t1_act && t2_load * 2 < t1_load)
+		return 1;
+
+	/* otherwise they're roughly equal */
+	return 0;
+}
+
+/* returns <0, 0, >0 if check thread 1's active checks count is respectively
+ * higher than, equal, or lower than thread 2's. This is made to decide on
+ * forced migrations upon overload, so only a very little margin is applied
+ * here (~1%). For ease of remembering the direction, consider this returns
+ * active1 - active2.
+ */
+static inline int check_thread_cmp_active(int thr1, int thr2)
+{
+	uint t1_act  = _HA_ATOMIC_LOAD(&ha_thread_ctx[thr1].active_checks);
+	uint t2_act  = _HA_ATOMIC_LOAD(&ha_thread_ctx[thr2].active_checks);
+
+	if (t1_act * 128 >= t2_act * 129)
+		return 1;
+	if (t2_act * 128 >= t1_act * 129)
+		return -1;
+	return 0;
+}
+
+
 /* manages a server health-check that uses a connection. Returns
  * the time the task accepts to wait, or TIME_ETERNITY for infinity.
  *
@@ -1132,32 +1183,90 @@ struct task *process_chk_conn(struct task *t, void *context, unsigned int state)
 		 * than half of the current thread's load, and if so we'll
 		 * bounce the task there. It's possible because it's not yet
 		 * tied to the current thread. The other thread will not bounce
-		 * the task again because we're removing CHK_ST_SLEEPING.
+		 * the task again because we're setting CHK_ST_READY indicating
+		 * a migration.
 		 */
+		uint run_checks = _HA_ATOMIC_LOAD(&th_ctx->running_checks);
 		uint my_load = HA_ATOMIC_LOAD(&th_ctx->rq_total);
+		uint attempts = MIN(global.nbthread, 3);
 
+		if (check->state & CHK_ST_READY) {
+			/* check was migrated, active already counted */
+			activity[tid].check_adopted++;
+		}
+		else {
+			/* first wakeup, let's check if another thread is less loaded
+			 * than this one in order to smooth the load. If the current
+			 * thread is not yet overloaded, we attempt an opportunistic
+			 * migration to another thread that is not full and that is
+			 * significantly less loaded. And if the current thread is
+			 * already overloaded, we attempt a forced migration to a
+			 * thread with less active checks. We try at most 3 random
+			 * other thread.
+			 */
+			while (attempts-- > 0 &&
+			       (!LIST_ISEMPTY(&th_ctx->queued_checks) || my_load >= 3) &&
+			       _HA_ATOMIC_LOAD(&th_ctx->active_checks) >= 3) {
+				uint new_tid  = statistical_prng_range(global.nbthread);
+
+				if (new_tid == tid)
+					continue;
+
+				ALREADY_CHECKED(new_tid);
+
+				if (check_thread_cmp_active(tid, new_tid) > 0 &&
+				    (run_checks >= global.tune.max_checks_per_thread ||
+				     check_thread_cmp_load(tid, new_tid) > 0)) {
+					/* Found one. Let's migrate the task over there. We have to
+					 * remove it from the WQ first and kill its expire time
+					 * otherwise the scheduler will reinsert it and trigger a
+					 * BUG_ON() as we're not allowed to call task_queue() for a
+					 * foreign thread. The recipient will restore the expiration.
+					 */
+					check->state |= CHK_ST_READY;
+					HA_ATOMIC_INC(&ha_thread_ctx[new_tid].active_checks);
+					task_unlink_wq(t);
+					t->expire = TICK_ETERNITY;
+					task_set_thread(t, new_tid);
+					task_wakeup(t, TASK_WOKEN_MSG);
+					TRACE_LEAVE(CHK_EV_TASK_WAKE, check);
+					return t;
+				}
+			}
+			/* check just woke up, count it as active */
+			_HA_ATOMIC_INC(&th_ctx->active_checks);
+		}
+
+		/* OK we're keeping it so this check is ours now */
+		task_set_thread(t, tid);
 		check->state &= ~CHK_ST_SLEEPING;
 
-		if (my_load >= 2) {
-			uint new_tid  = statistical_prng_range(global.nbthread);
-			uint new_load = HA_ATOMIC_LOAD(&ha_thread_ctx[new_tid].rq_total);
+		/* if we just woke up and the thread is full of running, or
+		 * already has others waiting, we might have to wait in queue
+		 * (for health checks only). This means !SLEEPING && !READY.
+		 */
+		if (check->server &&
+		    (!LIST_ISEMPTY(&th_ctx->queued_checks) ||
+		     (global.tune.max_checks_per_thread &&
+		      _HA_ATOMIC_LOAD(&th_ctx->running_checks) >= global.tune.max_checks_per_thread))) {
+			TRACE_DEVEL("health-check queued", CHK_EV_TASK_WAKE, check);
+			t->expire = TICK_ETERNITY;
+			LIST_APPEND(&th_ctx->queued_checks, &check->check_queue);
 
-			if (new_load <= my_load / 2) {
-				/* Found one. Let's migrate the task over there. We have to
-				 * remove it from the WQ first and kill its expire time
-				 * otherwise the scheduler will reinsert it and trigger a
-				 * BUG_ON() as we're not allowed to call task_queue() for a
-				 * foreign thread. The recipient will restore the expiration.
-				 */
-				task_unlink_wq(t);
-				t->expire = TICK_ETERNITY;
-				task_set_thread(t, new_tid);
-				task_wakeup(t, TASK_WOKEN_MSG);
-				TRACE_LEAVE(CHK_EV_TASK_WAKE, check);
-				return t;
-			}
+			/* reset fastinter flag (if set) so that srv_getinter()
+			 * only returns fastinter if server health is degraded
+			 */
+			check->state &= ~CHK_ST_FASTINTER;
+			goto out_leave;
 		}
+
+		/* OK let's run, now we cannot roll back anymore */
+		check->state |= CHK_ST_READY;
+		activity[tid].check_started++;
+		_HA_ATOMIC_INC(&th_ctx->running_checks);
 	}
+
+	/* at this point, CHK_ST_SLEEPING = 0 and CHK_ST_READY = 1*/
 
 	if (check->server)
 		HA_SPIN_LOCK(SERVER_LOCK, &check->server->lock);
@@ -1167,8 +1276,10 @@ struct task *process_chk_conn(struct task *t, void *context, unsigned int state)
 		 * needs an expiration timer that was supposed to be now, but that
 		 * was erased during the bounce.
 		 */
-		if (!tick_isset(t->expire))
+		if (!tick_isset(t->expire)) {
 			t->expire = now_ms;
+			expired = 0;
+		}
 	}
 
 	if (unlikely(check->state & CHK_ST_PURGE)) {
@@ -1180,7 +1291,7 @@ struct task *process_chk_conn(struct task *t, void *context, unsigned int state)
 		 * new state (e.g. fastinter), in which case we'll reprogram
 		 * the new timer.
 		 */
-		if (!expired) /* woke up too early */ {
+		if (!tick_is_expired(t->expire, now_ms)) { /* woke up too early */
 			if (check->server) {
 				int new_exp = tick_add(now_ms, MS_TO_TICKS(srv_getinter(check)));
 
@@ -1209,8 +1320,6 @@ struct task *process_chk_conn(struct task *t, void *context, unsigned int state)
 
 		check->state |= CHK_ST_INPROGRESS;
 		TRACE_STATE("init new health-check", CHK_EV_TASK_WAKE|CHK_EV_HCHK_START, check);
-
-		task_set_thread(t, tid);
 
 		check->current_step = NULL;
 
@@ -1309,10 +1418,32 @@ struct task *process_chk_conn(struct task *t, void *context, unsigned int state)
 
 	check_release_buf(check, &check->bi);
 	check_release_buf(check, &check->bo);
+	_HA_ATOMIC_DEC(&th_ctx->running_checks);
+	_HA_ATOMIC_DEC(&th_ctx->active_checks);
 	check->state &= ~(CHK_ST_INPROGRESS|CHK_ST_IN_ALLOC|CHK_ST_OUT_ALLOC);
+	check->state &= ~CHK_ST_READY;
 	check->state |= CHK_ST_SLEEPING;
 
  update_timer:
+	/* when going to sleep, we need to check if other checks are waiting
+	 * for a slot. If so we pick them out of the queue and wake them up.
+	 */
+	if (check->server && (check->state & CHK_ST_SLEEPING)) {
+		if (!LIST_ISEMPTY(&th_ctx->queued_checks) &&
+		    _HA_ATOMIC_LOAD(&th_ctx->running_checks) < global.tune.max_checks_per_thread) {
+			struct check *next_chk = LIST_ELEM(th_ctx->queued_checks.n, struct check *, check_queue);
+
+			/* wake up pending task */
+			LIST_DEL_INIT(&next_chk->check_queue);
+
+			activity[tid].check_started++;
+			_HA_ATOMIC_INC(&th_ctx->running_checks);
+			next_chk->state |= CHK_ST_READY;
+			/* now running */
+			task_wakeup(next_chk->task, TASK_WOKEN_RES);
+		}
+	}
+
 	if (check->server) {
 		rv = 0;
 		if (global.spread_checks > 0) {
@@ -1338,6 +1469,7 @@ struct task *process_chk_conn(struct task *t, void *context, unsigned int state)
 	if (check->server)
 		HA_SPIN_UNLOCK(SERVER_LOCK, &check->server->lock);
 
+ out_leave:
 	TRACE_LEAVE(CHK_EV_TASK_WAKE, check);
 
 	/* Free the check if set to PURGE. After this, the check instance may be
@@ -1422,6 +1554,7 @@ const char *init_check(struct check *check, int type)
 	check->bi = BUF_NULL;
 	check->bo = BUF_NULL;
 	LIST_INIT(&check->buf_wait.list);
+	LIST_INIT(&check->check_queue);
 	return NULL;
 }
 
@@ -1752,7 +1885,7 @@ int init_srv_check(struct server *srv)
 		ret |= ERR_ALERT | ERR_ABORT;
 		goto out;
 	}
-	srv->check.state |= CHK_ST_CONFIGURED | CHK_ST_ENABLED;
+	srv->check.state |= CHK_ST_CONFIGURED | CHK_ST_ENABLED | CHK_ST_SLEEPING;
 	srv_take(srv);
 
 	/* Only increment maxsock for servers from the configuration. Dynamic
@@ -1815,7 +1948,7 @@ int init_srv_agent_check(struct server *srv)
 	if (!srv->agent.inter)
 		srv->agent.inter = srv->check.inter;
 
-	srv->agent.state |= CHK_ST_CONFIGURED | CHK_ST_ENABLED | CHK_ST_AGENT;
+	srv->agent.state |= CHK_ST_CONFIGURED | CHK_ST_ENABLED | CHK_ST_SLEEPING | CHK_ST_AGENT;
 	srv_take(srv);
 
 	/* Only increment maxsock for servers from the configuration. Dynamic
@@ -1860,6 +1993,16 @@ REGISTER_POST_CHECK(start_checks);
 REGISTER_SERVER_DEINIT(deinit_srv_check);
 REGISTER_SERVER_DEINIT(deinit_srv_agent_check);
 
+/* perform minimal intializations */
+static void init_checks()
+{
+	int i;
+
+	for (i = 0; i < MAX_THREADS; i++)
+		LIST_INIT(&ha_thread_ctx[i].queued_checks);
+}
+
+INITCALL0(STG_PREPARE, init_checks);
 
 /**************************************************************************/
 /************************** Check sample fetches **************************/
@@ -2444,6 +2587,26 @@ static int srv_parse_check_port(char **args, int *cur_arg, struct proxy *curpx, 
 	goto out;
 }
 
+/* config parser for global "tune.max-checks-per-thread" */
+static int check_parse_global_max_checks(char **args, int section_type, struct proxy *curpx,
+                                       const struct proxy *defpx, const char *file, int line,
+                                       char **err)
+{
+	if (too_many_args(1, args, err, NULL))
+		return -1;
+	global.tune.max_checks_per_thread = atoi(args[1]);
+	return 0;
+}
+
+/* register "global" section keywords */
+static struct cfg_kw_list chk_cfg_kws = {ILH, {
+	{ CFG_GLOBAL, "tune.max-checks-per-thread", check_parse_global_max_checks },
+	{ 0, NULL, NULL }
+}};
+
+INITCALL1(STG_REGISTER, cfg_register_keywords, &chk_cfg_kws);
+
+/* register "server" line keywords */
 static struct srv_kw_list srv_kws = { "CHK", { }, {
 	{ "addr",                srv_parse_addr,                1,  1,  1 }, /* IP address to send health to or to probe from agent-check */
 	{ "agent-addr",          srv_parse_agent_addr,          1,  1,  1 }, /* Enable an auxiliary agent check */

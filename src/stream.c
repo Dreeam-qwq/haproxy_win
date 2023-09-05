@@ -2831,16 +2831,16 @@ void stream_dump(struct buffer *buf, const struct stream *s, const char *pfx, ch
 	res = &s->res;
 
 	scf = s->scf;
-	cof = sc_conn(scf);
-	acf = sc_appctx(scf);
+	cof = (scf && scf->sedesc) ? sc_conn(scf) : NULL;
+	acf = (scf && scf->sedesc) ? sc_appctx(scf) : NULL;
 	if (cof && cof->src && addr_to_str(cof->src, pn, sizeof(pn)) >= 0)
 		src = pn;
 	else if (acf)
 		src = acf->applet->name;
 
 	scb = s->scb;
-	cob = sc_conn(scb);
-	acb = sc_appctx(scb);
+	cob = (scb && scb->sedesc) ? sc_conn(scb) : NULL;
+	acb = (scb && scb->sedesc) ? sc_appctx(scb) : NULL;
 	srv = objt_server(s->target);
 	if (srv)
 		dst = srv->id;
@@ -2861,7 +2861,8 @@ void stream_dump(struct buffer *buf, const struct stream *s, const char *pfx, ch
 		           (s->txn ? h1_msg_state_str(s->txn->req.msg_state): "-"), (s->txn ? s->txn->req.flags : 0),
 		           (s->txn ? h1_msg_state_str(s->txn->rsp.msg_state): "-"), (s->txn ? s->txn->rsp.flags : 0), eol,
 	              pfx, req->flags, req->analysers, res->flags, res->analysers, eol,
-		      pfx, scf, sc_state_str(scf->state), scf->flags, scb, sc_state_str(scb->state), scb->flags, eol,
+		      pfx, scf, scf ? sc_state_str(scf->state) : 0, scf ? scf->flags : 0,
+		      scb, scb ? sc_state_str(scb->state) : 0, scb ? scb->flags : 0, eol,
 	              pfx, acf, acf ? acf->st0   : 0, acb, acb ? acb->st0   : 0, eol,
 	              pfx, cof, cof ? cof->flags : 0, conn_get_mux_name(cof), cof?cof->ctx:0, conn_get_xprt_name(cof),
 		           cof ? cof->xprt_ctx : 0, conn_get_ctrl_name(cof), conn_fd(cof), eol,
