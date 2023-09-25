@@ -116,6 +116,10 @@ const struct quic_version quic_versions[] = {
 	},
 };
 
+/* Function pointers, can be used to compute a hash from first generated CID and to derive new CIDs */
+uint64_t (*quic_hash64_from_cid)(const unsigned char *cid, int size, const unsigned char *secret, size_t secretlen) = NULL;
+void (*quic_newcid_from_hash64)(unsigned char *cid, int size, uint64_t hash, const unsigned char *secret, size_t secretlen) = NULL;
+
 /* The total number of supported versions */
 const size_t quic_versions_nb = sizeof quic_versions / sizeof *quic_versions;
 /* Listener only preferred version */
@@ -477,8 +481,8 @@ int quic_stateless_reset_token_cpy(unsigned char *pos, size_t len,
                                    const unsigned char *salt, size_t saltlen)
 {
 	/* Input secret */
-	const unsigned char *key = (const unsigned char *)global.cluster_secret;
-	size_t keylen = strlen(global.cluster_secret);
+	const unsigned char *key = global.cluster_secret;
+	size_t keylen = sizeof global.cluster_secret;
 	/* Info */
 	const unsigned char label[] = "stateless token";
 	size_t labellen = sizeof label - 1;
@@ -494,25 +498,14 @@ int quic_stateless_reset_token_cpy(unsigned char *pos, size_t len,
  */
 static int quic_stateless_reset_token_init(struct quic_connection_id *conn_id)
 {
-	int ret;
+	/* Output secret */
+	unsigned char *token = conn_id->stateless_reset_token;
+	size_t tokenlen = sizeof conn_id->stateless_reset_token;
+	/* Salt */
+	const unsigned char *cid = conn_id->cid.data;
+	size_t cidlen = conn_id->cid.len;
 
-	if (global.cluster_secret) {
-		/* Output secret */
-		unsigned char *token = conn_id->stateless_reset_token;
-		size_t tokenlen = sizeof conn_id->stateless_reset_token;
-		/* Salt */
-		const unsigned char *cid = conn_id->cid.data;
-		size_t cidlen = conn_id->cid.len;
-
-		ret = quic_stateless_reset_token_cpy(token, tokenlen, cid, cidlen);
-	}
-	else {
-		/* TODO: RAND_bytes() should be replaced */
-		ret = RAND_bytes(conn_id->stateless_reset_token,
-		                 sizeof conn_id->stateless_reset_token) == 1;
-	}
-
-	return ret;
+	return quic_stateless_reset_token_cpy(token, tokenlen, cid, cidlen);
 }
 
 /* Generate a CID directly derived from <orig> CID and <addr> address.
@@ -655,8 +648,11 @@ struct quic_connection_id *new_quic_cid(struct eb_root *root,
 	conn_id->cid.len = QUIC_HAP_CID_LEN;
 
 	if (!orig) {
-		/* TODO: RAND_bytes() should be replaced */
-		if (RAND_bytes(conn_id->cid.data, conn_id->cid.len) != 1) {
+		if (quic_newcid_from_hash64)
+			quic_newcid_from_hash64(conn_id->cid.data, conn_id->cid.len, qc->hash64,
+						global.cluster_secret, sizeof(global.cluster_secret));
+		else if (RAND_bytes(conn_id->cid.data, conn_id->cid.len) != 1) {
+			/* TODO: RAND_bytes() should be replaced */
 			TRACE_ERROR("RAND_bytes() failed", QUIC_EV_CONN_TXPKT, qc);
 			goto err;
 		}
@@ -846,7 +842,8 @@ static struct quic_cc_conn *qc_new_cc_conn(struct quic_conn *qc)
 	quic_conn_mv_cids_to_cc_conn(cc_qc, qc);
 
 	cc_qc->fd = qc->fd;
-	fdtab[cc_qc->fd].owner = cc_qc;
+	if (qc->fd >= 0)
+		fdtab[cc_qc->fd].owner = cc_qc;
 	cc_qc->flags = qc->flags;
 	if (quic_peer_validated_addr(qc))
 	    cc_qc->flags |= QUIC_FL_CONN_PEER_VALIDATED_ADDR;

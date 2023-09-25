@@ -499,6 +499,8 @@ struct quic_conn_cntrs {
         /* Used only to reach the tasklet for the I/O handler from this        \
          * quic_conn object.                                                   \
          */                                                                    \
+        /* QUIC connection level counters */                                   \
+        struct quic_conn_cntrs cntrs;                                          \
         struct connection *conn;                                               \
     }
 
@@ -518,6 +520,10 @@ struct quic_conn {
 #endif
 
 	uint64_t next_cid_seq_num;
+	/* Initial hash computed from first ID (derived from ODCID).
+	 * it could be reused to derive extra CIDs from the same hash
+	 */
+	uint64_t hash64;
 
 	/* Initial encryption level */
 	struct quic_enc_level *iel;
@@ -584,8 +590,6 @@ struct quic_conn {
 	unsigned int ack_expire;
 
 	const struct qcc_app_ops *app_ops;
-	/* QUIC connection level counters */
-	struct quic_conn_cntrs cntrs;
 	/* Proxy counters */
 	struct quic_counters *prx_counters;
 

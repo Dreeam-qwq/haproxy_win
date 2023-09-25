@@ -3327,35 +3327,47 @@ int in_net_ipv6(const void *addr, const struct in6_addr *mask, const struct in6_
 	return 1;
 }
 
-/* RFC 4291 prefix */
-const char rfc4291_pfx[] = { 0x00, 0x00, 0x00, 0x00,
-			     0x00, 0x00, 0x00, 0x00,
-			     0x00, 0x00, 0xFF, 0xFF };
-
-/* Map IPv4 address on IPv6 address, as specified in RFC 3513.
+/* Map IPv4 address on IPv6 address, as specified in RFC4291
+ * "IPv4-Mapped IPv6 Address" (using the :ffff: prefix)
+ *
  * Input and output may overlap.
  */
 void v4tov6(struct in6_addr *sin6_addr, struct in_addr *sin_addr)
 {
-	struct in_addr tmp_addr;
+	uint32_t ip4_addr;
 
-	tmp_addr.s_addr = sin_addr->s_addr;
-	memcpy(sin6_addr->s6_addr, rfc4291_pfx, sizeof(rfc4291_pfx));
-	memcpy(sin6_addr->s6_addr+12, &tmp_addr.s_addr, 4);
+	ip4_addr = sin_addr->s_addr;
+	memset(&sin6_addr->s6_addr, 0, 10);
+	write_u16(&sin6_addr->s6_addr[10], htons(0xFFFF));
+	write_u32(&sin6_addr->s6_addr[12], ip4_addr);
 }
 
-/* Map IPv6 address on IPv4 address, as specified in RFC 3513.
+/* Try to convert IPv6 address to IPv4 address thanks to the
+ * following mapping methods:
+ *  - RFC4291 IPv4-Mapped IPv6 Address (prefered method)
+ *    -> ::ffff:ip:v4
+ *  - RFC4291 IPv4-Compatible IPv6 Address (deprecated, RFC3513 legacy for
+ *    "IPv6 Addresses with Embedded IPv4 Addresses)
+ *    -> ::0000:ip:v4
+ *  - 6to4 (defined in RFC3056 proposal, seems deprecated nowadays)
+ *    -> 2002:ip:v4::
  * Return true if conversion is possible and false otherwise.
  */
 int v6tov4(struct in_addr *sin_addr, struct in6_addr *sin6_addr)
 {
-	if (memcmp(sin6_addr->s6_addr, rfc4291_pfx, sizeof(rfc4291_pfx)) == 0) {
-		memcpy(&(sin_addr->s_addr), &(sin6_addr->s6_addr[12]),
-			sizeof(struct in_addr));
-		return 1;
+	if (read_u64(&sin6_addr->s6_addr[0]) == 0 &&
+	    (read_u32(&sin6_addr->s6_addr[8]) == htonl(0xFFFF) ||
+	     read_u32(&sin6_addr->s6_addr[8]) == 0)) {
+		// RFC4291 ipv4 mapped or compatible ipv6 address
+		sin_addr->s_addr = read_u32(&sin6_addr->s6_addr[12]);
+	} else if (read_u16(&sin6_addr->s6_addr[0]) == htons(0x2002)) {
+		// RFC3056 6to4 address
+		sin_addr->s_addr = htonl((ntohs(read_u16(&sin6_addr->s6_addr[2])) << 16) +
+		                         ntohs(read_u16(&sin6_addr->s6_addr[4])));
 	}
-
-	return 0;
+	else
+		return 0; /* unrecognized input */
+	return 1; /* mapping completed */
 }
 
 /* compare two struct sockaddr_storage, including port if <check_port> is true,
@@ -5826,6 +5838,50 @@ uint32_t parse_line(char *in, char *out, size_t *outlen, char **args, int *nbarg
 	return err;
 }
 #undef EMIT_CHAR
+
+/* Use <path_fmt> and following arguments as a printf format to build up the
+ * name of a file, whose first line will be read into the trash buffer. The
+ * trailing CR and LF if any are stripped. On success, it sets trash.data to
+ * the number of resulting bytes in the trash and returns this value. Otherwise
+ * on failure it returns -1 if it could not build the path, -2 on file access
+ * access error (e.g. permissions), or -3 on file read error. The trash is
+ * always reset before proceeding. Too large lines are truncated to the size
+ * of the trash.
+ */
+ssize_t read_line_to_trash(const char *path_fmt, ...)
+{
+	va_list args;
+	FILE *file;
+	ssize_t ret;
+
+	chunk_reset(&trash);
+
+	va_start(args, path_fmt);
+	ret = vsnprintf(trash.area, trash.size, path_fmt, args);
+	va_end(args);
+
+	if (ret >= trash.size)
+		return -1;
+
+	file = fopen(trash.area, "r");
+	if (!file)
+		return -2;
+
+	ret = -3;
+	chunk_reset(&trash);
+	if (fgets(trash.area, trash.size, file)) {
+		trash.data = strlen(trash.area);
+		while (trash.data &&
+		       (trash.area[trash.data - 1] == '\r' ||
+			trash.area[trash.data - 1] == '\n'))
+			trash.data--;
+		trash.area[trash.data] = 0;
+		ret = trash.data; // success
+	}
+
+	fclose(file);
+	return ret;
+}
 
 /* This is used to sanitize an input line that's about to be used for error reporting.
  * It will adjust <line> to print approximately <width> chars around <pos>, trying to

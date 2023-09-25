@@ -70,14 +70,16 @@
 		*(typeof(pool)*)(((char *)__i) + __p->size) = __builtin_return_address(0); \
 	} while (0)
 
-# define POOL_DEBUG_CHECK_MARK(pool, item)				\
+# define POOL_DEBUG_CHECK_MARK(pool, item, caller)				\
 	do {								\
 		typeof(pool) __p = (pool);				\
 		typeof(item) __i = (item);				\
 		if (likely(!(pool_debugging & POOL_DBG_TAG)))		\
 			break;						\
-		if (*(typeof(pool)*)(((char *)__i) + __p->size) != __p)	\
+		if (*(typeof(pool)*)(((char *)__i) + __p->size) != __p)	{ \
+			pool_inspect_item("tag mismatch on free()", pool, item, caller); \
 			ABORT_NOW();					\
+		}							\
 	} while (0)
 
 /* It's possible to trace callers of pool_free() by placing their pointer
@@ -106,7 +108,7 @@ void trim_all_pools(void);
 
 void *pool_get_from_os_noinc(struct pool_head *pool);
 void pool_put_to_os_nodec(struct pool_head *pool, void *ptr);
-void *pool_alloc_nocache(struct pool_head *pool);
+void *pool_alloc_nocache(struct pool_head *pool, const void *caller);
 void pool_free_nocache(struct pool_head *pool, void *ptr);
 void dump_pools(void);
 int pool_parse_debugging(const char *str, char **err);
@@ -121,6 +123,7 @@ void *pool_destroy(struct pool_head *pool);
 void pool_destroy_all(void);
 void *__pool_alloc(struct pool_head *pool, unsigned int flags);
 void __pool_free(struct pool_head *pool, void *ptr);
+void pool_inspect_item(const char *msg, struct pool_head *pool, const void *item, const void *caller);
 
 
 /****************** Thread-local cache management ******************/
@@ -132,7 +135,7 @@ void pool_evict_from_local_cache(struct pool_head *pool, int full);
 void pool_evict_from_local_caches(void);
 void pool_put_to_cache(struct pool_head *pool, void *ptr, const void *caller);
 void pool_fill_pattern(struct pool_cache_head *pch, struct pool_cache_item *item, uint size);
-void pool_check_pattern(struct pool_cache_head *pch, struct pool_cache_item *item, uint size);
+void pool_check_pattern(struct pool_cache_head *pch, struct pool_head *pool, struct pool_cache_item *item, const void *caller);
 void pool_refill_local_from_shared(struct pool_head *pool, struct pool_cache_head *pch);
 void pool_put_to_shared_cache(struct pool_head *pool, struct pool_item *item);
 
@@ -252,7 +255,7 @@ static inline void *pool_get_from_cache(struct pool_head *pool, const void *call
 			item = LIST_PREV(&ph->list, typeof(item), by_pool);
 
 		if (pool_debugging & POOL_DBG_INTEGRITY)
-			pool_check_pattern(ph, item, pool->size);
+			pool_check_pattern(ph, pool, item, caller);
 	}
 
 	BUG_ON(&item->by_pool == &ph->list);

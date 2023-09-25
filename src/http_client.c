@@ -55,6 +55,9 @@ static char *resolvers_id = NULL;
 static char *resolvers_prefer = NULL;
 static int resolvers_disabled = 0;
 
+static int httpclient_retries = CONN_RETRIES;
+static int httpclient_timeout_connect = MS_TO_TICKS(5000);
+
 /* --- This part of the file implement an HTTP client over the CLI ---
  * The functions will be  starting by "hc_cli" for "httpclient cli"
  */
@@ -1218,7 +1221,8 @@ struct proxy *httpclient_create_proxy(const char *id)
 	px->mode = PR_MODE_HTTP;
 	px->maxconn = 0;
 	px->accept = NULL;
-	px->conn_retries = CONN_RETRIES;
+	px->conn_retries = httpclient_retries;
+	px->timeout.connect = httpclient_timeout_connect;
 	px->timeout.client = TICK_ETERNITY;
 	/* The HTTP Client use the "option httplog" with the global log server */
 	px->conf.logformat_string = httpclient_log_format;
@@ -1346,11 +1350,11 @@ static int httpclient_precheck()
 	return 0;
 }
 
-static int httpclient_postcheck()
+/* Initialize the logs for every proxy dedicated to the httpclient */
+static int httpclient_postcheck_proxy(struct proxy *curproxy)
 {
 	int err_code = ERR_NONE;
 	struct logsrv *logsrv;
-	struct proxy *curproxy = NULL;
 	char *errmsg = NULL;
 #ifdef USE_OPENSSL
 	struct server *srv = NULL;
@@ -1360,61 +1364,52 @@ static int httpclient_postcheck()
 	if (global.mode & MODE_MWORKER_WAIT)
 		return ERR_NONE;
 
-	/* Initialize the logs for every proxy dedicated to the httpclient */
-	for (curproxy = proxies_list; curproxy; curproxy = curproxy->next) {
+	if (!(curproxy->cap & PR_CAP_HTTPCLIENT))
+		return ERR_NONE; /* nothing to do */
 
-		if (!(curproxy->cap & PR_CAP_HTTPCLIENT))
-			continue;
+	/* copy logs from "global" log list */
+	list_for_each_entry(logsrv, &global.logsrvs, list) {
+		struct logsrv *node = dup_logsrv(logsrv);
 
-		/* copy logs from "global" log list */
-		list_for_each_entry(logsrv, &global.logsrvs, list) {
-			struct logsrv *node = malloc(sizeof(*node));
-
-			if (!node) {
-				memprintf(&errmsg, "out of memory.");
-				err_code |= ERR_ALERT | ERR_FATAL;
-				goto err;
-			}
-
-			memcpy(node, logsrv, sizeof(*node));
-			LIST_INIT(&node->list);
-			LIST_APPEND(&curproxy->logsrvs, &node->list);
-			node->ring_name = logsrv->ring_name ? strdup(logsrv->ring_name) : NULL;
-			node->conf.file = logsrv->conf.file ? strdup(logsrv->conf.file) : NULL;
+		if (!node) {
+			memprintf(&errmsg, "out of memory.");
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto err;
 		}
-		if (curproxy->conf.logformat_string) {
-			curproxy->conf.args.ctx = ARGC_LOG;
-			if (!parse_logformat_string(curproxy->conf.logformat_string, curproxy, &curproxy->logformat,
-						    LOG_OPT_MANDATORY|LOG_OPT_MERGE_SPACES,
-						    SMP_VAL_FE_LOG_END, &errmsg)) {
-				memprintf(&errmsg, "failed to parse log-format : %s.", errmsg);
-				err_code |= ERR_ALERT | ERR_FATAL;
-				goto err;
-			}
-			curproxy->conf.args.file = NULL;
-			curproxy->conf.args.line = 0;
+		LIST_APPEND(&curproxy->logsrvs, &node->list);
+	}
+	if (curproxy->conf.logformat_string) {
+		curproxy->conf.args.ctx = ARGC_LOG;
+		if (!parse_logformat_string(curproxy->conf.logformat_string, curproxy, &curproxy->logformat,
+					    LOG_OPT_MANDATORY|LOG_OPT_MERGE_SPACES,
+					    SMP_VAL_FE_LOG_END, &errmsg)) {
+			memprintf(&errmsg, "failed to parse log-format : %s.", errmsg);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto err;
 		}
+		curproxy->conf.args.file = NULL;
+		curproxy->conf.args.line = 0;
+	}
 
 #ifdef USE_OPENSSL
-		/* initialize the SNI for the SSL servers */
+	/* initialize the SNI for the SSL servers */
 
-		for (srv = curproxy->srv; srv != NULL; srv = srv->next) {
-			if (srv->xprt == xprt_get(XPRT_SSL)) {
-				srv_ssl = srv;
-			}
+	for (srv = curproxy->srv; srv != NULL; srv = srv->next) {
+		if (srv->xprt == xprt_get(XPRT_SSL)) {
+			srv_ssl = srv;
 		}
-		if (srv_ssl && !srv_ssl->sni_expr) {
-			/* init the SNI expression */
-			/* always use the host header as SNI, without the port */
-			srv_ssl->sni_expr = strdup("req.hdr(host),field(1,:)");
-			err_code |= server_parse_sni_expr(srv_ssl, curproxy, &errmsg);
-			if (err_code & ERR_CODE) {
-				memprintf(&errmsg, "failed to configure sni: %s.", errmsg);
-				goto err;
-			}
-		}
-#endif
 	}
+	if (srv_ssl && !srv_ssl->sni_expr) {
+		/* init the SNI expression */
+		/* always use the host header as SNI, without the port */
+		srv_ssl->sni_expr = strdup("req.hdr(host),field(1,:)");
+		err_code |= server_parse_sni_expr(srv_ssl, curproxy, &errmsg);
+		if (err_code & ERR_CODE) {
+			memprintf(&errmsg, "failed to configure sni: %s.", errmsg);
+			goto err;
+		}
+	}
+#endif
 
 err:
 	if (err_code & ERR_CODE) {
@@ -1428,7 +1423,7 @@ err:
 /* initialize the proxy and servers for the HTTP client */
 
 REGISTER_PRE_CHECK(httpclient_precheck);
-REGISTER_POST_CHECK(httpclient_postcheck);
+REGISTER_POST_PROXY_CHECK(httpclient_postcheck_proxy);
 
 static int httpclient_parse_global_resolvers(char **args, int section_type, struct proxy *curpx,
                                         const struct proxy *defpx, const char *file, int line,
@@ -1529,10 +1524,72 @@ static int httpclient_parse_global_verify(char **args, int section_type, struct 
 }
 #endif /* ! USE_OPENSSL */
 
+static int httpclient_parse_global_retries(char **args, int section_type, struct proxy *curpx,
+                                        const struct proxy *defpx, const char *file, int line,
+                                        char **err)
+{
+	if (too_many_args(1, args, err, NULL))
+		return -1;
+
+	if (*(args[1]) == 0) {
+		ha_alert("parsing [%s:%d] : '%s' expects an integer argument.\n",
+			 file, line, args[0]);
+		return -1;
+	}
+	httpclient_retries = atol(args[1]);
+
+	return 0;
+}
+
+static int httpclient_parse_global_timeout_connect(char **args, int section_type, struct proxy *curpx,
+                                        const struct proxy *defpx, const char *file, int line,
+                                        char **err)
+{
+	const char *res;
+	unsigned timeout;
+
+	if (too_many_args(1, args, err, NULL))
+		return -1;
+
+	if (*(args[1]) == 0) {
+		ha_alert("parsing [%s:%d] : '%s' expects an integer argument.\n",
+			 file, line, args[0]);
+		return -1;
+	}
+
+	res = parse_time_err(args[1], &timeout, TIME_UNIT_MS);
+	if (res == PARSE_TIME_OVER) {
+		memprintf(err, "timer overflow in argument '%s' to '%s' (maximum value is 2147483647 ms or ~24.8 days)",
+			  args[1], args[0]);
+		return -1;
+	}
+	else if (res == PARSE_TIME_UNDER) {
+		memprintf(err, "timer underflow in argument '%s' to '%s' (minimum non-null value is 1 ms)",
+			  args[1], args[0]);
+		return -1;
+	}
+	else if (res) {
+		memprintf(err, "unexpected character '%c' in '%s'", *res, args[0]);
+		return -1;
+	}
+
+	if (*args[2] != 0) {
+		memprintf(err, "'%s' : unexpected extra argument '%s' after value '%s'.", args[0], args[2], args[1]);
+		return -1;
+	}
+
+	httpclient_timeout_connect = MS_TO_TICKS(timeout);
+
+	return 0;
+}
+
+
 static struct cfg_kw_list cfg_kws = {ILH, {
 	{ CFG_GLOBAL, "httpclient.resolvers.disabled", httpclient_parse_global_resolvers_disabled },
 	{ CFG_GLOBAL, "httpclient.resolvers.id", httpclient_parse_global_resolvers },
 	{ CFG_GLOBAL, "httpclient.resolvers.prefer", httpclient_parse_global_prefer },
+	{ CFG_GLOBAL, "httpclient.retries", httpclient_parse_global_retries },
+	{ CFG_GLOBAL, "httpclient.timeout.connect", httpclient_parse_global_timeout_connect },
 #ifdef USE_OPENSSL
 	{ CFG_GLOBAL, "httpclient.ssl.verify", httpclient_parse_global_verify },
 	{ CFG_GLOBAL, "httpclient.ssl.ca-file", httpclient_parse_global_ca_file },

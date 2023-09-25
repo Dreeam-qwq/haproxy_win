@@ -490,7 +490,7 @@ int compare_current_version(const char *version)
 	return 0;
 }
 
-static void display_version()
+void display_version()
 {
 	struct utsname utsname;
 
@@ -1530,19 +1530,6 @@ static void init_early(int argc, char **argv)
 		exit(EXIT_FAILURE);
 	}
 
-	/* Some CPU affinity stuff may have to be initialized */
-#ifdef USE_CPU_AFFINITY
-	{
-		int g, i;
-
-		for (g = 0; g < MAX_TGROUPS; g++) {
-			for (i = 0; i < MAX_THREADS_PER_GROUP; ++i) {
-				ha_cpuset_zero(&cpu_map[g].thread[i]);
-			}
-		}
-	}
-#endif
-
 	/* extract the program name from argv[0], it will be used for the logs
 	 * and error messages.
 	 */
@@ -1925,17 +1912,16 @@ static void dump_registered_keywords(void)
 static void generate_random_cluster_secret()
 {
 	/* used as a default random cluster-secret if none defined. */
-	uint64_t rand = ha_random64();
+	uint64_t rand;
 
 	/* The caller must not overwrite an already defined secret. */
-	BUG_ON(global.cluster_secret);
+	BUG_ON(cluster_secret_isset);
 
-	global.cluster_secret = malloc(8);
-	if (!global.cluster_secret)
-		return;
-
+	rand = ha_random64();
 	memcpy(global.cluster_secret, &rand, sizeof(rand));
-	global.cluster_secret[7] = '\0';
+	rand = ha_random64();
+	memcpy(global.cluster_secret + sizeof(rand), &rand, sizeof(rand));
+	cluster_secret_isset = 1;
 }
 
 /*
@@ -1976,11 +1962,6 @@ static void init(int argc, char **argv)
 #endif
 
 	startup_logs_init();
-
-	if (!init_trash_buffers(1)) {
-		ha_alert("failed to initialize trash buffers.\n");
-		exit(1);
-	}
 
 	if (init_acl() != 0)
 		exit(1);
@@ -2657,7 +2638,7 @@ static void init(int argc, char **argv)
 		exit(1);
 	}
 
-	if (!global.cluster_secret)
+	if (!cluster_secret_isset)
 		generate_random_cluster_secret();
 
 	/*
@@ -2805,16 +2786,9 @@ void deinit(void)
 		free_proxy(p0);
 	}/* end while(p) */
 
-	/* we don't need to free sink_proxies_list proxies since it is
-	 * already handled in sink_deinit()
+	/* we don't need to free sink_proxies_list nor cfg_log_forward proxies since
+	 * they are respectively cleaned up in sink_deinit() and deinit_log_forward()
 	 */
-	p = cfg_log_forward;
-	/* we need to manually clean cfg_log_forward proxy list */
-	while (p) {
-		p0 = p;
-		p = p->next;
-		free_proxy(p0);
-	}
 
 	/* destroy all referenced defaults proxies  */
 	proxy_destroy_all_unref_defaults();
@@ -2857,7 +2831,6 @@ void deinit(void)
 	ha_free(&global.log_send_hostname);
 	chunk_destroy(&global.log_tag);
 	ha_free(&global.chroot);
-	ha_free(&global.cluster_secret);
 	ha_free(&global.pidfile);
 	ha_free(&global.node);
 	ha_free(&global.desc);
@@ -3312,6 +3285,13 @@ int main(int argc, char **argv)
 
 	RUN_INITCALLS(STG_ALLOC);
 	RUN_INITCALLS(STG_POOL);
+
+	/* some code really needs to have the trash properly allocated */
+	if (!trash.area) {
+		ha_alert("failed to initialize trash buffers.\n");
+		exit(1);
+	}
+
 	RUN_INITCALLS(STG_INIT);
 
 	/* this is the late init where the config is parsed */

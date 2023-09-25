@@ -1724,6 +1724,14 @@ resume_execution:
 	/* out of lua processing, stop the timer */
 	hlua_timer_stop(&lua->timer);
 
+	/* reset nargs because those possibly passed to the lua_resume() call
+	 * were already consumed, and since we may call lua_resume() again
+	 * after a successful yield, we don't want to pass stale nargs hint
+	 * to the Lua API. As such, nargs should be set explicitly before each
+	 * lua_resume() (or hlua_ctx_resume()) invocation if needed.
+	 */
+	lua->nargs = 0;
+
 	switch (ret) {
 
 	case LUA_OK:
@@ -10345,7 +10353,7 @@ static enum act_return hlua_action(struct act_rule *rule, struct proxy *px,
 	case HLUA_E_YIELD:
 	  err_yield:
 		act_ret = ACT_RET_CONT;
-		SEND_ERR(px, "Lua function '%s': aborting Lua processing on expired timeout.\n",
+		SEND_ERR(px, "Lua function '%s': yield not allowed.\n",
 		         rule->arg.hlua_rule->fcn->name);
 		goto end;
 
@@ -10976,6 +10984,8 @@ __LJMP static int hlua_register_action(lua_State *L)
 			akw = action_http_req_custom(trash->area);
 		} else if (strcmp(lua_tostring(L, -1), "http-res") == 0) {
 			akw = action_http_res_custom(trash->area);
+		} else if (strcmp(lua_tostring(L, -1), "http-after-res") == 0) {
+			akw = action_http_after_res_custom(trash->area);
 		} else {
 			akw = NULL;
 		}
@@ -11035,6 +11045,8 @@ __LJMP static int hlua_register_action(lua_State *L)
 			http_req_keywords_register(akl);
 		else if (strcmp(lua_tostring(L, -1), "http-res") == 0)
 			http_res_keywords_register(akl);
+		else if (strcmp(lua_tostring(L, -1), "http-after-res") == 0)
+			http_after_res_keywords_register(akl);
 		else {
 			release_hlua_function(fcn);
 			hlua_unref(L, ref);
@@ -11042,7 +11054,8 @@ __LJMP static int hlua_register_action(lua_State *L)
 				ha_free((char **)&(akl->kw[0].kw));
 			ha_free(&akl);
 			WILL_LJMP(luaL_error(L, "Lua action environment '%s' is unknown. "
-			                        "'tcp-req', 'tcp-res', 'http-req' or 'http-res' "
+			                        "'tcp-req', 'tcp-res', 'http-req', 'http-res' "
+			                        "or 'http-after-res' "
 			                        "are expected.", lua_tostring(L, -1)));
 		}
 
@@ -12864,9 +12877,9 @@ int hlua_post_init_state(lua_State *L)
 		hlua_unref(L, init->function_ref);
 
 #if defined(LUA_VERSION_NUM) && LUA_VERSION_NUM >= 504
-		ret = lua_resume(L, L, 0, &nres);
+		ret = lua_resume(L, NULL, 0, &nres);
 #else
-		ret = lua_resume(L, L, 0);
+		ret = lua_resume(L, NULL, 0);
 #endif
 		kind = NULL;
 		switch (ret) {

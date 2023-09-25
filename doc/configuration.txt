@@ -3,7 +3,7 @@
                           Configuration Manual
                          ----------------------
                               version 2.9
-                              2023/08/25
+                              2023/09/22
 
 
 This document covers the configuration language as implemented in the version
@@ -1088,8 +1088,10 @@ The following keywords are supported in the "global" section :
    - httpclient.resolvers.disabled
    - httpclient.resolvers.id
    - httpclient.resolvers.prefer
+   - httpclient.retries
    - httpclient.ssl.ca-file
    - httpclient.ssl.verify
+   - httpclient.timeout.connect
    - insecure-fork-wanted
    - insecure-setuid-wanted
    - issuers-chain-path
@@ -1121,6 +1123,7 @@ The following keywords are supported in the "global" section :
    - ssl-default-server-ciphers
    - ssl-default-server-ciphersuites
    - ssl-default-server-client-sigalgs
+   - ssl-default-server-curves
    - ssl-default-server-options
    - ssl-default-server-sigalgs
    - ssl-dh-param-file
@@ -1729,6 +1732,13 @@ httpclient.resolvers.prefer <ipv4|ipv6>
   which is convenient when IPv6 is not available on your network. Default
   option is "ipv6".
 
+httpclient.retries <number>
+  This option allows to configure the number of retries attempt of the
+  httpclient when a request failed. This does the same as the "retries" keyword
+  in a backend.
+
+  Default value is 3.
+
 httpclient.ssl.ca-file <cafile>
   This option defines the ca-file which should be used to verify the server
   certificate. It takes the same parameters as the "ca-file" option on the
@@ -1750,6 +1760,18 @@ httpclient.ssl.verify [none|required]
 
   However, when this option is explicitly enabled it will trigger a
   configuration error if it fails.
+
+httpclient.timeout.connect <timeout>
+  Set the maximum time to wait for a connection attempt by default for the
+  httpclient.
+
+  Arguments :
+    <timeout> is the timeout value specified in milliseconds by default, but
+              can be in any other unit if the number is suffixed by the unit,
+              as explained at the top of this document.
+
+  The default value is 5000ms.
+
 
 insecure-fork-wanted
   By default HAProxy tries hard to prevent any thread and process creation
@@ -2314,6 +2336,13 @@ ssl-default-server-client-sigalgs <sigalgs>
   protocol as the signature algorithms aren't separately negotiated in these
   versions. It is not recommended to change this setting unless compatibility
   with a middlebox is required.
+
+ssl-default-server-curves <curves>
+  This setting is only available when support for OpenSSL was built in. It sets
+  the default string describing the list of elliptic curves algorithms ("curve
+  suite") that are negotiated during the SSL/TLS handshake with ECDHE. The format
+  of the string is a colon-delimited list of curve name.
+  Please check the "server" keyword for more information.
 
 ssl-default-server-options [<option>]...
   This setting is only available when support for OpenSSL was built in. It sets
@@ -16039,6 +16068,13 @@ crt <cert>
   at the same path suffixed by a ".key" (provided the "ssl-load-extra-files"
   option is set accordingly).
 
+curves <curves>
+  This setting is only available when support for OpenSSL was built in. It sets
+  the string describing the list of elliptic curves algorithms ("curve suite")
+  that are negotiated during the SSL/TLS handshake with ECDHE. The format of the
+  string is a colon-delimited list of curve name.
+  Example: "X25519:P-256" (without quote)
+
 disabled
   The "disabled" keyword starts the server in the "disabled" state. That means
   that it is marked down in maintenance mode, and no connection other than the
@@ -18023,7 +18059,21 @@ bool
 bytes(<offset>[,<length>])
   Extracts some bytes from an input binary sample. The result is a binary
   sample starting at an offset (in bytes) of the original sample and
-  optionally truncated at the given length.
+  optionally truncated at the given length. <offset> and <length> can be numeric
+  values or variable names. The converter returns an empty sample if either
+  <offset> or <length> is invalid. Invalid <offset> means a negative value or a
+  value >= length of the input sample. Invalid <length> means a negative value
+  or, in some cases, a value bigger than the length of the input sample.
+
+  Example:
+      http-request set-var(txn.input) req.hdr(input) # let's say input is "012345"
+
+      http-response set-header bytes_0 "%[var(txn.input),bytes(0)]"  # outputs "012345"
+      http-response set-header bytes_1_3 "%[var(txn.input),bytes(1,3)]"  # outputs "123"
+
+      http-response set-var(txn.var_start) int(1)
+      http-response set-var(txn.var_length) int(3)
+      http-response set-header bytes_var1_var3    "%[var(txn.input),bytes(txn.var_start,txn.var_length)]"  # outputs "123"
 
 concat([<start>],[<var>],[<end>])
   Concatenates up to 3 fields after the current sample which is then turned to
@@ -22027,6 +22077,13 @@ baseq : string
   instead of "base" allows one to properly identify the target resource, for
   statistics or caching use cases. See also "path", "pathq" and "base".
 
+
+bytes_in : integer
+  This returns the number of bytes uploaded from the client to the server.
+
+bytes_out integer
+   This is the number of bytes transmitted from the server to the client.
+
 capture.req.hdr(<idx>) : string
   This extracts the content of the header captured by the "capture request
   header", idx is the position of the capture keyword in the configuration.
@@ -23709,6 +23766,7 @@ Please refer to the table below for currently defined variables :
   |                          Others                                           |
   +---+------+------------------------------------------------------+---------+
   |   | %B   | bytes_read           (from server to client)         | numeric |
+  |   |      | %[bytes_out]                                         |         |
   +---+------+------------------------------------------------------+---------+
   | H | %CC  | captured_request_cookie                              | string  |
   +---+------+------------------------------------------------------+---------+
@@ -23723,16 +23781,19 @@ Please refer to the table below for currently defined variables :
   | H | %HPO | HTTP path only (without host nor query string)       | string  |
   +---+------+------------------------------------------------------+---------+
   | H | %HQ  | HTTP request URI query string (ex: ?bar=baz)         | string  |
+  |   |      | ?%[query]                                            |         |
   +---+------+------------------------------------------------------+---------+
   | H | %HU  | HTTP request URI (ex: /foo?bar=baz)                  | string  |
   +---+------+------------------------------------------------------+---------+
   | H | %HV  | HTTP version (ex: HTTP/1.0)                          | string  |
+  |   |      | HTTP/%[req.ver]                                      |         |
   +---+------+------------------------------------------------------+---------+
   |   | %ID  | unique-id                                            | string  |
   +---+------+------------------------------------------------------+---------+
   |   | %ST  | status_code                                          | numeric |
   +---+------+------------------------------------------------------+---------+
   |   | %U   | bytes_uploaded       (from client to server)         | numeric |
+  |   |      | %[bytes_in]                                          |         |
   +---+------+------------------------------------------------------+---------+
   |   | %ac  | actconn                                              |         |
   |   |      | %[act_conn]                                          | numeric |

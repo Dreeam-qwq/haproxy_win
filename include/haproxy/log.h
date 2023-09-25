@@ -87,6 +87,9 @@ int add_to_logformat_list(char *start, char *end, int type, struct list *list_fo
  */
 int parse_logformat_string(const char *str, struct proxy *curproxy, struct list *list_format, int options, int cap, char **err);
 
+int postresolve_logsrv_list(struct list *logsrvs, const char *section, const char *section_name);
+
+struct logsrv *dup_logsrv(struct logsrv *def);
 void free_logsrv(struct logsrv *logsrv);
 
 /* Parse "log" keyword and update the linked list. */
@@ -151,17 +154,6 @@ char *update_log_hdr_rfc5424(const time_t time, suseconds_t frac);
 char *update_log_hdr(const time_t time);
 char * get_format_pid_sep1(int format, size_t *len);
 char * get_format_pid_sep2(int format, size_t *len);
-
-/*
- * Test if <idx> index numbered from 0 is in <rg> range with low and high
- * limits of indexes numbered from 1.
- */
-static inline int in_smp_log_range(struct smp_log_range *rg, unsigned int idx)
-{
-       if (idx + 1 <= rg->high && idx + 1 >= rg->low)
-               return 1;
-       return 0;
-}
 
 /*
  * Builds a log line for the stream (must be valid).

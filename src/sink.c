@@ -346,11 +346,11 @@ static void sink_forward_io_handler(struct appctx *appctx)
 		goto close;
 	}
 
-	HA_RWLOCK_WRLOCK(LOGSRV_LOCK, &ring->lock);
+	HA_RWLOCK_WRLOCK(RING_LOCK, &ring->lock);
 	LIST_DEL_INIT(&appctx->wait_entry);
-	HA_RWLOCK_WRUNLOCK(LOGSRV_LOCK, &ring->lock);
+	HA_RWLOCK_WRUNLOCK(RING_LOCK, &ring->lock);
 
-	HA_RWLOCK_RDLOCK(LOGSRV_LOCK, &ring->lock);
+	HA_RWLOCK_RDLOCK(RING_LOCK, &ring->lock);
 
 	/* explanation for the initialization below: it would be better to do
 	 * this in the parsing function but this would occasionally result in
@@ -409,14 +409,14 @@ static void sink_forward_io_handler(struct appctx *appctx)
 	last_ofs = b_tail_ofs(buf);
 	sft->ofs = b_peek_ofs(buf, ofs);
 
-	HA_RWLOCK_RDUNLOCK(LOGSRV_LOCK, &ring->lock);
+	HA_RWLOCK_RDUNLOCK(RING_LOCK, &ring->lock);
 
 	if (ret) {
 		/* let's be woken up once new data arrive */
-		HA_RWLOCK_WRLOCK(LOGSRV_LOCK, &ring->lock);
+		HA_RWLOCK_WRLOCK(RING_LOCK, &ring->lock);
 		LIST_APPEND(&ring->waiters, &appctx->wait_entry);
 		ofs = b_tail_ofs(buf);
-		HA_RWLOCK_WRUNLOCK(LOGSRV_LOCK, &ring->lock);
+		HA_RWLOCK_WRUNLOCK(RING_LOCK, &ring->lock);
 		if (ofs != last_ofs) {
 			/* more data was added into the ring between the
 			 * unlock and the lock, and the writer might not
@@ -478,11 +478,11 @@ static void sink_forward_oc_io_handler(struct appctx *appctx)
 		goto close;
 	}
 
-	HA_RWLOCK_WRLOCK(LOGSRV_LOCK, &ring->lock);
+	HA_RWLOCK_WRLOCK(RING_LOCK, &ring->lock);
 	LIST_DEL_INIT(&appctx->wait_entry);
-	HA_RWLOCK_WRUNLOCK(LOGSRV_LOCK, &ring->lock);
+	HA_RWLOCK_WRUNLOCK(RING_LOCK, &ring->lock);
 
-	HA_RWLOCK_RDLOCK(LOGSRV_LOCK, &ring->lock);
+	HA_RWLOCK_RDLOCK(RING_LOCK, &ring->lock);
 
 	/* explanation for the initialization below: it would be better to do
 	 * this in the parsing function but this would occasionally result in
@@ -544,13 +544,13 @@ static void sink_forward_oc_io_handler(struct appctx *appctx)
 	HA_ATOMIC_INC(b_peek(buf, ofs));
 	sft->ofs = b_peek_ofs(buf, ofs);
 
-	HA_RWLOCK_RDUNLOCK(LOGSRV_LOCK, &ring->lock);
+	HA_RWLOCK_RDUNLOCK(RING_LOCK, &ring->lock);
 
 	if (ret) {
 		/* let's be woken up once new data arrive */
-		HA_RWLOCK_WRLOCK(LOGSRV_LOCK, &ring->lock);
+		HA_RWLOCK_WRLOCK(RING_LOCK, &ring->lock);
 		LIST_APPEND(&ring->waiters, &appctx->wait_entry);
-		HA_RWLOCK_WRUNLOCK(LOGSRV_LOCK, &ring->lock);
+		HA_RWLOCK_WRUNLOCK(RING_LOCK, &ring->lock);
 		applet_have_no_more_data(appctx);
 	}
 	HA_SPIN_UNLOCK(SFT_LOCK, &sft->lock);
@@ -574,9 +574,9 @@ void __sink_forward_session_deinit(struct sink_forward_target *sft)
 	if (!sink)
 		return;
 
-	HA_RWLOCK_WRLOCK(LOGSRV_LOCK, &sink->ctx.ring->lock);
+	HA_RWLOCK_WRLOCK(RING_LOCK, &sink->ctx.ring->lock);
 	LIST_DEL_INIT(&sft->appctx->wait_entry);
-	HA_RWLOCK_WRUNLOCK(LOGSRV_LOCK, &sink->ctx.ring->lock);
+	HA_RWLOCK_WRUNLOCK(RING_LOCK, &sink->ctx.ring->lock);
 
 	sft->appctx = NULL;
 	task_wakeup(sink->forward_task, TASK_WOKEN_MSG);
@@ -771,6 +771,144 @@ void sink_rotate_file_backed_ring(const char *name)
 	}
 }
 
+
+/* helper function to completely deallocate a sink struct
+ */
+static void sink_free(struct sink *sink)
+{
+	struct sink_forward_target *sft_next;
+
+	if (!sink)
+		return;
+	if (sink->type == SINK_TYPE_BUFFER) {
+		if (sink->store) {
+			size_t size = (sink->ctx.ring->buf.size + 4095UL) & -4096UL;
+			void *area = (sink->ctx.ring->buf.area - sizeof(*sink->ctx.ring));
+
+			msync(area, size, MS_SYNC);
+			munmap(area, size);
+			ha_free(&sink->store);
+		}
+		else
+			ring_free(sink->ctx.ring);
+	}
+	LIST_DEL_INIT(&sink->sink_list); // remove from parent list
+	task_destroy(sink->forward_task);
+	free_proxy(sink->forward_px);
+	ha_free(&sink->name);
+	ha_free(&sink->desc);
+	while (sink->sft) {
+		sft_next = sink->sft->next;
+		ha_free(&sink->sft);
+		sink->sft = sft_next;
+	}
+	ha_free(&sink);
+}
+
+/* Helper function to create new high-level ring buffer (as in ring section from
+ * the config)
+ *
+ * Returns NULL on failure
+ */
+static struct sink *sink_new_ringbuf(const char *id, const char *description,
+                                     const char *file, int linenum, char **err_msg)
+{
+	struct sink *sink;
+	struct proxy *p = NULL; // forward_px
+
+	/* allocate new proxy to handle forwards */
+	p = calloc(1, sizeof(*p));
+	if (!p) {
+		memprintf(err_msg, "out of memory");
+		goto err;
+	}
+
+	init_new_proxy(p);
+	sink_setup_proxy(p);
+	p->id = strdup(id);
+	p->conf.args.file = p->conf.file = strdup(file);
+	p->conf.args.line = p->conf.line = linenum;
+
+	sink = sink_new_buf(id, description, LOG_FORMAT_RAW, BUFSIZE);
+	if (!sink || sink->type != SINK_TYPE_BUFFER) {
+		memprintf(err_msg, "unable to create a new sink buffer for ring '%s'", id);
+		goto err;
+	}
+
+	sink->forward_px = p;
+
+	/* link sink forward_target to proxy */
+	p->parent = sink;
+	sink->forward_px = p;
+
+	return sink;
+
+ err:
+	free_proxy(p);
+	return NULL;
+}
+
+/* Finalize sink struct to ensure configuration consistency and
+ * allocate final struct members
+ *
+ * Returns ERR_NONE on success, ERR_WARN on warning
+ * Returns a composition of ERR_ALERT, ERR_ABORT, ERR_FATAL on failure
+ */
+static int sink_finalize(struct sink *sink)
+{
+	int err_code = ERR_NONE;
+	struct server *srv;
+
+	if (sink && (sink->type == SINK_TYPE_BUFFER)) {
+		if (!sink->maxlen)
+			sink->maxlen = ~0; // maxlen not set: no implicit truncation
+		else if (sink->maxlen > ring_max_payload(sink->ctx.ring)) {
+			/* maxlen set by user however it doesn't fit: set to max value */
+			ha_warning("ring '%s' event max length '%u' exceeds max payload size, forced to '%lu'.\n",
+			           sink->name, sink->maxlen, (unsigned long)ring_max_payload(sink->ctx.ring));
+			sink->maxlen = ring_max_payload(sink->ctx.ring);
+			err_code |= ERR_WARN;
+		}
+
+		/* prepare forward server descriptors */
+		if (sink->forward_px) {
+			srv = sink->forward_px->srv;
+			while (srv) {
+				struct sink_forward_target *sft;
+
+				/* allocate sink_forward_target descriptor */
+				sft = calloc(1, sizeof(*sft));
+				if (!sft) {
+					ha_alert("memory allocation error initializing server '%s' in ring '%s'.\n", srv->id, sink->name);
+					err_code |= ERR_ALERT | ERR_FATAL;
+					break;
+				}
+				sft->srv = srv;
+				sft->appctx = NULL;
+				sft->ofs = ~0; /* init ring offset */
+				sft->sink = sink;
+				sft->next = sink->sft;
+				HA_SPIN_INIT(&sft->lock);
+
+				/* mark server attached to the ring */
+				if (!ring_attach(sink->ctx.ring)) {
+					ha_alert("server '%s' sets too many watchers > 255 on ring '%s'.\n", srv->id, sink->name);
+					err_code |= ERR_ALERT | ERR_FATAL;
+					ha_free(&sft);
+					break;
+				}
+				sink->sft = sft;
+				srv = srv->next;
+			}
+			if (sink_init_forward(sink) == 0) {
+				ha_alert("error when trying to initialize sink buffer forwarding.\n");
+				err_code |= ERR_ALERT | ERR_FATAL;
+			}
+		}
+	}
+	return err_code;
+}
+
 /*
  * Parse "ring" section and create corresponding sink buffer.
  *
@@ -780,9 +918,8 @@ void sink_rotate_file_backed_ring(const char *name)
 int cfg_parse_ring(const char *file, int linenum, char **args, int kwm)
 {
 	int err_code = 0;
+	char *err_msg = NULL;
 	const char *inv;
-	size_t size = BUFSIZE;
-	struct proxy *p;
 
 	if (strcmp(args[0], "ring") == 0) { /* new ring section */
 		if (!*args[1]) {
@@ -804,30 +941,22 @@ int cfg_parse_ring(const char *file, int linenum, char **args, int kwm)
 			goto err;
 		}
 
-		cfg_sink = sink_new_buf(args[1], args[1], LOG_FORMAT_RAW, size);
-		if (!cfg_sink || cfg_sink->type != SINK_TYPE_BUFFER) {
-			ha_alert("parsing [%s:%d] : unable to create a new sink buffer for ring '%s'.\n", file, linenum, args[1]);
+		cfg_sink = sink_new_ringbuf(args[1], args[1], file, linenum, &err_msg);
+		if (!cfg_sink) {
+			ha_alert("parsing [%s:%d] : %s.\n", file, linenum, err_msg);
+			ha_free(&err_msg);
 			err_code |= ERR_ALERT | ERR_FATAL;
 			goto err;
 		}
 
-		/* allocate new proxy to handle forwards */
-		p = calloc(1, sizeof *p);
-		if (!p) {
-			ha_alert("parsing [%s:%d] : out of memory.\n", file, linenum);
-			err_code |= ERR_ALERT | ERR_FATAL;
-			goto err;
-		}
-
-		init_new_proxy(p);
-		sink_setup_proxy(p);
-		p->parent = cfg_sink;
-		p->id = strdup(args[1]);
-		p->conf.args.file = p->conf.file = strdup(file);
-		p->conf.args.line = p->conf.line = linenum;
-		cfg_sink->forward_px = p;
+		/* set maxlen value to 0 for now, we rely on this in postparsing
+		 * to know if it was explicitly set using the "maxlen" parameter
+		 */
+		cfg_sink->maxlen = 0;
 	}
 	else if (strcmp(args[0], "size") == 0) {
+		size_t size;
+
 		if (!cfg_sink || (cfg_sink->type != SINK_TYPE_BUFFER)) {
 			ha_alert("parsing [%s:%d] : 'size' directive not usable with this type of sink.\n", file, linenum);
 			err_code |= ERR_ALERT | ERR_FATAL;
@@ -1049,33 +1178,36 @@ err:
  */
 struct sink *sink_new_from_logsrv(struct logsrv *logsrv)
 {
-	struct proxy *p = NULL;
 	struct sink *sink = NULL;
 	struct server *srv = NULL;
-	struct sink_forward_target *sft = NULL;
+	char *err_msg = NULL;
 
-	/* allocate new proxy to handle
-	 * forward to a stream server
-	 */
-	p = calloc(1, sizeof *p);
-	if (!p) {
+	/* prepare description for the sink */
+	chunk_reset(&trash);
+	chunk_printf(&trash, "created from logserver declared into '%s' at line %d", logsrv->conf.file, logsrv->conf.line);
+
+	/* allocate a new sink buffer */
+	sink = sink_new_ringbuf(logsrv->ring_name, trash.area, logsrv->conf.file, logsrv->conf.line, &err_msg);
+	if (!sink) {
+		ha_alert("%s.\n", err_msg);
+		ha_free(&err_msg);
 		goto error;
-        }
+	}
 
-	init_new_proxy(p);
-	sink_setup_proxy(p);
-	p->id = strdup(logsrv->ring_name);
-	p->conf.args.file = p->conf.file = strdup(logsrv->conf.file);
-	p->conf.args.line = p->conf.line = logsrv->conf.line;
+	/* disable sink->maxlen, we already have logsrv->maxlen */
+	sink->maxlen = 0;
 
-	/* Set default connect and server timeout */
-	p->timeout.connect = MS_TO_TICKS(1000);
-	p->timeout.server = MS_TO_TICKS(5000);
+	/* set ring format from logsrv format */
+	sink->fmt = logsrv->format;
+
+	/* Set default connect and server timeout for sink forward proxy */
+	sink->forward_px->timeout.connect = MS_TO_TICKS(1000);
+	sink->forward_px->timeout.server = MS_TO_TICKS(5000);
 
 	/* allocate a new server to forward messages
 	 * from ring buffer
 	 */
-	srv = new_server(p);
+	srv = new_server(sink->forward_px);
 	if (!srv)
 		goto error;
 
@@ -1091,84 +1223,24 @@ struct sink *sink_new_from_logsrv(struct logsrv *logsrv)
 	if (srv_init_per_thr(srv) == -1)
 		goto error;
 
-	/* the servers are linked backwards
-	 * first into proxy
+	/* link srv with sink forward proxy: the servers are linked
+	 * backwards first into proxy
 	 */
-	srv->next = p->srv;
-	p->srv = srv;
+	srv->next = sink->forward_px->srv;
+	sink->forward_px->srv = srv;
 
-	/* allocate sink_forward_target descriptor */
-	sft = calloc(1, sizeof(*sft));
-	if (!sft)
-		goto error;
-
-	/* init sink_forward_target offset */
-	sft->srv = srv;
-	sft->appctx = NULL;
-	sft->ofs = ~0;
-	HA_SPIN_INIT(&sft->lock);
-
-	/* prepare description for the sink */
-	chunk_reset(&trash);
-	chunk_printf(&trash, "created from logserver declared into '%s' at line %d", logsrv->conf.file, logsrv->conf.line);
-
-	/* allocate a new sink buffer */
-	sink = sink_new_buf(logsrv->ring_name, trash.area, logsrv->format, BUFSIZE);
-	if (!sink || sink->type != SINK_TYPE_BUFFER) {
-		goto error;
-	}
-
-	/* link sink_forward_target to proxy */
-	sink->forward_px = p;
-	p->parent = sink;
-
-	/* insert into sink_forward_targets
-	 * list into sink
-	 */
-	sft->sink = sink;
-	sft->next = sink->sft;
-	sink->sft = sft;
-
-	/* mark server as an attached reader to the ring */
-	if (!ring_attach(sink->ctx.ring)) {
-		/* should never fail since there is
-		 * only one reader
-		 */
-		goto error;
-	}
-
-	/* initialize sink buffer forwarding */
-	if (!sink_init_forward(sink))
-		goto error;
+	if (sink_finalize(sink) & ERR_CODE)
+		goto error_final;
 
 	/* reset familyt of logsrv to consider the ring buffer target */
 	logsrv->addr.ss_family = AF_UNSPEC;
 
 	return sink;
-error:
-	if (srv)
-		srv_drop(srv);
+ error:
+	srv_drop(srv);
 
-	if (p) {
-		if (p->id)
-			free(p->id);
-		if (p->conf.file)
-			free(p->conf.file);
-
-		free(p);
-	}
-
-	if (sft)
-		free(sft);
-
-	if (sink) {
-		ring_free(sink->ctx.ring);
-
-		LIST_DELETE(&sink->sink_list);
-		free(sink->name);
-		free(sink->desc);
-		free(sink);
-	}
+ error_final:
+	sink_free(sink);
 
 	return NULL;
 }
@@ -1181,168 +1253,67 @@ error:
  */
 int cfg_post_parse_ring()
 {
-	int err_code = 0;
-	struct server *srv;
+	int err_code;
 
-	if (cfg_sink && (cfg_sink->type == SINK_TYPE_BUFFER)) {
-		if (cfg_sink->maxlen > b_size(&cfg_sink->ctx.ring->buf)) {
-			ha_warning("ring '%s' event max length '%u' exceeds size, forced to size '%lu'.\n",
-			           cfg_sink->name, cfg_sink->maxlen, (unsigned long)b_size(&cfg_sink->ctx.ring->buf));
-			cfg_sink->maxlen = b_size(&cfg_sink->ctx.ring->buf);
-			err_code |= ERR_WARN;
-		}
-
-		/* prepare forward server descriptors */
-		if (cfg_sink->forward_px) {
-			srv = cfg_sink->forward_px->srv;
-			while (srv) {
-				struct sink_forward_target *sft;
-
-				/* allocate sink_forward_target descriptor */
-				sft = calloc(1, sizeof(*sft));
-				if (!sft) {
-					ha_alert("memory allocation error initializing server '%s' in ring '%s'.\n",srv->id, cfg_sink->name);
-					err_code |= ERR_ALERT | ERR_FATAL;
-					break;
-				}
-				sft->srv = srv;
-				sft->appctx = NULL;
-				sft->ofs = ~0; /* init ring offset */
-				sft->sink = cfg_sink;
-				sft->next = cfg_sink->sft;
-				HA_SPIN_INIT(&sft->lock);
-
-				/* mark server attached to the ring */
-				if (!ring_attach(cfg_sink->ctx.ring)) {
-					ha_alert("server '%s' sets too many watchers > 255 on ring '%s'.\n", srv->id, cfg_sink->name);
-					err_code |= ERR_ALERT | ERR_FATAL;
-					ha_free(&sft);
-					break;
-				}
-				cfg_sink->sft = sft;
-				srv = srv->next;
-			}
-			if (sink_init_forward(cfg_sink) == 0) {
-				ha_alert("error when trying to initialize sink buffer forwarding.\n");
-				err_code |= ERR_ALERT | ERR_FATAL;
-			}
-		}
-	}
+	err_code = sink_finalize(cfg_sink);
 	cfg_sink = NULL;
 
 	return err_code;
 }
 
-/* resolve sink names at end of config. Returns 0 on success otherwise error
- * flags.
-*/
-int post_sink_resolve()
+/* function: resolve a single logsrv target of BUFFER type
+ *
+ * <logsrv> is parent logsrv used for implicit settings
+ *
+ * Returns err_code which defaults to ERR_NONE and can be set to a combination
+ * of ERR_WARN, ERR_ALERT, ERR_FATAL and ERR_ABORT in case of errors.
+ * <msg> could be set at any time (it will usually be set on error, but
+ * could also be set when no error occured to report a diag warning), thus is
+ * up to the caller to check it and to free it.
+ */
+int sink_resolve_logsrv_buffer(struct logsrv *target, char **msg)
 {
 	int err_code = ERR_NONE;
-	struct logsrv *logsrv, *logb;
 	struct sink *sink;
-	struct proxy *px;
 
-	list_for_each_entry_safe(logsrv, logb, &global.logsrvs, list) {
-		if (logsrv->type == LOG_TARGET_BUFFER) {
-			sink = sink_find(logsrv->ring_name);
+	BUG_ON(target->type != LOG_TARGET_BUFFER);
+	sink = sink_find(target->ring_name);
+	if (!sink) {
+		/* LOG_TARGET_BUFFER but !AF_UNSPEC
+		 * means we must allocate a sink
+		 * buffer to send messages to this logsrv
+		 */
+		if (target->addr.ss_family != AF_UNSPEC) {
+			sink = sink_new_from_logsrv(target);
 			if (!sink) {
-				/* LOG_TARGET_BUFFER but !AF_UNSPEC
-				 * means we must allocate a sink
-				 * buffer to send messages to this logsrv
-				 */
-				if (logsrv->addr.ss_family != AF_UNSPEC) {
-					sink = sink_new_from_logsrv(logsrv);
-					if (!sink) {
-						ha_alert("global stream log server declared in file '%s' at line %d cannot be initialized'.\n",
-						         logsrv->conf.file, logsrv->conf.line);
-						err_code |= ERR_ALERT | ERR_FATAL;
-					}
-				}
-				else {
-					ha_alert("global log server declared in file '%s' at line %d uses unknown ring named '%s'.\n",
-					         logsrv->conf.file, logsrv->conf.line, logsrv->ring_name);
-					err_code |= ERR_ALERT | ERR_FATAL;
-				}
-			}
-			else if (sink->type != SINK_TYPE_BUFFER) {
-				ha_alert("global log server declared in file '%s' at line %d uses incompatible ring '%s'.\n",
-				         logsrv->conf.file, logsrv->conf.line, logsrv->ring_name);
+				memprintf(msg, "cannot be initialized (failed to create implicit ring)");
 				err_code |= ERR_ALERT | ERR_FATAL;
-			}
-			logsrv->sink = sink;
-		}
-
-	}
-
-	for (px = proxies_list; px; px = px->next) {
-		list_for_each_entry_safe(logsrv, logb, &px->logsrvs, list) {
-			if (logsrv->type == LOG_TARGET_BUFFER) {
-				sink = sink_find(logsrv->ring_name);
-				if (!sink) {
-					/* LOG_TARGET_BUFFER but !AF_UNSPEC
-					 * means we must allocate a sink
-					 * buffer to send messages to this logsrv
-					 */
-					if (logsrv->addr.ss_family != AF_UNSPEC) {
-						sink = sink_new_from_logsrv(logsrv);
-						if (!sink) {
-							ha_alert("log server declared in proxy section '%s' file '%s' at line %d cannot be initialized'.\n",
-							         px->id, logsrv->conf.file, logsrv->conf.line);
-							err_code |= ERR_ALERT | ERR_FATAL;
-						}
-					}
-					else {
-						ha_alert("log server declared in proxy section '%s' in file '%s' at line %d uses unknown ring named '%s'.\n",
-						         px->id, logsrv->conf.file, logsrv->conf.line, logsrv->ring_name);
-						err_code |= ERR_ALERT | ERR_FATAL;
-					}
-				}
-				else if (sink->type != SINK_TYPE_BUFFER) {
-					ha_alert("log server declared in proxy section '%s' in file '%s' at line %d uses incomatible ring named '%s'.\n",
-					         px->id, logsrv->conf.file, logsrv->conf.line, logsrv->ring_name);
-					err_code |= ERR_ALERT | ERR_FATAL;
-				}
-				logsrv->sink = sink;
+				goto end;
 			}
 		}
-	}
-
-	for (px = cfg_log_forward; px; px = px->next) {
-		list_for_each_entry_safe(logsrv, logb, &px->logsrvs, list) {
-			if (logsrv->type == LOG_TARGET_BUFFER) {
-				sink = sink_find(logsrv->ring_name);
-				if (!sink) {
-					/* LOG_TARGET_BUFFER but !AF_UNSPEC
-					 * means we must allocate a sink
-					 * buffer to send messages to this logsrv
-					 */
-					if (logsrv->addr.ss_family != AF_UNSPEC) {
-						sink = sink_new_from_logsrv(logsrv);
-						if (!sink) {
-							ha_alert("log server declared in log-forward section '%s' file '%s' at line %d cannot be initialized'.\n",
-							         px->id, logsrv->conf.file, logsrv->conf.line);
-							err_code |= ERR_ALERT | ERR_FATAL;
-						}
-					}
-					else {
-						ha_alert("log server declared in log-forward section '%s' in file '%s' at line %d uses unknown ring named '%s'.\n",
-							 px->id, logsrv->conf.file, logsrv->conf.line, logsrv->ring_name);
-						err_code |= ERR_ALERT | ERR_FATAL;
-					}
-				}
-				else if (sink->type != SINK_TYPE_BUFFER) {
-					ha_alert("log server declared in log-forward section '%s' in file '%s' at line %d uses unknown ring named '%s'.\n",
-						 px->id, logsrv->conf.file, logsrv->conf.line, logsrv->ring_name);
-					err_code |= ERR_ALERT | ERR_FATAL;
-				}
-				logsrv->sink = sink;
-			}
+		else {
+			memprintf(msg, "uses unknown ring named '%s'", target->ring_name);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto end;
 		}
 	}
+	else if (sink->type != SINK_TYPE_BUFFER) {
+		memprintf(msg, "uses incompatible ring '%s'", target->ring_name);
+		err_code |= ERR_ALERT | ERR_FATAL;
+		goto end;
+	}
+	if (sink && target->maxlen > ring_max_payload(sink->ctx.ring)) {
+		memprintf(msg, "uses a max length which exceeds ring capacity ('%s' supports %lu bytes at most)",
+		          target->ring_name, (unsigned long)ring_max_payload(sink->ctx.ring));
+	}
+	else if (sink && target->maxlen > sink->maxlen) {
+		memprintf(msg, "uses a ring with a smaller maxlen than the one specified on the log directive ('%s' has maxlen = %d), logs will be truncated according to the lowest maxlen between the two",
+		          target->ring_name, sink->maxlen);
+	}
+ end:
+	target->sink = sink;
 	return err_code;
 }
-
 
 static void sink_init()
 {
@@ -1354,33 +1325,9 @@ static void sink_init()
 static void sink_deinit()
 {
 	struct sink *sink, *sb;
-	struct sink_forward_target *sft_next;
 
-	list_for_each_entry_safe(sink, sb, &sink_list, sink_list) {
-		if (sink->type == SINK_TYPE_BUFFER) {
-			if (sink->store) {
-				size_t size = (sink->ctx.ring->buf.size + 4095UL) & -4096UL;
-				void *area = (sink->ctx.ring->buf.area - sizeof(*sink->ctx.ring));
-
-				msync(area, size, MS_SYNC);
-				munmap(area, size);
-				ha_free(&sink->store);
-			}
-			else
-				ring_free(sink->ctx.ring);
-		}
-		LIST_DELETE(&sink->sink_list);
-		task_destroy(sink->forward_task);
-		free_proxy(sink->forward_px);
-		free(sink->name);
-		free(sink->desc);
-		while (sink->sft) {
-			sft_next = sink->sft->next;
-			free(sink->sft);
-			sink->sft = sft_next;
-		}
-		free(sink);
-	}
+	list_for_each_entry_safe(sink, sb, &sink_list, sink_list)
+		sink_free(sink);
 }
 
 INITCALL0(STG_REGISTER, sink_init);
@@ -1395,7 +1342,6 @@ INITCALL1(STG_REGISTER, cli_register_kw, &cli_kws);
 
 /* config parsers for this section */
 REGISTER_CONFIG_SECTION("ring", cfg_parse_ring, cfg_post_parse_ring);
-REGISTER_POST_CHECK(post_sink_resolve);
 
 /*
  * Local variables:

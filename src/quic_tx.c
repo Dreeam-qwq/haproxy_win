@@ -79,22 +79,6 @@ static inline void free_quic_tx_packet(struct quic_conn *qc,
 	TRACE_LEAVE(QUIC_EV_CONN_TXPKT, qc);
 }
 
-/* Free the TX packets of <pkts> list */
-void free_quic_tx_pkts(struct quic_conn *qc, struct list *pkts)
-{
-	struct quic_tx_packet *pkt, *tmp;
-
-	TRACE_ENTER(QUIC_EV_CONN_TXPKT, qc);
-
-	list_for_each_entry_safe(pkt, tmp, pkts, list) {
-		LIST_DELETE(&pkt->list);
-		eb64_delete(&pkt->pn_node);
-		free_quic_tx_packet(qc, pkt);
-	}
-
-	TRACE_LEAVE(QUIC_EV_CONN_TXPKT, qc);
-}
-
 /* Duplicate all frames from <pkt_frm_list> list into <out_frm_list> list
  * for <qc> QUIC connection.
  * This is a best effort function which never fails even if no memory could be
@@ -504,7 +488,7 @@ static int qc_prep_app_pkts(struct quic_conn *qc, struct buffer *buf,
 			end = pos + QUIC_MIN_CC_PKTSIZE;
 		}
 		else if (!quic_peer_validated_addr(qc) && qc_is_listener(qc)) {
-			end = pos + QUIC_MIN((uint64_t)qc->path->mtu, quic_may_send_bytes(qc));
+			end = pos + QUIC_MIN(qc->path->mtu, quic_may_send_bytes(qc));
 		}
 		else {
 			end = pos + qc->path->mtu;
@@ -1112,7 +1096,7 @@ int qc_prep_hpkts(struct quic_conn *qc, struct buffer *buf, struct list *qels)
 					end = pos + QUIC_MIN_CC_PKTSIZE;
 				}
 				else if (!quic_peer_validated_addr(qc) && qc_is_listener(qc)) {
-					end = pos + QUIC_MIN((uint64_t)qc->path->mtu, quic_may_send_bytes(qc));
+					end = pos + QUIC_MIN(qc->path->mtu, quic_may_send_bytes(qc));
 				}
 				else {
 					end = pos + qc->path->mtu;
@@ -1333,12 +1317,14 @@ int qc_dgrams_retransmit(struct quic_conn *qc)
 				if (!LIST_ISEMPTY(&hfrms))
 					hpktns->tx.pto_probe = 1;
 				qc->iel->retrans_frms = &ifrms;
-				qc->hel->retrans_frms = &hfrms;
+				if (qc->hel)
+					qc->hel->retrans_frms = &hfrms;
 				if (!qc_send_hdshk_pkts(qc, 1, qc->iel, qc->hel))
 					goto leave;
 				/* Put back unsent frames in their packet number spaces */
 				LIST_SPLICE(&ipktns->tx.frms, &ifrms);
-				LIST_SPLICE(&hpktns->tx.frms, &hfrms);
+				if (hpktns)
+					LIST_SPLICE(&hpktns->tx.frms, &hfrms);
 			}
 			else {
 				/* We are in the case where the anti-amplification limit will be
@@ -1356,7 +1342,8 @@ int qc_dgrams_retransmit(struct quic_conn *qc)
 		TRACE_STATE("no more need to probe Initial packet number space",
 					QUIC_EV_CONN_TXPKT, qc);
 		ipktns->flags &= ~QUIC_FL_PKTNS_PROBE_NEEDED;
-		hpktns->flags &= ~QUIC_FL_PKTNS_PROBE_NEEDED;
+		if (hpktns)
+			hpktns->flags &= ~QUIC_FL_PKTNS_PROBE_NEEDED;
 	}
 	else {
 		int i;
@@ -1607,8 +1594,8 @@ static int quic_generate_retry_token(unsigned char *token, size_t len,
 	unsigned char salt[QUIC_RETRY_TOKEN_SALTLEN];
 	unsigned char key[QUIC_TLS_KEY_LEN];
 	unsigned char iv[QUIC_TLS_IV_LEN];
-	const unsigned char *sec = (const unsigned char *)global.cluster_secret;
-	size_t seclen = strlen(global.cluster_secret);
+	const unsigned char *sec = global.cluster_secret;
+	size_t seclen = sizeof global.cluster_secret;
 	EVP_CIPHER_CTX *ctx = NULL;
 	const EVP_CIPHER *aead = EVP_aes_128_gcm();
 	uint32_t timestamp = (uint32_t)date.tv_sec;

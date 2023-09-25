@@ -520,62 +520,6 @@ int parse_process_number(const char *arg, unsigned long *proc, int max, int *aut
 	return 0;
 }
 
-#ifdef USE_CPU_AFFINITY
-/* Parse cpu sets. Each CPU set is either a unique number between 0 and
- * ha_cpuset_size() - 1 or a range with two such numbers delimited by a dash
- * ('-'). Each CPU set can be a list of unique numbers or ranges separated by
- * a comma. It is also possible to specify multiple cpu numbers or ranges in
- * distinct argument in <args>. On success, it returns 0, otherwise it returns
- * 1 with an error message in <err>.
- */
-int parse_cpu_set(const char **args, struct hap_cpuset *cpu_set, char **err)
-{
-	int cur_arg = 0;
-	const char *arg;
-
-	ha_cpuset_zero(cpu_set);
-
-	arg = args[cur_arg];
-	while (*arg) {
-		const char *dash, *comma;
-		unsigned int low, high;
-
-		if (!isdigit((unsigned char)*args[cur_arg])) {
-			memprintf(err, "'%s' is not a CPU range.", arg);
-			return 1;
-		}
-
-		low = high = str2uic(arg);
-
-		comma = strchr(arg, ',');
-		dash = strchr(arg, '-');
-
-		if (dash && (!comma || dash < comma))
-			high = *(dash+1) ? str2uic(dash + 1) : ha_cpuset_size() - 1;
-
-		if (high < low) {
-			unsigned int swap = low;
-			low = high;
-			high = swap;
-		}
-
-		if (high >= ha_cpuset_size()) {
-			memprintf(err, "supports CPU numbers from 0 to %d.",
-			          ha_cpuset_size() - 1);
-			return 1;
-		}
-
-		while (low <= high)
-			ha_cpuset_set(cpu_set, low++);
-
-		/* if a comma is present, parse the rest of the arg, else
-		 * skip to the next arg */
-		arg = comma ? comma + 1 : args[++cur_arg];
-	}
-	return 0;
-}
-#endif
-
 /* Allocate and initialize the frontend of a "peers" section found in
  * file <file> at line <linenum> with <id> as ID.
  * Return 0 if succeeded, -1 if not.
@@ -2585,57 +2529,6 @@ static int numa_filter(const struct dirent *dir)
 	return 1;
 }
 
-/* Parse a linux cpu map string representing to a numeric cpu mask map
- * The cpu map string is a list of 4-byte hex strings separated by commas, with
- * most-significant byte first, one bit per cpu number.
- */
-static void parse_cpumap(char *cpumap_str, struct hap_cpuset *cpu_set)
-{
-	unsigned long cpumap;
-	char *start, *endptr, *comma;
-	int i, j;
-
-	ha_cpuset_zero(cpu_set);
-
-	i = 0;
-	do {
-		/* reverse-search for a comma, parse the string after the comma
-		 * or at the beginning if no comma found
-		 */
-		comma = strrchr(cpumap_str, ',');
-		start = comma ? comma + 1 : cpumap_str;
-
-		cpumap = strtoul(start, &endptr, 16);
-		for (j = 0; cpumap; cpumap >>= 1, ++j) {
-			if (cpumap & 0x1)
-				ha_cpuset_set(cpu_set, j + i * 32);
-		}
-
-		if (comma)
-			*comma = '\0';
-		++i;
-	} while (comma);
-}
-
-/* Read the first line of a file from <path> into the trash buffer.
- * Returns 0 on success, otherwise non-zero.
- */
-static int read_file_to_trash(const char *path)
-{
-	FILE *file;
-	int ret = 1;
-
-	file = fopen(path, "r");
-	if (file) {
-		if (fgets(trash.area, trash.size, file))
-			ret = 0;
-
-		fclose(file);
-	}
-
-	return ret;
-}
-
 /* Inspect the cpu topology of the machine on startup. If a multi-socket
  * machine is detected, try to bind on the first node with active cpu. This is
  * done to prevent an impact on the overall performance when the topology of
@@ -2655,8 +2548,8 @@ static int numa_detect_topology()
 
 	struct hap_cpuset active_cpus, node_cpu_set;
 	const char *parse_cpu_set_args[2];
-	char cpumap_path[PATH_MAX];
 	char *err = NULL;
+	int grp, thr;
 
 	/* node_cpu_set count is used as return value */
 	ha_cpuset_zero(&node_cpu_set);
@@ -2668,7 +2561,7 @@ static int numa_detect_topology()
 		goto free_scandir_entries;
 
 	/* 2. read and parse the list of currently online cpu */
-	if (read_file_to_trash(NUMA_DETECT_SYSTEM_SYSFS_PATH"/cpu/online")) {
+	if (read_line_to_trash("%s/cpu/online", NUMA_DETECT_SYSTEM_SYSFS_PATH) < 0) {
 		ha_notice("Cannot read online CPUs list, will not try to refine binding\n");
 		goto free_scandir_entries;
 	}
@@ -2686,10 +2579,7 @@ static int numa_detect_topology()
 		const char *node = node_dirlist[node_dirlist_size]->d_name;
 		ha_cpuset_zero(&node_cpu_set);
 
-		snprintf(cpumap_path, PATH_MAX, "%s/node/%s/cpumap",
-		         NUMA_DETECT_SYSTEM_SYSFS_PATH, node);
-
-		if (read_file_to_trash(cpumap_path)) {
+		if (read_line_to_trash("%s/node/%s/cpumap", NUMA_DETECT_SYSTEM_SYSFS_PATH, node) < 0) {
 			ha_notice("Cannot read CPUs list of '%s', will not select them to refine binding\n", node);
 			free(node_dirlist[node_dirlist_size]);
 			continue;
@@ -2705,12 +2595,9 @@ static int numa_detect_topology()
 		}
 
 		ha_diag_warning("Multi-socket cpu detected, automatically binding on active CPUs of '%s' (%u active cpu(s))\n", node, ha_cpuset_count(&node_cpu_set));
-		if (sched_setaffinity(getpid(), sizeof(node_cpu_set.cpuset), &node_cpu_set.cpuset) == -1) {
-			ha_warning("Cannot set the cpu affinity for this multi-cpu machine\n");
-
-			/* clear the cpuset used as return value */
-			ha_cpuset_zero(&node_cpu_set);
-		}
+		for (grp = 0; grp < MAX_TGROUPS; grp++)
+			for (thr = 0; thr < MAX_THREADS_PER_GROUP; thr++)
+				ha_cpuset_assign(&cpu_map[grp].thread[thr], &node_cpu_set);
 
 		free(node_dirlist[node_dirlist_size]);
 		break;
@@ -2730,6 +2617,7 @@ static int numa_detect_topology()
 	struct hap_cpuset node_cpu_set;
 	int ndomains = 0, i;
 	size_t len = sizeof(ndomains);
+	int grp, thr;
 
 	if (sysctlbyname("vm.ndomains", &ndomains, &len, NULL, 0) == -1) {
 		ha_notice("Cannot assess the number of CPUs domains\n");
@@ -2759,12 +2647,9 @@ static int numa_detect_topology()
 		ha_cpuset_assign(&node_cpu_set, &dom);
 
 		ha_diag_warning("Multi-socket cpu detected, automatically binding on active CPUs of '%d' (%u active cpu(s))\n", i, ha_cpuset_count(&node_cpu_set));
-		if (cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_PID, -1, sizeof(node_cpu_set.cpuset), &node_cpu_set.cpuset) == -1) {
-			ha_warning("Cannot set the cpu affinity for this multi-cpu machine\n");
-
-			/* clear the cpuset used as return value */
-			ha_cpuset_zero(&node_cpu_set);
-		}
+		for (grp = 0; grp < MAX_TGROUPS; grp++)
+			for (thr = 0; thr < MAX_THREADS_PER_GROUP; thr++)
+				ha_cpuset_assign(&cpu_map[grp].thread[thr], &node_cpu_set);
 		break;
 	}
  leave:
@@ -2803,7 +2688,6 @@ int check_config_validity()
 	struct cfg_postparser *postparser;
 	struct resolvers *curr_resolvers = NULL;
 	int i;
-	int diag_no_cluster_secret = 0;
 
 	bind_conf = NULL;
 	/*
@@ -4318,13 +4202,6 @@ init_proxies_list_stage2:
 
 #ifdef USE_QUIC
 			if (listener->bind_conf->xprt == xprt_get(XPRT_QUIC)) {
-				if (!global.cluster_secret) {
-					diag_no_cluster_secret = 1;
-					if (listener->bind_conf->options & BC_O_QUIC_FORCE_RETRY) {
-						ha_alert("QUIC listener with quic-force-retry requires global cluster-secret to be set.\n");
-						cfgerr++;
-					}
-				}
 # ifdef USE_QUIC_OPENSSL_COMPAT
 				/* store the last checked bind_conf in bind_conf */
 				if (!(global.tune.options & GTUNE_NO_QUIC) &&
@@ -4373,12 +4250,6 @@ init_proxies_list_stage2:
 		/* check if list is not null to avoid infinite loop */
 		if (init_proxies_list)
 			goto init_proxies_list_stage2;
-	}
-
-	if (diag_no_cluster_secret) {
-		ha_diag_warning("Generating a random cluster secret. "
-		                "You should define your own one in the configuration to ensure consistency "
-		                "after reload/restart or across your whole cluster.\n");
 	}
 
 	/*

@@ -60,7 +60,7 @@ static void http_debug_stline(const char *dir, struct stream *s, const struct ht
 static void http_debug_hdr(const char *dir, struct stream *s, const struct ist n, const struct ist v);
 
 static enum rule_result http_req_get_intercept_rule(struct proxy *px, struct list *def_rules, struct list *rules, struct stream *s);
-static enum rule_result http_res_get_intercept_rule(struct proxy *px, struct list *def_rules, struct list *rules, struct stream *s);
+static enum rule_result http_res_get_intercept_rule(struct proxy *px, struct list *def_rules, struct list *rules, struct stream *s, uint8_t final);
 static enum rule_result http_req_restrict_header_names(struct stream *s, struct htx *htx, struct proxy *px);
 
 static void http_manage_client_side_cookies(struct stream *s, struct channel *req);
@@ -985,8 +985,12 @@ int http_request_forward_body(struct stream *s, struct channel *req, int an_bit)
 
 	if ((s->scb->flags & SC_FL_SHUT_DONE) && co_data(req)) {
 		/* request errors are most likely due to the server aborting the
-		 * transfer. */
-		goto return_srv_abort;
+		 * transfer.Bit handle server aborts only if there is no
+		 * response. Otherwise, let a change to foward the response
+		 * first.
+		 */
+		if (htx_is_empty(htxbuf(&s->res.buf)))
+			goto return_srv_abort;
 	}
 
 	http_end_request(s);
@@ -1023,8 +1027,13 @@ int http_request_forward_body(struct stream *s, struct channel *req, int an_bit)
 
  waiting:
 	/* waiting for the last bits to leave the buffer */
-	if (s->scb->flags & SC_FL_SHUT_DONE)
-		goto return_srv_abort;
+	if (s->scb->flags & SC_FL_SHUT_DONE) {
+		/* Handle server aborts only if there is no response. Otherwise,
+		 * let a change to foward the response first.
+		 */
+		if (htx_is_empty(htxbuf(&s->res.buf)))
+			goto return_srv_abort;
+	}
 
 	/* When TE: chunked is used, we need to get there again to parse remaining
 	 * chunks even if the client has closed, so we don't want to set CF_DONTCLOSE.
@@ -1709,7 +1718,7 @@ int http_process_res_common(struct stream *s, struct channel *rep, int an_bit, s
 			def_rules = ((cur_proxy->defpx && (cur_proxy == s->be || cur_proxy->defpx != s->be->defpx)) ? &cur_proxy->defpx->http_res_rules : NULL);
 			rules = &cur_proxy->http_res_rules;
 
-			ret = http_res_get_intercept_rule(cur_proxy, def_rules, rules, s);
+			ret = http_res_get_intercept_rule(cur_proxy, def_rules, rules, s, 0);
 
 			switch (ret) {
 			case HTTP_RULE_RES_YIELD: /* some data miss, call the function later. */
@@ -2787,7 +2796,7 @@ static enum rule_result http_req_get_intercept_rule(struct proxy *px, struct lis
  * function with the same context.
  */
 static enum rule_result http_res_get_intercept_rule(struct proxy *px, struct list *def_rules,
-						    struct list *rules, struct stream *s)
+						    struct list *rules, struct stream *s, uint8_t final)
 {
 	struct session *sess = strm_sess(s);
 	struct http_txn *txn = s->txn;
@@ -2795,6 +2804,8 @@ static enum rule_result http_res_get_intercept_rule(struct proxy *px, struct lis
 	enum rule_result rule_ret = HTTP_RULE_RES_CONT;
 	int act_opts = 0;
 
+	if (final)
+		act_opts |= ACT_OPT_FINAL;
 	/* If "the current_rule_list" match the executed rule list, we are in
 	 * resume condition. If a resume is needed it is always in the action
 	 * and never in the ACL or converters. In this case, we initialise the
@@ -2955,11 +2966,11 @@ int http_eval_after_res_rules(struct stream *s)
 	def_rules = (s->be->defpx ? &s->be->defpx->http_after_res_rules : NULL);
 	rules = &s->be->http_after_res_rules;
 
-	ret = http_res_get_intercept_rule(s->be, def_rules, rules, s);
+	ret = http_res_get_intercept_rule(s->be, def_rules, rules, s, 1);
 	if ((ret == HTTP_RULE_RES_CONT || ret == HTTP_RULE_RES_STOP) && sess->fe != s->be) {
 		def_rules = ((sess->fe->defpx && sess->fe->defpx != s->be->defpx) ? &sess->fe->defpx->http_after_res_rules : NULL);
 		rules = &sess->fe->http_after_res_rules;
-		ret = http_res_get_intercept_rule(sess->fe, def_rules, rules, s);
+		ret = http_res_get_intercept_rule(sess->fe, def_rules, rules, s, 1);
 	}
 
   end:
