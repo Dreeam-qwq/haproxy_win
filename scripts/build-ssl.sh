@@ -122,6 +122,34 @@ download_quictls () {
     fi
 }
 
+download_wolfssl () {
+    if [ ! -f "download-cache/wolfssl-${WOLFSSL_VERSION}.tar.gz" ]; then
+      mkdir -p download-cache
+      if [ "${WOLFSSL_VERSION%%-*}" != "git" ]; then
+        wget -q -O "download-cache/wolfssl-${WOLFSSL_VERSION}.tar.gz" \
+             "https://github.com/wolfSSL/wolfssl/archive/refs/tags/v${WOLFSSL_VERSION}-stable.tar.gz"
+      else
+        wget -q -O "download-cache/wolfssl-${WOLFSSL_VERSION}.tar.gz" \
+             "https://github.com/wolfSSL/wolfssl/archive/${WOLFSSL_VERSION##git-}.tar.gz"
+      fi
+    fi
+}
+
+build_wolfssl () {
+    if [ "$(cat ${HOME}/opt/.wolfssl-version)" != "${WOLFSSL_VERSION}" ]; then
+        mkdir "wolfssl-${WOLFSSL_VERSION}/"
+        tar zxf "download-cache/wolfssl-${WOLFSSL_VERSION}.tar.gz" -C "wolfssl-${WOLFSSL_VERSION}/" --strip-components=1
+        (
+           cd "wolfssl-${WOLFSSL_VERSION}/"
+            autoreconf -i
+           ./configure --enable-haproxy --enable-quic --prefix="${HOME}/opt"
+           make -j$(nproc)
+           make install
+        )
+        echo "${WOLFSSL_VERSION}" > "${HOME}/opt/.wolfssl-version"
+    fi
+}
+
 if [ ! -z ${LIBRESSL_VERSION+x} ]; then
 	download_libressl
 	build_libressl
@@ -172,4 +200,9 @@ if [ ! -z ${QUICTLS+x} ]; then
         make install_sw
 
         )
+fi
+
+if [ ! -z ${WOLFSSL_VERSION+x} ]; then
+	download_wolfssl
+	build_wolfssl
 fi

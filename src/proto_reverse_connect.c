@@ -50,14 +50,15 @@ struct protocol proto_reverse_connect = {
 static struct connection *new_reverse_conn(struct listener *l, struct server *srv)
 {
 	struct connection *conn = conn_new(srv);
+	struct sockaddr_storage *bind_addr = NULL;
 	if (!conn)
 		goto err;
 
 	conn_set_reverse(conn, &l->obj_type);
 
-	/* These options is incompatible with a reverse connection. */
-	BUG_ON(srv->conn_src.opts & CO_SRC_BIND);
-	BUG_ON(srv->proxy->conn_src.opts & CO_SRC_BIND);
+	if (alloc_bind_address(&bind_addr, srv, srv->proxy, NULL) != SRV_STATUS_OK)
+		goto err;
+	conn->src = bind_addr;
 
 	sockaddr_alloc(&conn->dst, 0, 0);
 	if (!conn->dst)
@@ -66,11 +67,6 @@ static struct connection *new_reverse_conn(struct listener *l, struct server *sr
 	set_host_port(conn->dst, srv->svc_port);
 
 	if (conn_prepare(conn, protocol_lookup(conn->dst->ss_family, PROTO_TYPE_STREAM, 0), srv->xprt))
-		goto err;
-
-	/* TODO simplification of tcp_connect_server() */
-	conn->handle.fd = sock_create_server_socket(conn);
-	if (fd_set_nonblock(conn->handle.fd) == -1)
 		goto err;
 
 	if (conn->ctrl->connect(conn, 0) != SF_ERR_NONE)
@@ -92,6 +88,15 @@ static struct connection *new_reverse_conn(struct listener *l, struct server *sr
 
  err:
 	if (conn) {
+		conn_stop_tracking(conn);
+		conn_xprt_shutw(conn);
+		conn_xprt_close(conn);
+		conn_sock_shutw(conn, 0);
+		conn_ctrl_close(conn);
+
+		if (conn->destroy_cb)
+			conn->destroy_cb(conn);
+
 		/* Mark connection as non-reversable. This prevents conn_free()
 		 * to reschedule reverse_connect task on freeing a preconnect
 		 * connection.
@@ -137,7 +142,14 @@ struct task *rev_process(struct task *task, void *ctx, unsigned int state)
 
 	if (conn) {
 		if (conn->flags & CO_FL_ERROR) {
-			conn_full_close(conn);
+			conn_stop_tracking(conn);
+			conn_xprt_shutw(conn);
+			conn_xprt_close(conn);
+			conn_sock_shutw(conn, 0);
+			conn_ctrl_close(conn);
+
+			if (conn->destroy_cb)
+				conn->destroy_cb(conn);
 			conn_free(conn);
 
 			/* conn_free() must report preconnect failure using rev_notify_preconn_err(). */
@@ -236,6 +248,16 @@ int rev_bind_listener(struct listener *listener, char *errmsg, int errlen)
 		snprintf(errmsg, errlen, "Cannot reverse connect with server '%s/%s' unless HTTP/2 is activated on it with either proto or alpn keyword.", name, ist0(sv_name));
 		goto err;
 	}
+
+	/* Prevent dynamic source address settings. */
+	if (((srv->conn_src.opts & CO_SRC_TPROXY_MASK) &&
+	     (srv->conn_src.opts & CO_SRC_TPROXY_MASK) != CO_SRC_TPROXY_ADDR) ||
+	    ((srv->proxy->conn_src.opts & CO_SRC_TPROXY_MASK) &&
+	     (srv->proxy->conn_src.opts & CO_SRC_TPROXY_MASK) != CO_SRC_TPROXY_ADDR)) {
+		snprintf(errmsg, errlen, "Cannot reverse connect with server '%s/%s' which uses dynamic source address setting.", name, ist0(sv_name));
+		goto err;
+	}
+
 	ha_free(&name);
 
 	listener->rx.reverse_connect.srv = srv;

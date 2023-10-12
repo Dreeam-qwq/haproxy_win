@@ -278,6 +278,8 @@ struct hlua_csk_ctx {
 	struct list wake_on_read;
 	struct list wake_on_write;
 	struct appctx *appctx;
+	struct server *srv;
+	int timeout;
 	int die;
 };
 
@@ -2327,7 +2329,7 @@ static void hlua_socket_handler(struct appctx *appctx)
 
 static int hlua_socket_init(struct appctx *appctx)
 {
-	struct hlua_csk_ctx *ctx = appctx->svcctx;
+	struct hlua_csk_ctx *csk_ctx = appctx->svcctx;
 	struct stream *s;
 
 	if (appctx_finalize_startup(appctx, socket_proxy, &BUF_NULL) == -1)
@@ -2343,9 +2345,14 @@ static int hlua_socket_init(struct appctx *appctx)
 
 	/* Force destination server. */
 	s->flags |= SF_DIRECT | SF_ASSIGNED | SF_BE_ASSIGNED;
-	s->target = &socket_tcp->obj_type;
+	s->target = &csk_ctx->srv->obj_type;
 
-	ctx->appctx = appctx;
+	if (csk_ctx->timeout) {
+		s->sess->fe->timeout.connect = csk_ctx->timeout;
+		s->scf->ioto = csk_ctx->timeout;
+		s->scb->ioto = csk_ctx->timeout;
+	}
+
 	return 0;
 
   error:
@@ -2498,6 +2505,9 @@ __LJMP static int hlua_socket_receive_yield(struct lua_State *L, int status, lua
 		goto no_peer;
 
 	csk_ctx = container_of(peer, struct hlua_csk_ctx, xref);
+	if (!csk_ctx->connected)
+		goto connection_closed;
+
 	appctx = csk_ctx->appctx;
 	s = appctx_strm(appctx);
 
@@ -2739,6 +2749,12 @@ static int hlua_socket_write_yield(struct lua_State *L,int status, lua_KContext 
 	}
 
 	csk_ctx = container_of(peer, struct hlua_csk_ctx, xref);
+	if (!csk_ctx->connected) {
+		xref_unlock(&socket->xref, peer);
+		lua_pushinteger(L, -1);
+		return 1;
+	}
+
 	appctx = csk_ctx->appctx;
 	sc = appctx_sc(appctx);
 	s = __sc_strm(sc);
@@ -2948,6 +2964,7 @@ __LJMP static int hlua_socket_getpeername(struct lua_State *L)
 {
 	struct hlua_socket *socket;
 	struct xref *peer;
+	struct hlua_csk_ctx *csk_ctx;
 	struct appctx *appctx;
 	struct stconn *sc;
 	const struct sockaddr_storage *dst;
@@ -2970,7 +2987,14 @@ __LJMP static int hlua_socket_getpeername(struct lua_State *L)
 		return 1;
 	}
 
-	appctx = container_of(peer, struct hlua_csk_ctx, xref)->appctx;
+	csk_ctx = container_of(peer, struct hlua_csk_ctx, xref);
+	if (!csk_ctx->connected) {
+		xref_unlock(&socket->xref, peer);
+		lua_pushnil(L);
+		return 1;
+	}
+
+	appctx = csk_ctx->appctx;
 	sc = appctx_sc(appctx);
 	dst = sc_dst(sc_opposite(sc));
 	if (!dst) {
@@ -2991,6 +3015,7 @@ static int hlua_socket_getsockname(struct lua_State *L)
 	struct connection *conn;
 	struct appctx *appctx;
 	struct xref *peer;
+	struct hlua_csk_ctx *csk_ctx;
 	struct stream *s;
 	int ret;
 
@@ -3011,7 +3036,14 @@ static int hlua_socket_getsockname(struct lua_State *L)
 		return 1;
 	}
 
-	appctx = container_of(peer, struct hlua_csk_ctx, xref)->appctx;
+	csk_ctx = container_of(peer, struct hlua_csk_ctx, xref);
+	if (!csk_ctx->connected) {
+		xref_unlock(&socket->xref, peer);
+		lua_pushnil(L);
+		return 1;
+	}
+
+	appctx = csk_ctx->appctx;
 	s = appctx_strm(appctx);
 
 	conn = sc_conn(s->scb);
@@ -3114,7 +3146,11 @@ __LJMP static int hlua_socket_connect(struct lua_State *L)
 	struct sockaddr_storage *addr;
 	struct xref *peer;
 	struct stconn *sc;
-	struct stream *s;
+
+	/* Get hlua struct, or NULL if we execute from main lua state */
+	hlua = hlua_gethlua(L);
+	if (!hlua)
+		return 0;
 
 	if (lua_gettop(L) < 2)
 		WILL_LJMP(luaL_error(L, "connect: need at least 2 arguments"));
@@ -3152,6 +3188,10 @@ __LJMP static int hlua_socket_connect(struct lua_State *L)
 		return 1;
 	}
 
+	csk_ctx = container_of(peer, struct hlua_csk_ctx, xref);
+	if (!csk_ctx->srv)
+		csk_ctx->srv = socket_tcp;
+
 	/* Parse ip address. */
 	addr = str2sa_range(ip, NULL, &low, &high, NULL, NULL, NULL, NULL, NULL, PA_O_PORT_OK | PA_O_STREAM);
 	if (!addr) {
@@ -3176,20 +3216,23 @@ __LJMP static int hlua_socket_connect(struct lua_State *L)
 		}
 	}
 
-	csk_ctx = container_of(peer, struct hlua_csk_ctx, xref);
 	appctx = csk_ctx->appctx;
+	if (appctx_sc(appctx)) {
+		xref_unlock(&socket->xref, peer);
+		WILL_LJMP(luaL_error(L, "connect: connect already performed\n"));
+	}
+
+	if (appctx_init(appctx) == -1) {
+		xref_unlock(&socket->xref, peer);
+		WILL_LJMP(luaL_error(L, "connect: fail to init applet."));
+	}
+
 	sc = appctx_sc(appctx);
-	s = __sc_strm(sc);
 
 	if (!sockaddr_alloc(&sc_opposite(sc)->dst, addr, sizeof(*addr))) {
 		xref_unlock(&socket->xref, peer);
 		WILL_LJMP(luaL_error(L, "connect: internal error"));
 	}
-
-	/* Get hlua struct, or NULL if we execute from main lua state */
-	hlua = hlua_gethlua(L);
-	if (!hlua)
-		return 0;
 
 	/* inform the stream that we want to be notified whenever the
 	 * connection completes.
@@ -3206,9 +3249,7 @@ __LJMP static int hlua_socket_connect(struct lua_State *L)
 	}
 	xref_unlock(&socket->xref, peer);
 
-	task_wakeup(s->task, TASK_WOKEN_INIT);
 	/* Return yield waiting for connection. */
-
 	MAY_LJMP(hlua_yieldk(L, 0, 0, hlua_socket_connect_yield, TICK_ETERNITY, 0));
 
 	return 0;
@@ -3219,7 +3260,6 @@ __LJMP static int hlua_socket_connect_ssl(struct lua_State *L)
 {
 	struct hlua_socket *socket;
 	struct xref *peer;
-	struct stream *s;
 
 	MAY_LJMP(check_args(L, 3, "connect_ssl"));
 	socket  = MAY_LJMP(hlua_checksocket(L, 1));
@@ -3231,9 +3271,8 @@ __LJMP static int hlua_socket_connect_ssl(struct lua_State *L)
 		return 1;
 	}
 
-	s = appctx_strm(container_of(peer, struct hlua_csk_ctx, xref)->appctx);
+	container_of(peer, struct hlua_csk_ctx, xref)->srv = socket_ssl;
 
-	s->target = &socket_ssl->obj_type;
 	xref_unlock(&socket->xref, peer);
 	return MAY_LJMP(hlua_socket_connect(L));
 }
@@ -3250,6 +3289,8 @@ __LJMP static int hlua_socket_settimeout(struct lua_State *L)
 	int tmout;
 	double dtmout;
 	struct xref *peer;
+	struct hlua_csk_ctx *csk_ctx;
+	struct appctx *appctx;
 	struct stream *s;
 
 	MAY_LJMP(check_args(L, 2, "settimeout"));
@@ -3284,17 +3325,25 @@ __LJMP static int hlua_socket_settimeout(struct lua_State *L)
 		return 0;
 	}
 
-	s = appctx_strm(container_of(peer, struct hlua_csk_ctx, xref)->appctx);
+	csk_ctx = container_of(peer, struct hlua_csk_ctx, xref);
+	csk_ctx->timeout = tmout;
+
+	appctx = csk_ctx->appctx;
+	if (!appctx_sc(appctx))
+		goto end;
+
+	s = appctx_strm(csk_ctx->appctx);
 
 	s->sess->fe->timeout.connect = tmout;
 	s->scf->ioto = tmout;
 	s->scb->ioto = tmout;
 
-	s->task->expire = tick_add_ifset(now_ms, tmout);
+	s->task->expire = (tick_is_expired(s->task->expire, now_ms) ? 0 : s->task->expire);
+	s->task->expire = tick_first(s->task->expire, tick_add_ifset(now_ms, tmout));
 	task_queue(s->task);
 
+  end:
 	xref_unlock(&socket->xref, peer);
-
 	lua_pushinteger(L, 1);
 	return 1;
 }
@@ -3337,13 +3386,11 @@ __LJMP static int hlua_socket_new(lua_State *L)
 	ctx = applet_reserve_svcctx(appctx, sizeof(*ctx));
 	ctx->connected = 0;
 	ctx->die = 0;
+	ctx->srv = NULL;
+	ctx->timeout = 0;
+	ctx->appctx = appctx;
 	LIST_INIT(&ctx->wake_on_write);
 	LIST_INIT(&ctx->wake_on_read);
-
-	if (appctx_init(appctx) == -1) {
-		hlua_pusherror(L, "socket: fail to init applet.");
-		goto out_fail_appctx;
-	}
 
 	/* Initialise cross reference between stream and Lua socket object. */
 	xref_create(&socket->xref, &ctx->xref);

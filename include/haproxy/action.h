@@ -39,6 +39,8 @@ void free_act_rule(struct act_rule *rule);
 static inline struct action_kw *action_lookup(struct list *keywords, const char *kw)
 {
 	struct action_kw_list *kw_list;
+	struct action_kw *best = NULL;
+	int len, bestlen = 0;
 	int i;
 
 	if (LIST_ISEMPTY(keywords))
@@ -47,13 +49,18 @@ static inline struct action_kw *action_lookup(struct list *keywords, const char 
 	list_for_each_entry(kw_list, keywords, list) {
 		for (i = 0; kw_list->kw[i].kw != NULL; i++) {
 			if ((kw_list->kw[i].flags & KWF_MATCH_PREFIX) &&
-			    strncmp(kw, kw_list->kw[i].kw, strlen(kw_list->kw[i].kw)) == 0)
-				return &kw_list->kw[i];
+			    (len = strlen(kw_list->kw[i].kw)) > bestlen &&
+			    strncmp(kw, kw_list->kw[i].kw, len) == 0) {
+				if (len > bestlen) {
+					bestlen = len;
+					best = &kw_list->kw[i];
+				}
+			}
 			if (strcmp(kw, kw_list->kw[i].kw) == 0)
 				return &kw_list->kw[i];
 		}
 	}
-	return NULL;
+	return best;
 }
 
 static inline void action_build_list(struct list *keywords,
@@ -102,10 +109,8 @@ int check_trk_action(struct act_rule *rule, struct proxy *px, char **err);
  */
 int check_capture(struct act_rule *rule, struct proxy *px, char **err);
 
-int cfg_parse_rule_set_timeout(const char **args, int idx, int *out_timeout,
-                               enum act_timeout_name *name,
-                               struct sample_expr **expr, char **err,
-                               const char *file, int line, struct arg_list *al);
+int cfg_parse_rule_set_timeout(const char **args, int idx, struct act_rule *rule,
+			       struct proxy *px, char **err);
 
 static inline void release_timeout_action(struct act_rule *rule)
 {

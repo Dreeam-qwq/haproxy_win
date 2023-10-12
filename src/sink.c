@@ -314,9 +314,8 @@ void sink_setup_proxy(struct proxy *px)
 static void sink_forward_io_handler(struct appctx *appctx)
 {
 	struct stconn *sc = appctx_sc(appctx);
-	struct stream *s = __sc_strm(sc);
-	struct sink *sink = strm_fe(s)->parent;
 	struct sink_forward_target *sft = appctx->svcctx;
+	struct sink *sink = sft->sink;
 	struct ring *ring = sink->ctx.ring;
 	struct buffer *buf = &ring->buf;
 	uint64_t msg_len;
@@ -445,9 +444,8 @@ close:
 static void sink_forward_oc_io_handler(struct appctx *appctx)
 {
 	struct stconn *sc = appctx_sc(appctx);
-	struct stream *s = __sc_strm(sc);
-	struct sink *sink = strm_fe(s)->parent;
 	struct sink_forward_target *sft = appctx->svcctx;
+	struct sink *sink = sft->sink;
 	struct ring *ring = sink->ctx.ring;
 	struct buffer *buf = &ring->buf;
 	uint64_t msg_len;
@@ -567,10 +565,9 @@ close:
 
 void __sink_forward_session_deinit(struct sink_forward_target *sft)
 {
-	struct stream *s = appctx_strm(sft->appctx);
 	struct sink *sink;
 
-	sink = strm_fe(s)->parent;
+	sink = sft->sink;
 	if (!sink)
 		return;
 
@@ -591,7 +588,7 @@ static int sink_forward_session_init(struct appctx *appctx)
 	if (!sockaddr_alloc(&addr, &sft->srv->addr, sizeof(sft->srv->addr)))
 		goto out_error;
 
-	if (appctx_finalize_startup(appctx, sft->sink->forward_px, &BUF_NULL) == -1)
+	if (appctx_finalize_startup(appctx, sft->srv->proxy, &BUF_NULL) == -1)
 		goto out_free_addr;
 
 	s = appctx_strm(appctx);
@@ -806,7 +803,9 @@ static void sink_free(struct sink *sink)
 }
 
 /* Helper function to create new high-level ring buffer (as in ring section from
- * the config)
+ * the config): will create a new sink of buf type, and a new forward proxy,
+ * which will be stored in forward_px to know that the sink is responsible for
+ * it.
  *
  * Returns NULL on failure
  */
@@ -830,15 +829,12 @@ static struct sink *sink_new_ringbuf(const char *id, const char *description,
 	p->conf.args.line = p->conf.line = linenum;
 
 	sink = sink_new_buf(id, description, LOG_FORMAT_RAW, BUFSIZE);
-	if (!sink || sink->type != SINK_TYPE_BUFFER) {
+	if (!sink) {
 		memprintf(err_msg, "unable to create a new sink buffer for ring '%s'", id);
 		goto err;
 	}
 
-	sink->forward_px = p;
-
-	/* link sink forward_target to proxy */
-	p->parent = sink;
+	/* link sink to proxy */
 	sink->forward_px = p;
 
 	return sink;
@@ -846,6 +842,38 @@ static struct sink *sink_new_ringbuf(const char *id, const char *description,
  err:
 	free_proxy(p);
 	return NULL;
+}
+
+/* helper function: add a new server to an existing sink
+ *
+ * Returns 1 on success and 0 on failure
+ */
+static int sink_add_srv(struct sink *sink, struct server *srv)
+{
+	struct sink_forward_target *sft;
+
+	/* allocate new sink_forward_target descriptor */
+	sft = calloc(1, sizeof(*sft));
+	if (!sft) {
+		ha_alert("memory allocation error initializing server '%s' in ring '%s'.\n", srv->id, sink->name);
+		return 0;
+	}
+	sft->srv = srv;
+	sft->appctx = NULL;
+	sft->ofs = ~0; /* init ring offset */
+	sft->sink = sink;
+	sft->next = sink->sft;
+	HA_SPIN_INIT(&sft->lock);
+
+	/* mark server attached to the ring */
+	if (!ring_attach(sink->ctx.ring)) {
+		ha_alert("server '%s' sets too many watchers > 255 on ring '%s'.\n", srv->id, sink->name);
+		ha_free(&sft);
+		return 0;
+	}
+	sink->sft = sft;
+	srv = srv->next;
+	return 1;
 }
 
 /* Finalize sink struct to ensure configuration consistency and
@@ -872,38 +900,20 @@ static int sink_finalize(struct sink *sink)
 
 		/* prepare forward server descriptors */
 		if (sink->forward_px) {
+			/* sink proxy is set: register all servers from the proxy */
 			srv = sink->forward_px->srv;
 			while (srv) {
-				struct sink_forward_target *sft;
-
-				/* allocate sink_forward_target descriptor */
-				sft = calloc(1, sizeof(*sft));
-				if (!sft) {
-					ha_alert("memory allocation error initializing server '%s' in ring '%s'.\n", srv->id, sink->name);
+				if (!sink_add_srv(sink, srv)) {
 					err_code |= ERR_ALERT | ERR_FATAL;
 					break;
 				}
-				sft->srv = srv;
-				sft->appctx = NULL;
-				sft->ofs = ~0; /* init ring offset */
-				sft->sink = sink;
-				sft->next = sink->sft;
-				HA_SPIN_INIT(&sft->lock);
-
-				/* mark server attached to the ring */
-				if (!ring_attach(sink->ctx.ring)) {
-					ha_alert("server '%s' sets too many watchers > 255 on ring '%s'.\n", srv->id, sink->name);
-					err_code |= ERR_ALERT | ERR_FATAL;
-					ha_free(&sft);
-					break;
-				}
-				sink->sft = sft;
 				srv = srv->next;
 			}
-			if (sink_init_forward(sink) == 0) {
-				ha_alert("error when trying to initialize sink buffer forwarding.\n");
-				err_code |= ERR_ALERT | ERR_FATAL;
-			}
+		}
+		/* init forwarding if at least one sft is registered */
+		if (sink->sft && sink_init_forward(sink) == 0) {
+			ha_alert("error when trying to initialize sink buffer forwarding.\n");
+			err_code |= ERR_ALERT | ERR_FATAL;
 		}
 	}
 	return err_code;
@@ -1162,7 +1172,7 @@ err:
 	return err_code;
 }
 
-/* Creates an new sink buffer from a log server.
+/* Creates a new sink buffer from a log server.
  *
  * It uses the logsrvaddress to declare a forward
  * server for this buffer. And it initializes the
@@ -1176,7 +1186,7 @@ err:
  * Note: the sink is created using the name
  *       specified into logsrv->ring_name
  */
-struct sink *sink_new_from_logsrv(struct logsrv *logsrv)
+static struct sink *sink_new_from_logsrv(struct logsrv *logsrv)
 {
 	struct sink *sink = NULL;
 	struct server *srv = NULL;
@@ -1262,8 +1272,6 @@ int cfg_post_parse_ring()
 }
 
 /* function: resolve a single logsrv target of BUFFER type
- *
- * <logsrv> is parent logsrv used for implicit settings
  *
  * Returns err_code which defaults to ERR_NONE and can be set to a combination
  * of ERR_WARN, ERR_ALERT, ERR_FATAL and ERR_ABORT in case of errors.

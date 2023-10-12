@@ -3,7 +3,7 @@
                           Configuration Manual
                          ----------------------
                               version 2.9
-                              2023/09/22
+                              2023/10/06
 
 
 This document covers the configuration language as implemented in the version
@@ -1840,137 +1840,7 @@ log <address> [len <length>] [format <format>] [sample <ranges>:<sample_size>]
     <facility> [max level [min level]]
   Adds a global syslog server. Several global servers can be defined. They
   will receive logs for starts and exits, as well as all logs from proxies
-  configured with "log global".
-
-  <address> can be one of:
-
-        - An IPv4 address optionally followed by a colon and a UDP port. If
-          no port is specified, 514 is used by default (the standard syslog
-          port).
-
-        - An IPv6 address followed by a colon and optionally a UDP port. If
-          no port is specified, 514 is used by default (the standard syslog
-          port).
-
-        - A filesystem path to a datagram UNIX domain socket, keeping in mind
-          considerations for chroot (be sure the path is accessible inside
-          the chroot) and uid/gid (be sure the path is appropriately
-          writable).
-
-        - A file descriptor number in the form "fd@<number>", which may point
-          to a pipe, terminal, or socket. In this case unbuffered logs are used
-          and one writev() call per log is performed. This is a bit expensive
-          but acceptable for most workloads. Messages sent this way will not be
-          truncated but may be dropped, in which case the DroppedLogs counter
-          will be incremented. The writev() call is atomic even on pipes for
-          messages up to PIPE_BUF size, which POSIX recommends to be at least
-          512 and which is 4096 bytes on most modern operating systems. Any
-          larger message may be interleaved with messages from other processes.
-          Exceptionally for debugging purposes the file descriptor may also be
-          directed to a file, but doing so will significantly slow HAProxy down
-          as non-blocking calls will be ignored. Also there will be no way to
-          purge nor rotate this file without restarting the process. Note that
-          the configured syslog format is preserved, so the output is suitable
-          for use with a TCP syslog server. See also the "short" and "raw"
-          format below.
-
-        - "stdout" / "stderr", which are respectively aliases for "fd@1" and
-          "fd@2", see above.
-
-        - A ring buffer in the form "ring@<name>", which will correspond to an
-          in-memory ring buffer accessible over the CLI using the "show events"
-          command, which will also list existing rings and their sizes. Such
-          buffers are lost on reload or restart but when used as a complement
-          this can help troubleshooting by having the logs instantly available.
-
-        You may want to reference some environment variables in the address
-        parameter, see section 2.3 about environment variables.
-
-  <length> is an optional maximum line length. Log lines larger than this value
-           will be truncated before being sent. The reason is that syslog
-           servers act differently on log line length. All servers support the
-           default value of 1024, but some servers simply drop larger lines
-           while others do log them. If a server supports long lines, it may
-           make sense to set this value here in order to avoid truncating long
-           lines. Similarly, if a server drops long lines, it is preferable to
-           truncate them before sending them. Accepted values are 80 to 65535
-           inclusive. The default value of 1024 is generally fine for all
-           standard usages. Some specific cases of long captures or
-           JSON-formatted logs may require larger values. You may also need to
-           increase "tune.http.logurilen" if your request URIs are truncated.
-
-  <format> is the log format used when generating syslog messages. It may be
-           one of the following :
-
-    local     Analog to rfc3164 syslog message format except that hostname
-              field is stripped. This is the default.
-              Note: option "log-send-hostname" switches the default to
-              rfc3164.
-
-    rfc3164   The RFC3164 syslog message format.
-              (https://tools.ietf.org/html/rfc3164)
-
-    rfc5424   The RFC5424 syslog message format.
-              (https://tools.ietf.org/html/rfc5424)
-
-    priority  A message containing only a level plus syslog facility between
-              angle brackets such as '<63>', followed by the text. The PID,
-              date, time, process name and system name are omitted. This is
-              designed to be used with a local log server.
-
-    short     A message containing only a level between angle brackets such as
-              '<3>', followed by the text. The PID, date, time, process name
-              and system name are omitted. This is designed to be used with a
-              local log server. This format is compatible with what the systemd
-              logger consumes.
-
-    timed     A message containing only a level between angle brackets such as
-             '<3>', followed by ISO date and by the text. The PID, process
-              name and system name are omitted. This is designed to be
-              used with a local log server.
-
-    iso       A message containing only the ISO date, followed by the text.
-              The PID, process name and system name are omitted. This is
-              designed to be used with a local log server.
-
-    raw       A message containing only the text. The level, PID, date, time,
-              process name and system name are omitted. This is designed to be
-              used in containers or during development, where the severity only
-              depends on the file descriptor used (stdout/stderr).
-
-  <ranges>   A list of comma-separated ranges to identify the logs to sample.
-             This is used to balance the load of the logs to send to the log
-             server. The limits of the ranges cannot be null. They are numbered
-             from 1. The size or period (in number of logs) of the sample must be
-             set with <sample_size> parameter.
-
-  <sample_size>
-             The size of the sample in number of logs to consider when balancing
-             their logging loads. It is used to balance the load of the logs to
-             send to the syslog server. This size must be greater or equal to the
-             maximum of the high limits of the ranges.
-             (see also <ranges> parameter).
-
-  <facility> must be one of the 24 standard syslog facilities :
-
-                 kern   user   mail   daemon auth   syslog lpr    news
-                 uucp   cron   auth2  ftp    ntp    audit  alert  cron2
-                 local0 local1 local2 local3 local4 local5 local6 local7
-
-             Note that the facility is ignored for the "short" and "raw"
-             formats, but still required as a positional field. It is
-             recommended to use "daemon" in this case to make it clear that
-             it's only supposed to be used locally.
-
-  An optional level can be specified to filter outgoing messages. By default,
-  all messages are sent. If a maximum level is specified, only messages with a
-  severity at least as important as this level will be sent. An optional minimum
-  level can be specified. If it is set, logs emitted with a more severe level
-  than this one will be capped to this level. This is used to avoid sending
-  "emerg" messages on all terminals on some default syslog configurations.
-  Eight levels are known :
-
-          emerg  alert  crit   err    warning notice info  debug
+  configured with "log global". See "log" option for proxies for more details.
 
 log-send-hostname [<string>]
   Sets the hostname field in the syslog header. If optional "string" parameter
@@ -3470,10 +3340,10 @@ tune.quic.retry-threshold <number>
   See https://www.rfc-editor.org/rfc/rfc9000.html#section-8.1.2 for more
   information about QUIC retry.
 
-tune.quic.socket-owner { listener | connection }
-  Specifies how QUIC connections will use socket for receive/send operations.
-  Connections can share listener socket or each connection can allocate its
-  own socket.
+tune.quic.socket-owner { connection | listener }
+  Specifies globally how QUIC connections will use socket for receive/send
+  operations. Connections can share listener socket or each connection can
+  allocate its own socket.
 
   When default "connection" value is set, a dedicated socket will be allocated
   by every QUIC connections. This option is the preferred one to achieve the
@@ -3492,6 +3362,12 @@ tune.quic.socket-owner { listener | connection }
   allows to reduce FD consumption. However, performance won't be optimal due to
   a higher CPU usage if listeners are shared across a lot of threads or a
   large number of QUIC connections can be used simultaneously.
+
+  This setting is applied in conjunction with each "quic-socket" bind options.
+  If "connection" mode is used on global tuning, it will be activated for each
+  listener, unless its bind option is set to "listener". However, if "listener"
+  is used globally, it will be forced on every listener instance, regardless of
+  their individual configuration.
 
 tune.rcvbuf.client <number>
 tune.rcvbuf.server <number>
@@ -7010,7 +6886,7 @@ http-request <action> [options...] [ { if | unless } <condition> ]
     - set-query <fmt>
     - set-src <expr>
     - set-src-port <expr>
-    - set-timeout { server | tunnel } { <timeout> | <expr> }
+    - set-timeout { client | server | tunnel } { <timeout> | <expr> }
     - set-tos <tos>
     - set-uri <fmt>
     - set-var(<var-name>[,<cond>...]) <expr>
@@ -7925,10 +7801,10 @@ http-request set-src-port <expr> [ { if | unless } <condition> ]
   the address family supports a port, otherwise it forces the source address to
   IPv4 "0.0.0.0" before rewriting the port.
 
-http-request set-timeout { server | tunnel } { <timeout> | <expr> }
+http-request set-timeout { client | server | tunnel } { <timeout> | <expr> }
                                        [ { if | unless } <condition> ]
 
-  This action overrides the specified "server" or "tunnel" timeout for the
+  This action overrides the specified "client", "server" or "tunnel" timeout for the
   current stream only. The timeout can be specified in millisecond or with any
   other unit if the number is suffixed by the unit as explained at the top of
   this document. It is also possible to write an expression which must returns
@@ -7936,8 +7812,8 @@ http-request set-timeout { server | tunnel } { <timeout> | <expr> }
 
   Note that the server/tunnel timeouts are only relevant on the backend side
   and thus this rule is only available for the proxies with backend
-  capabilities. Also the timeout value must be non-null to obtain the expected
-  results.
+  capabilities. As well as client timeout is only relevant for frontend side.
+  Also the timeout value must be non-null to obtain the expected results.
 
   Example:
     http-request set-timeout tunnel 5s
@@ -8834,6 +8710,8 @@ no log
                values are 80 to 65535 inclusive. The default value of 1024 is
                generally fine for all standard usages. Some specific cases of
                long captures or JSON-formatted logs may require larger values.
+               You may also need to increase "tune.http.logurilen" if your
+               request URIs are truncated.
 
     <ranges>   A list of comma-separated ranges to identify the logs to sample.
                This is used to balance the load of the logs to send to the log
@@ -15520,6 +15398,11 @@ quic-force-retry
   See https://www.rfc-editor.org/rfc/rfc9000.html#section-8.1.2 for more
   information about QUIC retry.
 
+quic-socket [ connection | listener ]
+  This QUIC specific setting allows to define the socket allocation mode for
+  the specific listeners. See "tune.quic.socket-owner" for a full description
+  of its usage.
+
 shards <number> | by-thread | by-group
   In multi-threaded mode, on operating systems supporting multiple listeners on
   the same IP:port, this will automatically create this number of multiple
@@ -17167,7 +17050,7 @@ The cache won't store and won't deliver objects in these cases:
 - If the response is not a 200
 - If the response contains a Vary header and either the process-vary option is
   disabled, or a currently unmanaged header is specified in the Vary value (only
-  accept-encoding and referer are managed for now)
+  accept-encoding, referer and origin are managed for now)
 - If the Content-Length + the headers size is greater than "max-object-size"
 - If the response is not cacheable
 - If the response does not have an explicit expiration time (s-maxage or max-age
@@ -17218,8 +17101,10 @@ process-vary <on/off>
   Enable or disable the processing of the Vary header. When disabled, a response
   containing such a header will never be cached. When enabled, we need to calculate
   a preliminary hash for a subset of request headers on all the incoming requests
-  (which might come with a cpu cost) which will be used to build a secondary key
-  for a given request (see RFC 7234#4.1). The default value is off (disabled).
+  (which might come with a cpu cost) which will be used to build a secondary
+  key for a given request (see RFC 7234#4.1). The secondary key is built out of
+  the contents of the 'accept-encoding', 'referer' and 'origin' headers for
+  now. The default value is off (disabled).
 
 max-secondary-entries <number>
   Define the maximum number of simultaneous secondary entries with the same primary
@@ -20098,6 +19983,11 @@ cur_tunnel_timeout : integer
   In the default case, this will be equal to be_tunnel_timeout unless a
   "set-timeout" rule has been applied. See also "be_tunnel_timeout".
 
+cur_client_timeout : integer
+  Returns the currently applied client timeout in millisecond for the stream.
+  In the default case, this will be equal to fe_client_timeout unless a
+  "set-timeout" rule has been applied. See also "fe_client_timeout".
+
 dst : ip
   This is the destination IP address of the connection on the client side,
   which is the address the client connected to. Any tcp/http rules may alter
@@ -20353,7 +20243,7 @@ fe_name : string
 
 fe_client_timeout : integer
   Returns the configuration value in millisecond for the client timeout of the
-  current frontend.
+  current frontend. This timeout can be overwritten by a "set-timeout" rule.
 
 res.timer.data : integer
   this is the total transfer time of the response payload till the last byte

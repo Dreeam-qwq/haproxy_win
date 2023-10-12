@@ -21,8 +21,6 @@
 #include <haproxy/quic_trace.h>
 #include <haproxy/ssl_sock-t.h>
 
-#define TRACE_SOURCE &trace_quic
-
 DECLARE_POOL(pool_head_quic_tx_packet, "quic_tx_packet", sizeof(struct quic_tx_packet));
 DECLARE_POOL(pool_head_quic_cc_buf, "quic_cc_buf", QUIC_MAX_CC_BUFSIZE);
 
@@ -1553,8 +1551,7 @@ int send_stateless_reset(struct listener *l, struct sockaddr_storage *dstaddr,
  */
 int quic_generate_retry_token_aad(unsigned char *aad,
                                   uint32_t version,
-                                  const struct quic_cid *dcid,
-                                  const struct quic_cid *scid,
+                                  const struct quic_cid *cid,
                                   const struct sockaddr_storage *addr)
 {
 	unsigned char *p;
@@ -1562,11 +1559,9 @@ int quic_generate_retry_token_aad(unsigned char *aad,
 	p = aad;
 	*(uint32_t *)p = htonl(version);
 	p += sizeof version;
-	memcpy(p, dcid->data, dcid->len);
-	p += dcid->len;
 	p += quic_saddr_cpy(p, addr);
-	memcpy(p, scid->data, scid->len);
-	p += scid->len;
+	memcpy(p, cid->data, cid->len);
+	p += cid->len;
 
 	return p - aad;
 }
@@ -1581,15 +1576,13 @@ int quic_generate_retry_token_aad(unsigned char *aad,
 static int quic_generate_retry_token(unsigned char *token, size_t len,
                                      const uint32_t version,
                                      const struct quic_cid *odcid,
-                                     const struct quic_cid *scid,
                                      const struct quic_cid *dcid,
                                      struct sockaddr_storage *addr)
 {
 	int ret = 0;
 	unsigned char *p;
-	unsigned char aad[sizeof(uint32_t) + QUIC_CID_MAXLEN +
-		          sizeof(in_port_t) + sizeof(struct in6_addr) +
-			  QUIC_CID_MAXLEN];
+	unsigned char aad[sizeof(uint32_t) + sizeof(in_port_t) +
+	                  sizeof(struct in6_addr) + QUIC_CID_MAXLEN];
 	size_t aadlen;
 	unsigned char salt[QUIC_RETRY_TOKEN_SALTLEN];
 	unsigned char key[QUIC_TLS_KEY_LEN];
@@ -1609,7 +1602,7 @@ static int quic_generate_retry_token(unsigned char *token, size_t len,
 	if (1 + odcid->len + 1 + sizeof(timestamp) + QUIC_TLS_TAG_LEN + QUIC_RETRY_TOKEN_SALTLEN > len)
 		goto err;
 
-	aadlen = quic_generate_retry_token_aad(aad, version, scid, dcid, addr);
+	aadlen = quic_generate_retry_token_aad(aad, version, dcid, addr);
 	/* TODO: RAND_bytes() should be replaced */
 	if (RAND_bytes(salt, sizeof salt) != 1) {
 		TRACE_ERROR("RAND_bytes()", QUIC_EV_CONN_TXPKT);
@@ -1701,7 +1694,7 @@ int send_retry(int fd, struct sockaddr_storage *addr,
 
 	/* token */
 	if (!(token_len = quic_generate_retry_token(&buf[i], sizeof(buf) - i, qv->num,
-	                                            &pkt->dcid, &scid, &pkt->scid, addr))) {
+	                                            &pkt->dcid, &pkt->scid, addr))) {
 		TRACE_ERROR("quic_generate_retry_token() failed", QUIC_EV_CONN_TXPKT);
 		goto out;
 	}

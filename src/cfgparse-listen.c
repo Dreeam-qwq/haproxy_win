@@ -676,6 +676,13 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 		if (warnifnotcap(curproxy, PR_CAP_BE, file, linenum, args[0], NULL))
 			err_code |= ERR_WARN;
 
+		if (curproxy->mode != PR_MODE_TCP && curproxy->mode != PR_MODE_HTTP) {
+			ha_alert("parsing [%s:%d] : '%s' requires TCP or HTTP mode.\n",
+				 file, linenum, args[0]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+
 		if (*(args[1]) == 0) {
 			ha_alert("parsing [%s:%d] : '%s' expects <secret_key> as argument.\n",
 				 file, linenum, args[0]);
@@ -1315,6 +1322,13 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 		if (warnifnotcap(curproxy, PR_CAP_BE, file, linenum, args[0], NULL))
 			err_code |= ERR_WARN;
 
+		if (curproxy->mode != PR_MODE_TCP && curproxy->mode != PR_MODE_HTTP) {
+			ha_alert("parsing [%s:%d] : '%s' requires TCP or HTTP mode.\n",
+				 file, linenum, args[0]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+
 		if (!*args[1]) {
 			ha_alert("parsing [%s:%d] : '%s' requires a header string.\n",
 				 file, linenum, args[0]);
@@ -1428,6 +1442,11 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 		if (warnifnotcap(curproxy, PR_CAP_BE, file, linenum, args[0], NULL))
 			err_code |= ERR_WARN;
 
+		if (curproxy->mode != PR_MODE_TCP && curproxy->mode != PR_MODE_HTTP) {
+			err_code |= ERR_WARN;
+			ha_warning("parsing [%s:%d] : '%s' rules will be ignored for %s backend '%s' (unsupported mode).\n", file, linenum, args[0], proxy_mode_str(curproxy->mode), curproxy->id);
+		}
+
 		if (*(args[1]) == 0) {
 			ha_alert("parsing [%s:%d] : '%s' expects a server name.\n", file, linenum, args[0]);
 			err_code |= ERR_ALERT | ERR_FATAL;
@@ -1527,6 +1546,13 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 			goto out;
 		}
 
+		if (curproxy->mode != PR_MODE_TCP && curproxy->mode != PR_MODE_HTTP) {
+			ha_alert("parsing [%s:%d] : 'stick-table' requires TCP or HTTP mode.\n",
+				 file, linenum);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+
 		other = stktable_find_by_name(curproxy->id);
 		if (other) {
 			ha_alert("parsing [%s:%d] : stick-table name '%s' conflicts with table declared in %s '%s' at %s:%d.\n",
@@ -1575,6 +1601,13 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 
 		if (curproxy->cap & PR_CAP_DEF) {
 			ha_alert("parsing [%s:%d] : '%s' not allowed in 'defaults' section.\n", file, linenum, args[0]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+
+		if (curproxy->mode != PR_MODE_TCP && curproxy->mode != PR_MODE_HTTP) {
+			ha_alert("parsing [%s:%d] : '%s' requires TCP or HTTP mode.\n",
+				 file, linenum, args[0]);
 			err_code |= ERR_ALERT | ERR_FATAL;
 			goto out;
 		}
@@ -2337,6 +2370,12 @@ stats_error_parsing:
 		if (warnifnotcap(curproxy, PR_CAP_BE, file, linenum, args[0], NULL))
 			err_code |= ERR_WARN;
 
+		if (curproxy->mode != PR_MODE_TCP && curproxy->mode != PR_MODE_HTTP) {
+			ha_alert("parsing [%s:%d] : '%s' requires TCP or HTTP mode.\n", file, linenum, args[0]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+
 		if (strcmp(args[1], "never") == 0) {
 			/* enable a graceful server shutdown on an HTTP 404 response */
 			curproxy->options &= ~PR_O_REUSE_MASK;
@@ -2488,6 +2527,12 @@ stats_error_parsing:
 		if (warnifnotcap(curproxy, PR_CAP_BE, file, linenum, args[0], NULL))
 			err_code |= ERR_WARN;
 
+		if (curproxy->mode != PR_MODE_TCP && curproxy->mode != PR_MODE_HTTP) {
+			ha_alert("parsing [%s:%d] : '%s' requires TCP or HTTP mode.\n", file, linenum, args[0]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+
 		if (backend_parse_balance((const char **)args + 1, &errmsg, curproxy) < 0) {
 			ha_alert("parsing [%s:%d] : %s %s\n", file, linenum, args[0], errmsg);
 			err_code |= ERR_ALERT | ERR_FATAL;
@@ -2502,6 +2547,12 @@ stats_error_parsing:
 		 * The default hash function is sdbm for map-based and sdbm+avalanche for consistent.
 		 */
 		curproxy->lbprm.algo &= ~(BE_LB_HASH_TYPE | BE_LB_HASH_FUNC | BE_LB_HASH_MOD);
+
+		if (curproxy->mode != PR_MODE_TCP && curproxy->mode != PR_MODE_HTTP) {
+			ha_alert("parsing [%s:%d] : '%s' requires TCP or HTTP mode.\n", file, linenum, args[0]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
 
 		if (warnifnotcap(curproxy, PR_CAP_BE, file, linenum, args[0], NULL))
 			err_code |= ERR_WARN;
@@ -2563,6 +2614,12 @@ stats_error_parsing:
 		}
 	}
 	else if (strcmp(args[0], "hash-balance-factor") == 0) {
+		if (curproxy->mode != PR_MODE_TCP && curproxy->mode != PR_MODE_HTTP) {
+			ha_alert("parsing [%s:%d] : '%s' requires TCP or HTTP mode.\n", file, linenum, args[0]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+
 		if (*(args[1]) == 0) {
 			ha_alert("parsing [%s:%d] : '%s' expects an integer argument.\n", file, linenum, args[0]);
 			err_code |= ERR_ALERT | ERR_FATAL;

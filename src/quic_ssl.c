@@ -6,9 +6,9 @@
 #include <haproxy/quic_ssl.h>
 #include <haproxy/quic_tls.h>
 #include <haproxy/quic_tp.h>
+#include <haproxy/quic_trace.h>
 #include <haproxy/ssl_sock.h>
-
-#define TRACE_SOURCE       &trace_quic
+#include <haproxy/trace.h>
 
 DECLARE_POOL(pool_head_quic_ssl_sock_ctx, "quic_ssl_sock_ctx", sizeof(struct ssl_sock_ctx));
 
@@ -192,14 +192,16 @@ static int ha_quic_set_encryption_secrets(SSL *ssl, enum ssl_encryption_level_t 
 		goto write;
 
 	rx = &tls_ctx->rx;
+	rx->aead = tls_aead(cipher);
+	rx->md   = tls_md(cipher);
+	rx->hp   = tls_hp(cipher);
+	if (!rx->aead || !rx->md || !rx->hp)
+		goto leave;
+
 	if (!quic_tls_secrets_keys_alloc(rx)) {
 		TRACE_ERROR("RX keys allocation failed", QUIC_EV_CONN_RWSEC, qc);
 		goto leave;
 	}
-
-	rx->aead = tls_aead(cipher);
-	rx->md   = tls_md(cipher);
-	rx->hp   = tls_hp(cipher);
 
 	if (!quic_tls_derive_keys(rx->aead, rx->hp, rx->md, ver, rx->key, rx->keylen,
 	                          rx->iv, rx->ivlen, rx->hp_key, sizeof rx->hp_key,
@@ -233,14 +235,16 @@ write:
 		goto keyupdate_init;
 
 	tx = &tls_ctx->tx;
+	tx->aead = tls_aead(cipher);
+	tx->md   = tls_md(cipher);
+	tx->hp   = tls_hp(cipher);
+	if (!tx->aead || !tx->md || !tx->hp)
+		goto leave;
+
 	if (!quic_tls_secrets_keys_alloc(tx)) {
 		TRACE_ERROR("TX keys allocation failed", QUIC_EV_CONN_RWSEC, qc);
 		goto leave;
 	}
-
-	tx->aead = tls_aead(cipher);
-	tx->md   = tls_md(cipher);
-	tx->hp   = tls_hp(cipher);
 
 	if (!quic_tls_derive_keys(tx->aead, tx->hp, tx->md, ver, tx->key, tx->keylen,
 	                          tx->iv, tx->ivlen, tx->hp_key, sizeof tx->hp_key,
@@ -298,9 +302,40 @@ write:
  out:
 	ret = 1;
  leave:
+	if (!ret) {
+		/* Release the CRYPTO frames which have been provided by the TLS stack
+		 * to prevent the transmission of ack-eliciting packets.
+		 */
+		qc_release_pktns_frms(qc, qc->ipktns);
+		qc_release_pktns_frms(qc, qc->hpktns);
+		qc_release_pktns_frms(qc, qc->apktns);
+		quic_set_tls_alert(qc, SSL_AD_HANDSHAKE_FAILURE);
+	}
+
 	TRACE_LEAVE(QUIC_EV_CONN_RWSEC, qc, &level);
 	return ret;
 }
+
+#if defined(OPENSSL_IS_AWSLC)
+/* compatibility function for split read/write encryption secrets to be used
+ * with the API which uses 2 callbacks. */
+static inline int ha_quic_set_read_secret(SSL *ssl, enum ssl_encryption_level_t level,
+                                   const SSL_CIPHER *cipher, const uint8_t *secret,
+                                   size_t secret_len)
+{
+	return ha_quic_set_encryption_secrets(ssl, level, secret, NULL, secret_len);
+
+}
+
+static inline int ha_quic_set_write_secret(SSL *ssl, enum ssl_encryption_level_t level,
+                                   const SSL_CIPHER *cipher, const uint8_t *secret,
+                                   size_t secret_len)
+{
+
+	return ha_quic_set_encryption_secrets(ssl, level, NULL, secret, secret_len);
+
+}
+#endif
 
 /* ->add_handshake_data QUIC TLS callback used by the QUIC TLS stack when it
  * wants to provide the QUIC layer with CRYPTO data.
@@ -367,12 +402,25 @@ static int ha_quic_send_alert(SSL *ssl, enum ssl_encryption_level_t level, uint8
 }
 
 /* QUIC TLS methods */
+#if defined(OPENSSL_IS_AWSLC)
+/* write/read set secret splitted */
+static SSL_QUIC_METHOD ha_quic_method = {
+	.set_read_secret        = ha_quic_set_read_secret,
+	.set_write_secret       = ha_quic_set_write_secret,
+	.add_handshake_data     = ha_quic_add_handshake_data,
+	.flush_flight           = ha_quic_flush_flight,
+	.send_alert             = ha_quic_send_alert,
+};
+
+#else
+
 static SSL_QUIC_METHOD ha_quic_method = {
 	.set_encryption_secrets = ha_quic_set_encryption_secrets,
 	.add_handshake_data     = ha_quic_add_handshake_data,
 	.flush_flight           = ha_quic_flush_flight,
 	.send_alert             = ha_quic_send_alert,
 };
+#endif
 
 /* Initialize the TLS context of a listener with <bind_conf> as configuration.
  * Returns an error count.
@@ -401,7 +449,7 @@ int ssl_quic_initial_ctx(struct bind_conf *bind_conf)
 #  if defined(SSL_OP_NO_ANTI_REPLAY)
 	if (bind_conf->ssl_conf.early_data) {
 		SSL_CTX_set_options(ctx, SSL_OP_NO_ANTI_REPLAY);
-#   ifdef USE_QUIC_OPENSSL_COMPAT
+#   if defined(USE_QUIC_OPENSSL_COMPAT) || defined(OPENSSL_IS_AWSLC)
 		ha_warning("Binding [%s:%d] for %s %s: 0-RTT is not supported in limited QUIC compatibility mode, ignored.\n",
 		           bind_conf->file, bind_conf->line, proxy_type_str(bind_conf->frontend), bind_conf->frontend->id);
 #   else
@@ -662,7 +710,7 @@ int qc_alloc_ssl_sock_ctx(struct quic_conn *qc)
 	if (qc_is_listener(qc)) {
 		if (qc_ssl_sess_init(qc, bc->initial_ctx, &ctx->ssl) == -1)
 		        goto err;
-#if (HA_OPENSSL_VERSION_NUMBER >= 0x10101000L)
+#if (HA_OPENSSL_VERSION_NUMBER >= 0x10101000L) && !defined(OPENSSL_IS_AWSLC)
 #ifndef USE_QUIC_OPENSSL_COMPAT
 		/* Enabling 0-RTT */
 		if (bc->ssl_conf.early_data)

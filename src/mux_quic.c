@@ -37,6 +37,11 @@ static void qcs_free_ncbuf(struct qcs *qcs, struct ncbuf *ncbuf)
 	offer_buffers(NULL, 1);
 
 	*ncbuf = NCBUF_NULL;
+
+	/* Reset DEM_FULL as buffer is released. This ensures mux is not woken
+	 * up from rcv_buf stream callback when demux was previously blocked.
+	 */
+	qcs->flags &= ~QC_SF_DEM_FULL;
 }
 
 /* Free <qcs> instance. This function is reserved for internal usage : it must
@@ -125,6 +130,10 @@ static struct qcs *qcs_new(struct qcc *qcc, uint64_t id, enum qcs_type type)
 	else if (quic_stream_is_local(qcc, id)) {
 		qcs->tx.msd = qcc->rfctl.msd_uni_l;
 	}
+
+	/* Properly set flow-control blocking if initial MSD is nul. */
+	if (!qcs->tx.msd)
+		qcs->flags |= QC_SF_BLK_SFCTL;
 
 	qcs->rx.ncbuf = NCBUF_NULL;
 	qcs->rx.app_buf = BUF_NULL;
@@ -1265,7 +1274,6 @@ int qcc_recv_reset_stream(struct qcc *qcc, uint64_t id, uint64_t err, uint64_t f
 	 */
 	if (qcc_get_qcs(qcc, id, 1, 0, &qcs)) {
 		TRACE_ERROR("RESET_STREAM for send-only stream received", QMUX_EV_QCC_RECV|QMUX_EV_QCS_RECV, qcc->conn, qcs);
-		qcc_set_error(qcc, QC_ERR_STREAM_STATE_ERROR, 0);
 		goto err;
 	}
 
@@ -2743,9 +2751,8 @@ static size_t qmux_strm_rcv_buf(struct stconn *sc, struct buffer *buf,
 
 	/* Restart demux if it was interrupted on full buffer. */
 	if (ret && qcs->flags & QC_SF_DEM_FULL) {
-		/* There must be data left for demux if it was interrupted on
-		 * full buffer. If this assumption is incorrect wakeup is not
-		 * necessary.
+		/* Ensure DEM_FULL is only set if there is available data to
+		 * ensure we never do unnecessary wakeup here.
 		 */
 		BUG_ON(!ncb_data(&qcs->rx.ncbuf, 0));
 

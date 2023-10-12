@@ -17,8 +17,6 @@
 #error "Must define USE_OPENSSL"
 #endif
 
-#define TRACE_SOURCE &trace_quic
-
 #include <stdlib.h>
 #include <string.h>
 
@@ -29,6 +27,7 @@
 #include <haproxy/quic_frame.h>
 #include <haproxy/quic_tls-t.h>
 #include <haproxy/quic_tx.h>
+#include <haproxy/quic_trace.h>
 #include <haproxy/trace.h>
 
 int quic_tls_finalize(struct quic_conn *qc, int server);
@@ -141,9 +140,11 @@ static inline const EVP_CIPHER *tls_aead(const SSL_CIPHER *cipher)
 		return EVP_aes_128_gcm();
 	case TLS1_3_CK_AES_256_GCM_SHA384:
 		return EVP_aes_256_gcm();
+#if !defined(OPENSSL_IS_AWSLC)
 	case TLS1_3_CK_CHACHA20_POLY1305_SHA256:
 		return EVP_chacha20_poly1305();
-#ifndef USE_OPENSSL_WOLFSSL
+#endif
+#if !defined(USE_OPENSSL_WOLFSSL) && !defined(OPENSSL_IS_AWSLC)
 	case TLS1_3_CK_AES_128_CCM_SHA256:
 		return EVP_aes_128_ccm();
 #endif
@@ -169,8 +170,10 @@ static inline const EVP_MD *tls_md(const SSL_CIPHER *cipher)
 static inline const EVP_CIPHER *tls_hp(const SSL_CIPHER *cipher)
 {
 	switch (SSL_CIPHER_get_id(cipher)) {
+#if !defined(OPENSSL_IS_AWSLC)
 	case TLS1_3_CK_CHACHA20_POLY1305_SHA256:
 		return EVP_chacha20();
+#endif
 	case TLS1_3_CK_AES_128_CCM_SHA256:
 	case TLS1_3_CK_AES_128_GCM_SHA256:
 		return EVP_aes_128_ctr();
@@ -367,7 +370,7 @@ static inline const char *ssl_error_str(int err)
 		return "WANT_CONNECT";
 	case SSL_ERROR_WANT_ACCEPT:
 		return "WANT_ACCEPT";
-#if !defined(LIBRESSL_VERSION_NUMBER) && !defined(USE_OPENSSL_WOLFSSL)
+#if !defined(LIBRESSL_VERSION_NUMBER) && !defined(USE_OPENSSL_WOLFSSL) && !defined(OPENSSL_IS_AWSLC)
 	case SSL_ERROR_WANT_ASYNC:
 		return "WANT_ASYNC";
 	case SSL_ERROR_WANT_ASYNC_JOB:
@@ -548,9 +551,13 @@ static inline void qc_release_pktns_frms(struct quic_conn *qc,
 
 	TRACE_ENTER(QUIC_EV_CONN_PHPKTS, qc);
 
+	if (!pktns)
+		goto leave;
+
 	list_for_each_entry_safe(frm, frmbak, &pktns->tx.frms, list)
 		qc_frm_free(qc, &frm);
 
+ leave:
 	TRACE_LEAVE(QUIC_EV_CONN_PHPKTS, qc);
 }
 

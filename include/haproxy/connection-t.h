@@ -241,6 +241,8 @@ enum {
 	CO_ER_SOCKS4_ABORT,      /* SOCKS4 Proxy handshake aborted by server */
 
 	CO_ERR_SSL_FATAL,        /* SSL fatal error during a SSL_read or SSL_write */
+
+	CO_ER_REVERSE,           /* Error during reverse connect */
 };
 
 /* error return codes for accept_conn() */
@@ -308,6 +310,7 @@ enum {
 	MX_FL_HOL_RISK    = 0x00000002, /* set if the protocol is subject the to head-of-line blocking on server */
 	MX_FL_NO_UPG      = 0x00000004, /* set if mux does not support any upgrade */
 	MX_FL_FRAMED      = 0x00000008, /* mux working on top of a framed transport layer (QUIC) */
+	MX_FL_REVERSABLE  = 0x00000010, /* mux supports connection reversal */
 };
 
 /* PROTO token registration */

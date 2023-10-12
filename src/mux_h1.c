@@ -2027,8 +2027,17 @@ static size_t h1_make_reqline(struct h1s *h1s, struct h1m *h1m, struct htx *htx,
 	h1_parse_req_vsn(h1m, sl);
 
 	h1m->flags |= H1_MF_XFER_LEN;
-	if (sl->flags & HTX_SL_F_BODYLESS)
+	if (sl->flags & HTX_SL_F_CHNK)
+		h1m->flags |= H1_MF_CHNK;
+	else if (sl->flags & HTX_SL_F_CLEN)
 		h1m->flags |= H1_MF_CLEN;
+	if (sl->flags & HTX_SL_F_XFER_ENC)
+		h1m->flags |= H1_MF_XFER_ENC;
+
+	if (sl->flags & HTX_SL_F_BODYLESS) {
+		h1m->flags = (h1m->flags & ~H1_MF_CHNK) | H1_MF_CLEN;
+		h1s->flags |= H1S_F_HAVE_CLEN;
+	}
 	if ((sl->flags & HTX_SL_F_BODYLESS_RESP) || h1s->meth == HTTP_METH_HEAD)
 		h1s->flags |= H1S_F_BODYLESS_RESP;
 
@@ -2102,8 +2111,15 @@ static size_t h1_make_stline(struct h1s *h1s, struct h1m *h1m, struct htx *htx, 
 	h1s->status = sl->info.res.status;
 	h1_parse_res_vsn(h1m, sl);
 
-	if (sl->flags & HTX_SL_F_XFER_LEN)
+	if (sl->flags & HTX_SL_F_XFER_LEN) {
 		h1m->flags |= H1_MF_XFER_LEN;
+		if (sl->flags & HTX_SL_F_CHNK)
+			h1m->flags |= H1_MF_CHNK;
+		else if (sl->flags & HTX_SL_F_CLEN)
+			h1m->flags |= H1_MF_CLEN;
+		if (sl->flags & HTX_SL_F_XFER_ENC)
+			h1m->flags |= H1_MF_XFER_ENC;
+	}
 	if (h1s->status < 200)
 		h1s->flags |= H1S_F_HAVE_O_CONN;
 	else if ((sl->flags & HTX_SL_F_BODYLESS_RESP) || h1s->status == 204 || h1s->status == 304)
@@ -2170,15 +2186,25 @@ static size_t h1_make_headers(struct h1s *h1s, struct h1m *h1m, struct htx *htx,
 			if (isteq(n, ist("transfer-encoding"))) {
 				if ((h1m->flags & H1_MF_RESP) && (h1s->status < 200 || h1s->status == 204))
 					goto nextblk;
+				if (!(h1m->flags & H1_MF_CHNK))
+					goto nextblk;
 				if (h1_parse_xfer_enc_header(h1m, v) < 0)
 					goto error;
+				h1s->flags |= H1S_F_HAVE_CHNK;
                         }
 			else if (isteq(n, ist("content-length"))) {
 				if ((h1m->flags & H1_MF_RESP) && (h1s->status < 200 || h1s->status == 204))
 					goto nextblk;
+				if (!(h1m->flags & H1_MF_CLEN))
+					goto nextblk;
+				if (!(h1s->flags & H1S_F_HAVE_CLEN))
+					h1m->flags &= ~H1_MF_CLEN;
 				/* Only skip C-L header with invalid value. */
 				if (h1_parse_cont_len_header(h1m, &v) < 0)
-					goto nextblk; // FIXME: must be handled as an error
+					goto error;
+				if (h1s->flags & H1S_F_HAVE_CLEN)
+					goto nextblk;
+				h1s->flags |= H1S_F_HAVE_CLEN;
 			}
 			else if (isteq(n, ist("connection"))) {
 				h1_parse_connection_header(h1m, &v);
@@ -2296,6 +2322,7 @@ static size_t h1_make_eoh(struct h1s *h1s, struct h1m *h1m, struct htx *htx, siz
 		else if ((h1m->flags & (H1_MF_XFER_ENC|H1_MF_CLEN)) == (H1_MF_XFER_ENC|H1_MF_CLEN)) {
 			/* T-E + C-L: force close */
 			h1s->flags = (h1s->flags & ~H1S_F_WANT_MSK) | H1S_F_WANT_CLO;
+			h1m->flags &= ~H1_MF_CLEN;
 			TRACE_STATE("force close mode (T-E + C-L)", H1_EV_TX_DATA|H1_EV_TX_HDRS, h1s->h1c->conn, h1s);
 		}
 		else if ((h1m->flags & (H1_MF_VER_11|H1_MF_XFER_ENC)) == H1_MF_XFER_ENC) {
@@ -2325,7 +2352,10 @@ static size_t h1_make_eoh(struct h1s *h1s, struct h1m *h1m, struct htx *htx, siz
 	    (h1s->status >= 200 && !(h1s->flags & H1S_F_BODYLESS_RESP) &&
 	     !(h1s->meth == HTTP_METH_CONNECT && h1s->status >= 200 && h1s->status < 300) &&
 	     (h1m->flags & (H1_MF_VER_11|H1_MF_RESP|H1_MF_CLEN|H1_MF_CHNK|H1_MF_XFER_LEN)) ==
-	     (H1_MF_VER_11|H1_MF_RESP|H1_MF_XFER_LEN))) {
+	     (H1_MF_VER_11|H1_MF_RESP|H1_MF_XFER_LEN)))
+		h1m->flags |= H1_MF_CHNK;
+
+	if ((h1m->flags & H1_MF_CHNK) && !(h1s->flags & H1S_F_HAVE_CHNK)) {
 		/* chunking needed but header not seen */
 		n = ist("transfer-encoding");
 		v = ist("chunked");
@@ -2334,7 +2364,24 @@ static size_t h1_make_eoh(struct h1s *h1s, struct h1m *h1m, struct htx *htx, siz
 		if (!h1_format_htx_hdr(n, v, &outbuf))
 			goto full;
 		TRACE_STATE("add \"Transfer-Encoding: chunked\"", H1_EV_TX_DATA|H1_EV_TX_HDRS, h1c->conn, h1s);
-		h1m->flags |= H1_MF_CHNK;
+		h1s->flags |= H1S_F_HAVE_CHNK;
+	}
+
+	/* Deal with "Content-Length header */
+	if ((h1m->flags & H1_MF_CLEN) && !(h1s->flags & H1S_F_HAVE_CLEN)) {
+		char *end;
+
+		h1m->curr_len = h1m->body_len = htx->data + htx->extra - sz;
+                end = DISGUISE(ulltoa(h1m->body_len, trash.area, b_size(&trash)));
+
+		n = ist("content-length");
+		v = ist2(trash.area, end-trash.area);
+		if (h1c->px->options2 & (PR_O2_H1_ADJ_BUGCLI|PR_O2_H1_ADJ_BUGSRV))
+			h1_adjust_case_outgoing_hdr(h1s, h1m, &n);
+		if (!h1_format_htx_hdr(n, v, &outbuf))
+			goto full;
+		TRACE_STATE("add \"Content-Length: chunked\"", H1_EV_TX_DATA|H1_EV_TX_HDRS, h1c->conn, h1s);
+		h1s->flags |= H1S_F_HAVE_CLEN;
 	}
 
 	/* Add the server name to a header (if requested) */
@@ -2480,7 +2527,7 @@ static size_t h1_make_data(struct h1s *h1s, struct h1m *h1m, struct buffer *buf,
 	size_t ret = 0;
 	int last_data = 0;
 
-	TRACE_ENTER(H1_EV_TX_DATA|H1_EV_TX_HDRS, h1c->conn, h1s, htx, (size_t[]){count});
+	TRACE_ENTER(H1_EV_TX_DATA|H1_EV_TX_BODY, h1c->conn, h1s, htx, (size_t[]){count});
 	blk = htx_get_head_blk(htx);
 
 	/* Perform some optimizations to reduce the number of buffer copies.  If
@@ -2693,7 +2740,7 @@ static size_t h1_make_data(struct h1s *h1s, struct h1m *h1m, struct buffer *buf,
 	TRACE_PROTO("H1 message payload data xferred", H1_EV_TX_DATA|H1_EV_TX_BODY, h1c->conn, h1s, 0, (size_t[]){ret});
 	b_add(&h1c->obuf, outbuf.data);
   end:
-	TRACE_LEAVE(H1_EV_TX_DATA|H1_EV_TX_HDRS, h1c->conn, h1s, htx, (size_t[]){ret});
+	TRACE_LEAVE(H1_EV_TX_DATA|H1_EV_TX_BODY, h1c->conn, h1s, htx, (size_t[]){ret});
 	return ret;
   full:
 	TRACE_STATE("h1c obuf full", H1_EV_TX_DATA|H1_EV_H1S_BLK, h1c->conn, h1s);
@@ -2725,7 +2772,7 @@ static size_t h1_make_tunnel(struct h1s *h1s, struct h1m *h1m, struct buffer *bu
 	uint32_t sz;
 	size_t ret = 0;
 
-	TRACE_ENTER(H1_EV_TX_DATA|H1_EV_TX_HDRS, h1c->conn, h1s, htx, (size_t[]){count});
+	TRACE_ENTER(H1_EV_TX_DATA|H1_EV_TX_BODY, h1c->conn, h1s, htx, (size_t[]){count});
 
 	blk = htx_get_head_blk(htx);
 
@@ -2808,7 +2855,7 @@ static size_t h1_make_tunnel(struct h1s *h1s, struct h1m *h1m, struct buffer *bu
 	b_add(&h1c->obuf, outbuf.data);
 
   end:
-	TRACE_LEAVE(H1_EV_TX_DATA|H1_EV_TX_HDRS, h1c->conn, h1s, htx, (size_t[]){ret});
+	TRACE_LEAVE(H1_EV_TX_DATA|H1_EV_TX_BODY, h1c->conn, h1s, htx, (size_t[]){ret});
 	return ret;
 
   full:
@@ -4284,7 +4331,7 @@ static int h1_rcv_pipe(struct stconn *sc, struct pipe *pipe, unsigned int count)
 				se_fl_set(h1s->sd, SE_FL_ERROR);
 				TRACE_ERROR("too much payload, more than announced",
 					    H1_EV_RX_DATA|H1_EV_STRM_ERR|H1_EV_H1C_ERR|H1_EV_H1S_ERR, h1c->conn, h1s);
-				goto end;
+				goto out;
 			}
 			h1m->curr_len -= ret;
 			if (!h1m->curr_len) {
@@ -4308,7 +4355,7 @@ static int h1_rcv_pipe(struct stconn *sc, struct pipe *pipe, unsigned int count)
 		HA_ATOMIC_ADD(&h1c->px_counters->spliced_bytes_in, ret);
 	}
 
-  end:
+  out:
 	if (conn_xprt_read0_pending(h1c->conn)) {
 		se_fl_set(h1s->sd, SE_FL_EOS);
 		TRACE_STATE("report EOS to SE", H1_EV_STRM_RECV, h1c->conn, h1s);
@@ -4326,6 +4373,7 @@ static int h1_rcv_pipe(struct stconn *sc, struct pipe *pipe, unsigned int count)
 		h1c->flags = (h1c->flags & ~H1C_F_WANT_SPLICE) | H1C_F_EOS;
 		TRACE_STATE("Allow xprt rcv_buf on read0", H1_EV_STRM_RECV, h1c->conn, h1s);
 	}
+  end:
 	if (h1c->conn->flags & CO_FL_ERROR) {
 		se_fl_set(h1s->sd, SE_FL_ERROR);
 		h1c->flags = (h1c->flags & ~H1C_F_WANT_SPLICE) | H1C_F_ERROR;
