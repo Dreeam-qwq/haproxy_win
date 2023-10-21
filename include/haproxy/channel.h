@@ -323,7 +323,6 @@ static inline void channel_init(struct channel *chn)
 	chn->last_read = now_ms;
 	chn->xfer_small = chn->xfer_large = 0;
 	chn->total = 0;
-	chn->pipe = NULL;
 	chn->analysers = 0;
 	chn->flags = 0;
 	chn->output = 0;
@@ -402,16 +401,6 @@ static inline void channel_htx_forward_forever(struct channel *chn, struct htx *
 /*********************************************************************/
 /* These functions are used to compute various channel content sizes */
 /*********************************************************************/
-
-/* Reports non-zero if the channel is empty, which means both its
- * buffer and pipe are empty. The construct looks strange but is
- * jump-less and much more efficient on both 32 and 64-bit than
- * the boolean test.
- */
-static inline unsigned int channel_is_empty(const struct channel *c)
-{
-	return !(co_data(c) | (long)c->pipe);
-}
 
 /* Returns non-zero if the channel is rewritable, which means that the buffer
  * it is attached to has at least <maxrewrite> bytes immediately available.
@@ -977,7 +966,7 @@ static inline int ci_putstr(struct channel *chn, const char *str)
 static inline int co_getchr(struct channel *chn)
 {
 	/* closed or empty + imminent close = -2; empty = -1 */
-	if (unlikely((chn_cons(chn)->flags & SC_FL_SHUT_DONE) || channel_is_empty(chn))) {
+	if (unlikely((chn_cons(chn)->flags & SC_FL_SHUT_DONE) || !co_data(chn))) {
 		if (chn_cons(chn)->flags & (SC_FL_SHUT_DONE|SC_FL_SHUT_WANTED))
 			return -2;
 		return -1;

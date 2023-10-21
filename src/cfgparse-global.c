@@ -517,6 +517,11 @@ int cfg_parse_global(const char *file, int linenum, char **args, int kwm)
 			goto out;
 		global.tune.options &= GTUNE_USE_FAST_FWD;
 	}
+	else if (strcmp(args[0], "tune.disable-zero-copy-forwarding") == 0) {
+		if (alertif_too_many_args(0, file, linenum, args, &err_code))
+			goto out;
+		global.tune.options &= GTUNE_USE_ZERO_COPY_FWD;
+	}
 	else if (strcmp(args[0], "cluster-secret") == 0) {
 		blk_SHA_CTX sha1_ctx;
 		unsigned char sha1_out[20];
@@ -963,7 +968,7 @@ int cfg_parse_global(const char *file, int linenum, char **args, int kwm)
                 }
 	}
 	else if (strcmp(args[0], "log") == 0) { /* "no log" or "log ..." */
-		if (!parse_logsrv(args, &global.logsrvs, (kwm == KWM_NO), file, linenum, &errmsg)) {
+		if (!parse_logger(args, &global.loggers, (kwm == KWM_NO), file, linenum, &errmsg)) {
 			ha_alert("parsing [%s:%d] : %s : %s\n", file, linenum, args[0], errmsg);
 			err_code |= ERR_ALERT | ERR_FATAL;
 			goto out;

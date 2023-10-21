@@ -2317,7 +2317,7 @@ static void hlua_socket_handler(struct appctx *appctx)
 		notification_wake(&ctx->wake_on_write);
 
 	/* Wake the tasks which wants to read if the buffer contains data. */
-	if (!channel_is_empty(sc_oc(sc)))
+	if (co_data(sc_oc(sc)))
 		notification_wake(&ctx->wake_on_read);
 
 	/* If write notifications are registered, we considers we want
@@ -3396,8 +3396,6 @@ __LJMP static int hlua_socket_new(lua_State *L)
 	xref_create(&socket->xref, &ctx->xref);
 	return 1;
 
- out_fail_appctx:
-	appctx_free_on_early_error(appctx);
  out_fail_conf:
 	WILL_LJMP(lua_error(L));
 	return 0;

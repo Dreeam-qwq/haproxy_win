@@ -1060,7 +1060,6 @@ struct task *qc_process_timer(struct task *task, void *ctx, unsigned int state)
 
 	if (qc->flags & (QUIC_FL_CONN_DRAINING|QUIC_FL_CONN_TO_KILL)) {
 		TRACE_PROTO("cancelled action (draining state)", QUIC_EV_CONN_PTIMER, qc);
-		task = NULL;
 		goto out;
 	}
 
@@ -1184,6 +1183,7 @@ struct quic_conn *qc_new_conn(const struct quic_version *qv, int ipv4,
 
 	/* Required to call free_quic_conn_cids() from quic_conn_release() */
 	qc->cids = NULL;
+	qc->tx.cc_buf_area = NULL;
 	qc_init_fd(qc);
 
 	LIST_INIT(&qc->back_refs);
@@ -1614,6 +1614,7 @@ struct task *qc_idle_timer_task(struct task *t, void *ctx, unsigned int state)
 	if (qc->mux_state != QC_MUX_READY) {
 		quic_conn_release(qc);
 		qc = NULL;
+		t = NULL;
 	}
 
 	/* TODO if the quic-conn cannot be freed because of the MUX, we may at
@@ -1625,10 +1626,6 @@ struct task *qc_idle_timer_task(struct task *t, void *ctx, unsigned int state)
 		TRACE_DEVEL("dec half open counter", QUIC_EV_CONN_IDLE_TIMER, qc);
 		HA_ATOMIC_DEC(&prx_counters->half_open_conn);
 	}
-
- leave:
-	TRACE_LEAVE(QUIC_EV_CONN_IDLE_TIMER, qc);
-	return NULL;
 
  requeue:
 	TRACE_LEAVE(QUIC_EV_CONN_IDLE_TIMER, qc);

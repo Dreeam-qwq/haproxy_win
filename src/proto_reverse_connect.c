@@ -36,6 +36,8 @@ struct protocol proto_reverse_connect = {
 	.accept_conn = rev_accept_conn,
 	.set_affinity = rev_set_affinity,
 
+	.connect     = rev_connect,
+
 	/* address family */
 	.fam  = &proto_fam_reverse_connect,
 
@@ -204,9 +206,12 @@ int rev_bind_listener(struct listener *listener, char *errmsg, int errlen)
 	listener->rx.reverse_connect.task = task;
 	listener->rx.reverse_connect.state = LI_PRECONN_ST_STOP;
 
-	/* Set a default maxconn to 1. This ensures listener is properly
-	 * reenable each time we fall back below it on connection error.
+	/* Set maxconn which is defined via the special kw nbconn for reverse
+	 * connect. Use a default value of 1 if not set. This guarantees that
+	 * listener will be automatically reenable each time it fell back below
+	 * it due to a connection error.
 	 */
+	listener->bind_conf->maxconn = listener->bind_conf->reverse_nbconn;
 	if (!listener->bind_conf->maxconn)
 		listener->bind_conf->maxconn = 1;
 
@@ -286,7 +291,7 @@ void rev_disable_listener(struct listener *l)
 {
 	if (l->rx.reverse_connect.state < LI_PRECONN_ST_FULL) {
 		send_log(l->bind_conf->frontend, LOG_INFO,
-		         "preconnect %s::%s: Reaching maxconn %d.\n",
+		         "preconnect %s::%s: Running with nbconn %d reached.\n",
 		         l->bind_conf->frontend->id, l->bind_conf->reverse_srvname,
 		         l->bind_conf->maxconn);
 		l->rx.reverse_connect.state = LI_PRECONN_ST_FULL;
@@ -338,6 +343,12 @@ int rev_set_affinity(struct connection *conn, int new_tid)
 	 * did not test possible race conditions.
 	 */
 	return -1;
+}
+
+/* Simple callback to enable definition of passive HTTP reverse servers. */
+int rev_connect(struct connection *conn, int flags)
+{
+	return SF_ERR_NONE;
 }
 
 int rev_accepting_conn(const struct receiver *rx)

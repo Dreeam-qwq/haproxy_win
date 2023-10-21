@@ -383,7 +383,7 @@ int appctx_buf_available(void *arg)
 	sc_have_buff(sc);
 
 	/* was already allocated another way ? if so, don't take this one */
-	if (c_size(sc_ic(sc)) || sc_ic(sc)->pipe)
+	if (c_size(sc_ic(sc)) || sc_ep_have_ff_data(sc_opposite(sc)))
 		return 0;
 
 	/* allocation possible now ? */
@@ -458,20 +458,19 @@ struct task *task_run_applet(struct task *t, void *context, unsigned int state)
 		sc_oc(sc)->flags |= CF_WRITE_EVENT | CF_WROTE_DATA;
 		if (sco->room_needed < 0 || channel_recv_max(sc_oc(sc)) >= sco->room_needed)
 			sc_have_room(sco);
+		sc_ep_report_send_activity(sc);
 	}
-	else if (!sco->room_needed)
-		sc_have_room(sco);
+	else {
+		if (!sco->room_needed)
+			sc_have_room(sco);
+		sc_ep_report_blocked_send(sc);
+	}
 
 	if (sc_ic(sc)->flags & CF_READ_EVENT)
 		sc_ep_report_read_activity(sc);
 
 	if (sc_waiting_room(sc) && (sc->flags & SC_FL_ABRT_DONE)) {
 		sc_ep_set(sc, SE_FL_EOS|SE_FL_ERROR);
-	}
-	else if (channel_is_empty(sc_oc(sc)))
-		sc_ep_report_send_activity(sc);
-	else {
-		sc_ep_report_blocked_send(sc);
 	}
 
 	/* measure the call rate and check for anomalies when too high */

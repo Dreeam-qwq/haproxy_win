@@ -164,18 +164,20 @@ struct sink *sink_new_buf(const char *name, const char *desc, enum log_fmt fmt, 
 	return NULL;
 }
 
-/* tries to send <nmsg> message parts (up to 8, ignored above) from message
- * array <msg> to sink <sink>. Formatting according to the sink's preference is
- * done here. Lost messages are NOT accounted for. It is preferable to call
- * sink_write() instead which will also try to emit the number of dropped
- * messages when there are any. It will stop writing at <maxlen> instead of
- * sink->maxlen if <maxlen> is positive and inferior to sink->maxlen.
+/* tries to send <nmsg> message parts from message array <msg> to sink <sink>.
+ * Formatting according to the sink's preference is done here, unless sink->fmt
+ * is unspecified, in which case the caller formatting will be used instead.
+ * Lost messages are NOT accounted for. It is preferable to call sink_write()
+ * instead which will also try to emit the number of dropped messages when there
+ * are any.
+ *
+ * It will stop writing at <maxlen> instead of sink->maxlen if <maxlen> is
+ * positive and inferior to sink->maxlen.
  *
  * It returns >0 if it could write anything, <=0 otherwise.
  */
- ssize_t __sink_write(struct sink *sink, size_t maxlen,
-	             const struct ist msg[], size_t nmsg,
-	             int level, int facility, struct ist *metadata)
+ ssize_t __sink_write(struct sink *sink, struct log_header hdr,
+                      size_t maxlen, const struct ist msg[], size_t nmsg)
  {
 	struct ist *pfx = NULL;
 	size_t npfx = 0;
@@ -183,7 +185,9 @@ struct sink *sink_new_buf(const char *name, const char *desc, enum log_fmt fmt, 
 	if (sink->fmt == LOG_FORMAT_RAW)
 		goto send;
 
-	pfx = build_log_header(sink->fmt, level, facility, metadata, &npfx);
+	if (sink->fmt != LOG_FORMAT_UNSPEC)
+		hdr.format = sink->fmt; /* sink format prevails over log one */
+	pfx = build_log_header(hdr, &npfx);
 
 send:
 	if (!maxlen)
@@ -197,16 +201,17 @@ send:
 	return 0;
 }
 
-/* Tries to emit a message indicating the number of dropped events. In case of
- * success, the amount of drops is reduced by as much. It's supposed to be
- * called under an exclusive lock on the sink to avoid multiple produces doing
- * the same. On success, >0 is returned, otherwise <=0 on failure.
+/* Tries to emit a message indicating the number of dropped events.
+ * The log header of the original message that we tried to emit is reused
+ * here with the only difference that we override the log level. This is
+ * possible since the announce message will be sent from the same context.
+ *
+ * In case of success, the amount of drops is reduced by as much. It's supposed
+ * to be called under an exclusive lock on the sink to avoid multiple producers
+ * doing the same. On success, >0 is returned, otherwise <=0 on failure.
  */
-int sink_announce_dropped(struct sink *sink, int facility)
+int sink_announce_dropped(struct sink *sink, struct log_header hdr)
 {
-	static THREAD_LOCAL struct ist metadata[LOG_META_FIELDS];
-	static THREAD_LOCAL pid_t curr_pid;
-	static THREAD_LOCAL char pidstr[16];
 	unsigned int dropped;
 	struct buffer msg;
 	struct ist msgvec[1];
@@ -217,24 +222,9 @@ int sink_announce_dropped(struct sink *sink, int facility)
 		chunk_printf(&msg, "%u event%s dropped", dropped, dropped > 1 ? "s" : "");
 		msgvec[0] = ist2(msg.area, msg.data);
 
-		if (!metadata[LOG_META_HOST].len) {
-			if (global.log_send_hostname)
-				metadata[LOG_META_HOST] = ist(global.log_send_hostname);
-		}
+		hdr.level = LOG_NOTICE; /* override level but keep original log header data */
 
-		if (!metadata[LOG_META_TAG].len)
-			metadata[LOG_META_TAG] = ist2(global.log_tag.area, global.log_tag.data);
-
-		if (unlikely(curr_pid != getpid()))
-			 metadata[LOG_META_PID].len = 0;
-
-		if (!metadata[LOG_META_PID].len) {
-			curr_pid = getpid();
-			ltoa_o(curr_pid, pidstr, sizeof(pidstr));
-			metadata[LOG_META_PID] = ist2(pidstr, strlen(pidstr));
-		}
-
-		if (__sink_write(sink, 0, msgvec, 1, LOG_NOTICE, facility, metadata) <= 0)
+		if (__sink_write(sink, hdr, 0, msgvec, 1) <= 0)
 			return 0;
 		/* success! */
 		HA_ATOMIC_SUB(&sink->ctx.dropped, dropped);
@@ -1172,9 +1162,9 @@ err:
 	return err_code;
 }
 
-/* Creates a new sink buffer from a log server.
+/* Creates a new sink buffer from a logger.
  *
- * It uses the logsrvaddress to declare a forward
+ * It uses the logger's address to declare a forward
  * server for this buffer. And it initializes the
  * forwarding.
  *
@@ -1184,9 +1174,9 @@ err:
  * it returns NULL.
  *
  * Note: the sink is created using the name
- *       specified into logsrv->ring_name
+ *       specified into logger->target.ring_name
  */
-static struct sink *sink_new_from_logsrv(struct logsrv *logsrv)
+struct sink *sink_new_from_logger(struct logger *logger)
 {
 	struct sink *sink = NULL;
 	struct server *srv = NULL;
@@ -1194,21 +1184,26 @@ static struct sink *sink_new_from_logsrv(struct logsrv *logsrv)
 
 	/* prepare description for the sink */
 	chunk_reset(&trash);
-	chunk_printf(&trash, "created from logserver declared into '%s' at line %d", logsrv->conf.file, logsrv->conf.line);
+	chunk_printf(&trash, "created from log directive declared into '%s' at line %d", logger->conf.file, logger->conf.line);
 
 	/* allocate a new sink buffer */
-	sink = sink_new_ringbuf(logsrv->ring_name, trash.area, logsrv->conf.file, logsrv->conf.line, &err_msg);
+	sink = sink_new_ringbuf(logger->target.ring_name, trash.area, logger->conf.file, logger->conf.line, &err_msg);
 	if (!sink) {
 		ha_alert("%s.\n", err_msg);
 		ha_free(&err_msg);
 		goto error;
 	}
 
-	/* disable sink->maxlen, we already have logsrv->maxlen */
-	sink->maxlen = 0;
+	/* ring format normally defaults to RAW, but here we set ring format
+	 * to UNSPEC to inherit from caller format in sink_write() since we
+	 * cannot customize implicit ring settings
+	 */
+	sink->fmt = LOG_FORMAT_UNSPEC;
 
-	/* set ring format from logsrv format */
-	sink->fmt = logsrv->format;
+	/* for the same reason, we disable sink->maxlen to inherit from caller
+	 * maxlen in sink_write()
+	 */
+	sink->maxlen = 0;
 
 	/* Set default connect and server timeout for sink forward proxy */
 	sink->forward_px->timeout.connect = MS_TO_TICKS(1000);
@@ -1222,11 +1217,11 @@ static struct sink *sink_new_from_logsrv(struct logsrv *logsrv)
 		goto error;
 
 	/* init server */
-	srv->id = strdup(logsrv->ring_name);
-	srv->conf.file = strdup(logsrv->conf.file);
-	srv->conf.line = logsrv->conf.line;
-	srv->addr = logsrv->addr;
-        srv->svc_port = get_host_port(&logsrv->addr);
+	srv->id = strdup(logger->target.ring_name);
+	srv->conf.file = strdup(logger->conf.file);
+	srv->conf.line = logger->conf.line;
+	srv->addr = *logger->target.addr;
+        srv->svc_port = get_host_port(logger->target.addr);
 	HA_SPIN_INIT(&srv->lock);
 
 	/* process per thread init */
@@ -1242,14 +1237,65 @@ static struct sink *sink_new_from_logsrv(struct logsrv *logsrv)
 	if (sink_finalize(sink) & ERR_CODE)
 		goto error_final;
 
-	/* reset familyt of logsrv to consider the ring buffer target */
-	logsrv->addr.ss_family = AF_UNSPEC;
-
 	return sink;
  error:
 	srv_drop(srv);
 
  error_final:
+	sink_free(sink);
+
+	return NULL;
+}
+
+/* This function is pretty similar to sink_from_logger():
+ * But instead of creating a forward proxy and server from a logger struct
+ * it uses already existing srv to create the forwarding sink, so most of
+ * the initialization is bypassed.
+ *
+ * The function returns a pointer on the
+ * allocated struct sink if allocate
+ * and initialize succeed, else if it fails
+ * it returns NULL.
+ *
+ * <from> allows to specify a string that will be inserted into the sink
+ * description to describe where it was created from.
+
+ * Note: the sink is created using the name
+ *       specified into srv->id
+ */
+struct sink *sink_new_from_srv(struct server *srv, const char *from)
+{
+	struct sink *sink = NULL;
+	int bufsize = (srv->log_bufsize) ? srv->log_bufsize : BUFSIZE;
+
+	/* prepare description for the sink */
+	chunk_reset(&trash);
+	chunk_printf(&trash, "created from %s declared into '%s' at line %d", from, srv->conf.file, srv->conf.line);
+
+	/* directly create a sink of BUF type, and use UNSPEC log format to
+	 * inherit from caller fmt in sink_write()
+	 */
+	sink = sink_new_buf(srv->id, trash.area, LOG_FORMAT_UNSPEC, bufsize);
+	if (!sink) {
+		ha_alert("unable to create a new sink buffer for server '%s'.\n", srv->id);
+		goto error;
+	}
+
+	/* we disable sink->maxlen to inherit from caller
+	 * maxlen in sink_write()
+	 */
+	sink->maxlen = 0;
+
+	/* add server to sink */
+	if (!sink_add_srv(sink, srv))
+		goto error;
+
+	if (sink_finalize(sink) & ERR_CODE)
+		goto error;
+
+	return sink;
+
+ error:
 	sink_free(sink);
 
 	return NULL;
@@ -1271,7 +1317,7 @@ int cfg_post_parse_ring()
 	return err_code;
 }
 
-/* function: resolve a single logsrv target of BUFFER type
+/* function: resolve a single logger target of BUFFER type
  *
  * Returns err_code which defaults to ERR_NONE and can be set to a combination
  * of ERR_WARN, ERR_ALERT, ERR_FATAL and ERR_ABORT in case of errors.
@@ -1279,46 +1325,46 @@ int cfg_post_parse_ring()
  * could also be set when no error occured to report a diag warning), thus is
  * up to the caller to check it and to free it.
  */
-int sink_resolve_logsrv_buffer(struct logsrv *target, char **msg)
+int sink_resolve_logger_buffer(struct logger *logger, char **msg)
 {
+	struct log_target *target = &logger->target;
 	int err_code = ERR_NONE;
 	struct sink *sink;
 
-	BUG_ON(target->type != LOG_TARGET_BUFFER);
-	sink = sink_find(target->ring_name);
-	if (!sink) {
-		/* LOG_TARGET_BUFFER but !AF_UNSPEC
-		 * means we must allocate a sink
-		 * buffer to send messages to this logsrv
-		 */
-		if (target->addr.ss_family != AF_UNSPEC) {
-			sink = sink_new_from_logsrv(target);
-			if (!sink) {
-				memprintf(msg, "cannot be initialized (failed to create implicit ring)");
-				err_code |= ERR_ALERT | ERR_FATAL;
-				goto end;
-			}
+	BUG_ON(target->type != LOG_TARGET_BUFFER || (target->flags & LOG_TARGET_FL_RESOLVED));
+	if (target->addr) {
+		sink = sink_new_from_logger(logger);
+		if (!sink) {
+			memprintf(msg, "cannot be initialized (failed to create implicit ring)");
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto end;
 		}
-		else {
+		ha_free(&target->addr); /* we no longer need this */
+	}
+	else {
+		sink = sink_find(target->ring_name);
+		if (!sink) {
 			memprintf(msg, "uses unknown ring named '%s'", target->ring_name);
 			err_code |= ERR_ALERT | ERR_FATAL;
 			goto end;
 		}
+		else if (sink->type != SINK_TYPE_BUFFER) {
+			memprintf(msg, "uses incompatible ring '%s'", target->ring_name);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto end;
+		}
 	}
-	else if (sink->type != SINK_TYPE_BUFFER) {
-		memprintf(msg, "uses incompatible ring '%s'", target->ring_name);
-		err_code |= ERR_ALERT | ERR_FATAL;
-		goto end;
-	}
-	if (sink && target->maxlen > ring_max_payload(sink->ctx.ring)) {
+	/* consistency checks */
+	if (sink && logger->maxlen > ring_max_payload(sink->ctx.ring)) {
 		memprintf(msg, "uses a max length which exceeds ring capacity ('%s' supports %lu bytes at most)",
 		          target->ring_name, (unsigned long)ring_max_payload(sink->ctx.ring));
 	}
-	else if (sink && target->maxlen > sink->maxlen) {
+	else if (sink && logger->maxlen > sink->maxlen) {
 		memprintf(msg, "uses a ring with a smaller maxlen than the one specified on the log directive ('%s' has maxlen = %d), logs will be truncated according to the lowest maxlen between the two",
 		          target->ring_name, sink->maxlen);
 	}
  end:
+	ha_free(&target->ring_name); /* sink is resolved and will replace ring_name hint */
 	target->sink = sink;
 	return err_code;
 }

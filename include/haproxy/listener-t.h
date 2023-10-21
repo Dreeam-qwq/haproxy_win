@@ -111,6 +111,7 @@ enum li_status {
 #define BC_O_ACC_CIP            0x00001000 /* find the proxied address in the NetScaler Client IP header */
 #define BC_O_UNLIMITED          0x00002000 /* listeners not subject to global limits (peers & stats socket) */
 #define BC_O_NOSTOP             0x00004000 /* keep the listeners active even after a soft stop */
+#define BC_O_REVERSE_HTTP       0x00008000 /* a reverse HTTP bind is used */
 
 
 /* flags used with bind_conf->ssl_options */
@@ -207,7 +208,8 @@ struct bind_conf {
 	char *arg;                 /* argument passed to "bind" for better error reporting */
 	char *file;                /* file where the section appears */
 	int line;                  /* line where the section appears */
-	char *reverse_srvname;     /* name of server when using "rev@" address */
+	char *reverse_srvname;     /* name of server when using "rhttp@" address */
+	int reverse_nbconn;        /* count of connections to initiate in parallel */
 	__decl_thread(HA_RWLOCK_T sni_lock); /* lock the SNI trees during add/del operations */
 	struct thread_set thread_set; /* entire set of the allowed threads (0=no restriction) */
 	struct rx_settings settings; /* all the settings needed for the listening socket */
@@ -270,6 +272,7 @@ struct bind_kw {
 	const char *kw;
 	int (*parse)(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err);
 	int skip; /* nb of args to skip */
+	int rhttp_ok; /* non-zero if kw is support for reverse HTTP bind */
 };
 
 /* same as bind_kw but for crtlist keywords */

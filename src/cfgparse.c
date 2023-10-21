@@ -162,6 +162,32 @@ int str2listener(char *str, struct proxy *curproxy, struct bind_conf *bind_conf,
 		if (!ss2)
 			goto fail;
 
+		if (ss2->ss_family == AF_CUST_REV_SRV) {
+			/* Check if a previous non reverse HTTP present is
+			 * already defined. If DGRAM or STREAM is set, this
+			 * indicates that we are currently parsing the second
+			 * or more address.
+			 */
+			if (bind_conf->options & (BC_O_USE_SOCK_DGRAM|BC_O_USE_SOCK_STREAM) &&
+			    !(bind_conf->options & BC_O_REVERSE_HTTP)) {
+				memprintf(err, "Cannot mix reverse HTTP bind with others.\n");
+				goto fail;
+			}
+
+			bind_conf->reverse_srvname = strdup(str + strlen("rhttp@"));
+			if (!bind_conf->reverse_srvname) {
+				memprintf(err, "Cannot allocate reverse HTTP bind.\n");
+				goto fail;
+			}
+
+			bind_conf->options |= BC_O_REVERSE_HTTP;
+		}
+		else if (bind_conf->options & BC_O_REVERSE_HTTP) {
+			/* Standard address mixed with a previous reverse HTTP one. */
+			memprintf(err, "Cannot mix reverse HTTP bind with others.\n");
+			goto fail;
+		}
+
 		/* OK the address looks correct */
 		if (proto->proto_type == PROTO_TYPE_DGRAM)
 			bind_conf->options |= BC_O_USE_SOCK_DGRAM;
@@ -172,10 +198,6 @@ int str2listener(char *str, struct proxy *curproxy, struct bind_conf *bind_conf,
 			bind_conf->options |= BC_O_USE_XPRT_DGRAM;
 		else
 			bind_conf->options |= BC_O_USE_XPRT_STREAM;
-
-		if (ss2->ss_family == AF_CUST_REV_SRV) {
-			bind_conf->reverse_srvname = strdup(str + strlen("rev@"));
-		}
 
 		if (!create_listeners(bind_conf, ss2, port, end, fd, proto, err)) {
 			memprintf(err, "%s for address '%s'.\n", *err, str);
@@ -748,7 +770,7 @@ int cfg_parse_peers(const char *file, int linenum, char **args, int kwm)
 			err_code |= ERR_ALERT | ERR_ABORT;
 			goto out;
 		}
-		if (!parse_logsrv(args, &curpeers->peers_fe->logsrvs, (kwm == KWM_NO), file, linenum, &errmsg)) {
+		if (!parse_logger(args, &curpeers->peers_fe->loggers, (kwm == KWM_NO), file, linenum, &errmsg)) {
 			ha_alert("parsing [%s:%d] : %s : %s\n", file, linenum, args[0], errmsg);
 			err_code |= ERR_ALERT | ERR_FATAL;
 			goto out;
@@ -2772,7 +2794,7 @@ init_proxies_list_stage1:
 		struct switching_rule *rule;
 		struct server_rule *srule;
 		struct sticking_rule *mrule;
-		struct logsrv *tmplogsrv;
+		struct logger *tmplogger;
 		unsigned int next_id;
 
 		if (!(curproxy->cap & PR_CAP_INT) && curproxy->uuid < 0) {
@@ -3404,9 +3426,9 @@ init_proxies_list_stage1:
 		}
 out_uri_auth_compat:
 
-		/* check whether we have a log server that uses RFC5424 log format */
-		list_for_each_entry(tmplogsrv, &curproxy->logsrvs, list) {
-			if (tmplogsrv->format == LOG_FORMAT_RFC5424) {
+		/* check whether we have a logger that uses RFC5424 log format */
+		list_for_each_entry(tmplogger, &curproxy->loggers, list) {
+			if (tmplogger->format == LOG_FORMAT_RFC5424) {
 				if (!curproxy->conf.logformat_sd_string) {
 					/* set the default logformat_sd_string */
 					curproxy->conf.logformat_sd_string = default_rfc5424_sd_log_format;
@@ -3510,8 +3532,11 @@ out_uri_auth_compat:
 			curproxy->conf.args.line = 0;
 		}
 
-		/* "balance hash" needs to compile its expression */
-		if ((curproxy->lbprm.algo & BE_LB_ALGO) == BE_LB_ALGO_SMP) {
+		/* "balance hash" needs to compile its expression
+		 * (log backends will handle this in proxy log postcheck)
+		 */
+		if (curproxy->mode != PR_MODE_SYSLOG &&
+		    (curproxy->lbprm.algo & BE_LB_ALGO) == BE_LB_ALGO_SMP) {
 			int idx = 0;
 			const char *args[] = {
 				curproxy->lbprm.arg_str,
@@ -3744,6 +3769,12 @@ out_uri_auth_compat:
 		 * on what LB algorithm was chosen.
 		 */
 
+		if (curproxy->mode == PR_MODE_SYSLOG) {
+			/* log load-balancing requires special init that is performed
+			 * during log-postparsing step
+			 */
+			goto skip_server_lb_init;
+		}
 		curproxy->lbprm.algo &= ~(BE_LB_LKUP | BE_LB_PROP_DYN);
 		switch (curproxy->lbprm.algo & BE_LB_KIND) {
 		case BE_LB_KIND_RR:
@@ -3783,13 +3814,14 @@ out_uri_auth_compat:
 			}
 			break;
 		}
+ skip_server_lb_init:
 		HA_RWLOCK_INIT(&curproxy->lbprm.lock);
 
 		if (curproxy->options & PR_O_LOGASAP)
 			curproxy->to_log &= ~LW_BYTES;
 
 		if (!(curproxy->cap & PR_CAP_INT) && (curproxy->mode == PR_MODE_TCP || curproxy->mode == PR_MODE_HTTP) &&
-		    (curproxy->cap & PR_CAP_FE) && LIST_ISEMPTY(&curproxy->logsrvs) &&
+		    (curproxy->cap & PR_CAP_FE) && LIST_ISEMPTY(&curproxy->loggers) &&
 		    (!LIST_ISEMPTY(&curproxy->logformat) || !LIST_ISEMPTY(&curproxy->logformat_sd))) {
 			ha_warning("log format ignored for %s '%s' since it has no log address.\n",
 				   proxy_type_str(curproxy), curproxy->id);

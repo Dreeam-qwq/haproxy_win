@@ -70,7 +70,7 @@ int be_lastsession(const struct proxy *be)
 }
 
 /* helper function to invoke the correct hash method */
-static unsigned int gen_hash(const struct proxy* px, const char* key, unsigned long len)
+unsigned int gen_hash(const struct proxy* px, const char* key, unsigned long len)
 {
 	unsigned int hash;
 
@@ -84,12 +84,23 @@ static unsigned int gen_hash(const struct proxy* px, const char* key, unsigned l
 	case BE_LB_HFCN_CRC32:
 		hash = hash_crc32(key, len);
 		break;
+	case BE_LB_HFCN_NONE:
+		/* use key as a hash */
+		{
+			const char *_key = key;
+
+			hash = read_int64(&_key, _key + len);
+		}
+		break;
 	case BE_LB_HFCN_SDBM:
 		/* this is the default hash function */
 	default:
 		hash = hash_sdbm(key, len);
 		break;
 	}
+
+	if ((px->lbprm.algo & BE_LB_HASH_MOD) == BE_LB_HMOD_AVAL)
+		hash = full_hash(hash);
 
 	return hash;
 }
@@ -182,6 +193,10 @@ static struct server *get_server_sh(struct proxy *px, const char *addr, int len,
 		h ^= ntohl(*(unsigned int *)(&addr[l]));
 		l += sizeof (int);
 	}
+	/* FIXME: why don't we use gen_hash() here as well?
+	 * -> we don't take into account hash function from "hash_type"
+	 * options here..
+	 */
 	if ((px->lbprm.algo & BE_LB_HASH_MOD) == BE_LB_HMOD_AVAL)
 		h = full_hash(h);
  hash_done:
@@ -237,8 +252,6 @@ static struct server *get_server_uh(struct proxy *px, char *uri, int uri_len, co
 
 	hash = gen_hash(px, start, (end - start));
 
-	if ((px->lbprm.algo & BE_LB_HASH_MOD) == BE_LB_HMOD_AVAL)
-		hash = full_hash(hash);
  hash_done:
 	if ((px->lbprm.algo & BE_LB_LKUP) == BE_LB_LKUP_CHTREE)
 		return chash_get_server_hash(px, hash, avoid);
@@ -293,9 +306,6 @@ static struct server *get_server_ph(struct proxy *px, const char *uri, int uri_l
 					end++;
 				}
 				hash = gen_hash(px, start, (end - start));
-
-				if ((px->lbprm.algo & BE_LB_HASH_MOD) == BE_LB_HMOD_AVAL)
-					hash = full_hash(hash);
 
 				if ((px->lbprm.algo & BE_LB_LKUP) == BE_LB_LKUP_CHTREE)
 					return chash_get_server_hash(px, hash, avoid);
@@ -373,9 +383,6 @@ static struct server *get_server_ph_post(struct stream *s, const struct server *
 					/* should we break if vlen exceeds limit? */
 				}
 				hash = gen_hash(px, start, (end - start));
-
-				if ((px->lbprm.algo & BE_LB_HASH_MOD) == BE_LB_HMOD_AVAL)
-					hash = full_hash(hash);
 
 				if ((px->lbprm.algo & BE_LB_LKUP) == BE_LB_LKUP_CHTREE)
 					return chash_get_server_hash(px, hash, avoid);
@@ -469,8 +476,7 @@ static struct server *get_server_hh(struct stream *s, const struct server *avoid
 		start = p;
 		hash = gen_hash(px, start, (end - start));
 	}
-	if ((px->lbprm.algo & BE_LB_HASH_MOD) == BE_LB_HMOD_AVAL)
-		hash = full_hash(hash);
+
  hash_done:
 	if ((px->lbprm.algo & BE_LB_LKUP) == BE_LB_LKUP_CHTREE)
 		return chash_get_server_hash(px, hash, avoid);
@@ -514,8 +520,6 @@ static struct server *get_server_rch(struct stream *s, const struct server *avoi
 	 */
 	hash = gen_hash(px, smp.data.u.str.area, len);
 
-	if ((px->lbprm.algo & BE_LB_HASH_MOD) == BE_LB_HMOD_AVAL)
-		hash = full_hash(hash);
  hash_done:
 	if ((px->lbprm.algo & BE_LB_LKUP) == BE_LB_LKUP_CHTREE)
 		return chash_get_server_hash(px, hash, avoid);
@@ -548,8 +552,6 @@ static struct server *get_server_expr(struct stream *s, const struct server *avo
 	 */
 	hash = gen_hash(px, smp->data.u.str.area, smp->data.u.str.data);
 
-	if ((px->lbprm.algo & BE_LB_HASH_MOD) == BE_LB_HMOD_AVAL)
-		hash = full_hash(hash);
  hash_done:
 	if ((px->lbprm.algo & BE_LB_LKUP) == BE_LB_LKUP_CHTREE)
 		return chash_get_server_hash(px, hash, avoid);
@@ -1289,7 +1291,7 @@ static int do_connect_server(struct stream *s, struct connection *conn)
 	if (unlikely(!conn || !conn->ctrl || !conn->ctrl->connect))
 		return SF_ERR_INTERNAL;
 
-	if (!channel_is_empty(&s->res))
+	if (co_data(&s->res))
 		conn_flags |= CONNECT_HAS_DATA;
 	if (s->conn_retries == s->be->conn_retries)
 		conn_flags |= CONNECT_CAN_USE_TFO;
@@ -1801,7 +1803,7 @@ skip_reuse:
 	     */
 	    ((cli_conn->flags & CO_FL_EARLY_DATA) ||
 	     ((s->be->retry_type & PR_RE_EARLY_ERROR) && !s->conn_retries)) &&
-	    !channel_is_empty(sc_oc(s->scb)) &&
+	    co_data(sc_oc(s->scb)) &&
 	    srv_conn->flags & CO_FL_SSL_WAIT_HS)
 		srv_conn->flags &= ~(CO_FL_SSL_WAIT_HS | CO_FL_WAIT_L6_CONN);
 #endif
@@ -1959,7 +1961,7 @@ static int back_may_abort_req(struct channel *req, struct stream *s)
 {
 	return ((s->scf->flags & SC_FL_ERROR) ||
 	        ((s->scb->flags & (SC_FL_SHUT_WANTED|SC_FL_SHUT_DONE)) &&  /* empty and client aborted */
-	         (channel_is_empty(req) || (s->be->options & PR_O_ABRT_CLOSE))));
+	         (!co_data(req) || (s->be->options & PR_O_ABRT_CLOSE))));
 }
 
 /* Update back stream connector status for input states SC_ST_ASS, SC_ST_QUE,
@@ -2249,7 +2251,7 @@ void back_handle_st_con(struct stream *s)
 	/* the client might want to abort */
 	if ((s->scf->flags & SC_FL_SHUT_DONE) ||
 	    ((s->scb->flags & SC_FL_SHUT_WANTED) &&
-	     (channel_is_empty(req) || (s->be->options & PR_O_ABRT_CLOSE)))) {
+	     (!co_data(req) || (s->be->options & PR_O_ABRT_CLOSE)))) {
 		sc->flags |= SC_FL_NOLINGER;
 		sc_shutdown(sc);
 		s->conn_err_type |= STRM_ET_CONN_ABRT;
@@ -2472,7 +2474,7 @@ void back_handle_st_rdy(struct stream *s)
 		/* client abort ? */
 		if ((s->scf->flags & SC_FL_SHUT_DONE) ||
 		    ((s->scb->flags & SC_FL_SHUT_WANTED) &&
-		     (channel_is_empty(req) || (s->be->options & PR_O_ABRT_CLOSE)))) {
+		     (!co_data(req) || (s->be->options & PR_O_ABRT_CLOSE)))) {
 			/* give up */
 			sc->flags |= SC_FL_NOLINGER;
 			sc_shutdown(sc);
@@ -2819,6 +2821,53 @@ int backend_parse_balance(const char **args, char **err, struct proxy *curproxy)
 	}
 	else {
 		memprintf(err, "only supports 'roundrobin', 'static-rr', 'leastconn', 'source', 'uri', 'url_param', 'hdr(name)' and 'rdp-cookie(name)' options.");
+		return -1;
+	}
+	return 0;
+}
+
+/* This function parses a "balance" statement in a log backend section
+ * describing <curproxy>. It returns -1 if there is any error, otherwise zero.
+ * If it returns -1, it will write an error message into the <err> buffer which
+ * will automatically be allocated and must be passed as NULL. The trailing '\n'
+ * will not be written. The function must be called with <args> pointing to the
+ * first word after "balance".
+ */
+int backend_parse_log_balance(const char **args, char **err, struct proxy *curproxy)
+{
+	if (!*(args[0])) {
+		/* if no option is set, use round-robin by default */
+		curproxy->lbprm.algo &= ~BE_LB_ALGO;
+		curproxy->lbprm.algo |= BE_LB_ALGO_RR;
+		return 0;
+	}
+
+	if (strcmp(args[0], "roundrobin") == 0) {
+		curproxy->lbprm.algo &= ~BE_LB_ALGO;
+		curproxy->lbprm.algo |= BE_LB_ALGO_RR;
+	}
+	else if (strcmp(args[0], "sticky") == 0) {
+		curproxy->lbprm.algo &= ~BE_LB_ALGO;
+		/* we use ALGO_FAS as "sticky" mode in log-balance context */
+		curproxy->lbprm.algo |= BE_LB_ALGO_FAS;
+	}
+	else if (strcmp(args[0], "random") == 0) {
+		curproxy->lbprm.algo &= ~BE_LB_ALGO;
+		curproxy->lbprm.algo |= BE_LB_ALGO_RND;
+	}
+	else if (strcmp(args[0], "hash") == 0) {
+		if (!*args[1]) {
+			memprintf(err, "%s requires a converter list.", args[0]);
+			return -1;
+		}
+		curproxy->lbprm.algo &= ~BE_LB_ALGO;
+		curproxy->lbprm.algo |= BE_LB_ALGO_SMP;
+
+		ha_free(&curproxy->lbprm.arg_str);
+		curproxy->lbprm.arg_str = strdup(args[1]);
+	}
+	else {
+		memprintf(err, "only supports 'roundrobin', 'sticky', 'random', 'hash' options");
 		return -1;
 	}
 	return 0;

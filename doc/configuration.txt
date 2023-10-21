@@ -3,7 +3,7 @@
                           Configuration Manual
                          ----------------------
                               version 2.9
-                              2023/10/06
+                              2023/10/20
 
 
 This document covers the configuration language as implemented in the version
@@ -1175,6 +1175,7 @@ The following keywords are supported in the "global" section :
    - tune.bufsize
    - tune.comp.maxlevel
    - tune.disable-fast-forward
+   - tune.disable-zero-copy-forwarding
    - tune.fail-alloc
    - tune.fd.edge-triggered
    - tune.h2.be.initial-window-size
@@ -1211,12 +1212,16 @@ The following keywords are supported in the "global" section :
    - tune.quic.max-frame-loss
    - tune.quic.retry-threshold
    - tune.quic.socket-owner
+   - tune.rcvbuf.backend
    - tune.rcvbuf.client
+   - tune.rcvbuf.frontend
    - tune.rcvbuf.server
    - tune.recv_enough
    - tune.runqueue-depth
    - tune.sched.low-latency
+   - tune.sndbuf.backend
    - tune.sndbuf.client
+   - tune.sndbuf.frontend
    - tune.sndbuf.server
    - tune.stick-counters
    - tune.ssl.cachesize
@@ -1836,7 +1841,7 @@ localpeer <name>
   This option will also set the HAPROXY_LOCALPEER environment variable.
   See also "-L" in the management guide and "peers" section below.
 
-log <address> [len <length>] [format <format>] [sample <ranges>:<sample_size>]
+log <target> [len <length>] [format <format>] [sample <ranges>:<sample_size>]
     <facility> [max level [min level]]
   Adds a global syslog server. Several global servers can be defined. They
   will receive logs for starts and exits, as well as all logs from proxies
@@ -2892,11 +2897,18 @@ tune.disable-fast-forward [ EXPERIMENTAL ]
   Disables the data fast-forwarding. It is a mechanism to optimize the data
   forwarding by passing data directly from a side to the other one without
   waking the stream up. Thanks to this directive, it is possible to disable
-  this optimization. Note it also disable any kernel tcp splicing. This command
-  is not meant for regular use, it will generally only be suggested by
-  developers along complex debugging sessions. For this reason it is internally
-  marked as experimental, meaning that "expose-experimental-directives" must
-  appear on a line before this directive.
+  this optimization. Note it also disable any kernel tcp splicing but also the
+  zero-copy forwarding. This command is not meant for regular use, it will
+  generally only be suggested by developers along complex debugging
+  sessions. For this reason it is internally marked as experimental, meaning
+  that "expose-experimental-directives" must appear on a line before this
+  directive.
+
+tune.zero-copy-forwarding
+  Disables the zero-copy forwarding of data. It is a mechanism to optimize the
+  data fast-forwarding by avoiding to use the channel's buffer. Thanks to this
+  directive, it is possible to disable this optimization. Note it also disable
+  any kernel tcp splicing.
 
 tune.fail-alloc
   If compiled with DEBUG_FAIL_ALLOC or started with "-dMfail", gives the
@@ -3369,6 +3381,22 @@ tune.quic.socket-owner { connection | listener }
   is used globally, it will be forced on every listener instance, regardless of
   their individual configuration.
 
+tune.rcvbuf.backend <number>
+tune.rcvbuf.frontend <number>
+  For the kernel socket receive buffer size on non-connected sockets to this
+  size. This can be used QUIC in listener mode and log-forward on the frontend.
+  The default system buffers might sometimes be too small for sockets receiving
+  lots of aggregated traffic, causing some losses and possibly retransmits (in
+  case of QUIC), possibly slowing down connection establishment under heavy
+  traffic. The value is expressed in bytes, applied to each socket. In listener
+  mode, sockets are shared between all connections, and the total number of
+  sockets depends on the "shards" value of the "bind" line. There's no good
+  value, a good one corresponds to an expected size per connection multiplied
+  by the expected number of connections. The kernel may trim large values. See
+  also "tune.rcvbuf.client" and "tune.rcvbuf.server" for their connected socket
+  counter parts, as well as "tune.sndbuf.backend" and "tune.sndbuf.frontend"
+  for the send setting.
+
 tune.rcvbuf.client <number>
 tune.rcvbuf.server <number>
   Forces the kernel socket receive buffer size on the client or the server side
@@ -3406,6 +3434,22 @@ tune.sched.low-latency { on | off }
   maximum latency experienced by new requests or connections in the middle of
   massive traffic, at the expense of a higher impact on this large traffic.
   For regular usage it is better to leave this off. The default value is off.
+
+tune.sndbuf.backend <number>
+tune.sndbuf.frontend <number>
+  For the kernel socket send buffer size on non-connected sockets to this size.
+  This can be used for UNIX socket and UDP logging on the backend side, and for
+  QUIC in listener mode on the frontend. The default system buffers might
+  sometimes be too small for sockets shared between many connections (or log
+  senders), causing some losses and possibly retransmits, slowing down new
+  connection establishment under high traffic. The value is expressed in bytes,
+  applied to each socket. In listener mode, sockets are shared between all
+  connections, and the total number of sockets depends on the "shards" value of
+  the "bind" line. There's no good value, a good one corresponds to an expected
+  size per connection multiplied by the expected number of connections. The
+  kernel may trim large values. See also "tune.sndbuf.client" and
+  "tune.sndbuf.server" for their connected socket counter parts, as well as
+  "tune.rcvbuf.backend" and "tune.rcvbuf.frontend" for the receive setting.
 
 tune.sndbuf.client <number>
 tune.sndbuf.server <number>
@@ -3749,7 +3793,7 @@ enabled
   This re-enables a peers section which was previously disabled via the
   "disabled" keyword.
 
-log <address> [len <length>] [format <format>] [sample <ranges>:<sample_size>]
+log <target> [len <length>] [format <format>] [sample <ranges>:<sample_size>]
     <facility> [<level> [<minlevel>]]
   "peers" sections support the same "log" keyword as for the proxies to
   log information about the "peers" listener. See "log" option for proxies for
@@ -4169,7 +4213,7 @@ dgram-bind <addr> [param*]
   silently ignored as irrelevant for UDP/syslog case.
 
 log global
-log <address> [len <length>] [format <format>] [sample <ranges>:<sample_size>]
+log <target> [len <length>] [format <format>] [sample <ranges>:<sample_size>]
     <facility> [<level> [<minlevel>]]
   Used to configure target log servers. See more details on proxies
   documentation.
@@ -4426,6 +4470,7 @@ id                                        -          X         X         X
 ignore-persist                            -          -         X         X
 load-server-state-from-file               X          -         X         X
 log                                  (*)  X          X         X         X
+log-balance                               X          -         X         X
 log-format                                X          X         X         -
 log-format-sd                             X          X         X         -
 log-tag                                   X          X         X         X
@@ -4932,10 +4977,11 @@ bind /<path> [, ...] [param*]
                     - 'quic6@' -> address is resolved as IPv6 and protocol UDP
                       is used. The performance note for QUIC over IPv4 applies
                       as well.
-                    - 'rev@' -> used for reverse HTTP. Address must be a server
-                      with the format '<backend>/<server>'. The server will be
-                      used to instantiate connections to a remote address. The
-                      listener will try to maintain 'maxconn' connections.
+                    - 'rhttp@' -> used for reverse HTTP. Address must be a
+                      server with the format '<backend>/<server>'. The server
+                      will be used to instantiate connections to a remote
+                      address. The listener will try to maintain 'maxconn'
+                      connections.
 
                   You may want to reference some environment variables in the
                   address parameter, see section 2.3 about environment
@@ -6058,6 +6104,10 @@ hash-type <method> <function> <modifier>
               gzip, PNG, etc. It is slower than the other ones but may provide
               a better distribution or less predictable results especially when
               used on strings.
+
+       none   don't hash the key, the key will be used as a hash, this can be
+              useful to manually hash the key using a converter for that purpose
+              and let haproxy use the result directly.
 
     <modifier> indicates an optional method applied after hashing the key :
 
@@ -8082,6 +8132,7 @@ http-response <action> <options...> [ { if | unless } <condition> ]
     - set-mark <mark>
     - set-nice <nice>
     - set-status <status> [reason <str>]
+    - set-timeout { client | server | tunnel } { <timeout> | <expr> }
     - set-tos <tos>
     - set-var(<var-name>[,<cond>...]) <expr>
     - set-var-fmt(<var-name>[,<cond>...]) <fmt>
@@ -8326,6 +8377,24 @@ http-response set-status <status> [reason <str>]
     http-response set-status 431
     # return "503 Slow Down", custom reason
     http-response set-status 503 reason "Slow Down".
+
+http-response set-timeout { client | server | tunnel } { <timeout> | <expr> }
+                                       [ { if | unless } <condition> ]
+
+  This action overrides the specified "client", "server" or "tunnel" timeout for the
+  current stream only. The timeout can be specified in millisecond or with any
+  other unit if the number is suffixed by the unit as explained at the top of
+  this document. It is also possible to write an expression which must returns
+  a number interpreted as a timeout in millisecond.
+
+  Note that the server/tunnel timeouts are only relevant on the backend side
+  and thus this rule is only available for the proxies with backend
+  capabilities. As well as client timeout is only relevant for frontend side.
+  Also the timeout value must be non-null to obtain the expected results.
+
+  Example:
+    http-response set-timeout tunnel 5s
+    http-response set-timeout server res.hdr(X-Refresh-Seconds),mul(1000)
 
 http-response set-tos <tos> [ { if | unless } <condition> ]
 
@@ -8627,7 +8696,7 @@ load-server-state-from-file { global | local | none }
 
 
 log global
-log <address> [len <length>] [format <format>] [sample <ranges>:<sample_size>]
+log <target> [len <length>] [format <format>] [sample <ranges>:<sample_size>]
     <facility> [<level> [<minlevel>]]
 no log
   Enable per-instance logging of events and traffic.
@@ -8642,12 +8711,12 @@ no log
   Arguments :
     global     should be used when the instance's logging parameters are the
                same as the global ones. This is the most common usage. "global"
-               replaces <address>, <facility> and <level> with those of the log
+               replaces <target>, <facility> and <level> with those of the log
                entries found in the "global" section. Only one "log global"
                statement may be used per instance, and this form takes no other
                parameter.
 
-    <address>  indicates where to send the logs. It takes the same format as
+    <target>   indicates where to send the logs. It takes the same format as
                for the "global" section's logs, and can be one of :
 
                - An IPv4 address optionally followed by a colon (':') and a UDP
@@ -8691,6 +8760,12 @@ no log
                  their sizes. Such buffers are lost on reload or restart but
                  when used as a complement this can help troubleshooting by
                  having the logs instantly available.
+
+               - A log backend in the form "backend@<name>", which will send
+                 log messages to the corresponding log backend responsible for
+                 sending the message to the proper server according to the
+                 backend's lb settings. A log backend is a backend section with
+                 "mode log" set (see "mode" for more information).
 
                - An explicit stream address prefix such as "tcp@","tcp6@",
                  "tcp4@" or "uxst@" will allocate an implicit ring buffer with
@@ -8809,6 +8884,81 @@ no log
                                                 # level and send in tcp
     log "${LOCAL_SYSLOG}:514" local0 notice   # send to local server
 
+log-balance <algorithm> [ <arguments> ]
+
+  Define the load balancing algorithm to be used in a log backend.
+  ("mode log" enabled)
+
+  May be used in sections :   defaults | frontend | listen | backend
+                                 yes   |    no    |   yes  |   yes
+  Arguments :
+    <algorithm> is the algorithm used to select a server when doing load
+                balancing. This only applies when no persistence information
+                is available, or when a connection is redispatched to another
+                server. <algorithm> may be one of the following :
+
+      roundrobin  Each server is used in turns. This is the smoothest and
+                  fairest algorithm when the server's processing time remains
+                  equally distributed.
+
+      sticky      The first server in the list of available servers receives all
+                  the log messages. When the server goes DOWN, the next server
+                  in the list takes its place. When a previously DOWN server
+                  goes back UP it is added at the end of the list so that the
+                  sticky server doesn't change until it becomes DOWN.
+
+      random      A random number will be used as the key for the server
+                  lookup. Random log balancing can be useful with large farms
+                  or when servers are frequently added or removed from the
+                  pool of available servers as it may avoid the hammering
+                  effect that could result from roundrobin in this situation.
+
+      hash        <arguments> should be found in the form: <cnv_list>
+                  e.g.: log-balance hash <cnv_list>
+
+                  Each log message will be passed to the converter list
+                  specified in <cnv_list> (ie: "cnv1,cnv2..."), and it will
+                  then be passed to haproxy hashing function according to
+                  "hash-type" settings. The resulting hash will be used to
+                  select the destination server among the ones declared in the
+                  log backend. The goal of this algorithm is to be able to
+                  extract a key within the final log message using string
+                  converters and then be able to stick to the same server thanks
+                  to the hash. Only "map-based" hashes are supported for now.
+
+    <arguments> is an optional list of arguments which may be needed by some
+                algorithms.
+
+  The load balancing algorithm of a log backend is set to roundrobin when
+  no other algorithm has been set. The algorithm may only be set once for each
+  log backend. The above algorithms support the "backup" server option and the
+  "allbackups" proxy option. However server "weight" is not supported and will
+  be ignored.
+
+  Examples :
+
+        global
+          log backend@mylog-rrb local0 # send all logs to mylog-rrb backend
+          log backend@mylog-hash local0 # send all logs to mylog-hash backend
+
+        backend mylog-rrb
+          mode log
+          log-balance roundrobin
+
+          server s1 udp@127.0.0.1:514 # will receive 50% of log messages
+          server s2 udp@127.0.0.1:514
+
+        backend mylog-hash
+          mode log
+
+          # extract "METHOD URL PROTO" at the end of the log message,
+          # and let haproxy hash it so that log messages generated from
+          # similar requests get sent to the same syslog server:
+          log-balance hash 'field(-2,\")'
+
+          # server list here
+          server s1 127.0.0.1:514
+          #...
 
 log-format <string>
   Specifies the log format string to use for traffic logs
@@ -8923,7 +9073,7 @@ maxconn <conns>
   See also : "server", global section's "maxconn", "fullconn"
 
 
-mode { tcp|http }
+mode { tcp|http|log }
   Set the running mode or protocol of the instance
   May be used in sections :   defaults | frontend | listen | backend
                                  yes   |    yes   |   yes  |   yes
@@ -8938,6 +9088,16 @@ mode { tcp|http }
               which is not RFC-compliant will be rejected. Layer 7 filtering,
               processing and switching will be possible. This is the mode which
               brings HAProxy most of its value.
+
+    log       When used in a backend section, it will turn the backend into a
+              log backend. Such backend can be used as a log destination for
+              any "log" directive by using the "backend@<name>" syntax. Log
+              messages will be distributed to the servers from the backend
+              according to the lb settings which can be configured using the
+              "log-balance" keyword (in place of the "balance" keyword for TCP
+              and HTTP backends). Log backends support UDP servers by prefixing
+              the server's address with the "udp@" prefix. Common backend and
+              server features are supported, but not TCP or HTTP related ones.
 
   When doing content switching, it is mandatory that the frontend and the
   backend are in the same mode (generally HTTP), otherwise the configuration
@@ -11375,17 +11535,12 @@ server <name> <address>[:[port]] [param*]
                       one of them over the FD. The bind part will use the
                       received socket as the client FD. Should be used
                       carefully.
+                    - 'rhttp@' -> custom address family for a passive server in
+                      HTTP reverse context.
               You may want to reference some environment variables in the
               address parameter, see section 2.3 about environment
               variables. The "init-addr" setting can be used to modify the way
               IP addresses should be resolved upon startup.
-
-              Additionally, there is a special address notation defined for
-              servers which does not have any address assigned. Currently, only
-              '@reverse' is valid. This instantiates a server which can only be
-              used with reverse connect. This mode requires the proxy to be in
-              HTTP mode and the server to explicitly use HTTP/2, either through
-              'proto' or 'alpn' keywords.
 
     <port>    is an optional port specification. If set, all connections will
               be sent to this port. If unset, the same port the client
@@ -15173,6 +15328,11 @@ namespace <name>
   a namespace different from the default one. Please refer to your operating
   system's documentation to find more details about network namespaces.
 
+nbconn <nbconn>
+  This setting is only valid for listener instances which uses reverse HTTP.
+  This will define the count of connections which will be mounted in parallel.
+  If not specified, a default value of 1 is used.
+
 nice <nice>
   Sets the 'niceness' of connections initiated from the socket. Value must be
   in the range -1024..1024 inclusive, and defaults to zero. Positive values
@@ -16080,9 +16240,17 @@ downinter <delay>
   "inter" setting will have a very limited effect as it will not be able to
   reduce the time spent in the queue.
 
+log-bufsize <bufsize>
+  The "log-bufsize" specifies the ring bufsize to use for the implicit ring
+  that will be associated to the log server in a log backend. When not
+  specified, this defaults to BUFSIZE. Use of a greater value will increase
+  memory usage but can help to prevent the loss of log messages with slow
+  servers since the buffer will be able to hold more pending messages.
+  This keyword may only be used in log backend sections (with "mode log")
+
 log-proto <logproto>
   The "log-proto" specifies the protocol used to forward event messages to
-  a server configured in a ring section. Possible values are "legacy"
+  a server configured in a log or ring section. Possible values are "legacy"
   and "octet-count" corresponding respectively to "Non-transparent-framing"
   and "Octet counting" in rfc6587. "legacy" is the default.
 
@@ -18255,10 +18423,18 @@ json([<input-code>])
      {"ip":"127.0.0.1","user-agent":"Very \"Ugly\" UA 1\/2"}
 
 json_query(<json_path>,[<output_type>])
-  The json_query converter supports the JSON types string, boolean and
-  number. Floating point numbers will be returned as a string. By
+  The json_query converter supports the JSON types string, boolean, number
+  and array. Floating point numbers will be returned as a string. By
   specifying the output_type 'int' the value will be converted to an
-  Integer. If conversion is not possible the json_query converter fails.
+  Integer. Arrays will be returned as string, starting and ending with a
+  square brackets. The content is a CSV. Depending on the data type, the
+  array values might be quoted. If the array values are complex types,
+  the string contains the complete json representation of each value
+  separated by a comma. Example result for a roles query to a JWT:
+
+     ["manage-account","manage-account-links","view-profile"]
+
+  If conversion is not possible the json_query converter fails.
 
   <json_path> must be a valid JSON Path string as defined in
   https://datatracker.ietf.org/doc/draft-ietf-jsonpath-base/
@@ -24965,7 +25141,7 @@ index <script-name>
     index index.php
 
 log-stderr global
-log-stderr <address> [len <length>] [format <format>]
+log-stderr <target> [len <length>] [format <format>]
     [sample <ranges>:<sample_size>] <facility> [<level> [<minlevel>]]
   Enable logging of STDERR messages reported by the FastCGI application.
 

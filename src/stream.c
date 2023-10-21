@@ -320,10 +320,10 @@ int stream_buf_available(void *arg)
 {
 	struct stream *s = arg;
 
-	if (!s->req.buf.size && !s->req.pipe && s->scf->flags & SC_FL_NEED_BUFF &&
+	if (!s->req.buf.size && !sc_ep_have_ff_data(s->scb) && s->scf->flags & SC_FL_NEED_BUFF &&
 	    b_alloc(&s->req.buf))
 		sc_have_buff(s->scf);
-	else if (!s->res.buf.size && !s->res.pipe && s->scb->flags & SC_FL_NEED_BUFF &&
+	else if (!s->res.buf.size && !sc_ep_have_ff_data(s->scf) && s->scb->flags & SC_FL_NEED_BUFF &&
 		 b_alloc(&s->res.buf))
 		sc_have_buff(s->scb);
 	else
@@ -630,12 +630,6 @@ void stream_free(struct stream *s)
 		 */
 		sess_change_server(s, NULL);
 	}
-
-	if (s->req.pipe)
-		put_pipe(s->req.pipe);
-
-	if (s->res.pipe)
-		put_pipe(s->res.pipe);
 
 	/* We may still be present in the buffer wait queue */
 	if (LIST_INLIST(&s->buffer_wait.list))
@@ -2275,22 +2269,6 @@ struct task *process_stream(struct task *t, void *context, unsigned int state)
 		}
 	}
 
-	/* check if it is wise to enable kernel splicing to forward request data */
-	if (!(req->flags & CF_KERN_SPLICING) &&
-	    !(scf->flags & (SC_FL_EOS|SC_FL_ABRT_DONE)) &&
-	    req->to_forward &&
-	    (global.tune.options & GTUNE_USE_SPLICE) &&
-	    (sc_conn(scf) && __sc_conn(scf)->xprt && __sc_conn(scf)->xprt->rcv_pipe &&
-	     __sc_conn(scf)->mux && __sc_conn(scf)->mux->rcv_pipe) &&
-	    (sc_conn(scb) && __sc_conn(scb)->xprt && __sc_conn(scb)->xprt->snd_pipe &&
-	     __sc_conn(scb)->mux && __sc_conn(scb)->mux->snd_pipe) &&
-	    (pipes_used < global.maxpipes) &&
-	    (((sess->fe->options2|s->be->options2) & PR_O2_SPLIC_REQ) ||
-	     (((sess->fe->options2|s->be->options2) & PR_O2_SPLIC_AUT) &&
-	      (req->flags & CF_STREAMER_FAST)))) {
-		req->flags |= CF_KERN_SPLICING;
-	}
-
 	/* reflect what the L7 analysers have seen last */
 	rqf_last = req->flags;
 	scf_flags = (scf_flags & ~(SC_FL_EOS|SC_FL_ABRT_DONE|SC_FL_ABRT_WANTED)) | (scf->flags & (SC_FL_EOS|SC_FL_ABRT_DONE|SC_FL_ABRT_WANTED));
@@ -2303,7 +2281,7 @@ struct task *process_stream(struct task *t, void *context, unsigned int state)
 	 */
 	if (scb->state == SC_ST_INI) {
 		if (!(scb->flags & SC_FL_SHUT_DONE)) {
-			if ((req->flags & CF_AUTO_CONNECT) || !channel_is_empty(req)) {
+			if ((req->flags & CF_AUTO_CONNECT) || co_data(req)) {
 				/* If we have an appctx, there is no connect method, so we
 				 * immediately switch to the connected state, otherwise we
 				 * perform a connection request.
@@ -2382,7 +2360,7 @@ struct task *process_stream(struct task *t, void *context, unsigned int state)
 
 	/* shutdown(write) pending */
 	if (unlikely((scb->flags & (SC_FL_SHUT_DONE|SC_FL_SHUT_WANTED)) == SC_FL_SHUT_WANTED &&
-		     (channel_is_empty(req) || (req->flags & CF_WRITE_TIMEOUT)))) {
+		     (!co_data(req) || (req->flags & CF_WRITE_TIMEOUT)))) {
 		if (scf->flags & SC_FL_ERROR)
 			scb->flags |= SC_FL_NOLINGER;
 		sc_shutdown(scb);
@@ -2466,22 +2444,6 @@ struct task *process_stream(struct task *t, void *context, unsigned int state)
 		}
 	}
 
-	/* check if it is wise to enable kernel splicing to forward response data */
-	if (!(res->flags & CF_KERN_SPLICING) &&
-	    !(scb->flags & (SC_FL_EOS|SC_FL_ABRT_DONE)) &&
-	    res->to_forward &&
-	    (global.tune.options & GTUNE_USE_SPLICE) &&
-	    (sc_conn(scf) && __sc_conn(scf)->xprt && __sc_conn(scf)->xprt->snd_pipe &&
-	     __sc_conn(scf)->mux && __sc_conn(scf)->mux->snd_pipe) &&
-	    (sc_conn(scb) && __sc_conn(scb)->xprt && __sc_conn(scb)->xprt->rcv_pipe &&
-	     __sc_conn(scb)->mux && __sc_conn(scb)->mux->rcv_pipe) &&
-	    (pipes_used < global.maxpipes) &&
-	    (((sess->fe->options2|s->be->options2) & PR_O2_SPLIC_RTR) ||
-	     (((sess->fe->options2|s->be->options2) & PR_O2_SPLIC_AUT) &&
-	      (res->flags & CF_STREAMER_FAST)))) {
-		res->flags |= CF_KERN_SPLICING;
-	}
-
 	/* reflect what the L7 analysers have seen last */
 	rpf_last = res->flags;
 	scb_flags = (scb_flags & ~(SC_FL_EOS|SC_FL_ABRT_DONE|SC_FL_ABRT_WANTED)) | (scb->flags & (SC_FL_EOS|SC_FL_ABRT_DONE|SC_FL_ABRT_WANTED));
@@ -2506,7 +2468,7 @@ struct task *process_stream(struct task *t, void *context, unsigned int state)
 
 	/* shutdown(write) pending */
 	if (unlikely((scf->flags & (SC_FL_SHUT_DONE|SC_FL_SHUT_WANTED)) == SC_FL_SHUT_WANTED &&
-		     (channel_is_empty(res) || (res->flags & CF_WRITE_TIMEOUT)))) {
+		     (!co_data(res) || (res->flags & CF_WRITE_TIMEOUT)))) {
 		sc_shutdown(scf);
 	}
 
@@ -3313,6 +3275,14 @@ void strm_dump_to_buffer(struct buffer *buf, const struct stream *strm, const ch
 	chunk_appendf(buf, " wex=%s\n",
 		      sc_ep_snd_ex(scf) ? human_time(TICKS_TO_MS(sc_ep_snd_ex(scf) - now_ms), TICKS_TO_MS(1000)) : "<NEVER>");
 
+	chunk_appendf(&trash, "%s    iobuf.flags=0x%08x .pipe=%d .buf=%u@%p+%u/%u\n", pfx,
+		      scf->sedesc->iobuf.flags,
+		      scf->sedesc->iobuf.pipe ? scf->sedesc->iobuf.pipe->data : 0,
+		      scf->sedesc->iobuf.buf ? (unsigned int)b_data(scf->sedesc->iobuf.buf): 0,
+		      scf->sedesc->iobuf.buf ? b_orig(scf->sedesc->iobuf.buf): NULL,
+		      scf->sedesc->iobuf.buf ? (unsigned int)b_head_ofs(scf->sedesc->iobuf.buf): 0,
+		      scf->sedesc->iobuf.buf ? (unsigned int)b_size(scf->sedesc->iobuf.buf): 0);
+
 	if ((conn = sc_conn(scf)) != NULL) {
 		if (conn->mux && conn->mux->show_sd) {
 			char muxpfx[100] = "";
@@ -3361,6 +3331,14 @@ void strm_dump_to_buffer(struct buffer *buf, const struct stream *strm, const ch
 		      sc_ep_rcv_ex(scb) ? human_time(TICKS_TO_MS(sc_ep_rcv_ex(scb) - now_ms), TICKS_TO_MS(1000)) : "<NEVER>");
 	chunk_appendf(buf, " wex=%s\n",
 		      sc_ep_snd_ex(scb) ? human_time(TICKS_TO_MS(sc_ep_snd_ex(scb) - now_ms), TICKS_TO_MS(1000)) : "<NEVER>");
+
+	chunk_appendf(&trash, "%s    iobuf.flags=0x%08x .pipe=%d .buf=%u@%p+%u/%u\n", pfx,
+		      scb->sedesc->iobuf.flags,
+		      scb->sedesc->iobuf.pipe ? scb->sedesc->iobuf.pipe->data : 0,
+		      scb->sedesc->iobuf.buf ? (unsigned int)b_data(scb->sedesc->iobuf.buf): 0,
+		      scb->sedesc->iobuf.buf ? b_orig(scb->sedesc->iobuf.buf): NULL,
+		      scb->sedesc->iobuf.buf ? (unsigned int)b_head_ofs(scb->sedesc->iobuf.buf): 0,
+		      scb->sedesc->iobuf.buf ? (unsigned int)b_size(scb->sedesc->iobuf.buf): 0);
 
 	if ((conn = sc_conn(scb)) != NULL) {
 		if (conn->mux && conn->mux->show_sd) {
@@ -3414,12 +3392,11 @@ void strm_dump_to_buffer(struct buffer *buf, const struct stream *strm, const ch
 	}
 
 	chunk_appendf(buf,
-		     "%s  req=%p (f=0x%06x an=0x%x pipe=%d tofwd=%d total=%lld)\n"
+		     "%s  req=%p (f=0x%06x an=0x%x tofwd=%d total=%lld)\n"
 		     "%s      an_exp=%s buf=%p data=%p o=%u p=%u i=%u size=%u\n",
 		     pfx,
 		     &strm->req,
 		     strm->req.flags, strm->req.analysers,
-		     strm->req.pipe ? strm->req.pipe->data : 0,
 		     strm->req.to_forward, strm->req.total,
 		     pfx,
 		     strm->req.analyse_exp ?
@@ -3447,12 +3424,11 @@ void strm_dump_to_buffer(struct buffer *buf, const struct stream *strm, const ch
 	}
 
 	chunk_appendf(buf,
-		     "%s  res=%p (f=0x%06x an=0x%x pipe=%d tofwd=%d total=%lld)\n"
+		     "%s  res=%p (f=0x%06x an=0x%x tofwd=%d total=%lld)\n"
 		     "%s      an_exp=%s buf=%p data=%p o=%u p=%u i=%u size=%u\n",
 		     pfx,
 		     &strm->res,
 		     strm->res.flags, strm->res.analysers,
-		     strm->res.pipe ? strm->res.pipe->data : 0,
 		     strm->res.to_forward, strm->res.total,
 		     pfx,
 		     strm->res.analyse_exp ?

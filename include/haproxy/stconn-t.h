@@ -24,8 +24,24 @@
 
 #include <haproxy/obj_type-t.h>
 #include <haproxy/connection-t.h>
+#include <haproxy/pipe-t.h>
 #include <haproxy/show_flags-t.h>
 #include <haproxy/xref-t.h>
+
+enum iobuf_flags {
+	IOBUF_FL_NONE             = 0x00000000, /* For initialization purposes */
+	IOBUF_FL_NO_FF            = 0x00000001, /* Fast-forwarding is not supported */
+	IOBUF_FL_NO_SPLICING      = 0x00000002, /* Splicing is not supported or unusable for this stream */
+	IOBUF_FL_FF_BLOCKED       = 0x00000004, /* Fast-forwarding is blocked (buffer allocation/full) */
+};
+
+struct iobuf {
+	struct pipe *pipe;     /* non-NULL only when data present */
+	struct buffer *buf;
+	size_t offset;
+	size_t data;
+	unsigned int flags;
+};
 
 /* Stream Endpoint Flags.
  * Please also update the se_show_flags() function below in case of changes.
@@ -65,7 +81,7 @@ enum se_flags {
 	SE_FL_ERROR      = 0x00010000,  /* a fatal error was reported */
 	/* Transient flags */
 	SE_FL_ERR_PENDING= 0x00020000,  /* An error is pending, but there's still data to be read */
-	SE_FL_MAY_SPLICE = 0x00040000,  /* The endpoint may use the kernel splicing to forward data to the other side (implies SE_FL_CAN_SPLICE) */
+	SE_FL_MAY_FASTFWD= 0x00040000,  /* The endpoint may fast-forward data to the other side */
 	SE_FL_RCV_MORE   = 0x00080000,  /* Endpoint may have more bytes to transfer */
 	SE_FL_WANT_ROOM  = 0x00100000,  /* More bytes to transfer, but not enough room */
 	SE_FL_EXP_NO_DATA= 0x00200000,  /* No data expected by the endpoint */
@@ -98,7 +114,7 @@ static forceinline char *se_show_flags(char *buf, size_t len, const char *delim,
 	_(SE_FL_T_MUX, _(SE_FL_T_APPLET, _(SE_FL_DETACHED, _(SE_FL_ORPHAN,
 	_(SE_FL_SHRD, _(SE_FL_SHRR, _(SE_FL_SHWN, _(SE_FL_SHWS,
 	_(SE_FL_NOT_FIRST, _(SE_FL_WEBSOCKET, _(SE_FL_EOI, _(SE_FL_EOS,
-	_(SE_FL_ERROR, _(SE_FL_ERR_PENDING, _(SE_FL_MAY_SPLICE,
+	_(SE_FL_ERROR, _(SE_FL_ERR_PENDING, _(SE_FL_MAY_FASTFWD,
 	_(SE_FL_RCV_MORE, _(SE_FL_WANT_ROOM, _(SE_FL_EXP_NO_DATA,
 	_(SE_FL_WAIT_FOR_HS, _(SE_FL_KILL_CONN, _(SE_FL_WAIT_DATA,
 	_(SE_FL_WONT_CONSUME, _(SE_FL_HAVE_NO_DATA, _(SE_FL_APPLET_NEED_CONN))))))))))))))))))))))));
@@ -246,11 +262,13 @@ struct stconn;
 
  * <fsb> should be updated when the first send of a series is blocked and reset
  *       when a successful send is reported.
+ *
  */
 struct sedesc {
 	void *se;                  /* the stream endpoint, i.e. the mux stream or the appctx */
 	struct connection *conn;   /* the connection for connection-based streams */
 	struct stconn *sc;         /* the stream connector we're attached to, or NULL */
+	struct iobuf iobuf;        /* contains data forwarded by the other side and that must be sent by the stream endpoint */
 	unsigned int flags;        /* SE_FL_* */
 	unsigned int lra;          /* the last read activity */
 	unsigned int fsb;          /* the first send blocked */

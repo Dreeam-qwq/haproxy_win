@@ -178,7 +178,7 @@ struct global global = {
 	.numa_cpu_mapping = 1,
 	.nbthread = 0,
 	.req_count = 0,
-	.logsrvs = LIST_HEAD_INIT(global.logsrvs),
+	.loggers = LIST_HEAD_INIT(global.loggers),
 	.maxzlibmem = DEFAULT_MAXZLIBMEM * 1024U * 1024U,
 	.comp_rate_lim = 0,
 	.ssl_server_verify = SSL_SERVER_VERIFY_REQUIRED,
@@ -649,6 +649,7 @@ static void usage(char *name)
 		"        -dW fails if any warning is emitted\n"
 		"        -dD diagnostic mode : warn about suspicious configuration statements\n"
 		"        -dF disable fast-forward\n"
+		"        -dZ disable zero-copy forwarding\n"
 		"        -sf/-st [pid ]* finishes/terminates old pids.\n"
 		"        -x <unix_socket> get listening sockets from a unix socket\n"
 		"        -S <bind>[,<bind options>...] new master CLI\n"
@@ -1609,6 +1610,7 @@ static void init_args(int argc, char **argv)
 	global.tune.options |= GTUNE_STRICT_LIMITS;
 
 	global.tune.options |= GTUNE_USE_FAST_FWD; /* Use fast-forward by default */
+	global.tune.options |= GTUNE_USE_ZERO_COPY_FWD; /* Use zero-copy forwarding by default */
 
 	/* keep a copy of original arguments for the master process */
 	old_argv = copy_argv(argc, argv);
@@ -1664,6 +1666,8 @@ static void init_args(int argc, char **argv)
 				global.tune.options &= ~GTUNE_USE_FAST_FWD;
 			else if (*flag == 'd' && flag[1] == 'V')
 				global.ssl_server_verify = SSL_SERVER_VERIFY_NONE;
+			else if (*flag == 'd' && flag[1] == 'Z')
+				global.tune.options &= ~GTUNE_USE_ZERO_COPY_FWD;
 			else if (*flag == 'V')
 				arg_mode |= MODE_VERBOSE;
 			else if (*flag == 'd' && flag[1] == 'C') {
@@ -2735,7 +2739,7 @@ void deinit(void)
 	struct proxy *p = proxies_list, *p0;
 	struct wordlist *wl, *wlb;
 	struct uri_auth *uap, *ua = NULL;
-	struct logsrv *log, *logb;
+	struct logger *log, *logb;
 	struct build_opts_str *bol, *bolb;
 	struct post_deinit_fct *pdf, *pdfb;
 	struct proxy_deinit_fct *pxdf, *pxdfb;
@@ -2864,9 +2868,9 @@ void deinit(void)
 	task_destroy(idle_conn_task);
 	idle_conn_task = NULL;
 
-	list_for_each_entry_safe(log, logb, &global.logsrvs, list) {
+	list_for_each_entry_safe(log, logb, &global.loggers, list) {
 		LIST_DEL_INIT(&log->list);
-		free_logsrv(log);
+		free_logger(log);
 	}
 
 	list_for_each_entry_safe(wl, wlb, &cfg_cfgfiles, list) {

@@ -2417,7 +2417,7 @@ int http_apply_redirect_rule(struct redirect_rule *rule, struct stream *s, struc
 	htx = htx_from_buf(&res->buf);
 	/* Trim any possible response */
 	channel_htx_truncate(&s->res, htx);
-	flags = (HTX_SL_F_IS_RESP|HTX_SL_F_VER_11|HTX_SL_F_XFER_LEN|HTX_SL_F_BODYLESS);
+	flags = (HTX_SL_F_IS_RESP|HTX_SL_F_VER_11|HTX_SL_F_XFER_LEN|HTX_SL_F_CLEN|HTX_SL_F_BODYLESS);
 	sl = htx_add_stline(htx, HTX_BLK_RES_SL, flags, ist("HTTP/1.1"), status, reason);
 	if (!sl)
 		goto fail;
@@ -4181,7 +4181,7 @@ void http_perform_server_redirect(struct stream *s, struct stconn *sc)
 	 * Create the 302 response
 	 */
 	htx = htx_from_buf(&res->buf);
-	flags = (HTX_SL_F_IS_RESP|HTX_SL_F_VER_11|HTX_SL_F_XFER_LEN|HTX_SL_F_BODYLESS);
+	flags = (HTX_SL_F_IS_RESP|HTX_SL_F_VER_11|HTX_SL_F_XFER_LEN|HTX_SL_F_CLEN|HTX_SL_F_BODYLESS);
 	sl = htx_add_stline(htx, HTX_BLK_RES_SL, flags,
 			    ist("HTTP/1.1"), ist("302"), ist("Found"));
 	if (!sl)
@@ -4314,7 +4314,7 @@ static void http_end_request(struct stream *s)
 		/* nothing else to forward, just waiting for the output buffer
 		 * to be empty and for the shut_wanted to take effect.
 		 */
-		if (channel_is_empty(chn)) {
+		if (!co_data(chn)) {
 			txn->req.msg_state = HTTP_MSG_CLOSED;
 			goto http_msg_closed;
 		}
@@ -4417,7 +4417,7 @@ static void http_end_response(struct stream *s)
 		/* nothing else to forward, just waiting for the output buffer
 		 * to be empty and for the shut_wanted to take effect.
 		 */
-		if (channel_is_empty(chn)) {
+		if (!co_data(chn)) {
 			txn->rsp.msg_state = HTTP_MSG_CLOSED;
 			goto http_msg_closed;
 		}

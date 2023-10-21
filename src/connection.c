@@ -78,7 +78,7 @@ struct conn_tlv_list *conn_get_tlv(struct connection *conn, int type)
  */
 void conn_delete_from_tree(struct connection *conn)
 {
-	LIST_DEL_INIT((struct list *)&conn->toremove_list);
+	LIST_DEL_INIT(&conn->idle_list);
 	eb64_delete(&conn->hash_node->node);
 }
 
@@ -188,7 +188,7 @@ int conn_notify_mux(struct connection *conn, int old_flags, int forced_wake)
 	     ((conn->flags ^ old_flags) & CO_FL_NOTIFY_DONE) ||
 	     ((old_flags & CO_FL_WAIT_XPRT) && !(conn->flags & CO_FL_WAIT_XPRT))) &&
 	    conn->mux && conn->mux->wake) {
-		uint conn_in_list = conn_get_idle_flag(conn);
+		uint conn_in_list = conn->flags & CO_FL_LIST_MASK;
 		struct server *srv = objt_server(conn->target);
 
 		if (conn_in_list) {
