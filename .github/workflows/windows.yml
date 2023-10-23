@@ -34,8 +34,8 @@ jobs:
           - USE_THREAD=1
           - USE_ZLIB=1
     steps:
-    - uses: actions/checkout@v4
-    - uses: msys2/setup-msys2@v2
+    - uses: actions/checkout@main
+    - uses: msys2/setup-msys2@dist
       with:
         install: >-
           coreutils
@@ -60,7 +60,7 @@ jobs:
           DEBUG="-DDEBUG_STRICT -DDEBUG_MEMORY_POOLS -DDEBUG_POOL_INTEGRITY" \
           ${{ join(matrix.FLAGS, ' ') }}
     - name: Upload a Build Artifact
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@main
       with:
         name: haproxy_win
         path: ./**.exe
