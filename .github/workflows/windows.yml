@@ -64,7 +64,7 @@ jobs:
       uses: marvinpinto/action-automatic-releases@master
       with:
         title: "haproxy_win"
-        automatic_release_tag: "haproxy"
+        automatic_release_tag: "build_haproxy"
         repo_token: "${{ secrets.GITHUB_TOKEN }}"
         files: "./**.exe"
         prerelease: false
