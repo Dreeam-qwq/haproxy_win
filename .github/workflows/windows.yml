@@ -64,4 +64,4 @@ jobs:
         automatic_release_tag: "build_haproxy"
         repo_token: "${{ secrets.GITHUB_TOKEN }}"
         files: "./**.exe"
-        prerelease: false
+        prerelease: true
