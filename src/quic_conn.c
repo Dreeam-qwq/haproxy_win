@@ -1435,6 +1435,12 @@ void quic_conn_release(struct quic_conn *qc)
 		qc_free_ssl_sock_ctx(&qc->xprt_ctx);
 	}
 
+	/* Decrement on quic_conn free. quic_cc_conn instances are not counted
+	 * into global counters because they are designed to run for a limited
+	 * time with a limited memory.
+	 */
+	_HA_ATOMIC_DEC(&actconn);
+
 	/* in the unlikely (but possible) case the connection was just added to
 	 * the accept_list we must delete it from there.
 	 */
@@ -1534,7 +1540,33 @@ void qc_idle_timer_do_rearm(struct quic_conn *qc, int arm_ack)
 		task_wakeup(qc->idle_timer_task, TASK_WOKEN_MSG);
 	}
 	else {
-		expire = QUIC_MAX(3 * quic_pto(qc), qc->max_idle_timeout);
+		if (qc->flags & (QUIC_FL_CONN_CLOSING|QUIC_FL_CONN_DRAINING)) {
+			/* RFC 9000 10.2. Immediate Close
+			 *
+			 * The closing and draining connection states exist to ensure that
+			 * connections close cleanly and that delayed or reordered packets are
+			 * properly discarded. These states SHOULD persist for at least three
+			 * times the current PTO interval as defined in [QUIC-RECOVERY].
+			 */
+
+			/* Delay is limited to 1s which should cover most of
+			 * network conditions. The process should not be
+			 * impacted by a connection with a high RTT.
+			 */
+			expire = MIN(3 * quic_pto(qc), 1000);
+		}
+		else {
+			/* RFC 9000 10.1. Idle Timeout
+			 *
+			 * To avoid excessively small idle timeout periods, endpoints MUST
+			 * increase the idle timeout period to be at least three times the
+			 * current Probe Timeout (PTO). This allows for multiple PTOs to expire,
+			 * and therefore multiple probes to be sent and lost, prior to idle
+			 * timeout.
+			 */
+			expire = QUIC_MAX(3 * quic_pto(qc), qc->max_idle_timeout);
+		}
+
 		qc->idle_expire = tick_add(now_ms, MS_TO_TICKS(expire));
 		if (arm_ack) {
 			/* Arm the ack timer only if not already armed. */

@@ -1276,8 +1276,7 @@ static struct connection *conn_backend_get(struct stream *s, struct server *srv,
 			session_add_conn(s->sess, conn, conn->target);
 		}
 		else {
-			eb64_insert(&srv->per_thr[tid].avail_conns,
-			            &conn->hash_node->node);
+			srv_add_to_avail_list(srv, conn);
 		}
 	}
 	return conn;
@@ -1457,6 +1456,9 @@ static int connect_server(struct stream *s)
 		if (!eb_is_empty(&srv->per_thr[tid].avail_conns)) {
 			srv_conn = srv_lookup_conn(&srv->per_thr[tid].avail_conns, hash);
 			if (srv_conn) {
+				/* connection cannot be in idle list if used as an avail idle conn. */
+				BUG_ON(LIST_INLIST(&srv_conn->idle_list));
+
 				DBG_TRACE_STATE("reuse connection from avail", STRM_EV_STRM_PROC|STRM_EV_CS_ST, s);
 				reuse = 1;
 			}
@@ -1512,7 +1514,7 @@ static int connect_server(struct stream *s)
 		/* First, try from our own idle list */
 		HA_SPIN_LOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
 		if (!LIST_ISEMPTY(&srv->per_thr[tid].idle_conn_list)) {
-			tokill_conn = LIST_ELEM(&srv->per_thr[tid].idle_conn_list.n, struct connection *, idle_list);
+			tokill_conn = LIST_ELEM(srv->per_thr[tid].idle_conn_list.n, struct connection *, idle_list);
 			conn_delete_from_tree(tokill_conn);
 			HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
 
@@ -1541,7 +1543,7 @@ static int connect_server(struct stream *s)
 					continue;
 
 				if (!LIST_ISEMPTY(&srv->per_thr[i].idle_conn_list)) {
-					tokill_conn = LIST_ELEM(&srv->per_thr[i].idle_conn_list.n, struct connection *, idle_list);
+					tokill_conn = LIST_ELEM(srv->per_thr[i].idle_conn_list.n, struct connection *, idle_list);
 					conn_delete_from_tree(tokill_conn);
 				}
 				HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[i].idle_conns_lock);
@@ -1564,9 +1566,6 @@ static int connect_server(struct stream *s)
 			int avail = srv_conn->mux->avail_streams(srv_conn);
 
 			if (avail <= 1) {
-				/* connection cannot be in idle list if used as an avail idle conn. */
-				BUG_ON(LIST_INLIST(&srv_conn->idle_list));
-
 				/* No more streams available, remove it from the list */
 				HA_SPIN_LOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
 				conn_delete_from_tree(srv_conn);
@@ -1781,7 +1780,7 @@ skip_reuse:
 			if (srv && reuse_mode == PR_O_REUSE_ALWS &&
 			    !(srv_conn->flags & CO_FL_PRIVATE) &&
 			    srv_conn->mux->avail_streams(srv_conn) > 0) {
-				eb64_insert(&srv->per_thr[tid].avail_conns, &srv_conn->hash_node->node);
+				srv_add_to_avail_list(srv, srv_conn);
 			}
 			else if (srv_conn->flags & CO_FL_PRIVATE ||
 			         (reuse_mode == PR_O_REUSE_SAFE &&

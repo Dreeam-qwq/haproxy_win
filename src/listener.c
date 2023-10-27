@@ -25,6 +25,7 @@
 #include <haproxy/errors.h>
 #include <haproxy/fd.h>
 #include <haproxy/freq_ctr.h>
+#include <haproxy/frontend.h>
 #include <haproxy/global.h>
 #include <haproxy/list.h>
 #include <haproxy/listener.h>
@@ -996,6 +997,12 @@ int listener_backlog(const struct listener *l)
 	return 1024;
 }
 
+/* Returns true if listener <l> must check maxconn limit prior to accept. */
+static inline int listener_uses_maxconn(const struct listener *l)
+{
+	return !(l->bind_conf->options & (BC_O_UNLIMITED|BC_O_XPRT_MAXCONN));
+}
+
 /* This function is called on a read event from a listening socket, corresponding
  * to an accept. It tries to accept as many connections as possible, and for each
  * calls the listener's accept handler (generally the frontend's accept handler).
@@ -1113,19 +1120,15 @@ void listener_accept(struct listener *l)
 			} while (!_HA_ATOMIC_CAS(&p->feconn, &count, next_feconn));
 		}
 
-		if (!(l->bind_conf->options & BC_O_UNLIMITED)) {
-			do {
-				count = actconn;
-				if (unlikely(count >= global.maxconn)) {
-					/* the process was marked full or another
-					 * thread is going to do it.
-					 */
-					next_actconn = 0;
-					expire = tick_add(now_ms, 1000); /* try again in 1 second */
-					goto limit_global;
-				}
-				next_actconn = count + 1;
-			} while (!_HA_ATOMIC_CAS(&actconn, (int *)(&count), next_actconn));
+		if (listener_uses_maxconn(l)) {
+			next_actconn = increment_actconn();
+			if (!next_actconn) {
+				/* the process was marked full or another
+				 * thread is going to do it.
+				 */
+				expire = tick_add(now_ms, 1000); /* try again in 1 second */
+				goto limit_global;
+			}
 		}
 
 		/* be careful below, the listener might be shutting down in
@@ -1149,7 +1152,7 @@ void listener_accept(struct listener *l)
 				_HA_ATOMIC_DEC(&l->nbconn);
 				if (p)
 					_HA_ATOMIC_DEC(&p->feconn);
-				if (!(l->bind_conf->options & BC_O_UNLIMITED))
+				if (listener_uses_maxconn(l))
 					_HA_ATOMIC_DEC(&actconn);
 				continue;
 
@@ -1583,7 +1586,7 @@ void listener_release(struct listener *l)
 {
 	struct proxy *fe = l->bind_conf->frontend;
 
-	if (!(l->bind_conf->options & BC_O_UNLIMITED))
+	if (listener_uses_maxconn(l))
 		_HA_ATOMIC_DEC(&actconn);
 	if (fe)
 		_HA_ATOMIC_DEC(&fe->feconn);

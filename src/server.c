@@ -2336,6 +2336,7 @@ void srv_settings_cpy(struct server *srv, const struct server *src, int srv_tmpl
 
 	if (srv_tmpl) {
 		srv->addr = src->addr;
+		srv->addr_proto = src->addr_proto;
 		srv->svc_port = src->svc_port;
 	}
 
@@ -2572,6 +2573,26 @@ struct server *srv_drop(struct server *srv)
 	return next;
 }
 
+/* Detach server from proxy list. It is supported to call this
+ * even if the server is not yet in the list
+ */
+static void _srv_detach(struct server *srv)
+{
+	struct proxy *be = srv->proxy;
+
+	if (be->srv == srv) {
+		be->srv = srv->next;
+	}
+	else {
+		struct server *prev;
+
+		for (prev = be->srv; prev && prev->next != srv; prev = prev->next)
+			;
+		if (prev)
+			prev->next = srv->next;
+	}
+}
+
 /* Remove a server <srv> from a tracking list if <srv> is tracking another
  * server. No special care is taken if <srv> is tracked itself by another one :
  * this situation should be avoided by the caller.
@@ -2706,6 +2727,93 @@ static int _srv_parse_tmpl_init(struct server *srv, struct proxy *px)
 	return i - srv->tmpl_info.nb_low;
 }
 
+/* Ensure server config will work with effective proxy mode
+ *
+ * This function is expected to be called after _srv_parse_init() initialization
+ * but only when the effective server's proxy mode is known, which is not always
+ * the case during parsing time, in which case the function will be called during
+ * postparsing thanks to the _srv_postparse() below.
+ *
+ * Returns ERR_NONE on success else a combination or ERR_CODE.
+ */
+static int _srv_check_proxy_mode(struct server *srv, char postparse)
+{
+	int err_code = ERR_NONE;
+
+	if (postparse && !(srv->proxy->cap & PR_CAP_LB))
+		return ERR_NONE; /* nothing to do, the check was already performed during parsing */
+
+	if (srv->conf.file)
+		set_usermsgs_ctx(srv->conf.file, srv->conf.line, NULL);
+
+	if (!srv->addr_proto) {
+		/* proto may not be set (ie: if srv_parse_init() was skipped or
+		 * SRV_PARSE_PARSE_ADDR was not set, in this case, we have nothing
+		 * to check
+		 */
+		goto out;
+	}
+	if (srv->proxy->mode == PR_MODE_SYSLOG) {
+		/* mode log enabled:
+		 * pre-resolve related log target from known infos
+		 */
+
+		BUG_ON(srv->log_target);
+		srv->log_target = malloc(sizeof(*srv->log_target));
+		if (!srv->log_target) {
+			ha_alert("memory error when allocating log server\n");
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+		srv->log_target->addr = &srv->addr;
+		switch (srv->addr_proto->xprt_type) {
+			case PROTO_TYPE_DGRAM:
+				srv->log_target->type = LOG_TARGET_DGRAM;
+				break;
+			case PROTO_TYPE_STREAM:
+				/* for now BUFFER type only supports TCP server to it's almost
+				 * explicit. This will require ring buffer creation during log
+				 * postresolving step.
+				 */
+				srv->log_target->type = LOG_TARGET_BUFFER;
+				break;
+			default:
+				ha_alert("log server type not supported for log backend server.\n");
+				err_code |= ERR_ALERT | ERR_FATAL;
+				break;
+		}
+	}
+	else {
+		/* for now, only TCP expected as srv's proto for other uses */
+		if (srv->addr_proto->xprt_type != PROTO_TYPE_STREAM || !srv->addr_proto->connect) {
+			ha_alert("unsupported protocol for server address in '%s' backend.\n", proxy_mode_str(srv->proxy->mode));
+			err_code |= ERR_ALERT | ERR_FATAL;
+		}
+	}
+ out:
+	if (srv->conf.file)
+		reset_usermsgs_ctx();
+
+	return err_code;
+}
+
+/* Perform some server postparsing checks / tasks:
+ * We must be careful that checks / postinits performed within this function
+ * don't depend or conflict with other postcheck functions that are registered
+ * using REGISTER_POST_SERVER_CHECK() hook.
+ *
+ * Returns ERR_NONE on success else a combination or ERR_CODE.
+ */
+static int _srv_postparse(struct server *srv)
+{
+	int err_code = ERR_NONE;
+
+	err_code |= _srv_check_proxy_mode(srv, 1);
+
+	return err_code;
+}
+REGISTER_POST_SERVER_CHECK(_srv_postparse);
+
 /* Allocate a new server pointed by <srv> and try to parse the first arguments
  * in <args> as an address for a server or an address-range for a template or
  * nothing for a default-server. <cur_arg> is incremented to the next argument.
@@ -2725,7 +2833,6 @@ static int _srv_parse_init(struct server **srv, char **args, int *cur_arg,
 	const char *err = NULL;
 	int err_code = 0;
 	char *fqdn = NULL;
-	struct protocol *proto;
 	int tmpl_range_low = 0, tmpl_range_high = 0;
 	char *errmsg = NULL;
 
@@ -2815,12 +2922,11 @@ static int _srv_parse_init(struct server **srv, char **args, int *cur_arg,
 		if (!(parse_flags & SRV_PARSE_PARSE_ADDR))
 			goto skip_addr;
 
-		sk = str2sa_range(args[*cur_arg], &port, &port1, &port2, NULL, &proto,
+		sk = str2sa_range(args[*cur_arg], &port, &port1, &port2, NULL, &newsrv->addr_proto,
 		                  &errmsg, NULL, &fqdn,
-		                  (parse_flags & SRV_PARSE_IN_LOG_BE ? PA_O_DGRAM : PA_O_CONNECT) |
 		                  (parse_flags & SRV_PARSE_INITIAL_RESOLVE ? PA_O_RESOLVE : 0) | PA_O_PORT_OK |
 				  (parse_flags & SRV_PARSE_IN_PEER_SECTION ? PA_O_PORT_MAND : PA_O_PORT_OFS) |
-				  PA_O_STREAM | PA_O_XPRT);
+				  PA_O_STREAM | PA_O_DGRAM | PA_O_XPRT);
 		if (!sk) {
 			ha_alert("%s\n", errmsg);
 			err_code |= ERR_ALERT | ERR_FATAL;
@@ -2855,35 +2961,6 @@ static int _srv_parse_init(struct server **srv, char **args, int *cur_arg,
 				         newsrv->id);
 				err_code |= ERR_ALERT | ERR_FATAL;
 				goto out;
-			}
-		}
-
-		if ((parse_flags & SRV_PARSE_IN_LOG_BE) && proto) {
-			/* mode log enabled, and found proto:
-			 * pre-resolve related log target from known infos
-			 */
-			newsrv->log_target = malloc(sizeof(*newsrv->log_target));
-			if (!newsrv->log_target) {
-				ha_alert("memory error when allocating log server\n");
-				err_code |= ERR_ALERT | ERR_FATAL;
-				goto out;
-			}
-			newsrv->log_target->addr = &newsrv->addr;
-			switch (proto->xprt_type) {
-				case PROTO_TYPE_DGRAM:
-					newsrv->log_target->type = LOG_TARGET_DGRAM;
-					break;
-				case PROTO_TYPE_STREAM:
-					/* for now BUFFER type only supports TCP server to it's almost
-					 * explicit. This will require ring buffer creation during log
-					 * postresolving step.
-					 */
-					newsrv->log_target->type = LOG_TARGET_BUFFER;
-					break;
-				default:
-					ha_alert("log server type not supported for log backend server.\n");
-					err_code |= ERR_ALERT | ERR_FATAL;
-					break;
 			}
 		}
 
@@ -2939,6 +3016,14 @@ static int _srv_parse_init(struct server **srv, char **args, int *cur_arg,
 	}
 
 	free(fqdn);
+	if (!(curproxy->cap & PR_CAP_LB)) {
+		/* No need to wait for effective proxy mode, it is already known:
+		 * Only general purpose user-declared proxies ("listen", "frontend", "backend")
+		 * offer the possibility to configure the mode of the proxy. Hopefully for us,
+		 * they have the PR_CAP_LB set.
+		 */
+		return _srv_check_proxy_mode(newsrv, 0);
+	}
 	return 0;
 
 out:
@@ -4944,7 +5029,12 @@ static int cli_parse_add_server(char **args, char *payload, struct appctx *appct
 	srv->init_addr_methods = SRV_IADDR_NONE;
 
 	if (srv->mux_proto) {
-		if (!conn_get_best_mux_entry(srv->mux_proto->token, PROTO_SIDE_BE, be->mode)) {
+		int proto_mode = conn_pr_mode_to_proto_mode(be->mode);
+		const struct mux_proto_list *mux_ent;
+
+		mux_ent = conn_get_best_mux_entry(srv->mux_proto->token, PROTO_SIDE_BE, proto_mode);
+
+		if (!mux_ent || !isteq(mux_ent->token, srv->mux_proto->token)) {
 			ha_alert("MUX protocol is not usable for server.\n");
 			goto out;
 		}
@@ -5111,17 +5201,7 @@ out:
 			free_check(&srv->agent);
 
 		/* remove the server from the proxy linked list */
-		if (be->srv == srv) {
-			be->srv = srv->next;
-		}
-		else {
-			struct server *prev;
-			for (prev = be->srv; prev && prev->next != srv; prev = prev->next)
-				;
-			if (prev)
-				prev->next = srv->next;
-		}
-
+		_srv_detach(srv);
 	}
 
 	thread_release();
@@ -5218,23 +5298,7 @@ static int cli_parse_delete_server(char **args, char *payload, struct appctx *ap
 	 * The proxy servers list is currently not protected by a lock, so this
 	 * requires thread_isolate/release.
 	 */
-
-	/* be->srv cannot be empty since we have already found the server with
-	 * get_backend_server */
-	BUG_ON(!be->srv);
-	if (be->srv == srv) {
-		be->srv = srv->next;
-	}
-	else {
-		struct server *next;
-		for (next = be->srv; srv != next->next; next = next->next) {
-			/* srv cannot be not found since we have already found
-			 * it with get_backend_server */
-			BUG_ON(!next);
-		}
-
-		next->next = srv->next;
-	}
+	_srv_detach(srv);
 
 	/* Some deleted servers could still point to us using their 'next',
 	 * update them as needed
@@ -5949,7 +6013,7 @@ static int srv_migrate_conns_to_remove(struct list *list, struct mt_list *toremo
 		if (toremove_nb != -1 && i >= toremove_nb)
 			break;
 
-		conn = LIST_ELEM(list->n, struct connection *, toremove_list);
+		conn = LIST_ELEM(list->n, struct connection *, idle_list);
 		conn_delete_from_tree(conn);
 		MT_LIST_APPEND(toremove_list, &conn->toremove_list);
 		i++;
@@ -6134,6 +6198,16 @@ int srv_add_to_idle_list(struct server *srv, struct connection *conn, int is_saf
 		return 1;
 	}
 	return 0;
+}
+
+/* Insert <conn> connection in <srv> server available list. This is reserved
+ * for backend connection currently in used with usable streams left.
+ */
+void srv_add_to_avail_list(struct server *srv, struct connection *conn)
+{
+	/* connection cannot be in idle list if used as an avail idle conn. */
+	BUG_ON(LIST_INLIST(&conn->idle_list));
+	eb64_insert(&srv->per_thr[tid].avail_conns, &conn->hash_node->node);
 }
 
 struct task *srv_cleanup_idle_conns(struct task *task, void *context, unsigned int state)
