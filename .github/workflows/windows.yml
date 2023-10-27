@@ -59,8 +59,12 @@ jobs:
           CC=${{ matrix.CC }} \
           DEBUG="-DDEBUG_STRICT -DDEBUG_MEMORY_POOLS -DDEBUG_POOL_INTEGRITY" \
           ${{ join(matrix.FLAGS, ' ') }}
-    - name: Upload a Build Artifact
-      uses: actions/upload-artifact@main
-      with:
-        name: haproxy_win
-        path: ./**.exe
+
+      - name: Release haproxy Windows
+        uses: marvinpinto/action-automatic-releases@master
+        with:
+          title: "haproxy_win"
+          automatic_release_tag: "haproxy"
+          repo_token: "${{ secrets.GITHUB_TOKEN }}"
+          files: "./**.exe"
+          prerelease: false
