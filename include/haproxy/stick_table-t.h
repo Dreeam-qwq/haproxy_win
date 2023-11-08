@@ -127,6 +127,7 @@ struct stktable_data_type {
 	int arg_type;     /* type of optional argument, ARG_T_* */
 	uint is_array:1;  /* this is an array of gpc/gpt */
 	uint is_local:1;  /* this is local only and never learned */
+	uint as_is:1;     /* cannot be processed / used with arithmetic operations */
 };
 
 /* stick table keyword type */
@@ -187,6 +188,11 @@ struct stktable {
 		void *p;
 	} data_arg[STKTABLE_DATA_TYPES]; /* optional argument of each data type */
 	struct proxy *proxy;      /* The proxy this stick-table is attached to, if any.*/
+	union {
+		char *name;         /* preparsing hint */
+		struct stktable *t; /* postparsing */
+		void *ptr;          /* generic ptr to check if set or not */
+	} write_to; /* updates received on the source table will also update write_to */
 
 	THREAD_ALIGN(64);
 

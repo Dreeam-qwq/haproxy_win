@@ -3243,71 +3243,22 @@ init_proxies_list_stage1:
 
 		/* find the target table for 'stick' rules */
 		list_for_each_entry(mrule, &curproxy->sticking_rules, list) {
-			struct stktable *target;
-
 			curproxy->be_req_ana |= AN_REQ_STICKING_RULES;
 			if (mrule->flags & STK_IS_STORE)
 				curproxy->be_rsp_ana |= AN_RES_STORE_RULES;
 
-			if (mrule->table.name)
-				target = stktable_find_by_name(mrule->table.name);
-			else
-				target = curproxy->table;
+			if (!resolve_stick_rule(curproxy, mrule))
+				cfgerr++;
 
-			if (!target) {
-				ha_alert("Proxy '%s': unable to find stick-table '%s'.\n",
-					 curproxy->id, mrule->table.name ? mrule->table.name : curproxy->id);
-				cfgerr++;
-			}
-			else if (!stktable_compatible_sample(mrule->expr,  target->type)) {
-				ha_alert("Proxy '%s': type of fetch not usable with type of stick-table '%s'.\n",
-					 curproxy->id, mrule->table.name ? mrule->table.name : curproxy->id);
-				cfgerr++;
-			}
-			else {
-				ha_free(&mrule->table.name);
-				mrule->table.t = target;
-				stktable_alloc_data_type(target, STKTABLE_DT_SERVER_ID, NULL, NULL);
-				stktable_alloc_data_type(target, STKTABLE_DT_SERVER_KEY, NULL, NULL);
-				if (!in_proxies_list(target->proxies_list, curproxy)) {
-					curproxy->next_stkt_ref = target->proxies_list;
-					target->proxies_list = curproxy;
-				}
-			}
 			err_code |= warnif_tcp_http_cond(curproxy, mrule->cond);
 		}
 
 		/* find the target table for 'store response' rules */
 		list_for_each_entry(mrule, &curproxy->storersp_rules, list) {
-			struct stktable *target;
-
 			curproxy->be_rsp_ana |= AN_RES_STORE_RULES;
 
-			if (mrule->table.name)
-				target = stktable_find_by_name(mrule->table.name);
-			else
-				target = curproxy->table;
-
-			if (!target) {
-				ha_alert("Proxy '%s': unable to find store table '%s'.\n",
-					 curproxy->id, mrule->table.name ? mrule->table.name : curproxy->id);
+			if (!resolve_stick_rule(curproxy, mrule))
 				cfgerr++;
-			}
-			else if (!stktable_compatible_sample(mrule->expr, target->type)) {
-				ha_alert("Proxy '%s': type of fetch not usable with type of stick-table '%s'.\n",
-					 curproxy->id, mrule->table.name ? mrule->table.name : curproxy->id);
-				cfgerr++;
-			}
-			else {
-				ha_free(&mrule->table.name);
-				mrule->table.t = target;
-				stktable_alloc_data_type(target, STKTABLE_DT_SERVER_ID, NULL, NULL);
-				stktable_alloc_data_type(target, STKTABLE_DT_SERVER_KEY, NULL, NULL);
-				if (!in_proxies_list(target->proxies_list, curproxy)) {
-					curproxy->next_stkt_ref = target->proxies_list;
-					target->proxies_list = curproxy;
-				}
-			}
 		}
 
 		/* check validity for 'tcp-request' layer 4/5/6/7 rules */
@@ -4447,8 +4398,10 @@ init_proxies_list_stage2:
 	for (t = stktables_list; t; t = t->next) {
 		if (t->proxy)
 			continue;
-		if (!stktable_init(t)) {
-			ha_alert("Proxy '%s': failed to initialize stick-table.\n", t->id);
+		err = NULL;
+		if (!stktable_init(t, &err)) {
+			ha_alert("Parsing [%s:%d]: failed to initialize '%s' stick-table: %s.\n", t->conf.file, t->conf.line, t->id, err);
+			ha_free(&err);
 			cfgerr++;
 		}
 	}
@@ -4461,8 +4414,10 @@ init_proxies_list_stage2:
 		if ((curproxy->flags & PR_FL_DISABLED) || !curproxy->table)
 			continue;
 
-		if (!stktable_init(curproxy->table)) {
-			ha_alert("Proxy '%s': failed to initialize stick-table.\n", curproxy->id);
+		err = NULL;
+		if (!stktable_init(curproxy->table, &err)) {
+			ha_alert("Proxy '%s': failed to initialize stick-table: %s.\n", curproxy->id, err);
+			ha_free(&err);
 			cfgerr++;
 		}
 	}

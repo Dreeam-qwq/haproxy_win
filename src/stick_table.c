@@ -794,8 +794,13 @@ out_unlock:
 	return task;
 }
 
-/* Perform minimal stick table intializations, report 0 in case of error, 1 if OK. */
-int stktable_init(struct stktable *t)
+/* Perform minimal stick table initialization. In case of error, the
+ * function will return 0 and <err_msg> will contain hints about the
+ * error and it is up to the caller to free it.
+ *
+ * Returns 1 on success
+ */
+int stktable_init(struct stktable *t, char **err_msg)
 {
 	int peers_retval = 0;
 
@@ -812,7 +817,7 @@ int stktable_init(struct stktable *t)
 		if ( t->expire ) {
 			t->exp_task = task_new_anywhere();
 			if (!t->exp_task)
-				return 0;
+				goto mem_error;
 			t->exp_task->process = process_table_expire;
 			t->exp_task->context = (void *)t;
 		}
@@ -820,9 +825,44 @@ int stktable_init(struct stktable *t)
 			peers_retval = peers_register_table(t->peers.p, t);
 		}
 
-		return (t->pool != NULL) && !peers_retval;
+		if (t->pool == NULL || peers_retval)
+			goto mem_error;
+	}
+	if (t->write_to.name) {
+		struct stktable *table;
+
+		/* postresolve write_to table */
+		table = stktable_find_by_name(t->write_to.name);
+		if (!table) {
+			memprintf(err_msg, "write-to: table '%s' doesn't exist", t->write_to.name);
+			ha_free(&t->write_to.name); /* no longer need this */
+			return 0;
+		}
+		ha_free(&t->write_to.name); /* no longer need this */
+		if (table->write_to.ptr) {
+			memprintf(err_msg, "write-to: table '%s' is already used as a source table", table->id);
+			return 0;
+		}
+		if (table->type != t->type) {
+			memprintf(err_msg, "write-to: cannot mix table types ('%s' has '%s' type and '%s' has '%s' type)",
+			          table->id, stktable_types[table->type].kw,
+			          t->id, stktable_types[t->type].kw);
+			return 0;
+		}
+		if (table->key_size != t->key_size) {
+			memprintf(err_msg, "write-to: cannot mix key sizes ('%s' has '%ld' key_size and '%s' has '%ld' key_size)",
+			          table->id, (long)table->key_size,
+			          t->id, (long)t->key_size);
+			return 0;
+		}
+
+		t->write_to.t = table;
 	}
 	return 1;
+
+ mem_error:
+	memprintf(err_msg, "memory allocation error");
+	return 0;
 }
 
 /*
@@ -966,6 +1006,7 @@ int parse_stick_table(const char *file, int linenum, char **args,
 	t->type = (unsigned int)-1;
 	t->conf.file = file;
 	t->conf.line = linenum;
+	t->write_to.name = NULL;
 
 	while (*args[idx]) {
 		const char *err;
@@ -995,6 +1036,7 @@ int parse_stick_table(const char *file, int linenum, char **args,
 				err_code |= ERR_ALERT | ERR_FATAL;
 				goto out;
 			}
+			ha_free(&t->peers.name);
 			t->peers.name = strdup(args[idx++]);
 		}
 		else if (strcmp(args[idx], "expire") == 0) {
@@ -1153,6 +1195,22 @@ int parse_stick_table(const char *file, int linenum, char **args,
 			}
 			idx++;
 		}
+		else if (strcmp(args[idx], "write-to") == 0) {
+			char *write_to;
+
+			idx++;
+			write_to = args[idx];
+			if (!write_to[0]) {
+				ha_alert("parsing [%s:%d] : %s : write-to requires table name.\n",
+						file, linenum, args[0]);
+				err_code |= ERR_ALERT | ERR_FATAL;
+				goto out;
+
+			}
+			ha_free(&t->write_to.name);
+			t->write_to.name = strdup(write_to);
+			idx++;
+		}
 		else {
 			ha_alert("parsing [%s:%d] : %s: unknown argument '%s'.\n",
 				 file, linenum, args[0], args[idx]);
@@ -1305,8 +1363,8 @@ int stktable_compatible_sample(struct sample_expr *expr, unsigned long table_typ
  * at run time.
  */
 struct stktable_data_type stktable_data_types[STKTABLE_DATA_TYPES] = {
-	[STKTABLE_DT_SERVER_ID]     = { .name = "server_id",      .std_type = STD_T_SINT  },
-	[STKTABLE_DT_GPT0]          = { .name = "gpt0",           .std_type = STD_T_UINT  },
+	[STKTABLE_DT_SERVER_ID]     = { .name = "server_id",      .std_type = STD_T_SINT, .as_is = 1  },
+	[STKTABLE_DT_GPT0]          = { .name = "gpt0",           .std_type = STD_T_UINT, .as_is = 1  },
 	[STKTABLE_DT_GPC0]          = { .name = "gpc0",           .std_type = STD_T_UINT  },
 	[STKTABLE_DT_GPC0_RATE]     = { .name = "gpc0_rate",      .std_type = STD_T_FRQP, .arg_type = ARG_T_DELAY  },
 	[STKTABLE_DT_CONN_CNT]      = { .name = "conn_cnt",       .std_type = STD_T_UINT  },
@@ -1324,10 +1382,10 @@ struct stktable_data_type stktable_data_types[STKTABLE_DATA_TYPES] = {
 	[STKTABLE_DT_BYTES_OUT_RATE]= { .name = "bytes_out_rate", .std_type = STD_T_FRQP, .arg_type = ARG_T_DELAY },
 	[STKTABLE_DT_GPC1]          = { .name = "gpc1",           .std_type = STD_T_UINT  },
 	[STKTABLE_DT_GPC1_RATE]     = { .name = "gpc1_rate",      .std_type = STD_T_FRQP, .arg_type = ARG_T_DELAY  },
-	[STKTABLE_DT_SERVER_KEY]    = { .name = "server_key",     .std_type = STD_T_DICT  },
+	[STKTABLE_DT_SERVER_KEY]    = { .name = "server_key",     .std_type = STD_T_DICT, .as_is = 1  },
 	[STKTABLE_DT_HTTP_FAIL_CNT] = { .name = "http_fail_cnt",  .std_type = STD_T_UINT  },
 	[STKTABLE_DT_HTTP_FAIL_RATE]= { .name = "http_fail_rate", .std_type = STD_T_FRQP, .arg_type = ARG_T_DELAY  },
-	[STKTABLE_DT_GPT]           = { .name = "gpt",            .std_type = STD_T_UINT, .is_array = 1 },
+	[STKTABLE_DT_GPT]           = { .name = "gpt",            .std_type = STD_T_UINT, .is_array = 1, .as_is = 1  },
 	[STKTABLE_DT_GPC]           = { .name = "gpc",            .std_type = STD_T_UINT, .is_array = 1 },
 	[STKTABLE_DT_GPC_RATE]      = { .name = "gpc_rate",       .std_type = STD_T_FRQP, .is_array = 1, .arg_type = ARG_T_DELAY },
 };
@@ -4832,8 +4890,7 @@ static int table_process_entry_per_key(struct appctx *appctx, char **args)
 	struct show_table_ctx *ctx = appctx->svcctx;
 	struct stktable *t = ctx->target;
 	struct stksess *ts;
-	uint32_t uint32_key;
-	unsigned char ip6_key[sizeof(struct in6_addr)];
+	struct sample key;
 	long long value;
 	int data_type;
 	int cur_arg;
@@ -4843,34 +4900,23 @@ static int table_process_entry_per_key(struct appctx *appctx, char **args)
 	if (!*args[4])
 		return cli_err(appctx, "Key value expected\n");
 
+	memset(&key, 0, sizeof(key));
+	key.data.type = SMP_T_STR;
+	key.data.u.str.area = args[4];
+	key.data.u.str.data = strlen(args[4]);
+
 	switch (t->type) {
 	case SMP_T_IPV4:
-		uint32_key = htonl(inetaddr_host(args[4]));
-		static_table_key.key = &uint32_key;
-		break;
 	case SMP_T_IPV6:
-		if (inet_pton(AF_INET6, args[4], ip6_key) <= 0)
+		/* prefer input format over table type when parsing ip addresses,
+		 * then let smp_to_stkey() do the conversion for us when needed
+		 */
+		BUG_ON(!sample_casts[key.data.type][SMP_T_ADDR]);
+		if (!sample_casts[key.data.type][SMP_T_ADDR](&key))
 			return cli_err(appctx, "Invalid key\n");
-		static_table_key.key = &ip6_key;
 		break;
 	case SMP_T_SINT:
-		{
-			char *endptr;
-			unsigned long val;
-			errno = 0;
-			val = strtoul(args[4], &endptr, 10);
-			if ((errno == ERANGE && val == ULONG_MAX) ||
-			    (errno != 0 && val == 0) || endptr == args[4] ||
-			    val > 0xffffffff)
-				return cli_err(appctx, "Invalid key\n");
-			uint32_key = (uint32_t) val;
-			static_table_key.key = &uint32_key;
-			break;
-		}
-		break;
 	case SMP_T_STR:
-		static_table_key.key = args[4];
-		static_table_key.key_len = strlen(args[4]);
 		break;
 	default:
 		switch (ctx->action) {
@@ -4884,6 +4930,12 @@ static int table_process_entry_per_key(struct appctx *appctx, char **args)
 			return cli_err(appctx, "Unknown action\n");
 		}
 	}
+
+	/* try to convert key according to table type
+	 * (it will fill static_table_key on success)
+	 */
+	if (!smp_to_stkey(&key, t))
+		return cli_err(appctx, "Invalid key\n");
 
 	/* check permissions */
 	if (!cli_has_level(appctx, ACCESS_LVL_OPER))

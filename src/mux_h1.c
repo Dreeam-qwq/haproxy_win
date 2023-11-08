@@ -573,6 +573,12 @@ static void h1_refresh_timeout(struct h1c *h1c)
 			h1c->task->expire = tick_add(now_ms, h1c->timeout);
 			TRACE_DEVEL("refreshing connection's timeout (pending outgoing data)", H1_EV_H1C_SEND|H1_EV_H1C_RECV, h1c->conn);
 		}
+		else if (!(h1c->flags & H1C_F_IS_BACK) && (h1c->state == H1_CS_IDLE)) {
+			/* idle front connections. */
+			h1c->task->expire = (tick_isset(h1c->idle_exp) ? h1c->idle_exp : tick_add(now_ms, h1c->timeout));
+			TRACE_DEVEL("refreshing connection's timeout (idle front h1c)", H1_EV_H1C_SEND|H1_EV_H1C_RECV, h1c->conn);
+			is_idle_conn = 1;
+		}
 		else if (!(h1c->flags & H1C_F_IS_BACK) && (h1c->state != H1_CS_RUNNING)) {
 			/* alive front connections waiting for a fully usable stream need a timeout. */
 			h1c->task->expire = tick_add(now_ms, h1c->timeout);
@@ -4424,7 +4430,7 @@ static size_t h1_nego_ff(struct stconn *sc, struct buffer *input, size_t count, 
 	 */
 	if (!b_data(input) && !b_data(&h1c->obuf) && may_splice) {
 #if defined(USE_LINUX_SPLICE)
-		if (h1s->sd->iobuf.pipe || (pipes_used < global.maxpipes && (h1s->sd->iobuf.pipe = get_pipe()))) {
+		if (h1c->conn->xprt->snd_pipe && (h1s->sd->iobuf.pipe || (pipes_used < global.maxpipes && (h1s->sd->iobuf.pipe = get_pipe())))) {
 			h1s->sd->iobuf.offset = 0;
 			h1s->sd->iobuf.data = 0;
 			ret = count;
@@ -4479,7 +4485,7 @@ static size_t h1_nego_ff(struct stconn *sc, struct buffer *input, size_t count, 
 	return ret;
 }
 
-static void h1_done_ff(struct stconn *sc)
+static size_t h1_done_ff(struct stconn *sc)
 {
 	struct h1s *h1s = __sc_mux_strm(sc);
 	struct h1c *h1c = h1s->h1c;
@@ -4546,6 +4552,7 @@ static void h1_done_ff(struct stconn *sc)
 	}
 
 	TRACE_LEAVE(H1_EV_STRM_RECV, h1c->conn, h1s, 0, (size_t[]){total});
+	return total;
 }
 
 static int h1_fastfwd(struct stconn *sc, unsigned int count, unsigned int flags)
@@ -4584,11 +4591,13 @@ static int h1_fastfwd(struct stconn *sc, unsigned int count, unsigned int flags)
 	if (h1m->state == H1_MSG_DATA && (h1m->flags & (H1_MF_CHNK|H1_MF_CLEN)) &&  count > h1m->curr_len)
 		count = h1m->curr_len;
 
-	try = se_nego_ff(sdo, &h1c->ibuf, count, !!(flags & CO_RFL_MAY_SPLICE) && !(sdo->iobuf.flags & IOBUF_FL_NO_SPLICING));
+	try = se_nego_ff(sdo, &h1c->ibuf, count, h1c->conn->xprt->rcv_pipe && !!(flags & CO_RFL_MAY_SPLICE) && !(sdo->iobuf.flags & IOBUF_FL_NO_SPLICING));
 	if (b_room(&h1c->ibuf) && (h1c->flags & H1C_F_IN_FULL)) {
 		h1c->flags &= ~H1C_F_IN_FULL;
 		TRACE_STATE("h1c ibuf not full anymore", H1_EV_STRM_RECV|H1_EV_H1C_BLK);
 	}
+	if (!b_data(&h1c->ibuf))
+		h1_release_buf(h1c, &h1c->ibuf);
 
 	if (sdo->iobuf.flags & IOBUF_FL_NO_FF) {
 		/* Fast forwading is not supported by the consumer */

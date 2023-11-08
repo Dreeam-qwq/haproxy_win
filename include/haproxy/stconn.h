@@ -132,41 +132,6 @@ static inline size_t se_ff_data(struct sedesc *se)
 	return (se->iobuf.data + (se->iobuf.pipe ? se->iobuf.pipe->data : 0));
 }
 
-static inline size_t se_nego_ff(struct sedesc *se, struct buffer *input, size_t count, unsigned int may_splice)
-{
-	size_t ret = 0;
-
-	if (se_fl_test(se, SE_FL_T_MUX)) {
-		const struct mux_ops *mux = se->conn->mux;
-
-		se->iobuf.flags &= ~IOBUF_FL_FF_BLOCKED;
-		if (mux->nego_fastfwd && mux->done_fastfwd) {
-			ret = mux->nego_fastfwd(se->sc, input, count, may_splice);
-			if ((se->iobuf.flags & IOBUF_FL_FF_BLOCKED) && !(se->sc->wait_event.events & SUB_RETRY_SEND)) {
-				/* The SC must be subs for send to be notify when some
-				 * space is made
-				 */
-				mux->subscribe(se->sc, SUB_RETRY_SEND, &se->sc->wait_event);
-			}
-			goto end;
-		}
-	}
-	se->iobuf.flags |= IOBUF_FL_NO_FF;
-
-  end:
-	return ret;
-}
-
-static inline void se_done_ff(struct sedesc *se)
-{
-	if (se_fl_test(se, SE_FL_T_MUX)) {
-		const struct mux_ops *mux = se->conn->mux;
-
-		BUG_ON(!mux->done_fastfwd);
-		mux->done_fastfwd(se->sc);
-	}
-}
-
 /* stream connector version */
 static forceinline void sc_ep_zero(struct stconn *sc)
 {
@@ -243,20 +208,6 @@ static forceinline unsigned int sc_ep_have_ff_data(struct stconn *sc)
 static forceinline size_t sc_ep_ff_data(struct stconn *sc)
 {
 	return se_ff_data(sc->sedesc);
-}
-
-static forceinline int sc_ep_rcv_ex(const struct stconn *sc)
-{
-	return (tick_isset(sc->sedesc->lra)
-		? tick_add_ifset(sc->sedesc->lra, sc->ioto)
-		: TICK_ETERNITY);
-}
-
-static forceinline int sc_ep_snd_ex(const struct stconn *sc)
-{
-	return (tick_isset(sc->sedesc->fsb)
-		? tick_add_ifset(sc->sedesc->fsb, sc->ioto)
-		: TICK_ETERNITY);
 }
 
 /* Returns the stream endpoint from an connector, without any control */
@@ -506,13 +457,13 @@ static inline void sc_have_room(struct stconn *sc)
  * SE_FL_HAVE_NO_DATA to be called again as soon as SC_FL_NEED_ROOM is cleared.
  *
  * The caller is responsible to specified the amount of free space required to
- * progress. However, to be sure the SC can be unblocked a max value cannot be
- * eceeded : (BUFSIZE - RESERVE - HTX OVERHEAD)
+ * progress. It must take care to not exceed the buffer size.
  */
 static inline void sc_need_room(struct stconn *sc, ssize_t room_needed)
 {
 	sc->flags |= SC_FL_NEED_ROOM;
-	sc->room_needed = MIN((ssize_t)(global.tune.bufsize - global.tune.maxrewrite - sizeof(struct htx)), room_needed);
+	BUG_ON_HOT(room_needed > (ssize_t)global.tune.bufsize);
+	sc->room_needed = room_needed;
 }
 
 /* The stream endpoint indicates that it's ready to consume data from the
@@ -542,6 +493,47 @@ static inline void se_need_more_data(struct sedesc *se)
 {
 	se_will_consume(se);
 	se_fl_set(se, SE_FL_WAIT_DATA);
+}
+
+
+static inline size_t se_nego_ff(struct sedesc *se, struct buffer *input, size_t count, unsigned int may_splice)
+{
+	size_t ret = 0;
+
+	if (se_fl_test(se, SE_FL_T_MUX)) {
+		const struct mux_ops *mux = se->conn->mux;
+
+		se->iobuf.flags &= ~IOBUF_FL_FF_BLOCKED;
+		if (mux->nego_fastfwd && mux->done_fastfwd) {
+			ret = mux->nego_fastfwd(se->sc, input, count, may_splice);
+			if ((se->iobuf.flags & IOBUF_FL_FF_BLOCKED) && !(se->sc->wait_event.events & SUB_RETRY_SEND)) {
+				/* The SC must be subs for send to be notify when some
+				 * space is made
+				 */
+				mux->subscribe(se->sc, SUB_RETRY_SEND, &se->sc->wait_event);
+			}
+			goto end;
+		}
+	}
+	se->iobuf.flags |= IOBUF_FL_NO_FF;
+
+  end:
+	return ret;
+}
+
+static inline void se_done_ff(struct sedesc *se)
+{
+	if (se_fl_test(se, SE_FL_T_MUX)) {
+		const struct mux_ops *mux = se->conn->mux;
+		size_t sent, to_send = se_ff_data(se);
+
+		BUG_ON(!mux->done_fastfwd);
+		sent = mux->done_fastfwd(se->sc);
+		if (sent > 0)
+			sc_ep_report_send_activity(se->sc);
+		else if (to_send > 0) /* implies sent == 0 */
+			sc_ep_report_blocked_send(se->sc);
+	}
 }
 
 #endif /* _HAPROXY_STCONN_H */
