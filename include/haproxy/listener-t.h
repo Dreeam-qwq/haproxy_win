@@ -186,6 +186,7 @@ struct bind_conf {
 #ifdef USE_QUIC
 	struct quic_transport_params quic_params; /* QUIC transport parameters. */
 	struct quic_cc_algo *quic_cc_algo; /* QUIC control congestion algorithm */
+	size_t max_cwnd;                   /* QUIC maximumu congestion control window size (kB) */
 	enum quic_sock_mode quic_mode;     /* QUIC socket allocation strategy */
 #endif
 	struct proxy *frontend;    /* the frontend all these listeners belong to, or NULL */
@@ -209,8 +210,8 @@ struct bind_conf {
 	char *arg;                 /* argument passed to "bind" for better error reporting */
 	char *file;                /* file where the section appears */
 	int line;                  /* line where the section appears */
-	char *reverse_srvname;     /* name of server when using "rhttp@" address */
-	int reverse_nbconn;        /* count of connections to initiate in parallel */
+	char *rhttp_srvname;       /* name of server when using "rhttp@" address */
+	int rhttp_nbconn;          /* count of connections to initiate in parallel */
 	__decl_thread(HA_RWLOCK_T sni_lock); /* lock the SNI trees during add/del operations */
 	struct thread_set thread_set; /* entire set of the allowed threads (0=no restriction) */
 	struct rx_settings settings; /* all the settings needed for the listening socket */

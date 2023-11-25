@@ -1087,7 +1087,8 @@ Proxy class
 
 .. js:attribute:: Proxy.stktable
 
-  Contains a stick table object attached to the proxy.
+  Contains a stick table object of type :ref:`sticktable_class` attached to the
+  proxy.
 
 .. js:attribute:: Proxy.listeners
 
@@ -1139,7 +1140,7 @@ Proxy class
 
   :param class_proxy px: A :ref:`proxy_class` which indicates the manipulated
    proxy.
-  :returns: a string "tcp", "http", "health" or "unknown"
+  :returns: a string "tcp", "http", "syslog" or "unknown"
 
 .. js:function:: Proxy.get_srv_act(px)
 
@@ -3729,6 +3730,8 @@ AppletTCP class
    syntax.
   :see: :js:func:`AppletTCP.unset_var`
   :see: :js:func:`AppletTCP.set_var`
+
+.. _sticktable_class:
 
 StickTable class
 ================

@@ -234,6 +234,7 @@ void sock_unbind(struct receiver *rx)
 {
 	/* There are a number of situations where we prefer to keep the FD and
 	 * not to close it (unless we're stopping, of course):
+	 *   - worker process unbinding from a worker's non-suspendable FD (ABNS) => close
 	 *   - worker process unbinding from a worker's FD with socket transfer enabled => keep
 	 *   - master process unbinding from a master's inherited FD => keep
 	 *   - master process unbinding from a master's FD => close
@@ -247,6 +248,7 @@ void sock_unbind(struct receiver *rx)
 
 	if (!stopping && !master &&
 	    !(rx->flags & RX_F_MWORKER) &&
+	    !(rx->flags & RX_F_NON_SUSPENDABLE) &&
 	    (global.tune.options & GTUNE_SOCKET_TRANSFER))
 		return;
 
@@ -894,6 +896,14 @@ void sock_conn_iocb(int fd)
 	if (unlikely(conn->flags & CO_FL_ERROR)) {
 		if (conn_ctrl_ready(conn))
 			fd_stop_both(fd);
+
+		if (conn->subs) {
+			t = conn->subs->tasklet;
+			conn->subs->events = 0;
+			if (!conn->subs->events)
+				conn->subs = NULL;
+			tasklet_wakeup(t);
+		}
 	}
 }
 

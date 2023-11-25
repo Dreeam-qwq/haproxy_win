@@ -85,7 +85,7 @@
 #define GTUNE_LISTENER_MQ_OPT    (1<<28)
 #define GTUNE_LISTENER_MQ_ANY    (GTUNE_LISTENER_MQ_FAIR | GTUNE_LISTENER_MQ_OPT)
 
-extern int cluster_secret_isset; /* non zero means a cluster secret was initiliazed */
+extern int cluster_secret_isset; /* non zero means a cluster secret was initialized */
 
 /* SSL server verify mode */
 enum {
@@ -105,7 +105,7 @@ struct proxy;
 struct global {
 	int uid;
 	int gid;
-	int external_check;
+	int external_check;             /* 0=disabled, 1=enabled, 2=enabled with env */
 	int nbthread;
 	int mode;
 	unsigned int hard_stop_after;	/* maximum time allowed to perform a soft-stop */

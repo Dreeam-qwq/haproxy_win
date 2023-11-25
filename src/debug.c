@@ -18,8 +18,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <syslog.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/utsname.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #ifdef USE_EPOLL
@@ -65,6 +67,73 @@
 #define THREAD_DUMP_TMASK     0x00007FFFU
 #define THREAD_DUMP_FSYNC     0x00008000U
 #define THREAD_DUMP_PMASK     0x7FFF0000U
+
+/* Description of a component with name, version, path, build options etc. E.g.
+ * one of them is haproxy. Others might be some clearly identified shared libs.
+ * They're intentionally self-contained and to be placed into an array to make
+ * it easier to find them in a core. The important fields (name and version)
+ * are locally allocated, other ones are dynamic.
+ */
+struct post_mortem_component {
+	char name[32];           // symbolic short name
+	char version[32];        // exact version
+	char *toolchain;         // compiler and version (e.g. gcc-11.4.0)
+	char *toolchain_opts;    // optims, arch-specific options (e.g. CFLAGS)
+	char *build_settings;    // build options (e.g. USE_*, TARGET, etc)
+	char *path;              // path if known.
+};
+
+/* This is a collection of information that are centralized to help with core
+ * dump analysis. It must be used with a public variable and gather elements
+ * as much as possible without dereferences so that even when identified in a
+ * core dump it's possible to get the most out of it even if the core file is
+ * not much exploitable. It's aligned to 256 so that it's easy to spot, given
+ * that being that large it will not change its size much.
+ */
+struct post_mortem {
+	/* platform-specific information */
+	struct {
+		struct utsname utsname; // OS name+ver+arch+hostname
+		char hw_vendor[64];     // hardware/hypervisor vendor when known
+		char hw_family[64];     // hardware/hypervisor product family when known
+		char hw_model[64];      // hardware/hypervisor product/model when known
+		char brd_vendor[64];    // mainboard vendor when known
+		char brd_model[64];     // mainboard model when known
+		char soc_vendor[64];    // SoC/CPU vendor from cpuinfo
+		char soc_model[64];     // SoC model when known and relevant
+		char cpu_model[64];     // CPU model when different from SoC
+		char virt_techno[16];   // when provided by cpuid
+		char cont_techno[16];   // empty, "no", "yes", "docker" or others
+	} platform;
+
+	/* process-specific information */
+	struct {
+		pid_t pid;
+		uid_t boot_uid;
+		gid_t boot_gid;
+		struct rlimit limit_fd;  // RLIMIT_NOFILE
+		struct rlimit limit_ram; // RLIMIT_AS or RLIMIT_DATA
+
+#if defined(USE_THREAD)
+		struct {
+			ullong pth_id;   // pthread_t cast to a ullong
+			void *stack_top; // top of the stack
+		} thread_info[MAX_THREADS];
+#endif
+	} process;
+
+#if defined(HA_HAVE_DUMP_LIBS)
+	/* information about dynamic shared libraries involved */
+	char *libs;                      // dump of one addr / path per line, or NULL
+#endif
+
+	/* info about identified distinct components (executable, shared libs, etc).
+	 * These can be all listed at once in gdb using:
+	 *    p *post_mortem.components@post_mortem.nb_components
+	 */
+	uint nb_components;              // # of components below
+	struct post_mortem_component *components; // NULL or array
+} post_mortem ALIGNED(256) = { };
 
 /* Points to a copy of the buffer where the dump functions should write, when
  * non-null. It's only used by debuggers for core dump analysis.
@@ -420,6 +489,63 @@ static int debug_parse_cli_show_libs(char **args, char *payload, struct appctx *
 		return 0;
 }
 #endif
+
+/* parse a "show dev" command. It returns 1 if it emits anything otherwise zero. */
+static int debug_parse_cli_show_dev(char **args, char *payload, struct appctx *appctx, void *private)
+{
+	if (*args[2])
+		return cli_err(appctx, "This command takes no argument.\n");
+
+	chunk_reset(&trash);
+
+	chunk_appendf(&trash, "Platform info\n");
+	if (*post_mortem.platform.hw_vendor)
+		chunk_appendf(&trash, "  machine vendor: %s\n", post_mortem.platform.hw_vendor);
+	if (*post_mortem.platform.hw_family)
+		chunk_appendf(&trash, "  machine family: %s\n", post_mortem.platform.hw_family);
+	if (*post_mortem.platform.hw_model)
+		chunk_appendf(&trash, "  machine model: %s\n", post_mortem.platform.hw_model);
+	if (*post_mortem.platform.brd_vendor)
+		chunk_appendf(&trash, "  board vendor: %s\n", post_mortem.platform.brd_vendor);
+	if (*post_mortem.platform.brd_model)
+		chunk_appendf(&trash, "  board model: %s\n", post_mortem.platform.brd_model);
+	if (*post_mortem.platform.soc_vendor)
+		chunk_appendf(&trash, "  soc vendor: %s\n", post_mortem.platform.soc_vendor);
+	if (*post_mortem.platform.soc_model)
+		chunk_appendf(&trash, "  soc model: %s\n", post_mortem.platform.soc_model);
+	if (*post_mortem.platform.cpu_model)
+		chunk_appendf(&trash, "  cpu model: %s\n", post_mortem.platform.cpu_model);
+	if (*post_mortem.platform.virt_techno)
+		chunk_appendf(&trash, "  virtual machine: %s\n", post_mortem.platform.virt_techno);
+	if (*post_mortem.platform.cont_techno)
+		chunk_appendf(&trash, "  container: %s\n", post_mortem.platform.cont_techno);
+	if (*post_mortem.platform.utsname.sysname)
+		chunk_appendf(&trash, "  OS name: %s\n", post_mortem.platform.utsname.sysname);
+	if (*post_mortem.platform.utsname.release)
+		chunk_appendf(&trash, "  OS release: %s\n", post_mortem.platform.utsname.release);
+	if (*post_mortem.platform.utsname.version)
+		chunk_appendf(&trash, "  OS version: %s\n", post_mortem.platform.utsname.version);
+	if (*post_mortem.platform.utsname.machine)
+		chunk_appendf(&trash, "  OS architecture: %s\n", post_mortem.platform.utsname.machine);
+	if (*post_mortem.platform.utsname.nodename)
+		chunk_appendf(&trash, "  node name: %s\n", HA_ANON_CLI(post_mortem.platform.utsname.nodename));
+
+	chunk_appendf(&trash, "Process info\n");
+	chunk_appendf(&trash, "  pid: %d\n", post_mortem.process.pid);
+	chunk_appendf(&trash, "  boot uid: %d\n", post_mortem.process.boot_uid);
+	chunk_appendf(&trash, "  boot gid: %d\n", post_mortem.process.boot_gid);
+
+	if ((ulong)post_mortem.process.limit_fd.rlim_cur != RLIM_INFINITY)
+		chunk_appendf(&trash, "  fd limit (soft): %lu\n", (ulong)post_mortem.process.limit_fd.rlim_cur);
+	if ((ulong)post_mortem.process.limit_fd.rlim_max != RLIM_INFINITY)
+		chunk_appendf(&trash, "  fd limit (hard): %lu\n", (ulong)post_mortem.process.limit_fd.rlim_max);
+	if ((ulong)post_mortem.process.limit_ram.rlim_cur != RLIM_INFINITY)
+		chunk_appendf(&trash, "  ram limit (soft): %lu\n", (ulong)post_mortem.process.limit_ram.rlim_cur);
+	if ((ulong)post_mortem.process.limit_ram.rlim_max != RLIM_INFINITY)
+		chunk_appendf(&trash, "  ram limit (hard): %lu\n", (ulong)post_mortem.process.limit_ram.rlim_max);
+
+	return cli_msg(appctx, LOG_INFO, trash.area);
+}
 
 /* Dumps a state of all threads into the trash and on fd #2, then aborts.
  * A copy will be put into a trash chunk that's assigned to thread_dump_buffer
@@ -903,7 +1029,7 @@ static int debug_parse_cli_stream(char **args, char *payload, struct appctx *app
 			       "     <obj>   = { strm.f | strm.x | scf.s | scb.s | txn.f | req.f | res.f }\n"
 			       "     <op>    = {'' (show) | '=' (assign) | '^' (xor) | '+' (or) | '-' (andnot)}\n"
 			       "     <value> = 'now' | 64-bit dec/hex integer (0x prefix supported)\n"
-			       "     'wake' wakes the stream asssigned to 'strm' (default: current)\n"
+			       "     'wake' wakes the stream assigned to 'strm' (default: current)\n"
 			       );
 	}
 
@@ -1838,6 +1964,294 @@ REGISTER_PER_THREAD_INIT(init_debug_per_thread);
 
 #endif /* USE_THREAD_DUMP */
 
+
+static void feed_post_mortem_linux()
+{
+#if defined(__linux__)
+	struct stat statbuf;
+	FILE *file;
+
+	/* DMI reports either HW or hypervisor, this allows to detect most VMs.
+	 * On ARM the device-tree is often more precise for the model. Since many
+	 * boards present "to be filled by OEM" or so in many fields, we dedup
+	 * them as much as possible.
+	 */
+	if (read_line_to_trash("/sys/class/dmi/id/sys_vendor") > 0)
+		strlcpy2(post_mortem.platform.hw_vendor, trash.area, sizeof(post_mortem.platform.hw_vendor));
+
+	if (read_line_to_trash("/sys/class/dmi/id/product_family") > 0 &&
+	    strcmp(trash.area, post_mortem.platform.hw_vendor) != 0)
+		strlcpy2(post_mortem.platform.hw_family, trash.area, sizeof(post_mortem.platform.hw_family));
+
+	if ((read_line_to_trash("/sys/class/dmi/id/product_name") > 0 &&
+	     strcmp(trash.area, post_mortem.platform.hw_vendor) != 0 &&
+	     strcmp(trash.area, post_mortem.platform.hw_family) != 0))
+		strlcpy2(post_mortem.platform.hw_model, trash.area, sizeof(post_mortem.platform.hw_model));
+
+	if ((read_line_to_trash("/sys/class/dmi/id/board_vendor") > 0 &&
+	     strcmp(trash.area, post_mortem.platform.hw_vendor) != 0))
+		strlcpy2(post_mortem.platform.brd_vendor, trash.area, sizeof(post_mortem.platform.brd_vendor));
+
+	if ((read_line_to_trash("/sys/firmware/devicetree/base/model") > 0 &&
+	     strcmp(trash.area, post_mortem.platform.brd_vendor) != 0 &&
+	     strcmp(trash.area, post_mortem.platform.hw_vendor) != 0 &&
+	     strcmp(trash.area, post_mortem.platform.hw_family) != 0 &&
+	     strcmp(trash.area, post_mortem.platform.hw_model) != 0) ||
+	    (read_line_to_trash("/sys/class/dmi/id/board_name") > 0 &&
+	     strcmp(trash.area, post_mortem.platform.brd_vendor) != 0 &&
+	     strcmp(trash.area, post_mortem.platform.hw_vendor) != 0 &&
+	     strcmp(trash.area, post_mortem.platform.hw_family) != 0 &&
+	     strcmp(trash.area, post_mortem.platform.hw_model) != 0))
+		strlcpy2(post_mortem.platform.brd_model, trash.area, sizeof(post_mortem.platform.brd_model));
+
+	/* Check for containers. In a container on linux we don't see keventd (2.4) kthreadd (2.6+) on pid 2 */
+	if (read_line_to_trash("/proc/2/status") <= 0 ||
+	    (strcmp(trash.area, "Name:\tkthreadd") != 0 &&
+	     strcmp(trash.area, "Name:\tkeventd") != 0)) {
+		/* OK we're in a container. Docker often has /.dockerenv */
+		const char *tech = "yes";
+
+		if (stat("/.dockerenv", &statbuf) == 0)
+			tech = "docker";
+		strlcpy2(post_mortem.platform.cont_techno, tech, sizeof(post_mortem.platform.cont_techno));
+	}
+	else {
+		strlcpy2(post_mortem.platform.cont_techno, "no", sizeof(post_mortem.platform.cont_techno));
+	}
+
+	file = fopen("/proc/cpuinfo", "r");
+	if (file) {
+		uint cpu_implem = 0, cpu_arch = 0, cpu_variant = 0, cpu_part = 0, cpu_rev = 0; // arm
+		uint cpu_family = 0, model = 0, stepping = 0;                                  // x86
+		char vendor_id[64] = "", model_name[64] = "";                                  // x86
+		char machine[64] = "", system_type[64] = "", cpu_model[64] = "";               // mips
+		const char *virt = "no";
+		char *p, *e, *v, *lf;
+
+		/* let's figure what CPU we're working with */
+		while ((p = fgets(trash.area, trash.size, file)) != NULL) {
+			lf = strchr(p, '\n');
+			if (lf)
+				*lf = 0;
+
+			/* stop at first line break */
+			if (!*p)
+				break;
+
+			/* skip colon and spaces and trim spaces after name */
+			v = e = strchr(p, ':');
+			if (!e)
+				continue;
+
+			do { *e-- = 0; } while (e >= p && (*e == ' ' || *e == '\t'));
+
+			/* locate value after colon */
+			do { v++; } while (*v == ' ' || *v == '\t');
+
+			/* ARM */
+			if (strcmp(p, "CPU implementer") == 0)
+				cpu_implem = strtoul(v, NULL, 0);
+			else if (strcmp(p, "CPU architecture") == 0)
+				cpu_arch = strtoul(v, NULL, 0);
+			else if (strcmp(p, "CPU variant") == 0)
+				cpu_variant = strtoul(v, NULL, 0);
+			else if (strcmp(p, "CPU part") == 0)
+				cpu_part = strtoul(v, NULL, 0);
+			else if (strcmp(p, "CPU revision") == 0)
+				cpu_rev = strtoul(v, NULL, 0);
+
+			/* x86 */
+			else if (strcmp(p, "cpu family") == 0)
+				cpu_family = strtoul(v, NULL, 0);
+			else if (strcmp(p, "model") == 0)
+				model = strtoul(v, NULL, 0);
+			else if (strcmp(p, "stepping") == 0)
+				stepping = strtoul(v, NULL, 0);
+			else if (strcmp(p, "vendor_id") == 0)
+				strlcpy2(vendor_id, v, sizeof(vendor_id));
+			else if (strcmp(p, "model name") == 0)
+				strlcpy2(model_name, v, sizeof(model_name));
+			else if (strcmp(p, "flags") == 0) {
+				if (strstr(v, "hypervisor")) {
+					if (strncmp(post_mortem.platform.hw_vendor, "QEMU", 4) == 0)
+						virt = "qemu";
+					else if (strncmp(post_mortem.platform.hw_vendor, "VMware", 6) == 0)
+						virt = "vmware";
+					else
+						virt = "yes";
+				}
+			}
+
+			/* MIPS */
+			else if (strcmp(p, "system type") == 0)
+				strlcpy2(system_type, v, sizeof(system_type));
+			else if (strcmp(p, "machine") == 0)
+				strlcpy2(machine, v, sizeof(machine));
+			else if (strcmp(p, "cpu model") == 0)
+				strlcpy2(cpu_model, v, sizeof(cpu_model));
+		}
+		fclose(file);
+
+		/* Machine may replace hw_product on MIPS */
+		if (!*post_mortem.platform.hw_model)
+			strlcpy2(post_mortem.platform.hw_model, machine, sizeof(post_mortem.platform.hw_model));
+
+		/* SoC vendor */
+		strlcpy2(post_mortem.platform.soc_vendor, vendor_id, sizeof(post_mortem.platform.soc_vendor));
+
+		/* SoC model */
+		if (*system_type) {
+			/* MIPS */
+			strlcpy2(post_mortem.platform.soc_model, system_type, sizeof(post_mortem.platform.soc_model));
+			*system_type = 0;
+		} else if (*model_name) {
+			/* x86 */
+			strlcpy2(post_mortem.platform.soc_model, model_name, sizeof(post_mortem.platform.soc_model));
+			*model_name = 0;
+		}
+
+		/* Create a CPU model name based on available IDs */
+		if (cpu_implem) // arm
+			snprintf(cpu_model + strlen(cpu_model),
+				 sizeof(cpu_model) - strlen(cpu_model),
+				 "%sImpl %#02x", *cpu_model ? " " : "", cpu_implem);
+
+		if (cpu_family) // x86
+			snprintf(cpu_model + strlen(cpu_model),
+				 sizeof(cpu_model) - strlen(cpu_model),
+				 "%sFam %u", *cpu_model ? " " : "", cpu_family);
+
+		if (model) // x86
+			snprintf(cpu_model + strlen(cpu_model),
+				 sizeof(cpu_model) - strlen(cpu_model),
+				 "%sModel %u", *cpu_model ? " " : "", model);
+
+		if (stepping) // x86
+			snprintf(cpu_model + strlen(cpu_model),
+				 sizeof(cpu_model) - strlen(cpu_model),
+				 "%sStep %u", *cpu_model ? " " : "", stepping);
+
+		if (cpu_arch) // arm
+			snprintf(cpu_model + strlen(cpu_model),
+				 sizeof(cpu_model) - strlen(cpu_model),
+				 "%sArch %u", *cpu_model ? " " : "", cpu_arch);
+
+		if (cpu_part) // arm
+			snprintf(cpu_model + strlen(cpu_model),
+				 sizeof(cpu_model) - strlen(cpu_model),
+				 "%sPart %#03x", *cpu_model ? " " : "", cpu_part);
+
+		if (cpu_variant || cpu_rev) // arm
+			snprintf(cpu_model + strlen(cpu_model),
+				 sizeof(cpu_model) - strlen(cpu_model),
+				 "%sr%up%u", *cpu_model ? " " : "", cpu_variant, cpu_rev);
+
+		strlcpy2(post_mortem.platform.cpu_model, cpu_model, sizeof(post_mortem.platform.cpu_model));
+
+		if (*virt)
+			strlcpy2(post_mortem.platform.virt_techno, virt, sizeof(post_mortem.platform.virt_techno));
+	}
+#endif // __linux__
+}
+
+static int feed_post_mortem()
+{
+	/* kernel type, version and arch */
+	uname(&post_mortem.platform.utsname);
+
+	/* some boot-time info related to the process */
+	post_mortem.process.pid = getpid();
+	post_mortem.process.boot_uid = geteuid();
+	post_mortem.process.boot_gid = getegid();
+
+	getrlimit(RLIMIT_NOFILE, &post_mortem.process.limit_fd);
+#if defined(RLIMIT_AS)
+	getrlimit(RLIMIT_AS, &post_mortem.process.limit_ram);
+#elif defined(RLIMIT_DATA)
+	getrlimit(RLIMIT_DATA, &post_mortem.process.limit_ram);
+#endif
+
+	if (strcmp(post_mortem.platform.utsname.sysname, "Linux") == 0)
+		feed_post_mortem_linux();
+
+#if defined(HA_HAVE_DUMP_LIBS)
+	chunk_reset(&trash);
+	if (dump_libs(&trash, 1))
+		post_mortem.libs = strdup(trash.area);
+#endif
+
+	return ERR_NONE;
+}
+
+REGISTER_POST_CHECK(feed_post_mortem);
+
+static void deinit_post_mortem(void)
+{
+	int comp;
+
+#if defined(HA_HAVE_DUMP_LIBS)
+	ha_free(&post_mortem.libs);
+#endif
+	for (comp = 0; comp < post_mortem.nb_components; comp++) {
+		free(post_mortem.components[comp].toolchain);
+		free(post_mortem.components[comp].toolchain_opts);
+		free(post_mortem.components[comp].build_settings);
+		free(post_mortem.components[comp].path);
+	}
+	ha_free(&post_mortem.components);
+}
+
+REGISTER_POST_DEINIT(deinit_post_mortem);
+
+/* Appends a component to the list of post_portem info. May silently fail
+ * on allocation errors but we don't care since the goal is to provide info
+ * we have in case it helps.
+ */
+void post_mortem_add_component(const char *name, const char *version,
+			       const char *toolchain, const char *toolchain_opts,
+			       const char *build_settings, const char *path)
+{
+	struct post_mortem_component *comp;
+	int nbcomp = post_mortem.nb_components;
+
+	comp = realloc(post_mortem.components, (nbcomp + 1) * sizeof(*comp));
+	if (!comp)
+		return;
+
+	memset(&comp[nbcomp], 0, sizeof(*comp));
+	strlcpy2(comp[nbcomp].name, name, sizeof(comp[nbcomp].name));
+	strlcpy2(comp[nbcomp].version, version, sizeof(comp[nbcomp].version));
+	comp[nbcomp].toolchain      = strdup(toolchain);
+	comp[nbcomp].toolchain_opts = strdup(toolchain_opts);
+	comp[nbcomp].build_settings = strdup(build_settings);
+	comp[nbcomp].path = strdup(path);
+
+	post_mortem.nb_components++;
+	post_mortem.components = comp;
+}
+
+#ifdef USE_THREAD
+/* init code is called one at a time so let's collect all per-thread info on
+ * the last starting thread. These info are not critical anyway and there's no
+ * problem if we get them slightly late.
+ */
+static int feed_post_mortem_late()
+{
+	static int per_thread_info_collected;
+
+	if (HA_ATOMIC_ADD_FETCH(&per_thread_info_collected, 1) == global.nbthread) {
+		int i;
+		for (i = 0; i < global.nbthread; i++) {
+			post_mortem.process.thread_info[i].pth_id = ha_thread_info[i].pth_id;
+			post_mortem.process.thread_info[i].stack_top = ha_thread_info[i].stack_top;
+		}
+	}
+	return 1;
+}
+
+REGISTER_PER_THREAD_INIT(feed_post_mortem_late);
+#endif
+
 /* register cli keywords */
 static struct cli_kw_list cli_kws = {{ },{
 	{{ "debug", "dev", "bug", NULL },      "debug dev bug                           : call BUG_ON() and crash",                 debug_parse_cli_bug,   NULL, NULL, NULL, ACCESS_EXPERT },
@@ -1867,6 +2281,7 @@ static struct cli_kw_list cli_kws = {{ },{
 	{{ "debug", "dev", "warn",  NULL },    "debug dev warn                          : call WARN_ON() and possibly crash",       debug_parse_cli_warn,  NULL, NULL, NULL, ACCESS_EXPERT },
 	{{ "debug", "dev", "write", NULL },    "debug dev write  [size]                 : write that many bytes in return",         debug_parse_cli_write, NULL, NULL, NULL, ACCESS_EXPERT },
 
+	{{ "show", "dev", NULL, NULL },        "show dev                                : show debug info for developers",          debug_parse_cli_show_dev, NULL, NULL },
 #if defined(HA_HAVE_DUMP_LIBS)
 	{{ "show", "libs", NULL, NULL },       "show libs                               : show loaded object files and libraries", debug_parse_cli_show_libs, NULL, NULL },
 #endif

@@ -360,6 +360,9 @@ void appctx_shut(struct appctx *appctx)
 	if (appctx->applet->release)
 		appctx->applet->release(appctx);
 
+	if (LIST_INLIST(&appctx->buffer_wait.list))
+		LIST_DEL_INIT(&appctx->buffer_wait.list);
+
 	se_fl_set(appctx->sedesc, SE_FL_SHRR | SE_FL_SHWN);
 	TRACE_LEAVE(APPLET_EV_RELEASE, appctx);
 }
@@ -403,6 +406,7 @@ struct task *task_run_applet(struct task *t, void *context, unsigned int state)
 	struct stconn *sc, *sco;
 	unsigned int rate;
 	size_t count;
+	int did_send = 0;
 
 	TRACE_ENTER(APPLET_EV_PROCESS, app);
 
@@ -458,12 +462,11 @@ struct task *task_run_applet(struct task *t, void *context, unsigned int state)
 		sc_oc(sc)->flags |= CF_WRITE_EVENT | CF_WROTE_DATA;
 		if (sco->room_needed < 0 || channel_recv_max(sc_oc(sc)) >= sco->room_needed)
 			sc_have_room(sco);
-		sc_ep_report_send_activity(sc);
+		did_send = 1;
 	}
 	else {
 		if (!sco->room_needed)
 			sc_have_room(sco);
-		sc_ep_report_blocked_send(sc);
 	}
 
 	if (sc_ic(sc)->flags & CF_READ_EVENT)
@@ -472,6 +475,13 @@ struct task *task_run_applet(struct task *t, void *context, unsigned int state)
 	if (sc_waiting_room(sc) && (sc->flags & SC_FL_ABRT_DONE)) {
 		sc_ep_set(sc, SE_FL_EOS|SE_FL_ERROR);
 	}
+
+	if (!co_data(sc_oc(sc))) {
+		if (did_send)
+			sc_ep_report_send_activity(sc);
+	}
+	else
+		sc_ep_report_blocked_send(sc, did_send);
 
 	/* measure the call rate and check for anomalies when too high */
 	if (((b_size(sc_ib(sc)) && sc->flags & SC_FL_NEED_BUFF) || // asks for a buffer which is present

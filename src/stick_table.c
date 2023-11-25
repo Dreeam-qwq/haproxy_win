@@ -865,6 +865,20 @@ int stktable_init(struct stktable *t, char **err_msg)
 	return 0;
 }
 
+/* Performs stick table cleanup: it's meant to be called after the table
+ * has been initialized ith stktable_init(), else it will lead to undefined
+ * behavior.
+ *
+ * However it does not free the table pointer itself
+ */
+void stktable_deinit(struct stktable *t)
+{
+	if (!t)
+		return;
+	task_destroy(t->exp_task);
+	pool_destroy(t->pool);
+}
+
 /*
  * Configuration keywords of known table types
  */

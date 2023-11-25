@@ -947,13 +947,15 @@ struct sockaddr_storage *str2ip2(const char *str, struct sockaddr_storage *sa, i
  * AF_CUST_EXISTING_FD.
  *
  * The matching protocol will be set into <proto> if non-null.
+ * The address protocol and transport types hints which are directly resolved
+ * will be set into <sa_type> if not NULL.
  *
  * Any known file descriptor is also assigned to <fd> if non-null, otherwise it
  * is forced to -1.
  */
 struct sockaddr_storage *str2sa_range(const char *str, int *port, int *low, int *high, int *fd,
-                                      struct protocol **proto, char **err,
-                                      const char *pfx, char **fqdn, unsigned int opts)
+                                      struct protocol **proto, struct net_addr_type *sa_type,
+                                      char **err, const char *pfx, char **fqdn, unsigned int opts)
 {
 	static THREAD_LOCAL struct sockaddr_storage ss;
 	struct sockaddr_storage *ret = NULL;
@@ -963,8 +965,8 @@ struct sockaddr_storage *str2sa_range(const char *str, int *port, int *low, int 
 	int portl, porth, porta;
 	int abstract = 0;
 	int new_fd = -1;
-	enum proto_type proto_type;
-	int ctrl_type;
+	enum proto_type proto_type = 0; // to shut gcc warning
+	int ctrl_type = 0; // to shut gcc warning
 
 	portl = porth = porta = 0;
 	if (fqdn)
@@ -1103,7 +1105,7 @@ struct sockaddr_storage *str2sa_range(const char *str, int *port, int *low, int 
 	}
 	else if (strncmp(str2, "rhttp@", 3) == 0) {
 		str2 += 4;
-		ss.ss_family = AF_CUST_REV_SRV;
+		ss.ss_family = AF_CUST_RHTTP_SRV;
 	}
 	else if (*str2 == '/') {
 		ss.ss_family = AF_UNIX;
@@ -1192,7 +1194,7 @@ struct sockaddr_storage *str2sa_range(const char *str, int *port, int *low, int 
 			memcpy(un->sun_path, pfx, prefix_path_len);
 		memcpy(un->sun_path + prefix_path_len + abstract, str2, adr_len + 1 - abstract);
 	}
-	else if (ss.ss_family == AF_CUST_REV_SRV) {
+	else if (ss.ss_family == AF_CUST_RHTTP_SRV) {
 		/* Nothing to do here. */
 	}
 	else { /* IPv4 and IPv6 */
@@ -1383,6 +1385,10 @@ struct sockaddr_storage *str2sa_range(const char *str, int *port, int *low, int 
 		*fd = new_fd;
 	if (proto)
 		*proto = new_proto;
+	if (sa_type) {
+		sa_type->proto_type = proto_type;
+		sa_type->xprt_type = (ctrl_type == SOCK_DGRAM) ? PROTO_TYPE_DGRAM : PROTO_TYPE_STREAM;
+	}
 	free(back);
 	return ret;
 }
@@ -3344,7 +3350,7 @@ void v4tov6(struct in6_addr *sin6_addr, struct in_addr *sin_addr)
 
 /* Try to convert IPv6 address to IPv4 address thanks to the
  * following mapping methods:
- *  - RFC4291 IPv4-Mapped IPv6 Address (prefered method)
+ *  - RFC4291 IPv4-Mapped IPv6 Address (preferred method)
  *    -> ::ffff:ip:v4
  *  - RFC4291 IPv4-Compatible IPv6 Address (deprecated, RFC3513 legacy for
  *    "IPv6 Addresses with Embedded IPv4 Addresses)
@@ -3376,7 +3382,7 @@ int v6tov4(struct in_addr *sin_addr, struct in6_addr *sin6_addr)
  *  1 (false) if the addr is not the same in both
  *  -1 (unable) if one of the addr is not AF_INET*
  */
-int ipcmp(struct sockaddr_storage *ss1, struct sockaddr_storage *ss2, int check_port)
+int ipcmp(const struct sockaddr_storage *ss1, const struct sockaddr_storage *ss2, int check_port)
 {
 	if ((ss1->ss_family != AF_INET) && (ss1->ss_family != AF_INET6))
 		return -1;
@@ -3444,7 +3450,7 @@ int ipcmp2net(const struct sockaddr_storage *addr, const struct net_addr *net)
  * it is preserved, so that this function can be used to switch to another
  * address family with no risk. Returns a pointer to the destination.
  */
-struct sockaddr_storage *ipcpy(struct sockaddr_storage *source, struct sockaddr_storage *dest)
+struct sockaddr_storage *ipcpy(const struct sockaddr_storage *source, struct sockaddr_storage *dest)
 {
 	int prev_port;
 
@@ -6018,7 +6024,7 @@ const char *hash_ipanon(uint32_t scramble, char *ipstring, int hasport)
 			sa = &ss;
 		}
 		else {
-			sa = str2sa_range(ipstring, NULL, NULL, NULL, NULL, NULL, &errmsg, NULL, NULL,
+			sa = str2sa_range(ipstring, NULL, NULL, NULL, NULL, NULL, NULL, &errmsg, NULL, NULL,
 					  PA_O_PORT_OK | PA_O_STREAM | PA_O_DGRAM | PA_O_XPRT | PA_O_CONNECT |
 					  PA_O_PORT_RANGE | PA_O_PORT_OFS | PA_O_RESOLVE);
 			if (sa == NULL) {

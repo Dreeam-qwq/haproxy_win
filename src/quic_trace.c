@@ -66,7 +66,7 @@ static const struct trace_event quic_trace_events[] = {
 	{ .mask = QUIC_EV_STATELESS_RST, .name = "stateless_reset",  .desc = "stateless reset sent"},
 	{ .mask = QUIC_EV_TRANSP_PARAMS, .name = "transport_params", .desc = "transport parameters"},
 	{ .mask = QUIC_EV_CONN_IDLE_TIMER, .name = "idle_timer",     .desc = "idle timer task"},
-	{ .mask = QUIC_EV_CONN_SUB,      .name = "xprt_sub",         .desc = "RX/TX subcription or unsubscription to QUIC xprt"},
+	{ .mask = QUIC_EV_CONN_SUB,      .name = "xprt_sub",         .desc = "RX/TX subscription or unsubscription to QUIC xprt"},
 	{ .mask = QUIC_EV_CONN_RCV,      .name = "conn_recv",        .desc = "RX on connection" },
 	{ .mask = QUIC_EV_CONN_SET_AFFINITY, .name = "conn_set_affinity", .desc = "set connection thread affinity" },
 	{ /* end */ }
@@ -111,7 +111,8 @@ static void quic_trace(enum trace_level level, uint64_t mask, const struct trace
 	if (qc) {
 		const struct quic_tls_ctx *tls_ctx;
 
-		chunk_appendf(&trace_buf, " : qc@%p flags=0x%x", qc, qc->flags);
+		chunk_appendf(&trace_buf, " : qc@%p idle_timer_task@%p flags=0x%x",
+		              qc, qc->idle_timer_task, qc->flags);
 		if (mask & QUIC_EV_CONN_INIT) {
 			chunk_appendf(&trace_buf, "\n  odcid");
 			quic_cid_dump(&trace_buf, &qc->odcid);

@@ -1204,11 +1204,16 @@ static struct connection *conn_backend_get(struct stream *s, struct server *srv,
 	/* Are we allowed to pick from another thread ? We'll still try
 	 * it if we're running low on FDs as we don't want to create
 	 * extra conns in this case, otherwise we can give up if we have
-	 * too few idle conns.
+	 * too few idle conns and the server protocol supports establishing
+	 * connections (i.e. not a reverse-http server for example).
 	 */
 	if (srv->curr_idle_conns < srv->low_idle_conns &&
-	    ha_used_fds < global.tune.pool_low_count)
-		goto done;
+	    ha_used_fds < global.tune.pool_low_count) {
+		const struct protocol *srv_proto = protocol_lookup(srv->addr.ss_family, PROTO_TYPE_STREAM, 0);
+
+		if (srv_proto && srv_proto->connect)
+			goto done;
+	}
 
 	/* Lookup all other threads for an idle connection, starting from last
 	 * unvisited thread, but always staying in the same group.
@@ -1356,7 +1361,7 @@ static int connect_server(struct stream *s)
 	srv = objt_server(s->target);
 
 	/* Override reuse-mode if reverse-connect is used. */
-	if (srv && srv->flags & SRV_F_REVERSE)
+	if (srv && srv->flags & SRV_F_RHTTP)
 		reuse_mode = PR_O_REUSE_ALWS;
 
 	err = alloc_dst_address(&s->scb->dst, srv, s);
@@ -1591,7 +1596,7 @@ static int connect_server(struct stream *s)
 skip_reuse:
 	/* no reuse or failed to reuse the connection above, pick a new one */
 	if (!srv_conn) {
-		if (srv && (srv->flags & SRV_F_REVERSE)) {
+		if (srv && (srv->flags & SRV_F_RHTTP)) {
 			DBG_TRACE_USER("cannot open a new connection for reverse server", STRM_EV_STRM_PROC|STRM_EV_CS_ST, s);
 			s->conn_err_type = STRM_ET_CONN_ERR;
 			return SF_ERR_INTERNAL;
@@ -1797,7 +1802,7 @@ skip_reuse:
 	    (srv->ssl_ctx.options & SRV_SSL_O_EARLY_DATA) &&
 	    /* Only attempt to use early data if either the client sent
 	     * early data, so that we know it can handle a 425, or if
-	     * we are allwoed to retry requests on early data failure, and
+	     * we are allowed to retry requests on early data failure, and
 	     * it's our first try
 	     */
 	    ((cli_conn->flags & CO_FL_EARLY_DATA) ||
@@ -2818,55 +2823,23 @@ int backend_parse_balance(const char **args, char **err, struct proxy *curproxy)
 			return -1;
 		}
 	}
-	else {
-		memprintf(err, "only supports 'roundrobin', 'static-rr', 'leastconn', 'source', 'uri', 'url_param', 'hdr(name)' and 'rdp-cookie(name)' options.");
-		return -1;
-	}
-	return 0;
-}
-
-/* This function parses a "balance" statement in a log backend section
- * describing <curproxy>. It returns -1 if there is any error, otherwise zero.
- * If it returns -1, it will write an error message into the <err> buffer which
- * will automatically be allocated and must be passed as NULL. The trailing '\n'
- * will not be written. The function must be called with <args> pointing to the
- * first word after "balance".
- */
-int backend_parse_log_balance(const char **args, char **err, struct proxy *curproxy)
-{
-	if (!*(args[0])) {
-		/* if no option is set, use round-robin by default */
-		curproxy->lbprm.algo &= ~BE_LB_ALGO;
-		curproxy->lbprm.algo |= BE_LB_ALGO_RR;
-		return 0;
-	}
-
-	if (strcmp(args[0], "roundrobin") == 0) {
-		curproxy->lbprm.algo &= ~BE_LB_ALGO;
-		curproxy->lbprm.algo |= BE_LB_ALGO_RR;
-	}
-	else if (strcmp(args[0], "sticky") == 0) {
-		curproxy->lbprm.algo &= ~BE_LB_ALGO;
-		/* we use ALGO_FAS as "sticky" mode in log-balance context */
-		curproxy->lbprm.algo |= BE_LB_ALGO_FAS;
-	}
-	else if (strcmp(args[0], "random") == 0) {
-		curproxy->lbprm.algo &= ~BE_LB_ALGO;
-		curproxy->lbprm.algo |= BE_LB_ALGO_RND;
-	}
-	else if (strcmp(args[0], "hash") == 0) {
+	else if (strcmp(args[0], "log-hash") == 0) {
 		if (!*args[1]) {
 			memprintf(err, "%s requires a converter list.", args[0]);
 			return -1;
 		}
 		curproxy->lbprm.algo &= ~BE_LB_ALGO;
-		curproxy->lbprm.algo |= BE_LB_ALGO_SMP;
+		curproxy->lbprm.algo |= BE_LB_ALGO_LH;
 
 		ha_free(&curproxy->lbprm.arg_str);
 		curproxy->lbprm.arg_str = strdup(args[1]);
 	}
+	else if (strcmp(args[0], "sticky") == 0) {
+		curproxy->lbprm.algo &= ~BE_LB_ALGO;
+		curproxy->lbprm.algo |= BE_LB_ALGO_LS;
+	}
 	else {
-		memprintf(err, "only supports 'roundrobin', 'sticky', 'random', 'hash' options");
+		memprintf(err, "only supports 'roundrobin', 'static-rr', 'leastconn', 'source', 'uri', 'url_param', 'hash', 'hdr(name)', 'rdp-cookie(name)', 'log-hash' and 'sticky' options.");
 		return -1;
 	}
 	return 0;

@@ -4,6 +4,7 @@
 #include <haproxy/api.h>
 #include <haproxy/connection.h>
 #include <haproxy/errors.h>
+#include <haproxy/intops.h>
 #include <haproxy/list.h>
 #include <haproxy/listener.h>
 #include <haproxy/log.h>
@@ -16,39 +17,37 @@
 #include <haproxy/ssl_sock.h>
 #include <haproxy/task.h>
 
-#include <haproxy/proto_reverse_connect.h>
+#include <haproxy/proto_rhttp.h>
 
-struct proto_fam proto_fam_reverse_connect = {
-	.name = "reverse_connect",
-	.sock_domain = AF_CUST_REV_SRV,
+struct proto_fam proto_fam_rhttp = {
+	.name = "rhttp",
+	.sock_domain = AF_CUST_RHTTP_SRV,
 	.sock_family = AF_INET,
-	.bind = rev_bind_receiver,
+	.bind = rhttp_bind_receiver,
 };
 
-struct protocol proto_reverse_connect = {
+struct protocol proto_rhttp = {
 	.name = "rev",
 
-	/* connection layer */
-	.listen      = rev_bind_listener,
-	.enable      = rev_enable_listener,
-	.disable     = rev_disable_listener,
+	/* connection layer (no outgoing connection) */
+	.listen      = rhttp_bind_listener,
+	.enable      = rhttp_enable_listener,
+	.disable     = rhttp_disable_listener,
 	.add         = default_add_listener,
-	.unbind      = rev_unbind_receiver,
+	.unbind      = rhttp_unbind_receiver,
 	.resume      = default_resume_listener,
-	.accept_conn = rev_accept_conn,
-	.set_affinity = rev_set_affinity,
-
-	.connect     = rev_connect,
+	.accept_conn = rhttp_accept_conn,
+	.set_affinity = rhttp_set_affinity,
 
 	/* address family */
-	.fam  = &proto_fam_reverse_connect,
+	.fam  = &proto_fam_rhttp,
 
 	/* socket layer */
 	.proto_type     = PROTO_TYPE_STREAM,
 	.sock_type      = SOCK_STREAM,
 	.sock_prot      = IPPROTO_TCP,
-	.rx_listening   = rev_accepting_conn,
-	.receivers      = LIST_HEAD_INIT(proto_reverse_connect.receivers),
+	.rx_listening   = rhttp_accepting_conn,
+	.receivers      = LIST_HEAD_INIT(proto_rhttp.receivers),
 };
 
 static struct connection *new_reverse_conn(struct listener *l, struct server *srv)
@@ -57,6 +56,8 @@ static struct connection *new_reverse_conn(struct listener *l, struct server *sr
 	struct sockaddr_storage *bind_addr = NULL;
 	if (!conn)
 		goto err;
+
+	HA_ATOMIC_INC(&th_ctx->nb_rhttp_conns);
 
 	conn_set_reverse(conn, &l->obj_type);
 
@@ -114,8 +115,7 @@ static struct connection *new_reverse_conn(struct listener *l, struct server *sr
 			conn->destroy_cb(conn);
 
 		/* Mark connection as non-reversable. This prevents conn_free()
-		 * to reschedule reverse_connect task on freeing a preconnect
-		 * connection.
+		 * to reschedule rhttp task on freeing a preconnect connection.
 		 */
 		conn->reverse.target = NULL;
 		conn_free(conn);
@@ -128,33 +128,76 @@ static struct connection *new_reverse_conn(struct listener *l, struct server *sr
  * reversal is completed. This is used to cleanup any reference to the
  * connection and rearm a new preconnect attempt.
  */
-void rev_notify_preconn_err(struct listener *l)
+void rhttp_notify_preconn_err(struct listener *l)
 {
-	/* For the moment reverse connection are bound only on first thread. */
-	BUG_ON(tid != 0);
-
 	/* Receiver must reference a reverse connection as pending. */
-	BUG_ON(!l->rx.reverse_connect.pend_conn);
+	BUG_ON(!l->rx.rhttp.pend_conn);
 
 	/* Remove reference to the freed connection. */
-	l->rx.reverse_connect.pend_conn = NULL;
+	l->rx.rhttp.pend_conn = NULL;
 
-	if (l->rx.reverse_connect.state != LI_PRECONN_ST_ERR) {
+	if (l->rx.rhttp.state != LI_PRECONN_ST_ERR) {
 		send_log(l->bind_conf->frontend, LOG_ERR,
 		        "preconnect %s::%s: Error encountered.\n",
-		         l->bind_conf->frontend->id, l->bind_conf->reverse_srvname);
-		l->rx.reverse_connect.state = LI_PRECONN_ST_ERR;
+		         l->bind_conf->frontend->id, l->bind_conf->rhttp_srvname);
+		l->rx.rhttp.state = LI_PRECONN_ST_ERR;
 	}
 
 	/* Rearm a new preconnect attempt. */
-	l->rx.reverse_connect.task->expire = MS_TO_TICKS(now_ms + 1000);
-	task_queue(l->rx.reverse_connect.task);
+	l->rx.rhttp.task->expire = MS_TO_TICKS(now_ms + 1000);
+	task_queue(l->rx.rhttp.task);
 }
 
-struct task *rev_process(struct task *task, void *ctx, unsigned int state)
+/* Lookup over listener <l> threads for their current count of active reverse
+ * HTTP connections. Returns the less loaded thread ID.
+ */
+static unsigned int select_thread(struct listener *l)
+{
+	unsigned long mask = l->rx.bind_thread & _HA_ATOMIC_LOAD(&tg->threads_enabled);
+	unsigned int load_min = HA_ATOMIC_LOAD(&th_ctx->nb_rhttp_conns);
+	unsigned int load_thr;
+	unsigned int ret = tid;
+	int i;
+
+	/* Returns current tid if listener runs on one thread only. */
+	if (!atleast2(mask))
+		goto end;
+
+	/* Loop over all threads and return the less loaded one. This needs to
+	 * be just an approximation so it's not important if the selected
+	 * thread load has varied since its selection.
+	 */
+
+	for (i = tg->base; mask; mask >>= 1, i++) {
+		if (!(mask & 0x1))
+			continue;
+
+		load_thr = HA_ATOMIC_LOAD(&ha_thread_ctx[i].nb_rhttp_conns);
+		if (load_min > load_thr) {
+			ret = i;
+			load_min = load_thr;
+		}
+	}
+
+ end:
+	return ret;
+}
+
+/* Detach <task> from its thread and assign it to <new_tid> thread. The task is
+ * queued to be woken up on the new thread.
+ */
+static void task_migrate(struct task *task, uint new_tid)
+{
+	task_unlink_wq(task);
+	task->expire = TICK_ETERNITY;
+	task_set_thread(task, new_tid);
+	task_wakeup(task, TASK_WOKEN_MSG);
+}
+
+struct task *rhttp_process(struct task *task, void *ctx, unsigned int state)
 {
 	struct listener *l = ctx;
-	struct connection *conn = l->rx.reverse_connect.pend_conn;
+	struct connection *conn = l->rx.rhttp.pend_conn;
 
 	if (conn) {
 		/* Either connection is on error ot the connect timeout fired. */
@@ -178,30 +221,40 @@ struct task *rev_process(struct task *task, void *ctx, unsigned int state)
 				conn_free(conn);
 			}
 
-			/* conn_free() must report preconnect failure using rev_notify_preconn_err(). */
-			BUG_ON(l->rx.reverse_connect.pend_conn);
+			/* conn_free() must report preconnect failure using rhttp_notify_preconn_err(). */
+			BUG_ON(l->rx.rhttp.pend_conn);
+
+			l->rx.rhttp.task->expire = TICKS_TO_MS(now_ms);
 		}
 		else {
-			/* Spurrious receiver task woken up despite pend_conn not ready/on error. */
-			BUG_ON(!(conn->flags & CO_FL_REVERSED));
+			/* Spurious receiver task woken up despite pend_conn not ready/on error. */
+			BUG_ON(!(conn->flags & CO_FL_ACT_REVERSING));
 
 			/* A connection is ready to be accepted. */
 			listener_accept(l);
-			l->rx.reverse_connect.task->expire = TICK_ETERNITY;
+			l->rx.rhttp.task->expire = TICK_ETERNITY;
 		}
 	}
 	else {
-		struct server *srv = l->rx.reverse_connect.srv;
+		struct server *srv = l->rx.rhttp.srv;
+
+		if ((state & TASK_WOKEN_ANY) != TASK_WOKEN_MSG) {
+			unsigned int new_tid = select_thread(l);
+			if (new_tid != tid) {
+				task_migrate(l->rx.rhttp.task, new_tid);
+				return task;
+			}
+		}
 
 		/* No pending reverse connection, prepare a new one. Store it in the
 		 * listener and return NULL. Connection will be returned later after
 		 * reversal is completed.
 		 */
 		conn = new_reverse_conn(l, srv);
-		l->rx.reverse_connect.pend_conn = conn;
+		l->rx.rhttp.pend_conn = conn;
 
 		/* On success task will be woken up by H2 mux after reversal. */
-		l->rx.reverse_connect.task->expire = conn ?
+		l->rx.rhttp.task->expire = conn ?
 		  tick_add_ifset(now_ms, srv->proxy->timeout.connect) :
 		  MS_TO_TICKS(now_ms + 1000);
 	}
@@ -209,13 +262,13 @@ struct task *rev_process(struct task *task, void *ctx, unsigned int state)
 	return task;
 }
 
-int rev_bind_receiver(struct receiver *rx, char **errmsg)
+int rhttp_bind_receiver(struct receiver *rx, char **errmsg)
 {
 	rx->flags |= RX_F_BOUND;
 	return ERR_NONE;
 }
 
-int rev_bind_listener(struct listener *listener, char *errmsg, int errlen)
+int rhttp_bind_listener(struct listener *listener, char *errmsg, int errlen)
 {
 	struct task *task;
 	struct proxy *be;
@@ -223,26 +276,34 @@ int rev_bind_listener(struct listener *listener, char *errmsg, int errlen)
 	struct ist be_name, sv_name;
 	char *name = NULL;
 
-	/* TODO for the moment reverse conn creation is pinned to the first thread only. */
-	if (!(task = task_new_here())) {
+	unsigned long mask;
+	uint task_tid;
+
+	if (listener->state != LI_ASSIGNED)
+		return ERR_NONE; /* already bound */
+
+	/* Retrieve the first thread usable for this listener. */
+	mask = listener->rx.bind_thread & _HA_ATOMIC_LOAD(&tg->threads_enabled);
+	task_tid = my_ffsl(mask) + ha_tgroup_info[listener->rx.bind_tgroup].base;
+	if (!(task = task_new_on(task_tid))) {
 		snprintf(errmsg, errlen, "Out of memory.");
 		goto err;
 	}
-	task->process = rev_process;
+	task->process = rhttp_process;
 	task->context = listener;
-	listener->rx.reverse_connect.task = task;
-	listener->rx.reverse_connect.state = LI_PRECONN_ST_STOP;
+	listener->rx.rhttp.task = task;
+	listener->rx.rhttp.state = LI_PRECONN_ST_STOP;
 
 	/* Set maxconn which is defined via the special kw nbconn for reverse
 	 * connect. Use a default value of 1 if not set. This guarantees that
-	 * listener will be automatically reenable each time it fell back below
+	 * listener will be automatically re-enable each time it fell back below
 	 * it due to a connection error.
 	 */
-	listener->bind_conf->maxconn = listener->bind_conf->reverse_nbconn;
+	listener->bind_conf->maxconn = listener->bind_conf->rhttp_nbconn;
 	if (!listener->bind_conf->maxconn)
 		listener->bind_conf->maxconn = 1;
 
-	name = strdup(listener->bind_conf->reverse_srvname);
+	name = strdup(listener->bind_conf->rhttp_srvname);
 	if (!name) {
 		snprintf(errmsg, errlen, "Out of memory.");
 		goto err;
@@ -264,8 +325,8 @@ int rev_bind_listener(struct listener *listener, char *errmsg, int errlen)
 		goto err;
 	}
 
-	if (srv->flags & SRV_F_REVERSE) {
-		snprintf(errmsg, errlen, "Cannot use reverse server '%s/%s' as target to a reverse bind.", ist0(be_name), ist0(sv_name));
+	if (srv->flags & SRV_F_RHTTP) {
+		snprintf(errmsg, errlen, "Cannot use reverse HTTP server '%s/%s' as target to a reverse bind.", ist0(be_name), ist0(sv_name));
 		goto err;
 	}
 
@@ -292,7 +353,7 @@ int rev_bind_listener(struct listener *listener, char *errmsg, int errlen)
 
 	ha_free(&name);
 
-	listener->rx.reverse_connect.srv = srv;
+	listener->rx.rhttp.srv = srv;
 	listener_set_state(listener, LI_LISTEN);
 
 	return ERR_NONE;
@@ -302,43 +363,52 @@ int rev_bind_listener(struct listener *listener, char *errmsg, int errlen)
 	return ERR_ALERT | ERR_FATAL;
 }
 
-void rev_enable_listener(struct listener *l)
+void rhttp_enable_listener(struct listener *l)
 {
-	if (l->rx.reverse_connect.state < LI_PRECONN_ST_INIT) {
+	if (l->rx.rhttp.state < LI_PRECONN_ST_INIT) {
 		send_log(l->bind_conf->frontend, LOG_INFO,
 		         "preconnect %s::%s: Initiating.\n",
-		         l->bind_conf->frontend->id, l->bind_conf->reverse_srvname);
-		l->rx.reverse_connect.state = LI_PRECONN_ST_INIT;
+		         l->bind_conf->frontend->id, l->bind_conf->rhttp_srvname);
+		l->rx.rhttp.state = LI_PRECONN_ST_INIT;
 	}
 
-	task_wakeup(l->rx.reverse_connect.task, TASK_WOKEN_ANY);
+	task_wakeup(l->rx.rhttp.task, TASK_WOKEN_ANY);
 }
 
-void rev_disable_listener(struct listener *l)
+void rhttp_disable_listener(struct listener *l)
 {
-	if (l->rx.reverse_connect.state < LI_PRECONN_ST_FULL) {
+	if (l->rx.rhttp.state < LI_PRECONN_ST_FULL) {
 		send_log(l->bind_conf->frontend, LOG_INFO,
 		         "preconnect %s::%s: Running with nbconn %d reached.\n",
-		         l->bind_conf->frontend->id, l->bind_conf->reverse_srvname,
+		         l->bind_conf->frontend->id, l->bind_conf->rhttp_srvname,
 		         l->bind_conf->maxconn);
-		l->rx.reverse_connect.state = LI_PRECONN_ST_FULL;
+		l->rx.rhttp.state = LI_PRECONN_ST_FULL;
 	}
 }
 
-struct connection *rev_accept_conn(struct listener *l, int *status)
+struct connection *rhttp_accept_conn(struct listener *l, int *status)
 {
-	struct connection *conn = l->rx.reverse_connect.pend_conn;
+	struct connection *conn = l->rx.rhttp.pend_conn;
 
 	if (!conn) {
 		/* Reverse connect listener must have an explicit maxconn set
-		 * to ensure it is reenabled on connection error.
+		 * to ensure it is re-enabled on connection error.
 		 */
 		BUG_ON(!l->bind_conf->maxconn);
 
 		/* Instantiate a new conn if maxconn not yet exceeded. */
 		if (l->nbconn <= l->bind_conf->maxconn) {
-			l->rx.reverse_connect.pend_conn = new_reverse_conn(l, l->rx.reverse_connect.srv);
-			if (!l->rx.reverse_connect.pend_conn) {
+			/* Try first if a new thread should be used for the new connection. */
+			unsigned int new_tid = select_thread(l);
+			if (new_tid != tid) {
+				task_migrate(l->rx.rhttp.task, new_tid);
+				*status = CO_AC_DONE;
+				return NULL;
+			}
+
+			/* No need to use a new thread, use the opportunity to alloc the connection right now. */
+			l->rx.rhttp.pend_conn = new_reverse_conn(l, l->rx.rhttp.srv);
+			if (!l->rx.rhttp.pend_conn) {
 				*status = CO_AC_PAUSE;
 				return NULL;
 			}
@@ -349,38 +419,46 @@ struct connection *rev_accept_conn(struct listener *l, int *status)
 	}
 
 	/* listener_accept() must not be called if no pending connection is not yet reversed. */
-	BUG_ON(!(conn->flags & CO_FL_REVERSED));
-	conn->flags &= ~CO_FL_REVERSED;
+	BUG_ON(!(conn->flags & CO_FL_ACT_REVERSING));
+	conn->flags &= ~CO_FL_ACT_REVERSING;
+	conn->flags |= CO_FL_REVERSED;
 	conn->mux->ctl(conn, MUX_REVERSE_CONN, NULL);
 
-	l->rx.reverse_connect.pend_conn = NULL;
+	l->rx.rhttp.pend_conn = NULL;
 	*status = CO_AC_NONE;
 
 	return conn;
 }
 
-void rev_unbind_receiver(struct listener *l)
+void rhttp_unbind_receiver(struct listener *l)
 {
 	l->rx.flags &= ~RX_F_BOUND;
 }
 
-int rev_set_affinity(struct connection *conn, int new_tid)
+int rhttp_set_affinity(struct connection *conn, int new_tid)
 {
-	/* TODO reversal conn rebinding after is disabled for the moment as we
-	 * did not test possible race conditions.
+	/* Explicitely disable connection thread migration on accept. Indeed,
+	 * it's unsafe to move a connection with its FD to another thread. Note
+	 * that active reverse task thread migration should be sufficient to
+	 * ensure repartition of reversed connections accross listener threads.
 	 */
 	return -1;
 }
 
-/* Simple callback to enable definition of passive HTTP reverse servers. */
-int rev_connect(struct connection *conn, int flags)
-{
-	return SF_ERR_NONE;
-}
-
-int rev_accepting_conn(const struct receiver *rx)
+int rhttp_accepting_conn(const struct receiver *rx)
 {
 	return 1;
 }
 
-INITCALL1(STG_REGISTER, protocol_register, &proto_reverse_connect);
+INITCALL1(STG_REGISTER, protocol_register, &proto_rhttp);
+
+/* perform minimal intializations */
+static void init_rhttp()
+{
+	int i;
+
+	for (i = 0; i < MAX_THREADS; i++)
+		ha_thread_ctx[i].nb_rhttp_conns = 0;
+}
+
+INITCALL0(STG_PREPARE, init_rhttp);

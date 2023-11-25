@@ -3,7 +3,7 @@
                           Configuration Manual
                          ----------------------
                               version 2.9
-                              2023/11/04
+                              2023/11/24
 
 
 This document covers the configuration language as implemented in the version
@@ -1541,14 +1541,20 @@ expose-experimental-directives
   This statement must appear before using directives tagged as experimental or
   the config file will be rejected.
 
-external-check
+external-check [preserve-env]
   Allows the use of an external agent to perform health checks. This is
   disabled by default as a security precaution, and even when enabled, checks
   may still fail unless "insecure-fork-wanted" is enabled as well. If the
   program launched makes use of a setuid executable (it should really not),
   you may also need to set "insecure-setuid-wanted" in the global section.
-  See "option external-check", and "insecure-fork-wanted", and
-  "insecure-setuid-wanted".
+  By default, the checks start with a clean environment which only contains
+  variables defined in the "external-check" command in the backend section. It
+  may sometimes be desirable to preserve the environment though, for example
+  when complex scripts retrieve their extra paths or information there. This
+  can be done by appending the "preserve-env" keyword. In this case however it
+  is strongly advised not to run a setuid nor as a privileged user, as this
+  exposes the check program to potential attacks. See "option external-check",
+  and "insecure-fork-wanted", and "insecure-setuid-wanted" for extra details.
 
 fd-hard-limit <number>
   Sets an upper bound to the maximum number of file descriptors that the
@@ -2906,7 +2912,7 @@ tune.disable-fast-forward [ EXPERIMENTAL ]
   that "expose-experimental-directives" must appear on a line before this
   directive.
 
-tune.zero-copy-forwarding
+tune.disable-zero-copy-forwarding
   Disables the zero-copy forwarding of data. It is a mechanism to optimize the
   data fast-forwarding by avoiding to use the channel's buffer. Thanks to this
   directive, it is possible to disable this optimization. Note it also disable
@@ -4492,7 +4498,6 @@ id                                        -          X         X         X
 ignore-persist                            -          -         X         X
 load-server-state-from-file               X          -         X         X
 log                                  (*)  X          X         X         X
-log-balance                               X          -         X         X
 log-format                                X          X         X         -
 log-format-sd                             X          X         X         -
 log-tag                                   X          X         X         X
@@ -4609,6 +4614,7 @@ tcp-response inspect-delay                X (!)      -         X         X
 timeout check                             X          -         X         X
 timeout client                            X          X         X         -
 timeout client-fin                        X          X         X         -
+timeout client-hs                         X          X         X         -
 timeout connect                           X          -         X         X
 timeout http-keep-alive                   X          X         X         X
 timeout http-request                      X          X         X         X
@@ -4659,18 +4665,30 @@ backlog <conns>
               system, it may represent the number of already acknowledged
               connections, of non-acknowledged ones, or both.
 
-  In order to protect against SYN flood attacks, one solution is to increase
-  the system's SYN backlog size. Depending on the system, sometimes it is just
-  tunable via a system parameter, sometimes it is not adjustable at all, and
-  sometimes the system relies on hints given by the application at the time of
-  the listen() syscall. By default, HAProxy passes the frontend's maxconn value
-  to the listen() syscall. On systems which can make use of this value, it can
-  sometimes be useful to be able to specify a different value, hence this
-  backlog parameter.
+  This option is only meaningful for stream listeners, including QUIC ones. Its
+  behavior however is not identical with QUIC instances.
+
+  For all listeners but QUIC, in order to protect against SYN flood attacks,
+  one solution is to increase the system's SYN backlog size. Depending on the
+  system, sometimes it is just tunable via a system parameter, sometimes it is
+  not adjustable at all, and sometimes the system relies on hints given by the
+  application at the time of the listen() syscall. By default, HAProxy passes
+  the frontend's maxconn value to the listen() syscall. On systems which can
+  make use of this value, it can sometimes be useful to be able to specify a
+  different value, hence this backlog parameter.
 
   On Linux 2.4, the parameter is ignored by the system. On Linux 2.6, it is
   used as a hint and the system accepts up to the smallest greater power of
   two, and never more than some limits (usually 32768).
+
+  For QUIC listeners, backlog sets a shared limits for both the maximum count
+  of active handshakes and connections waiting to be accepted. The handshake
+  phase relies primarily of the network latency with the remote peer, whereas
+  the second phase depends solely on haproxy load. When either one of this
+  limit is reached, haproxy starts to drop reception of INITIAL packets,
+  preventing any new connection allocation, until the connection excess starts
+  to decrease. This situation may cause browsers to silently downgrade the HTTP
+  versions and switching to TCP.
 
   See also : "maxconn" and the target operating system's tuning guide.
 
@@ -4697,7 +4715,8 @@ balance url_param <param> [check_post]
                   requests for it to be re-integrated into the farm and start
                   receiving traffic. This is normal, though very rare. It is
                   indicated here in case you would have the chance to observe
-                  it, so that you don't worry.
+                  it, so that you don't worry. Note: weights are ignored for
+                  backends in LOG mode.
 
       static-rr   Each server is used in turns, according to their weights.
                   This algorithm is as similar to roundrobin except that it is
@@ -4706,7 +4725,7 @@ balance url_param <param> [check_post]
                   limitation on the number of servers, and when a server goes
                   up, it is always immediately reintroduced into the farm, once
                   the full map is recomputed. It also uses slightly less CPU to
-                  run (around -1%).
+                  run (around -1%). This algorithm is not usable in LOG mode.
 
       leastconn   The server with the lowest number of connections receives the
                   connection. Round-robin is performed within groups of servers
@@ -4717,7 +4736,8 @@ balance url_param <param> [check_post]
                   algorithm is dynamic, which means that server weights may be
                   adjusted on the fly for slow starts for instance. It will
                   also consider the number of queued connections in addition to
-                  the established ones in order to minimize queuing.
+                  the established ones in order to minimize queuing. This
+                  algorithm is not usable in LOG mode.
 
       first       The first server with available connection slots receives the
                   connection. The servers are chosen from the lowest numeric
@@ -4747,7 +4767,8 @@ balance url_param <param> [check_post]
                   is not available, round robin will apply. This algorithm is
                   static by default, which means that changing a server's
                   weight on the fly will have no effect, but this can be
-                  changed using "hash-type".
+                  changed using "hash-type". This algorithm is not usable for
+                  backends in LOG mode, please use "log-hash" instead.
 
       source      The source IP address is hashed and divided by the total
                   weight of the running servers to designate which server will
@@ -4762,6 +4783,7 @@ balance url_param <param> [check_post]
                   static by default, which means that changing a server's
                   weight on the fly will have no effect, but this can be
                   changed using "hash-type". See also the "hash" option above.
+                  This algorithm is not usable for backends in LOG mode.
 
       uri         This algorithm hashes either the left part of the URI (before
                   the question mark) or the whole URI (if the "whole" parameter
@@ -4869,6 +4891,13 @@ balance url_param <param> [check_post]
                   the Power of Two Random Choices and is described here :
                   http://www.eecs.harvard.edu/~michaelm/postscripts/handbook2001.pdf
 
+                  For backends in LOG mode, the number of draws is ignored and
+                  a single random is picked since there is no notion of server
+                  load. Random log balancing can be useful with large farms or
+                  when servers are frequently added or removed from the pool of
+                  available servers as it may avoid the hammering effect that
+                  could result from roundrobin in this situation.
+
       rdp-cookie
       rdp-cookie(<name>)
                   The RDP cookie <name> (or "mstshash" if omitted) will be
@@ -4890,20 +4919,40 @@ balance url_param <param> [check_post]
                   but this can be changed using "hash-type". See also the
                   "hash" option above.
 
+      log-hash    Takes a comma-delimited list of converters in argument. These
+                  converters are applied in sequence to the input log message,
+                  and the result will be cast as a string then hashed according
+                  to the configured hash-type. The resulting hash will be used
+                  to select the destination server among the ones declared in
+                  the log backend. The goal of this algorithm is to be able to
+                  extract a key within the final log message using string
+                  converters and then be able to stick to the same server thanks
+                  to the hash. Only "map-based" hashes are supported for now.
+                  This algorithm is only usable for backends in LOG mode, for
+                  others, please use "hash" instead.
+
+      sticky      Tries to stick to the same server as much as possible. The
+                  first server in the list of available servers receives all
+                  the log messages. When the server goes DOWN, the next server
+                  in the list takes its place. When a previously DOWN server
+                  goes back UP it is added at the end of the list so that the
+                  sticky server doesn't change until it becomes DOWN. This
+                  algorithm is only usable for backends in LOG mode.
+
     <arguments> is an optional list of arguments which may be needed by some
-                algorithms. Right now, only "url_param" and "uri" support an
-                optional argument.
+                algorithms. Right now, only "url_param", "uri" and "log-hash"
+                support an optional argument.
 
   The load balancing algorithm of a backend is set to roundrobin when no other
   algorithm, mode nor option have been set. The algorithm may only be set once
-  for each backend.
+  for each backend. In backends in LOG mode, server "weight" is always ignored.
 
   With authentication schemes that require the same connection like NTLM, URI
   based algorithms must not be used, as they would cause subsequent requests
   to be routed to different backend servers, breaking the invalid assumptions
   NTLM relies on.
 
-  Examples :
+  TCP/HTTP Examples :
         balance roundrobin
         balance url_param userid
         balance url_param session_id check_post 64
@@ -4913,6 +4962,30 @@ balance url_param <param> [check_post]
         balance hash req.cookie(clientid)
         balance hash var(req.client_id)
         balance hash req.hdr_ip(x-forwarded-for,-1),ipmask(24)
+
+  LOG backend examples:
+        global
+          log backend@mylog-rrb local0 # send all logs to mylog-rrb backend
+          log backend@mylog-hash local0 # send all logs to mylog-hash backend
+
+        backend mylog-rrb
+          mode log
+          balance roundrobin
+
+          server s1 udp@127.0.0.1:514 # will receive 50% of log messages
+          server s2 udp@127.0.0.1:514
+
+        backend mylog-hash
+          mode log
+
+          # extract "METHOD URL PROTO" at the end of the log message,
+          # and let haproxy hash it so that log messages generated from
+          # similar requests get sent to the same syslog server:
+          balance log-hash 'field(-2,\")'
+
+          # server list here
+          server s1 127.0.0.1:514
+          #...
 
   Note: the following caveats and limitations on using the "check_post"
   extension with "url_param" must be considered :
@@ -5002,7 +5075,7 @@ bind /<path> [, ...] [param*]
                     - 'rhttp@' -> used for reverse HTTP. Address must be a
                       server with the format '<backend>/<server>'. The server
                       will be used to instantiate connections to a remote
-                      address. The listener will try to maintain 'maxconn'
+                      address. The listener will try to maintain "nbconn"
                       connections.
 
                   You may want to reference some environment variables in the
@@ -8906,82 +8979,6 @@ no log
                                                 # level and send in tcp
     log "${LOCAL_SYSLOG}:514" local0 notice   # send to local server
 
-log-balance <algorithm> [ <arguments> ]
-
-  Define the load balancing algorithm to be used in a log backend.
-  ("mode log" enabled)
-
-  May be used in sections :   defaults | frontend | listen | backend
-                                 yes   |    no    |   yes  |   yes
-  Arguments :
-    <algorithm> is the algorithm used to select a server when doing load
-                balancing. This only applies when no persistence information
-                is available, or when a connection is redispatched to another
-                server. <algorithm> may be one of the following :
-
-      roundrobin  Each server is used in turns. This is the smoothest and
-                  fairest algorithm when the server's processing time remains
-                  equally distributed.
-
-      sticky      The first server in the list of available servers receives all
-                  the log messages. When the server goes DOWN, the next server
-                  in the list takes its place. When a previously DOWN server
-                  goes back UP it is added at the end of the list so that the
-                  sticky server doesn't change until it becomes DOWN.
-
-      random      A random number will be used as the key for the server
-                  lookup. Random log balancing can be useful with large farms
-                  or when servers are frequently added or removed from the
-                  pool of available servers as it may avoid the hammering
-                  effect that could result from roundrobin in this situation.
-
-      hash        <arguments> should be found in the form: <cnv_list>
-                  e.g.: log-balance hash <cnv_list>
-
-                  Each log message will be passed to the converter list
-                  specified in <cnv_list> (ie: "cnv1,cnv2..."), and it will
-                  then be passed to haproxy hashing function according to
-                  "hash-type" settings. The resulting hash will be used to
-                  select the destination server among the ones declared in the
-                  log backend. The goal of this algorithm is to be able to
-                  extract a key within the final log message using string
-                  converters and then be able to stick to the same server thanks
-                  to the hash. Only "map-based" hashes are supported for now.
-
-    <arguments> is an optional list of arguments which may be needed by some
-                algorithms.
-
-  The load balancing algorithm of a log backend is set to roundrobin when
-  no other algorithm has been set. The algorithm may only be set once for each
-  log backend. The above algorithms support the "backup" server option and the
-  "allbackups" proxy option. However server "weight" is not supported and will
-  be ignored.
-
-  Examples :
-
-        global
-          log backend@mylog-rrb local0 # send all logs to mylog-rrb backend
-          log backend@mylog-hash local0 # send all logs to mylog-hash backend
-
-        backend mylog-rrb
-          mode log
-          log-balance roundrobin
-
-          server s1 udp@127.0.0.1:514 # will receive 50% of log messages
-          server s2 udp@127.0.0.1:514
-
-        backend mylog-hash
-          mode log
-
-          # extract "METHOD URL PROTO" at the end of the log message,
-          # and let haproxy hash it so that log messages generated from
-          # similar requests get sent to the same syslog server:
-          log-balance hash 'field(-2,\")'
-
-          # server list here
-          server s1 127.0.0.1:514
-          #...
-
 log-format <string>
   Specifies the log format string to use for traffic logs
   May be used in sections:    defaults | frontend | listen | backend
@@ -9065,6 +9062,8 @@ max-session-srv-conns <nb>
   Set the maximum number of outgoing connections we can keep idling for a given
   client session. The default is 5 (it precisely equals MAX_SRV_LIST which is
   defined at build time).
+  May be used in sections :   defaults | frontend | listen | backend
+                                 yes   |    yes   |   yes  |   no
 
 maxconn <conns>
   Fix the maximum number of concurrent connections on a frontend
@@ -9116,10 +9115,9 @@ mode { tcp|http|log }
               any "log" directive by using the "backend@<name>" syntax. Log
               messages will be distributed to the servers from the backend
               according to the lb settings which can be configured using the
-              "log-balance" keyword (in place of the "balance" keyword for TCP
-              and HTTP backends). Log backends support UDP servers by prefixing
+              "balance" keyword. Log backends support UDP servers by prefixing
               the server's address with the "udp@" prefix. Common backend and
-              server features are supported, but not TCP or HTTP related ones.
+              server features are supported, but not TCP or HTTP specific ones.
 
   When doing content switching, it is mandatory that the frontend and the
   backend are in the same mode (generally HTTP), otherwise the configuration
@@ -12574,13 +12572,13 @@ stick-table type {ip | integer | string [len <length>] | binary [len <length>]}
                written to in addition to the source table. <wtable> must be of
                the same type as the table being defined and must have the same
                key length, and source table cannot be used as a target table
-               itself. Everytime an entry update will be received on the source
+               itself. Every time an entry update will be received on the source
                table through a peer, haproxy will try to refresh related
                <wtable> entry. If the entry doesn't exist yet, it will be
                created, else its values will be updated as well as its timer.
                Note that only types that are not involved in arithmetic ops such
                as server_id, server_key and gpt will be written to <wtable> to
-               prevent processed values from a remote table from intefering with
+               prevent processed values from a remote table from interfering with
                arithmetic operations performed on the local target table.
                (ie: prevent shared cumulative counter from growing indefinitely)
                One common use of this option is to be able to use sticking rules
@@ -14348,9 +14346,6 @@ timeout check <timeout>
   "defaults" sections. This is in fact one of the easiest solutions not to
   forget about it.
 
-  This directive is only available from named defaults sections, not anonymous
-  ones. Proxies inherit this value from their defaults section.
-
   See also: "timeout connect", "timeout queue", "timeout server",
             "timeout tarpit".
 
@@ -14416,6 +14411,20 @@ timeout client-fin <timeout>
   will use the other timeouts (timeout.client or timeout.tunnel).
 
   See also : "timeout client", "timeout server-fin", and "timeout tunnel".
+
+
+timeout client-hs <timeout>
+  Set the maximum time to wait for a client TLS handshake to complete. This is
+  usable both for TCP and QUIC connections.
+  May be used in sections :   defaults | frontend | listen | backend
+                                 yes   |    yes   |   yes  |   no
+  Arguments :
+    <timeout> is the timeout value specified in milliseconds by default, but
+              can be in any other unit if the number is suffixed by the unit,
+              as explained at the top of this document.
+
+  If this handshake timeout is not set, this is the client timeout which is used
+  in place.
 
 
 timeout connect <timeout>
@@ -15574,17 +15583,26 @@ proto <name>
   instance, it is possible to force the http/2 on clear TCP by specifying "proto
   h2" on the bind line.
 
-quic-cc-algo [ cubic | newreno ]
+quic-cc-algo { cubic | newreno }
+quic-cc-algo { cubic | newreno }(max_window)
   This is a QUIC specific setting to select the congestion control algorithm
   for any connection attempts to the configured QUIC listeners. They are similar
-  to those used by TCP.
+  to those used by TCP. An optional value in bytes may be used to specify the
+  maximum window size. It must be greater than 1k and smaller than 4g.
 
   Default value: cubic
+  Default window value: tune.quic.frontend.conn-tx-buffers.limit * tune.bufsize
+
+  Example:
+      # newreno congestion control algorithm
+      quic-cc-algo newreno
+      # cubic congestion control algorithm with one megabytes as window
+      quic-cc-algo cubic(1m)
 
 quic-force-retry
   This is a QUIC specific setting which forces the use of the QUIC Retry feature
   for all the connection attempts to the configured QUIC listeners. It consists
-  in veryfying the peers are able to receive packets at the transport address
+  in verifying the peers are able to receive packets at the transport address
   they used to initiate a new connection, sending them a Retry packet which
   contains a token. This token must be sent back to the Retry packet sender,
   this latter being the only one to be able to validate the token. Note that QUIC
@@ -15752,6 +15770,10 @@ thread [<thread-group>/]<thread-set>[,...]
   load balancing. Currently Linux 3.9 and above is known for supporting this.
   See also the "shards" keyword above that automates duplication of "bind"
   lines and their assignment to multiple groups of threads.
+
+  This keyword is compatible with reverse HTTP binds. However, it is forbidden
+  to specify a thread set which spans accross several thread groups for such a
+  listener as this may caused "nbconn" to not work as intended.
 
 tls-ticket-keys <keyfile>
   Sets the TLS ticket keys file to load the keys from. The keys need to be 48
@@ -16940,11 +16962,11 @@ tfo
   "empty-response" and "response-timeout" keywords for "retry-on", or HAProxy
   won't be able to retry the connection on failure. See also "no-tfo".
 
-track [<proxy>/]<server>
+track [<backend>/]<server>
   This option enables ability to set the current state of the server by tracking
   another one. It is possible to track a server which itself tracks another
   server, provided that at the end of the chain, a server has health checks
-  enabled. If <proxy> is omitted the current one is used. If disable-on-404 is
+  enabled. If <backend> is omitted the current one is used. If disable-on-404 is
   used, it has to be enabled on both proxies.
 
 tls-tickets
@@ -20391,7 +20413,7 @@ fc_pp_tlv(<id>) : string
   values to 256 bytes for optimal performance.
 
   Note that unlike fc_pp_authority and fc_pp_unique_id, fc_pp_tlv is able to
-  iterate over all occurances of a requested TLV in case there are duplicate
+  iterate over all occurrences of a requested TLV in case there are duplicate
   TLV IDs. The order of iteration matches the position in the PROXY protocol
   header. However, relying on duplicates should mostly be avoided as TLVs are
   typically assumed to be unique. Generally, finding duplicated TLV IDs
@@ -22597,7 +22619,7 @@ req_ver : string (deprecated)
   Common values are "1.0", "1.1", "2.0" or "3.0".
 
   In the case of http/2 and http/3, the value is not extracted from the HTTP
-  version in the request line but is determined by the negociated protocol
+  version in the request line but is determined by the negotiated protocol
   version.
 
   ACL derivatives :
@@ -23022,6 +23044,7 @@ HTTP             req.proto_http                     match if request protocol is
 HTTP_1.0         req.ver 1.0                        match if HTTP request version is 1.0
 HTTP_1.1         req.ver 1.1                        match if HTTP request version is 1.1
 HTTP_2.0         req.ver 2.0                        match if HTTP request version is 2.0
+HTTP_3.0         req.ver 3.0                        match if HTTP request version is 3.0
 HTTP_CONTENT     req.hdr_val(content-length) gt 0   match an existing content-length in the HTTP request
 HTTP_URL_ABS     url_reg ^[^/:]*://                 match absolute URL with scheme
 HTTP_URL_SLASH   url_beg /                          match URL beginning with "/"

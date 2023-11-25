@@ -49,9 +49,17 @@ extern struct applet http_cache_applet;
 
 struct flt_ops cache_ops;
 
-struct cache {
-	struct list list;        /* cache linked list */
+struct cache_tree {
 	struct eb_root entries;  /* head of cache entries based on keys */
+	__decl_thread(HA_RWLOCK_T lock);
+
+	struct list cleanup_list;
+	__decl_thread(HA_SPINLOCK_T cleanup_lock);
+} ALIGNED(64);
+
+struct cache {
+	struct cache_tree trees[CACHE_TREE_NUM];
+	struct list list;        /* cache linked list */
 	unsigned int maxage;     /* max-age */
 	unsigned int maxblocks;
 	unsigned int maxobjsz;   /* max-object-size (in bytes) */
@@ -62,6 +70,7 @@ struct cache {
 
 /* the appctx context of a cache applet, stored in appctx->svcctx */
 struct cache_appctx {
+	struct cache_tree *cache_tree;
 	struct cache_entry *entry;       /* Entry to be sent from cache. */
 	unsigned int sent;               /* The number of bytes already sent for this cache entry. */
 	unsigned int offset;             /* start offset of remaining data relative to beginning of the next block */
@@ -83,6 +92,7 @@ struct cache_flt_conf {
 /* CLI context used during "show cache" */
 struct show_cache_ctx {
 	struct cache *cache;
+	struct cache_tree *cache_tree;
 	uint next_key;
 };
 
@@ -148,11 +158,32 @@ const struct vary_hashing_information vary_information[] = {
 };
 
 
+static inline void cache_rdlock(struct cache_tree *cache)
+{
+	HA_RWLOCK_RDLOCK(CACHE_LOCK, &cache->lock);
+}
+
+static inline  void cache_rdunlock(struct cache_tree *cache)
+{
+	HA_RWLOCK_RDUNLOCK(CACHE_LOCK, &cache->lock);
+}
+
+static inline void cache_wrlock(struct cache_tree *cache)
+{
+	HA_RWLOCK_WRLOCK(CACHE_LOCK, &cache->lock);
+}
+
+static inline void cache_wrunlock(struct cache_tree *cache)
+{
+	HA_RWLOCK_WRUNLOCK(CACHE_LOCK, &cache->lock);
+}
+
 /*
  * cache ctx for filters
  */
 struct cache_st {
 	struct shared_block *first_block;
+	struct list detached_head;
 };
 
 #define DEFAULT_MAX_SECONDARY_ENTRY 10
@@ -163,8 +194,12 @@ struct cache_entry {
 	unsigned int expire;      /* expiration date (wall clock time) */
 	unsigned int age;         /* Origin server "Age" header value */
 
+	int refcount;
+
 	struct eb32_node eb;     /* ebtree node used to hold the cache object */
 	char hash[20];
+
+	struct list cleanup_list;/* List used between the cache_free_blocks and cache_reserve_finish calls */
 
 	char secondary_key[HTTP_CACHE_SEC_KEY_LEN];  /* Optional secondary key. */
 	unsigned int secondary_key_signature;  /* Bitfield of the HTTP headers that should be used
@@ -194,15 +229,29 @@ static struct cache *tmp_cache_config = NULL;
 
 DECLARE_STATIC_POOL(pool_head_cache_st, "cache_st", sizeof(struct cache_st));
 
-static struct eb32_node *insert_entry(struct cache *cache, struct cache_entry *new_entry);
+static struct eb32_node *insert_entry(struct cache *cache, struct cache_tree *tree, struct cache_entry *new_entry);
 static void delete_entry(struct cache_entry *del_entry);
+static void release_entry_locked(struct cache_tree *cache, struct cache_entry *entry);
+static void release_entry_unlocked(struct cache_tree *cache, struct cache_entry *entry);
 
-struct cache_entry *entry_exist(struct cache *cache, char *hash)
+/*
+ * Find a cache_entry in the <cache>'s tree that has the hash <hash>.
+ * If <delete_expired> is 0 then the entry is left untouched if it is found but
+ * is already expired, and NULL is returned. Otherwise, the expired entry is
+ * removed from the tree and NULL is returned.
+ * Returns a valid (not expired) cache_tree pointer.
+ * The returned entry is not retained, it should be explicitly retained only
+ * when necessary.
+ *
+ * This function must be called under a cache lock, either read if
+ * delete_expired==0, write otherwise.
+ */
+struct cache_entry *get_entry(struct cache_tree *cache_tree, char *hash, int delete_expired)
 {
 	struct eb32_node *node;
 	struct cache_entry *entry;
 
-	node = eb32_lookup(&cache->entries, read_u32(hash));
+	node = eb32_lookup(&cache_tree->entries, read_u32(hash));
 	if (!node)
 		return NULL;
 
@@ -214,12 +263,70 @@ struct cache_entry *entry_exist(struct cache *cache, char *hash)
 
 	if (entry->expire > date.tv_sec) {
 		return entry;
-	} else {
-		delete_entry(entry);
-		entry->eb.key = 0;
+	} else if (delete_expired) {
+		release_entry_locked(cache_tree, entry);
 	}
 	return NULL;
+}
 
+/*
+ * Increment a cache_entry's reference counter.
+ */
+static void retain_entry(struct cache_entry *entry)
+{
+	if (entry)
+		HA_ATOMIC_INC(&entry->refcount);
+}
+
+/*
+ * Decrement a cache_entry's reference counter and remove it from the <cache>'s
+ * tree if the reference counter becomes 0.
+ * If <needs_locking> is 0 then the cache lock was already taken by the caller,
+ * otherwise it must be taken in write mode before actually deleting the entry.
+ */
+static void release_entry(struct cache_tree *cache, struct cache_entry *entry, int needs_locking)
+{
+	if (!entry)
+		return;
+
+	if (HA_ATOMIC_SUB_FETCH(&entry->refcount, 1) <= 0) {
+		if (needs_locking) {
+			cache_wrlock(cache);
+			/* The value might have changed between the last time we
+			 * checked it and now, we need to recheck it just in
+			 * case.
+			 */
+			if (HA_ATOMIC_LOAD(&entry->refcount) > 0) {
+				cache_wrunlock(cache);
+				return;
+			}
+		}
+		delete_entry(entry);
+		if (needs_locking) {
+			cache_wrunlock(cache);
+		}
+	}
+}
+
+/*
+ * Decrement a cache_entry's reference counter and remove it from the <cache>'s
+ * tree if the reference counter becomes 0.
+ * This function must be called under the cache lock in write mode.
+ */
+static inline void release_entry_locked(struct cache_tree *cache, struct cache_entry *entry)
+{
+	release_entry(cache, entry, 0);
+}
+
+/*
+ * Decrement a cache_entry's reference counter and remove it from the <cache>'s
+ * tree if the reference counter becomes 0.
+ * This function must not be called under the cache lock or the shctx lock. The
+ * cache lock might be taken in write mode (if the entry gets deleted).
+ */
+static inline void release_entry_unlocked(struct cache_tree *cache, struct cache_entry *entry)
+{
+	release_entry(cache, entry, 1);
 }
 
 
@@ -256,10 +363,16 @@ static int secondary_key_cmp(const char *ref_key, const char *new_key)
  * order to get the proper one out of the list, we use a secondary_key.
  * This function simply iterates over all the entries with the same primary_key
  * until it finds the right one.
+ * If <delete_expired> is 0 then the entry is left untouched if it is found but
+ * is already expired, and NULL is returned. Otherwise, the expired entry is
+ * removed from the tree and NULL is returned.
  * Returns the cache_entry in case of success, NULL otherwise.
+ *
+ * This function must be called under a cache lock, either read if
+ * delete_expired==0, write otherwise.
  */
-struct cache_entry *secondary_entry_exist(struct cache *cache, struct cache_entry *entry,
-					  const char *secondary_key)
+struct cache_entry *get_secondary_entry(struct cache_tree *cache, struct cache_entry *entry,
+                                        const char *secondary_key, int delete_expired)
 {
 	struct eb32_node *node = &entry->eb;
 
@@ -273,9 +386,8 @@ struct cache_entry *secondary_entry_exist(struct cache *cache, struct cache_entr
 		 * when we find them. Calling delete_entry would be too costly
 		 * so we simply call eb32_delete. The secondary_entry count will
 		 * be updated when we try to insert a new entry to this list. */
-		if (entry->expire <= date.tv_sec) {
-			eb32_delete(&entry->eb);
-			entry->eb.key = 0;
+		if (entry->expire <= date.tv_sec && delete_expired) {
+			release_entry_locked(cache, entry);
 		}
 
 		entry = node ? eb32_entry(node, struct cache_entry, eb) : NULL;
@@ -283,12 +395,21 @@ struct cache_entry *secondary_entry_exist(struct cache *cache, struct cache_entr
 
 	/* Expired entry */
 	if (entry && entry->expire <= date.tv_sec) {
-		eb32_delete(&entry->eb);
-		entry->eb.key = 0;
+		if (delete_expired) {
+			release_entry_locked(cache, entry);
+		}
 		entry = NULL;
 	}
 
 	return entry;
+}
+
+static inline struct cache_tree *get_cache_tree_from_hash(struct cache *cache, unsigned int hash)
+{
+	if (!cache)
+		return NULL;
+
+	return &cache->trees[hash % CACHE_TREE_NUM];
 }
 
 
@@ -296,8 +417,10 @@ struct cache_entry *secondary_entry_exist(struct cache *cache, struct cache_entr
  * Remove all expired entries from a list of duplicates.
  * Return the number of alive entries in the list and sets dup_tail to the
  * current last item of the list.
+ *
+ * This function must be called under a cache write lock.
  */
-static unsigned int clear_expired_duplicates(struct eb32_node **dup_tail)
+static unsigned int clear_expired_duplicates(struct cache_tree *cache, struct eb32_node **dup_tail)
 {
 	unsigned int entry_count = 0;
 	struct cache_entry *entry = NULL;
@@ -308,8 +431,7 @@ static unsigned int clear_expired_duplicates(struct eb32_node **dup_tail)
 		entry = container_of(prev, struct cache_entry, eb);
 		prev = eb32_prev_dup(prev);
 		if (entry->expire <= date.tv_sec) {
-			eb32_delete(&entry->eb);
-			entry->eb.key = 0;
+			release_entry_locked(cache, entry);
 		}
 		else {
 			if (!tail)
@@ -333,15 +455,19 @@ static unsigned int clear_expired_duplicates(struct eb32_node **dup_tail)
  * simple insert. In case of secondary entries, it will at most cost an
  * insertion+max_sec_entries time checks and entry deletion.
  * Returns the newly inserted node in case of success, NULL otherwise.
+ *
+ * This function must be called under a cache write lock.
  */
-static struct eb32_node *insert_entry(struct cache *cache, struct cache_entry *new_entry)
+static struct eb32_node *insert_entry(struct cache *cache, struct cache_tree *tree, struct cache_entry *new_entry)
 {
 	struct eb32_node *prev = NULL;
 	struct cache_entry *entry = NULL;
 	unsigned int entry_count = 0;
 	unsigned int last_clear_ts = date.tv_sec;
 
-	struct eb32_node *node = eb32_insert(&cache->entries, &new_entry->eb);
+	struct eb32_node *node = eb32_insert(&tree->entries, &new_entry->eb);
+
+	new_entry->refcount = 1;
 
 	/* We should not have multiple entries with the same primary key unless
 	 * the entry has a non null vary signature. */
@@ -365,19 +491,17 @@ static struct eb32_node *insert_entry(struct cache *cache, struct cache_entry *n
 			if (last_clear_ts == date.tv_sec) {
 				/* Too many entries for this primary key, clear the
 				 * one that was inserted. */
-				eb32_delete(node);
-				node->key = 0;
+				release_entry_locked(tree, entry);
 				return NULL;
 			}
 
-			entry_count = clear_expired_duplicates(&prev);
+			entry_count = clear_expired_duplicates(tree, &prev);
 			if (entry_count >= cache->max_secondary_entries) {
 				/* Still too many entries for this primary key, delete
 				 * the newly inserted one. */
 				entry = container_of(prev, struct cache_entry, eb);
 				entry->last_clear_ts = date.tv_sec;
-				eb32_delete(node);
-				node->key = 0;
+				release_entry_locked(tree, entry);
 				return NULL;
 			}
 		}
@@ -394,6 +518,8 @@ static struct eb32_node *insert_entry(struct cache *cache, struct cache_entry *n
  * This function removes an entry from the ebtree. If the entry was a duplicate
  * (in case of Vary), it updates the secondary entry counter in another
  * duplicate entry (the last entry of the dup list).
+ *
+ * This function must be called under a cache write lock.
  */
 static void delete_entry(struct cache_entry *del_entry)
 {
@@ -541,9 +667,9 @@ cache_store_strm_deinit(struct stream *s, struct filter *filter)
 	/* Everything should be released in the http_end filter, but we need to do it
 	 * there too, in case of errors */
 	if (st && st->first_block) {
-		shctx_lock(shctx);
-		shctx_row_dec_hot(shctx, st->first_block);
-		shctx_unlock(shctx);
+		shctx_wrlock(shctx);
+		shctx_row_reattach(shctx, st->first_block);
+		shctx_wrunlock(shctx);
 	}
 	if (st) {
 		pool_free(pool_head_cache_st, st);
@@ -594,14 +720,14 @@ static inline void disable_cache_entry(struct cache_st *st,
                                        struct filter *filter, struct shared_context *shctx)
 {
 	struct cache_entry *object;
+	struct cache *cache = (struct cache*)shctx->data;
 
 	object = (struct cache_entry *)st->first_block->data;
 	filter->ctx = NULL; /* disable cache  */
-	shctx_lock(shctx);
-	shctx_row_dec_hot(shctx, st->first_block);
-	eb32_delete(&object->eb);
-	object->eb.key = 0;
-	shctx_unlock(shctx);
+	release_entry_unlocked(&cache->trees[object->eb.key % CACHE_TREE_NUM], object);
+	shctx_wrlock(shctx);
+	shctx_row_reattach(shctx, st->first_block);
+	shctx_wrunlock(shctx);
 	pool_free(pool_head_cache_st, st);
 }
 
@@ -674,15 +800,13 @@ cache_store_http_payload(struct stream *s, struct filter *filter, struct http_ms
 	}
 
   end:
-	shctx_lock(shctx);
+
 	fb = shctx_row_reserve_hot(shctx, st->first_block, trash.data);
 	if (!fb) {
-		shctx_unlock(shctx);
 		goto no_cache;
 	}
-	shctx_unlock(shctx);
 
-	ret = shctx_row_data_append(shctx, st->first_block, st->first_block->last_append,
+	ret = shctx_row_data_append(shctx, st->first_block,
 				    (unsigned char *)b_head(&trash), b_data(&trash));
 	if (ret < 0)
 		goto no_cache;
@@ -712,12 +836,12 @@ cache_store_http_end(struct stream *s, struct filter *filter,
 
 		object = (struct cache_entry *)st->first_block->data;
 
-		shctx_lock(shctx);
+		shctx_wrlock(shctx);
 		/* The whole payload was cached, the entry can now be used. */
 		object->complete = 1;
 		/* remove from the hotlist */
-		shctx_row_dec_hot(shctx, st->first_block);
-		shctx_unlock(shctx);
+		shctx_row_reattach(shctx, st->first_block);
+		shctx_wrunlock(shctx);
 
 	}
 	if (st) {
@@ -871,13 +995,56 @@ int http_calc_maxage(struct stream *s, struct cache *cache, int *true_maxage)
 }
 
 
-static void cache_free_blocks(struct shared_block *first, struct shared_block *block)
+static void cache_free_blocks(struct shared_block *first, void *data)
 {
-	struct cache_entry *object = (struct cache_entry *)block->data;
+	struct cache_entry *object = (struct cache_entry *)first->data;
+	struct cache *cache = (struct cache *)data;
+	struct cache_tree *cache_tree;
 
-	if (first == block && object->eb.key)
-		delete_entry(object);
-	object->eb.key = 0;
+	if (object->eb.key) {
+		object->complete = 0;
+		cache_tree = &cache->trees[object->eb.key % CACHE_TREE_NUM];
+		retain_entry(object);
+		HA_SPIN_LOCK(CACHE_LOCK, &cache_tree->cleanup_lock);
+		LIST_INSERT(&cache_tree->cleanup_list, &object->cleanup_list);
+		HA_SPIN_UNLOCK(CACHE_LOCK, &cache_tree->cleanup_lock);
+	}
+}
+
+static void cache_reserve_finish(struct shared_context *shctx)
+{
+	struct cache_entry *object, *back;
+	struct cache *cache = (struct cache *)shctx->data;
+	struct cache_tree *cache_tree;
+	int cache_tree_idx = 0;
+
+	for (; cache_tree_idx < CACHE_TREE_NUM; ++cache_tree_idx) {
+		cache_tree = &cache->trees[cache_tree_idx];
+
+		cache_wrlock(cache_tree);
+		HA_SPIN_LOCK(CACHE_LOCK, &cache_tree->cleanup_lock);
+
+		list_for_each_entry_safe(object, back, &cache_tree->cleanup_list, cleanup_list) {
+			LIST_DELETE(&object->cleanup_list);
+			/*
+			 * At this point we locked the cache tree in write mode
+			 * so no new thread could retain the current entry
+			 * because the only two places where it can happen is in
+			 * the cache_use case which is under cache_rdlock and
+			 * the reserve_hot case which would require the
+			 * corresponding block to still be in the avail list,
+			 * which is impossible (we reserved it for a thread and
+			 * took it out of the avail list already). The only two
+			 * references are then the default one (upon cache_entry
+			 * creation) and the one in this cleanup list.
+			 */
+			BUG_ON(object->refcount > 2);
+			delete_entry(object);
+		}
+
+		HA_SPIN_UNLOCK(CACHE_LOCK, &cache_tree->cleanup_lock);
+		cache_wrunlock(cache_tree);
+	}
 }
 
 
@@ -1016,6 +1183,7 @@ enum act_return http_action_store_cache(struct act_rule *rule, struct proxy *px,
 	size_t hdrs_len = 0;
 	int32_t pos;
 	unsigned int vary_signature = 0;
+	struct cache_tree *cache_tree = NULL;
 
 	/* Don't cache if the response came from a cache */
 	if ((obj_type(s->target) == OBJ_TYPE_APPLET) &&
@@ -1026,6 +1194,8 @@ enum act_return http_action_store_cache(struct act_rule *rule, struct proxy *px,
 	/* cache only HTTP/1.1 */
 	if (!(txn->req.flags & HTTP_MSGF_VER_11))
 		goto out;
+
+	cache_tree = get_cache_tree_from_hash(cache, read_u32(txn->cache_hash));
 
 	/* cache only GET method */
 	if (txn->meth != HTTP_METH_GET) {
@@ -1044,14 +1214,12 @@ enum act_return http_action_store_cache(struct act_rule *rule, struct proxy *px,
 			default: /* Any unsafe method */
 				/* Discard any corresponding entry in case of successful
 				 * unsafe request (such as PUT, POST or DELETE). */
-				shctx_lock(shctx);
+				cache_wrlock(cache_tree);
 
-				old = entry_exist(cconf->c.cache, txn->cache_hash);
-				if (old) {
-					eb32_delete(&old->eb);
-					old->eb.key = 0;
-				}
-				shctx_unlock(shctx);
+				old = get_entry(cache_tree, txn->cache_hash, 1);
+				if (old)
+					release_entry_locked(cache_tree, old);
+				cache_wrunlock(cache_tree);
 			}
 		}
 		goto out;
@@ -1109,29 +1277,30 @@ enum act_return http_action_store_cache(struct act_rule *rule, struct proxy *px,
 	if (!(txn->flags & TX_CACHEABLE) || !(txn->flags & TX_CACHE_COOK))
 		goto out;
 
-	shctx_lock(shctx);
-	old = entry_exist(cache, txn->cache_hash);
+	cache_wrlock(cache_tree);
+	old = get_entry(cache_tree, txn->cache_hash, 1);
 	if (old) {
 		if (vary_signature)
-			old = secondary_entry_exist(cconf->c.cache, old,
-						    txn->cache_secondary_hash);
+			old = get_secondary_entry(cache_tree, old,
+			                          txn->cache_secondary_hash, 1);
 		if (old) {
 			if (!old->complete) {
 				/* An entry with the same primary key is already being
 				 * created, we should not try to store the current
 				 * response because it will waste space in the cache. */
-				shctx_unlock(shctx);
+				cache_wrunlock(cache_tree);
 				goto out;
 			}
-			delete_entry(old);
-			old->eb.key = 0;
+			release_entry_locked(cache_tree, old);
 		}
 	}
+	cache_wrunlock(cache_tree);
+
 	first = shctx_row_reserve_hot(shctx, NULL, sizeof(struct cache_entry));
 	if (!first) {
-		shctx_unlock(shctx);
 		goto out;
 	}
+
 	/* the received memory is not initialized, we need at least to mark
 	 * the object as not indexed yet.
 	 */
@@ -1149,13 +1318,14 @@ enum act_return http_action_store_cache(struct act_rule *rule, struct proxy *px,
 	if (vary_signature)
 		memcpy(object->secondary_key, txn->cache_secondary_hash, HTTP_CACHE_SEC_KEY_LEN);
 
+	cache_wrlock(cache_tree);
 	/* Insert the entry in the tree even if the payload is not cached yet. */
-	if (insert_entry(cache, object) != &object->eb) {
+	if (insert_entry(cache, cache_tree, object) != &object->eb) {
 		object->eb.key = 0;
-		shctx_unlock(shctx);
+		cache_wrunlock(cache_tree);
 		goto out;
 	}
-	shctx_unlock(shctx);
+	cache_wrunlock(cache_tree);
 
 	/* reserve space for the cache_entry structure */
 	first->len = sizeof(struct cache_entry);
@@ -1164,7 +1334,7 @@ enum act_return http_action_store_cache(struct act_rule *rule, struct proxy *px,
 	/* Determine the entry's maximum age (taking into account the cache's
 	 * configuration) as well as the response's explicit max age (extracted
 	 * from cache-control directives or the expires header). */
-	effective_maxage = http_calc_maxage(s, cconf->c.cache, &true_maxage);
+	effective_maxage = http_calc_maxage(s, cache, &true_maxage);
 
 	ctx.blk = NULL;
 	if (http_find_header(htx, ist("Age"), &ctx, 0)) {
@@ -1226,12 +1396,9 @@ enum act_return http_action_store_cache(struct act_rule *rule, struct proxy *px,
 		if (set_secondary_key_encoding(htx, object->secondary_key))
 		    goto out;
 
-	shctx_lock(shctx);
 	if (!shctx_row_reserve_hot(shctx, first, trash.data)) {
-		shctx_unlock(shctx);
 		goto out;
 	}
-	shctx_unlock(shctx);
 
 	/* cache the headers in a http action because it allows to chose what
 	 * to cache, for example you might want to cache a response before
@@ -1240,12 +1407,13 @@ enum act_return http_action_store_cache(struct act_rule *rule, struct proxy *px,
 	 */
 	/* does not need to be locked because it's in the "hot" list,
 	 * copy the headers */
-	if (shctx_row_data_append(shctx, first, NULL, (unsigned char *)trash.area, trash.data) < 0)
+	if (shctx_row_data_append(shctx, first, (unsigned char *)trash.area, trash.data) < 0)
 		goto out;
 
 	/* register the buffer in the filter ctx for filling it with data*/
 	if (cache_ctx) {
 		cache_ctx->first_block = first;
+		LIST_INIT(&cache_ctx->detached_head);
 		/* store latest value and expiration time */
 		object->latest_validation = date.tv_sec;
 		object->expire = date.tv_sec + effective_maxage;
@@ -1255,13 +1423,13 @@ enum act_return http_action_store_cache(struct act_rule *rule, struct proxy *px,
 out:
 	/* if does not cache */
 	if (first) {
-		shctx_lock(shctx);
 		first->len = 0;
-		if (object->eb.key)
-			delete_entry(object);
-		object->eb.key = 0;
-		shctx_row_dec_hot(shctx, first);
-		shctx_unlock(shctx);
+		if (object->eb.key) {
+			release_entry_unlocked(cache_tree, object);
+		}
+		shctx_wrlock(shctx);
+		shctx_row_reattach(shctx, first);
+		shctx_wrunlock(shctx);
 	}
 
 	return ACT_RET_CONT;
@@ -1279,11 +1447,14 @@ static void http_cache_applet_release(struct appctx *appctx)
 	struct cache_flt_conf *cconf = appctx->rule->arg.act.p[0];
 	struct cache_entry *cache_ptr = ctx->entry;
 	struct cache *cache = cconf->c.cache;
+	struct shared_context *shctx = shctx_ptr(cache);
 	struct shared_block *first = block_ptr(cache_ptr);
 
-	shctx_lock(shctx_ptr(cache));
-	shctx_row_dec_hot(shctx_ptr(cache), first);
-	shctx_unlock(shctx_ptr(cache));
+	release_entry(ctx->cache_tree, cache_ptr, 1);
+
+	shctx_wrlock(shctx);
+	shctx_row_reattach(shctx, first);
+	shctx_wrunlock(shctx);
 }
 
 
@@ -1774,8 +1945,10 @@ enum act_return http_action_req_cache_use(struct act_rule *rule, struct proxy *p
 	struct cache_entry *res, *sec_entry = NULL;
 	struct cache_flt_conf *cconf = rule->arg.act.p[0];
 	struct cache *cache = cconf->c.cache;
+	struct shared_context *shctx = shctx_ptr(cache);
 	struct shared_block *entry_block;
 
+	struct cache_tree *cache_tree = NULL;
 
 	/* Ignore cache for HTTP/1.0 requests and for requests other than GET
 	 * and HEAD */
@@ -1800,46 +1973,74 @@ enum act_return http_action_req_cache_use(struct act_rule *rule, struct proxy *p
 	else
 		_HA_ATOMIC_INC(&px->be_counters.p.http.cache_lookups);
 
-	shctx_lock(shctx_ptr(cache));
-	res = entry_exist(cache, s->txn->cache_hash);
+	cache_tree = get_cache_tree_from_hash(cache, read_u32(s->txn->cache_hash));
+
+	if (!cache_tree)
+		return ACT_RET_CONT;
+
+	cache_rdlock(cache_tree);
+	res = get_entry(cache_tree, s->txn->cache_hash, 0);
 	/* We must not use an entry that is not complete but the check will be
 	 * performed after we look for a potential secondary entry (in case of
 	 * Vary). */
 	if (res) {
 		struct appctx *appctx;
+		int detached = 0;
+
+		retain_entry(res);
+
 		entry_block = block_ptr(res);
-		shctx_row_inc_hot(shctx_ptr(cache), entry_block);
-		shctx_unlock(shctx_ptr(cache));
+		shctx_wrlock(shctx);
+		if (res->complete) {
+			shctx_row_detach(shctx, entry_block);
+			detached = 1;
+		} else {
+			release_entry(cache_tree, res, 0);
+			res = NULL;
+		}
+		shctx_wrunlock(shctx);
+		cache_rdunlock(cache_tree);
 
 		/* In case of Vary, we could have multiple entries with the same
 		 * primary hash. We need to calculate the secondary hash in order
 		 * to find the actual entry we want (if it exists). */
-		if (res->secondary_key_signature) {
+		if (res && res->secondary_key_signature) {
 			if (!http_request_build_secondary_key(s, res->secondary_key_signature)) {
-				shctx_lock(shctx_ptr(cache));
-				sec_entry = secondary_entry_exist(cache, res,
-								 s->txn->cache_secondary_hash);
+				cache_rdlock(cache_tree);
+				sec_entry = get_secondary_entry(cache_tree, res,
+				                                s->txn->cache_secondary_hash, 0);
 				if (sec_entry && sec_entry != res) {
 					/* The wrong row was added to the hot list. */
-					shctx_row_dec_hot(shctx_ptr(cache), entry_block);
+					release_entry(cache_tree, res, 0);
+					retain_entry(sec_entry);
+					shctx_wrlock(shctx);
+					if (detached)
+						shctx_row_reattach(shctx, entry_block);
 					entry_block = block_ptr(sec_entry);
-					shctx_row_inc_hot(shctx_ptr(cache), entry_block);
+					shctx_row_detach(shctx, entry_block);
+					shctx_wrunlock(shctx);
 				}
 				res = sec_entry;
-				shctx_unlock(shctx_ptr(cache));
+				cache_rdunlock(cache_tree);
 			}
-			else
+			else {
+				release_entry(cache_tree, res, 1);
+
 				res = NULL;
+				shctx_wrlock(shctx);
+				shctx_row_reattach(shctx, entry_block);
+				shctx_wrunlock(shctx);
+			}
 		}
 
 		/* We either looked for a valid secondary entry and could not
 		 * find one, or the entry we want to use is not complete. We
 		 * can't use the cache's entry and must forward the request to
 		 * the server. */
-		if (!res || !res->complete) {
-			shctx_lock(shctx_ptr(cache));
-			shctx_row_dec_hot(shctx_ptr(cache), entry_block);
-			shctx_unlock(shctx_ptr(cache));
+		if (!res) {
+			return ACT_RET_CONT;
+		} else if (!res->complete) {
+			release_entry(cache_tree, res, 1);
 			return ACT_RET_CONT;
 		}
 
@@ -1849,6 +2050,7 @@ enum act_return http_action_req_cache_use(struct act_rule *rule, struct proxy *p
 
 			appctx->st0 = HTX_CACHE_INIT;
 			appctx->rule = rule;
+			ctx->cache_tree = cache_tree;
 			ctx->entry = res;
 			ctx->next = NULL;
 			ctx->sent = 0;
@@ -1862,13 +2064,14 @@ enum act_return http_action_req_cache_use(struct act_rule *rule, struct proxy *p
 			return ACT_RET_CONT;
 		} else {
 			s->target = NULL;
-			shctx_lock(shctx_ptr(cache));
-			shctx_row_dec_hot(shctx_ptr(cache), entry_block);
-			shctx_unlock(shctx_ptr(cache));
+			release_entry(cache_tree, res, 1);
+			shctx_wrlock(shctx);
+			shctx_row_reattach(shctx, entry_block);
+			shctx_wrunlock(shctx);
 			return ACT_RET_CONT;
 		}
 	}
-	shctx_unlock(shctx_ptr(cache));
+	cache_rdunlock(cache_tree);
 
 	/* Shared context does not need to be locked while we calculate the
 	 * secondary hash. */
@@ -2104,11 +2307,12 @@ int post_check_cache()
 	struct shared_context *shctx;
 	int ret_shctx;
 	int err_code = ERR_NONE;
+	int i;
 
 	list_for_each_entry_safe(cache_config, back, &caches_config, list) {
 
 		ret_shctx = shctx_init(&shctx, cache_config->maxblocks, CACHE_BLOCKSIZE,
-		                       cache_config->maxobjsz, sizeof(struct cache), 1);
+		                       cache_config->maxobjsz, sizeof(struct cache));
 
 		if (ret_shctx <= 0) {
 			if (ret_shctx == SHCTX_E_INIT_LOCK)
@@ -2120,15 +2324,23 @@ int post_check_cache()
 			goto out;
 		}
 		shctx->free_block = cache_free_blocks;
+		shctx->reserve_finish = cache_reserve_finish;
+		shctx->cb_data = (void*)shctx->data;
 		/* the cache structure is stored in the shctx and added to the
 		 * caches list, we can remove the entry from the caches_config
 		 * list */
 		memcpy(shctx->data, cache_config, sizeof(struct cache));
 		cache = (struct cache *)shctx->data;
-		cache->entries = EB_ROOT;
 		LIST_APPEND(&caches, &cache->list);
 		LIST_DELETE(&cache_config->list);
 		free(cache_config);
+		for (i = 0; i < CACHE_TREE_NUM; ++i) {
+			cache->trees[i].entries = EB_ROOT;
+			HA_RWLOCK_INIT(&cache->trees[i].lock);
+
+			LIST_INIT(&cache->trees[i].cleanup_list);
+			HA_SPIN_INIT(&cache->trees[i].cleanup_lock);
+		}
 
 		/* Find all references for this cache in the existing filters
 		 * (over all proxies) and reference it in matching filters.
@@ -2604,60 +2816,77 @@ static int cli_io_handler_show_cache(struct appctx *appctx)
 {
 	struct show_cache_ctx *ctx = appctx->svcctx;
 	struct cache* cache = ctx->cache;
+	struct buffer *buf = alloc_trash_chunk();
+
+	if (buf == NULL)
+		return 1;
 
 	list_for_each_entry_from(cache, &caches, list) {
 		struct eb32_node *node = NULL;
 		unsigned int next_key;
 		struct cache_entry *entry;
 		unsigned int i;
+		struct shared_context *shctx = shctx_ptr(cache);
+		int cache_tree_index = 0;
+		struct cache_tree *cache_tree = NULL;
 
 		next_key = ctx->next_key;
 		if (!next_key) {
-			chunk_printf(&trash, "%p: %s (shctx:%p, available blocks:%d)\n", cache, cache->id, shctx_ptr(cache), shctx_ptr(cache)->nbav);
-			if (applet_putchk(appctx, &trash) == -1)
-				return 0;
+			shctx_rdlock(shctx);
+			chunk_printf(buf, "%p: %s (shctx:%p, available blocks:%d)\n", cache, cache->id, shctx_ptr(cache), shctx_ptr(cache)->nbav);
+			shctx_rdunlock(shctx);
+			if (applet_putchk(appctx, buf) == -1) {
+				goto yield;
+			}
 		}
 
 		ctx->cache = cache;
 
-		while (1) {
+		if (ctx->cache_tree)
+			cache_tree_index = (ctx->cache_tree - ctx->cache->trees);
 
-			shctx_lock(shctx_ptr(cache));
-			node = eb32_lookup_ge(&cache->entries, next_key);
-			if (!node) {
-				shctx_unlock(shctx_ptr(cache));
-				ctx->next_key = 0;
-				break;
+		for (;cache_tree_index < CACHE_TREE_NUM; ++cache_tree_index) {
+
+			ctx->cache_tree = cache_tree = &ctx->cache->trees[cache_tree_index];
+
+			cache_rdlock(cache_tree);
+
+			while (1) {
+				node = eb32_lookup_ge(&cache_tree->entries, next_key);
+				if (!node) {
+					ctx->next_key = 0;
+					break;
+				}
+
+				entry = container_of(node, struct cache_entry, eb);
+				next_key = node->key + 1;
+
+				if (entry->expire > date.tv_sec) {
+					chunk_printf(buf, "%p hash:%u vary:0x", entry, read_u32(entry->hash));
+					for (i = 0; i < HTTP_CACHE_SEC_KEY_LEN; ++i)
+						chunk_appendf(buf, "%02x", (unsigned char)entry->secondary_key[i]);
+					chunk_appendf(buf, " size:%u (%u blocks), refcount:%u, expire:%d\n",
+						      block_ptr(entry)->len, block_ptr(entry)->block_count,
+						      block_ptr(entry)->refcount, entry->expire - (int)date.tv_sec);
+				}
+
+				ctx->next_key = next_key;
+
+				if (applet_putchk(appctx, buf) == -1) {
+					cache_rdunlock(cache_tree);
+					goto yield;
+				}
 			}
-
-			entry = container_of(node, struct cache_entry, eb);
-			next_key = node->key + 1;
-
-			if (entry->expire > date.tv_sec) {
-				chunk_printf(&trash, "%p hash:%u vary:0x", entry, read_u32(entry->hash));
-				for (i = 0; i < HTTP_CACHE_SEC_KEY_LEN; ++i)
-					chunk_appendf(&trash, "%02x", (unsigned char)entry->secondary_key[i]);
-				chunk_appendf(&trash, " size:%u (%u blocks), refcount:%u, expire:%d\n",
-					      block_ptr(entry)->len, block_ptr(entry)->block_count,
-					      block_ptr(entry)->refcount, entry->expire - (int)date.tv_sec);
-			} else {
-				/* time to remove that one */
-				delete_entry(entry);
-				entry->eb.key = 0;
-			}
-
-			ctx->next_key = next_key;
-
-			shctx_unlock(shctx_ptr(cache));
-
-			if (applet_putchk(appctx, &trash) == -1)
-				return 0;
+			cache_rdunlock(cache_tree);
 		}
-
 	}
 
+	free_trash_chunk(buf);
 	return 1;
 
+yield:
+	free_trash_chunk(buf);
+	return 0;
 }
 
 

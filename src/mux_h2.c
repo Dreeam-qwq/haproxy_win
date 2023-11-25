@@ -3261,7 +3261,7 @@ static int h2_frame_check_vs_state(struct h2c *h2c, struct h2s *h2s)
  * For active reversal, only minor steps are required. The connection should
  * then be accepted by its listener before being able to use it for transfers.
  *
- * For passive reversal, connection is inserted in its targetted server idle
+ * For passive reversal, connection is inserted in its targeted server idle
  * pool. It can thus be reused immediately for future transfers on this server.
  *
  * Returns 1 on success else 0.
@@ -3295,7 +3295,8 @@ static int h2_conn_reverse(struct h2c *h2c)
 
 		HA_ATOMIC_OR(&h2c->wait_event.tasklet->state, TASK_F_USR1);
 		xprt_set_idle(conn, conn->xprt, conn->xprt_ctx);
-		srv_add_to_idle_list(srv, conn, 1);
+		if (!srv_add_to_idle_list(srv, conn, 1))
+			goto err;
 	}
 	else {
 		struct listener *l = __objt_listener(h2c->conn->target);
@@ -5005,7 +5006,7 @@ next_frame:
 			goto fail;
 		}
 
-		/* detect when we must stop aggragating frames */
+		/* detect when we must stop aggregating frames */
 		h2c->dff |= hdr.ff & H2_F_HEADERS_END_HEADERS;
 
 		/* Take as much as we can of the CONTINUATION frame's payload */
@@ -5015,7 +5016,7 @@ next_frame:
 
 		/* Move the frame's payload over the padding, hole and frame
 		 * header. At least one of hole or dpl is null (see diagrams
-		 * above). The hole moves after the new aggragated frame.
+		 * above). The hole moves after the new aggregated frame.
 		 */
 		b_move(&h2c->dbuf, b_peek_ofs(&h2c->dbuf, h2c->dfl + hole + 9), clen, -(h2c->dpl + hole + 9));
 		h2c->dfl += hdr.len - h2c->dpl;
@@ -6077,6 +6078,15 @@ static size_t h2s_make_data(struct h2s *h2s, struct buffer *buf, size_t count)
 
 	mbuf = br_tail(h2c->mbuf);
  retry:
+	if (br_count(h2c->mbuf) > h2c->nb_streams) {
+		/* more buffers than streams allocated, pointless
+		 * to continue, we'd use more RAM for no reason.
+		 */
+		h2s->flags |= H2_SF_BLK_MROOM;
+		TRACE_STATE("waiting for room in output buffer", H2_EV_TX_FRAME|H2_EV_TX_DATA|H2_EV_H2S_BLK, h2c->conn, h2s);
+		goto end;
+	}
+
 	if (!h2_get_buf(h2c, mbuf)) {
 		h2c->flags |= H2_CF_MUX_MALLOC;
 		h2s->flags |= H2_SF_BLK_MROOM;
@@ -6912,6 +6922,9 @@ static size_t h2_nego_ff(struct stconn *sc, struct buffer *input, size_t count, 
 	/* If we were not just woken because we wanted to send but couldn't,
 	 * and there's somebody else that is waiting to send, do nothing,
 	 * we will subscribe later and be put at the end of the list
+	 *
+	 * WARNING: h2_done_ff() is responsible to remove H2_SF_NOTIFIED flags
+	 *          depending on iobuf flags.
 	 */
 	if (!(h2s->flags & H2_SF_NOTIFIED) &&
 	    (!LIST_ISEMPTY(&h2c->send_list) || !LIST_ISEMPTY(&h2c->fctl_list))) {
@@ -6924,7 +6937,6 @@ static size_t h2_nego_ff(struct stconn *sc, struct buffer *input, size_t count, 
 		h2s->sd->iobuf.flags |= IOBUF_FL_FF_BLOCKED;
 		goto end;
 	}
-	h2s->flags &= ~H2_SF_NOTIFIED;
 
 	if (h2s_mws(h2s) <= 0) {
 		h2s->flags |= H2_SF_BLK_SFCTL;
@@ -7039,21 +7051,8 @@ static size_t h2_done_ff(struct stconn *sc)
 		goto end;
 	head = b_peek(mbuf, b_data(mbuf) - sd->iobuf.data);
 
-	/* FIXME: Must be handled with a flag. It is just a temporary hack */
-	{
-		struct xref *peer;
-		struct sedesc *sdo;
-
-		peer = xref_get_peer_and_lock(&h2s->sd->xref);
-		if (!peer)
-			goto end;
-
-		sdo = container_of(peer, struct sedesc, xref);
-		xref_unlock(&h2s->sd->xref, peer);
-
-		if (se_fl_test(sdo, SE_FL_EOI))
-			h2s->flags &= ~H2_SF_MORE_HTX_DATA;
-	}
+	if (sd->iobuf.flags & IOBUF_FL_EOI)
+		h2s->flags &= ~H2_SF_MORE_HTX_DATA;
 
 	if (!(sd->iobuf.flags & IOBUF_FL_FF_BLOCKED) &&
 	    !(h2s->flags & H2_SF_BLK_SFCTL) &&
@@ -7080,6 +7079,9 @@ static size_t h2_done_ff(struct stconn *sc)
 	sd->iobuf.buf = NULL;
 	sd->iobuf.offset = 0;
 	sd->iobuf.data = 0;
+
+	if (!(sd->iobuf.flags & IOBUF_FL_INTERIM_FF))
+	    h2s->flags &= ~H2_SF_NOTIFIED;
 
 	TRACE_LEAVE(H2_EV_H2S_SEND|H2_EV_STRM_SEND, h2s->h2c->conn, h2s);
 	return total;
@@ -7259,9 +7261,19 @@ static int h2_takeover(struct connection *conn, int orig_tid)
 {
 	struct h2c *h2c = conn->ctx;
 	struct task *task;
+	struct task *new_task;
+	struct tasklet *new_tasklet;
+
+	/* Pre-allocate tasks so that we don't have to roll back after the xprt
+	 * has been migrated.
+	 */
+	new_task = task_new_here();
+	new_tasklet = tasklet_new();
+	if (!new_task || !new_tasklet)
+		goto fail;
 
 	if (fd_takeover(conn->handle.fd, conn) != 0)
-		return -1;
+		goto fail;
 
 	if (conn->xprt->takeover && conn->xprt->takeover(conn, conn->xprt_ctx, orig_tid) != 0) {
 		/* We failed to takeover the xprt, even if the connection may
@@ -7271,44 +7283,49 @@ static int h2_takeover(struct connection *conn, int orig_tid)
 		 */
 		conn->flags |= CO_FL_ERROR;
 		tasklet_wakeup_on(h2c->wait_event.tasklet, orig_tid);
-		return -1;
+		goto fail;
 	}
 
 	if (h2c->wait_event.events)
 		h2c->conn->xprt->unsubscribe(h2c->conn, h2c->conn->xprt_ctx,
 		    h2c->wait_event.events, &h2c->wait_event);
+
+	task = h2c->task;
+	if (task) {
+		/* only assign a task if there was already one, otherwise
+		 * the preallocated new task will be released.
+		 */
+		task->context = NULL;
+		h2c->task = NULL;
+		__ha_barrier_store();
+		task_kill(task);
+
+		h2c->task = new_task;
+		new_task = NULL;
+		h2c->task->process = h2_timeout_task;
+		h2c->task->context = h2c;
+	}
+
 	/* To let the tasklet know it should free itself, and do nothing else,
 	 * set its context to NULL.
 	 */
 	h2c->wait_event.tasklet->context = NULL;
 	tasklet_wakeup_on(h2c->wait_event.tasklet, orig_tid);
 
-	task = h2c->task;
-	if (task) {
-		task->context = NULL;
-		h2c->task = NULL;
-		__ha_barrier_store();
-		task_kill(task);
-
-		h2c->task = task_new_here();
-		if (!h2c->task) {
-			h2_release(h2c);
-			return -1;
-		}
-		h2c->task->process = h2_timeout_task;
-		h2c->task->context = h2c;
-	}
-	h2c->wait_event.tasklet = tasklet_new();
-	if (!h2c->wait_event.tasklet) {
-		h2_release(h2c);
-		return -1;
-	}
+	h2c->wait_event.tasklet = new_tasklet;
 	h2c->wait_event.tasklet->process = h2_io_cb;
 	h2c->wait_event.tasklet->context = h2c;
 	h2c->conn->xprt->subscribe(h2c->conn, h2c->conn->xprt_ctx,
 		                   SUB_RETRY_RECV, &h2c->wait_event);
 
+	if (new_task)
+		__task_free(new_task);
 	return 0;
+ fail:
+	if (new_task)
+		__task_free(new_task);
+	tasklet_free(new_tasklet);
+	return -1;
 }
 
 /*******************************************************/

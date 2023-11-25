@@ -27,7 +27,7 @@
 
 #include <haproxy/api-t.h>
 #include <haproxy/namespace-t.h>
-#include <haproxy/proto_reverse_connect-t.h>
+#include <haproxy/proto_rhttp-t.h>
 #include <haproxy/quic_sock-t.h>
 #include <haproxy/thread.h>
 
@@ -36,6 +36,7 @@
 #define RX_F_INHERITED          0x00000002  /* inherited FD from the parent process (fd@) or duped from another local receiver */
 #define RX_F_MWORKER            0x00000004  /* keep the FD open in the master but close it in the children */
 #define RX_F_MUST_DUP           0x00000008  /* this receiver's fd must be dup() from a reference; ignore socket-level ops here */
+#define RX_F_NON_SUSPENDABLE    0x00000010  /* this socket cannot be suspended hence must always be unbound */
 
 /* Bit values for rx_settings->options */
 #define RX_O_FOREIGN            0x00000001  /* receives on foreign addresses */
@@ -81,13 +82,15 @@ struct receiver {
 #ifdef USE_QUIC
 	struct mt_list rxbuf_list;       /* list of buffers to receive and dispatch QUIC datagrams. */
 	enum quic_sock_mode quic_mode;   /* QUIC socket allocation strategy */
+	unsigned int quic_curr_handshake; /* count of active QUIC handshakes */
+	unsigned int quic_curr_accept;   /* count of QUIC conns waiting for accept */
 #endif
 	struct {
 		struct task *task;  /* Task used to open connection for reverse. */
 		struct server *srv; /* Underlying server used to initiate reverse pre-connect. */
 		struct connection *pend_conn; /* Pending connection waiting to complete reversal before being accepted. */
 		enum li_preconn_state state; /* State for transition logging. */
-	} reverse_connect;
+	} rhttp;
 
 	/* warning: this struct is huge, keep it at the bottom */
 	struct sockaddr_storage addr;    /* the address the socket is bound to */

@@ -420,9 +420,8 @@ list of options is :
     before entering the chroot jail, and after doing the chdir() implied by
     "-C". Each pid appears on its own line.
 
-  -q : set "quiet" mode. This disables some messages during the configuration
-    parsing and during startup. It can be used in combination with "-c" to
-    just check if a configuration file is valid or not.
+  -q : set "quiet" mode. This disables the output messages. It can be used in
+    combination with "-c" to just check if a configuration file is valid or not.
 
   -S <bind>[,bind_options...]: in master-worker mode, bind a master CLI, which
     allows the access to every processes, running or leaving ones.
@@ -2634,6 +2633,47 @@ show cache
   6. number of transactions using the entry
   7. expiration time, can be negative if already expired
 
+show dev
+  This command is meant to centralize some information that HAProxy developers
+  might need to better understand the causes of a given problem. It generally
+  does not provide useful information for the user, but these information allow
+  developers to eliminate certain hypothesis. The format is roughly a series of
+  sections containing indented lines with one element per line, such as the OS
+  type and version, the CPU type or the boot-time FD limits for example. Some
+  fields will be omitted to avoid repetition or output pollution when they do
+  not add value (e.g. unlimited values). More fields may appear in the future,
+  and some may change. This output is not meant for being parsed by scripts, and
+  should not be considered with a high degree of reliability, it's essentially
+  aimed at saving time for those who can read it.
+
+  Technically speaking, such information are taken as-is out of an internal
+  structure that stores them together at boot time so that they can also be
+  found in a core file after a crash. As such, it may happen that developers
+  ask for an early output on a well behaving process to compare with what is
+  found in a core dump, or to compare between several reloads (e.g. some limits
+  might change). If anonymizing is enabled, any possibly sensitive value will
+  be anonymized as well (e.g. the node name).
+
+  Example of output:
+     $ socat stdio /tmp/sock1 <<< "show dev"
+     Platform info
+       machine vendor: To be filled by O.E.M
+       machine family: Altra
+       cpu model: Impl 0x41 Arch 8 Part 0xd0c r3p1
+       virtual machine: no
+       container: no
+       OS name: Linux
+       OS release: 6.2.0-36-generic
+       OS version: #37~22.04.1-Ubuntu SMP PREEMPT_DYNAMIC Mon Oct  9 18:01:07 UTC 2
+       OS architecture: aarch64
+       node name: 489aaf
+     Process info
+       pid: 1735846
+       boot uid: 509
+       boot gid: 1002
+       fd limit (soft): 1024
+       fd limit (hard): 1048576
+
 show env [<name>]
   Dump one or all environment variables known by the process. Without any
   argument, all variables are dumped. With an argument, only the specified
@@ -3145,17 +3185,22 @@ show sess
   the last one that was created before the command was entered; those which
   die in the mean time will not appear.
 
-show sess <id>
-  Display a lot of internal information about the specified session identifier.
-  This identifier is the first field at the beginning of the lines in the dumps
-  of "show sess" (it corresponds to the session pointer). Those information are
-  useless to most users but may be used by haproxy developers to troubleshoot a
-  complex bug. The output format is intentionally not documented so that it can
-  freely evolve depending on demands. You may find a description of all fields
-  returned in src/dumpstats.c
-
-  The special id "all" dumps the states of all sessions, which must be avoided
-  as much as possible as it is highly CPU intensive and can take a lot of time.
+show sess <id> | older <age> | susp | all
+  Display a lot of internal information about the matching sessions. In the
+  first form, only the session matching the specified session identifier will
+  be shown. This identifier is the first field at the beginning of the lines in
+  the dumps of "show sess" (it corresponds to the session pointer). In the
+  second form, only sessions older than <age> (in seconds by default) will be
+  shown. Passing "susp" instead will only report entries that are considered as
+  suspicious by the developers based on criteria that may in time or vary along
+  versions. If "all" is used instead, then all sessions will be dumped. Dumping
+  many sessions can produce a huge output, take a lot of time and be CPU
+  intensive, so it's always better to only dump the minimum needed. Those
+  information are useless to most users but may be used by haproxy developers
+  to troubleshoot a complex bug. The output format is intentionally not
+  documented so that it can freely evolve depending on demands. This output
+  is meant to be interpreted while checking function strm_dump_to_buffer() in
+  src/stream.c to figure the exact meaning of certain fields.
 
 show stat [domain <dns|proxy>] [{<iid>|<proxy>} <type> <sid>] [typed|json] \
           [desc] [up|no-maint]
@@ -4014,6 +4059,14 @@ experimental-mode [on|off]
 
   See also "experimental-mode" in Section 9.3 and "mcli-debug-mode" in 9.4.1.
 
+hard-reload
+  This command does the same as the "reload" command over the master CLI with
+  the expection that it does a hard-stop (-st) instead of a stop-stop (-sf) of
+  the previous process. This means the previous process does not wait to
+  achieve anything before exiting, so all connections will be closed.
+
+  See also the "reload" command.
+
 mcli-debug-mode [on|off]
   This keyword allows a special mode in the master CLI which enables every
   keywords that were meant for a worker CLI on the master CLI, allowing to debug
@@ -4083,6 +4136,7 @@ reload
   will close the connection to the CLI.
 
   Note that a reload will close all connections to the master CLI.
+  See also the "hard-reload" command.
 
 show proc
   The master CLI introduces a 'show proc' command to surpervise the

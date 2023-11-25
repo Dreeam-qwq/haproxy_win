@@ -222,7 +222,7 @@ static inline struct quic_pktns **qel_to_quic_pktns(struct quic_conn *qc,
 }
 
 /* Map <level> TLS stack encryption level to our internal QUIC TLS encryption level
- * if succeded, or -1 if failed.
+ * if succeeded, or -1 if failed.
  */
 static inline enum quic_tls_enc_level ssl_to_quic_enc_level(enum ssl_encryption_level_t level)
 {
@@ -685,8 +685,11 @@ static inline void quic_tls_ctx_reset(struct quic_tls_ctx *ctx)
 	ctx->rx.hp_ctx = NULL;
 	ctx->rx.hp = NULL;
 	ctx->rx.secret = NULL;
+	ctx->rx.secretlen = 0;
 	ctx->rx.iv = NULL;
+	ctx->rx.ivlen = 0;
 	ctx->rx.key = NULL;
+	ctx->rx.keylen = 0;
 	ctx->rx.pn = 0;
 
 	ctx->tx.ctx = NULL;
@@ -695,8 +698,11 @@ static inline void quic_tls_ctx_reset(struct quic_tls_ctx *ctx)
 	ctx->tx.hp_ctx = NULL;
 	ctx->tx.hp = NULL;
 	ctx->tx.secret = NULL;
+	ctx->tx.secretlen = 0;
 	ctx->tx.iv = NULL;
+	ctx->tx.ivlen = 0;
 	ctx->tx.key = NULL;
+	ctx->tx.keylen = 0;
 	/* Not used on the TX path. */
 	ctx->tx.pn = 0;
 
@@ -834,6 +840,20 @@ static inline int quic_initial_tls_ctx_init(struct quic_tls_ctx *ctx)
 	ctx->rx.aead = ctx->tx.aead = EVP_aes_128_gcm();
 	ctx->rx.md   = ctx->tx.md   = EVP_sha256();
 	ctx->rx.hp   = ctx->tx.hp   = EVP_aes_128_ctr();
+
+	ctx->rx.iv   = NULL;
+	ctx->rx.ivlen = 0;
+	ctx->rx.key  = NULL;
+	ctx->rx.keylen = 0;
+	ctx->rx.secret = NULL;
+	ctx->rx.secretlen = 0;
+
+	ctx->tx.iv   = NULL;
+	ctx->tx.ivlen = 0;
+	ctx->tx.key  = NULL;
+	ctx->tx.keylen = 0;
+	ctx->tx.secret = NULL;
+	ctx->tx.secretlen = 0;
 
 	return quic_tls_ctx_keys_alloc(ctx);
 }

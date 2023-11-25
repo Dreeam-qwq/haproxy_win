@@ -166,7 +166,7 @@ int session_accept_fd(struct connection *cli_conn)
 	cli_conn->proxy_netns = l->rx.settings->netns;
 
 	/* Active reversed connection has already been initialized before being
-	 * accepted. It must not be resetted.
+	 * accepted. It must not be reset.
 	 * TODO use a dedicated accept_fd callback for reverse protocol
 	 */
 	if (!cli_conn->xprt) {
@@ -279,13 +279,19 @@ int session_accept_fd(struct connection *cli_conn)
 	 *          conn -- owner ---> task <-----+
 	 */
 	if (cli_conn->flags & (CO_FL_WAIT_XPRT | CO_FL_EARLY_SSL_HS)) {
+		int timeout;
+		int clt_tmt = p->timeout.client;
+		int hs_tmt = p->timeout.client_hs;
+
 		if (unlikely((sess->task = task_new_here()) == NULL))
 			goto out_free_sess;
 
+		/* Handshake timeout as default timeout */
+		timeout = hs_tmt ? hs_tmt : clt_tmt;
 		sess->task->context = sess;
 		sess->task->nice    = l->bind_conf->nice;
 		sess->task->process = session_expire_embryonic;
-		sess->task->expire  = tick_add_ifset(now_ms, p->timeout.client);
+		sess->task->expire  = tick_add_ifset(now_ms, timeout);
 		task_queue(sess->task);
 		return 1;
 	}

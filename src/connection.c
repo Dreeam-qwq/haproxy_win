@@ -25,7 +25,7 @@
 #include <haproxy/log.h>
 #include <haproxy/namespace.h>
 #include <haproxy/net_helper.h>
-#include <haproxy/proto_reverse_connect.h>
+#include <haproxy/proto_rhttp.h>
 #include <haproxy/proto_tcp.h>
 #include <haproxy/sample.h>
 #include <haproxy/sc_strm.h>
@@ -126,7 +126,7 @@ fail:
 
 			/* If mux init failed, consider connection on error.
 			 * This is necessary to ensure connection is freed by
-			 * proto-reverse-connect receiver task.
+			 * proto-rhttp receiver task.
 			 */
 			if (!conn->mux)
 				conn->flags |= CO_FL_ERROR;
@@ -134,7 +134,7 @@ fail:
 			/* If connection is interrupted  without CO_FL_ERROR, receiver task won't free it. */
 			BUG_ON(!(conn->flags & CO_FL_ERROR));
 
-			task_wakeup(l->rx.reverse_connect.task, TASK_WOKEN_ANY);
+			task_wakeup(l->rx.rhttp.task, TASK_WOKEN_ANY);
 		}
 		return -1;
 	} else
@@ -285,7 +285,7 @@ int conn_install_mux_fe(struct connection *conn, void *ctx)
 			return -1;
 	}
 
-	/* Ensure a valid protocol is selected if connection is targetted by a
+	/* Ensure a valid protocol is selected if connection is targeted by a
 	 * tcp-request session attach-srv rule.
 	 */
 	if (conn->reverse.target && !(mux_ops->flags & MX_FL_REVERSABLE)) {
@@ -591,8 +591,13 @@ void conn_free(struct connection *conn)
 
 	if (conn_reverse_in_preconnect(conn)) {
 		struct listener *l = conn_active_reverse_listener(conn);
-		rev_notify_preconn_err(l);
+		rhttp_notify_preconn_err(l);
+		HA_ATOMIC_DEC(&th_ctx->nb_rhttp_conns);
 	}
+	else if (conn->flags & CO_FL_REVERSED) {
+		HA_ATOMIC_DEC(&th_ctx->nb_rhttp_conns);
+	}
+
 
 	conn_force_unsubscribe(conn);
 	pool_free(pool_head_connection, conn);
@@ -808,7 +813,7 @@ int conn_unsubscribe(struct connection *conn, void *xprt_ctx, int event_type, st
 /* Called from the upper layer, to subscribe <es> to events <event_type>.
  * The <es> struct is not allowed to differ from the one passed during a
  * previous call to subscribe(). If the connection's ctrl layer is ready,
- * the wait_event is immediately woken up and the subcription is cancelled.
+ * the wait_event is immediately woken up and the subscription is cancelled.
  * It always returns zero.
  */
 int conn_subscribe(struct connection *conn, void *xprt_ctx, int event_type, struct wait_event *es)
@@ -1806,7 +1811,7 @@ void list_mux_proto(FILE *out)
 
 		done = 0;
 
-		/* note: the block below could be simplied using macros but for only
+		/* note: the block below could be simplified using macros but for only
 		 * 4 flags it's not worth it.
 		 */
 		if (item->mux->flags & MX_FL_HTX)
@@ -2670,6 +2675,8 @@ int conn_reverse(struct connection *conn)
 		sess->origin = NULL;
 		session_free(sess);
 		conn_set_owner(conn, NULL, NULL);
+
+		conn->flags |= CO_FL_REVERSED;
 	}
 	else {
 		/* Wake up receiver to proceed to connection accept. */
@@ -2678,8 +2685,8 @@ int conn_reverse(struct connection *conn)
 		conn_backend_deinit(conn);
 
 		conn->target = &l->obj_type;
-		conn->flags |= CO_FL_REVERSED;
-		task_wakeup(l->rx.reverse_connect.task, TASK_WOKEN_ANY);
+		conn->flags |= CO_FL_ACT_REVERSING;
+		task_wakeup(l->rx.rhttp.task, TASK_WOKEN_ANY);
 	}
 
 	/* Invert source and destination addresses if already set. */

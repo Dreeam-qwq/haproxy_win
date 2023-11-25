@@ -6,23 +6,6 @@
  * modify it under the terms of the GNU General Public License
  * as published by the Free Software Foundation; either version
  * 2 of the License, or (at your option) any later version.
- *
- * Please refer to RFC7230 - RFC7235 information about HTTP protocol, and
- * RFC6265 for information about cookies usage. More generally, the IETF HTTP
- * Working Group's web site should be consulted for protocol related changes :
- *
- *     http://ftp.ics.uci.edu/pub/ietf/http/
- *
- * Pending bugs (may be not fixed because never reproduced) :
- *   - solaris only : sometimes, an HTTP proxy with only a dispatch address causes
- *     the proxy to terminate (no core) if the client breaks the connection during
- *     the response. Seen on 1.1.8pre4, but never reproduced. May not be related to
- *     the snprintf() bug since requests were simple (GET / HTTP/1.0), but may be
- *     related to missing setsid() (fixed in 1.1.15)
- *   - a proxy with an invalid config will prevent the startup even if disabled.
- *
- * ChangeLog has moved to the CHANGELOG file.
- *
  */
 
 #define _GNU_SOURCE
@@ -100,6 +83,7 @@
 #ifdef USE_CPU_AFFINITY
 #include <haproxy/cpuset.h>
 #endif
+#include <haproxy/debug.h>
 #include <haproxy/dns.h>
 #include <haproxy/dynbuf.h>
 #include <haproxy/errors.h>
@@ -702,7 +686,7 @@ int delete_oldpid(int pid)
  * When called, this function reexec haproxy with -sf followed by current
  * children PIDs and possibly old children PIDs if they didn't leave yet.
  */
-static void mworker_reexec()
+static void mworker_reexec(int hardreload)
 {
 	char **next_argv = NULL;
 	int old_argc = 0; /* previous number of argument */
@@ -765,7 +749,10 @@ static void mworker_reexec()
 		if (mworker_child_nb() > 0) {
 			struct mworker_proc *child;
 
-			next_argv[next_argc++] = "-sf";
+			if (hardreload)
+				next_argv[next_argc++] = "-st";
+			else
+				next_argv[next_argc++] = "-sf";
 
 			list_for_each_entry(child, &proc_list, list) {
 				if (!(child->options & PROC_O_LEAVING) && (child->options & PROC_O_TYPE_WORKER))
@@ -808,16 +795,16 @@ alloc_error:
 static void mworker_reexec_waitmode()
 {
 	setenv("HAPROXY_MWORKER_WAIT_ONLY", "1", 1);
-	mworker_reexec();
+	mworker_reexec(0);
 }
 
 /* reload haproxy and emit a warning */
-void mworker_reload()
+void mworker_reload(int hardreload)
 {
 	struct mworker_proc *child;
 	struct per_thread_deinit_fct *ptdf;
 
-	ha_notice("Reloading HAProxy\n");
+	ha_notice("Reloading HAProxy%s\n", hardreload?" (hard-reload)":"");
 
 	/* close the poller FD and the thread waker pipe FD */
 	list_for_each_entry(ptdf, &per_thread_deinit_list, list)
@@ -832,7 +819,7 @@ void mworker_reload()
 	if (global.tune.options & GTUNE_USE_SYSTEMD)
 		sd_notify(0, "RELOADING=1\nSTATUS=Reloading Configuration.\n");
 #endif
-	mworker_reexec();
+	mworker_reexec(hardreload);
 }
 
 static void mworker_loop()
@@ -1963,6 +1950,7 @@ static void init(int argc, char **argv)
 	struct post_check_fct *pcf;
 	struct pre_check_fct *prcf;
 	int ideal_maxconn;
+	const char *cc, *cflags, *opts;
 
 #ifdef USE_OPENSSL
 #ifdef USE_OPENSSL_WOLFSSL
@@ -2200,6 +2188,7 @@ static void init(int argc, char **argv)
 	if (global.mode & (MODE_MWORKER|MODE_MWORKER_WAIT)) {
 		struct wordlist *it, *c;
 
+		master = 1;
 		/* get the info of the children in the env */
 		if (mworker_env_to_proc_list() < 0) {
 			exit(EXIT_FAILURE);
@@ -2250,7 +2239,8 @@ static void init(int argc, char **argv)
 	}
 
 	if (!LIST_ISEMPTY(&mworker_cli_conf) && !(arg_mode & MODE_MWORKER)) {
-		ha_warning("a master CLI socket was defined, but master-worker mode (-W) is not enabled.\n");
+		ha_alert("a master CLI socket was defined, but master-worker mode (-W) is not enabled.\n");
+		exit(EXIT_FAILURE);
 	}
 
 	/* destroy unreferenced defaults proxies  */
@@ -2374,7 +2364,8 @@ static void init(int argc, char **argv)
 
 		if (pr || px) {
 			/* At least one peer or one listener has been found */
-			qfprintf(stdout, "Configuration file is valid\n");
+			if (global.mode & MODE_VERBOSE)
+				qfprintf(stdout, "Configuration file is valid\n");
 			deinit_and_exit(0);
 		}
 		qfprintf(stdout, "Configuration file has no error but will not start (no listener) => exit(2).\n");
@@ -2732,6 +2723,44 @@ static void init(int argc, char **argv)
 	 */
 	if (!global.tune.pool_cache_size)
 		global.tune.pool_cache_size = CONFIG_HAP_POOL_CACHE_SIZE;
+
+	/* fill in a few info about our version and build options */
+	chunk_reset(&trash);
+
+	/* toolchain */
+	cc = chunk_newstr(&trash);
+#if defined(__clang_version__)
+	chunk_appendf(&trash, "clang-" __clang_version__);
+#elif defined(__VERSION__)
+	chunk_appendf(&trash, "gcc-" __VERSION__);
+#endif
+#if __has_feature(address_sanitizer) || defined(__SANITIZE_ADDRESS__)
+	chunk_appendf(&trash, "+asan");
+#endif
+	/* toolchain opts */
+	cflags = chunk_newstr(&trash);
+#ifdef BUILD_CC
+	chunk_appendf(&trash, "%s", BUILD_CC);
+#endif
+#ifdef BUILD_CFLAGS
+	chunk_appendf(&trash, " %s", BUILD_CFLAGS);
+#endif
+#ifdef BUILD_DEBUG
+	chunk_appendf(&trash, " %s", BUILD_DEBUG);
+#endif
+	/* settings */
+	opts = chunk_newstr(&trash);
+#ifdef BUILD_TARGET
+	chunk_appendf(&trash, "TARGET='%s'", BUILD_TARGET);
+#endif
+#ifdef BUILD_CPU
+	chunk_appendf(&trash, " CPU='%s'", BUILD_CPU);
+#endif
+#ifdef BUILD_OPTIONS
+	chunk_appendf(&trash, " %s", BUILD_OPTIONS);
+#endif
+
+	post_mortem_add_component("haproxy", haproxy_version, cc, cflags, opts, argv[0]);
 }
 
 void deinit(void)
@@ -3009,9 +3038,6 @@ void run_poll_loop()
 				/* stop muxes/quic-conns before acknowledging stopping */
 				if (!(tg_ctx->stopping_threads & ti->ltid_bit)) {
 					task_wakeup(mux_stopping_data[tid].task, TASK_WOKEN_OTHER);
-#ifdef USE_QUIC
-					quic_handle_stopping();
-#endif
 					wake = 1;
 				}
 
@@ -3073,6 +3099,12 @@ static void *run_thread_poll_loop(void *data)
 	ha_set_thread(data);
 	set_thread_cpu_affinity();
 	clock_set_local_source();
+
+#ifdef USE_THREAD
+	ha_thread_info[tid].pth_id = ha_get_pthread_id(tid);
+#endif
+	ha_thread_info[tid].stack_top = __builtin_frame_address(0);
+
 	/* thread is started, from now on it is not idle nor harmless */
 	thread_harmless_end();
 	thread_idle_end();
@@ -3764,22 +3796,6 @@ int main(int argc, char **argv)
 		ha_free(&global.chroot);
 		set_identity(argv[0]);
 
-		/* pass through every cli socket, and check if it's bound to
-		 * the current process and if it exposes listeners sockets.
-		 * Caution: the GTUNE_SOCKET_TRANSFER is now set after the fork.
-		 * */
-
-		if (global.cli_fe) {
-			struct bind_conf *bind_conf;
-
-			list_for_each_entry(bind_conf, &global.cli_fe->conf.bind, by_fe) {
-				if (bind_conf->level & ACCESS_FD_LISTENERS) {
-					global.tune.options |= GTUNE_SOCKET_TRANSFER;
-					break;
-				}
-			}
-		}
-
 		/*
 		 * This is only done in daemon mode because we might want the
 		 * logs on stdout in mworker mode. If we're NOT in QUIET mode,
@@ -3799,6 +3815,22 @@ int main(int argc, char **argv)
 		if (!(global.mode & MODE_MWORKER)) /* in mworker mode we don't want a new pgid for the children */
 			setsid();
 		fork_poller();
+	}
+
+	/* pass through every cli socket, and check if it's bound to
+	 * the current process and if it exposes listeners sockets.
+	 * Caution: the GTUNE_SOCKET_TRANSFER is now set after the fork.
+	 * */
+
+	if (global.cli_fe) {
+		struct bind_conf *bind_conf;
+
+		list_for_each_entry(bind_conf, &global.cli_fe->conf.bind, by_fe) {
+			if (bind_conf->level & ACCESS_FD_LISTENERS) {
+				global.tune.options |= GTUNE_SOCKET_TRANSFER;
+				break;
+			}
+		}
 	}
 
 	/* Note that here we can't be in the parent/master anymore */

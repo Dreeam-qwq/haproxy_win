@@ -577,6 +577,8 @@ static int sink_forward_session_init(struct appctx *appctx)
 
 	if (!sockaddr_alloc(&addr, &sft->srv->addr, sizeof(sft->srv->addr)))
 		goto out_error;
+	/* srv port should be learned from srv->svc_port not from srv->addr */
+	set_host_port(addr, sft->srv->svc_port);
 
 	if (appctx_finalize_startup(appctx, sft->srv->proxy, &BUF_NULL) == -1)
 		goto out_free_addr;
@@ -661,7 +663,7 @@ static struct appctx *sink_forward_session_create(struct sink *sink, struct sink
 }
 
 /*
- * Task to handle connctions to forward servers
+ * Task to handle connections to forward servers
  */
 static struct task *process_sink_forward(struct task * task, void *context, unsigned int state)
 {
@@ -694,7 +696,7 @@ static struct task *process_sink_forward(struct task * task, void *context, unsi
 	return task;
 }
 /*
- * Init task to manage connctions to forward servers
+ * Init task to manage connections to forward servers
  *
  * returns 0 in case of error.
  */
@@ -862,7 +864,6 @@ static int sink_add_srv(struct sink *sink, struct server *srv)
 		return 0;
 	}
 	sink->sft = sft;
-	srv = srv->next;
 	return 1;
 }
 
@@ -1221,7 +1222,7 @@ struct sink *sink_new_from_logger(struct logger *logger)
 	srv->conf.file = strdup(logger->conf.file);
 	srv->conf.line = logger->conf.line;
 	srv->addr = *logger->target.addr;
-        srv->svc_port = get_host_port(logger->target.addr);
+	srv->svc_port = get_host_port(logger->target.addr);
 	HA_SPIN_INIT(&srv->lock);
 
 	/* process per thread init */
@@ -1322,7 +1323,7 @@ int cfg_post_parse_ring()
  * Returns err_code which defaults to ERR_NONE and can be set to a combination
  * of ERR_WARN, ERR_ALERT, ERR_FATAL and ERR_ABORT in case of errors.
  * <msg> could be set at any time (it will usually be set on error, but
- * could also be set when no error occured to report a diag warning), thus is
+ * could also be set when no error occurred to report a diag warning), thus is
  * up to the caller to check it and to free it.
  */
 int sink_resolve_logger_buffer(struct logger *logger, char **msg)

@@ -147,7 +147,7 @@ static void qc_dup_pkt_frms(struct quic_conn *qc,
 		TRACE_DEVEL("built probing frame", QUIC_EV_CONN_PRSAFRM, qc, origin);
 		if (origin->pkt) {
 			TRACE_DEVEL("duplicated from packet", QUIC_EV_CONN_PRSAFRM,
-			            qc, NULL, &origin->pkt->pn_node.key);
+			            qc, dup_frm, &origin->pkt->pn_node.key);
 		}
 		else {
 			/* <origin> is a frame which was sent from a packet detected as lost. */
@@ -340,7 +340,7 @@ void qc_txb_release(struct quic_conn *qc)
 	/* For the moment sending function is responsible to purge the buffer
 	 * entirely. It may change in the future but this requires to be able
 	 * to reuse old data.
-	 * For the momemt we do not care to leave data in the buffer for
+	 * For the moment we do not care to leave data in the buffer for
 	 * a connection which is supposed to be killed asap.
 	 */
 	BUG_ON_HOT(buf && b_data(buf));
@@ -495,6 +495,9 @@ static int qc_prep_app_pkts(struct quic_conn *qc, struct buffer *buf,
 		pkt = qc_build_pkt(&pos, end, qel, &qel->tls_ctx, frms, qc, NULL, 0,
 		                   QUIC_PACKET_TYPE_SHORT, must_ack, 0, probe, cc, &err);
 		switch (err) {
+		case -3:
+			qc_purge_txbuf(qc, buf);
+			goto leave;
 		case -2:
 			// trace already emitted by function above
 			goto leave;
@@ -542,10 +545,14 @@ static inline void qc_free_frm_list(struct quic_conn *qc, struct list *l)
 {
 	struct quic_frame *frm, *frmbak;
 
+	TRACE_ENTER(QUIC_EV_CONN_TXPKT, qc);
+
 	list_for_each_entry_safe(frm, frmbak, l, list) {
 		LIST_DEL_INIT(&frm->ref);
 		qc_frm_free(qc, &frm);
 	}
+
+	TRACE_LEAVE(QUIC_EV_CONN_TXPKT, qc);
 }
 
 /* Free <pkt> TX packet and all the packets coalesced to it. */
@@ -554,11 +561,15 @@ static inline void qc_free_tx_coalesced_pkts(struct quic_conn *qc,
 {
 	struct quic_tx_packet *pkt, *nxt_pkt;
 
+	TRACE_ENTER(QUIC_EV_CONN_TXPKT, qc);
+
 	for (pkt = p; pkt; pkt = nxt_pkt) {
 		qc_free_frm_list(qc, &pkt->frms);
 		nxt_pkt = pkt->next;
 		pool_free(pool_head_quic_tx_packet, pkt);
 	}
+
+	TRACE_LEAVE(QUIC_EV_CONN_TXPKT, qc);
 }
 
 /* Purge <buf> TX buffer from its prepare packets. */
@@ -1127,6 +1138,11 @@ int qc_prep_hpkts(struct quic_conn *qc, struct buffer *buf, struct list *qels)
 			                       qc, ver, dglen, pkt_type,
 			                       must_ack, padding, probe, cc, &err);
 			switch (err) {
+				case -3:
+					if (first_pkt)
+						qc_txb_store(buf, dglen, first_pkt);
+					qc_purge_tx_buf(qc, buf);
+					goto leave;
 				case -2:
 					// trace already emitted by function above
 					goto leave;
@@ -1226,8 +1242,10 @@ int qc_send_hdshk_pkts(struct quic_conn *qc, int old_data,
 		goto leave;
 	}
 
-	if (b_data(buf) && !qc_purge_txbuf(qc, buf))
+	if (b_data(buf) && !qc_purge_txbuf(qc, buf)) {
+		TRACE_ERROR("Could not purge TX buffer", QUIC_EV_CONN_TXPKT, qc);
 		goto out;
+	}
 
 	/* Currently buf cannot be non-empty at this stage. Even if a previous
 	 * sendto() has failed it is emptied to simulate packet emission and
@@ -1254,12 +1272,14 @@ int qc_send_hdshk_pkts(struct quic_conn *qc, int old_data,
 	ret = qc_prep_hpkts(qc, buf, &qels);
 	if (ret == -1) {
 		qc_txb_release(qc);
+		TRACE_ERROR("Could not build some packets", QUIC_EV_CONN_TXPKT, qc);
 		goto out;
 	}
 
 	if (ret && !qc_send_ppkts(buf, qc->xprt_ctx)) {
 		if (qc->flags & QUIC_FL_CONN_TO_KILL)
 			qc_txb_release(qc);
+		TRACE_ERROR("Could not send some packets", QUIC_EV_CONN_TXPKT, qc);
 		goto out;
 	}
 
@@ -1290,6 +1310,7 @@ int qc_send_hdshk_pkts(struct quic_conn *qc, int old_data,
 int qc_dgrams_retransmit(struct quic_conn *qc)
 {
 	int ret = 0;
+	int sret;
 	struct quic_pktns *ipktns = qc->ipktns;
 	struct quic_pktns *hpktns = qc->hpktns;
 	struct quic_pktns *apktns = qc->apktns;
@@ -1317,21 +1338,24 @@ int qc_dgrams_retransmit(struct quic_conn *qc)
 				qc->iel->retrans_frms = &ifrms;
 				if (qc->hel)
 					qc->hel->retrans_frms = &hfrms;
-				if (!qc_send_hdshk_pkts(qc, 1, qc->iel, qc->hel))
+				sret = qc_send_hdshk_pkts(qc, 1, qc->iel, qc->hel);
+				qc_free_frm_list(qc, &ifrms);
+				qc_free_frm_list(qc, &hfrms);
+				if (!sret)
 					goto leave;
-				/* Put back unsent frames in their packet number spaces */
-				LIST_SPLICE(&ipktns->tx.frms, &ifrms);
-				if (hpktns)
-					LIST_SPLICE(&hpktns->tx.frms, &hfrms);
 			}
 			else {
 				/* We are in the case where the anti-amplification limit will be
-				 * reached after having sent this datagram. There is no need to
-				 * send more than one datagram.
+				 * reached after having sent this datagram or some handshake frames
+				 * could not be allocated. There is no need to send more than one
+				 * datagram.
 				 */
 				ipktns->tx.pto_probe = 1;
 				qc->iel->retrans_frms = &ifrms;
-				if (!qc_send_hdshk_pkts(qc, 0, qc->iel, NULL))
+				sret = qc_send_hdshk_pkts(qc, 0, qc->iel, NULL);
+				qc_free_frm_list(qc, &ifrms);
+				qc_free_frm_list(qc, &hfrms);
+				if (!sret)
 					goto leave;
 
 				break;
@@ -1356,11 +1380,10 @@ int qc_dgrams_retransmit(struct quic_conn *qc)
 				if (!LIST_ISEMPTY(&frms1)) {
 					hpktns->tx.pto_probe = 1;
 					qc->hel->retrans_frms = &frms1;
-					if (!qc_send_hdshk_pkts(qc, 1, qc->hel, NULL))
+					sret = qc_send_hdshk_pkts(qc, 1, qc->hel, NULL);
+					qc_free_frm_list(qc, &frms1);
+					if (!sret)
 						goto leave;
-
-					/* Put back unsent frames into their packet number spaces */
-					LIST_SPLICE(&hpktns->tx.frms, &frms1);
 				}
 			}
 			TRACE_STATE("no more need to probe Handshake packet number space",
@@ -1375,25 +1398,23 @@ int qc_dgrams_retransmit(struct quic_conn *qc)
 			qc_prep_fast_retrans(qc, apktns, &frms1, &frms2);
 			TRACE_PROTO("Avail. ack eliciting frames", QUIC_EV_CONN_FRMLIST, qc, &frms1);
 			TRACE_PROTO("Avail. ack eliciting frames", QUIC_EV_CONN_FRMLIST, qc, &frms2);
+
 			if (!LIST_ISEMPTY(&frms1)) {
 				apktns->tx.pto_probe = 1;
-				if (!qc_send_app_probing(qc, &frms1)) {
-					qc_free_frm_list(qc, &frms1);
+				sret = qc_send_app_probing(qc, &frms1);
+				qc_free_frm_list(qc, &frms1);
+				if (!sret) {
 					qc_free_frm_list(qc, &frms2);
 					goto leave;
 				}
-
-				/* Put back unsent frames into their packet number spaces */
-				LIST_SPLICE(&apktns->tx.frms, &frms1);
 			}
+
 			if (!LIST_ISEMPTY(&frms2)) {
 				apktns->tx.pto_probe = 1;
-				if (!qc_send_app_probing(qc, &frms2)) {
-					qc_free_frm_list(qc, &frms2);
+				sret = qc_send_app_probing(qc, &frms2);
+				qc_free_frm_list(qc, &frms2);
+				if (!sret)
 					goto leave;
-				}
-				/* Put back unsent frames into their packet number spaces */
-				LIST_SPLICE(&apktns->tx.frms, &frms2);
 			}
 			TRACE_STATE("no more need to probe 01RTT packet number space",
 			            QUIC_EV_CONN_TXPKT, qc);
@@ -2152,11 +2173,13 @@ static void qc_build_cc_frm(struct quic_conn *qc, struct quic_enc_level *qel,
 		else {
 			out->type = QUIC_FT_CONNECTION_CLOSE_APP;
 			out->connection_close.error_code = qc->err.code;
+			out->connection_close.reason_phrase_len = 0;
 		}
 	}
 	else {
 		out->type = QUIC_FT_CONNECTION_CLOSE;
 		out->connection_close.error_code = qc->err.code;
+		out->connection_close.reason_phrase_len = 0;
 	}
 	TRACE_LEAVE(QUIC_EV_CONN_BFRM, qc);
 
@@ -2185,9 +2208,9 @@ static int qc_do_build_pkt(unsigned char *pos, const unsigned char *end,
 {
 	unsigned char *beg, *payload;
 	size_t len, len_sz, len_frms, padding_len;
-	struct quic_frame frm = { .type = QUIC_FT_CRYPTO, };
-	struct quic_frame ack_frm = { .type = QUIC_FT_ACK, };
-	struct quic_frame cc_frm = { };
+	struct quic_frame frm;
+	struct quic_frame ack_frm;
+	struct quic_frame cc_frm;
 	size_t ack_frm_len, head_len;
 	int64_t rx_largest_acked_pn;
 	int add_ping_frm;
@@ -2243,8 +2266,9 @@ static int qc_do_build_pkt(unsigned char *pos, const unsigned char *end,
 	ack_frm_len = 0;
 	/* Do not ack and probe at the same time. */
 	if ((must_ack || (qel->pktns->flags & QUIC_FL_PKTNS_ACK_REQUIRED)) && !qel->pktns->tx.pto_probe) {
-	    struct quic_arngs *arngs = &qel->pktns->rx.arngs;
-	    BUG_ON(eb_is_empty(&qel->pktns->rx.arngs.root));
+		struct quic_arngs *arngs = &qel->pktns->rx.arngs;
+		BUG_ON(eb_is_empty(&qel->pktns->rx.arngs.root));
+		ack_frm.type = QUIC_FT_ACK;
 		ack_frm.tx_ack.arngs = arngs;
 		if (qel->pktns->flags & QUIC_FL_PKTNS_NEW_LARGEST_PN) {
 			qel->pktns->tx.ack_delay =
@@ -2282,11 +2306,17 @@ static int qc_do_build_pkt(unsigned char *pos, const unsigned char *end,
 		                   end - pos, &len_frms, pos - beg, qel, qc)) {
 			TRACE_PROTO("Not enough room", QUIC_EV_CONN_TXPKT,
 			            qc, NULL, NULL, &room);
+			if (padding) {
+				len_frms = 0;
+				goto comp_pkt_len;
+			}
+
 			if (!ack_frm_len && !qel->pktns->tx.pto_probe)
 				goto no_room;
 		}
 	}
 
+ comp_pkt_len:
 	/* Length (of the remaining data). Must not fail because, the buffer size
 	 * has been checked above. Note that we have reserved QUIC_TLS_TAG_LEN bytes
 	 * for the encryption tag. It must be taken into an account for the length
@@ -2465,8 +2495,8 @@ static inline void quic_tx_packet_init(struct quic_tx_packet *pkt, int type)
  * the end of this buffer, with <pkt_type> as packet type for <qc> QUIC connection
  * at <qel> encryption level with <frms> list of prebuilt frames.
  *
- * Return -2 if the packet could not be allocated or encrypted for any reason,
- * -1 if there was not enough room to build a packet.
+ * Return -3 if the packet could not be allocated, -2 if could not be encrypted for
+ * any reason, -1 if there was not enough room to build a packet.
  * XXX NOTE XXX
  * If you provide provide qc_build_pkt() with a big enough buffer to build a packet as big as
  * possible (to fill an MTU), the unique reason why this function may fail is the congestion
@@ -2495,7 +2525,7 @@ static struct quic_tx_packet *qc_build_pkt(unsigned char **pos,
 	pkt = pool_alloc(pool_head_quic_tx_packet);
 	if (!pkt) {
 		TRACE_DEVEL("Not enough memory for a new packet", QUIC_EV_CONN_TXPKT, qc);
-		*err = -2;
+		*err = -3;
 		goto err;
 	}
 

@@ -3228,7 +3228,7 @@ __LJMP static int hlua_socket_connect(struct lua_State *L)
 		csk_ctx->srv = socket_tcp;
 
 	/* Parse ip address. */
-	addr = str2sa_range(ip, NULL, &low, &high, NULL, NULL, NULL, NULL, NULL, PA_O_PORT_OK | PA_O_STREAM);
+	addr = str2sa_range(ip, NULL, &low, &high, NULL, NULL, NULL, NULL, NULL, NULL, PA_O_PORT_OK | PA_O_STREAM);
 	if (!addr) {
 		xref_unlock(&socket->xref, peer);
 		WILL_LJMP(luaL_error(L, "connect: cannot parse destination address '%s'", ip));
@@ -12911,7 +12911,7 @@ __LJMP static int hlua_ckch_set(lua_State *L)
 			goto end;
 		}
 
-		/* appply the change on the duplicate */
+		/* apply the change on the duplicate */
 		if (cert_ext->load(filename, payload, data, &err) != 0) {
 			memprintf(&err, "%sCan't load the payload for '%s'", err ? err : "", cert_ext->ext);
 			errcode |= ERR_ALERT | ERR_FATAL;
@@ -13877,7 +13877,6 @@ void hlua_init(void) {
 		fprintf(stderr, "Lua init: %s\n", errmsg);
 		exit(1);
 	}
-	proxy_preset_defaults(socket_proxy);
 
 	/* Init TCP server: unchanged parameters */
 	socket_tcp = new_server(socket_proxy);

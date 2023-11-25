@@ -4516,6 +4516,9 @@ static size_t h1_done_ff(struct stconn *sc)
 		sd->iobuf.offset = 0;
 		sd->iobuf.data = 0;
 
+		if (sd->iobuf.flags & IOBUF_FL_EOI)
+			h1c->flags &= ~H1C_F_CO_MSG_MORE;
+
 		/* Perform a synchronous send but in all cases, consider
 		 * everything was already sent from the SC point of view.
 		 */
@@ -4588,6 +4591,9 @@ static int h1_fastfwd(struct stconn *sc, unsigned int count, unsigned int flags)
 		goto out;
 	}
 
+  retry:
+	ret = 0;
+
 	if (h1m->state == H1_MSG_DATA && (h1m->flags & (H1_MF_CHNK|H1_MF_CLEN)) &&  count > h1m->curr_len)
 		count = h1m->curr_len;
 
@@ -4600,7 +4606,7 @@ static int h1_fastfwd(struct stconn *sc, unsigned int count, unsigned int flags)
 		h1_release_buf(h1c, &h1c->ibuf);
 
 	if (sdo->iobuf.flags & IOBUF_FL_NO_FF) {
-		/* Fast forwading is not supported by the consumer */
+		/* Fast forwarding is not supported by the consumer */
 		h1c->flags = (h1c->flags & ~H1C_F_WANT_FASTFWD) | H1C_F_CANT_FASTFWD;
 		TRACE_DEVEL("Fast-forwarding not supported by opposite endpoint, disable it", H1_EV_STRM_RECV, h1c->conn, h1s);
 		goto end;
@@ -4626,6 +4632,7 @@ static int h1_fastfwd(struct stconn *sc, unsigned int count, unsigned int flags)
 			goto end;
 		}
 		total += ret;
+		count -= ret;
 		if (!ret) {
 			TRACE_STATE("failed to receive data, subscribing", H1_EV_STRM_RECV, h1c->conn);
 			h1c->conn->xprt->subscribe(h1c->conn, h1c->conn->xprt_ctx, SUB_RETRY_RECV, &h1c->wait_event);
@@ -4642,16 +4649,30 @@ static int h1_fastfwd(struct stconn *sc, unsigned int count, unsigned int flags)
 		}
 		b_sub(sdo->iobuf.buf, sdo->iobuf.offset);
 		total += ret;
+		count -= ret;
 		sdo->iobuf.data += ret;
 	}
 
+	/* Till now, we forwarded less than a buffer, we can immediately retry
+	 * to fast-forward more data.  Instruct the consumer it is an interim
+	 * fast-forward. It is of course only possible if there is still data to
+	 * fast-forward (count > 0), if the previous attempt was a full success
+	 * (0 > ret == try) and if we are not splicing (iobuf.buf != NULL).
+	 */
+	if (ret > 0 && ret == try && count && sdo->iobuf.buf && total < b_size(sdo->iobuf.buf)) {
+		sdo->iobuf.flags |= IOBUF_FL_INTERIM_FF;
+		se_done_ff(sdo);
+		goto retry;
+	}
+
+ out:
 	if (h1m->state == H1_MSG_DATA && (h1m->flags & (H1_MF_CHNK|H1_MF_CLEN))) {
 		if (total > h1m->curr_len) {
 			h1s->flags |= H1S_F_PARSING_ERROR;
 			se_fl_set(h1s->sd, SE_FL_ERROR);
 			TRACE_ERROR("too much payload, more than announced",
 				    H1_EV_STRM_RECV|H1_EV_STRM_ERR|H1_EV_H1C_ERR|H1_EV_H1S_ERR, h1c->conn, h1s);
-			goto out;
+			goto end;
 		}
 		h1m->curr_len -= total;
 		if (!h1m->curr_len) {
@@ -4677,17 +4698,6 @@ static int h1_fastfwd(struct stconn *sc, unsigned int count, unsigned int flags)
 		}
 	}
 
-	HA_ATOMIC_ADD(&h1c->px_counters->bytes_in, total);
-	ret = total;
-	se_done_ff(sdo);
-
-	if (sdo->iobuf.pipe) {
-		se_fl_set(h1s->sd, SE_FL_RCV_MORE | SE_FL_WANT_ROOM);
-	}
-
-	TRACE_DEVEL("Data fast-forwarded", H1_EV_STRM_RECV, h1c->conn, h1s, 0, (size_t[]){ret});
-
- out:
 	if (conn_xprt_read0_pending(h1c->conn)) {
 		se_fl_set(h1s->sd, SE_FL_EOS);
 		TRACE_STATE("report EOS to SE", H1_EV_STRM_RECV, h1c->conn, h1s);
@@ -4711,7 +4721,24 @@ static int h1_fastfwd(struct stconn *sc, unsigned int count, unsigned int flags)
 		TRACE_DEVEL("connection error", H1_EV_STRM_ERR|H1_EV_H1C_ERR|H1_EV_H1S_ERR, h1c->conn, h1s);
 	}
 
+
+	sdo->iobuf.flags &= ~IOBUF_FL_INTERIM_FF;
+	if (se_fl_test(h1s->sd, SE_FL_EOI)) {
+		sdo->iobuf.flags |= IOBUF_FL_EOI; /* TODO: it may be good to have a flag to be sure we can
+						   *       forward the EOI the to consumer side
+						   */
+	}
+	se_done_ff(sdo);
+
+	ret = total;
+	HA_ATOMIC_ADD(&h1c->px_counters->bytes_in, total);
+
+	if (sdo->iobuf.pipe) {
+		se_fl_set(h1s->sd, SE_FL_RCV_MORE | SE_FL_WANT_ROOM);
+	}
+
  end:
+
 	if (!(h1c->flags & H1C_F_WANT_FASTFWD)) {
 		TRACE_STATE("notify the mux can't use fast-forward anymore", H1_EV_STRM_RECV, h1c->conn, h1s);
 		se_fl_clr(h1s->sd, SE_FL_MAY_FASTFWD);
@@ -4781,7 +4808,7 @@ static int h1_resume_fastfwd(struct stconn *sc, unsigned int flags)
 
 static int h1_ctl(struct connection *conn, enum mux_ctl_type mux_ctl, void *output)
 {
-	const struct h1c *h1c = conn->ctx;
+	struct h1c *h1c = conn->ctx;
 	int ret = 0;
 
 	switch (mux_ctl) {
@@ -4798,6 +4825,10 @@ static int h1_ctl(struct connection *conn, enum mux_ctl_type mux_ctl, void *outp
 			 ((h1c->errcode >= 400 && h1c->errcode <= 499) ? MUX_ES_INVALID_ERR :
 			  MUX_ES_SUCCESS))));
 		return ret;
+	case MUX_SUBS_RECV:
+		if (!(h1c->wait_event.events & SUB_RETRY_RECV))
+			h1c->conn->xprt->subscribe(h1c->conn, h1c->conn->xprt_ctx, SUB_RETRY_RECV, &h1c->wait_event);
+		return 0;
 	default:
 		return -1;
 	}
@@ -4932,7 +4963,7 @@ static int add_hdr_case_adjust(const char *from, const char *to, char **err)
 
 	/* Be sure only the case differs between <from> and <to> */
 	if (strcasecmp(from, to) != 0) {
-		memprintf(err, "<from> and <to> must not differ execpt the case");
+		memprintf(err, "<from> and <to> must not differ except the case");
 		return -1;
 	}
 
@@ -4970,9 +5001,19 @@ static int h1_takeover(struct connection *conn, int orig_tid)
 {
 	struct h1c *h1c = conn->ctx;
 	struct task *task;
+	struct task *new_task;
+	struct tasklet *new_tasklet;
+
+	/* Pre-allocate tasks so that we don't have to roll back after the xprt
+	 * has been migrated.
+	 */
+	new_task = task_new_here();
+	new_tasklet = tasklet_new();
+	if (!new_task || !new_tasklet)
+		goto fail;
 
 	if (fd_takeover(conn->handle.fd, conn) != 0)
-		return -1;
+		goto fail;
 
 	if (conn->xprt->takeover && conn->xprt->takeover(conn, conn->xprt_ctx, orig_tid) != 0) {
 		/* We failed to takeover the xprt, even if the connection may
@@ -4982,44 +5023,49 @@ static int h1_takeover(struct connection *conn, int orig_tid)
 		 */
 		conn->flags |= CO_FL_ERROR;
 		tasklet_wakeup_on(h1c->wait_event.tasklet, orig_tid);
-		return -1;
+		goto fail;
 	}
 
 	if (h1c->wait_event.events)
 		h1c->conn->xprt->unsubscribe(h1c->conn, h1c->conn->xprt_ctx,
 		    h1c->wait_event.events, &h1c->wait_event);
+
+	task = h1c->task;
+	if (task) {
+		/* only assign a task if there was already one, otherwise
+		 * the preallocated new task will be released.
+		 */
+		task->context = NULL;
+		h1c->task = NULL;
+		__ha_barrier_store();
+		task_kill(task);
+
+		h1c->task = new_task;
+		new_task = NULL;
+		h1c->task->process = h1_timeout_task;
+		h1c->task->context = h1c;
+	}
+
 	/* To let the tasklet know it should free itself, and do nothing else,
 	 * set its context to NULL.
 	 */
 	h1c->wait_event.tasklet->context = NULL;
 	tasklet_wakeup_on(h1c->wait_event.tasklet, orig_tid);
 
-	task = h1c->task;
-	if (task) {
-		task->context = NULL;
-		h1c->task = NULL;
-		__ha_barrier_store();
-		task_kill(task);
-
-		h1c->task = task_new_here();
-		if (!h1c->task) {
-			h1_release(h1c);
-			return -1;
-		}
-		h1c->task->process = h1_timeout_task;
-		h1c->task->context = h1c;
-	}
-	h1c->wait_event.tasklet = tasklet_new();
-	if (!h1c->wait_event.tasklet) {
-		h1_release(h1c);
-		return -1;
-	}
+	h1c->wait_event.tasklet = new_tasklet;
 	h1c->wait_event.tasklet->process = h1_io_cb;
 	h1c->wait_event.tasklet->context = h1c;
 	h1c->conn->xprt->subscribe(h1c->conn, h1c->conn->xprt_ctx,
 		                   SUB_RETRY_RECV, &h1c->wait_event);
 
+	if (new_task)
+		__task_free(new_task);
 	return 0;
+ fail:
+	if (new_task)
+		__task_free(new_task);
+	tasklet_free(new_tasklet);
+	return -1;
 }
 
 

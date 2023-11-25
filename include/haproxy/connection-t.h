@@ -85,7 +85,8 @@ enum {
 	CO_FL_IDLE_LIST     = 0x00000002,  /* 2 = in idle_list, 3 = invalid */
 	CO_FL_LIST_MASK     = 0x00000003,  /* Is the connection in any server-managed list ? */
 
-	CO_FL_REVERSED      = 0x00000004,  /* connection has been reversed but not yet accepted */
+	CO_FL_REVERSED      = 0x00000004,  /* connection has been reversed to backend / reversed and accepted on frontend */
+	CO_FL_ACT_REVERSING = 0x00000008,  /* connection has been reversed to frontend but not yet accepted */
 	/* unused : 0x00000008 */
 
 	/* unused : 0x00000010 */
@@ -171,13 +172,14 @@ static forceinline char *conn_show_flags(char *buf, size_t len, const char *deli
 	/* prologue */
 	_(0);
 	/* flags */
-	_(CO_FL_SAFE_LIST, _(CO_FL_IDLE_LIST, _(CO_FL_CTRL_READY, _(CO_FL_XPRT_READY,
+	_(CO_FL_SAFE_LIST, _(CO_FL_IDLE_LIST, _(CO_FL_CTRL_READY,
+	_(CO_FL_REVERSED, _(CO_FL_ACT_REVERSING, _(CO_FL_XPRT_READY,
 	_(CO_FL_WANT_DRAIN, _(CO_FL_WAIT_ROOM, _(CO_FL_EARLY_SSL_HS, _(CO_FL_EARLY_DATA,
 	_(CO_FL_SOCKS4_SEND, _(CO_FL_SOCKS4_RECV, _(CO_FL_SOCK_RD_SH, _(CO_FL_SOCK_WR_SH,
 	_(CO_FL_ERROR, _(CO_FL_FDLESS, _(CO_FL_WAIT_L4_CONN, _(CO_FL_WAIT_L6_CONN,
 	_(CO_FL_SEND_PROXY, _(CO_FL_ACCEPT_PROXY, _(CO_FL_ACCEPT_CIP, _(CO_FL_SSL_WAIT_HS,
 	_(CO_FL_PRIVATE, _(CO_FL_RCVD_PROXY, _(CO_FL_SESS_IDLE, _(CO_FL_XPRT_TRACKED
-	))))))))))))))))))))))));
+	))))))))))))))))))))))))));
 	/* epilogue */
 	_(~0U);
 	return buf;
@@ -334,6 +336,7 @@ enum mux_ctl_type {
 	MUX_STATUS, /* Expects an int as output, sets it to a combinaison of MUX_STATUS flags */
 	MUX_EXIT_STATUS, /* Expects an int as output, sets the mux exist/error/http status, if known or 0 */
 	MUX_REVERSE_CONN, /* Notify about an active reverse connection accepted. */
+	MUX_SUBS_RECV, /* Notify the mux it must wait for read events again  */
 };
 
 /* response for ctl MUX_STATUS */
@@ -649,8 +652,8 @@ struct mux_proto_list {
 #define TLV_HEADER_SIZE 3
 
 #define HA_PP2_AUTHORITY_MAX 255  /* Maximum length of an authority TLV */
-#define HA_PP2_TLV_VALUE_128 128  /* E.g., accomodate unique IDs (128 B) */
-#define HA_PP2_TLV_VALUE_256 256  /* E.g., accomodate authority TLVs (currently, <= 255 B) */
+#define HA_PP2_TLV_VALUE_128 128  /* E.g., accommodate unique IDs (128 B) */
+#define HA_PP2_TLV_VALUE_256 256  /* E.g., accommodate authority TLVs (currently, <= 255 B) */
 #define HA_PP2_MAX_ALLOC     1024 /* Maximum TLV value for PPv2 to prevent DoS */
 
 struct proxy_hdr_v2 {

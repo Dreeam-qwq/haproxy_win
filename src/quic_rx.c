@@ -829,13 +829,22 @@ static int qc_handle_crypto_frm(struct quic_conn *qc,
 	}
 
 	if (crypto_frm->offset == cstream->rx.offset && ncb_is_empty(ncbuf)) {
-		if (!qc_ssl_provide_quic_data(&qel->cstream->rx.ncbuf, qel->level,
-		                              qc->xprt_ctx, crypto_frm->data, crypto_frm->len)) {
-			// trace already emitted by function above
+		struct qf_crypto *qf_crypto;
+
+		qf_crypto = pool_alloc(pool_head_qf_crypto);
+		if (!qf_crypto) {
+			TRACE_ERROR("CRYPTO frame allocation failed", QUIC_EV_CONN_PRSHPKT, qc);
 			goto leave;
 		}
 
+		qf_crypto->offset = crypto_frm->offset;
+		qf_crypto->len = crypto_frm->len;
+		qf_crypto->data = crypto_frm->data;
+		qf_crypto->qel = qel;
+		LIST_APPEND(&qel->rx.crypto_frms, &qf_crypto->list);
+
 		cstream->rx.offset += crypto_frm->len;
+		HA_ATOMIC_OR(&qc->wait_event.tasklet->state, TASK_HEAVY);
 		TRACE_DEVEL("increment crypto level offset", QUIC_EV_CONN_PHPKTS, qc, qel);
 		goto done;
 	}
@@ -861,6 +870,9 @@ static int qc_handle_crypto_frm(struct quic_conn *qc,
 		}
 		goto leave;
 	}
+
+	if (ncb_data(ncbuf, 0))
+		HA_ATOMIC_OR(&qc->wait_event.tasklet->state, TASK_HEAVY);
 
  done:
 	ret = 1;
@@ -1111,10 +1123,6 @@ static int qc_parse_pkt_frms(struct quic_conn *qc, struct quic_rx_packet *pkt,
 			/* Increment the error counters */
 			qc_cc_err_count_inc(qc, &frm);
 			if (!(qc->flags & QUIC_FL_CONN_DRAINING)) {
-				if (!(qc->flags & QUIC_FL_CONN_HALF_OPEN_CNT_DECREMENTED)) {
-					qc->flags |= QUIC_FL_CONN_HALF_OPEN_CNT_DECREMENTED;
-					HA_ATOMIC_DEC(&qc->prx_counters->half_open_conn);
-				}
 				TRACE_STATE("Entering draining state", QUIC_EV_CONN_PRSHPKT, qc);
 				/* RFC 9000 10.2. Immediate Close:
 				 * The closing and draining connection states exist to ensure
@@ -1145,9 +1153,6 @@ static int qc_parse_pkt_frms(struct quic_conn *qc, struct quic_rx_packet *pkt,
 			goto leave;
 		}
 	}
-
-	/* Flag this packet number space as having received a packet. */
-	qel->pktns->flags |= QUIC_FL_PKTNS_PKT_RECEIVED;
 
 	if (fast_retrans && qc->iel && qc->hel) {
 		struct quic_enc_level *iqel = qc->iel;
@@ -1253,9 +1258,8 @@ static void qc_rm_hp_pkts(struct quic_conn *qc, struct quic_enc_level *el)
  * stream for this level.
  * Return 1 if succeeded, 0 if not.
  */
-static int qc_treat_rx_crypto_frms(struct quic_conn *qc,
-                                   struct quic_enc_level *el,
-                                   struct ssl_sock_ctx *ctx)
+int qc_treat_rx_crypto_frms(struct quic_conn *qc, struct quic_enc_level *el,
+                            struct ssl_sock_ctx *ctx)
 {
 	int ret = 0;
 	struct ncbuf *ncbuf;
@@ -1370,23 +1374,43 @@ int qc_treat_rx_pkts(struct quic_conn *qc)
 				else {
 					struct quic_arng ar = { .first = pkt->pn, .last = pkt->pn };
 
-					if (pkt->flags & QUIC_FL_RX_PACKET_ACK_ELICITING) {
-						int arm_ack_timer =
-							qc->state >= QUIC_HS_ST_COMPLETE &&
-							qel->pktns == qc->apktns;
+					/* RFC 9000 8.1. Address Validation during Connection Establishment
+					 *
+					 * Connection establishment implicitly provides address validation for
+					 * both endpoints. In particular, receipt of a packet protected with
+					 * Handshake keys confirms that the peer successfully processed an
+					 * Initial packet.
+					 */
+					if (qel == qc->hel &&
+					    !(qc->flags & QUIC_FL_CONN_PEER_VALIDATED_ADDR)) {
+						TRACE_STATE("validate peer address on handshake packet",
+						            QUIC_EV_CONN_RXPKT, qc, pkt);
+						qc->flags |= QUIC_FL_CONN_PEER_VALIDATED_ADDR;
+						BUG_ON(!qc->prx_counters->half_open_conn);
+						HA_ATOMIC_DEC(&qc->prx_counters->half_open_conn);
+					}
 
-						qel->pktns->flags |= QUIC_FL_PKTNS_ACK_REQUIRED;
-						qel->pktns->rx.nb_aepkts_since_last_ack++;
-						qc_idle_timer_rearm(qc, 1, arm_ack_timer);
-					}
-					if (pkt->pn > largest_pn) {
-						largest_pn = pkt->pn;
-						largest_pn_time_received = pkt->time_received;
-					}
 					/* Update the list of ranges to acknowledge. */
-					if (!quic_update_ack_ranges_list(qc, &qel->pktns->rx.arngs, &ar))
+					if (quic_update_ack_ranges_list(qc, &qel->pktns->rx.arngs, &ar)) {
+						if (pkt->flags & QUIC_FL_RX_PACKET_ACK_ELICITING) {
+							int arm_ack_timer =
+								qc->state >= QUIC_HS_ST_COMPLETE &&
+								qel->pktns == qc->apktns;
+
+							qel->pktns->flags |= QUIC_FL_PKTNS_ACK_REQUIRED;
+							qel->pktns->rx.nb_aepkts_since_last_ack++;
+							qc_idle_timer_rearm(qc, 1, arm_ack_timer);
+						}
+
+						if (pkt->pn > largest_pn) {
+							largest_pn = pkt->pn;
+							largest_pn_time_received = pkt->time_received;
+						}
+					}
+					else {
 						TRACE_ERROR("Could not update ack range list",
 						            QUIC_EV_CONN_RXPKT, qc);
+					}
 				}
 			}
 			node = eb64_next(node);
@@ -1402,9 +1426,13 @@ int qc_treat_rx_pkts(struct quic_conn *qc)
 			qel->pktns->flags |= QUIC_FL_PKTNS_NEW_LARGEST_PN;
 		}
 
-		if (qel->cstream && !qc_treat_rx_crypto_frms(qc, qel, qc->xprt_ctx)) {
-			// trace already emitted by function above
-			goto leave;
+		if (qel->cstream) {
+			struct ncbuf *ncbuf = &qel->cstream->rx.ncbuf;
+
+			if (!ncb_is_null(ncbuf) && ncb_data(ncbuf, 0)) {
+				/* Some in order CRYPTO data were bufferized. */
+				HA_ATOMIC_OR(&qc->wait_event.tasklet->state, TASK_HEAVY);
+			}
 		}
 
 		/* Release the Initial encryption level and packet number space. */
@@ -1919,19 +1947,34 @@ static struct quic_conn *quic_rx_pkt_retrieve_conn(struct quic_rx_packet *pkt,
 	if (pkt->type == QUIC_PACKET_TYPE_INITIAL) {
 		BUG_ON(!pkt->version); /* This must not happen. */
 
-		if (pkt->token_len) {
-			if (!quic_retry_token_check(pkt, dgram, l, qc, &token_odcid))
-				goto err;
-		}
-
 		if (!qc) {
 			struct quic_cid_tree *tree;
 			struct ebmb_node *node;
 			struct quic_connection_id *conn_id;
 			int ipv4;
 
-			if (!pkt->token_len && !(l->bind_conf->options & BC_O_QUIC_FORCE_RETRY) &&
-			    HA_ATOMIC_LOAD(&prx_counters->half_open_conn) >= global.tune.quic_retry_threshold) {
+			/* Reject INITIAL early if listener limits reached. */
+			if (unlikely(HA_ATOMIC_LOAD(&l->rx.quic_curr_handshake) >=
+			             quic_listener_max_handshake(l))) {
+				TRACE_DATA("Drop INITIAL on max handshake",
+				            QUIC_EV_CONN_LPKT, NULL, NULL, NULL, pkt->version);
+				goto out;
+			}
+
+			if (unlikely(HA_ATOMIC_LOAD(&l->rx.quic_curr_accept) >=
+			             quic_listener_max_accept(l))) {
+				TRACE_DATA("Drop INITIAL on max accept",
+				            QUIC_EV_CONN_LPKT, NULL, NULL, NULL, pkt->version);
+				goto out;
+			}
+
+			if (pkt->token_len) {
+				/* Validate the token only when connection is unknown. */
+				if (!quic_retry_token_check(pkt, dgram, l, qc, &token_odcid))
+					goto err;
+			}
+			else if (!(l->bind_conf->options & BC_O_QUIC_FORCE_RETRY) &&
+			         HA_ATOMIC_LOAD(&prx_counters->half_open_conn) >= global.tune.quic_retry_threshold) {
 				TRACE_PROTO("Initial without token, sending retry",
 				            QUIC_EV_CONN_LPKT, NULL, NULL, NULL, pkt->version);
 				if (send_retry(l->rx.fd, &dgram->saddr, pkt, pkt->version)) {
@@ -2006,8 +2049,6 @@ static struct quic_conn *quic_rx_pkt_retrieve_conn(struct quic_rx_packet *pkt,
 
 			if (*new_tid != -1)
 				goto out;
-
-			HA_ATOMIC_INC(&prx_counters->half_open_conn);
 		}
 	}
 	else if (!qc) {
@@ -2022,10 +2063,7 @@ static struct quic_conn *quic_rx_pkt_retrieve_conn(struct quic_rx_packet *pkt,
 	return qc;
 
  err:
-	if (qc)
-		qc->cntrs.dropped_pkt++;
-	else
-		HA_ATOMIC_INC(&prx_counters->dropped_pkt);
+	HA_ATOMIC_INC(&prx_counters->dropped_pkt);
 
 	TRACE_LEAVE(QUIC_EV_CONN_LPKT);
 	return NULL;
@@ -2549,6 +2587,7 @@ int quic_dgram_parse(struct quic_dgram *dgram, struct quic_conn *from_qc,
 					MT_LIST_APPEND(&quic_dghdlrs[new_tid].dgrams,
 					               &dgram->handler_list);
 					tasklet_wakeup(quic_dghdlrs[new_tid].task);
+					pool_free(pool_head_quic_rx_packet, pkt);
 					goto out;
 				}
 
@@ -2560,6 +2599,7 @@ int quic_dgram_parse(struct quic_dgram *dgram, struct quic_conn *from_qc,
 			dgram->qc = qc;
 		}
 
+		/* Ensure thread connection migration is finalized ASAP. */
 		if (qc->flags & QUIC_FL_CONN_AFFINITY_CHANGED)
 			qc_finalize_affinity_rebind(qc);
 

@@ -209,11 +209,13 @@ static inline void _task_wakeup(struct task *t, unsigned int f, const struct ha_
 	state = _HA_ATOMIC_OR_FETCH(&t->state, f);
 	while (!(state & (TASK_RUNNING | TASK_QUEUED))) {
 		if (_HA_ATOMIC_CAS(&t->state, &state, state | TASK_QUEUED)) {
-			caller = HA_ATOMIC_XCHG(&t->caller, caller);
-			BUG_ON((ulong)caller & 1);
+			if (likely(caller)) {
+				caller = HA_ATOMIC_XCHG(&t->caller, caller);
+				BUG_ON((ulong)caller & 1);
 #ifdef DEBUG_TASK
-			HA_ATOMIC_STORE(&t->debug.prev_caller, caller);
+				HA_ATOMIC_STORE(&t->debug.prev_caller, caller);
 #endif
+			}
 			__task_wakeup(t);
 			break;
 		}
@@ -247,11 +249,13 @@ static inline void _task_drop_running(struct task *t, unsigned int f, const stru
 	}
 
 	if ((new_state & ~state) & TASK_QUEUED) {
-		caller = HA_ATOMIC_XCHG(&t->caller, caller);
-		BUG_ON((ulong)caller & 1);
+		if (likely(caller)) {
+			caller = HA_ATOMIC_XCHG(&t->caller, caller);
+			BUG_ON((ulong)caller & 1);
 #ifdef DEBUG_TASK
-		HA_ATOMIC_STORE(&t->debug.prev_caller, caller);
+			HA_ATOMIC_STORE(&t->debug.prev_caller, caller);
 #endif
+		}
 		__task_wakeup(t);
 	}
 }
@@ -294,7 +298,10 @@ static inline struct task *task_unlink_wq(struct task *t)
  * protected by the global wq_lock, otherwise by it necessarily belongs to the
  * current thread'sand is queued without locking.
  */
-static inline void task_queue(struct task *task)
+#define task_queue(t) \
+	_task_queue(t, MK_CALLER(WAKEUP_TYPE_TASK_QUEUE, 0, 0))
+
+static inline void _task_queue(struct task *task, const struct ha_caller *caller)
 {
 	/* If we already have a place in the wait queue no later than the
 	 * timeout we're trying to set, we'll stay there, because it is very
@@ -311,15 +318,31 @@ static inline void task_queue(struct task *task)
 #ifdef USE_THREAD
 	if (task->tid < 0) {
 		HA_RWLOCK_WRLOCK(TASK_WQ_LOCK, &wq_lock);
-		if (!task_in_wq(task) || tick_is_lt(task->expire, task->wq.key))
+		if (!task_in_wq(task) || tick_is_lt(task->expire, task->wq.key)) {
+			if (likely(caller)) {
+				caller = HA_ATOMIC_XCHG(&task->caller, caller);
+				BUG_ON((ulong)caller & 1);
+#ifdef DEBUG_TASK
+				HA_ATOMIC_STORE(&task->debug.prev_caller, caller);
+#endif
+			}
 			__task_queue(task, &tg_ctx->timers);
+		}
 		HA_RWLOCK_WRUNLOCK(TASK_WQ_LOCK, &wq_lock);
 	} else
 #endif
 	{
 		BUG_ON(task->tid != tid);
-		if (!task_in_wq(task) || tick_is_lt(task->expire, task->wq.key))
+		if (!task_in_wq(task) || tick_is_lt(task->expire, task->wq.key)) {
+			if (likely(caller)) {
+				caller = HA_ATOMIC_XCHG(&task->caller, caller);
+				BUG_ON((ulong)caller & 1);
+#ifdef DEBUG_TASK
+				HA_ATOMIC_STORE(&task->debug.prev_caller, caller);
+#endif
+			}
 			__task_queue(task, &th_ctx->timers);
+		}
 	}
 }
 
@@ -370,11 +393,14 @@ static inline void _tasklet_wakeup_on(struct tasklet *tl, int thr, const struct 
 	} while (!_HA_ATOMIC_CAS(&tl->state, &state, state | TASK_IN_LIST));
 
 	/* at this point we're the first ones to add this task to the list */
-	caller = HA_ATOMIC_XCHG(&tl->caller, caller);
-	BUG_ON((ulong)caller & 1);
+	if (likely(caller)) {
+		caller = HA_ATOMIC_XCHG(&tl->caller, caller);
+		BUG_ON((ulong)caller & 1);
 #ifdef DEBUG_TASK
-	HA_ATOMIC_STORE(&tl->debug.prev_caller, caller);
+		HA_ATOMIC_STORE(&tl->debug.prev_caller, caller);
 #endif
+	}
+
 	if (_HA_ATOMIC_LOAD(&th_ctx->flags) & TH_FL_TASK_PROFILING)
 		tl->wake_date = now_mono_time();
 	__tasklet_wakeup_on(tl, thr);
@@ -424,11 +450,14 @@ static inline void _task_instant_wakeup(struct task *t, unsigned int f, const st
 	BUG_ON_HOT(task_in_rq(t));
 
 	/* at this point we're the first ones to add this task to the list */
-	caller = HA_ATOMIC_XCHG(&t->caller, caller);
-	BUG_ON((ulong)caller & 1);
+	if (likely(caller)) {
+		caller = HA_ATOMIC_XCHG(&t->caller, caller);
+		BUG_ON((ulong)caller & 1);
 #ifdef DEBUG_TASK
-	HA_ATOMIC_STORE(&t->debug.prev_caller, caller);
+		HA_ATOMIC_STORE(&t->debug.prev_caller, caller);
 #endif
+	}
+
 	if (_HA_ATOMIC_LOAD(&th_ctx->flags) & TH_FL_TASK_PROFILING)
 		t->wake_date = now_mono_time();
 	__tasklet_wakeup_on((struct tasklet *)t, thr);
@@ -458,11 +487,14 @@ static inline struct list *_tasklet_wakeup_after(struct list *head, struct taskl
 	} while (!_HA_ATOMIC_CAS(&tl->state, &state, state | TASK_IN_LIST));
 
 	/* at this point we're the first one to add this task to the list */
-	caller = HA_ATOMIC_XCHG(&tl->caller, caller);
-	BUG_ON((ulong)caller & 1);
+	if (likely(caller)) {
+		caller = HA_ATOMIC_XCHG(&tl->caller, caller);
+		BUG_ON((ulong)caller & 1);
 #ifdef DEBUG_TASK
-	HA_ATOMIC_STORE(&tl->debug.prev_caller, caller);
+		HA_ATOMIC_STORE(&tl->debug.prev_caller, caller);
 #endif
+	}
+
 	if (th_ctx->flags & TH_FL_TASK_PROFILING)
 		tl->wake_date = now_mono_time();
 	return __tasklet_wakeup_after(head, tl);
@@ -664,7 +696,10 @@ static inline void tasklet_set_tid(struct tasklet *tl, int tid)
  * now_ms without using tick_add() will definitely make this happen once every
  * 49.7 days.
  */
-static inline void task_schedule(struct task *task, int when)
+#define task_schedule(t, w) \
+	_task_schedule(t, w, MK_CALLER(WAKEUP_TYPE_TASK_SCHEDULE, 0, 0))
+
+static inline void _task_schedule(struct task *task, int when, const struct ha_caller *caller)
 {
 	/* TODO: mthread, check if there is no tisk with this test */
 	if (task_in_rq(task))
@@ -678,8 +713,16 @@ static inline void task_schedule(struct task *task, int when)
 			when = tick_first(when, task->expire);
 
 		task->expire = when;
-		if (!task_in_wq(task) || tick_is_lt(task->expire, task->wq.key))
+		if (!task_in_wq(task) || tick_is_lt(task->expire, task->wq.key)) {
+			if (likely(caller)) {
+				caller = HA_ATOMIC_XCHG(&task->caller, caller);
+				BUG_ON((ulong)caller & 1);
+#ifdef DEBUG_TASK
+				HA_ATOMIC_STORE(&task->debug.prev_caller, caller);
+#endif
+			}
 			__task_queue(task, &tg_ctx->timers);
+		}
 		HA_RWLOCK_WRUNLOCK(TASK_WQ_LOCK, &wq_lock);
 	} else
 #endif
@@ -689,8 +732,16 @@ static inline void task_schedule(struct task *task, int when)
 			when = tick_first(when, task->expire);
 
 		task->expire = when;
-		if (!task_in_wq(task) || tick_is_lt(task->expire, task->wq.key))
+		if (!task_in_wq(task) || tick_is_lt(task->expire, task->wq.key)) {
+			if (likely(caller)) {
+				caller = HA_ATOMIC_XCHG(&task->caller, caller);
+				BUG_ON((ulong)caller & 1);
+#ifdef DEBUG_TASK
+				HA_ATOMIC_STORE(&task->debug.prev_caller, caller);
+#endif
+			}
 			__task_queue(task, &th_ctx->timers);
+		}
 	}
 }
 
@@ -705,6 +756,8 @@ static inline const char *task_wakeup_type_str(uint t)
 	case WAKEUP_TYPE_TASKLET_WAKEUP       : return "tasklet_wakeup";
 	case WAKEUP_TYPE_TASKLET_WAKEUP_AFTER : return "tasklet_wakeup_after";
 	case WAKEUP_TYPE_TASK_DROP_RUNNING    : return "task_drop_running";
+	case WAKEUP_TYPE_TASK_QUEUE           : return "task_queue";
+	case WAKEUP_TYPE_TASK_SCHEDULE        : return "task_schedule";
 	case WAKEUP_TYPE_APPCTX_WAKEUP        : return "appctx_wakeup";
 	default                               : return "?";
 	}

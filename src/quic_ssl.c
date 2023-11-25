@@ -2,6 +2,7 @@
 #include <haproxy/ncbuf.h>
 #include <haproxy/proxy.h>
 #include <haproxy/quic_conn.h>
+#include <haproxy/quic_rx.h>
 #include <haproxy/quic_sock.h>
 #include <haproxy/quic_ssl.h>
 #include <haproxy/quic_tls.h>
@@ -172,8 +173,8 @@ static int ha_quic_set_encryption_secrets(SSL *ssl, enum ssl_encryption_level_t 
 	BUG_ON(secret_len > QUIC_TLS_SECRET_LEN);
 
 	if (!*qel && !qc_enc_level_alloc(qc, pktns, qel, level)) {
-		TRACE_PROTO("Could not allocated an encryption level", QUIC_EV_CONN_ADDDATA, qc);
-		goto out;
+		TRACE_PROTO("Could not allocate an encryption level", QUIC_EV_CONN_ADDDATA, qc);
+		goto leave;
 	}
 
 	tls_ctx = &(*qel)->tls_ctx;
@@ -403,7 +404,7 @@ static int ha_quic_send_alert(SSL *ssl, enum ssl_encryption_level_t level, uint8
 
 /* QUIC TLS methods */
 #if defined(OPENSSL_IS_AWSLC)
-/* write/read set secret splitted */
+/* write/read set secret split */
 static SSL_QUIC_METHOD ha_quic_method = {
 	.set_read_secret        = ha_quic_set_read_secret,
 	.set_write_secret       = ha_quic_set_write_secret,
@@ -548,13 +549,8 @@ int qc_ssl_provide_quic_data(struct ncbuf *ncbuf,
 				goto out;
 			}
 
-			/* TODO: Should close the connection asap */
-			if (!(qc->flags & QUIC_FL_CONN_HALF_OPEN_CNT_DECREMENTED)) {
-				qc->flags |= QUIC_FL_CONN_HALF_OPEN_CNT_DECREMENTED;
-				HA_ATOMIC_DEC(&qc->prx_counters->half_open_conn);
-				HA_ATOMIC_INC(&qc->prx_counters->hdshk_fail);
-			}
 			TRACE_ERROR("SSL handshake error", QUIC_EV_CONN_IO_CB, qc, &state, &ssl_err);
+			HA_ATOMIC_INC(&qc->prx_counters->hdshk_fail);
 			qc_ssl_dump_errors(ctx->conn);
 			ERR_clear_error();
 			goto leave;
@@ -569,11 +565,6 @@ int qc_ssl_provide_quic_data(struct ncbuf *ncbuf,
 			goto leave;
 		}
 
-		if (!(qc->flags & QUIC_FL_CONN_HALF_OPEN_CNT_DECREMENTED)) {
-			TRACE_DEVEL("dec half open counter", QUIC_EV_CONN_IO_CB, qc, &state);
-			qc->flags |= QUIC_FL_CONN_HALF_OPEN_CNT_DECREMENTED;
-			HA_ATOMIC_DEC(&qc->prx_counters->half_open_conn);
-		}
 		/* I/O callback switch */
 		qc->wait_event.tasklet->process = quic_conn_app_io_cb;
 		if (qc_is_listener(ctx->qc)) {
@@ -581,6 +572,9 @@ int qc_ssl_provide_quic_data(struct ncbuf *ncbuf,
 			qc->state = QUIC_HS_ST_CONFIRMED;
 			/* The connection is ready to be accepted. */
 			quic_accept_push_qc(qc);
+
+			BUG_ON(qc->li->rx.quic_curr_handshake == 0);
+			HA_ATOMIC_DEC(&qc->li->rx.quic_curr_handshake);
 		}
 		else {
 			qc->state = QUIC_HS_ST_COMPLETE;
@@ -630,6 +624,48 @@ int qc_ssl_provide_quic_data(struct ncbuf *ncbuf,
 	}
 
 	TRACE_LEAVE(QUIC_EV_CONN_SSLDATA, qc);
+	return ret;
+}
+
+/* Provide all the stored in order CRYPTO data received from the peer to the TLS.
+ * Return 1 if succeeded, 0 if not.
+ */
+int qc_ssl_provide_all_quic_data(struct quic_conn *qc, struct ssl_sock_ctx *ctx)
+{
+	int ret = 0;
+	struct quic_enc_level *qel;
+	struct ncbuf ncbuf = NCBUF_NULL;
+
+	TRACE_ENTER(QUIC_EV_CONN_PHPKTS, qc);
+	list_for_each_entry(qel, &qc->qel_list, list) {
+		struct qf_crypto *qf_crypto, *qf_back;
+
+		list_for_each_entry_safe(qf_crypto, qf_back, &qel->rx.crypto_frms, list) {
+			const unsigned char *crypto_data = qf_crypto->data;
+			size_t crypto_len = qf_crypto->len;
+
+			/* Free this frame asap */
+			LIST_DELETE(&qf_crypto->list);
+			pool_free(pool_head_qf_crypto, qf_crypto);
+
+			if (!qc_ssl_provide_quic_data(&ncbuf, qel->level, ctx,
+			                              crypto_data, crypto_len))
+				goto leave;
+
+			TRACE_DEVEL("buffered crypto data were provided to TLS stack",
+						QUIC_EV_CONN_PHPKTS, qc, qel);
+		}
+
+		if (!qel->cstream)
+			continue;
+
+		if (!qc_treat_rx_crypto_frms(qc, qel, ctx))
+			goto leave;
+	}
+
+	ret = 1;
+ leave:
+	TRACE_LEAVE(QUIC_EV_CONN_PHPKTS, qc);
 	return ret;
 }
 

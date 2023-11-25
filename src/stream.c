@@ -2292,6 +2292,13 @@ struct task *process_stream(struct task *t, void *context, unsigned int state)
 				    (s->be->mode == PR_MODE_HTTP) &&
 				    !(s->txn->flags & TX_D_L7_RETRY))
 					s->txn->flags |= TX_L7_RETRY;
+
+				if (s->be->options & PR_O_ABRT_CLOSE) {
+					struct connection *conn = sc_conn(scf);
+
+					if (conn && conn->mux && conn->mux->ctl)
+						conn->mux->ctl(conn, MUX_SUBS_RECV, NULL);
+				}
 			}
 		}
 		else {
@@ -3102,12 +3109,16 @@ void list_services(FILE *out)
 }
 
 /* appctx context used by the "show sess" command */
+/* flags used for show_sess_ctx.flags */
+#define CLI_SHOWSESS_F_SUSP  0x00000001   /* show only suspicious streams */
 
 struct show_sess_ctx {
 	struct bref bref;	/* back-reference from the session being dumped */
 	void *target;		/* session we want to dump, or NULL for all */
 	unsigned int thr;       /* the thread number being explored (0..MAX_THREADS-1) */
 	unsigned int uid;	/* if non-null, the uniq_id of the session being dumped */
+	unsigned int min_age;   /* minimum age of streams to dump */
+	unsigned int flags;     /* CLI_SHOWSESS_* */
 	int section;		/* section of the session being dumped */
 	int pos;		/* last position of the current session's buffer */
 };
@@ -3248,7 +3259,7 @@ void strm_dump_to_buffer(struct buffer *buf, const struct stream *strm, const ch
 
 	chunk_appendf(buf,
 		     " age=%s)\n",
-		     human_time(ns_to_sec(now_ns) - ns_to_sec(strm->logs.accept_ts), 1));
+		     human_time(ns_to_sec(now_ns) - ns_to_sec(strm->logs.request_ts), 1));
 
 	if (strm->txn)
 		chunk_appendf(buf,
@@ -3503,15 +3514,35 @@ static int cli_parse_show_sess(char **args, char *payload, struct appctx *appctx
 	if (!cli_has_level(appctx, ACCESS_LVL_OPER))
 		return 1;
 
-	if (*args[2] && strcmp(args[2], "all") == 0)
-		ctx->target = (void *)-1;
-	else if (*args[2])
-		ctx->target = (void *)strtoul(args[2], NULL, 0);
-	else
-		ctx->target = NULL;
+	/* now all sessions by default */
+	ctx->target = NULL;
+	ctx->min_age = 0;
 	ctx->section = 0; /* start with stream status */
 	ctx->pos = 0;
 	ctx->thr = 0;
+
+	if (*args[2] && strcmp(args[2], "older") == 0) {
+		unsigned timeout;
+		const char *res;
+
+		if (!*args[3])
+			return cli_err(appctx, "Expects a minimum age (in seconds by default).\n");
+
+		res = parse_time_err(args[3], &timeout, TIME_UNIT_S);
+		if (res != 0)
+			return cli_err(appctx, "Invalid age.\n");
+
+		ctx->min_age = timeout;
+		ctx->target = (void *)-1; /* show all matching entries */
+	}
+	else if (*args[2] && strcmp(args[2], "susp") == 0) {
+		ctx->flags |= CLI_SHOWSESS_F_SUSP;
+		ctx->target = (void *)-1; /* show all matching entries */
+	}
+	else if (*args[2] && strcmp(args[2], "all") == 0)
+		ctx->target = (void *)-1;
+	else if (*args[2])
+		ctx->target = (void *)strtoul(args[2], NULL, 0);
 
 	/* The back-ref must be reset, it will be detected and set by
 	 * the dump code upon first invocation.
@@ -3589,6 +3620,22 @@ static int cli_io_handler_dump_sess(struct appctx *appctx)
 			continue;
 		}
 
+		if (ctx->min_age) {
+			uint age = ns_to_sec(now_ns) - ns_to_sec(curr_strm->logs.request_ts);
+			if (age < ctx->min_age)
+				goto next_sess;
+		}
+
+		if (ctx->flags & CLI_SHOWSESS_F_SUSP) {
+			/* only show suspicious streams. Non-suspicious ones have a valid
+			 * expiration date in the future and a valid front endpoint.
+			 */
+			if (curr_strm->task->expire &&
+			    !tick_is_expired(curr_strm->task->expire, now_ms) &&
+			    curr_strm->scf && curr_strm->scf->sedesc && curr_strm->scf->sedesc->se)
+				goto next_sess;
+		}
+
 		if (ctx->target) {
 			if (ctx->target != (void *)-1 && ctx->target != curr_strm)
 				goto next_sess;
@@ -3641,7 +3688,7 @@ static int cli_io_handler_dump_sess(struct appctx *appctx)
 		chunk_appendf(&trash,
 			     " ts=%02x epoch=%#x age=%s calls=%u rate=%u cpu=%llu lat=%llu",
 		             curr_strm->task->state, curr_strm->stream_epoch,
-		             human_time(ns_to_sec(now_ns) - ns_to_sec(curr_strm->logs.accept_ts), 1),
+		             human_time(ns_to_sec(now_ns) - ns_to_sec(curr_strm->logs.request_ts), 1),
 		             curr_strm->task->calls, read_freq_ctr(&curr_strm->call_rate),
 		             (unsigned long long)curr_strm->cpu_time, (unsigned long long)curr_strm->lat_time);
 
@@ -3815,7 +3862,7 @@ static int cli_parse_shutdown_sessions_server(char **args, char *payload, struct
 
 /* register cli keywords */
 static struct cli_kw_list cli_kws = {{ },{
-	{ { "show", "sess",  NULL },             "show sess [id]                          : report the list of current sessions or dump this exact session", cli_parse_show_sess, cli_io_handler_dump_sess, cli_release_show_sess },
+	{ { "show", "sess",  NULL },             "show sess [<id>|all|susp|older <age>]   : report the list of current sessions or dump this exact session", cli_parse_show_sess, cli_io_handler_dump_sess, cli_release_show_sess },
 	{ { "shutdown", "session",  NULL },      "shutdown session [id]                   : kill a specific session",                                        cli_parse_shutdown_session, NULL, NULL },
 	{ { "shutdown", "sessions",  "server" }, "shutdown sessions server <bk>/<srv>     : kill sessions on a server",                                      cli_parse_shutdown_sessions_server, NULL, NULL },
 	{{},}

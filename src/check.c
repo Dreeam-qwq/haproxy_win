@@ -1995,7 +1995,7 @@ REGISTER_POST_CHECK(start_checks);
 REGISTER_SERVER_DEINIT(deinit_srv_check);
 REGISTER_SERVER_DEINIT(deinit_srv_agent_check);
 
-/* perform minimal intializations */
+/* perform minimal initializations */
 static void init_checks()
 {
 	int i;
@@ -2033,7 +2033,7 @@ static int srv_parse_addr(char **args, int *cur_arg, struct proxy *curpx, struct
 		goto error;
 	}
 
-	sk = str2sa_range(args[*cur_arg+1], NULL, &port1, &port2, NULL, NULL, errmsg, NULL, NULL,
+	sk = str2sa_range(args[*cur_arg+1], NULL, &port1, &port2, NULL, NULL, NULL, errmsg, NULL, NULL,
 	                  PA_O_RESOLVE | PA_O_PORT_OK | PA_O_STREAM | PA_O_CONNECT);
 	if (!sk) {
 		memprintf(errmsg, "'%s' : %s", args[*cur_arg], *errmsg);

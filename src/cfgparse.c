@@ -155,14 +155,14 @@ int str2listener(char *str, struct proxy *curproxy, struct bind_conf *bind_conf,
 			*next++ = 0;
 		}
 
-		ss2 = str2sa_range(str, NULL, &port, &end, &fd, &proto, err,
+		ss2 = str2sa_range(str, NULL, &port, &end, &fd, &proto, NULL, err,
 		                   (curproxy == global.cli_fe || curproxy == mworker_proxy) ? NULL : global.unix_bind.prefix,
 		                   NULL, PA_O_RESOLVE | PA_O_PORT_OK | PA_O_PORT_MAND | PA_O_PORT_RANGE |
 		                          PA_O_SOCKET_FD | PA_O_STREAM | PA_O_XPRT);
 		if (!ss2)
 			goto fail;
 
-		if (ss2->ss_family == AF_CUST_REV_SRV) {
+		if (ss2->ss_family == AF_CUST_RHTTP_SRV) {
 			/* Check if a previous non reverse HTTP present is
 			 * already defined. If DGRAM or STREAM is set, this
 			 * indicates that we are currently parsing the second
@@ -174,8 +174,8 @@ int str2listener(char *str, struct proxy *curproxy, struct bind_conf *bind_conf,
 				goto fail;
 			}
 
-			bind_conf->reverse_srvname = strdup(str + strlen("rhttp@"));
-			if (!bind_conf->reverse_srvname) {
+			bind_conf->rhttp_srvname = strdup(str + strlen("rhttp@"));
+			if (!bind_conf->rhttp_srvname) {
 				memprintf(err, "Cannot allocate reverse HTTP bind.\n");
 				goto fail;
 			}
@@ -241,7 +241,7 @@ int str2receiver(char *str, struct proxy *curproxy, struct bind_conf *bind_conf,
 			*next++ = 0;
 		}
 
-		ss2 = str2sa_range(str, NULL, &port, &end, &fd, &proto, err,
+		ss2 = str2sa_range(str, NULL, &port, &end, &fd, &proto, NULL, err,
 		                   curproxy == global.cli_fe ? NULL : global.unix_bind.prefix,
 		                   NULL, PA_O_RESOLVE | PA_O_PORT_OK | PA_O_PORT_MAND | PA_O_PORT_RANGE |
 		                          PA_O_SOCKET_FD | PA_O_DGRAM | PA_O_XPRT);
@@ -1178,7 +1178,7 @@ int cfg_parse_mailers(const char *file, int linenum, char **args, int kwm)
 
 		newmailer->id = strdup(args[1]);
 
-		sk = str2sa_range(args[2], NULL, &port1, &port2, NULL, &proto,
+		sk = str2sa_range(args[2], NULL, &port1, &port2, NULL, &proto, NULL,
 		                  &errmsg, NULL, NULL,
 		                  PA_O_RESOLVE | PA_O_PORT_OK | PA_O_PORT_MAND | PA_O_STREAM | PA_O_XPRT | PA_O_CONNECT);
 		if (!sk) {
@@ -2939,14 +2939,17 @@ init_proxies_list_stage1:
 		switch (curproxy->mode) {
 		case PR_MODE_TCP:
 			cfgerr += proxy_cfg_ensure_no_http(curproxy);
+			cfgerr += proxy_cfg_ensure_no_log(curproxy);
 			break;
 
 		case PR_MODE_HTTP:
+			cfgerr += proxy_cfg_ensure_no_log(curproxy);
 			curproxy->http_needed = 1;
 			break;
 
 		case PR_MODE_CLI:
 			cfgerr += proxy_cfg_ensure_no_http(curproxy);
+			cfgerr += proxy_cfg_ensure_no_log(curproxy);
 			break;
 
 		case PR_MODE_SYSLOG:
@@ -3886,8 +3889,8 @@ out_uri_auth_compat:
 			if ((curproxy->mode != PR_MODE_HTTP) && (curproxy->options & PR_O_REUSE_MASK) != PR_O_REUSE_NEVR)
 				curproxy->options &= ~PR_O_REUSE_MASK;
 
-			if ((curproxy->mode != PR_MODE_HTTP) && newsrv->flags & SRV_F_REVERSE) {
-				ha_alert("%s '%s' : server %s uses reverse addressing which can only be used with HTTP mode.\n",
+			if ((curproxy->mode != PR_MODE_HTTP) && newsrv->flags & SRV_F_RHTTP) {
+				ha_alert("%s '%s' : server %s uses reverse HTTP addressing which can only be used with HTTP mode.\n",
 					   proxy_type_str(curproxy), curproxy->id, newsrv->id);
 				cfgerr++;
 				err_code |= ERR_FATAL | ERR_ALERT;
@@ -4187,6 +4190,8 @@ init_proxies_list_stage2:
 			if (listener->bind_conf->xprt == xprt_get(XPRT_QUIC)) {
 				/* quic_conn are counted against maxconn. */
 				listener->bind_conf->options |= BC_O_XPRT_MAXCONN;
+				listener->rx.quic_curr_handshake = 0;
+				listener->rx.quic_curr_accept = 0;
 
 # ifdef USE_QUIC_OPENSSL_COMPAT
 				/* store the last checked bind_conf in bind_conf */

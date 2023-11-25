@@ -62,6 +62,7 @@ struct server *findserver(const struct proxy *px, const char *name);
 struct server *findserver_unique_id(const struct proxy *px, int puid, uint32_t rid);
 struct server *findserver_unique_name(const struct proxy *px, const char *name, uint32_t rid);
 int proxy_cfg_ensure_no_http(struct proxy *curproxy);
+int proxy_cfg_ensure_no_log(struct proxy *curproxy);
 void init_new_proxy(struct proxy *p);
 void proxy_preset_defaults(struct proxy *defproxy);
 void proxy_free_defaults(struct proxy *defproxy);
@@ -85,6 +86,8 @@ void proxy_adjust_all_maxconn(void);
 struct proxy *cli_find_frontend(struct appctx *appctx, const char *arg);
 struct proxy *cli_find_frontend(struct appctx *appctx, const char *arg);
 int resolve_stick_rule(struct proxy *curproxy, struct sticking_rule *mrule);
+void free_stick_rules(struct list *rules);
+void free_server_rules(struct list *srules);
 
 /*
  * This function returns a string containing the type of the proxy in a format

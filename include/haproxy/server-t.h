@@ -41,6 +41,7 @@
 #include <haproxy/task-t.h>
 #include <haproxy/thread-t.h>
 #include <haproxy/event_hdl-t.h>
+#include <haproxy/tools-t.h>
 
 
 /* server states. Only SRV_ST_STOPPED indicates a down server. */
@@ -141,7 +142,7 @@ enum srv_initaddr {
 #define SRV_F_NON_STICK    0x0004        /* never add connections allocated to this server to a stick table */
 #define SRV_F_USE_NS_FROM_PP 0x0008      /* use namespace associated with connection if present */
 #define SRV_F_FORCED_ID    0x0010        /* server's ID was forced in the configuration */
-#define SRV_F_REVERSE      0x0020        /* reverse connect server which requires idle connection for transfers */
+#define SRV_F_RHTTP        0x0020        /* reverse HTTP server which requires idle connection for transfers */
 #define SRV_F_AGENTPORT    0x0040        /* this server has a agent port configured */
 #define SRV_F_AGENTADDR    0x0080        /* this server has a agent addr configured */
 #define SRV_F_COOKIESET    0x0100        /* this server has a cookie configured, so don't generate dynamic cookies */
@@ -285,7 +286,7 @@ struct server {
 
 	struct proxy *proxy;			/* the proxy this server belongs to */
 	const struct mux_proto_list *mux_proto; /* the mux to use for all outgoing connections (specified by the "proto" keyword) */
-	struct protocol *addr_proto;            /* server side protocol used for haproxy<->server communication */
+	struct net_addr_type addr_type;         /* server address type (socket and transport hints) */
 	struct log_target *log_target;          /* when 'mode log' is enabled, target facility used to transport log messages */
 	unsigned maxconn, minconn;		/* max # of active sessions (0 = unlimited), min# for dynamic limit. */
 	struct srv_per_thread *per_thr;         /* array of per-thread stuff such as connections lists */
@@ -476,6 +477,7 @@ struct event_hdl_cb_data_server {
 	 *   EVENT_HDL_SUB_SERVER_STATE
 	 *   EVENT_HDL_SUB_SERVER_ADMIN
 	 *   EVENT_HDL_SUB_SERVER_CHECK
+	 *   EVENT_HDL_SUB_SERVER_INETADDR
 	 */
 	struct {
 		/* safe data can be safely used from both
@@ -514,7 +516,7 @@ struct event_hdl_cb_data_server_checkres {
 	} reason;
 	struct {
 		int cur;              /* dynamic (= check->health) */
-		int rise, fall;       /* config dependant */
+		int rise, fall;       /* config dependent */
 	} health;                     /* check's health, see check-t.h */
 };
 
@@ -593,6 +595,39 @@ struct event_hdl_cb_data_server_check {
 	struct {
 		struct check *ptr;                              /* check ptr */
 	} unsafe;
+};
+
+/* data provided to EVENT_HDL_SUB_SERVER_INETADDR handlers through
+ * event_hdl facility
+ *
+ * Note that this may be casted to regular event_hdl_cb_data_server if
+ * you don't care about inetaddr related optional info
+ */
+struct event_hdl_cb_data_server_inetaddr {
+	/* provided by:
+	 *   EVENT_HDL_SUB_SERVER_INETADDR
+	 */
+	struct event_hdl_cb_data_server server;                 /* must be at the beginning */
+	struct {
+		struct  {
+			int family; /* AF_INET or AF_INET6 */
+			union {
+				struct in_addr v4;
+				struct in6_addr v6;
+			} addr; /* may hold v4 or v6 addr */
+			unsigned int svc_port;
+		} prev;
+		struct {
+			int family; /* AF_INET or AF_INET6 */
+			union {
+				struct in_addr v4;
+				struct in6_addr v6;
+			} addr; /* may hold v4 or v6 addr */
+			unsigned int svc_port;
+		} next;
+		uint8_t purge_conn; /* set to 1 if the network change will force a connection cleanup */
+	} safe;
+	/* no unsafe data */
 };
 
 /* Storage structure to load server-state lines from a flat file into

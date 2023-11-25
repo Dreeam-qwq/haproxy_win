@@ -41,6 +41,7 @@
 #include <haproxy/ssl_sock.h>
 #include <haproxy/stconn.h>
 #include <haproxy/stream.h>
+#include <haproxy/action.h>
 #include <haproxy/time.h>
 #include <haproxy/hash.h>
 #include <haproxy/tools.h>
@@ -84,7 +85,7 @@ static const struct log_fmt_st log_formats[LOG_FORMATS] = {
 
 /*
  * This map is used with all the FD_* macros to check whether a particular bit
- * is set or not. Each bit represents an ACSII code. ha_bit_set() sets those
+ * is set or not. Each bit represents an ASCII code. ha_bit_set() sets those
  * bytes which should be escaped. When ha_bit_test() returns non-zero, it means
  * that the byte should be escaped. Be careful to always pass bytes from 0 to
  * 255 exclusively to the macros.
@@ -779,7 +780,7 @@ static void _log_backend_srv_queue(struct server *srv)
 {
 	struct proxy *p = srv->proxy;
 
-	/* queue the server in the proxy lb array to make it easily searcheable by
+	/* queue the server in the proxy lb array to make it easily searchable by
 	 * log-balance algorithms. Here we use the srv array as a general server
 	 * pool of in-use servers, lookup is done using a relative positional id
 	 * (array is contiguous)
@@ -804,11 +805,13 @@ static void _log_backend_srv_queue(struct server *srv)
 	}
 	/* append the server to the list of available servers */
 	LIST_APPEND(&p->lbprm.log.avail, &srv->lb_list);
+
+	p->lbprm.tot_weight = (p->srv_act) ? p->srv_act : p->srv_bck;
 }
 
 static void log_backend_srv_up(struct server *srv)
 {
-	struct proxy *p = srv->proxy;
+	struct proxy *p __maybe_unused = srv->proxy;
 
 	if (!srv_lb_status_changed(srv))
 		return; /* nothing to do */
@@ -858,11 +861,13 @@ static void _log_backend_srv_dequeue(struct server *srv)
 
 	/* reconstruct the array of usable servers */
 	_log_backend_srv_recalc(p);
+
+	p->lbprm.tot_weight = (p->srv_act) ? p->srv_act : p->srv_bck;
 }
 
 static void log_backend_srv_down(struct server *srv)
 {
-	struct proxy *p = srv->proxy;
+	struct proxy *p __maybe_unused = srv->proxy;
 
 	if (!srv_lb_status_changed(srv))
 		return; /* nothing to do */
@@ -872,6 +877,70 @@ static void log_backend_srv_down(struct server *srv)
 	HA_RWLOCK_WRLOCK(LBPRM_LOCK, &p->lbprm.lock);
 	_log_backend_srv_dequeue(srv);
 	HA_RWLOCK_WRUNLOCK(LBPRM_LOCK, &p->lbprm.lock);
+}
+
+/* check that current configuration is compatible with "mode log" */
+static int _postcheck_log_backend_compat(struct proxy *be)
+{
+	int err_code = ERR_NONE;
+
+	if (!LIST_ISEMPTY(&be->tcp_req.inspect_rules) ||
+	    !LIST_ISEMPTY(&be->tcp_req.l4_rules) ||
+	    !LIST_ISEMPTY(&be->tcp_req.l5_rules)) {
+		ha_warning("Cannot use tcp-request rules with 'mode log' in %s '%s'. They will be ignored.\n",
+			   proxy_type_str(be), be->id);
+
+		err_code |= ERR_WARN;
+		free_act_rules(&be->tcp_req.inspect_rules);
+		free_act_rules(&be->tcp_req.l4_rules);
+		free_act_rules(&be->tcp_req.l5_rules);
+	}
+	if (!LIST_ISEMPTY(&be->tcp_rep.inspect_rules)) {
+		ha_warning("Cannot use tcp-response rules with 'mode log' in %s '%s'. They will be ignored.\n",
+			   proxy_type_str(be), be->id);
+
+		err_code |= ERR_WARN;
+		free_act_rules(&be->tcp_rep.inspect_rules);
+	}
+	if (be->table) {
+		ha_warning("Cannot use stick table with 'mode log' in %s '%s'. It will be ignored.\n",
+			   proxy_type_str(be), be->id);
+
+		err_code |= ERR_WARN;
+		stktable_deinit(be->table);
+		ha_free(&be->table);
+	}
+	if (!LIST_ISEMPTY(&be->storersp_rules) ||
+	    !LIST_ISEMPTY(&be->sticking_rules)) {
+		ha_warning("Cannot use sticking rules with 'mode log' in %s '%s'. They will be ignored.\n",
+			   proxy_type_str(be), be->id);
+
+		err_code |= ERR_WARN;
+		free_stick_rules(&be->storersp_rules);
+		free_stick_rules(&be->sticking_rules);
+	}
+	if (isttest(be->server_id_hdr_name)) {
+		ha_warning("Cannot set \"server_id_hdr_name\" with 'mode log' in %s '%s'. It will be ignored.\n",
+			   proxy_type_str(be), be->id);
+
+		err_code |= ERR_WARN;
+		istfree(&be->server_id_hdr_name);
+	}
+	if (be->dyncookie_key) {
+		ha_warning("Cannot set \"dynamic-cookie-key\" with 'mode log' in %s '%s'. It will be ignored.\n",
+			   proxy_type_str(be), be->id);
+
+		err_code |= ERR_WARN;
+		ha_free(&be->dyncookie_key);
+	}
+	if (!LIST_ISEMPTY(&be->server_rules)) {
+		ha_warning("Cannot use \"use-server\" rules with 'mode log' in %s '%s'. They will be ignored.\n",
+			   proxy_type_str(be), be->id);
+
+		err_code |= ERR_WARN;
+		free_server_rules(&be->server_rules);
+	}
+	return err_code;
 }
 
 static int postcheck_log_backend(struct proxy *be)
@@ -885,7 +954,11 @@ static int postcheck_log_backend(struct proxy *be)
 	    (be->flags & (PR_FL_DISABLED|PR_FL_STOPPED)))
 		return ERR_NONE; /* nothing to do */
 
-	/* First time encoutering this log backend, perform some init
+	err_code |= _postcheck_log_backend_compat(be);
+	if (err_code & ERR_CODE)
+		return err_code;
+
+	/* First time encountering this log backend, perform some init
 	 */
 	be->lbprm.set_server_status_up = log_backend_srv_up;
 	be->lbprm.set_server_status_down = log_backend_srv_down;
@@ -910,7 +983,7 @@ static int postcheck_log_backend(struct proxy *be)
 	be->srv_bck = 0;
 
 	/* "log-balance hash" needs to compile its expression */
-	if ((be->lbprm.algo & BE_LB_ALGO) == BE_LB_ALGO_SMP) {
+	if ((be->lbprm.algo & BE_LB_ALGO) == BE_LB_ALGO_LH) {
 		struct sample_expr *expr;
 		char *expr_str = NULL;
 		char *err_str = NULL;
@@ -971,8 +1044,30 @@ static int postcheck_log_backend(struct proxy *be)
 	/* finish the initialization of proxy's servers */
 	srv = be->srv;
 	while (srv) {
+		BUG_ON(srv->log_target);
+		BUG_ON(srv->addr_type.proto_type != PROTO_TYPE_DGRAM &&
+		       srv->addr_type.proto_type != PROTO_TYPE_STREAM);
+
+		srv->log_target = malloc(sizeof(*srv->log_target));
+		if (!srv->log_target) {
+			memprintf(&msg, "memory error when allocating log server '%s'\n", srv->id);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto end;
+		}
+		srv->log_target->addr = &srv->addr;
+		if (srv->addr_type.proto_type == PROTO_TYPE_DGRAM)
+			srv->log_target->type = LOG_TARGET_DGRAM;
+		else {
+			/* for now BUFFER type only supports TCP server to it's almost
+			 * explicit. This will require ring buffer creation during log
+			 * postresolving step.
+			 */
+			srv->log_target->type = LOG_TARGET_BUFFER;
+		}
+
 		if (target_type == -1)
 			target_type = srv->log_target->type;
+
 		if (target_type != srv->log_target->type) {
 			memprintf(&msg, "cannot mix server types within a log backend, '%s' srv's network type differs from previous server", srv->id);
 			err_code |= ERR_ALERT | ERR_FATAL;
@@ -1008,7 +1103,7 @@ static int postcheck_log_backend(struct proxy *be)
  * Returns err_code which defaults to ERR_NONE and can be set to a combination
  * of ERR_WARN, ERR_ALERT, ERR_FATAL and ERR_ABORT in case of errors.
  * <msg> could be set at any time (it will usually be set on error, but
- * could also be set when no error occured to report a diag warning), thus is
+ * could also be set when no error occurred to report a diag warning), thus is
  * up to the caller to check it and to free it.
  */
 int resolve_logger(struct logger *logger, char **msg)
@@ -1067,7 +1162,10 @@ struct logger *dup_logger(struct logger *def)
 		if (!cpy->conf.file)
 			goto error;
 	}
-	cpy->ref = def;
+
+	/* inherit from original reference if set */
+	cpy->ref = (def->ref) ? def->ref : def;
+
 	return cpy;
 
  error:
@@ -1123,7 +1221,7 @@ static int parse_log_target(char *raw, struct log_target *target, char **err)
 	target->type = LOG_TARGET_DGRAM; // default type
 
 	/* parse the target address */
-	sk = str2sa_range(raw, NULL, &port1, &port2, &fd, &proto,
+	sk = str2sa_range(raw, NULL, &port1, &port2, &fd, &proto, NULL,
 	                  err, NULL, NULL,
 	                  PA_O_RESOLVE | PA_O_PORT_OK | PA_O_RAW_FD | PA_O_DGRAM | PA_O_STREAM | PA_O_DEFAULT_DGRAM);
 	if (!sk)
@@ -2173,7 +2271,7 @@ static inline void __do_send_log_backend(struct proxy *be, struct log_header hdr
 		 */
 		targetid = HA_ATOMIC_FETCH_ADD(&be->lbprm.log.lastid, 1) % nb_srv;
 	}
-	else if ((be->lbprm.algo & BE_LB_ALGO) == BE_LB_ALGO_FAS) {
+	else if ((be->lbprm.algo & BE_LB_ALGO) == BE_LB_ALGO_LS) {
 		/* sticky mode: use first server in the pool, which will always stay
 		 * first during dequeuing and requeuing, unless it becomes unavailable
 		 * and will be replaced by another one
@@ -2184,7 +2282,7 @@ static inline void __do_send_log_backend(struct proxy *be, struct log_header hdr
 		/* random mode */
 		targetid = statistical_prng() % nb_srv;
 	}
-	else if ((be->lbprm.algo & BE_LB_ALGO) == BE_LB_ALGO_SMP) {
+	else if ((be->lbprm.algo & BE_LB_ALGO) == BE_LB_ALGO_LH) {
 		struct sample result;
 
 		/* log-balance hash */

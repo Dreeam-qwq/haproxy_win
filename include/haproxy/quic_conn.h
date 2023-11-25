@@ -458,7 +458,7 @@ static inline uint64_t quic_compute_ack_delay_us(unsigned int time_received,
 /* Initialize <p> QUIC network path depending on <ipv4> boolean
  * which is true for an IPv4 path, if not false for an IPv6 path.
  */
-static inline void quic_path_init(struct quic_path *path, int ipv4,
+static inline void quic_path_init(struct quic_path *path, int ipv4, unsigned long max_cwnd,
                                   struct quic_cc_algo *algo, struct quic_conn *qc)
 {
 	unsigned int max_dgram_sz;
@@ -468,6 +468,7 @@ static inline void quic_path_init(struct quic_path *path, int ipv4,
 	path->mtu = max_dgram_sz;
 	path->cwnd = QUIC_MIN(10 * max_dgram_sz, QUIC_MAX(max_dgram_sz << 1, 14720U));
 	path->mcwnd = path->cwnd;
+	path->max_cwnd = max_cwnd;
 	path->min_cwnd = max_dgram_sz << 1;
 	path->prep_in_flight = 0;
 	path->in_flight = 0;
@@ -488,7 +489,7 @@ static inline size_t quic_path_prep_data(struct quic_path *path)
 }
 
 /* Return the number of bytes which may be sent from <qc> connection when
- * it has not already been validated. Note that this is the responsability
+ * it has not already been validated. Note that this is the responsibility
  * of the caller to check that the case with quic_peer_validated_addr().
  * This latter BUG_ON() if 3 * qc->rx.bytes < qc->tx.prep_bytes.
  */
@@ -604,20 +605,6 @@ int qc_parse_hd_form(struct quic_rx_packet *pkt,
                      unsigned char **buf, const unsigned char *end);
 int quic_dgram_parse(struct quic_dgram *dgram, struct quic_conn *qc,
                      struct listener *li);
-
-/* Wake up every QUIC connections on closing/draining state if process stopping
- * is active. They will be immediately released so this ensures haproxy process
- * stopping is not delayed by them.
- */
-static inline void quic_handle_stopping(void)
-{
-	struct quic_conn *qc;
-
-	if (stopping) {
-		list_for_each_entry(qc, &th_ctx->quic_conns_clo, el_th_ctx)
-			task_wakeup(qc->idle_timer_task, TASK_WOKEN_OTHER);
-	}
-}
 
 int qc_set_tid_affinity(struct quic_conn *qc, uint new_tid, struct listener *new_li);
 void qc_finalize_affinity_rebind(struct quic_conn *qc);

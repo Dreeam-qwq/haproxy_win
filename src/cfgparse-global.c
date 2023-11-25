@@ -515,12 +515,12 @@ int cfg_parse_global(const char *file, int linenum, char **args, int kwm)
 
 		if (alertif_too_many_args(0, file, linenum, args, &err_code))
 			goto out;
-		global.tune.options &= GTUNE_USE_FAST_FWD;
+		global.tune.options &= ~GTUNE_USE_FAST_FWD;
 	}
 	else if (strcmp(args[0], "tune.disable-zero-copy-forwarding") == 0) {
 		if (alertif_too_many_args(0, file, linenum, args, &err_code))
 			goto out;
-		global.tune.options &= GTUNE_USE_ZERO_COPY_FWD;
+		global.tune.options &= ~GTUNE_USE_ZERO_COPY_FWD;
 	}
 	else if (strcmp(args[0], "cluster-secret") == 0) {
 		blk_SHA_CTX sha1_ctx;
@@ -586,9 +586,16 @@ int cfg_parse_global(const char *file, int linenum, char **args, int kwm)
 		}
 	}
 	else if (strcmp(args[0], "external-check") == 0) {
-		if (alertif_too_many_args(0, file, linenum, args, &err_code))
+		if (alertif_too_many_args(1, file, linenum, args, &err_code))
 			goto out;
 		global.external_check = 1;
+		if (strcmp(args[1], "preserve-env") == 0) {
+			global.external_check = 2;
+		} else {
+			ha_alert("parsing [%s:%d] : '%s' only supports 'preserve-env' as an argument, found '%s'.\n", file, linenum, args[0], args[1]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+	                goto out;
+		}
 	}
 	/* user/group name handling */
 	else if (strcmp(args[0], "user") == 0) {

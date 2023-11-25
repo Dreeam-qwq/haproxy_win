@@ -599,7 +599,7 @@ struct sample_fetch *sample_fetch_getnext(struct sample_fetch *current, int *idx
 		kwl = LIST_NEXT(&sample_fetches.list, struct sample_fetch_kw_list *, list);
 		(*idx) = 0;
 	} else {
-		/* Get kwl corresponding to the curret entry. */
+		/* Get kwl corresponding to the current entry. */
 		base = current + 1 - (*idx);
 		kwl = container_of(base, struct sample_fetch_kw_list, kw);
 	}
@@ -642,7 +642,7 @@ struct sample_conv *sample_conv_getnext(struct sample_conv *current, int *idx)
 		kwl = LIST_NEXT(&sample_convs.list, struct sample_conv_kw_list *, list);
 		(*idx) = 0;
 	} else {
-		/* Get kwl corresponding to the curret entry. */
+		/* Get kwl corresponding to the current entry. */
 		base = current + 1 - (*idx);
 		kwl = container_of(base, struct sample_conv_kw_list, kw);
 	}
@@ -895,7 +895,7 @@ int c_none(struct sample *smp)
 }
 
 /* special converter function used by pseudo types in the compatibility matrix
- * to inform that the conversion is theorically allowed at parsing time.
+ * to inform that the conversion is theoretically allowed at parsing time.
  *
  * However, being a pseudo type, it may not be emitted by fetches or converters
  * so this function should never be called. If this is the case, then it means
@@ -2258,7 +2258,7 @@ found:
   * strftime(3) does not implement nanoseconds, but we still want them in our
   * date format.
   *
-  * This function implements %N like in date(1) which gives you the nanoseconds part of the timetamp
+  * This function implements %N like in date(1) which gives you the nanoseconds part of the timestamp
   * An optional field width can be specified, a maximum width of 9 is supported (ex: %3N %6N %9N)
   *
   * <format> is the format string
@@ -2310,7 +2310,7 @@ static struct buffer *conv_time_common(const char *format, time_t curr_date, uin
 
 		if (chunk_istcat(tmp_format, ist2(p, cpy)) == 0) /* copy before the %N */
 			goto error;
-		if (chunk_istcat(tmp_format, ist2(ns_str, width)) == 0) /* copy the %N result with the right precison  */
+		if (chunk_istcat(tmp_format, ist2(ns_str, width)) == 0) /* copy the %N result with the right precision  */
 			goto error;
 
 		p += skip + cpy; /* skip the %N */
@@ -2724,28 +2724,29 @@ static int sample_conv_bytes(const struct arg *arg_p, struct sample *smp, void *
 
 	// determine the start_idx and length of the output
 	smp_set_owner(&smp_arg0, smp->px, smp->sess, smp->strm, smp->opt);
-	if (!sample_conv_var2smp_sint(&arg_p[0], &smp_arg0)) {
-		smp->data.u.str.data = 0;
-		return 0;
+	if (!sample_conv_var2smp_sint(&arg_p[0], &smp_arg0) || smp_arg0.data.u.sint < 0) {
+		/* invalid or negative value */
+		goto fail;
 	}
-	if (smp_arg0.data.u.sint < 0 || (smp_arg0.data.u.sint >= smp->data.u.str.data)) {
-		// empty output if the arg0 value is negative or >= the input length
-		smp->data.u.str.data = 0;
-		return 0;
+
+	if (smp_arg0.data.u.sint >= smp->data.u.str.data) {
+		// arg0 >= the input length
+		if (smp->opt & SMP_OPT_FINAL) {
+			// empty output value on final smp
+			smp->data.u.str.data = 0;
+			goto end;
+		}
+		goto wait;
 	}
 	start_idx = smp_arg0.data.u.sint;
 
 	// length comes from arg1 if present, otherwise it's the remaining length
+	length = smp->data.u.str.data - start_idx;
 	if (arg_p[1].type != ARGT_STOP) {
 		smp_set_owner(&smp_arg1, smp->px, smp->sess, smp->strm, smp->opt);
-		if (!sample_conv_var2smp_sint(&arg_p[1], &smp_arg1)) {
-			smp->data.u.str.data = 0;
-			return 0;
-		}
-		if (smp_arg1.data.u.sint < 0) {
-			// empty output if the arg1 value is negative
-			smp->data.u.str.data = 0;
-			return 0;
+		if (!sample_conv_var2smp_sint(&arg_p[1], &smp_arg1) || smp_arg1.data.u.sint < 0) {
+			// invalid or negative value
+			goto fail;
 		}
 
 		if (smp_arg1.data.u.sint > (smp->data.u.str.data - start_idx)) {
@@ -2753,22 +2754,25 @@ static int sample_conv_bytes(const struct arg *arg_p, struct sample *smp, void *
 			if (smp->opt & SMP_OPT_FINAL) {
 				// truncate to remaining length
 				length = smp->data.u.str.data - start_idx;
-			} else {
-				smp->data.u.str.data = 0;
-				return 0;
+				goto end;
 			}
-		} else {
-			length = smp_arg1.data.u.sint;
+			goto wait;
 		}
-	} else {
-		length = smp->data.u.str.data - start_idx;
+		length = smp_arg1.data.u.sint;
 	}
 
 	// update the output using the start_idx and length
 	smp->data.u.str.area += start_idx;
 	smp->data.u.str.data = length;
 
+  end:
 	return 1;
+
+  fail:
+	smp->flags &= ~SMP_F_MAY_CHANGE;
+  wait:
+	smp->data.u.str.data = 0;
+	return 0;
 }
 
 static int sample_conv_field_check(struct arg *args, struct sample_conv *conv,
@@ -4724,7 +4728,7 @@ static int smp_check_const_meth(struct arg *args, char **err)
 		args[0].type = ARGT_SINT;
 		args[0].data.sint = meth;
 	} else {
-		/* Check method avalaibility. A method is a token defined as :
+		/* Check method availability. A method is a token defined as :
 		 * tchar = "!" / "#" / "$" / "%" / "&" / "'" / "*" / "+" / "-" / "." /
 		 *         "^" / "_" / "`" / "|" / "~" / DIGIT / ALPHA
 		 * token = 1*tchar

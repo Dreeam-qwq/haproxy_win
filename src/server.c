@@ -166,6 +166,16 @@ int srv_getinter(const struct check *check)
 	return (check->fastinter)?(check->fastinter):(check->inter);
 }
 
+/* Update server's addr:svc_port tuple in INET context
+ *
+ * Must be called with server lock held
+ */
+void _srv_set_inetaddr(struct server *srv, const struct sockaddr_storage *addr, unsigned int svc_port)
+{
+	ipcpy(addr, &srv->addr);
+	srv->svc_port = svc_port;
+}
+
 /* fill common server event data members struct
  * must be called with server lock or under thread isolate
  */
@@ -232,6 +242,54 @@ void _srv_event_hdl_prepare_state(struct event_hdl_cb_data_server_state *cb_data
 			_srv_event_hdl_prepare_checkres(&cb_data->safe.op_st_chg.check, check);
 		}
 	}
+}
+
+/* Prepare SERVER_INETADDR event
+ *
+ * This special event will contain extra hints related to the addr change
+ *
+ */
+void _srv_event_hdl_prepare_inetaddr(struct event_hdl_cb_data_server_inetaddr *cb_data,
+                                     struct sockaddr_storage *prev_addr, unsigned int prev_port,
+                                     struct sockaddr_storage *next_addr, unsigned int next_port,
+                                     uint8_t purge_conn)
+{
+	/* only INET families are supported */
+	BUG_ON((prev_addr->ss_family != AF_UNSPEC &&
+	        prev_addr->ss_family != AF_INET && prev_addr->ss_family != AF_INET6) ||
+	       (next_addr->ss_family != AF_UNSPEC &&
+	        next_addr->ss_family != AF_INET && next_addr->ss_family != AF_INET6));
+
+	/* prev */
+	if (prev_addr->ss_family == AF_INET) {
+		cb_data->safe.prev.family = AF_INET;
+		cb_data->safe.prev.addr.v4.s_addr =
+			((struct sockaddr_in *)prev_addr)->sin_addr.s_addr;
+	}
+	else {
+		cb_data->safe.prev.family = AF_INET6;
+		memcpy(&cb_data->safe.prev.addr.v6.s6_addr,
+		       ((struct sockaddr_in6 *)prev_addr)->sin6_addr.s6_addr,
+		       sizeof(struct sockaddr_in6));
+	}
+	cb_data->safe.prev.svc_port = prev_port;
+
+	/* next */
+	if (next_addr->ss_family == AF_INET) {
+		cb_data->safe.next.family = AF_INET;
+		cb_data->safe.next.addr.v4.s_addr =
+			((struct sockaddr_in *)next_addr)->sin_addr.s_addr;
+	}
+	else {
+		cb_data->safe.next.family = AF_INET6;
+		memcpy(&cb_data->safe.next.addr.v6.s6_addr,
+		       ((struct sockaddr_in6 *)next_addr)->sin6_addr.s6_addr,
+		       sizeof(struct sockaddr_in6));
+	}
+
+	cb_data->safe.next.svc_port = next_port;
+
+	cb_data->safe.purge_conn = purge_conn;
 }
 
 /* server event publishing helper: publish in both global and
@@ -1432,7 +1490,7 @@ static int srv_parse_source(char **args, int *cur_arg,
 	}
 
 	/* 'sk' is statically allocated (no need to be freed). */
-	sk = str2sa_range(args[*cur_arg + 1], NULL, &port_low, &port_high, NULL, NULL,
+	sk = str2sa_range(args[*cur_arg + 1], NULL, &port_low, &port_high, NULL, NULL, NULL,
 	                  &errmsg, NULL, NULL,
 		          PA_O_RESOLVE | PA_O_PORT_OK | PA_O_PORT_RANGE | PA_O_STREAM | PA_O_CONNECT);
 	if (!sk) {
@@ -1520,7 +1578,7 @@ static int srv_parse_source(char **args, int *cur_arg,
 				int port1, port2;
 
 				/* 'sk' is statically allocated (no need to be freed). */
-				sk = str2sa_range(args[*cur_arg + 1], NULL, &port1, &port2, NULL, NULL,
+				sk = str2sa_range(args[*cur_arg + 1], NULL, &port1, &port2, NULL, NULL, NULL,
 				                  &errmsg, NULL, NULL,
 				                  PA_O_RESOLVE | PA_O_PORT_OK | PA_O_STREAM | PA_O_CONNECT);
 				if (!sk) {
@@ -1610,7 +1668,7 @@ static int srv_parse_socks4(char **args, int *cur_arg,
 	}
 
 	/* 'sk' is statically allocated (no need to be freed). */
-	sk = str2sa_range(args[*cur_arg + 1], NULL, &port_low, &port_high, NULL, NULL,
+	sk = str2sa_range(args[*cur_arg + 1], NULL, &port_low, &port_high, NULL, NULL, NULL,
 	                  &errmsg, NULL, NULL,
 	                  PA_O_RESOLVE | PA_O_PORT_OK | PA_O_PORT_MAND | PA_O_STREAM | PA_O_CONNECT);
 	if (!sk) {
@@ -2401,7 +2459,7 @@ void srv_settings_cpy(struct server *srv, const struct server *src, int srv_tmpl
 
 	if (srv_tmpl) {
 		srv->addr = src->addr;
-		srv->addr_proto = src->addr_proto;
+		srv->addr_type = src->addr_type;
 		srv->svc_port = src->svc_port;
 	}
 
@@ -2514,8 +2572,6 @@ void srv_settings_cpy(struct server *srv, const struct server *src, int srv_tmpl
 	LIST_INIT(&srv->pp_tlvs);
 
 	list_for_each_entry(srv_tlv, &src->pp_tlvs, list) {
-		if (srv_tlv == NULL)
-			break;
 		new_srv_tlv = malloc(sizeof(*new_srv_tlv));
 		if (unlikely(!new_srv_tlv)) {
 			break;
@@ -2830,47 +2886,39 @@ static int _srv_check_proxy_mode(struct server *srv, char postparse)
 	if (srv->conf.file)
 		set_usermsgs_ctx(srv->conf.file, srv->conf.line, NULL);
 
-	if (!srv->addr_proto) {
-		/* proto may not be set (ie: if srv_parse_init() was skipped or
-		 * SRV_PARSE_PARSE_ADDR was not set, in this case, we have nothing
-		 * to check
-		 */
+	if (!srv->proxy) {
+		/* proxy mode not known, cannot perform checks (ie: defaults section) */
 		goto out;
 	}
+
 	if (srv->proxy->mode == PR_MODE_SYSLOG) {
-		/* mode log enabled:
-		 * pre-resolve related log target from known infos
+		/* log backend server (belongs to proxy with mode log enabled):
+		 * perform some compatibility checks
 		 */
 
-		BUG_ON(srv->log_target);
-		srv->log_target = malloc(sizeof(*srv->log_target));
-		if (!srv->log_target) {
-			ha_alert("memory error when allocating log server\n");
+		/* supported address family types are:
+		 *   - ipv4
+		 *   - ipv6
+		 * (UNSPEC is supported because it means it will be resolved later)
+		 */
+		if (srv->addr.ss_family != AF_UNSPEC &&
+		    srv->addr.ss_family != AF_INET && srv->addr.ss_family != AF_INET6) {
+			ha_alert("log server address family not supported for log backend server.\n");
 			err_code |= ERR_ALERT | ERR_FATAL;
 			goto out;
 		}
-		srv->log_target->addr = &srv->addr;
-		switch (srv->addr_proto->xprt_type) {
-			case PROTO_TYPE_DGRAM:
-				srv->log_target->type = LOG_TARGET_DGRAM;
-				break;
-			case PROTO_TYPE_STREAM:
-				/* for now BUFFER type only supports TCP server to it's almost
-				 * explicit. This will require ring buffer creation during log
-				 * postresolving step.
-				 */
-				srv->log_target->type = LOG_TARGET_BUFFER;
-				break;
-			default:
-				ha_alert("log server type not supported for log backend server.\n");
-				err_code |= ERR_ALERT | ERR_FATAL;
-				break;
+
+		/* only @tcp or @udp address forms (or equivalent) are supported */
+		if (!(srv->addr_type.xprt_type == PROTO_TYPE_DGRAM && srv->addr_type.proto_type == PROTO_TYPE_DGRAM) &&
+		    !(srv->addr_type.xprt_type == PROTO_TYPE_STREAM && srv->addr_type.proto_type == PROTO_TYPE_STREAM)) {
+			ha_alert("log server address type not supported for log backend server.\n");
+			err_code |= ERR_ALERT | ERR_FATAL;
 		}
 	}
 	else {
-		/* for now, only TCP expected as srv's proto for other uses */
-		if (srv->addr_proto->xprt_type != PROTO_TYPE_STREAM || !srv->addr_proto->connect) {
-			ha_alert("unsupported protocol for server address in '%s' backend.\n", proxy_mode_str(srv->proxy->mode));
+		/* for all other proxy modes: only TCP expected as srv's transport type for now */
+		if (srv->addr_type.xprt_type != PROTO_TYPE_STREAM) {
+			ha_alert("unsupported transport for server address in '%s' backend.\n", proxy_mode_str(srv->proxy->mode));
 			err_code |= ERR_ALERT | ERR_FATAL;
 		}
 	}
@@ -3006,7 +3054,7 @@ static int _srv_parse_init(struct server **srv, char **args, int *cur_arg,
 		if (!(parse_flags & SRV_PARSE_PARSE_ADDR))
 			goto skip_addr;
 
-		sk = str2sa_range(args[*cur_arg], &port, &port1, &port2, NULL, &newsrv->addr_proto,
+		sk = str2sa_range(args[*cur_arg], &port, &port1, &port2, NULL, NULL, &newsrv->addr_type,
 		                  &errmsg, NULL, &fqdn,
 		                  (parse_flags & SRV_PARSE_INITIAL_RESOLVE ? PA_O_RESOLVE : 0) | PA_O_PORT_OK |
 				  (parse_flags & SRV_PARSE_IN_PEER_SECTION ? PA_O_PORT_MAND : PA_O_PORT_OFS) |
@@ -3019,12 +3067,12 @@ static int _srv_parse_init(struct server **srv, char **args, int *cur_arg,
 		}
 
 		if (!port1 || !port2) {
-			if (sk->ss_family != AF_CUST_REV_SRV) {
+			if (sk->ss_family != AF_CUST_RHTTP_SRV) {
 				/* no port specified, +offset, -offset */
 				newsrv->flags |= SRV_F_MAPPORTS;
 			}
 			else {
-				newsrv->flags |= SRV_F_REVERSE;
+				newsrv->flags |= SRV_F_RHTTP;
 			}
 		}
 
@@ -3302,7 +3350,8 @@ int parse_server(const char *file, int linenum, char **args,
 	if (err_code & ERR_CODE)
 		goto out;
 
-	newsrv->conf.file = strdup(file);
+	if (!newsrv->conf.file) // note: do it only once for default-server
+		newsrv->conf.file = strdup(file);
 	newsrv->conf.line = linenum;
 
 	while (*args[cur_arg]) {
@@ -3474,6 +3523,12 @@ struct server *server_find_best_match(struct proxy *bk, char *name, int id, int 
  */
 int srv_update_addr(struct server *s, void *ip, int ip_sin_family, const char *updater)
 {
+	union {
+		struct event_hdl_cb_data_server_inetaddr addr;
+		struct event_hdl_cb_data_server common;
+	} cb_data;
+	struct sockaddr_storage new_addr;
+
 	/* save the new IP family & address if necessary */
 	switch (ip_sin_family) {
 	case AF_INET:
@@ -3532,16 +3587,25 @@ int srv_update_addr(struct server *s, void *ip, int ip_sin_family, const char *u
 	}
 
 	/* save the new IP family */
-	s->addr.ss_family = ip_sin_family;
+	new_addr.ss_family = ip_sin_family;
 	/* save the new IP address */
 	switch (ip_sin_family) {
 	case AF_INET:
-		memcpy(&((struct sockaddr_in *)&s->addr)->sin_addr.s_addr, ip, 4);
+		memcpy(&((struct sockaddr_in *)&new_addr)->sin_addr.s_addr, ip, 4);
 		break;
 	case AF_INET6:
-		memcpy(((struct sockaddr_in6 *)&s->addr)->sin6_addr.s6_addr, ip, 16);
+		memcpy(((struct sockaddr_in6 *)&new_addr)->sin6_addr.s6_addr, ip, 16);
 		break;
 	};
+
+	_srv_event_hdl_prepare(&cb_data.common, s, 0);
+	_srv_event_hdl_prepare_inetaddr(&cb_data.addr, &s->addr, s->svc_port, &new_addr, s->svc_port, 0);
+
+	/* apply the new IP address */
+	_srv_set_inetaddr(s, &new_addr, s->svc_port);
+
+	_srv_event_hdl_publish(EVENT_HDL_SUB_SERVER_INETADDR, cb_data, s);
+
 	srv_set_dyncookie(s);
 	srv_set_addr_desc(s, 1);
 
@@ -3668,12 +3732,17 @@ out:
  */
 const char *srv_update_addr_port(struct server *s, const char *addr, const char *port, char *updater)
 {
+	union {
+		struct event_hdl_cb_data_server_inetaddr addr;
+		struct event_hdl_cb_data_server common;
+	} cb_data;
 	struct sockaddr_storage sa;
-	int ret, port_change_required;
+	int ret;
 	char current_addr[INET6_ADDRSTRLEN];
 	uint16_t current_port, new_port;
 	struct buffer *msg;
-	int changed = 0;
+	int ip_change = 0;
+	int port_change = 0;
 
 	msg = get_trash_chunk();
 	chunk_reset(msg);
@@ -3707,8 +3776,7 @@ const char *srv_update_addr_port(struct server *s, const char *addr, const char 
 			chunk_appendf(msg, "no need to change the addr");
 			goto port;
 		}
-		ipcpy(&sa, &s->addr);
-		changed = 1;
+		ip_change = 1;
 
 		/* update report for caller */
 		chunk_printf(msg, "IP changed from '%s' to '%s'", current_addr, addr);
@@ -3725,9 +3793,6 @@ const char *srv_update_addr_port(struct server *s, const char *addr, const char 
 		/* collecting data currently setup */
 		current_port = s->svc_port;
 
-		/* check if PORT change is required */
-		port_change_required = 0;
-
 		sign = *port;
 		errno = 0;
 		new_port = strtol(port, &endptr, 10);
@@ -3740,9 +3805,6 @@ const char *srv_update_addr_port(struct server *s, const char *addr, const char 
 		if (sign == '-' || (sign == '+')) {
 			/* check if server currently uses port map */
 			if (!(s->flags & SRV_F_MAPPORTS)) {
-				/* switch from fixed port to port map mandatorily triggers
-				 * a port change */
-				port_change_required = 1;
 				/* check is configured
 				 * we're switching from a fixed port to a SRV_F_MAPPORTS (mapped) port
 				 * prevent PORT change if check doesn't have it's dedicated port while switching
@@ -3751,22 +3813,23 @@ const char *srv_update_addr_port(struct server *s, const char *addr, const char 
 					chunk_appendf(msg, "can't change <port> to port map because it is incompatible with current health check port configuration (use 'port' statement from the 'server' directive.");
 					goto out;
 				}
+				/* switch from fixed port to port map mandatorily triggers
+				 * a port change */
+				port_change = 1;
 			}
 			/* we're already using port maps */
 			else {
-				port_change_required = current_port != new_port;
+				port_change = current_port != new_port;
 			}
 		}
 		/* fixed port */
 		else {
-			port_change_required = current_port != new_port;
+			port_change = current_port != new_port;
 		}
 
 		/* applying PORT changes if required and update response message */
-		if (port_change_required) {
-			/* apply new port */
-			s->svc_port = new_port;
-			changed = 1;
+		if (port_change) {
+			uint16_t new_port_print = new_port;
 
 			/* prepare message */
 			chunk_appendf(msg, "port changed from '");
@@ -3778,7 +3841,7 @@ const char *srv_update_addr_port(struct server *s, const char *addr, const char 
 				s->flags |= SRV_F_MAPPORTS;
 				chunk_appendf(msg, "%c", sign);
 				/* just use for result output */
-				new_port = -new_port;
+				new_port_print = -new_port_print;
 			}
 			else if (sign == '+') {
 				s->flags |= SRV_F_MAPPORTS;
@@ -3788,7 +3851,7 @@ const char *srv_update_addr_port(struct server *s, const char *addr, const char 
 				s->flags &= ~SRV_F_MAPPORTS;
 			}
 
-			chunk_appendf(msg, "%d'", new_port);
+			chunk_appendf(msg, "%d'", new_port_print);
 		}
 		else {
 			chunk_appendf(msg, "no need to change the port");
@@ -3796,7 +3859,20 @@ const char *srv_update_addr_port(struct server *s, const char *addr, const char 
 	}
 
 out:
-	if (changed) {
+	if (ip_change || port_change) {
+		_srv_event_hdl_prepare(&cb_data.common, s, 0);
+		_srv_event_hdl_prepare_inetaddr(&cb_data.addr, &s->addr, s->svc_port,
+		                                ((ip_change) ? &sa : &s->addr),
+		                                ((port_change) ? new_port : s->svc_port),
+		                                1);
+
+		/* apply new ip and port */
+		_srv_set_inetaddr(s,
+		                  ((ip_change) ? &sa : &s->addr),
+		                  ((port_change) ? new_port : s->svc_port));
+
+		_srv_event_hdl_publish(EVENT_HDL_SUB_SERVER_INETADDR, cb_data, s);
+
 		/* force connection cleanup on the given server */
 		srv_cleanup_connections(s);
 		srv_set_dyncookie(s);
@@ -4202,11 +4278,15 @@ struct server *snr_check_ip_callback(struct server *srv, void *ip, unsigned char
  */
 int srv_set_addr_via_libc(struct server *srv, int *err_code)
 {
-	if (str2ip2(srv->hostname, &srv->addr, 1) == NULL) {
+	struct sockaddr_storage new_addr;
+
+	memset(&new_addr, 0, sizeof(new_addr));
+	if (str2ip2(srv->hostname, &new_addr, 1) == NULL) {
 		if (err_code)
 			*err_code |= ERR_WARN;
 		return 1;
 	}
+	_srv_set_inetaddr(srv, &new_addr, srv->svc_port);
 	return 0;
 }
 
@@ -4282,11 +4362,15 @@ int srv_set_fqdn(struct server *srv, const char *hostname, int resolv_locked)
  */
 static int srv_apply_lastaddr(struct server *srv, int *err_code)
 {
-	if (!str2ip2(srv->lastaddr, &srv->addr, 0)) {
+	struct sockaddr_storage new_addr;
+
+	memset(&new_addr, 0, sizeof(new_addr));
+	if (!str2ip2(srv->lastaddr, &new_addr, 0)) {
 		if (err_code)
 			*err_code |= ERR_WARN;
 		return 1;
 	}
+	_srv_set_inetaddr(srv, &new_addr, srv->svc_port);
 	return 0;
 }
 
@@ -4348,7 +4432,7 @@ static int srv_iterate_initaddr(struct server *srv)
 			return return_code;
 
 		case SRV_IADDR_IP:
-			ipcpy(&srv->init_addr, &srv->addr);
+			_srv_set_inetaddr(srv, &srv->init_addr, srv->svc_port);
 			if (return_code) {
 				ha_warning("could not resolve address '%s', falling back to configured address.\n",
 					   name);
@@ -6250,7 +6334,8 @@ int srv_add_to_idle_list(struct server *srv, struct connection *conn, int is_saf
 	      (is_safe || eb_is_empty(&srv->per_thr[tid].idle_conns))) ||
 	     (ha_used_fds < global.tune.pool_low_count &&
 	      (srv->curr_used_conns + srv->curr_idle_conns <=
-	       MAX(srv->curr_used_conns, srv->est_need_conns) + srv->low_idle_conns))) &&
+	       MAX(srv->curr_used_conns, srv->est_need_conns) + srv->low_idle_conns ||
+	       (conn->flags & CO_FL_REVERSED)))) &&
 	    !conn->mux->used_streams(conn) && conn->mux->avail_streams(conn)) {
 		int retadd;
 

@@ -521,7 +521,7 @@ struct appctx *sc_applet_create(struct stconn *sc, struct applet *app)
  */
 static inline int sc_cond_forward_shut(struct stconn *sc)
 {
-	/* Foward the shutdown if an write error occurred on the input channel */
+	/* Forward the shutdown if an write error occurred on the input channel */
 	if (sc_ic(sc)->flags & CF_WRITE_TIMEOUT)
 		return 1;
 
@@ -1091,7 +1091,7 @@ static void sc_notify(struct stconn *sc)
 	 */
 	if (sc_ep_have_ff_data(sc_opposite(sc)) ||
 	    (co_data(ic) && sc_ep_test(sco, SE_FL_WAIT_DATA) &&
-	     (!(sc->flags & SC_FL_SND_EXP_MORE) || c_full(ic) || ci_data(ic) == 0))) {
+	     (!(sc->flags & SC_FL_SND_EXP_MORE) || channel_full(ic, co_data(ic)) || channel_input_data(ic) == 0))) {
 		int new_len, last_len;
 
 		last_len = co_data(ic) + sc_ep_ff_data(sco);
@@ -1135,19 +1135,20 @@ static void sc_notify(struct stconn *sc)
 		task_wakeup(task, TASK_WOKEN_IO);
 	}
 	else {
-		/* Update expiration date for the task and requeue it */
-		task->expire = (tick_is_expired(task->expire, now_ms) ? 0 : task->expire);
-		task->expire = tick_first(task->expire, sc_ep_rcv_ex(sc));
-		task->expire = tick_first(task->expire, sc_ep_snd_ex(sc));
-		task->expire = tick_first(task->expire, sc_ep_rcv_ex(sco));
-		task->expire = tick_first(task->expire, sc_ep_snd_ex(sco));
-		task->expire = tick_first(task->expire, ic->analyse_exp);
-		task->expire = tick_first(task->expire, oc->analyse_exp);
-		task->expire = tick_first(task->expire, __sc_strm(sc)->conn_exp);
+		/* Update expiration date for the task and requeue it if not already expired */
+		if (!tick_is_expired(task->expire, now_ms)) {
+			task->expire = tick_first(task->expire, sc_ep_rcv_ex(sc));
+			task->expire = tick_first(task->expire, sc_ep_snd_ex(sc));
+			task->expire = tick_first(task->expire, sc_ep_rcv_ex(sco));
+			task->expire = tick_first(task->expire, sc_ep_snd_ex(sco));
+			task->expire = tick_first(task->expire, ic->analyse_exp);
+			task->expire = tick_first(task->expire, oc->analyse_exp);
+			task->expire = tick_first(task->expire, __sc_strm(sc)->conn_exp);
 
-		/* WARNING: Don't forget to remove this BUG_ON before 2.9.0 */
-		BUG_ON(tick_is_expired(task->expire, now_ms));
-		task_queue(task);
+			/* WARNING: Don't forget to remove this BUG_ON before 2.9.0 */
+			BUG_ON(tick_is_expired(task->expire, now_ms));
+			task_queue(task);
+		}
 	}
 
 	if (ic->flags & CF_READ_EVENT)
@@ -1274,7 +1275,7 @@ static int sc_conn_recv(struct stconn *sc)
 	 */
 	if ((global.tune.options & GTUNE_USE_ZERO_COPY_FWD) &&
 	    sc_ep_test(sc, SE_FL_MAY_FASTFWD) && ic->to_forward) {
-		if (c_data(ic)) {
+		if (channel_data(ic)) {
 			/* We're embarrassed, there are already data pending in
 			 * the buffer and we don't want to have them at two
 			 * locations at a time. Let's indicate we need some
@@ -1326,7 +1327,10 @@ static int sc_conn_recv(struct stconn *sc)
 	}
 
 	/* Instruct the mux it must subscribed for read events */
-	flags |= ((!conn_is_back(conn) && (__sc_strm(sc)->be->options & PR_O_ABRT_CLOSE)) ? CO_RFL_KEEP_RECV : 0);
+	if (!(sc->flags & SC_FL_ISBACK) &&                         /* for frontend conns only */
+	    (sc_opposite(sc)->state != SC_ST_INI) &&               /* before backend connection setup */
+	    (__sc_strm(sc)->be->options & PR_O_ABRT_CLOSE))        /* if abortonclose option is set for the current backend */
+		flags |= CO_RFL_KEEP_RECV;
 
 	/* Important note : if we're called with POLL_IN|POLL_HUP, it means the read polling
 	 * was enabled, which implies that the recv buffer was not full. So we have a guarantee
@@ -1459,8 +1463,7 @@ static int sc_conn_recv(struct stconn *sc)
 				ic->flags &= ~CF_STREAMER_FAST;
 			}
 		}
-		else if (!(ic->flags & CF_STREAMER_FAST) &&
-			 (cur_read >= ic->buf.size - global.tune.maxrewrite)) {
+		else if (!(ic->flags & CF_STREAMER_FAST) && (cur_read >= channel_data_limit(ic))) {
 			/* we read a full buffer at once */
 			ic->xfer_small = 0;
 			ic->xfer_large++;
@@ -1686,11 +1689,6 @@ static int sc_conn_send(struct stconn *sc)
 		oc->flags |= CF_WRITE_EVENT | CF_WROTE_DATA;
 		if (sc->state == SC_ST_CON)
 			sc->state = SC_ST_RDY;
-		sc_ep_report_send_activity(sc);
-	}
-	else {
-		if (sc_state_in(sc->state, SC_SB_EST|SC_SB_DIS|SC_SB_CLO))
-			sc_ep_report_blocked_send(sc);
 	}
 
 	if (!sco->room_needed || (did_send && (sco->room_needed < 0 || channel_recv_max(sc_oc(sc)) >= sco->room_needed)))
@@ -1706,6 +1704,8 @@ static int sc_conn_send(struct stconn *sc)
 
 	/* FIXME: Must be reviewed for FF */
 	if (!co_data(oc) && !sc_ep_have_ff_data(sc)) {
+		if (did_send)
+			sc_ep_report_send_activity(sc);
 		/* If fast-forwarding is blocked, unblock it now to check for
 		 * receive on the other side
 		 */
@@ -1718,6 +1718,8 @@ static int sc_conn_send(struct stconn *sc)
 	else {
 		/* We couldn't send all of our data, let the mux know we'd like to send more */
 		conn->mux->subscribe(sc, SUB_RETRY_SEND, &sc->wait_event);
+		if (sc_state_in(sc->state, SC_SB_EST|SC_SB_DIS|SC_SB_CLO))
+				sc_ep_report_blocked_send(sc, did_send);
 	}
 
 	return did_send;

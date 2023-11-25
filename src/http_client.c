@@ -455,7 +455,7 @@ int httpclient_set_dst(struct httpclient *hc, const char *dst)
 
 	sockaddr_free(&hc->dst);
 	/* 'sk' is statically allocated (no need to be freed). */
-	sk = str2sa_range(dst, NULL, NULL, NULL, NULL, NULL,
+	sk = str2sa_range(dst, NULL, NULL, NULL, NULL, NULL, NULL,
 	                  &errmsg, NULL, NULL,
 	                  PA_O_PORT_OK | PA_O_STREAM | PA_O_XPRT | PA_O_CONNECT);
 	if (!sk) {
@@ -1212,8 +1212,6 @@ struct proxy *httpclient_create_proxy(const char *id)
 		err_code |= ERR_ALERT | ERR_FATAL;
 		goto err;
 	}
-
-	proxy_preset_defaults(px);
 
 	px->options |= PR_O_WREQ_BODY;
 	px->retry_type |= PR_RE_CONN_FAILED | PR_RE_DISCONNECTED | PR_RE_TIMEOUT;

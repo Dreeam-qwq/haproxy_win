@@ -46,13 +46,17 @@ struct shared_block {
 };
 
 struct shared_context {
-	__decl_thread(HA_SPINLOCK_T lock);
+	__decl_thread(HA_RWLOCK_T lock);
 	struct list avail;  /* list for active and free blocks */
-	struct list hot;     /* list for locked blocks */
 	unsigned int nbav;  /* number of available blocks */
 	unsigned int max_obj_size;   /* maximum object size (in bytes). */
-	void (*free_block)(struct shared_block *first, struct shared_block *block);
+	void (*free_block)(struct shared_block *first, void *data);
+	void (*reserve_finish)(struct shared_context *shctx);
+	void *cb_data;
 	short int block_size;
+	ALWAYS_ALIGN(64);  /* The following member needs to be aligned to 64 in the
+			      cache's case because the cache struct contains an explicitly
+			      aligned member (struct cache_tree). */
 	unsigned char data[VAR_ARRAY];
 };
 

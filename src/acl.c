@@ -710,6 +710,7 @@ const struct {
 	{ .name = "HTTP_1.0",       .expr = {"req.ver","1.0",""}},
 	{ .name = "HTTP_1.1",       .expr = {"req.ver","1.1",""}},
 	{ .name = "HTTP_2.0",       .expr = {"req.ver","2.0",""}},
+	{ .name = "HTTP_3.0",       .expr = {"req.ver","3.0",""}},
 	{ .name = "METH_CONNECT",   .expr = {"method","CONNECT",""}},
 	{ .name = "METH_DELETE",    .expr = {"method","DELETE",""}},
 	{ .name = "METH_GET",       .expr = {"method","GET","HEAD",""}},
@@ -952,7 +953,7 @@ struct acl_cond *parse_acl_cond(const char **args, struct list *known_acl,
  * condition is returned. NULL is returned in case of error or if the first
  * word is neither "if" nor "unless". It automatically sets the file name and
  * the line number in the condition for better error reporting, and sets the
- * HTTP intiailization requirements in the proxy. If <err> is not NULL, it will
+ * HTTP initialization requirements in the proxy. If <err> is not NULL, it will
  * be filled with a pointer to an error message in case of error, that the
  * caller is responsible for freeing. The initial location must either be
  * freeable or NULL.

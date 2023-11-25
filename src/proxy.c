@@ -165,7 +165,7 @@ int resolve_stick_rule(struct proxy *curproxy, struct sticking_rule *mrule)
 	return 1;
 }
 
-static void free_stick_rules(struct list *rules)
+void free_stick_rules(struct list *rules)
 {
 	struct sticking_rule *rule, *ruleb;
 
@@ -177,6 +177,31 @@ static void free_stick_rules(struct list *rules)
 	}
 }
 
+static void free_logformat_list(struct list *lfs)
+{
+	struct logformat_node *lf, *lfb;
+
+	list_for_each_entry_safe(lf, lfb, lfs, list) {
+		LIST_DELETE(&lf->list);
+		release_sample_expr(lf->expr);
+		free(lf->arg);
+		free(lf);
+	}
+}
+
+void free_server_rules(struct list *srules)
+{
+	struct server_rule *srule, *sruleb;
+
+	list_for_each_entry_safe(srule, sruleb, srules, list) {
+		LIST_DELETE(&srule->list);
+		free_acl_cond(srule->cond);
+		free_logformat_list(&srule->expr);
+		free(srule->file);
+		free(srule);
+	}
+}
+
 void free_proxy(struct proxy *p)
 {
 	struct server *s;
@@ -185,11 +210,9 @@ void free_proxy(struct proxy *p)
 	struct bind_conf *bind_conf, *bind_back;
 	struct acl_cond *cond, *condb;
 	struct acl *acl, *aclb;
-	struct server_rule *srule, *sruleb;
 	struct switching_rule *rule, *ruleb;
 	struct redirect_rule *rdr, *rdrb;
 	struct logger *log, *logb;
-	struct logformat_node *lf, *lfb;
 	struct proxy_deinit_fct *pxdf;
 	struct server_deinit_fct *srvdf;
 
@@ -249,18 +272,7 @@ void free_proxy(struct proxy *p)
 		free(acl);
 	}
 
-	list_for_each_entry_safe(srule, sruleb, &p->server_rules, list) {
-		LIST_DELETE(&srule->list);
-		free_acl_cond(srule->cond);
-		list_for_each_entry_safe(lf, lfb, &srule->expr, list) {
-			LIST_DELETE(&lf->list);
-			release_sample_expr(lf->expr);
-			free(lf->arg);
-			free(lf);
-		}
-		free(srule->file);
-		free(srule);
-	}
+	free_server_rules(&p->server_rules);
 
 	list_for_each_entry_safe(rule, ruleb, &p->switching_rules, list) {
 		LIST_DELETE(&rule->list);
@@ -279,33 +291,10 @@ void free_proxy(struct proxy *p)
 		free_logger(log);
 	}
 
-	list_for_each_entry_safe(lf, lfb, &p->logformat, list) {
-		LIST_DELETE(&lf->list);
-		release_sample_expr(lf->expr);
-		free(lf->arg);
-		free(lf);
-	}
-
-	list_for_each_entry_safe(lf, lfb, &p->logformat_sd, list) {
-		LIST_DELETE(&lf->list);
-		release_sample_expr(lf->expr);
-		free(lf->arg);
-		free(lf);
-	}
-
-	list_for_each_entry_safe(lf, lfb, &p->format_unique_id, list) {
-		LIST_DELETE(&lf->list);
-		release_sample_expr(lf->expr);
-		free(lf->arg);
-		free(lf);
-	}
-
-	list_for_each_entry_safe(lf, lfb, &p->logformat_error, list) {
-		LIST_DELETE(&lf->list);
-		release_sample_expr(lf->expr);
-		free(lf->arg);
-		free(lf);
-	}
+	free_logformat_list(&p->logformat);
+	free_logformat_list(&p->logformat_sd);
+	free_logformat_list(&p->format_unique_id);
+	free_logformat_list(&p->logformat_error);
 
 	free_act_rules(&p->tcp_req.inspect_rules);
 	free_act_rules(&p->tcp_rep.inspect_rules);
@@ -358,7 +347,7 @@ void free_proxy(struct proxy *p)
 		free(l->name);
 		free(l->per_thr);
 		free(l->counters);
-		task_destroy(l->rx.reverse_connect.task);
+		task_destroy(l->rx.rhttp.task);
 
 		EXTRA_COUNTERS_FREE(l->extra_counters);
 		free(l);
@@ -372,7 +361,7 @@ void free_proxy(struct proxy *p)
 		free(bind_conf->arg);
 		free(bind_conf->settings.interface);
 		LIST_DELETE(&bind_conf->by_fe);
-		free(bind_conf->reverse_srvname);
+		free(bind_conf->rhttp_srvname);
 		free(bind_conf);
 	}
 
@@ -389,8 +378,9 @@ void free_proxy(struct proxy *p)
 
 	pool_destroy(p->req_cap_pool);
 	pool_destroy(p->rsp_cap_pool);
-	if (p->table)
-		pool_destroy(p->table->pool);
+
+	stktable_deinit(p->table);
+	ha_free(&p->table);
 
 	HA_RWLOCK_DESTROY(&p->lbprm.lock);
 	HA_RWLOCK_DESTROY(&p->lock);
@@ -524,6 +514,10 @@ static int proxy_parse_timeout(char **args, int section, struct proxy *proxy,
 		tv = &proxy->timeout.tarpit;
 		td = &defpx->timeout.tarpit;
 		cap = PR_CAP_FE | PR_CAP_BE;
+	} else if (strcmp(args[0], "client-hs") == 0) {
+		tv = &proxy->timeout.client_hs;
+		td = &defpx->timeout.client_hs;
+		cap = PR_CAP_FE;
 	} else if (strcmp(args[0], "http-keep-alive") == 0) {
 		tv = &proxy->timeout.httpka;
 		td = &defpx->timeout.httpka;
@@ -574,7 +568,7 @@ static int proxy_parse_timeout(char **args, int section, struct proxy *proxy,
 	} else {
 		memprintf(err,
 		          "'timeout' supports 'client', 'server', 'connect', 'check', "
-		          "'queue', 'http-keep-alive', 'http-request', 'tunnel', 'tarpit', "
+		          "'queue', 'handshake', 'http-keep-alive', 'http-request', 'tunnel', 'tarpit', "
 			  "'client-fin' and 'server-fin' (got '%s')",
 		          args[0]);
 		return -1;
@@ -1331,10 +1325,6 @@ struct server *findserver_unique_name(const struct proxy *px, const char *name, 
  */
 int proxy_cfg_ensure_no_http(struct proxy *curproxy)
 {
-	if (curproxy->max_ka_queue) {
-		ha_warning("max_ka_queue will be ignored for %s '%s' (needs 'mode http').\n",
-			   proxy_type_str(curproxy), curproxy->id);
-	}
 	if (curproxy->cookie_name != NULL) {
 		ha_warning("cookie will be ignored for %s '%s' (needs 'mode http').\n",
 			   proxy_type_str(curproxy), curproxy->id);
@@ -1368,6 +1358,24 @@ int proxy_cfg_ensure_no_http(struct proxy *curproxy)
 		curproxy->conf.logformat_string = default_tcp_log_format;
 		ha_warning("parsing [%s:%d] : 'option httpslog' not usable with %s '%s' (needs 'mode http'). Falling back to 'option tcplog'.\n",
 			   curproxy->conf.lfs_file, curproxy->conf.lfs_line,
+			   proxy_type_str(curproxy), curproxy->id);
+	}
+
+	return 0;
+}
+
+/* This function checks that the designated proxy has no log directives
+ * enabled. It will output a warning if there are, and will fix some of them.
+ * It returns the number of fatal errors encountered. This should be called
+ * at the end of the configuration parsing if the proxy is not in log mode.
+ * The <file> argument is used to construct the error message.
+ */
+int proxy_cfg_ensure_no_log(struct proxy *curproxy)
+{
+	if (curproxy->lbprm.algo & BE_LB_NEED_LOG) {
+		curproxy->lbprm.algo &= ~BE_LB_ALGO;
+		curproxy->lbprm.algo |= BE_LB_ALGO_RR;
+		ha_warning("Unusable balance algorithm for %s '%s' (needs 'mode log'). Falling back to round robin.\n",
 			   proxy_type_str(curproxy), curproxy->id);
 	}
 
@@ -1430,6 +1438,9 @@ void init_new_proxy(struct proxy *p)
 	p->extra_counters_be = NULL;
 
 	HA_RWLOCK_INIT(&p->lock);
+
+	/* initialize the default settings */
+	proxy_preset_defaults(p);
 }
 
 /* Preset default settings onto proxy <defproxy>. */
@@ -1469,6 +1480,7 @@ void proxy_preset_defaults(struct proxy *defproxy)
 	defproxy->defsrv.onerror = DEF_HANA_ONERR;
 	defproxy->defsrv.consecutive_errors_limit = DEF_HANA_ERRLIMIT;
 	defproxy->defsrv.uweight = defproxy->defsrv.iweight = 1;
+	LIST_INIT(&defproxy->defsrv.pp_tlvs);
 
 	defproxy->email_alert.level = LOG_ALERT;
 	defproxy->load_server_state_from_file = PR_SRV_STATE_FILE_UNSPEC;
@@ -1494,6 +1506,7 @@ void proxy_free_defaults(struct proxy *defproxy)
 
 	ha_free(&defproxy->id);
 	ha_free(&defproxy->conf.file);
+	ha_free((char **)&defproxy->defsrv.conf.file);
 	ha_free(&defproxy->check_command);
 	ha_free(&defproxy->check_path);
 	ha_free(&defproxy->cookie_name);
@@ -1793,6 +1806,7 @@ static int proxy_defproxy_cpy(struct proxy *curproxy, const struct proxy *defpro
 
 	if (curproxy->cap & PR_CAP_FE) {
 		curproxy->timeout.client = defproxy->timeout.client;
+		curproxy->timeout.client_hs = defproxy->timeout.client_hs;
 		curproxy->timeout.clientfin = defproxy->timeout.clientfin;
 		curproxy->timeout.tarpit = defproxy->timeout.tarpit;
 		curproxy->timeout.httpreq = defproxy->timeout.httpreq;
@@ -1944,9 +1958,6 @@ struct proxy *parse_new_proxy(const char *name, unsigned int cap,
 			ha_free(&curproxy);
 			return NULL;
 		}
-	}
-	else {
-		proxy_preset_defaults(curproxy);
 	}
 
 	curproxy->conf.args.file = curproxy->conf.file = strdup(file);
