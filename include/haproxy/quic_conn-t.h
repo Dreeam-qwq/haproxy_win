@@ -33,6 +33,7 @@
 
 #include <haproxy/openssl-compat.h>
 #include <haproxy/mux_quic-t.h>
+#include <haproxy/quic_cid-t.h>
 #include <haproxy/quic_cc-t.h>
 #include <haproxy/quic_loss-t.h>
 #include <haproxy/quic_openssl_compat-t.h>
@@ -61,8 +62,6 @@ typedef unsigned long long ull;
 #define QUIC_HAP_CID_LEN               8
 
 /* Common definitions for short and long QUIC packet headers. */
-/* QUIC connection ID maximum length for version 1. */
-#define QUIC_CID_MAXLEN               20 /* bytes */
 /* QUIC original destination connection ID minial length */
 #define QUIC_ODCID_MINLEN              8 /* bytes */
 /*
@@ -89,8 +88,6 @@ typedef unsigned long long ull;
 #define QUIC_TOKEN_FMT_RETRY 0x9c
 /* Format for token sent for new connections after a Retry token was sent */
 #define  QUIC_TOKEN_FMT_NEW  0xb7
-/* Salt length used to derive retry token secret */
-#define QUIC_RETRY_TOKEN_SALTLEN       16 /* bytes */
 /* Retry token duration */
 #define QUIC_RETRY_DURATION_SEC       10
 /* Default Retry threshold */
@@ -196,8 +193,6 @@ enum quic_pkt_type {
 /* Size of the QUIC RX buffer for the connections */
 #define QUIC_CONN_RX_BUFSZ (1UL << 16)
 
-extern struct pool_head *pool_head_quic_crypto_buf;
-
 struct quic_version {
 	uint32_t num;
 	const unsigned char *initial_salt;
@@ -219,34 +214,6 @@ extern const struct quic_version quic_versions[];
 extern const size_t quic_versions_nb;
 extern const struct quic_version *preferred_version;
 
-/* QUIC connection id data.
- *
- * This struct is used by ebmb_node structs as last member of flexible arrays.
- * So do not change the order of the member of quic_cid struct.
- * <data> member must be the first one.
- */
-struct quic_cid {
-	unsigned char data[QUIC_CID_MAXLEN];
-	unsigned char len; /* size of QUIC CID */
-};
-
-/* QUIC connection id attached to a QUIC connection.
- *
- * This structure is used to match received packets DCIDs with the
- * corresponding QUIC connection.
- */
-struct quic_connection_id {
-	struct eb64_node seq_num;
-	uint64_t retire_prior_to;
-	unsigned char stateless_reset_token[QUIC_STATELESS_RESET_TOKEN_LEN];
-
-	struct ebmb_node node; /* node for receiver tree, cid.data as key */
-	struct quic_cid cid;   /* CID data */
-
-	struct quic_conn *qc;  /* QUIC connection using this CID */
-	uint tid;              /* Attached Thread ID for the connection. */
-};
-
 /* unused: 0x01 */
 /* Flag the packet number space as requiring an ACK frame to be sent. */
 #define QUIC_FL_PKTNS_ACK_REQUIRED  (1UL << 1)
@@ -260,93 +227,11 @@ struct quic_connection_id {
 /* The maximum number of dgrams which may be sent upon PTO expirations. */
 #define QUIC_MAX_NB_PTO_DGRAMS         2
 
-/* QUIC datagram */
-struct quic_dgram {
-	void *owner;
-	unsigned char *buf;
-	size_t len;
-	unsigned char *dcid;
-	size_t dcid_len;
-	struct sockaddr_storage saddr;
-	struct sockaddr_storage daddr;
-	struct quic_conn *qc;
-
-	struct list recv_list; /* elemt to quic_receiver_buf <dgram_list>. */
-	struct mt_list handler_list; /* elem to quic_dghdlr <dgrams>. */
-};
-
 /* The QUIC packet numbers are 62-bits integers */
 #define QUIC_MAX_PACKET_NUM      ((1ULL << 62) - 1)
 
-/* QUIC datagram handler */
-struct quic_dghdlr {
-	struct mt_list dgrams;
-	struct tasklet *task;
-};
-
-/* Structure to store enough information about the RX CRYPTO frames. */
-struct quic_rx_crypto_frm {
-	struct eb64_node offset_node;
-	uint64_t len;
-	const unsigned char *data;
-	struct quic_rx_packet *pkt;
-};
-
-#define QUIC_CRYPTO_BUF_SHIFT  10
-#define QUIC_CRYPTO_BUF_MASK   ((1UL << QUIC_CRYPTO_BUF_SHIFT) - 1)
-/* The maximum allowed size of CRYPTO data buffer provided by the TLS stack. */
-#define QUIC_CRYPTO_BUF_SZ    (1UL << QUIC_CRYPTO_BUF_SHIFT) /* 1 KB */
-
 /* The maximum number of bytes of CRYPTO data in flight during handshakes. */
 #define QUIC_CRYPTO_IN_FLIGHT_MAX 4096
-
-/*
- * CRYPTO buffer struct.
- * Such buffers are used to send CRYPTO data.
- */
-struct quic_crypto_buf {
-	unsigned char data[QUIC_CRYPTO_BUF_SZ];
-	size_t sz;
-};
-
-/* Crypto data stream (one by encryption level) */
-struct quic_cstream {
-	struct {
-		uint64_t offset;       /* absolute current base offset of ncbuf */
-		struct ncbuf ncbuf;    /* receive buffer - can handle out-of-order offset frames */
-	} rx;
-	struct {
-		uint64_t offset;      /* last offset of data ready to be sent */
-		uint64_t sent_offset; /* last offset sent by transport layer */
-		struct buffer buf;    /* transmit buffer before sending via xprt */
-	} tx;
-
-	struct qc_stream_desc *desc;
-};
-
-struct quic_path {
-	/* Control congestion. */
-	struct quic_cc cc;
-	/* Packet loss detection information. */
-	struct quic_loss loss;
-
-	/* MTU. */
-	size_t mtu;
-	/* Congestion window. */
-	uint64_t cwnd;
-	/* The current maximum congestion window value reached. */
-	uint64_t mcwnd;
-	/* The maximum congestion window value which can be reached. */
-	uint64_t max_cwnd;
-	/* Minimum congestion window. */
-	uint64_t min_cwnd;
-	/* Prepared data to be sent (in bytes). */
-	uint64_t prep_in_flight;
-	/* Outstanding data (in bytes). */
-	uint64_t in_flight;
-	/* Number of in flight ack-eliciting packets. */
-	uint64_t ifae_pkts;
-};
 
 /* Status of the connection/mux layer. This defines how to handle app data.
  *
@@ -522,8 +407,8 @@ struct quic_conn {
 	} ku;
 	unsigned int max_ack_delay;
 	unsigned int max_idle_timeout;
-	struct quic_path paths[1];
-	struct quic_path *path;
+	struct quic_cc_path paths[1];
+	struct quic_cc_path *path;
 
 	struct mt_list accept_list; /* chaining element used for accept, only valid for frontend connections */
 
@@ -548,7 +433,7 @@ struct quic_conn {
 };
 
 /* QUIC connection in "connection close" state. */
-struct quic_cc_conn {
+struct quic_conn_closed {
 	QUIC_CONN_COMMON;
 	char *cc_buf_area;
 	/* Length of the "connection close" datagram. */

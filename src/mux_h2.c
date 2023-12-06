@@ -4503,23 +4503,39 @@ static int h2_ctl(struct connection *conn, enum mux_ctl_type mux_ctl, void *outp
 	struct h2c *h2c = conn->ctx;
 
 	switch (mux_ctl) {
-	case MUX_STATUS:
+	case MUX_CTL_STATUS:
 		/* Only consider the mux to be ready if we're done with
 		 * the preface and settings, and we had no error.
 		 */
 		if (h2c->st0 >= H2_CS_FRAME_H && h2c->st0 < H2_CS_ERROR)
 			ret |= MUX_STATUS_READY;
 		return ret;
-	case MUX_EXIT_STATUS:
+	case MUX_CTL_EXIT_STATUS:
 		return MUX_ES_UNKNOWN;
 
-	case MUX_REVERSE_CONN:
+	case MUX_CTL_REVERSE_CONN:
 		BUG_ON(h2c->flags & H2_CF_IS_BACK);
 
 		TRACE_DEVEL("connection reverse done, restart demux", H2_EV_H2C_WAKE, h2c->conn);
 		h2c->flags &= ~H2_CF_DEM_TOOMANY;
 		tasklet_wakeup(h2c->wait_event.tasklet);
 		return 0;
+
+	default:
+		return -1;
+	}
+}
+
+static int h2_sctl(struct stconn *sc, enum mux_sctl_type mux_sctl, void *output)
+{
+	int ret = 0;
+	struct h2s *h2s = __sc_mux_strm(sc);
+
+	switch (mux_sctl) {
+	case MUX_SCTL_SID:
+		if (output)
+			*((int64_t *)output) = h2s->id;
+		return ret;
 
 	default:
 		return -1;
@@ -6919,6 +6935,11 @@ static size_t h2_nego_ff(struct stconn *sc, struct buffer *input, size_t count, 
 
 	TRACE_ENTER(H2_EV_H2S_SEND|H2_EV_STRM_SEND, h2s->h2c->conn, h2s);
 
+	if (global.tune.no_zero_copy_fwd & NO_ZERO_COPY_FWD_H2_SND) {
+		h2s->sd->iobuf.flags |= IOBUF_FL_NO_FF;
+		goto end;
+	}
+
 	/* If we were not just woken because we wanted to send but couldn't,
 	 * and there's somebody else that is waiting to send, do nothing,
 	 * we will subscribe later and be put at the end of the list
@@ -6967,6 +6988,16 @@ static size_t h2_nego_ff(struct stconn *sc, struct buffer *input, size_t count, 
 
 	mbuf = br_tail(h2c->mbuf);
  retry:
+	if (br_count(h2c->mbuf) > h2c->nb_streams) {
+		/* more buffers than streams allocated, pointless
+		 * to continue, we'd use more RAM for no reason.
+		 */
+		h2s->flags |= H2_SF_BLK_MROOM;
+		h2s->sd->iobuf.flags |= IOBUF_FL_FF_BLOCKED;
+		TRACE_STATE("waiting for room in output buffer", H2_EV_TX_FRAME|H2_EV_TX_DATA|H2_EV_H2S_BLK, h2c->conn, h2s);
+		goto end;
+	}
+
 	if (!h2_get_buf(h2c, mbuf)) {
 		h2c->flags |= H2_CF_MUX_MALLOC;
 		h2s->flags |= H2_SF_BLK_MROOM;
@@ -7031,6 +7062,8 @@ static size_t h2_nego_ff(struct stconn *sc, struct buffer *input, size_t count, 
 
 	ret = count - h2s->sd->iobuf.data;
  end:
+	if (h2s->sd->iobuf.flags & IOBUF_FL_FF_BLOCKED)
+		h2s->flags &= ~H2_SF_NOTIFIED;
 	TRACE_LEAVE(H2_EV_H2S_SEND|H2_EV_STRM_SEND, h2s->h2c->conn, h2s);
 	return ret;
 }
@@ -7411,6 +7444,25 @@ static int h2_parse_max_frame_size(char **args, int section_type, struct proxy *
 }
 
 
+/* config parser for global "tune.h2.zero-copy-fwd-send" */
+static int h2_parse_zero_copy_fwd_snd(char **args, int section_type, struct proxy *curpx,
+					  const struct proxy *defpx, const char *file, int line,
+					  char **err)
+{
+	if (too_many_args(1, args, err, NULL))
+		return -1;
+
+	if (strcmp(args[1], "on") == 0)
+		global.tune.no_zero_copy_fwd &= ~NO_ZERO_COPY_FWD_H2_SND;
+	else if (strcmp(args[1], "off") == 0)
+		global.tune.no_zero_copy_fwd |= NO_ZERO_COPY_FWD_H2_SND;
+	else {
+		memprintf(err, "'%s' expects 'on' or 'off'.", args[0]);
+		return -1;
+	}
+	return 0;
+}
+
 /****************************************/
 /* MUX initialization and instantiation */
 /***************************************/
@@ -7435,6 +7487,7 @@ static const struct mux_ops h2_ops = {
 	.shutr = h2_shutr,
 	.shutw = h2_shutw,
 	.ctl = h2_ctl,
+	.sctl = h2_sctl,
 	.show_fd = h2_show_fd,
 	.show_sd = h2_show_sd,
 	.takeover = h2_takeover,
@@ -7457,6 +7510,7 @@ static struct cfg_kw_list cfg_kws = {ILH, {
 	{ CFG_GLOBAL, "tune.h2.initial-window-size",    h2_parse_initial_window_size    },
 	{ CFG_GLOBAL, "tune.h2.max-concurrent-streams", h2_parse_max_concurrent_streams },
 	{ CFG_GLOBAL, "tune.h2.max-frame-size",         h2_parse_max_frame_size         },
+	{ CFG_GLOBAL, "tune.h2.zero-copy-fwd-send",     h2_parse_zero_copy_fwd_snd },
 	{ 0, NULL, NULL }
 }};
 

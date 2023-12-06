@@ -301,56 +301,126 @@ static inline size_t h3_decode_frm_header(uint64_t *ftype, uint64_t *flen,
 
 /* Check if H3 frame of type <ftype> is valid when received on stream <qcs>.
  *
- * Returns a boolean. If false, a connection error H3_FRAME_UNEXPECTED should
- * be reported.
+ * Returns 0 if frame valid, otherwise HTTP/3 error code.
  */
-static int h3_is_frame_valid(struct h3c *h3c, struct qcs *qcs, uint64_t ftype)
+static int h3_check_frame_valid(struct h3c *h3c, struct qcs *qcs, uint64_t ftype)
 {
 	struct h3s *h3s = qcs->ctx;
-	const uint64_t id = qcs->id;
+	int ret = 0;
 
 	/* Stream type must be known to ensure frame is valid for this stream. */
 	BUG_ON(h3s->type == H3S_T_UNKNOWN);
 
 	switch (ftype) {
 	case H3_FT_DATA:
-		return h3s->type != H3S_T_CTRL && (h3s->st_req == H3S_ST_REQ_HEADERS ||
-		                                   h3s->st_req == H3S_ST_REQ_DATA);
+		/* cf H3_FT_HEADERS case. */
+		if (h3s->type == H3S_T_CTRL ||
+		    (h3s->st_req != H3S_ST_REQ_HEADERS && h3s->st_req != H3S_ST_REQ_DATA)) {
+			ret = H3_FRAME_UNEXPECTED;
+		}
+
+		break;
 
 	case H3_FT_HEADERS:
-		return h3s->type != H3S_T_CTRL && h3s->st_req != H3S_ST_REQ_TRAILERS;
+		/* RFC 9114 4.1. HTTP Message Framing
+		 *
+		 *
+		 * An HTTP message (request or response) consists of:
+		 * 1. the header section, including message control data, sent as a
+		 *    single HEADERS frame,
+		 * 2. optionally, the content, if present, sent as a series of DATA
+		 *    frames, and
+		 * 3. optionally, the trailer section, if present, sent as a single
+		 *    HEADERS frame.
+		 *
+		 * [...]
+		 *
+		 *  Receipt of an invalid sequence of frames MUST be treated as a
+		 *  connection error of type H3_FRAME_UNEXPECTED. In particular, a DATA
+		 *  frame before any HEADERS frame, or a HEADERS or DATA frame after the
+		 *  trailing HEADERS frame, is considered invalid. Other frame types,
+		 *  especially unknown frame types, might be permitted subject to their
+		 *  own rules; see Section 9.
+		 */
+		if (h3s->type == H3S_T_CTRL || h3s->st_req == H3S_ST_REQ_TRAILERS)
+			ret = H3_FRAME_UNEXPECTED;
+		break;
 
 	case H3_FT_CANCEL_PUSH:
 	case H3_FT_GOAWAY:
 	case H3_FT_MAX_PUSH_ID:
-		/* Only allowed for control stream. First frame of control
-		 * stream MUST be SETTINGS.
+		/* RFC 9114 7.2.3. CANCEL_PUSH
+		 *
+		 * A CANCEL_PUSH frame is sent on the control stream. Receiving a
+		 * CANCEL_PUSH frame on a stream other than the control stream MUST be
+		 * treated as a connection error of type H3_FRAME_UNEXPECTED.
 		 */
-		return h3s->type == H3S_T_CTRL &&
-		       (h3c->flags & H3_CF_SETTINGS_RECV);
+
+		/* RFC 9114 7.2.6. GOAWAY
+		 *
+		 * A client MUST treat a GOAWAY frame on a stream other than the
+		 * control stream as a connection error of type H3_FRAME_UNEXPECTED.
+		 */
+
+		/* RFC 9114 7.2.7. MAX_PUSH_ID
+		 *
+		 * The MAX_PUSH_ID frame is always sent on the control stream. Receipt
+		 * of a MAX_PUSH_ID frame on any other stream MUST be treated as a
+		 * connection error of type H3_FRAME_UNEXPECTED.
+		 */
+
+		if (h3s->type != H3S_T_CTRL)
+			ret = H3_FRAME_UNEXPECTED;
+		else if (!(h3c->flags & H3_CF_SETTINGS_RECV))
+			ret = H3_MISSING_SETTINGS;
+		break;
 
 	case H3_FT_SETTINGS:
-		/* draft-ietf-quic-http34 7.2.4. SETTINGS
+		/* RFC 9114 7.2.4. SETTINGS
 		 *
-		 * If an endpoint receives a second SETTINGS frame on the control
+		 * A SETTINGS frame MUST be sent as the first frame of
+		 * each control stream (see Section 6.2.1) by each peer, and it MUST NOT
+		 * be sent subsequently. If an endpoint receives a second SETTINGS frame
+		 * on the control stream, the endpoint MUST respond with a connection
+		 * error of type H3_FRAME_UNEXPECTED.
+		 *
+		 * SETTINGS frames MUST NOT be sent on any stream other than the control
+		 * stream. If an endpoint receives a SETTINGS frame on a different
 		 * stream, the endpoint MUST respond with a connection error of type
 		 * H3_FRAME_UNEXPECTED.
 		 */
-		return h3s->type == H3S_T_CTRL &&
-		       !(h3c->flags & H3_CF_SETTINGS_RECV);
+		if (h3s->type != H3S_T_CTRL || h3c->flags & H3_CF_SETTINGS_RECV)
+			ret = H3_FRAME_UNEXPECTED;
+		break;
 
 	case H3_FT_PUSH_PROMISE:
-		return h3s->type != H3S_T_CTRL &&
-		       (id & QCS_ID_SRV_INTIATOR_BIT);
+		/* RFC 9114 7.2.5. PUSH_PROMISE
+		 *
+		 * A client MUST NOT send a PUSH_PROMISE frame. A server MUST treat the
+		 * receipt of a PUSH_PROMISE frame as a connection error of type
+		 * H3_FRAME_UNEXPECTED.
+		 */
+
+		/* TODO server-side only. */
+		ret = H3_FRAME_UNEXPECTED;
+		break;
 
 	default:
-		/* draft-ietf-quic-http34 9. Extensions to HTTP/3
+		/* RFC 9114 9. Extensions to HTTP/3
 		 *
-		 * Implementations MUST discard frames [...] that have unknown
-		 * or unsupported types.
+		 * Implementations MUST ignore unknown or unsupported values in all
+		 * extensible protocol elements. [...]
+		 * However, where a known frame type is required to be in a
+		 * specific location, such as the SETTINGS frame as the first frame of
+		 * the control stream (see Section 6.2.1), an unknown frame type does
+		 * not satisfy that requirement and SHOULD be treated as an error.
 		 */
-		return h3s->type != H3S_T_CTRL || (h3c->flags & H3_CF_SETTINGS_RECV);
+		if (h3s->type == H3S_T_CTRL && !(h3c->flags & H3_CF_SETTINGS_RECV))
+			ret = H3_MISSING_SETTINGS;
+		break;
 	}
+
+	return ret;
 }
 
 /* Check from stream <qcs> that length of all DATA frames does not exceed with
@@ -846,8 +916,8 @@ static ssize_t h3_trailers_to_htx(struct qcs *qcs, const struct buffer *buf,
 {
 	struct h3s *h3s = qcs->ctx;
 	struct h3c *h3c = h3s->h3c;
-	struct buffer htx_buf = BUF_NULL;
 	struct buffer *tmp = get_trash_chunk();
+	struct buffer *appbuf = NULL;
 	struct htx *htx = NULL;
 	struct htx_sl *sl;
 	struct http_hdr list[global.tune.max_http_hdr];
@@ -868,14 +938,14 @@ static ssize_t h3_trailers_to_htx(struct qcs *qcs, const struct buffer *buf,
 		goto out;
 	}
 
-	if (!qcs_get_buf(qcs, &htx_buf)) {
+	if (!(appbuf = qcs_get_buf(qcs, &qcs->rx.app_buf))) {
 		TRACE_ERROR("HTX buffer alloc failure", H3_EV_RX_FRAME|H3_EV_RX_HDR, qcs->qcc->conn, qcs);
 		h3c->err = H3_INTERNAL_ERROR;
 		len = -1;
 		goto out;
 	}
-	BUG_ON(!b_size(&htx_buf)); /* TODO */
-	htx = htx_from_buf(&htx_buf);
+	BUG_ON(!b_size(appbuf)); /* TODO */
+	htx = htx_from_buf(appbuf);
 
 	if (!h3s->data_len) {
 		/* Notify that no body is present. This can only happens if
@@ -972,13 +1042,10 @@ static ssize_t h3_trailers_to_htx(struct qcs *qcs, const struct buffer *buf,
 	if (fin)
 		htx->flags |= HTX_FL_EOM;
 
-	htx_to_buf(htx, &htx_buf);
-	htx = NULL;
-
  out:
 	/* HTX may be non NULL if error before previous htx_to_buf(). */
-	if (htx)
-		htx_to_buf(htx, &htx_buf);
+	if (appbuf)
+		htx_to_buf(htx, appbuf);
 
 	TRACE_LEAVE(H3_EV_RX_FRAME|H3_EV_RX_HDR, qcs->qcc->conn, qcs);
 	return len;
@@ -1233,9 +1300,9 @@ static ssize_t h3_decode_qcs(struct qcs *qcs, struct buffer *b, int fin)
 					break;
 			}
 
-			if (!h3_is_frame_valid(h3c, qcs, ftype)) {
+			if ((ret = h3_check_frame_valid(h3c, qcs, ftype))) {
 				TRACE_ERROR("received an invalid frame", H3_EV_RX_FRAME, qcs->qcc->conn, qcs);
-				qcc_set_error(qcs->qcc, H3_FRAME_UNEXPECTED, 1);
+				qcc_set_error(qcs->qcc, ret, 1);
 				goto err;
 			}
 

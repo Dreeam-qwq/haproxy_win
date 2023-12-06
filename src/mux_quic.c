@@ -2819,6 +2819,11 @@ static size_t qmux_nego_ff(struct stconn *sc, struct buffer *input, size_t count
 	/* stream layer has been detached so no transfer must occur after. */
 	BUG_ON_HOT(qcs->flags & QC_SF_DETACH);
 
+	if (global.tune.no_zero_copy_fwd & NO_ZERO_COPY_FWD_QUIC_SND) {
+		qcs->sd->iobuf.flags |= IOBUF_FL_NO_FF;
+		goto end;
+	}
+
 	if (!qcs->qcc->app_ops->nego_ff || !qcs->qcc->app_ops->done_ff) {
 		/* Fast forwading is not supported by the QUIC application layer */
 		qcs->sd->iobuf.flags |= IOBUF_FL_NO_FF;
@@ -2843,8 +2848,10 @@ static size_t qmux_nego_ff(struct stconn *sc, struct buffer *input, size_t count
 		b_sub(qcs->sd->iobuf.buf, qcs->sd->iobuf.offset);
 
 		/* Cannot forward more data, wait for room */
-		if (b_data(input))
+		if (b_data(input)) {
+			ret = 0;
 			goto end;
+		}
 	}
 	ret -= qcs->sd->iobuf.data;
 
@@ -2974,6 +2981,22 @@ static void qmux_strm_shutw(struct stconn *sc, enum co_shw_mode mode)
 	TRACE_LEAVE(QMUX_EV_STRM_SHUT, qcc->conn, qcs);
 }
 
+static int qmux_sctl(struct stconn *sc, enum mux_sctl_type mux_sctl, void *output)
+{
+	int ret = 0;
+	struct qcs *qcs = __sc_mux_strm(sc);
+
+	switch (mux_sctl) {
+	case MUX_SCTL_SID:
+		if (output)
+			*((int64_t *)output) = qcs->id;
+		return ret;
+
+	default:
+		return -1;
+	}
+}
+
 /* for debugging with CLI's "show sess" command. May emit multiple lines, each
  * new one being prefixed with <pfx>, if <pfx> is not NULL, otherwise a single
  * line is used. Each field starts with a space so it's safe to print it after
@@ -3014,6 +3037,7 @@ static const struct mux_ops qmux_ops = {
 	.unsubscribe = qmux_strm_unsubscribe,
 	.wake        = qmux_wake,
 	.shutw       = qmux_strm_shutw,
+	.sctl        = qmux_sctl,
 	.show_sd     = qmux_strm_show_sd,
 	.flags = MX_FL_HTX|MX_FL_NO_UPG|MX_FL_FRAMED,
 	.name = "QUIC",

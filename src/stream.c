@@ -890,7 +890,7 @@ int stream_set_timeout(struct stream *s, enum act_timeout_name name, int timeout
  * Timeouts are cleared. Error are reported on the channel so that analysers
  * can handle them.
  */
-static void back_establish(struct stream *s)
+void back_establish(struct stream *s)
 {
 	struct connection *conn = sc_conn(s->scb);
 	struct channel *req = &s->req;
@@ -1536,7 +1536,7 @@ int stream_set_http_mode(struct stream *s, const struct mux_proto_list *mux_prot
  * Note that this does not change the stream connector's current state, though
  * it updates the previous state to the current one.
  */
-static void stream_update_both_sc(struct stream *s)
+void stream_update_both_sc(struct stream *s)
 {
 	struct stconn *scf = s->scf;
 	struct stconn *scb = s->scb;
@@ -2297,7 +2297,7 @@ struct task *process_stream(struct task *t, void *context, unsigned int state)
 					struct connection *conn = sc_conn(scf);
 
 					if (conn && conn->mux && conn->mux->ctl)
-						conn->mux->ctl(conn, MUX_SUBS_RECV, NULL);
+						conn->mux->ctl(conn, MUX_CTL_SUBS_RECV, NULL);
 				}
 			}
 		}
@@ -3269,14 +3269,18 @@ void strm_dump_to_buffer(struct buffer *buf, const struct stream *strm, const ch
 		      strm->txn->req.flags, strm->txn->rsp.flags);
 
 	scf = strm->scf;
-	chunk_appendf(buf, "%s  scf=%p flags=0x%08x state=%s endp=%s,%p,0x%08x sub=%d", pfx,
-		      scf, scf->flags, sc_state_str(scf->state),
+	chunk_appendf(buf, "%s  scf=%p flags=0x%08x ioto=%s state=%s endp=%s,%p,0x%08x sub=%d", pfx,
+		      scf, scf->flags, human_time(scf->ioto, TICKS_TO_MS(1000)), sc_state_str(scf->state),
 		      (sc_ep_test(scf, SE_FL_T_MUX) ? "CONN" : (sc_ep_test(scf, SE_FL_T_APPLET) ? "APPCTX" : "NONE")),
 		      scf->sedesc->se, sc_ep_get(scf), scf->wait_event.events);
 	chunk_appendf(buf, " rex=%s",
 		      sc_ep_rcv_ex(scf) ? human_time(TICKS_TO_MS(sc_ep_rcv_ex(scf) - now_ms), TICKS_TO_MS(1000)) : "<NEVER>");
-	chunk_appendf(buf, " wex=%s\n",
+	chunk_appendf(buf, " wex=%s",
 		      sc_ep_snd_ex(scf) ? human_time(TICKS_TO_MS(sc_ep_snd_ex(scf) - now_ms), TICKS_TO_MS(1000)) : "<NEVER>");
+	chunk_appendf(buf, " rto=%s",
+		      tick_isset(scf->sedesc->lra) ? human_time(TICKS_TO_MS(tick_add(scf->sedesc->lra, scf->ioto) - now_ms), TICKS_TO_MS(1000)) : "<NEVER>");
+	chunk_appendf(buf, " wto=%s\n",
+		      tick_isset(scf->sedesc->fsb) ? human_time(TICKS_TO_MS(tick_add(scf->sedesc->fsb, scf->ioto) - now_ms), TICKS_TO_MS(1000)) : "<NEVER>");
 
 	chunk_appendf(&trash, "%s    iobuf.flags=0x%08x .pipe=%d .buf=%u@%p+%u/%u\n", pfx,
 		      scf->sedesc->iobuf.flags,
@@ -3326,14 +3330,18 @@ void strm_dump_to_buffer(struct buffer *buf, const struct stream *strm, const ch
 	}
 
 	scb = strm->scb;
-	chunk_appendf(buf, "%s  scb=%p flags=0x%08x state=%s endp=%s,%p,0x%08x sub=%d", pfx,
-		      scb, scb->flags, sc_state_str(scb->state),
+	chunk_appendf(buf, "%s  scb=%p flags=0x%08x ioto=%s state=%s endp=%s,%p,0x%08x sub=%d", pfx,
+		      scb, scb->flags, human_time(scb->ioto, TICKS_TO_MS(1000)), sc_state_str(scb->state),
 		      (sc_ep_test(scb, SE_FL_T_MUX) ? "CONN" : (sc_ep_test(scb, SE_FL_T_APPLET) ? "APPCTX" : "NONE")),
 		      scb->sedesc->se, sc_ep_get(scb), scb->wait_event.events);
 	chunk_appendf(buf, " rex=%s",
 		      sc_ep_rcv_ex(scb) ? human_time(TICKS_TO_MS(sc_ep_rcv_ex(scb) - now_ms), TICKS_TO_MS(1000)) : "<NEVER>");
-	chunk_appendf(buf, " wex=%s\n",
+	chunk_appendf(buf, " wex=%s",
 		      sc_ep_snd_ex(scb) ? human_time(TICKS_TO_MS(sc_ep_snd_ex(scb) - now_ms), TICKS_TO_MS(1000)) : "<NEVER>");
+	chunk_appendf(buf, " rto=%s",
+		      tick_isset(scb->sedesc->lra) ? human_time(TICKS_TO_MS(tick_add(scb->sedesc->lra, scb->ioto) - now_ms), TICKS_TO_MS(1000)) : "<NEVER>");
+	chunk_appendf(buf, " wto=%s\n",
+		      tick_isset(scb->sedesc->fsb) ? human_time(TICKS_TO_MS(tick_add(scb->sedesc->fsb, scb->ioto) - now_ms), TICKS_TO_MS(1000)) : "<NEVER>");
 
 	chunk_appendf(&trash, "%s    iobuf.flags=0x%08x .pipe=%d .buf=%u@%p+%u/%u\n", pfx,
 		      scb->sedesc->iobuf.flags,
@@ -3971,6 +3979,47 @@ static int smp_fetch_last_rule_line(const struct arg *args, struct sample *smp, 
 	return 1;
 }
 
+static int smp_fetch_sess_term_state(const struct arg *args, struct sample *smp, const char *km, void *private)
+{
+	struct buffer *trash = get_trash_chunk();
+
+	smp->flags = SMP_F_VOLATILE;
+	smp->data.type = SMP_T_STR;
+	if (!smp->strm)
+		return 0;
+
+	trash->area[trash->data++] = sess_term_cond[(smp->strm->flags & SF_ERR_MASK) >> SF_ERR_SHIFT];
+	trash->area[trash->data++] = sess_fin_state[(smp->strm->flags & SF_FINST_MASK) >> SF_FINST_SHIFT];
+
+	smp->data.u.str = *trash;
+	smp->data.type = SMP_T_STR;
+	smp->flags &= ~SMP_F_CONST;
+	return 1;
+}
+
+static int smp_fetch_conn_retries(const struct arg *args, struct sample *smp, const char *km, void *private)
+{
+	smp->flags = SMP_F_VOL_TXN;
+	smp->data.type = SMP_T_SINT;
+	if (!smp->strm)
+		return 0;
+
+	if (!sc_state_in(smp->strm->scb->state, SC_SB_DIS|SC_SB_CLO))
+		smp->flags |= SMP_F_VOL_TEST;
+	smp->data.u.sint = smp->strm->conn_retries;
+	return 1;
+}
+
+static int smp_fetch_id32(const struct arg *args, struct sample *smp, const char *km, void *private)
+{
+	smp->flags = SMP_F_VOL_TXN;
+	smp->data.type = SMP_T_SINT;
+	if (!smp->strm)
+		return 0;
+	smp->data.u.sint = smp->strm->uniq_id;
+	return 1;
+}
+
 /* Note: must not be declared <const> as its list will be overwritten.
  * Please take care of keeping this list alphabetically sorted.
  */
@@ -3980,6 +4029,9 @@ static struct sample_fetch_kw_list smp_kws = {ILH, {
 	{ "cur_tunnel_timeout", smp_fetch_cur_tunnel_timeout, 0, NULL, SMP_T_SINT, SMP_USE_BKEND, },
 	{ "last_rule_file",     smp_fetch_last_rule_file,     0, NULL, SMP_T_STR,  SMP_USE_INTRN, },
 	{ "last_rule_line",     smp_fetch_last_rule_line,     0, NULL, SMP_T_SINT, SMP_USE_INTRN, },
+	{ "txn.conn_retries",   smp_fetch_conn_retries,       0, NULL, SMP_T_SINT, SMP_USE_L4SRV, },
+	{ "txn.id32",           smp_fetch_id32,               0, NULL, SMP_T_SINT, SMP_USE_INTRN, },
+	{ "txn.sess_term_state",smp_fetch_sess_term_state,    0, NULL, SMP_T_STR,  SMP_USE_INTRN, },
 	{ NULL, NULL, 0, 0, 0 },
 }};
 

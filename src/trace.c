@@ -347,6 +347,66 @@ const struct trace_event *trace_find_event(const struct trace_event *ev, const c
 	return NULL;
 }
 
+/* Returns the level value or a negative error code. */
+static int trace_parse_level(const char *level)
+{
+	if (!level)
+		return -1;
+
+	if (strcmp(level, "error") == 0)
+		return TRACE_LEVEL_ERROR;
+	else if (strcmp(level, "user") == 0)
+		return TRACE_LEVEL_USER;
+	else if (strcmp(level, "proto") == 0)
+		return TRACE_LEVEL_PROTO;
+	else if (strcmp(level, "state") == 0)
+		return TRACE_LEVEL_STATE;
+	else if (strcmp(level, "data") == 0)
+		return TRACE_LEVEL_DATA;
+	else if (strcmp(level, "developer") == 0)
+		return TRACE_LEVEL_DEVELOPER;
+	else
+		return -1;
+}
+
+/* Returns the verbosity value or a negative error code. */
+static int trace_source_parse_verbosity(struct trace_source *src,
+                                        const char *verbosity)
+{
+	const struct name_desc *nd;
+	int ret;
+
+	if (strcmp(verbosity, "quiet") == 0) {
+		ret = 0;
+		goto end;
+	}
+
+	/* Only "quiet" is defined for all sources. Other identifiers are
+	 * specific to trace source.
+	 */
+	BUG_ON(!src);
+
+	if (!src->decoding || !src->decoding[0].name) {
+		if (strcmp(verbosity, "default") != 0)
+			return -1;
+
+		ret = 1;
+	}
+	else {
+		for (nd = src->decoding; nd->name && nd->desc; nd++)
+			if (strcmp(verbosity, nd->name) == 0)
+				break;
+
+		if (!nd->name || !nd->desc)
+			return -1;
+
+		ret = nd - src->decoding + 1;
+	}
+
+ end:
+	return ret;
+}
+
 /* Parse a "trace" statement. Returns a severity as a LOG_* level and a status
  * message that may be delivered to the user, in <msg>. The message will be
  * nulled first and msg must be an allocated pointer. A null status message output
@@ -506,6 +566,7 @@ static int trace_parse_statement(char **args, char **msg)
 	}
 	else if (strcmp(args[2], "level") == 0) {
 		const char *name = args[3];
+		int level;
 
 		if (!*name) {
 			chunk_printf(&trash, "Supported trace levels for source %s:\n", src->name.ptr);
@@ -526,22 +587,13 @@ static int trace_parse_statement(char **args, char **msg)
 			return LOG_WARNING;
 		}
 
-		if (strcmp(name, "error") == 0)
-			HA_ATOMIC_STORE(&src->level, TRACE_LEVEL_ERROR);
-		else if (strcmp(name, "user") == 0)
-			HA_ATOMIC_STORE(&src->level, TRACE_LEVEL_USER);
-		else if (strcmp(name, "proto") == 0)
-			HA_ATOMIC_STORE(&src->level, TRACE_LEVEL_PROTO);
-		else if (strcmp(name, "state") == 0)
-			HA_ATOMIC_STORE(&src->level, TRACE_LEVEL_STATE);
-		else if (strcmp(name, "data") == 0)
-			HA_ATOMIC_STORE(&src->level, TRACE_LEVEL_DATA);
-		else if (strcmp(name, "developer") == 0)
-			HA_ATOMIC_STORE(&src->level, TRACE_LEVEL_DEVELOPER);
-		else {
+		level = trace_parse_level(name);
+		if (level < 0) {
 			memprintf(msg, "No such trace level '%s'", name);
 			return LOG_ERR;
 		}
+
+		HA_ATOMIC_STORE(&src->level, level);
 	}
 	else if (strcmp(args[2], "lock") == 0) {
 		const char *name = args[3];
@@ -682,6 +734,7 @@ static int trace_parse_statement(char **args, char **msg)
 	else if (strcmp(args[2], "verbosity") == 0) {
 		const char *name = args[3];
 		const struct name_desc *nd;
+		int verbosity;
 
 		if (!*name) {
 			chunk_printf(&trash, "Supported trace verbosities for source %s:\n", src->name.ptr);
@@ -701,27 +754,13 @@ static int trace_parse_statement(char **args, char **msg)
 			return LOG_WARNING;
 		}
 
-		if (strcmp(name, "quiet") == 0)
-			HA_ATOMIC_STORE(&src->verbosity, 0);
-		else if (!src->decoding || !src->decoding[0].name) {
-			if (strcmp(name, "default") == 0)
-				HA_ATOMIC_STORE(&src->verbosity, 1);
-			else {
-				memprintf(msg, "No such verbosity level '%s'", name);
-				return LOG_ERR;
-			}
-		} else {
-			for (nd = src->decoding; nd->name && nd->desc; nd++)
-				if (strcmp(name, nd->name) == 0)
-					break;
-
-			if (!nd->name || !nd->desc) {
-				memprintf(msg, "No such verbosity level '%s'", name);
-				return LOG_ERR;
-			}
-
-			HA_ATOMIC_STORE(&src->verbosity, (nd - src->decoding) + 1);
+		verbosity = trace_source_parse_verbosity(src, name);
+		if (verbosity < 0) {
+			memprintf(msg, "No such verbosity level '%s'", name);
+			return LOG_ERR;
 		}
+
+		HA_ATOMIC_STORE(&src->verbosity, verbosity);
 	}
 	else {
 		memprintf(msg, "Unknown trace keyword '%s'", args[2]);
@@ -729,6 +768,115 @@ static int trace_parse_statement(char **args, char **msg)
 	}
 	return 0;
 
+}
+
+void _trace_parse_cmd(struct trace_source *src, int level, int verbosity)
+{
+	src->sink = sink_find("stderr");
+	src->level = level >= 0 ? level : TRACE_LEVEL_ERROR;
+	src->verbosity = verbosity >= 0 ? verbosity : 1;
+	src->state = TRACE_STATE_RUNNING;
+}
+
+/* Parse a process argument specified via "-dt".
+ *
+ * Returns 0 on success else non-zero.
+ */
+int trace_parse_cmd(char *arg, char **errmsg)
+{
+	char *str;
+
+	if (!arg) {
+		/* No trace specification, activate all sources on error level. */
+		struct trace_source *src = NULL;
+
+		list_for_each_entry(src, &trace_sources, source_link)
+			_trace_parse_cmd(src, -1, -1);
+		return 0;
+	}
+
+	while ((str = strtok(arg, ","))) {
+		struct trace_source *src = NULL;
+		char *field, *name;
+		char *sep;
+		int level = -1, verbosity = -1;
+
+		/* 1. name */
+		name = str;
+		sep = strchr(str, ':');
+		if (sep) {
+			str = sep + 1;
+			*sep = '\0';
+		}
+		else {
+			str = NULL;
+		}
+
+		if (strlen(name)) {
+			src = trace_find_source(name);
+			if (!src) {
+				memprintf(errmsg, "unknown trace source '%s'", name);
+				return 1;
+			}
+		}
+
+		if (!str || !strlen(str))
+			goto parse;
+
+		/* 2. level */
+		field = str;
+		sep = strchr(str, ':');
+		if (sep) {
+			str = sep + 1;
+			*sep = '\0';
+		}
+		else {
+			str = NULL;
+		}
+
+		if (strlen(field)) {
+			level = trace_parse_level(field);
+			if (level < 0) {
+				memprintf(errmsg, "no such level '%s'", field);
+				return 1;
+			}
+		}
+
+		if (!str || !strlen(str))
+			goto parse;
+
+		/* 3. verbosity */
+		field = str;
+		if (strchr(field, ':')) {
+			memprintf(errmsg, "too many double-colon separator");
+			return 1;
+		}
+
+		if (!src && strcmp(field, "quiet") != 0) {
+			memprintf(errmsg, "trace source must be specified for verbosity other than 'quiet'");
+			return 1;
+		}
+
+		verbosity = trace_source_parse_verbosity(src, field);
+		if (verbosity < 0) {
+			memprintf(errmsg, "no such verbosity '%s' for source '%s'", field, name);
+			return 1;
+		}
+
+ parse:
+		if (src) {
+			_trace_parse_cmd(src, level, verbosity);
+		}
+		else {
+			list_for_each_entry(src, &trace_sources, source_link)
+				_trace_parse_cmd(src, level, verbosity);
+		}
+
+		/* Reset arg to NULL for strtok. */
+		arg = NULL;
+	}
+
+	return 0;
 }
 
 /* parse a "trace" statement in the "global" section, returns 1 if a message is returned, otherwise zero */

@@ -53,6 +53,8 @@ struct h1c {
 	int timeout;                     /* client/server timeout duration */
 	int shut_timeout;                /* client-fin/server-fin timeout duration */
 
+	unsigned int req_count;          /* The number of requests handled by this H1 connection */
+
 	struct h1_counters *px_counters; /* h1 counters attached to proxy */
 	struct buffer_wait buf_wait;     /* Wait list for buffer allocation */
 	struct wait_event wait_event;    /* To be used if we're waiting for I/Os */
@@ -872,6 +874,7 @@ static void h1s_destroy(struct h1s *h1s)
 		    h1s->req.state == H1_MSG_DONE && h1s->res.state == H1_MSG_DONE) {        /* req/res in DONE state */
 			h1c->state = H1_CS_IDLE;
 			h1c->flags |= H1C_F_WAIT_NEXT_REQ;
+			h1c->req_count++;
 			TRACE_STATE("set idle mode on h1c, waiting for the next request", H1_EV_H1C_ERR, h1c->conn, h1s);
 		}
 		else {
@@ -918,6 +921,7 @@ static int h1_init(struct connection *conn, struct proxy *proxy, struct session 
 	h1c->obuf  = BUF_NULL;
 	h1c->h1s   = NULL;
 	h1c->task  = NULL;
+	h1c->req_count = 0;
 
 	LIST_INIT(&h1c->buf_wait.list);
 	h1c->wait_event.tasklet = tasklet_new();
@@ -2485,7 +2489,7 @@ static size_t h1_make_eoh(struct h1s *h1s, struct h1m *h1m, struct htx *htx, siz
 		}
 		else if (!chunk_memcat(&outbuf, "\r\n", 2))
 			goto full;
-		h1m->state = H1_MSG_DONE;
+		h1m->state = ((htx->flags & HTX_FL_EOM) ? H1_MSG_DONE : H1_MSG_TRAILERS);
 	}
 	else {
 		if (!chunk_memcat(&outbuf, "\r\n", 2))
@@ -2577,7 +2581,7 @@ static size_t h1_make_data(struct h1s *h1s, struct h1m *h1m, struct buffer *buf,
 			}
 			h1m->curr_len -= count;
 			if (!h1m->curr_len)
-				h1m->state = H1_MSG_DONE;
+				h1m->state = (eom ? H1_MSG_DONE : H1_MSG_TRAILERS);
 		}
 		else if (h1m->flags & H1_MF_CHNK) {
 			/* The message is chunked. We need to check if we must
@@ -4405,6 +4409,12 @@ static size_t h1_nego_ff(struct stconn *sc, struct buffer *input, size_t count, 
 
 	TRACE_ENTER(H1_EV_STRM_SEND, h1c->conn, h1s, 0, (size_t[]){count});
 
+
+	if (global.tune.no_zero_copy_fwd & NO_ZERO_COPY_FWD_H1_SND) {
+		h1s->sd->iobuf.flags |= IOBUF_FL_NO_FF;
+		goto out;
+	}
+
 	/* TODO: add check on curr_len if CLEN */
 
 	if (h1m->flags & H1_MF_CHNK) {
@@ -4530,7 +4540,7 @@ static size_t h1_done_ff(struct stconn *sc)
 		h1m->curr_len -= total;
 
 	if (!h1m->curr_len && (h1m->flags & H1_MF_CLEN))
-		h1m->state = H1_MSG_DONE;
+		h1m->state = ((sd->iobuf.flags & IOBUF_FL_EOI) ? H1_MSG_DONE : H1_MSG_TRAILERS);
 	else if (!h1m->curr_len && (h1m->flags & H1_MF_CHNK)) {
 		if (h1m->state == H1_MSG_DATA)
 			h1m->state = H1_MSG_CHUNK_CRLF;
@@ -4568,6 +4578,11 @@ static int h1_fastfwd(struct stconn *sc, unsigned int count, unsigned int flags)
 	int ret = 0;
 
 	TRACE_ENTER(H1_EV_STRM_RECV, h1c->conn, h1s, 0, (size_t[]){count});
+
+	if (global.tune.no_zero_copy_fwd & NO_ZERO_COPY_FWD_H1_RCV) {
+		h1c->flags = (h1c->flags & ~H1C_F_WANT_FASTFWD) | H1C_F_CANT_FASTFWD;
+		goto end;
+	}
 
 	if (h1m->state != H1_MSG_DATA && h1m->state != H1_MSG_TUNNEL) {
 		h1c->flags &= ~H1C_F_WANT_FASTFWD;
@@ -4812,11 +4827,11 @@ static int h1_ctl(struct connection *conn, enum mux_ctl_type mux_ctl, void *outp
 	int ret = 0;
 
 	switch (mux_ctl) {
-	case MUX_STATUS:
+	case MUX_CTL_STATUS:
 		if (!(conn->flags & CO_FL_WAIT_XPRT))
 			ret |= MUX_STATUS_READY;
 		return ret;
-	case MUX_EXIT_STATUS:
+	case MUX_CTL_EXIT_STATUS:
 		if (output)
 			*((int *)output) = h1c->errcode;
 		ret = (h1c->errcode == 408 ? MUX_ES_TOUT_ERR :
@@ -4825,10 +4840,26 @@ static int h1_ctl(struct connection *conn, enum mux_ctl_type mux_ctl, void *outp
 			 ((h1c->errcode >= 400 && h1c->errcode <= 499) ? MUX_ES_INVALID_ERR :
 			  MUX_ES_SUCCESS))));
 		return ret;
-	case MUX_SUBS_RECV:
+	case MUX_CTL_SUBS_RECV:
 		if (!(h1c->wait_event.events & SUB_RETRY_RECV))
 			h1c->conn->xprt->subscribe(h1c->conn, h1c->conn->xprt_ctx, SUB_RETRY_RECV, &h1c->wait_event);
 		return 0;
+	default:
+		return -1;
+	}
+}
+
+static int h1_sctl(struct stconn *sc, enum mux_sctl_type mux_sctl, void *output)
+{
+	int ret = 0;
+	struct h1s *h1s = __sc_mux_strm(sc);
+
+	switch (mux_sctl) {
+	case MUX_SCTL_SID:
+		if (output)
+			*((int64_t *)output) = h1s->h1c->req_count;
+		return ret;
+
 	default:
 		return -1;
 	}
@@ -5211,11 +5242,51 @@ static int cfg_parse_h1_headers_case_adjust_file(char **args, int section_type, 
         return 0;
 }
 
+/* config parser for global "tune.h1.zero-copy-fwd-recv" */
+static int cfg_parse_h1_zero_copy_fwd_rcv(char **args, int section_type, struct proxy *curpx,
+					   const struct proxy *defpx, const char *file, int line,
+					   char **err)
+{
+	if (too_many_args(1, args, err, NULL))
+		return -1;
+
+	if (strcmp(args[1], "on") == 0)
+		global.tune.no_zero_copy_fwd &= ~NO_ZERO_COPY_FWD_H1_RCV;
+	else if (strcmp(args[1], "off") == 0)
+		global.tune.no_zero_copy_fwd |= NO_ZERO_COPY_FWD_H1_RCV;
+	else {
+		memprintf(err, "'%s' expects 'on' or 'off'.", args[0]);
+		return -1;
+	}
+	return 0;
+}
+
+/* config parser for global "tune.h1.zero-copy-fwd-send" */
+static int cfg_parse_h1_zero_copy_fwd_snd(char **args, int section_type, struct proxy *curpx,
+					  const struct proxy *defpx, const char *file, int line,
+					  char **err)
+{
+	if (too_many_args(1, args, err, NULL))
+		return -1;
+
+	if (strcmp(args[1], "on") == 0)
+		global.tune.no_zero_copy_fwd &= ~NO_ZERO_COPY_FWD_H1_SND;
+	else if (strcmp(args[1], "off") == 0)
+		global.tune.no_zero_copy_fwd |= NO_ZERO_COPY_FWD_H1_SND;
+	else {
+		memprintf(err, "'%s' expects 'on' or 'off'.", args[0]);
+		return -1;
+	}
+	return 0;
+}
+
 /* config keyword parsers */
 static struct cfg_kw_list cfg_kws = {{ }, {
 		{ CFG_GLOBAL, "h1-accept-payload-with-any-method", cfg_parse_h1_accept_payload_with_any_method },
 		{ CFG_GLOBAL, "h1-case-adjust", cfg_parse_h1_header_case_adjust },
 		{ CFG_GLOBAL, "h1-case-adjust-file", cfg_parse_h1_headers_case_adjust_file },
+		{ CFG_GLOBAL, "tune.h1.zero-copy-fwd-recv", cfg_parse_h1_zero_copy_fwd_rcv },
+		{ CFG_GLOBAL, "tune.h1.zero-copy-fwd-send", cfg_parse_h1_zero_copy_fwd_snd },
 		{ 0, NULL, NULL },
 	}
 };
@@ -5251,6 +5322,7 @@ static const struct mux_ops mux_http_ops = {
 	.show_fd     = h1_show_fd,
 	.show_sd     = h1_show_sd,
 	.ctl         = h1_ctl,
+	.sctl        = h1_sctl,
 	.takeover    = h1_takeover,
 	.flags       = MX_FL_HTX,
 	.name        = "H1",
@@ -5278,6 +5350,7 @@ static const struct mux_ops mux_h1_ops = {
 	.show_fd     = h1_show_fd,
 	.show_sd     = h1_show_sd,
 	.ctl         = h1_ctl,
+	.sctl        = h1_sctl,
 	.takeover    = h1_takeover,
 	.flags       = MX_FL_HTX|MX_FL_NO_UPG,
 	.name        = "H1",

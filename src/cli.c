@@ -757,13 +757,22 @@ static int cli_parse_request(struct appctx *appctx)
 		if (!*p)
 			break;
 
-		if (strcmp(p, PAYLOAD_PATTERN) == 0) {
-			/* payload pattern recognized here, this is not an arg anymore,
-			 * the payload starts at the first byte that follows the zero
-			 * after the pattern.
-			 */
-			payload = p + strlen(PAYLOAD_PATTERN) + 1;
-			break;
+		/* first check if the '<<' is present, but this is not enough
+		 * because we don't know if this is the end of the string */
+		if (strncmp(p, PAYLOAD_PATTERN, strlen(PAYLOAD_PATTERN)) == 0) {
+			int pat_len = strlen(appctx->cli_payload_pat);
+
+			/* then if the customized pattern is empty, check if the next character is '\0' */
+			if (pat_len == 0 && p[strlen(PAYLOAD_PATTERN)] == '\0') {
+				payload = p + strlen(PAYLOAD_PATTERN) + 1;
+				break;
+			}
+
+			/* else if we found the customized pattern at the end of the string */
+			if (strcmp(p + strlen(PAYLOAD_PATTERN), appctx->cli_payload_pat) == 0) {
+				payload = p + strlen(PAYLOAD_PATTERN) + pat_len + 1;
+				break;
+			}
 		}
 
 		args[i] = p;
@@ -1010,29 +1019,53 @@ static void cli_io_handler(struct appctx *appctx)
 			appctx->st0 = CLI_ST_PROMPT;
 
 			if (appctx->st1 & APPCTX_CLI_ST1_PAYLOAD) {
-				/* empty line */
-				if (!len) {
-					/* remove the last two \n */
-					appctx->chunk->data -= 2;
-					appctx->chunk->area[appctx->chunk->data] = 0;
-					cli_parse_request(appctx);
-					chunk_reset(appctx->chunk);
-					/* NB: cli_sock_parse_request() may have put
-					 * another CLI_ST_O_* into appctx->st0.
-					 */
+				/* look for a pattern */
+				if (len == strlen(appctx->cli_payload_pat)) {
+					/* here use 'len' because str still contains the \n */
+					if (strncmp(str, appctx->cli_payload_pat, len) == 0) {
+						/* remove the last two \n */
+						appctx->chunk->data -= strlen(appctx->cli_payload_pat) + 2;
+						appctx->chunk->area[appctx->chunk->data] = 0;
+						cli_parse_request(appctx);
+						chunk_reset(appctx->chunk);
+						/* NB: cli_sock_parse_request() may have put
+						 * another CLI_ST_O_* into appctx->st0.
+						 */
 
-					appctx->st1 &= ~APPCTX_CLI_ST1_PAYLOAD;
+						appctx->st1 &= ~APPCTX_CLI_ST1_PAYLOAD;
+					}
 				}
 			}
 			else {
+				char *last_arg;
 				/*
 				 * Look for the "payload start" pattern at the end of a line
 				 * Its location is not remembered here, this is just to switch
 				 * to a gathering mode.
+				 * The pattern must start by << followed by 0
+				 * to 7 characters, and finished by the end of
+				 * the command (\n or ;).
 				 */
-				if (strcmp(appctx->chunk->area + appctx->chunk->data - strlen(PAYLOAD_PATTERN), PAYLOAD_PATTERN) == 0) {
-					appctx->st1 |= APPCTX_CLI_ST1_PAYLOAD;
-					appctx->chunk->data++; // keep the trailing \0 after '<<'
+				/* look for the first space starting by the end of the line */
+				for (last_arg = appctx->chunk->area + appctx->chunk->data; last_arg != appctx->chunk->area; last_arg--) {
+					if (*last_arg == ' ' || *last_arg == '\t') {
+						last_arg++;
+						break;
+					}
+				}
+				if (strncmp(last_arg, PAYLOAD_PATTERN, strlen(PAYLOAD_PATTERN)) == 0) {
+					ssize_t pat_len = strlen(last_arg + strlen(PAYLOAD_PATTERN));
+
+					/* A customized pattern can't be more than 7 characters
+					 * if it's more, don't make it a payload
+					 */
+					if (pat_len < sizeof(appctx->cli_payload_pat)) {
+						appctx->st1 |= APPCTX_CLI_ST1_PAYLOAD;
+						/* copy the customized pattern, don't store the << */
+						strncpy(appctx->cli_payload_pat, last_arg + strlen(PAYLOAD_PATTERN), sizeof(appctx->cli_payload_pat)-1);
+						appctx->cli_payload_pat[sizeof(appctx->cli_payload_pat)-1] = '\0';
+						appctx->chunk->data++; // keep the trailing \0 after the pattern
+					}
 				}
 				else {
 					/* no payload, the command is complete: parse the request */
@@ -2522,7 +2555,6 @@ int pcli_parse_request(struct stream *s, struct channel *req, char **errmsg, int
 	int argl; /* number of args */
 	char *p;
 	char *trim = NULL;
-	char *payload = NULL;
 	int wtrim = 0; /* number of words to trim */
 	int reql = 0;
 	int ret;
@@ -2572,13 +2604,20 @@ int pcli_parse_request(struct stream *s, struct channel *req, char **errmsg, int
 
 	/* there is no end to this command, need more to parse ! */
 	if (!reql || *(end-1) != '\n') {
-		return -1;
+		ret = -1;
+		goto end;
 	}
 
+	/* in payload mode, skip the whole parsing/exec and just look for a pattern */
 	if (s->pcli_flags & PCLI_F_PAYLOAD) {
-		if (reql == 1) /* last line of the payload */
-			s->pcli_flags &= ~PCLI_F_PAYLOAD;
-		return reql;
+		if (reql-1 == strlen(s->pcli_payload_pat)) {
+			/* the custom pattern len can be 0 (empty line)  */
+			if (strncmp(str, s->pcli_payload_pat, strlen(s->pcli_payload_pat)) == 0) {
+				s->pcli_flags &= ~PCLI_F_PAYLOAD;
+			}
+		}
+		ret = reql;
+		goto end;
 	}
 
 	*(end-1) = '\0';
@@ -2606,8 +2645,23 @@ int pcli_parse_request(struct stream *s, struct channel *req, char **errmsg, int
 		*p++ = 0;
 		i++;
 	}
-
 	argl = i;
+
+	/* first look for '<<' at the beginning of the last argument */
+	if (argl && strncmp(args[argl-1], PAYLOAD_PATTERN, strlen(PAYLOAD_PATTERN)) == 0) {
+		size_t pat_len = strlen(args[argl-1] + strlen(PAYLOAD_PATTERN));
+
+		/*
+		 * A customized pattern can't be more than 7 characters
+		 * if it's more, don't make it a payload
+		 */
+		if (pat_len < sizeof(s->pcli_payload_pat)) {
+			s->pcli_flags |= PCLI_F_PAYLOAD;
+			/* copy the customized pattern, don't store the << */
+			strncpy(s->pcli_payload_pat, args[argl-1] + strlen(PAYLOAD_PATTERN), sizeof(s->pcli_payload_pat)-1);
+			s->pcli_payload_pat[sizeof(s->pcli_payload_pat)-1] = '\0';
+		}
+	}
 
 	for (; i < MAX_CLI_ARGS + 1; i++)
 		args[i] = NULL;
@@ -2623,12 +2677,6 @@ int pcli_parse_request(struct stream *s, struct channel *req, char **errmsg, int
 		p++;
 	}
 
-	payload = strstr(str, PAYLOAD_PATTERN);
-	if ((end - 1) == (payload + strlen(PAYLOAD_PATTERN))) {
-		/* if the payload pattern is at the end */
-		s->pcli_flags |= PCLI_F_PAYLOAD;
-	}
-
 	*(end-1) = '\n';
 
 	if (wtrim > 0) {
@@ -2641,7 +2689,8 @@ int pcli_parse_request(struct stream *s, struct channel *req, char **errmsg, int
 		ret = end - trim;
 	} else if (wtrim < 0) {
 		/* parsing error */
-		return -1;
+		ret = -1;
+		goto end;
 	} else {
 		/* the whole string */
 		ret = end - str;
@@ -3178,6 +3227,9 @@ struct bind_conf *mworker_cli_proxy_new_listener(char *line)
 	bind_conf->accept = session_accept_fd;
 	bind_conf->nice = -64;  /* we want to boost priority for local stats */
 	bind_conf->options |= BC_O_UNLIMITED; /* don't make the peers subject to global limits */
+
+	/* Pin master CLI on the first thread of the first group only */
+	thread_set_pin_grp1(&bind_conf->thread_set, 1);
 
 	list_for_each_entry(l, &bind_conf->listeners, by_bind) {
 		l->rx.flags |= RX_F_MWORKER; /* we are keeping this FD in the master */

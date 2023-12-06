@@ -1,4 +1,4 @@
-varnishtest "field converter Test"
+varnishtest "word converter Test"
 
 feature ignore_unknown_macro
 
@@ -19,7 +19,7 @@ haproxy h1 -conf {
 
 	#### requests
 	http-request set-var(txn.uri) path
-	http-response set-header Found %[var(txn.uri),field(3,/)] if { var(txn.uri),field(3,/) -m found }
+	http-response set-header Found %[var(txn.uri),word(2,/)] if { var(txn.uri),word(2,/) -m found }
 
 	default_backend be
 
@@ -35,7 +35,7 @@ client c1 -connect ${h1_fe_sock} {
 	txreq -url "/foo//bar/baz"
 	rxresp
 	expect resp.status == 200
-	expect resp.http.found == ""
+	expect resp.http.found == "bar"
 	txreq -url "/foo"
 	rxresp
 	expect resp.status == 200

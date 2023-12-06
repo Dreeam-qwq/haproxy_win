@@ -333,10 +333,15 @@ enum proto_proxy_side {
 
 /* ctl command used by mux->ctl() */
 enum mux_ctl_type {
-	MUX_STATUS, /* Expects an int as output, sets it to a combinaison of MUX_STATUS flags */
-	MUX_EXIT_STATUS, /* Expects an int as output, sets the mux exist/error/http status, if known or 0 */
-	MUX_REVERSE_CONN, /* Notify about an active reverse connection accepted. */
-	MUX_SUBS_RECV, /* Notify the mux it must wait for read events again  */
+	MUX_CTL_STATUS, /* Expects an int as output, sets it to a combinaison of MUX_CTL_STATUS flags */
+	MUX_CTL_EXIT_STATUS, /* Expects an int as output, sets the mux exist/error/http status, if known or 0 */
+	MUX_CTL_REVERSE_CONN, /* Notify about an active reverse connection accepted. */
+	MUX_CTL_SUBS_RECV, /* Notify the mux it must wait for read events again  */
+};
+
+/* sctl command used by mux->sctl() */
+enum mux_sctl_type {
+	MUX_SCTL_SID, /* Return the mux stream ID as ouput, as a signed 64bits integer */
 };
 
 /* response for ctl MUX_STATUS */
@@ -440,12 +445,13 @@ struct mux_ops {
 	int (*show_sd)(struct buffer *, struct sedesc *, const char *pfx); /* append some data about the mux stream into chunk for "show sess"; returns non-zero if suspicious */
 	int (*subscribe)(struct stconn *sc, int event_type,  struct wait_event *es); /* Subscribe <es> to events, such as "being able to send" */
 	int (*unsubscribe)(struct stconn *sc, int event_type,  struct wait_event *es); /* Unsubscribe <es> from events */
+	int (*sctl)(struct stconn *sc, enum mux_sctl_type mux_sctl, void *arg); /* Provides information about the mux stream */
 	int (*avail_streams)(struct connection *conn); /* Returns the number of streams still available for a connection */
 	int (*avail_streams_bidi)(struct connection *conn); /* Returns the number of bidirectional streams still available for a connection */
 	int (*avail_streams_uni)(struct connection *conn); /* Returns the number of unidirectional streams still available for a connection */
 	int (*used_streams)(struct connection *conn);  /* Returns the number of streams in use on a connection. */
 	void (*destroy)(void *ctx); /* Let the mux know one of its users left, so it may have to disappear */
-	int (*ctl)(struct connection *conn, enum mux_ctl_type mux_ctl, void *arg); /* Provides information about the mux */
+	int (*ctl)(struct connection *conn, enum mux_ctl_type mux_ctl, void *arg); /* Provides information about the mux connection */
 	int (*takeover)(struct connection *conn, int orig_tid); /* Attempts to migrate the connection to the current thread */
 	unsigned int flags;                           /* some flags characterizing the mux's capabilities (MX_FL_*) */
 	char name[8];                                 /* mux layer name, zero-terminated */

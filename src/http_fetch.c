@@ -311,8 +311,12 @@ struct htx *smp_prefetch_htx(struct sample *smp, struct channel *chn, struct che
 			if (txn->meth == HTTP_METH_GET || txn->meth == HTTP_METH_HEAD)
 				s->flags |= SF_REDIRECTABLE;
 		}
-		else if (txn->status == -1)
-			txn->status = sl->info.res.status;
+		else {
+			if (txn->status == -1)
+				txn->status = sl->info.res.status;
+			if (!(htx->flags & HTX_FL_PROXY_RESP) && txn->server_status == -1)
+				txn->server_status = sl->info.res.status;
+		}
 		if (sl->flags & HTX_SL_F_VER_11)
 			msg->flags |= HTTP_MSGF_VER_11;
 	}
@@ -438,6 +442,34 @@ static int smp_fetch_stcode(const struct arg *args, struct sample *smp, const ch
 	smp->data.type = SMP_T_SINT;
 	smp->data.u.sint = __strl2ui(ptr, len);
 	smp->flags = SMP_F_VOL_1ST;
+	return 1;
+}
+
+/* It returns the server or the txn status code, depending on the keyword */
+static int smp_fetch_srv_status(const struct arg *args, struct sample *smp, const char *kw, void *private)
+{
+	struct http_txn *txn;
+	short status;
+
+	txn = (smp->strm ? smp->strm->txn : NULL);
+	if (!txn)
+		return 0;
+
+	status = (kw[0] == 't' ? txn->status : txn->server_status);
+	if (status == -1) {
+		struct channel *chn = SMP_RES_CHN(smp);
+		struct htx *htx = smp_prefetch_htx(smp, chn, NULL, 1);
+
+		if (!htx)
+			return 0;
+
+		status = (kw[0] == 't' ? txn->status : txn->server_status);
+	}
+
+	if (kw[0] != 't')
+		smp->flags = SMP_F_VOL_1ST;
+	smp->data.type = SMP_T_SINT;
+	smp->data.u.sint = status;
 	return 1;
 }
 
@@ -2298,6 +2330,8 @@ static struct sample_fetch_kw_list sample_fetch_keywords = {ILH, {
 	{ "res.hdr_names",      smp_fetch_hdr_names,          ARG1(0,STR),      NULL,    SMP_T_STR,  SMP_USE_HRSHV },
 	{ "res.hdr_val",        smp_fetch_hdr_val,            ARG2(0,STR,SINT), val_hdr, SMP_T_SINT, SMP_USE_HRSHV },
 
+	{ "server_status",      smp_fetch_srv_status,         0,                NULL,    SMP_T_SINT, SMP_USE_HRSHP },
+
 	/* scook is valid only on the response and is used for ACL compatibility */
 	{ "scook",              smp_fetch_cookie,             ARG1(0,STR),      NULL,    SMP_T_STR,  SMP_USE_HRSHV },
 	{ "scook_cnt",          smp_fetch_cookie_cnt,         ARG1(0,STR),      NULL,    SMP_T_SINT, SMP_USE_HRSHV },
@@ -2310,6 +2344,7 @@ static struct sample_fetch_kw_list sample_fetch_keywords = {ILH, {
 	{ "shdr_val",           smp_fetch_hdr_val,            ARG2(0,STR,SINT), val_hdr, SMP_T_SINT, SMP_USE_HRSHV },
 
 	{ "status",             smp_fetch_stcode,             0,                NULL,    SMP_T_SINT, SMP_USE_HRSHP },
+	{ "txn.status",         smp_fetch_srv_status,         0,                NULL,    SMP_T_SINT, SMP_USE_HRSHP },
 	{ "unique-id",          smp_fetch_uniqueid,           0,                NULL,    SMP_T_STR,  SMP_SRC_L4SRV },
 	{ "url",                smp_fetch_url,                0,                NULL,    SMP_T_STR,  SMP_USE_HRQHV },
 	{ "url32",              smp_fetch_url32,              0,                NULL,    SMP_T_SINT, SMP_USE_HRQHV },

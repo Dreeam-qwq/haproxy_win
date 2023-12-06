@@ -19,6 +19,9 @@
 #include <haproxy/ncbuf.h>
 #include <haproxy/proto_quic.h>
 #include <haproxy/quic_ack.h>
+#include <haproxy/quic_cid.h>
+#include <haproxy/quic_retransmit.h>
+#include <haproxy/quic_retry.h>
 #include <haproxy/quic_sock.h>
 #include <haproxy/quic_stream.h>
 #include <haproxy/quic_ssl.h>
@@ -251,8 +254,11 @@ static int quic_stream_try_to_consume(struct quic_conn *qc,
 	return ret;
 }
 
-/* Treat <frm> frame whose packet it is attached to has just been acknowledged. */
-static void qc_treat_acked_tx_frm(struct quic_conn *qc, struct quic_frame *frm)
+/* Handle <frm> frame whose packet it is attached to has just been acknowledged. The memory allocated
+ * for this frame will be at least released in every cases.
+ * Never fail.
+ */
+static void qc_handle_newly_acked_frm(struct quic_conn *qc, struct quic_frame *frm)
 {
 	TRACE_ENTER(QUIC_EV_CONN_PRSAFRM, qc);
 	TRACE_PROTO("RX ack TX frm", QUIC_EV_CONN_PRSAFRM, qc, frm);
@@ -350,12 +356,9 @@ static void qc_newly_acked_pkts(struct quic_conn *qc, struct eb_root *pkts,
 	TRACE_LEAVE(QUIC_EV_CONN_PRSAFRM, qc);
 }
 
-/* Remove <largest> down to <smallest> node entries from <pkts> tree of TX packet,
- * deallocating them, and their TX frames.
- * May be NULL if <largest> node could not be found.
- */
-static void qc_ackrng_pkts(struct quic_conn *qc,
-                           unsigned int *pkt_flags, struct list *newly_acked_pkts)
+/* Handle <newly_acked_pkts> list of newly acknowledged TX packets */
+static void qc_handle_newly_acked_pkts(struct quic_conn *qc,
+                                       unsigned int *pkt_flags, struct list *newly_acked_pkts)
 {
 	struct quic_tx_packet *pkt, *tmp;
 
@@ -367,7 +370,7 @@ static void qc_ackrng_pkts(struct quic_conn *qc,
 		*pkt_flags |= pkt->flags;
 		TRACE_DEVEL("Removing packet #", QUIC_EV_CONN_PRSAFRM, qc, NULL, &pkt->pn_node.key);
 		list_for_each_entry_safe(frm, frmbak, &pkt->frms, list)
-			qc_treat_acked_tx_frm(qc, frm);
+			qc_handle_newly_acked_frm(qc, frm);
 		/* If there are others packet in the same datagram <pkt> is attached to,
 		 * detach the previous one and the next one from <pkt>.
 		 */
@@ -379,16 +382,16 @@ static void qc_ackrng_pkts(struct quic_conn *qc,
 	TRACE_LEAVE(QUIC_EV_CONN_PRSAFRM, qc);
 }
 
-/* Remove all frames from <pkt_frm_list> and reinsert them in the same order
+/* Handle all frames sent from <pkt> packet and reinsert them in the same order
  * they have been sent into <pktns_frm_list>. The loss counter of each frame is
  * incremented and checked if it does not exceed retransmission limit.
  *
  * Returns 1 on success, 0 if a frame loss limit is exceeded. A
  * CONNECTION_CLOSE is scheduled in this case.
  */
-static int qc_requeue_nacked_pkt_tx_frms(struct quic_conn *qc,
-                                         struct quic_tx_packet *pkt,
-                                         struct list *pktns_frm_list)
+int qc_handle_frms_of_lost_pkt(struct quic_conn *qc,
+                               struct quic_tx_packet *pkt,
+                               struct list *pktns_frm_list)
 {
 	struct quic_frame *frm, *frmbak;
 	struct list *pkt_frm_list = &pkt->frms;
@@ -481,8 +484,8 @@ static int qc_requeue_nacked_pkt_tx_frms(struct quic_conn *qc,
  * <newly_acked_pkts> list and free them.
  * Always succeeds.
  */
-static void qc_treat_newly_acked_pkts(struct quic_conn *qc,
-                                      struct list *newly_acked_pkts)
+static void qc_notify_cc_of_newly_acked_pkts(struct quic_conn *qc,
+                                             struct list *newly_acked_pkts)
 {
 	struct quic_tx_packet *pkt, *tmp;
 	struct quic_cc_event ev = { .type = QUIC_CC_EVT_ACK, };
@@ -510,86 +513,6 @@ static void qc_treat_newly_acked_pkts(struct quic_conn *qc,
 
 	TRACE_LEAVE(QUIC_EV_CONN_PRSAFRM, qc);
 
-}
-
-/* Handle <pkts> list of lost packets detected at <now_us> handling their TX
- * frames. Send a packet loss event to the congestion controller if in flight
- * packet have been lost. Also frees the packet in <pkts> list.
- *
- * Returns 1 on success else 0 if loss limit has been exceeded. A
- * CONNECTION_CLOSE was prepared to close the connection ASAP.
- */
-int qc_release_lost_pkts(struct quic_conn *qc, struct quic_pktns *pktns,
-                         struct list *pkts, uint64_t now_us)
-{
-	struct quic_tx_packet *pkt, *tmp, *oldest_lost, *newest_lost;
-	int close = 0;
-
-	TRACE_ENTER(QUIC_EV_CONN_PRSAFRM, qc);
-
-	if (LIST_ISEMPTY(pkts))
-		goto leave;
-
-	oldest_lost = newest_lost = NULL;
-	list_for_each_entry_safe(pkt, tmp, pkts, list) {
-		struct list tmp = LIST_HEAD_INIT(tmp);
-
-		pkt->pktns->tx.in_flight -= pkt->in_flight_len;
-		qc->path->prep_in_flight -= pkt->in_flight_len;
-		qc->path->in_flight -= pkt->in_flight_len;
-		if (pkt->flags & QUIC_FL_TX_PACKET_ACK_ELICITING)
-			qc->path->ifae_pkts--;
-		/* Treat the frames of this lost packet. */
-		if (!qc_requeue_nacked_pkt_tx_frms(qc, pkt, &pktns->tx.frms))
-			close = 1;
-		LIST_DELETE(&pkt->list);
-		if (!oldest_lost) {
-			oldest_lost = newest_lost = pkt;
-		}
-		else {
-			if (newest_lost != oldest_lost)
-				quic_tx_packet_refdec(newest_lost);
-			newest_lost = pkt;
-		}
-	}
-
-	if (!close) {
-		if (newest_lost) {
-			/* Sent a congestion event to the controller */
-			struct quic_cc_event ev = { };
-
-			ev.type = QUIC_CC_EVT_LOSS;
-			ev.loss.time_sent = newest_lost->time_sent;
-
-			quic_cc_event(&qc->path->cc, &ev);
-		}
-
-		/* If an RTT have been already sampled, <rtt_min> has been set.
-		 * We must check if we are experiencing a persistent congestion.
-		 * If this is the case, the congestion controller must re-enter
-		 * slow start state.
-		 */
-		if (qc->path->loss.rtt_min && newest_lost != oldest_lost) {
-			unsigned int period = newest_lost->time_sent - oldest_lost->time_sent;
-
-			if (quic_loss_persistent_congestion(&qc->path->loss, period,
-							    now_ms, qc->max_ack_delay))
-				qc->path->cc.algo->slow_start(&qc->path->cc);
-		}
-	}
-
-	/* <oldest_lost> cannot be NULL at this stage because we have ensured
-	 * that <pkts> list is not empty. Without this, GCC 12.2.0 reports a
-	 * possible overflow on a 0 byte region with O2 optimization.
-	 */
-	ALREADY_CHECKED(oldest_lost);
-	quic_tx_packet_refdec(oldest_lost);
-	if (newest_lost != oldest_lost)
-		quic_tx_packet_refdec(newest_lost);
-
- leave:
-	TRACE_LEAVE(QUIC_EV_CONN_PRSAFRM, qc);
-	return !close;
 }
 
 /* Parse ACK frame into <frm> from a buffer at <buf> address with <end> being at
@@ -691,7 +614,7 @@ static int qc_parse_ack_frm(struct quic_conn *qc,
 	} while (1);
 
 	if (!LIST_ISEMPTY(&newly_acked_pkts)) {
-		qc_ackrng_pkts(qc, &pkt_flags, &newly_acked_pkts);
+		qc_handle_newly_acked_pkts(qc, &pkt_flags, &newly_acked_pkts);
 		if (new_largest_acked_pn && (pkt_flags & QUIC_FL_TX_PACKET_ACK_ELICITING)) {
 			*rtt_sample = tick_remain(time_sent, now_ms);
 			qel->pktns->rx.largest_acked_pn = ack_frm->largest_ack;
@@ -702,7 +625,7 @@ static int qc_parse_ack_frm(struct quic_conn *qc,
 			if (!qc_release_lost_pkts(qc, qel->pktns, &lost_pkts, now_ms))
 				goto leave;
 		}
-		qc_treat_newly_acked_pkts(qc, &newly_acked_pkts);
+		qc_notify_cc_of_newly_acked_pkts(qc, &newly_acked_pkts);
 		if (quic_peer_validated_addr(qc))
 			qc->path->loss.pto_count = 0;
 		qc_set_timer(qc);
@@ -751,38 +674,6 @@ static int qc_handle_strm_frm(struct quic_rx_packet *pkt,
 	/* frame rejected - packet must not be acknowledeged */
 	TRACE_LEAVE(QUIC_EV_CONN_PRSFRM, qc);
 	return !ret;
-}
-
-/* Release the underlying memory use by <ncbuf> non-contiguous buffer */
-void quic_free_ncbuf(struct ncbuf *ncbuf)
-{
-	struct buffer buf;
-
-	if (ncb_is_null(ncbuf))
-		return;
-
-	buf = b_make(ncbuf->area, ncbuf->size, 0, 0);
-	b_free(&buf);
-	offer_buffers(NULL, 1);
-
-	*ncbuf = NCBUF_NULL;
-}
-
-/* Allocate the underlying required memory for <ncbuf> non-contiguous buffer */
-static struct ncbuf *quic_get_ncbuf(struct ncbuf *ncbuf)
-{
-	struct buffer buf = BUF_NULL;
-
-	if (!ncb_is_null(ncbuf))
-		return ncbuf;
-
-	b_alloc(&buf);
-	BUG_ON(b_is_null(&buf));
-
-	*ncbuf = ncb_make(buf.area, buf.size, 0);
-	ncb_init(ncbuf, 0);
-
-	return ncbuf;
 }
 
 /* Parse <frm> CRYPTO frame coming with <pkt> packet at <qel> <qc> connectionn.
@@ -937,6 +828,16 @@ static int qc_handle_retire_connection_id_frm(struct quic_conn *qc,
 	quic_set_connection_close(qc, quic_err_transport(QC_ERR_PROTOCOL_VIOLATION));
 	qc_notify_err(qc);
 	goto leave;
+}
+
+/* Returns the <ack_delay> field value in milliseconds from <ack_frm> ACK frame for
+ * <conn> QUIC connection. Note that the value of <ack_delay> coming from
+ * ACK frame is in microseconds.
+ */
+static inline unsigned int quic_ack_delay_ms(struct qf_ack *ack_frm,
+                                             struct quic_conn *conn)
+{
+	return (ack_frm->ack_delay << conn->tx.params.ack_delay_exponent) / 1000;
 }
 
 /* Parse all the frames of <pkt> QUIC packet for QUIC connection <qc> and <qel>
@@ -1121,7 +1022,7 @@ static int qc_parse_pkt_frms(struct quic_conn *qc, struct quic_rx_packet *pkt,
 		case QUIC_FT_CONNECTION_CLOSE:
 		case QUIC_FT_CONNECTION_CLOSE_APP:
 			/* Increment the error counters */
-			qc_cc_err_count_inc(qc, &frm);
+			quic_conn_closed_err_count_inc(qc, &frm);
 			if (!(qc->flags & QUIC_FL_CONN_DRAINING)) {
 				TRACE_STATE("Entering draining state", QUIC_EV_CONN_PRSHPKT, qc);
 				/* RFC 9000 10.2. Immediate Close:
@@ -1451,62 +1352,6 @@ int qc_treat_rx_pkts(struct quic_conn *qc)
 	return ret;
 }
 
-/* Parse the Retry token from buffer <token> with <end> a pointer to
- * one byte past the end of this buffer. This will extract the ODCID
- * which will be stored into <odcid>
- *
- * Returns 0 on success else non-zero.
- */
-static int parse_retry_token(struct quic_conn *qc,
-                             const unsigned char *token, const unsigned char *end,
-                             struct quic_cid *odcid)
-{
-	int ret = 0;
-	uint64_t odcid_len;
-	uint32_t timestamp;
-	uint32_t now_sec = (uint32_t)date.tv_sec;
-
-	TRACE_ENTER(QUIC_EV_CONN_LPKT, qc);
-
-	if (!quic_dec_int(&odcid_len, &token, end)) {
-		TRACE_ERROR("quic_dec_int() error", QUIC_EV_CONN_LPKT, qc);
-		goto leave;
-	}
-
-	/* RFC 9000 7.2. Negotiating Connection IDs:
-	 * When an Initial packet is sent by a client that has not previously
-	 * received an Initial or Retry packet from the server, the client
-	 * populates the Destination Connection ID field with an unpredictable
-	 * value. This Destination Connection ID MUST be at least 8 bytes in length.
-	 */
-	if (odcid_len < QUIC_ODCID_MINLEN || odcid_len > QUIC_CID_MAXLEN) {
-		TRACE_ERROR("wrong ODCID length", QUIC_EV_CONN_LPKT, qc);
-		goto leave;
-	}
-
-	if (end - token < odcid_len + sizeof timestamp) {
-		TRACE_ERROR("too long ODCID length", QUIC_EV_CONN_LPKT, qc);
-		goto leave;
-	}
-
-	timestamp = ntohl(read_u32(token + odcid_len));
-	/* check if elapsed time is +/- QUIC_RETRY_DURATION_SEC
-	 * to tolerate token generator is not perfectly time synced
-	 */
-	if ((uint32_t)(now_sec - timestamp) > QUIC_RETRY_DURATION_SEC &&
-            (uint32_t)(timestamp - now_sec) > QUIC_RETRY_DURATION_SEC) {
-		TRACE_ERROR("token has expired", QUIC_EV_CONN_LPKT, qc);
-		goto leave;
-	}
-
-	ret = 1;
-	memcpy(odcid->data, token, odcid_len);
-	odcid->len = odcid_len;
- leave:
-	TRACE_LEAVE(QUIC_EV_CONN_LPKT, qc);
-	return !ret;
-}
-
 /* Parse into <pkt> a long header located at <*pos> position, <end> begin a pointer to the end
  * past one byte of this buffer.
  */
@@ -1565,19 +1410,6 @@ static inline int quic_packet_read_long_header(unsigned char **pos, const unsign
  leave:
 	TRACE_LEAVE(QUIC_EV_CONN_RXPKT);
 	return ret;
-}
-
-/* Insert <pkt> RX packet in its <qel> RX packets tree */
-static void qc_pkt_insert(struct quic_conn *qc,
-                          struct quic_rx_packet *pkt, struct quic_enc_level *qel)
-{
-	TRACE_ENTER(QUIC_EV_CONN_RXPKT, qc);
-
-	pkt->pn_node.key = pkt->pn;
-	quic_rx_packet_refinc(pkt);
-	eb64_insert(&qel->rx.pkts, &pkt->pn_node);
-
-	TRACE_LEAVE(QUIC_EV_CONN_RXPKT, qc);
 }
 
 /* Try to remove the header protection of <pkt> QUIC packet with <beg> the
@@ -1669,6 +1501,24 @@ static int qc_try_rm_hp(struct quic_conn *qc, struct quic_rx_packet *pkt,
 	return ret;
 }
 
+/* Return a 32-bits integer in <val> from QUIC packet with <buf> as address.
+ * Makes <buf> point to the data after this 32-bits value if succeeded.
+ * Note that these 32-bits integers are network bytes ordered.
+ * Returns 0 if failed (not enough data in the buffer), 1 if succeeded.
+ */
+static inline int quic_read_uint32(uint32_t *val,
+                                   const unsigned char **buf,
+                                   const unsigned char *end)
+{
+	if (end - *buf < sizeof *val)
+		return 0;
+
+	*val = ntohl(*(uint32_t *)*buf);
+	*buf += sizeof *val;
+
+	return 1;
+}
+
 /* Parse a QUIC packet header starting at <pos> position without exceeding <end>.
  * Version and type are stored in <pkt> packet instance. Type is set to unknown
  * on two occasions : for unsupported version, in this case version field is
@@ -1733,170 +1583,6 @@ int qc_parse_hd_form(struct quic_rx_packet *pkt,
 	return ret;
 }
 
-/* QUIC server only function.
- *
- * Check the validity of the Retry token from Initial packet <pkt>. <dgram> is
- * the UDP datagram containing <pkt> and <l> is the listener instance on which
- * it was received. If the token is valid, the ODCID of <qc> QUIC connection
- * will be put into <odcid>. <qc> is used to retrieve the QUIC version needed
- * to validate the token but it can be NULL : in this case the version will be
- * retrieved from the packet.
- *
- * Return 1 if succeeded, 0 if not.
- */
-
-static int quic_retry_token_check(struct quic_rx_packet *pkt,
-                                  struct quic_dgram *dgram,
-                                  struct listener *l,
-                                  struct quic_conn *qc,
-                                  struct quic_cid *odcid)
-{
-	struct proxy *prx;
-	struct quic_counters *prx_counters;
-	int ret = 0;
-	unsigned char *token = pkt->token;
-	const uint64_t tokenlen = pkt->token_len;
-	unsigned char buf[128];
-	unsigned char aad[sizeof(uint32_t) + QUIC_CID_MAXLEN +
-	                  sizeof(in_port_t) + sizeof(struct in6_addr)];
-	size_t aadlen;
-	const unsigned char *salt;
-	unsigned char key[QUIC_TLS_KEY_LEN];
-	unsigned char iv[QUIC_TLS_IV_LEN];
-	const unsigned char *sec = global.cluster_secret;
-	size_t seclen = sizeof global.cluster_secret;
-	EVP_CIPHER_CTX *ctx = NULL;
-	const EVP_CIPHER *aead = EVP_aes_128_gcm();
-	const struct quic_version *qv = qc ? qc->original_version :
-	                                     pkt->version;
-
-	TRACE_ENTER(QUIC_EV_CONN_LPKT, qc);
-
-	/* The caller must ensure this. */
-	BUG_ON(!pkt->token_len);
-
-	prx = l->bind_conf->frontend;
-	prx_counters = EXTRA_COUNTERS_GET(prx->extra_counters_fe, &quic_stats_module);
-
-	if (*pkt->token != QUIC_TOKEN_FMT_RETRY) {
-		/* TODO: New token check */
-		TRACE_PROTO("Packet dropped", QUIC_EV_CONN_LPKT, qc, NULL, NULL, pkt->version);
-		goto leave;
-	}
-
-	if (sizeof buf < tokenlen) {
-		TRACE_ERROR("too short buffer", QUIC_EV_CONN_LPKT, qc);
-		goto err;
-	}
-
-	/* The token is made of the token format byte, the ODCID prefixed by its one byte
-	 * length, the creation timestamp, an AEAD TAG, and finally
-	 * the random bytes used to derive the secret to encrypt the token.
-	 */
-	if (tokenlen < 2 + QUIC_ODCID_MINLEN + sizeof(uint32_t) + QUIC_TLS_TAG_LEN + QUIC_RETRY_TOKEN_SALTLEN ||
-	    tokenlen > 2 + QUIC_CID_MAXLEN + sizeof(uint32_t) + QUIC_TLS_TAG_LEN + QUIC_RETRY_TOKEN_SALTLEN) {
-		TRACE_ERROR("invalid token length", QUIC_EV_CONN_LPKT, qc);
-		goto err;
-	}
-
-	aadlen = quic_generate_retry_token_aad(aad, qv->num, &pkt->scid, &dgram->saddr);
-	salt = token + tokenlen - QUIC_RETRY_TOKEN_SALTLEN;
-	if (!quic_tls_derive_retry_token_secret(EVP_sha256(), key, sizeof key, iv, sizeof iv,
-	                                        salt, QUIC_RETRY_TOKEN_SALTLEN, sec, seclen)) {
-		TRACE_ERROR("Could not derive retry secret", QUIC_EV_CONN_LPKT, qc);
-		goto err;
-	}
-
-	if (!quic_tls_rx_ctx_init(&ctx, aead, key)) {
-		TRACE_ERROR("quic_tls_rx_ctx_init() failed", QUIC_EV_CONN_LPKT, qc);
-		goto err;
-	}
-
-	/* The token is prefixed by a one-byte length format which is not ciphered. */
-	if (!quic_tls_decrypt2(buf, token + 1, tokenlen - QUIC_RETRY_TOKEN_SALTLEN - 1, aad, aadlen,
-	                       ctx, aead, key, iv)) {
-		TRACE_ERROR("Could not decrypt retry token", QUIC_EV_CONN_LPKT, qc);
-		goto err;
-	}
-
-	if (parse_retry_token(qc, buf, buf + tokenlen - QUIC_RETRY_TOKEN_SALTLEN - 1, odcid)) {
-		TRACE_ERROR("Error during Initial token parsing", QUIC_EV_CONN_LPKT, qc);
-		goto err;
-	}
-
-	EVP_CIPHER_CTX_free(ctx);
-
-	ret = 1;
-	HA_ATOMIC_INC(&prx_counters->retry_validated);
-
- leave:
-	TRACE_LEAVE(QUIC_EV_CONN_LPKT, qc);
-	return ret;
-
- err:
-	HA_ATOMIC_INC(&prx_counters->retry_error);
-	if (ctx)
-		EVP_CIPHER_CTX_free(ctx);
-	goto leave;
-}
-
-/* Retrieve a quic_conn instance from the <pkt> DCID field. If the packet is an
- * INITIAL or 0RTT type, we may have to use client address <saddr> if an ODCID
- * is used.
- *
- * Returns the instance or NULL if not found.
- */
-static struct quic_conn *retrieve_qc_conn_from_cid(struct quic_rx_packet *pkt,
-                                                   struct listener *l,
-                                                   struct sockaddr_storage *saddr,
-                                                   int *new_tid)
-{
-	struct quic_conn *qc = NULL;
-	struct ebmb_node *node;
-	struct quic_connection_id *conn_id;
-	struct quic_cid_tree *tree;
-	uint conn_id_tid;
-
-	TRACE_ENTER(QUIC_EV_CONN_RXPKT);
-	*new_tid = -1;
-
-	/* First look into DCID tree. */
-	tree = &quic_cid_trees[_quic_cid_tree_idx(pkt->dcid.data)];
-	HA_RWLOCK_RDLOCK(QC_CID_LOCK, &tree->lock);
-	node = ebmb_lookup(&tree->root, pkt->dcid.data, pkt->dcid.len);
-
-	/* If not found on an Initial/0-RTT packet, it could be because an
-	 * ODCID is reused by the client. Calculate the derived CID value to
-	 * retrieve it from the DCID tree.
-	 */
-	if (!node && (pkt->type == QUIC_PACKET_TYPE_INITIAL ||
-	     pkt->type == QUIC_PACKET_TYPE_0RTT)) {
-		const struct quic_cid derive_cid = quic_derive_cid(&pkt->dcid, saddr);
-
-		HA_RWLOCK_RDUNLOCK(QC_CID_LOCK, &tree->lock);
-
-		tree = &quic_cid_trees[quic_cid_tree_idx(&derive_cid)];
-		HA_RWLOCK_RDLOCK(QC_CID_LOCK, &tree->lock);
-		node = ebmb_lookup(&tree->root, derive_cid.data, derive_cid.len);
-	}
-
-	if (!node)
-		goto end;
-
-	conn_id = ebmb_entry(node, struct quic_connection_id, node);
-	conn_id_tid = HA_ATOMIC_LOAD(&conn_id->tid);
-	if (conn_id_tid != tid) {
-		*new_tid = conn_id_tid;
-		goto end;
-	}
-	qc = conn_id->qc;
-
- end:
-	HA_RWLOCK_RDUNLOCK(QC_CID_LOCK, &tree->lock);
-	TRACE_LEAVE(QUIC_EV_CONN_RXPKT, qc);
-	return qc;
-}
-
 /* Check that all the bytes between <pos> included and <end> address
  * excluded are null. This is the responsibility of the caller to
  * check that there is at least one byte between <pos> end <end>.
@@ -1938,7 +1624,7 @@ static struct quic_conn *quic_rx_pkt_retrieve_conn(struct quic_rx_packet *pkt,
 	prx = l->bind_conf->frontend;
 	prx_counters = EXTRA_COUNTERS_GET(prx->extra_counters_fe, &quic_stats_module);
 
-	qc = retrieve_qc_conn_from_cid(pkt, l, &dgram->saddr, new_tid);
+	qc = retrieve_qc_conn_from_cid(pkt, &dgram->saddr, new_tid);
 
 	/* If connection already created or rebinded on another thread. */
 	if (!qc && *new_tid != -1 && tid != *new_tid)
@@ -2303,73 +1989,6 @@ static int qc_rx_check_closing(struct quic_conn *qc,
 	return 1;
 }
 
-/* React to a connection migration initiated on <qc> by a client with the new
- * path addresses <peer_addr>/<local_addr>.
- *
- * Returns 0 on success else non-zero.
- */
-static int qc_handle_conn_migration(struct quic_conn *qc,
-                                    const struct sockaddr_storage *peer_addr,
-                                    const struct sockaddr_storage *local_addr)
-{
-	TRACE_ENTER(QUIC_EV_CONN_LPKT, qc);
-
-	/* RFC 9000. Connection Migration
-	 *
-	 * If the peer sent the disable_active_migration transport parameter,
-	 * an endpoint also MUST NOT send packets (including probing packets;
-	 * see Section 9.1) from a different local address to the address the peer
-	 * used during the handshake, unless the endpoint has acted on a
-	 * preferred_address transport parameter from the peer.
-	 */
-	if (qc->li->bind_conf->quic_params.disable_active_migration) {
-		TRACE_ERROR("Active migration was disabled, datagram dropped", QUIC_EV_CONN_LPKT, qc);
-		goto err;
-	}
-
-	/* RFC 9000 9. Connection Migration
-	 *
-	 * The design of QUIC relies on endpoints retaining a stable address for
-	 * the duration of the handshake.  An endpoint MUST NOT initiate
-	 * connection migration before the handshake is confirmed, as defined in
-	 * Section 4.1.2 of [QUIC-TLS].
-	 */
-	if (qc->state < QUIC_HS_ST_COMPLETE) {
-		TRACE_STATE("Connection migration during handshake rejected", QUIC_EV_CONN_LPKT, qc);
-		goto err;
-	}
-
-	/* RFC 9000 9. Connection Migration
-	 *
-	 * TODO
-	 * An endpoint MUST
-	 * perform path validation (Section 8.2) if it detects any change to a
-	 * peer's address, unless it has previously validated that address.
-	 */
-
-	/* Update quic-conn owned socket if in used.
-	 * TODO try to reuse it instead of closing and opening a new one.
-	 */
-	if (qc_test_fd(qc)) {
-		/* TODO try to reuse socket instead of closing it and opening a new one. */
-		TRACE_STATE("Connection migration detected, allocate a new connection socket", QUIC_EV_CONN_LPKT, qc);
-		qc_release_fd(qc, 1);
-		/* TODO need to adjust <jobs> on socket allocation failure. */
-		qc_alloc_fd(qc, local_addr, peer_addr);
-	}
-
-	qc->local_addr = *local_addr;
-	qc->peer_addr = *peer_addr;
-	qc->cntrs.conn_migration_done++;
-
-	TRACE_LEAVE(QUIC_EV_CONN_LPKT, qc);
-	return 0;
-
- err:
-	TRACE_LEAVE(QUIC_EV_CONN_LPKT, qc);
-	return 1;
-}
-
 /* Release the memory for the RX packets which are no more referenced
  * and consume their payloads which have been copied to the RX buffer
  * for the connection.
@@ -2496,8 +2115,12 @@ static void qc_rx_pkt_handle(struct quic_conn *qc, struct quic_rx_packet *pkt,
 	}
 
 	TRACE_DATA("New packet", QUIC_EV_CONN_LPKT, qc, pkt, NULL, qv);
-	if (pkt->aad_len)
-		qc_pkt_insert(qc, pkt, qel);
+	if (pkt->aad_len) {
+		/* Insert this RX packet in its encryption level tree */
+		pkt->pn_node.key = pkt->pn;
+		quic_rx_packet_refinc(pkt);
+		eb64_insert(&qel->rx.pkts, &pkt->pn_node);
+	}
  out:
 	*tasklist_head = tasklet_wakeup_after(*tasklist_head,
 	                                      qc->wait_event.tasklet);

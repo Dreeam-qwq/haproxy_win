@@ -21,6 +21,7 @@
 
 #include <import/ebtree.h>
 
+#include <haproxy/ncbuf-t.h>
 #include <haproxy/quic_ack-t.h>
 #include <haproxy/openssl-compat.h>
 
@@ -201,6 +202,37 @@ struct quic_tls_ctx {
 	struct quic_tls_secrets rx;
 	struct quic_tls_secrets tx;
 	unsigned char flags;
+};
+
+#define QUIC_CRYPTO_BUF_SHIFT  10
+#define QUIC_CRYPTO_BUF_MASK   ((1UL << QUIC_CRYPTO_BUF_SHIFT) - 1)
+/* The maximum allowed size of CRYPTO data buffer provided by the TLS stack. */
+#define QUIC_CRYPTO_BUF_SZ    (1UL << QUIC_CRYPTO_BUF_SHIFT) /* 1 KB */
+
+extern struct pool_head *pool_head_quic_crypto_buf;
+
+/*
+ * CRYPTO buffer struct.
+ * Such buffers are used to send CRYPTO data.
+ */
+struct quic_crypto_buf {
+	unsigned char data[QUIC_CRYPTO_BUF_SZ];
+	size_t sz;
+};
+
+/* Crypto data stream (one by encryption level) */
+struct quic_cstream {
+	struct {
+		uint64_t offset;       /* absolute current base offset of ncbuf */
+		struct ncbuf ncbuf;    /* receive buffer - can handle out-of-order offset frames */
+	} rx;
+	struct {
+		uint64_t offset;      /* last offset of data ready to be sent */
+		uint64_t sent_offset; /* last offset sent by transport layer */
+		struct buffer buf;    /* transmit buffer before sending via xprt */
+	} tx;
+
+	struct qc_stream_desc *desc;
 };
 
 struct quic_enc_level {

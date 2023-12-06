@@ -1104,6 +1104,13 @@ struct sockaddr_storage *str2sa_range(const char *str, int *port, int *low, int 
 		ss.ss_family = AF_CUST_SOCKPAIR;
 	}
 	else if (strncmp(str2, "rhttp@", 3) == 0) {
+		/* TODO duplicated code from check_kw_experimental() */
+		if (!experimental_directives_allowed) {
+			memprintf(err, "Address '%s' is experimental, must be allowed via a global 'expose-experimental-directives'", str2);
+			goto out;
+		}
+		mark_tainted(TAINTED_CONFIG_EXP_KW_DECLARED);
+
 		str2 += 4;
 		ss.ss_family = AF_CUST_RHTTP_SRV;
 	}
@@ -5799,6 +5806,21 @@ uint32_t parse_line(char *in, char *out, size_t *outlen, char **args, int *nbarg
 							;
 					} else {
 						EMIT_CHAR(*value++);
+					}
+				}
+			}
+			else {
+				/* An unmatched environment variable was parsed.
+				 * Let's skip the trailing double-quote character
+				 * and spaces.
+				 */
+				if (likely(*var_name != '.') && *in == '"') {
+					in++;
+					while (isspace((unsigned char)*in))
+						in++;
+					if (dquote) {
+						dquote = 0;
+						quote = NULL;
 					}
 				}
 			}

@@ -124,6 +124,7 @@
 #include <haproxy/thread.h>
 #include <haproxy/time.h>
 #include <haproxy/tools.h>
+#include <haproxy/trace.h>
 #include <haproxy/uri_auth-t.h>
 #include <haproxy/vars.h>
 #include <haproxy/version.h>
@@ -588,6 +589,7 @@ static void usage(char *name)
 		"        -v displays version ; -vv shows known build options.\n"
 		"        -d enters debug mode ; -db only disables background mode.\n"
 		"        -dM[<byte>,help,...] debug memory (default: poison with <byte>/0x50)\n"
+		"        -dt activate traces on stderr\n"
 		"        -V enters verbose mode (disables quiet mode)\n"
 		"        -D goes daemon ; -C changes to <dir> before loading files.\n"
 		"        -W master-worker mode.\n"
@@ -1597,7 +1599,9 @@ static void init_args(int argc, char **argv)
 	global.tune.options |= GTUNE_STRICT_LIMITS;
 
 	global.tune.options |= GTUNE_USE_FAST_FWD; /* Use fast-forward by default */
-	global.tune.options |= GTUNE_USE_ZERO_COPY_FWD; /* Use zero-copy forwarding by default */
+
+	/* Use zero-copy forwarding by default */
+	global.tune.no_zero_copy_fwd = NO_ZERO_COPY_FWD_QUIC_SND;
 
 	/* keep a copy of original arguments for the master process */
 	old_argv = copy_argv(argc, argv);
@@ -1654,7 +1658,7 @@ static void init_args(int argc, char **argv)
 			else if (*flag == 'd' && flag[1] == 'V')
 				global.ssl_server_verify = SSL_SERVER_VERIFY_NONE;
 			else if (*flag == 'd' && flag[1] == 'Z')
-				global.tune.options &= ~GTUNE_USE_ZERO_COPY_FWD;
+				global.tune.no_zero_copy_fwd |= NO_ZERO_COPY_FWD;
 			else if (*flag == 'V')
 				arg_mode |= MODE_VERBOSE;
 			else if (*flag == 'd' && flag[1] == 'C') {
@@ -1704,6 +1708,19 @@ static void init_args(int argc, char **argv)
 			else if (*flag == 'd' && flag[1] == 'K') {
 				arg_mode |= MODE_DUMP_KWD;
 				kwd_dump = flag + 2;
+			}
+			else if (*flag == 'd' && flag[1] == 't') {
+				if (argc > 1 && argv[1][0] != '-') {
+					if (trace_parse_cmd(argv[1], &err_msg)) {
+						ha_alert("-dt: %s.\n", err_msg);
+						ha_free(&err_msg);
+						exit(EXIT_FAILURE);
+					}
+					argc--; argv++;
+				}
+				else {
+					trace_parse_cmd(NULL, NULL);
+				}
 			}
 			else if (*flag == 'd')
 				arg_mode |= MODE_DEBUG;

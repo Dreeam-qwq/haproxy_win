@@ -17,6 +17,7 @@
 #include <haproxy/http_ana.h>
 #include <haproxy/pipe.h>
 #include <haproxy/pool.h>
+#include <haproxy/sample.h>
 #include <haproxy/sc_strm.h>
 #include <haproxy/stconn.h>
 #include <haproxy/xref.h>
@@ -1046,9 +1047,10 @@ void sc_update_tx(struct stconn *sc)
  * It may update SE_FL_WAIT_DATA and/or SC_FL_NEED_ROOM, that the callers are
  * encouraged to watch to take appropriate action.
  * It should not be called from within the stream itself, sc_update()
- * is designed for this.
+ * is designed for this. Please do not statify this function, it's often
+ * present in backtraces, it's useful to recognize it.
  */
-static void sc_notify(struct stconn *sc)
+void sc_notify(struct stconn *sc)
 {
 	struct channel *ic = sc_ic(sc);
 	struct channel *oc = sc_oc(sc);
@@ -1204,9 +1206,10 @@ static void sc_conn_eos(struct stconn *sc)
 /*
  * This is the callback which is called by the connection layer to receive data
  * into the buffer from the connection. It iterates over the mux layer's
- * rcv_buf function.
+ * rcv_buf function. Please do not statify this function, it's often present in
+ * backtraces, it's useful to recognize it.
  */
-static int sc_conn_recv(struct stconn *sc)
+int sc_conn_recv(struct stconn *sc)
 {
 	struct connection *conn = __sc_conn(sc);
 	struct channel *ic = sc_ic(sc);
@@ -1273,7 +1276,7 @@ static int sc_conn_recv(struct stconn *sc)
 	/* First, let's see if we may fast-forward data from a side to the other
 	 * one without using the channel buffer.
 	 */
-	if ((global.tune.options & GTUNE_USE_ZERO_COPY_FWD) &&
+	if (!(global.tune.no_zero_copy_fwd & NO_ZERO_COPY_FWD) &&
 	    sc_ep_test(sc, SE_FL_MAY_FASTFWD) && ic->to_forward) {
 		if (channel_data(ic)) {
 			/* We're embarrassed, there are already data pending in
@@ -1549,9 +1552,10 @@ int sc_conn_sync_recv(struct stconn *sc)
  * This function is called to send buffer data to a stream socket.
  * It calls the mux layer's snd_buf function. It relies on the
  * caller to commit polling changes. The caller should check conn->flags
- * for errors.
+ * for errors. Please do not statify this function, it's often present in
+ * backtraces, it's useful to recognize it.
  */
-static int sc_conn_send(struct stconn *sc)
+int sc_conn_send(struct stconn *sc)
 {
 	struct connection *conn = __sc_conn(sc);
 	struct stconn *sco = sc_opposite(sc);
@@ -1754,9 +1758,10 @@ void sc_conn_sync_send(struct stconn *sc)
  * connection flags to the stream connector, updates the stream (which may or
  * may not take this opportunity to try to forward data), then update the
  * connection's polling based on the channels and stream connector's final
- * states. The function always returns 0.
+ * states. The function always returns 0. Please do not statify this function,
+ * it's often present in backtraces, it's useful to recognize it.
  */
-static int sc_conn_process(struct stconn *sc)
+int sc_conn_process(struct stconn *sc)
 {
 	struct connection *conn = __sc_conn(sc);
 	struct channel *ic = sc_ic(sc);
@@ -1905,9 +1910,10 @@ static void sc_applet_eos(struct stconn *sc)
 /* Callback to be used by applet handlers upon completion. It updates the stream
  * (which may or may not take this opportunity to try to forward data), then
  * may re-enable the applet's based on the channels and stream connector's final
- * states.
+ * states. Please do not statify this function, it's often present in backtraces,
+ * it's useful to recognize it.
  */
-static int sc_applet_process(struct stconn *sc)
+int sc_applet_process(struct stconn *sc)
 {
 	struct channel *ic = sc_ic(sc);
 
@@ -1990,3 +1996,54 @@ void sc_conn_commit_endp_upgrade(struct stconn *sc)
 	BUG_ON(!sc);
 	BUG_ON(!sc->sedesc);
 }
+
+/* return the frontend or backend mux stream ID.
+ */
+static int
+smp_fetch_sid(const struct arg *args, struct sample *smp, const char *kw, void *private)
+{
+	struct connection *conn;
+	struct stconn *sc;
+	int64_t sid = 0;
+
+	if (!smp->strm)
+		return 0;
+
+	sc = (kw[0] == 'f' ? smp->strm->scf : smp->strm->scb);
+	conn = sc_conn(sc);
+
+	/* No connection */
+	if (!conn)
+		return 0;
+
+	/* No mux install, this may change */
+	if (!conn->mux) {
+		smp->flags |= SMP_F_MAY_CHANGE;
+		return 0;
+	}
+
+	/* No sctl, report sid=0 in this case */
+	if (conn->mux->sctl) {
+		if (conn->mux->sctl(sc, MUX_SCTL_SID, &sid) == -1)
+			return 0;
+	}
+
+	smp->flags = SMP_F_VOL_TXN;
+	smp->data.type = SMP_T_SINT;
+	smp->data.u.sint = sid;
+
+	return 1;
+}
+
+/* Note: must not be declared <const> as its list will be overwritten.
+ * Note: fetches that may return multiple types should be declared using the
+ * appropriate pseudo-type. If not available it must be declared as the lowest
+ * common denominator, the type that can be casted into all other ones.
+ */
+static struct sample_fetch_kw_list sample_fetch_keywords = {ILH, {
+	{ "bs.id", smp_fetch_sid, 0, NULL, SMP_T_SINT, SMP_USE_L6REQ },
+	{ "fs.id", smp_fetch_sid, 0, NULL, SMP_T_STR, SMP_USE_L6RES },
+	{ /* END */ },
+}};
+
+INITCALL1(STG_REGISTER, sample_register_fetches, &sample_fetch_keywords);
