@@ -1292,8 +1292,10 @@ static int ssl_sock_load_ocsp(const char *path, SSL_CTX *ctx, struct ckch_data *
 	}
 
 out:
-	if (ret && data->ocsp_cid)
+	if (ret && data->ocsp_cid) {
 		OCSP_CERTID_free(data->ocsp_cid);
+		data->ocsp_cid = NULL;
+	}
 
 	if (!ret && data->ocsp_response) {
 		ha_free(&data->ocsp_response->area);
@@ -2795,7 +2797,7 @@ int ssl_sock_switchctx_cbk(SSL *ssl, int *al, void *priv)
 #endif /* (!) OPENSSL_IS_BORINGSSL */
 #endif /* SSL_CTRL_SET_TLSEXT_HOSTNAME */
 
-#if 0 && defined(USE_OPENSSL_WOLFSSL)
+#if defined(USE_OPENSSL_WOLFSSL)
 /* This implement the equivalent of the clientHello Callback but using the cert_cb.
  * WolfSSL is able to extract the sigalgs and ciphers of the client byt using the API
  * provided in https://github.com/wolfSSL/wolfssl/pull/6963
@@ -2857,8 +2859,8 @@ static int ssl_sock_switchctx_wolfSSL_cbk(WOLFSSL* ssl, void* arg)
 			has_rsa_sig = 0;
 		}
 		for (idx = 0; idx < hashSigAlgoSz; idx += 2) {
-			enum wc_HashType hashAlgo;
-			enum Key_Sum sigAlgo;
+			int hashAlgo;
+			int sigAlgo;
 
 			wolfSSL_get_sigalg_info(hashSigAlgo[idx+0], hashSigAlgo[idx+1], &hashAlgo, &sigAlgo);
 
@@ -4350,7 +4352,7 @@ ssl_sock_initial_ctx(struct bind_conf *bind_conf)
 #  endif /* ! SSL_OP_NO_ANTI_REPLAY */
 	SSL_CTX_set_client_hello_cb(ctx, ssl_sock_switchctx_cbk, NULL);
 	SSL_CTX_set_tlsext_servername_callback(ctx, ssl_sock_switchctx_err_cbk);
-# elif 0 && defined(USE_OPENSSL_WOLFSSL)
+# elif defined(USE_OPENSSL_WOLFSSL)
 	SSL_CTX_set_cert_cb(ctx, ssl_sock_switchctx_wolfSSL_cbk, bind_conf);
 # else
 	/* ! OPENSSL_IS_BORINGSSL && ! HAVE_SSL_CLIENT_HELLO_CB */

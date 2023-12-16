@@ -58,17 +58,19 @@ static const struct trace_event h3_trace_events[] = {
 	{ .mask = H3_EV_RX_HDR,       .name = "rx_hdr",      .desc = "receipt of H3 HEADERS frame" },
 #define           H3_EV_RX_SETTINGS   (1ULL <<  3)
 	{ .mask = H3_EV_RX_SETTINGS,  .name = "rx_settings", .desc = "receipt of H3 SETTINGS frame" },
-#define           H3_EV_TX_DATA       (1ULL <<  4)
+#define           H3_EV_TX_FRAME      (1ULL <<  4)
+	{ .mask = H3_EV_TX_FRAME,     .name = "tx_frame",    .desc = "transmission of any H3 frame" },
+#define           H3_EV_TX_DATA       (1ULL <<  5)
 	{ .mask = H3_EV_TX_DATA,      .name = "tx_data",     .desc = "transmission of H3 DATA frame" },
-#define           H3_EV_TX_HDR        (1ULL <<  5)
+#define           H3_EV_TX_HDR        (1ULL <<  6)
 	{ .mask = H3_EV_TX_HDR,       .name = "tx_hdr",      .desc = "transmission of H3 HEADERS frame" },
-#define           H3_EV_TX_SETTINGS   (1ULL <<  6)
+#define           H3_EV_TX_SETTINGS   (1ULL <<  7)
 	{ .mask = H3_EV_TX_SETTINGS,  .name = "tx_settings", .desc = "transmission of H3 SETTINGS frame" },
-#define           H3_EV_H3S_NEW       (1ULL <<  7)
+#define           H3_EV_H3S_NEW       (1ULL <<  8)
 	{ .mask = H3_EV_H3S_NEW,      .name = "h3s_new",     .desc = "new H3 stream" },
-#define           H3_EV_H3S_END       (1ULL <<  8)
+#define           H3_EV_H3S_END       (1ULL <<  9)
 	{ .mask = H3_EV_H3S_END,      .name = "h3s_end",     .desc = "H3 stream terminated" },
-#define           H3_EV_H3C_END       (1ULL <<  9)
+#define           H3_EV_H3C_END       (1ULL <<  10)
 	{ .mask = H3_EV_H3C_END,      .name = "h3c_end",     .desc = "H3 connection terminated" },
 	{ }
 };
@@ -559,7 +561,7 @@ static ssize_t h3_headers_to_htx(struct qcs *qcs, const struct buffer *buf,
 		goto out;
 	}
 
-	if (!qcs_get_buf(qcs, &htx_buf)) {
+	if (!b_alloc(&htx_buf)) {
 		TRACE_ERROR("HTX buffer alloc failure", H3_EV_RX_FRAME|H3_EV_RX_HDR, qcs->qcc->conn, qcs);
 		h3c->err = H3_INTERNAL_ERROR;
 		len = -1;
@@ -938,7 +940,7 @@ static ssize_t h3_trailers_to_htx(struct qcs *qcs, const struct buffer *buf,
 		goto out;
 	}
 
-	if (!(appbuf = qcs_get_buf(qcs, &qcs->rx.app_buf))) {
+	if (!(appbuf = qcc_get_stream_rxbuf(qcs))) {
 		TRACE_ERROR("HTX buffer alloc failure", H3_EV_RX_FRAME|H3_EV_RX_HDR, qcs->qcc->conn, qcs);
 		h3c->err = H3_INTERNAL_ERROR;
 		len = -1;
@@ -1070,7 +1072,7 @@ static ssize_t h3_data_to_htx(struct qcs *qcs, const struct buffer *buf,
 
 	TRACE_ENTER(H3_EV_RX_FRAME|H3_EV_RX_DATA, qcs->qcc->conn, qcs);
 
-	if (!(appbuf = qcs_get_buf(qcs, &qcs->rx.app_buf))) {
+	if (!(appbuf = qcc_get_stream_rxbuf(qcs))) {
 		TRACE_ERROR("data buffer alloc failure", H3_EV_RX_FRAME|H3_EV_RX_DATA, qcs->qcc->conn, qcs);
 		h3c->err = H3_INTERNAL_ERROR;
 		len = -1;
@@ -1205,12 +1207,12 @@ static ssize_t h3_parse_settings_frm(struct h3c *h3c, const struct buffer *buf,
 	return ret;
 }
 
-/* Decode <qcs> remotely initiated bidi-stream. <fin> must be set to indicate
- * that we received the last data of the stream.
+/* Transcode HTTP/3 payload received in buffer <b> to HTX data for stream
+ * <qcs>. If <fin> is set, it indicates that no more data will arrive after.
  *
  * Returns 0 on success else non-zero.
  */
-static ssize_t h3_decode_qcs(struct qcs *qcs, struct buffer *b, int fin)
+static ssize_t h3_rcv_buf(struct qcs *qcs, struct buffer *b, int fin)
 {
 	struct h3s *h3s = qcs->ctx;
 	struct h3c *h3c = h3s->h3c;
@@ -1261,7 +1263,7 @@ static ssize_t h3_decode_qcs(struct qcs *qcs, struct buffer *b, int fin)
 		struct htx *htx;
 
 		TRACE_PROTO("received FIN without data", H3_EV_RX_FRAME, qcs->qcc->conn, qcs);
-		if (!(appbuf = qcs_get_buf(qcs, &qcs->rx.app_buf))) {
+		if (!(appbuf = qcc_get_stream_rxbuf(qcs))) {
 			TRACE_ERROR("data buffer alloc failure", H3_EV_RX_FRAME, qcs->qcc->conn, qcs);
 			h3c->err = H3_INTERNAL_ERROR;
 			goto err;
@@ -1415,17 +1417,6 @@ static ssize_t h3_decode_qcs(struct qcs *qcs, struct buffer *b, int fin)
 	return -1;
 }
 
-/* Returns buffer for data sending.
- * May be NULL if the allocation failed.
- */
-static struct buffer *mux_get_buf(struct qcs *qcs)
-{
-	if (!b_size(&qcs->tx.buf))
-		b_alloc(&qcs->tx.buf);
-
-	return &qcs->tx.buf;
-}
-
 /* Function used to emit stream data from <qcs> control uni-stream */
 static int h3_control_send(struct qcs *qcs, void *ctx)
 {
@@ -1435,7 +1426,7 @@ static int h3_control_send(struct qcs *qcs, void *ctx)
 	struct buffer pos, *res;
 	size_t frm_len;
 
-	TRACE_ENTER(H3_EV_TX_SETTINGS, qcs->qcc->conn, qcs);
+	TRACE_ENTER(H3_EV_TX_FRAME|H3_EV_TX_SETTINGS, qcs->qcc->conn, qcs);
 
 	BUG_ON_HOT(h3c->flags & H3_CF_SETTINGS_SENT);
 
@@ -1464,7 +1455,7 @@ static int h3_control_send(struct qcs *qcs, void *ctx)
 		b_quic_enc_int(&pos, h3_settings_max_field_section_size, 0);
 	}
 
-	res = mux_get_buf(qcs);
+	res = qcc_get_stream_txbuf(qcs);
 	if (b_room(res) < b_data(&pos)) {
 		// TODO the mux should be put in blocked state, with
 		// the stream in state waiting for settings to be sent
@@ -1478,7 +1469,7 @@ static int h3_control_send(struct qcs *qcs, void *ctx)
 		h3c->flags |= H3_CF_SETTINGS_SENT;
 	}
 
-	TRACE_LEAVE(H3_EV_TX_SETTINGS, qcs->qcc->conn, qcs);
+	TRACE_LEAVE(H3_EV_TX_FRAME|H3_EV_TX_SETTINGS, qcs->qcc->conn, qcs);
 	return ret;
 }
 
@@ -1496,7 +1487,7 @@ static int h3_resp_headers_send(struct qcs *qcs, struct htx *htx)
 	int hdr;
 	int status = 0;
 
-	TRACE_ENTER(H3_EV_TX_HDR, qcs->qcc->conn, qcs);
+	TRACE_ENTER(H3_EV_TX_FRAME|H3_EV_TX_HDR, qcs->qcc->conn, qcs);
 
 	sl = NULL;
 	hdr = 0;
@@ -1533,7 +1524,8 @@ static int h3_resp_headers_send(struct qcs *qcs, struct htx *htx)
 
 	list[hdr].n = ist("");
 
-	res = mux_get_buf(qcs);
+	if (!(res = qcc_get_stream_txbuf(qcs)))
+		goto err;
 
 	/* At least 5 bytes to store frame type + length as a varint max size */
 	if (b_room(res) < 5)
@@ -1544,6 +1536,8 @@ static int h3_resp_headers_send(struct qcs *qcs, struct htx *htx)
 	/* Start the headers after frame type + length */
 	headers_buf = b_make(b_head(res) + 5, b_size(res) - 5, 0, 0);
 
+	TRACE_DATA("encoding HEADERS frame", H3_EV_TX_FRAME|H3_EV_TX_HDR,
+	           qcs->qcc->conn, qcs);
 	if (qpack_encode_field_section_line(&headers_buf))
 		ABORT_NOW();
 	if (qpack_encode_int_status(&headers_buf, status))
@@ -1600,11 +1594,11 @@ static int h3_resp_headers_send(struct qcs *qcs, struct htx *htx)
 			break;
 	}
 
-	TRACE_LEAVE(H3_EV_TX_HDR, qcs->qcc->conn, qcs);
+	TRACE_LEAVE(H3_EV_TX_FRAME|H3_EV_TX_HDR, qcs->qcc->conn, qcs);
 	return ret;
 
  err:
-	TRACE_DEVEL("leaving on error", H3_EV_TX_HDR, qcs->qcc->conn, qcs);
+	TRACE_DEVEL("leaving on error", H3_EV_TX_FRAME|H3_EV_TX_HDR, qcs->qcc->conn, qcs);
 	return 0;
 }
 
@@ -1629,7 +1623,7 @@ static int h3_resp_trailers_send(struct qcs *qcs, struct htx *htx)
 	int ret = 0;
 	int hdr;
 
-	TRACE_ENTER(H3_EV_TX_HDR, qcs->qcc->conn, qcs);
+	TRACE_ENTER(H3_EV_TX_FRAME|H3_EV_TX_HDR, qcs->qcc->conn, qcs);
 
 	hdr = 0;
 	for (blk = htx_get_head_blk(htx); blk; blk = htx_get_next_blk(htx, blk)) {
@@ -1649,7 +1643,7 @@ static int h3_resp_trailers_send(struct qcs *qcs, struct htx *htx)
 			hdr++;
 		}
 		else {
-			TRACE_ERROR("unexpected HTX block", H3_EV_TX_HDR, qcs->qcc->conn, qcs);
+			TRACE_ERROR("unexpected HTX block", H3_EV_TX_FRAME|H3_EV_TX_HDR, qcs->qcc->conn, qcs);
 			goto err;
 		}
 	}
@@ -1658,12 +1652,13 @@ static int h3_resp_trailers_send(struct qcs *qcs, struct htx *htx)
 		/* No headers encoded here so no need to generate a H3 HEADERS
 		 * frame. Mux will send an empty QUIC STREAM frame with FIN.
 		 */
-		TRACE_DATA("skipping trailer", H3_EV_TX_HDR, qcs->qcc->conn, qcs);
+		TRACE_DATA("skipping trailer", H3_EV_TX_FRAME|H3_EV_TX_HDR, qcs->qcc->conn, qcs);
 		goto end;
 	}
 	list[hdr].n = ist("");
 
-	res = mux_get_buf(qcs);
+	if (!(res = qcc_get_stream_txbuf(qcs)))
+		goto err;
 
 	/* At least 9 bytes to store frame type + length as a varint max size */
 	if (b_room(res) < 9) {
@@ -1709,13 +1704,15 @@ static int h3_resp_trailers_send(struct qcs *qcs, struct htx *htx)
 		/* No headers encoded here so no need to generate a H3 HEADERS
 		 * frame. Mux will send an empty QUIC STREAM frame with FIN.
 		 */
-		TRACE_DATA("skipping trailer", H3_EV_TX_HDR, qcs->qcc->conn, qcs);
+		TRACE_DATA("skipping trailer", H3_EV_TX_FRAME|H3_EV_TX_HDR, qcs->qcc->conn, qcs);
 		goto end;
 	}
 
 	/* Now that all headers are encoded, we are certain that res buffer is
 	 * big enough.
 	 */
+	TRACE_DATA("encoding TRAILERS frame", H3_EV_TX_FRAME|H3_EV_TX_HDR,
+	           qcs->qcc->conn, qcs);
 	b_putchr(res, 0x01); /* h3 HEADERS frame type */
 	if (!b_quic_enc_int(res, b_data(&headers_buf), 8))
 		ABORT_NOW();
@@ -1732,18 +1729,25 @@ static int h3_resp_trailers_send(struct qcs *qcs, struct htx *htx)
 			break;
 	}
 
-	TRACE_LEAVE(H3_EV_TX_HDR, qcs->qcc->conn, qcs);
+	TRACE_LEAVE(H3_EV_TX_FRAME|H3_EV_TX_HDR, qcs->qcc->conn, qcs);
 	return ret;
 
  err:
-	TRACE_DEVEL("leaving on error", H3_EV_TX_HDR, qcs->qcc->conn, qcs);
+	TRACE_DEVEL("leaving on error", H3_EV_TX_FRAME|H3_EV_TX_HDR, qcs->qcc->conn, qcs);
 	return 0;
 }
 
-/* Returns the total of bytes sent. */
-static int h3_resp_data_send(struct qcs *qcs, struct buffer *buf, size_t count)
+/* Convert a series of HTX data blocks from <htx> buffer of size <count> into
+ * HTTP/3 frames encoded into <qcs> Tx buffer. The caller must also specify the
+ * underlying HTX area via <buf> as this will be used if zero-copy can be
+ * performed.
+ *
+ * Returns the total bytes of encoded HTTP/3 payload. This corresponds to the
+ * total bytes of HTX block removed.
+ */
+static int h3_resp_data_send(struct qcs *qcs, struct htx *htx,
+                             struct buffer *buf, size_t count)
 {
-	struct htx *htx;
 	struct buffer outbuf;
 	struct buffer *res;
 	size_t total = 0;
@@ -1751,9 +1755,7 @@ static int h3_resp_data_send(struct qcs *qcs, struct buffer *buf, size_t count)
 	struct htx_blk *blk;
 	enum htx_blk_type type;
 
-	TRACE_ENTER(H3_EV_TX_DATA, qcs->qcc->conn, qcs);
-
-	htx = htx_from_buf(buf);
+	TRACE_ENTER(H3_EV_TX_FRAME|H3_EV_TX_DATA, qcs->qcc->conn, qcs);
 
  new_frame:
 	if (!count || htx_is_empty(htx))
@@ -1769,26 +1771,36 @@ static int h3_resp_data_send(struct qcs *qcs, struct buffer *buf, size_t count)
 	if (type != HTX_BLK_DATA)
 		goto end;
 
-	res = mux_get_buf(qcs);
+	if (!(res = qcc_get_stream_txbuf(qcs))) {
+		/* TODO */
+	}
 
+	/* If HTX contains only one DATA block, try to exchange it with MUX
+	 * buffer to perform zero-copy. This is only achievable if MUX buffer
+	 * is currently empty.
+	 */
 	if (unlikely(fsize == count &&
-		     !b_data(res) &&
-		     htx_nbblks(htx) == 1 && type == HTX_BLK_DATA)) {
+	             !b_data(res) &&
+	             htx_nbblks(htx) == 1 && type == HTX_BLK_DATA)) {
 		void *old_area = res->area;
 
-		/* map an H2 frame to the HTX block so that we can put the
-		 * frame header there.
-		 */
-		*res = b_make(buf->area, buf->size, sizeof(struct htx) + blk->addr - hsize, fsize + hsize);
-		outbuf = b_make(b_head(res), hsize, 0, 0);
-		b_putchr(&outbuf, 0x00); /* h3 frame type = DATA */
-		b_quic_enc_int(&outbuf, fsize, QUIC_VARINT_MAX_SIZE); /* h3 frame length */
+		TRACE_DATA("perform zero-copy DATA transfer",
+		           H3_EV_TX_FRAME|H3_EV_TX_DATA, qcs->qcc->conn, qcs);
 
-		/* and exchange with our old area */
+		/* remap MUX buffer to HTX area, keep an offset for H3 header. */
+		*res = b_make(buf->area, buf->size,
+		              sizeof(struct htx) + blk->addr - hsize, 0);
+
+		/* write H3 header frame before old HTX block. */
+		b_putchr(res, 0x00); /* h3 frame type = DATA */
+		b_quic_enc_int(res, fsize, QUIC_VARINT_MAX_SIZE); /* h3 frame length */
+		b_add(res, fsize);
+
+		/* assign old MUX area to HTX buffer. */
 		buf->area = old_area;
 		buf->data = buf->head = 0;
 		total += fsize;
-		fsize = 0;
+
 		goto end;
 	}
 
@@ -1816,6 +1828,8 @@ static int h3_resp_data_send(struct qcs *qcs, struct buffer *buf, size_t count)
 		fsize = b_size(&outbuf) - hsize;
 	BUG_ON(fsize <= 0);
 
+	TRACE_DATA("encoding DATA frame", H3_EV_TX_FRAME|H3_EV_TX_DATA,
+	           qcs->qcc->conn, qcs);
 	b_putchr(&outbuf, 0x00);        /* h3 frame type = DATA */
 	b_quic_enc_int(&outbuf, fsize, 0); /* h3 frame length */
 
@@ -1833,7 +1847,7 @@ static int h3_resp_data_send(struct qcs *qcs, struct buffer *buf, size_t count)
 	goto new_frame;
 
  end:
-	TRACE_LEAVE(H3_EV_TX_DATA, qcs->qcc->conn, qcs);
+	TRACE_LEAVE(H3_EV_TX_FRAME|H3_EV_TX_DATA, qcs->qcc->conn, qcs);
 	return total;
 }
 
@@ -1850,9 +1864,6 @@ static size_t h3_snd_buf(struct qcs *qcs, struct buffer *buf, size_t count)
 	h3_debug_printf(stderr, "%s\n", __func__);
 
 	htx = htx_from_buf(buf);
-
-	if (htx->extra && htx->extra == HTX_UNKOWN_PAYLOAD_LENGTH)
-		qcs->flags |= QC_SF_UNKNOWN_PL_LENGTH;
 
 	while (count && !htx_is_empty(htx) && !(qcs->flags & QC_SF_BLK_MROOM)) {
 		idx = htx_get_head(htx);
@@ -1876,9 +1887,11 @@ static size_t h3_snd_buf(struct qcs *qcs, struct buffer *buf, size_t count)
 			break;
 
 		case HTX_BLK_DATA:
-			ret = h3_resp_data_send(qcs, buf, count);
+			ret = h3_resp_data_send(qcs, htx, buf, count);
 			if (ret > 0) {
+				/* Reload HTX. This is necessary if 0-copy was performed. */
 				htx = htx_from_buf(buf);
+
 				total += ret;
 				count -= ret;
 				if (ret < bsize)
@@ -1944,8 +1957,9 @@ static size_t h3_nego_ff(struct qcs *qcs, size_t count)
 
 	h3_debug_printf(stderr, "%s\n", __func__);
 
-	/* FIXME: no check on ALLOC ? */
-	res = mux_get_buf(qcs);
+	if (!(res = qcc_get_stream_txbuf(qcs))) {
+		/* TODO */
+	}
 
 	/* h3 DATA headers : 1-byte frame type + varint frame length */
 	hsize = 1 + QUIC_VARINT_MAX_SIZE;
@@ -1986,6 +2000,8 @@ static size_t h3_done_ff(struct qcs *qcs)
 	h3_debug_printf(stderr, "%s\n", __func__);
 
 	if (qcs->sd->iobuf.data) {
+		TRACE_DATA("encoding DATA frame (fast forward)",
+		           H3_EV_TX_FRAME|H3_EV_TX_DATA, qcs->qcc->conn, qcs);
 		b_sub(qcs->sd->iobuf.buf, qcs->sd->iobuf.data);
 		b_putchr(qcs->sd->iobuf.buf, 0x00); /* h3 frame type = DATA */
 		b_quic_enc_int(qcs->sd->iobuf.buf, qcs->sd->iobuf.data, QUIC_VARINT_MAX_SIZE); /* h3 frame length */
@@ -2108,25 +2124,6 @@ static void h3_detach(struct qcs *qcs)
 	TRACE_LEAVE(H3_EV_H3S_END, qcs->qcc->conn, qcs);
 }
 
-/* Initialize H3 control stream and prepare SETTINGS emission.
- *
- * Returns 0 on success else non-zero.
- */
-static int h3_finalize(void *ctx)
-{
-	struct h3c *h3c = ctx;
-	struct qcs *qcs;
-
-	qcs = qcc_init_stream_local(h3c->qcc, 0);
-	if (!qcs)
-		return 1;
-
-	h3_control_send(qcs, h3c);
-	h3c->ctrl_strm = qcs;
-
-	return 0;
-}
-
 /* Generate a GOAWAY frame for <h3c> connection on the control stream.
  *
  * Returns 0 on success else non-zero.
@@ -2151,7 +2148,7 @@ static int h3_send_goaway(struct h3c *h3c)
 	b_quic_enc_int(&pos, frm_len, 0);
 	b_quic_enc_int(&pos, h3c->id_goaway, 0);
 
-	res = mux_get_buf(qcs);
+	res = qcc_get_stream_txbuf(qcs);
 	if (!res || b_room(res) < b_data(&pos)) {
 		/* Do not try forcefully to emit GOAWAY if no space left. */
 		TRACE_ERROR("cannot send GOAWAY", H3_EV_H3C_END, h3c->qcc->conn, qcs);
@@ -2202,6 +2199,25 @@ static int h3_init(struct qcc *qcc)
 	return 1;
 
  fail_no_h3:
+	return 0;
+}
+
+/* Initialize H3 control stream and prepare SETTINGS emission.
+ *
+ * Returns 0 on success else non-zero.
+ */
+static int h3_finalize(void *ctx)
+{
+	struct h3c *h3c = ctx;
+	struct qcs *qcs;
+
+	qcs = qcc_init_stream_local(h3c->qcc, 0);
+	if (!qcs)
+		return 1;
+
+	h3_control_send(qcs, h3c);
+	h3c->ctrl_strm = qcs;
+
 	return 0;
 }
 
@@ -2292,14 +2308,14 @@ static void h3_trace(enum trace_level level, uint64_t mask,
 /* HTTP/3 application layer operations */
 const struct qcc_app_ops h3_ops = {
 	.init        = h3_init,
+	.finalize    = h3_finalize,
 	.attach      = h3_attach,
-	.decode_qcs  = h3_decode_qcs,
+	.rcv_buf     = h3_rcv_buf,
 	.snd_buf     = h3_snd_buf,
 	.nego_ff     = h3_nego_ff,
 	.done_ff     = h3_done_ff,
 	.close       = h3_close,
 	.detach      = h3_detach,
-	.finalize    = h3_finalize,
 	.shutdown    = h3_shutdown,
 	.inc_err_cnt = h3_stats_inc_err_cnt,
 	.release     = h3_release,

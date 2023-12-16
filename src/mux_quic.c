@@ -423,15 +423,6 @@ int qcs_is_close_remote(struct qcs *qcs)
 	return qcs->st == QC_SS_HREM || qcs->st == QC_SS_CLO;
 }
 
-/* Allocate if needed buffer <bptr> for stream <qcs>.
- *
- * Returns the buffer instance or NULL on allocation failure.
- */
-struct buffer *qcs_get_buf(struct qcs *qcs, struct buffer *bptr)
-{
-	return b_alloc(bptr);
-}
-
 /* Allocate if needed buffer <ncbuf> for stream <qcs>.
  *
  * Returns the buffer instance or NULL on allocation failure.
@@ -690,6 +681,19 @@ struct stconn *qcs_attach_sc(struct qcs *qcs, struct buffer *buf, char fin)
 		se_fl_set(qcs->sd, SE_FL_EOI);
 	}
 
+	/* A QCS can be already locally closed before stream layer
+	 * instantiation. This notably happens if STOP_SENDING was the first
+	 * frame received for this instance. In this case, an error is
+	 * immediately to the stream layer to prevent transmission.
+	 *
+	 * TODO it could be better to not instantiate at all the stream layer.
+	 * However, extra care is required to ensure QCS instance is released.
+	 */
+	if (unlikely(qcs_is_close_local(qcs) || (qcs->flags & QC_SF_TO_RESET))) {
+		TRACE_STATE("report early error", QMUX_EV_STRM_RECV, qcc->conn, qcs);
+		se_fl_set_error(qcs->sd);
+	}
+
 	return qcs->sd->sc;
 }
 
@@ -883,7 +887,7 @@ static int qcc_decode_qcs(struct qcc *qcc, struct qcs *qcs)
 		fin = 1;
 
 	if (!(qcs->flags & QC_SF_READ_ABORTED)) {
-		ret = qcc->app_ops->decode_qcs(qcs, &b, fin);
+		ret = qcc->app_ops->rcv_buf(qcs, &b, fin);
 		if (ret < 0) {
 			TRACE_ERROR("decoding error", QMUX_EV_QCS_RECV, qcc->conn, qcs);
 			goto err;
@@ -912,6 +916,24 @@ static int qcc_decode_qcs(struct qcc *qcc, struct qcs *qcs)
  err:
 	TRACE_LEAVE(QMUX_EV_QCS_RECV, qcc->conn, qcs);
 	return 1;
+}
+
+/* Allocate if needed and retrieve <qcs> stream buffer for data reception.
+ *
+ * Returns buffer pointer. May be NULL on allocation failure.
+ */
+struct buffer *qcc_get_stream_rxbuf(struct qcs *qcs)
+{
+	return b_alloc(&qcs->rx.app_buf);
+}
+
+/* Allocate if needed and retrieve <qcs> stream buffer for data emission.
+ *
+ * Returns buffer pointer. May be NULL on allocation failure.
+ */
+struct buffer *qcc_get_stream_txbuf(struct qcs *qcs)
+{
+	return b_alloc(&qcs->tx.buf);
 }
 
 /* Prepare for the emission of RESET_STREAM on <qcs> with error code <err>. */
@@ -1510,7 +1532,7 @@ static int qcs_xfer_data(struct qcs *qcs, struct buffer *out, struct buffer *in)
 
 	TRACE_ENTER(QMUX_EV_QCS_SEND, qcc->conn, qcs);
 
-	if (!qcs_get_buf(qcs, out)) {
+	if (!b_alloc(out)) {
 		TRACE_ERROR("buffer alloc failure", QMUX_EV_QCS_SEND, qcc->conn, qcs);
 		goto err;
 	}
@@ -2809,7 +2831,8 @@ static size_t qmux_strm_snd_buf(struct stconn *sc, struct buffer *buf,
 }
 
 
-static size_t qmux_nego_ff(struct stconn *sc, struct buffer *input, size_t count, unsigned int may_splice)
+static size_t qmux_strm_nego_ff(struct stconn *sc, struct buffer *input,
+                                size_t count, unsigned int may_splice)
 {
 	struct qcs *qcs = __sc_mux_strm(sc);
 	size_t ret = 0;
@@ -2860,7 +2883,7 @@ static size_t qmux_nego_ff(struct stconn *sc, struct buffer *input, size_t count
 	return ret;
 }
 
-static size_t qmux_done_ff(struct stconn *sc)
+static size_t qmux_strm_done_ff(struct stconn *sc)
 {
 	struct qcs *qcs = __sc_mux_strm(sc);
 	struct qcc *qcc = qcs->qcc;
@@ -2869,8 +2892,10 @@ static size_t qmux_done_ff(struct stconn *sc)
 
 	TRACE_ENTER(QMUX_EV_STRM_SEND, qcs->qcc->conn, qcs);
 
-	if (sd->iobuf.flags & IOBUF_FL_EOI)
+	if (sd->iobuf.flags & IOBUF_FL_EOI) {
+		TRACE_STATE("reached stream fin", QMUX_EV_STRM_SEND, qcs->qcc->conn, qcs);
 		qcs->flags |= QC_SF_FIN_STREAM;
+	}
 
 	if (!(qcs->flags & QC_SF_FIN_STREAM) && !sd->iobuf.data)
 		goto end;
@@ -2889,7 +2914,7 @@ static size_t qmux_done_ff(struct stconn *sc)
 	return total;
 }
 
-static int qmux_resume_ff(struct stconn *sc, unsigned int flags)
+static int qmux_strm_resume_ff(struct stconn *sc, unsigned int flags)
 {
 	return 0;
 }
@@ -3030,9 +3055,9 @@ static const struct mux_ops qmux_ops = {
 	.detach      = qmux_strm_detach,
 	.rcv_buf     = qmux_strm_rcv_buf,
 	.snd_buf     = qmux_strm_snd_buf,
-	.nego_fastfwd = qmux_nego_ff,
-	.done_fastfwd = qmux_done_ff,
-	.resume_fastfwd = qmux_resume_ff,
+	.nego_fastfwd = qmux_strm_nego_ff,
+	.done_fastfwd = qmux_strm_done_ff,
+	.resume_fastfwd = qmux_strm_resume_ff,
 	.subscribe   = qmux_strm_subscribe,
 	.unsubscribe = qmux_strm_unsubscribe,
 	.wake        = qmux_wake,

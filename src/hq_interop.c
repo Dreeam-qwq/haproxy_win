@@ -8,8 +8,10 @@
 #include <haproxy/http.h>
 #include <haproxy/mux_quic.h>
 #include <haproxy/qmux_http.h>
+#include <haproxy/qmux_trace.h>
+#include <haproxy/trace.h>
 
-static ssize_t hq_interop_decode_qcs(struct qcs *qcs, struct buffer *b, int fin)
+static ssize_t hq_interop_rcv_buf(struct qcs *qcs, struct buffer *b, int fin)
 {
 	struct htx *htx;
 	struct htx_sl *sl;
@@ -83,14 +85,6 @@ static ssize_t hq_interop_decode_qcs(struct qcs *qcs, struct buffer *b, int fin)
 	return b_data(b);
 }
 
-static struct buffer *mux_get_buf(struct qcs *qcs)
-{
-	if (!b_size(&qcs->tx.buf))
-		b_alloc(&qcs->tx.buf);
-
-	return &qcs->tx.buf;
-}
-
 static size_t hq_interop_snd_buf(struct qcs *qcs, struct buffer *buf,
                                  size_t count)
 {
@@ -102,13 +96,10 @@ static size_t hq_interop_snd_buf(struct qcs *qcs, struct buffer *buf,
 	struct buffer *res, outbuf;
 	size_t total = 0;
 
-	res = mux_get_buf(qcs);
+	res = qcc_get_stream_txbuf(qcs);
 	outbuf = b_make(b_tail(res), b_contig_space(res), 0, 0);
 
 	htx = htx_from_buf(buf);
-
-	if (htx->extra && htx->extra == HTX_UNKOWN_PAYLOAD_LENGTH)
-		qcs->flags |= QC_SF_UNKNOWN_PL_LENGTH;
 
 	while (count && !htx_is_empty(htx) && !(qcs->flags & QC_SF_BLK_MROOM)) {
 		/* Not implemented : QUIC on backend side */
@@ -121,6 +112,28 @@ static size_t hq_interop_snd_buf(struct qcs *qcs, struct buffer *buf,
 
 		switch (btype) {
 		case HTX_BLK_DATA:
+			if (unlikely(fsize == count &&
+				     !b_data(res) &&
+				     htx_nbblks(htx) == 1 && btype == HTX_BLK_DATA)) {
+				void *old_area = res->area;
+
+				TRACE_DATA("perform zero-copy DATA transfer", QMUX_EV_STRM_SEND,
+					   qcs->qcc->conn, qcs);
+
+				/* remap MUX buffer to HTX area */
+				*res = b_make(buf->area, buf->size,
+					      sizeof(struct htx) + blk->addr, fsize);
+
+				/* assign old MUX area to HTX buffer. */
+				buf->area = old_area;
+				buf->data = buf->head = 0;
+				total += fsize;
+
+				/* reload HTX with empty buffer. */
+				*htx = *htx_from_buf(buf);
+				goto end;
+			}
+
 			if (fsize > count)
 				fsize = count;
 
@@ -161,6 +174,37 @@ static size_t hq_interop_snd_buf(struct qcs *qcs, struct buffer *buf,
 	return total;
 }
 
+static size_t hq_interop_nego_ff(struct qcs *qcs, size_t count)
+{
+	struct buffer *res = qcc_get_stream_txbuf(qcs);
+
+	if (!b_room(res)) {
+		qcs->flags |= QC_SF_BLK_MROOM;
+		qcs->sd->iobuf.flags |= IOBUF_FL_FF_BLOCKED;
+		goto end;
+	}
+
+	/* No header required for HTTP/0.9, no need to reserve an offset. */
+	qcs->sd->iobuf.buf = res;
+	qcs->sd->iobuf.offset = 0;
+	qcs->sd->iobuf.data = 0;
+
+ end:
+	return MIN(b_contig_space(res), count);
+}
+
+static size_t hq_interop_done_ff(struct qcs *qcs)
+{
+	const size_t ret = qcs->sd->iobuf.data;
+
+	/* No header required for HTTP/0.9, simply mark ff as done. */
+	qcs->sd->iobuf.buf = NULL;
+	qcs->sd->iobuf.offset = 0;
+	qcs->sd->iobuf.data = 0;
+
+	return ret;
+}
+
 static int hq_interop_attach(struct qcs *qcs, void *conn_ctx)
 {
 	qcs_wait_http_req(qcs);
@@ -168,7 +212,9 @@ static int hq_interop_attach(struct qcs *qcs, void *conn_ctx)
 }
 
 const struct qcc_app_ops hq_interop_ops = {
-	.decode_qcs = hq_interop_decode_qcs,
+	.rcv_buf    = hq_interop_rcv_buf,
 	.snd_buf    = hq_interop_snd_buf,
+	.nego_ff    = hq_interop_nego_ff,
+	.done_ff    = hq_interop_done_ff,
 	.attach     = hq_interop_attach,
 };

@@ -220,8 +220,8 @@ const struct promex_metric promex_st_metrics[ST_F_TOTAL_FIELDS] = {
 	[ST_F_WREDIS]               = { .n = IST("redispatch_warnings_total"),        .type = PROMEX_MT_COUNTER,  .flags = (                                               PROMEX_FL_BACK_METRIC | PROMEX_FL_SRV_METRIC) },
 	[ST_F_STATUS]               = { .n = IST("status"),                           .type = PROMEX_MT_GAUGE,    .flags = (PROMEX_FL_FRONT_METRIC | PROMEX_FL_LI_METRIC | PROMEX_FL_BACK_METRIC | PROMEX_FL_SRV_METRIC) },
 	[ST_F_WEIGHT]               = { .n = IST("weight"),                           .type = PROMEX_MT_GAUGE,    .flags = (                                               PROMEX_FL_BACK_METRIC | PROMEX_FL_SRV_METRIC) },
-	[ST_F_ACT]                  = { .n = IST("active_servers"),                   .type = PROMEX_MT_GAUGE,    .flags = (                                               PROMEX_FL_BACK_METRIC                       ) },
-	[ST_F_BCK]                  = { .n = IST("backup_servers"),                   .type = PROMEX_MT_GAUGE,    .flags = (                                               PROMEX_FL_BACK_METRIC                       ) },
+	[ST_F_ACT]                  = { .n = IST("active_servers"),                   .type = PROMEX_MT_GAUGE,    .flags = (                                               PROMEX_FL_BACK_METRIC | PROMEX_FL_SRV_METRIC) },
+	[ST_F_BCK]                  = { .n = IST("backup_servers"),                   .type = PROMEX_MT_GAUGE,    .flags = (                                               PROMEX_FL_BACK_METRIC | PROMEX_FL_SRV_METRIC) },
 	[ST_F_CHKFAIL]              = { .n = IST("check_failures_total"),             .type = PROMEX_MT_COUNTER,  .flags = (                                                                       PROMEX_FL_SRV_METRIC) },
 	[ST_F_CHKDOWN]              = { .n = IST("check_up_down_total"),              .type = PROMEX_MT_COUNTER,  .flags = (                                               PROMEX_FL_BACK_METRIC | PROMEX_FL_SRV_METRIC) },
 	[ST_F_LASTCHG]              = { .n = IST("check_last_change_seconds"),        .type = PROMEX_MT_GAUGE,    .flags = (                                               PROMEX_FL_BACK_METRIC | PROMEX_FL_SRV_METRIC) },
@@ -304,6 +304,24 @@ const struct promex_metric promex_st_metrics[ST_F_TOTAL_FIELDS] = {
 	[ST_F_AGG_SRV_CHECK_STATUS] = { .n = IST("agg_server_check_status"),	      .type = PROMEX_MT_GAUGE,    .flags = (                                               PROMEX_FL_BACK_METRIC                       ) },
 	[ST_F_AGG_SRV_STATUS ]      = { .n = IST("agg_server_status"),	              .type = PROMEX_MT_GAUGE,    .flags = (                                               PROMEX_FL_BACK_METRIC                       ) },
 	[ST_F_AGG_CHECK_STATUS]     = { .n = IST("agg_check_status"),	              .type = PROMEX_MT_GAUGE,    .flags = (                                               PROMEX_FL_BACK_METRIC                       ) },
+};
+
+/* Specialized frontend metric names, to override default ones */
+const struct ist promex_st_front_metrics_names[ST_F_TOTAL_FIELDS] = {
+};
+
+/* Specialized bakcend metric names, to override default ones */
+const struct ist promex_st_back_metrics_names[ST_F_TOTAL_FIELDS] = {
+};
+
+/* Specialized listener metric names, to override default ones */
+const struct ist promex_st_li_metrics_names[ST_F_TOTAL_FIELDS] = {
+};
+
+/* Specialized server metric names, to override default ones */
+const struct ist promex_st_srv_metrics_names[ST_F_TOTAL_FIELDS] = {
+	[ST_F_ACT] = IST("active"),
+	[ST_F_BCK] = IST("backup"),
 };
 
 /* Description of overridden stats fields */
@@ -490,8 +508,8 @@ static int promex_dump_metric_header(struct appctx *appctx, struct htx *htx,
  * success. Otherwise if <out> length exceeds <max>, it returns 0.
  */
 static int promex_dump_metric(struct appctx *appctx, struct htx *htx, struct ist prefix,
-			      const  struct promex_metric *metric, struct field *val,
-			      struct promex_label *labels, struct ist *out, size_t max)
+			      const struct ist n, const  struct promex_metric *metric,
+			      struct field *val, struct promex_label *labels, struct ist *out, size_t max)
 {
 	struct ist name = { .ptr = (char[PROMEX_MAX_NAME_LEN]){ 0 }, .len = 0 };
 	struct promex_ctx *ctx = appctx->svcctx;
@@ -502,7 +520,7 @@ static int promex_dump_metric(struct appctx *appctx, struct htx *htx, struct ist
 
 	/* Fill the metric name */
 	istcat(&name, prefix, PROMEX_MAX_NAME_LEN);
-	istcat(&name, metric->n, PROMEX_MAX_NAME_LEN);
+	istcat(&name, (isttest(n) ? n : metric->n), PROMEX_MAX_NAME_LEN);
 
 
 	if ((ctx->flags & PROMEX_FL_METRIC_HDR) &&
@@ -585,7 +603,7 @@ static int promex_dump_global_metrics(struct appctx *appctx, struct htx *htx)
 				val = info[ctx->field_num];
 		}
 
-		if (!promex_dump_metric(appctx, htx, prefix, &promex_global_metrics[ctx->field_num],
+		if (!promex_dump_metric(appctx, htx, prefix, IST_NULL, &promex_global_metrics[ctx->field_num],
 					&val, labels, &out, max))
 			goto full;
 
@@ -645,7 +663,9 @@ static int promex_dump_front_metrics(struct appctx *appctx, struct htx *htx)
 						labels[1].name = ist("state");
 						labels[1].value = promex_front_st[ctx->obj_state];
 						val = mkf_u32(FO_STATUS, state == ctx->obj_state);
-						if (!promex_dump_metric(appctx, htx, prefix, &promex_st_metrics[ctx->field_num],
+						if (!promex_dump_metric(appctx, htx, prefix,
+									promex_st_front_metrics_names[ctx->field_num],
+									&promex_st_metrics[ctx->field_num],
 									&val, labels, &out, max))
 							goto full;
 					}
@@ -683,7 +703,9 @@ static int promex_dump_front_metrics(struct appctx *appctx, struct htx *htx)
 					val = stats[ctx->field_num];
 			}
 
-			if (!promex_dump_metric(appctx, htx, prefix, &promex_st_metrics[ctx->field_num],
+			if (!promex_dump_metric(appctx, htx, prefix,
+						promex_st_front_metrics_names[ctx->field_num],
+						&promex_st_metrics[ctx->field_num],
 						&val, labels, &out, max))
 				goto full;
 		  next_px:
@@ -757,7 +779,9 @@ static int promex_dump_listener_metrics(struct appctx *appctx, struct htx *htx)
 							val = mkf_u32(FO_STATUS, status == ctx->obj_state);
 							labels[2].name = ist("state");
 							labels[2].value = ist(li_status_st[ctx->obj_state]);
-							if (!promex_dump_metric(appctx, htx, prefix, &promex_st_metrics[ctx->field_num],
+							if (!promex_dump_metric(appctx, htx, prefix,
+										promex_st_li_metrics_names[ctx->field_num],
+										&promex_st_metrics[ctx->field_num],
 										&val, labels, &out, max))
 								goto full;
 						}
@@ -768,6 +792,7 @@ static int promex_dump_listener_metrics(struct appctx *appctx, struct htx *htx)
 				}
 
 				if (!promex_dump_metric(appctx, htx, prefix,
+							promex_st_li_metrics_names[ctx->field_num],
 							&promex_st_metrics[ctx->field_num],
 							&val, labels, &out, max))
 					goto full;
@@ -852,7 +877,9 @@ static int promex_dump_back_metrics(struct appctx *appctx, struct htx *htx)
 						val = mkf_u32(FN_GAUGE, srv_state_count[ctx->obj_state]);
 						labels[1].name = ist("state");
 						labels[1].value = promex_srv_st[ctx->obj_state];
-						if (!promex_dump_metric(appctx, htx, prefix, &promex_st_metrics[ctx->field_num],
+						if (!promex_dump_metric(appctx, htx, prefix,
+									promex_st_back_metrics_names[ctx->field_num],
+									&promex_st_metrics[ctx->field_num],
 									&val, labels, &out, max))
 							goto full;
 					}
@@ -876,7 +903,9 @@ static int promex_dump_back_metrics(struct appctx *appctx, struct htx *htx)
 						check_state = get_check_status_info(ctx->obj_state);
 						labels[1].name = ist("state");
 						labels[1].value = ist(check_state);
-						if (!promex_dump_metric(appctx, htx, prefix, &promex_st_metrics[ctx->field_num],
+						if (!promex_dump_metric(appctx, htx, prefix,
+									promex_st_back_metrics_names[ctx->field_num],
+									&promex_st_metrics[ctx->field_num],
 									&val, labels, &out, max))
 							goto full;
 					}
@@ -888,7 +917,9 @@ static int promex_dump_back_metrics(struct appctx *appctx, struct htx *htx)
 						labels[1].name = ist("state");
 						labels[1].value = promex_back_st[ctx->obj_state];
 						val = mkf_u32(FO_STATUS, bkd_state == ctx->obj_state);
-						if (!promex_dump_metric(appctx, htx, prefix, &promex_st_metrics[ctx->field_num],
+						if (!promex_dump_metric(appctx, htx, prefix,
+									promex_st_back_metrics_names[ctx->field_num],
+									&promex_st_metrics[ctx->field_num],
 									&val, labels, &out, max))
 							goto full;
 					}
@@ -956,7 +987,9 @@ static int promex_dump_back_metrics(struct appctx *appctx, struct htx *htx)
 					val = stats[ctx->field_num];
 			}
 
-			if (!promex_dump_metric(appctx, htx, prefix, &promex_st_metrics[ctx->field_num],
+			if (!promex_dump_metric(appctx, htx, prefix,
+						promex_st_back_metrics_names[ctx->field_num],
+						&promex_st_metrics[ctx->field_num],
 						&val, labels, &out, max))
 				goto full;
 		  next_px:
@@ -1031,7 +1064,9 @@ static int promex_dump_srv_metrics(struct appctx *appctx, struct htx *htx)
 							val = mkf_u32(FO_STATUS, state == ctx->obj_state);
 							labels[2].name = ist("state");
 							labels[2].value = promex_srv_st[ctx->obj_state];
-							if (!promex_dump_metric(appctx, htx, prefix, &promex_st_metrics[ctx->field_num],
+							if (!promex_dump_metric(appctx, htx, prefix,
+										promex_st_srv_metrics_names[ctx->field_num],
+										&promex_st_metrics[ctx->field_num],
 										&val, labels, &out, max))
 								goto full;
 						}
@@ -1080,7 +1115,9 @@ static int promex_dump_srv_metrics(struct appctx *appctx, struct htx *htx)
 							check_state = get_check_status_info(ctx->obj_state);
 							labels[2].name = ist("state");
 							labels[2].value = ist(check_state);
-							if (!promex_dump_metric(appctx, htx, prefix, &promex_st_metrics[ctx->field_num],
+							if (!promex_dump_metric(appctx, htx, prefix,
+										promex_st_srv_metrics_names[ctx->field_num],
+										&promex_st_metrics[ctx->field_num],
 										&val, labels, &out, max))
 								goto full;
 						}
@@ -1121,7 +1158,9 @@ static int promex_dump_srv_metrics(struct appctx *appctx, struct htx *htx)
 						val = stats[ctx->field_num];
 				}
 
-				if (!promex_dump_metric(appctx, htx, prefix, &promex_st_metrics[ctx->field_num],
+				if (!promex_dump_metric(appctx, htx, prefix,
+							promex_st_srv_metrics_names[ctx->field_num],
+							&promex_st_metrics[ctx->field_num],
 							&val, labels, &out, max))
 					goto full;
 			  next_sv:
@@ -1189,7 +1228,7 @@ static int promex_dump_sticktable_metrics(struct appctx *appctx, struct htx *htx
 					goto next_px;
 			}
 
-			if (!promex_dump_metric(appctx, htx, prefix,
+			if (!promex_dump_metric(appctx, htx, prefix, IST_NULL,
 						&promex_sticktable_metrics[ctx->field_num],
 						&val, labels, &out, max))
 				goto full;

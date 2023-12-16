@@ -2046,7 +2046,7 @@ static size_t h1_make_reqline(struct h1s *h1s, struct h1m *h1m, struct htx *htx,
 	if (sl->flags & HTX_SL_F_XFER_ENC)
 		h1m->flags |= H1_MF_XFER_ENC;
 
-	if (sl->flags & HTX_SL_F_BODYLESS) {
+	if (sl->flags & HTX_SL_F_BODYLESS && !(h1m->flags & H1_MF_CLEN)) {
 		h1m->flags = (h1m->flags & ~H1_MF_CHNK) | H1_MF_CLEN;
 		h1s->flags |= H1S_F_HAVE_CLEN;
 	}
@@ -2392,7 +2392,7 @@ static size_t h1_make_eoh(struct h1s *h1s, struct h1m *h1m, struct htx *htx, siz
 			h1_adjust_case_outgoing_hdr(h1s, h1m, &n);
 		if (!h1_format_htx_hdr(n, v, &outbuf))
 			goto full;
-		TRACE_STATE("add \"Content-Length: chunked\"", H1_EV_TX_DATA|H1_EV_TX_HDRS, h1c->conn, h1s);
+		TRACE_STATE("add \"Content-Length: <LEN>\"", H1_EV_TX_DATA|H1_EV_TX_HDRS, h1c->conn, h1s);
 		h1s->flags |= H1S_F_HAVE_CLEN;
 	}
 
@@ -4633,6 +4633,7 @@ static int h1_fastfwd(struct stconn *sc, unsigned int count, unsigned int flags)
 	}
 
 	total += sdo->iobuf.data;
+	count -= sdo->iobuf.data;
 #if defined(USE_LINUX_SPLICE)
 	if (sdo->iobuf.pipe) {
 		/* Here, not data was xferred */

@@ -1547,6 +1547,10 @@ struct pat_ref *pat_ref_lookup(const char *reference)
 {
 	struct pat_ref *ref;
 
+	/* Skip file@ prefix, it is the default case. Can be mixed with ref omitting the prefix */
+	if (strlen(reference) > 5 && strncmp(reference, "file@", 5) == 0)
+		reference += 5;
+
 	list_for_each_entry(ref, &pattern_reference, list)
 		if (ref->reference && strcmp(reference, ref->reference) == 0)
 			return ref;
@@ -1602,17 +1606,25 @@ void pat_ref_delete_by_ptr(struct pat_ref *ref, struct pat_ref_elt *elt)
 	free(elt);
 }
 
-/* This function removes all the patterns matching the pointer <refelt> from
+/* This function removes the pattern matching the pointer <refelt> from
  * the reference and from each expr member of this reference. This function
  * returns 1 if the entry was found and deleted, otherwise zero.
+ *
+ * <refelt> is user input: it is provided as an ID and should never be
+ * dereferenced without making sure that it is valid.
  */
 int pat_ref_delete_by_id(struct pat_ref *ref, struct pat_ref_elt *refelt)
 {
-	int ret = !!refelt->node.node.leaf_p;
+	struct pat_ref_elt *elt, *safe;
 
-	ebmb_delete(&refelt->node);
-
-	return ret;
+	/* delete pattern from reference */
+	list_for_each_entry_safe(elt, safe, &ref->head, list) {
+		if (elt == refelt) {
+			pat_ref_delete_by_ptr(ref, elt);
+			return 1;
+		}
+	}
+	return 0;
 }
 
 /* This function removes all patterns matching <key> from the reference
@@ -1735,13 +1747,21 @@ static inline int pat_ref_set_elt(struct pat_ref *ref, struct pat_ref_elt *elt,
 /* This function modifies the sample of pat_ref_elt <refelt> in all expressions
  * found under <ref> to become <value>, after checking that <refelt> really
  * belongs to <ref>.
+ *
+ * <refelt> is user input: it is provided as an ID and should never be
+ * dereferenced without making sure that it is valid.
  */
 int pat_ref_set_by_id(struct pat_ref *ref, struct pat_ref_elt *refelt, const char *value, char **err)
 {
-	if (refelt->node.node.leaf_p) {
-		if (!pat_ref_set_elt(ref, refelt, value, err))
-			return 0;
-		return 1;
+	struct pat_ref_elt *elt;
+
+	/* Look for pattern in the reference. */
+	list_for_each_entry(elt, &ref->head, list) {
+		if (elt == refelt) {
+			if (!pat_ref_set_elt(ref, elt, value, err))
+				return 0;
+			return 1;
+		}
 	}
 
 	memprintf(err, "key or pattern not found");
@@ -1817,6 +1837,22 @@ struct pat_ref *pat_ref_new(const char *reference, const char *display, unsigned
 			return NULL;
 		}
 	}
+
+
+	if (strlen(reference) > 5 && strncmp(reference, "virt@", 5) == 0)
+		flags |= PAT_REF_ID;
+	else if (strlen(reference) > 4 && strncmp(reference, "opt@", 4) == 0) {
+		flags |= (PAT_REF_ID|PAT_REF_FILE); // Will be decided later
+		reference += 4;
+	}
+	else {
+		/* A file by default */
+		flags |= PAT_REF_FILE;
+		/* Skip file@ prefix to be mixed with ref omitting the prefix */
+		if (strlen(reference) > 5 && strncmp(reference, "file@", 5) == 0)
+			reference += 5;
+	}
+
 
 	ref->reference = strdup(reference);
 	if (!ref->reference) {
@@ -2223,7 +2259,7 @@ struct pattern_expr *pattern_new_expr(struct pattern_head *head, struct pat_ref 
  *
  * Return non-zero in case of success, otherwise 0.
  */
-int pat_ref_read_from_file_smp(struct pat_ref *ref, const char *filename, char **err)
+int pat_ref_read_from_file_smp(struct pat_ref *ref, char **err)
 {
 	FILE *file;
 	char *c;
@@ -2234,11 +2270,17 @@ int pat_ref_read_from_file_smp(struct pat_ref *ref, const char *filename, char *
 	char *value_beg;
 	char *value_end;
 
-	file = fopen(filename, "r");
+	file = fopen(ref->reference, "r");
 	if (!file) {
-		memprintf(err, "failed to open pattern file <%s>", filename);
+		if (ref->flags & PAT_REF_ID) {
+			/* file not found for an optional file, switch it to a virtual list of patterns */
+			ref->flags &= ~PAT_REF_FILE;
+			return 1;
+		}
+		memprintf(err, "failed to open pattern file <%s>", ref->reference);
 		return 0;
 	}
+	ref->flags |= PAT_REF_FILE;
 
 	/* now parse all patterns. The file may contain only one pattern
 	 * followed by one value per line. The start spaces, separator spaces
@@ -2294,7 +2336,7 @@ int pat_ref_read_from_file_smp(struct pat_ref *ref, const char *filename, char *
 
 	if (ferror(file)) {
 		memprintf(err, "error encountered while reading  <%s> : %s",
-				filename, strerror(errno));
+				ref->reference, strerror(errno));
 		goto out_close;
 	}
 	/* success */
@@ -2308,7 +2350,7 @@ int pat_ref_read_from_file_smp(struct pat_ref *ref, const char *filename, char *
 /* Reads patterns from a file. If <err_msg> is non-NULL, an error message will
  * be returned there on errors and the caller will have to free it.
  */
-int pat_ref_read_from_file(struct pat_ref *ref, const char *filename, char **err)
+int pat_ref_read_from_file(struct pat_ref *ref, char **err)
 {
 	FILE *file;
 	char *c;
@@ -2316,9 +2358,14 @@ int pat_ref_read_from_file(struct pat_ref *ref, const char *filename, char **err
 	int ret = 0;
 	int line = 0;
 
-	file = fopen(filename, "r");
+	file = fopen(ref->reference, "r");
 	if (!file) {
-		memprintf(err, "failed to open pattern file <%s>", filename);
+		if (ref->flags & PAT_REF_ID) {
+			/* file not found for an optional file, switch it to a virtual list of patterns */
+			ref->flags &= ~PAT_REF_FILE;
+			return 1;
+		}
+		memprintf(err, "failed to open pattern file <%s>", ref->reference);
 		return 0;
 	}
 
@@ -2349,14 +2396,14 @@ int pat_ref_read_from_file(struct pat_ref *ref, const char *filename, char **err
 			continue;
 
 		if (!pat_ref_append(ref, arg, NULL, line)) {
-			memprintf(err, "out of memory when loading patterns from file <%s>", filename);
+			memprintf(err, "out of memory when loading patterns from file <%s>", ref->reference);
 			goto out_close;
 		}
 	}
 
 	if (ferror(file)) {
 		memprintf(err, "error encountered while reading  <%s> : %s",
-				filename, strerror(errno));
+				ref->reference, strerror(errno));
 		goto out_close;
 	}
 	ret = 1; /* success */
@@ -2391,14 +2438,16 @@ int pattern_read_from_file(struct pattern_head *head, unsigned int refflags,
 			return 0;
 		}
 
-		if (load_smp) {
-			ref->flags |= PAT_REF_SMP;
-			if (!pat_ref_read_from_file_smp(ref, filename, err))
-				return 0;
-		}
-		else {
-			if (!pat_ref_read_from_file(ref, filename, err))
-				return 0;
+		if (ref->flags & PAT_REF_FILE) {
+			if (load_smp) {
+				ref->flags |= PAT_REF_SMP;
+				if (!pat_ref_read_from_file_smp(ref, err))
+					return 0;
+			}
+			else {
+				if (!pat_ref_read_from_file(ref, err))
+					return 0;
+			}
 		}
 	}
 	else {
