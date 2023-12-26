@@ -136,6 +136,7 @@ struct dns_session {
 struct dns_nameserver {
 	char *id;                       /* nameserver unique identifier */
 	void *parent;
+	unsigned int puid;              /* parent-unique numeric id */
 	struct {
 		const char *file;       /* file where the section appears */
 		int         line;       /* line where the section appears */
@@ -153,8 +154,9 @@ struct dns_nameserver {
 
 /* mixed dns and resolver counters, we will have to split them */
 struct dns_counters {
-	char *id;
-	char *pid;
+	char *id;               /* nameserver id */
+	char *pid;              /* parent resolver id */
+	unsigned int ns_puid;   /* nameserver numerical id (ns->puid) */
 	long long sent;         /* - queries sent */
 	long long snd_error;    /* - sending errors */
 	union {

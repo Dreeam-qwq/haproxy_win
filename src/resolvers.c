@@ -170,6 +170,20 @@ struct resolvers *find_resolvers_by_id(const char *id)
 	return NULL;
 }
 
+/* Returns a pointer to the nameserver matching numerical <id> within <parent>
+ * resolver section. NULL is returned if no match is found.
+ */
+struct dns_nameserver *find_nameserver_by_resolvers_and_id(struct resolvers *parent, unsigned int id)
+{
+	struct dns_nameserver *ns;
+
+	list_for_each_entry(ns, &parent->nameservers, list) {
+		if (ns->puid == id)
+			return ns;
+	}
+	return NULL;
+}
+
 /* Returns a pointer on the SRV request matching the name <name> for the proxy
  * <px>. NULL is returned if no match is found.
  */
@@ -645,14 +659,17 @@ static void leave_resolver_code()
  */
 static void resolv_srvrq_cleanup_srv(struct server *srv)
 {
+	struct server_inetaddr srv_addr;
+
 	_resolv_unlink_resolution(srv->resolv_requester);
 	HA_SPIN_LOCK(SERVER_LOCK, &srv->lock);
-	srvrq_update_srv_status(srv, 1);
+	srvrq_set_srv_down(srv);
 	ha_free(&srv->hostname);
 	ha_free(&srv->hostname_dn);
 	srv->hostname_dn_len = 0;
-	memset(&srv->addr, 0, sizeof(srv->addr));
-	srv->svc_port = 0;
+	memset(&srv_addr, 0, sizeof(srv_addr));
+	/* unset server's addr */
+	server_set_inetaddr(srv, &srv_addr, SERVER_INETADDR_UPDATER_NONE, NULL);
 	srv->flags |= SRV_F_NO_RESOLUTION;
 
 	ebpt_delete(&srv->host_dn);
@@ -815,12 +832,16 @@ static void resolv_check_response(struct resolv_resolution *res)
 srv_found:
 			/* And update this server, if found (srv is locked here) */
 			if (srv) {
+				struct server_inetaddr srv_addr;
+				uint8_t ip_change = 0;
+
 				/* re-enable DNS resolution for this server by default */
 				srv->flags &= ~SRV_F_NO_RESOLUTION;
 				srv->srvrq_check->expire = TICK_ETERNITY;
 
-				srv->svc_port = item->port;
-				srv->flags   &= ~SRV_F_MAPPORTS;
+				server_get_inetaddr(srv, &srv_addr);
+				srv_addr.port.svc = item->port;
+				srv_addr.port.map = 0;
 
 				/* Check if an Additional Record is associated to this SRV record.
 				 * Perform some sanity checks too to ensure the record can be used.
@@ -833,10 +854,12 @@ srv_found:
 
 					switch (item->ar_item->type) {
 						case DNS_RTYPE_A:
-							srv_update_addr(srv, &item->ar_item->data.in4.sin_addr, AF_INET, "DNS additional record");
+							srv_addr.family = AF_INET;
+							srv_addr.addr.v4 = item->ar_item->data.in4.sin_addr;
 						break;
 						case DNS_RTYPE_AAAA:
-							srv_update_addr(srv, &item->ar_item->data.in6.sin6_addr, AF_INET6, "DNS additional record");
+							srv_addr.family = AF_INET6;
+							srv_addr.addr.v6 = item->ar_item->data.in6.sin6_addr;
 						break;
 					}
 
@@ -846,7 +869,14 @@ srv_found:
 					 * It is usless to perform an extra resolution
 					 */
 					_resolv_unlink_resolution(srv->resolv_requester);
+
+					ip_change = 1;
 				}
+
+				if (ip_change)
+					server_set_inetaddr_warn(srv, &srv_addr, SERVER_INETADDR_UPDATER_DNS_AR);
+				else
+					server_set_inetaddr(srv, &srv_addr, SERVER_INETADDR_UPDATER_NONE, NULL);
 
 				if (!srv->hostname_dn) {
 					const char *msg = NULL;
@@ -872,9 +902,6 @@ srv_found:
 					if (!srv->resolv_requester || !srv->resolv_requester->resolution)
 						resolv_link_resolution(srv, OBJ_TYPE_SERVER, 1);
 				}
-
-				/* Update the server status */
-				srvrq_update_srv_status(srv, (srv->addr.ss_family != AF_INET && srv->addr.ss_family != AF_INET6));
 
 				if (!srv->resolv_opts.ignore_weight) {
 					char weight[9];
@@ -2567,9 +2594,11 @@ static int resolvers_finalize_config(void)
 			if (ns->dgram) {
 				/* Check nameserver info */
 				if ((fd = socket(ns->dgram->conn.addr.to.ss_family, SOCK_DGRAM, IPPROTO_UDP)) == -1) {
-					ha_alert("resolvers '%s': can't create socket for nameserver '%s'.\n",
-						 resolvers->id, ns->id);
-					err_code |= (ERR_ALERT|ERR_ABORT);
+					if (!resolvers->conf.implicit) {  /* emit a warning only if it was configured manually */
+						ha_alert("resolvers '%s': can't create socket for nameserver '%s'.\n",
+							 resolvers->id, ns->id);
+						err_code |= (ERR_ALERT|ERR_ABORT);
+					}
 					continue;
 				}
 				if (connect(fd, (struct sockaddr*)&ns->dgram->conn.addr.to, get_addr_len(&ns->dgram->conn.addr.to)) == -1) {
@@ -2795,6 +2824,7 @@ int resolv_allocate_counters(struct list *stat_modules)
 				if (strcmp(mod->name, "resolvers") == 0) {
 					ns->counters = (struct dns_counters *)ns->extra_counters->data + mod->counters_off[COUNTERS_RSLV];
 					ns->counters->id = ns->id;
+					ns->counters->ns_puid = ns->puid;
 					ns->counters->pid = resolvers->id;
 				}
 			}
@@ -3369,7 +3399,9 @@ static int parse_resolve_conf(char **errmsg, char **warnmsg)
 		newnameserver->parent = curr_resolvers;
 		newnameserver->process_responses = resolv_process_responses;
 		newnameserver->conf.line = resolv_linenum;
+		newnameserver->puid = curr_resolvers->nb_nameservers;
 		LIST_APPEND(&curr_resolvers->nameservers, &newnameserver->list);
+		curr_resolvers->nb_nameservers++;
 	}
 
 resolv_out:
@@ -3426,6 +3458,7 @@ static int resolvers_new(struct resolvers **resolvers, const char *id, const cha
 	r->timeout.resolve = 1000;
 	r->timeout.retry   = 1000;
 	r->resolve_retries = 3;
+	r->nb_nameservers = 0;
 	LIST_INIT(&r->nameservers);
 	LIST_INIT(&r->resolutions.curr);
 	LIST_INIT(&r->resolutions.wait);
@@ -3570,8 +3603,10 @@ int cfg_parse_resolvers(const char *file, int linenum, char **args, int kwm)
 		newnameserver->parent = curr_resolvers;
 		newnameserver->process_responses = resolv_process_responses;
 		newnameserver->conf.line = linenum;
+		newnameserver->puid = curr_resolvers->nb_nameservers;
 		/* the nameservers are linked backward first */
 		LIST_APPEND(&curr_resolvers->nameservers, &newnameserver->list);
+		curr_resolvers->nb_nameservers++;
 	}
 	else if (strcmp(args[0], "parse-resolv-conf") == 0) {
 		err_code |= parse_resolve_conf(&errmsg, &warnmsg);

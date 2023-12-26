@@ -386,6 +386,40 @@ struct stksess *stktable_lookup_key(struct stktable *t, struct stktable_key *key
 }
 
 /*
+ * Looks in table <t> for a sticky session matching ptr <ptr>.
+ * Returns pointer on requested sticky session or NULL if none was found.
+ * The refcount of the found entry is increased and this function
+ * is protected using the table lock
+ */
+struct stksess *stktable_lookup_ptr(struct stktable *t, void *ptr)
+{
+	struct stksess *ts = NULL;
+	struct ebmb_node *eb;
+
+	HA_RWLOCK_RDLOCK(STK_TABLE_LOCK, &t->lock);
+	/* linear search is performed, this could be optimized by adding
+	 * an eb node dedicated to ptr lookups into stksess struct to
+	 * leverage eb_lookup function instead.
+	 */
+	eb = ebmb_first(&t->keys);
+	while (eb) {
+		struct stksess *cur;
+
+		cur = ebmb_entry(eb, struct stksess, key);
+		if (cur == ptr) {
+			ts = cur;
+			break;
+		}
+		eb = ebmb_next(eb);
+	}
+	if (ts)
+		HA_ATOMIC_INC(&ts->ref_cnt);
+	HA_RWLOCK_RDUNLOCK(STK_TABLE_LOCK, &t->lock);
+
+	return ts;
+}
+
+/*
  * Looks in table <t> for a sticky session with same key as <ts>.
  * Returns pointer on requested sticky session or NULL if none was found.
  */
@@ -4896,39 +4930,22 @@ struct show_table_ctx {
 	char action;                                /* action on the table : one of STK_CLI_ACT_* */
 };
 
-/* Processes a single table entry matching a specific key passed in argument.
- * returns 0 if wants to be called again, 1 if has ended processing.
+/* Processes a single table entry <ts>.
+ * returns 0 if it wants to be called again, 1 if has ended processing.
  */
-static int table_process_entry_per_key(struct appctx *appctx, char **args)
+static int table_process_entry(struct appctx *appctx, struct stksess *ts, char **args)
 {
 	struct show_table_ctx *ctx = appctx->svcctx;
 	struct stktable *t = ctx->target;
-	struct stksess *ts;
-	struct sample key;
 	long long value;
 	int data_type;
 	int cur_arg;
 	void *ptr;
 	struct freq_ctr *frqp;
 
-	if (!*args[4])
-		return cli_err(appctx, "Key value expected\n");
-
-	memset(&key, 0, sizeof(key));
-	key.data.type = SMP_T_STR;
-	key.data.u.str.area = args[4];
-	key.data.u.str.data = strlen(args[4]);
-
 	switch (t->type) {
 	case SMP_T_IPV4:
 	case SMP_T_IPV6:
-		/* prefer input format over table type when parsing ip addresses,
-		 * then let smp_to_stkey() do the conversion for us when needed
-		 */
-		BUG_ON(!sample_casts[key.data.type][SMP_T_ADDR]);
-		if (!sample_casts[key.data.type][SMP_T_ADDR](&key))
-			return cli_err(appctx, "Invalid key\n");
-		break;
 	case SMP_T_SINT:
 	case SMP_T_STR:
 		break;
@@ -4945,21 +4962,15 @@ static int table_process_entry_per_key(struct appctx *appctx, char **args)
 		}
 	}
 
-	/* try to convert key according to table type
-	 * (it will fill static_table_key on success)
-	 */
-	if (!smp_to_stkey(&key, t))
-		return cli_err(appctx, "Invalid key\n");
-
 	/* check permissions */
 	if (!cli_has_level(appctx, ACCESS_LVL_OPER))
 		return 1;
 
+	if (!ts)
+		return 1;
+
 	switch (ctx->action) {
 	case STK_CLI_ACT_SHOW:
-		ts = stktable_lookup_key(t, &static_table_key);
-		if (!ts)
-			return 1;
 		chunk_reset(&trash);
 		if (!table_dump_head_to_buffer(&trash, appctx, t, t)) {
 			stktable_release(t, ts);
@@ -4976,10 +4987,6 @@ static int table_process_entry_per_key(struct appctx *appctx, char **args)
 		break;
 
 	case STK_CLI_ACT_CLR:
-		ts = stktable_lookup_key(t, &static_table_key);
-		if (!ts)
-			return 1;
-
 		if (!stksess_kill(t, ts, 1)) {
 			/* don't delete an entry which is currently referenced */
 			return cli_err(appctx, "Entry currently in use, cannot remove\n");
@@ -4987,11 +4994,6 @@ static int table_process_entry_per_key(struct appctx *appctx, char **args)
 		break;
 
 	case STK_CLI_ACT_SET:
-		ts = stktable_get_entry(t, &static_table_key);
-		if (!ts) {
-			/* don't delete an entry which is currently referenced */
-			return cli_err(appctx, "Unable to allocate a new entry\n");
-		}
 		HA_RWLOCK_WRLOCK(STK_SESS_LOCK, &ts->lock);
 		for (cur_arg = 5; *args[cur_arg]; cur_arg += 2) {
 			if (strncmp(args[cur_arg], "data.", 5) != 0) {
@@ -5060,6 +5062,82 @@ static int table_process_entry_per_key(struct appctx *appctx, char **args)
 		return cli_err(appctx, "Unknown action\n");
 	}
 	return 1;
+
+}
+
+/* Processes a single table entry matching a specific key passed in argument.
+ * returns 0 if wants to be called again, 1 if has ended processing.
+ */
+static int table_process_entry_per_key(struct appctx *appctx, char **args)
+{
+	struct show_table_ctx *ctx = appctx->svcctx;
+	struct stktable *t = ctx->target;
+	struct stksess *ts;
+	struct sample key;
+
+	if (!*args[4])
+		return cli_err(appctx, "Key value expected\n");
+
+	memset(&key, 0, sizeof(key));
+	key.data.type = SMP_T_STR;
+	key.data.u.str.area = args[4];
+	key.data.u.str.data = strlen(args[4]);
+
+	switch (t->type) {
+	case SMP_T_IPV4:
+	case SMP_T_IPV6:
+		/* prefer input format over table type when parsing ip addresses,
+		 * then let smp_to_stkey() do the conversion for us when needed
+		 */
+		BUG_ON(!sample_casts[key.data.type][SMP_T_ADDR]);
+		if (!sample_casts[key.data.type][SMP_T_ADDR](&key))
+			return cli_err(appctx, "Invalid key\n");
+		break;
+	default:
+		/* nothing to do */
+		break;
+	}
+
+	/* try to convert key according to table type
+	 * (it will fill static_table_key on success)
+	 */
+	if (!smp_to_stkey(&key, t))
+		return cli_err(appctx, "Invalid key\n");
+
+	if (ctx->action == STK_CLI_ACT_SET) {
+		ts = stktable_get_entry(t, &static_table_key);
+		if (!ts)
+			return cli_err(appctx, "Unable to allocate a new entry\n");
+	} else
+		ts = stktable_lookup_key(t, &static_table_key);
+
+	return table_process_entry(appctx, ts, args);
+}
+
+/* Processes a single table entry matching a specific ptr passed in argument.
+ * returns 0 if wants to be called again, 1 if has ended processing.
+ */
+static int table_process_entry_per_ptr(struct appctx *appctx, char **args)
+{
+	struct show_table_ctx *ctx = appctx->svcctx;
+	struct stktable *t = ctx->target;
+	long long int ptr;
+	char *error;
+	struct stksess *ts;
+
+	if (!*args[4] || args[4][0] != '0' || args[4][1] != 'x')
+		return cli_err(appctx, "Pointer expected (0xffff notation)\n");
+
+	/* Convert argument to integer value */
+	ptr = strtoll(args[4], &error, 16);
+	if (*error != '\0')
+		return cli_err(appctx, "Malformed ptr.\n");
+
+	ts = stktable_lookup_ptr(t, (void *)ptr);
+	if (!ts)
+		return cli_err(appctx, "No entry can be found matching ptr.\n");
+
+	return table_process_entry(appctx, ts, args);
 }
 
 /* Prepares the appctx fields with the data-based filters from the command line.
@@ -5127,6 +5205,8 @@ static int cli_parse_table_req(char **args, char *payload, struct appctx *appctx
 
 	if (strcmp(args[3], "key") == 0)
 		return table_process_entry_per_key(appctx, args);
+	if (strcmp(args[3], "ptr") == 0)
+		return table_process_entry_per_ptr(appctx, args);
 	else if (strncmp(args[3], "data.", 5) == 0)
 		return table_prepare_data_request(appctx, args);
 	else if (*args[3])
@@ -5137,11 +5217,11 @@ static int cli_parse_table_req(char **args, char *payload, struct appctx *appctx
 err_args:
 	switch (ctx->action) {
 	case STK_CLI_ACT_SHOW:
-		return cli_err(appctx, "Optional argument only supports \"data.<store_data_type>\" <operator> <value> and key <key>\n");
+		return cli_err(appctx, "Optional argument only supports \"data.<store_data_type>\" <operator> <value> or key <key> or ptr <ptr>\n");
 	case STK_CLI_ACT_CLR:
-		return cli_err(appctx, "Required arguments: <table> \"data.<store_data_type>\" <operator> <value> or <table> key <key>\n");
+		return cli_err(appctx, "Required arguments: <table> \"data.<store_data_type>\" <operator> <value> or <table> key <key> or <table> ptr <ptr>\n");
 	case STK_CLI_ACT_SET:
-		return cli_err(appctx, "Required arguments: <table> key <key> [data.<store_data_type> <value>]*\n");
+		return cli_err(appctx, "Required arguments: <table> key <key> [data.<store_data_type> <value>]* or <table> ptr <ptr> [data.<store_data_type> <value>]*\n");
 	default:
 		return cli_err(appctx, "Unknown action\n");
 	}

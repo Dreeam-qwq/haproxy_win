@@ -597,6 +597,71 @@ struct event_hdl_cb_data_server_check {
 	} unsafe;
 };
 
+/* struct to store server address and port information in INET
+ * context
+ */
+struct server_inetaddr {
+	int family; /* AF_UNSPEC, AF_INET or AF_INET6 */
+	union {
+		struct in_addr v4;
+		struct in6_addr v6;
+	} addr; /* may hold v4 or v6 addr */
+	struct {
+		unsigned int svc;
+		uint8_t map; /* is a mapped port? (boolean) */
+	} port;
+};
+
+/* struct to store informations about server's addr / port updater in
+ * INET context
+ */
+enum server_inetaddr_updater_by {
+	SERVER_INETADDR_UPDATER_BY_NONE = 0,
+	SERVER_INETADDR_UPDATER_BY_CLI,
+	SERVER_INETADDR_UPDATER_BY_LUA,
+	SERVER_INETADDR_UPDATER_BY_DNS_AR,
+	SERVER_INETADDR_UPDATER_BY_DNS_CACHE,
+	SERVER_INETADDR_UPDATER_BY_DNS_RESOLVER,
+	/* changes here must be reflected in SERVER_INETADDR_UPDATER_*
+	 * helper macros and in server_inetaddr_updater_by_to_str() func
+	 */
+};
+struct server_inetaddr_updater {
+	enum server_inetaddr_updater_by by; // by identifier (unique)
+	uint8_t dns;                        // is dns involved?
+	union {
+		struct {
+			unsigned int ns_id; // nameserver id responsible for the update
+		} dns_resolver;             // SERVER_INETADDR_UPDATER_DNS_RESOLVER specific infos
+	};                                  // per updater's additional ctx
+};
+#define SERVER_INETADDR_UPDATER_NONE                                           \
+ (struct server_inetaddr_updater){ .by = SERVER_INETADDR_UPDATER_BY_NONE,      \
+                                   .dns = 0 }
+
+#define SERVER_INETADDR_UPDATER_CLI                                            \
+ (struct server_inetaddr_updater){ .by = SERVER_INETADDR_UPDATER_BY_CLI,       \
+                                   .dns = 0 }
+
+#define SERVER_INETADDR_UPDATER_LUA                                            \
+ (struct server_inetaddr_updater){ .by = SERVER_INETADDR_UPDATER_BY_LUA,       \
+                                   .dns = 0 }
+
+#define SERVER_INETADDR_UPDATER_DNS_AR                                         \
+ (struct server_inetaddr_updater){ .by = SERVER_INETADDR_UPDATER_BY_DNS_AR,    \
+                                   .dns = 1 }
+
+#define SERVER_INETADDR_UPDATER_DNS_CACHE                                      \
+ (struct server_inetaddr_updater){ .by = SERVER_INETADDR_UPDATER_BY_DNS_CACHE, \
+                                   .dns = 1 }
+
+#define SERVER_INETADDR_UPDATER_DNS_RESOLVER(_ns_id)                           \
+ (struct server_inetaddr_updater){                                             \
+    .by = SERVER_INETADDR_UPDATER_BY_DNS_RESOLVER,                             \
+    .dns = 1,                                                                  \
+    .dns_resolver.ns_id = _ns_id,                                              \
+ }
+
 /* data provided to EVENT_HDL_SUB_SERVER_INETADDR handlers through
  * event_hdl facility
  *
@@ -609,23 +674,9 @@ struct event_hdl_cb_data_server_inetaddr {
 	 */
 	struct event_hdl_cb_data_server server;                 /* must be at the beginning */
 	struct {
-		struct  {
-			int family; /* AF_UNSPEC, AF_INET or AF_INET6 */
-			union {
-				struct in_addr v4;
-				struct in6_addr v6;
-			} addr; /* may hold v4 or v6 addr */
-			unsigned int svc_port;
-		} prev;
-		struct {
-			int family; /* AF_UNSPEC, AF_INET or AF_INET6 */
-			union {
-				struct in_addr v4;
-				struct in6_addr v6;
-			} addr; /* may hold v4 or v6 addr */
-			unsigned int svc_port;
-		} next;
-		uint8_t purge_conn; /* set to 1 if the network change will force a connection cleanup */
+		struct server_inetaddr prev;
+		struct server_inetaddr next;
+		struct server_inetaddr_updater updater;
 	} safe;
 	/* no unsafe data */
 };

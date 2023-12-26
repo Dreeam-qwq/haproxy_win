@@ -633,8 +633,6 @@ static struct peer *cfg_peers_add_peer(struct peers *peers,
 	p->conf.file = strdup(file);
 	p->conf.line = linenum;
 	p->last_change = ns_to_sec(now_ns);
-	p->xprt  = xprt_get(XPRT_RAW);
-	p->sock_init_arg = NULL;
 	HA_SPIN_INIT(&p->lock);
 	if (id)
 		p->id = strdup(id);
@@ -747,8 +745,6 @@ int cfg_parse_peers(const char *file, int linenum, char **args, int kwm)
 					goto out;
 				}
 			}
-			newpeer->addr = l->rx.addr;
-			newpeer->proto = l->rx.proto;
 			cur_arg++;
 		}
 
@@ -902,16 +898,6 @@ int cfg_parse_peers(const char *file, int linenum, char **args, int kwm)
 			err_code |= ERR_WARN;
 		}
 
-		/* If the peer address has just been parsed, let's copy it to <newpeer>
-		 * and initializes ->proto.
-		 */
-		if (peer || !local_peer) {
-			newpeer->addr = curpeers->peers_fe->srv->addr;
-			newpeer->proto = protocol_lookup(newpeer->addr.ss_family, PROTO_TYPE_STREAM, 0);
-		}
-
-		newpeer->xprt  = xprt_get(XPRT_RAW);
-		newpeer->sock_init_arg = NULL;
 		HA_SPIN_INIT(&newpeer->lock);
 
 		newpeer->srv = curpeers->peers_fe->srv;
@@ -3120,6 +3106,12 @@ init_proxies_list_stage1:
 						   curproxy->id);
 					err_code |= ERR_WARN;
 				}
+				if (target->mode == PR_MODE_HTTP) {
+					/* at least one of the used backends will provoke an
+					 * HTTP upgrade
+					 */
+					curproxy->options |= PR_O_HTTP_UPG;
+				}
 			}
 		}
 
@@ -3153,6 +3145,11 @@ init_proxies_list_stage1:
 				if (node->type != LOG_FMT_TEXT || node->list.n != &rule->be.expr) {
 					rule->dynamic = 1;
 					free(pxname);
+					/* backend is not yet known so we cannot assume its type,
+					 * thus we should consider that at least one of the used
+					 * backends may provoke HTTP upgrade
+					 */
+					curproxy->options |= PR_O_HTTP_UPG;
 					continue;
 				}
 				/* Only one element in the list, a simple string: free the expression and
@@ -3187,6 +3184,12 @@ init_proxies_list_stage1:
 			} else {
 				ha_free(&rule->be.name);
 				rule->be.backend = target;
+				if (target->mode == PR_MODE_HTTP) {
+					/* at least one of the used backends will provoke an
+					 * HTTP upgrade
+					 */
+					curproxy->options |= PR_O_HTTP_UPG;
+				}
 			}
 			err_code |= warnif_tcp_http_cond(curproxy, rule->cond);
 		}
@@ -3794,6 +3797,12 @@ out_uri_auth_compat:
 
 			if (curproxy->capture_name) {
 				ha_warning("'capture' statement ignored for %s '%s' as it requires HTTP mode.\n",
+					   proxy_type_str(curproxy), curproxy->id);
+				err_code |= ERR_WARN;
+			}
+
+			if (isttest(curproxy->monitor_uri)) {
+				ha_warning("'monitor-uri' statement ignored for %s '%s' as it requires HTTP mode.\n",
 					   proxy_type_str(curproxy), curproxy->id);
 				err_code |= ERR_WARN;
 			}

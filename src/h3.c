@@ -36,7 +36,6 @@
 #include <haproxy/qmux_http.h>
 #include <haproxy/qpack-dec.h>
 #include <haproxy/qpack-enc.h>
-#include <haproxy/quic_conn-t.h>
 #include <haproxy/quic_enc.h>
 #include <haproxy/quic_frame.h>
 #include <haproxy/stats-t.h>
@@ -70,7 +69,9 @@ static const struct trace_event h3_trace_events[] = {
 	{ .mask = H3_EV_H3S_NEW,      .name = "h3s_new",     .desc = "new H3 stream" },
 #define           H3_EV_H3S_END       (1ULL <<  9)
 	{ .mask = H3_EV_H3S_END,      .name = "h3s_end",     .desc = "H3 stream terminated" },
-#define           H3_EV_H3C_END       (1ULL <<  10)
+#define           H3_EV_H3C_NEW       (1ULL << 10)
+	{ .mask = H3_EV_H3C_NEW,      .name = "h3c_new",     .desc = "new H3 connection" },
+#define           H3_EV_H3C_END       (1ULL << 11)
 	{ .mask = H3_EV_H3C_END,      .name = "h3c_end",     .desc = "H3 connection terminated" },
 	{ }
 };
@@ -1417,7 +1418,11 @@ static ssize_t h3_rcv_buf(struct qcs *qcs, struct buffer *b, int fin)
 	return -1;
 }
 
-/* Function used to emit stream data from <qcs> control uni-stream */
+/* Function used to emit stream data from <qcs> control uni-stream.
+ *
+ * On success return the number of sent bytes. A negative code is used on
+ * error.
+ */
 static int h3_control_send(struct qcs *qcs, void *ctx)
 {
 	int ret;
@@ -1455,7 +1460,11 @@ static int h3_control_send(struct qcs *qcs, void *ctx)
 		b_quic_enc_int(&pos, h3_settings_max_field_section_size, 0);
 	}
 
-	res = qcc_get_stream_txbuf(qcs);
+	if (!(res = qcc_get_stream_txbuf(qcs))) {
+		TRACE_ERROR("cannot allocate Tx buffer", H3_EV_TX_FRAME|H3_EV_TX_SETTINGS, qcs->qcc->conn, qcs);
+		goto err;
+	}
+
 	if (b_room(res) < b_data(&pos)) {
 		// TODO the mux should be put in blocked state, with
 		// the stream in state waiting for settings to be sent
@@ -1471,10 +1480,16 @@ static int h3_control_send(struct qcs *qcs, void *ctx)
 
 	TRACE_LEAVE(H3_EV_TX_FRAME|H3_EV_TX_SETTINGS, qcs->qcc->conn, qcs);
 	return ret;
+
+ err:
+	TRACE_DEVEL("leaving on error", H3_EV_TX_FRAME|H3_EV_TX_SETTINGS, qcs->qcc->conn, qcs);
+	return -1;
 }
 
 static int h3_resp_headers_send(struct qcs *qcs, struct htx *htx)
 {
+	struct h3s *h3s = qcs->ctx;
+	struct h3c *h3c = h3s->h3c;
 	struct buffer outbuf;
 	struct buffer headers_buf = BUF_NULL;
 	struct buffer *res;
@@ -1508,8 +1523,11 @@ static int h3_resp_headers_send(struct qcs *qcs, struct htx *htx)
 			status = sl->info.res.status;
 		}
 		else if (type == HTX_BLK_HDR) {
-			if (unlikely(hdr >= sizeof(list) / sizeof(list[0]) - 1))
+			if (unlikely(hdr >= sizeof(list) / sizeof(list[0]) - 1)) {
+				TRACE_ERROR("too many headers", H3_EV_TX_FRAME|H3_EV_TX_HDR, qcs->qcc->conn, qcs);
+				h3c->err = H3_INTERNAL_ERROR;
 				goto err;
+			}
 			list[hdr].n = htx_get_blk_name(htx, blk);
 			list[hdr].v = htx_get_blk_value(htx, blk);
 			hdr++;
@@ -1524,8 +1542,11 @@ static int h3_resp_headers_send(struct qcs *qcs, struct htx *htx)
 
 	list[hdr].n = ist("");
 
-	if (!(res = qcc_get_stream_txbuf(qcs)))
+	if (!(res = qcc_get_stream_txbuf(qcs))) {
+		TRACE_ERROR("cannot allocate Tx buffer", H3_EV_TX_FRAME|H3_EV_TX_HDR, qcs->qcc->conn, qcs);
+		h3c->err = H3_INTERNAL_ERROR;
 		goto err;
+	}
 
 	/* At least 5 bytes to store frame type + length as a varint max size */
 	if (b_room(res) < 5)
@@ -1599,7 +1620,7 @@ static int h3_resp_headers_send(struct qcs *qcs, struct htx *htx)
 
  err:
 	TRACE_DEVEL("leaving on error", H3_EV_TX_FRAME|H3_EV_TX_HDR, qcs->qcc->conn, qcs);
-	return 0;
+	return -1;
 }
 
 /* Convert a series of HTX trailer blocks from <htx> buffer into <qcs> buffer
@@ -1614,6 +1635,8 @@ static int h3_resp_headers_send(struct qcs *qcs, struct htx *htx)
  */
 static int h3_resp_trailers_send(struct qcs *qcs, struct htx *htx)
 {
+	struct h3s *h3s = qcs->ctx;
+	struct h3c *h3c = h3s->h3c;
 	struct buffer headers_buf = BUF_NULL;
 	struct buffer *res;
 	struct http_hdr list[global.tune.max_http_hdr];
@@ -1636,14 +1659,18 @@ static int h3_resp_trailers_send(struct qcs *qcs, struct htx *htx)
 			break;
 
 		if (type == HTX_BLK_TLR) {
-			if (unlikely(hdr >= sizeof(list) / sizeof(list[0]) - 1))
+			if (unlikely(hdr >= sizeof(list) / sizeof(list[0]) - 1)) {
+				TRACE_ERROR("too many headers", H3_EV_TX_FRAME|H3_EV_TX_HDR, qcs->qcc->conn, qcs);
+				h3c->err = H3_INTERNAL_ERROR;
 				goto err;
+			}
 			list[hdr].n = htx_get_blk_name(htx, blk);
 			list[hdr].v = htx_get_blk_value(htx, blk);
 			hdr++;
 		}
 		else {
 			TRACE_ERROR("unexpected HTX block", H3_EV_TX_FRAME|H3_EV_TX_HDR, qcs->qcc->conn, qcs);
+			h3c->err = H3_INTERNAL_ERROR;
 			goto err;
 		}
 	}
@@ -1657,8 +1684,11 @@ static int h3_resp_trailers_send(struct qcs *qcs, struct htx *htx)
 	}
 	list[hdr].n = ist("");
 
-	if (!(res = qcc_get_stream_txbuf(qcs)))
+	if (!(res = qcc_get_stream_txbuf(qcs))) {
+		TRACE_ERROR("cannot allocate Tx buffer", H3_EV_TX_FRAME|H3_EV_TX_HDR, qcs->qcc->conn, qcs);
+		h3c->err = H3_INTERNAL_ERROR;
 		goto err;
+	}
 
 	/* At least 9 bytes to store frame type + length as a varint max size */
 	if (b_room(res) < 9) {
@@ -1734,7 +1764,7 @@ static int h3_resp_trailers_send(struct qcs *qcs, struct htx *htx)
 
  err:
 	TRACE_DEVEL("leaving on error", H3_EV_TX_FRAME|H3_EV_TX_HDR, qcs->qcc->conn, qcs);
-	return 0;
+	return -1;
 }
 
 /* Convert a series of HTX data blocks from <htx> buffer of size <count> into
@@ -1748,6 +1778,8 @@ static int h3_resp_trailers_send(struct qcs *qcs, struct htx *htx)
 static int h3_resp_data_send(struct qcs *qcs, struct htx *htx,
                              struct buffer *buf, size_t count)
 {
+	struct h3s *h3s = qcs->ctx;
+	struct h3c *h3c = h3s->h3c;
 	struct buffer outbuf;
 	struct buffer *res;
 	size_t total = 0;
@@ -1772,7 +1804,9 @@ static int h3_resp_data_send(struct qcs *qcs, struct htx *htx,
 		goto end;
 
 	if (!(res = qcc_get_stream_txbuf(qcs))) {
-		/* TODO */
+		TRACE_ERROR("cannot allocate Tx buffer", H3_EV_TX_FRAME|H3_EV_TX_DATA, qcs->qcc->conn, qcs);
+		h3c->err = H3_INTERNAL_ERROR;
+		goto err;
 	}
 
 	/* If HTX contains only one DATA block, try to exchange it with MUX
@@ -1820,8 +1854,9 @@ static int h3_resp_data_send(struct qcs *qcs, struct htx *htx,
 	 * on SEND.
 	 */
 	if (b_size(&outbuf) <= hsize) {
+		TRACE_STATE("not enough room for data frame", H3_EV_TX_FRAME|H3_EV_TX_DATA, qcs->qcc->conn, qcs);
 		qcs->flags |= QC_SF_BLK_MROOM;
-		goto end;
+		goto err;
 	}
 
 	if (b_size(&outbuf) < hsize + fsize)
@@ -1849,23 +1884,31 @@ static int h3_resp_data_send(struct qcs *qcs, struct htx *htx,
  end:
 	TRACE_LEAVE(H3_EV_TX_FRAME|H3_EV_TX_DATA, qcs->qcc->conn, qcs);
 	return total;
+
+ err:
+	TRACE_DEVEL("leaving on error", H3_EV_TX_FRAME|H3_EV_TX_DATA, qcs->qcc->conn, qcs);
+	return -1;
 }
 
 static size_t h3_snd_buf(struct qcs *qcs, struct buffer *buf, size_t count)
 {
+	struct h3s *h3s = qcs->ctx;
+	struct h3c *h3c = h3s->h3c;
 	size_t total = 0;
 	enum htx_blk_type btype;
 	struct htx *htx;
 	struct htx_blk *blk;
 	uint32_t bsize;
 	int32_t idx;
-	int ret;
+	int ret = 0;
 
 	h3_debug_printf(stderr, "%s\n", __func__);
 
 	htx = htx_from_buf(buf);
 
-	while (count && !htx_is_empty(htx) && !(qcs->flags & QC_SF_BLK_MROOM)) {
+	while (count && !htx_is_empty(htx) &&
+	       !(qcs->flags & QC_SF_BLK_MROOM) && !h3c->err) {
+
 		idx = htx_get_head(htx);
 		blk = htx_get_blk(htx, idx);
 		btype = htx_get_blk_type(blk);
@@ -1916,6 +1959,17 @@ static size_t h3_snd_buf(struct qcs *qcs, struct buffer *buf, size_t count)
 			count -= bsize;
 			break;
 		}
+
+		/* If an error occured, either buffer space or connection error
+		 * must be set to break current loop.
+		 */
+		BUG_ON(ret < 0 && !(qcs->flags & QC_SF_BLK_MROOM) && !h3c->err);
+	}
+
+	/* Interrupt sending on connection error. */
+	if (unlikely(h3c->err)) {
+		qcc_set_error(qcs->qcc, h3c->err, 1);
+		goto out;
 	}
 
 	/* RFC 9114 4.1. HTTP Message Framing
@@ -1958,7 +2012,8 @@ static size_t h3_nego_ff(struct qcs *qcs, size_t count)
 	h3_debug_printf(stderr, "%s\n", __func__);
 
 	if (!(res = qcc_get_stream_txbuf(qcs))) {
-		/* TODO */
+		qcs->sd->iobuf.flags |= IOBUF_FL_NO_FF;
+		goto end;
 	}
 
 	/* h3 DATA headers : 1-byte frame type + varint frame length */
@@ -2177,11 +2232,15 @@ static int h3_send_goaway(struct h3c *h3c)
 static int h3_init(struct qcc *qcc)
 {
 	struct h3c *h3c;
-	struct quic_conn *qc = qcc->conn->handle.qc;
+	const struct listener *li = __objt_listener(qcc->conn->target);
+
+	TRACE_ENTER(H3_EV_H3C_NEW, qcc->conn);
 
 	h3c = pool_alloc(pool_head_h3c);
-	if (!h3c)
+	if (!h3c) {
+		TRACE_ERROR("cannot allocate h3c", H3_EV_H3C_NEW, qcc->conn);
 		goto fail_no_h3;
+	}
 
 	h3c->qcc = qcc;
 	h3c->ctrl_strm = NULL;
@@ -2190,15 +2249,17 @@ static int h3_init(struct qcc *qcc)
 	h3c->id_goaway = 0;
 
 	qcc->ctx = h3c;
-	/* TODO cleanup only ref to quic_conn */
 	h3c->prx_counters =
-		EXTRA_COUNTERS_GET(qc->li->bind_conf->frontend->extra_counters_fe,
+		EXTRA_COUNTERS_GET(li->bind_conf->frontend->extra_counters_fe,
 		                   &h3_stats_module);
 	LIST_INIT(&h3c->buf_wait.list);
 
+	TRACE_LEAVE(H3_EV_H3C_NEW, qcc->conn);
 	return 1;
 
  fail_no_h3:
+	qcc_set_error(qcc, H3_INTERNAL_ERROR, 1);
+	TRACE_DEVEL("leaving on error", H3_EV_H3C_NEW, qcc->conn);
 	return 0;
 }
 
@@ -2209,16 +2270,29 @@ static int h3_init(struct qcc *qcc)
 static int h3_finalize(void *ctx)
 {
 	struct h3c *h3c = ctx;
+	struct qcc *qcc = h3c->qcc;
 	struct qcs *qcs;
 
-	qcs = qcc_init_stream_local(h3c->qcc, 0);
-	if (!qcs)
-		return 1;
+	TRACE_ENTER(H3_EV_H3C_NEW, qcc->conn);
 
-	h3_control_send(qcs, h3c);
+	qcs = qcc_init_stream_local(qcc, 0);
+	if (!qcs) {
+		TRACE_ERROR("cannot init control stream", H3_EV_H3C_NEW, qcc->conn);
+		goto err;
+	}
+
 	h3c->ctrl_strm = qcs;
 
+	if (h3_control_send(qcs, h3c) < 0)
+		goto err;
+
+	TRACE_LEAVE(H3_EV_H3C_NEW, qcc->conn);
 	return 0;
+
+ err:
+	qcc_set_error(qcc, H3_INTERNAL_ERROR, 1);
+	TRACE_DEVEL("leaving on error", H3_EV_H3C_NEW, qcc->conn);
+	return 1;
 }
 
 /* Send a HTTP/3 GOAWAY followed by a CONNECTION_CLOSE_APP. */

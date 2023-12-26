@@ -957,6 +957,12 @@ void qcc_reset_stream(struct qcs *qcs, int err)
 		qcs->tx.offset = qcs->tx.sent_offset;
 	}
 
+	/* Report send error to stream-endpoint layer. */
+	if (qcs_sc(qcs)) {
+		se_fl_set_error(qcs->sd);
+		qcs_alert(qcs);
+	}
+
 	qcc_send_stream(qcs, 1);
 	tasklet_wakeup(qcc->wait_event.tasklet);
 }
@@ -1410,6 +1416,14 @@ int qcc_recv_stop_sending(struct qcc *qcc, uint64_t id, uint64_t err)
 		}
 	}
 
+	/* If FIN already reached, future RESET_STREAMS will be ignored.
+	 * Manually set EOS in this case.
+	 */
+	if (qcs_sc(qcs) && se_fl_test(qcs->sd, SE_FL_EOI)) {
+		se_fl_set(qcs->sd, SE_FL_EOS);
+		qcs_alert(qcs);
+	}
+
 	/* RFC 9000 3.5. Solicited State Transitions
 	 *
 	 * An endpoint that receives a STOP_SENDING frame
@@ -1425,18 +1439,6 @@ int qcc_recv_stop_sending(struct qcc *qcc, uint64_t id, uint64_t err)
 	 * code.
 	 */
 	qcc_reset_stream(qcs, err);
-
-	/* Report send error to stream-endpoint layer. */
-	if (qcs_sc(qcs)) {
-		/* If FIN already reached, future RESET_STREAMS will be ignored.
-		 * Manually set EOS in this case.
-		 */
-		if (se_fl_test(qcs->sd, SE_FL_EOI))
-			se_fl_set(qcs->sd, SE_FL_EOS);
-
-		se_fl_set_error(qcs->sd);
-		qcs_alert(qcs);
-	}
 
 	if (qcc_may_expire(qcc) && !qcc->nb_hreq)
 		qcc_refresh_timeout(qcc);
@@ -2387,17 +2389,13 @@ static int qcc_io_process(struct qcc *qcc)
 	return 0;
 }
 
-/* release function. This one should be called to free all resources allocated
- * to the mux.
- */
+/* Free all resources allocated for <qcc> connection. */
 static void qcc_release(struct qcc *qcc)
 {
 	struct connection *conn = qcc->conn;
 	struct eb64_node *node;
 
 	TRACE_ENTER(QMUX_EV_QCC_END, conn);
-
-	qcc_shutdown(qcc);
 
 	if (qcc->task) {
 		task_destroy(qcc->task);
@@ -2471,6 +2469,7 @@ struct task *qcc_io_cb(struct task *t, void *ctx, unsigned int status)
 	return NULL;
 
  release:
+	qcc_shutdown(qcc);
 	qcc_release(qcc);
 	TRACE_LEAVE(QMUX_EV_QCC_WAKE);
 	return NULL;
@@ -2513,6 +2512,7 @@ static struct task *qcc_timeout_task(struct task *t, void *ctx, unsigned int sta
 	 */
 	if (qcc_is_dead(qcc)) {
 		TRACE_STATE("releasing dead connection", QMUX_EV_QCC_WAKE, qcc->conn);
+		qcc_shutdown(qcc);
 		qcc_release(qcc);
 	}
 
@@ -2523,6 +2523,17 @@ static struct task *qcc_timeout_task(struct task *t, void *ctx, unsigned int sta
  requeue:
 	TRACE_LEAVE(QMUX_EV_QCC_WAKE);
 	return t;
+}
+
+/* Minimal initialization of <qcc> members to use qcc_release() safely. */
+static void _qcc_init(struct qcc *qcc)
+{
+	qcc->conn = NULL;
+	qcc->task = NULL;
+	qcc->wait_event.tasklet = NULL;
+	qcc->app_ops = NULL;
+	qcc->streams_by_id = EB_ROOT_UNIQUE;
+	LIST_INIT(&qcc->lfctl.frms);
 }
 
 static int qmux_init(struct connection *conn, struct proxy *prx,
@@ -2536,24 +2547,20 @@ static int qmux_init(struct connection *conn, struct proxy *prx,
 	qcc = pool_alloc(pool_head_qcc);
 	if (!qcc) {
 		TRACE_ERROR("alloc failure", QMUX_EV_QCC_NEW);
-		goto fail_no_qcc;
+		goto err;
 	}
 
-	qcc->conn = conn;
+	_qcc_init(qcc);
 	conn->ctx = qcc;
 	qcc->nb_hreq = qcc->nb_sc = 0;
 	qcc->flags = 0;
-
-	qcc->app_ops = NULL;
-
-	qcc->streams_by_id = EB_ROOT_UNIQUE;
+	qcc->err = quic_err_transport(QC_ERR_NO_ERROR);
 
 	/* Server parameters, params used for RX flow control. */
 	lparams = &conn->handle.qc->rx.params;
 
 	qcc->tx.sent_offsets = qcc->tx.offsets = 0;
 
-	LIST_INIT(&qcc->lfctl.frms);
 	qcc->lfctl.ms_bidi = qcc->lfctl.ms_bidi_init = lparams->initial_max_streams_bidi;
 	qcc->lfctl.ms_uni = lparams->initial_max_streams_uni;
 	qcc->lfctl.msd_bidi_l = lparams->initial_max_stream_data_bidi_local;
@@ -2586,7 +2593,7 @@ static int qmux_init(struct connection *conn, struct proxy *prx,
 	qcc->wait_event.tasklet = tasklet_new();
 	if (!qcc->wait_event.tasklet) {
 		TRACE_ERROR("taslket alloc failure", QMUX_EV_QCC_NEW);
-		goto fail_no_tasklet;
+		goto err;
 	}
 
 	LIST_INIT(&qcc->send_list);
@@ -2597,7 +2604,7 @@ static int qmux_init(struct connection *conn, struct proxy *prx,
 
 	qcc->proxy = prx;
 	/* haproxy timeouts */
-	if (conn_is_back(qcc->conn)) {
+	if (conn_is_back(conn)) {
 		qcc->timeout = prx->timeout.server;
 		qcc->shut_timeout = tick_isset(prx->timeout.serverfin) ?
 		                    prx->timeout.serverfin : prx->timeout.server;
@@ -2614,7 +2621,7 @@ static int qmux_init(struct connection *conn, struct proxy *prx,
 	qcc->task = task_new_here();
 	if (!qcc->task) {
 		TRACE_ERROR("timeout task alloc failure", QMUX_EV_QCC_NEW);
-		goto fail_no_timeout_task;
+		goto err;
 	}
 	qcc->task->process = qcc_timeout_task;
 	qcc->task->context = qcc;
@@ -2625,11 +2632,12 @@ static int qmux_init(struct connection *conn, struct proxy *prx,
 
 	HA_ATOMIC_STORE(&conn->handle.qc->qcc, qcc);
 
+	/* Register conn as app_ops may use it. */
+	qcc->conn = conn;
+
 	if (qcc_install_app_ops(qcc, conn->handle.qc->app_ops)) {
-		TRACE_PROTO("Cannot install app layer", QMUX_EV_QCC_NEW|QMUX_EV_QCC_ERR, qcc->conn);
-		/* prepare a CONNECTION_CLOSE frame */
-		quic_set_connection_close(conn->handle.qc, quic_err_transport(QC_ERR_APPLICATION_ERROR));
-		goto fail_install_app_ops;
+		TRACE_PROTO("Cannot install app layer", QMUX_EV_QCC_NEW|QMUX_EV_QCC_ERR, conn);
+		goto err;
 	}
 
 	if (qcc->app_ops == &h3_ops)
@@ -2642,19 +2650,24 @@ static int qmux_init(struct connection *conn, struct proxy *prx,
 	/* init read cycle */
 	tasklet_wakeup(qcc->wait_event.tasklet);
 
-	TRACE_LEAVE(QMUX_EV_QCC_NEW, qcc->conn);
+	TRACE_LEAVE(QMUX_EV_QCC_NEW, conn);
 	return 0;
 
- fail_install_app_ops:
-	if (qcc->app_ops && qcc->app_ops->release)
-		qcc->app_ops->release(qcc->ctx);
-	task_destroy(qcc->task);
- fail_no_timeout_task:
-	tasklet_free(qcc->wait_event.tasklet);
- fail_no_tasklet:
-	pool_free(pool_head_qcc, qcc);
- fail_no_qcc:
-	TRACE_LEAVE(QMUX_EV_QCC_NEW);
+ err:
+	/* Prepare CONNECTION_CLOSE, using INTERNAL_ERROR as fallback code if unset. */
+	if (!(conn->handle.qc->flags & QUIC_FL_CONN_IMMEDIATE_CLOSE)) {
+		struct quic_err err = qcc && qcc->err.code ?
+		  qcc->err : quic_err_transport(QC_ERR_INTERNAL_ERROR);
+		quic_set_connection_close(conn->handle.qc, err);
+	}
+
+	if (qcc) {
+		/* In case of MUX init failure, session will ensure connection is freed. */
+		qcc->conn = NULL;
+		qcc_release(qcc);
+	}
+
+	TRACE_DEVEL("leaving on error", QMUX_EV_QCC_NEW, conn);
 	return -1;
 }
 
@@ -2710,6 +2723,7 @@ static void qmux_strm_detach(struct sedesc *sd)
 	return;
 
  release:
+	qcc_shutdown(qcc);
 	qcc_release(qcc);
 	TRACE_LEAVE(QMUX_EV_STRM_END);
 	return;
@@ -2797,6 +2811,9 @@ static size_t qmux_strm_snd_buf(struct stconn *sc, struct buffer *buf,
 
 	TRACE_ENTER(QMUX_EV_STRM_SEND, qcs->qcc->conn, qcs);
 
+	/* Sending forbidden if QCS is locally closed (FIN or RESET_STREAM sent). */
+	BUG_ON(qcs_is_close_local(qcs) || (qcs->flags & QC_SF_TO_RESET));
+
 	/* stream layer has been detached so no transfer must occur after. */
 	BUG_ON_HOT(qcs->flags & QC_SF_DETACH);
 
@@ -2804,11 +2821,6 @@ static size_t qmux_strm_snd_buf(struct stconn *sc, struct buffer *buf,
 	if (qcs->qcc->flags & (QC_CF_ERR_CONN|QC_CF_ERRL)) {
 		se_fl_set(qcs->sd, SE_FL_ERROR);
 		TRACE_DEVEL("connection in error", QMUX_EV_STRM_SEND, qcs->qcc->conn, qcs);
-		goto end;
-	}
-
-	if (qcs_is_close_local(qcs) || (qcs->flags & QC_SF_TO_RESET)) {
-		ret = qcs_http_reset_buf(qcs, buf, count);
 		goto end;
 	}
 
@@ -2839,6 +2851,9 @@ static size_t qmux_strm_nego_ff(struct stconn *sc, struct buffer *input,
 
 	TRACE_ENTER(QMUX_EV_STRM_SEND, qcs->qcc->conn, qcs);
 
+	/* Sending forbidden if QCS is locally closed (FIN or RESET_STREAM sent). */
+	BUG_ON(qcs_is_close_local(qcs) || (qcs->flags & QC_SF_TO_RESET));
+
 	/* stream layer has been detached so no transfer must occur after. */
 	BUG_ON_HOT(qcs->flags & QC_SF_DETACH);
 
@@ -2849,6 +2864,15 @@ static size_t qmux_strm_nego_ff(struct stconn *sc, struct buffer *input,
 
 	if (!qcs->qcc->app_ops->nego_ff || !qcs->qcc->app_ops->done_ff) {
 		/* Fast forwading is not supported by the QUIC application layer */
+		qcs->sd->iobuf.flags |= IOBUF_FL_NO_FF;
+		goto end;
+	}
+
+	if (qcs->qcc->flags & (QC_CF_ERR_CONN|QC_CF_ERRL)) {
+		/* Disable fast-forward if connection is on error. Eventually,
+		 * error will be reported to stream-conn if snd_buf is invoked.
+		 */
+		TRACE_DEVEL("connection in error", QMUX_EV_STRM_SEND, qcs->qcc->conn, qcs);
 		qcs->sd->iobuf.flags |= IOBUF_FL_NO_FF;
 		goto end;
 	}
@@ -2967,6 +2991,7 @@ static int qmux_wake(struct connection *conn)
 	return 0;
 
  release:
+	qcc_shutdown(qcc);
 	qcc_release(qcc);
 	TRACE_LEAVE(QMUX_EV_QCC_WAKE);
 	return 1;
@@ -2994,9 +3019,7 @@ static void qmux_strm_shutw(struct stconn *sc, enum co_shw_mode mode)
 		}
 		else {
 			/* RESET_STREAM necessary. */
-			if (!(qcc->flags & (QC_CF_ERR_CONN|QC_CF_ERRL)))
-				qcc_reset_stream(qcs, 0);
-			se_fl_set_error(qcs->sd);
+			qcc_reset_stream(qcs, 0);
 		}
 
 		tasklet_wakeup(qcc->wait_event.tasklet);

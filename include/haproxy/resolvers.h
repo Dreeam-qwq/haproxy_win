@@ -34,6 +34,7 @@ extern struct list sec_resolvers;
 extern unsigned int resolv_failed_resolutions;
 
 struct resolvers *find_resolvers_by_id(const char *id);
+struct dns_nameserver *find_nameserver_by_resolvers_and_id(struct resolvers *parent, unsigned int id);
 struct resolv_srvrq *find_srvrq_by_name(const char *name, struct proxy *px);
 struct resolv_srvrq *new_resolv_srvrq(struct server *srv, char *fqdn);
 struct resolv_answer_item *find_srvrq_answer_record(const struct resolv_requester *requester);
@@ -60,7 +61,6 @@ int stats_dump_resolvers(struct stconn *sc,
                          struct list *stat_modules);
 void resolv_stats_clear_counters(int clrall, struct list *stat_modules);
 int resolv_allocate_counters(struct list *stat_modules);
-int dns_dgram_init(struct dns_nameserver *ns, struct sockaddr_storage *sk);
 int resolvers_create_default();
 
 #endif // _HAPROXY_RESOLVER_H

@@ -47,13 +47,19 @@ int srv_lastsession(const struct server *s);
 int srv_getinter(const struct check *check);
 void srv_settings_cpy(struct server *srv, const struct server *src, int srv_tmpl);
 int parse_server(const char *file, int linenum, char **args, struct proxy *curproxy, const struct proxy *defproxy, int parse_flags);
-int srv_update_addr(struct server *s, void *ip, int ip_sin_family, const char *updater);
+int srv_update_addr(struct server *s, void *ip, int ip_sin_family, struct server_inetaddr_updater updater);
 int server_parse_sni_expr(struct server *newsrv, struct proxy *px, char **err);
-const char *srv_update_addr_port(struct server *s, const char *addr, const char *port, char *updater);
+int server_set_inetaddr(struct server *s, const struct server_inetaddr *inetaddr, struct server_inetaddr_updater updater, struct buffer *msg);
+int server_set_inetaddr_warn(struct server *s, const struct server_inetaddr *inetaddr, struct server_inetaddr_updater updater);
+void server_get_inetaddr(struct server *s, struct server_inetaddr *inetaddr);
+const char *srv_update_addr_port(struct server *s, const char *addr, const char *port, struct server_inetaddr_updater updater);
+const char *server_inetaddr_updater_by_to_str(enum server_inetaddr_updater_by by);
 const char *srv_update_check_addr_port(struct server *s, const char *addr, const char *port);
 const char *srv_update_agent_addr_port(struct server *s, const char *addr, const char *port);
 struct server *server_find_by_id(struct proxy *bk, int id);
+struct server *server_find_by_id_unique(struct proxy *bk, int id, uint32_t rid);
 struct server *server_find_by_name(struct proxy *bk, const char *name);
+struct server *server_find_by_name_unique(struct proxy *bk, const char *name, uint32_t rid);
 struct server *server_find_best_match(struct proxy *bk, char *name, int id, int *diff);
 void apply_server_state(void);
 void srv_compute_all_admin_states(struct proxy *px);
@@ -72,8 +78,7 @@ void srv_event_hdl_publish_check(struct server *srv, struct check *check);
 
 /* functions related to server name resolution */
 int srv_prepare_for_resolution(struct server *srv, const char *hostname);
-int srvrq_update_srv_status(struct server *s, int has_no_ip);
-int snr_update_srv_status(struct server *s, int has_no_ip);
+int srvrq_set_srv_down(struct server *s);
 int srv_set_fqdn(struct server *srv, const char *fqdn, int resolv_locked);
 const char *srv_update_fqdn(struct server *server, const char *fqdn, const char *updater, int dns_locked);
 int snr_resolution_cb(struct resolv_requester *requester, struct dns_counters *counters);
@@ -116,14 +121,6 @@ void server_recalc_eweight(struct server *sv, int must_update);
  */
 const char *server_parse_weight_change_request(struct server *sv,
 					       const char *weight_str);
-
-/*
- * Parses addr_str and configures sv accordingly. updater precise
- * the source of the change in the associated message log.
- * Returns NULL on success, error message string otherwise.
- */
-const char *server_parse_addr_change_request(struct server *sv,
-                                             const char *addr_str, const char *updater);
 
 /*
  * Parses maxconn_str and configures sv accordingly.

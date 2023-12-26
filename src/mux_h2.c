@@ -2178,8 +2178,9 @@ static void h2s_wake_one_stream(struct h2s *h2s)
 			h2s_close(h2s);
 	}
 
-	if (h2s->h2c->st0 >= H2_CS_ERROR || (h2s->h2c->flags & (H2_CF_ERR_PENDING|H2_CF_ERROR)) ||
-	    (h2s->h2c->last_sid > 0 && (!h2s->id || h2s->id > h2s->h2c->last_sid))) {
+	if ((h2s->st != H2_SS_CLOSED) &&
+	    (h2s->h2c->st0 >= H2_CS_ERROR || (h2s->h2c->flags & H2_CF_ERROR) ||
+	     (h2s->h2c->last_sid > 0 && (!h2s->id || h2s->id > h2s->h2c->last_sid)))) {
 		se_fl_set_error(h2s->sd);
 
 		if (h2s->st < H2_SS_ERROR)
@@ -3959,7 +3960,7 @@ static int h2_recv(struct h2c *h2c)
 		TRACE_DATA("received read0", H2_EV_H2C_RECV, h2c->conn);
 		h2c->flags |= H2_CF_RCVD_SHUT;
 	}
-	if (h2c->conn->flags & CO_FL_ERROR) {
+	if (h2c->conn->flags & CO_FL_ERROR && !b_data(&h2c->dbuf)) {
 		TRACE_DATA("connection error", H2_EV_H2C_RECV, h2c->conn);
 		h2c->flags |= H2_CF_ERROR;
 	}
@@ -3992,7 +3993,7 @@ static int h2_send(struct h2c *h2c)
 
 	if (h2c->flags & (H2_CF_ERROR|H2_CF_ERR_PENDING)) {
 		TRACE_DEVEL("leaving on error", H2_EV_H2C_SEND, h2c->conn);
-		if (h2c->flags & H2_CF_RCVD_SHUT)
+		if (h2c->flags & H2_CF_END_REACHED)
 			h2c->flags |= H2_CF_ERROR;
 		b_reset(br_tail(h2c->mbuf));
 		h2c->idle_start = now_ms;
@@ -4090,7 +4091,7 @@ static int h2_send(struct h2c *h2c)
 
 	if (conn->flags & CO_FL_ERROR) {
 		h2c->flags |= H2_CF_ERR_PENDING;
-		if (h2c->flags & H2_CF_RCVD_SHUT)
+		if (h2c->flags & H2_CF_END_REACHED)
 			h2c->flags |= H2_CF_ERROR;
 		b_reset(br_tail(h2c->mbuf));
 	}
