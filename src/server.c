@@ -170,7 +170,7 @@ int srv_getinter(const struct check *check)
 
 /* Update server's addr:svc_port tuple in INET context
  *
- * Must be called under thread isolation to ensure consistent readings accross
+ * Must be called under thread isolation to ensure consistent readings across
  * all threads (addr:svc_port might be read without srv lock being held).
  */
 static void _srv_set_inetaddr_port(struct server *srv,
@@ -295,7 +295,7 @@ static struct task *server_atomic_sync(struct task *task, void *context, unsigne
 			/*
 			 * this requires thread isolation, which is safe since we're the only
 			 * task working for the current subscription and we don't hold locks
-			 * or ressources that other threads may depend on to complete a running
+			 * or resources that other threads may depend on to complete a running
 			 * cycle. Note that we do this way because we assume that this event is
 			 * rather rare.
 			 */
@@ -3008,6 +3008,9 @@ static int _srv_parse_tmpl_init(struct server *srv, struct proxy *px)
 		/* Linked backwards first. This will be restablished after parsing. */
 		newsrv->next = px->srv;
 		px->srv = newsrv;
+
+		newsrv->conf.name.key = newsrv->id;
+		ebis_insert(&curproxy->conf.used_server_name, &newsrv->conf.name);
 	}
 	_srv_parse_set_id_from_prefix(srv, srv->tmpl_info.prefix, srv->tmpl_info.nb_low);
 
@@ -3525,8 +3528,13 @@ int parse_server(const char *file, int linenum, char **args,
 			goto out;
 	}
 
-	if (parse_flags & SRV_PARSE_TEMPLATE)
+	if (parse_flags & SRV_PARSE_TEMPLATE) {
 		_srv_parse_tmpl_init(newsrv, curproxy);
+	}
+	else if (!(parse_flags & SRV_PARSE_DEFAULT_SERVER)) {
+		newsrv->conf.name.key = newsrv->id;
+		ebis_insert(&curproxy->conf.used_server_name, &newsrv->conf.name);
+	}
 
 	/* If the server id is fixed, insert it in the proxy used_id tree.
 	 * This is needed to detect a later duplicate id via srv_parse_id.
@@ -3630,7 +3638,7 @@ struct server *server_find_by_name(struct proxy *bk, const char *name)
  * from the proxy. For this we assume that <name> is unique within the list,
  * which is the case in most setups, but in rare cases the user may have
  * enforced duplicate server names in the initial config (ie: if he intends to
- * use numerical IDs for indentification instead). In this particular case, the
+ * use numerical IDs for identification instead). In this particular case, the
  * function will not work as expected so server_find_by_id_unique() should be
  * used to match a unique server instead.
  *
@@ -4167,8 +4175,7 @@ const char *srv_update_addr_port(struct server *s, const char *addr, const char 
 	 * s->svc_port is only relevant under inet context
 	*/
 	if ((s->addr.ss_family != AF_INET) && (s->addr.ss_family != AF_INET6)) {
-		if (msg)
-			chunk_printf(msg, "Update for the current server address family is only supported through configuration file.");
+		chunk_printf(msg, "Update for the current server address family is only supported through configuration file.");
 		goto out;
 	}
 
@@ -4268,43 +4275,39 @@ int srvrq_set_srv_down(struct server *s)
  *
  * Must be called with the server lock held.
  */
-int snr_set_srv_down(struct server *s, int has_no_ip)
+int snr_set_srv_down(struct server *s)
 {
 	struct resolvers  *resolvers  = s->resolvers;
 	struct resolv_resolution *resolution = (s->resolv_requester ? s->resolv_requester->resolution : NULL);
 	int exp;
 
+	/* server already under maintenance */
+	if (s->next_admin & SRV_ADMF_RMAINT)
+		goto out;
+
 	/* If resolution is NULL we're dealing with SRV records Additional records */
-	if (resolution == NULL && has_no_ip)
+	if (resolution == NULL)
 		return srvrq_set_srv_down(s);
 
 	switch (resolution->status) {
 		case RSLV_STATUS_NONE:
 			/* status when HAProxy has just (re)started.
 			 * Nothing to do, since the task is already automatically started */
-			break;
+			goto out;
 
 		case RSLV_STATUS_VALID:
-			if (has_no_ip) {
-				/*
-				 * valid resolution but no usable server address
-				 */
-				if (s->next_admin & SRV_ADMF_RMAINT)
-					return 1;
-				srv_set_admin_flag(s, SRV_ADMF_RMAINT, SRV_ADM_STCHGC_DNS_NOIP);
-				return 0;
-			}
-
+			/*
+			 * valid resolution but no usable server address
+			 */
+			srv_set_admin_flag(s, SRV_ADMF_RMAINT, SRV_ADM_STCHGC_DNS_NOIP);
 			return 0;
 
 		case RSLV_STATUS_NX:
 			/* stop server if resolution is NX for a long enough period */
 			exp = tick_add(resolution->last_valid, resolvers->hold.nx);
 			if (!tick_is_expired(exp, now_ms))
-				break;
+				goto out; // not yet expired
 
-			if (s->next_admin & SRV_ADMF_RMAINT)
-				return 1;
 			srv_set_admin_flag(s, SRV_ADMF_RMAINT, SRV_ADM_STCHGC_DNS_NX);
 			return 0;
 
@@ -4312,10 +4315,8 @@ int snr_set_srv_down(struct server *s, int has_no_ip)
 			/* stop server if resolution is TIMEOUT for a long enough period */
 			exp = tick_add(resolution->last_valid, resolvers->hold.timeout);
 			if (!tick_is_expired(exp, now_ms))
-				break;
+				goto out; // not yet expired
 
-			if (s->next_admin & SRV_ADMF_RMAINT)
-				return 1;
 			srv_set_admin_flag(s, SRV_ADMF_RMAINT, SRV_ADM_STCHGC_DNS_TIMEOUT);
 			return 0;
 
@@ -4323,10 +4324,8 @@ int snr_set_srv_down(struct server *s, int has_no_ip)
 			/* stop server if resolution is REFUSED for a long enough period */
 			exp = tick_add(resolution->last_valid, resolvers->hold.refused);
 			if (!tick_is_expired(exp, now_ms))
-				break;
+				goto out; // not yet expired
 
-			if (s->next_admin & SRV_ADMF_RMAINT)
-				return 1;
 			srv_set_admin_flag(s, SRV_ADMF_RMAINT, SRV_ADM_STCHGC_DNS_REFUSED);
 			return 0;
 
@@ -4334,14 +4333,13 @@ int snr_set_srv_down(struct server *s, int has_no_ip)
 			/* stop server if resolution failed for a long enough period */
 			exp = tick_add(resolution->last_valid, resolvers->hold.other);
 			if (!tick_is_expired(exp, now_ms))
-				break;
+				goto out; // not yet expired
 
-			if (s->next_admin & SRV_ADMF_RMAINT)
-				return 1;
 			srv_set_admin_flag(s, SRV_ADMF_RMAINT, SRV_ADM_STCHGC_DNS_UNSPEC);
 			return 0;
 	}
 
+ out:
 	return 1;
 }
 
@@ -4425,12 +4423,6 @@ int snr_resolution_cb(struct resolv_requester *requester, struct dns_counters *c
 			has_no_ip = 1;
 			goto update_status;
 
-		case RSLV_UPD_NAME_ERROR:
-			/* update resolution status to OTHER error type */
-			resolution->status = RSLV_STATUS_OTHER;
-			has_no_ip = 1;
-			goto update_status;
-
 		default:
 			has_no_ip = 1;
 			goto invalid;
@@ -4448,7 +4440,7 @@ int snr_resolution_cb(struct resolv_requester *requester, struct dns_counters *c
 		srv_update_addr(s, firstip, firstip_sin_family, SERVER_INETADDR_UPDATER_DNS_CACHE);
 
  update_status:
-	if (!snr_set_srv_down(s, has_no_ip) && has_no_ip) {
+	if (has_no_ip && !snr_set_srv_down(s)) {
 		struct server_inetaddr s_addr;
 
 		memset(&s_addr, 0, sizeof(s_addr));
@@ -4462,7 +4454,7 @@ int snr_resolution_cb(struct resolv_requester *requester, struct dns_counters *c
 		counters->app.resolver.invalid++;
 		goto update_status;
 	}
-	if (!snr_set_srv_down(s, has_no_ip) && has_no_ip) {
+	if (has_no_ip && !snr_set_srv_down(s)) {
 		struct server_inetaddr s_addr;
 
 		memset(&s_addr, 0, sizeof(s_addr));
@@ -4548,7 +4540,7 @@ int snr_resolution_error_cb(struct resolv_requester *requester, int error_code)
 		return 0;
 
 	HA_SPIN_LOCK(SERVER_LOCK, &s->lock);
-	if (!snr_set_srv_down(s, 1)) {
+	if (!snr_set_srv_down(s)) {
 		struct server_inetaddr s_addr;
 
 		memset(&s_addr, 0, sizeof(s_addr));
