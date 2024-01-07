@@ -250,39 +250,84 @@
 #include <import/ebtree-t.h>
 #include <haproxy/api.h>
 
-static inline int flsnz8_generic(unsigned int x)
+/* returns clz from 7 to 0 for 0x01 to 0xFF. Returns 7 for 0 as well. */
+static inline unsigned int clz8(unsigned char c)
 {
-	int ret = 0;
+	unsigned int r = 4;
+
+	if (c & 0xf0) {
+		r = 0;
+		c >>= 4;
+	}
+	return r + ((0x000055afU >> (c * 2)) & 0x3);
+}
+
+/* FLSNZ: find last set bit for non-zero value. "Last" here means the highest
+ * one. It returns a value from 1 to 32 for 1<<0 to 1<<31.
+ */
+
+#if (defined(__i386__) || defined(__x86_64__)) && !defined(__atom__)
+/* DO NOT USE ON ATOM! The instruction is emulated and is several times slower
+ * than doing the math by hand.
+ */
+static inline unsigned int flsnz32(unsigned int x)
+{
+	unsigned int r;
+	__asm__("bsrl %1,%0\n"
+	        : "=r" (r) : "rm" (x));
+	return r + 1;
+}
+#define flsnz32(x) flsnz32(x)
+
+# if defined(__x86_64__)
+static inline unsigned int flsnz64(unsigned long long x)
+{
+	unsigned long long r;
+	__asm__("bsrq %1,%0\n"
+	        : "=r" (r) : "rm" (x));
+	return r + 1;
+}
+#  define flsnz64(x) flsnz64(x)
+# endif
+
+#elif !defined(__atom__) && defined(__GNUC__) && ((__GNUC__ > 4) || ((__GNUC__ == 4) && (__GNUC_MINOR__ >= 2)))
+/* gcc >= 4.2 brings __builtin_clz() and __builtin_clzl(), usable for non-x86 */
+
+static inline unsigned int flsnz32(unsigned int x)
+{
+	return 32 - __builtin_clz(x);
+}
+# define flsnz32(x) flsnz32(x)
+
+# if defined(__SIZEOF_LONG__) && (__SIZEOF_LONG__ > 4)
+static inline unsigned int flsnz64(unsigned long x)
+{
+	return (__SIZEOF_LONG__ * 8) - __builtin_clzl(x);
+}
+#  define flsnz64(x) flsnz64(x)
+# endif
+
+#endif /* end of arch-specific implementations */
+
+/*** Fallback versions below ***/
+
+#ifndef flsnz8
+# if defined(flsnz32)
+#  define flsnz8(x) flsnz32((unsigned char)x)
+# else
+static inline unsigned int flsnz8(unsigned int x)
+{
+	unsigned int ret = 0;
 	if (x >> 4) { x >>= 4; ret += 4; }
 	return ret + ((0xFFFFAA50U >> (x << 1)) & 3) + 1;
 }
+#  define flsnz8(x) flsnz8(x)
+# endif
+#endif
 
-/* Note: we never need to run fls on null keys, so we can optimize the fls
- * function by removing a conditional jump.
- */
-#if defined(__i386__) || defined(__x86_64__)
-/* this code is similar on 32 and 64 bit */
-static inline int flsnz(int x)
-{
-	int r;
-	__asm__("bsrl %1,%0\n"
-	        : "=r" (r) : "rm" (x));
-	return r+1;
-}
-
-static inline int flsnz8(unsigned char x)
-{
-	int r;
-	__asm__("movzbl %%al, %%eax\n"
-		"bsrl %%eax,%0\n"
-	        : "=r" (r) : "a" (x));
-	return r+1;
-}
-
-#else
-// returns 1 to 32 for 1<<0 to 1<<31. Undefined for 0.
-#define flsnz(___a) ({ \
-	register int ___x, ___bits = 0; \
+#ifndef flsnz32
+# define flsnz32(___a) ({ \
+	register unsigned int ___x, ___bits = 0; \
 	___x = (___a); \
 	if (___x & 0xffff0000) { ___x &= 0xffff0000; ___bits += 16;} \
 	if (___x & 0xff00ff00) { ___x &= 0xff00ff00; ___bits +=  8;} \
@@ -291,16 +336,10 @@ static inline int flsnz8(unsigned char x)
 	if (___x & 0xaaaaaaaa) { ___x &= 0xaaaaaaaa; ___bits +=  1;} \
 	___bits + 1; \
 	})
-
-static inline int flsnz8(unsigned int x)
-{
-	return flsnz8_generic(x);
-}
-
-
 #endif
 
-static inline int fls64(unsigned long long x)
+#ifndef flsnz64
+static inline unsigned int flsnz64(unsigned long long x)
 {
 	unsigned int h;
 	unsigned int bits = 32;
@@ -310,10 +349,21 @@ static inline int fls64(unsigned long long x)
 		h = x;
 		bits = 0;
 	}
-	return flsnz(h) + bits;
+	return flsnz32(h) + bits;
 }
+# define flsnz64(x) flsnz64(x)
+#endif
 
-#define fls_auto(x) ((sizeof(x) > 4) ? fls64(x) : flsnz(x))
+#ifndef flsnz_long
+# define flsnz_long(x) ((sizeof(long) > 4) ? flsnz64(x) : flsnz32(x))
+#endif
+
+#ifndef flsnz
+# define flsnz(x) ((sizeof(x) > 4) ? flsnz64(x) : (sizeof(x) > 1) ? flsnz32(x) : flsnz8(x))
+#endif
+
+#define fls64(x) flsnz64(x)
+#define fls_auto(x) ((x) ? flsnz(x) : 0)
 
 /* Linux-like "container_of". It returns a pointer to the structure of type
  * <type> which has its member <name> stored at address <ptr>.
@@ -720,9 +770,9 @@ static forceinline void __eb_delete(struct eb_node *node)
  * bytes. Note that parts or all of <ignore> bits may be rechecked. It is only
  * passed here as a hint to speed up the check.
  */
-static forceinline int equal_bits(const unsigned char *a,
-				  const unsigned char *b,
-				  int ignore, int len)
+static forceinline size_t equal_bits(const unsigned char *a,
+				     const unsigned char *b,
+				     size_t ignore, size_t len)
 {
 	for (ignore >>= 3, a += ignore, b += ignore, ignore <<= 3;
 	     ignore < len; ) {
@@ -738,7 +788,7 @@ static forceinline int equal_bits(const unsigned char *a,
 			 * it as the number of identical bits. Note that low bit numbers are
 			 * assigned to high positions in the byte, as we compare them as strings.
 			 */
-			ignore -= flsnz8(c);
+			ignore -= flsnz_long(c);
 			break;
 		}
 	}
@@ -786,12 +836,12 @@ static forceinline int check_bits(const unsigned char *a,
  * permitted. Equal strings are reported as a negative number of bits, which
  * indicates the end was reached.
  */
-static forceinline int string_equal_bits(const unsigned char *a,
-					 const unsigned char *b,
-					 int ignore)
+static forceinline size_t string_equal_bits(const unsigned char *a,
+					     const unsigned char *b,
+					     size_t ignore)
 {
-	int beg;
-	unsigned char c;
+	unsigned char c, d;
+	size_t beg;
 
 	beg = ignore >> 3;
 
@@ -799,8 +849,6 @@ static forceinline int string_equal_bits(const unsigned char *a,
 	 * or at the first zero we encounter on either side.
 	 */
 	while (1) {
-		unsigned char d;
-
 		c = a[beg];
 		d = b[beg];
 		beg++;
@@ -809,14 +857,14 @@ static forceinline int string_equal_bits(const unsigned char *a,
 		if (c)
 			break;
 		if (!d)
-			return -1;
+			return (size_t)-1;
 	}
 	/* OK now we know that a and b differ at byte <beg>, or that both are zero.
 	 * We have to find what bit is differing and report it as the number of
 	 * identical bits. Note that low bit numbers are assigned to high positions
 	 * in the byte, as we compare them as strings.
 	 */
-	return (beg << 3) - flsnz8(c);
+	return (beg << 3) - flsnz(c);
 }
 
 static forceinline int cmp_bits(const unsigned char *a, const unsigned char *b, unsigned int pos)
