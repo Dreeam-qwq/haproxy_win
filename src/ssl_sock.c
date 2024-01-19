@@ -72,6 +72,7 @@
 #include <haproxy/shctx.h>
 #include <haproxy/ssl_ckch.h>
 #include <haproxy/ssl_crtlist.h>
+#include <haproxy/ssl_gencert.h>
 #include <haproxy/ssl_sock.h>
 #include <haproxy/ssl_utils.h>
 #include <haproxy/stats.h>
@@ -504,37 +505,7 @@ static HASSL_DH *global_dh = NULL;
 static HASSL_DH *local_dh_1024 = NULL;
 static HASSL_DH *local_dh_2048 = NULL;
 static HASSL_DH *local_dh_4096 = NULL;
-#if (HA_OPENSSL_VERSION_NUMBER < 0x3000000fL)
-static DH *ssl_get_tmp_dh_cbk(SSL *ssl, int export, int keylen);
-#else
-static void ssl_sock_set_tmp_dh_from_pkey(SSL_CTX *ctx, EVP_PKEY *pkey);
-#endif
 #endif /* OPENSSL_NO_DH */
-
-#if (defined SSL_CTRL_SET_TLSEXT_HOSTNAME && !defined SSL_NO_GENERATE_CERTIFICATES)
-/* X509V3 Extensions that will be added on generated certificates */
-#define X509V3_EXT_SIZE 5
-static char *x509v3_ext_names[X509V3_EXT_SIZE] = {
-	"basicConstraints",
-	"nsComment",
-	"subjectKeyIdentifier",
-	"authorityKeyIdentifier",
-	"keyUsage",
-};
-static char *x509v3_ext_values[X509V3_EXT_SIZE] = {
-	"CA:FALSE",
-	"\"OpenSSL Generated Certificate\"",
-	"hash",
-	"keyid,issuer:always",
-	"nonRepudiation,digitalSignature,keyEncipherment"
-};
-/* LRU cache to store generated certificate */
-static struct lru64_head *ssl_ctx_lru_tree = NULL;
-static unsigned int       ssl_ctx_lru_seed = 0;
-static unsigned int	  ssl_ctx_serial;
-__decl_rwlock(ssl_ctx_lru_rwlock);
-
-#endif // SSL_CTRL_SET_TLSEXT_HOSTNAME
 
 /* The order here matters for picking a default context,
  * keep the most common keytype at the bottom of the list
@@ -1891,342 +1862,6 @@ static int ssl_sock_advertise_alpn_protos(SSL *s, const unsigned char **out,
 }
 #endif
 
-#ifdef SSL_CTRL_SET_TLSEXT_HOSTNAME
-#ifndef SSL_NO_GENERATE_CERTIFICATES
-
-/* Configure a DNS SAN extension on a certificate. */
-int ssl_sock_add_san_ext(X509V3_CTX* ctx, X509* cert, const char *servername) {
-	int failure = 0;
-	X509_EXTENSION *san_ext = NULL;
-	CONF *conf = NULL;
-	struct buffer *san_name = get_trash_chunk();
-
-	conf = NCONF_new(NULL);
-	if (!conf) {
-		failure = 1;
-		goto cleanup;
-	}
-
-	/* Build an extension based on the DNS entry above */
-	chunk_appendf(san_name, "DNS:%s", servername);
-	san_ext = X509V3_EXT_nconf_nid(conf, ctx, NID_subject_alt_name, san_name->area);
-	if (!san_ext) {
-		failure = 1;
-		goto cleanup;
-	}
-
-	/* Add the extension */
-	if (!X509_add_ext(cert, san_ext, -1 /* Add to end */)) {
-		failure = 1;
-		goto cleanup;
-	}
-
-	/* Success */
-	failure = 0;
-
-cleanup:
-	if (NULL != san_ext) X509_EXTENSION_free(san_ext);
-	if (NULL != conf) NCONF_free(conf);
-
-	return failure;
-}
-
-/* Create a X509 certificate with the specified servername and serial. This
- * function returns a SSL_CTX object or NULL if an error occurs. */
-static SSL_CTX *
-ssl_sock_do_create_cert(const char *servername, struct bind_conf *bind_conf, SSL *ssl)
-{
-	X509         *cacert  = bind_conf->ca_sign_ckch->cert;
-	EVP_PKEY     *capkey  = bind_conf->ca_sign_ckch->key;
-	SSL_CTX      *ssl_ctx = NULL;
-	X509         *newcrt  = NULL;
-	EVP_PKEY     *pkey    = NULL;
-	SSL          *tmp_ssl = NULL;
-	CONF         *ctmp    = NULL;
-	X509_NAME    *name;
-	const EVP_MD *digest;
-	X509V3_CTX    ctx;
-	unsigned int  i;
-	int 	      key_type;
-
-	/* Get the private key of the default certificate and use it */
-#ifdef HAVE_SSL_CTX_get0_privatekey
-	pkey = SSL_CTX_get0_privatekey(bind_conf->default_ctx);
-#else
-	tmp_ssl = SSL_new(bind_conf->default_ctx);
-	if (tmp_ssl)
-		pkey = SSL_get_privatekey(tmp_ssl);
-#endif
-	if (!pkey)
-		goto mkcert_error;
-
-	/* Create the certificate */
-	if (!(newcrt = X509_new()))
-		goto mkcert_error;
-
-	/* Set version number for the certificate (X509v3) and the serial
-	 * number */
-	if (X509_set_version(newcrt, 2L) != 1)
-		goto mkcert_error;
-	ASN1_INTEGER_set(X509_get_serialNumber(newcrt), _HA_ATOMIC_ADD_FETCH(&ssl_ctx_serial, 1));
-
-	/* Set duration for the certificate */
-	if (!X509_gmtime_adj(X509_getm_notBefore(newcrt), (long)-60*60*24) ||
-	    !X509_gmtime_adj(X509_getm_notAfter(newcrt),(long)60*60*24*365))
-		goto mkcert_error;
-
-	/* set public key in the certificate */
-	if (X509_set_pubkey(newcrt, pkey) != 1)
-		goto mkcert_error;
-
-	/* Set issuer name from the CA */
-	if (!(name = X509_get_subject_name(cacert)))
-		goto mkcert_error;
-	if (X509_set_issuer_name(newcrt, name) != 1)
-		goto mkcert_error;
-
-	/* Set the subject name using the same, but the CN */
-	name = X509_NAME_dup(name);
-	if (X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC,
-				       (const unsigned char *)servername,
-				       -1, -1, 0) != 1) {
-		X509_NAME_free(name);
-		goto mkcert_error;
-	}
-	if (X509_set_subject_name(newcrt, name) != 1) {
-		X509_NAME_free(name);
-		goto mkcert_error;
-	}
-	X509_NAME_free(name);
-
-	/* Add x509v3 extensions as specified */
-	ctmp = NCONF_new(NULL);
-	X509V3_set_ctx(&ctx, cacert, newcrt, NULL, NULL, 0);
-	for (i = 0; i < X509V3_EXT_SIZE; i++) {
-		X509_EXTENSION *ext;
-
-		if (!(ext = X509V3_EXT_nconf(ctmp, &ctx, x509v3_ext_names[i], x509v3_ext_values[i])))
-			goto mkcert_error;
-		if (!X509_add_ext(newcrt, ext, -1)) {
-			X509_EXTENSION_free(ext);
-			goto mkcert_error;
-		}
-		X509_EXTENSION_free(ext);
-	}
-
-	/* Add SAN extension */
-	if (ssl_sock_add_san_ext(&ctx, newcrt, servername)) {
-		goto mkcert_error;
-	}
-
-	/* Sign the certificate with the CA private key */
-
-	key_type = EVP_PKEY_base_id(capkey);
-
-	if (key_type == EVP_PKEY_DSA)
-		digest = EVP_sha1();
-	else if (key_type == EVP_PKEY_RSA)
-		digest = EVP_sha256();
-	else if (key_type == EVP_PKEY_EC)
-		digest = EVP_sha256();
-	else {
-#ifdef ASN1_PKEY_CTRL_DEFAULT_MD_NID
-		int nid;
-
-		if (EVP_PKEY_get_default_digest_nid(capkey, &nid) <= 0)
-			goto mkcert_error;
-		if (!(digest = EVP_get_digestbynid(nid)))
-			goto mkcert_error;
-#else
-		goto mkcert_error;
-#endif
-	}
-
-	if (!(X509_sign(newcrt, capkey, digest)))
-		goto mkcert_error;
-
-	/* Create and set the new SSL_CTX */
-	if (!(ssl_ctx = SSL_CTX_new(SSLv23_server_method())))
-		goto mkcert_error;
-	if (!SSL_CTX_use_PrivateKey(ssl_ctx, pkey))
-		goto mkcert_error;
-	if (!SSL_CTX_use_certificate(ssl_ctx, newcrt))
-		goto mkcert_error;
-	if (!SSL_CTX_check_private_key(ssl_ctx))
-		goto mkcert_error;
-
-	/* Build chaining the CA cert and the rest of the chain, keep these order */
-#if defined(SSL_CTX_add1_chain_cert)
-	if (!SSL_CTX_add1_chain_cert(ssl_ctx, bind_conf->ca_sign_ckch->cert)) {
-		goto mkcert_error;
-	}
-
-	if (bind_conf->ca_sign_ckch->chain) {
-		for (i = 0; i < sk_X509_num(bind_conf->ca_sign_ckch->chain); i++) {
-			X509 *chain_cert = sk_X509_value(bind_conf->ca_sign_ckch->chain, i);
-			if (!SSL_CTX_add1_chain_cert(ssl_ctx, chain_cert)) {
-				goto mkcert_error;
-			}
-		}
-	}
-#endif
-
-	if (newcrt) X509_free(newcrt);
-
-#ifndef OPENSSL_NO_DH
-#if (HA_OPENSSL_VERSION_NUMBER < 0x3000000fL)
-	SSL_CTX_set_tmp_dh_callback(ssl_ctx, ssl_get_tmp_dh_cbk);
-#else
-	ssl_sock_set_tmp_dh_from_pkey(ssl_ctx, pkey);
-#endif
-#endif
-
-#if (HA_OPENSSL_VERSION_NUMBER >= 0x10101000L)
-#if defined(SSL_CTX_set1_curves_list)
-	{
-		const char *ecdhe = (bind_conf->ssl_conf.ecdhe ? bind_conf->ssl_conf.ecdhe : ECDHE_DEFAULT_CURVE);
-		if (!SSL_CTX_set1_curves_list(ssl_ctx, ecdhe))
-			goto end;
-	}
-#endif
-#else
-#if defined(SSL_CTX_set_tmp_ecdh) && !defined(OPENSSL_NO_ECDH)
-	{
-		const char *ecdhe = (bind_conf->ssl_conf.ecdhe ? bind_conf->ssl_conf.ecdhe : ECDHE_DEFAULT_CURVE);
-		EC_KEY     *ecc;
-		int         nid;
-
-		if ((nid = OBJ_sn2nid(ecdhe)) == NID_undef)
-			goto end;
-		if (!(ecc = EC_KEY_new_by_curve_name(nid)))
-			goto end;
-		SSL_CTX_set_tmp_ecdh(ssl_ctx, ecc);
-		EC_KEY_free(ecc);
-	}
-#endif /* defined(SSL_CTX_set_tmp_ecdh) && !defined(OPENSSL_NO_ECDH) */
-#endif /* HA_OPENSSL_VERSION_NUMBER >= 0x10101000L */
- end:
-	return ssl_ctx;
-
- mkcert_error:
-	if (ctmp) NCONF_free(ctmp);
-	if (tmp_ssl) SSL_free(tmp_ssl);
-	if (ssl_ctx) SSL_CTX_free(ssl_ctx);
-	if (newcrt)  X509_free(newcrt);
-	return NULL;
-}
-
-
-/* Do a lookup for a certificate in the LRU cache used to store generated
- * certificates and immediately assign it to the SSL session if not null. */
-SSL_CTX *
-ssl_sock_assign_generated_cert(unsigned int key, struct bind_conf *bind_conf, SSL *ssl)
-{
-	struct lru64 *lru = NULL;
-
-	if (ssl_ctx_lru_tree) {
-		HA_RWLOCK_WRLOCK(SSL_GEN_CERTS_LOCK, &ssl_ctx_lru_rwlock);
-		lru = lru64_lookup(key, ssl_ctx_lru_tree, bind_conf->ca_sign_ckch->cert, 0);
-		if (lru && lru->domain) {
-			if (ssl)
-				SSL_set_SSL_CTX(ssl, (SSL_CTX *)lru->data);
-			HA_RWLOCK_WRUNLOCK(SSL_GEN_CERTS_LOCK, &ssl_ctx_lru_rwlock);
-			return (SSL_CTX *)lru->data;
-		}
-		HA_RWLOCK_WRUNLOCK(SSL_GEN_CERTS_LOCK, &ssl_ctx_lru_rwlock);
-	}
-	return NULL;
-}
-
-/* Same as <ssl_sock_assign_generated_cert> but without SSL session. This
- * function is not thread-safe, it should only be used to check if a certificate
- * exists in the lru cache (with no warranty it will not be removed by another
- * thread). It is kept for backward compatibility. */
-SSL_CTX *
-ssl_sock_get_generated_cert(unsigned int key, struct bind_conf *bind_conf)
-{
-	return ssl_sock_assign_generated_cert(key, bind_conf, NULL);
-}
-
-/* Set a certificate int the LRU cache used to store generated
- * certificate. Return 0 on success, otherwise -1 */
-int
-ssl_sock_set_generated_cert(SSL_CTX *ssl_ctx, unsigned int key, struct bind_conf *bind_conf)
-{
-	struct lru64 *lru = NULL;
-
-	if (ssl_ctx_lru_tree) {
-		HA_RWLOCK_WRLOCK(SSL_GEN_CERTS_LOCK, &ssl_ctx_lru_rwlock);
-		lru = lru64_get(key, ssl_ctx_lru_tree, bind_conf->ca_sign_ckch->cert, 0);
-		if (!lru) {
-			HA_RWLOCK_WRUNLOCK(SSL_GEN_CERTS_LOCK, &ssl_ctx_lru_rwlock);
-			return -1;
-		}
-		if (lru->domain && lru->data)
-			lru->free((SSL_CTX *)lru->data);
-		lru64_commit(lru, ssl_ctx, bind_conf->ca_sign_ckch->cert, 0, (void (*)(void *))SSL_CTX_free);
-		HA_RWLOCK_WRUNLOCK(SSL_GEN_CERTS_LOCK, &ssl_ctx_lru_rwlock);
-		return 0;
-	}
-	return -1;
-}
-
-/* Compute the key of the certificate. */
-unsigned int
-ssl_sock_generated_cert_key(const void *data, size_t len)
-{
-	return XXH32(data, len, ssl_ctx_lru_seed);
-}
-
-/* Generate a cert and immediately assign it to the SSL session so that the cert's
- * refcount is maintained regardless of the cert's presence in the LRU cache.
- */
-static int
-ssl_sock_generate_certificate(const char *servername, struct bind_conf *bind_conf, SSL *ssl)
-{
-	X509         *cacert  = bind_conf->ca_sign_ckch->cert;
-	SSL_CTX      *ssl_ctx = NULL;
-	struct lru64 *lru     = NULL;
-	unsigned int  key;
-
-	key = ssl_sock_generated_cert_key(servername, strlen(servername));
-	if (ssl_ctx_lru_tree) {
-		HA_RWLOCK_WRLOCK(SSL_GEN_CERTS_LOCK, &ssl_ctx_lru_rwlock);
-		lru = lru64_get(key, ssl_ctx_lru_tree, cacert, 0);
-		if (lru && lru->domain)
-			ssl_ctx = (SSL_CTX *)lru->data;
-		if (!ssl_ctx && lru) {
-			ssl_ctx = ssl_sock_do_create_cert(servername, bind_conf, ssl);
-			lru64_commit(lru, ssl_ctx, cacert, 0, (void (*)(void *))SSL_CTX_free);
-		}
-		SSL_set_SSL_CTX(ssl, ssl_ctx);
-		HA_RWLOCK_WRUNLOCK(SSL_GEN_CERTS_LOCK, &ssl_ctx_lru_rwlock);
-		return 1;
-	}
-	else {
-		ssl_ctx = ssl_sock_do_create_cert(servername, bind_conf, ssl);
-		SSL_set_SSL_CTX(ssl, ssl_ctx);
-		/* No LRU cache, this CTX will be released as soon as the session dies */
-		SSL_CTX_free(ssl_ctx);
-		return 1;
-	}
-	return 0;
-}
-static int
-ssl_sock_generate_certificate_from_conn(struct bind_conf *bind_conf, SSL *ssl)
-{
-	unsigned int key;
-	struct connection *conn = SSL_get_ex_data(ssl, ssl_app_data_index);
-
-	if (conn_get_dst(conn)) {
-		key = ssl_sock_generated_cert_key(conn->dst, get_addr_len(conn->dst));
-		if (ssl_sock_assign_generated_cert(key, bind_conf, ssl))
-			return 1;
-	}
-	return 0;
-}
-#endif /* !defined SSL_NO_GENERATE_CERTIFICATES */
-
 #if (HA_OPENSSL_VERSION_NUMBER < 0x1010000fL)
 
 static void ctx_set_SSLv3_func(SSL_CTX *ctx, set_context_func c)
@@ -2332,7 +1967,7 @@ static void ssl_sock_switchctx_set(SSL *ssl, SSL_CTX *ctx)
  *
  * This function does a lookup in the bind_conf sni tree so the caller should lock its tree.
  */
-static __maybe_unused struct sni_ctx *ssl_sock_chose_sni_ctx(struct bind_conf *s, const char *servername,
+struct sni_ctx *ssl_sock_chose_sni_ctx(struct bind_conf *s, const char *servername,
                                                              int have_rsa_sig, int have_ecdsa_sig)
 {
 	struct ebmb_node *node, *n, *node_ecdsa = NULL, *node_rsa = NULL, *node_anonymous = NULL;
@@ -2346,6 +1981,9 @@ static __maybe_unused struct sni_ctx *ssl_sock_chose_sni_ctx(struct bind_conf *s
 			break;
 		}
 	}
+	/* if the servername is empty look for the default in the wildcard list */
+	if (!*servername)
+		wildp = servername;
 
 	/* Look for an ECDSA, RSA and DSA certificate, first in the single
 	 * name and if not found in the wildcard  */
@@ -2444,7 +2082,8 @@ int ssl_sock_switchctx_cbk(SSL *ssl, int *al, void *arg)
 	int has_rsa_sig = 0, has_ecdsa_sig = 0;
 	struct sni_ctx *sni_ctx;
 	const char *servername;
-	size_t servername_len;
+	size_t servername_len = 0;
+	int default_lookup = 0; /* did we lookup for a default yet? */
 	int allow_early = 0;
 	int i;
 
@@ -2532,14 +2171,16 @@ int ssl_sock_switchctx_cbk(SSL *ssl, int *al, void *arg)
 			goto allow_early;
 		}
 #endif
-		/* without SNI extension, is the default_ctx (need SSL_TLSEXT_ERR_NOACK) */
-		if (!s->strict_sni) {
-			HA_RWLOCK_RDLOCK(SNI_LOCK, &s->sni_lock);
-			ssl_sock_switchctx_set(ssl, s->default_ctx);
-			HA_RWLOCK_RDUNLOCK(SNI_LOCK, &s->sni_lock);
-			goto allow_early;
-		}
-		goto abort;
+
+		/* no servername field is not compatible with strict-sni */
+		if (s->strict_sni)
+			goto abort;
+
+		/* without servername extension, look for the defaults which is
+		 * defined by an empty servername string */
+		servername = "";
+		servername_len = 0;
+		default_lookup = 1;
 	}
 
 	/* extract/check clientHello information */
@@ -2615,14 +2256,14 @@ int ssl_sock_switchctx_cbk(SSL *ssl, int *al, void *arg)
 		}
 	}
 
+sni_lookup:
 	/* we need to transform this a NULL-ended string in lowecase */
 	for (i = 0; i < trash.size && i < servername_len; i++)
 		trash.area[i] = tolower(servername[i]);
 	trash.area[i] = 0;
-	servername = trash.area;
 
 	HA_RWLOCK_RDLOCK(SNI_LOCK, &s->sni_lock);
-	sni_ctx = ssl_sock_chose_sni_ctx(s, servername, has_rsa_sig, has_ecdsa_sig);
+	sni_ctx = ssl_sock_chose_sni_ctx(s, trash.area, has_rsa_sig, has_ecdsa_sig);
 	if (sni_ctx) {
 		/* switch ctx */
 		struct ssl_bind_conf *conf = sni_ctx->conf;
@@ -2639,17 +2280,20 @@ int ssl_sock_switchctx_cbk(SSL *ssl, int *al, void *arg)
 
 	HA_RWLOCK_RDUNLOCK(SNI_LOCK, &s->sni_lock);
 #if (!defined SSL_NO_GENERATE_CERTIFICATES)
-	if (s->options & BC_O_GENERATE_CERTS && ssl_sock_generate_certificate(servername, s, ssl)) {
+	if (s->options & BC_O_GENERATE_CERTS && ssl_sock_generate_certificate(trash.area, s, ssl)) {
 		/* switch ctx done in ssl_sock_generate_certificate */
 		goto allow_early;
 	}
 #endif
-	if (!s->strict_sni) {
-		/* no certificate match, is the default_ctx */
-		HA_RWLOCK_RDLOCK(SNI_LOCK, &s->sni_lock);
-		ssl_sock_switchctx_set(ssl, s->default_ctx);
-		HA_RWLOCK_RDUNLOCK(SNI_LOCK, &s->sni_lock);
-		goto allow_early;
+
+	if (!s->strict_sni && !default_lookup) {
+		/* we didn't find a SNI, and we didn't look for a default
+		 * look again to find a matching default cert */
+		servername = "";
+		servername_len = 0;
+		default_lookup = 1;
+
+		goto sni_lookup;
 	}
 
 	/* We are about to raise an handshake error so the servername extension
@@ -2703,6 +2347,7 @@ int ssl_sock_switchctx_cbk(SSL *ssl, int *al, void *priv)
 	const char *wildp = NULL;
 	struct ebmb_node *node, *n;
 	struct bind_conf *s = priv;
+	int default_lookup = 0; /* did we lookup for a default yet? */
 #ifdef USE_QUIC
 	const uint8_t *extension_data;
 	size_t extension_len;
@@ -2742,11 +2387,14 @@ int ssl_sock_switchctx_cbk(SSL *ssl, int *al, void *priv)
 #endif
 		if (s->strict_sni)
 			return SSL_TLSEXT_ERR_ALERT_FATAL;
-		HA_RWLOCK_RDLOCK(SNI_LOCK, &s->sni_lock);
-		ssl_sock_switchctx_set(ssl, s->default_ctx);
-		HA_RWLOCK_RDUNLOCK(SNI_LOCK, &s->sni_lock);
-		return SSL_TLSEXT_ERR_NOACK;
+
+		/* without servername extension, look for the defaults which is
+		 * defined by an empty servername string */
+		servername = "";
+		default_lookup = 1;
 	}
+
+sni_lookup:
 
 	for (i = 0; i < trash.size; i++) {
 		if (!servername[i])
@@ -2756,6 +2404,8 @@ int ssl_sock_switchctx_cbk(SSL *ssl, int *al, void *priv)
 			wildp = &trash.area[i];
 	}
 	trash.area[i] = 0;
+	if(!*trash.area) /* handle the default which in wildcard tree */
+		wildp = trash.area;
 
 	HA_RWLOCK_RDLOCK(SNI_LOCK, &s->sni_lock);
 	node = NULL;
@@ -2785,13 +2435,17 @@ int ssl_sock_switchctx_cbk(SSL *ssl, int *al, void *priv)
 			return SSL_TLSEXT_ERR_OK;
 		}
 #endif
-		if (s->strict_sni) {
-			HA_RWLOCK_RDUNLOCK(SNI_LOCK, &s->sni_lock);
-			return SSL_TLSEXT_ERR_ALERT_FATAL;
-		}
-		ssl_sock_switchctx_set(ssl, s->default_ctx);
 		HA_RWLOCK_RDUNLOCK(SNI_LOCK, &s->sni_lock);
-		return SSL_TLSEXT_ERR_OK;
+
+		if (!s->strict_sni && !default_lookup) {
+			/* we didn't find a SNI, and we didn't look for a default
+			 * look again to find a matching default cert */
+			servername = "";
+			default_lookup = 1;
+
+			goto sni_lookup;
+		}
+		return SSL_TLSEXT_ERR_ALERT_FATAL;
 	}
 
 	/* switch ctx */
@@ -2800,7 +2454,6 @@ int ssl_sock_switchctx_cbk(SSL *ssl, int *al, void *priv)
 	return SSL_TLSEXT_ERR_OK;
 }
 #endif /* (!) OPENSSL_IS_BORINGSSL */
-#endif /* SSL_CTRL_SET_TLSEXT_HOSTNAME */
 
 #if defined(USE_OPENSSL_WOLFSSL)
 /* This implement the equivalent of the clientHello Callback but using the cert_cb.
@@ -2814,6 +2467,7 @@ static int ssl_sock_switchctx_wolfSSL_cbk(WOLFSSL* ssl, void* arg)
 	struct bind_conf *s = arg;
 	int has_rsa_sig = 0, has_ecdsa_sig = 0;
 	const char *servername;
+	int default_lookup = 0;
 	struct sni_ctx *sni_ctx;
 	int i;
 
@@ -2825,14 +2479,13 @@ static int ssl_sock_switchctx_wolfSSL_cbk(WOLFSSL* ssl, void* arg)
 
 	servername = SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name);
 	if (!servername) {
-		/* without SNI extension, is the default_ctx (need SSL_TLSEXT_ERR_NOACK) */
-		if (!s->strict_sni) {
-			HA_RWLOCK_RDLOCK(SNI_LOCK, &s->sni_lock);
-			ssl_sock_switchctx_set(ssl, s->default_ctx);
-			HA_RWLOCK_RDUNLOCK(SNI_LOCK, &s->sni_lock);
-			goto allow_early;
-		}
-		goto abort;
+		if (s->strict_sni)
+			goto abort;
+
+		/* without servername extension, look for the defaults which is
+		 * defined by an empty servername string */
+		servername = "";
+		default_lookup = 1;
 	}
 
 	/* extract sigalgs and ciphers */
@@ -2876,6 +2529,8 @@ static int ssl_sock_switchctx_wolfSSL_cbk(WOLFSSL* ssl, void* arg)
 		}
 	}
 
+sni_lookup:
+
 	/* we need to transform this into a NULL-ended string in lowecase */
 	for (i = 0; i < trash.size && servername[i] != '\0'; i++)
 		trash.area[i] = tolower(servername[i]);
@@ -2897,12 +2552,13 @@ static int ssl_sock_switchctx_wolfSSL_cbk(WOLFSSL* ssl, void* arg)
 	}
 
 	HA_RWLOCK_RDUNLOCK(SNI_LOCK, &s->sni_lock);
-	if (!s->strict_sni) {
-		/* no certificate match, is the default_ctx */
-		HA_RWLOCK_RDLOCK(SNI_LOCK, &s->sni_lock);
-		ssl_sock_switchctx_set(ssl, s->default_ctx);
-		HA_RWLOCK_RDUNLOCK(SNI_LOCK, &s->sni_lock);
-		goto allow_early;
+	if (!s->strict_sni && !default_lookup) {
+		/* we didn't find a SNI, and we didn't look for a default
+		 * look again to find a matching default cert */
+		servername = "";
+		default_lookup = 1;
+
+		goto sni_lookup;
 	}
 
 	/* We are about to raise an handshake error so the servername extension
@@ -3205,7 +2861,7 @@ static HASSL_DH *ssl_get_tmp_dh(EVP_PKEY *pkey)
 #if (HA_OPENSSL_VERSION_NUMBER < 0x3000000fL)
 /* Returns Diffie-Hellman parameters matching the private key length
    but not exceeding global_ssl.default_dh_param */
-static HASSL_DH *ssl_get_tmp_dh_cbk(SSL *ssl, int export, int keylen)
+HASSL_DH *ssl_get_tmp_dh_cbk(SSL *ssl, int export, int keylen)
 {
 	EVP_PKEY *pkey = SSL_get_privatekey(ssl);
 
@@ -3231,7 +2887,7 @@ static int ssl_sock_set_tmp_dh(SSL_CTX *ctx, HASSL_DH *dh)
 }
 
 #if (HA_OPENSSL_VERSION_NUMBER >= 0x3000000fL)
-static void ssl_sock_set_tmp_dh_from_pkey(SSL_CTX *ctx, EVP_PKEY *pkey)
+void ssl_sock_set_tmp_dh_from_pkey(SSL_CTX *ctx, EVP_PKEY *pkey)
 {
 	HASSL_DH *dh = NULL;
 	if (pkey && (dh = ssl_get_tmp_dh(pkey))) {
@@ -3316,7 +2972,7 @@ static int ckch_inst_add_cert_sni(SSL_CTX *ctx, struct ckch_inst *ckch_inst,
                                  struct pkey_info kinfo, char *name, int order)
 {
 	struct sni_ctx *sc;
-	int wild = 0, neg = 0;
+	int wild = 0, neg = 0, default_crt = 0;
 
 	if (*name == '!') {
 		neg = 1;
@@ -3325,11 +2981,14 @@ static int ckch_inst_add_cert_sni(SSL_CTX *ctx, struct ckch_inst *ckch_inst,
 	if (*name == '*') {
 		wild = 1;
 		name++;
+		/* if this was only a '*' filter, this is a default cert */
+		if (!*name)
+			default_crt = 1;
 	}
 	/* !* filter is a nop */
 	if (neg && wild)
 		return order;
-	if (*name) {
+	if (*name || default_crt) {
 		int j, len;
 		len = strlen(name);
 		for (j = 0; j < len && j < trash.size; j++)
@@ -3400,14 +3059,6 @@ void ssl_sock_load_cert_sni(struct ckch_inst *ckch_inst, struct bind_conf *bind_
 			ebst_insert(&bind_conf->sni_w_ctx, &sc0->name);
 		else
 			ebst_insert(&bind_conf->sni_ctx, &sc0->name);
-	}
-
-	/* replace the default_ctx if required with the instance's ctx. */
-	if (ckch_inst->is_default) {
-		SSL_CTX_free(bind_conf->default_ctx);
-		SSL_CTX_up_ref(ckch_inst->ctx);
-		bind_conf->default_ctx = ckch_inst->ctx;
-		bind_conf->default_inst = ckch_inst;
 	}
 }
 
@@ -3725,7 +3376,7 @@ end:
  *     ERR_WARN if a warning is available into err
  */
 int ckch_inst_new_load_store(const char *path, struct ckch_store *ckchs, struct bind_conf *bind_conf,
-                                    struct ssl_bind_conf *ssl_conf, char **sni_filter, int fcount, struct ckch_inst **ckchi, char **err)
+                                    struct ssl_bind_conf *ssl_conf, char **sni_filter, int fcount, int is_default, struct ckch_inst **ckchi, char **err)
 {
 	SSL_CTX *ctx;
 	int i;
@@ -3838,20 +3489,16 @@ int ckch_inst_new_load_store(const char *path, struct ckch_store *ckchs, struct 
 	 * the tree, so it will be discovered and cleaned in time.
 	 */
 
-#ifndef SSL_CTRL_SET_TLSEXT_HOSTNAME
-	if (bind_conf->default_ctx) {
-		memprintf(err, "%sthis version of openssl cannot load multiple SSL certificates.\n",
-		          err && *err ? *err : "");
-		errcode |= ERR_ALERT | ERR_FATAL;
-		goto error;
-	}
-#endif
-	if (!bind_conf->default_ctx) {
-		bind_conf->default_ctx = ctx;
-		bind_conf->default_ssl_conf = ssl_conf;
+	if (is_default) {
 		ckch_inst->is_default = 1;
-		SSL_CTX_up_ref(ctx);
-		bind_conf->default_inst = ckch_inst;
+
+		/* insert an empty SNI which will be used to lookup default certificate */
+		order = ckch_inst_add_cert_sni(ctx, ckch_inst, bind_conf, ssl_conf, kinfo, "*", order);
+		if (order < 0) {
+			memprintf(err, "%sunable to create a sni context.\n", err && *err ? *err : "");
+			errcode |= ERR_ALERT | ERR_FATAL;
+			goto error;
+		}
 	}
 
 	/* Always keep a reference to the newly constructed SSL_CTX in the
@@ -3873,9 +3520,6 @@ int ckch_inst_new_load_store(const char *path, struct ckch_store *ckchs, struct 
 error:
 	/* free the allocated sni_ctxs */
 	if (ckch_inst) {
-		if (ckch_inst->is_default)
-			SSL_CTX_free(ctx);
-
 		ckch_inst_free(ckch_inst);
 		ckch_inst = NULL;
 	}
@@ -3948,12 +3592,14 @@ error:
 /* Returns a set of ERR_* flags possibly with an error in <err>. */
 static int ssl_sock_load_ckchs(const char *path, struct ckch_store *ckchs,
                                struct bind_conf *bind_conf, struct ssl_bind_conf *ssl_conf,
-                               char **sni_filter, int fcount, struct ckch_inst **ckch_inst, char **err)
+                               char **sni_filter, int fcount,
+                               int is_default,
+                               struct ckch_inst **ckch_inst, char **err)
 {
 	int errcode = 0;
 
 	/* we found the ckchs in the tree, we can use it directly */
-	errcode |= ckch_inst_new_load_store(path, ckchs, bind_conf, ssl_conf, sni_filter, fcount, ckch_inst, err);
+	errcode |= ckch_inst_new_load_store(path, ckchs, bind_conf, ssl_conf, sni_filter, fcount, is_default, ckch_inst, err);
 
 	if (errcode & ERR_CODE)
 		return errcode;
@@ -4062,9 +3708,17 @@ int ssl_sock_load_cert_list_file(char *file, int dir, struct bind_conf *bind_con
 	list_for_each_entry(entry, &crtlist->ord_entries, by_crtlist) {
 		struct ckch_store *store;
 		struct ckch_inst *ckch_inst = NULL;
+		int is_default = 0;
 
 		store = entry->node.key;
-		cfgerr |= ssl_sock_load_ckchs(store->path, store, bind_conf, entry->ssl_conf, entry->filters, entry->fcount, &ckch_inst, err);
+
+		/* if the SNI trees were empty the first "crt" become a default certificate,
+		 * it can be applied on multiple certificates if it's a bundle */
+		if (eb_is_empty(&bind_conf->sni_ctx) && eb_is_empty(&bind_conf->sni_w_ctx))
+			is_default = 1;
+
+
+		cfgerr |= ssl_sock_load_ckchs(store->path, store, bind_conf, entry->ssl_conf, entry->filters, entry->fcount, is_default, &ckch_inst, err);
 		if (cfgerr & ERR_CODE) {
 			memprintf(err, "error processing line %d in file '%s' : %s", entry->linenum, file, *err);
 			goto error;
@@ -4106,7 +3760,7 @@ error:
 }
 
 /* Returns a set of ERR_* flags possibly with an error in <err>. */
-int ssl_sock_load_cert(char *path, struct bind_conf *bind_conf, char **err)
+int ssl_sock_load_cert(char *path, struct bind_conf *bind_conf, int is_default, char **err)
 {
 	struct stat buf;
 	int cfgerr = 0;
@@ -4114,9 +3768,16 @@ int ssl_sock_load_cert(char *path, struct bind_conf *bind_conf, char **err)
 	struct ckch_inst *ckch_inst = NULL;
 	int found = 0; /* did we found a file to load ? */
 
+	/* if the SNI trees were empty the first "crt" become a default certificate,
+	 * it can be applied on multiple certificates if it's a bundle */
+	if (is_default == 0) {
+		if (eb_is_empty(&bind_conf->sni_ctx) && eb_is_empty(&bind_conf->sni_w_ctx))
+			is_default = 1;
+	}
+
 	if ((ckchs = ckchs_lookup(path))) {
 		/* we found the ckchs in the tree, we can use it directly */
-		 cfgerr |= ssl_sock_load_ckchs(path, ckchs, bind_conf, NULL, NULL, 0, &ckch_inst, err);
+		 cfgerr |= ssl_sock_load_ckchs(path, ckchs, bind_conf, NULL, NULL, 0, is_default, &ckch_inst, err);
 		 found++;
 	} else if (stat(path, &buf) == 0) {
 		found++;
@@ -4124,7 +3785,7 @@ int ssl_sock_load_cert(char *path, struct bind_conf *bind_conf, char **err)
 			ckchs =  ckchs_load_cert_file(path, err);
 			if (!ckchs)
 				cfgerr |= ERR_ALERT | ERR_FATAL;
-			cfgerr |= ssl_sock_load_ckchs(path, ckchs, bind_conf, NULL, NULL, 0, &ckch_inst, err);
+			cfgerr |= ssl_sock_load_ckchs(path, ckchs, bind_conf, NULL, NULL, 0, is_default, &ckch_inst, err);
 		} else {
 			cfgerr |= ssl_sock_load_cert_list_file(path, 1, bind_conf, bind_conf->frontend, err);
 		}
@@ -4144,7 +3805,7 @@ int ssl_sock_load_cert(char *path, struct bind_conf *bind_conf, char **err)
 					continue;
 
 				if ((ckchs = ckchs_lookup(fp))) {
-					cfgerr |= ssl_sock_load_ckchs(fp, ckchs, bind_conf, NULL, NULL, 0, &ckch_inst, err);
+					cfgerr |= ssl_sock_load_ckchs(fp, ckchs, bind_conf, NULL, NULL, 0, is_default, &ckch_inst, err);
 					found++;
 				} else {
 					if (stat(fp, &buf) == 0) {
@@ -4152,7 +3813,7 @@ int ssl_sock_load_cert(char *path, struct bind_conf *bind_conf, char **err)
 						ckchs =  ckchs_load_cert_file(fp, err);
 						if (!ckchs)
 							cfgerr |= ERR_ALERT | ERR_FATAL;
-						cfgerr |= ssl_sock_load_ckchs(fp, ckchs, bind_conf, NULL, NULL, 0, &ckch_inst, err);
+						cfgerr |= ssl_sock_load_ckchs(fp, ckchs, bind_conf, NULL, NULL, 0, is_default, &ckch_inst, err);
 					}
 				}
 			}
@@ -5520,16 +5181,12 @@ int ssl_sock_prepare_all_ctx(struct bind_conf *bind_conf)
 		   to initial_ctx in ssl_initial_ctx. */
 		errcode |= ssl_sock_prep_ctx_and_inst(bind_conf, NULL, bind_conf->initial_ctx, NULL, &errmsg);
 	}
-	if (bind_conf->default_ctx) {
-		errcode |= ssl_sock_prep_ctx_and_inst(bind_conf, bind_conf->default_ssl_conf, bind_conf->default_ctx, bind_conf->default_inst, &errmsg);
-	}
 
 	node = ebmb_first(&bind_conf->sni_ctx);
 	while (node) {
 		sni = ebmb_entry(node, struct sni_ctx, name);
-		if (!sni->order && sni->ctx != bind_conf->default_ctx) {
-			/* only initialize the CTX on its first occurrence and
-			   if it is not the default_ctx */
+		if (!sni->order) {
+			/* only initialize the CTX on its first occurrence */
 			errcode |= ssl_sock_prep_ctx_and_inst(bind_conf, sni->conf, sni->ctx, sni->ckch_inst, &errmsg);
 		}
 		node = ebmb_next(node);
@@ -5538,9 +5195,8 @@ int ssl_sock_prepare_all_ctx(struct bind_conf *bind_conf)
 	node = ebmb_first(&bind_conf->sni_w_ctx);
 	while (node) {
 		sni = ebmb_entry(node, struct sni_ctx, name);
-		if (!sni->order && sni->ctx != bind_conf->default_ctx) {
-			/* only initialize the CTX on its first occurrence and
-			   if it is not the default_ctx */
+		if (!sni->order) {
+			/* only initialize the CTX on its first occurrence */
 			errcode |= ssl_sock_prep_ctx_and_inst(bind_conf, sni->conf, sni->ctx, sni->ckch_inst, &errmsg);
 		}
 		node = ebmb_next(node);
@@ -5567,14 +5223,17 @@ int ssl_sock_prepare_bind_conf(struct bind_conf *bind_conf)
 	int alloc_ctx;
 	int err;
 
+	/* check if some certificates were loaded but no ssl keyword is used */
 	if (!(bind_conf->options & BC_O_USE_SSL)) {
-		if (bind_conf->default_ctx) {
+		if (!eb_is_empty(&bind_conf->sni_ctx) || !eb_is_empty(&bind_conf->sni_w_ctx)) {
 			ha_warning("Proxy '%s': A certificate was specified but SSL was not enabled on bind '%s' at [%s:%d] (use 'ssl').\n",
 				   px->id, bind_conf->arg, bind_conf->file, bind_conf->line);
 		}
 		return 0;
 	}
-	if (!bind_conf->default_ctx) {
+
+	/* check if we have certificates */
+	if (eb_is_empty(&bind_conf->sni_ctx) && eb_is_empty(&bind_conf->sni_w_ctx)) {
 		if (bind_conf->strict_sni && !(bind_conf->options & BC_O_GENERATE_CERTS)) {
 			ha_warning("Proxy '%s': no SSL certificate specified for bind '%s' at [%s:%d], ssl connections will fail (use 'crt').\n",
 				   px->id, bind_conf->arg, bind_conf->file, bind_conf->line);
@@ -5585,6 +5244,19 @@ int ssl_sock_prepare_bind_conf(struct bind_conf *bind_conf)
 			return -1;
 		}
 	}
+
+	if ((bind_conf->options & BC_O_GENERATE_CERTS)) {
+		struct sni_ctx *sni_ctx;
+
+		/* if we use the generate-certificates option, look for the first default cert available */
+		sni_ctx = ssl_sock_chose_sni_ctx(bind_conf, "", 1, 1);
+		if (!sni_ctx) {
+			ha_alert("Proxy '%s': no SSL certificate specified for bind '%s' and 'generate-certificates' option at [%s:%d] (use 'crt').\n",
+				 px->id, bind_conf->arg, bind_conf->file, bind_conf->line);
+			return -1;
+		}
+	}
+
 	if (!ssl_shctx && global.tune.sslcachesize) {
 		alloc_ctx = shctx_init(&ssl_shctx, global.tune.sslcachesize,
 		                       sizeof(struct sh_ssl_sess_hdr) + SHSESS_BLOCK_MIN_SIZE, -1,
@@ -5686,10 +5358,6 @@ void ssl_sock_free_all_ctx(struct bind_conf *bind_conf)
 
 	SSL_CTX_free(bind_conf->initial_ctx);
 	bind_conf->initial_ctx = NULL;
-	SSL_CTX_free(bind_conf->default_ctx);
-	bind_conf->default_ctx = NULL;
-	bind_conf->default_inst = NULL;
-	bind_conf->default_ssl_conf = NULL;
 }
 
 
@@ -5717,81 +5385,6 @@ void ssl_sock_destroy_bind_conf(struct bind_conf *bind_conf)
 	bind_conf->keys_ref = NULL;
 	bind_conf->ca_sign_pass = NULL;
 	bind_conf->ca_sign_file = NULL;
-}
-
-/* Load CA cert file and private key used to generate certificates */
-int
-ssl_sock_load_ca(struct bind_conf *bind_conf)
-{
-	struct proxy *px = bind_conf->frontend;
-	struct ckch_data *data = NULL;
-	int ret = 0;
-	char *err = NULL;
-
-	if (!(bind_conf->options & BC_O_GENERATE_CERTS))
-		return ret;
-
-#if (defined SSL_CTRL_SET_TLSEXT_HOSTNAME && !defined SSL_NO_GENERATE_CERTIFICATES)
-	if (global_ssl.ctx_cache) {
-		ssl_ctx_lru_tree = lru64_new(global_ssl.ctx_cache);
-	}
-	ssl_ctx_lru_seed = (unsigned int)time(NULL);
-	ssl_ctx_serial   = now_ms;
-#endif
-
-	if (!bind_conf->ca_sign_file) {
-		ha_alert("Proxy '%s': cannot enable certificate generation, "
-			 "no CA certificate File configured at [%s:%d].\n",
-			 px->id, bind_conf->file, bind_conf->line);
-		goto failed;
-	}
-
-	/* Allocate cert structure */
-	data = calloc(1, sizeof(*data));
-	if (!data) {
-		ha_alert("Proxy '%s': Failed to read CA certificate file '%s' at [%s:%d]. Chain allocation failure\n",
-			px->id, bind_conf->ca_sign_file, bind_conf->file, bind_conf->line);
-		goto failed;
-	}
-
-	/* Try to parse file */
-	if (ssl_sock_load_files_into_ckch(bind_conf->ca_sign_file, data, &err)) {
-		ha_alert("Proxy '%s': Failed to read CA certificate file '%s' at [%s:%d]. Chain loading failed: %s\n",
-			px->id, bind_conf->ca_sign_file, bind_conf->file, bind_conf->line, err);
-		free(err);
-		goto failed;
-	}
-
-	/* Fail if missing cert or pkey */
-	if ((!data->cert) || (!data->key)) {
-		ha_alert("Proxy '%s': Failed to read CA certificate file '%s' at [%s:%d]. Chain missing certificate or private key\n",
-			px->id, bind_conf->ca_sign_file, bind_conf->file, bind_conf->line);
-		goto failed;
-	}
-
-	/* Final assignment to bind */
-	bind_conf->ca_sign_ckch = data;
-	return ret;
-
- failed:
-	if (data) {
-		ssl_sock_free_cert_key_and_chain_contents(data);
-		free(data);
-	}
-
-	bind_conf->options &= ~BC_O_GENERATE_CERTS;
-	ret++;
-	return ret;
-}
-
-/* Release CA cert and private key used to generate certificated */
-void
-ssl_sock_free_ca(struct bind_conf *bind_conf)
-{
-	if (bind_conf->ca_sign_ckch) {
-		ssl_sock_free_cert_key_and_chain_contents(bind_conf->ca_sign_ckch);
-		ha_free(&bind_conf->ca_sign_ckch);
-	}
 }
 
 /*
@@ -8041,12 +7634,6 @@ void ssl_free_dh(void) {
 
 static void __ssl_sock_deinit(void)
 {
-#if (defined SSL_CTRL_SET_TLSEXT_HOSTNAME && !defined SSL_NO_GENERATE_CERTIFICATES)
-	if (ssl_ctx_lru_tree) {
-		lru64_destroy(ssl_ctx_lru_tree);
-		HA_RWLOCK_DESTROY(&ssl_ctx_lru_rwlock);
-	}
-#endif
 
 #if (HA_OPENSSL_VERSION_NUMBER < 0x10100000L)
         ERR_remove_state(0);

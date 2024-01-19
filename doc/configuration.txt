@@ -1919,6 +1919,40 @@ hard-stop-after <time>
 
   See also: grace
 
+http-err-codes [+-]<range>[,...] [...]
+  Replace, reduce or extend the list of status codes that define an error as
+  considered by the termination codes and the "http_err_cnt" counter in stick
+  tables. The default range for errors is 400 to 499, but in certain contexts
+  some users prefer to exclude specific codes, especially when tracking client
+  errors (e.g. 404 on systems with dynamically generated contents). See also
+  "http-fail-codes" and "http_err_cnt".
+
+  A range specified without '+' nor '-' redefines the existing range to the new
+  one. A range starting with '+' extends the existing range to also include the
+  specified one, which may or may not overlap with the existing one. A range
+  starting with '-' removes the specified range from the existing one. A range
+  consists in a number from 100 to 599, optionally followed by "-" followed by
+  another number greater than or equal to the first one to indicate the high
+  boundary of the range. Multiple ranges may be delimited by commas for a same
+  add/del/ replace operation.
+
+  Example:
+     http-err-codes 400,402-444,446-480,490   # sets exactly these codes
+     http-err-codes 400-499 -450 +500         # sets 400 to 500 except 450
+     http-err-codes -450-459                  # removes 450 to 459 from range
+     http-err-codes +501,505                  # adds 501 and 505 to range
+
+http-fail-codes [+-]<range>[,...] [...]
+  Replace, reduce or extend the list of status codes that define a failure as
+  considered by the termination codes and the "http_fail_cnt" counter in stick
+  tables. The default range for failures is 500 to 599 except 501 and 505 which
+  can be triggered by clients, and normally indicate a failure from the server
+  to process the request. Some users prefer to exclude certain codes in certain
+  contexts where it is known they're not relevant, such as 500 in certain SOAP
+  environments as it doesn't translate a server fault there. The syntax is
+  exactly the same as for http-err-codes above. See also "http-err-codes" and
+  "http_fail_cnt".
+
 httpclient.resolvers.disabled <on|off>
   Disable the DNS resolution of the httpclient. Prevent the creation of the
   "default" resolvers section.
@@ -3904,11 +3938,6 @@ tune.ssl.ocsp-update.mindelay <number>
   expiration times. It must be set to a lower value than
   "tune.ssl.ocsp-update.maxdelay". See option "ocsp-update" for more
   information about the auto update mechanism.
-
-  Sets the size of the cache used to store generated certificates to <number>
-  entries. This is a LRU cache. Because generating a SSL certificate
-  dynamically is expensive, they are cached. The default cache size is set to
-  1000 entries.
 
 tune.stick-counters <number>
   Sets the number of stick-counters that may be tracked at the same time by a
@@ -13754,7 +13783,7 @@ sc-set-gpt                     X     X     X     X            X   X   X
 sc-set-gpt0                    X     X     X     X            X   X   X
 send-spoe-group                -     -     X     X            X   X   -
 set-bandwidth-limit            -     -     X     X            X   X   -
-set-dst <expr>                 X     X     X     -            X   -   -
+set-dst                        X     X     X     -            X   -   -
 set-dst-port                   X     X     X     -            X   -   -
 set-header                     -     -     -     -            X   X   X
 set-log-level                  -     -     X     X            X   X   X
@@ -15444,7 +15473,13 @@ crt <cert>
   match any certificate, then the first loaded certificate will be presented.
   This means that when loading certificates from a directory, it is highly
   recommended to load the default one first as a file or to ensure that it will
-  always be the first one in the directory.
+  always be the first one in the directory. In order to chose multiple default
+  certificates (1 rsa and 1 ecdsa), there are 3 options:
+  - A multi-cert bundle can be configured as the first certificate
+    (`crt foobar.pem` in the configuration where the existing files
+    are `foobar.pem.ecdsa` and `foobar.pem.rsa`.
+  - Or a '*' filter for each certificate in a crt-list line.
+  - The 'default-crt' keyword can be used.
 
   Note that the same cert may be loaded multiple times without side effects.
 
@@ -15531,7 +15566,10 @@ crt-list <file>
   filter is found on any crt-list. The SNI filter !* can be used after the first
   declared certificate to not include its CN and SAN in the SNI tree, so it will
   never match except if no other certificate matches. This way the first
-  declared certificate act as a fallback.
+  declared certificate act as a fallback. It is also possible to declare a '*'
+  filter, which will allow to chose this certificate as default. When multiple
+  default certificates are defined, HAProxy is able to chose the right ECDSA or
+  RSA one depending on what the client supports.
 
   When no ALPN is set, the "bind" line's default one is used. If a "bind" line
   has no "no-alpn", "alpn" nor "npn" set, a default value will be used
@@ -15545,6 +15583,25 @@ crt-list <file>
         cert2.pem [alpn h2,http/1.1]
         certW.pem                   *.domain.tld !secure.domain.tld
         certS.pem [curves X25519:P-256 ciphers ECDHE-ECDSA-AES256-GCM-SHA384] secure.domain.tld
+        default.pem.rsa *
+        default.pem.ecdsa *
+
+default-crt <cert>
+  This option does the same as the "crt" option, with the difference that this
+  certificate will be used as a default one. It is possible to add multiple
+  default certificates to have an ECDSA and an RSA one, having more is not
+  really useful.
+
+  A default certificate is used when no "strict-sni" option is used on the bind
+  line. A default certificate is provided when the servername extension was not
+  used by the client, or when the servername does not match any configured
+  certificate.
+
+  Example:
+
+     bind *:443 default-crt foobar.pem.rsa default-crt foobar.pem.ecdsa crt website.pem.rsa
+
+  See also the "crt" keyword.
 
 defer-accept
   Is an optional keyword which is supported only on certain Linux kernels. It
@@ -19328,8 +19385,8 @@ map_<match_type>_<output_type>(<map_name>[,<default_value>])
   expression and modify the output replacing back reference (like "\1") by
   the corresponding match text.
 
-  Output type "key" means that it its the matched entry's key (as found in the
-  map file)that will be returned as a string instead of the value. Note that
+  Output type "key" means that it is the matched entry's key (as found in the
+  map file) that will be returned as a string instead of the value. Note that
   optional <default_value> argument is not supported when "key" output type is
   used.
 
@@ -20912,6 +20969,7 @@ bc_dst                                             ip
 bc_dst_port                                        integer
 bc_err                                             integer
 bc_err_str                                         string
+bc_glitches                                        integer
 bc_http_major                                      integer
 bc_src                                             ip
 bc_src_port                                        integer
@@ -20936,6 +20994,7 @@ fc_dst_port                                        integer
 fc_err                                             integer
 fc_err_str                                         string
 fc_fackets                                         integer
+fc_glitches                                        integer
 fc_http_major                                      integer
 fc_lost                                            integer
 fc_pp_authority                                    string
@@ -21149,6 +21208,20 @@ bc_err_str : string
   "fc_err_str" fetch for a full list of error codes and their
   corresponding error message.
 
+bc_glitches : integer
+  Returns the number of protocol glitches counted on the backend connection.
+  These generally cover protocol violations as well as small anomalies that
+  generally indicate a bogus or misbehaving server that may cause trouble in
+  the infrastructure (e.g. cause connections to be aborted early, inducing
+  frequent TLS renegotiations). These may also be caused by too large responses
+  that cannot fit into a single buffer, explaining HTTP 502 errors. Ideally
+  this number should remain zero, though it's generally fine if it remains very
+  low compared to the total number of requests. These values should normally
+  not be considered as alarming (especially small ones), though a sudden jump
+  may indicate an anomaly somewhere. Not all protocol multiplexers measure this
+  metric and the only way to get more details about the events is to enable
+  traces to capture all exchanges.
+
 bc_http_major : integer
   Returns the backend connection's HTTP major version encoding, which may be 1
   for HTTP/0.9 to HTTP/1.1 or 2 for HTTP/2. Note, this is based on the on-wire
@@ -21353,6 +21426,23 @@ fc_fackets : integer
   connection. If the server connection is not established, if the connection is
   not TCP or if the operating system does not support TCP_INFO, for example
   Linux kernels before 2.4, the sample fetch fails.
+
+fc_glitches : integer
+  Returns the number of protocol glitches counted on the frontend connection.
+  These generally cover protocol violations as well as small anomalies that
+  generally indicate a bogus or misbehaving client that may cause trouble in
+  the infrastructure, such as excess of errors in the logs, or many connections
+  being aborted early, inducing frequent TLS renegotiations. These may also be
+  caused by too large requests that cannot fit into a single buffer, explaining
+  HTTP 400 errors. Ideally this number should remain zero, though it may be
+  possible that some browsers playing with the protocol boundaries trigger it
+  once in a while. These values should normally not be considered as alarming
+  (especially small ones), though a sudden jump may indicate an anomaly
+  somewhere. Large values (i.e. hundreds to thousands per connection, or as
+  many as the requests) may indicate a purposely built client that is trying to
+  fingerprint or attack the protocol stack. Not all protocol multiplexers
+  measure this metric, and the only way to get more details about the events is
+  to enable traces to capture all exchanges.
 
 fc_http_major : integer
   Reports the front connection's HTTP major version encoding, which may be 1

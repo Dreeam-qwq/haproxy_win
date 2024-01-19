@@ -4,12 +4,13 @@
 # All fields are optional. 0 assumed when absent.
 
 USAGE=\
-"Usage: %s [-l <len> ] [-t <type>] [-f <flags>] [-i <sid>] [ -d <data> ]
-           [ -e <name> <value> ]* [ -r raw ] [ -h | --help ] > hdr.bin
+"Usage: %s [-l <len> ] [-t <type>] [-f <flags>[,...]] [-i <sid>] [ -d <data> ]
+           [ -e <name> <value> ]* [ -r|-R raw ] [ -h | --help ] > hdr.bin
         Numbers are decimal or 0xhex. Not set=0. If <data> is passed, it points
         to a file that is read and chunked into frames of <len> bytes. -e
         encodes a headers frame (by default) with all headers at once encoded
-        in literal. Use type 'p' for the preface. Use -r to pass raw hex data.
+        in literal. Use type 'p' for the preface. Use -r to pass raw data or
+        -R to pass raw hex codes (hex digit pairs, blanks ignored).
 
 Supported symbolic types (case insensitive prefix match):
    DATA        (0x00)      PUSH_PROMISE   (0x05)
@@ -53,7 +54,7 @@ mkframe() {
 	local T="${2:-0}"
 	local F="${3:-0}"
 	local I="${4:-0}"
-	local t f
+	local t f f2 f3
 
 	# get the first match in this order
 	for t in DATA:0x00 HEADERS:0x01 RST_STREAM:0x03 SETTINGS:0x04 PING:0x06 \
@@ -71,17 +72,37 @@ mkframe() {
 		die
 	fi
 
-	# get the first match in this order
-	for f in ES:0x01 EH:0x04 PAD:0x08 PRIO:0x20; do
-		if [ -z "${f##${F^^*}*}" ]; then
-			F="${f##*:}"
+	# get the first match in this order, for each entry delimited by ','.
+	# E.g.: "-f ES,EH"
+	f2=${F^^*}; F=0
+
+	while [ -n "$f2" ]; do
+		f3="${f2%%,*}"
+		tmp=""
+		for f in ES:0x01 EH:0x04 PAD:0x08 PRIO:0x20; do
+			if [ -n "$f3" -a -z "${f##${f3}*}" ]; then
+				tmp="${f#*:}"
+				break
+			fi
+		done
+
+		if [ -n "$tmp" ]; then
+			F=$(( F | tmp ))
+			f2="${f2#$f3}"
+			f2="${f2#,}"
+		elif [ -z "${f3##[X0-9A-F]*}" ]; then
+			F=$(( F | f3 ))
+			f2="${f2#$f3}"
+			f2="${f2#,}"
+		else
+			echo "Unknown flag(s) '$f3'" >&2
+			usage "${0##*}"
+			die
 		fi
 	done
 
-	if [ -n "${F##[0-9]*}" ]; then
-		echo "Unknown type '$T'" >&2
-		usage "${0##*}"
-		die
+	if [ -n "$f2" ]; then
+		F="${f2} | ${F}"
 	fi
 
 	L=$(( L )); T=$(( T )); F=$(( F )); I=$(( I ))
@@ -116,6 +137,7 @@ while [ -n "$1" -a -z "${1##-*}" ]; do
 		-i)        ID="$2"       ; shift 2 ;;
 		-d)        DATA="$2"     ; shift 2 ;;
 		-r)        RAW="$2"      ; shift 2 ;;
+		-R)        RAW="$(printf $(echo -n "${2// /}" | sed -e 's/\([^ ][^ ]\)/\\\\x\1/g'))" ; shift 2 ;;
                 -e)        TYPE=1; HDR[${#HDR[@]}]="$2=$3"; shift 3 ;;
 		-h|--help) usage "${0##*}"; quit;;
 		*)         usage "${0##*}"; die ;;

@@ -12,6 +12,7 @@
 
 #include <ctype.h>
 #include <haproxy/api.h>
+#include <haproxy/cfgparse.h>
 #include <haproxy/http.h>
 #include <haproxy/tools.h>
 
@@ -344,6 +345,14 @@ const struct ist http_known_methods[HTTP_METH_OTHER] = {
 	[HTTP_METH_CONNECT] = IST("CONNECT"),
 };
 
+/* 500 bits to indicate for each status code from 100 to 599 if it participates
+ * to the error or failure class. The last 12 bits are not assigned for now.
+ * Not initialized, has to be done at boot. This is manipulated using
+ * http_status_{add,del}_range().
+ */
+long http_err_status_codes[512 / sizeof(long)] = { };
+long http_fail_status_codes[512 / sizeof(long)] = { };
+
 /*
  * returns a known method among HTTP_METH_* or HTTP_METH_OTHER for all unknown
  * ones.
@@ -352,15 +361,15 @@ enum http_meth_t find_http_meth(const char *str, const int len)
 {
 	const struct ist m = ist2(str, len);
 
-	if      (isteq(m, ist("GET")))     return HTTP_METH_GET;
-	else if (isteq(m, ist("HEAD")))    return HTTP_METH_HEAD;
-	else if (isteq(m, ist("POST")))    return HTTP_METH_POST;
-	else if (isteq(m, ist("CONNECT"))) return HTTP_METH_CONNECT;
-	else if (isteq(m, ist("PUT")))     return HTTP_METH_PUT;
-	else if (isteq(m, ist("OPTIONS"))) return HTTP_METH_OPTIONS;
-	else if (isteq(m, ist("DELETE")))  return HTTP_METH_DELETE;
-	else if (isteq(m, ist("TRACE")))   return HTTP_METH_TRACE;
-	else                               return HTTP_METH_OTHER;
+	if      (isteq(m, http_known_methods[HTTP_METH_GET]))     return HTTP_METH_GET;
+	else if (isteq(m, http_known_methods[HTTP_METH_PUT]))     return HTTP_METH_PUT;
+	else if (isteq(m, http_known_methods[HTTP_METH_HEAD]))    return HTTP_METH_HEAD;
+	else if (isteq(m, http_known_methods[HTTP_METH_POST]))    return HTTP_METH_POST;
+	else if (isteq(m, http_known_methods[HTTP_METH_TRACE]))   return HTTP_METH_TRACE;
+	else if (isteq(m, http_known_methods[HTTP_METH_DELETE]))  return HTTP_METH_DELETE;
+	else if (isteq(m, http_known_methods[HTTP_METH_CONNECT])) return HTTP_METH_CONNECT;
+	else if (isteq(m, http_known_methods[HTTP_METH_OPTIONS])) return HTTP_METH_OPTIONS;
+	else                                                      return HTTP_METH_OTHER;
 }
 
 /* This function returns HTTP_ERR_<num> (enum) matching http status code.
@@ -368,28 +377,27 @@ enum http_meth_t find_http_meth(const char *str, const int len)
  */
 int http_get_status_idx(unsigned int status)
 {
-	switch (status) {
-	case 200: return HTTP_ERR_200;
-	case 400: return HTTP_ERR_400;
-	case 401: return HTTP_ERR_401;
-	case 403: return HTTP_ERR_403;
-	case 404: return HTTP_ERR_404;
-	case 405: return HTTP_ERR_405;
-	case 407: return HTTP_ERR_407;
-	case 408: return HTTP_ERR_408;
-	case 410: return HTTP_ERR_410;
-	case 413: return HTTP_ERR_413;
-	case 421: return HTTP_ERR_421;
-	case 422: return HTTP_ERR_422;
-	case 425: return HTTP_ERR_425;
-	case 429: return HTTP_ERR_429;
-	case 500: return HTTP_ERR_500;
-	case 501: return HTTP_ERR_501;
-	case 502: return HTTP_ERR_502;
-	case 503: return HTTP_ERR_503;
-	case 504: return HTTP_ERR_504;
-	default: return HTTP_ERR_500;
-	}
+	/* This table was built using dev/phash and easily finds solutions up
+	 * to 21 different entries and produces much better code with 32
+	 * (padded with err 500 below as it's the default, though only [19] is
+	 * the real one).
+	 */
+	const uchar codes[32] = {
+		HTTP_ERR_408, HTTP_ERR_200, HTTP_ERR_504, HTTP_ERR_400,
+		HTTP_ERR_500, HTTP_ERR_500, HTTP_ERR_401, HTTP_ERR_410,
+		HTTP_ERR_500, HTTP_ERR_500, HTTP_ERR_500, HTTP_ERR_500,
+		HTTP_ERR_500, HTTP_ERR_429, HTTP_ERR_403, HTTP_ERR_500,
+		HTTP_ERR_421, HTTP_ERR_404, HTTP_ERR_413, HTTP_ERR_500,
+		HTTP_ERR_422, HTTP_ERR_405, HTTP_ERR_500, HTTP_ERR_501,
+		HTTP_ERR_500, HTTP_ERR_500, HTTP_ERR_500, HTTP_ERR_502,
+		HTTP_ERR_407, HTTP_ERR_500, HTTP_ERR_503, HTTP_ERR_425,
+	};
+	uint hash = ((status * 118) >> 5) % 32;
+	uint ret  = codes[hash];
+
+	if (http_err_codes[ret] == status)
+		return ret;
+	return HTTP_ERR_500;
 }
 
 /* This function returns a reason associated with the HTTP status.
@@ -476,6 +484,40 @@ const char *http_get_reason(unsigned int status)
 		default:          return "Other";
 		}
 	}
+}
+
+/* add status codes from low to high included to status codes array <array>
+ * which must be compatible with http_err_codes and http_fail_codes (i.e. 512
+ * bits each). This is not thread save and is meant for being called during
+ * boot only. Only status codes 100-599 are permitted.
+ */
+void http_status_add_range(long *array, uint low, uint high)
+{
+	low -= 100;
+	high -= 100;
+
+	BUG_ON(low > 499);
+	BUG_ON(high > 499);
+
+	while (low <= high)
+		ha_bit_set(low++, array);
+}
+
+/* remove status codes from low to high included to status codes array <array>
+ * which must be compatible with http_err_codes and http_fail_codes (i.e. 512
+ * bits each). This is not thread save and is meant for being called during
+ * boot only. Only status codes 100-599 are permitted.
+ */
+void http_status_del_range(long *array, uint low, uint high)
+{
+	low -= 100;
+	high -= 100;
+
+	BUG_ON(low > 499);
+	BUG_ON(high > 499);
+
+	while (low <= high)
+		ha_bit_clr(low++, array);
 }
 
 /* Returns the ist string corresponding to port part (without ':') in the host
@@ -1431,3 +1473,111 @@ struct ist http_trim_trailing_spht(struct ist value)
 
 	return ret;
 }
+
+/* initialize the required structures and arrays */
+static void _http_init()
+{
+	/* preset the default status codes that count as errors and failures */
+	http_status_add_range(http_err_status_codes,  400, 499);
+	http_status_add_range(http_fail_status_codes, 500, 599);
+	http_status_del_range(http_fail_status_codes, 501, 501);
+	http_status_del_range(http_fail_status_codes, 505, 505);
+}
+INITCALL0(STG_INIT, _http_init);
+
+/*
+ * registered keywords below
+ */
+
+/* parses a global "http-err-codes" and "http-fail-codes" directive. */
+static int http_parse_http_err_fail_codes(char **args, int section_type, struct proxy *curpx,
+					  const struct proxy *defpx, const char *file, int line,
+					  char **err)
+{
+	const char *cmd = args[0];
+	const char *p, *b, *e;
+	int op, low, high;
+	long *bitfield;
+	int ret = -1;
+
+	if (strcmp(cmd, "http-err-codes") == 0)
+		bitfield = http_err_status_codes;
+	else if (strcmp(cmd, "http-fail-codes") == 0)
+		bitfield = http_fail_status_codes;
+	else
+		ABORT_NOW();
+
+	if (!*args[1]) {
+		memprintf(err, "Missing status codes range for '%s'.", cmd);
+		goto end;
+	}
+
+	/* operation: <0 = remove, 0 = replace, >0 = add. The operation is only
+	 * reset for each new arg so that we can do +200,300,400 without
+	 * changing the operation.
+	 */
+	for (; *(p = *(++args)); ) {
+		switch (*p) {
+		case '+': op =  1; p++; break;
+		case '-': op = -1; p++; break;
+		default:  op =  0; break;
+		}
+
+		if (!*p)
+			goto inval;
+
+		while (1) {
+			b = p;
+			e = p + strlen(p);
+			low = read_uint(&p, e);
+			if (b == e || p == b)
+				goto inval;
+
+			high = low;
+			if (*p == '-') {
+				p++;
+				b = p;
+				high = read_uint(&p, e);
+				if (b == e || p == b || (*p && *p != ','))
+					goto inval;
+			}
+			else if (*p && *p != ',')
+				goto inval;
+
+			if (high < low || low < 100 || high > 599) {
+				memprintf(err, "Invalid status codes range '%s' in '%s'.\n"
+					  " Codes must be between 100 and 599 and ranges in ascending order.",
+					  *args, cmd);
+				goto end;
+			}
+
+			if (!op)
+				memset(bitfield, 0, sizeof(http_err_status_codes));
+			if (op >= 0)
+				http_status_add_range(bitfield, low, high);
+			if (op < 0)
+				http_status_del_range(bitfield, low, high);
+
+			if (!*p)
+				break;
+			/* skip ',' */
+			p++;
+		}
+	}
+	ret = 0;
+ end:
+	return ret;
+ inval:
+	memprintf(err, "Invalid status codes range '%s' in '%s' at position %lu. Ranges must be in the form [+-]{low[-{high}]}[,...].",
+		  *args, cmd, (ulong)(p - *args));
+	goto end;
+
+}
+
+static struct cfg_kw_list cfg_kws = {{ },{
+	{ CFG_GLOBAL, "http-err-codes",      http_parse_http_err_fail_codes },
+	{ CFG_GLOBAL, "http-fail-codes",     http_parse_http_err_fail_codes },
+	{ /* END */ }
+}};
+
+INITCALL1(STG_REGISTER, cfg_register_keywords, &cfg_kws);
