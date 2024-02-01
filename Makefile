@@ -621,7 +621,7 @@ OPTIONS_OBJS += src/quic_conn.o src/mux_quic.o src/h3.o src/xprt_quic.o    \
                 src/cbuf.o src/quic_cc.o src/quic_cc_nocc.o src/quic_ack.o \
                 src/quic_trace.o src/quic_cli.o src/quic_ssl.o             \
                 src/quic_rx.o src/quic_tx.o src/quic_cid.o src/quic_retry.o\
-                src/quic_retransmit.o
+                src/quic_retransmit.o src/quic_fctl.o
 endif
 
 ifneq ($(USE_QUIC_OPENSSL_COMPAT),)
@@ -667,28 +667,13 @@ endif
 
 ifneq ($(USE_DEVICEATLAS),)
   # Use DEVICEATLAS_SRC and possibly DEVICEATLAS_INC and DEVICEATLAS_LIB to force path
-  # to DeviceAtlas headers and libraries if needed.
+  # to DeviceAtlas headers and libraries if needed. In this context, DEVICEATLAS_NOCACHE
+  # can be used to disable the cache support if needed (this also removes the necessity of having
+  # a C++ toolchain installed).
   DEVICEATLAS_INC = $(DEVICEATLAS_SRC)
   DEVICEATLAS_LIB = $(DEVICEATLAS_SRC)
-  ifeq ($(DEVICEATLAS_SRC),)
-    DEVICEATLAS_LDFLAGS += -lda
-  else
-    ifeq ($(USE_PCRE),)
-      ifeq ($(USE_PCRE2),)
-        $(error the DeviceAtlas module needs the PCRE or the PCRE2 library in order to compile)
-      endif
-    endif
-    ifneq ($(USE_PCRE2),)
-      DEVICEATLAS_CFLAGS += -DDA_REGEX_HDR=\"dac_pcre2.c\" -DDA_REGEX_TAG=2
-    endif
-    OPTIONS_OBJS += $(DEVICEATLAS_LIB)/Os/daunix.o
-    OPTIONS_OBJS += $(DEVICEATLAS_LIB)/dadwcom.o
-    OPTIONS_OBJS += $(DEVICEATLAS_LIB)/dasch.o
-    OPTIONS_OBJS += $(DEVICEATLAS_LIB)/json.o
-    OPTIONS_OBJS += $(DEVICEATLAS_LIB)/dac.o
-  endif
+  include addons/deviceatlas/Makefile.inc
   OPTIONS_OBJS += addons/deviceatlas/da.o
-  DEVICEATLAS_CFLAGS += $(if $(DEVICEATLAS_INC),-I$(DEVICEATLAS_INC)) $(if $(DEVICEATLAS_SRC),-DDATLAS_DA_NOCACHE)
 endif
 
 # Use 51DEGREES_SRC and possibly 51DEGREES_INC and 51DEGREES_LIB to force path

@@ -447,19 +447,18 @@ int ssl_quic_initial_ctx(struct bind_conf *bind_conf)
 	SSL_CTX_set_min_proto_version(ctx, TLS1_3_VERSION);
 	SSL_CTX_set_max_proto_version(ctx, TLS1_3_VERSION);
 
+	if (bind_conf->ssl_conf.early_data) {
+#if !defined(HAVE_SSL_0RTT_QUIC)
+		ha_warning("Binding [%s:%d] for %s %s: 0-RTT with QUIC is not supported by this SSL library, ignored.\n",
+		           bind_conf->file, bind_conf->line, proxy_type_str(bind_conf->frontend), bind_conf->frontend->id);
+#else
+		SSL_CTX_set_options(ctx, SSL_OP_NO_ANTI_REPLAY);
+		SSL_CTX_set_max_early_data(ctx, 0xffffffff);
+#endif /* ! HAVE_SSL_0RTT_QUIC  */
+	}
+
 #ifdef SSL_CTRL_SET_TLSEXT_HOSTNAME
 # if defined(HAVE_SSL_CLIENT_HELLO_CB)
-#  if defined(SSL_OP_NO_ANTI_REPLAY)
-	if (bind_conf->ssl_conf.early_data) {
-		SSL_CTX_set_options(ctx, SSL_OP_NO_ANTI_REPLAY);
-#   if defined(USE_QUIC_OPENSSL_COMPAT) || defined(OPENSSL_IS_AWSLC)
-		ha_warning("Binding [%s:%d] for %s %s: 0-RTT is not supported in limited QUIC compatibility mode, ignored.\n",
-		           bind_conf->file, bind_conf->line, proxy_type_str(bind_conf->frontend), bind_conf->frontend->id);
-#   else
-		SSL_CTX_set_max_early_data(ctx, 0xffffffff);
-#   endif /* ! USE_QUIC_OPENSSL_COMPAT */
-	}
-#  endif /* !SSL_OP_NO_ANTI_REPLAY */
 	SSL_CTX_set_client_hello_cb(ctx, ssl_sock_switchctx_cbk, NULL);
 	SSL_CTX_set_tlsext_servername_callback(ctx, ssl_sock_switchctx_err_cbk);
 # else /* ! HAVE_SSL_CLIENT_HELLO_CB */
@@ -557,6 +556,28 @@ int qc_ssl_provide_quic_data(struct ncbuf *ncbuf,
 			ERR_clear_error();
 			goto leave;
 		}
+
+#if defined(OPENSSL_IS_AWSLC)
+		/* As a server, if early data is accepted, SSL_do_handshake will
+		 * complete as soon as the ClientHello is processed and server flight sent.
+		 * SSL_write may be used to send half-RTT data. SSL_read will consume early
+		 * data and transition to 1-RTT data as appropriate. Prior to the
+		 * transition, SSL_in_init will report the handshake is still in progress.
+		 * Callers may use it or SSL_in_early_data to defer or reject requests
+		 * as needed.
+		 * (see https://commondatastorage.googleapis.com/chromium-boringssl-docs/ssl.h.html#Early-data)
+		 */
+
+		/* If we do not returned here, the handshake is considered as completed/confirmed.
+		 * This has as bad side effect to discard the Handshake packet number space,
+		 * so without sending the Handshake level CRYPTO data.
+		 */
+		if (SSL_in_early_data(ctx->ssl)) {
+			TRACE_PROTO("SSL handshake in progrees with early data",
+			            QUIC_EV_CONN_IO_CB, qc, &state, &ssl_err);
+			goto out;
+		}
+#endif
 
 		TRACE_PROTO("SSL handshake OK", QUIC_EV_CONN_IO_CB, qc, &state);
 
@@ -713,6 +734,43 @@ static int qc_ssl_sess_init(struct quic_conn *qc, SSL_CTX *ssl_ctx, SSL **ssl)
 	return ret;
 }
 
+#ifdef HAVE_SSL_0RTT_QUIC
+
+/* Enable early data for <ssl> QUIC TLS session.
+ * Return 1 if succeeded, 0 if not.
+ */
+static int qc_set_quic_early_data_enabled(struct quic_conn *qc, SSL *ssl)
+{
+#if defined(OPENSSL_IS_AWSLC)
+	struct quic_transport_params p = {0};
+	unsigned char buf[128];
+	size_t len;
+
+	/* Apply default values to <p> transport parameters. */
+	quic_transport_params_init(&p, 1);
+	/* The stateless_reset_token transport parameter is not needed. */
+	p.with_stateless_reset_token = 0;
+	len = quic_transport_params_encode(buf, buf + sizeof buf, &p, NULL, 1);
+	if (!len) {
+		TRACE_ERROR("quic_transport_params_encode() failed", QUIC_EV_CONN_RWSEC, qc);
+		return 0;
+	}
+
+	/* XXX TODO: Should also add the application settings. XXX */
+	if (!SSL_set_quic_early_data_context(ssl, buf, len)) {
+		TRACE_ERROR("SSL_set_quic_early_data_context() failed", QUIC_EV_CONN_RWSEC, qc);
+		return 0;
+	}
+
+	SSL_set_early_data_enabled(ssl, 1);
+#else
+	SSL_set_quic_early_data_enabled(ssl, 1);
+#endif
+
+	return 1;
+}
+#endif // HAVE_SSL_0RTT_QUIC
+
 /* Allocate the ssl_sock_ctx from connection <qc>. This creates the tasklet
  * used to process <qc> received packets. The allocated context is stored in
  * <qc.xprt_ctx>.
@@ -748,12 +806,10 @@ int qc_alloc_ssl_sock_ctx(struct quic_conn *qc)
 	if (qc_is_listener(qc)) {
 		if (qc_ssl_sess_init(qc, bc->initial_ctx, &ctx->ssl) == -1)
 		        goto err;
-#if (HA_OPENSSL_VERSION_NUMBER >= 0x10101000L) && !defined(OPENSSL_IS_AWSLC)
-#ifndef USE_QUIC_OPENSSL_COMPAT
+#if (HA_OPENSSL_VERSION_NUMBER >= 0x10101000L) && defined(HAVE_SSL_0RTT_QUIC)
 		/* Enabling 0-RTT */
-		if (bc->ssl_conf.early_data)
-			SSL_set_quic_early_data_enabled(ctx->ssl, 1);
-#endif
+		if (bc->ssl_conf.early_data && !qc_set_quic_early_data_enabled(qc, ctx->ssl))
+			goto err;
 #endif
 
 		SSL_set_accept_state(ctx->ssl);

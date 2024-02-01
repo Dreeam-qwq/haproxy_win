@@ -947,6 +947,17 @@ int h1_headers_to_hdr_list(char *start, const char *stop,
 			goto http_msg_ood;
 		}
 	http_msg_hdr_val2:
+		if (likely(!*ptr)) {
+			/* RFC9110 clarified that NUL is explicitly forbidden in header values
+			 * (like CR and LF).
+			 */
+			if (h1m->err_pos < -1) { /* PR_O2_REQBUG_OK not set */
+				state = H1_MSG_HDR_VAL;
+				goto http_msg_invalid;
+			}
+			if (h1m->err_pos == -1) /* PR_O2_REQBUG_OK set: just log */
+				h1m->err_pos = ptr - start + skip;
+		}
 		if (likely(!HTTP_IS_CRLF(*ptr)))
 			EAT_AND_JUMP_OR_RETURN(ptr, end, http_msg_hdr_val2, http_msg_ood, state, H1_MSG_HDR_VAL);
 
@@ -1214,57 +1225,6 @@ int h1_headers_to_hdr_list(char *start, const char *stop,
 	else
 		h1m->state = H1_MSG_RQBEFORE;
 	goto try_again;
-}
-
-/* This function performs a very minimal parsing of the trailers block present
- * at offset <ofs> in <buf> for up to <max> bytes, and returns the number of
- * bytes to delete to skip the trailers. It may return 0 if it's missing some
- * input data, or < 0 in case of parse error (in which case the caller may have
- * to decide how to proceed, possibly eating everything).
- */
-int h1_measure_trailers(const struct buffer *buf, unsigned int ofs, unsigned int max)
-{
-	const char *stop = b_peek(buf, ofs + max);
-	int count = ofs;
-
-	while (1) {
-		const char *p1 = NULL, *p2 = NULL;
-		const char *start = b_peek(buf, count);
-		const char *ptr   = start;
-
-		/* scan current line and stop at LF or CRLF */
-		while (1) {
-			if (ptr == stop)
-				return 0;
-
-			if (*ptr == '\n') {
-				if (!p1)
-					p1 = ptr;
-				p2 = ptr;
-				break;
-			}
-
-			if (*ptr == '\r') {
-				if (p1)
-					return -1;
-				p1 = ptr;
-			}
-
-			ptr = b_next(buf, ptr);
-		}
-
-		/* after LF; point to beginning of next line */
-		p2 = b_next(buf, p2);
-		count += b_dist(buf, start, p2);
-
-		/* LF/CRLF at beginning of line => end of trailers at p2.
-		 * Everything was scheduled for forwarding, there's nothing left
-		 * from this message. */
-		if (p1 == start)
-			break;
-		/* OK, next line then */
-	}
-	return count - ofs;
 }
 
 /* Generate a random key for a WebSocket Handshake in respect with rfc6455

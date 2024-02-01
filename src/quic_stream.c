@@ -6,7 +6,7 @@
 #include <haproxy/buf.h>
 #include <haproxy/dynbuf.h>
 #include <haproxy/list.h>
-#include <haproxy/mux_quic-t.h>
+#include <haproxy/mux_quic.h>
 #include <haproxy/pool.h>
 #include <haproxy/quic_conn.h>
 #include <haproxy/task.h>
@@ -16,6 +16,36 @@ DECLARE_STATIC_POOL(pool_head_quic_stream_desc, "qc_stream_desc",
 DECLARE_STATIC_POOL(pool_head_quic_stream_buf, "qc_stream_buf",
                     sizeof(struct qc_stream_buf));
 
+
+static void qc_stream_buf_free(struct qc_stream_desc *stream,
+                               struct qc_stream_buf **stream_buf)
+{
+	struct quic_conn *qc = stream->qc;
+	struct buffer *buf = &(*stream_buf)->buf;
+
+	LIST_DEL_INIT(&(*stream_buf)->list);
+
+	/* Reset current buf ptr if deleted instance is the same one. */
+	if (*stream_buf == stream->buf)
+		stream->buf = NULL;
+
+	b_free(buf);
+	offer_buffers(NULL, 1);
+	pool_free(pool_head_quic_stream_buf, *stream_buf);
+	*stream_buf = NULL;
+
+	/* notify MUX about available buffers. */
+	--qc->stream_buf_count;
+	if (qc->mux_state == QC_MUX_READY) {
+		/* notify MUX about available buffers.
+		 *
+		 * TODO several streams may be woken up even if a single buffer
+		 * is available for now.
+		 */
+		while (qcc_notify_buf(qc->qcc))
+			;
+	}
+}
 
 /* Allocate a new stream descriptor with id <id>. The caller is responsible to
  * store the stream in the appropriate tree. -1 special value must be used for
@@ -57,8 +87,13 @@ struct qc_stream_desc *qc_stream_desc_new(uint64_t id, enum qcs_type type, void 
 /* Mark the stream descriptor <stream> as released. It will be freed as soon as
  * all its buffered data are acknowledged. Does nothing if <stream> is already
  * NULL.
+ *
+ * <final_size> corresponds to the last offset sent for this stream. If there
+ * is unsent data present, they will be remove first to guarantee that buffer
+ * is freed after receiving all acknowledges.
  */
-void qc_stream_desc_release(struct qc_stream_desc *stream)
+void qc_stream_desc_release(struct qc_stream_desc *stream,
+                            uint64_t final_size)
 {
 	if (!stream)
 		return;
@@ -69,13 +104,30 @@ void qc_stream_desc_release(struct qc_stream_desc *stream)
 	stream->release = 1;
 	stream->ctx = NULL;
 
+	if (stream->buf) {
+		struct qc_stream_buf *stream_buf = stream->buf;
+		struct buffer *buf = &stream_buf->buf;
+		const uint64_t tail_offset =
+		  MAX(stream->buf_offset, stream->ack_offset) + b_data(buf);
+
+		/* final_size cannot be greater than all currently stored data. */
+		BUG_ON(final_size > tail_offset);
+
+		/* Remove unsent data from current buffer. */
+		if (final_size < tail_offset) {
+			b_sub(buf, tail_offset - final_size);
+			/* Remove buffer is all ACK already received. */
+			if (!b_data(buf))
+				qc_stream_buf_free(stream, &stream_buf);
+		}
+
+		/* A released stream does not use <stream.buf>. */
+		stream->buf = NULL;
+	}
+
 	if (LIST_ISEMPTY(&stream->buf_list)) {
 		/* if no buffer left we can free the stream. */
 		qc_stream_desc_free(stream, 0);
-	}
-	else {
-		/* A released stream does not use <stream.buf>. */
-		stream->buf = NULL;
 	}
 }
 
@@ -92,7 +144,6 @@ int qc_stream_desc_ack(struct qc_stream_desc **stream, size_t offset, size_t len
 {
 	struct qc_stream_desc *s = *stream;
 	struct qc_stream_buf *stream_buf;
-	struct quic_conn *qc = s->qc;
 	struct buffer *buf;
 	size_t diff;
 
@@ -110,37 +161,15 @@ int qc_stream_desc_ack(struct qc_stream_desc **stream, size_t offset, size_t len
 	s->ack_offset += diff;
 	b_del(buf, diff);
 
-	/* nothing more to do if buf still not empty. */
-	if (b_data(buf))
-		return diff;
+	/* Free oldest buffer if all data acknowledged. */
+	if (!b_data(buf)) {
+		qc_stream_buf_free(s, &stream_buf);
 
-	/* buf is empty and can now be freed. Do not forget to reset current
-	 * buf ptr if we were working on it.
-	 */
-	LIST_DELETE(&stream_buf->list);
-	if (stream_buf == s->buf) {
-		/* current buf must always be last entry in buflist */
-		BUG_ON(!LIST_ISEMPTY(&s->buf_list));
-		s->buf = NULL;
-	}
-
-	b_free(buf);
-	pool_free(pool_head_quic_stream_buf, stream_buf);
-	offer_buffers(NULL, 1);
-
-	/* notify MUX about available buffers. */
-	--qc->stream_buf_count;
-	if (qc->mux_state == QC_MUX_READY) {
-		if (qc->qcc->flags & QC_CF_CONN_FULL) {
-			qc->qcc->flags &= ~QC_CF_CONN_FULL;
-			tasklet_wakeup(qc->qcc->wait_event.tasklet);
+		/* Free stream instance if already released and no buffers left. */
+		if (s->release && LIST_ISEMPTY(&s->buf_list)) {
+			qc_stream_desc_free(s, 0);
+			*stream = NULL;
 		}
-	}
-
-	/* Free stream instance if already released and no buffers left. */
-	if (s->release && LIST_ISEMPTY(&s->buf_list)) {
-		qc_stream_desc_free(s, 0);
-		*stream = NULL;
 	}
 
 	return diff;
@@ -176,11 +205,13 @@ void qc_stream_desc_free(struct qc_stream_desc *stream, int closing)
 
 		qc->stream_buf_count -= free_count;
 		if (qc->mux_state == QC_MUX_READY) {
-			/* notify MUX about available buffers. */
-			if (qc->qcc->flags & QC_CF_CONN_FULL) {
-				qc->qcc->flags &= ~QC_CF_CONN_FULL;
-				tasklet_wakeup(qc->qcc->wait_event.tasklet);
-			}
+			/* notify MUX about available buffers.
+			 *
+			 * TODO several streams may be woken up even if a single buffer
+			 * is available for now.
+			 */
+			while (qcc_notify_buf(qc->qcc))
+				;
 		}
 	}
 

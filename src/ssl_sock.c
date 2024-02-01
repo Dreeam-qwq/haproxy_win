@@ -226,11 +226,11 @@ static int ha_ssl_write(BIO *h, const char *buf, int num)
 	tmpbuf.head = 0;
 	flags = (ctx->xprt_st & SSL_SOCK_SEND_MORE) ? CO_SFL_MSG_MORE : 0;
 	ret = ctx->xprt->snd_buf(ctx->conn, ctx->xprt_ctx, &tmpbuf, num, flags);
+	BIO_clear_retry_flags(h);
 	if (ret == 0 && !(ctx->conn->flags & (CO_FL_ERROR | CO_FL_SOCK_WR_SH))) {
 		BIO_set_retry_write(h);
 		ret = -1;
-	} else if (ret == 0)
-		 BIO_clear_retry_flags(h);
+	}
 	return ret;
 }
 
@@ -258,11 +258,11 @@ static int ha_ssl_read(BIO *h, char *buf, int size)
 	tmpbuf.data = 0;
 	tmpbuf.head = 0;
 	ret = ctx->xprt->rcv_buf(ctx->conn, ctx->xprt_ctx, &tmpbuf, size, 0);
+	BIO_clear_retry_flags(h);
 	if (ret == 0 && !(ctx->conn->flags & (CO_FL_ERROR | CO_FL_SOCK_RD_SH))) {
 		BIO_set_retry_read(h);
 		ret = -1;
-	} else if (ret == 0)
-		BIO_clear_retry_flags(h);
+	}
 
 	return ret;
 }
@@ -2448,6 +2448,14 @@ sni_lookup:
 		return SSL_TLSEXT_ERR_ALERT_FATAL;
 	}
 
+#if defined(OPENSSL_IS_AWSLC)
+	/* Note that ssl_sock_switchctx_set() calls SSL_set_SSL_CTX() which propagates the
+	 * "early data enabled" setting from the SSL_CTX object to the SSL objects.
+	 * So enable early data for this SSL_CTX context if configured.
+	 */
+	if (s->ssl_conf.early_data)
+		SSL_CTX_set_early_data_enabled(container_of(node, struct sni_ctx, name)->ctx, 1);
+#endif
 	/* switch ctx */
 	ssl_sock_switchctx_set(ssl, container_of(node, struct sni_ctx, name)->ctx);
 	HA_RWLOCK_RDUNLOCK(SNI_LOCK, &s->sni_lock);

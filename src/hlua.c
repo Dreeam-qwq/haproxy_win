@@ -2011,7 +2011,7 @@ static int hlua_set_map(lua_State *L)
 /* This function is an LUA binding. It provides a function
  * for retrieving a var from the proc scope in core.
  */
- static int hlua_core_get_var(lua_State *L)
+__LJMP static int hlua_core_get_var(lua_State *L)
 {
 	const char *name;
 	size_t len;
@@ -2026,13 +2026,13 @@ static int hlua_set_map(lua_State *L)
 	if (len < 5 || strncmp(name, "proc.", 5) != 0)
 		WILL_LJMP(luaL_error(L, "'get_var': Only 'proc.' scope allowed to be retrieved in 'core.get_var()'."));
 
+	memset(&smp, 0, sizeof(smp));
 	if (!vars_get_by_name(name, len, &smp, NULL)) {
 		lua_pushnil(L);
 		return 1;
 	}
 
 	return MAY_LJMP(hlua_smp2lua(L, &smp));
-	return 1;
 }
 
 /* This function disables the sending of email through the

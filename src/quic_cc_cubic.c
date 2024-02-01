@@ -15,7 +15,6 @@
 #define CUBIC_BETA   717 /*    CUBIC_BETA / CUBIC_BETA_SCALE = 0.7 */
 #define CUBIC_C      410 /*       CUBIC_C / CUBIC_BETA_SCALE = 0.4 */
 
-#define CUBIC_BETA_SCALE_FACTOR_SHIFT (3 * CUBIC_BETA_SCALE_SHIFT)
 #define TIME_SCALE_FACTOR_SHIFT  10
 
 /* The maximum value which may be cubed an multiplied by CUBIC_BETA */
@@ -139,7 +138,7 @@ static inline void quic_cubic_update(struct quic_cc *cc, uint32_t acked)
 		goto leave;
 	}
 
-	delta = path->mtu * ((CUBIC_C * diff * diff * diff) >> (10 + 3 * TIME_SCALE_FACTOR_SHIFT));
+	delta = path->mtu * ((CUBIC_C * diff * diff * diff) >> (CUBIC_BETA_SCALE_SHIFT + 3 * TIME_SCALE_FACTOR_SHIFT));
 	if (t < c->K)
 		target = c->origin_point - delta;
 	else

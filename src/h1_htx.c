@@ -693,11 +693,6 @@ static size_t h1_parse_full_contig_chunks(struct h1m *h1m, struct htx **dsthtx,
 				++ridx;
 				break;
 			}
-			else if (end[ridx] == '\n') {
-				/* Parse LF only, nothing more to do */
-				++ridx;
-				break;
-			}
 			else if (likely(end[ridx] == ';')) {
 				/* chunk extension, ends at next CRLF */
 				if (!++ridx)
@@ -710,7 +705,7 @@ static size_t h1_parse_full_contig_chunks(struct h1m *h1m, struct htx **dsthtx,
 				continue;
 			}
 			else {
-				/* all other characters are unexpected */
+				/* all other characters are unexpected, especially LF alone */
 				goto parsing_error;
 			}
 		}
@@ -740,9 +735,12 @@ static size_t h1_parse_full_contig_chunks(struct h1m *h1m, struct htx **dsthtx,
 		dpos += chksz;
 		ridx += chksz;
 
-		/* Parse CRLF or LF (always present) */
-		if (likely(end[ridx] == '\r'))
-			++ridx;
+		/* Parse CRLF */
+		if (unlikely(end[ridx] != '\r')) {
+			h1m->state = H1_MSG_CHUNK_CRLF;
+			goto parsing_error;
+		}
+		++ridx;
 		if (end[ridx] != '\n') {
 			h1m->state = H1_MSG_CHUNK_CRLF;
 			goto parsing_error;
@@ -902,6 +900,7 @@ int h1_parse_msg_tlrs(struct h1m *h1m, struct htx *dsthtx,
 		b_slow_realign_ofs(srcbuf, trash.area, 0);
 
 	tlr_h1m.flags = (H1_MF_NO_PHDR|H1_MF_HDRS_ONLY);
+	tlr_h1m.err_pos = h1m->err_pos;
 	ret = h1_headers_to_hdr_list(b_peek(srcbuf, ofs), b_tail(srcbuf),
 				     hdrs, sizeof(hdrs)/sizeof(hdrs[0]), &tlr_h1m, NULL);
 	if (ret <= 0) {

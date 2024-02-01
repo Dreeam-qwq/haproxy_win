@@ -13,6 +13,7 @@
 #include <haproxy/htx-t.h>
 #include <haproxy/list-t.h>
 #include <haproxy/ncbuf-t.h>
+#include <haproxy/quic_fctl-t.h>
 #include <haproxy/quic_frame-t.h>
 #include <haproxy/quic_stream-t.h>
 #include <haproxy/stconn-t.h>
@@ -30,7 +31,7 @@ enum qcs_type {
 
 #define QC_CF_ERRL      0x00000001 /* fatal error detected locally, connection should be closed soon */
 #define QC_CF_ERRL_DONE 0x00000002 /* local error properly handled, connection can be released */
-#define QC_CF_BLK_MFCTL 0x00000004 /* sending blocked due to connection flow-control */
+/* unused 0x00000004 */
 #define QC_CF_CONN_FULL 0x00000008 /* no stream buffers available on connection */
 #define QC_CF_APP_SHUT  0x00000010 /* Application layer shutdown done. */
 #define QC_CF_ERR_CONN  0x00000020 /* fatal error reported by transport layer */
@@ -70,8 +71,7 @@ struct qcc {
 	} rfctl;
 
 	struct {
-		uint64_t offsets; /* sum of all offsets prepared */
-		uint64_t sent_offsets; /* sum of all offset sent */
+		struct quic_fctl fc; /* stream flow control applied on sending */
 	} tx;
 
 	uint64_t largest_bidi_r; /* largest remote bidi stream ID opened. */
@@ -83,6 +83,8 @@ struct qcc {
 
 	struct list send_retry_list; /* list of qcs eligible to send retry */
 	struct list send_list; /* list of qcs ready to send (STREAM, STOP_SENDING or RESET_STREAM emission) */
+	struct list fctl_list; /* list of sending qcs blocked on conn flow control */
+	struct list buf_wait_list; /* list of qcs blocked on stream desc buf */
 
 	struct wait_event wait_event;  /* To be used if we're waiting for I/Os */
 
@@ -105,7 +107,7 @@ struct qcc {
 #define QC_SF_FIN_STREAM        0x00000002  /* FIN bit must be set for last frame of the stream */
 #define QC_SF_BLK_MROOM         0x00000004  /* app layer is blocked waiting for room in the qcs.tx.buf */
 #define QC_SF_DETACH            0x00000008  /* sc is detached but there is remaining data to send */
-#define QC_SF_BLK_SFCTL         0x00000010  /* stream blocked due to stream flow control limit */
+/* unused 0x00000010 */
 #define QC_SF_DEM_FULL          0x00000020  /* demux blocked on request channel buffer full */
 #define QC_SF_READ_ABORTED      0x00000040  /* Rx closed using STOP_SENDING*/
 #define QC_SF_TO_RESET          0x00000080  /* a RESET_STREAM must be sent */
@@ -155,10 +157,7 @@ struct qcs {
 		uint64_t msd_init; /* initial max-stream-data */
 	} rx;
 	struct {
-		uint64_t offset; /* last offset of data ready to be sent */
-		uint64_t sent_offset; /* last offset sent by transport layer */
-		struct buffer buf; /* transmit buffer before sending via xprt */
-		uint64_t msd; /* fctl bytes limit to respect on emission */
+		struct quic_fctl fc; /* stream flow control applied on sending */
 	} tx;
 
 	struct eb64_node by_id;
@@ -168,6 +167,8 @@ struct qcs {
 	struct list el; /* element of qcc.send_retry_list */
 	struct list el_send; /* element of qcc.send_list */
 	struct list el_opening; /* element of qcc.opening_list */
+	struct list el_fctl; /* element of qcc.fctl_list */
+	struct list el_buf; /* element of qcc.buf_wait_list */
 
 	struct wait_event wait_event;
 	struct wait_event *subs;
