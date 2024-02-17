@@ -40,6 +40,9 @@ struct task *sc_conn_io_cb(struct task *t, void *ctx, unsigned int state);
 int sc_conn_sync_recv(struct stconn *sc);
 void sc_conn_sync_send(struct stconn *sc);
 
+int sc_applet_sync_recv(struct stconn *sc);
+void sc_applet_sync_send(struct stconn *sc);
+
 
 /* returns the channel which receives data from this stream connector (input channel) */
 static inline struct channel *sc_ic(const struct stconn *sc)
@@ -281,7 +284,7 @@ static inline int sc_is_recv_allowed(const struct stconn *sc)
 	if (sc_ep_test(sc, SE_FL_HAVE_NO_DATA))
 		return 0;
 
-	if (sc_ep_test(sc, SE_FL_MAY_FASTFWD) && (sc_opposite(sc)->sedesc->iobuf.flags & IOBUF_FL_FF_BLOCKED))
+	if (sc_ep_test(sc, SE_FL_MAY_FASTFWD_PROD) && (sc_opposite(sc)->sedesc->iobuf.flags & IOBUF_FL_FF_BLOCKED))
 		return 0;
 
 	return !(sc->flags & (SC_FL_WONT_READ|SC_FL_NEED_BUFF|SC_FL_NEED_ROOM));
@@ -354,16 +357,13 @@ static inline int sc_is_send_allowed(const struct stconn *sc)
 {
 	if (sc->flags & SC_FL_SHUT_DONE)
 		return 0;
-	if (sc->flags & SC_FL_SHUT_WANTED)
-		return 1;
 
 	return !sc_ep_test(sc, SE_FL_WAIT_DATA | SE_FL_WONT_CONSUME);
 }
 
 static inline int sc_rcv_may_expire(const struct stconn *sc)
 {
-	if ((sc->flags & (SC_FL_ABRT_DONE|SC_FL_EOS)) ||
-	    (sc_ic(sc)->flags & (CF_READ_TIMEOUT|CF_READ_EVENT)))
+	if ((sc->flags & (SC_FL_ABRT_DONE|SC_FL_EOS)) || (sc_ic(sc)->flags & CF_READ_TIMEOUT))
 		return 0;
 	if (sc->flags & (SC_FL_EOI|SC_FL_WONT_READ|SC_FL_NEED_BUFF|SC_FL_NEED_ROOM))
 		return 0;
@@ -374,8 +374,7 @@ static inline int sc_rcv_may_expire(const struct stconn *sc)
 
 static inline int sc_snd_may_expire(const struct stconn *sc)
 {
-	if ((sc->flags & SC_FL_SHUT_DONE) ||
-	    (sc_oc(sc)->flags & (CF_WRITE_TIMEOUT|CF_WRITE_EVENT)))
+	if ((sc->flags & SC_FL_SHUT_DONE) || (sc_oc(sc)->flags & CF_WRITE_TIMEOUT))
 		return 0;
 	if (sc_ep_test(sc, SE_FL_WONT_CONSUME))
 		return 0;

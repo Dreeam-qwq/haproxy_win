@@ -355,25 +355,67 @@ static struct h2_counters {
 	long long total_streams; /* total number of streams */
 } h2_counters;
 
-static void h2_fill_stats(void *data, struct field *stats)
+static int h2_fill_stats(void *data, struct field *stats, unsigned int *selected_field)
 {
 	struct h2_counters *counters = data;
+	unsigned int current_field = (selected_field != NULL ? *selected_field : 0);
 
-	stats[H2_ST_HEADERS_RCVD]    = mkf_u64(FN_COUNTER, counters->headers_rcvd);
-	stats[H2_ST_DATA_RCVD]       = mkf_u64(FN_COUNTER, counters->data_rcvd);
-	stats[H2_ST_SETTINGS_RCVD]   = mkf_u64(FN_COUNTER, counters->settings_rcvd);
-	stats[H2_ST_RST_STREAM_RCVD] = mkf_u64(FN_COUNTER, counters->rst_stream_rcvd);
-	stats[H2_ST_GOAWAY_RCVD]     = mkf_u64(FN_COUNTER, counters->goaway_rcvd);
+	for (; current_field < H2_STATS_COUNT; current_field++) {
+		struct field metric = { 0 };
 
-	stats[H2_ST_CONN_PROTO_ERR]  = mkf_u64(FN_COUNTER, counters->conn_proto_err);
-	stats[H2_ST_STRM_PROTO_ERR]  = mkf_u64(FN_COUNTER, counters->strm_proto_err);
-	stats[H2_ST_RST_STREAM_RESP] = mkf_u64(FN_COUNTER, counters->rst_stream_resp);
-	stats[H2_ST_GOAWAY_RESP]     = mkf_u64(FN_COUNTER, counters->goaway_resp);
-
-	stats[H2_ST_OPEN_CONN]    = mkf_u64(FN_GAUGE,   counters->open_conns);
-	stats[H2_ST_OPEN_STREAM]  = mkf_u64(FN_GAUGE,   counters->open_streams);
-	stats[H2_ST_TOTAL_CONN]   = mkf_u64(FN_COUNTER, counters->total_conns);
-	stats[H2_ST_TOTAL_STREAM] = mkf_u64(FN_COUNTER, counters->total_streams);
+		switch (current_field) {
+		case H2_ST_HEADERS_RCVD:
+			metric = mkf_u64(FN_COUNTER, counters->headers_rcvd);
+			break;
+		case H2_ST_DATA_RCVD:
+			metric = mkf_u64(FN_COUNTER, counters->data_rcvd);
+			break;
+		case H2_ST_SETTINGS_RCVD:
+			metric = mkf_u64(FN_COUNTER, counters->settings_rcvd);
+			break;
+		case H2_ST_RST_STREAM_RCVD:
+			metric = mkf_u64(FN_COUNTER, counters->rst_stream_rcvd);
+			break;
+		case H2_ST_GOAWAY_RCVD:
+			metric = mkf_u64(FN_COUNTER, counters->goaway_rcvd);
+			break;
+		case H2_ST_CONN_PROTO_ERR:
+			metric = mkf_u64(FN_COUNTER, counters->conn_proto_err);
+			break;
+		case H2_ST_STRM_PROTO_ERR:
+			metric = mkf_u64(FN_COUNTER, counters->strm_proto_err);
+			break;
+		case H2_ST_RST_STREAM_RESP:
+			metric = mkf_u64(FN_COUNTER, counters->rst_stream_resp);
+			break;
+		case H2_ST_GOAWAY_RESP:
+			metric = mkf_u64(FN_COUNTER, counters->goaway_resp);
+			break;
+		case H2_ST_OPEN_CONN:
+			metric = mkf_u64(FN_GAUGE,   counters->open_conns);
+			break;
+		case H2_ST_OPEN_STREAM:
+			metric = mkf_u64(FN_GAUGE,   counters->open_streams);
+			break;
+		case H2_ST_TOTAL_CONN:
+			metric = mkf_u64(FN_COUNTER, counters->total_conns);
+			break;
+		case H2_ST_TOTAL_STREAM:
+			metric = mkf_u64(FN_COUNTER, counters->total_streams);
+			break;
+		default:
+			/* not used for frontends. If a specific metric
+			 * is requested, return an error. Otherwise continue.
+			 */
+			if (selected_field != NULL)
+				return 0;
+			continue;
+		}
+		stats[current_field] = metric;
+		if (selected_field != NULL)
+			break;
+	}
+	return 1;
 }
 
 static struct stats_module h2_stats_module = {
@@ -1617,6 +1659,10 @@ static struct h2s *h2c_frt_stream_new(struct h2c *h2c, int id, struct buffer *in
 	h2s->sd->se   = h2s;
 	h2s->sd->conn = h2c->conn;
 	se_fl_set(h2s->sd, SE_FL_T_MUX | SE_FL_ORPHAN | SE_FL_NOT_FIRST);
+
+	if (!(global.tune.no_zero_copy_fwd & NO_ZERO_COPY_FWD_H2_SND))
+		se_fl_set(h2s->sd, SE_FL_MAY_FASTFWD_CONS);
+
 	/* The request is not finished, don't expect data from the opposite side
 	 * yet
 	 */
@@ -1707,6 +1753,8 @@ static struct h2s *h2c_bck_stream_new(struct h2c *h2c, struct stconn *sc, struct
 	h2s->sess = sess;
 	h2c->nb_sc++;
 
+	if (!(global.tune.no_zero_copy_fwd & NO_ZERO_COPY_FWD_H2_SND))
+		se_fl_set(h2s->sd, SE_FL_MAY_FASTFWD_CONS);
 	/* on the backend we can afford to only count total streams upon success */
 	h2c->stream_cnt++;
 
@@ -2311,11 +2359,14 @@ static int h2c_handle_settings(struct h2c *h2c)
 				h2c_report_glitch(h2c);
 				goto fail;
 			}
-			/* WT: maybe we should count a glitch here in case of a
-			 * change after H2_CS_SETTINGS1 because while it's not
+			/* Let's count a glitch here in case of a reduction
+			 * after H2_CS_SETTINGS1 because while it's not
 			 * fundamentally invalid from a protocol's perspective,
 			 * it's often suspicious.
 			 */
+			if (h2c->st0 != H2_CS_SETTINGS1 && arg < h2c->miw)
+				h2c_report_glitch(h2c);
+
 			h2c->miw = arg;
 			break;
 		case H2_SETTINGS_MAX_FRAME_SIZE:
@@ -3100,7 +3151,7 @@ static int h2c_handle_data(struct h2c *h2c, struct h2s *h2s)
 	if (h2s->st != H2_SS_OPEN && h2s->st != H2_SS_HLOC) {
 		/* RFC7540#6.1 */
 		error = H2_ERR_STREAM_CLOSED;
-		goto strm_err;
+		goto strm_err_wu;
 	}
 
 	if (!(h2s->flags & H2_SF_HEADERS_RCVD)) {
@@ -3109,7 +3160,7 @@ static int h2c_handle_data(struct h2c *h2c, struct h2s *h2s)
 		TRACE_ERROR("Unexpected DATA frame before the message headers", H2_EV_RX_FRAME|H2_EV_RX_DATA, h2c->conn, h2s);
 		error = H2_ERR_PROTOCOL_ERROR;
 		HA_ATOMIC_INC(&h2c->px_counters->strm_proto_err);
-		goto strm_err;
+		goto strm_err_wu;
 	}
 	if ((h2s->flags & H2_SF_DATA_CLEN) && (h2c->dfl - h2c->dpl) > h2s->body_len) {
 		/* RFC7540#8.1.2 */
@@ -3117,7 +3168,7 @@ static int h2c_handle_data(struct h2c *h2c, struct h2s *h2s)
 		TRACE_ERROR("DATA frame larger than content-length", H2_EV_RX_FRAME|H2_EV_RX_DATA, h2c->conn, h2s);
 		error = H2_ERR_PROTOCOL_ERROR;
 		HA_ATOMIC_INC(&h2c->px_counters->strm_proto_err);
-		goto strm_err;
+		goto strm_err_wu;
 	}
 	if (!(h2c->flags & H2_CF_IS_BACK) &&
 	    (h2s->flags & (H2_SF_TUNNEL_ABRT|H2_SF_ES_SENT)) == (H2_SF_TUNNEL_ABRT|H2_SF_ES_SENT) &&
@@ -3130,7 +3181,7 @@ static int h2c_handle_data(struct h2c *h2c, struct h2s *h2s)
 		 */
 		TRACE_ERROR("Request DATA frame for aborted tunnel", H2_EV_RX_FRAME|H2_EV_RX_DATA, h2c->conn, h2s);
 		error = H2_ERR_CANCEL;
-		goto strm_err;
+		goto strm_err_wu;
 	}
 
 	if (!h2_frt_transfer_data(h2s))
@@ -3192,6 +3243,12 @@ static int h2c_handle_data(struct h2c *h2c, struct h2s *h2s)
 	TRACE_LEAVE(H2_EV_RX_FRAME|H2_EV_RX_DATA, h2c->conn, h2s);
 	return 1;
 
+ strm_err_wu:
+	/* stream error before the frame was taken into account, we're
+	 * going to kill the stream but must still update the connection's
+	 * window.
+	 */
+	h2c->rcvd_c += h2c->dfl - h2c->dpl;
  strm_err:
 	h2s_error(h2s, error);
 	h2c->st0 = H2_CS_FRAME_E;
@@ -3308,6 +3365,13 @@ static int h2_frame_check_vs_state(struct h2c *h2c, struct h2s *h2s)
 			 * RST_RCVD bit, we don't want to accidentally catch valid
 			 * frames for a closed stream, i.e. RST/PRIO/WU.
 			 */
+			if (h2c->dft == H2_FT_DATA) {
+				/* even if we reject out-of-stream DATA, it must
+				 * still count against the connection's flow control.
+				 */
+				h2c->rcvd_c += h2c->dfl - h2c->dpl;
+			}
+
 			h2c_report_glitch(h2c);
 			h2s_error(h2s, H2_ERR_STREAM_CLOSED);
 			h2c->st0 = H2_CS_FRAME_E;
@@ -4306,7 +4370,12 @@ static int h2_process(struct h2c *h2c)
 
 	if (!(h2c->flags & H2_CF_DEM_BLOCK_ANY) &&
 	    (b_data(&h2c->dbuf) || (h2c->flags & H2_CF_RCVD_SHUT))) {
+		int prev_glitches = h2c->glitches;
+
 		h2_process_demux(h2c);
+
+		if (h2c->glitches != prev_glitches && !(h2c->flags & H2_CF_IS_BACK))
+			session_add_glitch_ctr(h2c->conn->owner, h2c->glitches - prev_glitches);
 
 		if (h2c->st0 >= H2_CS_ERROR || (h2c->flags & H2_CF_ERROR))
 			b_reset(&h2c->dbuf);
@@ -5073,7 +5142,8 @@ static int h2c_dec_hdrs(struct h2c *h2c, struct buffer *rxbuf, uint32_t *flags, 
 	struct buffer *copy = NULL;
 	unsigned int msgf;
 	struct htx *htx = NULL;
-	int flen; // header frame len
+	int flen = 0; // header frame len
+	int fragments = 0;
 	int hole = 0;
 	int ret = 0;
 	int outlen;
@@ -5148,6 +5218,7 @@ next_frame:
 		hole     += h2c->dpl + 9;
 		h2c->dpl  = 0;
 		TRACE_STATE("waiting for next continuation frame", H2_EV_RX_FRAME|H2_EV_RX_FHDR|H2_EV_RX_CONT|H2_EV_RX_HDR, h2c->conn);
+		fragments++;
 		goto next_frame;
 	}
 
@@ -5336,6 +5407,16 @@ next_frame:
 		htx_to_buf(htx, rxbuf);
 	free_trash_chunk(copy);
 	TRACE_LEAVE(H2_EV_RX_FRAME|H2_EV_RX_HDR, h2c->conn);
+
+	/* Check for abuse of CONTINUATION: more than 4 fragments and less than
+	 * 1kB per fragment is clearly unusual and suspicious enough to count
+	 * one glitch per 1kB fragment in a 16kB buffer, which means that an
+	 * abuser sending 1600 1-byte frames in a 16kB buffer would increment
+	 * its counter by 100.
+	 */
+	if (unlikely(fragments > 4) && fragments > flen / 1024 && ret != 0)
+		h2c->glitches += (fragments + 15) / 16;
+
 	return ret;
 
  fail:
@@ -7041,7 +7122,7 @@ static size_t h2_snd_buf(struct stconn *sc, struct buffer *buf, size_t count, in
 	return total;
 }
 
-static size_t h2_nego_ff(struct stconn *sc, struct buffer *input, size_t count, unsigned int may_splice)
+static size_t h2_nego_ff(struct stconn *sc, struct buffer *input, size_t count, unsigned int flags)
 {
 	struct h2s *h2s = __sc_mux_strm(sc);
 	struct h2c *h2c = h2s->h2c;
@@ -7049,11 +7130,6 @@ static size_t h2_nego_ff(struct stconn *sc, struct buffer *input, size_t count, 
 	size_t sz , ret = 0;
 
 	TRACE_ENTER(H2_EV_H2S_SEND|H2_EV_STRM_SEND, h2s->h2c->conn, h2s);
-
-	if (global.tune.no_zero_copy_fwd & NO_ZERO_COPY_FWD_H2_SND) {
-		h2s->sd->iobuf.flags |= IOBUF_FL_NO_FF;
-		goto end;
-	}
 
 	/* If we were not just woken because we wanted to send but couldn't,
 	 * and there's somebody else that is waiting to send, do nothing,

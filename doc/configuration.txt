@@ -3,7 +3,7 @@
                           Configuration Manual
                          ----------------------
                               version 3.0
-                              2024/01/26
+                              2024/02/10
 
 
 This document covers the configuration language as implemented in the version
@@ -1351,10 +1351,10 @@ The following keywords are supported in the "global" section :
    - spread-checks
    - ssl-engine
    - ssl-mode-async
+   - tune.applet.zero-copy-forwarding
    - tune.buffers.limit
    - tune.buffers.reserve
    - tune.bufsize
-   - tune.cache.zero-copy-forwarding
    - tune.comp.maxlevel
    - tune.disable-fast-forward
    - tune.disable-zero-copy-forwarding
@@ -1400,6 +1400,7 @@ The following keywords are supported in the "global" section :
    - tune.quic.frontend.max-idle-timeout
    - tune.quic.frontend.max-streams-bidi
    - tune.quic.max-frame-loss
+   - tune.quic.reorder-ratio
    - tune.quic.retry-threshold
    - tune.quic.socket-owner
    - tune.quic.zero-copy-fwd-send
@@ -3025,6 +3026,12 @@ ssl-mode-async
   read/write  operations (it is only enabled during initial and renegotiation
   handshakes).
 
+tune.applet.zero-copy-forwarding { on | off }
+  Enables ('on') of disabled ('off') the zero-copy forwarding of data for the
+  applets. It is enabled by default.
+
+  See also: tune.disable-zero-copy-forwarding.
+
 tune.buffers.limit <number>
   Sets a hard limit on the number of buffers which may be allocated per process.
   The default value is zero which means unlimited. The minimum non-zero value
@@ -3064,13 +3071,6 @@ tune.bufsize <number>
   value set using this parameter will automatically be rounded up to the next
   multiple of 8 on 32-bit machines and 16 on 64-bit machines.
 
-tune.cache.zero-copy-forwarding { on | off }
-  Enables ('on') of disabled ('off') the zero-copy forwarding of data for the
-  cache applet, when objects are served from the cache to clients. It is
-  enabled by default.
-
-  See also: tune.disable-zero-copy-forwarding.
-
 tune.comp.maxlevel <number>
   Sets the maximum compression level. The compression level affects CPU
   usage during compression. This value affects CPU usage during compression.
@@ -3094,7 +3094,7 @@ tune.disable-zero-copy-forwarding
   Thanks to this directive, it is possible to disable this optimization. Note
   it also disable any kernel tcp splicing.
 
-  See also: tune.pt.zero-copy-forwarding, tune.cache.zero-copy-forwarding,
+  See also: tune.pt.zero-copy-forwarding, tune.applet.zero-copy-forwarding,
             tune.h1.zero-copy-fwd-recv, tune.h1.zero-copy-fwd-send,
             tune.h2.zero-copy-fwd-send, tune.quic.zero-copy-fwd-send
 
@@ -3617,6 +3617,12 @@ tune.quic.max-frame-loss <number>
 
   The default value is 10.
 
+tune.quic.reorder-ratio <0..100, in percent>
+  The ratio applied to the packet reordering threshold calculated. It may
+  trigger a high packet loss detection when too small.
+
+  The default value is 50.
+
 tune.quic.retry-threshold <number>
   Dynamically enables the Retry feature for all the configured QUIC listeners
   as soon as this number of half open connections is reached. A half open
@@ -3993,7 +3999,15 @@ user <username> [password|insecure-password <password>]
   designed to be expensive to compute to achieve resistance against brute
   force attacks. They do not simply salt/hash the clear text password once,
   but thousands of times. This can quickly become a major factor in HAProxy's
-  overall CPU consumption!
+  overall CPU consumption, and can even lead to application crashes!
+
+  To address the high CPU usage of hash functions, one approach is to reduce
+  the number of rounds of the hash function (SHA family algorithms) or decrease
+  the "cost" of the function, if the algorithm supports it.
+
+  As a side note, musl (e.g. Alpine Linux) implementations are known to be
+  slower than their glibc counterparts when calculating hashes, so you might
+  want to consider this aspect too.
 
   Example:
         userlist L1
@@ -7513,9 +7527,10 @@ http-reuse { never | safe | aggressive | always }
 
   When http connection sharing is enabled, a great care is taken to respect the
   connection properties and compatibility. Indeed, some properties are specific
-  and it is not possibly to reuse it blindly. Those are the SSL SNI, source
-  and destination address and proxy protocol block. A connection is reused only
-  if it shares the same set of properties with the request.
+  and it is not possible to reuse it blindly. Those are the SSL SNI, source
+  and destination address, proxy protocol block as well as tos and mark
+  sockopts. A connection is reused only if it shares the same set of properties
+  with the request.
 
   Also note that connections with certain bogus authentication schemes (relying
   on the connection) like NTLM are marked private and never shared.
@@ -13791,12 +13806,16 @@ sc-set-gpt                     X     X     X     X            X   X   X
 sc-set-gpt0                    X     X     X     X            X   X   X
 send-spoe-group                -     -     X     X            X   X   -
 set-bandwidth-limit            -     -     X     X            X   X   -
+set-bc-mark                    -     -     X     -            X   -   -
+set-bc-tos                     -     -     X     -            X   -   -
 set-dst                        X     X     X     -            X   -   -
 set-dst-port                   X     X     X     -            X   -   -
+set-fc-mark                    X     X     X     X            X   X   -
+set-fc-tos                     X     X     X     X            X   X   -
 set-header                     -     -     -     -            X   X   X
 set-log-level                  -     -     X     X            X   X   X
 set-map                        -     -     -     -            X   X   X
-set-mark                       X     X     X     X            X   X   -
+set-mark (deprecated)          X     X     X     X            X   X   -
 set-method                     -     -     -     -            X   -   -
 set-nice                       -     -     X     X            X   X   -
 set-path                       -     -     -     -            X   -   -
@@ -13809,7 +13828,7 @@ set-src                        X     X     X     -            X   -   -
 set-src-port                   X     X     X     -            X   -   -
 set-status                     -     -     -     -            -   X   X
 set-timeout                    -     -     -     -            X   X   -
-set-tos                        X     X     X     X            X   X   -
+set-tos (deprecated)           X     X     X     X            X   X   -
 set-uri                        -     -     -     -            X   -   -
 set-var                        X     X     X     X            X   X   X
 set-var-fmt                    X     X     X     X            X   X   X
@@ -14699,6 +14718,42 @@ set-bandwidth-limit <name> [limit {<expr> | <size>}] [period {<expr> | <time>}]
   See section 9.7 about bandwidth limitation filter setup.
 
 
+set-bc-mark { <mark> | <expr> }
+  Usable in:  TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
+                    -  |   -  |   X  |   -  |          X |  - |  -
+
+  This is used to set the Netfilter/IPFW MARK on the backend connection (all
+  packets sent to the server) to the value passed in <mark> or <expr> on
+  platforms which support it. This value is an unsigned 32 bit value which can
+  be matched by netfilter/ipfw and by the routing table or monitoring the
+  packets through DTrace. <mark> can be expressed both in decimal or hexadecimal
+  format (prefixed by "0x"). Alternatively, <expr> can be used: it is a standard
+  HAProxy expression formed by a sample-fetch followed by some converters which
+  must resolve to integer type. This action can be useful to force certain
+  packets to take a different route (for example a cheaper network path for bulk
+  downloads). This works on Linux kernels 2.6.32 and above and requires admin
+  privileges, as well on FreeBSD and OpenBSD. The mark will be set for the whole
+  duration of the backend/server connection (from connect to close).
+
+
+set-bc-tos { <tos> | <expr> }
+  Usable in:  TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
+                    -  |   -  |   X  |   -  |          X |  - |  -
+
+  This is used to set the TOS or DSCP field value on the backend connection
+  (all packets sent to the server) to the value passed in <tos> or <expr> on
+  platforms which support this. This value represents the whole 8 bits of the
+  IP TOS field. Note that only the 6 higher bits are used in DSCP or TOS, and
+  the two lower bits are always 0. Alternatively, <expr> can be used: it is a
+  standard HAProxy expression formed by a sample-fetch followed by some
+  converters which must resolve to integer type. This action can be used to
+  adjust some routing behavior on inner routers based on some information from
+  the request. The tos will be set for the whole duration of the backend/server
+  connection (from connect to close).
+
+  See RFC 2474, 2597, 3260 and 4594 for more information.
+
+
 set-dst <expr>
   Usable in:  TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
                     X  |   X  |   X  |   -  |          X |  - |  -
@@ -14740,6 +14795,39 @@ set-dst-port <expr>
   When possible, set-dst-port preserves the original destination address as
   long as the address family supports a port, otherwise it forces the
   destination address to IPv4 "0.0.0.0" before rewriting the port.
+
+
+set-fc-mark { <mark> | <expr> }
+  Usable in:  TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
+                    X  |   X  |   X  |   X  |          X |  X |  -
+
+  This is used to set the Netfilter/IPFW MARK on all packets sent to the client
+  to the value passed in <mark> or <expr> on platforms which support it. This
+  value is an unsigned 32 bit value which can be matched by netfilter/ipfw and
+  by the routing table or monitoring the packets through DTrace. <mark> can be
+  expressed both in decimal or hexadecimal format (prefixed by "0x").
+  Alternatively, <expr> can be used: it is a standard HAProxy expression formed
+  by a sample-fetch followed by some converters which must resolve to integer
+  type. This action can be useful to force certain packets to take a different
+  route (for example a cheaper network path for bulk downloads). This works on
+  Linux kernels 2.6.32 and above and requires admin privileges, as well on
+  FreeBSD and OpenBSD.
+
+
+set-fc-tos { <tos | <expr> }
+  Usable in:  TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
+                    X  |   X  |   X  |   X  |          X |  X |  -
+
+  This is used to set the TOS or DSCP field value of packets sent to the client
+  to the value passed in <tos> or <expr> on platforms which support this. This
+  value represents the whole 8 bits of the IP TOS field. Note that only the 6
+  higher bits are used in DSCP or TOS, and the two lower bits are always 0.
+  Alternatively, <expr> can be used: it is a standard HAProxy expression formed
+  by a sample-fetch followed by some converters which must resolve to integer
+  type. This action can be used to adjust some routing behavior on border
+  routers based on some information from the request.
+
+  See RFC 2474, 2597, 3260 and 4594 for more information.
 
 
 set-header <name> <fmt>
@@ -14790,19 +14878,8 @@ set-map(<map-name>) <key fmt> <value fmt>
   stats socket, but can be triggered by an HTTP request.
 
 
-set-mark <mark>
-  Usable in:  TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
-                    X  |   X  |   X  |   X  |          X |  X |  -
-
-  This is used to set the Netfilter/IPFW MARK on all packets sent to the client
-  to the value passed in <mark> on platforms which support it. This value is an
-  unsigned 32 bit value which can be matched by netfilter/ipfw and by the
-  routing table or monitoring the packets through DTrace. It can be expressed
-  both in decimal or hexadecimal format (prefixed by "0x").
-  This can be useful to force certain packets to take a different route (for
-  example a cheaper network path for bulk downloads). This works on Linux
-  kernels 2.6.32 and above and requires admin privileges, as well on FreeBSD
-  and OpenBSD.
+set-mark <mark> (deprecated)
+  This is an alias for "set-fc-mark" (which should be used instead).
 
 
 set-method <fmt>
@@ -14989,19 +15066,8 @@ set-timeout { client | server | tunnel } { <timeout> | <expr> }
     http-response set-timeout server res.hdr(X-Refresh-Seconds),mul(1000)
 
 
-set-tos <tos>
-  Usable in:  TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
-                    X  |   X  |   X  |   X  |          X |  X |  -
-
-  This is used to set the TOS or DSCP field value of packets sent to the client
-  to the value passed in <tos> on platforms which support this. This value
-  represents the whole 8 bits of the IP TOS field, and can be expressed both in
-  decimal or hexadecimal format (prefixed by "0x"). Note that only the 6 higher
-  bits are used in DSCP or TOS, and the two lower bits are always 0. This can
-  be used to adjust some routing behavior on border routers based on some
-  information from the request.
-
-  See RFC 2474, 2597, 3260 and 4594 for more information.
+set-tos <tos> (deprecated)
+  This is an alias for "set-fc-tos" (which should be used instead).
 
 
 set-uri <fmt>
@@ -19950,6 +20016,21 @@ table_expire(<table>[,<default_value>])
   input sample in the designated table.
   See also the table_idle sample fetch keyword.
 
+table_glitch_cnt(<table>)
+  Uses the string representation of the input sample to perform a look up in
+  the specified table. If the key is not found in the table, integer value zero
+  is returned. Otherwise the converter returns the cumulative number of front
+  connection glitches associated with the input sample in the designated table.
+  See also the sc_glitch_cnt sample fetch keyword and fc_glitches for the value
+  measured on the current front connection.
+
+table_glitch_rate(<table>)
+  Uses the string representation of the input sample to perform a look up in
+  the specified table. If the key is not found in the table, integer value zero
+  is returned. Otherwise the converter returns the average front connection
+  glitch rate associated with the input sample in the designated table. See
+  also the sc_glitch_rate sample fetch keyword.
+
 table_gpc(<idx>,<table>)
   Uses the string representation of the input sample to perform a lookup in
   the specified table. If the key is not found in the table, integer value zero
@@ -20463,7 +20544,6 @@ table_avl([<table>])                               integer
 table_cnt([<table>])                               integer
 thread                                             integer
 txn.id32                                           integer
-txn.conn_retries                                   integer
 txn.sess_term_state                                string
 uuid([<version>])                                  string
 var(<var-name>[,<default>])                        undefined
@@ -20920,12 +21000,6 @@ txn.id32 : integer
   depends on the request rate. In practice, it should not be an issue. For a
   true unique ID, see "unique-id-format" directive.
 
-txn.conn_retries : integer
-  Returns the the number of connection retries experienced by this stream when
-  trying to connect to the server. This value is subject to change while the
-  connection is not fully established. For HTTP connections, the value may be
-  affected by L7 retries.
-
 txn.sess_term_state : string
   Returns the TCP or HTTP stream termination state, as reported in the log. It
   is a 2-characters string, The final stream state followed by the event which
@@ -20981,6 +21055,7 @@ Summary of sample fetch methods in this section and their respective types:
 -------------------------------------------------+-------------
 accept_date([<unit>])                              integer
 bc.timer.connect                                   integer
+bc_be_queue                                        integer
 bc_dst                                             ip
 bc_dst_port                                        integer
 bc_err                                             integer
@@ -20989,12 +21064,15 @@ bc_glitches                                        integer
 bc_http_major                                      integer
 bc_src                                             ip
 bc_src_port                                        integer
+bc_srv_queue                                       integer
 be_id                                              integer
 be_name                                            string
 bc_rtt(<unit>)                                     integer
 bc_rttvar(<unit>)                                  integer
 be_server_timeout                                  integer
 be_tunnel_timeout                                  integer
+bytes_in                                           integer
+bytes_out                                          integer
 cur_server_timeout                                 integer
 cur_tunnel_timeout                                 integer
 cur_client_timeout                                 integer
@@ -21074,6 +21152,14 @@ sc_get_gpt0(<ctr>[,<table>])                       integer
 sc0_get_gpt0([<table>])                            integer
 sc1_get_gpt0([<table>])                            integer
 sc2_get_gpt0([<table>])                            integer
+sc_glitch_cnt(<ctr>[,<table>])                     integer
+sc0_glitch_cnt([<table>])                          integer
+sc1_glitch_cnt([<table>])                          integer
+sc2_glitch_cnt([<table>])                          integer
+sc_glitch_rate(<ctr>[,<table>])                    integer
+sc0_glitch_rate([<table>])                         integer
+sc1_glitch_rate([<table>])                         integer
+sc2_glitch_rate([<table>])                         integer
 sc_gpc_rate(<idx>,<ctr>[,<table>])                 integer
 sc_gpc0_rate(<ctr>[,<table>])                      integer
 sc0_gpc0_rate([<table>])                           integer
@@ -21177,6 +21263,8 @@ src_sess_rate([<table>])                           integer
 src_updt_conn_cnt([<table>])                       integer
 srv_id                                             integer
 srv_name                                           string
+txn.conn_retries                                   integer
+txn.redispatched                                   boolean
 -------------------------------------------------+-------------
 
 Detailed list:
@@ -21202,6 +21290,10 @@ bc.timer.connect : integer
   Total time to establish the TCP connection to the server.  This is the
   equivalent of %Tc in the log-format. This is reported in milliseconds (ms).
   For more information see Section 8.4 "Timing events"
+
+bc_be_queue : integer
+  Number of streams de-queued while waiting for a connection slot on the
+  target backend. This is the equivalent of %bq in the log-format.
 
 bc_dst : ip
   This is the destination ip address of the connection on the server side,
@@ -21253,6 +21345,10 @@ bc_src_port : integer
   Returns an integer value corresponding to the TCP source port of the
   connection on the server side, which is the port HAProxy connected from.
 
+bc_srv_queue : integer
+  Number of streams de-queued while waiting for a connection slot on the
+  target server. This is the equivalent of %sq in the log-format.
+
 be_id : integer
   Returns an integer containing the current backend's id. It can be used in
   frontends with responses to check which backend processed the request. If
@@ -21291,6 +21387,12 @@ be_tunnel_timeout : integer
   Returns the configuration value in millisecond for the tunnel timeout of the
   current backend. This timeout can be overwritten by a "set-timeout" rule. See
   also the "cur_tunnel_timeout".
+
+bytes_in : integer
+  This returns the number of bytes uploaded from the client to the server.
+
+bytes_out : integer
+  This is the number of bytes transmitted from the server to the client.
 
 cur_server_timeout : integer
   Returns the currently applied server timeout in millisecond for the stream.
@@ -21706,6 +21808,34 @@ sc2_get_gpt0([<table>]) : integer
   Returns the value of the first General Purpose Tag associated to the
   currently tracked counters. See also src_get_gpt0.
 
+sc_glitch_cnt(<ctr>[,<table>]) : integer
+sc0_glitch_cnt([<table>]) : integer
+sc1_glitch_cnt([<table>]) : integer
+sc2_glitch_cnt([<table>]) : integer
+  Returns the cumulative number of front connection glitches that were observed
+  on connections associated with the currently tracked counters. Usually these
+  result in requests or connections to be aborted so the returned value will
+  often correspond to past connections. There is no good nor bad value, but a
+  poor quality client may occasionally cause a few glitches per connection,
+  while a very bogus or malevolent client may quickly cause thousands of events
+  to be added on a connection. See also fc_glitches for the number affecting
+  the current connection, src_glitch_cnt to look them up per source, and
+  sc_glitch_rate for the event rate measurements.
+
+sc_glitch_rate(<ctr>[,<table>]) : integer
+sc0_glitch_rate([<table>]) : integer
+sc1_glitch_rate([<table>]) : integer
+sc2_glitch_rate([<table>]) : integer
+  Returns the average rate at which front connection glitches were observed for
+  the currently tracked counters, measured in amount of events over the period
+  configured in the table. Usually these glitches result in requests or
+  connections to be aborted so the returned value will often be related to past
+  connections. There is no good nor bad value, but a poor quality client may
+  occasionally cause a few glitches per connection, hence a low rate is
+  generally expected. However, a very bogus or malevolent client may quickly
+  cause thousands of events to be added per connection, and maintain a high
+  rate here. See also src_glitch_rate and sc_glitch_cnt.
+
 sc_gpc_rate(<idx>,<ctr>[,<table>]) : integer
   Returns the average increment rate of the General Purpose Counter at the
   index <idx> of the array associated to the tracked counter of ID <ctr> from
@@ -22020,6 +22150,29 @@ src_get_gpt0([<table>]) : integer
   the designated stick-table. If the address is not found, zero is returned.
   See also sc/sc0/sc1/sc2_get_gpt0.
 
+src_glitch_cnt([<table>]) : integer
+  Returns the cumulative number of front connection glitches that were observed
+  on connections from the current connection's source address. Usually these
+  result in requests or connections to be aborted so the returned value will
+  often correspond to past connections. There is no good nor bad value, but a
+  poor quality client may occasionally cause a few glitches per connection,
+  while a very bogus or malevolent client may quickly cause thousands of events
+  to be added on a connection. See also fc_glitches for the number affecting
+  the current connection, sc_glitch_cnt to look them up in currently tracked
+  counters, and src_glitch_rate for the event rate measurements.
+
+src_glitch_rate([<table>]) : integer
+  Returns the average rate at which front connection glitches were observed for
+  on connections from the current connection's source address, measured in
+  amount of events over the period configured in the table. Usually these
+  glitches result in requests or connections to be aborted so the returned
+  value will often be related to past connections. There is no good nor bad
+  value, but a poor quality client may occasionally cause a few glitches per
+  connection, hence a low rate is generally expected. However, a very bogus or
+  malevolent client may quickly cause thousands of events to be added per
+  connection, and maintain a high rate here. See also sc_glitch_rate and
+  src_glitch_cnt.
+
 src_gpc_rate(<idx>[,<table>]) : integer
   Returns the average increment rate of the General Purpose Counter at the
   index <idx> of the array associated to the incoming connection's
@@ -22198,6 +22351,18 @@ srv_name : string
   Returns a string containing the server's name when processing the response.
   While it's almost only used with ACLs, it may be used for logging or
   debugging. It can also be used in a tcp-check or an http-check ruleset.
+
+txn.conn_retries : integer
+  Returns the the number of connection retries experienced by this stream when
+  trying to connect to the server. This value is subject to change while the
+  connection is not fully established. For HTTP connections, the value may be
+  affected by L7 retries.
+
+txn.redispatched : boolean
+  Returns true if the connection has experienced redispatch upon retry according
+  to "option redispatch" configuration. This value is subject to change while
+  the connection is not fully established. For HTTP connections, the value may
+  be affected by L7 retries.
 
 7.3.4. Fetching samples at Layer 5
 ----------------------------------
@@ -23418,8 +23583,6 @@ base                                               string
 base32                                             integer
 base32+src                                         binary
 baseq                                              string
-bytes_in                                           integer
-bytes_out                                          integer
 capture.req.hdr(<idx>)                             string
 capture.req.method                                 string
 capture.req.uri                                    string
@@ -23556,13 +23719,6 @@ baseq : string
   the request with the query-string, which starts at the first slash. Using this
   instead of "base" allows one to properly identify the target resource, for
   statistics or caching use cases. See also "path", "pathq" and "base".
-
-
-bytes_in : integer
-  This returns the number of bytes uploaded from the client to the server.
-
-bytes_out : integer
-   This is the number of bytes transmitted from the server to the client.
 
 capture.req.hdr(<idx>) : string
   This extracts the content of the header captured by the "capture request
@@ -25240,12 +25396,13 @@ Please refer to the table below for currently defined variables :
   |   |      | %[accept_date,ltime("%d/%b/%Y:%H:%M:%S %z")]         | date    |
   +---+------+------------------------------------------------------+---------+
   |   | %Ts  | Accept date as a UNIX timestamp                      | numeric |
+  |   |      | %[accept_date]                                       |         |
   +---+------+------------------------------------------------------+---------+
   |   | %t   | Accept date local (with millisecond resolution)      |         |
   |   |      | %[accept_date(ms),ms_ltime("%d/%b/%Y:%H:%M:%S.%3N")] | date    |
   +---+------+------------------------------------------------------+---------+
   |   | %ms  | Accept date milliseconds                             |         |
-  |   |      | %[accept_date(ms),ms_utime("%3N")                    | numeric |
+  |   |      | %[accept_date(ms),ms_utime("%3N")]                   | numeric |
   +---+------+------------------------------------------------------+---------+
   | H | %tr  | Request date local (with millisecond resolution)     |         |
   |   |      | %[request_date(ms),ms_ltime("%d/%b/%Y:%H:%M:%S.%3N")]| date    |
@@ -25301,8 +25458,10 @@ Please refer to the table below for currently defined variables :
   | H | %CS  | captured_response_cookie                             | string  |
   +---+------+------------------------------------------------------+---------+
   |   | %H   | hostname                                             | string  |
+  |   |      | %[hostname]                                          |         |
   +---+------+------------------------------------------------------+---------+
   | H | %HM  | HTTP method (ex: POST)                               | string  |
+  |   |      | %[method]
   +---+------+------------------------------------------------------+---------+
   | H | %HP  | HTTP request URI without query string                | string  |
   +---+------+------------------------------------------------------+---------+
@@ -25331,6 +25490,7 @@ Please refer to the table below for currently defined variables :
   |   |      | %[be_name]                                           | string  |
   +---+------+------------------------------------------------------+---------+
   |   | %bc  | beconn      (backend concurrent connections)         | numeric |
+  |   |      | %[be_conn]                                           |         |
   +---+------+------------------------------------------------------+---------+
   |   | %bi  | backend_source_ip       (connecting address)         |         |
   |   |      | %[bc_src]                                            | IP      |
@@ -25339,6 +25499,7 @@ Please refer to the table below for currently defined variables :
   |   |      | %[bc_src_port]                                       | numeric |
   +---+------+------------------------------------------------------+---------+
   |   | %bq  | backend_queue                                        | numeric |
+  |   |      | %[bc_be_queue]                                       |         |
   +---+------+------------------------------------------------------+---------+
   |   | %ci  | client_ip                 (accepted address)         |         |
   |   |      | %[src]                                               | IP      |
@@ -25347,8 +25508,10 @@ Please refer to the table below for currently defined variables :
   |   |      | %[src_port]                                          | numeric |
   +---+------+------------------------------------------------------+---------+
   |   | %f   | frontend_name                                        | string  |
+  |   |      | %[fe_name]                                           |         |
   +---+------+------------------------------------------------------+---------+
   |   | %fc  | feconn     (frontend concurrent connections)         | numeric |
+  |   |      | %[fe_conn]                                           |         |
   +---+------+------------------------------------------------------+---------+
   |   | %fi  | frontend_ip              (accepting address)         |         |
   |   |      | %[dst]                                               | IP      |
@@ -25376,12 +25539,13 @@ Please refer to the table below for currently defined variables :
   | H | %r   | http_request                                         | string  |
   +---+------+------------------------------------------------------+---------+
   |   | %rc  | retries                                              | numeric |
-  |   |      | %[txn.conn_retries]                                  |         |
+  |   |      | %[txn.redispatched,iif(+,)]%[txn.conn_retries]       |         |
   +---+------+------------------------------------------------------+---------+
   |   | %rt  | request_counter (HTTP req or TCP session)            | numeric |
   |   |      | %[txn.id32]                                          |         |
   +---+------+------------------------------------------------------+---------+
   |   | %s   | server_name                                          | string  |
+  |   |      | %[srv_name]                                          |         |
   +---+------+------------------------------------------------------+---------+
   |   | %sc  | srv_conn     (server concurrent connections)         | numeric |
   +---+------+------------------------------------------------------+---------+
@@ -25392,6 +25556,7 @@ Please refer to the table below for currently defined variables :
   |   |      | %[bc_dst_port]                                       | numeric |
   +---+------+------------------------------------------------------+---------+
   |   | %sq  | srv_queue                                            | numeric |
+  |   |      | %[bc_srv_queue]                                      |         |
   +---+------+------------------------------------------------------+---------+
   | S | %sslc| ssl_ciphers (ex: AES-SHA)                            |         |
   |   |      | %[ssl_fc_cipher]                                     | string  |

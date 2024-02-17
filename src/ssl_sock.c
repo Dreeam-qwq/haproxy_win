@@ -172,13 +172,37 @@ static struct ssl_counters {
 	long long failed_handshake;
 } ssl_counters;
 
-static void ssl_fill_stats(void *data, struct field *stats)
+static int ssl_fill_stats(void *data, struct field *stats, unsigned int *selected_field)
 {
 	struct ssl_counters *counters = data;
+	unsigned int current_field = (selected_field != NULL ? *selected_field : 0);
 
-	stats[SSL_ST_SESS]             = mkf_u64(FN_COUNTER, counters->sess);
-	stats[SSL_ST_REUSED_SESS]      = mkf_u64(FN_COUNTER, counters->reused_sess);
-	stats[SSL_ST_FAILED_HANDSHAKE] = mkf_u64(FN_COUNTER, counters->failed_handshake);
+	for (; current_field < SSL_ST_STATS_COUNT; current_field++) {
+		struct field metric = { 0 };
+
+		switch (current_field) {
+		case SSL_ST_SESS:
+			metric = mkf_u64(FN_COUNTER, counters->sess);
+			break;
+		case SSL_ST_REUSED_SESS:
+			metric = mkf_u64(FN_COUNTER, counters->reused_sess);
+			break;
+		case SSL_ST_FAILED_HANDSHAKE:
+			metric = mkf_u64(FN_COUNTER, counters->failed_handshake);
+			break;
+		default:
+			/* not used for frontends. If a specific metric
+			 * is requested, return an error. Otherwise continue.
+			 */
+			if (selected_field != NULL)
+				return 0;
+			continue;
+		}
+		stats[current_field] = metric;
+		if (selected_field != NULL)
+			break;
+	}
+	return 1;
 }
 
 static struct stats_module ssl_stats_module = {
@@ -1099,6 +1123,7 @@ static int ssl_sock_load_ocsp(const char *path, SSL_CTX *ctx, struct ckch_data *
 	struct buffer *ocsp_uri = get_trash_chunk();
 	char *err = NULL;
 	size_t path_len;
+	int inc_refcount_store = 0;
 
 	x = data->cert;
 	if (!x)
@@ -1134,8 +1159,10 @@ static int ssl_sock_load_ocsp(const char *path, SSL_CTX *ctx, struct ckch_data *
 	if (!issuer)
 		goto out;
 
-	if (!data->ocsp_cid)
+	if (!data->ocsp_cid) {
 		data->ocsp_cid = OCSP_cert_to_id(0, x, issuer);
+		inc_refcount_store = 1;
+	}
 	if (!data->ocsp_cid)
 		goto out;
 
@@ -1162,6 +1189,9 @@ static int ssl_sock_load_ocsp(const char *path, SSL_CTX *ctx, struct ckch_data *
 #endif
 	SSL_CTX_get_tlsext_status_cb(ctx, &callback);
 
+	if (inc_refcount_store)
+		iocsp->refcount_store++;
+
 	if (!callback) {
 		struct ocsp_cbk_arg *cb_arg;
 		EVP_PKEY *pkey;
@@ -1172,7 +1202,7 @@ static int ssl_sock_load_ocsp(const char *path, SSL_CTX *ctx, struct ckch_data *
 
 		cb_arg->is_single = 1;
 		cb_arg->s_ocsp = iocsp;
-		iocsp->refcount++;
+		iocsp->refcount_instance++;
 
 		pkey = X509_get_pubkey(x);
 		cb_arg->single_kt = EVP_PKEY_base_id(pkey);
@@ -1212,7 +1242,7 @@ static int ssl_sock_load_ocsp(const char *path, SSL_CTX *ctx, struct ckch_data *
 		index = ssl_sock_get_ocsp_arg_kt_index(key_type);
 		if (index >= 0 && !cb_arg->m_ocsp[index]) {
 			cb_arg->m_ocsp[index] = iocsp;
-			iocsp->refcount++;
+			iocsp->refcount_instance++;
 		}
 	}
 	HA_SPIN_UNLOCK(OCSP_LOCK, &ocsp_tree_lock);
@@ -1254,6 +1284,25 @@ static int ssl_sock_load_ocsp(const char *path, SSL_CTX *ctx, struct ckch_data *
 		memcpy(iocsp->path, path, path_len + 1);
 
 		if (data->ocsp_update_mode == SSL_SOCK_OCSP_UPDATE_ON) {
+			ssl_ocsp_update_insert(iocsp);
+			/* If we are during init the update task is not
+			 * scheduled yet so a wakeup won't do anything.
+			 * Otherwise, if the OCSP was added through the CLI, we
+			 * wake the task up to manage the case of a new entry
+			 * that needs to be updated before the previous first
+			 * entry.
+			 */
+			if (ocsp_update_task)
+				task_wakeup(ocsp_update_task, TASK_WOKEN_MSG);
+		}
+	} else if (iocsp->uri && data->ocsp_update_mode == SSL_SOCK_OCSP_UPDATE_ON) {
+		/* This unlikely case can happen if a series of "del ssl
+		 * crt-list" / "add ssl crt-list" commands are made on the CLI.
+		 * In such a case, the OCSP response tree entry will be created
+		 * prior to the activation of the ocsp auto update and in such a
+		 * case we must "force" insertion in the auto update tree.
+		 */
+		if (iocsp->next_update.node.leaf_p == NULL) {
 			ssl_ocsp_update_insert(iocsp);
 			/* If we are during init the update task is not
 			 * scheduled yet so a wakeup won't do anything.
@@ -3324,7 +3373,7 @@ static int ssl_sock_put_ckch_into_ctx(const char *path, struct ckch_data *data, 
 			memprintf(err, "%s '%s.ocsp' is present and activates OCSP but it is impossible to compute the OCSP certificate ID (maybe the issuer could not be found)'.\n",
 				  err && *err ? *err : "", path);
 		else
-			memprintf(err, "%s '%s' has an OCSP URI and OCSP auto-update is set to 'on' but an error occurred (maybe the issuer could not be found)'.\n",
+			memprintf(err, "%s '%s' has an OCSP auto-update set to 'on' but an error occurred (maybe the OCSP URI or the issuer could not be found)'.\n",
 				  err && *err ? *err : "", path);
 		errcode |= ERR_ALERT | ERR_FATAL;
 		goto end;

@@ -198,6 +198,7 @@ struct global global = {
 		.quic_backend_max_idle_timeout = QUIC_TP_DFLT_BACK_MAX_IDLE_TIMEOUT,
 		.quic_frontend_max_idle_timeout = QUIC_TP_DFLT_FRONT_MAX_IDLE_TIMEOUT,
 		.quic_frontend_max_streams_bidi = QUIC_TP_DFLT_FRONT_MAX_STREAMS_BIDI,
+		.quic_reorder_ratio = QUIC_DFLT_REORDER_RATIO,
 		.quic_retry_threshold = QUIC_DFLT_RETRY_THRESHOLD,
 		.quic_max_frame_loss = QUIC_DFLT_MAX_FRAME_LOSS,
 		.quic_streams_buf = 30,
@@ -2380,6 +2381,10 @@ static void init(int argc, char **argv)
 	if (global.mode & MODE_DUMP_KWD)
 		dump_registered_keywords();
 
+	if (global.mode & MODE_DIAG) {
+		cfg_run_diagnostics();
+	}
+
 	if (global.mode & MODE_CHECK) {
 		struct peers *pr;
 		struct proxy *px;
@@ -2414,10 +2419,6 @@ static void init(int argc, char **argv)
 
 	if (global.mode & MODE_DUMP_CFG)
 		deinit_and_exit(0);
-
-	if (global.mode & MODE_DIAG) {
-		cfg_run_diagnostics();
-	}
 
 #ifdef USE_OPENSSL
 

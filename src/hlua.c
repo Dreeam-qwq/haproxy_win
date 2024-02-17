@@ -2312,7 +2312,7 @@ static void hlua_socket_handler(struct appctx *appctx)
 	struct hlua_csk_ctx *ctx = appctx->svcctx;
 	struct stconn *sc = appctx_sc(appctx);
 
-	if (unlikely(se_fl_test(appctx->sedesc, (SE_FL_EOS|SE_FL_ERROR|SE_FL_SHR|SE_FL_SHW)))) {
+	if (unlikely(se_fl_test(appctx->sedesc, (SE_FL_EOS|SE_FL_ERROR)))) {
 		co_skip(sc_oc(sc), co_data(sc_oc(sc)));
 		notification_wake(&ctx->wake_on_read);
 		notification_wake(&ctx->wake_on_write);
@@ -2352,8 +2352,10 @@ static void hlua_socket_handler(struct appctx *appctx)
 		notification_wake(&ctx->wake_on_write);
 
 	/* Wake the tasks which wants to read if the buffer contains data. */
-	if (co_data(sc_oc(sc)))
+	if (co_data(sc_oc(sc))) {
 		notification_wake(&ctx->wake_on_read);
+		applet_wont_consume(appctx);
+	}
 
 	/* If write notifications are registered, we considers we want
 	 * to write, so we clear the blocking flag.
@@ -2434,12 +2436,19 @@ __LJMP static int hlua_socket_gc(lua_State *L)
 
 	ctx = container_of(peer, struct hlua_csk_ctx, xref);
 
-	/* Set the flag which destroy the session. */
-	ctx->die = 1;
-	appctx_wakeup(ctx->appctx);
-
 	/* Remove all reference between the Lua stack and the coroutine stream. */
 	xref_disconnect(&socket->xref, peer);
+
+	if (se_fl_test(ctx->appctx->sedesc, SE_FL_ORPHAN)) {
+		/* The applet was never initialized, just release it */
+		appctx_free(ctx->appctx);
+	}
+	else {
+		/* Otherwise, notify it that is must die and wake it up */
+		ctx->die = 1;
+		appctx_wakeup(ctx->appctx);
+	}
+
 	return 0;
 }
 
@@ -2615,6 +2624,7 @@ __LJMP static int hlua_socket_receive_yield(struct lua_State *L, int status, lua
 	co_skip(oc, len + skip_at_end);
 
 	/* Don't wait anything. */
+	applet_will_consume(appctx);
 	appctx_wakeup(appctx);
 
 	/* If the pattern reclaim to read all the data
@@ -3276,8 +3286,6 @@ __LJMP static int hlua_socket_connect(struct lua_State *L)
 	applet_have_more_data(appctx);
 	appctx_wakeup(appctx);
 
-	hlua->gc_count++;
-
 	if (!notification_new(&hlua->com, &csk_ctx->wake_on_write, hlua->task)) {
 		xref_unlock(&socket->xref, peer);
 		WILL_LJMP(luaL_error(L, "out of memory"));
@@ -3388,6 +3396,12 @@ __LJMP static int hlua_socket_new(lua_State *L)
 	struct hlua_socket *socket;
 	struct hlua_csk_ctx *ctx;
 	struct appctx *appctx;
+	struct hlua *hlua;
+
+	/* Get hlua struct, or NULL if we execute from main lua state */
+	hlua = hlua_gethlua(L);
+	if (!hlua)
+		return 0;
 
 	/* Check stack size. */
 	if (!lua_checkstack(L, 3)) {
@@ -3426,6 +3440,8 @@ __LJMP static int hlua_socket_new(lua_State *L)
 	ctx->appctx = appctx;
 	LIST_INIT(&ctx->wake_on_write);
 	LIST_INIT(&ctx->wake_on_read);
+
+	hlua->gc_count++;
 
 	/* Initialise cross reference between stream and Lua socket object. */
 	xref_create(&socket->xref, &ctx->xref);
@@ -8192,6 +8208,32 @@ __LJMP static int hlua_txn_log_alert(lua_State *L)
 	return 0;
 }
 
+__LJMP static int hlua_txn_set_fc_mark(lua_State *L)
+{
+	struct hlua_txn *htxn;
+	int mark;
+
+	MAY_LJMP(check_args(L, 2, "set_fc_mark"));
+	htxn = MAY_LJMP(hlua_checktxn(L, 1));
+	mark = MAY_LJMP(luaL_checkinteger(L, 2));
+
+	conn_set_mark(objt_conn(htxn->s->sess->origin), mark);
+	return 0;
+}
+
+__LJMP static int hlua_txn_set_fc_tos(lua_State *L)
+{
+	struct hlua_txn *htxn;
+	int tos;
+
+	MAY_LJMP(check_args(L, 2, "set_fc_tos"));
+	htxn = MAY_LJMP(hlua_checktxn(L, 1));
+	tos = MAY_LJMP(luaL_checkinteger(L, 2));
+
+	conn_set_tos(objt_conn(htxn->s->sess->origin), tos);
+	return 0;
+}
+
 __LJMP static int hlua_txn_set_loglevel(lua_State *L)
 {
 	struct hlua_txn *htxn;
@@ -8205,32 +8247,6 @@ __LJMP static int hlua_txn_set_loglevel(lua_State *L)
 		WILL_LJMP(luaL_argerror(L, 2, "Bad log level. It must be between 0 and 7"));
 
 	htxn->s->logs.level = ll;
-	return 0;
-}
-
-__LJMP static int hlua_txn_set_tos(lua_State *L)
-{
-	struct hlua_txn *htxn;
-	int tos;
-
-	MAY_LJMP(check_args(L, 2, "set_tos"));
-	htxn = MAY_LJMP(hlua_checktxn(L, 1));
-	tos = MAY_LJMP(luaL_checkinteger(L, 2));
-
-	conn_set_tos(objt_conn(htxn->s->sess->origin), tos);
-	return 0;
-}
-
-__LJMP static int hlua_txn_set_mark(lua_State *L)
-{
-	struct hlua_txn *htxn;
-	int mark;
-
-	MAY_LJMP(check_args(L, 2, "set_mark"));
-	htxn = MAY_LJMP(hlua_checktxn(L, 1));
-	mark = MAY_LJMP(luaL_checkinteger(L, 2));
-
-	conn_set_mark(objt_conn(htxn->s->sess->origin), mark);
 	return 0;
 }
 
@@ -13776,9 +13792,11 @@ lua_State *hlua_init_state(int thread_num)
 	hlua_class_function(L, "get_var",             hlua_get_var);
 	hlua_class_function(L, "done",                hlua_txn_done);
 	hlua_class_function(L, "reply",               hlua_txn_reply_new);
+	hlua_class_function(L, "set_fc_mark",         hlua_txn_set_fc_mark);
+	hlua_class_function(L, "set_fc_tos",          hlua_txn_set_fc_tos);
 	hlua_class_function(L, "set_loglevel",        hlua_txn_set_loglevel);
-	hlua_class_function(L, "set_tos",             hlua_txn_set_tos);
-	hlua_class_function(L, "set_mark",            hlua_txn_set_mark);
+	hlua_class_function(L, "set_mark",            hlua_txn_set_fc_mark); // DEPRECATED, use set_fc_mark
+	hlua_class_function(L, "set_tos",             hlua_txn_set_fc_tos);  // DEPRECATED, use set_fc_tos
 	hlua_class_function(L, "set_priority_class",  hlua_txn_set_priority_class);
 	hlua_class_function(L, "set_priority_offset", hlua_txn_set_priority_offset);
 	hlua_class_function(L, "deflog",              hlua_txn_deflog);

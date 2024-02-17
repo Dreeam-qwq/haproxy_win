@@ -34,18 +34,18 @@ are a few build examples :
   - recent Linux system with all options, make and install :
     $ make clean
     $ make -j $(nproc) TARGET=linux-glibc \
-                USE_OPENSSL=1 USE_LUA=1 USE_PCRE=1 USE_SYSTEMD=1
+                USE_OPENSSL=1 USE_LUA=1 USE_PCRE2=1 USE_SYSTEMD=1
     $ sudo make install
 
   - FreeBSD and OpenBSD, build with all options :
-    $ gmake -j 4 TARGET=freebsd USE_OPENSSL=1 USE_LUA=1 USE_PCRE=1
+    $ gmake -j 4 TARGET=freebsd USE_OPENSSL=1 USE_LUA=1 USE_PCRE2=1
 
   - embedded Linux, build using a cross-compiler :
-    $ make -j $(nproc) TARGET=linux-glibc USE_OPENSSL=1 USE_PCRE=1 \
+    $ make -j $(nproc) TARGET=linux-glibc USE_OPENSSL=1 USE_PCRE2=1 \
                 CC=/opt/cross/gcc730-arm/bin/gcc ADDLIB=-latomic
 
   - Build with static PCRE on Solaris / UltraSPARC :
-    $ make TARGET=solaris CPU=ultrasparc USE_STATIC_PCRE=1
+    $ make TARGET=solaris CPU=ultrasparc USE_STATIC_PCRE2=1
 
 For more advanced build options or if a command above reports an error, please
 read the following sections.
@@ -181,9 +181,9 @@ regex engine which could be slow or even crash on certain patterns.
 
 If you plan on importing a particularly heavy configuration involving a lot of
 regex, you may benefit from using some alternative regex implementations such as
-PCRE. HAProxy natively supports PCRE and PCRE2, both in standard and JIT
-flavors (Just In Time). The following options are available depending on the
-library version provided on your system :
+PCRE. HAProxy natively supports PCRE and PCRE2 (recommended), both in standard
+and JIT flavors (Just In Time). The following options are available depending on
+the library version provided on your system :
 
   - "USE_PCRE=1"         : enable PCRE version 1, dynamic linking
   - "USE_STATIC_PCRE=1"  : enable PCRE version 1, static linking
@@ -292,6 +292,18 @@ some of the features:
 Please also note that wolfSSL supports many platform-specific features that may
 affect performance, and that for production uses it might be a good idea to
 check them using "./configure --help". Please refer to the lib's documentation.
+
+When running wolfSSL in chroot, either mount /dev/[u]random devices into the
+chroot:
+
+  $ mkdir -p /path/to/chrootdir/dev/
+  $ mknod -m 444 /path/to/chrootdir/dev/random c 1 8
+  $ mknod -m 444 /path/to/chrootdir/dev/urandom c 1 9
+
+Or, if your OS supports it, enable the getrandom() syscall by appending the
+following argument to the wolfSSL configure command:
+
+  EXTRA_CFLAGS=-DWOLFSSL_GETRANDOM=1
 
 Building HAProxy with wolfSSL requires to specify the API variant on the "make"
 command line, for example:

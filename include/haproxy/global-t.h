@@ -95,7 +95,7 @@
 #define NO_ZERO_COPY_FWD_QUIC_SND    0x0080 /* disable zero-copy FF for QUIC on send */
 #define NO_ZERO_COPY_FWD_FCGI_RCV    0x0100 /* disable zero-copy FF for FCGI on received */
 #define NO_ZERO_COPY_FWD_FCGI_SND    0x0200 /* disable zero-copy FF for FCGI on send */
-#define NO_ZERO_COPY_FWD_CACHE       0x0400 /* disable zero-copy FF for cache applet */
+#define NO_ZERO_COPY_FWD_APPLET      0x0400 /* disable zero-copy FF for applets */
 
 
 extern int cluster_secret_isset; /* non zero means a cluster secret was initialized */
@@ -195,6 +195,7 @@ struct global {
 		unsigned int quic_frontend_max_idle_timeout;
 		unsigned int quic_frontend_max_streams_bidi;
 		unsigned int quic_retry_threshold;
+		unsigned int quic_reorder_ratio;
 		unsigned int quic_streams_buf;
 		unsigned int quic_max_frame_loss;
 #endif /* USE_QUIC */

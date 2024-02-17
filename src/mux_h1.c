@@ -264,21 +264,54 @@ static struct h1_counters {
 #endif
 } h1_counters;
 
-static void h1_fill_stats(void *data, struct field *stats)
+static int h1_fill_stats(void *data, struct field *stats, unsigned int *selected_field)
 {
 	struct h1_counters *counters = data;
+	unsigned int current_field = (selected_field != NULL ? *selected_field : 0);
 
-	stats[H1_ST_OPEN_CONN]        = mkf_u64(FN_GAUGE,   counters->open_conns);
-	stats[H1_ST_OPEN_STREAM]      = mkf_u64(FN_GAUGE,   counters->open_streams);
-	stats[H1_ST_TOTAL_CONN]       = mkf_u64(FN_COUNTER, counters->total_conns);
-	stats[H1_ST_TOTAL_STREAM]     = mkf_u64(FN_COUNTER, counters->total_streams);
+	for (; current_field < H1_STATS_COUNT; current_field++) {
+		struct field metric = { 0 };
 
-	stats[H1_ST_BYTES_IN]          = mkf_u64(FN_COUNTER, counters->bytes_in);
-	stats[H1_ST_BYTES_OUT]         = mkf_u64(FN_COUNTER, counters->bytes_out);
+		switch (current_field) {
+		case H1_ST_OPEN_CONN:
+			metric = mkf_u64(FN_GAUGE,   counters->open_conns);
+			break;
+		case H1_ST_OPEN_STREAM:
+			metric = mkf_u64(FN_GAUGE,   counters->open_streams);
+			break;
+		case H1_ST_TOTAL_CONN:
+			metric = mkf_u64(FN_COUNTER, counters->total_conns);
+			break;
+		case H1_ST_TOTAL_STREAM:
+			metric = mkf_u64(FN_COUNTER, counters->total_streams);
+			break;
+		case H1_ST_BYTES_IN:
+			metric = mkf_u64(FN_COUNTER, counters->bytes_in);
+			break;
+		case H1_ST_BYTES_OUT:
+			metric = mkf_u64(FN_COUNTER, counters->bytes_out);
+			break;
 #if defined(USE_LINUX_SPLICE)
-	stats[H1_ST_SPLICED_BYTES_IN]  = mkf_u64(FN_COUNTER, counters->spliced_bytes_in);
-	stats[H1_ST_SPLICED_BYTES_OUT] = mkf_u64(FN_COUNTER, counters->spliced_bytes_out);
+		case H1_ST_SPLICED_BYTES_IN:
+			metric = mkf_u64(FN_COUNTER, counters->spliced_bytes_in);
+			break;
+		case H1_ST_SPLICED_BYTES_OUT:
+			metric = mkf_u64(FN_COUNTER, counters->spliced_bytes_out);
+			break;
 #endif
+		default:
+			/* not used for frontends. If a specific metric
+			 * is requested, return an error. Otherwise continue.
+			 */
+			if (selected_field != NULL)
+				return 0;
+			continue;
+		}
+		stats[current_field] = metric;
+		if (selected_field != NULL)
+			break;
+	}
+	return 1;
 }
 
 static struct stats_module h1_stats_module = {
@@ -797,6 +830,8 @@ static struct h1s *h1c_frt_stream_new(struct h1c *h1c, struct stconn *sc, struct
 	 * especially if headers were already forwarded. But it is not
 	 * mandatory.
 	 */
+	if (!(global.tune.no_zero_copy_fwd & NO_ZERO_COPY_FWD_H1_SND))
+		se_fl_set(h1s->sd, SE_FL_MAY_FASTFWD_CONS);
 	se_expect_no_data(h1s->sd);
 	h1s->sess = sess;
 
@@ -834,6 +869,8 @@ static struct h1s *h1c_bck_stream_new(struct h1c *h1c, struct stconn *sc, struct
 	h1s->sd = sc->sedesc;
 	h1s->sess = sess;
 
+	if (!(global.tune.no_zero_copy_fwd & NO_ZERO_COPY_FWD_H1_SND))
+		se_fl_set(h1s->sd, SE_FL_MAY_FASTFWD_CONS);
 	h1c->state = H1_CS_RUNNING;
 
 	if (h1c->px->options2 & PR_O2_RSPBUG_OK)
@@ -1412,21 +1449,33 @@ static void h1_capture_bad_message(struct h1c *h1c, struct h1s *h1s,
 			    &ctx, h1_show_error_snapshot);
 }
 
-/* Emit the chunksize followed by a CRLF in front of data of the buffer
+/* Emit the chunk size <chksz> followed by a CRLF in front of data of the buffer
  * <buf>. It goes backwards and starts with the byte before the buffer's
  * head. The caller is responsible for ensuring there is enough room left before
- * the buffer's head for the string.
+ * the buffer's head for the string. if <length> is greater than 0, it
+ * represents the expected total length of the chunk size, including the
+ * CRLF. So it will be padded with 0 to resepct this length. It is the caller
+ * responsibility to pass the right value. if <length> is set to 0 (or less that
+ * the smallest size to represent the chunk size), it is ignored.
  */
-static void h1_prepend_chunk_size(struct buffer *buf, size_t chksz)
+static void h1_prepend_chunk_size(struct buffer *buf, size_t chksz, size_t length)
 {
 	char *beg, *end;
 
 	beg = end = b_head(buf);
 	*--beg = '\n';
 	*--beg = '\r';
+	if (length)
+		length -= 2;
 	do {
 		*--beg = hextab[chksz & 0xF];
+		if (length)
+			--length;
 	} while (chksz >>= 4);
+	while (length) {
+		*--beg = '0';
+		--length;
+	}
 	buf->head -= (end - beg);
 	b_add(buf, end - beg);
 }
@@ -1919,13 +1968,14 @@ static size_t h1_process_demux(struct h1c *h1c, struct buffer *buf, size_t count
 	/* Here h1s_sc(h1s) is always defined */
 	if (!(h1c->flags & H1C_F_CANT_FASTFWD) &&
 	    (!(h1m->flags & H1_MF_RESP) || !(h1s->flags & H1S_F_BODYLESS_RESP)) &&
-	    (h1m->state == H1_MSG_DATA || h1m->state == H1_MSG_TUNNEL)) {
+	    (h1m->state == H1_MSG_DATA || h1m->state == H1_MSG_TUNNEL) &&
+	    !(global.tune.no_zero_copy_fwd & NO_ZERO_COPY_FWD_H1_RCV)) {
 		TRACE_STATE("notify the mux can use fast-forward", H1_EV_RX_DATA|H1_EV_RX_BODY, h1c->conn, h1s);
-		se_fl_set(h1s->sd, SE_FL_MAY_FASTFWD);
+		se_fl_set(h1s->sd, SE_FL_MAY_FASTFWD_PROD);
 	}
 	else {
 		TRACE_STATE("notify the mux can't use fast-forward anymore", H1_EV_RX_DATA|H1_EV_RX_BODY, h1c->conn, h1s);
-		se_fl_clr(h1s->sd, SE_FL_MAY_FASTFWD);
+		se_fl_clr(h1s->sd, SE_FL_MAY_FASTFWD_PROD);
 		h1c->flags &= ~H1C_F_WANT_FASTFWD;
 	}
 
@@ -2607,7 +2657,7 @@ static size_t h1_make_data(struct h1s *h1s, struct h1m *h1m, struct buffer *buf,
 				/* Because chunk meta-data are prepended, the chunk size of the current chunk
 				 * must be handled before the end of the previous chunk.
 				 */
-				h1_prepend_chunk_size(&h1c->obuf, h1m->curr_len);
+				h1_prepend_chunk_size(&h1c->obuf, h1m->curr_len, 0);
 				if (h1m->state == H1_MSG_CHUNK_CRLF)
 					h1_prepend_chunk_crlf(&h1c->obuf);
 
@@ -4300,7 +4350,7 @@ static size_t h1_rcv_buf(struct stconn *sc, struct buffer *buf, size_t count, in
 	else
 		TRACE_DEVEL("h1c ibuf not allocated", H1_EV_H1C_RECV|H1_EV_H1C_BLK, h1c->conn);
 
-	if ((flags & CO_RFL_BUF_FLUSH) && se_fl_test(h1s->sd, SE_FL_MAY_FASTFWD)) {
+	if ((flags & CO_RFL_BUF_FLUSH) && se_fl_test(h1s->sd, SE_FL_MAY_FASTFWD_PROD)) {
 		h1c->flags |= H1C_F_WANT_FASTFWD;
 		TRACE_STATE("Block xprt rcv_buf to flush stream's buffer (want_fastfwd)", H1_EV_STRM_RECV, h1c->conn, h1s);
 	}
@@ -4400,12 +4450,12 @@ static inline struct sedesc *h1s_opposite_sd(struct h1s *h1s)
 	return sdo;
 }
 
-static size_t h1_nego_ff(struct stconn *sc, struct buffer *input, size_t count, unsigned int may_splice)
+static size_t h1_nego_ff(struct stconn *sc, struct buffer *input, size_t count, unsigned int flags)
 {
 	struct h1s *h1s = __sc_mux_strm(sc);
 	struct h1c *h1c = h1s->h1c;
 	struct h1m *h1m = (!(h1c->flags & H1C_F_IS_BACK) ? &h1s->res : &h1s->req);
-	size_t ret = 0;
+	size_t sz, prefix = 0, suffix = 0, ret = 0;
 
 	TRACE_ENTER(H1_EV_STRM_SEND, h1c->conn, h1s, 0, (size_t[]){count});
 
@@ -4415,19 +4465,48 @@ static size_t h1_nego_ff(struct stconn *sc, struct buffer *input, size_t count, 
 		goto out;
 	}
 
-	/* TODO: add check on curr_len if CLEN */
-
-	if (h1m->flags & H1_MF_CHNK) {
+	if (h1m->flags & H1_MF_CLEN) {
+		if ((flags & NEGO_FF_FL_EXACT_SIZE) && count > h1m->curr_len) {
+			TRACE_ERROR("more payload than announced", H1_EV_STRM_SEND|H1_EV_STRM_ERR, h1c->conn, h1s);
+			h1s->sd->iobuf.flags |= IOBUF_FL_NO_FF;
+			goto out;
+		}
+	}
+	else if (h1m->flags & H1_MF_CHNK) {
 		if (h1m->curr_len) {
 			BUG_ON(h1m->state != H1_MSG_DATA);
-			if (count > h1m->curr_len)
+			if (count > h1m->curr_len) {
+				if ((flags & NEGO_FF_FL_EXACT_SIZE) && count > h1m->curr_len) {
+					TRACE_ERROR("chunk bigger than announced", H1_EV_STRM_SEND|H1_EV_STRM_ERR, h1c->conn, h1s);
+					h1s->sd->iobuf.flags |= IOBUF_FL_NO_FF;
+					goto out;
+				}
 				count = h1m->curr_len;
+			}
 		}
 		else {
 			BUG_ON(h1m->state != H1_MSG_CHUNK_CRLF && h1m->state != H1_MSG_CHUNK_SIZE);
-			if (!h1_make_chunk(h1s, h1m, count))
-				goto out;
-			h1m->curr_len = count;
+			if (flags & NEGO_FF_FL_EXACT_SIZE) {
+				if (!h1_make_chunk(h1s, h1m, count))
+					goto out;
+				h1m->curr_len = count;
+			}
+			else {
+				/* The producer does not know the chunk size, thus this will be emitted at the
+				 * end, in done_ff(). So splicing cannot be used (see TODO below).
+				 * We will reserve 12 bytes to handle at most 4Go chunk with all CRLFs !
+				 * (<8-bytes SIZE><CRLF><CHUNK-DATA><CRLF>, 10 bytes at the beginning and
+				 *  2 bytes reserved at the end)
+				 */
+				if (count > MAX_RANGE(unsigned int))
+					count = MAX_RANGE(unsigned int);
+				prefix = 10;
+				suffix = 2;
+				/* Add 2 more bytes to finish the previous chunk */
+				if (h1m->state == H1_MSG_CHUNK_CRLF)
+					prefix += 2;
+				goto no_splicing;
+			}
 		}
 	}
 
@@ -4438,7 +4517,7 @@ static size_t h1_nego_ff(struct stconn *sc, struct buffer *input, size_t count, 
 	 *       and then data in pipe, or the opposite. For now, it is not
 	 *       supported to mix data.
 	 */
-	if (!b_data(input) && !b_data(&h1c->obuf) && may_splice) {
+	if (!b_data(input) && !b_data(&h1c->obuf) && (flags & NEGO_FF_FL_MAY_SPLICE)) {
 #if defined(USE_LINUX_SPLICE)
 		if (h1c->conn->xprt->snd_pipe && (h1s->sd->iobuf.pipe || (pipes_used < global.maxpipes && (h1s->sd->iobuf.pipe = get_pipe())))) {
 			h1s->sd->iobuf.offset = 0;
@@ -4451,6 +4530,7 @@ static size_t h1_nego_ff(struct stconn *sc, struct buffer *input, size_t count, 
 		TRACE_DEVEL("Unable to allocate pipe for splicing, fallback to buffer", H1_EV_STRM_SEND, h1c->conn, h1s);
 	}
 
+  no_splicing:
 	if (!h1_get_buf(h1c, &h1c->obuf)) {
 		h1c->flags |= H1C_F_OUT_ALLOC;
 		TRACE_STATE("waiting for opposite h1c obuf allocation", H1_EV_STRM_SEND|H1_EV_H1S_BLK, h1c->conn, h1s);
@@ -4460,20 +4540,21 @@ static size_t h1_nego_ff(struct stconn *sc, struct buffer *input, size_t count, 
 	if (b_space_wraps(&h1c->obuf))
 		b_slow_realign(&h1c->obuf, trash.area, b_data(&h1c->obuf));
 
-	h1s->sd->iobuf.buf = &h1c->obuf;
-	h1s->sd->iobuf.offset = 0;
-	h1s->sd->iobuf.data = 0;
-
-	/* Cannot forward more than available room in output buffer */
-	if (count > b_room(&h1c->obuf))
-		count = b_room(&h1c->obuf);
-
-	if (!count) {
+	if (b_contig_space(&h1c->obuf) <= prefix + suffix) {
 		h1c->flags |= H1C_F_OUT_FULL;
 		h1s->sd->iobuf.flags |= IOBUF_FL_FF_BLOCKED;
 		TRACE_STATE("output buffer full", H1_EV_STRM_SEND|H1_EV_H1S_BLK, h1c->conn, h1s);
 		goto out;
 	}
+
+	/* Cannot forward more than available room in output buffer */
+	sz = b_contig_space(&h1c->obuf) - prefix - suffix;
+	if (count > sz)
+		count = sz;
+
+	h1s->sd->iobuf.buf = &h1c->obuf;
+	h1s->sd->iobuf.offset = prefix;
+	h1s->sd->iobuf.data = 0;
 
 	/* forward remaining input data */
 	if (b_data(input)) {
@@ -4520,6 +4601,20 @@ static size_t h1_done_ff(struct stconn *sc)
 	if (!sd->iobuf.pipe) {
 		if (b_room(&h1c->obuf) == sd->iobuf.offset)
 			h1c->flags |= H1C_F_OUT_FULL;
+
+		if (sd->iobuf.offset) {
+			struct buffer buf = b_make(b_orig(&h1c->obuf), b_size(&h1c->obuf),
+						   b_peek_ofs(&h1c->obuf, b_data(&h1c->obuf) - sd->iobuf.data + sd->iobuf.offset),
+						   sd->iobuf.data);
+			h1_prepend_chunk_size(&buf, sd->iobuf.data, sd->iobuf.offset - ((h1m->state == H1_MSG_CHUNK_CRLF) ?  2 : 0));
+			h1_append_chunk_crlf(&buf);
+			b_add(&h1c->obuf, sd->iobuf.offset + 2);
+			if (h1m->state == H1_MSG_CHUNK_CRLF) {
+				h1_prepend_chunk_crlf(&buf);
+				b_add(&h1c->obuf, 2);
+			}
+			h1m->state = H1_MSG_CHUNK_SIZE;
+		}
 
 		total = sd->iobuf.data;
 		sd->iobuf.buf = NULL;
@@ -4575,14 +4670,10 @@ static int h1_fastfwd(struct stconn *sc, unsigned int count, unsigned int flags)
 	struct h1m *h1m = (!(h1c->flags & H1C_F_IS_BACK) ? &h1s->req : &h1s->res);
 	struct sedesc *sdo = NULL;
 	size_t total = 0, try = 0;
+	unsigned int nego_flags = NEGO_FF_FL_NONE;
 	int ret = 0;
 
 	TRACE_ENTER(H1_EV_STRM_RECV, h1c->conn, h1s, 0, (size_t[]){count});
-
-	if (global.tune.no_zero_copy_fwd & NO_ZERO_COPY_FWD_H1_RCV) {
-		h1c->flags = (h1c->flags & ~H1C_F_WANT_FASTFWD) | H1C_F_CANT_FASTFWD;
-		goto end;
-	}
 
 	if (h1m->state != H1_MSG_DATA && h1m->state != H1_MSG_TUNNEL) {
 		h1c->flags &= ~H1C_F_WANT_FASTFWD;
@@ -4609,10 +4700,15 @@ static int h1_fastfwd(struct stconn *sc, unsigned int count, unsigned int flags)
   retry:
 	ret = 0;
 
-	if (h1m->state == H1_MSG_DATA && (h1m->flags & (H1_MF_CHNK|H1_MF_CLEN)) &&  count > h1m->curr_len)
+	if (h1m->state == H1_MSG_DATA && (h1m->flags & (H1_MF_CHNK|H1_MF_CLEN)) &&  count > h1m->curr_len) {
+		flags |= NEGO_FF_FL_EXACT_SIZE;
 		count = h1m->curr_len;
+	}
 
-	try = se_nego_ff(sdo, &h1c->ibuf, count, h1c->conn->xprt->rcv_pipe && !!(flags & CO_RFL_MAY_SPLICE) && !(sdo->iobuf.flags & IOBUF_FL_NO_SPLICING));
+	if (h1c->conn->xprt->rcv_pipe && !!(flags & CO_RFL_MAY_SPLICE) && !(sdo->iobuf.flags & IOBUF_FL_NO_SPLICING))
+		nego_flags |= NEGO_FF_FL_MAY_SPLICE;
+
+	try = se_nego_ff(sdo, &h1c->ibuf, count, nego_flags);
 	if (b_room(&h1c->ibuf) && (h1c->flags & H1C_F_IN_FULL)) {
 		h1c->flags &= ~H1C_F_IN_FULL;
 		TRACE_STATE("h1c ibuf not full anymore", H1_EV_STRM_RECV|H1_EV_H1C_BLK);
@@ -4757,7 +4853,7 @@ static int h1_fastfwd(struct stconn *sc, unsigned int count, unsigned int flags)
 
 	if (!(h1c->flags & H1C_F_WANT_FASTFWD)) {
 		TRACE_STATE("notify the mux can't use fast-forward anymore", H1_EV_STRM_RECV, h1c->conn, h1s);
-		se_fl_clr(h1s->sd, SE_FL_MAY_FASTFWD);
+		se_fl_clr(h1s->sd, SE_FL_MAY_FASTFWD_PROD);
 		if (!(h1c->wait_event.events & SUB_RETRY_RECV)) {
 			TRACE_STATE("restart receiving data, subscribing", H1_EV_STRM_RECV, h1c->conn, h1s);
 			h1c->conn->xprt->subscribe(h1c->conn, h1c->conn->xprt_ctx, SUB_RETRY_RECV, &h1c->wait_event);

@@ -35,7 +35,6 @@
 #include <haproxy/stconn.h>
 #include <haproxy/stream.h>
 #include <haproxy/tools.h>
-#include <haproxy/xref.h>
 #include <haproxy/xxhash.h>
 
 #define CACHE_FLT_F_IMPLICIT_DECL  0x00000001 /* The cache filtre was implicitly declared (ie without
@@ -74,7 +73,6 @@ struct cache_appctx {
 	struct cache_tree *cache_tree;
 	struct cache_entry *entry;       /* Entry to be sent from cache. */
 	unsigned int sent;               /* The number of bytes already sent for this cache entry. */
-	unsigned int data_sent;           /* The number of bytes of the payload already sent for this cache entry. */
 	unsigned int offset;             /* start offset of remaining data relative to beginning of the next block */
 	unsigned int rem_data;           /* Remaining bytes for the last data block (HTX only, 0 means process next block) */
 	unsigned int send_notmodified:1; /* In case of conditional request, we might want to send a "304 Not Modified" response instead of the stored data. */
@@ -1486,8 +1484,7 @@ static unsigned int htx_cache_dump_blk(struct appctx *appctx, struct htx *htx, e
 	unsigned int max, total;
 	uint32_t blksz;
 
-	max = htx_get_max_blksz(htx,
-				channel_htx_recv_max(sc_ic(appctx_sc(appctx)), htx));
+	max = htx_free_data_space(htx);
 	if (!max)
 		return 0;
 	blksz = ((type == HTX_BLK_HDR || type == HTX_BLK_TLR)
@@ -1530,8 +1527,7 @@ static unsigned int htx_cache_dump_data_blk(struct appctx *appctx, struct htx *h
 	unsigned int max, total, rem_data, data_len;
 	uint32_t blksz;
 
-	max = htx_get_max_blksz(htx,
-				channel_htx_recv_max(sc_ic(appctx_sc(appctx)), htx));
+	max = htx_free_data_space(htx);
 	if (!max)
 		return 0;
 
@@ -1570,8 +1566,8 @@ static unsigned int htx_cache_dump_data_blk(struct appctx *appctx, struct htx *h
 	ctx->offset   = offset;
 	ctx->next     = shblk;
 	ctx->sent    += total;
-	ctx->data_sent += data_len;
 	ctx->rem_data = rem_data + blksz;
+	appctx->to_forward -= data_len;
 	return total;
 }
 
@@ -1628,32 +1624,6 @@ static size_t htx_cache_dump_msg(struct appctx *appctx, struct htx *htx, unsigne
 	return total;
 }
 
-
-static void ff_cache_skip_tlr_blk(struct appctx *appctx, uint32_t info, struct shared_block *shblk, unsigned int offset)
-{
-	struct cache_appctx *ctx = appctx->svcctx;
-	struct cache_flt_conf *cconf = appctx->rule->arg.act.p[0];
-	struct shared_context *shctx = shctx_ptr(cconf->c.cache);
-	unsigned int max, total;
-	uint32_t blksz;
-
-	blksz = (info & 0xff) + ((info >> 8) & 0xfffff);
-	total = 4;
-	while (blksz) {
-		max = MIN(blksz, shctx->block_size - offset);
-		offset += max;
-		blksz  -= max;
-		total  += max;
-		if (blksz || offset == shctx->block_size) {
-			shblk = LIST_NEXT(&shblk->list, typeof(shblk), list);
-			offset = 0;
-		}
-	}
-	ctx->offset = offset;
-	ctx->next   = shblk;
-	ctx->sent  += total;
-}
-
 static unsigned int ff_cache_dump_data_blk(struct appctx *appctx, struct buffer *buf, unsigned int len,
 					   uint32_t info, struct shared_block *shblk, unsigned int offset)
 {
@@ -1697,8 +1667,8 @@ static unsigned int ff_cache_dump_data_blk(struct appctx *appctx, struct buffer 
 	ctx->offset   = offset;
 	ctx->next     = shblk;
 	ctx->sent    += total;
-	ctx->data_sent += data_len;
 	ctx->rem_data = rem_data + blksz;
+	appctx->to_forward -= data_len;
 	return total;
 }
 
@@ -1741,15 +1711,8 @@ static size_t ff_cache_dump_msg(struct appctx *appctx, struct buffer *buf, unsig
 		  add_data_blk:
 			ret = ff_cache_dump_data_blk(appctx, buf, len, info, shblk, offset);
 		}
-		else if (type == HTX_BLK_TLR) {
-			ff_cache_skip_tlr_blk(appctx, info, shblk, offset);
-			BUG_ON(ctx->sent != first->len - sizeof(*cache_ptr));
+		else
 			ret = 0;
-		}
-		else {
-			sc_ep_clr(appctx_sc(appctx), SE_FL_MAY_FASTFWD);
-			ret = 0;
-		}
 
 		if (!ret)
 			break;
@@ -1781,101 +1744,58 @@ static int htx_cache_add_age_hdr(struct appctx *appctx, struct htx *htx)
 	return 1;
 }
 
+static size_t http_cache_fastfwd(struct appctx *appctx, struct buffer *buf, size_t count, unsigned int flags)
+{
+	struct cache_appctx *ctx = appctx->svcctx;
+	struct cache_entry *cache_ptr = ctx->entry;
+	struct shared_block *first = block_ptr(cache_ptr);
+	size_t ret;
+
+	BUG_ON(!appctx->to_forward || count > appctx->to_forward);
+
+	ret = ff_cache_dump_msg(appctx, buf, count);
+
+	if (!appctx->to_forward) {
+		se_fl_clr(appctx->sedesc, SE_FL_MAY_FASTFWD_PROD);
+		applet_fl_clr(appctx, APPCTX_FL_FASTFWD);
+		if (ctx->sent == first->len - sizeof(*cache_ptr)) {
+			applet_set_eoi(appctx);
+			applet_set_eos(appctx);
+			appctx->st0 = HTX_CACHE_END;
+		}
+	}
+	return ret;
+}
+
 static void http_cache_io_handler(struct appctx *appctx)
 {
 	struct cache_appctx *ctx = appctx->svcctx;
 	struct cache_entry *cache_ptr = ctx->entry;
 	struct shared_block *first = block_ptr(cache_ptr);
-	struct stconn *sc = appctx_sc(appctx);
-	struct channel *req = sc_oc(sc);
-	struct channel *res = sc_ic(sc);
-	struct htx *req_htx, *res_htx;
+	struct htx *res_htx = NULL;
 	struct buffer *errmsg;
 	unsigned int len;
-	size_t ret, total = 0;
+	size_t ret;
 
-	if (unlikely(se_fl_test(appctx->sedesc, (SE_FL_EOS|SE_FL_ERROR|SE_FL_SHR|SE_FL_SHW))))
+	if (applet_fl_test(appctx, APPCTX_FL_OUTBLK_ALLOC|APPCTX_FL_OUTBLK_FULL))
 		goto exit;
 
-	applet_have_more_data(appctx);
+	if (applet_fl_test(appctx, APPCTX_FL_FASTFWD) && se_fl_test(appctx->sedesc, SE_FL_MAY_FASTFWD_PROD))
+		goto exit;
 
-	if (!(global.tune.no_zero_copy_fwd & (NO_ZERO_COPY_FWD|NO_ZERO_COPY_FWD_CACHE)) &&
-	    sc_ep_test(sc, SE_FL_MAY_FASTFWD) &&
-	    res->to_forward &&
-	    ctx->data_sent != cache_ptr->body_size) {
-		struct xref *peer;
-		struct sedesc *sdo = NULL;
-
-		se_fl_clr(appctx->sedesc, SE_FL_WANT_ROOM);
-		if (channel_data(res)) {
-			sc_need_room(sc, -1);
-			goto exit;
-		}
-
-		peer = xref_get_peer_and_lock(&appctx->sedesc->xref);
-		if (!peer)
-			goto error;
-		sdo = container_of(peer, struct sedesc, xref);
-		xref_unlock(&appctx->sedesc->xref, peer);
-
-		len = cache_ptr->body_size - ctx->data_sent;
-		if (len > res->to_forward)
-			len = res->to_forward;
-
-		len = se_nego_ff(sdo, &BUF_NULL, len, 0);
-		if (sdo->iobuf.flags & IOBUF_FL_NO_FF) {
-			sc_ep_clr(sc, SE_FL_MAY_FASTFWD);
-			goto abort_fastfwd;
-		}
-		if (sdo->iobuf.flags & IOBUF_FL_FF_BLOCKED) {
-			sc_need_room(sc, -1);
-			goto exit;
-		}
-
-		total = sdo->iobuf.data;
-		b_add(sdo->iobuf.buf, sdo->iobuf.offset);
-		ret = ff_cache_dump_msg(appctx, sdo->iobuf.buf, len);
-		b_sub(sdo->iobuf.buf, sdo->iobuf.offset);
-		total += ret;
-		sdo->iobuf.data += ret;
-
-		if (ctx->sent == first->len - sizeof(*cache_ptr)) {
-			sc_ep_clr(sc, SE_FL_MAY_FASTFWD);
-			se_fl_set(appctx->sedesc, SE_FL_EOI|SE_FL_EOS);
-			BUG_ON(ctx->data_sent != cache_ptr->body_size);
-			appctx->st0 = HTX_CACHE_END;
-		}
-
-		if (se_fl_test(appctx->sedesc, SE_FL_EOI)) {
-			sdo->iobuf.flags |= IOBUF_FL_EOI; /* TODO: it may be good to have a flag to be sure we can
-							   *       forward the EOI the to consumer side
-							   */
-		}
-		/* else */
-		/* 	applet_have_more_data(appctx); */
-
-		se_done_ff(sdo);
-
-		if (total > 0) {
-			if (res->to_forward != CHN_INFINITE_FORWARD)
-				res->to_forward -= total;
-			res->total += total;
-			res->flags |= CF_READ_EVENT;
-			sc_ep_report_read_activity(sc);
-		}
+	if (!appctx_get_buf(appctx, &appctx->outbuf)) {
+		appctx->flags |= APPCTX_FL_OUTBLK_ALLOC;
 		goto exit;
 	}
 
-  abort_fastfwd:
+	if (unlikely(applet_fl_test(appctx, APPCTX_FL_EOS|APPCTX_FL_ERROR))) {
+		goto exit;
+	}
+
+	res_htx = htx_from_buf(&appctx->outbuf);
+
 	len = first->len - sizeof(*cache_ptr) - ctx->sent;
-	res_htx = htx_from_buf(&res->buf);
-	total = res_htx->data;
-
-	/* Check if the input buffer is available. */
-	if (!b_size(&res->buf)) {
-		sc_need_room(sc, 0);
-		goto out;
-	}
+	res_htx = htx_from_buf(&appctx->outbuf);
 
 	if (appctx->st0 == HTX_CACHE_INIT) {
 		ctx->next = block_ptr(cache_ptr);
@@ -1886,6 +1806,8 @@ static void http_cache_io_handler(struct appctx *appctx)
 	}
 
 	if (appctx->st0 == HTX_CACHE_HEADER) {
+		struct ist meth;
+
 		/* Headers must be dump at once. Otherwise it is an error */
 		ret = htx_cache_dump_msg(appctx, res_htx, len, HTX_BLK_EOH);
 		if (!ret || (htx_get_tail_type(res_htx) != HTX_BLK_EOH) ||
@@ -1903,10 +1825,14 @@ static void http_cache_io_handler(struct appctx *appctx)
 
 		/* Skip response body for HEAD requests or in case of "304 Not
 		 * Modified" response. */
-		if (__sc_strm(sc)->txn->meth == HTTP_METH_HEAD || ctx->send_notmodified)
+		meth = htx_sl_req_meth(http_get_stline(htxbuf(&appctx->inbuf)));
+		if (find_http_meth(istptr(meth), istlen(meth)) == HTTP_METH_HEAD || ctx->send_notmodified)
 			appctx->st0 = HTX_CACHE_EOM;
 		else {
-			se_fl_set(appctx->sedesc, SE_FL_MAY_FASTFWD);
+			if (!(global.tune.no_zero_copy_fwd & NO_ZERO_COPY_FWD_APPLET))
+				se_fl_set(appctx->sedesc, SE_FL_MAY_FASTFWD_PROD);
+
+			appctx->to_forward = cache_ptr->body_size;
 			len = first->len - sizeof(*cache_ptr) - ctx->sent;
 			appctx->st0 = HTX_CACHE_DATA;
 		}
@@ -1916,52 +1842,49 @@ static void http_cache_io_handler(struct appctx *appctx)
 		if (len) {
 			ret = htx_cache_dump_msg(appctx, res_htx, len, HTX_BLK_UNUSED);
 			if (ret < len) {
-				sc_need_room(sc, channel_htx_recv_max(res, res_htx) + 1);
+				appctx->flags |= APPCTX_FL_OUTBLK_FULL;
 				goto out;
 			}
 		}
-		BUG_ON(ctx->data_sent != cache_ptr->body_size);
+		BUG_ON(appctx->to_forward);
 		appctx->st0 = HTX_CACHE_EOM;
 	}
 
 	if (appctx->st0 == HTX_CACHE_EOM) {
 		 /* no more data are expected. */
 		res_htx->flags |= HTX_FL_EOM;
-		se_fl_set(appctx->sedesc, SE_FL_EOI);
+		applet_set_eoi(appctx);
+		se_fl_clr(appctx->sedesc, SE_FL_MAY_FASTFWD_PROD);
+		applet_fl_clr(appctx, APPCTX_FL_FASTFWD);
 		appctx->st0 = HTX_CACHE_END;
 	}
 
   end:
 	if (appctx->st0 == HTX_CACHE_END) {
-		applet_have_no_more_data(appctx);
-		se_fl_set(appctx->sedesc, SE_FL_EOS);
+		applet_set_eos(appctx);
 	}
 
   out:
-	total = res_htx->data - total;
-	if (total)
-		channel_add_input(res, total);
-	htx_to_buf(res_htx, &res->buf);
+	if (res_htx)
+		htx_to_buf(res_htx, &appctx->outbuf);
 
   exit:
 	/* eat the whole request */
-	if (co_data(req)) {
-		req_htx = htx_from_buf(&req->buf);
-		co_htx_skip(req, req_htx, co_data(req));
-		htx_to_buf(req_htx, &req->buf);
-	}
+	b_reset(&appctx->inbuf);
+	applet_fl_clr(appctx, APPCTX_FL_INBLK_FULL);
+	appctx->sedesc->iobuf.flags &= ~IOBUF_FL_FF_BLOCKED;
 	return;
 
   error:
 	/* Sent and HTTP error 500 */
-	b_reset(&res->buf);
+	b_reset(&appctx->outbuf);
 	errmsg = &http_err_chunks[HTTP_ERR_500];
-	res->buf.data = b_data(errmsg);
-	memcpy(res->buf.area, b_head(errmsg), b_data(errmsg));
-	res_htx = htx_from_buf(&res->buf);
+	appctx->outbuf.data = b_data(errmsg);
+	memcpy(appctx->outbuf.area, b_head(errmsg), b_data(errmsg));
+	res_htx = htx_from_buf(&appctx->outbuf);
 
-	total = 0;
-	se_fl_set(appctx->sedesc, SE_FL_ERROR);
+	applet_set_eos(appctx);
+	applet_set_error(appctx);
 	appctx->st0 = HTX_CACHE_END;
 	goto end;
 }
@@ -2284,7 +2207,7 @@ enum act_return http_action_req_cache_use(struct act_rule *rule, struct proxy *p
 			ctx->cache_tree = cache_tree;
 			ctx->entry = res;
 			ctx->next = NULL;
-			ctx->sent = ctx->data_sent = 0;
+			ctx->sent = 0;
 			ctx->send_notmodified =
                                 should_send_notmodified_response(cache, htxbuf(&s->req.buf), res);
 
@@ -3030,26 +2953,6 @@ parse_cache_flt(char **args, int *cur_arg, struct proxy *px,
 	return -1;
 }
 
-/* config parser for global "tune.cache.zero-copy-forwarding" */
-static int cfg_parse_cache_zero_copy_fwd(char **args, int section_type, struct proxy *curpx,
-				      const struct proxy *defpx, const char *file, int line,
-				      char **err)
-{
-	if (too_many_args(1, args, err, NULL))
-		return -1;
-
-	if (strcmp(args[1], "on") == 0)
-		global.tune.no_zero_copy_fwd &= ~NO_ZERO_COPY_FWD_CACHE;
-	else if (strcmp(args[1], "off") == 0)
-		global.tune.no_zero_copy_fwd |= NO_ZERO_COPY_FWD_CACHE;
-	else {
-		memprintf(err, "'%s' expects 'on' or 'off'.", args[0]);
-		return -1;
-	}
-	return 0;
-}
-
-
 /* It reserves a struct show_cache_ctx for the local variables */
 static int cli_parse_show_cache(char **args, char *payload, struct appctx *appctx, void *private)
 {
@@ -3234,16 +3137,11 @@ struct applet http_cache_applet = {
 	.obj_type = OBJ_TYPE_APPLET,
 	.name = "<CACHE>", /* used for logging */
 	.fct = http_cache_io_handler,
+	.rcv_buf = appctx_htx_rcv_buf,
+	.snd_buf = appctx_htx_snd_buf,
+	.fastfwd = http_cache_fastfwd,
 	.release = http_cache_applet_release,
 };
-
-/* config keyword parsers */
-static struct cfg_kw_list cfg_kws = {ILH, {
-	{ CFG_GLOBAL, "tune.cache.zero-copy-forwarding", cfg_parse_cache_zero_copy_fwd },
-	{ 0, NULL, NULL }
-}};
-
-INITCALL1(STG_REGISTER, cfg_register_keywords, &cfg_kws);
 
 
 /* config parsers for this section */

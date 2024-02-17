@@ -50,6 +50,10 @@
 #include <haproxy/vars.h>
 #include <haproxy/xxhash.h>
 
+#if defined(USE_PROMEX)
+#include <promex/promex.h>
+#endif
+
 
 struct list sec_resolvers  = LIST_HEAD_INIT(sec_resolvers);
 struct list resolv_srvrq_list = LIST_HEAD_INIT(resolv_srvrq_list);
@@ -114,26 +118,79 @@ static struct name_desc resolv_stats[] = {
 
 static struct dns_counters dns_counters;
 
-static void resolv_fill_stats(void *d, struct field *stats)
+static int resolv_fill_stats(void *d, struct field *stats, unsigned int *selected_field)
 {
 	struct dns_counters *counters = d;
-	stats[RSLV_STAT_ID]          = mkf_str(FO_CONFIG, counters->id);
-	stats[RSLV_STAT_PID]         = mkf_str(FO_CONFIG, counters->pid);
-	stats[RSLV_STAT_SENT]        = mkf_u64(FN_GAUGE, counters->sent);
-	stats[RSLV_STAT_SND_ERROR]   = mkf_u64(FN_GAUGE, counters->snd_error);
-	stats[RSLV_STAT_VALID]       = mkf_u64(FN_GAUGE, counters->app.resolver.valid);
-	stats[RSLV_STAT_UPDATE]      = mkf_u64(FN_GAUGE, counters->app.resolver.update);
-	stats[RSLV_STAT_CNAME]       = mkf_u64(FN_GAUGE, counters->app.resolver.cname);
-	stats[RSLV_STAT_CNAME_ERROR] = mkf_u64(FN_GAUGE, counters->app.resolver.cname_error);
-	stats[RSLV_STAT_ANY_ERR]     = mkf_u64(FN_GAUGE, counters->app.resolver.any_err);
-	stats[RSLV_STAT_NX]          = mkf_u64(FN_GAUGE, counters->app.resolver.nx);
-	stats[RSLV_STAT_TIMEOUT]     = mkf_u64(FN_GAUGE, counters->app.resolver.timeout);
-	stats[RSLV_STAT_REFUSED]     = mkf_u64(FN_GAUGE, counters->app.resolver.refused);
-	stats[RSLV_STAT_OTHER]       = mkf_u64(FN_GAUGE, counters->app.resolver.other);
-	stats[RSLV_STAT_INVALID]     = mkf_u64(FN_GAUGE, counters->app.resolver.invalid);
-	stats[RSLV_STAT_TOO_BIG]     = mkf_u64(FN_GAUGE, counters->app.resolver.too_big);
-	stats[RSLV_STAT_TRUNCATED]   = mkf_u64(FN_GAUGE, counters->app.resolver.truncated);
-	stats[RSLV_STAT_OUTDATED]    = mkf_u64(FN_GAUGE, counters->app.resolver.outdated);
+	unsigned int current_field = (selected_field != NULL ? *selected_field : 0);
+
+	for (; current_field < RSLV_STAT_END; current_field++) {
+		struct field metric = { 0 };
+
+		switch (current_field) {
+		case RSLV_STAT_ID:
+			metric = mkf_str(FO_CONFIG, counters->id);
+			break;
+		case RSLV_STAT_PID:
+			metric = mkf_str(FO_CONFIG, counters->pid);
+			break;
+		case RSLV_STAT_SENT:
+			metric = mkf_u64(FN_GAUGE, counters->sent);
+			break;
+		case RSLV_STAT_SND_ERROR:
+			metric = mkf_u64(FN_GAUGE, counters->snd_error);
+			break;
+		case RSLV_STAT_VALID:
+			metric = mkf_u64(FN_GAUGE, counters->app.resolver.valid);
+			break;
+		case RSLV_STAT_UPDATE:
+			metric = mkf_u64(FN_GAUGE, counters->app.resolver.update);
+			break;
+		case RSLV_STAT_CNAME:
+			metric = mkf_u64(FN_GAUGE, counters->app.resolver.cname);
+			break;
+		case RSLV_STAT_CNAME_ERROR:
+			metric = mkf_u64(FN_GAUGE, counters->app.resolver.cname_error);
+			break;
+		case RSLV_STAT_ANY_ERR:
+			metric = mkf_u64(FN_GAUGE, counters->app.resolver.any_err);
+			break;
+		case RSLV_STAT_NX:
+			metric = mkf_u64(FN_GAUGE, counters->app.resolver.nx);
+			break;
+		case RSLV_STAT_TIMEOUT:
+			metric = mkf_u64(FN_GAUGE, counters->app.resolver.timeout);
+			break;
+		case RSLV_STAT_REFUSED:
+			metric = mkf_u64(FN_GAUGE, counters->app.resolver.refused);
+			break;
+		case RSLV_STAT_OTHER:
+			metric = mkf_u64(FN_GAUGE, counters->app.resolver.other);
+			break;
+		case RSLV_STAT_INVALID:
+			metric = mkf_u64(FN_GAUGE, counters->app.resolver.invalid);
+			break;
+		case RSLV_STAT_TOO_BIG:
+			metric = mkf_u64(FN_GAUGE, counters->app.resolver.too_big);
+			break;
+		case RSLV_STAT_TRUNCATED:
+			metric = mkf_u64(FN_GAUGE, counters->app.resolver.truncated);
+			break;
+		case RSLV_STAT_OUTDATED:
+			metric = mkf_u64(FN_GAUGE, counters->app.resolver.outdated);
+			break;
+		default:
+			/* not used for frontends. If a specific metric
+			 * is requested, return an error. Otherwise continue.
+			 */
+			if (selected_field != NULL)
+				return 0;
+			continue;
+		}
+		stats[current_field] = metric;
+		if (selected_field != NULL)
+			break;
+	}
+	return 1;
 }
 
 static struct stats_module rslv_stats_module = {
@@ -2711,14 +2768,15 @@ static int stats_dump_resolv_to_buffer(struct stconn *sc,
 	list_for_each_entry(mod, stat_modules, list) {
 		struct counters_node *counters = EXTRA_COUNTERS_GET(ns->extra_counters, mod);
 
-		mod->fill_stats(counters, stats + idx);
+		if (!mod->fill_stats(counters, stats + idx, NULL))
+			continue;
 		idx += mod->stats_count;
 	}
 
 	if (!stats_dump_one_line(stats, idx, appctx))
 		return 0;
 
-	if (!stats_putchk(appctx, NULL))
+	if (!stats_putchk(appctx, NULL, NULL))
 		goto full;
 
 	return 1;
@@ -3844,3 +3902,70 @@ REGISTER_CONFIG_SECTION("resolvers",      cfg_parse_resolvers, cfg_post_parse_re
 REGISTER_POST_DEINIT(resolvers_deinit);
 REGISTER_CONFIG_POSTPARSER("dns runtime resolver", resolvers_finalize_config);
 REGISTER_PRE_CHECK(resolvers_create_default);
+
+#if defined(USE_PROMEX)
+
+static int rslv_promex_metric_info(unsigned int id, struct promex_metric *metric, struct ist *desc)
+{
+	if (id >= RSLV_STAT_END)
+		return -1;
+	if (id == RSLV_STAT_ID  || id == RSLV_STAT_PID)
+		return 0;
+
+	*metric = (struct promex_metric){ .n = ist(resolv_stats[id].name), .type = PROMEX_MT_GAUGE, .flags = PROMEX_FL_MODULE_METRIC };
+	*desc = ist(resolv_stats[id].desc);
+	return 1;
+}
+
+static void *rslv_promex_start_ts(void *unused, unsigned int id)
+{
+	struct resolvers *resolver = LIST_NEXT(&sec_resolvers, struct resolvers *, list);
+
+	return LIST_NEXT(&resolver->nameservers, struct dns_nameserver *, list);
+}
+
+static void *rslv_promex_next_ts(void *unsued, void *metric_ctx, unsigned int id)
+{
+	struct dns_nameserver *ns = metric_ctx;
+	struct resolvers *resolver = ns->parent;
+
+	ns = LIST_NEXT(&ns->list, struct dns_nameserver *, list);
+	if (&ns->list == &resolver->nameservers) {
+		resolver = LIST_NEXT(&resolver->list, struct resolvers *, list);
+		ns = ((&resolver->list == &sec_resolvers)
+		      ? NULL
+		      : LIST_NEXT(&resolver->nameservers, struct dns_nameserver *, list));
+	}
+	return ns;
+}
+
+static int rslv_promex_fill_ts(void *unused, void *metric_ctx, unsigned int id, struct promex_label *labels, struct field *field)
+{
+	struct dns_nameserver *ns = metric_ctx;
+	struct resolvers *resolver = ns->parent;
+	struct field stats[RSLV_STAT_END];
+	int ret;
+
+	labels[0].name  = ist("resolver");
+	labels[0].value = ist2(resolver->id, strlen(resolver->id));
+	labels[1].name  = ist("nameserver");
+	labels[1].value = ist2(ns->id, strlen(ns->id));
+
+	ret = resolv_fill_stats(ns->counters, stats, &id);
+	if (ret == 1)
+		*field = stats[id];
+	return ret;
+}
+
+static struct promex_module promex_resolver_module = {
+	.name        = IST("resolver"),
+	.metric_info = rslv_promex_metric_info,
+	.start_ts    = rslv_promex_start_ts,
+	.next_ts     = rslv_promex_next_ts,
+	.fill_ts     = rslv_promex_fill_ts,
+	.nb_metrics  = RSLV_STAT_END,
+};
+
+INITCALL1(STG_REGISTER, promex_register_module, &promex_resolver_module);
+
+#endif

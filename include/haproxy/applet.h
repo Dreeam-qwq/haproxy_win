@@ -38,6 +38,7 @@ extern unsigned int nb_applets;
 extern struct pool_head *pool_head_appctx;
 
 struct task *task_run_applet(struct task *t, void *context, unsigned int state);
+struct task *task_process_applet(struct task *t, void *context, unsigned int state);
 int appctx_buf_available(void *arg);
 void *applet_reserve_svcctx(struct appctx *appctx, size_t size);
 void applet_reset_svcctx(struct appctx *appctx);
@@ -48,6 +49,16 @@ int appctx_finalize_startup(struct appctx *appctx, struct proxy *px, struct buff
 void appctx_free_on_early_error(struct appctx *appctx);
 void appctx_free(struct appctx *appctx);
 
+size_t appctx_htx_rcv_buf(struct appctx *appctx, struct buffer *buf, size_t count, unsigned int flags);
+size_t appctx_raw_rcv_buf(struct appctx *appctx, struct buffer *buf, size_t count, unsigned int flags);
+size_t appctx_rcv_buf(struct stconn *sc, struct buffer *buf, size_t count, unsigned int flags);
+
+size_t appctx_htx_snd_buf(struct appctx *appctx, struct buffer *buf, size_t count, unsigned int flags);
+size_t appctx_raw_snd_buf(struct appctx *appctx, struct buffer *buf, size_t count, unsigned int flags);
+size_t appctx_snd_buf(struct stconn *sc, struct buffer *buf, size_t count, unsigned int flags);
+
+int appctx_fastfwd(struct stconn *sc, unsigned int count, unsigned int flags);
+
 static inline struct appctx *appctx_new_here(struct applet *applet, struct sedesc *sedesc)
 {
 	return appctx_new_on(applet, sedesc, tid);
@@ -56,6 +67,35 @@ static inline struct appctx *appctx_new_here(struct applet *applet, struct sedes
 static inline struct appctx *appctx_new_anywhere(struct applet *applet, struct sedesc *sedesc)
 {
 	return appctx_new_on(applet, sedesc, -1);
+}
+
+
+/*
+ * Release a buffer, if any, and try to wake up entities waiting in the buffer
+ * wait queue.
+ */
+static inline void appctx_release_buf(struct appctx *appctx, struct buffer *bptr)
+{
+	if (bptr->size) {
+		b_free(bptr);
+		offer_buffers(appctx->buffer_wait.target, 1);
+	}
+}
+
+/*
+ * Allocate a buffer. If if fails, it adds the appctx in buffer wait queue.
+ */
+static inline struct buffer *appctx_get_buf(struct appctx *appctx, struct buffer *bptr)
+{
+	struct buffer *buf = NULL;
+
+	if (likely(!LIST_INLIST(&appctx->buffer_wait.list)) &&
+	    unlikely((buf = b_alloc(bptr)) == NULL)) {
+		appctx->buffer_wait.target = appctx;
+		appctx->buffer_wait.wakeup_cb = appctx_buf_available;
+		LIST_APPEND(&th_ctx->buffer_wq, &appctx->buffer_wait.list);
+	}
+	return buf;
 }
 
 /* Helper function to call .init applet callback function, if it exists. Returns 0
@@ -78,6 +118,9 @@ static inline int appctx_init(struct appctx *appctx)
 /* Releases an appctx previously allocated by appctx_new(). */
 static inline void __appctx_free(struct appctx *appctx)
 {
+	appctx_release_buf(appctx, &appctx->inbuf);
+	appctx_release_buf(appctx, &appctx->outbuf);
+
 	task_destroy(appctx->t);
 	if (LIST_INLIST(&appctx->buffer_wait.list))
 		LIST_DEL_INIT(&appctx->buffer_wait.list);
@@ -87,6 +130,14 @@ static inline void __appctx_free(struct appctx *appctx)
 	sedesc_free(appctx->sedesc);
 	pool_free(pool_head_appctx, appctx);
 	_HA_ATOMIC_DEC(&nb_applets);
+}
+
+static inline void appctx_shutw(struct appctx *appctx)
+{
+	if (se_fl_test(appctx->sedesc, SE_FL_SHW))
+		return;
+
+	se_fl_set(appctx->sedesc, SE_FL_SHWN);
 }
 
 /* wakes up an applet when conditions have changed. We're using a macro here in
@@ -107,6 +158,57 @@ static inline struct stconn *appctx_sc(const struct appctx *appctx)
 static inline struct stream *appctx_strm(const struct appctx *appctx)
 {
 	return __sc_strm(appctx->sedesc->sc);
+}
+
+static forceinline void applet_fl_zero(struct appctx *appctx)
+{
+	appctx->flags = 0;
+}
+
+static forceinline void applet_fl_setall(struct appctx *appctx, uint all)
+{
+	appctx->flags = all;
+}
+
+static forceinline void applet_fl_set(struct appctx *appctx, uint on)
+{
+	if (((on & (APPCTX_FL_EOS|APPCTX_FL_EOI)) && appctx->flags & APPCTX_FL_ERR_PENDING) ||
+	    ((on & APPCTX_FL_ERR_PENDING) && appctx->flags & (APPCTX_FL_EOI|APPCTX_FL_EOS)))
+		on |= APPCTX_FL_ERROR;
+	appctx->flags |= on;
+}
+
+static forceinline void applet_fl_clr(struct appctx *appctx, uint off)
+{
+	appctx->flags &= ~off;
+}
+
+static forceinline uint applet_fl_test(const struct appctx *appctx, uint test)
+{
+	return !!(appctx->flags & test);
+}
+
+static forceinline uint applet_fl_get(const struct appctx *appctx)
+{
+	return appctx->flags;
+}
+
+static inline void applet_set_eoi(struct appctx *appctx)
+{
+	applet_fl_set(appctx, APPCTX_FL_EOI);
+}
+
+static inline void applet_set_eos(struct appctx *appctx)
+{
+	applet_fl_set(appctx, APPCTX_FL_EOS);
+}
+
+static inline void applet_set_error(struct appctx *appctx)
+{
+	if (applet_fl_test(appctx, (APPCTX_FL_EOS|APPCTX_FL_EOI)))
+		applet_fl_set(appctx, APPCTX_FL_ERROR);
+	else
+		applet_fl_set(appctx, APPCTX_FL_ERR_PENDING);
 }
 
 /* The applet announces it has more data to deliver to the stream's input

@@ -15,13 +15,16 @@
 
 #include <haproxy/api.h>
 #include <haproxy/applet.h>
+#include <haproxy/cfgparse.h>
 #include <haproxy/channel.h>
+#include <haproxy/htx.h>
 #include <haproxy/list.h>
 #include <haproxy/sc_strm.h>
 #include <haproxy/stconn.h>
 #include <haproxy/stream.h>
 #include <haproxy/task.h>
 #include <haproxy/trace.h>
+#include <haproxy/xref.h>
 
 unsigned int nb_applets = 0;
 
@@ -50,6 +53,14 @@ static const struct trace_event applet_trace_events[] = {
 	{ .mask = APPLET_EV_ERR,      .name = "app_err",      .desc = "error on appctx" },
 #define           APPLET_EV_START     (1ULL <<  5)
 	{ .mask = APPLET_EV_START,    .name = "app_start",   .desc = "start appctx" },
+#define           APPLET_EV_RECV      (1ULL <<  6)
+	{ .mask = APPLET_EV_START,    .name = "app_receive", .desc = "RX on appctx" },
+#define           APPLET_EV_SEND      (1ULL <<  7)
+	{ .mask = APPLET_EV_START,    .name = "app_send",    .desc = "TX on appctx" },
+#define           APPLET_EV_BLK       (1ULL <<  8)
+	{ .mask = APPLET_EV_START,    .name = "app_blk",     .desc = "appctx blocked" },
+#define           APPLET_EV_WAKE      (1ULL <<  9)
+	{ .mask = APPLET_EV_START,    .name = "app_wake",    .desc = "appctx woken up" },
 	{}
 };
 
@@ -129,9 +140,9 @@ static void applet_trace(enum trace_level level, uint64_t mask, const struct tra
 	if (src->verbosity == STRM_VERB_CLEAN)
 		return;
 
-	chunk_appendf(&trace_buf, " appctx=%p .t=%p .t.exp=%d .state=%d .st0=%d .st1=%d",
+	chunk_appendf(&trace_buf, " appctx=%p .t=%p .t.exp=%d .flags=0x%x .st0=%d .st1=%d to_fwd=%lu",
 		      appctx, appctx->t, tick_isset(appctx->t->expire) ? TICKS_TO_MS(appctx->t->expire - now_ms) : TICK_ETERNITY,
-		      appctx->state, appctx->st0, appctx->st1);
+		      appctx->flags, appctx->st0, appctx->st1, appctx->to_forward);
 
 	if (!sc || src->verbosity == STRM_VERB_MINIMAL)
 		return;
@@ -167,21 +178,41 @@ static void applet_trace(enum trace_level level, uint64_t mask, const struct tra
 	    (src->verbosity == STRM_VERB_ADVANCED && src->level < TRACE_LEVEL_DATA))
 		return;
 
-	/* channels' buffer info */
-	if (s->flags & SF_HTX) {
-		struct htx *ichtx = htxbuf(&ic->buf);
-		struct htx *ochtx = htxbuf(&oc->buf);
+	if (appctx->t->process == task_run_applet) {
+		/* channels' buffer info */
+		if (s->flags & SF_HTX) {
+			struct htx *ichtx = htxbuf(&ic->buf);
+			struct htx *ochtx = htxbuf(&oc->buf);
 
-		chunk_appendf(&trace_buf, " htx=(%u/%u#%u, %u/%u#%u)",
-			      ichtx->data, ichtx->size, htx_nbblks(ichtx),
-			      ochtx->data, ochtx->size, htx_nbblks(ochtx));
+			chunk_appendf(&trace_buf, " htx=(%u/%u#%u, %u/%u#%u)",
+				      ichtx->data, ichtx->size, htx_nbblks(ichtx),
+				      ochtx->data, ochtx->size, htx_nbblks(ochtx));
+		}
+		else {
+			chunk_appendf(&trace_buf, " buf=(%u@%p+%u/%u, %u@%p+%u/%u)",
+				      (unsigned int)b_data(&ic->buf), b_orig(&ic->buf),
+				      (unsigned int)b_head_ofs(&ic->buf), (unsigned int)b_size(&ic->buf),
+				      (unsigned int)b_data(&oc->buf), b_orig(&oc->buf),
+				      (unsigned int)b_head_ofs(&oc->buf), (unsigned int)b_size(&oc->buf));
+		}
 	}
 	else {
-		chunk_appendf(&trace_buf, " buf=(%u@%p+%u/%u, %u@%p+%u/%u)",
-			      (unsigned int)b_data(&ic->buf), b_orig(&ic->buf),
-			      (unsigned int)b_head_ofs(&ic->buf), (unsigned int)b_size(&ic->buf),
-			      (unsigned int)b_data(&oc->buf), b_orig(&oc->buf),
-			      (unsigned int)b_head_ofs(&oc->buf), (unsigned int)b_size(&oc->buf));
+		/* RX/TX buffer info */
+		if (s->flags & SF_HTX) {
+			struct htx *rxhtx = htxbuf(&appctx->inbuf);
+			struct htx *txhtx = htxbuf(&appctx->outbuf);
+
+			chunk_appendf(&trace_buf, " htx=(%u/%u#%u, %u/%u#%u)",
+				      rxhtx->data, rxhtx->size, htx_nbblks(rxhtx),
+				      txhtx->data, txhtx->size, htx_nbblks(txhtx));
+		}
+		else {
+			chunk_appendf(&trace_buf, " buf=(%u@%p+%u/%u, %u@%p+%u/%u)",
+				      (unsigned int)b_data(&appctx->inbuf), b_orig(&appctx->inbuf),
+				      (unsigned int)b_head_ofs(&appctx->inbuf), (unsigned int)b_size(&appctx->inbuf),
+				      (unsigned int)b_data(&appctx->outbuf), b_orig(&appctx->outbuf),
+				      (unsigned int)b_head_ofs(&appctx->outbuf), (unsigned int)b_size(&appctx->outbuf));
+		}
 	}
 }
 
@@ -229,7 +260,18 @@ struct appctx *appctx_new_on(struct applet *applet, struct sedesc *sedesc, int t
 	}
 
 	appctx->sedesc = sedesc;
-	appctx->t->process = task_run_applet;
+
+	appctx->flags = 0;
+	appctx->inbuf = BUF_NULL;
+	appctx->outbuf = BUF_NULL;
+	appctx->to_forward = 0;
+
+	if (applet->rcv_buf != NULL && applet->snd_buf != NULL) {
+		appctx->t->process = task_process_applet;
+		appctx->flags |= APPCTX_FL_INOUT_BUFS;
+	}
+	else
+		appctx->t->process = task_run_applet;
 	appctx->t->context = appctx;
 
 	LIST_INIT(&appctx->buffer_wait.list);
@@ -298,7 +340,7 @@ void appctx_free_on_early_error(struct appctx *appctx)
 		stream_free(appctx_strm(appctx));
 		return;
 	}
-	appctx_free(appctx);
+	__appctx_free(appctx);
 }
 
 void appctx_free(struct appctx *appctx)
@@ -314,7 +356,7 @@ void appctx_free(struct appctx *appctx)
 		/* if it's running, or about to run, defer the freeing
 		 * until the callback is called.
 		 */
-		appctx->state |= APPLET_WANT_DIE;
+		applet_fl_set(appctx, APPCTX_FL_WANT_DIE);
 		task_wakeup(appctx->t, TASK_WOKEN_OTHER);
 		TRACE_DEVEL("Cannot release APPCTX now, wake it up", APPLET_EV_FREE, appctx);
 	}
@@ -353,18 +395,42 @@ void applet_reset_svcctx(struct appctx *appctx)
  */
 void appctx_shut(struct appctx *appctx)
 {
-	if (se_fl_test(appctx->sedesc, SE_FL_SHR | SE_FL_SHW))
+	if (applet_fl_test(appctx, APPCTX_FL_SHUTDOWN))
 		return;
 
 	TRACE_ENTER(APPLET_EV_RELEASE, appctx);
 	if (appctx->applet->release)
 		appctx->applet->release(appctx);
+	applet_fl_set(appctx, APPCTX_FL_SHUTDOWN);
 
 	if (LIST_INLIST(&appctx->buffer_wait.list))
 		LIST_DEL_INIT(&appctx->buffer_wait.list);
 
 	se_fl_set(appctx->sedesc, SE_FL_SHRR | SE_FL_SHWN);
 	TRACE_LEAVE(APPLET_EV_RELEASE, appctx);
+}
+
+/* releases unused buffers after processing. It will try to wake up as many
+ * entities as the number of buffers that it releases.
+ */
+static void appctx_release_buffers(struct appctx * appctx)
+{
+	int offer = 0;
+
+	if (b_size(&appctx->inbuf) && !b_data(&appctx->inbuf)) {
+		offer++;
+		b_free(&appctx->inbuf);
+	}
+	if (b_size(&appctx->outbuf) && !b_data(&appctx->outbuf)) {
+		offer++;
+		b_free(&appctx->outbuf);
+	}
+
+	/* if we're certain to have at least 1 buffer available, and there is
+	 * someone waiting, we can wake up a waiter and offer them.
+	 */
+	if (offer)
+		offer_buffers(appctx, offer);
 }
 
 /* Callback used to wake up an applet when a buffer is available. The applet
@@ -378,6 +444,20 @@ int appctx_buf_available(void *arg)
 {
 	struct appctx *appctx = arg;
 	struct stconn *sc = appctx_sc(appctx);
+
+	if (applet_fl_test(appctx, APPCTX_FL_INBLK_ALLOC) && b_alloc(&appctx->inbuf)) {
+		applet_fl_clr(appctx, APPCTX_FL_INBLK_ALLOC);
+		TRACE_STATE("unblocking appctx, inbuf allocated", APPLET_EV_RECV|APPLET_EV_BLK|APPLET_EV_WAKE, appctx);
+		task_wakeup(appctx->t, TASK_WOKEN_RES);
+		return 1;
+	}
+
+	if (applet_fl_test(appctx, APPCTX_FL_OUTBLK_ALLOC) && b_alloc(&appctx->outbuf)) {
+		applet_fl_clr(appctx, APPCTX_FL_OUTBLK_ALLOC);
+		TRACE_STATE("unblocking appctx, outbuf allocated", APPLET_EV_SEND|APPLET_EV_BLK|APPLET_EV_WAKE, appctx);
+		task_wakeup(appctx->t, TASK_WOKEN_RES);
+		return 1;
+	}
 
 	/* allocation requested ? */
 	if (!(sc->flags & SC_FL_NEED_BUFF))
@@ -399,6 +479,252 @@ int appctx_buf_available(void *arg)
 	return 1;
 }
 
+size_t appctx_htx_rcv_buf(struct appctx *appctx, struct buffer *buf, size_t count, unsigned int flags)
+{
+	struct htx *appctx_htx = htx_from_buf(&appctx->outbuf);
+	struct htx *buf_htx = NULL;
+	size_t ret = 0;
+
+	if (htx_is_empty(appctx_htx)) {
+		htx_to_buf(appctx_htx, &appctx->outbuf);
+		goto out;
+	}
+
+	ret = appctx_htx->data;
+	buf_htx = htx_from_buf(buf);
+	if (htx_is_empty(buf_htx) && htx_used_space(appctx_htx) <= count) {
+		htx_to_buf(buf_htx, buf);
+		htx_to_buf(appctx_htx, &appctx->outbuf);
+		b_xfer(buf, &appctx->outbuf, b_data(&appctx->outbuf));
+		goto out;
+	}
+
+	htx_xfer_blks(buf_htx, appctx_htx, count, HTX_BLK_UNUSED);
+	buf_htx->flags |= (appctx_htx->flags & (HTX_FL_PARSING_ERROR|HTX_FL_PROCESSING_ERROR));
+	if (htx_is_empty(appctx_htx)) {
+		buf_htx->flags |= (appctx_htx->flags & HTX_FL_EOM);
+	}
+	buf_htx->extra = (appctx_htx->extra ? (appctx_htx->data + appctx_htx->extra) : 0);
+	htx_to_buf(buf_htx, buf);
+	htx_to_buf(appctx_htx, &appctx->inbuf);
+	ret -= appctx_htx->data;
+
+  out:
+	return ret;
+}
+
+size_t appctx_raw_rcv_buf(struct appctx *appctx, struct buffer *buf, size_t count, unsigned int flags)
+{
+	return b_xfer(buf, &appctx->outbuf, MAX(count, b_data(&appctx->outbuf)));
+}
+
+size_t appctx_rcv_buf(struct stconn *sc, struct buffer *buf, size_t count, unsigned int flags)
+{
+	struct appctx *appctx = __sc_appctx(sc);
+	size_t ret = 0;
+
+	TRACE_ENTER(APPLET_EV_RECV, appctx);
+
+	if (applet_fl_test(appctx, APPCTX_FL_OUTBLK_ALLOC))
+		goto end;
+
+	if (!count)
+		goto end;
+
+	if (!appctx_get_buf(appctx, &appctx->outbuf)) {
+		applet_fl_set(appctx, APPCTX_FL_OUTBLK_ALLOC);
+		TRACE_STATE("waiting for appctx outbuf allocation", APPLET_EV_RECV|APPLET_EV_BLK, appctx);
+		goto end;
+	}
+
+	if (flags & CO_RFL_BUF_FLUSH)
+		applet_fl_set(appctx, APPCTX_FL_FASTFWD);
+
+	ret = appctx->applet->rcv_buf(appctx, buf, count, flags);
+	if (ret)
+		applet_fl_clr(appctx, APPCTX_FL_OUTBLK_FULL);
+
+	if (b_data(&appctx->outbuf)) {
+		se_fl_set(appctx->sedesc, SE_FL_RCV_MORE | SE_FL_WANT_ROOM);
+		TRACE_STATE("waiting for more room", APPLET_EV_RECV|APPLET_EV_BLK, appctx);
+	}
+	else {
+		se_fl_clr(appctx->sedesc, SE_FL_RCV_MORE | SE_FL_WANT_ROOM);
+		if (applet_fl_test(appctx, APPCTX_FL_EOI)) {
+			se_fl_set(appctx->sedesc, SE_FL_EOI);
+			TRACE_STATE("report EOI to SE", APPLET_EV_RECV|APPLET_EV_BLK, appctx);
+		}
+		if (applet_fl_test(appctx, APPCTX_FL_EOS)) {
+			se_fl_set(appctx->sedesc, SE_FL_EOS);
+			TRACE_STATE("report EOS to SE", APPLET_EV_RECV|APPLET_EV_BLK, appctx);
+		}
+		if (applet_fl_test(appctx, APPCTX_FL_ERROR)) {
+			se_fl_set(appctx->sedesc, SE_FL_ERROR);
+			TRACE_STATE("report ERROR to SE", APPLET_EV_RECV|APPLET_EV_BLK, appctx);
+		}
+	}
+
+  end:
+	TRACE_LEAVE(APPLET_EV_RECV, appctx);
+	return ret;
+}
+
+size_t appctx_htx_snd_buf(struct appctx *appctx, struct buffer *buf, size_t count, unsigned int flags)
+{
+	struct htx *appctx_htx = htx_from_buf(&appctx->inbuf);
+	struct htx *buf_htx = htx_from_buf(buf);
+	size_t ret = 0;
+
+	ret = buf_htx->data;
+	if (htx_is_empty(appctx_htx) && buf_htx->data == count) {
+		htx_to_buf(appctx_htx, &appctx->inbuf);
+		htx_to_buf(buf_htx, buf);
+		b_xfer(&appctx->inbuf, buf, b_data(buf));
+		goto end;
+	}
+
+	htx_xfer_blks(appctx_htx, buf_htx, count, HTX_BLK_UNUSED);
+	if (htx_is_empty(buf_htx)) {
+		appctx_htx->flags |= (buf_htx->flags & HTX_FL_EOM);
+	}
+
+	appctx_htx->extra = (buf_htx->extra ? (buf_htx->data + buf_htx->extra) : 0);
+	htx_to_buf(appctx_htx, &appctx->outbuf);
+	htx_to_buf(buf_htx, buf);
+	ret -= buf_htx->data;
+
+end:
+	return ret;
+}
+
+size_t appctx_raw_snd_buf(struct appctx *appctx, struct buffer *buf, size_t count, unsigned flags)
+{
+	return b_xfer(&appctx->inbuf, buf, MIN(b_room(&appctx->inbuf), count));
+}
+
+size_t appctx_snd_buf(struct stconn *sc, struct buffer *buf, size_t count, unsigned int flags)
+{
+	struct appctx *appctx = __sc_appctx(sc);
+	size_t ret = 0;
+
+	TRACE_ENTER(APPLET_EV_SEND, appctx);
+
+	if (applet_fl_test(appctx, (APPCTX_FL_ERROR|APPCTX_FL_ERR_PENDING)))
+		goto end;
+
+	if (applet_fl_test(appctx, (APPCTX_FL_INBLK_FULL|APPCTX_FL_INBLK_ALLOC)))
+		goto end;
+
+	if (!appctx_get_buf(appctx, &appctx->inbuf)) {
+		applet_fl_set(appctx, APPCTX_FL_INBLK_ALLOC);
+		TRACE_STATE("waiting for appctx inbuf allocation", APPLET_EV_SEND|APPLET_EV_BLK, appctx);
+		goto end;
+	}
+
+	if (!count)
+		goto end;
+
+	ret = appctx->applet->snd_buf(appctx, buf, count, flags);
+	if (ret < count) {
+		applet_fl_set(appctx, APPCTX_FL_INBLK_FULL);
+		appctx_wakeup(appctx);
+		TRACE_STATE("report appctx inbuf is full", APPLET_EV_SEND|APPLET_EV_BLK, appctx);
+	}
+
+  end:
+	if (applet_fl_test(appctx, (APPCTX_FL_ERROR|APPCTX_FL_ERR_PENDING))) {
+		BUG_ON((applet_fl_get(appctx) & (APPCTX_FL_EOS|APPCTX_FL_ERROR|APPCTX_FL_ERR_PENDING)) == (APPCTX_FL_EOS|APPCTX_FL_ERR_PENDING));
+		applet_set_error(appctx);
+		TRACE_STATE("report ERR_PENDING/ERROR to SE", APPLET_EV_SEND, appctx);
+	}
+	TRACE_LEAVE(APPLET_EV_SEND, appctx);
+	return ret;
+}
+
+int appctx_fastfwd(struct stconn *sc, unsigned int count, unsigned int flags)
+{
+	struct appctx *appctx = __sc_appctx(sc);
+	struct xref *peer;
+	struct sedesc *sdo = NULL;
+	unsigned int len, nego_flags = NEGO_FF_FL_NONE;
+	int ret = 0;
+
+	TRACE_ENTER(APPLET_EV_RECV, appctx);
+
+	applet_fl_set(appctx, APPCTX_FL_FASTFWD);
+
+	/* TODO: outbuf must be empty. Find a better way to handle that but for now just return -1 */
+	if (b_data(&appctx->outbuf)) {
+		TRACE_STATE("Output buffer not empty, cannot fast-forward data", APPLET_EV_RECV, appctx);
+		return -1;
+	}
+
+	peer = xref_get_peer_and_lock(&appctx->sedesc->xref);
+	if (!peer) {
+		TRACE_STATE("Opposite endpoint not available yet", APPLET_EV_RECV, appctx);
+		goto end;
+	}
+	sdo = container_of(peer, struct sedesc, xref);
+	xref_unlock(&appctx->sedesc->xref, peer);
+
+	if (appctx->to_forward && count > appctx->to_forward) {
+		count = appctx->to_forward;
+		nego_flags |= NEGO_FF_FL_EXACT_SIZE;
+	}
+
+	len = se_nego_ff(sdo, &BUF_NULL, count, nego_flags);
+	if (sdo->iobuf.flags & IOBUF_FL_NO_FF) {
+		sc_ep_clr(sc, SE_FL_MAY_FASTFWD_PROD);
+		applet_fl_clr(appctx, APPCTX_FL_FASTFWD);
+		TRACE_DEVEL("Fast-forwarding not supported by opposite endpoint, disable it", APPLET_EV_RECV, appctx);
+		goto end;
+	}
+	if (sdo->iobuf.flags & IOBUF_FL_FF_BLOCKED) {
+		sc_ep_set(sc, /* SE_FL_RCV_MORE |  */SE_FL_WANT_ROOM);
+		TRACE_STATE("waiting for more room", APPLET_EV_RECV|APPLET_EV_BLK, appctx);
+		goto end;
+	}
+
+	b_add(sdo->iobuf.buf, sdo->iobuf.offset);
+	ret = appctx->applet->fastfwd(appctx, sdo->iobuf.buf, len, 0);
+	b_sub(sdo->iobuf.buf, sdo->iobuf.offset);
+	sdo->iobuf.data += ret;
+
+	if (se_fl_test(appctx->sedesc, SE_FL_WANT_ROOM)) {
+		/* The applet request more room, report the info at the iobuf level */
+		sdo->iobuf.flags |= IOBUF_FL_FF_BLOCKED;
+		TRACE_STATE("waiting for more room", APPLET_EV_RECV|APPLET_EV_BLK, appctx);
+	}
+
+	if (applet_fl_test(appctx, APPCTX_FL_EOI)) {
+		se_fl_set(appctx->sedesc, SE_FL_EOI);
+		sdo->iobuf.flags |= IOBUF_FL_EOI; /* TODO: it may be good to have a flag to be sure we can
+						   *       forward the EOI the to consumer side
+						   */
+		TRACE_STATE("report EOI to SE", APPLET_EV_RECV|APPLET_EV_BLK, appctx);
+	}
+	if (applet_fl_test(appctx, APPCTX_FL_EOS)) {
+		se_fl_set(appctx->sedesc, SE_FL_EOS);
+		TRACE_STATE("report EOS to SE", APPLET_EV_RECV|APPLET_EV_BLK, appctx);
+	}
+	if (applet_fl_test(appctx, APPCTX_FL_ERROR)) {
+		se_fl_set(appctx->sedesc, SE_FL_ERROR);
+		TRACE_STATE("report ERROR to SE", APPLET_EV_RECV|APPLET_EV_BLK, appctx);
+	}
+	/* else */
+	/* 	applet_have_more_data(appctx); */
+
+	if (se_done_ff(sdo) != 0) {
+		/* Something was forwarding, don't reclaim more room */
+		se_fl_clr(appctx->sedesc, SE_FL_WANT_ROOM);
+		TRACE_STATE("more room available", APPLET_EV_RECV|APPLET_EV_BLK, appctx);
+	}
+
+end:
+	TRACE_LEAVE(APPLET_EV_RECV, appctx);
+	return ret;
+}
+
 /* Default applet handler */
 struct task *task_run_applet(struct task *t, void *context, unsigned int state)
 {
@@ -411,7 +737,7 @@ struct task *task_run_applet(struct task *t, void *context, unsigned int state)
 
 	TRACE_ENTER(APPLET_EV_PROCESS, app);
 
-	if (app->state & APPLET_WANT_DIE) {
+	if (applet_fl_test(app, APPCTX_FL_WANT_DIE)) {
 		TRACE_DEVEL("APPCTX want die, release it", APPLET_EV_FREE, app);
 		__appctx_free(app);
 		return NULL;
@@ -482,6 +808,7 @@ struct task *task_run_applet(struct task *t, void *context, unsigned int state)
 		sc_ep_report_read_activity(sc);
 	}
 
+	/* TODO: May be move in appctx_rcv_buf or sc_applet_process ? */
 	if (sc_waiting_room(sc) && (sc->flags & SC_FL_ABRT_DONE)) {
 		sc_ep_set(sc, SE_FL_EOS|SE_FL_ERROR);
 	}
@@ -509,3 +836,104 @@ struct task *task_run_applet(struct task *t, void *context, unsigned int state)
 	TRACE_LEAVE(APPLET_EV_PROCESS, app);
 	return t;
 }
+
+
+/* Default applet handler based on IN/OUT buffers. It is a true task here, no a tasklet  */
+struct task *task_process_applet(struct task *t, void *context, unsigned int state)
+{
+	struct appctx *app = context;
+	struct stconn *sc;
+	unsigned int rate;
+
+	TRACE_ENTER(APPLET_EV_PROCESS, app);
+
+	if (applet_fl_test(app, APPCTX_FL_WANT_DIE)) {
+		TRACE_DEVEL("APPCTX want die, release it", APPLET_EV_FREE, app);
+		__appctx_free(app);
+		return NULL;
+	}
+
+	if (se_fl_test(app->sedesc, SE_FL_ORPHAN)) {
+		/* Finalize init of orphan appctx. .init callback function must
+		 * be defined and it must finalize appctx startup.
+		 */
+		BUG_ON(!app->applet->init);
+
+		if (appctx_init(app) == -1) {
+			TRACE_DEVEL("APPCTX init failed", APPLET_EV_FREE|APPLET_EV_ERR, app);
+			appctx_free_on_early_error(app);
+			return NULL;
+		}
+		BUG_ON(!app->sess || !appctx_sc(app) || !appctx_strm(app));
+		TRACE_DEVEL("APPCTX initialized", APPLET_EV_PROCESS, app);
+	}
+
+	sc = appctx_sc(app);
+
+	sc_applet_sync_send(sc);
+
+	/* We always pretend the applet can't get and doesn't want to
+	 * put, it's up to it to change this if needed. This ensures
+	 * that one applet which ignores any event will not spin.
+	 */
+	applet_need_more_data(app);
+	applet_have_no_more_data(app);
+
+	app->applet->fct(app);
+
+	TRACE_POINT(APPLET_EV_PROCESS, app);
+
+	if (b_data(&app->outbuf) || se_fl_test(app->sedesc, SE_FL_MAY_FASTFWD_PROD))
+		applet_have_more_data(app);
+
+	sc_applet_sync_recv(sc);
+
+	/* TODO: May be move in appctx_rcv_buf or sc_applet_process ? */
+	if (sc_waiting_room(sc) && (sc->flags & SC_FL_ABRT_DONE)) {
+		sc_ep_set(sc, SE_FL_EOS|SE_FL_ERROR);
+	}
+
+	/* measure the call rate and check for anomalies when too high */
+	if (((b_size(sc_ib(sc)) && sc->flags & SC_FL_NEED_BUFF) || // asks for a buffer which is present
+	     (b_size(sc_ib(sc)) && !b_data(sc_ib(sc)) && sc->flags & SC_FL_NEED_ROOM) || // asks for room in an empty buffer
+	     (b_data(sc_ob(sc)) && sc_is_send_allowed(sc)) || // asks for data already present
+	     (!b_data(sc_ib(sc)) && b_data(sc_ob(sc)) && // didn't return anything ...
+	      (!(sc_oc(sc)->flags & CF_WRITE_EVENT) && (sc->flags & SC_FL_SHUT_WANTED))))) { // ... and left data pending after a shut
+		rate = update_freq_ctr(&app->call_rate, 1);
+		if (rate >= 100000 && app->call_rate.prev_ctr) // looped like this more than 100k times over last second
+			stream_dump_and_crash(&app->obj_type, read_freq_ctr(&app->call_rate));
+	}
+
+	sc->app_ops->wake(sc);
+	appctx_release_buffers(app);
+	TRACE_LEAVE(APPLET_EV_PROCESS, app);
+	return t;
+}
+
+/* config parser for global "tune.applet.zero-copy-forwarding" */
+static int cfg_parse_applet_zero_copy_fwd(char **args, int section_type, struct proxy *curpx,
+					  const struct proxy *defpx, const char *file, int line,
+					  char **err)
+{
+	if (too_many_args(1, args, err, NULL))
+		return -1;
+
+	if (strcmp(args[1], "on") == 0)
+		global.tune.no_zero_copy_fwd &= ~NO_ZERO_COPY_FWD_APPLET;
+	else if (strcmp(args[1], "off") == 0)
+		global.tune.no_zero_copy_fwd |= NO_ZERO_COPY_FWD_APPLET;
+	else {
+		memprintf(err, "'%s' expects 'on' or 'off'.", args[0]);
+		return -1;
+	}
+	return 0;
+}
+
+
+/* config keyword parsers */
+static struct cfg_kw_list cfg_kws = {ILH, {
+	{ CFG_GLOBAL, "tune.applet.zero-copy-forwarding", cfg_parse_applet_zero_copy_fwd },
+	{ 0, NULL, NULL }
+}};
+
+INITCALL1(STG_REGISTER, cfg_register_keywords, &cfg_kws);

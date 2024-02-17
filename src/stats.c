@@ -289,7 +289,7 @@ static size_t stat_count[STATS_DOMAIN_COUNT];
 THREAD_LOCAL struct field *stat_l[STATS_DOMAIN_COUNT];
 
 /* list of all registered stats module */
-static struct list stats_module_list[STATS_DOMAIN_COUNT] = {
+struct list stats_module_list[STATS_DOMAIN_COUNT] = {
 	LIST_HEAD_INIT(stats_module_list[STATS_DOMAIN_PROXY]),
 	LIST_HEAD_INIT(stats_module_list[STATS_DOMAIN_RESOLVERS]),
 };
@@ -298,48 +298,70 @@ THREAD_LOCAL void *trash_counters;
 static THREAD_LOCAL struct buffer trash_chunk = BUF_NULL;
 
 
-static inline uint8_t stats_get_domain(uint32_t domain)
-{
-	return domain >> STATS_DOMAIN & STATS_DOMAIN_MASK;
-}
-
-static inline enum stats_domain_px_cap stats_px_get_cap(uint32_t domain)
-{
-	return domain >> STATS_PX_CAP & STATS_PX_CAP_MASK;
-}
-
 static void stats_dump_json_schema(struct buffer *out);
 
-int stats_putchk(struct appctx *appctx, struct htx *htx)
+int stats_putchk(struct appctx *appctx, struct buffer *buf, struct htx *htx)
 {
-	struct stconn *sc = appctx_sc(appctx);
-	struct channel *chn = sc_ic(sc);
 	struct buffer *chk = &trash_chunk;
 
 	if (htx) {
-		if (chk->data >= channel_htx_recv_max(chn, htx)) {
-			sc_need_room(sc, chk->data);
+		if (chk->data > htx_free_data_space(htx)) {
+			applet_fl_set(appctx, APPCTX_FL_OUTBLK_FULL);
 			return 0;
 		}
 		if (!htx_add_data_atonce(htx, ist2(chk->area, chk->data))) {
-			sc_need_room(sc, 0);
+			applet_fl_set(appctx, APPCTX_FL_OUTBLK_FULL);
 			return 0;
 		}
-		channel_add_input(chn, chk->data);
 		chk->data = 0;
 	}
-	else  {
+	else if (buf) {
+		if (b_data(chk) > b_room(buf)) {
+			se_fl_set(appctx->sedesc, SE_FL_RCV_MORE | SE_FL_WANT_ROOM);
+			return 0;
+		}
+		b_putblk(buf, b_head(chk), b_data(chk));
+		chk->data = 0;
+	}
+	else {
 		if (applet_putchk(appctx, chk) == -1)
 			return 0;
 	}
 	return 1;
 }
 
-static const char *stats_scope_ptr(struct appctx *appctx, struct stconn *sc)
+
+int stats_is_full(struct appctx *appctx, struct buffer *buf, struct htx *htx)
+{
+	if (htx) {
+		if (htx_almost_full(htx)) {
+			appctx->flags |= APPCTX_FL_OUTBLK_FULL;
+			goto full;
+		}
+	}
+	else if (buf) {
+		if (buffer_almost_full(buf)) {
+			se_fl_set(appctx->sedesc, SE_FL_RCV_MORE | SE_FL_WANT_ROOM);
+			goto full;
+		}
+	}
+	else {
+		struct channel *rep = sc_ic(appctx_sc(appctx));
+
+		if (buffer_almost_full(&rep->buf)) {
+			sc_need_room(appctx_sc(appctx), b_size(&rep->buf) / 2);
+			goto full;
+		}
+	}
+	return 0;
+full:
+	return 1;
+}
+
+static const char *stats_scope_ptr(struct appctx *appctx)
 {
 	struct show_stat_ctx *ctx = appctx->svcctx;
-	struct channel *req = sc_oc(sc);
-	struct htx *htx = htxbuf(&req->buf);
+	struct htx *htx = htxbuf(&appctx->inbuf);
 	struct htx_blk *blk;
 	struct ist uri;
 
@@ -1962,7 +1984,8 @@ static int stats_dump_fe_stats(struct stconn *sc, struct proxy *px)
 		}
 
 		counters = EXTRA_COUNTERS_GET(px->extra_counters_fe, mod);
-		mod->fill_stats(counters, stats + stats_count);
+		if (!mod->fill_stats(counters, stats + stats_count, NULL))
+			continue;
 		stats_count += mod->stats_count;
 	}
 
@@ -2129,7 +2152,8 @@ static int stats_dump_li_stats(struct stconn *sc, struct proxy *px, struct liste
 		}
 
 		counters = EXTRA_COUNTERS_GET(l->extra_counters, mod);
-		mod->fill_stats(counters, stats + stats_count);
+		if (!mod->fill_stats(counters, stats + stats_count, NULL))
+			continue;
 		stats_count += mod->stats_count;
 	}
 
@@ -2647,7 +2671,8 @@ static int stats_dump_sv_stats(struct stconn *sc, struct proxy *px, struct serve
 		}
 
 		counters = EXTRA_COUNTERS_GET(sv->extra_counters, mod);
-		mod->fill_stats(counters, stats + stats_count);
+		if (!mod->fill_stats(counters, stats + stats_count, NULL))
+			continue;
 		stats_count += mod->stats_count;
 	}
 
@@ -2983,7 +3008,8 @@ static int stats_dump_be_stats(struct stconn *sc, struct proxy *px)
 		}
 
 		counters = EXTRA_COUNTERS_GET(px->extra_counters_be, mod);
-		mod->fill_stats(counters, stats + stats_count);
+		if (!mod->fill_stats(counters, stats + stats_count, NULL))
+			continue;
 		stats_count += mod->stats_count;
 	}
 
@@ -3008,7 +3034,7 @@ static void stats_dump_html_px_hdr(struct stconn *sc, struct proxy *px)
 		/* scope_txt = search pattern + search query, ctx->scope_len is always <= STAT_SCOPE_TXT_MAXLEN */
 		scope_txt[0] = 0;
 		if (ctx->scope_len) {
-			const char *scope_ptr = stats_scope_ptr(appctx, sc);
+			const char *scope_ptr = stats_scope_ptr(appctx);
 
 			strlcpy2(scope_txt, STAT_SCOPE_PATTERN, sizeof(scope_txt));
 			memcpy(scope_txt + strlen(STAT_SCOPE_PATTERN), scope_ptr, ctx->scope_len);
@@ -3148,12 +3174,11 @@ static void stats_dump_html_px_end(struct stconn *sc, struct proxy *px)
  * both by the CLI and the HTTP entry points, and is able to dump the output
  * in HTML or CSV formats.
  */
-int stats_dump_proxy_to_buffer(struct stconn *sc, struct htx *htx,
+int stats_dump_proxy_to_buffer(struct stconn *sc, struct buffer *buf, struct htx *htx,
 			       struct proxy *px)
 {
 	struct appctx *appctx = __sc_appctx(sc);
 	struct show_stat_ctx *ctx = appctx->svcctx;
-	struct channel *rep = sc_ic(sc);
 	struct server *sv, *svs;	/* server and server-state, server-state=server or server->track */
 	struct listener *l;
 	struct uri_auth *uri = NULL;
@@ -3197,7 +3222,7 @@ more:
 		 * name does not match, skip it.
 		 */
 		if (ctx->scope_len) {
-			const char *scope_ptr = stats_scope_ptr(appctx, sc);
+			const char *scope_ptr = stats_scope_ptr(appctx);
 
 			if (strnistr(px->id, strlen(px->id), scope_ptr, ctx->scope_len) == NULL)
 				return 1;
@@ -3214,7 +3239,7 @@ more:
 	case STAT_PX_ST_TH:
 		if (ctx->flags & STAT_FMT_HTML) {
 			stats_dump_html_px_hdr(sc, px);
-			if (!stats_putchk(appctx, htx))
+			if (!stats_putchk(appctx, buf, htx))
 				goto full;
 		}
 
@@ -3224,7 +3249,7 @@ more:
 	case STAT_PX_ST_FE:
 		/* print the frontend */
 		if (stats_dump_fe_stats(sc, px)) {
-			if (!stats_putchk(appctx, htx))
+			if (!stats_putchk(appctx, buf, htx))
 				goto full;
 			ctx->flags |= STAT_STARTED;
 			if (ctx->field)
@@ -3239,18 +3264,8 @@ more:
 	case STAT_PX_ST_LI:
 		/* obj2 points to listeners list as initialized above */
 		for (; ctx->obj2 != &px->conf.listeners; ctx->obj2 = l->by_fe.n) {
-			if (htx) {
-				if (htx_almost_full(htx)) {
-					sc_need_room(sc, htx->size / 2);
-					goto full;
-				}
-			}
-			else {
-				if (buffer_almost_full(&rep->buf)) {
-					sc_need_room(sc, b_size(&rep->buf) / 2);
-					goto full;
-				}
-			}
+			if (stats_is_full(appctx, buf, htx))
+				goto full;
 
 			l = LIST_ELEM(ctx->obj2, struct listener *, by_fe);
 			if (!l->counters)
@@ -3266,7 +3281,7 @@ more:
 
 			/* print the frontend */
 			if (stats_dump_li_stats(sc, px, l)) {
-				if (!stats_putchk(appctx, htx))
+				if (!stats_putchk(appctx, buf, htx))
 					goto full;
 				ctx->flags |= STAT_STARTED;
 				if (ctx->field)
@@ -3309,18 +3324,8 @@ more:
 			sv = ctx->obj2;
 			srv_take(sv);
 
-			if (htx) {
-				if (htx_almost_full(htx)) {
-					sc_need_room(sc, htx->size / 2);
-					goto full;
-				}
-			}
-			else {
-				if (buffer_almost_full(&rep->buf)) {
-					sc_need_room(sc, b_size(&rep->buf) / 2);
-					goto full;
-				}
-			}
+			if (stats_is_full(appctx, buf, htx))
+				goto full;
 
 			if (ctx->flags & STAT_BOUND) {
 				if (!(ctx->type & (1 << STATS_TYPE_SV))) {
@@ -3353,7 +3358,7 @@ more:
 			}
 
 			if (stats_dump_sv_stats(sc, px, sv)) {
-				if (!stats_putchk(appctx, htx))
+				if (!stats_putchk(appctx, buf, htx))
 					goto full;
 				ctx->flags |= STAT_STARTED;
 				if (ctx->field)
@@ -3368,7 +3373,7 @@ more:
 	case STAT_PX_ST_BE:
 		/* print the backend */
 		if (stats_dump_be_stats(sc, px)) {
-			if (!stats_putchk(appctx, htx))
+			if (!stats_putchk(appctx, buf, htx))
 				goto full;
 			ctx->flags |= STAT_STARTED;
 			if (ctx->field)
@@ -3382,7 +3387,7 @@ more:
 	case STAT_PX_ST_END:
 		if (ctx->flags & STAT_FMT_HTML) {
 			stats_dump_html_px_end(sc, px);
-			if (!stats_putchk(appctx, htx))
+			if (!stats_putchk(appctx, buf, htx))
 				goto full;
 		}
 
@@ -3587,7 +3592,7 @@ static void stats_dump_html_info(struct stconn *sc)
 	struct show_stat_ctx *ctx = appctx->svcctx;
 	unsigned int up = ns_to_sec(now_ns - start_time_ns);
 	char scope_txt[STAT_SCOPE_TXT_MAXLEN + sizeof STAT_SCOPE_PATTERN];
-	const char *scope_ptr = stats_scope_ptr(appctx, sc);
+	const char *scope_ptr = stats_scope_ptr(appctx);
 	struct uri_auth *uri;
 	unsigned long long bps;
 	int thr;
@@ -3869,28 +3874,17 @@ static void stats_dump_json_end()
 /* Uses <appctx.ctx.stats.obj1> as a pointer to the current proxy and <obj2> as
  * a pointer to the current server/listener.
  */
-static int stats_dump_proxies(struct stconn *sc,
+static int stats_dump_proxies(struct stconn *sc, struct buffer *buf,
                               struct htx *htx)
 {
 	struct appctx *appctx = __sc_appctx(sc);
 	struct show_stat_ctx *ctx = appctx->svcctx;
-	struct channel *rep = sc_ic(sc);
 	struct proxy *px;
 
 	/* dump proxies */
 	while (ctx->obj1) {
-		if (htx) {
-			if (htx_almost_full(htx)) {
-				sc_need_room(sc, htx->size / 2);
-				goto full;
-			}
-		}
-		else {
-			if (buffer_almost_full(&rep->buf)) {
-				sc_need_room(sc, b_size(&rep->buf) / 2);
-				goto full;
-			}
-		}
+		if (stats_is_full(appctx, buf, htx))
+			goto full;
 
 		px = ctx->obj1;
 		/* Skip the global frontend proxies and non-networked ones.
@@ -3899,7 +3893,7 @@ static int stats_dump_proxies(struct stconn *sc,
 		 */
 		if (!(px->flags & PR_FL_DISABLED) && px->uuid > 0 &&
 		    (px->cap & (PR_CAP_FE | PR_CAP_BE)) && !(px->cap & PR_CAP_INT)) {
-			if (stats_dump_proxy_to_buffer(sc, htx, px) == 0)
+			if (stats_dump_proxy_to_buffer(sc, buf, htx, px) == 0)
 				return 0;
 		}
 
@@ -3920,7 +3914,7 @@ static int stats_dump_proxies(struct stconn *sc,
  * or -1 in case of any error. This function is used by both the CLI and the
  * HTTP handlers.
  */
-static int stats_dump_stat_to_buffer(struct stconn *sc, struct htx *htx)
+static int stats_dump_stat_to_buffer(struct stconn *sc, struct buffer *buf, struct htx *htx)
 {
 	struct appctx *appctx = __sc_appctx(sc);
 	struct show_stat_ctx *ctx = appctx->svcctx;
@@ -3943,7 +3937,7 @@ static int stats_dump_stat_to_buffer(struct stconn *sc, struct htx *htx)
 		else if (!(ctx->flags & STAT_FMT_TYPED))
 			stats_dump_csv_header(ctx->domain);
 
-		if (!stats_putchk(appctx, htx))
+		if (!stats_putchk(appctx, buf, htx))
 			goto full;
 
 		if (ctx->flags & STAT_JSON_SCHM) {
@@ -3956,7 +3950,7 @@ static int stats_dump_stat_to_buffer(struct stconn *sc, struct htx *htx)
 	case STAT_STATE_INFO:
 		if (ctx->flags & STAT_FMT_HTML) {
 			stats_dump_html_info(sc);
-			if (!stats_putchk(appctx, htx))
+			if (!stats_putchk(appctx, buf, htx))
 				goto full;
 		}
 
@@ -3981,7 +3975,7 @@ static int stats_dump_stat_to_buffer(struct stconn *sc, struct htx *htx)
 		case STATS_DOMAIN_PROXY:
 		default:
 			/* dump proxies */
-			if (!stats_dump_proxies(sc, htx))
+			if (!stats_dump_proxies(sc, buf, htx))
 				return 0;
 			break;
 		}
@@ -3995,7 +3989,7 @@ static int stats_dump_stat_to_buffer(struct stconn *sc, struct htx *htx)
 				stats_dump_html_end();
 			else
 				stats_dump_json_end();
-			if (!stats_putchk(appctx, htx))
+			if (!stats_putchk(appctx, buf, htx))
 				goto full;
 		}
 
@@ -4023,7 +4017,6 @@ static int stats_dump_stat_to_buffer(struct stconn *sc, struct htx *htx)
  */
 static int stats_process_http_post(struct stconn *sc)
 {
-	struct stream *s = __sc_strm(sc);
 	struct appctx *appctx = __sc_appctx(sc);
 	struct show_stat_ctx *ctx = appctx->svcctx;
 
@@ -4043,17 +4036,17 @@ static int stats_process_http_post(struct stconn *sc)
 
 	struct buffer *temp = get_trash_chunk();
 
-	struct htx *htx = htxbuf(&s->req.buf);
+	struct htx *htx = htxbuf(&appctx->inbuf);
 	struct htx_blk *blk;
 
 	/*  we need more data */
-	if (s->txn->req.msg_state < HTTP_MSG_DONE) {
+	if (!(htx->flags & HTX_FL_EOM)) {
 		/* check if we can receive more */
-		if (htx_free_data_space(htx) <= global.tune.maxrewrite) {
+		if (applet_fl_test(appctx, APPCTX_FL_INBLK_FULL)) {
 			ctx->st_code = STAT_STATUS_EXCD;
 			goto out;
 		}
-		goto wait;
+		goto  wait;
 	}
 
 	/* The request was fully received. Copy data */
@@ -4359,7 +4352,6 @@ static int stats_process_http_post(struct stconn *sc)
 
 static int stats_send_http_headers(struct stconn *sc, struct htx *htx)
 {
-	struct stream *s = __sc_strm(sc);
 	struct uri_auth *uri;
 	struct appctx *appctx = __sc_appctx(sc);
 	struct show_stat_ctx *ctx = appctx->svcctx;
@@ -4403,13 +4395,12 @@ static int stats_send_http_headers(struct stconn *sc, struct htx *htx)
 
 	if (!htx_add_endof(htx, HTX_BLK_EOH))
 		goto full;
-
-	channel_add_input(&s->res, htx->data);
 	return 1;
 
   full:
 	htx_reset(htx);
-	sc_need_room(sc, 0);
+	applet_set_eos(appctx);
+	applet_set_error(appctx);
 	return 0;
 }
 
@@ -4417,7 +4408,6 @@ static int stats_send_http_headers(struct stconn *sc, struct htx *htx)
 static int stats_send_http_redirect(struct stconn *sc, struct htx *htx)
 {
 	char scope_txt[STAT_SCOPE_TXT_MAXLEN + sizeof STAT_SCOPE_PATTERN];
-	struct stream *s = __sc_strm(sc);
 	struct uri_auth *uri;
 	struct appctx *appctx = __sc_appctx(sc);
 	struct show_stat_ctx *ctx = appctx->svcctx;
@@ -4430,7 +4420,7 @@ static int stats_send_http_redirect(struct stconn *sc, struct htx *htx)
 	/* scope_txt = search pattern + search query, ctx->scope_len is always <= STAT_SCOPE_TXT_MAXLEN */
 	scope_txt[0] = 0;
 	if (ctx->scope_len) {
-		const char *scope_ptr = stats_scope_ptr(appctx, sc);
+		const char *scope_ptr = stats_scope_ptr(appctx);
 
 		strlcpy2(scope_txt, STAT_SCOPE_PATTERN, sizeof(scope_txt));
 		memcpy(scope_txt + strlen(STAT_SCOPE_PATTERN), scope_ptr, ctx->scope_len);
@@ -4467,15 +4457,30 @@ static int stats_send_http_redirect(struct stconn *sc, struct htx *htx)
 	if (!htx_add_endof(htx, HTX_BLK_EOH))
 		goto full;
 
-	channel_add_input(&s->res, htx->data);
 	return 1;
 
-full:
+  full:
 	htx_reset(htx);
-	sc_need_room(sc, 0);
+	applet_set_eos(appctx);
+	applet_set_error(appctx);
 	return 0;
 }
 
+static size_t http_stats_fastfwd(struct appctx *appctx, struct buffer *buf, size_t count, unsigned int flags)
+{
+	struct stconn *sc = appctx_sc(appctx);
+	size_t ret = 0;
+
+	ret = b_data(buf);
+	if (stats_dump_stat_to_buffer(sc, buf, NULL)) {
+		se_fl_clr(appctx->sedesc, SE_FL_MAY_FASTFWD_PROD);
+		applet_fl_clr(appctx, APPCTX_FL_FASTFWD);
+		appctx->st0 = STAT_HTTP_DONE;
+	}
+
+	ret = b_data(buf) - ret;
+	return ret;
+}
 
 /* This I/O handler runs as an applet embedded in a stream connector. It is
  * used to send HTTP stats over a TCP socket. The mechanism is very simple.
@@ -4486,52 +4491,57 @@ static void http_stats_io_handler(struct appctx *appctx)
 {
 	struct show_stat_ctx *ctx = appctx->svcctx;
 	struct stconn *sc = appctx_sc(appctx);
-	struct stream *s = __sc_strm(sc);
-	struct channel *req = sc_oc(sc);
-	struct channel *res = sc_ic(sc);
-	struct htx *req_htx, *res_htx;
+	struct htx *res_htx = NULL;
 
 	/* only proxy stats are available via http */
 	ctx->domain = STATS_DOMAIN_PROXY;
 
-	res_htx = htx_from_buf(&res->buf);
+	if (applet_fl_test(appctx, APPCTX_FL_OUTBLK_ALLOC|APPCTX_FL_OUTBLK_FULL))
+		goto out;
 
-	if (unlikely(se_fl_test(appctx->sedesc, (SE_FL_EOS|SE_FL_ERROR|SE_FL_SHR|SE_FL_SHW)))) {
-		appctx->st0 = STAT_HTTP_END;
+	if (applet_fl_test(appctx, APPCTX_FL_FASTFWD) && se_fl_test(appctx->sedesc, SE_FL_MAY_FASTFWD_PROD))
+		goto out;
+
+	if (!appctx_get_buf(appctx, &appctx->outbuf)) {
+		appctx->flags |= APPCTX_FL_OUTBLK_ALLOC;
 		goto out;
 	}
 
-	/* Check if the input buffer is available. */
-	if (!b_size(&res->buf)) {
-		sc_need_room(sc, 0);
+	res_htx = htx_from_buf(&appctx->outbuf);
+
+	if (unlikely(applet_fl_test(appctx, APPCTX_FL_EOS|APPCTX_FL_ERROR))) {
+		appctx->st0 = STAT_HTTP_END;
 		goto out;
 	}
 
 	/* all states are processed in sequence */
 	if (appctx->st0 == STAT_HTTP_HEAD) {
 		if (stats_send_http_headers(sc, res_htx)) {
-			if (s->txn->meth == HTTP_METH_HEAD)
+			struct ist meth = htx_sl_req_meth(http_get_stline(htxbuf(&appctx->inbuf)));
+
+			if (find_http_meth(istptr(meth), istlen(meth)) == HTTP_METH_HEAD)
 				appctx->st0 = STAT_HTTP_DONE;
-			else
+			else {
+				if (!(global.tune.no_zero_copy_fwd & NO_ZERO_COPY_FWD_APPLET))
+					se_fl_set(appctx->sedesc, SE_FL_MAY_FASTFWD_PROD);
 				appctx->st0 = STAT_HTTP_DUMP;
+			}
 		}
 	}
 
 	if (appctx->st0 == STAT_HTTP_DUMP) {
-		trash_chunk = b_make(trash.area, res->buf.size, 0, 0);
+		trash_chunk = b_make(trash.area, appctx->outbuf.size, 0, 0);
 		/* adjust buffer size to take htx overhead into account,
 		 * make sure to perform this call on an empty buffer
 		 */
 		trash_chunk.size = buf_room_for_htx_data(&trash_chunk);
-		if (stats_dump_stat_to_buffer(sc, res_htx))
+		if (stats_dump_stat_to_buffer(sc, NULL, res_htx))
 			appctx->st0 = STAT_HTTP_DONE;
 	}
 
 	if (appctx->st0 == STAT_HTTP_POST) {
 		if (stats_process_http_post(sc))
 			appctx->st0 = STAT_HTTP_LAST;
-		else if (s->scf->flags & (SC_FL_EOS|SC_FL_ABRT_DONE))
-			appctx->st0 = STAT_HTTP_DONE;
 	}
 
 	if (appctx->st0 == STAT_HTTP_LAST) {
@@ -4547,18 +4557,19 @@ static void http_stats_io_handler(struct appctx *appctx)
 		 */
 		if (htx_is_empty(res_htx)) {
 			if (!htx_add_endof(res_htx, HTX_BLK_EOT)) {
-				sc_need_room(sc, sizeof(struct htx_blk) + 1);
+				appctx->flags |= APPCTX_FL_OUTBLK_FULL;
 				goto out;
 			}
-			channel_add_input(res, 1);
 		}
 		res_htx->flags |= HTX_FL_EOM;
-		se_fl_set(appctx->sedesc, SE_FL_EOI);
+		applet_set_eoi(appctx);
+		se_fl_clr(appctx->sedesc, SE_FL_MAY_FASTFWD_PROD);
+		applet_fl_clr(appctx, APPCTX_FL_FASTFWD);
 		appctx->st0 = STAT_HTTP_END;
 	}
 
 	if (appctx->st0 == STAT_HTTP_END) {
-		se_fl_set(appctx->sedesc, SE_FL_EOS);
+		applet_set_eos(appctx);
 		applet_will_consume(appctx);
 	}
 
@@ -4570,16 +4581,16 @@ static void http_stats_io_handler(struct appctx *appctx)
 	 * deciding to wake the applet up. It saves it from looping when
 	 * emitting large blocks into small TCP windows.
 	 */
-	htx_to_buf(res_htx, &res->buf);
+	if (res_htx)
+		htx_to_buf(res_htx, &appctx->outbuf);
+
 	if (appctx->st0 == STAT_HTTP_END) {
 		/* eat the whole request */
-		if (co_data(req)) {
-			req_htx = htx_from_buf(&req->buf);
-			co_htx_skip(req, req_htx, co_data(req));
-			htx_to_buf(req_htx, &req->buf);
-		}
+		b_reset(&appctx->inbuf);
+		applet_fl_clr(appctx, APPCTX_FL_INBLK_FULL);
+		appctx->sedesc->iobuf.flags &= ~IOBUF_FL_FF_BLOCKED;
 	}
-	else if (co_data(res))
+	else if (applet_fl_test(appctx, APPCTX_FL_OUTBLK_FULL))
 		applet_wont_consume(appctx);
 }
 
@@ -5253,7 +5264,7 @@ static int cli_io_handler_dump_info(struct appctx *appctx)
 static int cli_io_handler_dump_stat(struct appctx *appctx)
 {
 	trash_chunk = b_make(trash.area, trash.size, 0, 0);
-	return stats_dump_stat_to_buffer(appctx_sc(appctx), NULL);
+	return stats_dump_stat_to_buffer(appctx_sc(appctx), NULL, NULL);
 }
 
 static int cli_io_handler_dump_json_schema(struct appctx *appctx)
@@ -5341,6 +5352,7 @@ void stats_register_module(struct stats_module *m)
 	LIST_APPEND(&stats_module_list[domain], &m->list);
 	stat_count[domain] += m->stats_count;
 }
+
 
 static int allocate_stats_px_postcheck(void)
 {
@@ -5511,6 +5523,9 @@ struct applet http_stats_applet = {
 	.obj_type = OBJ_TYPE_APPLET,
 	.name = "<STATS>", /* used for logging */
 	.fct = http_stats_io_handler,
+	.rcv_buf = appctx_htx_rcv_buf,
+	.snd_buf = appctx_htx_snd_buf,
+	.fastfwd = http_stats_fastfwd,
 	.release = NULL,
 };
 

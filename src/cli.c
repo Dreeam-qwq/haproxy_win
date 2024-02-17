@@ -861,12 +861,13 @@ fail:
 static int cli_output_msg(struct appctx *appctx, const char *msg, int severity, int severity_output)
 {
 	struct buffer *tmp;
-
-	if (likely(severity_output == CLI_SEVERITY_NONE))
-		return applet_putstr(appctx, msg);
+	struct ist imsg;
 
 	tmp = get_trash_chunk();
 	chunk_reset(tmp);
+
+	if (likely(severity_output == CLI_SEVERITY_NONE))
+		goto send_it;
 
 	if (severity < 0 || severity > 7) {
 		ha_warning("socket command feedback with invalid severity %d", severity);
@@ -884,7 +885,17 @@ static int cli_output_msg(struct appctx *appctx, const char *msg, int severity, 
 				ha_warning("Unrecognized severity output %d", severity_output);
 		}
 	}
-	chunk_appendf(tmp, "%s", msg);
+ send_it:
+	/* the vast majority of messages have their trailing LF but a few are
+	 * still missing it, and very rare ones might even have two. For this
+	 * reason, we'll first delete the trailing LFs if present, then
+	 * systematically append one.
+	 */
+	for (imsg = ist(msg); imsg.len > 0 && imsg.ptr[imsg.len - 1] == '\n'; imsg.len--)
+		;
+
+	chunk_istcat(tmp, imsg);
+	chunk_istcat(tmp, ist("\n"));
 
 	return applet_putchk(appctx, tmp);
 }
@@ -906,7 +917,7 @@ static void cli_io_handler(struct appctx *appctx)
 	int reql;
 	int len;
 
-	if (unlikely(se_fl_test(appctx->sedesc, (SE_FL_EOS|SE_FL_ERROR|SE_FL_SHR|SE_FL_SHW)))) {
+	if (unlikely(se_fl_test(appctx->sedesc, (SE_FL_EOS|SE_FL_ERROR)))) {
 		co_skip(sc_oc(sc), co_data(sc_oc(sc)));
 		goto out;
 	}
@@ -1016,6 +1027,7 @@ static void cli_io_handler(struct appctx *appctx)
 				appctx->chunk->data++;
 			}
 
+			appctx->t->expire = TICK_ETERNITY;
 			appctx->st0 = CLI_ST_PROMPT;
 
 			if (appctx->st1 & APPCTX_CLI_ST1_PAYLOAD) {
@@ -1128,6 +1140,7 @@ static void cli_io_handler(struct appctx *appctx)
 					         appctx->st0 == CLI_ST_PRINT_UMSGERR) {
 						usermsgs_clr(NULL);
 					}
+					appctx->t->expire = TICK_ETERNITY;
 					appctx->st0 = CLI_ST_PROMPT;
 				}
 				break;
@@ -1135,10 +1148,15 @@ static void cli_io_handler(struct appctx *appctx)
 			case CLI_ST_CALLBACK: /* use custom pointer */
 				if (appctx->io_handler)
 					if (appctx->io_handler(appctx)) {
+						appctx->t->expire = TICK_ETERNITY;
 						appctx->st0 = CLI_ST_PROMPT;
 						if (appctx->io_release) {
 							appctx->io_release(appctx);
 							appctx->io_release = NULL;
+							/* some release handlers might have
+							 * pending output to print.
+							 */
+							continue;
 						}
 					}
 				break;
@@ -1990,6 +2008,173 @@ static int cli_parse_set_ratelimit(char **args, char *payload, struct appctx *ap
 	dequeue_all_listeners();
 
 	return 1;
+}
+
+/* Parse a "wait <time>" command.
+ * It uses a "cli_wait_ctx" struct for its context.
+ * Returns 0 if the server deletion has been successfully scheduled, 1 on failure.
+ */
+static int cli_parse_wait(char **args, char *payload, struct appctx *appctx, void *private)
+{
+	struct cli_wait_ctx *ctx = applet_reserve_svcctx(appctx, sizeof(*ctx));
+	uint wait_ms;
+	const char *err;
+
+	if (!cli_has_level(appctx, ACCESS_LVL_ADMIN))
+		return 1;
+
+	if (!*args[1])
+		return cli_err(appctx, "Expects a duration in milliseconds.\n");
+
+	err = parse_time_err(args[1], &wait_ms, TIME_UNIT_MS);
+	if (err || wait_ms < 1) {
+		/* in case -h is passed as the first option, continue to the next test */
+		if (strcmp(args[1], "-h") == 0)
+			args--;
+		else
+			return cli_err(appctx, "Invalid duration.\n");
+	}
+
+	if (strcmp(args[2], "srv-unused") == 0) {
+		struct ist be_name, sv_name;
+
+		if (!*args[3])
+			return cli_err(appctx, "Missing server name (<backend>/<server>).\n");
+
+		sv_name = ist(args[3]);
+		be_name = istsplit(&sv_name, '/');
+		if (!istlen(sv_name))
+			return cli_err(appctx, "Require 'backend/server'.\n");
+
+		be_name = istdup(be_name);
+		sv_name = istdup(sv_name);
+		if (!isttest(be_name) || !isttest(sv_name)) {
+			free(istptr(be_name));
+			free(istptr(sv_name));
+			return cli_err(appctx, "Out of memory trying to clone the server name.\n");
+		}
+
+		ctx->args[0] = ist0(be_name);
+		ctx->args[1] = ist0(sv_name);
+		ctx->cond = CLI_WAIT_COND_SRV_UNUSED;
+	}
+	else if (*args[2]) {
+		/* show the command's help either upon request (-h) or error */
+		err = "Usage: wait {-h|<duration>} [condition [args...]]\n"
+			"  - '-h' displays this help\n"
+			"  - <duration> is the maximum wait time, optionally suffixed by the unit among\n"
+			"    'us', 'ms', 's', 'm', 'h', and 'd'. ; the default unit is milliseconds.\n"
+			"  - <condition> indicates what to wait for, no longer than the specified\n"
+			"    duration. Supported conditions are:\n"
+			"    - <none> : by default, just sleep for the specified duration.\n"
+			"    - srv-unused <px>/<sv> : wait for this server to become unused.\n"
+			"";
+
+		if (strcmp(args[2], "-h") == 0)
+			return cli_msg(appctx, LOG_INFO, err);
+		else
+			return cli_err(appctx, err);
+	}
+
+	ctx->start = now_ms;
+	ctx->deadline = tick_add(now_ms, wait_ms);
+
+	/* proceed with the I/O handler */
+	return 0;
+}
+
+/* Execute a "wait" condition. The delay is exponentially incremented between
+ * now_ms and ctx->deadline in powers of 1.5 and with a bound set to 10% of the
+ * programmed wait time, so that in a few wakeups we can later check a condition
+ * with reasonable accuracy. Shutdowns and other errors are handled as well and
+ * terminate the operation, but not new inputs so that it remains possible to
+ * chain other commands after it. Returns 0 if not finished, 1 if finished.
+ */
+static int cli_io_handler_wait(struct appctx *appctx)
+{
+	struct cli_wait_ctx *ctx = appctx->svcctx;
+	uint total, elapsed, left, wait;
+	int ret;
+
+	/* note: upon first invocation, the timeout is not set */
+	if (tick_isset(appctx->t->expire) &&
+	    !tick_is_expired(appctx->t->expire, now_ms))
+		goto wait;
+
+	/* here we should evaluate our waiting conditions, if any */
+
+	if (ctx->cond == CLI_WAIT_COND_SRV_UNUSED) {
+		/* check if the server in args[0]/args[1] can be released now */
+		thread_isolate();
+		ret = srv_check_for_deletion(ctx->args[0], ctx->args[1], NULL, NULL, NULL);
+		thread_release();
+
+		if (ret < 0) {
+			/* unrecoverable failure */
+			ctx->error = CLI_WAIT_ERR_FAIL;
+			return 1;
+		} else if (ret > 0) {
+			/* immediate success */
+			ctx->error = CLI_WAIT_ERR_DONE;
+			return 1;
+		}
+		/* let's check the timer */
+	}
+
+	/* and here we recalculate the new wait time or abort */
+	left  = tick_remain(now_ms, ctx->deadline);
+	if (!left) {
+		/* let the release handler know we've expired. When there is no
+		 * wait condition, it's a simple sleep so we declare we're done.
+		 */
+		if (ctx->cond == CLI_WAIT_COND_NONE)
+			ctx->error = CLI_WAIT_ERR_DONE;
+		else
+			ctx->error = CLI_WAIT_ERR_EXP;
+		return 1;
+	}
+
+	total = tick_remain(ctx->start, ctx->deadline);
+	elapsed = total - left;
+	wait = elapsed / 2 + 1;
+	if (wait > left)
+		wait = left;
+	else if (wait > total / 10)
+		wait = total / 10;
+
+	appctx->t->expire = tick_add(now_ms, wait);
+
+ wait:
+	/* Stop waiting upon close/abort/error */
+	if (unlikely(se_fl_test(appctx->sedesc, SE_FL_SHW))) {
+		ctx->error = CLI_WAIT_ERR_INTR;
+		return 1;
+	}
+
+	return 0;
+}
+
+/* release structs allocated by "delete server" */
+static void cli_release_wait(struct appctx *appctx)
+{
+	struct cli_wait_ctx *ctx = appctx->svcctx;
+	const char *msg;
+	int i;
+
+	switch (ctx->error) {
+	case CLI_WAIT_ERR_EXP:      msg = "Wait delay expired.\n"; break;
+	case CLI_WAIT_ERR_INTR:     msg = "Interrupted.\n"; break;
+	case CLI_WAIT_ERR_FAIL:     msg = ctx->msg ? ctx->msg : "Failed.\n"; break;
+	default:                    msg = "Done.\n"; break;
+	}
+
+	for (i = 0; i < sizeof(ctx->args) / sizeof(ctx->args[0]); i++)
+		ha_free(&ctx->args[i]);
+
+	if (ctx->error == CLI_WAIT_ERR_DONE)
+		cli_msg(appctx, LOG_INFO, msg);
+	else
+		cli_err(appctx, msg);
 }
 
 /* parse the "expose-fd" argument on the bind lines */
@@ -3388,6 +3573,7 @@ static struct cli_kw_list cli_kws = {{ },{
 	{ { "show", "version", NULL },           "show version                            : show version of the current process",                     cli_parse_show_version, NULL, NULL, NULL, ACCESS_MASTER },
 	{ { "operator", NULL },                  "operator                                : lower the level of the current CLI session to operator",  cli_parse_set_lvl, NULL, NULL, NULL, ACCESS_MASTER},
 	{ { "user", NULL },                      "user                                    : lower the level of the current CLI session to user",      cli_parse_set_lvl, NULL, NULL, NULL, ACCESS_MASTER},
+	{ { "wait", NULL },                      "wait {-h|<delay_ms>} cond [args...]     : wait the specified delay or condition (-h to see list)",  cli_parse_wait, cli_io_handler_wait, cli_release_wait, NULL },
 	{{},}
 }};
 

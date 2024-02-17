@@ -46,6 +46,18 @@
 #include <haproxy/tools.h>
 #include <haproxy/xxhash.h>
 
+#if defined(USE_PROMEX)
+#include <promex/promex.h>
+#endif
+
+/* stick table base fields */
+enum sticktable_field {
+	STICKTABLE_SIZE = 0,
+	STICKTABLE_USED,
+	/* must always be the last one */
+	STICKTABLE_TOTAL_FIELDS
+};
+
 
 /* structure used to return a table key built from a sample */
 static THREAD_LOCAL struct stktable_key static_table_key;
@@ -1436,6 +1448,8 @@ struct stktable_data_type stktable_data_types[STKTABLE_DATA_TYPES] = {
 	[STKTABLE_DT_GPT]           = { .name = "gpt",            .std_type = STD_T_UINT, .is_array = 1, .as_is = 1  },
 	[STKTABLE_DT_GPC]           = { .name = "gpc",            .std_type = STD_T_UINT, .is_array = 1 },
 	[STKTABLE_DT_GPC_RATE]      = { .name = "gpc_rate",       .std_type = STD_T_FRQP, .is_array = 1, .arg_type = ARG_T_DELAY },
+	[STKTABLE_DT_GLITCH_CNT]    = { .name = "glitch_cnt",     .std_type = STD_T_UINT  },
+	[STKTABLE_DT_GLITCH_RATE]   = { .name = "glitch_rate",    .std_type = STD_T_FRQP, .arg_type = ARG_T_DELAY  },
 };
 
 /* Registers stick-table extra data type with index <idx>, name <name>, type
@@ -1770,6 +1784,79 @@ static int sample_conv_table_bytes_out_rate(const struct arg *arg_p, struct samp
 	if (ptr)
 		smp->data.u.sint = read_freq_ctr_period(&stktable_data_cast(ptr, std_t_frqp),
                                                        t->data_arg[STKTABLE_DT_BYTES_OUT_RATE].u);
+
+	stktable_release(t, ts);
+	return !!ptr;
+}
+
+/* Casts sample <smp> to the type of the table specified in arg(0), and looks
+ * it up into this table. Returns the cumulated number of front glitches for the
+ * key if the key is present in the table, otherwise zero, so that comparisons
+ * can be easily performed. If the inspected parameter is not stored in the
+ * table, <not found> is returned.
+ */
+static int sample_conv_table_glitch_cnt(const struct arg *arg_p, struct sample *smp, void *private)
+{
+	struct stktable *t;
+	struct stktable_key *key;
+	struct stksess *ts;
+	void *ptr;
+
+	t = arg_p[0].data.t;
+
+	key = smp_to_stkey(smp, t);
+	if (!key)
+		return 0;
+
+	ts = stktable_lookup_key(t, key);
+
+	smp->flags = SMP_F_VOL_TEST;
+	smp->data.type = SMP_T_SINT;
+	smp->data.u.sint = 0;
+
+	if (!ts) /* key not present */
+		return 1;
+
+	ptr = stktable_data_ptr(t, ts, STKTABLE_DT_GLITCH_CNT);
+	if (ptr)
+		smp->data.u.sint = stktable_data_cast(ptr, std_t_uint);
+
+	stktable_release(t, ts);
+	return !!ptr;
+}
+
+/* Casts sample <smp> to the type of the table specified in arg(0), and looks
+ * it up into this table. Returns the front glitch rate the key if the key is
+ * present in the table, otherwise zero, so that comparisons can be easily
+ * performed. If the inspected parameter is not stored in the table, <not found>
+ * is returned.
+ */
+static int sample_conv_table_glitch_rate(const struct arg *arg_p, struct sample *smp, void *private)
+{
+	struct stktable *t;
+	struct stktable_key *key;
+	struct stksess *ts;
+	void *ptr;
+
+	t = arg_p[0].data.t;
+
+	key = smp_to_stkey(smp, t);
+	if (!key)
+		return 0;
+
+	ts = stktable_lookup_key(t, key);
+
+	smp->flags = SMP_F_VOL_TEST;
+	smp->data.type = SMP_T_SINT;
+	smp->data.u.sint = 0;
+
+	if (!ts) /* key not present */
+		return 1;
+
+	ptr = stktable_data_ptr(t, ts, STKTABLE_DT_GLITCH_RATE);
+	if (ptr)
+		smp->data.u.sint = read_freq_ctr_period(&stktable_data_cast(ptr, std_t_frqp),
+                                                       t->data_arg[STKTABLE_DT_GLITCH_RATE].u);
 
 	stktable_release(t, ts);
 	return !!ptr;
@@ -4252,6 +4339,85 @@ smp_fetch_sc_conn_cur(const struct arg *args, struct sample *smp, const char *kw
 	return 1;
 }
 
+/* set <smp> to the cumulated number of glitches from the stream or session's
+ * tracked frontend counters. Supports being called as "sc[0-9]_glitch_cnt" or
+ * "src_glitch_cnt" only.
+ */
+static int
+smp_fetch_sc_glitch_cnt(const struct arg *args, struct sample *smp, const char *kw, void *private)
+{
+	struct stkctr tmpstkctr;
+	struct stkctr *stkctr;
+
+	stkctr = smp_fetch_sc_stkctr(smp->sess, smp->strm, args, kw, &tmpstkctr);
+	if (!stkctr)
+		return 0;
+
+	smp->flags = SMP_F_VOL_TEST;
+	smp->data.type = SMP_T_SINT;
+	smp->data.u.sint = 0;
+	if (stkctr_entry(stkctr) != NULL) {
+		void *ptr;
+
+		ptr = stktable_data_ptr(stkctr->table, stkctr_entry(stkctr), STKTABLE_DT_GLITCH_CNT);
+		if (!ptr) {
+			if (stkctr == &tmpstkctr)
+				stktable_release(stkctr->table, stkctr_entry(stkctr));
+			return 0; /* parameter not stored */
+		}
+
+		HA_RWLOCK_RDLOCK(STK_SESS_LOCK, &stkctr_entry(stkctr)->lock);
+
+		smp->data.u.sint = stktable_data_cast(ptr, std_t_uint);
+
+		HA_RWLOCK_RDUNLOCK(STK_SESS_LOCK, &stkctr_entry(stkctr)->lock);
+
+		if (stkctr == &tmpstkctr)
+			stktable_release(stkctr->table, stkctr_entry(stkctr));
+	}
+	return 1;
+}
+
+/* set <smp> to the rate of glitches from the stream or session's tracked
+ * frontend counters. Supports being called as "sc[0-9]_glitch_rate" or
+ * "src_glitch_rate" only.
+ */
+static int
+smp_fetch_sc_glitch_rate(const struct arg *args, struct sample *smp, const char *kw, void *private)
+{
+	struct stkctr tmpstkctr;
+	struct stkctr *stkctr;
+
+	stkctr = smp_fetch_sc_stkctr(smp->sess, smp->strm, args, kw, &tmpstkctr);
+	if (!stkctr)
+		return 0;
+
+	smp->flags = SMP_F_VOL_TEST;
+	smp->data.type = SMP_T_SINT;
+	smp->data.u.sint = 0;
+	if (stkctr_entry(stkctr) != NULL) {
+		void *ptr;
+
+		ptr = stktable_data_ptr(stkctr->table, stkctr_entry(stkctr), STKTABLE_DT_GLITCH_RATE);
+		if (!ptr) {
+			if (stkctr == &tmpstkctr)
+				stktable_release(stkctr->table, stkctr_entry(stkctr));
+			return 0; /* parameter not stored */
+		}
+
+		HA_RWLOCK_RDLOCK(STK_SESS_LOCK, &stkctr_entry(stkctr)->lock);
+
+		smp->data.u.sint = read_freq_ctr_period(&stktable_data_cast(ptr, std_t_frqp),
+					       stkctr->table->data_arg[STKTABLE_DT_GLITCH_RATE].u);
+
+		HA_RWLOCK_RDUNLOCK(STK_SESS_LOCK, &stkctr_entry(stkctr)->lock);
+
+		if (stkctr == &tmpstkctr)
+			stktable_release(stkctr->table, stkctr_entry(stkctr));
+	}
+	return 1;
+}
+
 /* set <smp> to the cumulated number of streams from the stream's tracked
  * frontend counters. Supports being called as "sc[0-9]_sess_cnt" or
  * "src_sess_cnt" only.
@@ -5561,6 +5727,8 @@ static struct sample_fetch_kw_list smp_fetch_keywords = {ILH, {
 	{ "sc_get_gpc",         smp_fetch_sc_get_gpc,        ARG3(2,SINT,SINT,TAB), NULL, SMP_T_SINT, SMP_USE_INTRN, },
 	{ "sc_get_gpc0",        smp_fetch_sc_get_gpc0,       ARG2(1,SINT,TAB), NULL, SMP_T_SINT, SMP_USE_INTRN, },
 	{ "sc_get_gpc1",        smp_fetch_sc_get_gpc1,       ARG2(1,SINT,TAB), NULL, SMP_T_SINT, SMP_USE_INTRN },
+	{ "sc_glitch_cnt",      smp_fetch_sc_glitch_cnt,     ARG2(1,SINT,TAB), NULL, SMP_T_SINT, SMP_USE_INTRN, },
+	{ "sc_glitch_rate",     smp_fetch_sc_glitch_rate,    ARG2(1,SINT,TAB), NULL, SMP_T_SINT, SMP_USE_INTRN, },
 	{ "sc_gpc_rate",        smp_fetch_sc_gpc_rate,       ARG3(2,SINT,SINT,TAB), NULL, SMP_T_SINT, SMP_USE_INTRN, },
 	{ "sc_gpc0_rate",       smp_fetch_sc_gpc0_rate,      ARG2(1,SINT,TAB), NULL, SMP_T_SINT, SMP_USE_INTRN, },
 	{ "sc_gpc1_rate",       smp_fetch_sc_gpc1_rate,      ARG2(1,SINT,TAB), NULL, SMP_T_SINT, SMP_USE_INTRN, },
@@ -5589,6 +5757,8 @@ static struct sample_fetch_kw_list smp_fetch_keywords = {ILH, {
 	{ "sc0_get_gpt0",       smp_fetch_sc_get_gpt0,       ARG1(0,TAB),      NULL, SMP_T_SINT, SMP_USE_INTRN, },
 	{ "sc0_get_gpc0",       smp_fetch_sc_get_gpc0,       ARG1(0,TAB),      NULL, SMP_T_SINT, SMP_USE_INTRN, },
 	{ "sc0_get_gpc1",       smp_fetch_sc_get_gpc1,       ARG1(0,TAB),      NULL, SMP_T_SINT, SMP_USE_INTRN, },
+	{ "sc0_glitch_cnt",     smp_fetch_sc_glitch_cnt,     ARG1(0,TAB),      NULL, SMP_T_SINT, SMP_USE_INTRN, },
+	{ "sc0_glitch_rate",    smp_fetch_sc_glitch_rate,    ARG1(0,TAB),      NULL, SMP_T_SINT, SMP_USE_INTRN, },
 	{ "sc0_gpc0_rate",      smp_fetch_sc_gpc0_rate,      ARG1(0,TAB),      NULL, SMP_T_SINT, SMP_USE_INTRN, },
 	{ "sc0_gpc1_rate",      smp_fetch_sc_gpc1_rate,      ARG1(0,TAB),      NULL, SMP_T_SINT, SMP_USE_INTRN, },
 	{ "sc0_http_err_cnt",   smp_fetch_sc_http_err_cnt,   ARG1(0,TAB),      NULL, SMP_T_SINT, SMP_USE_INTRN, },
@@ -5616,6 +5786,8 @@ static struct sample_fetch_kw_list smp_fetch_keywords = {ILH, {
 	{ "sc1_get_gpt0",       smp_fetch_sc_get_gpt0,       ARG1(0,TAB),      NULL, SMP_T_SINT, SMP_USE_INTRN, },
 	{ "sc1_get_gpc0",       smp_fetch_sc_get_gpc0,       ARG1(0,TAB),      NULL, SMP_T_SINT, SMP_USE_INTRN, },
 	{ "sc1_get_gpc1",       smp_fetch_sc_get_gpc1,       ARG1(0,TAB),      NULL, SMP_T_SINT, SMP_USE_INTRN, },
+	{ "sc1_glitch_cnt",     smp_fetch_sc_glitch_cnt,     ARG1(0,TAB),      NULL, SMP_T_SINT, SMP_USE_INTRN, },
+	{ "sc1_glitch_rate",    smp_fetch_sc_glitch_rate,    ARG1(0,TAB),      NULL, SMP_T_SINT, SMP_USE_INTRN, },
 	{ "sc1_gpc0_rate",      smp_fetch_sc_gpc0_rate,      ARG1(0,TAB),      NULL, SMP_T_SINT, SMP_USE_INTRN, },
 	{ "sc1_gpc1_rate",      smp_fetch_sc_gpc1_rate,      ARG1(0,TAB),      NULL, SMP_T_SINT, SMP_USE_INTRN, },
 	{ "sc1_http_err_cnt",   smp_fetch_sc_http_err_cnt,   ARG1(0,TAB),      NULL, SMP_T_SINT, SMP_USE_INTRN, },
@@ -5642,6 +5814,8 @@ static struct sample_fetch_kw_list smp_fetch_keywords = {ILH, {
 	{ "sc2_get_gpt0",       smp_fetch_sc_get_gpt0,       ARG1(0,TAB),      NULL, SMP_T_SINT, SMP_USE_INTRN, },
 	{ "sc2_get_gpc0",       smp_fetch_sc_get_gpc0,       ARG1(0,TAB),      NULL, SMP_T_SINT, SMP_USE_INTRN, },
 	{ "sc2_get_gpc1",       smp_fetch_sc_get_gpc1,       ARG1(0,TAB),      NULL, SMP_T_SINT, SMP_USE_INTRN, },
+	{ "sc2_glitch_cnt",     smp_fetch_sc_glitch_cnt,     ARG1(0,TAB),      NULL, SMP_T_SINT, SMP_USE_INTRN, },
+	{ "sc2_glitch_rate",    smp_fetch_sc_glitch_rate,    ARG1(0,TAB),      NULL, SMP_T_SINT, SMP_USE_INTRN, },
 	{ "sc2_gpc0_rate",      smp_fetch_sc_gpc0_rate,      ARG1(0,TAB),      NULL, SMP_T_SINT, SMP_USE_INTRN, },
 	{ "sc2_gpc1_rate",      smp_fetch_sc_gpc1_rate,      ARG1(0,TAB),      NULL, SMP_T_SINT, SMP_USE_INTRN, },
 	{ "sc2_http_err_cnt",   smp_fetch_sc_http_err_cnt,   ARG1(0,TAB),      NULL, SMP_T_SINT, SMP_USE_INTRN, },
@@ -5671,6 +5845,8 @@ static struct sample_fetch_kw_list smp_fetch_keywords = {ILH, {
 	{ "src_get_gpc",        smp_fetch_sc_get_gpc,        ARG2(2,SINT,TAB), NULL, SMP_T_SINT, SMP_USE_L4CLI, },
 	{ "src_get_gpc0",       smp_fetch_sc_get_gpc0,       ARG1(1,TAB),      NULL, SMP_T_SINT, SMP_USE_L4CLI, },
 	{ "src_get_gpc1",       smp_fetch_sc_get_gpc1,       ARG1(1,TAB),      NULL, SMP_T_SINT, SMP_USE_L4CLI, },
+	{ "src_glitch_cnt",     smp_fetch_sc_glitch_cnt,     ARG1(1,TAB),      NULL, SMP_T_SINT, SMP_USE_L4CLI, },
+	{ "src_glitch_rate",    smp_fetch_sc_glitch_rate,    ARG1(1,TAB),      NULL, SMP_T_SINT, SMP_USE_L4CLI, },
 	{ "src_gpc_rate",       smp_fetch_sc_gpc_rate,       ARG2(2,SINT,TAB), NULL, SMP_T_SINT, SMP_USE_L4CLI, },
 	{ "src_gpc0_rate",      smp_fetch_sc_gpc0_rate,      ARG1(1,TAB),      NULL, SMP_T_SINT, SMP_USE_L4CLI, },
 	{ "src_gpc1_rate",      smp_fetch_sc_gpc1_rate,      ARG1(1,TAB),      NULL, SMP_T_SINT, SMP_USE_L4CLI, },
@@ -5712,6 +5888,8 @@ static struct sample_conv_kw_list sample_conv_kws = {ILH, {
 	{ "table_gpc_rate",       sample_conv_table_gpc_rate,       ARG2(2,SINT,TAB),  NULL, SMP_T_ANY,  SMP_T_SINT  },
 	{ "table_gpc0_rate",      sample_conv_table_gpc0_rate,      ARG1(1,TAB),  NULL, SMP_T_ANY,  SMP_T_SINT  },
 	{ "table_gpc1_rate",      sample_conv_table_gpc1_rate,      ARG1(1,TAB),  NULL, SMP_T_ANY,  SMP_T_SINT  },
+	{ "table_glitch_cnt",     sample_conv_table_glitch_cnt,     ARG1(1,TAB),  NULL, SMP_T_ANY,  SMP_T_SINT  },
+	{ "table_glitch_rate",    sample_conv_table_glitch_rate,    ARG1(1,TAB),  NULL, SMP_T_ANY,  SMP_T_SINT  },
 	{ "table_http_err_cnt",   sample_conv_table_http_err_cnt,   ARG1(1,TAB),  NULL, SMP_T_ANY,  SMP_T_SINT  },
 	{ "table_http_err_rate",  sample_conv_table_http_err_rate,  ARG1(1,TAB),  NULL, SMP_T_ANY,  SMP_T_SINT  },
 	{ "table_http_fail_cnt",  sample_conv_table_http_fail_cnt,  ARG1(1,TAB),  NULL, SMP_T_ANY,  SMP_T_SINT  },
@@ -5736,3 +5914,73 @@ static struct cfg_kw_list cfg_kws = {{ },{
 }};
 
 INITCALL1(STG_REGISTER, cfg_register_keywords, &cfg_kws);
+
+
+#if defined(USE_PROMEX)
+
+static int stk_promex_metric_info(unsigned int id, struct promex_metric *metric, struct ist *desc)
+{
+	switch (id) {
+		case STICKTABLE_SIZE:
+			*metric = (struct promex_metric){ .n = ist("size"), .type = PROMEX_MT_GAUGE, .flags = PROMEX_FL_MODULE_METRIC };
+			*desc = ist("Stick table size.");
+			break;
+		case STICKTABLE_USED:
+			*metric = (struct promex_metric){ .n = ist("used"), .type = PROMEX_MT_GAUGE, .flags = PROMEX_FL_MODULE_METRIC };
+			*desc = ist("Number of entries used in this stick table.");
+			break;
+		default:
+			return -1;
+	}
+	return 1;
+}
+
+static void *stk_promex_start_ts(void *unused, unsigned int id)
+{
+	return stktables_list;
+}
+
+static void *stk_promex_next_ts(void *unsued, void *metric_ctx, unsigned int id)
+{
+	struct stktable *t = metric_ctx;
+
+	return t->next;
+}
+
+static int stk_promex_fill_ts(void *unused, void *metric_ctx, unsigned int id, struct promex_label *labels, struct field *field)
+{
+	struct stktable *t = metric_ctx;
+
+	if (!t->size)
+		return 0;
+
+	labels[0].name  = ist("name");
+	labels[0].value = ist2(t->id, strlen(t->id));
+	labels[1].name  = ist("type");
+	labels[1].value = ist2(stktable_types[t->type].kw, strlen(stktable_types[t->type].kw));
+
+	switch (id) {
+		case STICKTABLE_SIZE:
+			*field = mkf_u32(FN_GAUGE, t->size);
+			break;
+		case STICKTABLE_USED:
+			*field = mkf_u32(FN_GAUGE, t->current);
+			break;
+		default:
+			return -1;
+	}
+	return 1;
+}
+
+static struct promex_module promex_sticktable_module = {
+	.name        = IST("sticktable"),
+	.metric_info = stk_promex_metric_info,
+	.start_ts    = stk_promex_start_ts,
+	.next_ts     = stk_promex_next_ts,
+	.fill_ts     = stk_promex_fill_ts,
+	.nb_metrics  = STICKTABLE_TOTAL_FIELDS,
+};
+
+INITCALL1(STG_REGISTER, promex_register_module, &promex_sticktable_module);
+
+#endif

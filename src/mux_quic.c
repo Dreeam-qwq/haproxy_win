@@ -675,6 +675,9 @@ struct stconn *qcs_attach_sc(struct qcs *qcs, struct buffer *buf, char fin)
 	se_fl_set(qcs->sd, SE_FL_T_MUX | SE_FL_ORPHAN | SE_FL_NOT_FIRST);
 	se_expect_no_data(qcs->sd);
 
+	if (!(global.tune.no_zero_copy_fwd & NO_ZERO_COPY_FWD_QUIC_SND))
+		se_fl_set(qcs->sd, SE_FL_MAY_FASTFWD_CONS);
+
 	/* TODO duplicated from mux_h2 */
 	sess->t_idle = ns_to_ms(now_ns - sess->accept_ts) - sess->t_handshake;
 
@@ -2922,7 +2925,7 @@ static size_t qmux_strm_snd_buf(struct stconn *sc, struct buffer *buf,
 
 
 static size_t qmux_strm_nego_ff(struct stconn *sc, struct buffer *input,
-                                size_t count, unsigned int may_splice)
+                                size_t count, unsigned int flags)
 {
 	struct qcs *qcs = __sc_mux_strm(sc);
 	size_t ret = 0;
@@ -2937,11 +2940,6 @@ static size_t qmux_strm_nego_ff(struct stconn *sc, struct buffer *input,
 
 	/* stream layer has been detached so no transfer must occur after. */
 	BUG_ON_HOT(qcs->flags & QC_SF_DETACH);
-
-	if (global.tune.no_zero_copy_fwd & NO_ZERO_COPY_FWD_QUIC_SND) {
-		qcs->sd->iobuf.flags |= IOBUF_FL_NO_FF;
-		goto end;
-	}
 
 	if (!qcs->qcc->app_ops->nego_ff || !qcs->qcc->app_ops->done_ff) {
 		/* Fast forwarding is not supported by the QUIC application layer */
