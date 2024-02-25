@@ -911,11 +911,11 @@ static int cli_output_msg(struct appctx *appctx, const char *msg, int severity, 
 static void cli_io_handler(struct appctx *appctx)
 {
 	struct stconn *sc = appctx_sc(appctx);
-	struct channel *req = sc_oc(sc);
 	struct channel *res = sc_ic(sc);
 	struct bind_conf *bind_conf = strm_li(__sc_strm(sc))->bind_conf;
 	int reql;
 	int len;
+	int lf = 0;
 
 	if (unlikely(se_fl_test(appctx->sedesc, (SE_FL_EOS|SE_FL_ERROR)))) {
 		co_skip(sc_oc(sc), co_data(sc_oc(sc)));
@@ -987,29 +987,15 @@ static void cli_io_handler(struct appctx *appctx)
 				continue;
 			}
 
-			if (!(appctx->st1 & APPCTX_CLI_ST1_PAYLOAD)) {
-				/* seek for a possible unescaped semi-colon. If we find
-				 * one, we replace it with an LF and skip only this part.
-				 */
-				for (len = 0; len < reql; len++) {
-					if (str[len] == '\\') {
-						len++;
-						continue;
-					}
-					if (str[len] == ';') {
-						str[len] = '\n';
-						reql = len + 1;
-						break;
-					}
-				}
-			}
+			if (str[reql-1] == '\n')
+				lf = 1;
 
 			/* now it is time to check that we have a full line,
 			 * remove the trailing \n and possibly \r, then cut the
 			 * line.
 			 */
 			len = reql - 1;
-			if (str[len] != '\n') {
+			if (str[len] != '\n' && str[len] != ';') {
 				se_fl_set(appctx->sedesc, SE_FL_ERROR);
 				appctx->st0 = CLI_ST_END;
 				continue;
@@ -1045,6 +1031,8 @@ static void cli_io_handler(struct appctx *appctx)
 						 */
 
 						appctx->st1 &= ~APPCTX_CLI_ST1_PAYLOAD;
+						if (!(appctx->st1 & APPCTX_CLI_ST1_PROMPT) && lf)
+							appctx->st1 |= APPCTX_CLI_ST1_LASTCMD;
 					}
 				}
 			}
@@ -1083,6 +1071,8 @@ static void cli_io_handler(struct appctx *appctx)
 					/* no payload, the command is complete: parse the request */
 					cli_parse_request(appctx);
 					chunk_reset(appctx->chunk);
+					if (!(appctx->st1 & APPCTX_CLI_ST1_PROMPT) && lf)
+						appctx->st1 |= APPCTX_CLI_ST1_LASTCMD;
 				}
 			}
 
@@ -1209,11 +1199,11 @@ static void cli_io_handler(struct appctx *appctx)
 			 * allows pipelined requests to be sent in
 			 * non-interactive mode.
 			 */
-			if (!(appctx->st1 & APPCTX_CLI_ST1_PROMPT) && !co_data(req) && (!(appctx->st1 & APPCTX_CLI_ST1_PAYLOAD))) {
-				se_fl_set(appctx->sedesc, SE_FL_EOI);
-				appctx->st0 = CLI_ST_END;
-				continue;
-			}
+			if ((appctx->st1 & (APPCTX_CLI_ST1_PROMPT|APPCTX_CLI_ST1_PAYLOAD|APPCTX_CLI_ST1_LASTCMD)) == APPCTX_CLI_ST1_LASTCMD) {
+                               se_fl_set(appctx->sedesc, SE_FL_EOI);
+                               appctx->st0 = CLI_ST_END;
+                               continue;
+                       }
 
 			/* switch state back to GETREQ to read next requests */
 			applet_reset_svcctx(appctx);

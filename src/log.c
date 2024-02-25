@@ -306,7 +306,7 @@ int parse_logformat_var_args(char *args, struct logformat_node *node, char **err
  * ignored when arg_len is 0. Neither <var> nor <var_len> may be null.
  * Returns false in error case and err is filled, otherwise returns true.
  */
-int parse_logformat_var(char *arg, int arg_len, char *var, int var_len, struct proxy *curproxy, struct list *list_format, int *defoptions, char **err)
+int parse_logformat_var(char *arg, int arg_len, char *name, int name_len, int typecast, char *var, int var_len, struct proxy *curproxy, struct list *list_format, int *defoptions, char **err)
 {
 	int j;
 	struct logformat_node *node = NULL;
@@ -321,6 +321,9 @@ int parse_logformat_var(char *arg, int arg_len, char *var, int var_len, struct p
 					goto error_free;
 				}
 				node->type = logformat_keywords[j].type;
+				node->typecast = typecast;
+				if (name)
+					node->name = my_strndup(name, name_len);
 				node->options = *defoptions;
 				if (arg_len) {
 					node->arg = my_strndup(arg, arg_len);
@@ -329,8 +332,7 @@ int parse_logformat_var(char *arg, int arg_len, char *var, int var_len, struct p
 				}
 				if (node->type == LOG_FMT_GLOBAL) {
 					*defoptions = node->options;
-					free(node->arg);
-					free(node);
+					free_logformat_node(node);
 				} else {
 					if (logformat_keywords[j].config_callback &&
 					    logformat_keywords[j].config_callback(node, curproxy) != 0) {
@@ -354,10 +356,7 @@ int parse_logformat_var(char *arg, int arg_len, char *var, int var_len, struct p
 	var[var_len] = j;
 
   error_free:
-	if (node) {
-		free(node->arg);
-		free(node);
-	}
+	free_logformat_node(node);
 	return 0;
 }
 
@@ -409,7 +408,7 @@ int add_to_logformat_list(char *start, char *end, int type, struct list *list_fo
  *
  * In error case, the function returns 0, otherwise it returns 1.
  */
-int add_sample_to_logformat_list(char *text, char *arg, int arg_len, struct proxy *curpx, struct list *list_format, int options, int cap, char **err, char **endptr)
+int add_sample_to_logformat_list(char *text, char *name, int name_len, int typecast, char *arg, int arg_len, struct proxy *curpx, struct list *list_format, int options, int cap, char **err, char **endptr)
 {
 	char *cmd[2];
 	struct sample_expr *expr = NULL;
@@ -432,7 +431,10 @@ int add_sample_to_logformat_list(char *text, char *arg, int arg_len, struct prox
 		memprintf(err, "out of memory error");
 		goto error_free;
 	}
+	if (name)
+		node->name = my_strndup(name, name_len);
 	node->type = LOG_FMT_EXPR;
+	node->typecast = typecast;
 	node->expr = expr;
 	node->options = options;
 
@@ -473,11 +475,7 @@ int add_sample_to_logformat_list(char *text, char *arg, int arg_len, struct prox
 	return 1;
 
   error_free:
-	release_sample_expr(expr);
-	if (node) {
-		free(node->arg);
-		free(node);
-	}
+	free_logformat_node(node);
 	return 0;
 }
 
@@ -500,11 +498,14 @@ int parse_logformat_string(const char *fmt, struct proxy *curproxy, struct list 
 	char *sp, *str, *backfmt; /* start pointer for text parts */
 	char *arg = NULL; /* start pointer for args */
 	char *var = NULL; /* start pointer for vars */
+	char *name = NULL; /* token name (optional) */
+	char *typecast_str = NULL; /* token output type (if custom name is set) */
 	int arg_len = 0;
 	int var_len = 0;
+	int name_len = 0;
+	int typecast = SMP_T_SAME; /* relaxed by default */
 	int cformat; /* current token format */
 	int pformat; /* previous token format */
-	struct logformat_node *tmplf, *back;
 
 	sp = str = backfmt = strdup(fmt);
 	if (!str) {
@@ -514,12 +515,7 @@ int parse_logformat_string(const char *fmt, struct proxy *curproxy, struct list 
 	curproxy->to_log |= LW_INIT;
 
 	/* flush the list first. */
-	list_for_each_entry_safe(tmplf, back, list_format, list) {
-		LIST_DELETE(&tmplf->list);
-		release_sample_expr(tmplf->expr);
-		free(tmplf->arg);
-		free(tmplf);
-	}
+	free_logformat_list(list_format);
 
 	for (cformat = LF_INIT; cformat != LF_END; str++) {
 		pformat = cformat;
@@ -535,7 +531,49 @@ int parse_logformat_string(const char *fmt, struct proxy *curproxy, struct list 
 		switch (pformat) {
 		case LF_STARTVAR:                      // text immediately following a '%'
 			arg = NULL; var = NULL;
+			name = NULL;
+			name_len = 0;
+			typecast = SMP_T_SAME;
 			arg_len = var_len = 0;
+			if (*str == '(') {             // custom output name
+				cformat = LF_STONAME;
+				name = str + 1;
+			}
+			else
+				goto startvar;
+			break;
+
+		case LF_STONAME:                       // text immediately following '%('
+		case LF_STOTYPE:
+			if (cformat == LF_STONAME && *str == ':') { // start custom output type
+				cformat = LF_STOTYPE;
+				name_len = str -name;
+				typecast_str = str + 1;
+			}
+			else if (*str == ')') {        // end of custom output name
+				if (cformat == LF_STONAME)
+					name_len = str - name;
+				else {
+					/* custom type */
+					*str = 0; // so that typecast_str is 0 terminated
+					typecast = type_to_smp(typecast_str);
+					if (typecast != SMP_T_STR && typecast != SMP_T_SINT &&
+					    typecast != SMP_T_BOOL) {
+						memprintf(err, "unexpected output type '%.*s' at position %d line : '%s'. Supported types are: str, sint, bool", (int)(str - typecast_str), typecast_str, (int)(typecast_str - backfmt), fmt);
+						goto fail;
+					}
+				}
+				cformat = LF_EDONAME;
+			} else if  (!isalnum((unsigned char)*str) && *str != '_' && *str != '-') {
+				memprintf(err, "invalid character in custom name near '%c' at position %d line : '%s'",
+				          *str, (int)(str - backfmt), fmt);
+
+				goto fail;
+			}
+			break;
+
+		case LF_EDONAME:                       // text immediately following %(name)
+ startvar:
 			if (*str == '{') {             // optional argument
 				cformat = LF_STARG;
 				arg = str + 1;
@@ -592,7 +630,7 @@ int parse_logformat_string(const char *fmt, struct proxy *curproxy, struct list 
 			 * part of the expression, which MUST be the trailing
 			 * angle bracket.
 			 */
-			if (!add_sample_to_logformat_list(var, arg, arg_len, curproxy, list_format, options, cap, err, &str))
+			if (!add_sample_to_logformat_list(var, name, name_len, typecast, arg, arg_len, curproxy, list_format, options, cap, err, &str))
 				goto fail;
 
 			if (*str == ']') {
@@ -638,7 +676,7 @@ int parse_logformat_string(const char *fmt, struct proxy *curproxy, struct list 
 		if (cformat != pformat || pformat == LF_SEPARATOR) {
 			switch (pformat) {
 			case LF_VAR:
-				if (!parse_logformat_var(arg, arg_len, var, var_len, curproxy, list_format, &options, err))
+				if (!parse_logformat_var(arg, arg_len, name, name_len, typecast, var, var_len, curproxy, list_format, &options, err))
 					goto fail;
 				break;
 			case LF_TEXT:
@@ -651,7 +689,7 @@ int parse_logformat_string(const char *fmt, struct proxy *curproxy, struct list 
 		}
 	}
 
-	if (pformat == LF_STARTVAR || pformat == LF_STARG || pformat == LF_STEXPR) {
+	if (pformat == LF_STARTVAR || pformat == LF_STARG || pformat == LF_STEXPR || pformat == LF_STONAME || pformat == LF_STOTYPE || pformat == LF_EDONAME) {
 		memprintf(err, "truncated line after '%s'", var ? var : arg ? arg : "%");
 		goto fail;
 	}
@@ -2339,7 +2377,7 @@ static inline void __do_send_log_backend(struct proxy *be, struct log_header hdr
  * data to build the header.
  */
 void process_send_log(struct list *loggers, int level, int facility,
-	                struct ist *metadata, char *message, size_t size)
+                      struct ist *metadata, char *message, size_t size)
 {
 	struct logger *logger;
 	int nblogger;
@@ -2465,6 +2503,44 @@ const char sess_set_cookie[8] = "NPDIRU67";	/* No set-cookie, Set-cookie found a
 			}                                              \
 		} while(0)
 
+/* start quoting the upcoming text if quoting is enabled. The final quote
+ * will automatically be added (because quote is set to 1).
+ */
+#define LOGQUOTE_START() do {                                          \
+			if (tmp->options & LOG_OPT_QUOTE) {            \
+				LOGCHAR('"');                          \
+				quote = 1;                             \
+			}                                              \
+		} while (0)
+
+/* properly finish a quotation that was started using LOGQUOTE_START */
+#define LOGQUOTE_END() do {                                            \
+			if (quote) {                                   \
+				LOGCHAR('"');                          \
+				quote = 0;                             \
+			}                                              \
+		} while (0)
+
+/* Prints additional logvalue hint represented by <chr>.
+ * It is useful to express that <chr> is not part of the "raw" value and
+ * should be considered as optional metadata instead.
+ */
+#define LOGMETACHAR(chr) do {                                          \
+			LOGCHAR(chr);                                  \
+		} while (0)
+
+/* indicate the start of a string array */
+#define LOG_STRARRAY_START() do {                                      \
+		} while (0)
+
+/* indicate that a new element is added to the string array */
+#define LOG_STRARRAY_NEXT() do {                                       \
+			LOGCHAR(' ');                                  \
+		} while (0)
+
+/* indicate the end of a string array */
+#define LOG_STRARRAY_END() do {                                        \
+		} while (0)
 
 /* Initializes some log data at boot */
 static void init_log()
@@ -2575,6 +2651,19 @@ void deinit_log_forward()
 	}
 }
 
+/* Releases memory for a single log-format node */
+void free_logformat_node(struct logformat_node *node)
+{
+	if (!node)
+		return;
+
+	release_sample_expr(node->expr);
+	node->expr = NULL;
+	ha_free(&node->name);
+	ha_free(&node->arg);
+	ha_free(&node);
+}
+
 /* Releases memory allocated for a log-format string */
 void free_logformat_list(struct list *fmt)
 {
@@ -2585,9 +2674,7 @@ void free_logformat_list(struct list *fmt)
 
 	list_for_each_entry_safe(lf, lfb, fmt, list) {
 		LIST_DELETE(&lf->list);
-		release_sample_expr(lf->expr);
-		free(lf->arg);
-		free(lf);
+		free_logformat_node(lf);
 	}
 }
 
@@ -2718,6 +2805,7 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 		const char *src = NULL;
 		struct sample *key;
 		const struct buffer empty = { };
+		int quote = 0; /* inside quoted string */
 
 		switch (tmp->type) {
 			case LOG_FMT_SEPARATOR:
@@ -2733,7 +2821,6 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 				if (iret == 0)
 					goto out;
 				tmplog += iret;
-				last_isspace = 0;
 				break;
 
 			case LOG_FMT_EXPR: // sample expression, may be request or response
@@ -2759,7 +2846,6 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 				if (ret == 0)
 					goto out;
 				tmplog = ret;
-				last_isspace = 0;
 				break;
 
 			case LOG_FMT_CLIENTIP:  // %ci
@@ -2772,7 +2858,6 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
-				last_isspace = 0;
 				break;
 
 			case LOG_FMT_CLIENTPORT:  // %cp
@@ -2790,7 +2875,6 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
-				last_isspace = 0;
 				break;
 
 			case LOG_FMT_FRONTENDIP: // %fi
@@ -2803,7 +2887,6 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
-				last_isspace = 0;
 				break;
 
 			case  LOG_FMT_FRONTENDPORT: // %fp
@@ -2821,7 +2904,6 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
-				last_isspace = 0;
 				break;
 
 			case LOG_FMT_BACKENDIP:  // %bi
@@ -2833,7 +2915,6 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
-				last_isspace = 0;
 				break;
 
 			case LOG_FMT_BACKENDPORT:  // %bp
@@ -2845,7 +2926,6 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
-				last_isspace = 0;
 				break;
 
 			case LOG_FMT_SERVERIP: // %si
@@ -2857,7 +2937,6 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
-				last_isspace = 0;
 				break;
 
 			case LOG_FMT_SERVERPORT: // %sp
@@ -2869,7 +2948,6 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
-				last_isspace = 0;
 				break;
 
 			case LOG_FMT_DATE: // %t = accept date
@@ -2878,7 +2956,6 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
-				last_isspace = 0;
 				break;
 
 			case LOG_FMT_tr: // %tr = start of request date
@@ -2889,7 +2966,6 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
-				last_isspace = 0;
 				break;
 
 			case LOG_FMT_DATEGMT: // %T = accept date, GMT
@@ -2898,7 +2974,6 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
-				last_isspace = 0;
 				break;
 
 			case LOG_FMT_trg: // %trg = start of request date, GMT
@@ -2908,7 +2983,6 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
-				last_isspace = 0;
 				break;
 
 			case LOG_FMT_DATELOCAL: // %Tl = accept date, local
@@ -2917,7 +2991,6 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
-				last_isspace = 0;
 				break;
 
 			case LOG_FMT_trl: // %trl = start of request date, local
@@ -2927,7 +3000,6 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
-				last_isspace = 0;
 				break;
 
 			case LOG_FMT_TS: // %Ts
@@ -2935,14 +3007,12 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 					iret = snprintf(tmplog, dst + maxsize - tmplog, "%04X", (unsigned int)logs->accept_date.tv_sec);
 					if (iret < 0 || iret > dst + maxsize - tmplog)
 						goto out;
-					last_isspace = 0;
 					tmplog += iret;
 				} else {
 					ret = ltoa_o(logs->accept_date.tv_sec, tmplog, dst + maxsize - tmplog);
 					if (ret == NULL)
 						goto out;
 					tmplog = ret;
-					last_isspace = 0;
 				}
 			break;
 
@@ -2951,7 +3021,6 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 					iret = snprintf(tmplog, dst + maxsize - tmplog, "%02X",(unsigned int)logs->accept_date.tv_usec/1000);
 					if (iret < 0 || iret > dst + maxsize - tmplog)
 						goto out;
-					last_isspace = 0;
 					tmplog += iret;
 			} else {
 				if ((dst + maxsize - tmplog) < 4)
@@ -2961,7 +3030,6 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
-				last_isspace = 0;
 			}
 			break;
 
@@ -2971,13 +3039,11 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
-				last_isspace = 0;
 				break;
 
 			case LOG_FMT_FRONTEND_XPRT: // %ft
 				src = fe->id;
-				if (tmp->options & LOG_OPT_QUOTE)
-					LOGCHAR('"');
+				LOGQUOTE_START();
 				iret = strlcpy2(tmplog, src, dst + maxsize - tmplog);
 				if (iret == 0)
 					goto out;
@@ -2986,9 +3052,6 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 				/* sess->listener may be undefined if the session's owner is a health-check */
 				if (sess->listener && sess->listener->bind_conf->xprt->get_ssl_sock_ctx)
 					LOGCHAR('~');
-				if (tmp->options & LOG_OPT_QUOTE)
-					LOGCHAR('"');
-				last_isspace = 0;
 				break;
 #ifdef USE_OPENSSL
 			case LOG_FMT_SSL_CIPHER: // %sslc
@@ -3001,7 +3064,6 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
-				last_isspace = 0;
 				break;
 
 			case LOG_FMT_SSL_VERSION: // %sslv
@@ -3014,7 +3076,6 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
-				last_isspace = 0;
 				break;
 #endif
 			case LOG_FMT_BACKEND: // %b
@@ -3023,7 +3084,6 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
-				last_isspace = 0;
 				break;
 
 			case LOG_FMT_SERVER: // %s
@@ -3047,7 +3107,6 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
-				last_isspace = 0;
 				break;
 
 			case LOG_FMT_Th: // %Th = handshake time
@@ -3055,7 +3114,6 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
-				last_isspace = 0;
 				break;
 
 			case LOG_FMT_Ti: // %Ti = HTTP idle time
@@ -3063,7 +3121,6 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
-				last_isspace = 0;
 				break;
 
 			case LOG_FMT_TR: // %TR = HTTP request time
@@ -3072,7 +3129,6 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
-				last_isspace = 0;
 				break;
 
 			case LOG_FMT_TQ: // %Tq = Th + Ti + TR
@@ -3080,7 +3136,6 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
-				last_isspace = 0;
 				break;
 
 			case LOG_FMT_TW: // %Tw
@@ -3089,7 +3144,6 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
-				last_isspace = 0;
 				break;
 
 			case LOG_FMT_TC: // %Tc
@@ -3098,7 +3152,6 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
-				last_isspace = 0;
 				break;
 
 			case LOG_FMT_Tr: // %Tr
@@ -3107,7 +3160,6 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
-				last_isspace = 0;
 				break;
 
 			case LOG_FMT_TD: // %Td
@@ -3120,39 +3172,35 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
-				last_isspace = 0;
 				break;
 
 			case LOG_FMT_Ta:  // %Ta = active time = Tt - Th - Ti
 				if (!(fe->to_log & LW_BYTES))
-					LOGCHAR('+');
+					LOGMETACHAR('+');
 				ret = ltoa_o(logs->t_close - (logs->t_idle >= 0 ? logs->t_idle + logs->t_handshake : 0),
 					     tmplog, dst + maxsize - tmplog);
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
-				last_isspace = 0;
 				break;
 
 			case LOG_FMT_TT:  // %Tt = total time
 				if (!(fe->to_log & LW_BYTES))
-					LOGCHAR('+');
+					LOGMETACHAR('+');
 				ret = ltoa_o(logs->t_close, tmplog, dst + maxsize - tmplog);
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
-				last_isspace = 0;
 				break;
 
 			case LOG_FMT_TU:  // %Tu = total time seen by user = Tt - Ti
 				if (!(fe->to_log & LW_BYTES))
-					LOGCHAR('+');
+					LOGMETACHAR('+');
 				ret = ltoa_o(logs->t_close - (logs->t_idle >= 0 ? logs->t_idle : 0),
 					     tmplog, dst + maxsize - tmplog);
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
-				last_isspace = 0;
 				break;
 
 			case LOG_FMT_STATUS: // %ST
@@ -3160,17 +3208,15 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
-				last_isspace = 0;
 				break;
 
 			case LOG_FMT_BYTES: // %B
 				if (!(fe->to_log & LW_BYTES))
-					LOGCHAR('+');
+					LOGMETACHAR('+');
 				ret = lltoa(logs->bytes_out, tmplog, dst + maxsize - tmplog);
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
-				last_isspace = 0;
 				break;
 
 			case LOG_FMT_BYTES_UP: // %U
@@ -3178,7 +3224,6 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
-				last_isspace = 0;
 				break;
 
 			case LOG_FMT_CCLIENT: // %CC
@@ -3187,7 +3232,6 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
-				last_isspace = 0;
 				break;
 
 			case LOG_FMT_CSERVER: // %CS
@@ -3196,14 +3240,12 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
-				last_isspace = 0;
 				break;
 
 			case LOG_FMT_TERMSTATE: // %ts
 				LOGCHAR(sess_term_cond[(s_flags & SF_ERR_MASK) >> SF_ERR_SHIFT]);
 				LOGCHAR(sess_fin_state[(s_flags & SF_FINST_MASK) >> SF_FINST_SHIFT]);
 				*tmplog = '\0';
-				last_isspace = 0;
 				break;
 
 			case LOG_FMT_TERMSTATE_CK: // %tsc, same as TS with cookie state (for mode HTTP)
@@ -3211,7 +3253,6 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 				LOGCHAR(sess_fin_state[(s_flags & SF_FINST_MASK) >> SF_FINST_SHIFT]);
 				LOGCHAR((txn && (be->ck_opts & PR_CK_ANY)) ? sess_cookie[(txn->flags & TX_CK_MASK) >> TX_CK_SHIFT] : '-');
 				LOGCHAR((txn && (be->ck_opts & PR_CK_ANY)) ? sess_set_cookie[(txn->flags & TX_SCK_MASK) >> TX_SCK_SHIFT] : '-');
-				last_isspace = 0;
 				break;
 
 			case LOG_FMT_ACTCONN: // %ac
@@ -3219,7 +3260,6 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
-				last_isspace = 0;
 				break;
 
 			case LOG_FMT_FECONN:  // %fc
@@ -3227,7 +3267,6 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
-				last_isspace = 0;
 				break;
 
 			case LOG_FMT_BECONN:  // %bc
@@ -3235,7 +3274,6 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
-				last_isspace = 0;
 				break;
 
 			case LOG_FMT_SRVCONN:  // %sc
@@ -3257,17 +3295,15 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
-				last_isspace = 0;
 				break;
 
 			case LOG_FMT_RETRIES:  // %rc
 				if (s_flags & SF_REDISP)
-					LOGCHAR('+');
+					LOGMETACHAR('+');
 				ret = ltoa_o((s  ? s->conn_retries : 0), tmplog, dst + maxsize - tmplog);
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
-				last_isspace = 0;
 				break;
 
 			case LOG_FMT_SRVQUEUE: // %sq
@@ -3275,7 +3311,6 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
-				last_isspace = 0;
 				break;
 
 			case LOG_FMT_BCKQUEUE:  // %bq
@@ -3283,14 +3318,12 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
-				last_isspace = 0;
 				break;
 
 			case LOG_FMT_HDRREQUEST: // %hr
 				/* request header */
 				if (fe->nb_req_cap && s && s->req_cap) {
-					if (tmp->options & LOG_OPT_QUOTE)
-						LOGCHAR('"');
+					LOGQUOTE_START();
 					LOGCHAR('{');
 					for (hdr = 0; hdr < fe->nb_req_cap; hdr++) {
 						if (hdr)
@@ -3304,20 +3337,17 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 						}
 					}
 					LOGCHAR('}');
-					if (tmp->options & LOG_OPT_QUOTE)
-						LOGCHAR('"');
-					last_isspace = 0;
 				}
 				break;
 
 			case LOG_FMT_HDRREQUESTLIST: // %hrl
 				/* request header list */
 				if (fe->nb_req_cap && s && s->req_cap) {
+					LOG_STRARRAY_START();
 					for (hdr = 0; hdr < fe->nb_req_cap; hdr++) {
 						if (hdr > 0)
-							LOGCHAR(' ');
-						if (tmp->options & LOG_OPT_QUOTE)
-							LOGCHAR('"');
+							LOG_STRARRAY_NEXT();
+						LOGQUOTE_START();
 						if (s->req_cap[hdr] != NULL) {
 							ret = lf_encode_string(tmplog, dst + maxsize,
 							                       '#', hdr_encode_map, s->req_cap[hdr], tmp);
@@ -3326,10 +3356,12 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 							tmplog = ret;
 						} else if (!(tmp->options & LOG_OPT_QUOTE))
 							LOGCHAR('-');
-						if (tmp->options & LOG_OPT_QUOTE)
-							LOGCHAR('"');
-						last_isspace = 0;
+						/* Manually end quotation as we're emitting multiple
+						 * quoted texts at once
+						 */
+						LOGQUOTE_END();
 					}
+					LOG_STRARRAY_END();
 				}
 				break;
 
@@ -3337,8 +3369,7 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 			case LOG_FMT_HDRRESPONS: // %hs
 				/* response header */
 				if (fe->nb_rsp_cap && s && s->res_cap) {
-					if (tmp->options & LOG_OPT_QUOTE)
-						LOGCHAR('"');
+					LOGQUOTE_START();
 					LOGCHAR('{');
 					for (hdr = 0; hdr < fe->nb_rsp_cap; hdr++) {
 						if (hdr)
@@ -3352,20 +3383,17 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 						}
 					}
 					LOGCHAR('}');
-					last_isspace = 0;
-					if (tmp->options & LOG_OPT_QUOTE)
-						LOGCHAR('"');
 				}
 				break;
 
 			case LOG_FMT_HDRRESPONSLIST: // %hsl
 				/* response header list */
 				if (fe->nb_rsp_cap && s && s->res_cap) {
+					LOG_STRARRAY_START();
 					for (hdr = 0; hdr < fe->nb_rsp_cap; hdr++) {
 						if (hdr > 0)
-							LOGCHAR(' ');
-						if (tmp->options & LOG_OPT_QUOTE)
-							LOGCHAR('"');
+							LOG_STRARRAY_NEXT();
+						LOGQUOTE_START();
 						if (s->res_cap[hdr] != NULL) {
 							ret = lf_encode_string(tmplog, dst + maxsize,
 							                       '#', hdr_encode_map, s->res_cap[hdr], tmp);
@@ -3374,33 +3402,30 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 							tmplog = ret;
 						} else if (!(tmp->options & LOG_OPT_QUOTE))
 							LOGCHAR('-');
-						if (tmp->options & LOG_OPT_QUOTE)
-							LOGCHAR('"');
-						last_isspace = 0;
+						/* Manually end quotation as we're emitting multiple
+						 * quoted texts at once
+						 */
+						LOGQUOTE_END();
 					}
+					LOG_STRARRAY_END();
 				}
 				break;
 
 			case LOG_FMT_REQ: // %r
 				/* Request */
-				if (tmp->options & LOG_OPT_QUOTE)
-					LOGCHAR('"');
+				LOGQUOTE_START();
 				uri = txn && txn->uri ? txn->uri : "<BADREQ>";
 				ret = lf_encode_string(tmplog, dst + maxsize,
 				                       '#', url_encode_map, uri, tmp);
 				if (ret == NULL || *ret != '\0')
 					goto out;
 				tmplog = ret;
-				if (tmp->options & LOG_OPT_QUOTE)
-					LOGCHAR('"');
-				last_isspace = 0;
 				break;
 
 			case LOG_FMT_HTTP_PATH: // %HP
 				uri = txn && txn->uri ? txn->uri : "<BADREQ>";
 
-				if (tmp->options & LOG_OPT_QUOTE)
-					LOGCHAR('"');
+				LOGQUOTE_START();
 
 				end = uri + strlen(uri);
 				// look for the first whitespace character
@@ -3430,17 +3455,13 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 					goto out;
 
 				tmplog = ret;
-				if (tmp->options & LOG_OPT_QUOTE)
-					LOGCHAR('"');
 
-				last_isspace = 0;
 				break;
 
 			case LOG_FMT_HTTP_PATH_ONLY: // %HPO
 				uri = txn && txn->uri ? txn->uri : "<BADREQ>";
 
-				if (tmp->options & LOG_OPT_QUOTE)
-					LOGCHAR('"');
+				LOGQUOTE_START();
 
 				end = uri + strlen(uri);
 
@@ -3476,15 +3497,11 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 					goto out;
 
 				tmplog = ret;
-				if (tmp->options & LOG_OPT_QUOTE)
-					LOGCHAR('"');
 
-				last_isspace = 0;
 				break;
 
 			case LOG_FMT_HTTP_QUERY: // %HQ
-				if (tmp->options & LOG_OPT_QUOTE)
-					LOGCHAR('"');
+				LOGQUOTE_START();
 
 				if (!txn || !txn->uri) {
 					chunk.area = "<BADREQ>";
@@ -3510,17 +3527,13 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 					goto out;
 
 				tmplog = ret;
-				if (tmp->options & LOG_OPT_QUOTE)
-					LOGCHAR('"');
 
-				last_isspace = 0;
 				break;
 
 			case LOG_FMT_HTTP_URI: // %HU
 				uri = txn && txn->uri ? txn->uri : "<BADREQ>";
 
-				if (tmp->options & LOG_OPT_QUOTE)
-					LOGCHAR('"');
+				LOGQUOTE_START();
 
 				end = uri + strlen(uri);
 				// look for the first whitespace character
@@ -3550,16 +3563,12 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 					goto out;
 
 				tmplog = ret;
-				if (tmp->options & LOG_OPT_QUOTE)
-					LOGCHAR('"');
 
-				last_isspace = 0;
 				break;
 
 			case LOG_FMT_HTTP_METHOD: // %HM
 				uri = txn && txn->uri ? txn->uri : "<BADREQ>";
-				if (tmp->options & LOG_OPT_QUOTE)
-					LOGCHAR('"');
+				LOGQUOTE_START();
 
 				end = uri + strlen(uri);
 				// look for the first whitespace character
@@ -3580,16 +3589,12 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 					goto out;
 
 				tmplog = ret;
-				if (tmp->options & LOG_OPT_QUOTE)
-					LOGCHAR('"');
 
-				last_isspace = 0;
 				break;
 
 			case LOG_FMT_HTTP_VERSION: // %HV
 				uri = txn && txn->uri ? txn->uri : "<BADREQ>";
-				if (tmp->options & LOG_OPT_QUOTE)
-					LOGCHAR('"');
+				LOGQUOTE_START();
 
 				end = uri + strlen(uri);
 				// look for the first whitespace character
@@ -3625,10 +3630,7 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 					goto out;
 
 				tmplog = ret;
-				if (tmp->options & LOG_OPT_QUOTE)
-					LOGCHAR('"');
 
-				last_isspace = 0;
 				break;
 
 			case LOG_FMT_COUNTER: // %rt
@@ -3636,14 +3638,12 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 					iret = snprintf(tmplog, dst + maxsize - tmplog, "%04X", uniq_id);
 					if (iret < 0 || iret > dst + maxsize - tmplog)
 						goto out;
-					last_isspace = 0;
 					tmplog += iret;
 				} else {
 					ret = ltoa_o(uniq_id, tmplog, dst + maxsize - tmplog);
 					if (ret == NULL)
 						goto out;
 					tmplog = ret;
-					last_isspace = 0;
 				}
 				break;
 
@@ -3652,14 +3652,12 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 					iret = snprintf(tmplog, dst + maxsize - tmplog, "%04X", fe->log_count);
 					if (iret < 0 || iret > dst + maxsize - tmplog)
 						goto out;
-					last_isspace = 0;
 					tmplog += iret;
 				} else {
 					ret = ultoa_o(fe->log_count, tmplog, dst + maxsize - tmplog);
 					if (ret == NULL)
 						goto out;
 					tmplog = ret;
-					last_isspace = 0;
 				}
 				break;
 
@@ -3669,7 +3667,6 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
-				last_isspace = 0;
 				break;
 
 			case LOG_FMT_PID: // %pid
@@ -3677,14 +3674,12 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 					iret = snprintf(tmplog, dst + maxsize - tmplog, "%04X", pid);
 					if (iret < 0 || iret > dst + maxsize - tmplog)
 						goto out;
-					last_isspace = 0;
 					tmplog += iret;
 				} else {
 					ret = ltoa_o(pid, tmplog, dst + maxsize - tmplog);
 					if (ret == NULL)
 						goto out;
 					tmplog = ret;
-					last_isspace = 0;
 				}
 				break;
 
@@ -3697,10 +3692,16 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
-				last_isspace = 0;
 				break;
 
 		}
+		if (tmp->type != LOG_FMT_SEPARATOR)
+			last_isspace = 0; // not a separator, hence not a space
+
+		/* if quotation was started for the current node data, we need
+		 * to finish the quote
+		 */
+		LOGQUOTE_END();
 	}
 
 out:
