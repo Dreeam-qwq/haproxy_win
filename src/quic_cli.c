@@ -3,17 +3,28 @@
 #include <haproxy/applet-t.h>
 #include <haproxy/cli.h>
 #include <haproxy/list.h>
-#include <haproxy/tools.h>
+#include <haproxy/mux_quic.h>
 #include <haproxy/quic_conn-t.h>
 #include <haproxy/quic_tp.h>
+#include <haproxy/tools.h>
 
 /* incremented by each "show quic". */
 unsigned int qc_epoch = 0;
 
 enum quic_dump_format {
+	QUIC_DUMP_FMT_DEFAULT, /* value used if not explicitely specified. */
+
 	QUIC_DUMP_FMT_ONELINE,
-	QUIC_DUMP_FMT_FULL,
+	QUIC_DUMP_FMT_CUST,
 };
+
+#define QUIC_DUMP_FLD_TP    0x0001
+#define QUIC_DUMP_FLD_SOCK  0x0002
+#define QUIC_DUMP_FLD_PKTNS 0x0004
+#define QUIC_DUMP_FLD_CC    0x0008
+#define QUIC_DUMP_FLD_MUX   0x0010
+/* Do not forget to update FLD_MASK when adding a new field. */
+#define QUIC_DUMP_FLD_MASK  0x001f
 
 /* appctx context used by "show quic" command */
 struct show_quic_ctx {
@@ -22,9 +33,23 @@ struct show_quic_ctx {
 	unsigned int thr;
 	int flags;
 	enum quic_dump_format format;
+	void *ptr;
+	int fields;
 };
 
 #define QC_CLI_FL_SHOW_ALL 0x1 /* show closing/draining connections */
+
+/* Returns the output format for show quic. If specified explicitely use it as
+ * set. Else format depends if filtering on a single connection instance. If
+ * true, full format is preferred else oneline.
+ */
+static enum quic_dump_format cli_show_quic_format(const struct show_quic_ctx *ctx)
+{
+	if (ctx->format == QUIC_DUMP_FMT_DEFAULT)
+		return ctx->ptr ? QUIC_DUMP_FMT_CUST : QUIC_DUMP_FMT_ONELINE;
+	else
+		return ctx->format;
+}
 
 static int cli_parse_show_quic(char **args, char *payload, struct appctx *appctx, void *private)
 {
@@ -37,20 +62,87 @@ static int cli_parse_show_quic(char **args, char *payload, struct appctx *appctx
 	ctx->epoch = _HA_ATOMIC_FETCH_ADD(&qc_epoch, 1);
 	ctx->thr = 0;
 	ctx->flags = 0;
-	ctx->format = QUIC_DUMP_FMT_ONELINE;
+	ctx->format = QUIC_DUMP_FMT_DEFAULT;
+	ctx->ptr = 0;
+	ctx->fields = 0;
 
 	if (strcmp(args[argc], "oneline") == 0) {
-		/* format already used as default value */
+		ctx->format = QUIC_DUMP_FMT_ONELINE;
 		++argc;
 	}
 	else if (strcmp(args[argc], "full") == 0) {
-		ctx->format = QUIC_DUMP_FMT_FULL;
+		ctx->format = QUIC_DUMP_FMT_CUST;
+		ctx->fields = QUIC_DUMP_FLD_MASK;
 		++argc;
 	}
+	else if (*args[argc]) {
+		struct ist istarg = ist(args[argc]);
+		struct ist field = istsplit(&istarg, ',');
 
-	while (*args[argc]) {
-		if (strcmp(args[argc], "all") == 0)
+		do {
+			if (isteq(field, ist("tp"))) {
+				ctx->fields |= QUIC_DUMP_FLD_TP;
+			}
+			else if (isteq(field, ist("sock"))) {
+				ctx->fields |= QUIC_DUMP_FLD_SOCK;
+			}
+			else if (isteq(field, ist("pktns"))) {
+				ctx->fields |= QUIC_DUMP_FLD_PKTNS;
+			}
+			else if (isteq(field, ist("cc"))) {
+				ctx->fields |= QUIC_DUMP_FLD_CC;
+			}
+			else if (isteq(field, ist("mux"))) {
+				ctx->fields |= QUIC_DUMP_FLD_MUX;
+			}
+			else {
+				/* Current argument is comma-separated so it is
+				 * interpreted as a field list but an unknown
+				 * field name has been specified.
+				 */
+				if (istarg.len || ctx->fields) {
+					cli_err(appctx, "Invalid field.\n");
+					return 1;
+				}
+
+				break;
+			}
+
+			field = istsplit(&istarg, ',');
+		} while (field.len);
+
+		/* At least one valid field specified, select the associated
+		 * format. Else parse the current argument as a filter.
+		 */
+		if (ctx->fields) {
+			ctx->format = QUIC_DUMP_FMT_CUST;
+			++argc;
+		}
+	}
+
+	if (*args[argc]) {
+		struct ist istarg = ist(args[argc]);
+
+		if (istmatchi(istarg, ist("0x"))) {
+			char *nptr;
+			ctx->ptr = (void *)strtol(args[argc], &nptr, 16);
+			if (*nptr) {
+				cli_err(appctx, "Invalid quic_conn pointer.\n");
+				return 1;
+			}
+
+			if (!ctx->fields)
+				ctx->fields = QUIC_DUMP_FLD_MASK;
+
+			++argc;
+		}
+		else if (istmatch(istarg, ist("all"))) {
 			ctx->flags |= QC_CLI_FL_SHOW_ALL;
+		}
+		else {
+			cli_err(appctx, "Invalid argument.\n");
+			return 1;
+		}
 
 		++argc;
 	}
@@ -115,10 +207,8 @@ static void dump_quic_oneline(struct show_quic_ctx *ctx, struct quic_conn *qc)
 static void dump_quic_full(struct show_quic_ctx *ctx, struct quic_conn *qc)
 {
 	struct quic_pktns *pktns;
-	struct eb64_node *node;
-	struct qc_stream_desc *stream;
 	char bufaddr[INET6_ADDRSTRLEN], bufport[6];
-	int expire, i, addnl;
+	int expire, addnl;
 	unsigned char cid_len;
 
 	addnl = 0;
@@ -137,12 +227,14 @@ static void dump_quic_full(struct show_quic_ctx *ctx, struct quic_conn *qc)
 
 	chunk_appendf(&trash, "\n");
 
-	chunk_appendf(&trash, "  loc. TPs:");
-	quic_transport_params_dump(&trash, qc, &qc->rx.params);
-	chunk_appendf(&trash, "\n");
-	chunk_appendf(&trash, "  rem. TPs:");
-	quic_transport_params_dump(&trash, qc, &qc->tx.params);
-	chunk_appendf(&trash, "\n");
+	if (ctx->fields & QUIC_DUMP_FLD_TP) {
+		chunk_appendf(&trash, "  loc. TPs:");
+		quic_transport_params_dump(&trash, qc, &qc->rx.params);
+		chunk_appendf(&trash, "\n");
+		chunk_appendf(&trash, "  rem. TPs:");
+		quic_transport_params_dump(&trash, qc, &qc->tx.params);
+		chunk_appendf(&trash, "\n");
+	}
 
 	/* Connection state */
 	if (qc->flags & QUIC_FL_CONN_CLOSING)
@@ -170,44 +262,50 @@ static void dump_quic_full(struct show_quic_ctx *ctx, struct quic_conn *qc)
 	chunk_appendf(&trash, "\n");
 
 	/* Socket */
-	chunk_appendf(&trash, "  fd=%d", qc->fd);
-	if (qc->local_addr.ss_family == AF_INET ||
-	    qc->local_addr.ss_family == AF_INET6) {
-		addr_to_str(&qc->local_addr, bufaddr, sizeof(bufaddr));
-		port_to_str(&qc->local_addr, bufport, sizeof(bufport));
-		chunk_appendf(&trash, "               local_addr=%s:%s", bufaddr, bufport);
+	if (ctx->fields & QUIC_DUMP_FLD_SOCK) {
+		chunk_appendf(&trash, "  fd=%d", qc->fd);
+		if (qc->local_addr.ss_family == AF_INET ||
+		    qc->local_addr.ss_family == AF_INET6) {
+			addr_to_str(&qc->local_addr, bufaddr, sizeof(bufaddr));
+			port_to_str(&qc->local_addr, bufport, sizeof(bufport));
+			chunk_appendf(&trash, "               local_addr=%s:%s", bufaddr, bufport);
 
-		addr_to_str(&qc->peer_addr, bufaddr, sizeof(bufaddr));
-		port_to_str(&qc->peer_addr, bufport, sizeof(bufport));
-		chunk_appendf(&trash, " foreign_addr=%s:%s", bufaddr, bufport);
+			addr_to_str(&qc->peer_addr, bufaddr, sizeof(bufaddr));
+			port_to_str(&qc->peer_addr, bufport, sizeof(bufport));
+			chunk_appendf(&trash, " foreign_addr=%s:%s", bufaddr, bufport);
+		}
+
+		chunk_appendf(&trash, "\n");
 	}
-
-	chunk_appendf(&trash, "\n");
 
 	/* Packet number spaces information */
-	pktns = qc->ipktns;
-	if (pktns) {
-		chunk_appendf(&trash, "  [initl]             rx.ackrng=%-6zu tx.inflight=%-6zu",
-		              pktns->rx.arngs.sz, pktns->tx.in_flight);
+	if (ctx->fields & QUIC_DUMP_FLD_PKTNS) {
+		pktns = qc->ipktns;
+		if (pktns) {
+			chunk_appendf(&trash, "  [initl] rx.ackrng=%-6zu tx.inflight=%-6zu\n",
+			              pktns->rx.arngs.sz, pktns->tx.in_flight);
+		}
+
+		pktns = qc->hpktns;
+		if (pktns) {
+			chunk_appendf(&trash, "  [hndshk] rx.ackrng=%-6zu tx.inflight=%-6zu\n",
+			              pktns->rx.arngs.sz, pktns->tx.in_flight);
+		}
+
+		pktns = qc->apktns;
+		if (pktns) {
+			chunk_appendf(&trash, "  [01rtt] rx.ackrng=%-6zu tx.inflight=%-6zu\n",
+			              pktns->rx.arngs.sz, pktns->tx.in_flight);
+		}
 	}
 
-	pktns = qc->hpktns;
-	if (pktns) {
-		chunk_appendf(&trash, "           [hndshk] rx.ackrng=%-6zu tx.inflight=%-6zu\n",
-		              pktns->rx.arngs.sz, pktns->tx.in_flight);
+	if (ctx->fields & QUIC_DUMP_FLD_CC) {
+		chunk_appendf(&trash, "  srtt=%-4u rttvar=%-4u rttmin=%-4u ptoc=%-4u cwnd=%-6llu"
+		                      " mcwnd=%-6llu sentpkts=%-6llu lostpkts=%-6llu reorderedpkts=%-6llu\n",
+		              qc->path->loss.srtt, qc->path->loss.rtt_var,
+		              qc->path->loss.rtt_min, qc->path->loss.pto_count, (ullong)qc->path->cwnd,
+		              (ullong)qc->path->mcwnd, (ullong)qc->cntrs.sent_pkt, (ullong)qc->path->loss.nb_lost_pkt, (ullong)qc->path->loss.nb_reordered_pkt);
 	}
-
-	pktns = qc->apktns;
-	if (pktns) {
-		chunk_appendf(&trash, "  [01rtt]             rx.ackrng=%-6zu tx.inflight=%-6zu\n",
-		              pktns->rx.arngs.sz, pktns->tx.in_flight);
-	}
-
-	chunk_appendf(&trash, "  srtt=%-4u rttvar=%-4u rttmin=%-4u ptoc=%-4u cwnd=%-6llu"
-	                      " mcwnd=%-6llu sentpkts=%-6llu lostpkts=%-6llu reorderedpkts=%-6llu\n",
-	              qc->path->loss.srtt, qc->path->loss.rtt_var,
-	              qc->path->loss.rtt_min, qc->path->loss.pto_count, (ullong)qc->path->cwnd,
-	              (ullong)qc->path->mcwnd, (ullong)qc->cntrs.sent_pkt, (ullong)qc->path->loss.nb_lost_pkt, (ullong)qc->path->loss.nb_reordered_pkt);
 
 	if (qc->cntrs.dropped_pkt) {
 		chunk_appendf(&trash, " droppkts=%-6llu", qc->cntrs.dropped_pkt);
@@ -256,23 +354,8 @@ static void dump_quic_full(struct show_quic_ctx *ctx, struct quic_conn *qc)
 	if (addnl)
 		chunk_appendf(&trash, "\n");
 
-	/* Streams */
-	node = eb64_first(&qc->streams_by_id);
-	i = 0;
-	while (node) {
-		stream = eb64_entry(node, struct qc_stream_desc, by_id);
-		node = eb64_next(node);
-
-		chunk_appendf(&trash, "  | stream=%-8llu", (unsigned long long)stream->by_id.key);
-		chunk_appendf(&trash, " off=%-8llu ack=%-8llu",
-		              (unsigned long long)stream->buf_offset,
-		              (unsigned long long)stream->ack_offset);
-
-		if (!(++i % 3)) {
-			chunk_appendf(&trash, "\n");
-			i = 0;
-		}
-	}
+	if (ctx->fields & QUIC_DUMP_FLD_MUX && qc->mux_state == QC_MUX_READY)
+		qcc_show_quic(qc->qcc);
 
 	chunk_appendf(&trash, "\n");
 }
@@ -309,7 +392,7 @@ static int cli_io_handler_dump_quic(struct appctx *appctx)
 		ctx->bref.ref = ha_thread_ctx[ctx->thr].quic_conns.n;
 
 		/* Print legend for oneline format. */
-		if (ctx->format == QUIC_DUMP_FMT_ONELINE) {
+		if (cli_show_quic_format(ctx) == QUIC_DUMP_FMT_ONELINE) {
 			chunk_appendf(&trash, "# conn/frontend                     state   "
 				      "in_flight infl_p lost_p         "
 				      "Local Address           Foreign Address      "
@@ -322,11 +405,12 @@ static int cli_io_handler_dump_quic(struct appctx *appctx)
 		int done = 0;
 
 		if (ctx->bref.ref == &ha_thread_ctx[ctx->thr].quic_conns) {
-			/* If closing connections requested through "all", move
-			 * to quic_conns_clo list after browsing quic_conns.
-			 * Else move directly to the next quic_conns thread.
+			/* If closing connections requested through "all" or a
+			 * specific connection is filtered, move to
+			 * quic_conns_clo list after browsing quic_conns. Else
+			 * move directly to the next quic_conns thread.
 			 */
-			if (ctx->flags & QC_CLI_FL_SHOW_ALL) {
+			if (ctx->flags & QC_CLI_FL_SHOW_ALL || ctx->ptr) {
 				ctx->bref.ref = ha_thread_ctx[ctx->thr].quic_conns_clo.n;
 				continue;
 			}
@@ -344,6 +428,10 @@ static int cli_io_handler_dump_quic(struct appctx *appctx)
 			qc = LIST_ELEM(ctx->bref.ref, struct quic_conn *, el_th_ctx);
 			if ((int)(qc->qc_epoch - ctx->epoch) > 0)
 				done = 1;
+
+			/* Skip to next element if filter on a different connection. */
+			if (ctx->ptr && ctx->ptr != qc)
+				done = 1;
 		}
 
 		if (done) {
@@ -355,13 +443,17 @@ static int cli_io_handler_dump_quic(struct appctx *appctx)
 			continue;
 		}
 
-		switch (ctx->format) {
-		case QUIC_DUMP_FMT_FULL:
+		switch (cli_show_quic_format(ctx)) {
+		case QUIC_DUMP_FMT_CUST:
 			dump_quic_full(ctx, qc);
 			break;
 		case QUIC_DUMP_FMT_ONELINE:
 			dump_quic_oneline(ctx, qc);
 			break;
+
+		case QUIC_DUMP_FMT_DEFAULT:
+			/* An explicit format must be returned by cli_show_quic_format(). */
+			ABORT_NOW();
 		}
 
 		if (applet_putchk(appctx, &trash) == -1) {
@@ -371,6 +463,10 @@ static int cli_io_handler_dump_quic(struct appctx *appctx)
 		}
 
 		ctx->bref.ref = qc->el_th_ctx.n;
+
+		/* If filtered connection displayed, show quic can be stopped early. */
+		if (ctx->ptr)
+			goto done;
 	}
 
  done:
@@ -395,7 +491,7 @@ static void cli_release_show_quic(struct appctx *appctx)
 }
 
 static struct cli_kw_list cli_kws = {{ }, {
-	{ { "show", "quic", NULL }, "show quic [oneline|full] [all]          : display quic connections status", cli_parse_show_quic, cli_io_handler_dump_quic, cli_release_show_quic },
+	{ { "show", "quic", NULL }, "show quic [<format>] [<filter>]         : display quic connections status", cli_parse_show_quic, cli_io_handler_dump_quic, cli_release_show_quic },
 	{{},}
 }};
 

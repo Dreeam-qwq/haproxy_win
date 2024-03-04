@@ -335,6 +335,8 @@ DECLARE_STATIC_POOL(pool_head_h1s, "h1s", sizeof(struct h1s));
 static int h1_recv(struct h1c *h1c);
 static int h1_send(struct h1c *h1c);
 static int h1_process(struct h1c *h1c);
+static void h1_release(struct h1c *h1c);
+
 /* h1_io_cb is exported to see it resolved in "show fd" */
 struct task *h1_io_cb(struct task *t, void *ctx, unsigned int state);
 struct task *h1_timeout_task(struct task *t, void *context, unsigned int state);
@@ -554,11 +556,11 @@ static inline void h1_release_buf(struct h1c *h1c, struct buffer *bptr)
 }
 
 /* Returns 1 if the H1 connection is alive (IDLE, EMBRYONIC, RUNNING or
- * RUNNING). Ortherwise 0 is returned.
+ * DRAINING). Ortherwise 0 is returned.
  */
 static inline int h1_is_alive(const struct h1c *h1c)
 {
-	return (h1c->state <= H1_CS_RUNNING);
+	return (h1c->state <= H1_CS_DRAINING);
 }
 
 /* Switch the H1 connection to CLOSING or CLOSED mode, depending on the output
@@ -925,6 +927,157 @@ static void h1s_destroy(struct h1s *h1s)
 		pool_free(pool_head_h1s, h1s);
 	}
 }
+
+
+/* Check if shutdown performed of an an H1S must lead to a connection shutdown
+ * of if it can be kept alive. It returns 1 if the connection must be shut down
+ * and 0 it if can be kept alive.
+ */
+static int h1s_must_shut_conn(struct h1s *h1s)
+{
+	struct h1c *h1c = h1s->h1c;
+	int ret;
+
+	TRACE_ENTER(H1_EV_STRM_SHUT, h1c->conn, h1s);
+
+	if (se_fl_test(h1s->sd, SE_FL_KILL_CONN)) {
+		TRACE_STATE("stream wants to kill the connection", H1_EV_STRM_SHUT, h1c->conn, h1s);
+		ret = 1;
+	}
+	else if (h1c->state == H1_CS_CLOSING || (h1c->flags & (H1C_F_EOS|H1C_F_ERR_PENDING|H1C_F_ERROR))) {
+		TRACE_STATE("shutdown on connection (EOS || CLOSING || ERROR)", H1_EV_STRM_SHUT, h1c->conn, h1s);
+		ret = 1;
+	}
+	else if (h1c->state == H1_CS_UPGRADING) {
+		TRACE_STATE("keep connection alive (UPGRADING)", H1_EV_STRM_SHUT, h1c->conn, h1s);
+		ret = 0;
+	}
+	else if (!(h1c->flags & H1C_F_IS_BACK) && h1s->req.state != H1_MSG_DONE && h1s->res.state == H1_MSG_DONE) {
+		TRACE_STATE("defer shutdown to drain request first", H1_EV_STRM_SHUT, h1c->conn, h1s);
+		ret = 0;
+	}
+	else if (((h1s->flags & H1S_F_WANT_KAL) && h1s->req.state == H1_MSG_DONE && h1s->res.state == H1_MSG_DONE)) {
+		TRACE_STATE("keep connection alive (want_kal)", H1_EV_STRM_SHUT, h1c->conn, h1s);
+		ret = 0;
+	}
+	else {
+		/* The default case, do the shutdown */
+		ret = 1;
+	}
+
+	TRACE_LEAVE(H1_EV_STRM_SHUT, h1c->conn, h1s);
+	return ret;
+}
+
+/* Really detach the H1S. Most of time of it called from h1_detach() when the
+ * stream is detached from the connection. But if the request message must be
+ * drained first, the detach is deferred.
+ */
+static void h1s_finish_detach(struct h1s *h1s)
+{
+	struct h1c *h1c;
+	struct session *sess;
+	int is_not_first;
+
+	TRACE_ENTER(H1_EV_STRM_END, h1s ? h1s->h1c->conn : NULL, h1s);
+
+	sess = h1s->sess;
+	h1c = h1s->h1c;
+
+	sess->accept_date = date;
+	sess->accept_ts   = now_ns;
+	sess->t_handshake = 0;
+	sess->t_idle      = -1;
+
+	is_not_first = h1s->flags & H1S_F_NOT_FIRST;
+	h1s_destroy(h1s);
+
+	if (h1c->state == H1_CS_IDLE && (h1c->flags & H1C_F_IS_BACK)) {
+		/* this connection may be killed at any moment, we want it to
+		 * die "cleanly" (i.e. only an RST).
+		 */
+		h1c->flags |= H1C_F_SILENT_SHUT;
+
+		/* If there are any excess server data in the input buffer,
+		 * release it and close the connection ASAP (some data may
+		 * remain in the output buffer). This happens if a server sends
+		 * invalid responses. So in such case, we don't want to reuse
+		 * the connection
+		 */
+		if (b_data(&h1c->ibuf)) {
+			h1_release_buf(h1c, &h1c->ibuf);
+			h1_close(h1c);
+			TRACE_DEVEL("remaining data on detach, kill connection", H1_EV_STRM_END|H1_EV_H1C_END);
+			goto release;
+		}
+
+		if (h1c->conn->flags & CO_FL_PRIVATE) {
+			/* Add the connection in the session server list, if not already done */
+			if (!session_add_conn(sess, h1c->conn, h1c->conn->target)) {
+				h1c->conn->owner = NULL;
+				h1c->conn->mux->destroy(h1c);
+				goto end;
+			}
+			/* Always idle at this step */
+			if (session_check_idle_conn(sess, h1c->conn)) {
+				/* The connection got destroyed, let's leave */
+				TRACE_DEVEL("outgoing connection killed", H1_EV_STRM_END|H1_EV_H1C_END);
+				goto end;
+			}
+		}
+		else {
+			if (h1c->conn->owner == sess)
+				h1c->conn->owner = NULL;
+
+			/* mark that the tasklet may lose its context to another thread and
+			 * that the handler needs to check it under the idle conns lock.
+			 */
+			HA_ATOMIC_OR(&h1c->wait_event.tasklet->state, TASK_F_USR1);
+			h1c->conn->xprt->subscribe(h1c->conn, h1c->conn->xprt_ctx, SUB_RETRY_RECV, &h1c->wait_event);
+			xprt_set_idle(h1c->conn, h1c->conn->xprt, h1c->conn->xprt_ctx);
+
+			if (!srv_add_to_idle_list(objt_server(h1c->conn->target), h1c->conn, is_not_first)) {
+				/* The server doesn't want it, let's kill the connection right away */
+				h1c->conn->mux->destroy(h1c);
+				TRACE_DEVEL("outgoing connection killed", H1_EV_STRM_END|H1_EV_H1C_END);
+				goto end;
+			}
+			/* At this point, the connection has been added to the
+			 * server idle list, so another thread may already have
+			 * hijacked it, so we can't do anything with it.
+			 */
+			return;
+		}
+	}
+
+  release:
+	/* We don't want to close right now unless the connection is in error or shut down for writes */
+	if ((h1c->flags & H1C_F_ERROR) ||
+	    (h1c->state == H1_CS_CLOSED) ||
+	    (h1c->state == H1_CS_CLOSING && !b_data(&h1c->obuf)) ||
+	    !h1c->conn->owner) {
+		TRACE_DEVEL("killing dead connection", H1_EV_STRM_END, h1c->conn);
+		h1_release(h1c);
+	}
+	else {
+		if (h1c->state == H1_CS_IDLE) {
+			/* If we have a new request, process it immediately or
+			 * subscribe for reads waiting for new data
+			 */
+			if (unlikely(b_data(&h1c->ibuf))) {
+				if (h1_process(h1c) == -1)
+					goto end;
+			}
+			else
+				h1c->conn->xprt->subscribe(h1c->conn, h1c->conn->xprt_ctx, SUB_RETRY_RECV, &h1c->wait_event);
+		}
+		h1_set_idle_expiration(h1c);
+		h1_refresh_timeout(h1c);
+	}
+  end:
+	TRACE_LEAVE(H1_EV_STRM_END);
+}
+
 
 /*
  * Initialize the mux once it's attached. It is expected that conn->ctx points
@@ -2375,13 +2528,7 @@ static size_t h1_make_eoh(struct h1s *h1s, struct h1m *h1m, struct htx *htx, siz
 
 	/* Deal with "Connection" header */
 	if (!(h1s->flags & H1S_F_HAVE_O_CONN)) {
-		if ((htx->flags & HTX_FL_PROXY_RESP) && h1s->req.state != H1_MSG_DONE) {
-			/* If the reply comes from haproxy while the request is
-			 * not finished, we force the connection close. */
-			h1s->flags = (h1s->flags & ~H1S_F_WANT_MSK) | H1S_F_WANT_CLO;
-			TRACE_STATE("force close mode (resp)", H1_EV_TX_DATA|H1_EV_TX_HDRS, h1s->h1c->conn, h1s);
-		}
-		else if ((h1m->flags & (H1_MF_XFER_ENC|H1_MF_CLEN)) == (H1_MF_XFER_ENC|H1_MF_CLEN)) {
+		if ((h1m->flags & (H1_MF_XFER_ENC|H1_MF_CLEN)) == (H1_MF_XFER_ENC|H1_MF_CLEN)) {
 			/* T-E + C-L: force close */
 			h1s->flags = (h1s->flags & ~H1S_F_WANT_MSK) | H1S_F_WANT_CLO;
 			h1m->flags &= ~H1_MF_CLEN;
@@ -3336,6 +3483,11 @@ static int h1_handle_internal_err(struct h1c *h1c)
 	struct session *sess = h1c->conn->owner;
 	int ret = 0;
 
+	if (h1c->state == H1_CS_DRAINING) {
+		h1c->flags = (h1c->flags & ~H1C_F_WAIT_NEXT_REQ) | H1C_F_ABRTED;
+		h1s_destroy(h1c->h1s);
+		goto end;
+	}
 	session_inc_http_req_ctr(sess);
 	proxy_inc_fe_req_ctr(sess->listener, sess->fe, 1);
 	_HA_ATOMIC_INC(&sess->fe->fe_counters.p.http.rsp[5]);
@@ -3346,6 +3498,7 @@ static int h1_handle_internal_err(struct h1c *h1c)
 	h1c->errcode = 500;
 	ret = h1_send_error(h1c);
 	sess_log(sess);
+  end:
 	return ret;
 }
 
@@ -3359,6 +3512,11 @@ static int h1_handle_parsing_error(struct h1c *h1c)
 	struct session *sess = h1c->conn->owner;
 	int ret = 0;
 
+	if (h1c->state == H1_CS_DRAINING) {
+		h1c->flags = (h1c->flags & ~H1C_F_WAIT_NEXT_REQ) | H1C_F_ABRTED;
+		h1s_destroy(h1c->h1s);
+		goto end;
+	}
 	if (!b_data(&h1c->ibuf) && ((h1c->flags & H1C_F_WAIT_NEXT_REQ) || (sess->fe->options & PR_O_IGNORE_PRB))) {
 		h1c->flags = (h1c->flags & ~H1C_F_WAIT_NEXT_REQ) | H1C_F_ABRTED;
 		h1_close(h1c);
@@ -3392,6 +3550,11 @@ static int h1_handle_not_impl_err(struct h1c *h1c)
 	struct session *sess = h1c->conn->owner;
 	int ret = 0;
 
+	if (h1c->state == H1_CS_DRAINING) {
+		h1c->flags = (h1c->flags & ~H1C_F_WAIT_NEXT_REQ) | H1C_F_ABRTED;
+		h1s_destroy(h1c->h1s);
+		goto end;
+	}
 	if (!b_data(&h1c->ibuf) && ((h1c->flags & H1C_F_WAIT_NEXT_REQ) || (sess->fe->options & PR_O_IGNORE_PRB))) {
 		h1c->flags = (h1c->flags & ~H1C_F_WAIT_NEXT_REQ) | H1C_F_ABRTED;
 		h1_close(h1c);
@@ -3422,6 +3585,11 @@ static int h1_handle_req_tout(struct h1c *h1c)
 	struct session *sess = h1c->conn->owner;
 	int ret = 0;
 
+	if (h1c->state == H1_CS_DRAINING) {
+		h1c->flags = (h1c->flags & ~H1C_F_WAIT_NEXT_REQ) | H1C_F_ABRTED;
+		h1s_destroy(h1c->h1s);
+		goto end;
+	}
 	if (!b_data(&h1c->ibuf) && ((h1c->flags & H1C_F_WAIT_NEXT_REQ) || (sess->fe->options & PR_O_IGNORE_PRB))) {
 		h1c->flags = (h1c->flags & ~H1C_F_WAIT_NEXT_REQ) | H1C_F_ABRTED;
 		h1_close(h1c);
@@ -3639,7 +3807,7 @@ static int h1_process(struct h1c * h1c)
 
 	/* Try to parse now the first block of a request, creating the H1 stream if necessary */
 	if (b_data(&h1c->ibuf) &&                                                /* Input data to be processed */
-	    (h1c->state < H1_CS_RUNNING) &&                                      /* IDLE, EMBRYONIC or UPGRADING */
+	    ((h1c->state < H1_CS_RUNNING) || (h1c->state == H1_CS_DRAINING)) &&  /* IDLE, EMBRYONIC, UPGRADING or DRAINING */
 	    !(h1c->flags & (H1C_F_IN_SALLOC|H1C_F_ABRT_PENDING))) {              /* No allocation failure on the stream rxbuf and no ERROR on the H1C */
 		struct h1s *h1s = h1c->h1s;
 		struct buffer *buf;
@@ -3650,7 +3818,8 @@ static int h1_process(struct h1c * h1c)
 			goto release;
 
 		/* First of all handle H1 to H2 upgrade (no need to create the H1 stream) */
-		if (!(h1c->flags & H1C_F_WAIT_NEXT_REQ) &&         /* First request */
+		if (h1c->state != H1_CS_DRAINING &&                /* Not draining message */
+		    !(h1c->flags & H1C_F_WAIT_NEXT_REQ) &&         /* First request */
 		    !(h1c->px->options2 & PR_O2_NO_H2_UPGRADE) &&  /* H2 upgrade supported by the proxy */
 		    !(conn->mux->flags & MX_FL_NO_UPG)) {          /* the current mux supports upgrades */
 			/* Try to match H2 preface before parsing the request headers. */
@@ -3691,7 +3860,7 @@ static int h1_process(struct h1c * h1c)
 		h1_process_demux(h1c, buf, count);
 		h1_release_buf(h1c, &h1s->rxbuf);
 		h1_set_idle_expiration(h1c);
-		if (h1c->state < H1_CS_RUNNING) {
+		if (h1c->state != H1_CS_RUNNING) { // TODO: be sure state cannot change in h1_process_demux
 			if (h1s->flags & H1S_F_INTERNAL_ERROR) {
 				h1_handle_internal_err(h1c);
 				TRACE_ERROR("internal error detected", H1_EV_H1C_WAKE|H1_EV_H1C_ERR);
@@ -3734,6 +3903,11 @@ static int h1_process(struct h1c * h1c)
 				if (h1_send_error(h1c))
 					h1_send(h1c);
 			}
+			else if (h1c->state == H1_CS_DRAINING) {
+				BUG_ON(h1c->h1s->sd && !se_fl_test(h1c->h1s->sd, SE_FL_ORPHAN));
+				h1s_destroy(h1c->h1s);
+				TRACE_STATE("abort/error when draining message. destroy h1s and close h1c", H1_EV_H1S_END, h1c->conn);
+			}
 			else {
 				h1_close(h1c);
 				TRACE_STATE("close h1c", H1_EV_H1S_END, h1c->conn);
@@ -3760,6 +3934,17 @@ static int h1_process(struct h1c * h1c)
 			}
 			TRACE_POINT(H1_EV_STRM_WAKE, h1c->conn, h1s);
 			h1_alert(h1s);
+		}
+	}
+	else if (h1c->state == H1_CS_DRAINING) {
+		BUG_ON(!h1c->h1s);
+		if (se_fl_test(h1c->h1s->sd, SE_FL_EOI)) {
+			if (h1s_must_shut_conn(h1c->h1s)) {
+				h1_shutw_conn(conn);
+				goto release;
+			}
+			h1s_finish_detach(h1c->h1s);
+			goto end;
 		}
 	}
 
@@ -4070,8 +4255,6 @@ static void h1_detach(struct sedesc *sd)
 {
 	struct h1s *h1s = sd->se;
 	struct h1c *h1c;
-	struct session *sess;
-	int is_not_first;
 
 	TRACE_ENTER(H1_EV_STRM_END, h1s ? h1s->h1c->conn : NULL, h1s);
 
@@ -4079,100 +4262,26 @@ static void h1_detach(struct sedesc *sd)
 		TRACE_LEAVE(H1_EV_STRM_END);
 		return;
 	}
-
-	sess = h1s->sess;
 	h1c = h1s->h1c;
 
-	sess->accept_date = date;
-	sess->accept_ts   = now_ns;
-	sess->t_handshake = 0;
-	sess->t_idle      = -1;
-
-	is_not_first = h1s->flags & H1S_F_NOT_FIRST;
-	h1s_destroy(h1s);
-
-	if (h1c->state == H1_CS_IDLE && (h1c->flags & H1C_F_IS_BACK)) {
-		/* this connection may be killed at any moment, we want it to
-		 * die "cleanly" (i.e. only an RST).
+	if (h1c->state == H1_CS_RUNNING && !(h1c->flags & H1C_F_IS_BACK) && h1s->req.state != H1_MSG_DONE) {
+		h1c->state = H1_CS_DRAINING;
+		TRACE_DEVEL("Deferring H1S destroy to drain message", H1_EV_STRM_END, h1s->h1c->conn, h1s);
+		/* If we have a pending data, process it immediately or
+		 * subscribe for reads waiting for new data
 		 */
-		h1c->flags |= H1C_F_SILENT_SHUT;
-
-		/* If there are any excess server data in the input buffer,
-		 * release it and close the connection ASAP (some data may
-		 * remain in the output buffer). This happens if a server sends
-		 * invalid responses. So in such case, we don't want to reuse
-		 * the connection
-		 */
-		if (b_data(&h1c->ibuf)) {
-			h1_release_buf(h1c, &h1c->ibuf);
-			h1_close(h1c);
-			TRACE_DEVEL("remaining data on detach, kill connection", H1_EV_STRM_END|H1_EV_H1C_END);
-			goto release;
-		}
-
-		if (h1c->conn->flags & CO_FL_PRIVATE) {
-			/* Add the connection in the session server list, if not already done */
-			if (!session_add_conn(sess, h1c->conn, h1c->conn->target)) {
-				h1c->conn->owner = NULL;
-				h1c->conn->mux->destroy(h1c);
+		if (unlikely(b_data(&h1c->ibuf))) {
+			if (h1_process(h1c) == -1)
 				goto end;
-			}
-			/* Always idle at this step */
-			if (session_check_idle_conn(sess, h1c->conn)) {
-				/* The connection got destroyed, let's leave */
-				TRACE_DEVEL("outgoing connection killed", H1_EV_STRM_END|H1_EV_H1C_END);
-				goto end;
-			}
 		}
-		else {
-			if (h1c->conn->owner == sess)
-				h1c->conn->owner = NULL;
-
-			/* mark that the tasklet may lose its context to another thread and
-			 * that the handler needs to check it under the idle conns lock.
-			 */
-			HA_ATOMIC_OR(&h1c->wait_event.tasklet->state, TASK_F_USR1);
+		else
 			h1c->conn->xprt->subscribe(h1c->conn, h1c->conn->xprt_ctx, SUB_RETRY_RECV, &h1c->wait_event);
-			xprt_set_idle(h1c->conn, h1c->conn->xprt, h1c->conn->xprt_ctx);
-
-			if (!srv_add_to_idle_list(objt_server(h1c->conn->target), h1c->conn, is_not_first)) {
-				/* The server doesn't want it, let's kill the connection right away */
-				h1c->conn->mux->destroy(h1c);
-				TRACE_DEVEL("outgoing connection killed", H1_EV_STRM_END|H1_EV_H1C_END);
-				goto end;
-			}
-			/* At this point, the connection has been added to the
-			 * server idle list, so another thread may already have
-			 * hijacked it, so we can't do anything with it.
-			 */
-			return;
-		}
-	}
-
-  release:
-	/* We don't want to close right now unless the connection is in error or shut down for writes */
-	if ((h1c->flags & H1C_F_ERROR) ||
-	    (h1c->state == H1_CS_CLOSED) ||
-	    (h1c->state == H1_CS_CLOSING && !b_data(&h1c->obuf)) ||
-	    !h1c->conn->owner) {
-		TRACE_DEVEL("killing dead connection", H1_EV_STRM_END, h1c->conn);
-		h1_release(h1c);
-	}
-	else {
-		if (h1c->state == H1_CS_IDLE) {
-			/* If we have a new request, process it immediately or
-			 * subscribe for reads waiting for new data
-			 */
-			if (unlikely(b_data(&h1c->ibuf))) {
-				if (h1_process(h1c) == -1)
-					goto end;
-			}
-			else
-				h1c->conn->xprt->subscribe(h1c->conn, h1c->conn->xprt_ctx, SUB_RETRY_RECV, &h1c->wait_event);
-		}
 		h1_set_idle_expiration(h1c);
 		h1_refresh_timeout(h1c);
 	}
+	else
+		h1s_finish_detach(h1s);
+
   end:
 	TRACE_LEAVE(H1_EV_STRM_END);
 }
@@ -4201,23 +4310,8 @@ static void h1_shutw(struct stconn *sc, enum co_shw_mode mode)
 
 	TRACE_ENTER(H1_EV_STRM_SHUT, h1c->conn, h1s, 0, (size_t[]){mode});
 
-	if (se_fl_test(h1s->sd, SE_FL_KILL_CONN)) {
-		TRACE_STATE("stream wants to kill the connection", H1_EV_STRM_SHUT, h1c->conn, h1s);
-		goto do_shutw;
-	}
-	if (h1c->state == H1_CS_CLOSING || (h1c->flags & (H1C_F_EOS|H1C_F_ERR_PENDING|H1C_F_ERROR))) {
-		TRACE_STATE("shutdown on connection (EOS || CLOSING || ERROR)", H1_EV_STRM_SHUT, h1c->conn, h1s);
-		goto do_shutw;
-	}
-
-	if (h1c->state == H1_CS_UPGRADING) {
-		TRACE_STATE("keep connection alive (UPGRADING)", H1_EV_STRM_SHUT, h1c->conn, h1s);
+	if (!h1s_must_shut_conn(h1s))
 		goto end;
-	}
-	if (((h1s->flags & H1S_F_WANT_KAL) && h1s->req.state == H1_MSG_DONE && h1s->res.state == H1_MSG_DONE)) {
-		TRACE_STATE("keep connection alive (want_kal)", H1_EV_STRM_SHUT, h1c->conn, h1s);
-		goto end;
-	}
 
   do_shutw:
 	h1_close(h1c);
@@ -4455,7 +4549,7 @@ static size_t h1_nego_ff(struct stconn *sc, struct buffer *input, size_t count, 
 	struct h1s *h1s = __sc_mux_strm(sc);
 	struct h1c *h1c = h1s->h1c;
 	struct h1m *h1m = (!(h1c->flags & H1C_F_IS_BACK) ? &h1s->res : &h1s->req);
-	size_t sz, prefix = 0, suffix = 0, ret = 0;
+	size_t sz, offset = 0, ret = 0;
 
 	TRACE_ENTER(H1_EV_STRM_SEND, h1c->conn, h1s, 0, (size_t[]){count});
 
@@ -4487,24 +4581,24 @@ static size_t h1_nego_ff(struct stconn *sc, struct buffer *input, size_t count, 
 		else {
 			BUG_ON(h1m->state != H1_MSG_CHUNK_CRLF && h1m->state != H1_MSG_CHUNK_SIZE);
 			if (flags & NEGO_FF_FL_EXACT_SIZE) {
-				if (!h1_make_chunk(h1s, h1m, count))
+				if (!h1_make_chunk(h1s, h1m, count)) {
+					h1s->sd->iobuf.flags |= IOBUF_FL_FF_BLOCKED;
 					goto out;
+				}
 				h1m->curr_len = count;
 			}
 			else {
 				/* The producer does not know the chunk size, thus this will be emitted at the
 				 * end, in done_ff(). So splicing cannot be used (see TODO below).
-				 * We will reserve 12 bytes to handle at most 4Go chunk with all CRLFs !
-				 * (<8-bytes SIZE><CRLF><CHUNK-DATA><CRLF>, 10 bytes at the beginning and
-				 *  2 bytes reserved at the end)
+				 * We will reserve 10 bytes to handle at most 4Go chunk !
+				 * (<8-bytes SIZE><CRLF><CHUNK-DATA>)
 				 */
 				if (count > MAX_RANGE(unsigned int))
 					count = MAX_RANGE(unsigned int);
-				prefix = 10;
-				suffix = 2;
+				offset = 10;
 				/* Add 2 more bytes to finish the previous chunk */
 				if (h1m->state == H1_MSG_CHUNK_CRLF)
-					prefix += 2;
+					offset += 2;
 				goto no_splicing;
 			}
 		}
@@ -4533,6 +4627,7 @@ static size_t h1_nego_ff(struct stconn *sc, struct buffer *input, size_t count, 
   no_splicing:
 	if (!h1_get_buf(h1c, &h1c->obuf)) {
 		h1c->flags |= H1C_F_OUT_ALLOC;
+		h1s->sd->iobuf.flags |= IOBUF_FL_FF_BLOCKED;
 		TRACE_STATE("waiting for opposite h1c obuf allocation", H1_EV_STRM_SEND|H1_EV_H1S_BLK, h1c->conn, h1s);
 		goto out;
 	}
@@ -4540,7 +4635,7 @@ static size_t h1_nego_ff(struct stconn *sc, struct buffer *input, size_t count, 
 	if (b_space_wraps(&h1c->obuf))
 		b_slow_realign(&h1c->obuf, trash.area, b_data(&h1c->obuf));
 
-	if (b_contig_space(&h1c->obuf) <= prefix + suffix) {
+	if (b_contig_space(&h1c->obuf) <= offset) {
 		h1c->flags |= H1C_F_OUT_FULL;
 		h1s->sd->iobuf.flags |= IOBUF_FL_FF_BLOCKED;
 		TRACE_STATE("output buffer full", H1_EV_STRM_SEND|H1_EV_H1S_BLK, h1c->conn, h1s);
@@ -4548,12 +4643,12 @@ static size_t h1_nego_ff(struct stconn *sc, struct buffer *input, size_t count, 
 	}
 
 	/* Cannot forward more than available room in output buffer */
-	sz = b_contig_space(&h1c->obuf) - prefix - suffix;
+	sz = b_contig_space(&h1c->obuf) - offset;
 	if (count > sz)
 		count = sz;
 
 	h1s->sd->iobuf.buf = &h1c->obuf;
-	h1s->sd->iobuf.offset = prefix;
+	h1s->sd->iobuf.offset = offset;
 	h1s->sd->iobuf.data = 0;
 
 	/* forward remaining input data */
@@ -4607,13 +4702,10 @@ static size_t h1_done_ff(struct stconn *sc)
 						   b_peek_ofs(&h1c->obuf, b_data(&h1c->obuf) - sd->iobuf.data + sd->iobuf.offset),
 						   sd->iobuf.data);
 			h1_prepend_chunk_size(&buf, sd->iobuf.data, sd->iobuf.offset - ((h1m->state == H1_MSG_CHUNK_CRLF) ?  2 : 0));
-			h1_append_chunk_crlf(&buf);
-			b_add(&h1c->obuf, sd->iobuf.offset + 2);
-			if (h1m->state == H1_MSG_CHUNK_CRLF) {
+			if (h1m->state == H1_MSG_CHUNK_CRLF)
 				h1_prepend_chunk_crlf(&buf);
-				b_add(&h1c->obuf, 2);
-			}
-			h1m->state = H1_MSG_CHUNK_SIZE;
+			b_add(&h1c->obuf, sd->iobuf.offset);
+			h1m->state = H1_MSG_CHUNK_CRLF;
 		}
 
 		total = sd->iobuf.data;
