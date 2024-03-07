@@ -127,7 +127,7 @@ static struct qcs *qcs_new(struct qcc *qcc, uint64_t id, enum qcs_type type)
 		qfctl_init(&qcs->tx.fc, qcc->rfctl.msd_uni_l);
 	}
 	else {
-		qcs->tx.fc.off_real = 0;
+		qfctl_init(&qcs->tx.fc, 0);
 	}
 
 	qcs->rx.ncbuf = NCBUF_NULL;
@@ -1107,7 +1107,7 @@ void qcc_reset_stream(struct qcs *qcs, int err)
 		/* Soft offset cannot be inferior to real one. */
 		BUG_ON(qcc->tx.fc.off_soft - diff < qcc->tx.fc.off_real);
 
-		/* Substract to conn flow control data amount prepared on stream not yet sent. */
+		/* Subtract to conn flow control data amount prepared on stream not yet sent. */
 		qcc->tx.fc.off_soft -= diff;
 		if (soft_blocked && !qfctl_sblocked(&qcc->tx.fc))
 			qcc_notify_fctl(qcc);
@@ -2010,7 +2010,7 @@ static int qcs_send_stop_sending(struct qcs *qcs)
 }
 
 /* Used internally by qcc_io_send function. Proceed to send for <qcs>. A STREAM
- * frame is generated poiting to QCS stream descriptor content and inserted in
+ * frame is generated pointing to QCS stream descriptor content and inserted in
  * <frms> list. Frame length will be truncated if greater than <window_conn>.
  * This allows to prepare several frames in a loop while respecting connection
  * flow control window.
@@ -2115,7 +2115,7 @@ static int qcc_io_send(struct qcc *qcc)
 
 		/* Stream must not be present in send_list if it has nothing to send. */
 		BUG_ON(!(qcs->flags & (QC_SF_FIN_STREAM|QC_SF_TO_STOP_SENDING|QC_SF_TO_RESET)) &&
-		       !qcs_prep_bytes(qcs));
+		       (!qcs->stream || !qcs_prep_bytes(qcs)));
 
 		/* Each STOP_SENDING/RESET_STREAM frame is sent individually to
 		 * guarantee its emission.
@@ -2130,7 +2130,7 @@ static int qcc_io_send(struct qcc *qcc)
 			 * to send.
 			 */
 			if (!(qcs->flags & (QC_SF_FIN_STREAM|QC_SF_TO_RESET)) &&
-			    !qcs_prep_bytes(qcs)) {
+			    (!qcs->stream || !qcs_prep_bytes(qcs))) {
 				LIST_DEL_INIT(&qcs->el_send);
 				continue;
 			}
