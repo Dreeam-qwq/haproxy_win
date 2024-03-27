@@ -3581,6 +3581,10 @@ static void fcgi_detach(struct sedesc *sd)
 				}
 			}
 			if (eb_is_empty(&fconn->streams_by_id)) {
+				/* mark that the tasklet may lose its context to another thread and
+				 * that the handler needs to check it under the idle conns lock.
+				 */
+				HA_ATOMIC_OR(&fconn->wait_event.tasklet->state, TASK_F_USR1);
 				if (session_check_idle_conn(fconn->conn->owner, fconn->conn) != 0) {
 					/* The connection is destroyed, let's leave */
 					TRACE_DEVEL("outgoing connection killed", FCGI_EV_STRM_END|FCGI_EV_FCONN_ERR);
@@ -3619,7 +3623,7 @@ static void fcgi_detach(struct sedesc *sd)
 			}
 			else if (!fconn->conn->hash_node->node.node.leaf_p &&
 				 fcgi_avail_streams(fconn->conn) > 0 && objt_server(fconn->conn->target) &&
-				 !LIST_INLIST(&fconn->conn->session_list)) {
+				 !LIST_INLIST(&fconn->conn->sess_el)) {
 				srv_add_to_avail_list(__objt_server(fconn->conn->target), fconn->conn);
 			}
 		}
@@ -4039,6 +4043,15 @@ static size_t fcgi_snd_buf(struct stconn *sc, struct buffer *buf, size_t count, 
 				}
 				break;
 
+			case HTX_BLK_EOT:
+				if (htx_is_unique_blk(htx, blk) && (htx->flags & HTX_FL_EOM)) {
+					TRACE_PROTO("sending FCGI STDIN record", FCGI_EV_TX_RECORD|FCGI_EV_TX_STDIN, fconn->conn, fstrm, htx);
+					ret = fcgi_strm_send_empty_stdin(fconn, fstrm);
+					if (!ret)
+						goto done;
+				}
+				__fallthrough;
+
 			default:
 			  remove_blk:
 				htx_remove_blk(htx, blk);
@@ -4154,25 +4167,27 @@ static int fcgi_show_fd(struct buffer *msg, struct connection *conn)
  * Return 0 if successful, non-zero otherwise.
  * Expected to be called with the old thread lock held.
  */
-static int fcgi_takeover(struct connection *conn, int orig_tid)
+static int fcgi_takeover(struct connection *conn, int orig_tid, int release)
 {
 	struct fcgi_conn *fcgi = conn->ctx;
 	struct task *task;
-	struct task *new_task;
-	struct tasklet *new_tasklet;
+	struct task *new_task = NULL;
+	struct tasklet *new_tasklet = NULL;
 
 	/* Pre-allocate tasks so that we don't have to roll back after the xprt
 	 * has been migrated.
 	 */
-	new_task = task_new_here();
-	new_tasklet = tasklet_new();
-	if (!new_task || !new_tasklet)
-		goto fail;
+	if (!release) {
+		new_task = task_new_here();
+		new_tasklet = tasklet_new();
+		if (!new_task || !new_tasklet)
+			goto fail;
+	}
 
 	if (fd_takeover(conn->handle.fd, conn) != 0)
 		goto fail;
 
-	if (conn->xprt->takeover && conn->xprt->takeover(conn, conn->xprt_ctx, orig_tid) != 0) {
+	if (conn->xprt->takeover && conn->xprt->takeover(conn, conn->xprt_ctx, orig_tid, release) != 0) {
 		/* We failed to takeover the xprt, even if the connection may
 		 * still be valid, flag it as error'd, as we have already
 		 * taken over the fd, and wake the tasklet, so that it will
@@ -4199,8 +4214,10 @@ static int fcgi_takeover(struct connection *conn, int orig_tid)
 
 		fcgi->task = new_task;
 		new_task = NULL;
-		fcgi->task->process = fcgi_timeout_task;
-		fcgi->task->context = fcgi;
+		if (!release) {
+			fcgi->task->process = fcgi_timeout_task;
+			fcgi->task->context = fcgi;
+		}
 	}
 
 	/* To let the tasklet know it should free itself, and do nothing else,
@@ -4210,10 +4227,12 @@ static int fcgi_takeover(struct connection *conn, int orig_tid)
 	tasklet_wakeup_on(fcgi->wait_event.tasklet, orig_tid);
 
 	fcgi->wait_event.tasklet = new_tasklet;
-	fcgi->wait_event.tasklet->process = fcgi_io_cb;
-	fcgi->wait_event.tasklet->context = fcgi;
-	fcgi->conn->xprt->subscribe(fcgi->conn, fcgi->conn->xprt_ctx,
-		                    SUB_RETRY_RECV, &fcgi->wait_event);
+	if (!release) {
+		fcgi->wait_event.tasklet->process = fcgi_io_cb;
+		fcgi->wait_event.tasklet->context = fcgi;
+		fcgi->conn->xprt->subscribe(fcgi->conn, fcgi->conn->xprt_ctx,
+		                            SUB_RETRY_RECV, &fcgi->wait_event);
+	}
 
 	if (new_task)
 		__task_free(new_task);

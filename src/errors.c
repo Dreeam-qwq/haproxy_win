@@ -90,11 +90,7 @@ static struct ring *startup_logs_from_fd(int fd, int new)
 	if (area == MAP_FAILED || area == NULL)
 		goto error;
 
-	if (new)
-		r = ring_make_from_area(area, STARTUP_LOG_SIZE);
-	else
-		r = ring_cast_from_area(area);
-
+        r = ring_make_from_area(area, STARTUP_LOG_SIZE, new);
 	if (r == NULL)
 		goto error;
 
@@ -194,10 +190,9 @@ void startup_logs_free(struct ring *r)
 {
 #ifdef USE_SHM_OPEN
 	if (r == shm_startup_logs)
-		munmap(r, STARTUP_LOG_SIZE);
-	else
+		munmap(ring_area(r), STARTUP_LOG_SIZE);
 #endif /* ! USE_SHM_OPEN */
-		ring_free(r);
+	ring_free(r);
 }
 
 /* duplicate a startup logs which was previously allocated in a shm */
@@ -206,12 +201,11 @@ struct ring *startup_logs_dup(struct ring *src)
 	struct ring *dst = NULL;
 
 	/* must use the size of the previous buffer */
-	dst = ring_new(b_size(&src->buf));
+	dst = ring_new(ring_size(src));
 	if (!dst)
 		goto error;
 
-	b_reset(&dst->buf);
-	b_ncat(&dst->buf, &src->buf, b_data(&src->buf));
+	ring_dup(dst, src, ring_size(src));
 error:
 	return dst;
 }

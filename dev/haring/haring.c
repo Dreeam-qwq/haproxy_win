@@ -35,12 +35,34 @@
 
 #include <haproxy/api.h>
 #include <haproxy/buf.h>
-#include <haproxy/ring.h>
+#include <haproxy/ring-t.h>
+#include <haproxy/thread.h>
 
 int force = 0; // force access to a different layout
 int lfremap = 0; // remap LF in traces
 int repair = 0; // repair file
 
+struct ring_v1 {
+	struct buffer buf;   // storage area
+};
+
+// ring v2 format (not aligned)
+struct ring_v2 {
+	size_t size;         // storage size
+	size_t rsvd;         // header length (used for file-backed maps)
+	size_t tail;         // storage tail
+	size_t head;         // storage head
+	char area[0];        // storage area begins immediately here
+};
+
+// ring v2 format (thread aligned)
+struct ring_v2a {
+	size_t size;         // storage size
+	size_t rsvd;         // header length (used for file-backed maps)
+	size_t tail __attribute__((aligned(64)));         // storage tail
+	size_t head __attribute__((aligned(64)));         // storage head
+	char area[0] __attribute__((aligned(64)));        // storage area begins immediately here
+};
 
 /* display the message and exit with the code */
 __attribute__((noreturn)) void die(int code, const char *format, ...)
@@ -69,75 +91,21 @@ __attribute__((noreturn)) void usage(int code, const char *arg0)
 	    "", arg0);
 }
 
-/* This function dumps all events from the ring whose pointer is in <p0> into
- * the appctx's output buffer, and takes from <o0> the seek offset into the
- * buffer's history (0 for oldest known event). It looks at <i0> for boolean
- * options: bit0 means it must wait for new data or any key to be pressed. Bit1
- * means it must seek directly to the end to wait for new contents. It returns
- * 0 if the output buffer or events are missing is full and it needs to be
- * called again, otherwise non-zero. It is meant to be used with
- * cli_release_show_ring() to clean up.
+/* dump a ring represented in a pre-initialized buffer, starting from offset
+ * <ofs> and with flags <flags>
  */
-int dump_ring(struct ring *ring, size_t ofs, int flags)
+int dump_ring_as_buf(struct buffer buf, size_t ofs, int flags)
 {
-	struct buffer buf;
 	uint64_t msg_len = 0;
 	size_t len, cnt;
 	const char *blk1 = NULL, *blk2 = NULL, *p;
 	size_t len1 = 0, len2 = 0, bl;
 
-	/* Explanation: the storage area in the writing process starts after
-	 * the end of the structure. Since the whole area is mmapped(), we know
-	 * it starts at 0 mod 4096, hence the buf->area pointer's 12 LSB point
-	 * to the relative offset of the storage area. As there will always be
-	 * users using the wrong version of the tool with a dump, we need to
-	 * run a few checks first. After that we'll create our own buffer
-	 * descriptor matching that area.
-	 */
-	if ((((long)ring->buf.area) & 4095) != sizeof(*ring)) {
-		if (!force) {
-			fprintf(stderr, "FATAL: header in file is %ld bytes long vs %ld expected!\n",
-				(((long)ring->buf.area) & 4095),
-				(long)sizeof(*ring));
-			exit(1);
-		}
-		else {
-			fprintf(stderr, "WARNING: header in file is %ld bytes long vs %ld expected!\n",
-				(((long)ring->buf.area) & 4095),
-				(long)sizeof(*ring));
-		}
-		/* maybe we could emit a warning at least ? */
-	}
-
-	/* Now make our own buffer pointing to that area */
-	buf = b_make(((void *)ring + (((long)ring->buf.area) & 4095)),
-		     ring->buf.size, ring->buf.head, ring->buf.data);
-
-	/* explanation for the initialization below: it would be better to do
-	 * this in the parsing function but this would occasionally result in
-	 * dropped events because we'd take a reference on the oldest message
-	 * and keep it while being scheduled. Thus instead let's take it the
-	 * first time we enter here so that we have a chance to pass many
-	 * existing messages before grabbing a reference to a location. This
-	 * value cannot be produced after initialization.
-	 */
-	if (unlikely(ofs == ~0)) {
-		ofs = 0;
-
-		/* going to the end means looking at tail-1 */
-		ofs = (flags & RING_WF_SEEK_NEW) ? buf.data - 1 : 0;
-
-		//HA_ATOMIC_INC(b_peek(&buf, ofs));
-	}
-
 	while (1) {
-		//HA_RWLOCK_RDLOCK(RING_LOCK, &ring->lock);
-
 		if (ofs >= buf.size) {
 			fprintf(stderr, "FATAL error at %d\n", __LINE__);
 			return 1;
 		}
-		//HA_ATOMIC_DEC(b_peek(&buf, ofs));
 
 		/* in this loop, ofs always points to the counter byte that precedes
 		 * the message so that we can take our reference there if we have to
@@ -198,9 +166,6 @@ int dump_ring(struct ring *ring, size_t ofs, int flags)
 			ofs += cnt + msg_len;
 		}
 
-		//HA_ATOMIC_INC(b_peek(&buf, ofs));
-		//HA_RWLOCK_RDUNLOCK(RING_LOCK, &ring->lock);
-
 		if (!(flags & RING_WF_WAIT_MODE))
 			break;
 
@@ -210,9 +175,84 @@ int dump_ring(struct ring *ring, size_t ofs, int flags)
 	return 0;
 }
 
+/* This function dumps all events from the ring <ring> from offset <ofs> and
+ * with flags <flags>.
+ */
+int dump_ring_v1(struct ring_v1 *ring, size_t ofs, int flags)
+{
+	struct buffer buf;
+
+	/* Explanation: the storage area in the writing process starts after
+	 * the end of the structure. Since the whole area is mmapped(), we know
+	 * it starts at 0 mod 4096, hence the buf->area pointer's 12 LSB point
+	 * to the relative offset of the storage area. As there will always be
+	 * users using the wrong version of the tool with a dump, we need to
+	 * run a few checks first. After that we'll create our own buffer
+	 * descriptor matching that area.
+	 */
+
+	/* Now make our own buffer pointing to that area */
+	buf = b_make(((void *)ring + (((long)ring->buf.area) & 4095)),
+		     ring->buf.size, ring->buf.head, ring->buf.data);
+
+	return dump_ring_as_buf(buf, ofs, flags);
+}
+
+/* This function dumps all events from the ring <ring> from offset <ofs> and
+ * with flags <flags>.
+ */
+int dump_ring_v2(struct ring_v2 *ring, size_t ofs, int flags)
+{
+	size_t size, head, tail, data;
+	struct buffer buf;
+
+	/* In ring v2 format, we have in this order:
+	 *    - size
+	 *    - hdr len (reserved bytes)
+	 *    - tail
+	 *    - head
+	 * We can rebuild an equivalent buffer from these info for the function
+	 * to dump.
+	 */
+
+	/* Now make our own buffer pointing to that area */
+	size = ring->size;
+	head = ring->head;
+	tail = ring->tail & ~RING_TAIL_LOCK;
+	data = (head <= tail ? 0 : size) + tail - head;
+	buf = b_make((void *)ring + ring->rsvd, size, head, data);
+	return dump_ring_as_buf(buf, ofs, flags);
+}
+
+/* This function dumps all events from the ring <ring> from offset <ofs> and
+ * with flags <flags>.
+ */
+int dump_ring_v2a(struct ring_v2a *ring, size_t ofs, int flags)
+{
+	size_t size, head, tail, data;
+	struct buffer buf;
+
+	/* In ring v2 format, we have in this order:
+	 *    - size
+	 *    - hdr len (reserved bytes)
+	 *    - tail
+	 *    - head
+	 * We can rebuild an equivalent buffer from these info for the function
+	 * to dump.
+	 */
+
+	/* Now make our own buffer pointing to that area */
+	size = ring->size;
+	head = ring->head;
+	tail = ring->tail & ~RING_TAIL_LOCK;
+	data = (head <= tail ? 0 : size) + tail - head;
+	buf = b_make((void *)ring + ring->rsvd, size, head, data);
+	return dump_ring_as_buf(buf, ofs, flags);
+}
+
 int main(int argc, char **argv)
 {
-	struct ring *ring;
+	void *ring;
 	struct stat statbuf;
 	const char *arg0;
 	int fd;
@@ -254,7 +294,15 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	return dump_ring(ring, ~0, 0);
+	if (((struct ring_v2 *)ring)->rsvd < 4096 && // not a pointer (v1), must be ringv2's rsvd
+	    ((struct ring_v2 *)ring)->rsvd + ((struct ring_v2 *)ring)->size == statbuf.st_size) {
+		if (((struct ring_v2 *)ring)->rsvd < 192)
+			return dump_ring_v2(ring, 0, 0);
+		else
+			return dump_ring_v2a(ring, 0, 0); // thread-aligned version
+	}
+	else
+		return dump_ring_v1(ring, 0, 0);
 }
 
 

@@ -1165,6 +1165,10 @@ spoe_recv_frame(struct appctx *appctx, char *buf, size_t framesz)
 	ret = co_getblk(sc_oc(sc), (char *)&netint, 4, 0);
 	if (ret > 0) {
 		framesz = ntohl(netint);
+		if (framesz < 7)  {
+			SPOE_APPCTX(appctx)->status_code = SPOE_FRM_ERR_INVALID;
+			return -1;
+		}
 		if (framesz > SPOE_APPCTX(appctx)->max_frame_size) {
 			SPOE_APPCTX(appctx)->status_code = SPOE_FRM_ERR_TOO_BIG;
 			return -1;
@@ -1998,10 +2002,13 @@ spoe_handle_appctx(struct appctx *appctx)
 			__fallthrough;
 
 		case SPOE_APPCTX_ST_END:
+			co_skip(sc_oc(sc), co_data(sc_oc(sc)));
 			return;
 	}
   out:
-	if (SPOE_APPCTX(appctx)->task->expire != TICK_ETERNITY)
+	if (stopping && appctx->st0 == SPOE_APPCTX_ST_IDLE)
+		task_wakeup(SPOE_APPCTX(appctx)->task, TASK_WOKEN_MSG);
+	else if (SPOE_APPCTX(appctx)->task->expire != TICK_ETERNITY)
 		task_queue(SPOE_APPCTX(appctx)->task);
 }
 
@@ -2625,6 +2632,8 @@ spoe_stop_processing(struct spoe_agent *agent, struct spoe_context *ctx)
 
 	/* Reset processing timer */
 	ctx->process_exp = TICK_ETERNITY;
+	ctx->strm->req.analyse_exp = TICK_ETERNITY;
+	ctx->strm->res.analyse_exp = TICK_ETERNITY;
 
 	spoe_release_buffer(&ctx->buffer, &ctx->buffer_wait);
 
@@ -2683,8 +2692,10 @@ spoe_process_messages(struct stream *s, struct spoe_context *ctx,
 
 		if (!tick_isset(ctx->process_exp)) {
 			ctx->process_exp = tick_add_ifset(now_ms, agent->timeout.processing);
-			s->task->expire  = tick_first((tick_is_expired(s->task->expire, now_ms) ? 0 : s->task->expire),
-						      ctx->process_exp);
+			if (dir == SMP_OPT_DIR_REQ)
+				s->req.analyse_exp = ctx->process_exp;
+			else
+				s->res.analyse_exp = ctx->process_exp;
 		}
 		ret = spoe_start_processing(agent, ctx, dir);
 		if (!ret)
@@ -4098,6 +4109,11 @@ parse_spoe_flt(char **args, int *cur_arg, struct proxy *px,
 	LIST_INIT(&curloggers);
 	curpxopts  = 0;
 	curpxopts2 = 0;
+
+
+	if (!deprecated_directives_allowed)
+		ha_warning("Proxy %s: SPOE filter is deprecated and will be removed in future version. "
+			   "Use 'expose-deprecated-directives' in global section to silent this warning\n", px->id);
 
 	conf = calloc(1, sizeof(*conf));
 	if (conf == NULL) {

@@ -267,6 +267,7 @@ unsigned int warned = 0;
 unsigned int tainted = 0;
 
 unsigned int experimental_directives_allowed = 0;
+unsigned int deprecated_directives_allowed = 0;
 
 int check_kw_experimental(struct cfg_keyword *kw, const char *file, int linenum,
                           char **errmsg)
@@ -659,6 +660,7 @@ static void usage(char *name)
 		"        -dW fails if any warning is emitted\n"
 		"        -dD diagnostic mode : warn about suspicious configuration statements\n"
 		"        -dF disable fast-forward\n"
+		"        -dI enable insecure fork\n"
 		"        -dZ disable zero-copy forwarding\n"
 		"        -sf/-st [pid ]* finishes/terminates old pids.\n"
 		"        -x <unix_socket> get listening sockets from a unix socket\n"
@@ -1679,6 +1681,8 @@ static void init_args(int argc, char **argv)
 #endif
 			else if (*flag == 'd' && flag[1] == 'F')
 				global.tune.options &= ~GTUNE_USE_FAST_FWD;
+			else if (*flag == 'd' && flag[1] == 'I')
+				global.tune.options |= GTUNE_INSECURE_FORK;
 			else if (*flag == 'd' && flag[1] == 'V')
 				global.ssl_server_verify = SSL_SERVER_VERIFY_NONE;
 			else if (*flag == 'd' && flag[1] == 'Z')
@@ -3145,6 +3149,18 @@ static void *run_thread_poll_loop(void *data)
 	ha_thread_info[tid].pth_id = ha_get_pthread_id(tid);
 #endif
 	ha_thread_info[tid].stack_top = __builtin_frame_address(0);
+
+	/* Assign the ring queue. Contrary to an intuitive thought, this does
+	 * not benefit from locality and it's counter-productive to group
+	 * threads from a same group or range number in the same queue. In some
+	 * sense it arranges us because it means we can use a modulo and ensure
+	 * that even small numbers of threads are well spread.
+	 */
+	ha_thread_info[tid].ring_queue =
+		(tid % MIN(global.nbthread,
+			   (global.tune.ring_queues ?
+			    global.tune.ring_queues :
+			    RING_DFLT_QUEUES))) % RING_WAIT_QUEUES;
 
 	/* thread is started, from now on it is not idle nor harmless */
 	thread_harmless_end();

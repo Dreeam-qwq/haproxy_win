@@ -1019,6 +1019,11 @@ static void h1s_finish_detach(struct h1s *h1s)
 				goto end;
 			}
 			/* Always idle at this step */
+
+			/* mark that the tasklet may lose its context to another thread and
+			 * that the handler needs to check it under the idle conns lock.
+			 */
+			HA_ATOMIC_OR(&h1c->wait_event.tasklet->state, TASK_F_USR1);
 			if (session_check_idle_conn(sess, h1c->conn)) {
 				/* The connection got destroyed, let's leave */
 				TRACE_DEVEL("outgoing connection killed", H1_EV_STRM_END|H1_EV_H1C_END);
@@ -5217,25 +5222,27 @@ static int add_hdr_case_adjust(const char *from, const char *to, char **err)
  * Return 0 if successful, non-zero otherwise.
  * Expected to be called with the old thread lock held.
  */
-static int h1_takeover(struct connection *conn, int orig_tid)
+static int h1_takeover(struct connection *conn, int orig_tid, int release)
 {
 	struct h1c *h1c = conn->ctx;
 	struct task *task;
-	struct task *new_task;
-	struct tasklet *new_tasklet;
+	struct task *new_task = NULL;
+	struct tasklet *new_tasklet = NULL;
 
 	/* Pre-allocate tasks so that we don't have to roll back after the xprt
 	 * has been migrated.
 	 */
-	new_task = task_new_here();
-	new_tasklet = tasklet_new();
-	if (!new_task || !new_tasklet)
-		goto fail;
+	if (!release) {
+		new_task = task_new_here();
+		new_tasklet = tasklet_new();
+		if (!new_task || !new_tasklet)
+			goto fail;
+	}
 
 	if (fd_takeover(conn->handle.fd, conn) != 0)
 		goto fail;
 
-	if (conn->xprt->takeover && conn->xprt->takeover(conn, conn->xprt_ctx, orig_tid) != 0) {
+	if (conn->xprt->takeover && conn->xprt->takeover(conn, conn->xprt_ctx, orig_tid, release) != 0) {
 		/* We failed to takeover the xprt, even if the connection may
 		 * still be valid, flag it as error'd, as we have already
 		 * taken over the fd, and wake the tasklet, so that it will
@@ -5262,8 +5269,10 @@ static int h1_takeover(struct connection *conn, int orig_tid)
 
 		h1c->task = new_task;
 		new_task = NULL;
-		h1c->task->process = h1_timeout_task;
-		h1c->task->context = h1c;
+		if (!release) {
+			h1c->task->process = h1_timeout_task;
+			h1c->task->context = h1c;
+		}
 	}
 
 	/* To let the tasklet know it should free itself, and do nothing else,
@@ -5273,10 +5282,12 @@ static int h1_takeover(struct connection *conn, int orig_tid)
 	tasklet_wakeup_on(h1c->wait_event.tasklet, orig_tid);
 
 	h1c->wait_event.tasklet = new_tasklet;
-	h1c->wait_event.tasklet->process = h1_io_cb;
-	h1c->wait_event.tasklet->context = h1c;
-	h1c->conn->xprt->subscribe(h1c->conn, h1c->conn->xprt_ctx,
-		                   SUB_RETRY_RECV, &h1c->wait_event);
+	if (!release) {
+		h1c->wait_event.tasklet->process = h1_io_cb;
+		h1c->wait_event.tasklet->context = h1c;
+		h1c->conn->xprt->subscribe(h1c->conn, h1c->conn->xprt_ctx,
+		                           SUB_RETRY_RECV, &h1c->wait_event);
+	}
 
 	if (new_task)
 		__task_free(new_task);

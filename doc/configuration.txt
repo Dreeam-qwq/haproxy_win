@@ -3,7 +3,7 @@
                           Configuration Manual
                          ----------------------
                               version 3.0
-                              2024/02/23
+                              2024/03/26
 
 
 This document covers the configuration language as implemented in the version
@@ -1262,6 +1262,7 @@ The following keywords are supported in the "global" section :
    - deviceatlas-log-level
    - deviceatlas-properties-cookie
    - deviceatlas-separator
+   - expose-deprecated-directives
    - expose-experimental-directives
    - external-check
    - fd-hard-limit
@@ -1311,6 +1312,7 @@ The following keywords are supported in the "global" section :
    - ssl-propquery
    - ssl-provider
    - ssl-provider-path
+   - ssl-security-level
    - ssl-server-verify
    - ssl-skip-self-issued-ca
    - stats
@@ -1363,8 +1365,10 @@ The following keywords are supported in the "global" section :
    - tune.fd.edge-triggered
    - tune.h1.zero-copy-fwd-recv
    - tune.h1.zero-copy-fwd-send
+   - tune.h2.be.glitches-threshold
    - tune.h2.be.initial-window-size
    - tune.h2.be.max-concurrent-streams
+   - tune.h2.fe.glitches-threshold
    - tune.h2.fe.initial-window-size
    - tune.h2.fe.max-concurrent-streams
    - tune.h2.fe.max-total-streams
@@ -1409,6 +1413,7 @@ The following keywords are supported in the "global" section :
    - tune.rcvbuf.frontend
    - tune.rcvbuf.server
    - tune.recv_enough
+   - tune.ring.queues
    - tune.runqueue-depth
    - tune.sched.low-latency
    - tune.sndbuf.backend
@@ -1735,6 +1740,12 @@ deviceatlas-separator <char>
   Sets the character separator for the API properties results. This directive
   is optional and set to | by default if not set.
 
+expose-deprecated-directives
+  This statement must appear before using some directives tagged as deprecated
+  to silent warnings and make sure the config file will not be rejected. Not
+  all deprecated directives are concerned, only those without any alternative
+  solution.
+
 expose-experimental-directives
   This statement must appear before using directives tagged as experimental or
   the config file will be rejected.
@@ -1972,7 +1983,8 @@ insecure-fork-wanted
   highly recommended that this option is never used and that any workload
   requiring such a fork be reconsidered and moved to a safer solution (such as
   agents instead of external checks). This option supports the "no" prefix to
-  disable it.
+  disable it. This can also be activated with "-dI" on the haproxy command
+  line.
 
 insecure-setuid-wanted
   HAProxy doesn't need to call executables at run time (except when using
@@ -2296,13 +2308,31 @@ ssl-default-bind-ciphers <ciphers>
 ssl-default-bind-ciphersuites <ciphersuites>
   This setting is only available when support for OpenSSL was built in and
   OpenSSL 1.1.1 or later was used to build HAProxy. It sets the default string
-  describing the list of cipher algorithms in "cipher suite" format that are
-  negotiated during the TLS handshake for all "bind" lines which do not
-  explicitly define theirs. The format of the string is defined in "man 1
-  ciphers" from OpenSSL man pages under the section "ciphersuites". For cipher
-  configuration for TLSv1.2 and earlier using the "OpenSSL" ciphers format,
-  please check the "ssl-default-bind-ciphers" keyword. Please check the "bind"
-  keyword for more information.
+  describing the list of cipher algorithms ("cipher suite") that are negotiated
+  during the TLSv1.3 handshake for all "bind" lines which do not explicitly define
+  theirs. The format of the string is defined in
+  "man 1 ciphers" from OpenSSL man pages under the section "ciphersuites". For
+  cipher configuration for TLSv1.2 and earlier, please check the
+  "ssl-default-bind-ciphers" keyword. This setting might accept TLSv1.2
+  ciphersuites however this is an undocumented behavior and not recommended as
+  it could be inconsistent or buggy.
+  The default TLSv1.3 ciphersuites of OpenSSL are:
+  "TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_GCM_SHA256"
+
+  TLSv1.3 only supports 5 ciphersuites:
+
+  - TLS_AES_128_GCM_SHA256
+  - TLS_AES_256_GCM_SHA384
+  - TLS_CHACHA20_POLY1305_SHA256
+  - TLS_AES_128_CCM_SHA256
+  - TLS_AES_128_CCM_8_SHA256
+
+  Please check the "bind" keyword for more information.
+
+  Example:
+      global
+          ssl-default-bind-ciphers ECDHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-CHACHA20-POLY1305:ECDHE-RSA-AES128-GCM-SHA256
+          ssl-default-bind-ciphersuites TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_GCM_SHA256
 
 ssl-default-bind-client-sigalgs <sigalgs>
   This setting is only available when support for OpenSSL was built in. It sets
@@ -2366,14 +2396,14 @@ ssl-default-server-ciphers <ciphers>
 
 ssl-default-server-ciphersuites <ciphersuites>
   This setting is only available when support for OpenSSL was built in and
-  OpenSSL 1.1.1 or later was used to build HAProxy. It sets the default string
-  describing the list of cipher algorithms in "cipher suite" format that are
-  negotiated during the TLS handshake with the server, for all "server" lines
-  which do not explicitly define theirs. The format of the string is defined in
+  OpenSSL 1.1.1 or later was used to build HAProxy. It sets the default
+  string describing the list of cipher algorithms that are negotiated during
+  the TLSv1.3 handshake with the server, for all "server" lines which do not
+  explicitly define theirs. The format of the string is defined in
   "man 1 ciphers" from OpenSSL man pages under the section "ciphersuites". For
-  cipher configuration for TLSv1.2 and earlier using the "OpenSSL" cipher
-  format, please check the "ssl-default-server-ciphers" keyword. Please check the
-  "server" keyword for more information.
+  cipher configuration for TLSv1.2 and earlier, please check the
+  "ssl-default-server-ciphers" keyword. Please check the "server" keyword for
+  more information.
 
 ssl-default-server-client-sigalgs <sigalgs>
   This setting is only available when support for OpenSSL was built in. It sets
@@ -2567,6 +2597,17 @@ ssl-load-extra-files <none|all|bundle|sctl|ocsp|issuer|key>*
 
   See also: "crt", section 5.1 about bind options and section 5.2 about server
   options.
+
+ssl-security-level <number>
+  This directive allows to chose the OpenSSL security level as described in
+  https://www.openssl.org/docs/man1.1.1/man3/SSL_CTX_set_security_level.html
+  The security level will be applied to every SSL contextes in HAProxy.
+  Only a value between 0 and 5 is supported.
+
+  The default value depends on your OpenSSL version, distribution and how was
+  compiled the library.
+
+  This directive requires at least OpenSSL 1.1.1.
 
 ssl-server-verify [none|required]
   The default behavior for SSL verify on servers side. If specified to 'none',
@@ -3135,6 +3176,18 @@ tune.h1.zero-copy-fwd-send { on | off }
 
   See also: tune.disable-zero-copy-forwarding, tune.h1.zero-copy-fwd-recv
 
+tune.h2.be.glitches-threshold <number>
+  Sets the threshold for the number of glitches on a backend connection, where
+  that connection will automatically be killed. This allows to automatically
+  kill misbehaving connections without having to write explicit rules for them.
+  The default value is zero, indicating that no threshold is set so that no
+  event will cause a connection to be closed. Beware that some H2 servers may
+  occasionally cause a few glitches over long lasting connection, so any non-
+  zero value here should probably be in the hundreds or thousands to be
+  effective without affecting slightly bogus servers.
+
+  See also: tune.h2.fe.glitches-threshold, bc_glitches
+
 tune.h2.be.initial-window-size <number>
   Sets the HTTP/2 initial window size for outgoing connections, which is the
   number of bytes the server can respond before waiting for an acknowledgment
@@ -3159,6 +3212,18 @@ tune.h2.be.max-concurrent-streams <number>
   clients sharing a connection (keep tune.h2.be.initial-window-size low in this
   case). It is highly recommended not to increase this value; some might find
   it optimal to run at low values (1..5 typically).
+
+tune.h2.fe.glitches-threshold <number>
+  Sets the threshold for the number of glitches on a frontend connection, where
+  that connection will automatically be killed. This allows to automatically
+  kill misbehaving connections without having to write explicit rules for them.
+  The default value is zero, indicating that no threshold is set so that no
+  event will cause a connection to be closed. Beware that some H2 clientss may
+  occasionally cause a few glitches over long lasting connection, so any non-
+  zero value here should probably be in the hundreds or thousands to be
+  effective without affecting slightly bogus clients.
+
+  See also: tune.h2.be.glitches-threshold, fc_glitches
 
 tune.h2.fe.initial-window-size <number>
   Sets the HTTP/2 initial window size for incoming connections, which is the
@@ -3705,6 +3770,15 @@ tune.recv_enough <number>
   may be changed by this setting to better deal with workloads involving lots
   of short messages such as telnet or SSH sessions.
 
+tune.ring.queues <number>
+  Sets the number of write queues in front of ring buffers. This can have an
+  effect on the CPU usage of traces during debugging sessions, and both too
+  low or too large a value can have an important effect. The good value was
+  determined experimentally by developers and there should be no reason to
+  try to change it unless instructed to do so in order to try to address
+  specific issues. Such a setting should not be left in the configuration
+  across version upgrades because its optimal value may evolve over time.
+
 tune.runqueue-depth <number>
   Sets the maximum amount of task that can be processed at once when running
   tasks. The default value depends on the number of threads but sits between 35
@@ -3884,6 +3958,15 @@ tune.ssl.ocsp-update.mindelay <number>
   expiration times. It must be set to a lower value than
   "tune.ssl.ocsp-update.maxdelay". See option "ocsp-update" for more
   information about the auto update mechanism.
+
+tune.ssl.ocsp-update.mode [ on | off ]
+  Sets the default ocsp-update mode for all certificates used in the
+  configuration. This global option can be superseded by the crt-list
+  "ocsp-update" option but an error will be raised if a given certificate has
+  two distinct configurations simultaneously. This option is set to "off" by
+  default.
+  See option "ocsp-update" for more information about the auto update
+  mechanism.
 
 tune.stick-counters <number>
   Sets the number of stick-counters that may be tracked at the same time by a
@@ -7535,7 +7618,11 @@ http-reuse { never | safe | aggressive | always }
   with the request.
 
   Also note that connections with certain bogus authentication schemes (relying
-  on the connection) like NTLM are marked private and never shared.
+  on the connection) like NTLM are marked private if possible and never shared.
+  This won't be the case however when using a protocol with multiplexing
+  abilities and using reuse mode level value greater than the default "safe"
+  strategy as in this case nothing prevents the connection from being already
+  shared.
 
   A connection pool is involved and configurable with "pool-max-conn".
 
@@ -13806,7 +13893,7 @@ sc-inc-gpc0                    X     X     X     X            X   X   X
 sc-inc-gpc1                    X     X     X     X            X   X   X
 sc-set-gpt                     X     X     X     X            X   X   X
 sc-set-gpt0                    X     X     X     X            X   X   X
-send-spoe-group                -     -     X     X            X   X   -
+send-spoe-group (deprecated)   -     -     X     X            X   X   -
 set-bandwidth-limit            -     -     X     X            X   X   -
 set-bc-mark                    -     -     X     -            X   -   -
 set-bc-tos                     -     -     X     -            X   -   -
@@ -14667,7 +14754,7 @@ sc-set-gpt0(<sc-id>) { <int> | <expr> }
   See also the "sc-set-gpt" action.
 
 
-send-spoe-group <engine-name> <group-name>
+send-spoe-group <engine-name> <group-name> (deprecated)
   Usable in:  TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
                     -  |   -  |   X  |   X  |          X |  X |  -
 
@@ -15507,11 +15594,26 @@ ciphers <ciphers>
 ciphersuites <ciphersuites>
   This setting is only available when support for OpenSSL was built in and
   OpenSSL 1.1.1 or later was used to build HAProxy. It sets the string describing
-  the list of cipher algorithms in "cipher suite" format that are negotiated
-  during the TLS handshake. The format of the string is defined in "man 1
-  ciphers" from OpenSSL man pages under the "ciphersuites" section. For cipher
-  configuration for TLSv1.2 and earlier using the "OpenSSL" ciphers format,
-  please check the "ciphers" keyword.
+  the list of cipher algorithms ("cipher suite") that are negotiated during the
+  TLSv1.3 handshake. The format of the string is defined in "man 1 ciphers" from
+  OpenSSL man pages under the "ciphersuites" section. For cipher configuration
+  for TLSv1.2 and earlier, please check the "ciphers" keyword.
+  This setting might accept TLSv1.2 ciphersuites however this is an
+  undocumented behavior and not recommended as it could be inconsistent or buggy.
+  The default TLSv1.3 ciphersuites of OpenSSL are:
+  "TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_GCM_SHA256"
+
+  TLSv1.3 only supports 5 ciphersuites:
+
+  - TLS_AES_128_GCM_SHA256
+  - TLS_AES_256_GCM_SHA384
+  - TLS_CHACHA20_POLY1305_SHA256
+  - TLS_AES_128_CCM_SHA256
+  - TLS_AES_128_CCM_8_SHA256
+
+  Example:
+          ciphers ECDHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-CHACHA20-POLY1305:ECDHE-RSA-AES128-GCM-SHA256
+          ciphersuites TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_GCM_SHA256
 
 client-sigalgs <sigalgs>
   This setting is only available when support for OpenSSL was built in. It sets
@@ -15954,11 +16056,15 @@ ocsp-update [ off | on ] (crt-list only)
   Its value defaults to 'off'.
   Please note that for now, this option can only be used in a crt-list line, it
   cannot be used directly on a bind line. It lies in this "Bind options"
-  section because it is still a frontend option. This limitation was set so
-  that the option applies to only one certificate at a time.
+  section because it is still a frontend option. For now, the only way to
+  enable OCSP auto update on a bind line certificate is via the global option
+  "tune.ocsp-update.mode".
   If a given certificate is used in multiple crt-lists with different values of
-  the 'ocsp-update' set, an error will be raised. Here is an example
-  configuration enabling it:
+  the 'ocsp-update' set, an error will be raised. Likewise, if a certificate
+  inherits from the global option on a bind line and has an incompatible
+  explicit 'ocsp-update' option set in a crt-list, the same error will be
+  raised.
+  Here is an example configuration enabling it:
 
   haproxy.cfg:
       frontend fe
@@ -15976,12 +16082,12 @@ ocsp-update [ off | on ] (crt-list only)
   hour limit. A minimum update interval of 5 minutes will still exist in order
   to avoid updating too often responses that have a really short expire time or
   even no 'Next Update' at all. Because of this hard limit, please note that
-  when auto update is set to 'on' or 'auto', any OCSP response loaded during
-  init will not be updated until at least 5 minutes, even if its expire time
-  ends before now+5m. This should not be too much of a hassle since an OCSP
-  response must be valid when it gets loaded during init (its expire time must
-  be in the future) so it is unlikely that this response expires in such a
-  short time after init.
+  when auto update is set to 'on', any OCSP response loaded during init will
+  not be updated until at least 5 minutes, even if its expire time ends before
+  now+5m. This should not be too much of a hassle since an OCSP response must
+  be valid when it gets loaded during init (its expire time must be in the
+  future) so it is unlikely that this response expires in such a short time
+  after init.
   On the other hand, if a certificate has an OCSP uri specified and no OCSP
   response, setting this option to 'on' for the given certificate will ensure
   that the OCSP response gets fetched automatically right after init.
@@ -15991,8 +16097,8 @@ ocsp-update [ off | on ] (crt-list only)
 
   Whenever an OCSP response is updated by the auto update task or following a
   call to the "update ssl ocsp-response" CLI command, a dedicated log line is
-  emitted. It follows a dedicated log-format that contains the following header
-  "%ci:%cp [%tr] %ft" and is followed by specific OCSP-related information:
+  emitted. It follows a dedicated format that contains the following header
+  "<OCSP-UPDATE>" and is followed by specific OCSP-related information:
     - the path of the corresponding frontend certificate
     - a numerical update status
     - a textual update status
@@ -16012,12 +16118,12 @@ ocsp-update [ off | on ] (crt-list only)
   Here are two examples of such log lines, with a successful OCSP update log
   line first and then an example of an HTTP error with the two different lines
   (lines were spit and the URL was shortened for readability):
-    <134>Mar  6 11:16:53 haproxy[14872]: -:- [06/Mar/2023:11:16:52.808] \
-            <OCSP-UPDATE> /path_to_cert/foo.pem 1 "Update successful" 0 1
+    <133>Mar  6 11:16:53 haproxy[14872]: <OCSP-UPDATE> /path_to_cert/foo.pem 1 \
+            "Update successful" 0 1
 
-    <134>Mar  6 11:18:55 haproxy[14872]: -:- [06/Mar/2023:11:18:54.207] \
-            <OCSP-UPDATE> /path_to_cert/bar.pem 2 "HTTP error" 1 0
-    <134>Mar  6 11:18:55 haproxy[14872]: -:- [06/Mar/2023:11:18:52.200] \
+    <133>Mar  6 11:18:55 haproxy[14872]: <OCSP-UPDATE> /path_to_cert/bar.pem 2 \
+            "HTTP error" 1 0
+    <133>Mar  6 11:18:55 haproxy[14872]: -:- [06/Mar/2023:11:18:52.200] \
             <OCSP-UPDATE> -/- 2/0/-1/-1/3009 503 217 - - SC-- 0/0/0/0/3 0/0 {} \
             "GET http://127.0.0.1:12345/MEMwQT HTTP/1.1"
 
@@ -16650,11 +16756,11 @@ ciphersuites <ciphersuites>
 
   This setting is only available when support for OpenSSL was built in and
   OpenSSL 1.1.1 or later was used to build HAProxy. This option sets the string
-  describing the list of cipher algorithms in "cipher suite" format that is
-  negotiated during the TLS handshake with the server. The format of the string
-  is defined in "man 1 ciphers" from OpenSSL man pages under the "ciphersuites"
-  section. For cipher configuration for TLSv1.2 and earlier using the "OpenSSL"
-  cipher format, please check the "ciphers" keyword.
+  describing the list of cipher algorithms that is negotiated during the TLS
+  1.3 handshake with the server. The format of the string is defined in
+  "man 1 ciphers" from OpenSSL man pages under the "ciphersuites" section.
+  For cipher configuration for TLSv1.2 and earlier, please check the "ciphers"
+  keyword.
 
 client-sigalgs <sigalgs>
   May be used in the following contexts: tcp, http, log, peers, ring
@@ -26545,6 +26651,9 @@ the Stream Processing Offload Protocol (SPOP).
 
 For all information about the SPOE configuration and the SPOP specification, see
 "doc/SPOE.txt".
+
+WARNING: The SPOE filter is now deprecated. Use 'expose-deprecated-directives'
+         to silent warnings if you must use it.
 
 9.4. Cache
 ----------

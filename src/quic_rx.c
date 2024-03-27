@@ -740,8 +740,11 @@ static int qc_handle_crypto_frm(struct quic_conn *qc,
 		goto leave;
 	}
 
-	if (ncb_data(ncbuf, 0))
+	/* Reschedule with TASK_HEAVY if CRYPTO data ready for decoding. */
+	if (ncb_data(ncbuf, 0)) {
 		HA_ATOMIC_OR(&qc->wait_event.tasklet->state, TASK_HEAVY);
+		tasklet_wakeup(qc->wait_event.tasklet);
+	}
 
  done:
 	ret = 1;
@@ -1152,50 +1155,6 @@ static void qc_rm_hp_pkts(struct quic_conn *qc, struct quic_enc_level *el)
 	TRACE_LEAVE(QUIC_EV_CONN_ELRMHP, qc);
 }
 
-/* Process all the CRYPTO frame at <el> encryption level. This is the
- * responsibility of the called to ensure there exists a CRYPTO data
- * stream for this level.
- * Return 1 if succeeded, 0 if not.
- */
-int qc_treat_rx_crypto_frms(struct quic_conn *qc, struct quic_enc_level *el,
-                            struct ssl_sock_ctx *ctx)
-{
-	int ret = 0;
-	struct ncbuf *ncbuf;
-	struct quic_cstream *cstream = el->cstream;
-	ncb_sz_t data;
-
-	TRACE_ENTER(QUIC_EV_CONN_PHPKTS, qc);
-
-	BUG_ON(!cstream);
-	ncbuf = &cstream->rx.ncbuf;
-	if (ncb_is_null(ncbuf))
-		goto done;
-
-	/* TODO not working if buffer is wrapping */
-	while ((data = ncb_data(ncbuf, 0))) {
-		const unsigned char *cdata = (const unsigned char *)ncb_head(ncbuf);
-
-		if (!qc_ssl_provide_quic_data(&el->cstream->rx.ncbuf, el->level,
-		                              ctx, cdata, data))
-			goto leave;
-
-		cstream->rx.offset += data;
-		TRACE_DEVEL("buffered crypto data were provided to TLS stack",
-		            QUIC_EV_CONN_PHPKTS, qc, el);
-	}
-
- done:
-	ret = 1;
- leave:
-	if (!ncb_is_null(ncbuf) && ncb_is_empty(ncbuf)) {
-		TRACE_DEVEL("freeing crypto buf", QUIC_EV_CONN_PHPKTS, qc, el);
-		quic_free_ncbuf(ncbuf);
-	}
-	TRACE_LEAVE(QUIC_EV_CONN_PHPKTS, qc);
-	return ret;
-}
-
 /* Check if it's possible to remove header protection for packets related to
  * encryption level <qel>. If <qel> is NULL, assume it's false.
  *
@@ -1323,15 +1282,6 @@ int qc_treat_rx_pkts(struct quic_conn *qc)
 			/* Update the largest acknowledged packet timestamps */
 			qel->pktns->rx.largest_time_received = largest_pn_time_received;
 			qel->pktns->flags |= QUIC_FL_PKTNS_NEW_LARGEST_PN;
-		}
-
-		if (qel->cstream) {
-			struct ncbuf *ncbuf = &qel->cstream->rx.ncbuf;
-
-			if (!ncb_is_null(ncbuf) && ncb_data(ncbuf, 0)) {
-				/* Some in order CRYPTO data were bufferized. */
-				HA_ATOMIC_OR(&qc->wait_event.tasklet->state, TASK_HEAVY);
-			}
 		}
 
 		/* Release the Initial encryption level and packet number space. */

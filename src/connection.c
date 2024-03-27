@@ -474,7 +474,7 @@ void conn_init(struct connection *conn, void *target)
 	conn->proxy_netns = NULL;
 	MT_LIST_INIT(&conn->toremove_list);
 	if (conn_is_back(conn))
-		LIST_INIT(&conn->session_list);
+		LIST_INIT(&conn->sess_el);
 	else
 		LIST_INIT(&conn->stopping_list);
 	LIST_INIT(&conn->tlv_list);
@@ -511,12 +511,12 @@ static int conn_backend_init(struct connection *conn)
  */
 static void conn_backend_deinit(struct connection *conn)
 {
-	/* If the connection is owned by the session, remove it from its list
-	 */
-	if (conn_is_back(conn) && LIST_INLIST(&conn->session_list)) {
+	/* If the connection is owned by the session, remove it from its list. */
+	if (LIST_INLIST(&conn->sess_el))
 		session_unown_conn(conn->owner, conn);
-	}
-	else if (!(conn->flags & CO_FL_PRIVATE)) {
+
+	/* If the connection is not private, it is accounted by the server. */
+	if (!(conn->flags & CO_FL_PRIVATE)) {
 		if (obj_type(conn->target) == OBJ_TYPE_SERVER)
 			srv_release_conn(__objt_server(conn->target), conn);
 	}
@@ -601,6 +601,21 @@ void conn_free(struct connection *conn)
 
 	conn_force_unsubscribe(conn);
 	pool_free(pool_head_connection, conn);
+}
+
+/* Close all <conn> internal layers accordingly prior to freeing it. */
+void conn_release(struct connection *conn)
+{
+	if (conn->mux) {
+		conn->mux->destroy(conn->ctx);
+	}
+	else {
+		conn_stop_tracking(conn);
+		conn_full_close(conn);
+		if (conn->destroy_cb)
+			conn->destroy_cb(conn);
+		conn_free(conn);
+	}
 }
 
 struct conn_hash_node *conn_alloc_hash_node(struct connection *conn)

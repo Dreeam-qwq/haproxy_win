@@ -2120,6 +2120,39 @@ static int ssl_parse_global_ca_crt_base(char **args, int section_type, struct pr
 	return 0;
 }
 
+/* parse the "ssl-security-level" keyword in global section.  */
+static int ssl_parse_security_level(char **args, int section_type, struct proxy *curpx,
+					 const struct proxy *defpx, const char *file, int linenum,
+					 char **err)
+{
+#ifndef HAVE_SSL_SET_SECURITY_LEVEL
+	memprintf(err, "global statement '%s' requires at least OpenSSL 1.1.1.", args[0]);
+	return -1;
+#else
+	char *endptr;
+
+	if (!*args[1]) {
+		ha_alert("parsing [%s:%d] : '%s' : missing value\n", file, linenum, args[0]);
+		return -1;
+	}
+
+	global_ssl.security_level = strtol(args[1], &endptr, 10);
+	if (*endptr != '\0') {
+		ha_alert("parsing [%s:%d] : '%s' : expects an integer argument, found '%s'\n",
+			 file, linenum, args[0], args[1]);
+		return -1;
+	}
+
+	if (global_ssl.security_level < 0 || global_ssl.security_level > 5) {
+		ha_alert("parsing [%s:%d] : '%s' : expects a value between 0 and 5\n",
+			 file, linenum, args[0]);
+		return -1;
+	}
+#endif
+
+	return 0;
+}
+
 /* parse the "ssl-skip-self-issued-ca" keyword in global section.  */
 static int ssl_parse_skip_self_issued_ca(char **args, int section_type, struct proxy *curpx,
 					 const struct proxy *defpx, const char *file, int line,
@@ -2188,6 +2221,35 @@ static int ssl_parse_global_ocsp_mindelay(char **args, int section_type, struct 
 
 	return 0;
 }
+
+static int ssl_parse_global_ocsp_update_mode(char **args, int section_type, struct proxy *curpx,
+                                             const struct proxy *defpx, const char *file, int line,
+                                             char **err)
+{
+	int ret = 0;
+
+	if (!*args[1]) {
+		memprintf(err, "'%s' : expecting <on|off>", args[0]);
+		return ERR_ALERT | ERR_FATAL;
+	}
+
+	if (strcmp(args[1], "on") == 0)
+		global_ssl.ocsp_update.mode = SSL_SOCK_OCSP_UPDATE_ON;
+	else if (strcmp(args[1], "off") == 0)
+		global_ssl.ocsp_update.mode = SSL_SOCK_OCSP_UPDATE_OFF;
+	else {
+		memprintf(err, "'%s' : expecting <on|off>", args[0]);
+		return ERR_ALERT | ERR_FATAL;
+	}
+
+	if (global_ssl.ocsp_update.mode != SSL_SOCK_OCSP_UPDATE_OFF) {
+		/* We might need to create the main ocsp update task */
+		ret = ssl_create_ocsp_update_task(err);
+	}
+
+	return ret;
+}
+
 
 
 
@@ -2343,6 +2405,7 @@ static struct cfg_kw_list cfg_kws = {ILH, {
 	{ CFG_GLOBAL, "ssl-provider",  ssl_parse_global_ssl_provider },
 	{ CFG_GLOBAL, "ssl-provider-path",  ssl_parse_global_ssl_provider_path },
 #endif
+	{ CFG_GLOBAL, "ssl-security-level", ssl_parse_security_level },
 	{ CFG_GLOBAL, "ssl-skip-self-issued-ca", ssl_parse_skip_self_issued_ca },
 	{ CFG_GLOBAL, "tune.ssl.cachesize", ssl_parse_global_int },
 #ifndef OPENSSL_NO_DH
@@ -2377,6 +2440,7 @@ static struct cfg_kw_list cfg_kws = {ILH, {
 #ifndef OPENSSL_NO_OCSP
 	{ CFG_GLOBAL, "tune.ssl.ocsp-update.maxdelay", ssl_parse_global_ocsp_maxdelay },
 	{ CFG_GLOBAL, "tune.ssl.ocsp-update.mindelay", ssl_parse_global_ocsp_mindelay },
+	{ CFG_GLOBAL, "tune.ssl.ocsp-update.mode", ssl_parse_global_ocsp_update_mode },
 #endif
 	{ 0, NULL, NULL },
 }};

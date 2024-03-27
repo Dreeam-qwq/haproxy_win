@@ -136,9 +136,11 @@ struct global_ssl global_ssl = {
 #ifdef HAVE_SSL_KEYLOG
 	.keylog = 0,
 #endif
+	.security_level = -1,
 #ifndef OPENSSL_NO_OCSP
 	.ocsp_update.delay_max = SSL_OCSP_UPDATE_DELAY_MAX,
 	.ocsp_update.delay_min = SSL_OCSP_UPDATE_DELAY_MIN,
+	.ocsp_update.mode = SSL_SOCK_OCSP_UPDATE_DFLT,
 #endif
 };
 
@@ -1123,24 +1125,29 @@ static int ssl_sock_load_ocsp(const char *path, SSL_CTX *ctx, struct ckch_data *
 	struct buffer *ocsp_uri = get_trash_chunk();
 	char *err = NULL;
 	size_t path_len;
+	int inc_refcount_store = 0;
+	int enable_auto_update = (data->ocsp_update_mode == SSL_SOCK_OCSP_UPDATE_ON ||
+				  (data->ocsp_update_mode == SSL_SOCK_OCSP_UPDATE_DFLT &&
+				   global_ssl.ocsp_update.mode == SSL_SOCK_OCSP_UPDATE_ON));
 
 	x = data->cert;
 	if (!x)
 		goto out;
 
 	ssl_ocsp_get_uri_from_cert(x, ocsp_uri, &err);
-	/* We should have an "OCSP URI" field in order for auto update to work. */
-	if (data->ocsp_update_mode == SSL_SOCK_OCSP_UPDATE_ON && b_data(ocsp_uri) == 0)
-		goto out;
-
-	/* In case of ocsp update mode set to 'on', this function might be
-	 * called with no known ocsp response. If no ocsp uri can be found in
-	 * the certificate, nothing needs to be done here. */
 	if (!data->ocsp_response && !data->ocsp_cid) {
-		if (data->ocsp_update_mode != SSL_SOCK_OCSP_UPDATE_ON || b_data(ocsp_uri) == 0) {
+		/* In case of ocsp update mode set to 'on', this function might
+		 * be called with no known ocsp response. If no ocsp uri can be
+		 * found in the certificate, nothing needs to be done here. */
+		if (!enable_auto_update || b_data(ocsp_uri) == 0) {
 			ret = 0;
 			goto out;
 		}
+	} else {
+		/* If we have an OCSP response provided and the ocsp auto update
+		 * enabled, we must raise an error if no OCSP URI was found. */
+		if (data->ocsp_update_mode == SSL_SOCK_OCSP_UPDATE_ON && b_data(ocsp_uri) == 0)
+			goto out;
 	}
 
 	issuer = data->ocsp_issuer;
@@ -1158,8 +1165,10 @@ static int ssl_sock_load_ocsp(const char *path, SSL_CTX *ctx, struct ckch_data *
 	if (!issuer)
 		goto out;
 
-	if (!data->ocsp_cid)
+	if (!data->ocsp_cid) {
 		data->ocsp_cid = OCSP_cert_to_id(0, x, issuer);
+		inc_refcount_store = 1;
+	}
 	if (!data->ocsp_cid)
 		goto out;
 
@@ -1185,6 +1194,9 @@ static int ssl_sock_load_ocsp(const char *path, SSL_CTX *ctx, struct ckch_data *
 	*cb = (void (*) (void))ctx->tlsext_status_cb;
 #endif
 	SSL_CTX_get_tlsext_status_cb(ctx, &callback);
+
+	if (inc_refcount_store)
+		iocsp->refcount_store++;
 
 	if (!callback) {
 		struct ocsp_cbk_arg *cb_arg;
@@ -1277,7 +1289,7 @@ static int ssl_sock_load_ocsp(const char *path, SSL_CTX *ctx, struct ckch_data *
 		 */
 		memcpy(iocsp->path, path, path_len + 1);
 
-		if (data->ocsp_update_mode == SSL_SOCK_OCSP_UPDATE_ON) {
+		if (enable_auto_update) {
 			ssl_ocsp_update_insert(iocsp);
 			/* If we are during init the update task is not
 			 * scheduled yet so a wakeup won't do anything.
@@ -1289,7 +1301,7 @@ static int ssl_sock_load_ocsp(const char *path, SSL_CTX *ctx, struct ckch_data *
 			if (ocsp_update_task)
 				task_wakeup(ocsp_update_task, TASK_WOKEN_MSG);
 		}
-	} else if (iocsp->uri && data->ocsp_update_mode == SSL_SOCK_OCSP_UPDATE_ON) {
+	} else if (iocsp->uri && enable_auto_update) {
 		/* This unlikely case can happen if a series of "del ssl
 		 * crt-list" / "add ssl crt-list" commands are made on the CLI.
 		 * In such a case, the OCSP response tree entry will be created
@@ -3458,6 +3470,9 @@ int ckch_inst_new_load_store(const char *path, struct ckch_store *ckchs, struct 
 		goto error;
 	}
 
+	if (global_ssl.security_level > -1)
+		SSL_CTX_set_security_level(ctx, global_ssl.security_level);
+
 	errcode |= ssl_sock_put_ckch_into_ctx(path, data, ctx, err);
 	if (errcode & ERR_CODE)
 		goto error;
@@ -3611,6 +3626,9 @@ int ckch_inst_new_load_srv_store(const char *path, struct ckch_store *ckchs,
 		errcode |= ERR_ALERT | ERR_FATAL;
 		goto error;
 	}
+
+	if (global_ssl.security_level > -1)
+		SSL_CTX_set_security_level(ctx, global_ssl.security_level);
 
 	errcode |= ssl_sock_put_srv_ckch_into_ctx(path, data, ctx, err);
 	if (errcode & ERR_CODE)
@@ -3829,6 +3847,13 @@ int ssl_sock_load_cert(char *path, struct bind_conf *bind_conf, int is_default, 
 	if ((ckchs = ckchs_lookup(path))) {
 		/* we found the ckchs in the tree, we can use it directly */
 		 cfgerr |= ssl_sock_load_ckchs(path, ckchs, bind_conf, NULL, NULL, 0, is_default, &ckch_inst, err);
+
+		 /* The ckch_store might have been created through a crt-list
+		  * line so we must check that the ocsp-update modes are still
+		  * compatible between the global mode and the explicit one from
+		  * the crt-list. */
+		 cfgerr |= ocsp_update_check_cfg_consistency(ckchs, NULL, path, err);
+
 		 found++;
 	} else if (stat(path, &buf) == 0) {
 		found++;
@@ -3958,6 +3983,9 @@ ssl_sock_initial_ctx(struct bind_conf *bind_conf)
 
 	ctx = SSL_CTX_new(SSLv23_server_method());
 	bind_conf->initial_ctx = ctx;
+
+	if (global_ssl.security_level > -1)
+		SSL_CTX_set_security_level(ctx, global_ssl.security_level);
 
 	if (conf_ssl_methods->flags && (conf_ssl_methods->min || conf_ssl_methods->max))
 		ha_warning("Proxy '%s': no-sslv3/no-tlsv1x are ignored for bind '%s' at [%s:%d]. "
@@ -4955,6 +4983,8 @@ int ssl_sock_prepare_srv_ctx(struct server *srv)
 			cfgerr++;
 			return cfgerr;
 		}
+		if (global_ssl.security_level > -1)
+			SSL_CTX_set_security_level(ctx, global_ssl.security_level);
 
 		srv->ssl_ctx.ctx = ctx;
 	}
@@ -6133,19 +6163,26 @@ static int ssl_unsubscribe(struct connection *conn, void *xprt_ctx, int event_ty
  * It should be called with the takeover lock for the old thread held.
  * Returns 0 on success, and -1 on failure
  */
-static int ssl_takeover(struct connection *conn, void *xprt_ctx, int orig_tid)
+static int ssl_takeover(struct connection *conn, void *xprt_ctx, int orig_tid, int release)
 {
 	struct ssl_sock_ctx *ctx = xprt_ctx;
-	struct tasklet *tl = tasklet_new();
+	struct tasklet *tl = NULL;
 
-	if (!tl)
-		return -1;
+	if (!release) {
+		tl = tasklet_new();
+		if (!tl)
+			return -1;
+	}
 
 	ctx->wait_event.tasklet->context = NULL;
 	tasklet_wakeup_on(ctx->wait_event.tasklet, orig_tid);
+
 	ctx->wait_event.tasklet = tl;
-	ctx->wait_event.tasklet->process = ssl_sock_io_cb;
-	ctx->wait_event.tasklet->context = ctx;
+	if (!release) {
+		ctx->wait_event.tasklet->process = ssl_sock_io_cb;
+		ctx->wait_event.tasklet->context = ctx;
+	}
+
 	return 0;
 }
 
@@ -7490,6 +7527,8 @@ static void __ssl_sock_init(void)
 	xprt_register(XPRT_SSL, &ssl_sock);
 #if HA_OPENSSL_VERSION_NUMBER < 0x10100000L
 	SSL_library_init();
+#elif HA_OPENSSL_VERSION_NUMBER >= 0x10100000L
+	OPENSSL_init_ssl(0, NULL);
 #endif
 #if (!defined(OPENSSL_NO_COMP) && !defined(SSL_OP_NO_COMPRESSION))
 	cm = SSL_COMP_get_compression_methods();

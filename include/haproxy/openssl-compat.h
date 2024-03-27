@@ -118,6 +118,16 @@
 #define HAVE_SSL_0RTT_QUIC
 #endif
 
+
+#if defined(SSL_CTX_set_security_level) || HA_OPENSSL_VERSION_NUMBER >= 0x1010100fL
+#define HAVE_SSL_SET_SECURITY_LEVEL
+#endif
+
+#if !defined(HAVE_SSL_SET_SECURITY_LEVEL)
+/* define a nope function for set_security_level */
+#define SSL_CTX_set_security_level(ctx, level) ({})
+#endif
+
 #if (HA_OPENSSL_VERSION_NUMBER >= 0x3000000fL)
 #define HAVE_OSSL_PARAM
 #define MAC_CTX EVP_MAC_CTX

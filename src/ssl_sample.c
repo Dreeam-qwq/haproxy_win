@@ -280,7 +280,7 @@ static int sample_conv_aes_gcm(const struct arg *arg_p, struct sample *smp, void
 {
 	struct sample nonce, key, aead_tag;
 	struct buffer *smp_trash = NULL, *smp_trash_alloc = NULL;
-	EVP_CIPHER_CTX *ctx;
+	EVP_CIPHER_CTX *ctx = NULL;
 	int size, ret, dec;
 
 	smp_trash_alloc = alloc_trash_chunk();
@@ -393,7 +393,6 @@ static int sample_conv_aes_gcm(const struct arg *arg_p, struct sample *smp, void
 
 		aead_tag.data.u.str.data = ret;
 		aead_tag.data.type = SMP_T_STR;
-		aead_tag.flags &= ~SMP_F_CONST;
 
 		if (!var_set(arg_p[3].data.var.name_hash, arg_p[3].data.var.scope, &aead_tag,
 		             (arg_p[3].data.var.scope == SCOPE_PROC) ? VF_COND_IFEXISTS : 0)) {
@@ -407,11 +406,13 @@ static int sample_conv_aes_gcm(const struct arg *arg_p, struct sample *smp, void
 	smp_dup(smp);
 	free_trash_chunk(smp_trash_alloc);
 	free_trash_chunk(smp_trash);
+	EVP_CIPHER_CTX_free(ctx);
 	return 1;
 
 err:
 	free_trash_chunk(smp_trash_alloc);
 	free_trash_chunk(smp_trash);
+	EVP_CIPHER_CTX_free(ctx);
 	return 0;
 }
 #endif
@@ -1404,7 +1405,9 @@ smp_fetch_ssl_fc_ec(const struct arg *args, struct sample *smp, const char *kw, 
 		 * different functional calls and to make it consistent while upgrading OpenSSL versions,
 		 * will convert the curve name returned by SSL_get0_group_name to upper case.
 		 */
-		for (int i = 0; curve_name[i]; i++)
+		int i;
+
+		for (i = 0; curve_name[i]; i++)
 			curve_name[i] = toupper(curve_name[i]);
 	}
 # else

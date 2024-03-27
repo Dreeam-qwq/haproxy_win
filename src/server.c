@@ -2474,8 +2474,10 @@ static void srv_conn_src_cpy(struct server *srv, const struct server *src)
 	srv->conn_src.bind_hdr_occ = src->conn_src.bind_hdr_occ;
 	srv->conn_src.tproxy_addr  = src->conn_src.tproxy_addr;
 #endif
-	if (src->conn_src.iface_name != NULL)
+	if (src->conn_src.iface_name != NULL) {
 		srv->conn_src.iface_name = strdup(src->conn_src.iface_name);
+		srv->conn_src.iface_len = src->conn_src.iface_len;
+	}
 }
 
 /*
@@ -2819,6 +2821,8 @@ struct server *new_server(struct proxy *proxy)
 	srv->agent.proxy = proxy;
 	srv->xprt  = srv->check.xprt = srv->agent.xprt = xprt_get(XPRT_RAW);
 
+	MT_LIST_INIT(&srv->sess_conns);
+
 	srv->extra_counters = NULL;
 #ifdef USE_OPENSSL
 	HA_RWLOCK_INIT(&srv->ssl_ctx.lock);
@@ -3017,6 +3021,12 @@ static int _srv_parse_tmpl_init(struct server *srv, struct proxy *px)
 	int i;
 	struct server *newsrv;
 
+	/* Set the first server's ID. */
+	_srv_parse_set_id_from_prefix(srv, srv->tmpl_info.prefix, srv->tmpl_info.nb_low);
+	srv->conf.name.key = srv->id;
+	ebis_insert(&curproxy->conf.used_server_name, &srv->conf.name);
+
+	/* then create other servers from this one */
 	for (i = srv->tmpl_info.nb_low + 1; i <= srv->tmpl_info.nb_high; i++) {
 		newsrv = new_server(px);
 		if (!newsrv)
@@ -3816,7 +3826,7 @@ static void _srv_append_inetaddr_updater_info(struct buffer *out,
 				 * query
 				 */
 				BUG_ON(!r);
-				ns = find_nameserver_by_resolvers_and_id(r, updater.dns_resolver.ns_id);
+				ns = find_nameserver_by_resolvers_and_id(r, updater.u.dns_resolver.ns_id);
 				BUG_ON(!ns);
 				chunk_appendf(out, " by '%s/%s'", r->id, ns->id);
 			}
@@ -4467,11 +4477,11 @@ int snr_resolution_cb(struct resolv_requester *requester, struct dns_counters *c
 
  update_status:
 	if (has_no_ip && !snr_set_srv_down(s)) {
-		struct server_inetaddr s_addr;
+		struct server_inetaddr srv_addr;
 
-		memset(&s_addr, 0, sizeof(s_addr));
+		memset(&srv_addr, 0, sizeof(srv_addr));
 		/* unset server's addr */
-		server_set_inetaddr(s, &s_addr, SERVER_INETADDR_UPDATER_NONE, NULL);
+		server_set_inetaddr(s, &srv_addr, SERVER_INETADDR_UPDATER_NONE, NULL);
 	}
 	return 1;
 
@@ -4481,11 +4491,11 @@ int snr_resolution_cb(struct resolv_requester *requester, struct dns_counters *c
 		goto update_status;
 	}
 	if (has_no_ip && !snr_set_srv_down(s)) {
-		struct server_inetaddr s_addr;
+		struct server_inetaddr srv_addr;
 
-		memset(&s_addr, 0, sizeof(s_addr));
+		memset(&srv_addr, 0, sizeof(srv_addr));
 		/* unset server's addr */
-		server_set_inetaddr(s, &s_addr, SERVER_INETADDR_UPDATER_NONE, NULL);
+		server_set_inetaddr(s, &srv_addr, SERVER_INETADDR_UPDATER_NONE, NULL);
 	}
 	return 0;
 }
@@ -4567,11 +4577,11 @@ int snr_resolution_error_cb(struct resolv_requester *requester, int error_code)
 
 	HA_SPIN_LOCK(SERVER_LOCK, &s->lock);
 	if (!snr_set_srv_down(s)) {
-		struct server_inetaddr s_addr;
+		struct server_inetaddr srv_addr;
 
-		memset(&s_addr, 0, sizeof(s_addr));
+		memset(&srv_addr, 0, sizeof(srv_addr));
 		/* unset server's addr */
-		server_set_inetaddr(s, &s_addr, SERVER_INETADDR_UPDATER_NONE, NULL);
+		server_set_inetaddr(s, &srv_addr, SERVER_INETADDR_UPDATER_NONE, NULL);
 		HA_SPIN_UNLOCK(SERVER_LOCK, &s->lock);
 		resolv_detach_from_resolution_answer_items(requester->resolution, requester);
 		return 0;
@@ -5820,12 +5830,8 @@ int srv_check_for_deletion(const char *bename, const char *svname, struct proxy 
 	/* Second, conditions that may change over time */
 	ret = 0;
 
-	/* Ensure that there is no active/idle/pending connection on the server.
-	 *
-	 * TODO idle connections should not prevent server deletion. A proper
-	 * cleanup function should be implemented to be used here.
-	 */
-	if (srv->curr_used_conns || srv->curr_idle_conns ||
+	/* Ensure that there is no active/pending connection on the server. */
+	if (srv->curr_used_conns ||
 	    !eb_is_empty(&srv->queue.head) || srv_has_streams(srv)) {
 		msg = "Server still has connections attached to it, cannot remove it.";
 		goto leave;
@@ -5852,8 +5858,10 @@ static int cli_parse_delete_server(char **args, char *payload, struct appctx *ap
 	struct server *srv;
 	struct server *prev_del;
 	struct ist be_name, sv_name;
+	struct mt_list *elt1, elt2;
+	struct sess_priv_conns *sess_conns = NULL;
 	const char *msg;
-	int ret;
+	int ret, i;
 
 	if (!cli_has_level(appctx, ACCESS_LVL_ADMIN))
 		return 1;
@@ -5880,6 +5888,54 @@ static int cli_parse_delete_server(char **args, char *payload, struct appctx *ap
 		/* failure (recoverable or not) */
 		cli_err(appctx, msg);
 		goto out;
+	}
+
+	/* Close idle connections attached to this server. */
+	for (i = tid;;) {
+		struct list *list = &srv->per_thr[i].idle_conn_list;
+		struct connection *conn;
+
+		while (!LIST_ISEMPTY(list)) {
+			conn = LIST_ELEM(list->n, struct connection *, idle_list);
+			if (i != tid) {
+				if (conn->mux && conn->mux->takeover)
+					conn->mux->takeover(conn, i, 1);
+				else if (conn->xprt && conn->xprt->takeover)
+					conn->xprt->takeover(conn, conn->ctx, i, 1);
+			}
+			conn_release(conn);
+		}
+
+		if ((i = ((i + 1 == global.nbthread) ? 0 : i + 1)) == tid)
+			break;
+	}
+
+	/* All idle connections should be removed now. */
+	BUG_ON(srv->curr_idle_conns);
+
+	/* Close idle private connections attached to this server. */
+	mt_list_for_each_entry_safe(sess_conns, &srv->sess_conns, srv_el, elt1, elt2) {
+		struct connection *conn, *conn_back;
+		list_for_each_entry_safe(conn, conn_back, &sess_conns->conn_list, sess_el) {
+
+			/* Only idle connections should be present if srv_check_for_deletion() is true. */
+			BUG_ON(!(conn->flags & CO_FL_SESS_IDLE));
+
+			LIST_DEL_INIT(&conn->sess_el);
+			conn->owner = NULL;
+			conn->flags &= ~CO_FL_SESS_IDLE;
+			if (sess_conns->tid != tid) {
+				if (conn->mux && conn->mux->takeover)
+					conn->mux->takeover(conn, sess_conns->tid, 1);
+				else if (conn->xprt && conn->xprt->takeover)
+					conn->xprt->takeover(conn, conn->ctx, sess_conns->tid, 1);
+			}
+			conn_release(conn);
+		}
+
+		LIST_DELETE(&sess_conns->sess_el);
+		MT_LIST_DELETE_SAFE(elt1);
+		pool_free(pool_head_sess_priv_conns, sess_conns);
 	}
 
 	/* removing cannot fail anymore when we reach this:
