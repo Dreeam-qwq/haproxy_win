@@ -480,6 +480,10 @@
 
 #define CONFIG_HAP_POOL_BUCKETS (1UL << (CONFIG_HAP_POOL_BUCKETS_BITS))
 
+#ifndef CONFIG_HAP_TBL_BUCKETS
+# define CONFIG_HAP_TBL_BUCKETS CONFIG_HAP_POOL_BUCKETS
+#endif
+
 /* Number of samples used to compute the times reported in stats. A power of
  * two is highly recommended, and this value multiplied by the largest response
  * time must not overflow and unsigned int. See freq_ctr.h for more information.
@@ -550,6 +554,15 @@
  */
 #ifndef RING_DFLT_QUEUES
 # define RING_DFLT_QUEUES   6
+#endif
+
+/* Let's make DEBUG_STRICT default to 1 to get rid of it in the makefile */
+#ifndef DEBUG_STRICT
+# define DEBUG_STRICT 1
+#endif
+
+#if !defined(DEBUG_MEMORY_POOLS)
+# define DEBUG_MEMORY_POOLS 1
 #endif
 
 #endif /* _HAPROXY_DEFAULTS_H */

@@ -64,12 +64,23 @@ void syslog_fd_handler(int fd);
 int init_log_buffers(void);
 void deinit_log_buffers(void);
 
+void lf_expr_init(struct lf_expr *expr);
+int lf_expr_dup(const struct lf_expr *orig, struct lf_expr *dest);
+void lf_expr_xfer(struct lf_expr *src, struct lf_expr *dst);
+void lf_expr_deinit(struct lf_expr *expr);
+static inline int lf_expr_isempty(const struct lf_expr *expr)
+{
+	return !(expr->flags & LF_FL_COMPILED) || LIST_ISEMPTY(&expr->nodes);
+}
+int lf_expr_compile(struct lf_expr *lf_expr, struct arg_list *al, int options, int cap, char **err);
+int lf_expr_postcheck(struct lf_expr *lf_expr, struct proxy *px, char **err);
+
 /* Deinitialize log buffers used for syslog messages */
 void free_logformat_list(struct list *fmt);
 void free_logformat_node(struct logformat_node *node);
 
 /* build a log line for the session and an optional stream */
-int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t maxsize, struct list *list_format);
+int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t maxsize, struct lf_expr *lf_expr);
 
 /*
  * send a log for the stream when we have enough info about it.
@@ -85,16 +96,16 @@ void app_log(struct list *loggers, struct buffer *tag, int level, const char *fo
 /*
  * add to the logformat linked list
  */
-int add_to_logformat_list(char *start, char *end, int type, struct list *list_format, char **err);
+int add_to_logformat_list(char *start, char *end, int type, struct lf_expr *lf_expr, char **err);
 
 ssize_t syslog_applet_append_event(void *ctx, struct ist v1, struct ist v2, size_t ofs, size_t len);
 
 /*
  * Parse the log_format string and fill a linked list.
- * Variable name are preceded by % and composed by characters [a-zA-Z0-9]* : %varname
- * You can set arguments using { } : %{many arguments}varname
+ * Tag name are preceded by % and composed by characters [a-zA-Z0-9]* : %tagname
+ * You can set arguments using { } : %{many arguments}tagname
  */
-int parse_logformat_string(const char *str, struct proxy *curproxy, struct list *list_format, int options, int cap, char **err);
+int parse_logformat_string(const char *str, struct proxy *curproxy, struct lf_expr *lf_expr, int options, int cap, char **err);
 
 int postresolve_logger_list(struct list *loggers, const char *section, const char *section_name);
 
@@ -168,9 +179,9 @@ char * get_format_pid_sep2(int format, size_t *len);
 /*
  * Builds a log line for the stream (must be valid).
  */
-static inline int build_logline(struct stream *s, char *dst, size_t maxsize, struct list *list_format)
+static inline int build_logline(struct stream *s, char *dst, size_t maxsize, struct lf_expr *lf_expr)
 {
-	return sess_build_logline(strm_sess(s), s, dst, maxsize, list_format);
+	return sess_build_logline(strm_sess(s), s, dst, maxsize, lf_expr);
 }
 
 struct ist *build_log_header(struct log_header hdr, size_t *nbelem);

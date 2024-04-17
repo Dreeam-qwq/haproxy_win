@@ -269,7 +269,7 @@ struct appctx *appctx_new_on(struct applet *applet, struct sedesc *sedesc, int t
 
 	if (applet->rcv_buf != NULL && applet->snd_buf != NULL) {
 		appctx->t->process = task_process_applet;
-		appctx->flags |= APPCTX_FL_INOUT_BUFS;
+		applet_fl_set(appctx, APPCTX_FL_INOUT_BUFS);
 	}
 	else
 		appctx->t->process = task_run_applet;
@@ -516,7 +516,7 @@ size_t appctx_htx_rcv_buf(struct appctx *appctx, struct buffer *buf, size_t coun
 
 size_t appctx_raw_rcv_buf(struct appctx *appctx, struct buffer *buf, size_t count, unsigned int flags)
 {
-	return b_xfer(buf, &appctx->outbuf, MAX(count, b_data(&appctx->outbuf)));
+	return b_xfer(buf, &appctx->outbuf, MIN(count, b_data(&appctx->outbuf)));
 }
 
 size_t appctx_rcv_buf(struct stconn *sc, struct buffer *buf, size_t count, unsigned int flags)
@@ -593,14 +593,25 @@ size_t appctx_htx_snd_buf(struct appctx *appctx, struct buffer *buf, size_t coun
 	htx_to_buf(appctx_htx, &appctx->outbuf);
 	htx_to_buf(buf_htx, buf);
 	ret -= buf_htx->data;
-
 end:
+	if (ret < count) {
+		applet_fl_set(appctx, APPCTX_FL_INBLK_FULL);
+		TRACE_STATE("report appctx inbuf is full", APPLET_EV_SEND|APPLET_EV_BLK, appctx);
+	}
 	return ret;
 }
 
 size_t appctx_raw_snd_buf(struct appctx *appctx, struct buffer *buf, size_t count, unsigned flags)
 {
-	return b_xfer(&appctx->inbuf, buf, MIN(b_room(&appctx->inbuf), count));
+	size_t ret = 0;
+
+	ret = b_xfer(&appctx->inbuf, buf, MIN(b_room(&appctx->inbuf), count));
+	if (ret < count) {
+		applet_fl_set(appctx, APPCTX_FL_INBLK_FULL);
+		TRACE_STATE("report appctx inbuf is full", APPLET_EV_SEND|APPLET_EV_BLK, appctx);
+	}
+  end:
+	return ret;
 }
 
 size_t appctx_snd_buf(struct stconn *sc, struct buffer *buf, size_t count, unsigned int flags)
@@ -616,21 +627,16 @@ size_t appctx_snd_buf(struct stconn *sc, struct buffer *buf, size_t count, unsig
 	if (applet_fl_test(appctx, (APPCTX_FL_INBLK_FULL|APPCTX_FL_INBLK_ALLOC)))
 		goto end;
 
+	if (!count)
+		goto end;
+
 	if (!appctx_get_buf(appctx, &appctx->inbuf)) {
 		applet_fl_set(appctx, APPCTX_FL_INBLK_ALLOC);
 		TRACE_STATE("waiting for appctx inbuf allocation", APPLET_EV_SEND|APPLET_EV_BLK, appctx);
 		goto end;
 	}
 
-	if (!count)
-		goto end;
-
 	ret = appctx->applet->snd_buf(appctx, buf, count, flags);
-	if (ret < count) {
-		applet_fl_set(appctx, APPCTX_FL_INBLK_FULL);
-		appctx_wakeup(appctx);
-		TRACE_STATE("report appctx inbuf is full", APPLET_EV_SEND|APPLET_EV_BLK, appctx);
-	}
 
   end:
 	if (applet_fl_test(appctx, (APPCTX_FL_ERROR|APPCTX_FL_ERR_PENDING))) {
@@ -910,7 +916,8 @@ struct task *task_process_applet(struct task *t, void *context, unsigned int sta
 
 	TRACE_POINT(APPLET_EV_PROCESS, app);
 
-	if (b_data(&app->outbuf) || se_fl_test(app->sedesc, SE_FL_MAY_FASTFWD_PROD))
+	if (b_data(&app->outbuf) || se_fl_test(app->sedesc, SE_FL_MAY_FASTFWD_PROD) ||
+	    applet_fl_test(app, APPCTX_FL_EOI|APPCTX_FL_EOS|APPCTX_FL_ERROR))
 		applet_have_more_data(app);
 
 	sc_applet_sync_recv(sc);

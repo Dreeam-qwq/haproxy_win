@@ -147,7 +147,8 @@ struct stksess {
 	unsigned int expire;      /* session expiration date */
 	unsigned int ref_cnt;     /* reference count, can only purge when zero */
 	__decl_thread(HA_RWLOCK_T lock); /* lock related to the table entry */
-	int shard;                /* shard */
+	int shard;                /* shard number used by peers */
+	int seen;                 /* 0 only when no peer has seen this entry yet */
 	struct eb32_node exp;     /* ebtree node used to hold the session in expiration tree */
 	struct eb32_node upd;     /* ebtree node used to hold the update sequence tree */
 	struct ebmb_node key;     /* ebtree node used to hold the session in table */
@@ -197,8 +198,12 @@ struct stktable {
 
 	THREAD_ALIGN(64);
 
-	struct eb_root keys;      /* head of sticky session tree */
-	struct eb_root exps;      /* head of sticky session expiration tree */
+	struct {
+		struct eb_root keys;      /* head of sticky session tree */
+		struct eb_root exps;      /* head of sticky session expiration tree */
+		__decl_thread(HA_RWLOCK_T sh_lock); /* for the trees above */
+	} shards[CONFIG_HAP_TBL_BUCKETS];
+
 	unsigned int refcnt;     /* number of local peer over all peers sections
 				    attached to this table */
 	unsigned int current;     /* number of sticky sessions currently in table */

@@ -3,7 +3,7 @@
                           Configuration Manual
                          ----------------------
                               version 3.0
-                              2024/03/26
+                              2024/04/06
 
 
 This document covers the configuration language as implemented in the version
@@ -59,6 +59,7 @@ Summary
 3.9.      Rings
 3.10.     Log forwarding
 3.11.     HTTPClient tuning
+3.12.     Certificate Storage
 
 4.    Proxies
 4.1.      Proxy keywords matrix
@@ -1277,6 +1278,7 @@ The following keywords are supported in the "global" section :
    - insecure-fork-wanted
    - insecure-setuid-wanted
    - issuers-chain-path
+   - key-base
    - localpeer
    - log
    - log-send-hostname
@@ -1400,6 +1402,7 @@ The following keywords are supported in the "global" section :
    - tune.pool-high-fd-ratio
    - tune.pool-low-fd-ratio
    - tune.pt.zero-copy-forwarding
+   - tune.quic.cc-hystart
    - tune.quic.frontend.conn-tx-buffers.limit
    - tune.quic.frontend.max-idle-timeout
    - tune.quic.frontend.max-streams-bidi
@@ -2015,6 +2018,11 @@ issuers-chain-path <dir>
   "issuers-chain-path" directory. All other certificates with the same issuer
   will share the chain in memory.
 
+key-base <dir>
+  Assigns a default directory to fetch SSL private keys from when a relative
+  path is used with "key" directives. Absolute locations specified prevail and
+  ignore "key-base". This option only works with a crt-store load line.
+
 limited-quic
   This setting must be used to explicitly enable the QUIC listener bindings when
   haproxy is compiled against a TLS/SSL stack without QUIC support, typically
@@ -2272,20 +2280,29 @@ set-var-fmt <var-name> <fmt>
           set-var-fmt proc.bootid        "%pid|%t"
 
 setcap <name>[,<name>...]
-  Sets a list of capabilities that must be preserved when starting with uid 0
-  and switching to a non-zero uid. By default all permissions are lost by the
-  uid switch, but some are often needed when trying connecting to a server from
-  a foreign address during transparent proxying, or when binding to a port
-  below 1024, e.g. when using "tune.quic.socket-owner connection", resulting in
-  setups running entirely under uid 0. Setting capabilities generally is a
-  safer alternative, as only the required capabilities will be preserved. The
-  feature is OS-specific and only enabled on Linux when USE_LINUX_CAP=1 is set
-  at build time. The list of supported capabilities also depends on the OS and
-  is enumerated by the error message displayed when an invalid capability name
-  or an empty one is passed. Multiple capabilities may be passed, delimited by
-  commas. Among those commonly used, "cap_net_raw" allows to transparently bind
-  to a foreign address, and "cap_net_bind_service" allows to bind to a
-  privileged port and may be used by QUIC.
+  Sets a list of capabilities that must be preserved when starting and running
+  either as a non-root user (uid > 0), or when starting with uid 0 (root)
+  and switching then to a non-root. By default all permissions are
+  lost by the uid switch, but some are often needed when trying to connect to
+  a server from a foreign address during transparent proxying, or when binding
+  to a port below 1024, e.g. when using "tune.quic.socket-owner connection",
+  resulting in setups running entirely under uid 0. Setting capabilities
+  generally is a safer alternative, as only the required capabilities will be
+  preserved. The feature is OS-specific and only enabled on Linux when
+  USE_LINUX_CAP=1 is set at build time. The list of supported capabilities also
+  depends on the OS and is enumerated by the error message displayed when an
+  invalid capability name or an empty one is passed. Multiple capabilities may
+  be passed, delimited by commas. Among those commonly used, "cap_net_raw"
+  allows to transparently bind to a foreign address, and "cap_net_bind_service"
+  allows to bind to a privileged port and may be used by QUIC. If the process
+  is started and run under the same non-root user, needed capabilities should
+  be set on haproxy binary file with setcap along with this keyword. For more
+  details about setting capabilities on haproxy binary, please see chapter
+  13.1 Linux capabilities support in the Management guide.
+
+  Example:
+      global
+          setcap cap_net_bind_service,cap_net_admin
 
 setenv <name> <value>
   Sets environment variable <name> to value <value>. If the variable exists, it
@@ -3650,6 +3667,11 @@ tune.pt.zero-copy-forwarding { on | off }
   See also: tune.disable-zero-copy-forwarding, option splice-auto,
             option splice-request and option splice-response
 
+tune.quic.cc-hystart { on | off }
+  Enables ('on') or disabled ('off') the HyStart++ (RFC 9406) algorithm for
+  QUIC connections used as a replacement for the slow start phase of congestion
+  control algorithms which may cause high packet loss. It is disabled by default.
+
 tune.quic.frontend.conn-tx-buffers.limit <number>
   This settings defines the maximum number of buffers allocated for a QUIC
   connection on data emission. By default, it is set to 30. QUIC buffers are
@@ -4702,6 +4724,65 @@ httpclient.timeout.connect <timeout>
 
   The default value is 5000ms.
 
+
+3.12. Certificate Storage
+-------------------------
+
+HAProxy uses an internal storage mecanism to load and store certificates used
+in the configuration. This storage can be configured by using a "crt-store"
+section. It allows to configure certificate definitions and which files should
+be loaded in it. A certificate definition must be written before it is used
+elsewhere in the configuration.
+
+Files in the certificate storage can also be updated dynamically with the CLI.
+See "set ssl cert" in the section 9.3 of the management guide.
+
+Currently only the "load" keyword is supported in the "crt-store" section:
+
+load [crt <filename>] [param*]
+  Load SSL files in the certificate storage.
+
+  Arguments:
+
+    alias <string>     Optional argument. Allow to name the certificate with an
+                       alias, so it can be referenced with it in the
+                       configuration. An alias must be prefixed with '@/' when
+                       called elsewhere in the configuration.
+
+    crt <filename>     This argument is mandatory, it loads a PEM which must
+                       contain the public certificate but could also contain
+                       the intermediate certificates and the private key.
+                       If no private key is provided in this file, a key can be
+                       provided with the "key" keyword.
+
+    key <filename>     This argument is optional. Load a private key in PEM
+                       format. If a private key was already defined in "crt",
+                       it will overwrite it.
+
+    ocsp <filename>    This argument is optional, it loads an OCSP response in
+                       DER format. It can be updated with the CLI.
+
+    issuer <filename>  This argument is optional. Load the OCSP issuer in PEM
+                       format. In order to identify which certificate an OCSP
+                       Response applies to, the issuer's certificate is necessary.
+                       If the issuer's certificate is not found in the "crt" file,
+                       it could be loaded from a file with this argument.
+
+    sctl <filename>    This argument is optional. Support for Certificate
+                       Transparency (RFC6962) TLS extension is enabled. The file
+                       must contain a valid Signed Certificate Timestamp List,
+                       as described in RFC. File is parsed to check basic syntax,
+                       but no signatures are verified.
+
+Example:
+
+    crt-store
+        load crt "site1.crt" key "site1.key" ocsp "site1.ocsp" alias "site1"
+        load crt "site2.crt" key "site2.key"
+
+    frontend in
+        bind *:443 ssl crt "@/site1" crt "site2.crt"
+
 4. Proxies
 ----------
 
@@ -4896,6 +4977,9 @@ error-log-format                          X          X         X         -
 force-persist                             -          -         X         X
 filter                                    -          X         X         X
 fullconn                                  X          -         X         X
+guid                                      -          X         X         X
+hash-balance-factor                       X          -         X         X
+hash-key                                  X          -         X         X
 hash-type                                 X          -         X         X
 http-after-response                       X (!)      X         X         X
 http-check comment                        X          -         X         X
@@ -5184,6 +5268,7 @@ balance url_param <param> [check_post]
                   them off when unused, and regularly checks backend queue to
                   turn new servers on when the queue inflates. Alternatively,
                   using "http-check send-state" may inform servers on the load.
+                  This algorithm is not usable in LOG mode.
 
       hash        Takes a regular sample expression in argument. The expression
                   is evaluated for each request and hashed according to the
@@ -5365,8 +5450,7 @@ balance url_param <param> [check_post]
                   the log messages. When the server goes DOWN, the next server
                   in the list takes its place. When a previously DOWN server
                   goes back UP it is added at the end of the list so that the
-                  sticky server doesn't change until it becomes DOWN. This
-                  algorithm is only usable for backends in LOG mode.
+                  sticky server doesn't change until it becomes DOWN.
 
     <arguments> is an optional list of arguments which may be needed by some
                 algorithms. Right now, only "url_param", "uri" and "log-hash"
@@ -5374,7 +5458,7 @@ balance url_param <param> [check_post]
 
   The load balancing algorithm of a backend is set to roundrobin when no other
   algorithm, mode nor option have been set. The algorithm may only be set once
-  for each backend. In backends in LOG mode, server "weight" is always ignored.
+  for each backend.
 
   With authentication schemes that require the same connection like NTLM, URI
   based algorithms must not be used, as they would cause subsequent requests
@@ -6658,6 +6742,14 @@ fullconn <conns>
   See also : "maxconn", "server"
 
 
+guid <string>
+  Specify a case-sensitive global unique ID for this proxy. This must be unique
+  across all haproxy configuration on every object types. Format is left
+  unspecified to allow the user to select its naming policy. The only
+  restriction is its length which cannot be greater than 127 characters. All
+  alphanumerical values and '.', ':', '-' and '_' characters are valid.
+
+
 hash-balance-factor <factor>
   Specify the balancing factor for bounded-load consistent hashing
 
@@ -6689,6 +6781,29 @@ hash-balance-factor <factor>
   consistent hashing mechanism.
 
   See also : "balance" and "hash-type".
+
+
+hash-key <key>
+  Specify how "hash-type consistent" node keys are computed
+
+  Arguments :
+    <key>   <key> may be one of the following :
+
+      id         The node keys will be derived from the server's numeric
+                 identifier as set from "id" or which defaults to its position
+                 in the server list.
+
+      addr       The node keys will be derived from the server's address, when
+                 available, or else fall back on "id".
+
+      addr-port  The node keys will be derived from the server's address and
+                 port, when available, or else fall back on "id".
+
+  The "addr" and "addr-port" options may be useful in scenarios where multiple
+  HAProxy processes are balancing traffic to the same set of servers. If the
+  server order of each process is different (because, for example, DNS records
+  were resolved in different orders) then this will allow each independent
+  HAProxy processes to agree on routing decisions.
 
 
 hash-type <method> <function> <modifier>
@@ -15868,6 +15983,12 @@ group <group>
   "gid" setting except that the group name is used instead of its gid. This
   setting is ignored by non UNIX sockets.
 
+guid-prefix <string>
+  Generate case-sensitive global unique IDs for each listening sockets
+  allocated on this bind line. Prefix will be concatenated to listeners
+  position index on the current bind line, with character '-' as separator. See
+  "guid" proxy keyword description for more information on its format.
+
 id <id>
   Fixes the socket ID. By default, socket IDs are automatically assigned, but
   sometimes it is more convenient to fix them to ease monitoring. This value
@@ -16265,9 +16386,9 @@ ssl-min-ver [ SSLv3 | TLSv1.0 | TLSv1.1 | TLSv1.2 | TLSv1.3 ]
 
 strict-sni
   This setting is only available when support for OpenSSL was built in. The
-  SSL/TLS negotiation is allow only if the client provided an SNI which match
+  SSL/TLS negotiation is allowed only if the client provided an SNI that matches
   a certificate. The default certificate is not used. This option also allows
-  to start without any certificate on a bind line, so an empty directory could
+  starting without any certificate on a bind line, so an empty directory could
   be used and filled later from the stats socket.
   See the "crt" option for more information. See "add ssl crt-list" command in
   the management guide.
@@ -16881,6 +17002,11 @@ force-tlsv13
   This option enforces use of TLSv1.3 only when SSL is used to communicate with
   the server. This option is also available on global statement
   "ssl-default-server-options". See also "ssl-min-ver" and ssl-max-ver".
+
+guid <string>
+  Specify a case-sensitive global unique ID for this server. This must be
+  unique across all haproxy configuration on every object types. See "guid"
+  proxy keyword description for more information on its format.
 
 id <value>
   May be used in the following contexts: tcp, http, log

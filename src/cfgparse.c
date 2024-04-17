@@ -64,6 +64,7 @@
 #include <haproxy/lb_fwlc.h>
 #include <haproxy/lb_fwrr.h>
 #include <haproxy/lb_map.h>
+#include <haproxy/lb_ss.h>
 #include <haproxy/listener.h>
 #include <haproxy/log.h>
 #include <haproxy/sink.h>
@@ -2865,8 +2866,7 @@ init_proxies_list_stage1:
 #ifdef USE_OPENSSL
 			/* no-alpn ? If so, it's the right moment to remove it */
 			if (bind_conf->ssl_conf.alpn_str && !bind_conf->ssl_conf.alpn_len) {
-				free(bind_conf->ssl_conf.alpn_str);
-				bind_conf->ssl_conf.alpn_str = NULL;
+				ha_free(&bind_conf->ssl_conf.alpn_str);
 			}
 #ifdef TLSEXT_TYPE_application_layer_protocol_negotiation
 			else if (!bind_conf->ssl_conf.alpn_str && !bind_conf->ssl_conf.npn_str &&
@@ -2919,6 +2919,12 @@ init_proxies_list_stage1:
 				cfgerr += ret;
 				if (err_code & ERR_FATAL)
 					goto out;
+			}
+
+			if (bind_generate_guid(bind_conf)) {
+				cfgerr++;
+				err_code |= ERR_FATAL | ERR_ALERT;
+				goto out;
 			}
 		}
 
@@ -3127,7 +3133,7 @@ init_proxies_list_stage1:
 			 * parsing is cancelled and be.name is restored to be resolved.
 			 */
 			pxname = rule->be.name;
-			LIST_INIT(&rule->be.expr);
+			lf_expr_init(&rule->be.expr);
 			curproxy->conf.args.ctx = ARGC_UBK;
 			curproxy->conf.args.file = rule->file;
 			curproxy->conf.args.line = rule->line;
@@ -3139,10 +3145,10 @@ init_proxies_list_stage1:
 				cfgerr++;
 				continue;
 			}
-			node = LIST_NEXT(&rule->be.expr, struct logformat_node *, list);
+			node = LIST_NEXT(&rule->be.expr.nodes, struct logformat_node *, list);
 
-			if (!LIST_ISEMPTY(&rule->be.expr)) {
-				if (node->type != LOG_FMT_TEXT || node->list.n != &rule->be.expr) {
+			if (!lf_expr_isempty(&rule->be.expr)) {
+				if (node->type != LOG_FMT_TEXT || node->list.n != &rule->be.expr.nodes) {
 					rule->dynamic = 1;
 					free(pxname);
 					/* backend is not yet known so we cannot assume its type,
@@ -3155,8 +3161,7 @@ init_proxies_list_stage1:
 				/* Only one element in the list, a simple string: free the expression and
 				 * fall back to static rule
 				 */
-				LIST_DELETE(&node->list);
-				free_logformat_node(node);
+				lf_expr_deinit(&rule->be.expr);
 			}
 
 			rule->dynamic = 0;
@@ -3204,7 +3209,7 @@ init_proxies_list_stage1:
 			 * to a static rule, thus the parsing is cancelled and we fall back to setting srv.ptr.
 			 */
 			server_name = srule->srv.name;
-			LIST_INIT(&srule->expr);
+			lf_expr_init(&srule->expr);
 			curproxy->conf.args.ctx = ARGC_USRV;
 			err = NULL;
 			if (!parse_logformat_string(server_name, curproxy, &srule->expr, 0, SMP_VAL_FE_HRQ_HDR, &err)) {
@@ -3214,10 +3219,10 @@ init_proxies_list_stage1:
 				cfgerr++;
 				continue;
 			}
-			node = LIST_NEXT(&srule->expr, struct logformat_node *, list);
+			node = LIST_NEXT(&srule->expr.nodes, struct logformat_node *, list);
 
-			if (!LIST_ISEMPTY(&srule->expr)) {
-				if (node->type != LOG_FMT_TEXT || node->list.n != &srule->expr) {
+			if (!lf_expr_isempty(&srule->expr)) {
+				if (node->type != LOG_FMT_TEXT || node->list.n != &srule->expr.nodes) {
 					srule->dynamic = 1;
 					free(server_name);
 					continue;
@@ -3225,8 +3230,7 @@ init_proxies_list_stage1:
 				/* Only one element in the list, a simple string: free the expression and
 				 * fall back to static rule
 				 */
-				LIST_DELETE(&node->list);
-				free_logformat_node(node);
+				lf_expr_deinit(&srule->expr);
 			}
 
 			srule->dynamic = 0;
@@ -3384,9 +3388,9 @@ out_uri_auth_compat:
 		/* check whether we have a logger that uses RFC5424 log format */
 		list_for_each_entry(tmplogger, &curproxy->loggers, list) {
 			if (tmplogger->format == LOG_FORMAT_RFC5424) {
-				if (!curproxy->conf.logformat_sd_string) {
+				if (!curproxy->logformat_sd.str) {
 					/* set the default logformat_sd_string */
-					curproxy->conf.logformat_sd_string = default_rfc5424_sd_log_format;
+					curproxy->logformat_sd.str = default_rfc5424_sd_log_format;
 				}
 				break;
 			}
@@ -3394,31 +3398,21 @@ out_uri_auth_compat:
 
 		/* compile the log format */
 		if (!(curproxy->cap & PR_CAP_FE)) {
-			if (curproxy->conf.logformat_string != default_http_log_format &&
-			    curproxy->conf.logformat_string != default_tcp_log_format &&
-			    curproxy->conf.logformat_string != clf_http_log_format)
-				free(curproxy->conf.logformat_string);
-			curproxy->conf.logformat_string = NULL;
-			ha_free(&curproxy->conf.lfs_file);
-			curproxy->conf.lfs_line = 0;
-
-			if (curproxy->conf.logformat_sd_string != default_rfc5424_sd_log_format)
-				free(curproxy->conf.logformat_sd_string);
-			curproxy->conf.logformat_sd_string = NULL;
-			ha_free(&curproxy->conf.lfsd_file);
-			curproxy->conf.lfsd_line = 0;
+			lf_expr_deinit(&curproxy->logformat);
+			lf_expr_deinit(&curproxy->logformat_sd);
 		}
 
-		if (curproxy->conf.logformat_string) {
+		if (curproxy->logformat.str) {
 			curproxy->conf.args.ctx = ARGC_LOG;
-			curproxy->conf.args.file = curproxy->conf.lfs_file;
-			curproxy->conf.args.line = curproxy->conf.lfs_line;
+			curproxy->conf.args.file = curproxy->logformat.conf.file;
+			curproxy->conf.args.line = curproxy->logformat.conf.line;
 			err = NULL;
-			if (!parse_logformat_string(curproxy->conf.logformat_string, curproxy, &curproxy->logformat,
+			if (!lf_expr_compile(&curproxy->logformat, &curproxy->conf.args,
 			                            LOG_OPT_MANDATORY|LOG_OPT_MERGE_SPACES,
-			                            SMP_VAL_FE_LOG_END, &err)) {
+			                            SMP_VAL_FE_LOG_END, &err) ||
+			    !lf_expr_postcheck(&curproxy->logformat, curproxy, &err)) {
 				ha_alert("Parsing [%s:%d]: failed to parse log-format : %s.\n",
-					 curproxy->conf.lfs_file, curproxy->conf.lfs_line, err);
+					 curproxy->logformat.conf.file, curproxy->logformat.conf.line, err);
 				free(err);
 				cfgerr++;
 			}
@@ -3426,21 +3420,18 @@ out_uri_auth_compat:
 			curproxy->conf.args.line = 0;
 		}
 
-		if (curproxy->conf.logformat_sd_string) {
+		if (curproxy->logformat_sd.str) {
 			curproxy->conf.args.ctx = ARGC_LOGSD;
-			curproxy->conf.args.file = curproxy->conf.lfsd_file;
-			curproxy->conf.args.line = curproxy->conf.lfsd_line;
+			curproxy->conf.args.file = curproxy->logformat_sd.conf.file;
+			curproxy->conf.args.line = curproxy->logformat_sd.conf.line;
 			err = NULL;
-			if (!parse_logformat_string(curproxy->conf.logformat_sd_string, curproxy, &curproxy->logformat_sd,
+			if (!lf_expr_compile(&curproxy->logformat_sd, &curproxy->conf.args,
 			                            LOG_OPT_MANDATORY|LOG_OPT_MERGE_SPACES,
-			                            SMP_VAL_FE_LOG_END, &err)) {
+			                            SMP_VAL_FE_LOG_END, &err) ||
+			    !add_to_logformat_list(NULL, NULL, LF_SEPARATOR, &curproxy->logformat_sd, &err) ||
+			    !lf_expr_postcheck(&curproxy->logformat_sd, curproxy, &err)) {
 				ha_alert("Parsing [%s:%d]: failed to parse log-format-sd : %s.\n",
-					 curproxy->conf.lfsd_file, curproxy->conf.lfsd_line, err);
-				free(err);
-				cfgerr++;
-			} else if (!add_to_logformat_list(NULL, NULL, LF_SEPARATOR, &curproxy->logformat_sd, &err)) {
-				ha_alert("Parsing [%s:%d]: failed to parse log-format-sd : %s.\n",
-					 curproxy->conf.lfsd_file, curproxy->conf.lfsd_line, err);
+					 curproxy->logformat_sd.conf.file, curproxy->logformat_sd.conf.line, err);
 				free(err);
 				cfgerr++;
 			}
@@ -3448,21 +3439,22 @@ out_uri_auth_compat:
 			curproxy->conf.args.line = 0;
 		}
 
-		if (curproxy->conf.uniqueid_format_string) {
+		if (curproxy->format_unique_id.str) {
 			int where = 0;
 
 			curproxy->conf.args.ctx = ARGC_UIF;
-			curproxy->conf.args.file = curproxy->conf.uif_file;
-			curproxy->conf.args.line = curproxy->conf.uif_line;
+			curproxy->conf.args.file = curproxy->format_unique_id.conf.file;
+			curproxy->conf.args.line = curproxy->format_unique_id.conf.line;
 			err = NULL;
 			if (curproxy->cap & PR_CAP_FE)
 				where |= SMP_VAL_FE_HRQ_HDR;
 			if (curproxy->cap & PR_CAP_BE)
 				where |= SMP_VAL_BE_HRQ_HDR;
-			if (!parse_logformat_string(curproxy->conf.uniqueid_format_string, curproxy, &curproxy->format_unique_id,
-			                            LOG_OPT_HTTP|LOG_OPT_MERGE_SPACES, where, &err)) {
+			if (!lf_expr_compile(&curproxy->format_unique_id, &curproxy->conf.args,
+			                            LOG_OPT_HTTP|LOG_OPT_MERGE_SPACES, where, &err) ||
+			    !lf_expr_postcheck(&curproxy->format_unique_id, curproxy, &err)) {
 				ha_alert("Parsing [%s:%d]: failed to parse unique-id : %s.\n",
-					 curproxy->conf.uif_file, curproxy->conf.uif_line, err);
+					 curproxy->format_unique_id.conf.file, curproxy->format_unique_id.conf.line, err);
 				free(err);
 				cfgerr++;
 			}
@@ -3470,16 +3462,17 @@ out_uri_auth_compat:
 			curproxy->conf.args.line = 0;
 		}
 
-		if (curproxy->conf.error_logformat_string) {
+		if (curproxy->logformat_error.str) {
 			curproxy->conf.args.ctx = ARGC_LOG;
-			curproxy->conf.args.file = curproxy->conf.elfs_file;
-			curproxy->conf.args.line = curproxy->conf.elfs_line;
+			curproxy->conf.args.file = curproxy->logformat_error.conf.file;
+			curproxy->conf.args.line = curproxy->logformat_error.conf.line;
 			err = NULL;
-			if (!parse_logformat_string(curproxy->conf.error_logformat_string, curproxy, &curproxy->logformat_error,
+			if (!lf_expr_compile(&curproxy->logformat_error, &curproxy->conf.args,
 			                            LOG_OPT_MANDATORY|LOG_OPT_MERGE_SPACES,
-			                            SMP_VAL_FE_LOG_END, &err)) {
+			                            SMP_VAL_FE_LOG_END, &err) ||
+			    !lf_expr_postcheck(&curproxy->logformat_error, curproxy, &err)) {
 				ha_alert("Parsing [%s:%d]: failed to parse error-log-format : %s.\n",
-					 curproxy->conf.elfs_file, curproxy->conf.elfs_line, err);
+					 curproxy->logformat_error.conf.file, curproxy->logformat_error.conf.line, err);
 				free(err);
 				cfgerr++;
 			}
@@ -3722,12 +3715,6 @@ out_uri_auth_compat:
 		 * on what LB algorithm was chosen.
 		 */
 
-		if (curproxy->mode == PR_MODE_SYSLOG) {
-			/* log load-balancing requires special init that is performed
-			 * during log-postparsing step
-			 */
-			goto skip_server_lb_init;
-		}
 		curproxy->lbprm.algo &= ~(BE_LB_LKUP | BE_LB_PROP_DYN);
 		switch (curproxy->lbprm.algo & BE_LB_KIND) {
 		case BE_LB_KIND_RR:
@@ -3766,8 +3753,13 @@ out_uri_auth_compat:
 				init_server_map(curproxy);
 			}
 			break;
+		case BE_LB_KIND_SA:
+			if ((curproxy->lbprm.algo & BE_LB_PARM) == BE_LB_SA_SS) {
+				curproxy->lbprm.algo |= BE_LB_PROP_DYN;
+				init_server_ss(curproxy);
+			}
+			break;
 		}
- skip_server_lb_init:
 		HA_RWLOCK_INIT(&curproxy->lbprm.lock);
 
 		if (curproxy->options & PR_O_LOGASAP)
@@ -3775,7 +3767,7 @@ out_uri_auth_compat:
 
 		if (!(curproxy->cap & PR_CAP_INT) && (curproxy->mode == PR_MODE_TCP || curproxy->mode == PR_MODE_HTTP) &&
 		    (curproxy->cap & PR_CAP_FE) && LIST_ISEMPTY(&curproxy->loggers) &&
-		    (!LIST_ISEMPTY(&curproxy->logformat) || !LIST_ISEMPTY(&curproxy->logformat_sd))) {
+		    (!lf_expr_isempty(&curproxy->logformat) || !lf_expr_isempty(&curproxy->logformat_sd))) {
 			ha_warning("log format ignored for %s '%s' since it has no log address.\n",
 				   proxy_type_str(curproxy), curproxy->id);
 			err_code |= ERR_WARN;
@@ -4186,6 +4178,11 @@ init_proxies_list_stage2:
 				/* listener ID not set, use automatic numbering with first
 				 * spare entry starting with next_luid.
 				 */
+				if (listener->by_fe.p != &curproxy->conf.listeners) {
+					struct listener *prev_li = LIST_PREV(&listener->by_fe, typeof(prev_li), by_fe);
+					if (prev_li->luid)
+						next_id = prev_li->luid + 1;
+				}
 				next_id = get_next_id(&curproxy->conf.used_listener_id, next_id);
 				listener->conf.id.key = listener->luid = next_id;
 				eb32_insert(&curproxy->conf.used_listener_id, &listener->conf.id);

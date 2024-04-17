@@ -28,6 +28,7 @@
 #include <haproxy/dict-t.h>
 #include <haproxy/errors.h>
 #include <haproxy/global.h>
+#include <haproxy/guid.h>
 #include <haproxy/log.h>
 #include <haproxy/mailers.h>
 #include <haproxy/namespace.h>
@@ -183,6 +184,11 @@ static void _srv_set_inetaddr_port(struct server *srv,
 		srv->flags |= SRV_F_MAPPORTS;
 	else
 		srv->flags &= ~SRV_F_MAPPORTS;
+
+	if (srv->proxy->lbprm.update_server_eweight) {
+		/* some balancers (chash in particular) may use the addr in their routing decisions */
+		srv->proxy->lbprm.update_server_eweight(srv);
+	}
 
 	if (srv->log_target && srv->log_target->type == LOG_TARGET_DGRAM) {
 		/* server is used as a log target, manually update log target addr for DGRAM */
@@ -921,6 +927,28 @@ static int srv_parse_error_limit(char **args, int *cur_arg,
 	return 0;
 }
 
+/* Parse the "guid" keyword */
+static int srv_parse_guid(char **args, int *cur_arg,
+                        struct proxy *curproxy, struct server *newsrv, char **err)
+{
+	const char *guid;
+	char *guid_err = NULL;
+
+	if (!*args[*cur_arg + 1]) {
+		memprintf(err, "'%s' : expects an argument", args[*cur_arg]);
+		return ERR_ALERT | ERR_FATAL;
+	}
+
+	guid = args[*cur_arg + 1];
+	if (guid_insert(&newsrv->obj_type, guid, &guid_err)) {
+		memprintf(err, "'%s': %s", args[*cur_arg], guid_err);
+		ha_free(&guid_err);
+		return ERR_ALERT | ERR_FATAL;
+	}
+
+	return 0;
+}
+
 /* Parse the "ws" keyword */
 static int srv_parse_ws(char **args, int *cur_arg,
                         struct proxy *curproxy, struct server *newsrv, char **err)
@@ -944,6 +972,32 @@ static int srv_parse_ws(char **args, int *cur_arg,
 		return ERR_ALERT | ERR_FATAL;
 	}
 
+
+	return 0;
+}
+
+/* Parse the "hash-key" server keyword */
+static int srv_parse_hash_key(char **args, int *cur_arg,
+			      struct proxy *curproxy, struct server *newsrv, char **err)
+{
+	if (!args[*cur_arg + 1]) {
+		memprintf(err, "'%s expects 'id', 'addr', or 'addr-port' value", args[*cur_arg]);
+		return ERR_ALERT | ERR_FATAL;
+	}
+
+	if (strcmp(args[*cur_arg + 1], "id") == 0) {
+		newsrv->hash_key = SRV_HASH_KEY_ID;
+	}
+	else if (strcmp(args[*cur_arg + 1], "addr") == 0) {
+		newsrv->hash_key = SRV_HASH_KEY_ADDR;
+	}
+	else if (strcmp(args[*cur_arg + 1], "addr-port") == 0) {
+		newsrv->hash_key = SRV_HASH_KEY_ADDR_PORT;
+	}
+	else {
+		memprintf(err, "'%s' has to be 'id', 'addr', or 'addr-port'", args[*cur_arg]);
+		return ERR_ALERT | ERR_FATAL;
+	}
 
 	return 0;
 }
@@ -2216,11 +2270,13 @@ void srv_compute_all_admin_states(struct proxy *px)
  */
 static struct srv_kw_list srv_kws = { "ALL", { }, {
 	{ "backup",               srv_parse_backup,               0,  1,  1 }, /* Flag as backup server */
-	{ "cookie",               srv_parse_cookie,               1,  1,  0 }, /* Assign a cookie to the server */
+	{ "cookie",               srv_parse_cookie,               1,  1,  1 }, /* Assign a cookie to the server */
 	{ "disabled",             srv_parse_disabled,             0,  1,  1 }, /* Start the server in 'disabled' state */
-	{ "enabled",              srv_parse_enabled,              0,  1,  1 }, /* Start the server in 'enabled' state */
+	{ "enabled",              srv_parse_enabled,              0,  1,  0 }, /* Start the server in 'enabled' state */
 	{ "error-limit",          srv_parse_error_limit,          1,  1,  1 }, /* Configure the consecutive count of check failures to consider a server on error */
+	{ "guid",                 srv_parse_guid,                 1,  0,  1 }, /* Set global unique ID of the server */
 	{ "ws",                   srv_parse_ws,                   1,  1,  1 }, /* websocket protocol */
+	{ "hash-key",             srv_parse_hash_key,             1,  1,  1 }, /* Configure how chash keys are computed */
 	{ "id",                   srv_parse_id,                   1,  0,  1 }, /* set id# of server */
 	{ "init-addr",            srv_parse_init_addr,            1,  1,  0 }, /* */
 	{ "log-bufsize",          srv_parse_log_bufsize,          1,  1,  0 }, /* Set the ring bufsize for log server (only for log backends) */
@@ -2279,15 +2335,17 @@ void server_recalc_eweight(struct server *sv, int must_update)
 	unsigned w;
 
 	if (ns_to_sec(now_ns) < sv->last_change || ns_to_sec(now_ns) >= sv->last_change + sv->slowstart) {
-		/* go to full throttle if the slowstart interval is reached */
-		if (sv->next_state == SRV_ST_STARTING)
+		/* go to full throttle if the slowstart interval is reached unless server is currently down */
+		if ((sv->cur_state != SRV_ST_STOPPED) && (sv->next_state == SRV_ST_STARTING))
 			sv->next_state = SRV_ST_RUNNING;
 	}
 
 	/* We must take care of not pushing the server to full throttle during slow starts.
 	 * It must also start immediately, at least at the minimal step when leaving maintenance.
 	 */
-	if ((sv->next_state == SRV_ST_STARTING) && (px->lbprm.algo & BE_LB_PROP_DYN))
+	if ((sv->cur_state == SRV_ST_STOPPED) && (sv->next_state == SRV_ST_STARTING) && (px->lbprm.algo & BE_LB_PROP_DYN))
+		w = 1;
+	else if ((sv->next_state == SRV_ST_STARTING) && (px->lbprm.algo & BE_LB_PROP_DYN))
 		w = (px->lbprm.wdiv * (ns_to_sec(now_ns) - sv->last_change) + sv->slowstart) / sv->slowstart;
 	else
 		w = px->lbprm.wdiv;
@@ -2705,6 +2763,7 @@ void srv_settings_cpy(struct server *srv, const struct server *src, int srv_tmpl
 	srv->minconn                  = src->minconn;
 	srv->maxconn                  = src->maxconn;
 	srv->slowstart                = src->slowstart;
+	srv->hash_key                 = src->hash_key;
 	srv->observe                  = src->observe;
 	srv->onerror                  = src->onerror;
 	srv->onmarkeddown             = src->onmarkeddown;
@@ -2823,6 +2882,8 @@ struct server *new_server(struct proxy *proxy)
 
 	MT_LIST_INIT(&srv->sess_conns);
 
+	guid_init(&srv->guid);
+
 	srv->extra_counters = NULL;
 #ifdef USE_OPENSSL
 	HA_RWLOCK_INIT(&srv->ssl_ctx.lock);
@@ -2884,6 +2945,8 @@ struct server *srv_drop(struct server *srv)
 	 */
 	if (HA_ATOMIC_SUB_FETCH(&srv->refcount, 1))
 		goto end;
+
+	guid_remove(&srv->guid);
 
 	/* make sure we are removed from our 'next->prev_deleted' list
 	 * This doesn't require full thread isolation as we're using mt lists
@@ -3492,7 +3555,7 @@ static int _srv_parse_finalize(char **args, int cur_arg,
 	}
 
 	list_for_each_entry(srv_tlv, &srv->pp_tlvs, list) {
-		LIST_INIT(&srv_tlv->fmt);
+		lf_expr_init(&srv_tlv->fmt);
 		if (srv_tlv->fmt_string && unlikely(!parse_logformat_string(srv_tlv->fmt_string,
 			srv->proxy, &srv_tlv->fmt, 0, SMP_VAL_BE_SRV_CON, &errmsg))) {
 			if (errmsg) {
@@ -5732,6 +5795,11 @@ static int cli_parse_add_server(char **args, char *payload, struct appctx *appct
 	 */
 	srv->rid = (srv_id_reuse_cnt) ? (srv_id_reuse_cnt / 2) : 0;
 
+	/* generate new server's dynamic cookie if enabled on backend */
+	if (be->ck_opts & PR_CK_DYNAMIC) {
+		srv_set_dyncookie(srv);
+	}
+
 	/* adding server cannot fail when we reach this:
 	 * publishing EVENT_HDL_SUB_SERVER_ADD
 	 */
@@ -5752,6 +5820,9 @@ static int cli_parse_add_server(char **args, char *payload, struct appctx *appct
 		if (!start_check_task(&srv->agent, 0, 1, 1))
 			ha_alert("System might be unstable, consider to execute a reload\n");
 	}
+
+	if (srv->cklen && be->mode != PR_MODE_HTTP)
+		ha_warning("Ignoring cookie as HTTP mode is disabled.\n");
 
 	ha_notice("New server registered.\n");
 	cli_umsg(appctx, LOG_INFO);

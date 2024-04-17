@@ -232,8 +232,8 @@ DECLARE_STATIC_POOL(pool_head_cache_st, "cache_st", sizeof(struct cache_st));
 
 static struct eb32_node *insert_entry(struct cache *cache, struct cache_tree *tree, struct cache_entry *new_entry);
 static void delete_entry(struct cache_entry *del_entry);
-static void release_entry_locked(struct cache_tree *cache, struct cache_entry *entry);
-static void release_entry_unlocked(struct cache_tree *cache, struct cache_entry *entry);
+static inline void release_entry_locked(struct cache_tree *cache, struct cache_entry *entry);
+static inline void release_entry_unlocked(struct cache_tree *cache, struct cache_entry *entry);
 
 /*
  * Find a cache_entry in the <cache>'s tree that has the hash <hash>.
@@ -820,7 +820,8 @@ cache_store_http_payload(struct stream *s, struct filter *filter, struct http_ms
 		goto no_cache;
 	}
 
-	((struct cache_entry *)st->first_block->data)->body_size += data_len;
+	/* disguise below to shut a warning on */
+	DISGUISE((struct cache_entry *)st->first_block->data)->body_size += data_len;
 	ret = shctx_row_data_append(shctx, st->first_block,
 				    (unsigned char *)b_head(&trash), b_data(&trash));
 	if (ret < 0)
@@ -1784,7 +1785,7 @@ static void http_cache_io_handler(struct appctx *appctx)
 		goto exit;
 
 	if (!appctx_get_buf(appctx, &appctx->outbuf)) {
-		appctx->flags |= APPCTX_FL_OUTBLK_ALLOC;
+		applet_fl_set(appctx, APPCTX_FL_OUTBLK_ALLOC);
 		goto exit;
 	}
 
@@ -1807,6 +1808,10 @@ static void http_cache_io_handler(struct appctx *appctx)
 
 	if (appctx->st0 == HTX_CACHE_HEADER) {
 		struct ist meth;
+
+		if (unlikely(applet_fl_test(appctx, APPCTX_FL_INBLK_ALLOC))) {
+			goto exit;
+		}
 
 		/* Headers must be dump at once. Otherwise it is an error */
 		ret = htx_cache_dump_msg(appctx, res_htx, len, HTX_BLK_EOH);
@@ -1842,7 +1847,7 @@ static void http_cache_io_handler(struct appctx *appctx)
 		if (len) {
 			ret = htx_cache_dump_msg(appctx, res_htx, len, HTX_BLK_UNUSED);
 			if (ret < len) {
-				appctx->flags |= APPCTX_FL_OUTBLK_FULL;
+				applet_fl_set(appctx, APPCTX_FL_OUTBLK_FULL);
 				goto out;
 			}
 		}

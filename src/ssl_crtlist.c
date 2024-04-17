@@ -438,12 +438,6 @@ int crtlist_parse_line(char *line, char **crt_path, struct crtlist_entry *entry,
 			cfgerr |= ERR_WARN;
 		}
 
-		ssl_conf = calloc(1, sizeof *ssl_conf);
-		if (!ssl_conf) {
-			memprintf(err, "not enough memory!");
-			cfgerr |= ERR_ALERT | ERR_FATAL;
-			goto error;
-		}
 	}
 
 	cur_arg = ssl_b ? ssl_b : 1;
@@ -451,6 +445,14 @@ int crtlist_parse_line(char *line, char **crt_path, struct crtlist_entry *entry,
 		newarg = 0;
 		for (i = 0; ssl_crtlist_kws[i].kw != NULL; i++) {
 			if (strcmp(ssl_crtlist_kws[i].kw, args[cur_arg]) == 0) {
+				if (!ssl_conf)
+					ssl_conf = calloc(1, sizeof *ssl_conf);
+				if (!ssl_conf) {
+					memprintf(err, "not enough memory!");
+					cfgerr |= ERR_ALERT | ERR_FATAL;
+					goto error;
+				}
+
 				newarg = 1;
 				cfgerr |= ssl_crtlist_kws[i].parse(args, cur_arg, NULL, ssl_conf, from_cli, err);
 				if (cur_arg + 1 + ssl_crtlist_kws[i].skip > ssl_e) {
@@ -573,7 +575,7 @@ int crtlist_parse_file(char *file, struct bind_conf *bind_conf, struct proxy *cu
 			continue;
 		}
 
-		if (*crt_path != '/' && global_ssl.crt_base) {
+		if (*crt_path != '@' && *crt_path != '/' && global_ssl.crt_base) {
 			if ((strlen(global_ssl.crt_base) + 1 + strlen(crt_path)) > sizeof(path) ||
 			    snprintf(path, sizeof(path), "%s/%s",  global_ssl.crt_base, crt_path) > sizeof(path)) {
 				memprintf(err, "parsing [%s:%d]: '%s' : path too long",
@@ -590,7 +592,7 @@ int crtlist_parse_file(char *file, struct bind_conf *bind_conf, struct proxy *cu
 			if (stat(crt_path, &buf) == 0) {
 				found++;
 
-				ckchs = ckchs_load_cert_file(crt_path, err);
+				ckchs = new_ckch_store_load_files_path(crt_path, err);
 				if (ckchs == NULL) {
 					cfgerr |= ERR_ALERT | ERR_FATAL;
 					goto error;
@@ -627,7 +629,7 @@ int crtlist_parse_file(char *file, struct bind_conf *bind_conf, struct proxy *cu
 					ckchs = ckchs_lookup(fp);
 					if (!ckchs) {
 						if (stat(fp, &buf) == 0) {
-							ckchs = ckchs_load_cert_file(fp, err);
+							ckchs = new_ckch_store_load_files_path(fp, err);
 							if (!ckchs) {
 								cfgerr |= ERR_ALERT | ERR_FATAL;
 								goto error;
@@ -780,7 +782,7 @@ int crtlist_load_cert_dir(char *path, struct bind_conf *bind_conf, struct crtlis
 
 			ckchs = ckchs_lookup(fp);
 			if (ckchs == NULL)
-				ckchs = ckchs_load_cert_file(fp, err);
+				ckchs = new_ckch_store_load_files_path(fp, err);
 			if (ckchs == NULL) {
 				free(de);
 				free(entry);
@@ -1134,7 +1136,6 @@ static int cli_io_handler_add_crtlist(struct appctx *appctx)
 {
 	struct add_crtlist_ctx *ctx = appctx->svcctx;
 	struct bind_conf_list *bind_conf_node;
-	struct stconn *sc = appctx_sc(appctx);
 	struct crtlist *crtlist = ctx->crtlist;
 	struct crtlist_entry *entry = ctx->entry;
 	struct ckch_store *store = entry->node.key;
@@ -1145,10 +1146,6 @@ static int cli_io_handler_add_crtlist(struct appctx *appctx)
 	/* for each bind_conf which use the crt-list, a new ckch_inst must be
 	 * created.
 	 */
-	/* FIXME: Don't watch the other side !*/
-	if (unlikely(sc_opposite(sc)->flags & SC_FL_SHUT_DONE))
-		goto end;
-
 	switch (ctx->state) {
 	case ADDCRT_ST_INIT:
 		/* This state just print the update message */
@@ -1341,7 +1338,7 @@ static int cli_parse_add_crtlist(char **args, char *payload, struct appctx *appc
 		*slash = '/';
 	}
 
-	if (*cert_path != '/' && global_ssl.crt_base) {
+	if (*cert_path != '@' && *cert_path != '/' && global_ssl.crt_base) {
 		if ((strlen(global_ssl.crt_base) + 1 + strlen(cert_path)) > sizeof(path) ||
 		    snprintf(path, sizeof(path), "%s/%s",  global_ssl.crt_base, cert_path) > sizeof(path)) {
 			memprintf(&err, "'%s' : path too long", cert_path);
@@ -1575,4 +1572,3 @@ static struct cli_kw_list cli_kws = {{ },{
 };
 
 INITCALL1(STG_REGISTER, cli_register_kw, &cli_kws);
-

@@ -190,7 +190,6 @@ err:
 static int hc_cli_io_handler(struct appctx *appctx)
 {
 	struct hcli_svc_ctx *ctx = appctx->svcctx;
-	struct stconn *sc = appctx_sc(appctx);
 	struct httpclient *hc = ctx->hc;
 	struct http_hdr *hdrs, *hdr;
 
@@ -217,10 +216,7 @@ static int hc_cli_io_handler(struct appctx *appctx)
 	}
 
 	if (ctx->flags & HC_F_RES_BODY) {
-		int ret;
-
-		ret = httpclient_res_xfer(hc, sc_ib(sc));
-		channel_add_input(sc_ic(sc), ret); /* forward what we put in the buffer channel */
+		httpclient_res_xfer(hc, &appctx->outbuf);
 
 		/* remove the flag if the buffer was emptied */
 		if (httpclient_data(hc))
@@ -1223,7 +1219,8 @@ struct proxy *httpclient_create_proxy(const char *id)
 	px->timeout.connect = httpclient_timeout_connect;
 	px->timeout.client = TICK_ETERNITY;
 	/* The HTTP Client use the "option httplog" with the global loggers */
-	px->conf.logformat_string = httpclient_log_format;
+	px->logformat.str = httpclient_log_format;
+	px->logformat.conf.file = strdup("httpclient");
 	px->http_needed = 1;
 
 	/* clear HTTP server */
@@ -1375,18 +1372,6 @@ static int httpclient_postcheck_proxy(struct proxy *curproxy)
 			goto err;
 		}
 		LIST_APPEND(&curproxy->loggers, &node->list);
-	}
-	if (curproxy->conf.logformat_string) {
-		curproxy->conf.args.ctx = ARGC_LOG;
-		if (!parse_logformat_string(curproxy->conf.logformat_string, curproxy, &curproxy->logformat,
-					    LOG_OPT_MANDATORY|LOG_OPT_MERGE_SPACES,
-					    SMP_VAL_FE_LOG_END, &errmsg)) {
-			memprintf(&errmsg, "failed to parse log-format : %s.", errmsg);
-			err_code |= ERR_ALERT | ERR_FATAL;
-			goto err;
-		}
-		curproxy->conf.args.file = NULL;
-		curproxy->conf.args.line = 0;
 	}
 
 #ifdef USE_OPENSSL

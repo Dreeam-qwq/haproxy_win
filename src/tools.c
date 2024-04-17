@@ -1969,11 +1969,11 @@ int addr_is_local(const struct netns_entry *ns,
  * <map> with the hexadecimal representation of their ASCII-code (2 digits)
  * prefixed by <escape>, and will store the result between <start> (included)
  * and <stop> (excluded), and will always terminate the string with a '\0'
- * before <stop>. The position of the '\0' is returned if the conversion
- * completes. If bytes are missing between <start> and <stop>, then the
- * conversion will be incomplete and truncated. If <stop> <= <start>, the '\0'
- * cannot even be stored so we return <start> without writing the 0.
+ * before <stop>. If bytes are missing between <start> and <stop>, then the
+ * conversion will be incomplete and truncated.
  * The input string must also be zero-terminated.
+ *
+ * Return the address of the \0 character, or NULL on error
  */
 const char hextab[16] = "0123456789ABCDEF";
 char *encode_string(char *start, char *stop,
@@ -1995,8 +1995,9 @@ char *encode_string(char *start, char *stop,
 			string++;
 		}
 		*start = '\0';
+		return start;
 	}
-	return start;
+	return NULL;
 }
 
 /*
@@ -2025,8 +2026,9 @@ char *encode_chunk(char *start, char *stop,
 			str++;
 		}
 		*start = '\0';
+		return start;
 	}
-	return start;
+	return NULL;
 }
 
 /*
@@ -2035,8 +2037,9 @@ char *encode_chunk(char *start, char *stop,
  * is reached or NULL-byte is encountered. The result will
  * be stored between <start> (included) and <stop> (excluded). This
  * function will always try to terminate the resulting string with a '\0'
- * before <stop>, and will return its position if the conversion
- * completes.
+ * before <stop>.
+ *
+ * Return the address of the \0 character, or NULL on error
  */
 char *escape_string(char *start, char *stop,
 		    const char escape, const long *map,
@@ -2056,8 +2059,9 @@ char *escape_string(char *start, char *stop,
 			string++;
 		}
 		*start = '\0';
+		return start;
 	}
-	return start;
+	return NULL;
 }
 
 /* Check a string for using it in a CSV output format. If the string contains
@@ -4902,6 +4906,58 @@ void dump_addr_and_bytes(struct buffer *buf, const char *pfx, const void *addr, 
 			chunk_appendf(buf, "%02x%s", ((uint8_t*)addr)[i], (i<n-1) ? " " : "]");
 		else
 			chunk_appendf(buf, "--%s", (i<n-1) ? " " : "]");
+	}
+}
+
+/* Dumps the 64 bytes around <addr> at the end of <output> with symbols
+ * decoding. An optional special pointer may be recognized (special), in
+ * which case its type (spec_type) and name (spec_name) will be reported.
+ * This is convenient for pool names but could be used for list heads or
+ * anything in that vein.
+*/
+void dump_area_with_syms(struct buffer *output, const void *base, const void *addr,
+                         const void *special, const char *spec_type, const char *spec_name)
+{
+	const char *start, *end, *p;
+	const void *tag;
+
+	chunk_appendf(output, "Contents around address %p+%lu=%p:\n", base, (ulong)(addr - base), addr);
+
+	/* dump in word-sized blocks */
+	start = (const void *)(((uintptr_t)addr - 32) & -sizeof(void*));
+	end   = (const void *)(((uintptr_t)addr + 32 + sizeof(void*) - 1) & -sizeof(void*));
+
+	while (start < end) {
+		dump_addr_and_bytes(output, "  ", start, sizeof(void*));
+		chunk_strcat(output, " [");
+		for (p = start; p < start + sizeof(void*); p++) {
+			if (!may_access(p))
+				chunk_strcat(output, "*");
+			else if (isprint((unsigned char)*p))
+				chunk_appendf(output, "%c", *p);
+			else
+				chunk_strcat(output, ".");
+		}
+
+		if (may_access(start))
+			tag = *(const void **)start;
+		else
+			tag = NULL;
+
+		if (special && tag == special) {
+			/* the pool can often be there so let's detect it */
+			chunk_appendf(output, "] [%s:%s", spec_type, spec_name);
+		}
+		else if (tag) {
+			/* print pointers that resolve to a symbol */
+			size_t back_data = output->data;
+			chunk_strcat(output, "] [");
+			if (!resolve_sym_name(output, NULL, tag))
+				output->data = back_data;
+		}
+
+		chunk_strcat(output, "]\n");
+		start = p;
 	}
 }
 

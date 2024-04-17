@@ -323,7 +323,7 @@ void http_free_redirect_rule(struct redirect_rule *rdr)
 	free_acl_cond(rdr->cond);
 	free(rdr->rdr_str);
 	free(rdr->cookie_str);
-	free_logformat_list(&rdr->rdr_fmt);
+	lf_expr_deinit(&rdr->rdr_fmt);
 	free(rdr);
 }
 
@@ -440,7 +440,7 @@ struct redirect_rule *http_parse_redirect_rule(const char *file, int linenum, st
 	if (!rule)
 		goto out_of_memory;
 	rule->cond = cond;
-	LIST_INIT(&rule->rdr_fmt);
+	lf_expr_init(&rule->rdr_fmt);
 
 	if (!use_fmt) {
 		/* old-style static redirect rule */
@@ -466,9 +466,6 @@ struct redirect_rule *http_parse_redirect_rule(const char *file, int linenum, st
 			if (!parse_logformat_string(destination, curproxy, &rule->rdr_fmt, LOG_OPT_HTTP, cap, errmsg)) {
 				goto err;
 			}
-			free(curproxy->conf.lfs_file);
-			curproxy->conf.lfs_file = strdup(curproxy->conf.args.file);
-			curproxy->conf.lfs_line = curproxy->conf.args.line;
 		}
 	}
 

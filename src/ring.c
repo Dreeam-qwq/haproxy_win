@@ -70,7 +70,7 @@ void ring_init(struct ring *ring, void *area, size_t size, int reset)
  * If <area> is null, then it's allocated of the requested size. The ring
  * storage struct is part of the area so the usable area is slightly reduced.
  * However the storage is immediately adjacent to the struct so that the ring
- * remains consistent on-disk. ring_free() will ignore such ring stoages and
+ * remains consistent on-disk. ring_free() will ignore such ring storages and
  * will only release the ring part, so the caller is responsible for releasing
  * them. If <reset> is non-zero, the storage area is reset, otherwise it's left
  * intact.
@@ -104,7 +104,7 @@ struct ring *ring_make_from_area(void *area, size_t size, int reset)
 }
 
 /* Creates and returns a ring buffer of size <size> bytes. Returns NULL on
- * allocation failure.
+ * allocation failure. The size is the area size, not the usable size.
  */
 struct ring *ring_new(size_t size)
 {
@@ -114,7 +114,8 @@ struct ring *ring_new(size_t size)
 /* Resizes existing ring <ring> to <size> which must be larger, without losing
  * its contents. The new size must be at least as large as the previous one or
  * no change will be performed. The pointer to the ring is returned on success,
- * or NULL on allocation failure. This will lock the ring for writes.
+ * or NULL on allocation failure. This will lock the ring for writes. The size
+ * is the allocated area size, and includes the ring_storage header.
  */
 struct ring *ring_resize(struct ring *ring, size_t size)
 {
@@ -691,10 +692,6 @@ int cli_io_handler_show_ring(struct appctx *appctx)
 	size_t last_ofs;
 	size_t ofs;
 	int ret;
-
-	/* FIXME: Don't watch the other side !*/
-	if (unlikely(sc_opposite(sc)->flags & SC_FL_SHUT_DONE))
-		return 1;
 
 	MT_LIST_DELETE(&appctx->wait_entry);
 

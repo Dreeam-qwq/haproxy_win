@@ -69,7 +69,7 @@ int type_to_smp(const char *type)
 	int it = 0;
 
 	while (it < SMP_TYPES) {
-		if (!strcmp(type, smp_to_type[it]))
+		if (strcmp(type, smp_to_type[it]) == 0)
 			break; // found
 		it += 1;
 	}
@@ -3818,7 +3818,7 @@ static int sample_conv_ungrpc(const struct arg *arg_p, struct sample *smp, void 
 	while (grpc_left > GRPC_MSG_HEADER_SZ) {
 		size_t grpc_msg_len, left;
 
-		grpc_msg_len = left = ntohl(*(uint32_t *)(pos + GRPC_MSG_COMPRESS_FLAG_SZ));
+		grpc_msg_len = left = ntohl(read_u32(pos + GRPC_MSG_COMPRESS_FLAG_SZ));
 
 		pos += GRPC_MSG_HEADER_SZ;
 		grpc_left -= GRPC_MSG_HEADER_SZ;

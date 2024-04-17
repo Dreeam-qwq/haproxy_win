@@ -35,6 +35,7 @@
 #include <haproxy/compression-t.h>
 #include <haproxy/counters-t.h>
 #include <haproxy/freq_ctr-t.h>
+#include <haproxy/guid-t.h>
 #include <haproxy/obj_type-t.h>
 #include <haproxy/queue-t.h>
 #include <haproxy/server-t.h>
@@ -214,6 +215,7 @@ enum PR_SRV_STATE_FILE {
 #define PR_FL_EXPLICIT_REF       0x08  /* The default proxy is explicitly referenced by another proxy */
 #define PR_FL_IMPLICIT_REF       0x10  /* The default proxy is implicitly referenced by another proxy */
 #define PR_FL_PAUSED             0x20  /* The proxy was paused at run time (reversible) */
+#define PR_FL_CHECKED            0x40  /* The proxy configuration was fully checked (including postparsing checks) */
 
 struct stream;
 
@@ -373,12 +375,12 @@ struct proxy {
 	struct proxy *next_stkt_ref;    /* Link to the list of proxies which refer to the same stick-table. */
 
 	struct list loggers;                    /* one per 'log' directive */
-	struct list logformat; 			/* log_format linked list */
-	struct list logformat_sd;		/* log_format linked list for the RFC5424 structured-data part */
-	struct list logformat_error;		/* log_format linked list used in case of connection error on the frontend */
+	struct lf_expr logformat; 	        /* log_format linked list */
+	struct lf_expr logformat_sd;	        /* log_format linked list for the RFC5424 structured-data part */
+	struct lf_expr logformat_error;	        /* log_format linked list used in case of connection error on the frontend */
 	struct buffer log_tag;                   /* override default syslog tag */
 	struct ist header_unique_id; 		/* unique-id header */
-	struct list format_unique_id;		/* unique-id format */
+	struct lf_expr format_unique_id;        /* unique-id format */
 	int to_log;				/* things to be logged (LW_*) */
 	int nb_req_cap, nb_rsp_cap;		/* # of headers to be captured */
 	struct cap_hdr *req_cap;		/* chained list of request headers to be captured */
@@ -426,18 +428,7 @@ struct proxy {
 		struct arg_list args;           /* sample arg list that need to be resolved */
 		unsigned int refcount;          /* refcount on this proxy (only used for default proxy for now) */
 		struct ebpt_node by_name;       /* proxies are stored sorted by name here */
-		char *logformat_string;		/* log format string */
-		char *lfs_file;                 /* file name where the logformat string appears (strdup) */
-		int   lfs_line;                 /* file name where the logformat string appears */
-		int   uif_line;                 /* file name where the unique-id-format string appears */
-		char *uif_file;                 /* file name where the unique-id-format string appears (strdup) */
-		char *uniqueid_format_string;	/* unique-id format string */
-		char *logformat_sd_string;	/* log format string for the RFC5424 structured-data part */
-		char *lfsd_file;		/* file name where the structured-data logformat string for RFC5424 appears (strdup) */
-		int  lfsd_line;			/* file name where the structured-data logformat string for RFC5424 appears */
-		char *error_logformat_string;
-		char *elfs_file;
-		int elfs_line;
+		struct list lf_checks;          /* list of logformats found in the proxy section that needs to be checked during postparse */
 	} conf;					/* config information */
 	struct http_ext *http_ext;	        /* http ext options */
 	struct eb_root used_server_addr;        /* list of server addresses in use */
@@ -467,6 +458,8 @@ struct proxy {
 						 */
 	struct list filter_configs;		/* list of the filters that are declared on this proxy */
 
+	struct guid_node guid;			/* GUID global tree node */
+
 	EXTRA_COUNTERS(extra_counters_fe);
 	EXTRA_COUNTERS(extra_counters_be);
 };
@@ -478,7 +471,7 @@ struct switching_rule {
 	union {
 		struct proxy *backend;		/* target backend */
 		char *name;			/* target backend name during config parsing */
-		struct list expr;		/* logformat expression to use for dynamic rules */
+		struct lf_expr expr;	        /* logformat expression to use for dynamic rules */
 	} be;
 	char *file;
 	int line;
@@ -492,7 +485,7 @@ struct server_rule {
 		struct server *ptr;		/* target server */
 		char *name;			/* target server name during config parsing */
 	} srv;
-	struct list expr;		/* logformat expression to use for dynamic rules */
+	struct lf_expr expr;		/* logformat expression to use for dynamic rules */
 	char *file;
 	int line;
 };
@@ -521,7 +514,7 @@ struct redirect_rule {
 	int type;
 	int rdr_len;
 	char *rdr_str;
-	struct list rdr_fmt;
+	struct lf_expr rdr_fmt;
 	int code;
 	unsigned int flags;
 	int cookie_len;

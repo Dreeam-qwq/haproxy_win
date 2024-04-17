@@ -60,7 +60,7 @@
 #include <assert.h>
 #endif
 #if defined(USE_SYSTEMD)
-#include <systemd/sd-daemon.h>
+#include <haproxy/systemd.h>
 #endif
 
 #include <import/sha1.h>
@@ -565,9 +565,6 @@ static void display_build_opts()
 #ifdef BUILD_TARGET
 	       "\n  TARGET  = " BUILD_TARGET
 #endif
-#ifdef BUILD_CPU
-	       "\n  CPU     = " BUILD_CPU
-#endif
 #ifdef BUILD_CC
 	       "\n  CC      = " BUILD_CC
 #endif
@@ -844,8 +841,17 @@ void mworker_reload(int hardreload)
 	}
 
 #if defined(USE_SYSTEMD)
-	if (global.tune.options & GTUNE_USE_SYSTEMD)
-		sd_notify(0, "RELOADING=1\nSTATUS=Reloading Configuration.\n");
+	if (global.tune.options & GTUNE_USE_SYSTEMD) {
+		struct timespec ts;
+
+		(void)clock_gettime(CLOCK_MONOTONIC, &ts);
+
+		sd_notifyf(0,
+		           "RELOADING=1\n"
+		               "STATUS=Reloading Configuration.\n"
+		               "MONOTONIC_USEC=%" PRIu64 "\n",
+		           (ts.tv_sec * 1000000ULL + ts.tv_nsec / 1000ULL));
+	}
 #endif
 	mworker_reexec(hardreload);
 }
@@ -2329,6 +2335,7 @@ static void init(int argc, char **argv)
 		}
 		list_for_each_entry(ppcf, &post_proxy_check_list, list)
 			err_code |= ppcf->fct(px);
+		px->flags |= PR_FL_CHECKED;
 	}
 	if (err_code & (ERR_ABORT|ERR_FATAL)) {
 		ha_alert("Fatal errors found in configuration.\n");
@@ -2797,9 +2804,6 @@ static void init(int argc, char **argv)
 	opts = chunk_newstr(&trash);
 #ifdef BUILD_TARGET
 	chunk_appendf(&trash, "TARGET='%s'", BUILD_TARGET);
-#endif
-#ifdef BUILD_CPU
-	chunk_appendf(&trash, " CPU='%s'", BUILD_CPU);
 #endif
 #ifdef BUILD_OPTIONS
 	chunk_appendf(&trash, " %s", BUILD_OPTIONS);
@@ -3357,9 +3361,6 @@ int main(int argc, char **argv)
 #ifdef BUILD_TARGET
 		        "\n  TARGET  = " BUILD_TARGET
 #endif
-#ifdef BUILD_CPU
-		        "\n  CPU     = " BUILD_CPU
-#endif
 #ifdef BUILD_CC
 		        "\n  CC      = " BUILD_CC
 #endif
@@ -3486,6 +3487,14 @@ int main(int argc, char **argv)
 #endif
 	}
 
+#if defined(USE_LINUX_CAP)
+	/* If CAP_NET_BIND_SERVICE is in binary file permitted set and process
+	 * is started and run under the same non-root user, this allows
+	 * binding to privileged ports.
+	 */
+	prepare_caps_from_permitted_set(geteuid(), global.uid, argv[0]);
+#endif
+
 	/* Try to get the listeners FD from the previous process using
 	 * _getsocks on the stat socket, it must never been done in wait mode
 	 * and check mode
@@ -3587,21 +3596,6 @@ int main(int argc, char **argv)
 		}
 	}
 
-	if ((global.last_checks & LSTCHK_NETADM) && global.uid) {
-		ha_alert("[%s.main()] Some configuration options require full privileges, so global.uid cannot be changed.\n"
-			 "", argv[0]);
-		protocol_unbind_all();
-		exit(1);
-	}
-
-	/* If the user is not root, we'll still let them try the configuration
-	 * but we inform them that unexpected behaviour may occur.
-	 */
-	if ((global.last_checks & LSTCHK_NETADM) && getuid())
-		ha_warning("[%s.main()] Some options which require full privileges"
-			   " might not work well.\n"
-			   "", argv[0]);
-
 	if ((global.mode & (MODE_MWORKER|MODE_DAEMON)) == 0) {
 
 		/* chroot if needed */
@@ -3629,6 +3623,34 @@ int main(int argc, char **argv)
 
 	if ((global.mode & (MODE_MWORKER | MODE_DAEMON)) == 0)
 		set_identity(argv[0]);
+
+	/* set_identity() above might have dropped LSTCHK_NETADM if
+	 * it changed to a new UID while preserving enough permissions
+	 * to honnor LSTCHK_NETADM.
+	 */
+	if ((global.last_checks & LSTCHK_NETADM) && getuid()) {
+		/* If global.uid is present in config, it is already set as euid
+		 * and ruid by set_identity() call just above, so it's better to
+		 * remind the user to fix uncoherent settings.
+		 */
+		if (global.uid) {
+			ha_alert("[%s.main()] Some configuration options require full "
+				 "privileges, so global.uid cannot be changed.\n", argv[0]);
+#if defined(USE_LINUX_CAP)
+			ha_alert("[%s.main()] Alternately, if your system supports "
+			         "Linux capabilities, you may also consider using "
+			         "'setcap cap_net_raw' or 'setcap cap_net_admin' in the "
+			         "'global' section.\n", argv[0]);
+#endif
+			protocol_unbind_all();
+			exit(1);
+		}
+		/* If the user is not root, we'll still let them try the configuration
+		 * but we inform them that unexpected behaviour may occur.
+		 */
+		ha_warning("[%s.main()] Some options which require full privileges"
+			   " might not work well.\n", argv[0]);
+	}
 
 	/* check ulimits */
 	limit.rlim_cur = limit.rlim_max = 0;

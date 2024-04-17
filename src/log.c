@@ -33,6 +33,10 @@
 #include <haproxy/http.h>
 #include <haproxy/http_ana.h>
 #include <haproxy/listener.h>
+#include <haproxy/lb_chash.h>
+#include <haproxy/lb_fwrr.h>
+#include <haproxy/lb_map.h>
+#include <haproxy/lb_ss.h>
 #include <haproxy/log.h>
 #include <haproxy/proxy.h>
 #include <haproxy/sample.h>
@@ -115,19 +119,78 @@ const char sess_term_cond[16] = "-LcCsSPRIDKUIIII"; /* normal, Local, CliTo, Cli
 const char sess_fin_state[8]  = "-RCHDLQT";	/* cliRequest, srvConnect, srvHeader, Data, Last, Queue, Tarpit */
 
 
-/* log_format   */
-struct logformat_type {
-	char *name;
-	int type;
-	int mode;
-	int lw; /* logwait bitsfield */
-	int (*config_callback)(struct logformat_node *node, struct proxy *curproxy);
-};
-
 int prepare_addrsource(struct logformat_node *node, struct proxy *curproxy);
 
-/* log_format variable names */
-static const struct logformat_type logformat_keywords[] = {
+/* logformat tag types (internal use) */
+enum logformat_tag_type {
+	LOG_FMT_GLOBAL,
+	LOG_FMT_CLIENTIP,
+	LOG_FMT_CLIENTPORT,
+	LOG_FMT_BACKENDIP,
+	LOG_FMT_BACKENDPORT,
+	LOG_FMT_FRONTENDIP,
+	LOG_FMT_FRONTENDPORT,
+	LOG_FMT_SERVERPORT,
+	LOG_FMT_SERVERIP,
+	LOG_FMT_COUNTER,
+	LOG_FMT_LOGCNT,
+	LOG_FMT_PID,
+	LOG_FMT_DATE,
+	LOG_FMT_DATEGMT,
+	LOG_FMT_DATELOCAL,
+	LOG_FMT_TS,
+	LOG_FMT_MS,
+	LOG_FMT_FRONTEND,
+	LOG_FMT_FRONTEND_XPRT,
+	LOG_FMT_BACKEND,
+	LOG_FMT_SERVER,
+	LOG_FMT_BYTES,
+	LOG_FMT_BYTES_UP,
+	LOG_FMT_Ta,
+	LOG_FMT_Th,
+	LOG_FMT_Ti,
+	LOG_FMT_TQ,
+	LOG_FMT_TW,
+	LOG_FMT_TC,
+	LOG_FMT_Tr,
+	LOG_FMT_tr,
+	LOG_FMT_trg,
+	LOG_FMT_trl,
+	LOG_FMT_TR,
+	LOG_FMT_TD,
+	LOG_FMT_TT,
+	LOG_FMT_TU,
+	LOG_FMT_STATUS,
+	LOG_FMT_CCLIENT,
+	LOG_FMT_CSERVER,
+	LOG_FMT_TERMSTATE,
+	LOG_FMT_TERMSTATE_CK,
+	LOG_FMT_ACTCONN,
+	LOG_FMT_FECONN,
+	LOG_FMT_BECONN,
+	LOG_FMT_SRVCONN,
+	LOG_FMT_RETRIES,
+	LOG_FMT_SRVQUEUE,
+	LOG_FMT_BCKQUEUE,
+	LOG_FMT_HDRREQUEST,
+	LOG_FMT_HDRRESPONS,
+	LOG_FMT_HDRREQUESTLIST,
+	LOG_FMT_HDRRESPONSLIST,
+	LOG_FMT_REQ,
+	LOG_FMT_HTTP_METHOD,
+	LOG_FMT_HTTP_URI,
+	LOG_FMT_HTTP_PATH,
+	LOG_FMT_HTTP_PATH_ONLY,
+	LOG_FMT_HTTP_QUERY,
+	LOG_FMT_HTTP_VERSION,
+	LOG_FMT_HOSTNAME,
+	LOG_FMT_UNIQUEID,
+	LOG_FMT_SSL_CIPHER,
+	LOG_FMT_SSL_VERSION,
+};
+
+/* log_format tag names */
+static const struct logformat_tag logformat_tags[] = {
 	{ "o", LOG_FMT_GLOBAL, PR_MODE_TCP, 0, NULL },  /* global option */
 
 	/* please keep these lines sorted ! */
@@ -209,6 +272,36 @@ char *log_format = NULL;
  */
 char default_rfc5424_sd_log_format[] = "- ";
 
+/* returns true if the input logformat string is one of the default ones declared
+ * above
+ */
+static inline int logformat_str_isdefault(const char *str)
+{
+	return str == httpclient_log_format ||
+	       str == default_http_log_format ||
+	       str == default_https_log_format ||
+	       str == clf_http_log_format ||
+	       str == default_tcp_log_format ||
+	       str == default_rfc5424_sd_log_format;
+}
+
+/* free logformat str if it is not a default (static) one */
+static inline void logformat_str_free(char **str)
+{
+	if (!logformat_str_isdefault(*str))
+		ha_free(str);
+}
+
+/* duplicate and return logformat str if it is not a default (static)
+ * one, else return the original one
+ */
+static inline char *logformat_str_dup(char *str)
+{
+	if (logformat_str_isdefault(str))
+		return str;
+	return strdup(str);
+}
+
 /* total number of dropped logs */
 unsigned int dropped_logs = 0;
 
@@ -222,12 +315,12 @@ THREAD_LOCAL char *logline = NULL;
  */
 THREAD_LOCAL char *logline_rfc5424 = NULL;
 
-struct logformat_var_args {
+struct logformat_tag_args {
 	char *name;
 	int mask;
 };
 
-struct logformat_var_args var_args_list[] = {
+struct logformat_tag_args tag_args_list[] = {
 // global
 	{ "M", LOG_OPT_MANDATORY },
 	{ "Q", LOG_OPT_QUOTE },
@@ -241,17 +334,19 @@ struct logformat_var_args var_args_list[] = {
  */
 int prepare_addrsource(struct logformat_node *node, struct proxy *curproxy)
 {
-	curproxy->options2 |= PR_O2_SRC_ADDR;
+	if ((curproxy->flags & PR_FL_CHECKED))
+		return 0;
 
-	return 0;
+	curproxy->options2 |= PR_O2_SRC_ADDR;
+	return 1;
 }
 
 
 /*
- * Parse args in a logformat_var. Returns 0 in error
+ * Parse args in a logformat_tag. Returns 0 in error
  * case, otherwise, it returns 1.
  */
-int parse_logformat_var_args(char *args, struct logformat_node *node, char **err)
+int parse_logformat_tag_args(char *args, struct logformat_node *node, char **err)
 {
 	int i = 0;
 	int end = 0;
@@ -259,7 +354,7 @@ int parse_logformat_var_args(char *args, struct logformat_node *node, char **err
 	char *sp = NULL; // start pointer
 
 	if (args == NULL) {
-		memprintf(err, "internal error: parse_logformat_var_args() expects non null 'args'");
+		memprintf(err, "internal error: parse_logformat_tag_args() expects non null 'args'");
 		return 0;
 	}
 
@@ -280,13 +375,13 @@ int parse_logformat_var_args(char *args, struct logformat_node *node, char **err
 
 		if (*args == '\0' || *args == ',') {
 			*args = '\0';
-			for (i = 0; sp && var_args_list[i].name; i++) {
-				if (strcmp(sp, var_args_list[i].name) == 0) {
+			for (i = 0; sp && tag_args_list[i].name; i++) {
+				if (strcmp(sp, tag_args_list[i].name) == 0) {
 					if (flags == 1) {
-						node->options |= var_args_list[i].mask;
+						node->options |= tag_args_list[i].mask;
 						break;
 					} else if (flags == 2) {
-						node->options &= ~var_args_list[i].mask;
+						node->options &= ~tag_args_list[i].mask;
 						break;
 					}
 				}
@@ -301,60 +396,53 @@ int parse_logformat_var_args(char *args, struct logformat_node *node, char **err
 }
 
 /*
- * Parse a variable '%varname' or '%{args}varname' in log-format. The caller
+ * Parse a tag '%tagname' or '%{args}tagname' in log-format. The caller
  * must pass the args part in the <arg> pointer with its length in <arg_len>,
- * and varname with its length in <var> and <var_len> respectively. <arg> is
- * ignored when arg_len is 0. Neither <var> nor <var_len> may be null.
+ * and tagname with its length in <tag> and <tag_len> respectively. <arg> is
+ * ignored when arg_len is 0. Neither <tag> nor <tag_len> may be null.
  * Returns false in error case and err is filled, otherwise returns true.
  */
-int parse_logformat_var(char *arg, int arg_len, char *name, int name_len, int typecast, char *var, int var_len, struct proxy *curproxy, struct list *list_format, int *defoptions, char **err)
+static int parse_logformat_tag(char *arg, int arg_len, char *name, int name_len, int typecast,
+                               char *tag, int tag_len, struct lf_expr *lf_expr,
+                               int *defoptions, char **err)
 {
 	int j;
+	struct list *list_format= &lf_expr->nodes;
 	struct logformat_node *node = NULL;
 
-	for (j = 0; logformat_keywords[j].name; j++) { // search a log type
-		if (strlen(logformat_keywords[j].name) == var_len &&
-		    strncmp(var, logformat_keywords[j].name, var_len) == 0) {
-			if (logformat_keywords[j].mode != PR_MODE_HTTP || curproxy->mode == PR_MODE_HTTP) {
-				node = calloc(1, sizeof(*node));
-				if (!node) {
-					memprintf(err, "out of memory error");
-					goto error_free;
-				}
-				node->type = logformat_keywords[j].type;
-				node->typecast = typecast;
-				if (name)
-					node->name = my_strndup(name, name_len);
-				node->options = *defoptions;
-				if (arg_len) {
-					node->arg = my_strndup(arg, arg_len);
-					if (!parse_logformat_var_args(node->arg, node, err))
-						goto error_free;
-				}
-				if (node->type == LOG_FMT_GLOBAL) {
-					*defoptions = node->options;
-					free_logformat_node(node);
-				} else {
-					if (logformat_keywords[j].config_callback &&
-					    logformat_keywords[j].config_callback(node, curproxy) != 0) {
-						goto error_free;
-					}
-					curproxy->to_log |= logformat_keywords[j].lw;
-					LIST_APPEND(list_format, &node->list);
-				}
-				return 1;
-			} else {
-				memprintf(err, "format variable '%s' is reserved for HTTP mode",
-				          logformat_keywords[j].name);
+	for (j = 0; logformat_tags[j].name; j++) { // search a log type
+		if (strlen(logformat_tags[j].name) == tag_len &&
+		    strncmp(tag, logformat_tags[j].name, tag_len) == 0) {
+			node = calloc(1, sizeof(*node));
+			if (!node) {
+				memprintf(err, "out of memory error");
 				goto error_free;
 			}
+			node->type = LOG_FMT_TAG;
+			node->tag = &logformat_tags[j];
+			node->typecast = typecast;
+			if (name)
+				node->name = my_strndup(name, name_len);
+			node->options = *defoptions;
+			if (arg_len) {
+				node->arg = my_strndup(arg, arg_len);
+				if (!parse_logformat_tag_args(node->arg, node, err))
+					goto error_free;
+			}
+			if (node->tag->type == LOG_FMT_GLOBAL) {
+				*defoptions = node->options;
+				free_logformat_node(node);
+			} else {
+				LIST_APPEND(list_format, &node->list);
+			}
+			return 1;
 		}
 	}
 
-	j = var[var_len];
-	var[var_len] = 0;
-	memprintf(err, "no such format variable '%s'. If you wanted to emit the '%%' character verbatim, you need to use '%%%%'", var);
-	var[var_len] = j;
+	j = tag[tag_len];
+	tag[tag_len] = 0;
+	memprintf(err, "no such format tag '%s'. If you wanted to emit the '%%' character verbatim, you need to use '%%%%'", tag);
+	tag[tag_len] = j;
 
   error_free:
 	free_logformat_node(node);
@@ -367,13 +455,14 @@ int parse_logformat_var(char *arg, int arg_len, char *name, int name_len, int ty
  *  start: start pointer
  *  end: end text pointer
  *  type: string type
- *  list_format: destination list
+ *  lf_expr: destination logformat expr (list of fmt nodes)
  *
  *  LOG_TEXT: copy chars from start to end excluding end.
  *
 */
-int add_to_logformat_list(char *start, char *end, int type, struct list *list_format, char **err)
+int add_to_logformat_list(char *start, char *end, int type, struct lf_expr *lf_expr, char **err)
 {
+	struct list *list_format = &lf_expr->nodes;
 	char *str;
 
 	if (type == LF_TEXT) { /* type text */
@@ -401,16 +490,19 @@ int add_to_logformat_list(char *start, char *end, int type, struct list *list_fo
 }
 
 /*
- * Parse the sample fetch expression <text> and add a node to <list_format> upon
+ * Parse the sample fetch expression <text> and add a node to <lf_expr> upon
  * success. The curpx->conf.args.ctx must be set by the caller. If an end pointer
  * is passed in <endptr>, it will be updated with the pointer to the first character
  * not part of the sample expression.
  *
  * In error case, the function returns 0, otherwise it returns 1.
  */
-int add_sample_to_logformat_list(char *text, char *name, int name_len, int typecast, char *arg, int arg_len, struct proxy *curpx, struct list *list_format, int options, int cap, char **err, char **endptr)
+static int add_sample_to_logformat_list(char *text, char *name, int name_len, int typecast,
+                                        char *arg, int arg_len, struct lf_expr *lf_expr,
+                                        struct arg_list *al, int options, int cap, char **err, char **endptr)
 {
 	char *cmd[2];
+	struct list *list_format = &lf_expr->nodes;
 	struct sample_expr *expr = NULL;
 	struct logformat_node *node = NULL;
 	int cmd_arg;
@@ -419,8 +511,8 @@ int add_sample_to_logformat_list(char *text, char *name, int name_len, int typec
 	cmd[1] = "";
 	cmd_arg = 0;
 
-	expr = sample_parse_expr(cmd, &cmd_arg, curpx->conf.args.file, curpx->conf.args.line, err,
-				 &curpx->conf.args, endptr);
+	expr = sample_parse_expr(cmd, &cmd_arg, lf_expr->conf.file, lf_expr->conf.line, err,
+				 al, endptr);
 	if (!expr) {
 		memprintf(err, "failed to parse sample expression <%s> : %s", text, *err);
 		goto error_free;
@@ -440,7 +532,7 @@ int add_sample_to_logformat_list(char *text, char *name, int name_len, int typec
 
 	if (arg_len) {
 		node->arg = my_strndup(arg, arg_len);
-		if (!parse_logformat_var_args(node->arg, node, err))
+		if (!parse_logformat_tag_args(node->arg, node, err))
 			goto error_free;
 	}
 	if (expr->fetch->val & cap & SMP_VAL_REQUEST)
@@ -457,20 +549,9 @@ int add_sample_to_logformat_list(char *text, char *name, int name_len, int typec
 
 	if ((options & LOG_OPT_HTTP) && (expr->fetch->use & (SMP_USE_L6REQ|SMP_USE_L6RES))) {
 		ha_warning("parsing [%s:%d] : L6 sample fetch <%s> ignored in HTTP log-format string.\n",
-			   curpx->conf.args.file, curpx->conf.args.line, text);
+			   lf_expr->conf.file, lf_expr->conf.line, text);
 	}
 
-	/* check if we need to allocate an http_txn struct for HTTP parsing */
-	/* Note, we may also need to set curpx->to_log with certain fetches */
-	curpx->http_needed |= !!(expr->fetch->use & SMP_USE_HTTP_ANY);
-
-	/* FIXME: temporary workaround for missing LW_XPRT and LW_REQ flags
-	 * needed with some sample fetches (eg: ssl*). We always set it for
-	 * now on, but this will leave with sample capabilities soon.
-	 */
-	curpx->to_log |= LW_XPRT;
-	if (curpx->http_needed)
-		curpx->to_log |= LW_REQ;
 	LIST_APPEND(list_format, &node->list);
 	return 1;
 
@@ -480,42 +561,56 @@ int add_sample_to_logformat_list(char *text, char *name, int name_len, int typec
 }
 
 /*
- * Parse the log_format string and fill a linked list.
- * Variable name are preceded by % and composed by characters [a-zA-Z0-9]* : %varname
- * You can set arguments using { } : %{many arguments}varname.
- * The curproxy->conf.args.ctx must be set by the caller.
+ * Compile logformat expression (from string to list of logformat nodes)
  *
- *  fmt: the string to parse
- *  curproxy: the proxy affected
- *  list_format: the destination list
+ * Tag name are preceded by % and composed by characters [a-zA-Z0-9]* : %tagname
+ * You can set arguments using { } : %{many arguments}tagname.
+ *
+ *  lf_expr: the destination logformat expression (logformat_node list)
+ *           which is supposed to be configured (str and conf set) but
+ *           shouldn't be compiled (shouldn't contain any nodes)
+ *  al: arg list where sample expr should store arg dependency (if the logformat
+ *      expression involves sample expressions), may be NULL
  *  options: LOG_OPT_* to force on every node
  *  cap: all SMP_VAL_* flags supported by the consumer
  *
  * The function returns 1 in success case, otherwise, it returns 0 and err is filled.
  */
-int parse_logformat_string(const char *fmt, struct proxy *curproxy, struct list *list_format, int options, int cap, char **err)
+int lf_expr_compile(struct lf_expr *lf_expr,
+                    struct arg_list *al, int options, int cap, char **err)
 {
+	char *fmt = lf_expr->str; /* will be freed unless default */
 	char *sp, *str, *backfmt; /* start pointer for text parts */
 	char *arg = NULL; /* start pointer for args */
-	char *var = NULL; /* start pointer for vars */
+	char *tag = NULL; /* start pointer for tags */
 	char *name = NULL; /* token name (optional) */
 	char *typecast_str = NULL; /* token output type (if custom name is set) */
 	int arg_len = 0;
-	int var_len = 0;
+	int tag_len = 0;
 	int name_len = 0;
 	int typecast = SMP_T_SAME; /* relaxed by default */
 	int cformat; /* current token format */
 	int pformat; /* previous token format */
+
+	BUG_ON((lf_expr->flags & LF_FL_COMPILED));
+
+	if (!fmt)
+		return 1; // nothing to do
 
 	sp = str = backfmt = strdup(fmt);
 	if (!str) {
 		memprintf(err, "out of memory error");
 		return 0;
 	}
-	curproxy->to_log |= LW_INIT;
 
-	/* flush the list first. */
-	free_logformat_list(list_format);
+	/* Prepare lf_expr nodes, past this lf_expr doesn't know about ->str
+	 * anymore as ->str and ->nodes are part of the same union. ->str has
+	 * been saved as local 'fmt' string pointer, so we must free it before
+	 * returning.
+	 */
+	LIST_INIT(&lf_expr->nodes);
+	/* we must set the compiled flag now for proper deinit in case of failure */
+	lf_expr->flags |= LF_FL_COMPILED;
 
 	for (cformat = LF_INIT; cformat != LF_END; str++) {
 		pformat = cformat;
@@ -529,18 +624,18 @@ int parse_logformat_string(const char *fmt, struct proxy *curproxy, struct list 
 		 * We use the common LF_INIT state to dispatch to the different final states.
 		 */
 		switch (pformat) {
-		case LF_STARTVAR:                      // text immediately following a '%'
-			arg = NULL; var = NULL;
+		case LF_STARTTAG:                      // text immediately following a '%'
+			arg = NULL; tag = NULL;
 			name = NULL;
 			name_len = 0;
 			typecast = SMP_T_SAME;
-			arg_len = var_len = 0;
+			arg_len = tag_len = 0;
 			if (*str == '(') {             // custom output name
 				cformat = LF_STONAME;
 				name = str + 1;
 			}
 			else
-				goto startvar;
+				goto starttag;
 			break;
 
 		case LF_STONAME:                       // text immediately following '%('
@@ -573,18 +668,18 @@ int parse_logformat_string(const char *fmt, struct proxy *curproxy, struct list 
 			break;
 
 		case LF_EDONAME:                       // text immediately following %(name)
- startvar:
+ starttag:
 			if (*str == '{') {             // optional argument
 				cformat = LF_STARG;
 				arg = str + 1;
 			}
 			else if (*str == '[') {
 				cformat = LF_STEXPR;
-				var = str + 1;         // store expr in variable name
+				tag = str + 1;         // store expr in tag name
 			}
-			else if (isalpha((unsigned char)*str)) { // variable name
-				cformat = LF_VAR;
-				var = str;
+			else if (isalpha((unsigned char)*str)) { // tag name
+				cformat = LF_TAG;
+				tag = str;
 			}
 			else if (*str == '%')
 				cformat = LF_TEXT;     // convert this character to a literal (useful for '%')
@@ -593,7 +688,7 @@ int parse_logformat_string(const char *fmt, struct proxy *curproxy, struct list 
 				cformat = LF_TEXT;
 				pformat = LF_TEXT; /* finally we include the previous char as well */
 				sp = str - 1; /* send both the '%' and the current char */
-				memprintf(err, "unexpected variable name near '%c' at position %d line : '%s'. Maybe you want to write a single '%%', use the syntax '%%%%'",
+				memprintf(err, "unexpected tag name near '%c' at position %d line : '%s'. Maybe you want to write a single '%%', use the syntax '%%%%'",
 				          *str, (int)(str - backfmt), fmt);
 				goto fail;
 
@@ -613,15 +708,15 @@ int parse_logformat_string(const char *fmt, struct proxy *curproxy, struct list 
 		case LF_EDARG:                         // text immediately following '%{arg}'
 			if (*str == '[') {
 				cformat = LF_STEXPR;
-				var = str + 1;         // store expr in variable name
+				tag = str + 1;         // store expr in tag name
 				break;
 			}
-			else if (isalnum((unsigned char)*str)) { // variable name
-				cformat = LF_VAR;
-				var = str;
+			else if (isalnum((unsigned char)*str)) { // tag name
+				cformat = LF_TAG;
+				tag = str;
 				break;
 			}
-			memprintf(err, "parse argument modifier without variable name near '%%{%s}'", arg);
+			memprintf(err, "parse argument modifier without tag name near '%%{%s}'", arg);
 			goto fail;
 
 		case LF_STEXPR:                        // text immediately following '%['
@@ -630,7 +725,7 @@ int parse_logformat_string(const char *fmt, struct proxy *curproxy, struct list 
 			 * part of the expression, which MUST be the trailing
 			 * angle bracket.
 			 */
-			if (!add_sample_to_logformat_list(var, name, name_len, typecast, arg, arg_len, curproxy, list_format, options, cap, err, &str))
+			if (!add_sample_to_logformat_list(tag, name, name_len, typecast, arg, arg_len, lf_expr, al, options, cap, err, &str))
 				goto fail;
 
 			if (*str == ']') {
@@ -642,26 +737,26 @@ int parse_logformat_string(const char *fmt, struct proxy *curproxy, struct list 
 				char c = *str;
 				*str = 0;
 				if (isprint((unsigned char)c))
-					memprintf(err, "expected ']' after '%s', but found '%c'", var, c);
+					memprintf(err, "expected ']' after '%s', but found '%c'", tag, c);
 				else
-					memprintf(err, "missing ']' after '%s'", var);
+					memprintf(err, "missing ']' after '%s'", tag);
 				goto fail;
 			}
 			break;
 
-		case LF_VAR:                           // text part of a variable name
-			var_len = str - var;
+		case LF_TAG:                           // text part of a tag name
+			tag_len = str - tag;
 			if (!isalnum((unsigned char)*str))
-				cformat = LF_INIT;     // not variable name anymore
+				cformat = LF_INIT;     // not tag name anymore
 			break;
 
 		default:                               // LF_INIT, LF_TEXT, LF_SEPARATOR, LF_END, LF_EDEXPR
 			cformat = LF_INIT;
 		}
 
-		if (cformat == LF_INIT) { /* resynchronize state to text/sep/startvar */
+		if (cformat == LF_INIT) { /* resynchronize state to text/sep/starttag */
 			switch (*str) {
-			case '%': cformat = LF_STARTVAR;  break;
+			case '%': cformat = LF_STARTTAG;  break;
 			case  0 : cformat = LF_END;       break;
 			case ' ':
 				if (options & LOG_OPT_MERGE_SPACES) {
@@ -675,13 +770,13 @@ int parse_logformat_string(const char *fmt, struct proxy *curproxy, struct list 
 
 		if (cformat != pformat || pformat == LF_SEPARATOR) {
 			switch (pformat) {
-			case LF_VAR:
-				if (!parse_logformat_var(arg, arg_len, name, name_len, typecast, var, var_len, curproxy, list_format, &options, err))
+			case LF_TAG:
+				if (!parse_logformat_tag(arg, arg_len, name, name_len, typecast, tag, tag_len, lf_expr, &options, err))
 					goto fail;
 				break;
 			case LF_TEXT:
 			case LF_SEPARATOR:
-				if (!add_to_logformat_list(sp, str, pformat, list_format, err))
+				if (!add_to_logformat_list(sp, str, pformat, lf_expr, err))
 					goto fail;
 				break;
 			}
@@ -689,16 +784,175 @@ int parse_logformat_string(const char *fmt, struct proxy *curproxy, struct list 
 		}
 	}
 
-	if (pformat == LF_STARTVAR || pformat == LF_STARG || pformat == LF_STEXPR || pformat == LF_STONAME || pformat == LF_STOTYPE || pformat == LF_EDONAME) {
-		memprintf(err, "truncated line after '%s'", var ? var : arg ? arg : "%");
+	if (pformat == LF_STARTTAG || pformat == LF_STARG || pformat == LF_STEXPR || pformat == LF_STONAME || pformat == LF_STOTYPE || pformat == LF_EDONAME) {
+		memprintf(err, "truncated line after '%s'", tag ? tag : arg ? arg : "%");
 		goto fail;
 	}
-	free(backfmt);
+	logformat_str_free(&fmt);
+	ha_free(&backfmt);
 
 	return 1;
  fail:
-	free(backfmt);
+	logformat_str_free(&fmt);
+	ha_free(&backfmt);
 	return 0;
+}
+
+/* lf_expr_compile() helper: uses <curproxy> to deduce settings and
+ * simplify function usage, mostly for legacy purpose
+ *
+ * curproxy->conf.args.ctx must be set by the caller.
+ *
+ * The logformat expression will be scheduled for postcheck on the proxy unless
+ * the proxy was already checked, in which case all checks will be performed right
+ * away.
+ *
+ * Returns 1 on success and 0 on failure. On failure: <lf_expr> will be cleaned
+ * up and <err> will be set.
+ */
+int parse_logformat_string(const char *fmt, struct proxy *curproxy,
+                           struct lf_expr *lf_expr,
+                           int options, int cap, char **err)
+{
+	int ret;
+
+
+	/* reinit lf_expr (if previously set) */
+	lf_expr_deinit(lf_expr);
+
+	lf_expr->str = strdup(fmt);
+	if (!lf_expr->str) {
+		memprintf(err, "out of memory error");
+		goto fail;
+	}
+
+	/* Save some parsing infos to raise relevant error messages during
+	 * postparsing if needed
+	 */
+	if (curproxy->conf.args.file) {
+		lf_expr->conf.file = strdup(curproxy->conf.args.file);
+		lf_expr->conf.line = curproxy->conf.args.line;
+	}
+
+	ret = lf_expr_compile(lf_expr, &curproxy->conf.args, options, cap, err);
+
+	if (!ret)
+		goto fail;
+
+	if (!(curproxy->flags & PR_FL_CHECKED)) {
+		/* add the lf_expr to the proxy checks to delay postparsing
+		 * since config-related proxy properties are not stable yet
+		 */
+		LIST_APPEND(&curproxy->conf.lf_checks, &lf_expr->list);
+	}
+	else {
+		/* probably called during runtime or with proxy already checked,
+		 * perform the postcheck right away
+		 */
+		if (!lf_expr_postcheck(lf_expr, curproxy, err))
+			goto fail;
+	}
+	return 1;
+
+ fail:
+	lf_expr_deinit(lf_expr);
+	return 0;
+}
+
+/* Performs a postparsing check on logformat expression <expr> for a given <px>
+ * proxy. The function will behave differently depending on the proxy state
+ * (during parsing we will try to adapt proxy configuration to make it
+ * compatible with logformat expression, but once the proxy is checked, we fail
+ * as soon as we face incompatibilities)
+ *
+ * It returns 1 on success and 0 on error, <err> will be set in case of error.
+ */
+int lf_expr_postcheck(struct lf_expr *lf_expr, struct proxy *px, char **err)
+{
+	struct logformat_node *lf;
+
+	if (!(px->flags & PR_FL_CHECKED))
+		px->to_log |= LW_INIT;
+
+	list_for_each_entry(lf, &lf_expr->nodes, list) {
+		if (lf->type == LOG_FMT_EXPR) {
+			struct sample_expr *expr = lf->expr;
+			uint8_t http_needed = !!(expr->fetch->use & SMP_USE_HTTP_ANY);
+
+			if ((px->flags & PR_FL_CHECKED)) {
+				/* fail as soon as proxy properties are not compatible */
+				if (http_needed && !px->http_needed) {
+					memprintf(err, "sample fetch '%s' requires HTTP enabled proxy which is not available here",
+					          expr->fetch->kw);
+					goto fail;
+				}
+				continue;
+			}
+			/* check if we need to allocate an http_txn struct for HTTP parsing */
+			/* Note, we may also need to set curpx->to_log with certain fetches */
+			px->http_needed |= http_needed;
+
+			/* FIXME: temporary workaround for missing LW_XPRT and LW_REQ flags
+			 * needed with some sample fetches (eg: ssl*). We always set it for
+			 * now on, but this will leave with sample capabilities soon.
+			 */
+			px->to_log |= LW_XPRT;
+			if (px->http_needed)
+				px->to_log |= LW_REQ;
+		}
+		else if (lf->type == LOG_FMT_TAG) {
+			if (lf->tag->mode == PR_MODE_HTTP && px->mode != PR_MODE_HTTP) {
+				memprintf(err, "format tag '%s' is reserved for HTTP mode",
+				          lf->tag->name);
+				goto fail;
+			}
+			if (lf->tag->config_callback &&
+			    !lf->tag->config_callback(lf, px)) {
+				memprintf(err, "cannot configure format tag '%s' in this context",
+				          lf->tag->name);
+				goto fail;
+			}
+			if (!(px->flags & PR_FL_CHECKED))
+				px->to_log |= lf->tag->lw;
+		}
+	}
+	if ((px->to_log & (LW_REQ | LW_RESP)) &&
+	    (px->mode != PR_MODE_HTTP && !(px->options & PR_O_HTTP_UPG))) {
+		memprintf(err, "logformat expression not usable here (at least one node depends on HTTP mode)");
+		goto fail;
+	}
+
+	return 1;
+ fail:
+	return 0;
+}
+
+/* postparse logformats defined at <px> level */
+static int postcheck_logformat_proxy(struct proxy *px)
+{
+	char *err = NULL;
+	struct lf_expr *lf_expr, *back_lf;
+	int err_code = ERR_NONE;
+
+	list_for_each_entry_safe(lf_expr, back_lf, &px->conf.lf_checks, list) {
+		BUG_ON(!(lf_expr->flags & LF_FL_COMPILED));
+		if (!lf_expr_postcheck(lf_expr, px, &err))
+			err_code |= ERR_FATAL | ERR_ALERT;
+		/* check performed, ensure it doesn't get checked twice */
+		LIST_DEL_INIT(&lf_expr->list);
+		if (err_code & ERR_CODE)
+			break;
+	}
+
+	if (err) {
+		memprintf(&err, "error detected while postparsing logformat expression used by %s '%s' : %s", proxy_type_str(px), px->id, err);
+		if (lf_expr->conf.file)
+			memprintf(&err, "parsing [%s:%d] : %s.\n", lf_expr->conf.file, lf_expr->conf.line, err);
+		ha_alert("%s", err);
+		ha_free(&err);
+	}
+
+	return err_code;
 }
 
 /*
@@ -813,114 +1067,11 @@ static int dup_log_target(struct log_target *def, struct log_target *cpy)
 	return 0;
 }
 
-/* must be called under the lbprm lock */
-static void _log_backend_srv_queue(struct server *srv)
-{
-	struct proxy *p = srv->proxy;
-
-	/* queue the server in the proxy lb array to make it easily searchable by
-	 * log-balance algorithms. Here we use the srv array as a general server
-	 * pool of in-use servers, lookup is done using a relative positional id
-	 * (array is contiguous)
-	 *
-	 * We use the avail server list to get a quick hand on available servers
-	 * (those that are UP)
-	 */
-	if (srv->flags & SRV_F_BACKUP) {
-		if (!p->srv_act)
-			p->lbprm.log.srv[p->srv_bck] = srv;
-		p->srv_bck++;
-	}
-	else {
-		if (!p->srv_act) {
-			/* we will be switching to act tree in LB logic, thus we need to
-			 * reset the lastid
-			 */
-			HA_ATOMIC_STORE(&p->lbprm.log.lastid, 0);
-		}
-		p->lbprm.log.srv[p->srv_act] = srv;
-		p->srv_act++;
-	}
-	/* append the server to the list of available servers */
-	LIST_APPEND(&p->lbprm.log.avail, &srv->lb_list);
-
-	p->lbprm.tot_weight = (p->srv_act) ? p->srv_act : p->srv_bck;
-}
-
-static void log_backend_srv_up(struct server *srv)
-{
-	struct proxy *p __maybe_unused = srv->proxy;
-
-	if (!srv_lb_status_changed(srv))
-		return; /* nothing to do */
-	if (srv_currently_usable(srv) || !srv_willbe_usable(srv))
-		return; /* false alarm */
-
-	HA_RWLOCK_WRLOCK(LBPRM_LOCK, &p->lbprm.lock);
-	_log_backend_srv_queue(srv);
-	HA_RWLOCK_WRUNLOCK(LBPRM_LOCK, &p->lbprm.lock);
-}
-
-/* must be called under lbprm lock */
-static void _log_backend_srv_recalc(struct proxy *p)
-{
-	unsigned int it = 0;
-	struct server *cur_srv;
-
-	list_for_each_entry(cur_srv, &p->lbprm.log.avail, lb_list) {
-		uint8_t backup = cur_srv->flags & SRV_F_BACKUP;
-
-		if ((!p->srv_act && backup) ||
-		    (p->srv_act && !backup))
-			p->lbprm.log.srv[it++] = cur_srv;
-	}
-}
-
-/* must be called under the lbprm lock */
-static void _log_backend_srv_dequeue(struct server *srv)
-{
-	struct proxy *p = srv->proxy;
-
-	if (srv->flags & SRV_F_BACKUP) {
-		p->srv_bck--;
-	}
-	else {
-		p->srv_act--;
-		if (!p->srv_act) {
-			/* we will be switching to bck tree in LB logic, thus we need to
-			 * reset the lastid
-			 */
-			HA_ATOMIC_STORE(&p->lbprm.log.lastid, 0);
-		}
-	}
-
-	/* remove the srv from the list of available (UP) servers */
-	LIST_DELETE(&srv->lb_list);
-
-	/* reconstruct the array of usable servers */
-	_log_backend_srv_recalc(p);
-
-	p->lbprm.tot_weight = (p->srv_act) ? p->srv_act : p->srv_bck;
-}
-
-static void log_backend_srv_down(struct server *srv)
-{
-	struct proxy *p __maybe_unused = srv->proxy;
-
-	if (!srv_lb_status_changed(srv))
-		return; /* nothing to do */
-	if (!srv_currently_usable(srv) || srv_willbe_usable(srv))
-		return; /* false alarm */
-
-	HA_RWLOCK_WRLOCK(LBPRM_LOCK, &p->lbprm.lock);
-	_log_backend_srv_dequeue(srv);
-	HA_RWLOCK_WRUNLOCK(LBPRM_LOCK, &p->lbprm.lock);
-}
-
 /* check that current configuration is compatible with "mode log" */
 static int _postcheck_log_backend_compat(struct proxy *be)
 {
 	int err_code = ERR_NONE;
+	int balance_algo = (be->lbprm.algo & BE_LB_ALGO);
 
 	if (!LIST_ISEMPTY(&be->tcp_req.inspect_rules) ||
 	    !LIST_ISEMPTY(&be->tcp_req.l4_rules) ||
@@ -978,6 +1129,16 @@ static int _postcheck_log_backend_compat(struct proxy *be)
 		err_code |= ERR_WARN;
 		free_server_rules(&be->server_rules);
 	}
+	if (balance_algo != BE_LB_ALGO_RR &&
+	    balance_algo != BE_LB_ALGO_RND &&
+	    balance_algo != BE_LB_ALGO_SS &&
+	    balance_algo != BE_LB_ALGO_LH) {
+		/* cannot correct the error since lbprm init was already performed
+		 * in cfgparse.c, so fail loudly
+		 */
+		ha_alert("in %s '%s': \"balance\" only supports 'roundrobin', 'random', 'sticky' and 'log-hash'.\n", proxy_type_str(be), be->id);
+		err_code |= ERR_ALERT | ERR_FATAL;
+	}
 	return err_code;
 }
 
@@ -995,30 +1156,6 @@ static int postcheck_log_backend(struct proxy *be)
 	err_code |= _postcheck_log_backend_compat(be);
 	if (err_code & ERR_CODE)
 		return err_code;
-
-	/* First time encountering this log backend, perform some init
-	 */
-	be->lbprm.set_server_status_up = log_backend_srv_up;
-	be->lbprm.set_server_status_down = log_backend_srv_down;
-	be->lbprm.log.lastid = 0; /* initial value */
-	LIST_INIT(&be->lbprm.log.avail);
-
-	/* alloc srv array (it will be used for active and backup server lists in turn,
-	 * so we ensure that the longest list will fit
-	 */
-	be->lbprm.log.srv = calloc(MAX(be->srv_act, be->srv_bck),
-				   sizeof(*be->lbprm.log.srv));
-
-	if (!be->lbprm.log.srv ) {
-		memprintf(&msg, "memory error when allocating server array (%d entries)",
-		          MAX(be->srv_act, be->srv_bck));
-		err_code |= ERR_ALERT | ERR_FATAL;
-		goto end;
-	}
-
-	/* reinit srv counters, lbprm queueing will recount */
-	be->srv_act = 0;
-	be->srv_bck = 0;
 
 	/* "log-balance hash" needs to compile its expression */
 	if ((be->lbprm.algo & BE_LB_ALGO) == BE_LB_ALGO_LH) {
@@ -1130,13 +1267,10 @@ static int postcheck_log_backend(struct proxy *be)
 			goto end;
 		}
 		srv->log_target->flags |= LOG_TARGET_FL_RESOLVED;
-		srv->cur_eweight = 1; /* ignore weights, all servers have the same weight */
-		_log_backend_srv_queue(srv);
 		srv = srv->next;
 	}
  end:
 	if (err_code & ERR_CODE) {
-		ha_free(&be->lbprm.log.srv); /* free log servers array */
 		ha_alert("log backend '%s': failed to initialize: %s.\n", be->id, msg);
 		ha_free(&msg);
 	}
@@ -1600,6 +1734,8 @@ int get_log_facility(const char *fac)
  * When using the +E log format option, it will try to escape '"\]'
  * characters with '\' as prefix. The same prefix should not be used as
  * <escape>.
+ *
+ * Return the address of the \0 character, or NULL on error
  */
 static char *lf_encode_string(char *start, char *stop,
                               const char escape, const long *map,
@@ -1630,13 +1766,14 @@ static char *lf_encode_string(char *start, char *stop,
 				string++;
 			}
 			*start = '\0';
+			return start;
 		}
 	}
 	else {
 		return encode_string(start, stop, escape, map, string);
 	}
 
-	return start;
+	return NULL;
 }
 
 /*
@@ -1645,6 +1782,8 @@ static char *lf_encode_string(char *start, char *stop,
  * When using the +E log format option, it will try to escape '"\]'
  * characters with '\' as prefix. The same prefix should not be used as
  * <escape>.
+ *
+ * Return the address of the \0 character, or NULL on error
  */
 static char *lf_encode_chunk(char *start, char *stop,
                              const char escape, const long *map,
@@ -1680,13 +1819,14 @@ static char *lf_encode_chunk(char *start, char *stop,
 				str++;
 			}
 			*start = '\0';
+			return start;
 		}
 	}
 	else {
 		return encode_chunk(start, stop, escape, map, chunk);
 	}
 
-	return start;
+	return NULL;
 }
 
 /*
@@ -1707,13 +1847,12 @@ char *lf_text_len(char *dst, const char *src, size_t len, size_t size, const str
 
 	if (src && len) {
 		/* escape_string and strlcpy2 will both try to add terminating NULL-byte
-		 * to dst, so we need to make sure that extra byte will fit into dst
-		 * before calling them
+		 * to dst
 		 */
 		if (node->options & LOG_OPT_ESC) {
 			char *ret;
 
-			ret = escape_string(dst, (dst + size - 1), '\\', rfc5424_escape_map, src, src + len);
+			ret = escape_string(dst, dst + size, '\\', rfc5424_escape_map, src, src + len);
 			if (ret == NULL || *ret != '\0')
 				return NULL;
 			len = ret - dst;
@@ -1775,7 +1914,7 @@ char *lf_ip(char *dst, const struct sockaddr *sockaddr, size_t size, const struc
 		default:
 			return NULL;
 		}
-		if (iret < 0 || iret > size)
+		if (iret < 0 || iret >= size)
 			return NULL;
 		ret += iret;
 	} else {
@@ -1799,7 +1938,7 @@ char *lf_port(char *dst, const struct sockaddr *sockaddr, size_t size, const str
 	if (node->options & LOG_OPT_HEXA) {
 		const unsigned char *port = (const unsigned char *)&((struct sockaddr_in *)sockaddr)->sin_port;
 		iret = snprintf(dst, size, "%02X%02X", port[0], port[1]);
-		if (iret < 0 || iret > size)
+		if (iret < 0 || iret >= size)
 			return NULL;
 		ret += iret;
 	} else {
@@ -2285,51 +2424,25 @@ static inline void __do_send_log_backend(struct proxy *be, struct log_header hdr
                                          int nblogger, size_t maxlen,
                                          char *message, size_t size)
 {
-	struct server *srv;
-	uint32_t targetid = ~0; /* default value to check if it was explicitly assigned */
-	uint32_t nb_srv;
-
-	HA_RWLOCK_RDLOCK(LBPRM_LOCK, &be->lbprm.lock);
-
-	if (be->srv_act) {
-		nb_srv = be->srv_act;
-	}
-	else if (be->srv_bck) {
-		/* no more active servers but backup ones are, switch to backup farm */
-		nb_srv = be->srv_bck;
-		if (!(be->options & PR_O_USE_ALL_BK)) {
-			/* log balancing disabled on backup farm */
-			targetid = 0; /* use first server */
-			goto skip_lb;
-		}
-	}
-	else {
-		/* no srv available, can't log */
-		goto drop;
-	}
+	struct server *srv = NULL;
 
 	/* log-balancing logic: */
 
 	if ((be->lbprm.algo & BE_LB_ALGO) == BE_LB_ALGO_RR) {
-		/* Atomically load and update lastid since it's not protected
-		 * by any write lock
-		 *
-		 * Wrapping is expected and could lead to unexpected ID reset in the
-		 * middle of a cycle, but given that this only happens once in every
-		 * 4 billions it is quite negligible
-		 */
-		targetid = HA_ATOMIC_FETCH_ADD(&be->lbprm.log.lastid, 1) % nb_srv;
+		srv = fwrr_get_next_server(be, NULL);
 	}
-	else if ((be->lbprm.algo & BE_LB_ALGO) == BE_LB_ALGO_LS) {
+	else if ((be->lbprm.algo & BE_LB_ALGO) == BE_LB_ALGO_SS) {
 		/* sticky mode: use first server in the pool, which will always stay
 		 * first during dequeuing and requeuing, unless it becomes unavailable
 		 * and will be replaced by another one
 		 */
-		targetid = 0;
+		srv = ss_get_server(be);
 	}
 	else if ((be->lbprm.algo & BE_LB_ALGO) == BE_LB_ALGO_RND) {
-		/* random mode */
-		targetid = statistical_prng() % nb_srv;
+		unsigned int hash;
+
+		hash = statistical_prng(); /* random */
+		srv = chash_get_server_hash(be, hash, NULL);
 	}
 	else if ((be->lbprm.algo & BE_LB_ALGO) == BE_LB_ALGO_LH) {
 		struct sample result;
@@ -2344,28 +2457,24 @@ static inline void __do_send_log_backend(struct proxy *be, struct log_header hdr
 		if (sample_process_cnv(be->lbprm.expr, &result)) {
 			/* gen_hash takes binary input, ensure that we provide such value to it */
 			if (result.data.type == SMP_T_BIN || sample_casts[result.data.type][SMP_T_BIN]) {
+				unsigned int hash;
+
 				sample_casts[result.data.type][SMP_T_BIN](&result);
-				targetid = gen_hash(be, result.data.u.str.area, result.data.u.str.data) % nb_srv;
+				hash = gen_hash(be, result.data.u.str.area, result.data.u.str.data);
+				srv = map_get_server_hash(be, hash);
 			}
 		}
 	}
 
- skip_lb:
-
-	if (targetid == ~0) {
-		/* no target assigned, nothing to do */
+	if (!srv) {
+		/* no srv available, can't log */
 		goto drop;
 	}
-
-	/* find server based on targetid */
-	srv = be->lbprm.log.srv[targetid];
-	HA_RWLOCK_RDUNLOCK(LBPRM_LOCK, &be->lbprm.lock);
 
 	__do_send_log(srv->log_target, hdr, nblogger, maxlen, message, size);
 	return;
 
  drop:
-	HA_RWLOCK_RDUNLOCK(LBPRM_LOCK, &be->lbprm.lock);
 	_HA_ATOMIC_INC(&dropped_logs);
 }
 
@@ -2678,19 +2787,105 @@ void free_logformat_list(struct list *fmt)
 	}
 }
 
-/* Builds a log line in <dst> based on <list_format>, and stops before reaching
+/* Prepares log-format expression struct */
+void lf_expr_init(struct lf_expr *expr)
+{
+	LIST_INIT(&expr->list);
+	expr->flags = LF_FL_NONE;
+	expr->str = NULL;
+	expr->conf.file = NULL;
+	expr->conf.line = 0;
+}
+
+/* Releases and resets a log-format expression */
+void lf_expr_deinit(struct lf_expr *expr)
+{
+	if ((expr->flags & LF_FL_COMPILED))
+		free_logformat_list(&expr->nodes);
+	else
+		logformat_str_free(&expr->str);
+	free(expr->conf.file);
+	/* remove from parent list (if any) */
+	LIST_DEL_INIT(&expr->list);
+
+	lf_expr_init(expr);
+}
+
+/* Transfer a compiled log-format expression from <src> to <dst>
+ * at the end of the operation, <src> is reset
+ */
+void lf_expr_xfer(struct lf_expr *src, struct lf_expr *dst)
+{
+	struct logformat_node *lf, *lfb;
+
+	/* first, reset any existing expr */
+	lf_expr_deinit(dst);
+
+	BUG_ON(!(src->flags & LF_FL_COMPILED));
+
+	/* then proceed with transfer between <src> and <dst> */
+	dst->conf.file = src->conf.file;
+	dst->conf.line = src->conf.line;
+
+	dst->flags |= LF_FL_COMPILED;
+	LIST_INIT(&dst->nodes);
+
+	list_for_each_entry_safe(lf, lfb, &src->nodes, list) {
+		LIST_DELETE(&lf->list);
+		LIST_APPEND(&dst->nodes, &lf->list);
+	}
+
+	/* replace <src> with <dst> in <src>'s list by first adding
+	 * <dst> after <src>, then removing <src>...
+	 */
+	LIST_INSERT(&src->list, &dst->list);
+	LIST_DEL_INIT(&src->list);
+
+	/* src is now empty, perform an explicit reset */
+	lf_expr_init(src);
+}
+
+/* tries to duplicate an uncompiled logformat expression from <orig> to <dest>
+ *
+ * Returns 1 on success and 0 on failure.
+ */
+int lf_expr_dup(const struct lf_expr *orig, struct lf_expr *dest)
+{
+	BUG_ON((orig->flags & LF_FL_COMPILED));
+	lf_expr_deinit(dest);
+	if (orig->str) {
+		dest->str = logformat_str_dup(orig->str);
+		if (!dest->str)
+			goto error;
+	}
+	if (orig->conf.file) {
+		dest->conf.file = strdup(orig->conf.file);
+		if (!dest->conf.file)
+			goto error;
+	}
+	dest->conf.line = orig->conf.line;
+
+	return 1;
+
+ error:
+	lf_expr_deinit(dest);
+	return 0;
+}
+
+/* Builds a log line in <dst> based on <lf_expr>, and stops before reaching
  * <maxsize> characters. Returns the size of the output string in characters,
  * not counting the trailing zero which is always added if the resulting size
  * is not zero. It requires a valid session and optionally a stream. If the
  * stream is NULL, default values will be assumed for the stream part.
  */
-int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t maxsize, struct list *list_format)
+int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t maxsize, struct lf_expr *lf_expr)
 {
 	struct proxy *fe = sess->fe;
 	struct proxy *be;
 	struct http_txn *txn;
 	const struct strm_logs *logs;
 	struct connection *fe_conn, *be_conn;
+	struct list *list_format = &lf_expr->nodes;
 	unsigned int s_flags;
 	unsigned int uniq_id;
 	struct buffer chunk;
@@ -2794,7 +2989,7 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 	tmplog = dst;
 
 	/* fill logbuffer */
-	if (LIST_ISEMPTY(list_format))
+	if (lf_expr_isempty(lf_expr))
 		return 0;
 
 	list_for_each_entry(tmp, list_format, list) {
@@ -2843,11 +3038,17 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 							  key ? key->data.u.str.data : 0,
 							  dst + maxsize - tmplog,
 							  tmp);
-				if (ret == 0)
+				if (ret == NULL)
 					goto out;
 				tmplog = ret;
 				break;
+		}
 
+		if (tmp->type != LOG_FMT_TAG)
+			goto next_fmt;
+
+		/* logformat tag */
+		switch (tmp->tag->type) {
 			case LOG_FMT_CLIENTIP:  // %ci
 				addr = (s ? sc_src(s->scf) : sess_src(sess));
 				if (addr)
@@ -3005,7 +3206,7 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 			case LOG_FMT_TS: // %Ts
 				if (tmp->options & LOG_OPT_HEXA) {
 					iret = snprintf(tmplog, dst + maxsize - tmplog, "%04X", (unsigned int)logs->accept_date.tv_sec);
-					if (iret < 0 || iret > dst + maxsize - tmplog)
+					if (iret < 0 || iret >= dst + maxsize - tmplog)
 						goto out;
 					tmplog += iret;
 				} else {
@@ -3019,7 +3220,7 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 			case LOG_FMT_MS: // %ms
 			if (tmp->options & LOG_OPT_HEXA) {
 					iret = snprintf(tmplog, dst + maxsize - tmplog, "%02X",(unsigned int)logs->accept_date.tv_usec/1000);
-					if (iret < 0 || iret > dst + maxsize - tmplog)
+					if (iret < 0 || iret >= dst + maxsize - tmplog)
 						goto out;
 					tmplog += iret;
 			} else {
@@ -3636,7 +3837,7 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 			case LOG_FMT_COUNTER: // %rt
 				if (tmp->options & LOG_OPT_HEXA) {
 					iret = snprintf(tmplog, dst + maxsize - tmplog, "%04X", uniq_id);
-					if (iret < 0 || iret > dst + maxsize - tmplog)
+					if (iret < 0 || iret >= dst + maxsize - tmplog)
 						goto out;
 					tmplog += iret;
 				} else {
@@ -3650,7 +3851,7 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 			case LOG_FMT_LOGCNT: // %lc
 				if (tmp->options & LOG_OPT_HEXA) {
 					iret = snprintf(tmplog, dst + maxsize - tmplog, "%04X", fe->log_count);
-					if (iret < 0 || iret > dst + maxsize - tmplog)
+					if (iret < 0 || iret >= dst + maxsize - tmplog)
 						goto out;
 					tmplog += iret;
 				} else {
@@ -3672,7 +3873,7 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 			case LOG_FMT_PID: // %pid
 				if (tmp->options & LOG_OPT_HEXA) {
 					iret = snprintf(tmplog, dst + maxsize - tmplog, "%04X", pid);
-					if (iret < 0 || iret > dst + maxsize - tmplog)
+					if (iret < 0 || iret >= dst + maxsize - tmplog)
 						goto out;
 					tmplog += iret;
 				} else {
@@ -3695,6 +3896,7 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 				break;
 
 		}
+ next_fmt:
 		if (tmp->type != LOG_FMT_SEPARATOR)
 			last_isspace = 0; // not a separator, hence not a space
 
@@ -3747,11 +3949,11 @@ void strm_log(struct stream *s)
 	}
 
 	/* if unique-id was not generated */
-	if (!isttest(s->unique_id) && !LIST_ISEMPTY(&sess->fe->format_unique_id)) {
+	if (!isttest(s->unique_id) && !lf_expr_isempty(&sess->fe->format_unique_id)) {
 		stream_generate_unique_id(s, &sess->fe->format_unique_id);
 	}
 
-	if (!LIST_ISEMPTY(&sess->fe->logformat_sd)) {
+	if (!lf_expr_isempty(&sess->fe->logformat_sd)) {
 		sd_size = build_logline(s, logline_rfc5424, global.max_syslog_len,
 		                        &sess->fe->logformat_sd);
 	}
@@ -3789,13 +3991,13 @@ void sess_log(struct session *sess)
 	if (sess->fe->options2 & PR_O2_LOGERRORS)
 		level = LOG_ERR;
 
-	if (!LIST_ISEMPTY(&sess->fe->logformat_sd)) {
+	if (!lf_expr_isempty(&sess->fe->logformat_sd)) {
 		sd_size = sess_build_logline(sess, NULL,
 		                             logline_rfc5424, global.max_syslog_len,
 		                             &sess->fe->logformat_sd);
 	}
 
-	if (!LIST_ISEMPTY(&sess->fe->logformat_error))
+	if (!lf_expr_isempty(&sess->fe->logformat_error))
 		size = sess_build_logline(sess, NULL, logline, global.max_syslog_len, &sess->fe->logformat_error);
 	else
 		size = sess_build_logline(sess, NULL, logline, global.max_syslog_len, &sess->fe->logformat);
@@ -4696,6 +4898,7 @@ static int postresolve_loggers()
 REGISTER_CONFIG_SECTION("log-forward", cfg_parse_log_forward, NULL);
 REGISTER_POST_CHECK(postresolve_loggers);
 REGISTER_POST_PROXY_CHECK(postcheck_log_backend);
+REGISTER_POST_PROXY_CHECK(postcheck_logformat_proxy);
 
 REGISTER_PER_THREAD_ALLOC(init_log_buffers);
 REGISTER_PER_THREAD_FREE(deinit_log_buffers);

@@ -506,6 +506,7 @@ static void qc_notify_cc_of_newly_acked_pkts(struct quic_conn *qc,
 			qc_treat_ack_of_ack(qc, &pkt->pktns->rx.arngs, pkt->largest_acked_pn);
 		ev.ack.acked = pkt->in_flight_len;
 		ev.ack.time_sent = pkt->time_sent;
+		ev.ack.pn = pkt->pn_node.key;
 		quic_cc_event(&qc->path->cc, &ev);
 		LIST_DEL_INIT(&pkt->list);
 		quic_tx_packet_refdec(pkt);
@@ -1461,7 +1462,7 @@ static inline int quic_read_uint32(uint32_t *val,
 	if (end - *buf < sizeof *val)
 		return 0;
 
-	*val = ntohl(*(uint32_t *)*buf);
+	*val = ntohl(read_u32(*buf));
 	*buf += sizeof *val;
 
 	return 1;

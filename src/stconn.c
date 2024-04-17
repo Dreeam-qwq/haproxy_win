@@ -14,6 +14,7 @@
 #include <haproxy/applet.h>
 #include <haproxy/connection.h>
 #include <haproxy/check.h>
+#include <haproxy/filters.h>
 #include <haproxy/http_ana.h>
 #include <haproxy/pipe.h>
 #include <haproxy/pool.h>
@@ -531,7 +532,7 @@ static inline int sc_cond_forward_shut(struct stconn *sc)
 	if (!(sc->flags & (SC_FL_EOS|SC_FL_ABRT_DONE)) || !(sc->flags & SC_FL_NOHALF))
 		return 0;
 
-	if (co_data(sc_ic(sc)) && !(sc_ic(sc)->flags & CF_WRITE_TIMEOUT)) {
+	if ((co_data(sc_ic(sc)) || sc_ep_have_ff_data(sc_opposite(sc))) && !(sc_ic(sc)->flags & CF_WRITE_TIMEOUT)) {
 		/* the shutdown cannot be forwarded now because
 		 * we should flush outgoing data first. But instruct the output
 		 * channel it should be done ASAP.
@@ -1067,7 +1068,7 @@ void sc_notify(struct stconn *sc)
 	struct task *task = sc_strm_task(sc);
 
 	/* process consumer side */
-	if (!co_data(oc)) {
+	if (!co_data(oc) && !sc_ep_have_ff_data(sco)) {
 		struct connection *conn = sc_conn(sc);
 
 		if (((sc->flags & (SC_FL_SHUT_DONE|SC_FL_SHUT_WANTED)) == SC_FL_SHUT_WANTED) &&
@@ -1102,6 +1103,7 @@ void sc_notify(struct stconn *sc)
 	 */
 	if (sc_ep_have_ff_data(sc_opposite(sc)) ||
 	    (co_data(ic) && sc_ep_test(sco, SE_FL_WAIT_DATA) &&
+	     (!HAS_DATA_FILTERS(__sc_strm(sc), ic) || channel_input_data(ic) == 0) &&
 	     (!(sc->flags & SC_FL_SND_EXP_MORE) || channel_full(ic, co_data(ic)) || channel_input_data(ic) == 0))) {
 		int new_len, last_len;
 
@@ -1636,6 +1638,9 @@ int sc_conn_send(struct stconn *sc)
 			}
 		}
 
+		if ((sc->flags & SC_FL_SHUT_WANTED) && co_data(oc) == c_data(oc))
+			send_flag |= CO_SFL_LAST_DATA;
+
 		ret = conn->mux->snd_buf(sc, &oc->buf, co_data(oc), send_flag);
 		if (ret > 0) {
 			did_send = 1;
@@ -2107,6 +2112,9 @@ int sc_applet_recv(struct stconn *sc)
  */
 int sc_applet_sync_recv(struct stconn *sc)
 {
+	if (!(__sc_appctx(sc)->flags & APPCTX_FL_INOUT_BUFS))
+		return 0;
+
 	if (!sc_state_in(sc->state, SC_SB_RDY|SC_SB_EST))
 		return 0;
 
@@ -2151,7 +2159,12 @@ int sc_applet_send(struct stconn *sc)
 	BUG_ON(sc_ep_have_ff_data(sc));
 
 	if (co_data(oc)) {
-		ret = appctx_snd_buf(sc, &oc->buf, co_data(oc), 0);
+		unsigned int send_flag = 0;
+
+		if ((sc->flags & SC_FL_SHUT_WANTED) && co_data(oc) == c_data(oc))
+			send_flag |= CO_SFL_LAST_DATA;
+
+		ret = appctx_snd_buf(sc, &oc->buf, co_data(oc), send_flag);
 		if (ret > 0) {
 			did_send = 1;
 			c_rew(oc, ret);
@@ -2197,6 +2210,9 @@ void sc_applet_sync_send(struct stconn *sc)
 	struct channel *oc = sc_oc(sc);
 
 	oc->flags &= ~CF_WRITE_EVENT;
+
+	if (!(__sc_appctx(sc)->flags & APPCTX_FL_INOUT_BUFS))
+		return;
 
 	if (sc->flags & SC_FL_SHUT_DONE)
 		return;

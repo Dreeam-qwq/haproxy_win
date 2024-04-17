@@ -27,6 +27,7 @@
 #include <haproxy/freq_ctr.h>
 #include <haproxy/frontend.h>
 #include <haproxy/global.h>
+#include <haproxy/guid.h>
 #include <haproxy/list.h>
 #include <haproxy/listener.h>
 #include <haproxy/log.h>
@@ -443,9 +444,9 @@ int default_resume_listener(struct listener *l)
 		err = l->rx.proto->fam->bind(&l->rx, &errmsg);
 		if (err != ERR_NONE) {
 			if (err & ERR_WARN)
-				ha_warning("Resuming listener: %s\n", errmsg);
+				ha_warning("Resuming listener: protocol %s: %s.\n", l->rx.proto->name, errmsg);
 			else if (err & ERR_ALERT)
-				ha_alert("Resuming listener: %s\n", errmsg);
+				ha_alert("Resuming listener: protocol %s: %s.\n", l->rx.proto->name, errmsg);
 			ha_free(&errmsg);
 			if (err & (ERR_FATAL | ERR_ABORT)) {
 				ret = 0;
@@ -460,9 +461,9 @@ int default_resume_listener(struct listener *l)
 		BUG_ON(!l->rx.proto->listen);
 		err = l->rx.proto->listen(l, msg, sizeof(msg));
 		if (err & ERR_ALERT)
-			ha_alert("Resuming listener: %s\n", msg);
+			ha_alert("Resuming listener: protocol %s: %s.\n", l->rx.proto->name, msg);
 		else if (err & ERR_WARN)
-			ha_warning("Resuming listener: %s\n", msg);
+			ha_warning("Resuming listener: protocol %s: %s.\n", l->rx.proto->name, msg);
 
 		if (err & (ERR_FATAL | ERR_ABORT)) {
 			ret = 0;
@@ -816,6 +817,8 @@ int create_listeners(struct bind_conf *bc, const struct sockaddr_storage *ss,
 		if (fd != -1)
 			l->rx.flags |= RX_F_INHERITED;
 
+		guid_init(&l->guid);
+
 		l->extra_counters = NULL;
 
 		HA_RWLOCK_INIT(&l->lock);
@@ -913,6 +916,7 @@ struct listener *clone_listener(struct listener *src)
 		goto oom1;
 	memcpy(l, src, sizeof(*l));
 
+	l->luid = 0; // don't dup the listener's ID!
 	if (l->name) {
 		l->name = strdup(l->name);
 		if (!l->name)
@@ -1713,8 +1717,8 @@ int bind_complete_thread_setup(struct bind_conf *bind_conf, int *err_code)
 			else {
 				if (fe != global.cli_fe)
 					ha_diag_warning("[%s:%d]: Disabling per-thread sharding for listener in"
-					                " %s '%s' because SO_REUSEPORT is disabled\n",
-					                bind_conf->file, bind_conf->line, proxy_type_str(fe), fe->id);
+					                " %s '%s' because SO_REUSEPORT is disabled for %s protocol.\n",
+					                bind_conf->file, bind_conf->line, proxy_type_str(fe), fe->id, li->rx.proto->name);
 				shards = 1;
 			}
 		}
@@ -1727,8 +1731,8 @@ int bind_complete_thread_setup(struct bind_conf *bind_conf, int *err_code)
 
 		/* We also need to check if an explicit shards count was set and cannot be honored */
 		if (shards > 1 && !protocol_supports_flag(li->rx.proto, PROTO_F_REUSEPORT_SUPPORTED)) {
-			ha_warning("[%s:%d]: Disabling sharding for listener in %s '%s' because SO_REUSEPORT is disabled\n",
-			           bind_conf->file, bind_conf->line, proxy_type_str(fe), fe->id);
+			ha_warning("[%s:%d]: Disabling sharding for listener in %s '%s' because SO_REUSEPORT is disabled for %s protocol.\n",
+			           bind_conf->file, bind_conf->line, proxy_type_str(fe), fe->id, li->rx.proto->name);
 			shards = 1;
 		}
 
@@ -1807,6 +1811,12 @@ int bind_complete_thread_setup(struct bind_conf *bind_conf, int *err_code)
 						*err_code |= ERR_FATAL | ERR_ALERT;
 						return cfgerr;
 					}
+					/* assign the ID to the first one only */
+					new_li->luid = new_li->conf.id.key = tmp_li->luid;
+					tmp_li->luid = 0;
+					eb32_delete(&tmp_li->conf.id);
+					if (tmp_li->luid)
+						eb32_insert(&fe->conf.used_listener_id, &new_li->conf.id);
 					new_li = tmp_li;
 				}
 			}
@@ -1825,11 +1835,54 @@ int bind_complete_thread_setup(struct bind_conf *bind_conf, int *err_code)
 				*err_code |= ERR_FATAL | ERR_ALERT;
 				return cfgerr;
 			}
+			/* assign the ID to the first one only */
+			new_li->luid = new_li->conf.id.key = li->luid;
+			li->luid = 0;
+			eb32_delete(&li->conf.id);
+			if (li->luid)
+				eb32_insert(&fe->conf.used_listener_id, &new_li->conf.id);
 		}
 	}
 
 	/* success */
 	return cfgerr;
+}
+
+/* Generate and insert unique GUID for each listeners of <bind_conf> instance
+ * if GUID prefix is defined.
+ *
+ * Returns 0 on success else non-zero.
+ */
+int bind_generate_guid(struct bind_conf *bind_conf)
+{
+	struct listener *l;
+	char *guid_err = NULL;
+
+	if (!bind_conf->guid_prefix)
+		return 0;
+
+	list_for_each_entry(l, &bind_conf->listeners, by_bind) {
+		if (bind_conf->guid_idx == (size_t)-1) {
+			ha_alert("[%s:%d] : error on GUID generation : Too many listeners.\n",
+			         bind_conf->file, bind_conf->line);
+			return 1;
+		}
+
+		chunk_printf(&trash, "%s-%lld", bind_conf->guid_prefix,
+		             (ullong)bind_conf->guid_idx);
+
+		if (guid_insert(&l->obj_type, b_head(&trash), &guid_err)) {
+			ha_alert("[%s:%d] : error on GUID generation : %s. "
+			         "You may fix it by adjusting guid-prefix.\n",
+			         bind_conf->file, bind_conf->line, guid_err);
+			ha_free(&guid_err);
+			return 1;
+		}
+
+		++bind_conf->guid_idx;
+	}
+
+	return 0;
 }
 
 /*
@@ -1975,6 +2028,9 @@ struct bind_conf *bind_conf_alloc(struct proxy *fe, const char *file,
 #endif
 	LIST_INIT(&bind_conf->listeners);
 
+	bind_conf->guid_prefix = NULL;
+	bind_conf->guid_idx = 0;
+
 	bind_conf->rhttp_srvname = NULL;
 
 	return bind_conf;
@@ -2079,6 +2135,26 @@ static int bind_parse_backlog(char **args, int cur_arg, struct proxy *px, struct
 	}
 
 	conf->backlog = val;
+	return 0;
+}
+
+/* parse the "guid-prefix" bind keyword */
+static int bind_parse_guid_prefix(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
+{
+	char *prefix = NULL;
+
+	if (!*args[cur_arg + 1]) {
+		memprintf(err, "'%s' : expects an argument", args[cur_arg]);
+		return ERR_ALERT | ERR_FATAL;
+	}
+
+	prefix = strdup(args[cur_arg + 1]);
+	if (!prefix) {
+		memprintf(err, "'%s' : out of memory", args[cur_arg]);
+		return ERR_ALERT | ERR_FATAL;
+	}
+
+	conf->guid_prefix = prefix;
 	return 0;
 }
 
@@ -2486,6 +2562,7 @@ static struct bind_kw_list bind_kws = { "ALL", { }, {
 	{ "accept-netscaler-cip", bind_parse_accept_netscaler_cip, 1, 0 }, /* enable NetScaler Client IP insertion protocol */
 	{ "accept-proxy", bind_parse_accept_proxy, 0, 0 }, /* enable PROXY protocol */
 	{ "backlog",      bind_parse_backlog,      1, 0 }, /* set backlog of listening socket */
+	{ "guid-prefix",  bind_parse_guid_prefix,  1, 1 }, /* set guid of listening socket */
 	{ "id",           bind_parse_id,           1, 1 }, /* set id of listening socket */
 	{ "maxconn",      bind_parse_maxconn,      1, 0 }, /* set maxconn of listening socket */
 	{ "name",         bind_parse_name,         1, 1 }, /* set name of listening socket */

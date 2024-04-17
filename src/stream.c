@@ -920,7 +920,7 @@ void back_establish(struct stream *s)
 	if (!IS_HTX_STRM(s)) { /* let's allow immediate data connection in this case */
 		/* if the user wants to log as soon as possible, without counting
 		 * bytes from the server, then this is the right moment. */
-		if (!LIST_ISEMPTY(&strm_fe(s)->logformat) && !(s->logs.logwait & LW_BYTES)) {
+		if (!lf_expr_isempty(&strm_fe(s)->logformat) && !(s->logs.logwait & LW_BYTES)) {
 			/* note: no pend_pos here, session is established */
 			s->logs.t_close = s->logs.t_connect; /* to get a valid end date */
 			s->do_log(s);
@@ -1736,8 +1736,8 @@ struct task *process_stream(struct task *t, void *context, unsigned int state)
 	scb = s->scb;
 
 	/* First, attempt to receive pending data from I/O layers */
-	sc_conn_sync_recv(scf);
-	sc_conn_sync_recv(scb);
+	sc_sync_recv(scf);
+	sc_sync_recv(scb);
 
 	/* Let's check if we're looping without making any progress, e.g. due
 	 * to a bogus analyser or the fact that we're ignoring a read0. The
@@ -2349,7 +2349,7 @@ struct task *process_stream(struct task *t, void *context, unsigned int state)
 	}
 
 	/* Let's see if we can send the pending request now */
-	sc_conn_sync_send(scb);
+	sc_sync_send(scb);
 
 	/*
 	 * Now forward all shutdown requests between both sides of the request buffer
@@ -2369,7 +2369,7 @@ struct task *process_stream(struct task *t, void *context, unsigned int state)
 
 	/* shutdown(write) pending */
 	if (unlikely((scb->flags & (SC_FL_SHUT_DONE|SC_FL_SHUT_WANTED)) == SC_FL_SHUT_WANTED &&
-		     (!co_data(req) || (req->flags & CF_WRITE_TIMEOUT)))) {
+		     ((!co_data(req) && !sc_ep_have_ff_data(scb)) || (req->flags & CF_WRITE_TIMEOUT)))) {
 		if (scf->flags & SC_FL_ERROR)
 			scb->flags |= SC_FL_NOLINGER;
 		sc_shutdown(scb);
@@ -2459,7 +2459,7 @@ struct task *process_stream(struct task *t, void *context, unsigned int state)
 	scf_flags = (scf_flags & ~(SC_FL_SHUT_DONE|SC_FL_SHUT_WANTED)) | (scf->flags & (SC_FL_SHUT_DONE|SC_FL_SHUT_WANTED));
 
 	/* Let's see if we can send the pending response now */
-	sc_conn_sync_send(scf);
+	sc_sync_send(scf);
 
 	/*
 	 * Now forward all shutdown requests between both sides of the buffer
@@ -2477,7 +2477,7 @@ struct task *process_stream(struct task *t, void *context, unsigned int state)
 
 	/* shutdown(write) pending */
 	if (unlikely((scf->flags & (SC_FL_SHUT_DONE|SC_FL_SHUT_WANTED)) == SC_FL_SHUT_WANTED &&
-		     (!co_data(res) || (res->flags & CF_WRITE_TIMEOUT)))) {
+		     ((!co_data(res) && !sc_ep_have_ff_data(scf)) || (res->flags & CF_WRITE_TIMEOUT)))) {
 		sc_shutdown(scf);
 	}
 
@@ -2597,7 +2597,7 @@ struct task *process_stream(struct task *t, void *context, unsigned int state)
 		}
 
 		/* let's do a final log if we need it */
-		if (!LIST_ISEMPTY(&sess->fe->logformat) && s->logs.logwait &&
+		if (!lf_expr_isempty(&sess->fe->logformat) && s->logs.logwait &&
 		    !(s->flags & SF_MONITOR) &&
 		    (!(sess->fe->options & PR_O_NULLNOLOG) || req->total)) {
 			/* we may need to know the position in the queue */
@@ -2847,7 +2847,7 @@ INITCALL0(STG_INIT, init_stream);
  * If an ID is already stored within the stream nothing happens existing unique ID is
  * returned.
  */
-struct ist stream_generate_unique_id(struct stream *strm, struct list *format)
+struct ist stream_generate_unique_id(struct stream *strm, struct lf_expr *format)
 {
 	if (isttest(strm->unique_id)) {
 		return strm->unique_id;
@@ -3494,9 +3494,8 @@ void strm_dump_to_buffer(struct buffer *buf, const struct stream *strm, const ch
  * buffer is full and it needs to be called again, otherwise non-zero. It is
  * designed to be called from stats_dump_strm_to_buffer() below.
  */
-static int stats_dump_full_strm_to_buffer(struct stconn *sc, struct stream *strm)
+static int stats_dump_full_strm_to_buffer(struct appctx *appctx, struct stream *strm)
 {
-	struct appctx *appctx = __sc_appctx(sc);
 	struct show_sess_ctx *ctx = appctx->svcctx;
 
 	chunk_reset(&trash);
@@ -3588,25 +3587,12 @@ static int cli_parse_show_sess(char **args, char *payload, struct appctx *appctx
 static int cli_io_handler_dump_sess(struct appctx *appctx)
 {
 	struct show_sess_ctx *ctx = appctx->svcctx;
-	struct stconn *sc = appctx_sc(appctx);
 	struct connection *conn;
 
 	thread_isolate();
 
 	if (ctx->thr >= global.nbthread) {
 		/* already terminated */
-		goto done;
-	}
-
-	/* FIXME: Don't watch the other side !*/
-	if (unlikely(sc_opposite(sc)->flags & SC_FL_SHUT_DONE)) {
-		/* If we're forced to shut down, we might have to remove our
-		 * reference to the last stream being dumped.
-		 */
-		if (!LIST_ISEMPTY(&ctx->bref.users)) {
-			LIST_DELETE(&ctx->bref.users);
-			LIST_INIT(&ctx->bref.users);
-		}
 		goto done;
 	}
 
@@ -3666,7 +3652,7 @@ static int cli_io_handler_dump_sess(struct appctx *appctx)
 
 			LIST_APPEND(&curr_strm->back_refs, &ctx->bref.users);
 			/* call the proper dump() function and return if we're missing space */
-			if (!stats_dump_full_strm_to_buffer(sc, curr_strm))
+			if (!stats_dump_full_strm_to_buffer(appctx, curr_strm))
 				goto full;
 
 			/* stream dump complete */

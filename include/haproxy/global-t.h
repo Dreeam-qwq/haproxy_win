@@ -46,7 +46,7 @@
 #define	MODE_DUMP_NB_L  0x10000 /* dump line numbers when the configuration file is dump */
 
 /* list of last checks to perform, depending on config options */
-#define LSTCHK_CAP_BIND	0x00000001	/* check that we can bind to any port */
+/* unused: 0x00000001	*/
 #define LSTCHK_NETADM	0x00000002	/* check that we have CAP_NET_ADMIN */
 
 /* Global tuning options */
@@ -84,6 +84,7 @@
 #define GTUNE_LISTENER_MQ_FAIR   (1<<27)
 #define GTUNE_LISTENER_MQ_OPT    (1<<28)
 #define GTUNE_LISTENER_MQ_ANY    (GTUNE_LISTENER_MQ_FAIR | GTUNE_LISTENER_MQ_OPT)
+#define GTUNE_QUIC_CC_HYSTART    (1<<29)
 
 #define NO_ZERO_COPY_FWD             0x0001 /* Globally disable zero-copy FF */
 #define NO_ZERO_COPY_FWD_PT          0x0002 /* disable zero-copy FF for PT (recv & send are disabled automatically) */
