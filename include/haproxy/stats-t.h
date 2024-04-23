@@ -23,31 +23,32 @@
 #define _HAPROXY_STATS_T_H
 
 #include <haproxy/api-t.h>
+#include <haproxy/buf-t.h>
 
 /* Flags for applet.ctx.stats.flags */
-#define STAT_FMT_HTML   0x00000001      /* dump the stats in HTML format */
-#define STAT_FMT_TYPED  0x00000002      /* use the typed output format */
-#define STAT_FMT_JSON   0x00000004      /* dump the stats in JSON format */
-#define STAT_HIDE_DOWN  0x00000008	/* hide 'down' servers in the stats page */
-#define STAT_NO_REFRESH 0x00000010	/* do not automatically refresh the stats page */
-#define STAT_ADMIN      0x00000020	/* indicate a stats admin level */
-#define STAT_CHUNKED    0x00000040      /* use chunked encoding (HTTP/1.1) */
-#define STAT_JSON_SCHM  0x00000080      /* dump the json schema */
+#define STAT_F_FMT_HTML   0x00000001    /* dump the stats in HTML format */
+#define STAT_F_FMT_TYPED  0x00000002    /* use the typed output format */
+#define STAT_F_FMT_JSON   0x00000004    /* dump the stats in JSON format */
+#define STAT_F_HIDE_DOWN  0x00000008    /* hide 'down' servers in the stats page */
+#define STAT_F_NO_REFRESH 0x00000010    /* do not automatically refresh the stats page */
+#define STAT_F_ADMIN      0x00000020    /* indicate a stats admin level */
+#define STAT_F_CHUNKED    0x00000040    /* use chunked encoding (HTTP/1.1) */
+#define STAT_F_JSON_SCHM  0x00000080    /* dump the json schema */
 
-#define STAT_HIDEVER    0x00000100      /* conf: do not report the version and reldate */
-#define STAT_SHNODE     0x00000200      /* conf: show node name */
-#define STAT_SHDESC     0x00000400      /* conf: show description */
-#define STAT_SHLGNDS    0x00000800      /* conf: show legends */
-#define STAT_SHOW_FDESC 0x00001000      /* show the field descriptions when possible */
-#define STAT_SHMODULES  0x00002000      /* conf: show modules */
-#define STAT_HIDE_MAINT 0x00004000	/* hide maint/disabled servers */
-#define STAT_CONVDONE   0x00008000	/* conf: rules conversion done */
-#define STAT_USE_FLOAT  0x00010000      /* use floats where possible in the outputs */
+#define STAT_F_HIDEVER    0x00000100    /* conf: do not report the version and reldate */
+#define STAT_F_SHNODE     0x00000200    /* conf: show node name */
+#define STAT_F_SHDESC     0x00000400    /* conf: show description */
+#define STAT_F_SHLGNDS    0x00000800    /* conf: show legends */
+#define STAT_F_SHOW_FDESC 0x00001000    /* show the column descriptions when possible */
+#define STAT_F_SHMODULES  0x00002000    /* conf: show modules */
+#define STAT_F_HIDE_MAINT 0x00004000    /* hide maint/disabled servers */
+#define STAT_F_CONVDONE   0x00008000    /* conf: rules conversion done */
+#define STAT_F_USE_FLOAT  0x00010000    /* use floats where possible in the outputs */
 
-#define STAT_BOUND      0x00800000	/* bound statistics to selected proxies/types/services */
-#define STAT_STARTED    0x01000000	/* some output has occurred */
+#define STAT_F_BOUND      0x00800000    /* bound statistics to selected proxies/types/services */
+#define STAT_F_STARTED    0x01000000    /* some output has occurred */
 
-#define STAT_FMT_MASK   0x00000007
+#define STAT_F_FMT_MASK   0x00000007
 
 #define STATS_TYPE_FE  0
 #define STATS_TYPE_BE  1
@@ -56,17 +57,6 @@
 
 #define STATS_DOMAIN  (0)               /* used for bitshifting, type of statistics: proxy or dns */
 #define STATS_PX_CAP  (8)               /* used for bitshifting, differentiate obj1 type for proxy statistics */
-
-/* HTTP stats : applet.st0 */
-enum {
-	STAT_HTTP_INIT = 0,  /* Initial state */
-	STAT_HTTP_HEAD,      /* send headers before dump */
-	STAT_HTTP_DUMP,      /* dumping stats */
-	STAT_HTTP_POST,      /* waiting post data */
-	STAT_HTTP_LAST,      /* sending last chunk of response */
-	STAT_HTTP_DONE,      /* dump is finished */
-	STAT_HTTP_END,       /* finished */
-};
 
 /* status codes available for the stats admin page */
 enum {
@@ -81,11 +71,6 @@ enum {
 	STAT_STATUS_IVAL,       /* invalid requests (chunked or invalid post) */
 	STAT_STATUS_SIZE
 };
-
-/* HTML form to limit output scope */
-#define STAT_SCOPE_TXT_MAXLEN 20      /* max len for scope substring */
-#define STAT_SCOPE_INPUT_NAME "scope" /* pattern form scope name <input> in html form */
-#define STAT_SCOPE_PATTERN    "?" STAT_SCOPE_INPUT_NAME "="
 
 /* Actions available for the stats admin forms */
 enum {
@@ -265,224 +250,220 @@ enum field_scope {
 	FS_MASK     = 0xFF000000,
 };
 
-/* Show info fields for CLI output. For any field added here, please add the
- * text representation in the info_fields array. Please only append at the end,
- * before the INF_TOTAL_FIELDS entry, and never insert anything in the middle
+/* Show info columns for CLI output. For any column added here, please add the
+ * text representation in the metrics_info array. Please only append at the end,
+ * before the ST_I_INF_MAX entry, and never insert anything in the middle
  * nor at the beginning.
  */
-enum info_field {
-	INF_NAME,
-	INF_VERSION,
-	INF_RELEASE_DATE,
-	INF_NBTHREAD,
-	INF_NBPROC,
-	INF_PROCESS_NUM,
-	INF_PID,
-	INF_UPTIME,
-	INF_UPTIME_SEC,
-	INF_MEMMAX_MB,
-	INF_POOL_ALLOC_MB,
-	INF_POOL_USED_MB,
-	INF_POOL_FAILED,
-	INF_ULIMIT_N,
-	INF_MAXSOCK,
-	INF_MAXCONN,
-	INF_HARD_MAXCONN,
-	INF_CURR_CONN,
-	INF_CUM_CONN,
-	INF_CUM_REQ,
-	INF_MAX_SSL_CONNS,
-	INF_CURR_SSL_CONNS,
-	INF_CUM_SSL_CONNS,
-	INF_MAXPIPES,
-	INF_PIPES_USED,
-	INF_PIPES_FREE,
-	INF_CONN_RATE,
-	INF_CONN_RATE_LIMIT,
-	INF_MAX_CONN_RATE,
-	INF_SESS_RATE,
-	INF_SESS_RATE_LIMIT,
-	INF_MAX_SESS_RATE,
-	INF_SSL_RATE,
-	INF_SSL_RATE_LIMIT,
-	INF_MAX_SSL_RATE,
-	INF_SSL_FRONTEND_KEY_RATE,
-	INF_SSL_FRONTEND_MAX_KEY_RATE,
-	INF_SSL_FRONTEND_SESSION_REUSE_PCT,
-	INF_SSL_BACKEND_KEY_RATE,
-	INF_SSL_BACKEND_MAX_KEY_RATE,
-	INF_SSL_CACHE_LOOKUPS,
-	INF_SSL_CACHE_MISSES,
-	INF_COMPRESS_BPS_IN,
-	INF_COMPRESS_BPS_OUT,
-	INF_COMPRESS_BPS_RATE_LIM,
-	INF_ZLIB_MEM_USAGE,
-	INF_MAX_ZLIB_MEM_USAGE,
-	INF_TASKS,
-	INF_RUN_QUEUE,
-	INF_IDLE_PCT,
-	INF_NODE,
-	INF_DESCRIPTION,
-	INF_STOPPING,
-	INF_JOBS,
-	INF_UNSTOPPABLE_JOBS,
-	INF_LISTENERS,
-	INF_ACTIVE_PEERS,
-	INF_CONNECTED_PEERS,
-	INF_DROPPED_LOGS,
-	INF_BUSY_POLLING,
-	INF_FAILED_RESOLUTIONS,
-	INF_TOTAL_BYTES_OUT,
-	INF_TOTAL_SPLICED_BYTES_OUT,
-	INF_BYTES_OUT_RATE,
-	INF_DEBUG_COMMANDS_ISSUED,
-	INF_CUM_LOG_MSGS,
-	INF_BUILD_INFO,
-	INF_MEMMAX_BYTES,
-	INF_POOL_ALLOC_BYTES,
-	INF_POOL_USED_BYTES,
-	INF_START_TIME_SEC,
-	INF_TAINTED,
-	INF_WARNINGS,
-	INF_MAXCONN_REACHED,
-	INF_BOOTTIME_MS,
-	INF_NICED_TASKS,
+enum stat_idx_info {
+	ST_I_INF_NAME,
+	ST_I_INF_VERSION,
+	ST_I_INF_RELEASE_DATE,
+	ST_I_INF_NBTHREAD,
+	ST_I_INF_NBPROC,
+	ST_I_INF_PROCESS_NUM,
+	ST_I_INF_PID,
+	ST_I_INF_UPTIME,
+	ST_I_INF_UPTIME_SEC,
+	ST_I_INF_MEMMAX_MB,
+	ST_I_INF_POOL_ALLOC_MB,
+	ST_I_INF_POOL_USED_MB,
+	ST_I_INF_POOL_FAILED,
+	ST_I_INF_ULIMIT_N,
+	ST_I_INF_MAXSOCK,
+	ST_I_INF_MAXCONN,
+	ST_I_INF_HARD_MAXCONN,
+	ST_I_INF_CURR_CONN,
+	ST_I_INF_CUM_CONN,
+	ST_I_INF_CUM_REQ,
+	ST_I_INF_MAX_SSL_CONNS,
+	ST_I_INF_CURR_SSL_CONNS,
+	ST_I_INF_CUM_SSL_CONNS,
+	ST_I_INF_MAXPIPES,
+	ST_I_INF_PIPES_USED,
+	ST_I_INF_PIPES_FREE,
+	ST_I_INF_CONN_RATE,
+	ST_I_INF_CONN_RATE_LIMIT,
+	ST_I_INF_MAX_CONN_RATE,
+	ST_I_INF_SESS_RATE,
+	ST_I_INF_SESS_RATE_LIMIT,
+	ST_I_INF_MAX_SESS_RATE,
+	ST_I_INF_SSL_RATE,
+	ST_I_INF_SSL_RATE_LIMIT,
+	ST_I_INF_MAX_SSL_RATE,
+	ST_I_INF_SSL_FRONTEND_KEY_RATE,
+	ST_I_INF_SSL_FRONTEND_MAX_KEY_RATE,
+	ST_I_INF_SSL_FRONTEND_SESSION_REUSE_PCT,
+	ST_I_INF_SSL_BACKEND_KEY_RATE,
+	ST_I_INF_SSL_BACKEND_MAX_KEY_RATE,
+	ST_I_INF_SSL_CACHE_LOOKUPS,
+	ST_I_INF_SSL_CACHE_MISSES,
+	ST_I_INF_COMPRESS_BPS_IN,
+	ST_I_INF_COMPRESS_BPS_OUT,
+	ST_I_INF_COMPRESS_BPS_RATE_LIM,
+	ST_I_INF_ZLIB_MEM_USAGE,
+	ST_I_INF_MAX_ZLIB_MEM_USAGE,
+	ST_I_INF_TASKS,
+	ST_I_INF_RUN_QUEUE,
+	ST_I_INF_IDLE_PCT,
+	ST_I_INF_NODE,
+	ST_I_INF_DESCRIPTION,
+	ST_I_INF_STOPPING,
+	ST_I_INF_JOBS,
+	ST_I_INF_UNSTOPPABLE_JOBS,
+	ST_I_INF_LISTENERS,
+	ST_I_INF_ACTIVE_PEERS,
+	ST_I_INF_CONNECTED_PEERS,
+	ST_I_INF_DROPPED_LOGS,
+	ST_I_INF_BUSY_POLLING,
+	ST_I_INF_FAILED_RESOLUTIONS,
+	ST_I_INF_TOTAL_BYTES_OUT,
+	ST_I_INF_TOTAL_SPLICED_BYTES_OUT,
+	ST_I_INF_BYTES_OUT_RATE,
+	ST_I_INF_DEBUG_COMMANDS_ISSUED,
+	ST_I_INF_CUM_LOG_MSGS,
+	ST_I_INF_BUILD_INFO,
+	ST_I_INF_MEMMAX_BYTES,
+	ST_I_INF_POOL_ALLOC_BYTES,
+	ST_I_INF_POOL_USED_BYTES,
+	ST_I_INF_START_TIME_SEC,
+	ST_I_INF_TAINTED,
+	ST_I_INF_WARNINGS,
+	ST_I_INF_MAXCONN_REACHED,
+	ST_I_INF_BOOTTIME_MS,
+	ST_I_INF_NICED_TASKS,
 
 	/* must always be the last one */
-	INF_TOTAL_FIELDS
+	ST_I_INF_MAX
 };
 
 
-/* Stats fields for CSV output. For any field added here, please add the text
- * representation in the stat_fields array. Please only append at the end,
- * before the ST_F_TOTAL_FIELDS entry, and never insert anything in the middle
+/* Stats columns for CSV output. For any column added here, please add the text
+ * representation in the metrics_px array. Please only append at the end,
+ * before the ST_I_PX_MAX entry, and never insert anything in the middle
  * nor at the beginning.When adding an entry here, one must always add a
- * corresponding one in stat_fields[] otherwise Lua's get_stats() will break,
+ * corresponding one in metrics_px[] otherwise Lua's get_stats() will break,
  * and "show stats" will show a null.
  */
-enum stat_field {
-	ST_F_PXNAME,
-	ST_F_SVNAME,
-	ST_F_QCUR,
-	ST_F_QMAX,
-	ST_F_SCUR,
-	ST_F_SMAX,
-	ST_F_SLIM,
-	ST_F_STOT,
-	ST_F_BIN ,
-	ST_F_BOUT,
-	ST_F_DREQ,
-	ST_F_DRESP,
-	ST_F_EREQ,
-	ST_F_ECON,
-	ST_F_ERESP,
-	ST_F_WRETR,
-	ST_F_WREDIS,
-	ST_F_STATUS,
-	ST_F_WEIGHT,
-	ST_F_ACT,
-	ST_F_BCK,
-	ST_F_CHKFAIL,
-	ST_F_CHKDOWN,
-	ST_F_LASTCHG,
-	ST_F_DOWNTIME,
-	ST_F_QLIMIT,
-	ST_F_PID,
-	ST_F_IID,
-	ST_F_SID,
-	ST_F_THROTTLE,
-	ST_F_LBTOT,
-	ST_F_TRACKED,
-	ST_F_TYPE,
-	ST_F_RATE,
-	ST_F_RATE_LIM,
-	ST_F_RATE_MAX,
-	ST_F_CHECK_STATUS,
-	ST_F_CHECK_CODE,
-	ST_F_CHECK_DURATION,
-	ST_F_HRSP_1XX,
-	ST_F_HRSP_2XX,
-	ST_F_HRSP_3XX,
-	ST_F_HRSP_4XX,
-	ST_F_HRSP_5XX,
-	ST_F_HRSP_OTHER,
-	ST_F_HANAFAIL,
-	ST_F_REQ_RATE,
-	ST_F_REQ_RATE_MAX,
-	ST_F_REQ_TOT,
-	ST_F_CLI_ABRT,
-	ST_F_SRV_ABRT,
-	ST_F_COMP_IN,
-	ST_F_COMP_OUT,
-	ST_F_COMP_BYP,
-	ST_F_COMP_RSP,
-	ST_F_LASTSESS,
-	ST_F_LAST_CHK,
-	ST_F_LAST_AGT,
-	ST_F_QTIME,
-	ST_F_CTIME,
-	ST_F_RTIME,
-	ST_F_TTIME,
-	ST_F_AGENT_STATUS,
-	ST_F_AGENT_CODE,
-	ST_F_AGENT_DURATION,
-	ST_F_CHECK_DESC,
-	ST_F_AGENT_DESC,
-	ST_F_CHECK_RISE,
-	ST_F_CHECK_FALL,
-	ST_F_CHECK_HEALTH,
-	ST_F_AGENT_RISE,
-	ST_F_AGENT_FALL,
-	ST_F_AGENT_HEALTH,
-	ST_F_ADDR,
-	ST_F_COOKIE,
-	ST_F_MODE,
-	ST_F_ALGO,
-	ST_F_CONN_RATE,
-	ST_F_CONN_RATE_MAX,
-	ST_F_CONN_TOT,
-	ST_F_INTERCEPTED,
-	ST_F_DCON,
-	ST_F_DSES,
-	ST_F_WREW,
-	ST_F_CONNECT,
-	ST_F_REUSE,
-	ST_F_CACHE_LOOKUPS,
-	ST_F_CACHE_HITS,
-	ST_F_SRV_ICUR,
-	ST_F_SRV_ILIM,
-	ST_F_QT_MAX,
-	ST_F_CT_MAX,
-	ST_F_RT_MAX,
-	ST_F_TT_MAX,
-	ST_F_EINT,
-	ST_F_IDLE_CONN_CUR,
-	ST_F_SAFE_CONN_CUR,
-	ST_F_USED_CONN_CUR,
-	ST_F_NEED_CONN_EST,
-	ST_F_UWEIGHT,
-	ST_F_AGG_SRV_STATUS,
-	ST_F_AGG_SRV_CHECK_STATUS,
-	ST_F_AGG_CHECK_STATUS,
-	ST_F_SRID,
-	ST_F_SESS_OTHER,
-	ST_F_H1SESS,
-	ST_F_H2SESS,
-	ST_F_H3SESS,
-	ST_F_REQ_OTHER,
-	ST_F_H1REQ,
-	ST_F_H2REQ,
-	ST_F_H3REQ,
-	ST_F_PROTO,
+enum stat_idx_px {
+	ST_I_PX_PXNAME,
+	ST_I_PX_SVNAME,
+	ST_I_PX_QCUR,
+	ST_I_PX_QMAX,
+	ST_I_PX_SCUR,
+	ST_I_PX_SMAX,
+	ST_I_PX_SLIM,
+	ST_I_PX_STOT,
+	ST_I_PX_BIN ,
+	ST_I_PX_BOUT,
+	ST_I_PX_DREQ,
+	ST_I_PX_DRESP,
+	ST_I_PX_EREQ,
+	ST_I_PX_ECON,
+	ST_I_PX_ERESP,
+	ST_I_PX_WRETR,
+	ST_I_PX_WREDIS,
+	ST_I_PX_STATUS,
+	ST_I_PX_WEIGHT,
+	ST_I_PX_ACT,
+	ST_I_PX_BCK,
+	ST_I_PX_CHKFAIL,
+	ST_I_PX_CHKDOWN,
+	ST_I_PX_LASTCHG,
+	ST_I_PX_DOWNTIME,
+	ST_I_PX_QLIMIT,
+	ST_I_PX_PID,
+	ST_I_PX_IID,
+	ST_I_PX_SID,
+	ST_I_PX_THROTTLE,
+	ST_I_PX_LBTOT,
+	ST_I_PX_TRACKED,
+	ST_I_PX_TYPE,
+	ST_I_PX_RATE,
+	ST_I_PX_RATE_LIM,
+	ST_I_PX_RATE_MAX,
+	ST_I_PX_CHECK_STATUS,
+	ST_I_PX_CHECK_CODE,
+	ST_I_PX_CHECK_DURATION,
+	ST_I_PX_HRSP_1XX,
+	ST_I_PX_HRSP_2XX,
+	ST_I_PX_HRSP_3XX,
+	ST_I_PX_HRSP_4XX,
+	ST_I_PX_HRSP_5XX,
+	ST_I_PX_HRSP_OTHER,
+	ST_I_PX_HANAFAIL,
+	ST_I_PX_REQ_RATE,
+	ST_I_PX_REQ_RATE_MAX,
+	ST_I_PX_REQ_TOT,
+	ST_I_PX_CLI_ABRT,
+	ST_I_PX_SRV_ABRT,
+	ST_I_PX_COMP_IN,
+	ST_I_PX_COMP_OUT,
+	ST_I_PX_COMP_BYP,
+	ST_I_PX_COMP_RSP,
+	ST_I_PX_LASTSESS,
+	ST_I_PX_LAST_CHK,
+	ST_I_PX_LAST_AGT,
+	ST_I_PX_QTIME,
+	ST_I_PX_CTIME,
+	ST_I_PX_RTIME,
+	ST_I_PX_TTIME,
+	ST_I_PX_AGENT_STATUS,
+	ST_I_PX_AGENT_CODE,
+	ST_I_PX_AGENT_DURATION,
+	ST_I_PX_CHECK_DESC,
+	ST_I_PX_AGENT_DESC,
+	ST_I_PX_CHECK_RISE,
+	ST_I_PX_CHECK_FALL,
+	ST_I_PX_CHECK_HEALTH,
+	ST_I_PX_AGENT_RISE,
+	ST_I_PX_AGENT_FALL,
+	ST_I_PX_AGENT_HEALTH,
+	ST_I_PX_ADDR,
+	ST_I_PX_COOKIE,
+	ST_I_PX_MODE,
+	ST_I_PX_ALGO,
+	ST_I_PX_CONN_RATE,
+	ST_I_PX_CONN_RATE_MAX,
+	ST_I_PX_CONN_TOT,
+	ST_I_PX_INTERCEPTED,
+	ST_I_PX_DCON,
+	ST_I_PX_DSES,
+	ST_I_PX_WREW,
+	ST_I_PX_CONNECT,
+	ST_I_PX_REUSE,
+	ST_I_PX_CACHE_LOOKUPS,
+	ST_I_PX_CACHE_HITS,
+	ST_I_PX_SRV_ICUR,
+	ST_I_PX_SRV_ILIM,
+	ST_I_PX_QT_MAX,
+	ST_I_PX_CT_MAX,
+	ST_I_PX_RT_MAX,
+	ST_I_PX_TT_MAX,
+	ST_I_PX_EINT,
+	ST_I_PX_IDLE_CONN_CUR,
+	ST_I_PX_SAFE_CONN_CUR,
+	ST_I_PX_USED_CONN_CUR,
+	ST_I_PX_NEED_CONN_EST,
+	ST_I_PX_UWEIGHT,
+	ST_I_PX_AGG_SRV_STATUS,
+	ST_I_PX_AGG_SRV_CHECK_STATUS,
+	ST_I_PX_AGG_CHECK_STATUS,
+	ST_I_PX_SRID,
+	ST_I_PX_SESS_OTHER,
+	ST_I_PX_H1SESS,
+	ST_I_PX_H2SESS,
+	ST_I_PX_H3SESS,
+	ST_I_PX_REQ_OTHER,
+	ST_I_PX_H1REQ,
+	ST_I_PX_H2REQ,
+	ST_I_PX_H3REQ,
+	ST_I_PX_PROTO,
 
 	/* must always be the last one */
-	ST_F_TOTAL_FIELDS
+	ST_I_PX_MAX
 };
 
-/* Please consider updating stats_dump_fields_*(),
- * stats_dump_.*_info_fields() and stats_*_schema()
- * when modifying struct field or related enums.
- */
 struct field {
 	uint32_t type;
 	union {
@@ -558,9 +539,10 @@ struct show_stat_ctx {
 	int scope_len;		/* length of the string above in the buffer */
 	int field;              /* current field iterator when stat line is dumped through returning function */
 	int px_st;		/* STAT_PX_ST* */
-	unsigned int flags;	/* STAT_* from stats-t.h */
+	unsigned int flags;	/* STAT_F_* from stats-t.h */
 	int iid, type, sid;	/* proxy id, type and service id if bounding of stats is enabled */
 	int st_code;		/* the status code returned by an action */
+	struct buffer chunk;    /* temporary buffer which holds a single-line output */
 	enum stat_state state;  /* phase of output production */
 };
 

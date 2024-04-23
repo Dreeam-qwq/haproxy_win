@@ -39,6 +39,8 @@ struct check;
 struct sedesc *sedesc_new();
 void sedesc_free(struct sedesc *sedesc);
 
+void se_shutdown(struct sedesc *sedesc, enum se_shut_mode mode);
+
 struct stconn *sc_new_from_endp(struct sedesc *sedesc, struct session *sess, struct buffer *input);
 struct stconn *sc_new_from_strm(struct stream *strm, unsigned int flags);
 struct stconn *sc_new_from_check(struct check *check, unsigned int flags);
@@ -255,7 +257,7 @@ static inline void *__sc_mux_strm(const struct stconn *sc)
 {
 	return __sc_endp(sc);
 }
-static inline struct appctx *sc_mux_strm(const struct stconn *sc)
+static inline void *sc_mux_strm(const struct stconn *sc)
 {
 	if (sc_ep_test(sc, SE_FL_T_MUX))
 		return __sc_mux_strm(sc);
@@ -316,54 +318,6 @@ static inline const char *sc_get_data_name(const struct stconn *sc)
 	if (!sc->app_ops)
 		return "NONE";
 	return sc->app_ops->name;
-}
-
-/* shut read */
-static inline void sc_conn_shutr(struct stconn *sc, enum co_shr_mode mode)
-{
-	const struct mux_ops *mux;
-
-	BUG_ON(!sc_conn(sc));
-
-	if (sc_ep_test(sc, SE_FL_SHR))
-		return;
-
-	/* clean data-layer shutdown */
-	mux = sc_mux_ops(sc);
-	if (mux && mux->shutr)
-		mux->shutr(sc, mode);
-	sc_ep_set(sc, (mode == CO_SHR_DRAIN) ? SE_FL_SHRD : SE_FL_SHRR);
-}
-
-/* shut write */
-static inline void sc_conn_shutw(struct stconn *sc, enum co_shw_mode mode)
-{
-	const struct mux_ops *mux;
-
-	BUG_ON(!sc_conn(sc));
-
-	if (sc_ep_test(sc, SE_FL_SHW))
-		return;
-
-	/* clean data-layer shutdown */
-	mux = sc_mux_ops(sc);
-	if (mux && mux->shutw)
-		mux->shutw(sc, mode);
-	sc_ep_set(sc, (mode == CO_SHW_NORMAL) ? SE_FL_SHWN : SE_FL_SHWS);
-}
-
-/* completely close a stream connector (but do not detach it) */
-static inline void sc_conn_shut(struct stconn *sc)
-{
-	sc_conn_shutw(sc, CO_SHW_SILENT);
-	sc_conn_shutr(sc, CO_SHR_RESET);
-}
-
-/* completely close a stream connector after draining possibly pending data (but do not detach it) */
-static inline void sc_conn_drain_and_shut(struct stconn *sc)
-{
-	sc_conn_shutw(sc, CO_SHW_SILENT);
-	sc_conn_shutr(sc, CO_SHR_DRAIN);
 }
 
 /* Returns non-zero if the stream connector's Rx path is blocked because of
@@ -572,7 +526,7 @@ static inline size_t se_done_ff(struct sedesc *se)
 				sc_ep_report_blocked_send(se->sc, 0);
 			if (se->iobuf.flags & IOBUF_FL_FF_BLOCKED) {
 				sc_ep_report_blocked_send(se->sc, 0);
-				
+
 				if (!(se->sc->wait_event.events & SUB_RETRY_SEND)) {
 					/* The SC must be subs for send to be notify when some
 					 * space is made

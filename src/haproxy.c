@@ -1006,19 +1006,19 @@ static void sig_dump_state(struct sig_handler *sh)
 			chunk_printf(&trash,
 			             "SIGHUP: Proxy %s has no servers. Conn: act(FE+BE): %d+%d, %d pend (%d unass), tot(FE+BE): %lld+%lld.",
 			             p->id,
-			             p->feconn, p->beconn, p->totpend, p->queue.length, p->fe_counters.cum_conn, p->be_counters.cum_conn);
+			             p->feconn, p->beconn, p->totpend, p->queue.length, p->fe_counters.cum_conn, p->be_counters.cum_sess);
 		} else if (p->srv_act == 0) {
 			chunk_printf(&trash,
 			             "SIGHUP: Proxy %s %s ! Conn: act(FE+BE): %d+%d, %d pend (%d unass), tot(FE+BE): %lld+%lld.",
 			             p->id,
 			             (p->srv_bck) ? "is running on backup servers" : "has no server available",
-			             p->feconn, p->beconn, p->totpend, p->queue.length, p->fe_counters.cum_conn, p->be_counters.cum_conn);
+			             p->feconn, p->beconn, p->totpend, p->queue.length, p->fe_counters.cum_conn, p->be_counters.cum_sess);
 		} else {
 			chunk_printf(&trash,
 			             "SIGHUP: Proxy %s has %d active servers and %d backup servers available."
 			             " Conn: act(FE+BE): %d+%d, %d pend (%d unass), tot(FE+BE): %lld+%lld.",
 			             p->id, p->srv_act, p->srv_bck,
-			             p->feconn, p->beconn, p->totpend, p->queue.length, p->fe_counters.cum_conn, p->be_counters.cum_conn);
+			             p->feconn, p->beconn, p->totpend, p->queue.length, p->fe_counters.cum_conn, p->be_counters.cum_sess);
 		}
 		ha_warning("%s\n", trash.area);
 		send_log(p, LOG_NOTICE, "%s\n", trash.area);
@@ -3462,18 +3462,6 @@ int main(int argc, char **argv)
 	if (global.rlimit_memmax) {
 		limit.rlim_cur = limit.rlim_max =
 			global.rlimit_memmax * 1048576ULL;
-#ifdef RLIMIT_AS
-		if (setrlimit(RLIMIT_AS, &limit) == -1) {
-			if (global.tune.options & GTUNE_STRICT_LIMITS) {
-				ha_alert("[%s.main()] Cannot fix MEM limit to %d megs.\n",
-					 argv[0], global.rlimit_memmax);
-				exit(1);
-			}
-			else
-				ha_warning("[%s.main()] Cannot fix MEM limit to %d megs.\n",
-					   argv[0], global.rlimit_memmax);
-		}
-#else
 		if (setrlimit(RLIMIT_DATA, &limit) == -1) {
 			if (global.tune.options & GTUNE_STRICT_LIMITS) {
 				ha_alert("[%s.main()] Cannot fix MEM limit to %d megs.\n",
@@ -3484,7 +3472,6 @@ int main(int argc, char **argv)
 				ha_warning("[%s.main()] Cannot fix MEM limit to %d megs.\n",
 					   argv[0], global.rlimit_memmax);
 		}
-#endif
 	}
 
 #if defined(USE_LINUX_CAP)

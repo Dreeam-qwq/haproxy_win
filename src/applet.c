@@ -391,8 +391,8 @@ void applet_reset_svcctx(struct appctx *appctx)
 	appctx->svcctx = NULL;
 }
 
-/* call the applet's release() function if any, and marks the sedesc as shut.
- * Needs to be called upon close().
+/* call the applet's release() function if any, and marks the sedesc as shut
+ * once both read and write side are shut.  Needs to be called upon close().
  */
 void appctx_shut(struct appctx *appctx)
 {
@@ -400,6 +400,7 @@ void appctx_shut(struct appctx *appctx)
 		return;
 
 	TRACE_ENTER(APPLET_EV_RELEASE, appctx);
+
 	if (appctx->applet->release)
 		appctx->applet->release(appctx);
 	applet_fl_set(appctx, APPCTX_FL_SHUTDOWN);
@@ -407,7 +408,6 @@ void appctx_shut(struct appctx *appctx)
 	if (LIST_INLIST(&appctx->buffer_wait.list))
 		LIST_DEL_INIT(&appctx->buffer_wait.list);
 
-	se_fl_set(appctx->sedesc, SE_FL_SHRR | SE_FL_SHWN);
 	TRACE_LEAVE(APPLET_EV_RELEASE, appctx);
 }
 
