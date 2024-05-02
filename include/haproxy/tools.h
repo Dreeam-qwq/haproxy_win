@@ -432,6 +432,25 @@ char *escape_string(char *start, char *stop,
 		    const char escape, const long *map,
 		    const char *string, const char *string_stop);
 
+/* Below are RFC8949 compliant cbor encode helper functions, see source
+ * file for functions descriptions
+ */
+char *cbor_encode_uint64_prefix(struct cbor_encode_ctx *ctx,
+                                char *start, char *stop,
+                                uint64_t value, uint8_t prefix);
+char *cbor_encode_int64(struct cbor_encode_ctx *ctx,
+                        char *start, char *stop, int64_t value);
+char *cbor_encode_bytes_prefix(struct cbor_encode_ctx *ctx,
+                               char *start, char *stop,
+                               const char *bytes, size_t len,
+                               uint8_t prefix);
+char *cbor_encode_bytes(struct cbor_encode_ctx *ctx,
+                        char *start, char *stop,
+                        const char *bytes, size_t len);
+char *cbor_encode_text(struct cbor_encode_ctx *ctx,
+                       char *start, char *stop,
+                       const char *text, size_t len);
+
 /* Check a string for using it in a CSV output format. If the string contains
  * one of the following four char <">, <,>, CR or LF, the string is
  * encapsulated between <"> and the <"> are escaped by a <""> sequence.
@@ -1056,7 +1075,8 @@ static inline void *my_realloc2(void *ptr, size_t size)
 int parse_dotted_uints(const char *s, unsigned int **nums, size_t *sz);
 
 /* PRNG */
-void ha_generate_uuid(struct buffer *output);
+void ha_generate_uuid_v4(struct buffer *output);
+void ha_generate_uuid_v7(struct buffer *output);
 void ha_random_seed(const unsigned char *seed, size_t len);
 void ha_random_jump96(uint32_t dist);
 uint64_t ha_random64(void);

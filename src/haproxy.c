@@ -118,6 +118,7 @@
 #include <haproxy/sock.h>
 #include <haproxy/sock_inet.h>
 #include <haproxy/ssl_sock.h>
+#include <haproxy/stats-file.h>
 #include <haproxy/stats-t.h>
 #include <haproxy/stream.h>
 #include <haproxy/task.h>
@@ -720,6 +721,7 @@ static void mworker_reexec(int hardreload)
 	char *msg = NULL;
 	struct rlimit limit;
 	struct mworker_proc *current_child = NULL;
+	int x_off = 0; /* disable -x by putting -x /dev/null */
 
 	mworker_block_signals();
 	setenv("HAPROXY_MWORKER_REEXEC", "1", 1);
@@ -767,6 +769,10 @@ static void mworker_reexec(int hardreload)
 	/* copy the program name */
 	next_argv[next_argc++] = old_argv[0];
 
+	/* we need to reintroduce /dev/null everytime */
+	if (old_unixsocket && strcmp(old_unixsocket, "/dev/null") == 0)
+		x_off = 1;
+
 	/* insert the new options just after argv[0] in case we have a -- */
 
 	if (getenv("HAPROXY_MWORKER_WAIT_ONLY") == NULL) {
@@ -790,14 +796,19 @@ static void mworker_reexec(int hardreload)
 				msg = NULL;
 			}
 		}
-
-		if (current_child) {
+		if (!x_off && current_child) {
 			/* add the -x option with the socketpair of the current worker */
 			next_argv[next_argc++] = "-x";
 			if ((next_argv[next_argc++] = memprintf(&msg, "sockpair@%d", current_child->ipc_fd[0])) == NULL)
 				goto alloc_error;
 			msg = NULL;
 		}
+	}
+
+	if (x_off) {
+		/* if the cmdline contained a -x /dev/null, continue to use it */
+		next_argv[next_argc++] = "-x";
+		next_argv[next_argc++] = "/dev/null";
 	}
 
 	/* copy the previous options */
@@ -2365,6 +2376,9 @@ static void init(int argc, char **argv)
 	/* Apply server states */
 	apply_server_state();
 
+	/* Preload internal counters. */
+	apply_stats_file();
+
 	for (px = proxies_list; px; px = px->next)
 		srv_compute_all_admin_states(px);
 
@@ -2943,6 +2957,7 @@ void deinit(void)
 	ha_free(&localpeer);
 	ha_free(&global.server_state_base);
 	ha_free(&global.server_state_file);
+	ha_free(&global.stats_file);
 	task_destroy(idle_conn_task);
 	idle_conn_task = NULL;
 
@@ -3611,13 +3626,13 @@ int main(int argc, char **argv)
 	if ((global.mode & (MODE_MWORKER | MODE_DAEMON)) == 0)
 		set_identity(argv[0]);
 
-	/* set_identity() above might have dropped LSTCHK_NETADM if
-	 * it changed to a new UID while preserving enough permissions
-	 * to honnor LSTCHK_NETADM.
+	/* set_identity() above might have dropped LSTCHK_NETADM or/and
+	 * LSTCHK_SYSADM if it changed to a new UID while preserving enough
+	 * permissions to honnor LSTCHK_NETADM/LSTCHK_SYSADM.
 	 */
-	if ((global.last_checks & LSTCHK_NETADM) && getuid()) {
+	if ((global.last_checks & (LSTCHK_NETADM|LSTCHK_SYSADM)) && getuid()) {
 		/* If global.uid is present in config, it is already set as euid
-		 * and ruid by set_identity() call just above, so it's better to
+		 * and ruid by set_identity() just above, so it's better to
 		 * remind the user to fix uncoherent settings.
 		 */
 		if (global.uid) {

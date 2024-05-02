@@ -38,6 +38,7 @@
 #define UNIQUEID_LEN            128
 
 /* flags used in logformat_node->options */
+#define LOG_OPT_NONE            0x00000000
 #define LOG_OPT_HEXA            0x00000001
 #define LOG_OPT_MANDATORY       0x00000002
 #define LOG_OPT_QUOTE           0x00000004
@@ -46,6 +47,11 @@
 #define LOG_OPT_HTTP            0x00000020
 #define LOG_OPT_ESC             0x00000040
 #define LOG_OPT_MERGE_SPACES    0x00000080
+#define LOG_OPT_BIN             0x00000100
+/* unused: 0x00000200 ... 0x00000800 */
+#define LOG_OPT_ENCODE_JSON     0x00001000
+#define LOG_OPT_ENCODE_CBOR     0x00002000
+#define LOG_OPT_ENCODE          0x00003000
 
 
 /* Fields that need to be extracted from the incoming connection or request for
@@ -168,6 +174,10 @@ struct logformat_node {
 	const struct logformat_tag *tag; // set if ->type == LOG_FMT_TAG
 };
 
+/* returns true if the node options may be set (according to it's type) */
+#define LF_NODE_WITH_OPT(node) \
+  (node->type == LOG_FMT_EXPR || node->type == LOG_FMT_TAG)
+
 enum lf_expr_flags {
 	LF_FL_NONE     = 0x00,
 	LF_FL_COMPILED = 0x01
@@ -175,14 +185,17 @@ enum lf_expr_flags {
 
 /* a full logformat expr made of one or multiple logformat nodes */
 struct lf_expr {
-	struct list list;          /* to store lf_expr inside a list */
+	struct list list;                 /* to store lf_expr inside a list */
 	union {
-		struct list nodes; /* logformat_node list */
-		char *str;         /* original string prior to parsing (NULL once compiled) */
+		struct {
+			struct list list; /* logformat_node list */
+			int options;      /* global '%o' options (common to all nodes) */
+		} nodes;
+		char *str;                /* original string prior to parsing (NULL once compiled) */
 	};
 	struct {
-		char *file;        /* file where the lft appears */
-		int line;          /* line where the lft appears */
+		char *file;               /* file where the lft appears */
+		int line;                 /* line where the lft appears */
 	} conf; // parsing hints
 	uint8_t flags;             /* LF_FL_* flags */
 };

@@ -3,7 +3,7 @@
                           Configuration Manual
                          ----------------------
                               version 3.0
-                              2024/04/19
+                              2024/04/27
 
 
 This document covers the configuration language as implemented in the version
@@ -1290,6 +1290,7 @@ The following keywords are supported in the "global" section :
    - nbthread
    - node
    - numa-cpu-mapping
+   - ocsp_update.http_proxy
    - pidfile
    - pp2-never-send-local
    - presetenv
@@ -1318,6 +1319,7 @@ The following keywords are supported in the "global" section :
    - ssl-server-verify
    - ssl-skip-self-issued-ca
    - stats
+   - stats-file
    - strict-limits
    - uid
    - ulimit-n
@@ -2167,6 +2169,11 @@ numa-cpu-mapping
   already specified, for example via the 'cpu-map' directive or the taskset
   utility.
 
+ocsp_update.http_proxy <address>[:port]
+  Allow to use an HTTP proxy for the OCSP updates. This only works with HTTP,
+  HTTPS is not supported. This option will allow the OCSP updater to send
+  absolute URI in the request to the proxy.
+
 pidfile <pidfile>
   Writes PIDs of all daemons into file <pidfile> when daemon mode or writes PID
   of master process into file <pidfile> when master-worker mode. This option is
@@ -2660,6 +2667,11 @@ stats timeout <timeout, in milliseconds>
   The default timeout on the stats socket is set to 10 seconds. It is possible
   to change this value with "stats timeout". The value must be passed in
   milliseconds, or be suffixed by a time unit among { us, ms, s, m, h, d }.
+
+stats-file <path>
+  Path to a generated haproxy stats-file. On startup haproxy will preload the
+  values to its internal counters. Use the CLI command "dump stats-file" to
+  produce such stats-file. See the management manual for more details.
 
 strict-limits
   Makes process fail at startup when a setrlimit fails. HAProxy tries to set the
@@ -21306,7 +21318,8 @@ txn.sess_term_state : string
 uuid([<version>]) : string
   Returns a UUID following the RFC4122 standard. If the version is not
   specified, a UUID version 4 (fully random) is returned.
-  Currently, only version 4 is supported.
+
+  Versions 4 and 7 are supported.
 
 var(<var-name>[,<default>]) : undefined
   Returns a variable with the stored type. If the variable is not set, the
@@ -25732,6 +25745,30 @@ Flags are :
   * X: hexadecimal representation (IPs, Ports, %Ts, %rt, %pid)
   * E: escape characters '"', '\' and ']' in a string with '\' as prefix
        (intended purpose is for the RFC5424 structured-data log formats)
+  * bin: try to preserve binary data, this can be useful with sample
+         expressions that output binary data in order to preserve the original
+         data. Be careful however, because it can obviously generate non-
+         printable chars, including NULL-byte, which most syslog endpoints
+         don't expect. Thus it is mainly intended for use with set-var-fmt,
+         rings and binary-capable log endpoints.
+         This option can only be set globally (with %o), it will be ignored
+         if set on an individual node's options.
+  * json: automatically encode value in JSON format
+          (when set globally, only named format variables are considered)
+          Incomplete numerical values (e.g.: '%B' when logasap is used),
+          which are normally prefixed with '+' without encoding, will be
+          encoded as-is. Also, '+E' option will be ignored.
+  * cbor: automatically encode value in CBOR format
+          (when set globally, only named format variables are considered)
+          By default, cbor encoded data is represented in HEX form so
+          that it remains printable on stdout an can be used with usual
+          syslog endpoints.
+          As with json encoding, incomplete numerical values will be encoded
+          as-is and '+E' option will be ignored.
+          When combined with '+bin' option, it will directly generate raw
+          binary CBOR payload. Be careful, because it will obviously generate
+          non-printable chars, thus it is mainly intented for use with
+          set-var-fmt, rings and binary-capable log endpoints.
 
   Example:
 
@@ -25739,6 +25776,9 @@ Flags are :
     log-format %{+Q}o\ %t\ %s\ %{-Q}r
 
     log-format-sd %{+Q,+E}o\ [exampleSDID@1234\ header=%[capture.req.hdr(0)]]
+
+    log-format "%{+json}o %(request)r %(custom_expr)[str(custom)]"
+    log-format "%{+cbor}o %(request)r %(custom_expr)[str(custom)]"
 
 Please refer to the table below for currently defined variables :
 

@@ -23,6 +23,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 
+#include <import/ebsttree.h>
 #include <haproxy/api.h>
 #include <haproxy/activity.h>
 #include <haproxy/applet.h>
@@ -57,6 +58,7 @@
 #include <haproxy/server.h>
 #include <haproxy/session.h>
 #include <haproxy/stats.h>
+#include <haproxy/stats-file.h>
 #include <haproxy/stats-html.h>
 #include <haproxy/stats-json.h>
 #include <haproxy/stconn.h>
@@ -67,6 +69,41 @@
 #include <haproxy/tools.h>
 #include <haproxy/uri_auth-t.h>
 #include <haproxy/version.h>
+
+/* Define a new metric for both frontend and backend sides. */
+#define ME_NEW_PX(name_f, nature, format, offset_f, cap_f, desc_f)            \
+  { .name = (name_f), .desc = (desc_f), .type = (nature)|(format),            \
+    .metric.offset[0] = offsetof(struct fe_counters, offset_f),               \
+    .metric.offset[1] = offsetof(struct be_counters, offset_f),               \
+    .cap = (cap_f),                                                           \
+  }
+
+/* Define a new metric for frontend side only. */
+#define ME_NEW_FE(name_f, nature, format, offset_f, cap_f, desc_f)            \
+  { .name = (name_f), .desc = (desc_f), .type = (nature)|(format),            \
+    .metric.offset[0] = offsetof(struct fe_counters, offset_f),               \
+    .cap = (cap_f),                                                           \
+  }
+
+/* Define a new metric for backend side only. */
+#define ME_NEW_BE(name_f, nature, format, offset_f, cap_f, desc_f)            \
+  { .name = (name_f), .desc = (desc_f), .type = (nature)|(format),            \
+    .metric.offset[1] = offsetof(struct be_counters, offset_f),               \
+    .cap = (cap_f),                                                           \
+  }
+
+/* Returns true if <col> is fully defined, false if only used as name-desc. */
+static int stcol_is_generic(const struct stat_col *col)
+{
+	return !!(col->cap);
+}
+
+/* Convert stat_col <col> to old-style <name> as name_desc. */
+static void stcol2ndesc(struct name_desc *name, const struct stat_col *col)
+{
+        name->name = col->name;
+        name->desc = col->desc;
+}
 
 
 /* status codes available for the stats admin page (strictly 4 chars length) */
@@ -81,11 +118,11 @@ const char *stat_status_codes[STAT_STATUS_SIZE] = {
 	[STAT_STATUS_IVAL] = "IVAL",
 };
 
-/* These are the metric names for each ST_I_INF_* field position. Please pay attention
+/* These are the column names for each ST_I_INF_* field position. Please pay attention
  * to always use the exact same name except that the strings for new names must
  * be lower case or CamelCase while the enum entries must be upper case.
  */
-const struct name_desc metrics_info[ST_I_INF_MAX] = {
+const struct name_desc stat_cols_info[ST_I_INF_MAX] = {
 	[ST_I_INF_NAME]                           = { .name = "Name",                        .desc = "Product name" },
 	[ST_I_INF_VERSION]                        = { .name = "Version",                     .desc = "Product version" },
 	[ST_I_INF_RELEASE_DATE]                   = { .name = "Release_date",                .desc = "Date of latest source code update" },
@@ -167,7 +204,7 @@ const struct name_desc metrics_info[ST_I_INF_MAX] = {
 /* one line of info */
 THREAD_LOCAL struct field stat_line_info[ST_I_INF_MAX];
 
-const struct name_desc metrics_px[ST_I_PX_MAX] = {
+const struct stat_col stat_cols_px[ST_I_PX_MAX] = {
 	[ST_I_PX_PXNAME]                        = { .name = "pxname",                      .desc = "Proxy name" },
 	[ST_I_PX_SVNAME]                        = { .name = "svname",                      .desc = "Server name" },
 	[ST_I_PX_QCUR]                          = { .name = "qcur",                        .desc = "Number of current queued connections" },
@@ -175,22 +212,22 @@ const struct name_desc metrics_px[ST_I_PX_MAX] = {
 	[ST_I_PX_SCUR]                          = { .name = "scur",                        .desc = "Number of current sessions on the frontend, backend or server" },
 	[ST_I_PX_SMAX]                          = { .name = "smax",                        .desc = "Highest value of current sessions encountered since process started" },
 	[ST_I_PX_SLIM]                          = { .name = "slim",                        .desc = "Frontend/listener/server's maxconn, backend's fullconn" },
-	[ST_I_PX_STOT]                          = { .name = "stot",                        .desc = "Total number of sessions since process started" },
-	[ST_I_PX_BIN]                           = { .name = "bin",                         .desc = "Total number of request bytes since process started" },
-	[ST_I_PX_BOUT]                          = { .name = "bout",                        .desc = "Total number of response bytes since process started" },
-	[ST_I_PX_DREQ]                          = { .name = "dreq",                        .desc = "Total number of denied requests since process started" },
-	[ST_I_PX_DRESP]                         = { .name = "dresp",                       .desc = "Total number of denied responses since process started" },
-	[ST_I_PX_EREQ]                          = { .name = "ereq",                        .desc = "Total number of invalid requests since process started" },
-	[ST_I_PX_ECON]                          = { .name = "econ",                        .desc = "Total number of failed connections to server since the worker process started" },
-	[ST_I_PX_ERESP]                         = { .name = "eresp",                       .desc = "Total number of invalid responses since the worker process started" },
-	[ST_I_PX_WRETR]                         = { .name = "wretr",                       .desc = "Total number of server connection retries since the worker process started" },
-	[ST_I_PX_WREDIS]                        = { .name = "wredis",                      .desc = "Total number of server redispatches due to connection failures since the worker process started" },
+	[ST_I_PX_STOT]          = ME_NEW_PX("stot",          FN_COUNTER, FF_U64, cum_sess,               STATS_PX_CAP_LFBS, "Total number of sessions since process started"),
+	[ST_I_PX_BIN]           = ME_NEW_PX("bin",           FN_COUNTER, FF_U64, bytes_in,               STATS_PX_CAP_LFBS, "Total number of request bytes since process started"),
+	[ST_I_PX_BOUT]          = ME_NEW_PX("bout",          FN_COUNTER, FF_U64, bytes_out,              STATS_PX_CAP_LFBS, "Total number of response bytes since process started"),
+	[ST_I_PX_DREQ]          = ME_NEW_PX("dreq",          FN_COUNTER, FF_U64, denied_req,             STATS_PX_CAP_LFB_, "Total number of denied requests since process started"),
+	[ST_I_PX_DRESP]         = ME_NEW_PX("dresp",         FN_COUNTER, FF_U64, denied_resp,            STATS_PX_CAP_LFBS, "Total number of denied responses since process started"),
+	[ST_I_PX_EREQ]          = ME_NEW_FE("ereq",          FN_COUNTER, FF_U64, failed_req,             STATS_PX_CAP_LF__, "Total number of invalid requests since process started"),
+	[ST_I_PX_ECON]          = ME_NEW_BE("econ",          FN_COUNTER, FF_U64, failed_conns,           STATS_PX_CAP___BS, "Total number of failed connections to server since the worker process started"),
+	[ST_I_PX_ERESP]         = ME_NEW_BE("eresp",         FN_COUNTER, FF_U64, failed_resp,            STATS_PX_CAP___BS, "Total number of invalid responses since the worker process started"),
+	[ST_I_PX_WRETR]         = ME_NEW_BE("wretr",         FN_COUNTER, FF_U64, retries,                STATS_PX_CAP___BS, "Total number of server connection retries since the worker process started"),
+	[ST_I_PX_WREDIS]        = ME_NEW_BE("wredis",        FN_COUNTER, FF_U64, redispatches,           STATS_PX_CAP___BS, "Total number of server redispatches due to connection failures since the worker process started"),
 	[ST_I_PX_STATUS]                        = { .name = "status",                      .desc = "Frontend/listen status: OPEN/WAITING/FULL/STOP; backend: UP/DOWN; server: last check status" },
 	[ST_I_PX_WEIGHT]                        = { .name = "weight",                      .desc = "Server's effective weight, or sum of active servers' effective weights for a backend" },
 	[ST_I_PX_ACT]                           = { .name = "act",                         .desc = "Total number of active UP servers with a non-zero weight" },
 	[ST_I_PX_BCK]                           = { .name = "bck",                         .desc = "Total number of backup UP servers with a non-zero weight" },
-	[ST_I_PX_CHKFAIL]                       = { .name = "chkfail",                     .desc = "Total number of failed individual health checks per server/backend, since the worker process started" },
-	[ST_I_PX_CHKDOWN]                       = { .name = "chkdown",                     .desc = "Total number of failed checks causing UP to DOWN server transitions, per server/backend, since the worker process started" },
+	[ST_I_PX_CHKFAIL]       = ME_NEW_BE("chkfail",       FN_COUNTER, FF_U64, failed_checks,          STATS_PX_CAP____S, "Total number of failed individual health checks per server/backend, since the worker process started"),
+	[ST_I_PX_CHKDOWN]       = ME_NEW_BE("chkdown",       FN_COUNTER, FF_U64, down_trans,             STATS_PX_CAP___BS, "Total number of failed checks causing UP to DOWN server transitions, per server/backend, since the worker process started"),
 	[ST_I_PX_LASTCHG]                       = { .name = "lastchg",                     .desc = "How long ago the last server state changed, in seconds" },
 	[ST_I_PX_DOWNTIME]                      = { .name = "downtime",                    .desc = "Total time spent in DOWN state, for server or backend" },
 	[ST_I_PX_QLIMIT]                        = { .name = "qlimit",                      .desc = "Limit on the number of connections in queue, for servers only (maxqueue argument)" },
@@ -198,7 +235,7 @@ const struct name_desc metrics_px[ST_I_PX_MAX] = {
 	[ST_I_PX_IID]                           = { .name = "iid",                         .desc = "Frontend or Backend numeric identifier ('id' setting)" },
 	[ST_I_PX_SID]                           = { .name = "sid",                         .desc = "Server numeric identifier ('id' setting)" },
 	[ST_I_PX_THROTTLE]                      = { .name = "throttle",                    .desc = "Throttling ratio applied to a server's maxconn and weight during the slowstart period (0 to 100%)" },
-	[ST_I_PX_LBTOT]                         = { .name = "lbtot",                       .desc = "Total number of requests routed by load balancing since the worker process started (ignores queue pop and stickiness)" },
+	[ST_I_PX_LBTOT]         = ME_NEW_BE("lbtot",         FN_COUNTER, FF_U64, cum_lbconn,             STATS_PX_CAP_LFBS, "Total number of requests routed by load balancing since the worker process started (ignores queue pop and stickiness)"),
 	[ST_I_PX_TRACKED]                       = { .name = "tracked",                     .desc = "Name of the other server this server tracks for its state" },
 	[ST_I_PX_TYPE]                          = { .name = "type",                        .desc = "Type of the object (Listener, Frontend, Backend, Server)" },
 	[ST_I_PX_RATE]                          = { .name = "rate",                        .desc = "Total number of sessions processed by this object over the last second (sessions for listeners/frontends, requests for backends/servers)" },
@@ -207,22 +244,22 @@ const struct name_desc metrics_px[ST_I_PX_MAX] = {
 	[ST_I_PX_CHECK_STATUS]                  = { .name = "check_status",                .desc = "Status report of the server's latest health check, prefixed with '*' if a check is currently in progress" },
 	[ST_I_PX_CHECK_CODE]                    = { .name = "check_code",                  .desc = "HTTP/SMTP/LDAP status code reported by the latest server health check" },
 	[ST_I_PX_CHECK_DURATION]                = { .name = "check_duration",              .desc = "Total duration of the latest server health check, in milliseconds" },
-	[ST_I_PX_HRSP_1XX]                      = { .name = "hrsp_1xx",                    .desc = "Total number of HTTP responses with status 100-199 returned by this object since the worker process started" },
-	[ST_I_PX_HRSP_2XX]                      = { .name = "hrsp_2xx",                    .desc = "Total number of HTTP responses with status 200-299 returned by this object since the worker process started" },
-	[ST_I_PX_HRSP_3XX]                      = { .name = "hrsp_3xx",                    .desc = "Total number of HTTP responses with status 300-399 returned by this object since the worker process started" },
-	[ST_I_PX_HRSP_4XX]                      = { .name = "hrsp_4xx",                    .desc = "Total number of HTTP responses with status 400-499 returned by this object since the worker process started" },
-	[ST_I_PX_HRSP_5XX]                      = { .name = "hrsp_5xx",                    .desc = "Total number of HTTP responses with status 500-599 returned by this object since the worker process started" },
-	[ST_I_PX_HRSP_OTHER]                    = { .name = "hrsp_other",                  .desc = "Total number of HTTP responses with status <100, >599 returned by this object since the worker process started (error -1 included)" },
-	[ST_I_PX_HANAFAIL]                      = { .name = "hanafail",                    .desc = "Total number of failed checks caused by an 'on-error' directive after an 'observe' condition matched" },
+	[ST_I_PX_HRSP_1XX]      = ME_NEW_PX("hrsp_1xx",      FN_COUNTER, FF_U64, p.http.rsp[1],          STATS_PX_CAP__FBS, "Total number of HTTP responses with status 100-199 returned by this object since the worker process started"),
+	[ST_I_PX_HRSP_2XX]      = ME_NEW_PX("hrsp_2xx",      FN_COUNTER, FF_U64, p.http.rsp[2],          STATS_PX_CAP__FBS, "Total number of HTTP responses with status 200-299 returned by this object since the worker process started"),
+	[ST_I_PX_HRSP_3XX]      = ME_NEW_PX("hrsp_3xx",      FN_COUNTER, FF_U64, p.http.rsp[3],          STATS_PX_CAP__FBS, "Total number of HTTP responses with status 300-399 returned by this object since the worker process started"),
+	[ST_I_PX_HRSP_4XX]      = ME_NEW_PX("hrsp_4xx",      FN_COUNTER, FF_U64, p.http.rsp[4],          STATS_PX_CAP__FBS, "Total number of HTTP responses with status 400-499 returned by this object since the worker process started"),
+	[ST_I_PX_HRSP_5XX]      = ME_NEW_PX("hrsp_5xx",      FN_COUNTER, FF_U64, p.http.rsp[5],          STATS_PX_CAP__FBS, "Total number of HTTP responses with status 500-599 returned by this object since the worker process started"),
+	[ST_I_PX_HRSP_OTHER]    = ME_NEW_PX("hrsp_other",    FN_COUNTER, FF_U64, p.http.rsp[0],          STATS_PX_CAP__FBS, "Total number of HTTP responses with status <100, >599 returned by this object since the worker process started (error -1 included)"),
+	[ST_I_PX_HANAFAIL]      = ME_NEW_BE("hanafail",      FN_COUNTER, FF_U64, failed_hana,            STATS_PX_CAP_SRV, "Total number of failed checks caused by an 'on-error' directive after an 'observe' condition matched"),
 	[ST_I_PX_REQ_RATE]                      = { .name = "req_rate",                    .desc = "Number of HTTP requests processed over the last second on this object" },
 	[ST_I_PX_REQ_RATE_MAX]                  = { .name = "req_rate_max",                .desc = "Highest value of http requests observed since the worker process started" },
 	[ST_I_PX_REQ_TOT]                       = { .name = "req_tot",                     .desc = "Total number of HTTP requests processed by this object since the worker process started" },
-	[ST_I_PX_CLI_ABRT]                      = { .name = "cli_abrt",                    .desc = "Total number of requests or connections aborted by the client since the worker process started" },
-	[ST_I_PX_SRV_ABRT]                      = { .name = "srv_abrt",                    .desc = "Total number of requests or connections aborted by the server since the worker process started" },
-	[ST_I_PX_COMP_IN]                       = { .name = "comp_in",                     .desc = "Total number of bytes submitted to the HTTP compressor for this object since the worker process started" },
-	[ST_I_PX_COMP_OUT]                      = { .name = "comp_out",                    .desc = "Total number of bytes emitted by the HTTP compressor for this object since the worker process started" },
-	[ST_I_PX_COMP_BYP]                      = { .name = "comp_byp",                    .desc = "Total number of bytes that bypassed HTTP compression for this object since the worker process started (CPU/memory/bandwidth limitation)" },
-	[ST_I_PX_COMP_RSP]                      = { .name = "comp_rsp",                    .desc = "Total number of HTTP responses that were compressed for this object since the worker process started" },
+	[ST_I_PX_CLI_ABRT]      = ME_NEW_BE("cli_abrt",      FN_COUNTER, FF_U64, cli_aborts,             STATS_PX_CAP_LFBS, "Total number of requests or connections aborted by the client since the worker process started"),
+	[ST_I_PX_SRV_ABRT]      = ME_NEW_BE("srv_abrt",      FN_COUNTER, FF_U64, srv_aborts,             STATS_PX_CAP_LFBS, "Total number of requests or connections aborted by the server since the worker process started"),
+	[ST_I_PX_COMP_IN]       = ME_NEW_PX("comp_in",       FN_COUNTER, FF_U64, comp_in[COMP_DIR_RES],  STATS_PX_CAP__FB_, "Total number of bytes submitted to the HTTP compressor for this object since the worker process started"),
+	[ST_I_PX_COMP_OUT]      = ME_NEW_PX("comp_out",      FN_COUNTER, FF_U64, comp_out[COMP_DIR_RES], STATS_PX_CAP__FB_, "Total number of bytes emitted by the HTTP compressor for this object since the worker process started"),
+	[ST_I_PX_COMP_BYP]      = ME_NEW_PX("comp_byp",      FN_COUNTER, FF_U64, comp_byp[COMP_DIR_RES], STATS_PX_CAP__FB_, "Total number of bytes that bypassed HTTP compression for this object since the worker process started (CPU/memory/bandwidth limitation)"),
+	[ST_I_PX_COMP_RSP]      = ME_NEW_PX("comp_rsp",      FN_COUNTER, FF_U64, p.http.comp_rsp,        STATS_PX_CAP__FB_, "Total number of HTTP responses that were compressed for this object since the worker process started"),
 	[ST_I_PX_LASTSESS]                      = { .name = "lastsess",                    .desc = "How long ago some traffic was seen on this object on this worker process, in seconds" },
 	[ST_I_PX_LAST_CHK]                      = { .name = "last_chk",                    .desc = "Short description of the latest health check report for this server (see also check_desc)" },
 	[ST_I_PX_LAST_AGT]                      = { .name = "last_agt",                    .desc = "Short description of the latest agent check report for this server (see also agent_desc)" },
@@ -247,22 +284,22 @@ const struct name_desc metrics_px[ST_I_PX_MAX] = {
 	[ST_I_PX_ALGO]                          = { .name = "algo",                        .desc = "Backend's load balancing algorithm, shown only if show-legends is set, or at levels oper/admin for the CLI" },
 	[ST_I_PX_CONN_RATE]                     = { .name = "conn_rate",                   .desc = "Number of new connections accepted over the last second on the frontend for this worker process" },
 	[ST_I_PX_CONN_RATE_MAX]                 = { .name = "conn_rate_max",               .desc = "Highest value of connections per second observed since the worker process started" },
-	[ST_I_PX_CONN_TOT]                      = { .name = "conn_tot",                    .desc = "Total number of new connections accepted on this frontend since the worker process started" },
-	[ST_I_PX_INTERCEPTED]                   = { .name = "intercepted",                 .desc = "Total number of HTTP requests intercepted on the frontend (redirects/stats/services) since the worker process started" },
-	[ST_I_PX_DCON]                          = { .name = "dcon",                        .desc = "Total number of incoming connections blocked on a listener/frontend by a tcp-request connection rule since the worker process started" },
-	[ST_I_PX_DSES]                          = { .name = "dses",                        .desc = "Total number of incoming sessions blocked on a listener/frontend by a tcp-request connection rule since the worker process started" },
-	[ST_I_PX_WREW]                          = { .name = "wrew",                        .desc = "Total number of failed HTTP header rewrites since the worker process started" },
-	[ST_I_PX_CONNECT]                       = { .name = "connect",                     .desc = "Total number of outgoing connection attempts on this backend/server since the worker process started" },
-	[ST_I_PX_REUSE]                         = { .name = "reuse",                       .desc = "Total number of reused connection on this backend/server since the worker process started" },
-	[ST_I_PX_CACHE_LOOKUPS]                 = { .name = "cache_lookups",               .desc = "Total number of HTTP requests looked up in the cache on this frontend/backend since the worker process started" },
-	[ST_I_PX_CACHE_HITS]                    = { .name = "cache_hits",                  .desc = "Total number of HTTP requests not found in the cache on this frontend/backend since the worker process started" },
+	[ST_I_PX_CONN_TOT]      = ME_NEW_FE("conn_tot",      FN_COUNTER, FF_U64, cum_conn,               STATS_PX_CAP_LF__, "Total number of new connections accepted on this frontend since the worker process started"),
+	[ST_I_PX_INTERCEPTED]   = ME_NEW_FE("intercepted",   FN_COUNTER, FF_U64, intercepted_req,        STATS_PX_CAP__F__, "Total number of HTTP requests intercepted on the frontend (redirects/stats/services) since the worker process started"),
+	[ST_I_PX_DCON]          = ME_NEW_FE("dcon",          FN_COUNTER, FF_U64, denied_conn,            STATS_PX_CAP_LF__, "Total number of incoming connections blocked on a listener/frontend by a tcp-request connection rule since the worker process started"),
+	[ST_I_PX_DSES]          = ME_NEW_FE("dses",          FN_COUNTER, FF_U64, denied_sess,            STATS_PX_CAP_LF__, "Total number of incoming sessions blocked on a listener/frontend by a tcp-request connection rule since the worker process started"),
+	[ST_I_PX_WREW]          = ME_NEW_PX("wrew",          FN_COUNTER, FF_U64, failed_rewrites,        STATS_PX_CAP_LFBS, "Total number of failed HTTP header rewrites since the worker process started"),
+	[ST_I_PX_CONNECT]       = ME_NEW_BE("connect",       FN_COUNTER, FF_U64, connect,                STATS_PX_CAP___BS, "Total number of outgoing connection attempts on this backend/server since the worker process started"),
+	[ST_I_PX_REUSE]         = ME_NEW_BE("reuse",         FN_COUNTER, FF_U64, reuse,                  STATS_PX_CAP___BS, "Total number of reused connection on this backend/server since the worker process started"),
+	[ST_I_PX_CACHE_LOOKUPS] = ME_NEW_PX("cache_lookups", FN_COUNTER, FF_U64, p.http.cache_lookups,   STATS_PX_CAP__FB_, "Total number of HTTP requests looked up in the cache on this frontend/backend since the worker process started"),
+	[ST_I_PX_CACHE_HITS]    = ME_NEW_PX("cache_hits",    FN_COUNTER, FF_U64, p.http.cache_hits,      STATS_PX_CAP__FB_, "Total number of HTTP requests not found in the cache on this frontend/backend since the worker process started"),
 	[ST_I_PX_SRV_ICUR]                      = { .name = "srv_icur",                    .desc = "Current number of idle connections available for reuse on this server" },
 	[ST_I_PX_SRV_ILIM]                      = { .name = "src_ilim",                    .desc = "Limit on the number of available idle connections on this server (server 'pool_max_conn' directive)" },
 	[ST_I_PX_QT_MAX]                        = { .name = "qtime_max",                   .desc = "Maximum observed time spent in the queue, in milliseconds (backend/server)" },
 	[ST_I_PX_CT_MAX]                        = { .name = "ctime_max",                   .desc = "Maximum observed time spent waiting for a connection to complete, in milliseconds (backend/server)" },
 	[ST_I_PX_RT_MAX]                        = { .name = "rtime_max",                   .desc = "Maximum observed time spent waiting for a server response, in milliseconds (backend/server)" },
 	[ST_I_PX_TT_MAX]                        = { .name = "ttime_max",                   .desc = "Maximum observed total request+response time (request+queue+connect+response+processing), in milliseconds (backend/server)" },
-	[ST_I_PX_EINT]                          = { .name = "eint",                        .desc = "Total number of internal errors since process started"},
+	[ST_I_PX_EINT]          = ME_NEW_PX("eint",          FN_COUNTER, FF_U64, internal_errors,        STATS_PX_CAP_LFBS, "Total number of internal errors since process started"),
 	[ST_I_PX_IDLE_CONN_CUR]                 = { .name = "idle_conn_cur",               .desc = "Current number of unsafe idle connections"},
 	[ST_I_PX_SAFE_CONN_CUR]                 = { .name = "safe_conn_cur",               .desc = "Current number of safe idle connections"},
 	[ST_I_PX_USED_CONN_CUR]                 = { .name = "used_conn_cur",               .desc = "Current number of connections in use"},
@@ -273,24 +310,24 @@ const struct name_desc metrics_px[ST_I_PX_MAX] = {
 	[ST_I_PX_AGG_CHECK_STATUS]              = { .name = "agg_check_status",            .desc = "Backend's aggregated gauge of servers' state check status" },
 	[ST_I_PX_SRID]                          = { .name = "srid",                        .desc = "Server id revision, to prevent server id reuse mixups" },
 	[ST_I_PX_SESS_OTHER]                    = { .name = "sess_other",                  .desc = "Total number of sessions other than HTTP since process started" },
-	[ST_I_PX_H1SESS]                        = { .name = "h1sess",                      .desc = "Total number of HTTP/1 sessions since process started" },
-	[ST_I_PX_H2SESS]                        = { .name = "h2sess",                      .desc = "Total number of HTTP/2 sessions since process started" },
-	[ST_I_PX_H3SESS]                        = { .name = "h3sess",                      .desc = "Total number of HTTP/3 sessions since process started" },
-	[ST_I_PX_REQ_OTHER]                     = { .name = "req_other",                   .desc = "Total number of sessions other than HTTP processed by this object since the worker process started" },
-	[ST_I_PX_H1REQ]                         = { .name = "h1req",                       .desc = "Total number of HTTP/1 sessions processed by this object since the worker process started" },
-	[ST_I_PX_H2REQ]                         = { .name = "h2req",                       .desc = "Total number of hTTP/2 sessions processed by this object since the worker process started" },
-	[ST_I_PX_H3REQ]                         = { .name = "h3req",                       .desc = "Total number of HTTP/3 sessions processed by this object since the worker process started" },
+	[ST_I_PX_H1SESS]        = ME_NEW_FE("h1sess",        FN_COUNTER, FF_U64, cum_sess_ver[0],        STATS_PX_CAP__F__, "Total number of HTTP/1 sessions since process started"),
+	[ST_I_PX_H2SESS]        = ME_NEW_FE("h2sess",        FN_COUNTER, FF_U64, cum_sess_ver[1],        STATS_PX_CAP__F__, "Total number of HTTP/2 sessions since process started"),
+	[ST_I_PX_H3SESS]        = ME_NEW_FE("h3sess",        FN_COUNTER, FF_U64, cum_sess_ver[2],        STATS_PX_CAP__F__, "Total number of HTTP/3 sessions since process started"),
+	[ST_I_PX_REQ_OTHER]     = ME_NEW_FE("req_other",     FN_COUNTER, FF_U64, p.http.cum_req[0],      STATS_PX_CAP__F__, "Total number of sessions other than HTTP processed by this object since the worker process started"),
+	[ST_I_PX_H1REQ]         = ME_NEW_FE("h1req",         FN_COUNTER, FF_U64, p.http.cum_req[1],      STATS_PX_CAP__F__, "Total number of HTTP/1 sessions processed by this object since the worker process started"),
+	[ST_I_PX_H2REQ]         = ME_NEW_FE("h2req",         FN_COUNTER, FF_U64, p.http.cum_req[2],      STATS_PX_CAP__F__, "Total number of hTTP/2 sessions processed by this object since the worker process started"),
+	[ST_I_PX_H3REQ]         = ME_NEW_FE("h3req",         FN_COUNTER, FF_U64, p.http.cum_req[3],      STATS_PX_CAP__F__, "Total number of HTTP/3 sessions processed by this object since the worker process started"),
 	[ST_I_PX_PROTO]                         = { .name = "proto",                       .desc = "Protocol" },
 };
 
 /* one line for stats */
 THREAD_LOCAL struct field *stat_lines[STATS_DOMAIN_COUNT];
 
-/* Unified storage for metrics from all stats module
+/* Unified storage for statistics from all module
  * TODO merge info stats into it as global statistic domain.
  */
-struct name_desc *metrics[STATS_DOMAIN_COUNT];
-static size_t metrics_len[STATS_DOMAIN_COUNT];
+struct name_desc *stat_cols[STATS_DOMAIN_COUNT];
+static size_t stat_cols_len[STATS_DOMAIN_COUNT];
 
 /* list of all registered stats module */
 struct list stats_module_list[STATS_DOMAIN_COUNT] = {
@@ -299,6 +336,36 @@ struct list stats_module_list[STATS_DOMAIN_COUNT] = {
 };
 
 THREAD_LOCAL void *trash_counters;
+
+/* Insert into <st_tree> all stat columns from <cols> indexed by their name. */
+int generate_stat_tree(struct eb_root *st_tree, const struct stat_col cols[])
+{
+	const struct stat_col *col;
+	struct stcol_node *node;
+	size_t len;
+	int i;
+
+	for (i = 0; i < ST_I_PX_MAX; ++i) {
+		col = &cols[i];
+		if (stcol_nature(col) == FN_COUNTER) {
+			len = strlen(col->name);
+			node = malloc(sizeof(struct stcol_node) + len + 1);
+			if (!node)
+				goto err;
+
+			node->col = col;
+			memcpy(node->name.key, col->name, len);
+			node->name.key[len] = '\0';
+
+			ebst_insert(st_tree, &node->name);
+		}
+	}
+
+	return 0;
+
+ err:
+	return 1;
+}
 
 
 int stats_putchk(struct appctx *appctx, struct buffer *buf, struct htx *htx)
@@ -402,9 +469,9 @@ static void stats_dump_csv_header(enum stats_domain domain, struct buffer *out)
 	int i;
 
 	chunk_appendf(out, "# ");
-	if (metrics[domain]) {
-		for (i = 0; i < metrics_len[domain]; ++i) {
-			chunk_appendf(out, "%s,", metrics[domain][i].name);
+	if (stat_cols[domain]) {
+		for (i = 0; i < stat_cols_len[domain]; ++i) {
+			chunk_appendf(out, "%s,", stat_cols[domain][i].name);
 
 			/* print special delimiter on proxy stats to mark end of
 			   static fields */
@@ -553,13 +620,13 @@ static int stats_dump_fields_typed(struct buffer *out,
 			              '?',
 			              line[ST_I_PX_IID].u.u32, line[ST_I_PX_SID].u.u32,
 			              i,
-			              metrics[domain][i].name,
+			              stat_cols[domain][i].name,
 			              line[ST_I_PX_PID].u.u32);
 			break;
 
 		case STATS_DOMAIN_RESOLVERS:
 			chunk_appendf(out, "N.%d.%s:", i,
-			              metrics[domain][i].name);
+			              stat_cols[domain][i].name);
 			break;
 
 		default:
@@ -572,7 +639,7 @@ static int stats_dump_fields_typed(struct buffer *out,
 			return 0;
 
 		if (flags & STAT_F_SHOW_FDESC &&
-		    !chunk_appendf(out, ":\"%s\"", metrics[domain][i].desc)) {
+		    !chunk_appendf(out, ":\"%s\"", stat_cols[domain][i].desc)) {
 			return 0;
 		}
 
@@ -596,10 +663,128 @@ int stats_dump_one_line(const struct field *line, size_t stats_count,
 		ret = stats_dump_fields_typed(chk, line, stats_count, ctx);
 	else if (ctx->flags & STAT_F_FMT_JSON)
 		ret = stats_dump_fields_json(chk, line, stats_count, ctx);
+	else if (ctx->flags & STAT_F_FMT_FILE)
+		ret = stats_dump_fields_file(chk, line, stats_count, ctx);
 	else
 		ret = stats_dump_fields_csv(chk, line, stats_count, ctx);
 
 	return ret;
+}
+
+/* Returns true if column at <idx> should be hidden.
+ * This may depends on various <objt> internal status.
+ */
+static int stcol_hide(enum stat_idx_px idx, enum obj_type *objt)
+{
+	struct proxy *px;
+	struct server *srv = NULL, *ref;
+	struct listener *li = NULL;
+
+	switch (obj_type(objt)) {
+	case OBJ_TYPE_PROXY:
+		px = __objt_proxy(objt);
+		break;
+	case OBJ_TYPE_SERVER:
+		srv = __objt_server(objt);
+		px = srv->proxy;
+		break;
+	case OBJ_TYPE_LISTENER:
+		li = __objt_listener(objt);
+		px = li->bind_conf->frontend;
+		break;
+	default:
+		ABORT_NOW();
+		return 0;
+	}
+
+	switch (idx) {
+	case ST_I_PX_HRSP_1XX:
+	case ST_I_PX_HRSP_2XX:
+	case ST_I_PX_HRSP_3XX:
+	case ST_I_PX_HRSP_4XX:
+	case ST_I_PX_HRSP_5XX:
+	case ST_I_PX_INTERCEPTED:
+	case ST_I_PX_CACHE_LOOKUPS:
+	case ST_I_PX_CACHE_HITS:
+		return px->mode != PR_MODE_HTTP;
+
+	case ST_I_PX_CHKFAIL:
+	case ST_I_PX_CHKDOWN:
+		return srv && !(srv->check.state & CHK_ST_ENABLED);
+
+	case ST_I_PX_HANAFAIL:
+		BUG_ON(!srv); /* HANAFAIL is only defined for server scope */
+
+		ref = srv->track ? srv->track : srv;
+		while (ref->track)
+			ref = ref->track;
+		return !ref->observe;
+
+	default:
+		return 0;
+	}
+}
+
+/* Generate if possible a metric value from <col>. <cap> must be set to one of
+ * STATS_PX_CAP_* values to check if the metric is available for this object
+ * type. <stat_file> must be set when dumping stats-file. Metric value will be
+ * extracted from <counters>.
+ *
+ * Returns a field metric.
+ */
+static struct field me_generate_field(const struct stat_col *col,
+                                      enum stat_idx_px idx, enum obj_type *objt,
+                                      const void *counters, uint8_t cap,
+                                      int stat_file)
+{
+	struct field value;
+	void *counter = NULL;
+	int wrong_side = 0;
+
+	/* Only generic stat column must be used as input. */
+	BUG_ON(!stcol_is_generic(col));
+
+	switch (cap) {
+	case STATS_PX_CAP_FE:
+	case STATS_PX_CAP_LI:
+		counter = (char *)counters + col->metric.offset[0];
+		wrong_side = !(col->cap & (STATS_PX_CAP_FE|STATS_PX_CAP_LI));
+		break;
+
+	case STATS_PX_CAP_BE:
+	case STATS_PX_CAP_SRV:
+		counter = (char *)counters + col->metric.offset[1];
+		wrong_side = !(col->cap & (STATS_PX_CAP_BE|STATS_PX_CAP_SRV));
+		break;
+
+	default:
+		/* invalid cap requested */
+		ABORT_NOW();
+	}
+
+	if (stat_file) {
+		/* stats-file emits separately frontend and backend stats.
+		 * Skip metric if not defined for any object on the cap side.
+		 */
+		if (wrong_side)
+			return (struct field){ .type = FF_EMPTY };
+	}
+	else {
+		/* Ensure metric is defined for the current cap. */
+		if (!(col->cap & cap) || stcol_hide(idx, objt))
+			return (struct field){ .type = FF_EMPTY };
+	}
+
+	switch (stcol_format(col)) {
+	case FF_U64:
+		value = mkf_u64(stcol_nature(col), *(uint64_t *)counter);
+		break;
+	default:
+		/* only FF_U64 counters currently use generic metric calculation */
+		ABORT_NOW();
+	}
+
+	return value;
 }
 
 /* Fill <line> with the frontend statistics. <line> is preallocated array of
@@ -608,7 +793,7 @@ int stats_dump_one_line(const struct field *line, size_t stats_count,
  * this value, or if the selected field is not implemented for frontends, the
  * function returns 0, otherwise, it returns 1.
  */
-int stats_fill_fe_line(struct proxy *px, struct field *line, int len,
+int stats_fill_fe_line(struct proxy *px, int flags, struct field *line, int len,
                        enum stat_idx_px *index)
 {
 	enum stat_idx_px i = index ? *index : 0;
@@ -617,9 +802,16 @@ int stats_fill_fe_line(struct proxy *px, struct field *line, int len,
 		return 0;
 
 	for (; i < ST_I_PX_MAX; i++) {
+		const struct stat_col *col = &stat_cols_px[i];
 		struct field field = { 0 };
 
-		switch (i) {
+		if (stcol_is_generic(col)) {
+			field = me_generate_field(col, i, &px->obj_type,
+			                          &px->fe_counters, STATS_PX_CAP_FE,
+			                          flags & STAT_F_FMT_FILE);
+		}
+		else if (!(flags & STAT_F_FMT_FILE)) {
+			switch (i) {
 			case ST_I_PX_PXNAME:
 				field = mkf_str(FO_KEY|FN_NAME|FS_SERVICE, px->id);
 				break;
@@ -637,30 +829,6 @@ int stats_fill_fe_line(struct proxy *px, struct field *line, int len,
 				break;
 			case ST_I_PX_SLIM:
 				field = mkf_u32(FO_CONFIG|FN_LIMIT, px->maxconn);
-				break;
-			case ST_I_PX_STOT:
-				field = mkf_u64(FN_COUNTER, px->fe_counters.cum_sess);
-				break;
-			case ST_I_PX_BIN:
-				field = mkf_u64(FN_COUNTER, px->fe_counters.bytes_in);
-				break;
-			case ST_I_PX_BOUT:
-				field = mkf_u64(FN_COUNTER, px->fe_counters.bytes_out);
-				break;
-			case ST_I_PX_DREQ:
-				field = mkf_u64(FN_COUNTER, px->fe_counters.denied_req);
-				break;
-			case ST_I_PX_DRESP:
-				field = mkf_u64(FN_COUNTER, px->fe_counters.denied_resp);
-				break;
-			case ST_I_PX_EREQ:
-				field = mkf_u64(FN_COUNTER, px->fe_counters.failed_req);
-				break;
-			case ST_I_PX_DCON:
-				field = mkf_u64(FN_COUNTER, px->fe_counters.denied_conn);
-				break;
-			case ST_I_PX_DSES:
-				field = mkf_u64(FN_COUNTER, px->fe_counters.denied_sess);
 				break;
 			case ST_I_PX_STATUS: {
 				const char *state;
@@ -695,48 +863,6 @@ int stats_fill_fe_line(struct proxy *px, struct field *line, int len,
 			case ST_I_PX_RATE_MAX:
 				field = mkf_u32(FN_MAX, px->fe_counters.sps_max);
 				break;
-			case ST_I_PX_WREW:
-				field = mkf_u64(FN_COUNTER, px->fe_counters.failed_rewrites);
-				break;
-			case ST_I_PX_EINT:
-				field = mkf_u64(FN_COUNTER, px->fe_counters.internal_errors);
-				break;
-			case ST_I_PX_HRSP_1XX:
-				if (px->mode == PR_MODE_HTTP)
-					field = mkf_u64(FN_COUNTER, px->fe_counters.p.http.rsp[1]);
-				break;
-			case ST_I_PX_HRSP_2XX:
-				if (px->mode == PR_MODE_HTTP)
-					field = mkf_u64(FN_COUNTER, px->fe_counters.p.http.rsp[2]);
-				break;
-			case ST_I_PX_HRSP_3XX:
-				if (px->mode == PR_MODE_HTTP)
-					field = mkf_u64(FN_COUNTER, px->fe_counters.p.http.rsp[3]);
-				break;
-			case ST_I_PX_HRSP_4XX:
-				if (px->mode == PR_MODE_HTTP)
-					field = mkf_u64(FN_COUNTER, px->fe_counters.p.http.rsp[4]);
-				break;
-			case ST_I_PX_HRSP_5XX:
-				if (px->mode == PR_MODE_HTTP)
-					field = mkf_u64(FN_COUNTER, px->fe_counters.p.http.rsp[5]);
-				break;
-			case ST_I_PX_HRSP_OTHER:
-				if (px->mode == PR_MODE_HTTP)
-					field = mkf_u64(FN_COUNTER, px->fe_counters.p.http.rsp[0]);
-				break;
-			case ST_I_PX_INTERCEPTED:
-				if (px->mode == PR_MODE_HTTP)
-					field = mkf_u64(FN_COUNTER, px->fe_counters.intercepted_req);
-				break;
-			case ST_I_PX_CACHE_LOOKUPS:
-				if (px->mode == PR_MODE_HTTP)
-					field = mkf_u64(FN_COUNTER, px->fe_counters.p.http.cache_lookups);
-				break;
-			case ST_I_PX_CACHE_HITS:
-				if (px->mode == PR_MODE_HTTP)
-					field = mkf_u64(FN_COUNTER, px->fe_counters.p.http.cache_hits);
-				break;
 			case ST_I_PX_REQ_RATE:
 				field = mkf_u32(FN_RATE, read_freq_ctr(&px->fe_req_per_sec));
 				break;
@@ -755,26 +881,11 @@ int stats_fill_fe_line(struct proxy *px, struct field *line, int len,
 				field = mkf_u64(FN_COUNTER, total_req);
 				break;
 			}
-			case ST_I_PX_COMP_IN:
-				field = mkf_u64(FN_COUNTER, px->fe_counters.comp_in[COMP_DIR_RES]);
-				break;
-			case ST_I_PX_COMP_OUT:
-				field = mkf_u64(FN_COUNTER, px->fe_counters.comp_out[COMP_DIR_RES]);
-				break;
-			case ST_I_PX_COMP_BYP:
-				field = mkf_u64(FN_COUNTER, px->fe_counters.comp_byp[COMP_DIR_RES]);
-				break;
-			case ST_I_PX_COMP_RSP:
-				field = mkf_u64(FN_COUNTER, px->fe_counters.p.http.comp_rsp);
-				break;
 			case ST_I_PX_CONN_RATE:
 				field = mkf_u32(FN_RATE, read_freq_ctr(&px->fe_conn_per_sec));
 				break;
 			case ST_I_PX_CONN_RATE_MAX:
 				field = mkf_u32(FN_MAX, px->fe_counters.cps_max);
-				break;
-			case ST_I_PX_CONN_TOT:
-				field = mkf_u64(FN_COUNTER, px->fe_counters.cum_conn);
 				break;
 			case ST_I_PX_SESS_OTHER: {
 				int i;
@@ -789,27 +900,6 @@ int stats_fill_fe_line(struct proxy *px, struct field *line, int len,
 				field = mkf_u64(FN_COUNTER, total_sess);
 				break;
 			}
-			case ST_I_PX_H1SESS:
-				field = mkf_u64(FN_COUNTER, px->fe_counters.cum_sess_ver[0]);
-				break;
-			case ST_I_PX_H2SESS:
-				field = mkf_u64(FN_COUNTER, px->fe_counters.cum_sess_ver[1]);
-				break;
-			case ST_I_PX_H3SESS:
-				field = mkf_u64(FN_COUNTER, px->fe_counters.cum_sess_ver[2]);
-				break;
-			case ST_I_PX_REQ_OTHER:
-				field = mkf_u64(FN_COUNTER, px->fe_counters.p.http.cum_req[0]);
-				break;
-			case ST_I_PX_H1REQ:
-				field = mkf_u64(FN_COUNTER, px->fe_counters.p.http.cum_req[1]);
-				break;
-			case ST_I_PX_H2REQ:
-				field = mkf_u64(FN_COUNTER, px->fe_counters.p.http.cum_req[2]);
-				break;
-			case ST_I_PX_H3REQ:
-				field = mkf_u64(FN_COUNTER, px->fe_counters.p.http.cum_req[3]);
-				break;
 			default:
 				/* not used for frontends. If a specific field
 				 * is requested, return an error. Otherwise continue.
@@ -817,6 +907,7 @@ int stats_fill_fe_line(struct proxy *px, struct field *line, int len,
 				if (index)
 					return 0;
 				continue;
+			}
 		}
 		line[i] = field;
 		if (index)
@@ -844,13 +935,16 @@ static int stats_dump_fe_line(struct stconn *sc, struct proxy *px)
 	if ((ctx->flags & STAT_F_BOUND) && !(ctx->type & (1 << STATS_TYPE_FE)))
 		return 0;
 
-	memset(line, 0, sizeof(struct field) * metrics_len[STATS_DOMAIN_PROXY]);
+	memset(line, 0, sizeof(struct field) * stat_cols_len[STATS_DOMAIN_PROXY]);
 
-	if (!stats_fill_fe_line(px, line, ST_I_PX_MAX, NULL))
+	if (!stats_fill_fe_line(px, ctx->flags, line, ST_I_PX_MAX, NULL))
 		return 0;
 
 	list_for_each_entry(mod, &stats_module_list[STATS_DOMAIN_PROXY], list) {
 		void *counters;
+
+		if (ctx->flags & STAT_F_FMT_FILE)
+			continue;
 
 		if (!(stats_px_get_cap(mod->domain_flags) & STATS_PX_CAP_FE)) {
 			stats_count += mod->stats_count;
@@ -875,7 +969,7 @@ static int stats_dump_fe_line(struct stconn *sc, struct proxy *px)
 int stats_fill_li_line(struct proxy *px, struct listener *l, int flags,
                        struct field *line, int len, enum stat_idx_px *selected_field)
 {
-	enum stat_idx_px current_field = (selected_field != NULL ? *selected_field : 0);
+	enum stat_idx_px i = (selected_field != NULL ? *selected_field : 0);
 	struct buffer *out = get_trash_chunk();
 
 	if (len < ST_I_PX_MAX)
@@ -886,10 +980,17 @@ int stats_fill_li_line(struct proxy *px, struct listener *l, int flags,
 
 	chunk_reset(out);
 
-	for (; current_field < ST_I_PX_MAX; current_field++) {
+	for (; i < ST_I_PX_MAX; i++) {
+		const struct stat_col *col = &stat_cols_px[i];
 		struct field field = { 0 };
 
-		switch (current_field) {
+		if (stcol_is_generic(col)) {
+			field = me_generate_field(col, i, &l->obj_type,
+			                          l->counters, STATS_PX_CAP_LI,
+			                          flags & STAT_F_FMT_FILE);
+		}
+		else if (!(flags & STAT_F_FMT_FILE)) {
+			switch (i) {
 			case ST_I_PX_PXNAME:
 				field = mkf_str(FO_KEY|FN_NAME|FS_SERVICE, px->id);
 				break;
@@ -908,30 +1009,6 @@ int stats_fill_li_line(struct proxy *px, struct listener *l, int flags,
 			case ST_I_PX_SLIM:
 				field = mkf_u32(FO_CONFIG|FN_LIMIT, l->bind_conf->maxconn);
 				break;
-			case ST_I_PX_STOT:
-				field = mkf_u64(FN_COUNTER, l->counters->cum_sess);
-				break;
-			case ST_I_PX_BIN:
-				field = mkf_u64(FN_COUNTER, l->counters->bytes_in);
-				break;
-			case ST_I_PX_BOUT:
-				field = mkf_u64(FN_COUNTER, l->counters->bytes_out);
-				break;
-			case ST_I_PX_DREQ:
-				field = mkf_u64(FN_COUNTER, l->counters->denied_req);
-				break;
-			case ST_I_PX_DRESP:
-				field = mkf_u64(FN_COUNTER, l->counters->denied_resp);
-				break;
-			case ST_I_PX_EREQ:
-				field = mkf_u64(FN_COUNTER, l->counters->failed_req);
-				break;
-			case ST_I_PX_DCON:
-				field = mkf_u64(FN_COUNTER, l->counters->denied_conn);
-				break;
-			case ST_I_PX_DSES:
-				field = mkf_u64(FN_COUNTER, l->counters->denied_sess);
-				break;
 			case ST_I_PX_STATUS:
 				field = mkf_str(FO_STATUS, li_status_st[get_li_status(l)]);
 				break;
@@ -946,15 +1023,6 @@ int stats_fill_li_line(struct proxy *px, struct listener *l, int flags,
 				break;
 			case ST_I_PX_TYPE:
 				field = mkf_u32(FO_CONFIG|FS_SERVICE, STATS_TYPE_SO);
-				break;
-			case ST_I_PX_CONN_TOT:
-				field = mkf_u64(FN_COUNTER, l->counters->cum_conn);
-				break;
-			case ST_I_PX_WREW:
-				field = mkf_u64(FN_COUNTER, l->counters->failed_rewrites);
-				break;
-			case ST_I_PX_EINT:
-				field = mkf_u64(FN_COUNTER, l->counters->internal_errors);
 				break;
 			case ST_I_PX_ADDR:
 				if (flags & STAT_F_SHLGNDS) {
@@ -993,8 +1061,9 @@ int stats_fill_li_line(struct proxy *px, struct listener *l, int flags,
 				if (selected_field != NULL)
 					return 0;
 				continue;
+			}
 		}
-		line[current_field] = field;
+		line[i] = field;
 		if (selected_field != NULL)
 			break;
 	}
@@ -1014,7 +1083,7 @@ static int stats_dump_li_line(struct stconn *sc, struct proxy *px, struct listen
 	struct stats_module *mod;
 	size_t stats_count = ST_I_PX_MAX;
 
-	memset(line, 0, sizeof(struct field) * metrics_len[STATS_DOMAIN_PROXY]);
+	memset(line, 0, sizeof(struct field) * stat_cols_len[STATS_DOMAIN_PROXY]);
 
 	if (!stats_fill_li_line(px, l, ctx->flags, line,
 	                        ST_I_PX_MAX, NULL))
@@ -1022,6 +1091,9 @@ static int stats_dump_li_line(struct stconn *sc, struct proxy *px, struct listen
 
 	list_for_each_entry(mod, &stats_module_list[STATS_DOMAIN_PROXY], list) {
 		void *counters;
+
+		if (ctx->flags & STAT_F_FMT_FILE)
+			continue;
 
 		if (!(stats_px_get_cap(mod->domain_flags) & STATS_PX_CAP_LI)) {
 			stats_count += mod->stats_count;
@@ -1162,9 +1234,16 @@ int stats_fill_sv_line(struct proxy *px, struct server *sv, int flags,
 	}
 
 	for (; i < ST_I_PX_MAX; i++) {
+		const struct stat_col *col = &stat_cols_px[i];
 		struct field field = { 0 };
 
-		switch (i) {
+		if (stcol_is_generic(col)) {
+			field = me_generate_field(col, i, &sv->obj_type,
+			                          &sv->counters, STATS_PX_CAP_SRV,
+			                          flags & STAT_F_FMT_FILE);
+		}
+		else if (!(flags & STAT_F_FMT_FILE)) {
+			switch (i) {
 			case ST_I_PX_PXNAME:
 				field = mkf_str(FO_KEY|FN_NAME|FS_SERVICE, px->id);
 				break;
@@ -1196,42 +1275,6 @@ int stats_fill_sv_line(struct proxy *px, struct server *sv, int flags,
 			case ST_I_PX_SRV_ILIM:
 				if (sv->max_idle_conns != -1)
 					field = mkf_u32(FO_CONFIG|FN_LIMIT, sv->max_idle_conns);
-				break;
-			case ST_I_PX_STOT:
-				field = mkf_u64(FN_COUNTER, sv->counters.cum_sess);
-				break;
-			case ST_I_PX_BIN:
-				field = mkf_u64(FN_COUNTER, sv->counters.bytes_in);
-				break;
-			case ST_I_PX_BOUT:
-				field = mkf_u64(FN_COUNTER, sv->counters.bytes_out);
-				break;
-			case ST_I_PX_DRESP:
-				field = mkf_u64(FN_COUNTER, sv->counters.denied_resp);
-				break;
-			case ST_I_PX_ECON:
-				field = mkf_u64(FN_COUNTER, sv->counters.failed_conns);
-				break;
-			case ST_I_PX_ERESP:
-				field = mkf_u64(FN_COUNTER, sv->counters.failed_resp);
-				break;
-			case ST_I_PX_WRETR:
-				field = mkf_u64(FN_COUNTER, sv->counters.retries);
-				break;
-			case ST_I_PX_WREDIS:
-				field = mkf_u64(FN_COUNTER, sv->counters.redispatches);
-				break;
-			case ST_I_PX_WREW:
-				field = mkf_u64(FN_COUNTER, sv->counters.failed_rewrites);
-				break;
-			case ST_I_PX_EINT:
-				field = mkf_u64(FN_COUNTER, sv->counters.internal_errors);
-				break;
-			case ST_I_PX_CONNECT:
-				field = mkf_u64(FN_COUNTER, sv->counters.connect);
-				break;
-			case ST_I_PX_REUSE:
-				field = mkf_u64(FN_COUNTER, sv->counters.reuse);
 				break;
 			case ST_I_PX_IDLE_CONN_CUR:
 				field = mkf_u32(0, sv->curr_idle_nb);
@@ -1276,14 +1319,6 @@ int stats_fill_sv_line(struct proxy *px, struct server *sv, int flags,
 			case ST_I_PX_BCK:
 				field = mkf_u32(FO_STATUS, (sv->flags & SRV_F_BACKUP) ? 1 : 0);
 				break;
-			case ST_I_PX_CHKFAIL:
-				if (sv->check.state & CHK_ST_ENABLED)
-					field = mkf_u64(FN_COUNTER, sv->counters.failed_checks);
-				break;
-			case ST_I_PX_CHKDOWN:
-				if (sv->check.state & CHK_ST_ENABLED)
-					field = mkf_u64(FN_COUNTER, sv->counters.down_trans);
-				break;
 			case ST_I_PX_DOWNTIME:
 				if (sv->check.state & CHK_ST_ENABLED)
 					field = mkf_u32(FN_COUNTER, srv_downtime(sv));
@@ -1307,9 +1342,6 @@ int stats_fill_sv_line(struct proxy *px, struct server *sv, int flags,
 			case ST_I_PX_THROTTLE:
 				if (sv->cur_state == SRV_ST_STARTING && !server_is_draining(sv))
 					field = mkf_u32(FN_AVG, server_throttle_rate(sv));
-				break;
-			case ST_I_PX_LBTOT:
-				field = mkf_u64(FN_COUNTER, sv->counters.cum_lbconn);
 				break;
 			case ST_I_PX_TRACKED:
 				if (sv->track) {
@@ -1414,40 +1446,6 @@ int stats_fill_sv_line(struct proxy *px, struct server *sv, int flags,
 				if (px->mode == PR_MODE_HTTP)
 					field = mkf_u64(FN_COUNTER, sv->counters.p.http.cum_req);
 				break;
-			case ST_I_PX_HRSP_1XX:
-				if (px->mode == PR_MODE_HTTP)
-					field = mkf_u64(FN_COUNTER, sv->counters.p.http.rsp[1]);
-				break;
-			case ST_I_PX_HRSP_2XX:
-				if (px->mode == PR_MODE_HTTP)
-					field = mkf_u64(FN_COUNTER, sv->counters.p.http.rsp[2]);
-				break;
-			case ST_I_PX_HRSP_3XX:
-				if (px->mode == PR_MODE_HTTP)
-					field = mkf_u64(FN_COUNTER, sv->counters.p.http.rsp[3]);
-				break;
-			case ST_I_PX_HRSP_4XX:
-				if (px->mode == PR_MODE_HTTP)
-					field = mkf_u64(FN_COUNTER, sv->counters.p.http.rsp[4]);
-				break;
-			case ST_I_PX_HRSP_5XX:
-				if (px->mode == PR_MODE_HTTP)
-					field = mkf_u64(FN_COUNTER, sv->counters.p.http.rsp[5]);
-				break;
-			case ST_I_PX_HRSP_OTHER:
-				if (px->mode == PR_MODE_HTTP)
-					field = mkf_u64(FN_COUNTER, sv->counters.p.http.rsp[0]);
-				break;
-			case ST_I_PX_HANAFAIL:
-				if (ref->observe)
-					field = mkf_u64(FN_COUNTER, sv->counters.failed_hana);
-				break;
-			case ST_I_PX_CLI_ABRT:
-				field = mkf_u64(FN_COUNTER, sv->counters.cli_aborts);
-				break;
-			case ST_I_PX_SRV_ABRT:
-				field = mkf_u64(FN_COUNTER, sv->counters.srv_aborts);
-				break;
 			case ST_I_PX_LASTSESS:
 				field = mkf_s32(FN_AGE, srv_lastsession(sv));
 				break;
@@ -1509,6 +1507,7 @@ int stats_fill_sv_line(struct proxy *px, struct server *sv, int flags,
 				if (index)
 					return 0;
 				continue;
+			}
 		}
 		line[i] = field;
 		if (index)
@@ -1530,7 +1529,7 @@ static int stats_dump_sv_line(struct stconn *sc, struct proxy *px, struct server
 	struct field *line = stat_lines[STATS_DOMAIN_PROXY];
 	size_t stats_count = ST_I_PX_MAX;
 
-	memset(line, 0, sizeof(struct field) * metrics_len[STATS_DOMAIN_PROXY]);
+	memset(line, 0, sizeof(struct field) * stat_cols_len[STATS_DOMAIN_PROXY]);
 
 	if (!stats_fill_sv_line(px, sv, ctx->flags, line,
 	                        ST_I_PX_MAX, NULL))
@@ -1538,6 +1537,9 @@ static int stats_dump_sv_line(struct stconn *sc, struct proxy *px, struct server
 
 	list_for_each_entry(mod, &stats_module_list[STATS_DOMAIN_PROXY], list) {
 		void *counters;
+
+		if (ctx->flags & STAT_F_FMT_FILE)
+			continue;
 
 		if (stats_get_domain(mod->domain_flags) != STATS_DOMAIN_PROXY)
 			continue;
@@ -1622,9 +1624,16 @@ int stats_fill_be_line(struct proxy *px, int flags, struct field *line, int len,
 	}
 
 	for (; i < ST_I_PX_MAX; i++) {
+		const struct stat_col *col = &stat_cols_px[i];
 		struct field field = { 0 };
 
-		switch (i) {
+		if (stcol_is_generic(col)) {
+			field = me_generate_field(col, i, &px->obj_type,
+			                          &px->be_counters, STATS_PX_CAP_BE,
+			                          flags & STAT_F_FMT_FILE);
+		}
+		else if (!(flags & STAT_F_FMT_FILE)) {
+			switch (i) {
 			case ST_I_PX_PXNAME:
 				field = mkf_str(FO_KEY|FN_NAME|FS_SERVICE, px->id);
 				break;
@@ -1648,45 +1657,6 @@ int stats_fill_be_line(struct proxy *px, int flags, struct field *line, int len,
 				break;
 			case ST_I_PX_SLIM:
 				field = mkf_u32(FO_CONFIG|FN_LIMIT, px->fullconn);
-				break;
-			case ST_I_PX_STOT:
-				field = mkf_u64(FN_COUNTER, px->be_counters.cum_sess);
-				break;
-			case ST_I_PX_BIN:
-				field = mkf_u64(FN_COUNTER, px->be_counters.bytes_in);
-				break;
-			case ST_I_PX_BOUT:
-				field = mkf_u64(FN_COUNTER, px->be_counters.bytes_out);
-				break;
-			case ST_I_PX_DREQ:
-				field = mkf_u64(FN_COUNTER, px->be_counters.denied_req);
-				break;
-			case ST_I_PX_DRESP:
-				field = mkf_u64(FN_COUNTER, px->be_counters.denied_resp);
-				break;
-			case ST_I_PX_ECON:
-				field = mkf_u64(FN_COUNTER, px->be_counters.failed_conns);
-				break;
-			case ST_I_PX_ERESP:
-				field = mkf_u64(FN_COUNTER, px->be_counters.failed_resp);
-				break;
-			case ST_I_PX_WRETR:
-				field = mkf_u64(FN_COUNTER, px->be_counters.retries);
-				break;
-			case ST_I_PX_WREDIS:
-				field = mkf_u64(FN_COUNTER, px->be_counters.redispatches);
-				break;
-			case ST_I_PX_WREW:
-				field = mkf_u64(FN_COUNTER, px->be_counters.failed_rewrites);
-				break;
-			case ST_I_PX_EINT:
-				field = mkf_u64(FN_COUNTER, px->be_counters.internal_errors);
-				break;
-			case ST_I_PX_CONNECT:
-				field = mkf_u64(FN_COUNTER, px->be_counters.connect);
-				break;
-			case ST_I_PX_REUSE:
-				field = mkf_u64(FN_COUNTER, px->be_counters.reuse);
 				break;
 			case ST_I_PX_STATUS:
 				fld = chunk_newstr(out);
@@ -1714,9 +1684,6 @@ int stats_fill_be_line(struct proxy *px, int flags, struct field *line, int len,
 			case ST_I_PX_BCK:
 				field = mkf_u32(0, px->srv_bck);
 				break;
-			case ST_I_PX_CHKDOWN:
-				field = mkf_u64(FN_COUNTER, px->be_counters.down_trans);
-				break;
 			case ST_I_PX_LASTCHG:
 				field = mkf_u32(FN_AGE, ns_to_sec(now_ns) - px->last_change);
 				break;
@@ -1732,9 +1699,6 @@ int stats_fill_be_line(struct proxy *px, int flags, struct field *line, int len,
 				break;
 			case ST_I_PX_SID:
 				field = mkf_u32(FO_KEY|FS_SERVICE, 0);
-				break;
-			case ST_I_PX_LBTOT:
-				field = mkf_u64(FN_COUNTER, px->be_counters.cum_lbconn);
 				break;
 			case ST_I_PX_TYPE:
 				field = mkf_u32(FO_CONFIG|FS_SERVICE, STATS_TYPE_BE);
@@ -1756,56 +1720,6 @@ int stats_fill_be_line(struct proxy *px, int flags, struct field *line, int len,
 			case ST_I_PX_REQ_TOT:
 				if (px->mode == PR_MODE_HTTP)
 					field = mkf_u64(FN_COUNTER, px->be_counters.p.http.cum_req);
-				break;
-			case ST_I_PX_HRSP_1XX:
-				if (px->mode == PR_MODE_HTTP)
-					field = mkf_u64(FN_COUNTER, px->be_counters.p.http.rsp[1]);
-				break;
-			case ST_I_PX_HRSP_2XX:
-				if (px->mode == PR_MODE_HTTP)
-					field = mkf_u64(FN_COUNTER, px->be_counters.p.http.rsp[2]);
-				break;
-			case ST_I_PX_HRSP_3XX:
-				if (px->mode == PR_MODE_HTTP)
-					field = mkf_u64(FN_COUNTER, px->be_counters.p.http.rsp[3]);
-				break;
-			case ST_I_PX_HRSP_4XX:
-				if (px->mode == PR_MODE_HTTP)
-					field = mkf_u64(FN_COUNTER, px->be_counters.p.http.rsp[4]);
-				break;
-			case ST_I_PX_HRSP_5XX:
-				if (px->mode == PR_MODE_HTTP)
-					field = mkf_u64(FN_COUNTER, px->be_counters.p.http.rsp[5]);
-				break;
-			case ST_I_PX_HRSP_OTHER:
-				if (px->mode == PR_MODE_HTTP)
-					field = mkf_u64(FN_COUNTER, px->be_counters.p.http.rsp[0]);
-				break;
-			case ST_I_PX_CACHE_LOOKUPS:
-				if (px->mode == PR_MODE_HTTP)
-					field = mkf_u64(FN_COUNTER, px->be_counters.p.http.cache_lookups);
-				break;
-			case ST_I_PX_CACHE_HITS:
-				if (px->mode == PR_MODE_HTTP)
-					field = mkf_u64(FN_COUNTER, px->be_counters.p.http.cache_hits);
-				break;
-			case ST_I_PX_CLI_ABRT:
-				field = mkf_u64(FN_COUNTER, px->be_counters.cli_aborts);
-				break;
-			case ST_I_PX_SRV_ABRT:
-				field = mkf_u64(FN_COUNTER, px->be_counters.srv_aborts);
-				break;
-			case ST_I_PX_COMP_IN:
-				field = mkf_u64(FN_COUNTER, px->be_counters.comp_in[COMP_DIR_RES]);
-				break;
-			case ST_I_PX_COMP_OUT:
-				field = mkf_u64(FN_COUNTER, px->be_counters.comp_out[COMP_DIR_RES]);
-				break;
-			case ST_I_PX_COMP_BYP:
-				field = mkf_u64(FN_COUNTER, px->be_counters.comp_byp[COMP_DIR_RES]);
-				break;
-			case ST_I_PX_COMP_RSP:
-				field = mkf_u64(FN_COUNTER, px->be_counters.p.http.comp_rsp);
 				break;
 			case ST_I_PX_LASTSESS:
 				field = mkf_s32(FN_AGE, be_lastsession(px));
@@ -1841,6 +1755,7 @@ int stats_fill_be_line(struct proxy *px, int flags, struct field *line, int len,
 				if (index)
 					return 0;
 				continue;
+			}
 		}
 		line[i] = field;
 		if (index)
@@ -1867,13 +1782,16 @@ static int stats_dump_be_line(struct stconn *sc, struct proxy *px)
 	if ((ctx->flags & STAT_F_BOUND) && !(ctx->type & (1 << STATS_TYPE_BE)))
 		return 0;
 
-	memset(line, 0, sizeof(struct field) * metrics_len[STATS_DOMAIN_PROXY]);
+	memset(line, 0, sizeof(struct field) * stat_cols_len[STATS_DOMAIN_PROXY]);
 
 	if (!stats_fill_be_line(px, ctx->flags, line, ST_I_PX_MAX, NULL))
 		return 0;
 
 	list_for_each_entry(mod, &stats_module_list[STATS_DOMAIN_PROXY], list) {
 		struct extra_counters *counters;
+
+		if (ctx->flags & STAT_F_FMT_FILE)
+			continue;
 
 		if (stats_get_domain(mod->domain_flags) != STATS_DOMAIN_PROXY)
 			continue;
@@ -2198,6 +2116,8 @@ int stats_dump_stat_to_buffer(struct stconn *sc, struct buffer *buf, struct htx 
 			stats_dump_json_schema(chk);
 		else if (ctx->flags & STAT_F_FMT_JSON)
 			stats_dump_json_header(chk);
+		else if (ctx->flags & STAT_F_FMT_FILE)
+			stats_dump_file_header(ctx->type, chk);
 		else if (!(ctx->flags & STAT_F_FMT_TYPED))
 			stats_dump_csv_header(ctx->domain, chk);
 
@@ -2230,7 +2150,7 @@ int stats_dump_stat_to_buffer(struct stconn *sc, struct buffer *buf, struct htx 
 		switch (domain) {
 		case STATS_DOMAIN_RESOLVERS:
 			if (!stats_dump_resolvers(sc, stat_lines[domain],
-			                          metrics_len[domain],
+			                          stat_cols_len[domain],
 			                          &stats_module_list[domain])) {
 				return 0;
 			}
@@ -2286,11 +2206,11 @@ static int stats_dump_info_fields(struct buffer *out,
 		if (!field_format(line, i))
 			continue;
 
-		if (!chunk_appendf(out, "%s: ", metrics_info[i].name))
+		if (!chunk_appendf(out, "%s: ", stat_cols_info[i].name))
 			return 0;
 		if (!stats_emit_raw_data_field(out, &line[i]))
 			return 0;
-		if ((flags & STAT_F_SHOW_FDESC) && !chunk_appendf(out, ":\"%s\"", metrics_info[i].desc))
+		if ((flags & STAT_F_SHOW_FDESC) && !chunk_appendf(out, ":\"%s\"", stat_cols_info[i].desc))
 			return 0;
 		if (!chunk_strcat(out, "\n"))
 			return 0;
@@ -2310,7 +2230,7 @@ static int stats_dump_typed_info_fields(struct buffer *out,
 		if (!field_format(line, i))
 			continue;
 
-		if (!chunk_appendf(out, "%d.%s.%u:", i, metrics_info[i].name,
+		if (!chunk_appendf(out, "%d.%s.%u:", i, stat_cols_info[i].name,
 		                   line[ST_I_INF_PROCESS_NUM].u.u32)) {
 			return 0;
 		}
@@ -2318,7 +2238,7 @@ static int stats_dump_typed_info_fields(struct buffer *out,
 			return 0;
 		if (!stats_emit_typed_data_field(out, &line[i]))
 			return 0;
-		if ((flags & STAT_F_SHOW_FDESC) && !chunk_appendf(out, ":\"%s\"", metrics_info[i].desc))
+		if ((flags & STAT_F_SHOW_FDESC) && !chunk_appendf(out, ":\"%s\"", stat_cols_info[i].desc))
 			return 0;
 		if (!chunk_strcat(out, "\n"))
 			return 0;
@@ -2739,6 +2659,56 @@ static int cli_io_handler_dump_json_schema(struct appctx *appctx)
 	return stats_dump_json_schema_to_buffer(appctx);
 }
 
+static int cli_parse_dump_stat_file(char **args, char *payload,
+                                    struct appctx *appctx, void *private)
+{
+	struct show_stat_ctx *ctx = applet_reserve_svcctx(appctx, sizeof(*ctx));
+
+	ctx->chunk = b_make(trash.area, trash.size, 0, 0);
+	ctx->domain = STATS_DOMAIN_PROXY;
+	ctx->flags |= STAT_F_FMT_FILE;
+
+	return 0;
+}
+
+/* Returns 1 on completion else 0. */
+static int cli_io_handler_dump_stat_file(struct appctx *appctx)
+{
+	struct show_stat_ctx *ctx = appctx->svcctx;
+	int ret;
+
+	/* Frontend and backend sides are ouputted separatedly on stats-file.
+	 * As such, use STAT_F_BOUND to restrict proxies looping over frontend
+	 * side first before first stats_dump_stat_to_buffer(). A second
+	 * iteration is conducted for backend side after.
+	 */
+	ctx->flags |= STAT_F_BOUND;
+
+	if (!(ctx->type & (1 << STATS_TYPE_BE))) {
+		/* Restrict to frontend side. */
+		ctx->type = (1 << STATS_TYPE_FE) | (1 << STATS_TYPE_SO);
+		ctx->iid = ctx->sid = -1;
+
+		ret = stats_dump_stat_to_buffer(appctx_sc(appctx), NULL, NULL);
+		if (!ret)
+			return 0;
+
+		chunk_strcat(&ctx->chunk, "\n");
+		if (!stats_putchk(appctx, NULL, NULL))
+			return 0;
+
+		/* Switch to backend side. */
+		ctx->state = STAT_STATE_INIT;
+		ctx->type = (1 << STATS_TYPE_BE) | (1 << STATS_TYPE_SV);
+	}
+
+	return stats_dump_stat_to_buffer(appctx_sc(appctx), NULL, NULL);
+}
+
+static void cli_io_handler_release_dump_stat_file(struct appctx *appctx)
+{
+}
+
 int stats_allocate_proxy_counters_internal(struct extra_counters **counters,
                                            int type, int px_cap)
 {
@@ -2816,34 +2786,35 @@ void stats_register_module(struct stats_module *m)
 	const uint8_t domain = stats_get_domain(m->domain_flags);
 
 	LIST_APPEND(&stats_module_list[domain], &m->list);
-	metrics_len[domain] += m->stats_count;
+	stat_cols_len[domain] += m->stats_count;
 }
 
 
 static int allocate_stats_px_postcheck(void)
 {
 	struct stats_module *mod;
-	size_t i = ST_I_PX_MAX;
+	size_t i = ST_I_PX_MAX, offset;
 	int err_code = 0;
 	struct proxy *px;
 
-	metrics_len[STATS_DOMAIN_PROXY] += ST_I_PX_MAX;
+	stat_cols_len[STATS_DOMAIN_PROXY] += ST_I_PX_MAX;
 
-	metrics[STATS_DOMAIN_PROXY] = malloc(metrics_len[STATS_DOMAIN_PROXY] * sizeof(struct name_desc));
-	if (!metrics[STATS_DOMAIN_PROXY]) {
+	stat_cols[STATS_DOMAIN_PROXY] = malloc(stat_cols_len[STATS_DOMAIN_PROXY] * sizeof(struct name_desc));
+	if (!stat_cols[STATS_DOMAIN_PROXY]) {
 		ha_alert("stats: cannot allocate all fields for proxy statistics\n");
 		err_code |= ERR_ALERT | ERR_FATAL;
 		return err_code;
 	}
 
-	memcpy(metrics[STATS_DOMAIN_PROXY], metrics_px,
-	       ST_I_PX_MAX * sizeof(struct name_desc));
+	for (i = 0; i < ST_I_PX_MAX; ++i)
+		stcol2ndesc(&stat_cols[STATS_DOMAIN_PROXY][i], &stat_cols_px[i]);
 
 	list_for_each_entry(mod, &stats_module_list[STATS_DOMAIN_PROXY], list) {
-		memcpy(metrics[STATS_DOMAIN_PROXY] + i,
-		       mod->stats,
-		       mod->stats_count * sizeof(struct name_desc));
-		i += mod->stats_count;
+		for (offset = i, i = 0; i < mod->stats_count; ++i) {
+			stcol2ndesc(&stat_cols[STATS_DOMAIN_PROXY][offset + i],
+			            &mod->stats[i]);
+		}
+		i += offset;
 	}
 
 	for (px = proxies_list; px; px = px->next) {
@@ -2864,21 +2835,22 @@ REGISTER_CONFIG_POSTPARSER("allocate-stats-px", allocate_stats_px_postcheck);
 static int allocate_stats_rslv_postcheck(void)
 {
 	struct stats_module *mod;
-	size_t i = 0;
+	size_t i = 0, offset;
 	int err_code = 0;
 
-	metrics[STATS_DOMAIN_RESOLVERS] = malloc(metrics_len[STATS_DOMAIN_RESOLVERS] * sizeof(struct name_desc));
-	if (!metrics[STATS_DOMAIN_RESOLVERS]) {
+	stat_cols[STATS_DOMAIN_RESOLVERS] = malloc(stat_cols_len[STATS_DOMAIN_RESOLVERS] * sizeof(struct name_desc));
+	if (!stat_cols[STATS_DOMAIN_RESOLVERS]) {
 		ha_alert("stats: cannot allocate all fields for resolver statistics\n");
 		err_code |= ERR_ALERT | ERR_FATAL;
 		return err_code;
 	}
 
 	list_for_each_entry(mod, &stats_module_list[STATS_DOMAIN_RESOLVERS], list) {
-		memcpy(metrics[STATS_DOMAIN_RESOLVERS] + i,
-		       mod->stats,
-		       mod->stats_count * sizeof(struct name_desc));
-		i += mod->stats_count;
+		for (offset = i, i = 0; i < mod->stats_count; ++i) {
+			stcol2ndesc(&stat_cols[STATS_DOMAIN_RESOLVERS][offset + i],
+			            &mod->stats[i]);
+		}
+		i += offset;
 	}
 
 	if (!resolv_allocate_counters(&stats_module_list[STATS_DOMAIN_RESOLVERS])) {
@@ -2901,7 +2873,7 @@ static int allocate_stat_lines_per_thread(void)
 	for (i = 0; i < STATS_DOMAIN_COUNT; ++i) {
 		const int domain = domains[i];
 
-		stat_lines[domain] = malloc(metrics_len[domain] * sizeof(struct field));
+		stat_lines[domain] = malloc(stat_cols_len[domain] * sizeof(struct field));
 		if (!stat_lines[domain])
 			return 0;
 	}
@@ -2959,8 +2931,8 @@ static void deinit_stats(void)
 	for (i = 0; i < STATS_DOMAIN_COUNT; ++i) {
 		const int domain = domains[i];
 
-		if (metrics[domain])
-			free(metrics[domain]);
+		if (stat_cols[domain])
+			free(stat_cols[domain]);
 	}
 }
 
@@ -2980,6 +2952,7 @@ static struct cli_kw_list cli_kws = {{ },{
 	{ { "show", "info",  NULL },           "show info [desc|json|typed|float]*      : report information about the running process",    cli_parse_show_info, cli_io_handler_dump_info, NULL },
 	{ { "show", "stat",  NULL },           "show stat [desc|json|no-maint|typed|up]*: report counters for each proxy and server",       cli_parse_show_stat, cli_io_handler_dump_stat, cli_io_handler_release_stat },
 	{ { "show", "schema",  "json", NULL }, "show schema json                        : report schema used for stats",                    NULL, cli_io_handler_dump_json_schema, NULL },
+	{ { "dump", "stats-file", NULL },      "dump stats-file                         : dump stats for restore",                          cli_parse_dump_stat_file, cli_io_handler_dump_stat_file, cli_io_handler_release_dump_stat_file },
 	{{},}
 }};
 

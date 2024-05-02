@@ -34,6 +34,102 @@
 #include <haproxy/stick_table-t.h>
 #include <haproxy/thread-t.h>
 
+/* peer state with respects of its applet, as seen from outside */
+enum peer_app_state {
+	PEER_APP_ST_STOPPED = 0, /* The peer has no applet */
+	PEER_APP_ST_STARTING,    /* The peer has an applet with a validated connection but sync task must ack it first */
+	PEER_APP_ST_RUNNING,     /* The starting state was processed by the sync task and the peer can process messages */
+	PEER_APP_ST_STOPPING,    /* The peer applet was released but the sync task must ack it before switching the peer in STOPPED state */
+};
+
+/* peer learn state */
+enum peer_learn_state {
+	PEER_LR_ST_NOTASSIGNED = 0,/* The peer is not assigned for a leason */
+	PEER_LR_ST_ASSIGNED,       /* The peer is assigned for a leason  */
+	PEER_LR_ST_PROCESSING,     /* The peer has started the leason and it is not finished */
+	PEER_LR_ST_FINISHED,       /* The peer has finished the leason, this state must be ack by the sync task */
+};
+
+/******************************/
+/* peers section resync flags */
+/******************************/
+#define PEERS_F_RESYNC_LOCAL_FINISHED     0x00000001 /* Learn from local peer finished or no more needed */
+#define PEERS_F_RESYNC_REMOTE_FINISHED    0x00000002 /* Learn from remote peer finished or no more needed */
+#define PEERS_F_RESYNC_ASSIGN             0x00000004 /* A peer was assigned to learn our lesson */
+/* unsued 0x00000008..0x00080000 */
+#define PEERS_F_DBG_RESYNC_LOCALTIMEOUT   0x00100000 /* Timeout waiting for a full resync from a local node was experienced at lest once (for debugging purpose) */
+#define PEERS_F_DBG_RESYNC_REMOTETIMEOUT  0x00200000 /* Timeout waiting for a full resync from a remote node was experienced at lest once (for debugging purpose) */
+#define PEERS_F_DBG_RESYNC_LOCALABORT     0x00400000 /* Session aborted learning from a local node was experienced at lest once (for debugging purpose) */
+#define PEERS_F_DBG_RESYNC_REMOTEABORT    0x00800000 /* Session aborted learning from a remote node was experienced at lest once (for debugging purpose) */
+#define PEERS_F_DBG_RESYNC_LOCALFINISHED  0x01000000 /* A fully up to date local node teach us at lest once (for debugging purpose) */
+#define PEERS_F_DBG_RESYNC_REMOTEFINISHED 0x02000000 /* A fully up to remote node teach us at lest once (for debugging purpose) */
+#define PEERS_F_DBG_RESYNC_LOCALPARTIAL   0x04000000 /* A partially up to date local node teach us at lest once (for debugging purpose) */
+#define PEERS_F_DBG_RESYNC_REMOTEPARTIAL  0x08000000 /* A partially up to date remote node teach us at lest once (for debugging purpose) */
+#define PEERS_F_DBG_RESYNC_LOCALASSIGN    0x10000000 /* A local node was assigned for a full resync at lest once (for debugging purpose) */
+#define PEERS_F_DBG_RESYNC_REMOTEASSIGN   0x20000000 /* A remote node was assigned for a full resync at lest once (for debugging purpose) */
+
+#define PEERS_RESYNC_FROMLOCAL      0x00000000                     /* No resync finished, must be performed from local first */
+#define PEERS_RESYNC_FROMREMOTE     PEERS_F_RESYNC_LOCAL_FINISHED  /* Resync from local peer finished, must be performed from remote peer now */
+#define PEERS_RESYNC_STATEMASK      (PEERS_F_RESYNC_LOCAL_FINISHED|PEERS_F_RESYNC_REMOTE_FINISHED)
+#define PEERS_RESYNC_FINISHED       (PEERS_F_RESYNC_LOCAL_FINISHED|PEERS_F_RESYNC_REMOTE_FINISHED)
+
+/* This function is used to report flags in debugging tools. Please reflect
+ * below any single-bit flag addition above in the same order via the
+ * __APPEND_FLAG macro. The new end of the buffer is returned.
+ */
+static forceinline char *peers_show_flags(char *buf, size_t len, const char *delim, uint flg)
+{
+#define _(f, ...) __APPEND_FLAG(buf, len, delim, flg, f, #f, __VA_ARGS__)
+	/* prologue */
+	_(0);
+	/* flags */
+	_(PEERS_F_RESYNC_LOCAL_FINISHED, _(PEERS_F_RESYNC_REMOTE_FINISHED, _(PEERS_F_RESYNC_ASSIGN,
+        _(PEERS_F_DBG_RESYNC_LOCALTIMEOUT, _(PEERS_F_DBG_RESYNC_REMOTETIMEOUT,
+        _(PEERS_F_DBG_RESYNC_LOCALABORT, _(PEERS_F_DBG_RESYNC_REMOTEABORT,
+	_(PEERS_F_DBG_RESYNC_LOCALFINISHED, _(PEERS_F_DBG_RESYNC_REMOTEFINISHED,
+	_(PEERS_F_DBG_RESYNC_LOCALPARTIAL, _(PEERS_F_DBG_RESYNC_REMOTEPARTIAL,
+	_(PEERS_F_DBG_RESYNC_LOCALASSIGN, _(PEERS_F_DBG_RESYNC_REMOTEABORT)))))))))))));
+	/* epilogue */
+	_(~0U);
+	return buf;
+#undef _
+}
+
+/******************************/
+/* Peer flags                 */
+/******************************/
+#define PEER_F_TEACH_PROCESS        0x00000001 /* Teach a lesson to current peer */
+#define PEER_F_TEACH_FINISHED       0x00000002 /* Teach conclude, (wait for confirm) */
+#define PEER_F_LOCAL_TEACH_COMPLETE 0x00000004 /* The old local peer taught all that it known to new one */
+#define PEER_F_LEARN_NOTUP2DATE     0x00000008 /* Learn from peer finished but peer is not up to date */
+#define PEER_F_WAIT_SYNCTASK_ACK    0x00000010 /* Stop all processing waiting for the sync task acknowledgement when the applet state changes */
+#define PEER_F_ALIVE                0x00000020 /* Used to flag a peer a alive. */
+#define PEER_F_HEARTBEAT            0x00000040 /* Heartbeat message to send. */
+#define PEER_F_DWNGRD               0x00000080 /* When this flag is enabled, we must downgrade the supported version announced during peer sessions. */
+/* unused 0x00000100..0x00080000 */
+#define PEER_F_DBG_RESYNC_REQUESTED 0x00100000 /* A resnyc was explicitly requested at least once (for debugging purpose) */
+
+#define PEER_TEACH_FLAGS            (PEER_F_TEACH_PROCESS|PEER_F_TEACH_FINISHED)
+
+/* This function is used to report flags in debugging tools. Please reflect
+ * below any single-bit flag addition above in the same order via the
+ * __APPEND_FLAG macro. The new end of the buffer is returned.
+ */
+static forceinline char *peer_show_flags(char *buf, size_t len, const char *delim, uint flg)
+{
+#define _(f, ...) __APPEND_FLAG(buf, len, delim, flg, f, #f, __VA_ARGS__)
+	/* prologue */
+	_(0);
+	/* flags */
+	_(PEER_F_TEACH_PROCESS, _(PEER_F_TEACH_FINISHED, _(PEER_F_LOCAL_TEACH_COMPLETE,
+        _(PEER_F_LEARN_NOTUP2DATE, _(PEER_F_WAIT_SYNCTASK_ACK,
+        _(PEER_F_ALIVE, _(PEER_F_HEARTBEAT, _(PEER_F_DWNGRD,
+	_(PEER_F_DBG_RESYNC_REQUESTED)))))))));
+	/* epilogue */
+	_(~0U);
+	return buf;
+#undef _
+}
 
 struct shared_table {
 	struct stktable *table;       /* stick table to sync */
@@ -52,6 +148,8 @@ struct shared_table {
 
 struct peer {
 	int local;                    /* proxy state */
+	enum peer_app_state appstate;    /* peer app state */
+	enum peer_learn_state learnstate; /* peer learn state */
 	__decl_thread(HA_SPINLOCK_T lock); /* lock used to handle this peer section */
 	char *id;
 	struct {

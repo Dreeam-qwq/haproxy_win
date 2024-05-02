@@ -46,7 +46,7 @@
 #define	MODE_DUMP_NB_L  0x10000 /* dump line numbers when the configuration file is dump */
 
 /* list of last checks to perform, depending on config options */
-/* unused: 0x00000001	*/
+#define LSTCHK_SYSADM	0x00000001	/* check that we have CAP_SYS_ADMIN */
 #define LSTCHK_NETADM	0x00000002	/* check that we have CAP_NET_ADMIN */
 
 /* Global tuning options */
@@ -155,6 +155,7 @@ struct global {
 	char *log_send_hostname;   /* set hostname in syslog header */
 	char *server_state_base;   /* path to a directory where server state files can be found */
 	char *server_state_file;   /* path to the file where server states are loaded from */
+	char *stats_file;          /* path to stats-file */
 	unsigned char cluster_secret[16]; /* 128 bits of an SHA1 digest of a secret defined as ASCII string */
 	struct {
 		int maxpollevents; /* max number of poll events at once */

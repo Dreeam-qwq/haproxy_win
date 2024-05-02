@@ -378,7 +378,7 @@ static int hlua_get_info(lua_State *L)
 
 	lua_newtable(L);
 	for (i=0; i<ST_I_INF_MAX; i++) {
-		lua_pushstring(L, metrics_info[i].name);
+		lua_pushstring(L, stat_cols_info[i].name);
 		hlua_fcn_pushfield(L, &stats[i]);
 		lua_settable(L, -3);
 	}
@@ -1163,7 +1163,7 @@ int hlua_listener_get_stats(lua_State *L)
 
 	lua_newtable(L);
 	for (i=0; i<ST_I_PX_MAX; i++) {
-		lua_pushstring(L, metrics_px[i].name);
+		lua_pushstring(L, stat_cols_px[i].name);
 		hlua_fcn_pushfield(L, &stats[i]);
 		lua_settable(L, -3);
 	}
@@ -1209,7 +1209,7 @@ int hlua_server_get_stats(lua_State *L)
 
 	lua_newtable(L);
 	for (i=0; i<ST_I_PX_MAX; i++) {
-		lua_pushstring(L, metrics_px[i].name);
+		lua_pushstring(L, stat_cols_px[i].name);
 		hlua_fcn_pushfield(L, &stats[i]);
 		lua_settable(L, -3);
 	}
@@ -2054,10 +2054,10 @@ int hlua_proxy_get_stats(lua_State *L)
 	if (px->cap & PR_CAP_BE)
 		stats_fill_be_line(px, STAT_F_SHLGNDS, stats, STATS_LEN, NULL);
 	else
-		stats_fill_fe_line(px, stats, STATS_LEN, NULL);
+		stats_fill_fe_line(px, 0, stats, STATS_LEN, NULL);
 	lua_newtable(L);
 	for (i=0; i<ST_I_PX_MAX; i++) {
-		lua_pushstring(L, metrics_px[i].name);
+		lua_pushstring(L, stat_cols_px[i].name);
 		hlua_fcn_pushfield(L, &stats[i]);
 		lua_settable(L, -3);
 	}

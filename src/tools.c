@@ -2064,6 +2064,164 @@ char *escape_string(char *start, char *stop,
 	return NULL;
 }
 
+/* CBOR helper to encode an uint64 value with prefix (3bits MAJOR type)
+ * according to RFC8949
+ *
+ * CBOR encode ctx is provided in <ctx>
+ *
+ * Returns the position of the last written byte on success and NULL on
+ * error. The function cannot write past <stop>
+ */
+char *cbor_encode_uint64_prefix(struct cbor_encode_ctx *ctx,
+                                char *start, char *stop, uint64_t value,
+                                uint8_t prefix)
+{
+	int nb_bytes = 0;
+
+	/*
+	 * For encoding logic, see:
+	 * https://www.rfc-editor.org/rfc/rfc8949.html#name-specification-of-the-cbor-e
+	 */
+	if (value < 24) {
+		/* argument is the value itself */
+		prefix |= value;
+	}
+	else {
+		if (value <= 0xFFU) {
+			/* 1-byte */
+			nb_bytes = 1;
+			prefix |= 24; // 0x18
+		}
+		else if (value <= 0xFFFFU) {
+			/* 2 bytes */
+			nb_bytes = 2;
+			prefix |= 25; // 0x19
+		}
+		else if (value <= 0xFFFFFFFFU) {
+			/* 4 bytes */
+			nb_bytes = 4;
+			prefix |= 26; // 0x1A
+		}
+		else {
+			/* 8 bytes */
+			nb_bytes = 8;
+			prefix |= 27; // 0x1B
+		}
+	}
+
+	start = ctx->e_fct_byte(ctx, start, stop, prefix);
+	if (start == NULL)
+		return NULL;
+
+	/* encode 1 byte at a time from higher bits to lower bits */
+	while (nb_bytes) {
+		uint8_t cur_byte = (value >> ((nb_bytes - 1) * 8)) & 0xFFU;
+
+		start = ctx->e_fct_byte(ctx, start, stop, cur_byte);
+		if (start == NULL)
+			return NULL;
+
+		nb_bytes--;
+	}
+
+	return start;
+}
+
+/* CBOR helper to encode an int64 value according to RFC8949
+ *
+ * CBOR encode ctx is provided in <ctx>
+ *
+ * Returns the position of the last written byte on success and NULL on
+ * error. The function cannot write past <stop>
+ */
+char *cbor_encode_int64(struct cbor_encode_ctx *ctx,
+                        char *start, char *stop, int64_t value)
+{
+	uint64_t absolute_value = llabs(value);
+	int cbor_prefix;
+
+	/*
+	 * For encoding logic, see:
+	 * https://www.rfc-editor.org/rfc/rfc8949.html#name-specification-of-the-cbor-e
+	 */
+	if (value >= 0)
+		cbor_prefix = 0x00; // unsigned int
+	else {
+		cbor_prefix = 0x20; // negative int
+		/* N-1 for negative int */
+		absolute_value -= 1;
+	}
+	return cbor_encode_uint64_prefix(ctx, start, stop,
+	                                 absolute_value, cbor_prefix);
+}
+
+/* CBOR helper to encode a <prefix> string chunk according to RFC8949
+ *
+ * if <bytes> is NULL, then only the <prefix> (with length) will be
+ * emitted
+ *
+ * CBOR encode ctx is provided in <ctx>
+ *
+ * Returns the position of the last written byte on success and NULL on
+ * error. The function cannot write past <stop>
+ */
+char *cbor_encode_bytes_prefix(struct cbor_encode_ctx *ctx,
+                               char *start, char *stop,
+                               const char *bytes, size_t len,
+                               uint8_t prefix)
+{
+
+	size_t it = 0;
+
+	/* write prefix (with text length as argument) */
+	start = cbor_encode_uint64_prefix(ctx, start, stop,
+	                                  len, prefix);
+	if (start == NULL)
+		return NULL;
+
+	/* write actual bytes if provided */
+	while (bytes && it < len) {
+		start = ctx->e_fct_byte(ctx, start, stop, bytes[it]);
+		if (start == NULL)
+			return NULL;
+		it++;
+	}
+	return start;
+}
+
+/* CBOR helper to encode a text chunk according to RFC8949
+ *
+ * if <text> is NULL, then only the text prefix (with length) will be emitted
+ *
+ * CBOR encode ctx is provided in <ctx>
+ *
+ * Returns the position of the last written byte on success and NULL on
+ * error. The function cannot write past <stop>
+ */
+char *cbor_encode_text(struct cbor_encode_ctx *ctx,
+                       char *start, char *stop,
+                       const char *text, size_t len)
+{
+	return cbor_encode_bytes_prefix(ctx, start, stop, text, len, 0x60);
+}
+
+/* CBOR helper to encode a byte string chunk according to RFC8949
+ *
+ * if <bytes> is NULL, then only the byte string prefix (with length) will be
+ * emitted
+ *
+ * CBOR encode ctx is provided in <ctx>
+ *
+ * Returns the position of the last written byte on success and NULL on
+ * error. The function cannot write past <stop>
+ */
+char *cbor_encode_bytes(struct cbor_encode_ctx *ctx,
+                        char *start, char *stop,
+                        const char *bytes, size_t len)
+{
+	return cbor_encode_bytes_prefix(ctx, start, stop, bytes, len, 0x40);
+}
+
 /* Check a string for using it in a CSV output format. If the string contains
  * one of the following four char <">, <,>, CR or LF, the string is
  * encapsulated between <"> and the <"> are escaped by a <""> sequence.
@@ -5581,10 +5739,10 @@ void ha_random_jump96(uint32_t dist)
 	}
 }
 
-/* Generates an RFC4122 UUID into chunk <output> which must be at least 37
+/* Generates an RFC4122 version 4 UUID into chunk <output> which must be at least 37
  * bytes large.
  */
-void ha_generate_uuid(struct buffer *output)
+void ha_generate_uuid_v4(struct buffer *output)
 {
 	uint32_t rnd[4];
 	uint64_t last;
@@ -5603,6 +5761,31 @@ void ha_generate_uuid(struct buffer *output)
 	             ((rnd[1] >> 16u) & 0xFFF) | 0x4000,  // highest 4 bits indicate the uuid version
 	             (rnd[2] & 0x3FFF) | 0x8000,  // the highest 2 bits indicate the UUID variant (10),
 	             (long long)((rnd[2] >> 14u) | ((uint64_t) rnd[3] << 18u)) & 0xFFFFFFFFFFFFull);
+}
+
+/* Generates a draft-ietf-uuidrev-rfc4122bis-14 version 7 UUID into chunk
+ * <output> which must be at least 37 bytes large.
+ */
+void ha_generate_uuid_v7(struct buffer *output)
+{
+	uint32_t rnd[3];
+	uint64_t last;
+	uint64_t time;
+
+	time = (date.tv_sec * 1000) + (date.tv_usec / 1000);
+	last = ha_random64();
+	rnd[0] = last;
+	rnd[1] = last >> 32;
+
+	last = ha_random64();
+	rnd[2] = last;
+
+	chunk_printf(output, "%8.8x-%4.4x-%4.4x-%4.4x-%12.12llx",
+	             (uint)(time >> 16u),
+	             (uint)(time & 0xFFFF),
+	             ((rnd[0] >> 16u) & 0xFFF) | 0x7000,  // highest 4 bits indicate the uuid version
+	             (rnd[1] & 0x3FFF) | 0x8000,  // the highest 2 bits indicate the UUID variant (10),
+	             (long long)((rnd[1] >> 14u) | ((uint64_t) rnd[2] << 18u)) & 0xFFFFFFFFFFFFull);
 }
 
 

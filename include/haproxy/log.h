@@ -70,7 +70,7 @@ void lf_expr_xfer(struct lf_expr *src, struct lf_expr *dst);
 void lf_expr_deinit(struct lf_expr *expr);
 static inline int lf_expr_isempty(const struct lf_expr *expr)
 {
-	return !(expr->flags & LF_FL_COMPILED) || LIST_ISEMPTY(&expr->nodes);
+	return !(expr->flags & LF_FL_COMPILED) || LIST_ISEMPTY(&expr->nodes.list);
 }
 int lf_expr_compile(struct lf_expr *lf_expr, struct arg_list *al, int options, int cap, char **err);
 int lf_expr_postcheck(struct lf_expr *lf_expr, struct proxy *px, char **err);
@@ -146,27 +146,6 @@ int get_log_level(const char *lev);
  * returns log facility for <fac> or -1 if not found.
  */
 int get_log_facility(const char *fac);
-
-/*
- * Write a string in the log string
- * Take cares of quote options
- *
- * Return the address of the \0 character, or NULL on error
- */
-char *lf_text_len(char *dst, const char *src, size_t len, size_t size, const struct logformat_node *node);
-
-/*
- * Write a IP address to the log string
- * +X option write in hexadecimal notation, most significant byte on the left
- */
-char *lf_ip(char *dst, const struct sockaddr *sockaddr, size_t size, const struct logformat_node *node);
-
-/*
- * Write a port to the log
- * +X option write in hexadecimal notation, most significant byte on the left
- */
-char *lf_port(char *dst, const struct sockaddr *sockaddr, size_t size, const struct logformat_node *node);
-
 
 /*
  * Function to handle log header building (exported for sinks)

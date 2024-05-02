@@ -32,6 +32,7 @@ Summary
 9.3.      Unix Socket commands
 9.4.      Master CLI
 9.4.1.    Master CLI commands
+9.5.      Stats-file
 10.   Tricks for easier configuration management
 11.   Well-known traps to avoid
 12.   Debugging and performance issues
@@ -470,11 +471,16 @@ list of options is :
   -x <unix_socket> : connect to the specified socket and try to retrieve any
     listening sockets from the old process, and use them instead of trying to
     bind new ones. This is useful to avoid missing any new connection when
-    reloading the configuration on Linux. The capability must be enable on the
-    stats socket using "expose-fd listeners" in your configuration.
-    In master-worker mode, the master will use this option upon a reload with
-    the "sockpair@" syntax, which allows the master to connect directly to a
-    worker without using stats socket declared in the configuration.
+    reloading the configuration on Linux.
+
+    Without master-worker mode, the capability must be enable on the stats
+    socket using "expose-fd listeners" in your configuration.
+
+    In master-worker mode, it does not need "expose-fd listeners", the master
+    will use automatically this option upon a reload with the "sockpair@"
+    syntax, which allows the master to connect directly to a worker without using
+    any stats socket declared in the configuration. If you want to disable this,
+    you can pass -x /dev/null.
 
 A safe way to start HAProxy from an init file consists in forcing the daemon
 mode, storing existing pids to a pid file and using this pid file to notify
@@ -2066,6 +2072,10 @@ disable server <backend>/<server>
 
   This command is restricted and can only be issued on sockets configured for
   level "admin".
+
+dump stats-file
+  Generate a stats-file which can be used to preload haproxy counters values on
+  startup. See "Stats-file" section for more detail.
 
 enable agent <backend>/<server>
   Resume auxiliary agent check that was temporarily stopped.
@@ -4022,13 +4032,13 @@ wait { -h | <delay> } [<condition> [<args>...]]
   specified condition to be satisfied, to unrecoverably fail, or to remain
   unsatisfied for the whole <delay> duration. The supported conditions are:
 
-  - srv-unused <proxy>/<server> : this will wait for the specified server to be
-    removable, i.e. be in maintenance and no longer have any connection on it.
-    Some conditions will never be accepted (e.g. not in maintenance) and will
-    cause the report of a specific error message indicating what condition is
-    not met. The server might even have been removed in parallel and no longer
-    exit. If everything is OK before the delay, a success is returned and the
-    operation is terminated.
+  - srv-removable <proxy>/<server> : this will wait for the specified server to
+    be removable, i.e. be in maintenance and no longer have any connection on
+    it.  Some conditions will never be accepted (e.g. not in maintenance) and
+    will cause the report of a specific error message indicating what condition
+    is not met. The server might even have been removed in parallel and no
+    longer exit. If everything is OK before the delay, a success is returned
+    and the operation is terminated.
 
   The default unit for the delay is milliseconds, though other units are
   accepted if suffixed with the usual timer units (us, ms, s, m, h, d). When
@@ -4041,7 +4051,7 @@ wait { -h | <delay> } [<condition> [<args>...]]
     $ socat -t5 /path/to/socket - <<< "
         disable server px/srv1
         shutdown sessions server px/srv1
-        wait 2s srv-unused px/srv1
+        wait 2s srv-removable px/srv1
         del server px/srv1"
 
 
@@ -4234,6 +4244,29 @@ show startup-logs
   reload.
 
   Those messages are also dumped with the "reload" command.
+
+
+9.5. Stats-file
+--------------
+
+A so-called stats-file can be used to preload internal haproxy counters on
+process startup with non-null values. Its main purpose is to preserve
+statistics for worker processes accross reloads. Only an excerpt of all the
+exposed haproxy statistics is present in a stats-file as it only makes sense to
+preload metric-type values.
+
+For the moment, only proxy counters are supported in stats-file. This allows to
+preload values for frontends, backends, servers and listeners. However only
+objects instances with a non-empty GUID are stored in a stats-file. This
+guarantees that value will be preloaded for object with matching type and GUID,
+even if other parameters differ.
+
+The CLI command "dump stats-file" purpose is to generate a stats-file. Format
+of the stats-file is internally defined and freely subject to future changes
+and extension. It is designed to be compatible at least accross adjacent
+haproxy stable branch releases, but may require optional extra configuration
+when loading a stats-file to a process running on an older version.
+
 
 10. Tricks for easier configuration management
 ----------------------------------------------
@@ -4574,33 +4607,35 @@ compiled with USE_LINUX_CAP=1, it is able to preserve capabilities given in
 'setcap' keyword during switching from root user to a non-root.
 
 Since version v3.1 haproxy also checks if capabilities given in 'setcap'
-keyword were set in its binary file permitted set by administrator
+keyword were set in its binary file Permitted set by administrator
 (capget syscall). If this a case it performs transition of these capabilities
-in its process effective set (capset syscall), while running as a non-root
+in its process Effective set (capset syscall), while running as a non-root
 user.
 
 This was done to avoid all potential use cases when haproxy starts and runs as
 root: transparent proxy mode, binding to privileged ports.
 
 'setcap' keyword supports following network capabilities:
-- cap_net_admin
-- cap_net_raw (subset of cap_net_admin)
-- cap_net_bind_service
+- cap_net_admin: transparent proxying, binding socket to a specific network
+  interface, using set-mark action;
+- cap_net_raw (subset of cap_net_admin): transparent proxying;
+- cap_net_bind_service: binding socket to a specific network interface;
+- cap_sys_admin: creating socket in a specific network namespace.
 
-Haproxy never does the transition of these capabilities from its permitted set
-to the effective, if they are not listed as 'setcap' argument. See more
+Haproxy never does the transition of these capabilities from its Permitted set
+to the Effective, if they are not listed as 'setcap' argument. See more
 information about 'setcap' keyword and supported capabilities in the chapter
 3.1 Process management and security in the Configuration guide.
 
-Administrator may add needed capabilities in the haproxy binary file permitted
+Administrator may add needed capabilities in the haproxy binary file Permitted
 set with the following command:
 
 Example:
 	# setcap cap_net_admin,cap_net_bind_service=p /usr/local/sbin/haproxy
 
-Added capabilities will be seen in process permitted set after its start.
+Added capabilities will be seen in process Permitted set after its start.
 If the same capabilities are the arguments of 'setcap' keyword, they could be
-also seen in the process effective set. This could be check with the following
+also seen in the process Effective set. This could be check with the following
 command:
 
 Example:
@@ -4614,20 +4649,20 @@ Example:
 See more details about setcap and capabilities sets in Linux man pages
 (capabilities(7)).
 
-In some cases like transparent proxying, binding socket to a specific network
-interface, using set-mark action, configuration file parser detects that
-cap_net_admin or cap_net_raw capabilities are needed. Then, during
-initialization stage, haproxy process checks, if these capabilities could be
-put in its effective set. If it's not possible due to capget or capset syscall
-failure (restrictions set on syscalls by some security modules like SELinux,
-Seccomp, etc), process emits diagnostic warnings (start with -dD).
+In some use cases like transparent proxying or creating socket in a specific
+network namespace, configuration file parser detects that cap_net_raw or
+cap_sys_admin or some other supported capabilities are needed. Then, during
+the initialization stage, haproxy process checks, if these capabilities could
+be put in its Effective set. If it's not possible due to capget or capset
+syscall failure (restrictions set on syscalls by some security modules like
+SELinux, Seccomp, etc), process emits diagnostic warnings (start with -dD).
 
 Due to support of many different platforms with different system settings,
 it's impossible for the parser to deduce from the configuration file, if
 binding to privileged ports will be done. So, in the case of insufficient
 privileges (run as non-root) process will terminate only with an alert
-message like below. It's up to a user to recheck its configuration and
-capabilities set for haproxy binary.
+message like below. It's up to a user to recheck its configuration and haproxy
+binary capabilities set.
 
 Example:
 	$ haproxy -dD -f haproxy.cfg

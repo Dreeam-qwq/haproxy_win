@@ -22,6 +22,7 @@
 #ifndef _HAPROXY_STATS_T_H
 #define _HAPROXY_STATS_T_H
 
+#include <import/ebtree-t.h>
 #include <haproxy/api-t.h>
 #include <haproxy/buf-t.h>
 
@@ -29,7 +30,7 @@
 #define STAT_F_FMT_HTML   0x00000001    /* dump the stats in HTML format */
 #define STAT_F_FMT_TYPED  0x00000002    /* use the typed output format */
 #define STAT_F_FMT_JSON   0x00000004    /* dump the stats in JSON format */
-#define STAT_F_HIDE_DOWN  0x00000008    /* hide 'down' servers in the stats page */
+#define STAT_F_FMT_FILE   0x00000008    /* dump stats-file */
 #define STAT_F_NO_REFRESH 0x00000010    /* do not automatically refresh the stats page */
 #define STAT_F_ADMIN      0x00000020    /* indicate a stats admin level */
 #define STAT_F_CHUNKED    0x00000040    /* use chunked encoding (HTTP/1.1) */
@@ -44,11 +45,12 @@
 #define STAT_F_HIDE_MAINT 0x00004000    /* hide maint/disabled servers */
 #define STAT_F_CONVDONE   0x00008000    /* conf: rules conversion done */
 #define STAT_F_USE_FLOAT  0x00010000    /* use floats where possible in the outputs */
+#define STAT_F_HIDE_DOWN  0x00020000	/* hide 'down' servers in the stats page */
 
 #define STAT_F_BOUND      0x00800000    /* bound statistics to selected proxies/types/services */
 #define STAT_F_STARTED    0x01000000    /* some output has occurred */
 
-#define STAT_F_FMT_MASK   0x00000007
+#define STAT_F_FMT_MASK   0x0000000f
 
 #define STATS_TYPE_FE  0
 #define STATS_TYPE_BE  1
@@ -337,6 +339,20 @@ enum stat_idx_info {
 	ST_I_INF_MAX
 };
 
+/* Represent an exposed statistic. */
+struct stat_col {
+	const char *name; /* short name, used notably in CSV headers */
+	const char *desc; /* user-friendly description */
+
+	uint32_t type;    /* combination of field_nature and field_format */
+	uint8_t cap;      /* mask of stats_domain_px_cap to restrain metrics to an object types subset */
+
+	/* used only for generic metrics */
+	struct {
+		int offset[2];    /* offset in counters */
+	} metric;
+};
+
 
 /* Stats columns for CSV output. For any column added here, please add the text
  * representation in the metrics_px array. Please only append at the end,
@@ -464,6 +480,12 @@ enum stat_idx_px {
 	ST_I_PX_MAX
 };
 
+/* Node for name-indexed stat tree from generate_stat_tree(). */
+struct stcol_node {
+	const struct stat_col *col;
+	struct ebmb_node name;
+};
+
 struct field {
 	uint32_t type;
 	union {
@@ -494,7 +516,7 @@ struct stats_module {
 	/* functor used to generate the stats module using counters provided through data parameter */
 	int (*fill_stats)(void *data, struct field *, unsigned int *);
 
-	struct name_desc *stats; /* name/description of stats provided by the module */
+	struct stat_col *stats;  /* statistics provided by the module */
 	void *counters;          /* initial values of allocated counters */
 	size_t counters_off[COUNTERS_OFF_END]; /* list of offsets of allocated counters in various objects */
 	size_t stats_count;      /* count of stats provided */
@@ -528,6 +550,16 @@ enum stats_domain_px_cap {
 
 	STATS_PX_CAP_MASK = 0xff
 };
+
+/* Shorcut names for enum stats_domain_px_cap only for declaration convenience */
+#define STATS_PX_CAP_LFBS (STATS_PX_CAP_MASK)
+#define STATS_PX_CAP_LFB_ (STATS_PX_CAP_FE|STATS_PX_CAP_BE|STATS_PX_CAP_LI)
+#define STATS_PX_CAP_LF__ (STATS_PX_CAP_FE|STATS_PX_CAP_LI)
+#define STATS_PX_CAP__FBS (STATS_PX_CAP_FE|STATS_PX_CAP_BE|STATS_PX_CAP_SRV)
+#define STATS_PX_CAP__FB_ (STATS_PX_CAP_FE|STATS_PX_CAP_BE)
+#define STATS_PX_CAP__F__ (STATS_PX_CAP_FE)
+#define STATS_PX_CAP___BS (STATS_PX_CAP_BE|STATS_PX_CAP_SRV)
+#define STATS_PX_CAP____S (STATS_PX_CAP_SRV)
 
 /* the context of a "show stat" command in progress on the CLI or the stats applet */
 struct show_stat_ctx {
