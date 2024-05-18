@@ -119,6 +119,7 @@ const char *log_levels[NB_LOG_LEVELS] = {
 
 const char sess_term_cond[16] = "-LcCsSPRIDKUIIII"; /* normal, Local, CliTo, CliErr, SrvTo, SrvErr, PxErr, Resource, Internal, Down, Killed, Up, -- */
 const char sess_fin_state[8]  = "-RCHDLQT";	/* cliRequest, srvConnect, srvHeader, Data, Last, Queue, Tarpit */
+const struct buffer empty = { };
 
 
 int prepare_addrsource(struct logformat_node *node, struct proxy *curproxy);
@@ -546,6 +547,7 @@ static int add_sample_to_logformat_list(char *text, char *name, int name_len, in
 
 	node = calloc(1, sizeof(*node));
 	if (!node) {
+		release_sample_expr(expr);
 		memprintf(err, "out of memory error");
 		goto error_free;
 	}
@@ -886,6 +888,58 @@ int parse_logformat_string(const char *fmt, struct proxy *curproxy,
 	return 0;
 }
 
+/* automatically resolves incompatible LOG_OPT options by taking into
+ * account current options and global options
+ */
+static inline void _lf_expr_postcheck_node_opt(int *options, int g_options)
+{
+	/* encoding is incompatible with HTTP option, so it is ignored
+	 * if HTTP option is set, unless HTTP option wasn't set globally
+	 * and encoding was set globally, which means encoding takes the
+	 * precedence>
+	 */
+	if (*options & LOG_OPT_HTTP) {
+		if ((g_options & (LOG_OPT_HTTP | LOG_OPT_ENCODE)) == LOG_OPT_ENCODE) {
+			/* global encoding enabled and http enabled individually */
+			*options &= ~LOG_OPT_HTTP;
+		}
+		else
+			*options &= ~LOG_OPT_ENCODE;
+	}
+
+	if (*options & LOG_OPT_ENCODE) {
+		/* when encoding is set, ignore +E option */
+		*options &= ~LOG_OPT_ESC;
+	}
+}
+
+/* Performs LOG_OPT postparsing check on logformat node <node> belonging to a
+ * given logformat expression <lf_expr>
+ *
+ * It returns 1 on success and 0 on error, <err> will be set in case of error
+ */
+static int lf_expr_postcheck_node_opt(struct lf_expr *lf_expr, struct logformat_node *node, char **err)
+{
+	/* per-node encoding options cannot be disabled if already
+	 * enabled globally
+	 *
+	 * Also, ensure we don't mix encoding types, global setting
+	 * prevails over per-node one.
+	 *
+	 * Finally, ignore LOG_OPT_BIN since it is a global-only option
+	 */
+	if (lf_expr->nodes.options & LOG_OPT_ENCODE) {
+		node->options &= ~(LOG_OPT_BIN | LOG_OPT_ENCODE);
+		node->options |= (lf_expr->nodes.options & LOG_OPT_ENCODE);
+	}
+	else
+		node->options &= ~LOG_OPT_BIN;
+
+	_lf_expr_postcheck_node_opt(&node->options, lf_expr->nodes.options);
+
+	return 1;
+}
+
 /* Performs a postparsing check on logformat expression <expr> for a given <px>
  * proxy. The function will behave differently depending on the proxy state
  * (during parsing we will try to adapt proxy configuration to make it
@@ -901,6 +955,9 @@ int lf_expr_postcheck(struct lf_expr *lf_expr, struct proxy *px, char **err)
 	if (!(px->flags & PR_FL_CHECKED))
 		px->to_log |= LW_INIT;
 
+	/* postcheck global node options */
+	_lf_expr_postcheck_node_opt(&lf_expr->nodes.options, LOG_OPT_NONE);
+
 	list_for_each_entry(lf, &lf_expr->nodes.list, list) {
 		if (lf->type == LOG_FMT_EXPR) {
 			struct sample_expr *expr = lf->expr;
@@ -913,7 +970,7 @@ int lf_expr_postcheck(struct lf_expr *lf_expr, struct proxy *px, char **err)
 					          expr->fetch->kw);
 					goto fail;
 				}
-				continue;
+				goto next_node;
 			}
 			/* check if we need to allocate an http_txn struct for HTTP parsing */
 			/* Note, we may also need to set curpx->to_log with certain fetches */
@@ -942,6 +999,10 @@ int lf_expr_postcheck(struct lf_expr *lf_expr, struct proxy *px, char **err)
 			if (!(px->flags & PR_FL_CHECKED))
 				px->to_log |= lf->tag->lw;
 		}
+ next_node:
+		/* postcheck individual node's options */
+		if (!lf_expr_postcheck_node_opt(lf_expr, lf, err))
+			goto fail;
 	}
 	if ((px->to_log & (LW_REQ | LW_RESP)) &&
 	    (px->mode != PR_MODE_HTTP && !(px->options & PR_O_HTTP_UPG))) {
@@ -1362,6 +1423,7 @@ struct logger *dup_logger(struct logger *def)
 
 	/* default values */
 	cpy->conf.file = NULL;
+	cpy->lb.smp_rgs = NULL;
 	LIST_INIT(&cpy->list);
 
 	/* special members */
@@ -1371,6 +1433,13 @@ struct logger *dup_logger(struct logger *def)
 		cpy->conf.file = strdup(def->conf.file);
 		if (!cpy->conf.file)
 			goto error;
+	}
+	if (def->lb.smp_rgs) {
+		cpy->lb.smp_rgs = malloc(sizeof(*cpy->lb.smp_rgs) * def->lb.smp_rgs_sz);
+		if (!cpy->lb.smp_rgs)
+			goto error;
+		memcpy(cpy->lb.smp_rgs, def->lb.smp_rgs,
+		       sizeof(*cpy->lb.smp_rgs) * def->lb.smp_rgs_sz);
 	}
 
 	/* inherit from original reference if set */
@@ -1395,6 +1464,7 @@ void free_logger(struct logger *logger)
 	BUG_ON(LIST_INLIST(&logger->list));
 	ha_free(&logger->conf.file);
 	deinit_log_target(&logger->target);
+	free(logger->lb.smp_rgs);
 	free(logger);
 }
 
@@ -1756,13 +1826,16 @@ int get_log_facility(const char *fac)
 }
 
 struct lf_buildctx {
-	int options; /* LOG_OPT_* options */
-	int typecast;/* same as logformat_node->typecast */
-	int in_text; /* inside variable-length text */
+	char _buf[256];/* fixed size buffer for building small strings */
+	int options;   /* LOG_OPT_* options */
+	int typecast;  /* same as logformat_node->typecast */
+	int in_text;   /* inside variable-length text */
 	union {
 		struct cbor_encode_ctx cbor; /* cbor-encode specific ctx */
 	} encode;
 };
+
+static THREAD_LOCAL struct lf_buildctx lf_buildctx;
 
 /* helper to encode a single byte in hex form
  *
@@ -1815,22 +1888,8 @@ static inline void lf_buildctx_prepare(struct lf_buildctx *ctx,
                                        const struct logformat_node *node)
 {
 	if (node) {
-		/* per-node encoding options cannot be disabled if already
-		 * enabled globally
-		 *
-		 * Also, ensure we don't mix encoding types, global setting
-		 * prevails over per-node one.
-		 *
-		 * Finally, ignore LOG_OPT_BIN since it is a global-only option
-		 */
-		if (g_options & LOG_OPT_ENCODE) {
-			ctx->options = (g_options & LOG_OPT_ENCODE);
-			ctx->options |= (node->options & ~(LOG_OPT_BIN | LOG_OPT_ENCODE));
-		}
-		else
-			ctx->options = (node->options & ~LOG_OPT_BIN);
-
-		/* consider node's typecast setting */
+		/* consider node's options and typecast setting */
+		ctx->options = node->options;
 		ctx->typecast = node->typecast;
 	}
 	else {
@@ -1838,21 +1897,10 @@ static inline void lf_buildctx_prepare(struct lf_buildctx *ctx,
 		ctx->typecast = SMP_T_SAME; /* default */
 	}
 
-	/* encoding is incompatible with HTTP option, so it is ignored
-	 * if HTTP option is set
-	 */
-	if (ctx->options & LOG_OPT_HTTP)
-		ctx->options &= ~LOG_OPT_ENCODE;
-
-	if (ctx->options & LOG_OPT_ENCODE) {
-		/* when encoding is set, ignore +E option */
-		ctx->options &= ~LOG_OPT_ESC;
-
-		if (ctx->options & LOG_OPT_ENCODE_CBOR) {
-			/* prepare cbor-specific encode ctx */
-			ctx->encode.cbor.e_fct_byte = _lf_cbor_encode_byte;
-			ctx->encode.cbor.e_fct_ctx = ctx;
-		}
+	if (ctx->options & LOG_OPT_ENCODE_CBOR) {
+		/* prepare cbor-specific encode ctx */
+		ctx->encode.cbor.e_fct_byte = _lf_cbor_encode_byte;
+		ctx->encode.cbor.e_fct_ctx = ctx;
 	}
 }
 
@@ -2187,7 +2235,15 @@ static inline char *_lf_text_len(char *dst, const char *src,
 			 * indefinite length text in cbor, because indefinite-length text
 			 * has to be made of multiple chunks of known size as per RFC8949...
 			 */
-			len = strnlen(src, len);
+			{
+				int _len;
+
+				/* strnlen(src, len) portable equivalent: */
+				for (_len = 0; _len < len && src[_len]; _len++)
+					;
+
+				len = _len;
+			}
 
 			ret = cbor_encode_text(&ctx->encode.cbor, dst, dst + size, src, len);
 			if (ret == NULL)
@@ -2318,23 +2374,19 @@ static char *lf_ip(char *dst, const struct sockaddr *sockaddr, size_t size, stru
 		switch (sockaddr->sa_family) {
 		case AF_INET:
 		{
-			char ip4_hex[9]; // 8 bytes + \0
-
 			addr = (unsigned char *)&((struct sockaddr_in *)sockaddr)->sin_addr.s_addr;
-			iret = snprintf(ip4_hex, sizeof(ip4_hex), "%02X%02X%02X%02X",
+			iret = snprintf(ctx->_buf, sizeof(ctx->_buf), "%02X%02X%02X%02X",
 			                addr[0], addr[1], addr[2], addr[3]);
 			if (iret < 0 || iret >= size)
 				return NULL;
-			ret = lf_rawtext(dst, ip4_hex, size, ctx);
+			ret = lf_rawtext(dst, ctx->_buf, size, ctx);
 
 			break;
 		}
 		case AF_INET6:
 		{
-			char ip6_hex[33]; // 32 bytes + \0
-
 			addr = (unsigned char *)&((struct sockaddr_in6 *)sockaddr)->sin6_addr.s6_addr;
-			iret = snprintf(ip6_hex, sizeof(ip6_hex),
+			iret = snprintf(ctx->_buf, sizeof(ctx->_buf),
 			                "%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X",
 			                addr[0], addr[1], addr[2], addr[3],
 			                addr[4], addr[5], addr[6], addr[7],
@@ -2342,7 +2394,7 @@ static char *lf_ip(char *dst, const struct sockaddr *sockaddr, size_t size, stru
 			                addr[12], addr[13], addr[14], addr[15]);
 			if (iret < 0 || iret >= size)
 				return NULL;
-			ret = lf_rawtext(dst, ip6_hex, size, ctx);
+			ret = lf_rawtext(dst, ctx->_buf, size, ctx);
 
 			break;
 		}
@@ -2475,13 +2527,12 @@ static char *lf_port(char *dst, const struct sockaddr *sockaddr, size_t size, st
 	int iret;
 
 	if (ctx->options & LOG_OPT_HEXA) {
-		char port_hex[5]; // 4 bytes + \0
 		const unsigned char *port = (const unsigned char *)&((struct sockaddr_in *)sockaddr)->sin_port;
 
-		iret = snprintf(port_hex, sizeof(port_hex), "%02X%02X", port[0], port[1]);
+		iret = snprintf(ctx->_buf, sizeof(ctx->_buf), "%02X%02X", port[0], port[1]);
 		if (iret < 0 || iret >= size)
 			return NULL;
-		ret = lf_rawtext(dst, port_hex, size, ctx);
+		ret = lf_rawtext(dst, ctx->_buf, size, ctx);
 	} else {
 		ret = lf_int(dst, size, get_host_port((struct sockaddr_storage *)sockaddr),
 		             ctx, LF_INT_LTOA);
@@ -3145,7 +3196,7 @@ const char sess_set_cookie[8] = "NPDIRU67";	/* No set-cookie, Set-cookie found a
  * try to write a cbor byte if there is enough space, or goto out
  */
 #define LOG_CBOR_BYTE(x) do {                                          \
-			ret = _lf_cbor_encode_byte(&ctx.encode.cbor,   \
+			ret = _lf_cbor_encode_byte(&ctx->encode.cbor,  \
 			                           tmplog,             \
 			                           dst + maxsize,      \
 			                           (x));               \
@@ -3158,15 +3209,15 @@ const char sess_set_cookie[8] = "NPDIRU67";	/* No set-cookie, Set-cookie found a
  * try to write a character if there is enough space, or goto out
  */
 #define LOGCHAR(x) do { \
-			if ((ctx.options & LOG_OPT_ENCODE_CBOR) &&             \
-			    ctx.in_text) {                                     \
+			if ((ctx->options & LOG_OPT_ENCODE_CBOR) &&            \
+			    ctx->in_text) {                                    \
 				char _x[1];                                    \
 				/* encode the char as text chunk since we      \
 				 * cannot just throw random bytes and expect   \
 				 * cbor decoder to know how to handle them     \
 				 */                                            \
 				_x[0] = (x);                                   \
-				ret = cbor_encode_text(&ctx.encode.cbor,       \
+				ret = cbor_encode_text(&ctx->encode.cbor,      \
 				                       tmplog,                 \
 				                       dst + maxsize,          \
 				                       _x, sizeof(_x));        \
@@ -3187,8 +3238,8 @@ const char sess_set_cookie[8] = "NPDIRU67";	/* No set-cookie, Set-cookie found a
  * encoding and options to know if some special treatment is needed.
  */
 #define LOG_VARTEXT_START() do {                                               \
-			ctx.in_text = 1;                                       \
-			if (ctx.options & LOG_OPT_ENCODE_CBOR) {               \
+			ctx->in_text = 1;                                      \
+			if (ctx->options & LOG_OPT_ENCODE_CBOR) {              \
 				/* start indefinite-length cbor text */        \
 				LOG_CBOR_BYTE(0x7F);                           \
 				break;                                         \
@@ -3196,7 +3247,7 @@ const char sess_set_cookie[8] = "NPDIRU67";	/* No set-cookie, Set-cookie found a
 			/* put the text within quotes if JSON encoding         \
 			 * is used or quoting is enabled                       \
 			 */                                                    \
-			if (ctx.options &                                      \
+			if (ctx->options &                                     \
 			    (LOG_OPT_QUOTE | LOG_OPT_ENCODE_JSON)) {           \
 				LOGCHAR('"');                                  \
 			}                                                      \
@@ -3208,10 +3259,10 @@ const char sess_set_cookie[8] = "NPDIRU67";	/* No set-cookie, Set-cookie found a
  * needed.
  */
 #define LOG_VARTEXT_END() do {                                                 \
-			if (!ctx.in_text)                                      \
+			if (!ctx->in_text)                                     \
 				break;                                         \
-			ctx.in_text = 0;                                       \
-			if (ctx.options & LOG_OPT_ENCODE_CBOR) {               \
+			ctx->in_text = 0;                                      \
+			if (ctx->options & LOG_OPT_ENCODE_CBOR) {              \
 				/* end indefinite-length cbor text with break*/\
 				LOG_CBOR_BYTE(0xFF);                           \
 				break;                                         \
@@ -3219,7 +3270,7 @@ const char sess_set_cookie[8] = "NPDIRU67";	/* No set-cookie, Set-cookie found a
 			/* add the ending quote if JSON encoding is            \
 			 * used or quoting is enabled                          \
 			 */                                                    \
-			if (ctx.options &                                      \
+			if (ctx->options &                                     \
 			    (LOG_OPT_QUOTE | LOG_OPT_ENCODE_JSON)) {           \
 				LOGCHAR('"');                                  \
 			}                                                      \
@@ -3231,16 +3282,16 @@ const char sess_set_cookie[8] = "NPDIRU67";	/* No set-cookie, Set-cookie found a
  */
 #define LOGMETACHAR(chr) do {                                          \
 			/* ignored when encoding is used */            \
-			if (ctx.options & LOG_OPT_ENCODE)              \
+			if (ctx->options & LOG_OPT_ENCODE)             \
 				break;                                 \
 			LOGCHAR(chr);                                  \
 		} while (0)
 
 /* indicate the start of a string array */
 #define LOG_STRARRAY_START() do {                                      \
-			if (ctx.options & LOG_OPT_ENCODE_JSON)         \
+			if (ctx->options & LOG_OPT_ENCODE_JSON)        \
 				LOGCHAR('[');                          \
-			if (ctx.options & LOG_OPT_ENCODE_CBOR) {       \
+			if (ctx->options & LOG_OPT_ENCODE_CBOR) {      \
 				/* start indefinite-length array */    \
 				LOG_CBOR_BYTE(0x9F);                   \
 			}                                              \
@@ -3248,9 +3299,9 @@ const char sess_set_cookie[8] = "NPDIRU67";	/* No set-cookie, Set-cookie found a
 
 /* indicate that a new element is added to the string array */
 #define LOG_STRARRAY_NEXT() do {                                       \
-			if (ctx.options & LOG_OPT_ENCODE_CBOR)         \
+			if (ctx->options & LOG_OPT_ENCODE_CBOR)        \
 				break;                                 \
-			if (ctx.options & LOG_OPT_ENCODE_JSON) {       \
+			if (ctx->options & LOG_OPT_ENCODE_JSON) {      \
 				LOGCHAR(',');                          \
 				LOGCHAR(' ');                          \
 			}                                              \
@@ -3260,9 +3311,9 @@ const char sess_set_cookie[8] = "NPDIRU67";	/* No set-cookie, Set-cookie found a
 
 /* indicate the end of a string array */
 #define LOG_STRARRAY_END() do {                                        \
-			if (ctx.options & LOG_OPT_ENCODE_JSON)         \
+			if (ctx->options & LOG_OPT_ENCODE_JSON)        \
 				LOGCHAR(']');                          \
-			if (ctx.options & LOG_OPT_ENCODE_CBOR) {       \
+			if (ctx->options & LOG_OPT_ENCODE_CBOR) {      \
 				/* cbor break */                       \
 				LOG_CBOR_BYTE(0xFF);                   \
 			}                                              \
@@ -3509,7 +3560,7 @@ int lf_expr_dup(const struct lf_expr *orig, struct lf_expr *dest)
  */
 int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t maxsize, struct lf_expr *lf_expr)
 {
-	struct lf_buildctx ctx = { };
+	struct lf_buildctx *ctx = &lf_buildctx;
 	struct proxy *fe = sess->fe;
 	struct proxy *be;
 	struct http_txn *txn;
@@ -3620,16 +3671,19 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 
 	tmplog = dst;
 
+	/* reset static ctx struct */
+	ctx->in_text = 0;
+
 	/* start with global ctx by default */
-	lf_buildctx_prepare(&ctx, g_options, NULL);
+	lf_buildctx_prepare(ctx, g_options, NULL);
 
 	/* fill logbuffer */
-	if (!(ctx.options & LOG_OPT_ENCODE) && lf_expr_isempty(lf_expr))
+	if (!(ctx->options & LOG_OPT_ENCODE) && lf_expr_isempty(lf_expr))
 		return 0;
 
-	if (ctx.options & LOG_OPT_ENCODE_JSON)
+	if (ctx->options & LOG_OPT_ENCODE_JSON)
 		LOGCHAR('{');
-	else if (ctx.options & LOG_OPT_ENCODE_CBOR) {
+	else if (ctx->options & LOG_OPT_ENCODE_CBOR) {
 		/* start indefinite-length map */
 		LOG_CBOR_BYTE(0xBF);
 	}
@@ -3642,29 +3696,55 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 		const char *src = NULL;
 		const char *value_beg = NULL;
 		struct sample *key;
-		const struct buffer empty = { };
+
+		/* first start with basic types (use continue statement to skip
+		 * the current node)
+		 */
+		if (tmp->type == LOG_FMT_SEPARATOR) {
+			if (g_options & LOG_OPT_ENCODE) {
+				/* ignored when global encoding is set */
+				continue;
+			}
+			if (!last_isspace) {
+				LOGCHAR(' ');
+				last_isspace = 1;
+			}
+			continue;
+		}
+		else if (tmp->type == LOG_FMT_TEXT) {
+			/* text */
+			if (g_options & LOG_OPT_ENCODE) {
+				/* ignored when global encoding is set */
+				continue;
+			}
+			src = tmp->arg;
+			iret = strlcpy2(tmplog, src, dst + maxsize - tmplog);
+			if (iret == 0)
+				goto out;
+			tmplog += iret;
+			last_isspace = 0; /* data was written */
+			continue;
+		}
+
+		/* dynamic types handling (use "goto next_fmt" statement to skip
+		 * the current node)
+		 */
 
 		if (g_options & LOG_OPT_ENCODE) {
 			/* only consider global ctx for key encoding */
-			lf_buildctx_prepare(&ctx, g_options, NULL);
-
-			/* types that cannot be named such as text or separator are ignored
-			 * when encoding is set
-			 */
-			if (!LF_NODE_WITH_OPT(tmp))
-				goto next_fmt;
+			lf_buildctx_prepare(ctx, g_options, NULL);
 
 			if (!tmp->name)
 				goto next_fmt; /* cannot represent anonymous field, ignore */
 
 			if (!first_node) {
-				if (ctx.options & LOG_OPT_ENCODE_JSON) {
+				if (ctx->options & LOG_OPT_ENCODE_JSON) {
 					LOGCHAR(',');
 					LOGCHAR(' ');
 				}
 			}
 
-			if (ctx.options & LOG_OPT_ENCODE_JSON) {
+			if (ctx->options & LOG_OPT_ENCODE_JSON) {
 				LOGCHAR('"');
 				iret = strlcpy2(tmplog, tmp->name, dst + maxsize - tmplog);
 				if (iret == 0)
@@ -3674,8 +3754,8 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 				LOGCHAR(':');
 				LOGCHAR(' ');
 			}
-			else if (ctx.options & LOG_OPT_ENCODE_CBOR) {
-				ret = cbor_encode_text(&ctx.encode.cbor, tmplog,
+			else if (ctx->options & LOG_OPT_ENCODE_CBOR) {
+				ret = cbor_encode_text(&ctx->encode.cbor, tmplog,
 				                       dst + maxsize, tmp->name,
 				                       strlen(tmp->name));
 				if (ret == NULL)
@@ -3690,118 +3770,100 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 		/* get the chance to consider per-node options (if not already
 		 * set globally) for printing the value
 		 */
-		lf_buildctx_prepare(&ctx, g_options, tmp);
+		lf_buildctx_prepare(ctx, g_options, tmp);
 
-		switch (tmp->type) {
-			case LOG_FMT_SEPARATOR:
-				if (!last_isspace) {
-					LOGCHAR(' ');
-					last_isspace = 1;
-				}
-				break;
+		if (tmp->type == LOG_FMT_EXPR) {
+			/* sample expression, may be request or response */
+			int type;
 
-			case LOG_FMT_TEXT: // text
-				src = tmp->arg;
-				iret = strlcpy2(tmplog, src, dst + maxsize - tmplog);
-				if (iret == 0)
-					goto out;
-				tmplog += iret;
-				break;
+			key = NULL;
+			if (ctx->options & LOG_OPT_REQ_CAP)
+				key = sample_process(be, sess, s, SMP_OPT_DIR_REQ|SMP_OPT_FINAL, tmp->expr, NULL);
 
-			case LOG_FMT_EXPR: // sample expression, may be request or response
-			{
-				int type;
+			if (!key && (ctx->options & LOG_OPT_RES_CAP))
+				key = sample_process(be, sess, s, SMP_OPT_DIR_RES|SMP_OPT_FINAL, tmp->expr, NULL);
 
-				key = NULL;
-				if (ctx.options & LOG_OPT_REQ_CAP)
-					key = sample_process(be, sess, s, SMP_OPT_DIR_REQ|SMP_OPT_FINAL, tmp->expr, NULL);
+			if (!key && !(ctx->options & (LOG_OPT_REQ_CAP|LOG_OPT_RES_CAP))) // cfg, cli
+				key = sample_process(be, sess, s, SMP_OPT_FINAL, tmp->expr, NULL);
 
-				if (!key && (ctx.options & LOG_OPT_RES_CAP))
-					key = sample_process(be, sess, s, SMP_OPT_DIR_RES|SMP_OPT_FINAL, tmp->expr, NULL);
+			type = SMP_T_STR; // default
 
-				if (!key && !(ctx.options & (LOG_OPT_REQ_CAP|LOG_OPT_RES_CAP))) // cfg, cli
-					key = sample_process(be, sess, s, SMP_OPT_FINAL, tmp->expr, NULL);
-
-				type = SMP_T_STR; // default
-
-				if (key && key->data.type == SMP_T_BIN &&
-				    (ctx.options & LOG_OPT_BIN)) {
-					/* output type is binary, and binary option is set:
-					 * preserve output type unless typecast is set to
-					 * force output type to string
-					 */
-					if (ctx.typecast != SMP_T_STR)
-						type = SMP_T_BIN;
-				}
-
-				/* if encoding is set, try to preserve output type
-				 * with respect to typecast settings
-				 * (ie: str, sint, bool)
-				 *
-				 * Special case for cbor encoding: we also try to
-				 * preserve bin output type since cbor encoders
-				 * know how to deal with binary data.
+			if (key && key->data.type == SMP_T_BIN &&
+			    (ctx->options & LOG_OPT_BIN)) {
+				/* output type is binary, and binary option is set:
+				 * preserve output type unless typecast is set to
+				 * force output type to string
 				 */
-				if (ctx.options & LOG_OPT_ENCODE) {
-					if (ctx.typecast == SMP_T_STR ||
-					    ctx.typecast == SMP_T_SINT ||
-					    ctx.typecast == SMP_T_BOOL) {
-						/* enforce type */
-						type = ctx.typecast;
-					}
-					else if (key &&
-					         (key->data.type == SMP_T_SINT ||
-					          key->data.type == SMP_T_BOOL ||
-					          ((ctx.options & LOG_OPT_ENCODE_CBOR) &&
-					           key->data.type == SMP_T_BIN))) {
-						/* preserve type */
-						type = key->data.type;
-					}
-				}
-
-				if (key && !sample_convert(key, type))
-					key = NULL;
-
-				if (ctx.options & LOG_OPT_HTTP)
-					ret = lf_encode_chunk(tmplog, dst + maxsize,
-					                      '%', http_encode_map, key ? &key->data.u.str : &empty, &ctx);
-				else {
-					if (key && type == SMP_T_BIN)
-						ret = lf_encode_chunk(tmplog, dst + maxsize,
-						                      0, no_escape_map,
-						                      &key->data.u.str,
-						                      &ctx);
-					else if (key && type == SMP_T_SINT)
-						ret = lf_int_encode(tmplog, dst + maxsize - tmplog,
-						                    key->data.u.sint, &ctx);
-					else if (key && type == SMP_T_BOOL)
-						ret = lf_bool_encode(tmplog, dst + maxsize - tmplog,
-						                     key->data.u.sint, &ctx);
-					else
-						ret = lf_text_len(tmplog,
-						                  key ? key->data.u.str.area : NULL,
-						                  key ? key->data.u.str.data : 0,
-						                  dst + maxsize - tmplog,
-						                  &ctx);
-				}
-				if (ret == NULL)
-					goto out;
-				tmplog = ret;
-				break;
+				if (ctx->typecast != SMP_T_STR)
+					type = SMP_T_BIN;
 			}
+
+			/* if encoding is set, try to preserve output type
+			 * with respect to typecast settings
+			 * (ie: str, sint, bool)
+			 *
+			 * Special case for cbor encoding: we also try to
+			 * preserve bin output type since cbor encoders
+			 * know how to deal with binary data.
+			 */
+			if (ctx->options & LOG_OPT_ENCODE) {
+				if (ctx->typecast == SMP_T_STR ||
+				    ctx->typecast == SMP_T_SINT ||
+				    ctx->typecast == SMP_T_BOOL) {
+					/* enforce type */
+					type = ctx->typecast;
+				}
+				else if (key &&
+				         (key->data.type == SMP_T_SINT ||
+				          key->data.type == SMP_T_BOOL ||
+				          ((ctx->options & LOG_OPT_ENCODE_CBOR) &&
+				           key->data.type == SMP_T_BIN))) {
+					/* preserve type */
+					type = key->data.type;
+				}
+			}
+
+			if (key && !sample_convert(key, type))
+				key = NULL;
+			if (ctx->options & LOG_OPT_HTTP)
+				ret = lf_encode_chunk(tmplog, dst + maxsize,
+				                      '%', http_encode_map, key ? &key->data.u.str : &empty, ctx);
+			else {
+				if (key && type == SMP_T_BIN)
+					ret = lf_encode_chunk(tmplog, dst + maxsize,
+					                      0, no_escape_map,
+					                      &key->data.u.str,
+					                      ctx);
+				else if (key && type == SMP_T_SINT)
+					ret = lf_int_encode(tmplog, dst + maxsize - tmplog,
+					                    key->data.u.sint, ctx);
+				else if (key && type == SMP_T_BOOL)
+					ret = lf_bool_encode(tmplog, dst + maxsize - tmplog,
+					                     key->data.u.sint, ctx);
+				else
+					ret = lf_text_len(tmplog,
+					                  key ? key->data.u.str.area : NULL,
+					                  key ? key->data.u.str.data : 0,
+					                  dst + maxsize - tmplog,
+					                  ctx);
+			}
+			if (ret == NULL)
+				goto out;
+			tmplog = ret;
+			last_isspace = 0; /* consider that data was written */
+			goto next_fmt;
 		}
 
-		if (tmp->type != LOG_FMT_TAG)
-			goto next_fmt;
+		BUG_ON(tmp->type != LOG_FMT_TAG);
 
 		/* logformat tag */
 		switch (tmp->tag->type) {
 			case LOG_FMT_CLIENTIP:  // %ci
 				addr = (s ? sc_src(s->scf) : sess_src(sess));
 				if (addr)
-					ret = lf_ip(tmplog, (struct sockaddr *)addr, dst + maxsize - tmplog, &ctx);
+					ret = lf_ip(tmplog, (struct sockaddr *)addr, dst + maxsize - tmplog, ctx);
 				else
-					ret = lf_text_len(tmplog, NULL, 0, dst + maxsize - tmplog, &ctx);
+					ret = lf_text_len(tmplog, NULL, 0, dst + maxsize - tmplog, ctx);
 
 				if (ret == NULL)
 					goto out;
@@ -3814,12 +3876,12 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 					/* sess->listener is always defined when the session's owner is an inbound connections */
 					if (addr->ss_family == AF_UNIX)
 						ret = lf_int(tmplog, dst + maxsize - tmplog,
-						             sess->listener->luid, &ctx, LF_INT_LTOA);
+						             sess->listener->luid, ctx, LF_INT_LTOA);
 					else
-						ret = lf_port(tmplog, (struct sockaddr *)addr, dst + maxsize - tmplog, &ctx);
+						ret = lf_port(tmplog, (struct sockaddr *)addr, dst + maxsize - tmplog, ctx);
 				}
 				else
-					ret = lf_text_len(tmplog, NULL, 0, dst + maxsize - tmplog, &ctx);
+					ret = lf_text_len(tmplog, NULL, 0, dst + maxsize - tmplog, ctx);
 
 				if (ret == NULL)
 					goto out;
@@ -3829,9 +3891,9 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 			case LOG_FMT_FRONTENDIP: // %fi
 				addr = (s ? sc_dst(s->scf) : sess_dst(sess));
 				if (addr)
-					ret = lf_ip(tmplog, (struct sockaddr *)addr, dst + maxsize - tmplog, &ctx);
+					ret = lf_ip(tmplog, (struct sockaddr *)addr, dst + maxsize - tmplog, ctx);
 				else
-					ret = lf_text_len(tmplog, NULL, 0, dst + maxsize - tmplog, &ctx);
+					ret = lf_text_len(tmplog, NULL, 0, dst + maxsize - tmplog, ctx);
 
 				if (ret == NULL)
 					goto out;
@@ -3844,12 +3906,12 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 					/* sess->listener is always defined when the session's owner is an inbound connections */
 					if (addr->ss_family == AF_UNIX)
 						ret = lf_int(tmplog, dst + maxsize - tmplog,
-						             sess->listener->luid, &ctx, LF_INT_LTOA);
+						             sess->listener->luid, ctx, LF_INT_LTOA);
 					else
-						ret = lf_port(tmplog, (struct sockaddr *)addr, dst + maxsize - tmplog, &ctx);
+						ret = lf_port(tmplog, (struct sockaddr *)addr, dst + maxsize - tmplog, ctx);
 				}
 				else
-					ret = lf_text_len(tmplog, NULL, 0, dst + maxsize - tmplog, &ctx);
+					ret = lf_text_len(tmplog, NULL, 0, dst + maxsize - tmplog, ctx);
 
 				if (ret == NULL)
 					goto out;
@@ -3858,9 +3920,9 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 
 			case LOG_FMT_BACKENDIP:  // %bi
 				if (be_conn && conn_get_src(be_conn))
-					ret = lf_ip(tmplog, (const struct sockaddr *)be_conn->src, dst + maxsize - tmplog, &ctx);
+					ret = lf_ip(tmplog, (const struct sockaddr *)be_conn->src, dst + maxsize - tmplog, ctx);
 				else
-					ret = lf_text_len(tmplog, NULL, 0, dst + maxsize - tmplog, &ctx);
+					ret = lf_text_len(tmplog, NULL, 0, dst + maxsize - tmplog, ctx);
 
 				if (ret == NULL)
 					goto out;
@@ -3869,9 +3931,9 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 
 			case LOG_FMT_BACKENDPORT:  // %bp
 				if (be_conn && conn_get_src(be_conn))
-					ret = lf_port(tmplog, (struct sockaddr *)be_conn->src, dst + maxsize - tmplog, &ctx);
+					ret = lf_port(tmplog, (struct sockaddr *)be_conn->src, dst + maxsize - tmplog, ctx);
 				else
-					ret = lf_text_len(tmplog, NULL, 0, dst + maxsize - tmplog, &ctx);
+					ret = lf_text_len(tmplog, NULL, 0, dst + maxsize - tmplog, ctx);
 
 				if (ret == NULL)
 					goto out;
@@ -3880,9 +3942,9 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 
 			case LOG_FMT_SERVERIP: // %si
 				if (be_conn && conn_get_dst(be_conn))
-					ret = lf_ip(tmplog, (struct sockaddr *)be_conn->dst, dst + maxsize - tmplog, &ctx);
+					ret = lf_ip(tmplog, (struct sockaddr *)be_conn->dst, dst + maxsize - tmplog, ctx);
 				else
-					ret = lf_text_len(tmplog, NULL, 0, dst + maxsize - tmplog, &ctx);
+					ret = lf_text_len(tmplog, NULL, 0, dst + maxsize - tmplog, ctx);
 
 				if (ret == NULL)
 					goto out;
@@ -3891,9 +3953,9 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 
 			case LOG_FMT_SERVERPORT: // %sp
 				if (be_conn && conn_get_dst(be_conn))
-					ret = lf_port(tmplog, (struct sockaddr *)be_conn->dst, dst + maxsize - tmplog, &ctx);
+					ret = lf_port(tmplog, (struct sockaddr *)be_conn->dst, dst + maxsize - tmplog, ctx);
 				else
-					ret = lf_text_len(tmplog, NULL, 0, dst + maxsize - tmplog, &ctx);
+					ret = lf_text_len(tmplog, NULL, 0, dst + maxsize - tmplog, ctx);
 
 				if (ret == NULL)
 					goto out;
@@ -3902,12 +3964,16 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 
 			case LOG_FMT_DATE: // %t = accept date
 			{
-				char date_str[25]; // "26/Apr/2024:09:39:58.774"
+				// "26/Apr/2024:09:39:58.774"
 
 				get_localtime(logs->accept_date.tv_sec, &tm);
-				if (!date2str_log(date_str, &tm, &logs->accept_date, sizeof(date_str)))
-					goto out;
-				ret = lf_rawtext(tmplog, date_str, dst + maxsize - tmplog, &ctx);
+				if (ctx->options & LOG_OPT_ENCODE) {
+					if (!date2str_log(ctx->_buf, &tm, &logs->accept_date, sizeof(ctx->_buf)))
+						goto out;
+					ret = lf_rawtext(tmplog, ctx->_buf, dst + maxsize - tmplog, ctx);
+				}
+				else // speedup
+					ret = date2str_log(tmplog, &tm, &logs->accept_date, dst + maxsize - tmplog);
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
@@ -3916,14 +3982,18 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 
 			case LOG_FMT_tr: // %tr = start of request date
 			{
-				char date_str[25]; // "26/Apr/2024:09:39:58.774"
+				// "26/Apr/2024:09:39:58.774"
 
 				/* Note that the timers are valid if we get here */
 				tv_ms_add(&tv, &logs->accept_date, logs->t_idle >= 0 ? logs->t_idle + logs->t_handshake : 0);
 				get_localtime(tv.tv_sec, &tm);
-				if (!date2str_log(date_str, &tm, &tv, sizeof(date_str)))
-					goto out;
-				ret = lf_rawtext(tmplog, date_str, dst + maxsize - tmplog, &ctx);
+				if (ctx->options & LOG_OPT_ENCODE) {
+					if (!date2str_log(ctx->_buf, &tm, &tv, sizeof(ctx->_buf)))
+						goto out;
+					ret = lf_rawtext(tmplog, ctx->_buf, dst + maxsize - tmplog, ctx);
+				}
+				else // speedup
+					ret = date2str_log(tmplog, &tm, &tv, dst + maxsize - tmplog);
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
@@ -3932,12 +4002,16 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 
 			case LOG_FMT_DATEGMT: // %T = accept date, GMT
 			{
-				char gmt_str[27]; // "26/Apr/2024:07:41:11 +0000"
+				// "26/Apr/2024:07:41:11 +0000"
 
 				get_gmtime(logs->accept_date.tv_sec, &tm);
-				if (!gmt2str_log(gmt_str, &tm, sizeof(gmt_str)))
-					goto out;
-				ret = lf_rawtext(tmplog, gmt_str, dst + maxsize - tmplog, &ctx);
+				if (ctx->options & LOG_OPT_ENCODE) {
+					if (!gmt2str_log(ctx->_buf, &tm, sizeof(ctx->_buf)))
+						goto out;
+					ret = lf_rawtext(tmplog, ctx->_buf, dst + maxsize - tmplog, ctx);
+				}
+				else // speedup
+					ret = gmt2str_log(tmplog, &tm, dst + maxsize - tmplog);
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
@@ -3946,13 +4020,17 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 
 			case LOG_FMT_trg: // %trg = start of request date, GMT
 			{
-				char gmt_str[27]; // "26/Apr/2024:07:41:11 +0000"
+				// "26/Apr/2024:07:41:11 +0000"
 
 				tv_ms_add(&tv, &logs->accept_date, logs->t_idle >= 0 ? logs->t_idle + logs->t_handshake : 0);
 				get_gmtime(tv.tv_sec, &tm);
-				if (!gmt2str_log(gmt_str, &tm, sizeof(gmt_str)))
-					goto out;
-				ret = lf_rawtext(tmplog, gmt_str, dst + maxsize - tmplog, &ctx);
+				if (ctx->options & LOG_OPT_ENCODE) {
+					if (!gmt2str_log(ctx->_buf, &tm, sizeof(ctx->_buf)))
+						goto out;
+					ret = lf_rawtext(tmplog, ctx->_buf, dst + maxsize - tmplog, ctx);
+				}
+				else // speedup
+					ret = gmt2str_log(tmplog, &tm, dst + maxsize - tmplog);
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
@@ -3961,12 +4039,18 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 
 			case LOG_FMT_DATELOCAL: // %Tl = accept date, local
 			{
-				char localdate_str[27]; // "26/Apr/2024:09:42:32 +0200"
+				// "26/Apr/2024:09:42:32 +0200"
 
 				get_localtime(logs->accept_date.tv_sec, &tm);
-				if (!localdate2str_log(localdate_str, logs->accept_date.tv_sec, &tm, sizeof(localdate_str)))
-					goto out;
-				ret = lf_rawtext(tmplog, localdate_str, dst + maxsize - tmplog, &ctx);
+				if (ctx->options & LOG_OPT_ENCODE) {
+					if (!localdate2str_log(ctx->_buf, logs->accept_date.tv_sec,
+					                       &tm, sizeof(ctx->_buf)))
+						goto out;
+					ret = lf_rawtext(tmplog, ctx->_buf, dst + maxsize - tmplog, ctx);
+				}
+				else // speedup
+					ret = localdate2str_log(tmplog, logs->accept_date.tv_sec,
+					                        &tm, dst + maxsize - tmplog);
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
@@ -3975,13 +4059,17 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 
 			case LOG_FMT_trl: // %trl = start of request date, local
 			{
-				char localdate_str[27]; // "26/Apr/2024:09:42:32 +0200"
+				// "26/Apr/2024:09:42:32 +0200"
 
 				tv_ms_add(&tv, &logs->accept_date, logs->t_idle >= 0 ? logs->t_idle + logs->t_handshake : 0);
 				get_localtime(tv.tv_sec, &tm);
-				if (!localdate2str_log(localdate_str, tv.tv_sec, &tm, sizeof(localdate_str)))
-					goto out;
-				ret = lf_rawtext(tmplog, localdate_str, dst + maxsize - tmplog, &ctx);
+				if (ctx->options & LOG_OPT_ENCODE) {
+					if (!localdate2str_log(ctx->_buf, tv.tv_sec, &tm, sizeof(ctx->_buf)))
+						goto out;
+					ret = lf_rawtext(tmplog, ctx->_buf, dst + maxsize - tmplog, ctx);
+				}
+				else // speedup
+					ret = localdate2str_log(tmplog, tv.tv_sec, &tm, dst + maxsize - tmplog);
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
@@ -3992,15 +4080,13 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 			{
 				unsigned long value = logs->accept_date.tv_sec;
 
-				if (ctx.options & LOG_OPT_HEXA) {
-					char hex[9]; // enough to hold 32bit hex representation + NULL byte
-
-					iret = snprintf(hex, sizeof(hex), "%04X", (unsigned int)value);
+				if (ctx->options & LOG_OPT_HEXA) {
+					iret = snprintf(ctx->_buf, sizeof(ctx->_buf), "%04X", (unsigned int)value);
 					if (iret < 0 || iret >= dst + maxsize - tmplog)
 						goto out;
-					ret = lf_rawtext(tmplog, hex, dst + maxsize - tmplog, &ctx);
+					ret = lf_rawtext(tmplog, ctx->_buf, dst + maxsize - tmplog, ctx);
 				} else {
-					ret = lf_int(tmplog, dst + maxsize - tmplog, value, &ctx, LF_INT_LTOA);
+					ret = lf_int(tmplog, dst + maxsize - tmplog, value, ctx, LF_INT_LTOA);
 				}
 				if (ret == NULL)
 					goto out;
@@ -4012,16 +4098,14 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 			{
 				unsigned int value = (unsigned int)logs->accept_date.tv_usec/1000;
 
-				if (ctx.options & LOG_OPT_HEXA) {
-					char hex[9]; // enough to hold 32bit hex representation + NULL byte
-
-					iret = snprintf(hex, sizeof(hex), "%02X", value);
+				if (ctx->options & LOG_OPT_HEXA) {
+					iret = snprintf(ctx->_buf, sizeof(ctx->_buf), "%02X", value);
 					if (iret < 0 || iret >= dst + maxsize - tmplog)
 						goto out;
-					ret = lf_rawtext(tmplog, hex, dst + maxsize - tmplog, &ctx);
+					ret = lf_rawtext(tmplog, ctx->_buf, dst + maxsize - tmplog, ctx);
 				} else {
 					ret = lf_int(tmplog, dst + maxsize - tmplog, value,
-					             &ctx, LF_INT_UTOA_PAD_4);
+					             ctx, LF_INT_UTOA_PAD_4);
 				}
 				if (ret == NULL)
 					goto out;
@@ -4031,7 +4115,7 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 
 			case LOG_FMT_FRONTEND: // %f
 				src = fe->id;
-				ret = lf_text(tmplog, src, dst + maxsize - tmplog, &ctx);
+				ret = lf_text(tmplog, src, dst + maxsize - tmplog, ctx);
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
@@ -4040,7 +4124,7 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 			case LOG_FMT_FRONTEND_XPRT: // %ft
 				src = fe->id;
 				LOG_VARTEXT_START();
-				ret = lf_rawtext(tmplog, src, dst + maxsize - tmplog, &ctx);
+				ret = lf_rawtext(tmplog, src, dst + maxsize - tmplog, ctx);
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
@@ -4056,7 +4140,7 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 				if (conn) {
 					src = ssl_sock_get_cipher_name(conn);
 				}
-				ret = lf_text(tmplog, src, dst + maxsize - tmplog, &ctx);
+				ret = lf_text(tmplog, src, dst + maxsize - tmplog, ctx);
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
@@ -4068,7 +4152,7 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 				if (conn) {
 					src = ssl_sock_get_proto_version(conn);
 				}
-				ret = lf_text(tmplog, src, dst + maxsize - tmplog, &ctx);
+				ret = lf_text(tmplog, src, dst + maxsize - tmplog, ctx);
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
@@ -4076,7 +4160,7 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 #endif
 			case LOG_FMT_BACKEND: // %b
 				src = be->id;
-				ret = lf_text(tmplog, src, dst + maxsize - tmplog, &ctx);
+				ret = lf_text(tmplog, src, dst + maxsize - tmplog, ctx);
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
@@ -4099,21 +4183,21 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 					src = "<NOSRV>";
 					break;
 				}
-				ret = lf_text(tmplog, src, dst + maxsize - tmplog, &ctx);
+				ret = lf_text(tmplog, src, dst + maxsize - tmplog, ctx);
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
 				break;
 
 			case LOG_FMT_Th: // %Th = handshake time
-				ret = lf_int(tmplog, dst + maxsize - tmplog, logs->t_handshake, &ctx, LF_INT_LTOA);
+				ret = lf_int(tmplog, dst + maxsize - tmplog, logs->t_handshake, ctx, LF_INT_LTOA);
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
 				break;
 
 			case LOG_FMT_Ti: // %Ti = HTTP idle time
-				ret = lf_int(tmplog, dst + maxsize - tmplog, logs->t_idle, &ctx, LF_INT_LTOA);
+				ret = lf_int(tmplog, dst + maxsize - tmplog, logs->t_idle, ctx, LF_INT_LTOA);
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
@@ -4123,7 +4207,7 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 			{
 				long value = (t_request >= 0) ? t_request - logs->t_idle - logs->t_handshake : -1;
 
-				ret = lf_int(tmplog, dst + maxsize - tmplog, value, &ctx, LF_INT_LTOA);
+				ret = lf_int(tmplog, dst + maxsize - tmplog, value, ctx, LF_INT_LTOA);
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
@@ -4131,7 +4215,7 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 			}
 
 			case LOG_FMT_TQ: // %Tq = Th + Ti + TR
-				ret = lf_int(tmplog, dst + maxsize - tmplog, t_request, &ctx, LF_INT_LTOA);
+				ret = lf_int(tmplog, dst + maxsize - tmplog, t_request, ctx, LF_INT_LTOA);
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
@@ -4141,7 +4225,7 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 			{
 				long value = (logs->t_queue >= 0) ? logs->t_queue - t_request : -1;
 
-				ret = lf_int(tmplog, dst + maxsize - tmplog, value, &ctx, LF_INT_LTOA);
+				ret = lf_int(tmplog, dst + maxsize - tmplog, value, ctx, LF_INT_LTOA);
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
@@ -4152,7 +4236,7 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 			{
 				long value = (logs->t_connect >= 0) ? logs->t_connect - logs->t_queue : -1;
 
-				ret = lf_int(tmplog, dst + maxsize - tmplog, value, &ctx, LF_INT_LTOA);
+				ret = lf_int(tmplog, dst + maxsize - tmplog, value, ctx, LF_INT_LTOA);
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
@@ -4163,7 +4247,7 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 			{
 				long value = (logs->t_data >= 0) ? logs->t_data - logs->t_connect : -1;
 
-				ret = lf_int(tmplog, dst + maxsize - tmplog, value, &ctx, LF_INT_LTOA);
+				ret = lf_int(tmplog, dst + maxsize - tmplog, value, ctx, LF_INT_LTOA);
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
@@ -4179,7 +4263,7 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 				else
 					value = (logs->t_connect >= 0) ? logs->t_close - logs->t_connect : -1;
 
-				ret = lf_int(tmplog, dst + maxsize - tmplog, value, &ctx, LF_INT_LTOA);
+				ret = lf_int(tmplog, dst + maxsize - tmplog, value, ctx, LF_INT_LTOA);
 
 				if (ret == NULL)
 					goto out;
@@ -4193,7 +4277,7 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 
 				if (!(fe->to_log & LW_BYTES))
 					LOGMETACHAR('+');
-				ret = lf_int(tmplog, dst + maxsize - tmplog, value, &ctx, LF_INT_LTOA);
+				ret = lf_int(tmplog, dst + maxsize - tmplog, value, ctx, LF_INT_LTOA);
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
@@ -4203,7 +4287,7 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 			case LOG_FMT_TT:  // %Tt = total time
 				if (!(fe->to_log & LW_BYTES))
 					LOGMETACHAR('+');
-				ret = lf_int(tmplog, dst + maxsize - tmplog, logs->t_close, &ctx, LF_INT_LTOA);
+				ret = lf_int(tmplog, dst + maxsize - tmplog, logs->t_close, ctx, LF_INT_LTOA);
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
@@ -4215,7 +4299,7 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 
 				if (!(fe->to_log & LW_BYTES))
 					LOGMETACHAR('+');
-				ret = lf_int(tmplog, dst + maxsize - tmplog, value, &ctx, LF_INT_LTOA);
+				ret = lf_int(tmplog, dst + maxsize - tmplog, value, ctx, LF_INT_LTOA);
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
@@ -4223,7 +4307,7 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 			}
 
 			case LOG_FMT_STATUS: // %ST
-				ret = lf_int(tmplog, dst + maxsize - tmplog, status, &ctx, LF_INT_LTOA);
+				ret = lf_int(tmplog, dst + maxsize - tmplog, status, ctx, LF_INT_LTOA);
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
@@ -4232,14 +4316,14 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 			case LOG_FMT_BYTES: // %B
 				if (!(fe->to_log & LW_BYTES))
 					LOGMETACHAR('+');
-				ret = lf_int(tmplog, dst + maxsize - tmplog, logs->bytes_out, &ctx, LF_INT_LLTOA);
+				ret = lf_int(tmplog, dst + maxsize - tmplog, logs->bytes_out, ctx, LF_INT_LLTOA);
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
 				break;
 
 			case LOG_FMT_BYTES_UP: // %U
-				ret = lf_int(tmplog, dst + maxsize - tmplog, logs->bytes_in, &ctx, LF_INT_LLTOA);
+				ret = lf_int(tmplog, dst + maxsize - tmplog, logs->bytes_in, ctx, LF_INT_LLTOA);
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
@@ -4247,7 +4331,7 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 
 			case LOG_FMT_CCLIENT: // %CC
 				src = txn ? txn->cli_cookie : NULL;
-				ret = lf_text(tmplog, src, dst + maxsize - tmplog, &ctx);
+				ret = lf_text(tmplog, src, dst + maxsize - tmplog, ctx);
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
@@ -4255,7 +4339,7 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 
 			case LOG_FMT_CSERVER: // %CS
 				src = txn ? txn->srv_cookie : NULL;
-				ret = lf_text(tmplog, src, dst + maxsize - tmplog, &ctx);
+				ret = lf_text(tmplog, src, dst + maxsize - tmplog, ctx);
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
@@ -4263,11 +4347,9 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 
 			case LOG_FMT_TERMSTATE: // %ts
 			{
-				char _ts[2];
-
-				_ts[0] = sess_term_cond[(s_flags & SF_ERR_MASK) >> SF_ERR_SHIFT];
-				_ts[1] = sess_fin_state[(s_flags & SF_FINST_MASK) >> SF_FINST_SHIFT];
-				ret = lf_rawtext_len(tmplog, _ts, 2, maxsize - (tmplog - dst), &ctx);
+				ctx->_buf[0] = sess_term_cond[(s_flags & SF_ERR_MASK) >> SF_ERR_SHIFT];
+				ctx->_buf[1] = sess_fin_state[(s_flags & SF_FINST_MASK) >> SF_FINST_SHIFT];
+				ret = lf_rawtext_len(tmplog, ctx->_buf, 2, maxsize - (tmplog - dst), ctx);
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
@@ -4276,13 +4358,11 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 
 			case LOG_FMT_TERMSTATE_CK: // %tsc, same as TS with cookie state (for mode HTTP)
 			{
-				char _tsc[4];
-
-				_tsc[0] = sess_term_cond[(s_flags & SF_ERR_MASK) >> SF_ERR_SHIFT];
-				_tsc[1] = sess_fin_state[(s_flags & SF_FINST_MASK) >> SF_FINST_SHIFT];
-				_tsc[2] = (txn && (be->ck_opts & PR_CK_ANY)) ? sess_cookie[(txn->flags & TX_CK_MASK) >> TX_CK_SHIFT] : '-';
-				_tsc[3] = (txn && (be->ck_opts & PR_CK_ANY)) ? sess_set_cookie[(txn->flags & TX_SCK_MASK) >> TX_SCK_SHIFT] : '-';
-				ret = lf_rawtext_len(tmplog, _tsc, 4, maxsize - (tmplog - dst), &ctx);
+				ctx->_buf[0] = sess_term_cond[(s_flags & SF_ERR_MASK) >> SF_ERR_SHIFT];
+				ctx->_buf[1] = sess_fin_state[(s_flags & SF_FINST_MASK) >> SF_FINST_SHIFT];
+				ctx->_buf[2] = (txn && (be->ck_opts & PR_CK_ANY)) ? sess_cookie[(txn->flags & TX_CK_MASK) >> TX_CK_SHIFT] : '-';
+				ctx->_buf[3] = (txn && (be->ck_opts & PR_CK_ANY)) ? sess_set_cookie[(txn->flags & TX_SCK_MASK) >> TX_SCK_SHIFT] : '-';
+				ret = lf_rawtext_len(tmplog, ctx->_buf, 4, maxsize - (tmplog - dst), ctx);
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
@@ -4290,21 +4370,21 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 			}
 
 			case LOG_FMT_ACTCONN: // %ac
-				ret = lf_int(tmplog, dst + maxsize - tmplog, actconn, &ctx, LF_INT_LTOA);
+				ret = lf_int(tmplog, dst + maxsize - tmplog, actconn, ctx, LF_INT_LTOA);
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
 				break;
 
 			case LOG_FMT_FECONN:  // %fc
-				ret = lf_int(tmplog, dst + maxsize - tmplog, fe->feconn, &ctx, LF_INT_LTOA);
+				ret = lf_int(tmplog, dst + maxsize - tmplog, fe->feconn, ctx, LF_INT_LTOA);
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
 				break;
 
 			case LOG_FMT_BECONN:  // %bc
-				ret = lf_int(tmplog, dst + maxsize - tmplog, be->beconn, &ctx, LF_INT_LTOA);
+				ret = lf_int(tmplog, dst + maxsize - tmplog, be->beconn, ctx, LF_INT_LTOA);
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
@@ -4328,7 +4408,7 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 					break;
 				}
 
-				ret = lf_int(tmplog, dst + maxsize - tmplog, value, &ctx, LF_INT_ULTOA);
+				ret = lf_int(tmplog, dst + maxsize - tmplog, value, ctx, LF_INT_ULTOA);
 
 				if (ret == NULL)
 					goto out;
@@ -4342,7 +4422,7 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 
 				if (s_flags & SF_REDISP)
 					LOGMETACHAR('+');
-				ret = lf_int(tmplog, dst + maxsize - tmplog, value, &ctx, LF_INT_LTOA);
+				ret = lf_int(tmplog, dst + maxsize - tmplog, value, ctx, LF_INT_LTOA);
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
@@ -4351,7 +4431,7 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 
 			case LOG_FMT_SRVQUEUE: // %sq
 				ret = lf_int(tmplog, dst + maxsize - tmplog, logs->srv_queue_pos,
-				             &ctx, LF_INT_LTOA);
+				             ctx, LF_INT_LTOA);
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
@@ -4359,7 +4439,7 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 
 			case LOG_FMT_BCKQUEUE:  // %bq
 				ret = lf_int(tmplog, dst + maxsize - tmplog, logs->prx_queue_pos,
-				             &ctx, LF_INT_LTOA);
+				             ctx, LF_INT_LTOA);
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
@@ -4375,7 +4455,7 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 							LOGCHAR('|');
 						if (s->req_cap[hdr] != NULL) {
 							ret = lf_encode_string(tmplog, dst + maxsize,
-							                       '#', hdr_encode_map, s->req_cap[hdr], &ctx);
+							                       '#', hdr_encode_map, s->req_cap[hdr], ctx);
 							if (ret == NULL)
 								goto out;
 							tmplog = ret;
@@ -4395,11 +4475,11 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 						LOG_VARTEXT_START();
 						if (s->req_cap[hdr] != NULL) {
 							ret = lf_encode_string(tmplog, dst + maxsize,
-							                       '#', hdr_encode_map, s->req_cap[hdr], &ctx);
+							                       '#', hdr_encode_map, s->req_cap[hdr], ctx);
 							if (ret == NULL)
 								goto out;
 							tmplog = ret;
-						} else if (!(ctx.options & LOG_OPT_QUOTE))
+						} else if (!(ctx->options & LOG_OPT_QUOTE))
 							LOGCHAR('-');
 						/* Manually end variable text as we're emitting multiple
 						 * texts at once
@@ -4421,7 +4501,7 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 							LOGCHAR('|');
 						if (s->res_cap[hdr] != NULL) {
 							ret = lf_encode_string(tmplog, dst + maxsize,
-							                       '#', hdr_encode_map, s->res_cap[hdr], &ctx);
+							                       '#', hdr_encode_map, s->res_cap[hdr], ctx);
 							if (ret == NULL)
 								goto out;
 							tmplog = ret;
@@ -4441,11 +4521,11 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 						LOG_VARTEXT_START();
 						if (s->res_cap[hdr] != NULL) {
 							ret = lf_encode_string(tmplog, dst + maxsize,
-							                       '#', hdr_encode_map, s->res_cap[hdr], &ctx);
+							                       '#', hdr_encode_map, s->res_cap[hdr], ctx);
 							if (ret == NULL)
 								goto out;
 							tmplog = ret;
-						} else if (!(ctx.options & LOG_OPT_QUOTE))
+						} else if (!(ctx->options & LOG_OPT_QUOTE))
 							LOGCHAR('-');
 						/* Manually end variable text as we're emitting multiple
 						 * texts at once
@@ -4461,7 +4541,7 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 				LOG_VARTEXT_START();
 				uri = txn && txn->uri ? txn->uri : "<BADREQ>";
 				ret = lf_encode_string(tmplog, dst + maxsize,
-				                       '#', url_encode_map, uri, &ctx);
+				                       '#', url_encode_map, uri, ctx);
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
@@ -4495,7 +4575,7 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 					chunk.data = spc - uri;
 				}
 
-				ret = lf_encode_chunk(tmplog, dst + maxsize, '#', url_encode_map, &chunk, &ctx);
+				ret = lf_encode_chunk(tmplog, dst + maxsize, '#', url_encode_map, &chunk, ctx);
 				if (ret == NULL)
 					goto out;
 
@@ -4537,7 +4617,7 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 					chunk.data = path.len;
 				}
 
-				ret = lf_encode_chunk(tmplog, dst + maxsize, '#', url_encode_map, &chunk, &ctx);
+				ret = lf_encode_chunk(tmplog, dst + maxsize, '#', url_encode_map, &chunk, ctx);
 				if (ret == NULL)
 					goto out;
 
@@ -4567,7 +4647,7 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 					chunk.data = uri - qmark;
 				}
 
-				ret = lf_encode_chunk(tmplog, dst + maxsize, '#', url_encode_map, &chunk, &ctx);
+				ret = lf_encode_chunk(tmplog, dst + maxsize, '#', url_encode_map, &chunk, ctx);
 				if (ret == NULL)
 					goto out;
 
@@ -4603,7 +4683,7 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 					chunk.data = spc - uri;
 				}
 
-				ret = lf_encode_chunk(tmplog, dst + maxsize, '#', url_encode_map, &chunk, &ctx);
+				ret = lf_encode_chunk(tmplog, dst + maxsize, '#', url_encode_map, &chunk, ctx);
 				if (ret == NULL)
 					goto out;
 
@@ -4629,7 +4709,7 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 					chunk.data = spc - uri;
 				}
 
-				ret = lf_encode_chunk(tmplog, dst + maxsize, '#', url_encode_map, &chunk, &ctx);
+				ret = lf_encode_chunk(tmplog, dst + maxsize, '#', url_encode_map, &chunk, ctx);
 				if (ret == NULL)
 					goto out;
 
@@ -4670,7 +4750,7 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 					chunk.data = end - uri;
 				}
 
-				ret = lf_encode_chunk(tmplog, dst + maxsize, '#', url_encode_map, &chunk, &ctx);
+				ret = lf_encode_chunk(tmplog, dst + maxsize, '#', url_encode_map, &chunk, ctx);
 				if (ret == NULL)
 					goto out;
 
@@ -4679,15 +4759,13 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 				break;
 
 			case LOG_FMT_COUNTER: // %rt
-				if (ctx.options & LOG_OPT_HEXA) {
-					char hex[9]; // enough to hold 32bit hex representation + NULL byte
-
-					iret = snprintf(hex, sizeof(hex), "%04X", uniq_id);
+				if (ctx->options & LOG_OPT_HEXA) {
+					iret = snprintf(ctx->_buf, sizeof(ctx->_buf), "%04X", uniq_id);
 					if (iret < 0 || iret >= dst + maxsize - tmplog)
 						goto out;
-					ret = lf_rawtext(tmplog, hex, dst + maxsize - tmplog, &ctx);
+					ret = lf_rawtext(tmplog, ctx->_buf, dst + maxsize - tmplog, ctx);
 				} else {
-					ret = lf_int(tmplog, dst + maxsize - tmplog, uniq_id, &ctx, LF_INT_LTOA);
+					ret = lf_int(tmplog, dst + maxsize - tmplog, uniq_id, ctx, LF_INT_LTOA);
 				}
 				if (ret == NULL)
 					goto out;
@@ -4695,16 +4773,14 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 				break;
 
 			case LOG_FMT_LOGCNT: // %lc
-				if (ctx.options & LOG_OPT_HEXA) {
-					char hex[9]; // enough to hold 32bit hex representation + NULL byte
-
-					iret = snprintf(hex, sizeof(hex), "%04X", fe->log_count);
+				if (ctx->options & LOG_OPT_HEXA) {
+					iret = snprintf(ctx->_buf, sizeof(ctx->_buf), "%04X", fe->log_count);
 					if (iret < 0 || iret >= dst + maxsize - tmplog)
 						goto out;
-					ret = lf_rawtext(tmplog, hex, dst + maxsize - tmplog, &ctx);
+					ret = lf_rawtext(tmplog, ctx->_buf, dst + maxsize - tmplog, ctx);
 				} else {
 					ret = lf_int(tmplog, dst + maxsize - tmplog, fe->log_count,
-					             &ctx, LF_INT_ULTOA);
+					             ctx, LF_INT_ULTOA);
 				}
 				if (ret == NULL)
 					goto out;
@@ -4713,22 +4789,20 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 
 			case LOG_FMT_HOSTNAME: // %H
 				src = hostname;
-				ret = lf_text(tmplog, src, dst + maxsize - tmplog, &ctx);
+				ret = lf_text(tmplog, src, dst + maxsize - tmplog, ctx);
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
 				break;
 
 			case LOG_FMT_PID: // %pid
-				if (ctx.options & LOG_OPT_HEXA) {
-					char hex[9]; // enough to hold 32bit hex representation + NULL byte
-
-					iret = snprintf(hex, sizeof(hex), "%04X", pid);
+				if (ctx->options & LOG_OPT_HEXA) {
+					iret = snprintf(ctx->_buf, sizeof(ctx->_buf), "%04X", pid);
 					if (iret < 0 || iret >= dst + maxsize - tmplog)
 						goto out;
-					ret = lf_rawtext(tmplog, hex, dst + maxsize - tmplog, &ctx);
+					ret = lf_rawtext(tmplog, ctx->_buf, dst + maxsize - tmplog, ctx);
 				} else {
-					ret = lf_int(tmplog, dst + maxsize - tmplog, pid, &ctx, LF_INT_LTOA);
+					ret = lf_int(tmplog, dst + maxsize - tmplog, pid, ctx, LF_INT_LTOA);
 				}
 				if (ret == NULL)
 					goto out;
@@ -4738,9 +4812,9 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 			case LOG_FMT_UNIQUEID: // %ID
 				ret = NULL;
 				if (s)
-					ret = lf_text_len(tmplog, s->unique_id.ptr, s->unique_id.len, maxsize - (tmplog - dst), &ctx);
+					ret = lf_text_len(tmplog, s->unique_id.ptr, s->unique_id.len, maxsize - (tmplog - dst), ctx);
 				else
-					ret = lf_text_len(tmplog, NULL, 0, maxsize - (tmplog - dst), &ctx);
+					ret = lf_text_len(tmplog, NULL, 0, maxsize - (tmplog - dst), ctx);
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
@@ -4748,21 +4822,18 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 
 		}
  next_fmt:
-		if (tmp->type != LOG_FMT_SEPARATOR)
-			last_isspace = 0; // not a separator, hence not a space
-
 		if (value_beg == tmplog) {
 			/* handle the case where no data was generated for the value after
 			 * the key was already announced
 			 */
-			if (ctx.options & LOG_OPT_ENCODE_JSON) {
+			if (ctx->options & LOG_OPT_ENCODE_JSON) {
 				/* for JSON, we simply output 'null' */
 				iret = snprintf(tmplog, dst + maxsize - tmplog, "null");
 				if (iret < 0 || iret >= dst + maxsize - tmplog)
 					goto out;
 				tmplog += iret;
 			}
-			if (ctx.options & LOG_OPT_ENCODE_CBOR) {
+			if (ctx->options & LOG_OPT_ENCODE_CBOR) {
 				/* for CBOR, we have the '22' primitive which is known as
 				 * NULL
 				 */
@@ -4775,16 +4846,23 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 		 * to end it
 		 */
 		LOG_VARTEXT_END();
+		if (tmplog != value_beg) {
+			/* data was actually generated for the current dynamic
+			 * node, reset the space hint so that a new space may
+			 * now be emitted when relevant.
+			 */
+			last_isspace = 0;
+		}
 	}
 
 	/* back to global ctx (some encoding types may need to output
 	 * ending closure)
 	*/
-	lf_buildctx_prepare(&ctx, g_options, NULL);
+	lf_buildctx_prepare(ctx, g_options, NULL);
 
-	if (ctx.options & LOG_OPT_ENCODE_JSON)
+	if (ctx->options & LOG_OPT_ENCODE_JSON)
 		LOGCHAR('}');
-	else if (ctx.options & LOG_OPT_ENCODE_CBOR) {
+	else if (ctx->options & LOG_OPT_ENCODE_CBOR) {
 		/* end indefinite-length map */
 		LOG_CBOR_BYTE(0xFF);
 	}
@@ -5457,7 +5535,7 @@ ssize_t syslog_applet_append_event(void *ctx, struct ist v1, struct ist v2, size
 		return -2;
 
 	/* try to transfer it or report full */
-	trash.data += vp_peek_ofs(v1, v2, ofs, trash.area, len);
+	trash.data += vp_peek_ofs(v1, v2, ofs, trash.area + trash.data, len);
 	if (applet_putchk(appctx, &trash) == -1)
 		return -1;
 
@@ -5525,7 +5603,7 @@ int cfg_parse_log_forward(const char *file, int linenum, char **args, int kwm)
 		px->conf.file = strdup(file);
 		px->conf.line = linenum;
 		px->mode = PR_MODE_SYSLOG;
-		px->last_change = ns_to_sec(now_ns);
+		px->fe_counters.last_change = ns_to_sec(now_ns);
 		px->cap = PR_CAP_FE;
 		px->maxconn = 10;
 		px->timeout.client = TICK_ETERNITY;

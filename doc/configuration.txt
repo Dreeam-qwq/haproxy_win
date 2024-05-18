@@ -3,7 +3,7 @@
                           Configuration Manual
                          ----------------------
                               version 3.0
-                              2024/04/27
+                              2024/05/18
 
 
 This document covers the configuration language as implemented in the version
@@ -1290,7 +1290,11 @@ The following keywords are supported in the "global" section :
    - nbthread
    - node
    - numa-cpu-mapping
-   - ocsp_update.http_proxy
+   - ocsp-update.disable
+   - ocsp-update.maxdelay
+   - ocsp-update.mindelay
+   - ocsp-update.httpproxy
+   - ocsp-update.mode
    - pidfile
    - pp2-never-send-local
    - presetenv
@@ -1406,6 +1410,7 @@ The following keywords are supported in the "global" section :
    - tune.pt.zero-copy-forwarding
    - tune.quic.cc-hystart
    - tune.quic.frontend.conn-tx-buffers.limit
+   - tune.quic.frontend.glitches-threshold
    - tune.quic.frontend.max-idle-timeout
    - tune.quic.frontend.max-streams-bidi
    - tune.quic.max-frame-loss
@@ -1436,8 +1441,8 @@ The following keywords are supported in the "global" section :
    - tune.ssl.lifetime
    - tune.ssl.maxrecord
    - tune.ssl.ssl-ctx-cache-size
-   - tune.ssl.ocsp-update.maxdelay
-   - tune.ssl.ocsp-update.mindelay
+   - tune.ssl.ocsp-update.maxdelay (deprecated)
+   - tune.ssl.ocsp-update.mindelay (deprecated)
    - tune.vars.global-max-size
    - tune.vars.proc-max-size
    - tune.vars.reqres-max-size
@@ -2169,10 +2174,39 @@ numa-cpu-mapping
   already specified, for example via the 'cpu-map' directive or the taskset
   utility.
 
-ocsp_update.http_proxy <address>[:port]
+ocsp-update.disable [ on | off ]
+  Disable completely the ocsp-update in HAProxy. Any ocsp-update configuration
+  will be ignored. Default is "off".
+  See option "ocsp-update" for more information about the auto update
+  mechanism.
+
+ocsp-update.httpproxy <address>[:port]
   Allow to use an HTTP proxy for the OCSP updates. This only works with HTTP,
   HTTPS is not supported. This option will allow the OCSP updater to send
   absolute URI in the request to the proxy.
+
+ocsp-update.maxdelay <number>
+tune.ssl.ocsp-update.maxdelay <number> (deprecated)
+  Sets the maximum interval between two automatic updates of the same OCSP
+  response. This time is expressed in seconds and defaults to 3600 (1 hour). It
+  must be set to a higher value than "ocsp-update.mindelay". See
+  option "ocsp-update" for more information about the auto update mechanism.
+
+ocsp-update.mindelay <number>
+tune.ssl.ocsp-update.mindelay <number> (deprecated)
+  Sets the minimum interval between two automatic updates of the same OCSP
+  response. This time is expressed in seconds and defaults to 300 (5 minutes).
+  It is particularly useful for OCSP response that do not have explicit
+  expiration times. It must be set to a lower value than
+  "ocsp-update.maxdelay". See option "ocsp-update" for more
+  information about the auto update mechanism.
+
+ocsp-update.mode [ on | off ]
+  Sets the default ocsp-update mode for all certificates used in the
+  configuration. This global option can be superseded by the crt-list
+  "ocsp-update" option. This option is set to "off" by default.
+  See option "ocsp-update" for more information about the auto update
+  mechanism.
 
 pidfile <pidfile>
   Writes PIDs of all daemons into file <pidfile> when daemon mode or writes PID
@@ -3104,26 +3138,24 @@ tune.applet.zero-copy-forwarding { on | off }
 
 tune.buffers.limit <number>
   Sets a hard limit on the number of buffers which may be allocated per process.
-  The default value is zero which means unlimited. The minimum non-zero value
-  will always be greater than "tune.buffers.reserve" and should ideally always
-  be about twice as large. Forcing this value can be particularly useful to
-  limit the amount of memory a process may take, while retaining a sane
-  behavior. When this limit is reached, streams which need a buffer wait for
-  another one to be released by another stream. Since buffers are dynamically
-  allocated and released, the waiting time is very short and not perceptible
-  provided that limits remain reasonable. In fact sometimes reducing the limit
-  may even increase performance by increasing the CPU cache's efficiency. Tests
-  have shown good results on average HTTP traffic with a limit to 1/10 of the
-  expected global maxconn setting, which also significantly reduces memory
-  usage. The memory savings come from the fact that a number of connections
-  will not allocate 2*tune.bufsize. It is best not to touch this value unless
-  advised to do so by an HAProxy core developer.
+  The default value is zero which means unlimited. The limit will automatically
+  be re-adjusted to satisfy the reserved buffers for emergency situations so
+  that the user doesn't have to perform complicated calculations. Forcing this
+  value can be particularly useful to limit the amount of memory a process may
+  take, while retaining a sane behavior. When this limit is reached, a task
+  that requests a buffer waits for another one to be released first. Most of
+  the time the waiting time is very short and not perceptible provided that
+  limits remain reasonable. However, some historical limitations have weakened
+  this mechanism over versions and it is known that in certain situations of
+  sustained shortage, some tasks may freeze until their timeout expires, so it
+  is safer to avoid using this when not strictly necessary.
 
 tune.buffers.reserve <number>
-  Sets the number of buffers which are pre-allocated and reserved for use only
-  during memory shortage conditions resulting in failed memory allocations. The
-  minimum value is 2 and is also the default. There is no reason a user would
-  want to change this value, it's mostly aimed at HAProxy core developers.
+  Sets the number of per-thread buffers which are pre-allocated and reserved
+  for use only during memory shortage conditions resulting in failed memory
+  allocations. The minimum value is 0 and the default is 4. There is no reason
+  a user would want to change this value, unless a core developer suggests to
+  change it for a very specific reason.
 
 tune.bufsize <number>
   Sets the buffer size to this size (in bytes). Lower values allow more
@@ -3458,10 +3490,17 @@ tune.lua.forced-yield <number>
   This directive forces the Lua engine to execute a yield each <number> of
   instructions executed. This permits interrupting a long script and allows the
   HAProxy scheduler to process other tasks like accepting connections or
-  forwarding traffic. The default value is 10000 instructions. If HAProxy often
-  executes some Lua code but more responsiveness is required, this value can be
-  lowered. If the Lua code is quite long and its result is absolutely required
-  to process the data, the <number> can be increased.
+  forwarding traffic. The default value is 10000 instructions for scripts loaded
+  using "lua-load-per-thread" and MAX(500, 10000 / nbthread) instructions for
+  scripts loaded using "lua-load" (it was found to be an optimal value for
+  performance while taking care of not creating thread contention with multiple
+  threads competing for the global lua lock).
+
+  If HAProxy often executes some Lua code but more responsiveness is required,
+  this value can be lowered. If the Lua code is quite long and its result is
+  absolutely required to process the data, the <number> can be increased, but
+  the value should be set wisely as in multithreading context it could increase
+  contention.
 
 tune.lua.maxmem <number>
   Sets the maximum amount of RAM in megabytes per process usable by Lua. By
@@ -3690,6 +3729,18 @@ tune.quic.frontend.conn-tx-buffers.limit <number>
   drained on ACK reception. This setting has a direct impact on the throughput
   and memory consumption and can be adjusted according to an estimated round
   time-trip. Each buffer is tune.bufsize.
+
+tune.quic.frontend.glitches-threshold <number>
+  Sets the threshold for the number of glitches on a frontend connection, where
+  that connection will automatically be killed. This allows to automatically
+  kill misbehaving connections without having to write explicit rules for them.
+  The default value is zero, indicating that no threshold is set so that no
+  event will cause a connection to be closed. Beware that some QUIC clients may
+  occasionally cause a few glitches over long lasting connection, so any non-
+  zero value here should probably be in the hundreds or thousands to be
+  effective without affecting slightly bogus clients.
+
+  See also: fc_glitches
 
 tune.quic.frontend.max-idle-timeout <timeout>
   Sets the QUIC max_idle_timeout transport parameters in milliseconds for
@@ -3992,29 +4043,6 @@ tune.ssl.ssl-ctx-cache-size <number>
   entries. This is a LRU cache. Because generating a SSL certificate
   dynamically is expensive, they are cached. The default cache size is set to
   1000 entries.
-
-tune.ssl.ocsp-update.maxdelay <number>
-  Sets the maximum interval between two automatic updates of the same OCSP
-  response. This time is expressed in seconds and defaults to 3600 (1 hour). It
-  must be set to a higher value than "tune.ssl.ocsp-update.mindelay". See
-  option "ocsp-update" for more information about the auto update mechanism.
-
-tune.ssl.ocsp-update.mindelay <number>
-  Sets the minimum interval between two automatic updates of the same OCSP
-  response. This time is expressed in seconds and defaults to 300 (5 minutes).
-  It is particularly useful for OCSP response that do not have explicit
-  expiration times. It must be set to a lower value than
-  "tune.ssl.ocsp-update.maxdelay". See option "ocsp-update" for more
-  information about the auto update mechanism.
-
-tune.ssl.ocsp-update.mode [ on | off ]
-  Sets the default ocsp-update mode for all certificates used in the
-  configuration. This global option can be superseded by the crt-list
-  "ocsp-update" option but an error will be raised if a given certificate has
-  two distinct configurations simultaneously. This option is set to "off" by
-  default.
-  See option "ocsp-update" for more information about the auto update
-  mechanism.
 
 tune.stick-counters <number>
   Sets the number of stick-counters that may be tracked at the same time by a
@@ -4754,7 +4782,7 @@ httpclient.timeout.connect <timeout>
 3.12. Certificate Storage
 -------------------------
 
-HAProxy uses an internal storage mecanism to load and store certificates used
+HAProxy uses an internal storage mechanism to load and store certificates used
 in the configuration. This storage can be configured by using a "crt-store"
 section. It allows to configure certificate definitions and which files should
 be loaded in it. A certificate definition must be written before it is used
@@ -21316,7 +21344,7 @@ txn.sess_term_state : string
       http-after-response set-status 429 if { txn.sess_term_state  "sQ" }
 
 uuid([<version>]) : string
-  Returns a UUID following the RFC4122 standard. If the version is not
+  Returns a UUID following the RFC 9562 standard. If the version is not
   specified, a UUID version 4 (fully random) is returned.
 
   Versions 4 and 7 are supported.
@@ -21366,9 +21394,11 @@ bc_err                                             integer
 bc_err_str                                         string
 bc_glitches                                        integer
 bc_http_major                                      integer
+bc_nb_streams                                      integer
 bc_src                                             ip
 bc_src_port                                        integer
 bc_srv_queue                                       integer
+bc_settings_streams_limit                          integer
 be_id                                              integer
 be_name                                            string
 bc_rtt(<unit>)                                     integer
@@ -21395,6 +21425,7 @@ fc_fackets                                         integer
 fc_glitches                                        integer
 fc_http_major                                      integer
 fc_lost                                            integer
+fc_nb_streams                                      integer
 fc_pp_authority                                    string
 fc_pp_unique_id                                    string
 fc_pp_tlv(<id>)                                    string
@@ -21407,6 +21438,7 @@ fc_sacked                                          integer
 fc_src                                             ip
 fc_src_is_local                                    boolean
 fc_src_port                                        integer
+fc_settings_streams_limit                          integer
 fc_unacked                                         integer
 fe_defbe                                           string
 fe_id                                              integer
@@ -21639,6 +21671,9 @@ bc_http_major : integer
   for HTTP/0.9 to HTTP/1.1 or 2 for HTTP/2. Note, this is based on the on-wire
   encoding and not the version present in the request header.
 
+bc_nb_streams : integer
+  Returns the number of streams opened on the backend connection.
+
 bc_src : ip
   This is the source ip address of the connection on the server side, which is
   the server address HAProxy connected from. It is of type IP and works on both
@@ -21652,6 +21687,11 @@ bc_src_port : integer
 bc_srv_queue : integer
   Number of streams de-queued while waiting for a connection slot on the
   target server. This is the equivalent of %sq in the log-format.
+
+bc_settings_streams_limit : integer
+  Returns the maximum number of streams allowed on the backend connection. For
+  TCP and HTTP/1.1 connections, it is always 1. For other protocols, it depends
+  on the settings negociated with the server.
 
 be_id : integer
   Returns an integer containing the current backend's id. It can be used in
@@ -21877,6 +21917,9 @@ fc_lost : integer
   not TCP or if the operating system does not support TCP_INFO, for example
   Linux kernels before 2.4, the sample fetch fails.
 
+fc_nb_streams : integer
+  Returns the number of streams opened on the frontend connection.
+
 fc_pp_authority : string
   Returns the first authority TLV sent by the client in the PROXY protocol
   header, if any.
@@ -21962,6 +22005,10 @@ fc_src_port : integer
   connection on the client side. Only "tcp-request connection" rules may alter
   this address. See "src-port" for details.
 
+fc_settings_streams_limit : integer
+  Returns the maximum number of streams allowed on the frontend connection. For
+  TCP and HTTP/1.1 connections, it is always 1. For other protocols, it depends
+  on the settings negociated with the client.
 
 fc_unacked : integer
   Returns the unacked counter measured by the kernel for the client connection.
@@ -23604,9 +23651,13 @@ Summary of sample fetch methods in this section and their respective types:
   keyword                                             output type
 ----------------------------------------------------+-------------
 bs.id                                                 integer
+bs.aborted                                            boolean
+bs.rst_code                                           integer
 distcc_body(<token>[,<occ>])                          binary
 distcc_param(<token>[,<occ>])                         integer
 fs.id                                                 integer
+fs.aborted                                            boolean
+fs.rst_code                                           integer
 payload(<offset>,<length>)                            binary
 payload_lv(<offset1>,<length>[,<offset2>])            binary
 req.len                                               integer
@@ -23642,6 +23693,16 @@ bs.id : integer
   Returns the multiplexer's stream ID on the server side. It is the
   multiplexer's responsibility to return the appropriate information.
 
+bs.aborted: boolean
+  Returns true is an abort was received from the server for the current
+  stream. Otherwise false is returned.
+
+bs.rst_code: integer
+  Returns the reset code received from the server for the current stream. The
+  code of the H2 RST_STEAM frame or the QUIC STOP_SENDING frame received from
+  the server is returned. The sample fetch fails if no abort was received or if
+  the server stream is not an H2/QUIC stream.
+
 distcc_body(<token>[,<occ>]) : binary
   Parses a distcc message and returns the body associated to occurrence #<occ>
   of the token <token>. Occurrences start at 1, and when unspecified, any may
@@ -23672,6 +23733,16 @@ fs.id : integer
   Returns the multiplexer's stream ID on the client side. It is the
   multiplexer's responsibility to return the appropriate information. For
   instance, on a raw TCP, 0 is always returned because there is no stream.
+
+fs.aborted: boolean
+  Returns true is an abort was received from the client for the current
+  stream. Otherwise false is returned.
+
+fs.rst_code: integer
+  Returns the reset code received from the client for the current stream. The
+  code of the H2 RST_STEAM frame or the QUIC STOP_SENDING frame received from the
+  client is returned. The sample fetch fails if no abort was received or
+  if the client stream is not an H2/QUIC stream.
 
 payload(<offset>,<length>) : binary (deprecated)
   This is an alias for "req.payload" when used in the context of a request (e.g.
@@ -25767,7 +25838,7 @@ Flags are :
           as-is and '+E' option will be ignored.
           When combined with '+bin' option, it will directly generate raw
           binary CBOR payload. Be careful, because it will obviously generate
-          non-printable chars, thus it is mainly intented for use with
+          non-printable chars, thus it is mainly intended for use with
           set-var-fmt, rings and binary-capable log endpoints.
 
   Example:

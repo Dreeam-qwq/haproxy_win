@@ -65,6 +65,8 @@ enum {
 #define TH_FL_STARTED           0x00000010  /* set once the thread starts */
 #define TH_FL_IN_LOOP           0x00000020  /* set only inside the polling loop */
 
+/* we have 4 buffer-wait queues, in highest to lowest emergency order */
+#define DYNBUF_NBQ              4
 
 /* Thread group information. This defines a base and a count of global thread
  * IDs which belong to it, and which can be looked up into thread_info/ctx. It
@@ -133,18 +135,24 @@ struct thread_ctx {
 	int current_queue;                  /* points to current tasklet list being run, -1 if none */
 	unsigned int nb_tasks;              /* number of tasks allocated on this thread */
 	uint8_t tl_class_mask;              /* bit mask of non-empty tasklets classes */
+	uint8_t bufq_map;                   /* one bit per non-empty buffer_wq */
 
-	// 7 bytes hole here
+	// 2 bytes hole here
+	unsigned int nb_rhttp_conns;        /* count of current conns used for active reverse HTTP */
+	struct sched_activity *sched_profile_entry; /* profile entry in use by the current task/tasklet, only if sched_wake_date>0 */
+
+	ALWAYS_ALIGN(2*sizeof(void*));
+	struct list buffer_wq[DYNBUF_NBQ];  /* buffer waiters, 4 criticality-based queues */
 	struct list pool_lru_head;          /* oldest objects in thread-local pool caches */
-	struct list buffer_wq;              /* buffer waiters */
 	struct list streams;                /* list of streams attached to this thread */
 	struct list quic_conns;             /* list of active quic-conns attached to this thread */
 	struct list quic_conns_clo;         /* list of closing quic-conns attached to this thread */
 	struct list queued_checks;          /* checks waiting for a connection slot */
-	unsigned int nb_rhttp_conns;        /* count of current conns used for active reverse HTTP */
-
-	ALWAYS_ALIGN(2*sizeof(void*));
 	struct list tasklets[TL_CLASSES];   /* tasklets (and/or tasks) to run, by class */
+
+	void **emergency_bufs;              /* array of buffers allocated at boot. Next free one is [emergency_bufs_left-1] */
+	uint emergency_bufs_left;           /* number of emergency buffers left in magic_bufs[] */
+	// around 36 bytes here for thread-local variables
 
 	// third cache line here on 64 bits: accessed mostly using atomic ops
 	ALWAYS_ALIGN(64);
@@ -158,7 +166,6 @@ struct thread_ctx {
 
 	uint32_t sched_wake_date;           /* current task/tasklet's wake date or 0 */
 	uint32_t sched_call_date;           /* current task/tasklet's call date (valid if sched_wake_date > 0) */
-	struct sched_activity *sched_profile_entry; /* profile entry in use by the current task/tasklet, only if sched_wake_date>0 */
 
 	uint64_t prev_cpu_time;             /* previous per thread CPU time */
 	uint64_t prev_mono_time;            /* previous system wide monotonic time  */
@@ -172,6 +179,7 @@ struct thread_ctx {
 	unsigned long long out_bytes;           /* total #of bytes emitted */
 	unsigned long long spliced_out_bytes;   /* total #of bytes emitted though a kernel pipe */
 	struct buffer *thread_dump_buffer;      /* NULL out of dump, valid during a dump, 0x01 once done */
+	// around 64 bytes here for shared variables
 
 	ALWAYS_ALIGN(128);
 };

@@ -59,6 +59,8 @@ size_t appctx_snd_buf(struct stconn *sc, struct buffer *buf, size_t count, unsig
 
 int appctx_fastfwd(struct stconn *sc, unsigned int count, unsigned int flags);
 ssize_t applet_append_line(void *ctx, struct ist v1, struct ist v2, size_t ofs, size_t len);
+static forceinline void applet_fl_set(struct appctx *appctx, uint on);
+static forceinline void applet_fl_clr(struct appctx *appctx, uint off);
 
 static inline struct appctx *appctx_new_here(struct applet *applet, struct sedesc *sedesc)
 {
@@ -84,17 +86,23 @@ static inline void appctx_release_buf(struct appctx *appctx, struct buffer *bptr
 }
 
 /*
- * Allocate a buffer. If if fails, it adds the appctx in buffer wait queue.
+ * Allocate a buffer. If if fails, it adds the appctx in buffer wait queue and
+ * sets the relevant blocking flag depending on the side (assuming that bptr is
+ * either &appctx->inbuf or &appctx->outbuf). Upon success it will also clear
+ * the equivalent MAYALLOC flags.
  */
 static inline struct buffer *appctx_get_buf(struct appctx *appctx, struct buffer *bptr)
 {
 	struct buffer *buf = NULL;
+	int is_inbuf = (bptr == &appctx->inbuf);
 
-	if (likely(!LIST_INLIST(&appctx->buffer_wait.list)) &&
-	    unlikely((buf = b_alloc(bptr)) == NULL)) {
-		appctx->buffer_wait.target = appctx;
-		appctx->buffer_wait.wakeup_cb = appctx_buf_available;
-		LIST_APPEND(&th_ctx->buffer_wq, &appctx->buffer_wait.list);
+	if (likely(!LIST_INLIST(&appctx->buffer_wait.list))) {
+		if (unlikely((buf = b_alloc(bptr, is_inbuf ? DB_MUX_TX : DB_SE_RX)) == NULL)) {
+			b_queue(is_inbuf ? DB_MUX_TX : DB_SE_RX, &appctx->buffer_wait, appctx, appctx_buf_available);
+			applet_fl_set(appctx, is_inbuf ? APPCTX_FL_INBLK_ALLOC : APPCTX_FL_OUTBLK_ALLOC);
+		} else {
+			applet_fl_clr(appctx, is_inbuf ? APPCTX_FL_IN_MAYALLOC : APPCTX_FL_OUT_MAYALLOC);
+		}
 	}
 	return buf;
 }
@@ -123,8 +131,7 @@ static inline void __appctx_free(struct appctx *appctx)
 	appctx_release_buf(appctx, &appctx->outbuf);
 
 	task_destroy(appctx->t);
-	if (LIST_INLIST(&appctx->buffer_wait.list))
-		LIST_DEL_INIT(&appctx->buffer_wait.list);
+	b_dequeue(&appctx->buffer_wait);
 	if (appctx->sess)
 		session_free(appctx->sess);
 	BUG_ON(appctx->sedesc && !se_fl_test(appctx->sedesc, SE_FL_ORPHAN));

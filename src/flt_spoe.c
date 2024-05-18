@@ -2852,21 +2852,19 @@ spoe_acquire_buffer(struct buffer *buf, struct buffer_wait *buffer_wait)
 	if (buf->size)
 		return 1;
 
-	if (LIST_INLIST(&buffer_wait->list))
-		LIST_DEL_INIT(&buffer_wait->list);
+	b_dequeue(buffer_wait);
 
-	if (b_alloc(buf))
+	if (b_alloc(buf, DB_CHANNEL))
 		return 1;
 
-	LIST_APPEND(&th_ctx->buffer_wq, &buffer_wait->list);
+	b_requeue(DB_CHANNEL, buffer_wait);
 	return 0;
 }
 
 static void
 spoe_release_buffer(struct buffer *buf, struct buffer_wait *buffer_wait)
 {
-	if (LIST_INLIST(&buffer_wait->list))
-		LIST_DEL_INIT(&buffer_wait->list);
+	b_dequeue(buffer_wait);
 
 	/* Release the buffer if needed */
 	if (buf->size) {
@@ -3014,7 +3012,7 @@ spoe_init(struct proxy *px, struct flt_conf *fconf)
 
 	/* conf->agent_fe was already initialized during the config
 	 * parsing. Finish initialization. */
-        conf->agent_fe.last_change = ns_to_sec(now_ns);
+        conf->agent_fe.fe_counters.last_change = ns_to_sec(now_ns);
         conf->agent_fe.cap = PR_CAP_FE;
         conf->agent_fe.mode = PR_MODE_TCP;
         conf->agent_fe.maxconn = 0;

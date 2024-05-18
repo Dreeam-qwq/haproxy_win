@@ -356,8 +356,6 @@ int ssl_sock_load_files_into_ckch(const char *path, struct ckch_data *data, char
 		goto end;
 	}
 
-	data->ocsp_update_mode = global_ssl.ocsp_update.mode;
-
 	/* remove the ".crt" extension */
 	if (global_ssl.extra_files_noext) {
 		char *ext;
@@ -829,8 +827,6 @@ struct ckch_data *ssl_sock_copy_cert_key_and_chain(struct ckch_data *src,
 
 	dst->ocsp_cid = OCSP_CERTID_dup(src->ocsp_cid);
 
-	dst->ocsp_update_mode = src->ocsp_update_mode;
-
 	return dst;
 
 error:
@@ -913,11 +909,7 @@ void ckch_store_free(struct ckch_store *store)
 	ha_free(&store->data);
 
 	/* free the ckch_conf content */
-	free(store->conf.crt);
-	free(store->conf.key);
-	free(store->conf.ocsp);
-	free(store->conf.issuer);
-	free(store->conf.sctl);
+	ckch_conf_clean(&store->conf);
 
 	free(store);
 }
@@ -970,6 +962,9 @@ struct ckch_store *ckchs_dup(const struct ckch_store *src)
 	if (!ssl_sock_copy_cert_key_and_chain(src->data, dst->data))
 		goto error;
 
+
+	dst->conf.ocsp_update_mode = src->conf.ocsp_update_mode;
+
 	return dst;
 
 error:
@@ -995,7 +990,7 @@ struct ckch_store *ckchs_lookup(char *path)
 /*
  * This function allocate a ckch_store and populate it with certificates from files.
  */
-struct ckch_store *new_ckch_store_load_files_path(char *path, char **err)
+struct ckch_store *ckch_store_new_load_files_path(char *path, char **err)
 {
 	struct ckch_store *ckchs;
 
@@ -1008,6 +1003,8 @@ struct ckch_store *new_ckch_store_load_files_path(char *path, char **err)
 	if (ssl_sock_load_files_into_ckch(path, ckchs->data, err) == 1)
 		goto end;
 
+	ckchs->conf.used = CKCH_CONF_SET_EMPTY;
+
 	/* insert into the ckchs tree */
 	memcpy(ckchs->path, path, strlen(path) + 1);
 	ebst_insert(&ckchs_tree, &ckchs->node);
@@ -1019,6 +1016,35 @@ end:
 	return NULL;
 }
 
+/*
+ * This function allocate a ckch_store and populate it with certificates using
+ * the ckch_conf structure.
+ */
+struct ckch_store *ckch_store_new_load_files_conf(char *name, struct ckch_conf *conf, char **err)
+{
+	struct ckch_store *ckchs;
+	int cfgerr = ERR_NONE;
+
+	ckchs = ckch_store_new(name);
+	if (!ckchs) {
+		memprintf(err, "%sunable to allocate memory.\n", err && *err ? *err : "");
+		goto end;
+	}
+
+	cfgerr = ckch_store_load_files(conf, ckchs, 0, err);
+	if (cfgerr & ERR_FATAL)
+		goto end;
+
+	/* insert into the ckchs tree */
+	memcpy(ckchs->path, name, strlen(name) + 1);
+	ebst_insert(&ckchs_tree, &ckchs->node);
+	return ckchs;
+
+end:
+	ckch_store_free(ckchs);
+
+	return NULL;
+}
 
 /********************  ckch_inst functions ******************************/
 
@@ -4002,63 +4028,84 @@ static int crtstore_load = 0; /* did we already load in this crt-store */
 
 struct ckch_conf_kws ckch_conf_kws[] = {
 	{ "alias",                               -1,                 PARSE_TYPE_NONE, NULL,                                  NULL },
-	{ "crt",    offsetof(struct ckch_conf, crt),    PARSE_TYPE_STR, ssl_sock_load_pem_into_ckch,           &current_crtbase },
-	{ "key",    offsetof(struct ckch_conf, key),    PARSE_TYPE_STR, ssl_sock_load_key_into_ckch,           &current_keybase },
-	{ "ocsp",   offsetof(struct ckch_conf, ocsp),   PARSE_TYPE_STR, ssl_sock_load_ocsp_response_from_file, &current_crtbase },
-	{ "issuer", offsetof(struct ckch_conf, issuer), PARSE_TYPE_STR, ssl_sock_load_issuer_file_into_ckch,   &current_crtbase },
-	{ "sctl",   offsetof(struct ckch_conf, sctl),   PARSE_TYPE_STR, ssl_sock_load_sctl_from_file,          &current_crtbase },
+	{ "crt",    offsetof(struct ckch_conf, crt),    PARSE_TYPE_STR, ckch_conf_load_pem,           &current_crtbase },
+	{ "key",    offsetof(struct ckch_conf, key),    PARSE_TYPE_STR, ckch_conf_load_key,           &current_keybase },
+	{ "ocsp",   offsetof(struct ckch_conf, ocsp),   PARSE_TYPE_STR, ckch_conf_load_ocsp_response, &current_crtbase },
+	{ "issuer", offsetof(struct ckch_conf, issuer), PARSE_TYPE_STR, ckch_conf_load_ocsp_issuer,   &current_crtbase },
+	{ "sctl",   offsetof(struct ckch_conf, sctl),   PARSE_TYPE_STR, ckch_conf_load_sctl,          &current_crtbase },
+	{ "ocsp-update", offsetof(struct ckch_conf, ocsp_update_mode), PARSE_TYPE_ONOFF, ocsp_update_init, NULL   },
 	{ NULL,     -1,                                  PARSE_TYPE_STR, NULL,                                  NULL            }
 };
 
 /* crt-store does not try to find files, but use the stored filename */
-int ckch_store_load_files(struct ckch_conf *f, struct ckch_store *c, char **err)
+int ckch_store_load_files(struct ckch_conf *f, struct ckch_store *c, int cli, char **err)
 {
 	int i;
 	int err_code = 0;
-	int rc = 0;
+	int rc = 1;
 	struct ckch_data *d = c->data;
 
-	/* crt */
-	if (!f->crt) {
-		err_code |= ERR_ALERT | ERR_FATAL;
-		goto out;
-	}
-
 	for (i = 0; ckch_conf_kws[i].name; i++) {
-		char *src = NULL;
-		char **base = ckch_conf_kws[i].base;
+		void *src = NULL;
 
 		if (ckch_conf_kws[i].offset < 0)
 			continue;
 
-		src = *(char **)((intptr_t)f + (ptrdiff_t)ckch_conf_kws[i].offset);
-		if (src) {
-			char *path;
-			char path_base[PATH_MAX];
+		if (!ckch_conf_kws[i].func)
+			continue;
 
-			if (!ckch_conf_kws[i].func || ckch_conf_kws[i].type != PARSE_TYPE_STR)
-				continue;
+		src = (void *)((intptr_t)f + (ptrdiff_t)ckch_conf_kws[i].offset);
 
-			path = src;
+		switch (ckch_conf_kws[i].type) {
+			case PARSE_TYPE_STR:
+			{
+				char *v;
+				char *path;
+				char **base = ckch_conf_kws[i].base;
+				char path_base[PATH_MAX];
 
-			if (base && *base) {
-				if (*src != '/') {
-					int rv = snprintf(path_base, sizeof(path_base), "%s/%s", *base, src);
+				v = *(char **)src;
+				if (!v)
+					goto next;
+
+				path = v;
+				if (base && *base && *path != '/') {
+					int rv = snprintf(path_base, sizeof(path_base), "%s/%s", *base, path);
 					if (rv >= sizeof(path_base)) {
-						memprintf(err, "'%s/%s' : path too long", *base, src);
+						memprintf(err, "'%s/%s' : path too long", *base, path);
 						err_code |= ERR_ALERT | ERR_FATAL;
 						goto out;
 					}
 					path = path_base;
 				}
+				rc = ckch_conf_kws[i].func(path, NULL, d, cli, err);
+				if (rc) {
+					err_code |= ERR_ALERT | ERR_FATAL;
+					memprintf(err, "%s '%s' cannot be read or parsed.", err && *err ? *err : "", path);
+					goto out;
+				}
+				break;
 			}
-			rc = ckch_conf_kws[i].func(path, NULL, d, err);
-			if (rc) {
-				err_code |= ERR_ALERT | ERR_FATAL;
-				memprintf(err, "%s '%s' cannot be read or parsed.", err && *err ? *err : "", path);
-				goto out;
+
+			case PARSE_TYPE_INT:
+			case PARSE_TYPE_ONOFF:
+			{
+				int v = *(int *)src;
+				rc = ckch_conf_kws[i].func(&v, NULL, d, cli, err);
+				if (rc) {
+					err_code |= ERR_ALERT | ERR_FATAL;
+					memprintf(err, "%s '%d' cannot be read or parsed.", err && *err ? *err : "", v);
+					goto out;
+				}
+
+				break;
 			}
+
+			default:
+				break;
 		}
+next:
+		;
 	}
 
 out:
@@ -4098,9 +4145,188 @@ static int crtstore_parse_path_base(char **args, int section_type, struct proxy 
 		free(current_keybase);
 		current_keybase = strdup(args[1]);
 	}
-
 out:
 	return err_code;
+}
+
+/*
+ * Check if ckch_conf <prev> and <new> are compatible:
+ *
+ * new \ prev | EMPTY | CRTLIST  | CRTSTORE
+ * ----------------------------------------
+ *  EMPTY     |  OK   |  X       |   OK
+ * ----------------------------------------
+ *  CRTLIST   |  X    | CMP      |  CMP
+ * ----------------------------------------
+ *
+ * Return:
+ *  1 when the 2 structures have different variables or are incompatible
+ *  0 when the 2 structures have equal variables or are compatibles
+ */
+int ckch_conf_cmp(struct ckch_conf *prev, struct ckch_conf *new, char **err)
+{
+	int ret = 0;
+	int i;
+
+	/* compatibility check */
+
+	if (prev->used == CKCH_CONF_SET_EMPTY) {
+		if (new->used == CKCH_CONF_SET_CRTLIST) {
+			memprintf(err, "%sCan't use the certificate previously defined without any keyword with these keywords:\n", *err ? *err : "");
+			ret = 1;
+		}
+		if (new->used == CKCH_CONF_SET_EMPTY)
+			return 0;
+
+	} else if (prev->used == CKCH_CONF_SET_CRTLIST) {
+		if (new->used == CKCH_CONF_SET_EMPTY) {
+			memprintf(err, "%sCan't use the certificate previously defined with keywords without these keywords:\n", *err ? *err : "");
+			ret = 1;
+		}
+	} else if (prev->used == CKCH_CONF_SET_CRTSTORE) {
+		if (new->used == CKCH_CONF_SET_EMPTY)
+			return 0;
+	}
+
+
+	for (i = 0; ckch_conf_kws[i].name != NULL; i++) {
+
+		if (strcmp(ckch_conf_kws[i].name, "crt") == 0)
+			continue;
+
+		switch (ckch_conf_kws[i].type) {
+			case PARSE_TYPE_STR: {
+				char *avail1, *avail2;
+				avail1 = prev ? *(char **)((intptr_t)prev + (ptrdiff_t)ckch_conf_kws[i].offset) : NULL;
+				avail2 = new ? *(char **)((intptr_t)new + (ptrdiff_t)ckch_conf_kws[i].offset) : NULL;
+
+				/* must alert when strcmp is wrong, or when one of the field is NULL */
+				if (((avail1 && avail2) && strcmp(avail1, avail2) != 0) || (!!avail1 ^ !!avail2)) {
+					memprintf(err, "%s- different parameter '%s' : previously '%s' vs '%s'\n", *err ? *err : "", ckch_conf_kws[i].name, avail1, avail2);
+					ret = 1;
+				}
+			}
+			break;
+
+			default:
+				break;
+		}
+		/* special case for ocsp-update and default */
+		if (strcmp(ckch_conf_kws[i].name, "ocsp-update") == 0) {
+			int o1, o2; /* ocsp-update from the configuration */
+			int q1, q2; /* final ocsp-update value (from default) */
+
+
+			o1 = prev ? *(int *)((intptr_t)prev + (ptrdiff_t)ckch_conf_kws[i].offset) : 0;
+			o2 = new ? *(int *)((intptr_t)new + (ptrdiff_t)ckch_conf_kws[i].offset) : 0;
+
+			q1 = (o1 == SSL_SOCK_OCSP_UPDATE_DFLT) ? global_ssl.ocsp_update.mode : o1;
+			q2 = (o2 == SSL_SOCK_OCSP_UPDATE_DFLT) ? global_ssl.ocsp_update.mode : o2;
+
+			if (q1 != q2) {
+				int j = 1;
+				int o = o1;
+				int q = q1;
+				memprintf(err, "%s- different parameter '%s' : previously ", *err ? *err : "", ckch_conf_kws[i].name);
+
+				do {
+					switch (o) {
+						case SSL_SOCK_OCSP_UPDATE_DFLT:
+							memprintf(err, "%s'default' (ocsp-update.mode %s)", *err ? *err : "", (q > 0) ? "on" : "off");
+						break;
+						case SSL_SOCK_OCSP_UPDATE_ON:
+							memprintf(err, "%s'%s'", *err ? *err : "", "on");
+						break;
+						case SSL_SOCK_OCSP_UPDATE_OFF:
+							memprintf(err, "%s'%s'", *err ? *err : "", "off");
+						break;
+					}
+					o = o2;
+					q = q2;
+					if (j)
+						memprintf(err, "%s vs ", *err ? *err : "");
+				} while (j--);
+				memprintf(err, "%s\n", *err ? *err : "");
+				ret = 1;
+			}
+		}
+	}
+
+out:
+	return ret;
+}
+
+/*
+ *  Compare a previously generated ckch_conf with an empty one, using ckch_conf_cmp().
+ */
+int ckch_conf_cmp_empty(struct ckch_conf *prev, char **err)
+{
+	struct ckch_conf new = {};
+
+	return ckch_conf_cmp(prev, &new, err);
+}
+
+/* parse ckch_conf keywords for crt-list */
+int ckch_conf_parse(char **args, int cur_arg, struct ckch_conf *f, int *found, const char *file, int linenum, char **err)
+{
+	int i;
+	int err_code = 0;
+
+	for (i = 0; ckch_conf_kws[i].name != NULL; i++) {
+		if (strcmp(ckch_conf_kws[i].name, args[cur_arg]) == 0) {
+			void *target;
+			*found = 1;
+			target = (char **)((intptr_t)f + (ptrdiff_t)ckch_conf_kws[i].offset);
+
+			if (ckch_conf_kws[i].type == PARSE_TYPE_STR) {
+				char **t = target;
+
+				*t = strdup(args[cur_arg + 1]);
+				if (!*t) {
+					ha_alert("parsing [%s:%d]: out of memory.\n", file, linenum);
+					err_code |= ERR_ALERT | ERR_ABORT;
+					goto out;
+				}
+			} else if (ckch_conf_kws[i].type == PARSE_TYPE_INT) {
+				int *t = target;
+				char *stop;
+
+				*t = strtol(args[cur_arg + 1], &stop, 10);
+				if (*stop != '\0') {
+					memprintf(err, "parsing [%s:%d] : cannot parse '%s' value '%s', an integer is expected.\n",
+					          file, linenum, args[cur_arg], args[cur_arg + 1]);
+					err_code |= ERR_ALERT | ERR_FATAL;
+					goto out;
+				}
+			} else if (ckch_conf_kws[i].type == PARSE_TYPE_ONOFF) {
+				int *t = target;
+
+				if (strcmp(args[cur_arg + 1], "on") == 0) {
+					*t = 1;
+				} else if (strcmp(args[cur_arg + 1], "off") == 0) {
+					*t = -1;
+				} else {
+					memprintf(err, "parsing [%s:%d] : cannot parse '%s' value '%s', 'on' or 'off' is expected.\n",
+					          file, linenum, args[cur_arg], args[cur_arg + 1]);
+					err_code |= ERR_ALERT | ERR_FATAL;
+					goto out;
+				}
+			}
+			break;
+		}
+	}
+out:
+	return err_code;
+}
+
+/* freeing the content of a ckch_conf structure */
+void ckch_conf_clean(struct ckch_conf *conf)
+{
+	free(conf->crt);
+	free(conf->key);
+	free(conf->ocsp);
+	free(conf->issuer);
+	free(conf->sctl);
 }
 
 static char current_crtstore_name[PATH_MAX] = {};
@@ -4108,7 +4334,6 @@ static char current_crtstore_name[PATH_MAX] = {};
 static int crtstore_parse_load(char **args, int section_type, struct proxy *curpx, const struct proxy *defpx,
                         const char *file, int linenum, char **err)
 {
-	int i;
 	int err_code = 0;
 	int cur_arg = 0;
 	struct ckch_conf f = {};
@@ -4122,65 +4347,31 @@ static int crtstore_parse_load(char **args, int section_type, struct proxy *curp
 	while (*(args[cur_arg])) {
 		int found = 0;
 
-		for (i = 0; ckch_conf_kws[i].name != NULL; i++) {
-			if (strcmp(ckch_conf_kws[i].name, args[cur_arg]) == 0) {
-				void *target;
-				found = 1;
-				target = (char **)((intptr_t)&f + (ptrdiff_t)ckch_conf_kws[i].offset);
+		if (strcmp("alias", args[cur_arg]) == 0) {
+			int rv;
 
-				if (strcmp("alias", args[cur_arg]) == 0) {
-					int rv;
-
-					if (*args[cur_arg + 1] == '/') {
-						memprintf(err, "parsing [%s:%d] : cannot parse '%s' value '%s', '/' is forbidden as the first character.\n",
-						          file, linenum, args[cur_arg], args[cur_arg + 1]);
-						err_code |= ERR_ALERT | ERR_FATAL;
-						goto out;
-					}
-
-					rv = snprintf(alias_name, sizeof(alias_name), "@%s/%s", current_crtstore_name, args[cur_arg + 1]);
-					if (rv >= sizeof(alias_name)) {
-						memprintf(err, "parsing [%s:%d] : cannot parse '%s' value '%s', too long, max len is %zd.\n",
-						          file, linenum, args[cur_arg], args[cur_arg + 1], sizeof(alias_name));
-						err_code |= ERR_ALERT | ERR_FATAL;
-						goto out;
-					}
-					final_name = alias_name;
-				} else if (ckch_conf_kws[i].type == PARSE_TYPE_STR) {
-					char **t = target;
-
-					*t = strdup(args[cur_arg + 1]);
-					if (!*t)
-						goto alloc_error;
-				} else if (ckch_conf_kws[i].type == PARSE_TYPE_INT) {
-					int *t = target;
-					char *stop;
-
-					*t = strtol(args[cur_arg + 1], &stop, 10);
-					if (*stop != '\0') {
-						memprintf(err, "parsing [%s:%d] : cannot parse '%s' value '%s', an integer is expected.\n",
-						          file, linenum, args[cur_arg], args[cur_arg + 1]);
-						err_code |= ERR_ALERT | ERR_FATAL;
-						goto out;
-					}
-				} else if (ckch_conf_kws[i].type == PARSE_TYPE_ONOFF) {
-					int *t = target;
-
-					if (strcmp(args[cur_arg + 1], "on") == 0) {
-						*t = 1;
-					} else if (strcmp(args[cur_arg + 1], "off") == 0) {
-						*t = 0;
-					} else {
-						memprintf(err, "parsing [%s:%d] : cannot parse '%s' value '%s', 'on' or 'off' is expected.\n",
-						          file, linenum, args[cur_arg], args[cur_arg + 1]);
-						err_code |= ERR_ALERT | ERR_FATAL;
-						goto out;
-					}
-				}
-				break;
+			if (*args[cur_arg + 1] == '/') {
+				memprintf(err, "parsing [%s:%d] : cannot parse '%s' value '%s', '/' is forbidden as the first character.\n",
+					  file, linenum, args[cur_arg], args[cur_arg + 1]);
+				err_code |= ERR_ALERT | ERR_FATAL;
+				goto out;
 			}
 
+			rv = snprintf(alias_name, sizeof(alias_name), "@%s/%s", current_crtstore_name, args[cur_arg + 1]);
+			if (rv >= sizeof(alias_name)) {
+				memprintf(err, "parsing [%s:%d] : cannot parse '%s' value '%s', too long, max len is %zd.\n",
+					  file, linenum, args[cur_arg], args[cur_arg + 1], sizeof(alias_name));
+				err_code |= ERR_ALERT | ERR_FATAL;
+				goto out;
+			}
+			final_name = alias_name;
+			found = 1;
+		} else {
+			err_code |= ckch_conf_parse(args, cur_arg, &f, &found, file, linenum, err);
+			if (err_code & ERR_FATAL)
+			goto out;
 		}
+
 		if (!found) {
 			memprintf(err,"parsing [%s:%d] : '%s %s' in section 'crt-store': unknown keyword '%s'.",
 			         file, linenum, args[0], args[cur_arg],args[cur_arg]);
@@ -4237,11 +4428,12 @@ static int crtstore_parse_load(char **args, int section_type, struct proxy *curp
 	if (!c)
 		goto alloc_error;
 
-	err_code |= ckch_store_load_files(&f, c, err);
+	err_code |= ckch_store_load_files(&f, c,  0, err);
 	if (err_code & ERR_FATAL)
 		goto out;
 
 	c->conf = f;
+	c->conf.used = CKCH_CONF_SET_CRTSTORE;
 
 	if (ebst_insert(&ckchs_tree, &c->node) != &c->node) {
 		memprintf(err,"parsing [%s:%d] : '%s' in section 'crt-store': store '%s' was already defined.",

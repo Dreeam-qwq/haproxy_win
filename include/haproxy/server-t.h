@@ -31,7 +31,6 @@
 #include <haproxy/check-t.h>
 #include <haproxy/connection-t.h>
 #include <haproxy/counters-t.h>
-#include <haproxy/freq_ctr-t.h>
 #include <haproxy/guid-t.h>
 #include <haproxy/listener-t.h>
 #include <haproxy/obj_type-t.h>
@@ -366,7 +365,6 @@ struct server {
 	int cur_sess;				/* number of currently active sessions (including syn_sent) */
 	int served;				/* # of active sessions currently being served (ie not pending) */
 	int consecutive_errors;			/* current number of consecutive errors */
-	struct freq_ctr sess_per_sec;		/* sessions per second on this server */
 	struct be_counters counters;		/* statistics counters */
 
 	/* Below are some relatively stable settings, only changed under the lock */
@@ -383,7 +381,6 @@ struct server {
 	struct xprt_ops *xprt;                  /* transport-layer operations */
 	unsigned int svc_port;                  /* the port to connect to (for relevant families) */
 	unsigned down_time;			/* total time the server was down */
-	time_t last_change;			/* last time, when the state was changed */
 
 	int puid;				/* proxy-unique server ID, used for SNMP, and "first" LB algo */
 	int tcp_ut;                             /* for TCP, user timeout */

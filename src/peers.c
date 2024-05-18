@@ -3219,7 +3219,7 @@ static void peer_session_forceshutdown(struct peer *peer)
 /* Pre-configures a peers frontend to accept incoming connections */
 void peers_setup_frontend(struct proxy *fe)
 {
-	fe->last_change = ns_to_sec(now_ns);
+	fe->fe_counters.last_change = ns_to_sec(now_ns);
 	fe->cap = PR_CAP_FE | PR_CAP_BE;
 	fe->mode = PR_MODE_PEERS;
 	fe->maxconn = 0;
@@ -3291,7 +3291,7 @@ static void sync_peer_learn_state(struct peers *peers, struct peer *peer)
 	if (peer->learnstate != PEER_LR_ST_FINISHED)
 		return;
 
-	/* The learning process is now fnished */
+	/* The learning process is now finished */
 	if (peer->flags & PEER_F_LEARN_NOTUP2DATE) {
 		/* Partial resync */
 		flags |= (peer->local ? PEERS_F_DBG_RESYNC_LOCALPARTIAL : PEERS_F_DBG_RESYNC_REMOTEPARTIAL);

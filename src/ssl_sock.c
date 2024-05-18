@@ -140,7 +140,8 @@ struct global_ssl global_ssl = {
 #ifndef OPENSSL_NO_OCSP
 	.ocsp_update.delay_max = SSL_OCSP_UPDATE_DELAY_MAX,
 	.ocsp_update.delay_min = SSL_OCSP_UPDATE_DELAY_MIN,
-	.ocsp_update.mode = SSL_SOCK_OCSP_UPDATE_DFLT,
+	.ocsp_update.mode = SSL_SOCK_OCSP_UPDATE_OFF,
+	.ocsp_update.disable = 0,
 #endif
 };
 
@@ -1106,8 +1107,9 @@ static int tlskeys_finalize_config(void)
  * Returns 1 if no ".ocsp" file found, 0 if OCSP status extension is
  * successfully enabled, or -1 in other error case.
  */
-static int ssl_sock_load_ocsp(const char *path, SSL_CTX *ctx, struct ckch_data *data, STACK_OF(X509) *chain)
+static int ssl_sock_load_ocsp(const char *path, SSL_CTX *ctx, struct ckch_store *store, STACK_OF(X509) *chain)
 {
+	struct ckch_data *data = store->data;
 	X509 *x, *issuer;
 	int i, ret = -1;
 	struct certificate_ocsp *ocsp = NULL, *iocsp;
@@ -1126,9 +1128,9 @@ static int ssl_sock_load_ocsp(const char *path, SSL_CTX *ctx, struct ckch_data *
 	char *err = NULL;
 	size_t path_len;
 	int inc_refcount_store = 0;
-	int enable_auto_update = (data->ocsp_update_mode == SSL_SOCK_OCSP_UPDATE_ON ||
-				  (data->ocsp_update_mode == SSL_SOCK_OCSP_UPDATE_DFLT &&
-				   global_ssl.ocsp_update.mode == SSL_SOCK_OCSP_UPDATE_ON));
+	int enable_auto_update = (store->conf.ocsp_update_mode == SSL_SOCK_OCSP_UPDATE_ON) ||
+	                         (store->conf.ocsp_update_mode == SSL_SOCK_OCSP_UPDATE_DFLT &&
+	                          global_ssl.ocsp_update.mode == SSL_SOCK_OCSP_UPDATE_ON);
 
 	x = data->cert;
 	if (!x)
@@ -1143,11 +1145,6 @@ static int ssl_sock_load_ocsp(const char *path, SSL_CTX *ctx, struct ckch_data *
 			ret = 0;
 			goto out;
 		}
-	} else {
-		/* If we have an OCSP response provided and the ocsp auto update
-		 * enabled, we must raise an error if no OCSP URI was found. */
-		if (data->ocsp_update_mode == SSL_SOCK_OCSP_UPDATE_ON && b_data(ocsp_uri) == 0)
-			goto out;
 	}
 
 	issuer = data->ocsp_issuer;
@@ -3320,9 +3317,10 @@ end:
  * The value 0 means there is no error nor warning and
  * the operation succeed.
  */
-static int ssl_sock_put_ckch_into_ctx(const char *path, struct ckch_data *data, SSL_CTX *ctx, char **err)
+static int ssl_sock_put_ckch_into_ctx(const char *path, struct ckch_store *store, SSL_CTX *ctx, char **err)
 {
 	int errcode = 0;
+	struct ckch_data *data = store->data;
 	STACK_OF(X509) *find_chain = NULL;
 
 	ERR_clear_error();
@@ -3374,7 +3372,7 @@ static int ssl_sock_put_ckch_into_ctx(const char *path, struct ckch_data *data, 
 	 * ocsp tree even if no ocsp_response was known during init, unless the
 	 * frontend's conf disables ocsp update explicitly.
 	 */
-	if (ssl_sock_load_ocsp(path, ctx, data, find_chain) < 0) {
+	if (ssl_sock_load_ocsp(path, ctx, store, find_chain) < 0) {
 		if (data->ocsp_response)
 			memprintf(err, "%s '%s.ocsp' is present and activates OCSP but it is impossible to compute the OCSP certificate ID (maybe the issuer could not be found)'.\n",
 				  err && *err ? *err : "", path);
@@ -3473,7 +3471,7 @@ int ckch_inst_new_load_store(const char *path, struct ckch_store *ckchs, struct 
 	if (global_ssl.security_level > -1)
 		SSL_CTX_set_security_level(ctx, global_ssl.security_level);
 
-	errcode |= ssl_sock_put_ckch_into_ctx(path, data, ctx, err);
+	errcode |= ssl_sock_put_ckch_into_ctx(path, ckchs, ctx, err);
 	if (errcode & ERR_CODE)
 		goto error;
 
@@ -3845,20 +3843,21 @@ int ssl_sock_load_cert(char *path, struct bind_conf *bind_conf, int is_default, 
 	}
 
 	if ((ckchs = ckchs_lookup(path))) {
+
+		cfgerr |= ckch_conf_cmp_empty(&ckchs->conf, err);
+		if (cfgerr & ERR_CODE) {
+			memprintf(err, "Can't load '%s', is already defined with incompatible parameters:\n %s", path, err ? *err : "");
+			return cfgerr;
+		}
+
 		/* we found the ckchs in the tree, we can use it directly */
 		 cfgerr |= ssl_sock_load_ckchs(path, ckchs, bind_conf, NULL, NULL, 0, is_default, &ckch_inst, err);
-
-		 /* The ckch_store might have been created through a crt-list
-		  * line so we must check that the ocsp-update modes are still
-		  * compatible between the global mode and the explicit one from
-		  * the crt-list. */
-		 cfgerr |= ocsp_update_check_cfg_consistency(ckchs, NULL, path, err);
 
 		 found++;
 	} else if (stat(path, &buf) == 0) {
 		found++;
 		if (S_ISDIR(buf.st_mode) == 0) {
-			ckchs = new_ckch_store_load_files_path(path, err);
+			ckchs = ckch_store_new_load_files_path(path, err);
 			if (!ckchs)
 				cfgerr |= ERR_ALERT | ERR_FATAL;
 			cfgerr |= ssl_sock_load_ckchs(path, ckchs, bind_conf, NULL, NULL, 0, is_default, &ckch_inst, err);
@@ -3886,7 +3885,7 @@ int ssl_sock_load_cert(char *path, struct bind_conf *bind_conf, int is_default, 
 				} else {
 					if (stat(fp, &buf) == 0) {
 						found++;
-						ckchs =  new_ckch_store_load_files_path(fp, err);
+						ckchs =  ckch_store_new_load_files_path(fp, err);
 						if (!ckchs)
 							cfgerr |= ERR_ALERT | ERR_FATAL;
 						cfgerr |= ssl_sock_load_ckchs(fp, ckchs, bind_conf, NULL, NULL, 0, is_default, &ckch_inst, err);
@@ -3939,7 +3938,7 @@ int ssl_sock_load_srv_cert(char *path, struct server *server, int create_if_none
 			/* We do not manage directories on backend side. */
 			if (S_ISDIR(buf.st_mode) == 0) {
 				++found;
-				ckchs = new_ckch_store_load_files_path(path, err);
+				ckchs = ckch_store_new_load_files_path(path, err);
 				if (!ckchs)
 					cfgerr |= ERR_ALERT | ERR_FATAL;
 				cfgerr |= ssl_sock_load_srv_ckchs(path, ckchs, server, &server->ssl_ctx.inst, err);
@@ -5717,7 +5716,7 @@ static int ssl_sock_init(struct connection *conn, void **xprt_ctx)
 
 #ifdef SSL_READ_EARLY_DATA_SUCCESS
 		if (bc->ssl_conf.early_data) {
-			b_alloc(&ctx->early_buf);
+			b_alloc(&ctx->early_buf, DB_MUX_RX);
 			SSL_set_max_early_data(ctx->ssl,
 			    /* Only allow early data if we managed to allocate
 			     * a buffer.
@@ -6222,7 +6221,7 @@ static void ssl_set_used(struct connection *conn, void *xprt_ctx)
 	if (!ctx || !ctx->wait_event.tasklet)
 		return;
 
-	HA_ATOMIC_OR(&ctx->wait_event.tasklet->state, TASK_F_USR1);
+	HA_ATOMIC_AND(&ctx->wait_event.tasklet->state, ~TASK_F_USR1);
 	if (ctx->xprt)
 		xprt_set_used(conn, ctx->xprt, ctx->xprt_ctx);
 }

@@ -30,13 +30,24 @@ int init_buffer()
 	void *buffer;
 	int thr;
 	int done;
+	int i;
 
 	pool_head_buffer = create_pool("buffer", global.tune.bufsize, MEM_F_SHARED|MEM_F_EXACT);
 	if (!pool_head_buffer)
 		return 0;
 
-	for (thr = 0; thr < MAX_THREADS; thr++)
-		LIST_INIT(&ha_thread_ctx[thr].buffer_wq);
+	/* make sure any change to the queues assignment isn't overlooked */
+	BUG_ON(DB_PERMANENT - DB_UNLIKELY - 1 != DYNBUF_NBQ);
+	BUG_ON(DB_MUX_RX_Q  < DB_SE_RX_Q   || DB_MUX_RX_Q  >= DYNBUF_NBQ);
+	BUG_ON(DB_SE_RX_Q   < DB_CHANNEL_Q || DB_SE_RX_Q   >= DYNBUF_NBQ);
+	BUG_ON(DB_CHANNEL_Q < DB_MUX_TX_Q  || DB_CHANNEL_Q >= DYNBUF_NBQ);
+	BUG_ON(DB_MUX_TX_Q >= DYNBUF_NBQ);
+
+	for (thr = 0; thr < MAX_THREADS; thr++) {
+		for (i = 0; i < DYNBUF_NBQ; i++)
+			LIST_INIT(&ha_thread_ctx[thr].buffer_wq[i]);
+		ha_thread_ctx[thr].bufq_map = 0;
+	}
 
 
 	/* The reserved buffer is what we leave behind us. Thus we always need
@@ -104,6 +115,7 @@ void buffer_dump(FILE *o, struct buffer *b, int from, int to)
 void __offer_buffers(void *from, unsigned int count)
 {
 	struct buffer_wait *wait, *wait_back;
+	int q;
 
 	/* For now, we consider that all objects need 1 buffer, so we can stop
 	 * waking up them once we have enough of them to eat all the available
@@ -111,15 +123,23 @@ void __offer_buffers(void *from, unsigned int count)
 	 * other tasks, but that's a rough estimate. Similarly, for each cached
 	 * event we'll need 1 buffer.
 	 */
-	list_for_each_entry_safe(wait, wait_back, &th_ctx->buffer_wq, list) {
-		if (!count)
-			break;
-
-		if (wait->target == from || !wait->wakeup_cb(wait->target))
+	for (q = 0; q < DYNBUF_NBQ; q++) {
+		if (!(th_ctx->bufq_map & (1 << q)))
 			continue;
+		BUG_ON_HOT(LIST_ISEMPTY(&th_ctx->buffer_wq[q]));
 
-		LIST_DEL_INIT(&wait->list);
-		count--;
+		list_for_each_entry_safe(wait, wait_back, &th_ctx->buffer_wq[q], list) {
+			if (!count)
+				break;
+
+			if (wait->target == from || !wait->wakeup_cb(wait->target))
+				continue;
+
+			LIST_DEL_INIT(&wait->list);
+			count--;
+		}
+		if (LIST_ISEMPTY(&th_ctx->buffer_wq[q]))
+			th_ctx->bufq_map &= ~(1 << q);
 	}
 }
 
@@ -143,8 +163,6 @@ static int cfg_parse_tune_buffers_limit(char **args, int section_type, struct pr
 	if (global.tune.buf_limit) {
 		if (global.tune.buf_limit < 3)
 			global.tune.buf_limit = 3;
-		if (global.tune.buf_limit <= global.tune.reserved_bufs)
-			global.tune.buf_limit = global.tune.reserved_bufs + 1;
 	}
 
 	return 0;
@@ -167,12 +185,42 @@ static int cfg_parse_tune_buffers_reserve(char **args, int section_type, struct 
 	}
 
 	global.tune.reserved_bufs = reserve;
-	if (global.tune.reserved_bufs < 2)
-		global.tune.reserved_bufs = 2;
-	if (global.tune.buf_limit && global.tune.buf_limit <= global.tune.reserved_bufs)
-		global.tune.buf_limit = global.tune.reserved_bufs + 1;
-
 	return 0;
+}
+
+/* allocate emergency buffers for the thread */
+static int alloc_emergency_buffers_per_thread(void)
+{
+	int idx;
+
+	th_ctx->emergency_bufs_left = global.tune.reserved_bufs;
+	th_ctx->emergency_bufs = calloc(global.tune.reserved_bufs, sizeof(*th_ctx->emergency_bufs));
+	if (!th_ctx->emergency_bufs)
+		return 0;
+
+	for (idx = 0; idx < global.tune.reserved_bufs; idx++) {
+		/* reserved bufs are not subject to the limit, so we must push it */
+		if (_HA_ATOMIC_LOAD(&pool_head_buffer->limit))
+			_HA_ATOMIC_INC(&pool_head_buffer->limit);
+		th_ctx->emergency_bufs[idx] = pool_alloc_flag(pool_head_buffer, POOL_F_NO_POISON | POOL_F_NO_FAIL);
+		if (!th_ctx->emergency_bufs[idx])
+			return 0;
+	}
+
+	return 1;
+}
+
+/* frees the thread's emergency buffers */
+static void free_emergency_buffers_per_thread(void)
+{
+	int idx;
+
+	if (th_ctx->emergency_bufs) {
+		for (idx = 0; idx < global.tune.reserved_bufs; idx++)
+			pool_free(pool_head_buffer, th_ctx->emergency_bufs[idx]);
+	}
+
+	ha_free(&th_ctx->emergency_bufs);
 }
 
 /* config keyword parsers */
@@ -183,6 +231,8 @@ static struct cfg_kw_list cfg_kws = {ILH, {
 }};
 
 INITCALL1(STG_REGISTER, cfg_register_keywords, &cfg_kws);
+REGISTER_PER_THREAD_ALLOC(alloc_emergency_buffers_per_thread);
+REGISTER_PER_THREAD_FREE(free_emergency_buffers_per_thread);
 
 /*
  * Local variables:

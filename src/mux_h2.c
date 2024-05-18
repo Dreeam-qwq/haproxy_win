@@ -812,13 +812,13 @@ static int h2_buf_available(void *target)
 	struct h2c *h2c = target;
 	struct h2s *h2s;
 
-	if ((h2c->flags & H2_CF_DEM_DALLOC) && b_alloc(&h2c->dbuf)) {
+	if ((h2c->flags & H2_CF_DEM_DALLOC) && b_alloc(&h2c->dbuf, DB_MUX_RX)) {
 		h2c->flags &= ~H2_CF_DEM_DALLOC;
 		h2c_restart_reading(h2c, 1);
 		return 1;
 	}
 
-	if ((h2c->flags & H2_CF_MUX_MALLOC) && b_alloc(br_tail(h2c->mbuf))) {
+	if ((h2c->flags & H2_CF_MUX_MALLOC) && b_alloc(br_tail(h2c->mbuf), DB_MUX_TX)) {
 		h2c->flags &= ~H2_CF_MUX_MALLOC;
 
 		if (h2c->flags & H2_CF_DEM_MROOM) {
@@ -830,7 +830,7 @@ static int h2_buf_available(void *target)
 
 	if ((h2c->flags & H2_CF_DEM_SALLOC) &&
 	    (h2s = h2c_st_by_id(h2c, h2c->dsi)) && h2s_sc(h2s) &&
-	    b_alloc(&h2s->rxbuf)) {
+	    b_alloc(&h2s->rxbuf, DB_SE_RX)) {
 		h2c->flags &= ~H2_CF_DEM_SALLOC;
 		h2c_restart_reading(h2c, 1);
 		return 1;
@@ -844,10 +844,8 @@ static inline struct buffer *h2_get_buf(struct h2c *h2c, struct buffer *bptr)
 	struct buffer *buf = NULL;
 
 	if (likely(!LIST_INLIST(&h2c->buf_wait.list)) &&
-	    unlikely((buf = b_alloc(bptr)) == NULL)) {
-		h2c->buf_wait.target = h2c;
-		h2c->buf_wait.wakeup_cb = h2_buf_available;
-		LIST_APPEND(&th_ctx->buffer_wq, &h2c->buf_wait.list);
+	    unlikely((buf = b_alloc(bptr, DB_MUX_RX)) == NULL)) {
+		b_queue(DB_MUX_RX, &h2c->buf_wait, h2c, h2_buf_available);
 	}
 	return buf;
 }
@@ -1195,8 +1193,7 @@ static void h2_release(struct h2c *h2c)
 
 	hpack_dht_free(h2c->ddht);
 
-	if (LIST_INLIST(&h2c->buf_wait.list))
-		LIST_DEL_INIT(&h2c->buf_wait.list);
+	b_dequeue(&h2c->buf_wait);
 
 	h2_release_buf(h2c, &h2c->dbuf);
 	h2_release_mbuf(h2c);
@@ -1262,6 +1259,20 @@ static inline __maybe_unused int h2s_id(const struct h2s *h2s)
 static inline int h2s_mws(const struct h2s *h2s)
 {
 	return h2s->sws + h2s->h2c->miw;
+}
+
+/* Returns 1 if the H2 error of the opposite side is forwardable to the peer.
+ * Otherwise 0 is returned.
+ * For now, only CANCEL from the client is forwardable to the server.
+ */
+static inline int h2s_is_forwardable_abort(struct h2s *h2s, struct se_abort_info *reason)
+{
+	enum h2_err err = H2_ERR_NO_ERROR;
+
+	if (reason && ((reason->info & SE_ABRT_SRC_MASK) >> SE_ABRT_SRC_SHIFT) == SE_ABRT_SRC_MUX_H2)
+		err = reason->code;
+
+	return ((h2s->h2c->flags & H2_CF_IS_BACK) && (err == H2_ERR_CANCEL));
 }
 
 /* marks an error on the connection. Before settings are sent, we must not send
@@ -2812,6 +2823,10 @@ static int h2c_handle_rst_stream(struct h2c *h2c, struct h2s *h2s)
 
 	if (h2s_sc(h2s)) {
 		se_fl_set_error(h2s->sd);
+		if (!h2s->sd->abort_info.info) {
+			h2s->sd->abort_info.info = (SE_ABRT_SRC_MUX_H2 << SE_ABRT_SRC_SHIFT);
+			h2s->sd->abort_info.code = h2s->errcode;
+		}
 		h2s_alert(h2s);
 	}
 
@@ -4711,6 +4726,12 @@ static int h2_ctl(struct connection *conn, enum mux_ctl_type mux_ctl, void *outp
 	case MUX_CTL_GET_GLITCHES:
 		return h2c->glitches;
 
+	case MUX_CTL_GET_NBSTRM:
+		return h2c->nb_streams;
+
+	case MUX_CTL_GET_MAXSTRM:
+		return h2c->streams_limit;
+
 	default:
 		return -1;
 	}
@@ -4888,7 +4909,7 @@ static void h2_detach(struct sedesc *sd)
 }
 
 /* Performs a synchronous or asynchronous shutr(). */
-static void h2_do_shutr(struct h2s *h2s)
+static void h2_do_shutr(struct h2s *h2s, struct se_abort_info *reason)
 {
 	struct h2c *h2c = h2s->h2c;
 
@@ -4910,6 +4931,10 @@ static void h2_do_shutr(struct h2s *h2s)
 		TRACE_STATE("stream wants to kill the connection", H2_EV_STRM_SHUT, h2c->conn, h2s);
 		h2c_error(h2c, H2_ERR_ENHANCE_YOUR_CALM);
 		h2s_error(h2s, H2_ERR_ENHANCE_YOUR_CALM);
+	}
+	else if (h2s_is_forwardable_abort(h2s, reason)) {
+		TRACE_STATE("shutr using opposite endp code", H2_EV_STRM_SHUT, h2c->conn, h2s);
+		h2s_error(h2s, reason->code);
 	}
 	else if (!(h2s->flags & H2_SF_HEADERS_SENT)) {
 		/* Nothing was never sent for this stream, so reset with
@@ -4956,8 +4981,9 @@ add_to_list:
 	return;
 }
 
+
 /* Performs a synchronous or asynchronous shutw(). */
-static void h2_do_shutw(struct h2s *h2s)
+static void h2_do_shutw(struct h2s *h2s, struct se_abort_info *reason)
 {
 	struct h2c *h2c = h2s->h2c;
 
@@ -4967,6 +4993,7 @@ static void h2_do_shutw(struct h2s *h2s)
 	TRACE_ENTER(H2_EV_STRM_SHUT, h2c->conn, h2s);
 
 	if (h2s->st != H2_SS_ERROR &&
+	    !h2s_is_forwardable_abort(h2s, reason) &&
 	    (h2s->flags & (H2_SF_HEADERS_SENT | H2_SF_MORE_HTX_DATA)) == H2_SF_HEADERS_SENT) {
 		/* we can cleanly close using an empty data frame only after headers
 		 * and if no more data is expected to be sent.
@@ -4990,6 +5017,10 @@ static void h2_do_shutw(struct h2s *h2s)
 			TRACE_STATE("stream wants to kill the connection", H2_EV_STRM_SHUT, h2c->conn, h2s);
 			h2c_error(h2c, H2_ERR_ENHANCE_YOUR_CALM);
 			h2s_error(h2s, H2_ERR_ENHANCE_YOUR_CALM);
+		}
+		else if (h2s_is_forwardable_abort(h2s, reason)) {
+			TRACE_STATE("shutw using opposite endp code", H2_EV_STRM_SHUT, h2c->conn, h2s);
+			h2s_error(h2s, reason->code);
 		}
 		else if (h2s->flags & H2_SF_MORE_HTX_DATA) {
 			/* some unsent data were pending (e.g. abort during an upload),
@@ -5057,10 +5088,10 @@ struct task *h2_deferred_shut(struct task *t, void *ctx, unsigned int state)
 	}
 
 	if (h2s->flags & H2_SF_WANT_SHUTW)
-		h2_do_shutw(h2s);
+		h2_do_shutw(h2s, NULL);
 
 	if (h2s->flags & H2_SF_WANT_SHUTR)
-		h2_do_shutr(h2s);
+		h2_do_shutr(h2s, NULL);
 
 	if (!(h2s->flags & (H2_SF_WANT_SHUTR|H2_SF_WANT_SHUTW))) {
 		/* We're done trying to send, remove ourself from the send_list */
@@ -5079,15 +5110,17 @@ struct task *h2_deferred_shut(struct task *t, void *ctx, unsigned int state)
 	return t;
 }
 
-static void h2_shut(struct stconn *sc, enum se_shut_mode mode)
+static void h2_shut(struct stconn *sc, enum se_shut_mode mode, struct se_abort_info *reason)
 {
 	struct h2s *h2s = __sc_mux_strm(sc);
 
 	TRACE_ENTER(H2_EV_STRM_SHUT, h2s->h2c->conn, h2s);
-	if (mode & (SE_SHW_SILENT|SE_SHW_NORMAL))
-		h2_do_shutw(h2s);
+	if (mode & (SE_SHW_SILENT|SE_SHW_NORMAL)) {
+		/* Pass the reason for silent shutw only (abort) */
+		h2_do_shutw(h2s, (mode & SE_SHW_SILENT) ? reason : NULL);
+	}
 	if (mode & SE_SHR_RESET)
-		h2_do_shutr(h2s);
+		h2_do_shutr(h2s, reason);
 	TRACE_LEAVE(H2_EV_STRM_SHUT, h2s->h2c->conn, h2s);
 }
 
@@ -7506,6 +7539,14 @@ static int h2_takeover(struct connection *conn, int orig_tid, int release)
 	 * has been migrated.
 	 */
 	if (!release) {
+		/* If the connection is attached to a buffer_wait (extremely
+		 * rare), it will be woken up at any instant by its own thread
+		 * and we can't undo it anyway, so let's give up on this one.
+		 * It's not interesting anyway since it's not usable right now.
+		 */
+		if (LIST_INLIST(&h2c->buf_wait.list))
+			goto fail;
+
 		new_task = task_new_here();
 		new_tasklet = tasklet_new();
 		if (!new_task || !new_tasklet)
@@ -7560,6 +7601,20 @@ static int h2_takeover(struct connection *conn, int orig_tid, int release)
 		h2c->wait_event.tasklet->context = h2c;
 		h2c->conn->xprt->subscribe(h2c->conn, h2c->conn->xprt_ctx,
 		                           SUB_RETRY_RECV, &h2c->wait_event);
+	}
+
+	if (release) {
+		/* we're being called for a server deletion and are running
+		 * under thread isolation. That's the only way we can
+		 * unregister a possible subscription of the original
+		 * connection from its owner thread's queue, as this involves
+		 * manipulating thread-unsafe areas. Note that it is not
+		 * possible to just call b_dequeue() here as it would update
+		 * the current thread's bufq_map and not the original one.
+		 */
+		BUG_ON(!thread_isolated());
+		if (LIST_INLIST(&h2c->buf_wait.list))
+			_b_dequeue(&h2c->buf_wait, orig_tid);
 	}
 
 	if (new_task)

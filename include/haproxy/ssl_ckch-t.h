@@ -55,16 +55,17 @@ struct ckch_data {
 	struct buffer *ocsp_response;
 	X509 *ocsp_issuer;
 	OCSP_CERTID *ocsp_cid;
-	int ocsp_update_mode;
 };
 
 /* configuration for the ckch_store */
 struct ckch_conf {
+	int used;
 	char *crt;
 	char *key;
 	char *ocsp;
 	char *issuer;
 	char *sctl;
+	int ocsp_update_mode;
 };
 
 /*
@@ -160,6 +161,16 @@ enum {
 	CERT_TYPE_MAX,
 };
 
+/*
+ * When crt-store options are set from a crt-list, the crt-store options must be explicit everywhere.
+ * When crt-store options are set from a crt-store, the crt-store options can be empty, or the exact same
+ */
+enum {
+	CKCH_CONF_SET_EMPTY    = 0,     /* config is empty */
+	CKCH_CONF_SET_CRTLIST  = 1,     /* config is set from a crt-list */
+	CKCH_CONF_SET_CRTSTORE = 2,     /* config is defined in a crt-store */
+};
+
 struct cert_exts {
 	const char *ext;
 	int type;
@@ -179,7 +190,7 @@ struct ckch_conf_kws {
 	const char *name;
 	ssize_t offset;
 	enum parse_type_t type;
-	int (*func)(const char *path, char *buf, struct ckch_data *d, char **err);
+	int (*func)(void *value, char *buf, struct ckch_data *d, int cli, char **err);
 	char **base; /* ptr to the base path */
 };
 

@@ -432,7 +432,7 @@ static struct ncbuf *qcs_get_ncbuf(struct qcs *qcs, struct ncbuf *ncbuf)
 	struct buffer buf = BUF_NULL;
 
 	if (ncb_is_null(ncbuf)) {
-		if (!b_alloc(&buf))
+		if (!b_alloc(&buf, DB_MUX_RX))
 			return NULL;
 
 		*ncbuf = ncb_make(buf.area, buf.size, 0);
@@ -554,6 +554,28 @@ void qcc_set_error(struct qcc *qcc, int err, int app)
 	 * the moment.
 	 */
 	tasklet_wakeup(qcc->wait_event.tasklet);
+}
+
+/* Increment glitch counter for <qcc> connection by <inc> steps. If configured
+ * threshold reached, close the connection with an error code.
+ */
+int qcc_report_glitch(struct qcc *qcc, int inc)
+{
+	const int max = global.tune.quic_frontend_glitches_threshold;
+
+	qcc->glitches += inc;
+	if (max && qcc->glitches >= max && !(qcc->flags & QC_CF_ERRL)) {
+		if (qcc->app_ops->report_susp) {
+			qcc->app_ops->report_susp(qcc->ctx);
+			qcc_set_error(qcc, qcc->err.code, 1);
+		}
+		else {
+			qcc_set_error(qcc, QC_ERR_INTERNAL_ERROR, 0);
+		}
+		return 1;
+	}
+
+	return 0;
 }
 
 /* Open a locally initiated stream for the connection <qcc>. Set <bidi> for a
@@ -956,7 +978,7 @@ static int qcc_decode_qcs(struct qcc *qcc, struct qcs *qcs)
  */
 struct buffer *qcc_get_stream_rxbuf(struct qcs *qcs)
 {
-	return b_alloc(&qcs->rx.app_buf);
+	return b_alloc(&qcs->rx.app_buf, DB_MUX_RX);
 }
 
 /* Allocate if needed and retrieve <qcs> stream buffer for data emission.
@@ -1000,7 +1022,7 @@ struct buffer *qcc_get_stream_txbuf(struct qcs *qcs, int *err)
 			goto out;
 		}
 
-		if (!b_alloc(out)) {
+		if (!b_alloc(out, DB_MUX_TX)) {
 			TRACE_ERROR("buffer alloc failure", QMUX_EV_QCS_SEND, qcc->conn, qcs);
 			*err = 1;
 			goto out;
@@ -1585,12 +1607,18 @@ int qcc_recv_stop_sending(struct qcc *qcc, uint64_t id, uint64_t err)
 		}
 	}
 
-	/* If FIN already reached, future RESET_STREAMS will be ignored.
-	 * Manually set EOS in this case.
-	 */
-	if (qcs_sc(qcs) && se_fl_test(qcs->sd, SE_FL_EOI)) {
-		se_fl_set(qcs->sd, SE_FL_EOS);
-		qcs_alert(qcs);
+	if (qcs_sc(qcs)) {
+		/* Manually set EOS if FIN already reached as futures RESET_STREAM will be ignored in this case. */
+		if (se_fl_test(qcs->sd, SE_FL_EOI)) {
+			se_fl_set(qcs->sd, SE_FL_EOS);
+			qcs_alert(qcs);
+		}
+
+		/* If not defined yet, set abort info for the sedesc */
+		if (!qcs->sd->abort_info.info) {
+			qcs->sd->abort_info.info = (SE_ABRT_SRC_MUX_QUIC << SE_ABRT_SRC_SHIFT);
+			qcs->sd->abort_info.code = err;
+		}
 	}
 
 	/* RFC 9000 3.5. Solicited State Transitions
@@ -2346,7 +2374,7 @@ static void qcc_shutdown(struct qcc *qcc)
 		qcc_io_send(qcc);
 	}
 	else {
-		qcc->err = quic_err_app(QC_ERR_NO_ERROR);
+		qcc->err = quic_err_transport(QC_ERR_NO_ERROR);
 	}
 
 	/* Register "no error" code at transport layer. Do not use
@@ -2616,6 +2644,7 @@ static int qmux_init(struct connection *conn, struct proxy *prx,
 	conn->ctx = qcc;
 	qcc->nb_hreq = qcc->nb_sc = 0;
 	qcc->flags = 0;
+	qcc->glitches = 0;
 	qcc->err = quic_err_transport(QC_ERR_NO_ERROR);
 
 	/* Server parameters, params used for RX flow control. */
@@ -3095,7 +3124,7 @@ static int qmux_wake(struct connection *conn)
 	return 1;
 }
 
-static void qmux_strm_shut(struct stconn *sc, enum se_shut_mode mode)
+static void qmux_strm_shut(struct stconn *sc, enum se_shut_mode mode, struct se_abort_info *reason)
 {
 	struct qcs *qcs = __sc_mux_strm(sc);
 	struct qcc *qcc = qcs->qcc;
@@ -3128,6 +3157,34 @@ static void qmux_strm_shut(struct stconn *sc, enum se_shut_mode mode)
 
  out:
 	TRACE_LEAVE(QMUX_EV_STRM_SHUT, qcc->conn, qcs);
+}
+
+static int qmux_ctl(struct connection *conn, enum mux_ctl_type mux_ctl, void *output)
+{
+	struct qcc *qcc = conn->ctx;
+
+	switch (mux_ctl) {
+	case MUX_CTL_EXIT_STATUS:
+		return MUX_ES_UNKNOWN;
+
+	case MUX_CTL_GET_GLITCHES:
+		return qcc->glitches;
+
+	case MUX_CTL_GET_NBSTRM: {
+		struct qcs *qcs;
+		unsigned int nb_strm = qcc->nb_sc;
+
+		list_for_each_entry(qcs, &qcc->opening_list, el_opening)
+			nb_strm++;
+		return nb_strm;
+	}
+
+	case MUX_CTL_GET_MAXSTRM:
+		return qcc->lfctl.ms_bidi_init;
+
+	default:
+		return -1;
+	}
 }
 
 static int qmux_sctl(struct stconn *sc, enum mux_sctl_type mux_sctl, void *output)
@@ -3186,6 +3243,7 @@ static const struct mux_ops qmux_ops = {
 	.unsubscribe = qmux_strm_unsubscribe,
 	.wake        = qmux_wake,
 	.shut       = qmux_strm_shut,
+	.ctl         = qmux_ctl,
 	.sctl        = qmux_sctl,
 	.show_sd     = qmux_strm_show_sd,
 	.flags = MX_FL_HTX|MX_FL_NO_UPG|MX_FL_FRAMED,

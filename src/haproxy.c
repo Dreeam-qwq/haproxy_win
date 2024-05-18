@@ -769,7 +769,7 @@ static void mworker_reexec(int hardreload)
 	/* copy the program name */
 	next_argv[next_argc++] = old_argv[0];
 
-	/* we need to reintroduce /dev/null everytime */
+	/* we need to reintroduce /dev/null every time */
 	if (old_unixsocket && strcmp(old_unixsocket, "/dev/null") == 0)
 		x_off = 1;
 
@@ -3087,7 +3087,7 @@ void run_poll_loop()
 			if (thread_has_tasks()) {
 				activity[tid].wake_tasks++;
 				_HA_ATOMIC_AND(&th_ctx->flags, ~TH_FL_SLEEPING);
-			} else if (signal_queue_len) {
+			} else if (signal_queue_len && tid == 0) {
 				/* this check is required after setting TH_FL_SLEEPING to avoid
 				 * a race with wakeup on signals using wake_threads() */
 				_HA_ATOMIC_AND(&th_ctx->flags, ~TH_FL_SLEEPING);

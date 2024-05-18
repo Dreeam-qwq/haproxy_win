@@ -488,14 +488,14 @@ static int fcgi_buf_available(void *target)
 	struct fcgi_conn *fconn = target;
 	struct fcgi_strm *fstrm;
 
-	if ((fconn->flags & FCGI_CF_DEM_DALLOC) && b_alloc(&fconn->dbuf)) {
+	if ((fconn->flags & FCGI_CF_DEM_DALLOC) && b_alloc(&fconn->dbuf, DB_MUX_RX)) {
 		TRACE_STATE("unblocking fconn, dbuf allocated", FCGI_EV_FCONN_RECV|FCGI_EV_FCONN_BLK|FCGI_EV_FCONN_WAKE, fconn->conn);
 		fconn->flags &= ~FCGI_CF_DEM_DALLOC;
 		fcgi_conn_restart_reading(fconn, 1);
 		return 1;
 	}
 
-	if ((fconn->flags & FCGI_CF_MUX_MALLOC) && b_alloc(br_tail(fconn->mbuf))) {
+	if ((fconn->flags & FCGI_CF_MUX_MALLOC) && b_alloc(br_tail(fconn->mbuf), DB_MUX_TX)) {
 		TRACE_STATE("unblocking fconn, mbuf allocated", FCGI_EV_FCONN_SEND|FCGI_EV_FCONN_BLK|FCGI_EV_FCONN_WAKE, fconn->conn);
 		fconn->flags &= ~FCGI_CF_MUX_MALLOC;
 		if (fconn->flags & FCGI_CF_DEM_MROOM) {
@@ -507,7 +507,7 @@ static int fcgi_buf_available(void *target)
 
 	if ((fconn->flags & FCGI_CF_DEM_SALLOC) &&
 	    (fstrm = fcgi_conn_st_by_id(fconn, fconn->dsi)) && fcgi_strm_sc(fstrm) &&
-	    b_alloc(&fstrm->rxbuf)) {
+	    b_alloc(&fstrm->rxbuf, DB_SE_RX)) {
 		TRACE_STATE("unblocking fstrm, rxbuf allocated", FCGI_EV_STRM_RECV|FCGI_EV_FSTRM_BLK|FCGI_EV_STRM_WAKE, fconn->conn, fstrm);
 		fconn->flags &= ~FCGI_CF_DEM_SALLOC;
 		fcgi_conn_restart_reading(fconn, 1);
@@ -523,10 +523,8 @@ static inline struct buffer *fcgi_get_buf(struct fcgi_conn *fconn, struct buffer
 	struct buffer *buf = NULL;
 
 	if (likely(!LIST_INLIST(&fconn->buf_wait.list)) &&
-	    unlikely((buf = b_alloc(bptr)) == NULL)) {
-		fconn->buf_wait.target = fconn;
-		fconn->buf_wait.wakeup_cb = fcgi_buf_available;
-		LIST_APPEND(&th_ctx->buffer_wq, &fconn->buf_wait.list);
+	    unlikely((buf = b_alloc(bptr, DB_MUX_RX)) == NULL)) {
+		b_queue(DB_MUX_RX, &fconn->buf_wait, fconn, fcgi_buf_available);
 	}
 	return buf;
 }
@@ -755,8 +753,7 @@ static void fcgi_release(struct fcgi_conn *fconn)
 
 	TRACE_POINT(FCGI_EV_FCONN_END);
 
-	if (LIST_INLIST(&fconn->buf_wait.list))
-		LIST_DEL_INIT(&fconn->buf_wait.list);
+	b_dequeue(&fconn->buf_wait);
 
 	fcgi_release_buf(fconn, &fconn->dbuf);
 	fcgi_release_mbuf(fconn);
@@ -3089,7 +3086,9 @@ static int fcgi_wake(struct connection *conn)
 
 static int fcgi_ctl(struct connection *conn, enum mux_ctl_type mux_ctl, void *output)
 {
+	struct fcgi_conn *fconn = conn->ctx;
 	int ret = 0;
+
 	switch (mux_ctl) {
 	case MUX_CTL_STATUS:
 		if (!(conn->flags & CO_FL_WAIT_XPRT))
@@ -3097,6 +3096,10 @@ static int fcgi_ctl(struct connection *conn, enum mux_ctl_type mux_ctl, void *ou
 		return ret;
 	case MUX_CTL_EXIT_STATUS:
 		return MUX_ES_UNKNOWN;
+	case MUX_CTL_GET_NBSTRM:
+		return fconn->nb_streams;
+	case MUX_CTL_GET_MAXSTRM:
+		return fconn->streams_limit;
 	default:
 		return -1;
 	}
@@ -3791,7 +3794,7 @@ struct task *fcgi_deferred_shut(struct task *t, void *ctx, unsigned int state)
 	return NULL;
 }
 
-static void fcgi_shut(struct stconn *sc, enum se_shut_mode mode)
+static void fcgi_shut(struct stconn *sc, enum se_shut_mode mode, struct se_abort_info *reason)
 {
 	struct fcgi_strm *fstrm = __sc_mux_strm(sc);
 
@@ -4170,6 +4173,14 @@ static int fcgi_takeover(struct connection *conn, int orig_tid, int release)
 	 * has been migrated.
 	 */
 	if (!release) {
+		/* If the connection is attached to a buffer_wait (extremely
+		 * rare), it will be woken up at any instant by its own thread
+		 * and we can't undo it anyway, so let's give up on this one.
+		 * It's not interesting anyway since it's not usable right now.
+		 */
+		if (LIST_INLIST(&fcgi->buf_wait.list))
+			goto fail;
+
 		new_task = task_new_here();
 		new_tasklet = tasklet_new();
 		if (!new_task || !new_tasklet)
@@ -4224,6 +4235,20 @@ static int fcgi_takeover(struct connection *conn, int orig_tid, int release)
 		fcgi->wait_event.tasklet->context = fcgi;
 		fcgi->conn->xprt->subscribe(fcgi->conn, fcgi->conn->xprt_ctx,
 		                            SUB_RETRY_RECV, &fcgi->wait_event);
+	}
+
+	if (release) {
+		/* we're being called for a server deletion and are running
+		 * under thread isolation. That's the only way we can
+		 * unregister a possible subscription of the original
+		 * connection from its owner thread's queue, as this involves
+		 * manipulating thread-unsafe areas. Note that it is not
+		 * possible to just call b_dequeue() here as it would update
+		 * the current thread's bufq_map and not the original one.
+		 */
+		BUG_ON(!thread_isolated());
+		if (LIST_INLIST(&fcgi->buf_wait.list))
+			_b_dequeue(&fcgi->buf_wait, orig_tid);
 	}
 
 	if (new_task)

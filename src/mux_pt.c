@@ -462,7 +462,7 @@ static int mux_pt_avail_streams(struct connection *conn)
 	return 1 - mux_pt_used_streams(conn);
 }
 
-static void mux_pt_shut(struct stconn *sc, enum se_shut_mode mode)
+static void mux_pt_shut(struct stconn *sc, enum se_shut_mode mode, struct se_abort_info *reason)
 {
 	struct connection *conn = __sc_conn(sc);
 	struct mux_pt_ctx *ctx = conn->ctx;
@@ -781,6 +781,7 @@ static int mux_pt_unsubscribe(struct stconn *sc, int event_type, struct wait_eve
 static int mux_pt_ctl(struct connection *conn, enum mux_ctl_type mux_ctl, void *output)
 {
 	int ret = 0;
+
 	switch (mux_ctl) {
 	case MUX_CTL_STATUS:
 		if (!(conn->flags & CO_FL_WAIT_XPRT))
@@ -788,6 +789,10 @@ static int mux_pt_ctl(struct connection *conn, enum mux_ctl_type mux_ctl, void *
 		return ret;
 	case MUX_CTL_EXIT_STATUS:
 		return MUX_ES_UNKNOWN;
+	case MUX_CTL_GET_NBSTRM:
+		return mux_pt_used_streams(conn);
+	case MUX_CTL_GET_MAXSTRM:
+		return 1;
 	default:
 		return -1;
 	}

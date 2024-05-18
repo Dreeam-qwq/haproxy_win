@@ -356,7 +356,7 @@ struct crtlist *crtlist_new(const char *filename, int unique)
  *  <crt_path> is a ptr in <line>
  *  Return an error code
  */
-int crtlist_parse_line(char *line, char **crt_path, struct crtlist_entry *entry, const char *file, int linenum, int from_cli, char **err)
+int crtlist_parse_line(char *line, char **crt_path, struct crtlist_entry *entry, struct ckch_conf *cc, const char *file, int linenum, int from_cli, char **err)
 {
 	int cfgerr = 0;
 	int arg, newarg, cur_arg, i, ssl_b = 0, ssl_e = 0;
@@ -443,6 +443,7 @@ int crtlist_parse_line(char *line, char **crt_path, struct crtlist_entry *entry,
 	cur_arg = ssl_b ? ssl_b : 1;
 	while (cur_arg < ssl_e) {
 		newarg = 0;
+		/* look for ssl_conf keywords */
 		for (i = 0; ssl_crtlist_kws[i].kw != NULL; i++) {
 			if (strcmp(ssl_crtlist_kws[i].kw, args[cur_arg]) == 0) {
 				if (!ssl_conf)
@@ -462,9 +463,22 @@ int crtlist_parse_line(char *line, char **crt_path, struct crtlist_entry *entry,
 					goto error;
 				}
 				cur_arg += 1 + ssl_crtlist_kws[i].skip;
-				break;
+				goto out;
 			}
 		}
+		if (cc) {
+			/* look for ckch_conf keywords */
+			cfgerr |= ckch_conf_parse(args, cur_arg, cc, &newarg, file, linenum, err);
+			if (cfgerr & ERR_FATAL)
+				goto error;
+
+			if (newarg) {
+				cur_arg += 2;  /* skip 2 words if the keyword was found */
+				cc->used = CKCH_CONF_SET_CRTLIST; /* if they are options they must be used everywhere */
+			}
+
+		}
+out:
 		if (!cfgerr && !newarg) {
 			memprintf(err, "parsing [%s:%d]: unknown ssl keyword %s",
 				  file, linenum, args[cur_arg]);
@@ -523,6 +537,7 @@ int crtlist_parse_file(char *file, struct bind_conf *bind_conf, struct proxy *cu
 		char *crt_path;
 		char path[MAXPATHLEN+1];
 		struct ckch_store *ckchs;
+		struct ckch_conf cc = {};
 		int found = 0;
 
 		if (missing_lf != -1) {
@@ -564,7 +579,7 @@ int crtlist_parse_file(char *file, struct bind_conf *bind_conf, struct proxy *cu
 			goto error;
 		}
 
-		cfgerr |= crtlist_parse_line(thisline, &crt_path, entry, file, linenum, 0, err);
+		cfgerr |= crtlist_parse_line(thisline, &crt_path, entry, &cc, file, linenum, 0, err);
 		if (cfgerr & ERR_CODE)
 			goto error;
 
@@ -591,19 +606,22 @@ int crtlist_parse_file(char *file, struct bind_conf *bind_conf, struct proxy *cu
 		if (ckchs == NULL) {
 			if (stat(crt_path, &buf) == 0) {
 				found++;
-
-				ckchs = new_ckch_store_load_files_path(crt_path, err);
+				if (cc.used) {
+					free(cc.crt);
+					cc.crt = strdup(crt_path);
+					ckchs = ckch_store_new_load_files_conf(crt_path, &cc, err);
+				} else {
+					ckchs = ckch_store_new_load_files_path(crt_path, err);
+				}
 				if (ckchs == NULL) {
 					cfgerr |= ERR_ALERT | ERR_FATAL;
 					goto error;
 				}
 
+				ckchs->conf = cc;
+
 				entry->node.key = ckchs;
 				entry->crtlist = newlist;
-				if (entry->ssl_conf)
-					ckchs->data->ocsp_update_mode = entry->ssl_conf->ocsp_update;
-				if (ckchs->data->ocsp_update_mode == SSL_SOCK_OCSP_UPDATE_DFLT)
-					ckchs->data->ocsp_update_mode = global_ssl.ocsp_update.mode;
 				ebpt_insert(&newlist->entries, &entry->node);
 				LIST_APPEND(&newlist->ord_entries, &entry->by_crtlist);
 				LIST_APPEND(&ckchs->crtlist_entry, &entry->by_ckch_store);
@@ -618,6 +636,7 @@ int crtlist_parse_file(char *file, struct bind_conf *bind_conf, struct proxy *cu
 				char fp[MAXPATHLEN+1] = {0};
 				int n = 0;
 				struct crtlist_entry *entry_dup = entry; /* use the previous created entry */
+
 				for (n = 0; n < SSL_SOCK_NUM_KEYTYPES; n++) {
 					struct stat buf;
 					int ret;
@@ -629,7 +648,13 @@ int crtlist_parse_file(char *file, struct bind_conf *bind_conf, struct proxy *cu
 					ckchs = ckchs_lookup(fp);
 					if (!ckchs) {
 						if (stat(fp, &buf) == 0) {
-							ckchs = new_ckch_store_load_files_path(fp, err);
+
+							if (cc.used) {
+								memprintf(err, "%sCan't load '%s'. Using crt-store keyword is not compatible with multi certificates bundle.\n",
+								          err && *err ? *err : "", crt_path);
+								cfgerr |= ERR_ALERT | ERR_FATAL;
+							}
+							ckchs = ckch_store_new_load_files_path(fp, err);
 							if (!ckchs) {
 								cfgerr |= ERR_ALERT | ERR_FATAL;
 								goto error;
@@ -653,14 +678,6 @@ int crtlist_parse_file(char *file, struct bind_conf *bind_conf, struct proxy *cu
 					entry_dup->node.key = ckchs;
 					entry_dup->crtlist = newlist;
 
-					cfgerr |= ocsp_update_check_cfg_consistency(ckchs, entry, crt_path, err);
-					if (cfgerr & ERR_FATAL)
-						goto error;
-
-					if (entry->ssl_conf)
-						ckchs->data->ocsp_update_mode = entry->ssl_conf->ocsp_update;
-					if (ckchs->data->ocsp_update_mode == SSL_SOCK_OCSP_UPDATE_DFLT)
-						ckchs->data->ocsp_update_mode = global_ssl.ocsp_update.mode;
 					ebpt_insert(&newlist->entries, &entry_dup->node);
 					LIST_APPEND(&newlist->ord_entries, &entry_dup->by_crtlist);
 					LIST_APPEND(&ckchs->crtlist_entry, &entry_dup->by_ckch_store);
@@ -682,17 +699,15 @@ int crtlist_parse_file(char *file, struct bind_conf *bind_conf, struct proxy *cu
 			}
 
 		} else {
+			if (ckch_conf_cmp(&ckchs->conf, &cc, err) != 0) {
+				memprintf(err, "'%s' in crt-list '%s' line %d, is already defined with incompatible parameters:\n %s", crt_path, file, linenum, err ? *err : "");
+				cfgerr |= ERR_ALERT | ERR_FATAL;
+				goto error;
+			}
+
 			entry->node.key = ckchs;
 			entry->crtlist = newlist;
 
-			cfgerr |= ocsp_update_check_cfg_consistency(ckchs, entry, crt_path, err);
-			if (cfgerr & ERR_FATAL)
-				goto error;
-
-			if (entry->ssl_conf)
-				ckchs->data->ocsp_update_mode = entry->ssl_conf->ocsp_update;
-			if (ckchs->data->ocsp_update_mode == SSL_SOCK_OCSP_UPDATE_DFLT)
-				ckchs->data->ocsp_update_mode = global_ssl.ocsp_update.mode;
 			ebpt_insert(&newlist->entries, &entry->node);
 			LIST_APPEND(&newlist->ord_entries, &entry->by_crtlist);
 			LIST_APPEND(&ckchs->crtlist_entry, &entry->by_ckch_store);
@@ -718,6 +733,8 @@ int crtlist_parse_file(char *file, struct bind_conf *bind_conf, struct proxy *cu
 	return cfgerr;
 error:
 	crtlist_entry_free(entry);
+
+	/* FIXME: free cc */
 
 	fclose(f);
 	crtlist_free(newlist);
@@ -782,7 +799,7 @@ int crtlist_load_cert_dir(char *path, struct bind_conf *bind_conf, struct crtlis
 
 			ckchs = ckchs_lookup(fp);
 			if (ckchs == NULL)
-				ckchs = new_ckch_store_load_files_path(fp, err);
+				ckchs = ckch_store_new_load_files_path(fp, err);
 			if (ckchs == NULL) {
 				free(de);
 				free(entry);
@@ -816,14 +833,21 @@ end:
  * Take an ssl_bind_conf structure and append the configuration line used to
  * create it in the buffer
  */
-static void dump_crtlist_sslconf(struct buffer *buf, const struct ssl_bind_conf *conf)
+static void dump_crtlist_conf(struct buffer *buf, const struct ssl_bind_conf *conf, const struct ckch_conf *cc)
 {
 	int space = 0;
 
-	if (conf == NULL)
+	if (conf == NULL && cc->used == 0)
 		return;
 
 	chunk_appendf(buf, " [");
+
+
+	if (conf == NULL)
+		goto dump_ckch;
+
+	/* first dump all ssl_conf keywords */
+
 #ifdef OPENSSL_NPN_NEGOTIATED
 	if (conf->npn_str) {
 		int len = conf->npn_len;
@@ -949,12 +973,22 @@ static void dump_crtlist_sslconf(struct buffer *buf, const struct ssl_bind_conf 
 		space++;
 	}
 
-	if (conf->ocsp_update != SSL_SOCK_OCSP_UPDATE_DFLT) {
+	/* then dump the ckch_conf */
+dump_ckch:
+	if (!cc->used)
+		goto end;
+
+	if (cc->ocsp_update_mode == SSL_SOCK_OCSP_UPDATE_OFF) {
 		if (space) chunk_appendf(buf, " ");
-		chunk_appendf(buf, "ocsp-update %s",
-		              conf->ocsp_update == SSL_SOCK_OCSP_UPDATE_OFF ? "off" : "on");
+		chunk_appendf(buf, "ocsp-update off");
+		space++;
+	} else if (cc->ocsp_update_mode == SSL_SOCK_OCSP_UPDATE_ON) {
+		if (space) chunk_appendf(buf, " ");
+		chunk_appendf(buf, "ocsp-update on");
 		space++;
 	}
+
+end:
 
 	chunk_appendf(buf, "]");
 
@@ -1038,7 +1072,7 @@ static int cli_io_handler_dump_crtlist_entries(struct appctx *appctx)
 		chunk_appendf(trash, "%s", filename);
 		if (ctx->mode == 's') /* show */
 			chunk_appendf(trash, ":%d", entry->linenum);
-		dump_crtlist_sslconf(trash, entry->ssl_conf);
+		dump_crtlist_conf(trash, entry->ssl_conf, &store->conf);
 		dump_crtlist_filters(trash, entry);
 		chunk_appendf(trash, "\n");
 
@@ -1268,6 +1302,7 @@ static int cli_parse_add_crtlist(char **args, char *payload, struct appctx *appc
 	struct ebpt_node *inserted;
 	struct crtlist *crtlist;
 	struct crtlist_entry *entry = NULL;
+	struct ckch_conf cc = {};
 	char *end;
 
 	if (!cli_has_level(appctx, ACCESS_LVL_ADMIN))
@@ -1298,6 +1333,7 @@ static int cli_parse_add_crtlist(char **args, char *payload, struct appctx *appc
 		goto error;
 	}
 
+
 	if (payload) {
 		char *lf;
 
@@ -1307,7 +1343,7 @@ static int cli_parse_add_crtlist(char **args, char *payload, struct appctx *appc
 			goto error;
 		}
 		/* cert_path is filled here */
-		cfgerr |= crtlist_parse_line(payload, &cert_path, entry, "CLI", 1, 1, &err);
+		cfgerr |= crtlist_parse_line(payload, &cert_path, entry, &cc, "CLI", 1, 1, &err);
 		if (cfgerr & ERR_CODE)
 			goto error;
 	} else {
@@ -1358,17 +1394,23 @@ static int cli_parse_add_crtlist(char **args, char *payload, struct appctx *appc
 		goto error;
 	}
 
-	/* No need to check 'ocsp-update' inconsistency on a store that is not
-	 * used yet (it was just added through the CLI for instance).
+	/* We can use a crt-store keyword when:
+	 * - no ckch_inst are linked OR
+	 * - ckch_inst are linked but exact same ckch_conf is used.
 	 */
-	if (!LIST_ISEMPTY(&store->ckch_inst) &&
-	    ocsp_update_check_cfg_consistency(store, entry, cert_path, &err))
-		goto error;
+	if (LIST_ISEMPTY(&store->ckch_inst)) {
 
-	if (entry->ssl_conf)
-		store->data->ocsp_update_mode = entry->ssl_conf->ocsp_update;
-	if (store->data->ocsp_update_mode == SSL_SOCK_OCSP_UPDATE_DFLT)
-		store->data->ocsp_update_mode = global_ssl.ocsp_update.mode;
+		store->conf = cc;
+		/* fresh new, run more init (for example init ocsp-update tasks) */
+		cfgerr |= ckch_store_load_files(&cc, store, 1, &err);
+		if (cfgerr & ERR_FATAL)
+			goto error;
+
+	} else if (ckch_conf_cmp(&store->conf, &cc, &err) != 0) {
+		memprintf(&err, "'%s' is already instantiated with incompatible parameters:\n %s", cert_path, err ? err : "");
+		cfgerr |= ERR_ALERT | ERR_FATAL;
+		goto error;
+	}
 
 	/* check if it's possible to insert this new crtlist_entry */
 	entry->node.key = store;
@@ -1379,8 +1421,8 @@ static int cli_parse_add_crtlist(char **args, char *payload, struct appctx *appc
 	}
 
 	/* this is supposed to be a directory (EB_ROOT_UNIQUE), so no ssl_conf are allowed */
-	if ((entry->ssl_conf || entry->filters) && eb_gettag(crtlist->entries.b[EB_RGHT])) {
-		memprintf(&err, "this is a directory, SSL configuration and filters are not allowed");
+	if ((entry->ssl_conf || entry->filters || cc.used) && eb_gettag(crtlist->entries.b[EB_RGHT])) {
+		memprintf(&err, "this is a directory, SSL configuration, crt-store keywords and filters are not allowed");
 		goto error;
 	}
 
@@ -1396,6 +1438,7 @@ static int cli_parse_add_crtlist(char **args, char *payload, struct appctx *appc
 	return 0;
 
 error:
+	ckch_conf_clean(&cc);
 	crtlist_entry_free(entry);
 	HA_SPIN_UNLOCK(CKCH_LOCK, &ckch_lock);
 	err = memprintf(&err, "Can't edit the crt-list: %s\n", err ? err : "");

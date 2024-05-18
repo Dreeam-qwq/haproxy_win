@@ -1473,35 +1473,6 @@ static int bind_parse_no_ca_names(char **args, int cur_arg, struct proxy *px, st
 	return ssl_bind_parse_no_ca_names(args, cur_arg, px, &conf->ssl_conf, 0, err);
 }
 
-
-static int ssl_bind_parse_ocsp_update(char **args, int cur_arg, struct proxy *px,
-                                      struct ssl_bind_conf *ssl_conf, int from_cli, char **err)
-{
-	if (!*args[cur_arg + 1]) {
-		memprintf(err, "'%s' : expecting <on|off>", args[cur_arg]);
-		return ERR_ALERT | ERR_FATAL;
-	}
-
-	if (strcmp(args[cur_arg + 1], "on") == 0)
-		ssl_conf->ocsp_update = SSL_SOCK_OCSP_UPDATE_ON;
-	else if (strcmp(args[cur_arg + 1], "off") == 0)
-		ssl_conf->ocsp_update = SSL_SOCK_OCSP_UPDATE_OFF;
-	else {
-		memprintf(err, "'%s' : expecting <on|off>", args[cur_arg]);
-		return ERR_ALERT | ERR_FATAL;
-	}
-
-	if (ssl_conf->ocsp_update == SSL_SOCK_OCSP_UPDATE_ON) {
-		/* We might need to create the main ocsp update task */
-		int ret = ssl_create_ocsp_update_task(err);
-		if (ret)
-			return ret;
-	}
-
-	return 0;
-}
-
-
 /***************************** "server" keywords Parsing ********************************************/
 
 /* parse the "npn" bind keyword */
@@ -2175,89 +2146,6 @@ static int ssl_parse_skip_self_issued_ca(char **args, int section_type, struct p
 }
 
 
-static int ssl_parse_global_ocsp_maxdelay(char **args, int section_type, struct proxy *curpx,
-                                          const struct proxy *defpx, const char *file, int line,
-                                          char **err)
-{
-	int value = 0;
-
-	if (*(args[1]) == 0) {
-		memprintf(err, "'%s' expects an integer argument.", args[0]);
-		return -1;
-	}
-
-	value = atoi(args[1]);
-	if (value < 0) {
-		memprintf(err, "'%s' expects a positive numeric value.", args[0]);
-		return -1;
-	}
-
-	if (global_ssl.ocsp_update.delay_min > value) {
-		memprintf(err, "'%s' can not be lower than tune.ssl.ocsp-update.mindelay.", args[0]);
-		return -1;
-	}
-
-	global_ssl.ocsp_update.delay_max = value;
-
-	return 0;
-}
-
-static int ssl_parse_global_ocsp_mindelay(char **args, int section_type, struct proxy *curpx,
-                                          const struct proxy *defpx, const char *file, int line,
-                                          char **err)
-{
-	int value = 0;
-
-	if (*(args[1]) == 0) {
-		memprintf(err, "'%s' expects an integer argument.", args[0]);
-		return -1;
-	}
-
-	value = atoi(args[1]);
-	if (value < 0) {
-		memprintf(err, "'%s' expects a positive numeric value.", args[0]);
-		return -1;
-	}
-
-	if (value > global_ssl.ocsp_update.delay_max) {
-		memprintf(err, "'%s' can not be higher than tune.ssl.ocsp-update.maxdelay.", args[0]);
-		return -1;
-	}
-
-	global_ssl.ocsp_update.delay_min = value;
-
-	return 0;
-}
-
-static int ssl_parse_global_ocsp_update_mode(char **args, int section_type, struct proxy *curpx,
-                                             const struct proxy *defpx, const char *file, int line,
-                                             char **err)
-{
-	int ret = 0;
-
-	if (!*args[1]) {
-		memprintf(err, "'%s' : expecting <on|off>", args[0]);
-		return ERR_ALERT | ERR_FATAL;
-	}
-
-	if (strcmp(args[1], "on") == 0)
-		global_ssl.ocsp_update.mode = SSL_SOCK_OCSP_UPDATE_ON;
-	else if (strcmp(args[1], "off") == 0)
-		global_ssl.ocsp_update.mode = SSL_SOCK_OCSP_UPDATE_OFF;
-	else {
-		memprintf(err, "'%s' : expecting <on|off>", args[0]);
-		return ERR_ALERT | ERR_FATAL;
-	}
-
-	if (global_ssl.ocsp_update.mode != SSL_SOCK_OCSP_UPDATE_OFF) {
-		/* We might need to create the main ocsp update task */
-		ret = ssl_create_ocsp_update_task(err);
-	}
-
-	return ret;
-}
-
-
 
 
 /* Note: must not be declared <const> as its list will be overwritten.
@@ -2288,7 +2176,6 @@ struct ssl_crtlist_kw ssl_crtlist_kws[] = {
 	{ "ssl-min-ver",           ssl_bind_parse_tls_method_minmax,1 }, /* minimum version */
 	{ "ssl-max-ver",           ssl_bind_parse_tls_method_minmax,1 }, /* maximum version */
 	{ "verify",                ssl_bind_parse_verify,           1 }, /* set SSL verify method */
-	{ "ocsp-update",           ssl_bind_parse_ocsp_update,      1 }, /* ocsp update mode (on or off) */
 	{ NULL, NULL, 0 },
 };
 
@@ -2445,11 +2332,6 @@ static struct cfg_kw_list cfg_kws = {ILH, {
 	{ CFG_GLOBAL, "ssl-default-server-ciphersuites", ssl_parse_global_ciphersuites },
 	{ CFG_GLOBAL, "ssl-load-extra-files", ssl_parse_global_extra_files },
 	{ CFG_GLOBAL, "ssl-load-extra-del-ext", ssl_parse_global_extra_noext },
-#ifndef OPENSSL_NO_OCSP
-	{ CFG_GLOBAL, "tune.ssl.ocsp-update.maxdelay", ssl_parse_global_ocsp_maxdelay },
-	{ CFG_GLOBAL, "tune.ssl.ocsp-update.mindelay", ssl_parse_global_ocsp_mindelay },
-	{ CFG_GLOBAL, "tune.ssl.ocsp-update.mode", ssl_parse_global_ocsp_update_mode },
-#endif
 	{ 0, NULL, NULL },
 }};
 

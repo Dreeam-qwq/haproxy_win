@@ -43,7 +43,6 @@ extern struct list servers_list;
 extern struct dict server_key_dict;
 
 int srv_downtime(const struct server *s);
-int srv_lastsession(const struct server *s);
 int srv_getinter(const struct check *check);
 void srv_settings_init(struct server *srv);
 void srv_settings_cpy(struct server *srv, const struct server *src, int srv_tmpl);
@@ -181,7 +180,7 @@ static inline void srv_inc_sess_ctr(struct server *s)
 {
 	_HA_ATOMIC_INC(&s->counters.cum_sess);
 	HA_ATOMIC_UPDATE_MAX(&s->counters.sps_max,
-			     update_freq_ctr(&s->sess_per_sec, 1));
+	                     update_freq_ctr(&s->counters.sess_per_sec, 1));
 }
 
 /* set the time of last session on the designated server */

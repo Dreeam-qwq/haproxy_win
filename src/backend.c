@@ -62,14 +62,6 @@
 
 #define TRACE_SOURCE &trace_strm
 
-int be_lastsession(const struct proxy *be)
-{
-	if (be->be_counters.last_sess)
-		return ns_to_sec(now_ns) - be->be_counters.last_sess;
-
-	return -1;
-}
-
 /* helper function to invoke the correct hash method */
 unsigned int gen_hash(const struct proxy* px, const char* key, unsigned long len)
 {
@@ -2566,7 +2558,7 @@ void back_handle_st_rdy(struct stream *s)
  */
 void set_backend_down(struct proxy *be)
 {
-	be->last_change = ns_to_sec(now_ns);
+	be->be_counters.last_change = ns_to_sec(now_ns);
 	_HA_ATOMIC_INC(&be->be_counters.down_trans);
 
 	if (!(global.mode & MODE_STARTING)) {
@@ -2639,10 +2631,10 @@ no_cookie:
 }
 
 int be_downtime(struct proxy *px) {
-	if (px->lbprm.tot_weight && px->last_change < ns_to_sec(now_ns))  // ignore negative time
+	if (px->lbprm.tot_weight && px->be_counters.last_change < ns_to_sec(now_ns))  // ignore negative time
 		return px->down_time;
 
-	return ns_to_sec(now_ns) - px->last_change + px->down_time;
+	return ns_to_sec(now_ns) - px->be_counters.last_change + px->down_time;
 }
 
 /*
@@ -3080,7 +3072,7 @@ smp_fetch_be_sess_rate(const struct arg *args, struct sample *smp, const char *k
 
 	smp->flags = SMP_F_VOL_TEST;
 	smp->data.type = SMP_T_SINT;
-	smp->data.u.sint = read_freq_ctr(&px->be_sess_per_sec);
+	smp->data.u.sint = read_freq_ctr(&px->be_counters.sess_per_sec);
 	return 1;
 }
 
@@ -3263,7 +3255,7 @@ smp_fetch_srv_sess_rate(const struct arg *args, struct sample *smp, const char *
 {
 	smp->flags = SMP_F_VOL_TEST;
 	smp->data.type = SMP_T_SINT;
-	smp->data.u.sint = read_freq_ctr(&args->data.srv->sess_per_sec);
+	smp->data.u.sint = read_freq_ctr(&args->data.srv->counters.sess_per_sec);
 	return 1;
 }
 

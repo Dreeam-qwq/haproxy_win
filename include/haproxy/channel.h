@@ -915,12 +915,17 @@ static inline int ci_space_for_replace(const struct channel *chn)
  */
 static inline int channel_alloc_buffer(struct channel *chn, struct buffer_wait *wait)
 {
-	if (b_alloc(&chn->buf) != NULL)
+	int force_noqueue;
+
+	/* If the producer has been notified of recent availability, we must
+	 * not check the queue again.
+	 */
+	force_noqueue = !!(chn_prod(chn)->flags & SC_FL_HAVE_BUFF);
+
+	if (b_alloc(&chn->buf, DB_CHANNEL | (force_noqueue ? DB_F_NOQUEUE : 0)) != NULL)
 		return 1;
 
-	if (!LIST_INLIST(&wait->list))
-		LIST_APPEND(&th_ctx->buffer_wq, &wait->list);
-
+	b_requeue(DB_CHANNEL, wait);
 	return 0;
 }
 

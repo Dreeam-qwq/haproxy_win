@@ -3,7 +3,7 @@
 # broken with BoringSSL.
 #
 # This reg-test tries loading multiple configurations that make use of the
-# 'ocsp-update' crt-list option and the global 'tune.ssl.ocsp-update.mode'
+# 'ocsp-update' crt-list option and the global 'ocsp-update.mode'
 # option. It ensures that an error message is raised when the user provides an
 # incoherent configuration. Any configuration in which a given certificate has
 # the ocsp auto update mode set to 'on' as well as 'off' simultaneously should
@@ -26,8 +26,8 @@ feature ignore_unknown_macro
 
 
 # test1
-#    global_option   DFLT
-#    bind line       DFLT    (first)
+#    global_option   OFF
+#    bind line       DFLT (OFF)   (first)
 #    crt-list        ON      (second)
 shell {
     cat << EOF > ${tmpdir}/ocsp_compat_check.list
@@ -37,7 +37,7 @@ EOF
     cat << EOF > ${tmpdir}/ocsp_compat_check.cfg
 global
     crt-base ${testdir}/ocsp_update/multicert
-#    tune.ssl.ocsp-update.mode on
+#    ocsp-update.mode on
 
 defaults
     log stderr local0 debug err
@@ -49,8 +49,10 @@ EOF
 
     haproxy_output="$($HAPROXY_PROGRAM -f ${tmpdir}/ocsp_compat_check.cfg -c 2>&1)"
     haproxy_ret=$?
-
-    ! [ $haproxy_ret -eq 0 ] && echo "$haproxy_output" | grep -q "Incompatibilities found in OCSP update mode for certificate"
+    echo "==== test 1"
+    echo "$haproxy_output"
+    echo "HAProxy return code: $haproxy_ret"
+    [ $haproxy_ret -ne 0 ] && echo "$haproxy_output" | grep -q "different parameter 'ocsp-update'"
 }
 
 # test2
@@ -65,7 +67,7 @@ EOF
     cat << EOF > ${tmpdir}/ocsp_compat_check.cfg
 global
     crt-base ${testdir}/ocsp_update/multicert
-    tune.ssl.ocsp-update.mode on
+    ocsp-update.mode on
 
 defaults
     log stderr local0 debug err
@@ -77,8 +79,10 @@ EOF
 
     haproxy_output="$($HAPROXY_PROGRAM -f ${tmpdir}/ocsp_compat_check.cfg -c 2>&1)"
     haproxy_ret=$?
-
-    ! [ $haproxy_ret -eq 0 ] && echo "$haproxy_output" | grep -q "Incompatibilities found in OCSP update mode for certificate"
+    echo "==== test 2"
+    echo "$haproxy_output"
+    echo "HAProxy return code: $haproxy_ret"
+    [ $haproxy_ret -ne 0 ] && echo "$haproxy_output" | grep -q "different parameter 'ocsp-update'"
 }
 
 # test3
@@ -93,7 +97,7 @@ EOF
     cat << EOF > ${tmpdir}/ocsp_compat_check.cfg
 global
     crt-base ${testdir}/ocsp_update/multicert
-    tune.ssl.ocsp-update.mode off
+    ocsp-update.mode off
 
 defaults
     log stderr local0 debug err
@@ -105,14 +109,16 @@ EOF
 
     haproxy_output="$($HAPROXY_PROGRAM -f ${tmpdir}/ocsp_compat_check.cfg -c 2>&1)"
     haproxy_ret=$?
-
-    ! [ $haproxy_ret -eq 0 ] && echo "$haproxy_output" | grep -q "Incompatibilities found in OCSP update mode for certificate"
+    echo "==== test 3"
+    echo "$haproxy_output"
+    echo "HAProxy return code: $haproxy_ret"
+    [ $haproxy_ret -ne 0 ] && echo "$haproxy_output" | grep -q "different parameter 'ocsp-update'"
 }
 
 # test4
-#    global_option   DFLT
-#    bind line       DFLT    (second)
-#    crt-list        ON      (first)
+#    global_option   OFF
+#    bind line       DFLT OFF (second)
+#    crt-list        ON       (first)
 shell {
     cat << EOF > ${tmpdir}/ocsp_compat_check.list
 server_ocsp_ecdsa.pem [ocsp-update on] foo.com
@@ -121,7 +127,7 @@ EOF
     cat << EOF > ${tmpdir}/ocsp_compat_check.cfg
 global
     crt-base ${testdir}/ocsp_update/multicert
-#    tune.ssl.ocsp-update.mode off
+#    ocsp-update.mode off
 
 defaults
     log stderr local0 debug err
@@ -134,8 +140,10 @@ EOF
 
     haproxy_output="$($HAPROXY_PROGRAM -f ${tmpdir}/ocsp_compat_check.cfg -c 2>&1)"
     haproxy_ret=$?
-
-    ! [ $haproxy_ret -eq 0 ] && echo "$haproxy_output" | grep -q "Incompatibilities found in OCSP update mode for certificate"
+    echo "==== test 4"
+    echo "$haproxy_output"
+    echo "HAProxy return code: $haproxy_ret"
+    [ $haproxy_ret -ne 0 ] && echo "$haproxy_output" | grep -q "different parameter 'ocsp-update'"
 }
 
 # test5
@@ -150,7 +158,7 @@ EOF
     cat << EOF > ${tmpdir}/ocsp_compat_check.cfg
 global
     crt-base ${testdir}/ocsp_update/multicert
-    tune.ssl.ocsp-update.mode on
+    ocsp-update.mode on
 
 defaults
     log stderr local0 debug err
@@ -163,8 +171,10 @@ EOF
 
     haproxy_output="$($HAPROXY_PROGRAM -f ${tmpdir}/ocsp_compat_check.cfg -c 2>&1)"
     haproxy_ret=$?
-
-    ! [ $haproxy_ret -eq 0 ] && echo "$haproxy_output" | grep -q "Incompatibilities found in OCSP update mode for certificate"
+    echo "==== test 5"
+    echo "$haproxy_output"
+    echo "HAProxy return code: $haproxy_ret"
+    [ $haproxy_ret -ne 0 ] && echo "$haproxy_output" | grep -q "different parameter 'ocsp-update'"
 }
 
 # test6
@@ -179,7 +189,7 @@ EOF
     cat << EOF > ${tmpdir}/ocsp_compat_check.cfg
 global
     crt-base ${testdir}/ocsp_update/multicert
-    tune.ssl.ocsp-update.mode off
+    ocsp-update.mode off
 
 defaults
     log stderr local0 debug err
@@ -192,8 +202,10 @@ EOF
 
     haproxy_output="$($HAPROXY_PROGRAM -f ${tmpdir}/ocsp_compat_check.cfg -c 2>&1)"
     haproxy_ret=$?
-
-    ! [ $haproxy_ret -eq 0 ] && echo "$haproxy_output" | grep -q "Incompatibilities found in OCSP update mode for certificate"
+    echo "==== test 6"
+    echo "$haproxy_output"
+    echo "HAProxy return code: $haproxy_ret"
+    [ $haproxy_ret -ne 0 ] && echo "$haproxy_output" | grep -q "different parameter 'ocsp-update'"
 }
 
 # test7
@@ -210,7 +222,7 @@ EOF
     cat << EOF > ${tmpdir}/ocsp_compat_check.cfg
 global
     crt-base ${testdir}/ocsp_update/multicert
-#    tune.ssl.ocsp-update.mode off
+#    ocsp-update.mode off
 
 defaults
     log stderr local0 debug err
@@ -222,8 +234,9 @@ EOF
 
     haproxy_output="$($HAPROXY_PROGRAM -f ${tmpdir}/ocsp_compat_check.cfg -c 2>&1)"
     haproxy_ret=$?
-
-    ! [ $haproxy_ret -eq 0 ] && echo "$haproxy_output" | grep -q "Incompatibilities found in OCSP update mode for certificate"
+    echo "==== test 7"
+    echo "$haproxy_output"
+    [ $haproxy_ret -ne 0 ] && echo "$haproxy_output" | grep -q "different parameter 'ocsp-update'"
 }
 
 # test8
@@ -240,7 +253,7 @@ EOF
     cat << EOF > ${tmpdir}/ocsp_compat_check.cfg
 global
     crt-base ${testdir}/ocsp_update/multicert
-#    tune.ssl.ocsp-update.mode off
+#    ocsp-update.mode off
 
 defaults
     log stderr local0 debug err
@@ -252,8 +265,10 @@ EOF
 
     haproxy_output="$($HAPROXY_PROGRAM -f ${tmpdir}/ocsp_compat_check.cfg -c 2>&1)"
     haproxy_ret=$?
-
-    ! [ $haproxy_ret -eq 0 ] && echo "$haproxy_output" | grep -q "Incompatibilities found in OCSP update mode for certificate"
+    echo "==== test 8"
+    echo "$haproxy_output"
+    echo "HAProxy return code: $haproxy_ret"
+    [ $haproxy_ret -ne 0 ] && echo "$haproxy_output" | grep -q "different parameter 'ocsp-update'"
 }
 
 # test9
@@ -270,7 +285,7 @@ EOF
     cat << EOF > ${tmpdir}/ocsp_compat_check.cfg
 global
     crt-base ${testdir}/ocsp_update/multicert
-    tune.ssl.ocsp-update.mode on
+    ocsp-update.mode on
 
 defaults
     log stderr local0 debug err
@@ -282,8 +297,10 @@ EOF
 
     haproxy_output="$($HAPROXY_PROGRAM -f ${tmpdir}/ocsp_compat_check.cfg -c 2>&1)"
     haproxy_ret=$?
-
-    ! [ $haproxy_ret -eq 0 ] && echo "$haproxy_output" | grep -q "Incompatibilities found in OCSP update mode for certificate"
+    echo "==== test 9"
+    echo "$haproxy_output"
+    echo "HAProxy return code: $haproxy_ret"
+    [ $haproxy_ret -ne 0 ] && echo "$haproxy_output" | grep -q "different parameter 'ocsp-update'"
 }
 
 # test10
@@ -300,7 +317,7 @@ EOF
     cat << EOF > ${tmpdir}/ocsp_compat_check.cfg
 global
     crt-base ${testdir}/ocsp_update/multicert
-    tune.ssl.ocsp-update.mode on
+    ocsp-update.mode on
 
 defaults
     log stderr local0 debug err
@@ -312,8 +329,10 @@ EOF
 
     haproxy_output="$($HAPROXY_PROGRAM -f ${tmpdir}/ocsp_compat_check.cfg -c 2>&1)"
     haproxy_ret=$?
-
-    ! [ $haproxy_ret -eq 0 ] && echo "$haproxy_output" | grep -q "Incompatibilities found in OCSP update mode for certificate"
+    echo "==== test 10"
+    echo "$haproxy_output"
+    echo "HAProxy return code: $haproxy_ret"
+    [ $haproxy_ret -ne 0 ] && echo "$haproxy_output" | grep -q "different parameter 'ocsp-update'"
 }
 
 # test11
@@ -330,7 +349,7 @@ EOF
     cat << EOF > ${tmpdir}/ocsp_compat_check.cfg
 global
     crt-base ${testdir}/ocsp_update/multicert
-    tune.ssl.ocsp-update.mode off
+    ocsp-update.mode off
 
 defaults
     log stderr local0 debug err
@@ -342,8 +361,10 @@ EOF
 
     haproxy_output="$($HAPROXY_PROGRAM -f ${tmpdir}/ocsp_compat_check.cfg -c 2>&1)"
     haproxy_ret=$?
-
-    ! [ $haproxy_ret -eq 0 ] && echo "$haproxy_output" | grep -q "Incompatibilities found in OCSP update mode for certificate"
+    echo "==== test 11"
+    echo "$haproxy_output"
+    echo "HAProxy return code: $haproxy_ret"
+    [ $haproxy_ret -ne 0 ] && echo "$haproxy_output" | grep -q "different parameter 'ocsp-update'"
 }
 
 # test12
@@ -360,7 +381,7 @@ EOF
     cat << EOF > ${tmpdir}/ocsp_compat_check.cfg
 global
     crt-base ${testdir}/ocsp_update/multicert
-    tune.ssl.ocsp-update.mode off
+    ocsp-update.mode off
 
 defaults
     log stderr local0 debug err
@@ -372,366 +393,9 @@ EOF
 
     haproxy_output="$($HAPROXY_PROGRAM -f ${tmpdir}/ocsp_compat_check.cfg -c 2>&1)"
     haproxy_ret=$?
-
-    ! [ $haproxy_ret -eq 0 ] && echo "$haproxy_output" | grep -q "Incompatibilities found in OCSP update mode for certificate"
+    echo "==== test 12"
+    echo "$haproxy_output"
+    echo "HAProxy return code: $haproxy_ret"
+    [ $haproxy_ret -ne 0 ] && echo "$haproxy_output" | grep -q "different parameter 'ocsp-update'"
 }
 
-
-
-
-###########################
-#                         #
-#   GOOD CONFIGURATIONS   #
-#                         #
-###########################
-
-# test1
-#    global_option   DFLT
-#    bind line       DFLT    (first)
-#    crt-list        OFF     (second)
-shell {
-    cat << EOF > ${tmpdir}/ocsp_compat_check.list
-server_ocsp_ecdsa.pem [ocsp-update off] foo.com
-EOF
-
-    cat << EOF > ${tmpdir}/ocsp_compat_check.cfg
-global
-    crt-base ${testdir}/ocsp_update/multicert
-#    tune.ssl.ocsp-update.mode on
-
-defaults
-    log stderr local0 debug err
-    timeout connect 1s
-    timeout client  1s
-    timeout server  1s
-
-listen ssl-lst
-    bind "${tmpdir}/ssl.sock" ssl crt server_ocsp_ecdsa.pem crt-list ${tmpdir}/ocsp_compat_check.list
-    server s1 127.0.0.1:80
-EOF
-
-    $HAPROXY_PROGRAM -f ${tmpdir}/ocsp_compat_check.cfg -c
-}
-
-# test2
-#    global_option   ON
-#    bind line       DFLT/ON (first)
-#    crt-list        ON      (second)
-shell {
-    cat << EOF > ${tmpdir}/ocsp_compat_check.list
-server_ocsp_ecdsa.pem [ocsp-update on] foo.com
-EOF
-
-    cat << EOF > ${tmpdir}/ocsp_compat_check.cfg
-global
-    crt-base ${testdir}/ocsp_update/multicert
-    tune.ssl.ocsp-update.mode on
-
-defaults
-    log stderr local0 debug err
-    timeout connect 1s
-    timeout client  1s
-    timeout server  1s
-
-listen ssl-lst
-    bind "${tmpdir}/ssl.sock" ssl crt server_ocsp_ecdsa.pem crt-list ${tmpdir}/ocsp_compat_check.list
-    server s1 127.0.0.1:80
-EOF
-
-    $HAPROXY_PROGRAM -f ${tmpdir}/ocsp_compat_check.cfg -c
-}
-
-# test3
-#    global_option   OFF
-#    bind line       DFLT/OFF(first)
-#    crt-list        OFF     (second)
-shell {
-    cat << EOF > ${tmpdir}/ocsp_compat_check.list
-server_ocsp_ecdsa.pem [ocsp-update off] foo.com
-EOF
-
-    cat << EOF > ${tmpdir}/ocsp_compat_check.cfg
-global
-    crt-base ${testdir}/ocsp_update/multicert
-    tune.ssl.ocsp-update.mode off
-
-defaults
-    log stderr local0 debug err
-    timeout connect 1s
-    timeout client  1s
-    timeout server  1s
-
-listen ssl-lst
-    bind "${tmpdir}/ssl.sock" ssl crt server_ocsp_ecdsa.pem crt-list ${tmpdir}/ocsp_compat_check.list
-    server s1 127.0.0.1:80
-EOF
-
-    $HAPROXY_PROGRAM -f ${tmpdir}/ocsp_compat_check.cfg -c
-}
-
-# test4
-#    global_option   DFLT
-#    bind line       DFLT    (second)
-#    crt-list        OFF     (first)
-shell {
-    cat << EOF > ${tmpdir}/ocsp_compat_check.list
-server_ocsp_ecdsa.pem [ocsp-update off] foo.com
-EOF
-
-    cat << EOF > ${tmpdir}/ocsp_compat_check.cfg
-global
-    crt-base ${testdir}/ocsp_update/multicert
-#    tune.ssl.ocsp-update.mode off
-
-defaults
-    log stderr local0 debug err
-    timeout connect 1s
-    timeout client  1s
-    timeout server  1s
-
-listen ssl-lst
-    bind "${tmpdir}/ssl.sock" ssl crt-list ${tmpdir}/ocsp_compat_check.list
-    bind "${tmpdir}/ssl2.sock" ssl crt server_ocsp_ecdsa.pem
-    server s1 127.0.0.1:80
-EOF
-
-    $HAPROXY_PROGRAM -f ${tmpdir}/ocsp_compat_check.cfg -c
-}
-
-# test5
-#    global_option   ON
-#    bind line       DFLT    (second)
-#    crt-list        ON      (first)
-shell {
-    cat << EOF > ${tmpdir}/ocsp_compat_check.list
-server_ocsp_ecdsa.pem [ocsp-update on] foo.com
-EOF
-
-    cat << EOF > ${tmpdir}/ocsp_compat_check.cfg
-global
-    crt-base ${testdir}/ocsp_update/multicert
-    tune.ssl.ocsp-update.mode on
-
-defaults
-    log stderr local0 debug err
-    timeout connect 1s
-    timeout client  1s
-    timeout server  1s
-
-listen ssl-lst
-    bind "${tmpdir}/ssl.sock" ssl crt-list ${tmpdir}/ocsp_compat_check.list
-    bind "${tmpdir}/ssl2.sock" ssl crt server_ocsp_ecdsa.pem
-    server s1 127.0.0.1:80
-EOF
-
-    $HAPROXY_PROGRAM -f ${tmpdir}/ocsp_compat_check.cfg -c
-}
-
-# test6
-#    global_option   OFF
-#    bind line       DFLT    (second)
-#    crt-list        OFF     (first)
-shell {
-    cat << EOF > ${tmpdir}/ocsp_compat_check.list
-server_ocsp_ecdsa.pem [ocsp-update off] foo.com
-EOF
-
-    cat << EOF > ${tmpdir}/ocsp_compat_check.cfg
-global
-    crt-base ${testdir}/ocsp_update/multicert
-    tune.ssl.ocsp-update.mode off
-
-defaults
-    log stderr local0 debug err
-    timeout connect 1s
-    timeout client  1s
-    timeout server  1s
-
-listen ssl-lst
-    bind "${tmpdir}/ssl.sock" ssl crt-list ${tmpdir}/ocsp_compat_check.list
-    bind "${tmpdir}/ssl2.sock" ssl crt server_ocsp_ecdsa.pem
-    server s1 127.0.0.1:80
-EOF
-
-    $HAPROXY_PROGRAM -f ${tmpdir}/ocsp_compat_check.cfg -c
-}
-
-# test7
-#    global_option   DFLT
-#    bind line       -
-#    crt-list        OFF
-#    crt-list        DFLT
-shell {
-    cat << EOF > ${tmpdir}/ocsp_compat_check.list
-server_ocsp_ecdsa.pem [ocsp-update off] foo.com
-server_ocsp_ecdsa.pem foo.com
-EOF
-
-    cat << EOF > ${tmpdir}/ocsp_compat_check.cfg
-global
-    crt-base ${testdir}/ocsp_update/multicert
-#    tune.ssl.ocsp-update.mode off
-
-defaults
-    log stderr local0 debug err
-    timeout connect 1s
-    timeout client  1s
-    timeout server  1s
-
-listen ssl-lst
-    bind "${tmpdir}/ssl.sock" ssl crt-list ${tmpdir}/ocsp_compat_check.list
-    server s1 127.0.0.1:80
-EOF
-
-    $HAPROXY_PROGRAM -f ${tmpdir}/ocsp_compat_check.cfg -c
-}
-
-# test8
-#    global_option   DFLT
-#    bind line       -
-#    crt-list        DFLT
-#    crt-list        OFF
-shell {
-    cat << EOF > ${tmpdir}/ocsp_compat_check.list
-server_ocsp_ecdsa.pem foo.com
-server_ocsp_ecdsa.pem [ocsp-update off] foo.com
-EOF
-
-    cat << EOF > ${tmpdir}/ocsp_compat_check.cfg
-global
-    crt-base ${testdir}/ocsp_update/multicert
-#    tune.ssl.ocsp-update.mode off
-
-defaults
-    log stderr local0 debug err
-    timeout connect 1s
-    timeout client  1s
-    timeout server  1s
-
-listen ssl-lst
-    bind "${tmpdir}/ssl.sock" ssl crt-list ${tmpdir}/ocsp_compat_check.list
-    server s1 127.0.0.1:80
-EOF
-
-    $HAPROXY_PROGRAM -f ${tmpdir}/ocsp_compat_check.cfg -c
-}
-
-# test9
-#    global_option   ON
-#    bind line       -
-#    crt-list        ON
-#    crt-list        DFLT
-shell {
-    cat << EOF > ${tmpdir}/ocsp_compat_check.list
-server_ocsp_ecdsa.pem [ocsp-update on] foo.com
-server_ocsp_ecdsa.pem foo.com
-EOF
-
-    cat << EOF > ${tmpdir}/ocsp_compat_check.cfg
-global
-    crt-base ${testdir}/ocsp_update/multicert
-    tune.ssl.ocsp-update.mode on
-
-defaults
-    log stderr local0 debug err
-    timeout connect 1s
-    timeout client  1s
-    timeout server  1s
-
-listen ssl-lst
-    bind "${tmpdir}/ssl.sock" ssl crt-list ${tmpdir}/ocsp_compat_check.list
-    server s1 127.0.0.1:80
-EOF
-
-    $HAPROXY_PROGRAM -f ${tmpdir}/ocsp_compat_check.cfg -c
-}
-
-# test10
-#    global_option   ON
-#    bind line       -
-#    crt-list        DFLT
-#    crt-list        ON
-shell {
-    cat << EOF > ${tmpdir}/ocsp_compat_check.list
-server_ocsp_ecdsa.pem foo.com
-server_ocsp_ecdsa.pem [ocsp-update on] foo.com
-EOF
-
-    cat << EOF > ${tmpdir}/ocsp_compat_check.cfg
-global
-    crt-base ${testdir}/ocsp_update/multicert
-    tune.ssl.ocsp-update.mode on
-
-defaults
-    log stderr local0 debug err
-    timeout connect 1s
-    timeout client  1s
-    timeout server  1s
-
-listen ssl-lst
-    bind "${tmpdir}/ssl.sock" ssl crt-list ${tmpdir}/ocsp_compat_check.list
-    server s1 127.0.0.1:80
-EOF
-
-    $HAPROXY_PROGRAM -f ${tmpdir}/ocsp_compat_check.cfg -c
-}
-
-# test11
-#    global_option   OFF
-#    bind line       -
-#    crt-list        OFF
-#    crt-list        DFLT
-shell {
-    cat << EOF > ${tmpdir}/ocsp_compat_check.list
-server_ocsp_ecdsa.pem [ocsp-update off] foo.com
-server_ocsp_ecdsa.pem foo.com
-EOF
-
-    cat << EOF > ${tmpdir}/ocsp_compat_check.cfg
-global
-    crt-base ${testdir}/ocsp_update/multicert
-    tune.ssl.ocsp-update.mode off
-
-defaults
-    log stderr local0 debug err
-    timeout connect 1s
-    timeout client  1s
-    timeout server  1s
-
-listen ssl-lst
-    bind "${tmpdir}/ssl.sock" ssl crt-list ${tmpdir}/ocsp_compat_check.list
-    server s1 127.0.0.1:80
-EOF
-
-    $HAPROXY_PROGRAM -f ${tmpdir}/ocsp_compat_check.cfg -c
-}
-
-# test12
-#    global_option   OFF
-#    bind line       -
-#    crt-list        DFLT
-#    crt-list        OFF
-shell {
-    cat << EOF > ${tmpdir}/ocsp_compat_check.list
-server_ocsp_ecdsa.pem foo.com
-server_ocsp_ecdsa.pem [ocsp-update off] foo.com
-EOF
-
-    cat << EOF > ${tmpdir}/ocsp_compat_check.cfg
-global
-    crt-base ${testdir}/ocsp_update/multicert
-    tune.ssl.ocsp-update.mode off
-
-defaults
-    log stderr local0 debug err
-    timeout connect 1s
-    timeout client  1s
-    timeout server  1s
-
-listen ssl-lst
-    bind "${tmpdir}/ssl.sock" ssl crt-list ${tmpdir}/ocsp_compat_check.list
-    server s1 127.0.0.1:80
-EOF
-
-    $HAPROXY_PROGRAM -f ${tmpdir}/ocsp_compat_check.cfg -c
-}

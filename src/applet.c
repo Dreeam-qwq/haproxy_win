@@ -405,8 +405,7 @@ void appctx_shut(struct appctx *appctx)
 		appctx->applet->release(appctx);
 	applet_fl_set(appctx, APPCTX_FL_SHUTDOWN);
 
-	if (LIST_INLIST(&appctx->buffer_wait.list))
-		LIST_DEL_INIT(&appctx->buffer_wait.list);
+	b_dequeue(&appctx->buffer_wait);
 
 	TRACE_LEAVE(APPLET_EV_RELEASE, appctx);
 }
@@ -436,48 +435,46 @@ static void appctx_release_buffers(struct appctx * appctx)
 
 /* Callback used to wake up an applet when a buffer is available. The applet
  * <appctx> is woken up if an input buffer was requested for the associated
- * stream connector. In this case the buffer is immediately allocated and the
- * function returns 1. Otherwise it returns 0. Note that this automatically
- * covers multiple wake-up attempts by ensuring that the same buffer will not
- * be accounted for multiple times.
+ * stream connector. In this case the buffer is expected to be allocated later,
+ * the applet is woken up, and the function returns 1 to mention this buffer is
+ * expected to be used. Otherwise it returns 0.
  */
 int appctx_buf_available(void *arg)
 {
 	struct appctx *appctx = arg;
 	struct stconn *sc = appctx_sc(appctx);
+	int ret = 0;
 
-	if (applet_fl_test(appctx, APPCTX_FL_INBLK_ALLOC) && b_alloc(&appctx->inbuf)) {
+	if (applet_fl_test(appctx, APPCTX_FL_INBLK_ALLOC)) {
 		applet_fl_clr(appctx, APPCTX_FL_INBLK_ALLOC);
-		TRACE_STATE("unblocking appctx, inbuf allocated", APPLET_EV_RECV|APPLET_EV_BLK|APPLET_EV_WAKE, appctx);
-		task_wakeup(appctx->t, TASK_WOKEN_RES);
-		return 1;
+		applet_fl_set(appctx, APPCTX_FL_IN_MAYALLOC);
+		TRACE_STATE("unblocking appctx on inbuf allocation", APPLET_EV_RECV|APPLET_EV_BLK|APPLET_EV_WAKE, appctx);
+		ret = 1;
 	}
 
-	if (applet_fl_test(appctx, APPCTX_FL_OUTBLK_ALLOC) && b_alloc(&appctx->outbuf)) {
+	if (applet_fl_test(appctx, APPCTX_FL_OUTBLK_ALLOC)) {
 		applet_fl_clr(appctx, APPCTX_FL_OUTBLK_ALLOC);
-		TRACE_STATE("unblocking appctx, outbuf allocated", APPLET_EV_SEND|APPLET_EV_BLK|APPLET_EV_WAKE, appctx);
+		applet_fl_set(appctx, APPCTX_FL_OUT_MAYALLOC);
+		TRACE_STATE("unblocking appctx on outbuf allocation", APPLET_EV_SEND|APPLET_EV_BLK|APPLET_EV_WAKE, appctx);
+		ret = 1;
+	}
+
+	/* allocation requested ? if no, give up. */
+	if (sc->flags & SC_FL_NEED_BUFF) {
+		sc_have_buff(sc);
+		ret = 1;
+	}
+
+	/* The requested buffer might already have been allocated (channel,
+	 * fast-forward etc), in which case we won't need to take that one.
+	 * Otherwise we expect to take it.
+	 */
+	if (!c_size(sc_ic(sc)) && !sc_ep_have_ff_data(sc_opposite(sc)))
+		ret = 1;
+ leave:
+	if (ret)
 		task_wakeup(appctx->t, TASK_WOKEN_RES);
-		return 1;
-	}
-
-	/* allocation requested ? */
-	if (!(sc->flags & SC_FL_NEED_BUFF))
-		return 0;
-
-	sc_have_buff(sc);
-
-	/* was already allocated another way ? if so, don't take this one */
-	if (c_size(sc_ic(sc)) || sc_ep_have_ff_data(sc_opposite(sc)))
-		return 0;
-
-	/* allocation possible now ? */
-	if (!b_alloc(&sc_ic(sc)->buf)) {
-		sc_need_buff(sc);
-		return 0;
-	}
-
-	task_wakeup(appctx->t, TASK_WOKEN_RES);
-	return 1;
+	return ret;
 }
 
 size_t appctx_htx_rcv_buf(struct appctx *appctx, struct buffer *buf, size_t count, unsigned int flags)
@@ -533,7 +530,6 @@ size_t appctx_rcv_buf(struct stconn *sc, struct buffer *buf, size_t count, unsig
 		goto end;
 
 	if (!appctx_get_buf(appctx, &appctx->outbuf)) {
-		applet_fl_set(appctx, APPCTX_FL_OUTBLK_ALLOC);
 		TRACE_STATE("waiting for appctx outbuf allocation", APPLET_EV_RECV|APPLET_EV_BLK, appctx);
 		goto end;
 	}
@@ -631,7 +627,6 @@ size_t appctx_snd_buf(struct stconn *sc, struct buffer *buf, size_t count, unsig
 		goto end;
 
 	if (!appctx_get_buf(appctx, &appctx->inbuf)) {
-		applet_fl_set(appctx, APPCTX_FL_INBLK_ALLOC);
 		TRACE_STATE("waiting for appctx inbuf allocation", APPLET_EV_SEND|APPLET_EV_BLK, appctx);
 		goto end;
 	}

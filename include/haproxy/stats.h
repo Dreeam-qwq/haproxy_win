@@ -46,11 +46,13 @@ extern struct list stats_module_list[];
 extern THREAD_LOCAL struct field stat_line_info[];
 extern THREAD_LOCAL struct field *stat_lines[];
 extern struct name_desc *stat_cols[STATS_DOMAIN_COUNT];
+extern size_t stat_cols_len[STATS_DOMAIN_COUNT];
 
 int generate_stat_tree(struct eb_root *st_tree, const struct stat_col cols[]);
 
 struct htx;
 int stats_putchk(struct appctx *appctx, struct buffer *buf, struct htx *htx);
+int stats_is_full(struct appctx *appctx, struct buffer *buf, struct htx *htx);
 
 const char *stats_scope_ptr(struct appctx *appctx);
 
@@ -73,6 +75,12 @@ int stats_emit_typed_data_field(struct buffer *out, const struct field *f);
 int stats_emit_field_tags(struct buffer *out, const struct field *f,
 			  char delim);
 
+
+/* Returns true if <col> is fully defined, false if only used as name-desc. */
+static inline int stcol_is_generic(const struct stat_col *col)
+{
+	return !!(col->cap);
+}
 
 static inline enum field_format stcol_format(const struct stat_col *col)
 {
