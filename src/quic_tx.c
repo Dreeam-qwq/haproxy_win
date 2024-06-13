@@ -32,7 +32,8 @@ static struct quic_tx_packet *qc_build_pkt(unsigned char **pos, const unsigned c
                                            struct quic_enc_level *qel, struct quic_tls_ctx *ctx,
                                            struct list *frms, struct quic_conn *qc,
                                            const struct quic_version *ver, size_t dglen, int pkt_type,
-                                           int must_ack, int padding, int probe, int cc, int *err);
+                                           int must_ack, int padding, int probe, int cc,
+                                           enum qc_build_pkt_err *err);
 
 static void quic_packet_encrypt(unsigned char *payload, size_t payload_len,
                                 unsigned char *aad, size_t aad_len, uint64_t pn,
@@ -152,19 +153,29 @@ struct buffer *qc_get_txb(struct quic_conn *qc)
 static void qc_txb_store(struct buffer *buf, uint16_t length,
                          struct quic_tx_packet *first_pkt)
 {
-	const size_t hdlen = sizeof(uint16_t) + sizeof(void *);
-	BUG_ON_HOT(b_contig_space(buf) < hdlen); /* this must not happen */
+	BUG_ON_HOT(b_contig_space(buf) < QUIC_DGRAM_HEADLEN); /* this must not happen */
+
+	/* If first packet is INITIAL, ensure datagram is sufficiently padded. */
+	BUG_ON(first_pkt->type == QUIC_PACKET_TYPE_INITIAL &&
+	       (first_pkt->flags & QUIC_FL_TX_PACKET_ACK_ELICITING) &&
+	       length < QUIC_INITIAL_PACKET_MINLEN);
 
 	write_u16(b_tail(buf), length);
 	write_ptr(b_tail(buf) + sizeof(length), first_pkt);
-	b_add(buf, hdlen + length);
+	b_add(buf, QUIC_DGRAM_HEADLEN + length);
 }
 
-/* Returns 1 if a packet may be built for <qc> from <qel> encryption level
- * with <frms> as ack-eliciting frame list to send, 0 if not.
- * <cc> must equal to 1 if an immediate close was asked, 0 if not.
- * <probe> must equalt to 1 if a probing packet is required, 0 if not.
- * Also set <*must_ack> to inform the caller if an acknowledgement should be sent.
+/* Reports if data are ready to be sent for <qel> encryption level on <qc>
+ * connection.
+ *
+ * <frms> is the ack-eliciting frames list to send, if any. Other parameters
+ * can be set individually for some special frame types : <cc> for immediate
+ * close, <probe> to emit probing frames.
+ *
+ * This function will also set <must_ack> to inform the caller that an
+ * acknowledgement should be sent.
+ *
+ * Returns true if data to emit else false.
  */
 static int qc_may_build_pkt(struct quic_conn *qc, struct list *frms,
                             struct quic_enc_level *qel, int cc, int probe,
@@ -242,12 +253,11 @@ static void qc_purge_tx_buf(struct quic_conn *qc, struct buffer *buf)
 	while (b_contig_data(buf, 0)) {
 		uint16_t dglen;
 		struct quic_tx_packet *pkt;
-		size_t headlen = sizeof dglen + sizeof pkt;
 
 		dglen = read_u16(b_head(buf));
-		pkt = read_ptr(b_head(buf) + sizeof dglen);
+		pkt = read_ptr(b_head(buf) + sizeof(dglen));
 		qc_free_tx_coalesced_pkts(qc, pkt);
-		b_del(buf, dglen + headlen);
+		b_del(buf, dglen + QUIC_DGRAM_HEADLEN);
 	}
 
 	BUG_ON(b_data(buf));
@@ -277,16 +287,14 @@ static int qc_send_ppkts(struct buffer *buf, struct ssl_sock_ctx *ctx)
 		struct buffer tmpbuf = { };
 		struct quic_tx_packet *first_pkt, *pkt, *next_pkt;
 		uint16_t dglen;
-		size_t headlen = sizeof dglen + sizeof first_pkt;
 		unsigned int time_sent;
 
 		pos = (unsigned char *)b_head(buf);
 		dglen = read_u16(pos);
 		BUG_ON_HOT(!dglen); /* this should not happen */
 
-		pos += sizeof dglen;
-		first_pkt = read_ptr(pos);
-		pos += sizeof first_pkt;
+		first_pkt = read_ptr(pos + sizeof(dglen));
+		pos += QUIC_DGRAM_HEADLEN;
 		tmpbuf.area = (char *)pos;
 		tmpbuf.size = tmpbuf.data = dglen;
 
@@ -307,7 +315,7 @@ static int qc_send_ppkts(struct buffer *buf, struct ssl_sock_ctx *ctx)
 				TRACE_ERROR("sendto fatal error", QUIC_EV_CONN_SPPKTS, qc, first_pkt);
 				qc_kill_conn(qc);
 				qc_free_tx_coalesced_pkts(qc, first_pkt);
-				b_del(buf, dglen + headlen);
+				b_del(buf, dglen + QUIC_DGRAM_HEADLEN);
 				qc_purge_tx_buf(qc, buf);
 				goto leave;
 			}
@@ -324,21 +332,13 @@ static int qc_send_ppkts(struct buffer *buf, struct ssl_sock_ctx *ctx)
 			}
 		}
 
-		b_del(buf, dglen + headlen);
+		b_del(buf, dglen + QUIC_DGRAM_HEADLEN);
 		qc->bytes.tx += tmpbuf.data;
 		time_sent = now_ms;
 
 		for (pkt = first_pkt; pkt; pkt = next_pkt) {
 			struct quic_cc *cc = &qc->path->cc;
-			/* RFC 9000 14.1 Initial datagram size
-			 * a server MUST expand the payload of all UDP datagrams carrying ack-eliciting
-			 * Initial packets to at least the smallest allowed maximum datagram size of
-			 * 1200 bytes.
-			 */
 			qc->cntrs.sent_pkt++;
-			BUG_ON_HOT(pkt->type == QUIC_PACKET_TYPE_INITIAL &&
-			           (pkt->flags & QUIC_FL_TX_PACKET_ACK_ELICITING) &&
-			           dglen < QUIC_INITIAL_PACKET_MINLEN);
 
 			pkt->time_sent = time_sent;
 			if (pkt->flags & QUIC_FL_TX_PACKET_ACK_ELICITING) {
@@ -510,8 +510,9 @@ static int qc_prep_pkts(struct quic_conn *qc, struct buffer *buf,
 	list_for_each_entry_safe(qel, tmp_qel, qels, el_send) {
 		struct quic_tls_ctx *tls_ctx;
 		const struct quic_version *ver;
-		struct list *frms = qel->send_frms, *next_frms;
+		struct list *frms = qel->send_frms;
 		struct quic_enc_level *next_qel;
+		int probe, must_ack;
 
 		if (qel == qc->eel) {
 			/* Next encryption level */
@@ -521,112 +522,105 @@ static int qc_prep_pkts(struct quic_conn *qc, struct buffer *buf,
 		qc_select_tls_ver(qc, qel, &tls_ctx, &ver);
 
 		/* Retrieve next QEL. Set it to NULL if on qels last element. */
-		if (qel->el_send.n != qels) {
-			next_qel = LIST_ELEM(qel->el_send.n, struct quic_enc_level *, el_send);
-			next_frms = next_qel->send_frms;
-		}
-		else {
-			next_qel  = NULL;
-			next_frms = NULL;
-		}
+		next_qel = LIST_NEXT(&qel->el_send, struct quic_enc_level *, el_send);
+		if (&next_qel->el_send == qels)
+			next_qel = NULL;
+		/* We do not probe if an immediate close was asked */
+		probe = !cc ? qel->pktns->tx.pto_probe : 0;
 
-		/* Build as much as datagrams at <qel> encryption level.
-		 * Each datagram is prepended with its length followed by the address
-		 * of the first packet in the datagram (QUIC_DGRAM_HEADLEN).
+		/* Build packets for QEL until nothing to send (and no padding
+		 * required anymore) while there is still room left in buffer.
 		 */
-		while ((!cc && b_contig_space(buf) >= (int)qc->path->mtu + QUIC_DGRAM_HEADLEN) ||
-		        (cc && b_contig_space(buf) >= QUIC_MIN_CC_PKTSIZE + QUIC_DGRAM_HEADLEN) || prv_pkt) {
-			int err, probe, must_ack;
+		while (b_contig_space(buf) >= QUIC_DGRAM_HEADLEN &&
+		       (qc_may_build_pkt(qc, frms, qel, cc, probe, &must_ack) ||
+		        (padding && !next_qel))) {
+
 			enum quic_pkt_type pkt_type;
 			struct quic_tx_packet *cur_pkt;
+			enum qc_build_pkt_err err;
 
 			TRACE_PROTO("TX prep pkts", QUIC_EV_CONN_PHPKTS, qc, qel);
-			probe = 0;
-			/* We do not probe if an immediate close was asked */
-			if (!cc)
-				probe = qel->pktns->tx.pto_probe;
 
-			if (!qc_may_build_pkt(qc, frms, qel, cc, probe, &must_ack)) {
-				/* Remove qel from send_list if nothing to send. */
-				LIST_DEL_INIT(&qel->el_send);
-				qel->send_frms = NULL;
-
-				if (prv_pkt && !next_qel) {
-					qc_txb_store(buf, dglen, first_pkt);
-					/* Build only one datagram when an immediate close is required. */
-					if (cc)
-						goto out;
-				}
-
-				TRACE_DEVEL("next encryption level", QUIC_EV_CONN_PHPKTS, qc);
-				break;
-			}
-
-			if (!prv_pkt) {
-				/* Leave room for the datagram header */
+			/* On starting a new datagram, calculate end max offset
+			 * to stay under MTU limit.
+			 */
+			if (!first_pkt) {
 				pos += QUIC_DGRAM_HEADLEN;
-				if (cc) {
+				if (cc)
 					end = pos + QUIC_MIN_CC_PKTSIZE;
-				}
-				else if (!quic_peer_validated_addr(qc) && qc_is_listener(qc)) {
+				else if (!quic_peer_validated_addr(qc) && qc_is_listener(qc))
 					end = pos + QUIC_MIN(qc->path->mtu, quic_may_send_bytes(qc));
-				}
-				else {
+				else
 					end = pos + qc->path->mtu;
-				}
+
+				/* Ensure end does not go beyond buffer */
+				if (end > (unsigned char *)b_wrap(buf))
+					end = (unsigned char *)b_wrap(buf);
 			}
 
 			/* RFC 9000 14.1 Initial datagram size
-			 * a server MUST expand the payload of all UDP datagrams carrying ack-eliciting
-			 * Initial packets to at least the smallest allowed maximum datagram size of
-			 * 1200 bytes.
 			 *
-			 * Ensure that no ack-eliciting packets are sent into too small datagrams
+			 * Similarly, a server MUST expand the payload of all UDP
+			 * datagrams carrying ack-eliciting Initial packets to at least the
+			 * smallest allowed maximum datagram size of 1200 bytes.
 			 */
-			if (qel == qc->iel && !LIST_ISEMPTY(frms)) {
+			if (qel == qc->iel && (!LIST_ISEMPTY(frms) || probe)) {
+				 /* Ensure that no ack-eliciting packets are sent into too small datagrams */
 				if (end - pos < QUIC_INITIAL_PACKET_MINLEN) {
 					TRACE_PROTO("No more enough room to build an Initial packet",
 					            QUIC_EV_CONN_PHPKTS, qc);
 					break;
 				}
 
-				/* Pad this Initial packet if there is no ack-eliciting frames to send from
-				 * the next packet number space.
-				 */
-				if (!next_frms || LIST_ISEMPTY(next_frms))
-					padding = 1;
+				/* padding will be set for last QEL */
+				padding = 1;
 			}
 
 			pkt_type = quic_enc_level_pkt_type(qc, qel);
 			cur_pkt = qc_build_pkt(&pos, end, qel, tls_ctx, frms,
 			                       qc, ver, dglen, pkt_type,
-			                       must_ack, padding, probe, cc, &err);
-			switch (err) {
-				case -3:
+			                       must_ack, padding && !next_qel,
+			                       probe, cc, &err);
+			if (!cur_pkt) {
+				switch (err) {
+				case QC_BUILD_PKT_ERR_ALLOC:
 					if (first_pkt)
 						qc_txb_store(buf, dglen, first_pkt);
 					qc_purge_tx_buf(qc, buf);
-					goto leave;
-				case -2:
+					break;
+
+				case QC_BUILD_PKT_ERR_ENCRYPT:
 					// trace already emitted by function above
-					goto leave;
-				case -1:
-					/* If there was already a correct packet present, set the
-					 * current datagram as prepared into <cbuf>.
-					 */
-					if (prv_pkt)
+					break;
+
+				case QC_BUILD_PKT_ERR_BUFROOM:
+					if (first_pkt)
 						qc_txb_store(buf, dglen, first_pkt);
 					TRACE_PROTO("could not prepare anymore packet", QUIC_EV_CONN_PHPKTS, qc, qel);
-					goto out;
-				default:
 					break;
+
+				default:
+					ABORT_NOW(); /* error case not handled */
+					break;
+				}
+
+				if (err == QC_BUILD_PKT_ERR_ALLOC || err == QC_BUILD_PKT_ERR_ENCRYPT)
+					goto leave;
+				goto out;
 			}
 
-			/* This is to please to GCC. We cannot have (err >= 0 && !cur_pkt) */
-			BUG_ON(!cur_pkt);
 
 			total += cur_pkt->len;
 			dglen += cur_pkt->len;
+
+			/* qc_do_build_pkt() is responsible to decrement probe
+			 * value. Required to break loop on qc_may_build_pkt().
+			 */
+			probe = qel->pktns->tx.pto_probe;
+
+			/* Reset padding if datagram is big enough. */
+			if (dglen >= QUIC_INITIAL_PACKET_MINLEN)
+				padding = 0;
 
 			if (qc->flags & QUIC_FL_CONN_RETRANS_OLD_DATA)
 				cur_pkt->flags |= QUIC_FL_TX_PACKET_PROBE_WITH_OLD_DATA;
@@ -642,31 +636,33 @@ static int qc_prep_pkts(struct quic_conn *qc, struct buffer *buf,
 				cur_pkt->flags |= QUIC_FL_TX_PACKET_COALESCED;
 			}
 
-			/* If there is no more packet to build for this encryption level,
-			 * select the next one <next_qel>, if any, to coalesce a packet in
-			 * the same datagram, except if <qel> is the Application data
-			 * encryption level which cannot be selected to do that.
-			 */
-			if (LIST_ISEMPTY(frms) && qel != qc->ael && next_qel) {
-				if (qel == qc->iel &&
-				    (!qc_is_listener(qc) ||
-				     cur_pkt->flags & QUIC_FL_TX_PACKET_ACK_ELICITING))
-					padding = 1;
+			/* Build only one datagram when an immediate close is required. */
+			if (cc) {
+				qc_txb_store(buf, dglen, first_pkt);
+				goto out;
+			}
 
+			if (LIST_ISEMPTY(frms)) {
 				prv_pkt = cur_pkt;
 			}
 			else {
+				/* Finalize current datagram if not all frames
+				 * left. This is due to full buffer or datagram
+				 * MTU reached.
+				 */
 				qc_txb_store(buf, dglen, first_pkt);
-				/* Build only one datagram when an immediate close is required. */
-				if (cc)
-					goto out;
 				first_pkt = NULL;
 				dglen = 0;
 				padding = 0;
 				prv_pkt = NULL;
 			}
 		}
+
+		TRACE_DEVEL("next encryption level", QUIC_EV_CONN_PHPKTS, qc);
 	}
+
+	if (first_pkt)
+		qc_txb_store(buf, dglen, first_pkt);
 
  out:
 	if (cc && total) {
@@ -691,7 +687,7 @@ static int qc_prep_pkts(struct quic_conn *qc, struct buffer *buf,
 int qc_send(struct quic_conn *qc, int old_data, struct list *send_list)
 {
 	struct quic_enc_level *qel, *tmp_qel;
-	int ret, status = 0;
+	int ret = 0, status = 0;
 	struct buffer *buf;
 
 	TRACE_ENTER(QUIC_EV_CONN_TXPKT, qc);
@@ -713,7 +709,7 @@ int qc_send(struct quic_conn *qc, int old_data, struct list *send_list)
 	}
 
 	/* Prepare and send packets until we could not further prepare packets. */
-	do {
+	while (!LIST_ISEMPTY(send_list)) {
 		/* Buffer must always be empty before qc_prep_pkts() usage.
 		 * qc_send_ppkts() ensures it is cleared on success.
 		 */
@@ -727,7 +723,12 @@ int qc_send(struct quic_conn *qc, int old_data, struct list *send_list)
 				qc_txb_release(qc);
 			goto out;
 		}
-	} while (ret > 0 && !LIST_ISEMPTY(send_list));
+
+		if (ret <= 0) {
+			TRACE_DEVEL("stopping on qc_prep_pkts() return", QUIC_EV_CONN_TXPKT, qc);
+			break;
+		}
+	}
 
 	qc_txb_release(qc);
 	if (ret < 0)
@@ -981,24 +982,38 @@ int send_stateless_reset(struct listener *l, struct sockaddr_storage *dstaddr,
 
 	TRACE_ENTER(QUIC_EV_STATELESS_RST);
 
+	/* RFC 9000 10.3. Stateless Reset
+	 *
+	 * Endpoints MUST discard packets that are too small to be valid QUIC
+	 * packets. To give an example, with the set of AEAD functions defined
+	 * in [QUIC-TLS], short header packets that are smaller than 21 bytes
+	 * are never valid.
+	 *
+	 * [...]
+	 *
+	 * RFC 9000 10.3.3. Looping
+	 *
+	 * An endpoint MUST ensure that every Stateless Reset that it sends is
+	 * smaller than the packet that triggered it, unless it maintains state
+	 * sufficient to prevent looping. In the event of a loop, this results
+	 * in packets eventually being too small to trigger a response.
+	 */
+	if (rxpkt->len <= QUIC_STATELESS_RESET_PACKET_MINLEN) {
+		TRACE_DEVEL("rxpkt too short", QUIC_EV_STATELESS_RST);
+		goto leave;
+	}
+
 	prx = l->bind_conf->frontend;
 	prx_counters = EXTRA_COUNTERS_GET(prx->extra_counters_fe, &quic_stats_module);
-	/* 10.3 Stateless Reset (https://www.rfc-editor.org/rfc/rfc9000.html#section-10.3)
-	 * The resulting minimum size of 21 bytes does not guarantee that a Stateless
-	 * Reset is difficult to distinguish from other packets if the recipient requires
-	 * the use of a connection ID. To achieve that end, the endpoint SHOULD ensure
-	 * that all packets it sends are at least 22 bytes longer than the minimum
-	 * connection ID length that it requests the peer to include in its packets,
-	 * adding PADDING frames as necessary. This ensures that any Stateless Reset
-	 * sent by the peer is indistinguishable from a valid packet sent to the endpoint.
+
+	/* RFC 9000 10.3. Stateless Reset
+	 *
 	 * An endpoint that sends a Stateless Reset in response to a packet that is
 	 * 43 bytes or shorter SHOULD send a Stateless Reset that is one byte shorter
 	 * than the packet it responds to.
 	 */
-
-	/* Note that we build at most a 42 bytes QUIC packet to mimic a short packet */
-	pktlen = rxpkt->len <= 43 ? rxpkt->len - 1 : 0;
-	pktlen = QUIC_MAX(QUIC_STATELESS_RESET_PACKET_MINLEN, pktlen);
+	pktlen = rxpkt->len <= 43 ? rxpkt->len - 1 :
+	                            QUIC_STATELESS_RESET_PACKET_MINLEN;
 	rndlen = pktlen - QUIC_STATELESS_RESET_TOKEN_LEN;
 
 	/* Put a header of random bytes */
@@ -1411,6 +1426,7 @@ static int qc_build_frms(struct list *outlist, struct list *inlist,
 	ret = 0;
 	if (*len > room)
 		goto leave;
+	room -= *len;
 
 	/* If we are not probing we must take into an account the congestion
 	 * control window.
@@ -1444,8 +1460,8 @@ static int qc_build_frms(struct list *outlist, struct list *inlist,
 			            QUIC_EV_CONN_BCFRMS, qc, &room, len);
 			/* Compute the length of this CRYPTO frame header */
 			hlen = 1 + quic_int_getsize(cf->crypto.offset);
-			/* Compute the data length of this CRyPTO frame. */
-			dlen = max_stream_data_size(room, *len + hlen, cf->crypto.len);
+			/* Compute the data length of this CRYPTO frame. */
+			dlen = max_stream_data_size(room, hlen, cf->crypto.len);
 			TRACE_DEVEL(" CRYPTO data length (hlen, crypto.len, dlen)",
 			            QUIC_EV_CONN_BCFRMS, qc, &hlen, &cf->crypto.len, &dlen);
 			if (!dlen)
@@ -1536,7 +1552,7 @@ static int qc_build_frms(struct list *outlist, struct list *inlist,
 			hlen = 1 + quic_int_getsize(cf->stream.id) +
 				((cf->type & QUIC_STREAM_FRAME_TYPE_OFF_BIT) ? quic_int_getsize(cf->stream.offset.key) : 0);
 			/* Compute the data length of this STREAM frame. */
-			avail_room = room - hlen - *len;
+			avail_room = room - hlen;
 			if ((ssize_t)avail_room <= 0)
 				continue;
 
@@ -2032,12 +2048,8 @@ static inline void quic_tx_packet_init(struct quic_tx_packet *pkt, int type)
  * the end of this buffer, with <pkt_type> as packet type for <qc> QUIC connection
  * at <qel> encryption level with <frms> list of prebuilt frames.
  *
- * Return -3 if the packet could not be allocated, -2 if could not be encrypted for
- * any reason, -1 if there was not enough room to build a packet.
- * XXX NOTE XXX
- * If you provide provide qc_build_pkt() with a big enough buffer to build a packet as big as
- * possible (to fill an MTU), the unique reason why this function may fail is the congestion
- * control window limitation.
+ * Return built packet instance or NULL on error. <err> will be set to the
+ * specific error encountered.
  */
 static struct quic_tx_packet *qc_build_pkt(unsigned char **pos,
                                            const unsigned char *end,
@@ -2045,9 +2057,9 @@ static struct quic_tx_packet *qc_build_pkt(unsigned char **pos,
                                            struct quic_tls_ctx *tls_ctx, struct list *frms,
                                            struct quic_conn *qc, const struct quic_version *ver,
                                            size_t dglen, int pkt_type, int must_ack,
-                                           int padding, int probe, int cc, int *err)
+                                           int padding, int probe, int cc,
+                                           enum qc_build_pkt_err *err)
 {
-	struct quic_tx_packet *ret_pkt = NULL;
 	/* The pointer to the packet number field. */
 	unsigned char *buf_pn;
 	unsigned char *first_byte, *last_byte, *payload;
@@ -2058,11 +2070,11 @@ static struct quic_tx_packet *qc_build_pkt(unsigned char **pos,
 
 	TRACE_ENTER(QUIC_EV_CONN_TXPKT, qc);
 	TRACE_PROTO("TX pkt build", QUIC_EV_CONN_TXPKT, qc, NULL, qel);
-	*err = 0;
+	*err = QC_BUILD_PKT_ERR_NONE;
 	pkt = pool_alloc(pool_head_quic_tx_packet);
 	if (!pkt) {
 		TRACE_DEVEL("Not enough memory for a new packet", QUIC_EV_CONN_TXPKT, qc);
-		*err = -3;
+		*err = QC_BUILD_PKT_ERR_ALLOC;
 		goto err;
 	}
 
@@ -2075,7 +2087,7 @@ static struct quic_tx_packet *qc_build_pkt(unsigned char **pos,
 	if (!qc_do_build_pkt(*pos, end, dglen, pkt, pn, &pn_len, &buf_pn,
 	                     must_ack, padding, cc, probe, qel, qc, ver, frms)) {
 		// trace already emitted by function above
-		*err = -1;
+		*err = QC_BUILD_PKT_ERR_BUFROOM;
 		goto err;
 	}
 
@@ -2088,7 +2100,7 @@ static struct quic_tx_packet *qc_build_pkt(unsigned char **pos,
 	if (encrypt_failure) {
 		/* TODO Unrecoverable failure, unencrypted data should be returned to the caller. */
 		WARN_ON("quic_packet_encrypt failure");
-		*err = -2;
+		*err = QC_BUILD_PKT_ERR_ENCRYPT;
 		goto err;
 	}
 
@@ -2098,7 +2110,7 @@ static struct quic_tx_packet *qc_build_pkt(unsigned char **pos,
 	if (encrypt_failure) {
 		/* TODO Unrecoverable failure, unencrypted data should be returned to the caller. */
 		WARN_ON("quic_apply_header_protection failure");
-		*err = -2;
+		*err = QC_BUILD_PKT_ERR_ENCRYPT;
 		goto err;
 	}
 
@@ -2135,18 +2147,15 @@ static struct quic_tx_packet *qc_build_pkt(unsigned char **pos,
 
 	pkt->pktns = qel->pktns;
 
-	ret_pkt = pkt;
- leave:
-	TRACE_PROTO("TX pkt built", QUIC_EV_CONN_TXPKT, qc, ret_pkt);
+	TRACE_PROTO("TX pkt built", QUIC_EV_CONN_TXPKT, qc, pkt);
 	TRACE_LEAVE(QUIC_EV_CONN_TXPKT, qc);
-	return ret_pkt;
+	return pkt;
 
  err:
-	/* TODO: what about the frames which have been built
-	 * for this packet.
-	 */
+	/* TODO What about the frames which have been built for this packet? */
 	free_quic_tx_packet(qc, pkt);
-	goto leave;
+	TRACE_DEVEL("leaving on error", QUIC_EV_CONN_TXPKT, qc);
+	return NULL;
 }
 /*
  * Local variables:

@@ -1018,9 +1018,10 @@ static int h1s_must_shut_conn(struct h1s *h1s)
 
 /* Really detach the H1S. Most of time of it called from h1_detach() when the
  * stream is detached from the connection. But if the request message must be
- * drained first, the detach is deferred.
+ * drained first, the detach is deferred. Returns 0 if the h1s is detached but
+ * h1c is still usable. -1 is returned if h1s was released.
  */
-static void h1s_finish_detach(struct h1s *h1s)
+static int h1s_finish_detach(struct h1s *h1s)
 {
 	struct h1c *h1c;
 	struct session *sess;
@@ -1063,7 +1064,7 @@ static void h1s_finish_detach(struct h1s *h1s)
 			if (!session_add_conn(sess, h1c->conn, h1c->conn->target)) {
 				h1c->conn->owner = NULL;
 				h1c->conn->mux->destroy(h1c);
-				goto end;
+				goto released;
 			}
 			/* Always idle at this step */
 
@@ -1074,7 +1075,7 @@ static void h1s_finish_detach(struct h1s *h1s)
 			if (session_check_idle_conn(sess, h1c->conn)) {
 				/* The connection got destroyed, let's leave */
 				TRACE_DEVEL("outgoing connection killed", H1_EV_STRM_END|H1_EV_H1C_END);
-				goto end;
+				goto released;
 			}
 		}
 		else {
@@ -1092,13 +1093,13 @@ static void h1s_finish_detach(struct h1s *h1s)
 				/* The server doesn't want it, let's kill the connection right away */
 				h1c->conn->mux->destroy(h1c);
 				TRACE_DEVEL("outgoing connection killed", H1_EV_STRM_END|H1_EV_H1C_END);
-				goto end;
+				goto released;
 			}
 			/* At this point, the connection has been added to the
 			 * server idle list, so another thread may already have
 			 * hijacked it, so we can't do anything with it.
 			 */
-			return;
+			goto end;
 		}
 	}
 
@@ -1110,6 +1111,7 @@ static void h1s_finish_detach(struct h1s *h1s)
 	    !h1c->conn->owner) {
 		TRACE_DEVEL("killing dead connection", H1_EV_STRM_END, h1c->conn);
 		h1_release(h1c);
+		goto released;
 	}
 	else {
 		if (h1c->state == H1_CS_IDLE) {
@@ -1117,8 +1119,10 @@ static void h1s_finish_detach(struct h1s *h1s)
 			 * subscribe for reads waiting for new data
 			 */
 			if (unlikely(b_data(&h1c->ibuf))) {
-				if (h1_process(h1c) == -1)
-					goto end;
+				if (h1_process(h1c) == -1) {
+					/* h1c was released, don't reuse it anymore */
+					goto released;
+				}
 			}
 			else
 				h1c->conn->xprt->subscribe(h1c->conn, h1c->conn->xprt_ctx, SUB_RETRY_RECV, &h1c->wait_event);
@@ -1128,6 +1132,11 @@ static void h1s_finish_detach(struct h1s *h1s)
 	}
   end:
 	TRACE_LEAVE(H1_EV_STRM_END);
+	return 0;
+
+  released:
+	TRACE_DEVEL("leaving after releasing the connection", H1_EV_STRM_END);
+	return -1;
 }
 
 
@@ -4017,8 +4026,8 @@ static int h1_process(struct h1c * h1c)
 				h1_shutw_conn(conn);
 				goto release;
 			}
-			h1s_finish_detach(h1c->h1s);
-			goto end;
+			if (h1s_finish_detach(h1c->h1s) == -1)
+				goto released;
 		}
 	}
 
@@ -4088,6 +4097,7 @@ static int h1_process(struct h1c * h1c)
 		h1_release(h1c);
 		TRACE_DEVEL("leaving after releasing the connection", H1_EV_H1C_WAKE);
 	}
+  released:
 	return -1;
 }
 
@@ -4376,7 +4386,7 @@ static void h1_shut(struct stconn *sc, enum se_shut_mode mode, struct se_abort_i
 
   do_shutw:
 	h1_close(h1c);
-	if (mode & SE_SHW_NORMAL)
+	if (!(mode & SE_SHW_NORMAL))
 		h1c->flags |= H1C_F_SILENT_SHUT;
 
 	if (!b_data(&h1c->obuf))
@@ -4724,7 +4734,9 @@ static size_t h1_nego_ff(struct stconn *sc, struct buffer *input, size_t count, 
 
 		if (xfer > b_data(input))
 			xfer = b_data(input);
+		h1c->obuf.head += offset;
 		h1s->sd->iobuf.data = b_xfer(&h1c->obuf, input, xfer);
+		h1c->obuf.head -= offset;
 
 		/* Cannot forward more data, wait for room */
 		if (b_data(input))
@@ -4860,7 +4872,7 @@ static int h1_fastfwd(struct stconn *sc, unsigned int count, unsigned int flags)
 	ret = 0;
 
 	if (h1m->state == H1_MSG_DATA && (h1m->flags & (H1_MF_CHNK|H1_MF_CLEN)) &&  count > h1m->curr_len) {
-		flags |= NEGO_FF_FL_EXACT_SIZE;
+		nego_flags |= NEGO_FF_FL_EXACT_SIZE;
 		count = h1m->curr_len;
 	}
 

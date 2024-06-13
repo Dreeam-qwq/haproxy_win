@@ -3110,7 +3110,7 @@ spoe_check(struct proxy *px, struct flt_conf *fconf)
 		HA_SPIN_INIT(&conf->agent->rt[i].lock);
 	}
 
-	if (postresolve_logger_list(&conf->agent_fe.loggers, "SPOE agent", conf->agent->id) & ERR_CODE)
+	if (postresolve_logger_list(NULL, &conf->agent_fe.loggers, "SPOE agent", conf->agent->id) & ERR_CODE)
 		return 1;
 
 	ha_free(&conf->agent->b.name);
@@ -4099,11 +4099,6 @@ parse_spoe_flt(char **args, int *cur_arg, struct proxy *px,
 	LIST_INIT(&curloggers);
 	curpxopts  = 0;
 	curpxopts2 = 0;
-
-
-	if (!deprecated_directives_allowed)
-		ha_warning("Proxy %s: SPOE filter is deprecated and will be removed in future version. "
-			   "Use 'expose-deprecated-directives' in global section to silent this warning\n", px->id);
 
 	conf = calloc(1, sizeof(*conf));
 	if (conf == NULL) {

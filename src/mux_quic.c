@@ -100,10 +100,20 @@ static struct qcs *qcs_new(struct qcc *qcc, uint64_t id, enum qcs_type type)
 
 	qcs->stream = NULL;
 	qcs->qcc = qcc;
-	qcs->sd = NULL;
 	qcs->flags = QC_SF_NONE;
 	qcs->st = QC_SS_IDLE;
 	qcs->ctx = NULL;
+
+	qcs->sd = sedesc_new();
+	if (!qcs->sd)
+		goto err;
+	qcs->sd->se   = qcs;
+	qcs->sd->conn = qcc->conn;
+	se_fl_set(qcs->sd, SE_FL_T_MUX | SE_FL_ORPHAN | SE_FL_NOT_FIRST);
+	se_expect_no_data(qcs->sd);
+
+	if (!(global.tune.no_zero_copy_fwd & NO_ZERO_COPY_FWD_QUIC_SND))
+		se_fl_set(qcs->sd, SE_FL_MAY_FASTFWD_CONS);
 
 	/* App callback attach may register the stream for http-request wait.
 	 * These fields must be initialed before.
@@ -692,17 +702,6 @@ struct stconn *qcs_attach_sc(struct qcs *qcs, struct buffer *buf, char fin)
 	struct qcc *qcc = qcs->qcc;
 	struct session *sess = qcc->conn->owner;
 
-	qcs->sd = sedesc_new();
-	if (!qcs->sd)
-		return NULL;
-
-	qcs->sd->se   = qcs;
-	qcs->sd->conn = qcc->conn;
-	se_fl_set(qcs->sd, SE_FL_T_MUX | SE_FL_ORPHAN | SE_FL_NOT_FIRST);
-	se_expect_no_data(qcs->sd);
-
-	if (!(global.tune.no_zero_copy_fwd & NO_ZERO_COPY_FWD_QUIC_SND))
-		se_fl_set(qcs->sd, SE_FL_MAY_FASTFWD_CONS);
 
 	/* TODO duplicated from mux_h2 */
 	sess->t_idle = ns_to_ms(now_ns - sess->accept_ts) - sess->t_handshake;
@@ -1607,18 +1606,16 @@ int qcc_recv_stop_sending(struct qcc *qcc, uint64_t id, uint64_t err)
 		}
 	}
 
-	if (qcs_sc(qcs)) {
-		/* Manually set EOS if FIN already reached as futures RESET_STREAM will be ignored in this case. */
-		if (se_fl_test(qcs->sd, SE_FL_EOI)) {
-			se_fl_set(qcs->sd, SE_FL_EOS);
-			qcs_alert(qcs);
-		}
+	/* Manually set EOS if FIN already reached as futures RESET_STREAM will be ignored in this case. */
+	if (qcs_sc(qcs) && se_fl_test(qcs->sd, SE_FL_EOI)) {
+		se_fl_set(qcs->sd, SE_FL_EOS);
+		qcs_alert(qcs);
+	}
 
-		/* If not defined yet, set abort info for the sedesc */
-		if (!qcs->sd->abort_info.info) {
-			qcs->sd->abort_info.info = (SE_ABRT_SRC_MUX_QUIC << SE_ABRT_SRC_SHIFT);
-			qcs->sd->abort_info.code = err;
-		}
+	/* If not defined yet, set abort info for the sedesc */
+	if (!qcs->sd->abort_info.info) {
+		qcs->sd->abort_info.info = (SE_ABRT_SRC_MUX_QUIC << SE_ABRT_SRC_SHIFT);
+		qcs->sd->abort_info.code = err;
 	}
 
 	/* RFC 9000 3.5. Solicited State Transitions
@@ -3049,10 +3046,20 @@ static size_t qmux_strm_done_ff(struct stconn *sc)
 		qcs->flags |= QC_SF_FIN_STREAM;
 	}
 
-	if (!(qcs->flags & QC_SF_FIN_STREAM) && !sd->iobuf.data)
-		goto end;
+	if (!(qcs->flags & QC_SF_FIN_STREAM) && !sd->iobuf.data) {
+		TRACE_STATE("no data sent", QMUX_EV_STRM_SEND, qcs->qcc->conn, qcs);
 
-	data += sd->iobuf.offset;
+		/* There is nothing to forward and the SD was blocked after a
+		 * successful nego by the producer. We can try to release the
+		 * TXBUF to retry. In this case, the TX buf MUST exist.
+		 */
+		if ((qcs->sd->iobuf.flags & IOBUF_FL_FF_WANT_ROOM) && !qcc_release_stream_txbuf(qcs))
+			qcs->sd->iobuf.flags &= ~(IOBUF_FL_FF_BLOCKED|IOBUF_FL_FF_WANT_ROOM);
+		goto end;
+	}
+
+	if (data)
+		data += sd->iobuf.offset;
 	total = qcs->qcc->app_ops->done_ff(qcs);
 
 	if (data || qcs->flags & QC_SF_FIN_STREAM)

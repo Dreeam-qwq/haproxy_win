@@ -46,12 +46,12 @@ static const char *common_kw_list[] = {
 	"ssl-server-verify", "maxconnrate", "maxsessrate", "maxsslrate",
 	"maxcomprate", "maxpipes", "maxzlibmem", "maxcompcpuusage", "ulimit-n",
 	"chroot", "description", "node", "pidfile", "unix-bind", "log",
-	"log-send-hostname", "server-state-base", "server-state-file",
-	"log-tag", "spread-checks", "max-spread-checks", "cpu-map", "setenv",
-	"presetenv", "unsetenv", "resetenv", "strict-limits", "localpeer",
-	"numa-cpu-mapping", "defaults", "listen", "frontend", "backend",
-	"peers", "resolvers", "cluster-secret", "no-quic", "limited-quic",
-	"stats-file",
+	"log-profile", "log-send-hostname", "log-tag", "server-state-base",
+	"server-state-file", "spread-checks", "max-spread-checks", "cpu-map",
+	"setenv", "presetenv", "unsetenv", "resetenv", "strict-limits",
+	"localpeer", "numa-cpu-mapping", "defaults", "listen", "frontend",
+	"backend", "peers", "resolvers", "cluster-secret", "no-quic",
+	"limited-quic", "stats-file",
 	NULL /* must be last */
 };
 
@@ -1376,8 +1376,59 @@ static int cfg_parse_prealloc_fd(char **args, int section_type, struct proxy *cu
 	return 0;
 }
 
+/* Parser for harden.reject-privileged-ports.{tcp|quic}. */
+static int cfg_parse_reject_privileged_ports(char **args, int section_type,
+                                             struct proxy *curpx,
+                                             const struct proxy *defpx,
+                                             const char *file, int line, char **err)
+{
+	struct ist proto;
+	char onoff;
+
+	if (!*(args[1])) {
+		memprintf(err, "'%s' expects either 'on' or 'off'.", args[0]);
+		return -1;
+	}
+
+	proto = ist(args[0]);
+	while (istlen(istfind(proto, '.')))
+		proto = istadv(istfind(proto, '.'), 1);
+
+	if (strcmp(args[1], "on") == 0) {
+		onoff = 1;
+	}
+	else if (strcmp(args[1], "off") == 0) {
+		onoff = 0;
+	}
+	else {
+		memprintf(err, "'%s' expects either 'on' or 'off'.", args[0]);
+		return -1;
+	}
+
+	if (istmatch(proto, ist("tcp"))) {
+		if (!onoff)
+			global.clt_privileged_ports |= HA_PROTO_TCP;
+		else
+			global.clt_privileged_ports &= ~HA_PROTO_TCP;
+	}
+	else if (istmatch(proto, ist("quic"))) {
+		if (!onoff)
+			global.clt_privileged_ports |= HA_PROTO_QUIC;
+		else
+			global.clt_privileged_ports &= ~HA_PROTO_QUIC;
+	}
+	else {
+		memprintf(err, "invalid protocol for '%s'.", args[0]);
+		return -1;
+	}
+
+	return 0;
+}
+
 static struct cfg_kw_list cfg_kws = {ILH, {
 	{ CFG_GLOBAL, "prealloc-fd", cfg_parse_prealloc_fd },
+	{ CFG_GLOBAL, "harden.reject-privileged-ports.tcp",  cfg_parse_reject_privileged_ports },
+	{ CFG_GLOBAL, "harden.reject-privileged-ports.quic", cfg_parse_reject_privileged_ports },
 	{ 0, NULL, NULL },
 }};
 

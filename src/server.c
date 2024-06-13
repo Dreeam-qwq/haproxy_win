@@ -1153,6 +1153,26 @@ static int srv_parse_pool_purge_delay(char **args, int *cur_arg, struct proxy *c
 	return 0;
 }
 
+static int srv_parse_pool_conn_name(char **args, int *cur_arg, struct proxy *curproxy, struct server *newsrv, char **err)
+{
+	char *arg;
+
+	arg = args[*cur_arg + 1];
+	if (!*arg) {
+		memprintf(err, "'%s' expects <value> as argument", args[*cur_arg]);
+		return ERR_ALERT | ERR_FATAL;
+	}
+
+	ha_free(&newsrv->pool_conn_name);
+	newsrv->pool_conn_name = strdup(arg);
+	if (!newsrv->pool_conn_name) {
+		memprintf(err, "'%s' : out of memory", args[*cur_arg]);
+		return ERR_ALERT | ERR_FATAL;
+	}
+
+	return 0;
+}
+
 static int srv_parse_pool_low_conn(char **args, int *cur_arg, struct proxy *curproxy, struct server *newsrv, char **err)
 {
 	char *arg;
@@ -2289,6 +2309,7 @@ static struct srv_kw_list srv_kws = { "ALL", { }, {
 	{ "on-error",             srv_parse_on_error,             1,  1,  1 }, /* Configure the action on check failure */
 	{ "on-marked-down",       srv_parse_on_marked_down,       1,  1,  1 }, /* Configure the action when a server is marked down */
 	{ "on-marked-up",         srv_parse_on_marked_up,         1,  1,  1 }, /* Configure the action when a server is marked up */
+	{ "pool-conn-name",       srv_parse_pool_conn_name,       1,  1,  1 }, /* Define expression to identify connections in idle pool */
 	{ "pool-low-conn",        srv_parse_pool_low_conn,        1,  1,  1 }, /* Set the min number of orphan idle connecbefore being allowed to pick from other threads */
 	{ "pool-max-conn",        srv_parse_pool_max_conn,        1,  1,  1 }, /* Set the max number of orphan idle connections, -1 means unlimited */
 	{ "pool-purge-delay",     srv_parse_pool_purge_delay,     1,  1,  1 }, /* Set the time before we destroy orphan idle connections, defaults to 1s */
@@ -2429,42 +2450,56 @@ const char *server_parse_maxconn_change_request(struct server *sv,
 	return NULL;
 }
 
-static struct sample_expr *srv_sni_sample_parse_expr(struct server *srv, struct proxy *px,
-                                                     const char *file, int linenum, char **err)
+/* Interpret <expr> as sample expression. This function is reserved for
+ * internal server allocation. On parsing use parse_srv_expr() for extra sample
+ * check validity.
+ *
+ * Returns the allocated sample on success or NULL on error.
+ */
+struct sample_expr *_parse_srv_expr(char *expr, struct arg_list *args_px,
+                                    const char *file, int linenum, char **err)
 {
 	int idx;
 	const char *args[] = {
-		srv->sni_expr,
+		expr,
 		NULL,
 	};
 
 	idx = 0;
-	px->conf.args.ctx = ARGC_SRV;
+	args_px->ctx = ARGC_SRV;
 
-	return sample_parse_expr((char **)args, &idx, file, linenum, err, &px->conf.args, NULL);
+	return sample_parse_expr((char **)args, &idx, file, linenum, err, args_px, NULL);
 }
 
-int server_parse_sni_expr(struct server *newsrv, struct proxy *px, char **err)
+/* Interpret <str> if not empty as a sample expression and store it into <out>.
+ * Contrary to _parse_srv_expr(), fetch scope validity is checked to ensure it
+ * is valid on a server line context. It also updates <px> HTTP mode
+ * requirement depending on fetch method used.
+ *
+ * Returns 0 on success else non zero.
+ */
+static int parse_srv_expr(char *str, struct sample_expr **out, struct proxy *px,
+                          char **err)
 {
 	struct sample_expr *expr;
 
-	expr = srv_sni_sample_parse_expr(newsrv, px, px->conf.file, px->conf.line, err);
-	if (!expr) {
-		memprintf(err, "error detected while parsing sni expression : %s", *err);
+	if (!str)
+		return 0;
+
+	expr = _parse_srv_expr(str, &px->conf.args, px->conf.file, px->conf.line, err);
+	if (!expr)
 		return ERR_ALERT | ERR_FATAL;
-	}
 
 	if (!(expr->fetch->val & SMP_VAL_BE_SRV_CON)) {
-		memprintf(err, "error detected while parsing sni expression : "
-		          " fetch method '%s' extracts information from '%s', "
+		memprintf(err, "fetch method '%s' extracts information from '%s', "
 		          "none of which is available here.",
-		          newsrv->sni_expr, sample_src_names(expr->fetch->use));
+		          str, sample_src_names(expr->fetch->use));
 		return ERR_ALERT | ERR_FATAL;
 	}
 
 	px->http_needed |= !!(expr->fetch->use & SMP_USE_HTTP_ANY);
-	release_sample_expr(newsrv->ssl_ctx.sni);
-	newsrv->ssl_ctx.sni = expr;
+	release_sample_expr(*out);
+	*out = expr;
 
 	return 0;
 }
@@ -2805,6 +2840,8 @@ void srv_settings_cpy(struct server *srv, const struct server *src, int srv_tmpl
 	srv->tcp_ut = src->tcp_ut;
 #endif
 	srv->mux_proto = src->mux_proto;
+	if (srv->pool_conn_name)
+		srv->pool_conn_name = strdup(srv->pool_conn_name);
 	srv->pool_purge_delay = src->pool_purge_delay;
 	srv->low_idle_conns = src->low_idle_conns;
 	srv->max_idle_conns = src->max_idle_conns;
@@ -2898,6 +2935,8 @@ void srv_take(struct server *srv)
 /* deallocate common server parameters (may be used by default-servers) */
 void srv_free_params(struct server *srv)
 {
+	struct srv_pp_tlv_list *srv_tlv = NULL;
+
 	free(srv->cookie);
 	free(srv->rdr_pfx);
 	free(srv->hostname);
@@ -2906,6 +2945,8 @@ void srv_free_params(struct server *srv)
 	free(srv->per_thr);
 	free(srv->per_tgrp);
 	free(srv->curr_idle_thr);
+	free(srv->pool_conn_name);
+	release_sample_expr(srv->pool_conn_name_expr);
 	free(srv->resolvers_id);
 	free(srv->addr_node.key);
 	free(srv->lb_nodes);
@@ -2916,6 +2957,14 @@ void srv_free_params(struct server *srv)
 
 	if (xprt_get(XPRT_SSL) && xprt_get(XPRT_SSL)->destroy_srv)
 		xprt_get(XPRT_SSL)->destroy_srv(srv);
+
+	while (!LIST_ISEMPTY(&srv->pp_tlvs)) {
+		srv_tlv = LIST_ELEM(srv->pp_tlvs.n, struct srv_pp_tlv_list *, list);
+		LIST_DEL_INIT(&srv_tlv->list);
+		lf_expr_deinit(&srv_tlv->fmt);
+		ha_free(&srv_tlv->fmt_string);
+		ha_free(&srv_tlv);
+	}
 }
 
 /* Deallocate a server <srv> and its member. <srv> must be allocated. For
@@ -3095,8 +3144,21 @@ static int _srv_parse_tmpl_init(struct server *srv, struct proxy *px)
 		srv_settings_cpy(newsrv, srv, 1);
 		srv_prepare_for_resolution(newsrv, srv->hostname);
 
+		/* Use sni as fallback if pool_conn_name isn't set */
+		if (!newsrv->pool_conn_name && newsrv->sni_expr) {
+			newsrv->pool_conn_name = strdup(newsrv->sni_expr);
+			if (!newsrv->pool_conn_name)
+				goto err;
+		}
+
+		if (newsrv->pool_conn_name) {
+			newsrv->pool_conn_name_expr = _parse_srv_expr(srv->pool_conn_name, &px->conf.args, NULL, 0, NULL);
+			if (!newsrv->pool_conn_name_expr)
+				goto err;
+		}
+
 		if (newsrv->sni_expr) {
-			newsrv->ssl_ctx.sni = srv_sni_sample_parse_expr(newsrv, px, NULL, 0, NULL);
+			newsrv->ssl_ctx.sni = _parse_srv_expr(srv->sni_expr, &px->conf.args, NULL, 0, NULL);
 			if (!newsrv->ssl_ctx.sni)
 				goto err;
 		}
@@ -3397,8 +3459,6 @@ static int _srv_parse_init(struct server **srv, char **args, int *cur_arg,
 	else {
 		*srv = newsrv = &curproxy->defsrv;
 		*cur_arg = 1;
-		newsrv->resolv_opts.family_prio = AF_INET6;
-		newsrv->resolv_opts.accept_duplicate_ip = 0;
 	}
 
 	free(fqdn);
@@ -3485,25 +3545,6 @@ out:
 	return err_code;
 }
 
-/* This function is first intended to be used through parse_server to
- * initialize a new server on startup.
- */
-static int _srv_parse_sni_expr_init(char **args, int cur_arg,
-                                    struct server *srv, struct proxy *proxy,
-                                    char **errmsg)
-{
-	int ret;
-
-	if (!srv->sni_expr)
-		return 0;
-
-	ret = server_parse_sni_expr(srv, proxy, errmsg);
-	if (!ret)
-	    return 0;
-
-	return ret;
-}
-
 /* Server initializations finalization.
  * Initialize health check, agent check, SNI expression and outgoing TLVs if enabled.
  * Must not be called for a default server instance.
@@ -3530,9 +3571,27 @@ static int _srv_parse_finalize(char **args, int cur_arg,
 		return ERR_ALERT | ERR_FATAL;
 	}
 
-	if ((ret = _srv_parse_sni_expr_init(args, cur_arg, srv, px, &errmsg)) != 0) {
+	if ((ret = parse_srv_expr(srv->sni_expr, &srv->ssl_ctx.sni, px, &errmsg))) {
 		if (errmsg) {
-			ha_alert("%s\n", errmsg);
+			ha_alert("error detected while parsing sni expression : %s.\n", errmsg);
+			free(errmsg);
+		}
+		return ret;
+	}
+
+	/* Use sni as fallback if pool_conn_name isn't set */
+	if (!srv->pool_conn_name && srv->sni_expr) {
+		srv->pool_conn_name = strdup(srv->sni_expr);
+		if (!srv->pool_conn_name) {
+			ha_alert("out of memory\n");
+			return ERR_ALERT | ERR_FATAL;
+		}
+	}
+
+	if ((ret = parse_srv_expr(srv->pool_conn_name, &srv->pool_conn_name_expr,
+	                          px, &errmsg))) {
+		if (errmsg) {
+			ha_alert("error detected while parsing pool-conn-name expression : %s.\n", errmsg);
 			free(errmsg);
 		}
 		return ret;
@@ -4536,8 +4595,9 @@ int snr_resolution_cb(struct resolv_requester *requester, struct dns_counters *c
 	if (has_no_ip && !snr_set_srv_down(s)) {
 		struct server_inetaddr srv_addr;
 
-		memset(&srv_addr, 0, sizeof(srv_addr));
-		/* unset server's addr */
+		/* unset server's addr, keep port */
+		server_get_inetaddr(s, &srv_addr);
+		memset(&srv_addr.addr, 0, sizeof(srv_addr.addr));
 		server_set_inetaddr(s, &srv_addr, SERVER_INETADDR_UPDATER_NONE, NULL);
 	}
 	return 1;
@@ -4550,8 +4610,9 @@ int snr_resolution_cb(struct resolv_requester *requester, struct dns_counters *c
 	if (has_no_ip && !snr_set_srv_down(s)) {
 		struct server_inetaddr srv_addr;
 
-		memset(&srv_addr, 0, sizeof(srv_addr));
-		/* unset server's addr */
+		/* unset server's addr, keep port */
+		server_get_inetaddr(s, &srv_addr);
+		memset(&srv_addr.addr, 0, sizeof(srv_addr.addr));
 		server_set_inetaddr(s, &srv_addr, SERVER_INETADDR_UPDATER_NONE, NULL);
 	}
 	return 0;
@@ -4636,8 +4697,9 @@ int snr_resolution_error_cb(struct resolv_requester *requester, int error_code)
 	if (!snr_set_srv_down(s)) {
 		struct server_inetaddr srv_addr;
 
-		memset(&srv_addr, 0, sizeof(srv_addr));
-		/* unset server's addr */
+		/* unset server's addr, keep port */
+		server_get_inetaddr(s, &srv_addr);
+		memset(&srv_addr.addr, 0, sizeof(srv_addr.addr));
 		server_set_inetaddr(s, &srv_addr, SERVER_INETADDR_UPDATER_NONE, NULL);
 		HA_SPIN_UNLOCK(SERVER_LOCK, &s->lock);
 		resolv_detach_from_resolution_answer_items(requester->resolution, requester);

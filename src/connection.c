@@ -134,7 +134,7 @@ fail:
 			/* If connection is interrupted  without CO_FL_ERROR, receiver task won't free it. */
 			BUG_ON(!(conn->flags & CO_FL_ERROR));
 
-			task_wakeup(l->rx.rhttp.task, TASK_WOKEN_ANY);
+			task_wakeup(l->rx.rhttp.task, TASK_WOKEN_RES);
 		}
 		return -1;
 	} else
@@ -1129,110 +1129,111 @@ int conn_recv_proxy(struct connection *conn, int flag)
 			break;
 		}
 
-		/* TLV parsing */
-		while (tlv_offset < total_v2_len) {
-			struct ist tlv;
-			struct tlv *tlv_packet = NULL;
-			struct conn_tlv_list *new_tlv = NULL;
-			size_t data_len = 0;
-
-			/* Verify that we have at least TLV_HEADER_SIZE bytes left */
-			if (tlv_offset + TLV_HEADER_SIZE > total_v2_len)
-				goto bad_header;
-
-			tlv_packet = (struct tlv *) &trash.area[tlv_offset];
-			tlv = ist2((const char *)tlv_packet->value, get_tlv_length(tlv_packet));
-			tlv_offset += istlen(tlv) + TLV_HEADER_SIZE;
-
-			/* Verify that the TLV length does not exceed the total PROXYv2 length */
-			if (tlv_offset > total_v2_len)
-				goto bad_header;
-
-			/* Prepare known TLV types */
-			switch (tlv_packet->type) {
-			case PP2_TYPE_CRC32C: {
-				uint32_t n_crc32c;
-
-				/* Verify that this TLV is exactly 4 bytes long */
-				if (istlen(tlv) != PP2_CRC32C_LEN)
-					goto bad_header;
-
-				n_crc32c = read_n32(istptr(tlv));
-				write_n32(istptr(tlv), 0); // compute with CRC==0
-
-				if (hash_crc32c(trash.area, total_v2_len) != n_crc32c)
-					goto bad_header;
-				break;
-			}
-#ifdef USE_NS
-			case PP2_TYPE_NETNS: {
-				const struct netns_entry *ns;
-
-				ns = netns_store_lookup(istptr(tlv), istlen(tlv));
-				if (ns)
-					conn->proxy_netns = ns;
-				break;
-			}
-#endif
-			case PP2_TYPE_AUTHORITY: {
-				/* For now, keep the length restriction by HAProxy */
-				if (istlen(tlv) > HA_PP2_AUTHORITY_MAX)
-					goto bad_header;
-
-				break;
-			}
-			case PP2_TYPE_UNIQUE_ID: {
-				if (istlen(tlv) > UNIQUEID_LEN)
-					goto bad_header;
-				break;
-			}
-			default:
-				break;
-			}
-
-			/* If we did not find a known TLV type that we can optimize for, we generically allocate it */
-			data_len = get_tlv_length(tlv_packet);
-
-			/* Prevent attackers from allocating too much memory */
-			if (unlikely(data_len > HA_PP2_MAX_ALLOC))
-				goto fail;
-
-			/* Alloc memory based on data_len */
-			if (data_len > HA_PP2_TLV_VALUE_256)
-				new_tlv = malloc(get_tlv_length(tlv_packet) + sizeof(struct conn_tlv_list));
-			else if (data_len <= HA_PP2_TLV_VALUE_128)
-				new_tlv = pool_alloc(pool_head_pp_tlv_128);
-			else
-				new_tlv = pool_alloc(pool_head_pp_tlv_256);
-
-			if (unlikely(!new_tlv))
-				goto fail;
-
-			new_tlv->type = tlv_packet->type;
-
-			/* Save TLV to make it accessible via sample fetch */
-			memcpy(new_tlv->value, tlv.ptr, data_len);
-			new_tlv->len = data_len;
-
-			LIST_APPEND(&conn->tlv_list, &new_tlv->list);
-		}
-
-
-		/* Verify that the PROXYv2 header ends at a TLV boundary.
-		 * This is can not be true, because the TLV parsing already
-		 * verifies that a TLV does not exceed the total length and
-		 * also that there is space for a TLV header.
-		 */
-		BUG_ON(tlv_offset != total_v2_len);
-
 		/* unsupported protocol, keep local connection address */
 		break;
 	case 0x00: /* LOCAL command */
 		/* keep local connection address for LOCAL */
+
+		tlv_offset = PP2_HEADER_LEN;
 		break;
 	default:
 		goto bad_header; /* not a supported command */
 	}
+
+	/* TLV parsing */
+	while (tlv_offset < total_v2_len) {
+		struct ist tlv;
+		struct tlv *tlv_packet = NULL;
+		struct conn_tlv_list *new_tlv = NULL;
+		size_t data_len = 0;
+
+		/* Verify that we have at least TLV_HEADER_SIZE bytes left */
+		if (tlv_offset + TLV_HEADER_SIZE > total_v2_len)
+			goto bad_header;
+
+		tlv_packet = (struct tlv *) &trash.area[tlv_offset];
+		tlv = ist2((const char *)tlv_packet->value, get_tlv_length(tlv_packet));
+		tlv_offset += istlen(tlv) + TLV_HEADER_SIZE;
+
+		/* Verify that the TLV length does not exceed the total PROXYv2 length */
+		if (tlv_offset > total_v2_len)
+			goto bad_header;
+
+		/* Prepare known TLV types */
+		switch (tlv_packet->type) {
+		case PP2_TYPE_CRC32C: {
+			uint32_t n_crc32c;
+
+			/* Verify that this TLV is exactly 4 bytes long */
+			if (istlen(tlv) != PP2_CRC32C_LEN)
+				goto bad_header;
+
+			n_crc32c = read_n32(istptr(tlv));
+			write_n32(istptr(tlv), 0); // compute with CRC==0
+
+			if (hash_crc32c(trash.area, total_v2_len) != n_crc32c)
+				goto bad_header;
+			break;
+		}
+#ifdef USE_NS
+		case PP2_TYPE_NETNS: {
+			const struct netns_entry *ns;
+
+			ns = netns_store_lookup(istptr(tlv), istlen(tlv));
+			if (ns)
+				conn->proxy_netns = ns;
+			break;
+		}
+#endif
+		case PP2_TYPE_AUTHORITY: {
+			/* For now, keep the length restriction by HAProxy */
+			if (istlen(tlv) > HA_PP2_AUTHORITY_MAX)
+				goto bad_header;
+
+			break;
+		}
+		case PP2_TYPE_UNIQUE_ID: {
+			if (istlen(tlv) > UNIQUEID_LEN)
+				goto bad_header;
+			break;
+		}
+		default:
+			break;
+		}
+
+		/* If we did not find a known TLV type that we can optimize for, we generically allocate it */
+		data_len = get_tlv_length(tlv_packet);
+
+		/* Prevent attackers from allocating too much memory */
+		if (unlikely(data_len > HA_PP2_MAX_ALLOC))
+			goto fail;
+
+		/* Alloc memory based on data_len */
+		if (data_len > HA_PP2_TLV_VALUE_256)
+			new_tlv = malloc(get_tlv_length(tlv_packet) + sizeof(struct conn_tlv_list));
+		else if (data_len <= HA_PP2_TLV_VALUE_128)
+			new_tlv = pool_alloc(pool_head_pp_tlv_128);
+		else
+			new_tlv = pool_alloc(pool_head_pp_tlv_256);
+
+		if (unlikely(!new_tlv))
+			goto fail;
+
+		new_tlv->type = tlv_packet->type;
+
+		/* Save TLV to make it accessible via sample fetch */
+		memcpy(new_tlv->value, tlv.ptr, data_len);
+		new_tlv->len = data_len;
+
+		LIST_APPEND(&conn->tlv_list, &new_tlv->list);
+	}
+
+	/* Verify that the PROXYv2 header ends at a TLV boundary.
+	 * This is can not be true, because the TLV parsing already
+	 * verifies that a TLV does not exceed the total length and
+	 * also that there is space for a TLV header.
+	 */
+	BUG_ON(tlv_offset != total_v2_len);
 
 	trash.data = total_v2_len;
 	goto eat_header;
@@ -1320,10 +1321,11 @@ int conn_send_proxy(struct connection *conn, unsigned int flag)
 		 */
 
 		if (sc && sc_strm(sc)) {
+			struct stream *strm = __sc_strm(sc);
 			ret = make_proxy_line(trash.area, trash.size,
 					      objt_server(conn->target),
 					      sc_conn(sc_opposite(sc)),
-					      __sc_strm(sc));
+					      strm, strm_sess(strm));
 		}
 		else {
 			/* The target server expects a LOCAL line to be sent first. Retrieving
@@ -1334,7 +1336,7 @@ int conn_send_proxy(struct connection *conn, unsigned int flag)
 
 			ret = make_proxy_line(trash.area, trash.size,
 					      objt_server(conn->target), conn,
-					      NULL);
+					      NULL, conn->owner);
 		}
 
 		if (!ret)
@@ -1940,7 +1942,7 @@ static int make_tlv(char *dest, int dest_len, char type, uint16_t length, const 
 }
 
 /* Note: <remote> is explicitly allowed to be NULL */
-static int make_proxy_line_v2(char *buf, int buf_len, struct server *srv, struct connection *remote, struct stream *strm)
+static int make_proxy_line_v2(char *buf, int buf_len, struct server *srv, struct connection *remote, struct stream *strm, struct session *sess)
 {
 	const char pp2_signature[] = PP2_SIGNATURE;
 	void *tlv_crc32c_p = NULL;
@@ -2021,7 +2023,7 @@ static int make_proxy_line_v2(char *buf, int buf_len, struct server *srv, struct
 		}
 	}
 
-	if (strm) {
+	if (sess) {
 		struct buffer *replace = NULL;
 
 		list_for_each_entry(srv_tlv, &srv->pp_tlvs, list) {
@@ -2035,7 +2037,7 @@ static int make_proxy_line_v2(char *buf, int buf_len, struct server *srv, struct
 				if (unlikely(!replace))
 					return 0;
 
-				replace->data = build_logline(strm, replace->area, replace->size, &srv_tlv->fmt);
+				replace->data = sess_build_logline(sess, strm, replace->area, replace->size, &srv_tlv->fmt);
 
 				if (unlikely((buf_len - ret) < sizeof(struct tlv))) {
 					free_trash_chunk(replace);
@@ -2178,12 +2180,12 @@ static int make_proxy_line_v2(char *buf, int buf_len, struct server *srv, struct
 }
 
 /* Note: <remote> is explicitly allowed to be NULL */
-int make_proxy_line(char *buf, int buf_len, struct server *srv, struct connection *remote, struct stream *strm)
+int make_proxy_line(char *buf, int buf_len, struct server *srv, struct connection *remote, struct stream *strm, struct session *sess)
 {
 	int ret = 0;
 
 	if (srv && (srv->pp_opts & SRV_PP_V2)) {
-		ret = make_proxy_line_v2(buf, buf_len, srv, remote, strm);
+		ret = make_proxy_line_v2(buf, buf_len, srv, remote, strm, sess);
 	}
 	else {
 		const struct sockaddr_storage *src = NULL;
@@ -2619,7 +2621,7 @@ INITCALL1(STG_REGISTER, cfg_register_keywords, &cfg_kws);
 /* Generate the hash of a connection with params as input
  * Each non-null field of params is taken into account for the hash calcul.
  */
-uint64_t conn_hash_prehash(char *buf, size_t size)
+uint64_t conn_hash_prehash(const char *buf, size_t size)
 {
 	return XXH64(buf, size, 0);
 }
@@ -2697,10 +2699,10 @@ uint64_t conn_calculate_hash(const struct conn_hash_params *params)
 
 	conn_hash_update(&hash, &params->target, sizeof(params->target), &hash_flags, 0);
 
-	if (params->sni_prehash) {
+	if (params->name_prehash) {
 		conn_hash_update(&hash,
-		                 &params->sni_prehash, sizeof(params->sni_prehash),
-		                 &hash_flags, CONN_HASH_PARAMS_TYPE_SNI);
+		                 &params->name_prehash, sizeof(params->name_prehash),
+		                 &hash_flags, CONN_HASH_PARAMS_TYPE_NAME);
 	}
 
 	if (params->dst_addr) {
@@ -2768,7 +2770,7 @@ int conn_reverse(struct connection *conn)
 			/* data cannot wrap else prehash usage is incorrect */
 			BUG_ON(b_data(&conn->reverse.name) != b_contig_data(&conn->reverse.name, 0));
 
-			hash_params.sni_prehash =
+			hash_params.name_prehash =
 			  conn_hash_prehash(b_head(&conn->reverse.name),
 			                    b_data(&conn->reverse.name));
 		}
@@ -2795,7 +2797,10 @@ int conn_reverse(struct connection *conn)
 
 		conn->target = &l->obj_type;
 		conn->flags |= CO_FL_ACT_REVERSING;
-		task_wakeup(l->rx.rhttp.task, TASK_WOKEN_ANY);
+		task_wakeup(l->rx.rhttp.task, TASK_WOKEN_RES);
+
+		/* Initialize session origin after reversal. Mandatory for several fetches. */
+		sess->origin = &conn->obj_type;
 	}
 
 	/* Invert source and destination addresses if already set. */

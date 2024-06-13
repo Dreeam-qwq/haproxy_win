@@ -13,6 +13,7 @@
 #include <haproxy/proxy.h>
 #include <haproxy/sample.h>
 #include <haproxy/server.h>
+#include <haproxy/session.h>
 #include <haproxy/sock.h>
 #include <haproxy/ssl_sock.h>
 #include <haproxy/task.h>
@@ -33,6 +34,7 @@ struct protocol proto_rhttp = {
 	.listen      = rhttp_bind_listener,
 	.enable      = rhttp_enable_listener,
 	.disable     = rhttp_disable_listener,
+	.suspend     = rhttp_suspend_listener,
 	.add         = default_add_listener,
 	.unbind      = rhttp_unbind_receiver,
 	.resume      = default_resume_listener,
@@ -54,11 +56,20 @@ static struct connection *new_reverse_conn(struct listener *l, struct server *sr
 {
 	struct connection *conn = conn_new(srv);
 	struct sockaddr_storage *bind_addr = NULL;
+	struct session *sess = NULL;
 	if (!conn)
 		goto err;
 
 	HA_ATOMIC_INC(&th_ctx->nb_rhttp_conns);
 
+	/* session origin is only set after reversal. This ensures fetches
+	 * will be functional only after reversal, in particular src/dst.
+	 */
+	sess = session_new(l->bind_conf->frontend, l, NULL);
+	if (!sess)
+		goto err;
+
+	conn_set_owner(conn, sess, conn_session_free);
 	conn_set_reverse(conn, &l->obj_type);
 
 	if (alloc_bind_address(&bind_addr, srv, srv->proxy, NULL) != SRV_STATUS_OK)
@@ -71,6 +82,14 @@ static struct connection *new_reverse_conn(struct listener *l, struct server *sr
 	*conn->dst = srv->addr;
 	set_host_port(conn->dst, srv->svc_port);
 
+	conn->send_proxy_ofs = 0;
+	if (srv->pp_opts) {
+		conn->flags |= CO_FL_SEND_PROXY;
+		conn->send_proxy_ofs = 1; /* must compute size */
+	}
+
+	/* TODO support SOCKS4 */
+
 	if (conn_prepare(conn, protocol_lookup(conn->dst->ss_family, PROTO_TYPE_STREAM, 0), srv->xprt))
 		goto err;
 
@@ -81,7 +100,7 @@ static struct connection *new_reverse_conn(struct listener *l, struct server *sr
 	if (srv->ssl_ctx.sni) {
 		struct sample *sni_smp = NULL;
 		/* TODO remove NULL session which can cause crash depending on the SNI sample expr used. */
-		sni_smp = sample_fetch_as_type(srv->proxy, NULL, NULL,
+		sni_smp = sample_fetch_as_type(srv->proxy, sess, NULL,
 		                               SMP_OPT_DIR_REQ | SMP_OPT_FINAL,
 		                               srv->ssl_ctx.sni, SMP_T_STR);
 		if (smp_make_safe(sni_smp))
@@ -89,21 +108,35 @@ static struct connection *new_reverse_conn(struct listener *l, struct server *sr
 	}
 #endif /* USE_OPENSSL */
 
+	/* The CO_FL_SEND_PROXY flag may have been set by the connect method,
+	 * if so, add our handshake pseudo-XPRT now.
+	 */
+	if (conn->flags & CO_FL_HANDSHAKE) {
+		if (xprt_add_hs(conn) < 0)
+			goto err;
+	}
+
 	if (conn_xprt_start(conn) < 0)
 		goto err;
 
 	if (!srv->use_ssl ||
 	    (!srv->ssl_ctx.alpn_str && !srv->ssl_ctx.npn_str) ||
 	    srv->mux_proto) {
-		if (conn_install_mux_be(conn, NULL, NULL, NULL) < 0)
+		if (conn_install_mux_be(conn, NULL, sess, NULL) < 0)
 			goto err;
 	}
 
-	/* Not expected here. */
-	BUG_ON((conn->flags & CO_FL_HANDSHAKE));
 	return conn;
 
  err:
+	if (l->rx.rhttp.state != LI_PRECONN_ST_ERR) {
+		send_log(l->bind_conf->frontend, LOG_ERR,
+		         "preconnect %s::%s: Error on conn allocation.\n",
+		         l->bind_conf->frontend->id, l->bind_conf->rhttp_srvname);
+		l->rx.rhttp.state = LI_PRECONN_ST_ERR;
+	}
+
+	/* No need to free session as conn.destroy_cb will take care of it. */
 	if (conn) {
 		conn_stop_tracking(conn);
 		conn_xprt_shutw(conn);
@@ -284,11 +317,12 @@ int rhttp_bind_listener(struct listener *listener, char *errmsg, int errlen)
 
 	/* Retrieve the first thread usable for this listener. */
 	mask = listener->rx.bind_thread & _HA_ATOMIC_LOAD(&tg->threads_enabled);
-	task_tid = my_ffsl(mask) + ha_tgroup_info[listener->rx.bind_tgroup].base;
+	task_tid = my_ffsl(mask) - 1 + ha_tgroup_info[listener->rx.bind_tgroup].base;
 	if (!(task = task_new_on(task_tid))) {
 		snprintf(errmsg, errlen, "Out of memory.");
 		goto err;
 	}
+
 	task->process = rhttp_process;
 	task->context = listener;
 	listener->rx.rhttp.task = task;
@@ -363,6 +397,13 @@ int rhttp_bind_listener(struct listener *listener, char *errmsg, int errlen)
 	return ERR_ALERT | ERR_FATAL;
 }
 
+/* Do not support "disable frontend" for rhttp protocol. */
+int rhttp_suspend_listener(struct listener *l)
+{
+	send_log(l->bind_conf->frontend, LOG_ERR, "cannot disable a reverse-HTTP listener.\n");
+	return -1;
+}
+
 void rhttp_enable_listener(struct listener *l)
 {
 	if (l->rx.rhttp.state < LI_PRECONN_ST_INIT) {
@@ -372,7 +413,7 @@ void rhttp_enable_listener(struct listener *l)
 		l->rx.rhttp.state = LI_PRECONN_ST_INIT;
 	}
 
-	task_wakeup(l->rx.rhttp.task, TASK_WOKEN_ANY);
+	task_wakeup(l->rx.rhttp.task, TASK_WOKEN_INIT);
 }
 
 void rhttp_disable_listener(struct listener *l)

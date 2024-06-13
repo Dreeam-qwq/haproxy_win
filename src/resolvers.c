@@ -725,7 +725,7 @@ static void resolv_srvrq_cleanup_srv(struct server *srv)
 	ha_free(&srv->hostname_dn);
 	srv->hostname_dn_len = 0;
 	memset(&srv_addr, 0, sizeof(srv_addr));
-	/* unset server's addr */
+	/* unset server's addr AND port */
 	server_set_inetaddr(srv, &srv_addr, SERVER_INETADDR_UPDATER_NONE, NULL);
 	srv->flags |= SRV_F_NO_RESOLUTION;
 
@@ -3919,8 +3919,12 @@ static int rslv_promex_metric_info(unsigned int id, struct promex_metric *metric
 
 static void *rslv_promex_start_ts(void *unused, unsigned int id)
 {
-	struct resolvers *resolver = LIST_NEXT(&sec_resolvers, struct resolvers *, list);
+	struct resolvers *resolver;
 
+	if (LIST_ISEMPTY(&sec_resolvers))
+		return NULL;
+
+	resolver = LIST_NEXT(&sec_resolvers, struct resolvers *, list);
 	return LIST_NEXT(&resolver->nameservers, struct dns_nameserver *, list);
 }
 

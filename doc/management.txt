@@ -1,7 +1,7 @@
                              ------------------------
                              HAProxy Management Guide
                              ------------------------
-                                   version 3.0
+                                   version 3.1
 
 
 This document describes how to start, stop, manage, and troubleshoot HAProxy,
@@ -360,6 +360,11 @@ list of options is :
         the byte's value to -dM but using this option allows to disable/enable
         use of a previously set value.
 
+  -dR : disable SO_REUSEPORT socket option on listening ports. It is equivalent
+    to the "global" section's "noreuseport" keyword. This may be applied in
+    multi-threading scenarios, when load distribution issues observed among the
+    haproxy threads (could be monitored with top).
+
   -dS : disable use of the splice() system call. It is equivalent to the
     "global" section's "nosplice" keyword. This may be used when splice() is
     suspected to behave improperly or to cause performance issues, or when
@@ -380,6 +385,12 @@ list of options is :
    tend to emit more warnings. It may be combined with "-c" to cause warnings
    in checked configurations to fail. This is equivalent to global option
    "zero-warning".
+
+  -dZ : disable forwarding of data in "zero-copy" mode. It is equivalent to the
+   "global" section's "tune.disable-zero-copy-forwarding" keyword. This may be
+   helpful in case of issues with data loss or data integrity, or when using
+   strace to see the forwarded data, as it also disables any kernel tcp
+   splicing.
 
   -db : disable background mode and multi-process mode. The process remains in
     foreground. It is mainly used during development or during small tests, as
@@ -414,8 +425,16 @@ list of options is :
     detect protocol violations from clients or servers. An optional argument
     can be used to specify a list of various trace configurations using ',' as
     separator. Each element activates one or all trace sources. Additionally,
-    level and verbosity can be optionally specified on each element using ':' as
-    inner separator with trace name.
+    level and verbosity can be optionally specified on each element using ':'
+    as inner separator with trace name. When entering an invalid verbosity or
+    level name, the list of available keywords is presented. For example it can
+    be convenient to pass 'help' for each field to consult the list first.
+
+  -dv : disable the use of the "evports" poller. It is equivalent to the
+    "global" section's keyword "noevports". It is mostly useful when suspecting
+    a bug related to this poller. On systems supporting event ports (SunOS
+    derived from Solaris 10 and later), the fallback will generally be the
+    "poll" poller.
 
   -m <limit> : limit allocatable memory, which is used to keep process's data,
     to <limit> megabytes. This may cause some connection refusals or some
@@ -3245,8 +3264,8 @@ show sess <id> | older <age> | susp | all
   is meant to be interpreted while checking function strm_dump_to_buffer() in
   src/stream.c to figure the exact meaning of certain fields.
 
-show stat [domain <dns|proxy>] [{<iid>|<proxy>} <type> <sid>] [typed|json] \
-          [desc] [up|no-maint]
+show stat [domain <resolvers|proxy>] [{<iid>|<proxy>} <type> <sid>] \
+          [typed|json] [desc] [up|no-maint]
   Dump statistics. The domain is used to select which statistics to print; dns
   and proxy are available for now. By default, the CSV format is used; you can
   activate the extended typed output format described in the section above if

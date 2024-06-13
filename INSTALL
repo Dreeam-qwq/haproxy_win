@@ -9,7 +9,7 @@ used to follow updates then it is recommended that instead you use the packages
 provided by your software vendor or Linux distribution. Most of them are taking
 this task seriously and are doing a good job at backporting important fixes.
 
-If for any reason you'd prefer to use a different version than the one packaged
+If for any reason you would prefer a different version than the one packaged
 for your system, you want to be certain to have all the fixes or to get some
 commercial support, other choices are available at http://www.haproxy.com/.
 
@@ -34,18 +34,26 @@ are a few build examples :
   - recent Linux system with all options, make and install :
     $ make clean
     $ make -j $(nproc) TARGET=linux-glibc \
-                USE_OPENSSL=1 USE_LUA=1 USE_PCRE2=1 USE_SYSTEMD=1
+           USE_OPENSSL=1 USE_QUIC=1 USE_QUIC_OPENSSL_COMPAT=1 \
+           USE_LUA=1 USE_PCRE2=1
     $ sudo make install
 
-  - FreeBSD and OpenBSD, build with all options :
-    $ gmake -j 4 TARGET=freebsd USE_OPENSSL=1 USE_LUA=1 USE_PCRE2=1
+  - FreeBSD + OpenSSL, build with all options :
+    $ gmake -j $(sysctl -n hw.ncpu) TARGET=freebsd \
+           USE_OPENSSL=1 USE_QUIC=1 USE_QUIC_OPENSSL_COMPAT=1 \
+           USE_LUA=1 USE_PCRE2=1
+
+  - OpenBSD + LibreSSL, build with all options :
+    $ gmake -j $(sysctl -n hw.ncpu) TARGET=openbsd \
+           USE_OPENSSL=1 USE_QUIC=1 USE_LUA=1 USE_PCRE2=1
 
   - embedded Linux, build using a cross-compiler :
     $ make -j $(nproc) TARGET=linux-glibc USE_OPENSSL=1 USE_PCRE2=1 \
-                CC=/opt/cross/gcc730-arm/bin/gcc ADDLIB=-latomic
+           CC=/opt/cross/gcc730-arm/bin/gcc CFLAGS="-mthumb" ADDLIB=-latomic
 
   - Build with static PCRE on Solaris / UltraSPARC :
-    $ make TARGET=solaris CPU_CFLAGS="-mcpu=v9" USE_STATIC_PCRE2=1
+    $ make -j $(/usr/sbin/psrinfo -p) TARGET=solaris \
+           CPU_CFLAGS="-mcpu=v9" USE_STATIC_PCRE2=1
 
 For more advanced build options or if a command above reports an error, please
 read the following sections.
@@ -227,7 +235,7 @@ to forcefully enable it using "USE_LIBCRYPT=1".
 -----------------
 For SSL/TLS, it is necessary to use a cryptography library. HAProxy currently
 supports the OpenSSL library, and is known to build and work with branches
-1.0.0, 1.0.1, 1.0.2, 1.1.0, 1.1.1, 3.0, 3.1 and 3.2. It is recommended to use
+1.0.0, 1.0.1, 1.0.2, 1.1.0, 1.1.1, and 3.0 to 3.3. It is recommended to use
 at least OpenSSL 1.1.1 to have support for all SSL keywords and configuration
 in HAProxy. OpenSSL follows a long-term support cycle similar to HAProxy's,
 and each of the branches above receives its own fixes, without forcing you to
@@ -244,7 +252,7 @@ https://github.com/openssl/openssl/issues/17627). If a migration to 3.x is
 mandated by support reasons, at least 3.1 recovers a small fraction of this
 important loss.
 
-Four OpenSSL derivatives called LibreSSL, BoringSSL, QUICTLS, and AWS-LC are
+Three OpenSSL derivatives called LibreSSL, QUICTLS, and AWS-LC are
 reported to work as well. While there are some efforts from the community to
 ensure they work well, OpenSSL remains the primary target and this means that
 in case of conflicting choices, OpenSSL support will be favored over other

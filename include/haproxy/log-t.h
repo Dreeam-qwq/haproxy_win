@@ -131,7 +131,7 @@ enum {
 	LOG_FMT_TEXT = 0,  /* raw text */
 	LOG_FMT_EXPR,      /* sample expression */
 	LOG_FMT_SEPARATOR, /* separator replaced by one space */
-	LOG_FMT_TAG,       /* reference to logformat_tag */
+	LOG_FMT_ALIAS,     /* reference to logformat_alias */
 };
 
 /* enum for parse_logformat_string */
@@ -139,8 +139,8 @@ enum {
 	LF_INIT = 0,   // before first character
 	LF_TEXT,       // normal text
 	LF_SEPARATOR,  // a single separator
-	LF_TAG,        // tag name, after '%' or '%{..}'
-	LF_STARTTAG,   // % in text
+	LF_ALIAS,      // alias name, after '%' or '%{..}'
+	LF_STARTALIAS, // % in text
 	LF_STONAME,    // after '%(' and before ')'
 	LF_STOTYPE,    // after ':' while in STONAME
 	LF_EDONAME,    // ')' after '%('
@@ -151,11 +151,11 @@ enum {
 	LF_END,        // \0 found
 };
 
-/* log_format tags (ie: %tag), see logformat_tags table in log.c for
- * available tags definitions
+/* log_format aliases (ie: %alias), see logformat_aliases table in log.c for
+ * available aliases definitions
  */
 struct logformat_node; // forward-declaration
-struct logformat_tag {
+struct logformat_alias {
 	char *name;
 	int type;
 	int mode;
@@ -171,7 +171,7 @@ struct logformat_node {
 	char *name;    // printable name for output types that require named fields (ie: json)
 	char *arg;     // text for LOG_FMT_TEXT, arg for others
 	void *expr;    // for use with LOG_FMT_EXPR
-	const struct logformat_tag *tag; // set if ->type == LOG_FMT_TAG
+	const struct logformat_alias *alias; // set if ->type == LOG_FMT_ALIAS
 };
 
 enum lf_expr_flags {
@@ -231,20 +231,67 @@ struct log_target {
 	uint16_t flags;
 };
 
+enum logger_flags {
+	LOGGER_FL_NONE     = 0x00,
+	LOGGER_FL_RESOLVED = 0x01,
+};
+
 struct logger {
 	struct list list;
 	struct log_target target;
 	struct smp_info lb;
+	uint16_t flags;
+	/* 2 bytes hole */
 	enum log_fmt format;
 	int facility;
 	int level;
 	int minlvl;
 	int maxlen;
 	struct logger *ref;
+	union {
+		struct log_profile *prof; /* postparsing */
+		char *prof_str;           /* preparsing */
+	};
 	struct {
                 char *file;                     /* file where the logger appears */
                 int line;                       /* line where the logger appears */
         } conf;
+};
+
+/* integer used to provide some context about the log origin
+ * when sending log through logging functions
+ */
+enum log_orig {
+	LOG_ORIG_UNSPEC = 0,         /* unspecified */
+	LOG_ORIG_SESS_ERROR,         /* general error during session handling */
+	LOG_ORIG_SESS_KILL,          /* during embryonic session kill */
+	LOG_ORIG_TXN_ACCEPT,         /* during stream accept handling */
+	LOG_ORIG_TXN_REQUEST,        /* during stream request handling */
+	LOG_ORIG_TXN_CONNECT,        /* during stream connect handling */
+	LOG_ORIG_TXN_RESPONSE,       /* during stream response handling */
+	LOG_ORIG_TXN_CLOSE,          /* during stream termination */
+};
+
+struct log_profile_step {
+	struct lf_expr logformat;
+	struct lf_expr logformat_sd;
+};
+
+struct log_profile {
+	struct list list;
+	struct {
+		char *file;
+		int line;
+	} conf;
+	char *id;
+	struct buffer log_tag;          // override log-tag
+	struct log_profile_step *accept;
+	struct log_profile_step *request;
+	struct log_profile_step *connect;
+	struct log_profile_step *response;
+	struct log_profile_step *close;
+	struct log_profile_step *error; // override error-log-format
+	struct log_profile_step *any;   // override log-format
 };
 
 #endif /* _HAPROXY_LOG_T_H */

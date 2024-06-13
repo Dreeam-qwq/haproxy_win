@@ -695,8 +695,8 @@ static void sink_free(struct sink *sink)
 		return;
 	if (sink->type == SINK_TYPE_BUFFER) {
 		if (sink->store) {
-			size_t size = (ring_size(sink->ctx.ring) + 4095UL) & -4096UL;
-			void *area = ring_area(sink->ctx.ring);
+			size_t size = (ring_allocated_size(sink->ctx.ring) + 4095UL) & -4096UL;
+			void *area = ring_allocated_area(sink->ctx.ring);
 
 			msync(area, size, MS_SYNC);
 			munmap(area, size);
@@ -828,6 +828,12 @@ static int sink_finalize(struct sink *sink)
 		if (sink->sft && sink_init_forward(sink) == 0) {
 			ha_alert("error when trying to initialize sink buffer forwarding.\n");
 			err_code |= ERR_ALERT | ERR_FATAL;
+		}
+		if (!sink->store) {
+			/* virtual memory backed sink */
+			vma_set_name(ring_allocated_area(sink->ctx.ring),
+			             ring_allocated_size(sink->ctx.ring),
+			             "ring", sink->name);
 		}
 	}
 	return err_code;

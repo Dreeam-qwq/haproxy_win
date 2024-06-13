@@ -42,6 +42,7 @@
 #include <haproxy/api.h>
 #include <haproxy/chunk.h>
 #include <haproxy/intops.h>
+#include <haproxy/global.h>
 #include <haproxy/namespace-t.h>
 #include <haproxy/protocol-t.h>
 #include <haproxy/tools-t.h>
@@ -781,6 +782,21 @@ static inline int set_host_port(struct sockaddr_storage *addr, int port)
 	return 0;
 }
 
+/* Returns true if <addr> port is forbidden as client source using <proto>. */
+static inline int port_is_restricted(const struct sockaddr_storage *addr,
+                                     enum ha_proto proto)
+{
+	const uint16_t port = get_host_port(addr);
+
+	BUG_ON_HOT(proto != HA_PROTO_TCP && proto != HA_PROTO_QUIC);
+
+	/* RFC 6335 6. Port Number Ranges */
+	if (unlikely(port < 1024 && port > 0))
+		return !(global.clt_privileged_ports & proto);
+
+	return 0;
+}
+
 /* Convert mask from bit length form to in_addr form.
  * This function never fails.
  */
@@ -1198,5 +1214,9 @@ static inline void update_char_fingerprint(uint8_t *fp, char prev, char curr)
 int openssl_compare_current_version(const char *version);
 /* compare the current OpenSSL name to a string */
 int openssl_compare_current_name(const char *name);
+
+/* vma helpers */
+void vma_set_name(void *addr, size_t size, const char *type, const char *name);
+void vma_set_name_id(void *addr, size_t size, const char *type, const char *name, unsigned int id);
 
 #endif /* _HAPROXY_TOOLS_H */
