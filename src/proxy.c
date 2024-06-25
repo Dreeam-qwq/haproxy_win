@@ -34,6 +34,7 @@
 #include <haproxy/http_htx.h>
 #include <haproxy/http_ext.h>
 #include <haproxy/http_rules.h>
+#include <haproxy/mailers.h>
 #include <haproxy/listener.h>
 #include <haproxy/log.h>
 #include <haproxy/obj_type-t.h>
@@ -1791,6 +1792,7 @@ static int proxy_defproxy_cpy(struct proxy *curproxy, const struct proxy *defpro
 	if (defproxy->check_command)
 		curproxy->check_command = strdup(defproxy->check_command);
 
+	BUG_ON(curproxy->email_alert.flags & PR_EMAIL_ALERT_RESOLVED);
 	if (defproxy->email_alert.mailers.name)
 		curproxy->email_alert.mailers.name = strdup(defproxy->email_alert.mailers.name);
 	if (defproxy->email_alert.from)
@@ -1800,7 +1802,7 @@ static int proxy_defproxy_cpy(struct proxy *curproxy, const struct proxy *defpro
 	if (defproxy->email_alert.myhostname)
 		curproxy->email_alert.myhostname = strdup(defproxy->email_alert.myhostname);
 	curproxy->email_alert.level = defproxy->email_alert.level;
-	curproxy->email_alert.set = defproxy->email_alert.set;
+	curproxy->email_alert.flags = defproxy->email_alert.flags;
 
 	return 0;
 }

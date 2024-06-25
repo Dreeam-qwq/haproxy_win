@@ -584,8 +584,6 @@ static int qc_prep_pkts(struct quic_conn *qc, struct buffer *buf,
 			if (!cur_pkt) {
 				switch (err) {
 				case QC_BUILD_PKT_ERR_ALLOC:
-					if (first_pkt)
-						qc_txb_store(buf, dglen, first_pkt);
 					qc_purge_tx_buf(qc, buf);
 					break;
 
@@ -708,8 +706,13 @@ int qc_send(struct quic_conn *qc, int old_data, struct list *send_list)
 		qc->flags |= QUIC_FL_CONN_RETRANS_OLD_DATA;
 	}
 
-	/* Prepare and send packets until we could not further prepare packets. */
-	while (!LIST_ISEMPTY(send_list)) {
+	/* Prepare and send packets until we could not further prepare packets.
+	 * Sending must be interrupted if a CONNECTION_CLOSE was already sent
+	 * previously and is currently not needed.
+	 */
+	while (!LIST_ISEMPTY(send_list) &&
+	       (!(qc->flags & (QUIC_FL_CONN_CLOSING|QUIC_FL_CONN_DRAINING)) ||
+	        (qc->flags & QUIC_FL_CONN_IMMEDIATE_CLOSE))) {
 		/* Buffer must always be empty before qc_prep_pkts() usage.
 		 * qc_send_ppkts() ensures it is cleared on success.
 		 */
@@ -726,6 +729,12 @@ int qc_send(struct quic_conn *qc, int old_data, struct list *send_list)
 
 		if (ret <= 0) {
 			TRACE_DEVEL("stopping on qc_prep_pkts() return", QUIC_EV_CONN_TXPKT, qc);
+			break;
+		}
+
+		if ((qc->flags & QUIC_FL_CONN_DRAINING) &&
+		    !(qc->flags & QUIC_FL_CONN_IMMEDIATE_CLOSE)) {
+			TRACE_DEVEL("draining connection", QUIC_EV_CONN_TXPKT, qc);
 			break;
 		}
 	}
@@ -1888,20 +1897,23 @@ static int qc_do_build_pkt(unsigned char *pos, const unsigned char *end,
 	padding_len = 0;
 	len_sz = quic_int_getsize(len);
 	/* Add this packet size to <dglen> */
-	dglen += head_len + len_sz + len;
-	/* Note that <padding> is true only when building an Handshake packet
-	 * coalesced to an Initial packet.
-	 */
+	dglen += head_len + len;
+	if (pkt->type != QUIC_PACKET_TYPE_SHORT)
+		dglen += len_sz;
+
 	if (padding && dglen < QUIC_INITIAL_PACKET_MINLEN) {
-		/* This is a maximum padding size */
 		padding_len = QUIC_INITIAL_PACKET_MINLEN - dglen;
-		/* The length field value is of this packet is <len> + <padding_len>
-		 * the size of which may be greater than the initial computed size
-		 * <len_sz>. So, let's deduce the difference between these to packet
-		 * sizes from <padding_len>.
-		 */
-		padding_len -= quic_int_getsize(len + padding_len) - len_sz;
+
 		len += padding_len;
+		/* Update size of packet length field with new PADDING data. */
+		if (pkt->type != QUIC_PACKET_TYPE_SHORT) {
+			size_t len_sz_diff = quic_int_getsize(len) - len_sz;
+			if (len_sz_diff) {
+				padding_len -= len_sz_diff;
+				len_sz += len_sz_diff;
+				dglen += len_sz_diff;
+			}
+		}
 	}
 	else if (len_frms && len_frms < QUIC_PACKET_PN_MAXLEN) {
 		len += padding_len = QUIC_PACKET_PN_MAXLEN - len_frms;

@@ -1259,14 +1259,6 @@ out:
 	return err_code;
 }
 
-void free_email_alert(struct proxy *p)
-{
-	ha_free(&p->email_alert.mailers.name);
-	ha_free(&p->email_alert.from);
-	ha_free(&p->email_alert.to);
-	ha_free(&p->email_alert.myhostname);
-}
-
 
 int
 cfg_parse_netns(const char *file, int linenum, char **args, int kwm)
@@ -3075,7 +3067,7 @@ init_proxies_list_stage1:
 			}
 		}
 
-		if (curproxy->email_alert.set) {
+		if (curproxy->email_alert.flags & PR_EMAIL_ALERT_SET) {
 		    if (!(curproxy->email_alert.mailers.name && curproxy->email_alert.from && curproxy->email_alert.to)) {
 			    ha_warning("'email-alert' will be ignored for %s '%s' (the presence any of "
 				       "'email-alert from', 'email-alert level' 'email-alert mailers', "

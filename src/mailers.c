@@ -157,6 +157,7 @@ int init_email_alert(struct mailers *mls, struct proxy *p, char **err)
 	mls->users++;
 	free(p->email_alert.mailers.name);
 	p->email_alert.mailers.m = mls;
+	p->email_alert.flags |= PR_EMAIL_ALERT_RESOLVED;
 	p->email_alert.queues    = queues;
 	return 0;
 
@@ -170,6 +171,15 @@ int init_email_alert(struct mailers *mls, struct proxy *p, char **err)
 	free(queues);
   fail_no_queue:
 	return 1;
+}
+
+void free_email_alert(struct proxy *p)
+{
+	if (!(p->email_alert.flags & PR_EMAIL_ALERT_RESOLVED))
+		ha_free(&p->email_alert.mailers.name);
+	ha_free(&p->email_alert.from);
+	ha_free(&p->email_alert.to);
+	ha_free(&p->email_alert.myhostname);
 }
 
 static int enqueue_one_email_alert(struct proxy *p, struct server *s,
