@@ -287,9 +287,6 @@ int check_kw_experimental(struct cfg_keyword *kw, const char *file, int linenum,
 	return 0;
 }
 
-/* master CLI configuration (-S flag) */
-struct list mworker_cli_conf = LIST_HEAD_INIT(mworker_cli_conf);
-
 /* These are strings to be reported in the output of "haproxy -vv". They may
  * either be constants (in which case must_free must be zero) or dynamically
  * allocated strings to pass to free() on exit, and in this case must_free
@@ -1170,6 +1167,82 @@ next_dir_entry:
 	free(err);
 }
 
+/* Reads config files. Terminates process with exit(1), if we are luck of RAM,
+ * couldn't open provided file(s) or parser has detected some fatal error.
+ * Otherwise, returns an err_code, which may contain 0 (OK) or ERR_WARN,
+ * ERR_ALERT. It could be used in further initialization stages.
+ */
+static int read_cfg(char *progname)
+{
+	char *env_cfgfiles = NULL;
+	int env_err = 0;
+	struct wordlist *wl;
+	int err_code = 0;
+
+	/* handle cfgfiles that are actually directories */
+	cfgfiles_expand_directories();
+
+	if (LIST_ISEMPTY(&cfg_cfgfiles))
+		usage(progname);
+
+	/* temporary create environment variables with default
+	 * values to ease user configuration. Do not forget to
+	 * unset them after the list_for_each_entry loop.
+	 */
+	setenv("HAPROXY_HTTP_LOG_FMT", default_http_log_format, 1);
+	setenv("HAPROXY_HTTPS_LOG_FMT", default_https_log_format, 1);
+	setenv("HAPROXY_TCP_LOG_FMT", default_tcp_log_format, 1);
+	setenv("HAPROXY_BRANCH", PRODUCT_BRANCH, 1);
+	list_for_each_entry(wl, &cfg_cfgfiles, list) {
+		int ret;
+
+		if (env_err == 0) {
+			if (!memprintf(&env_cfgfiles, "%s%s%s",
+					   (env_cfgfiles ? env_cfgfiles : ""),
+					   (env_cfgfiles ? ";" : ""), wl->s))
+				env_err = 1;
+		}
+
+		ret = readcfgfile(wl->s);
+		if (ret == -1) {
+			ha_alert("Could not open configuration file %s : %s\n",
+				 wl->s, strerror(errno));
+			free(env_cfgfiles);
+			exit(1);
+		}
+		if (ret & (ERR_ABORT|ERR_FATAL))
+			ha_alert("Error(s) found in configuration file : %s\n", wl->s);
+		err_code |= ret;
+		if (err_code & ERR_ABORT) {
+			free(env_cfgfiles);
+			exit(1);
+		}
+	}
+	/* remove temporary environment variables. */
+	unsetenv("HAPROXY_BRANCH");
+	unsetenv("HAPROXY_HTTP_LOG_FMT");
+	unsetenv("HAPROXY_HTTPS_LOG_FMT");
+	unsetenv("HAPROXY_TCP_LOG_FMT");
+
+	/* do not try to resolve arguments nor to spot inconsistencies when
+	 * the configuration contains fatal errors caused by files not found
+	 * or failed memory allocations.
+	 */
+	if (err_code & (ERR_ABORT|ERR_FATAL)) {
+		ha_alert("Fatal errors found in configuration.\n");
+		free(env_cfgfiles);
+		exit(1);
+	}
+	if (env_err) {
+		ha_alert("Could not allocate memory for HAPROXY_CFGFILES env variable\n");
+		exit(1);
+	}
+	setenv("HAPROXY_CFGFILES", env_cfgfiles, 1);
+	free(env_cfgfiles);
+
+	return err_code;
+}
+
 /*
  * copy and cleanup the current argv
  * Remove the -sf /-st / -x parameters
@@ -1539,6 +1612,71 @@ static int check_if_maxsock_permitted(int maxsock)
 	return ret == 0;
 }
 
+/* Evaluates a condition provided within a conditional block of the
+ * configuration. Makes process to exit with 0, if the condition is true, with
+ * 1, if the condition is false or with 2, if parse_line encounters an error.
+ */
+static void do_check_condition(char *progname)
+{
+	int result;
+	uint32_t err;
+	const char *errptr;
+	char *errmsg = NULL;
+
+	char *args[MAX_LINE_ARGS+1];
+	int arg = sizeof(args) / sizeof(*args);
+	size_t outlen;
+	char *w;
+
+	if (!check_condition)
+		usage(progname);
+
+	outlen = strlen(check_condition) + 1;
+	err = parse_line(check_condition, check_condition, &outlen, args, &arg,
+                         PARSE_OPT_ENV | PARSE_OPT_WORD_EXPAND | PARSE_OPT_DQUOTE | PARSE_OPT_SQUOTE | PARSE_OPT_BKSLASH,
+                         &errptr);
+
+	if (err & PARSE_ERR_QUOTE) {
+		ha_alert("Syntax Error in condition: Unmatched quote.\n");
+		exit(2);
+	}
+
+	if (err & PARSE_ERR_HEX) {
+		ha_alert("Syntax Error in condition: Truncated or invalid hexadecimal sequence.\n");
+		exit(2);
+	}
+
+	if (err & (PARSE_ERR_TOOLARGE|PARSE_ERR_OVERLAP)) {
+		ha_alert("Error in condition: Line too long.\n");
+		exit(2);
+	}
+
+	if (err & PARSE_ERR_TOOMANY) {
+		ha_alert("Error in condition: Too many words.\n");
+		exit(2);
+	}
+
+	if (err) {
+		ha_alert("Unhandled error in condition, please report this to the developers.\n");
+		exit(2);
+	}
+
+	/* remerge all words into a single expression */
+	for (w = *args; (w += strlen(w)) < check_condition + outlen - 1; *w = ' ')
+		;
+
+	result = cfg_eval_condition(args, &errmsg, &errptr);
+
+	if (result < 0) {
+		if (errmsg)
+			ha_alert("Failed to evaluate condition: %s\n", errmsg);
+
+		exit(2);
+	}
+
+	exit(result ? 0 : 1);
+}
+
 /* This performs th every basic early initialization at the end of the PREPARE
  * init stage. It may only assume that list heads are initialized, but not that
  * anything else is correct. It will initialize a number of variables that
@@ -1557,6 +1695,11 @@ static void init_early(int argc, char **argv)
 	totalconn = actconn = listeners = stopping = 0;
 	killed = pid = 0;
 
+	/* cast to one byte in order to fill better a 3 bytes hole in the global struct,
+	 * we hopefully will never start with > than 255 args
+	 */
+	global.argc = (unsigned char)argc;
+	global.argv = argv;
 	global.maxsock = 10; /* reserve 10 fds ; will be incremented by socket eaters */
 	global.rlimit_memmax_all = HAPROXY_MEMMAX;
 	global.mode = MODE_STARTING;
@@ -2009,7 +2152,6 @@ static void init(int argc, char **argv)
 {
 	char *progname = global.log_tag.area;
 	int err_code = 0;
-	struct wordlist *wl;
 	struct proxy *px;
 	struct post_check_fct *pcf;
 	struct pre_check_fct *prcf;
@@ -2058,9 +2200,12 @@ static void init(int argc, char **argv)
 		global.mode &= ~MODE_MWORKER;
 	}
 
+	/* Do check_condition, if we started with -cc, and exit. */
+	if (global.mode & MODE_CHECK_CONDITION)
+		do_check_condition(progname);
+
 	/* set the atexit functions when not doing configuration check */
-	if (!(global.mode & (MODE_CHECK | MODE_CHECK_CONDITION))
-	    && (getenv("HAPROXY_MWORKER_REEXEC") != NULL)) {
+	if (!(global.mode & MODE_CHECK) && (getenv("HAPROXY_MWORKER_REEXEC") != NULL)) {
 
 		if (global.mode & MODE_MWORKER) {
 			atexit_flag = 1;
@@ -2078,134 +2223,10 @@ static void init(int argc, char **argv)
 
 	usermsgs_clr("config");
 
-	if (global.mode & MODE_CHECK_CONDITION) {
-		int result;
-
-		uint32_t err;
-		const char *errptr;
-		char *errmsg = NULL;
-
-		char *args[MAX_LINE_ARGS+1];
-		int arg = sizeof(args) / sizeof(*args);
-		size_t outlen;
-		char *w;
-
-		if (!check_condition)
-			usage(progname);
-
-		outlen = strlen(check_condition) + 1;
-		err = parse_line(check_condition, check_condition, &outlen, args, &arg,
-		                 PARSE_OPT_ENV | PARSE_OPT_WORD_EXPAND | PARSE_OPT_DQUOTE | PARSE_OPT_SQUOTE | PARSE_OPT_BKSLASH,
-		                 &errptr);
-
-		if (err & PARSE_ERR_QUOTE) {
-			ha_alert("Syntax Error in condition: Unmatched quote.\n");
-			exit(2);
-		}
-
-		if (err & PARSE_ERR_HEX) {
-			ha_alert("Syntax Error in condition: Truncated or invalid hexadecimal sequence.\n");
-			exit(2);
-		}
-
-		if (err & (PARSE_ERR_TOOLARGE|PARSE_ERR_OVERLAP)) {
-			ha_alert("Error in condition: Line too long.\n");
-			exit(2);
-		}
-
-		if (err & PARSE_ERR_TOOMANY) {
-			ha_alert("Error in condition: Too many words.\n");
-			exit(2);
-		}
-
-		if (err) {
-			ha_alert("Unhandled error in condition, please report this to the developers.\n");
-			exit(2);
-		}
-
-		/* remerge all words into a single expression */
-		for (w = *args; (w += strlen(w)) < check_condition + outlen - 1; *w = ' ')
-			;
-
-		result = cfg_eval_condition(args, &errmsg, &errptr);
-
-		if (result < 0) {
-			if (errmsg)
-				ha_alert("Failed to evaluate condition: %s\n", errmsg);
-
-			exit(2);
-		}
-
-		exit(result ? 0 : 1);
-	}
-
 	/* in wait mode, we don't try to read the configuration files */
-	if (!(global.mode & MODE_MWORKER_WAIT)) {
-		char *env_cfgfiles = NULL;
-		int env_err = 0;
+	if (!(global.mode & MODE_MWORKER_WAIT))
+		read_cfg(progname);
 
-		/* handle cfgfiles that are actually directories */
-		cfgfiles_expand_directories();
-
-		if (LIST_ISEMPTY(&cfg_cfgfiles))
-			usage(progname);
-
-		/* temporary create environment variables with default
-		 * values to ease user configuration. Do not forget to
-		 * unset them after the list_for_each_entry loop.
-		 */
-		setenv("HAPROXY_HTTP_LOG_FMT", default_http_log_format, 1);
-		setenv("HAPROXY_HTTPS_LOG_FMT", default_https_log_format, 1);
-		setenv("HAPROXY_TCP_LOG_FMT", default_tcp_log_format, 1);
-		setenv("HAPROXY_BRANCH", PRODUCT_BRANCH, 1);
-		list_for_each_entry(wl, &cfg_cfgfiles, list) {
-			int ret;
-
-			if (env_err == 0) {
-				if (!memprintf(&env_cfgfiles, "%s%s%s",
-					       (env_cfgfiles ? env_cfgfiles : ""),
-					       (env_cfgfiles ? ";" : ""), wl->s))
-					env_err = 1;
-			}
-
-			ret = readcfgfile(wl->s);
-			if (ret == -1) {
-				ha_alert("Could not open configuration file %s : %s\n",
-					 wl->s, strerror(errno));
-				free(env_cfgfiles);
-				exit(1);
-			}
-			if (ret & (ERR_ABORT|ERR_FATAL))
-				ha_alert("Error(s) found in configuration file : %s\n", wl->s);
-			err_code |= ret;
-			if (err_code & ERR_ABORT) {
-				free(env_cfgfiles);
-				exit(1);
-			}
-		}
-		/* remove temporary environment variables. */
-		unsetenv("HAPROXY_BRANCH");
-		unsetenv("HAPROXY_HTTP_LOG_FMT");
-		unsetenv("HAPROXY_HTTPS_LOG_FMT");
-		unsetenv("HAPROXY_TCP_LOG_FMT");
-
-		/* do not try to resolve arguments nor to spot inconsistencies when
-		 * the configuration contains fatal errors caused by files not found
-		 * or failed memory allocations.
-		 */
-		if (err_code & (ERR_ABORT|ERR_FATAL)) {
-			ha_alert("Fatal errors found in configuration.\n");
-			free(env_cfgfiles);
-			exit(1);
-		}
-		if (env_err) {
-			ha_alert("Could not allocate memory for HAPROXY_CFGFILES env variable\n");
-			exit(1);
-		}
-		setenv("HAPROXY_CFGFILES", env_cfgfiles, 1);
-		free(env_cfgfiles);
-
-	}
 	if (global.mode & MODE_MWORKER) {
 		struct mworker_proc *tmproc;
 
@@ -2249,58 +2270,8 @@ static void init(int argc, char **argv)
 		global.nbthread = 1;
 	}
 
-	if (global.mode & (MODE_MWORKER|MODE_MWORKER_WAIT)) {
-		struct wordlist *it, *c;
-
-		master = 1;
-		/* get the info of the children in the env */
-		if (mworker_env_to_proc_list() < 0) {
-			exit(EXIT_FAILURE);
-		}
-
-		if (!LIST_ISEMPTY(&mworker_cli_conf)) {
-			char *path = NULL;
-
-			if (mworker_cli_proxy_create() < 0) {
-				ha_alert("Can't create the master's CLI.\n");
-				exit(EXIT_FAILURE);
-			}
-
-			list_for_each_entry_safe(c, it, &mworker_cli_conf, list) {
-
-				if (mworker_cli_proxy_new_listener(c->s) == NULL) {
-					ha_alert("Can't create the master's CLI.\n");
-					exit(EXIT_FAILURE);
-				}
-				LIST_DELETE(&c->list);
-				free(c->s);
-				free(c);
-			}
-			/* Creates the mcli_reload listener, which is the listener used
-			 * to retrieve the master CLI session which asked for the reload.
-			 *
-			 * ipc_fd[1] will be used as a listener, and ipc_fd[0]
-			 * will be used to send the FD of the session.
-			 *
-			 * Both FDs will be kept in the master. The sockets are
-			 * created only if they weren't inherited.
-			 */
-			if ((proc_self->ipc_fd[1] == -1) &&
-			     socketpair(AF_UNIX, SOCK_STREAM, 0, proc_self->ipc_fd) < 0) {
-				ha_alert("cannot create the mcli_reload socketpair.\n");
-				exit(EXIT_FAILURE);
-			}
-
-			/* Create the mcli_reload listener from the proc_self struct */
-			memprintf(&path, "sockpair@%d", proc_self->ipc_fd[1]);
-			mcli_reload_bind_conf = mworker_cli_proxy_new_listener(path);
-			if (mcli_reload_bind_conf == NULL) {
-				ha_alert("Cannot create the mcli_reload listener.\n");
-				exit(EXIT_FAILURE);
-			}
-			ha_free(&path);
-		}
-	}
+	if (global.mode & (MODE_MWORKER|MODE_MWORKER_WAIT))
+		mworker_create_master_cli();
 
 	if (!LIST_ISEMPTY(&mworker_cli_conf) && !(arg_mode & MODE_MWORKER)) {
 		ha_alert("a master CLI socket was defined, but master-worker mode (-W) is not enabled.\n");

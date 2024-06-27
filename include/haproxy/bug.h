@@ -29,6 +29,7 @@
 #define _HAPROXY_BUG_H
 
 #include <stddef.h>
+#include <sys/types.h>
 #include <haproxy/atomic.h>
 #include <haproxy/compiler.h>
 
@@ -123,9 +124,17 @@ static __attribute__((noinline,noreturn,unused)) void abort_with_line(uint line)
 }
 
 #define __ABORT_NOW(file, line, ...) do {				\
+		extern ssize_t write(int, const void *, size_t);	\
+		extern size_t strlen(const char *s);			\
+		const char *msg;					\
 		if (sizeof("" __VA_ARGS__) > 1)				\
 			complain(NULL, "\nABORT at " file ":" #line ": " __VA_ARGS__ "\n", 1); \
 		DUMP_TRACE();						\
+		msg = "\n"						\
+		      "Hint: when reporting this bug to developers, please check if a core file was\n" \
+		      "      produced, open it with 'gdb', issue 'bt' to produce a backtrace for the\n" \
+		      "      current thread only, then join it with the bug report.\n"; \
+		DISGUISE(write(2, msg, strlen(msg)));			\
 		abort_with_line(__LINE__);				\
 	} while (0)
 #else
@@ -133,9 +142,17 @@ static __attribute__((noinline,noreturn,unused)) void abort_with_line(uint line)
  * stack and stops at the exact location we need.
  */
 #define __ABORT_NOW(file, line, ...) do {				\
+		extern ssize_t write(int, const void *, size_t);	\
+		extern size_t strlen(const char *s);			\
+		const char *msg;					\
 		if (sizeof("" __VA_ARGS__) > 1)				\
 			complain(NULL, "\nABORT at " file ":" #line ": " __VA_ARGS__ "\n", 1); \
 		DUMP_TRACE();						\
+		msg = "\n"						\
+		      "Hint: when reporting this bug to developers, please check if a core file was\n" \
+		      "      produced, open it with 'gdb', issue 'bt' to produce a backtrace for the\n" \
+		      "      current thread only, then join it with the bug report.\n"; \
+		DISGUISE(write(2, msg, strlen(msg)));			\
 		ha_crash_now();						\
 	} while (0)
 #endif
