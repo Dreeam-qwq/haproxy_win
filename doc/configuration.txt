@@ -3,7 +3,7 @@
                           Configuration Manual
                          ----------------------
                               version 3.1
-                              2024/06/14
+                              2024/07/10
 
 
 This document covers the configuration language as implemented in the version
@@ -1790,9 +1790,14 @@ fd-hard-limit <number>
   much RAM for regular usage. The fd-hard-limit setting is provided to enforce
   a possibly lower bound to this limit. This means that it will always respect
   the system-imposed limits when they are below <number> but the specified
-  value will be used if system-imposed limits are higher. In the example below,
-  no other setting is specified and the maxconn value will automatically adapt
-  to the lower of "fd-hard-limit" and the system-imposed limit:
+  value will be used if system-imposed limits are higher. By default
+  fd-hard-limit is set to 1048576. This default could be changed via
+  DEFAULT_MAXFD compile-time variable, that could serve as the maximum (kernel)
+  system limit, if RLIMIT_NOFILE hard limit is extremely large. fd-hard-limit
+  set in global section allows to temporarily override the value provided via
+  DEFAULT_MAXFD at the build-time. In the example below, no other setting is
+  specified and the maxconn value will automatically adapt to the lower of
+  "fd-hard-limit" and the RLIMIT_NOFILE limit:
 
       global
           # use as many FDs as possible but no more than 50000
@@ -2140,10 +2145,18 @@ lua-prepend-path <string> [<type>]
 
 master-worker [no-exit-on-failure]
   Master-worker mode. It is equivalent to the command line "-W" argument.
-  This mode will launch a "master" which will monitor the "workers". Using
-  this mode, you can reload HAProxy directly by sending a SIGUSR2 signal to
-  the master. The master-worker mode is compatible either with the foreground
-  or daemon mode.
+
+  This mode will launch a "master" which will fork a "worker" after reading the
+  configuration to process the traffic. The master is used as a process manager
+  which will monitor the "workers".
+
+  Using this mode, you can reload HAProxy directly by sending a SIGUSR2 signal
+  to the master. Reloading will ask the master to read the configuration again
+  and fork a new worker. The previous worker will be kept until the end of its
+  jobs.
+
+  The master-worker mode is compatible either with the foreground or daemon
+  mode.
 
   By default, if a worker exits with a bad return code, in the case of a
   segfault for example, all workers will be killed, and the master will leave.
@@ -2952,18 +2965,25 @@ maxcomprate <number>
 
 maxconn <number>
   Sets the maximum per-process number of concurrent connections to <number>. It
-  is equivalent to the command-line argument "-n". Proxies will stop accepting
-  connections when this limit is reached. The "ulimit-n" parameter is
-  automatically adjusted according to this value. See also "ulimit-n". Note:
-  the "select" poller cannot reliably use more than 1024 file descriptors on
-  some platforms. If your platform only supports select and reports "select
-  FAILED" on startup, you need to reduce maxconn until it works (slightly
-  below 500 in general). If this value is not set, it will automatically be
-  calculated based on the current file descriptors limit reported by the
-  "ulimit -n" command, possibly reduced to a lower value if a memory limit
-  is enforced, based on the buffer size, memory allocated to compression, SSL
-  cache size, and use or not of SSL and the associated maxsslconn (which can
-  also be automatic). In any case, the fd-hard-limit applies if set.
+  is equivalent to the command-line argument "-n". The value provided in
+  command-line argument via "-n" takes the precedence over the maxconn value set
+  in the global section. Haproxy process could be also compiled with
+  SYSTEM_MAXCONN compile-time variable, which is served in this case as the
+  system maxconn maximum. Again, the command-line "-n" argument allows at
+  runtime to bypass SYSTEM_MAXCONN limit, if set. Proxies will stop accepting
+  connections when maxconn is reached. The process soft file descriptor limit
+  (could be obtained with "ulimit -n" command) is automatically adjusted
+  according to provided maxconn. See also "ulimit-n". Note: the "select" poller
+  cannot reliably use more than 1024 file descriptors on some platforms. If your
+  platform only supports select and reports "select FAILED" on startup, you need
+  to reduce the maxconn until it works (slightly below 500 in general). If
+  maxconn value is not set, it will be automatically calculated based on the
+  current file descriptors limits, reported by the "ulimit -nH" command (we take
+  the maximum between the hard and soft values), then automatic value will be
+  possibly reduced by "fd-hard-limit" and by memory limit, if the latter was
+  enforced via "-m" command line option. Automatic value is also dependent from
+  the buffer size, memory allocated to compression, SSL cache size, and the use
+  or not of SSL and the associated maxsslconn (which can also be automatic).
 
   See also: fd-hard-limit, ulimit-n
 
@@ -15945,8 +15965,15 @@ crl-file <crlfile>
   list for every certificate of your certificate authority chain.
 
 crt <cert>
-  This setting is only available when support for OpenSSL was built in. It
-  designates a PEM file containing both the required certificates and any
+  This setting is only available when support for OpenSSL was built in.
+
+  HAProxy uses a cache system, the files are loaded only once in the certificate
+  storage, and each next "crt" keyword will use this cached version. When the
+  certificate was declared in a "crt-store", the certificate storage is
+  populated from there and don't try to load additional files by detecting file
+  extensions.
+
+  It designates a PEM file containing both the required certificates and any
   associated private keys. This file can be built by concatenating multiple
   PEM files into one (e.g. cat cert.pem key.pem > combined.pem). If your CA
   requires an intermediate certificate, this can also be concatenated into this
@@ -22893,6 +22920,7 @@ ssl_c_notafter                                     string
 ssl_c_notbefore                                    string
 ssl_c_r_dn([<entry>[,<occ>[,<format>]]])           string
 ssl_c_s_dn([<entry>[,<occ>[,<format>]]])           string
+ssl_c_san                                          string
 ssl_c_serial                                       binary
 ssl_c_sha1                                         binary
 ssl_c_sig_alg                                      string
@@ -23236,6 +23264,23 @@ ssl_c_s_dn([<entry>[,<occ>[,<format>]]]) : string
   LDAP v3.
   If you'd like to modify the format only you can specify an empty string
   and zero for the first two parameters. Example: ssl_c_s_dn(,0,rfc2253)
+
+ssl_c_san : string
+  When the incoming connection was made over an SSL/TLS transport layer, and was
+  provided with a client certificate. Returns a string of comma separated
+  Subject Alt Name fields contained into the provided certificate.
+
+  This can be used to inspect the client certificate.
+
+  Example:
+
+    acl is_valid_client_cert ssl_c_used && ! ssl_c_verify
+    http-request set-header X-SSL-Client-SAN %[ssl_c_san] if is_valid_client_cert
+
+  will results in:
+
+    X-SSL-Client-SAN: IP Address:127.0.0.1, IP Address:127.0.0.2, IP Address:127.0.0.3, URI:http://docs.haproxy.org/2.7/, DNS:ca.tests.haproxy.com
+
 
 ssl_c_serial : binary
   Returns the serial of the certificate presented by the client when the

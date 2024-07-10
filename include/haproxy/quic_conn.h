@@ -60,10 +60,6 @@ void quic_free_arngs(struct quic_conn *qc, struct quic_arngs *arngs);
 struct quic_cstream *quic_cstream_new(struct quic_conn *qc);
 struct task *quic_conn_app_io_cb(struct task *t, void *context, unsigned int state);
 
-struct quic_connection_id *new_quic_cid(struct eb_root *root,
-                                        struct quic_conn *qc,
-                                        const struct quic_cid *orig,
-                                        const struct sockaddr_storage *addr);
 void quic_conn_closed_err_count_inc(struct quic_conn *qc, struct quic_frame *frm);
 int qc_h3_request_reject(struct quic_conn *qc, uint64_t id);
 struct quic_conn *qc_new_conn(const struct quic_version *qv, int ipv4,
@@ -167,11 +163,6 @@ void quic_set_connection_close(struct quic_conn *qc, const struct quic_err err);
 void quic_set_tls_alert(struct quic_conn *qc, int alert);
 int quic_set_app_ops(struct quic_conn *qc, const unsigned char *alpn, size_t alpn_len);
 int qc_check_dcid(struct quic_conn *qc, unsigned char *dcid, size_t dcid_len);
-struct quic_cid quic_derive_cid(const struct quic_cid *orig,
-                                const struct sockaddr_storage *addr);
-int quic_get_cid_tid(const unsigned char *cid, size_t cid_len,
-                     const struct sockaddr_storage *cli_addr,
-                     unsigned char *buf, size_t buf_len);
 int qc_send_mux(struct quic_conn *qc, struct list *frms);
 
 void qc_notify_err(struct quic_conn *qc);
@@ -186,8 +177,11 @@ void qc_kill_conn(struct quic_conn *qc);
 int qc_parse_hd_form(struct quic_rx_packet *pkt,
                      unsigned char **buf, const unsigned char *end);
 
-int qc_set_tid_affinity(struct quic_conn *qc, uint new_tid, struct listener *new_li);
+int qc_set_tid_affinity1(struct quic_conn *qc, uint new_tid);
+void qc_set_tid_affinity2(struct quic_conn *qc, struct listener *new_li);
+void qc_reset_tid_affinity(struct quic_conn *qc);
 void qc_finalize_affinity_rebind(struct quic_conn *qc);
+
 int qc_handle_conn_migration(struct quic_conn *qc,
                              const struct sockaddr_storage *peer_addr,
                              const struct sockaddr_storage *local_addr);

@@ -262,6 +262,16 @@ static struct task *server_atomic_sync(struct task *task, void *context, unsigne
 			 * to prevent invalid reads by other threads.
 			 */
 
+			/*
+			 * this requires thread isolation, which is safe since we're the only
+			 * task working for the current subscription and we don't hold locks
+			 * or resources that other threads may depend on to complete a running
+			 * cycle. Note that we do this way because we assume that this event is
+			 * rather rare.
+			 */
+			if (!thread_isolated())
+				thread_isolate_full();
+
 			/* check if related server still exists */
 			px = proxy_find_by_id(data->server.safe.proxy_uuid, PR_CAP_BE, 0);
 			if (!px)
@@ -290,15 +300,6 @@ static struct task *server_atomic_sync(struct task *task, void *context, unsigne
 					/* should not happen */
 					break;
 			}
-			/*
-			 * this requires thread isolation, which is safe since we're the only
-			 * task working for the current subscription and we don't hold locks
-			 * or resources that other threads may depend on to complete a running
-			 * cycle. Note that we do this way because we assume that this event is
-			 * rather rare.
-			 */
-			if (!thread_isolated())
-				thread_isolate_full();
 
 			/* apply new addr:port combination */
 			_srv_set_inetaddr_port(srv, &new_addr,
@@ -709,6 +710,9 @@ static void srv_set_addr_desc(struct server *s, int reattach)
 {
 	struct proxy *p = s->proxy;
 	char *key;
+
+	/* Risk of used_server_addr tree corruption if server is already deleted. */
+	BUG_ON(s->flags & SRV_F_DELETED);
 
 	key = sa2str(&s->addr, s->svc_port, s->flags & SRV_F_MAPPORTS);
 
@@ -1990,11 +1994,11 @@ static int srv_has_streams(struct server *srv)
 void srv_shutdown_streams(struct server *srv, int why)
 {
 	struct stream *stream;
-	struct mt_list *elt1, elt2;
+	struct mt_list back;
 	int thr;
 
 	for (thr = 0; thr < global.nbthread; thr++)
-		mt_list_for_each_entry_safe(stream, &srv->per_thr[thr].streams, by_srv, elt1, elt2)
+		MT_LIST_FOR_EACH_ENTRY_LOCKED(stream, &srv->per_thr[thr].streams, by_srv, back)
 			if (stream->srv_conn == srv)
 				stream_shutdown(stream, why);
 }
@@ -2988,6 +2992,14 @@ struct server *srv_drop(struct server *srv)
 	 */
 	if (HA_ATOMIC_SUB_FETCH(&srv->refcount, 1))
 		goto end;
+
+	/* This BUG_ON() is invalid for now as server released on deinit will
+	 * trigger it as they are not properly removed from their tree.
+	 */
+	//BUG_ON(srv->addr_node.node.leaf_p ||
+	//       srv->idle_node.node.leaf_p ||
+	//       srv->conf.id.node.leaf_p ||
+	//       srv->conf.name.node.leaf_p);
 
 	guid_remove(&srv->guid);
 
@@ -4595,6 +4607,7 @@ int snr_resolution_cb(struct resolv_requester *requester, struct dns_counters *c
 
 		/* unset server's addr, keep port */
 		server_get_inetaddr(s, &srv_addr);
+		srv_addr.family = AF_UNSPEC;
 		memset(&srv_addr.addr, 0, sizeof(srv_addr.addr));
 		server_set_inetaddr(s, &srv_addr, SERVER_INETADDR_UPDATER_NONE, NULL);
 	}
@@ -4610,6 +4623,7 @@ int snr_resolution_cb(struct resolv_requester *requester, struct dns_counters *c
 
 		/* unset server's addr, keep port */
 		server_get_inetaddr(s, &srv_addr);
+		srv_addr.family = AF_UNSPEC;
 		memset(&srv_addr.addr, 0, sizeof(srv_addr.addr));
 		server_set_inetaddr(s, &srv_addr, SERVER_INETADDR_UPDATER_NONE, NULL);
 	}
@@ -4697,6 +4711,7 @@ int snr_resolution_error_cb(struct resolv_requester *requester, int error_code)
 
 		/* unset server's addr, keep port */
 		server_get_inetaddr(s, &srv_addr);
+		srv_addr.family = AF_UNSPEC;
 		memset(&srv_addr.addr, 0, sizeof(srv_addr.addr));
 		server_set_inetaddr(s, &srv_addr, SERVER_INETADDR_UPDATER_NONE, NULL);
 		HA_SPIN_UNLOCK(SERVER_LOCK, &s->lock);
@@ -5983,7 +5998,7 @@ static int cli_parse_delete_server(char **args, char *payload, struct appctx *ap
 	struct server *srv;
 	struct server *prev_del;
 	struct ist be_name, sv_name;
-	struct mt_list *elt1, elt2;
+	struct mt_list back;
 	struct sess_priv_conns *sess_conns = NULL;
 	const char *msg;
 	int ret, i;
@@ -6047,7 +6062,7 @@ static int cli_parse_delete_server(char **args, char *payload, struct appctx *ap
 	BUG_ON(srv->curr_idle_conns);
 
 	/* Close idle private connections attached to this server. */
-	mt_list_for_each_entry_safe(sess_conns, &srv->sess_conns, srv_el, elt1, elt2) {
+	MT_LIST_FOR_EACH_ENTRY_LOCKED(sess_conns, &srv->sess_conns, srv_el, back) {
 		struct connection *conn, *conn_back;
 		list_for_each_entry_safe(conn, conn_back, &sess_conns->conn_list, sess_el) {
 
@@ -6067,8 +6082,8 @@ static int cli_parse_delete_server(char **args, char *payload, struct appctx *ap
 		}
 
 		LIST_DELETE(&sess_conns->sess_el);
-		MT_LIST_DELETE_SAFE(elt1);
 		pool_free(pool_head_sess_priv_conns, sess_conns);
+		sess_conns = NULL;
 	}
 
 	/* removing cannot fail anymore when we reach this:
@@ -6114,8 +6129,7 @@ static int cli_parse_delete_server(char **args, char *payload, struct appctx *ap
 	/* remove srv from addr_node tree */
 	eb32_delete(&srv->conf.id);
 	ebpt_delete(&srv->conf.name);
-	if (srv->addr_node.key)
-		ebpt_delete(&srv->addr_node);
+	ebpt_delete(&srv->addr_node);
 
 	/* remove srv from idle_node tree for idle conn cleanup */
 	eb32_delete(&srv->idle_node);

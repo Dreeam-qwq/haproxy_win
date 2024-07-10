@@ -51,11 +51,6 @@
 
 /* per-thread quic datagram handlers */
 struct quic_dghdlr *quic_dghdlrs;
-struct eb_root *quic_cid_tree;
-
-/* global CID trees */
-#define QUIC_CID_TREES_CNT 256
-struct quic_cid_tree *quic_cid_trees;
 
 /* Size of the internal buffer of QUIC RX buffer at the fd level */
 #define QUIC_RX_BUFSZ  (1UL << 18)
@@ -66,7 +61,9 @@ static int quic_bind_listener(struct listener *listener, char *errmsg, int errle
 static int quic_connect_server(struct connection *conn, int flags);
 static void quic_enable_listener(struct listener *listener);
 static void quic_disable_listener(struct listener *listener);
-static int quic_set_affinity(struct connection *conn, int new_tid);
+static int quic_set_affinity1(struct connection *conn, int new_tid);
+static void quic_set_affinity2(struct connection *conn);
+static void quic_reset_affinity(struct connection *conn);
 
 /* Note: must not be declared <const> as its list will be overwritten */
 struct protocol proto_quic4 = {
@@ -85,7 +82,9 @@ struct protocol proto_quic4 = {
 	.get_src        = quic_sock_get_src,
 	.get_dst        = quic_sock_get_dst,
 	.connect        = quic_connect_server,
-	.set_affinity   = quic_set_affinity,
+	.set_affinity1  = quic_set_affinity1,
+	.set_affinity2  = quic_set_affinity2,
+	.reset_affinity = quic_reset_affinity,
 
 	/* binding layer */
 	.rx_suspend     = udp_suspend_receiver,
@@ -129,7 +128,9 @@ struct protocol proto_quic6 = {
 	.get_src        = quic_sock_get_src,
 	.get_dst        = quic_sock_get_dst,
 	.connect        = quic_connect_server,
-	.set_affinity   = quic_set_affinity,
+	.set_affinity1  = quic_set_affinity1,
+	.set_affinity2  = quic_set_affinity2,
+	.reset_affinity = quic_reset_affinity,
 
 	/* binding layer */
 	.rx_suspend     = udp_suspend_receiver,
@@ -673,10 +674,22 @@ static void quic_disable_listener(struct listener *l)
  * target is a listener, and the caller is responsible for guaranteeing that
  * the listener assigned to the connection is bound to the requested thread.
  */
-static int quic_set_affinity(struct connection *conn, int new_tid)
+static int quic_set_affinity1(struct connection *conn, int new_tid)
 {
 	struct quic_conn *qc = conn->handle.qc;
-	return qc_set_tid_affinity(qc, new_tid, objt_listener(conn->target));
+	return qc_set_tid_affinity1(qc, new_tid);
+}
+
+static void quic_set_affinity2(struct connection *conn)
+{
+	struct quic_conn *qc = conn->handle.qc;
+	qc_set_tid_affinity2(qc, objt_listener(conn->target));
+}
+
+static void quic_reset_affinity(struct connection *conn)
+{
+	struct quic_conn *qc = conn->handle.qc;
+	qc_reset_tid_affinity(qc);
 }
 
 static int quic_alloc_dghdlrs(void)
@@ -705,17 +718,6 @@ static int quic_alloc_dghdlrs(void)
 		MT_LIST_INIT(&dghdlr->dgrams);
 	}
 
-	quic_cid_trees = calloc(QUIC_CID_TREES_CNT, sizeof(*quic_cid_trees));
-	if (!quic_cid_trees) {
-		ha_alert("Failed to allocate global quic CIDs trees.\n");
-		return 0;
-	}
-
-	for (i = 0; i < QUIC_CID_TREES_CNT; ++i) {
-		HA_RWLOCK_INIT(&quic_cid_trees[i].lock);
-		quic_cid_trees[i].root = EB_ROOT_UNIQUE;
-	}
-
 	return 1;
 }
 REGISTER_POST_CHECK(quic_alloc_dghdlrs);
@@ -729,8 +731,6 @@ static int quic_deallocate_dghdlrs(void)
 			tasklet_free(quic_dghdlrs[i].task);
 		free(quic_dghdlrs);
 	}
-
-	ha_free(&quic_cid_trees);
 
 	return 1;
 }

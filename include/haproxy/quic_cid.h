@@ -11,18 +11,24 @@
 #include <haproxy/buf-t.h>
 #include <haproxy/chunk.h>
 #include <haproxy/quic_conn-t.h>
+#include <haproxy/quic_cid-t.h>
 #include <haproxy/quic_rx-t.h>
 #include <haproxy/proto_quic.h>
+
+extern struct quic_cid_tree *quic_cid_trees;
 
 struct quic_connection_id *new_quic_cid(struct eb_root *root,
                                         struct quic_conn *qc,
                                         const struct quic_cid *orig,
                                         const struct sockaddr_storage *addr);
+
+int quic_cid_insert(struct quic_connection_id *conn_id, int *new_tid);
+int quic_cmp_cid_conn(const unsigned char *cid, size_t cid_len,
+                      struct quic_conn *qc);
 int quic_get_cid_tid(const unsigned char *cid, size_t cid_len,
                      const struct sockaddr_storage *cli_addr,
                      unsigned char *pos, size_t len);
-struct quic_cid quic_derive_cid(const struct quic_cid *orig,
-                                const struct sockaddr_storage *addr);
+
 struct quic_conn *retrieve_qc_conn_from_cid(struct quic_rx_packet *pkt,
                                             struct sockaddr_storage *saddr,
                                             int *new_tid);
@@ -69,8 +75,11 @@ static inline uchar quic_cid_tree_idx(const struct quic_cid *cid)
 	return _quic_cid_tree_idx(cid->data);
 }
 
-/* Insert <conn_id> into global CID tree as a thread-safe operation. */
-static inline void quic_cid_insert(struct quic_connection_id *conn_id)
+/* Insert <conn_id> into global CID tree. Do not check if value is already
+ * present in the tree. As such, it should not be used for the first DCID of a
+ * connection instance.
+ */
+static inline void _quic_cid_insert(struct quic_connection_id *conn_id)
 {
 	const uchar idx = quic_cid_tree_idx(&conn_id->cid);
 	struct quic_cid_tree *tree = &quic_cid_trees[idx];
