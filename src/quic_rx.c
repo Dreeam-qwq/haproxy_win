@@ -22,6 +22,7 @@
 #include <haproxy/quic_cid.h>
 #include <haproxy/quic_retransmit.h>
 #include <haproxy/quic_retry.h>
+#include <haproxy/quic_rules.h>
 #include <haproxy/quic_sock.h>
 #include <haproxy/quic_stream.h>
 #include <haproxy/quic_ssl.h>
@@ -91,7 +92,7 @@ static int qc_do_rm_hp(struct quic_conn *qc,
 
 	sample = pn + QUIC_PACKET_PN_MAXLEN;
 
-	if (!quic_tls_aes_decrypt(mask, sample, sizeof mask, tls_ctx->rx.hp_ctx)) {
+	if (!quic_tls_hp_decrypt(mask, sample, sizeof mask, tls_ctx->rx.hp_ctx, tls_ctx->rx.hp_key)) {
 		TRACE_ERROR("HP removing failed", QUIC_EV_CONN_RMHP, qc, pkt);
 		goto leave;
 	}
@@ -126,7 +127,7 @@ static int qc_pkt_decrypt(struct quic_conn *qc, struct quic_enc_level *qel,
 	unsigned char iv[QUIC_TLS_IV_LEN];
 	struct quic_tls_ctx *tls_ctx =
 		qc_select_tls_ctx(qc, qel, pkt->type, pkt->version);
-	EVP_CIPHER_CTX *rx_ctx = tls_ctx->rx.ctx;
+	QUIC_AEAD_CTX *rx_ctx = tls_ctx->rx.ctx;
 	unsigned char *rx_iv = tls_ctx->rx.iv;
 	size_t rx_iv_sz = tls_ctx->rx.ivlen;
 	unsigned char *rx_key = tls_ctx->rx.key;
@@ -217,15 +218,18 @@ static int quic_stream_try_to_consume(struct quic_conn *qc,
 		struct qf_stream *strm_frm;
 		struct quic_frame *frm;
 		size_t offset, len;
+		int fin;
 
 		strm_frm = eb64_entry(frm_node, struct qf_stream, offset);
+		frm = container_of(strm_frm, struct quic_frame, stream);
 		offset = strm_frm->offset.key;
 		len = strm_frm->len;
+		fin = frm->type & QUIC_STREAM_FRAME_TYPE_FIN_BIT;
 
 		if (offset > stream->ack_offset)
 			break;
 
-		if (qc_stream_desc_ack(&stream, offset, len)) {
+		if (qc_stream_desc_ack(&stream, offset, len, fin)) {
 			/* cf. next comment : frame may be freed at this stage. */
 			TRACE_DEVEL("stream consumed", QUIC_EV_CONN_ACKSTRM,
 			            qc, stream ? strm_frm : NULL, stream);
@@ -245,7 +249,6 @@ static int quic_stream_try_to_consume(struct quic_conn *qc,
 		frm_node = eb64_next(frm_node);
 		eb64_delete(&strm_frm->offset);
 
-		frm = container_of(strm_frm, struct quic_frame, stream);
 		qc_release_frm(qc, frm);
 	}
 
@@ -271,6 +274,7 @@ static void qc_handle_newly_acked_frm(struct quic_conn *qc, struct quic_frame *f
 		struct qc_stream_desc *stream = NULL;
 		const size_t offset = strm_frm->offset.key;
 		const size_t len = strm_frm->len;
+		const int fin = frm->type & QUIC_STREAM_FRAME_TYPE_FIN_BIT;
 
 		/* do not use strm_frm->stream as the qc_stream_desc instance
 		 * might be freed at this stage. Use the id to do a proper
@@ -290,7 +294,7 @@ static void qc_handle_newly_acked_frm(struct quic_conn *qc, struct quic_frame *f
 
 		TRACE_DEVEL("acked stream", QUIC_EV_CONN_ACKSTRM, qc, strm_frm, stream);
 		if (offset <= stream->ack_offset) {
-			if (qc_stream_desc_ack(&stream, offset, len)) {
+			if (qc_stream_desc_ack(&stream, offset, len, fin)) {
 				TRACE_DEVEL("stream consumed", QUIC_EV_CONN_ACKSTRM,
 				            qc, strm_frm, stream);
 			}
@@ -411,33 +415,9 @@ int qc_handle_frms_of_lost_pkt(struct quic_conn *qc,
 		switch (frm->type) {
 		case QUIC_FT_STREAM_8 ... QUIC_FT_STREAM_F:
 		{
-			struct qf_stream *strm_frm = &frm->stream;
-			struct eb64_node *node = NULL;
-			struct qc_stream_desc *stream_desc;
-
-			node = eb64_lookup(&qc->streams_by_id, strm_frm->id);
-			if (!node) {
-				TRACE_DEVEL("released stream", QUIC_EV_CONN_PRSAFRM, qc, frm);
-				TRACE_DEVEL("freeing frame from packet", QUIC_EV_CONN_PRSAFRM,
-				            qc, frm, &pn);
+			if (qc_stream_frm_is_acked(qc, frm)) {
 				qc_frm_free(qc, &frm);
 				continue;
-			}
-
-			stream_desc = eb64_entry(node, struct qc_stream_desc, by_id);
-			/* Do not resend this frame if in the "already acked range" */
-			if (strm_frm->offset.key + strm_frm->len <= stream_desc->ack_offset) {
-				TRACE_DEVEL("ignored frame in already acked range",
-				            QUIC_EV_CONN_PRSAFRM, qc, frm);
-				qc_frm_free(qc, &frm);
-				continue;
-			}
-			else if (strm_frm->offset.key < stream_desc->ack_offset) {
-				uint64_t diff = stream_desc->ack_offset - strm_frm->offset.key;
-
-				qc_stream_frm_mv_fwd(frm, diff);
-				TRACE_DEVEL("updated partially acked frame",
-				            QUIC_EV_CONN_PRSAFRM, qc, frm);
 			}
 			break;
 		}
@@ -1144,7 +1124,7 @@ static void qc_rm_hp_pkts(struct quic_conn *qc, struct quic_enc_level *el)
 			quic_rx_packet_refinc(pqpkt);
 			TRACE_PROTO("RX hp removed", QUIC_EV_CONN_ELRMHP, qc, pqpkt);
 		}
-		LIST_DELETE(&pqpkt->list);
+		LIST_DEL_INIT(&pqpkt->list);
 		quic_rx_packet_refdec(pqpkt);
 	}
 
@@ -1605,18 +1585,29 @@ static struct quic_conn *quic_rx_pkt_retrieve_conn(struct quic_rx_packet *pkt,
 				if (!quic_retry_token_check(pkt, dgram, l, qc, &token_odcid))
 					goto err;
 			}
-			else if (!(l->bind_conf->options & BC_O_QUIC_FORCE_RETRY) &&
-			         HA_ATOMIC_LOAD(&prx_counters->half_open_conn) >= global.tune.quic_retry_threshold) {
-				TRACE_PROTO("Initial without token, sending retry",
-				            QUIC_EV_CONN_LPKT, NULL, NULL, NULL, pkt->version);
-				if (send_retry(l->rx.fd, &dgram->saddr, pkt, pkt->version)) {
-					TRACE_ERROR("Error during Retry generation",
-					            QUIC_EV_CONN_LPKT, NULL, NULL, NULL, pkt->version);
+
+			if (!quic_init_exec_rules(l, dgram)) {
+				TRACE_USER("drop datagram on quic-initial rules", QUIC_EV_CONN_LPKT, NULL, NULL, NULL, pkt->version);
+				goto err;
+			}
+
+			/* No need to emit Retry if connection is refused. */
+			if (!pkt->token_len && !(dgram->flags & QUIC_DGRAM_FL_REJECT)) {
+				if ((l->bind_conf->options & BC_O_QUIC_FORCE_RETRY) ||
+				    HA_ATOMIC_LOAD(&prx_counters->half_open_conn) >= global.tune.quic_retry_threshold ||
+				    (dgram->flags & QUIC_DGRAM_FL_SEND_RETRY)) {
+
+					TRACE_PROTO("Initial without token, sending retry",
+						    QUIC_EV_CONN_LPKT, NULL, NULL, NULL, pkt->version);
+					if (send_retry(l->rx.fd, &dgram->saddr, pkt, pkt->version)) {
+						TRACE_ERROR("Error during Retry generation",
+							    QUIC_EV_CONN_LPKT, NULL, NULL, NULL, pkt->version);
+						goto out;
+					}
+
+					HA_ATOMIC_INC(&prx_counters->retry_sent);
 					goto out;
 				}
-
-				HA_ATOMIC_INC(&prx_counters->retry_sent);
-				goto out;
 			}
 
 			/* RFC 9000 7.2. Negotiating Connection IDs:
@@ -1670,6 +1661,9 @@ static struct quic_conn *quic_rx_pkt_retrieve_conn(struct quic_rx_packet *pkt,
 				eb64_insert(qc->cids, &conn_id->seq_num);
 				/* Initialize the next CID sequence number to be used for this connection. */
 				qc->next_cid_seq_num = 1;
+
+				if (dgram->flags & QUIC_DGRAM_FL_REJECT)
+					quic_set_connection_close(qc, quic_err_transport(QC_ERR_CONNECTION_REFUSED));
 			}
 
 			if (*new_tid != -1)
@@ -1797,24 +1791,6 @@ static int quic_rx_pkt_parse(struct quic_rx_packet *pkt,
 				TRACE_PROTO("Packet dropped",
 				            QUIC_EV_CONN_LPKT, NULL, NULL, NULL, pkt->version);
 				goto drop;
-			}
-
-			/* TODO Retry should be automatically activated if
-			 * suspect network usage is detected.
-			 */
-			if (!token_len) {
-				if (l->bind_conf->options & BC_O_QUIC_FORCE_RETRY) {
-					TRACE_PROTO("Initial without token, sending retry",
-					            QUIC_EV_CONN_LPKT, NULL, NULL, NULL, pkt->version);
-					if (send_retry(l->rx.fd, &dgram->saddr, pkt, pkt->version)) {
-						TRACE_PROTO("Error during Retry generation",
-						            QUIC_EV_CONN_LPKT, NULL, NULL, NULL, pkt->version);
-						goto drop_silent;
-					}
-
-					HA_ATOMIC_INC(&prx_counters->retry_sent);
-					goto drop_silent;
-				}
 			}
 
 			pkt->token = pos;
@@ -2169,8 +2145,8 @@ int quic_dgram_parse(struct quic_dgram *dgram, struct quic_conn *from_qc,
 		               eb64_entry(eb64_first(qc->cids), struct quic_connection_id, seq_num))->tid != tid);
 
 		/* Ensure thread connection migration is finalized ASAP. */
-		if (qc->flags & QUIC_FL_CONN_AFFINITY_CHANGED)
-			qc_finalize_affinity_rebind(qc);
+		if (qc->flags & QUIC_FL_CONN_TID_REBIND)
+			qc_finalize_tid_rebind(qc);
 
 		if (qc_rx_check_closing(qc, pkt)) {
 			/* Skip the entire datagram. */

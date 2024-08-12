@@ -12,6 +12,7 @@
 
 #include <haproxy/api.h>
 #include <haproxy/applet.h>
+#include <haproxy/arg.h>
 #include <haproxy/connection.h>
 #include <haproxy/check.h>
 #include <haproxy/filters.h>
@@ -141,44 +142,43 @@ void sedesc_free(struct sedesc *sedesc)
  */
 void se_shutdown(struct sedesc *sedesc, enum se_shut_mode mode)
 {
+	struct sedesc *sdo;
+	struct se_abort_info *reason = NULL;
+	unsigned int flags = 0;
+
+	if ((mode & (SE_SHW_SILENT|SE_SHW_NORMAL)) && !se_fl_test(sedesc, SE_FL_SHW))
+		flags |= (mode & SE_SHW_NORMAL) ? SE_FL_SHWN : SE_FL_SHWS;
+	if ((mode & (SE_SHR_RESET|SE_SHR_DRAIN)) && !se_fl_test(sedesc, SE_FL_SHR))
+		flags |= (mode & SE_SHR_DRAIN) ? SE_FL_SHRD : SE_FL_SHRR;
+
 	if (se_fl_test(sedesc, SE_FL_T_MUX)) {
 		const struct mux_ops *mux = (sedesc->conn ? sedesc->conn->mux : NULL);
-		unsigned int flags = 0;
-
-		if ((mode & (SE_SHW_SILENT|SE_SHW_NORMAL)) && !se_fl_test(sedesc, SE_FL_SHW))
-			flags |= (mode & SE_SHW_NORMAL) ? SE_FL_SHWN : SE_FL_SHWS;
-
-
-		if ((mode & (SE_SHR_RESET|SE_SHR_DRAIN)) && !se_fl_test(sedesc, SE_FL_SHR))
-			flags |= (mode & SE_SHR_DRAIN) ? SE_FL_SHRD : SE_FL_SHRR;
 
 		if (flags) {
 			if (mux && mux->shut) {
-				struct se_abort_info *reason = NULL;
-				struct xref *peer = xref_get_peer_and_lock(&sedesc->xref);
-
-				if (peer) {
-					struct sedesc *sdo = container_of(peer, struct sedesc, xref);
-
+				sdo = se_opposite(sedesc);
+				if (sdo)
 					reason = &sdo->abort_info;
-					xref_unlock(&sedesc->xref, peer);
-				}
-
 				mux->shut(sedesc->sc, mode, reason);
-
 			}
 			se_fl_set(sedesc, flags);
 		}
 	}
 	else if (se_fl_test(sedesc, SE_FL_T_APPLET)) {
-		if ((mode & (SE_SHW_SILENT|SE_SHW_NORMAL)) && !se_fl_test(sedesc, SE_FL_SHW))
-			se_fl_set(sedesc, SE_FL_SHWN);
+		struct appctx *appctx = sedesc->se;
 
-		if ((mode & (SE_SHR_RESET|SE_SHR_DRAIN)) && !se_fl_test(sedesc, SE_FL_SHR))
-			se_fl_set(sedesc, SE_FL_SHRR);
+		if (flags) {
+			if (appctx->applet->shut) {
+				sdo = se_opposite(sedesc);
+				if (sdo)
+					reason = &sdo->abort_info;
+				appctx->applet->shut(appctx, mode, reason);
+			}
+			se_fl_set(sedesc, flags);
+		}
 
 		if (se_fl_test(sedesc, SE_FL_SHR) && se_fl_test(sedesc, SE_FL_SHW))
-			appctx_shut(sedesc->se);
+			appctx_shut(appctx);
 	}
 }
 
@@ -1590,6 +1590,8 @@ int sc_conn_send(struct stconn *sc)
 		if (sc->state < SC_ST_CON)
 			return 0;
 		BUG_ON(sc_ep_test(sc, SE_FL_EOS|SE_FL_ERROR|SE_FL_ERR_PENDING) == (SE_FL_EOS|SE_FL_ERR_PENDING));
+		if (sc_ep_test(sc, SE_FL_ERROR))
+			sc->flags |= SC_FL_ERROR;
 		return 1;
 	}
 
@@ -2363,6 +2365,45 @@ void sc_conn_commit_endp_upgrade(struct stconn *sc)
 	BUG_ON(!sc->sedesc);
 }
 
+/* Return a debug string exposing the internals of the front or back
+ * stream/connection when supported. It will be protocol-dependent and will
+ * change over time like the output of "show fd" or "show sess all".
+ */
+static int smp_fetch_debug_str(const struct arg *args, struct sample *smp, const char *kw, void *private)
+{
+	struct connection *conn;
+	struct stconn *sc;
+	union mux_sctl_dbg_str_ctx sctl_ctx = { };
+
+	if (!smp->strm)
+		return 0;
+
+	sc = (kw[0] == 'f' ? smp->strm->scf : smp->strm->scb);
+	conn = sc_conn(sc);
+
+	if (!conn)
+		return 0;
+
+	/* a missing mux is necessarily on the backend, and may arrive later */
+	if (!conn->mux) {
+		smp->flags |= SMP_F_MAY_CHANGE;
+		return 0;
+	}
+
+	/* Not implemented, return nothing */
+	if (!conn->mux->sctl)
+		return 0;
+
+	sctl_ctx.arg.debug_flags = args->data.sint ? args->data.sint : ~0U;
+	if (conn->mux->sctl(sc, MUX_SCTL_DBG_STR, &sctl_ctx) == -1)
+		return 0;
+
+	smp->data.type = SMP_T_STR;
+	smp->flags = SMP_F_VOL_TEST | SMP_F_MAY_CHANGE;
+	smp->data.u.str = sctl_ctx.ret.buf;
+	return 1;
+}
+
 /* return the frontend or backend mux stream ID.
  */
 static int
@@ -2458,10 +2499,12 @@ smp_fetch_strm_rst_code(const struct arg *args, struct sample *smp, const char *
  * common denominator, the type that can be casted into all other ones.
  */
 static struct sample_fetch_kw_list sample_fetch_keywords = {ILH, {
-	{ "bs.id", smp_fetch_sid, 0, NULL, SMP_T_SINT, SMP_USE_L6REQ },
+	{ "bs.debug_str", smp_fetch_debug_str, ARG1(0,SINT), NULL, SMP_T_STR, SMP_USE_L5SRV },
+	{ "bs.id", smp_fetch_sid, 0, NULL, SMP_T_SINT, SMP_USE_L5SRV },
 	{ "bs.aborted", smp_fetch_strm_aborted, 0, NULL, SMP_T_SINT, SMP_USE_L5SRV },
 	{ "bs.rst_code", smp_fetch_strm_rst_code, 0, NULL, SMP_T_SINT, SMP_USE_L5SRV },
-	{ "fs.id", smp_fetch_sid, 0, NULL, SMP_T_STR, SMP_USE_L6RES },
+	{ "fs.debug_str", smp_fetch_debug_str, ARG1(0,SINT), NULL, SMP_T_STR, SMP_USE_L5CLI },
+	{ "fs.id", smp_fetch_sid, 0, NULL, SMP_T_STR, SMP_USE_L5CLI },
 	{ "fs.aborted", smp_fetch_strm_aborted, 0, NULL, SMP_T_SINT, SMP_USE_L5CLI },
 	{ "fs.rst_code", smp_fetch_strm_rst_code, 0, NULL, SMP_T_SINT, SMP_USE_L5CLI },
 	{ /* END */ },

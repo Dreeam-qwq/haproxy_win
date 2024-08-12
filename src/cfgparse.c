@@ -1717,9 +1717,106 @@ static int cfg_parse_global_def_path(char **args, int section_type, struct proxy
 	return ret;
 }
 
+/* append a copy of string <filename>, ptr to some allocated memory at the at
+ * the end of the list <li>.
+ * On failure : return 0 and <err> filled with an error message.
+ * The caller is responsible for freeing the <err> and <filename> copy
+ * memory area using free().
+ */
+int list_append_cfgfile(struct list *li, const char *filename, char **err)
+{
+	struct cfgfile *entry = NULL;
+
+	entry = calloc(1, sizeof(*entry));
+	if (!entry) {
+		memprintf(err, "out of memory");
+		goto fail_entry;
+	}
+
+	entry->filename = strdup(filename);
+	if (!entry->filename) {
+		memprintf(err, "out of memory");
+		goto fail_entry_name;
+	}
+
+	LIST_APPEND(li, &entry->list);
+
+	return 1;
+
+fail_entry_name:
+	free(entry->filename);
+fail_entry:
+	free(entry);
+	return 0;
+}
+
+/* loads the content of the given file in memory. On success, returns the number
+ * of bytes successfully stored at *cfg_content until EOF. On error, emits
+ * alerts, performs needed clean-up routines and returns -1.
+ */
+ssize_t load_cfg_in_mem(char *filename, char **cfg_content)
+{
+	size_t bytes_to_read = LINESIZE;
+	size_t chunk_size = 0;
+	size_t read_bytes = 0;
+	struct stat file_stat;
+	char *new_area;
+	size_t ret = 0;
+	FILE *f;
+
+	/* let's try to obtain the size, if regular file */
+	if (stat(filename, &file_stat) != 0) {
+		ha_alert("stat() failed for configuration file %s : %s\n",
+			 filename, strerror(errno));
+		return -1;
+	}
+
+	if (file_stat.st_size > chunk_size)
+		bytes_to_read = file_stat.st_size;
+
+
+	if ((f = fopen(filename,"r")) == NULL) {
+		ha_alert("Could not open configuration file %s : %s\n",
+			 filename, strerror(errno));
+		return -1;
+	}
+
+	*cfg_content = NULL;
+
+	while (1) {
+		if (read_bytes + bytes_to_read > chunk_size) {
+			chunk_size = (read_bytes + bytes_to_read) * 2;
+			new_area  = realloc(*cfg_content, chunk_size);
+			if (new_area == NULL) {
+				ha_alert("Loading %s: file too long, cannot allocate memory.\n",
+					 filename);
+				goto free_mem;
+			}
+			*cfg_content = new_area;
+		}
+
+		bytes_to_read = chunk_size - read_bytes;
+		ret = fread(*cfg_content + read_bytes, sizeof(char), bytes_to_read, f);
+		read_bytes += ret;
+
+		if (!ret || feof(f) || ferror(f))
+			break;
+	}
+
+	fclose(f);
+
+	return read_bytes;
+
+free_mem:
+	ha_free(cfg_content);
+	fclose(f);
+
+	return -1;
+}
+
 /*
- * This function reads and parses the configuration file given in the argument.
- * Returns the error code, 0 if OK, -1 if the config file couldn't be opened,
+ * This function parses the configuration file given in the argument.
+ * Returns the error code, 0 if OK, -1 if we are run out of memory,
  * or any combination of :
  *  - ERR_ABORT: must abort ASAP
  *  - ERR_FATAL: we can continue parsing but not start the service
@@ -1728,11 +1825,10 @@ static int cfg_parse_global_def_path(char **args, int section_type, struct proxy
  * Only the two first ones can stop processing, the two others are just
  * indicators.
  */
-int readcfgfile(const char *file)
+int parse_cfg(const struct cfgfile *cfg)
 {
 	char *thisline = NULL;
 	int linesize = LINESIZE;
-	FILE *f = NULL;
 	int linenum = 0;
 	int err_code = 0;
 	struct cfg_section *cs = NULL, *pcs = NULL;
@@ -1746,17 +1842,14 @@ int readcfgfile(const char *file)
 	int nested_cond_lvl = 0;
 	enum nested_cond_state nested_conds[MAXNESTEDCONDS];
 	char *errmsg = NULL;
+	const char *cur_position = cfg->content;
+	char *file = cfg->filename;
 
 	global.cfg_curr_line = 0;
 	global.cfg_curr_file = file;
 
 	if ((thisline = malloc(sizeof(*thisline) * linesize)) == NULL) {
 		ha_alert("Out of memory trying to allocate a buffer for a configuration line.\n");
-		err_code = -1;
-		goto err;
-	}
-
-	if ((f = fopen(file,"r")) == NULL) {
 		err_code = -1;
 		goto err;
 	}
@@ -1770,7 +1863,8 @@ int readcfgfile(const char *file)
 	}
 
 next_line:
-	while (fgets(thisline + readbytes, linesize - readbytes, f) != NULL) {
+	while (fgets_from_mem(thisline + readbytes, linesize - readbytes,
+			      &cur_position, cfg->content + cfg->size)) {
 		int arg, kwm = KWM_STD;
 		char *end;
 		char *args[MAX_LINE_ARGS + 1];
@@ -2199,7 +2293,7 @@ next_line:
 		/* end of config dump */
 
 		/* empty line */
-		if (!**args)
+		if (!*args || !**args)
 			continue;
 
 		/* check for config macros */
@@ -2518,9 +2612,6 @@ err:
 	free(outline);
 	global.cfg_curr_line = 0;
 	global.cfg_curr_file = NULL;
-
-	if (f)
-		fclose(f);
 
 	return err_code;
 }
@@ -2975,6 +3066,11 @@ init_proxies_list_stage1:
 		case PR_MODE_SYSLOG:
 			/* this mode is initialized as the classic tcp proxy */
 			cfgerr += proxy_cfg_ensure_no_http(curproxy);
+			break;
+
+		case PR_MODE_SPOP:
+			cfgerr += proxy_cfg_ensure_no_http(curproxy);
+			cfgerr += proxy_cfg_ensure_no_log(curproxy);
 			break;
 
 		case PR_MODE_PEERS:
@@ -3913,6 +4009,8 @@ out_uri_auth_compat:
 
 			if ((curproxy->mode != PR_MODE_HTTP) && (curproxy->options & PR_O_REUSE_MASK) != PR_O_REUSE_NEVR)
 				curproxy->options &= ~PR_O_REUSE_MASK;
+			if (curproxy->mode == PR_MODE_SPOP)
+				curproxy->options |= PR_O_REUSE_ALWS;
 
 			if ((curproxy->mode != PR_MODE_HTTP) && newsrv->flags & SRV_F_RHTTP) {
 				ha_alert("%s '%s' : server %s uses reverse HTTP addressing which can only be used with HTTP mode.\n",

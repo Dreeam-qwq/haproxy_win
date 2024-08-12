@@ -16,6 +16,7 @@
 #include <string.h>
 
 #include <netinet/in.h>
+#include <netinet/udp.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 
@@ -28,6 +29,7 @@
 #include <haproxy/list.h>
 #include <haproxy/listener.h>
 #include <haproxy/log.h>
+#include <haproxy/obj_type.h>
 #include <haproxy/pool.h>
 #include <haproxy/protocol-t.h>
 #include <haproxy/proto_quic.h>
@@ -284,6 +286,7 @@ static int quic_lstnr_dgram_dispatch(unsigned char *pos, size_t len, void *owner
 	}
 
 	/* All the members must be initialized! */
+	dgram->obj_type = OBJ_TYPE_DGRAM;
 	dgram->owner = owner;
 	dgram->buf = pos;
 	dgram->len = len;
@@ -292,6 +295,7 @@ static int quic_lstnr_dgram_dispatch(unsigned char *pos, size_t len, void *owner
 	dgram->saddr = *saddr;
 	dgram->daddr = *daddr;
 	dgram->qc = NULL;
+	dgram->flags = 0;
 
 	/* Attached datagram to its quic_receiver_buf and quic_dghdlrs. */
 	LIST_APPEND(dgrams, &dgram->recv_list);
@@ -652,8 +656,33 @@ static void cmsg_set_saddr(struct msghdr *msg, struct cmsghdr **cmsg,
 	}
 }
 
-/* Send a datagram stored into <buf> buffer with <sz> as size.
- * The caller must ensure there is at least <sz> bytes in this buffer.
+static void cmsg_set_gso(struct msghdr *msg, struct cmsghdr **cmsg,
+                         uint16_t gso_size)
+{
+#ifdef UDP_SEGMENT
+	struct cmsghdr *c;
+	size_t sz = sizeof(gso_size);
+
+	/* Set first msg_controllen to be able to use CMSG_* macros. */
+	msg->msg_controllen += CMSG_SPACE(sz);
+
+	*cmsg = !(*cmsg) ? CMSG_FIRSTHDR(msg) : CMSG_NXTHDR(msg, *cmsg);
+	ALREADY_CHECKED(*cmsg);
+	c = *cmsg;
+	c->cmsg_len = CMSG_LEN(sz);
+
+	c->cmsg_level = SOL_UDP;
+	c->cmsg_type = UDP_SEGMENT;
+	c->cmsg_len = CMSG_LEN(sz);
+	*((uint16_t *)CMSG_DATA(c)) = gso_size;
+#endif
+}
+
+/* Send a datagram stored into <buf> buffer with <sz> as size. The caller must
+ * ensure there is at least <sz> bytes in this buffer.
+ *
+ * If <gso_size> is non null, it will be used as value for UDP_SEGMENT option.
+ * This allows to transmit multiple datagrams in a single syscall.
  *
  * Returns the total bytes sent over the socket. 0 is returned if a transient
  * error is encountered which allows send to be retry later. A negative value
@@ -664,7 +693,7 @@ static void cmsg_set_saddr(struct msghdr *msg, struct cmsghdr **cmsg,
  * done by removing the <qc> arg and replace it with address/port.
  */
 int qc_snd_buf(struct quic_conn *qc, const struct buffer *buf, size_t sz,
-               int flags)
+               int flags, uint16_t gso_size)
 {
 	ssize_t ret;
 	struct msghdr msg;
@@ -673,14 +702,24 @@ int qc_snd_buf(struct quic_conn *qc, const struct buffer *buf, size_t sz,
 
 	union {
 #ifdef IP_PKTINFO
-		char buf[CMSG_SPACE(sizeof(struct in_pktinfo))];
+		char buf[CMSG_SPACE(sizeof(struct in_pktinfo)) + CMSG_SPACE(sizeof(gso_size))];
 #endif /* IP_PKTINFO */
 #ifdef IPV6_RECVPKTINFO
-		char buf6[CMSG_SPACE(sizeof(struct in6_pktinfo))];
+		char buf6[CMSG_SPACE(sizeof(struct in6_pktinfo)) + CMSG_SPACE(sizeof(gso_size))];
 #endif /* IPV6_RECVPKTINFO */
-		char bufaddr[CMSG_SPACE(sizeof(struct in_addr))];
+		char bufaddr[CMSG_SPACE(sizeof(struct in_addr)) + CMSG_SPACE(sizeof(gso_size))];
 		struct cmsghdr align;
 	} ancillary_data;
+
+	/* man 3 cmsg
+	 *
+	 * When initializing a buffer that will contain a
+	 * series of cmsghdr structures (e.g., to be sent with
+	 * sendmsg(2)), that buffer should first be
+	 * zero-initialized to ensure the correct operation of
+	 * CMSG_NXTHDR().
+	 */
+	memset(&ancillary_data, 0, sizeof(ancillary_data));
 
 	vec.iov_base = b_peek(buf, b_head_ofs(buf));
 	vec.iov_len = sz;
@@ -717,6 +756,16 @@ int qc_snd_buf(struct quic_conn *qc, const struct buffer *buf, size_t sz,
 		cmsg_set_saddr(&msg, &cmsg, &qc->local_addr);
 	}
 
+	/* Set GSO parameter if datagram size is bigger than MTU. */
+	if (gso_size) {
+		/* GSO size must be less than total data to sent for multiple datagrams. */
+		BUG_ON_HOT(b_data(buf) <= gso_size);
+
+		if (!msg.msg_control)
+			msg.msg_control = ancillary_data.bufaddr;
+		cmsg_set_gso(&msg, &cmsg, gso_size);
+	}
+
 	do {
 		ret = sendmsg(qc_fd(qc), &msg, MSG_DONTWAIT|MSG_NOSIGNAL);
 	} while (ret < 0 && errno == EINTR);
@@ -743,7 +792,7 @@ int qc_snd_buf(struct quic_conn *qc, const struct buffer *buf, size_t sz,
 			qc->cntrs.sendto_err_unknown++;
 			TRACE_PRINTF(TRACE_LEVEL_USER, QUIC_EV_CONN_SPPKTS, qc, 0, 0, 0,
 			             "UDP send failure errno=%d (%s)", errno, strerror(errno));
-			return -1;
+			return -errno;
 		}
 	}
 
@@ -803,6 +852,7 @@ int qc_rcv_buf(struct quic_conn *qc)
 
 		b_add(&buf, ret);
 
+		new_dgram->obj_type = OBJ_TYPE_DGRAM;
 		new_dgram->buf = dgram_buf;
 		new_dgram->len = ret;
 		new_dgram->dcid_len = 0;
@@ -810,6 +860,7 @@ int qc_rcv_buf(struct quic_conn *qc)
 		new_dgram->saddr = saddr;
 		new_dgram->daddr = daddr;
 		new_dgram->qc = NULL;  /* set later via quic_dgram_parse() */
+		new_dgram->flags = 0;
 
 		TRACE_DEVEL("read datagram", QUIC_EV_CONN_RCV, qc, new_dgram);
 

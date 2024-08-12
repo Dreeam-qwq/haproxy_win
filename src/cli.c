@@ -2918,36 +2918,41 @@ int pcli_parse_request(struct stream *s, struct channel *req, char **errmsg, int
 
 		/* the mcli-debug-mode is only sent to the applet of the master */
 		if ((s->pcli_flags & ACCESS_MCLI_DEBUG) && *next_pid <= 0) {
-			ci_insert_line2(req, 0, "mcli-debug-mode on -", strlen("mcli-debug-mode on -"));
-			ret += strlen("mcli-debug-mode on -") + 2;
+			const char *cmd = "mcli-debug-mode on -;";
+			ci_insert(req, 0, cmd, strlen(cmd));
+			ret += strlen(cmd);
 		}
 		if (s->pcli_flags & ACCESS_EXPERIMENTAL) {
-			ci_insert_line2(req, 0, "experimental-mode on -", strlen("experimental-mode on -"));
-			ret += strlen("experimental-mode on -") + 2;
+			const char *cmd = "experimental-mode on -;";
+			ci_insert(req, 0, cmd, strlen(cmd));
+			ret += strlen(cmd);
 		}
 		if (s->pcli_flags & ACCESS_EXPERT) {
-			ci_insert_line2(req, 0, "expert-mode on -", strlen("expert-mode on -"));
-			ret += strlen("expert-mode on -") + 2;
+			const char *cmd = "expert-mode on -;";
+			ci_insert(req, 0, cmd, strlen(cmd));
+			ret += strlen(cmd);
 		}
 		if (s->pcli_flags & ACCESS_MCLI_SEVERITY_STR) {
-			const char *cmd = "set severity-output string -";
-			ci_insert_line2(req, 0, cmd, strlen(cmd));
-			ret += strlen(cmd) + 2;
+			const char *cmd = "set severity-output string -;";
+			ci_insert(req, 0, cmd, strlen(cmd));
+			ret += strlen(cmd);
 		}
 		if (s->pcli_flags & ACCESS_MCLI_SEVERITY_NB) {
-			const char *cmd = "set severity-output number -";
-			ci_insert_line2(req, 0, cmd, strlen(cmd));
-			ret += strlen(cmd) + 2;
+			const char *cmd = "set severity-output number -;";
+			ci_insert(req, 0, cmd, strlen(cmd));
+			ret += strlen(cmd);
 		}
 
 		if (pcli_has_level(s, ACCESS_LVL_ADMIN)) {
 			goto end;
 		} else if (pcli_has_level(s, ACCESS_LVL_OPER)) {
-			ci_insert_line2(req, 0, "operator -", strlen("operator -"));
-			ret += strlen("operator -") + 2;
+			const char *cmd = "operator -;";
+			ci_insert(req, 0, cmd, strlen(cmd));
+			ret += strlen(cmd);
 		} else if (pcli_has_level(s, ACCESS_LVL_USER)) {
-			ci_insert_line2(req, 0, "user -", strlen("user -"));
-			ret += strlen("user -") + 2;
+			const char *cmd = "user -;";
+			ci_insert(req, 0, cmd, strlen(cmd));
+			ret += strlen(cmd);
 		}
 	}
 end:
@@ -3219,7 +3224,7 @@ int pcli_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 		s->target = NULL;
 		/* re-init store persistence */
 		s->store_count = 0;
-		s->uniq_id = global.req_count++;
+		s->uniq_id = _HA_ATOMIC_FETCH_ADD(&global.req_count, 1);
 
 		s->scf->flags &= ~(SC_FL_EOS|SC_FL_ERROR|SC_FL_ABRT_DONE|SC_FL_ABRT_WANTED);
 		s->scf->flags &= ~SC_FL_SND_NEVERWAIT;

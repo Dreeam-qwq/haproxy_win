@@ -580,6 +580,7 @@ int ssl_sock_load_pem_into_ckch(const char *path, char *buf, struct ckch_data *d
 	EVP_PKEY *key = NULL;
 	HASSL_DH *dh = NULL;
 	STACK_OF(X509) *chain = NULL;
+	struct issuer_chain *issuer_chain = NULL;
 
 	if (buf) {
 		/* reading from a buffer */
@@ -647,6 +648,13 @@ int ssl_sock_load_pem_into_ckch(const char *path, char *buf, struct ckch_data *d
 		}
 	}
 
+	/* If we couldn't find a chain, we should try to look for a corresponding chain in 'issuers-chain-path' */
+	if (chain == NULL) {
+		issuer_chain = ssl_get0_issuer_chain(cert);
+		if (issuer_chain)
+			chain = X509_chain_up_ref(issuer_chain->chain);
+	}
+
 	ret = ERR_get_error();
 	if (ret && !(ERR_GET_LIB(ret) == ERR_LIB_PEM && ERR_GET_REASON(ret) == PEM_R_NO_START_LINE)) {
 		memprintf(err, "%sunable to load certificate chain from file '%s': %s\n",
@@ -675,6 +683,7 @@ int ssl_sock_load_pem_into_ckch(const char *path, char *buf, struct ckch_data *d
 	SWAP(data->dh, dh);
 	SWAP(data->cert, cert);
 	SWAP(data->chain, chain);
+	SWAP(data->extra_chain, issuer_chain);
 
 	ret = 0;
 
@@ -1733,7 +1742,7 @@ void ckch_inst_add_cafile_link(struct ckch_inst *ckch_inst, struct bind_conf *bi
 
 
 
-static int show_cert_detail(X509 *cert, STACK_OF(X509) *chain, struct buffer *out)
+static int show_cert_detail(X509 *cert, STACK_OF(X509) *chain, struct issuer_chain *extra_chain, struct buffer *out)
 {
 	BIO *bio = NULL;
 	struct buffer *tmp = alloc_trash_chunk();
@@ -1748,15 +1757,11 @@ static int show_cert_detail(X509 *cert, STACK_OF(X509) *chain, struct buffer *ou
 	if (!cert)
 		goto end;
 
-	if (chain == NULL) {
-		struct issuer_chain *issuer;
-		issuer = ssl_get0_issuer_chain(cert);
-		if (issuer) {
-			chain = issuer->chain;
-			chunk_appendf(out, "Chain Filename: ");
-			chunk_appendf(out, "%s\n", issuer->path);
-		}
+	if (extra_chain) {
+		chunk_appendf(out, "Chain Filename: ");
+		chunk_appendf(out, "%s\n", extra_chain->path);
 	}
+
 	chunk_appendf(out, "Serial: ");
 	if (ssl_sock_get_serial(cert, tmp) == -1)
 		goto end;
@@ -1906,7 +1911,7 @@ static int cli_io_handler_show_cert_detail(struct appctx *appctx)
 	else
 		chunk_appendf(out, "Used\n");
 
-	retval = show_cert_detail(ckchs->data->cert, ckchs->data->chain, out);
+	retval = show_cert_detail(ckchs->data->cert, ckchs->data->chain, ckchs->data->extra_chain, out);
 	if (retval < 0)
 		goto end_no_putchk;
 	else if (retval)
@@ -3158,7 +3163,7 @@ static int cli_io_handler_show_cafile_detail(struct appctx *appctx)
 
 		/* file starts at line 1 */
 		chunk_appendf(out, " \nCertificate #%d:\n", i+1);
-		retval = show_cert_detail(cert, NULL, out);
+		retval = show_cert_detail(cert, NULL, NULL, out);
 		if (retval < 0)
 			goto end_no_putchk;
 		else if (retval)

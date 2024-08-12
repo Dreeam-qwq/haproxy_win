@@ -1034,8 +1034,6 @@ static inline unsigned long long rdtsc()
  * The caller is responsible for freeing the <err> and <str> copy
  * memory area using free()
  */
-struct list;
-int list_append_word(struct list *li, const char *str, char **err);
 
 int dump_text(struct buffer *out, const char *buf, int bsize);
 int dump_binary(struct buffer *out, const char *buf, int bsize);
@@ -1192,7 +1190,7 @@ static inline void update_char_fingerprint(uint8_t *fp, char prev, char curr)
 	switch (prev) {
 	case 0:         from = 28; break; // begin
 	case 'a'...'z': from = prev - 'a' + 1; break;
-	case 'A'...'Z': from = tolower(prev) - 'a' + 1; break;
+	case 'A'...'Z': from = tolower((unsigned char)prev) - 'a' + 1; break;
 	case '0'...'9': from = 27; break;
 	default:        from = 28; break;
 	}
@@ -1200,7 +1198,7 @@ static inline void update_char_fingerprint(uint8_t *fp, char prev, char curr)
 	switch (curr) {
 	case 0:         to = 28; break; // end
 	case 'a'...'z': to = curr - 'a' + 1; break;
-	case 'A'...'Z': to = tolower(curr) - 'a' + 1; break;
+	case 'A'...'Z': to = tolower((unsigned char)curr) - 'a' + 1; break;
 	case '0'...'9': to = 27; break;
 	default:        to = 28; break;
 	}
@@ -1218,5 +1216,8 @@ int openssl_compare_current_name(const char *name);
 /* vma helpers */
 void vma_set_name(void *addr, size_t size, const char *type, const char *name);
 void vma_set_name_id(void *addr, size_t size, const char *type, const char *name, unsigned int id);
+
+/* cfgparse helpers */
+char *fgets_from_mem(char* buf, int size, const char **position, const char *end);
 
 #endif /* _HAPROXY_TOOLS_H */

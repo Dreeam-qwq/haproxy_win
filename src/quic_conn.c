@@ -654,7 +654,7 @@ static struct task *quic_conn_closed_io_cb(struct task *t, void *context, unsign
 
 	buf = b_make(cc_qc->cc_buf_area + headlen,
 	             QUIC_MAX_CC_BUFSIZE - headlen, 0, cc_qc->cc_dgram_len);
-	if (qc_snd_buf(qc, &buf, buf.data, 0) < 0) {
+	if (qc_snd_buf(qc, &buf, buf.data, 0, 0) < 0) {
 		TRACE_ERROR("sendto fatal error", QUIC_EV_CONN_IO_CB, qc);
 		quic_release_cc_conn(cc_qc);
 		cc_qc = NULL;
@@ -755,6 +755,7 @@ struct task *quic_conn_io_cb(struct task *t, void *context, unsigned int state)
 	st = qc->state;
 	TRACE_PROTO("connection state", QUIC_EV_CONN_IO_CB, qc, &st);
 
+	/* TASK_HEAVY is set when received CRYPTO data have to be handled. */
 	if (HA_ATOMIC_LOAD(&tl->state) & TASK_HEAVY) {
 		qc_ssl_provide_all_quic_data(qc, qc->xprt_ctx);
 		HA_ATOMIC_AND(&tl->state, ~TASK_HEAVY);
@@ -774,6 +775,16 @@ struct task *quic_conn_io_cb(struct task *t, void *context, unsigned int state)
 	if (!qc_treat_rx_pkts(qc))
 		goto out;
 
+	/* TASK_HEAVY is set when received CRYPTO data have to be handled. These data
+	 * must be acknowledged asap and replied to with others CRYPTO data. In this
+	 * case, it is more optimal to delay the ACK to send it with the CRYPTO data
+	 * from the same datagram.
+	 */
+	if (HA_ATOMIC_LOAD(&tl->state) & TASK_HEAVY) {
+		tasklet_wakeup(tl);
+		goto out;
+	}
+
 	if (qc->flags & QUIC_FL_CONN_TO_KILL) {
 		TRACE_DEVEL("connection to be killed", QUIC_EV_CONN_PHPKTS, qc);
 		goto out;
@@ -792,6 +803,33 @@ struct task *quic_conn_io_cb(struct task *t, void *context, unsigned int state)
 			qc_set_timer(qc);
 			qc_el_rx_pkts_del(qc->hel);
 			qc_release_pktns_frms(qc, qc->hel->pktns);
+		}
+
+		/* Release 0RTT packets still waiting for HP removal. These
+		 * packets are considered unneeded after handshake completion.
+		 * They will be freed later from Rx buf via quic_rx_pkts_del().
+		 */
+		if (qc->eel && !LIST_ISEMPTY(&qc->eel->rx.pqpkts)) {
+			struct quic_rx_packet *pqpkt, *pkttmp;
+			list_for_each_entry_safe(pqpkt, pkttmp, &qc->eel->rx.pqpkts, list) {
+				LIST_DEL_INIT(&pqpkt->list);
+				quic_rx_packet_refdec(pqpkt);
+			}
+
+			/* RFC 9001 4.9.3. Discarding 0-RTT Keys
+			 * Additionally, a server MAY discard 0-RTT keys as soon as it receives
+			 * a 1-RTT packet. However, due to packet reordering, a 0-RTT packet
+			 * could arrive after a 1-RTT packet. Servers MAY temporarily retain 0-
+			 * RTT keys to allow decrypting reordered packets without requiring
+			 * their contents to be retransmitted with 1-RTT keys. After receiving a
+			 * 1-RTT packet, servers MUST discard 0-RTT keys within a short time;
+			 * the RECOMMENDED time period is three times the Probe Timeout (PTO,
+			 * see [QUIC-RECOVERY]). A server MAY discard 0-RTT keys earlier if it
+			 * determines that it has received all 0-RTT packets, which can be done
+			 * by keeping track of missing packet numbers.
+			 *
+			 * TODO implement discarding of 0-RTT keys
+			 */
 		}
 	}
 
@@ -1315,7 +1353,7 @@ void quic_conn_release(struct quic_conn *qc)
 		goto leave;
 
 	/* Must not delete a quic_conn if thread affinity rebind in progress. */
-	BUG_ON(qc->flags & QUIC_FL_CONN_AFFINITY_CHANGED);
+	BUG_ON(qc->flags & QUIC_FL_CONN_TID_REBIND);
 
 	/* We must not free the quic-conn if the MUX is still allocated. */
 	BUG_ON(qc->mux_state == QC_MUX_READY);
@@ -1363,7 +1401,7 @@ void quic_conn_release(struct quic_conn *qc)
 		/* all streams attached to the quic-conn are released, so
 		 * qc_stream_desc_free will liberate the stream instance.
 		 */
-		BUG_ON(!stream->release);
+		BUG_ON(!(stream->flags & QC_SD_FL_RELEASE));
 		qc_stream_desc_free(stream, 1);
 	}
 
@@ -1728,12 +1766,12 @@ void qc_notify_err(struct quic_conn *qc)
  *
  * Returns 0 on success else non-zero.
  */
-int qc_set_tid_affinity1(struct quic_conn *qc, uint new_tid)
+int qc_bind_tid_prep(struct quic_conn *qc, uint new_tid)
 {
 	struct task *t1 = NULL, *t2 = NULL;
 	struct tasklet *t3 = NULL;
 
-	TRACE_ENTER(QUIC_EV_CONN_SET_AFFINITY, qc);
+	TRACE_ENTER(QUIC_EV_CONN_BIND_TID, qc);
 
 	/* Pre-allocate all required resources. This ensures we do not left a
 	 * connection with only some of its field rebinded.
@@ -1771,13 +1809,13 @@ int qc_set_tid_affinity1(struct quic_conn *qc, uint new_tid)
 	qc->wait_event.events = 0;
 
 	/* Remove conn from per-thread list instance. It will be hidden from
-	 * "show quic" until qc_finalize_affinity_rebind().
+	 * "show quic" until qc_finalize_tid_rebind().
 	 */
 	qc_detach_th_ctx_list(qc, 0);
 
-	qc->flags |= QUIC_FL_CONN_AFFINITY_CHANGED;
+	qc->flags |= QUIC_FL_CONN_TID_REBIND;
 
-	TRACE_LEAVE(QUIC_EV_CONN_SET_AFFINITY, qc);
+	TRACE_LEAVE(QUIC_EV_CONN_BIND_TID, qc);
 	return 0;
 
  err:
@@ -1785,27 +1823,27 @@ int qc_set_tid_affinity1(struct quic_conn *qc, uint new_tid)
 	task_destroy(t2);
 	tasklet_free(t3);
 
-	TRACE_DEVEL("leaving on error", QUIC_EV_CONN_SET_AFFINITY, qc);
+	TRACE_DEVEL("leaving on error", QUIC_EV_CONN_BIND_TID, qc);
 	return 1;
 }
 
-/* Complete <qc> rebiding to an already selected new thread and associate it
+/* Complete <qc> rebinding to an already selected new thread and associate it
  * to <new_li> if necessary as required when migrating to a new thread group.
  *
  * After this function, <qc> instance must only be accessed via its newly
- * associated thread. qc_finalize_affinity_rebind() must be called to
+ * associated thread. qc_finalize_tid_rebind() must be called to
  * reactivate quic_conn elements.
  */
-void qc_set_tid_affinity2(struct quic_conn *qc, struct listener *new_li)
+void qc_bind_tid_commit(struct quic_conn *qc, struct listener *new_li)
 {
 	const uint new_tid = qc->wait_event.tasklet->tid;
 	struct quic_connection_id *conn_id;
 	struct eb64_node *node;
 
-	TRACE_ENTER(QUIC_EV_CONN_SET_AFFINITY, qc);
+	TRACE_ENTER(QUIC_EV_CONN_BIND_TID, qc);
 
-	/* Must only be called after qc_set_tid_affinity1(). */
-	BUG_ON(!(qc->flags & QUIC_FL_CONN_AFFINITY_CHANGED));
+	/* Must only be called after qc_bind_tid_prep(). */
+	BUG_ON(!(qc->flags & QUIC_FL_CONN_TID_REBIND));
 
 	/* At this point no connection was accounted for yet on this
 	 * listener so it's OK to just swap the pointer.
@@ -1836,39 +1874,38 @@ void qc_set_tid_affinity2(struct quic_conn *qc, struct listener *new_li)
 	HA_ATOMIC_STORE(&conn_id->tid, new_tid);
 	qc = NULL;
 
-	TRACE_LEAVE(QUIC_EV_CONN_SET_AFFINITY, NULL);
+	TRACE_LEAVE(QUIC_EV_CONN_BIND_TID, NULL);
 }
 
 /* Interrupt <qc> thread migration and stick to the current tid.
- * qc_finalize_affinity_rebind() must be called to reactivate quic_conn
- * elements.
+ * qc_finalize_tid_rebind() must be called to reactivate quic_conn elements.
  */
-void qc_reset_tid_affinity(struct quic_conn *qc)
+void qc_bind_tid_reset(struct quic_conn *qc)
 {
-	TRACE_ENTER(QUIC_EV_CONN_SET_AFFINITY, qc);
+	TRACE_ENTER(QUIC_EV_CONN_BIND_TID, qc);
 
-	/* Must only be called after qc_set_tid_affinity1(). */
-	BUG_ON(!(qc->flags & QUIC_FL_CONN_AFFINITY_CHANGED));
+	/* Must only be called after qc_bind_tid_prep(). */
+	BUG_ON(!(qc->flags & QUIC_FL_CONN_TID_REBIND));
 
 	/* Reset tasks affinity to the current thread. quic_conn will remain
-	 * inactive until qc_finalize_affinity_rebind().
+	 * inactive until qc_finalize_tid_rebind().
 	 */
 	task_set_thread(qc->idle_timer_task, tid);
 	if (qc->timer_task)
 		task_set_thread(qc->timer_task, tid);
 	tasklet_set_tid(qc->wait_event.tasklet, tid);
 
-	TRACE_LEAVE(QUIC_EV_CONN_SET_AFFINITY, qc);
+	TRACE_LEAVE(QUIC_EV_CONN_BIND_TID, qc);
 }
 
-/* Must be called after qc_set_tid_affinity() on the new thread. */
-void qc_finalize_affinity_rebind(struct quic_conn *qc)
+/* Must be called after TID rebind commit or reset on the new thread. */
+void qc_finalize_tid_rebind(struct quic_conn *qc)
 {
-	TRACE_ENTER(QUIC_EV_CONN_SET_AFFINITY, qc);
+	TRACE_ENTER(QUIC_EV_CONN_BIND_TID, qc);
 
 	/* This function must not be called twice after an affinity rebind. */
-	BUG_ON(!(qc->flags & QUIC_FL_CONN_AFFINITY_CHANGED));
-	qc->flags &= ~QUIC_FL_CONN_AFFINITY_CHANGED;
+	BUG_ON(!(qc->flags & QUIC_FL_CONN_TID_REBIND));
+	qc->flags &= ~QUIC_FL_CONN_TID_REBIND;
 
 	/* If quic_conn is closing it is unnecessary to migrate it as it will
 	 * be soon released. Besides, special care must be taken for CLOSING
@@ -1897,7 +1934,7 @@ void qc_finalize_affinity_rebind(struct quic_conn *qc)
 		qc->flags &= ~QUIC_FL_CONN_IO_TO_REQUEUE;
 	}
 
-	TRACE_LEAVE(QUIC_EV_CONN_SET_AFFINITY, qc);
+	TRACE_LEAVE(QUIC_EV_CONN_BIND_TID, qc);
 }
 
 /*

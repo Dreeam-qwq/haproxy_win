@@ -135,6 +135,9 @@ static void h2_trace(enum trace_level level, uint64_t mask, \
                      const struct ist where, const struct ist func,
                      const void *a1, const void *a2, const void *a3, const void *a4);
 
+static void h2_trace_fill_ctx(struct trace_ctx *ctx, const struct trace_source *src,
+                              const void *a1, const void *a2, const void *a3, const void *a4);
+
 /* The event representation is split like this :
  *   strm  - application layer
  *   h2s   - internal H2 stream
@@ -276,6 +279,7 @@ static struct trace_source trace_h2 __read_mostly = {
 	.desc = "HTTP/2 multiplexer",
 	.arg_def = TRC_ARG1_CONN,  // TRACE()'s first argument is always a connection
 	.default_cb = h2_trace,
+	.fill_ctx = h2_trace_fill_ctx,
 	.known_events = h2_trace_events,
 	.lockon_args = h2_trace_lockon_args,
 	.decoding = h2_trace_decoding,
@@ -521,6 +525,8 @@ struct task *h2_deferred_shut(struct task *t, void *ctx, unsigned int state);
 static struct h2s *h2c_bck_stream_new(struct h2c *h2c, struct stconn *sc, struct session *sess);
 static void h2s_alert(struct h2s *h2s);
 static inline void h2_remove_from_list(struct h2s *h2s);
+static int h2_dump_h2c_info(struct buffer *msg, struct h2c *h2c, const char *pfx);
+static int h2_dump_h2s_info(struct buffer *msg, const struct h2s *h2s, const char *pfx);
 
 /* returns the stconn associated to the H2 stream */
 static forceinline struct stconn *h2s_sc(const struct h2s *h2s)
@@ -606,6 +612,33 @@ static void h2_trace(enum trace_level level, uint64_t mask, const struct trace_s
 				      HTX_SL_P1_LEN(sl), HTX_SL_P1_PTR(sl),
 				      HTX_SL_P2_LEN(sl), HTX_SL_P2_PTR(sl),
 				      HTX_SL_P3_LEN(sl), HTX_SL_P3_PTR(sl));
+	}
+}
+
+/* This fills the trace_ctx with extra info guessed from the args */
+static void h2_trace_fill_ctx(struct trace_ctx *ctx, const struct trace_source *src,
+                              const void *a1, const void *a2, const void *a3, const void *a4)
+{
+	const struct connection *conn = a1;
+	const struct h2c *h2c = conn ? conn->ctx : NULL;
+	const struct h2s *h2s    = a2;
+
+	if (!ctx->conn)
+		ctx->conn = conn;
+
+	if (h2c) {
+		if (!ctx->fe && !(h2c->flags & H2_CF_IS_BACK))
+			ctx->fe = h2c->proxy;
+
+		if (!ctx->be && (h2c->flags & H2_CF_IS_BACK))
+			ctx->be = h2c->proxy;
+	}
+
+	if (h2s) {
+		if (!ctx->sess)
+			ctx->sess = h2s->sess;
+		if (!ctx->strm && h2s->sd && h2s_sc(h2s))
+			ctx->strm = sc_strm(h2s_sc(h2s));
 	}
 }
 
@@ -1523,6 +1556,7 @@ static inline void h2s_close(struct h2s *h2s)
 {
 	if (h2s->st != H2_SS_CLOSED) {
 		TRACE_ENTER(H2_EV_H2S_END, h2s->h2c->conn, h2s);
+		TRACE_STATE("releasing H2 stream", H2_EV_H2S_NEW, h2s->h2c->conn, h2s);
 		h2s->h2c->nb_streams--;
 		if (!h2s->id)
 			h2s->h2c->nb_reserved--;
@@ -1619,6 +1653,7 @@ static struct h2s *h2s_new(struct h2c *h2c, int id)
 	h2s->shut_tl->context = h2s;
 	LIST_INIT(&h2s->list);
 	h2s->h2c       = h2c;
+	h2s->sess      = NULL;
 	h2s->sd        = NULL;
 	h2s->sws       = 0;
 	h2s->flags     = H2_SF_NONE;
@@ -1723,6 +1758,8 @@ static struct h2s *h2c_frt_stream_new(struct h2c *h2c, int id, struct buffer *in
 	/* OK done, the stream lives its own life now */
 	if (h2_frt_has_too_many_sc(h2c))
 		h2c->flags |= H2_CF_DEM_TOOMANY;
+
+	TRACE_STATE("created new H2 front stream", H2_EV_H2S_NEW, h2c->conn, h2s);
 	TRACE_LEAVE(H2_EV_H2S_NEW, h2c->conn);
 	return h2s;
 
@@ -1780,6 +1817,7 @@ static struct h2s *h2c_bck_stream_new(struct h2c *h2c, struct stconn *sc, struct
 		se_fl_set(h2s->sd, SE_FL_MAY_FASTFWD_CONS);
 	/* on the backend we can afford to only count total streams upon success */
 	h2c->stream_cnt++;
+	TRACE_STATE("created new H2 back stream", H2_EV_H2S_NEW, h2c->conn, h2s);
 
  out:
 	if (likely(h2s))
@@ -2274,6 +2312,7 @@ static void h2s_wake_one_stream(struct h2s *h2s)
 	    (h2s->h2c->st0 >= H2_CS_ERROR || (h2s->h2c->flags & H2_CF_ERROR) ||
 	     (h2s->h2c->last_sid > 0 && (!h2s->id || h2s->id > h2s->h2c->last_sid)))) {
 		se_fl_set_error(h2s->sd);
+		h2s_propagate_term_flags(h2c, h2s);
 
 		if (h2s->st < H2_SS_ERROR)
 			h2s->st = H2_SS_ERROR;
@@ -4156,7 +4195,8 @@ static int h2_recv(struct h2c *h2c)
 		TRACE_DATA("received read0", H2_EV_H2C_RECV, h2c->conn);
 		h2c->flags |= H2_CF_RCVD_SHUT;
 	}
-	if (h2c->conn->flags & CO_FL_ERROR && !b_data(&h2c->dbuf)) {
+	if (h2c->conn->flags & CO_FL_ERROR &&
+	    (!b_data(&h2c->dbuf) || (h2c->flags & H2_CF_DEM_SHORT_READ))) {
 		TRACE_DATA("connection error", H2_EV_H2C_RECV, h2c->conn);
 		h2c->flags |= H2_CF_ERROR;
 	}
@@ -4741,11 +4781,29 @@ static int h2_sctl(struct stconn *sc, enum mux_sctl_type mux_sctl, void *output)
 {
 	int ret = 0;
 	struct h2s *h2s = __sc_mux_strm(sc);
+	union mux_sctl_dbg_str_ctx *dbg_ctx;
+	struct buffer *buf;
 
 	switch (mux_sctl) {
 	case MUX_SCTL_SID:
 		if (output)
 			*((int64_t *)output) = h2s->id;
+		return ret;
+	case MUX_SCTL_DBG_STR:
+		dbg_ctx = output;
+		buf = get_trash_chunk();
+
+		if (dbg_ctx->arg.debug_flags & MUX_SCTL_DBG_STR_L_MUXS)
+			h2_dump_h2s_info(buf, h2s, NULL);
+
+		if (dbg_ctx->arg.debug_flags & MUX_SCTL_DBG_STR_L_MUXC)
+			h2_dump_h2c_info(buf, h2s->h2c, NULL);
+
+		if (dbg_ctx->arg.debug_flags & MUX_SCTL_DBG_STR_L_CONN)
+			chunk_appendf(buf, " conn.flg=%#08x", h2s->h2c->conn->flags);
+
+		/* other layers not implemented */
+		dbg_ctx->ret.buf = *buf;
 		return ret;
 
 	default:
@@ -5110,7 +5168,7 @@ struct task *h2_deferred_shut(struct task *t, void *ctx, unsigned int state)
 	return t;
 }
 
-static void h2_shut(struct stconn *sc, enum se_shut_mode mode, struct se_abort_info *reason)
+static void h2_shut(struct stconn *sc, unsigned int mode, struct se_abort_info *reason)
 {
 	struct h2s *h2s = __sc_mux_strm(sc);
 

@@ -12,6 +12,8 @@
 
 #include <inttypes.h>
 
+#include <haproxy/api-t.h>
+#include <haproxy/chunk.h>
 #include <haproxy/quic_conn.h>
 #include <haproxy/quic_tls.h>
 #include <haproxy/quic_trace.h>
@@ -68,7 +70,7 @@ static const struct trace_event quic_trace_events[] = {
 	{ .mask = QUIC_EV_CONN_IDLE_TIMER, .name = "idle_timer",     .desc = "idle timer task"},
 	{ .mask = QUIC_EV_CONN_SUB,      .name = "xprt_sub",         .desc = "RX/TX subscription or unsubscription to QUIC xprt"},
 	{ .mask = QUIC_EV_CONN_RCV,      .name = "conn_recv",        .desc = "RX on connection" },
-	{ .mask = QUIC_EV_CONN_SET_AFFINITY, .name = "conn_set_affinity", .desc = "set connection thread affinity" },
+	{ .mask = QUIC_EV_CONN_BIND_TID, .name = "conn_bind_tid",    .desc = "change connection thread affinity" },
 	{ /* end */ }
 };
 
@@ -630,4 +632,10 @@ static void quic_trace(enum trace_level level, uint64_t mask, const struct trace
 			quic_cid_dump(&trace_buf, cid);
 	}
 
+}
+
+void quic_dump_qc_info(struct buffer *msg, const struct quic_conn *qc)
+{
+	chunk_appendf(msg, " qc.wnd=%llu/%llu", (ullong)qc->path->in_flight,
+	                                        (ullong)qc->path->cwnd);
 }

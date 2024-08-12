@@ -19,6 +19,9 @@ struct qc_stream_buf {
 	struct list list; /* element for qc_stream_desc list */
 };
 
+#define QC_SD_FL_RELEASE	0x00000001 /* set when MUX has finished to use this stream */
+#define QC_SD_FL_WAIT_FOR_FIN	0x00000002 /* set if sent FIN is waiting for acknowledgement */
+
 /* QUIC STREAM descriptor.
  *
  * This structure is the low-level counterpart of the QUIC STREAM at the MUX
@@ -39,7 +42,7 @@ struct qc_stream_desc {
 	uint64_t ack_offset; /* last acknowledged offset */
 	struct eb_root acked_frms; /* ACK frames tree for non-contiguous ACK ranges */
 
-	int release; /* set to 1 when the MUX has finished to use this stream */
+	int flags; /* QC_SD_FL_* values */
 
 	void *ctx; /* MUX specific context */
 };

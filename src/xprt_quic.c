@@ -11,6 +11,7 @@
  */
 
 #include <haproxy/api.h>
+#include <haproxy/buf.h>
 #include <haproxy/connection.h>
 #include <haproxy/quic_conn.h>
 #include <haproxy/ssl_sock.h>
@@ -113,8 +114,8 @@ static int qc_conn_init(struct connection *conn, void **xprt_ctx)
 	TRACE_ENTER(QUIC_EV_CONN_NEW, qc);
 
 	/* Ensure thread connection migration is finalized ASAP. */
-	if (qc->flags & QUIC_FL_CONN_AFFINITY_CHANGED)
-		qc_finalize_affinity_rebind(qc);
+	if (qc->flags & QUIC_FL_CONN_TID_REBIND)
+		qc_finalize_tid_rebind(qc);
 
 	/* do not store the context if already set */
 	if (*xprt_ctx)
@@ -161,6 +162,11 @@ static struct ssl_sock_ctx *qc_get_ssl_sock_ctx(struct connection *conn)
 	return conn->handle.qc->xprt_ctx;
 }
 
+static void qc_xprt_dump_info(struct buffer *msg, const struct connection *conn)
+{
+	quic_dump_qc_info(msg, conn->handle.qc);
+}
+
 /* transport-layer operations for QUIC connections. */
 static struct xprt_ops ssl_quic = {
 	.close    = quic_close,
@@ -172,6 +178,7 @@ static struct xprt_ops ssl_quic = {
 	.destroy_bind_conf = ssl_sock_destroy_bind_conf,
 	.get_alpn = ssl_sock_get_alpn,
 	.get_ssl_sock_ctx = qc_get_ssl_sock_ctx,
+	.dump_info = qc_xprt_dump_info,
 	.name     = "QUIC",
 };
 

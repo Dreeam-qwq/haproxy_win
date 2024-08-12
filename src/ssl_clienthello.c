@@ -131,7 +131,7 @@ int ssl_sock_switchctx_err_cbk(SSL *ssl, int *al, void *priv)
 	return SSL_TLSEXT_ERR_NOACK;
 }
 
-#if defined(OPENSSL_IS_BORINGSSL) || defined(USE_OPENSSL_AWSLC)
+#if defined(OPENSSL_IS_BORINGSSL) || defined(OPENSSL_IS_AWSLC)
 int ssl_sock_switchctx_cbk(const struct ssl_early_callback_ctx *ctx)
 {
 	SSL *ssl = ctx->ssl;
@@ -170,7 +170,7 @@ int ssl_sock_switchctx_cbk(SSL *ssl, int *al, void *arg)
 #ifdef USE_QUIC
 	if (qc) {
 		/* Look for the QUIC transport parameters. */
-#if defined(OPENSSL_IS_BORINGSSL) || defined(USE_OPENSSL_AWSLC)
+#if defined(OPENSSL_IS_BORINGSSL) || defined(OPENSSL_IS_AWSLC)
 		if (!SSL_early_callback_ctx_extension_get(ctx, qc->tps_tls_ext,
 		                                          &extension_data, &extension_len))
 #else
@@ -182,7 +182,7 @@ int ssl_sock_switchctx_cbk(SSL *ssl, int *al, void *arg)
 			 * <*al>, this has as side effect to generate another TLS alert
 			 * which would be set after calling quic_set_tls_alert().
 			 */
-#if !defined(OPENSSL_IS_BORINGSSL) && !defined(USE_OPENSSL_AWSLC)
+#if !defined(OPENSSL_IS_BORINGSSL) && !defined(OPENSSL_IS_AWSLC)
 			*al = SSL_AD_MISSING_EXTENSION;
 #endif
 			quic_set_tls_alert(qc, SSL_AD_MISSING_EXTENSION);
@@ -199,7 +199,7 @@ int ssl_sock_switchctx_cbk(SSL *ssl, int *al, void *arg)
 
 	if (s->ssl_conf.early_data)
 		allow_early = 1;
-#if defined(OPENSSL_IS_BORINGSSL) || defined(USE_OPENSSL_AWSLC)
+#if defined(OPENSSL_IS_BORINGSSL) || defined(OPENSSL_IS_AWSLC)
 	if (SSL_early_callback_ctx_extension_get(ctx, TLSEXT_TYPE_server_name,
 						 &extension_data, &extension_len)) {
 #else
@@ -253,7 +253,7 @@ int ssl_sock_switchctx_cbk(SSL *ssl, int *al, void *arg)
 	}
 
 	/* extract/check clientHello information */
-#if defined(OPENSSL_IS_BORINGSSL) || defined(USE_OPENSSL_AWSLC)
+#if defined(OPENSSL_IS_BORINGSSL) || defined(OPENSSL_IS_AWSLC)
 	if (SSL_early_callback_ctx_extension_get(ctx, TLSEXT_TYPE_signature_algorithms, &extension_data, &extension_len)) {
 #else
 	if (SSL_client_hello_get0_ext(ssl, TLSEXT_TYPE_signature_algorithms, &extension_data, &extension_len)) {
@@ -298,7 +298,7 @@ int ssl_sock_switchctx_cbk(SSL *ssl, int *al, void *arg)
 		ha_ciphers = SSL_get_ciphers(ssl);
 		has_ecdsa_sig = 0;
 
-#if defined(OPENSSL_IS_BORINGSSL) || defined(USE_OPENSSL_AWSLC)
+#if defined(OPENSSL_IS_BORINGSSL) || defined(OPENSSL_IS_AWSLC)
 		len = ctx->cipher_suites_len;
 		cipher_suites = ctx->cipher_suites;
 #else
@@ -307,7 +307,7 @@ int ssl_sock_switchctx_cbk(SSL *ssl, int *al, void *arg)
 		if (len % 2 != 0)
 			goto abort;
 		for (; len != 0; len -= 2, cipher_suites += 2) {
-#if defined(OPENSSL_IS_BORINGSSL) || defined(USE_OPENSSL_AWSLC)
+#if defined(OPENSSL_IS_BORINGSSL) || defined(OPENSSL_IS_AWSLC)
 			uint16_t cipher_suite = (cipher_suites[0] << 8) | cipher_suites[1];
 			cipher = SSL_get_cipher_by_value(cipher_suite);
 #else
@@ -317,7 +317,7 @@ int ssl_sock_switchctx_cbk(SSL *ssl, int *al, void *arg)
 				continue;
 
 			/* check if this cipher is available in haproxy configuration */
-#if defined(USE_OPENSSL_AWSLC)
+#if defined(OPENSSL_IS_AWSLC)
                         /* because AWS-LC does not provide the TLSv1.3 ciphersuites (which are NID_auth_any) in ha_ciphers,
                          * does not check if it's available when it's an NID_auth_any
                          */
@@ -345,7 +345,7 @@ int ssl_sock_switchctx_cbk(SSL *ssl, int *al, void *arg)
 sni_lookup:
 	/* we need to transform this a NULL-ended string in lowecase */
 	for (i = 0; i < trash.size && i < servername_len; i++)
-		trash.area[i] = tolower(servername[i]);
+		trash.area[i] = tolower((unsigned char)servername[i]);
 	trash.area[i] = 0;
 
 	HA_RWLOCK_RDLOCK(SNI_LOCK, &s->sni_lock);
@@ -403,7 +403,7 @@ sni_lookup:
 	/* abort handshake (was SSL_TLSEXT_ERR_ALERT_FATAL) */
 	if (conn)
 		conn->err_code = CO_ER_SSL_HANDSHAKE;
-#if defined(OPENSSL_IS_BORINGSSL) || defined(USE_OPENSSL_AWSLC)
+#if defined(OPENSSL_IS_BORINGSSL) || defined(OPENSSL_IS_AWSLC)
 	return ssl_select_cert_error;
 #else
 	*al = SSL_AD_UNRECOGNIZED_NAME;
@@ -411,7 +411,7 @@ sni_lookup:
 #endif
 
 allow_early:
-#if defined(OPENSSL_IS_BORINGSSL) || defined(USE_OPENSSL_AWSLC)
+#if defined(OPENSSL_IS_BORINGSSL) || defined(OPENSSL_IS_AWSLC)
 	if (allow_early)
 		SSL_set_early_data_enabled(ssl, 1);
 #else
@@ -534,14 +534,6 @@ sni_lookup:
 		return SSL_TLSEXT_ERR_ALERT_FATAL;
 	}
 
-#if defined(OPENSSL_IS_AWSLC)
-	/* Note that ssl_sock_switchctx_set() calls SSL_set_SSL_CTX() which propagates the
-	 * "early data enabled" setting from the SSL_CTX object to the SSL objects.
-	 * So enable early data for this SSL_CTX context if configured.
-	 */
-	if (s->ssl_conf.early_data)
-		SSL_CTX_set_early_data_enabled(container_of(node, struct sni_ctx, name)->ctx, 1);
-#endif
 	/* switch ctx */
 	ssl_sock_switchctx_set(ssl, container_of(node, struct sni_ctx, name)->ctx);
 	HA_RWLOCK_RDUNLOCK(SNI_LOCK, &s->sni_lock);
@@ -630,7 +622,7 @@ sni_lookup:
 
 	/* we need to transform this into a NULL-ended string in lowecase */
 	for (i = 0; i < trash.size && servername[i] != '\0'; i++)
-		trash.area[i] = tolower(servername[i]);
+		trash.area[i] = tolower((unsigned char)servername[i]);
 	trash.area[i] = 0;
 	servername = trash.area;
 

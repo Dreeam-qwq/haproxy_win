@@ -17,6 +17,9 @@
 #error "Must define USE_OPENSSL"
 #endif
 
+#if defined(OPENSSL_IS_AWSLC)
+#include <openssl/chacha.h>
+#endif
 #include <openssl/evp.h>
 
 #include <import/ebtree.h>
@@ -25,6 +28,33 @@
 #include <haproxy/ncbuf-t.h>
 #include <haproxy/quic_ack-t.h>
 #include <haproxy/openssl-compat.h>
+
+/* Use EVP_CIPHER or EVP_AEAD API depending on the library */
+#if defined(OPENSSL_IS_AWSLC)
+
+# define QUIC_AEAD_API
+
+# define QUIC_AEAD            EVP_AEAD
+# define QUIC_AEAD_CTX        EVP_AEAD_CTX
+
+# define QUIC_AEAD_CTX_free   EVP_AEAD_CTX_free
+# define QUIC_AEAD_key_length EVP_AEAD_key_length
+# define QUIC_AEAD_iv_length  EVP_AEAD_nonce_length
+
+# define EVP_CIPHER_CTX_CHACHA20 ((EVP_CIPHER_CTX *)EVP_aead_chacha20_poly1305())
+# define EVP_CIPHER_CHACHA20     ((EVP_CIPHER*)EVP_aead_chacha20_poly1305())
+
+#else
+
+# define QUIC_AEAD            EVP_CIPHER
+# define QUIC_AEAD_CTX        EVP_CIPHER_CTX
+
+# define QUIC_AEAD_CTX_free   EVP_CIPHER_CTX_free
+# define QUIC_AEAD_key_length EVP_CIPHER_key_length
+# define QUIC_AEAD_iv_length  EVP_CIPHER_iv_length
+
+#endif
+
 
 /* It seems TLS 1.3 ciphersuites macros differ between openssl and boringssl */
 
@@ -162,7 +192,7 @@ struct quic_pktns {
 
 /* Key phase used for Key Update */
 struct quic_tls_kp {
-	EVP_CIPHER_CTX *ctx;
+	QUIC_AEAD_CTX *ctx;
 	unsigned char *secret;
 	size_t secretlen;
 	unsigned char *iv;
@@ -178,8 +208,8 @@ struct quic_tls_kp {
 #define QUIC_FL_TLS_KP_BIT_SET   (1 << 0)
 
 struct quic_tls_secrets {
-	EVP_CIPHER_CTX *ctx;
-	const EVP_CIPHER *aead;
+	QUIC_AEAD_CTX *ctx;
+	const QUIC_AEAD *aead;
 	const EVP_MD *md;
 	EVP_CIPHER_CTX *hp_ctx;
 	const EVP_CIPHER *hp;

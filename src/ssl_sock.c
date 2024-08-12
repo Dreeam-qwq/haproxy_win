@@ -1195,8 +1195,10 @@ static int ssl_sock_load_ocsp(const char *path, SSL_CTX *ctx, struct ckch_store 
 		EVP_PKEY *pkey;
 
 		cb_arg = calloc(1, sizeof(*cb_arg));
-		if (!cb_arg)
+		if (!cb_arg) {
+			HA_SPIN_UNLOCK(OCSP_LOCK, &ocsp_tree_lock);
 			goto out;
+		}
 
 		cb_arg->is_single = 1;
 		cb_arg->s_ocsp = iocsp;
@@ -2611,12 +2613,6 @@ static int ssl_sock_load_cert_chain(const char *path, const struct ckch_data *da
 
 	if (data->chain) {
 		*find_chain = X509_chain_up_ref(data->chain);
-	} else {
-		/* Find Certificate Chain in global */
-		struct issuer_chain *issuer;
-		issuer = ssl_get0_issuer_chain(data->cert);
-		if (issuer)
-			*find_chain = X509_chain_up_ref(issuer->chain);
 	}
 
 	if (!*find_chain) {
@@ -3442,9 +3438,11 @@ ssl_sock_initial_ctx(struct bind_conf *bind_conf)
 		SSL_CTX_set_timeout(ctx, global_ssl.life_time);
 
 #ifdef SSL_CTRL_SET_TLSEXT_HOSTNAME
-# if defined(OPENSSL_IS_BORINGSSL) || defined(USE_OPENSSL_AWSLC)
+# if defined(OPENSSL_IS_BORINGSSL) || defined(OPENSSL_IS_AWSLC)
 	SSL_CTX_set_select_certificate_cb(ctx, ssl_sock_switchctx_cbk);
 	SSL_CTX_set_tlsext_servername_callback(ctx, ssl_sock_switchctx_err_cbk);
+	if (bind_conf->ssl_conf.early_data)
+		SSL_CTX_set_early_data_enabled(ctx, 1);
 # elif defined(HAVE_SSL_CLIENT_HELLO_CB)
 #  if defined(SSL_OP_NO_ANTI_REPLAY)
 	if (bind_conf->ssl_conf.early_data)
@@ -6947,7 +6945,7 @@ static void __ssl_sock_init(void)
 #ifdef HAVE_SSL_PROVIDERS
 	hap_register_post_deinit(ssl_unload_providers);
 #endif
-#if (HA_OPENSSL_VERSION_NUMBER < 0x3000000fL) && !defined(USE_OPENSSL_AWSLC)
+#if (HA_OPENSSL_VERSION_NUMBER < 0x3000000fL) && !defined(OPENSSL_IS_AWSLC)
 	/* Load SSL string for the verbose & debug mode. */
 	ERR_load_SSL_strings();
 #endif

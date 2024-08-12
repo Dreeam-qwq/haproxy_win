@@ -1,13 +1,18 @@
 #include <errno.h>
 #include <string.h>
+#include <netinet/in.h>
+#include <netinet/udp.h>
 
+#include <haproxy/acl.h>
+#include <haproxy/action.h>
 #include <haproxy/api.h>
 #include <haproxy/cfgparse.h>
 #include <haproxy/errors.h>
 #include <haproxy/global.h>
 #include <haproxy/listener.h>
-#include <haproxy/proxy-t.h>
+#include <haproxy/proxy.h>
 #include <haproxy/quic_cc-t.h>
+#include <haproxy/quic_rules.h>
 #include <haproxy/tools.h>
 
 #define QUIC_CC_NEWRENO_STR "newreno"
@@ -259,6 +264,29 @@ static int cfg_parse_quic_tune_setting(char **args, int section_type,
 	return 0;
 }
 
+static int cfg_parse_quic_tune_setting0(char **args, int section_type,
+                                        struct proxy *curpx,
+                                        const struct proxy *defpx,
+                                        const char *file, int line, char **err)
+{
+	int prefix_len = strlen("tune.quic.");
+	const char *suffix;
+
+	if (too_many_args(0, args, err, NULL))
+		return -1;
+
+	suffix = args[0] + prefix_len;
+	if (strcmp(suffix, "disable-udp-gso") == 0) {
+		global.tune.options |= GTUNE_QUIC_NO_UDP_GSO;
+	}
+	else {
+		memprintf(err, "'%s' keyword unhandled (please report this bug).", args[0]);
+		return -1;
+	}
+
+	return 0;
+}
+
 /* config parser for global "tune.quic.* {on|off}" */
 static int cfg_parse_quic_tune_on_off(char **args, int section_type, struct proxy *curpx,
                                       const struct proxy *defpx, const char *file, int line,
@@ -308,8 +336,132 @@ static struct cfg_kw_list cfg_kws = {ILH, {
 	{ CFG_GLOBAL, "tune.quic.max-frame-loss", cfg_parse_quic_tune_setting },
 	{ CFG_GLOBAL, "tune.quic.reorder-ratio", cfg_parse_quic_tune_setting },
 	{ CFG_GLOBAL, "tune.quic.retry-threshold", cfg_parse_quic_tune_setting },
+	{ CFG_GLOBAL, "tune.quic.disable-udp-gso", cfg_parse_quic_tune_setting0 },
 	{ CFG_GLOBAL, "tune.quic.zero-copy-fwd-send", cfg_parse_quic_tune_on_off },
 	{ 0, NULL, NULL }
 }};
 
 INITCALL1(STG_REGISTER, cfg_register_keywords, &cfg_kws);
+
+static int quic_parse_quic_initial(char **args, int section_type, struct proxy *curpx,
+                                   const struct proxy *defpx, const char *file, int line,
+                                   char **err)
+{
+	const struct acl *acl;
+	struct act_rule *rule;
+	struct action_kw *kw;
+	const char *acl_kw;
+	unsigned int where;
+	int warn = 0;
+	int arg = 1;
+
+	where = SMP_VAL_FE_CON_ACC;
+
+	if (curpx == defpx && strlen(defpx->id) == 0) {
+		memprintf(err, "%s is not allowed in anonymous 'defaults' sections",
+			  args[0]);
+		return -1;
+	}
+
+	if (!(curpx->cap & PR_CAP_FE)) {
+		memprintf(err, "'%s' : proxy '%s' has no frontend capability",
+		          args[0], curpx->id);
+		return -1;
+	}
+
+	if (!(curpx->mode & PR_MODE_HTTP)) {
+		memprintf(err, "'%s' : proxy '%s' does not used HTTP mode",
+		          args[0], curpx->id);
+		return -1;
+	}
+
+	rule = new_act_rule(0, file, line);
+	if (!rule) {
+		memprintf(err, "parsing [%s:%d] : out of memory", file, line);
+		return -1;
+	}
+
+	LIST_INIT(&rule->list);
+	rule->from = ACT_F_QUIC_INIT;
+
+	kw = action_quic_init_custom(args[1]);
+	if (kw) {
+		rule->kw = kw;
+		arg++;
+
+		if (kw->parse((const char **)args, &arg, curpx, rule, err) == ACT_RET_PRS_ERR)
+			goto err;
+	}
+	else {
+		const char *best = action_suggest(args[1], &quic_init_actions_list.list, NULL);
+
+		action_build_list(&quic_init_actions_list.list, &trash);
+		memprintf(err, "'quic-initial' expects %s, but got '%s'%s.%s%s%s",
+		          trash.area,
+		          args[1], *args[1] ? "" : " (missing argument)",
+		          best ? " Did you mean '" : "",
+		          best ? best : "",
+		          best ? "' maybe ?" : "");
+		goto err;
+	}
+
+	if (strcmp(args[arg], "if") == 0 || strcmp(args[arg], "unless") == 0) {
+		if ((rule->cond = build_acl_cond(file, line, &curpx->acl, curpx, (const char **)args+arg, err)) == NULL) {
+			memprintf(err,
+			          "'%s %s %s' : error detected in %s '%s' while parsing '%s' condition : %s",
+			          args[0], args[1], args[2], proxy_type_str(curpx), curpx->id, args[arg], *err);
+			goto err;
+		}
+	}
+	else if (*args[arg]) {
+		memprintf(err,
+			 "'%s %s %s' only accepts 'if' or 'unless', in %s '%s' (got '%s')",
+			 args[0], args[1], args[2], proxy_type_str(curpx), curpx->id, args[arg]);
+		goto err;
+	}
+
+	acl = rule->cond ? acl_cond_conflicts(rule->cond, where) : NULL;
+	if (acl) {
+		if (acl->name && *acl->name)
+			memprintf(err,
+				  "acl '%s' will never match in '%s' because it only involves keywords that are incompatible with '%s'",
+				  acl->name, args[0], sample_ckp_names(where));
+		else
+			memprintf(err,
+				  "anonymous acl will never match in '%s' because it uses keyword '%s' which is incompatible with '%s'",
+				  args[0],
+				  LIST_ELEM(acl->expr.n, struct acl_expr *, list)->kw,
+				  sample_ckp_names(where));
+
+		warn++;
+	}
+	else if (rule->cond && acl_cond_kw_conflicts(rule->cond, where, &acl, &acl_kw)) {
+		if (acl->name && *acl->name)
+			memprintf(err,
+				  "acl '%s' involves keyword '%s' which is incompatible with '%s'",
+				  acl->name, acl_kw, sample_ckp_names(where));
+		else
+			memprintf(err,
+				  "anonymous acl involves keyword '%s' which is incompatible with '%s'",
+				  acl_kw, sample_ckp_names(where));
+		warn++;
+	}
+
+	/* the following function directly emits the warning */
+	warnif_misplaced_quic_init(curpx, file, line, args[0]);
+
+	LIST_APPEND(&curpx->quic_init_rules, &rule->list);
+
+	return warn;
+
+ err:
+	free_act_rule(rule);
+	return -1;
+}
+
+static struct cfg_kw_list cfg_kws_li = {ILH, {
+	{ CFG_LISTEN, "quic-initial",  quic_parse_quic_initial },
+	{ 0, NULL, NULL },
+}};
+
+INITCALL1(STG_REGISTER, cfg_register_keywords, &cfg_kws_li);

@@ -90,6 +90,14 @@ struct cfg_postparser {
 	int (*func)();
 };
 
+/* store in memory config files meta data and content */
+struct cfgfile {
+	struct list list;
+	char *filename;                         /* config file name */
+	char *content;                          /* allocated str with config file content */
+	ssize_t size;                           /* size of stored file or error indication (-1) */
+};
+
 extern struct list postparsers;
 extern int cfg_maxpconn;
 extern int cfg_maxconn;
@@ -104,7 +112,7 @@ int cfg_parse_global(const char *file, int linenum, char **args, int inv);
 int cfg_parse_listen(const char *file, int linenum, char **args, int inv);
 int cfg_parse_track_sc_num(unsigned int *track_sc_num,
                            const char *arg, const char *end, char **err);
-int readcfgfile(const char *file);
+int parse_cfg(const struct cfgfile *cfg);
 void cfg_register_keywords(struct cfg_kw_list *kwl);
 void cfg_unregister_keywords(struct cfg_kw_list *kwl);
 int check_config_validity(void);
@@ -120,6 +128,7 @@ void cfg_restore_sections(struct list *backup_sections);
 int warnif_misplaced_tcp_conn(struct proxy *proxy, const char *file, int line, const char *arg);
 int warnif_misplaced_tcp_sess(struct proxy *proxy, const char *file, int line, const char *arg);
 int warnif_misplaced_tcp_cont(struct proxy *proxy, const char *file, int line, const char *arg);
+int warnif_misplaced_quic_init(struct proxy *proxy, const char *file, int line, const char *arg);
 int warnif_cond_conflicts(const struct acl_cond *cond, unsigned int where, const char *file, int line);
 int warnif_tcp_http_cond(const struct proxy *px, const struct acl_cond *cond);
 int too_many_args_idx(int maxarg, int index, char **args, char **msg, int *err_code);
@@ -131,6 +140,8 @@ const char *cfg_find_best_match(const char *word, const struct list *list, int s
 int warnifnotcap(struct proxy *proxy, int cap, const char *file, int line, const char *arg, const char *hint);
 int failifnotcap(struct proxy *proxy, int cap, const char *file, int line, const char *arg, const char *hint);
 void cfg_dump_registered_keywords();
+int list_append_cfgfile(struct list *li, const char *filename, char **err);
+ssize_t load_cfg_in_mem(char* filename, char** cfg_content);
 
 /* simplified way to define a section parser */
 #define REGISTER_CONFIG_SECTION(name, parse, post)                            \

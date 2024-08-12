@@ -243,13 +243,24 @@ static inline void quic_cubic_update(struct quic_cc *cc, uint32_t acked)
 			c->W_target = path->cwnd;
 		}
 		else {
+			uint64_t wnd_diff;
+
 			/* K value computing (in seconds):
 			 * K = cubic_root((W_max - cwnd_epoch)/C) (Figure 2)
-			 * Note that K is stored in milliseconds.
+			 * Note that K is stored in milliseconds and that
+			 * 8000 * 125000 = 1000^3.
+			 *
+			 * Supporting 2^40 windows, shifted by 10, leaves ~13 bits of unused
+			 * precision. We exploit this precision for our NS conversion by
+			 * multiplying by 8000 without overflowing, then later by 125000
+			 * after the divide so that we limit the precision loss to the minimum
+			 * before the cubic_root() call."
 			 */
-			c->K = cubic_root(((c->last_w_max - path->cwnd) << CUBIC_SCALE_FACTOR_SHIFT) / (CUBIC_C_SCALED * path->mtu));
-			/* Convert to milliseconds. */
-			c->K *= 1000;
+			wnd_diff = (c->last_w_max - path->cwnd) << CUBIC_SCALE_FACTOR_SHIFT;
+			wnd_diff *= 8000ULL;
+			wnd_diff /= CUBIC_C_SCALED * path->mtu;
+			wnd_diff *= 125000ULL;
+			c->K = cubic_root(wnd_diff);
 			c->W_target = c->last_w_max;
 		}
 
@@ -632,6 +643,15 @@ static void quic_cc_cubic_state_trace(struct buffer *buf, const struct quic_cc *
 	              TICKS_TO_MS(tick_remain(c->recovery_start_time, now_ms)));
 }
 
+static void quic_cc_cubic_state_cli(struct buffer *buf, const struct quic_cc_path *path)
+{
+	struct cubic *c = quic_cc_priv(&path->cc);
+
+	chunk_appendf(buf, "  cc: state=%s ssthresh=%u K=%u last_w_max=%u wdiff=%ld\n",
+	              quic_cc_state_str(c->state), c->ssthresh, c->K, c->last_w_max,
+	              (int64_t)(path->cwnd - c->last_w_max));
+}
+
 struct quic_cc_algo quic_cc_algo_cubic = {
 	.type        = QUIC_CC_ALGO_TP_CUBIC,
 	.init        = quic_cc_cubic_init,
@@ -639,4 +659,13 @@ struct quic_cc_algo quic_cc_algo_cubic = {
 	.slow_start  = quic_cc_cubic_slow_start,
 	.hystart_start_round = quic_cc_cubic_hystart_start_round,
 	.state_trace = quic_cc_cubic_state_trace,
+	.state_cli   = quic_cc_cubic_state_cli,
 };
+
+void quic_cc_cubic_check(void)
+{
+	struct quic_cc *cc;
+	BUG_ON_HOT(sizeof(struct cubic) > sizeof(cc->priv));
+}
+
+INITCALL0(STG_REGISTER, quic_cc_cubic_check);

@@ -17,6 +17,7 @@
 #include <haproxy/quic_frame-t.h>
 #include <haproxy/quic_stream-t.h>
 #include <haproxy/stconn-t.h>
+#include <haproxy/time-t.h>
 
 /* Stream types */
 enum qcs_type {
@@ -28,13 +29,6 @@ enum qcs_type {
 	/* Must be the last one */
 	QCS_MAX_TYPES
 };
-
-#define QC_CF_ERRL      0x00000001 /* fatal error detected locally, connection should be closed soon */
-#define QC_CF_ERRL_DONE 0x00000002 /* local error properly handled, connection can be released */
-/* unused 0x00000004 */
-#define QC_CF_CONN_FULL 0x00000008 /* no stream buffers available on connection */
-#define QC_CF_APP_SHUT  0x00000010 /* Application layer shutdown done. */
-#define QC_CF_ERR_CONN  0x00000020 /* fatal error reported by transport layer */
 
 struct qcc {
 	struct connection *conn;
@@ -103,20 +97,6 @@ struct qcc {
 	void *ctx; /* Application layer context */
 };
 
-#define QC_SF_NONE              0x00000000
-#define QC_SF_SIZE_KNOWN        0x00000001  /* last frame received for this stream */
-#define QC_SF_FIN_STREAM        0x00000002  /* FIN bit must be set for last frame of the stream */
-#define QC_SF_BLK_MROOM         0x00000004  /* app layer is blocked waiting for room in the qcs.tx.buf */
-#define QC_SF_DETACH            0x00000008  /* sc is detached but there is remaining data to send */
-/* unused 0x00000010 */
-#define QC_SF_DEM_FULL          0x00000020  /* demux blocked on request channel buffer full */
-#define QC_SF_READ_ABORTED      0x00000040  /* Rx closed using STOP_SENDING*/
-#define QC_SF_TO_RESET          0x00000080  /* a RESET_STREAM must be sent */
-#define QC_SF_HREQ_RECV         0x00000100  /* a full HTTP request has been received */
-#define QC_SF_TO_STOP_SENDING   0x00000200  /* a STOP_SENDING must be sent */
-#define QC_SF_UNKNOWN_PL_LENGTH 0x00000400  /* HTX EOM may be missing from the stream layer */
-#define QC_SF_RECV_RESET        0x00000800  /* a RESET_STREAM was received */
-
 /* Maximum size of stream Rx buffer. */
 #define QC_S_RX_BUF_SZ   (global.tune.bufsize - NCB_RESERVED_SZ)
 
@@ -177,6 +157,12 @@ struct qcs {
 	uint64_t err; /* error code to transmit via RESET_STREAM */
 
 	int start; /* base timestamp for http-request timeout */
+
+	struct {
+		struct tot_time base; /* total QCS lifetime */
+		struct tot_time buf;  /* stream to QCS send blocked on buffer */
+		struct tot_time fctl; /* stream to QCS send blocked on flow-control */
+	} timer;
 };
 
 /* Used as qcc_app_ops.close callback argument. */
@@ -222,5 +208,74 @@ struct qcc_app_ops {
 };
 
 #endif /* USE_QUIC */
+
+#define QC_CF_ERRL      0x00000001 /* fatal error detected locally, connection should be closed soon */
+#define QC_CF_ERRL_DONE 0x00000002 /* local error properly handled, connection can be released */
+/* unused 0x00000004 */
+#define QC_CF_CONN_FULL 0x00000008 /* no stream buffers available on connection */
+#define QC_CF_APP_SHUT  0x00000010 /* Application layer shutdown done. */
+#define QC_CF_ERR_CONN  0x00000020 /* fatal error reported by transport layer */
+
+/* This function is used to report flags in debugging tools. Please reflect
+ * below any single-bit flag addition above in the same order via the
+ * __APPEND_FLAG macro. The new end of the buffer is returned.
+ */
+static forceinline char *qcc_show_flags(char *buf, size_t len, const char *delim, uint flg)
+{
+#define _(f, ...) __APPEND_FLAG(buf, len, delim, flg, f, #f, __VA_ARGS__)
+	/* prologue */
+	_(0);
+	/* flags */
+	_(QC_CF_ERRL,
+	_(QC_CF_ERRL_DONE,
+	_(QC_CF_CONN_FULL,
+	_(QC_CF_APP_SHUT,
+	_(QC_CF_ERR_CONN)))));
+	/* epilogue */
+	_(~0U);
+	return buf;
+#undef _
+}
+
+#define QC_SF_NONE              0x00000000
+#define QC_SF_SIZE_KNOWN        0x00000001  /* last frame received for this stream */
+#define QC_SF_FIN_STREAM        0x00000002  /* FIN bit must be set for last frame of the stream */
+#define QC_SF_BLK_MROOM         0x00000004  /* app layer is blocked waiting for room in the qcs.tx.buf */
+#define QC_SF_DETACH            0x00000008  /* sc is detached but there is remaining data to send */
+/* unused 0x00000010 */
+#define QC_SF_DEM_FULL          0x00000020  /* demux blocked on request channel buffer full */
+#define QC_SF_READ_ABORTED      0x00000040  /* Rx closed using STOP_SENDING*/
+#define QC_SF_TO_RESET          0x00000080  /* a RESET_STREAM must be sent */
+#define QC_SF_HREQ_RECV         0x00000100  /* a full HTTP request has been received */
+#define QC_SF_TO_STOP_SENDING   0x00000200  /* a STOP_SENDING must be sent */
+#define QC_SF_UNKNOWN_PL_LENGTH 0x00000400  /* HTX EOM may be missing from the stream layer */
+#define QC_SF_RECV_RESET        0x00000800  /* a RESET_STREAM was received */
+
+/* This function is used to report flags in debugging tools. Please reflect
+ * below any single-bit flag addition above in the same order via the
+ * __APPEND_FLAG macro. The new end of the buffer is returned.
+ */
+static forceinline char *qcs_show_flags(char *buf, size_t len, const char *delim, uint flg)
+{
+#define _(f, ...) __APPEND_FLAG(buf, len, delim, flg, f, #f, __VA_ARGS__)
+	/* prologue */
+	_(0);
+	/* flags */
+	_(QC_SF_SIZE_KNOWN,
+	_(QC_SF_FIN_STREAM,
+	_(QC_SF_BLK_MROOM,
+	_(QC_SF_DETACH,
+	_(QC_SF_DEM_FULL,
+	_(QC_SF_READ_ABORTED,
+	_(QC_SF_TO_RESET,
+	_(QC_SF_HREQ_RECV,
+	_(QC_SF_TO_STOP_SENDING,
+	_(QC_SF_UNKNOWN_PL_LENGTH,
+	_(QC_SF_RECV_RESET)))))))))));
+	/* epilogue */
+	_(~0U);
+	return buf;
+#undef _
+}
 
 #endif /* _HAPROXY_MUX_QUIC_T_H */

@@ -227,8 +227,14 @@ static struct task *server_atomic_sync(struct task *task, void *context, unsigne
 	unsigned int remain = event_hdl_tune.max_events_at_once; // to limit max number of events per batch
 	struct event_hdl_async_event *event;
 
+	BUG_ON(remain == 0); // event_hdl_tune.max_events_at_once is expected to be > 0
+
 	/* check for new server events that we care about */
-	while ((event = event_hdl_async_equeue_pop(&server_atomic_sync_queue))) {
+	do {
+		event = event_hdl_async_equeue_pop(&server_atomic_sync_queue);
+		if (!event)
+			break; /* no events in queue */
+
 		if (event_hdl_sub_type_equal(event->type, EVENT_HDL_SUB_END)) {
 			/* ending event: no more events to come */
 			event_hdl_async_free_event(event);
@@ -236,20 +242,6 @@ static struct task *server_atomic_sync(struct task *task, void *context, unsigne
 			task = NULL;
 			break;
 		}
-
-		if (!remain) {
-			/* STOP: we've already spent all our budget here, and
-			 * considering we possibly are under isolation, we cannot
-		         * keep blocking other threads any longer.
-			 *
-			 * Reschedule the task to finish where we left off if
-			 * there are remaining events in the queue.
-			 */
-			if (!event_hdl_async_equeue_isempty(&server_atomic_sync_queue))
-				task_wakeup(task, TASK_WOKEN_OTHER);
-			break;
-		}
-		remain--;
 
 		/* new event to process */
 		if (event_hdl_sub_type_equal(event->type, EVENT_HDL_SUB_SERVER_INETADDR)) {
@@ -327,7 +319,7 @@ static struct task *server_atomic_sync(struct task *task, void *context, unsigne
 			srv_set_addr_desc(srv, 1);
 		}
 		event_hdl_async_free_event(event);
-	}
+	} while (--remain);
 
 	/* some events possibly required thread_isolation:
 	 * now that we are done, we must leave thread isolation before
@@ -335,6 +327,19 @@ static struct task *server_atomic_sync(struct task *task, void *context, unsigne
 	 */
 	if (thread_isolated())
 		thread_release();
+
+	if (!remain) {
+		/* we stopped because we've already spent all our budget here,
+		 * and considering we possibly were under isolation, we cannot
+	         * keep blocking other threads any longer.
+		 *
+		 * Reschedule the task to finish where we left off if
+		 * there are remaining events in the queue.
+		 */
+		BUG_ON(task == NULL); // ending event doesn't decrement remain
+		if (!event_hdl_async_equeue_isempty(&server_atomic_sync_queue))
+			task_wakeup(task, TASK_WOKEN_OTHER);
+	}
 
 	return task;
 }
@@ -4954,8 +4959,8 @@ static int srv_iterate_initaddr(struct server *srv)
 		case SRV_IADDR_IP:
 			_srv_set_inetaddr(srv, &srv->init_addr);
 			if (return_code) {
-				ha_warning("could not resolve address '%s', falling back to configured address.\n",
-					   name);
+				ha_notice("could not resolve address '%s', falling back to configured address.\n",
+					  name);
 			}
 			goto out;
 
@@ -6108,18 +6113,19 @@ static int cli_parse_delete_server(char **args, char *payload, struct appctx *ap
 	_srv_detach(srv);
 
 	/* Some deleted servers could still point to us using their 'next',
-	 * update them as needed
-	 * Please note the small race between the POP and APPEND, although in
-	 * this situation this is not an issue as we are under full thread
-	 * isolation
+	 * migrate them as needed
 	 */
-	while ((prev_del = MT_LIST_POP(&srv->prev_deleted, struct server *, prev_deleted))) {
+	MT_LIST_FOR_EACH_ENTRY_LOCKED(prev_del, &srv->prev_deleted, prev_deleted, back) {
 		/* update its 'next' ptr */
 		prev_del->next = srv->next;
 		if (srv->next) {
 			/* now it is our 'next' responsibility */
 			MT_LIST_APPEND(&srv->next->prev_deleted, &prev_del->prev_deleted);
 		}
+		else
+			mt_list_unlock_self(&prev_del->prev_deleted);
+		/* unlink from our list */
+		prev_del = NULL;
 	}
 
 	/* we ourselves need to inform our 'next' that we will still point it */

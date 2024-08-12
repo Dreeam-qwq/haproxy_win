@@ -394,7 +394,7 @@ static int sample_conv_aes_gcm(const struct arg *arg_p, struct sample *smp, void
 		aead_tag.data.u.str.data = ret;
 		aead_tag.data.type = SMP_T_STR;
 
-		if (!var_set(arg_p[3].data.var.name_hash, arg_p[3].data.var.scope, &aead_tag,
+		if (!var_set(&arg_p[3].data.var, &aead_tag,
 		             (arg_p[3].data.var.scope == SCOPE_PROC) ? VF_COND_IFEXISTS : 0)) {
 			goto err;
 		}
@@ -1484,7 +1484,7 @@ smp_fetch_ssl_fc_ec(const struct arg *args, struct sample *smp, const char *kw, 
 		int i;
 
 		for (i = 0; curve_name[i]; i++)
-			curve_name[i] = toupper(curve_name[i]);
+			curve_name[i] = toupper((unsigned char)curve_name[i]);
 	}
 # else
 	nid = SSL_get_negotiated_group(ssl);

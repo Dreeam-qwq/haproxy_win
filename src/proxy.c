@@ -236,6 +236,9 @@ static inline void proxy_free_common(struct proxy *px)
 	free_act_rules(&px->http_req_rules);
 	free_act_rules(&px->http_res_rules);
 	free_act_rules(&px->http_after_res_rules);
+#ifdef USE_QUIC
+	free_act_rules(&px->quic_init_rules);
+#endif
 
 	lf_expr_deinit(&px->logformat);
 	lf_expr_deinit(&px->logformat_sd);
@@ -431,6 +434,8 @@ const char *proxy_mode_str(int mode) {
 		return "syslog";
 	else if (mode == PR_MODE_PEERS)
 		return "peers";
+	else if (mode == PR_MODE_SPOP)
+		return "spop";
 	else
 		return "unknown";
 }
@@ -1384,6 +1389,9 @@ void init_new_proxy(struct proxy *p)
 	LIST_INIT(&p->tcp_rep.inspect_rules);
 	LIST_INIT(&p->tcp_req.l4_rules);
 	LIST_INIT(&p->tcp_req.l5_rules);
+#ifdef USE_QUIC
+	LIST_INIT(&p->quic_init_rules);
+#endif
 	MT_LIST_INIT(&p->listener_queue);
 	LIST_INIT(&p->loggers);
 	LIST_INIT(&p->conf.bind);
@@ -1881,11 +1889,11 @@ void proxy_cond_disable(struct proxy *p)
 	 * peers, etc) we must not report them at all as they're not really on
 	 * the data plane but on the control plane.
 	 */
-	if ((p->mode == PR_MODE_TCP || p->mode == PR_MODE_HTTP || p->mode == PR_MODE_SYSLOG) && !(p->cap & PR_CAP_INT))
+	if ((p->mode == PR_MODE_TCP || p->mode == PR_MODE_HTTP || p->mode == PR_MODE_SYSLOG || p->mode == PR_MODE_SPOP) && !(p->cap & PR_CAP_INT))
 		ha_warning("Proxy %s stopped (cumulated conns: FE: %lld, BE: %lld).\n",
 			   p->id, p->fe_counters.cum_conn, p->be_counters.cum_sess);
 
-	if ((p->mode == PR_MODE_TCP || p->mode == PR_MODE_HTTP) && !(p->cap & PR_CAP_INT))
+	if ((p->mode == PR_MODE_TCP || p->mode == PR_MODE_HTTP || p->mode == PR_MODE_SPOP) && !(p->cap & PR_CAP_INT))
 		send_log(p, LOG_WARNING, "Proxy %s stopped (cumulated conns: FE: %lld, BE: %lld).\n",
 			 p->id, p->fe_counters.cum_conn, p->be_counters.cum_sess);
 

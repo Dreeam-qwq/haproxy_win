@@ -3,7 +3,7 @@
                           Configuration Manual
                          ----------------------
                               version 3.1
-                              2024/07/10
+                              2024/08/07
 
 
 This document covers the configuration language as implemented in the version
@@ -45,7 +45,8 @@ Summary
 2.5.      Time format
 2.6.      Size format
 2.7.      Name format for maps and ACLs
-2.8.      Examples
+2.8.      Variables
+2.9.      Examples
 
 3.    Global parameters
 3.1.      Process management and security
@@ -1189,7 +1190,95 @@ Note: Even if it is unlikely, it means no regular file starting with "file@",
       front of the filename (for instance "file@./virt@map").
 
 
-2.8. Examples
+2.8. Variables
+--------------
+
+In HAProxy configuration, variables can be used in sample fetch functions,
+converters, log-format strings or TCP/HTTP actions. Process-wide variables can
+be defined, globally accessible for the whole life of the process. Some others
+have a shorter lifespan. Variables are similar to those found in shell
+scripts. It is a symbolic name for a chunk of memory. The variables size is not
+limited and is dynamically allocated. So they must be used with caution,
+especially for an intensive usage. However, it is possible to limit the maximum
+amount of memory used by the variables by setting "tune.vars" global parameters.
+
+Variables must be designated using the format "<scope>.<name>". The <scope> is
+a single word indicating the life time of the variable. The <name> part, inside
+a scope, may only contain characters 'a-z', 'A-Z', '0-9' and '_'. It is unique
+in this scope but the same name in different scopes can be used and refers to
+different variables. Supported scopes are:
+
+  * proc  : for variables known during the whole process lifespan and globally
+            accessible. "proc" variables can be manipulated from the CLI using
+            "get var" and "set var" commands. They can also be set from
+            "global" sections via "set-var" and "set-var-fmt" directives.
+
+  * sess  : for variables known during the whole lifespan of a session. "sess"
+            variables are private to a session, not visbile from outside it and
+            not shared with other sessions.
+
+  * txn   : for variables known during the whole lifespan of a transaction. "txn"
+            variables are private to a stream, not visible from outside it and
+            not shared with other streams.
+
+  * req   : for variables known during the request processing for a specific
+            stream. "req" variables are visible from the stream creation and
+            until the first server connection attempt. They are private to a
+            stream, not visible from outside it and not shared with other
+            streams. There is no overlap at all between "req" and "res"
+            variables.
+
+  * res   : for variables known during the response processing for a specific
+            stream. "res" variables are visible from the first server
+            connection attempt and until the stream destruction. They are
+            private to a stream, not visible from outside it and not shared
+            with other streams. There is no overlap at all between "req" and
+            "res" variables.
+
+  * check : for variables known during a health-check execution. "check"
+            variables are private to a health-check, not visible from outside
+            it and are not shared with other health-checks. They can be set
+            using dedicated "tcp-check" or "http-check" directives.
+
+Depending on the context, extra scopes referencing the parent of a current
+stream can be used:
+
+  * psess : same as "sess" but using the session of the parent stream, if any.
+
+  * ptxn  : same as "txn" but using the transaction of the parent stream, if
+            any.
+
+  * preq  : same as "req" but using the parent stream, if any. "preq"
+            variables are only accessible during request processing of the
+            parent stream.
+
+  * pres  : same as "res" but using the parent stream, if any. "pres"
+            variables are only accessible during response processing of the
+            parent stream.
+
+Scopes referencing the parent stream are usable from the moment it is defined.
+Most of time, there is no parent stream. But, if applicable, this will be
+explicitly specified. For now, it is only possible to retrieve the value of
+variables defined in a scope of the parent stream. It is not possible to set
+nor unset such variables. Usually a child stream performs some processing for
+the parent at a precise moment and prevents it from making progress until the
+operation it does is completed. This means that the parent may be stopped in
+the middle of a request processing or a response processing for example. As
+such, certain scopes will not be available from the child stream. For example
+if a request is subject to some analysis performed by a child stream, this
+child stream will not find any variable in the "pres" scope since the parent is
+not processing a response, hence doesn't have any variables in its "res" scope.
+
+The content of a variable is the result of the evaluation of a sample fetch
+expression and it inherits of the output type of this expression. It is
+important when the variable is used because its type must be compatible with
+its usage. For instance a variable containing a string used in "add()"
+converter must be convertible to a valid integer to succeed. It is especially
+true when variables are compared to static value. The right matching method
+must be used.
+
+
+2.9. Examples
 -------------
 
     # Simple configuration for an HTTP proxy listening on port 80 on all
@@ -1276,6 +1365,7 @@ The following keywords are supported in the "global" section :
    - h1-accept-payload-with-any-method
    - h1-case-adjust
    - h1-case-adjust-file
+   - h1-do-not-close-on-insecure-transfer-encoding
    - h2-workaround-bogus-websocket-clients
    - hard-stop-after
    - harden.reject-privileged-ports.tcp
@@ -1414,6 +1504,7 @@ The following keywords are supported in the "global" section :
    - tune.pool-low-fd-ratio
    - tune.pt.zero-copy-forwarding
    - tune.quic.cc-hystart
+   - tune.quic.disable-udp-gso
    - tune.quic.frontend.conn-tx-buffers.limit
    - tune.quic.frontend.glitches-threshold
    - tune.quic.frontend.max-idle-timeout
@@ -1877,6 +1968,32 @@ h1-accept-payload-with-any-method
   However, it may be an issue with some old clients. In this case, this global
   option may be set.
 
+h1-do-not-close-on-insecure-transfer-encoding
+  As mandated by the HTTP/1.1 specification (RFC9112#6.1), the presence of both
+  a Transfer-Encoding header field and a Content-Length header field in the
+  same message represents a serious risk of conveying a content smuggling
+  attack if there are any HTTP/1.0 agent anywhere in the upstream of downstream
+  chain, and when facing this, an agent must absolutely close the connection
+  after the response so as to prevent any exploitation. But this may have a
+  performance impact on some very old clients, especially if they need to
+  renegotiate a TLS connection for every request. This option is present to
+  ask HAProxy not to enforce this rule, and to just sanitize the message but
+  leave the connection alive after the response. This may only be done when
+  absolutely certain that no HTTP/1.0 agents are present in the chain and that
+  all implementations before HAProxy are fully HTTP/1.1 compliant regarding the
+  rules that apply to these header fields. In any case, HAProxy will continue
+  to ignore and drop the extraneous Content-Length header so as not to confuse
+  the next hop.
+
+  When enabling this option to work around an old broken client or server, it
+  is important to understand that regardless of the need or not for this
+  option, such an agent violating this rule faces a risk to see its messages
+  truncated by old agents that would consider Content-Length and ignore
+  Transfer-Encoding, since the cumulated size of the encoded chunk sizes are
+  not being accounted for. As such, the rule above is not just a matter of
+  security but also of taking care of getting rid of agents that may face
+  communication trouble due to incompatibilities with older ones.
+
 h1-case-adjust <from> <to>
   Defines the case adjustment to apply, when enabled, to the header name
   <from>, to change it to <to> before sending it to HTTP/1 clients or
@@ -2042,6 +2159,9 @@ issuers-chain-path <dir>
   chain if a file with IntermediateCA2+IntermediateCA1 is present in
   "issuers-chain-path" directory. All other certificates with the same issuer
   will share the chain in memory.
+
+  The OCSP features are able to use the completed chain when no .issuer was
+  used, or no chain was provided in the PEM.
 
 key-base <dir>
   Assigns a default directory to fetch SSL private keys from when a relative
@@ -3770,6 +3890,12 @@ tune.quic.cc-hystart { on | off }
   QUIC connections used as a replacement for the slow start phase of congestion
   control algorithms which may cause high packet loss. It is disabled by default.
 
+tune.quic.disable-udp-gso
+  Disable UDP GSO emission. This kernel feature allows to emit multiple
+  datagrams via a single system call which is more efficient for large
+  transfer. It may be useful to disable it on developers suggestion when
+  suspecting an issue on emission.
+
 tune.quic.frontend.conn-tx-buffers.limit <number>
   This settings defines the maximum number of buffers allocated for a QUIC
   connection on data emission. By default, it is set to 30. QUIC buffers are
@@ -4166,11 +4292,18 @@ quiet
 
 zero-warning
   When this option is set, HAProxy will refuse to start if any warning was
-  emitted while processing the configuration. It is highly recommended to set
-  this option on configurations that are not changed often, as it helps detect
-  subtle mistakes and keep the configuration clean and forward-compatible. Note
-  that "haproxy -c" will also report errors in such a case. This option is
-  equivalent to command line argument "-dW".
+  emitted while processing the configuration and applying it. It means that
+  warnings about bad combinations of parameters, warnings about very high
+  limits that couldn't be set, and so on, make the process exit with an error
+  during startup. A few late startup warnings cannot be caught by this option,
+  such as the failure to drop supplementary groups when changing the group ID
+  in "daemon" or "master-worker" modes, or the failure to mark the process
+  dumpable after the fork(). This option does not catch warnings emitted at
+  runtime. It is highly recommended to set this option on configurations that
+  are not changed often, as it helps to detect subtle mistakes and keep the
+  configuration clean and forward-compatible. Note that "haproxy -c" will also
+  report errors in such a case. This option is equivalent to command line
+  argument "-dW".
 
 
 3.4. Userlists
@@ -5299,6 +5432,7 @@ option idle-close-on-response        (*)  X          X         X         -
 external-check command                    X          -         X         X
 external-check path                       X          -         X         X
 persist rdp-cookie                        X          -         X         X
+quic-initial                              X (!)      X         X         -
 rate-limit sessions                       X          X         X         -
 redirect                                  -          X         X         X
 -- keyword -------------------------- defaults - frontend - listen -- backend -
@@ -7624,14 +7758,8 @@ http-check set-var-fmt(<var-name>[,<cond>...]) <fmt>
                                yes    |    no    |   yes  |   yes
 
   Arguments :
-    <var-name>  The name of the variable starts with an indication about its
-                scope. The scopes allowed for http-check are:
-                  "proc" : the variable is shared with the whole process.
-                  "sess" : the variable is shared with the tcp-check session.
-                  "check": the variable is declared for the lifetime of the tcp-check.
-                This prefix is followed by a name. The separator is a '.'.
-                The name may only contain characters 'a-z', 'A-Z', '0-9', '.',
-                and '-'.
+   <var-name>   The name of the variable. Only "proc", "sess" and "check"
+                scopes can be used. See section 2.8 about variables for details.
 
     <cond>      A set of conditions that must all be true for the variable to
                 actually be set (such as "ifnotempty", "ifgt" ...). See the
@@ -7657,14 +7785,8 @@ http-check unset-var(<var-name>)
                                yes    |    no    |   yes  |   yes
 
   Arguments :
-    <var-name>  The name of the variable starts with an indication about its
-                scope. The scopes allowed for http-check are:
-                  "proc" : the variable is shared with the whole process.
-                  "sess" : the variable is shared with the tcp-check session.
-                  "check": the variable is declared for the lifetime of the tcp-check.
-                This prefix is followed by a name. The separator is a '.'.
-                The name may only contain characters 'a-z', 'A-Z', '0-9', '.',
-                and '-'.
+   <var-name>   The name of the variable. Only "proc", "sess" and "check"
+                scopes can be used. See section 2.8 about variables for details.
 
   Examples :
         http-check unset-var(check.port)
@@ -8490,7 +8612,7 @@ maxconn <conns>
   See also : "server", global section's "maxconn", "fullconn"
 
 
-mode { tcp|http|log }
+mode { tcp|http|log|spop }
   Set the running mode or protocol of the instance
   May be used in sections :   defaults | frontend | listen | backend
                                  yes   |    yes   |   yes  |   yes
@@ -8514,6 +8636,10 @@ mode { tcp|http|log }
               "balance" keyword. Log backends support UDP servers by prefixing
               the server's address with the "udp@" prefix. Common backend and
               server features are supported, but not TCP or HTTP specific ones.
+
+    spop      When used in a backend section, it will turn the backend into a
+              log backend. This mode is mandatory and automatically set, if
+              necessary, for backends referenced by SPOE engines.
 
   When doing content switching, it is mandatory that the frontend and the
   backend are in the same mode (generally HTTP), otherwise the configuration
@@ -10886,6 +11012,38 @@ persist rdp-cookie(<name>)
   See also : "balance rdp-cookie", "tcp-request" and the "req.rdp_cookie" ACL.
 
 
+quic-initial <action> [ { if | unless } <condition> ]
+  Perform an action on an incoming QUIC Initial packet. Contrary to
+  "tcp-request connection", this is executed prior to any connection element
+  instantiation and starting and completion of the SSL handshake, which is more
+  efficient when wanting to reject connections attempts.
+
+  May be used in the following contexts: http
+
+  May be used in sections :   defaults | frontend | listen | backend
+                                yes(!) |    yes   |   yes  |   no
+
+  Arguments :
+    <action>    defines the action to perform if the condition applies. See
+                below.
+
+    <condition> is a standard layer4-only ACL-based condition (see section 7).
+                However, QUIC initial rules are executed too early even for
+                some layer4 sample fetch methods despite no configuration
+                warning and may result in unspecified runtime behavior,
+                although they will not crash. Consider that only internal
+                samples and layer4 "src*" and "dst*" are considered as
+                supported for now.
+
+
+  This action is executed early during QUIC packet parsing. As such, only a
+  minimal list of actions is supported :
+    - accept
+    - dgram-drop
+    - reject
+    - send-retry
+
+
 rate-limit sessions <rate>
   Set a limit on the number of new sessions accepted per second on a frontend
 
@@ -13018,14 +13176,8 @@ tcp-check set-var-fmt(<var-name>[,<cond>...]) <fmt>
                                yes    |    no    |   yes  |   yes
 
   Arguments :
-    <var-name>  The name of the variable starts with an indication about its
-                scope. The scopes allowed for tcp-check are:
-                  "proc" : the variable is shared with the whole process.
-                  "sess" : the variable is shared with the tcp-check session.
-                  "check": the variable is declared for the lifetime of the tcp-check.
-                This prefix is followed by a name. The separator is a '.'.
-                The name may only contain characters 'a-z', 'A-Z', '0-9', '.',
-                and '-'.
+   <var-name>   The name of the variable. Only "proc", "sess" and "check"
+                scopes can be used. See section 2.8 about variables for details.
 
     <cond>      A set of conditions that must all be true for the variable to
                 actually be set (such as "ifnotempty", "ifgt" ...). See the
@@ -13051,14 +13203,8 @@ tcp-check unset-var(<var-name>)
                                yes    |    no    |   yes  |   yes
 
   Arguments :
-    <var-name>  The name of the variable starts with an indication about its
-                scope. The scopes allowed for tcp-check are:
-                  "proc" : the variable is shared with the whole process.
-                  "sess" : the variable is shared with the tcp-check session.
-                  "check": the variable is declared for the lifetime of the tcp-check.
-                This prefix is followed by a name. The separator is a '.'.
-                The name may only contain characters 'a-z', 'A-Z', '0-9', '.',
-                and '-'.
+   <var-name>   The name of the variable. Only "proc", "sess" and "check"
+                scopes can be used. See section 2.8 about variables for details.
 
   Examples :
     tcp-check unset-var(check.port)
@@ -13702,14 +13848,47 @@ timeout http-keep-alive <timeout>
   There is also another difference between the two timeouts : when a connection
   expires during timeout http-keep-alive, no error is returned, the connection
   just closes. If the connection expires in "http-request" while waiting for a
-  connection to complete, a HTTP 408 error is returned.
+  request to complete, an HTTP 408 error is returned to the client before
+  closing the connection, unless "option http-ignore-probes" is set in the
+  frontend.
 
-  In general it is optimal to set this value to a few tens to hundreds of
-  milliseconds, to allow users to fetch all objects of a page at once but
-  without waiting for further clicks. Also, if set to a very small value (e.g.
-  1 millisecond) it will probably only accept pipelined requests but not the
-  non-pipelined ones. It may be a nice trade-off for very large sites running
-  with tens to hundreds of thousands of clients.
+  In general "timeout http-keep-alive" is best used to prevent clients from
+  holding open an otherwise idle connection too long on sites seeing large
+  amounts of short connections. This can be accomplished by setting the value
+  to a few tens to hundreds of milliseconds in HTTP/1.1. This will close the
+  connection after the client requests a page without having to hold that
+  connection open to wait for more activity from the client. In that scenario,
+  a new activity from the browser would result in a new handshake at the TCP
+  and/or SSL layer. A common use case for this is HTTP sites serving only a
+  redirect to the HTTPS page. Such connections are better not kept idle too
+  long because they won't be reused, unless maybe to fetch a favicon.
+
+  Another use case is the exact opposite: some sites want to permit clients
+  to reuse idle connections for a long time (e.g. 30 seconds to one minute) but
+  do not want to wait that long for the first request, in order to avoid a very
+  inexpensive attack vector. In this case, the http-keep-alive timeout would be
+  set to a large value, but http-request would remain low (a few seconds).
+
+  When set to a very small value additional requests that are not pipelined
+  are likely going to be handled over another connection unless the requests
+  are truly pipelined, which is very rare with HTTP/1.1 (requests being sent
+  back-to-back without waiting for a response). Most HTTP/1.1 implementations
+  send a request, wait for a response and then send another request. A small
+  value here for HTTP/1.1 may be advantageous to use less memory and sockets
+  for sites with hundreds of thousands of clients, at the expense of an
+  increase in handshake computation costs.
+
+  Special care should be taken with small values when dealing with HTTP/2. The
+  nature of HTTP/2 is to multiplex requests over a connection in order to save
+  on the overhead of reconnecting the TCP and/or SSL layers. The protocol also
+  uses control frames which cope poorly with early TCP connection closures, on
+  very rare occasions this may result in truncated responses when data are
+  destroyed in flight after leaving HAProxy (which then cannot even log an
+  error). A suggested low starting value for HTTP/2 connections would be around
+  4 seconds. This would prevent most modern keep-alive implementations from
+  needlessly holding open stale connections, and at the same time would allow
+  subsequent requests to reuse the connection. However, this should be adjusted
+  as needed and is simply a starting point.
 
   If this parameter is not set, the "http-request" timeout applies, and if both
   are not set, "timeout client" still applies at the lower level. It should be
@@ -14193,6 +14372,7 @@ many actions are usable with many rule sets. The listing in this section will
 indicate for which supported action where it may be used, by ticking the
 corresponding abbreviated entry names among the following rule sets:
 
+  - QUIC  Ini: the action is valid for "quic-initial" rules
   - TCP RqCon: the action is valid for "tcp-request connection" rules
   - TCP RqSes: the action is valid for "tcp-request session" rules
   - TCP RqCnt: the action is valid for "tcp-request content" rules
@@ -14203,83 +14383,84 @@ corresponding abbreviated entry names among the following rule sets:
 
 The same abbreviations are used in the reference section 4.4 below.
 
-
- keyword                TCP: RqCon RqSes RqCnt RsCnt   HTTP: Req Res Aft
-----------------------+-----------+-----+-----+------+----------+---+----
-accept                         X     X     X     X            -   -   -
-add-acl                        -     -     -     -            X   X   -
-add-header                     -     -     -     -            X   X   X
-allow                          -     -     -     -            X   X   X
-attach-srv                     -     X     -     -            -   -   -
-auth                           -     -     -     -            X   -   -
-cache-store                    -     -     -     -            -   X   -
-cache-use                      -     -     -     -            X   -   -
-capture                        -     -     X     -            X   X   X
-close                          -     -     -     X            -   -   -
-del-acl                        -     -     -     -            X   X   -
-del-header                     -     -     -     -            X   X   X
-del-map                        -     -     -     -            X   X   X
-deny                           -     -     -     -            X   X   -
-disable-l7-retry               -     -     -     -            X   -   -
-do-resolve                     -     -     X     -            X   -   -
-early-hint                     -     -     -     -            X   -   -
-expect-netscaler-cip           X     -     -     -            -   -   -
-expect-proxy layer4            X     -     -     -            -   -   -
-normalize-uri                  -     -     -     -            X   -   -
-redirect                       -     -     -     -            X   X   -
-reject                         X     X     X     X            X   -   -
-replace-header                 -     -     -     -            X   X   X
-replace-path                   -     -     -     -            X   -   -
-replace-pathq                  -     -     -     -            X   -   -
-replace-uri                    -     -     -     -            X   -   -
-replace-value                  -     -     -     -            X   X   X
-return                         -     -     -     -            X   X   -
-sc-add-gpc                     X     X     X     X            X   X   X
---keyword---------------TCP--RqCon-RqSes-RqCnt-RsCnt---HTTP--Req-Res-Aft-
-sc-inc-gpc                     X     X     X     X            X   X   X
-sc-inc-gpc0                    X     X     X     X            X   X   X
-sc-inc-gpc1                    X     X     X     X            X   X   X
-sc-set-gpt                     X     X     X     X            X   X   X
-sc-set-gpt0                    X     X     X     X            X   X   X
-send-spoe-group                -     -     X     X            X   X   -
-set-bandwidth-limit            -     -     X     X            X   X   -
-set-bc-mark                    -     -     X     -            X   -   -
-set-bc-tos                     -     -     X     -            X   -   -
-set-dst                        X     X     X     -            X   -   -
-set-dst-port                   X     X     X     -            X   -   -
-set-fc-mark                    X     X     X     X            X   X   -
-set-fc-tos                     X     X     X     X            X   X   -
-set-header                     -     -     -     -            X   X   X
-set-log-level                  -     -     X     X            X   X   X
-set-map                        -     -     -     -            X   X   X
-set-mark (deprecated)          X     X     X     X            X   X   -
-set-method                     -     -     -     -            X   -   -
-set-nice                       -     -     X     X            X   X   -
-set-path                       -     -     -     -            X   -   -
-set-pathq                      -     -     -     -            X   -   -
-set-priority-class             -     -     X     -            X   -   -
-set-priority-offset            -     -     X     -            X   -   -
---keyword---------------TCP--RqCon-RqSes-RqCnt-RsCnt---HTTP--Req-Res-Aft-
-set-query                      -     -     -     -            X   -   -
-set-src                        X     X     X     -            X   -   -
-set-src-port                   X     X     X     -            X   -   -
-set-status                     -     -     -     -            -   X   X
-set-timeout                    -     -     -     -            X   X   -
-set-tos (deprecated)           X     X     X     X            X   X   -
-set-uri                        -     -     -     -            X   -   -
-set-var                        X     X     X     X            X   X   X
-set-var-fmt                    X     X     X     X            X   X   X
-silent-drop                    X     X     X     X            X   X   -
-strict-mode                    -     -     -     -            X   X   X
-switch-mode                    -     -     X     -            -   -   -
-tarpit                         -     -     -     -            X   -   -
-track-sc1                      X     X     X     -            X   X   -
-track-sc2                      X     X     X     -            X   X   -
-unset-var                      X     X     X     X            X   X   X
-use-service                    -     -     X     -            X   -   -
-wait-for-body                  -     -     -     -            X   X   -
-wait-for-handshake             -     -     -     -            X   -   -
---keyword---------------TCP--RqCon-RqSes-RqCnt-RsCnt---HTTP--Req-Res-Aft-
+ keyword                QUIC: Ini   TCP: RqCon RqSes RqCnt RsCnt   HTTP: Req Res Aft
+----------------------+-----------+-----------+-----+-----+------+----------+---+----
+accept                         X           X     X     X     X            -   -   -
+add-acl                        -           -     -     -     -            X   X   -
+add-header                     -           -     -     -     -            X   X   X
+allow                          -           -     -     -     -            X   X   X
+attach-srv                     -           -     X     -     -            -   -   -
+auth                           -           -     -     -     -            X   -   -
+cache-store                    -           -     -     -     -            -   X   -
+cache-use                      -           -     -     -     -            X   -   -
+capture                        -           -     -     X     -            X   X   X
+close                          -           -     -     -     X            -   -   -
+del-acl                        -           -     -     -     -            X   X   -
+del-header                     -           -     -     -     -            X   X   X
+del-map                        -           -     -     -     -            X   X   X
+deny                           -           -     -     -     -            X   X   -
+dgram-drop                     X           -     -     -     -            -   -   -
+disable-l7-retry               -           -     -     -     -            X   -   -
+do-resolve                     -           -     -     X     -            X   -   -
+early-hint                     -           -     -     -     -            X   -   -
+expect-netscaler-cip           -           X     -     -     -            -   -   -
+expect-proxy layer4            -           X     -     -     -            -   -   -
+normalize-uri                  -           -     -     -     -            X   -   -
+redirect                       -           -     -     -     -            X   X   -
+reject                         X           X     X     X     X            X   -   -
+replace-header                 -           -     -     -     -            X   X   X
+replace-path                   -           -     -     -     -            X   -   -
+replace-pathq                  -           -     -     -     -            X   -   -
+replace-uri                    -           -     -     -     -            X   -   -
+replace-value                  -           -     -     -     -            X   X   X
+return                         -           -     -     -     -            X   X   -
+sc-add-gpc                     -           X     X     X     X            X   X   X
+--keyword---------------QUIC--Ini---TCP--RqCon-RqSes-RqCnt-RsCnt---HTTP--Req-Res-Aft-
+sc-inc-gpc                     -           X     X     X     X            X   X   X
+sc-inc-gpc0                    -           X     X     X     X            X   X   X
+sc-inc-gpc1                    -           X     X     X     X            X   X   X
+sc-set-gpt                     -           X     X     X     X            X   X   X
+sc-set-gpt0                    -           X     X     X     X            X   X   X
+send-retry                     X           -     -     -     -            -   -   -
+send-spoe-group                -           -     -     X     X            X   X   -
+set-bandwidth-limit            -           -     -     X     X            X   X   -
+set-bc-mark                    -           -     -     X     -            X   -   -
+set-bc-tos                     -           -     -     X     -            X   -   -
+set-dst                        -           X     X     X     -            X   -   -
+set-dst-port                   -           X     X     X     -            X   -   -
+set-fc-mark                    -           X     X     X     X            X   X   -
+set-fc-tos                     -           X     X     X     X            X   X   -
+set-header                     -           -     -     -     -            X   X   X
+set-log-level                  -           -     -     X     X            X   X   X
+set-map                        -           -     -     -     -            X   X   X
+set-mark (deprecated)          -           X     X     X     X            X   X   -
+set-method                     -           -     -     -     -            X   -   -
+set-nice                       -           -     -     X     X            X   X   -
+set-path                       -           -     -     -     -            X   -   -
+set-pathq                      -           -     -     -     -            X   -   -
+set-priority-class             -           -     -     X     -            X   -   -
+set-priority-offset            -           -     -     X     -            X   -   -
+--keyword---------------QUIC--Ini---TCP--RqCon-RqSes-RqCnt-RsCnt---HTTP--Req-Res-Aft-
+set-query                      -           -     -     -     -            X   -   -
+set-src                        -           X     X     X     -            X   -   -
+set-src-port                   -           X     X     X     -            X   -   -
+set-status                     -           -     -     -     -            -   X   X
+set-timeout                    -           -     -     -     -            X   X   -
+set-tos (deprecated)           -           X     X     X     X            X   X   -
+set-uri                        -           -     -     -     -            X   -   -
+set-var                        -           X     X     X     X            X   X   X
+set-var-fmt                    -           X     X     X     X            X   X   X
+silent-drop                    -           X     X     X     X            X   X   -
+strict-mode                    -           -     -     -     -            X   X   X
+switch-mode                    -           -     -     X     -            -   -   -
+tarpit                         -           -     -     -     -            X   -   -
+track-sc1                      -           X     X     X     -            X   X   -
+track-sc2                      -           X     X     X     -            X   X   -
+unset-var                      -           X     X     X     X            X   X   X
+use-service                    -           -     -     X     -            X   -   -
+wait-for-body                  -           -     -     -     -            X   X   -
+wait-for-handshake             -           -     -     -     -            X   -   -
+--keyword---------------QUIC--Ini---TCP--RqCon-RqSes-RqCnt-RsCnt---HTTP--Req-Res-Aft-
 
 
 4.4. Alphabetically sorted actions reference
@@ -14290,20 +14471,20 @@ using the same ruleset terminology marking as described in section 4.3 above.
 
 
 accept
-  Usable in:  TCP RqCon| RqSes| RqCnt| RsCnt |   HTTP Req| Res| Aft
-                    X  |   X  |   X  |   X   |         - |  - |  -
+  Usable in:  QUIC Ini|    TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
+                    X |          X  |   X  |   X  |   X  |         - |  - |  -
 
   This stops the evaluation of the rules and lets the request or response pass
   the check. This action is final, i.e. no further rules from the same rule set
   are evaluated for the current section. There is no difference between this
   and the "allow" action except that for historical compatibility, "accept" is
-  used for TCP rules and "allow" for HTTP rules. See also the "allow" action
-  below.
+  used for TCP and QUIC rules and "allow" for HTTP rules. See also the "allow"
+  action below.
 
 
 add-acl(<file-name>) <key fmt>
-  Usable in:  TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
-                    -  |   -  |   -  |   -  |          X |  X |  -
+  Usable in:  QUIC Ini|    TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
+                    - |          -  |   -  |   -  |   -  |          X |  X |  -
 
   This is used to add a new entry into an ACL. The ACL must be loaded from a
   file (even a dummy empty file). The file name of the ACL to be updated is
@@ -14315,8 +14496,8 @@ add-acl(<file-name>) <key fmt>
 
 
 add-header <name> <fmt>
-  Usable in:  TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
-                    -  |   -  |   -  |   -  |          X |  X |  X
+  Usable in:  QUIC Ini|    TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
+                    - |          -  |   -  |   -  |   -  |          X |  X |  X
 
   This appends an HTTP header field whose name is specified in <name> and
   whose value is defined by <fmt> which follows the Custom log format rules
@@ -14329,8 +14510,8 @@ add-header <name> <fmt>
 
 
 allow
-  Usable in:  TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
-                    -  |   -  |   -  |   -  |          X |  X |  X
+  Usable in:  QUIC Ini|    TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
+                    - |          -  |   -  |   -  |   -  |          X |  X |  X
 
   This stops the evaluation of the rules and lets the request pass the check.
   This action is final, i.e. no further rules from the same rule set are
@@ -14341,8 +14522,8 @@ allow
 
 
 attach-srv <srv> [name <expr>] [ EXPERIMENTAL ]
-  Usable in:  TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
-                    -  |   X  |   -  |   -  |          - |  - |  -
+  Usable in:  QUIC Ini|    TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
+                    - |          -  |   X  |   -  |   -  |          - |  - |  -
 
   This is used to intercept the connection after proper HTTP/2 establishment.
   The connection is reversed to the backend side and inserted into the idle
@@ -14363,8 +14544,8 @@ attach-srv <srv> [name <expr>] [ EXPERIMENTAL ]
   https://www.ietf.org/archive/id/draft-bt-httpbis-reverse-http-00.html.
 
 auth [realm <realm>]
-  Usable in:  TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
-                    -  |   -  |   -  |   -  |          X |  - |  -
+  Usable in:  QUIC Ini|    TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
+                    - |          -  |   -  |   -  |   -  |          X |  - |  -
 
   This stops the evaluation of the rules and immediately responds with an
   HTTP 401 or 407 error code to invite the user to present a valid user name
@@ -14386,8 +14567,8 @@ auth [realm <realm>]
 
 
 cache-store <name>
-  Usable in:  TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
-                    -  |   -  |   -  |   -  |          - |  X |  -
+  Usable in:  QUIC Ini|    TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
+                    - |          -  |   -  |   -  |   -  |          - |  X |  -
 
   Store an http-response within the cache. The storage of the response headers
   is done at this step, which means you can use others http-response actions
@@ -14398,8 +14579,8 @@ cache-store <name>
 
 
 cache-use <name>
-  Usable in:  TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
-                    -  |   -  |   -  |   -  |          X |  - |  -
+  Usable in:  QUIC Ini|    TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
+                    - |          -  |   -  |   -  |   -  |          X |  - |  -
 
   Try to deliver a cached object from the cache <name>. This directive is also
   mandatory to store the cache as it calculates the cache hash. If you want to
@@ -14410,8 +14591,8 @@ cache-use <name>
 
 
 capture <sample> [ len <length> | id <id> ]
-  Usable in:  TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
-                    -  |   -  |   X  |   -  |          X |  X |  X
+  Usable in:  QUIC Ini|    TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
+                    - |          -  |   -  |   X  |   -  |          X |  X |  X
 
   This captures sample expression <sample> from the request or response buffer,
   and converts it to a string of at most <len> characters. The resulting string
@@ -14436,8 +14617,8 @@ capture <sample> [ len <length> | id <id> ]
 
 
 close
-  Usable in:  TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
-                    -  |   -  |   -  |   X  |          - |  - |  -
+  Usable in:  QUIC Ini|    TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
+                    - |          -  |   -  |   -  |   X  |          - |  - |  -
 
   This is used to immediately close the connection with the server. No further
   "tcp-response content" rules are evaluated. The main purpose of this action
@@ -14448,8 +14629,8 @@ close
 
 
 del-acl(<file-name>) <key fmt>
-  Usable in:  TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
-                    -  |   -  |   -  |   -  |          X |  X |  -
+  Usable in:  QUIC Ini|    TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
+                    - |          -  |   -  |   -  |   -  |          X |  X |  -
 
   This is used to delete an entry from an ACL. The ACL must be loaded from a
   file (even a dummy empty file). The file name of the ACL to be updated is
@@ -14460,8 +14641,8 @@ del-acl(<file-name>) <key fmt>
 
 
 del-header <name> [ -m <meth> ]
-  Usable in:  TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
-                    -  |   -  |   -  |   -  |          X |  X |  X
+  Usable in:  QUIC Ini|    TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
+                    - |          -  |   -  |   -  |   -  |          X |  X |  X
 
   This removes all HTTP header fields whose name is specified in <name>. <meth>
   is the matching method, applied on the header name. Supported matching methods
@@ -14471,8 +14652,8 @@ del-header <name> [ -m <meth> ]
 
 
 del-map(<map-name>) <key fmt>
-  Usable in:  TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
-                    -  |   -  |   -  |   -  |          X |  X |  X
+  Usable in:  QUIC Ini|    TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
+                    - |          -  |   -  |   -  |   -  |          X |  X |  X
 
   This is used to delete an entry from a MAP. <map-name> must follow the format
   described in 2.7. about name format for maps and ACLs. The name of the MAP to
@@ -14487,8 +14668,8 @@ deny [ { status | deny_status } <code> ] [ content-type <type> ]
      [ { default-errorfiles | errorfile <file> | errorfiles <name> |
        file <file> | lf-file <file> | string <str> | lf-string <fmt> } ]
      [ hdr <name> <fmt> ]*
-  Usable in:  TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
-                    -  |   -  |   -  |   -  |          X |  X |  -
+  Usable in:  QUIC Ini|    TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
+                    - |          -  |   -  |   -  |   -  |          X |  X |  -
 
   This stops the evaluation of the rules and immediately rejects the request or
   response. By default an HTTP 403 error is returned for requests, and 502 for
@@ -14502,9 +14683,18 @@ deny [ { status | deny_status } <code> ] [ content-type <type> ]
   syntax.
 
 
+dgram-drop
+  Usable in:  QUIC Ini|    TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
+                    X |          -  |   -  |   -  |   -  |          - |  - |  -
+
+  This silently ignores the reception of a QUIC initial packet which otherwise
+  whould have resulted in a new QUIC connection instantiation and its SSL
+  handshake execution.
+
+
 disable-l7-retry
-  Usable in:  TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
-                    -  |   -  |   -  |   -  |          X |  - |  -
+  Usable in:  QUIC Ini|    TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
+                    - |          -  |   -  |   -  |   -  |          X |  - |  -
 
   This disables any attempt to retry the request if it fails for any other
   reason than a connection failure. This can be useful for example to make
@@ -14512,8 +14702,8 @@ disable-l7-retry
 
 
 do-resolve(<var>,<resolvers>,[ipv4,ipv6]) <expr>
-  Usable in:  TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
-                    -  |   -  |   X  |   -  |          X |  - |  -
+  Usable in:  QUIC Ini|    TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
+                    - |          -  |   -  |   X  |   -  |          X |  - |  -
 
   This action performs a DNS resolution of the output of <expr> and stores
   the result in the variable <var>. It uses the DNS resolvers section
@@ -14570,8 +14760,8 @@ do-resolve(<var>,<resolvers>,[ipv4,ipv6]) <expr>
 
 
 early-hint <name> <fmt>
-  Usable in:  TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
-                    -  |   -  |   -  |   -  |          X |  - |  -
+  Usable in:  QUIC Ini|    TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
+                    - |          -  |   -  |   -  |   -  |          X |  - |  -
 
   This is used to build an HTTP 103 Early Hints response prior to any other one.
   This appends an HTTP header field to this response whose name is specified in
@@ -14584,8 +14774,8 @@ early-hint <name> <fmt>
 
 
 expect-netscaler-cip layer4
-  Usable in:  TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
-                    X  |   -  |   -  |   -  |          - |  - |  -
+  Usable in:  QUIC Ini|    TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
+                    - |          X  |   -  |   -  |   -  |          - |  - |  -
 
   This configures the client-facing connection to receive a NetScaler Client IP
   insertion protocol header before any byte is read from the socket.  This is
@@ -14597,8 +14787,8 @@ expect-netscaler-cip layer4
 
 
 expect-proxy layer4
-  Usable in:  TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
-                    X  |   -  |   -  |   -  |          - |  - |  -
+  Usable in:  QUIC Ini|    TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
+                    - |          X  |   -  |   -  |   -  |          - |  - |  -
 
   This configures the client-facing connection to receive a PROXY protocol
   header before any byte is read from the socket. This is equivalent to having
@@ -14617,8 +14807,8 @@ normalize-uri path-strip-dotdot [ full ]
 normalize-uri percent-decode-unreserved [ strict ]
 normalize-uri percent-to-uppercase [ strict ]
 normalize-uri query-sort-by-name
-  Usable in:  TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
-                    -  |   -  |   -  |   -  |          X |  - |  -
+  Usable in:  QUIC Ini|    TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
+                    - |          -  |   -  |   -  |   -  |          X |  - |  -
 
   Performs normalization of the request's URI.
 
@@ -14759,8 +14949,8 @@ normalize-uri query-sort-by-name
 
 
 redirect <rule>
-  Usable in:  TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
-                    -  |   -  |   -  |   -  |          X |  X |  -
+  Usable in:  QUIC Ini|    TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
+                    - |          -  |   -  |   -  |   -  |          X |  X |  -
 
   This performs an HTTP redirection based on a redirect rule. This is exactly
   the same as the "redirect" statement except that it inserts a redirect rule
@@ -14775,8 +14965,8 @@ redirect <rule>
 
 
 reject
-  Usable in:  TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
-                    X  |   X  |   X  |   X  |          X |  - |  -
+  Usable in:  QUIC Ini|    TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
+                    X |          X  |   X  |   X  |   X  |          X |  - |  -
 
   This stops the evaluation of the rules and immediately closes the connection
   without sending any response. For HTTP rules, it acts similarly to the
@@ -14799,10 +14989,14 @@ reject
   information from leaking, typically after inspecting contents in conjunction
   with the "wait-for-body" action.
 
+  This action can also be used in "quic-initial" rules. The newly opened QUIC
+  connection is immediately closed without any SSL handshake processing and the
+  client is notified via a CONNECTION_REFUSED error code.
+
 
 replace-header <name> <match-regex> <replace-fmt>
-  Usable in:  TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
-                    -  |   -  |   -  |   -  |          X |  X |  X
+  Usable in:  QUIC Ini|    TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
+                    - |          -  |   -  |   -  |   -  |          X |  X |  X
 
   This matches the value of all occurrences of header field <name> against
   <match-regex>. Matching is performed case-sensitively. Matching values are
@@ -14850,8 +15044,8 @@ replace-header <name> <match-regex> <replace-fmt>
 
 
 replace-path <match-regex> <replace-fmt>
-  Usable in:  TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
-                    -  |   -  |   -  |   -  |          X |  - |  -
+  Usable in:  QUIC Ini|    TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
+                    - |          -  |   -  |   -  |   -  |          X |  - |  -
 
   This works like "replace-header" except that it works on the request's path
   component instead of a header. The path component starts at the first '/'
@@ -14874,8 +15068,8 @@ replace-path <match-regex> <replace-fmt>
 
 
 replace-pathq <match-regex> <replace-fmt>
-  Usable in:  TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
-                    -  |   -  |   -  |   -  |          X |  - |  -
+  Usable in:  QUIC Ini|    TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
+                    - |          -  |   -  |   -  |   -  |          X |  - |  -
 
   This does the same as "http-request replace-path" except that the path
   contains the query-string if any is present. Thus, the path and the
@@ -14887,8 +15081,8 @@ replace-pathq <match-regex> <replace-fmt>
 
 
 replace-uri <match-regex> <replace-fmt>
-  Usable in:  TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
-                    -  |   -  |   -  |   -  |          X |  - |  -
+  Usable in:  QUIC Ini|    TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
+                    - |          -  |   -  |   -  |   -  |          X |  - |  -
 
   This works like "replace-header" except that it works on the request's URI part
   instead of a header. The URI part may contain an optional scheme, authority or
@@ -14920,8 +15114,8 @@ replace-uri <match-regex> <replace-fmt>
 
 
 replace-value <name> <match-regex> <replace-fmt>
-  Usable in:  TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
-                    -  |   -  |   -  |   -  |          X |  X |  X
+  Usable in:  QUIC Ini|    TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
+                    - |          -  |   -  |   -  |   -  |          X |  X |  X
 
   This works like "replace-header" except that it matches the regex against
   every comma-delimited value of the header field <name> instead of the
@@ -14952,8 +15146,8 @@ return [ status <code> ] [ content-type <type> ]
        [ { default-errorfiles | errorfile <file> | errorfiles <name> |
          file <file> | lf-file <file> | string <str> | lf-string <fmt> } ]
        [ hdr <name> <fmt> ]*
-  Usable in:  TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
-                    -  |   -  |   -  |   -  |          X |  X |  -
+  Usable in:  QUIC Ini|    TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
+                    - |          -  |   -  |   -  |   -  |          X |  X |  -
 
   This stops the evaluation of the rules and immediately returns a response. The
   default status code used for the response is 200. It can be optionally
@@ -15026,8 +15220,8 @@ return [ status <code> ] [ content-type <type> ]
 
 
 sc-add-gpc(<idx>,<sc-id>) { <int> | <expr> }
-  Usable in:  TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
-                    X  |   X  |   X  |   X  |          X |  X |  X
+  Usable in:  QUIC Ini|    TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
+                    - |          X  |   X  |   X  |   X  |          X |  X |  X
 
   This action increments the General Purpose Counter at the index <idx> of the
   array associated to the sticky counter designated by <sc-id> by the value of
@@ -15052,8 +15246,8 @@ sc-add-gpc(<idx>,<sc-id>) { <int> | <expr> }
 
 
 sc-inc-gpc(<idx>,<sc-id>)
-  Usable in:  TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
-                    X  |   X  |   X  |   X  |          X |  X |  X
+  Usable in:  QUIC Ini|    TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
+                    - |          X  |   X  |   X  |   X  |          X |  X |  X
 
   This actions increments the General Purpose Counter at the index <idx> of the
   array associated to the sticky counter designated by <sc-id>. If an error
@@ -15066,8 +15260,8 @@ sc-inc-gpc(<idx>,<sc-id>)
 
 sc-inc-gpc0(<sc-id>)
 sc-inc-gpc1(<sc-id>)
-  Usable in:  TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
-                    X  |   X  |   X  |   X  |          X |  X |  X
+  Usable in:  QUIC Ini|    TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
+                    - |          X  |   X  |   X  |   X  |          X |  X |  X
 
   This actions increments the GPC0 or GPC1 counter according with the sticky
   counter designated by <sc-id>. If an error occurs, this action silently fails
@@ -15075,8 +15269,8 @@ sc-inc-gpc1(<sc-id>)
 
 
 sc-set-gpt(<idx>,<sc-id>) { <int> | <expr> }
-  Usable in:  TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
-                    X  |   X  |   X  |   X  |          X |  X |  X
+  Usable in:  QUIC Ini|    TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
+                    - |          X  |   X  |   X  |   X  |          X |  X |  X
 
   This action sets the 32-bit unsigned GPT at the index <idx> of the array
   associated to the sticky counter designated by <sc-id> at the value of
@@ -15092,8 +15286,8 @@ sc-set-gpt(<idx>,<sc-id>) { <int> | <expr> }
 
 
 sc-set-gpt0(<sc-id>) { <int> | <expr> }
-  Usable in:  TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
-                    X  |   X  |   X  |   X  |          X |  X |  X
+  Usable in:  QUIC Ini|    TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
+                    - |          X  |   X  |   X  |   X  |          X |  X |  X
 
   This action sets the 32-bit unsigned GPT0 tag according to the sticky counter
   designated by <sc-id> and the value of <int>/<expr>. The expected result is a
@@ -15102,9 +15296,19 @@ sc-set-gpt0(<sc-id>) { <int> | <expr> }
   See also the "sc-set-gpt" action.
 
 
+send-retry
+  Usable in:  QUIC Ini|    TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
+                    X |          -  |   -  |   -  |   -  |          - |  - |  -
+
+  This action forces the emission of a Retry packet in response to a client
+  Initial packet without token. This is useful to ensure client address is
+  validated prior to instantiating any connection elements and starting the
+  handshake.
+
+
 send-spoe-group <engine-name> <group-name>
-  Usable in:  TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
-                    -  |   -  |   X  |   X  |          X |  X |  -
+  Usable in:  QUIC Ini|    TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
+                    - |          -  |   -  |   X  |   X  |          X |  X |  -
 
   This action is used to trigger sending of a group of SPOE messages. To do so,
   the SPOE engine used to send messages must be defined, as well as the SPOE
@@ -15120,8 +15324,8 @@ send-spoe-group <engine-name> <group-name>
 
 
 set-bandwidth-limit <name> [limit {<expr> | <size>}] [period {<expr> | <time>}]
-  Usable in:  TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
-                    -  |   -  |   X  |   X  |          X |  X |  -
+  Usable in:  QUIC Ini|    TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
+                    - |          -  |   -  |   X  |   X  |          X |  X |  -
 
   This action is used to enable the bandwidth limitation filter <name>, either
   on the upload or download direction depending on the filter type. Custom
@@ -15156,8 +15360,8 @@ set-bandwidth-limit <name> [limit {<expr> | <size>}] [period {<expr> | <time>}]
 
 
 set-bc-mark { <mark> | <expr> }
-  Usable in:  TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
-                    -  |   -  |   X  |   -  |          X |  - |  -
+  Usable in:  QUIC Ini|    TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
+                    - |          -  |   -  |   X  |   -  |          X |  - |  -
 
   This is used to set the Netfilter/IPFW MARK on the backend connection (all
   packets sent to the server) to the value passed in <mark> or <expr> on
@@ -15174,8 +15378,8 @@ set-bc-mark { <mark> | <expr> }
 
 
 set-bc-tos { <tos> | <expr> }
-  Usable in:  TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
-                    -  |   -  |   X  |   -  |          X |  - |  -
+  Usable in:  QUIC Ini|    TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
+                    - |          -  |   -  |   X  |   -  |          X |  - |  -
 
   This is used to set the TOS or DSCP field value on the backend connection
   (all packets sent to the server) to the value passed in <tos> or <expr> on
@@ -15192,8 +15396,8 @@ set-bc-tos { <tos> | <expr> }
 
 
 set-dst <expr>
-  Usable in:  TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
-                    X  |   X  |   X  |   -  |          X |  - |  -
+  Usable in:  QUIC Ini|    TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
+                    - |          X  |   X  |   X  |   -  |          X |  - |  -
 
   This is used to set the destination IP address to the value of specified
   expression. Useful when a proxy in front of HAProxy rewrites destination IP,
@@ -15214,8 +15418,8 @@ set-dst <expr>
 
 
 set-dst-port <expr>
-  Usable in:  TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
-                    X  |   X  |   X  |   -  |          X |  - |  -
+  Usable in:  QUIC Ini|    TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
+                    - |          X  |   X  |   X  |   -  |          X |  - |  -
 
   This is used to set the destination port address to the value of specified
   expression. If you want to connect to the new address/port, use '0.0.0.0:0'
@@ -15235,8 +15439,8 @@ set-dst-port <expr>
 
 
 set-fc-mark { <mark> | <expr> }
-  Usable in:  TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
-                    X  |   X  |   X  |   X  |          X |  X |  -
+  Usable in:  QUIC Ini|    TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
+                    - |          X  |   X  |   X  |   X  |          X |  X |  -
 
   This is used to set the Netfilter/IPFW MARK on all packets sent to the client
   to the value passed in <mark> or <expr> on platforms which support it. This
@@ -15252,8 +15456,8 @@ set-fc-mark { <mark> | <expr> }
 
 
 set-fc-tos { <tos | <expr> }
-  Usable in:  TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
-                    X  |   X  |   X  |   X  |          X |  X |  -
+  Usable in:  QUIC Ini|    TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
+                    - |          X  |   X  |   X  |   X  |          X |  X |  -
 
   This is used to set the TOS or DSCP field value of packets sent to the client
   to the value passed in <tos> or <expr> on platforms which support this. This
@@ -15268,8 +15472,8 @@ set-fc-tos { <tos | <expr> }
 
 
 set-header <name> <fmt>
-  Usable in:  TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
-                    -  |   -  |   -  |   -  |          X |  X |  X
+  Usable in:  QUIC Ini|    TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
+                    - |          -  |   -  |   -  |   -  |          X |  X |  X
 
   This does the same as the "add-header" action except that the header is first
   removed if it existed. This is useful when passing security information to
@@ -15291,8 +15495,8 @@ set-header <name> <fmt>
 
 
 set-log-level <level>
-  Usable in:  TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
-                    -  |   -  |   X  |   X  |          X |  X |  X
+  Usable in:  QUIC Ini|    TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
+                    - |          -  |   -  |   X  |   X  |          X |  X |  X
 
   This is used to change the log level of the current request when a certain
   condition is met. Valid levels are the 8 syslog levels (see the "log"
@@ -15302,8 +15506,8 @@ set-log-level <level>
 
 
 set-map(<map-name>) <key fmt> <value fmt>
-  Usable in:  TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
-                    -  |   -  |   -  |   -  |          X |  X |  X
+  Usable in:  QUIC Ini|    TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
+                    - |          -  |   -  |   -  |   -  |          X |  X |  X
 
   This is used to add a new entry into a map. <map-name> must follow the format
   described in 2.7. about name format for maps and ACLs. The name of the MAP to
@@ -15321,8 +15525,8 @@ set-mark <mark> (deprecated)
 
 
 set-method <fmt>
-  Usable in:  TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
-                    -  |   -  |   -  |   -  |          X |  - |  -
+  Usable in:  QUIC Ini|    TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
+                    - |          -  |   -  |   -  |   -  |          X |  - |  -
 
   This rewrites the request method with the result of the evaluation of format
   string <fmt>. There should be very few valid reasons for having to do so as
@@ -15330,8 +15534,8 @@ set-method <fmt>
 
 
 set-nice <nice>
-  Usable in:  TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
-                    -  |   -  |   X  |   X  |          X |  X |  -
+  Usable in:  QUIC Ini|    TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
+                    - |          -  |   -  |   X  |   X  |          X |  X |  -
 
   This sets the "nice" factor of the current request/response being processed.
   It only has effect against the other requests being processed at the same
@@ -15344,8 +15548,8 @@ set-nice <nice>
 
 
 set-path <fmt>
-  Usable in:  TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
-                    -  |   -  |   -  |   -  |          X |  - |  -
+  Usable in:  QUIC Ini|    TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
+                    - |          -  |   -  |   -  |   -  |          X |  - |  -
 
     This rewrites the request path with the result of the evaluation of format
     string <fmt>. The query string, if any, is left intact. If a scheme and
@@ -15360,8 +15564,8 @@ set-path <fmt>
 
 
 set-pathq <fmt>
-  Usable in:  TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
-                    -  |   -  |   -  |   -  |          X |  - |  -
+  Usable in:  QUIC Ini|    TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
+                    - |          -  |   -  |   -  |   -  |          X |  - |  -
 
   This does the same as "http-request set-path" except that the query-string is
   also rewritten. It may be used to remove the query-string, including the
@@ -15369,8 +15573,8 @@ set-pathq <fmt>
 
 
 set-priority-class <expr>
-  Usable in:  TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
-                    -  |   -  |   X  |   -  |          X |  - |  -
+  Usable in:  QUIC Ini|    TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
+                    - |          -  |   -  |   X  |   -  |          X |  - |  -
 
   This is used to set the queue priority class of the current request.
   The value must be a sample expression which converts to an integer in the
@@ -15380,8 +15584,8 @@ set-priority-class <expr>
 
 
 set-priority-offset <expr>
-  Usable in:  TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
-                    -  |   -  |   X  |   -  |          X |  - |  -
+  Usable in:  QUIC Ini|    TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
+                    - |          -  |   -  |   X  |   -  |          X |  - |  -
 
   This is used to set the queue priority timestamp offset of the current
   request. The value must be a sample expression which converts to an integer
@@ -15397,8 +15601,8 @@ set-priority-offset <expr>
 
 
 set-query <fmt>
-  Usable in:  TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
-                    -  |   -  |   -  |   -  |          X |  - |  -
+  Usable in:  QUIC Ini|    TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
+                    - |          -  |   -  |   -  |   -  |          X |  - |  -
 
   This rewrites the request's query string which appears after the first
   question mark ("?") with the result of the evaluation of format string <fmt>.
@@ -15416,8 +15620,8 @@ set-query <fmt>
 
 
 set-src <expr>
-  Usable in:  TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
-                    X  |   X  |   X  |   -  |          X |  - |  -
+  Usable in:  QUIC Ini|    TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
+                    - |          X  |   X  |   X  |   -  |          X |  - |  -
 
   This is used to set the source IP address to the value of specified
   expression. Useful when a proxy in front of HAProxy rewrites source IP, but
@@ -15444,8 +15648,8 @@ set-src <expr>
 
 
 set-src-port <expr>
-  Usable in:  TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
-                    X  |   X  |   X  |   -  |          X |  - |  -
+  Usable in:  QUIC Ini|    TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
+                    - |          X  |   X  |   X  |   -  |          X |  - |  -
 
   This is used to set the source port address to the value of specified
   expression.
@@ -15464,8 +15668,8 @@ set-src-port <expr>
 
 
 set-status <status> [reason <str>]
-  Usable in:  TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
-                    -  |   -  |   -  |   -  |          - |  X |  X
+  Usable in:  QUIC Ini|    TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
+                    - |          -  |   -  |   -  |   -  |          - |  X |  X
 
   This replaces the response status code with <status> which must be an integer
   between 100 and 999. Optionally, a custom reason text can be provided defined
@@ -15481,8 +15685,8 @@ set-status <status> [reason <str>]
 
 
 set-timeout { client | server | tunnel } { <timeout> | <expr> }
-  Usable in:  TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
-                    -  |   -  |   -  |   -  |          X |  X |  -
+  Usable in:  QUIC Ini|    TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
+                    - |          -  |   -  |   -  |   -  |          X |  X |  -
 
   This action overrides the specified "client", "server" or "tunnel" timeout
   for the current stream only. The timeout can be specified in milliseconds or
@@ -15509,8 +15713,8 @@ set-tos <tos> (deprecated)
 
 
 set-uri <fmt>
-  Usable in:  TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
-                    -  |   -  |   -  |   -  |          X |  - |  -
+  Usable in:  QUIC Ini|    TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
+                    - |          -  |   -  |   -  |   -  |          X |  - |  -
 
   This rewrites the request URI with the result of the evaluation of format
   string <fmt>. The scheme, authority, path and query string are all replaced
@@ -15524,26 +15728,15 @@ set-uri <fmt>
 
 set-var(<var-name>[,<cond>...]) <expr>
 set-var-fmt(<var-name>[,<cond>...]) <fmt>
-  Usable in:  TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
-                    X  |   X  |   X  |   X  |          X |  X |  X
+  Usable in:  QUIC Ini|    TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
+                    - |          X  |   X  |   X  |   X  |          X |  X |  X
 
   This is used to set the contents of a variable. The variable is declared
   inline.
 
   Arguments:
-    <var-name>  The name of the variable starts with an indication about its
-                scope. The scopes allowed are:
-                  "proc" : the variable is shared with the whole process
-                  "sess" : the variable is shared with the whole session
-                  "txn"  : the variable is shared with the transaction
-                           (request and response)
-                  "req"  : the variable is shared only during request
-                           processing
-                  "res"  : the variable is shared only during response
-                           processing
-                This prefix is followed by a name. The separator is a '.'.
-                The name may only contain characters 'a-z', 'A-Z', '0-9'
-                and '_'.
+   <var-name>   The name of the variable. Variable of the parent stream cannot
+                be set. See section 2.8 about variables for details.
 
     <cond>      A set of conditions that must all be true for the variable to
                 actually be set (such as "ifnotempty", "ifgt" ...). See the
@@ -15566,8 +15759,8 @@ set-var-fmt(<var-name>[,<cond>...]) <fmt>
 
 
 silent-drop [ rst-ttl <ttl> ]
-  Usable in:  TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
-                    X  |   X  |   X  |   X  |          X |  X |  -
+  Usable in:  QUIC Ini|    TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
+                    - |          X  |   X  |   X  |   X  |          X |  X |  -
 
   This stops the evaluation of the rules and makes the client-facing connection
   suddenly disappear using a system-dependent way that tries to prevent the
@@ -15593,8 +15786,8 @@ silent-drop [ rst-ttl <ttl> ]
 
 
 strict-mode { on | off }
-  Usable in:  TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
-                    -  |   -  |   -  |   -  |          X |  X |  X
+  Usable in:  QUIC Ini|    TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
+                    - |          -  |   -  |   -  |   -  |          X |  X |  X
 
   This enables or disables the strict rewriting mode for following rules. It
   does not affect rules declared before it and it is only applicable on rules
@@ -15611,8 +15804,8 @@ strict-mode { on | off }
 
 
 switch-mode http [ proto <name> ]
-  Usable in:  TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
-                    -  |   -  |   X  |   -  |          - |  - |  -
+  Usable in:  QUIC Ini|    TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
+                    - |          -  |   -  |   X  |   -  |          - |  - |  -
 
   This action is used to perform a connection upgrade. Only HTTP upgrades are
   supported for now. The protocol may optionally be specified. This action is
@@ -15632,8 +15825,8 @@ tarpit [ { status | deny_status } <code>] [content-type <type>]
        [ { default-errorfiles | errorfile <file> | errorfiles <name> |
            file <file> | lf-file <file> | string <str> | lf-string <fmt> } ]
        [ hdr <name> <fmt> ]*
-  Usable in:  TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
-                    -  |   -  |   -  |   -  |          X |  - |  -
+  Usable in:  QUIC Ini|    TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
+                    - |          -  |   -  |   -  |   -  |          X |  - |  -
 
   This stops the evaluation of the rules and immediately blocks the request
   without responding for a delay specified by "timeout tarpit" or
@@ -15660,8 +15853,8 @@ tarpit [ { status | deny_status } <code>] [content-type <type>]
 track-sc0 <key> [table <table>]
 track-sc1 <key> [table <table>]
 track-sc2 <key> [table <table>]
-  Usable in:  TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
-                    X  |   X  |   X  |   -  |          X |  X |  -
+  Usable in:  QUIC Ini|    TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
+                    - |          X  |   X  |   X  |   -  |          X |  X |  -
 
   This enables tracking of sticky counters from current request. These rules do
   not stop evaluation and do not change default action. The number of counters
@@ -15706,8 +15899,8 @@ track-sc2 <key> [table <table>]
 
 
 unset-var(<var-name>)
-  Usable in:  TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
-                    X  |   X  |   X  |   X  |          X |  X |  X
+  Usable in:  QUIC Ini|    TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
+                    - |          X  |   X  |   X  |   X  |          X |  X |  X
 
   This is used to unset a variable. See the "set-var" action for details about
   <var-name>.
@@ -15717,8 +15910,8 @@ unset-var(<var-name>)
 
 
 use-service <service-name>
-  Usable in:  TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
-                    -  |   -  |   X  |   -  |          X |  - |  -
+  Usable in:  QUIC Ini|    TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
+                    - |          -  |   -  |   X  |   -  |          X |  - |  -
 
   This action executes the configured TCP or HTTP service to reply to the
   request, depending on the rule set it's used in. The rule is final, i.e.
@@ -15738,8 +15931,8 @@ use-service <service-name>
 
 
 wait-for-body time <time> [ at-least <bytes> ]
-  Usable in:  TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
-                    -  |   -  |   -  |   -  |          X |  X |  -
+  Usable in:  QUIC Ini|    TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
+                    - |          -  |   -  |   -  |   -  |          X |  X |  -
 
   This will delay the processing of the request or response until one of the
   following conditions occurs:
@@ -15773,8 +15966,8 @@ wait-for-body time <time> [ at-least <bytes> ]
 
 
 wait-for-handshake
-  Usable in:  TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
-                    -  |   -  |   -  |   -  |          X |  - |  -
+  Usable in:  QUIC Ini|    TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
+                    - |          -  |   -  |   -  |   -  |          X |  - |  -
 
   This will delay the processing of the request until the SSL handshake
   happened. This is mostly useful to delay processing early data until we're
@@ -17345,7 +17538,9 @@ maxqueue <maxqueue>
   and "balance leastconn".
 
 max-reuse <count>
-  May be used in the following contexts: http
+  May be used in the following contexts: http, ring
+
+  When used under http context:
 
   The "max-reuse" argument indicates the HTTP connection processors that they
   should not reuse a server connection more than this number of times to send
@@ -17355,6 +17550,32 @@ max-reuse <count>
   resources over time. The argument is not necessarily respected by the lower
   layers as there might be technical limitations making it impossible to
   enforce. At least HTTP/2 connections to servers will respect it.
+
+  When used under ring context:
+
+  The "max-reuse" argument indicates that the sink TCP connection processors
+  that they should not reuse a server connection more than this number of
+  times to send messages. It means that the connection to the server will be
+  forcefully destroyed once at least "max-reuse + 1" messages were handled on
+  the same connection. The connection to the server will then be automatically
+  re-created. When dealing with a large amount of messages in multithreading
+  context, this can help to better distribute the ring's load over multiple
+  threads. Indeed, each connection is bound to the same CPU thread for its
+  entire duration: unlike HTTP, there is no thing like syslog transaction, so
+  the server connection could live indefinitely as long as the server doesn't
+  close the connection or no network error occurs. By destroying connections
+  from time to time we give the opportunity to other threads to pick-up some
+  messages in turn. It may also help gracefully rotate log servers in contexts
+  where there is an extra load-balancing layer between haproxy and the log
+  servers. However, keep in mind that each connection recycling will leave an
+  outgoing port in TIME_WAIT state that will not be reusable for around one
+  minute on modern operating systems, and that as such, one must be careful
+  not to use too low values to prevent rapid source port exhaustion. As a rule
+  of thumb, make sure never to close more than a few times per second, and
+  preferably much less often. Permitted values are -1 (the default), which
+  disables this limit, or any positive value. Unlike under HTTP context, when
+  used with sink servers "max-reuse" is a best-effort: ring messages are
+  batched, so the limit is checked between each batch.
 
 minconn <minconn>
   May be used in the following contexts: tcp, http
@@ -19285,15 +19506,7 @@ The detailed list of converter keywords follows:
 add(<value>)
   Adds <value> to the input value of type signed integer, and returns the
   result as a signed integer. <value> can be a numeric value or a variable
-  name. The name of the variable starts with an indication about its scope. The
-  scopes allowed are:
-    "proc" : the variable is shared with the whole process
-    "sess" : the variable is shared with the whole session
-    "txn"  : the variable is shared with the transaction (request and response)
-    "req"  : the variable is shared only during request processing
-    "res"  : the variable is shared only during response processing
-  This prefix is followed by a name. The separator is a '.'. The name may only
-  contain characters 'a-z', 'A-Z', '0-9', '.' and '_'.
+  name. See section 2.8 about variables for details.
 
 add_item(<delim>,[<var>][,<suff>]])
   Concatenates a minimum of 2 and up to 3 fields after the current sample which
@@ -19352,15 +19565,7 @@ aes_gcm_enc(<bits>,<nonce>,<key>,<aead_tag>)
 and(<value>)
   Performs a bitwise "AND" between <value> and the input value of type signed
   integer, and returns the result as an signed integer. <value> can be a
-  numeric value or a variable name. The name of the variable starts with an
-  indication about its scope. The scopes allowed are:
-    "proc" : the variable is shared with the whole process
-    "sess" : the variable is shared with the whole session
-    "txn"  : the variable is shared with the transaction (request and response)
-    "req"  : the variable is shared only during request processing
-    "res"  : the variable is shared only during response processing
-  This prefix is followed by a name. The separator is a '.'. The name may only
-  contain characters 'a-z', 'A-Z', '0-9', '.' and '_'.
+  numeric value or a variable name. See section 2.8 about variables for details.
 
 b64dec
   Converts (decodes) a base64 encoded input string to its binary
@@ -19547,15 +19752,7 @@ div(<value>)
   Divides the input value of type signed integer by <value>, and returns the
   result as an signed integer. If <value> is null, the largest unsigned
   integer is returned (typically 2^63-1). <value> can be a numeric value or a
-  variable name. The name of the variable starts with an indication about its
-  scope. The scopes allowed are:
-    "proc" : the variable is shared with the whole process
-    "sess" : the variable is shared with the whole session
-    "txn"  : the variable is shared with the transaction (request and response)
-    "req"  : the variable is shared only during request processing
-    "res"  : the variable is shared only during response processing
-  This prefix is followed by a name. The separator is a '.'. The name may only
-  contain characters 'a-z', 'A-Z', '0-9', '.' and '_'.
+  variable name. See section 2.8 about variables for details.
 
 djb2([<avalanche>])
   Hashes a binary input sample into an unsigned 32-bit quantity using the DJB2
@@ -19977,15 +20174,8 @@ map_<match_type>_<output_type>(<map_name>[,<default_value>])
 mod(<value>)
   Divides the input value of type signed integer by <value>, and returns the
   remainder as an signed integer. If <value> is null, then zero is returned.
-  <value> can be a numeric value or a variable name. The name of the variable
-  starts with an indication about its scope. The scopes allowed are:
-    "proc" : the variable is shared with the whole process
-    "sess" : the variable is shared with the whole session
-    "txn"  : the variable is shared with the transaction (request and response)
-    "req"  : the variable is shared only during request processing
-    "res"  : the variable is shared only during response processing
-  This prefix is followed by a name. The separator is a '.'. The name may only
-  contain characters 'a-z', 'A-Z', '0-9', '.' and '_'.
+  <value> can be a numeric value or a variable name. See section 2.8 about
+  variables for details.
 
 mqtt_field_value(<packettype>,<fieldname_or_property_ID>)
   Returns value of <fieldname> found in input MQTT payload of type
@@ -20130,15 +20320,8 @@ mul(<value>)
   Multiplies the input value of type signed integer by <value>, and returns
   the product as an signed integer. In case of overflow, the largest possible
   value for the sign is returned so that the operation doesn't wrap around.
-  <value> can be a numeric value or a variable name. The name of the variable
-  starts with an indication about its scope. The scopes allowed are:
-    "proc" : the variable is shared with the whole process
-    "sess" : the variable is shared with the whole session
-    "txn"  : the variable is shared with the transaction (request and response)
-    "req"  : the variable is shared only during request processing
-    "res"  : the variable is shared only during response processing
-  This prefix is followed by a name. The separator is a '.'. The name may only
-  contain characters 'a-z', 'A-Z', '0-9', '.' and '_'.
+  <value> can be a numeric value or a variable name. See section 2.8 about
+  variables for details.
 
 nbsrv
   Takes an input value of type string, interprets it as a backend name and
@@ -20165,15 +20348,7 @@ odd
 or(<value>)
   Performs a bitwise "OR" between <value> and the input value of type signed
   integer, and returns the result as an signed integer. <value> can be a
-  numeric value or a variable name. The name of the variable starts with an
-  indication about its scope. The scopes allowed are:
-    "proc" : the variable is shared with the whole process
-    "sess" : the variable is shared with the whole session
-    "txn"  : the variable is shared with the transaction (request and response)
-    "req"  : the variable is shared only during request processing
-    "res"  : the variable is shared only during response processing
-  This prefix is followed by a name. The separator is a '.'. The name may only
-  contain characters 'a-z', 'A-Z', '0-9', '.' and '_'.
+  numeric value or a variable name. See section 2.8 about variables for details.
 
 param(<name>,[<delim>])
   This extracts the first occurrence of the parameter <name> in the input string
@@ -20367,16 +20542,7 @@ set-var(<var>[,<cond>...])
   Sets a variable with the input content and returns the content on the output
   as-is if all of the specified conditions are true (see below for a list of
   possible conditions). The variable keeps the value and the associated input
-  type. The name of the variable starts with an indication about its scope. The
-  scopes allowed are:
-    "proc" : the variable is shared with the whole process
-    "sess" : the variable is shared with the whole session
-    "txn"  : the variable is shared with the transaction (request and
-             response),
-    "req"  : the variable is shared only during request processing,
-    "res"  : the variable is shared only during response processing.
-  This prefix is followed by a name. The separator is a '.'. The name may only
-  contain characters 'a-z', 'A-Z', '0-9', '.' and '_'.
+  type. See section 2.8 about variables for details.
 
   You can pass at most four conditions to the converter among the following
   possible conditions :
@@ -20444,16 +20610,7 @@ sub(<value>)
   Subtracts <value> from the input value of type signed integer, and returns
   the result as an signed integer. Note: in order to subtract the input from
   a constant, simply perform a "neg,add(value)". <value> can be a numeric value
-  or a variable name. The name of the variable starts with an indication about
-  its scope. The scopes allowed are:
-    "proc" : the variable is shared with the whole process
-    "sess" : the variable is shared with the whole session
-    "txn"  : the variable is shared with the transaction (request and
-             response),
-    "req"  : the variable is shared only during request processing,
-    "res"  : the variable is shared only during response processing.
-  This prefix is followed by a name. The separator is a '.'. The name may only
-  contain characters 'a-z', 'A-Z', '0-9', '.' and '_'.
+  or a variable name. See section 2.8 about variables for details.
 
 table_bytes_in_rate(<table>)
   Uses the string representation of the input sample to perform a look up in
@@ -20772,15 +20929,8 @@ ungrpc(<field_number>,[<field_type>])
 
 unset-var(<var>)
   Unsets a variable if the input content is defined. The name of the variable
-  starts with an indication about its scope. The scopes allowed are:
-    "proc" : the variable is shared with the whole process
-    "sess" : the variable is shared with the whole session
-    "txn"  : the variable is shared with the transaction (request and
-             response),
-    "req"  : the variable is shared only during request processing,
-    "res"  : the variable is shared only during response processing.
-  This prefix is followed by a name. The separator is a '.'. The name may only
-  contain characters 'a-z', 'A-Z', '0-9', '.' and '_'.
+  starts with an indication about its scope. See section 2.8 about variables
+  for details.
 
 upper
   Convert a string sample to upper case. This can only be placed after a string
@@ -20927,16 +21077,8 @@ x509_v_err_str
 xor(<value>)
   Performs a bitwise "XOR" (exclusive OR) between <value> and the input value
   of type signed integer, and returns the result as an signed integer.
-  <value> can be a numeric value or a variable name. The name of the variable
-  starts with an indication about its scope. The scopes allowed are:
-    "proc" : the variable is shared with the whole process
-    "sess" : the variable is shared with the whole session
-    "txn"  : the variable is shared with the transaction (request and
-             response),
-    "req"  : the variable is shared only during request processing,
-    "res"  : the variable is shared only during response processing.
-  This prefix is followed by a name. The separator is a '.'. The name may only
-  contain characters 'a-z', 'A-Z', '0-9', '.' and '_'.
+  <value> can be a numeric value or a variable name. See section 2.8 about
+  variables for details.
 
 xxh3([<seed>])
   Hashes a binary input sample into a signed 64-bit quantity using the XXH3
@@ -21509,16 +21651,8 @@ uuid([<version>]) : string
 var(<var-name>[,<default>]) : undefined
   Returns a variable with the stored type. If the variable is not set, the
   sample fetch fails, unless a default value is provided, in which case it will
-  return it as a string. Empty strings are permitted. The name of the variable
-  starts with an indication about its scope. The scopes allowed are:
-    "proc" : the variable is shared with the whole process
-    "sess" : the variable is shared with the whole session
-    "txn"  : the variable is shared with the transaction (request and
-             response),
-    "req"  : the variable is shared only during request processing,
-    "res"  : the variable is shared only during response processing.
-  This prefix is followed by a name. The separator is a '.'. The name may only
-  contain characters 'a-z', 'A-Z', '0-9', '.' and '_'.
+  return it as a string. Empty strings are permitted. See section 2.8 about
+  variables for details.
 
 7.3.3. Fetching samples at Layer 4
 ----------------------------------
@@ -22069,10 +22203,12 @@ fc_http_major : integer
   encoding and not on the version present in the request header.
 
 fc_lost : integer
-  Returns the lost counter measured by the kernel for the client
-  connection. If the server connection is not established, if the connection is
-  not TCP or if the operating system does not support TCP_INFO, for example
-  Linux kernels before 2.4, the sample fetch fails.
+  If the connection is not TCP, nor QUIC, the sample fetch fails.
+  For QUIC, returns the number of lost QUIC packets by the client connection.
+  For TCP, returns the lost counter measured by the kernel for the client
+  connection. If the server connection is not established, or if the operating
+  system does not support TCP_INFO, for example Linux kernels before 2.4, the
+  sample fetch fails.
 
 fc_nb_streams : integer
   Returns the number of streams opened on the frontend connection.
@@ -22113,10 +22249,12 @@ fc_rcvd_proxy : boolean
   header.
 
 fc_reordering : integer
-  Returns the reordering counter measured by the kernel for the client
-  connection. If the server connection is not established, if the connection is
-  not TCP or if the operating system does not support TCP_INFO, for example
-  Linux kernels before 2.4, the sample fetch fails.
+  If the connection is not TCP, nor QUIC, the sample fetch fails.
+  For QUIC, return the number of QUIC reordered packets for the client connection.
+  For TCP, returns the reordering counter measured by the kernel for the client
+  connection. If the server connection is not established, or if the operating
+  system does not support TCP_INFO, for example Linux kernels before 2.4, the
+  sample fetch fails.
 
 fc_retrans : integer
   Returns the retransmits counter measured by the kernel for the client
@@ -22125,20 +22263,22 @@ fc_retrans : integer
   Linux kernels before 2.4, the sample fetch fails.
 
 fc_rtt(<unit>) : integer
-  Returns the Round Trip Time (RTT) measured by the kernel for the client
+  If the connection is not TCP, nor QUIC, the sample fetch fails.
+  For QUIC, returns Smoothed Round Trip Time for the client connection.
+  For TCP, returns the Round Trip Time (RTT) measured by the kernel for the client
   connection. <unit> is facultative, by default the unit is milliseconds. <unit>
   can be set to "ms" for milliseconds or "us" for microseconds. If the server
-  connection is not established, if the connection is not TCP or if the
-  operating system does not support TCP_INFO, for example Linux kernels before
-  2.4, the sample fetch fails.
+  connection is not established, or if the operating system does not support
+  TCP_INFO, for example Linux kernels before 2.4, the sample fetch fails.
 
 fc_rttvar(<unit>) : integer
-  Returns the Round Trip Time (RTT) variance measured by the kernel for the
-  client connection. <unit> is facultative, by default the unit is milliseconds.
+  If the connection is not TCP, nor QUIC, the sample fetch fails.
+  For QUIC, returns Smoothed Round Trip Time variance for the client connection.
+  For TCP, returns the Round Trip Time (RTT) variance measured by the kernel for
+  the client connection. <unit> is facultative, by default the unit is milliseconds.
   <unit> can be set to "ms" for milliseconds or "us" for microseconds. If the
-  server connection is not established, if the connection is not TCP or if the
-  operating system does not support TCP_INFO, for example Linux kernels before
-  2.4, the sample fetch fails.
+  server connection is not established, or if the operating system does not
+  support TCP_INFO, for example Linux kernels before 2.4, the sample fetch fails.
 
 fc_sacked : integer
   Returns the sacked counter measured by the kernel for the client connection.
@@ -23825,13 +23965,15 @@ Summary of sample fetch methods in this section and their respective types:
 
   keyword                                             output type
 ----------------------------------------------------+-------------
-bs.id                                                 integer
 bs.aborted                                            boolean
+bs.debug_str([<bitmap>])                              string
+bs.id                                                 integer
 bs.rst_code                                           integer
 distcc_body(<token>[,<occ>])                          binary
 distcc_param(<token>[,<occ>])                         integer
-fs.id                                                 integer
 fs.aborted                                            boolean
+fs.debug_str([<bitmap>])                              string
+fs.id                                                 integer
 fs.rst_code                                           integer
 payload(<offset>,<length>)                            binary
 payload_lv(<offset1>,<length>[,<offset2>])            binary
@@ -23864,13 +24006,35 @@ wait_end                                              boolean
 
 Detailed list:
 
-bs.id : integer
-  Returns the multiplexer's stream ID on the server side. It is the
-  multiplexer's responsibility to return the appropriate information.
-
 bs.aborted: boolean
   Returns true is an abort was received from the server for the current
   stream. Otherwise false is returned.
+
+bs.debug_str([<bitmap>]) : string
+  This function is meant to be used by developers during certain complex
+  troubleshooting sessions. It extracts some internal states from the lower
+  layers of the backend stream and connection, and arranges them as a string,
+  generally in the form of a series of "name=value" delimited with spaces. The
+  <bitmap> optional argument indicates what layer(s) to extract information
+  from, and is an arithmetic OR (or a sum) of the following values:
+     - socket layer: 16
+     - connection layer: 8
+     - transport layer (e.g. SSL): 4
+     - mux connection: 2
+     - mux stream: 1
+
+  These values might change across versions. The default value of zero is
+  special and enables all layers. Please do not rely on the output of this
+  function for long-term production monitoring. It is meant to evolve even
+  within a stable branch, as the needs for increased details arise. One use
+  typical use case is to concatenate these information at the very end of a
+  log-format, along with fs.debug_str(). Example:
+
+     log-format "$HAPROXY_HTTP_LOG_FMT fs=<%[fs.debug_str]> bs=<%[bs.debug_str]>"
+
+bs.id : integer
+  Returns the multiplexer's stream ID on the server side. It is the
+  multiplexer's responsibility to return the appropriate information.
 
 bs.rst_code: integer
   Returns the reset code received from the server for the current stream. The
@@ -23904,14 +24068,36 @@ distcc_param(<token>[,<occ>]) : integer
       # send large files to the big farm
       use_backend big_farm if { distcc_param(DOTI) gt 1000000 }
 
+fs.aborted: boolean
+  Returns true is an abort was received from the client for the current
+  stream. Otherwise false is returned.
+
+fs.debug_str([<bitmap>]) : string
+  This function is meant to be used by developers during certain complex
+  troubleshooting sessions. It extracts some internal states from the lower
+  layers of the frontend stream and connection, and arranges them as a string,
+  generally in the form of a series of "name=value" delimited with spaces. The
+  <bitmap> optional argument indicates what layer(s) to extract information
+  from, and is an arithmetic OR (or a sum) of the following values:
+     - socket layer: 16
+     - connection layer: 8
+     - transport layer (e.g. SSL): 4
+     - mux connection: 2
+     - mux stream: 1
+
+  These values might change across versions. The default value of zero is
+  special and enables all layers. Please do not rely on the output of this
+  function for long-term production monitoring. It is meant to evolve even
+  within a stable branch, as the needs for increased details arise. One use
+  typical use case is to concatenate these information at the very end of a
+  log-format, along with bs.debug_str(). Example:
+
+     log-format "$HAPROXY_HTTP_LOG_FMT fs=<%[fs.debug_str]> bs=<%[bs.debug_str]>"
+
 fs.id : integer
   Returns the multiplexer's stream ID on the client side. It is the
   multiplexer's responsibility to return the appropriate information. For
   instance, on a raw TCP, 0 is always returned because there is no stream.
-
-fs.aborted: boolean
-  Returns true is an abort was received from the client for the current
-  stream. Otherwise false is returned.
 
 fs.rst_code: integer
   Returns the reset code received from the client for the current stream. The
@@ -27318,6 +27504,12 @@ also requires dedicated backends, defined in HAProxy configuration.
 
 SPOE communicates with external components using an in-house binary protocol,
 the Stream Processing Offload Protocol (SPOP).
+
+When the SPOE is used on a stream, a dedicated stream is spawned to handle the
+communcation with the external component. The main stream is the parent stream
+of this "SPOE" stream. It means it is possible to retrieve variables of the
+main stream from the "SPOE" stream. See section 2.8 about variables for
+details.
 
 For all information about the SPOE configuration and the SPOP specification, see
 "doc/SPOE.txt".

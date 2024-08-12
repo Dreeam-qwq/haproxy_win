@@ -38,6 +38,7 @@
 #include <haproxy/global.h>
 #include <haproxy/hlua.h>
 #include <haproxy/http_ana.h>
+#include <haproxy/limits.h>
 #if defined(USE_LINUX_CAP)
 #include <haproxy/linuxcap.h>
 #endif
@@ -116,15 +117,22 @@ struct post_mortem {
 		pid_t pid;
 		uid_t boot_uid;
 		gid_t boot_gid;
+		uid_t run_uid;
+		gid_t run_gid;
 #if defined(USE_LINUX_CAP)
 		struct {
 			// initial process capabilities
 			struct __user_cap_data_struct boot[_LINUX_CAPABILITY_U32S_3];
-			int err; // errno, if capget() syscall fails
+			int err_boot; // errno, if capget() syscall fails at boot
+			// runtime process capabilities
+			struct __user_cap_data_struct run[_LINUX_CAPABILITY_U32S_3];
+			int err_run; // errno, if capget() syscall fails at runtime
 		} caps;
 #endif
-		struct rlimit limit_fd;  // RLIMIT_NOFILE
-		struct rlimit limit_ram; // RLIMIT_DATA
+		struct rlimit boot_lim_fd;  // RLIMIT_NOFILE at startup
+		struct rlimit boot_lim_ram; // RLIMIT_DATA at startup
+		struct rlimit run_lim_fd;  // RLIMIT_NOFILE just before enter in polling loop
+		struct rlimit run_lim_ram; // RLIMIT_DATA just before enter in polling loop
 		char **argv;
 
 #if defined(USE_THREAD)
@@ -470,24 +478,21 @@ void ha_task_dump(struct buffer *buf, const struct task *task, const char *pfx)
  */
 static int cli_io_handler_show_threads(struct appctx *appctx)
 {
-	int thr;
+	int *thr = appctx->svcctx;
 
-	if (appctx->st0)
-		thr = appctx->st1;
-	else
-		thr = 0;
+	if (!thr)
+		thr = applet_reserve_svcctx(appctx, sizeof(*thr));
 
 	do {
 		chunk_reset(&trash);
-		ha_thread_dump(&trash, thr);
+		ha_thread_dump(&trash, *thr);
 
 		if (applet_putchk(appctx, &trash) == -1) {
 			/* failed, try again */
-			appctx->st1 = thr;
 			return 0;
 		}
-		thr++;
-	} while (thr < global.nbthread);
+		(*thr)++;
+	} while (*thr < global.nbthread);
 
 	return 1;
 }
@@ -510,10 +515,6 @@ static int debug_parse_cli_show_libs(char **args, char *payload, struct appctx *
 /* parse a "show dev" command. It returns 1 if it emits anything otherwise zero. */
 static int debug_parse_cli_show_dev(char **args, char *payload, struct appctx *appctx, void *private)
 {
-#if defined(USE_LINUX_CAP)
-	/* to dump runtime process capabilities */
-	struct __user_cap_data_struct runtime_caps[_LINUX_CAPABILITY_U32S_3] = { };
-#endif
 	const char **build_opt;
 	int i;
 
@@ -568,54 +569,64 @@ static int debug_parse_cli_show_dev(char **args, char *payload, struct appctx *a
 	for (i = 0; i < post_mortem.process.argc; i++)
 		chunk_appendf(&trash, "%s ", post_mortem.process.argv[i]);
 	chunk_appendf(&trash, "\n");
+
 	chunk_appendf(&trash, "  boot uid: %d\n", post_mortem.process.boot_uid);
-	chunk_appendf(&trash, "  runtime uid: %d\n", geteuid());
+	chunk_appendf(&trash, "  runtime uid: %d\n", post_mortem.process.run_uid);
 	chunk_appendf(&trash, "  boot gid: %d\n", post_mortem.process.boot_gid);
-	chunk_appendf(&trash, "  runtime gid: %d\n", getegid());
+	chunk_appendf(&trash, "  runtime gid: %d\n", post_mortem.process.run_gid);
 
 #if defined(USE_LINUX_CAP)
 	/* let's dump saved in feed_post_mortem() initial capabilities sets */
-	if(!post_mortem.process.caps.err) {
+	if(!post_mortem.process.caps.err_boot) {
 		chunk_appendf(&trash, "  boot capabilities:\n");
 		chunk_appendf(&trash, "  \tCapEff: 0x%016llx\n",
-                              CAPS_TO_ULLONG(post_mortem.process.caps.boot[0].effective,
-                                             post_mortem.process.caps.boot[1].effective));
+			      CAPS_TO_ULLONG(post_mortem.process.caps.boot[0].effective,
+					     post_mortem.process.caps.boot[1].effective));
 		chunk_appendf(&trash, "  \tCapPrm: 0x%016llx\n",
-                              CAPS_TO_ULLONG(post_mortem.process.caps.boot[0].permitted,
-                                             post_mortem.process.caps.boot[1].permitted));
+			      CAPS_TO_ULLONG(post_mortem.process.caps.boot[0].permitted,
+					     post_mortem.process.caps.boot[1].permitted));
 		chunk_appendf(&trash, "  \tCapInh: 0x%016llx\n",
-                              CAPS_TO_ULLONG(post_mortem.process.caps.boot[0].inheritable,
-                                             post_mortem.process.caps.boot[1].inheritable));
+			      CAPS_TO_ULLONG(post_mortem.process.caps.boot[0].inheritable,
+					     post_mortem.process.caps.boot[1].inheritable));
 	} else
-		chunk_appendf(&trash, "  capget() failed with: %s.\n",
-                              strerror(post_mortem.process.caps.err));
-
+		chunk_appendf(&trash, "  capget() failed at boot with: %s.\n",
+			      strerror(post_mortem.process.caps.err_boot));
 
 	/* let's print actual capabilities sets, could be useful in order to compare */
-	if (capget(&cap_hdr_haproxy, runtime_caps) == 0) {
+	if (!post_mortem.process.caps.err_run) {
 		chunk_appendf(&trash, "  runtime capabilities:\n");
 		chunk_appendf(&trash, "  \tCapEff: 0x%016llx\n",
-                              CAPS_TO_ULLONG(runtime_caps[0].effective,
-                                             runtime_caps[1].effective));
+			      CAPS_TO_ULLONG(post_mortem.process.caps.run[0].effective,
+					     post_mortem.process.caps.run[1].effective));
 		chunk_appendf(&trash, "  \tCapPrm: 0x%016llx\n",
-                              CAPS_TO_ULLONG(runtime_caps[0].permitted,
-                                             runtime_caps[1].permitted));
+			      CAPS_TO_ULLONG(post_mortem.process.caps.run[0].permitted,
+					     post_mortem.process.caps.run[1].permitted));
 		chunk_appendf(&trash, "  \tCapInh: 0x%016llx\n",
-                              CAPS_TO_ULLONG(runtime_caps[0].inheritable,
-                                             runtime_caps[1].inheritable));
+			      CAPS_TO_ULLONG(post_mortem.process.caps.run[0].inheritable,
+					     post_mortem.process.caps.run[1].inheritable));
 	} else
-		chunk_appendf(&trash, "  capget() failed with: %s.\n",
-                              strerror(errno));
-
+		chunk_appendf(&trash, "  capget() failed at runtime with: %s.\n",
+			      strerror(post_mortem.process.caps.err_run));
 #endif
-	if ((ulong)post_mortem.process.limit_fd.rlim_cur != RLIM_INFINITY)
-		chunk_appendf(&trash, "  fd limit (soft): %lu\n", (ulong)post_mortem.process.limit_fd.rlim_cur);
-	if ((ulong)post_mortem.process.limit_fd.rlim_max != RLIM_INFINITY)
-		chunk_appendf(&trash, "  fd limit (hard): %lu\n", (ulong)post_mortem.process.limit_fd.rlim_max);
-	if ((ulong)post_mortem.process.limit_ram.rlim_cur != RLIM_INFINITY)
-		chunk_appendf(&trash, "  ram limit (soft): %lu\n", (ulong)post_mortem.process.limit_ram.rlim_cur);
-	if ((ulong)post_mortem.process.limit_ram.rlim_max != RLIM_INFINITY)
-		chunk_appendf(&trash, "  ram limit (hard): %lu\n", (ulong)post_mortem.process.limit_ram.rlim_max);
+	chunk_appendf(&trash, "  boot limits:\n");
+	chunk_appendf(&trash, "  \tfd limit (soft): %s\n",
+		      LIM2A(normalize_rlim((ulong)post_mortem.process.boot_lim_fd.rlim_cur), "unlimited"));
+	chunk_appendf(&trash, "  \tfd limit (hard): %s\n",
+		      LIM2A(normalize_rlim((ulong)post_mortem.process.boot_lim_fd.rlim_max), "unlimited"));
+	chunk_appendf(&trash, "  \tram limit (soft): %s\n",
+		      LIM2A(normalize_rlim((ulong)post_mortem.process.boot_lim_ram.rlim_cur), "unlimited"));
+	chunk_appendf(&trash, "  \tram limit (hard): %s\n",
+		      LIM2A(normalize_rlim((ulong)post_mortem.process.boot_lim_ram.rlim_max), "unlimited"));
+
+	chunk_appendf(&trash, "  runtime limits:\n");
+	chunk_appendf(&trash, "  \tfd limit (soft): %s\n",
+		      LIM2A(normalize_rlim((ulong)post_mortem.process.run_lim_fd.rlim_cur), "unlimited"));
+	chunk_appendf(&trash, "  \tfd limit (hard): %s\n",
+		      LIM2A(normalize_rlim((ulong)post_mortem.process.run_lim_fd.rlim_max), "unlimited"));
+	chunk_appendf(&trash, "  \tram limit (soft): %s\n",
+		      LIM2A(normalize_rlim((ulong)post_mortem.process.run_lim_ram.rlim_cur), "unlimited"));
+	chunk_appendf(&trash, "  \tram limit (hard): %s\n",
+		      LIM2A(normalize_rlim((ulong)post_mortem.process.run_lim_ram.rlim_max), "unlimited"));
 
 	return cli_msg(appctx, LOG_INFO, trash.area);
 }
@@ -2345,10 +2356,11 @@ static int feed_post_mortem()
 
 #if defined(USE_LINUX_CAP)
 	if (capget(&cap_hdr_haproxy, post_mortem.process.caps.boot) == -1)
-		post_mortem.process.caps.err = errno;
+		post_mortem.process.caps.err_boot = errno;
 #endif
-	getrlimit(RLIMIT_NOFILE, &post_mortem.process.limit_fd);
-	getrlimit(RLIMIT_DATA, &post_mortem.process.limit_ram);
+	post_mortem.process.boot_lim_fd.rlim_cur = rlim_fd_cur_at_boot;
+	post_mortem.process.boot_lim_fd.rlim_max = rlim_fd_max_at_boot;
+	getrlimit(RLIMIT_DATA, &post_mortem.process.boot_lim_ram);
 
 	if (strcmp(post_mortem.platform.utsname.sysname, "Linux") == 0)
 		feed_post_mortem_linux();
@@ -2417,14 +2429,36 @@ void post_mortem_add_component(const char *name, const char *version,
 static int feed_post_mortem_late()
 {
 	static int per_thread_info_collected;
+	int i;
 
-	if (HA_ATOMIC_ADD_FETCH(&per_thread_info_collected, 1) == global.nbthread) {
-		int i;
-		for (i = 0; i < global.nbthread; i++) {
-			post_mortem.process.thread_info[i].pth_id = ha_thread_info[i].pth_id;
-			post_mortem.process.thread_info[i].stack_top = ha_thread_info[i].stack_top;
-		}
+	if (HA_ATOMIC_ADD_FETCH(&per_thread_info_collected, 1) != global.nbthread)
+		return 1;
+
+	/* Collect thread info, only when we are in the last thread context.
+	 * feed_post_mortem_late() is registered in per_thread_init_list. Each
+	 * thread takes a mutex before looping over this list, so
+	 * feed_post_mortem_late() will be called by each thread in exclusive
+	 * manner, one by one in synchronious order. Thread unlocks mutex only
+	 * after executing all init functions from this list.
+	*/
+	for (i = 0; i < global.nbthread; i++) {
+		post_mortem.process.thread_info[i].pth_id = ha_thread_info[i].pth_id;
+		post_mortem.process.thread_info[i].stack_top = ha_thread_info[i].stack_top;
 	}
+
+	/* also set runtime process settings. At this stage we are sure, that all
+	 * config options and limits adjustements are successfully applied.
+	 */
+	post_mortem.process.run_uid = geteuid();
+	post_mortem.process.run_gid = getegid();
+#if defined(USE_LINUX_CAP)
+	if (capget(&cap_hdr_haproxy, post_mortem.process.caps.run) == -1) {
+		post_mortem.process.caps.err_run = errno;
+	}
+#endif
+	getrlimit(RLIMIT_NOFILE, &post_mortem.process.run_lim_fd);
+	getrlimit(RLIMIT_DATA, &post_mortem.process.run_lim_ram);
+
 	return 1;
 }
 

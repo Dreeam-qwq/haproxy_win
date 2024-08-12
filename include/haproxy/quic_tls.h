@@ -59,25 +59,25 @@ int quic_tls_derive_initial_secrets(const EVP_MD *md,
 
 int quic_tls_encrypt(unsigned char *buf, size_t len,
                      const unsigned char *aad, size_t aad_len,
-                     EVP_CIPHER_CTX *ctx, const EVP_CIPHER *aead,
+                     QUIC_AEAD_CTX *ctx, const QUIC_AEAD *aead,
                      const unsigned char *iv);
 
 int quic_tls_decrypt2(unsigned char *out,
                       unsigned char *in, size_t ilen,
                       unsigned char *aad, size_t aad_len,
-                      EVP_CIPHER_CTX *ctx, const EVP_CIPHER *aead,
+                      QUIC_AEAD_CTX *ctx, const QUIC_AEAD *aead,
                       const unsigned char *key, const unsigned char *iv);
 
 int quic_tls_decrypt(unsigned char *buf, size_t len,
                      unsigned char *aad, size_t aad_len,
-                     EVP_CIPHER_CTX *tls_ctx, const EVP_CIPHER *aead,
+                     QUIC_AEAD_CTX *tls_ctx, const QUIC_AEAD *aead,
                      const unsigned char *key, const unsigned char *iv);
 
 int quic_tls_generate_retry_integrity_tag(unsigned char *odcid, unsigned char odcid_len,
                                           unsigned char *buf, size_t len,
                                           const struct quic_version *qv);
 
-int quic_tls_derive_keys(const EVP_CIPHER *aead, const EVP_CIPHER *hp,
+int quic_tls_derive_keys(const QUIC_AEAD *aead, const EVP_CIPHER *hp,
                          const EVP_MD *md, const struct quic_version *qv,
                          unsigned char *key, size_t keylen,
                          unsigned char *iv, size_t ivlen,
@@ -106,10 +106,10 @@ int quic_hkdf_extract_and_expand(const EVP_MD *md,
                                  const unsigned char *salt, size_t saltlen,
                                  const unsigned char *label, size_t labellen);
 
-int quic_tls_rx_ctx_init(EVP_CIPHER_CTX **rx_ctx,
-                         const EVP_CIPHER *aead, unsigned char *key);
-int quic_tls_tx_ctx_init(EVP_CIPHER_CTX **tx_ctx,
-                         const EVP_CIPHER *aead, unsigned char *key);
+int quic_tls_rx_ctx_init(QUIC_AEAD_CTX **rx_ctx,
+                         const QUIC_AEAD *aead, unsigned char *key);
+int quic_tls_tx_ctx_init(QUIC_AEAD_CTX **tx_ctx,
+                         const QUIC_AEAD *aead, unsigned char *key);
 
 int quic_tls_sec_update(const EVP_MD *md, const struct quic_version *qv,
                         unsigned char *new_sec, size_t new_seclen,
@@ -119,28 +119,38 @@ void quic_aead_iv_build(unsigned char *iv, size_t ivlen,
                         unsigned char *aead_iv, size_t aead_ivlen, uint64_t pn);
 
 /* HP protection (AES) */
-int quic_tls_dec_aes_ctx_init(EVP_CIPHER_CTX **aes_ctx,
+int quic_tls_dec_hp_ctx_init(EVP_CIPHER_CTX **aes_ctx,
                               const EVP_CIPHER *aes, unsigned char *key);
-int quic_tls_enc_aes_ctx_init(EVP_CIPHER_CTX **aes_ctx,
+int quic_tls_enc_hp_ctx_init(EVP_CIPHER_CTX **aes_ctx,
                               const EVP_CIPHER *aes, unsigned char *key);
-int quic_tls_aes_decrypt(unsigned char *out,
+int quic_tls_hp_decrypt(unsigned char *out,
                          const unsigned char *in, size_t inlen,
-                         EVP_CIPHER_CTX *ctx);
-int quic_tls_aes_encrypt(unsigned char *out,
+                         EVP_CIPHER_CTX *ctx, unsigned char *key);
+int quic_tls_hp_encrypt(unsigned char *out,
                          const unsigned char *in, size_t inlen,
-                         EVP_CIPHER_CTX *ctx);
+                         EVP_CIPHER_CTX *ctx, unsigned char *key);
 
 int quic_tls_key_update(struct quic_conn *qc);
 void quic_tls_rotate_keys(struct quic_conn *qc);
 
-static inline const EVP_CIPHER *tls_aead(const SSL_CIPHER *cipher)
+static inline const QUIC_AEAD *tls_aead(const SSL_CIPHER *cipher)
 {
 	switch (SSL_CIPHER_get_id(cipher)) {
 	case TLS1_3_CK_AES_128_GCM_SHA256:
+#ifdef QUIC_AEAD_API
+		return EVP_aead_aes_128_gcm();
+#else
 		return EVP_aes_128_gcm();
+#endif
+
 	case TLS1_3_CK_AES_256_GCM_SHA384:
+#ifdef QUIC_AEAD_API
+		return EVP_aead_aes_256_gcm();
+#else
 		return EVP_aes_256_gcm();
-#if !defined(OPENSSL_IS_AWSLC) && (!defined(LIBRESSL_VERSION_NUMBER) || LIBRESSL_VERSION_NUMBER >= 0x4000000fL)
+#endif
+
+#if (!defined(LIBRESSL_VERSION_NUMBER) || LIBRESSL_VERSION_NUMBER >= 0x4000000fL)
 	/* WT: LibreSSL has an issue with CHACHA20 running in-place till 3.9.2
 	 *     included, but the fix is already identified and will be merged
 	 *     into next major version. Given that on machines without AES-NI
@@ -150,7 +160,11 @@ static inline const EVP_CIPHER *tls_aead(const SSL_CIPHER *cipher)
 	 *     Thanks to Theo Buehler for his help!
 	 */
 	case TLS1_3_CK_CHACHA20_POLY1305_SHA256:
+# ifdef QUIC_AEAD_API
+		return EVP_aead_chacha20_poly1305();
+# else
 		return EVP_chacha20_poly1305();
+# endif
 #endif
 #if !defined(USE_OPENSSL_WOLFSSL) && !defined(OPENSSL_IS_AWSLC)
 	case TLS1_3_CK_AES_128_CCM_SHA256:
@@ -178,8 +192,10 @@ static inline const EVP_MD *tls_md(const SSL_CIPHER *cipher)
 static inline const EVP_CIPHER *tls_hp(const SSL_CIPHER *cipher)
 {
 	switch (SSL_CIPHER_get_id(cipher)) {
-#if !defined(OPENSSL_IS_AWSLC)
 	case TLS1_3_CK_CHACHA20_POLY1305_SHA256:
+#ifdef QUIC_AEAD_API
+		return EVP_CIPHER_CHACHA20;
+#else
 		return EVP_chacha20();
 #endif
 	case TLS1_3_CK_AES_128_CCM_SHA256:
@@ -744,16 +760,26 @@ static inline void quic_tls_ctx_secs_free(struct quic_tls_ctx *ctx)
 	}
 
 	/* RX HP protection */
+#ifdef QUIC_AEAD_API
+	if (ctx->rx.hp_ctx != EVP_CIPHER_CTX_CHACHA20)
+		EVP_CIPHER_CTX_free(ctx->rx.hp_ctx);
+#else
 	EVP_CIPHER_CTX_free(ctx->rx.hp_ctx);
+#endif
 	/* RX AEAD decryption */
-	EVP_CIPHER_CTX_free(ctx->rx.ctx);
+	QUIC_AEAD_CTX_free(ctx->rx.ctx);
 	pool_free(pool_head_quic_tls_iv,  ctx->rx.iv);
 	pool_free(pool_head_quic_tls_key, ctx->rx.key);
 
 	/* TX HP protection */
+#ifdef QUIC_AEAD_API
+	if (ctx->tx.hp_ctx != EVP_CIPHER_CTX_CHACHA20)
+		EVP_CIPHER_CTX_free(ctx->tx.hp_ctx);
+#else
 	EVP_CIPHER_CTX_free(ctx->tx.hp_ctx);
+#endif
 	/* TX AEAD encryption */
-	EVP_CIPHER_CTX_free(ctx->tx.ctx);
+	QUIC_AEAD_CTX_free(ctx->tx.ctx);
 	pool_free(pool_head_quic_tls_iv,  ctx->tx.iv);
 	pool_free(pool_head_quic_tls_key, ctx->tx.key);
 
@@ -806,7 +832,7 @@ static inline void quic_tls_secrets_keys_free(struct quic_tls_secrets *secs)
 	/* HP protection */
 	EVP_CIPHER_CTX_free(secs->hp_ctx);
 	/* AEAD decryption */
-	EVP_CIPHER_CTX_free(secs->ctx);
+	QUIC_AEAD_CTX_free(secs->ctx);
 	pool_free(pool_head_quic_tls_iv,  secs->iv);
 	pool_free(pool_head_quic_tls_key, secs->key);
 
@@ -845,7 +871,11 @@ static inline void quic_nictx_free(struct quic_conn *qc)
 /* Initialize a TLS cryptographic context for the Initial encryption level. */
 static inline int quic_initial_tls_ctx_init(struct quic_tls_ctx *ctx)
 {
+#ifdef QUIC_AEAD_API
+	ctx->rx.aead = ctx->tx.aead = EVP_aead_aes_128_gcm();
+#else
 	ctx->rx.aead = ctx->tx.aead = EVP_aes_128_gcm();
+#endif
 	ctx->rx.md   = ctx->tx.md   = EVP_sha256();
 	ctx->rx.hp   = ctx->tx.hp   = EVP_aes_128_ctr();
 
@@ -945,7 +975,7 @@ static inline int qc_new_isecs(struct quic_conn *qc,
 	if (!quic_tls_rx_ctx_init(&rx_ctx->ctx, rx_ctx->aead, rx_ctx->key))
 		goto err;
 
-	if (!quic_tls_enc_aes_ctx_init(&rx_ctx->hp_ctx, rx_ctx->hp, rx_ctx->hp_key))
+	if (!quic_tls_enc_hp_ctx_init(&rx_ctx->hp_ctx, rx_ctx->hp, rx_ctx->hp_key))
 		goto err;
 
 	if (!quic_tls_derive_keys(ctx->tx.aead, ctx->tx.hp, ctx->tx.md, ver,
@@ -958,7 +988,7 @@ static inline int qc_new_isecs(struct quic_conn *qc,
 	if (!quic_tls_tx_ctx_init(&tx_ctx->ctx, tx_ctx->aead, tx_ctx->key))
 		goto err;
 
-	if (!quic_tls_enc_aes_ctx_init(&tx_ctx->hp_ctx, tx_ctx->hp, tx_ctx->hp_key))
+	if (!quic_tls_enc_hp_ctx_init(&tx_ctx->hp_ctx, tx_ctx->hp, tx_ctx->hp_key))
 		goto err;
 
 	TRACE_LEAVE(QUIC_EV_CONN_ISEC, qc, rx_init_sec, tx_init_sec);
@@ -985,17 +1015,17 @@ static inline void quic_tls_ku_reset(struct quic_tls_kp *tls_kp)
  */
 static inline void quic_tls_ku_free(struct quic_conn *qc)
 {
-	EVP_CIPHER_CTX_free(qc->ku.prv_rx.ctx);
+	QUIC_AEAD_CTX_free(qc->ku.prv_rx.ctx);
 	pool_free(pool_head_quic_tls_secret, qc->ku.prv_rx.secret);
 	pool_free(pool_head_quic_tls_iv,     qc->ku.prv_rx.iv);
 	pool_free(pool_head_quic_tls_key,    qc->ku.prv_rx.key);
 	quic_tls_ku_reset(&qc->ku.prv_rx);
-	EVP_CIPHER_CTX_free(qc->ku.nxt_rx.ctx);
+	QUIC_AEAD_CTX_free(qc->ku.nxt_rx.ctx);
 	pool_free(pool_head_quic_tls_secret, qc->ku.nxt_rx.secret);
 	pool_free(pool_head_quic_tls_iv,     qc->ku.nxt_rx.iv);
 	pool_free(pool_head_quic_tls_key,    qc->ku.nxt_rx.key);
 	quic_tls_ku_reset(&qc->ku.nxt_rx);
-	EVP_CIPHER_CTX_free(qc->ku.nxt_tx.ctx);
+	QUIC_AEAD_CTX_free(qc->ku.nxt_tx.ctx);
 	pool_free(pool_head_quic_tls_secret, qc->ku.nxt_tx.secret);
 	pool_free(pool_head_quic_tls_iv,     qc->ku.nxt_tx.iv);
 	pool_free(pool_head_quic_tls_key,    qc->ku.nxt_tx.key);

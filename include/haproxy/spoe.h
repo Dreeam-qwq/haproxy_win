@@ -27,14 +27,19 @@
 #include <haproxy/sample-t.h>
 #include <haproxy/spoe-t.h>
 
+struct appctx;
+
+extern const struct ist spop_err_reasons[SPOP_ERR_ENTRIES];
+extern const struct spop_version spop_supported_versions[];
+
+struct spoe_agent *spoe_appctx_agent(struct appctx *appctx);
 
 /* Encode a buffer. Its length <len> is encoded as a varint, followed by a copy
  * of <str>. It must have enough space in <*buf> to encode the buffer, else an
  * error is triggered.
  * On success, it returns <len> and <*buf> is moved after the encoded value. If
  * an error occurred, it returns -1. */
-static inline int
-spoe_encode_buffer(const char *str, size_t len, char **buf, char *end)
+static inline int spoe_encode_buffer(const char *str, size_t len, char **buf, char *end)
 {
 	char *p = *buf;
 	int   ret;
@@ -57,41 +62,11 @@ spoe_encode_buffer(const char *str, size_t len, char **buf, char *end)
 	return len;
 }
 
-/* Encode a buffer, possibly partially. It does the same thing than
- * 'spoe_encode_buffer', but if there is not enough space, it does not fail.
- * On success, it returns the number of copied bytes and <*buf> is moved after
- * the encoded value. If an error occurred, it returns -1. */
-static inline int
-spoe_encode_frag_buffer(const char *str, size_t len, char **buf, char *end)
-{
-	char *p = *buf;
-	int   ret;
-
-	if (p >= end)
-		return -1;
-
-	if (!len) {
-		*p++ = 0;
-		*buf = p;
-		return 0;
-	}
-
-	ret = encode_varint(len, &p, end);
-	if (ret == -1 || p >= end)
-		return -1;
-
-	ret = (p+len < end) ? len : (end - p);
-	memcpy(p, str, ret);
-	*buf = p + ret;
-	return ret;
-}
-
 /* Decode a buffer. The buffer length is decoded and saved in <*len>. <*str>
  * points on the first byte of the buffer.
  * On success, it returns the buffer length and <*buf> is moved after the
  * encoded buffer. Otherwise, it returns -1. */
-static inline int
-spoe_decode_buffer(char **buf, char *end, char **str, uint64_t *len)
+static inline int spoe_decode_buffer(char **buf, char *end, char **str, uint64_t *len)
 {
 	char    *p = *buf;
 	uint64_t sz;
@@ -117,8 +92,7 @@ spoe_decode_buffer(char **buf, char *end, char **str, uint64_t *len)
  * If the value is too big to be encoded, depending on its type, then encoding
  * failed or the value is partially encoded. Only strings and binaries can be
  * partially encoded. */
-static inline int
-spoe_encode_data(struct sample *smp, char **buf, char *end)
+static inline int spoe_encode_data(struct sample *smp, char **buf, char *end)
 {
 	char *p = *buf;
 	int   ret;
@@ -127,18 +101,18 @@ spoe_encode_data(struct sample *smp, char **buf, char *end)
 		return -1;
 
 	if (smp == NULL) {
-		*p++ = SPOE_DATA_T_NULL;
+		*p++ = SPOP_DATA_T_NULL;
 		goto end;
 	}
 
 	switch (smp->data.type) {
 		case SMP_T_BOOL:
-			*p    = SPOE_DATA_T_BOOL;
-			*p++ |= ((!smp->data.u.sint) ? SPOE_DATA_FL_FALSE : SPOE_DATA_FL_TRUE);
+			*p    = SPOP_DATA_T_BOOL;
+			*p++ |= ((!smp->data.u.sint) ? SPOP_DATA_FL_FALSE : SPOP_DATA_FL_TRUE);
 			break;
 
 		case SMP_T_SINT:
-			*p++ = SPOE_DATA_T_INT64;
+			*p++ = SPOP_DATA_T_INT64;
 			if (encode_varint(smp->data.u.sint, &p, end) == -1)
 				return -1;
 			break;
@@ -146,7 +120,7 @@ spoe_encode_data(struct sample *smp, char **buf, char *end)
 		case SMP_T_IPV4:
 			if (p + 5 > end)
 				return -1;
-			*p++ = SPOE_DATA_T_IPV4;
+			*p++ = SPOP_DATA_T_IPV4;
 			memcpy(p, &smp->data.u.ipv4, 4);
 			p += 4;
 			break;
@@ -154,51 +128,19 @@ spoe_encode_data(struct sample *smp, char **buf, char *end)
 		case SMP_T_IPV6:
 			if (p + 17 > end)
 				return -1;
-			*p++ = SPOE_DATA_T_IPV6;
+			*p++ = SPOP_DATA_T_IPV6;
 			memcpy(p, &smp->data.u.ipv6, 16);
 			p += 16;
 			break;
 
 		case SMP_T_STR:
 		case SMP_T_BIN: {
-			/* If defined, get length and offset of the sample by reading the sample
-			 * context. ctx.a[0] is the pointer to the length and ctx.a[1] is the
-			 * pointer to the offset. If the offset is greater than 0, it means the
-			 * sample is partially encoded. In this case, we only need to encode the
-			 * remaining. When all the sample is encoded, the offset is reset to 0.
-			 * So the caller know it can try to encode the next sample. */
 			struct buffer *chk = &smp->data.u.str;
-			unsigned int *len  = smp->ctx.a[0];
-			unsigned int *off  = smp->ctx.a[1];
 
-			if (!*off) {
-				/* First evaluation of the sample : encode the
-				 * type (string or binary), the buffer length
-				 * (as a varint) and at least 1 byte of the
-				 * buffer. */
-				struct buffer *chk = &smp->data.u.str;
-
-				*p++ = (smp->data.type == SMP_T_STR)
-					? SPOE_DATA_T_STR
-					: SPOE_DATA_T_BIN;
-				ret = spoe_encode_frag_buffer(chk->area,
-							      chk->data, &p,
-							      end);
-				if (ret == -1)
-					return -1;
-				*len = chk->data;
-			}
-			else {
-				/* The sample has been fragmented, encode remaining data */
-				ret = MIN(*len - *off, end - p);
-				memcpy(p, chk->area + *off, ret);
-				p += ret;
-			}
-			/* Now update <*off> */
-			if (ret + *off != *len)
-				*off += ret;
-			else
-				*off = 0;
+			*p++ = (smp->data.type == SMP_T_STR) ? SPOP_DATA_T_STR : SPOP_DATA_T_BIN;
+			ret = spoe_encode_buffer(chk->area, chk->data, &p, end);
+			if (ret == -1)
+				return -1;
 			break;
 		}
 
@@ -206,7 +148,7 @@ spoe_encode_data(struct sample *smp, char **buf, char *end)
 			char   *m;
 			size_t  len;
 
-			*p++ = SPOE_DATA_T_STR;
+			*p++ = SPOP_DATA_T_STR;
 			switch (smp->data.u.meth.meth) {
 				case HTTP_METH_OPTIONS: m = "OPTIONS"; len = 7; break;
 				case HTTP_METH_GET    : m = "GET";     len = 3; break;
@@ -227,7 +169,7 @@ spoe_encode_data(struct sample *smp, char **buf, char *end)
 		}
 
 		default:
-			*p++ = SPOE_DATA_T_NULL;
+			*p++ = SPOP_DATA_T_NULL;
 			break;
 	}
 
@@ -247,8 +189,7 @@ spoe_encode_data(struct sample *smp, char **buf, char *end)
  *  - ipv6: 16 bytes
  *  - binary and string: a buffer prefixed by its size, a variable-length
  *    integer (see spoe_decode_buffer) */
-static inline int
-spoe_skip_data(char **buf, char *end)
+static inline int spoe_skip_data(char **buf, char *end)
 {
 	char    *str, *p = *buf;
 	int      type, ret;
@@ -258,28 +199,28 @@ spoe_skip_data(char **buf, char *end)
 		return -1;
 
 	type = *p++;
-	switch (type & SPOE_DATA_T_MASK) {
-		case SPOE_DATA_T_BOOL:
+	switch (type & SPOP_DATA_T_MASK) {
+		case SPOP_DATA_T_BOOL:
 			break;
-		case SPOE_DATA_T_INT32:
-		case SPOE_DATA_T_INT64:
-		case SPOE_DATA_T_UINT32:
-		case SPOE_DATA_T_UINT64:
+		case SPOP_DATA_T_INT32:
+		case SPOP_DATA_T_INT64:
+		case SPOP_DATA_T_UINT32:
+		case SPOP_DATA_T_UINT64:
 			if (decode_varint(&p, end, &v) == -1)
 				return -1;
 			break;
-		case SPOE_DATA_T_IPV4:
+		case SPOP_DATA_T_IPV4:
 			if (p+4 > end)
 				return -1;
 			p += 4;
 			break;
-		case SPOE_DATA_T_IPV6:
+		case SPOP_DATA_T_IPV6:
 			if (p+16 > end)
 				return -1;
 			p += 16;
 			break;
-		case SPOE_DATA_T_STR:
-		case SPOE_DATA_T_BIN:
+		case SPOP_DATA_T_STR:
+		case SPOP_DATA_T_BIN:
 			/* All the buffer must be skipped */
 			if (spoe_decode_buffer(&p, end, &str, &sz) == -1)
 				return -1;
@@ -294,8 +235,7 @@ spoe_skip_data(char **buf, char *end)
 /* Decode a typed data and fill <smp>. If an error occurred, -1 is returned,
  * otherwise the number of read bytes is returned and <*buf> is moved after the
  * decoded data. See spoe_skip_data for details. */
-static inline int
-spoe_decode_data(char **buf, char *end, struct sample *smp)
+static inline int spoe_decode_data(char **buf, char *end, struct sample *smp)
 {
 	char  *str, *p = *buf;
 	int    type, r = 0;
@@ -305,47 +245,123 @@ spoe_decode_data(char **buf, char *end, struct sample *smp)
 		return -1;
 
 	type = *p++;
-	switch (type & SPOE_DATA_T_MASK) {
-		case SPOE_DATA_T_BOOL:
-			smp->data.u.sint = ((type & SPOE_DATA_FL_MASK) == SPOE_DATA_FL_TRUE);
+	switch (type & SPOP_DATA_T_MASK) {
+		case SPOP_DATA_T_BOOL:
+			smp->data.u.sint = ((type & SPOP_DATA_FL_MASK) == SPOP_DATA_FL_TRUE);
 			smp->data.type = SMP_T_BOOL;
 			break;
-		case SPOE_DATA_T_INT32:
-		case SPOE_DATA_T_INT64:
-		case SPOE_DATA_T_UINT32:
-		case SPOE_DATA_T_UINT64:
+		case SPOP_DATA_T_INT32:
+		case SPOP_DATA_T_INT64:
+		case SPOP_DATA_T_UINT32:
+		case SPOP_DATA_T_UINT64:
 			if (decode_varint(&p, end, (uint64_t *)&smp->data.u.sint) == -1)
 				return -1;
 			smp->data.type = SMP_T_SINT;
 			break;
-		case SPOE_DATA_T_IPV4:
+		case SPOP_DATA_T_IPV4:
 			if (p+4 > end)
 				return -1;
 			smp->data.type = SMP_T_IPV4;
 			memcpy(&smp->data.u.ipv4, p, 4);
 			p += 4;
 			break;
-		case SPOE_DATA_T_IPV6:
+		case SPOP_DATA_T_IPV6:
 			if (p+16 > end)
 				return -1;
 			memcpy(&smp->data.u.ipv6, p, 16);
 			smp->data.type = SMP_T_IPV6;
 			p += 16;
 			break;
-		case SPOE_DATA_T_STR:
-		case SPOE_DATA_T_BIN:
+		case SPOP_DATA_T_STR:
+		case SPOP_DATA_T_BIN:
 			/* All the buffer must be decoded */
 			if (spoe_decode_buffer(&p, end, &str, &sz) == -1)
 				return -1;
 			smp->data.u.str.area = str;
 			smp->data.u.str.data = sz;
-			smp->data.type = (type == SPOE_DATA_T_STR) ? SMP_T_STR : SMP_T_BIN;
+			smp->data.type = (type == SPOP_DATA_T_STR) ? SMP_T_STR : SMP_T_BIN;
 			break;
 	}
 
 	r    = (p - *buf);
 	*buf = p;
 	return r;
+}
+
+/* Convert a string to a SPOP version value. The string must follow the format
+ * "MAJOR.MINOR". It will be concerted into the integer (1000 * MAJOR + MINOR).
+ * If an error occurred, -1 is returned.
+ */
+static inline int spoe_str_to_vsn(const char *str, size_t len)
+{
+	const char *p, *end;
+	int   maj, min, vsn;
+
+	p   = str;
+	end = str+len;
+	maj = min = 0;
+	vsn = -1;
+
+	/* skip leading spaces */
+	while (p < end && isspace((unsigned char)*p))
+		p++;
+
+	/* parse Major number, until the '.' */
+	while (*p != '.') {
+		if (p >= end || *p < '0' || *p > '9')
+			goto out;
+		maj *= 10;
+		maj += (*p - '0');
+		p++;
+	}
+
+	/* check Major version */
+	if (!maj)
+		goto out;
+
+	p++; /* skip the '.' */
+	if (p >= end || *p < '0' || *p > '9') /* Minor number is missing */
+		goto out;
+
+	/* Parse Minor number */
+	while (p < end) {
+		if (*p < '0' || *p > '9')
+			break;
+		min *= 10;
+		min += (*p - '0');
+		p++;
+	}
+
+	/* check Minor number */
+	if (min > 999)
+		goto out;
+
+	/* skip trailing spaces */
+	while (p < end && isspace((unsigned char)*p))
+		p++;
+	if (p != end)
+		goto out;
+
+	vsn = maj * 1000 + min;
+out:
+	return vsn;
+}
+
+/* Check if vsn, converted into an integer, is supported by looping on the list
+ * of supported versions. It return -1 on error and 0 on success.
+ */
+static inline int spoe_check_vsn(int vsn)
+{
+	int i;
+
+	for (i = 0; spop_supported_versions[i].str != NULL; ++i) {
+		if (vsn >= spop_supported_versions[i].min &&
+		    vsn <= spop_supported_versions[i].max)
+			break;
+	}
+	if (spop_supported_versions[i].str == NULL)
+		return -1;
+	return 0;
 }
 
 #endif /* _HAPROXY_SPOE_H */

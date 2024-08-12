@@ -217,7 +217,7 @@ static int ha_quic_set_encryption_secrets(SSL *ssl, enum ssl_encryption_level_t 
 		goto leave;
 	}
 
-	if (!quic_tls_dec_aes_ctx_init(&rx->hp_ctx, rx->hp, rx->hp_key)) {
+	if (!quic_tls_dec_hp_ctx_init(&rx->hp_ctx, rx->hp, rx->hp_key)) {
 		TRACE_ERROR("could not initial RX TLS cipher context for HP", QUIC_EV_CONN_RWSEC, qc);
 		goto leave;
 	}
@@ -260,7 +260,7 @@ write:
 		goto leave;
 	}
 
-	if (!quic_tls_enc_aes_ctx_init(&tx->hp_ctx, tx->hp, tx->hp_key)) {
+	if (!quic_tls_enc_hp_ctx_init(&tx->hp_ctx, tx->hp, tx->hp_key)) {
 		TRACE_ERROR("could not initial TX TLS cipher context for HP", QUIC_EV_CONN_RWSEC, qc);
 		goto leave;
 	}
@@ -452,6 +452,8 @@ int ssl_quic_initial_ctx(struct bind_conf *bind_conf)
 #if !defined(HAVE_SSL_0RTT_QUIC)
 		ha_warning("Binding [%s:%d] for %s %s: 0-RTT with QUIC is not supported by this SSL library, ignored.\n",
 		           bind_conf->file, bind_conf->line, proxy_type_str(bind_conf->frontend), bind_conf->frontend->id);
+#elif defined(OPENSSL_IS_BORINGSSL) || defined(OPENSSL_IS_AWSLC)
+		SSL_CTX_set_early_data_enabled(ctx, 1);
 #else
 		SSL_CTX_set_options(ctx, SSL_OP_NO_ANTI_REPLAY);
 		SSL_CTX_set_max_early_data(ctx, 0xffffffff);
@@ -459,7 +461,7 @@ int ssl_quic_initial_ctx(struct bind_conf *bind_conf)
 	}
 
 #ifdef SSL_CTRL_SET_TLSEXT_HOSTNAME
-# if defined(OPENSSL_IS_BORINGSSL) || defined(USE_OPENSSL_AWSLC)
+# if defined(OPENSSL_IS_BORINGSSL) || defined(OPENSSL_IS_AWSLC)
 	SSL_CTX_set_select_certificate_cb(ctx, ssl_sock_switchctx_cbk);
 	SSL_CTX_set_tlsext_servername_callback(ctx, ssl_sock_switchctx_err_cbk);
 # elif defined(HAVE_SSL_CLIENT_HELLO_CB)

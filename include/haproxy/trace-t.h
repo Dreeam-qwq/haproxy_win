@@ -136,6 +136,20 @@ struct trace_event {
 	const char *desc;
 };
 
+/* context of a trace in progress. Unknown fields are NULL */
+struct trace_ctx {
+	const struct listener *li;
+	const struct proxy *fe;
+	const struct proxy *be;
+	const struct server *srv;
+	const struct session *sess;
+	const struct stream *strm;
+	const struct connection *conn;
+	const struct check *check;
+	const struct quic_conn *qc;
+	const struct appctx *appctx;
+};
+
 /* Regarding the verbosity, if <decoding> is not NULL, it must point to a NULL-
  * terminated array of name:description, which will define verbosity levels
  * implemented by the decoding callback. The verbosity value will default to
@@ -152,6 +166,8 @@ struct trace_source {
 	                   const struct trace_source *src,
 	                   const struct ist where, const struct ist func,
 	                   const void *a1, const void *a2, const void *a3, const void *a4);
+	void (*fill_ctx)(struct trace_ctx *ctx, const struct trace_source *src,
+	                 const void *a1, const void *a2, const void *a3, const void *a4);
 	uint32_t arg_def;        // argument definitions (sum of TRC_ARG{1..4}_*)
 	const struct name_desc *lockon_args; // must be 4 entries if not NULL
 	const struct name_desc *decoding;    // null-terminated if not NULL
@@ -167,6 +183,7 @@ struct trace_source {
 	/* trace state part below */
 	enum trace_state state;
 	const void *lockon_ptr;  // what to lockon when lockon is set
+	const struct trace_source *follow; // other trace source's tracker to follow
 };
 
 #endif /* _HAPROXY_TRACE_T_H */

@@ -41,6 +41,9 @@ enum act_from {
 	ACT_F_TCP_CHK,     /* tcp-check. */
 	ACT_F_CFG_PARSER,  /* config parser */
 	ACT_F_CLI_PARSER,  /* command line parser */
+#ifdef USE_QUIC
+	ACT_F_QUIC_INIT,   /* quic-initial */
+#endif
 };
 
 enum act_return {
@@ -170,8 +173,7 @@ struct act_rule {
 		struct {
 			struct lf_expr fmt;         /* log-format compatible expression */
 			struct sample_expr *expr;
-			uint64_t name_hash;
-			enum vars_scope scope;
+			struct var_desc desc;
 			uint conditions;            /* Bitfield of the conditions passed to this set-var call */
 		} vars;
 		struct {

@@ -31,7 +31,6 @@
 #include <haproxy/stconn.h>
 #include <haproxy/stream.h>
 #include <haproxy/trace.h>
-#include <haproxy/xref.h>
 
 /* H1 connection descriptor */
 struct h1c {
@@ -100,6 +99,9 @@ static void h1_trace(enum trace_level level, uint64_t mask,
                      const struct trace_source *src,
                      const struct ist where, const struct ist func,
                      const void *a1, const void *a2, const void *a3, const void *a4);
+
+static void h1_trace_fill_ctx(struct trace_ctx *ctx, const struct trace_source *src,
+                              const void *a1, const void *a2, const void *a3, const void *a4);
 
 /* The event representation is split like this :
  *   h1c   - internal H1 connection
@@ -200,6 +202,7 @@ static struct trace_source trace_h1 __read_mostly = {
 	.desc = "HTTP/1 multiplexer",
 	.arg_def = TRC_ARG1_CONN,  // TRACE()'s first argument is always a connection
 	.default_cb = h1_trace,
+	.fill_ctx = h1_trace_fill_ctx,
 	.known_events = h1_trace_events,
 	.lockon_args = h1_trace_lockon_args,
 	.decoding = h1_trace_decoding,
@@ -451,6 +454,33 @@ static void h1_trace(enum trace_level level, uint64_t mask, const struct trace_s
 
 		chunk_memcat(&trace_buf, "\n\t", 2);
 		htx_dump(&trace_buf, htx, full);
+	}
+}
+
+/* This fills the trace_ctx with extra info guessed from the args */
+static void h1_trace_fill_ctx(struct trace_ctx *ctx, const struct trace_source *src,
+                              const void *a1, const void *a2, const void *a3, const void *a4)
+{
+	const struct connection *conn = a1;
+	const struct h1c *h1c = conn ? conn->ctx : NULL;
+	const struct h1s *h1s = a2;
+
+	if (!ctx->conn)
+		ctx->conn = conn;
+
+	if (h1c) {
+		if (!ctx->fe && !(h1c->flags & H1C_F_IS_BACK))
+			ctx->fe = h1c->px;
+
+		if (!ctx->be && (h1c->flags & H1C_F_IS_BACK))
+			ctx->be = h1c->px;
+	}
+
+	if (h1s) {
+		if (!ctx->sess)
+			ctx->sess = h1s->sess;
+		if (!ctx->strm && h1s->sd && h1s_sc(h1s))
+			ctx->strm = sc_strm(h1s_sc(h1s));
 	}
 }
 
@@ -800,6 +830,8 @@ static struct stconn *h1s_upgrade_sc(struct h1s *h1s, struct buffer *input)
 		goto err;
 	}
 
+	TRACE_STATE("upgraded H1 stream", H1_EV_H1S_NEW, h1s->h1c->conn, h1s);
+
 	h1s->h1c->state = H1_CS_RUNNING;
 	TRACE_LEAVE(H1_EV_STRM_NEW, h1s->h1c->conn, h1s);
 	return h1s_sc(h1s);
@@ -891,6 +923,8 @@ static struct h1s *h1c_frt_stream_new(struct h1c *h1c, struct stconn *sc, struct
 
 	h1c->idle_exp = TICK_ETERNITY;
 	h1_set_idle_expiration(h1c);
+
+	TRACE_STATE("created new H1 front stream", H1_EV_H1S_NEW, h1c->conn, h1s);
 	TRACE_LEAVE(H1_EV_H1S_NEW, h1c->conn, h1s);
 	return h1s;
 
@@ -927,6 +961,7 @@ static struct h1s *h1c_bck_stream_new(struct h1c *h1c, struct stconn *sc, struct
 	HA_ATOMIC_INC(&h1c->px_counters->open_streams);
 	HA_ATOMIC_INC(&h1c->px_counters->total_streams);
 
+	TRACE_STATE("created new H1 back stream", H1_EV_H1S_NEW, h1c->conn, h1s);
 	TRACE_LEAVE(H1_EV_H1S_NEW, h1c->conn, h1s);
 	return h1s;
 
@@ -2627,9 +2662,11 @@ static size_t h1_make_eoh(struct h1s *h1s, struct h1m *h1m, struct htx *htx, siz
 	if (!(h1s->flags & H1S_F_HAVE_O_CONN)) {
 		if ((h1m->flags & (H1_MF_XFER_ENC|H1_MF_CLEN)) == (H1_MF_XFER_ENC|H1_MF_CLEN)) {
 			/* T-E + C-L: force close */
-			h1s->flags = (h1s->flags & ~H1S_F_WANT_MSK) | H1S_F_WANT_CLO;
 			h1m->flags &= ~H1_MF_CLEN;
-			TRACE_STATE("force close mode (T-E + C-L)", H1_EV_TX_DATA|H1_EV_TX_HDRS, h1s->h1c->conn, h1s);
+			if (!h1_do_not_close_on_insecure_t_e) {
+				h1s->flags = (h1s->flags & ~H1S_F_WANT_MSK) | H1S_F_WANT_CLO;
+				TRACE_STATE("force close mode (T-E + C-L)", H1_EV_TX_DATA|H1_EV_TX_HDRS, h1s->h1c->conn, h1s);
+			}
 		}
 		else if ((h1m->flags & (H1_MF_VER_11|H1_MF_XFER_ENC)) == H1_MF_XFER_ENC) {
 			/* T-E + HTTP/1.0: force close */
@@ -4370,7 +4407,7 @@ static void h1_detach(struct sedesc *sd)
 	TRACE_LEAVE(H1_EV_STRM_END);
 }
 
-static void h1_shut(struct stconn *sc, enum se_shut_mode mode, struct se_abort_info *reason)
+static void h1_shut(struct stconn *sc, unsigned int mode, struct se_abort_info *reason)
 {
 	struct h1s *h1s = __sc_mux_strm(sc);
 	struct h1c *h1c;
@@ -4603,16 +4640,7 @@ static size_t h1_snd_buf(struct stconn *sc, struct buffer *buf, size_t count, in
 
 static inline struct sedesc *h1s_opposite_sd(struct h1s *h1s)
 {
-	struct xref *peer;
-	struct sedesc *sdo;
-
-	peer = xref_get_peer_and_lock(&h1s->sd->xref);
-	if (!peer)
-		return NULL;
-
-	sdo = container_of(peer, struct sedesc, xref);
-	xref_unlock(&h1s->sd->xref, peer);
-	return sdo;
+	return se_opposite(h1s->sd);
 }
 
 static size_t h1_nego_ff(struct stconn *sc, struct buffer *input, size_t count, unsigned int flags)
@@ -4827,6 +4855,10 @@ static size_t h1_done_ff(struct stconn *sc)
 			h1c->conn->xprt->subscribe(h1c->conn, h1c->conn->xprt_ctx, SUB_RETRY_RECV, &h1c->wait_event);
 		}
 		se_fl_set_error(h1s->sd);
+		if (sd->iobuf.pipe) {
+			put_pipe(sd->iobuf.pipe);
+			sd->iobuf.pipe = NULL;
+		}
 		TRACE_DEVEL("connection error", H1_EV_STRM_ERR|H1_EV_H1C_ERR|H1_EV_H1S_ERR, h1c->conn, h1s);
 	}
 
@@ -5082,6 +5114,10 @@ static int h1_resume_fastfwd(struct stconn *sc, unsigned int flags)
 			h1c->conn->xprt->subscribe(h1c->conn, h1c->conn->xprt_ctx, SUB_RETRY_RECV, &h1c->wait_event);
 		}
 		se_fl_set_error(h1s->sd);
+		if (h1s->sd->iobuf.pipe) {
+			put_pipe(h1s->sd->iobuf.pipe);
+			h1s->sd->iobuf.pipe = NULL;
+		}
 		TRACE_DEVEL("connection error", H1_EV_STRM_ERR|H1_EV_H1C_ERR|H1_EV_H1S_ERR, h1c->conn, h1s);
 	}
 
