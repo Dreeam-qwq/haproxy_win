@@ -3,7 +3,7 @@
                           Configuration Manual
                          ----------------------
                               version 3.1
-                              2024/08/07
+                              2024/08/21
 
 
 This document covers the configuration language as implemented in the version
@@ -927,6 +927,11 @@ file, or could be inherited by a program (See 3.7. Programs):
   defined in section 8.2.3 "HTTP log format". It can be used to override the
   default log format without having to copy the whole original definition.
 
+* HAPROXY_HTTP_CLF_LOG_FMT: contains the value of the default HTTP CLF log
+  format as defined in section 8.2.3 "HTTP log format". It can be used to
+  override the default log format without having to copy the whole original
+  definition.
+
   Example:
     # Add the rule that gave the final verdict to the log
     log-format "${HAPROXY_TCP_LOG_FMT} lr=last_rule_file:last_rule_line"
@@ -936,6 +941,9 @@ file, or could be inherited by a program (See 3.7. Programs):
 
 * HAPROXY_TCP_LOG_FMT: similar to HAPROXY_HTTP_LOG_FMT but for TCP log format
   as defined in section 8.2.2 "TCP log format".
+
+* HAPROXY_TCP_CLF_LOG_FMT: similar to HAPROXY_HTTP_CLF_LOG_FMT but for TCP CLF
+  log format as defined in section 8.2.2 "TCP log format".
 
 * HAPROXY_MWORKER: In master-worker mode, this variable is set to 1.
 
@@ -1460,6 +1468,7 @@ The following keywords are supported in the "global" section :
    - tune.buffers.limit
    - tune.buffers.reserve
    - tune.bufsize
+   - tune.bufsize.small
    - tune.comp.maxlevel
    - tune.disable-fast-forward
    - tune.disable-zero-copy-forwarding
@@ -1505,10 +1514,10 @@ The following keywords are supported in the "global" section :
    - tune.pt.zero-copy-forwarding
    - tune.quic.cc-hystart
    - tune.quic.disable-udp-gso
-   - tune.quic.frontend.conn-tx-buffers.limit
    - tune.quic.frontend.glitches-threshold
    - tune.quic.frontend.max-idle-timeout
    - tune.quic.frontend.max-streams-bidi
+   - tune.quic.frontend.max-window-size
    - tune.quic.max-frame-loss
    - tune.quic.reorder-ratio
    - tune.quic.retry-threshold
@@ -3340,6 +3349,17 @@ tune.bufsize <number>
   value set using this parameter will automatically be rounded up to the next
   multiple of 8 on 32-bit machines and 16 on 64-bit machines.
 
+tune.bufsize.small <number>
+  Sets the size in bytes for small buffers. The defaults value is 1024.
+
+  These buffers are designed to be used in some specific contexts where memory
+  consumption is restrained but it seems unnecessary to allocate a full buffer.
+  If however a small buffer is not sufficient, a reallocation is automatically
+  done to switch to a standard size buffer.
+
+  For the moment, it is used only by HTTP/3 protocol to emit the response
+  headers.
+
 tune.comp.maxlevel <number>
   Sets the maximum compression level. The compression level affects CPU
   usage during compression. This value affects CPU usage during compression.
@@ -3890,18 +3910,30 @@ tune.quic.cc-hystart { on | off }
   QUIC connections used as a replacement for the slow start phase of congestion
   control algorithms which may cause high packet loss. It is disabled by default.
 
+tune.quic.cc.cubic.min-losses <number>
+  Defines how many lost packets are needed for the Cubic congestion control
+  algorithm to really consider a loss event. Normally, any loss event is
+  considered as the result of a congestion and is sufficient for Cubic to
+  restart from a smaller window. But experiments show that there can be a
+  variety of causes for losses that are not at all caused by congestion and
+  that can simply be qualified of spurious losses, and for which adjusting the
+  window will have no effect, except slowing communication down. Poor radio
+  signal, out-of-order delivery, high CPU usage on a client causing random
+  delays, as well as system timer imprecision can be among the common causes
+  for this. This setting allows to make Cubic a bit more tolerant to spurious
+  losses, by changing the minimum number of cumulated losses between two ACKs
+  to be considered as a loss event, which defaults to 1. Some significant gains
+  have been observed experimentally, but always accompanied with an aggravation
+  of the bandwidth wasted on retransmits, and an increased risk of saturation
+  of congested links. The value 2 may be used for short periods of time to
+  compare some metrics. Never go beyond 2 without an expert's prior analysis of
+  the situation. The default and minimum value is 1. Always use 1.
+
 tune.quic.disable-udp-gso
   Disable UDP GSO emission. This kernel feature allows to emit multiple
   datagrams via a single system call which is more efficient for large
   transfer. It may be useful to disable it on developers suggestion when
   suspecting an issue on emission.
-
-tune.quic.frontend.conn-tx-buffers.limit <number>
-  This settings defines the maximum number of buffers allocated for a QUIC
-  connection on data emission. By default, it is set to 30. QUIC buffers are
-  drained on ACK reception. This setting has a direct impact on the throughput
-  and memory consumption and can be adjusted according to an estimated round
-  time-trip. Each buffer is tune.bufsize.
 
 tune.quic.frontend.glitches-threshold <number>
   Sets the threshold for the number of glitches on a frontend connection, where
@@ -3933,6 +3965,19 @@ tune.quic.frontend.max-streams-bidi <number>
   requests.
 
   The default value is 100.
+
+tune.quic.frontend.max-window-size <size>
+  Sets the default maximum window size for the congestion controller of a
+  single QUIC connection. The value must be written as an integer with an
+  optional suffix 'k', 'm' or 'g'. It must be between 10k and 4g.
+
+  QUIC multiplexer also uses the current congestion window size to determine if
+  it can allocate new stream buffers on data emission. As such, the maximum
+  congestion window size also serves as a limit on this allocator.
+
+  The default value is 480k.
+
+  See also the "quic-cc-algo" bind option.
 
 tune.quic.max-frame-loss <number>
   Sets the limit for which a single QUIC frame can be marked as lost. If
@@ -5426,7 +5471,7 @@ option tcp-check                          X          -         X         X
 option tcp-smart-accept              (*)  X          X         X         -
 option tcp-smart-connect             (*)  X          -         X         X
 option tcpka                              X          X         X         X
-option tcplog                             X          X         X         X
+option tcplog                             X          X         X         -
 option transparent                   (*)  X          -         X         X
 option idle-close-on-response        (*)  X          X         X         -
 external-check command                    X          -         X         X
@@ -10821,7 +10866,7 @@ option tcpka
   See also : "option clitcpka", "option srvtcpka"
 
 
-option tcplog
+option tcplog [clf]
   Enable advanced logging of TCP connections with stream state and timers
 
   May be used in the following contexts: tcp, http
@@ -10829,7 +10874,14 @@ option tcplog
   May be used in sections :   defaults | frontend | listen | backend
                                  yes   |    yes   |   yes  |   no
 
-  Arguments : none
+  Arguments :
+    clf       if the "clf" argument is added, then the output format will be
+              the CLF format instead of HAProxy's default TCP format. You can
+              use this when you need to feed HAProxy's logs through a specific
+              log analyzer which only support the CLF format and which is not
+              extensible.  Since this expects an HTTP format some of the
+              values have been pre set. The http request will show as TCP and
+              the response code will show as 000.
 
   By default, the log output format is very poor, as it only contains the
   source and destination addresses, and the instance name. By specifying
@@ -16653,21 +16705,26 @@ proto <name>
   instance, it is possible to force the http/2 on clear TCP by specifying "proto
   h2" on the bind line.
 
-quic-cc-algo { cubic | newreno }
-quic-cc-algo { cubic | newreno }(max_window)
+quic-cc-algo { cubic | newreno | nocc }
+quic-cc-algo { cubic | newreno | nocc }(<max_window>)
   This is a QUIC specific setting to select the congestion control algorithm
   for any connection attempts to the configured QUIC listeners. They are similar
   to those used by TCP. An optional value in bytes may be used to specify the
-  maximum window size. It must be greater than 1k and smaller than 4g.
+  maximum window size. It must be greater than 10k and smaller than 4g.
 
   Default value: cubic
-  Default window value: tune.quic.frontend.conn-tx-buffers.limit * tune.bufsize
+  Default window value: "tune.quic.frontend.max-window-size"
 
   Example:
       # newreno congestion control algorithm
       quic-cc-algo newreno
       # cubic congestion control algorithm with one megabytes as window
       quic-cc-algo cubic(1m)
+
+  A special value "nocc" may be used to force a fixed congestion window always
+  set at the maximum size. It is reserved for debugging scenarios to remove any
+  side effects caused by the congestion controller. It must not be used in
+  production as it can quickly lead to network issues such as a high loss rate.
 
 quic-force-retry
   This is a QUIC specific setting which forces the use of the QUIC Retry feature
@@ -25553,6 +25610,14 @@ Refer to section 8.2.6 "Custom log format" to see how to use this:
     # or using the HAPROXY_TCP_LOG_FMT variable
     log-format "${HAPROXY_TCP_LOG_FMT}"
 
+And the CLF log format is internally declared as a custom log format based on
+this exact string:
+
+    # strict equivalent of "option tcplog clf"
+    log-format "%{Q}o %{-Q}ci - - [%T] \"TCP \" 000 %B \"\" \"\" %cp \
+                %ms %ft %b %s %Th %Tw %Tc %Tt %U %ts-- %ac %fc %bc \
+                %sc %rc %sq %bq \"\" \"\" "
+
 A few fields may slightly vary depending on some configuration options, those
 are marked with a star ('*') after the field name below.
 
@@ -26572,11 +26637,17 @@ log-profile <name>
 log-tag <string>
   Override syslog log tag set globally or per-proxy using "log-tag" directive.
 
-on <step> [format <fmt>] [sd <sd_fmt>]
+on <step> [drop] [format <fmt>] [sd <sd_fmt>]
   Override the log-format string normally used to build the log line at
   <step> logging step. <fmt> is used to override "log-format" or
   "error-log-format" strings (depending on the <step>) whereas <sd_fmt> is
-  used to override "log-format-sd" string. Possible values for <step> are:
+  used to override "log-format-sd" string (both can be combined).
+
+  "drop" special keyword may be used to specify that no log should be
+  emitted for the given <step>. It takes precedence over "format" and
+  "sd" if previously defined.
+
+  Possible values for <step> are:
 
   - "accept"   : override log-format if the log is generated right after
                  frontend conn was accepted
@@ -26604,6 +26675,7 @@ on <step> [format <fmt>] [sd <sd_fmt>]
       log-tag "custom-tag"
 
       on error format "%ci: error"
+      on connect drop
       on any sd "custom-sd"
 
     listen myproxy

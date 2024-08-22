@@ -38,6 +38,7 @@
 #include <haproxy/lb_map.h>
 #include <haproxy/lb_ss.h>
 #include <haproxy/log.h>
+#include <haproxy/protocol.h>
 #include <haproxy/proxy.h>
 #include <haproxy/sample.h>
 #include <haproxy/sc_strm.h>
@@ -294,6 +295,7 @@ char default_http_log_format[] = "%ci:%cp [%tr] %ft %b/%s %TR/%Tw/%Tc/%Tr/%Ta %S
 char default_https_log_format[] = "%ci:%cp [%tr] %ft %b/%s %TR/%Tw/%Tc/%Tr/%Ta %ST %B %CC %CS %tsc %ac/%fc/%bc/%sc/%rc %sq/%bq %hr %hs %{+Q}r %[fc_err]/%[ssl_fc_err,hex]/%[ssl_c_err]/%[ssl_c_ca_err]/%[ssl_fc_is_resumed] %[ssl_fc_sni]/%sslv/%sslc";
 char clf_http_log_format[] = "%{+Q}o %{-Q}ci - - [%trg] %r %ST %B \"\" \"\" %cp %ms %ft %b %s %TR %Tw %Tc %Tr %Ta %tsc %ac %fc %bc %sc %rc %sq %bq %CC %CS %hrl %hsl";
 char default_tcp_log_format[] = "%ci:%cp [%t] %ft %b/%s %Tw/%Tc/%Tt %B %ts %ac/%fc/%bc/%sc/%rc %sq/%bq";
+char clf_tcp_log_format[] = "%{+Q}o %{-Q}ci - - [%T] \"TCP \" 000 %B \"\" \"\" %cp %ms %ft %b %s %Th %Tw %Tc %Tt %U %ts-- %ac %fc %bc %sc %rc %sq %bq \"\" \"\" ";
 char *log_format = NULL;
 
 /* Default string used for structured-data part in RFC5424 formatted
@@ -311,6 +313,7 @@ static inline int logformat_str_isdefault(const char *str)
 	       str == default_https_log_format ||
 	       str == clf_http_log_format ||
 	       str == default_tcp_log_format ||
+	       str == clf_tcp_log_format ||
 	       str == default_rfc5424_sd_log_format;
 }
 
@@ -989,20 +992,23 @@ static int lf_expr_postcheck_node_opt(struct lf_expr *lf_expr, struct logformat_
 /* Performs a postparsing check on logformat expression <expr> for a given <px>
  * proxy. The function will behave differently depending on the proxy state
  * (during parsing we will try to adapt proxy configuration to make it
- * compatible with logformat expression, but once the proxy is checked, we fail
- * as soon as we face incompatibilities)
+ * compatible with logformat expression, but once the proxy is checked, we
+ * cannot help anymore so all we can do is raise a diag warning and hope that
+ * the conditions will be met when executing the logformat expression)
  *
- * If the proxy is a default section, then allow the postcheck to succeed:
- * the logformat expression may or may not work properly depending on the
- * actual proxy that effectively runs it during runtime, but we have to stay
- * permissive since we cannot assume it won't work.
+ * If the proxy is a default section, then allow the postcheck to succeed
+ * without errors nor warnings: the logformat expression may or may not work
+ * properly depending on the actual proxy that effectively runs it during
+ * runtime, but we have to stay permissive since we cannot assume it won't work.
  *
- * It returns 1 on success and 0 on error, <err> will be set in case of error.
+ * It returns 1 on success (although diag_warnings may have been emitted) and 0
+ * on error (cannot be recovered from), <err> will be set in case of error.
  */
 int lf_expr_postcheck(struct lf_expr *lf_expr, struct proxy *px, char **err)
 {
 	struct logformat_node *lf;
 	int default_px = (px->cap & PR_CAP_DEF);
+	uint8_t http_mode = (px->mode == PR_MODE_HTTP || (px->options & PR_O_HTTP_UPG));
 
 	if (!(px->flags & PR_FL_CHECKED))
 		px->to_log |= LW_INIT;
@@ -1015,13 +1021,18 @@ int lf_expr_postcheck(struct lf_expr *lf_expr, struct proxy *px, char **err)
 			struct sample_expr *expr = lf->expr;
 			uint8_t http_needed = !!(expr->fetch->use & SMP_USE_HTTP_ANY);
 
+			if (!default_px && !http_mode && http_needed)
+				ha_diag_warning("parsing [%s:%d]: sample fetch '%s' used from %s '%s' may not work as expected (item depends on HTTP proxy mode).\n",
+				                lf_expr->conf.file, lf_expr->conf.line,
+				                expr->fetch->kw,
+				                proxy_type_str(px), px->id);
+
 			if ((px->flags & PR_FL_CHECKED)) {
-				/* fail as soon as proxy properties are not compatible */
-				if (http_needed && !px->http_needed) {
-					memprintf(err, "sample fetch '%s' requires HTTP enabled proxy which is not available here",
-					          expr->fetch->kw);
-					goto fail;
-				}
+				if (http_needed && !px->http_needed)
+					ha_diag_warning("parsing [%s:%d]: sample fetch '%s' used from %s '%s' requires HTTP-specific proxy attributes, but the current proxy lacks them.\n",
+					                lf_expr->conf.file, lf_expr->conf.line,
+					                expr->fetch->kw,
+			                                proxy_type_str(px), px->id);
 				goto next_node;
 			}
 			/* check if we need to allocate an http_txn struct for HTTP parsing */
@@ -1037,15 +1048,17 @@ int lf_expr_postcheck(struct lf_expr *lf_expr, struct proxy *px, char **err)
 				px->to_log |= LW_REQ;
 		}
 		else if (lf->type == LOG_FMT_ALIAS) {
-			if (lf->alias->mode == PR_MODE_HTTP &&
-			    !default_px && px->mode != PR_MODE_HTTP) {
-				memprintf(err, "format alias '%s' is reserved for HTTP mode",
-				          lf->alias->name);
-				goto fail;
-			}
+			if (!default_px && !http_mode &&
+			    (lf->alias->mode == PR_MODE_HTTP ||
+			    (lf->alias->lw & ((LW_REQ | LW_RESP)))))
+				ha_diag_warning("parsing [%s:%d]: format alias '%s' used from %s '%s' may not work as expected (item depends on HTTP proxy mode).\n",
+		                                lf_expr->conf.file, lf_expr->conf.line,
+				                lf->alias->name,
+				                proxy_type_str(px), px->id);
+
 			if (lf->alias->config_callback &&
 			    !lf->alias->config_callback(lf, px)) {
-				memprintf(err, "cannot configure format alias '%s' in this context",
+				memprintf(err, "error while configuring format alias '%s'",
 				          lf->alias->name);
 				goto fail;
 			}
@@ -1056,11 +1069,6 @@ int lf_expr_postcheck(struct lf_expr *lf_expr, struct proxy *px, char **err)
 		/* postcheck individual node's options */
 		if (!lf_expr_postcheck_node_opt(lf_expr, lf, err))
 			goto fail;
-	}
-	if (!default_px && (px->to_log & (LW_REQ | LW_RESP)) &&
-	    (px->mode != PR_MODE_HTTP && !(px->options & PR_O_HTTP_UPG))) {
-		memprintf(err, "logformat expression not usable here (at least one item depends on HTTP mode)");
-		goto fail;
 	}
 
 	return 1;
@@ -2663,6 +2671,7 @@ static inline void __do_send_log(struct log_target *target, struct log_header hd
 	};
 	static THREAD_LOCAL int logfdunix = -1;	/* syslog to AF_UNIX socket */
 	static THREAD_LOCAL int logfdinet = -1;	/* syslog to AF_INET socket */
+	const struct protocol *proto;
 	int *plogfd;
 	int sent;
 	size_t nbelem;
@@ -2691,8 +2700,13 @@ static inline void __do_send_log(struct log_target *target, struct log_header hd
 
 	if (plogfd && unlikely(*plogfd < 0)) {
 		/* socket not successfully initialized yet */
-		if ((*plogfd = socket(target->addr->ss_family, SOCK_DGRAM,
-		                      (target->addr->ss_family == AF_UNIX) ? 0 : IPPROTO_UDP)) < 0) {
+
+		/* WT: this is not compliant with AF_CUST_* usage but we don't use that
+		 * with DNS at the moment.
+		 */
+		proto = protocol_lookup(target->addr->ss_family, PROTO_TYPE_DGRAM, 1);
+		BUG_ON(!proto);
+		if ((*plogfd = socket(proto->fam->sock_domain, proto->sock_type, proto->sock_prot)) < 0) {
 			static char once;
 
 			if (!once) {
@@ -2922,6 +2936,9 @@ static inline void _process_send_log_override(struct process_send_log_ctx *ctx,
 		step = prof->any;
 
 	if (ctx && ctx->sess && step) {
+		if (step->flags & LOG_PS_FL_DROP)
+			goto end; // skip logging
+
 		/* we may need to rebuild message using lf_expr from profile
 		 * step and possibly sd metadata if provided on the profile
 		 */
@@ -6060,6 +6077,7 @@ static inline void log_profile_step_init(struct log_profile_step *lprof_step)
 {
 	lf_expr_init(&lprof_step->logformat);
 	lf_expr_init(&lprof_step->logformat_sd);
+	lprof_step->flags = LOG_PS_FL_NONE;
 }
 
 static inline void log_profile_step_free(struct log_profile_step *lprof_step)
@@ -6280,13 +6298,23 @@ int cfg_parse_log_profile(const char *file, int linenum, char **args, int kwm)
 		cur_arg = 2;
 
 		while (*(args[cur_arg]) != 0) {
+			/* drop logs ? */
+			if (strcmp(args[cur_arg], "drop") == 0) {
+				if (cur_arg != 2)
+					break;
+				(*target_step)->flags |= LOG_PS_FL_DROP;
+				cur_arg += 1;
+				continue;
+			}
 			/* regular format or SD (structured-data) one? */
-			if (strcmp(args[cur_arg], "format") == 0)
+			else if (strcmp(args[cur_arg], "format") == 0)
 				target_lf = &(*target_step)->logformat;
 			else if (strcmp(args[cur_arg], "sd") == 0)
 				target_lf = &(*target_step)->logformat_sd;
 			else
 				break;
+
+			(*target_step)->flags &= ~LOG_PS_FL_DROP;
 
 			/* parse and assign logformat expression */
 			lf_expr_deinit(target_lf); /* if already configured */
@@ -6314,7 +6342,7 @@ int cfg_parse_log_profile(const char *file, int linenum, char **args, int kwm)
 			cur_arg += 2;
 		}
 		if (cur_arg == 2 || *(args[cur_arg]) != 0) {
-			ha_alert("parsing [%s:%d] : '%s %s' expects 'format' and/or 'sd'.\n",
+			ha_alert("parsing [%s:%d] : '%s %s' expects 'drop', 'format' or 'sd'.\n",
 			         file, linenum, args[0], args[1]);
 			err_code |= ERR_ALERT | ERR_FATAL;
 			goto out;

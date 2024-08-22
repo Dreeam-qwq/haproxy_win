@@ -25,6 +25,48 @@ static int bind_parse_quic_force_retry(char **args, int cur_arg, struct proxy *p
 	return 0;
 }
 
+/* Parse <value> as a window size integer argument to keyword <kw>. By
+ * default, value is explained as bytes. Suffixes 'k', 'm' and 'g' are valid as
+ * multipliers. <end_opt> will point to the next unparsed character.
+ *
+ * Return the parsed window size or 0 on error.
+ */
+static unsigned long parse_window_size(const char *kw, char *value,
+                                       char **end_opt, char **err)
+{
+	unsigned long size;
+
+	errno = 0;
+	size = strtoul(value, end_opt, 0);
+	if (*end_opt == value || errno != 0) {
+		memprintf(err, "'%s' : could not parse congestion window value", kw);
+		goto fail;
+	}
+
+	if (**end_opt == 'k') {
+		size <<= 10;
+		(*end_opt)++;
+	}
+	else if (**end_opt == 'm') {
+		size <<= 20;
+		(*end_opt)++;
+	}
+	else if (**end_opt == 'g') {
+		size <<= 30;
+		(*end_opt)++;
+	}
+
+	if (size < 10240 || size > (4UL << 30)) {
+		memprintf(err, "'%s' : should be between 10k and 4g", kw);
+		goto fail;
+	}
+
+	return size;
+
+ fail:
+	return 0;
+}
+
 /* parse "quic-cc-algo" bind keyword */
 static int bind_parse_quic_cc_algo(char **args, int cur_arg, struct proxy *px,
                                    struct bind_conf *conf, char **err)
@@ -72,33 +114,12 @@ static int bind_parse_quic_cc_algo(char **args, int cur_arg, struct proxy *px,
 		unsigned long cwnd;
 		char *end_opt;
 
-		errno = 0;
-		cwnd = strtoul(arg, &end_opt, 0);
-		if (end_opt == arg || errno != 0) {
-			memprintf(err, "'%s' : could not parse congestion window value", args[cur_arg + 1]);
+		cwnd = parse_window_size(args[cur_arg], arg, &end_opt, err);
+		if (!cwnd)
 			goto fail;
-		}
-
-		if (*end_opt == 'k') {
-			cwnd <<= 10;
-			end_opt++;
-		}
-		else if (*end_opt == 'm') {
-			cwnd <<= 20;
-			end_opt++;
-		}
-		else if (*end_opt == 'g') {
-			cwnd <<= 30;
-			end_opt++;
-		}
 
 		if (*end_opt != ')') {
 			memprintf(err, "'%s' : expects %s(<max window>)", args[cur_arg + 1], algo);
-			goto fail;
-		}
-
-		if (cwnd < 10240 || cwnd > (4UL << 30)) {
-			memprintf(err, "'%s' : should be greater than 10k and smaller than 4g", args[cur_arg + 1]);
 			goto fail;
 		}
 
@@ -215,7 +236,8 @@ static int cfg_parse_quic_time(char **args, int section_type,
 }
 
 /* Parse any tune.quic.* setting with strictly positive integer values.
- * Return -1 on alert, or 0 if succeeded.
+ *
+ * Returns 0 on success, >0 on warning, <0 on fatal error.
  */
 static int cfg_parse_quic_tune_setting(char **args, int section_type,
                                        struct proxy *curpx,
@@ -238,12 +260,31 @@ static int cfg_parse_quic_tune_setting(char **args, int section_type,
 	}
 
 	suffix = args[0] + prefix_len;
-	if (strcmp(suffix, "frontend.conn-tx-buffers.limit") == 0)
-		global.tune.quic_streams_buf = arg;
+	if (strcmp(suffix, "cc.cubic.min-losses") == 0)
+		global.tune.quic_cubic_loss_tol = arg - 1;
+	else if (strcmp(suffix, "frontend.conn-tx-buffers.limit") == 0) {
+		memprintf(err, "'%s' keyword is now obsolote and has no effect. "
+		               "Use 'tune.quic.frontend.max-window-size' to limit Tx buffer allocation per connection.", args[0]);
+		return 1;
+	}
 	else if (strcmp(suffix, "frontend.glitches-threshold") == 0)
 		global.tune.quic_frontend_glitches_threshold = arg;
 	else if (strcmp(suffix, "frontend.max-streams-bidi") == 0)
 		global.tune.quic_frontend_max_streams_bidi = arg;
+	else if (strcmp(suffix, "frontend.max-window-size") == 0) {
+		unsigned long cwnd;
+		char *end_opt;
+
+		cwnd = parse_window_size(args[0], args[1], &end_opt, err);
+		if (!cwnd)
+			return -1;
+		if (*end_opt != '\0') {
+			memprintf(err, "'%s' : expects an integer value with an optional suffix 'k', 'm' or 'g'", args[0]);
+			return -1;
+		}
+
+		global.tune.quic_frontend_max_window_size = cwnd;
+	}
 	else if (strcmp(suffix, "max-frame-loss") == 0)
 		global.tune.quic_max_frame_loss = arg;
 	else if (strcmp(suffix, "reorder-ratio") == 0) {
@@ -329,10 +370,12 @@ static struct cfg_kw_list cfg_kws = {ILH, {
 	{ CFG_GLOBAL, "tune.quic.socket-owner", cfg_parse_quic_tune_socket_owner },
 	{ CFG_GLOBAL, "tune.quic.backend.max-idle-timeou", cfg_parse_quic_time },
 	{ CFG_GLOBAL, "tune.quic.cc-hystart", cfg_parse_quic_tune_on_off },
+	{ CFG_GLOBAL, "tune.quic.cc.cubic.min-losses", cfg_parse_quic_tune_setting },
 	{ CFG_GLOBAL, "tune.quic.frontend.conn-tx-buffers.limit", cfg_parse_quic_tune_setting },
 	{ CFG_GLOBAL, "tune.quic.frontend.glitches-threshold", cfg_parse_quic_tune_setting },
 	{ CFG_GLOBAL, "tune.quic.frontend.max-streams-bidi", cfg_parse_quic_tune_setting },
 	{ CFG_GLOBAL, "tune.quic.frontend.max-idle-timeout", cfg_parse_quic_time },
+	{ CFG_GLOBAL, "tune.quic.frontend.max-window-size", cfg_parse_quic_tune_setting },
 	{ CFG_GLOBAL, "tune.quic.max-frame-loss", cfg_parse_quic_tune_setting },
 	{ CFG_GLOBAL, "tune.quic.reorder-ratio", cfg_parse_quic_tune_setting },
 	{ CFG_GLOBAL, "tune.quic.retry-threshold", cfg_parse_quic_tune_setting },

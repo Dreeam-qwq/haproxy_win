@@ -179,6 +179,7 @@ struct global global = {
 	.tune = {
 		.options = GTUNE_LISTENER_MQ_OPT,
 		.bufsize = (BUFSIZE + 2*sizeof(void *) - 1) & -(2*sizeof(void *)),
+		.bufsize_small = BUFSIZE_SMALL,
 		.maxrewrite = MAXREWRITE,
 		.reserved_bufs = RESERVED_BUFS,
 		.pattern_cache = DEFAULT_PAT_LRU_SIZE,
@@ -200,10 +201,10 @@ struct global global = {
 		.quic_backend_max_idle_timeout = QUIC_TP_DFLT_BACK_MAX_IDLE_TIMEOUT,
 		.quic_frontend_max_idle_timeout = QUIC_TP_DFLT_FRONT_MAX_IDLE_TIMEOUT,
 		.quic_frontend_max_streams_bidi = QUIC_TP_DFLT_FRONT_MAX_STREAMS_BIDI,
+		.quic_frontend_max_window_size = QUIC_DFLT_MAX_WINDOW_SIZE,
 		.quic_reorder_ratio = QUIC_DFLT_REORDER_RATIO,
 		.quic_retry_threshold = QUIC_DFLT_RETRY_THRESHOLD,
 		.quic_max_frame_loss = QUIC_DFLT_MAX_FRAME_LOSS,
-		.quic_streams_buf = 30,
 #endif /* USE_QUIC */
 	},
 #ifdef USE_OPENSSL
@@ -1188,8 +1189,10 @@ static int read_cfg(char *progname)
 	 * unset them after the list_for_each_entry loop.
 	 */
 	setenv("HAPROXY_HTTP_LOG_FMT", default_http_log_format, 1);
+	setenv("HAPROXY_HTTP_CLF_LOG_FMT", clf_http_log_format, 1);
 	setenv("HAPROXY_HTTPS_LOG_FMT", default_https_log_format, 1);
 	setenv("HAPROXY_TCP_LOG_FMT", default_tcp_log_format, 1);
+	setenv("HAPROXY_TCP_CLF_LOG_FMT", clf_tcp_log_format, 1);
 	setenv("HAPROXY_BRANCH", PRODUCT_BRANCH, 1);
 	list_for_each_entry_safe(cfg, cfg_tmp, &cfg_cfgfiles, list) {
 		int ret;
@@ -1219,8 +1222,10 @@ static int read_cfg(char *progname)
 	/* remove temporary environment variables. */
 	unsetenv("HAPROXY_BRANCH");
 	unsetenv("HAPROXY_HTTP_LOG_FMT");
+	unsetenv("HAPROXY_HTTP_CLF_LOG_FMT");
 	unsetenv("HAPROXY_HTTPS_LOG_FMT");
 	unsetenv("HAPROXY_TCP_LOG_FMT");
+	unsetenv("HAPROXY_TCP_CLF_LOG_FMT");
 
 	/* do not try to resolve arguments nor to spot inconsistencies when
 	 * the configuration contains fatal errors.

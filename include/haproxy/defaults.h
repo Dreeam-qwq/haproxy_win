@@ -71,6 +71,10 @@
 #define BUFSIZE	        16384
 #endif
 
+#ifndef BUFSIZE_SMALL
+#define BUFSIZE_SMALL   1024
+#endif
+
 // number of per-thread emergency buffers for low-memory conditions
 #ifndef RESERVED_BUFS
 #define RESERVED_BUFS   4
@@ -105,6 +109,11 @@
 #ifndef LINESIZE
 #define LINESIZE	2048
 #endif
+
+// maximum size of a configuration file that could be loaded in memory via
+// /dev/sdtin. This is needed to prevent from loading extremely large files
+// via standard input.
+#define MAX_CFG_SIZE	10485760
 
 // max # args on a configuration line
 #define MAX_LINE_ARGS   64

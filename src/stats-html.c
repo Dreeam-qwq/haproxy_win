@@ -59,9 +59,8 @@ void stats_dump_html_head(struct appctx *appctx)
 
 	/* WARNING! This must fit in the first buffer !!! */
 	chunk_appendf(chk,
-	              "<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 4.01 Transitional//EN\"\n"
-	              "\"http://www.w3.org/TR/html4/loose.dtd\">\n"
-	              "<html><head><title>Statistics Report for " PRODUCT_NAME "%s%s</title>\n"
+	              "<!DOCTYPE html>\n"
+	              "<html lang=\"en\"><head><title>Statistics Report for " PRODUCT_NAME "%s%s</title>\n"
 	              "<link rel=\"icon\" href=\"data:,\">\n"
 	              "<meta http-equiv=\"content-type\" content=\"text/html; charset=iso-8859-1\">\n"
 	              "<style type=\"text/css\"><!--\n"
@@ -169,7 +168,7 @@ void stats_dump_html_head(struct appctx *appctx)
 	              " h2 { color: #a265e0; }\n"
 	              " h3 { color: #ff5190; background-color: #3e3e1f; }\n"
 	              " a { color: #3391ff; }\n"
-	              " input { background-color: #2f3437; }\n"
+	              " input { background-color: #2f3437; color: #e8e6e3; }\n"
 	              " .hr { border-color: #8c8273; }\n"
 	              " .titre { background-color: #1aa6a6; color: #e8e6e3; }\n"
 	              " .frontend {background: #2f3437;}\n"

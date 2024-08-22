@@ -97,6 +97,8 @@ typedef unsigned long long ull;
 #define QUIC_DFLT_REORDER_RATIO        50 /* in percent */
 /* Default limit of loss detection on a single frame. If exceeded, connection is closed. */
 #define QUIC_DFLT_MAX_FRAME_LOSS       10
+/* Default congestion window size. 480 kB, equivalent to the legacy value which was 30*bufsize */
+#define QUIC_DFLT_MAX_WINDOW_SIZE  491520
 
 /*
  *  0                   1                   2                   3
@@ -396,7 +398,6 @@ struct quic_conn {
 	struct mt_list accept_list; /* chaining element used for accept, only valid for frontend connections */
 
 	struct eb_root streams_by_id; /* qc_stream_desc tree */
-	int stream_buf_count; /* total count of allocated stream buffers for this connection */
 
 	/* MUX */
 	struct qcc *qcc;

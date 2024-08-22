@@ -5,6 +5,7 @@
 #include <haproxy/api.h>
 #include <haproxy/buf.h>
 #include <haproxy/dynbuf.h>
+#include <haproxy/errors.h>
 #include <haproxy/list.h>
 #include <haproxy/mux_quic.h>
 #include <haproxy/pool.h>
@@ -16,6 +17,7 @@ DECLARE_STATIC_POOL(pool_head_quic_stream_desc, "qc_stream_desc",
 DECLARE_STATIC_POOL(pool_head_quic_stream_buf, "qc_stream_buf",
                     sizeof(struct qc_stream_buf));
 
+static struct pool_head *pool_head_sbuf;
 
 /* Returns true if nothing to ack yet for stream <s> including FIN bit. */
 static inline int qc_stream_desc_done(const struct qc_stream_desc *s)
@@ -28,6 +30,7 @@ static void qc_stream_buf_free(struct qc_stream_desc *stream,
 {
 	struct quic_conn *qc = stream->qc;
 	struct buffer *buf = &(*stream_buf)->buf;
+	uint64_t free_size;
 
 	LIST_DEL_INIT(&(*stream_buf)->list);
 
@@ -35,21 +38,23 @@ static void qc_stream_buf_free(struct qc_stream_desc *stream,
 	if (*stream_buf == stream->buf)
 		stream->buf = NULL;
 
-	b_free(buf);
-	offer_buffers(NULL, 1);
+	free_size = b_size(buf);
+	if ((*stream_buf)->sbuf) {
+		pool_free(pool_head_sbuf, buf->area);
+	}
+	else {
+		b_free(buf);
+		offer_buffers(NULL, 1);
+	}
 	pool_free(pool_head_quic_stream_buf, *stream_buf);
 	*stream_buf = NULL;
 
 	/* notify MUX about available buffers. */
-	--qc->stream_buf_count;
 	if (qc->mux_state == QC_MUX_READY) {
-		/* notify MUX about available buffers.
-		 *
-		 * TODO several streams may be woken up even if a single buffer
-		 * is available for now.
-		 */
-		while (qcc_notify_buf(qc->qcc))
-			;
+		if (!(stream->flags & QC_SD_FL_OOB_BUF)) {
+			/* notify MUX about available buffers. */
+			qcc_notify_buf(qc->qcc, free_size);
+		}
 	}
 }
 
@@ -204,6 +209,7 @@ void qc_stream_desc_free(struct qc_stream_desc *stream, int closing)
 	struct quic_conn *qc = stream->qc;
 	struct eb64_node *frm_node;
 	unsigned int free_count = 0;
+	uint64_t free_size = 0;
 
 	/* This function only deals with released streams. */
 	BUG_ON(!(stream->flags & QC_SD_FL_RELEASE));
@@ -211,10 +217,13 @@ void qc_stream_desc_free(struct qc_stream_desc *stream, int closing)
 	/* free remaining stream buffers */
 	list_for_each_entry_safe(buf, buf_back, &stream->buf_list, list) {
 		if (!(b_data(&buf->buf)) || closing) {
-			b_free(&buf->buf);
+			free_size += b_size(&buf->buf);
+			if (buf->sbuf)
+				pool_free(pool_head_sbuf, buf->buf.area);
+			else
+				b_free(&buf->buf);
 			LIST_DELETE(&buf->list);
 			pool_free(pool_head_quic_stream_buf, buf);
-
 			++free_count;
 		}
 	}
@@ -222,15 +231,11 @@ void qc_stream_desc_free(struct qc_stream_desc *stream, int closing)
 	if (free_count) {
 		offer_buffers(NULL, free_count);
 
-		qc->stream_buf_count -= free_count;
 		if (qc->mux_state == QC_MUX_READY) {
-			/* notify MUX about available buffers.
-			 *
-			 * TODO several streams may be woken up even if a single buffer
-			 * is available for now.
-			 */
-			while (qcc_notify_buf(qc->qcc))
-				;
+			if (!(stream->flags & QC_SD_FL_OOB_BUF)) {
+				/* notify MUX about available buffers. */
+				qcc_notify_buf(qc->qcc, free_size);
+			}
 		}
 	}
 
@@ -265,42 +270,72 @@ struct buffer *qc_stream_buf_get(struct qc_stream_desc *stream)
 	return &stream->buf->buf;
 }
 
-/* Returns the count of available buffer left for <qc>. */
-static int qc_stream_buf_avail(struct quic_conn *qc)
-{
-	BUG_ON(qc->stream_buf_count > global.tune.quic_streams_buf);
-	return global.tune.quic_streams_buf - qc->stream_buf_count;
-}
-
-/* Allocate a new current buffer for <stream>. The buffer limit count for the
- * connection is checked first. This function is not allowed if current buffer
- * is not NULL prior to this call. The new buffer represents stream payload at
- * offset <offset>.
+/* Allocate a new current buffer for <stream>. This function is not allowed if
+ * current buffer is not NULL prior to this call. The new buffer represents
+ * stream payload at offset <offset>.
  *
- * Returns the buffer or NULL on error. Caller may check <avail> to ensure if
- * the connection buffer limit was reached or a fatal error was encountered.
+ * Returns the buffer or NULL on error.
  */
 struct buffer *qc_stream_buf_alloc(struct qc_stream_desc *stream,
-                                   uint64_t offset, int *avail)
+                                   uint64_t offset, int small)
 {
-	struct quic_conn *qc = stream->qc;
-
 	/* current buffer must be released first before allocate a new one. */
 	BUG_ON(stream->buf);
-
-	*avail = qc_stream_buf_avail(qc);
-	if (!*avail)
-		return NULL;
 
 	stream->buf_offset = offset;
 	stream->buf = pool_alloc(pool_head_quic_stream_buf);
 	if (!stream->buf)
 		return NULL;
 
-	++qc->stream_buf_count;
-
 	stream->buf->buf = BUF_NULL;
+
+	if (!small) {
+		stream->buf->sbuf = 0;
+		if (!b_alloc(&stream->buf->buf, DB_MUX_TX)) {
+			pool_free(pool_head_quic_stream_buf, stream->buf);
+			stream->buf = NULL;
+			return NULL;
+		}
+	}
+	else {
+		char *area;
+
+		if (!(area = pool_alloc(pool_head_sbuf))) {
+			pool_free(pool_head_quic_stream_buf, stream->buf);
+			stream->buf = NULL;
+			return NULL;
+		}
+
+		stream->buf->sbuf = 1;
+		stream->buf->buf = b_make(area, global.tune.bufsize_small, 0, 0);
+	}
+
 	LIST_APPEND(&stream->buf_list, &stream->buf->list);
+
+	return &stream->buf->buf;
+}
+
+/* Free current <stream> buffer and allocate a new one. This function is reserved
+ * to convert a small buffer to a standard one.
+ *
+ * Returns the buffer or NULL on error.
+ */
+struct buffer *qc_stream_buf_realloc(struct qc_stream_desc *stream)
+{
+	/* This function is reserved to convert a big buffer to a smaller one. */
+	BUG_ON(!stream->buf || !stream->buf->sbuf);
+
+	/* Release buffer */
+	pool_free(pool_head_sbuf, stream->buf->buf.area);
+	stream->buf->buf = BUF_NULL;
+	stream->buf->sbuf = 0;
+
+	if (!b_alloc(&stream->buf->buf, DB_MUX_TX)) {
+		LIST_DEL_INIT(&stream->buf->list);
+		pool_free(pool_head_quic_stream_buf, stream->buf);
+		stream->buf = NULL;
+		return NULL;
+	}
 
 	return &stream->buf->buf;
 }
@@ -316,3 +351,23 @@ void qc_stream_buf_release(struct qc_stream_desc *stream)
 	stream->buf = NULL;
 	stream->buf_offset = 0;
 }
+
+static int create_sbuf_pool(void)
+{
+	if (global.tune.bufsize_small > global.tune.bufsize) {
+		ha_warning("invalid small buffer size %d bytes which is greater to default bufsize %d bytes.\n",
+		           global.tune.bufsize_small, global.tune.bufsize);
+		return ERR_FATAL|ERR_ABORT;
+	}
+
+	pool_head_sbuf = create_pool("sbuf", global.tune.bufsize_small,
+	                             MEM_F_SHARED|MEM_F_EXACT);
+	if (!pool_head_sbuf) {
+		ha_warning("error on small buffer pool allocation.\n");
+		return ERR_FATAL|ERR_ABORT;
+	}
+
+	return ERR_NONE;
+}
+
+REGISTER_POST_CHECK(create_sbuf_pool);

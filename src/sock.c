@@ -30,7 +30,7 @@
 #include <haproxy/listener.h>
 #include <haproxy/log.h>
 #include <haproxy/namespace.h>
-#include <haproxy/protocol-t.h>
+#include <haproxy/protocol.h>
 #include <haproxy/proto_sockpair.h>
 #include <haproxy/sock.h>
 #include <haproxy/sock_inet.h>
@@ -268,6 +268,7 @@ static int sock_handle_system_err(struct connection *conn, struct proxy *be)
 int sock_create_server_socket(struct connection *conn, struct proxy *be, int *stream_err)
 {
 	const struct netns_entry *ns = NULL;
+	const struct protocol *proto;
 	int sock_fd;
 
 #ifdef USE_NS
@@ -278,7 +279,9 @@ int sock_create_server_socket(struct connection *conn, struct proxy *be, int *st
 			ns = __objt_server(conn->target)->netns;
 	}
 #endif
-	sock_fd = my_socketat(ns, conn->dst->ss_family, SOCK_STREAM, 0);
+	proto = protocol_lookup(conn->dst->ss_family, PROTO_TYPE_STREAM, 0);
+	BUG_ON(!proto);
+	sock_fd = my_socketat(ns, proto->fam->sock_domain, SOCK_STREAM, 0);
 
 	/* at first, handle common to all proto families system limits and permission related errors */
 	if (sock_fd == -1) {
@@ -1147,7 +1150,7 @@ int _sock_supports_reuseport(const struct proto_fam *fam, int type, int protocol
 	fd1 = fd2 = -1;
 
 	/* ignore custom sockets */
-	if (!fam || fam->sock_domain >= AF_MAX)
+	if (!fam || real_family(fam->sock_family) >= AF_MAX)
 		goto leave;
 
 	fd1 = socket(fam->sock_domain, type, protocol);
@@ -1159,7 +1162,7 @@ int _sock_supports_reuseport(const struct proto_fam *fam, int type, int protocol
 
 	/* bind to any address assigned by the kernel, we'll then try to do it twice */
 	memset(&ss, 0, sizeof(ss));
-	ss.ss_family = fam->sock_family;
+	ss.ss_family = real_family(fam->sock_family);
 	if (bind(fd1, (struct sockaddr *)&ss, fam->sock_addrlen) < 0)
 		goto leave;
 

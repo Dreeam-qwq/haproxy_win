@@ -165,6 +165,7 @@ struct global {
 		int runqueue_depth;/* max number of tasks to run at once */
 		int recv_enough;   /* how many input bytes at once are "enough" */
 		int bufsize;       /* buffer size in bytes, defaults to BUFSIZE */
+		int bufsize_small; /* small buffer size in bytes */
 		int maxrewrite;    /* buffer max rewrite size in bytes, defaults to MAXREWRITE */
 		int reserved_bufs; /* how many buffers can only be allocated for response */
 		int buf_limit;     /* if not null, how many total buffers may only be allocated */
@@ -199,10 +200,11 @@ struct global {
 		unsigned int quic_frontend_max_idle_timeout;
 		unsigned int quic_frontend_glitches_threshold;
 		unsigned int quic_frontend_max_streams_bidi;
+		size_t quic_frontend_max_window_size;
 		unsigned int quic_retry_threshold;
 		unsigned int quic_reorder_ratio;
-		unsigned int quic_streams_buf;
 		unsigned int quic_max_frame_loss;
+		unsigned int quic_cubic_loss_tol;
 #endif /* USE_QUIC */
 	} tune;
 	struct {

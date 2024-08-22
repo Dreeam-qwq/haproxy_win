@@ -1181,7 +1181,6 @@ struct quic_conn *qc_new_conn(const struct quic_version *qv, int ipv4,
 	quic_cc_path_init(qc->path, ipv4, server ? l->bind_conf->max_cwnd : 0,
 	                  cc_algo ? cc_algo : default_quic_cc_algo, qc);
 
-	qc->stream_buf_count = 0;
 	memcpy(&qc->local_addr, local_addr, sizeof(qc->local_addr));
 	memcpy(&qc->peer_addr, peer_addr, sizeof qc->peer_addr);
 
@@ -1718,6 +1717,9 @@ int qc_notify_send(struct quic_conn *qc)
 {
 	const struct quic_pktns *pktns = qc->apktns;
 
+	/* Wake up MUX for new emission unless there is no congestion room or
+	 * connection FD is not ready.
+	 */
 	if (qc->subs && qc->subs->events & SUB_RETRY_SEND) {
 		/* RFC 9002 7.5. Probe Timeout
 		 *
@@ -1733,6 +1735,12 @@ int qc_notify_send(struct quic_conn *qc)
 			return 1;
 		}
 	}
+
+	/* Wake up streams layer waiting for buffer. Useful after congestion
+	 * window increase.
+	 */
+	if (qc->mux_state == QC_MUX_READY && (qc->qcc->flags & QC_CF_CONN_FULL))
+		qcc_notify_buf(qc->qcc, 0);
 
 	return 0;
 }

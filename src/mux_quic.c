@@ -7,6 +7,7 @@
 #include <haproxy/chunk.h>
 #include <haproxy/connection.h>
 #include <haproxy/dynbuf.h>
+#include <haproxy/global-t.h>
 #include <haproxy/h3.h>
 #include <haproxy/list.h>
 #include <haproxy/ncbuf.h>
@@ -523,34 +524,49 @@ void qcs_notify_send(struct qcs *qcs)
 	}
 }
 
-/* Notify on a new stream-desc buffer available for <qcc> connection.
- *
- * Returns true if a stream was woken up. If false is returned, this indicates
- * to the caller that it's currently unnecessary to notify for the rest of the
- * available buffers.
+/* Returns true if a Tx stream buffer can be allocated. */
+static inline int qcc_bufwnd_full(const struct qcc *qcc)
+{
+	const struct quic_conn *qc = qcc->conn->handle.qc;
+	return qcc->tx.buf_in_flight >= qc->path->cwnd;
+}
+
+/* Report that one or several stream-desc buffers have been released for <qcc>
+ * connection. <free_size> represent the sum of freed buffers sizes. May also
+ * be used to notify about congestion window increase, in which case
+ * <free_size> can be nul.
  */
-int qcc_notify_buf(struct qcc *qcc)
+void qcc_notify_buf(struct qcc *qcc, uint64_t free_size)
 {
 	struct qcs *qcs;
-	int ret = 0;
 
 	TRACE_ENTER(QMUX_EV_QCC_WAKE, qcc->conn);
 
+	/* Cannot have a negative buf_in_flight counter */
+	BUG_ON(qcc->tx.buf_in_flight < free_size);
+	qcc->tx.buf_in_flight -= free_size;
+
+	if (qcc_bufwnd_full(qcc))
+		return;
+
 	if (qcc->flags & QC_CF_CONN_FULL) {
-		TRACE_STATE("new stream desc buffer available", QMUX_EV_QCC_WAKE, qcc->conn);
+		TRACE_STATE("buf window now available", QMUX_EV_QCC_WAKE, qcc->conn);
 		qcc->flags &= ~QC_CF_CONN_FULL;
 	}
 
-	if (!LIST_ISEMPTY(&qcc->buf_wait_list)) {
+	/* TODO an optimization would be to only wake up a limited count of QCS
+	 * instances based on <free_size>. But it may not work if a woken QCS
+	 * is in error and does not try to allocate a buffer, leaving the
+	 * unwoken QCS indefinitely in the buflist.
+	 */
+	while (!LIST_ISEMPTY(&qcc->buf_wait_list)) {
 		qcs = LIST_ELEM(qcc->buf_wait_list.n, struct qcs *, el_buf);
 		LIST_DEL_INIT(&qcs->el_buf);
 		tot_time_stop(&qcs->timer.buf);
 		qcs_notify_send(qcs);
-		ret = 1;
 	}
 
 	TRACE_LEAVE(QMUX_EV_QCC_WAKE, qcc->conn);
-	return ret;
 }
 
 /* A fatal error is detected locally for <qcc> connection. It should be closed
@@ -710,6 +726,19 @@ static struct qcs *qcc_init_stream_remote(struct qcc *qcc, uint64_t id)
  err:
 	TRACE_LEAVE(QMUX_EV_QCS_NEW, qcc->conn);
 	return NULL;
+}
+
+/* Mark <qcs> as reserved for metadata transfer. As such, future txbuf
+ * allocation won't be accounted against connection limit.
+ */
+void qcs_send_metadata(struct qcs *qcs)
+{
+	/* Reserved for stream with Tx capability. */
+	BUG_ON(!qcs->stream);
+	/* Cannot use if some data already transferred for this stream. */
+	BUG_ON(!LIST_ISEMPTY(&qcs->stream->buf_list));
+
+	qcs->stream->flags |= QC_SD_FL_OOB_BUF;
 }
 
 struct stconn *qcs_attach_sc(struct qcs *qcs, struct buffer *buf, char fin)
@@ -999,16 +1028,20 @@ struct buffer *qcc_get_stream_rxbuf(struct qcs *qcs)
  *
  * <err> is an output argument which is useful to differentiate the failure
  * cause when the buffer cannot be allocated. It is set to 0 if the connection
- * buffer limit is reached. For fatal errors, its value is non-zero.
+ * buffer window is full. For fatal errors, its value is non-zero.
+ *
+ * Streams reserved for application protocol metadata transfer are not subject
+ * to the buffer limit per connection. Hence, for them only a memory error
+ * can prevent a buffer allocation.
  *
  * Returns buffer pointer. May be NULL on allocation failure, in which case
  * <err> will refer to the cause.
  */
-struct buffer *qcc_get_stream_txbuf(struct qcs *qcs, int *err)
+struct buffer *qcc_get_stream_txbuf(struct qcs *qcs, int *err, int small)
 {
 	struct qcc *qcc = qcs->qcc;
-	int buf_avail;
 	struct buffer *out = qc_stream_buf_get(qcs->stream);
+	const int unlimited = qcs->stream->flags & QC_SD_FL_OOB_BUF;
 
 	/* Stream must not try to reallocate a buffer if currently waiting for one. */
 	BUG_ON(LIST_INLIST(&qcs->el_buf));
@@ -1016,37 +1049,72 @@ struct buffer *qcc_get_stream_txbuf(struct qcs *qcs, int *err)
 	*err = 0;
 
 	if (!out) {
-		if (qcc->flags & QC_CF_CONN_FULL) {
-			LIST_APPEND(&qcc->buf_wait_list, &qcs->el_buf);
-			tot_time_start(&qcs->timer.buf);
-			goto out;
-		}
-
-		out = qc_stream_buf_alloc(qcs->stream, qcs->tx.fc.off_real,
-		                          &buf_avail);
-		if (!out) {
-			if (buf_avail) {
-				TRACE_ERROR("stream desc alloc failure", QMUX_EV_QCS_SEND, qcc->conn, qcs);
-				*err = 1;
+		if (likely(!unlimited)) {
+			if ((qcc->flags & QC_CF_CONN_FULL)) {
+				LIST_APPEND(&qcc->buf_wait_list, &qcs->el_buf);
+				tot_time_start(&qcs->timer.buf);
 				goto out;
 			}
 
-			TRACE_STATE("hitting stream desc buffer limit", QMUX_EV_QCS_SEND, qcc->conn, qcs);
-			LIST_APPEND(&qcc->buf_wait_list, &qcs->el_buf);
-			tot_time_start(&qcs->timer.buf);
-			qcc->flags |= QC_CF_CONN_FULL;
-			goto out;
+			if (qcc_bufwnd_full(qcc)) {
+				TRACE_STATE("no more room", QMUX_EV_QCS_SEND, qcc->conn, qcs);
+				LIST_APPEND(&qcc->buf_wait_list, &qcs->el_buf);
+				tot_time_start(&qcs->timer.buf);
+				qcc->flags |= QC_CF_CONN_FULL;
+				goto out;
+			}
 		}
 
-		if (!b_alloc(out, DB_MUX_TX)) {
-			TRACE_ERROR("buffer alloc failure", QMUX_EV_QCS_SEND, qcc->conn, qcs);
+		out = qc_stream_buf_alloc(qcs->stream, qcs->tx.fc.off_real, small);
+		if (!out) {
+			TRACE_ERROR("stream desc alloc failure", QMUX_EV_QCS_SEND, qcc->conn, qcs);
 			*err = 1;
 			goto out;
 		}
+
+		if (likely(!unlimited))
+			qcc->tx.buf_in_flight += b_size(out);
 	}
 
  out:
 	return out;
+}
+
+/* Reallocate <qcs> stream buffer to convert a small buffer to a bigger one.
+ * Contrary to standard allocation, this function will never stop due to a full
+ * buffer window. The smaller buffer is released first which guarantee that the
+ * buffer window has room left.
+ *
+ * Returns buffer pointer or NULL on allocation failure.
+ */
+struct buffer *qcc_realloc_stream_txbuf(struct qcs *qcs)
+{
+	struct qcc *qcc = qcs->qcc;
+	struct buffer *out = qc_stream_buf_get(qcs->stream);
+	const int unlimited = qcs->stream->flags & QC_SD_FL_OOB_BUF;
+
+	/* Stream must not try to reallocate a buffer if currently waiting for one. */
+	BUG_ON(LIST_INLIST(&qcs->el_buf));
+
+	if (likely(!unlimited)) {
+		/* Reduce buffer window. As such there is always some space
+		 * left for a new buffer allocation.
+		 */
+		BUG_ON(qcc->tx.buf_in_flight < b_size(out));
+		qcc->tx.buf_in_flight -= b_size(out);
+	}
+
+	out = qc_stream_buf_realloc(qcs->stream);
+	if (!out) {
+		TRACE_ERROR("buffer alloc failure", QMUX_EV_QCS_SEND, qcc->conn, qcs);
+		goto out;
+	}
+
+	if (likely(!unlimited))
+		qcc->tx.buf_in_flight += b_size(out);
+
+ out:
+	return out && b_size(out) ? out : NULL;
 }
 
 /* Returns total number of bytes not already sent to quic-conn layer. */
@@ -2709,6 +2777,8 @@ static int qmux_init(struct connection *conn, struct proxy *prx,
 	qcc->rfctl.msd_bidi_r = rparams->initial_max_stream_data_bidi_remote;
 	qcc->rfctl.msd_uni_l = rparams->initial_max_stream_data_uni;
 
+	qcc->tx.buf_in_flight = 0;
+
 	if (conn_is_back(conn)) {
 		qcc->next_bidi_l    = 0x00;
 		qcc->largest_bidi_r = 0x01;
@@ -3329,9 +3399,12 @@ static const struct mux_ops qmux_ops = {
 
 void qcc_show_quic(struct qcc *qcc)
 {
+	const struct quic_conn *qc = qcc->conn->handle.qc;
 	struct eb64_node *node;
-	chunk_appendf(&trash, "  qcc=0x%p flags=0x%x sc=%llu hreq=%llu\n",
-	              qcc, qcc->flags, (ullong)qcc->nb_sc, (ullong)qcc->nb_hreq);
+
+	chunk_appendf(&trash, "  qcc=0x%p flags=0x%x sc=%llu hreq=%llu bwnd=%llu/%llu\n",
+	              qcc, qcc->flags, (ullong)qcc->nb_sc, (ullong)qcc->nb_hreq,
+	              (ullong)qcc->tx.buf_in_flight, (ullong)qc->path->cwnd);
 
 	node = eb64_first(&qcc->streams_by_id);
 	while (node) {

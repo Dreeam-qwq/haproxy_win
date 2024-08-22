@@ -28,6 +28,7 @@
 
 /* [AF][sock_dgram][ctrl_dgram] */
 extern struct protocol *__protocol_by_family[AF_CUST_MAX][PROTO_NUM_TYPES][2];
+extern const struct proto_fam *__proto_fam_by_family[AF_CUST_MAX];
 __decl_thread(extern HA_SPINLOCK_T proto_lock);
 
 /* Registers the protocol <proto> */
@@ -99,6 +100,28 @@ static inline struct protocol *protocol_lookup(int family, enum proto_type proto
 	if (family >= 0 && family < AF_CUST_MAX)
 		return __protocol_by_family[family][proto_type][!!ctrl_dgram];
 	return NULL;
+}
+
+/* returns the proto_fam that matches ss_family. This supports custom address
+ * families so it is suitable for use with ss_family as found in various config
+ * element addresses.
+ */
+static inline const struct proto_fam *proto_fam_lookup(int ss_family)
+{
+	if (ss_family >= 0 && ss_family < AF_CUST_MAX)
+		return __proto_fam_by_family[ss_family];
+	return NULL;
+}
+
+/* returns either the real family when known or AF_UNSPEC for non-existing
+ * families. Note that real families that contain a custom value will be
+ * returned as-is. This aims at simplifying address validation tests everywhere.
+ */
+static inline int real_family(int ss_family)
+{
+	const struct proto_fam *fam = proto_fam_lookup(ss_family);
+
+	return fam ? fam->real_family : AF_UNSPEC;
 }
 
 #endif /* _HAPROXY_PROTOCOL_H */
