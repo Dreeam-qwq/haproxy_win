@@ -59,6 +59,7 @@
  * and appear as flags in session->logs.logwait, which are removed once the
  * required information has been collected.
  */
+#define LW_LOGSTEPS        -1        /* special value: ignore LW_* fields and consider proxy log-steps */
 #define LW_INIT             1        /* anything */
 #define LW_CLIP             2        /* CLient IP */
 #define LW_SVIP             4        /* SerVer IP */
@@ -261,7 +262,7 @@ struct logger {
 /* integer used to provide some context about the log origin
  * when sending log through logging functions
  */
-enum log_orig {
+enum log_orig_id {
 	LOG_ORIG_UNSPEC = 0,         /* unspecified */
 	LOG_ORIG_SESS_ERROR,         /* general error during session handling */
 	LOG_ORIG_SESS_KILL,          /* during embryonic session kill */
@@ -270,6 +271,32 @@ enum log_orig {
 	LOG_ORIG_TXN_CONNECT,        /* during stream connect handling */
 	LOG_ORIG_TXN_RESPONSE,       /* during stream response handling */
 	LOG_ORIG_TXN_CLOSE,          /* during stream termination */
+	LOG_ORIG_EXTRA,              /* end of hard-coded/legacy log origins,
+	                              * beginning of extra ones. 1 extra orig
+	                              * = 1 logging step
+	                              */
+	LOG_ORIG_MAX = 0xFFFF,       /* max log origin number (65k) */
+};
+
+/* log orig flags
+ */
+#define LOG_ORIG_FL_NONE  0x0000
+#define LOG_ORIG_FL_ERROR 0x0001
+#define LOG_ORIG_FL_ALL   0xFFFF
+
+struct log_orig {
+	enum log_orig_id id;
+	uint16_t flags; /* any LOG_ORIG_FL_* */
+};
+
+/* max number of extra log origins */
+#define LOG_ORIG_EXTRA_SLOTS LOG_ORIG_MAX - LOG_ORIG_EXTRA
+
+/* used to register extra log origins */
+struct log_origin_node {
+	struct list list;      /* per-name lookup during config */
+	struct eb32_node tree; /* per-id lookup during runtime */
+	const char *name;
 };
 
 /* log profile step flags */
@@ -282,6 +309,12 @@ struct log_profile_step {
 	struct lf_expr logformat;
 	struct lf_expr logformat_sd;
 	enum log_ps_flags flags;     /* LOG_PS_FL_* */
+};
+
+struct log_profile_step_extra {
+	struct log_profile_step step;
+	struct eb32_node node;
+	struct log_origin_node *orig; // reference to log_origin config node
 };
 
 struct log_profile {
@@ -299,6 +332,7 @@ struct log_profile {
 	struct log_profile_step *close;
 	struct log_profile_step *error; // override error-log-format
 	struct log_profile_step *any;   // override log-format
+	struct eb_root extra;           // extra log profile steps (if any)
 };
 
 #endif /* _HAPROXY_LOG_T_H */

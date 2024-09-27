@@ -61,6 +61,7 @@ struct proxy *proxies_list  = NULL;	/* list of all existing proxies */
 struct eb_root used_proxy_id = EB_ROOT;	/* list of proxy IDs in use */
 struct eb_root proxy_by_name = EB_ROOT; /* tree of proxies sorted by name */
 struct eb_root defproxy_by_name = EB_ROOT; /* tree of default proxies sorted by name (dups possible) */
+struct proxy *orphaned_default_proxies = NULL; /* deleted ones with refcount != 0 */
 unsigned int error_snapshot_id = 0;     /* global ID assigned to each error then incremented */
 
 /* CLI context used during "show servers {state|conn}" */
@@ -113,8 +114,8 @@ const struct cfg_opt cfg_opts2[] =
         { "splice-response", 0, 0, 0, 0 },
         { "splice-auto",     0, 0, 0, 0 },
 #endif
-	{ "accept-invalid-http-request",  PR_O2_REQBUG_OK, PR_CAP_FE, 0, PR_MODE_HTTP },
-	{ "accept-invalid-http-response", PR_O2_RSPBUG_OK, PR_CAP_BE, 0, PR_MODE_HTTP },
+	{ "accept-unsafe-violations-in-http-request",  PR_O2_REQBUG_OK, PR_CAP_FE, 0, PR_MODE_HTTP },
+	{ "accept-unsafe-violations-in-http-response", PR_O2_RSPBUG_OK, PR_CAP_BE, 0, PR_MODE_HTTP },
 	{ "dontlog-normal",               PR_O2_NOLOGNORM, PR_CAP_FE, 0, 0 },
 	{ "log-separate-errors",          PR_O2_LOGERRORS, PR_CAP_FE, 0, 0 },
 	{ "log-health-checks",            PR_O2_LOGHCHKS,  PR_CAP_BE, 0, 0 },
@@ -201,9 +202,10 @@ static inline void proxy_free_common(struct proxy *px)
 	struct acl *acl, *aclb;
 	struct logger *log, *logb;
 	struct lf_expr *lf, *lfb;
+	struct eb32_node *node;
 
 	ha_free(&px->id);
-	ha_free(&px->conf.file);
+	drop_file_name(&px->conf.file);
 	ha_free(&px->check_command);
 	ha_free(&px->check_path);
 	ha_free(&px->cookie_name);
@@ -257,6 +259,16 @@ static inline void proxy_free_common(struct proxy *px)
 		LIST_DEL_INIT(&lf->list);
 
 	chunk_destroy(&px->log_tag);
+
+	node = eb32_first(&px->conf.log_steps);
+	while (node) {
+		struct eb32_node *prev_node = node;
+
+		/* log steps directly use the node key as id, they are not encapsulated */
+		node = eb32_next(node);
+		eb32_delete(prev_node);
+		free(prev_node);
+	}
 
 	free_email_alert(px);
 }
@@ -855,6 +867,8 @@ proxy_parse_retry_on(char **args, int section, struct proxy *curpx,
 			curpx->retry_type |= PR_RE_408;
 		else if (strcmp(args[i], "425") == 0)
 			curpx->retry_type |= PR_RE_425;
+		else if (strcmp(args[i], "429") == 0)
+			curpx->retry_type |= PR_RE_429;
 		else if (strcmp(args[i], "500") == 0)
 			curpx->retry_type |= PR_RE_500;
 		else if (strcmp(args[i], "501") == 0)
@@ -1412,6 +1426,7 @@ void init_new_proxy(struct proxy *p)
 	p->conf.used_listener_id = EB_ROOT;
 	p->conf.used_server_id   = EB_ROOT;
 	p->used_server_addr      = EB_ROOT_UNIQUE;
+	p->conf.log_steps        = EB_ROOT_UNIQUE;
 
 	/* Timeouts are defined as -1 */
 	proxy_reset_timeouts(p);
@@ -1526,15 +1541,43 @@ void proxy_destroy_defaults(struct proxy *px)
 void proxy_destroy_all_unref_defaults()
 {
 	struct ebpt_node *n;
+	struct proxy *px, *nx;
 
 	n = ebpt_first(&defproxy_by_name);
 	while (n) {
-		struct proxy *px = container_of(n, struct proxy, conf.by_name);
+		px = container_of(n, struct proxy, conf.by_name);
 		BUG_ON(!(px->cap & PR_CAP_DEF));
 		n = ebpt_next(n);
 		if (!px->conf.refcount)
 			proxy_destroy_defaults(px);
 	}
+
+	px = orphaned_default_proxies;
+	while (px) {
+		BUG_ON(!(px->cap & PR_CAP_DEF));
+		nx = px->next;
+		if (!px->conf.refcount)
+			proxy_destroy_defaults(px);
+		px = nx;
+	}
+}
+
+/* Try to destroy a defaults section, or just unreference it if still
+ * refcounted. In this case it's added to the orphaned_default_proxies list
+ * so that it can later be found.
+ */
+void proxy_unref_or_destroy_defaults(struct proxy *px)
+{
+	if (!px || !(px->cap & PR_CAP_DEF))
+		return;
+
+	ebpt_delete(&px->conf.by_name);
+	if (px->conf.refcount) {
+		/* still referenced just append it to the orphaned list */
+		px->next = orphaned_default_proxies;
+		orphaned_default_proxies = px;
+	} else
+		proxy_destroy_defaults(px);
 }
 
 /* Add a reference on the default proxy <defpx> for the proxy <px> Nothing is
@@ -1613,6 +1656,7 @@ static int proxy_defproxy_cpy(struct proxy *curproxy, const struct proxy *defpro
 {
 	struct logger *tmplogger;
 	char *tmpmsg = NULL;
+	struct eb32_node *node;
 
 	/* set default values from the specified default proxy */
 	srv_settings_cpy(&curproxy->defsrv, &defproxy->defsrv, 0);
@@ -1818,6 +1862,25 @@ static int proxy_defproxy_cpy(struct proxy *curproxy, const struct proxy *defpro
 	curproxy->email_alert.level = defproxy->email_alert.level;
 	curproxy->email_alert.flags = defproxy->email_alert.flags;
 
+	/* defproxy is const pointer, so we need to typecast log_steps to
+	 * drop the const in order to use EB tree API, please note however
+	 * that the operations performed below should theorically be read-only
+	 */
+	node = eb32_first((struct eb_root *)&defproxy->conf.log_steps);
+	while (node) {
+		struct eb32_node *new_node;
+
+		new_node = malloc(sizeof(*new_node));
+		if (!new_node) {
+			memprintf(errmsg, "proxy '%s': out of memory for log_steps option", curproxy->id);
+			return 1;
+		}
+
+		new_node->key = node->key;
+		eb32_insert(&curproxy->conf.log_steps, new_node);
+		node = eb32_next(node);
+	}
+
 	return 0;
 }
 
@@ -1848,7 +1911,7 @@ struct proxy *parse_new_proxy(const char *name, unsigned int cap,
 		}
 	}
 
-	curproxy->conf.args.file = curproxy->conf.file = strdup(file);
+	curproxy->conf.args.file = curproxy->conf.file = copy_file_name(file);
 	curproxy->conf.args.line = curproxy->conf.line = linenum;
 
 	return curproxy;
@@ -1999,7 +2062,7 @@ struct task *manage_proxy(struct task *t, void *context, unsigned int state)
 	}
 
 	/* The proxy is not limited so we can re-enable any waiting listener */
-	dequeue_proxy_listeners(p);
+	dequeue_proxy_listeners(p, 0);
  out:
 	t->expire = next;
 	task_queue(t);
@@ -3010,7 +3073,7 @@ static int cli_parse_set_maxconn_frontend(char **args, char *payload, struct app
 	}
 
 	if (px->maxconn > px->feconn)
-		dequeue_proxy_listeners(px);
+		dequeue_proxy_listeners(px, 1);
 
 	HA_RWLOCK_WRUNLOCK(PROXY_LOCK, &px->lock);
 

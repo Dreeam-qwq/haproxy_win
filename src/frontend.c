@@ -55,11 +55,15 @@ int frontend_accept(struct stream *s)
 
 	if ((fe->mode == PR_MODE_TCP || fe->mode == PR_MODE_HTTP)
 	    && (!LIST_ISEMPTY(&fe->loggers))) {
-		if (likely(!lf_expr_isempty(&fe->logformat))) {
+		if (fe->to_log == LW_LOGSTEPS) {
+			if (log_orig_proxy(LOG_ORIG_TXN_ACCEPT, fe))
+				s->do_log(s, log_orig(LOG_ORIG_TXN_ACCEPT, LOG_ORIG_FL_NONE));
+		}
+		else if (likely(!lf_expr_isempty(&fe->logformat))) {
 			/* we have the client ip */
 			if (s->logs.logwait & LW_CLIP)
 				if (!(s->logs.logwait &= ~(LW_CLIP|LW_INIT)))
-					s->do_log(s, LOG_ORIG_TXN_ACCEPT);
+					s->do_log(s, log_orig(LOG_ORIG_TXN_ACCEPT, LOG_ORIG_FL_NONE));
 		}
 		else if (conn) {
 			src = sc_src(s->scf);

@@ -89,8 +89,13 @@ static const struct log_fmt_st log_formats[LOG_FORMATS] = {
 	},
 };
 
+/* list of extra log origins */
+static struct list log_origins = LIST_HEAD_INIT(log_origins);
+/* tree of extra log origins (lookup by id) */
+static struct eb_root log_origins_per_id = EB_ROOT_UNIQUE;
+
 /* get human readable representation for log_orig enum members */
-const char *log_orig_to_str(enum log_orig orig)
+const char *log_orig_to_str(enum log_orig_id orig)
 {
 	switch (orig) {
 		case LOG_ORIG_SESS_ERROR:
@@ -108,9 +113,40 @@ const char *log_orig_to_str(enum log_orig orig)
 		case LOG_ORIG_TXN_CLOSE:
 			return "txn_close";
 		default:
+		{
+			/* catchall for extra log origins */
+			struct log_origin_node *origin;
+
+			/* lookup raw origin id */
+			origin = container_of_safe(eb32_lookup(&log_origins_per_id, orig),
+			                           struct log_origin_node, tree);
+			if (origin)
+				return origin->name;
 			break;
+		}
 	}
 	return "unspec";
+}
+
+/* Check if <orig> log origin is set for logging on <px>
+ *
+ * It is assumed that the caller already checked that log-steps were
+ * enabled on the proxy (do_log special value LW_LOGSTEPS)
+ *
+ * Returns 1 for true and 0 for false
+ */
+int log_orig_proxy(enum log_orig_id orig, struct proxy *px)
+{
+	if (eb_is_empty(&px->conf.log_steps)) {
+		/* empty tree means all log steps are enabled, thus
+		 * all log origins are considered
+		 */
+		return 1;
+	}
+	/* selectively check if the current log origin is referenced in
+	 * proxy log-steps
+	 */
+	return !!eb32_lookup(&px->conf.log_steps, orig);
 }
 
 /*
@@ -1278,6 +1314,13 @@ static int _postcheck_log_backend_compat(struct proxy *be)
 		err_code |= ERR_WARN;
 		free_server_rules(&be->server_rules);
 	}
+	if (be->to_log == LW_LOGSTEPS) {
+		ha_warning("Cannot use \"log-steps\" with 'mode log' in %s '%s'. It will be ignored.\n",
+			   proxy_type_str(be), be->id);
+
+		err_code |= ERR_WARN;
+		/* we don't have a convenient freeing function, let the proxy free it upon deinit */
+	}
 	if (balance_algo != BE_LB_ALGO_RR &&
 	    balance_algo != BE_LB_ALGO_RND &&
 	    balance_algo != BE_LB_ALGO_SS &&
@@ -1600,7 +1643,7 @@ static int parse_log_target(char *raw, struct log_target *target, char **err)
 
 	/* parse the target address */
 	sk = str2sa_range(raw, NULL, &port1, &port2, &fd, &proto, NULL,
-	                  err, NULL, NULL,
+	                  err, NULL, NULL, NULL,
 	                  PA_O_RESOLVE | PA_O_PORT_OK | PA_O_RAW_FD | PA_O_DGRAM | PA_O_STREAM | PA_O_DEFAULT_DGRAM);
 	if (!sk)
 		goto error;
@@ -2869,7 +2912,7 @@ static inline void __send_log_set_metadata_sd(struct ist *metadata, char *sd, si
 struct process_send_log_ctx {
 	struct session *sess;
 	struct stream *stream;
-	enum log_orig origin;
+	struct log_orig origin;
 };
 
 static inline void _process_send_log_final(struct logger *logger, struct log_header hdr,
@@ -2892,7 +2935,8 @@ static inline void _process_send_log_override(struct process_send_log_ctx *ctx,
 	struct log_profile_step *step = NULL;
 	struct ist orig_tag = hdr.metadata[LOG_META_TAG];
 	struct ist orig_sd = hdr.metadata[LOG_META_STDATA];
-	enum log_orig orig = (ctx) ? ctx->origin : LOG_ORIG_UNSPEC;
+	enum log_orig_id orig = (ctx) ? ctx->origin.id : LOG_ORIG_UNSPEC;
+	uint16_t orig_fl = (ctx) ? ctx->origin.flags : LOG_ORIG_FL_NONE;
 
 	BUG_ON(!prof);
 
@@ -2929,7 +2973,25 @@ static inline void _process_send_log_override(struct process_send_log_ctx *ctx,
 				step = prof->close;
 			break;
 		default:
+		{
+			struct log_profile_step_extra *extra;
+
+			/* catchall for extra log origins */
+			if ((orig_fl & LOG_ORIG_FL_ERROR) && prof->error) {
+				/* extra orig with explicit error flag, must be
+				 * handled as an error
+				 */
+				step = prof->error;
+				break;
+			}
+
+			/* check if there is a log step defined for this log origin */
+			extra = container_of_safe(eb32_lookup(&prof->extra, orig),
+			                          struct log_profile_step_extra, node);
+			if (extra)
+				step = &extra->step;
 			break;
+		}
 	}
 
 	if (!step && prof->any)
@@ -3798,7 +3860,7 @@ int lf_expr_dup(const struct lf_expr *orig, struct lf_expr *dest)
  */
 int sess_build_logline_orig(struct session *sess, struct stream *s,
                             char *dst, size_t maxsize, struct lf_expr *lf_expr,
-                            enum log_orig log_orig)
+                            struct log_orig log_orig)
 {
 	struct lf_buildctx *ctx = &lf_buildctx;
 	struct proxy *fe = sess->fe;
@@ -5061,7 +5123,7 @@ int sess_build_logline_orig(struct session *sess, struct stream *s,
 				break;
 
 			case LOG_FMT_ORIGIN: // %OG
-				ret = lf_text(tmplog, log_orig_to_str(log_orig),
+				ret = lf_text(tmplog, log_orig_to_str(log_orig.id),
 				              dst + maxsize - tmplog, ctx);
 				if (ret == NULL)
 					goto out;
@@ -5126,7 +5188,7 @@ out:
  * send a log for the stream when we have enough info about it.
  * Will not log if the frontend has no log defined.
  */
-void strm_log(struct stream *s, int origin)
+void strm_log(struct stream *s, struct log_orig origin)
 {
 	struct session *sess = s->sess;
 	int size, err, level;
@@ -5136,7 +5198,8 @@ void strm_log(struct stream *s, int origin)
 	err = (s->flags & SF_REDISP) ||
               ((s->flags & SF_ERR_MASK) > SF_ERR_LOCAL) ||
 	      (((s->flags & SF_ERR_MASK) == SF_ERR_NONE) && s->conn_retries) ||
-	      ((sess->fe->mode == PR_MODE_HTTP) && s->txn && s->txn->status >= 500);
+	      ((sess->fe->mode == PR_MODE_HTTP) && s->txn && s->txn->status >= 500) ||
+	      (origin.flags & LOG_ORIG_FL_ERROR);
 
 	if (!err && (sess->fe->options2 & PR_O2_NOLOGNORM))
 		return;
@@ -5164,7 +5227,7 @@ void strm_log(struct stream *s, int origin)
 
 	if (!lf_expr_isempty(&sess->fe->logformat_sd)) {
 		sd_size = build_logline_orig(s, logline_rfc5424, global.max_syslog_len,
-		                        &sess->fe->logformat_sd, origin);
+		                             &sess->fe->logformat_sd, origin);
 	}
 
 	size = build_logline_orig(s, logline, global.max_syslog_len, &sess->fe->logformat, origin);
@@ -5198,10 +5261,15 @@ void _sess_log(struct session *sess, int embryonic)
 {
 	int size, level;
 	int sd_size = 0;
-	int orig = (embryonic) ? LOG_ORIG_SESS_KILL : LOG_ORIG_SESS_ERROR;
+	struct log_orig orig;
 
 	if (!sess)
 		return;
+
+	if (embryonic)
+		orig = log_orig(LOG_ORIG_SESS_KILL, LOG_ORIG_FL_NONE);
+	else
+		orig = log_orig(LOG_ORIG_SESS_ERROR, LOG_ORIG_FL_NONE);
 
 	if (LIST_ISEMPTY(&sess->fe->loggers))
 		return;
@@ -5867,6 +5935,16 @@ int cfg_parse_log_forward(const char *file, int linenum, char **args, int kwm)
 			goto out;
 		}
 
+		px = proxy_find_by_name(args[1], PR_CAP_DEF, 0);
+		if (px) {
+			/* collision with a "defaults" section */
+			ha_warning("Parsing [%s:%d]: log-forward section '%s' has the same name as %s '%s' declared at %s:%d."
+				   " This is dangerous and will not be supported anymore in version 3.3.\n",
+				   file, linenum, args[1], proxy_type_str(px),
+				   px->id, px->conf.file, px->conf.line);
+			err_code |= ERR_WARN;
+		}
+
 		px = calloc(1, sizeof *px);
 		if (!px) {
 			err_code |= ERR_ALERT | ERR_FATAL;
@@ -5876,7 +5954,7 @@ int cfg_parse_log_forward(const char *file, int linenum, char **args, int kwm)
 		init_new_proxy(px);
 		px->next = cfg_log_forward;
 		cfg_log_forward = px;
-		px->conf.file = strdup(file);
+		px->conf.file = copy_file_name(file);
 		px->conf.line = linenum;
 		px->mode = PR_MODE_SYSLOG;
 		px->fe_counters.last_change = ns_to_sec(now_ns);
@@ -6080,13 +6158,18 @@ static inline void log_profile_step_init(struct log_profile_step *lprof_step)
 	lprof_step->flags = LOG_PS_FL_NONE;
 }
 
-static inline void log_profile_step_free(struct log_profile_step *lprof_step)
+static inline void log_profile_step_deinit(struct log_profile_step *lprof_step)
 {
 	if (!lprof_step)
 		return;
 
 	lf_expr_deinit(&lprof_step->logformat);
 	lf_expr_deinit(&lprof_step->logformat_sd);
+}
+
+static inline void log_profile_step_free(struct log_profile_step *lprof_step)
+{
+	log_profile_step_deinit(lprof_step);
 	free(lprof_step);
 }
 
@@ -6131,6 +6214,9 @@ static inline int log_profile_step_postcheck(struct proxy *px, const char *step_
  */
 static int log_profile_postcheck(struct proxy *px, struct log_profile *prof, char **err)
 {
+	struct eb32_node *node;
+	struct log_profile_step_extra *extra;
+
 	/* log profile steps are only relevant under proxy
 	 * context
 	 */
@@ -6147,11 +6233,23 @@ static int log_profile_postcheck(struct proxy *px, struct log_profile *prof, cha
 	    !log_profile_step_postcheck(px, "any", prof->any, err))
 		return 0;
 
+	/* postcheck extra steps (if any) */
+	node = eb32_first(&prof->extra);
+	while (node) {
+		extra = eb32_entry(node, struct log_profile_step_extra, node);
+		node = eb32_next(node);
+		if (!log_profile_step_postcheck(px, extra->orig->name, &extra->step, err))
+			return 0;
+	}
+
 	return 1;
 }
 
 static void log_profile_free(struct log_profile *prof)
 {
+	struct eb32_node *node;
+	struct log_profile_step_extra *extra;
+
 	ha_free(&prof->id);
 	ha_free(&prof->conf.file);
 	chunk_destroy(&prof->log_tag);
@@ -6163,6 +6261,16 @@ static void log_profile_free(struct log_profile *prof)
 	log_profile_step_free(prof->close);
 	log_profile_step_free(prof->error);
 	log_profile_step_free(prof->any);
+
+	/* free extra steps (if any) */
+	node = eb32_first(&prof->extra);
+	while (node) {
+		extra = eb32_entry(node, struct log_profile_step_extra, node);
+		node = eb32_next(node);
+		eb32_delete(&extra->node);
+		log_profile_step_deinit(&extra->step);
+		free(extra);
+	}
 
 	ha_free(&prof);
 }
@@ -6237,6 +6345,7 @@ int cfg_parse_log_profile(const char *file, int linenum, char **args, int kwm)
 		}
 		prof->conf.file = strdup(file);
 		prof->conf.line = linenum;
+		prof->extra = EB_ROOT_UNIQUE;
 
 		/* add to list */
 		LIST_APPEND(&log_profile_list, &prof->list);
@@ -6257,11 +6366,14 @@ int cfg_parse_log_profile(const char *file, int linenum, char **args, int kwm)
 		}
 	}
 	else if (strcmp(args[0], "on") == 0) { /* log profile step */
-		struct log_profile_step **target_step;
+		struct log_profile_step **target_step = NULL;
+		struct log_profile_step *extra_step;
 		struct lf_expr *target_lf;
 		int cur_arg;
 
-		/* get targeted log-profile step */
+		/* get targeted log-profile step:
+		 *   first try with native ones
+		 */
 		if (strcmp(args[1], "accept") == 0)
 			target_step = &prof->accept;
 		else if (strcmp(args[1], "request") == 0)
@@ -6277,9 +6389,50 @@ int cfg_parse_log_profile(const char *file, int linenum, char **args, int kwm)
 		else if (strcmp(args[1], "any") == 0)
 			target_step = &prof->any;
 		else {
-			ha_alert("parsing [%s:%d] : '%s' expects a log step.\n"
-			         "expected values are: 'accept', 'request', 'connect', 'response', 'close', 'error' or 'any'\n",
-			         file, linenum, args[0]);
+			struct log_origin_node *cur;
+			struct log_profile_step_extra *extra = NULL;
+
+			/* then try extra ones (if any) */
+			list_for_each_entry(cur, &log_origins, list) {
+				if (strcmp(args[1], cur->name) == 0) {
+					/* found matching one */
+					extra = malloc(sizeof(*extra));
+					if (extra == NULL) {
+						ha_alert("parsing [%s:%d]: cannot allocate memory for '%s %s'.\n", file, linenum, args[0], args[1]);
+						err_code |= ERR_ALERT | ERR_FATAL;
+						goto out;
+					}
+					log_profile_step_init(&extra->step);
+					extra->orig = cur;
+					extra->node.key = cur->tree.key;
+					eb32_insert(&prof->extra, &extra->node);
+					extra_step = &extra->step;
+					target_step = &extra_step;
+					break;
+				}
+			}
+		}
+
+		if (target_step == NULL) {
+			char *extra_origins = NULL;
+			struct log_origin_node *cur;
+
+			list_for_each_entry(cur, &log_origins, list) {
+				if (extra_origins)
+					memprintf(&extra_origins, "%s, '%s'", extra_origins, cur->name);
+				else
+					memprintf(&extra_origins, "'%s'", cur->name);
+			}
+
+			memprintf(&errmsg, "'%s' expects a log step.\n"
+			                   "expected values are: 'accept', 'request', 'connect', "
+			                   "'response', 'close', 'error' or 'any'.",
+			                   args[0]);
+			if (extra_origins)
+				memprintf(&errmsg, "%s\nOr one of the additional log steps: %s.", errmsg, extra_origins);
+			free(extra_origins);
+
+			ha_alert("parsing [%s:%d]: %s\n", file, linenum, errmsg);
 			err_code |= ERR_ALERT | ERR_FATAL;
 			goto out;
 		}
@@ -6358,6 +6511,67 @@ out:
 	return err_code;
 }
 
+/* suitable for use with INITCALL0(STG_PREPARE), may not be used anymore
+ * once config parsing has started since it will depend on this.
+ *
+ * Returns the ID of the log origin on success and LOG_ORIG_UNSPEC on failure.
+ * ID must be saved for later use (ie: inside static variable), in order
+ * to use it as log origin during runtime.
+ *
+ * If the origin is already defined, the existing ID is returned.
+ *
+ * Don't forget to update the documentation when new log origins are added
+ * (both %OG log alias and on <step> log-profile keyword are concerned)
+ */
+enum log_orig_id log_orig_register(const char *name)
+{
+	struct log_origin_node *cur;
+	size_t last = 0;
+
+	list_for_each_entry(cur, &log_origins, list) {
+		if (strcmp(name, cur->name) == 0)
+			return cur->tree.key;
+		last = cur->tree.key;
+	}
+	/* not found, need to register new log origin */
+
+	if (last == LOG_ORIG_EXTRA_SLOTS) {
+		ha_alert("Reached maximum number of log origins. Please report to developers if you see this message.\n");
+		goto out_error;
+	}
+
+	cur = malloc(sizeof(*cur));
+	if (cur == NULL)
+		goto out_oom;
+
+	cur->name = strdup(name);
+	if (!cur->name) {
+		free(cur);
+		goto out_oom;
+	}
+	cur->tree.key = LOG_ORIG_EXTRA + last;
+	LIST_APPEND(&log_origins, &cur->list);
+	eb32_insert(&log_origins_per_id, &cur->tree);
+	return cur->tree.key;
+
+ out_oom:
+	ha_alert("Failed to register additional log origin. Out of memory\n");
+ out_error:
+	return LOG_ORIG_UNSPEC;
+}
+
+/* Deinitialize all extra log origins */
+static void deinit_log_origins()
+{
+	struct log_origin_node *orig, *back;
+
+	list_for_each_entry_safe(orig, back, &log_origins, list) {
+		LIST_DEL_INIT(&orig->list);
+		free((char *)orig->name);
+		free(orig);
+	}
+}
+
 /* function: post-resolve a single list of loggers
  *
  * Returns err_code which defaults to ERR_NONE and can be set to a combination
@@ -6420,6 +6634,105 @@ static int postresolve_loggers()
 /* config parsers for this section */
 REGISTER_CONFIG_SECTION("log-forward", cfg_parse_log_forward, NULL);
 REGISTER_CONFIG_SECTION("log-profile", cfg_parse_log_profile, NULL);
+
+static int px_parse_log_steps(char **args, int section_type, struct proxy *curpx,
+                              const struct proxy *defpx, const char *file, int line,
+                              char **err)
+{
+	char *str;
+	size_t cur_sep;
+	int retval = -1;
+
+	if (!(curpx->cap & PR_CAP_FE)) {
+		memprintf(err, "%s will be ignored because %s '%s' has no frontend capability",
+		          args[0], proxy_type_str(curpx), curpx->id);
+		retval = 1;
+		goto end;
+	}
+
+	if (args[1] == NULL) {
+		memprintf(err, "%s: invalid arguments, expects 'all' or a composition of logging"
+		               "steps separated by spaces.",
+		          args[0]);
+		goto end;
+	}
+
+	if (strcmp(args[1], "all") == 0) {
+		/* enable all logging steps */
+		curpx->to_log = LW_LOGSTEPS;
+		retval = 0;
+		goto end;
+	}
+
+	/* selectively enable logging steps */
+	str = args[1];
+
+	while (str[0]) {
+		struct eb32_node *cur_step;
+		enum log_orig_id cur_id;
+
+		cur_sep = strcspn(str, ",");
+
+		/* check for valid logging step */
+                if (cur_sep == 6 && strncmp(str, "accept", cur_sep) == 0)
+			cur_id = LOG_ORIG_TXN_ACCEPT;
+                else if (cur_sep == 7 && strncmp(str, "request", cur_sep) == 0)
+			cur_id = LOG_ORIG_TXN_REQUEST;
+                else if (cur_sep == 7 && strncmp(str, "connect", cur_sep) == 0)
+			cur_id = LOG_ORIG_TXN_CONNECT;
+                else if (cur_sep == 8 && strncmp(str, "response", cur_sep) == 0)
+			cur_id = LOG_ORIG_TXN_RESPONSE;
+                else if (cur_sep == 5 && strncmp(str, "close", cur_sep) == 0)
+			cur_id = LOG_ORIG_TXN_CLOSE;
+		else {
+			struct log_origin_node *cur;
+
+			list_for_each_entry(cur, &log_origins, list) {
+				if (cur_sep == strlen(cur->name) && strncmp(str, cur->name, cur_sep) == 0) {
+					cur_id = cur->tree.key;
+					break;
+				}
+			}
+
+			memprintf(err,
+			          "invalid log step name (%.*s). Expected values are: "
+			          "accept, request, connect, response, close",
+			          (int)cur_sep, str);
+                        list_for_each_entry(cur, &log_origins, list)
+				memprintf(err, "%s, %s", *err, cur->name);
+
+			goto end;
+		}
+
+		cur_step = malloc(sizeof(*cur_step));
+		if (!cur_step) {
+			memprintf(err, "memory failure when trying to configure log-step (%.*s)",
+			          (int)cur_sep, str);
+			goto end;
+		}
+		cur_step->key = cur_id;
+		eb32_insert(&curpx->conf.log_steps, cur_step);
+ next:
+		if (str[cur_sep])
+			str += cur_sep + 1;
+		else
+			str += cur_sep;
+	}
+
+	curpx->to_log = LW_LOGSTEPS;
+	retval = 0;
+
+ end:
+	return retval;
+}
+
+static struct cfg_kw_list cfg_kws_li = {ILH, {
+	{ CFG_LISTEN, "log-steps",  px_parse_log_steps },
+	{ 0, NULL, NULL },
+}};
+
+INITCALL1(STG_REGISTER, cfg_register_keywords, &cfg_kws_li);
+
 REGISTER_POST_CHECK(postresolve_loggers);
 REGISTER_POST_PROXY_CHECK(postcheck_log_backend);
 REGISTER_POST_PROXY_CHECK(postcheck_logformat_proxy);
@@ -6429,6 +6742,7 @@ REGISTER_PER_THREAD_FREE(deinit_log_buffers);
 
 REGISTER_POST_DEINIT(deinit_log_forward);
 REGISTER_POST_DEINIT(deinit_log_profiles);
+REGISTER_POST_DEINIT(deinit_log_origins);
 
 /*
  * Local variables:

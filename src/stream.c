@@ -695,10 +695,8 @@ void stream_free(struct stream *s)
 	}
 
 	/* Cleanup all variable contexts. */
-	if (!LIST_ISEMPTY(&s->vars_txn.head))
-		vars_prune(&s->vars_txn, s->sess, s);
-	if (!LIST_ISEMPTY(&s->vars_reqres.head))
-		vars_prune(&s->vars_reqres, s->sess, s);
+	vars_prune(&s->vars_txn, s->sess, s);
+	vars_prune(&s->vars_reqres, s->sess, s);
 
 	stream_store_counters(s);
 	pool_free(pool_head_stk_ctr, s->stkctr);
@@ -898,6 +896,7 @@ void back_establish(struct stream *s)
 	struct connection *conn = sc_conn(s->scb);
 	struct channel *req = &s->req;
 	struct channel *rep = &s->res;
+	uint8_t do_log = 0;
 
 	DBG_TRACE_ENTER(STRM_EV_STRM_PROC|STRM_EV_CS_ST, s);
 	/* First, centralize the timers information, and clear any irrelevant
@@ -918,17 +917,26 @@ void back_establish(struct stream *s)
 	if (objt_server(s->target))
 		health_adjust(__objt_server(s->target), HANA_STATUS_L4_OK);
 
+	if (strm_fe(s)->to_log == LW_LOGSTEPS) {
+		if (log_orig_proxy(LOG_ORIG_TXN_CONNECT, strm_fe(s)))
+			do_log = 1;
+	}
+
 	if (!IS_HTX_STRM(s)) { /* let's allow immediate data connection in this case */
 		/* if the user wants to log as soon as possible, without counting
 		 * bytes from the server, then this is the right moment. */
-		if (!lf_expr_isempty(&strm_fe(s)->logformat) && !(s->logs.logwait & LW_BYTES)) {
-			/* note: no pend_pos here, session is established */
-			s->logs.t_close = s->logs.t_connect; /* to get a valid end date */
-			s->do_log(s, LOG_ORIG_TXN_CONNECT);
-		}
+		if (strm_fe(s)->to_log != LW_LOGSTEPS &&
+		    !lf_expr_isempty(&strm_fe(s)->logformat) && !(s->logs.logwait & LW_BYTES))
+			do_log = 1;
 	}
 	else {
 		s->scb->flags |= SC_FL_RCV_ONCE; /* a single read is enough to get response headers */
+	}
+
+	if (do_log) {
+		/* note: no pend_pos here, session is established */
+		s->logs.t_close = s->logs.t_connect; /* to get a valid end date */
+		s->do_log(s, log_orig(LOG_ORIG_TXN_CONNECT, LOG_ORIG_FL_NONE));
 	}
 
 	rep->analysers |= strm_fe(s)->fe_rsp_ana | s->be->be_rsp_ana;
@@ -1489,6 +1497,10 @@ int stream_set_http_mode(struct stream *s, const struct mux_proto_list *mux_prot
 		return 0;
 
 	conn = sc_conn(sc);
+
+	if (!sc_conn_ready(sc))
+		return 0;
+
 	if (conn) {
 		se_have_more_data(s->scf->sedesc);
 		/* Make sure we're unsubscribed, the the new
@@ -1710,6 +1722,12 @@ void stream_update_timings(struct task *t, uint64_t lat, uint64_t cpu)
  * nothing too many times, the request and response buffers flags are monitored
  * and each function is called only if at least another function has changed at
  * least one flag it is interested in.
+ *
+ * This task handler understands a few wake up reasons:
+ *  - TASK_WOKEN_MSG forces analysers to be re-evaluated
+ *  - TASK_WOKEN_OTHER+TASK_F_UEVT1 shuts the stream down on server down
+ *  - TASK_WOKEN_OTHER+TASK_F_UEVT2 shuts the stream down on active kill
+ *  - TASK_WOKEN_OTHER alone has no effect
  */
 struct task *process_stream(struct task *t, void *context, unsigned int state)
 {
@@ -1729,6 +1747,11 @@ struct task *process_stream(struct task *t, void *context, unsigned int state)
 
 	activity[tid].stream_calls++;
 	stream_cond_update_cpu_latency(s);
+
+	if ((state & TASK_WOKEN_OTHER) && (state & (TASK_F_UEVT1 | TASK_F_UEVT2))) {
+		/* that an instant kill message, the reason is in _UEVT* */
+		stream_shutdown_self(s, (state & TASK_F_UEVT2) ? SF_ERR_KILLED : SF_ERR_DOWN);
+	}
 
 	req = &s->req;
 	res = &s->res;
@@ -2305,8 +2328,7 @@ struct task *process_stream(struct task *t, void *context, unsigned int state)
 	if (sc_state_in(scb->state, SC_SB_REQ|SC_SB_QUE|SC_SB_TAR|SC_SB_ASS)) {
 		/* prune the request variables and swap to the response variables. */
 		if (s->vars_reqres.scope != SCOPE_RES) {
-			if (!LIST_ISEMPTY(&s->vars_reqres.head))
-				vars_prune(&s->vars_reqres, s->sess, s);
+			vars_prune(&s->vars_reqres, s->sess, s);
 			vars_init_head(&s->vars_reqres, SCOPE_RES);
 		}
 
@@ -2563,6 +2585,8 @@ struct task *process_stream(struct task *t, void *context, unsigned int state)
 	}
 
 	if (!(s->flags & SF_IGNORE)) {
+		uint8_t do_log = 0;
+
 		s->logs.t_close = ns_to_ms(now_ns - s->logs.accept_ts);
 
 		stream_process_counters(s);
@@ -2585,14 +2609,21 @@ struct task *process_stream(struct task *t, void *context, unsigned int state)
 		}
 
 		/* let's do a final log if we need it */
-		if (!lf_expr_isempty(&sess->fe->logformat) && s->logs.logwait &&
+		if (sess->fe->to_log == LW_LOGSTEPS) {
+			if (log_orig_proxy(LOG_ORIG_TXN_CLOSE, sess->fe))
+				do_log = 1;
+		}
+		else if (!lf_expr_isempty(&sess->fe->logformat) && s->logs.logwait)
+			do_log = 1;
+
+		if (do_log &&
 		    !(s->flags & SF_MONITOR) &&
 		    (!(sess->fe->options & PR_O_NULLNOLOG) || req->total)) {
 			/* we may need to know the position in the queue */
 			pendconn_free(s);
 
 			stream_cond_update_cpu_usage(s);
-			s->do_log(s, LOG_ORIG_TXN_CLOSE);
+			s->do_log(s, log_orig(LOG_ORIG_TXN_CLOSE, LOG_ORIG_FL_NONE));
 		}
 
 		/* update time stats for this stream */
@@ -2756,8 +2787,12 @@ void default_srv_error(struct stream *s, struct stconn *sc)
 		s->flags |= fin;
 }
 
-/* kill a stream and set the termination flags to <why> (one of SF_ERR_*) */
-void stream_shutdown(struct stream *stream, int why)
+/* shutdown the stream from itself. It's also possible for another one from the
+ * same thread but then an explicit wakeup will be needed since this function
+ * does not perform it. <why> is a set of SF_ERR_* flags to pass as the cause
+ * for shutting down.
+ */
+void stream_shutdown_self(struct stream *stream, int why)
 {
 	if (stream->scb->flags & (SC_FL_SHUT_DONE|SC_FL_SHUT_WANTED))
 		return;
@@ -2767,7 +2802,6 @@ void stream_shutdown(struct stream *stream, int why)
 	stream->task->nice = 1024;
 	if (!(stream->flags & SF_ERR_MASK))
 		stream->flags |= why;
-	task_wakeup(stream->task, TASK_WOKEN_OTHER);
 }
 
 /* dumps an error message for type <type> at ptr <ptr> related to stream <s>,
