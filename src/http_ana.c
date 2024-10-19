@@ -956,7 +956,8 @@ int http_request_forward_body(struct stream *s, struct channel *req, int an_bit)
 	}
 	else {
 		c_adv(req, htx->data - co_data(req));
-		if ((global.tune.options & GTUNE_USE_FAST_FWD) && (msg->flags & HTTP_MSGF_XFER_LEN))
+		if ((global.tune.options & GTUNE_USE_FAST_FWD) && (msg->flags & HTTP_MSGF_XFER_LEN) &&
+		    (!(msg->flags & HTTP_MSGF_CONN_UPG) || (htx->flags & HTX_FL_EOM)))
 			channel_htx_forward_forever(req, htx);
 	}
 
@@ -1142,7 +1143,7 @@ static __inline int do_l7_retry(struct stream *s, struct stconn *sc)
 	struct channel *req, *res;
 	int co_data;
 
-	if (s->conn_retries >= s->be->conn_retries)
+	if (s->conn_retries >= s->max_retries)
 		return -1;
 	s->conn_retries++;
 	if (objt_server(s->target)) {
@@ -2246,8 +2247,6 @@ int http_response_forward_body(struct stream *s, struct channel *res, int an_bit
 		health_adjust(__objt_server(s->target), HANA_STATUS_HTTP_RSP);
 	}
 	stream_inc_http_fail_ctr(s);
-	if (!(s->flags & SF_ERR_MASK))
-		s->flags |= SF_ERR_SRVCL;
 	/* fall through */
 
    return_error:

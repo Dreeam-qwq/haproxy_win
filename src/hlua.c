@@ -1811,10 +1811,15 @@ static int hlua_ctx_renew(struct hlua *lua, int keep_msg)
 	lua_State *T;
 	int new_ref;
 
+	if (!SET_SAFE_LJMP_PARENT(lua))
+		return 0;
+
 	/* New Lua coroutine. */
 	T = lua_newthread(hlua_states[lua->state_id]);
-	if (!T)
+	if (!T) {
+		RESET_SAFE_LJMP_PARENT(lua);
 		return 0;
+	}
 
 	/* Copy last error message. */
 	if (keep_msg)
@@ -1835,6 +1840,8 @@ static int hlua_ctx_renew(struct hlua *lua, int keep_msg)
 	lua->Mref = new_ref;
 	lua->T = T;
 	lua->Tref = luaL_ref(hlua_states[lua->state_id], LUA_REGISTRYINDEX);
+
+	RESET_SAFE_LJMP_PARENT(lua);
 
 	/* Set context. */
 	hlua_sethlua(lua);
@@ -4809,6 +4816,7 @@ __LJMP static int hlua_run_sample_fetch(lua_State *L)
 {
 	struct hlua_smp *hsmp;
 	struct sample_fetch *f;
+	char *errmsg = NULL;
 	struct arg args[ARGM_NBARGS + 1] = {{0}};
 	int i;
 	struct sample smp;
@@ -4840,8 +4848,9 @@ __LJMP static int hlua_run_sample_fetch(lua_State *L)
 	MAY_LJMP(hlua_lua2arg_check(L, 2, args, f->arg_mask, hsmp->p));
 
 	/* Run the special args checker. */
-	if (f->val_args && !f->val_args(args, NULL)) {
-		hlua_pushfstring_safe(L, "error in arguments");
+	if (f->val_args && !f->val_args(args, &errmsg)) {
+		hlua_pushfstring_safe(L, "error in arguments: %s", errmsg);
+		ha_free(&errmsg);
 		goto error;
 	}
 
@@ -4931,6 +4940,7 @@ __LJMP static int hlua_run_sample_conv(lua_State *L)
 {
 	struct hlua_smp *hsmp;
 	struct sample_conv *conv;
+	char *errmsg = NULL;
 	struct arg args[ARGM_NBARGS + 1] = {{0}};
 	int i;
 	struct sample smp;
@@ -4954,8 +4964,9 @@ __LJMP static int hlua_run_sample_conv(lua_State *L)
 	MAY_LJMP(hlua_lua2arg_check(L, 3, args, conv->arg_mask, hsmp->p));
 
 	/* Run the special args checker. */
-	if (conv->val_args && !conv->val_args(args, conv, "", 0, NULL)) {
-		hlua_pusherror(L, "error in arguments");
+	if (conv->val_args && !conv->val_args(args, conv, "", 0, &errmsg)) {
+		hlua_pushfstring_safe(L, "error in arguments: %s", errmsg);
+		ha_free(&errmsg);
 		goto error;
 	}
 

@@ -247,8 +247,8 @@ struct stream {
 	uint64_t cpu_time;              /* total CPU time consumed */
 	struct freq_ctr call_rate;      /* stream task call rate without making progress */
 
+	unsigned short max_retries;     /* Maximum number of connection retried (=0 is backend is not set) */
 	short store_count;
-	/* 2 unused bytes here */
 
 	struct {
 		struct stksess *ts;

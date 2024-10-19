@@ -873,7 +873,7 @@ static void sc_app_chk_snd_conn(struct stconn *sc)
 	/* OK, so now we know that some data might have been sent, and that we may
 	 * have to poll first. We have to do that too if the buffer is not empty.
 	 */
-	if (!co_data(oc)) {
+	if (!co_data(oc) && !sc_ep_have_ff_data(sc)) {
 		/* the connection is established but we can't write. Either the
 		 * buffer is empty, or we just refrain from sending because the
 		 * ->o limit was reached. Maybe we just wrote the last
@@ -1119,7 +1119,7 @@ void sc_notify(struct stconn *sc)
 	struct task *task = sc_strm_task(sc);
 
 	/* process consumer side */
-	if (!co_data(oc) && !sc_ep_have_ff_data(sco)) {
+	if (!co_data(oc) && !sc_ep_have_ff_data(sc)) {
 		struct connection *conn = sc_conn(sc);
 
 		if (((sc->flags & (SC_FL_SHUT_DONE|SC_FL_SHUT_WANTED)) == SC_FL_SHUT_WANTED) &&
@@ -1520,19 +1520,39 @@ int sc_conn_recv(struct stconn *sc)
 		sc_conn_eos(sc);
 		ret = 1;
 	}
-
 	if (sc_ep_test(sc, SE_FL_ERROR)) {
 		sc->flags |= SC_FL_ERROR;
 		ret = 1;
 	}
+
+	/* Ensure sc_conn_process() is called if waiting on handshake. */
+	if (!(conn->flags & (CO_FL_WAIT_XPRT | CO_FL_EARLY_SSL_HS)) &&
+	    sc_ep_test(sc, SE_FL_WAIT_FOR_HS)) {
+		ret = 1;
+	}
+
+	if (sc->flags & (SC_FL_EOS|SC_FL_ERROR)) {
+		/* No more data are expected at this stage */
+		se_have_no_more_data(sc->sedesc);
+	}
 	else if (!cur_read &&
 		 !(sc->flags & (SC_FL_WONT_READ|SC_FL_NEED_BUFF|SC_FL_NEED_ROOM)) &&
 		 !(sc->flags & (SC_FL_EOS|SC_FL_ABRT_DONE))) {
-		/* Subscribe to receive events if we're blocking on I/O */
+		/* Subscribe to receive events if we're blocking on I/O. Nothing
+		 * was received and it was not because of a blocking
+		 * condition.
+		 */
 		conn->mux->subscribe(sc, SUB_RETRY_RECV, &sc->wait_event);
 		se_have_no_more_data(sc->sedesc);
 	}
+	else if (sc->flags & SC_FL_EOI) {
+		/* No more data are expected at this stage */
+		se_have_no_more_data(sc->sedesc);
+	}
 	else {
+		/* The mux may have more data to deliver. Be sure to be able to
+		 * ask it ASAP
+		 */
 		se_have_more_data(sc->sedesc);
 		ret = 1;
 	}

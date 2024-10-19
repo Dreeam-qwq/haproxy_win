@@ -49,6 +49,10 @@ int mworker_ext_launch_all()
 
 	/* find the right mworker_proc */
 	list_for_each_entry_safe(child, tmp, &proc_list, list) {
+		/* need to stop progs, which were launched before reload */
+		if ((child->options & PROC_O_TYPE_PROG) && (child->options & PROC_O_LEAVING))
+			kill(child->pid, oldpids_sig);
+
 		if (child->reloads == 0 && (child->options & PROC_O_TYPE_PROG)) {
 
 			if (reexec && (!(child->options & PROC_O_START_RELOAD))) {
@@ -115,7 +119,6 @@ int mworker_ext_launch_all()
 				/* This one must not be exported, it's internal! */
 				unsetenv("HAPROXY_MWORKER_REEXEC");
 				unsetenv("HAPROXY_STARTUPLOGS_FD");
-				unsetenv("HAPROXY_MWORKER_WAIT_ONLY");
 				unsetenv("HAPROXY_PROCESSES");
 				execvp(child->command[0], child->command);
 
@@ -137,6 +140,9 @@ int cfg_parse_program(const char *file, int linenum, char **args, int kwm)
 	static struct mworker_proc *ext_child = NULL;
 	struct mworker_proc *child;
 	int err_code = 0;
+
+	if (!(global.mode & MODE_DISCOVERY))
+		return err_code;
 
 	if (strcmp(args[0], "program") == 0) {
 		if (alertif_too_many_args(1, file, linenum, args, &err_code)) {
@@ -332,9 +338,7 @@ int cfg_program_postparser()
 	int err_code = 0;
 	struct mworker_proc *child;
 
-	/* we only need to check this during configuration parsing,
-	 * wait mode doesn't have the complete description of a program */
-	if (global.mode & MODE_MWORKER_WAIT)
+	if (!(global.mode & MODE_DISCOVERY))
 		return err_code;
 
 	list_for_each_entry(child, &proc_list, list) {

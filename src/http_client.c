@@ -628,6 +628,9 @@ struct httpclient *httpclient_new(void *caller, enum http_meth_t meth, struct is
 {
 	struct httpclient *hc;
 
+	if (!httpclient_proxy)
+		return NULL;
+
 	hc = calloc(1, sizeof(*hc));
 	if (!hc)
 		goto err;
@@ -654,6 +657,9 @@ err:
 struct httpclient *httpclient_new_from_proxy(struct proxy *px, void *caller, enum http_meth_t meth, struct ist url)
 {
 	struct httpclient *hc;
+
+	if (!px)
+		return NULL;
 
 	hc = httpclient_new(caller, meth, url);
 	if (!hc)
@@ -1202,7 +1208,8 @@ struct proxy *httpclient_create_proxy(const char *id)
 	struct server *srv_ssl = NULL;
 #endif
 
-	if (global.mode & MODE_MWORKER_WAIT)
+	/* the httpclient is not usable in the master process */
+	if (master)
 		return ERR_NONE;
 
 	px = alloc_new_proxy(id, PR_CAP_LISTEN|PR_CAP_INT|PR_CAP_HTTPCLIENT, &errmsg);
@@ -1339,8 +1346,11 @@ err:
  */
 static int httpclient_precheck()
 {
-	/* initialize the default httpclient_proxy which is used for the CLI and the lua */
+	/* the httpclient is not usable in the master process */
+	if (master)
+		return ERR_NONE;
 
+	/* initialize the default httpclient_proxy which is used for the CLI and the lua */
 	httpclient_proxy = httpclient_create_proxy("<HTTPCLIENT>");
 	if (!httpclient_proxy)
 		return ERR_RETRYABLE;
@@ -1359,7 +1369,8 @@ static int httpclient_postcheck_proxy(struct proxy *curproxy)
 	struct server *srv_ssl = NULL;
 #endif
 
-	if (global.mode & MODE_MWORKER_WAIT)
+	/* the httpclient is not usable in the master process */
+	if (master)
 		return ERR_NONE;
 
 	if (!(curproxy->cap & PR_CAP_HTTPCLIENT))

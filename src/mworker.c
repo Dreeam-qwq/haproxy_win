@@ -46,7 +46,7 @@
 #endif
 
 static int exitcode = -1;
-static int max_reloads = -1; /* number max of reloads a worker can have until they are killed */
+int max_reloads = INT_MAX; /* max number of reloads a worker can have until they are killed */
 struct mworker_proc *proc_self = NULL; /* process structure of current process */
 struct list mworker_cli_conf = LIST_HEAD_INIT(mworker_cli_conf); /* master CLI configuration (-S flag) */
 
@@ -115,7 +115,6 @@ void mworker_proc_list_to_env()
 {
 	char *msg = NULL;
 	struct mworker_proc *child;
-	int minreloads = INT_MAX; /* minimum number of reloads to chose which processes are "current" ones */
 
 	list_for_each_entry(child, &proc_list, list) {
 		char type = '?';
@@ -127,22 +126,11 @@ void mworker_proc_list_to_env()
 		else if (child->options &= PROC_O_TYPE_WORKER)
 			type = 'w';
 
-		if (child->reloads < minreloads)
-			minreloads = child->reloads;
-
 		if (child->pid > -1)
 			memprintf(&msg, "%s|type=%c;fd=%d;cfd=%d;pid=%d;reloads=%d;failedreloads=%d;timestamp=%d;id=%s;version=%s", msg ? msg : "", type, child->ipc_fd[0], child->ipc_fd[1], child->pid, child->reloads, child->failedreloads, child->timestamp, child->id ? child->id : "", child->version);
 	}
 	if (msg)
 		setenv("HAPROXY_PROCESSES", msg, 1);
-
-	list_for_each_entry(child, &proc_list, list) {
-		if (child->reloads > minreloads && !(child->options & PROC_O_TYPE_MASTER)) {
-			child->options |= PROC_O_LEAVING;
-		}
-	}
-
-
 }
 
 struct mworker_proc *mworker_proc_new()
@@ -172,7 +160,6 @@ int mworker_env_to_proc_list()
 {
 	char *env, *msg, *omsg = NULL, *token = NULL, *s1;
 	struct mworker_proc *child;
-	int minreloads = INT_MAX; /* minimum number of reloads to chose which processes are "current" ones */
 	int err = 0;
 
 	env = getenv("HAPROXY_PROCESSES");
@@ -229,9 +216,6 @@ int mworker_env_to_proc_list()
 			} else if (strncmp(subtoken, "reloads=", 8) == 0) {
 				/* we only increment the number of asked reload */
 				child->reloads = atoi(subtoken+8);
-
-				if (child->reloads < minreloads)
-					minreloads = child->reloads;
 			} else if (strncmp(subtoken, "failedreloads=", 14) == 0) {
 				child->failedreloads = atoi(subtoken+14);
 			} else if (strncmp(subtoken, "timestamp=", 10) == 0) {
@@ -252,7 +236,7 @@ int mworker_env_to_proc_list()
 	/* set the leaving processes once we know which number of reloads are the current processes */
 
 	list_for_each_entry(child, &proc_list, list) {
-		if (child->reloads > minreloads)
+		if (child->reloads > 0)
 			child->options |= PROC_O_LEAVING;
 	}
 
@@ -341,6 +325,8 @@ void mworker_catch_sigchld(struct sig_handler *sh)
 	int exitpid = -1;
 	int status = 0;
 	int childfound;
+	struct listener *l, *l_next;
+	struct proxy *curproxy;
 
 restart_wait:
 
@@ -365,7 +351,6 @@ restart_wait:
 				continue;
 
 			LIST_DELETE(&child->list);
-			close(child->ipc_fd[0]);
 			childfound = 1;
 			break;
 		}
@@ -373,10 +358,41 @@ restart_wait:
 		if (!childfound) {
 			/* We didn't find the PID in the list, that shouldn't happen but we can emit a warning */
 			ha_warning("Process %d exited with code %d (%s)\n", exitpid, status, (status >= 128) ? strsignal(status - 128) : "Exit");
+		} else if (child->options & PROC_O_INIT) {
+			on_new_child_failure();
+
+			/* Detach all listeners */
+			for (curproxy = proxies_list; curproxy; curproxy = curproxy->next) {
+				list_for_each_entry_safe(l, l_next, &curproxy->conf.listeners, by_fe) {
+					if ((l->rx.fd == child->ipc_fd[0]) || (l->rx.fd == child->ipc_fd[1])) {
+						unbind_listener(l);
+						delete_listener(l);
+					}
+				}
+			}
+
+			/* Drop server */
+			if (child->srv)
+				srv_drop(child->srv);
+
+			/* Delete fd from poller fdtab, which will close it */
+			fd_delete(child->ipc_fd[0]);
+			child->ipc_fd[0] = -1;
+			mworker_free_child(child);
+			child = NULL;
+
+			/* When worker fails during the first startup, there is
+			 * no previous workers with state PROC_O_LEAVING, master
+			 * process should exit here as well to keep the
+			 * previous behaviour
+			 */
+			if ((proc_self->options & PROC_O_TYPE_MASTER) && (proc_self->reloads == 0))
+				exit(status);
 		} else {
 			/* check if exited child is a current child */
 			if (!(child->options & PROC_O_LEAVING)) {
 				if (child->options & PROC_O_TYPE_WORKER) {
+					fd_delete(child->ipc_fd[0]);
 					if (status < 128)
 						ha_warning("Current worker (%d) exited with code %d (%s)\n", exitpid, status, "Exit");
 					else
@@ -390,7 +406,8 @@ restart_wait:
 						ha_warning("A worker process unexpectedly died and this can only be explained by a bug in haproxy or its dependencies.\nPlease check that you are running an up to date and maintained version of haproxy and open a bug report.\n");
 						display_version();
 					}
-					if (!(global.tune.options & GTUNE_NOEXIT_ONFAILURE)) {
+					/* new worker, which has been launched at reload has status PROC_O_INIT */
+					if (!(global.tune.options & GTUNE_NOEXIT_ONFAILURE) && !(child->options & PROC_O_INIT)) {
 						ha_alert("exit-on-failure: killing every processes with SIGTERM\n");
 						mworker_kill(SIGTERM);
 					}
@@ -400,9 +417,17 @@ restart_wait:
 					exitcode = status;
 			} else {
 				if (child->options & PROC_O_TYPE_WORKER) {
-					ha_warning("Former worker (%d) exited with code %d (%s)\n", exitpid, status, (status >= 128) ? strsignal(status - 128) : "Exit");
+					if (child->reloads > max_reloads)
+						ha_warning("Former worker (%d) exited with code %d (%s), as it exceeds max reloads (%d)\n", exitpid, status, (status >= 128) ? strsignal(status - 128) : "Exit", max_reloads);
+					else
+						ha_warning("Former worker (%d) exited with code %d (%s)\n", exitpid, status, (status >= 128) ? strsignal(status - 128) : "Exit");
+					/* Delete fd from poller fdtab, which will close it */
+					fd_delete(child->ipc_fd[0]);
 					delete_oldpid(exitpid);
 				} else if (child->options & PROC_O_TYPE_PROG) {
+					/* ipc_fd[0] and ipc_fd[1] are not used for PROC_O_TYPE_PROG and kept as -1,
+					 * thus they are never inserted in fdtab (otherwise, BUG_ON in fd_insert if fd <0)
+					 */
 					ha_warning("Former program '%s' (%d) exited with code %d (%s)\n", child->id, exitpid, status, (status >= 128) ? strsignal(status - 128) : "Exit");
 				}
 			}
@@ -681,9 +706,26 @@ static int cli_parse_reload(char **args, char *payload, struct appctx *appctx, v
 	struct connection *conn = NULL;
 	int fd = -1;
 	int hardreload = 0;
+	struct mworker_proc *proc;
 
 	if (!cli_has_level(appctx, ACCESS_LVL_OPER))
 		return 1;
+
+	list_for_each_entry(proc, &proc_list, list) {
+		/* if there is a process with PROC_O_INIT, i.e. new worker is
+		 * doing its init routine, block the reload
+		 */
+		if (proc->options & PROC_O_INIT) {
+			chunk_printf(&trash, "Success=0\n");
+			chunk_appendf(&trash, "--\n");
+			chunk_appendf(&trash, "Another reload is still in progress.\n");
+
+			if (applet_putchk(appctx, &trash) == -1)
+				return 0;
+
+			return 1;
+		}
+	}
 
 	/* hard reload requested */
 	if (*args[0] == 'h')
@@ -713,10 +755,21 @@ static int cli_parse_reload(char **args, char *payload, struct appctx *appctx, v
  * If the startup-logs is available, dump it.  */
 static int cli_io_handler_show_loadstatus(struct appctx *appctx)
 {
+	struct mworker_proc *proc;
 	char *env;
 
 	if (!cli_has_level(appctx, ACCESS_LVL_OPER))
 		return 1;
+
+	/* if the worker is still in the process of starting, we have to
+	 * wait a little bit before trying again to get a final status.
+	 */
+	list_for_each_entry(proc, &proc_list, list) {
+		if (proc->options & PROC_O_INIT) {
+			appctx->t->expire = tick_add(now_ms, 50);
+			return 0;
+		}
+	}
 
 	env = getenv("HAPROXY_LOAD_SUCCESS");
 	if (!env)
@@ -751,6 +804,8 @@ static int mworker_parse_global_max_reloads(char **args, int section_type, struc
 {
 
 	int err_code = 0;
+	if (!(global.mode & MODE_DISCOVERY))
+		return 0;
 
 	if (alertif_too_many_args(1, file, linenum, args, &err_code))
 		goto out;
@@ -793,22 +848,11 @@ void mworker_create_master_cli(void)
 {
 	struct wordlist *it, *c;
 
-	/* get the info of the children in the env */
-	if (mworker_env_to_proc_list() < 0) {
-		exit(EXIT_FAILURE);
-	}
-
 	if (!LIST_ISEMPTY(&mworker_cli_conf)) {
 		char *path = NULL;
 
-		if (mworker_cli_proxy_create() < 0) {
-			ha_alert("Can't create the master's CLI.\n");
-			exit(EXIT_FAILURE);
-		}
-
 		list_for_each_entry_safe(c, it, &mworker_cli_conf, list) {
-
-			if (mworker_cli_proxy_new_listener(c->s) == NULL) {
+			if (mworker_cli_master_proxy_new_listener(c->s) == NULL) {
 				ha_alert("Can't create the master's CLI.\n");
 				exit(EXIT_FAILURE);
 			}
@@ -833,7 +877,8 @@ void mworker_create_master_cli(void)
 
 		/* Create the mcli_reload listener from the proc_self struct */
 		memprintf(&path, "sockpair@%d", proc_self->ipc_fd[1]);
-		mcli_reload_bind_conf = mworker_cli_proxy_new_listener(path);
+
+		mcli_reload_bind_conf = mworker_cli_master_proxy_new_listener(path);
 		if (mcli_reload_bind_conf == NULL) {
 			ha_alert("Can't create the mcli_reload listener.\n");
 			exit(EXIT_FAILURE);
@@ -843,7 +888,7 @@ void mworker_create_master_cli(void)
 }
 
 static struct cfg_kw_list mworker_kws = {{ }, {
-	{ CFG_GLOBAL, "mworker-max-reloads", mworker_parse_global_max_reloads },
+	{ CFG_GLOBAL, "mworker-max-reloads", mworker_parse_global_max_reloads, KWF_DISCOVERY },
 	{ 0, NULL, NULL },
 }};
 

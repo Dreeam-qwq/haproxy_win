@@ -462,7 +462,7 @@ int quic_stateless_reset_token_cpy(unsigned char *pos, size_t len,
  */
 int quic_build_post_handshake_frames(struct quic_conn *qc)
 {
-	int ret = 0, max;
+	int ret = 0, max = 0;
 	struct quic_enc_level *qel;
 	struct quic_frame *frm, *frmbak;
 	struct list frm_list = LIST_HEAD_INIT(frm_list);
@@ -473,6 +473,8 @@ int quic_build_post_handshake_frames(struct quic_conn *qc)
 	qel = qc->ael;
 	/* Only servers must send a HANDSHAKE_DONE frame. */
 	if (qc_is_listener(qc)) {
+		size_t new_token_frm_len;
+
 		frm = qc_frm_alloc(QUIC_FT_HANDSHAKE_DONE);
 		if (!frm) {
 			TRACE_ERROR("frame allocation error", QUIC_EV_CONN_IO_CB, qc);
@@ -481,29 +483,23 @@ int quic_build_post_handshake_frames(struct quic_conn *qc)
 
 		LIST_APPEND(&frm_list, &frm->list);
 
-#ifdef HAVE_SSL_0RTT_QUIC
-		if (qc->li->bind_conf->ssl_conf.early_data) {
-			size_t new_token_frm_len;
-
-			frm = qc_frm_alloc(QUIC_FT_NEW_TOKEN);
-			if (!frm) {
-				TRACE_ERROR("frame allocation error", QUIC_EV_CONN_IO_CB, qc);
-				goto leave;
-			}
-
-			new_token_frm_len =
-				quic_generate_token(frm->new_token.data,
-				                    sizeof(frm->new_token.data), &qc->peer_addr);
-			if (!new_token_frm_len) {
-				TRACE_ERROR("token generation failed", QUIC_EV_CONN_IO_CB, qc);
-				goto leave;
-			}
-
-			BUG_ON(new_token_frm_len != sizeof(frm->new_token.data));
-			frm->new_token.len = new_token_frm_len;
-			LIST_APPEND(&frm_list, &frm->list);
+		frm = qc_frm_alloc(QUIC_FT_NEW_TOKEN);
+		if (!frm) {
+			TRACE_ERROR("frame allocation error", QUIC_EV_CONN_IO_CB, qc);
+			goto err;
 		}
-#endif
+
+		new_token_frm_len =
+			quic_generate_token(frm->new_token.data,
+			                    sizeof(frm->new_token.data), &qc->peer_addr);
+		if (!new_token_frm_len) {
+			TRACE_ERROR("token generation failed", QUIC_EV_CONN_IO_CB, qc);
+			goto err;
+		}
+
+		BUG_ON(new_token_frm_len != sizeof(frm->new_token.data));
+		frm->new_token.len = new_token_frm_len;
+		LIST_APPEND(&frm_list, &frm->list);
 	}
 
 	/* Initialize <max> connection IDs minus one: there is
@@ -815,11 +811,6 @@ struct task *quic_conn_io_cb(struct task *t, void *context, unsigned int state)
 		goto out;
 	}
 
-	if (qc->flags & QUIC_FL_CONN_TO_KILL) {
-		TRACE_DEVEL("connection to be killed", QUIC_EV_CONN_PHPKTS, qc);
-		goto out;
-	}
-
 	if ((qc->flags & QUIC_FL_CONN_DRAINING) &&
 	    !(qc->flags & QUIC_FL_CONN_IMMEDIATE_CLOSE))
 		goto out;
@@ -835,11 +826,20 @@ struct task *quic_conn_io_cb(struct task *t, void *context, unsigned int state)
 			qc_release_pktns_frms(qc, qc->hel->pktns);
 		}
 
-		/* Release 0RTT packets still waiting for HP removal. These
+		/* Note: if no token for address validation was received
+		 * for a 0RTT connection, some 0RTT packet could still be
+		 * waiting for HP removal AFTER the successful handshake completion.
+		 * Indeed a successful handshake completion implicitely valids
+		 * the peer address. In this case, one wants to process
+		 * these ORTT packets AFTER the succesful handshake completion.
+		 *
+		 * On the contrary, when a token for address validation was received,
+		 * release 0RTT packets still waiting for HP removal. These
 		 * packets are considered unneeded after handshake completion.
 		 * They will be freed later from Rx buf via quic_rx_pkts_del().
 		 */
-		if (qc->eel && !LIST_ISEMPTY(&qc->eel->rx.pqpkts)) {
+		if (qc->eel && !LIST_ISEMPTY(&qc->eel->rx.pqpkts) &&
+		    !(qc->flags & QUIC_FL_CONN_NO_TOKEN_RCVD)) {
 			struct quic_rx_packet *pqpkt, *pkttmp;
 			list_for_each_entry_safe(pqpkt, pkttmp, &qc->eel->rx.pqpkts, list) {
 				LIST_DEL_INIT(&pqpkt->list);
@@ -860,6 +860,14 @@ struct task *quic_conn_io_cb(struct task *t, void *context, unsigned int state)
 			 *
 			 * TODO implement discarding of 0-RTT keys
 			 */
+		}
+
+		/* Wake up connection layer if on wait-for-handshake. */
+		if (qc->subs && qc->subs->events & SUB_RETRY_RECV) {
+			tasklet_wakeup(qc->subs->tasklet);
+			qc->subs->events &= ~SUB_RETRY_RECV;
+			if (!qc->subs->events)
+				qc->subs = NULL;
 		}
 	}
 
@@ -892,25 +900,7 @@ struct task *quic_conn_io_cb(struct task *t, void *context, unsigned int state)
 		quic_nictx_free(qc);
 	}
 
-	if (qc->flags & QUIC_FL_CONN_SEND_RETRY) {
-		struct quic_counters *prx_counters;
-		struct proxy *prx = qc->li->bind_conf->frontend;
-		struct quic_rx_packet pkt = {
-			.scid = qc->dcid,
-			.dcid = qc->odcid,
-		};
-
-		prx_counters = EXTRA_COUNTERS_GET(prx->extra_counters_fe, &quic_stats_module);
-		if (send_retry(qc->li->rx.fd, &qc->peer_addr, &pkt, qc->original_version)) {
-			TRACE_ERROR("Error during Retry generation",
-			            QUIC_EV_CONN_LPKT, NULL, NULL, NULL, qc->original_version);
-		}
-		else
-			HA_ATOMIC_INC(&prx_counters->retry_sent);
-	}
-
-	if ((qc->flags & (QUIC_FL_CONN_CLOSING|QUIC_FL_CONN_TO_KILL)) &&
-	    qc->mux_state != QC_MUX_READY) {
+	if ((qc->flags & QUIC_FL_CONN_CLOSING) && qc->mux_state != QC_MUX_READY) {
 		quic_conn_release(qc);
 		qc = NULL;
 	}

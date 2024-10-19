@@ -3841,7 +3841,8 @@ int resolvers_create_default()
 {
 	int err_code = ERR_NONE;
 
-	if (global.mode & MODE_MWORKER_WAIT) /* does not create the section if in wait mode */
+	/* does not create the section if in master process */
+	if (master)
 		return ERR_NONE;
 
 	/* if the section already exists, do nothing */

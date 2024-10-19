@@ -37,6 +37,7 @@ struct acl_cond;
 #define CFG_PEERS	4
 #define CFG_CRTLIST	5
 #define CFG_CRTSTORE    6
+#define CFG_TRACES      7
 
 /* various keyword modifiers */
 enum kw_mod {
@@ -48,6 +49,7 @@ enum kw_mod {
 enum cfg_keyword_flags {
 	KWF_EXPERIMENTAL = 0x1,
 	KWF_MATCH_PREFIX = 0x2,
+	KWF_DISCOVERY = 0x4,
 };
 
 struct cfg_keyword {
@@ -110,6 +112,7 @@ extern struct proxy *curproxy;
 
 int cfg_parse_global(const char *file, int linenum, char **args, int inv);
 int cfg_parse_listen(const char *file, int linenum, char **args, int inv);
+int cfg_parse_traces(const char *file, int linenum, char **args, int inv);
 int cfg_parse_track_sc_num(unsigned int *track_sc_num,
                            const char *arg, const char *end, char **err);
 int parse_cfg(const struct cfgfile *cfg);

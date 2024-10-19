@@ -10,7 +10,6 @@
  *
  */
 #include <import/ebistree.h>
-#include <import/ebmbtree.h>
 
 #include <haproxy/api.h>
 #include <haproxy/cfgparse.h>
@@ -434,10 +433,17 @@ static void h1_trace(enum trace_level level, uint64_t mask, const struct trace_s
 				      (unsigned int)b_data(&h1c->ibuf), b_orig(&h1c->ibuf),
 				      (unsigned int)b_head_ofs(&h1c->ibuf), (unsigned int)b_size(&h1c->ibuf));
 		if (src->verbosity == H1_VERB_COMPLETE ||
-		    (src->verbosity == H1_VERB_ADVANCED && (mask & (H1_EV_H1C_SEND|H1_EV_STRM_SEND))))
+		    (src->verbosity == H1_VERB_ADVANCED && (mask & (H1_EV_H1C_SEND|H1_EV_STRM_SEND)))) {
 			chunk_appendf(&trace_buf, " obuf=%u@%p+%u/%u",
 				      (unsigned int)b_data(&h1c->obuf), b_orig(&h1c->obuf),
 				      (unsigned int)b_head_ofs(&h1c->obuf), (unsigned int)b_size(&h1c->obuf));
+
+			if (h1s && h1s->sd)
+				chunk_appendf(&trace_buf, " iobuf(.pipe=%d, .data=%u+%u, .flags=0x%x)",
+					      (h1s->sd->iobuf.pipe ? h1s->sd->iobuf.pipe->data : 0),
+					      (unsigned int)h1s->sd->iobuf.data, (unsigned int)h1s->sd->iobuf.offset,
+					      h1s->sd->iobuf.flags);
+		}
 	}
 
 	/* Display htx info if defined (level > USER) */
@@ -779,6 +785,22 @@ static void h1_set_idle_expiration(struct h1c *h1c)
 /*****************************************************************/
 /* functions below are dedicated to the mux setup and management */
 /*****************************************************************/
+/* Set EOI on stream connector in DONE state iff:
+ *  - it is a response
+ *  - it is a request and the response is DONE too
+ *  - it is a request but no a protocol upgrade nor a CONNECT
+ *
+ * If not set, Wait the response to do so or not depending on the status
+ * code.
+ */
+static inline void h1s_set_se_eoi_cond(struct h1s *h1s, const struct h1m *h1m)
+{
+
+	if ((h1m->state == H1_MSG_DONE) && ((h1m->flags & H1_MF_RESP) ||
+					    (h1s->res.state == H1_MSG_DONE) ||
+					    ((h1s->meth != HTTP_METH_CONNECT) && !(h1m->flags & H1_MF_CONN_UPG))))
+		se_fl_set(h1s->sd, SE_FL_EOI);
+}
 
 /* returns non-zero if there are input data pending for stream h1s. */
 static inline size_t h1s_data_pending(const struct h1s *h1s)
@@ -1044,6 +1066,7 @@ static int h1s_must_shut_conn(struct h1s *h1s)
 	}
 	else {
 		/* The default case, do the shutdown */
+		TRACE_STATE("shutdown on connection (abort || want_clo)", H1_EV_STRM_SHUT, h1c->conn, h1s);
 		ret = 1;
 	}
 
@@ -2234,18 +2257,7 @@ static size_t h1_process_demux(struct h1c *h1c, struct buffer *buf, size_t count
 		h1c->flags &= ~H1C_F_WANT_FASTFWD;
 	}
 
-	/* Set EOI on stream connector in DONE state iff:
-	 *  - it is a response
-	 *  - it is a request and the response is DONE too
-	 *  - it is a request but no a protocol upgrade nor a CONNECT
-	 *
-	 * If not set, Wait the response to do so or not depending on the status
-	 * code.
-	 */
-	if ((h1m->state == H1_MSG_DONE) && ((h1m->flags & H1_MF_RESP) ||
-					    (h1s->res.state == H1_MSG_DONE) ||
-					    ((h1s->meth != HTTP_METH_CONNECT) && !(h1m->flags & H1_MF_CONN_UPG))))
-		se_fl_set(h1s->sd, SE_FL_EOI);
+	h1s_set_se_eoi_cond(h1s, h1m);
 
   out:
 	/* When Input data are pending for this message, notify upper layer that
@@ -5005,10 +5017,7 @@ static int h1_fastfwd(struct stconn *sc, unsigned int count, unsigned int flags)
 		if (!h1m->curr_len) {
 			if (h1m->flags & H1_MF_CLEN) {
 				h1m->state = H1_MSG_DONE;
-				se_fl_set(h1s->sd, SE_FL_EOI); /* TODO: this line is tricky and must be evaluated first
-								*       Its purpose is to avoid to set CO_SFL_MSG_MORE on the
-								*       next calls to ->complete_fastfwd().
-								*/
+				h1s_set_se_eoi_cond(h1s, h1m);
 			}
 			else
 				h1m->state = H1_MSG_CHUNK_CRLF;

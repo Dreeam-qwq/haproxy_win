@@ -216,6 +216,7 @@ struct qcc_app_ops {
 #define QC_CF_CONN_FULL 0x00000008 /* no stream buffers available on connection */
 #define QC_CF_APP_SHUT  0x00000010 /* Application layer shutdown done. */
 #define QC_CF_ERR_CONN  0x00000020 /* fatal error reported by transport layer */
+#define QC_CF_WAIT_FOR_HS 0x00000040 /* QUIC handshake has been completed */
 
 /* This function is used to report flags in debugging tools. Please reflect
  * below any single-bit flag addition above in the same order via the
@@ -243,7 +244,7 @@ static forceinline char *qcc_show_flags(char *buf, size_t len, const char *delim
 #define QC_SF_FIN_STREAM        0x00000002  /* FIN bit must be set for last frame of the stream */
 #define QC_SF_BLK_MROOM         0x00000004  /* app layer is blocked waiting for room in the qcs.tx.buf */
 #define QC_SF_DETACH            0x00000008  /* sc is detached but there is remaining data to send */
-/* unused 0x00000010 */
+#define QC_SF_TXBUB_OOB         0x00000010  /* stream reserved for metadata out-of-band transmission; txbuf allocation is unrestricted */
 #define QC_SF_DEM_FULL          0x00000020  /* demux blocked on request channel buffer full */
 #define QC_SF_READ_ABORTED      0x00000040  /* Rx closed using STOP_SENDING*/
 #define QC_SF_TO_RESET          0x00000080  /* a RESET_STREAM must be sent */

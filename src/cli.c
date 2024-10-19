@@ -26,6 +26,10 @@
 
 #include <net/if.h>
 
+#if defined(USE_SYSTEMD)
+#include <haproxy/systemd.h>
+#endif
+
 #include <haproxy/api.h>
 #include <haproxy/applet.h>
 #include <haproxy/base64.h>
@@ -2463,6 +2467,48 @@ static int cli_parse_simple(char **args, char *payload, struct appctx *appctx, v
 	return 1;
 }
 
+static int _send_status(char **args, char *payload, struct appctx *appctx, void *private)
+{
+	struct mworker_proc *proc;
+	int pid;
+
+	BUG_ON((strcmp(args[0], "_send_status") != 0),
+		"Triggered in _send_status by unsupported command name.\n");
+
+	pid = atoi(args[2]);
+
+	list_for_each_entry(proc, &proc_list, list) {
+		/* update status of the new worker */
+		if (proc->pid == pid)
+			proc->options &= ~PROC_O_INIT;
+		/* send TERM to workers, which have exceeded max_reloads counter */
+		if (max_reloads != -1) {
+			if ((proc->options & PROC_O_TYPE_WORKER) &&
+				(proc->options & PROC_O_LEAVING) &&
+				(proc->reloads > max_reloads) && (proc->pid > 0)) {
+				kill(proc->pid, SIGTERM);
+			}
+
+		}
+	}
+	/* stop previous worker process, if it wasn't signaled during max reloads check */
+	list_for_each_entry(proc, &proc_list, list) {
+		if ((proc->options & PROC_O_TYPE_WORKER) &&
+			(proc->options & PROC_O_LEAVING) &&
+			(proc->reloads >= 1)) {
+			kill(proc->pid, oldpids_sig);
+		}
+	}
+	setenv("HAPROXY_LOAD_SUCCESS", "1", 1);
+	ha_notice("Loading success.\n");
+
+#if defined(USE_SYSTEMD)
+	if (global.tune.options & GTUNE_USE_SYSTEMD)
+		sd_notifyf(0, "READY=1\nMAINPID=%lu\nSTATUS=Ready.\n", (unsigned long)getpid());
+#endif
+	return 1;
+}
+
 void pcli_write_prompt(struct stream *s)
 {
 	struct buffer *msg = get_trash_chunk();
@@ -3230,9 +3276,11 @@ int pcli_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 		s->store_count = 0;
 		s->uniq_id = _HA_ATOMIC_FETCH_ADD(&global.req_count, 1);
 
-		s->scf->flags &= ~(SC_FL_EOS|SC_FL_ERROR|SC_FL_ABRT_DONE|SC_FL_ABRT_WANTED);
+		s->scf->flags &= ~(SC_FL_EOI|SC_FL_EOS|SC_FL_ERROR|SC_FL_ABRT_DONE|SC_FL_ABRT_WANTED);
 		s->scf->flags &= ~SC_FL_SND_NEVERWAIT;
 		s->scf->flags |= SC_FL_RCV_ONCE; /* one read is usually enough */
+
+		se_have_more_data(s->scf->sedesc);
 
 		s->req.flags |= CF_WAKE_ONCE; /* need to be called again if there is some command left in the request */
 
@@ -3384,7 +3432,7 @@ error_proxy:
 /*
  * Create a new listener for the master CLI proxy
  */
-struct bind_conf *mworker_cli_proxy_new_listener(char *line)
+struct bind_conf *mworker_cli_master_proxy_new_listener(char *line)
 {
 	struct bind_conf *bind_conf;
 	struct listener *l;
@@ -3485,21 +3533,16 @@ err:
 }
 
 /*
- * Create a new CLI socket using a socketpair for a worker process
- * <mworker_proc> is the process structure, and <proc> is the process number
+ * Creates a "master-socket" bind conf and a listener. Assigns
+ * this new listener to the one "end" of the given process <proc> sockpair in
+ * order to have a new master CLI listening socket for this process.
  */
-int mworker_cli_sockpair_new(struct mworker_proc *mworker_proc, int proc)
+int mworker_cli_global_proxy_new_listener(struct mworker_proc *proc)
 {
 	struct bind_conf *bind_conf;
 	struct listener *l;
 	char *path = NULL;
 	char *err = NULL;
-
-	/* master pipe to ensure the master is still alive  */
-	if (socketpair(AF_UNIX, SOCK_STREAM, 0, mworker_proc->ipc_fd) < 0) {
-		ha_alert("Cannot create worker socketpair.\n");
-		return -1;
-	}
 
 	/* XXX: we might want to use a separate frontend at some point */
 	if (!global.cli_fe) {
@@ -3517,14 +3560,14 @@ int mworker_cli_sockpair_new(struct mworker_proc *mworker_proc, int proc)
 	bind_conf->level |= ACCESS_LVL_ADMIN; /* TODO: need to lower the rights with a CLI keyword*/
 	bind_conf->level |= ACCESS_FD_LISTENERS;
 
-	if (!memprintf(&path, "sockpair@%d", mworker_proc->ipc_fd[1])) {
+	if (!memprintf(&path, "sockpair@%d", proc->ipc_fd[1])) {
 		ha_alert("Cannot allocate listener.\n");
 		goto error;
 	}
 
 	if (!str2listener(path, global.cli_fe, bind_conf, "master-socket", 0, &err)) {
 		free(path);
-		ha_alert("Cannot create a CLI sockpair listener for process #%d\n", proc);
+		ha_alert("Cannot create a CLI sockpair listener.\n");
 		goto error;
 	}
 	ha_free(&path);
@@ -3546,8 +3589,8 @@ int mworker_cli_sockpair_new(struct mworker_proc *mworker_proc, int proc)
 	return 0;
 
 error:
-	close(mworker_proc->ipc_fd[0]);
-	close(mworker_proc->ipc_fd[1]);
+	close(proc->ipc_fd[0]);
+	close(proc->ipc_fd[1]);
 	free(err);
 
 	return -1;
@@ -3597,6 +3640,7 @@ static struct cli_kw_list cli_kws = {{ },{
 	{ { "operator", NULL },                  "operator                                : lower the level of the current CLI session to operator",  cli_parse_set_lvl, NULL, NULL, NULL, ACCESS_MASTER},
 	{ { "user", NULL },                      "user                                    : lower the level of the current CLI session to user",      cli_parse_set_lvl, NULL, NULL, NULL, ACCESS_MASTER},
 	{ { "wait", NULL },                      "wait {-h|<delay_ms>} cond [args...]     : wait the specified delay or condition (-h to see list)",  cli_parse_wait, cli_io_handler_wait, cli_release_wait, NULL },
+	{ { "_send_status", NULL },              NULL,  											      _send_status, NULL, NULL, NULL, ACCESS_MASTER_ONLY },
 	{{},}
 }};
 

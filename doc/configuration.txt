@@ -3,7 +3,7 @@
                           Configuration Manual
                          ----------------------
                               version 3.1
-                              2024/09/18
+                              2024/10/16
 
 
 This document covers the configuration language as implemented in the version
@@ -52,6 +52,7 @@ Summary
 3.1.      Process management and security
 3.2.      Performance tuning
 3.3.      Debugging
+3.3.1.    Traces
 3.4.      Userlists
 3.5.      Peers
 3.6.      Mailers
@@ -2903,25 +2904,6 @@ thread-hard-limit <number>
   and a warning is emitted in so that the configuration anomaly can be
   fixed. By default there is no limit. See also "nbthread".
 
-trace <args...>
-  This command configures one "trace" subsystem statement. Each of them can be
-  found in the management manual, and follow the exact same syntax. Only one
-  statement per line is permitted (i.e. if some long trace configurations using
-  semi-colons are to be imported, they must be placed one per line). Any output
-  that the "trace" command would produce will be emitted during the parsing
-  step of the section. Most of the time these will be errors and warnings, but
-  certain incomplete commands might list permissible choices. This command is
-  not meant for regular use, it will generally only be suggested by developers
-  along complex debugging sessions. For this reason it is internally marked as
-  experimental, meaning that "expose-experimental-directives" must appear on a
-  line before any "trace" statement. Note that these directives are parsed on
-  the fly, so referencing a ring buffer that is only declared further will not
-  work. For such use cases it is suggested to place another "global" section
-  with only the "trace" statements after the declaration of that ring. It is
-  important to keep in mind that depending on the trace level and details,
-  enabling traces can severely degrade the global performance. Please refer to
-  the management manual for the statements syntax.
-
 uid <number>
   Changes the process's user ID to <number>. It is recommended that the user ID
   is dedicated to HAProxy or to a small set of similar daemons. HAProxy must
@@ -3443,7 +3425,8 @@ tune.h2.be.initial-window-size <number>
   not set, the common default value set by tune.h2.initial-window-size applies.
   It can make sense to slightly increase this value to allow faster downloads
   or to reduce CPU usage on the servers, at the expense of creating unfairness
-  between clients. It doesn't affect resource usage.
+  between clients. It is better to use tune.h2.be.rxbuf instead, which does not
+  cause any unfairness. It doesn't affect resource usage.
 
   See also: tune.h2.initial-window-size.
 
@@ -3460,6 +3443,22 @@ tune.h2.be.max-concurrent-streams <number>
   clients sharing a connection (keep tune.h2.be.initial-window-size low in this
   case). It is highly recommended not to increase this value; some might find
   it optimal to run at low values (1..5 typically).
+
+tune.h2.be.rxbuf <size>
+  Sets the HTTP/2 receive buffer size for outgoing connections, in bytes. This
+  size will be rounded up to the next multiple of tune.bufsize and will be
+  shared between all streams uploading data (both HEADERS and DATA frames). In
+  any case, one buffer will always be granted to each stream, and 7/8 of the
+  unused buffers will be shared between streams downloading payload, allowing
+  to significantly improve upload performance and avoid head-of-line blocking
+  (HoL) on backend connections shared between multiple clients when http-reuse
+  is set to "always". The advertised per-stream window is automatically
+  adjusted to reflect the available space so that in practice it should not be
+  required to touch tune.h2.be.initial-window-size. If less than the size
+  required to deal with all streams is set, this minimum will be used. The
+  default value is about 1600k (100 streams with 16kB buffers each).
+
+  See also: tune.h2.be.initial-window-size, tune.h2.fe.rxbuf, http-reuse.
 
 tune.h2.fe.glitches-threshold <number>
   Sets the threshold for the number of glitches on a frontend connection, where
@@ -3479,11 +3478,12 @@ tune.h2.fe.initial-window-size <number>
   from HAProxy. This setting only affects payload contents (i.e. the body of
   POST requests), not headers. When not set, the common default value set by
   tune.h2.initial-window-size applies. It can make sense to increase this value
-  to allow faster uploads. The default value of 65536 allows up to 5 Mbps of
-  bandwidth per client over a 100 ms ping time, and 500 Mbps for 1 ms ping
-  time. It doesn't affect resource usage. Using too large values may cause
-  clients to experience a lack of responsiveness if pages are accessed in
-  parallel to large uploads.
+  to allow faster uploads. The default value equals tune.bufsize (16384) and
+  allows at least 1.25 Mbps of bandwidth per stream over a 100 ms ping time,
+  and 125 Mbps for 1 ms ping time. It doesn't affect resource usage. Using too
+  large values may cause clients to experience a lack of responsiveness if
+  pages are accessed in parallel to large uploads. It is better to use
+  tune.h2.fe.rxbuf instead, which does not cause any unfairness.
 
   See also: tune.h2.initial-window-size.
 
@@ -3532,6 +3532,21 @@ tune.h2.fe.max-total-streams <number>
   errors with this setting; as such it may be needed to disable it when running
   performance benchmarks. See also "tune.h2.fe.max-concurrent-streams".
 
+tune.h2.fe.rxbuf <size>
+  Sets the HTTP/2 receive buffer size for incoming connections, in bytes. This
+  size will be rounded up to the next multiple of tune.bufsize and will be
+  shared between all streams uploading data (both HEADERS and DATA frames). In
+  any case, one buffer will always be granted to each stream, and 7/8 of the
+  unused buffers will be shared between streams uploading payload, allowing to
+  significantly improve upload performance. The advertised per-stream window is
+  automatically adjusted to reflect the available space so that in practice it
+  should not be required to touch tune.h2.fe.initial-window-size. If less than
+  the size required to deal with all streams is set, this minimum will be used.
+  The default value of 1600k (100 streams with 16kB buffers each) permits
+  roughly 130 Mbps of upload speed for a client with a 100ms RTT.
+
+  See also: tune.h2.fe.initial-window-size and tune.h2.be.rxbuf.
+
 tune.h2.header-table-size <number>
   Sets the HTTP/2 dynamic header table size. It defaults to 4096 bytes and
   cannot be larger than 65536 bytes. A larger value may help certain clients
@@ -3543,12 +3558,17 @@ tune.h2.initial-window-size <number>
   Sets the default value for the HTTP/2 initial window size, on both incoming
   and outgoing connections. This value is used for incoming connections when
   tune.h2.fe.initial-window-size is not set, and by outgoing connections when
-  tune.h2.be.initial-window-size is not set. The default value is 65536, which
-  for uploads roughly allows up to 5 Mbps of bandwidth per client over a
-  network showing a 100 ms ping time, or 500 Mbps over a 1-ms local network.
-  Given that changing the default value will both increase upload speeds and
-  cause more unfairness between clients on downloads, it is recommended to
-  instead use the side-specific settings tune.h2.fe.initial-window-size and
+  tune.h2.be.initial-window-size is not set. This setting is used both as the
+  initial value and as a minimum per stream. The default value equals 16384
+  (tune.bufsize), which for uploads roughly allows at least 1.25 Mbps of
+  bandwidth per stream over a network showing a 100 ms ping time, or 125 Mbps
+  over a 1-ms local network. When less receive buffers than the maximum are in
+  use, within the limits defined by tune.h2.be.rxbuf and tune.h2.fe.rxbuf,
+  unused buffers will be shared between receiving streams. As such there is
+  normally no point in changing this default setting. Given that changing this
+  default value will both increase upload speeds and cause more unfairness
+  between clients on downloads, it is recommended to instead use the side-
+  specific settings tune.h2.fe.initial-window-size and
   tune.h2.be.initial-window-size.
 
 tune.h2.max-concurrent-streams <number>
@@ -4322,6 +4342,23 @@ anonkey <key>
   from the CLI command "set anon global-key". See also command line argument
   "-dC" in the management manual.
 
+force-cfg-parser-pause <timeout>
+  This command is pausing the configuration parser for <timeout> milliseconds.
+  This is useful for development or for testing timeouts of init scripts,
+  particularly to simulate a very long reload.
+  It requires the expose-experimental-directives to be set.
+
+  <timeout> is the timeout value specified in milliseconds by default, but
+              can be in any other unit if the number is suffixed by the unit,
+              as explained at the top of this document.
+
+  Example:
+
+    global
+        expose-experimental-directives
+        force-cfg-parser-pause 10s
+
+
 quick-exit
   This speeds up the old process exit upon reload by skipping the releasing of
   memory objects and listeners, since all of these are reclaimed by the
@@ -4350,6 +4387,49 @@ zero-warning
   report errors in such a case. This option is equivalent to command line
   argument "-dW".
 
+3.3.1. Traces
+-------------
+
+For debugging purpose, it is possible to activate traces on an HAProxy's
+subsystem. This will dump debug messages about a specific subsystem. It is a
+very powerful tool to diagnose issues. Traces can be dynamically configured via
+the CLI. It is also possible to predefined some settings in the configuration
+file, in dedicated "traces" sections. More details about traces can be found in
+the management guide. It remains a developper tools used during complex
+debugging sessions.  It is pretty verbose and have a cost, so use it with
+caution. And because it is a developper tool, there is no warranty about the
+backward compatibility of this section.
+
+traces
+  Starts a new traces section. One or multiple "traces" section may be
+  used. All direcitives are evaluated in the declararion order, the last ones
+  overriding previous ones.
+
+trace <source> <args...>
+  Configures on "trace" subsystem. Each of them can be found in the management
+  manual, and follow the exact same syntax. Any output that the "trace"
+  command would produce will be emitted during the parsing step of the
+  section. Most of the time these will be errors and warnings, but certain
+  incomplete commands might list permissible choices. This command is not meant
+  for regular use, it will generally only be suggested by developers along
+  complex debugging sessions. It is important to keep in mind that depending on
+  the trace level and details, enabling traces can severely degrade the global
+  performance. Please refer to the management manual for the statements syntax.
+
+  Example:
+    ring buf1
+      size 10485760 # 10MB
+      format timed
+      backing-file /tmp/h1.traces
+
+    ring buf2
+      size 10485760 # 10MB
+      format timed
+      backing-file /tmp/h2.traces
+
+    traces
+      trace h1 sink buf1 level developer verbosity complete start now
+      trace h2 sink buf1 level developer verbosity complete start now
 
 3.4. Userlists
 --------------
@@ -9251,16 +9331,16 @@ no option forwarded
     <host_expr>     optional argument to specify a custom sample expression
                     those result will be used as 'host' parameter value
 
-    <by_expr>       optional argument to specicy a custom sample expression
+    <by_expr>       optional argument to specify a custom sample expression
                     those result will be used as 'by' parameter nodename value
 
-    <for_expr>      optional argument to specicy a custom sample expression
+    <for_expr>      optional argument to specify a custom sample expression
                     those result will be used as 'for' parameter nodename value
 
-    <by_port_expr>  optional argument to specicy a custom sample expression
+    <by_port_expr>  optional argument to specify a custom sample expression
                     those result will be used as 'by' parameter nodeport value
 
-    <for_port_expr> optional argument to specicy a custom sample expression
+    <for_port_expr> optional argument to specify a custom sample expression
                     those result will be used as 'for' parameter nodeport value
 
 
@@ -9831,6 +9911,7 @@ option httpchk
 option httpchk <uri>
 option httpchk <method> <uri>
 option httpchk <method> <uri> <version>
+option httpchk <method> <uri> <version> <host>
   Enables HTTP protocol to check on the servers health
 
   May be used in the following contexts: tcp, http
@@ -9852,7 +9933,10 @@ option httpchk <method> <uri> <version>
     <version> is the optional HTTP version string. It defaults to "HTTP/1.0"
               but some servers might behave incorrectly in HTTP 1.0, so turning
               it to HTTP/1.1 may sometimes help. Note that the Host field is
-              mandatory in HTTP/1.1, use "http-check send" directive to add it.
+              mandatory in HTTP/1.1.
+
+    <host>    is the optional HTTP Host header value. It is not set by default.
+              It is a log-format string.
 
   By default, server health checks only consist in trying to establish a TCP
   connection. When "option httpchk" is specified, a complete HTTP request is
@@ -14554,6 +14638,7 @@ del-map                        -           -     -     -     -            X   X 
 deny                           -           -     -     -     -            X   X   -
 dgram-drop                     X           -     -     -     -            -   -   -
 disable-l7-retry               -           -     -     -     -            X   -   -
+do-log                         X           X     X     X     X            X   X   X
 do-resolve                     -           -     -     X     -            X   -   -
 early-hint                     -           -     -     -     -            X   -   -
 expect-netscaler-cip           -           X     -     -     -            -   -   -
@@ -14595,6 +14680,7 @@ set-priority-class             -           -     -     X     -            X   - 
 set-priority-offset            -           -     -     X     -            X   -   -
 --keyword---------------QUIC--Ini---TCP--RqCon-RqSes-RqCnt-RsCnt---HTTP--Req-Res-Aft-
 set-query                      -           -     -     -     -            X   -   -
+set-retries                    -           -     -     X     -            X   -   -
 set-src                        -           X     X     X     -            X   -   -
 set-src-port                   -           X     X     X     -            X   -   -
 set-status                     -           -     -     -     -            -   X   X
@@ -14853,6 +14939,33 @@ disable-l7-retry
   reason than a connection failure. This can be useful for example to make
   sure POST requests aren't retried on failure.
 
+do-log
+  Usable in:  QUIC Ini|    TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
+                    X |          X  |   X  |   X  |   X  |          X |  X |  X
+
+  This action manually triggers a log emission on the proxy. This means
+  log options on the proxy will be considered (including formatting options
+  such as "log-format"), but it will not interfere with the logs automatically
+  generated by the proxy during transaction handling. It currently doesn't
+  support any argument, though extensions may appear in future versions.
+
+  Using "log-profile", it is possible to precisely describe how the log should
+  be emitted for each of the available contexts where the action may be used.
+  That is, 'on' keyword followed by of the following values: 'quic-init',
+  'tcp-req-conn', 'tcp-req-sess', 'tcp-req-cont', 'tcp-res-cont', 'http-req',
+  'http-res', 'http-after-res'.
+
+  Also, they will be properly reported when using "%OG" logformat alias.
+
+  Example:
+    log-profile myprof
+      on tcp-req-conn format "Connect: %ci"
+
+    frontend myfront
+      log stdout format rfc5424 profile myprof local0
+      log-format "log generated using proxy logformat, from '%OG'"
+      tcp-request connection do-log             #uses special log-profile format
+      tcp-request content do-log                #uses proxy logformat
 
 do-resolve(<var>,<resolvers>,[ipv4,ipv6]) <expr>
   Usable in:  QUIC Ini|    TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
@@ -15771,6 +15884,22 @@ set-query <fmt>
     # replace "%3D" with "=" in the query string
     http-request set-query %[query,regsub(%3D,=,g)]
 
+
+set-retries <int> | <epxr>
+  Usable in:  QUIC Ini|    TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
+                    - |          -  |   -  |   X  |   -  |          X |  - |  -
+
+  This action overrides the specified "retries" value for the current stream
+  only. It can be an integer value, in the range [0, 100], or an expression
+  which must return a integer in the range [0, 100].
+
+  Note that this action is only relevant on the backend side and thus this rule
+  is only available for the proxies with backend capability. It is also not
+  allowed in "defaults" sections.
+
+  Example:
+    tcp-request content set-retries 3
+    http-request set-retries var(txn.retries)
 
 set-src <expr>
   Usable in:  QUIC Ini|    TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
@@ -19631,6 +19760,8 @@ rfc7239_field(field)                               string       string
 rfc7239_is_valid                                   string       boolean
 rfc7239_n2nn                                       string       address / str
 rfc7239_n2np                                       string       integer / str
+rfc7239_nn                                         address/str  string
+rfc7239_np                                         integer/str  string
 rtrim(chars)                                       string       string
 sdbm([avalanche])                                  binary       integer
 secure_memcmp(var)                                 string       boolean
@@ -20708,6 +20839,52 @@ rfc7239_n2np
     #  output: 9998 (integer)
     #input: "_name:_port"
     #  output: "_port" (string)
+
+rfc7239_nn
+  Converts provided address / string input into RFC7239-compliant node name.
+  It may be used to manually build 'for' or 'by' 7239 header fields.
+
+  When provided input is string, it will be automatically prefixed with '_'
+  char to represent obfuscated identifier. String must comply with RFC7239
+  charset. If string is empty, it will be converter to "unknown" identifier.
+
+  Example:
+    #input: ipv6(ab:cd:ff:ff:ff:ff:ff:ff)
+    #  output: "[ab:cd:ff:ff:ff:ff:ff:ff]"
+    #input: str(test)
+    #  output: "_test"
+    #input: str()
+    #  output: "unknown"
+
+  See also: "rfc7239_np"
+
+rfc7239_np
+  Converts provided unsigned integer / string input into RFC7239-compliant node
+  port. It may be used to manually build 'for' or 'by' 7239 header fields.
+
+  When provided input is string, it will be automatically prefixed with '_'
+  char to represent obfuscated identifier. String must comply with RFC7239
+  charset and cannot be empty.
+
+  Example:
+    #input: int(12)
+    #  output: "12"
+    #input: str(test)
+    #  output: "_test"
+
+    # build 'for' forwarded header field
+    http-request set-var-fmt(txn.test) "for=\"%[ipv6(::1),rfc7239_nn]:%[int(8080),rfc7239_np]\";"
+    #  output: "for=\"[::1]:8080\";"
+
+    # build RFC-compliant 7239 header:
+    http-request set-var-fmt(txn.forwarded) "for=\"%[ipv6(::1),rfc7239_nn]:%[str(8888),rfc7239_np]\";host=\"haproxy.org\";proto=http"
+    # check RFC-compliancy:
+    http-request set-var(txn.test) "var(txn.forwarded),debug(test,stderr),rfc7239_is_valid,debug(test,stderr)"
+    #  stderr output:
+    #    [debug] test: type=str <for="[::1]:_8888";host="haproxy.org";proto=http>
+    #    [debug] test: type=bool <1>
+
+  See also: "rfc7239_nn"
 
 rtrim(<chars>)
   Skips any characters from <chars> from the end of the string representation
@@ -26833,6 +27010,8 @@ on <step> [drop] [format <fmt>] [sd <sd_fmt>]
                  to a transaction error
   - "any"      : override both log-format and error-log-format for all logging
                  steps, unless a more precise step override is declared.
+
+  See "do-log" action for relevant additional <step> values.
 
   This setting is only relevant for "log" directives used from contexts where
   using "log-format" directive makes sense (e.g.: http and tcp proxies).

@@ -2027,6 +2027,9 @@ void srv_shutdown_streams(struct server *srv, int why)
 		MT_LIST_FOR_EACH_ENTRY_LOCKED(stream, &srv->per_thr[thr].streams, by_srv, back)
 			if (stream->srv_conn == srv)
 				stream_shutdown(stream, why);
+
+	/* also kill the possibly pending streams in the queue */
+	pendconn_redistribute(srv);
 }
 
 /* Shutdown all connections of all backup servers of a proxy. The caller must
@@ -5112,8 +5115,8 @@ const char *srv_update_fqdn(struct server *server, const char *fqdn, const char 
 		goto out;
 	}
 
-	/* Flag as FQDN set from stats socket. */
-	server->next_admin |= SRV_ADMF_HMAINT;
+	/* Flag as FQDN changed (e.g.: set from stats socket or resolvers) */
+	server->next_admin |= SRV_ADMF_FQDN_CHANGED;
 
  out:
 	if (updater)

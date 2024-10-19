@@ -681,7 +681,7 @@ int assign_server(struct stream *s)
 		/* if there's some queue on the backend, with certain algos we
 		 * know it's because all servers are full.
 		 */
-		if (s->be->queue.length && s->be->queue.length != s->be->beconn &&
+		if (s->be->queue.length && s->be->served && s->be->queue.length != s->be->beconn &&
 		    (((s->be->lbprm.algo & (BE_LB_KIND|BE_LB_NEED|BE_LB_PARM)) == BE_LB_ALGO_FAS)||   // first
 		     ((s->be->lbprm.algo & (BE_LB_KIND|BE_LB_NEED|BE_LB_PARM)) == BE_LB_ALGO_RR) ||   // roundrobin
 		     ((s->be->lbprm.algo & (BE_LB_KIND|BE_LB_NEED|BE_LB_PARM)) == BE_LB_ALGO_SRR))) { // static-rr
@@ -1324,7 +1324,7 @@ static int do_connect_server(struct stream *s, struct connection *conn)
 
 	if (co_data(&s->res))
 		conn_flags |= CONNECT_HAS_DATA;
-	if (s->conn_retries == s->be->conn_retries)
+	if (s->conn_retries == s->max_retries)
 		conn_flags |= CONNECT_CAN_USE_TFO;
 	if (!conn_ctrl_ready(conn) || !conn_xprt_ready(conn)) {
 		ret = conn->ctrl->connect(conn, conn_flags);
@@ -2402,13 +2402,13 @@ void back_handle_st_cer(struct stream *s)
 			 * provided by the client and we don't want to let the
 			 * client provoke retries.
 			 */
-			s->conn_retries = s->be->conn_retries;
+			s->conn_retries = s->max_retries;
 			DBG_TRACE_DEVEL("Bad SSL cert, disable connection retries", STRM_EV_STRM_PROC|STRM_EV_CS_ST|STRM_EV_STRM_ERR, s);
 		}
 	}
 
 	/* ensure that we have enough retries left */
-	if (s->conn_retries >= s->be->conn_retries || !(s->be->retry_type & PR_RE_CONN_FAILED)) {
+	if (s->conn_retries >= s->max_retries || !(s->be->retry_type & PR_RE_CONN_FAILED)) {
 		if (!s->conn_err_type) {
 			s->conn_err_type = STRM_ET_CONN_ERR;
 		}

@@ -2565,6 +2565,10 @@ next_line:
 		if (pcs && pcs->post_section_parser) {
 			int status;
 
+			/* don't call post_section_parser in MODE_DISCOVERY, except program section */
+			if ((global.mode & MODE_DISCOVERY) && (strcmp(pcs->section_name, "program") != 0))
+				continue;
+
 			status = pcs->post_section_parser();
 			err_code |= status;
 			if (status & ERR_FATAL)
@@ -2576,11 +2580,19 @@ next_line:
 		pcs = NULL;
 
 		if (!cs) {
+			/* ignore unknown section names during the first read in MODE_DISCOVERY */
+			if (global.mode & MODE_DISCOVERY)
+				continue;
 			ha_alert("parsing [%s:%d]: unknown keyword '%s' out of section.\n", file, linenum, args[0]);
 			err_code |= ERR_ALERT | ERR_FATAL;
 			fatal++;
 		} else {
 			int status;
+
+			/* read only the "global" and "program" sections in MODE_DISCOVERY */
+			if (((global.mode & MODE_DISCOVERY) && (strcmp(cs->section_name, "global") != 0)
+			     && (strcmp(cs->section_name, "program") != 0)))
+				continue;
 
 			status = cs->section_parser(file, linenum, args, kwm);
 			err_code |= status;
@@ -4937,6 +4949,7 @@ REGISTER_CONFIG_SECTION("userlist",       cfg_parse_users,     NULL);
 REGISTER_CONFIG_SECTION("peers",          cfg_parse_peers,     NULL);
 REGISTER_CONFIG_SECTION("mailers",        cfg_parse_mailers,   NULL);
 REGISTER_CONFIG_SECTION("namespace_list", cfg_parse_netns,     NULL);
+REGISTER_CONFIG_SECTION("traces",         cfg_parse_traces,    NULL);
 
 static struct cfg_kw_list cfg_kws = {{ },{
 	{ CFG_GLOBAL, "default-path",     cfg_parse_global_def_path },

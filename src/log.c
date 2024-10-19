@@ -5185,6 +5185,61 @@ out:
 }
 
 /*
+ * opportunistic log when at least the session is known to exist
+ * <s> may be NULL
+ *
+ * Will not log if the frontend has no log defined. By default it will
+ * try to emit the log as INFO, unless the stream already exists and
+ * set-log-level was used.
+ */
+void do_log(struct session *sess, struct stream *s, struct log_orig origin)
+{
+	int size;
+	int sd_size = 0;
+	int level = -1;
+
+	if (LIST_ISEMPTY(&sess->fe->loggers))
+		return;
+
+	if (s) {
+		if (s->logs.level) { /* loglevel was overridden */
+			if (s->logs.level == -1) {
+				/* log disabled */
+				return;
+			}
+			level = s->logs.level - 1;
+		}
+		/* if unique-id was not generated */
+		if (!isttest(s->unique_id) && !lf_expr_isempty(&sess->fe->format_unique_id)) {
+			stream_generate_unique_id(s, &sess->fe->format_unique_id);
+		}
+	}
+
+	if (level == -1) {
+		level = LOG_INFO;
+		if ((origin.flags & LOG_ORIG_FL_ERROR) &&
+		    (sess->fe->options2 & PR_O2_LOGERRORS))
+			level = LOG_ERR;
+	}
+
+	if (!lf_expr_isempty(&sess->fe->logformat_sd)) {
+		sd_size = sess_build_logline_orig(sess, s, logline_rfc5424, global.max_syslog_len,
+		                                  &sess->fe->logformat_sd, origin);
+	}
+
+	size = sess_build_logline_orig(sess, s, logline, global.max_syslog_len, &sess->fe->logformat, origin);
+	if (size > 0) {
+		struct process_send_log_ctx ctx;
+
+		ctx.origin = origin;
+		ctx.sess = sess;
+		ctx.stream = s;
+		__send_log(&ctx, &sess->fe->loggers, &sess->fe->log_tag, level,
+			   logline, size + 1, logline_rfc5424, sd_size);
+	}
+}
+
+/*
  * send a log for the stream when we have enough info about it.
  * Will not log if the frontend has no log defined.
  */
@@ -6724,6 +6779,36 @@ static int px_parse_log_steps(char **args, int section_type, struct proxy *curpx
 
  end:
 	return retval;
+}
+
+/* needed by do_log_parse_act() */
+static enum act_return do_log_action(struct act_rule *rule, struct proxy *px,
+                                     struct session *sess, struct stream *s, int flags)
+{
+	/* do_log() expects valid session pointer */
+	BUG_ON(sess == NULL);
+
+	do_log(sess, s, log_orig(rule->arg.expr_int.value, LOG_ORIG_FL_NONE));
+	return ACT_RET_CONT;
+}
+
+/* Parse a "do_log" action. It doesn't take any argument
+ * May be used from places where per-context actions are usually registered
+ */
+enum act_parse_ret do_log_parse_act(enum log_orig_id id,
+                                    const char **args, int *orig_arg, struct proxy *px,
+                                    struct act_rule *rule, char **err)
+{
+	if (*args[*orig_arg]) {
+		memprintf(err, "doesn't expects any argument");
+		return ACT_RET_PRS_ERR;
+	}
+
+	rule->action_ptr = do_log_action;
+	rule->action = ACT_CUSTOM;
+	rule->release_ptr = NULL;
+	rule->arg.expr_int.value = id;
+	return ACT_RET_PRS_OK;
 }
 
 static struct cfg_kw_list cfg_kws_li = {ILH, {
