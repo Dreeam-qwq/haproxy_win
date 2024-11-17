@@ -651,30 +651,30 @@ int listeners_setenv(struct proxy *frontend, const char *varname)
 				char addr[46];
 				char port[6];
 
-				/* separate listener by semicolons */
-				if (trash->data)
-					chunk_appendf(trash, ";");
-
-				if (l->rx.addr.ss_family == AF_UNIX) {
+				if (l->rx.addr.ss_family == AF_UNIX ||
+				    l->rx.addr.ss_family == AF_CUST_ABNS ||
+				    l->rx.addr.ss_family == AF_CUST_ABNSZ) {
 					const struct sockaddr_un *un;
 
 					un = (struct sockaddr_un *)&l->rx.addr;
-					if (un->sun_path[0] == '\0') {
-						chunk_appendf(trash, "abns@%s", un->sun_path+1);
+					if (l->rx.addr.ss_family == AF_CUST_ABNS ||
+					    l->rx.addr.ss_family == AF_CUST_ABNSZ) {
+						chunk_appendf(trash, "%sabns@%s", (trash->data ? ";" : ""), un->sun_path+1);
 					} else {
-						chunk_appendf(trash, "unix@%s", un->sun_path);
+						chunk_appendf(trash, "%sunix@%s", (trash->data ? ";" : ""), un->sun_path);
 					}
 				} else if (l->rx.addr.ss_family == AF_INET) {
 					addr_to_str(&l->rx.addr, addr, sizeof(addr));
 					port_to_str(&l->rx.addr, port, sizeof(port));
-					chunk_appendf(trash, "ipv4@%s:%s", addr, port);
+					chunk_appendf(trash, "%sipv4@%s:%s", (trash->data ? ";" : ""), addr, port);
 				} else if (l->rx.addr.ss_family == AF_INET6) {
 					addr_to_str(&l->rx.addr, addr, sizeof(addr));
 					port_to_str(&l->rx.addr, port, sizeof(port));
-					chunk_appendf(trash, "ipv6@[%s]:%s", addr, port);
-				} else if (l->rx.addr.ss_family == AF_CUST_SOCKPAIR) {
-					chunk_appendf(trash, "sockpair@%d", ((struct sockaddr_in *)&l->rx.addr)->sin_addr.s_addr);
+					chunk_appendf(trash, "%sipv6@[%s]:%s", (trash->data ? ";" : ""), addr, port);
 				}
+				/* AF_CUST_SOCKPAIR is explicitly skipped, we don't want to show reload and shared
+				 * master CLI sockpairs in HAPROXY_CLI and HAPROXY_MASTER_CLI
+				 */
 			}
 		}
 		trash->area[trash->data++] = '\0';
@@ -1461,6 +1461,7 @@ static int cli_io_handler_show_fd(struct appctx *appctx)
 
 				salen = sizeof(sa);
 				if (getsockname(fd, (struct sockaddr *)&sa, &salen) != -1) {
+					/* only real address families in .ss_family (as provided by getsockname) */
 					if (sa.ss_family == AF_INET)
 						chunk_appendf(&trash, " fam=ipv4 lport=%d", ntohs(((const struct sockaddr_in *)&sa)->sin_port));
 					else if (sa.ss_family == AF_INET6)
@@ -1513,6 +1514,7 @@ static int cli_io_handler_show_fd(struct appctx *appctx)
 
 			salen = sizeof(sa);
 			if (getsockname(fd, (struct sockaddr *)&sa, &salen) != -1) {
+				/* only real address families in .ss_family (as provided by getsockname) */
 				if (sa.ss_family == AF_INET)
 					chunk_appendf(&trash, " fam=ipv4 lport=%d", ntohs(((const struct sockaddr_in *)&sa)->sin_port));
 				else if (sa.ss_family == AF_INET6)
@@ -1582,11 +1584,14 @@ static int cli_io_handler_show_cli_sock(struct appctx *appctx)
 			char addr[46];
 			char port[6];
 
-			if (l->rx.addr.ss_family == AF_UNIX) {
+			if (l->rx.addr.ss_family == AF_UNIX ||
+			    l->rx.addr.ss_family == AF_CUST_ABNS ||
+			    l->rx.addr.ss_family == AF_CUST_ABNSZ) {
 				const struct sockaddr_un *un;
 
 				un = (struct sockaddr_un *)&l->rx.addr;
-				if (un->sun_path[0] == '\0') {
+				if (l->rx.addr.ss_family == AF_CUST_ABNS ||
+				    l->rx.addr.ss_family == AF_CUST_ABNSZ) {
 					chunk_appendf(&trash, "abns@%s ", un->sun_path+1);
 				} else {
 					chunk_appendf(&trash, "unix@%s ", un->sun_path);
@@ -2467,8 +2472,30 @@ static int cli_parse_simple(char **args, char *payload, struct appctx *appctx, v
 	return 1;
 }
 
+static int cli_parse_echo(char **args, char *payload, struct appctx *appctx, void *private)
+{
+	int i = 1; /* starts after 'echo' */
+
+	chunk_reset(&trash);
+
+	while (*args[i]) {
+		/* add a space if there was a word before */
+		if (i == 1)
+			chunk_printf(&trash, "%s", args[i]);
+		else
+			chunk_appendf(&trash, " %s", args[i]);
+		i++;
+	}
+	chunk_appendf(&trash, "\n");
+
+	cli_msg(appctx, LOG_INFO, trash.area);
+
+	return 1;
+}
+
 static int _send_status(char **args, char *payload, struct appctx *appctx, void *private)
 {
+	struct listener *mproxy_li;
 	struct mworker_proc *proc;
 	int pid;
 
@@ -2479,8 +2506,11 @@ static int _send_status(char **args, char *payload, struct appctx *appctx, void 
 
 	list_for_each_entry(proc, &proc_list, list) {
 		/* update status of the new worker */
-		if (proc->pid == pid)
+		if (proc->pid == pid) {
 			proc->options &= ~PROC_O_INIT;
+			mproxy_li = fdtab[proc->ipc_fd[0]].owner;
+			stop_listener(mproxy_li, 0, 0, 0);
+		}
 		/* send TERM to workers, which have exceeded max_reloads counter */
 		if (max_reloads != -1) {
 			if ((proc->options & PROC_O_TYPE_WORKER) &&
@@ -2499,7 +2529,7 @@ static int _send_status(char **args, char *payload, struct appctx *appctx, void 
 			kill(proc->pid, oldpids_sig);
 		}
 	}
-	setenv("HAPROXY_LOAD_SUCCESS", "1", 1);
+	load_status = 1;
 	ha_notice("Loading success.\n");
 
 #if defined(USE_SYSTEMD)
@@ -3334,29 +3364,47 @@ void mworker_cli_proxy_stop()
 }
 
 /*
- * Create the mworker CLI proxy
+ * Create the MASTER proxy
  */
-int mworker_cli_proxy_create()
+int mworker_cli_create_master_proxy(char **errmsg)
 {
-	struct mworker_proc *child;
-	char *msg = NULL;
-	char *errmsg = NULL;
-
-	mworker_proxy = alloc_new_proxy("MASTER", PR_CAP_LISTEN|PR_CAP_INT, &errmsg);
-	if (!mworker_proxy)
-		goto error_proxy;
+	mworker_proxy = alloc_new_proxy("MASTER", PR_CAP_LISTEN|PR_CAP_INT, errmsg);
+	if (!mworker_proxy) {
+		return -1;
+	}
 
 	mworker_proxy->mode = PR_MODE_CLI;
-	mworker_proxy->maxconn = 10;                 /* default to 10 concurrent connections */
-	mworker_proxy->timeout.client = 0; /* no timeout */
-	mworker_proxy->conf.file = copy_file_name("MASTER");
+	/* default to 10 concurrent connections */
+	mworker_proxy->maxconn = 10;
+	/* no timeout */
+	mworker_proxy->timeout.client = 0;
+	mworker_proxy->conf.file = strdup("MASTER");
 	mworker_proxy->conf.line = 0;
 	mworker_proxy->accept = frontend_accept;
-	mworker_proxy-> lbprm.algo = BE_LB_ALGO_NONE;
+	mworker_proxy->lbprm.algo = BE_LB_ALGO_NONE;
 
 	/* Does not init the default target the CLI applet, but must be done in
 	 * the request parsing code */
 	mworker_proxy->default_target = NULL;
+	mworker_proxy->next = proxies_list;
+	proxies_list = mworker_proxy;
+
+	return 0;
+}
+
+/*
+ * Attach servers to ipc_fd[0] of all presented in proc_list workers. Master and
+ * worker share MCLI sockpair (ipc_fd[0] and ipc_fd[1]). Servers are attached to
+ * ipc_fd[0], which is always opened at master side. ipc_fd[0] of worker, started
+ * before the reload, is inherited in master after the reload (execvp).
+ */
+int mworker_cli_attach_server(char **errmsg)
+{
+	char *msg = NULL;
+	struct mworker_proc *child;
+
+	BUG_ON((mworker_proxy == NULL), "Triggered in mworker_cli_attach_server(), "
+		"mworker_proxy must be created before this call.\n");
 
 	/* create all servers using the mworker_proc list */
 	list_for_each_entry(child, &proc_list, list) {
@@ -3373,8 +3421,7 @@ int mworker_cli_proxy_create()
 		if (!newsrv)
 			goto error;
 
-		/* we don't know the new pid yet */
-		if (child->pid == -1)
+		if (child->options & PROC_O_INIT)
 			memprintf(&msg, "cur-%d", 1);
 		else
 			memprintf(&msg, "old-%d", child->pid);
@@ -3387,7 +3434,7 @@ int mworker_cli_proxy_create()
 
 		memprintf(&msg, "sockpair@%d", child->ipc_fd[0]);
 		if ((sk = str2sa_range(msg, &port, &port1, &port2, NULL, &proto, NULL,
-		                       &errmsg, NULL, NULL, NULL, PA_O_STREAM)) == 0) {
+		                       errmsg, NULL, NULL, NULL, PA_O_STREAM)) == 0) {
 			goto error;
 		}
 		ha_free(&msg);
@@ -3407,9 +3454,6 @@ int mworker_cli_proxy_create()
 		child->srv = newsrv;
 	}
 
-	mworker_proxy->next = proxies_list;
-	proxies_list = mworker_proxy;
-
 	return 0;
 
 error:
@@ -3419,12 +3463,7 @@ error:
 		free(child->srv->id);
 		ha_free(&child->srv);
 	}
-	free_proxy(mworker_proxy);
 	free(msg);
-
-error_proxy:
-	ha_alert("%s\n", errmsg);
-	free(errmsg);
 
 	return -1;
 }
@@ -3589,7 +3628,6 @@ int mworker_cli_global_proxy_new_listener(struct mworker_proc *proc)
 	return 0;
 
 error:
-	close(proc->ipc_fd[0]);
 	close(proc->ipc_fd[1]);
 	free(err);
 
@@ -3618,6 +3656,7 @@ static struct applet mcli_applet = {
 /* register cli keywords */
 static struct cli_kw_list cli_kws = {{ },{
 	{ { "help", NULL },                      NULL,                                                                                                cli_parse_simple, NULL, NULL, NULL, ACCESS_MASTER },
+	{ { "echo", NULL },                      "echo <text>                             : print text to the output",                                cli_parse_echo,   NULL, NULL, NULL, ACCESS_MASTER },
 	{ { "prompt", NULL },                    NULL,                                                                                                cli_parse_simple, NULL, NULL, NULL, ACCESS_MASTER },
 	{ { "quit", NULL },                      NULL,                                                                                                cli_parse_simple, NULL, NULL, NULL, ACCESS_MASTER },
 	{ { "_getsocks", NULL },                 NULL,                                                                                                _getsocks, NULL },

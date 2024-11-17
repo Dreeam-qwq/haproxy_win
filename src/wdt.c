@@ -12,7 +12,9 @@
 #include <signal.h>
 #include <time.h>
 
+#include <haproxy/activity.h>
 #include <haproxy/api.h>
+#include <haproxy/cfgparse.h>
 #include <haproxy/clock.h>
 #include <haproxy/debug.h>
 #include <haproxy/errors.h>
@@ -33,7 +35,16 @@
 #define TIMER_INVALID ((timer_t)(unsigned long)(0xfffffffful))
 #endif
 
-static timer_t per_thread_wd_timer[MAX_THREADS];
+/* per-thread context for the watchdog, permits to store timers, counters,
+ * task pointers, etc (anything that helps providing accurate reports).
+ */
+static struct {
+	timer_t timer;
+	uint prev_ctxsw;
+} per_thread_wd_ctx[MAX_THREADS];
+
+/* warn about stuck tasks after this delay (ns) */
+static unsigned int wdt_warn_blocked_traffic_ns = 100000000U;
 
 /* Setup (or ping) the watchdog timer for thread <thr>. Returns non-zero on
  * success, zero on failure. It interrupts once per second of CPU time. It
@@ -44,9 +55,10 @@ int wdt_ping(int thr)
 {
 	struct itimerspec its;
 
-	its.it_value.tv_sec    = 1; its.it_value.tv_nsec    = 0;
+	its.it_value.tv_sec    = wdt_warn_blocked_traffic_ns / 1000000000U;
+	its.it_value.tv_nsec   = wdt_warn_blocked_traffic_ns % 1000000000U;
 	its.it_interval.tv_sec = 0; its.it_interval.tv_nsec = 0;
-	return timer_settime(per_thread_wd_timer[thr], 0, &its, NULL) == 0;
+	return timer_settime(per_thread_wd_ctx[thr].timer, 0, &its, NULL) == 0;
 }
 
 /* This is the WDTSIG signal handler */
@@ -80,7 +92,7 @@ void wdt_handler(int sig, siginfo_t *si, void *arg)
 		/* not yet reached the deadline of 1 sec,
 		 * or p wasn't initialized yet
 		 */
-		if (!p || n - p < 1000000000UL)
+		if (!p)
 			goto update_and_leave;
 
 		if ((_HA_ATOMIC_LOAD(&ha_thread_ctx[thr].flags) & TH_FL_SLEEPING) ||
@@ -101,10 +113,29 @@ void wdt_handler(int sig, siginfo_t *si, void *arg)
 		 * scheduler is still alive by setting the TH_FL_STUCK flag
 		 * that the scheduler clears when switching to the next task.
 		 * If it's already set, then it's our second call with no
-		 * progress and the thread is dead.
+		 * progress and the thread is dead. However, if we figure
+		 * that the scheduler made no progress since last time, we'll
+		 * at least emit a warning.
 		 */
 		if (!(_HA_ATOMIC_LOAD(&ha_thread_ctx[thr].flags) & TH_FL_STUCK)) {
-			_HA_ATOMIC_OR(&ha_thread_ctx[thr].flags, TH_FL_STUCK);
+			uint prev_ctxsw;
+
+			prev_ctxsw = HA_ATOMIC_LOAD(&per_thread_wd_ctx[tid].prev_ctxsw);
+
+			/* only after one second it's clear we're stuck */
+			if (n - p >= 1000000000ULL)
+				_HA_ATOMIC_OR(&ha_thread_ctx[thr].flags, TH_FL_STUCK);
+
+			/* have we crossed the warning boundary ? If so we note were we
+			 * where, and second time called from the same place will trigger
+			 * a warning (unless already stuck).
+			 */
+			if (n - p >= (ullong)wdt_warn_blocked_traffic_ns) {
+				if (HA_ATOMIC_LOAD(&activity[thr].ctxsw) == prev_ctxsw)
+					ha_stuck_warning(thr);
+				HA_ATOMIC_STORE(&activity[thr].ctxsw, prev_ctxsw);
+			}
+
 			goto update_and_leave;
 		}
 
@@ -148,9 +179,47 @@ void wdt_handler(int sig, siginfo_t *si, void *arg)
 	wdt_ping(thr);
 }
 
+/* parse the "warn-blocked-traffic-after" parameter */
+static int wdt_parse_warn_blocked(char **args, int section_type, struct proxy *curpx,
+                                  const struct proxy *defpx, const char *file, int line,
+                                  char **err)
+{
+	const char *res;
+	uint value;
+
+	if (!*args[1]) {
+		memprintf(err, "'%s' expects <time> as argument between 1 and 1000 ms.\n", args[0]);
+		return -1;
+	}
+
+	res = parse_time_err(args[1], &value, TIME_UNIT_MS);
+	if (res == PARSE_TIME_OVER) {
+		memprintf(err, "timer overflow in argument '%s' to '%s' (maximum value is 1000 ms)",
+			  args[1], args[0]);
+		return -1;
+	}
+	else if (res == PARSE_TIME_UNDER) {
+		memprintf(err, "timer underflow in argument '%s' to '%s' (minimum value is 1 ms)",
+			  args[1], args[0]);
+		return -1;
+	}
+	else if (res) {
+		memprintf(err, "unexpected character '%c' in argument to <%s>.\n", *res, args[0]);
+		return -1;
+	}
+	else if (value > 1000 || value < 1) {
+		memprintf(err, "timer out of range in argument '%s' to '%s' (value must be between 1 and 1000 ms)",
+			  args[1], args[0]);
+		return -1;
+	}
+
+	wdt_warn_blocked_traffic_ns = value * 1000000U;
+	return 0;
+}
+
 int init_wdt_per_thread()
 {
-	if (!clock_setup_signal_timer(&per_thread_wd_timer[tid], WDTSIG, tid))
+	if (!clock_setup_signal_timer(&per_thread_wd_ctx[tid].timer, WDTSIG, tid))
 		goto fail1;
 
 	if (!wdt_ping(tid))
@@ -159,17 +228,17 @@ int init_wdt_per_thread()
 	return 1;
 
  fail2:
-	timer_delete(per_thread_wd_timer[tid]);
+	timer_delete(per_thread_wd_ctx[tid].timer);
  fail1:
-	per_thread_wd_timer[tid] = TIMER_INVALID;
+	per_thread_wd_ctx[tid].timer = TIMER_INVALID;
 	ha_warning("Failed to setup watchdog timer for thread %u, disabling lockup detection.\n", tid);
 	return 1;
 }
 
 void deinit_wdt_per_thread()
 {
-	if (per_thread_wd_timer[tid] != TIMER_INVALID)
-		timer_delete(per_thread_wd_timer[tid]);
+	if (per_thread_wd_ctx[tid].timer != TIMER_INVALID)
+		timer_delete(per_thread_wd_ctx[tid].timer);
 }
 
 /* registers the watchdog signal handler and returns 0. This sets up the signal
@@ -187,6 +256,12 @@ int init_wdt()
 	return ERR_NONE;
 }
 
+static struct cfg_kw_list cfg_kws = {ILH, {
+	{ CFG_GLOBAL, "warn-blocked-traffic-after", wdt_parse_warn_blocked },
+	{ 0, NULL, NULL },
+}};
+
+INITCALL1(STG_REGISTER, cfg_register_keywords, &cfg_kws);
 REGISTER_POST_CHECK(init_wdt);
 REGISTER_PER_THREAD_INIT(init_wdt_per_thread);
 REGISTER_PER_THREAD_DEINIT(deinit_wdt_per_thread);

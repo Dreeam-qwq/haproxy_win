@@ -156,6 +156,17 @@ enum {
 	STRM_ET_DATA_ABRT  = 0x0400,  /* data phase aborted by external cause */
 };
 
+
+/* Types of entities that may interrupt a processing, teomporarily or not
+ * depending on the context;
+ */
+enum {
+	STRM_ENTITY_NONE      = 0x0000,
+	STRM_ENTITY_RULE      = 0x0001,
+	STRM_ENTITY_FILTER    = 0x0002,
+	STRM_ENTITY_WREQ_BODY = 0x0003,
+};
+
 /* This function is used to report flags in debugging tools. Please reflect
  * below any single-bit flag addition above in the same order via the
  * __APPEND_FLAG macro. The new end of the buffer is returned.
@@ -246,6 +257,10 @@ struct stream {
 	uint64_t lat_time;		/* total latency time experienced */
 	uint64_t cpu_time;              /* total CPU time consumed */
 	struct freq_ctr call_rate;      /* stream task call rate without making progress */
+	uint32_t passes_stconn;         /* number of passes on the stconn evaluation code */
+	uint32_t passes_reqana;         /* number of passes on the req analysers block */
+	uint32_t passes_resana;         /* number of passes on the res analysers block */
+	uint32_t passes_propag;         /* number of passes on the shut/err propag code */
 
 	unsigned short max_retries;     /* Maximum number of connection retried (=0 is backend is not set) */
 	short store_count;
@@ -285,8 +300,16 @@ struct stream {
 	void *current_rule;                     /* this is used to store the current rule to be resumed. */
 	int rules_exp;                          /* expiration date for current rules execution */
 	int tunnel_timeout;
-	const char *last_rule_file;             /* last evaluated final rule's file (def: NULL) */
-	int last_rule_line;                     /* last evaluated final rule's line (def: 0) */
+
+	struct {
+		void *ptr;                      /* Pointer on the entity  (def: NULL) */
+		int type;                       /* entity type (STRM_ENTITY_*) */
+	} last_entity;                          /* last evaluated entity that interrupted processing */
+
+	struct {
+		void *ptr;                      /* Pointer on the entity  (def: NULL) */
+		int type;                       /* entity type (STRM_ENTITY_*) */
+	} waiting_entity;                       /* The entity waiting to continue its processing and interrupted by an error/timeout */
 
 	unsigned int stream_epoch;              /* copy of stream_epoch when the stream was created */
 	struct hlua *hlua[2];                   /* lua runtime context (0: global, 1: per-thread) */

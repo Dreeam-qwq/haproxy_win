@@ -57,9 +57,14 @@ static int handle_analyzer_result(struct stream *s, struct channel *chn, unsigne
 	do {								\
 		struct filter *filter;					\
 									\
-		if (strm_flt(strm)->current[CHN_IDX(chn)]) {	\
+		if (strm_flt(strm)->current[CHN_IDX(chn)]) {		\
 			filter = strm_flt(strm)->current[CHN_IDX(chn)]; \
-			strm_flt(strm)->current[CHN_IDX(chn)] = NULL; \
+			strm_flt(strm)->current[CHN_IDX(chn)] = NULL;	\
+			if (!(chn_prod(chn)->flags & SC_FL_ERROR) &&	\
+			    !(chn->flags & (CF_READ_TIMEOUT|CF_WRITE_TIMEOUT))) { \
+				(strm)->waiting_entity.type = STRM_ENTITY_NONE;	\
+				(strm)->waiting_entity.ptr = NULL;	\
+			}						\
 			goto resume_execution;				\
 		}							\
 									\
@@ -72,7 +77,15 @@ static int handle_analyzer_result(struct stream *s, struct channel *chn, unsigne
 
 #define BREAK_EXECUTION(strm, chn, label)				\
 	do {								\
-		strm_flt(strm)->current[CHN_IDX(chn)] = filter;	\
+		if (ret == 0) {						\
+			s->waiting_entity.type = STRM_ENTITY_FILTER;	\
+			s->waiting_entity.ptr  = filter;		\
+		}							\
+		else if (ret < 0) {					\
+			(strm)->last_entity.type = STRM_ENTITY_FILTER;	\
+			(strm)->last_entity.ptr = filter;		\
+		}							\
+		strm_flt(strm)->current[CHN_IDX(chn)] = filter;		\
 		goto label;						\
 	} while (0)
 
@@ -464,6 +477,7 @@ flt_stream_release(struct stream *s, int only_backend)
 
 	list_for_each_entry_safe(filter, back, &strm_flt(s)->filters, list) {
 		if (!only_backend || (filter->flags & FLT_FL_IS_BACKEND_FILTER)) {
+			filter->calls++;
 			if (FLT_OPS(filter)->detach)
 				FLT_OPS(filter)->detach(s, filter);
 			LIST_DELETE(&filter->list);
@@ -485,8 +499,11 @@ flt_stream_start(struct stream *s)
 	struct filter *filter;
 
 	list_for_each_entry(filter, &strm_flt(s)->filters, list) {
-		if (FLT_OPS(filter)->stream_start && FLT_OPS(filter)->stream_start(s, filter) < 0)
-			return -1;
+		if (FLT_OPS(filter)->stream_start) {
+			filter->calls++;
+			if (FLT_OPS(filter)->stream_start(s, filter) < 0)
+				return -1;
+		}
 	}
 	if (strm_li(s) && (strm_li(s)->bind_conf->analysers & AN_REQ_FLT_START_FE)) {
 		s->req.flags |= CF_FLT_ANALYZE;
@@ -505,8 +522,10 @@ flt_stream_stop(struct stream *s)
 	struct filter *filter;
 
 	list_for_each_entry(filter, &strm_flt(s)->filters, list) {
-		if (FLT_OPS(filter)->stream_stop)
+		if (FLT_OPS(filter)->stream_stop) {
+			filter->calls++;
 			FLT_OPS(filter)->stream_stop(s, filter);
+		}
 	}
 }
 
@@ -520,8 +539,10 @@ flt_stream_check_timeouts(struct stream *s)
 	struct filter *filter;
 
 	list_for_each_entry(filter, &strm_flt(s)->filters, list) {
-		if (FLT_OPS(filter)->check_timeouts)
+		if (FLT_OPS(filter)->check_timeouts) {
+			filter->calls++;
 			FLT_OPS(filter)->check_timeouts(s, filter);
+		}
 	}
 }
 
@@ -546,9 +567,14 @@ flt_set_stream_backend(struct stream *s, struct proxy *be)
 
   end:
 	list_for_each_entry(filter, &strm_flt(s)->filters, list) {
-		if (FLT_OPS(filter)->stream_set_backend &&
-		    FLT_OPS(filter)->stream_set_backend(s, filter, be) < 0)
-			return -1;
+		if (FLT_OPS(filter)->stream_set_backend) {
+			filter->calls++;
+			if (FLT_OPS(filter)->stream_set_backend(s, filter, be) < 0) {
+				s->last_entity.type = STRM_ENTITY_FILTER;
+				s->last_entity.ptr = filter;
+				return -1;
+			}
+		}
 	}
 	if (be->be_req_ana & AN_REQ_FLT_START_BE) {
 		s->req.flags |= CF_FLT_ANALYZE;
@@ -590,6 +616,7 @@ flt_http_end(struct stream *s, struct http_msg *msg)
 
 		if (FLT_OPS(filter)->http_end) {
 			DBG_TRACE_DEVEL(FLT_ID(filter), STRM_EV_HTTP_ANA|STRM_EV_FLT_ANA, s);
+			filter->calls++;
 			ret = FLT_OPS(filter)->http_end(s, filter, msg);
 			if (ret <= 0)
 				BREAK_EXECUTION(s, msg->chn, end);
@@ -617,6 +644,7 @@ flt_http_reset(struct stream *s, struct http_msg *msg)
 	list_for_each_entry(filter, &strm_flt(s)->filters, list) {
 		if (FLT_OPS(filter)->http_reset) {
 			DBG_TRACE_DEVEL(FLT_ID(filter), STRM_EV_HTTP_ANA|STRM_EV_FLT_ANA, s);
+			filter->calls++;
 			FLT_OPS(filter)->http_reset(s, filter, msg);
 		}
 	}
@@ -636,6 +664,7 @@ flt_http_reply(struct stream *s, short status, const struct buffer *msg)
 	list_for_each_entry(filter, &strm_flt(s)->filters, list) {
 		if (FLT_OPS(filter)->http_reply) {
 			DBG_TRACE_DEVEL(FLT_ID(filter), STRM_EV_HTTP_ANA|STRM_EV_FLT_ANA, s);
+			filter->calls++;
 			FLT_OPS(filter)->http_reply(s, filter, status, msg);
 		}
 	}
@@ -678,9 +707,13 @@ flt_http_payload(struct stream *s, struct http_msg *msg, unsigned int len)
 
 		if (FLT_OPS(filter)->http_payload) {
 			DBG_TRACE_DEVEL(FLT_ID(filter), STRM_EV_HTTP_ANA|STRM_EV_FLT_ANA, s);
+			filter->calls++;
 			ret = FLT_OPS(filter)->http_payload(s, filter, msg, out + offset, data - offset);
-			if (ret < 0)
+			if (ret < 0) {
+				s->last_entity.type = STRM_ENTITY_FILTER;
+				s->last_entity.ptr = filter;
 				goto end;
+			}
 			data = ret + *flt_off - *strm_off;
 			*flt_off += ret;
 		}
@@ -749,6 +782,7 @@ flt_start_analyze(struct stream *s, struct channel *chn, unsigned int an_bit)
 		FLT_OFF(filter, chn) = 0;
 		if (FLT_OPS(filter)->channel_start_analyze) {
 			DBG_TRACE_DEVEL(FLT_ID(filter), STRM_EV_FLT_ANA, s);
+			filter->calls++;
 			ret = FLT_OPS(filter)->channel_start_analyze(s, filter, chn);
 			if (ret <= 0)
 				BREAK_EXECUTION(s, chn, end);
@@ -781,6 +815,7 @@ flt_pre_analyze(struct stream *s, struct channel *chn, unsigned int an_bit)
 	RESUME_FILTER_LOOP(s, chn) {
 		if (FLT_OPS(filter)->channel_pre_analyze && (filter->pre_analyzers & an_bit)) {
 			DBG_TRACE_DEVEL(FLT_ID(filter), STRM_EV_FLT_ANA, s);
+			filter->calls++;
 			ret = FLT_OPS(filter)->channel_pre_analyze(s, filter, chn, an_bit);
 			if (ret <= 0)
 				BREAK_EXECUTION(s, chn, check_result);
@@ -814,9 +849,13 @@ flt_post_analyze(struct stream *s, struct channel *chn, unsigned int an_bit)
 	list_for_each_entry(filter, &strm_flt(s)->filters, list) {
 		if (FLT_OPS(filter)->channel_post_analyze &&  (filter->post_analyzers & an_bit)) {
 			DBG_TRACE_DEVEL(FLT_ID(filter), STRM_EV_FLT_ANA, s);
+			filter->calls++;
 			ret = FLT_OPS(filter)->channel_post_analyze(s, filter, chn, an_bit);
-			if (ret < 0)
+			if (ret < 0) {
+				s->last_entity.type = STRM_ENTITY_FILTER;
+				s->last_entity.ptr = filter;
 				break;
+			}
 			filter->post_analyzers &= ~an_bit;
 		}
 	}
@@ -842,6 +881,7 @@ flt_analyze_http_headers(struct stream *s, struct channel *chn, unsigned int an_
 	RESUME_FILTER_LOOP(s, chn) {
 		if (FLT_OPS(filter)->http_headers) {
 			DBG_TRACE_DEVEL(FLT_ID(filter), STRM_EV_HTTP_ANA|STRM_EV_FLT_ANA, s);
+			filter->calls++;
 			ret = FLT_OPS(filter)->http_headers(s, filter, msg);
 			if (ret <= 0)
 				BREAK_EXECUTION(s, chn, check_result);
@@ -887,6 +927,7 @@ flt_end_analyze(struct stream *s, struct channel *chn, unsigned int an_bit)
 
 		if (FLT_OPS(filter)->channel_end_analyze) {
 			DBG_TRACE_DEVEL(FLT_ID(filter), STRM_EV_FLT_ANA, s);
+			filter->calls++;
 			ret = FLT_OPS(filter)->channel_end_analyze(s, filter, chn);
 			if (ret <= 0)
 				BREAK_EXECUTION(s, chn, end);
@@ -965,9 +1006,13 @@ flt_tcp_payload(struct stream *s, struct channel *chn, unsigned int len)
 		if (FLT_OPS(filter)->tcp_payload) {
 
 			DBG_TRACE_DEVEL(FLT_ID(filter), STRM_EV_TCP_ANA|STRM_EV_FLT_ANA, s);
+			filter->calls++;
 			ret = FLT_OPS(filter)->tcp_payload(s, filter, chn, out + offset, data - offset);
-			if (ret < 0)
+			if (ret < 0) {
+				s->last_entity.type = STRM_ENTITY_FILTER;
+				s->last_entity.ptr = filter;
 				goto end;
+			}
 			data = ret + *flt_off - *strm_off;
 			*flt_off += ret;
 		}

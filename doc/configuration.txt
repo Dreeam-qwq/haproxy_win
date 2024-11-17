@@ -3,7 +3,7 @@
                           Configuration Manual
                          ----------------------
                               version 3.1
-                              2024/10/16
+                              2024/11/15
 
 
 This document covers the configuration language as implemented in the version
@@ -56,7 +56,7 @@ Summary
 3.4.      Userlists
 3.5.      Peers
 3.6.      Mailers
-3.7.      Programs
+3.7.      Programs (deprecated)
 3.8.      HTTP-errors
 3.9.      Rings
 3.10.     Log forwarding
@@ -1481,10 +1481,12 @@ The following keywords are supported in the "global" section :
    - tune.h2.be.glitches-threshold
    - tune.h2.be.initial-window-size
    - tune.h2.be.max-concurrent-streams
+   - tune.h2.be.rxbuf
    - tune.h2.fe.glitches-threshold
    - tune.h2.fe.initial-window-size
    - tune.h2.fe.max-concurrent-streams
    - tune.h2.fe.max-total-streams
+   - tune.h2.fe.rxbuf
    - tune.h2.header-table-size
    - tune.h2.initial-window-size
    - tune.h2.max-concurrent-streams
@@ -1524,6 +1526,8 @@ The following keywords are supported in the "global" section :
    - tune.quic.retry-threshold
    - tune.quic.socket-owner
    - tune.quic.zero-copy-fwd-send
+   - tune.renice.runtime
+   - tune.renice.startup
    - tune.rcvbuf.backend
    - tune.rcvbuf.client
    - tune.rcvbuf.frontend
@@ -1560,6 +1564,7 @@ The following keywords are supported in the "global" section :
  * Debugging
    - anonkey
    - quiet
+   - warn-blocked-traffic-after
    - zero-warning
 
  * HTTPClient
@@ -4060,6 +4065,26 @@ tune.quic.zero-copy-fwd-send { on | off }
 
   See also: tune.disable-zero-copy-forwarding
 
+tune.renice.runtime <number>
+  This configuration option takes a value between -20 and 19. It applies a
+  scheduling priority as documented in man 2 setpriority. This priority is
+  applied after the configuration parsing, which means only the worker or the
+  standalone process will apply it. It is usually configured to set a higher
+  priority than a process doing configuration parsing (tune.renice.startup).
+
+  See also: tune.renice.startup
+
+tune.renice.startup <number>
+  This configuration option takes a value between -20 and 19. It applies a
+  scheduling priority as documented in man 2 setpriority. This priority is
+  applied before applying the rest of the configuration which can be useful if
+  you want to lower the priority for configuration parsing. This is applied on
+  the standalone process or the worker before configuration parsing. Once the
+  configuration is parsed, the previous priority is restored unless
+  tune.renice.runtime is used.
+
+  See also: tune.renice.runtime
+
 tune.rcvbuf.backend <number>
 tune.rcvbuf.frontend <number>
   For the kernel socket receive buffer size on non-connected sockets to this
@@ -4371,6 +4396,24 @@ quick-exit
 quiet
   Do not display any message during startup. It is equivalent to the command-
   line argument "-q".
+
+warn-blocked-traffic-after <time>
+  This allows to adjust the delay after which a stuck task blocking the traffic
+  will trigger the emission of a warning on the standard error output. The
+  delay is expressed in milliseconds and defaults to 100 ms. Permitted values
+  must be comprised between 1 ms and 1000 ms included. Lower values will
+  trigger warnings frequently and higher ones will rarely. The watchdog will
+  kill a runaway task that fails to respond twice for one second anyway, so a
+  1000 ms warning delay will normally not trigger any warning. It is
+  recommended to stay with values between 10 and 100ms to detect configuration
+  anomalies that may degrade the user's experience, causing long response times
+  or jerkiness on interactive sessions. For example, a poorly designed Lua
+  sample-fetch function doing heavy computations, or a very large map_reg or
+  map_regm map file with a very high evaluation cost may cause such trouble.
+  For comparison a TLS handshake can eat between one and two milliseconds, and
+  compressing a 16kB HTTP response buffer is around one millisecond. The output
+  contains a thread dump of the offending task with a backtrace and some
+  context that helps figure where the time is being spent.
 
 zero-warning
   When this option is set, HAProxy will refuse to start if any warning was
@@ -4722,11 +4765,23 @@ timeout mail <time>
         timeout mail 20s
         mailer smtp1 192.168.0.1:587
 
-3.7. Programs
--------------
+3.7. Programs (deprecated)
+--------------------------
+
+This section is deprecated and should disappear with HAProxy 3.3. The section
+could be replaced easily by separated process managers. Systemd unit files or
+sysvinit scripts could replace this section as they are more reliable. In docker
+environments, some alternatives can also be found such as s6 or supervisord.
+
 In master-worker mode, it is possible to launch external binaries with the
 master, these processes are called programs. These programs are launched and
 managed the same way as the workers.
+
+Since version 3.1, the program section has a slightly different behavior, the
+section is parsed and the program is started from the master, but the rest of
+the configuration is loaded in the worker. This mean the program configuration
+is completely separated from the worker configuration, and a program could be
+reexecuted even if the worker configuration is wrong upon a reload.
 
 During a reload of HAProxy, those processes are dealing with the same
 sequence as a worker:
@@ -6073,6 +6128,11 @@ bind /<path> [, ...] [param*]
                       only in log-forward sections.
                     - 'unix@'  -> address is a path to a local unix socket
                     - 'abns@'  -> address is in abstract namespace (Linux only).
+                    - 'abnsz@'  -> address is in abstract namespace (Linux only)
+                       but it is explicitly zero-terminated. This means no \0
+                       padding is used to complete sun_path. It is useful to
+                       interconnect with programs that don't implement the
+                       default abns naming logic that haproxy uses.
                     - 'fd@<n>' -> use file descriptor <n> inherited from the
                       parent. The fd must be bound and may or may not already
                       be listening.
@@ -6165,11 +6225,12 @@ bind /<path> [, ...] [param*]
         listen h3_quic_proxy
             bind quic4@10.0.0.1:8888 ssl crt /etc/mycrt
 
-  Note: regarding Linux's abstract namespace sockets, HAProxy uses the whole
-        sun_path length is used for the address length. Some other programs
-        such as socat use the string length only by default. Pass the option
-        ",unix-tightsocklen=0" to any abstract socket definition in socat to
-        make it compatible with HAProxy's.
+  Note: regarding Linux's abstract namespace sockets, "abns" HAProxy sockets
+        uses the whole sun_path length is used for the address length. Some
+        other programs such as socat use the string length only by default.
+        Pass the option ",unix-tightsocklen=0" to any abstract socket
+        definition in socat to make it compatible with HAProxy's, or use the
+        "abnsz" HAProxy socket family instead.
 
   See also : "source", "option forwardfor", "unix-bind" and the PROXY protocol
              documentation, and section 5 about bind options.
@@ -11586,6 +11647,11 @@ server <name> <address>[:[port]] [param*]
                     - 'ipv6@'  -> address is always IPv6
                     - 'unix@'  -> address is a path to a local unix socket
                     - 'abns@'  -> address is in abstract namespace (Linux only)
+                    - 'abnsz@'  -> address is in abstract namespace (Linux only)
+                       but it is explicitly zero-terminated. This means no \0
+                       padding is used to complete sun_path. It is useful to
+                       interconnect with programs that don't implement the
+                       default abns naming logic that haproxy uses.
                     - 'sockpair@' -> address is the FD of a connected unix
                       socket or of a socketpair. During a connection, the
                       backend creates a pair of connected sockets, and passes
@@ -11620,11 +11686,12 @@ server <name> <address>[:[port]] [param*]
         server www1_dc1 "${LAN_DC1}.101:80"
         server www1_dc2 "${LAN_DC2}.101:80"
 
-  Note: regarding Linux's abstract namespace sockets, HAProxy uses the whole
-        sun_path length is used for the address length. Some other programs
-        such as socat use the string length only by default. Pass the option
-        ",unix-tightsocklen=0" to any abstract socket definition in socat to
-        make it compatible with HAProxy's.
+  Note: regarding Linux's abstract namespace sockets, "abns" HAProxy sockets
+        uses the whole sun_path length is used for the address length. Some
+        other programs such as socat use the string length only by default.
+        Pass the option ",unix-tightsocklen=0" to any abstract socket
+        definition in socat to make it compatible with HAProxy's, or use the
+        "abnsz" HAProxy socket family instead.
 
   See also: "default-server", "http-send-name-header" and section 5 about
              server options
@@ -11721,6 +11788,9 @@ source <addr>[:<port>] [interface <name>]
                 - 'ipv6@' -> address is always IPv6
                 - 'unix@' -> address is a path to a local unix socket
                 - 'abns@' -> address is in abstract namespace (Linux only)
+                - 'abnsz@'  -> address is in zero-terminated abstract namespace
+                               (Linux only)
+
               You may want to reference some environment variables in the
               address parameter, see section 2.3 about environment variables.
 
@@ -12937,6 +13007,21 @@ stick-table type {ip | integer | string [len <length>] | binary [len <length>]}
       transfer speed instead of having a smooth one. This may partially be
       smoothed with "option contstats" though this is not perfect yet. Use of
       byte_out_cnt is recommended for better fairness.
+
+    - glitch_cnt : front glitches count. It is a positive 32-bit integer which
+      counts the cumulative number of glitches reported on a front connection.
+      Glitches correspond to either unusual or unexpected actions (protocol-
+      wise) from the client that could indicate a badly defective client or
+      possibly an attacker. As such, this counter can help in order to decide
+      how to act with them in such case.
+
+    - glitch_rate(<period>) : frequency counter (takes 12 bytes). It takes an
+      integer parameter <period> which indicates in milliseconds the length of
+      the period over which the average is measured. It reports the average
+      front glitches rate over that period. It may be used to detect defective
+      clients or potential attackers that perform uncommon or unexpected
+      actions from a protocol point of view, provided that HAProxy flagged them
+      them as such.
 
   There is only one stick-table per proxy. At the moment of writing this doc,
   it does not seem useful to have multiple tables per proxy. If this happens
@@ -19778,6 +19863,8 @@ table_conn_cnt(table)                              string       integer
 table_conn_cur(table)                              string       integer
 table_conn_rate(table)                             string       integer
 table_expire(table[,default_value])                string       integer
+table_glitch_cnt(table)                            string       integer
+table_glitch_rate(table)                           string       integer
 table_gpc(idx,table)                               string       integer
 table_gpc0(table)                                  string       integer
 table_gpc0_rate(table)                             string       integer
@@ -19810,6 +19897,7 @@ url_enc([enc_type])                                string       string
 us_ltime(format[,offset])                          integer      string
 us_utime(format[,offset])                          integer      string
 utime(format[,offset])                             integer      string
+when(condition)                                     any          same
 word(index,delimiters[,count])                     string       string
 wt6([avalanche])                                   binary       integer
 x509_v_err_str                                     integer      string
@@ -21397,6 +21485,67 @@ utime(<format>[,<offset>])
       # e.g.  20140710162350 127.0.0.1:57325
       log-format %[date,utime(%Y%m%d%H%M%S)]\ %ci:%cp
 
+when(<condition>)
+  Evaluates the condition and when true, passes the input sample as-is to the
+  output, otherwise return nothing. This is designed specifically to produce
+  some rarely needed data that should only be emitted under certain conditions,
+  such as debugging information when an error is met.
+
+  The condition is made of a keyword among the list below, optionally preceeded
+  by an exclamation mark ('!') to negate it:
+
+    - "error" returns true when an error was encountered during the processing
+      of the request or stream. It uses the same rules as "dontlog-normal"
+      (e.g. a successful redispatch counts as an error).
+
+    - "forwarded" returns true when the request was forwarded to a backend
+      server
+
+    - "normal" returns true when no error happened (this is equivalent to
+      "!error").
+
+    - "processed" returns true when the request was either forwarded to a
+      backend server, or processed by an applet.
+
+    - "stopping" returns true if the process is currently stopping when the
+      rule is evaluated
+
+    - "toapplet" returns true when the request was processed by an applet.
+
+  Note that the content is evaluated in any case, so doing this does not avoid
+  the generation of that information. It's only meant to avoid producing that
+  information.
+
+  An example would be to add backend stream debugging information in the logs
+  only when an error was encountered during processing, or logging extra
+  information when stopping, etc.
+
+  Example:
+    # log "dbg={-}" when fine, or "dbg={... debug info ...}" on error:
+    log-format "$HAPROXY_HTTP_LOG_FMT dbg={%[bs.debug_str,when(!normal)]}"
+
+    Here, the "dbg" field in the log will only contain an dash ('-') to
+    indicate a missing content when the rule is not validated, and will emit a
+    whole debugging block when it is.
+
+  Example
+    # only emit the backend src/port when a real connection was issued:
+    log-format "$HAPROXY_HTTP_LOG_FMT \
+               src=[%[bc_src,when(forwarded)]:%[bc_src_port,when(forwarded)]]"
+
+  Since it kills the evaluation of the expression when it is not true, it is
+  also possible to use it to stop a subsequent converter from being called.
+  This may for example be used to call the debug() converter only upon error,
+  to log an element only when absolutely necessary.
+
+  Example:
+    # emit the whole response headers list to stderr only on error and only
+    # when the output is a connection. We abuse a dummy variable here.
+    http-after-response set-var(res.test) \
+                  res.hdrs,when(error),when(forwarded),debug(hdrs,stderr)
+
+  See also: debug converter
+
 word(<index>,<delimiters>[,<count>])
   Extracts the nth word counting from the beginning (positive index) or from
   the end (negative index) considering given delimiters from an input string.
@@ -21525,6 +21674,7 @@ hostname                                           string
 int(<integer>)                                     signed
 ipv4(<ipv4>)                                       ipv4
 ipv6(<ipv6>)                                       ipv6
+last_entity                                        string
 last_rule_file                                     string
 last_rule_line                                     integer
 lat_ns_avg                                         integer
@@ -21555,6 +21705,7 @@ txn.id32                                           integer
 txn.sess_term_state                                string
 uuid([<version>])                                  string
 var(<var-name>[,<default>])                        undefined
+waiting_entity                                     string
 -------------------------------------------------+-------------
 
 Detailed list:
@@ -21792,6 +21943,35 @@ ipv4(<ipv4>) : ipv4
 
 ipv6(<ipv6>) : ipv6
   Returns an ipv6.
+
+last_entity : string
+  This returns the identity of the last entity that was evaluated during stream
+  analysis. It may be the final rule that matched or the filter that
+  interrupted the processing.
+
+  A final rule is one that terminates the evaluation of the rule set (like an
+  "accept", "deny" or "redirect"). This works for TCP request and response
+  rules acting on the "content" rulesets, and on HTTP rules from
+  "http-request", "http-response" and "http-after-response" rule sets. The
+  legacy "redirect" rulesets are not supported (such information is not stored
+  there), and neither "tcp-request connection" nor "tcp-request session"
+  rulesets are supported because the information is stored at the stream level
+  and streams do not exist during these rules. In that case, the returned value
+  is equivalent to "last_rule_file:last_rule_line".
+  See also "last_rule_file", "last_rule_line".
+
+  For a filter, its identifier is returned as defined by the developers. If
+  this identifier is not defined, an hexadecimal value is returned
+  corresponding to an unique internal identifier.
+
+  The main purpose of this function is to be able to report in logs the last
+  entity that interrupted a processing, in order to help debugging issues. The
+  information returned on entities may changed in time and must not be used for
+  something else than debugging.
+
+  Example:
+      # Log the last entity, if any, and only if an error is reported
+      log-format "$HAPROXY_HTTP_LOG_FMT %{Q}[last_entity,when(error)]
 
 last_rule_file : string
   This returns the name of the configuration file containing the last final
@@ -22035,6 +22215,30 @@ var(<var-name>[,<default>]) : undefined
   return it as a string. Empty strings are permitted. See section 2.8 about
   variables for details.
 
+waiting_entity : string
+  This returns the identity of the entity that was waiting to continue its
+  processing when an error or a timeout was encountered. It may be the a rule
+  or a filter for instance. However, this list is not exhaustive and the format
+  of all possible entities is not forcefully documented.
+
+  When the entity is a rule, its location is returned. It is the configuration
+  file containing the rule followed by the line where the rule is defined in
+  this file, separated by a colon.
+
+  For a filter, its identifier is returned as defined by the developers. If
+  this identifier is not defined, an hexadecimal value is returned
+  corresponding to an unique internal identifier.
+
+  The main purpose of this function is to be able to report in logs the entity
+  blocking the stream analysis when an error or a timeout was encountered,
+  interrupting this processing, in order to help debugging issues. The
+  information returned on entities may changed in time and must not be used for
+  something else than debugging.
+
+  Example:
+      # Log the waiting entity, if any, and only if an error is reported
+      log-format "$HAPROXY_HTTP_LOG_FMT %{Q}[waiting_entity,when(error)]
+
 7.3.3. Fetching samples at Layer 4
 ----------------------------------
 
@@ -22063,6 +22267,7 @@ bc_be_queue                                        integer
 bc_dst                                             ip
 bc_dst_port                                        integer
 bc_err                                             integer
+bc_err_name                                        string
 bc_err_str                                         string
 bc_glitches                                        integer
 bc_http_major                                      integer
@@ -22092,6 +22297,7 @@ fc_dst                                             ip
 fc_dst_is_local                                    boolean
 fc_dst_port                                        integer
 fc_err                                             integer
+fc_err_name                                        string
 fc_err_str                                         string
 fc_fackets                                         integer
 fc_glitches                                        integer
@@ -22250,6 +22456,8 @@ src_get_gpc0([<table>])                            integer
 src_get_gpc1([<table>])                            integer
 src_get_gpt(<idx>[,<table>])                       integer
 src_get_gpt0([<table>])                            integer
+src_glitch_cnt([<table>])                          integer
+src_glitch_rate([<table>])                         integer
 src_gpc_rate(<idx>[,<table>])                      integer
 src_gpc0_rate([<table>])                           integer
 src_gpc1_rate([<table>])                           integer
@@ -22317,6 +22525,12 @@ bc_err : integer
   Returns the ID of the error that might have occurred on the current backend
   connection. See the "fc_err_str" fetch for a full list of error codes
   and their corresponding error message.
+
+bc_err_name : string
+  Returns the internal error name describing what problem happened on the
+  backend connection, resulting in a connection failure. This string is made of
+  a single word and is empty when no error is present. It corresponds to the
+  "name" column in the table presented in the "fc_err_str" keyword.
 
 bc_err_str : string
   Returns an error message describing what problem happened on the current
@@ -22500,60 +22714,79 @@ fc_err : integer
   described in section 8.2.5). See the "fc_err_str" fetch for a full list of
   error codes and their corresponding error message.
 
+fc_err_name : string
+  Returns the internal error name describing what problem happened on the
+  frontend connection, resulting in a connection failure. This string is made
+  of a single word and is empty when no error is present. It corresponds to the
+  "name" column in the table presented in the "fc_err_str" keyword.
+
 fc_err_str : string
   Returns an error message describing what problem happened on the current
   connection, resulting in a connection failure. This string corresponds to the
   "message" part of the error log format (see section 8.2.5). See below for a
   full list of error codes and their corresponding error messages :
 
-  +----+---------------------------------------------------------------------------+
-  | ID | message                                                                   |
-  +----+---------------------------------------------------------------------------+
-  | 0  | "Success"                                                                 |
-  | 1  | "Reached configured maxconn value"                                        |
-  | 2  | "Too many sockets on the process"                                         |
-  | 3  | "Too many sockets on the system"                                          |
-  | 4  | "Out of system buffers"                                                   |
-  | 5  | "Protocol or address family not supported"                                |
-  | 6  | "General socket error"                                                    |
-  | 7  | "Source port range exhausted"                                             |
-  | 8  | "Can't bind to source address"                                            |
-  | 9  | "Out of local source ports on the system"                                 |
-  | 10 | "Local source address already in use"                                     |
-  | 11 | "Connection closed while waiting for PROXY protocol header"               |
-  | 12 | "Connection error while waiting for PROXY protocol header"                |
-  | 13 | "Timeout while waiting for PROXY protocol header"                         |
-  | 14 | "Truncated PROXY protocol header received"                                |
-  | 15 | "Received something which does not look like a PROXY protocol header"     |
-  | 16 | "Received an invalid PROXY protocol header"                               |
-  | 17 | "Received an unhandled protocol in the PROXY protocol header"             |
-  | 18 | "Connection closed while waiting for NetScaler Client IP header"          |
-  | 19 | "Connection error while waiting for NetScaler Client IP header"           |
-  | 20 | "Timeout while waiting for a NetScaler Client IP header"                  |
-  | 21 | "Truncated NetScaler Client IP header received"                           |
-  | 22 | "Received an invalid NetScaler Client IP magic number"                    |
-  | 23 | "Received an unhandled protocol in the NetScaler Client IP header"        |
-  | 24 | "Connection closed during SSL handshake"                                  |
-  | 25 | "Connection error during SSL handshake"                                   |
-  | 26 | "Timeout during SSL handshake"                                            |
-  | 27 | "Too many SSL connections"                                                |
-  | 28 | "Out of memory when initializing an SSL connection"                       |
-  | 29 | "Rejected a client-initiated SSL renegotiation attempt"                   |
-  | 30 | "SSL client CA chain cannot be verified"                                  |
-  | 31 | "SSL client certificate not trusted"                                      |
-  | 32 | "Server presented an SSL certificate different from the configured one"   |
-  | 33 | "Server presented an SSL certificate different from the expected one"     |
-  | 34 | "SSL handshake failure"                                                   |
-  | 35 | "SSL handshake failure after heartbeat"                                   |
-  | 36 | "Stopped a TLSv1 heartbeat attack (CVE-2014-0160)"                        |
-  | 37 | "Attempt to use SSL on an unknown target (internal error)"                |
-  | 38 | "Server refused early data"                                               |
-  | 39 | "SOCKS4 Proxy write error during handshake"                               |
-  | 40 | "SOCKS4 Proxy read error during handshake"                                |
-  | 41 | "SOCKS4 Proxy deny the request"                                           |
-  | 42 | "SOCKS4 Proxy handshake aborted by server"                                |
-  | 43 | "SSL fatal error"                                                         |
-  +----+---------------------------------------------------------------------------+
+  +----+------------------+-------------------------------------------------------------------------+
+  | ID | name             | message                                                                 |
+  +----+------------------+-------------------------------------------------------------------------+
+  | 0  | -                | "Success"                                                               |
+  | 1  | CONF_FDLIM       | "Reached configured maxconn value"                                      |
+  | 2  | PROC_FDLIM       | "Too many sockets on the process"                                       |
+  | 3  | SYS_FDLIM        | "Too many sockets on the system"                                        |
+  | 4  | SYS_MEMLIM       | "Out of system buffers"                                                 |
+  | 5  | NOPROTO          | "Protocol or address family not supported"                              |
+  | 6  | SOCK_ERR         | "General socket error"                                                  |
+  | 7  | PORT_RANGE       | "Source port range exhausted"                                           |
+  | 8  | CANT_BIND        | "Can't bind to source address"                                          |
+  | 9  | FREE_PORTS       | "Out of local source ports on the system"                               |
+  | 10 | ADDR_INUSE       | "Local source address already in use"                                   |
+  | 11 | PRX_EMPTY        | "Connection closed while waiting for PROXY protocol header"             |
+  | 12 | PRX_ABORT        | "Connection error while waiting for PROXY protocol header"              |
+  | 13 | PRX_TIMEOUT      | "Timeout while waiting for PROXY protocol header"                       |
+  | 14 | PRX_TRUNCATED    | "Truncated PROXY protocol header received"                              |
+  | 15 | PRX_NOT_HDR      | "Received something which does not look like a PROXY protocol header"   |
+  | 16 | PRX_BAD_HDR      | "Received an invalid PROXY protocol header"                             |
+  | 17 | PRX_BAD_PROTO    | "Received an unhandled protocol in the PROXY protocol header"           |
+  | 18 | CIP_EMPTY        | "Connection closed while waiting for NetScaler Client IP header"        |
+  | 19 | CIP_ABORT        | "Connection error while waiting for NetScaler Client IP header"         |
+  | 20 | CIP_TIMEOUT      | "Timeout while waiting for a NetScaler Client IP header"                |
+  | 21 | CIP_TRUNCATED    | "Truncated NetScaler Client IP header received"                         |
+  | 22 | CIP_BAD_MAGIC    | "Received an invalid NetScaler Client IP magic number"                  |
+  | 23 | CIP_BAD_PROTO    | "Received an unhandled protocol in the NetScaler Client IP header"      |
+  | 24 | SSL_EMPTY        | "Connection closed during SSL handshake"                                |
+  | 25 | SSL_ABORT        | "Connection error during SSL handshake"                                 |
+  | 26 | SSL_TIMEOUT      | "Timeout during SSL handshake"                                          |
+  | 27 | SSL_TOO_MANY     | "Too many SSL connections"                                              |
+  | 28 | SSL_NO_MEM       | "Out of memory when initializing an SSL connection"                     |
+  | 29 | SSL_RENEG        | "Rejected a client-initiated SSL renegotiation attempt"                 |
+  | 30 | SSL_CA_FAIL      | "SSL client CA chain cannot be verified"                                |
+  | 31 | SSL_CRT_FAIL     | "SSL client certificate not trusted"                                    |
+  | 32 | SSL_MISMATCH     | "Server presented an SSL certificate different from the configured one" |
+  | 33 | SSL_MISMATCH_SNI | "Server presented an SSL certificate different from the expected one"   |
+  | 34 | SSL_HANDSHAKE    | "SSL handshake failure"                                                 |
+  | 35 | SSL_HANDSHAKE_HB | "SSL handshake failure after heartbeat"                                 |
+  | 36 | SSL_KILLED_HB    | "Stopped a TLSv1 heartbeat attack (CVE-2014-0160)"                      |
+  | 37 | SSL_NO_TARGET    | "Attempt to use SSL on an unknown target (internal error)"              |
+  | 38 | SSL_EARLY_FAILED | "Server refused early data"                                             |
+  | 39 | SOCKS4_SEND      | "SOCKS4 Proxy write error during handshake"                             |
+  | 40 | SOCKS4_RECV      | "SOCKS4 Proxy read error during handshake"                              |
+  | 41 | SOCKS4_DENY      | "SOCKS4 Proxy deny the request"                                         |
+  | 42 | SOCKS4_ABORT     | "SOCKS4 Proxy handshake aborted by server"                              |
+  | 43 | SSL_FATAL        | "SSL fatal error"                                                       |
+  | 44 | REVERSE          | "Reverse connect failure"                                               |
+  | 45 | POLLERR          | "Poller reported POLLERR"                                               |
+  | 46 | EREFUSED         | "ECONNREFUSED returned by OS"                                           |
+  | 47 | ERESET           | "ECONNRESET returned by OS"                                             |
+  | 48 | EUNREACH         | "ENETUNREACH returned by OS"                                            |
+  | 49 | ENOMEM           | "ENOMEM returned by OS"                                                 |
+  | 50 | EBADF            | "EBADF returned by OS"                                                  |
+  | 51 | EFAULT           | "EFAULT returned by OS"                                                 |
+  | 52 | EINVAL           | "EINVAL returned by OS"                                                 |
+  | 53 | ENCONN           | "ENCONN returned by OS"                                                 |
+  | 54 | ENSOCK           | "ENSOCK returned by OS"                                                 |
+  | 55 | ENOBUFS          | "ENOBUFS returned by OS"                                                |
+  | 56 | EPIPE            | "EPIPE returned by OS"                                                  |
+  +----+------------------+-------------------------------------------------------------------------+
 
 fc_fackets : integer
   Returns the fack counter measured by the kernel for the client
@@ -28501,6 +28734,9 @@ socket type and the transport method.
 -----------------------------
 
 'abns@<name>' following <name> is an abstract namespace (Linux only).
+
+'abnsz@<name>' following <name> is a zero-terminated abstract namespace
+               (Linux only).
 
 'fd@<n>'      following address is a file descriptor <n> inherited from the
               parent. The fd must be bound and may or may not already be

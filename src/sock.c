@@ -385,6 +385,28 @@ void sock_unbind(struct receiver *rx)
 	rx->fd = -1;
 }
 
+/* restore effective family for UNIX type sockets if needed. Indeed since
+ * kernel doesn't know about custom UNIX families (internal to HAproxy),
+ * they lost when leveraging syscalls such as getsockname() or getpeername().
+ *
+ * This function guesses the effective family by analyzing address and address
+ * length as returned by getsockname() and getpeername() calls.
+ */
+static void sock_restore_unix_family(struct sockaddr_un *un, socklen_t socklen)
+{
+	BUG_ON(un->sun_family != AF_UNIX);
+
+	if (un->sun_path[0]); // regular UNIX socket, not a custom family
+	else if (socklen == sizeof(*un))
+		un->sun_family = AF_CUST_ABNS;
+	else {
+		/* not all struct sockaddr_un space is used..
+		 * (sun_path is partially filled)
+		 */
+		un->sun_family = AF_CUST_ABNSZ;
+	}
+}
+
 /*
  * Retrieves the source address for the socket <fd>, with <dir> indicating
  * if we're a listener (=0) or an initiator (!=0). It returns 0 in case of
@@ -393,10 +415,19 @@ void sock_unbind(struct receiver *rx)
  */
 int sock_get_src(int fd, struct sockaddr *sa, socklen_t salen, int dir)
 {
+	int ret;
+
 	if (dir)
-		return getsockname(fd, sa, &salen);
+		ret = getsockname(fd, sa, &salen);
 	else
-		return getpeername(fd, sa, &salen);
+		ret = getpeername(fd, sa, &salen);
+
+	if (ret)
+		return ret;
+	if (sa->sa_family == AF_UNIX)
+		sock_restore_unix_family((struct sockaddr_un *)sa, salen);
+
+	return ret;
 }
 
 /*
@@ -407,10 +438,19 @@ int sock_get_src(int fd, struct sockaddr *sa, socklen_t salen, int dir)
  */
 int sock_get_dst(int fd, struct sockaddr *sa, socklen_t salen, int dir)
 {
+	int ret;
+
 	if (dir)
-		return getpeername(fd, sa, &salen);
+		ret = getpeername(fd, sa, &salen);
 	else
-		return getsockname(fd, sa, &salen);
+		ret = getsockname(fd, sa, &salen);
+
+	if (ret)
+		return ret;
+	if (sa->sa_family == AF_UNIX)
+		sock_restore_unix_family((struct sockaddr_un *)sa, salen);
+
+	return ret;
 }
 
 /* Try to retrieve exported sockets from worker at CLI <unixsocket>. These
@@ -440,6 +480,17 @@ int sock_get_old_sockets(const char *unixsocket)
 		int sv[2];
 		int dst_fd;
 
+		/* dst_fd is always open in the worker process context because
+		 * it's inherited from the master via -x cmd option. It's closed
+		 * futher in main (after bind_listeners()) and not here for the
+		 * simplicity. In main(), after bind_listeners(), it's safe just
+		 * to loop over all workers list, launched before this reload and
+		 * to close its ipc_fd[0], thus we also close this fd. If we
+		 * would close dst_fd here, it might be potentially "reused" in
+		 * bind_listeners() followed this call, thus it would be difficult
+		 * to exclude it, in the case if it was bound again when we will
+		 * filter the previous workers list.
+		 */
 		dst_fd = strtoll(unixsocket + strlen("sockpair@"), NULL, 0);
 
 		if (socketpair(PF_UNIX, SOCK_STREAM, 0, sv) == -1) {
@@ -589,6 +640,13 @@ int sock_get_old_sockets(const char *unixsocket)
 			ha_free(&xfer_sock);
 			continue;
 		}
+		if (xfer_sock->addr.ss_family == AF_UNIX) {
+			/* restore effective family if needed, because getsockname()
+			 * only knows about real families:
+			 */
+			sock_restore_unix_family((struct sockaddr_un *)&xfer_sock->addr, socklen);
+		}
+
 
 		if (curoff >= maxoff) {
 			ha_warning("Inconsistency while transferring sockets\n");

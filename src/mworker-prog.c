@@ -118,7 +118,6 @@ int mworker_ext_launch_all()
 
 				/* This one must not be exported, it's internal! */
 				unsetenv("HAPROXY_MWORKER_REEXEC");
-				unsetenv("HAPROXY_STARTUPLOGS_FD");
 				unsetenv("HAPROXY_PROCESSES");
 				execvp(child->command[0], child->command);
 
@@ -194,6 +193,10 @@ int cfg_parse_program(const char *file, int linenum, char **args, int kwm)
 			err_code |= ERR_ALERT | ERR_ABORT;
 			goto error;
 		}
+
+		ha_warning("parsing [%s:%d]: The '%s' section is deprecated and will eventually be removed, please consider "
+		           "using a process manager instead, such as sysvinit, systemd, supervisord or s6\n",
+		           file, linenum, args[0]);
 
 		LIST_APPEND(&proc_list, &ext_child->list);
 
@@ -333,31 +336,4 @@ out:
 
 }
 
-int cfg_program_postparser()
-{
-	int err_code = 0;
-	struct mworker_proc *child;
-
-	if (!(global.mode & MODE_DISCOVERY))
-		return err_code;
-
-	list_for_each_entry(child, &proc_list, list) {
-		if (child->reloads == 0 && (child->options & PROC_O_TYPE_PROG)) {
-			if (child->command == NULL) {
-				ha_alert("The program section '%s' lacks a command to launch.\n", child->id);
-				err_code |= ERR_ALERT | ERR_FATAL;
-			}
-		}
-	}
-
-	if (use_program && !(global.mode & MODE_MWORKER)) {
-		ha_alert("Can't use a 'program' section without master worker mode.\n");
-		err_code |= ERR_ALERT | ERR_FATAL;
-	}
-
-	return err_code;
-}
-
-
 REGISTER_CONFIG_SECTION("program", cfg_parse_program, NULL);
-REGISTER_CONFIG_POSTPARSER("program", cfg_program_postparser);

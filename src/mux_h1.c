@@ -346,6 +346,8 @@ static void h1_shutw_conn(struct connection *conn);
 static void h1_wake_stream_for_recv(struct h1s *h1s);
 static void h1_wake_stream_for_send(struct h1s *h1s);
 static void h1s_destroy(struct h1s *h1s);
+static int h1_dump_h1c_info(struct buffer *msg, struct h1c *h1c, const char *pfx);
+static int h1_dump_h1s_info(struct buffer *msg, const struct h1s *h1s, const char *pfx);
 
 /* returns the stconn associated to the H1 stream */
 static forceinline struct stconn *h1s_sc(const struct h1s *h1s)
@@ -414,6 +416,15 @@ static void h1_trace(enum trace_level level, uint64_t mask, const struct trace_s
 	chunk_appendf(&trace_buf, " - h1c=%p(0x%08x)", h1c, h1c->flags);
 	if (h1c->conn)
 		chunk_appendf(&trace_buf, " conn=%p(0x%08x)", h1c->conn, h1c->conn->flags);
+	chunk_appendf(&trace_buf, " .task=%p", h1c->task);
+	if (h1c->task) {
+		chunk_appendf(&trace_buf, " .exp=%s",
+			      h1c->task->expire ? tick_is_expired(h1c->task->expire, now_ms) ? "<PAST>" :
+			      human_time(TICKS_TO_MS(h1c->task->expire - now_ms), TICKS_TO_MS(1000)) : "<NEVER>");
+	}
+	chunk_appendf(&trace_buf, " .idle_exp=%s",
+		      h1c->idle_exp ? tick_is_expired(h1c->idle_exp, now_ms) ? "<PAST>" :
+		      human_time(TICKS_TO_MS(h1c->idle_exp - now_ms), TICKS_TO_MS(1000)) : "<NEVER>");
 	if (h1s) {
 		chunk_appendf(&trace_buf, " h1s=%p(0x%08x)", h1s, h1s->flags);
 		if (h1s->sd)
@@ -683,24 +694,24 @@ static void h1_refresh_timeout(struct h1c *h1c)
 			 * timeouts so that we don't hang too long on clients that have
 			 * gone away (especially in tunnel mode).
 			 */
-			h1c->task->expire = tick_add(now_ms, h1c->shut_timeout);
+			h1c->task->expire = tick_add_ifset(now_ms, h1c->shut_timeout);
 			TRACE_DEVEL("refreshing connection's timeout (dead or half-closed)", H1_EV_H1C_SEND|H1_EV_H1C_RECV, h1c->conn);
 			is_idle_conn = 1;
 		}
 		else if (b_data(&h1c->obuf)) {
 			/* alive connection with pending outgoing data, need a timeout (server or client). */
-			h1c->task->expire = tick_add(now_ms, h1c->timeout);
+			h1c->task->expire = tick_add_ifset(now_ms, h1c->timeout);
 			TRACE_DEVEL("refreshing connection's timeout (pending outgoing data)", H1_EV_H1C_SEND|H1_EV_H1C_RECV, h1c->conn);
 		}
 		else if (!(h1c->flags & H1C_F_IS_BACK) && (h1c->state == H1_CS_IDLE)) {
 			/* idle front connections. */
-			h1c->task->expire = (tick_isset(h1c->idle_exp) ? h1c->idle_exp : tick_add(now_ms, h1c->timeout));
+			h1c->task->expire = (tick_isset(h1c->idle_exp) ? h1c->idle_exp : tick_add_ifset(now_ms, h1c->timeout));
 			TRACE_DEVEL("refreshing connection's timeout (idle front h1c)", H1_EV_H1C_SEND|H1_EV_H1C_RECV, h1c->conn);
 			is_idle_conn = 1;
 		}
 		else if (!(h1c->flags & H1C_F_IS_BACK) && (h1c->state != H1_CS_RUNNING)) {
 			/* alive front connections waiting for a fully usable stream need a timeout. */
-			h1c->task->expire = tick_add(now_ms, h1c->timeout);
+			h1c->task->expire = tick_first(h1c->idle_exp, tick_add_ifset(now_ms, h1c->timeout));
 			TRACE_DEVEL("refreshing connection's timeout (alive front h1c but not ready)", H1_EV_H1C_SEND|H1_EV_H1C_RECV, h1c->conn);
 			/* A frontend connection not yet ready could be treated the same way as an idle
 			 * one in case of soft-close.
@@ -712,9 +723,6 @@ static void h1_refresh_timeout(struct h1c *h1c)
 			h1c->task->expire = TICK_ETERNITY;
 			TRACE_DEVEL("no connection timeout (alive back h1c or front h1c with an SC)", H1_EV_H1C_SEND|H1_EV_H1C_RECV, h1c->conn);
 		}
-
-		/* Finally set the idle expiration date if shorter */
-		h1c->task->expire = tick_first(h1c->task->expire, h1c->idle_exp);
 
 		if ((h1c->px->flags & (PR_FL_DISABLED|PR_FL_STOPPED)) &&
 		     is_idle_conn && tick_isset(global.close_spread_end)) {
@@ -1018,10 +1026,15 @@ static void h1s_destroy(struct h1s *h1s)
 			h1c->state = H1_CS_IDLE;
 			h1c->flags |= H1C_F_WAIT_NEXT_REQ;
 			h1c->req_count++;
+
+			COUNT_IF(!(h1c->flags & H1C_F_IS_BACK) && b_data(&h1c->obuf), "front H1C switched in IDLE state with pending outgoing data");
+			COUNT_IF((h1c->flags & H1C_F_IS_BACK) && b_data(&h1c->obuf), "back H1C switched in IDLE state with pending outgoing data");
 			TRACE_STATE("set idle mode on h1c, waiting for the next request", H1_EV_H1C_ERR, h1c->conn, h1s);
 		}
 		else {
 			h1_close(h1c);
+			COUNT_IF(!(h1c->flags & H1C_F_IS_BACK) && b_data(&h1c->obuf), "front H1C swiched in CLOSED state with pending outgoing data");
+			COUNT_IF((h1c->flags & H1C_F_IS_BACK) && b_data(&h1c->obuf), "back H1C switch in CLOSED state with pending outgoing data");
 			TRACE_STATE("close h1c", H1_EV_H1S_END, h1c->conn, h1s);
 		}
 
@@ -1260,19 +1273,16 @@ static int h1_init(struct connection *conn, struct proxy *proxy, struct session 
 		LIST_APPEND(&mux_stopping_data[tid].list,
 		            &h1c->conn->stopping_list);
 	}
-	if (tick_isset(h1c->timeout)) {
-		t = task_new_here();
-		if (!t) {
-			TRACE_ERROR("H1C task allocation failure", H1_EV_H1C_NEW|H1_EV_H1C_END|H1_EV_H1C_ERR);
-			goto fail;
-		}
 
-		h1c->task = t;
-		t->process = h1_timeout_task;
-		t->context = h1c;
-
-		t->expire = tick_add(now_ms, h1c->timeout);
+	t = task_new_here();
+	if (!t) {
+		TRACE_ERROR("H1C task allocation failure", H1_EV_H1C_NEW|H1_EV_H1C_END|H1_EV_H1C_ERR);
+		goto fail;
 	}
+	h1c->task = t;
+	t->process = h1_timeout_task;
+	t->context = h1c;
+	t->expire = tick_add_ifset(now_ms, h1c->timeout);
 
 	conn->ctx = h1c;
 
@@ -1353,6 +1363,8 @@ static void h1_release(struct h1c *h1c)
 		sess_log(conn->owner); /* Log if the upgrade failed */
 	}
 
+	COUNT_IF(b_data(&h1c->ibuf), "H1C released with pending input data");
+	COUNT_IF(b_data(&h1c->obuf), "H1C released with pending output data");
 
 	b_dequeue(&h1c->buf_wait);
 	h1_release_buf(h1c, &h1c->ibuf);
@@ -2285,6 +2297,7 @@ static size_t h1_process_demux(struct h1c *h1c, struct buffer *buf, size_t count
 				if (h1m->state <= H1_MSG_LAST_LF && b_data(&h1c->ibuf))
 					htx->flags |= HTX_FL_PARSING_ERROR;
 				se_fl_set(h1s->sd, SE_FL_ERROR);
+				COUNT_IF(1, "H1C EOS before the end of the message");
 				TRACE_ERROR("message aborted, set error on SC", H1_EV_RX_DATA|H1_EV_H1S_ERR, h1c->conn, h1s);
 			}
 
@@ -2297,6 +2310,7 @@ static size_t h1_process_demux(struct h1c *h1c, struct buffer *buf, size_t count
 		if (h1c->flags & H1C_F_ERROR) {
 			/* Report a terminal error to the SE if a previous read error was detected */
 			se_fl_set(h1s->sd, SE_FL_ERROR);
+			COUNT_IF(h1m->state < H1_MSG_DONE, "H1C ERROR before the end of the message");
 			TRACE_STATE("report ERROR to SE", H1_EV_RX_DATA|H1_EV_H1S_ERR, h1c->conn, h1s);
 		}
 	}
@@ -2913,6 +2927,7 @@ static size_t h1_make_data(struct h1s *h1s, struct h1m *h1m, struct buffer *buf,
 
 		if (h1m->flags & H1_MF_CLEN) {
 			if (count > h1m->curr_len) {
+				COUNT_IF(1, "more payload than announced (0-copy)");
 				TRACE_ERROR("more payload than announced",
 					    H1_EV_TX_DATA|H1_EV_STRM_ERR|H1_EV_H1C_ERR|H1_EV_H1S_ERR, h1c->conn, h1s);
 				goto error;
@@ -2936,6 +2951,7 @@ static size_t h1_make_data(struct h1s *h1s, struct h1m *h1m, struct buffer *buf,
 			/* If is a new chunk, prepend the chunk size */
 			if (h1m->state == H1_MSG_CHUNK_CRLF || h1m->state == H1_MSG_CHUNK_SIZE) {
 				if (h1m->curr_len) {
+					COUNT_IF(1, "chunk bigger than announced (0-copy)");
 					TRACE_ERROR("chunk bigger than announced",
 						    H1_EV_TX_DATA|H1_EV_STRM_ERR|H1_EV_H1C_ERR|H1_EV_H1S_ERR, h1c->conn, h1s);
 					goto error;
@@ -2963,6 +2979,7 @@ static size_t h1_make_data(struct h1s *h1s, struct h1m *h1m, struct buffer *buf,
 			/* It is the end of the message, add the last chunk with the extra CRLF */
 			if (eom) {
 				if (h1m->curr_len) {
+					COUNT_IF(1, "chunk smaller than announced (0-copy)");
 					TRACE_ERROR("chunk smaller than announced",
 						    H1_EV_TX_DATA|H1_EV_STRM_ERR|H1_EV_H1C_ERR|H1_EV_H1S_ERR, h1c->conn, h1s);
 					goto error;
@@ -2987,6 +3004,7 @@ static size_t h1_make_data(struct h1s *h1s, struct h1m *h1m, struct buffer *buf,
 	/* Handle now case of CRLF at the end of a chun. */
 	if ((h1m->flags & H1_MF_CHNK) && h1m->state == H1_MSG_CHUNK_CRLF) {
 		if (h1m->curr_len) {
+			COUNT_IF(1, "chunk bigger than announced");
 			TRACE_ERROR("chunk bigger than announced",
 				    H1_EV_TX_DATA|H1_EV_STRM_ERR|H1_EV_H1C_ERR|H1_EV_H1S_ERR, h1c->conn, h1s);
 			goto error;
@@ -3060,6 +3078,7 @@ static size_t h1_make_data(struct h1s *h1s, struct h1m *h1m, struct buffer *buf,
 
 			if (h1m->flags & H1_MF_CLEN) {
 				if (vlen > h1m->curr_len) {
+					COUNT_IF(1, "more payload than announced");
 					TRACE_ERROR("more payload than announced",
 						    H1_EV_TX_DATA|H1_EV_STRM_ERR|H1_EV_H1C_ERR|H1_EV_H1S_ERR, h1c->conn, h1s);
 					goto error;
@@ -3076,6 +3095,7 @@ static size_t h1_make_data(struct h1s *h1s, struct h1m *h1m, struct buffer *buf,
 				}
 				if (last_data) {
 					if (h1m->curr_len) {
+						COUNT_IF(1, "chunk smaller than announced");
 						TRACE_ERROR("chunk smaller than announced",
 							    H1_EV_TX_DATA|H1_EV_STRM_ERR|H1_EV_H1C_ERR|H1_EV_H1S_ERR, h1c->conn, h1s);
 						goto error;
@@ -3472,6 +3492,7 @@ static size_t h1_process_mux(struct h1c *h1c, struct buffer *buf, size_t count)
 				htx->flags |= HTX_FL_PROCESSING_ERROR;
 				h1s->flags |= H1S_F_PROCESSING_ERROR;
 				se_fl_set(h1s->sd, SE_FL_ERROR);
+				COUNT_IF(1, "processing error during message formatting");
 				TRACE_ERROR("processing error", H1_EV_TX_DATA|H1_EV_STRM_ERR|H1_EV_H1C_ERR|H1_EV_H1S_ERR, h1c->conn, h1s);
 				break;
 		}
@@ -3838,6 +3859,7 @@ static int h1_recv(struct h1c *h1c)
 	}
 	if (h1c->conn->flags & CO_FL_ERROR) {
 		TRACE_DEVEL("connection error", H1_EV_H1C_RECV, h1c->conn);
+		COUNT_IF(b_data(&h1c->obuf), "connection error (recv) with pending output data");
 		h1c->flags |= H1C_F_ERROR;
 	}
 
@@ -3876,6 +3898,7 @@ static int h1_send(struct h1c *h1c)
 
 	if (h1c->flags & (H1C_F_ERROR|H1C_F_ERR_PENDING)) {
 		TRACE_DEVEL("leaving on H1C error|err_pending", H1_EV_H1C_SEND, h1c->conn);
+		COUNT_IF(b_data(&h1c->obuf), "connection error (send) with pending output data");
 		b_reset(&h1c->obuf);
 		if (h1c->flags & H1C_F_EOS)
 			h1c->flags |= H1C_F_ERROR;
@@ -3905,6 +3928,7 @@ static int h1_send(struct h1c *h1c)
 	if (conn->flags & CO_FL_ERROR) {
 		/* connection error, nothing to send, clear the buffer to release it */
 		TRACE_DEVEL("connection error", H1_EV_H1C_SEND, h1c->conn);
+		COUNT_IF(b_data(&h1c->obuf), "connection error (send) with pending output data");
 		h1c->flags |= H1C_F_ERR_PENDING;
 		if (h1c->flags & H1C_F_EOS)
 			h1c->flags |= H1C_F_ERROR;
@@ -4307,6 +4331,9 @@ struct task *h1_timeout_task(struct task *t, void *context, unsigned int state)
 			return t;
 		}
 
+		COUNT_IF(b_data(&h1c->ibuf), "H1C timed out with pending input data");
+		COUNT_IF(b_data(&h1c->obuf), "H1C timed out with pending output data");
+
 		/* We're about to destroy the connection, so make sure nobody attempts
 		 * to steal it from us.
 		 */
@@ -4411,6 +4438,7 @@ static void h1_detach(struct sedesc *sd)
 
 	if (h1c->state == H1_CS_RUNNING && !(h1c->flags & H1C_F_IS_BACK) && h1s->req.state != H1_MSG_DONE) {
 		h1c->state = H1_CS_DRAINING;
+		COUNT_IF(1, "Deferring H1S destroy to drain message");
 		TRACE_DEVEL("Deferring H1S destroy to drain message", H1_EV_STRM_END, h1s->h1c->conn, h1s);
 		/* If we have a pending data, process it immediately or
 		 * subscribe for reads waiting for new data
@@ -4446,6 +4474,9 @@ static void h1_shut(struct stconn *sc, unsigned int mode, struct se_abort_info *
 		goto end;
 
   do_shutw:
+	COUNT_IF((h1c->flags & H1C_F_IS_BACK) && (h1s->res.state < H1_MSG_DONE), "Abort sending of the response");
+	COUNT_IF(!(h1c->flags & H1C_F_IS_BACK) && (h1s->req.state < H1_MSG_DONE), "Abort sending of the request");
+
 	h1_close(h1c);
 	if (!(mode & SE_SHW_NORMAL))
 		h1c->flags |= H1C_F_SILENT_SHUT;
@@ -4464,6 +4495,9 @@ static void h1_shutw_conn(struct connection *conn)
 	h1_close(h1c);
 	if (conn->flags & CO_FL_SOCK_WR_SH)
 		return;
+
+	COUNT_IF(b_data(&h1c->ibuf), "close connection with pending input data");
+	COUNT_IF(b_data(&h1c->obuf), "close connection with pending output data");
 
 	conn_xprt_shutw(conn);
 	conn_sock_shutw(conn, !(h1c->flags & H1C_F_SILENT_SHUT));
@@ -4878,6 +4912,7 @@ static size_t h1_done_ff(struct stconn *sc)
 			 */
 			h1c->conn->xprt->subscribe(h1c->conn, h1c->conn->xprt_ctx, SUB_RETRY_RECV, &h1c->wait_event);
 		}
+		COUNT_IF(b_data(&h1c->obuf) || (sd->iobuf.pipe && sd->iobuf.pipe->data), "connection error (done_ff) with pending output data");
 		se_fl_set_error(h1s->sd);
 		if (sd->iobuf.pipe) {
 			put_pipe(sd->iobuf.pipe);
@@ -5009,6 +5044,7 @@ static int h1_fastfwd(struct stconn *sc, unsigned int count, unsigned int flags)
 		if (total > h1m->curr_len) {
 			h1s->flags |= H1S_F_PARSING_ERROR;
 			se_fl_set(h1s->sd, SE_FL_ERROR);
+			COUNT_IF(1, "more payload than announced");
 			TRACE_ERROR("too much payload, more than announced",
 				    H1_EV_STRM_RECV|H1_EV_STRM_ERR|H1_EV_H1C_ERR|H1_EV_H1S_ERR, h1c->conn, h1s);
 			goto end;
@@ -5046,6 +5082,7 @@ static int h1_fastfwd(struct stconn *sc, unsigned int count, unsigned int flags)
 		else {
 			se_fl_set(h1s->sd, SE_FL_ERROR);
 			h1c->flags = (h1c->flags & ~H1C_F_WANT_FASTFWD) | H1C_F_ERROR;
+			COUNT_IF(1, "H1C EOS before the end of the message");
 			TRACE_ERROR("message aborted, set error on SC", H1_EV_STRM_RECV|H1_EV_H1S_ERR, h1c->conn, h1s);
 		}
 		h1c->flags = (h1c->flags & ~H1C_F_WANT_FASTFWD) | H1C_F_EOS;
@@ -5054,6 +5091,8 @@ static int h1_fastfwd(struct stconn *sc, unsigned int count, unsigned int flags)
 	if (h1c->conn->flags & CO_FL_ERROR) {
 		se_fl_set(h1s->sd, SE_FL_ERROR);
 		h1c->flags = (h1c->flags & ~H1C_F_WANT_FASTFWD) | H1C_F_ERROR;
+		COUNT_IF(h1m->state < H1_MSG_DONE, "H1C ERROR before the end of the message");
+		COUNT_IF(b_data(&h1c->obuf) || (h1s->sd->iobuf.pipe && h1s->sd->iobuf.pipe->data), "connection error (fastfwd) with pending output data");
 		TRACE_DEVEL("connection error", H1_EV_STRM_ERR|H1_EV_H1C_ERR|H1_EV_H1S_ERR, h1c->conn, h1s);
 	}
 
@@ -5135,6 +5174,7 @@ static int h1_resume_fastfwd(struct stconn *sc, unsigned int flags)
 			h1c->conn->xprt->subscribe(h1c->conn, h1c->conn->xprt_ctx, SUB_RETRY_RECV, &h1c->wait_event);
 		}
 		se_fl_set_error(h1s->sd);
+		COUNT_IF(b_data(&h1c->obuf) || (h1s->sd->iobuf.pipe && h1s->sd->iobuf.pipe->data), "connection error (resume_ff) with pending output data");
 		if (h1s->sd->iobuf.pipe) {
 			put_pipe(h1s->sd->iobuf.pipe);
 			h1s->sd->iobuf.pipe = NULL;
@@ -5182,13 +5222,30 @@ static int h1_sctl(struct stconn *sc, enum mux_sctl_type mux_sctl, void *output)
 {
 	int ret = 0;
 	struct h1s *h1s = __sc_mux_strm(sc);
+	union mux_sctl_dbg_str_ctx *dbg_ctx;
+	struct buffer *buf;
 
 	switch (mux_sctl) {
 	case MUX_SCTL_SID:
 		if (output)
 			*((int64_t *)output) = h1s->h1c->req_count;
 		return ret;
+	case MUX_SCTL_DBG_STR:
+		dbg_ctx = output;
+		buf = get_trash_chunk();
 
+		if (dbg_ctx->arg.debug_flags & MUX_SCTL_DBG_STR_L_MUXS)
+			h1_dump_h1s_info(buf, h1s, NULL);
+
+		if (dbg_ctx->arg.debug_flags & MUX_SCTL_DBG_STR_L_MUXC)
+			h1_dump_h1c_info(buf, h1s->h1c, NULL);
+
+		if (dbg_ctx->arg.debug_flags & MUX_SCTL_DBG_STR_L_CONN)
+			chunk_appendf(buf, " conn.flg=%#08x", h1s->h1c->conn->flags);
+
+		/* other layers not implemented */
+		dbg_ctx->ret.buf = *buf;
+		return ret;
 	default:
 		return -1;
 	}

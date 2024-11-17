@@ -1236,7 +1236,7 @@ static void sc_conn_eos(struct stconn *sc)
 	ic->flags |= CF_READ_EVENT;
 	sc_ep_report_read_activity(sc);
 
-	if (!sc_state_in(sc->state, SC_SB_CON|SC_SB_RDY|SC_SB_EST))
+	if (sc->state != SC_ST_EST)
 		return;
 
 	if (sc->flags & SC_FL_SHUT_DONE)
@@ -1546,8 +1546,11 @@ int sc_conn_recv(struct stconn *sc)
 		se_have_no_more_data(sc->sedesc);
 	}
 	else if (sc->flags & SC_FL_EOI) {
-		/* No more data are expected at this stage */
-		se_have_no_more_data(sc->sedesc);
+		/* No more data are expected at this stage, except if abortonclose is enabled */
+		if (!(flags & CO_RFL_KEEP_RECV))
+			se_have_no_more_data(sc->sedesc);
+		else
+			se_have_more_data(sc->sedesc);
 	}
 	else {
 		/* The mux may have more data to deliver. Be sure to be able to
@@ -1612,6 +1615,8 @@ int sc_conn_send(struct stconn *sc)
 		BUG_ON(sc_ep_test(sc, SE_FL_EOS|SE_FL_ERROR|SE_FL_ERR_PENDING) == (SE_FL_EOS|SE_FL_ERR_PENDING));
 		if (sc_ep_test(sc, SE_FL_ERROR))
 			sc->flags |= SC_FL_ERROR;
+		if (co_data(oc) || sc_ep_have_ff_data(sc))
+			sc_ep_report_blocked_send(sc, 0);
 		return 1;
 	}
 
@@ -1935,7 +1940,7 @@ static void sc_applet_eos(struct stconn *sc)
 
 	/* Note: on abort, we don't call the applet */
 
-	if (!sc_state_in(sc->state, SC_SB_CON|SC_SB_RDY|SC_SB_EST))
+	if (sc->state != SC_ST_EST)
 		return;
 
 	if (sc->flags & SC_FL_SHUT_DONE) {
@@ -2206,6 +2211,8 @@ int sc_applet_send(struct stconn *sc)
 
 	if (sc_ep_test(sc, SE_FL_ERROR | SE_FL_ERR_PENDING)) {
 		BUG_ON(sc_ep_test(sc, SE_FL_EOS|SE_FL_ERROR|SE_FL_ERR_PENDING) == (SE_FL_EOS|SE_FL_ERR_PENDING));
+		if (co_data(oc))
+			sc_ep_report_blocked_send(sc, 0);
 		return 1;
 	}
 

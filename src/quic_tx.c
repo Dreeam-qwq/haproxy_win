@@ -199,7 +199,8 @@ static int qc_may_build_pkt(struct quic_conn *qc, struct list *frms,
 		 (force_ack || nb_aepkts_since_last_ack >= QUIC_MAX_RX_AEPKTS_SINCE_LAST_ACK));
 
 	TRACE_PRINTF(TRACE_LEVEL_DEVELOPER, QUIC_EV_CONN_PHPKTS, qc, 0, 0, 0,
-	             "has_sec=%d cc=%d probe=%d must_ack=%d frms=%d prep_in_fligh=%llu cwnd=%llu",
+	             "%c has_sec=%d cc=%d probe=%d must_ack=%d frms=%d prep_in_fligh=%llu cwnd=%llu",
+	             quic_enc_level_char_from_qel(qel, qc),
 	             quic_tls_has_tx_sec(qel), cc, probe, *must_ack, LIST_ISEMPTY(frms),
 	             (ullong)qc->path->prep_in_flight, (ullong)qc->path->cwnd);
 
@@ -622,14 +623,24 @@ static int qc_prep_pkts(struct quic_conn *qc, struct buffer *buf,
 					break;
 				}
 
-				/* padding will be set for last QEL */
+				/* padding will be set for last QEL, except when probing:
+				 * to build a PING only non coalesced Initial datagram for
+				 * instance when blocked by the anti-amplification limit,
+				 * this datagram MUST be padded.
+				 */
 				padding = 1;
 			}
 
 			pkt_type = quic_enc_level_pkt_type(qc, qel);
+			/* <paddding> parameter for qc_build_pkt() must not be set to 1 when
+			 * building PING only Initial datagram (a datagram with an Initial
+			 * packet inside containing only a PING frame as ack-eliciting
+			 * frame). This is the case when both <probe> and LIST_EMPTY(<frms>)
+			 * conditions are verified (see qc_do_build_pkt()).
+			 */
 			cur_pkt = qc_build_pkt(&pos, end, qel, tls_ctx, frms,
-			                       qc, ver, dglen, pkt_type,
-			                       must_ack, padding && !next_qel,
+			                       qc, ver, dglen, pkt_type, must_ack,
+			                       padding && !next_qel && (!probe || !LIST_ISEMPTY(frms)),
 			                       probe, cc, &err);
 			if (!cur_pkt) {
 				switch (err) {
@@ -1811,6 +1822,20 @@ static inline uint64_t quic_compute_ack_delay_us(unsigned int time_received,
  * number field in this packet. <pn_len> will also have the packet number
  * length as value.
  *
+ * NOTE: This function does not build all the possible combinations of packets
+ * depending on its list of parameters. In most cases, <frms> frame list is
+ * not empty. So, this function first tries to build this list of frames.
+ * Then some padding is added to this packet if <padding> boolean is set true.
+ * The unique case one wants to do that is when a first Initial packet was
+ * previously built into the same datagram as the currently built one and when
+ * this packet is supposed to pad the datagram, if needed, to build an at
+ * least 1200 bytes long Initial datagram.
+ * If <padding> is not true, if the packet is too short, the packet is also
+ * padded. This is very often the case when no frames are provided by <frms>
+ * and when probing with only a PING frame.
+ * Finally, if <frms> was empty, if <probe> boolean is true this function builds
+ * a PING only packet handling also the cases where it must be padded.
+ *
  * Return 1 if succeeded (enough room to buile this packet), O if not.
  */
 static int qc_do_build_pkt(unsigned char *pos, const unsigned char *end,
@@ -2070,6 +2095,8 @@ static int qc_do_build_pkt(unsigned char *pos, const unsigned char *end,
 		goto no_room;
 	}
 
+	BUG_ON(qel->pktns->tx.pto_probe &&
+	       !(pkt->flags & QUIC_FL_TX_PACKET_ACK_ELICITING));
 	/* If this packet is ack-eliciting and we are probing let's
 	 * decrement the PTO probe counter.
 	 */

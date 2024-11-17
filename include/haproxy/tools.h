@@ -83,6 +83,21 @@
 extern int strlcpy2(char *dst, const char *src, int size);
 
 /*
+ * portable equivalent to POSIX strnlen():
+ * returns the number of bytes in the string pointed to by <s>, excluding
+ * the terminating null byte, but at most <maxlen>. The function does not
+ * look at characters passed <maxlen>.
+ */
+static inline size_t strnlen2(const char *s, size_t maxlen)
+{
+	size_t len;
+
+	for (len = 0; len < maxlen && s[len]; len++)
+		;
+	return len;
+}
+
+/*
  * This function simply returns a locally allocated string containing
  * the ascii representation for number 'n' in decimal.
  */
@@ -726,7 +741,11 @@ static inline int is_inet_addr(const struct sockaddr_storage *addr)
  */
 static inline int is_addr(const struct sockaddr_storage *addr)
 {
-	if (addr->ss_family == AF_UNIX || addr->ss_family == AF_CUST_SOCKPAIR)
+	/* WT: ideally we should use real_family(addr->ss_family) here, but we
+	 * have so few custom addresses that it's simple enough to test them all.
+	 */
+	if (addr->ss_family == AF_UNIX || addr->ss_family == AF_CUST_ABNS ||
+	    addr->ss_family == AF_CUST_ABNSZ || addr->ss_family == AF_CUST_SOCKPAIR)
 		return 1;
 	else
 		return is_inet_addr(addr);
@@ -765,7 +784,16 @@ static inline int get_addr_len(const struct sockaddr_storage *addr)
 	case AF_INET6:
 		return sizeof(struct sockaddr_in6);
 	case AF_UNIX:
+	case AF_CUST_ABNS:
 		return sizeof(struct sockaddr_un);
+	case AF_CUST_ABNSZ:
+		{
+			const struct sockaddr_un *un = (struct sockaddr_un *)addr;
+
+			/* stop at first NULL-byte */
+			return offsetof(struct sockaddr_un, sun_path) + 1 +
+			       strnlen2(un->sun_path + 1, sizeof(un->sun_path) - 1);
+		}
 	}
 	return 0;
 }

@@ -30,6 +30,7 @@
 #include <haproxy/http.h>
 #include <haproxy/net_helper.h>
 #include <haproxy/pattern-t.h>
+#include <haproxy/protocol.h>
 #include <haproxy/proxy.h>
 #include <haproxy/regex.h>
 #include <haproxy/server.h>
@@ -1250,7 +1251,7 @@ int hlua_server_get_addr(lua_State *L)
 
 	luaL_buffinit(L, &b);
 
-	switch (srv->addr.ss_family) {
+	switch (real_family(srv->addr.ss_family)) {
 	case AF_INET:
 		inet_ntop(AF_INET, &((struct sockaddr_in *)&srv->addr)->sin_addr,
 		          addr, INET_ADDRSTRLEN);

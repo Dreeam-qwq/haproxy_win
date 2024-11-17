@@ -47,6 +47,7 @@
 
 static int exitcode = -1;
 int max_reloads = INT_MAX; /* max number of reloads a worker can have until they are killed */
+int load_status; /* worker process startup status: 1 - loaded successfully; 0 - load failed */
 struct mworker_proc *proc_self = NULL; /* process structure of current process */
 struct list mworker_cli_conf = LIST_HEAD_INIT(mworker_cli_conf); /* master CLI configuration (-S flag) */
 
@@ -586,6 +587,9 @@ void mworker_cleanup_proc()
 	}
 }
 
+struct cli_showproc_ctx {
+	int debug;
+};
 
 /*  Displays workers and processes  */
 static int cli_io_handler_show_proc(struct appctx *appctx)
@@ -593,8 +597,10 @@ static int cli_io_handler_show_proc(struct appctx *appctx)
 	struct mworker_proc *child;
 	int old = 0;
 	int up = date.tv_sec - proc_self->timestamp;
+	struct cli_showproc_ctx *ctx = appctx->svcctx;
 	char *uptime = NULL;
 	char *reloadtxt = NULL;
+	int program_nb = 0;
 
 	if (up < 0) /* must never be negative because of clock drift */
 		up = 0;
@@ -602,9 +608,15 @@ static int cli_io_handler_show_proc(struct appctx *appctx)
 	chunk_reset(&trash);
 
 	memprintf(&reloadtxt, "%d [failed: %d]", proc_self->reloads, proc_self->failedreloads);
-	chunk_printf(&trash, "#%-14s %-15s %-15s %-15s %-15s\n", "<PID>", "<type>", "<reloads>", "<uptime>", "<version>");
+	chunk_printf(&trash, "#%-14s %-15s %-15s %-15s %-15s", "<PID>", "<type>", "<reloads>", "<uptime>", "<version>");
+	if (ctx->debug)
+		chunk_appendf(&trash, "\t\t %-15s %-15s", "<ipc_fd[0]>", "<ipc_fd[1]>");
+	chunk_appendf(&trash, "\n");
 	memprintf(&uptime, "%dd%02dh%02dm%02ds", up / 86400, (up % 86400) / 3600, (up % 3600) / 60, (up % 60));
-	chunk_appendf(&trash, "%-15u %-15s %-15s %-15s %-15s\n", (unsigned int)getpid(), "master", reloadtxt, uptime, haproxy_version);
+	chunk_appendf(&trash, "%-15u %-15s %-15s %-15s %-15s", (unsigned int)getpid(), "master", reloadtxt, uptime, haproxy_version);
+	if (ctx->debug)
+		chunk_appendf(&trash, "\t\t %-15d %-15d", proc_self->ipc_fd[0], proc_self->ipc_fd[1]);
+	chunk_appendf(&trash, "\n");
 	ha_free(&reloadtxt);
 	ha_free(&uptime);
 
@@ -624,7 +636,10 @@ static int cli_io_handler_show_proc(struct appctx *appctx)
 			continue;
 		}
 		memprintf(&uptime, "%dd%02dh%02dm%02ds", up / 86400, (up % 86400) / 3600, (up % 3600) / 60, (up % 60));
-		chunk_appendf(&trash, "%-15u %-15s %-15d %-15s %-15s\n", child->pid, "worker", child->reloads, uptime, child->version);
+		chunk_appendf(&trash, "%-15u %-15s %-15d %-15s %-15s", child->pid, "worker", child->reloads, uptime, child->version);
+		if (ctx->debug)
+			chunk_appendf(&trash, "\t\t %-15d %-15d", child->ipc_fd[0], child->ipc_fd[1]);
+		chunk_appendf(&trash, "\n");
 		ha_free(&uptime);
 	}
 
@@ -644,7 +659,10 @@ static int cli_io_handler_show_proc(struct appctx *appctx)
 
 			if (child->options & PROC_O_LEAVING) {
 				memprintf(&uptime, "%dd%02dh%02dm%02ds", up / 86400, (up % 86400) / 3600, (up % 3600) / 60, (up % 60));
-				chunk_appendf(&trash, "%-15u %-15s %-15d %-15s %-15s\n", child->pid, "worker", child->reloads, uptime, child->version);
+				chunk_appendf(&trash, "%-15u %-15s %-15d %-15s %-15s", child->pid, "worker", child->reloads, uptime, child->version);
+				if (ctx->debug)
+					chunk_appendf(&trash, "\t\t %-15d %-15d", child->ipc_fd[0], child->ipc_fd[1]);
+				chunk_appendf(&trash, "\n");
 				ha_free(&uptime);
 			}
 		}
@@ -652,7 +670,6 @@ static int cli_io_handler_show_proc(struct appctx *appctx)
 	}
 
 	/* displays external process */
-	chunk_appendf(&trash, "# programs\n");
 	old = 0;
 	list_for_each_entry(child, &proc_list, list) {
 		up = date.tv_sec - child->timestamp;
@@ -666,6 +683,9 @@ static int cli_io_handler_show_proc(struct appctx *appctx)
 			old++;
 			continue;
 		}
+		if (program_nb == 0)
+			chunk_appendf(&trash, "# programs\n");
+		program_nb++;
 		memprintf(&uptime, "%dd%02dh%02dm%02ds", up / 86400, (up % 86400) / 3600, (up % 3600) / 60, (up % 60));
 		chunk_appendf(&trash, "%-15u %-15s %-15d %-15s %-15s\n", child->pid, child->id, child->reloads, uptime, "-");
 		ha_free(&uptime);
@@ -696,6 +716,26 @@ static int cli_io_handler_show_proc(struct appctx *appctx)
 
 	/* dump complete */
 	return 1;
+}
+/* reload the master process */
+static int cli_parse_show_proc(char **args, char *payload, struct appctx *appctx, void *private)
+{
+	struct cli_showproc_ctx *ctx;
+
+	ctx = applet_reserve_svcctx(appctx, sizeof(*ctx));
+
+	if (!cli_has_level(appctx, ACCESS_LVL_OPER))
+		return 1;
+
+	if (*args[2]) {
+
+		if (strcmp(args[2], "debug") == 0)
+			ctx->debug = 1;
+		else
+			return cli_err(appctx, "'show proc' only supports 'debug' as argument\n");
+	}
+
+	return 0;
 }
 
 /* reload the master process */
@@ -756,7 +796,6 @@ static int cli_parse_reload(char **args, char *payload, struct appctx *appctx, v
 static int cli_io_handler_show_loadstatus(struct appctx *appctx)
 {
 	struct mworker_proc *proc;
-	char *env;
 
 	if (!cli_has_level(appctx, ACCESS_LVL_OPER))
 		return 1;
@@ -771,15 +810,11 @@ static int cli_io_handler_show_loadstatus(struct appctx *appctx)
 		}
 	}
 
-	env = getenv("HAPROXY_LOAD_SUCCESS");
-	if (!env)
-		return 1;
-
-	if (strcmp(env, "0") == 0) {
+	if (load_status == 0)
 		chunk_printf(&trash, "Success=0\n");
-	} else if (strcmp(env, "1") == 0) {
+	else
 		chunk_printf(&trash, "Success=1\n");
-	}
+
 #ifdef USE_SHM_OPEN
 	if (startup_logs && ring_data(startup_logs) > 1)
 		chunk_appendf(&trash, "--\n");
@@ -802,29 +837,29 @@ static int cli_io_handler_show_loadstatus(struct appctx *appctx)
 static int mworker_parse_global_max_reloads(char **args, int section_type, struct proxy *curpx,
            const struct proxy *defpx, const char *file, int linenum, char **err)
 {
-
-	int err_code = 0;
 	if (!(global.mode & MODE_DISCOVERY))
 		return 0;
 
-	if (alertif_too_many_args(1, file, linenum, args, &err_code))
-		goto out;
+	if (strcmp(args[0], "mworker-max-reloads") == 0) {
+		if (too_many_args(1, args, err, NULL))
+			return -1;
 
-	if (*(args[1]) == 0) {
-		memprintf(err, "%sparsing [%s:%d] : '%s' expects an integer argument.\n", *err, file, linenum, args[0]);
-		err_code |= ERR_ALERT | ERR_FATAL;
-		goto out;
+		if (*(args[1]) == 0) {
+			memprintf(err, "'%s' expects an integer argument.", args[0]);
+			return -1;
+		}
+
+		max_reloads = atol(args[1]);
+		if (max_reloads < 0) {
+			memprintf(err, "'%s' expects a positive value or zero.", args[0]);
+			return -1;
+		}
+	} else {
+		BUG_ON(1, "Triggered in mworker_parse_global_max_reloads() by unsupported keyword.\n");
+		return -1;
 	}
 
-	max_reloads = atol(args[1]);
-	if (max_reloads < 0) {
-		memprintf(err, "%sparsing [%s:%d] '%s' : invalid value %d, must be >= 0", *err, file, linenum, args[0], max_reloads);
-		err_code |= ERR_ALERT | ERR_FATAL;
-		goto out;
-	}
-
-out:
-	return err_code;
+	return 0;
 }
 
 void mworker_free_child(struct mworker_proc *child)
@@ -869,10 +904,11 @@ void mworker_create_master_cli(void)
 		 * Both FDs will be kept in the master. The sockets are
 		 * created only if they weren't inherited.
 		 */
-		if ((proc_self->ipc_fd[1] == -1) &&
-		     socketpair(AF_UNIX, SOCK_STREAM, 0, proc_self->ipc_fd) < 0) {
-			ha_alert("Can't create the mcli_reload socketpair.\n");
-			exit(EXIT_FAILURE);
+		if (proc_self->ipc_fd[1] == -1) {
+			if (socketpair(AF_UNIX, SOCK_STREAM, 0, proc_self->ipc_fd) < 0) {
+				ha_alert("Can't create the mcli_reload socketpair.\n");
+				exit(EXIT_FAILURE);
+			}
 		}
 
 		/* Create the mcli_reload listener from the proc_self struct */
@@ -900,7 +936,7 @@ static struct cli_kw_list cli_kws = {{ },{
 	{ { "@<relative pid>", NULL }, "@<relative pid>                         : send a command to the <relative pid> process", NULL, cli_io_handler_show_proc, NULL, NULL, ACCESS_MASTER_ONLY},
 	{ { "@!<pid>", NULL },         "@!<pid>                                 : send a command to the <pid> process", cli_parse_default, NULL, NULL, NULL, ACCESS_MASTER_ONLY},
 	{ { "@master", NULL },         "@master                                 : send a command to the master process", cli_parse_default, NULL, NULL, NULL, ACCESS_MASTER_ONLY},
-	{ { "show", "proc", NULL },    "show proc                               : show processes status", cli_parse_default, cli_io_handler_show_proc, NULL, NULL, ACCESS_MASTER_ONLY},
+	{ { "show", "proc", NULL },    "show proc                               : show processes status", cli_parse_show_proc, cli_io_handler_show_proc, NULL, NULL, ACCESS_MASTER_ONLY},
 	{ { "reload", NULL },          "reload                                  : achieve a soft-reload (-sf) of haproxy", cli_parse_reload, NULL, NULL, NULL, ACCESS_MASTER_ONLY},
 	{ { "hard-reload", NULL },     "hard-reload                             : achieve a hard-reload (-st) of haproxy", cli_parse_reload, NULL, NULL, NULL, ACCESS_MASTER_ONLY},
 	{ { "_loadstatus", NULL },     NULL,                                                             cli_parse_default, cli_io_handler_show_loadstatus, NULL, NULL, ACCESS_MASTER_ONLY},

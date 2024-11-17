@@ -632,7 +632,7 @@ static void h2_trace(enum trace_level level, uint64_t mask, const struct trace_s
 		}
 
 		if ((mask & H2_EV_RX_DATA) && level == TRACE_LEVEL_DATA)
-			chunk_appendf(&trace_buf, " data=%llu", (ullong)a4);
+			chunk_appendf(&trace_buf, " data=%lu", (ulong)a4);
 	}
 
 	/* Let's dump decoded requests and responses right after parsing. They
@@ -847,7 +847,14 @@ static void h2c_update_timeout(struct h2c *h2c)
 			h2c->task->expire = tick_add_ifset(now_ms, h2c->timeout);
 		} else {
 			/* no stream, no output data */
-			if (!(h2c->flags & H2_CF_IS_BACK)) {
+			if (h2c->flags & (H2_CF_GOAWAY_SENT|H2_CF_GOAWAY_FAILED)) {
+				/* GOAWAY sent (or failed), closing in progress */
+				int exp = tick_add_ifset(now_ms, h2c->shut_timeout);
+
+				h2c->task->expire = tick_first(h2c->task->expire, exp);
+				is_idle_conn = 1;
+			}
+			else if (!(h2c->flags & H2_CF_IS_BACK)) {
 				int to;
 
 				if (h2c->max_id > 0 && !b_data(&h2c->dbuf) &&
@@ -862,14 +869,6 @@ static void h2c_update_timeout(struct h2c *h2c)
 				}
 
 				h2c->task->expire = tick_add_ifset(h2c->idle_start, to);
-				is_idle_conn = 1;
-			}
-
-			if (h2c->flags & (H2_CF_GOAWAY_SENT|H2_CF_GOAWAY_FAILED)) {
-				/* GOAWAY sent (or failed), closing in progress */
-				int exp = tick_add_ifset(now_ms, h2c->shut_timeout);
-
-				h2c->task->expire = tick_first(h2c->task->expire, exp);
 				is_idle_conn = 1;
 			}
 
@@ -1587,7 +1586,12 @@ static void __maybe_unused h2s_alert(struct h2s *h2s)
  * glitch limit was reached, in which case an error is also reported on the
  * connection.
  */
-static inline int h2c_report_glitch(struct h2c *h2c, int increment)
+#define h2c_report_glitch(h2c, inc, ...) ({		\
+		COUNT_GLITCH(__VA_ARGS__);		\
+		_h2c_report_glitch(h2c, inc); 		\
+	})
+
+static inline int _h2c_report_glitch(struct h2c *h2c, int increment)
 {
 	int thres = (h2c->flags & H2_CF_IS_BACK) ?
 		h2_be_glitches_threshold : h2_fe_glitches_threshold;
@@ -2362,8 +2366,10 @@ static int h2s_send_rst_stream(struct h2c *h2c, struct h2s *h2s)
 
 	/* RFC7540#5.4.2: To avoid looping, an endpoint MUST NOT send a
 	 * RST_STREAM in response to a RST_STREAM frame.
+	 *
+	 * if h2s is not assigned yet (id == 0), don't send a RST_STREAM frame.
 	 */
-	if (h2c->dsi == h2s->id && h2c->dft == H2_FT_RST_STREAM) {
+	if ((h2s->id == 0) || (h2c->dsi == h2s->id && h2c->dft == H2_FT_RST_STREAM)) {
 		ret = 1;
 		goto ignore;
 	}
@@ -4607,10 +4613,7 @@ static int h2_recv(struct h2c *h2c)
 }
 
 /* Try to send data if possible.
- * The function returns non-zero if some state changes require to call the
- * tasklet handler to deal with changes, otherwise zero. Reasons for a wakeup
- * are non-zero data sent and ability to demux (indicating a previous blocking)
- * or report of a an error.
+ * The function returns 1 if data have been sent, otherwise zero.
  */
 static int h2_send(struct h2c *h2c)
 {
@@ -4749,7 +4752,7 @@ static int h2_send(struct h2c *h2c)
 	}
 	TRACE_DEVEL("leaving with some data left to send", H2_EV_H2C_SEND, h2c->conn);
 end:
-	return (sent && h2_may_demux(h2c)) || (h2c->flags & (H2_CF_ERR_PENDING|H2_CF_ERROR));
+	return sent || (h2c->flags & (H2_CF_ERR_PENDING|H2_CF_ERROR));
 }
 
 /* this is the tasklet referenced in h2c->wait_event.tasklet */
@@ -5039,6 +5042,20 @@ struct task *h2_timeout_task(struct task *t, void *context, unsigned int state)
 			conn_delete_from_tree(h2c->conn);
 
 		HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
+
+		/* Try to gracefully close idle connections by sending a GOAWAY first,
+		 * and then waiting for the fin timeout.
+		 */
+		if (!br_data(h2c->mbuf) && h2c_may_expire(h2c) &&
+		    !(h2c->flags & (H2_CF_GOAWAY_SENT|H2_CF_GOAWAY_FAILED))) {
+			h2c_error(h2c, H2_ERR_NO_ERROR);
+			if (h2_send(h2c))
+				tasklet_wakeup(h2c->wait_event.tasklet);
+			t->expire = tick_add_ifset(now_ms, h2c->shut_timeout);
+			if (!tick_isset(t->expire))
+				t->expire = tick_add_ifset(now_ms, h2c->timeout);
+			return t;
+		}
 	}
 
 do_leave:
@@ -5985,7 +6002,6 @@ static int h2_frt_transfer_data(struct h2s *h2s)
 	struct htx *htx = NULL;
 	struct buffer *scbuf = NULL;
 	unsigned int sent;
-	int full = 0;
 
 	TRACE_ENTER(H2_EV_RX_FRAME|H2_EV_RX_DATA, h2c->conn, h2s);
 
@@ -5996,7 +6012,7 @@ static int h2_frt_transfer_data(struct h2s *h2s)
 	 * allocating an rxbuf if possible. If we fail we'll more aggressively
 	 * retry.
 	 */
-	if ((!h2s_rxbuf_tail(h2s) || (full || !h2s_may_append_to_rxbuf(h2s))) && !h2s_get_rxbuf(h2s)) {
+	if ((!h2s_rxbuf_tail(h2s) || !h2s_may_append_to_rxbuf(h2s)) && !h2s_get_rxbuf(h2s)) {
 		h2c->flags |= H2_CF_DEM_RXBUF;
 		TRACE_STATE("waiting for an h2s rxbuf slot", H2_EV_RX_FRAME|H2_EV_RX_DATA|H2_EV_H2S_BLK, h2c->conn, h2s);
 		goto fail;
@@ -6013,7 +6029,6 @@ static int h2_frt_transfer_data(struct h2s *h2s)
 	htx = htx_from_buf(scbuf);
 
 try_again:
-	full = 0;
 	flen = h2c->dfl - h2c->dpl;
 	if (!flen)
 		goto end_transfer;
@@ -6026,7 +6041,6 @@ try_again:
 
 	block = htx_free_data_space(htx);
 	if (!block) {
-		full = 1;
 		if (h2s_get_rxbuf(h2s))
 			goto next_buffer;
 
@@ -6056,8 +6070,6 @@ try_again:
 	}
 
 	if (sent < flen) {
-		if (!sent)
-			full = 1;
 		if (h2s_get_rxbuf(h2s))
 			goto next_buffer;
 
@@ -7860,13 +7872,6 @@ static size_t h2_done_ff(struct stconn *sc)
 		h2s->flags &= ~H2_SF_MORE_HTX_DATA;
 	}
 
-	if (!(sd->iobuf.flags & IOBUF_FL_FF_BLOCKED) &&
-	    !(h2s->flags & H2_SF_BLK_SFCTL) &&
-	    !(h2s->flags & (H2_SF_WANT_SHUTR|H2_SF_WANT_SHUTW))) {
-		/* Ok we managed to send something, leave the send_list if we were still there */
-		h2_remove_from_list(h2s);
-	}
-
 	if (!sd->iobuf.data)
 		goto end;
 
@@ -7900,6 +7905,13 @@ static size_t h2_done_ff(struct stconn *sc)
 
 	if (!(sd->iobuf.flags & IOBUF_FL_INTERIM_FF))
 	    h2s->flags &= ~H2_SF_NOTIFIED;
+
+	if ((total || !(sd->iobuf.flags & IOBUF_FL_FF_BLOCKED)) &&
+	    !(h2s->flags & H2_SF_BLK_SFCTL) &&
+	    !(h2s->flags & (H2_SF_WANT_SHUTR|H2_SF_WANT_SHUTW))) {
+		/* Ok we managed to send something, leave the send_list if we were still there */
+		h2_remove_from_list(h2s);
+	}
 
 	TRACE_LEAVE(H2_EV_H2S_SEND|H2_EV_STRM_SEND, h2s->h2c->conn, h2s);
 	return total;

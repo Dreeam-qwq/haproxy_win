@@ -29,8 +29,9 @@
 #include <haproxy/fd.h>
 #include <haproxy/global.h>
 #include <haproxy/listener.h>
-#include <haproxy/receiver-t.h>
 #include <haproxy/namespace.h>
+#include <haproxy/protocol.h>
+#include <haproxy/receiver-t.h>
 #include <haproxy/sock.h>
 #include <haproxy/sock_unix.h>
 #include <haproxy/tools.h>
@@ -49,6 +50,32 @@ struct proto_fam proto_fam_unix = {
 	.get_dst = sock_get_dst,
 };
 
+struct proto_fam proto_fam_abns = {
+	.name = "abns",
+	.sock_domain = AF_UNIX,
+	.sock_family = AF_CUST_ABNS,
+	.real_family = AF_UNIX,
+	.sock_addrlen = sizeof(struct sockaddr_un),
+	.l3_addrlen = sizeof(((struct sockaddr_un*)0)->sun_path),
+	.addrcmp = sock_abns_addrcmp,
+	.bind = sock_unix_bind_receiver,
+	.get_src = sock_get_src,
+	.get_dst = sock_get_dst,
+};
+
+struct proto_fam proto_fam_abnsz = {
+	.name = "abnsz",
+	.sock_domain = AF_UNIX,
+	.sock_family = AF_CUST_ABNSZ,
+	.real_family = AF_UNIX,
+	.sock_addrlen = sizeof(struct sockaddr_un),
+	.l3_addrlen = sizeof(((struct sockaddr_un*)0)->sun_path),
+	.addrcmp = sock_abnsz_addrcmp,
+	.bind = sock_unix_bind_receiver,
+	.get_src = sock_get_src,
+	.get_dst = sock_get_dst,
+};
+
 /* PLEASE NOTE for functions below:
  *
  * The address family SHOULD always be checked. In some cases a function will
@@ -58,12 +85,58 @@ struct proto_fam proto_fam_unix = {
  */
 
 
-/* Compares two AF_UNIX sockaddr addresses. Returns 0 if they match or non-zero
- * if they do not match. It also supports ABNS socket addresses (those starting
- * with \0). For regular UNIX sockets however, this does explicitly support
- * matching names ending exactly with .XXXXX.tmp which are newly bound sockets
- * about to be replaced; this suffix is then ignored. Note that our UNIX socket
- * paths are always zero-terminated.
+/* Compares two AF_CUST_ABNS sockaddr addresses (ABNS UNIX sockets). Returns 0 if
+ * they match or non-zero.
+ */
+int sock_abns_addrcmp(const struct sockaddr_storage *a, const struct sockaddr_storage *b)
+{
+	const struct sockaddr_un *au = (const struct sockaddr_un *)a;
+	const struct sockaddr_un *bu = (const struct sockaddr_un *)b;
+
+	if (a->ss_family != b->ss_family)
+		return -1;
+
+	if (a->ss_family != AF_CUST_ABNS)
+		return -1;
+
+	if (au->sun_path[0] != bu->sun_path[0])
+		return -1;
+
+	if (au->sun_path[0] != '\0')
+		return -1;
+
+	return memcmp(au->sun_path, bu->sun_path, sizeof(au->sun_path));
+}
+
+
+/* Compares two AF_CUST_ABNSZ sockaddr addresses (ABNSZ UNIX sockets). Returns 0 if
+ * they match or non-zero.
+ */
+int sock_abnsz_addrcmp(const struct sockaddr_storage *a, const struct sockaddr_storage *b)
+{
+	const struct sockaddr_un *au = (const struct sockaddr_un *)a;
+	const struct sockaddr_un *bu = (const struct sockaddr_un *)b;
+
+	if (a->ss_family != b->ss_family)
+		return -1;
+
+	if (a->ss_family != AF_CUST_ABNSZ)
+		return -1;
+
+	if (au->sun_path[0] != bu->sun_path[0])
+		return -1;
+
+	if (au->sun_path[0] != '\0')
+		return -1;
+
+	return strncmp(au->sun_path + 1, bu->sun_path + 1, sizeof(au->sun_path) - 1);
+}
+
+/* Compares two AF_UNIX sockaddr addresses (regular UNIX sockets). Returns 0 if
+ * they match or non-zero. Tis does explicitly support matching names ending
+ * exactly with .XXXXX.tmp which are newly bound sockets about to be replaced;
+ * this suffix is then ignored. Note that our UNIX socket paths are always
+ * zero-terminated.
  */
 int sock_unix_addrcmp(const struct sockaddr_storage *a, const struct sockaddr_storage *b)
 {
@@ -77,13 +150,7 @@ int sock_unix_addrcmp(const struct sockaddr_storage *a, const struct sockaddr_st
 	if (a->ss_family != AF_UNIX)
 		return -1;
 
-	if (au->sun_path[0] != bu->sun_path[0])
-		return -1;
-
-	if (au->sun_path[0] == 0)
-		return memcmp(au->sun_path, bu->sun_path, sizeof(au->sun_path));
-
-	idx = 1; dot = 0;
+	idx = 0; dot = 0;
 	while (au->sun_path[idx] == bu->sun_path[idx]) {
 		if (au->sun_path[idx] == 0)
 			return 0;
@@ -295,7 +362,7 @@ int sock_unix_bind_receiver(struct receiver *rx, char **errmsg)
 		goto bind_close_return;
 	}
 
-	if (!ext && bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+	if (!ext && bind(fd, (struct sockaddr *)&addr, get_addr_len(&rx->addr)) < 0) {
 		/* note that bind() creates the socket <tempname> on the file system */
 		if (errno == EADDRINUSE) {
 			/* the old process might still own it, let's retry */

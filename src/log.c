@@ -2388,15 +2388,7 @@ static inline char *_lf_text_len(char *dst, const char *src,
 			 * indefinite length text in cbor, because indefinite-length text
 			 * has to be made of multiple chunks of known size as per RFC8949...
 			 */
-			{
-				int _len;
-
-				/* strnlen(src, len) portable equivalent: */
-				for (_len = 0; _len < len && src[_len]; _len++)
-					;
-
-				len = _len;
-			}
+			len = strnlen2(src, len);
 
 			ret = cbor_encode_text(&ctx->encode.cbor, dst, dst + size, src, len);
 			if (ret == NULL)
@@ -2736,7 +2728,7 @@ static inline void __do_send_log(struct log_target *target, struct log_header hd
 		/* the socket's address is a file descriptor */
 		plogfd = (int *)&((struct sockaddr_in *)target->addr)->sin_addr.s_addr;
 	}
-	else if (target->addr->ss_family == AF_UNIX)
+	else if (real_family(target->addr->ss_family) == AF_UNIX)
 		plogfd = &logfdunix;
 	else
 		plogfd = &logfdinet;
@@ -4176,7 +4168,7 @@ int sess_build_logline_orig(struct session *sess, struct stream *s,
 				addr = (s ? sc_src(s->scf) : sess_src(sess));
 				if (addr) {
 					/* sess->listener is always defined when the session's owner is an inbound connections */
-					if (addr->ss_family == AF_UNIX)
+					if (real_family(addr->ss_family) == AF_UNIX)
 						ret = lf_int(tmplog, dst + maxsize - tmplog,
 						             sess->listener->luid, ctx, LF_INT_LTOA);
 					else
@@ -4206,7 +4198,7 @@ int sess_build_logline_orig(struct session *sess, struct stream *s,
 				addr = (s ? sc_dst(s->scf) : sess_dst(sess));
 				if (addr) {
 					/* sess->listener is always defined when the session's owner is an inbound connections */
-					if (addr->ss_family == AF_UNIX)
+					if (real_family(addr->ss_family) == AF_UNIX)
 						ret = lf_int(tmplog, dst + maxsize - tmplog,
 						             sess->listener->luid, ctx, LF_INT_LTOA);
 					else

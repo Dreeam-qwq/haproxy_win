@@ -747,11 +747,7 @@ static void mworker_reexec(int hardreload)
 
 	setenv("HAPROXY_MWORKER_REEXEC", "1", 1);
 
-	mworker_cleanup_proc();
 	mworker_proc_list_to_env(); /* put the children description in the env */
-
-	/* ensure that we close correctly every listeners before reexecuting */
-	mworker_cleanlisteners();
 
 	/* during the reload we must ensure that every FDs that can't be
 	 * reuse (ie those that are not referenced in the proc_list)
@@ -833,6 +829,12 @@ static void mworker_reexec(int hardreload)
 	/* copy the previous options */
 	for (i = 1; i < old_argc; i++)
 		next_argv[next_argc++] = old_argv[i];
+
+	/* need to withdraw MODE_STARTING from master, because we have to free
+	 * the startup logs ring here, see more details in print_message()
+	 */
+	global.mode &= ~MODE_STARTING;
+	startup_logs_free(startup_logs);
 
 	signal(SIGPROF, SIG_IGN);
 	execvp(next_argv[0], next_argv);
@@ -934,7 +936,7 @@ void on_new_child_failure()
 	sock_drop_unused_old_sockets();
 
 	usermsgs_clr(NULL);
-	setenv("HAPROXY_LOAD_SUCCESS", "0", 1);
+	load_status = 0;
 	ha_warning("Failed to load worker!\n");
 #if defined(USE_SYSTEMD)
 	/* the sd_notify API is not able to send a reload failure signal. So
@@ -1178,7 +1180,6 @@ next_dir_entry:
 static int load_cfg(char *progname)
 {
 	struct cfgfile *cfg, *cfg_tmp;
-	char *env_cfgfiles = NULL;
 
 	/* handle cfgfiles that are actually directories */
 	cfgfiles_expand_directories();
@@ -1190,24 +1191,11 @@ static int load_cfg(char *progname)
 
 		cfg->size = load_cfg_in_mem(cfg->filename, &cfg->content);
 		if (cfg->size < 0)
-			goto err;
+			return -1;
 
-		if (!memprintf(&env_cfgfiles, "%s%s%s",
-			       (env_cfgfiles ? env_cfgfiles : ""),
-			       (env_cfgfiles ? ";" : ""), cfg->filename)) {
-			/* free what we've already allocated and free cfglist */
-			ha_alert("Could not allocate memory for HAPROXY_CFGFILES env variable\n");
-			goto err;
-		}
 	}
 
-	setenv("HAPROXY_CFGFILES", env_cfgfiles, 1);
-	free(env_cfgfiles);
-
 	return 0;
-err:
-	free(env_cfgfiles);
-	return -1;
 
 }
 
@@ -1219,6 +1207,7 @@ err:
  */
 static int read_cfg(char *progname)
 {
+	char *env_cfgfiles = NULL;
 	struct cfgfile *cfg;
 	int err_code = 0;
 
@@ -1235,15 +1224,28 @@ static int read_cfg(char *progname)
 	list_for_each_entry(cfg, &cfg_cfgfiles, list) {
 		int ret;
 
+		/* save all successfully loaded conf files in HAPROXY_CFGFILES
+		 * env var
+		 */
+		if (!memprintf(&env_cfgfiles, "%s%s%s",
+			       (env_cfgfiles ? env_cfgfiles : ""),
+			       (env_cfgfiles ? ";" : ""), cfg->filename)) {
+			/* free what we've already allocated and free cfglist */
+			ha_alert("Could not allocate memory for HAPROXY_CFGFILES env variable\n");
+			goto err;
+		}
+
 		ret = parse_cfg(cfg);
 		if (ret == -1)
-			return -1;
+			goto err;
 
 		if (ret & (ERR_ABORT|ERR_FATAL))
 			ha_alert("Error(s) found in configuration file : %s\n", cfg->filename);
 		err_code |= ret;
 		if (err_code & ERR_ABORT)
-			return -1;
+			goto err;
+
+
 	}
 	/* remove temporary environment variables. */
 	unsetenv("HAPROXY_BRANCH");
@@ -1258,10 +1260,17 @@ static int read_cfg(char *progname)
 	 */
 	if (err_code & (ERR_ABORT|ERR_FATAL)) {
 		ha_alert("Fatal errors found in configuration.\n");
-		return -1;
+		goto err;
 	}
 
+	setenv("HAPROXY_CFGFILES", env_cfgfiles, 1);
+	free(env_cfgfiles);
+
 	return err_code;
+
+err:
+	free(env_cfgfiles);
+	return -1;
 }
 
 /*
@@ -2134,8 +2143,8 @@ static void apply_master_worker_mode()
 {
 	int worker_pid;
 	struct mworker_proc *child;
-	struct ring *tmp_startup_logs = NULL;
 	char *sock_name = NULL;
+	char *errmsg = NULL;
 
 	worker_pid = fork();
 	switch (worker_pid) {
@@ -2144,12 +2153,6 @@ static void apply_master_worker_mode()
 
 		exit(EXIT_FAILURE);
 	case 0:
-		/* in child: at this point the worker must have his own startup_logs buffer */
-		tmp_startup_logs = startup_logs_dup(startup_logs);
-		if (tmp_startup_logs == NULL)
-			exit(EXIT_FAILURE);
-		startup_logs_free(startup_logs);
-		startup_logs = tmp_startup_logs;
 		/* This one must not be exported, it's internal! */
 		unsetenv("HAPROXY_MWORKER_REEXEC");
 		ha_random_jump96(1);
@@ -2170,6 +2173,18 @@ static void apply_master_worker_mode()
 
 				break;
 			}
+
+			/* need to close reload sockpair fds, inherited after master's execvp and fork(),
+			 * we can't close these fds in master before the fork(), as ipc_fd[1] serves after
+			 * the mworker_reexec to obtain the MCLI client connection fd, like this we can
+			 * write to this connection fd the content of the startup_logs ring.
+			 */
+			if (child->options & PROC_O_TYPE_MASTER) {
+				if (child->ipc_fd[0] > 0)
+					close(child->ipc_fd[0]);
+				if (child->ipc_fd[1] > 0)
+					close(child->ipc_fd[1]);
+			}
 		}
 		break;
 	default:
@@ -2184,9 +2199,17 @@ static void apply_master_worker_mode()
 		global.nbtgroups = 1;
 		global.nbthread = 1;
 
-		/* creates MASTER proxy and attaches server to child->ipc_fd[0] */
-		if (mworker_cli_proxy_create() < 0) {
-			ha_alert("Can't create the master's CLI.\n");
+		/* creates MASTER proxy */
+		if (mworker_cli_create_master_proxy(&errmsg) < 0) {
+			ha_alert("Can't create MASTER proxy: %s\n", errmsg);
+			free(errmsg);
+			exit(EXIT_FAILURE);
+		}
+
+		/* attaches servers to all existed workers on its shared MCLI sockpair ends, ipc_fd[0] */
+		if (mworker_cli_attach_server(&errmsg) < 0) {
+			ha_alert("Can't attach servers needed for master CLI %s\n", errmsg ? errmsg : "");
+			free(errmsg);
 			exit(EXIT_FAILURE);
 		}
 
@@ -2308,6 +2331,7 @@ static void step_init_1()
 #endif
 #endif /* USE_OPENSSL */
 
+	/* saves ptr to ring in startup_logs var */
 	startup_logs_init();
 
 	if (init_acl() != 0)
@@ -2439,7 +2463,7 @@ static void step_init_2(int argc, char** argv)
 	}
 
 #if defined(HA_HAVE_DUMP_LIBS)
-	if (global.mode & MODE_DUMP_LIBS) {
+	if (global.mode & MODE_DUMP_LIBS && !master) {
 		qfprintf(stdout, "List of loaded object files:\n");
 		chunk_reset(&trash);
 		if (dump_libs(&trash, ((arg_mode & (MODE_QUIET|MODE_VERBOSE)) == MODE_VERBOSE)))
@@ -2447,7 +2471,7 @@ static void step_init_2(int argc, char** argv)
 	}
 #endif
 
-	if (global.mode & MODE_DUMP_KWD)
+	if (global.mode & MODE_DUMP_KWD && !master)
 		dump_registered_keywords();
 
 	if (global.mode & MODE_DIAG) {
@@ -2769,7 +2793,7 @@ static void step_init_2(int argc, char** argv)
 
 	/* Note: we could disable any poller by name here */
 
-	if (global.mode & (MODE_VERBOSE|MODE_DEBUG)) {
+	if ((global.mode & (MODE_VERBOSE|MODE_DEBUG)) && !master) {
 		list_pollers(stderr);
 		fprintf(stderr, "\n");
 		list_filters(stderr);
@@ -3029,6 +3053,12 @@ static void set_verbosity(void) {
 static void run_master_in_recovery_mode(int argc, char **argv)
 {
 	struct mworker_proc *proc;
+	char *errmsg = NULL;
+
+	/* load_status is global and checked in cli_io_handler_show_cli_sock() to
+	 * dump master startup logs with its alerts/warnings via master CLI sock.
+	 */
+	load_status = 0;
 
 	/* increment the number failed reloads */
 	list_for_each_entry(proc, &proc_list, list) {
@@ -3047,9 +3077,17 @@ static void run_master_in_recovery_mode(int argc, char **argv)
 	atexit(exit_on_failure);
 	set_verbosity();
 
-	/* creates MASTER proxy and attaches server to child->ipc_fd[0] */
-	if (mworker_cli_proxy_create() < 0) {
-		ha_alert("Can't create the master's CLI.\n");
+	/* creates MASTER proxy */
+	if (mworker_cli_create_master_proxy(&errmsg) < 0) {
+		ha_alert("Can't create MASTER proxy: %s\n", errmsg);
+		free(errmsg);
+		exit(EXIT_FAILURE);
+	}
+
+	/* attaches servers to all existed workers on its shared MCLI sockpair ends, ipc_fd[0] */
+	if (mworker_cli_attach_server(&errmsg) < 0) {
+		ha_alert("Can't attach servers needed for master CLI %s\n", errmsg ? errmsg : "");
+		free(errmsg);
 		exit(EXIT_FAILURE);
 	}
 
@@ -3071,6 +3109,7 @@ static void run_master_in_recovery_mode(int argc, char **argv)
 static void read_cfg_in_discovery_mode(int argc, char **argv)
 {
 	struct cfgfile *cfg, *cfg_tmp;
+	struct mworker_proc *proc;
 
 	/* load configs in memory and parse only global section (MODE_DISCOVERY) */
 	global.mode |= MODE_DISCOVERY;
@@ -3119,13 +3158,48 @@ static void read_cfg_in_discovery_mode(int argc, char **argv)
 		ha_alert("a master CLI socket was defined, but master-worker mode (-W) is not enabled.\n");
 		exit(EXIT_FAILURE);
 	}
+
+	/* "progam" sections, if there are any, were alredy parsed only by master
+	 * and programs are forked before calling postparser functions from
+	 * postparser list. So, all checks related to "program" section integrity
+	 * and sections vs MODE_MWORKER combinations should be done here.
+	 */
+	list_for_each_entry(proc, &proc_list, list) {
+		if (proc->options & PROC_O_TYPE_PROG) {
+			if (!(global.mode & MODE_MWORKER)) {
+				ha_alert("'program' section is defined in configuration, "
+				         "but master-worker mode (-W) is not enabled.\n");
+				exit(EXIT_FAILURE);
+			}
+
+			if ((proc->reloads == 0) && (proc->command == NULL)) {
+				if (getenv("HAPROXY_MWORKER_REEXEC") != NULL) {
+					ha_warning("Master failed to parse new configuration: "
+					           "the program section '%s' lacks a command to launch. "
+					           "It can't start a new worker and launch defined programs. "
+					           "Already running worker and programs "
+					           "will be kept. Please, check program section settings\n", proc->id);
+
+					run_master_in_recovery_mode(argc, argv);
+				} else {
+					ha_alert("The program section '%s' lacks a command to launch.\n", proc->id);
+					exit(EXIT_FAILURE);
+				}
+			}
+		}
+	}
+
+	/* in MODE_CHECK and in MODE_DUMP_CFG we just need to parse the
+	 * configuration and exit, see step_init_2()
+	 */
+	if ((global.mode & MODE_MWORKER) && (global.mode & (MODE_CHECK | MODE_DUMP_CFG)))
+		global.mode &= ~MODE_MWORKER;
 }
 
 void deinit(void)
 {
 	struct proxy *p = proxies_list, *p0;
 	struct cfgfile *cfg, *cfg_tmp;
-	struct uri_auth *uap, *ua = NULL;
 	struct logger *log, *logb;
 	struct build_opts_str *bol, *bolb;
 	struct post_deinit_fct *pdf, *pdfb;
@@ -3179,22 +3253,6 @@ void deinit(void)
 
 	deinit_signals();
 	while (p) {
-		/* build a list of unique uri_auths */
-		if (!ua)
-			ua = p->uri_auth;
-		else {
-			/* check if p->uri_auth is unique */
-			for (uap = ua; uap; uap=uap->next)
-				if (uap == p->uri_auth)
-					break;
-
-			if (!uap && p->uri_auth) {
-				/* add it, if it is */
-				p->uri_auth->next = ua;
-				ua = p->uri_auth;
-			}
-		}
-
 		p0 = p;
 		p = p->next;
 		free_proxy(p0);
@@ -3206,32 +3264,6 @@ void deinit(void)
 
 	/* destroy all referenced defaults proxies  */
 	proxy_destroy_all_unref_defaults();
-
-	while (ua) {
-		struct stat_scope *scope, *scopep;
-
-		uap = ua;
-		ua = ua->next;
-
-		free(uap->uri_prefix);
-		free(uap->auth_realm);
-		free(uap->node);
-		free(uap->desc);
-
-		userlist_free(uap->userlist);
-		free_act_rules(&uap->http_req_rules);
-
-		scope = uap->scope;
-		while (scope) {
-			scopep = scope;
-			scope = scope->next;
-
-			free(scopep->px_id);
-			free(scopep);
-		}
-
-		free(uap);
-	}
 
 	userlist_free(userlist);
 
@@ -3656,6 +3688,8 @@ int main(int argc, char **argv)
 	struct rlimit limit;
 	int intovf = (unsigned char)argc + 1; /* let the compiler know it's strictly positive */
 	struct cfgfile *cfg, *cfg_tmp;
+	struct ring *tmp_startup_logs = NULL;
+	struct mworker_proc *proc;
 
 	/* Catch broken toolchains */
 	if (sizeof(long) != sizeof(void *) || (intovf + 0x7FFFFFFF >= intovf)) {
@@ -3845,6 +3879,27 @@ int main(int argc, char **argv)
 
 	bind_listeners();
 
+	/* worker context: now listeners fds were transferred from the previous
+	 * worker, all listeners fd are bound. So we can close ipc_fd[0]s of all
+	 * previous workers, which are still referenced in the proc_list, i.e.
+	 * they are not exited yet at the moment, when this current worker was
+	 * forked. Thus the current worker inherits ipc_fd[0]s from the previous
+	 * ones by it's parent, master, because we have to keep shared sockpair
+	 * ipc_fd[0] always opened in master (master CLI server is listening on
+	 * this fd). It's safe to call close() at this point on these inhereted
+	 * ipc_fd[0]s, as they are inhereted after master re-exec unbound, we
+	 * keep them like this during bind_listeners() call. So, these fds were
+	 * never referenced in the current worker's fdtab.
+	 */
+	if ((global.mode & MODE_MWORKER) && !master) {
+		list_for_each_entry(proc, &proc_list, list) {
+			if ((proc->options & PROC_O_TYPE_WORKER) && (proc->options & PROC_O_LEAVING)) {
+				close(proc->ipc_fd[0]);
+				proc->ipc_fd[0] = -1;
+			}
+		}
+	}
+
 	/* Exit in standalone mode, if no listeners found */
 	if (!(global.mode & MODE_MWORKER) && listeners == 0) {
 		ha_alert("[%s.main()] No enabled listener found (check for 'bind' directives) ! Exiting.\n", argv[0]);
@@ -3879,6 +3934,15 @@ int main(int argc, char **argv)
 		if (devnullfd < 0) {
 			ha_alert("Cannot open /dev/null\n");
 			exit(EXIT_FAILURE);
+		}
+	}
+
+        /* applies the renice value in the worker or standalone after configuration parsing
+         * but before chaning identity */
+        if (!master && global.tune.renice_runtime) {
+		if (setpriority(PRIO_PROCESS, 0, global.tune.renice_runtime - 100) == -1) {
+			ha_warning("[%s.main()] couldn't set the runtime nice value to %d: %s\n",
+			           argv[0], global.tune.renice_runtime - 100, strerror(errno));
 		}
 	}
 
@@ -4033,8 +4097,6 @@ int main(int argc, char **argv)
 #endif
 	}
 
-	global.mode &= ~MODE_STARTING;
-	reset_usermsgs_ctx();
 
 	/* start threads 2 and above */
 	setup_extra_threads(&run_thread_poll_loop);
@@ -4080,7 +4142,19 @@ int main(int argc, char **argv)
 		}
 		close(sock_pair[1]);
 		ha_free(&msg);
+
+		/* at this point the worker must have his own startup_logs buffer */
+		tmp_startup_logs = startup_logs_dup(startup_logs);
+		if (tmp_startup_logs == NULL)
+			exit(EXIT_FAILURE);
+		startup_logs_free(startup_logs);
+		startup_logs = tmp_startup_logs;
 	}
+	/* can't unset MODE_STARTING earlier, otherwise worker's last alerts
+	 * should be not written in startup logs.
+	 */
+	global.mode &= ~MODE_STARTING;
+	reset_usermsgs_ctx();
 
 	/* Finally, start the poll loop for the first thread */
 	run_thread_poll_loop(&ha_thread_info[0]);

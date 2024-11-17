@@ -48,6 +48,7 @@
 #include <haproxy/obj_type.h>
 #include <haproxy/pattern.h>
 #include <haproxy/payload.h>
+#include <haproxy/protocol.h>
 #include <haproxy/proxy.h>
 #include <haproxy/regex.h>
 #include <haproxy/sample.h>
@@ -3258,6 +3259,8 @@ __LJMP static inline int hlua_socket_info(struct lua_State *L, const struct sock
 		lua_pushnil(L);
 		return 1;
 	}
+
+	ret = real_family(ret);
 
 	if (ret == AF_UNIX) {
 		lua_pushstring(L, buffer+1);

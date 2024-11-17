@@ -686,6 +686,74 @@ int xprt_add_hs(struct connection *conn)
 	return 0;
 }
 
+/* returns a short name for an error, typically the same as the enum name
+ * without the "CO_ER_" prefix, or an empty string for no error (better eye
+ * catching in logs). This is more compact for some debug cases.
+ */
+const char *conn_err_code_name(struct connection *c)
+{
+	switch (c->err_code) {
+	case CO_ER_NONE:             return "";
+	case CO_ER_CONF_FDLIM:       return "CONF_FDLIM";
+	case CO_ER_PROC_FDLIM:       return "PROC_FDLIM";
+	case CO_ER_SYS_FDLIM:        return "SYS_FDLIM";
+	case CO_ER_SYS_MEMLIM:       return "SYS_MEMLIM";
+	case CO_ER_NOPROTO:          return "NOPROTO";
+	case CO_ER_SOCK_ERR:         return "SOCK_ERR";
+	case CO_ER_PORT_RANGE:       return "PORT_RANGE";
+	case CO_ER_CANT_BIND:        return "CANT_BIND";
+	case CO_ER_FREE_PORTS:       return "FREE_PORTS";
+	case CO_ER_ADDR_INUSE:       return "ADDR_INUSE";
+	case CO_ER_PRX_EMPTY:        return "PRX_EMPTY";
+	case CO_ER_PRX_ABORT:        return "PRX_ABORT";
+	case CO_ER_PRX_TIMEOUT:      return "PRX_TIMEOUT";
+	case CO_ER_PRX_TRUNCATED:    return "PRX_TRUNCATED";
+	case CO_ER_PRX_NOT_HDR:      return "PRX_NOT_HDR";
+	case CO_ER_PRX_BAD_HDR:      return "PRX_BAD_HDR";
+	case CO_ER_PRX_BAD_PROTO:    return "PRX_BAD_PROTO";
+	case CO_ER_CIP_EMPTY:        return "CIP_EMPTY";
+	case CO_ER_CIP_ABORT:        return "CIP_ABORT";
+	case CO_ER_CIP_TIMEOUT:      return "CIP_TIMEOUT";
+	case CO_ER_CIP_TRUNCATED:    return "CIP_TRUNCATED";
+	case CO_ER_CIP_BAD_MAGIC:    return "CIP_BAD_MAGIC";
+	case CO_ER_CIP_BAD_PROTO:    return "CIP_BAD_PROTO";
+	case CO_ER_SSL_EMPTY:        return "SSL_EMPTY";
+	case CO_ER_SSL_ABORT:        return "SSL_ABORT";
+	case CO_ER_SSL_TIMEOUT:      return "SSL_TIMEOUT";
+	case CO_ER_SSL_TOO_MANY:     return "SSL_TOO_MANY";
+	case CO_ER_SSL_NO_MEM:       return "SSL_NO_MEM";
+	case CO_ER_SSL_RENEG:        return "SSL_RENEG";
+	case CO_ER_SSL_CA_FAIL:      return "SSL_CA_FAIL";
+	case CO_ER_SSL_CRT_FAIL:     return "SSL_CRT_FAIL";
+	case CO_ER_SSL_MISMATCH:     return "SSL_MISMATCH";
+	case CO_ER_SSL_MISMATCH_SNI: return "SSL_MISMATCH_SNI";
+	case CO_ER_SSL_HANDSHAKE:    return "SSL_HANDSHAKE";
+	case CO_ER_SSL_HANDSHAKE_HB: return "SSL_HANDSHAKE_HB";
+	case CO_ER_SSL_KILLED_HB:    return "SSL_KILLED_HB";
+	case CO_ER_SSL_NO_TARGET:    return "SSL_NO_TARGET";
+	case CO_ER_SSL_EARLY_FAILED: return "SSL_EARLY_FAILED";
+	case CO_ER_SOCKS4_SEND:      return "SOCKS4_SEND";
+	case CO_ER_SOCKS4_RECV:      return "SOCKS4_RECV";
+	case CO_ER_SOCKS4_DENY:      return "SOCKS4_DENY";
+	case CO_ER_SOCKS4_ABORT:     return "SOCKS4_ABORT";
+	case CO_ER_SSL_FATAL:        return "SSL_FATAL";
+	case CO_ER_REVERSE:          return "REVERSE";
+	case CO_ER_POLLERR:          return "POLLERR";
+	case CO_ER_EREFUSED:         return "EREFUSED";
+	case CO_ER_ERESET:           return "ERESET";
+	case CO_ER_EUNREACH:         return "EUNREACH";
+	case CO_ER_ENOMEM:           return "ENOMEM";
+	case CO_ER_EBADF:            return "EBADF";
+	case CO_ER_EFAULT:           return "EFAULT";
+	case CO_ER_EINVAL:           return "EINVAL";
+	case CO_ER_ENCONN:           return "ENCONN";
+	case CO_ER_ENSOCK:           return "ENSOCK";
+	case CO_ER_ENOBUFS:          return "ENOBUFS";
+	case CO_ER_EPIPE:            return "EPIPE";
+	}
+	return NULL;
+}
+
 /* returns a human-readable error code for conn->err_code, or NULL if the code
  * is unknown.
  */
@@ -741,11 +809,55 @@ const char *conn_err_code_str(struct connection *c)
 	case CO_ER_SOCKS4_DENY:    return "SOCKS4 Proxy deny the request";
 	case CO_ER_SOCKS4_ABORT:   return "SOCKS4 Proxy handshake aborted by server";
 
-	case CO_ERR_SSL_FATAL:     return "SSL fatal error";
+	case CO_ER_SSL_FATAL:      return "SSL fatal error";
 
 	case CO_ER_REVERSE:        return "Reverse connect failure";
+
+	case CO_ER_POLLERR:        return "Poller reported POLLERR";
+	case CO_ER_EREFUSED:       return "ECONNREFUSED returned by OS";
+	case CO_ER_ERESET:         return "ECONNRESET returned by OS";
+	case CO_ER_EUNREACH:       return "ENETUNREACH returned by OS";
+	case CO_ER_ENOMEM:         return "ENOMEM returned by OS";
+	case CO_ER_EBADF:          return "EBADF returned by OS";
+	case CO_ER_EFAULT:         return "EFAULT returned by OS";
+	case CO_ER_EINVAL:         return "EINVAL returned by OS";
+	case CO_ER_ENCONN:         return "ENCONN returned by OS";
+	case CO_ER_ENSOCK:         return "ENSOCK returned by OS";
+	case CO_ER_ENOBUFS:        return "ENOBUFS returned by OS";
+	case CO_ER_EPIPE:          return "EPIPE returned by OS";
 	}
 	return NULL;
+}
+
+/* Try to set conn->err_code to a meaningful value based on the errno value
+ * passed in <err>. Values of errno are meant to be set on return from recv/
+ * send mostly, so not all of them are handled. Any existing err_code is
+ * preserved.
+ */
+void conn_set_errno(struct connection *conn, int err)
+{
+	uchar code = 0;
+
+	if (conn->err_code)
+		return;
+
+	switch (err) {
+	case ECONNREFUSED: code = CO_ER_EREFUSED; break;
+	case ECONNRESET:   code = CO_ER_ERESET;   break;
+	case EHOSTUNREACH: code = CO_ER_EUNREACH; break;
+	case ENETUNREACH:  code = CO_ER_EUNREACH; break;
+	case ENOMEM:       code = CO_ER_ENOMEM;   break;
+	case EBADF:        code = CO_ER_EBADF;    break;
+	case EFAULT:       code = CO_ER_EFAULT;   break;
+	case EINVAL:       code = CO_ER_EINVAL;   break;
+	case ENOTCONN:     code = CO_ER_ENCONN;   break;
+	case ENOTSOCK:     code = CO_ER_ENSOCK;   break;
+	case ENOBUFS:      code = CO_ER_ENOBUFS;  break;
+	case EPIPE:        code = CO_ER_EPIPE;    break;
+	default:           code = CO_ER_SOCK_ERR; break;
+	}
+
+	conn->err_code = code;
 }
 
 /* Send a message over an established connection. It makes use of send() and
@@ -2486,7 +2598,7 @@ int smp_fetch_fc_err(const struct arg *args, struct sample *smp, const char *kw,
 	return 1;
 }
 
-/* fetch a string representation of the error code of a connection */
+/* fetch a string representation of the error code of a connection ({fc,bc}_err_{str,name} */
 int smp_fetch_fc_err_str(const struct arg *args, struct sample *smp, const char *kw, void *private)
 {
 	struct connection *conn;
@@ -2506,7 +2618,8 @@ int smp_fetch_fc_err_str(const struct arg *args, struct sample *smp, const char 
 		return 0;
 	}
 
-	err_code_str = conn_err_code_str(conn);
+	/* [7] = "str" or "name" */
+	err_code_str = kw[7] == 's' ? conn_err_code_str(conn) : conn_err_code_name(conn);
 
 	if (!err_code_str)
 		return 0;
@@ -2579,12 +2692,14 @@ int smp_fetch_fc_streams_limit(const struct arg *args, struct sample *smp, const
  */
 static struct sample_fetch_kw_list sample_fetch_keywords = {ILH, {
 	{ "bc_err", smp_fetch_fc_err, 0, NULL, SMP_T_SINT, SMP_USE_L4SRV },
+	{ "bc_err_name", smp_fetch_fc_err_str, 0, NULL, SMP_T_STR, SMP_USE_L4SRV },
 	{ "bc_err_str", smp_fetch_fc_err_str, 0, NULL, SMP_T_STR, SMP_USE_L4SRV },
 	{ "bc_glitches", smp_fetch_fc_glitches, 0, NULL, SMP_T_SINT, SMP_USE_L4SRV },
 	{ "bc_http_major", smp_fetch_fc_http_major, 0, NULL, SMP_T_SINT, SMP_USE_L4SRV },
 	{ "bc_nb_streams", smp_fetch_fc_nb_streams, 0, NULL, SMP_T_SINT, SMP_USE_L5SRV },
 	{ "bc_setting_streams_limit", smp_fetch_fc_streams_limit, 0, NULL, SMP_T_SINT, SMP_USE_L5SRV },
 	{ "fc_err", smp_fetch_fc_err, 0, NULL, SMP_T_SINT, SMP_USE_L4CLI },
+	{ "fc_err_name", smp_fetch_fc_err_str, 0, NULL, SMP_T_STR, SMP_USE_L4CLI },
 	{ "fc_err_str", smp_fetch_fc_err_str, 0, NULL, SMP_T_STR, SMP_USE_L4CLI },
 	{ "fc_glitches", smp_fetch_fc_glitches, 0, NULL, SMP_T_SINT, SMP_USE_L4CLI },
 	{ "fc_http_major", smp_fetch_fc_http_major, 0, NULL, SMP_T_SINT, SMP_USE_L4CLI },
@@ -2674,6 +2789,50 @@ static void conn_calculate_hash_sockaddr(const struct sockaddr_storage *ss,
 			                 hash_flags, param_type_port);
 		}
 
+		break;
+
+	case AF_UNIX:
+		conn_hash_update(hash,
+		                 &((struct sockaddr_un *)ss)->sun_path,
+		                 strlen(((struct sockaddr_un *)ss)->sun_path),
+		                 hash_flags, param_type_addr);
+		break;
+
+	case AF_CUST_ABNS:
+		conn_hash_update(hash,
+		                 &((struct sockaddr_un *)ss)->sun_path,
+		                 sizeof(((struct sockaddr_un *)ss)->sun_path),
+		                 hash_flags, param_type_addr);
+		break;
+
+	case AF_CUST_ABNSZ:
+	{
+		const struct sockaddr_un *un = (struct sockaddr_un *)ss;
+		conn_hash_update(hash,
+		                 &un->sun_path,
+		                 1 + strnlen2(un->sun_path + 1, sizeof(un->sun_path) - 1),
+		                 hash_flags, param_type_addr);
+		break;
+	}
+
+	case AF_CUST_SOCKPAIR:
+		/* simply hash the fd */
+		conn_hash_update(hash,
+		                 &((struct sockaddr_in *)ss)->sin_addr.s_addr,
+		                 sizeof(int),
+		                 hash_flags, param_type_addr);
+		break;
+
+	default:
+		/* We don't know how to specifically handle this address family.
+		 * yet we cannot afford to have 2 sockaddr_storage structs
+		 * colliding with different parameters. So instead of risking
+		 * hash collision (which would result in HTTP reuse issues),
+		 * let's switch to generic sockaddr storage hashing (unoptimal
+		 * as it is slower and may not be able to group similar
+		 * addresses if they're not byte to byte equivalents).
+		 */
+		conn_hash_update(hash, ss, sizeof(*ss), hash_flags, param_type_addr);
 		break;
 	}
 }
