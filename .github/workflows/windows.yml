@@ -8,7 +8,7 @@
 
 name: Build Haproxy Windows
 
-on: [push]
+on: [ push ]
 
 jobs:
   msys2:
