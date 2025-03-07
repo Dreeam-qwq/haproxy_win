@@ -13,13 +13,17 @@
 #include <haproxy/global.h>
 #include <haproxy/listener.h>
 #include <haproxy/proxy.h>
-#include <haproxy/quic_cc-t.h>
+#include <haproxy/quic_cc.h>
 #include <haproxy/quic_rules.h>
+#include <haproxy/quic_tune.h>
 #include <haproxy/tools.h>
 
 #define QUIC_CC_NEWRENO_STR "newreno"
 #define QUIC_CC_CUBIC_STR   "cubic"
+#define QUIC_CC_BBR_STR     "bbr"
 #define QUIC_CC_NO_CC_STR   "nocc"
+
+struct quic_tune quic_tune;
 
 static int bind_parse_quic_force_retry(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
 {
@@ -73,9 +77,16 @@ static unsigned long parse_window_size(const char *kw, char *value,
 static int bind_parse_quic_cc_algo(char **args, int cur_arg, struct proxy *px,
                                    struct bind_conf *conf, char **err)
 {
-	struct quic_cc_algo *cc_algo;
+	struct quic_cc_algo *cc_algo = NULL;
 	const char *algo = NULL;
+	struct ist algo_ist, arg_ist;
 	char *arg;
+
+	cc_algo = calloc(1, sizeof(struct quic_cc_algo));
+	if (!cc_algo) {
+		memprintf(err, "'%s' : out of memory", args[cur_arg]);
+		goto fail;
+	}
 
 	if (!*args[cur_arg + 1]) {
 		memprintf(err, "'%s' : missing control congestion algorithm", args[cur_arg]);
@@ -83,19 +94,27 @@ static int bind_parse_quic_cc_algo(char **args, int cur_arg, struct proxy *px,
 	}
 
 	arg = args[cur_arg + 1];
-	if (strncmp(arg, QUIC_CC_NEWRENO_STR, strlen(QUIC_CC_NEWRENO_STR)) == 0) {
+	arg_ist = ist(args[cur_arg + 1]);
+	algo_ist = istsplit(&arg_ist, '(');
+	if (isteq(algo_ist, ist(QUIC_CC_NEWRENO_STR))) {
 		/* newreno */
 		algo = QUIC_CC_NEWRENO_STR;
-		cc_algo = &quic_cc_algo_nr;
+		*cc_algo = quic_cc_algo_nr;
 		arg += strlen(QUIC_CC_NEWRENO_STR);
 	}
-	else if (strncmp(arg, QUIC_CC_CUBIC_STR, strlen(QUIC_CC_CUBIC_STR)) == 0) {
+	else if (isteq(algo_ist, ist(QUIC_CC_CUBIC_STR))) {
 		/* cubic */
 		algo = QUIC_CC_CUBIC_STR;
-		cc_algo = &quic_cc_algo_cubic;
+		*cc_algo = quic_cc_algo_cubic;
 		arg += strlen(QUIC_CC_CUBIC_STR);
 	}
-	else if (strncmp(arg, QUIC_CC_NO_CC_STR, strlen(QUIC_CC_NO_CC_STR)) == 0) {
+	else if (isteq(algo_ist, ist(QUIC_CC_BBR_STR))) {
+		/* bbr */
+		algo = QUIC_CC_BBR_STR;
+		*cc_algo = quic_cc_algo_bbr;
+		arg += strlen(QUIC_CC_BBR_STR);
+	}
+	else if (isteq(algo_ist, ist(QUIC_CC_NO_CC_STR))) {
 		/* nocc */
 		if (!experimental_directives_allowed) {
 			ha_alert("'%s' algo is experimental, must be allowed via a global "
@@ -104,7 +123,7 @@ static int bind_parse_quic_cc_algo(char **args, int cur_arg, struct proxy *px,
 		}
 
 		algo = QUIC_CC_NO_CC_STR;
-		cc_algo = &quic_cc_algo_nocc;
+		*cc_algo = quic_cc_algo_nocc;
 		arg += strlen(QUIC_CC_NO_CC_STR);
 	}
 	else {
@@ -113,25 +132,40 @@ static int bind_parse_quic_cc_algo(char **args, int cur_arg, struct proxy *px,
 	}
 
 	if (*arg++ == '(') {
-		unsigned long cwnd;
 		char *end_opt;
 
-		cwnd = parse_window_size(args[cur_arg], arg, &end_opt, err);
-		if (!cwnd)
-			goto fail;
+		if (*arg == ')')
+			goto out;
 
-		if (*end_opt != ')') {
-			memprintf(err, "'%s' : expects %s(<max window>)", args[cur_arg + 1], algo);
-			goto fail;
+		if (*arg != ',') {
+			unsigned long cwnd = parse_window_size(args[cur_arg], arg, &end_opt, err);
+			if (!cwnd)
+				goto fail;
+
+			conf->max_cwnd = cwnd;
+
+			if (*end_opt == ')') {
+				goto out;
+			}
+			else if (*end_opt != ',') {
+				memprintf(err, "'%s' : cannot parse max-window argument for '%s' algorithm", args[cur_arg], algo);
+				goto fail;
+			}
+			arg = end_opt;
 		}
 
-		conf->max_cwnd = cwnd;
+		if (*++arg != ')') {
+			memprintf(err, "'%s' : too many argument for '%s' algorithm", args[cur_arg], algo);
+			goto fail;
+		}
 	}
 
+ out:
 	conf->quic_cc_algo = cc_algo;
 	return 0;
 
  fail:
+	free(cc_algo);
 	return ERR_ALERT | ERR_FATAL;
 }
 
@@ -266,14 +300,14 @@ static int cfg_parse_quic_tune_setting(char **args, int section_type,
 		global.tune.quic_cubic_loss_tol = arg - 1;
 	else if (strcmp(suffix, "frontend.conn-tx-buffers.limit") == 0) {
 		memprintf(err, "'%s' keyword is now obsolote and has no effect. "
-		               "Use 'tune.quic.frontend.max-window-size' to limit Tx buffer allocation per connection.", args[0]);
+		               "Use 'tune.quic.frontend.default-max-window-size' to limit Tx buffer allocation per connection.", args[0]);
 		return 1;
 	}
 	else if (strcmp(suffix, "frontend.glitches-threshold") == 0)
 		global.tune.quic_frontend_glitches_threshold = arg;
 	else if (strcmp(suffix, "frontend.max-streams-bidi") == 0)
 		global.tune.quic_frontend_max_streams_bidi = arg;
-	else if (strcmp(suffix, "frontend.max-window-size") == 0) {
+	else if (strcmp(suffix, "frontend.default-max-window-size") == 0) {
 		unsigned long cwnd;
 		char *end_opt;
 
@@ -319,7 +353,10 @@ static int cfg_parse_quic_tune_setting0(char **args, int section_type,
 		return -1;
 
 	suffix = args[0] + prefix_len;
-	if (strcmp(suffix, "disable-udp-gso") == 0) {
+	if (strcmp(suffix, "disable-tx-pacing") == 0) {
+		quic_tune.options |= QUIC_TUNE_NO_PACING;
+	}
+	else if (strcmp(suffix, "disable-udp-gso") == 0) {
 		global.tune.options |= GTUNE_QUIC_NO_UDP_GSO;
 	}
 	else {
@@ -376,10 +413,11 @@ static struct cfg_kw_list cfg_kws = {ILH, {
 	{ CFG_GLOBAL, "tune.quic.frontend.glitches-threshold", cfg_parse_quic_tune_setting },
 	{ CFG_GLOBAL, "tune.quic.frontend.max-streams-bidi", cfg_parse_quic_tune_setting },
 	{ CFG_GLOBAL, "tune.quic.frontend.max-idle-timeout", cfg_parse_quic_time },
-	{ CFG_GLOBAL, "tune.quic.frontend.max-window-size", cfg_parse_quic_tune_setting },
+	{ CFG_GLOBAL, "tune.quic.frontend.default-max-window-size", cfg_parse_quic_tune_setting },
 	{ CFG_GLOBAL, "tune.quic.max-frame-loss", cfg_parse_quic_tune_setting },
 	{ CFG_GLOBAL, "tune.quic.reorder-ratio", cfg_parse_quic_tune_setting },
 	{ CFG_GLOBAL, "tune.quic.retry-threshold", cfg_parse_quic_tune_setting },
+	{ CFG_GLOBAL, "tune.quic.disable-tx-pacing", cfg_parse_quic_tune_setting0 },
 	{ CFG_GLOBAL, "tune.quic.disable-udp-gso", cfg_parse_quic_tune_setting0 },
 	{ CFG_GLOBAL, "tune.quic.zero-copy-fwd-send", cfg_parse_quic_tune_on_off },
 	{ 0, NULL, NULL }
@@ -492,7 +530,7 @@ static int quic_parse_quic_initial(char **args, int section_type, struct proxy *
 	}
 
 	/* the following function directly emits the warning */
-	warnif_misplaced_quic_init(curpx, file, line, args[0]);
+	warnif_misplaced_quic_init(curpx, file, line, args[0], NULL);
 
 	LIST_APPEND(&curpx->quic_init_rules, &rule->list);
 

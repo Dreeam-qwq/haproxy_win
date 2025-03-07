@@ -10,7 +10,13 @@ server s1 {
 
 haproxy h1 -conf {
     global
+        tune.lua.bool-sample-conversion normal
         lua-load ${testdir}/lua_socket.lua
+
+    defaults
+        timeout client 30s
+        timeout server 30s
+        timeout connect 30s
 
     frontend fe1
         mode http

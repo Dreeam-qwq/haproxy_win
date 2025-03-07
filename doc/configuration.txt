@@ -2,8 +2,8 @@
                                 HAProxy
                           Configuration Manual
                          ----------------------
-                              version 3.1
-                              2024/11/15
+                              version 3.2
+                              2025/02/19
 
 
 This document covers the configuration language as implemented in the version
@@ -423,7 +423,7 @@ on the server. The part after the question mark is called the "query string".
 It is mostly used with GET requests sent to dynamic scripts and is very
 specific to the language, framework or application in use.
 
-HTTP/3 and HTTP/3 do not convey a version information with the request, so the
+HTTP/2 and HTTP/3 do not convey a version information with the request, so the
 version is assumed to be the same as the one of the underlying protocol (i.e.
 "HTTP/2"). In addition, these protocols do not send a request line as one part,
 but split it into individual fields called "pseudo-headers", whose name start
@@ -852,6 +852,26 @@ double quotes inside (so that the double quotes are not stripped again):
                                           arg2 ___________/    /
                                           arg3 _______________/
 
+But in this case it's important to note that delimiters embedded into the
+higher level string remain pure characters and are not delimiters anymore. It
+particularly means that spaces and tabs around commas are part of the string.
+The example below is wrong on multiple points:
+
+    http-request set-path '%[path, regsub("(foo|bar)", blah, g)]'
+    ------------ --------  --------------------------------------
+       word1       word2    word3=%[path, regsub("(foo|bar)", blah, g)]
+                                        |--------|---------||-----|--|
+                       converter=" regsub" _/        /         /   /
+                                    arg1=(foo|bar) _/         /   /
+                                     arg2=" blah" ___________/   /
+                                        arg3=" g" ______________/
+
+The single fact of surrounding commas with spaces resulted in the spaces being
+part of the field itself, hence the converter " regsub" (starting with a
+space), which won't be found and will trigger an error, but more subtly, the
+replacement string " blah" will insert a space in the output. A good rule of
+thumb is to never insert unneeded spaces inside expressions.
+
 When using regular expressions, it can happen that the dollar ('$') character
 appears in the expression or that a backslash ('\') is used in the replacement
 string. In this case these ones will also be processed inside the double quotes
@@ -915,66 +935,136 @@ existing variables, not empty ones.
       user "$HAPROXY_USER"
 
 Some variables are defined by HAProxy, they can be used in the configuration
-file, or could be inherited by a program (See 3.7. Programs):
+file, or could be inherited by a program (See 3.7. Programs). These variables
+are listed in the matrix below, and they are classified among four categories:
 
-* HAPROXY_LOCALPEER: defined at the startup of the process which contains the
-  name of the local peer. (See "-L" in the management guide.)
+  * usable: the variable is accessible from the configuration, either to be
+    resolved as-is, or used within conditional blocks or predicates to enable
+    or disable this some configuration fragments, as described in section 2.4
+    "Conditional blocks".
 
-* HAPROXY_CFGFILES: list of the configuration files loaded by HAProxy,
-  separated by semicolons. Can be useful in the case you specified a
-  directory.
+  * modifiable: the variable can be redefined or unset in the configuration via
+    "setenv"/"unsetenv" keywords.
 
-* HAPROXY_HTTP_LOG_FMT: contains the value of the default HTTP log format as
-  defined in section 8.2.3 "HTTP log format". It can be used to override the
-  default log format without having to copy the whole original definition.
+  * listed: the variable is listed in CLI's "show env" command output,
+    described in section 9.3 "Unix Sockets commands" of the management guide.
 
-* HAPROXY_HTTP_CLF_LOG_FMT: contains the value of the default HTTP CLF log
-  format as defined in section 8.2.3 "HTTP log format". It can be used to
-  override the default log format without having to copy the whole original
-  definition.
+  * exported: variable is exported to launch programs in a modified environment
+    (See section 3.7 "Programs"). Note that this does not apply to external
+    checks which have their own rules regarding exported variables.
 
-  Example:
-    # Add the rule that gave the final verdict to the log
-    log-format "${HAPROXY_TCP_LOG_FMT} lr=last_rule_file:last_rule_line"
+There also two subcategories "master" and "worker", respectively marked 'M' and
+'W' in the table below, showing the differences between the two processes when
+HAProxy is launched in master-worker mode.
 
-* HAPROXY_HTTPS_LOG_FMT: similar to HAPROXY_HTTP_LOG_FMT but for HTTPS log
-  format as defined in section 8.2.4 "HTTPS log format".
+  * master: the variable is set and accessible from the master process. So, it
+    will appear in the master CLI's "show env" output and it can be used in
+    conditional blocks or directives to enable some special settings for the
+    master (see examples in section 2.4 "Conditional blocks").
 
-* HAPROXY_TCP_LOG_FMT: similar to HAPROXY_HTTP_LOG_FMT but for TCP log format
-  as defined in section 8.2.2 "TCP log format".
+  * worker: the variable is set and accessible from the worker process. It will
+    appear in the worker CLI's "show env" (or the master CLI's "@1 show env")
+    and it may as well condition some worker process parameters (see examples
+    from section 2.4 "Conditional blocks").
 
-* HAPROXY_TCP_CLF_LOG_FMT: similar to HAPROXY_HTTP_CLF_LOG_FMT but for TCP CLF
-  log format as defined in section 8.2.2 "TCP log format".
+In standalone mode (without "-W" option nor the "master-worker" keyword) the
+process behaves like a worker, except for variables "HAPROXY_MASTER_CLI" and
+"HAPROXY_MWORKER" which are not defined.
 
-* HAPROXY_MWORKER: In master-worker mode, this variable is set to 1.
+Some variables are marked as not usable and not modifiable:
 
-* HAPROXY_CLI: configured listeners addresses of the stats socket for every
-  processes, separated by semicolons.
+  * HAPROXY_CFGFILES
+  * HAPROXY_MWORKER
+  * HAPROXY_CLI
+  * HAPROXY_MASTER_CLI
+  * HAPROXY_LOCALPEER
 
-* HAPROXY_MASTER_CLI: In master-worker mode, listeners addresses of the master
-  CLI, separated by semicolons.
+Their values are undefined during configuration parsing, they are set later
+during the initialization. So, it's recommended not to use these variables
+within conditional blocks and not to reference them in the global section's
+"setenv"/"resetenv"/"unsetenv" keywords.
 
-* HAPROXY_STARTUP_VERSION: contains the version used to start, in master-worker
-  mode this is the version which was used to start the master, even after
-  updating the binary and reloading.
+The table below summaries the status of each variable for the different working
+modes:
 
-* HAPROXY_BRANCH: contains the HAProxy branch version (such as "2.8"). It does
-  not contain the full version number. It can be useful in case of migration
-  if resources (such as maps or certificates) are in a path containing the
-  branch number.
+  +--------------------------+----------+---------+------------+-----------+
+  |        variable          | exported | usable  | modifiable |  listed   |
+  |                          |          +---------+------------+-----------+
+  |                          |          |  M | W  |   M  |  W  |  M  |  W  |
+  +--------------------------+----------+----+----+------+-----+-----+-----+
+  | HAPROXY_STARTUP_VERSION  |    X     |  X | X  |      |     |  X  |  X  |
+  | HAPROXY_BRANCH           |    X     |  X | X  |      |     |  X  |  X  |
+  | HAPROXY_CFGFILES         |    X     |    |    |      |     |  X  |  X  |
+  | HAPROXY_MWORKER          |    X     |    |    |      |     |  X  |  X  |
+  | HAPROXY_CLI              |          |    |    |      |     |     |  X  |
+  | HAPROXY_MASTER_CLI       |          |    |    |      |     |  X  |     |
+  | HAPROXY_LOCALPEER        |          |    | X  |      |     |     |  X  |
+  | HAPROXY_HTTP_LOG_FMT     |          |    | X  |      |  X  |     |     |
+  | HAPROXY_HTTP_CLF_LOG_FMT |          |    | X  |      |  X  |     |     |
+  | HAPROXY_HTTPS_LOG_FMT    |          |    | X  |      |  X  |     |     |
+  | HAPROXY_TCP_LOG_FMT      |          |    | X  |      |  X  |     |     |
+  +--------------------------+----------+----+----+------+-----+-----+-----+
+
+The variables in question are the following:
+
+  * HAPROXY_LOCALPEER: defined at the startup of the process which contains the
+    name of the local peer. (See "-L" in the management guide.)
+
+  * HAPROXY_CFGFILES: list of the configuration files loaded by HAProxy,
+    separated by semicolons. Can be useful in the case you specified a
+    directory.
+
+  * HAPROXY_HTTP_LOG_FMT: contains the value of the default HTTP log format as
+    defined in section 8.2.3 "HTTP log format". It can be used to override the
+    default log format without having to copy the whole original definition.
+
+  * HAPROXY_HTTP_CLF_LOG_FMT: contains the value of the default HTTP CLF log
+    format as defined in section 8.2.3 "HTTP log format". It can be used to
+    override the default log format without having to copy the whole original
+    definition.
+
+    Example:
+      # Add the rule that gave the final verdict to the log
+      log-format "${HAPROXY_TCP_LOG_FMT} lr=last_rule_file:last_rule_line"
+
+  * HAPROXY_HTTPS_LOG_FMT: similar to HAPROXY_HTTP_LOG_FMT but for HTTPS log
+    format as defined in section 8.2.4 "HTTPS log format".
+
+  * HAPROXY_TCP_LOG_FMT: similar to HAPROXY_HTTP_LOG_FMT but for TCP log format
+    as defined in section 8.2.2 "TCP log format".
+
+  * HAPROXY_TCP_CLF_LOG_FMT: similar to HAPROXY_HTTP_CLF_LOG_FMT but for TCP
+    CLF log format as defined in section 8.2.2 "TCP log format".
+
+  * HAPROXY_MWORKER: In master-worker mode, this variable is set to 1.
+
+  * HAPROXY_CLI: configured listeners addresses of the stats socket of every
+    processe, these addresses are separated by semicolons.
+
+  * HAPROXY_MASTER_CLI: In master-worker mode, listeners addresses of the master
+    CLI, separated by semicolons.
+
+  * HAPROXY_STARTUP_VERSION: contains the version used to start, in master-
+    worker mode this is the version which was used to start the master, even
+    after updating the binary and reloading.
+
+  * HAPROXY_BRANCH: contains the HAProxy branch version (such as "2.8"). It
+    does not contain the full version number. It can be useful in case of
+    migration if resources (such as maps or certificates) are in a path
+    containing the branch number.
 
 In addition, some pseudo-variables are internally resolved and may be used as
 regular variables. Pseudo-variables always start with a dot ('.'), and are the
 only ones where the dot is permitted. The current list of pseudo-variables is:
 
-* .FILE: the name of the configuration file currently being parsed.
+  * .FILE: the name of the configuration file currently being parsed.
 
-* .LINE: the line number of the configuration file currently being parsed,
-  starting at one.
+  * .LINE: the line number of the configuration file currently being parsed,
+    starting at one.
 
-* .SECTION: the name of the section currently being parsed, or its type if the
-  section doesn't have a name (e.g. "global"), or an empty string before the
-  first section.
+  * .SECTION: the name of the section currently being parsed, or its type if
+    the section doesn't have a name (e.g. "global"), or an empty string before
+    the first section.
 
 These variables are resolved at the location where they are parsed. For example
 if a ".LINE" variable is used in a "log-format" directive located in a defaults
@@ -985,8 +1075,6 @@ proxies.
 This way it is possible to emit information to help locate a rule in variables,
 logs, error statuses, health checks, header values, or even to use line numbers
 to name some config objects like servers for example.
-
-See also "external-check command" for other variables.
 
 
 2.4. Conditional blocks
@@ -1036,6 +1124,54 @@ expression made of any combination of:
   - expressions combined with a logical OR ('||'), which will be evaluated
     from right to left until one returns true
 
+The same line tokenizer and argument parser are used as for the rest of the
+configuration language. Words are split around consecutive series of one or
+more unquoted spaces or tabs, and are reassembled together using a single space
+to delimit them before evaluation, in order to save the user from having to
+quote the entire line. But this also means that spaces surrounding commas or
+parenthesis are definitely part of the value, which is not always expected.
+For example, the expression below:
+
+   .if defined( HAPROXY_MWORKER )
+
+will test for the existence of variable " HAPROXY_MWORKER " (with spaces),
+and this one:
+
+   .if streq("$ENABLE_SSL",     1)
+
+will compare the environment variable "ENABLE_SSL" to the value " 1" (with a
+single leading space). The reason is the line is first split into words like
+this:
+
+   .if streq("$ENABLE_SSL",     1)
+  |---|--------------------|   |--|
+    1           2               3
+
+then the weak quoting is applied and environment variable "$ENABLE_SSL" is
+resolved (let's say for example that ENABLE_SSL=0), and finally the words are
+reassembled into a single string by placing a single space between the words:
+
+   .if streq(0, 1)
+  |---|-------|--|
+    1     2     3
+
+and only then it is parsed as a single expression. The space that was inserted
+between the comma and "1" is still part of the argument value, making this
+argument " 1":
+
+   .if streq(0, 1)
+  |---|-----|-|--|
+    \    \    \  \_ argument2: " 1"
+     \    \    \___ argument1: "0"
+      \    \_______ function: "streq"
+       \___________ directive: ".if"
+
+It's visible here that even if ENABLE_SSL had been equal to "1", it wouldn't
+have matched " 1" since the string would differ by one space.
+
+Note: as explained in section "2.2. Quoting and escaping", a good rule of thumb
+      is to never insert unneeded spaces inside expressions.
+
 Note that like in other languages, the AND operator has precedence over the OR
 operator, so that "A && B || C && D" evalues as "(A && B) || (C && D)".
 
@@ -1050,7 +1186,8 @@ The list of currently supported predicates is the following:
 
   - streq(<str1>,<str2>)  : returns true only if the two strings are equal
   - strneq(<str1>,<str2>) : returns true only if the two strings differ
-  - strstr(<str1>,<str2>) : returns true only if the second string is found in the first one
+  - strstr(<str1>,<str2>) : returns true only if the second string is found in
+                            the first one.
 
   - version_atleast(<ver>): returns true if the current haproxy version is
                             at least as recent as <ver> otherwise false. The
@@ -1070,11 +1207,40 @@ The list of currently supported predicates is the following:
 
 Example:
 
+   # 1. HAPROXY_MWORKER variable is set automatically by HAProxy in master and
+   # in worker process environments (see HAProxy variables matrix from
+   # 2.3. Environment variables). Its presence enables an additional listener.
+
+   global
+     master-worker
+
    .if defined(HAPROXY_MWORKER)
        listen mwcli_px
           bind :1111
           ...
    .endif
+
+   # 2. HAPROXY_BRANCH is set automatically by HAProxy in master and in worker
+   # process environments (see HAProxy variables matrix from 2.3. Environment
+   # variables). We check HAPROXY_BRANCH value and conditionally enable
+   # mworker-max-reloads parameter.
+
+   global
+     master-worker
+
+   .if streq("$HAPROXY_BRANCH",3.1)
+        mworker-max-reloads 5
+   .endif
+
+   # 3. Some arbitrary environment variables are set by user in the global
+   # section. If HAProxy is started in master-worker mode, they are presented in
+   # master and in worker process environments. We check values of these
+   # variables and conditionally enable ports 80 and 443. Environment variables
+   # checks can be mixed with features and version checks.
+
+   global
+     setenv WITH_SSL yes
+     unsetenv SSL_ONLY
 
    .if strneq("$SSL_ONLY",yes)
           bind :80
@@ -1473,6 +1639,7 @@ The following keywords are supported in the "global" section :
    - tune.comp.maxlevel
    - tune.disable-fast-forward
    - tune.disable-zero-copy-forwarding
+   - tune.epoll.mask-events
    - tune.events.max-events-at-once
    - tune.fail-alloc
    - tune.fd.edge-triggered
@@ -1497,17 +1664,20 @@ The following keywords are supported in the "global" section :
    - tune.http.maxhdr
    - tune.idle-pool.shared
    - tune.idletimer
+   - tune.lua.bool-sample-conversion
+   - tune.lua.burst-timeout
    - tune.lua.forced-yield
+   - tune.lua.log.loggers
+   - tune.lua.log.stderr
    - tune.lua.maxmem
    - tune.lua.service-timeout
    - tune.lua.session-timeout
    - tune.lua.task-timeout
-   - tune.lua.log.loggers
-   - tune.lua.log.stderr
    - tune.max-checks-per-thread
    - tune.maxaccept
    - tune.maxpollevents
    - tune.maxrewrite
+   - tune.max-rules-at-once
    - tune.memory.hot-size
    - tune.pattern.cache-size
    - tune.peers.max-updates-at-once
@@ -1516,11 +1686,12 @@ The following keywords are supported in the "global" section :
    - tune.pool-low-fd-ratio
    - tune.pt.zero-copy-forwarding
    - tune.quic.cc-hystart
+   - tune.quic.disable-tx-pacing
    - tune.quic.disable-udp-gso
    - tune.quic.frontend.glitches-threshold
    - tune.quic.frontend.max-idle-timeout
    - tune.quic.frontend.max-streams-bidi
-   - tune.quic.frontend.max-window-size
+   - tune.quic.frontend.default-max-window-size
    - tune.quic.max-frame-loss
    - tune.quic.reorder-ratio
    - tune.quic.retry-threshold
@@ -1553,6 +1724,7 @@ The following keywords are supported in the "global" section :
    - tune.ssl.ssl-ctx-cache-size
    - tune.ssl.ocsp-update.maxdelay (deprecated)
    - tune.ssl.ocsp-update.mindelay (deprecated)
+   - tune.takeover-other-tg-connections
    - tune.vars.global-max-size
    - tune.vars.proc-max-size
    - tune.vars.reqres-max-size
@@ -2869,6 +3041,13 @@ stats-file <path>
   values to its internal counters. Use the CLI command "dump stats-file" to
   produce such stats-file. See the management manual for more details.
 
+stress-level <level>
+  Activate alternative code to stress haproxy binary. Level is an integer from
+  0 to 9. The default value 0 disable any stressing execution. Levels from 1 to
+  9 will increase the stress pressure on the haproxy binary. Note that using
+  any positive level can significantly hurt performance. As such it should
+  never be activated unless for debugging purpose and on a developer request.
+
 strict-limits
   Makes process fail at startup when a setrlimit fails. HAProxy tries to set the
   best setrlimit according to what has been calculated. If it fails, it will
@@ -3320,7 +3499,7 @@ tune.buffers.reserve <number>
   a user would want to change this value, unless a core developer suggests to
   change it for a very specific reason.
 
-tune.bufsize <number>
+tune.bufsize <size>
   Sets the buffer size to this size (in bytes). Lower values allow more
   streams to coexist in the same amount of RAM, and higher values allow some
   applications with very large cookies to work. The default value is 16384 and
@@ -3336,7 +3515,7 @@ tune.bufsize <number>
   value set using this parameter will automatically be rounded up to the next
   multiple of 8 on 32-bit machines and 16 on 64-bit machines.
 
-tune.bufsize.small <number>
+tune.bufsize.small <size>
   Sets the size in bytes for small buffers. The defaults value is 1024.
 
   These buffers are designed to be used in some specific contexts where memory
@@ -3373,6 +3552,31 @@ tune.disable-zero-copy-forwarding
   See also: tune.pt.zero-copy-forwarding, tune.applet.zero-copy-forwarding,
             tune.h1.zero-copy-fwd-recv, tune.h1.zero-copy-fwd-send,
             tune.h2.zero-copy-fwd-send, tune.quic.zero-copy-fwd-send
+
+tune.epoll.mask-events <event[,...]>
+  Along HAProxy's history, a few complex issues were met that were caused by
+  bugs in the epoll mechanism in the Linux kernel. These ones usually are very
+  rare and unreproducible outside the reporter's environment, and may only be
+  worked around by disabling epoll and switching to poll instead, which is not
+  very satisfying for high performance environments. Each time, issues affect
+  only very specific (and rare) event types, and offering the ability to mask
+  them can constitute a more acceptable work-around. This options offers this
+  possibility by permitting to silently ignore events a few uncommon events
+  and replace them with an input (which reports an unspecified incoming event).
+  The effect is to avoid the fast error processing paths in certain places and
+  only use the common paths. This should never be used unless being invited to
+  do so by an expert in order to diagnose or work around a kernel bug.
+
+  The option takes a single argument which is a comma-delimited list of words
+  each designating an event to be masked. The currently supported list of
+  events is:
+    - "err":   mask the EPOLLERR event
+    - "hup":   mask the EPOLLHUP events
+    - "rdhup": mask the EPOLLRDHUP events
+
+  Example:
+     # mask all non-traffic epoll events:
+     tune.epoll.mask-events err,hup,rdhup
 
 tune.events.max-events-at-once <number>
   Sets the number of events that may be processed at once by an asynchronous
@@ -3621,15 +3825,22 @@ tune.http.logurilen <number>
   The default value is 1024.
 
 tune.http.maxhdr <number>
-  Sets the maximum number of headers in a request. When a request comes with a
-  number of headers greater than this value (including the first line), it is
-  rejected with a "400 Bad Request" status code. Similarly, too large responses
-  are blocked with "502 Bad Gateway". The default value is 101, which is enough
-  for all usages, considering that the widely deployed Apache server uses the
-  same limit. It can be useful to push this limit further to temporarily allow
-  a buggy application to work by the time it gets fixed. The accepted range is
-  1..32767. Keep in mind that each new header consumes 32bits of memory for
-  each stream, so don't push this limit too high.
+  Sets the maximum number of headers allowed in received HTTP messages. When a
+  message comes with a number of headers greater than this value (including the
+  first line), it is rejected with a "400 Bad Request" status code for a
+  request, or "502 Bad Gateway" for a response. The default value is 101, which
+  is enough for all usages, considering that the widely deployed Apache server
+  uses the same limit. It can be useful to push this limit further to
+  temporarily allow a buggy application to work by the time it gets fixed. The
+  accepted range is 1..32767. Keep in mind that each new header consumes 32bits
+  of memory for each stream, so don't push this limit too high.
+
+  Note that HTTP/1.1 is a text protocol, so there is no special limit when the
+  message is sent. The limit during the message parsing is sufficient. HTTP/2
+  and HTTP/3 are binary protocols and require an encoding step. A limit is set
+  too when headers are encoded to comply to limitation imposed by the
+  protocols. This limit is large enough but not documented on purpose. The same
+  limit is applied on the first steps of the decoding for the same reason.
 
 tune.idle-pool.shared { on | off }
   Enables ('on') or disables ('off') sharing of idle connection pools between
@@ -3698,33 +3909,25 @@ tune.listener.multi-queue { on | fair | off }
   short-lived and it is estimated that the operating system already provides a
   good enough distribution. The default is "on".
 
-tune.lua.forced-yield <number>
-  This directive forces the Lua engine to execute a yield each <number> of
-  instructions executed. This permits interrupting a long script and allows the
-  HAProxy scheduler to process other tasks like accepting connections or
-  forwarding traffic. The default value is 10000 instructions for scripts loaded
-  using "lua-load-per-thread" and MAX(500, 10000 / nbthread) instructions for
-  scripts loaded using "lua-load" (it was found to be an optimal value for
-  performance while taking care of not creating thread contention with multiple
-  threads competing for the global lua lock).
-
-  If HAProxy often executes some Lua code but more responsiveness is required,
-  this value can be lowered. If the Lua code is quite long and its result is
-  absolutely required to process the data, the <number> can be increased, but
-  the value should be set wisely as in multithreading context it could increase
-  contention.
-
-tune.lua.maxmem <number>
-  Sets the maximum amount of RAM in megabytes per process usable by Lua. By
-  default it is zero which means unlimited. It is important to set a limit to
-  ensure that a bug in a script will not result in the system running out of
-  memory.
-
-tune.lua.session-timeout <timeout>
-  This is the execution timeout for the Lua sessions. This is useful for
-  preventing infinite loops or spending too much time in Lua. This timeout
-  counts only the pure Lua runtime. If the Lua does a sleep, the sleep is
-  not taken in account. The default timeout is 4s.
+tune.lua.bool-sample-conversion { normal | pre-3.1-bug }
+  Explicitly tell haproxy how haproxy sample objects should be handled when
+  pushed to Lua. Indeed, when leveraging native converters, sample fetches or
+  variables from Lua script (to name a few), haproxy converts the internal
+  smp type to equivalent Lua type. Because of historical implementation, there
+  is an ambiguity around boolean handling: when doing Lua -> haproxy smp
+  conversion, booleans are properly preserved, but when doing haproxy
+  smp -> Lua conversion, booleans were converted to integers by mistake. This
+  means that a sample fetch or converter returning a boolean would return an
+  integer 0 or 1 when leveraged from Lua. Unfortunately, in Lua, booleans and
+  integers are not interchangeable. Thus, to avoid ambiguities,
+  "tune.lua.bool-sample-conversion" must explicitly be set to either "normal"
+  (which means dropping the historical behavior for better consistency) or
+  "pre-3.1-bug" (enforce historical behavior to prevent existing script logic
+  from misbehaving). If the option is not set explicitly and a Lua script is
+  loaded from the configuration, haproxy will emit a warning, and the option
+  will implicitly default to "pre-3.1-bug" to match with the historical
+  behavior. It is recommended to set this option to "normal" after ensuring
+  that in-use Lua scripts are properly handling bool haproxy samples as booleans.
 
 tune.lua.burst-timeout <timeout>
   The "burst" execution timeout applies to any Lua handler. If the handler
@@ -3776,17 +3979,21 @@ tune.lua.burst-timeout <timeout>
 
   Setting value to 0 completely disables this protection.
 
-tune.lua.service-timeout <timeout>
-  This is the execution timeout for the Lua services. This is useful for
-  preventing infinite loops or spending too much time in Lua. This timeout
-  counts only the pure Lua runtime. If the Lua does a sleep, the sleep is
-  not taken in account. The default timeout is 4s.
+tune.lua.forced-yield <number>
+  This directive forces the Lua engine to execute a yield each <number> of
+  instructions executed. This permits interrupting a long script and allows the
+  HAProxy scheduler to process other tasks like accepting connections or
+  forwarding traffic. The default value is 10000 instructions for scripts loaded
+  using "lua-load-per-thread" and MAX(500, 10000 / nbthread) instructions for
+  scripts loaded using "lua-load" (it was found to be an optimal value for
+  performance while taking care of not creating thread contention with multiple
+  threads competing for the global lua lock).
 
-tune.lua.task-timeout <timeout>
-  Purpose is the same as "tune.lua.session-timeout", but this timeout is
-  dedicated to the tasks. By default, this timeout isn't set because a task may
-  remain alive during of the lifetime of HAProxy. For example, a task used to
-  check servers.
+  If HAProxy often executes some Lua code but more responsiveness is required,
+  this value can be lowered. If the Lua code is quite long and its result is
+  absolutely required to process the data, the <number> can be increased, but
+  the value should be set wisely as in multithreading context it could increase
+  contention.
 
 tune.lua.log.loggers { on | off }
   Enables ('on') or disables ('off') logging the output of LUA scripts via the
@@ -3807,6 +4014,30 @@ tune.lua.log.stderr { on | auto | off }
   configured via tune.lua.log.loggers.
 
   Defaults to 'auto'.
+
+tune.lua.maxmem <number>
+  Sets the maximum amount of RAM in megabytes per process usable by Lua. By
+  default it is zero which means unlimited. It is important to set a limit to
+  ensure that a bug in a script will not result in the system running out of
+  memory.
+
+tune.lua.service-timeout <timeout>
+  This is the execution timeout for the Lua services. This is useful for
+  preventing infinite loops or spending too much time in Lua. This timeout
+  counts only the pure Lua runtime. If the Lua does a sleep, the sleep is
+  not taken in account. The default timeout is 4s.
+
+tune.lua.session-timeout <timeout>
+  This is the execution timeout for the Lua sessions. This is useful for
+  preventing infinite loops or spending too much time in Lua. This timeout
+  counts only the pure Lua runtime. If the Lua does a sleep, the sleep is
+  not taken in account. The default timeout is 4s.
+
+tune.lua.task-timeout <timeout>
+  Purpose is the same as "tune.lua.session-timeout", but this timeout is
+  dedicated to the tasks. By default, this timeout isn't set because a task may
+  remain alive during of the lifetime of HAProxy. For example, a task used to
+  check servers.
 
 tune.max-checks-per-thread <number>
   Sets the number of active checks per thread above which a thread will
@@ -3854,6 +4085,28 @@ tune.maxrewrite <number>
   larger than that. This means you don't have to worry about it when changing
   bufsize.
 
+tune.max-rules-at-once <number>
+  Sets the maximum number of rules that can be evaluated at once in ruleset
+  evaluating functions, provided that they support yielding. Indeed, it is
+  not rare to see configurations with a large number of "tcp-request content"
+  or "http-request" rules for instance. A large number of rules combined with
+  cpu-demanding actions (e.g.: actions that work on content) may create thread
+  contention as all the rules from a given ruleset are evaluated under the same
+  polling loop if the evaluation is not interrupted. This option ensures that no
+  more than <number> number of rules may be excecuted under the same polling
+  loop for content-oriented rulesets (those that already support yielding due
+  to content inspection). What it does is that it forces the evaluating function
+  to yield, so that it comes back on the next polling loop to continues the
+  evaluation.
+
+  Affected rulesets are:
+   - "tcp-request content"
+   - "tcp-response content"
+   - "http-request"
+   - "http-response"
+
+  The default value is 50.
+
 tune.memory.hot-size <number>
   Sets the per-thread amount of memory that will be kept hot in the local cache
   and will never be recoverable by other threads. Access to this memory is very
@@ -3899,7 +4152,7 @@ tune.peers.max-updates-at-once <number>
   Conversely low values may also incur higher CPU overhead, and take longer
   to complete. The default value is 200 and it is suggested not to change it.
 
-tune.pipesize <number>
+tune.pipesize <size>
   Sets the kernel pipe buffer size to this size (in bytes). By default, pipes
   are the default size for the system. But sometimes when using TCP splicing,
   it can improve performance to increase pipe sizes, especially if it is
@@ -3954,6 +4207,16 @@ tune.quic.cc.cubic.min-losses <number>
   compare some metrics. Never go beyond 2 without an expert's prior analysis of
   the situation. The default and minimum value is 1. Always use 1.
 
+tune.quic.disable-tx-pacing
+  Disables pacing support for QUIC emission. The purpose of pacing is to smooth
+  emission of data to reduce network losses. In most scenario, it will
+  significantly improve network throughput by avoiding retransmissions.
+  However, it can be useful to deactivate it for networks with very high
+  bandwidth/low latency characteristics to prevent unwanted delay and reduce
+  CPU consumption.
+
+  See also the "quic-cc-algo" bind option.
+
 tune.quic.disable-udp-gso
   Disable UDP GSO emission. This kernel feature allows to emit multiple
   datagrams via a single system call which is more efficient for large
@@ -3991,7 +4254,7 @@ tune.quic.frontend.max-streams-bidi <number>
 
   The default value is 100.
 
-tune.quic.frontend.max-window-size <size>
+tune.quic.frontend.default-max-window-size <size>
   Sets the default maximum window size for the congestion controller of a
   single QUIC connection. The value must be written as an integer with an
   optional suffix 'k', 'm' or 'g'. It must be between 10k and 4g.
@@ -4085,8 +4348,8 @@ tune.renice.startup <number>
 
   See also: tune.renice.runtime
 
-tune.rcvbuf.backend <number>
-tune.rcvbuf.frontend <number>
+tune.rcvbuf.backend  <size>
+tune.rcvbuf.frontend <size>
   For the kernel socket receive buffer size on non-connected sockets to this
   size. This can be used QUIC in listener mode and log-forward on the frontend.
   The default system buffers might sometimes be too small for sockets receiving
@@ -4101,8 +4364,8 @@ tune.rcvbuf.frontend <number>
   counter parts, as well as "tune.sndbuf.backend" and "tune.sndbuf.frontend"
   for the send setting.
 
-tune.rcvbuf.client <number>
-tune.rcvbuf.server <number>
+tune.rcvbuf.client <size>
+tune.rcvbuf.server <size>
   Forces the kernel socket receive buffer size on the client or the server side
   to the specified value in bytes. This value applies to all TCP/HTTP frontends
   and backends. It should normally never be set, and the default size (0) lets
@@ -4111,7 +4374,7 @@ tune.rcvbuf.server <number>
   order to save kernel memory by preventing it from buffering too large amounts
   of received data. Lower values will significantly increase CPU usage though.
 
-tune.recv_enough <number>
+tune.recv_enough <size>
   HAProxy uses some hints to detect that a short read indicates the end of the
   socket buffers. One of them is that a read returns more than <recv_enough>
   bytes, which defaults to 10136 (7 segments of 1448 each). This default value
@@ -4148,8 +4411,8 @@ tune.sched.low-latency { on | off }
   massive traffic, at the expense of a higher impact on this large traffic.
   For regular usage it is better to leave this off. The default value is off.
 
-tune.sndbuf.backend <number>
-tune.sndbuf.frontend <number>
+tune.sndbuf.backend  <size>
+tune.sndbuf.frontend <size>
   For the kernel socket send buffer size on non-connected sockets to this size.
   This can be used for UNIX socket and UDP logging on the backend side, and for
   QUIC in listener mode on the frontend. The default system buffers might
@@ -4164,8 +4427,8 @@ tune.sndbuf.frontend <number>
   "tune.sndbuf.server" for their connected socket counter parts, as well as
   "tune.rcvbuf.backend" and "tune.rcvbuf.frontend" for the receive setting.
 
-tune.sndbuf.client <number>
-tune.sndbuf.server <number>
+tune.sndbuf.client <size>
+tune.sndbuf.server <size>
   Forces the kernel socket send buffer size on the client or the server side to
   the specified value in bytes. This value applies to all TCP/HTTP frontends
   and backends. It should normally never be set, and the default size (0) lets
@@ -4321,6 +4584,18 @@ tune.stick-counters <number>
   for each request, which does have measurable CPU impacts. Conversely, when
   no "track-sc" rules are used, the value may be lowered (0 being valid to
   entirely disable stick-counters).
+
+tune.takeover-other-tg-connections <value>
+  By default, we won't attempt to use idle connections from other thread groups.
+  This can however be changed. Valid values for <value> are : "none", the
+  default, if used, no attempt will be made to use idle connections from
+  other thread groups, "restricted" where we will only attempt to get an idle
+  connection from another thread if we're using protocols that can't create
+  new connections, such as reverse http, as well as when using strict-maxconn,
+  and "full" where we will always look in other thread groups for idle
+  connections.
+  Note that using connections from other thread groups can occur performance
+  penalties, so it should not be used unless really needed.
 
 tune.vars.global-max-size <size>
 tune.vars.proc-max-size <size>
@@ -4541,13 +4816,19 @@ user <username> [password|insecure-password <password>]
 It is possible to propagate entries of any data-types in stick-tables between
 several HAProxy instances over TCP connections in a multi-master fashion. Each
 instance pushes its local updates and insertions to remote peers. The pushed
-values overwrite remote ones without aggregation. As an exception, the data
-type "conn_cur" is never learned from peers, as it is supposed to reflect local
-values. Earlier versions used to synchronize it and to cause negative values in
-active-active setups, and always-growing values upon reloads or active-passive
+values overwrite remote ones without aggregation.
+
+One exception is the data type "conn_cur" which is never learned from peers by
+default as it is supposed to reflect local values. Earlier versions used to
+synchronize it by default which was known to cause negative values in active-
+active setups, and always-growing values upon reloads or active-passive
 switches because the local value would reflect more connections than locally
-present. This information, however, is pushed so that monitoring systems can
-watch it.
+present. However there are some setups where it could be relevant to learn
+this value from peers, for instance when the table is a passive remote table
+solely used to learn/monitor data from it without relying on it for write-
+oriented operations or updates. To achieve this, the "recv-only" keyword can
+be added on the table declaration. In any case, the "conn_cur" info is always
+pushed so that monitoring systems can watch it.
 
 Interrupted exchanges are automatically detected and recovered from the last
 known point. In addition, during a soft restart, the old process connects to
@@ -4672,6 +4953,7 @@ shards <shards>
 
 table <tablename> type {ip | integer | string [len <length>] | binary [len <length>]}
       size <size> [expire <expire>] [write-to <wtable>] [nopurge] [store <data_type>]*
+      [recv-only]
 
   Configure a stickiness table for the current section. This line is parsed
   exactly the same way as the "stick-table" keyword in others section, except
@@ -5076,6 +5358,18 @@ maxconn <conns>
 timeout client <timeout>
   Set the maximum inactivity time on the client side.
 
+option assume-rfc6587-ntf
+  Directs HAProxy to treat incoming TCP log streams always as using
+  non-transparent framing. This option simplifies the framing logic and ensures
+  consistent handling of messages, particularly useful when dealing with
+  improperly formed starting characters.
+
+option dont-parse-log
+  Enables HAProxy to relay syslog messages without attempting to parse and
+  restructure them, useful for forwarding messages that may not conform to
+  traditional formats. This option should be used with the format raw setting on
+  destination log targets to ensure the original message content is preserved.
+
 3.11. HTTPClient tuning
 -----------------------
 
@@ -5333,6 +5627,9 @@ ocsp-update [ off | on ]
   section.
   In case of "OCSP response check failure" error, you might want to check that
   the issuer certificate that you provided is valid.
+  A more precise error message might also be displayed between parenthesis
+  after the "generic" error message. It can happen for "OCSP response check
+  failure" or "Error during insertion" errors.
 
 4. Proxies
 ----------
@@ -5511,6 +5808,7 @@ clitcpka-idle                             X          X         X         -
 clitcpka-intvl                            X          X         X         -
 compression                               X          X         X         X
 cookie                                    X          -         X         X
+crt                                       -          X         X         -
 declare capture                           -          X         X         -
 default-server                            X          -         X         X
 default_backend                           X          X         X         -
@@ -6509,6 +6807,8 @@ compression type <mime type> ...
     * The response contains a "Content-Encoding" header, indicating that the
       response is already compressed (see compression offload)
     * The response contains an invalid "ETag" header or multiple ETag headers
+    * The payload size is smaller than the minimum size
+      (see compression minsize-res)
 
   Note: The compression does not emit the Warning header.
 
@@ -6516,7 +6816,22 @@ compression type <mime type> ...
         compression algo gzip
         compression type text/html text/plain
 
-  See also : "compression offload", "compression direction"
+  See also : "compression offload", "compression direction",
+             "compression minsize-req" and "compression minsize-res"
+
+compression minsize-req <size>
+compression minsize-res <size>
+  Sets the minimum payload size in bytes for compression to be applied.
+
+  May be used in the following contexts: http
+
+  May be used in sections :   defaults | frontend | listen | backend
+                                 yes   |    yes   |   yes  |   yes
+
+  Payloads smaller than this size will not be compressed, avoiding unnecessary
+  CPU overhead for data that would not significantly benefit from compression.
+  "minsize-req" applies on requests and "minsize-res" on responses.
+  The default value is 0.
 
 compression offload
   Makes HAProxy work as a compression offloader only.
@@ -6737,6 +7052,62 @@ cookie <name> [ rewrite | insert | prefix ] [ indirect ] [ nocache ]
 
   See also : "balance source", "capture cookie", "server" and "ignore-persist".
 
+crt <crtname> [<sslbindconf> ...]*
+  Assignate a certificate to the current frontend.
+
+  May be used in the following contexts: tcp, http
+
+  May be used in sections :   defaults | frontend | listen | backend
+                                 no    |    yes   |   yes  |   no
+
+  Arguments :
+    <sslbindconf> supports the following keywords from the bind line
+    (see Section 5.1. Bind options):
+
+    - allow-0rtt
+    - alpn
+    - ca-file
+    - ca-verify-file
+    - ciphers
+    - ciphersuites
+    - client-sigalgs
+    - crl-file
+    - curves
+    - ecdhe
+    - no-alpn
+    - no-ca-names
+    - npn
+    - sigalgs
+    - ssl-min-ver
+    - ssl-max-ver
+    - verify
+
+    sslbindconf also supports the following keywords from the crt-store load
+    keyword (see Section 3.12.1. Load options):
+
+    - key
+    - ocsp
+    - issuer
+    - sctl
+    - ocsp-update
+
+  Assignate a certificate <crtname> to a crt-list created automatically with the
+  frontend name and prefixed by @ (ex: '@frontend1').
+
+  This implicit crt-list will be assigned to every "ssl" bind lines in a
+  frontend that does not already have the "crt" or the "crt-list" line.
+  crt-list commands from the stats socket are effective with this crt-list, so
+  one could replace, remove or add certificates and SSL options to it.
+
+  Example :
+
+    frontend https
+        bind :443 ssl
+        crt foobar.pem.rsa sigalgs "RSA-PSS+SHA256"
+        crt test.foobar.pem
+        crt test2.foobar.crt key test2.foobar.key ocsp test2.foobar.ocsp ocsp-update on
+
+  See also : "crt-list" and "crt".
 
 declare capture [ request | response ] len <length>
   Declares a capture slot.
@@ -6912,7 +7283,7 @@ errorfile <code> <file>
   Arguments :
     <code>    is the HTTP status code. Currently, HAProxy is capable of
               generating codes 200, 400, 401, 403, 404, 405, 407, 408, 410,
-              413, 425, 429, 500, 501, 502, 503, and 504.
+              413, 414, 425, 429, 431, 500, 501, 502, 503, and 504.
 
     <file>    designates a file containing the full HTTP response. It is
               recommended to follow the common practice of appending ".http" to
@@ -6965,8 +7336,8 @@ errorfiles <name> [<code> ...]
 
     <code>  is a HTTP status code. Several status code may be listed.
             Currently, HAProxy is capable of generating codes 200, 400, 401,
-            403, 404, 405, 407, 408, 410, 413, 425, 429, 500, 501, 502, 503,
-            and 504.
+            403, 404, 405, 407, 408, 410, 413, 414, 425, 429, 431, 500, 501,
+            502, 503, and 504.
 
   Errors defined in the http-errors section with the name <name> are imported
   in the current proxy. If no status code is specified, all error files of the
@@ -6996,7 +7367,7 @@ errorloc302 <code> <url>
   Arguments :
     <code>    is the HTTP status code. Currently, HAProxy is capable of
               generating codes 200, 400, 401, 403, 404, 405, 407, 408, 410,
-              413, 425, 429, 500, 501, 502, 503, and 504.
+              413, 414, 425, 429, 431, 500, 501, 502, 503, and 504.
 
     <url>     it is the exact contents of the "Location" header. It may contain
               either a relative URI to an error page hosted on the same site,
@@ -7032,7 +7403,7 @@ errorloc303 <code> <url>
   Arguments :
     <code>    is the HTTP status code. Currently, HAProxy is capable of
               generating codes 200, 400, 401, 403, 404, 405, 407, 408, 410,
-              413, 425, 429, 500, 501, 502, 503, and 504.
+              413, 414, 425, 429, 431, 500, 501, 502, 503, and 504.
 
     <url>     it is the exact contents of the "Location" header. It may contain
               either a relative URI to an error page hosted on the same site,
@@ -8002,8 +8373,8 @@ http-error status <code> [content-type <type>]
   Arguments :
     status <code>        is the HTTP status code. It must be specified.
                          Currently, HAProxy is capable of generating codes
-                         200, 400, 401, 403, 404, 405, 407, 408, 410, 413, 425,
-                         429, 500, 501, 502, 503, and 504.
+                         200, 400, 401, 403, 404, 405, 407, 408, 410, 413,
+                         414, 425, 429, 431, 500, 501, 502, 503, and 504.
 
     content-type <type>  is the response content type, for instance
                          "text/plain". This parameter is ignored and should be
@@ -9085,6 +9456,9 @@ no option accept-unsafe-violations-in-http-request
       different protocol names (e.g. RTSP), and multiple digits for both the
       major and the minor version.
 
+    * In H1 only, WebSocket (RFC6455) requests failing to present a valid
+      "Sec-Websocket-Key" header field will be accepted.
+
   This option should never be enabled by default as it hides application bugs
   and open security breaches. It should only be deployed after a problem has
   been confirmed.
@@ -9134,6 +9508,9 @@ no option accept-unsafe-violations-in-http-response
     * In H1 only, tests on the HTTP version will be relaxed. It will allow
       different protocol names (e.g. RTSP), and multiple digits for both the
       major and the minor version.
+
+    * In H1 only, WebSocket (RFC6455) responses failing to present a valid
+      "Sec-Websocket-Accept" header field will be accepted.
 
   This option should never be enabled by default as it hides application bugs
   and open security breaches. It should only be deployed after a problem has
@@ -10603,7 +10980,8 @@ no option redispatch
 
 
   In HTTP mode, if a server designated by a cookie is down, clients may
-  definitely stick to it because they cannot flush the cookie, so they will not
+  definitely stick to it, for example when using "option persist" or
+  "force-persist", because they cannot flush the cookie, so they will not
   be able to access the service anymore.
 
   Specifying "option redispatch" will allow the proxy to break cookie or
@@ -10636,7 +11014,7 @@ no option redispatch
   If this option has been enabled in a "defaults" section, it can be disabled
   in a specific instance by prepending the "no" keyword before it.
 
-  See also : "retries", "force-persist"
+  See also : "option persist", "force-persist", "retries"
 
 
 option redis-check
@@ -11222,8 +11600,6 @@ external-check command <command>
     PATH                    The PATH environment variable used when executing
                             the command may be set using "external-check path".
 
-  See also "2.3. Environment variables" for other variables.
-
   If the command executed and exits with a zero status then the check is
   considered to have passed, otherwise the check is considered to have
   failed.
@@ -11453,6 +11829,12 @@ redirect scheme   <sch> [code <code>] <option> [{if | unless} <condition>]
         that for a browser, a sole cookie name without an equal sign is
         different from a cookie with an equal sign.
 
+      - "set-cookie-fmt <fmt>"
+        It is equivaliant to the option above, except the "Set-Cookie" header
+        will be filled with the result of the log-format string <fmt>
+        evaluation. Be carefull to respect the "NAME[=value]" format because no
+        special check are performed during the configuration parsing.
+
       - "clear-cookie NAME[=]"
         A "Set-Cookie" header will be added with NAME (and optionally "="), but
         with the "Max-Age" attribute set to zero. This will tell the browser to
@@ -11460,6 +11842,14 @@ redirect scheme   <sch> [code <code>] <option> [{if | unless} <condition>]
         important to note that clearing the cookie "NAME" will not remove a
         cookie set with "NAME=value". You have to clear the cookie "NAME=" for
         that, because the browser makes the difference.
+
+      - "keep-query"
+        When this keyword is used in a location-based redirection, then the
+        query-string of the original URI, if any, will be appended to the
+        location. If no query-string is found, nothing is added. If the
+        location already contains a query-string, the original one will be
+        appended with the '&' delimiter.
+
 
   Example: move the login URL only to HTTPS.
         acl clear      dst_port  80
@@ -11575,10 +11965,10 @@ retry-on [space-delimited list of keywords]
 
       <status>          any HTTP status code among "401" (Unauthorized), "403"
                         (Forbidden), "404" (Not Found), "408" (Request Timeout),
-                        "425" (Too Early), "429" (Too Many Requests), "500"
-                        (Server Error), "501" (Not Implemented), "502"
-                        (Bad Gateway), "503" (Service Unavailable), "504"
-                        (Gateway Timeout).
+			"421" (Misdirected Request), "425" (Too Early),
+			"429" (Too Many Requests), "500" (Server Error),
+			"501" (Not Implemented), "502" (Bad Gateway),
+			"503" (Service Unavailable), "504" (Gateway Timeout).
 
       all-retryable-errors
                         retry request for any error that are considered
@@ -12694,6 +13084,7 @@ stick store-request <pattern> [table <table>] [{if | unless} <condition>]
 stick-table type {ip | integer | string [len <length>] | binary [len <length>]}
             size <size> [expire <expire>] [nopurge] [peers <peersect>] [srvkey <srvkey>]
             [write-to <wtable>] [store <data_type>]* [brates-factor <factor>]
+            [recv-only]
   Configure the stickiness table for the current section
 
   May be used in the following contexts: tcp, http
@@ -12821,6 +13212,18 @@ stick-table type {ip | integer | string [len <length>] | binary [len <length>]}
                parameter, it is possible to have rates exceeding the 4G on the
                defined period. The factor must be greater than 0 and lower or
                equal to 1024.
+
+   [recv-only] indicates that we don't intent to use the table to perform
+               updates on it, but thay we only plan on using the table to
+               retrieve data from a remote peer which we are interested in.
+               Indeed, the use of this keyword enables the retrieval of
+               local-only values such as conn_cur that are not learned by
+               default as they would conflict with local updates performed
+               on the table by the local peer. Use of this option is only
+               relevant for tables that are not involved in tracking rules or
+               methods that perform update operations on the table, or put
+               simpler: remote tables that are only used to retrieve
+               information.
 
   The data types that can be stored with an entry are the following :
     - server_id : this is an integer which holds the numeric ID of the server a
@@ -14778,6 +15181,7 @@ silent-drop                    -           X     X     X     X            X   X 
 strict-mode                    -           -     -     -     -            X   X   X
 switch-mode                    -           -     -     X     -            -   -   -
 tarpit                         -           -     -     -     -            X   -   -
+track-sc0                      -           X     X     X     -            X   X   -
 track-sc1                      -           X     X     X     -            X   X   -
 track-sc2                      -           X     X     X     -            X   X   -
 unset-var                      -           X     X     X     X            X   X   X
@@ -15052,7 +15456,7 @@ do-log
       tcp-request connection do-log             #uses special log-profile format
       tcp-request content do-log                #uses proxy logformat
 
-do-resolve(<var>,<resolvers>,[ipv4,ipv6]) <expr>
+do-resolve(<var>,<resolvers>[,ipv4|ipv6]) <expr>
   Usable in:  QUIC Ini|    TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
                     - |          -  |   -  |   X  |   -  |          X |  - |  -
 
@@ -15516,21 +15920,22 @@ return [ status <code> ] [ content-type <type> ]
   * If "default-errorfiles" argument is set, the proxy's errorfiles are
     considered.  If the "status" argument is defined, it must be one of the
     status code handled by HAProxy (200, 400, 403, 404, 405, 408, 410, 413,
-    425, 429, 500, 501, 502, 503, and 504). The "content-type" argument, if
-    any, is ignored.
+    414, 425, 429, 431, 500, 501, 502, 503, and 504). The "content-type"
+    argument, if any, is ignored.
 
   * If a specific errorfile is defined, with an "errorfile" argument, the
     corresponding file, containing a full HTTP response, is returned. Only the
     "status" argument is considered. It must be one of the status code handled
-    by HAProxy (200, 400, 403, 404, 405, 408, 410, 413, 425, 429, 500, 501,
-    502, 503, and 504). The "content-type" argument, if any, is ignored.
+    by HAProxy (200, 400, 403, 404, 405, 408, 410, 413, 414, 425, 429, 431,
+    500, 501, 502, 503, and 504). The "content-type" argument, if any, is
+    ignored.
 
   * If an http-errors section is defined, with an "errorfiles" argument, the
     corresponding file in the specified http-errors section, containing a full
     HTTP response, is returned. Only the "status" argument is considered. It
     must be one of the status code handled by HAProxy (200, 400, 403, 404, 405,
-    408, 410, 413, 425, 429, 500, 501, 502, 503, and 504). The "content-type"
-    argument, if any, is ignored.
+    408, 410, 413, 414, 425, 429, 431, 500, 501, 502, 503, and 504).
+    The "content-type" argument, if any, is ignored.
 
   * If a "file" or a "lf-file" argument is specified, the file's content is
     used as the response payload. If the file is not empty, its content-type
@@ -17020,15 +17425,25 @@ proto <name>
   instance, it is possible to force the http/2 on clear TCP by specifying "proto
   h2" on the bind line.
 
-quic-cc-algo { cubic | newreno | nocc }
-quic-cc-algo { cubic | newreno | nocc }(<max_window>)
+quic-cc-algo { cubic | newreno | bbr | nocc }[(<args,...>)]
   This is a QUIC specific setting to select the congestion control algorithm
-  for any connection attempts to the configured QUIC listeners. They are similar
-  to those used by TCP. An optional value in bytes may be used to specify the
-  maximum window size. It must be greater than 10k and smaller than 4g.
+  for any connection attempts to the configured QUIC listeners. They are
+  similar to those used by TCP.
+
+  Pacing is activated on top of the congestion algorithm to reduce loss and
+  improve throughput. It can be turned off via "tune.quic.disable-tx-pacing"
+  global keyword. In most cases, pacing should remain activated, especially
+  when using BBR as it relies on it to work as expected. Using BBR without
+  pacing may cause slowdowns or high loss rates during transfers.
 
   Default value: cubic
-  Default window value: "tune.quic.frontend.max-window-size"
+
+  For further customization, a list of parameters can be specified after the
+  algorithm token. It must be written between parenthesis, separated by a
+  comma. Each argument is optional and can be empty if needed. Here is the
+  mandatory order of each parameters :
+  - maximum window size in bytes. It must be greater than 10k and smaller than
+    4g. By default "tune.quic.frontend.default-max-window-size" value is used.
 
   Example:
       # newreno congestion control algorithm
@@ -17337,7 +17752,22 @@ agent-check
     Values in this format will set the weight proportional to the initial
     weight of a server as configured when HAProxy starts. Note that a zero
     weight is reported on the stats page as "DRAIN" since it has the same
-    effect on the server (it's removed from the LB farm).
+    effect on the server (it's removed from the LB farm). It is the legacy way
+    to set the weight of a server. Setting it with the "weight:" prefix is
+    preferred.
+
+  - The string "weight:" following by an positive interger or a positive
+    interger percentage, with no space. If the value ends with the '%' sign,
+    then the new weight will be proportional to the initially weight of the
+    server. Otherwise, the value is considered as an absolute weight and must
+    be between 0 and 256. Servers which are part of a farm running a static
+    load-balancing algorithm have stricter limitations because the weight
+    cannot change once set. Thus for these servers, the only accepted values
+    are 0 and 100% (or 0 and the initial weight). Changes take effect
+    immediately, though certain LB algorithms require a certain amount of
+    requests to consider changes. Note that a zero weight is reported on the
+    stats page as "DRAIN" since it has the same effect on the server (it's
+    removed from the LB farm).
 
   - The string "maxconn:" followed by an integer (no space between). Values
     in this format will set the maxconn of a server. The maximum number of
@@ -17894,13 +18324,8 @@ init-state { fully-up | up | down | fully-down }
       # pass traffic to the server only after 3 successful health checks
       backend google-backend
         mode http
-        server srv1 google.com:80 check init-state down rise 3
-        server srv2 google.com:80 check init-state down rise 3
-
-      # or
-      listen
-        mode http
-        server-template srv 2 google.com:80 check init-state down rise 3
+        server srv1 google.com:80 check init-state fully-down rise 3
+        server srv2 google.com:80 check init-state fully-down rise 3
 
 See also: "option tcp-check", "option httpchk"
 
@@ -18700,6 +19125,20 @@ stick
   It may also be used as "default-server" setting to reset any previous
   "default-server" "non-stick" setting.
 
+strict-maxconn
+  May be used in the following contexts: tcp, http
+
+  maxconn to servers is a bit of a misnomer, it actually configure the maximum
+  number of requests we send to a server, but with idle connections, we may
+  have more total connections to the server. If a strict limit of connections
+  to a server is required, then adding strict-maxconn can be used. We will
+  then never establish more connections to a server than maxconn, and try to
+  reuse or kill connections if needed. Please note, however, than it may lead
+  to failed requests in case we can't establish a new connection, and no
+  idle connection is available. This can happen when 'private" connections
+  are established, connections tied only to a session, because authentication
+  happened.
+
 socks4 <addr>:<port>
   May be used in the following contexts: tcp, http, log, peers, ring
 
@@ -18742,6 +19181,15 @@ track [<backend>/]<server>
   server, provided that at the end of the chain, a server has health checks
   enabled. If <backend> is omitted the current one is used. If disable-on-404 is
   used, it has to be enabled on both proxies.
+
+  Example :
+
+    backend A
+    server a1 1.1.1.1:80 track B/b1
+    server a2 1.1.1.2:80 track B/b1
+
+    backend B
+    server b1 2.2.2.2:80 check
 
 tls-tickets
   May be used in the following contexts: tcp, http, log, peers, ring
@@ -19774,19 +20222,19 @@ The following keywords are supported:
 ------------------------------------------------+-------------+----------------
 51d.single(prop[,prop*])                           string       string
 add(value)                                         integer      integer
-add_item(delim,[var][,suff]])                      string       string
+add_item(delim[,var[,suff]])                       string       string
 aes_gcm_dec(bits,nonce,key,aead_tag)               binary       binary
 aes_gcm_enc(bits,nonce,key,aead_tag)               binary       binary
 and(value)                                         integer      integer
 b64dec                                             string       binary
 base64                                             binary       string
-be2dec(separator,chunk_size,[truncate])            binary       string
-be2hex([separator],[chunk_size],[truncate])        binary       string
+be2dec(separator,chunk_size[,truncate])            binary       string
+be2hex([separator[,chunk_size[,truncate]]])        binary       string
 bool                                               integer      boolean
 bytes(offset[,length])                             binary       binary
 capture-req(id)                                    string       string
 capture-res(id)                                    string       string
-concat([start],[var],[end])                        string       string
+concat([start[,var[,end]]])                        string       string
 cpl                                                integer      integer
 crc32([avalanche])                                 binary       integer
 crc32c([avalanche])                                binary       integer
@@ -19807,14 +20255,14 @@ hex2i                                              binary       integer
 hmac(algorithm,key)                                binary       binary
 host_only                                          string       string
 htonl                                              integer      integer
-http_date([offset],[unit])                         integer      string
+http_date([offset[,unit]])                         integer      string
 iif(true,false)                                    boolean      string
-in_table(table)                                    string       boolean
-ipmask(mask4,[mask6])                              address      address
+in_table([table])                                  any          boolean
+ipmask(mask4[,mask6])                              address      address
 json([input-code])                                 string       string
-json_query(json_path,[output_type])                string       _outtype_
-jwt_header_query([json_path],[output_type])        string       string
-jwt_payload_query([json_path],[output_type])       string       string
+json_query(json_path[,output_type])                string       _outtype_
+jwt_header_query([json_path[,output_type]])        string       string
+jwt_payload_query([json_path[,output_type]])       string       string
 -- keyword -------------------------------------+- input type + output type -
 jwt_verify(alg,key)                                string       integer
 language(value[,default])                          string       string
@@ -19837,9 +20285,9 @@ not                                                integer      boolean
 odd                                                integer      boolean
 or(value)                                          integer      integer
 -- keyword -------------------------------------+- input type + output type -
-param(name,[delim])                                string       string
+param(name[,delim])                                string       string
 port_only                                          string       integer
-protobuf(field_number,[field_type])                binary       binary
+protobuf(field_number[,field_type])                binary       binary
 regsub(regex,subst[,flags])                        string       string
 rfc7239_field(field)                               string       string
 rfc7239_is_valid                                   string       boolean
@@ -19856,40 +20304,46 @@ sha2([bits])                                       binary       binary
 srv_queue                                          string       integer
 strcmp(var)                                        string       boolean
 sub(value)                                         integer      integer
-table_bytes_in_rate(table)                         string       integer
-table_bytes_out_rate(table)                        string       integer
-table_conn_cnt(table)                              string       integer
+table_bytes_in_rate([table])                       any          integer
+table_bytes_out_rate([table])                      any          integer
+table_clr_gpc(idx[,table])                         any          integer
+table_clr_gpc0([table])                            any          integer
+table_clr_gpc1([table])                            any          integer
+table_conn_cnt([table])                            any          integer
 -- keyword -------------------------------------+- input type + output type -
-table_conn_cur(table)                              string       integer
-table_conn_rate(table)                             string       integer
-table_expire(table[,default_value])                string       integer
-table_glitch_cnt(table)                            string       integer
-table_glitch_rate(table)                           string       integer
-table_gpc(idx,table)                               string       integer
-table_gpc0(table)                                  string       integer
-table_gpc0_rate(table)                             string       integer
-table_gpc1(table)                                  string       integer
-table_gpc1_rate(table)                             string       integer
-table_gpc_rate(idx,table)                          string       integer
-table_gpt(idx,table)                               string       integer
-table_gpt0(table)                                  string       integer
-table_http_err_cnt(table)                          string       integer
-table_http_err_rate(table)                         string       integer
-table_http_fail_cnt(table)                         string       integer
-table_http_fail_rate(table)                        string       integer
-table_http_req_cnt(table)                          string       integer
-table_http_req_rate(table)                         string       integer
-table_idle(table[,default_value])                  string       integer
-table_kbytes_in(table)                             string       integer
+table_conn_cur([table])                            any          integer
+table_conn_rate([table])                           any          integer
+table_expire([table[,default_value]])              any          integer
+table_glitch_cnt([table])                          any          integer
+table_glitch_rate([table])                         any          integer
+table_gpc(idx[,table])                             any          integer
+table_gpc0([table])                                any          integer
+table_gpc0_rate([table])                           any          integer
+table_gpc1([table])                                any          integer
+table_gpc1_rate([table])                           any          integer
+table_gpc_rate(idx[,table])                        any          integer
+table_gpt(idx[,table])                             any          integer
+table_gpt0([table])                                any          integer
+table_http_err_cnt([table])                        any          integer
+table_http_err_rate([table])                       any          integer
+table_http_fail_cnt([table])                       any          integer
+table_http_fail_rate([table])                      any          integer
+table_http_req_cnt([table])                        any          integer
+table_http_req_rate([table])                       any          integer
+table_idle([table[,default_value]])                any          integer
+table_inc_gpc(idx[,table])                         any          integer
+table_inc_gpc0([table])                            any          integer
+table_inc_gpc1([table])                            any          integer
+table_kbytes_in([table])                           any          integer
 -- keyword -------------------------------------+- input type + output type -
-table_kbytes_out(table)                            string       integer
-table_server_id(table)                             string       integer
-table_sess_cnt(table)                              string       integer
-table_sess_rate(table)                             string       integer
-table_trackers(table)                              string       integer
+table_kbytes_out([table])                          any          integer
+table_server_id([table])                           any          integer
+table_sess_cnt([table])                            any          integer
+table_sess_rate([table])                           any          integer
+table_trackers([table])                            any          integer
 ub64dec                                            string       string
 ub64enc                                            string       string
-ungrpc(field_number,[field_type])                  binary       binary / int
+ungrpc(field_number[,field_type])                  binary       binary / int
 unset-var(var)                                      any          same
 upper                                              string       string
 url_dec([in_form])                                 string       string
@@ -19931,7 +20385,7 @@ add(<value>)
   result as a signed integer. <value> can be a numeric value or a variable
   name. See section 2.8 about variables for details.
 
-add_item(<delim>,[<var>][,<suff>]])
+add_item(<delim>[,<var>[,<suff>]])
   Concatenates a minimum of 2 and up to 3 fields after the current sample which
   is then turned into a string. The first one, <delim>, is a constant string,
   that will be appended immediately after the existing sample if an existing
@@ -20002,7 +20456,7 @@ base64
   an SSL ID can be copied in a header). For base64url("URL and Filename
   Safe Alphabet" (RFC 4648)) variant see "ub64enc".
 
-be2dec(<separator>,<chunk_size>,[<truncate>])
+be2dec(<separator>,<chunk_size>[,<truncate>])
   Converts big-endian binary input sample to a string containing an unsigned
   integer number per <chunk_size> input bytes. <separator> is put every
   <chunk_size> binary input bytes if specified. <truncate> flag indicates
@@ -20015,7 +20469,7 @@ be2dec(<separator>,<chunk_size>,[<truncate>])
       bin(01020304050607),be2dec(,2,1)  # 2587721286
       bin(7f000001),be2dec(.,1)         # 127.0.0.1
 
-be2hex([<separator>],[<chunk_size>],[<truncate>])
+be2hex([<separator>[,<chunk_size>[,<truncate>]]])
   Converts big-endian binary input sample to a hex string containing two hex
   digits per input byte. It is used to log or transfer hex dumps of some
   binary input data in a way that can be reliably transferred (e.g. an SSL ID
@@ -20070,7 +20524,7 @@ capture-res(<id>)
             "http-response capture", "capture.req.hdr" and
             "capture.res.hdr" (sample fetches).
 
-concat([<start>],[<var>],[<end>])
+concat([<start>[,<var>[,<end>]]])
   Concatenates up to 3 fields after the current sample which is then turned to
   a string. The first one, <start>, is a constant string, that will be appended
   immediately after the existing sample. It may be omitted if not used. The
@@ -20289,7 +20743,7 @@ htonl
   this converter is used, the input integer value is first casted to an
   unsigned 32-bit integer.
 
-http_date([<offset],[<unit>])
+http_date([<offset[,<unit>]])
   Converts an integer supposed to contain a date since epoch to a string
   representing this date in a format suitable for use in HTTP header fields. If
   an offset value is specified, then it is added to the date before the
@@ -20308,14 +20762,15 @@ iif(<true>,<false>)
   Example:
     http-request set-header x-forwarded-proto %[ssl_fc,iif(https,http)]
 
-in_table(<table>)
-  Uses the string representation of the input sample to perform a look up in
-  the specified table. If the key is not found in the table, a boolean false
-  is returned. Otherwise a boolean true is returned. This can be used to verify
-  the presence of a certain key in a table tracking some elements (e.g. whether
-  or not a source IP address or an Authorization header was already seen).
+in_table([<table>])
+  Uses the input sample to perform a look up in the current proxy's stick-table
+  or in the designated stick-table. If the key is not found in the table, a
+  boolean false is returned. Otherwise a boolean true is returned. This can be
+  used to verify the presence of a certain key in a table tracking some
+  elements (e.g. whether or not a source IP address or an Authorization header
+  was already seen).
 
-ipmask(<mask4>,[<mask6>])
+ipmask(<mask4>[,<mask6>])
   Apply a mask to an IP address, and use the result for lookups and storage.
   This can be used to make all hosts within a certain mask to share the same
   table entries and as such use the same server. The mask4 can be passed in
@@ -20364,7 +20819,7 @@ json([<input-code>])
   Output log:
      {"ip":"127.0.0.1","user-agent":"Very \"Ugly\" UA 1\/2"}
 
-json_query(<json_path>,[<output_type>])
+json_query(<json_path>[,<output_type>])
   The json_query converter supports the JSON types string, boolean, number
   and array. Floating point numbers will be returned as a string. By
   specifying the output_type 'int' the value will be converted to an
@@ -20396,7 +20851,7 @@ json_query(<json_path>,[<output_type>])
      # get the value of the key 'iss' from a JWT Bearer token
      http-request set-var(txn.token_payload) req.hdr(Authorization),word(2,.),ub64dec,json_query('$.iss')
 
-jwt_header_query([<json_path>],[<output_type>])
+jwt_header_query([<json_path>[,<output_type>]])
   When given a JSON Web Token (JWT) in input, either returns the decoded header
   part of the token (the first base64-url encoded part of the JWT) if no
   parameter is given, or performs a json_query on the decoded header part of
@@ -20406,7 +20861,7 @@ jwt_header_query([<json_path>],[<output_type>])
   Please note that this converter is only available when HAProxy has been
   compiled with USE_OPENSSL.
 
-jwt_payload_query([<json_path>],[<output_type>])
+jwt_payload_query([<json_path>[,<output_type>]])
   When given a JSON Web Token (JWT) in input, either returns the decoded
   payload part of the token (the second base64-url encoded part of the JWT) if
   no parameter is given, or performs a json_query on the decoded payload part
@@ -20773,7 +21228,7 @@ or(<value>)
   integer, and returns the result as an signed integer. <value> can be a
   numeric value or a variable name. See section 2.8 about variables for details.
 
-param(<name>,[<delim>])
+param(<name>[,<delim>])
   This extracts the first occurrence of the parameter <name> in the input string
   where parameters are delimited by <delim>, which defaults to "&", and the name
   and value of the parameter are separated by a "=". If there is no "=" and
@@ -20810,7 +21265,7 @@ port_only
 
   See also: "host_only" converter which will return the host.
 
-protobuf(<field_number>,[<field_type>])
+protobuf(<field_number>[,<field_type>])
   This extracts the protocol buffers message field in raw mode of an input binary
   sample representation of a protocol buffer message with <field_number> as field
   number (dotted notation) if <field_type> is not present, or as an integer sample
@@ -21081,249 +21536,310 @@ sub(<value>)
   a constant, simply perform a "neg,add(value)". <value> can be a numeric value
   or a variable name. See section 2.8 about variables for details.
 
-table_bytes_in_rate(<table>)
-  Uses the string representation of the input sample to perform a look up in
-  the specified table. If the key is not found in the table, integer value zero
-  is returned. Otherwise the converter returns the average client-to-server
-  bytes rate associated with the input sample in the designated table, measured
-  in amount of bytes over the period configured in the table. See also the
-  sc_bytes_in_rate sample fetch keyword.
+table_bytes_in_rate([<table>])
+  Uses the input sample to perform a look up in the current proxy's stick-table
+  or in the designated stick-table. If the key is not found in the table,
+  integer value zero is returned. Otherwise the converter returns the average
+  client-to-server bytes rate associated with the input sample in the designated
+  table, measured in amount of bytes over the period configured in the table.
+  See also the sc_bytes_in_rate sample fetch keyword.
 
 
-table_bytes_out_rate(<table>)
-  Uses the string representation of the input sample to perform a look up in
-  the specified table. If the key is not found in the table, integer value zero
-  is returned. Otherwise the converter returns the average server-to-client
-  bytes rate associated with the input sample in the designated table, measured
-  in amount of bytes over the period configured in the table. See also the
-  sc_bytes_out_rate sample fetch keyword.
+table_bytes_out_rate([<table>])
+  Uses the input sample to perform a look up in the current proxy's stick-table
+  or in the designated stick-table. If the key is not found in the table,
+  integer value zero is returned. Otherwise the converter returns the average
+  server-to-client bytes rate associated with the input sample in the designated
+  table, measured in amount of bytes over the period configured in the table.
+  See also the sc_bytes_out_rate sample fetch keyword.
 
-table_conn_cnt(<table>)
-  Uses the string representation of the input sample to perform a look up in
-  the specified table. If the key is not found in the table, integer value zero
-  is returned. Otherwise the converter returns the cumulative number of incoming
-  connections associated with the input sample in the designated table. See
-  also the sc_conn_cnt sample fetch keyword.
+table_clr_gpc(<idx>[,<table>])
+  Uses the input sample to perform a look up in the current proxy's stick-table
+  or in the designated stick-table. Clears the General Purpose Counter at the
+  index <idx> of the gpc array and returns its previous value. <idx> is an
+  integer between 0 and 99. If the entry is not found, an entry is created and
+  0 is returned. This converter applies only to the 'gpc' array data_type (and
+  not to the legacy 'gpc0' nor 'gpc1' data_types).
+  See also the sc_clr_gpc sample fetch keyword.
 
-table_conn_cur(<table>)
-  Uses the string representation of the input sample to perform a look up in
-  the specified table. If the key is not found in the table, integer value zero
-  is returned. Otherwise the converter returns the current amount of concurrent
-  tracked connections associated with the input sample in the designated table.
-  See also the sc_conn_cur sample fetch keyword.
+table_clr_gpc0([<table>])
+  Uses the input sample to perform a look up in the current proxy's stick-table
+  or in the designated stick-table. Clears the first General Purpose Counter
+  '0' and returns its previous value. If the entry is not found, an entry is
+  created and 0 is returned. This is typically used as a second ACL in an
+  expression in order to mark a connection when a first ACL was verified :
 
-table_conn_rate(<table>)
-  Uses the string representation of the input sample to perform a look up in
-  the specified table. If the key is not found in the table, integer value zero
-  is returned. Otherwise the converter returns the average incoming connection
-  rate associated with the input sample in the designated table. See also the
-  sc_conn_rate sample fetch keyword.
+  Example:
+        # block if 5 consecutive requests continue to come faster than 10 sess
+        # per second, and reset the counter as soon as the traffic slows down.
+        acl abuse src_http_req_rate gt 10
+        acl kill  src,table_inc_gpc0 gt 5
+        acl save  src,table_clr_gpc0 ge 0
+        tcp-request connection accept if !abuse save
+        tcp-request connection reject if abuse kill
 
-table_expire(<table>[,<default_value>])
-  Uses the input sample to perform a look up in the specified table. If the key
-  is not found in the table, the converter fails except if <default_value> is
-  set: this makes the converter succeed and return <default_value>. If the key
-  is found the converter returns the key expiration delay associated with the
-  input sample in the designated table.
-  See also the table_idle sample fetch keyword.
+  See also the sc_clr_gpc0 sample fetch keyword.
 
-table_glitch_cnt(<table>)
-  Uses the string representation of the input sample to perform a look up in
-  the specified table. If the key is not found in the table, integer value zero
-  is returned. Otherwise the converter returns the cumulative number of front
-  connection glitches associated with the input sample in the designated table.
-  See also the sc_glitch_cnt sample fetch keyword and fc_glitches for the value
-  measured on the current front connection.
+table_clr_gpc1([<table>])
+  Uses the input sample to perform a look up in the current proxy's stick-table
+  or in the designated stick-table. Clears the first General Purpose Counter
+  '1' and returns its previous value. If the entry is not found, an entry is
+  created and 0 is returned. This is typically used as a second ACL in an
+  expression in order to mark a connection when a first ACL was verified.
+  See also the sc_clr_gpc1 sample fetch keyword.
 
-table_glitch_rate(<table>)
-  Uses the string representation of the input sample to perform a look up in
-  the specified table. If the key is not found in the table, integer value zero
-  is returned. Otherwise the converter returns the average front connection
-  glitch rate associated with the input sample in the designated table. See
-  also the sc_glitch_rate sample fetch keyword.
+table_conn_cnt([<table>])
+  Uses the input sample to perform a look up in the current proxy's stick-table
+  or in the designated stick-table. If the key is not found in the table,
+  integer value zero is returned. Otherwise the converter returns the cumulative
+  number of incoming connections associated with the input sample in the
+  designated table. See also the sc_conn_cnt sample fetch keyword.
 
-table_gpc(<idx>,<table>)
-  Uses the string representation of the input sample to perform a lookup in
-  the specified table. If the key is not found in the table, integer value zero
-  is returned. Otherwise the converter returns the current value of the
-  General Purpose Counter at the index <idx> of the array associated
-  to the input sample in the designated <table>. <idx> is an integer
-  between 0 and 99.
-  If there is no GPC stored at this index, it also returns the boolean value 0.
-  This applies only to the 'gpc' array data_type (and not to the legacy
-  'gpc0' nor 'gpc1' data_types).
-  See also the sc_get_gpc sample fetch keyword.
+table_conn_cur([<table>])
+  Uses the input sample to perform a look up in the current proxy's stick-table
+  or in the designated stick-table. If the key is not found in the table,
+  integer value zero is returned. Otherwise the converter returns the current
+  amount of concurrent tracked connections associated with the input sample in
+  the designated table. See also the sc_conn_cur sample fetch keyword.
 
-table_gpc0(<table>)
-  Uses the string representation of the input sample to perform a look up in
-  the specified table. If the key is not found in the table, integer value zero
-  is returned. Otherwise the converter returns the current value of the first
-  general purpose counter associated with the input sample in the designated
-  table. See also the sc_get_gpc0 sample fetch keyword.
+table_conn_rate([<table>])
+  Uses the input sample to perform a look up in the current proxy's stick-table
+  or in the designated stick-table. If the key is not found in the table,
+  integer value zero is returned. Otherwise the converter returns the average
+  incoming connection rate associated with the input sample in the designated
+  table. See also the sc_conn_rate sample fetch keyword.
 
-table_gpc0_rate(<table>)
-  Uses the string representation of the input sample to perform a look up in
-  the specified table. If the key is not found in the table, integer value zero
-  is returned. Otherwise the converter returns the frequency which the gpc0
-  counter was incremented over the configured period in the table, associated
-  with the input sample in the designated table. See also the sc_get_gpc0_rate
+table_expire([<table>[,<default_value>]])
+  Uses the input sample to perform a look up in in the current proxy's
+  stick-table or in the designated stick-table. If the key is not found in the
+  table, the converter fails except if <default_value> is set: this makes the
+  converter succeed and return <default_value>. If the key is found the
+  converter returns the key expiration delay associated with the input sample
+  in the designated table. See also the table_idle sample fetch keyword.
+
+table_glitch_cnt([<table>])
+  Uses the input sample to perform a look up in the current proxy's stick-table
+  or in the designated stick-table. If the key is not found in the table,
+  integer value zero is returned. Otherwise the converter returns the cumulative
+  number of front connection glitches associated with the input sample in the
+  designated table. See also the sc_glitch_cnt sample fetch keyword and
+  fc_glitches for the value measured on the current front connection.
+
+table_glitch_rate([<table>])
+  Uses the input sample to perform a look up in the current proxy's stick-table
+  or in the designated stick-table. If the key is not found in the table,
+  integer value zero is returned. Otherwise the converter returns the average
+  front connection glitch rate associated with the input sample in the
+  designated table. See also the sc_glitch_rate sample fetch keyword.
+
+table_gpc(<idx>[,<table>])
+  Uses the input sample to perform a lookup in the current proxy's stick-table
+  or in the designated stick-table. If the key is not found in the table,
+  integer value zero is returned. Otherwise the converter returns the current
+  value of the General Purpose Counter at the index <idx> of the array
+  associated to the input sample in the designated <table>. <idx> is an integer
+  between 0 and 99. If there is no GPC stored at this index, it also returns
+  the integer value 0. This applies only to the 'gpc' array data_type (and not
+  to the legacy 'gpc0' nor 'gpc1' data_types). See also the sc_get_gpc sample
+  fetch keyword.
+
+table_gpc0([<table>])
+  Uses the input sample to perform a look up in the current proxy's stick-table
+  or in the designated stick-table. If the key is not found in the table,
+  integer value zero is returned. Otherwise the converter returns the current
+  value of the first general purpose counter associated with the input sample
+  in the designated table. See also the sc_get_gpc0 sample fetch keyword.
+
+table_gpc0_rate([<table>])
+  Uses the input sample to perform a look up in the current proxy's stick-table
+  or in the designated stick-table. If the key is not found in the table,
+  integer value zero is returned. Otherwise the converter returns the frequency
+  which the gpc0 counter was incremented over the configured period in the
+  table, associated with the input sample in the designated table. See also the
+  sc_get_gpc0_rate sample fetch keyword.
+
+table_gpc1([<table>])
+  Uses the input sample to perform a look up in the current proxy's stick-table
+  or in the designated stick-table. If the key is not found in the table,
+  integer value zero is returned. Otherwise the converter returns the current
+  value of the second general purpose counter associated with the input sample
+  in the designated table. See also the sc_get_gpc1 sample fetch keyword.
+
+table_gpc1_rate([<table>])
+  Uses the input sample to perform a look up in the current proxy's stick-table
+  or in the designated stick-table. If the key is not found in the table,
+  integer value zero is returned. Otherwise the converter returns the frequency
+  which the gpc1 counter was incremented over the configured period in the
+  table, associated with the input sample in the designated table. See also the
+  sc_get_gpc1_rate sample fetch keyword.
+
+table_gpc_rate(<idx>[,<table>])
+  Uses the input sample to perform a lookup in the current proxy's stick-table
+  or in the designated stick-table. If the key is not found in the table,
+  integer value zero is returned. Otherwise the converter returns the frequency
+  which the Global Purpose Counter at index <idx> of the array (associated to
+  the input sample in the designated stick-table <table>) was incremented over
+  the configured period. <idx> is an integer between 0 and 99. If there is no
+  gpc_rate stored at this index, it also returns the integer value 0. This
+  applies only to the 'gpc_rate' array data_type (and not to the legacy
+  'gpc0_rate' nor 'gpc1_rate' data_types). See also the sc_gpc_rate sample
+  fetch keyword.
+
+table_gpt(<idx>[,<table>])
+  Uses the input sample to perform a lookup in the current proxy's stick-table
+  or in the designated stick-table. If the key is not found in the table,
+  integer value zero is returned. Otherwise the converter returns the current
+  value of the general purpose tag at the index <idx> of the array associated
+  to the input sample in the designated <table>. <idx> is an integer between
+  0 and 99. If there is no GPT stored at this index, it also returns the
+  integer value 0. This applies only to the 'gpt' array data_type (and not on
+  the legacy 'gpt0' data-type). See also the sc_get_gpt sample fetch keyword.
+
+table_gpt0([<table>])
+  Uses the input sample to perform a look up in the current proxy's stick-table
+  or in the designated stick-table. If the key is not found in the table,
+  integer value zero is returned. Otherwise the converter returns the current
+  value of the first general purpose tag associated with the input sample in
+  the designated table. See also the sc_get_gpt0 sample fetch keyword.
+
+table_http_err_cnt([<table>])
+  Uses the input sample to perform a look up in the current proxy's stick-table
+  or in the designated stick-table. If the key is not found in the table,
+  integer value zero is returned. Otherwise the converter returns the cumulative
+  number of HTTP errors associated with the input sample in the designated
+  table. See also the sc_http_err_cnt sample fetch keyword.
+
+table_http_err_rate([<table>])
+  Uses the input sample to perform a look up in the current proxy's stick-table
+  or in the designated stick-table. If the key is not found in the table,
+  integer value zero is returned. Otherwise the average rate of HTTP errors
+  associated with the input sample in the designated table, measured in amount
+  of errors over the period configured in the table. See also the
+  sc_http_err_rate sample fetch keyword.
+
+table_http_fail_cnt([<table>])
+  Uses the input sample to perform a look up in the current proxy's stick-table
+  or in the designated stick-table. If the key is not found in the table,
+  integer value zero is returned. Otherwise the converter returns the cumulative
+  number of HTTP failures associated with the input sample in the designated
+  table. See also the sc_http_fail_cnt sample fetch keyword.
+
+table_http_fail_rate([<table>])
+  Uses the input sample to perform a look up in the current proxy's stick-table
+  or in the designated stick-table. If the key is not found in the table,
+  integer value zero is returned. Otherwise the average rate of HTTP failures
+  associated with the input sample in the designated table, measured in amount
+  of failures over the period configured in the table. See also the
+  sc_http_fail_rate sample fetch keyword.
+
+table_http_req_cnt([<table>])
+  Uses the input sample to perform a look up in the current proxy's stick-table
+  or in the designated stick-table. If the key is not found in the table,
+  integer value zero is returned. Otherwise the converter returns the cumulative
+  number of HTTP requests associated with the input sample in the designated
+  table. See also the sc_http_req_cnt sample fetch keyword.
+
+table_http_req_rate([<table>])
+  Uses the input sample to perform a look up in the current proxy's stick-table
+  or in the designated stick-table. If the key is not found in the table,
+  integer value zero is returned. Otherwise the average rate of HTTP requests
+  associated with the input sample in the designated table, measured in amount
+  of requests over the period configured in the table. See also the
+  sc_http_req_rate sample fetch keyword.
+
+table_idle([<table>[,<default_value>]])
+  Uses the input sample to perform a look up in the current proxy's stick-table
+  or in the designated stick-table. If the key is not found in the table, the
+  converter fails except if <default_value> is set: this makes the converter
+  succeed and return <default_value>. If the key is found the converter returns
+  the time the key entry associated with the input sample in the designated
+  table remained idle since the last time it was updated. See also the
+  table_expire sample fetch keyword.
+
+table_inc_gpc(<idx>[,<table>])
+  Uses the input sample to perform a look up in the current proxy's stick-table
+  or in the designated stick-table. Increments the General Purpose Counter at
+  index <idx> of the array and returns its new value. <idx> is an integer
+  between 0 and 99. If the entry is not found, an entry is created and 1 is
+  returned. This converter applies only to the 'gpc' array data_type (and not to
+  the legacy 'gpc0' nor 'gpc1' data_types). See also sc_inc_gpc.
+
+table_inc_gpc0([<table>])
+  Uses the input sample to perform a look up in the current proxy's stick-table
+  or in the designated stick-table. Increments the General Purpose Counter '0'
+  and returns its new value. If the entry is not found, an entry is created and
+  1 is returned. See also sc0/sc2/sc2_inc_gpc0. This is typically used as a
+  second ACL in an expression in order to mark a connection when a first ACL
+  was verified :
+
+  Example:
+        acl abuse src,table_req_rate gt 10
+        acl kill  src,table_inc_gpc0 gt 0
+        tcp-request connection reject if abuse kill
+
+table_inc_gpc1([<table>])
+  Uses the input sample to perform a look up in the current proxy's stick-table
+  or in the designated stick-table. Increments the General Purpose Counter '1'
+  and returns its new value. If the entry is not found, an entry is created and
+  1 is returned. See also sc0/sc2/sc2_inc_gpc1. This is typically used as a
+  second ACL in an expression in order to mark a connection when a first ACL
+  was verified.
+
+table_kbytes_in([<table>])
+  Uses the input sample to perform a look up in the current proxy's stick-table
+  or in the designated stick-table. If the key is not found in the table,
+  integer value zero is returned. Otherwise the converter returns the cumulative
+  number of client-to-server data associated with the input sample in the
+  designated table, measured in kilobytes. The test is currently performed on
+  32-bit integers, which limits values to 4 terabytes. See also the sc_kbytes_in
   sample fetch keyword.
 
-table_gpc1(<table>)
-  Uses the string representation of the input sample to perform a look up in
-  the specified table. If the key is not found in the table, integer value zero
-  is returned. Otherwise the converter returns the current value of the second
-  general purpose counter associated with the input sample in the designated
-  table. See also the sc_get_gpc1 sample fetch keyword.
+table_kbytes_out([<table>])
+  Uses the input sample to perform a look up in the current proxy's stick-table
+  or in the designated stick-table. If the key is not found in the table,
+  integer value zero is returned. Otherwise the converter returns the cumulative
+  number of server-to-client data associated with the input sample in the
+  designated table, measured in kilobytes. The test is currently performed on
+  32-bit integers, which limits values to 4 terabytes. See also the
+  sc_kbytes_out sample fetch keyword.
 
-table_gpc1_rate(<table>)
-  Uses the string representation of the input sample to perform a look up in
-  the specified table. If the key is not found in the table, integer value zero
-  is returned. Otherwise the converter returns the frequency which the gpc1
-  counter was incremented over the configured period in the table, associated
-  with the input sample in the designated table. See also the sc_get_gpc1_rate
+table_server_id([<table>])
+  Uses the input sample to perform a look up in the current proxy's stick-table
+  or in the designated stick-table. If the key is not found in the table,
+  integer value zero is returned. Otherwise the converter returns the server ID
+  associated with the input sample in the designated table. A server ID is
+  associated to a sample by a "stick" rule when a connection to a server
+  succeeds. A server ID zero means that no server is associated with this key.
+
+table_sess_cnt([<table>])
+  Uses the input sample to perform a look up in the current proxy's stick-table
+  or in the designated stick-table. If the key is not found in the table,
+  integer value zero is returned. Otherwise the converter returns the cumulative
+  number of incoming sessions associated with the input sample in the designated
+  table. Note that a session here refers to an incoming connection being
+  accepted by the "tcp-request connection" rulesets. See also the sc_sess_cnt
   sample fetch keyword.
 
-table_gpc_rate(<idx>,<table>)
-  Uses the string representation of the input sample to perform a lookup in
-  the specified table. If the key is not found in the table, integer value zero
-  is returned. Otherwise the converter returns the frequency which the Global
-  Purpose Counter at index <idx> of the array (associated to the input sample
-  in the designated stick-table <table>) was incremented over the
-  configured period. <idx> is an integer between 0 and 99.
-  If there is no gpc_rate stored at this index, it also returns the boolean
-  value 0.
-  This applies only to the 'gpc_rate' array data_type (and not to the
-  legacy 'gpc0_rate' nor 'gpc1_rate' data_types).
-  See also the sc_gpc_rate sample fetch keyword.
+table_sess_rate([<table>])
+  Uses the input sample to perform a look up in the current proxy's stick-table
+  or in the designated stick-table. If the key is not found in the table,
+  integer value zero is returned. Otherwise the converter returns the average
+  incoming session rate associated with the input sample in the designated
+  table. Note that a session here refers to an incoming connection being
+  accepted by the "tcp-request connection" rulesets. See also the sc_sess_rate
+  sample fetch keyword.
 
-table_gpt(<idx>,<table>)
-  Uses the string representation of the input sample to perform a lookup in
-  the specified table. If the key is not found in the table, boolean value zero
-  is returned. Otherwise the converter returns the current value of the general
-  purpose tag at the index <idx> of the array associated to the input sample
-  in the designated <table>. <idx> is an integer between 0 and 99.
-  If there is no GPT stored at this index, it also returns the boolean value 0.
-  This applies only to the 'gpt' array data_type (and not on the legacy 'gpt0'
-  data-type).
-  See also the sc_get_gpt sample fetch keyword.
-
-table_gpt0(<table>)
-  Uses the string representation of the input sample to perform a look up in
-  the specified table. If the key is not found in the table, boolean value zero
-  is returned. Otherwise the converter returns the current value of the first
-  general purpose tag associated with the input sample in the designated table.
-  See also the sc_get_gpt0 sample fetch keyword.
-
-table_http_err_cnt(<table>)
-  Uses the string representation of the input sample to perform a look up in
-  the specified table. If the key is not found in the table, integer value zero
-  is returned. Otherwise the converter returns the cumulative number of HTTP
-  errors associated with the input sample in the designated table. See also the
-  sc_http_err_cnt sample fetch keyword.
-
-table_http_err_rate(<table>)
-  Uses the string representation of the input sample to perform a look up in
-  the specified table. If the key is not found in the table, integer value zero
-  is returned. Otherwise the average rate of HTTP errors associated with the
-  input sample in the designated table, measured in amount of errors over the
-  period configured in the table. See also the sc_http_err_rate sample fetch
-  keyword.
-
-table_http_fail_cnt(<table>)
-  Uses the string representation of the input sample to perform a look up in
-  the specified table. If the key is not found in the table, integer value zero
-  is returned. Otherwise the converter returns the cumulative number of HTTP
-  failures associated with the input sample in the designated table. See also
-  the sc_http_fail_cnt sample fetch keyword.
-
-table_http_fail_rate(<table>)
-  Uses the string representation of the input sample to perform a look up in
-  the specified table. If the key is not found in the table, integer value zero
-  is returned. Otherwise the average rate of HTTP failures associated with the
-  input sample in the designated table, measured in amount of failures over the
-  period configured in the table. See also the sc_http_fail_rate sample fetch
-  keyword.
-
-table_http_req_cnt(<table>)
-  Uses the string representation of the input sample to perform a look up in
-  the specified table. If the key is not found in the table, integer value zero
-  is returned. Otherwise the converter returns the cumulative number of HTTP
-  requests associated with the input sample in the designated table. See also
-  the sc_http_req_cnt sample fetch keyword.
-
-table_http_req_rate(<table>)
-  Uses the string representation of the input sample to perform a look up in
-  the specified table. If the key is not found in the table, integer value zero
-  is returned. Otherwise the average rate of HTTP requests associated with the
-  input sample in the designated table, measured in amount of requests over the
-  period configured in the table. See also the sc_http_req_rate sample fetch
-  keyword.
-
-table_idle(<table>[,<default_value>])
-  Uses the input sample to perform a look up in the specified table. If the key
-  is not found in the table, the converter fails except if <default_value> is
-  set: this makes the converter succeed and return <default_value>. If the key
-  is found the converter returns the time the key entry associated with the
-  input sample in the designated table remained idle since the last time it was
-  updated.
-  See also the table_expire sample fetch keyword.
-
-table_kbytes_in(<table>)
-  Uses the string representation of the input sample to perform a look up in
-  the specified table. If the key is not found in the table, integer value zero
-  is returned. Otherwise the converter returns the cumulative number of client-
-  to-server data associated with the input sample in the designated table,
-  measured in kilobytes. The test is currently performed on 32-bit integers,
-  which limits values to 4 terabytes. See also the sc_kbytes_in sample fetch
-  keyword.
-
-table_kbytes_out(<table>)
-  Uses the string representation of the input sample to perform a look up in
-  the specified table. If the key is not found in the table, integer value zero
-  is returned. Otherwise the converter returns the cumulative number of server-
-  to-client data associated with the input sample in the designated table,
-  measured in kilobytes. The test is currently performed on 32-bit integers,
-  which limits values to 4 terabytes. See also the sc_kbytes_out sample fetch
-  keyword.
-
-table_server_id(<table>)
-  Uses the string representation of the input sample to perform a look up in
-  the specified table. If the key is not found in the table, integer value zero
-  is returned. Otherwise the converter returns the server ID associated with
-  the input sample in the designated table. A server ID is associated to a
-  sample by a "stick" rule when a connection to a server succeeds. A server ID
-  zero means that no server is associated with this key.
-
-table_sess_cnt(<table>)
-  Uses the string representation of the input sample to perform a look up in
-  the specified table. If the key is not found in the table, integer value zero
-  is returned. Otherwise the converter returns the cumulative number of incoming
-  sessions associated with the input sample in the designated table. Note that
-  a session here refers to an incoming connection being accepted by the
-  "tcp-request connection" rulesets. See also the sc_sess_cnt sample fetch
-  keyword.
-
-table_sess_rate(<table>)
-  Uses the string representation of the input sample to perform a look up in
-  the specified table. If the key is not found in the table, integer value zero
-  is returned. Otherwise the converter returns the average incoming session
-  rate associated with the input sample in the designated table. Note that a
-  session here refers to an incoming connection being accepted by the
-  "tcp-request connection" rulesets. See also the sc_sess_rate sample fetch
-  keyword.
-
-table_trackers(<table>)
-  Uses the string representation of the input sample to perform a look up in
-  the specified table. If the key is not found in the table, integer value zero
-  is returned. Otherwise the converter returns the current amount of concurrent
-  connections tracking the same key as the input sample in the designated
-  table. It differs from table_conn_cur in that it does not rely on any stored
-  information but on the table's reference count (the "use" value which is
-  returned by "show table" on the CLI). This may sometimes be more suited for
-  layer7 tracking. It can be used to tell a server how many concurrent
-  connections there are from a given address for example. See also the
-  sc_trackers sample fetch keyword.
+table_trackers([<table>])
+  Uses the input sample to perform a look up in the current proxy's stick-table
+  or in the designated stick-table. If the key is not found in the table,
+  integer value zero is returned. Otherwise the converter returns the current
+  amount of concurrent connections tracking the same key as the input sample
+  in the designated table. It differs from table_conn_cur in that it does not
+  rely on any stored information but on the table's reference count (the "use"
+  value which is returned by "show table" on the CLI). This may sometimes be
+  more suited for layer7 tracking. It can be used to tell a server how many
+  concurrent connections there are from a given address for example. See also
+  the sc_trackers sample fetch keyword.
 
 ub64dec
   This converter is the base64url variant of b64dec converter. base64url
@@ -21337,7 +21853,7 @@ ub64dec
 ub64enc
   This converter is the base64url variant of base64 converter.
 
-ungrpc(<field_number>,[<field_type>])
+ungrpc(<field_number>[,<field_type>])
   This extracts the protocol buffers message field in raw mode of an input binary
   sample representation of a gRPC message with <field_number> as field number
   (dotted notation) if <field_type> is not present, or as an integer sample if this
@@ -21485,14 +22001,15 @@ utime(<format>[,<offset>])
       # e.g.  20140710162350 127.0.0.1:57325
       log-format %[date,utime(%Y%m%d%H%M%S)]\ %ci:%cp
 
-when(<condition>)
+when(<condition>[,<args>...])
   Evaluates the condition and when true, passes the input sample as-is to the
   output, otherwise return nothing. This is designed specifically to produce
   some rarely needed data that should only be emitted under certain conditions,
   such as debugging information when an error is met.
 
   The condition is made of a keyword among the list below, optionally preceeded
-  by an exclamation mark ('!') to negate it:
+  by an exclamation mark ('!') to negate it, and optionally suffixed by some
+  arguments specific to that condition:
 
     - "error" returns true when an error was encountered during the processing
       of the request or stream. It uses the same rules as "dontlog-normal"
@@ -21512,6 +22029,12 @@ when(<condition>)
 
     - "toapplet" returns true when the request was processed by an applet.
 
+    - "acl" returns true when the ACL designated by the next argument evaluates
+      to true. Note that the ACL is evaluated inline by the converter, so that
+      what it refers to must be valid in that context. A particular use case
+      consists in evaluating if the total transfer time is too long or not
+      before deciding to log detauls from abnormally long transfers.
+
   Note that the content is evaluated in any case, so doing this does not avoid
   the generation of that information. It's only meant to avoid producing that
   information.
@@ -21527,6 +22050,13 @@ when(<condition>)
     Here, the "dbg" field in the log will only contain an dash ('-') to
     indicate a missing content when the rule is not validated, and will emit a
     whole debugging block when it is.
+
+  Example
+    # log "dbg={-}" when fine, or "dbg={... debug info ...}" on slow transfers
+    acl slow_xfer res.timer.data ge 10000   # more than 10s is slow
+    log-format "$HAPROXY_HTTP_LOG_FMT                                         \
+                fsdbg={%[fs.debug_str,when(acl,slow_xfer)]}                   \
+                bsdbg={%[bs.debug_str,when(acl,slow_xfer)]}"
 
   Example
     # only emit the backend src/port when a real connection was issued:
@@ -21664,7 +22194,7 @@ connslots([<backend>])                             integer
 cpu_calls                                          integer
 cpu_ns_avg                                         integer
 cpu_ns_tot                                         integer
-date([<offset>],[<unit>])                          integer
+date([<offset>[,<unit>]])                          integer
 date_us                                            integer
 env(<name>)                                        string
 fe_conn([<frontend>])                              integer
@@ -21700,11 +22230,13 @@ stopping                                           boolean
 str(<string>)                                      string
 table_avl([<table>])                               integer
 table_cnt([<table>])                               integer
+term_events                                        string
 thread                                             integer
 txn.id32                                           integer
 txn.sess_term_state                                string
 uuid([<version>])                                  string
 var(<var-name>[,<default>])                        undefined
+wait_end                                           boolean
 waiting_entity                                     string
 -------------------------------------------------+-------------
 
@@ -21851,7 +22383,7 @@ cpu_ns_tot : integer
   high cpu_calls count, for example when processing many HTTP chunks, and for
   this reason it is often preferred to log cpu_ns_avg instead.
 
-date([<offset>],[<unit>]) : integer
+date([<offset>[,<unit>]]) : integer
   Returns the current date as the epoch (number of seconds since 01/01/1970).
 
   If an offset value is specified, then it is added to the current date before
@@ -22170,12 +22702,33 @@ str(<string>) : string
 
 table_avl([<table>]) : integer
   Returns the total number of available entries in the current proxy's
-  stick-table or in the designated stick-table. See also table_cnt.
+  stick-table or in the designated stick-table. See also "table_cnt".
 
 table_cnt([<table>]) : integer
   Returns the total number of entries currently in use in the current proxy's
-  stick-table or in the designated stick-table. See also src_conn_cnt and
+  stick-table or in the designated stick-table. See also "table_conn_cnt" and
   table_avl for other entry counting methods.
+
+term_events: string
+  Returns all known termination events for all entities attached a stream, on
+  client and server sides. A tuple of seven elements is returned with following info:
+
+    - the termination events of the frontend connection
+    - the termination events of the frontend mux connection
+    - the termination events of the frontend stream endpoint descriptor
+      (the mux stream or the applet)
+    - the termination events of the stream
+    - the termination events of the backend stream endpoint descriptor
+      (the mux stream or the applet)
+    - the termination events of the backend mux connection
+    - the termination events of the backend connection
+
+  At each level, the first four events are reported. An empty string is
+  returned if no event was reported yet for a specific level. If termination
+  events are not supported, a "-" is returned.
+
+  It must only be used for debugging purpose. The exact format is not
+  documented because it may evolve depending on developers requirements.
 
 thread : integer
   Returns an integer value corresponding to the position of the thread calling
@@ -22214,6 +22767,29 @@ var(<var-name>[,<default>]) : undefined
   sample fetch fails, unless a default value is provided, in which case it will
   return it as a string. Empty strings are permitted. See section 2.8 about
   variables for details.
+
+wait_end : boolean
+  This fetch either returns true when the inspection period is over, or does
+  not fetch. It is only used in ACLs, in conjunction with content analysis to
+  avoid returning a wrong verdict early. It may also be used to delay some
+  actions, such as a delayed reject for some special addresses. Since it either
+  stops the rules evaluation or immediately returns true, it is recommended to
+  use this acl as the last one in a rule. Please note that the default ACL
+  "WAIT_END" is always usable without prior declaration. This test was designed
+  to be used with TCP request content inspection.
+
+  Examples :
+     # delay every incoming request by 2 seconds
+     tcp-request inspect-delay 2s
+     tcp-request content accept if WAIT_END
+
+     # don't immediately tell bad guys they are rejected
+     tcp-request inspect-delay 10s
+     acl goodguys src 10.0.0.0/24
+     acl badguys  src 10.0.1.0/24
+     tcp-request content accept if goodguys
+     tcp-request content reject if badguys WAIT_END
+     tcp-request content reject
 
 waiting_entity : string
   This returns the identity of the entity that was waiting to continue its
@@ -22424,6 +23000,10 @@ sc_kbytes_out(<ctr>[,<table>])                     integer
 sc0_kbytes_out([<table>])                          integer
 sc1_kbytes_out([<table>])                          integer
 sc2_kbytes_out([<table>])                          integer
+sc_key(<ctr>)                                      any
+sc0_key                                            any
+sc1_key                                            any
+sc2_key                                            any
 sc_sess_cnt(<ctr>[,<table>])                       integer
 sc0_sess_cnt([<table>])                            integer
 sc1_sess_cnt([<table>])                            integer
@@ -22445,13 +23025,13 @@ so_name                                            string
 src                                                ip
 src_bytes_in_rate([<table>])                       integer
 src_bytes_out_rate([<table>])                      integer
-src_clr_gpc(<idx>,[<table>])                       integer
+src_clr_gpc(<idx>[,<table>])                       integer
 src_clr_gpc0([<table>])                            integer
 src_clr_gpc1([<table>])                            integer
 src_conn_cnt([<table>])                            integer
 src_conn_cur([<table>])                            integer
 src_conn_rate([<table>])                           integer
-src_get_gpc(<idx>,[<table>])                       integer
+src_get_gpc(<idx>[,<table>])                       integer
 src_get_gpc0([<table>])                            integer
 src_get_gpc1([<table>])                            integer
 src_get_gpt(<idx>[,<table>])                       integer
@@ -22467,7 +23047,7 @@ src_http_fail_cnt([<table>])                       integer
 src_http_fail_rate([<table>])                      integer
 src_http_req_cnt([<table>])                        integer
 src_http_req_rate([<table>])                       integer
-src_inc_gpc(<idx>,[<table>])                       integer
+src_inc_gpc(<idx>[,<table>])                       integer
 src_inc_gpc0([<table>])                            integer
 src_inc_gpc1([<table>])                            integer
 src_is_local                                       boolean
@@ -22957,7 +23537,7 @@ sc1_bytes_in_rate([<table>]) : integer
 sc2_bytes_in_rate([<table>]) : integer
   Returns the average client-to-server bytes rate from the currently tracked
   counters, measured in amount of bytes over the period configured in the
-  table. See also src_bytes_in_rate.
+  table. See also "table_bytes_in_rate".
 
 sc_bytes_out_rate(<ctr>[,<table>]) : integer
 sc0_bytes_out_rate([<table>]) : integer
@@ -22965,7 +23545,7 @@ sc1_bytes_out_rate([<table>]) : integer
 sc2_bytes_out_rate([<table>]) : integer
   Returns the average server-to-client bytes rate from the currently tracked
   counters, measured in amount of bytes over the period configured in the
-  table. See also src_bytes_out_rate.
+  table. See also "table_bytes_out_rate".
 
 sc_clr_gpc(<idx>,<ctr>[,<table>]) : integer
   Clears the General Purpose Counter at the index <idx> of the array
@@ -23012,7 +23592,7 @@ sc0_conn_cnt([<table>]) : integer
 sc1_conn_cnt([<table>]) : integer
 sc2_conn_cnt([<table>]) : integer
   Returns the cumulative number of incoming connections from currently tracked
-  counters. See also src_conn_cnt.
+  counters. See also "table_conn_cnt".
 
 sc_conn_cur(<ctr>[,<table>]) : integer
 sc0_conn_cur([<table>]) : integer
@@ -23020,7 +23600,7 @@ sc1_conn_cur([<table>]) : integer
 sc2_conn_cur([<table>]) : integer
   Returns the current amount of concurrent connections tracking the same
   tracked counters. This number is automatically incremented when tracking
-  begins and decremented when tracking stops. See also src_conn_cur.
+  begins and decremented when tracking stops. See also "table_conn_cur".
 
 sc_conn_rate(<ctr>[,<table>]) : integer
 sc0_conn_rate([<table>]) : integer
@@ -23028,7 +23608,7 @@ sc1_conn_rate([<table>]) : integer
 sc2_conn_rate([<table>]) : integer
   Returns the average connection rate from the currently tracked counters,
   measured in amount of connections over the period configured in the table.
-  See also src_conn_rate.
+  See also "table_conn_rate".
 
 sc_get_gpc(<idx>,<ctr>[,<table>]) : integer
   Returns the value of the General Purpose Counter at the index <idx>
@@ -23038,21 +23618,21 @@ sc_get_gpc(<idx>,<ctr>[,<table>]) : integer
   <ctr> an integer between 0 and 2. If there is not gpc stored at this
   index, zero is returned.
   This fetch applies only to the 'gpc' array data_type (and not to the legacy
-  'gpc0' nor 'gpc1' data_types). See also src_get_gpc and sc_inc_gpc.
+  'gpc0' nor 'gpc1' data_types). See also "table_gpc" and "sc_inc_gpc".
 
 sc_get_gpc0(<ctr>[,<table>]) : integer
 sc0_get_gpc0([<table>]) : integer
 sc1_get_gpc0([<table>]) : integer
 sc2_get_gpc0([<table>]) : integer
   Returns the value of the first General Purpose Counter associated to the
-  currently tracked counters. See also src_get_gpc0 and sc/sc0/sc1/sc2_inc_gpc0.
+  currently tracked counters. See also "table_gpc0" and sc/sc0/sc1/sc2_inc_gpc0.
 
 sc_get_gpc1(<ctr>[,<table>]) : integer
 sc0_get_gpc1([<table>]) : integer
 sc1_get_gpc1([<table>]) : integer
 sc2_get_gpc1([<table>]) : integer
   Returns the value of the second General Purpose Counter associated to the
-  currently tracked counters. See also src_get_gpc1 and sc/sc0/sc1/sc2_inc_gpc1.
+  currently tracked counters. See also "table_gpc1" and sc/sc0/sc1/sc2_inc_gpc1.
 
 sc_get_gpt(<idx>,<ctr>[,<table>]) : integer
   Returns the value of the first General Purpose Tag at the index <idx> of
@@ -23061,14 +23641,14 @@ sc_get_gpt(<idx>,<ctr>[,<table>]) : integer
   is an integer between 0 and 99 and <ctr> an integer between 0 and 2.
   If there is no GPT stored at this index, zero is returned.
   This fetch applies only to the 'gpt' array data_type (and not on
-  the legacy 'gpt0' data-type). See also src_get_gpt.
+  the legacy 'gpt0' data-type). See also "table_gpt".
 
 sc_get_gpt0(<ctr>[,<table>]) : integer
 sc0_get_gpt0([<table>]) : integer
 sc1_get_gpt0([<table>]) : integer
 sc2_get_gpt0([<table>]) : integer
   Returns the value of the first General Purpose Tag associated to the
-  currently tracked counters. See also src_get_gpt0.
+  currently tracked counters. See also "table_gpt0".
 
 sc_glitch_cnt(<ctr>[,<table>]) : integer
 sc0_glitch_cnt([<table>]) : integer
@@ -23096,7 +23676,7 @@ sc2_glitch_rate([<table>]) : integer
   occasionally cause a few glitches per connection, hence a low rate is
   generally expected. However, a very bogus or malevolent client may quickly
   cause thousands of events to be added per connection, and maintain a high
-  rate here. See also src_glitch_rate and sc_glitch_cnt.
+  rate here. See also "table_glitch_rate" and "sc_glitch_cnt".
 
 sc_gpc_rate(<idx>,<ctr>[,<table>]) : integer
   Returns the average increment rate of the General Purpose Counter at the
@@ -23109,7 +23689,7 @@ sc_gpc_rate(<idx>,<ctr>[,<table>]) : integer
   for a value to be returned, as 'gpc' only holds the event count.
   This fetch applies only to the 'gpc_rate' array data_type (and not to
   the legacy 'gpc0_rate' nor 'gpc1_rate' data_types).
-  See also src_gpc_rate, sc_get_gpc, and sc_inc_gpc.
+  See also "table_gpc_rate", "sc_get_gpc", and "sc_inc_gpc".
 
 sc_gpc0_rate(<ctr>[,<table>]) : integer
 sc0_gpc0_rate([<table>]) : integer
@@ -23139,7 +23719,7 @@ sc1_http_err_cnt([<table>]) : integer
 sc2_http_err_cnt([<table>]) : integer
   Returns the cumulative number of HTTP errors from the currently tracked
   counters. This includes the both request errors and 4xx error responses.
-  See also src_http_err_cnt.
+  See also "table_http_err_cnt".
 
 sc_http_err_rate(<ctr>[,<table>]) : integer
 sc0_http_err_rate([<table>]) : integer
@@ -23156,7 +23736,7 @@ sc1_http_fail_cnt([<table>]) : integer
 sc2_http_fail_cnt([<table>]) : integer
   Returns the cumulative number of HTTP response failures from the currently
   tracked counters. This includes the both response errors and 5xx status codes
-  other than 501 and 505. See also src_http_fail_cnt.
+  other than 501 and 505. See also "table_http_fail_cnt".
 
 sc_http_fail_rate(<ctr>[,<table>]) : integer
 sc0_http_fail_rate([<table>]) : integer
@@ -23165,7 +23745,7 @@ sc2_http_fail_rate([<table>]) : integer
   Returns the average rate of HTTP response failures from the currently tracked
   counters, measured in amount of failures over the period configured in the
   table. This includes the both response errors and 5xx status codes other than
-  501 and 505. See also src_http_fail_rate.
+  501 and 505. See also "table_http_fail_rate".
 
 sc_http_req_cnt(<ctr>[,<table>]) : integer
 sc0_http_req_cnt([<table>]) : integer
@@ -23226,7 +23806,7 @@ sc1_kbytes_in([<table>]) : integer
 sc2_kbytes_in([<table>]) : integer
   Returns the total amount of client-to-server data from the currently tracked
   counters, measured in kilobytes. The test is currently performed on 32-bit
-  integers, which limits values to 4 terabytes. See also src_kbytes_in.
+  integers, which limits values to 4 terabytes. See also "table_kbytes_in".
 
 sc_kbytes_out(<ctr>[,<table>]) : integer
 sc0_kbytes_out([<table>]) : integer
@@ -23234,7 +23814,13 @@ sc1_kbytes_out([<table>]) : integer
 sc2_kbytes_out([<table>]) : integer
   Returns the total amount of server-to-client data from the currently tracked
   counters, measured in kilobytes. The test is currently performed on 32-bit
-  integers, which limits values to 4 terabytes. See also src_kbytes_out.
+  integers, which limits values to 4 terabytes. See also "table_kbytes_out".
+
+sc_key(<ctr>) : any
+sc0_key : any
+sc1_key : any
+sc2_key : any
+  Returns the key used to match the currently tracked counter.
 
 sc_sess_cnt(<ctr>[,<table>]) : integer
 sc0_sess_cnt([<table>]) : integer
@@ -23245,7 +23831,7 @@ sc2_sess_cnt([<table>]) : integer
   connection" rule, from the currently tracked counters. A backend may count
   more sessions than connections because each connection could result in many
   backend sessions if some HTTP keep-alive is performed over the connection
-  with the client. See also src_sess_cnt.
+  with the client. See also "table_sess_cnt".
 
 sc_sess_rate(<ctr>[,<table>]) : integer
 sc0_sess_rate([<table>]) : integer
@@ -23256,7 +23842,7 @@ sc2_sess_rate([<table>]) : integer
   session is a connection that got past the early "tcp-request connection"
   rules. A backend may count more sessions than connections because each
   connection could result in many backend sessions if some HTTP keep-alive is
-  performed over the connection with the client. See also src_sess_rate.
+  performed over the connection with the client. See also "table_sess_rate".
 
 sc_tracked(<ctr>[,<table>]) : boolean
 sc0_tracked([<table>]) : boolean
@@ -23311,232 +23897,166 @@ src : ip
        http-request set-header X-Country %[src,map_ip(geoip.lst)]
 
 src_bytes_in_rate([<table>]) : integer
-  Returns the average bytes rate from the incoming connection's source address
-  in the current proxy's stick-table or in the designated stick-table, measured
-  in amount of bytes over the period configured in the table. If the address is
-  not found, zero is returned. See also sc/sc0/sc1/sc2_bytes_in_rate.
+  Same as "table_bytes_in_rate" converter with key set to the incoming
+  connection's source address.
+
+  Equivalent to: src,table_bytes_in_rate([<table>])
 
 src_bytes_out_rate([<table>]) : integer
-  Returns the average bytes rate to the incoming connection's source address in
-  the current proxy's stick-table or in the designated stick-table, measured in
-  amount of bytes over the period configured in the table. If the address is
-  not found, zero is returned. See also sc/sc0/sc1/sc2_bytes_out_rate.
+  Same as "table_bytes_out_rate" converter with key set to the incoming
+  connection's source address.
 
-src_clr_gpc(<idx>,[<table>]) : integer
-  Clears the General Purpose Counter at the index <idx> of the array
-  associated to the incoming connection's source address in the current proxy's
-  stick-table or in the designated stick-table <table>, and returns its
-  previous value. <idx> is an integer between 0 and 99.
-  If the address is not found, an entry is created and 0 is returned.
-  This fetch applies only to the 'gpc' array data_type (and not to the legacy
-  'gpc0' nor 'gpc1' data_types).
-  See also sc_clr_gpc.
+  Equivalent to: src,table_bytes_out_rate([<table>])
+
+src_clr_gpc(<idx>[,<table>]) : integer
+  Same as "table_clr_gpc" converter with key set to the incoming
+  connection's source address.
+
+  Equivalent to: src,table_clr_gpc(<idx>[,<table>])
 
 src_clr_gpc0([<table>]) : integer
-  Clears the first General Purpose Counter associated to the incoming
-  connection's source address in the current proxy's stick-table or in the
-  designated stick-table, and returns its previous value. If the address is not
-  found, an entry is created and 0 is returned. This is typically used as a
-  second ACL in an expression in order to mark a connection when a first ACL
-  was verified :
+  Same as "table_clr_gpc0" converter with key set to the incoming
+  connection's source address.
 
-  Example:
-        # block if 5 consecutive requests continue to come faster than 10 sess
-        # per second, and reset the counter as soon as the traffic slows down.
-        acl abuse src_http_req_rate gt 10
-        acl kill  src_inc_gpc0 gt 5
-        acl save  src_clr_gpc0 ge 0
-        tcp-request connection accept if !abuse save
-        tcp-request connection reject if abuse kill
+  Equivalent to: src,table_clr_gpc0([<table>])
 
 src_clr_gpc1([<table>]) : integer
-  Clears the second General Purpose Counter associated to the incoming
-  connection's source address in the current proxy's stick-table or in the
-  designated stick-table, and returns its previous value. If the address is not
-  found, an entry is created and 0 is returned. This is typically used as a
-  second ACL in an expression in order to mark a connection when a first ACL
-  was verified.
+  Same as "table_clr_gpc1" converter with key set to the incoming
+  connection's source address.
+
+  Equivalent to: src,table_clr_gpc1([<table>])
 
 src_conn_cnt([<table>]) : integer
-  Returns the cumulative number of connections initiated from the current
-  incoming connection's source address in the current proxy's stick-table or in
-  the designated stick-table. If the address is not found, zero is returned.
-  See also sc/sc0/sc1/sc2_conn_cnt.
+  Same as "table_conn_cnt" converter with key set to the incoming
+  connection's source address.
+
+  Equivalent to: src,table_conn_cnt([<table>])
 
 src_conn_cur([<table>]) : integer
-  Returns the current amount of concurrent connections initiated from the
-  current incoming connection's source address in the current proxy's
-  stick-table or in the designated stick-table. If the address is not found,
-  zero is returned. See also sc/sc0/sc1/sc2_conn_cur.
+  Same as "table_conn_cur" converter with key set to the incoming
+  connection's source address.
+
+  Equivalent to: src,table_conn_cur([<table>])
 
 src_conn_rate([<table>]) : integer
-  Returns the average connection rate from the incoming connection's source
-  address in the current proxy's stick-table or in the designated stick-table,
-  measured in amount of connections over the period configured in the table. If
-  the address is not found, zero is returned. See also sc/sc0/sc1/sc2_conn_rate.
+  Same as "table_conn_rate" converter with key set to the incoming
+  connection's source address.
 
-src_get_gpc(<idx>,[<table>]) : integer
-  Returns the value of the General Purpose Counter at the index <idx> of the
-  array associated to the incoming connection's source address in the
-  current proxy's stick-table or in the designated stick-table <table>. <idx>
-  is an integer between 0 and 99.
-  If the address is not found or there is no gpc stored at this index, zero
-  is returned.
-  This fetch applies only to the 'gpc' array data_type (and not on the legacy
-  'gpc0' nor 'gpc1' data_types).
-  See also sc_get_gpc and src_inc_gpc.
+  Equivalent to: src,table_conn_rate([<table>])
+
+src_get_gpc(<idx>[,<table>]) : integer
+  Same as "table_gpc" converter with key set to the incoming connection's
+  source address.
+
+  Equivalent to: src,table_gpc(<idx>[,<table>])
 
 src_get_gpc0([<table>]) : integer
-  Returns the value of the first General Purpose Counter associated to the
-  incoming connection's source address in the current proxy's stick-table or in
-  the designated stick-table. If the address is not found, zero is returned.
-  See also sc/sc0/sc1/sc2_get_gpc0 and src_inc_gpc0.
+  Same as "table_gpc0" converter with key set to the incoming connection's
+  source address.
+
+  Equivalent to: src,table_gpc0([<table>])
 
 src_get_gpc1([<table>]) : integer
-  Returns the value of the second General Purpose Counter associated to the
-  incoming connection's source address in the current proxy's stick-table or in
-  the designated stick-table. If the address is not found, zero is returned.
-  See also sc/sc0/sc1/sc2_get_gpc1 and src_inc_gpc1.
+  Same as "table_gpc1" converter with key set to the incoming connection's
+  source address.
+
+  Equivalent to: src,table_gpc1([<table>])
 
 src_get_gpt(<idx>[,<table>]) : integer
-  Returns the value of the first General Purpose Tag at the index <idx> of
-  the array associated to the incoming connection's source address in the
-  current proxy's stick-table or in the designated stick-table <table>.
-  <idx> is an integer between 0 and 99.
-  If the address is not found or the GPT is not stored, zero is returned.
-  See also the sc_get_gpt sample fetch keyword.
+  Same as "table_gpt" converter with key set to the incoming connection's
+  source address.
+
+  Equivalent to: src,table_gpt(<idx>[,<table>])
 
 src_get_gpt0([<table>]) : integer
-  Returns the value of the first General Purpose Tag associated to the
-  incoming connection's source address in the current proxy's stick-table or in
-  the designated stick-table. If the address is not found, zero is returned.
-  See also sc/sc0/sc1/sc2_get_gpt0.
+  Same as "table_gpt0" converter with key set to the incoming connection's
+  source address.
+
+  Equivalent to: src,table_gpt0([<table>])
 
 src_glitch_cnt([<table>]) : integer
-  Returns the cumulative number of front connection glitches that were observed
-  on connections from the current connection's source address. Usually these
-  result in requests or connections to be aborted so the returned value will
-  often correspond to past connections. There is no good nor bad value, but a
-  poor quality client may occasionally cause a few glitches per connection,
-  while a very bogus or malevolent client may quickly cause thousands of events
-  to be added on a connection. See also fc_glitches for the number affecting
-  the current connection, sc_glitch_cnt to look them up in currently tracked
-  counters, and src_glitch_rate for the event rate measurements.
+  Same as "table_glitch_cnt" converter with key set to the incoming
+  connection's source address.
+
+  Equivalent to: src,table_glitch_cnt([<table>])
 
 src_glitch_rate([<table>]) : integer
-  Returns the average rate at which front connection glitches were observed for
-  on connections from the current connection's source address, measured in
-  amount of events over the period configured in the table. Usually these
-  glitches result in requests or connections to be aborted so the returned
-  value will often be related to past connections. There is no good nor bad
-  value, but a poor quality client may occasionally cause a few glitches per
-  connection, hence a low rate is generally expected. However, a very bogus or
-  malevolent client may quickly cause thousands of events to be added per
-  connection, and maintain a high rate here. See also sc_glitch_rate and
-  src_glitch_cnt.
+  Same as "table_glitch_rate" converter with key set to the incoming
+  connection's source address.
+
+  Equivalent to: src,table_glitch_rate([<table>])
 
 src_gpc_rate(<idx>[,<table>]) : integer
-  Returns the average increment rate of the General Purpose Counter at the
-  index <idx> of the array associated to the incoming connection's
-  source address in the current proxy's stick-table or in the designated
-  stick-table <table>. It reports the frequency which the gpc counter was
-  incremented over the configured period. <idx> is an integer between 0 and 99.
-  Note that the 'gpc_rate' counter must be stored in the stick-table for a
-  value to be returned, as 'gpc' only holds the event count.
-  This fetch applies only to the 'gpc_rate' array data_type (and not to
-  the legacy 'gpc0_rate' nor 'gpc1_rate' data_types).
-  See also sc_gpc_rate, src_get_gpc, and sc_inc_gpc.
+  Same as "table_gpc_rate" converter with key set to the incoming connection's
+  source address.
+
+  Equivalent to: src,table_gpc_rate(<idx>[,<table>])
 
 src_gpc0_rate([<table>]) : integer
-  Returns the average increment rate of the first General Purpose Counter
-  associated to the incoming connection's source address in the current proxy's
-  stick-table or in the designated stick-table. It reports the frequency
-  which the gpc0 counter was incremented over the configured period. See also
-  sc/sc0/sc1/sc2_gpc0_rate, src_get_gpc0, and sc/sc0/sc1/sc2_inc_gpc0. Note
-  that the "gpc0_rate" counter must be stored in the stick-table for a value to
-  be returned, as "gpc0" only holds the event count.
+  Same as "table_gpc0_rate" converter with key set to the incoming connection's
+  source address.
+
+  Equivalent to: src,table_gpc0_rate([<table>])
 
 src_gpc1_rate([<table>]) : integer
-  Returns the average increment rate of the second General Purpose Counter
-  associated to the incoming connection's source address in the current proxy's
-  stick-table or in the designated stick-table. It reports the frequency
-  which the gpc1 counter was incremented over the configured period. See also
-  sc/sc0/sc1/sc2_gpc1_rate, src_get_gpc1, and sc/sc0/sc1/sc2_inc_gpc1. Note
-  that the "gpc1_rate" counter must be stored in the stick-table for a value to
-  be returned, as "gpc1" only holds the event count.
+  Same as "table_gpc1_rate" converter with key set to the incoming connection's
+  source address.
+
+  Equivalent to: src,table_gpc1_rate([<table>])
 
 src_http_err_cnt([<table>]) : integer
-  Returns the cumulative number of HTTP errors from the incoming connection's
-  source address in the current proxy's stick-table or in the designated
-  stick-table. This includes the both request errors and 4xx error responses.
-  See also sc/sc0/sc1/sc2_http_err_cnt. If the address is not found, zero is
-  returned.
+  Same as "table_http_err_cnt" converter with key set to the incoming
+  connection's source address.
+
+  Equivalent to: src,table_http_err_cnt([<table>])
 
 src_http_err_rate([<table>]) : integer
-  Returns the average rate of HTTP errors from the incoming connection's source
-  address in the current proxy's stick-table or in the designated stick-table,
-  measured in amount of errors over the period configured in the table. This
-  includes the both request errors and 4xx error responses. If the address is
-  not found, zero is returned. See also sc/sc0/sc1/sc2_http_err_rate.
+  Same as "table_http_err_rate" converter with key set to the incoming
+  connection's source address.
+
+  Equivalent to: src,table_http_err_rate([<table>])
 
 src_http_fail_cnt([<table>]) : integer
-  Returns the cumulative number of HTTP response failures triggered by the
-  incoming connection's source address in the current proxy's stick-table or in
-  the designated stick-table. This includes the both response errors and 5xx
-  status codes other than 501 and 505. See also sc/sc0/sc1/sc2_http_fail_cnt.
-  If the address is not found, zero is returned.
+  Same as "table_http_fail_cnt" converter with key set to the incoming
+  connection's source address.
+
+  Equivalent to: src,table_http_fail_cnt([<table>])
 
 src_http_fail_rate([<table>]) : integer
-  Returns the average rate of HTTP response failures triggered by the incoming
-  connection's source address in the current proxy's stick-table or in the
-  designated stick-table, measured in amount of failures over the period
-  configured in the table. This includes the both response errors and 5xx
-  status codes other than 501 and 505. If the address is not found, zero is
-  returned. See also sc/sc0/sc1/sc2_http_fail_rate.
+  Same as "table_http_fail_rate" converter with key set to the incoming
+  connection's source address.
+
+  Equivalent to: src,table_http_fail_rate([<table>])
 
 src_http_req_cnt([<table>]) : integer
-  Returns the cumulative number of HTTP requests from the incoming connection's
-  source address in the current proxy's stick-table or in the designated stick-
-  table. This includes every started request, valid or not. If the address is
-  not found, zero is returned. See also sc/sc0/sc1/sc2_http_req_cnt.
+  Same as "table_http_req_cnt" converter with key set to the incoming
+  connection's source address.
+
+  Equivalent to: src,table_http_req_cnt([<table>])
 
 src_http_req_rate([<table>]) : integer
-  Returns the average rate of HTTP requests from the incoming connection's
-  source address in the current proxy's stick-table or in the designated stick-
-  table, measured in amount of requests over the period configured in the
-  table. This includes every started request, valid or not. If the address is
-  not found, zero is returned. See also sc/sc0/sc1/sc2_http_req_rate.
+  Same as "table_http_req_rate" converter with key set to the incoming
+  connection's source address.
 
-src_inc_gpc(<idx>,[<table>]) : integer
-  Increments the General Purpose Counter at index <idx> of the array
-  associated to the incoming connection's source address in the current proxy's
-  stick-table or in the designated stick-table <table>, and returns its new
-  value. <idx> is an integer between 0 and 99.
-  If the address is not found, an entry is created and 1 is returned.
-  This fetch applies only to the 'gpc' array data_type (and not to the legacy
-  'gpc0' nor 'gpc1' data_types).
-  See also sc_inc_gpc.
+  Equivalent to: src,table_http_req_rate([<table>])
+
+src_inc_gpc(<idx>[,<table>]) : integer
+  Same as "src_inc_gpc" converter with key set to the incoming
+  connection's source address.
+
+  Equivalent to: src,table_inc_gpc(<idx>[,<table>])
 
 src_inc_gpc0([<table>]) : integer
-  Increments the first General Purpose Counter associated to the incoming
-  connection's source address in the current proxy's stick-table or in the
-  designated stick-table, and returns its new value. If the address is not
-  found, an entry is created and 1 is returned. See also sc0/sc2/sc2_inc_gpc0.
-  This is typically used as a second ACL in an expression in order to mark a
-  connection when a first ACL was verified :
+  Same as "src_inc_gpc0" converter with key set to the incoming
+  connection's source address.
 
-  Example:
-        acl abuse src_http_req_rate gt 10
-        acl kill  src_inc_gpc0 gt 0
-        tcp-request connection reject if abuse kill
+  Equivalent to: src,table_inc_gpc0([<table>])
 
 src_inc_gpc1([<table>]) : integer
-  Increments the second General Purpose Counter associated to the incoming
-  connection's source address in the current proxy's stick-table or in the
-  designated stick-table, and returns its new value. If the address is not
-  found, an entry is created and 1 is returned. See also sc0/sc2/sc2_inc_gpc1.
-  This is typically used as a second ACL in an expression in order to mark a
-  connection when a first ACL was verified.
+  Same as "src_inc_gpc1" converter with key set to the incoming
+  connection's source address.
+
+  Equivalent to: src,table_inc_gpc1([<table>])
 
 src_is_local : boolean
   Returns true if the source address of the incoming connection is local to the
@@ -23548,18 +24068,16 @@ src_is_local : boolean
   once per connection.
 
 src_kbytes_in([<table>]) : integer
-  Returns the total amount of data received from the incoming connection's
-  source address in the current proxy's stick-table or in the designated
-  stick-table, measured in kilobytes. If the address is not found, zero is
-  returned. The test is currently performed on 32-bit integers, which limits
-  values to 4 terabytes. See also sc/sc0/sc1/sc2_kbytes_in.
+  Same as "table_kbytes_in" converter with key set to the incoming connection's
+  source address.
+
+  Equivalent to: src,table_kbytes_in([<table>])
 
 src_kbytes_out([<table>]) : integer
-  Returns the total amount of data sent to the incoming connection's source
-  address in the current proxy's stick-table or in the designated stick-table,
-  measured in kilobytes. If the address is not found, zero is returned. The
-  test is currently performed on 32-bit integers, which limits values to 4
-  terabytes. See also sc/sc0/sc1/sc2_kbytes_out.
+  Same as "table_kbytes_out" converter with key set to the incoming connection's
+  source address.
+
+  Equivalent to: src,table_kbytes_out([<table>])
 
 src_port : integer
   Returns an integer value corresponding to the TCP source port of the
@@ -23569,18 +24087,16 @@ src_port : integer
   nowadays.
 
 src_sess_cnt([<table>]) : integer
-  Returns the cumulative number of connections initiated from the incoming
-  connection's source IPv4 address in the current proxy's stick-table or in the
-  designated stick-table, that were transformed into sessions, which means that
-  they were accepted by "tcp-request" rules. If the address is not found, zero
-  is returned. See also sc/sc0/sc1/sc2_sess_cnt.
+  Same as "table_sess_cnt" converter with key set to the incoming connection's
+  source address.
+
+  Equivalent to: src,table_sess_cnt([<table>])
 
 src_sess_rate([<table>]) : integer
-  Returns the average session rate from the incoming connection's source
-  address in the current proxy's stick-table or in the designated stick-table,
-  measured in amount of sessions over the period configured in the table. A
-  session is a connection that went past the early "tcp-request" rules. If the
-  address is not found, zero is returned. See also sc/sc0/sc1/sc2_sess_rate.
+  Same as "table_sess_rate" converter with key set to the incoming connection's
+  source address.
+
+  Equivalent to: src,table_sess_rate([<table>])
 
 src_updt_conn_cnt([<table>]) : integer
   Creates or updates the entry associated to the incoming connection's source
@@ -23640,6 +24156,14 @@ Summary of sample fetch methods in this section and their respective types:
   keyword                                          output type
 -------------------------------------------------+-------------
 51d.all(<prop>[,<prop>*])                          string
+bs.aborted                                         boolean
+bs.debug_str([<bitmap>])                           string
+bs.id                                              integer
+bs.rst_code                                        integer
+fs.aborted                                         boolean
+fs.debug_str([<bitmap>])                           string
+fs.id                                              integer
+fs.rst_code                                        integer
 ssl_bc                                             boolean
 ssl_bc_alg_keysize                                 integer
 ssl_bc_alpn                                        string
@@ -23761,11 +24285,84 @@ Detailed list:
       http-request set-header X-51D-DeviceTypeMobileTablet \
         %[51d.all(DeviceType,IsMobile,IsTablet)]
 
+bs.aborted : boolean
+  Returns true is an abort was received from the server for the current
+  stream. Otherwise false is returned.
+
+bs.debug_str([<bitmap>]) : string
+  This function is meant to be used by developers during certain complex
+  troubleshooting sessions. It extracts some internal states from the lower
+  layers of the backend stream and connection, and arranges them as a string,
+  generally in the form of a series of "name=value" delimited with spaces. The
+  <bitmap> optional argument indicates what layer(s) to extract information
+  from, and is an arithmetic OR (or a sum) of the following values:
+     - socket layer: 16
+     - connection layer: 8
+     - transport layer (e.g. SSL): 4
+     - mux connection: 2
+     - mux stream: 1
+
+  These values might change across versions. The default value of zero is
+  special and enables all layers. Please do not rely on the output of this
+  function for long-term production monitoring. It is meant to evolve even
+  within a stable branch, as the needs for increased details arise. One use
+  typical use case is to concatenate these information at the very end of a
+  log-format, along with fs.debug_str(). Example:
+
+     log-format "$HAPROXY_HTTP_LOG_FMT fs=<%[fs.debug_str]> bs=<%[bs.debug_str]>"
+
+bs.id : integer
+  Returns the multiplexer's stream ID on the server side. It is the
+  multiplexer's responsibility to return the appropriate information.
+
+bs.rst_code : integer
+  Returns the reset code received from the server for the current stream. The
+  code of the H2 RST_STREAM frame or the QUIC STOP_SENDING frame received from
+  the server is returned. The sample fetch fails if no abort was received or if
+  the server stream is not an H2/QUIC stream.
+
 ssl_bc : boolean
   Returns true when the back connection was made via an SSL/TLS transport
   layer and is locally deciphered. This means the outgoing connection was made
   to a server with the "ssl" option. It can be used in a tcp-check or an
   http-check ruleset.
+
+fs.aborted : boolean
+  Returns true is an abort was received from the client for the current
+  stream. Otherwise false is returned.
+
+fs.debug_str([<bitmap>]) : string
+  This function is meant to be used by developers during certain complex
+  troubleshooting sessions. It extracts some internal states from the lower
+  layers of the frontend stream and connection, and arranges them as a string,
+  generally in the form of a series of "name=value" delimited with spaces. The
+  <bitmap> optional argument indicates what layer(s) to extract information
+  from, and is an arithmetic OR (or a sum) of the following values:
+     - socket layer: 16
+     - connection layer: 8
+     - transport layer (e.g. SSL): 4
+     - mux connection: 2
+     - mux stream: 1
+
+  These values might change across versions. The default value of zero is
+  special and enables all layers. Please do not rely on the output of this
+  function for long-term production monitoring. It is meant to evolve even
+  within a stable branch, as the needs for increased details arise. One use
+  typical use case is to concatenate these information at the very end of a
+  log-format, along with bs.debug_str(). Example:
+
+     log-format "$HAPROXY_HTTP_LOG_FMT fs=<%[fs.debug_str]> bs=<%[bs.debug_str]>"
+
+fs.id : integer
+  Returns the multiplexer's stream ID on the client side. It is the
+  multiplexer's responsibility to return the appropriate information. For
+  instance, on a raw TCP, 0 is always returned because there is no stream.
+
+fs.rst_code : integer
+  Returns the reset code received from the client for the current stream. The
+  code of the H2 RST_STREAM frame or the QUIC STOP_SENDING frame received from
+  the client is returned. The sample fetch fails if no abort was received or
+  if the client stream is not an H2/QUIC stream.
 
 ssl_bc_alg_keysize : integer
   Returns the symmetric cipher key size supported in bits when the outgoing
@@ -24602,16 +25199,8 @@ Summary of sample fetch methods in this section and their respective types:
 
   keyword                                             output type
 ----------------------------------------------------+-------------
-bs.aborted                                            boolean
-bs.debug_str([<bitmap>])                              string
-bs.id                                                 integer
-bs.rst_code                                           integer
 distcc_body(<token>[,<occ>])                          binary
 distcc_param(<token>[,<occ>])                         integer
-fs.aborted                                            boolean
-fs.debug_str([<bitmap>])                              string
-fs.id                                                 integer
-fs.rst_code                                           integer
 payload(<offset>,<length>)                            binary
 payload_lv(<offset1>,<length>[,<offset2>])            binary
 req.len                                               integer
@@ -24638,46 +25227,9 @@ res.payload(<offset>,<length>)                        binary
 res.payload_lv(<offset1>,<length>[,<offset2>])        binary
 res.ssl_hello_type                                    integer
 rep_ssl_hello_type                                    integer
-wait_end                                              boolean
 ----------------------------------------------------+-------------
 
 Detailed list:
-
-bs.aborted: boolean
-  Returns true is an abort was received from the server for the current
-  stream. Otherwise false is returned.
-
-bs.debug_str([<bitmap>]) : string
-  This function is meant to be used by developers during certain complex
-  troubleshooting sessions. It extracts some internal states from the lower
-  layers of the backend stream and connection, and arranges them as a string,
-  generally in the form of a series of "name=value" delimited with spaces. The
-  <bitmap> optional argument indicates what layer(s) to extract information
-  from, and is an arithmetic OR (or a sum) of the following values:
-     - socket layer: 16
-     - connection layer: 8
-     - transport layer (e.g. SSL): 4
-     - mux connection: 2
-     - mux stream: 1
-
-  These values might change across versions. The default value of zero is
-  special and enables all layers. Please do not rely on the output of this
-  function for long-term production monitoring. It is meant to evolve even
-  within a stable branch, as the needs for increased details arise. One use
-  typical use case is to concatenate these information at the very end of a
-  log-format, along with fs.debug_str(). Example:
-
-     log-format "$HAPROXY_HTTP_LOG_FMT fs=<%[fs.debug_str]> bs=<%[bs.debug_str]>"
-
-bs.id : integer
-  Returns the multiplexer's stream ID on the server side. It is the
-  multiplexer's responsibility to return the appropriate information.
-
-bs.rst_code: integer
-  Returns the reset code received from the server for the current stream. The
-  code of the H2 RST_STREAM frame or the QUIC STOP_SENDING frame received from
-  the server is returned. The sample fetch fails if no abort was received or if
-  the server stream is not an H2/QUIC stream.
 
 distcc_body(<token>[,<occ>]) : binary
   Parses a distcc message and returns the body associated to occurrence #<occ>
@@ -24704,43 +25256,6 @@ distcc_param(<token>[,<occ>]) : integer
       tcp-request content accept if { distcc_param(DOTI) -m found }
       # send large files to the big farm
       use_backend big_farm if { distcc_param(DOTI) gt 1000000 }
-
-fs.aborted: boolean
-  Returns true is an abort was received from the client for the current
-  stream. Otherwise false is returned.
-
-fs.debug_str([<bitmap>]) : string
-  This function is meant to be used by developers during certain complex
-  troubleshooting sessions. It extracts some internal states from the lower
-  layers of the frontend stream and connection, and arranges them as a string,
-  generally in the form of a series of "name=value" delimited with spaces. The
-  <bitmap> optional argument indicates what layer(s) to extract information
-  from, and is an arithmetic OR (or a sum) of the following values:
-     - socket layer: 16
-     - connection layer: 8
-     - transport layer (e.g. SSL): 4
-     - mux connection: 2
-     - mux stream: 1
-
-  These values might change across versions. The default value of zero is
-  special and enables all layers. Please do not rely on the output of this
-  function for long-term production monitoring. It is meant to evolve even
-  within a stable branch, as the needs for increased details arise. One use
-  typical use case is to concatenate these information at the very end of a
-  log-format, along with bs.debug_str(). Example:
-
-     log-format "$HAPROXY_HTTP_LOG_FMT fs=<%[fs.debug_str]> bs=<%[bs.debug_str]>"
-
-fs.id : integer
-  Returns the multiplexer's stream ID on the client side. It is the
-  multiplexer's responsibility to return the appropriate information. For
-  instance, on a raw TCP, 0 is always returned because there is no stream.
-
-fs.rst_code: integer
-  Returns the reset code received from the client for the current stream. The
-  code of the H2 RST_STREAM frame or the QUIC STOP_SENDING frame received from
-  the client is returned. The sample fetch fails if no abort was received or
-  if the client stream is not an H2/QUIC stream.
 
 payload(<offset>,<length>) : binary (deprecated)
   This is an alias for "req.payload" when used in the context of a request (e.g.
@@ -24973,29 +25488,6 @@ rep_ssl_hello_type : integer (deprecated)
   option. This is mostly used in ACL to detect presence of an SSL hello message
   that is supposed to contain an SSL session ID usable for stickiness.
 
-wait_end : boolean
-  This fetch either returns true when the inspection period is over, or does
-  not fetch. It is only used in ACLs, in conjunction with content analysis to
-  avoid returning a wrong verdict early. It may also be used to delay some
-  actions, such as a delayed reject for some special addresses. Since it either
-  stops the rules evaluation or immediately returns true, it is recommended to
-  use this acl as the last one in a rule. Please note that the default ACL
-  "WAIT_END" is always usable without prior declaration. This test was designed
-  to be used with TCP request content inspection.
-
-  Examples :
-     # delay every incoming request by 2 seconds
-     tcp-request inspect-delay 2s
-     tcp-request content accept if WAIT_END
-
-     # don't immediately tell bad guys they are rejected
-     tcp-request inspect-delay 10s
-     acl goodguys src 10.0.0.0/24
-     acl badguys  src 10.0.1.0/24
-     tcp-request content accept if goodguys
-     tcp-request content reject if badguys WAIT_END
-     tcp-request content reject
-
 
 7.3.6. Fetching HTTP samples (Layer 7)
 --------------------------------------
@@ -25072,7 +25564,7 @@ http_first_req                                     boolean
 method                                             integer
 path                                               string
 pathq                                              string
-query                                              string
+query([<options>])                                 string
 req.hdr_names([<delim>])                           string
 req.ver                                            string
 req_ver                                            string
@@ -25532,13 +26024,20 @@ pathq : string
   accept-unsafe-violations-in-http-request", then this fragment part will be
   accepted and will also appear in the path.
 
-query : string
+query([<options>]) : string
   This extracts the request's query string, which starts after the first
   question mark. If no question mark is present, this fetch returns nothing. If
   a question mark is present but nothing follows, it returns an empty string.
   This means it's possible to easily know whether a query string is present
   using the "found" matching method. This fetch is the complement of "path"
-  which stops before the question mark.
+  which stops before the question mark and of "query_string", which include the
+  question mark.
+
+  An optional parameter may be used to customize the return value. Following
+  options are supported:
+
+    - with_qm : Include the question mark at the beginning ot the query string,
+                if not empty.
 
 req.hdr_names([<delim>]) : string
   This builds a string made from the concatenation of all header names as they
@@ -27386,9 +27885,10 @@ Timings events in TCP mode:
     instance during a POST request, the time already runs, and this can distort
     apparent response time. For this reason, it's generally wise not to trust
     too much this field for POST requests initiated from clients behind an
-    untrusted network. A value of "-1" here means that the last the response
-    header (empty line) was never seen, most likely because the server timeout
-    stroke before the server managed to process the request.
+    untrusted network. A value of "-1" here means that the last response header
+    (empty line) was never seen, most likely because the server timeout stroke
+    before the server managed to process the request or because the server
+    returned an invalid response.
 
     This timer is named %Tr as a log-format alias, and res.timer.hdr as a
     sample fetch.
@@ -28246,6 +28746,13 @@ filter opentracing [id <id>] config <file>
 
 More detailed documentation related to the operation, configuration and use
 of the filter can be found in the addons/ot directory.
+
+Note: The OpenTracing filter shouldn't be used for new designs as OpenTracing
+      itself is no longer maintained nor supported by its authors. A
+      replacement filter base on OpenTelemetry is currently under development
+      and is expected to be ready around HAProxy 3.2. As such OpenTracing will
+      be deprecated in 3.3 and removed in 3.5.
+
 
 9.7. Bandwidth limitation
 --------------------------

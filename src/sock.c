@@ -945,6 +945,31 @@ int sock_conn_check(struct connection *conn)
 			goto done;
 		if (!(fdtab[fd].state & (FD_POLL_ERR|FD_POLL_HUP)))
 			goto wait;
+
+		/* Removing HUP if there is no ERR reported.
+		 *
+		 * After a first connect() returning EINPROGRESS, it seems
+		 * possible to have EPOLLHUP or EPOLLRDHUP reported by
+		 * epoll_wait() and turned to an error while the following
+		 * connect() will return a success. So the connection is
+		 * validated but the error is saved and reported on the first
+		 * subsequent read.
+		 *
+		 * We have no explanation for now. Why epoll report the
+		 * connection is closed while the connect() it able to validate
+		 * it ? no idea. But, it seems reasonnable in this case, and if
+		 * no error was reported, to remove the the HUP flag. At worst, if
+		 * the connection is really closed, this will be reported later.
+		 *
+		 * Only observed on Ubuntu kernel (5.4/5.15). See:
+		 *   - https://github.com/haproxy/haproxy/issues/1863
+		 *   - https://www.spinics.net/lists/netdev/msg876470.html
+		 */
+		if (unlikely((fdtab[fd].state & (FD_POLL_HUP|FD_POLL_ERR)) == FD_POLL_HUP)) {
+			COUNT_IF(1, "Removing FD_POLL_HUP if no FD_POLL_ERR to let connect() decide");
+			fdtab[fd].state &= ~FD_POLL_HUP;
+		}
+
 		/* error present, fall through common error check path */
 	}
 
@@ -963,8 +988,10 @@ int sock_conn_check(struct connection *conn)
 		if (errno == EALREADY || errno == EINPROGRESS)
 			goto wait;
 
-		if (errno && errno != EISCONN)
+		if (errno && errno != EISCONN) {
+			conn_report_term_evt(conn, tevt_loc_fd, fd_tevt_type_connect_err);
 			goto out_error;
+		}
 	}
 
  done:
@@ -992,8 +1019,10 @@ int sock_conn_check(struct connection *conn)
 	 * in some corner cases while the system disagrees and reports an error
 	 * on the FD.
 	 */
-	if (fdtab[fd].state & FD_POLL_ERR)
+	if (fdtab[fd].state & FD_POLL_ERR) {
+		conn_report_term_evt(conn, tevt_loc_fd, fd_tevt_type_connect_poll_err);
 		goto out_error;
+	}
 
 	fd_cant_send(fd);
 	fd_want_send(fd);

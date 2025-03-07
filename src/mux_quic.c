@@ -19,9 +19,11 @@
 #include <haproxy/quic_enc.h>
 #include <haproxy/quic_fctl.h>
 #include <haproxy/quic_frame.h>
+#include <haproxy/quic_pacing.h>
 #include <haproxy/quic_sock.h>
 #include <haproxy/quic_stream.h>
 #include <haproxy/quic_tp-t.h>
+#include <haproxy/quic_tune.h>
 #include <haproxy/quic_tx.h>
 #include <haproxy/session.h>
 #include <haproxy/ssl_sock-t.h>
@@ -35,6 +37,12 @@ DECLARE_POOL(pool_head_qcs, "qcs", sizeof(struct qcs));
 
 static void qmux_ctrl_send(struct qc_stream_desc *, uint64_t data, uint64_t offset);
 static void qmux_ctrl_room(struct qc_stream_desc *, uint64_t room);
+
+/* Returns true if pacing should be used for <conn> connection. */
+static int qcc_is_pacing_active(const struct connection *conn)
+{
+	return !(quic_tune.options & QUIC_TUNE_NO_PACING);
+}
 
 static void qcs_free_ncbuf(struct qcs *qcs, struct ncbuf *ncbuf)
 {
@@ -68,6 +76,7 @@ static void qcs_free(struct qcs *qcs)
 
 	/* Safe to use even if already removed from the list. */
 	LIST_DEL_INIT(&qcs->el_opening);
+	LIST_DEL_INIT(&qcs->el_recv);
 	LIST_DEL_INIT(&qcs->el_send);
 	LIST_DEL_INIT(&qcs->el_fctl);
 	LIST_DEL_INIT(&qcs->el_buf);
@@ -121,6 +130,7 @@ static struct qcs *qcs_new(struct qcc *qcc, uint64_t id, enum qcs_type type)
 	 * These fields must be initialed before.
 	 */
 	LIST_INIT(&qcs->el_opening);
+	LIST_INIT(&qcs->el_recv);
 	LIST_INIT(&qcs->el_send);
 	LIST_INIT(&qcs->el_fctl);
 	LIST_INIT(&qcs->el_buf);
@@ -299,7 +309,7 @@ static void qcc_refresh_timeout(struct qcc *qcc)
 	 * processed if shutdown already one or connection is idle.
 	 */
 	if (!conn_is_back(qcc->conn)) {
-		if (qcc->nb_hreq && !(qcc->flags & QC_CF_APP_SHUT)) {
+		if (qcc->nb_hreq && qcc->app_st < QCC_APP_ST_SHUT) {
 			TRACE_DEVEL("one or more requests still in progress", QMUX_EV_QCC_WAKE, qcc->conn);
 			qcc->task->expire = tick_add_ifset(now_ms, qcc->timeout);
 			task_queue(qcc->task);
@@ -307,7 +317,7 @@ static void qcc_refresh_timeout(struct qcc *qcc)
 		}
 
 		if ((!LIST_ISEMPTY(&qcc->opening_list) || unlikely(!qcc->largest_bidi_r)) &&
-		    !(qcc->flags & QC_CF_APP_SHUT)) {
+		    qcc->app_st < QCC_APP_ST_SHUT) {
 			int timeout = px->timeout.httpreq;
 			struct qcs *qcs = NULL;
 			int base_time;
@@ -323,7 +333,7 @@ static void qcc_refresh_timeout(struct qcc *qcc)
 			qcc->task->expire = tick_add_ifset(base_time, timeout);
 		}
 		else {
-			if (qcc->flags & QC_CF_APP_SHUT) {
+			if (qcc->app_st >= QCC_APP_ST_SHUT) {
 				TRACE_DEVEL("connection in closing", QMUX_EV_QCC_WAKE, qcc->conn);
 				qcc->task->expire = tick_add_ifset(now_ms,
 				                                   qcc->shut_timeout);
@@ -425,6 +435,16 @@ static void qcs_close_local(struct qcs *qcs)
 	}
 }
 
+/* Returns true if <qcs> can be purged. */
+static int qcs_is_completed(struct qcs *qcs)
+{
+	/* A stream is completed if fully closed and stconn released, or simply
+	 * detached and everything already sent.
+	 */
+	return (qcs->st == QC_SS_CLO && !qcs_sc(qcs)) ||
+	       (qcs_is_close_local(qcs) && (qcs->flags & QC_SF_DETACH));
+}
+
 /* Close the remote channel of <qcs> instance. */
 static void qcs_close_remote(struct qcs *qcs)
 {
@@ -443,6 +463,12 @@ static void qcs_close_remote(struct qcs *qcs)
 		/* Only remote uni streams are valid for this operation. */
 		BUG_ON_HOT(quic_stream_is_local(qcs->qcc, qcs->id));
 		qcs->st = QC_SS_CLO;
+	}
+
+	if (qcs_is_completed(qcs)) {
+		BUG_ON(LIST_INLIST(&qcs->el_send));
+		TRACE_STATE("add stream in purg_list", QMUX_EV_QCS_RECV, qcs->qcc->conn, qcs);
+		LIST_APPEND(&qcs->qcc->purg_list, &qcs->el_send);
 	}
 }
 
@@ -630,6 +656,11 @@ static void qmux_ctrl_send(struct qc_stream_desc *stream, uint64_t data, uint64_
 
 			/* Unsubscribe from streamdesc when everything sent. */
 			qc_stream_desc_sub_send(qcs->stream, NULL);
+
+			if (qcs_is_completed(qcs)) {
+				TRACE_STATE("add stream in purg_list", QMUX_EV_QCS_SEND, qcc->conn, qcs);
+				LIST_APPEND(&qcc->purg_list, &qcs->el_send);
+			}
 		}
 	}
 
@@ -863,17 +894,37 @@ void qcs_send_metadata(struct qcs *qcs)
 	qc_stream_desc_sub_room(qcs->stream, NULL);
 }
 
-struct stconn *qcs_attach_sc(struct qcs *qcs, struct buffer *buf, char fin)
+/* Instantiate a streamdesc instance for <qcs> stream. This is necessary to
+ * transfer data after a new request reception. <buf> can be used to forward
+ * the first received request data. <fin> must be set if the whole request is
+ * already received.
+ *
+ * Note that if <qcs> is already fully closed, no streamdesc is instantiated.
+ * This is useful if a RESET_STREAM was already emitted in response to a
+ * STOP_SENDING.
+ *
+ * Returns 0 on success else a negative error code. If stream is already fully
+ * closed and nothing is performed, it is considered as a success case.
+ */
+int qcs_attach_sc(struct qcs *qcs, struct buffer *buf, char fin)
 {
 	struct qcc *qcc = qcs->qcc;
 	struct session *sess = qcc->conn->owner;
 
+	TRACE_ENTER(QMUX_EV_STRM_RECV, qcc->conn, qcs);
+
+	if (qcs->st == QC_SS_CLO) {
+		TRACE_STATE("skip attach on already closed stream", QMUX_EV_STRM_RECV, qcc->conn, qcs);
+		goto out;
+	}
 
 	/* TODO duplicated from mux_h2 */
 	sess->t_idle = ns_to_ms(now_ns - sess->accept_ts) - sess->t_handshake;
 
-	if (!sc_new_from_endp(qcs->sd, sess, buf))
-		return NULL;
+	if (!sc_new_from_endp(qcs->sd, sess, buf)) {
+		TRACE_DEVEL("leaving on error", QMUX_EV_STRM_RECV, qcc->conn, qcs);
+		return -1;
+	}
 
 	/* QC_SF_HREQ_RECV must be set once for a stream. Else, nb_hreq counter
 	 * will be incorrect for the connection.
@@ -917,7 +968,9 @@ struct stconn *qcs_attach_sc(struct qcs *qcs, struct buffer *buf, char fin)
 		se_fl_set_error(qcs->sd);
 	}
 
-	return qcs->sd->sc;
+ out:
+	TRACE_LEAVE(QMUX_EV_STRM_RECV, qcc->conn, qcs);
+	return 0;
 }
 
 /* Use this function for a stream <id> which is not in <qcc> stream tree. It
@@ -1084,7 +1137,7 @@ static void qcs_consume(struct qcs *qcs, uint64_t bytes)
 		frm->max_data.max_data = qcc->lfctl.md;
 
 		LIST_APPEND(&qcs->qcc->lfctl.frms, &frm->list);
-		tasklet_wakeup(qcs->qcc->wait_event.tasklet);
+		tasklet_wakeup(qcc->wait_event.tasklet);
 	}
 
 	TRACE_LEAVE(QMUX_EV_QCS_RECV, qcc->conn, qcs);
@@ -1305,6 +1358,16 @@ static void qcc_notify_fctl(struct qcc *qcc)
 	}
 }
 
+/* Free <qcc> STREAM frames in Tx list. */
+static void qcc_clear_frms(struct qcc *qcc)
+{
+	TRACE_STATE("resetting STREAM frames list", QMUX_EV_QCC_SEND, qcc->conn);
+	while (!LIST_ISEMPTY(&qcc->tx.frms)) {
+		struct quic_frame *frm = LIST_ELEM(qcc->tx.frms.n, struct quic_frame *, list);
+		qc_frm_free(qcc->conn->handle.qc, &frm);
+	}
+}
+
 /* Prepare for the emission of RESET_STREAM on <qcs> with error code <err>. */
 void qcc_reset_stream(struct qcs *qcs, int err)
 {
@@ -1361,7 +1424,12 @@ void qcc_send_stream(struct qcs *qcs, int urg, int count)
 	/* Cannot send if already closed. */
 	BUG_ON(qcs_is_close_local(qcs));
 
+	qcc_clear_frms(qcc);
+
 	if (urg) {
+		/* qcc_emit_rs_ss() relies on resetted/aborted streams in send_list front. */
+		BUG_ON(!(qcs->flags & (QC_SF_TO_RESET|QC_SF_TO_STOP_SENDING|QC_SF_TXBUB_OOB)));
+
 		LIST_DEL_INIT(&qcs->el_send);
 		LIST_INSERT(&qcc->send_list, &qcs->el_send);
 	}
@@ -1406,27 +1474,12 @@ int qcc_install_app_ops(struct qcc *qcc, const struct qcc_app_ops *app_ops)
 	TRACE_ENTER(QMUX_EV_QCC_NEW, qcc->conn);
 
 	if (app_ops->init && !app_ops->init(qcc)) {
-		TRACE_ERROR("app ops init error", QMUX_EV_QCC_NEW, qcc->conn);
+		TRACE_ERROR("application layer install error", QMUX_EV_QCC_NEW, qcc->conn);
 		goto err;
 	}
 
-	TRACE_PROTO("application layer initialized", QMUX_EV_QCC_NEW, qcc->conn);
+	TRACE_PROTO("application layer installed", QMUX_EV_QCC_NEW, qcc->conn);
 	qcc->app_ops = app_ops;
-
-	/* RFC 9114 7.2.4.2. Initialization
-	 *
-	 * Endpoints MUST NOT require any data to be
-	 * received from the peer prior to sending the SETTINGS frame;
-	 * settings MUST be sent as soon as the transport is ready to
-	 * send data.
-	 */
-	if (qcc->app_ops->finalize) {
-		if (qcc->app_ops->finalize(qcc->ctx)) {
-			TRACE_ERROR("app ops finalize error", QMUX_EV_QCC_NEW, qcc->conn);
-			goto err;
-		}
-		tasklet_wakeup(qcc->wait_event.tasklet);
-	}
 
 	TRACE_LEAVE(QMUX_EV_QCC_NEW, qcc->conn);
 	return 0;
@@ -1576,6 +1629,7 @@ int qcc_recv(struct qcc *qcc, uint64_t id, uint64_t len, uint64_t offset,
 
 	if ((ncb_data(&qcs->rx.ncbuf, 0) && !(qcs->flags & QC_SF_DEM_FULL)) || fin) {
 		qcc_decode_qcs(qcc, qcs);
+		LIST_DEL_INIT(&qcs->el_recv);
 		qcc_refresh_timeout(qcc);
 	}
 
@@ -1595,6 +1649,7 @@ int qcc_recv(struct qcc *qcc, uint64_t id, uint64_t len, uint64_t offset,
  */
 int qcc_recv_max_data(struct qcc *qcc, uint64_t max)
 {
+	const int blocked_soft = qfctl_sblocked(&qcc->tx.fc);
 	int unblock_soft = 0, unblock_real = 0;
 
 	TRACE_ENTER(QMUX_EV_QCC_RECV, qcc->conn);
@@ -1608,6 +1663,13 @@ int qcc_recv_max_data(struct qcc *qcc, uint64_t max)
 
 		if (unblock_soft)
 			qcc_notify_fctl(qcc);
+
+		/* Refresh frms list only if this would result in newer data :
+		 * a. flow-control is not real blocked
+		 * b. soft off was equal or greater than previous limit
+		 */
+		if (!qfctl_rblocked(&qcc->tx.fc) && blocked_soft)
+			qcc_clear_frms(qcc);
 	}
 
 	TRACE_LEAVE(QMUX_EV_QCC_RECV, qcc->conn);
@@ -1643,6 +1705,7 @@ int qcc_recv_max_stream_data(struct qcc *qcc, uint64_t id, uint64_t max)
 		goto err;
 
 	if (qcs) {
+		const int blocked_soft = qfctl_sblocked(&qcs->tx.fc);
 		int unblock_soft = 0, unblock_real = 0;
 
 		TRACE_PROTO("receiving MAX_STREAM_DATA", QMUX_EV_QCC_RECV|QMUX_EV_QCS_RECV, qcc->conn, qcs);
@@ -1657,6 +1720,10 @@ int qcc_recv_max_stream_data(struct qcc *qcc, uint64_t id, uint64_t max)
 				tot_time_stop(&qcs->timer.fctl);
 				qcs_notify_send(qcs);
 			}
+
+			/* Same refresh condition as qcc_recv_max_data(). */
+			if (!qfctl_rblocked(&qcs->tx.fc) && blocked_soft)
+				qcc_clear_frms(qcc);
 		}
 	}
 
@@ -2070,18 +2137,26 @@ static int qcc_subscribe_send(struct qcc *qcc)
 /* Wrapper for send on transport layer. Send a list of frames <frms> for the
  * connection <qcc>.
  *
- * Returns 0 if all data sent with success else non-zero.
+ * Returns 0 if all data sent with success. On fatal error, a negative error
+ * code is returned. A positive 1 is used if emission should be paced.
  */
-static int qcc_send_frames(struct qcc *qcc, struct list *frms)
+static int qcc_send_frames(struct qcc *qcc, struct list *frms, int stream)
 {
+	enum quic_tx_err ret;
+	struct quic_pacer *pacer = NULL;
+
 	TRACE_ENTER(QMUX_EV_QCC_SEND, qcc->conn);
 
 	if (LIST_ISEMPTY(frms)) {
 		TRACE_DEVEL("leaving on no frame to send", QMUX_EV_QCC_SEND, qcc->conn);
-		return 1;
+		return -1;
 	}
 
-	if (!qc_send_mux(qcc->conn->handle.qc, frms)) {
+	if (stream && qcc_is_pacing_active(qcc->conn))
+		pacer = &qcc->tx.pacer;
+
+	ret = qc_send_mux(qcc->conn->handle.qc, frms, pacer);
+	if (ret == QUIC_TX_ERR_FATAL) {
 		TRACE_DEVEL("error on sending", QMUX_EV_QCC_SEND, qcc->conn);
 		qcc_subscribe_send(qcc);
 		goto err;
@@ -2090,18 +2165,18 @@ static int qcc_send_frames(struct qcc *qcc, struct list *frms)
 	/* If there is frames left at this stage, transport layer is blocked.
 	 * Subscribe on it to retry later.
 	 */
-	if (!LIST_ISEMPTY(frms)) {
+	if (!LIST_ISEMPTY(frms) && ret != QUIC_TX_ERR_PACING) {
 		TRACE_DEVEL("remaining frames to send", QMUX_EV_QCC_SEND, qcc->conn);
 		qcc_subscribe_send(qcc);
 		goto err;
 	}
 
 	TRACE_LEAVE(QMUX_EV_QCC_SEND, qcc->conn);
-	return 0;
+	return ret == QUIC_TX_ERR_PACING ? 1 : 0;
 
  err:
 	TRACE_DEVEL("leaving on error", QMUX_EV_QCC_SEND, qcc->conn);
-	return 1;
+	return -1;
 }
 
 /* Emit a RESET_STREAM on <qcs>.
@@ -2126,7 +2201,7 @@ static int qcs_send_reset(struct qcs *qcs)
 	frm->reset_stream.final_size = qcs->tx.fc.off_real;
 
 	LIST_APPEND(&frms, &frm->list);
-	if (qcc_send_frames(qcs->qcc, &frms)) {
+	if (qcc_send_frames(qcs->qcc, &frms, 0)) {
 		if (!LIST_ISEMPTY(&frms))
 			qc_frm_free(qcs->qcc->conn->handle.qc, &frm);
 		TRACE_DEVEL("cannot send RESET_STREAM", QMUX_EV_QCS_SEND, qcs->qcc->conn, qcs);
@@ -2177,7 +2252,7 @@ static int qcs_send_stop_sending(struct qcs *qcs)
 	frm->stop_sending.app_error_code = qcs->err;
 
 	LIST_APPEND(&frms, &frm->list);
-	if (qcc_send_frames(qcs->qcc, &frms)) {
+	if (qcc_send_frames(qcs->qcc, &frms, 0)) {
 		if (!LIST_ISEMPTY(&frms))
 			qc_frm_free(qcc->conn->handle.qc, &frm);
 		TRACE_DEVEL("cannot send STOP_SENDING", QMUX_EV_QCS_SEND, qcs->qcc->conn, qcs);
@@ -2237,6 +2312,195 @@ static int qcs_send(struct qcs *qcs, struct list *frms, uint64_t window_conn)
 	return -1;
 }
 
+/* Send RESET_STREAM/STOP_SENDING for streams in <qcc> send_list if requested.
+ * Each frame is encoded and emitted separately for now. If a frame cannot be
+ * sent, send_list looping is interrupted.
+ *
+ * Returns 0 on success else non-zero.
+ */
+static int qcc_emit_rs_ss(struct qcc *qcc)
+{
+	struct qcs *qcs, *qcs_tmp;
+
+	TRACE_ENTER(QMUX_EV_QCC_END, qcc->conn);
+
+	list_for_each_entry_safe(qcs, qcs_tmp, &qcc->send_list, el_send) {
+		/* Stream must not be present in send_list if it has nothing to send. */
+		BUG_ON(!(qcs->flags & (QC_SF_FIN_STREAM|QC_SF_TO_STOP_SENDING|QC_SF_TO_RESET)) &&
+		       (!qcs->stream || !qcs_prep_bytes(qcs)));
+
+		/* Interrupt looping for the first stream where no RS nor SS is
+		 * necessary and is not use for "metadata" transfer. These
+		 * streams are always in front of the send_list.
+		 */
+		if (!(qcs->flags & (QC_SF_TO_STOP_SENDING|QC_SF_TO_RESET|QC_SF_TXBUB_OOB)))
+			break;
+
+		TRACE_DATA("prepare for RS/SS transfer", QMUX_EV_QCC_SEND, qcc->conn, qcs);
+
+		/* Each RS and SS frame is sent individually. Necessary to
+		 * ensure it has been emitted as there is no transport callback
+		 * for now.
+		 *
+		 * TODO multiplex frames to optimize sending. However, it may
+		 * not be advisable to mix different streams in the same dgram
+		 * to avoid interdependency in case of loss.
+		 */
+
+		if (qcs->flags & QC_SF_TO_STOP_SENDING) {
+			if (qcs_send_stop_sending(qcs))
+				goto err;
+
+			/* Remove stream from send_list if only SS was necessary. */
+			if (!(qcs->flags & (QC_SF_FIN_STREAM|QC_SF_TO_RESET)) &&
+			    (!qcs->stream || !qcs_prep_bytes(qcs))) {
+				LIST_DEL_INIT(&qcs->el_send);
+				continue;
+			}
+		}
+
+		if (qcs->flags & QC_SF_TO_RESET) {
+			if (qcs_send_reset(qcs))
+				goto err;
+
+			/* RFC 9000 3.3. Permitted Frame Types
+			 *
+			 * A sender MUST NOT send
+			 * a STREAM or STREAM_DATA_BLOCKED frame for a stream in the
+			 * "Reset Sent" state or any terminal state -- that is, after
+			 * sending a RESET_STREAM frame.
+			 */
+			LIST_DEL_INIT(&qcs->el_send);
+			if (qcs_is_completed(qcs)) {
+				TRACE_STATE("add stream in purg_list", QMUX_EV_QCC_SEND|QMUX_EV_QCS_SEND, qcc->conn, qcs);
+				LIST_APPEND(&qcc->purg_list, &qcs->el_send);
+			}
+			continue;
+		}
+	}
+
+	TRACE_LEAVE(QMUX_EV_QCC_SEND, qcc->conn);
+	return 0;
+
+ err:
+	TRACE_DEVEL("leaving on error", QMUX_EV_QCC_SEND, qcc->conn);
+	return 1;
+}
+
+/* Encode STREAM frames into <qcc> tx frms for streams registered into
+ * send_list. On each error, related stream is removed from send_list and
+ * inserted into <qcs_failed> list.
+ *
+ * This functions also serves to emit RESET_STREAM and STOP_SENDING frames. In
+ * this case, frame is emitted immediately without using <qcc> tx frms. If an
+ * error occured during this step, this is considered as fatal. Tx frms is
+ * cleared and 0 is returned.
+ *
+ * Returns the sum of encoded payload STREAM frames length. Note that 0 can be
+ * returned either if no frame was built or only empty payload frames were
+ * encoded.
+ */
+static int qcc_build_frms(struct qcc *qcc, struct list *qcs_failed)
+{
+	struct list *frms = &qcc->tx.frms;
+	struct qcs *qcs, *qcs_tmp, *first_qcs = NULL;
+	uint64_t window_conn = qfctl_rcap(&qcc->tx.fc);
+	int ret = 0, total = 0;
+
+	TRACE_ENTER(QMUX_EV_QCC_END, qcc->conn);
+
+	/* Frames list must first be cleared via qcc_clear_frms(). */
+	BUG_ON(!LIST_ISEMPTY(&qcc->tx.frms));
+
+	list_for_each_entry_safe(qcs, qcs_tmp, &qcc->send_list, el_send) {
+		/* Check if all QCS were processed. */
+		if (qcs == first_qcs)
+			break;
+
+		TRACE_DATA("prepare for data transfer", QMUX_EV_QCC_SEND, qcc->conn, qcs);
+
+		/* Streams with RS/SS must be handled via qcc_emit_rs_ss(). */
+		BUG_ON(qcs->flags & (QC_SF_TO_STOP_SENDING|QC_SF_TO_RESET));
+		/* Stream must not be present in send_list if it has nothing to send. */
+		BUG_ON(!(qcs->flags & QC_SF_FIN_STREAM) && (!qcs->stream || !qcs_prep_bytes(qcs)));
+
+		/* Total sent bytes must not exceed connection window. */
+		BUG_ON(total > window_conn);
+
+		if (!qfctl_rblocked(&qcc->tx.fc) &&
+		    !qfctl_rblocked(&qcs->tx.fc) && window_conn > total) {
+			if ((ret = qcs_send(qcs, frms, window_conn - total)) < 0) {
+				/* Temporarily remove QCS from send-list. */
+				LIST_DEL_INIT(&qcs->el_send);
+				LIST_APPEND(qcs_failed, &qcs->el_send);
+				continue;
+			}
+
+			total += ret;
+			if (ret) {
+				/* Move QCS with some bytes transferred at the
+				 * end of send-list for next iterations.
+				 */
+				LIST_DEL_INIT(&qcs->el_send);
+				LIST_APPEND(&qcc->send_list, &qcs->el_send);
+				/* Remember first moved QCS as checkpoint to interrupt loop */
+				if (!first_qcs)
+					first_qcs = qcs;
+			}
+		}
+	}
+
+	TRACE_LEAVE(QMUX_EV_QCC_SEND, qcc->conn);
+	return total;
+}
+
+/* Schedule <qcc> after emission was interrupted on pacing. */
+static void qcc_wakeup_pacing(struct qcc *qcc)
+{
+	/* Sleep to be able to reemit at least a single packet */
+	const int inter = qcc->tx.pacer.cc->algo->pacing_inter(qcc->tx.pacer.cc);
+	/* Convert nano to milliseconds rounded up, with 1ms as minimal value. */
+	const int expire = MAX((inter + 999999) / 1000000, 1);
+	qcc->pacing_task->expire = tick_add_ifset(now_ms, MS_TO_TICKS(expire));
+	++qcc->tx.paced_sent_ctr;
+}
+
+/* Conduct I/O operations to finalize <qcc> app layer initialization. Note that
+ * <qcc> app state may remain NULL even on success, if only a transient
+ * blocking was encountered. Finalize operation can be retry later.
+ *
+ * Returns 0 on success else non-zero.
+ */
+static int qcc_app_init(struct qcc *qcc)
+{
+	int ret;
+
+	TRACE_ENTER(QMUX_EV_QCC_SEND, qcc->conn);
+
+	if (qcc->app_ops->finalize) {
+		ret = qcc->app_ops->finalize(qcc->ctx);
+		if (ret < 0) {
+			TRACE_ERROR("app ops finalize error", QMUX_EV_QCC_NEW, qcc->conn);
+			goto err;
+		}
+
+		if (ret) {
+			TRACE_STATE("cannot finalize app ops yet", QMUX_EV_QCC_NEW, qcc->conn);
+			goto again;
+		}
+	}
+
+	qcc->app_st = QCC_APP_ST_INIT;
+
+ again:
+	TRACE_LEAVE(QMUX_EV_QCC_SEND, qcc->conn);
+	return 0;
+
+ err:
+	TRACE_DEVEL("leaving on error", QMUX_EV_QCC_SEND, qcc->conn);
+	return 1;
+}
+
 /* Proceed to sending. Loop through all available streams for the <qcc>
  * instance and try to send as much as possible.
  *
@@ -2244,14 +2508,19 @@ static int qcs_send(struct qcs *qcs, struct list *frms, uint64_t window_conn)
  */
 static int qcc_io_send(struct qcc *qcc)
 {
-	struct list frms = LIST_HEAD_INIT(frms);
+	struct list *frms = &qcc->tx.frms;
 	/* Temporary list for QCS on error. */
 	struct list qcs_failed = LIST_HEAD_INIT(qcs_failed);
-	struct qcs *qcs, *qcs_tmp, *first_qcs = NULL;
+	struct qcs *qcs, *qcs_tmp;
 	uint64_t window_conn = qfctl_rcap(&qcc->tx.fc);
-	int ret, total = 0, resent;
+	int ret = 0, total = 0, resent;
 
 	TRACE_ENTER(QMUX_EV_QCC_SEND, qcc->conn);
+
+	if (qcc_is_pacing_active(qcc->conn)) {
+		/* Always reset pacing_task timer to prevent unnecessary execution. */
+		qcc->pacing_task->expire = TICK_ETERNITY;
+	}
 
 	/* TODO if socket in transient error, sending should be temporarily
 	 * disabled for all frames. However, checking for send subscription is
@@ -2282,87 +2551,42 @@ static int qcc_io_send(struct qcc *qcc)
 		goto out;
 	}
 
+	if (qcc->app_st < QCC_APP_ST_INIT) {
+		if (qcc_app_init(qcc))
+			goto out;
+	}
+
 	if (!LIST_ISEMPTY(&qcc->lfctl.frms)) {
-		if (qcc_send_frames(qcc, &qcc->lfctl.frms)) {
+		if (qcc_send_frames(qcc, &qcc->lfctl.frms, 0)) {
 			TRACE_DEVEL("flow-control frames rejected by transport, aborting send", QMUX_EV_QCC_SEND, qcc->conn);
 			goto out;
 		}
 	}
 
-	/* Send STREAM/STOP_SENDING/RESET_STREAM data for registered streams. */
-	list_for_each_entry_safe(qcs, qcs_tmp, &qcc->send_list, el_send) {
-		/* Check if all QCS were processed. */
-		if (qcs == first_qcs)
-			break;
+	if (qcc_emit_rs_ss(qcc)) {
+		TRACE_DEVEL("emission interrupted on STOP_SENDING/RESET_STREAM send error", QMUX_EV_QCC_SEND, qcc->conn);
+		goto out;
+	}
 
-		/* Stream must not be present in send_list if it has nothing to send. */
-		BUG_ON(!(qcs->flags & (QC_SF_FIN_STREAM|QC_SF_TO_STOP_SENDING|QC_SF_TO_RESET)) &&
-		       (!qcs->stream || !qcs_prep_bytes(qcs)));
+	/* Encode new STREAM frames if list has been previously cleared. */
+	if (LIST_ISEMPTY(frms) && !LIST_ISEMPTY(&qcc->send_list)) {
+		total = qcc_build_frms(qcc, &qcs_failed);
+		if (LIST_ISEMPTY(frms))
+			goto out;
+	}
 
-		/* Each STOP_SENDING/RESET_STREAM frame is sent individually to
-		 * guarantee its emission.
-		 *
-		 * TODO multiplex several frames in same datagram to optimize sending
-		 */
-		if (qcs->flags & QC_SF_TO_STOP_SENDING) {
-			if (qcs_send_stop_sending(qcs))
-				goto sent_done;
-
-			/* Remove stream from send_list if it had only STOP_SENDING
-			 * to send.
-			 */
-			if (!(qcs->flags & (QC_SF_FIN_STREAM|QC_SF_TO_RESET)) &&
-			    (!qcs->stream || !qcs_prep_bytes(qcs))) {
-				LIST_DEL_INIT(&qcs->el_send);
-				continue;
-			}
-		}
-
-		if (qcs->flags & QC_SF_TO_RESET) {
-			if (qcs_send_reset(qcs))
-				goto sent_done;
-
-			/* RFC 9000 3.3. Permitted Frame Types
-			 *
-			 * A sender MUST NOT send
-			 * a STREAM or STREAM_DATA_BLOCKED frame for a stream in the
-			 * "Reset Sent" state or any terminal state -- that is, after
-			 * sending a RESET_STREAM frame.
-			 */
-			LIST_DEL_INIT(&qcs->el_send);
-			continue;
-		}
-
-		/* Total sent bytes must not exceed connection window. */
-		BUG_ON(total > window_conn);
-
-		if (!qfctl_rblocked(&qcc->tx.fc) &&
-		    !qfctl_rblocked(&qcs->tx.fc) && window_conn > total) {
-			if ((ret = qcs_send(qcs, &frms, window_conn - total)) < 0) {
-				/* Temporarily remove QCS from send-list. */
-				LIST_DEL_INIT(&qcs->el_send);
-				LIST_APPEND(&qcs_failed, &qcs->el_send);
-				continue;
-			}
-
-			total += ret;
-			if (ret) {
-				/* Move QCS with some bytes transferred at the
-				 * end of send-list for next iterations.
-				 */
-				LIST_DEL_INIT(&qcs->el_send);
-				LIST_APPEND(&qcc->send_list, &qcs->el_send);
-				/* Remember first moved QCS as checkpoint to interrupt loop */
-				if (!first_qcs)
-					first_qcs = qcs;
-			}
+	if (!LIST_ISEMPTY(frms) && qcc_is_pacing_active(qcc->conn)) {
+		if (!quic_pacing_reload(&qcc->tx.pacer)) {
+			qcc_wakeup_pacing(qcc);
+			total = 0;
+			goto out;
 		}
 	}
 
 	/* Retry sending until no frame to send, data rejected or connection
 	 * flow-control limit reached.
 	 */
-	while (qcc_send_frames(qcc, &frms) == 0 && !qfctl_rblocked(&qcc->tx.fc)) {
+	while ((ret = qcc_send_frames(qcc, frms, 1)) == 0 && !qfctl_rblocked(&qcc->tx.fc)) {
 		window_conn = qfctl_rcap(&qcc->tx.fc);
 		resent = 0;
 
@@ -2380,7 +2604,7 @@ static int qcc_io_send(struct qcc *qcc)
 			BUG_ON(resent > window_conn);
 
 			if (!qfctl_rblocked(&qcs->tx.fc) && window_conn > resent) {
-				if ((ret = qcs_send(qcs, &frms, window_conn - resent)) < 0) {
+				if ((ret = qcs_send(qcs, frms, window_conn - resent)) < 0) {
 					LIST_DEL_INIT(&qcs->el_send);
 					LIST_APPEND(&qcs_failed, &qcs->el_send);
 					continue;
@@ -2392,15 +2616,13 @@ static int qcc_io_send(struct qcc *qcc)
 		}
 	}
 
- sent_done:
-	/* Deallocate frames that the transport layer has rejected. */
-	if (!LIST_ISEMPTY(&frms)) {
-		struct quic_frame *frm, *frm2;
-
-		list_for_each_entry_safe(frm, frm2, &frms, list)
-			qc_frm_free(qcc->conn->handle.qc, &frm);
+	if (ret == 1) {
+		/* qcc_send_frames cannot return 1 if pacing not used. */
+		BUG_ON(!qcc_is_pacing_active(qcc->conn));
+		qcc_wakeup_pacing(qcc);
 	}
 
+ out:
 	/* Re-insert on-error QCS at the end of the send-list. */
 	if (!LIST_ISEMPTY(&qcs_failed)) {
 		list_for_each_entry_safe(qcs, qcs_tmp, &qcs_failed, el_send) {
@@ -2412,7 +2634,6 @@ static int qcc_io_send(struct qcc *qcc)
 			tasklet_wakeup(qcc->wait_event.tasklet);
 	}
 
- out:
 	if (qcc->conn->flags & CO_FL_ERROR && !(qcc->flags & QC_CF_ERR_CONN)) {
 		TRACE_ERROR("error reported by transport layer",
 		            QMUX_EV_QCC_SEND, qcc->conn);
@@ -2423,14 +2644,46 @@ static int qcc_io_send(struct qcc *qcc)
 	return total;
 }
 
-/* Proceed on receiving. Loop through all streams from <qcc> and use decode_qcs
- * operation.
+/* Detects QUIC handshake completion. Any SE_FL_WAIT_FOR_HS streams are woken
+ * up if wait-for-handshake is active.
+ */
+static void qcc_wait_for_hs(struct qcc *qcc)
+{
+	struct connection *conn = qcc->conn;
+	struct quic_conn *qc = conn->handle.qc;
+	struct eb64_node *node;
+	struct qcs *qcs;
+
+	TRACE_ENTER(QMUX_EV_QCC_RECV, qcc->conn);
+
+	if (qc->state >= QUIC_HS_ST_COMPLETE) {
+		if (conn->flags & CO_FL_EARLY_SSL_HS) {
+			TRACE_STATE("mark early data as ready", QMUX_EV_QCC_WAKE, conn);
+			conn->flags &= ~CO_FL_EARLY_SSL_HS;
+		}
+
+		/* wake-up any stream blocked on early data transfer */
+		node = eb64_first(&qcc->streams_by_id);
+		while (node) {
+			qcs = container_of(node, struct qcs, by_id);
+			if (se_fl_test(qcs->sd, SE_FL_WAIT_FOR_HS))
+				qcs_notify_recv(qcs);
+			node = eb64_next(node);
+		}
+
+		qcc->flags &= ~QC_CF_WAIT_HS;
+	}
+
+	TRACE_LEAVE(QMUX_EV_QCC_RECV, qcc->conn);
+}
+
+/* Proceed on receiving. Loop on streams subscribed in recv_list and performed
+ * STREAM frames decoding upon them.
  *
  * Returns 0 on success else non-zero.
  */
 static int qcc_io_recv(struct qcc *qcc)
 {
-	struct eb64_node *node;
 	struct qcs *qcs;
 
 	TRACE_ENTER(QMUX_EV_QCC_RECV, qcc->conn);
@@ -2441,25 +2694,15 @@ static int qcc_io_recv(struct qcc *qcc)
 		return 0;
 	}
 
-	node = eb64_first(&qcc->streams_by_id);
-	while (node) {
-		uint64_t id;
+	if ((qcc->flags & QC_CF_WAIT_HS) && !(qcc->wait_event.events & SUB_RETRY_RECV))
+		qcc_wait_for_hs(qcc);
 
-		qcs = eb64_entry(node, struct qcs, by_id);
-		id = qcs->id;
-
-		if (!ncb_data(&qcs->rx.ncbuf, 0) || (qcs->flags & QC_SF_DEM_FULL)) {
-			node = eb64_next(node);
-			continue;
-		}
-
-		if (quic_stream_is_uni(id) && quic_stream_is_local(qcc, id)) {
-			node = eb64_next(node);
-			continue;
-		}
-
+	while (!LIST_ISEMPTY(&qcc->recv_list)) {
+		qcs = LIST_ELEM(qcc->recv_list.n, struct qcs *, el_recv);
+		/* No need to add an uni local stream in recv_list. */
+		BUG_ON(quic_stream_is_uni(qcs->id) && quic_stream_is_local(qcc, qcs->id));
 		qcc_decode_qcs(qcc, qcs);
-		node = eb64_next(node);
+		LIST_DEL_INIT(&qcs->el_recv);
 	}
 
 	TRACE_LEAVE(QMUX_EV_QCC_RECV, qcc->conn);
@@ -2467,48 +2710,27 @@ static int qcc_io_recv(struct qcc *qcc)
 }
 
 
-/* Release all streams which have their transfer operation achieved.
- *
- * Returns true if at least one stream is released.
- */
-static int qcc_purge_streams(struct qcc *qcc)
+/* Release all streams which have their transfer operation achieved. */
+static void qcc_purge_streams(struct qcc *qcc)
 {
-	struct eb64_node *node;
-	int release = 0;
+	struct qcs *qcs;
 
 	TRACE_ENTER(QMUX_EV_QCC_WAKE, qcc->conn);
 
-	node = eb64_first(&qcc->streams_by_id);
-	while (node) {
-		struct qcs *qcs = eb64_entry(node, struct qcs, by_id);
-		node = eb64_next(node);
+	while (!LIST_ISEMPTY(&qcc->purg_list)) {
+		qcs = LIST_ELEM(qcc->purg_list.n, struct qcs *, el_send);
 
-		/* Release not attached closed streams. */
-		if (qcs->st == QC_SS_CLO && !qcs_sc(qcs)) {
-			TRACE_STATE("purging closed stream", QMUX_EV_QCC_WAKE, qcs->qcc->conn, qcs);
-			qcs_destroy(qcs);
-			release = 1;
-			continue;
-		}
-
-		/* Release detached streams with empty buffer. */
-		if (qcs->flags & QC_SF_DETACH) {
-			if (qcs_is_close_local(qcs)) {
-				TRACE_STATE("purging detached stream", QMUX_EV_QCC_WAKE, qcs->qcc->conn, qcs);
-				qcs_destroy(qcs);
-				release = 1;
-				continue;
-			}
-		}
+		TRACE_STATE("purging stream", QMUX_EV_QCC_WAKE, qcs->qcc->conn, qcs);
+		BUG_ON_HOT(!qcs_is_completed(qcs));
+		qcs_destroy(qcs);
 	}
 
 	TRACE_LEAVE(QMUX_EV_QCC_WAKE, qcc->conn);
-	return release;
 }
 
 /* Execute application layer shutdown. If this operation is not defined, a
  * CONNECTION_CLOSE will be prepared as a fallback. This function is protected
- * against multiple invocation with the flag QC_CF_APP_SHUT.
+ * against multiple invocation thanks to <qcc> application state context.
  */
 static void qcc_shutdown(struct qcc *qcc)
 {
@@ -2519,7 +2741,7 @@ static void qcc_shutdown(struct qcc *qcc)
 		goto out;
 	}
 
-	if (qcc->flags & QC_CF_APP_SHUT)
+	if (qcc->app_st >= QCC_APP_ST_SHUT)
 		goto out;
 
 	TRACE_STATE("perform graceful shutdown", QMUX_EV_QCC_END, qcc->conn);
@@ -2542,7 +2764,7 @@ static void qcc_shutdown(struct qcc *qcc)
 		qcc->conn->handle.qc->err = qcc->err;
 
  out:
-	qcc->flags |= QC_CF_APP_SHUT;
+	qcc->app_st = QCC_APP_ST_SHUT;
 	TRACE_LEAVE(QMUX_EV_QCC_END, qcc->conn);
 }
 
@@ -2573,44 +2795,6 @@ static int qcc_wake_some_streams(struct qcc *qcc)
 	return 0;
 }
 
-/* Checks whether QUIC handshake is still active or not. This is necessary to
- * mark that connection may convey early data to delay stream processing if
- * wait-for-handshake is active. On handshake completion, any SE_FL_WAIT_FOR_HS
- * streams are woken up to restart their processing.
- */
-static void qcc_wait_for_hs(struct qcc *qcc)
-{
-	struct connection *conn = qcc->conn;
-	struct quic_conn *qc = conn->handle.qc;
-	struct eb64_node *node;
-	struct qcs *qcs;
-
-	if (qc->state < QUIC_HS_ST_COMPLETE) {
-		if (!(conn->flags & CO_FL_EARLY_SSL_HS)) {
-			TRACE_STATE("flag connection with early data", QMUX_EV_QCC_WAKE, conn);
-			conn->flags |= CO_FL_EARLY_SSL_HS;
-			/* subscribe for handshake completion */
-			conn->xprt->subscribe(conn, conn->xprt_ctx, SUB_RETRY_RECV,
-			                      &qcc->wait_event);
-		}
-	}
-	else {
-		if (conn->flags & CO_FL_EARLY_SSL_HS) {
-			TRACE_STATE("mark early data as ready", QMUX_EV_QCC_WAKE, conn);
-			conn->flags &= ~CO_FL_EARLY_SSL_HS;
-		}
-		qcc->flags |= QC_CF_WAIT_FOR_HS;
-
-		node = eb64_first(&qcc->streams_by_id);
-		while (node) {
-			qcs = container_of(node, struct qcs, by_id);
-			if (se_fl_test(qcs->sd, SE_FL_WAIT_FOR_HS))
-				qcs_notify_recv(qcs);
-			node = eb64_next(node);
-		}
-	}
-}
-
 /* Conduct operations which should be made for <qcc> connection after
  * input/output. Most notably, closed streams are purged which may leave the
  * connection has ready to be released.
@@ -2619,10 +2803,8 @@ static void qcc_wait_for_hs(struct qcc *qcc)
  */
 static int qcc_io_process(struct qcc *qcc)
 {
-	qcc_purge_streams(qcc);
-
-	if (!(qcc->flags & QC_CF_WAIT_FOR_HS))
-		qcc_wait_for_hs(qcc);
+	if (!LIST_ISEMPTY(&qcc->purg_list))
+		qcc_purge_streams(qcc);
 
 	/* Check if a soft-stop is in progress.
 	 *
@@ -2683,6 +2865,8 @@ static void qcc_release(struct qcc *qcc)
 
 	TRACE_ENTER(QMUX_EV_QCC_END, conn);
 
+	task_destroy(qcc->pacing_task);
+
 	if (qcc->task) {
 		task_destroy(qcc->task);
 		qcc->task = NULL;
@@ -2719,6 +2903,8 @@ static void qcc_release(struct qcc *qcc)
 		qc_frm_free(qcc->conn->handle.qc, &frm);
 	}
 
+	qcc_clear_frms(qcc);
+
 	if (qcc->app_ops && qcc->app_ops->release)
 		qcc->app_ops->release(qcc->ctx);
 	TRACE_PROTO("application layer released", QMUX_EV_QCC_END, conn);
@@ -2728,7 +2914,6 @@ static void qcc_release(struct qcc *qcc)
 	if (conn) {
 		LIST_DEL_INIT(&conn->stopping_list);
 
-		conn->handle.qc->conn = NULL;
 		conn->mux = NULL;
 		conn->ctx = NULL;
 
@@ -2762,15 +2947,44 @@ struct task *qcc_io_cb(struct task *t, void *ctx, unsigned int status)
 
 	qcc_refresh_timeout(qcc);
 
- end:
+	/* Trigger pacing task is emission should be retried after some delay. */
+	if (qcc_is_pacing_active(qcc->conn)) {
+		if (tick_isset(qcc->pacing_task->expire))
+			task_queue(qcc->pacing_task);
+	}
+
 	TRACE_LEAVE(QMUX_EV_QCC_WAKE, qcc->conn);
+
 	return NULL;
 
  release:
 	qcc_shutdown(qcc);
 	qcc_release(qcc);
+
 	TRACE_LEAVE(QMUX_EV_QCC_WAKE);
+
 	return NULL;
+}
+
+static struct task *qcc_pacing_task(struct task *t, void *ctx, unsigned int state)
+{
+	struct qcc *qcc = ctx;
+	int expired = tick_is_expired(t->expire, now_ms);
+
+	TRACE_ENTER(QMUX_EV_QCC_WAKE, qcc->conn);
+
+	if (!expired) {
+		if (!tick_isset(t->expire))
+			TRACE_DEVEL("cancelled pacing task", QMUX_EV_QCC_WAKE, qcc->conn);
+		goto requeue;
+	}
+
+	/* Reschedule I/O immediately. */
+	tasklet_wakeup_after(NULL, qcc->wait_event.tasklet);
+
+ requeue:
+	TRACE_LEAVE(QMUX_EV_QCC_WAKE, qcc->conn);
+	return t;
 }
 
 static struct task *qcc_timeout_task(struct task *t, void *ctx, unsigned int state)
@@ -2827,11 +3041,13 @@ static struct task *qcc_timeout_task(struct task *t, void *ctx, unsigned int sta
 static void _qcc_init(struct qcc *qcc)
 {
 	qcc->conn = NULL;
+	qcc->pacing_task = NULL;
 	qcc->task = NULL;
 	qcc->wait_event.tasklet = NULL;
 	qcc->app_ops = NULL;
 	qcc->streams_by_id = EB_ROOT_UNIQUE;
 	LIST_INIT(&qcc->lfctl.frms);
+	LIST_INIT(&qcc->tx.frms);
 }
 
 static int qmux_init(struct connection *conn, struct proxy *prx,
@@ -2852,6 +3068,7 @@ static int qmux_init(struct connection *conn, struct proxy *prx,
 	conn->ctx = qcc;
 	qcc->nb_hreq = qcc->nb_sc = 0;
 	qcc->flags = 0;
+	qcc->app_st = QCC_APP_ST_NULL;
 	qcc->glitches = 0;
 	qcc->err = quic_err_transport(QC_ERR_NO_ERROR);
 
@@ -2876,6 +3093,22 @@ static int qmux_init(struct connection *conn, struct proxy *prx,
 
 	qcc->tx.buf_in_flight = 0;
 
+	if (qcc_is_pacing_active(conn)) {
+		quic_pacing_init(&qcc->tx.pacer, &conn->handle.qc->path->cc);
+		qcc->tx.paced_sent_ctr = 0;
+
+		/* Initialize pacing_task. */
+		qcc->pacing_task = task_new_here();
+		if (!qcc->pacing_task) {
+			TRACE_ERROR("pacing task alloc failure", QMUX_EV_QCC_NEW);
+			goto err;
+		}
+		qcc->pacing_task->process = qcc_pacing_task;
+		qcc->pacing_task->context = qcc;
+		qcc->pacing_task->expire = TICK_ETERNITY;
+		qcc->pacing_task->state |= TASK_F_WANTS_TIME;
+	}
+
 	if (conn_is_back(conn)) {
 		qcc->next_bidi_l    = 0x00;
 		qcc->largest_bidi_r = 0x01;
@@ -2895,12 +3128,15 @@ static int qmux_init(struct connection *conn, struct proxy *prx,
 		goto err;
 	}
 
+	LIST_INIT(&qcc->recv_list);
 	LIST_INIT(&qcc->send_list);
 	LIST_INIT(&qcc->fctl_list);
 	LIST_INIT(&qcc->buf_wait_list);
+	LIST_INIT(&qcc->purg_list);
 
 	qcc->wait_event.tasklet->process = qcc_io_cb;
 	qcc->wait_event.tasklet->context = qcc;
+	qcc->wait_event.tasklet->state  |= TASK_F_WANTS_TIME;
 	qcc->wait_event.events = 0;
 
 	qcc->proxy = prx;
@@ -2951,6 +3187,21 @@ static int qmux_init(struct connection *conn, struct proxy *prx,
 	/* init read cycle */
 	tasklet_wakeup(qcc->wait_event.tasklet);
 
+	/* MUX is initialized before QUIC handshake completion if early data
+	 * received. Flag connection to delay stream processing if
+	 * wait-for-handshake is active.
+	 */
+	if (conn->handle.qc->state < QUIC_HS_ST_COMPLETE) {
+		if (!(conn->flags & CO_FL_EARLY_SSL_HS)) {
+			TRACE_STATE("flag connection with early data", QMUX_EV_QCC_WAKE, conn);
+			conn->flags |= CO_FL_EARLY_SSL_HS;
+			/* subscribe for handshake completion */
+			conn->xprt->subscribe(conn, conn->xprt_ctx, SUB_RETRY_RECV,
+			                      &qcc->wait_event);
+			qcc->flags |= QC_CF_WAIT_HS;
+		}
+	}
+
 	TRACE_LEAVE(QMUX_EV_QCC_NEW, conn);
 	return 0;
 
@@ -2966,6 +3217,7 @@ static int qmux_init(struct connection *conn, struct proxy *prx,
 		/* In case of MUX init failure, session will ensure connection is freed. */
 		qcc->conn = NULL;
 		qcc_release(qcc);
+		conn->ctx = NULL;
 	}
 
 	TRACE_DEVEL("leaving on error", QMUX_EV_QCC_NEW, conn);
@@ -3094,8 +3346,10 @@ static size_t qmux_strm_rcv_buf(struct stconn *sc, struct buffer *buf,
 		BUG_ON(!ncb_data(&qcs->rx.ncbuf, 0));
 
 		qcs->flags &= ~QC_SF_DEM_FULL;
-		if (!(qcc->flags & QC_CF_ERRL))
+		if (!(qcc->flags & QC_CF_ERRL)) {
+			LIST_APPEND(&qcc->recv_list, &qcs->el_recv);
 			tasklet_wakeup(qcc->wait_event.tasklet);
+		}
 	}
 
 	TRACE_LEAVE(QMUX_EV_STRM_RECV, qcc->conn, qcs);
@@ -3158,6 +3412,8 @@ static size_t qmux_strm_snd_buf(struct stconn *sc, struct buffer *buf,
 		const size_t data = qcs_prep_bytes(qcs) - old_data;
 		if (data || fin)
 			qcc_send_stream(qcs, 0, data);
+
+		/* Wake up MUX to emit newly transferred data. */
 		if (!(qcs->qcc->wait_event.events & SUB_RETRY_SEND))
 			tasklet_wakeup(qcs->qcc->wait_event.tasklet);
 	}
@@ -3273,18 +3529,21 @@ static size_t qmux_strm_done_ff(struct stconn *sc)
 		goto end;
 	}
 
-	if (data)
-		data += sd->iobuf.offset;
 	total = qcs->qcc->app_ops->done_ff(qcs);
+	if (total || qcs->flags & QC_SF_FIN_STREAM)
+		qcc_send_stream(qcs, 0, total);
 
-	if (data || qcs->flags & QC_SF_FIN_STREAM)
-		qcc_send_stream(qcs, 0, data);
+	/* Reset stconn iobuf information. */
+	qcs->sd->iobuf.buf = NULL;
+	qcs->sd->iobuf.offset = 0;
+	qcs->sd->iobuf.data = 0;
+
 	if (!(qcs->qcc->wait_event.events & SUB_RETRY_SEND))
 		tasklet_wakeup(qcc->wait_event.tasklet);
 
   end:
 	TRACE_LEAVE(QMUX_EV_STRM_SEND, qcs->qcc->conn, qcs);
-	return total;
+	return data;
 }
 
 static int qmux_strm_resume_ff(struct stconn *sc, unsigned int flags)
@@ -3507,6 +3766,12 @@ void qcc_show_quic(struct qcc *qcc)
 	              qcc, qcc->flags, (ullong)qcc->nb_sc, (ullong)qcc->nb_hreq,
 	              (ullong)qcc->tx.buf_in_flight, (ullong)qc->path->cwnd);
 
+	if (qcc_is_pacing_active(qcc->conn)) {
+		chunk_appendf(&trash, "  pacing int_sent=%d last_sent=%d\n",
+		              qcc->tx.paced_sent_ctr,
+		              qcc->tx.pacer.last_sent);
+	}
+
 	node = eb64_first(&qcc->streams_by_id);
 	while (node) {
 		struct qcs *qcs = eb64_entry(node, struct qcs, by_id);
@@ -3518,7 +3783,7 @@ void qcc_show_quic(struct qcc *qcc)
 		if (!quic_stream_is_uni(qcs->id) || !quic_stream_is_remote(qcc, qcs->id))
 			chunk_appendf(&trash, " txoff=%llu(%llu) msd=%llu",
 			              (ullong)qcs->tx.fc.off_real,
-			              (ullong)qcs->tx.fc.off_soft - (ullong)qcs->tx.fc.off_soft,
+			              (ullong)qcs->tx.fc.off_soft - (ullong)qcs->tx.fc.off_real,
 			              (ullong)qcs->tx.fc.limit);
 		chunk_appendf(&trash, "\n");
 		node = eb64_next(node);

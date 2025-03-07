@@ -23,6 +23,7 @@
 #define _HAPROXY_CFGPARSE_H
 
 #include <haproxy/api.h>
+#include <haproxy/proxy-t.h>
 
 struct hap_cpuset;
 struct proxy;
@@ -109,9 +110,14 @@ extern char *cursection;
 extern int non_global_section_parsed;
 
 extern struct proxy *curproxy;
+extern char initial_cwd[PATH_MAX];
 
 int cfg_parse_global(const char *file, int linenum, char **args, int inv);
 int cfg_parse_listen(const char *file, int linenum, char **args, int inv);
+int cfg_parse_listen_match_option(const char *file, int linenum, int kwm,
+                                  const struct cfg_opt config_opts[], int *err_code,
+                                  char **args, int mode, int cap,
+                                  int *options, int *no_options);
 int cfg_parse_traces(const char *file, int linenum, char **args, int inv);
 int cfg_parse_track_sc_num(unsigned int *track_sc_num,
                            const char *arg, const char *end, char **err);
@@ -128,10 +134,11 @@ int cfg_register_postparser(char *name, int (*func)());
 void cfg_unregister_sections(void);
 void cfg_backup_sections(struct list *backup_sections);
 void cfg_restore_sections(struct list *backup_sections);
-int warnif_misplaced_tcp_conn(struct proxy *proxy, const char *file, int line, const char *arg);
-int warnif_misplaced_tcp_sess(struct proxy *proxy, const char *file, int line, const char *arg);
-int warnif_misplaced_tcp_cont(struct proxy *proxy, const char *file, int line, const char *arg);
-int warnif_misplaced_quic_init(struct proxy *proxy, const char *file, int line, const char *arg);
+int warnif_misplaced_tcp_req_conn(struct proxy *proxy, const char *file, int line, const char *arg1, const char *arg2);
+int warnif_misplaced_tcp_req_sess(struct proxy *proxy, const char *file, int line, const char *arg, const char *arg2);
+int warnif_misplaced_tcp_req_cont(struct proxy *proxy, const char *file, int line, const char *arg, const char *arg2);
+int warnif_misplaced_tcp_res_cont(struct proxy *proxy, const char *file, int line, const char *arg, const char *arg2);
+int warnif_misplaced_quic_init(struct proxy *proxy, const char *file, int line, const char *arg, const char *arg2);
 int warnif_cond_conflicts(const struct acl_cond *cond, unsigned int where, const char *file, int line);
 int warnif_tcp_http_cond(const struct proxy *px, const struct acl_cond *cond);
 int too_many_args_idx(int maxarg, int index, char **args, char **msg, int *err_code);
@@ -149,6 +156,10 @@ ssize_t load_cfg_in_mem(char* filename, char** cfg_content);
 /* simplified way to define a section parser */
 #define REGISTER_CONFIG_SECTION(name, parse, post)                            \
 	INITCALL3(STG_REGISTER, cfg_register_section, (name), (parse), (post))
+
+/* simplified way to define a post section parser */
+#define REGISTER_CONFIG_POST_SECTION(name, post)                              \
+	INITCALL3(STG_REGISTER, cfg_register_section, (name), NULL, (post))
 
 #define REGISTER_CONFIG_POSTPARSER(name, parser)                              \
 	INITCALL2(STG_REGISTER, cfg_register_postparser, (name), (parser))

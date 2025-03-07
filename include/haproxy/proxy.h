@@ -87,6 +87,7 @@ struct proxy *cli_find_frontend(struct appctx *appctx, const char *arg);
 int resolve_stick_rule(struct proxy *curproxy, struct sticking_rule *mrule);
 void free_stick_rules(struct list *rules);
 void free_server_rules(struct list *srules);
+int proxy_init_per_thr(struct proxy *px);
 
 /*
  * This function returns a string containing the type of the proxy in a format
@@ -205,6 +206,8 @@ static inline int l7_status_match(struct proxy *p, int status)
 		return (p->retry_type & PR_RE_404);
 	case 408:
 		return (p->retry_type & PR_RE_408);
+	case 421:
+		return (p->retry_type & PR_RE_421);
 	case 425:
 		return (p->retry_type & PR_RE_425);
 	case 429:

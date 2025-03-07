@@ -68,6 +68,9 @@ void wdt_handler(int sig, siginfo_t *si, void *arg)
 	ulong thr_bit;
 	int thr, tgrp;
 
+	/* inform callees to be careful, we're in a signal handler! */
+	_HA_ATOMIC_OR(&th_ctx->flags, TH_FL_IN_WDT_HANDLER);
+
 	switch (si->si_code) {
 	case SI_TIMER:
 		/* A thread's timer fired, the thread ID is in si_int. We have
@@ -95,13 +98,15 @@ void wdt_handler(int sig, siginfo_t *si, void *arg)
 		if (!p)
 			goto update_and_leave;
 
-		if ((_HA_ATOMIC_LOAD(&ha_thread_ctx[thr].flags) & TH_FL_SLEEPING) ||
+		if ((_HA_ATOMIC_LOAD(&ha_thread_ctx[thr].flags) & (TH_FL_SLEEPING|TH_FL_DUMPING_OTHERS)) ||
 		    (_HA_ATOMIC_LOAD(&ha_tgroup_ctx[tgrp-1].threads_harmless) & thr_bit)) {
 			/* This thread is currently doing exactly nothing
 			 * waiting in the poll loop (unlikely but possible),
 			 * waiting for all other threads to join the rendez-vous
 			 * point (common), or waiting for another thread to
-			 * finish an isolated operation (unlikely but possible).
+			 * finish an isolated operation (unlikely but possible),
+			 * or waiting for another thread to finish dumping its
+			 * stack.
 			 */
 			goto update_and_leave;
 		}
@@ -120,7 +125,7 @@ void wdt_handler(int sig, siginfo_t *si, void *arg)
 		if (!(_HA_ATOMIC_LOAD(&ha_thread_ctx[thr].flags) & TH_FL_STUCK)) {
 			uint prev_ctxsw;
 
-			prev_ctxsw = HA_ATOMIC_LOAD(&per_thread_wd_ctx[tid].prev_ctxsw);
+			prev_ctxsw = HA_ATOMIC_LOAD(&per_thread_wd_ctx[thr].prev_ctxsw);
 
 			/* only after one second it's clear we're stuck */
 			if (n - p >= 1000000000ULL)
@@ -131,9 +136,11 @@ void wdt_handler(int sig, siginfo_t *si, void *arg)
 			 * a warning (unless already stuck).
 			 */
 			if (n - p >= (ullong)wdt_warn_blocked_traffic_ns) {
-				if (HA_ATOMIC_LOAD(&activity[thr].ctxsw) == prev_ctxsw)
+				uint curr_ctxsw = HA_ATOMIC_LOAD(&activity[thr].ctxsw);
+
+				if (curr_ctxsw == prev_ctxsw)
 					ha_stuck_warning(thr);
-				HA_ATOMIC_STORE(&activity[thr].ctxsw, prev_ctxsw);
+				HA_ATOMIC_STORE(&per_thread_wd_ctx[thr].prev_ctxsw, curr_ctxsw);
 			}
 
 			goto update_and_leave;
@@ -159,6 +166,7 @@ void wdt_handler(int sig, siginfo_t *si, void *arg)
 #endif
 	default:
 		/* unhandled other conditions */
+		_HA_ATOMIC_AND(&th_ctx->flags, ~TH_FL_IN_WDT_HANDLER);
 		return;
 	}
 
@@ -173,10 +181,14 @@ void wdt_handler(int sig, siginfo_t *si, void *arg)
 	else
 #endif
 		ha_panic();
+
+	_HA_ATOMIC_AND(&th_ctx->flags, ~TH_FL_IN_WDT_HANDLER);
 	return;
 
  update_and_leave:
 	wdt_ping(thr);
+
+	_HA_ATOMIC_AND(&th_ctx->flags, ~TH_FL_IN_WDT_HANDLER);
 }
 
 /* parse the "warn-blocked-traffic-after" parameter */

@@ -225,11 +225,11 @@ extern __attribute__((__weak__)) struct debug_count __stop_dbg_cnt  HA_SECTION_S
 /* Core of the COUNT_IF() macro, checks the condition and counts one hit if
  * true.
  */
-#define _COUNT_IF(cond, file, line, ...) do {					\
-	(void)(unlikely(cond) ? ({						\
+#define _COUNT_IF(cond, file, line, ...)					\
+	(unlikely(cond) ? ({							\
 		__DBG_COUNT(cond, file, line, DBG_COUNT_IF, __VA_ARGS__);	\
 		1; /* let's return the true condition */			\
-	}) : 0); } while (0)
+	}) : 0)
 
 /* DEBUG_GLITCHES enables counting the number of glitches per line of code. The
  * condition is empty (nothing to write there), except maybe __VA_ARGS at the
@@ -245,7 +245,7 @@ extern __attribute__((__weak__)) struct debug_count __stop_dbg_cnt  HA_SECTION_S
 
 #else /* USE_OBSOLETE_LINKER not defined below  */
 # define __DBG_COUNT(cond, file, line, type, ...) do { } while (0)
-# define _COUNT_IF(cond, file, line, ...) do { } while (0)
+# define _COUNT_IF(cond, file, line, ...) DISGUISE(cond)
 # define _COUNT_GLITCH(file, line, ...) do { } while (0)
 #endif
 
@@ -348,10 +348,16 @@ extern __attribute__((__weak__)) struct debug_count __stop_dbg_cnt  HA_SECTION_S
 #  define COUNT_IF(cond, ...) _COUNT_IF   (cond, __FILE__, __LINE__, __VA_ARGS__)
 # endif
 #else
-#  define BUG_ON(cond, ...)   do { (void)sizeof(cond); } while (0)
+/* We want BUG_ON() to evaluate the expression sufficiently for next lines
+ * of codes not to complain about suspicious dereferences for example.
+ * GCC-11 tends to fail to validate that in combined expressions such as
+ * "BUG_ON(!a || !b)", but it works fine when using a temporary assignment
+ * like below, without hurting the generated code.
+ */
+#  define BUG_ON(cond, ...)   ({ typeof(cond) __cond = (cond); ASSUME(!__cond); })
 #  define WARN_ON(cond, ...)  do { (void)sizeof(cond); } while (0)
 #  define CHECK_IF(cond, ...) do { (void)sizeof(cond); } while (0)
-#  define COUNT_IF(cond, ...) do { (void)sizeof(cond); } while (0)
+#  define COUNT_IF(cond, ...) DISGUISE(cond)
 #endif
 
 /* These macros are only for hot paths and remain disabled unless DEBUG_STRICT is 2 or above.
@@ -376,9 +382,13 @@ extern __attribute__((__weak__)) struct debug_count __stop_dbg_cnt  HA_SECTION_S
 #  define COUNT_IF_HOT(cond, ...) _COUNT_IF   (cond, __FILE__, __LINE__, __VA_ARGS__)
 # endif
 #else
+/* Contrary to BUG_ON(), we do *NOT* want BUG_ON_HOT() to evaluate the
+ * expression unless explicitly enabled, since it is located in hot code paths.
+ * We just validate that the expression results in a valid type.
+ */
 #  define BUG_ON_HOT(cond, ...)   do { (void)sizeof(cond) ; } while (0)
 #  define CHECK_IF_HOT(cond, ...) do { (void)sizeof(cond) ; } while (0)
-#  define COUNT_IF_HOT(cond, ...) do { (void)sizeof(cond) ; } while (0)
+#  define COUNT_IF_HOT(cond, ...) DISGUISE(cond)
 #endif
 
 

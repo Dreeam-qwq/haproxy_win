@@ -10,6 +10,7 @@
  *
  */
 
+#include <errno.h>
 #include <haproxy/activity-t.h>
 #include <haproxy/api.h>
 #include <haproxy/applet.h>
@@ -46,6 +47,7 @@ struct show_activity_ctx {
 #undef calloc
 #undef malloc
 #undef realloc
+#undef strdup
 #endif
 
 /* bit field of profiling options. Beware, may be modified at runtime! */
@@ -67,7 +69,8 @@ struct sched_activity sched_activity[SCHED_ACT_HASH_BUCKETS] __attribute__((alig
 #ifdef USE_MEMORY_PROFILING
 
 static const char *const memprof_methods[MEMPROF_METH_METHODS] = {
-	"unknown", "malloc", "calloc", "realloc", "free", "p_alloc", "p_free",
+	"unknown", "malloc", "calloc", "realloc", "strdup", "free", "p_alloc", "p_free",
+	"strndup", "valloc", "aligned_valloc", "posix_memalign", "memalign", "pvalloc",
 };
 
 /* last one is for hash collisions ("others") and has no caller address */
@@ -82,7 +85,16 @@ static THREAD_LOCAL int in_memprof = 0;
 static void *memprof_malloc_initial_handler(size_t size);
 static void *memprof_calloc_initial_handler(size_t nmemb, size_t size);
 static void *memprof_realloc_initial_handler(void *ptr, size_t size);
+static char *memprof_strdup_initial_handler(const char *s);
 static void  memprof_free_initial_handler(void *ptr);
+
+/* these ones are optional but may be used by some dependecies */
+static char *memprof_strndup_initial_handler(const char *s, size_t n);
+static void *memprof_valloc_initial_handler(size_t sz);
+static void *memprof_pvalloc_initial_handler(size_t sz);
+static void *memprof_memalign_initial_handler(size_t al, size_t sz);
+static void *memprof_aligned_alloc_initial_handler(size_t al, size_t sz);
+static int   memprof_posix_memalign_initial_handler(void **ptr, size_t al, size_t sz);
 
 /* Fallback handlers for the main alloc/free functions. They are preset to
  * the initializer in order to save a test in the functions's critical path.
@@ -90,7 +102,16 @@ static void  memprof_free_initial_handler(void *ptr);
 static void *(*memprof_malloc_handler)(size_t size)               = memprof_malloc_initial_handler;
 static void *(*memprof_calloc_handler)(size_t nmemb, size_t size) = memprof_calloc_initial_handler;
 static void *(*memprof_realloc_handler)(void *ptr, size_t size)   = memprof_realloc_initial_handler;
+static char *(*memprof_strdup_handler)(const char *s)             = memprof_strdup_initial_handler;
 static void  (*memprof_free_handler)(void *ptr)                   = memprof_free_initial_handler;
+
+/* these ones are optional but may be used by some dependecies */
+static char *(*memprof_strndup_handler)(const char *s, size_t n)                 = memprof_strndup_initial_handler;
+static void *(*memprof_valloc_handler)(size_t sz)                                = memprof_valloc_initial_handler;
+static void *(*memprof_pvalloc_handler)(size_t sz)                               = memprof_pvalloc_initial_handler;
+static void *(*memprof_memalign_handler)(size_t al, size_t sz)                   = memprof_memalign_initial_handler;
+static void *(*memprof_aligned_alloc_handler)(size_t al, size_t sz)              = memprof_aligned_alloc_initial_handler;
+static int   (*memprof_posix_memalign_handler)(void **ptr, size_t al, size_t sz) = memprof_posix_memalign_initial_handler;
 
 /* Used to force to die if it's not possible to retrieve the allocation
  * functions. We cannot even use stdio in this case.
@@ -126,9 +147,24 @@ static void memprof_init()
 	if (!memprof_realloc_handler)
 		memprof_die("FATAL: realloc() function not found.\n");
 
+	memprof_strdup_handler  = get_sym_next_addr("strdup");
+	if (!memprof_strdup_handler)
+		memprof_die("FATAL: strdup() function not found.\n");
+
 	memprof_free_handler    = get_sym_next_addr("free");
 	if (!memprof_free_handler)
 		memprof_die("FATAL: free() function not found.\n");
+
+	/* these ones are not always implemented, rarely used and may not exist
+	 * so we don't fail on them.
+	 */
+	memprof_strndup_handler        = get_sym_next_addr("strndup");
+	memprof_valloc_handler         = get_sym_next_addr("valloc");
+	memprof_pvalloc_handler        = get_sym_next_addr("pvalloc");
+	memprof_memalign_handler       = get_sym_next_addr("memalign");
+	memprof_aligned_alloc_handler  = get_sym_next_addr("aligned_alloc");
+	memprof_posix_memalign_handler = get_sym_next_addr("posix_memalign");
+
 	in_memprof--;
 }
 
@@ -168,10 +204,89 @@ static void *memprof_realloc_initial_handler(void *ptr, size_t size)
 	return memprof_realloc_handler(ptr, size);
 }
 
+static char *memprof_strdup_initial_handler(const char *s)
+{
+	if (in_memprof) {
+		/* probably that dlsym() needs strdup(), let's fail */
+		return NULL;
+	}
+
+	memprof_init();
+	return memprof_strdup_handler(s);
+}
+
 static void  memprof_free_initial_handler(void *ptr)
 {
 	memprof_init();
 	memprof_free_handler(ptr);
+}
+
+/* optional handlers */
+
+static char *memprof_strndup_initial_handler(const char *s, size_t n)
+{
+	if (in_memprof) {
+		/* probably that dlsym() needs strndup(), let's fail */
+		return NULL;
+	}
+
+	memprof_init();
+	return memprof_strndup_handler(s, n);
+}
+
+static void *memprof_valloc_initial_handler(size_t sz)
+{
+	if (in_memprof) {
+		/* probably that dlsym() needs valloc(), let's fail */
+		return NULL;
+	}
+
+	memprof_init();
+	return memprof_valloc_handler(sz);
+}
+
+static void *memprof_pvalloc_initial_handler(size_t sz)
+{
+	if (in_memprof) {
+		/* probably that dlsym() needs pvalloc(), let's fail */
+		return NULL;
+	}
+
+	memprof_init();
+	return memprof_pvalloc_handler(sz);
+}
+
+static void *memprof_memalign_initial_handler(size_t al, size_t sz)
+{
+	if (in_memprof) {
+		/* probably that dlsym() needs memalign(), let's fail */
+		return NULL;
+	}
+
+	memprof_init();
+	return memprof_memalign_handler(al, sz);
+}
+
+static void *memprof_aligned_alloc_initial_handler(size_t al, size_t sz)
+{
+	if (in_memprof) {
+		/* probably that dlsym() needs aligned_alloc(), let's fail */
+		return NULL;
+	}
+
+	memprof_init();
+	return memprof_aligned_alloc_handler(al, sz);
+}
+
+static int memprof_posix_memalign_initial_handler(void **ptr, size_t al, size_t sz)
+{
+	if (in_memprof) {
+		/* probably that dlsym() needs posix_memalign(), let's fail */
+		return ENOMEM;
+	}
+
+	memprof_init();
+	return memprof_posix_memalign_handler(ptr, al, sz);
 }
 
 /* Assign a bin for the memprof_stats to the return address. May perform a few
@@ -295,6 +410,32 @@ void *realloc(void *ptr, size_t size)
 	return ret;
 }
 
+/* This is the new global strdup() function. It must optimize for the normal
+ * case (i.e. profiling disabled) hence the first test to permit a direct jump.
+ * It must remain simple to guarantee the lack of reentrance. stdio is not
+ * possible there even for debugging. The reported size is the really allocated
+ * one as returned by malloc_usable_size(), because this will allow it to be
+ * compared to the one before realloc() or free(). This is a GNU and jemalloc
+ * extension but other systems may also store this size in ptr[-1].
+ */
+char *strdup(const char *s)
+{
+	struct memprof_stats *bin;
+	size_t size;
+	char *ret;
+
+	if (likely(!(profiling & HA_PROF_MEMORY)))
+		return memprof_strdup_handler(s);
+
+	ret = memprof_strdup_handler(s);
+	size = malloc_usable_size(ret) + sizeof(void *);
+
+	bin = memprof_get_bin(__builtin_return_address(0), MEMPROF_METH_STRDUP);
+	_HA_ATOMIC_ADD(&bin->alloc_calls, 1);
+	_HA_ATOMIC_ADD(&bin->alloc_tot, size);
+	return ret;
+}
+
 /* This is the new global free() function. It must optimize for the normal
  * case (i.e. profiling disabled) hence the first test to permit a direct jump.
  * It must remain simple to guarantee the lack of reentrance. stdio is not
@@ -322,6 +463,142 @@ void free(void *ptr)
 	bin = memprof_get_bin(__builtin_return_address(0), MEMPROF_METH_FREE);
 	_HA_ATOMIC_ADD(&bin->free_calls, 1);
 	_HA_ATOMIC_ADD(&bin->free_tot, size_before);
+}
+
+/* optional handlers below, essentially to monitor libs activities */
+
+char *strndup(const char *s, size_t size)
+{
+	struct memprof_stats *bin;
+	char *ret;
+
+	if (!memprof_strndup_handler)
+		return NULL;
+
+	ret = memprof_strndup_handler(s, size);
+	if (likely(!(profiling & HA_PROF_MEMORY)))
+		return ret;
+
+	size = malloc_usable_size(ret) + sizeof(void *);
+	bin = memprof_get_bin(__builtin_return_address(0), MEMPROF_METH_STRNDUP);
+	_HA_ATOMIC_ADD(&bin->alloc_calls, 1);
+	_HA_ATOMIC_ADD(&bin->alloc_tot, size);
+	return ret;
+}
+
+void *valloc(size_t size)
+{
+	struct memprof_stats *bin;
+	void *ret;
+
+	if (!memprof_valloc_handler)
+		return NULL;
+
+	ret = memprof_valloc_handler(size);
+	if (likely(!(profiling & HA_PROF_MEMORY)))
+		return ret;
+
+	size = malloc_usable_size(ret) + sizeof(void *);
+	bin = memprof_get_bin(__builtin_return_address(0), MEMPROF_METH_VALLOC);
+	_HA_ATOMIC_ADD(&bin->alloc_calls, 1);
+	_HA_ATOMIC_ADD(&bin->alloc_tot, size);
+	return ret;
+}
+
+void *pvalloc(size_t size)
+{
+	struct memprof_stats *bin;
+	void *ret;
+
+	if (!memprof_pvalloc_handler)
+		return NULL;
+
+	ret = memprof_pvalloc_handler(size);
+	if (likely(!(profiling & HA_PROF_MEMORY)))
+		return ret;
+
+	size = malloc_usable_size(ret) + sizeof(void *);
+	bin = memprof_get_bin(__builtin_return_address(0), MEMPROF_METH_PVALLOC);
+	_HA_ATOMIC_ADD(&bin->alloc_calls, 1);
+	_HA_ATOMIC_ADD(&bin->alloc_tot, size);
+	return ret;
+}
+
+void *memalign(size_t align, size_t size)
+{
+	struct memprof_stats *bin;
+	void *ret;
+
+	if (!memprof_memalign_handler)
+		return NULL;
+
+	ret = memprof_memalign_handler(align, size);
+	if (likely(!(profiling & HA_PROF_MEMORY)))
+		return ret;
+
+	size = malloc_usable_size(ret) + sizeof(void *);
+	bin = memprof_get_bin(__builtin_return_address(0), MEMPROF_METH_MEMALIGN);
+	_HA_ATOMIC_ADD(&bin->alloc_calls, 1);
+	_HA_ATOMIC_ADD(&bin->alloc_tot, size);
+	return ret;
+}
+
+void *aligned_alloc(size_t align, size_t size)
+{
+	struct memprof_stats *bin;
+	void *ret;
+
+	if (!memprof_aligned_alloc_handler)
+		return NULL;
+
+	ret = memprof_aligned_alloc_handler(align, size);
+	if (likely(!(profiling & HA_PROF_MEMORY)))
+		return ret;
+
+	size = malloc_usable_size(ret) + sizeof(void *);
+	bin = memprof_get_bin(__builtin_return_address(0), MEMPROF_METH_ALIGNED_ALLOC);
+	_HA_ATOMIC_ADD(&bin->alloc_calls, 1);
+	_HA_ATOMIC_ADD(&bin->alloc_tot, size);
+	return ret;
+}
+
+int posix_memalign(void **ptr, size_t align, size_t size)
+{
+	struct memprof_stats *bin;
+	int ret;
+
+	if (!memprof_posix_memalign_handler)
+		return ENOMEM;
+
+	ret = memprof_posix_memalign_handler(ptr, align, size);
+	if (likely(!(profiling & HA_PROF_MEMORY)))
+		return ret;
+
+	if (ret != 0) // error
+		return ret;
+
+	size = malloc_usable_size(*ptr) + sizeof(void *);
+	bin = memprof_get_bin(__builtin_return_address(0), MEMPROF_METH_POSIX_MEMALIGN);
+	_HA_ATOMIC_ADD(&bin->alloc_calls, 1);
+	_HA_ATOMIC_ADD(&bin->alloc_tot, size);
+	return ret;
+}
+
+/* remove info from entries matching <info>. This needs to be used by callers
+ * of pool_destroy() so that we don't keep a reference to a dead pool. Nothing
+ * is done if <info> is NULL.
+ */
+void memprof_remove_stale_info(const void *info)
+{
+	int i;
+
+	if (!info)
+		return;
+
+	for (i = 0; i < MEMPROF_HASH_BUCKETS; i++) {
+		if (_HA_ATOMIC_LOAD(&memprof_stats[i].info) == info)
+			_HA_ATOMIC_STORE(&memprof_stats[i].info, NULL);
+	}
 }
 
 #endif // USE_MEMORY_PROFILING
@@ -657,6 +934,7 @@ static int cli_io_handler_show_profiling(struct appctx *appctx)
 	const char *str;
 	int max_lines;
 	int i, j, max;
+	int dumped;
 
 	chunk_reset(&trash);
 
@@ -720,11 +998,17 @@ static int cli_io_handler_show_profiling(struct appctx *appctx)
 	if (!max_lines)
 		max_lines = SCHED_ACT_HASH_BUCKETS;
 
+	dumped = 0;
 	for (i = ctx->linenum; i < max_lines; i++) {
 		if (!tmp_activity[i].calls)
 			continue; // skip aggregated or empty entries
 
 		ctx->linenum = i;
+
+		/* resolve_sym_name() may be slow, better dump a few entries at a time */
+		if (dumped >= 10)
+			return 0;
+
 		chunk_reset(name_buffer);
 		caller = HA_ATOMIC_LOAD(&tmp_activity[i].caller);
 
@@ -757,6 +1041,7 @@ static int cli_io_handler_show_profiling(struct appctx *appctx)
 			/* failed, try again */
 			return 0;
 		}
+		dumped++;
 	}
 
 	if (applet_putchk(appctx, &trash) == -1) {
@@ -792,12 +1077,18 @@ static int cli_io_handler_show_profiling(struct appctx *appctx)
 	if (!max_lines)
 		max_lines = MEMPROF_HASH_BUCKETS + 1;
 
+	dumped = 0;
 	for (i = ctx->linenum; i < max_lines; i++) {
 		struct memprof_stats *entry = &tmp_memstats[i];
 
 		ctx->linenum = i;
 		if (!entry->alloc_calls && !entry->free_calls)
 			continue;
+
+		/* resolve_sym_name() may be slow, better dump a few entries at a time */
+		if (dumped >= 10)
+			return 0;
+
 		chunk_appendf(&trash, "%11llu %11llu %14llu %14llu| %16p ",
 			      entry->alloc_calls, entry->free_calls,
 			      entry->alloc_tot, entry->free_tot,
@@ -808,9 +1099,7 @@ static int cli_io_handler_show_profiling(struct appctx *appctx)
 		else
 			chunk_appendf(&trash, "[other]");
 
-		if ((tmp_memstats[i].method != MEMPROF_METH_P_ALLOC) &&
-		    (tmp_memstats[i].method != MEMPROF_METH_MALLOC) &&
-		    (tmp_memstats[i].method != MEMPROF_METH_CALLOC)) {
+		if (((1UL << tmp_memstats[i].method) & MEMPROF_FREE_MASK) || !entry->alloc_calls) {
 			chunk_appendf(&trash," %s(%lld)", memprof_methods[entry->method],
 				(long long)(entry->alloc_tot - entry->free_tot) / (long long)(entry->alloc_calls + entry->free_calls));
 		} else
@@ -832,6 +1121,8 @@ static int cli_io_handler_show_profiling(struct appctx *appctx)
 
 		if (applet_putchk(appctx, &trash) == -1)
 			return 0;
+
+		dumped++;
 	}
 
 	if (applet_putchk(appctx, &trash) == -1)
@@ -841,9 +1132,7 @@ static int cli_io_handler_show_profiling(struct appctx *appctx)
 	for (i = 0; i < max_lines; i++) {
 		tot_alloc_calls += tmp_memstats[i].alloc_calls;
 		tot_alloc_bytes += tmp_memstats[i].alloc_tot;
-		if ((tmp_memstats[i].method != MEMPROF_METH_P_ALLOC) &&
-		    (tmp_memstats[i].method != MEMPROF_METH_MALLOC) &&
-		    (tmp_memstats[i].method != MEMPROF_METH_CALLOC)) {
+		if ((1UL << tmp_memstats[i].method) & MEMPROF_FREE_MASK) {
 			tot_free_calls  += tmp_memstats[i].free_calls;
 			tot_free_bytes  += tmp_memstats[i].free_tot;
 		}
@@ -857,29 +1146,19 @@ static int cli_io_handler_show_profiling(struct appctx *appctx)
 	 */
 	for (i = max = 0; i < max_lines; i++) {
 		struct memprof_stats *entry = &tmp_memstats[i];
-		char *p;
 
 		if (!entry->alloc_calls && !entry->free_calls)
 			continue;
 
 		chunk_reset(name_buffer);
 		if (!entry->caller)
-			chunk_printf(name_buffer, "other:");
+			chunk_printf(name_buffer, "other");
 		else
-			resolve_sym_name(name_buffer, "", entry->caller);
-
-		/* figure the DSO name (before colon) otherwise "*program*" */
-		p = strchr(name_buffer->area, ':');
-		if (p) {
-			*p = 0;
-			p = name_buffer->area;
-		}
-		else
-			p = "*program*";
+			resolve_dso_name(name_buffer, "", entry->caller);
 
 		/* look it up among known names (0..max) */
 		for (j = 0; j < max; j++) {
-			if (tmp_memstats[j].info && strcmp(p, tmp_memstats[j].info) == 0)
+			if (tmp_memstats[j].info && strcmp(name_buffer->area, tmp_memstats[j].info) == 0)
 				break;
 		}
 
@@ -892,21 +1171,20 @@ static int cli_io_handler_show_profiling(struct appctx *appctx)
 			if (j != i) // set max to keep min caller's address
 				tmp_memstats[j].caller = (void*)-1;
 
-			tmp_memstats[j].info = strdup(p);   // may fail, but checked when used
+			tmp_memstats[j].info = strdup(name_buffer->area);   // may fail, but checked when used
 			tmp_memstats[j].alloc_calls = entry->alloc_calls;
 			tmp_memstats[j].alloc_tot   = entry->alloc_tot;
-			if ((entry->method != MEMPROF_METH_P_ALLOC) &&
-			    (entry->method != MEMPROF_METH_MALLOC) &&
-			    (entry->method != MEMPROF_METH_CALLOC)) {
+			if ((1UL << entry->method) & MEMPROF_FREE_MASK) {
 				tmp_memstats[j].free_calls  = entry->free_calls;
 				tmp_memstats[j].free_tot    = entry->free_tot;
+			} else {
+				tmp_memstats[j].free_calls  = 0;
+				tmp_memstats[j].free_tot    = 0;
 			}
 		} else {
 			tmp_memstats[j].alloc_calls += entry->alloc_calls;
 			tmp_memstats[j].alloc_tot += entry->alloc_tot;
-			if ((entry->method != MEMPROF_METH_P_ALLOC) &&
-			    (entry->method != MEMPROF_METH_MALLOC) &&
-			    (entry->method != MEMPROF_METH_CALLOC)) {
+			if ((1UL << entry->method) & MEMPROF_FREE_MASK) {
 				tmp_memstats[j].free_calls  += entry->free_calls;
 				tmp_memstats[j].free_tot  += entry->free_tot;
 			}
@@ -931,7 +1209,7 @@ static int cli_io_handler_show_profiling(struct appctx *appctx)
 		chunk_appendf(&trash, "%11llu %11llu %14llu %14llu| %16p DSO:%s;",
 			      entry->alloc_calls, entry->free_calls,
 			      entry->alloc_tot, entry->free_tot,
-			      entry->caller, entry->info ? (const char*)entry->info : "other");
+			      entry->caller == (void*)-1 ? 0 : entry->caller, entry->info ? (const char*)entry->info : "other");
 
 		if (entry->alloc_tot != entry->free_tot)
 			chunk_appendf(&trash, " delta_calls=%lld; delta_bytes=%lld",

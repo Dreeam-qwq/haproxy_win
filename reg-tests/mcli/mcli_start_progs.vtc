@@ -1,3 +1,4 @@
+#EXCLUDE_TARGETS=osx
 varnishtest "Try to start a master CLI with 2 programs"
 #REGTEST_TYPE=bug
 feature cmd "command -v sleep"
@@ -8,7 +9,9 @@ feature ignore_unknown_macro
 server s1 {
 } -start
 
-haproxy h1 -W -S -conf {
+haproxy h1 -Ws -S -conf {
+    global
+        expose-deprecated-directives
     defaults
         mode http
         timeout connect "${HAPROXY_TEST_TIMEOUT-5s}"

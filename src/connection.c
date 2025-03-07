@@ -455,6 +455,7 @@ void conn_init(struct connection *conn, void *target)
 	conn->send_proxy_ofs = 0;
 	conn->handle.fd = DEAD_FD_MAGIC;
 	conn->err_code = CO_ER_NONE;
+	conn->term_evts_log = 0;
 	conn->target = target;
 	conn->destroy_cb = NULL;
 	conn->proxy_netns = NULL;
@@ -501,10 +502,15 @@ static void conn_backend_deinit(struct connection *conn)
 	if (LIST_INLIST(&conn->sess_el))
 		session_unown_conn(conn->owner, conn);
 
-	/* If the connection is not private, it is accounted by the server. */
-	if (!(conn->flags & CO_FL_PRIVATE)) {
-		if (obj_type(conn->target) == OBJ_TYPE_SERVER)
-			srv_release_conn(__objt_server(conn->target), conn);
+	if (obj_type(conn->target) == OBJ_TYPE_SERVER) {
+		struct server *srv = __objt_server(conn->target);
+
+		/* If the connection is not private, it is accounted by the server. */
+		if (!(conn->flags & CO_FL_PRIVATE)) {
+			srv_release_conn(srv, conn);
+		}
+		if (srv->flags & SRV_F_STRICT_MAXCONN)
+			_HA_ATOMIC_DEC(&srv->curr_total_conns);
 	}
 
 	/* Make sure the connection is not left in the idle connection tree */
@@ -1372,11 +1378,14 @@ int conn_recv_proxy(struct connection *conn, int flag)
 	goto fail;
 
  recv_abort:
+	conn_report_term_evt(conn, tevt_loc_hs, hs_tevt_type_truncated_shutr);
 	conn->err_code = CO_ER_PRX_ABORT;
 	conn->flags |= CO_FL_SOCK_RD_SH | CO_FL_SOCK_WR_SH;
 	goto fail;
 
  fail:
+	if (!(conn->flags & CO_FL_SOCK_RD_SH))
+		conn_report_term_evt(conn, tevt_loc_hs, hs_tevt_type_truncated_rcv_err);
 	conn->flags |= CO_FL_ERROR;
 	return 0;
 }
@@ -1470,6 +1479,7 @@ int conn_send_proxy(struct connection *conn, unsigned int flag)
 
  out_error:
 	/* Write error on the file descriptor */
+	conn_report_term_evt(conn, tevt_loc_hs, hs_tevt_type_snd_err);
 	conn->flags |= CO_FL_ERROR;
 	return 0;
 
@@ -1672,11 +1682,14 @@ int conn_recv_netscaler_cip(struct connection *conn, int flag)
 	goto fail;
 
  recv_abort:
+	conn_report_term_evt(conn, tevt_loc_hs, hs_tevt_type_truncated_shutr);
 	conn->err_code = CO_ER_CIP_ABORT;
 	conn->flags |= CO_FL_SOCK_RD_SH | CO_FL_SOCK_WR_SH;
 	goto fail;
 
  fail:
+	if (!(conn->flags & CO_FL_SOCK_RD_SH))
+		conn_report_term_evt(conn, tevt_loc_hs, hs_tevt_type_truncated_rcv_err);
 	conn->flags |= CO_FL_ERROR;
 	return 0;
 }
@@ -1750,6 +1763,7 @@ int conn_send_socks4_proxy_request(struct connection *conn)
 
  out_error:
 	/* Write error on the file descriptor */
+	conn_report_term_evt(conn, tevt_loc_hs, hs_tevt_type_snd_err);
 	conn->flags |= CO_FL_ERROR;
 	if (conn->err_code == CO_ER_NONE) {
 		conn->err_code = CO_ER_SOCKS4_SEND;
@@ -1870,6 +1884,7 @@ int conn_recv_socks4_proxy_response(struct connection *conn)
 	return 0;
 
  recv_abort:
+	conn_report_term_evt(conn, tevt_loc_hs, hs_tevt_type_truncated_shutr);
 	if (conn->err_code == CO_ER_NONE) {
 		conn->err_code = CO_ER_SOCKS4_ABORT;
 	}
@@ -1877,6 +1892,8 @@ int conn_recv_socks4_proxy_response(struct connection *conn)
 	goto fail;
 
  fail:
+	if (!(conn->flags & CO_FL_SOCK_RD_SH))
+		conn_report_term_evt(conn, tevt_loc_hs, hs_tevt_type_truncated_rcv_err);
 	conn->flags |= CO_FL_ERROR;
 	return 0;
 }

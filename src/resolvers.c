@@ -3489,13 +3489,17 @@ static int resolvers_new(struct resolvers **resolvers, const char *id, const cha
 	p = calloc(1, sizeof *p);
 	if (!p) {
 		err_code |= ERR_ALERT | ERR_FATAL;
-		goto out;
+		goto err_free_r;
 	}
 
 	init_new_proxy(p);
 	resolvers_setup_proxy(p);
 	p->parent = r;
 	p->id = strdup(id);
+	if (!p->id) {
+		err_code |= ERR_ALERT | ERR_FATAL;
+		goto err_free_p;
+	}
 	p->conf.args.file = p->conf.file = copy_file_name(file);
 	p->conf.args.line = p->conf.line = linenum;
 	r->px = p;
@@ -3503,8 +3507,16 @@ static int resolvers_new(struct resolvers **resolvers, const char *id, const cha
 	/* default values */
 	LIST_APPEND(&sec_resolvers, &r->list);
 	r->conf.file = strdup(file);
+	if (!r->conf.file) {
+		err_code |= ERR_ALERT | ERR_FATAL;
+		goto err_free_p_id;
+	}
 	r->conf.line = linenum;
 	r->id = strdup(id);
+	if (!r->id) {
+		err_code |= ERR_ALERT | ERR_FATAL;
+		goto err_free_conf_file;
+	}
 	r->query_ids = EB_ROOT;
 	/* default maximum response size */
 	r->accepted_payload_size = 512;
@@ -3528,11 +3540,17 @@ static int resolvers_new(struct resolvers **resolvers, const char *id, const cha
 	*resolvers = r;
 
 out:
-	if (err_code & (ERR_FATAL|ERR_ABORT)) {
-		ha_free(&r);
-		ha_free(&p);
-	}
+	return err_code;
 
+/* free all allocated stuff and return err_code */
+err_free_conf_file:
+	ha_free((void **)&r->conf.file);
+err_free_p_id:
+	ha_free(&p->id);
+err_free_p:
+	ha_free(&p);
+err_free_r:
+	ha_free(&r);
 	return err_code;
 }
 
@@ -3733,6 +3751,12 @@ int cfg_parse_resolvers(const char *file, int linenum, char **args, int kwm)
 			goto out;
 		}
 
+		if (warn_if_lower(args[2], 100)) {
+			ha_alert("parsing [%s:%d] : '%s %s %u' looks suspiciously small for a value in milliseconds."
+				 " Please use an explicit unit ('%ums') if that was the intent.\n",
+				 file, linenum, args[0], args[1], time, time);
+			err_code |= ERR_WARN;
+		}
 	}
 	else if (strcmp(args[0], "accepted_payload_size") == 0) {
 		int i = 0;
@@ -3813,6 +3837,12 @@ int cfg_parse_resolvers(const char *file, int linenum, char **args, int kwm)
 				curr_resolvers->px->timeout.connect = tout;
 			}
 
+			if (warn_if_lower(args[2], 100)) {
+				ha_alert("parsing [%s:%d] : '%s %s %u' looks suspiciously small for a value in milliseconds."
+					 " Please use an explicit unit ('%ums') if that was the intent.\n",
+					 file, linenum, args[0], args[1], tout, tout);
+				err_code |= ERR_WARN;
+			}
 		}
 		else {
 			ha_alert("parsing [%s:%d] : '%s' expects 'retry' or 'resolve' and <time> as arguments got '%s'.\n",
@@ -3929,8 +3959,13 @@ static void *rslv_promex_start_ts(void *unused, unsigned int id)
 	if (LIST_ISEMPTY(&sec_resolvers))
 		return NULL;
 
-	resolver = LIST_NEXT(&sec_resolvers, struct resolvers *, list);
-	return LIST_NEXT(&resolver->nameservers, struct dns_nameserver *, list);
+	/* Find the first resolvers with at least one nameserver */
+	list_for_each_entry(resolver, &sec_resolvers, list) {
+		if (LIST_ISEMPTY(&resolver->nameservers))
+			continue;
+		return LIST_NEXT(&resolver->nameservers, struct dns_nameserver *, list);
+	}
+	return NULL;
 }
 
 static void *rslv_promex_next_ts(void *unused, void *metric_ctx, unsigned int id)
@@ -3940,10 +3975,14 @@ static void *rslv_promex_next_ts(void *unused, void *metric_ctx, unsigned int id
 
 	ns = LIST_NEXT(&ns->list, struct dns_nameserver *, list);
 	if (&ns->list == &resolver->nameservers) {
+		/* Find the next resolver with at least on nameserver */
 		resolver = LIST_NEXT(&resolver->list, struct resolvers *, list);
-		ns = ((&resolver->list == &sec_resolvers)
-		      ? NULL
-		      : LIST_NEXT(&resolver->nameservers, struct dns_nameserver *, list));
+		list_for_each_entry_from(resolver, &sec_resolvers, list) {
+			if (LIST_ISEMPTY(&resolver->nameservers))
+				continue;
+			return LIST_NEXT(&resolver->nameservers, struct dns_nameserver *, list);
+		}
+		ns = NULL;
 	}
 	return ns;
 }

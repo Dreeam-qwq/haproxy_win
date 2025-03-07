@@ -584,7 +584,7 @@ struct server *get_server_rnd(struct stream *s, const struct server *avoid)
 	 * the backend's queue instead.
 	 */
 	if (curr &&
-	    (curr->queue.length || (curr->maxconn && curr->served >= srv_dynamic_maxconn(curr))))
+	    (curr->queueslength || (curr->maxconn && curr->served >= srv_dynamic_maxconn(curr))))
 		curr = NULL;
 
 	return curr;
@@ -654,7 +654,7 @@ int assign_server(struct stream *s)
 			    ((s->sess->flags & SESS_FL_PREFER_LAST) ||
 			     (!s->be->max_ka_queue ||
 			      server_has_room(tmpsrv) || (
-			      tmpsrv->queue.length + 1 < s->be->max_ka_queue))) &&
+			      tmpsrv->queueslength + 1 < s->be->max_ka_queue))) &&
 			    srv_currently_usable(tmpsrv)) {
 				list_for_each_entry(conn, &pconns->conn_list, sess_el) {
 					if (!(conn->flags & CO_FL_WAIT_XPRT)) {
@@ -681,7 +681,7 @@ int assign_server(struct stream *s)
 		/* if there's some queue on the backend, with certain algos we
 		 * know it's because all servers are full.
 		 */
-		if (s->be->queue.length && s->be->served && s->be->queue.length != s->be->beconn &&
+		if (s->be->queueslength && s->be->served && s->be->queueslength != s->be->beconn &&
 		    (((s->be->lbprm.algo & (BE_LB_KIND|BE_LB_NEED|BE_LB_PARM)) == BE_LB_ALGO_FAS)||   // first
 		     ((s->be->lbprm.algo & (BE_LB_KIND|BE_LB_NEED|BE_LB_PARM)) == BE_LB_ALGO_RR) ||   // roundrobin
 		     ((s->be->lbprm.algo & (BE_LB_KIND|BE_LB_NEED|BE_LB_PARM)) == BE_LB_ALGO_SRR))) { // static-rr
@@ -967,7 +967,6 @@ int assign_server_and_queue(struct stream *s)
 	struct server *srv;
 	int err;
 
- balance_again:
 	if (s->pend_pos)
 		return SRV_STATUS_INTERNAL;
 
@@ -1029,28 +1028,51 @@ int assign_server_and_queue(struct stream *s)
 		 * is set on the server, we must also check that the server's queue is
 		 * not full, in which case we have to return FULL.
 		 */
-		if (srv->maxconn &&
-		    (srv->queue.length || srv->served >= srv_dynamic_maxconn(srv))) {
+		if (srv->maxconn) {
+			struct queue *queue = &srv->per_tgrp[tgid - 1].queue;
+			int served;
+			int got_it = 0;
 
-			if (srv->maxqueue > 0 && srv->queue.length >= srv->maxqueue)
-				return SRV_STATUS_FULL;
-
-			p = pendconn_add(s);
-			if (p) {
-				/* There's a TOCTOU here: it may happen that between the
-				 * moment we decided to queue the request and the moment
-				 * it was done, the last active request on the server
-				 * ended and no new one will be able to dequeue that one.
-				 * Since we already have our server we don't care, this
-				 * will be handled by the caller which will check for
-				 * this condition and will immediately dequeue it if
-				 * possible.
+			/*
+			 * Make sure that there's still a slot on the server.
+			 * Try to increment its served, while making sure
+			 * it is < maxconn.
+			 */
+			if (!queue->length &&
+			    (served = srv->served) < srv_dynamic_maxconn(srv)) {
+				/*
+				 * Attempt to increment served, while
+				 * making sure it is always below maxconn
 				 */
-				return SRV_STATUS_QUEUED;
+
+				do {
+					got_it = _HA_ATOMIC_CAS(&srv->served,
+							        &served, served + 1);
+				} while (!got_it && served < srv_dynamic_maxconn(srv) &&
+					 __ha_cpu_relax());
 			}
-			else
-				return SRV_STATUS_INTERNAL;
-		}
+			if (!got_it) {
+				if (srv->maxqueue > 0 && srv->queueslength >= srv->maxqueue)
+					return SRV_STATUS_FULL;
+
+				p = pendconn_add(s);
+				if (p) {
+					/* There's a TOCTOU here: it may happen that between the
+					 * moment we decided to queue the request and the moment
+					 * it was done, the last active request on the server
+					 * ended and no new one will be able to dequeue that one.
+					 * Since we already have our server we don't care, this
+					 * will be handled by the caller which will check for
+					 * this condition and will immediately dequeue it if
+					 * possible.
+					 */
+					return SRV_STATUS_QUEUED;
+				}
+				else
+					return SRV_STATUS_INTERNAL;
+			}
+		} else
+			_HA_ATOMIC_INC(&srv->served);
 
 		/* OK, we can use this server. Let's reserve our place */
 		sess_change_server(s, srv);
@@ -1066,13 +1088,63 @@ int assign_server_and_queue(struct stream *s)
 			 * ended and no new one will be able to dequeue that one.
 			 * This is more visible with maxconn 1 where it can
 			 * happen 1/1000 times, though the vast majority are
-			 * correctly recovered from. Since it's so rare and we
-			 * have no server assigned, the best solution in this
-			 * case is to detect the condition, dequeue our request
-			 * and balance it again.
+			 * correctly recovered from.
+			 * To work around that, when a server is getting idle,
+			 * it will set the ready_srv field of the proxy.
+			 * Here, if ready_srv is non-NULL, we get that server,
+			 * and we attempt to switch its served from 0 to 1.
+			 * If it works, then we can just run, otherwise,
+			 * it means another stream will be running, and will
+			 * dequeue us eventually, so we can just do nothing.
 			 */
-			if (unlikely(pendconn_must_try_again(p)))
-				goto balance_again;
+			if (unlikely(s->be->ready_srv != NULL)) {
+				struct server *newserv;
+
+				newserv = HA_ATOMIC_XCHG(&s->be->ready_srv, NULL);
+				if (newserv != NULL) {
+					int got_slot = 0;
+
+					while (_HA_ATOMIC_LOAD(&newserv->served) == 0) {
+						int served = 0;
+
+						if (_HA_ATOMIC_CAS(&newserv->served, &served, 1)) {
+							got_slot = 1;
+							break;
+						}
+					}
+					if (!got_slot) {
+						/*
+						 * Somebody else can now
+						 * wake up us, stop now.
+						 */
+						return SRV_STATUS_QUEUED;
+					}
+
+					HA_SPIN_LOCK(QUEUE_LOCK, &p->queue->lock);
+					if (!p->node.node.leaf_p) {
+						/*
+						 * Okay we've been queued and
+						 * unqueued already, just leave
+						 */
+						_HA_ATOMIC_DEC(&newserv->served);
+						return SRV_STATUS_QUEUED;
+					}
+					eb32_delete(&p->node);
+					HA_SPIN_UNLOCK(QUEUE_LOCK, &p->queue->lock);
+
+					_HA_ATOMIC_DEC(&p->queue->length);
+					_HA_ATOMIC_INC(&p->queue->idx);
+					_HA_ATOMIC_DEC(&s->be->totpend);
+
+					pool_free(pool_head_pendconn, p);
+
+					s->flags |= SF_ASSIGNED;
+					s->target = &newserv->obj_type;
+					s->pend_pos = NULL;
+					sess_change_server(s, newserv);
+					return SRV_STATUS_OK;
+				}
+			}
 
 			return SRV_STATUS_QUEUED;
 		}
@@ -1191,7 +1263,9 @@ int alloc_bind_address(struct sockaddr_storage **ss,
  */
 struct connection *conn_backend_get(struct stream *s, struct server *srv, int is_safe, int64_t hash)
 {
+	const struct tgroup_info *curtg = tg;
 	struct connection *conn = NULL;
+	unsigned int curtgid = tgid;
 	int i; // thread number
 	int found = 0;
 	int stop;
@@ -1246,10 +1320,10 @@ struct connection *conn_backend_get(struct stream *s, struct server *srv, int is
 	 * unvisited thread, but always staying in the same group.
 	 */
 	stop = srv->per_tgrp[tgid - 1].next_takeover;
-	if (stop >= tg->count)
-		stop %= tg->count;
-
-	stop += tg->base;
+	if (stop >= curtg->count)
+		stop %= curtg->count;
+	stop += curtg->base;
+check_tgid:
 	i = stop;
 	do {
 		if (!srv->curr_idle_thr[i] || i == tid)
@@ -1284,8 +1358,21 @@ struct connection *conn_backend_get(struct stream *s, struct server *srv, int is
 			}
 		}
 		HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[i].idle_conns_lock);
-	} while (!found && (i = (i + 1 == tg->base + tg->count) ? tg->base : i + 1) != stop);
+	} while (!found && (i = (i + 1 == curtg->base + curtg->count) ? curtg->base : i + 1) != stop);
 
+	if (!found && (global.tune.tg_takeover == FULL_THREADGROUP_TAKEOVER ||
+	    (global.tune.tg_takeover == RESTRICTED_THREADGROUP_TAKEOVER &&
+	    srv->flags & (SRV_F_RHTTP | SRV_F_STRICT_MAXCONN)))) {
+		curtgid = curtgid + 1;
+		if (curtgid == global.nbtgroups + 1)
+			curtgid = 1;
+		/* If we haven't looped yet */
+		if (curtgid != tgid) {
+			curtg = &ha_tgroup_info[curtgid - 1];
+			stop = curtg->base;
+			goto check_tgid;
+		}
+	}
 	if (!found)
 		conn = NULL;
  done:
@@ -1350,6 +1437,83 @@ static int do_connect_server(struct stream *s, struct connection *conn)
 		conn_get_src(conn);
 
 	return ret;
+}
+
+/*
+ * Returns the first connection from a tree we managed to take over,
+ * if any.
+ */
+static struct connection *
+takeover_random_idle_conn(struct eb_root *root, int curtid)
+{
+	struct conn_hash_node *hash_node;
+	struct connection *conn = NULL;
+	struct eb64_node *node = eb64_first(root);
+
+	while (node) {
+		hash_node = eb64_entry(node, struct conn_hash_node, node);
+		conn = hash_node->conn;
+		if (conn && conn->mux->takeover && conn->mux->takeover(conn, curtid, 0) == 0) {
+			conn_delete_from_tree(conn);
+			return conn;
+		}
+		node = eb64_next(node);
+	}
+
+	return NULL;
+}
+
+/*
+ * Kills an idle connection, any idle connection we can get a hold on.
+ * The goal is just to free a connection in case we reached the max and
+ * have to establish a new one.
+ * Returns -1 if there is no idle connection to kill, 0 if there are some
+ * available but we failed to get one, and 1 if we successfully killed one.
+ */
+static int
+kill_random_idle_conn(struct server *srv)
+{
+	struct connection *conn = NULL;
+	int i;
+	int curtid;
+	/* No idle conn, then there is nothing we can do at this point */
+
+	if (srv->curr_idle_conns == 0)
+		return -1;
+	for (i = 0; i < global.nbthread; i++) {
+		curtid = (i + tid) % global.nbthread;
+
+		if (HA_SPIN_TRYLOCK(IDLE_CONNS_LOCK, &idle_conns[curtid].idle_conns_lock) != 0)
+			continue;
+		conn = takeover_random_idle_conn(&srv->per_thr[curtid].idle_conns, curtid);
+		if (!conn)
+			conn = takeover_random_idle_conn(&srv->per_thr[curtid].safe_conns, curtid);
+		HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[curtid].idle_conns_lock);
+		if (conn)
+			break;
+	}
+	if (conn) {
+		/*
+		 * We have to manually decrement counters, as srv_release_conn()
+		 * will attempt to access the current tid's counters, while
+		 * we may have taken the connection from a different thread.
+		 */
+		if (conn->flags & CO_FL_LIST_MASK) {
+			_HA_ATOMIC_DEC(&srv->curr_idle_conns);
+			_HA_ATOMIC_DEC(conn->flags & CO_FL_SAFE_LIST ? &srv->curr_safe_nb : &srv->curr_idle_nb);
+			_HA_ATOMIC_DEC(&srv->curr_idle_thr[curtid]);
+			conn->flags &= ~CO_FL_LIST_MASK;
+			/*
+			 * If we have no list flag then srv_release_conn()
+			 * will consider the connection is used, so let's
+			 * pretend it is.
+			 */
+			_HA_ATOMIC_INC(&srv->curr_used_conns);
+		}
+		conn->mux->destroy(conn->ctx);
+		return 1;
+	}
+	return 0;
 }
 
 /*
@@ -1434,7 +1598,7 @@ int connect_server(struct stream *s)
 	hash_params.src_addr = bind_addr;
 
 	/* 5. proxy protocol */
-	if (srv && srv->pp_opts) {
+	if (srv && (srv->pp_opts & SRV_PP_ENABLED)) {
 		proxy_line_ret = make_proxy_line(trash.area, trash.size, srv, cli_conn, s, strm_sess(s));
 		if (proxy_line_ret) {
 			hash_params.proxy_prehash =
@@ -1603,6 +1767,9 @@ int connect_server(struct stream *s)
 					task_wakeup(idle_conns[i].cleanup_task, TASK_WOKEN_OTHER);
 					break;
 				}
+
+				if (!(global.tune.options & GTUNE_IDLE_POOL_SHARED))
+					break;
 			}
 		}
 
@@ -1638,12 +1805,49 @@ int connect_server(struct stream *s)
 skip_reuse:
 	/* no reuse or failed to reuse the connection above, pick a new one */
 	if (!srv_conn) {
+		unsigned int total_conns;
+
 		if (srv && (srv->flags & SRV_F_RHTTP)) {
 			DBG_TRACE_USER("cannot open a new connection for reverse server", STRM_EV_STRM_PROC|STRM_EV_CS_ST, s);
 			s->conn_err_type = STRM_ET_CONN_ERR;
 			return SF_ERR_INTERNAL;
 		}
 
+		if (srv && (srv->flags & SRV_F_STRICT_MAXCONN)) {
+			int kill_tries = 0;
+			/*
+			 * Before creating a new connection, make sure we still
+			 * have a slot for that
+			 */
+			total_conns = srv->curr_total_conns;
+
+			while (1) {
+				if (total_conns < srv->maxconn) {
+					if (_HA_ATOMIC_CAS(&srv->curr_total_conns,
+					    &total_conns, total_conns + 1))
+						break;
+					__ha_cpu_relax();
+				} else {
+					int ret = kill_random_idle_conn(srv);
+
+					/*
+					 * There is no idle connection to kill
+					 * so there is nothing we can do at
+					 * that point but to report an
+					 * error.
+					 */
+					if (ret == -1)
+						return SF_ERR_RESOURCE;
+					kill_tries++;
+					/*
+					 * We tried 3 times to kill an idle
+					 * connection, we failed, give up now.
+					 */
+					if (ret == 0 && kill_tries == 3)
+						return SF_ERR_RESOURCE;
+				}
+			}
+		}
 		srv_conn = conn_new(s->target);
 		if (srv_conn) {
 			DBG_TRACE_STATE("alloc new be connection", STRM_EV_STRM_PROC|STRM_EV_CS_ST, s);
@@ -1672,7 +1876,8 @@ skip_reuse:
 			}
 
 			srv_conn->hash_node->node.key = hash;
-		}
+		} else if (srv && (srv->flags & SRV_F_STRICT_MAXCONN))
+			_HA_ATOMIC_DEC(&srv->curr_total_conns);
 	}
 
 	/* if bind_addr is non NULL free it */
@@ -1727,7 +1932,7 @@ skip_reuse:
 		/* process the case where the server requires the PROXY protocol to be sent */
 		srv_conn->send_proxy_ofs = 0;
 
-		if (srv && srv->pp_opts) {
+		if (srv && (srv->pp_opts & SRV_PP_ENABLED)) {
 			srv_conn->flags |= CO_FL_SEND_PROXY;
 			srv_conn->send_proxy_ofs = 1; /* must compute size */
 		}
@@ -2992,7 +3197,7 @@ smp_fetch_connslots(const struct arg *args, struct sample *smp, const char *kw, 
 		}
 
 		smp->data.u.sint += (iterator->maxconn - iterator->cur_sess)
-		                       +  (iterator->maxqueue - iterator->queue.length);
+		                       +  (iterator->maxqueue - iterator->queueslength);
 	}
 
 	return 1;
@@ -3269,7 +3474,7 @@ smp_fetch_srv_queue(const struct arg *args, struct sample *smp, const char *kw, 
 {
 	smp->flags = SMP_F_VOL_TEST;
 	smp->data.type = SMP_T_SINT;
-	smp->data.u.sint = args->data.srv->queue.length;
+	smp->data.u.sint = args->data.srv->queueslength;
 	return 1;
 }
 
@@ -3411,7 +3616,7 @@ sample_conv_srv_queue(const struct arg *args, struct sample *smp, void *private)
 		return 0;
 
 	smp->data.type = SMP_T_SINT;
-	smp->data.u.sint = srv->queue.length;
+	smp->data.u.sint = srv->queueslength;
 	return 1;
 }
 

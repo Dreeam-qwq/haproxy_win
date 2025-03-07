@@ -135,22 +135,39 @@ int tcp_inspect_request(struct stream *s, struct channel *req, int an_bit)
 	 * current rule, and go to the action execution point.
 	 */
 	if (s->current_rule) {
+		int forced = s->flags & SF_RULE_FYIELD;
+
 		rule = s->current_rule;
 		s->current_rule = NULL;
+		s->flags &= ~SF_RULE_FYIELD;
 		if (!(req->flags & SC_FL_ERROR) && !(req->flags & (CF_READ_TIMEOUT|CF_WRITE_TIMEOUT))) {
 			s->waiting_entity.type = STRM_ENTITY_NONE;
 			s->waiting_entity.ptr = NULL;
 		}
-		if ((def_rules && s->current_rule_list == def_rules) || s->current_rule_list == rules)
+		if ((def_rules && s->current_rule_list == def_rules) || s->current_rule_list == rules) {
+			if (forced)
+				goto resume_rule;
 			goto resume_execution;
+		}
 	}
 	s->current_rule_list = ((!def_rules || s->current_rule_list == def_rules) ? rules : def_rules);
 
   restart:
 	list_for_each_entry(rule, s->current_rule_list, list) {
-		enum acl_test_res ret = ACL_TEST_PASS;
+ resume_rule:
+		/* check if budget is exceeded and we need to continue on the next
+		 * polling loop, unless we know that we cannot yield
+		 */
+		if (s->rules_bcount++ >= global.tune.max_rules_at_once && !(act_opts & ACT_OPT_FINAL)) {
+			s->current_rule = rule;
+			s->flags |= SF_RULE_FYIELD;
+			task_wakeup(s->task, TASK_WOKEN_MSG);
+			goto missing_data;
+		}
 
 		if (rule->cond) {
+			enum acl_test_res ret = ACL_TEST_PASS;
+
 			ret = acl_exec_cond(rule->cond, s->be, sess, s, SMP_OPT_DIR_REQ | partial);
 			if (ret == ACL_TEST_MISS)
 				goto missing_data;
@@ -158,65 +175,67 @@ int tcp_inspect_request(struct stream *s, struct channel *req, int an_bit)
 			ret = acl_pass(ret);
 			if (rule->cond->pol == ACL_COND_UNLESS)
 				ret = !ret;
+
+			if (!ret)
+				continue;
 		}
 
-		if (ret) {
-			act_opts |= ACT_OPT_FIRST;
+		act_opts |= ACT_OPT_FIRST;
 resume_execution:
-			/* Always call the action function if defined */
-			if (rule->action_ptr) {
-				switch (rule->action_ptr(rule, s->be, s->sess, s, act_opts)) {
-					case ACT_RET_CONT:
-						break;
-					case ACT_RET_STOP:
-					case ACT_RET_DONE:
-						s->last_entity.type = STRM_ENTITY_RULE;
-						s->last_entity.ptr  = rule;
-						goto end;
-					case ACT_RET_YIELD:
-						s->current_rule = rule;
-						if (act_opts & ACT_OPT_FINAL) {
-							send_log(s->be, LOG_WARNING,
-								 "Internal error: yield not allowed if the inspect-delay expired "
-								 "for the tcp-request content actions.");
-							s->last_entity.type = STRM_ENTITY_RULE;
-							s->last_entity.ptr  = rule;
-							goto internal;
-						}
-						s->waiting_entity.type = STRM_ENTITY_RULE;
-						s->waiting_entity.ptr  = rule;
-						goto missing_data;
-					case ACT_RET_DENY:
-						s->last_entity.type = STRM_ENTITY_RULE;
-						s->last_entity.ptr  = rule;
-						goto deny;
-					case ACT_RET_ABRT:
-						s->last_entity.type = STRM_ENTITY_RULE;
-						s->last_entity.ptr  = rule;
-						goto abort;
-					case ACT_RET_ERR:
+		/* Always call the action function if defined */
+		if (rule->action_ptr) {
+			switch (rule->action_ptr(rule, s->be, s->sess, s, act_opts)) {
+				case ACT_RET_CONT:
+					break;
+				case ACT_RET_STOP:
+				case ACT_RET_DONE:
+					s->last_entity.type = STRM_ENTITY_RULE;
+					s->last_entity.ptr  = rule;
+					goto end;
+				case ACT_RET_YIELD:
+					s->current_rule = rule;
+					if (act_opts & ACT_OPT_FINAL) {
+						send_log(s->be, LOG_WARNING,
+							 "Internal error: yield not allowed if the inspect-delay expired "
+							 "for the tcp-request content actions.");
 						s->last_entity.type = STRM_ENTITY_RULE;
 						s->last_entity.ptr  = rule;
 						goto internal;
-					case ACT_RET_INV:
-						s->last_entity.type = STRM_ENTITY_RULE;
-						s->last_entity.ptr  = rule;
-						goto invalid;
-				}
-				continue; /* eval the next rule */
+					}
+					s->waiting_entity.type = STRM_ENTITY_RULE;
+					s->waiting_entity.ptr  = rule;
+					goto missing_data;
+				case ACT_RET_DENY:
+					s->last_entity.type = STRM_ENTITY_RULE;
+					s->last_entity.ptr  = rule;
+					goto deny;
+				case ACT_RET_ABRT:
+					stream_report_term_evt(s->scf, strm_tevt_type_intercepted);
+					s->last_entity.type = STRM_ENTITY_RULE;
+					s->last_entity.ptr  = rule;
+					goto abort;
+				case ACT_RET_ERR:
+					s->last_entity.type = STRM_ENTITY_RULE;
+					s->last_entity.ptr  = rule;
+					goto internal;
+				case ACT_RET_INV:
+					s->last_entity.type = STRM_ENTITY_RULE;
+					s->last_entity.ptr  = rule;
+					goto invalid;
 			}
+			continue; /* eval the next rule */
+		}
 
-			/* If not action function defined, check for known actions */
-			if (rule->action == ACT_ACTION_ALLOW) {
-				s->last_entity.type = STRM_ENTITY_RULE;
-				s->last_entity.ptr  = rule;
-				goto end;
-			}
-			else if (rule->action == ACT_ACTION_DENY) {
-				s->last_entity.type = STRM_ENTITY_RULE;
-				s->last_entity.ptr  = rule;
-				goto deny;
-			}
+		/* If not action function defined, check for known actions */
+		if (rule->action == ACT_ACTION_ALLOW) {
+			s->last_entity.type = STRM_ENTITY_RULE;
+			s->last_entity.ptr  = rule;
+			goto end;
+		}
+		else if (rule->action == ACT_ACTION_DENY) {
+			s->last_entity.type = STRM_ENTITY_RULE;
+			s->last_entity.ptr  = rule;
+			goto deny;
 		}
 	}
 
@@ -248,6 +267,7 @@ resume_execution:
 	_HA_ATOMIC_INC(&sess->fe->fe_counters.denied_req);
 	if (sess->listener && sess->listener->counters)
 		_HA_ATOMIC_INC(&sess->listener->counters->denied_req);
+	stream_report_term_evt(s->scf, strm_tevt_type_intercepted);
 	goto reject;
 
  internal:
@@ -256,18 +276,21 @@ resume_execution:
 		_HA_ATOMIC_INC(&sess->listener->counters->internal_errors);
 	if (!(s->flags & SF_ERR_MASK))
 		s->flags |= SF_ERR_INTERNAL;
+	stream_report_term_evt(s->scf, strm_tevt_type_internal_err);
 	goto reject;
 
  invalid:
 	_HA_ATOMIC_INC(&sess->fe->fe_counters.failed_req);
 	if (sess->listener && sess->listener->counters)
 		_HA_ATOMIC_INC(&sess->listener->counters->failed_req);
+	stream_report_term_evt(s->scf, strm_tevt_type_proto_err);
 
  reject:
 	sc_must_kill_conn(s->scf);
 	stream_abort(s);
 
  abort:
+	// XXX: All errors are handled as intercepted here !
 	req->analysers &= AN_REQ_FLT_END;
 	s->current_rule = s->current_rule_list = NULL;
 	req->analyse_exp = s->rules_exp = TICK_ETERNITY;
@@ -325,22 +348,39 @@ int tcp_inspect_response(struct stream *s, struct channel *rep, int an_bit)
 	 * current rule, and go to the action execution point.
 	 */
 	if (s->current_rule) {
+		int forced = s->flags & SF_RULE_FYIELD;
+
 		rule = s->current_rule;
 		s->current_rule = NULL;
+		s->flags &= ~SF_RULE_FYIELD;
 		if (!(rep->flags & SC_FL_ERROR) && !(rep->flags & (CF_READ_TIMEOUT|CF_WRITE_TIMEOUT))) {
 			s->waiting_entity.type = STRM_ENTITY_NONE;
 			s->waiting_entity.ptr = NULL;
 		}
-		if ((def_rules && s->current_rule_list == def_rules) || s->current_rule_list == rules)
+		if ((def_rules && s->current_rule_list == def_rules) || s->current_rule_list == rules) {
+			if (forced)
+				goto resume_rule;
 			goto resume_execution;
+		}
 	}
 	s->current_rule_list = ((!def_rules || s->current_rule_list == def_rules) ? rules : def_rules);
 
   restart:
 	list_for_each_entry(rule, s->current_rule_list, list) {
-		enum acl_test_res ret = ACL_TEST_PASS;
+ resume_rule:
+		/* check if budget is exceeded and we need to continue on the next
+		 * polling loop, unless we know that we cannot yield
+		 */
+		if (s->rules_bcount++ >= global.tune.max_rules_at_once && !(act_opts & ACT_OPT_FINAL)) {
+			s->current_rule = rule;
+			s->flags |= SF_RULE_FYIELD;
+			task_wakeup(s->task, TASK_WOKEN_MSG);
+			goto missing_data;
+		}
 
 		if (rule->cond) {
+			enum acl_test_res ret = ACL_TEST_PASS;
+
 			ret = acl_exec_cond(rule->cond, s->be, sess, s, SMP_OPT_DIR_RES | partial);
 			if (ret == ACL_TEST_MISS)
 				goto missing_data;
@@ -348,76 +388,76 @@ int tcp_inspect_response(struct stream *s, struct channel *rep, int an_bit)
 			ret = acl_pass(ret);
 			if (rule->cond->pol == ACL_COND_UNLESS)
 				ret = !ret;
+			if (!ret)
+				continue;
 		}
 
-		if (ret) {
-			act_opts |= ACT_OPT_FIRST;
+		act_opts |= ACT_OPT_FIRST;
 resume_execution:
 
-			/* Always call the action function if defined */
-			if (rule->action_ptr) {
-				switch (rule->action_ptr(rule, s->be, s->sess, s, act_opts)) {
-					case ACT_RET_CONT:
-						break;
-					case ACT_RET_STOP:
-					case ACT_RET_DONE:
-						s->last_entity.type = STRM_ENTITY_RULE;
-						s->last_entity.ptr  = rule;
-						goto end;
-					case ACT_RET_YIELD:
-						s->current_rule = rule;
-						if (act_opts & ACT_OPT_FINAL) {
-							send_log(s->be, LOG_WARNING,
-								 "Internal error: yield not allowed if the inspect-delay expired "
-								 "for the tcp-response content actions.");
-							s->last_entity.type = STRM_ENTITY_RULE;
-							s->last_entity.ptr  = rule;
-							goto internal;
-						}
-						s->waiting_entity.type = STRM_ENTITY_RULE;
-						s->waiting_entity.ptr  = rule;
-						channel_dont_close(rep);
-						goto missing_data;
-					case ACT_RET_DENY:
-						s->last_entity.type = STRM_ENTITY_RULE;
-						s->last_entity.ptr  = rule;
-						goto deny;
-					case ACT_RET_ABRT:
-						s->last_entity.type = STRM_ENTITY_RULE;
-						s->last_entity.ptr  = rule;
-						goto abort;
-					case ACT_RET_ERR:
+		/* Always call the action function if defined */
+		if (rule->action_ptr) {
+			switch (rule->action_ptr(rule, s->be, s->sess, s, act_opts)) {
+				case ACT_RET_CONT:
+					break;
+				case ACT_RET_STOP:
+				case ACT_RET_DONE:
+					s->last_entity.type = STRM_ENTITY_RULE;
+					s->last_entity.ptr  = rule;
+					goto end;
+				case ACT_RET_YIELD:
+					s->current_rule = rule;
+					if (act_opts & ACT_OPT_FINAL) {
+						send_log(s->be, LOG_WARNING,
+							 "Internal error: yield not allowed if the inspect-delay expired "
+							 "for the tcp-response content actions.");
 						s->last_entity.type = STRM_ENTITY_RULE;
 						s->last_entity.ptr  = rule;
 						goto internal;
-					case ACT_RET_INV:
-						s->last_entity.type = STRM_ENTITY_RULE;
-						s->last_entity.ptr  = rule;
-						goto invalid;
-				}
-				continue; /* eval the next rule */
+					}
+					s->waiting_entity.type = STRM_ENTITY_RULE;
+					s->waiting_entity.ptr  = rule;
+					goto missing_data;
+				case ACT_RET_DENY:
+					s->last_entity.type = STRM_ENTITY_RULE;
+					s->last_entity.ptr  = rule;
+					goto deny;
+				case ACT_RET_ABRT:
+					stream_report_term_evt(s->scb, strm_tevt_type_intercepted);
+					s->last_entity.type = STRM_ENTITY_RULE;
+					s->last_entity.ptr  = rule;
+					goto abort;
+				case ACT_RET_ERR:
+					s->last_entity.type = STRM_ENTITY_RULE;
+					s->last_entity.ptr  = rule;
+					goto internal;
+				case ACT_RET_INV:
+					s->last_entity.type = STRM_ENTITY_RULE;
+					s->last_entity.ptr  = rule;
+					goto invalid;
 			}
+			continue; /* eval the next rule */
+		}
 
-			/* If not action function defined, check for known actions */
-			if (rule->action == ACT_ACTION_ALLOW) {
-				s->last_entity.type = STRM_ENTITY_RULE;
-				s->last_entity.ptr  = rule;
-				goto end;
-			}
-			else if (rule->action == ACT_ACTION_DENY) {
-				s->last_entity.type = STRM_ENTITY_RULE;
-				s->last_entity.ptr  = rule;
-				goto deny;
-			}
-			else if (rule->action == ACT_TCP_CLOSE) {
-				s->scb->flags |= SC_FL_NOLINGER | SC_FL_NOHALF;
-				sc_must_kill_conn(s->scb);
-				sc_abort(s->scb);
-				sc_shutdown(s->scb);
-				s->last_entity.type = STRM_ENTITY_RULE;
-				s->last_entity.ptr  = rule;
-				goto end;
-			}
+		/* If not action function defined, check for known actions */
+		if (rule->action == ACT_ACTION_ALLOW) {
+			s->last_entity.type = STRM_ENTITY_RULE;
+			s->last_entity.ptr  = rule;
+			goto end;
+		}
+		else if (rule->action == ACT_ACTION_DENY) {
+			s->last_entity.type = STRM_ENTITY_RULE;
+			s->last_entity.ptr  = rule;
+			goto deny;
+		}
+		else if (rule->action == ACT_TCP_CLOSE) {
+			s->scb->flags |= SC_FL_NOLINGER | SC_FL_NOHALF;
+			sc_must_kill_conn(s->scb);
+			sc_abort(s->scb);
+			sc_shutdown(s->scb);
+			s->last_entity.type = STRM_ENTITY_RULE;
+			s->last_entity.ptr  = rule;
+			goto end;
 		}
 	}
 
@@ -438,6 +478,7 @@ resume_execution:
 
  missing_data:
 	/* just set the analyser timeout once at the beginning of the response */
+	channel_dont_close(rep);
 	if (!tick_isset(s->rules_exp) && s->be->tcp_rep.inspect_delay)
 		s->rules_exp = tick_add(now_ms, s->be->tcp_rep.inspect_delay);
 	rep->analyse_exp = tick_first((tick_is_expired(rep->analyse_exp, now_ms) ? 0 : rep->analyse_exp), s->rules_exp);
@@ -451,6 +492,7 @@ resume_execution:
 		_HA_ATOMIC_INC(&s->sess->listener->counters->denied_resp);
 	if (objt_server(s->target))
 		_HA_ATOMIC_INC(&__objt_server(s->target)->counters.denied_resp);
+	stream_report_term_evt(s->scb, strm_tevt_type_intercepted);
 	goto reject;
 
  internal:
@@ -462,12 +504,14 @@ resume_execution:
 		_HA_ATOMIC_INC(&__objt_server(s->target)->counters.internal_errors);
 	if (!(s->flags & SF_ERR_MASK))
 		s->flags |= SF_ERR_INTERNAL;
+	stream_report_term_evt(s->scf, strm_tevt_type_internal_err);
 	goto reject;
 
  invalid:
 	_HA_ATOMIC_INC(&s->be->be_counters.failed_resp);
 	if (objt_server(s->target))
 		_HA_ATOMIC_INC(&__objt_server(s->target)->counters.failed_resp);
+	stream_report_term_evt(s->scf, strm_tevt_type_proto_err);
 
  reject:
 	sc_must_kill_conn(s->scb);
@@ -498,7 +542,6 @@ int tcp_exec_l4_rules(struct session *sess)
 	struct act_rule *rule;
 	struct connection *conn = objt_conn(sess->origin);
 	int result = 1;
-	enum acl_test_res ret;
 
 	if (!conn)
 		return result;
@@ -508,71 +551,64 @@ int tcp_exec_l4_rules(struct session *sess)
 
   restart:
 	list_for_each_entry(rule, &px->tcp_req.l4_rules, list) {
-		ret = ACL_TEST_PASS;
 
-		if (rule->cond) {
-			ret = acl_exec_cond(rule->cond, sess->fe, sess, NULL, SMP_OPT_DIR_REQ|SMP_OPT_FINAL);
-			ret = acl_pass(ret);
-			if (rule->cond->pol == ACL_COND_UNLESS)
-				ret = !ret;
+		if (!acl_match_cond(rule->cond, sess->fe, sess, NULL, SMP_OPT_DIR_REQ|SMP_OPT_FINAL))
+			continue;
+
+		/* Always call the action function if defined */
+		if (rule->action_ptr) {
+			switch (rule->action_ptr(rule, sess->fe, sess, NULL, ACT_OPT_FINAL | ACT_OPT_FIRST)) {
+				case ACT_RET_YIELD:
+					/* yield is not allowed at this point. If this return code is
+					 * used it is a bug, so I prefer to abort the process.
+					 */
+					send_log(sess->fe, LOG_WARNING,
+						 "Internal error: yield not allowed with tcp-request connection actions.");
+					/* fall through */
+				case ACT_RET_STOP:
+				case ACT_RET_DONE:
+					goto end;
+				case ACT_RET_CONT:
+					break;
+				case ACT_RET_DENY:
+				case ACT_RET_ABRT:
+				case ACT_RET_ERR:
+				case ACT_RET_INV:
+					result = 0;
+					goto end;
+			}
+			continue; /* eval the next rule */
 		}
 
-		if (ret) {
-			/* Always call the action function if defined */
-			if (rule->action_ptr) {
-				switch (rule->action_ptr(rule, sess->fe, sess, NULL, ACT_OPT_FINAL | ACT_OPT_FIRST)) {
-					case ACT_RET_YIELD:
-						/* yield is not allowed at this point. If this return code is
-						 * used it is a bug, so I prefer to abort the process.
-						 */
-						send_log(sess->fe, LOG_WARNING,
-							 "Internal error: yield not allowed with tcp-request connection actions.");
-						/* fall through */
-					case ACT_RET_STOP:
-					case ACT_RET_DONE:
-						goto end;
-					case ACT_RET_CONT:
-						break;
-					case ACT_RET_DENY:
-					case ACT_RET_ABRT:
-					case ACT_RET_ERR:
-					case ACT_RET_INV:
-						result = 0;
-						goto end;
+		/* If not action function defined, check for known actions */
+		if (rule->action == ACT_ACTION_ALLOW) {
+			goto end;
+		}
+		else if (rule->action == ACT_ACTION_DENY) {
+			_HA_ATOMIC_INC(&sess->fe->fe_counters.denied_conn);
+			if (sess->listener && sess->listener->counters)
+				_HA_ATOMIC_INC(&sess->listener->counters->denied_conn);
+
+			result = 0;
+			goto end;
+		}
+		else if (rule->action == ACT_TCP_EXPECT_PX) {
+			if (!(conn->flags & CO_FL_HANDSHAKE)) {
+				if (xprt_add_hs(conn) < 0) {
+					result = 0;
+					goto end;
 				}
-				continue; /* eval the next rule */
 			}
-
-			/* If not action function defined, check for known actions */
-			if (rule->action == ACT_ACTION_ALLOW) {
-				goto end;
-			}
-			else if (rule->action == ACT_ACTION_DENY) {
-				_HA_ATOMIC_INC(&sess->fe->fe_counters.denied_conn);
-				if (sess->listener && sess->listener->counters)
-					_HA_ATOMIC_INC(&sess->listener->counters->denied_conn);
-
+			conn->flags |= CO_FL_ACCEPT_PROXY;
+		}
+		else if (rule->action == ACT_TCP_EXPECT_CIP) {
+			if (!(conn->flags & CO_FL_HANDSHAKE)) {
+				if (xprt_add_hs(conn) < 0) {
 				result = 0;
-				goto end;
-			}
-			else if (rule->action == ACT_TCP_EXPECT_PX) {
-				if (!(conn->flags & CO_FL_HANDSHAKE)) {
-					if (xprt_add_hs(conn) < 0) {
-						result = 0;
-						goto end;
-					}
+					goto end;
 				}
-				conn->flags |= CO_FL_ACCEPT_PROXY;
 			}
-			else if (rule->action == ACT_TCP_EXPECT_CIP) {
-				if (!(conn->flags & CO_FL_HANDSHAKE)) {
-					if (xprt_add_hs(conn) < 0) {
-						result = 0;
-						goto end;
-					}
-				}
-				conn->flags |= CO_FL_ACCEPT_CIP;
-			}
+			conn->flags |= CO_FL_ACCEPT_CIP;
 		}
 	}
 
@@ -581,6 +617,8 @@ int tcp_exec_l4_rules(struct session *sess)
 		goto restart;
 	}
  end:
+	if (!result)
+		conn_report_term_evt(conn, tevt_loc_fd, fd_tevt_type_intercepted);
 	return result;
 }
 
@@ -596,60 +634,51 @@ int tcp_exec_l5_rules(struct session *sess)
 	struct proxy *px = sess->fe;
 	struct act_rule *rule;
 	int result = 1;
-	enum acl_test_res ret;
 
 	if  (sess->fe->defpx && (sess->fe->mode == PR_MODE_TCP || sess->fe->mode == PR_MODE_HTTP))
 		px = sess->fe->defpx;
 
   restart:
 	list_for_each_entry(rule, &px->tcp_req.l5_rules, list) {
-		ret = ACL_TEST_PASS;
+		if (!acl_match_cond(rule->cond, sess->fe, sess, NULL, SMP_OPT_DIR_REQ|SMP_OPT_FINAL))
+			continue;
 
-		if (rule->cond) {
-			ret = acl_exec_cond(rule->cond, sess->fe, sess, NULL, SMP_OPT_DIR_REQ|SMP_OPT_FINAL);
-			ret = acl_pass(ret);
-			if (rule->cond->pol == ACL_COND_UNLESS)
-				ret = !ret;
+		/* Always call the action function if defined */
+		if (rule->action_ptr) {
+			switch (rule->action_ptr(rule, sess->fe, sess, NULL, ACT_OPT_FINAL | ACT_OPT_FIRST)) {
+				case ACT_RET_YIELD:
+					/* yield is not allowed at this point. If this return code is
+					 * used it is a bug, so I prefer to abort the process.
+					 */
+					send_log(sess->fe, LOG_WARNING,
+						 "Internal error: yield not allowed with tcp-request session actions.");
+					/* fall through */
+				case ACT_RET_STOP:
+				case ACT_RET_DONE:
+					goto end;
+				case ACT_RET_CONT:
+					break;
+				case ACT_RET_DENY:
+				case ACT_RET_ABRT:
+				case ACT_RET_ERR:
+				case ACT_RET_INV:
+					result = 0;
+					goto end;
+			}
+			continue; /* eval the next rule */
 		}
 
-		if (ret) {
-			/* Always call the action function if defined */
-			if (rule->action_ptr) {
-				switch (rule->action_ptr(rule, sess->fe, sess, NULL, ACT_OPT_FINAL | ACT_OPT_FIRST)) {
-					case ACT_RET_YIELD:
-						/* yield is not allowed at this point. If this return code is
-						 * used it is a bug, so I prefer to abort the process.
-						 */
-						send_log(sess->fe, LOG_WARNING,
-							 "Internal error: yield not allowed with tcp-request session actions.");
-						/* fall through */
-					case ACT_RET_STOP:
-					case ACT_RET_DONE:
-						goto end;
-					case ACT_RET_CONT:
-						break;
-					case ACT_RET_DENY:
-					case ACT_RET_ABRT:
-					case ACT_RET_ERR:
-					case ACT_RET_INV:
-						result = 0;
-						goto end;
-				}
-				continue; /* eval the next rule */
-			}
+		/* If not action function defined, check for known actions */
+		if (rule->action == ACT_ACTION_ALLOW) {
+			goto end;
+		}
+		else if (rule->action == ACT_ACTION_DENY) {
+			_HA_ATOMIC_INC(&sess->fe->fe_counters.denied_sess);
+			if (sess->listener && sess->listener->counters)
+				_HA_ATOMIC_INC(&sess->listener->counters->denied_sess);
 
-			/* If not action function defined, check for known actions */
-			if (rule->action == ACT_ACTION_ALLOW) {
-				goto end;
-			}
-			else if (rule->action == ACT_ACTION_DENY) {
-				_HA_ATOMIC_INC(&sess->fe->fe_counters.denied_sess);
-				if (sess->listener && sess->listener->counters)
-					_HA_ATOMIC_INC(&sess->listener->counters->denied_sess);
-
-				result = 0;
-				goto end;
-			}
+			result = 0;
+			goto end;
 		}
 	}
 
@@ -1200,6 +1229,8 @@ static int tcp_parse_tcp_rep(char **args, int section_type, struct proxy *curpx,
 			warn++;
 		}
 
+		/* the following function directly emits the warning */
+		warnif_misplaced_tcp_res_cont(curpx, file, line, args[0], args[1]);
 		LIST_APPEND(&curpx->tcp_rep.inspect_rules, &rule->list);
 	}
 	else {
@@ -1319,7 +1350,7 @@ static int tcp_parse_tcp_req(char **args, int section_type, struct proxy *curpx,
 		}
 
 		/* the following function directly emits the warning */
-		warnif_misplaced_tcp_cont(curpx, file, line, args[0]);
+		warnif_misplaced_tcp_req_cont(curpx, file, line, args[0], args[1]);
 		LIST_APPEND(&curpx->tcp_req.inspect_rules, &rule->list);
 	}
 	else if (strcmp(args[1], "connection") == 0) {
@@ -1364,7 +1395,7 @@ static int tcp_parse_tcp_req(char **args, int section_type, struct proxy *curpx,
 		}
 
 		/* the following function directly emits the warning */
-		warnif_misplaced_tcp_conn(curpx, file, line, args[0]);
+		warnif_misplaced_tcp_req_conn(curpx, file, line, args[0], args[1]);
 		LIST_APPEND(&curpx->tcp_req.l4_rules, &rule->list);
 	}
 	else if (strcmp(args[1], "session") == 0) {
@@ -1408,7 +1439,7 @@ static int tcp_parse_tcp_req(char **args, int section_type, struct proxy *curpx,
 		}
 
 		/* the following function directly emits the warning */
-		warnif_misplaced_tcp_sess(curpx, file, line, args[0]);
+		warnif_misplaced_tcp_req_sess(curpx, file, line, args[0], args[1]);
 		LIST_APPEND(&curpx->tcp_req.l5_rules, &rule->list);
 	}
 	else {

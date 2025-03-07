@@ -51,7 +51,7 @@ static const char *common_kw_list[] = {
 	"use-server", "force-persist", "ignore-persist", "force-persist",
 	"stick-table", "stick", "stats", "option", "default_backend",
 	"http-reuse", "monitor", "transparent", "maxconn", "backlog",
-	"fullconn", "dispatch", "balance", "log-balance", "hash-type",
+	"fullconn", "dispatch", "balance", "hash-type",
 	"hash-balance-factor", "unique-id-format", "unique-id-header",
 	"log-format", "log-format-sd", "log-tag", "log", "source", "usesrc",
 	"error-log-format",
@@ -70,11 +70,11 @@ static const char *common_options[] = {
 /* Report a warning if a rule is placed after a 'tcp-request connection' rule.
  * Return 1 if the warning has been emitted, otherwise 0.
  */
-int warnif_rule_after_tcp_conn(struct proxy *proxy, const char *file, int line, const char *arg)
+static int warnif_rule_after_tcp_conn(struct proxy *proxy, const char *file, int line, const char *arg1, const char *arg2)
 {
 	if (!LIST_ISEMPTY(&proxy->tcp_req.l4_rules)) {
-		ha_warning("parsing [%s:%d] : a '%s' rule placed after a 'tcp-request connection' rule will still be processed before.\n",
-			   file, line, arg);
+		ha_warning("parsing [%s:%d] : a '%s%s%s' rule placed after a 'tcp-request connection' rule will still be processed before.\n",
+			   file, line, arg1, (arg2 ? " ": ""), (arg2 ? arg2 : ""));
 		return 1;
 	}
 	return 0;
@@ -83,11 +83,11 @@ int warnif_rule_after_tcp_conn(struct proxy *proxy, const char *file, int line, 
 /* Report a warning if a rule is placed after a 'tcp-request session' rule.
  * Return 1 if the warning has been emitted, otherwise 0.
  */
-int warnif_rule_after_tcp_sess(struct proxy *proxy, const char *file, int line, const char *arg)
+static int warnif_rule_after_tcp_sess(struct proxy *proxy, const char *file, int line, const char *arg1, const char *arg2)
 {
 	if (!LIST_ISEMPTY(&proxy->tcp_req.l5_rules)) {
-		ha_warning("parsing [%s:%d] : a '%s' rule placed after a 'tcp-request session' rule will still be processed before.\n",
-			   file, line, arg);
+		ha_warning("parsing [%s:%d] : a '%s%s%s' rule placed after a 'tcp-request session' rule will still be processed before.\n",
+			   file, line, arg1, (arg2 ? " ": ""), (arg2 ? arg2 : ""));
 		return 1;
 	}
 	return 0;
@@ -96,11 +96,11 @@ int warnif_rule_after_tcp_sess(struct proxy *proxy, const char *file, int line, 
 /* Report a warning if a rule is placed after a 'tcp-request content' rule.
  * Return 1 if the warning has been emitted, otherwise 0.
  */
-int warnif_rule_after_tcp_cont(struct proxy *proxy, const char *file, int line, const char *arg)
+static int warnif_rule_after_tcp_cont(struct proxy *proxy, const char *file, int line, const char *arg1, const char *arg2)
 {
 	if (!LIST_ISEMPTY(&proxy->tcp_req.inspect_rules)) {
-		ha_warning("parsing [%s:%d] : a '%s' rule placed after a 'tcp-request content' rule will still be processed before.\n",
-			   file, line, arg);
+		ha_warning("parsing [%s:%d] : a '%s%s%s' rule placed after a 'tcp-request content' rule will still be processed before.\n",
+			   file, line, arg1, (arg2 ? " ": ""), (arg2 ? arg2 : ""));
 		return 1;
 	}
 	return 0;
@@ -109,11 +109,11 @@ int warnif_rule_after_tcp_cont(struct proxy *proxy, const char *file, int line, 
 /* Report a warning if a rule is placed after a 'monitor fail' rule.
  * Return 1 if the warning has been emitted, otherwise 0.
  */
-int warnif_rule_after_monitor(struct proxy *proxy, const char *file, int line, const char *arg)
+static int warnif_rule_after_monitor(struct proxy *proxy, const char *file, int line, const char *arg1, const char *arg2)
 {
 	if (!LIST_ISEMPTY(&proxy->mon_fail_cond)) {
-		ha_warning("parsing [%s:%d] : a '%s' rule placed after a 'monitor fail' rule will still be processed before.\n",
-			   file, line, arg);
+		ha_warning("parsing [%s:%d] : a '%s%s%s' rule placed after a 'monitor fail' rule will still be processed before.\n",
+			   file, line, arg1, (arg2 ? " ": ""), (arg2 ? arg2 : ""));
 		return 1;
 	}
 	return 0;
@@ -122,11 +122,24 @@ int warnif_rule_after_monitor(struct proxy *proxy, const char *file, int line, c
 /* Report a warning if a rule is placed after an 'http_request' rule.
  * Return 1 if the warning has been emitted, otherwise 0.
  */
-int warnif_rule_after_http_req(struct proxy *proxy, const char *file, int line, const char *arg)
+static int warnif_rule_after_http_req(struct proxy *proxy, const char *file, int line, const char *arg1, const char *arg2)
 {
 	if (!LIST_ISEMPTY(&proxy->http_req_rules)) {
-		ha_warning("parsing [%s:%d] : a '%s' rule placed after an 'http-request' rule will still be processed before.\n",
-			   file, line, arg);
+		ha_warning("parsing [%s:%d] : a '%s%s%s' rule placed after an 'http-request' rule will still be processed before.\n",
+			   file, line, arg1, (arg2 ? " ": ""), (arg2 ? arg2 : ""));
+		return 1;
+	}
+	return 0;
+}
+
+/* Report a warning if a rule is placed after an 'http_response' rule.
+ * Return 1 if the warning has been emitted, otherwise 0.
+ */
+static int warnif_rule_after_http_res(struct proxy *proxy, const char *file, int line, const char *arg1, const char *arg2)
+{
+	if (!LIST_ISEMPTY(&proxy->http_res_rules)) {
+		ha_warning("parsing [%s:%d] : a '%s%s%s' rule placed after an 'http-response' rule will still be processed before.\n",
+			   file, line, arg1, (arg2 ? " ": ""), (arg2 ? arg2 : ""));
 		return 1;
 	}
 	return 0;
@@ -135,11 +148,11 @@ int warnif_rule_after_http_req(struct proxy *proxy, const char *file, int line, 
 /* Report a warning if a rule is placed after a redirect rule.
  * Return 1 if the warning has been emitted, otherwise 0.
  */
-int warnif_rule_after_redirect(struct proxy *proxy, const char *file, int line, const char *arg)
+static int warnif_rule_after_redirect(struct proxy *proxy, const char *file, int line, const char *arg1, const char *arg2)
 {
 	if (!LIST_ISEMPTY(&proxy->redirect_rules)) {
-		ha_warning("parsing [%s:%d] : a '%s' rule placed after a 'redirect' rule will still be processed before.\n",
-			   file, line, arg);
+		ha_warning("parsing [%s:%d] : a '%s%s%s' rule placed after a 'redirect' rule will still be processed before.\n",
+			   file, line, arg1, (arg2 ? " ": ""), (arg2 ? arg2 : ""));
 		return 1;
 	}
 	return 0;
@@ -148,11 +161,11 @@ int warnif_rule_after_redirect(struct proxy *proxy, const char *file, int line, 
 /* Report a warning if a rule is placed after a 'use_backend' rule.
  * Return 1 if the warning has been emitted, otherwise 0.
  */
-int warnif_rule_after_use_backend(struct proxy *proxy, const char *file, int line, const char *arg)
+static int warnif_rule_after_use_backend(struct proxy *proxy, const char *file, int line, const char *arg1, const char *arg2)
 {
 	if (!LIST_ISEMPTY(&proxy->switching_rules)) {
-		ha_warning("parsing [%s:%d] : a '%s' rule placed after a 'use_backend' rule will still be processed before.\n",
-			   file, line, arg);
+		ha_warning("parsing [%s:%d] : a '%s%s%s' rule placed after a 'use_backend' rule will still be processed before.\n",
+			   file, line, arg1, (arg2 ? " ": ""), (arg2 ? arg2 : ""));
 		return 1;
 	}
 	return 0;
@@ -161,62 +174,126 @@ int warnif_rule_after_use_backend(struct proxy *proxy, const char *file, int lin
 /* Report a warning if a rule is placed after a 'use-server' rule.
  * Return 1 if the warning has been emitted, otherwise 0.
  */
-int warnif_rule_after_use_server(struct proxy *proxy, const char *file, int line, const char *arg)
+static int warnif_rule_after_use_server(struct proxy *proxy, const char *file, int line, const char *arg1, const char *arg2)
 {
 	if (!LIST_ISEMPTY(&proxy->server_rules)) {
-		ha_warning("parsing [%s:%d] : a '%s' rule placed after a 'use-server' rule will still be processed before.\n",
-			   file, line, arg);
+		ha_warning("parsing [%s:%d] : a '%s%s%s' rule placed after a 'use-server' rule will still be processed before.\n",
+			   file, line, arg1, (arg2 ? " ": ""), (arg2 ? arg2 : ""));
 		return 1;
 	}
 	return 0;
 }
 
 /* report a warning if a redirect rule is dangerously placed */
-int warnif_misplaced_redirect(struct proxy *proxy, const char *file, int line, const char *arg)
+static int warnif_misplaced_redirect(struct proxy *proxy, const char *file, int line, const char *arg1, const char *arg2)
 {
-	return	warnif_rule_after_use_backend(proxy, file, line, arg) ||
-		warnif_rule_after_use_server(proxy, file, line, arg);
+	return	warnif_rule_after_use_backend(proxy, file, line, arg1, arg2) ||
+		warnif_rule_after_use_server(proxy, file, line, arg1, arg2);
 }
 
 /* report a warning if an http-request rule is dangerously placed */
-int warnif_misplaced_http_req(struct proxy *proxy, const char *file, int line, const char *arg)
+static int warnif_misplaced_http_req(struct proxy *proxy, const char *file, int line, const char *arg1, const char *arg2)
 {
-	return	warnif_rule_after_redirect(proxy, file, line, arg) ||
-		warnif_misplaced_redirect(proxy, file, line, arg);
+	return	warnif_rule_after_redirect(proxy, file, line, arg1, arg2) ||
+		warnif_misplaced_redirect(proxy, file, line, arg1, arg2);
 }
 
 /* report a warning if a block rule is dangerously placed */
-int warnif_misplaced_monitor(struct proxy *proxy, const char *file, int line, const char *arg)
+static int warnif_misplaced_monitor(struct proxy *proxy, const char *file, int line, const char *arg1, const char *arg2)
 {
-	return	warnif_rule_after_http_req(proxy, file, line, arg) ||
-		warnif_misplaced_http_req(proxy, file, line, arg);
+	return	warnif_rule_after_http_req(proxy, file, line, arg1, arg2) ||
+		warnif_misplaced_http_req(proxy, file, line, arg1, arg2);
 }
 
 /* report a warning if a "tcp request content" rule is dangerously placed */
-int warnif_misplaced_tcp_cont(struct proxy *proxy, const char *file, int line, const char *arg)
+int warnif_misplaced_tcp_req_cont(struct proxy *proxy, const char *file, int line, const char *arg1, const char *arg2)
 {
-	return	warnif_rule_after_monitor(proxy, file, line, arg) ||
-		warnif_misplaced_monitor(proxy, file, line, arg);
+	return	warnif_rule_after_monitor(proxy, file, line, arg1, arg2) ||
+		warnif_misplaced_monitor(proxy, file, line, arg1, arg2);
+}
+
+/* report a warning if a "tcp response content" rule is dangerously placed */
+int warnif_misplaced_tcp_res_cont(struct proxy *proxy, const char *file, int line, const char *arg1, const char *arg2)
+{
+	return	warnif_rule_after_http_res(proxy, file, line, arg1, arg2);
 }
 
 /* report a warning if a "tcp request session" rule is dangerously placed */
-int warnif_misplaced_tcp_sess(struct proxy *proxy, const char *file, int line, const char *arg)
+int warnif_misplaced_tcp_req_sess(struct proxy *proxy, const char *file, int line, const char *arg1, const char *arg2)
 {
-	return	warnif_rule_after_tcp_cont(proxy, file, line, arg) ||
-		warnif_misplaced_tcp_cont(proxy, file, line, arg);
+	return	warnif_rule_after_tcp_cont(proxy, file, line, arg1, arg2) ||
+		warnif_misplaced_tcp_req_cont(proxy, file, line, arg1, arg2);
 }
 
 /* report a warning if a "tcp request connection" rule is dangerously placed */
-int warnif_misplaced_tcp_conn(struct proxy *proxy, const char *file, int line, const char *arg)
+int warnif_misplaced_tcp_req_conn(struct proxy *proxy, const char *file, int line, const char *arg1, const char *arg2)
 {
-	return	warnif_rule_after_tcp_sess(proxy, file, line, arg) ||
-		warnif_misplaced_tcp_sess(proxy, file, line, arg);
+	return	warnif_rule_after_tcp_sess(proxy, file, line, arg1, arg2) ||
+		warnif_misplaced_tcp_req_sess(proxy, file, line, arg1, arg2);
 }
 
-int warnif_misplaced_quic_init(struct proxy *proxy, const char *file, int line, const char *arg)
+int warnif_misplaced_quic_init(struct proxy *proxy, const char *file, int line, const char *arg1, const char *arg2)
 {
-	return warnif_rule_after_tcp_conn(proxy, file, line, arg) ||
-	       warnif_misplaced_tcp_conn(proxy, file, line, arg);
+	return warnif_rule_after_tcp_conn(proxy, file, line, arg1, arg2) ||
+	       warnif_misplaced_tcp_req_conn(proxy, file, line, arg1, arg2);
+}
+
+/* helper function that checks for a match in cfg_opt array, for a given
+ * input args, capability (if <cap> != PR_CAP_NONE) and mode (if <mode> != PR_MODES)
+ *
+ * <options> and <no_options> will be set according to <kwm> if an option matches
+ *
+ * Returns 1 on success and 0 if no match
+ * <err_code> is updated accordingly and must be checked upon return
+ */
+int cfg_parse_listen_match_option(const char *file, int linenum, int kwm,
+                                  const struct cfg_opt config_opts[], int *err_code,
+                                  char **args, int mode, int cap,
+                                  int *options, int *no_options)
+{
+	int optnum;
+
+	for (optnum = 0; config_opts[optnum].name; optnum++) {
+		if (strcmp(args[1], config_opts[optnum].name) == 0) {
+			if (config_opts[optnum].cap == PR_CAP_NONE) {
+				ha_alert("parsing [%s:%d]: option '%s' is not supported due to build options.\n",
+					 file, linenum, config_opts[optnum].name);
+				*err_code |= ERR_ALERT | ERR_FATAL;
+				goto out;
+			}
+			if ((mode != PR_MODES && !(config_opts[optnum].mode & mode)) ||
+			    (cap != PR_CAP_NONE && !(config_opts[optnum].cap & cap))) {
+				ha_alert("parsing [%s:%d]: option '%s' is not supported in this section.\n",
+				         file, linenum, config_opts[optnum].name);
+				*err_code |= ERR_ALERT | ERR_FATAL;
+				goto out;
+			}
+
+			if (alertif_too_many_args_idx(0, 1, file, linenum, args, err_code))
+				goto out;
+			if (warnifnotcap(curproxy, config_opts[optnum].cap, file, linenum, args[1], NULL)) {
+				*err_code |= ERR_WARN;
+				goto out;
+			}
+
+			*no_options &= ~config_opts[optnum].val;
+			*options &= ~config_opts[optnum].val;
+
+			switch (kwm) {
+				case KWM_STD:
+					*options |= config_opts[optnum].val;
+					break;
+				case KWM_NO:
+					*no_options |= config_opts[optnum].val;
+					break;
+				case KWM_DEF: /* already cleared */
+					break;
+			}
+			return 1;
+		}
+	}
+ out:
+	return 0;
 }
 
 int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
@@ -1311,7 +1388,7 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 			goto out;
 		}
 
-		err_code |= warnif_misplaced_http_req(curproxy, file, linenum, args[0]);
+		err_code |= warnif_misplaced_http_req(curproxy, file, linenum, args[0], NULL);
 
 		if (curproxy->cap & PR_CAP_FE)
 			where |= SMP_VAL_FE_HRQ_HDR;
@@ -1429,7 +1506,7 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 		}
 
 		LIST_APPEND(&curproxy->redirect_rules, &rule->list);
-		err_code |= warnif_misplaced_redirect(curproxy, file, linenum, args[0]);
+		err_code |= warnif_misplaced_redirect(curproxy, file, linenum, args[0], NULL);
 
 		if (curproxy->cap & PR_CAP_FE)
 			where |= SMP_VAL_FE_HRQ_HDR;
@@ -1966,8 +2043,6 @@ stats_error_parsing:
 		}
 	}
 	else if (strcmp(args[0], "option") == 0) {
-		int optnum;
-
 		if (*(args[1]) == '\0') {
 			ha_alert("parsing [%s:%d]: '%s' expects an option name.\n",
 				 file, linenum, args[0]);
@@ -1975,71 +2050,21 @@ stats_error_parsing:
 			goto out;
 		}
 
-		for (optnum = 0; cfg_opts[optnum].name; optnum++) {
-			if (strcmp(args[1], cfg_opts[optnum].name) == 0) {
-				if (cfg_opts[optnum].cap == PR_CAP_NONE) {
-					ha_alert("parsing [%s:%d]: option '%s' is not supported due to build options.\n",
-						 file, linenum, cfg_opts[optnum].name);
-					err_code |= ERR_ALERT | ERR_FATAL;
-					goto out;
-				}
-				if (alertif_too_many_args_idx(0, 1, file, linenum, args, &err_code))
-					goto out;
+		/* try to match option within cfg_opts */
+		if (cfg_parse_listen_match_option(file, linenum, kwm, cfg_opts, &err_code, args,
+		                                  PR_MODES, PR_CAP_NONE,
+		                                  &curproxy->options, &curproxy->no_options))
+			goto out;
+		if (err_code & ERR_CODE)
+			goto out;
 
-				if (warnifnotcap(curproxy, cfg_opts[optnum].cap, file, linenum, args[1], NULL)) {
-					err_code |= ERR_WARN;
-					goto out;
-				}
-
-				curproxy->no_options &= ~cfg_opts[optnum].val;
-				curproxy->options    &= ~cfg_opts[optnum].val;
-
-				switch (kwm) {
-				case KWM_STD:
-					curproxy->options |= cfg_opts[optnum].val;
-					break;
-				case KWM_NO:
-					curproxy->no_options |= cfg_opts[optnum].val;
-					break;
-				case KWM_DEF: /* already cleared */
-					break;
-				}
-
-				goto out;
-			}
-		}
-
-		for (optnum = 0; cfg_opts2[optnum].name; optnum++) {
-			if (strcmp(args[1], cfg_opts2[optnum].name) == 0) {
-				if (cfg_opts2[optnum].cap == PR_CAP_NONE) {
-					ha_alert("parsing [%s:%d]: option '%s' is not supported due to build options.\n",
-						 file, linenum, cfg_opts2[optnum].name);
-					err_code |= ERR_ALERT | ERR_FATAL;
-					goto out;
-				}
-				if (alertif_too_many_args_idx(0, 1, file, linenum, args, &err_code))
-					goto out;
-				if (warnifnotcap(curproxy, cfg_opts2[optnum].cap, file, linenum, args[1], NULL)) {
-					err_code |= ERR_WARN;
-					goto out;
-				}
-
-				curproxy->no_options2 &= ~cfg_opts2[optnum].val;
-				curproxy->options2    &= ~cfg_opts2[optnum].val;
-
-				switch (kwm) {
-				case KWM_STD:
-					curproxy->options2 |= cfg_opts2[optnum].val;
-					break;
-				case KWM_NO:
-					curproxy->no_options2 |= cfg_opts2[optnum].val;
-					break;
-				case KWM_DEF: /* already cleared */
-					break;
-				}
-				goto out;
-			}
-		}
+		/* try to match option within cfg_opts2 */
+		if (cfg_parse_listen_match_option(file, linenum, kwm, cfg_opts2, &err_code, args,
+		                                  PR_MODES, PR_CAP_NONE,
+		                                  &curproxy->options2, &curproxy->no_options2))
+			goto out;
+		if (err_code & ERR_CODE)
+			goto out;
 
 		/* HTTP options override each other. They can be cancelled using
 		 * "no option xxx" which only switches to default mode if the mode
@@ -2390,20 +2415,24 @@ stats_error_parsing:
 
 			if (alertif_too_many_args_idx(0, 1, file, linenum, args, &err_code))
 				goto out;
-			if (warnifnotcap(curproxy, PR_MODE_HTTP, file, linenum, args[1], NULL)) {
-				err_code |= ERR_WARN;
-				goto out;
-			}
 
 			if (args[1][22] == 'q') {
-				ha_alert("parsing [%s:%d]: option '%s' is deprecated. please use 'option accept-unsafe-violations-in-http-request' if absolutely needed.\n",
-					 file, linenum, args[1]);
-				val = PR_O2_REQBUG_OK;
+                            if (warnifnotcap(curproxy, PR_CAP_FE, file, linenum, args[1], NULL)) {
+                                err_code |= ERR_WARN;
+                                goto out;
+                            }
+                            ha_warning("parsing [%s:%d]: option '%s' is deprecated. please use 'option accept-unsafe-violations-in-http-request' if absolutely needed.\n",
+                                       file, linenum, args[1]);
+                            val = PR_O2_REQBUG_OK;
 			}
 			else {
-				ha_alert("parsing [%s:%d]: option '%s' is deprecated. please use 'option accept-unsafe-violations-in-http-response' if absolutely needed.\n",
-					 file, linenum, args[1]);
-				val = PR_O2_RSPBUG_OK;
+                            if (warnifnotcap(curproxy, PR_CAP_BE, file, linenum, args[1], NULL)) {
+                                err_code |= ERR_WARN;
+                                goto out;
+                            }
+                            ha_warning("parsing [%s:%d]: option '%s' is deprecated. please use 'option accept-unsafe-violations-in-http-response' if absolutely needed.\n",
+                                       file, linenum, args[1]);
+                            val = PR_O2_RSPBUG_OK;
 			}
 
 			curproxy->no_options2 &= ~val;
@@ -2515,7 +2544,7 @@ stats_error_parsing:
 				goto out;
 			}
 
-			err_code |= warnif_misplaced_monitor(curproxy, file, linenum, "monitor fail");
+			err_code |= warnif_misplaced_monitor(curproxy, file, linenum, args[0], args[1]);
 			if ((cond = build_acl_cond(file, linenum, &curproxy->acl, curproxy, (const char **)args + 2, &errmsg)) == NULL) {
 				ha_alert("parsing [%s:%d] : error detected while parsing a '%s %s' condition : %s.\n",
 					 file, linenum, args[0], args[1], errmsg);

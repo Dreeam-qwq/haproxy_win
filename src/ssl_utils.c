@@ -700,3 +700,86 @@ nosec:
 
 	return -1;
 }
+
+/* Return the nofAfter value as as string extracted from an X509 certificate
+ * The returned buffer is static and thread local.
+ */
+const char *x509_get_notafter(X509 *cert)
+{
+	BIO *bio = NULL;
+	int write;
+	static THREAD_LOCAL char buf[256];
+
+	memset(buf, 0, sizeof(buf));
+
+	if ((bio = BIO_new(BIO_s_mem())) ==  NULL)
+		goto end;
+	if (ASN1_TIME_print(bio, X509_getm_notAfter(cert)) == 0)
+		goto end;
+	write = BIO_read(bio, buf, sizeof(buf)-1);
+	buf[write] = '\0';
+	BIO_free(bio);
+
+	return buf;
+
+end:
+	BIO_free(bio);
+	return NULL;
+}
+
+/* Return the nofBefore value as as string extracted from an X509 certificate
+ * The returned buffer is static and thread local.
+ */
+const char *x509_get_notbefore(X509 *cert)
+{
+	BIO *bio = NULL;
+	int write;
+	static THREAD_LOCAL char buf[256];
+
+	memset(buf, 0, sizeof(buf));
+
+	if ((bio = BIO_new(BIO_s_mem())) ==  NULL)
+		goto end;
+	if (ASN1_TIME_print(bio, X509_getm_notBefore(cert)) == 0)
+		goto end;
+	write = BIO_read(bio, buf, sizeof(buf)-1);
+	buf[write] = '\0';
+	BIO_free(bio);
+
+	return buf;
+
+end:
+	BIO_free(bio);
+	return NULL;
+}
+
+#ifdef HAVE_ASN1_TIME_TO_TM
+/* Takes a ASN1_TIME and converts it into a time_t */
+time_t ASN1_to_time_t(ASN1_TIME *asn1_time)
+{
+	struct tm tm;
+	time_t ret = -1;
+
+	if (ASN1_TIME_to_tm(asn1_time, &tm) == 0)
+		goto error;
+
+	ret  = my_timegm(&tm);
+error:
+	return ret;
+}
+
+/* return the notAfter date of a X509 certificate in a time_t format */
+time_t x509_get_notafter_time_t(X509 *cert)
+{
+	time_t ret = -1;
+	ASN1_TIME *asn1_time;
+
+	if ((asn1_time = X509_getm_notAfter(cert)) == NULL)
+		goto error;
+
+	ret = ASN1_to_time_t(asn1_time);
+
+error:
+	return ret;
+}
+#endif

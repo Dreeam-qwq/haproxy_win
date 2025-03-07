@@ -946,6 +946,9 @@ void *pool_destroy(struct pool_head *pool)
 			/* note that if used == 0, the cache is empty */
 			free(pool->base_addr);
 		}
+
+		/* make sure this pool is no longer referenced in memory profiling */
+		memprof_remove_stale_info(pool);
 	}
 	return NULL;
 }
@@ -1370,6 +1373,8 @@ static int cli_parse_show_pools(char **args, char *payload, struct appctx *appct
 		}
 		else if (strcmp(args[arg], "match") == 0 && *args[arg+1]) {
 			ctx->prefix = strdup(args[arg+1]); // only pools starting with this
+			if (!ctx->prefix)
+				return cli_err(appctx, "Out of memory.\n");
 			arg++;
 		}
 		else if (isdigit((unsigned char)*args[arg])) {

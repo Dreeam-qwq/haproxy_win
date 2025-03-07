@@ -675,10 +675,10 @@ struct htx_blk *htx_replace_blk_value(struct htx *htx, struct htx_blk *blk,
 	return blk;
 }
 
-/* Transfer HTX blocks from <src> to <dst>, stopping on the first block of the
- * type <mark> (typically EOH or EOT) or when <count> bytes were moved
- * (including payload and meta-data). It returns the number of bytes moved and
- * the last HTX block inserted in <dst>.
+/* Transfer HTX blocks from <src> to <dst>, stopping once the first block of the
+ * type <mark> is transferred (typically EOH or EOT) or when <count> bytes were
+ * moved (including payload and meta-data). It returns the number of bytes moved
+ * and the last HTX block inserted in <dst>.
  */
 struct htx_ret htx_xfer_blks(struct htx *dst, struct htx *src, uint32_t count,
 			     enum htx_blk_type mark)
@@ -722,17 +722,11 @@ struct htx_ret htx_xfer_blks(struct htx *dst, struct htx *src, uint32_t count,
 		dstblk->info = info;
 		htx_memcpy(htx_get_blk_ptr(dst, dstblk), htx_get_blk_ptr(src, blk), sz);
 
-		count -= sizeof(dstblk) + sz;
+		count -= sizeof(*dstblk) + sz;
 		if (blk->info != info) {
 			/* Partial xfer: don't remove <blk> from <src> but
 			 * resize its content */
 			htx_cut_data_blk(src, blk, sz);
-			break;
-		}
-
-		if (type == mark) {
-			blk = htx_get_next_blk(src, blk);
-			srcref = dstref = NULL;
 			break;
 		}
 
@@ -748,6 +742,12 @@ struct htx_ret htx_xfer_blks(struct htx *dst, struct htx *src, uint32_t count,
 		}
 		else if (type == HTX_BLK_EOH || type == HTX_BLK_EOT)
 			srcref = dstref = NULL;
+
+		/* <mark> allows a copy of the block which matched, then stop */
+		if (type == mark) {
+			blk = htx_get_next_blk(src, blk);
+			break;
+		}
 	}
 
 	if (unlikely(dstref)) {

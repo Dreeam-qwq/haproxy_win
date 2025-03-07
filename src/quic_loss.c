@@ -1,5 +1,6 @@
 #include <import/eb64tree.h>
 
+#include <haproxy/quic_cc-t.h>
 #include <haproxy/quic_conn-t.h>
 #include <haproxy/quic_loss.h>
 #include <haproxy/quic_tls.h>
@@ -151,7 +152,7 @@ struct quic_pktns *quic_pto_pktns(struct quic_conn *qc,
  * Always succeeds.
  */
 void qc_packet_loss_lookup(struct quic_pktns *pktns, struct quic_conn *qc,
-                           struct list *lost_pkts)
+                           struct list *lost_pkts, uint32_t *bytes_lost)
 {
 	struct eb_root *pkts;
 	struct eb64_node *node;
@@ -205,7 +206,7 @@ void qc_packet_loss_lookup(struct quic_pktns *pktns, struct quic_conn *qc,
 		if ((int64_t)pkt->pn_node.key > largest_acked_pn)
 			break;
 
-		time_sent = pkt->time_sent;
+		time_sent = pkt->time_sent_ms;
 		loss_time_limit = tick_add(time_sent, loss_delay);
 
 		reordered = (int64_t)largest_acked_pn >= pkt->pn_node.key + pktthresh;
@@ -213,8 +214,16 @@ void qc_packet_loss_lookup(struct quic_pktns *pktns, struct quic_conn *qc,
 			ql->nb_reordered_pkt++;
 
 		if (tick_is_le(loss_time_limit, now_ms) || reordered) {
+			struct quic_cc *cc = &qc->path->cc;
+
+			/* Delivery rate sampling is applied to ack-eliciting packet only. */
+			if ((pkt->flags & QUIC_FL_TX_PACKET_ACK_ELICITING) &&
+			    cc->algo->on_pkt_lost)
+				cc->algo->on_pkt_lost(cc, pkt, pkt->rs.lost);
 			eb64_delete(&pkt->pn_node);
 			LIST_APPEND(lost_pkts, &pkt->list);
+			if (bytes_lost)
+				*bytes_lost += pkt->len;
 			ql->nb_lost_pkt++;
 		}
 		else {
@@ -250,7 +259,11 @@ int qc_release_lost_pkts(struct quic_conn *qc, struct quic_pktns *pktns,
 	if (LIST_ISEMPTY(pkts))
 		goto leave;
 
-	oldest_lost = newest_lost = NULL;
+	/* Oldest will point to first list entry and newest on the last. First,
+	 * initialize them to point on the same entry. Newest pointer will be
+	 * updated along the loop. Release all other packet in between.
+	 */
+	newest_lost = oldest_lost = LIST_ELEM(pkts->n, struct quic_tx_packet *, list);
 	list_for_each_entry_safe(pkt, tmp, pkts, list) {
 		struct list tmp = LIST_HEAD_INIT(tmp);
 
@@ -263,28 +276,28 @@ int qc_release_lost_pkts(struct quic_conn *qc, struct quic_pktns *pktns,
 		if (!qc_handle_frms_of_lost_pkt(qc, pkt, &pktns->tx.frms))
 			close = 1;
 		LIST_DELETE(&pkt->list);
-		if (!oldest_lost) {
-			oldest_lost = newest_lost = pkt;
-		}
-		else {
-			if (newest_lost != oldest_lost)
-				quic_tx_packet_refdec(newest_lost);
-			newest_lost = pkt;
-		}
+
+		/* Move newest so that it will point on the last list entry.
+		 * Release every intermediary packet.
+		 */
+		if (oldest_lost != newest_lost)
+			quic_tx_packet_refdec(newest_lost);
+		newest_lost = pkt;
 		tot_lost++;
 	}
 
 	if (!close) {
-		if (newest_lost) {
-			/* Sent a congestion event to the controller */
-			struct quic_cc_event ev = { };
+		struct quic_cc *cc = &qc->path->cc;
+		/* Sent a congestion event to the controller */
+		struct quic_cc_event ev = { };
 
-			ev.type = QUIC_CC_EVT_LOSS;
-			ev.loss.time_sent = newest_lost->time_sent;
-			ev.loss.count = tot_lost;
+		ev.type = QUIC_CC_EVT_LOSS;
+		ev.loss.time_sent = newest_lost->time_sent_ms;
+		ev.loss.count = tot_lost;
 
-			quic_cc_event(&qc->path->cc, &ev);
-		}
+		quic_cc_event(cc, &ev);
+		if (cc->algo->congestion_event)
+		    cc->algo->congestion_event(cc, newest_lost->time_sent_ms);
 
 		/* If an RTT have been already sampled, <rtt_min> has been set.
 		 * We must check if we are experiencing a persistent congestion.
@@ -292,19 +305,15 @@ int qc_release_lost_pkts(struct quic_conn *qc, struct quic_pktns *pktns,
 		 * slow start state.
 		 */
 		if (qc->path->loss.rtt_min && newest_lost != oldest_lost) {
-			unsigned int period = newest_lost->time_sent - oldest_lost->time_sent;
+			unsigned int period = newest_lost->time_sent_ms - oldest_lost->time_sent_ms;
 
 			if (quic_loss_persistent_congestion(&qc->path->loss, period,
-							    now_ms, qc->max_ack_delay))
+							    now_ms, qc->max_ack_delay) &&
+			    qc->path->cc.algo->slow_start)
 				qc->path->cc.algo->slow_start(&qc->path->cc);
 		}
 	}
 
-	/* <oldest_lost> cannot be NULL at this stage because we have ensured
-	 * that <pkts> list is not empty. Without this, GCC 12.2.0 reports a
-	 * possible overflow on a 0 byte region with O2 optimization.
-	 */
-	ALREADY_CHECKED(oldest_lost);
 	quic_tx_packet_refdec(oldest_lost);
 	if (newest_lost != oldest_lost)
 		quic_tx_packet_refdec(newest_lost);

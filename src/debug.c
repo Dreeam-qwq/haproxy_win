@@ -358,11 +358,22 @@ void ha_thread_dump_one(int thr, int from_signal)
  * there is enough room otherwise some contents will be truncated. The function
  * waits for the called thread to fill the buffer before returning (or cancelling
  * by reporting NULL). It does not release the called thread yet. It returns a
- * pointer to the buffer used if the dump was done, otherwise NULL.
+ * pointer to the buffer used if the dump was done, otherwise NULL. When the
+ * dump starts, it marks the current thread as dumping, which will only be
+ * released via a failure (returns NULL) or via a call to ha_dump_thread_done().
  */
 struct buffer *ha_thread_dump_fill(struct buffer *buf, int thr)
 {
 	struct buffer *old = NULL;
+
+	/* A thread that's currently dumping other threads cannot be dumped, or
+	 * it will very likely cause a deadlock.
+	 */
+	if (HA_ATOMIC_LOAD(&ha_thread_ctx[thr].flags) & TH_FL_DUMPING_OTHERS)
+		return NULL;
+
+	/* This will be undone in ha_thread_dump_done() */
+	HA_ATOMIC_OR(&th_ctx->flags, TH_FL_DUMPING_OTHERS);
 
 	/* try to impose our dump buffer and to reserve the target thread's
 	 * next dump for us.
@@ -388,8 +399,11 @@ struct buffer *ha_thread_dump_fill(struct buffer *buf, int thr)
 		old = HA_ATOMIC_LOAD(&ha_thread_ctx[thr].thread_dump_buffer);
 		if ((ulong)old & 0x1)
 			break;
-		if (!old)
+		if (!old) {
+			/* cancelled: no longer dumping */
+			HA_ATOMIC_AND(&th_ctx->flags, ~TH_FL_DUMPING_OTHERS);
 			return old;
+		}
 		ha_thread_relax();
 	}
 	return (struct buffer *)((ulong)old & ~0x1UL);
@@ -409,11 +423,13 @@ void ha_thread_dump_done(struct buffer *buf, int thr)
 		old = HA_ATOMIC_LOAD(&ha_thread_ctx[thr].thread_dump_buffer);
 		if (!((ulong)old & 0x1)) {
 			if (!old)
-				return;
+				break;
 			ha_thread_relax();
 			continue;
 		}
 	} while (!HA_ATOMIC_CAS(&ha_thread_ctx[thr].thread_dump_buffer, &old, buf));
+
+	HA_ATOMIC_AND(&th_ctx->flags, ~TH_FL_DUMPING_OTHERS);
 }
 
 /* dumps into the buffer some information related to task <task> (which may
@@ -542,6 +558,7 @@ static int debug_parse_cli_show_libs(char **args, char *payload, struct appctx *
 static int debug_parse_cli_show_dev(char **args, char *payload, struct appctx *appctx, void *private)
 {
 	const char **build_opt;
+	char *err = NULL;
 	int i;
 
 	if (*args[2])
@@ -595,12 +612,6 @@ static int debug_parse_cli_show_dev(char **args, char *payload, struct appctx *a
 	for (i = 0; i < post_mortem.process.argc; i++)
 		chunk_appendf(&trash, "%s ", post_mortem.process.argv[i]);
 	chunk_appendf(&trash, "\n");
-
-	chunk_appendf(&trash, "  boot uid: %d\n", post_mortem.process.boot_uid);
-	chunk_appendf(&trash, "  runtime uid: %d\n", post_mortem.process.run_uid);
-	chunk_appendf(&trash, "  boot gid: %d\n", post_mortem.process.boot_gid);
-	chunk_appendf(&trash, "  runtime gid: %d\n", post_mortem.process.run_gid);
-
 #if defined(USE_LINUX_CAP)
 	/* let's dump saved in feed_post_mortem() initial capabilities sets */
 	if(!post_mortem.process.caps.err_boot) {
@@ -616,7 +627,7 @@ static int debug_parse_cli_show_dev(char **args, char *payload, struct appctx *a
 					     post_mortem.process.caps.boot[1].inheritable));
 	} else
 		chunk_appendf(&trash, "  capget() failed at boot with: %s.\n",
-			      strerror(post_mortem.process.caps.err_boot));
+			      errname(post_mortem.process.caps.err_boot, &err));
 
 	/* let's print actual capabilities sets, could be useful in order to compare */
 	if (!post_mortem.process.caps.err_run) {
@@ -632,27 +643,29 @@ static int debug_parse_cli_show_dev(char **args, char *payload, struct appctx *a
 					     post_mortem.process.caps.run[1].inheritable));
 	} else
 		chunk_appendf(&trash, "  capget() failed at runtime with: %s.\n",
-			      strerror(post_mortem.process.caps.err_run));
+			      errname(post_mortem.process.caps.err_run, &err));
 #endif
-	chunk_appendf(&trash, "  boot limits:\n");
-	chunk_appendf(&trash, "  \tfd limit (soft): %s\n",
-		      LIM2A(normalize_rlim((ulong)post_mortem.process.boot_lim_fd.rlim_cur), "unlimited"));
-	chunk_appendf(&trash, "  \tfd limit (hard): %s\n",
-		      LIM2A(normalize_rlim((ulong)post_mortem.process.boot_lim_fd.rlim_max), "unlimited"));
-	chunk_appendf(&trash, "  \tram limit (soft): %s\n",
-		      LIM2A(normalize_rlim((ulong)post_mortem.process.boot_lim_ram.rlim_cur), "unlimited"));
-	chunk_appendf(&trash, "  \tram limit (hard): %s\n",
-		      LIM2A(normalize_rlim((ulong)post_mortem.process.boot_lim_ram.rlim_max), "unlimited"));
 
-	chunk_appendf(&trash, "  runtime limits:\n");
-	chunk_appendf(&trash, "  \tfd limit (soft): %s\n",
-		      LIM2A(normalize_rlim((ulong)post_mortem.process.run_lim_fd.rlim_cur), "unlimited"));
-	chunk_appendf(&trash, "  \tfd limit (hard): %s\n",
-		      LIM2A(normalize_rlim((ulong)post_mortem.process.run_lim_fd.rlim_max), "unlimited"));
-	chunk_appendf(&trash, "  \tram limit (soft): %s\n",
-		      LIM2A(normalize_rlim((ulong)post_mortem.process.run_lim_ram.rlim_cur), "unlimited"));
-	chunk_appendf(&trash, "  \tram limit (hard): %s\n",
-		      LIM2A(normalize_rlim((ulong)post_mortem.process.run_lim_ram.rlim_max), "unlimited"));
+	chunk_appendf(&trash, "  %-22s  %-11s  %-11s \n", "identity:", "-boot-", "-runtime-");
+	chunk_appendf(&trash, "  %-22s  %-11d  %-11d \n", "    uid:", post_mortem.process.boot_uid,
+		                                                      post_mortem.process.run_uid);
+	chunk_appendf(&trash, "  %-22s  %-11d  %-11d \n", "    gid:", post_mortem.process.boot_gid,
+		                                                      post_mortem.process.run_gid);
+	chunk_appendf(&trash, "  %-22s  %-11s  %-11s \n", "limits:", "-boot-", "-runtime-");
+	chunk_appendf(&trash, "  %-22s  %-11s  %-11s \n", "    fd limit (soft):",
+		LIM2A(normalize_rlim((ulong)post_mortem.process.boot_lim_fd.rlim_cur), "unlimited"),
+		LIM2A(normalize_rlim((ulong)post_mortem.process.run_lim_fd.rlim_cur), "unlimited"));
+	chunk_appendf(&trash, "  %-22s  %-11s  %-11s \n", "    fd limit (hard):",
+		LIM2A(normalize_rlim((ulong)post_mortem.process.boot_lim_fd.rlim_max), "unlimited"),
+		LIM2A(normalize_rlim((ulong)post_mortem.process.run_lim_fd.rlim_max), "unlimited"));
+	chunk_appendf(&trash, "  %-22s  %-11s  %-11s \n", "    ram limit (soft):",
+		LIM2A(normalize_rlim((ulong)post_mortem.process.boot_lim_ram.rlim_cur), "unlimited"),
+		LIM2A(normalize_rlim((ulong)post_mortem.process.run_lim_ram.rlim_cur), "unlimited"));
+	chunk_appendf(&trash, "  %-22s  %-11s  %-11s \n", "    ram limit (hard):",
+		LIM2A(normalize_rlim((ulong)post_mortem.process.boot_lim_ram.rlim_max), "unlimited"),
+		LIM2A(normalize_rlim((ulong)post_mortem.process.run_lim_ram.rlim_max), "unlimited"));
+
+	ha_free(&err);
 
 	return cli_msg(appctx, LOG_INFO, trash.area);
 }
@@ -1523,6 +1536,9 @@ static struct task *debug_task_handler(struct task *t, void *ctx, unsigned int s
 	unsigned long inter = tctx[1];
 	unsigned long rnd;
 
+	if (stopping)
+		return NULL;
+
 	t->expire = tick_add(now_ms, inter);
 
 	/* half of the calls will wake up another entry */
@@ -1545,6 +1561,9 @@ static struct task *debug_tasklet_handler(struct task *t, void *ctx, unsigned in
 	unsigned long *tctx = ctx; // [0] = #tasks, [1] = inter, [2+] = { tl | (tsk+1) }
 	unsigned long rnd;
 	int i;
+
+	if (stopping)
+		return NULL;
 
 	/* wake up two random entries */
 	for (i = 0; i < 2; i++) {
@@ -1636,7 +1655,7 @@ static int debug_parse_cli_sched(char **args, char *payload, struct appctx *appc
 	tctx[0] = (unsigned long)count;
 	tctx[1] = (unsigned long)inter;
 
-	if (thrid >= global.nbthread)
+	if ((int)thrid >= global.nbthread)
 		thrid = tid;
 
 	for (i = 0; i < count; i++) {
@@ -2048,6 +2067,8 @@ static int debug_parse_cli_memstats(char **args, char *payload, struct appctx *a
 		else if (strcmp(args[arg], "match") == 0 && *args[arg + 1]) {
 			ha_free(&ctx->match);
 			ctx->match = strdup(args[arg + 1]);
+			if (!ctx->match)
+				return cli_err(appctx, "Out of memory.\n");
 			arg++;
 			continue;
 		}
@@ -2261,13 +2282,17 @@ static int debug_parse_cli_counters(char **args, char *payload, struct appctx *a
 			return cli_err(appctx, "Expects an optional action ('reset','show'), optional types ('bug','chk','cnt','glt') and optionally 'all' to even dump null counters.\n");
 	}
 
+#if DEBUG_STRICT > 0 || defined(DEBUG_GLITCHES)
+	ctx->start = &__start_dbg_cnt;
+	ctx->stop  = &__stop_dbg_cnt;
+#endif
 	if (action == 1) { // reset
 		struct debug_count *ptr;
 
 		if (!cli_has_level(appctx, ACCESS_LVL_ADMIN))
 			return 1;
 
-		for (ptr = &__start_dbg_cnt; ptr < &__stop_dbg_cnt; ptr++) {
+		for (ptr = ctx->start; ptr < ctx->stop; ptr++) {
 			if (ctx->types && !(ctx->types & (1 << ptr->type)))
 				continue;
 			_HA_ATOMIC_STORE(&ptr->count, 0);
@@ -2276,8 +2301,6 @@ static int debug_parse_cli_counters(char **args, char *payload, struct appctx *a
 	}
 
 	/* OK it's a show, let's dump relevant counters */
-	ctx->start = &__start_dbg_cnt;
-	ctx->stop  = &__stop_dbg_cnt;
 	return 0;
 }
 
@@ -2347,7 +2370,6 @@ static int debug_iohandler_counters(struct appctx *appctx)
 void debug_handler(int sig, siginfo_t *si, void *arg)
 {
 	struct buffer *buf = HA_ATOMIC_LOAD(&th_ctx->thread_dump_buffer);
-	int harmless = is_thread_harmless();
 	int no_return = 0;
 
 	/* first, let's check it's really for us and that we didn't just get
@@ -2355,6 +2377,9 @@ void debug_handler(int sig, siginfo_t *si, void *arg)
 	 */
 	if (!buf || (ulong)buf & 0x1UL)
 		return;
+
+	/* inform callees to be careful, we're in a signal handler! */
+	_HA_ATOMIC_OR(&th_ctx->flags, TH_FL_IN_DBG_HANDLER);
 
 	/* Special value 0x2 is used during panics and requires that the thread
 	 * allocates its own dump buffer among its own trash buffers. The goal
@@ -2371,18 +2396,13 @@ void debug_handler(int sig, siginfo_t *si, void *arg)
 	 */
 	ha_thread_dump_one(tid, 1);
 
-	/* mark the current thread as stuck to detect it upon next invocation
-	 * if it didn't move.
-	 */
-	if (!harmless &&
-	    !(_HA_ATOMIC_LOAD(&th_ctx->flags) & TH_FL_SLEEPING))
-		_HA_ATOMIC_OR(&th_ctx->flags, TH_FL_STUCK);
-
 	/* in case of panic, no return is planned so that we don't destroy
 	 * the buffer's contents and we make sure not to trigger in loops.
 	 */
 	while (no_return)
 		wait(NULL);
+
+	_HA_ATOMIC_AND(&th_ctx->flags, ~TH_FL_IN_DBG_HANDLER);
 }
 
 static int init_debug_per_thread()
@@ -2743,6 +2763,31 @@ static int feed_post_mortem_late()
 
 REGISTER_PER_THREAD_INIT(feed_post_mortem_late);
 #endif
+
+#ifdef DEBUG_UNIT
+
+extern struct list unittest_list;
+
+void list_unittests()
+{
+	struct unittest_fct *unit;
+	int found = 0;
+
+	fprintf(stdout, "Unit tests list :");
+
+	list_for_each_entry(unit, &unittest_list, list) {
+		fprintf(stdout, " %s", unit->name);
+		found = 1;
+	}
+
+	if (!found)
+		fprintf(stdout, " none");
+
+	fprintf(stdout, "\n");
+}
+
+#endif
+
 
 /* register cli keywords */
 static struct cli_kw_list cli_kws = {{ },{

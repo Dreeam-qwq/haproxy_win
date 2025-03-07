@@ -525,7 +525,7 @@ static ssize_t h3_headers_to_htx(struct qcs *qcs, const struct buffer *buf,
 	struct buffer *tmp = get_trash_chunk();
 	struct htx *htx = NULL;
 	struct htx_sl *sl;
-	struct http_hdr list[global.tune.max_http_hdr];
+	struct http_hdr list[global.tune.max_http_hdr * 2];
 	unsigned int flags = HTX_SL_F_NONE;
 	struct ist meth = IST_NULL, path = IST_NULL;
 	struct ist scheme = IST_NULL, authority = IST_NULL;
@@ -898,6 +898,12 @@ static ssize_t h3_headers_to_htx(struct qcs *qcs, const struct buffer *buf,
 		}
 	}
 
+	/* Check the number of blocks agains "tune.http.maxhdr" value before adding EOH block */
+	if (htx_nbblks(htx) > global.tune.max_http_hdr) {
+		len = -1;
+		goto out;
+	}
+
 	if (!htx_add_endof(htx, HTX_BLK_EOH)) {
 		len = -1;
 		goto out;
@@ -909,7 +915,7 @@ static ssize_t h3_headers_to_htx(struct qcs *qcs, const struct buffer *buf,
 	htx_to_buf(htx, &htx_buf);
 	htx = NULL;
 
-	if (!qcs_attach_sc(qcs, &htx_buf, fin)) {
+	if (qcs_attach_sc(qcs, &htx_buf, fin)) {
 		len = -1;
 		goto out;
 	}
@@ -932,8 +938,8 @@ static ssize_t h3_headers_to_htx(struct qcs *qcs, const struct buffer *buf,
 	if (htx)
 		htx_to_buf(htx, &htx_buf);
 
-	/* buffer is transferred to the stream connector and set to NULL
-	 * except on stream creation error.
+	/* Buffer is transferred to the stream connector and set to NULL except
+	 * on stream creation error or QCS already fully closed.
 	 */
 	if (b_size(&htx_buf)) {
 		b_free(&htx_buf);
@@ -962,7 +968,7 @@ static ssize_t h3_trailers_to_htx(struct qcs *qcs, const struct buffer *buf,
 	struct buffer *appbuf = NULL;
 	struct htx *htx = NULL;
 	struct htx_sl *sl;
-	struct http_hdr list[global.tune.max_http_hdr];
+	struct http_hdr list[global.tune.max_http_hdr * 2];
 	int hdr_idx, ret;
 	const char *ctl;
 	int qpack_err;
@@ -1078,6 +1084,12 @@ static ssize_t h3_trailers_to_htx(struct qcs *qcs, const struct buffer *buf,
 		}
 
 		++hdr_idx;
+	}
+
+	/* Check the number of blocks agains "tune.http.maxhdr" value before adding EOT block */
+	if (htx_nbblks(htx) > global.tune.max_http_hdr) {
+		len = -1;
+		goto out;
 	}
 
 	if (!htx_add_endof(htx, HTX_BLK_EOT)) {
@@ -1258,7 +1270,9 @@ static ssize_t h3_parse_settings_frm(struct h3c *h3c, const struct buffer *buf,
 /* Transcode HTTP/3 payload received in buffer <b> to HTX data for stream
  * <qcs>. If <fin> is set, it indicates that no more data will arrive after.
  *
- * Returns 0 on success else non-zero.
+ * Returns the count of consumed bytes or a negative error code. If 0 is
+ * returned, stream data is incomplete, decoding should be call again later
+ * with more content.
  */
 static ssize_t h3_rcv_buf(struct qcs *qcs, struct buffer *b, int fin)
 {
@@ -1476,7 +1490,7 @@ static ssize_t h3_rcv_buf(struct qcs *qcs, struct buffer *b, int fin)
 	return -1;
 }
 
-/* Function used to emit stream data from <qcs> control uni-stream.
+/* Emit SETTINGS frame on <qcs> control uni-stream.
  *
  * On success return the number of sent bytes. A negative code is used on
  * error.
@@ -1519,11 +1533,6 @@ static int h3_control_send(struct qcs *qcs, void *ctx)
 		b_quic_enc_int(&pos, h3_settings_max_field_section_size, 0);
 	}
 
-	if (qfctl_sblocked(&qcs->tx.fc) || qfctl_sblocked(&qcs->qcc->tx.fc)) {
-		TRACE_ERROR("not enough initial credit for control stream", H3_EV_TX_FRAME|H3_EV_TX_SETTINGS, qcs->qcc->conn, qcs);
-		goto err;
-	}
-
 	if (!(res = qcc_get_stream_txbuf(qcs, &err, 0))) {
 		/* Only memory failure can cause buf alloc error for control stream due to qcs_send_metadata() usage. */
 		TRACE_ERROR("cannot allocate Tx buffer", H3_EV_TX_FRAME|H3_EV_TX_SETTINGS, qcs->qcc->conn, qcs);
@@ -1557,7 +1566,7 @@ static int h3_resp_headers_send(struct qcs *qcs, struct htx *htx)
 	struct buffer outbuf;
 	struct buffer headers_buf = BUF_NULL;
 	struct buffer *res;
-	struct http_hdr list[global.tune.max_http_hdr];
+	struct http_hdr list[global.tune.max_http_hdr * 2];
 	struct htx_sl *sl;
 	struct htx_blk *blk;
 	enum htx_blk_type type;
@@ -2093,6 +2102,12 @@ static size_t h3_snd_buf(struct qcs *qcs, struct buffer *buf, size_t count)
 	 * request, clients SHOULD continue sending the content of the request
 	 * and close the stream normally.
 	 */
+
+	/* TODO deactivate for now STOP_SENDING emission on complete response.
+	 * In particular, this may prevent FIN transmission to stream layer
+	 * which results in transfers reported as prematurely aborted (cL--).
+	 */
+#if 0
 	if (unlikely((htx->flags & HTX_FL_EOM) && htx_is_empty(htx)) &&
 	             !qcs_is_close_remote(qcs)) {
 	        /* Generate a STOP_SENDING if full response transferred before
@@ -2101,6 +2116,7 @@ static size_t h3_snd_buf(struct qcs *qcs, struct buffer *buf, size_t count)
 	        qcs->err = H3_ERR_NO_ERROR;
 	        qcc_abort_stream_read(qcs);
 	}
+#endif
 
  out:
 	htx_to_buf(htx, buf);
@@ -2167,9 +2183,14 @@ static size_t h3_nego_ff(struct qcs *qcs, size_t count)
 	return ret;
 }
 
+/* Finalize encoding of a HTTP/3 data frame after zero-copy for <qcs> stream.
+ * No frame is encoded if <qcs> iobuf indicates that no data were transferred.
+ *
+ * Return the payload size of the H3 data frame or 0 if no frame encoded.
+ */
 static size_t h3_done_ff(struct qcs *qcs)
 {
-	size_t total = qcs->sd->iobuf.data;
+	size_t total = 0;
 	TRACE_ENTER(H3_EV_STRM_SEND, qcs->qcc->conn, qcs);
 
 	h3_debug_printf(stderr, "%s\n", __func__);
@@ -2177,15 +2198,14 @@ static size_t h3_done_ff(struct qcs *qcs)
 	if (qcs->sd->iobuf.data) {
 		TRACE_DATA("encoding DATA frame (fast forward)",
 		           H3_EV_TX_FRAME|H3_EV_TX_DATA, qcs->qcc->conn, qcs);
+
 		b_sub(qcs->sd->iobuf.buf, qcs->sd->iobuf.data);
 		b_putchr(qcs->sd->iobuf.buf, 0x00); /* h3 frame type = DATA */
 		b_quic_enc_int(qcs->sd->iobuf.buf, qcs->sd->iobuf.data, QUIC_VARINT_MAX_SIZE); /* h3 frame length */
 		b_add(qcs->sd->iobuf.buf, qcs->sd->iobuf.data);
-	}
 
-	qcs->sd->iobuf.buf = NULL;
-	qcs->sd->iobuf.offset = 0;
-	qcs->sd->iobuf.data = 0;
+		total = qcs->sd->iobuf.offset + qcs->sd->iobuf.data;
+	}
 
 	TRACE_LEAVE(H3_EV_STRM_SEND, qcs->qcc->conn, qcs);
 	return total;
@@ -2390,29 +2410,46 @@ static int h3_init(struct qcc *qcc)
 	return 0;
 }
 
-/* Initialize H3 control stream and prepare SETTINGS emission.
+/* Open control stream for <ctx> HTTP/3 connection and schedule a SETTINGS
+ * frame emission on it.
  *
- * Returns 0 on success else non-zero.
+ * Returns 0 on success. If a transient error was encountered, a positive value
+ * is returned, finalize operation should be recalled later. A negative value is
+ * used for a fatal error, in this case the connection should be closed.
  */
 static int h3_finalize(void *ctx)
 {
 	struct h3c *h3c = ctx;
 	struct qcc *qcc = h3c->qcc;
-	struct qcs *qcs;
+	struct qcs *qcs = h3c->ctrl_strm;
 
 	TRACE_ENTER(H3_EV_H3C_NEW, qcc->conn);
 
-	qcs = qcc_init_stream_local(qcc, 0);
 	if (!qcs) {
-		/* Error must be set by qcc_init_stream_local(). */
-		BUG_ON(!(qcc->flags & QC_CF_ERRL));
-		TRACE_ERROR("cannot init control stream", H3_EV_H3C_NEW, qcc->conn);
-		goto err;
+		qcs = qcc_init_stream_local(qcc, 0);
+		if (!qcs) {
+			/* Error must be set by qcc_init_stream_local(). */
+			BUG_ON(!(qcc->flags & QC_CF_ERRL));
+			TRACE_ERROR("cannot init control stream", H3_EV_H3C_NEW, qcc->conn);
+			goto err;
+		}
+
+		qcs_send_metadata(qcs);
+		h3c->ctrl_strm = qcs;
 	}
 
-	qcs_send_metadata(qcs);
-	h3c->ctrl_strm = qcs;
+	if (qfctl_sblocked(&qcs->tx.fc) || qfctl_sblocked(&qcs->qcc->tx.fc)) {
+		TRACE_STATE("not enough initial credit for control stream", H3_EV_TX_FRAME|H3_EV_TX_SETTINGS, qcs->qcc->conn, qcs);
+		goto again;
+	}
 
+	/* RFC 9114 7.2.4.2. Initialization
+	 *
+	 * Endpoints MUST NOT require any data to be
+	 * received from the peer prior to sending the SETTINGS frame;
+	 * settings MUST be sent as soon as the transport is ready to
+	 * send data.
+	 */
 	if (h3_control_send(qcs, h3c) < 0) {
 		qcc_set_error(qcc, H3_ERR_INTERNAL_ERROR, 1);
 		goto err;
@@ -2421,9 +2458,13 @@ static int h3_finalize(void *ctx)
 	TRACE_LEAVE(H3_EV_H3C_NEW, qcc->conn);
 	return 0;
 
+ again:
+	TRACE_DEVEL("leaving on transient state", H3_EV_H3C_NEW, qcc->conn);
+	return 1;
+
  err:
 	TRACE_DEVEL("leaving on error", H3_EV_H3C_NEW, qcc->conn);
-	return 1;
+	return -1;
 }
 
 /* Send a HTTP/3 GOAWAY followed by a CONNECTION_CLOSE_APP. */

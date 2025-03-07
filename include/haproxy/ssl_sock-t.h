@@ -327,5 +327,13 @@ extern const char *SSL_SOCK_KEYTYPE_NAMES[];
 
 extern struct pool_head *ssl_sock_client_sni_pool;
 
+struct ssl_counters {
+	long long sess;
+	long long reused_sess;
+	long long failed_handshake;
+	long long ocsp_staple;
+	long long failed_ocsp_staple;
+};
+
 #endif /* USE_OPENSSL */
 #endif /* _HAPROXY_SSL_SOCK_T_H */

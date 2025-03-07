@@ -14,6 +14,7 @@
 #ifndef _HAPROXY_MWORKER_H_
 #define _HAPROXY_MWORKER_H_
 
+#include <haproxy/limits.h>
 #include <haproxy/mworker-t.h>
 #include <haproxy/signal-t.h>
 
@@ -50,5 +51,9 @@ void mworker_free_child(struct mworker_proc *);
 void mworker_cleanup_proc();
 
 void mworker_create_master_cli(void);
+
+void mworker_prepare_master(void);
+void mworker_run_master(void);
+void mworker_apply_master_worker_mode(void);
 
 #endif /* _HAPROXY_MWORKER_H_ */

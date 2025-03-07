@@ -131,6 +131,8 @@ const struct cfg_opt cfg_opts2[] =
 	{"h1-case-adjust-bogus-client",   PR_O2_H1_ADJ_BUGCLI, PR_CAP_FE, 0, 0 },
 	{"h1-case-adjust-bogus-server",   PR_O2_H1_ADJ_BUGSRV, PR_CAP_BE, 0, 0 },
 	{"disable-h2-upgrade",            PR_O2_NO_H2_UPGRADE, PR_CAP_FE, 0, PR_MODE_HTTP },
+	{"assume-rfc6587-ntf",            PR_O2_ASSUME_RFC6587_NTF, PR_CAP_FE, 0, PR_MODE_SYSLOG },
+	{"dont-parse-log",                PR_O2_DONTPARSELOG, PR_CAP_FE, 0, PR_MODE_SYSLOG },
 	{ NULL, 0, 0, 0 }
 };
 
@@ -387,6 +389,9 @@ void free_proxy(struct proxy *p)
 		LIST_DELETE(&bind_conf->by_fe);
 		free(bind_conf->guid_prefix);
 		free(bind_conf->rhttp_srvname);
+#ifdef USE_QUIC
+		free(bind_conf->quic_cc_algo);
+#endif
 		free(bind_conf);
 	}
 
@@ -404,6 +409,7 @@ void free_proxy(struct proxy *p)
 
 	stktable_deinit(p->table);
 	ha_free(&p->table);
+	ha_free(&p->per_tgrp);
 
 	HA_RWLOCK_DESTROY(&p->lbprm.lock);
 	HA_RWLOCK_DESTROY(&p->lock);
@@ -618,6 +624,12 @@ static int proxy_parse_timeout(char **args, int section, struct proxy *proxy,
 	else if (res) {
 		memprintf(err, "unexpected character '%c' in 'timeout %s'", *res, name);
 		return -1;
+	}
+
+	if (warn_if_lower(args[1], 100)) {
+		memprintf(err, "'timeout %s %u' in %s '%s' is suspiciously small for a value in milliseconds. Please use an explicit unit ('%ums') if that was the intent.",
+		          name, timeout, proxy_type_str(proxy), proxy->id, timeout);
+		retval = 1;
 	}
 
 	if (!(proxy->cap & cap)) {
@@ -868,6 +880,8 @@ proxy_parse_retry_on(char **args, int section, struct proxy *curpx,
 			curpx->retry_type |= PR_RE_404;
 		else if (strcmp(args[i], "408") == 0)
 			curpx->retry_type |= PR_RE_408;
+		else if (strcmp(args[i], "421") == 0)
+			curpx->retry_type |= PR_RE_421;
 		else if (strcmp(args[i], "425") == 0)
 			curpx->retry_type |= PR_RE_425;
 		else if (strcmp(args[i], "429") == 0)
@@ -1396,7 +1410,6 @@ void init_new_proxy(struct proxy *p)
 {
 	memset(p, 0, sizeof(struct proxy));
 	p->obj_type = OBJ_TYPE_PROXY;
-	queue_init(&p->queue, p, NULL);
 	LIST_INIT(&p->acl);
 	LIST_INIT(&p->http_req_rules);
 	LIST_INIT(&p->http_res_rules);
@@ -1450,6 +1463,18 @@ void init_new_proxy(struct proxy *p)
 
 	/* initialize the default settings */
 	proxy_preset_defaults(p);
+}
+
+/* Initialize per-thread proxy fields */
+int proxy_init_per_thr(struct proxy *px)
+{
+	int i;
+
+	px->per_tgrp = calloc(global.nbtgroups, sizeof(*px->per_tgrp));
+	for (i = 0; i < global.nbtgroups; i++)
+		queue_init(&px->per_tgrp[i].queue, px, NULL);
+
+	return 0;
 }
 
 /* Preset default settings onto proxy <defproxy>. */
@@ -1845,6 +1870,8 @@ static int proxy_defproxy_cpy(struct proxy *curproxy, const struct proxy *defpro
 		curproxy->comp->algo_req = defproxy->comp->algo_req;
 		curproxy->comp->types_res = defproxy->comp->types_res;
 		curproxy->comp->types_req = defproxy->comp->types_req;
+		curproxy->comp->minsize_res = defproxy->comp->minsize_res;
+		curproxy->comp->minsize_req = defproxy->comp->minsize_req;
 		curproxy->comp->flags = defproxy->comp->flags;
 	}
 

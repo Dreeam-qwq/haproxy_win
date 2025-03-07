@@ -654,6 +654,7 @@ static struct appctx *sink_forward_session_create(struct sink *sink, struct sink
 		goto out_close;
 	appctx->svcctx = (void *)sft;
 	appctx_wakeup(appctx);
+	sft->last_conn = now_ms;
 	return appctx;
 
 	/* Error unrolling */
@@ -678,9 +679,20 @@ static struct task *process_sink_forward(struct task * task, void *context, unsi
 			 * assigment right away since the applet is not supposed to change
 			 * during the session lifetime. By doing the assignment now we
 			 * make sure to start the session exactly once.
+			 *
+			 * We enforce a tempo to ensure we don't perform more than 1 session
+			 * establishment attempt per second.
 			 */
-			if (!sft->appctx)
-				sft->appctx = sink_forward_session_create(sink, sft);
+			if (!sft->appctx) {
+				uint tempo = sft->last_conn + MS_TO_TICKS(1000);
+
+				if (sft->last_conn == TICK_ETERNITY || tick_is_expired(tempo, now_ms))
+					sft->appctx = sink_forward_session_create(sink, sft);
+				else if (task->expire == TICK_ETERNITY)
+					task->expire = tempo;
+				else
+					task->expire = tick_first(task->expire, tempo);
+			}
 			HA_SPIN_UNLOCK(SFT_LOCK, &sft->lock);
 			sft = sft->next;
 		}
@@ -976,8 +988,7 @@ int cfg_parse_ring(const char *file, int linenum, char **args, int kwm)
 			goto err;
 		}
 
-		size = atol(args[1]);
-		if (!size) {
+		if (parse_size_err(args[1], &size) != NULL || !size) {
 			ha_alert("parsing [%s:%d] : invalid size '%s' for new sink buffer.\n", file, linenum, args[1]);
 			err_code |= ERR_ALERT | ERR_FATAL;
 			goto err;
@@ -1286,17 +1297,28 @@ struct sink *sink_new_from_srv(struct server *srv, const char *from)
 {
 	struct sink *sink = NULL;
 	int bufsize = (srv->log_bufsize) ? srv->log_bufsize : BUFSIZE;
+	char *sink_name = NULL;
 
 	/* prepare description for the sink */
 	chunk_reset(&trash);
 	chunk_printf(&trash, "created from %s declared into '%s' at line %d", from, srv->conf.file, srv->conf.line);
 
+	memprintf(&sink_name, "%s/%s", srv->proxy->id, srv->id);
+	if (!sink_name) {
+		ha_alert("memory error while creating ring buffer for server '%s/%s'.\n", srv->proxy->id, srv->id);
+		goto error;
+	}
+
 	/* directly create a sink of BUF type, and use UNSPEC log format to
 	 * inherit from caller fmt in sink_write()
+	 *
+	 * sink_name must be unique to prevent existing sink from being re-used
 	 */
-	sink = sink_new_buf(srv->id, trash.area, LOG_FORMAT_UNSPEC, bufsize);
+	sink = sink_new_buf(sink_name, trash.area, LOG_FORMAT_UNSPEC, bufsize);
+	ha_free(&sink_name); // no longer needed
+
 	if (!sink) {
-		ha_alert("unable to create a new sink buffer for server '%s'.\n", srv->id);
+		ha_alert("unable to create a new sink buffer for server '%s/%s'.\n", srv->proxy->id, srv->id);
 		goto error;
 	}
 

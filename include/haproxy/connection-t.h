@@ -339,12 +339,14 @@ enum mux_ctl_type {
 	MUX_CTL_GET_GLITCHES, /* returns number of glitches on the connection */
 	MUX_CTL_GET_NBSTRM, /* Return the current number of streams on the connection */
 	MUX_CTL_GET_MAXSTRM, /* Return the max number of streams supported by the connection */
+	MUX_CTL_TEVTS, /* Return the termination events log of the mux connection */
 };
 
 /* sctl command used by mux->sctl() */
 enum mux_sctl_type {
 	MUX_SCTL_SID, /* Return the mux stream ID as output, as a signed 64bits integer */
 	MUX_SCTL_DBG_STR,    /* takes a mux_sctl_dbg_str_ctx argument, reads flags and returns debug info */
+	MUX_SCTL_TEVTS, /* Return the termination events log of the mux stream */
 };
 
 #define MUX_SCTL_DBG_STR_L_MUXS  0x00000001  // info from mux stream
@@ -538,6 +540,7 @@ struct conn_tlv_list {
 	char value[0];
 } __attribute__((packed));
 
+
 /* This structure describes a connection with its methods and data.
  * A connection may be performed to proxy or server via a local or remote
  * socket, and can also be made to an internal applet. It can support
@@ -588,6 +591,8 @@ struct connection {
 		enum obj_type *target; /* Listener for active reverse, server for passive. */
 		struct buffer name;    /* Only used for passive reverse. Used as SNI when connection added to server idle pool. */
 	} reverse;
+
+	uint32_t term_evts_log;        /* Termination events log: first 4 events reported from fd, handshake or xprt */
 	uint32_t mark;                 /* set network mark, if CO_FL_OPT_MARK is set */
 	uint8_t tos;                   /* set ip tos, if CO_FL_OPT_TOS is set */
 };
@@ -729,6 +734,102 @@ struct idle_conns {
 	struct task *cleanup_task;
 	__decl_thread(HA_SPINLOCK_T idle_conns_lock);
 } THREAD_ALIGNED(64);
+
+
+/* Termination events logs:
+ * Each event is stored on 8 bits: 4 bits bor the event location and
+ * 4 bits for the event type.
+ */
+
+/* Locations for termination event logs (4-bits). But only 7 locations are
+ * supported because 1 bit is reserved to distinguish frontend to backend
+ * events: the msb is set to 1 for backend events.
+ */
+enum term_event_loc {
+	tevt_loc_fd    = 1,
+	tevt_loc_hs    = 2,
+	tevt_loc_xprt  = 3,
+	tevt_loc_muxc  = 4,
+	tevt_loc_se    = 5,
+	tevt_loc_strm  = 6,
+};
+
+/* Types for termination event logs (4-bits) per location */
+enum fd_term_event_type {
+	fd_tevt_type_shutw       = 1,
+	fd_tevt_type_shutr       = 2,
+	fd_tevt_type_rcv_err     = 3,
+	fd_tevt_type_snd_err     = 4,
+	/* unused: 5, 6 */
+	fd_tevt_type_connect_err = 7,
+	fd_tevt_type_intercepted = 8,
+
+	fd_tevt_type_connect_poll_err  =  9,
+	fd_tevt_type_poll_err          = 10,
+	fd_tevt_type_poll_hup          = 11,
+};
+
+enum hs_term_event_type {
+	/* unused: 1, 2, 3 */
+	hs_tevt_type_snd_err           = 4,
+	hs_tevt_type_truncated_shutr   = 5,
+	hs_tevt_type_truncated_rcv_err = 6,
+};
+
+enum xprt_term_event_type {
+	xprt_tevt_type_shutw   = 1,
+	xprt_tevt_type_shutr   = 2,
+	xprt_tevt_type_rcv_err = 3,
+	xprt_tevt_type_snd_err = 4,
+};
+
+enum muxc_term_event_type {
+	muxc_tevt_type_shutw            =  1,
+	muxc_tevt_type_shutr            =  2,
+	muxc_tevt_type_rcv_err          =  3,
+	muxc_tevt_type_snd_err          =  4,
+	muxc_tevt_type_truncated_shutr  =  5,
+	muxc_tevt_type_truncated_rcv_err=  6,
+
+	muxc_tevt_type_tout             =  7,
+	muxc_tevt_type_goaway_rcvd      =  8,
+	muxc_tevt_type_proto_err        =  9,
+	muxc_tevt_type_internal_err     = 10,
+	muxc_tevt_type_other_err        = 11,
+	muxc_tevt_type_graceful_shut    = 12,
+};
+
+enum se_term_event_type {
+	se_tevt_type_shutw            =  1,
+	se_tevt_type_eos              =  2,
+	se_tevt_type_rcv_err          =  3,
+	se_tevt_type_snd_err          =  4,
+	se_tevt_type_truncated_eos    =  5,
+	se_tevt_type_truncated_rcv_err=  6,
+	/* unused: 7 */
+	se_tevt_type_rst_rcvd         =  8,
+	se_tevt_type_proto_err        =  9,
+	se_tevt_type_internal_err     = 10,
+	se_tevt_type_other_err        = 11,
+	se_tevt_type_cancelled        = 12,
+};
+
+enum strm_term_event_type {
+	strm_tevt_type_shutw            =  1,
+	strm_tevt_type_eos              =  2,
+	strm_tevt_type_rcv_err          =  3,
+	strm_tevt_type_snd_err          =  4,
+	strm_tevt_type_truncated_eos    =  5,
+	strm_tevt_type_truncated_rcv_err=  6,
+
+	strm_tevt_type_tout             =  7,
+	strm_tevt_type_intercepted      =  8,
+
+	strm_tevt_type_proto_err        =  9,
+	strm_tevt_type_internal_err     = 10,
+	strm_tevt_type_other_err        = 11,
+	strm_tevt_type_aborted          = 12,
+};
 
 #endif /* _HAPROXY_CONNECTION_T_H */
 

@@ -3,6 +3,9 @@ set -eux
 
 BUILDSSL_DESTDIR=${BUILDSSL_DESTDIR:-${HOME}/opt}
 BUILDSSL_TMPDIR=${BUILDSSL_TMPDIR:-/tmp/download-cache}
+QUICTLS_URL=${QUICTLS_URL:-https://github.com/quictls/openssl}
+
+WOLFSSL_DEBUG=${WOLFSSL_DEBUG:-0}
 
 download_openssl () {
     if [ ! -f "${BUILDSSL_TMPDIR}/openssl-${OPENSSL_VERSION}.tar.gz" ]; then
@@ -146,9 +149,37 @@ build_aws_lc () {
     fi
 }
 
+download_aws_lc_fips () {
+    if [ ! -f "${BUILDSSL_TMPDIR}/aws-lc-${AWS_LC_FIPS_VERSION}.tar.gz" ]; then
+        mkdir -p "${BUILDSSL_TMPDIR}"
+        wget -q -O "${BUILDSSL_TMPDIR}/aws-lc-fips-${AWS_LC_FIPS_VERSION}.tar.gz" \
+          "https://github.com/aws/aws-lc/archive/refs/tags/AWS-LC-FIPS-${AWS_LC_FIPS_VERSION}.tar.gz"
+    fi
+}
+
+
+# require GO + Perl for FIPS mode
+build_aws_lc_fips () {
+    if [ "$(cat ${BUILDSSL_DESTDIR}/.aws_lc_fips-version)" != "${AWS_LC_FIPS_VERSION}" ]; then
+        mkdir -p "${BUILDSSL_TMPDIR}/aws-lc-fips-${AWS_LC_FIPS_VERSION}/"
+        tar zxf "${BUILDSSL_TMPDIR}/aws-lc-fips-${AWS_LC_FIPS_VERSION}.tar.gz" -C "${BUILDSSL_TMPDIR}/aws-lc-fips-${AWS_LC_FIPS_VERSION}/" --strip-components=1
+        (
+           cd "${BUILDSSL_TMPDIR}/aws-lc-fips-${AWS_LC_FIPS_VERSION}/"
+           mkdir -p build
+           cd build
+           cmake -version
+           cmake -DCMAKE_BUILD_TYPE=Release -DFIPS=1 -DBUILD_SHARED_LIBS=1 \
+             -DBUILD_TESTING=0 -DCMAKE_INSTALL_PREFIX=${BUILDSSL_DESTDIR} ..
+           make -j$(nproc)
+           make install
+        )
+        echo "${AWS_LC_FIPS_VERSION}" > "${BUILDSSL_DESTDIR}/.aws_lc_fips-version"
+    fi
+}
+
 download_quictls () {
     if [ ! -d "${BUILDSSL_TMPDIR}/quictls" ]; then
-        git clone --depth=1 https://github.com/quictls/openssl ${BUILDSSL_TMPDIR}/quictls
+        git clone --depth=1 ${QUICTLS_URL} ${BUILDSSL_TMPDIR}/quictls
     else
        (
         cd ${BUILDSSL_TMPDIR}/quictls
@@ -181,10 +212,16 @@ build_wolfssl () {
     if [ "$(cat ${BUILDSSL_DESTDIR}/.wolfssl-version)" != "${WOLFSSL_VERSION}" ]; then
         mkdir -p "${BUILDSSL_TMPDIR}/wolfssl-${WOLFSSL_VERSION}/"
         tar zxf "${BUILDSSL_TMPDIR}/wolfssl-${WOLFSSL_VERSION}.tar.gz" -C "${BUILDSSL_TMPDIR}/wolfssl-${WOLFSSL_VERSION}/" --strip-components=1
+        if [ "${WOLFSSL_DEBUG}" -eq 1 ]; then
+          WOLFSSL_DEBUG="--enable-debug"
+        else
+          WOLFSSL_DEBUG=
+        fi
         (
+
            cd "${BUILDSSL_TMPDIR}/wolfssl-${WOLFSSL_VERSION}/"
             autoreconf -i
-           ./configure --enable-haproxy --enable-quic --prefix="${BUILDSSL_DESTDIR}"
+           ./configure --enable-haproxy --enable-quic --prefix="${BUILDSSL_DESTDIR}" ${WOLFSSL_DEBUG}
            make -j$(nproc)
            make install
         )
@@ -213,6 +250,11 @@ fi
 if [ ! -z ${AWS_LC_VERSION+x} ]; then
 	download_aws_lc
   build_aws_lc
+fi
+
+if [ ! -z ${AWS_LC_FIPS_VERSION+x} ]; then
+	download_aws_lc_fips
+	build_aws_lc_fips
 fi
 
 if [ ! -z ${QUICTLS+x} ]; then

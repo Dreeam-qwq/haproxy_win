@@ -84,6 +84,18 @@ enum hlua_log_opt {
 /* default log options, made of flags in hlua_log_opt */
 static uint hlua_log_opts = HLUA_LOG_LOGGERS_ON | HLUA_LOG_STDERR_AUTO;
 
+#define HLUA_BOOL_SAMPLE_CONVERSION_UNK     0x0
+#define HLUA_BOOL_SAMPLE_CONVERSION_NORMAL  0x1
+#define HLUA_BOOL_SAMPLE_CONVERSION_BUG     0X2
+
+/* used to know how to deal with smp2lua bool handling, option implicitly
+ * defaults to historical behavior (BUG), but it has to be set explicitly
+ * to avoid ambiguity, else a warning will be emitted
+ *
+ * FIXME: make it default to NORMAL in 3.3??
+ */
+static uint8_t hlua_bool_sample_conversion = HLUA_BOOL_SAMPLE_CONVERSION_UNK;
+
 /* Lua uses longjmp to perform yield or throwing errors. This
  * macro is used only for identifying the function that can
  * not return because a longjmp is executed.
@@ -1085,8 +1097,13 @@ __LJMP static int hlua_smp2lua(lua_State *L, struct sample *smp)
 {
 	switch (smp->data.type) {
 	case SMP_T_SINT:
-	case SMP_T_BOOL:
 		lua_pushinteger(L, smp->data.u.sint);
+		break;
+	case SMP_T_BOOL:
+		if (hlua_bool_sample_conversion == HLUA_BOOL_SAMPLE_CONVERSION_NORMAL)
+			lua_pushboolean(L, !!smp->data.u.sint);
+		else
+			lua_pushinteger(L, smp->data.u.sint);
 		break;
 
 	case SMP_T_BIN:
@@ -2279,6 +2296,7 @@ static int hlua_set_map(lua_State *L)
 	const char *key;
 	const char *value;
 	struct pat_ref *ref;
+	struct pat_ref_elt *elt;
 
 	MAY_LJMP(check_args(L, 3, "set_map"));
 
@@ -2291,12 +2309,35 @@ static int hlua_set_map(lua_State *L)
 		WILL_LJMP(luaL_error(L, "'set_map': unknown map file '%s'", name));
 
 	HA_RWLOCK_WRLOCK(PATREF_LOCK, &ref->lock);
-	if (pat_ref_find_elt(ref, key) != NULL)
-		pat_ref_set(ref, key, value, NULL, NULL);
+	elt = pat_ref_find_elt(ref, key);
+	if (elt)
+		pat_ref_set_elt_duplicate(ref, elt, value, NULL);
 	else
 		pat_ref_add(ref, key, value, NULL);
 	HA_RWLOCK_WRUNLOCK(PATREF_LOCK, &ref->lock);
 	return 0;
+}
+
+/* This function is an LUA binding. It provides a function
+ * for retrieving a patref object from a reference name
+ */
+static int hlua_get_patref(lua_State *L)
+{
+	const char *name;
+	struct pat_ref *ref;
+
+	MAY_LJMP(check_args(L, 1, "get_patref"));
+
+	name = MAY_LJMP(luaL_checkstring(L, 1));
+
+	ref = pat_ref_lookup(name);
+	if (!ref)
+		WILL_LJMP(luaL_error(L, "'get_patref': unknown pattern reference '%s'", name));
+
+	/* push the existing patref object on the stack */
+	MAY_LJMP(hlua_fcn_new_patref(L, ref));
+
+	return 1;
 }
 
 /* This function is an LUA binding. It provides a function
@@ -5040,10 +5081,9 @@ __LJMP static struct hlua_appctx *hlua_checkapplet_tcp(lua_State *L, int ud)
 static int hlua_applet_tcp_new(lua_State *L, struct appctx *ctx)
 {
 	struct hlua_appctx *luactx;
-	struct stream *s = appctx_strm(ctx);
+	struct stream *s = ASSUME_NONNULL(appctx_strm(ctx));
 	struct proxy *p;
 
-	ALREADY_CHECKED(s);
 	p = s->be;
 
 	/* Check stack size. */
@@ -12286,6 +12326,10 @@ static void hlua_filter_delete(struct stream *s, struct filter *filter)
 	struct hlua_flt_ctx *flt_ctx = filter->ctx;
 	struct hlua *hlua = hlua_stream_ctx_get(s, flt_ctx->_hlua->state_id);
 
+	BUG_ON(!hlua); /* hlua_filter_new() is responsible for preparing
+	                * hlua stream_ctx, thus hlua_stream_ctx_get() should
+	                * not return NULL!
+	                */
 	hlua_lock(hlua);
 	hlua_unref(hlua->T, flt_ctx->ref);
 	hlua_unlock(hlua);
@@ -12909,6 +12953,24 @@ static int hlua_cfg_parse_log_stderr(char **args, int section_type, struct proxy
 	return 0;
 }
 
+static int hlua_cfg_parse_bool_sample_conversion(char **args, int section_type, struct proxy *curpx,
+                                                 const struct proxy *defpx, const char *file, int line,
+                                                 char **err)
+{
+	if (too_many_args(1, args, err, NULL))
+		return -1;
+
+	if (strcmp(args[1], "normal") == 0)
+		hlua_bool_sample_conversion = HLUA_BOOL_SAMPLE_CONVERSION_NORMAL;
+	else if (strcmp(args[1], "pre-3.1-bug") == 0)
+		hlua_bool_sample_conversion = HLUA_BOOL_SAMPLE_CONVERSION_BUG;
+	else {
+		memprintf(err, "'%s' expects either 'normal' or 'pre-3.1-bug' but got '%s'.", args[0], args[1]);
+		return -1;
+	}
+	return 0;
+}
+
 /* This function is called by the main configuration key "lua-load". It loads and
  * execute an lua file during the parsing of the HAProxy configuration file. It is
  * the main lua entry point.
@@ -12927,6 +12989,21 @@ static int hlua_load_state(char **args, lua_State *L, char **err)
 {
 	int error;
 	int nargs;
+
+	if (ONLY_ONCE()) {
+		/* we know we get there if "lua-load" or "lua-load-per-thread" was
+		 * used in the config
+		 */
+		if (hlua_bool_sample_conversion == HLUA_BOOL_SAMPLE_CONVERSION_UNK) {
+			/* hlua_bool_sample_conversion tunable must be explicitly set to
+			 * avoid ambiguity, so we raise a warning (but only if lua
+			 * is actually used
+			 */
+			ha_warning("hlua: please set \"tune.lua.bool-sample-conversion\" tunable "
+			           "to either \"normal\" or \"pre-3.1-bug\" explicitly to avoid "
+			           "ambiguities. Defaulting to \"pre-3.1-bug\".\n");
+		}
+	}
 
 	/* Just load and compile the file. */
 	error = luaL_loadfile(L, args[0]);
@@ -13159,6 +13236,7 @@ static struct cfg_kw_list cfg_kws = {{ },{
 	{ CFG_GLOBAL, "tune.lua.maxmem",          hlua_parse_maxmem },
 	{ CFG_GLOBAL, "tune.lua.log.loggers",     hlua_cfg_parse_log_loggers },
 	{ CFG_GLOBAL, "tune.lua.log.stderr",      hlua_cfg_parse_log_stderr },
+	{ CFG_GLOBAL, "tune.lua.bool-sample-conversion", hlua_cfg_parse_bool_sample_conversion },
 	{ 0, NULL, NULL },
 }};
 
@@ -13326,14 +13404,14 @@ __LJMP static int hlua_ckch_set(lua_State *L)
 			errcode |= ERR_ALERT | ERR_FATAL;
 			goto end;
 		}
-
+#ifdef HAVE_SSL_OCSP
 		/* Reset the OCSP CID */
 		if (cert_ext->type == CERT_TYPE_PEM || cert_ext->type == CERT_TYPE_KEY ||
 		    cert_ext->type == CERT_TYPE_ISSUER) {
 			OCSP_CERTID_free(new_ckchs->data->ocsp_cid);
 			new_ckchs->data->ocsp_cid = NULL;
 		}
-
+#endif
 		/* apply the change on the duplicate */
 		if (cert_ext->load(filename, payload, data, &err) != 0) {
 			memprintf(&err, "%sCan't load the payload for '%s'", err ? err : "", cert_ext->ext);
@@ -13780,6 +13858,7 @@ lua_State *hlua_init_state(int thread_num)
 	hlua_class_function(L, "del_acl", hlua_del_acl);
 	hlua_class_function(L, "set_map", hlua_set_map);
 	hlua_class_function(L, "del_map", hlua_del_map);
+	hlua_class_function(L, "get_patref", hlua_get_patref);
 	hlua_class_function(L, "get_var", hlua_core_get_var);
 	hlua_class_function(L, "tcp", hlua_socket_new);
 	hlua_class_function(L, "httpclient", hlua_httpclient_new);

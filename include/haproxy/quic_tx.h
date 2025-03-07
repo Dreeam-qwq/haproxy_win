@@ -25,6 +25,7 @@
 #include <haproxy/list-t.h>
 #include <haproxy/quic_conn-t.h>
 #include <haproxy/quic_tls-t.h>
+#include <haproxy/quic_pacing-t.h>
 #include <haproxy/quic_rx-t.h>
 #include <haproxy/quic_tx-t.h>
 
@@ -33,12 +34,14 @@ void qc_txb_release(struct quic_conn *qc);
 int qc_purge_txbuf(struct quic_conn *qc, struct buffer *buf);
 struct buffer *qc_get_txb(struct quic_conn *qc);
 
-int qc_send_mux(struct quic_conn *qc, struct list *frms);
+enum quic_tx_err qc_send_mux(struct quic_conn *qc, struct list *frms,
+                             struct quic_pacer *pacer);
 
 void qel_register_send(struct list *send_list, struct quic_enc_level *qel,
                        struct list *frms);
 int qel_need_sending(struct quic_enc_level *qel, struct quic_conn *qc);
-int qc_send(struct quic_conn *qc, int old_data, struct list *send_list);
+int qc_send(struct quic_conn *qc, int old_data, struct list *send_list,
+            int max_dgrams);
 
 int qc_dgrams_retransmit(struct quic_conn *qc);
 void qc_prep_hdshk_fast_retrans(struct quic_conn *qc,
@@ -60,6 +63,7 @@ static inline void quic_tx_packet_dgram_detach(struct quic_tx_packet *pkt)
 		pkt->prev->next = pkt->next;
 	if (pkt->next)
 		pkt->next->prev = pkt->prev;
+	pkt->prev = pkt->next = NULL;
 }
 
 
@@ -72,6 +76,7 @@ static inline void quic_tx_packet_refinc(struct quic_tx_packet *pkt)
 /* Decrement the reference counter of <pkt> */
 static inline void quic_tx_packet_refdec(struct quic_tx_packet *pkt)
 {
+	BUG_ON(pkt->refcnt <= 0);
 	if (--pkt->refcnt == 0) {
 		BUG_ON(!LIST_ISEMPTY(&pkt->frms));
 		/* If there are others packet in the same datagram <pkt> is attached to,

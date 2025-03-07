@@ -59,18 +59,13 @@ static forceinline char *spop_conn_show_flags(char *buf, size_t len, const char 
 
 /**** SPOP stream flags (32 bit), in spop_strm->flags ****/
 #define SPOP_SF_NONE           0x00000000
-// #define SPOP_SF_ACK_RCVD       0x00000001 /* ACK freme received */
-//#define SPOP_SF_ES_SENT        0x00000002 /* end-of-stream sent */
-//#define SPOP_SF_EP_SENT        0x00000004 /* end-of-param sent */
-//#define SPOP_SF_DISCON_SENT      0x00000008 /* disconnect sent */
+#define SPOP_SF_ACK_RCVD       0x00000001 /* ACK freme received */
 
 /* Stream flags indicating the reason the stream is blocked */
 #define SPOP_SF_BLK_MBUSY      0x00000010 /* blocked waiting for mux access (transient) */
 #define SPOP_SF_BLK_MROOM      0x00000020 /* blocked waiting for room in the mux */
 #define SPOP_SF_BLK_ANY        0x00000030 /* any of the reasons above */
 
-//#define SPOP_SF_BEGIN_SENT     0x00000100  /* a BEGIN_REQUEST record was sent for this stream */
-//#define SPOP_SF_OUTGOING_DATA  0x00000200  /* set whenever we've seen outgoing data */
 #define SPOP_SF_NOTIFIED       0x00000400  /* a paused stream was notified to try to send again */
 
 /* This function is used to report flags in debugging tools. Please reflect
@@ -83,7 +78,7 @@ static forceinline char *spop_strm_show_flags(char *buf, size_t len, const char 
 	/* prologue */
 	_(0);
 	/* flags */
-	_(SPOP_SF_BLK_MBUSY, _(SPOP_SF_BLK_MROOM, _(SPOP_SF_NOTIFIED)));
+	_(SPOP_SF_ACK_RCVD, _(SPOP_SF_BLK_MBUSY, _(SPOP_SF_BLK_MROOM, _(SPOP_SF_NOTIFIED))));
 	/* epilogue */
 	_(~0U);
 	return buf;

@@ -348,7 +348,19 @@ Core class
   end
 ..
 
+.. js:function:: core.get_patref(name)
+
+  **context**: init, task, action, sample-fetch, converter
+
+  Find the pattern object *name* used by HAProxy. It corresponds to the
+  generic pattern reference used to handle both ACL ands Maps.
+
+  :param string name: reference name
+  :returns: A :ref:`patref_class` object.
+
 .. js:function:: core.add_acl(name, key)
+
+  **LEGACY**
 
   **context**: init, task, action, sample-fetch, converter
 
@@ -357,7 +369,13 @@ Core class
   :param string name: the name that reference the ACL entries.
   :param string key: the key which will be added.
 
+  .. Note::
+     This function is not optimal due to systematic Map reference lookup.
+     It is recommended to use :js:func:`Patref.add()` instead.
+
 .. js:function:: core.del_acl(name, key)
+
+  **LEGACY**
 
   **context**: init, task, action, sample-fetch, converter
 
@@ -367,7 +385,13 @@ Core class
   :param string name: the name that reference the ACL entries.
   :param string key: the key which will be deleted.
 
+  .. Note::
+     This function is not optimal due to systematic Map reference lookup.
+     It is recommended to use :js:func:`Patref.del()` instead.
+
 .. js:function:: core.del_map(name, key)
+
+  **LEGACY**
 
   **context**: init, task, action, sample-fetch, converter
 
@@ -376,6 +400,10 @@ Core class
 
   :param string name: the name that reference the map entries.
   :param string key: the key which will be deleted.
+
+  .. Note::
+     This function is not optimal due to systematic Map reference lookup.
+     It is recommended to use :js:func:`Patref.del()` instead.
 
 .. js:function:: core.get_info()
 
@@ -485,7 +513,7 @@ Core class
 
 .. js:function:: core.msleep(milliseconds)
 
-  **context**: body, init, task, action
+  **context**: task, action
 
   The `core.msleep()` stops the Lua execution between specified milliseconds.
 
@@ -830,6 +858,8 @@ Core class
 
 .. js:function:: core.set_map(name, key, value)
 
+  **LEGACY**
+
   **context**: init, task, action, sample-fetch, converter
 
   Set the value *value* associated to the key *key* in the map referenced by
@@ -839,9 +869,13 @@ Core class
   :param string key: the key to set or replace
   :param string value: the associated value
 
+  .. Note::
+     This function is not optimal due to systematic Map reference lookup.
+     It is recommended to use :js:func:`Patref.set()` instead.
+
 .. js:function:: core.sleep(int seconds)
 
-  **context**: body, init, task, action
+  **context**: task, action
 
   The `core.sleep()` functions stop the Lua execution between specified seconds.
 
@@ -894,7 +928,7 @@ Core class
 
 .. js:function:: core.yield()
 
-  **context**: task, action, sample-fetch, converter
+  **context**: task, action
 
   Give back the hand at the HAProxy scheduler. It is used when the LUA
   processing consumes a lot of processing time.
@@ -3411,6 +3445,178 @@ Map class
   :param class_map map: Is the class Map object.
   :param string str: Is the string used as key.
   :returns: a string containing the result or empty string if no match.
+
+.. _patref_class:
+
+Patref class
+=================
+
+.. js:class:: Patref
+
+  Patref object corresponds to the internal HAProxy pat_ref element which
+  is used to store ACL and MAP elements. It is identified by its name
+  (reference) which often is a filename, unless it is prefixed by 'virt@'
+  for virtual references or 'opt@' for references that don't necessarily
+  point to real file. From Lua, :ref:`patref_class` object may be used to
+  directly manipulate existing pattern reference storage. For convenience,
+  Patref objects may be directly accessed and listed as a table thanks to
+  index and pairs metamethods. Note however that for the index metamethod,
+  in case of duplicated entries, only the first matching entry is returned.
+
+  .. Warning::
+     Not meant to be shared bewteen multiple contexts. If multiple contexts
+     need to work on the same pattern reference, each context should have
+     its own patref object.
+
+  Patref object is obtained using the :js:func:`core.get_patref()`
+  function
+
+.. js:function:: Patref.get_name(ref)
+
+  :returns: the name of the pattern reference object.
+
+.. js:function:: Patref.is_map(ref)
+
+  :returns: true if the pattern reference is used to handle maps instead
+   of acl, false otherwise.
+
+.. js:function:: Patref.purge(ref)
+
+  Completely prune all pattern reference entries pointed to by Patref object.
+  This special operation doesn't require committing.
+
+.. js:function:: Patref.prepare(ref)
+
+  Create a new empty version for Patref Object. It can be used to manipulate
+  the Patref object with update methods without applying the updates until the
+  commit() method is called.
+
+.. js:function:: Patref.commit(ref)
+
+  Tries to commit pending Patref object updates, that is updates made to the
+  local object will be committed to the underlying patter reference storage
+  in an atomic manner upon success. Upon failure, local pending updates are
+  lost. Upon success, all other pending updates on the pattern reference
+  (e.g.: "prepare" from the cli or from other Patref Lua objects) started
+  before the new one will be pruned.
+
+  :returns: true on success and nil on failure (followed by an error message).
+
+  See :js:func:`Patref.prepare()` and :js:func:`Patref.giveup()`
+
+.. js:function:: Patref.giveup(ref)
+
+  Drop the pending patref version created using Patref:prepare(): get back to
+  live dataset.
+
+.. js:function:: Patref.add(ref, key[, value])
+
+  Add a new key to the pattern reference, with associated value for maps.
+
+  :param string key: the string used as a key
+  :param string value: the string used as value to be associated with the key
+   (only relevant for maps)
+  :returns: true on success and nil on failure (followed by an error message).
+
+  .. Note::
+     Affects the live pattern reference version, unless :js:func:`Patref.prepare()`
+     was called and is still ongoing (waiting for commit or giveup)
+
+.. js:function:: patref.add_bulk(ref, table)
+
+  Adds multiple entries at once to the Pattern reference. It is recommended
+  to use this one over :js:func:`Patref.prepare()` to add a lot of entries
+  at once because this one is more efficient.
+
+  :param table table: For ACL, a table of keys strings: t[0] = "key1",
+   t[1] = "key2"...
+
+   For Maps, a table of key:value string pairs: t["key"] = "value"
+  :returns: true on success and nil on failure (followed by an error message).
+
+  .. Note::
+     Affects the live pattern reference version, unless :js:func:`Patref.prepare()`
+     was called and is still pending (waiting for commit or giveup)
+
+.. js:function:: Patref.del(ref, key)
+
+  Delete all entries matching the input key in the pattern reference. In
+  case of duplicate keys, all keys are removed.
+
+  :param string key: the string used as a key
+  :returns: true on success and false on failure.
+
+  .. Note::
+     Affects the live pattern reference version, unless :js:func:`Patref.prepare()`
+     was called and is still ongoing (waiting for commit or giveup)
+
+.. js:function:: Patref.set(ref, key, value[, force])
+
+  Only relevant for maps. Set existing entries matching key to the provided
+  value. In case of duplicate keys, all matching keys will be set to the new
+  value.
+
+  :param string key: the string used as a key
+  :param string value: the string used as value
+  :param boolean force: create the entry if it doesn't exist (optional,
+   defaults to false)
+  :returns: true on success and nil on failure (followed by an error message)
+
+  .. Note::
+     Affects the live pattern reference version, unless :js:func:`Patref.prepare()`
+     was called and is still ongoing (waiting for commit or giveup)
+
+.. js:function:: Patref.event_sub(ref, event_types, func)
+
+  Register a function that will be called on specific PAT_REF events.
+  See :js:func:`core.event_sub()` for generalities. Please note however that
+  for performance reasons pattern reference events can only be subscribed
+  per pattern reference (not globally). What this means is that the provided
+  callback function will only be called for events affecting the pattern
+  reference pointed by the Patref object (ref) passed as parameter.
+
+  If you want to be notified for events on a given set of pattern references, it
+  is still possible to perform as many per-patref subscriptions as needed.
+
+  Also, for PAT_REF events, no event data is provided (known as "event_data" in
+  callback function's prototype from :js:func:`core.event_sub()`)
+
+  The list of the available event types for the PAT_REF family are:
+
+    * **PAT_REF_ADD**: element was added to the current version of the pattern
+      reference
+    * **PAT_REF_DEL**: element was deleted from the current version of the
+      pattern reference
+    * **PAT_REF_SET**: element was modified in the current version of the
+      pattern reference
+    * **PAT_REF_CLEAR**: all elements were cleared from the current version of
+      the pattern reference
+    * **PAT_REF_COMMIT**: pending element(s) was/were committed in the current
+      version of the pattern reference
+
+   .. Note::
+     Use **PAT_REF** in **event_types** to subscribe to all pattern reference
+     events types at once.
+
+  Here is a working example showing how to trigger a callback function for the
+  pattern reference associated to file "test.map":
+
+.. code-block:: lua
+
+  core.register_init(function()
+    -- We assume that "test.map" is a map file referenced in haproxy config
+    -- file, thus it is loaded during config parsing and is expected to be
+    -- available at init Lua stage. Indeed, the below code wouldn't work if
+    -- used directly within body context, as at that time the config is not
+    -- fully parsed.
+    local map_patref = core.get_patref("test.map")
+    map_patref:event_sub({"PAT_REF_ADD"}, function(event, data, sub)
+      -- in the patref event handler
+      print("entry added!")
+    end)
+  end)
+
+..
 
 .. _applethttp_class:
 

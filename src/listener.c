@@ -1622,7 +1622,7 @@ void listener_release(struct listener *l)
 	if (fe && !MT_LIST_ISEMPTY(&fe->listener_queue) &&
 	    (!fe->fe_sps_lim || freq_ctr_remain(&fe->fe_counters.sess_per_sec, fe->fe_sps_lim, 0) > 0))
 		dequeue_proxy_listeners(fe, 0);
-	else {
+	else if (fe) {
 		unsigned int wait;
 		int expire = TICK_ETERNITY;
 
@@ -2368,8 +2368,13 @@ static int bind_parse_name(char **args, int cur_arg, struct proxy *px, struct bi
 		return ERR_ALERT | ERR_FATAL;
 	}
 
-	list_for_each_entry(l, &conf->listeners, by_bind)
+	list_for_each_entry(l, &conf->listeners, by_bind) {
 		l->name = strdup(args[cur_arg + 1]);
+		if (!l->name) {
+			memprintf(err, "'%s %s' : out of memory", args[cur_arg], args[cur_arg + 1]);
+			return ERR_ALERT | ERR_FATAL;
+		}
+	}
 
 	return 0;
 }

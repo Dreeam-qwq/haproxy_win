@@ -26,10 +26,6 @@
 
 #include <net/if.h>
 
-#if defined(USE_SYSTEMD)
-#include <haproxy/systemd.h>
-#endif
-
 #include <haproxy/api.h>
 #include <haproxy/applet.h>
 #include <haproxy/base64.h>
@@ -63,6 +59,7 @@
 #include <haproxy/stats-t.h>
 #include <haproxy/stconn.h>
 #include <haproxy/stream.h>
+#include <haproxy/systemd.h>
 #include <haproxy/task.h>
 #include <haproxy/ticks.h>
 #include <haproxy/time.h>
@@ -927,6 +924,12 @@ size_t cli_snd_buf(struct appctx *appctx, struct buffer *buf, size_t count, unsi
 
 	if (appctx->st0 == CLI_ST_INIT)
 		cli_init(appctx);
+	else if (appctx->st0 == CLI_ST_END) {
+		/* drop all data on END state */
+		ret = count;
+		b_del(buf, ret);
+		goto end;
+	}
 	else if (appctx->st0 != CLI_ST_GETREQ)
 		goto end;
 
@@ -965,19 +968,19 @@ size_t cli_snd_buf(struct appctx *appctx, struct buffer *buf, size_t count, unsi
 
 		if (str[len-1] == '\n')
 			lf = 1;
-
-		/* Remove the trailing \r, if any and add a null byte at the
-		 * end. For normal mode, the trailing \n is removed, but we
-		 * conserve if for payload mode.
-		 */
 		len--;
-		if (len && str[len-1] == '\r')
-			len--;
+
 		if (appctx->st1 & APPCTX_CLI_ST1_PAYLOAD) {
 			str[len+1] = '\0';
 			b_add(&appctx->inbuf, len+1);
 		}
 		else  {
+			/* Remove the trailing \r, if any and add a null byte at the
+			 * end. For normal mode, the trailing \n is removed, but we
+			 * conserve \r\n or \n sequences for payload mode.
+			 */
+			if (len && str[len-1] == '\r')
+				len--;
 			str[len] = '\0';
 			b_add(&appctx->inbuf, len);
 		}
@@ -1184,7 +1187,7 @@ static void cli_io_handler(struct appctx *appctx)
 					}
 				break;
 			default: /* abnormal state */
-				se_fl_set(appctx->sedesc, SE_FL_ERROR);
+				applet_set_error(appctx);
 				break;
 			}
 
@@ -1418,7 +1421,7 @@ static int cli_io_handler_show_fd(struct appctx *appctx)
 			suspicious = 1;
 
 		chunk_printf(&trash,
-			     "  %5d : st=0x%06x(%c%c %c%c%c%c%c W:%c%c%c R:%c%c%c) ref=%#x gid=%d tmask=0x%lx umask=0x%lx prmsk=0x%lx pwmsk=0x%lx owner=%p iocb=%p(",
+			     "  %5d : st=0x%06x(%c%c %c%c%c%c%c W:%c%c%c R:%c%c%c) ref=%#x gid=%d tmask=0x%lx umask=0x%lx prmsk=0x%lx pwmsk=0x%lx owner=%p gen=%u tkov=%u iocb=%p(",
 			     fd,
 			     fdt.state,
 			     (fdt.state & FD_CLONED) ? 'C' : 'c',
@@ -1440,6 +1443,8 @@ static int cli_io_handler_show_fd(struct appctx *appctx)
 			     polled_mask[fd].poll_recv,
 			     polled_mask[fd].poll_send,
 			     fdt.owner,
+			     fdt.generation,
+			     fdt.nb_takeover,
 			     fdt.iocb);
 		resolve_sym_name(&trash, NULL, fdt.iocb);
 
@@ -1635,7 +1640,7 @@ static int cli_io_handler_show_cli_sock(struct appctx *appctx)
 
 
 /* parse a "show env" CLI request. Returns 0 if it needs to continue, 1 if it
- * wants to stop here. It reserves a sohw_env_ctx where it puts the variable to
+ * wants to stop here. It reserves a show_env_ctx where it puts the variable to
  * be dumped as well as a flag if a single variable is requested, otherwise puts
  * environ there.
  */
@@ -2362,6 +2367,9 @@ static int _getsocks(char **args, char *payload, struct appctx *appctx, void *pr
 		if (!(fdtab[cur_fd].state & FD_EXPORTED))
 			continue;
 
+		/* this FD is now shared between processes */
+		HA_ATOMIC_OR(&fdtab[cur_fd].state, FD_CLONED);
+
 		ns_name = if_name = "";
 		ns_nlen = if_nlen = 0;
 
@@ -2408,7 +2416,7 @@ static int _getsocks(char **args, char *payload, struct appctx *appctx, void *pr
 			iov.iov_len = curoff;
 			if (sendmsg(fd, &msghdr, 0) != curoff) {
 				ha_warning("Failed to transfer sockets\n");
-				return -1;
+				goto out;
 			}
 
 			/* Wait for an ack */
@@ -2418,7 +2426,7 @@ static int _getsocks(char **args, char *payload, struct appctx *appctx, void *pr
 
 			if (ret <= 0) {
 				ha_warning("Unexpected error while transferring sockets\n");
-				return -1;
+				goto out;
 			}
 			curoff = 0;
 			nb_queued = 0;
@@ -2436,14 +2444,22 @@ static int _getsocks(char **args, char *payload, struct appctx *appctx, void *pr
 			ha_warning("Failed to transfer sockets\n");
 			goto out;
 		}
+
+		/* Wait for an ack */
+		do {
+			ret = recv(fd, &tot_fd_nb, sizeof(tot_fd_nb), 0);
+		} while (ret == -1 && errno == EINTR);
+
+		if (ret <= 0) {
+			ha_warning("Unexpected error while transferring sockets\n");
+			goto out;
+		}
 	}
 
 out:
-	if (fd >= 0 && old_fcntl >= 0 && fcntl(fd, F_SETFL, old_fcntl) == -1) {
+	if (fd >= 0 && old_fcntl >= 0 && fcntl(fd, F_SETFL, old_fcntl) == -1)
 		ha_warning("Cannot make the unix socket non-blocking\n");
-		goto out;
-	}
-	se_fl_set(appctx->sedesc, SE_FL_EOI);
+	applet_set_eoi(appctx);
 	appctx->st0 = CLI_ST_END;
 	free(cmsgbuf);
 	free(tmpbuf);
@@ -2465,7 +2481,7 @@ static int cli_parse_simple(char **args, char *payload, struct appctx *appctx, v
 			appctx->st1 ^= APPCTX_CLI_ST1_PROMPT;
 	else if (*args[0] == 'q') {
 		/* quit */
-		se_fl_set(appctx->sedesc, SE_FL_EOI);
+		applet_set_eoi(appctx);
 		appctx->st0 = CLI_ST_END;
 	}
 
@@ -2497,6 +2513,7 @@ static int _send_status(char **args, char *payload, struct appctx *appctx, void 
 {
 	struct listener *mproxy_li;
 	struct mworker_proc *proc;
+	char *msg = "READY\n";
 	int pid;
 
 	BUG_ON((strcmp(args[0], "_send_status") != 0),
@@ -2521,21 +2538,52 @@ static int _send_status(char **args, char *payload, struct appctx *appctx, void 
 
 		}
 	}
-	/* stop previous worker process, if it wasn't signaled during max reloads check */
-	list_for_each_entry(proc, &proc_list, list) {
-		if ((proc->options & PROC_O_TYPE_WORKER) &&
-			(proc->options & PROC_O_LEAVING) &&
-			(proc->reloads >= 1)) {
-			kill(proc->pid, oldpids_sig);
+
+	/* At this point we are sure, that newly forked worker is started,
+	 * so we can write our PID in a pidfile, if provided. Master doesn't
+	 * perform chroot.
+	 */
+	if (global.pidfile != NULL) {
+		if (handle_pidfile() < 0) {
+			ha_alert("Fatal error(s) found, exiting.\n");
+			exit(1);
 		}
 	}
+
+	/* either send USR1/TERM to old master, case when we launched as -W -D ... -sf $(cat pidfile),
+	 * or send USR1/TERM to old worker processes.
+	 */
+	if (nb_oldpids > 0) {
+		nb_oldpids = tell_old_pids(oldpids_sig);
+	}
+
+	if (daemon_fd[1] != -1) {
+		if (write(daemon_fd[1], msg, strlen(msg)) < 0) {
+			ha_alert("[%s.main()] Failed to write into pipe with parent process: %s\n", progname, strerror(errno));
+			exit(1);
+		}
+		close(daemon_fd[1]);
+		daemon_fd[1] = -1;
+	}
+
 	load_status = 1;
 	ha_notice("Loading success.\n");
 
-#if defined(USE_SYSTEMD)
 	if (global.tune.options & GTUNE_USE_SYSTEMD)
 		sd_notifyf(0, "READY=1\nMAINPID=%lu\nSTATUS=Ready.\n", (unsigned long)getpid());
-#endif
+
+	/* master and worker have successfully started, now we can set quiet mode
+	 * if MODE_DAEMON
+	 */
+	if ((!(global.mode & MODE_QUIET) || (global.mode & MODE_VERBOSE)) &&
+		(global.mode & MODE_DAEMON)) {
+		/* detach from the tty, this is required to properly daemonize. */
+		if ((getenv("HAPROXY_MWORKER_REEXEC") == NULL))
+			stdio_quiet(-1);
+		global.mode &= ~MODE_VERBOSE;
+		global.mode |= MODE_QUIET; /* ensure that we won't say anything from now */
+	}
+
 	return 1;
 }
 
@@ -3671,7 +3719,7 @@ static struct cli_kw_list cli_kws = {{ },{
 	{ { "set", "severity-output",  NULL },   "set severity-output [none|number|string]: set presence of severity level in feedback information",  cli_parse_set_severity_output, NULL, NULL },
 	{ { "set", "timeout",  NULL },           "set timeout [cli] <delay>               : change a timeout setting",                                cli_parse_set_timeout, NULL, NULL },
 	{ { "show", "anon", NULL },              "show anon                               : display the current state of anonymized mode",            cli_parse_show_anon, NULL },
-	{ { "show", "env",  NULL },              "show env [var]                          : dump environment variables known to the process",         cli_parse_show_env, cli_io_handler_show_env, NULL },
+	{ { "show", "env",  NULL },              "show env [var]                          : dump environment variables known to the process",         cli_parse_show_env, cli_io_handler_show_env, NULL, NULL, ACCESS_MASTER },
 	{ { "show", "cli", "sockets",  NULL },   "show cli sockets                        : dump list of cli sockets",                                cli_parse_default, cli_io_handler_show_cli_sock, NULL, NULL, ACCESS_MASTER },
 	{ { "show", "cli", "level", NULL },      "show cli level                          : display the level of the current CLI session",            cli_parse_show_lvl, NULL, NULL, NULL, ACCESS_MASTER},
 	{ { "show", "fd", NULL },                "show fd [-!plcfbsd]* [num]              : dump list of file descriptors in use or a specific one",  cli_parse_show_fd, cli_io_handler_show_fd, NULL },

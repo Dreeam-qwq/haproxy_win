@@ -193,6 +193,12 @@ struct fdtab {
 	void *owner;                         /* the connection or listener associated with this fd, NULL if closed */
 	unsigned int state;                  /* FD state for read and write directions (FD_EV_*) + FD_POLL_* */
 	unsigned int refc_tgid;              /* refcounted tgid, updated atomically */
+	/* the info below are mainly used for epoll debugging/strengthening.
+	 * they're filling the rest of the cache line but may easily be dropped
+	 * if the room is needed for more important stuff.
+	 */
+	unsigned int nb_takeover;            /* number of times this FD was taken over since inserted (used for debugging) */
+	unsigned int generation;             /* number of times this FD was closed before (used for epoll strengthening) */
 #ifdef DEBUG_FD
 	unsigned int event_count;            /* number of events reported */
 #endif
@@ -236,6 +242,7 @@ struct poller {
 	void   (*term)(struct poller *p);            /* termination of this poller */
 	int    (*test)(struct poller *p);            /* pre-init check of the poller */
 	int    (*fork)(struct poller *p);            /* post-fork re-opening */
+	void   (*fixup_tgid_takeover)(struct poller *p, const int fd, const int old_tid, const int old_tgid); /* Fixup anything necessary after a FD takeover across tgids */
 	const char   *name;                                  /* poller name */
 	unsigned int flags;                                  /* HAP_POLL_F_* */
 	int    pref;                                         /* try pollers with higher preference first */

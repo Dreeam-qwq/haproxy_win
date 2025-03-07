@@ -318,6 +318,7 @@ int h2_make_htx_request(struct http_hdr *list, struct htx *htx, unsigned int *ms
 	struct htx_sl *sl = NULL;
 	unsigned int sl_flags = 0;
 	const char *ctl;
+	struct ist v;
 
 	lck = ck = -1; // no cookie for now
 	fields = 0;
@@ -434,7 +435,15 @@ int h2_make_htx_request(struct http_hdr *list, struct htx *htx, unsigned int *ms
 			continue;
 		}
 
-		if (!htx_add_header(htx, list[idx].n, list[idx].v))
+		/* trim leading/trailing LWS as per RC9113#8.2.1 */
+		for (v = list[idx].v; v.len; v.len--) {
+			if (unlikely(HTTP_IS_LWS(*v.ptr)))
+				v.ptr++;
+			else if (!unlikely(HTTP_IS_LWS(v.ptr[v.len - 1])))
+				break;
+		}
+
+		if (!htx_add_header(htx, list[idx].n, v))
 			goto fail;
 	}
 
@@ -493,6 +502,10 @@ int h2_make_htx_request(struct http_hdr *list, struct htx *htx, unsigned int *ms
 		if (http_cookie_merge(htx, list, ck))
 			goto fail;
 	}
+
+	/* Check the number of blocks agains "tune.http.maxhdr" value before adding EOH block */
+	if (htx_nbblks(htx) > global.tune.max_http_hdr)
+		goto fail;
 
 	/* now send the end of headers marker */
 	if (!htx_add_endof(htx, HTX_BLK_EOH))
@@ -619,6 +632,7 @@ int h2_make_htx_response(struct http_hdr *list, struct htx *htx, unsigned int *m
 	struct htx_sl *sl = NULL;
 	unsigned int sl_flags = 0;
 	const char *ctl;
+	struct ist v;
 
 	fields = 0;
 	for (idx = 0; list[idx].n.len != 0; idx++) {
@@ -698,7 +712,15 @@ int h2_make_htx_response(struct http_hdr *list, struct htx *htx, unsigned int *m
 		    isteq(list[idx].n, ist("transfer-encoding")))
 			goto fail;
 
-		if (!htx_add_header(htx, list[idx].n, list[idx].v))
+		/* trim leading/trailing LWS as per RC9113#8.2.1 */
+		for (v = list[idx].v; v.len; v.len--) {
+			if (unlikely(HTTP_IS_LWS(*v.ptr)))
+				v.ptr++;
+			else if (!unlikely(HTTP_IS_LWS(v.ptr[v.len - 1])))
+				break;
+		}
+
+		if (!htx_add_header(htx, list[idx].n, v))
 			goto fail;
 	}
 
@@ -745,6 +767,10 @@ int h2_make_htx_response(struct http_hdr *list, struct htx *htx, unsigned int *m
 		 */
 	}
 
+	/* Check the number of blocks agains "tune.http.maxhdr" value before adding EOH block */
+	if (htx_nbblks(htx) > global.tune.max_http_hdr)
+		goto fail;
+
 	/* now send the end of headers marker */
 	if (!htx_add_endof(htx, HTX_BLK_EOH))
 		goto fail;
@@ -773,6 +799,7 @@ int h2_make_htx_response(struct http_hdr *list, struct htx *htx, unsigned int *m
 int h2_make_htx_trailers(struct http_hdr *list, struct htx *htx)
 {
 	const char *ctl;
+	struct ist v;
 	uint32_t idx;
 	int i;
 
@@ -808,9 +835,21 @@ int h2_make_htx_trailers(struct http_hdr *list, struct htx *htx)
 		if (unlikely(ctl) && http_header_has_forbidden_char(list[idx].v, ctl))
 			goto fail;
 
-		if (!htx_add_trailer(htx, list[idx].n, list[idx].v))
+		/* trim leading/trailing LWS as per RC9113#8.2.1 */
+		for (v = list[idx].v; v.len; v.len--) {
+			if (unlikely(HTTP_IS_LWS(*v.ptr)))
+				v.ptr++;
+			else if (!unlikely(HTTP_IS_LWS(v.ptr[v.len - 1])))
+				break;
+		}
+
+		if (!htx_add_trailer(htx, list[idx].n, v))
 			goto fail;
 	}
+
+	/* Check the number of blocks agains "tune.http.maxhdr" value before adding EOT block */
+	if (htx_nbblks(htx) > global.tune.max_http_hdr)
+		goto fail;
 
 	if (!htx_add_endof(htx, HTX_BLK_EOT))
 		goto fail;

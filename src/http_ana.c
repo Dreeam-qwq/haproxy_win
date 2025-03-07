@@ -237,25 +237,22 @@ int http_wait_for_request(struct stream *s, struct channel *req, int an_bit)
 
 			/* Check if we want to fail this monitor request or not */
 			list_for_each_entry(cond, &sess->fe->mon_fail_cond, list) {
-				int ret = acl_exec_cond(cond, sess->fe, sess, s, SMP_OPT_DIR_REQ|SMP_OPT_FINAL);
+				if (!acl_match_cond(cond, sess->fe, sess, s, SMP_OPT_DIR_REQ|SMP_OPT_FINAL))
+					continue;
 
-				ret = acl_pass(ret);
-				if (cond->pol == ACL_COND_UNLESS)
-					ret = !ret;
-
-				if (ret) {
-					/* we fail this request, let's return 503 service unavail */
-					txn->status = 503;
-					if (!(s->flags & SF_ERR_MASK))
-						s->flags |= SF_ERR_LOCAL; /* we don't want a real error here */
-					goto return_prx_cond;
-				}
+				/* we fail this request, let's return 503 service unavail */
+				txn->status = 503;
+				if (!(s->flags & SF_ERR_MASK))
+					s->flags |= SF_ERR_LOCAL; /* we don't want a real error here */
+				stream_report_term_evt(s->scf, strm_tevt_type_intercepted);
+				goto return_prx_cond;
 			}
 
 			/* nothing to fail, let's reply normally */
 			txn->status = 200;
 			if (!(s->flags & SF_ERR_MASK))
 				s->flags |= SF_ERR_LOCAL; /* we don't want a real error here */
+			stream_report_term_evt(s->scf, strm_tevt_type_intercepted);
 			goto return_prx_cond;
 		}
 	}
@@ -348,6 +345,7 @@ int http_wait_for_request(struct stream *s, struct channel *req, int an_bit)
 	_HA_ATOMIC_INC(&sess->fe->fe_counters.internal_errors);
 	if (sess->listener && sess->listener->counters)
 		_HA_ATOMIC_INC(&sess->listener->counters->internal_errors);
+	stream_report_term_evt(s->scb, strm_tevt_type_internal_err);
 	goto return_prx_cond;
 
  return_bad_req:
@@ -355,6 +353,7 @@ int http_wait_for_request(struct stream *s, struct channel *req, int an_bit)
 	_HA_ATOMIC_INC(&sess->fe->fe_counters.failed_req);
 	if (sess->listener && sess->listener->counters)
 		_HA_ATOMIC_INC(&sess->listener->counters->failed_req);
+	stream_report_term_evt(s->scb, strm_tevt_type_proto_err);
 	/* fall through */
 
  return_prx_cond:
@@ -405,6 +404,9 @@ int http_process_req_common(struct stream *s, struct channel *req, int an_bit, s
 		case HTTP_RULE_RES_YIELD: /* some data miss, call the function later. */
 			goto return_prx_yield;
 
+		case HTTP_RULE_RES_FYIELD: /* we must try again after context-switch */
+			goto return_prx_fyield;
+
 		case HTTP_RULE_RES_CONT:
 		case HTTP_RULE_RES_STOP: /* nothing to do */
 			break;
@@ -415,6 +417,7 @@ int http_process_req_common(struct stream *s, struct channel *req, int an_bit, s
 			goto deny;
 
 		case HTTP_RULE_RES_ABRT: /* abort request, response already sent. Eg: auth */
+			stream_report_term_evt(s->scf, strm_tevt_type_intercepted);
 			goto return_prx_cond;
 
 		case HTTP_RULE_RES_DONE: /* OK, but terminate request processing (eg: redirect) */
@@ -468,8 +471,10 @@ int http_process_req_common(struct stream *s, struct channel *req, int an_bit, s
 		if (verdict == HTTP_RULE_RES_DENY) /* stats http-request deny */
 			goto deny;
 
-		if (verdict == HTTP_RULE_RES_ABRT) /* stats auth / stats http-request auth */
+		if (verdict == HTTP_RULE_RES_ABRT) { /* stats auth / stats http-request auth */
+			stream_report_term_evt(s->scf, strm_tevt_type_intercepted);
 			goto return_prx_cond;
+		}
 
 		if (verdict == HTTP_RULE_RES_BADREQ) /* failed with a bad request */
 			goto return_bad_req;
@@ -505,19 +510,12 @@ int http_process_req_common(struct stream *s, struct channel *req, int an_bit, s
 
 	/* check whether we have some ACLs set to redirect this request */
 	list_for_each_entry(rule, &px->redirect_rules, list) {
-		if (rule->cond) {
-			int ret;
-
-			ret = acl_exec_cond(rule->cond, px, sess, s, SMP_OPT_DIR_REQ|SMP_OPT_FINAL);
-			ret = acl_pass(ret);
-			if (rule->cond->pol == ACL_COND_UNLESS)
-				ret = !ret;
-			if (!ret)
-				continue;
-		}
+		if (!acl_match_cond(rule->cond, px, sess, s, SMP_OPT_DIR_REQ|SMP_OPT_FINAL))
+			continue;
 		if (!http_apply_redirect_rule(rule, s, txn)) {
 			goto return_int_err;
 		}
+		stream_report_term_evt(s->scf, strm_tevt_type_intercepted);
 		goto done;
 	}
 
@@ -569,6 +567,7 @@ int http_process_req_common(struct stream *s, struct channel *req, int an_bit, s
 		_HA_ATOMIC_INC(&s->be->be_counters.denied_req);
 	if (sess->listener && sess->listener->counters)
 		_HA_ATOMIC_INC(&sess->listener->counters->denied_req);
+	stream_report_term_evt(s->scf, strm_tevt_type_intercepted);
 	goto done_without_exp;
 
  deny:	/* this request was blocked (denied) */
@@ -585,6 +584,7 @@ int http_process_req_common(struct stream *s, struct channel *req, int an_bit, s
 		_HA_ATOMIC_INC(&s->be->be_counters.denied_req);
 	if (sess->listener && sess->listener->counters)
 		_HA_ATOMIC_INC(&sess->listener->counters->denied_req);
+	stream_report_term_evt(s->scf, strm_tevt_type_intercepted);
 	goto return_prx_err;
 
  return_fail_rewrite:
@@ -608,6 +608,7 @@ int http_process_req_common(struct stream *s, struct channel *req, int an_bit, s
 		_HA_ATOMIC_INC(&s->be->be_counters.internal_errors);
 	if (sess->listener && sess->listener->counters)
 		_HA_ATOMIC_INC(&sess->listener->counters->internal_errors);
+	stream_report_term_evt(s->scf, strm_tevt_type_internal_err);
 	goto return_prx_err;
 
  return_bad_req:
@@ -615,6 +616,7 @@ int http_process_req_common(struct stream *s, struct channel *req, int an_bit, s
 	_HA_ATOMIC_INC(&sess->fe->fe_counters.failed_req);
 	if (sess->listener && sess->listener->counters)
 		_HA_ATOMIC_INC(&sess->listener->counters->failed_req);
+	stream_report_term_evt(s->scf, strm_tevt_type_proto_err);
 	/* fall through */
 
  return_prx_err:
@@ -624,7 +626,6 @@ int http_process_req_common(struct stream *s, struct channel *req, int an_bit, s
 
  return_prx_cond:
 	http_set_term_flags(s);
-
 	req->analysers &= AN_REQ_FLT_END;
 	req->analyse_exp = TICK_ETERNITY;
 	s->current_rule = s->current_rule_list = NULL;
@@ -635,6 +636,12 @@ int http_process_req_common(struct stream *s, struct channel *req, int an_bit, s
  return_prx_yield:
 	channel_dont_connect(req);
 	DBG_TRACE_DEVEL("waiting for more data",
+			STRM_EV_STRM_ANA|STRM_EV_HTTP_ANA, s, txn);
+	return 0;
+
+ return_prx_fyield:
+	channel_dont_connect(req);
+	DBG_TRACE_DEVEL("forced yield",
 			STRM_EV_STRM_ANA|STRM_EV_HTTP_ANA, s, txn);
 	return 0;
 }
@@ -759,6 +766,7 @@ int http_process_request(struct stream *s, struct channel *req, int an_bit)
 		_HA_ATOMIC_INC(&s->be->be_counters.internal_errors);
 	if (sess->listener && sess->listener->counters)
 		_HA_ATOMIC_INC(&sess->listener->counters->internal_errors);
+	stream_report_term_evt(s->scf, strm_tevt_type_internal_err);
 
 	http_set_term_flags(s);
 	http_reply_and_close(s, txn->status, http_error_message(s));
@@ -801,6 +809,7 @@ int http_process_tarpit(struct stream *s, struct channel *req, int an_bit)
 	 */
 	s->logs.t_queue = ns_to_ms(now_ns - s->logs.accept_ts);
 
+	stream_report_term_evt(s->scf, strm_tevt_type_intercepted);
 	http_set_term_flags(s);
 	http_reply_and_close(s, txn->status, (!(s->scf->flags & SC_FL_ERROR) ? http_error_message(s) : NULL));
 
@@ -838,6 +847,7 @@ int http_wait_for_request_body(struct stream *s, struct channel *req, int an_bit
 	case HTTP_RULE_RES_ERROR:
 		goto return_int_err;
 	case HTTP_RULE_RES_ABRT:
+		stream_report_term_evt(s->scf, strm_tevt_type_intercepted);
 		goto return_prx_cond;
 	default:
 		goto return_int_err;
@@ -866,6 +876,7 @@ int http_wait_for_request_body(struct stream *s, struct channel *req, int an_bit
 		_HA_ATOMIC_INC(&s->be->be_counters.internal_errors);
 	if (sess->listener && sess->listener->counters)
 		_HA_ATOMIC_INC(&sess->listener->counters->internal_errors);
+	stream_report_term_evt(s->scf, strm_tevt_type_internal_err);
 	goto return_prx_err;
 
  return_bad_req: /* let's centralize all bad requests */
@@ -873,6 +884,7 @@ int http_wait_for_request_body(struct stream *s, struct channel *req, int an_bit
 	_HA_ATOMIC_INC(&sess->fe->fe_counters.failed_req);
 	if (sess->listener && sess->listener->counters)
 		_HA_ATOMIC_INC(&sess->listener->counters->failed_req);
+	stream_report_term_evt(s->scf, strm_tevt_type_proto_err);
 	/* fall through */
 
  return_prx_err:
@@ -1012,10 +1024,8 @@ int http_request_forward_body(struct stream *s, struct channel *req, int an_bit)
 		 * response. Otherwise, let a change to forward the response
 		 * first.
 		 */
-		if (txn->rsp.msg_state >= HTTP_MSG_BODY && htx_is_empty(htxbuf(&s->res.buf))) {
-			COUNT_IF(1, "Server abort during request forwarding");
+		if (txn->rsp.msg_state >= HTTP_MSG_BODY && htx_is_empty(htxbuf(&s->res.buf)))
 			goto return_srv_abort;
-		}
 	}
 
 	http_end_request(s);
@@ -1047,10 +1057,8 @@ int http_request_forward_body(struct stream *s, struct channel *req, int an_bit)
 
  missing_data_or_waiting:
 	/* stop waiting for data if the input is closed before the end */
-	if (msg->msg_state < HTTP_MSG_ENDING && (s->scf->flags & (SC_FL_ABRT_DONE|SC_FL_EOS))) {
-		COUNT_IF(1, "Client abort during request forwarding");
+	if (msg->msg_state < HTTP_MSG_ENDING && (s->scf->flags & (SC_FL_ABRT_DONE|SC_FL_EOS)))
 		goto return_cli_abort;
-	}
 
  waiting:
 	/* waiting for the last bits to leave the buffer */
@@ -1058,10 +1066,8 @@ int http_request_forward_body(struct stream *s, struct channel *req, int an_bit)
 		/* Handle server aborts only if there is no response. Otherwise,
 		 * let a change to forward the response first.
 		 */
-		if (htx_is_empty(htxbuf(&s->res.buf))) {
-			COUNT_IF(1, "Server abort during request forwarding");
+		if (htx_is_empty(htxbuf(&s->res.buf)))
 			goto return_srv_abort;
-		}
 	}
 
 	/* When TE: chunked is used, we need to get there again to parse remaining
@@ -1123,16 +1129,16 @@ int http_request_forward_body(struct stream *s, struct channel *req, int an_bit)
 		_HA_ATOMIC_INC(&sess->listener->counters->internal_errors);
 	if (objt_server(s->target))
 		_HA_ATOMIC_INC(&__objt_server(s->target)->counters.internal_errors);
+	stream_report_term_evt(s->scf, strm_tevt_type_internal_err);
 	status = 500;
-	COUNT_IF(1, "Internal error during request forwarding");
 	goto return_prx_cond;
 
   return_bad_req:
 	_HA_ATOMIC_INC(&sess->fe->fe_counters.failed_req);
 	if (sess->listener && sess->listener->counters)
 		_HA_ATOMIC_INC(&sess->listener->counters->failed_req);
+	stream_report_term_evt(s->scf, strm_tevt_type_proto_err);
 	status = 400;
-	COUNT_IF(1, "Request parsing error during request forwarding");
 	/* fall through */
 
   return_prx_cond:
@@ -1173,7 +1179,7 @@ static __inline int do_l7_retry(struct stream *s, struct stconn *sc)
 
 	/* Remove any write error from the request, and read error from the response */
 	s->scf->flags &= ~(SC_FL_EOS|SC_FL_ABRT_DONE|SC_FL_ABRT_WANTED);
-	req->flags &= ~CF_WRITE_TIMEOUT;
+	req->flags &= ~(CF_WRITE_TIMEOUT|CF_WROTE_DATA);
 	res->flags &= ~(CF_READ_TIMEOUT | CF_READ_EVENT);
 	res->analysers &= AN_RES_FLT_END;
 	s->conn_err_type = STRM_ET_NONE;
@@ -1234,8 +1240,11 @@ int http_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 	htx = htxbuf(&rep->buf);
 
 	/* Parsing errors are caught here */
-	if (htx->flags & HTX_FL_PARSING_ERROR)
+	if (htx->flags & HTX_FL_PARSING_ERROR) {
+		if (objt_server(s->target))
+			health_adjust(__objt_server(s->target), HANA_STATUS_HTTP_HDRRSP);
 		goto return_bad_res;
+	}
 	if (htx->flags & HTX_FL_PROCESSING_ERROR)
 		goto return_int_err;
 
@@ -1257,6 +1266,8 @@ int http_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 		if (s->scb->flags & SC_FL_ERROR) {
 			struct connection *conn = sc_conn(s->scb);
 
+			if (!(s->flags & SF_SRV_REUSED) && objt_server(s->target))
+				health_adjust(__objt_server(s->target), HANA_STATUS_HTTP_READ_ERROR);
 
 			if ((txn->flags & TX_L7_RETRY) &&
 			    (s->be->retry_type & PR_RE_DISCONNECTED) &&
@@ -1279,10 +1290,8 @@ int http_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 				goto abort_keep_alive;
 
 			_HA_ATOMIC_INC(&s->be->be_counters.failed_resp);
-			if (objt_server(s->target)) {
+			if (objt_server(s->target))
 				_HA_ATOMIC_INC(&__objt_server(s->target)->counters.failed_resp);
-				health_adjust(__objt_server(s->target), HANA_STATUS_HTTP_READ_ERROR);
-			}
 
 			/* if the server refused the early data, just send a 425 */
 			if (conn && conn->err_code == CO_ER_SSL_EARLY_FAILED)
@@ -1306,6 +1315,9 @@ int http_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 
 		/* 2: read timeout : return a 504 to the client. */
 		else if (rep->flags & CF_READ_TIMEOUT) {
+			if (objt_server(s->target))
+				health_adjust(__objt_server(s->target), HANA_STATUS_HTTP_READ_TIMEOUT);
+
 			if ((txn->flags & TX_L7_RETRY) &&
 			    (s->be->retry_type & PR_RE_TIMEOUT)) {
 				if (co_data(rep) || do_l7_retry(s, s->scb) == 0) {
@@ -1315,10 +1327,8 @@ int http_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 				}
 			}
 			_HA_ATOMIC_INC(&s->be->be_counters.failed_resp);
-			if (objt_server(s->target)) {
+			if (objt_server(s->target))
 				_HA_ATOMIC_INC(&__objt_server(s->target)->counters.failed_resp);
-				health_adjust(__objt_server(s->target), HANA_STATUS_HTTP_READ_TIMEOUT);
-			}
 
 			txn->status = 504;
 			stream_inc_http_fail_ctr(s);
@@ -1360,6 +1370,9 @@ int http_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 
 		/* 4: close from server, capture the response if the server has started to respond */
 		else if (s->scb->flags & (SC_FL_EOS|SC_FL_ABRT_DONE)) {
+			if (!(s->flags & SF_SRV_REUSED) && objt_server(s->target))
+				health_adjust(__objt_server(s->target), HANA_STATUS_HTTP_BROKEN_PIPE);
+
 			if ((txn->flags & TX_L7_RETRY) &&
 			    (s->be->retry_type & PR_RE_DISCONNECTED)) {
 				if (co_data(rep) || do_l7_retry(s, s->scb) == 0) {
@@ -1373,10 +1386,8 @@ int http_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 				goto abort_keep_alive;
 
 			_HA_ATOMIC_INC(&s->be->be_counters.failed_resp);
-			if (objt_server(s->target)) {
+			if (objt_server(s->target))
 				_HA_ATOMIC_INC(&__objt_server(s->target)->counters.failed_resp);
-				health_adjust(__objt_server(s->target), HANA_STATUS_HTTP_BROKEN_PIPE);
-			}
 
 			txn->status = 502;
 			stream_inc_http_fail_ctr(s);
@@ -1427,6 +1438,17 @@ int http_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 	BUG_ON(htx_get_first_type(htx) != HTX_BLK_RES_SL);
 	sl = http_get_stline(htx);
 
+	/* Adjust server's health based on status code. Note: status codes 501
+	 * and 505 are triggered on demand by client request, so we must not
+	 * count them as server failures.
+	 */
+	if (objt_server(s->target)) {
+		if (sl->info.res.status >= 100 && (sl->info.res.status < 500 || sl->info.res.status == 501 || sl->info.res.status == 505))
+			health_adjust(__objt_server(s->target), HANA_STATUS_HTTP_OK);
+		else
+			health_adjust(__objt_server(s->target), HANA_STATUS_HTTP_STS);
+	}
+
 	/* Perform a L7 retry because of the status code */
 	if ((txn->flags & TX_L7_RETRY) &&
 	    l7_status_match(s->be, sl->info.res.status) &&
@@ -1434,9 +1456,6 @@ int http_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 		DBG_TRACE_DEVEL("leaving on L7 retry", STRM_EV_STRM_ANA|STRM_EV_HTTP_ANA, s, txn);
 		return 0;
 	}
-
-	/* Now, L7 buffer is useless, it can be released */
-	b_free(&txn->l7_buffer);
 
 	msg->msg_state = HTTP_MSG_BODY;
 
@@ -1499,17 +1518,6 @@ int http_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 		_HA_ATOMIC_INC(&__objt_server(s->target)->counters.p.http.cum_req);
 	}
 
-	/* Adjust server's health based on status code. Note: status codes 501
-	 * and 505 are triggered on demand by client request, so we must not
-	 * count them as server failures.
-	 */
-	if (objt_server(s->target)) {
-		if (txn->status >= 100 && (txn->status < 500 || txn->status == 501 || txn->status == 505))
-			health_adjust(__objt_server(s->target), HANA_STATUS_HTTP_OK);
-		else
-			health_adjust(__objt_server(s->target), HANA_STATUS_HTTP_STS);
-	}
-
 	/*
 	 * We may be facing a 100-continue response, or any other informational
 	 * 1xx response which is non-final, in which case this is not the right
@@ -1535,8 +1543,11 @@ int http_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 	 * header content. But it is probably stronger enough for now.
 	 */
 	if (txn->status == 101 &&
-	    (!(txn->req.flags & HTTP_MSGF_CONN_UPG) || !(txn->rsp.flags & HTTP_MSGF_CONN_UPG)))
+	    (!(txn->req.flags & HTTP_MSGF_CONN_UPG) || !(txn->rsp.flags & HTTP_MSGF_CONN_UPG))) {
+		if (objt_server(s->target))
+			health_adjust(__objt_server(s->target), HANA_STATUS_HTTP_HDRRSP);
 		goto return_bad_res;
+	}
 
 	/*
 	 * 2: check for cacheability.
@@ -1634,6 +1645,9 @@ int http_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 	}
 
   end:
+	/* Now, L7 buffer is useless, it can be released */
+	b_free(&txn->l7_buffer);
+
 	/* we want to have the response time before we start processing it */
 	s->logs.t_data = ns_to_ms(now_ns - s->logs.accept_ts);
 
@@ -1654,14 +1668,10 @@ int http_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 	txn->status = 500;
 	if (!(s->flags & SF_ERR_MASK))
 		s->flags |= SF_ERR_INTERNAL;
+	stream_report_term_evt(s->scb, strm_tevt_type_internal_err);
 	goto return_prx_cond;
 
   return_bad_res:
-	_HA_ATOMIC_INC(&s->be->be_counters.failed_resp);
-	if (objt_server(s->target)) {
-		_HA_ATOMIC_INC(&__objt_server(s->target)->counters.failed_resp);
-		health_adjust(__objt_server(s->target), HANA_STATUS_HTTP_HDRRSP);
-	}
 	if ((s->be->retry_type & PR_RE_JUNK_REQUEST) &&
 	    (txn->flags & TX_L7_RETRY) &&
 	    do_l7_retry(s, s->scb) == 0) {
@@ -1669,8 +1679,14 @@ int http_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 				STRM_EV_STRM_ANA|STRM_EV_HTTP_ANA, s, txn);
 		return 0;
 	}
+
+	_HA_ATOMIC_INC(&s->be->be_counters.failed_resp);
+	if (objt_server(s->target))
+		_HA_ATOMIC_INC(&__objt_server(s->target)->counters.failed_resp);
+
 	txn->status = 502;
 	stream_inc_http_fail_ctr(s);
+	stream_report_term_evt(s->scb, strm_tevt_type_proto_err);
 	/* fall through */
 
  return_prx_cond:
@@ -1766,6 +1782,9 @@ int http_process_res_common(struct stream *s, struct channel *rep, int an_bit, s
 			case HTTP_RULE_RES_YIELD: /* some data miss, call the function later. */
 				goto return_prx_yield;
 
+			case HTTP_RULE_RES_FYIELD: /* we must try again after context-switch */
+				goto return_prx_fyield;
+
 			case HTTP_RULE_RES_CONT:
 			case HTTP_RULE_RES_STOP: /* nothing to do */
 				break;
@@ -1774,6 +1793,7 @@ int http_process_res_common(struct stream *s, struct channel *rep, int an_bit, s
 				goto deny;
 
 			case HTTP_RULE_RES_ABRT: /* abort request, response already sent */
+				stream_report_term_evt(s->scb, strm_tevt_type_intercepted);
 				goto return_prx_cond;
 
 			case HTTP_RULE_RES_DONE: /* OK, but terminate request processing (eg: redirect) */
@@ -1965,6 +1985,7 @@ int http_process_res_common(struct stream *s, struct channel *rep, int an_bit, s
 		_HA_ATOMIC_INC(&sess->listener->counters->denied_resp);
 	if (objt_server(s->target))
 		_HA_ATOMIC_INC(&__objt_server(s->target)->counters.denied_resp);
+	stream_report_term_evt(s->scb, strm_tevt_type_intercepted);
 	goto return_prx_err;
 
  return_fail_rewrite:
@@ -1988,9 +2009,11 @@ int http_process_res_common(struct stream *s, struct channel *rep, int an_bit, s
 		_HA_ATOMIC_INC(&sess->listener->counters->internal_errors);
 	if (objt_server(s->target))
 		_HA_ATOMIC_INC(&__objt_server(s->target)->counters.internal_errors);
+	stream_report_term_evt(s->scb, strm_tevt_type_internal_err);
 	goto return_prx_err;
 
  return_bad_res:
+	s->logs.t_data = -1; /* was not a valid response */
 	txn->status = 502;
 	stream_inc_http_fail_ctr(s);
 	_HA_ATOMIC_INC(&s->be->be_counters.failed_resp);
@@ -1998,6 +2021,7 @@ int http_process_res_common(struct stream *s, struct channel *rep, int an_bit, s
 		_HA_ATOMIC_INC(&__objt_server(s->target)->counters.failed_resp);
 		health_adjust(__objt_server(s->target), HANA_STATUS_HTTP_RSP);
 	}
+	stream_report_term_evt(s->scb, strm_tevt_type_proto_err);
 	/* fall through */
 
  return_prx_err:
@@ -2006,9 +2030,7 @@ int http_process_res_common(struct stream *s, struct channel *rep, int an_bit, s
 	/* fall through */
 
  return_prx_cond:
-	s->logs.t_data = -1; /* was not a valid response */
 	s->scb->flags |= SC_FL_NOLINGER;
-
 	http_set_term_flags(s);
 
 	rep->analysers &= AN_RES_FLT_END;
@@ -2024,6 +2046,13 @@ int http_process_res_common(struct stream *s, struct channel *rep, int an_bit, s
 	DBG_TRACE_DEVEL("waiting for more data",
 			STRM_EV_STRM_ANA|STRM_EV_HTTP_ANA, s, txn);
 	return 0;
+
+ return_prx_fyield:
+	channel_dont_close(rep);
+	DBG_TRACE_DEVEL("forced yield",
+			STRM_EV_STRM_ANA|STRM_EV_HTTP_ANA, s, txn);
+	return 0;
+
 }
 
 /* This function is an analyser which forwards response body (including chunk
@@ -2164,7 +2193,6 @@ int http_response_forward_body(struct stream *s, struct channel *res, int an_bit
 	if ((s->scf->flags & SC_FL_SHUT_DONE) && co_data(res)) {
 		/* response errors are most likely due to the client aborting
 		 * the transfer. */
-		COUNT_IF(1, "Client abort during response forwarding");
 		goto return_cli_abort;
 	}
 
@@ -2178,10 +2206,8 @@ int http_response_forward_body(struct stream *s, struct channel *res, int an_bit
 	return 0;
 
   missing_data_or_waiting:
-	if (s->scf->flags & SC_FL_SHUT_DONE) {
-		COUNT_IF(1, "Client abort during response forwarding");
+	if (s->scf->flags & SC_FL_SHUT_DONE)
 		goto return_cli_abort;
-	}
 
 	/* stop waiting for data if the input is closed before the end. If the
 	 * client side was already closed, it means that the client has aborted,
@@ -2190,15 +2216,11 @@ int http_response_forward_body(struct stream *s, struct channel *res, int an_bit
 	 */
 	if (msg->msg_state < HTTP_MSG_ENDING && (s->scb->flags & (SC_FL_EOS|SC_FL_ABRT_DONE))) {
 		if ((s->scf->flags & SC_FL_ABRT_DONE) &&
-		    (s->scb->flags & SC_FL_SHUT_DONE)) {
-			COUNT_IF(1, "Client abort during response forwarding");
+		    (s->scb->flags & SC_FL_SHUT_DONE))
 			goto return_cli_abort;
-		}
 		/* If we have some pending data, we continue the processing */
-		if (htx_is_empty(htx)) {
-			COUNT_IF(1, "Server abort during response forwarding");
+		if (htx_is_empty(htx))
 			goto return_srv_abort;
-		}
 	}
 
 	/* When TE: chunked is used, we need to get there again to parse
@@ -2258,7 +2280,7 @@ int http_response_forward_body(struct stream *s, struct channel *res, int an_bit
 		_HA_ATOMIC_INC(&__objt_server(s->target)->counters.internal_errors);
 	if (!(s->flags & SF_ERR_MASK))
 		s->flags |= SF_ERR_INTERNAL;
-	COUNT_IF(1, "Internal error during response forwarding");
+	stream_report_term_evt(s->scb, strm_tevt_type_internal_err);
 	goto return_error;
 
   return_bad_res:
@@ -2268,7 +2290,7 @@ int http_response_forward_body(struct stream *s, struct channel *res, int an_bit
 		health_adjust(__objt_server(s->target), HANA_STATUS_HTTP_RSP);
 	}
 	stream_inc_http_fail_ctr(s);
-	COUNT_IF(1, "Response parsing error during response forwarding");
+	stream_report_term_evt(s->scb, strm_tevt_type_proto_err);
 	/* fall through */
 
    return_error:
@@ -2420,6 +2442,7 @@ int http_apply_redirect_rule(struct redirect_rule *rule, struct stream *s, struc
 		}
 		case REDIRECT_TYPE_LOCATION:
 		default:
+			memset(chunk->area, 0x50, chunk->size);
 			if (rule->rdr_str) { /* this is an old "redirect" rule */
 				/* add location */
 				if (!chunk_memcat(chunk, rule->rdr_str, rule->rdr_len))
@@ -2436,6 +2459,36 @@ int http_apply_redirect_rule(struct redirect_rule *rule, struct stream *s, struc
 				}
 
 				chunk->data += len;
+			}
+
+			if (rule->flags & REDIRECT_FLAG_KEEP_QS) {
+				struct ist path;
+				struct http_uri_parser parser;
+				char *ptr, *end;
+				char sep = '?';
+
+				ptr = memchr(chunk->area, '?', chunk->data);
+				if (ptr != NULL)
+					sep = ((ptr+1 != b_tail(chunk)) ? '&' : '\0');
+
+				sl = http_get_stline(htx);
+				parser = http_uri_parser_init(htx_sl_req_uri(sl));
+				path = http_parse_path(&parser);
+				ptr = istptr(path);
+				end = istend(path);
+
+				/* look up the '?' */
+				do {
+					if (ptr == end)
+						return 0;
+				} while (*ptr++ != '?');
+
+				if (ptr == end)
+					break;
+				if (sep != '\0' && !chunk_memcat(chunk, &sep, 1))
+					goto fail;
+				if (!chunk_memcat(chunk, ptr, end-ptr))
+					goto fail;
 			}
 			break;
 	}
@@ -2487,8 +2540,13 @@ int http_apply_redirect_rule(struct redirect_rule *rule, struct stream *s, struc
 			goto fail;
 	}
 
-	if (rule->cookie_len) {
-		if (!htx_add_header(htx, ist("Set-Cookie"), ist2(rule->cookie_str, rule->cookie_len)))
+	if (rule->flags & REDIRECT_FLAG_COOKIE_FMT) {
+		trash.data = build_logline(s, trash.area, trash.size, &rule->cookie.fmt);
+		if (!htx_add_header(htx, ist("Set-Cookie"), ist2(trash.area, trash.data)))
+			goto fail;
+	}
+	else if (isttest(rule->cookie.str)) {
+		if (!htx_add_header(htx, ist("Set-Cookie"), rule->cookie.str))
 			goto fail;
 	}
 
@@ -2694,16 +2752,27 @@ static enum rule_result http_req_get_intercept_rule(struct proxy *px, struct lis
 	enum rule_result rule_ret = HTTP_RULE_RES_CONT;
 	int act_opts = 0;
 
+	if ((s->scf->flags & SC_FL_ERROR) ||
+	    ((s->scf->flags & (SC_FL_EOS|SC_FL_ABRT_DONE)) &&
+	     (px->options & PR_O_ABRT_CLOSE)))
+		act_opts |= ACT_OPT_FINAL;
+
 	/* If "the current_rule_list" match the executed rule list, we are in
 	 * resume condition. If a resume is needed it is always in the action
 	 * and never in the ACL or converters. In this case, we initialise the
 	 * current rule, and go to the action execution point.
 	 */
 	if (s->current_rule) {
+		int forced = s->flags & SF_RULE_FYIELD;
+
 		rule = s->current_rule;
 		s->current_rule = NULL;
-		if (s->current_rule_list == rules || (def_rules && s->current_rule_list == def_rules))
+		s->flags &= ~SF_RULE_FYIELD;
+		if (s->current_rule_list == rules || (def_rules && s->current_rule_list == def_rules)) {
+			if (forced)
+				goto resume_rule;
 			goto resume_execution;
+		}
 	}
 	s->current_rule_list = ((!def_rules || s->current_rule_list == def_rules) ? rules : def_rules);
 
@@ -2712,19 +2781,21 @@ static enum rule_result http_req_get_intercept_rule(struct proxy *px, struct lis
 	txn->req.flags &= ~HTTP_MSGF_SOFT_RW;
 
 	list_for_each_entry(rule, s->current_rule_list, list) {
-		/* check optional condition */
-		if (rule->cond) {
-			int ret;
-
-			ret = acl_exec_cond(rule->cond, px, sess, s, SMP_OPT_DIR_REQ|SMP_OPT_FINAL);
-			ret = acl_pass(ret);
-
-			if (rule->cond->pol == ACL_COND_UNLESS)
-				ret = !ret;
-
-			if (!ret) /* condition not matched */
-				continue;
+ resume_rule:
+		/* check if budget is exceeded and we need to continue on the next
+		 * polling loop, unless we know that we cannot yield
+		 */
+		if (s->rules_bcount++ >= global.tune.max_rules_at_once && !(act_opts & ACT_OPT_FINAL)) {
+			s->current_rule = rule;
+			s->flags |= SF_RULE_FYIELD;
+			rule_ret = HTTP_RULE_RES_FYIELD;
+			task_wakeup(s->task, TASK_WOKEN_MSG);
+			goto end;
 		}
+
+		/* check optional condition */
+		if (!acl_match_cond(rule->cond, px, sess, s, SMP_OPT_DIR_REQ|SMP_OPT_FINAL))
+			continue;
 
 		act_opts |= ACT_OPT_FIRST;
   resume_execution:
@@ -2733,11 +2804,6 @@ static enum rule_result http_req_get_intercept_rule(struct proxy *px, struct lis
 
 		/* Always call the action function if defined */
 		if (rule->action_ptr) {
-			if ((s->scf->flags & SC_FL_ERROR) ||
-			    ((s->scf->flags & (SC_FL_EOS|SC_FL_ABRT_DONE)) &&
-			     (px->options & PR_O_ABRT_CLOSE)))
-				act_opts |= ACT_OPT_FINAL;
-
 			if (!(s->scf->flags & SC_FL_ERROR) & !(s->req.flags & (CF_READ_TIMEOUT|CF_WRITE_TIMEOUT))) {
 				s->waiting_entity.type = STRM_ENTITY_NONE;
 				s->waiting_entity.ptr  = NULL;
@@ -2847,7 +2913,7 @@ static enum rule_result http_req_get_intercept_rule(struct proxy *px, struct lis
 
   end:
 	/* if the ruleset evaluation is finished reset the strict mode */
-	if (rule_ret != HTTP_RULE_RES_YIELD)
+	if (rule_ret != HTTP_RULE_RES_YIELD && rule_ret != HTTP_RULE_RES_FYIELD)
 		txn->req.flags &= ~HTTP_MSGF_SOFT_RW;
 
 	/* we reached the end of the rules, nothing to report */
@@ -2855,8 +2921,8 @@ static enum rule_result http_req_get_intercept_rule(struct proxy *px, struct lis
 }
 
 /* Executes the http-response rules <rules> for stream <s> and proxy <px>. It
- * returns one of 5 possible statuses: HTTP_RULE_RES_CONT, HTTP_RULE_RES_STOP,
- * HTTP_RULE_RES_DONE, HTTP_RULE_RES_YIELD, or HTTP_RULE_RES_BADREQ. If *CONT
+ * returns one of 6 possible statuses: HTTP_RULE_RES_CONT, HTTP_RULE_RES_STOP,
+ * HTTP_RULE_RES_DONE, HTTP_RULE_RES_(F)YIELD, or HTTP_RULE_RES_BADREQ. If *CONT
  * is returned, the process can continue the evaluation of next rule list. If
  * *STOP or *DONE is returned, the process must stop the evaluation. If *BADREQ
  * is returned, it means the operation could not be processed and a server error
@@ -2874,16 +2940,27 @@ static enum rule_result http_res_get_intercept_rule(struct proxy *px, struct lis
 
 	if (final)
 		act_opts |= ACT_OPT_FINAL;
+	if ((s->scf->flags & SC_FL_ERROR) ||
+	    ((s->scf->flags & (SC_FL_EOS|SC_FL_ABRT_DONE)) &&
+	     (px->options & PR_O_ABRT_CLOSE)))
+		act_opts |= ACT_OPT_FINAL;
+
 	/* If "the current_rule_list" match the executed rule list, we are in
 	 * resume condition. If a resume is needed it is always in the action
 	 * and never in the ACL or converters. In this case, we initialise the
 	 * current rule, and go to the action execution point.
 	 */
 	if (s->current_rule) {
+		int forced = s->flags & SF_RULE_FYIELD;
+
 		rule = s->current_rule;
 		s->current_rule = NULL;
-		if (s->current_rule_list == rules || (def_rules && s->current_rule_list == def_rules))
+		s->flags &= ~SF_RULE_FYIELD;
+		if (s->current_rule_list == rules || (def_rules && s->current_rule_list == def_rules)) {
+			if (forced)
+				goto resume_rule;
 			goto resume_execution;
+		}
 	}
 	s->current_rule_list = ((!def_rules || s->current_rule_list == def_rules) ? rules : def_rules);
 
@@ -2893,19 +2970,21 @@ static enum rule_result http_res_get_intercept_rule(struct proxy *px, struct lis
 	txn->rsp.flags &= ~HTTP_MSGF_SOFT_RW;
 
 	list_for_each_entry(rule, s->current_rule_list, list) {
-		/* check optional condition */
-		if (rule->cond) {
-			int ret;
-
-			ret = acl_exec_cond(rule->cond, px, sess, s, SMP_OPT_DIR_RES|SMP_OPT_FINAL);
-			ret = acl_pass(ret);
-
-			if (rule->cond->pol == ACL_COND_UNLESS)
-				ret = !ret;
-
-			if (!ret) /* condition not matched */
-				continue;
+ resume_rule:
+		/* check if budget is exceeded and we need to continue on the next
+		 * polling loop, unless we know that we cannot yield
+		 */
+		if (s->rules_bcount++ >= global.tune.max_rules_at_once && !(act_opts & ACT_OPT_FINAL)) {
+			s->current_rule = rule;
+			s->flags |= SF_RULE_FYIELD;
+			rule_ret = HTTP_RULE_RES_YIELD;
+			task_wakeup(s->task, TASK_WOKEN_MSG);
+			goto end;
 		}
+
+		/* check optional condition */
+		if (!acl_match_cond(rule->cond, px, sess, s, SMP_OPT_DIR_RES|SMP_OPT_FINAL))
+			continue;
 
 		act_opts |= ACT_OPT_FIRST;
 resume_execution:
@@ -2914,11 +2993,6 @@ resume_execution:
 
 		/* Always call the action function if defined */
 		if (rule->action_ptr) {
-			if ((s->scf->flags & SC_FL_ERROR) ||
-			    ((s->scf->flags & (SC_FL_EOS|SC_FL_ABRT_DONE)) &&
-			     (px->options & PR_O_ABRT_CLOSE)))
-				act_opts |= ACT_OPT_FINAL;
-
 			if (!(s->scb->flags & SC_FL_ERROR) & !(s->res.flags & (CF_READ_TIMEOUT|CF_WRITE_TIMEOUT))) {
 				s->waiting_entity.type = STRM_ENTITY_NONE;
 				s->waiting_entity.ptr  = NULL;
@@ -3018,7 +3092,7 @@ resume_execution:
 
   end:
 	/* if the ruleset evaluation is finished reset the strict mode */
-	if (rule_ret != HTTP_RULE_RES_YIELD)
+	if (rule_ret != HTTP_RULE_RES_YIELD && rule_ret != HTTP_RULE_RES_FYIELD)
 		txn->rsp.flags &= ~HTTP_MSGF_SOFT_RW;
 
 	/* we reached the end of the rules, nothing to report */
@@ -3964,6 +4038,7 @@ static int http_handle_stats(struct stream *s, struct channel *req, struct proxy
 	ctx->flags |= STAT_F_FMT_HTML; /* assume HTML mode by default */
 	if ((msg->flags & HTTP_MSGF_VER_11) && (txn->meth != HTTP_METH_HEAD))
 		ctx->flags |= STAT_F_CHUNKED;
+	watcher_init(&ctx->srv_watch, &ctx->obj2, offsetof(struct server, watcher_list));
 
 	htx = htxbuf(&req->buf);
 	sl = http_get_stline(htx);
@@ -4077,20 +4152,12 @@ static int http_handle_stats(struct stream *s, struct channel *req, struct proxy
 
 	/* now check whether we have some admin rules for this request */
 	list_for_each_entry(stats_admin_rule, &uri_auth->admin_rules, list) {
-		int ret = 1;
+		if (!acl_match_cond(stats_admin_rule->cond, s->be, sess, s, SMP_OPT_DIR_REQ|SMP_OPT_FINAL))
+			continue;
 
-		if (stats_admin_rule->cond) {
-			ret = acl_exec_cond(stats_admin_rule->cond, s->be, sess, s, SMP_OPT_DIR_REQ|SMP_OPT_FINAL);
-			ret = acl_pass(ret);
-			if (stats_admin_rule->cond->pol == ACL_COND_UNLESS)
-				ret = !ret;
-		}
-
-		if (ret) {
-			/* no rule, or the rule matches */
-			ctx->flags |= STAT_F_ADMIN;
-			break;
-		}
+		/* no rule, or the rule matches */
+		ctx->flags |= STAT_F_ADMIN;
+		break;
 	}
 
 	if (txn->meth == HTTP_METH_GET || txn->meth == HTTP_METH_HEAD)

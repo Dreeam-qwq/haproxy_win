@@ -15,6 +15,7 @@
 #include <haproxy/backend.h>
 #include <haproxy/queue.h>
 #include <haproxy/server-t.h>
+#include <haproxy/task.h>
 
 
 /* Remove a server from a tree. It must have previously been dequeued. This
@@ -57,7 +58,7 @@ static inline void fwlc_dequeue_srv(struct server *s)
  */
 static inline void fwlc_queue_srv(struct server *s, unsigned int eweight)
 {
-	unsigned int inflight = _HA_ATOMIC_LOAD(&s->served) + _HA_ATOMIC_LOAD(&s->queue.length);
+	unsigned int inflight = _HA_ATOMIC_LOAD(&s->served) + _HA_ATOMIC_LOAD(&s->queueslength);
 
 	s->lb_node.key = inflight ? (inflight + 1) * SRV_EWGHT_MAX / eweight : 0;
 	eb32_insert(s->lb_tree, &s->lb_node);
@@ -70,7 +71,7 @@ static inline void fwlc_queue_srv(struct server *s, unsigned int eweight)
  */
 static void fwlc_srv_reposition(struct server *s)
 {
-	unsigned int inflight = _HA_ATOMIC_LOAD(&s->served) + _HA_ATOMIC_LOAD(&s->queue.length);
+	unsigned int inflight = _HA_ATOMIC_LOAD(&s->served) + _HA_ATOMIC_LOAD(&s->queueslength);
 	unsigned int eweight = _HA_ATOMIC_LOAD(&s->cur_eweight);
 	unsigned int new_key = inflight ? (inflight + 1) * SRV_EWGHT_MAX / (eweight ? eweight : 1) : 0;
 
@@ -80,14 +81,26 @@ static void fwlc_srv_reposition(struct server *s)
 	if (s->lb_node.node.leaf_p && eweight && s->lb_node.key == new_key)
 		return;
 
-	HA_RWLOCK_WRLOCK(LBPRM_LOCK, &s->proxy->lbprm.lock);
+	if (HA_RWLOCK_TRYWRLOCK(LBPRM_LOCK, &s->proxy->lbprm.lock) != 0) {
+		/* there's already some contention on the tree's lock, there's
+		 * no point insisting. Better wake up the server's tasklet that
+		 * will let this or another thread retry later. For the time
+		 * being, the server's apparent load is slightly inaccurate but
+		 * we don't care, if there is contention, it will self-regulate.
+		 */
+		if (s->requeue_tasklet)
+			tasklet_wakeup(s->requeue_tasklet);
+		return;
+	}
+
+	/* below we've got the lock */
 	if (s->lb_tree) {
 		/* we might have been waiting for a while on the lock above
 		 * so it's worth testing again because other threads are very
 		 * likely to have released a connection or taken one leading
 		 * to our target value (50% of the case in measurements).
 		 */
-		inflight = _HA_ATOMIC_LOAD(&s->served) + _HA_ATOMIC_LOAD(&s->queue.length);
+		inflight = _HA_ATOMIC_LOAD(&s->served) + _HA_ATOMIC_LOAD(&s->queueslength);
 		eweight = _HA_ATOMIC_LOAD(&s->cur_eweight);
 		new_key = inflight ? (inflight + 1) * SRV_EWGHT_MAX / (eweight ? eweight : 1) : 0;
 		if (!s->lb_node.node.leaf_p || s->lb_node.key != new_key) {
@@ -292,6 +305,7 @@ void fwlc_init_server_tree(struct proxy *p)
 	p->lbprm.update_server_eweight  = fwlc_update_server_weight;
 	p->lbprm.server_take_conn = fwlc_srv_reposition;
 	p->lbprm.server_drop_conn = fwlc_srv_reposition;
+	p->lbprm.server_requeue   = fwlc_srv_reposition;
 
 	p->lbprm.wdiv = BE_WEIGHT_SCALE;
 	for (srv = p->srv; srv; srv = srv->next) {
@@ -349,7 +363,7 @@ struct server *fwlc_get_next_server(struct proxy *p, struct server *srvtoavoid)
 		struct server *s;
 
 		s = eb32_entry(node, struct server, lb_node);
-		if (!s->maxconn || s->served + s->queue.length < srv_dynamic_maxconn(s) + s->maxqueue) {
+		if (!s->maxconn || s->served + s->queueslength < srv_dynamic_maxconn(s) + s->maxqueue) {
 			if (s != srvtoavoid) {
 				srv = s;
 				break;

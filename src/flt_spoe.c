@@ -391,8 +391,12 @@ static int spoe_init_appctx(struct appctx *appctx)
 	applet_need_more_data(appctx);
 
 	s->do_log = NULL;
-	s->scb->flags |= SC_FL_RCV_ONCE;
+	s->scb->flags |= SC_FL_RCV_ONCE | SC_FL_NOHALF;
+	s->scf->flags |= SC_FL_NOHALF;
 	s->parent = spoe_appctx->spoe_ctx->strm;
+
+	/* The frame was forwarded to the SPOP mux, set EOI now */
+	applet_set_eoi(appctx);
 
 	appctx->st0 = SPOE_APPCTX_ST_WAITING_ACK;
 	appctx_wakeup(appctx);
@@ -490,7 +494,7 @@ static void spoe_handle_appctx(struct appctx *appctx)
 	if (!appctx_get_buf(appctx, &appctx->inbuf))
 		goto out;
 
-	if (unlikely(se_fl_test(appctx->sedesc, (SE_FL_EOS|SE_FL_ERROR)))) {
+	if (unlikely(applet_fl_test(appctx, APPCTX_FL_EOS|APPCTX_FL_ERROR))) {
 		b_reset(&appctx->inbuf);
 		applet_fl_clr(appctx, APPCTX_FL_INBLK_FULL);
 		goto out;
@@ -508,13 +512,14 @@ static void spoe_handle_appctx(struct appctx *appctx)
 			goto switchstate;
 
 		case SPOE_APPCTX_ST_EXIT:
-			appctx->st0 = SPOE_APPCTX_ST_END;
-			se_fl_set(appctx->sedesc, SE_FL_EOS);
 			if (SPOE_APPCTX(appctx)->status_code != SPOP_ERR_NONE)
-				se_fl_set(appctx->sedesc, SE_FL_ERROR);
-			else
-				se_fl_set(appctx->sedesc, SE_FL_EOI);
-			__fallthrough;
+				applet_set_error(appctx);
+			if (!SPOE_APPCTX(appctx)->spoe_ctx) {
+				appctx->st0 = SPOE_APPCTX_ST_END;
+				applet_set_eos(appctx);
+				goto switchstate;
+			}
+			break;
 
 		case SPOE_APPCTX_ST_END:
 			b_reset(&appctx->inbuf);
@@ -592,16 +597,8 @@ static int spoe_encode_message(struct stream *s, struct spoe_context *ctx,
 	struct spoe_arg *arg;
 	int ret;
 
-	if (msg->cond) {
-		ret = acl_exec_cond(msg->cond, s->be, s->sess, s, dir|SMP_OPT_FINAL);
-		ret = acl_pass(ret);
-		if (msg->cond->pol == ACL_COND_UNLESS)
-			ret = !ret;
-
-		/* the rule does not match */
-		if (!ret)
-			goto next;
-	}
+	if (!acl_match_cond(msg->cond, s->be, s->sess, s, dir|SMP_OPT_FINAL))
+		goto next;
 
 	/* Check if there is enough space for the message name and the
 	 * number of arguments. It implies <msg->id_len> is encoded on 2
@@ -1218,6 +1215,8 @@ static int spoe_init(struct proxy *px, struct flt_conf *fconf)
 	conf->agent->fe.timeout.client = TICK_ETERNITY;
 	conf->agent->fe.fe_req_ana = AN_REQ_SWITCHING_RULES;
 
+	proxy_init_per_thr(&conf->agent->fe);
+
 	conf->agent->engine_id = generate_pseudo_uuid();
 	if (conf->agent->engine_id == NULL)
 		return -1;
@@ -1352,7 +1351,7 @@ static void spoe_check_timeouts(struct stream *s, struct filter *filter)
 	struct spoe_context *ctx = filter->ctx;
 
 	if (tick_is_expired(ctx->process_exp, now_ms))
-		s->pending_events |= TASK_WOKEN_MSG;
+		s->pending_events |= STRM_EVT_MSG;
 }
 
 /* Called when we are ready to filter data on a channel */

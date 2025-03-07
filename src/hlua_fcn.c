@@ -29,7 +29,7 @@
 #include <haproxy/hlua_fcn.h>
 #include <haproxy/http.h>
 #include <haproxy/net_helper.h>
-#include <haproxy/pattern-t.h>
+#include <haproxy/pattern.h>
 #include <haproxy/protocol.h>
 #include <haproxy/proxy.h>
 #include <haproxy/regex.h>
@@ -49,6 +49,7 @@ static int class_proxy_ref;
 static int class_server_ref;
 static int class_listener_ref;
 static int class_event_sub_ref;
+static int class_patref_ref;
 static int class_regex_ref;
 static int class_stktable_ref;
 static int class_proxy_list_ref;
@@ -822,7 +823,7 @@ int hlua_stktable_info(lua_State *L)
 	lua_settable(L, -3);
 
 	lua_pushstring(L, "nopurge");
-	lua_pushboolean(L, tbl->nopurge > 0);
+	lua_pushboolean(L, (tbl->flags & STK_FL_NOPURGE));
 	lua_settable(L, -3);
 
 	lua_pushstring(L, "expire");
@@ -1420,7 +1421,7 @@ int hlua_server_get_pend_conn(lua_State *L)
 		return 1;
 	}
 
-	lua_pushinteger(L, srv->queue.length);
+	lua_pushinteger(L, srv->queueslength);
 	return 1;
 }
 
@@ -1895,29 +1896,33 @@ int hlua_listable_servers_pairs_iterator(lua_State *L)
 {
 	int context_index;
 	struct hlua_server_list_iterator_context *ctx;
+	struct server *cur;
 
 	context_index = lua_upvalueindex(1);
 	ctx = lua_touserdata(L, context_index);
 
-	if (ctx->cur == NULL) {
+	if (ctx->px) {
 		/* First iteration, initialize list on the first server */
-		ctx->cur = ctx->px->srv;
-	} else {
-
-		/* Next server (next ptr is always valid, even if current
-		 * server has the SRV_F_DELETED flag set)
-		 */
-		ctx->cur = ctx->cur->next;
+		cur = ctx->px->srv;
+		watcher_attach(&ctx->srv_watch, cur);
+		ctx->px = NULL;
+	}
+	else {
+		/* next iteration */
+		cur = ctx->next;
 	}
 
-	/* next server is null, end of iteration */
-	if (ctx->cur == NULL) {
+	/* cur server is null, end of iteration */
+	if (cur == NULL) {
 		lua_pushnil(L);
 		return 1;
 	}
 
-	lua_pushstring(L, ctx->cur->id);
-	hlua_fcn_new_server(L, ctx->cur);
+	/* compute next server */
+	ctx->next = watcher_next(&ctx->srv_watch, cur->next);
+
+	lua_pushstring(L, cur->id);
+	hlua_fcn_new_server(L, cur);
 	return 2;
 }
 
@@ -1934,7 +1939,8 @@ int hlua_listable_servers_pairs(lua_State *L)
 
 	ctx = lua_newuserdata(L, sizeof(*ctx));
 	ctx->px = hlua_srv_list->px;
-	ctx->cur = NULL;
+	ctx->next = NULL;
+	watcher_init(&ctx->srv_watch, &ctx->next, offsetof(struct server, watcher_list));
 
 	lua_pushcclosure(L, hlua_listable_servers_pairs_iterator, 1);
 	return 1;
@@ -2617,6 +2623,513 @@ static int hlua_regex_free(struct lua_State *L)
 	return 0;
 }
 
+int hlua_patref_get_name(lua_State *L)
+{
+	struct hlua_patref *ref;
+
+
+	ref = hlua_checkudata(L, 1, class_patref_ref);
+	BUG_ON(!ref);
+
+	lua_pushstring(L, ref->ptr->reference);
+	return 1;
+}
+
+int hlua_patref_is_map(lua_State *L)
+{
+	struct hlua_patref *ref;
+
+	ref = hlua_checkudata(L, 1, class_patref_ref);
+	BUG_ON(!ref);
+
+	lua_pushboolean(L, !!(ref->ptr->flags & PAT_REF_MAP));
+	return 1;
+}
+
+/* full-clear may require yielding between pruning
+ * batches
+ */
+static int _hlua_patref_clear(lua_State *L, int status, lua_KContext ctx)
+{
+	struct hlua_patref *ref = hlua_checkudata(L, 1, class_patref_ref);
+	unsigned int from = lua_tointeger(L, 2);
+	unsigned int to = lua_tointeger(L, 3);
+	int ret;
+
+ loop:
+	HA_RWLOCK_WRLOCK(PATREF_LOCK, &ref->ptr->lock);
+	ret = pat_ref_purge_range(ref->ptr, from, to, 100);
+	HA_RWLOCK_WRUNLOCK(PATREF_LOCK, &ref->ptr->lock);
+	if (!ret) {
+		hlua_yieldk(L, 0, 0, _hlua_patref_clear, TICK_ETERNITY, HLUA_CTRLYIELD); // continue
+		/* never reached, unless if called from body/init state
+		 * where yieldk is no-op, thus we can't do anything to prevent
+		 * thread contention
+		 */
+		goto loop;
+	}
+
+	lua_pushboolean(L, 1);
+	return 1; // end
+}
+
+int hlua_patref_commit(lua_State *L)
+{
+	struct hlua_patref *ref;
+	int ret;
+
+	ref = hlua_checkudata(L, 1, class_patref_ref);
+	BUG_ON(!ref);
+
+	if (!(ref->flags & HLUA_PATREF_FL_GEN))
+		return hlua_error(L, "Nothing to do");
+
+	ref->flags &= ~HLUA_PATREF_FL_GEN;
+	ret = pat_ref_commit(ref->ptr, ref->curr_gen);
+
+	if (ret)
+		return hlua_error(L, "Commit failed");
+
+	/* cleanup: prune previous generations: The range of generations
+	 * that get trashed by a commit starts from the opposite of the
+	 * current one and ends at the previous one.
+         */
+	lua_pushinteger(L, ref->curr_gen - ((~0U) >> 1)); // from
+	lua_pushinteger(L, ref->curr_gen - 1); // to
+	return _hlua_patref_clear(L, LUA_OK, 0);
+}
+
+int hlua_patref_giveup(lua_State *L)
+{
+	struct hlua_patref *ref;
+
+	ref = hlua_checkudata(L, 1, class_patref_ref);
+	BUG_ON(!ref);
+
+	if (!(ref->flags & HLUA_PATREF_FL_GEN)) {
+		/* nothing to do */
+		return 0;
+	}
+
+	lua_pushinteger(L, ref->curr_gen); // from
+	lua_pushinteger(L, ref->curr_gen); // to
+	_hlua_patref_clear(L, LUA_OK, 0);
+
+	/* didn't make use of the generation ID, give it back to the API */
+	pat_ref_giveup(ref->ptr, ref->curr_gen);
+
+	return 0;
+}
+
+int hlua_patref_prepare(lua_State *L)
+{
+	struct hlua_patref *ref;
+
+	ref = hlua_checkudata(L, 1, class_patref_ref);
+	BUG_ON(!ref);
+	ref->curr_gen = pat_ref_newgen(ref->ptr);
+	ref->flags |= HLUA_PATREF_FL_GEN;
+	return 0;
+}
+
+int hlua_patref_purge(lua_State *L)
+{
+	struct hlua_patref *ref;
+
+	ref = hlua_checkudata(L, 1, class_patref_ref);
+	BUG_ON(!ref);
+
+	lua_pushinteger(L, 0); // from
+	lua_pushinteger(L, ~0); // to
+	return _hlua_patref_clear(L, LUA_OK, 0);
+}
+
+int hlua_patref_add(lua_State *L)
+{
+	struct hlua_patref *ref;
+	const char *key;
+	const char *value = NULL;
+	char *errmsg = NULL;
+	int ret;
+
+	ref = hlua_checkudata(L, 1, class_patref_ref);
+
+	BUG_ON(!ref);
+
+	key = luaL_checkstring(L, 2);
+	if (lua_gettop(L) == 3)
+		value = luaL_checkstring(L, 3);
+
+	HA_RWLOCK_WRLOCK(PATREF_LOCK, &ref->ptr->lock);
+	if ((ref->flags & HLUA_PATREF_FL_GEN) &&
+	    pat_ref_may_commit(ref->ptr, ref->curr_gen))
+		ret = !!pat_ref_load(ref->ptr, ref->curr_gen, key, value, -1, &errmsg);
+	else
+		ret = pat_ref_add(ref->ptr, key, value, &errmsg);
+	HA_RWLOCK_WRUNLOCK(PATREF_LOCK, &ref->ptr->lock);
+
+
+	if (!ret) {
+		ret = hlua_error(L, errmsg);
+		ha_free(&errmsg);
+		return ret;
+	}
+	lua_pushboolean(L, 1);
+	return 1;
+}
+
+/* re-entrant helper, expects table of string as second argument on the stack */
+static int _hlua_patref_add_bulk(lua_State *L, int status, lua_KContext ctx)
+{
+	struct hlua_patref *ref = hlua_checkudata(L, 1, class_patref_ref);
+	char *errmsg;
+	unsigned int curr_gen;
+	int count = 0;
+	int ret;
+
+	if ((ref->flags & HLUA_PATREF_FL_GEN) &&
+	    pat_ref_may_commit(ref->ptr, ref->curr_gen))
+		curr_gen = ref->curr_gen;
+	else
+		curr_gen = ref->ptr->curr_gen;
+
+	HA_RWLOCK_WRLOCK(PATREF_LOCK, &ref->ptr->lock);
+
+	while (lua_next(L, 2) != 0) {
+		const char *key;
+		const char *value = NULL;
+
+		/* check if we may do something to try to prevent thread contention,
+		 * unless we run from body/init state where hlua_yieldk is no-op
+		 */
+		if (count > 100 && hlua_gethlua(L)) {
+			/* let's yield and wait for being called again to continue where we left off */
+			HA_RWLOCK_WRUNLOCK(PATREF_LOCK, &ref->ptr->lock);
+			hlua_yieldk(L, 0, 0, _hlua_patref_add_bulk, TICK_ETERNITY, HLUA_CTRLYIELD); // continue
+			return 0; // not reached
+
+		}
+
+		if (ref->ptr->flags & PAT_REF_SMP) {
+			/* key:val table */
+			luaL_checktype(L, -2, LUA_TSTRING);
+			key = lua_tostring(L, -2);
+			luaL_checktype(L, -1, LUA_TSTRING);
+			value = lua_tostring(L, -1);
+		}
+		else {
+			/* key-only table, use value as key */
+			luaL_checktype(L, -1, LUA_TSTRING);
+			key = lua_tostring(L, -1);
+		}
+
+		if (!pat_ref_load(ref->ptr, curr_gen, key, value, -1, &errmsg)) {
+			HA_RWLOCK_WRUNLOCK(PATREF_LOCK, &ref->ptr->lock);
+			ret = hlua_error(L, errmsg);
+			ha_free(&errmsg);
+			return ret;
+		}
+
+
+		/* removes 'value'; keeps 'key' for next iteration */
+		lua_pop(L, 1);
+		count += 1;
+	}
+	HA_RWLOCK_WRUNLOCK(PATREF_LOCK, &ref->ptr->lock);
+	lua_pushboolean(L, 1);
+	return 1;
+}
+int hlua_patref_add_bulk(lua_State *L)
+{
+	struct hlua_patref *ref;
+
+	ref = hlua_checkudata(L, 1, class_patref_ref);
+
+	BUG_ON(!ref);
+
+	/* table is in the stack at index 't' */
+	lua_pushnil(L);  /* first key */
+	return _hlua_patref_add_bulk(L, LUA_OK, 0);
+}
+
+int hlua_patref_del(lua_State *L)
+{
+	struct hlua_patref *ref;
+	const char *key;
+	int ret;
+
+	ref = hlua_checkudata(L, 1, class_patref_ref);
+
+	BUG_ON(!ref);
+
+	key = luaL_checkstring(L, 2);
+
+	HA_RWLOCK_WRLOCK(PATREF_LOCK, &ref->ptr->lock);
+	if ((ref->flags & HLUA_PATREF_FL_GEN) &&
+	    pat_ref_may_commit(ref->ptr, ref->curr_gen))
+		ret = pat_ref_gen_delete(ref->ptr, ref->curr_gen, key);
+	else
+		ret = pat_ref_delete(ref->ptr, key);
+	HA_RWLOCK_WRUNLOCK(PATREF_LOCK, &ref->ptr->lock);
+
+	lua_pushboolean(L, !!ret);
+	return 1;
+}
+
+int hlua_patref_set(lua_State *L)
+{
+	struct hlua_patref *ref;
+	const char *key;
+	const char *value;
+	char *errmsg = NULL;
+	unsigned int curr_gen;
+	int force = 0;
+	int ret;
+
+	ref = hlua_checkudata(L, 1, class_patref_ref);
+
+	BUG_ON(!ref);
+
+	key = luaL_checkstring(L, 2);
+	value = luaL_checkstring(L, 3);
+
+	if (lua_gettop(L) == 4)
+		force = lua_toboolean(L, 4);
+
+	HA_RWLOCK_WRLOCK(PATREF_LOCK, &ref->ptr->lock);
+	if ((ref->flags & HLUA_PATREF_FL_GEN) &&
+	    pat_ref_may_commit(ref->ptr, ref->curr_gen))
+		curr_gen = ref->curr_gen;
+	else
+		curr_gen = ref->ptr->curr_gen;
+
+	if (force) {
+		struct pat_ref_elt *elt;
+
+		elt = pat_ref_gen_find_elt(ref->ptr, curr_gen, key);
+		if (elt)
+			ret = pat_ref_set_elt_duplicate(ref->ptr, elt, value, &errmsg);
+		else
+			ret = !!pat_ref_load(ref->ptr, curr_gen, key, value, -1, &errmsg);
+	}
+	else
+		ret = pat_ref_gen_set(ref->ptr, curr_gen, key, value, &errmsg);
+
+	HA_RWLOCK_WRUNLOCK(PATREF_LOCK, &ref->ptr->lock);
+
+	if (!ret) {
+		ret = hlua_error(L, errmsg);
+		ha_free(&errmsg);
+		return ret;
+	}
+	lua_pushboolean(L, 1);
+	return 1;
+}
+
+/* hlua_event_sub wrapper for per-patref subscription:
+ *
+ * hlua_event_sub() is called with ref->ptr->e_subs subscription list and
+ * lua arguments are passed as-is (skipping the first argument which
+ * is the hlua_patref)
+ */
+int hlua_patref_event_sub(lua_State *L)
+{
+	struct hlua_patref *ref;
+
+	ref = hlua_checkudata(L, 1, class_patref_ref);
+
+	BUG_ON(!ref);
+
+	/* remove first argument from the stack (hlua_patref) */
+	lua_remove(L, 1);
+
+	/* try to subscribe within patref's subscription list */
+	return hlua_event_sub(L, &ref->ptr->e_subs);
+}
+
+void hlua_fcn_new_patref(lua_State *L, struct pat_ref *ref)
+{
+	struct hlua_patref *_ref;
+
+	lua_newtable(L);
+
+	/* Pop a class patref metatable and affect it to the userdata
+	 * (if provided)
+	 */
+	lua_rawgeti(L, LUA_REGISTRYINDEX, class_patref_ref);
+	lua_setmetatable(L, -2);
+
+	if (ref) {
+		/* allocate hlua_patref wrapper and store it in the metatable */
+		_ref = malloc(sizeof(*_ref));
+		if (!_ref)
+			luaL_error(L, "Lua out of memory error.");
+		_ref->ptr = ref;
+		_ref->curr_gen = 0;
+		_ref->flags = HLUA_PATREF_FL_NONE;
+		lua_pushlightuserdata(L, _ref);
+		lua_rawseti(L, -2, 0);
+	}
+
+	/* set public methods */
+	hlua_class_function(L, "get_name", hlua_patref_get_name);
+	hlua_class_function(L, "is_map", hlua_patref_is_map);
+	hlua_class_function(L, "prepare", hlua_patref_prepare);
+	hlua_class_function(L, "commit", hlua_patref_commit);
+	hlua_class_function(L, "giveup", hlua_patref_giveup);
+	hlua_class_function(L, "purge", hlua_patref_purge);
+	hlua_class_function(L, "add", hlua_patref_add);
+	hlua_class_function(L, "add_bulk", hlua_patref_add_bulk);
+	hlua_class_function(L, "del", hlua_patref_del);
+	hlua_class_function(L, "set", hlua_patref_set);
+	hlua_class_function(L, "event_sub", hlua_patref_event_sub);
+}
+
+int hlua_patref_gc(lua_State *L)
+{
+	struct hlua_patref *ref = hlua_checkudata(L, 1, class_patref_ref);
+
+	free(ref);
+	return 0;
+}
+
+int hlua_listable_patref_newindex(lua_State *L) {
+	/* not yet supported */
+	return 0;
+}
+
+/* first arg is the pat_ref
+ * second arg is the required index, in case of duplicate, only the
+ * first matching entry is returned.
+ */
+int hlua_listable_patref_index(lua_State *L)
+{
+	struct hlua_patref *ref;
+	const char *key;
+	struct pat_ref_elt *elt;
+
+	ref = hlua_checkudata(L, 1, class_patref_ref);
+	key = luaL_checkstring(L, 2);
+
+	/* Perform pat ref element lookup by key */
+	HA_RWLOCK_WRLOCK(PATREF_LOCK, &ref->ptr->lock);
+	if ((ref->flags & HLUA_PATREF_FL_GEN) &&
+	    pat_ref_may_commit(ref->ptr, ref->curr_gen))
+		elt = pat_ref_gen_find_elt(ref->ptr, ref->curr_gen, key);
+	else
+		elt = pat_ref_find_elt(ref->ptr, key);
+	if (elt == NULL) {
+		HA_RWLOCK_WRUNLOCK(PATREF_LOCK, &ref->ptr->lock);
+		lua_pushnil(L);
+		return 1;
+	}
+
+	if (elt->sample)
+		lua_pushstring(L, elt->sample);
+	else
+		lua_pushboolean(L, 1); // acl: just push true to tell that the key exists
+	HA_RWLOCK_WRUNLOCK(PATREF_LOCK, &ref->ptr->lock);
+
+	return 1;
+}
+
+static int _hlua_listable_patref_pairs_iterator(lua_State *L, int status, lua_KContext ctx)
+{
+	int context_index;
+	struct hlua_patref_iterator_context *hctx;
+	struct pat_ref_elt *elt;
+	int cnt = 0;
+	unsigned int curr_gen;
+
+	context_index = lua_upvalueindex(1);
+	hctx = lua_touserdata(L, context_index);
+
+	HA_RWLOCK_WRLOCK(PATREF_LOCK, &hctx->ref->ptr->lock);
+
+	if ((hctx->ref->flags & HLUA_PATREF_FL_GEN) &&
+	    pat_ref_may_commit(hctx->ref->ptr, hctx->ref->curr_gen))
+		curr_gen = hctx->ref->curr_gen;
+	else
+		curr_gen = hctx->ref->ptr->curr_gen;
+
+	if (LIST_ISEMPTY(&hctx->bref.users)) {
+		/* first iteration */
+		hctx->bref.ref = hctx->ref->ptr->head.n;
+	}
+	else
+		LIST_DEL_INIT(&hctx->bref.users); // drop back ref from previous iteration
+
+ next:
+	/* reached end of list? */
+	if (hctx->bref.ref == &hctx->ref->ptr->head) {
+		HA_RWLOCK_WRUNLOCK(PATREF_LOCK, &hctx->ref->ptr->lock);
+		lua_pushnil(L);
+		return 1;
+	}
+
+	elt = LIST_ELEM(hctx->bref.ref, struct pat_ref_elt *, list);
+
+	if (elt->gen_id != curr_gen) {
+		/* check if we may do something to try to prevent thread contention,
+		 * unless we run from body/init state where hlua_yieldk is no-op
+		 */
+		if (cnt > 10000 && hlua_gethlua(L)) {
+			/* let's yield and wait for being called again to continue where we left off */
+			LIST_APPEND(&elt->back_refs, &hctx->bref.users);
+			HA_RWLOCK_WRUNLOCK(PATREF_LOCK, &hctx->ref->ptr->lock);
+			hlua_yieldk(L, 0, 0, _hlua_listable_patref_pairs_iterator, TICK_ETERNITY, HLUA_CTRLYIELD); // continue
+			return 0; // not reached
+		}
+
+		hctx->bref.ref = elt->list.n;
+		cnt++;
+		goto next;
+	}
+
+	LIST_APPEND(&elt->back_refs, &hctx->bref.users);
+	HA_RWLOCK_WRUNLOCK(PATREF_LOCK, &hctx->ref->ptr->lock);
+
+	hctx->bref.ref = elt->list.n;
+
+	lua_pushstring(L, elt->pattern);
+	if (elt->sample)
+		lua_pushstring(L, elt->sample);
+	else
+		return 1;
+	return 2;
+
+}
+/* iterator must return key as string and value as patref
+ * element value (as string), if we reach end of list, it
+ * returns nil. The context knows the last returned patref's
+ * value. if the context contains patref_elem == NULL, we
+ * start enumeration. We use pat_ref element iterator logic
+ * to iterate through the list.
+ */
+int hlua_listable_patref_pairs_iterator(lua_State *L)
+{
+	return _hlua_listable_patref_pairs_iterator(L, LUA_OK, 0);
+}
+
+/* init the iterator context, return iterator function
+ * with context as closure. The only argument is a
+ * patref list object.
+ */
+int hlua_listable_patref_pairs(lua_State *L)
+{
+	struct hlua_patref_iterator_context *ctx;
+	struct hlua_patref *ref;
+
+	ref = hlua_checkudata(L, 1, class_patref_ref);
+
+	ctx = lua_newuserdata(L, sizeof(*ctx));
+	ctx->ref = ref;
+	LIST_INIT(&ctx->bref.users);
+
+	lua_pushcclosure(L, hlua_listable_patref_pairs_iterator, 1);
+	return 1;
+}
+
 void hlua_fcn_reg_core_fcn(lua_State *L)
 {
 	hlua_concat_init(L);
@@ -2674,6 +3187,14 @@ void hlua_fcn_reg_core_fcn(lua_State *L)
 	lua_newtable(L);
 	hlua_class_function(L, "__gc", hlua_event_sub_gc);
 	class_event_sub_ref = hlua_register_metatable(L, CLASS_EVENT_SUB);
+
+	/* Create patref object. */
+	lua_newtable(L);
+	hlua_class_function(L, "__index", hlua_listable_patref_index);
+	hlua_class_function(L, "__newindex", hlua_listable_patref_newindex);
+	hlua_class_function(L, "__pairs", hlua_listable_patref_pairs);
+	hlua_class_function(L, "__gc", hlua_patref_gc);
+	class_patref_ref = hlua_register_metatable(L, CLASS_PATREF);
 
 	/* Create server object. */
 	lua_newtable(L);

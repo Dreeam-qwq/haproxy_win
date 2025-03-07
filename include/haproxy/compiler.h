@@ -66,6 +66,14 @@
 #define __has_attribute(x) __equals_1(__has_attribute_ ## x)
 #endif
 
+/* gcc 10 and clang 3 brought __has_builtin() to test if a builtin exists.
+ * Just like above, if it doesn't exist, we remap it to a macro allowing us
+ * to define these ourselves by defining __has_builtin_<name> to 1.
+ */
+#ifndef __has_builtin
+#define __has_builtin(x) __equals_1(__has_builtin_ ## x)
+#endif
+
 /* The fallthrough attribute arrived with gcc 7, the same version that started
  * to emit the fallthrough warnings and to parse the comments. Comments do not
  * manage to stop the warning when preprocessing is split from compiling (e.g.
@@ -183,6 +191,11 @@
 #define __read_mostly           HA_SECTION("read_mostly")
 #endif
 
+/* __builtin_unreachable() was added in gcc 4.5 */
+#if defined(__GNUC__) && (__GNUC__ >= 5 || (__GNUC__ == 4 && __GNUC_MINOR__ >= 5))
+#define __has_builtin___builtin_unreachable 1
+#endif
+
 /* This allows gcc to know that some locations are never reached, for example
  * after a longjmp() in the Lua code, hence that some errors caught by such
  * methods cannot propagate further. This is important with gcc versions 6 and
@@ -192,11 +205,34 @@
 #ifdef DEBUG_USE_ABORT
 #define my_unreachable() abort()
 #else
-#if defined(__GNUC__) && (__GNUC__ >= 5 || (__GNUC__ == 4 && __GNUC_MINOR__ >= 5))
+#if __has_builtin(__builtin_unreachable)
 #define my_unreachable() __builtin_unreachable()
 #else
 #define my_unreachable() do { } while (1)
 #endif
+#endif
+
+/* By using an unreachable statement, we can tell the compiler that certain
+ * conditions are not expected to be met and let it arrange as it wants to
+ * optimize some checks away. The principle is to place a test on the condition
+ * and call unreachable upon a match. It may also help static code analyzers
+ * know that some conditions are not supposed to happen. This can only be used
+ * with compilers that support it, and we do not want to emit any static code
+ * for other ones, so we use a construct that the compiler should easily be
+ * able to optimize away. Clang also has __builtin_assume() since at least 3.x.
+ * In addition, ASSUME_NONNULL() tells the compiler that the pointer argument
+ * will never be null. If not supported, it will be disguised via an assembly
+ * step.
+ */
+#if __has_builtin(__builtin_assume)
+# define ASSUME(expr) __builtin_assume(expr)
+# define ASSUME_NONNULL(p) ({ typeof(p) __p = (p); __builtin_assume(__p != NULL); (__p); })
+#elif __has_builtin(__builtin_unreachable)
+# define ASSUME(expr) do { if (!(expr)) __builtin_unreachable(); } while (0)
+# define ASSUME_NONNULL(p) ({ typeof(p) __p = (p); if (__p == NULL) __builtin_unreachable(); (__p); })
+#else
+# define ASSUME(expr) do { if (!(expr)) break; } while (0)
+# define ASSUME_NONNULL(p) ({ typeof(p) __p = (p); asm("" : "=rm"(__p) : "0"(__p)); __p; })
 #endif
 
 /* This prevents the compiler from folding multiple identical code paths into a

@@ -128,6 +128,10 @@
 #define HAVE_SSL_SET_SECURITY_LEVEL
 #endif
 
+#if ((defined(LIBRESSL_VERSION_NUMBER) && (LIBRESSL_VERSION_NUMBER >= 0x3030600L)) || (HA_OPENSSL_VERSION_NUMBER >= 0x10101000L) || defined(OPENSSL_IS_AWSLC)) && !defined(USE_OPENSSL_WOLFSSL)
+#define HAVE_JWS
+#endif
+
 #if !defined(HAVE_SSL_SET_SECURITY_LEVEL)
 /* define a nope function for set_security_level */
 #define SSL_CTX_set_security_level(ctx, level) ({})
@@ -147,6 +151,12 @@
 #define HASSL_DH DH
 #define HASSL_DH_free DH_free
 #define HASSL_DH_up_ref DH_up_ref
+#endif
+
+#if ((defined SSL_CTRL_SET_TLSEXT_STATUS_REQ_CB || AWSLC_API_VERSION >= 29) && (!defined(OPENSSL_NO_OCSP)))
+#define HAVE_SSL_OCSP
+#else
+typedef void OCSP_CERTID;
 #endif
 
 #if ((HA_OPENSSL_VERSION_NUMBER < 0x1000000fL) && !defined(X509_get_X509_PUBKEY))
@@ -186,19 +196,6 @@ static inline STACK_OF(X509) *X509_chain_up_ref(STACK_OF(X509) *chain)
 
 #endif
 
-#ifdef OPENSSL_IS_BORINGSSL
-/*
- * Functions missing in BoringSSL
- */
-
-static inline X509_CRL *X509_OBJECT_get0_X509_CRL(const X509_OBJECT *a)
-{
-    if (a == NULL || a->type != X509_LU_CRL) {
-        return NULL;
-    }
-    return a->data.crl;
-}
-#endif
 
 #if (HA_OPENSSL_VERSION_NUMBER < 0x1010000fL) && (!defined(LIBRESSL_VERSION_NUMBER) || LIBRESSL_VERSION_NUMBER < 0x2070000fL)
 /*
@@ -411,8 +408,12 @@ static inline unsigned long ERR_peek_error_func(const char **func)
 #define SSL_OP_CIPHER_SERVER_PREFERENCE 0
 #endif
 
-#ifndef SSL_OP_NO_SESSION_RESUMPTION_ON_RENEGOTIATION   /* needs OpenSSL >= 0.9.7 */
+/* needs OpenSSL >= 0.9.7 and renegotation options on WolfSSL */
+#if !defined(SSL_OP_NO_SESSION_RESUMPTION_ON_RENEGOTIATION) || \
+	 (defined(USE_OPENSSL_WOLFSSL) && !defined(HAVE_SECURE_RENEGOTIATION) && !defined(HAVE_SERVER_RENEGOTIATION_INFO))
+#undef  SSL_OP_NO_SESSION_RESUMPTION_ON_RENEGOTIATION
 #define SSL_OP_NO_SESSION_RESUMPTION_ON_RENEGOTIATION 0
+#undef  SSL_renegotiate_pending
 #define SSL_renegotiate_pending(arg) 0
 #endif
 

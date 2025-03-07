@@ -137,7 +137,7 @@ struct global_ssl global_ssl = {
 	.keylog = 0,
 #endif
 	.security_level = -1,
-#ifndef OPENSSL_NO_OCSP
+#ifdef HAVE_SSL_OCSP
 	.ocsp_update.delay_max = SSL_OCSP_UPDATE_DELAY_MAX,
 	.ocsp_update.delay_min = SSL_OCSP_UPDATE_DELAY_MIN,
 	.ocsp_update.mode = SSL_SOCK_OCSP_UPDATE_OFF,
@@ -156,6 +156,8 @@ enum {
 	SSL_ST_SESS,
 	SSL_ST_REUSED_SESS,
 	SSL_ST_FAILED_HANDSHAKE,
+	SSL_ST_OCSP_STAPLE,
+	SSL_ST_FAILED_OCSP_STAPLE,
 
 	SSL_ST_STATS_COUNT /* must be the last member of the enum */
 };
@@ -167,13 +169,13 @@ static struct stat_col ssl_stats[] = {
 	                              .desc = "Total number of ssl sessions reused" },
 	[SSL_ST_FAILED_HANDSHAKE] = { .name = "ssl_failed_handshake",
 	                              .desc = "Total number of failed handshake" },
+	[SSL_ST_OCSP_STAPLE]      = { .name = "ssl_ocsp_staple",
+	                              .desc = "Total number of stapled OCSP responses" },
+	[SSL_ST_FAILED_OCSP_STAPLE] = { .name = "ssl_failed_ocsp_staple",
+	                              .desc = "Total number of failed OCSP stapling (expired or error)" },
 };
 
-static struct ssl_counters {
-	long long sess;
-	long long reused_sess;
-	long long failed_handshake;
-} ssl_counters;
+static struct ssl_counters ssl_counters;
 
 static int ssl_fill_stats(void *data, struct field *stats, unsigned int *selected_field)
 {
@@ -193,6 +195,13 @@ static int ssl_fill_stats(void *data, struct field *stats, unsigned int *selecte
 		case SSL_ST_FAILED_HANDSHAKE:
 			metric = mkf_u64(FN_COUNTER, counters->failed_handshake);
 			break;
+		case SSL_ST_OCSP_STAPLE:
+			metric = mkf_u64(FN_COUNTER, counters->ocsp_staple);
+			break;
+		case SSL_ST_FAILED_OCSP_STAPLE:
+			metric = mkf_u64(FN_COUNTER, counters->failed_ocsp_staple);
+			break;
+
 		default:
 			/* not used for frontends. If a specific metric
 			 * is requested, return an error. Otherwise continue.
@@ -208,7 +217,7 @@ static int ssl_fill_stats(void *data, struct field *stats, unsigned int *selecte
 	return 1;
 }
 
-static struct stats_module ssl_stats_module = {
+struct stats_module ssl_stats_module = {
 	.name          = "ssl",
 	.fill_stats    = ssl_fill_stats,
 	.stats         = ssl_stats,
@@ -1092,7 +1101,7 @@ static int tlskeys_finalize_config(void)
 #endif /* SSL_CTRL_SET_TLSEXT_TICKET_KEY_CB */
 
 
-#if ((defined SSL_CTRL_SET_TLSEXT_STATUS_REQ_CB && !defined OPENSSL_NO_OCSP) && !defined OPENSSL_IS_BORINGSSL)
+#if (defined(HAVE_SSL_OCSP) && !defined OPENSSL_IS_BORINGSSL)
 /*
  * This function enables the handling of OCSP status extension on 'ctx' if a
  * ocsp_response buffer was found in the cert_key_and_chain.  To enable OCSP
@@ -1471,8 +1480,6 @@ int ssl_sock_bind_verifycbk(int ok, X509_STORE_CTX *x_store)
 #endif
 
 	BUG_ON(!ctx || !bind_conf);
-	ALREADY_CHECKED(ctx);
-	ALREADY_CHECKED(bind_conf);
 
 	ctx->xprt_st |= SSL_SOCK_ST_FL_VERIFY_DONE;
 
@@ -2774,7 +2781,7 @@ static int ssl_sock_put_ckch_into_ctx(const char *path, struct ckch_store *store
 	}
 #endif
 
-#if ((defined SSL_CTRL_SET_TLSEXT_STATUS_REQ_CB && !defined OPENSSL_NO_OCSP) || defined OPENSSL_IS_BORINGSSL)
+#if defined(HAVE_SSL_OCSP)
 	/* Load OCSP Info into context
 	 * If OCSP update mode is set to 'on', an entry will be created in the
 	 * ocsp tree even if no ocsp_response was known during init, unless the
@@ -4781,8 +4788,10 @@ int ssl_sock_prepare_bind_conf(struct bind_conf *bind_conf)
 	/* initialize all certificate contexts */
 	err += ssl_sock_prepare_all_ctx(bind_conf);
 
+#ifndef SSL_NO_GENERATE_CERTIFICATES
 	/* initialize CA variables if the certificates generation is enabled */
-	err += ssl_sock_load_ca(bind_conf);
+	err += ssl_sock_gencert_load_ca(bind_conf);
+#endif
 
 	return -err;
 }
@@ -4874,7 +4883,9 @@ REGISTER_POST_DEINIT(ssl_sock_deinit);
 /* Destroys all the contexts for a bind_conf. This is used during deinit(). */
 void ssl_sock_destroy_bind_conf(struct bind_conf *bind_conf)
 {
-	ssl_sock_free_ca(bind_conf);
+#ifndef SSL_NO_GENERATE_CERTIFICATES
+	ssl_sock_gencert_free_ca(bind_conf);
+#endif
 	ssl_sock_free_all_ctx(bind_conf);
 	ssl_sock_free_ssl_conf(&bind_conf->ssl_conf);
 	free(bind_conf->ca_sign_file);
@@ -5520,6 +5531,10 @@ reneg_ok:
 		HA_ATOMIC_INC(&counters_px->failed_handshake);
 	}
 
+	/* Report an HS error only on SSL error */
+	if (!(conn->flags & (CO_FL_ERROR | CO_FL_SOCK_RD_SH | CO_FL_SOCK_WR_SH)))
+		conn_report_term_evt(conn, tevt_loc_hs, hs_tevt_type_truncated_rcv_err);
+
 	/* Fail on all other handshake errors */
 	conn->flags |= CO_FL_ERROR;
 	if (!conn->err_code)
@@ -5871,10 +5886,12 @@ static size_t ssl_sock_to_buf(struct connection *conn, void *xprt_ctx, struct bu
 	ssl_sock_dump_errors(conn, NULL);
 	ERR_clear_error();
  read0:
+	conn_report_term_evt(conn, tevt_loc_xprt, xprt_tevt_type_shutr);
 	conn_sock_read0(conn);
 	goto leave;
 
  out_error:
+	conn_report_term_evt(conn, tevt_loc_xprt, xprt_tevt_type_rcv_err);
 	conn->flags |= CO_FL_ERROR;
 	/* Clear openssl global errors stack */
 	ssl_sock_dump_errors(conn, NULL);
@@ -6041,6 +6058,7 @@ static size_t ssl_sock_from_buf(struct connection *conn, void *xprt_ctx, const s
 	ssl_sock_dump_errors(conn, NULL);
 	ERR_clear_error();
 
+	conn_report_term_evt(conn, tevt_loc_xprt, xprt_tevt_type_snd_err);
 	conn->flags |= CO_FL_ERROR;
 	goto leave;
 }
@@ -6131,6 +6149,7 @@ static void ssl_sock_shutw(struct connection *conn, void *xprt_ctx, int clean)
 
 	if (conn->flags & (CO_FL_WAIT_XPRT | CO_FL_SSL_WAIT_HS))
 		return;
+	conn_report_term_evt(conn, tevt_loc_xprt, xprt_tevt_type_shutw);
 	if (!clean)
 		/* don't sent notify on SSL_shutdown */
 		SSL_set_quiet_shutdown(ctx->ssl, 1);
@@ -6967,7 +6986,7 @@ static void __ssl_sock_init(void)
 	sctl_ex_index = SSL_CTX_get_ex_new_index(0, NULL, NULL, NULL, ssl_sock_sctl_free_func);
 #endif
 
-#if ((defined SSL_CTRL_SET_TLSEXT_STATUS_REQ_CB && !defined OPENSSL_NO_OCSP) && !defined OPENSSL_IS_BORINGSSL)
+#if (defined(HAVE_SSL_OCSP) && !defined OPENSSL_IS_BORINGSSL)
 	ocsp_ex_index = SSL_CTX_get_ex_new_index(0, NULL, NULL, NULL, ssl_sock_ocsp_free_func);
 #endif
 
@@ -7021,7 +7040,9 @@ static void __ssl_sock_init(void)
 
 	HA_SPIN_INIT(&ckch_lock);
 
+#if defined(HAVE_SSL_OCSP)
 	HA_SPIN_INIT(&ocsp_tree_lock);
+#endif
 
 	/* Try to register dedicated SSL/TLS protocol message callbacks for
 	 * heartbleed attack (CVE-2014-0160) and clienthello.
@@ -7041,16 +7062,16 @@ static void ssl_register_build_options()
 	char *ptr = NULL;
 	int i;
 
-	memprintf(&ptr, "Built with OpenSSL version : "
+	memprintf(&ptr, "Built with SSL library version : "
 #ifdef OPENSSL_IS_BORINGSSL
 		"BoringSSL");
 #else /* OPENSSL_IS_BORINGSSL */
 	        OPENSSL_VERSION_TEXT
-		"\nRunning on OpenSSL version : %s%s",
+		"\nRunning on SSL library version : %s%s",
 	       OpenSSL_version(OPENSSL_VERSION),
 	       ((OPENSSL_VERSION_NUMBER ^ OpenSSL_version_num()) >> 8) ? " (VERSIONS DIFFER!)" : "");
 #endif
-	memprintf(&ptr, "%s\nOpenSSL library supports TLS extensions : "
+	memprintf(&ptr, "%s\nSSL library supports TLS extensions : "
 #if HA_OPENSSL_VERSION_NUMBER < 0x00907000L
 		"no (library version too old)"
 #elif defined(OPENSSL_NO_TLSEXT)
@@ -7060,7 +7081,7 @@ static void ssl_register_build_options()
 #endif
 		"", ptr);
 
-	memprintf(&ptr, "%s\nOpenSSL library supports SNI : "
+	memprintf(&ptr, "%s\nSSL library supports SNI : "
 #ifdef SSL_CTRL_SET_TLSEXT_HOSTNAME
 		"yes"
 #else
@@ -7071,8 +7092,10 @@ static void ssl_register_build_options()
 #endif
 #endif
 	       "", ptr);
-
-	memprintf(&ptr, "%s\nOpenSSL library supports :", ptr);
+#if defined(USE_OPENSSL) && (HA_OPENSSL_VERSION_NUMBER < 0x3000000fL)
+	memprintf(&ptr, "%s\nSSL library FIPS mode : %s", ptr, FIPS_mode() ? "yes" : "no");
+#endif
+	memprintf(&ptr, "%s\nSSL library supports :", ptr);
 	for (i = CONF_TLSV_MIN; i <= CONF_TLSV_MAX; i++)
 		if (methodVersions[i].option)
 			memprintf(&ptr, "%s %s", ptr, methodVersions[i].name);
@@ -7159,7 +7182,7 @@ static void __ssl_sock_deinit(void)
 #endif
 	BIO_meth_free(ha_meth);
 
-#if !defined OPENSSL_NO_OCSP
+#if defined(HAVE_SSL_OCSP)
 	ssl_destroy_ocsp_update_task();
 #endif
 }

@@ -67,6 +67,37 @@ def determine_latest_aws_lc(ssl):
     latest_tag = max(valid_tags, key=aws_lc_version_string_to_num)
     return "AWS_LC_VERSION={}".format(latest_tag[1:])
 
+def aws_lc_fips_version_string_to_num(version_string):
+    return tuple(map(int, version_string[12:].split('.')))
+
+def aws_lc_fips_version_valid(version_string):
+    return re.match('^AWS-LC-FIPS-[0-9]+(\.[0-9]+)*$', version_string)
+
+@functools.lru_cache(5)
+def determine_latest_aws_lc_fips(ssl):
+    # the AWS-LC-FIPS tags are at the end of the list, so let's get a lot
+    tags = get_all_github_tags("https://api.github.com/repos/aws/aws-lc/tags?per_page=200")
+    if not tags:
+        return "AWS_LC_FIPS_VERSION=failed_to_detect"
+    valid_tags = list(filter(aws_lc_fips_version_valid, tags))
+    latest_tag = max(valid_tags, key=aws_lc_fips_version_string_to_num)
+    return "AWS_LC_FIPS_VERSION={}".format(latest_tag[12:])
+
+def wolfssl_version_string_to_num(version_string):
+    return tuple(map(int, version_string[1:].removesuffix('-stable').split('.')))
+
+def wolfssl_version_valid(version_string):
+    return re.match('^v[0-9]+(\.[0-9]+)*-stable$', version_string)
+
+@functools.lru_cache(5)
+def determine_latest_wolfssl(ssl):
+    tags = get_all_github_tags("https://api.github.com/repos/wolfssl/wolfssl/tags")
+    if not tags:
+        return "WOLFSSL_VERSION=failed_to_detect"
+    valid_tags = list(filter(wolfssl_version_valid, tags))
+    latest_tag = max(valid_tags, key=wolfssl_version_string_to_num)
+    return "WOLFSSL_VERSION={}".format(latest_tag[1:].removesuffix('-stable'))
+
 @functools.lru_cache(5)
 def determine_latest_libressl(ssl):
     try:
@@ -127,7 +158,6 @@ def main(ref_name):
                     "USE_PCRE2_JIT=1",
                     "USE_LUA=1",
                     "USE_OPENSSL=1",
-                    "USE_SYSTEMD=1",
                     "USE_WURFL=1",
                     "WURFL_INC=addons/wurfl/dummy",
                     "WURFL_LIB=addons/wurfl/dummy",
@@ -161,7 +191,6 @@ def main(ref_name):
                     "USE_PCRE2_JIT=1",
                     "USE_LUA=1",
                     "USE_OPENSSL=1",
-                    "USE_SYSTEMD=1",
                     "USE_WURFL=1",
                     "WURFL_INC=addons/wurfl/dummy",
                     "WURFL_LIB=addons/wurfl/dummy",
@@ -191,7 +220,7 @@ def main(ref_name):
             "OPENSSL_VERSION=1.1.1s",
             "QUICTLS=yes",
             "WOLFSSL_VERSION=5.7.0",
-            "AWS_LC_VERSION=1.29.0",
+            "AWS_LC_VERSION=1.39.0",
             # "BORINGSSL=yes",
         ]
 

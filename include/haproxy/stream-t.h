@@ -89,6 +89,7 @@
 #define SF_SRC_ADDR     0x00800000	/* get the source ip/port with getsockname */
 #define SF_BC_MARK      0x01000000	/* need to set specific mark on backend/srv conn upon connect */
 #define SF_BC_TOS       0x02000000	/* need to set specific tos on backend/srv conn upon connect */
+#define SF_RULE_FYIELD  0x04000000      /* s->current_rule set because of forced yield */
 
 /* This function is used to report flags in debugging tools. Please reflect
  * below any single-bit flag addition above in the same order via the
@@ -103,7 +104,8 @@ static forceinline char *strm_show_flags(char *buf, size_t len, const char *deli
 	_(0);
 	/* flags & enums */
 	_(SF_IGNORE_PRST, _(SF_SRV_REUSED, _(SF_SRV_REUSED_ANTICIPATED,
-	_(SF_WEBSOCKET, _(SF_SRC_ADDR, _(SF_BC_MARK, _(SF_BC_TOS)))))));
+	_(SF_WEBSOCKET, _(SF_SRC_ADDR, _(SF_BC_MARK, _(SF_BC_TOS,
+	_(SF_RULE_FYIELD))))))));
 
 	_e(SF_FINST_MASK, SF_FINST_R,    _e(SF_FINST_MASK, SF_FINST_C,
 	_e(SF_FINST_MASK, SF_FINST_H,    _e(SF_FINST_MASK, SF_FINST_D,
@@ -165,6 +167,18 @@ enum {
 	STRM_ENTITY_RULE      = 0x0001,
 	STRM_ENTITY_FILTER    = 0x0002,
 	STRM_ENTITY_WREQ_BODY = 0x0003,
+};
+
+/* All possible stream events handled by process_stream(). First ones are mapped
+ * from TASK_WOKEN_*.
+ */
+enum {
+	STRM_EVT_NONE          = 0x00000000, /* No events */
+	STRM_EVT_TIMER         = 0x00000001, /* A timer has expired */
+	STRM_EVT_MSG           = 0x00000002, /* A message event was triggered  */
+	STRM_EVT_SHUT_SRV_DOWN = 0x00000004, /* Must be shut because the selected server became available */
+	STRM_EVT_SHUT_SRV_UP   = 0x00000008, /* Must be shut because a preferred server became available */
+	STRM_EVT_KILLED        = 0x00000010, /* Must be shut for external reason */
 };
 
 /* This function is used to report flags in debugging tools. Please reflect
@@ -241,11 +255,13 @@ struct stream {
 	struct http_txn *txn;           /* current HTTP transaction being processed. Should become a list. */
 
 	struct task *task;              /* the task associated with this stream */
-	unsigned int pending_events;	/* the pending events not yet processed by the stream.
-					 * This is a bit field of TASK_WOKEN_* */
+	unsigned int pending_events;	/* the pending events not yet processed by the stream but handled by process_stream() */
+	unsigned int new_events;        /* the new events added since the previous wakeup (never seen by process_stream()). It is atomic field */
 	int conn_retries;               /* number of connect retries performed */
 	unsigned int conn_exp;          /* wake up time for connect, queue, turn-around, ... */
 	unsigned int conn_err_type;     /* first error detected, one of STRM_ET_* */
+
+	uint32_t rules_bcount;          /* number of rules evaluated since last yield */
 
 	struct stream *parent;          /* Pointer to the parent stream, if any. NULL most of time */
 
@@ -312,6 +328,7 @@ struct stream {
 	} waiting_entity;                       /* The entity waiting to continue its processing and interrupted by an error/timeout */
 
 	unsigned int stream_epoch;              /* copy of stream_epoch when the stream was created */
+	uint32_t term_evts_log;                 /* termination events log */
 	struct hlua *hlua[2];                   /* lua runtime context (0: global, 1: per-thread) */
 
 	/* Context */

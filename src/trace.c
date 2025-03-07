@@ -27,6 +27,7 @@
 #include <haproxy/istbuf.h>
 #include <haproxy/list.h>
 #include <haproxy/log.h>
+#include <haproxy/global.h>
 #include <haproxy/quic_conn-t.h>
 #include <haproxy/sink.h>
 #include <haproxy/trace.h>
@@ -97,7 +98,11 @@ int __trace_enabled(enum trace_level level, uint64_t mask, struct trace_source *
 	/* in case we also follow another one (e.g. session) */
 	origin = HA_ATOMIC_LOAD(&src->follow);
 
+	/* Trace can be temporarily disabled via trace_disable(). */
 	if (likely(src->state == TRACE_STATE_STOPPED) && !origin)
+		return 0;
+
+	if (th_ctx->trc_disable_ctr)
 		return 0;
 
 	/* check that at least one action is interested by this event */
@@ -344,11 +349,7 @@ void trace_no_cb(enum trace_level level, uint64_t mask, const struct trace_sourc
 	/* do nothing */
 }
 
-/* registers trace source <source>. Modifies the list element!
- * The {start,pause,stop,report} events are not changed so the source may
- * preset them.
- */
-void trace_register_source(struct trace_source *source)
+static void trace_source_reset(struct trace_source *source)
 {
 	source->lockon = TRACE_LOCKON_NOTHING;
 	source->level = TRACE_LEVEL_USER;
@@ -356,6 +357,16 @@ void trace_register_source(struct trace_source *source)
 	source->sink = NULL;
 	source->state = TRACE_STATE_STOPPED;
 	source->lockon_ptr = NULL;
+	source->cmdline = 0;
+}
+
+/* registers trace source <source>. Modifies the list element!
+ * The {start,pause,stop,report} events are not changed so the source may
+ * preset them.
+ */
+void trace_register_source(struct trace_source *source)
+{
+	trace_source_reset(source);
 	LIST_APPEND(&trace_sources, &source->source_link);
 }
 
@@ -469,6 +480,15 @@ static struct sink *_trace_get_sink(const char *name, char **msg,
 	return sink;
 }
 
+/* Returns true if <src> trace source configuration can be changed. */
+static int trace_enforce_origin_priority(const struct trace_source *src)
+{
+	/* Trace cannot be modified via configuration file (during startup) if
+	 * already activated via -dt command line argument.
+	 */
+	return !src->cmdline || !(global.mode & MODE_STARTING);
+}
+
 /* Parse a "trace" statement. Returns a severity as a LOG_* level and a status
  * message that may be delivered to the user, in <msg>. The message will be
  * nulled first and msg must be an allocated pointer. A null status message output
@@ -551,6 +571,9 @@ static int _trace_parse_statement(char **args, char **msg, const char *file, int
 		return LOG_ERR;
 	}
 
+	if (src && !trace_enforce_origin_priority(src))
+		goto out;
+
 	if (strcmp(args[cur_arg], "follow") == 0) {
 		const struct trace_source *origin = src ? HA_ATOMIC_LOAD(&src->follow) : NULL;
 
@@ -585,12 +608,15 @@ static int _trace_parse_statement(char **args, char **msg, const char *file, int
 			}
 		}
 
-		if (src)
+		if (src) {
 			HA_ATOMIC_STORE(&src->follow, origin);
-		else
-			list_for_each_entry(src, &trace_sources, source_link)
-				if (src != origin)
+		}
+		else {
+			list_for_each_entry(src, &trace_sources, source_link) {
+				if (src != origin && trace_enforce_origin_priority(src))
 					HA_ATOMIC_STORE(&src->follow, origin);
+			}
+		}
 		cur_arg += 2;
 		goto next_stmt;
 	}
@@ -708,11 +734,15 @@ static int _trace_parse_statement(char **args, char **msg, const char *file, int
 				return LOG_ERR;
 		}
 
-		if (src)
+		if (src) {
 			HA_ATOMIC_STORE(&src->sink, sink);
-		else
-			list_for_each_entry(src, &trace_sources, source_link)
-				HA_ATOMIC_STORE(&src->sink, sink);
+		}
+		else {
+			list_for_each_entry(src, &trace_sources, source_link) {
+				if (trace_enforce_origin_priority(src))
+					HA_ATOMIC_STORE(&src->sink, sink);
+			}
+		}
 
 		cur_arg += 2;
 		goto next_stmt;
@@ -746,11 +776,15 @@ static int _trace_parse_statement(char **args, char **msg, const char *file, int
 			return *name ? LOG_ERR : LOG_WARNING;
 		}
 
-		if (src)
+		if (src) {
 			HA_ATOMIC_STORE(&src->level, level);
-		else
-			list_for_each_entry(src, &trace_sources, source_link)
-				HA_ATOMIC_STORE(&src->level, level);
+		}
+		else {
+			list_for_each_entry(src, &trace_sources, source_link) {
+				if (trace_enforce_origin_priority(src))
+					HA_ATOMIC_STORE(&src->level, level);
+			}
+		}
 
 		cur_arg += 2;
 		goto next_stmt;
@@ -956,10 +990,12 @@ static int trace_parse_statement(char **args, char **msg)
 
 void _trace_parse_cmd(struct trace_source *src, int level, int verbosity)
 {
+	trace_source_reset(src);
 	src->sink = sink_find("stderr");
 	src->level = level >= 0 ? level : TRACE_LEVEL_ERROR;
 	src->verbosity = verbosity >= 0 ? verbosity : 1;
 	src->state = TRACE_STATE_RUNNING;
+	src->cmdline = 1;
 }
 
 /* Parse a process argument specified via "-dt".
@@ -973,11 +1009,29 @@ int trace_parse_cmd(const char *arg_src, char **errmsg)
 	char *saveptr;
 
 	if (arg_src) {
+		if (strcmp(arg_src, "help") == 0) {
+			memprintf(errmsg,
+			  "-dt activates traces on stderr output via the command-line.\n"
+			  "Without argument, all registered trace sources are activated with error level as filter.\n"
+			  "A list can be specified as argument to configure several trace sources with comma as separator.\n"
+			  "Each entry can contains the trace name, a log level and a verbosity using colon as separator.\n"
+			  "Every fields are optional and can be left empty, or with a colon to specify the next one.\n\n"
+			  "An empty name or the alias 'all' will activate all registered sources.\n"
+			  "Verbosity cannot be configured in this case except 'quiet' as their values are specific to each source.\n\n"
+			  "Examples:\n"
+			  "-dt           activate every sources on error level\n"
+			  "-dt all:user  activate every sources on user level\n"
+			  "-dt h1        activate HTTP/1 traces on error level\n"
+			  "-dt h2:data   activate HTTP/2 traces on data level\n"
+			  "-dt quic::clean,qmux::minimal\n    activate both QUIC transport and MUX traces on error level with their custom verbosity\n");
+			return -1;
+		}
+
 		/* keep a copy of the ptr for strtok */
 		oarg = arg = strdup(arg_src);
 		if (!arg) {
 			memprintf(errmsg, "Can't allocate !");
-			return 1;
+			return -2;
 		}
 	}
 
@@ -1007,12 +1061,12 @@ int trace_parse_cmd(const char *arg_src, char **errmsg)
 			str = NULL;
 		}
 
-		if (strlen(name)) {
+		if (strlen(name) && strcmp(name, "all") != 0) {
 			src = trace_find_source(name);
 			if (!src) {
 				memprintf(errmsg, "unknown trace source '%s'", name);
 				ha_free(&oarg);
-				return 1;
+				return -2;
 			}
 		}
 
@@ -1035,7 +1089,7 @@ int trace_parse_cmd(const char *arg_src, char **errmsg)
 			if (level < 0) {
 				memprintf(errmsg, "no such trace level '%s', available levels are 'error', 'user', 'proto', 'state', 'data', and 'developer'", field);
 				ha_free(&oarg);
-				return 1;
+				return -2;
 			}
 		}
 
@@ -1045,9 +1099,9 @@ int trace_parse_cmd(const char *arg_src, char **errmsg)
 		/* 3. verbosity */
 		field = str;
 		if (strchr(field, ':')) {
-			memprintf(errmsg, "too many double-colon separators in trace definition");
+			memprintf(errmsg, "too many colon separators in trace definition");
 			ha_free(&oarg);
-			return 1;
+			return -2;
 		}
 
 		verbosity = trace_source_parse_verbosity(src, field);
@@ -1064,7 +1118,7 @@ int trace_parse_cmd(const char *arg_src, char **errmsg)
 			}
 
 			ha_free(&oarg);
-			return 1;
+			return -2;
 		}
 
  parse:

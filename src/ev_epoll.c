@@ -16,6 +16,7 @@
 
 #include <haproxy/activity.h>
 #include <haproxy/api.h>
+#include <haproxy/cfgparse.h>
 #include <haproxy/clock.h>
 #include <haproxy/fd.h>
 #include <haproxy/global.h>
@@ -28,6 +29,7 @@
 /* private data */
 static THREAD_LOCAL struct epoll_event *epoll_events = NULL;
 static int epoll_fd[MAX_THREADS] __read_mostly; // per-thread epoll_fd
+static uint epoll_mask = 0; // events to be masked and turned to EPOLLIN
 
 #ifndef EPOLLRDHUP
 /* EPOLLRDHUP was defined late in libc, and it appeared in kernel 2.6.17 */
@@ -65,6 +67,14 @@ static void __fd_clo(int fd)
 			if (m & ha_thread_info[i].ltid_bit)
 				epoll_ctl(epoll_fd[i], EPOLL_CTL_DEL, fd, &ev);
 	}
+}
+
+static void _do_fixup_tgid_takeover(struct poller *poller, const int fd, const int old_ltid, const int old_tgid)
+{
+
+	polled_mask[fd].poll_recv = 0;
+	polled_mask[fd].poll_send = 0;
+	fdtab[fd].update_mask = 0;
 }
 
 static void _update_fd(int fd)
@@ -150,8 +160,16 @@ static void _update_fd(int fd)
 		ev.events |= EPOLLOUT;
 
  done:
-	ev.data.fd = fd;
-	epoll_ctl(epoll_fd[tid], opcode, fd, &ev);
+	ev.events &= ~epoll_mask;
+	ev.data.u64 = ((u64)fdtab[fd].generation << 32) + fd;
+	if (epoll_ctl(epoll_fd[tid], opcode, fd, &ev) != 0) {
+		if (opcode == EPOLL_CTL_ADD && errno == EEXIST) {
+			BUG_ON(epoll_ctl(epoll_fd[tid], EPOLL_CTL_DEL, fd, &ev) != 0);
+			BUG_ON(epoll_ctl(epoll_fd[tid], EPOLL_CTL_ADD, fd, &ev) != 0);
+		} else {
+			BUG_ON(1, "epoll_ctl() failed when it should not");
+		}
+	}
 }
 
 /*
@@ -249,9 +267,63 @@ static void _do_poll(struct poller *p, int exp, int wake)
 
 	for (count = 0; count < status; count++) {
 		unsigned int n, e;
+		uint64_t epoll_data;
+		uint ev_gen, fd_gen;
 
 		e = epoll_events[count].events;
-		fd = epoll_events[count].data.fd;
+		epoll_data = epoll_events[count].data.u64;
+
+		/* epoll_data contains the fd's generation in the 32 upper bits
+		 * and the fd in the 32 lower ones.
+		 */
+		fd = (uint32_t)epoll_data;
+		ev_gen = epoll_data >> 32;
+		fd_gen = _HA_ATOMIC_LOAD(&fdtab[fd].generation);
+
+		if (unlikely(ev_gen != fd_gen)) {
+			/* this is a stale report for an older instance of this FD,
+			 * we must ignore it.
+			 */
+
+			if (_HA_ATOMIC_LOAD(&fdtab[fd].owner)) {
+				ulong tmask = _HA_ATOMIC_LOAD(&fdtab[fd].thread_mask);
+				if (!(tmask & ti->ltid_bit)) {
+					/* thread has change. quite common, that's already handled
+					 * by fd_update_events(), let's just report sensitivive
+					 * events for statistics purposes.
+					 */
+					if (e & (EPOLLRDHUP|EPOLLHUP|EPOLLERR))
+						COUNT_IF(1, "epoll report of HUP/ERR on a stale fd reopened on another thread (harmless)");
+				} else {
+					/* same thread but different generation, this smells bad,
+					 * maybe that could be caused by crossed takeovers with a
+					 * close() in between or something like this, but this is
+					 * something fd_update_events() cannot detect. It still
+					 * remains relatively safe for HUP because we consider it
+					 * once we've read all pending data.
+					 */
+					if (e & EPOLLERR)
+						COUNT_IF(1, "epoll report of ERR on a stale fd reopened on the same thread (suspicious)");
+					else if (e & (EPOLLRDHUP|EPOLLHUP))
+						COUNT_IF(1, "epoll report of HUP on a stale fd reopened on the same thread (suspicious)");
+					else
+						COUNT_IF(1, "epoll report of a harmless event on a stale fd reopened on the same thread (suspicious)");
+				}
+			} else if (ev_gen + 1 != fd_gen) {
+				COUNT_IF(1, "epoll report of event on a closed recycled fd (rare)");
+			} else {
+				COUNT_IF(1, "epoll report of event on a just closed fd (harmless)");
+			}
+			continue;
+		} else if (fd_tgid(fd) != tgid) {
+			struct epoll_event ev;
+			/*
+			 * We've been taken over by another thread from
+			 * another thread group, give up.
+			 */
+			epoll_ctl(epoll_fd[tid], EPOLL_CTL_DEL, fd, &ev);
+			continue;
+                }
 
 		if ((e & EPOLLRDHUP) && !(cur_poller.flags & HAP_POLL_F_RDHUP))
 			_HA_ATOMIC_OR(&cur_poller.flags, HAP_POLL_F_RDHUP);
@@ -259,6 +331,11 @@ static void _do_poll(struct poller *p, int exp, int wake)
 #ifdef DEBUG_FD
 		_HA_ATOMIC_INC(&fdtab[fd].event_count);
 #endif
+		if (e & epoll_mask) {
+			e |= EPOLLIN;
+			e &= ~epoll_mask;
+		}
+
 		n = ((e & EPOLLIN)    ? FD_EV_READY_R : 0) |
 		    ((e & EPOLLOUT)   ? FD_EV_READY_W : 0) |
 		    ((e & EPOLLRDHUP) ? FD_EV_SHUT_R  : 0) |
@@ -402,8 +479,46 @@ static void _do_register(void)
 	p->term = _do_term;
 	p->poll = _do_poll;
 	p->fork = _do_fork;
+	p->fixup_tgid_takeover = _do_fixup_tgid_takeover;
 }
 
+/* config parser for global "tune.epoll.mask-events", accepts "err", "hup", "rdhup" */
+static int cfg_parse_tune_epoll_mask_events(char **args, int section_type, struct proxy *curpx,
+                                            const struct proxy *defpx, const char *file, int line,
+                                            char **err)
+{
+	char *comma, *kw;
+
+	if (too_many_args(1, args, err, NULL))
+		return -1;
+
+	epoll_mask = 0;
+	for (kw = args[1]; kw && *kw; kw = comma) {
+		comma = strchr(kw, ',');
+		if (comma)
+			*(comma++) = 0;
+
+		if (strcmp(kw, "err") == 0)
+			epoll_mask |= EPOLLERR;
+		else if (strcmp(kw, "hup") == 0)
+			epoll_mask |= EPOLLHUP;
+		else if (strcmp(kw, "rdhup") == 0)
+			epoll_mask |= EPOLLRDHUP;
+		else {
+			memprintf(err, "'%s' expects a comma-delimited list of 'err', 'hup' and 'rdhup' but got '%s'.", args[0], kw);
+			return -1;
+		}
+	}
+	return 0;
+}
+
+/* config keyword parsers */
+static struct cfg_kw_list cfg_kws = {ILH, {
+	{ CFG_GLOBAL, "tune.epoll.mask-events",   cfg_parse_tune_epoll_mask_events },
+	{ 0, NULL, NULL }
+}};
+
+INITCALL1(STG_REGISTER, cfg_register_keywords, &cfg_kws);
 INITCALL0(STG_REGISTER, _do_register);
 
 

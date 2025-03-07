@@ -45,15 +45,19 @@
 #include <haproxy/uri_auth-t.h>
 #include <haproxy/http_ext-t.h>
 
-/* values for proxy->mode */
+/* values for proxy->mode, only one value per proxy.
+ *
+ * values are bitfield compatible so that functions may
+ * take a bitfield of compatible modes as parameter
+ */
 enum pr_mode {
-	PR_MODE_TCP = 0,
-	PR_MODE_HTTP,
-	PR_MODE_CLI,
-	PR_MODE_SYSLOG,
-	PR_MODE_PEERS,
-	PR_MODE_SPOP,
-	PR_MODES
+	PR_MODES       = 0x00,
+	PR_MODE_TCP    = 0x01,
+	PR_MODE_HTTP   = 0x02,
+	PR_MODE_CLI    = 0x04,
+	PR_MODE_SYSLOG = 0x08,
+	PR_MODE_PEERS  = 0x10,
+	PR_MODE_SPOP   = 0x20,
 } __attribute__((packed));
 
 enum PR_SRV_STATE_FILE {
@@ -151,7 +155,12 @@ enum PR_SRV_STATE_FILE {
 #define PR_O2_RSTRICT_REQ_HDR_NAMES_DEL  0x00800000 /* remove request header names containing chars outside of [0-9a-zA-Z-] charset */
 #define PR_O2_RSTRICT_REQ_HDR_NAMES_NOOP 0x01000000 /* preserve request header names containing chars outside of [0-9a-zA-Z-] charset */
 #define PR_O2_RSTRICT_REQ_HDR_NAMES_MASK 0x01c00000 /* mask for restrict-http-header-names option */
-/* unused : 0x0000000..0x80000000 */
+
+/* bits for log-forward proxies */
+#define PR_O2_DONTPARSELOG       0x02000000 /* don't parse log messages */
+#define PR_O2_ASSUME_RFC6587_NTF 0x04000000 /* assume that we are going to receive just non-transparent framing messages */
+
+/* unused : 0x08000000 */
 
 /* server health checks */
 #define PR_O2_CHK_NONE  0x00000000      /* no L7 health checks configured (TCP by default) */
@@ -192,17 +201,18 @@ enum PR_SRV_STATE_FILE {
 #define PR_RE_403                 0x00000010 /* Retry if we got a 403 */
 #define PR_RE_404                 0x00000020 /* Retry if we got a 404 */
 #define PR_RE_408                 0x00000040 /* Retry if we got a 408 */
-#define PR_RE_425                 0x00000080 /* Retry if we got a 425 */
-#define PR_RE_429                 0x00000100 /* Retry if we got a 429 */
-#define PR_RE_500                 0x00000200 /* Retry if we got a 500 */
-#define PR_RE_501                 0x00000400 /* Retry if we got a 501 */
-#define PR_RE_502                 0x00000800 /* Retry if we got a 502 */
-#define PR_RE_503                 0x00001000 /* Retry if we got a 503 */
-#define PR_RE_504                 0x00002000 /* Retry if we got a 504 */
+#define PR_RE_421                 0x00000080 /* Retry if we got a 421 */
+#define PR_RE_425                 0x00000100 /* Retry if we got a 425 */
+#define PR_RE_429                 0x00000200 /* Retry if we got a 429 */
+#define PR_RE_500                 0x00000400 /* Retry if we got a 500 */
+#define PR_RE_501                 0x00000800 /* Retry if we got a 501 */
+#define PR_RE_502                 0x00001000 /* Retry if we got a 502 */
+#define PR_RE_503                 0x00002000 /* Retry if we got a 503 */
+#define PR_RE_504                 0x00004000 /* Retry if we got a 504 */
 #define PR_RE_STATUS_MASK         (PR_RE_401 | PR_RE_403 | PR_RE_404 | \
-                                   PR_RE_408 | PR_RE_425 | PR_RE_429 | \
-                                   PR_RE_500 | PR_RE_501 | PR_RE_502 | \
-                                   PR_RE_503 | PR_RE_504)
+                                   PR_RE_408 | PR_RE_421 | PR_RE_425 | \
+                                   PR_RE_429 | PR_RE_500 | PR_RE_501 | \
+                                   PR_RE_502 | PR_RE_503 | PR_RE_504)
 /* 0x00000800, 0x00001000, 0x00002000, 0x00004000 and 0x00008000 unused,
  * reserved for eventual future status codes
  */
@@ -270,6 +280,11 @@ struct error_snapshot {
 	char buf[VAR_ARRAY];                    /* copy of the beginning of the message for bufsize bytes */
 };
 
+/* Each proxy will have one occurence of this structure per thread group */
+struct proxy_per_tgroup {
+	struct queue queue;
+} THREAD_ALIGNED(64);
+
 struct proxy {
 	enum obj_type obj_type;                 /* object type == OBJ_TYPE_PROXY */
 	char flags;                             /* bit field PR_FL_* */
@@ -316,6 +331,7 @@ struct proxy {
 	int srv_act, srv_bck;			/* # of servers eligible for LB (UP|!checked) AND (enabled+weight!=0) */
 	int served;				/* # of active sessions currently being served */
 	int  cookie_len;			/* strlen(cookie_name), computed only once */
+	struct server *ready_srv;		/* a server being ready to serve requests */
 	char *cookie_domain;			/* domain used to insert the cookie */
 	char *cookie_name;			/* name of the cookie to look for */
 	char *cookie_attrs;                     /* list of attributes to add to the cookie */
@@ -355,7 +371,8 @@ struct proxy {
 	__decl_thread(HA_RWLOCK_T lock);        /* may be taken under the server's lock */
 
 	char *id, *desc;			/* proxy id (name) and description */
-	struct queue queue;			/* queued requests (pendconns) */
+	struct proxy_per_tgroup *per_tgrp;	/* array of per-tgroup stuff such as queues */
+	unsigned int queueslength;		/* Sum of the length of each queue */
 	int totpend;				/* total number of pending connections on this instance (for stats) */
 	unsigned int feconn, beconn;		/* # of active frontend and backends streams */
 	unsigned int fe_sps_lim;		/* limit on new sessions per second on the frontend */
@@ -518,8 +535,10 @@ struct redirect_rule {
 	struct lf_expr rdr_fmt;
 	int code;
 	unsigned int flags;
-	int cookie_len;
-	char *cookie_str;
+	union {
+		struct ist str;     /* the cookie is a string  */
+		struct lf_expr fmt; /* or a log-format string (possible for set-cookie only) */
+	} cookie;
 };
 
 /* some of the most common options which are also the easiest to handle */

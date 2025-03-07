@@ -193,6 +193,12 @@ static inline int thread_has_tasks(void)
 		(int)!MT_LIST_ISEMPTY(&th_ctx->shared_tasklet_list));
 }
 
+/* returns the most recent known date of the task's call from the scheduler */
+static inline uint64_t task_mono_time(void)
+{
+	return th_ctx->sched_call_date;
+}
+
 /* puts the task <t> in run queue with reason flags <f>, and returns <t> */
 /* This will put the task in the local runqueue if the task is only runnable
  * by the current thread, in the global runqueue otherwies. With DEBUG_TASK,
@@ -367,13 +373,18 @@ static inline void task_set_thread(struct task *t, int thr)
  * at least once scheduled on a specific thread. With DEBUG_TASK, the
  * <file>:<line> from the call place are stored into the tasklet for tracing
  * purposes.
+ *
+ * The macro accepts an optional 3rd argument that is passed as a set of flags
+ * to be set on the tasklet, among TASK_WOKEN_*, TASK_F_UEVT* etc to indicate a
+ * wakeup cause to the tasklet. When not set, the arg defaults to zero (i.e. no
+ * flag is added).
  */
-#define tasklet_wakeup_on(tl, thr) \
-	_tasklet_wakeup_on(tl, thr, MK_CALLER(WAKEUP_TYPE_TASKLET_WAKEUP, 0, 0))
+#define tasklet_wakeup_on(tl, thr, ...)					\
+	_tasklet_wakeup_on(tl, thr, DEFVAL(TASK_WOKEN_OTHER, ##__VA_ARGS__), MK_CALLER(WAKEUP_TYPE_TASKLET_WAKEUP, 0, 0))
 
-static inline void _tasklet_wakeup_on(struct tasklet *tl, int thr, const struct ha_caller *caller)
+static inline void _tasklet_wakeup_on(struct tasklet *tl, int thr, uint f, const struct ha_caller *caller)
 {
-	unsigned int state = tl->state;
+	unsigned int state = _HA_ATOMIC_OR_FETCH(&tl->state, f);
 
 	do {
 		/* do nothing if someone else already added it */
@@ -399,9 +410,14 @@ static inline void _tasklet_wakeup_on(struct tasklet *tl, int thr, const struct 
  * is either its owner thread if >= 0 or the current thread if < 0. When
  * DEBUG_TASK is set, the <file>:<line> from the call place are stored into the
  * task for tracing purposes.
+ *
+ * The macro accepts an optional 3rd argument that is passed as a set of flags
+ * to be set on the tasklet, among TASK_WOKEN_*, TASK_F_UEVT* etc to indicate a
+ * wakeup cause to the tasklet. When not set, the arg defaults to zero (i.e. no
+ * flag is added).
  */
-#define tasklet_wakeup(tl) \
-	_tasklet_wakeup_on(tl, (tl)->tid, MK_CALLER(WAKEUP_TYPE_TASKLET_WAKEUP, 0, 0))
+#define tasklet_wakeup(tl, ...)						\
+	_tasklet_wakeup_on(tl, (tl)->tid, DEFVAL(TASK_WOKEN_OTHER, ##__VA_ARGS__), MK_CALLER(WAKEUP_TYPE_TASKLET_WAKEUP, 0, 0))
 
 /* instantly wakes up task <t> on its owner thread even if it's not the current
  * one, bypassing the run queue. The purpose is to be able to avoid contention
@@ -460,14 +476,22 @@ static inline void _task_instant_wakeup(struct task *t, unsigned int f, const st
  * thread will be used.
  * With DEBUG_TASK, the <file>:<line> from the call place are stored into the tasklet
  * for tracing purposes.
+ *
+ * The macro accepts an optional 3rd argument that is passed as a set of flags
+ * to be set on the tasklet, among TASK_WOKEN_*, TASK_F_UEVT* etc to indicate a
+ * wakeup cause to the tasklet. When not set, the arg defaults to
+ * TASK_WOKEN_OTHER, so that tasklets can differentiate a unique explicit wakeup
+ * cause from a wakeup cause combined with other implicit ones. I.e. that may be
+ * used by muxes to decide whether or not to perform a short path for certain
+ * operations, or a complete one that also covers regular I/O.
  */
-#define tasklet_wakeup_after(head, tl) \
-	_tasklet_wakeup_after(head, tl, MK_CALLER(WAKEUP_TYPE_TASKLET_WAKEUP_AFTER, 0, 0))
+#define tasklet_wakeup_after(head, tl, ...)					\
+	_tasklet_wakeup_after(head, tl, DEFVAL(TASK_WOKEN_OTHER, ##__VA_ARGS__), MK_CALLER(WAKEUP_TYPE_TASKLET_WAKEUP_AFTER, 0, 0))
 
 static inline struct list *_tasklet_wakeup_after(struct list *head, struct tasklet *tl,
-                                                 const struct ha_caller *caller)
+                                                 uint f, const struct ha_caller *caller)
 {
-	unsigned int state = tl->state;
+	unsigned int state = _HA_ATOMIC_OR_FETCH(&tl->state, f);
 
 	do {
 		/* do nothing if someone else already added it */

@@ -1,7 +1,7 @@
                              ------------------------
                              HAProxy Management Guide
                              ------------------------
-                                   version 3.1
+                                   version 3.2
 
 
 This document describes how to start, stop, manage, and troubleshoot HAProxy,
@@ -191,8 +191,6 @@ list of options is :
     recommended to use this mode with multiprocess and systemd.
 
   -Ws : master-worker mode with support of `notify` type of systemd service.
-    This option is only available when HAProxy was built with `USE_SYSTEMD`
-    build option enabled.
 
   -c : only performs a check of the configuration files and exits before trying
     to bind. The exit status is zero if everything is OK, or non-zero if an
@@ -1871,6 +1869,9 @@ clear table <table> [ data.<type> <operator> <value> ] | [ key <key> ] |
   the entry cannot be matched using the key due to empty key or incompatible
   characters on the cli.
 
+  If data.<type> is an array type, "[]" may be used to access a specific
+  index in the array, like so: data.gpt[1]
+
   Example :
         $ echo "show table http_proxy" | socat stdio /tmp/sock1
     >>> # table: http_proxy, type: ip, size:204800, used:2
@@ -2627,6 +2628,9 @@ set table <table> ptr <ptr> [data.<data_type> <value>]*
   pointer may be relevant if the entry cannot be matched using the key due to
   empty key or incompatible characters on the cli.
 
+  If data.<data_type> is an array type, "[]" may be used to access a specific
+  index in the array, like so: data.gpt[1]
+
 set timeout cli <delay>
   Change the CLI interface timeout for current connection. This can be useful
   during long debugging sessions where the user needs to constantly inspect
@@ -2822,14 +2826,14 @@ show env [<name>]
   can only be issued on sockets configured for levels "operator" or "admin".
 
 show errors [<iid>|<proxy>] [request|response]
-  Dump last known request and response errors collected by frontends and
-  backends. If <iid> is specified, the limit the dump to errors concerning
-  either frontend or backend whose ID is <iid>. Proxy ID "-1" will cause
-  all instances to be dumped. If a proxy name is specified instead, its ID
-  will be used as the filter. If "request" or "response" is added after the
-  proxy name or ID, only request or response errors will be dumped. This
-  command is restricted and can only be issued on sockets configured for
-  levels "operator" or "admin".
+  Dump last known HTTP/1.x request and response errors collected by frontends
+  and backends. If <iid> is specified, the limit the dump to errors concerning
+  either frontend or backend whose ID is <iid>. Proxy ID "-1" will cause all
+  instances to be dumped. If a proxy name is specified instead, its ID will be
+  used as the filter. If "request" or "response" is added after the proxy name
+  or ID, only request or response errors will be dumped. This command is
+  restricted and can only be issued on sockets configured for levels "operator"
+  or "admin".
 
   The errors which may be collected are the last request and response errors
   caused by protocol violations, often due to invalid characters in header
@@ -3197,7 +3201,8 @@ show quic [<format>] [<filter>]
   values, "oneline" for the default format and "full" to display all
   information. Alternatively, a list of comma-delimited fields can be specified
   to restrict output. Currently supported values are "tp", "sock", "pktns",
-  "cc" and "mux".
+  "cc" and "mux". Finally, "help" in the format will instead show a more
+  detailed help message.
 
   The final argument is used to restrict or extend the connection list. By
   default, connections on closing or draining state are not displayed. Use the
@@ -3321,7 +3326,7 @@ show servers state [<backend>]
      srv_agent_addr:              Server health agent address.
      srv_agent_port:              Server health agent port.
 
-show sess
+show sess [<options>*]
   Dump all known active streams (formerly called "sessions"). Avoid doing this
   on slow connections as this can be huge. This command is restricted and can
   only be issued on sockets configured for levels "operator" or "admin". Note
@@ -3329,8 +3334,9 @@ show sess
   output reports less entries than really exist because it will dump all
   existing streams up to the last one that was created before the command was
   entered; those which die in the mean time will not appear.
+  For supported opitons, see below.
 
-show sess <id> | older <age> | susp | all
+show sess [<id> | older <age> | susp | all] [<options>*]
   Display a lot of internal information about the matching streams. In the
   first form, only the stream matching the specified stream identifier will
   be shown. This identifier is the first field at the beginning of the lines in
@@ -3346,6 +3352,14 @@ show sess <id> | older <age> | susp | all
   documented so that it can freely evolve depending on demands. This output
   is meant to be interpreted while checking function strm_dump_to_buffer() in
   src/stream.c to figure the exact meaning of certain fields.
+
+  It is possible to set some options to customize the dump. Here are the
+  supported options:
+
+    - show-uri: Dump the transaction URI, as captured during the request
+      analysis. It is only displayed if it was captured.
+
+    - help:     dump a more detailed help message instead
 
 show stat [domain <resolvers|proxy>] [{<iid>|<proxy>} <type> <sid>] \
           [typed|json] [desc] [up|no-maint]
@@ -3515,7 +3529,7 @@ show stat [domain <resolvers|proxy>] [{<iid>|<proxy>} <type> <sid>] \
   $ echo "show stat json" | socat /var/run/haproxy.sock stdio | \
     python -m json.tool
 
-show ssl ca-file [<cafile>[:<index>]]
+show ssl ca-file [[*][\]<cafile>[:<index>]]
   Display the list of CA files loaded into the process and their respective
   certificate counts. The certificates are not used by any frontend or backend
   until their status is "Used".
@@ -3532,7 +3546,8 @@ show ssl ca-file [<cafile>[:<index>]]
   If the index is invalid (too big for instance), nothing will be displayed.
   This command can be useful to check if a CA file was properly updated.
   You can also display the details of an ongoing transaction by prefixing the
-  filename by an asterisk.
+  filename by a '*'. If the first character of the filename is a '*', it can be
+  escaped with '\*'.
 
   Example :
 
@@ -3564,14 +3579,15 @@ show ssl ca-file [<cafile>[:<index>]]
     Serial: 587A1CE5ED855040A0C82BF255FF300ADB7C8136
     [...]
 
-show ssl cert [<filename>]
+show ssl cert [[*][\]<filename>]
   Display the list of certificates loaded into the process. They are not used
   by any frontend or backend until their status is "Used".
   If a filename is prefixed by an asterisk, it is a transaction which is not
   committed yet. If a filename is specified, it will show details about the
   certificate. This command can be useful to check if a certificate was well
   updated. You can also display details on a transaction by prefixing the
-  filename by an asterisk.
+  filename by a '*'. If the first character of the filename is a '*', it can be
+  escaped with '\*'.
   This command can also be used to display the details of a certificate's OCSP
   response by suffixing the filename with a ".ocsp" extension. It works for
   committed certificates as well as for ongoing transactions. On a committed
@@ -3603,7 +3619,12 @@ show ssl cert [<filename>]
     Status: Unused
     [...]
 
-show ssl crl-file [<crlfile>[:<index>]]
+    $ echo "@1 show ssl cert \*.local.pem" | socat /var/run/haproxy.master -
+    Filename: *.local.pem
+    Status: Used
+    [...]
+
+show ssl crl-file [[*][\]<crlfile>[:<index>]]
   Display the list of CRL files loaded into the process. They are not used
   by any frontend or backend until their status is "Used".
   If a filename is prefixed by an asterisk, it is a transaction which is not
@@ -3616,7 +3637,8 @@ show ssl crl-file [<crlfile>[:<index>]]
   If the index is invalid (too big for instance), nothing will be displayed.
   This command can be useful to check if a CRL file was properly updated.
   You can also display the details of an ongoing transaction by prefixing the
-  filename by an asterisk.
+  filename by a '*'. If the first character of the filename is a '*', it can be
+  escaped with '\*'.
 
   Example :
 
@@ -3753,6 +3775,48 @@ show ssl providers
         - fips
         - base
 
+show ssl sni [-f <frontend>] [-A]
+  Dump every SNI configured for the designated frontend, or all frontends if no
+  frontend was specified. It allows to see what SNI are offered for a frontend,
+  and to identify if a SNI is defined multiple times by multiple certificates for
+  the same frontend.
+
+  The -A option allows to filter the list and only displays the certificates
+  that are past the notAfter date, allowing to show only expired certificates.
+
+  Columns are separated by a single \t, allowing to parse it simply.
+
+  The 'Frontend/Bind' column shows the frontend name followed by the bind line
+  position in the configuration (frontend/file:linenum).
+
+  The 'SNI' column shows the SNI, it can be either a CN, a SAN or a filter from a crt-list.
+  The default certificates of a bind line, (which are either declared
+  explicitely by 'default-crt' or is implicitely the first certificate of a bind
+  line when no 'strict-sni' is used) shows the '*' character in the SNI column.
+
+  The 'Negative Filter' column is the list of negative filters associated to a
+  wildcard, this will show all negatives filters that are on the same crt-list
+  line. A dash character is displayed if there are none.
+
+  The 'Type' column shows the encryption algorithm type, it can be "rsa", "ecdsa" or "dsa".
+
+  The 'Filename' column can be either a filename from the configuration, or an
+  alias declared in a crt-store.
+
+  The 'NotAfter' and 'NotBefore' columns are directly extracted from the X509
+  leaf certificate.
+
+  Example:
+    $ echo "@1 show ssl sni" | socat /var/run/haproxy-master.sock - | column -t -s $'\t'
+    # Frontend/Bind        SNI        Negative Filter  Type   Filename             NotAfter                  NotBefore
+    li1/haproxy.cfg:10021  *.ex.lan   !m1.ex.lan       rsa    example.lan.pem      Jun 13 13:37:21 2024 GMT  May 14 13:37:21 2024 GMT
+    li1/haproxy.cfg:10021  machine10  -                ecdsa  machine10.pem.ecdsa  Jun 13 13:37:21 2024 GMT  May 14 13:37:21 2024 GMT
+    li1/haproxy.cfg:10021  machine10  -                rsa    machine10.pem.rsa    Jun 13 13:37:21 2024 GMT  May 14 13:37:21 2024 GMT
+    li1/haproxy.cfg:10021  machine10  -                ecdsa  machine10.pem.ecdsa  Jun 13 13:37:21 2024 GMT  May 14 13:37:21 2024 GMT
+    li1/haproxy.cfg:10021  localhost  -                rsa    localhost.pem.rsa    Jun 13 13:37:11 2024 GMT  May 14 13:37:11 2024 GMT
+    li1/haproxy.cfg:10021  localhost  -                ecdsa  localhost.pem.ecdsa  Jun 13 13:37:10 2024 GMT  May 14 13:37:10 2024 GMT
+    li1/haproxy.cfg:10021  *          -                rsa    localhost.pem.rsa    Jun 13 13:37:11 2024 GMT  May 14 13:37:11 2024 GMT
+
 show startup-logs
   Dump all messages emitted during the startup of the current haproxy process,
   each startup-logs buffer is unique to its haproxy worker.
@@ -3803,6 +3867,9 @@ show table <name> [ data.<type> <operator> <value> [data.<type> ...]] |
   "show table" command. Matching an entry using its pointer may be relevant if
   the entry cannot be matched using the key due empty key or incompatible
   characters on the cli.
+
+  If data.<type> is an array type, "[]" may be used to access a specific
+  index in the array, like so: data.gpt[1]
 
   Example :
         $ echo "show table http_proxy" | socat stdio /tmp/sock1
@@ -4532,17 +4599,17 @@ connections are handled in parallel, though the "debug2ansi" and "debug2html"
 scripts found in the examples/ directory definitely help here by coloring the
 output.
 
-If a request or response is rejected because HAProxy finds it is malformed, the
-best thing to do is to connect to the CLI and issue "show errors", which will
-report the last captured faulty request and response for each frontend and
-backend, with all the necessary information to indicate precisely the first
-character of the input stream that was rejected. This is sometimes needed to
-prove to customers or to developers that a bug is present in their code. In this
-case it is often possible to relax the checks (but still keep the captures)
-using "option accept-unsafe-violations-in-http-request" or its equivalent for
-responses coming from the server "option
-accept-unsafe-violations-in-http-response". Please see the configuration manual
-for more details.
+If a HTTP/1.x request or response is rejected because HAProxy finds it is
+malformed, the best thing to do is to connect to the CLI and issue "show
+errors", which will report the last captured faulty HTTP/1.x request and
+response for each frontend and backend, with all the necessary information to
+indicate precisely the first character of the input stream that was
+rejected. This is sometimes needed to prove to customers or to developers that a
+bug is present in their code. In this case it is often possible to relax the
+checks (but still keep the captures) using "option
+accept-unsafe-violations-in-http-request" or its equivalent for responses coming
+from the server "option accept-unsafe-violations-in-http-response". Please see
+the configuration manual for more details.
 
 Example :
 

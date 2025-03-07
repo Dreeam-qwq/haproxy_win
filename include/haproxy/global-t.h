@@ -109,6 +109,13 @@ enum {
 	SSL_SERVER_VERIFY_REQUIRED = 1,
 };
 
+/* Takeover across thread groups */
+enum threadgroup_takeover {
+	NO_THREADGROUP_TAKEOVER = 0,
+	RESTRICTED_THREADGROUP_TAKEOVER = 1,
+	FULL_THREADGROUP_TAKEOVER = 2,
+};
+
 /* bit values to go with "warned" above */
 #define WARN_ANY                    0x00000001 /* any warning was emitted */
 #define WARN_FORCECLOSE_DEPRECATED  0x00000002
@@ -161,24 +168,25 @@ struct global {
 	unsigned char cluster_secret[16]; /* 128 bits of an SHA1 digest of a secret defined as ASCII string */
 	struct {
 		int maxpollevents; /* max number of poll events at once */
+		int max_rules_at_once; /* max number of rules excecuted in a single evaluation loop */
 		int maxaccept;     /* max number of consecutive accept() */
 		int options;       /* various tuning options */
 		int runqueue_depth;/* max number of tasks to run at once */
-		int recv_enough;   /* how many input bytes at once are "enough" */
-		int bufsize;       /* buffer size in bytes, defaults to BUFSIZE */
-		int bufsize_small; /* small buffer size in bytes */
+		uint recv_enough;  /* how many input bytes at once are "enough" */
+		uint bufsize;      /* buffer size in bytes, defaults to BUFSIZE */
+		uint bufsize_small;/* small buffer size in bytes */
 		int maxrewrite;    /* buffer max rewrite size in bytes, defaults to MAXREWRITE */
 		int reserved_bufs; /* how many buffers can only be allocated for response */
 		int buf_limit;     /* if not null, how many total buffers may only be allocated */
-		int client_sndbuf; /* set client sndbuf to this value if not null */
-		int client_rcvbuf; /* set client rcvbuf to this value if not null */
-		int server_sndbuf; /* set server sndbuf to this value if not null */
-		int server_rcvbuf; /* set server rcvbuf to this value if not null */
-		int frontend_sndbuf; /* set frontend dgram sndbuf to this value if not null */
-		int frontend_rcvbuf; /* set frontend dgram rcvbuf to this value if not null */
-		int backend_sndbuf;  /* set backend dgram sndbuf to this value if not null */
-		int backend_rcvbuf;  /* set backend dgram rcvbuf to this value if not null */
-		int pipesize;      /* pipe size in bytes, system defaults if zero */
+		uint client_sndbuf;   /* set client sndbuf to this value if not null */
+		uint client_rcvbuf;   /* set client rcvbuf to this value if not null */
+		uint server_sndbuf;   /* set server sndbuf to this value if not null */
+		uint server_rcvbuf;   /* set server rcvbuf to this value if not null */
+		uint frontend_sndbuf; /* set frontend dgram sndbuf to this value if not null */
+		uint frontend_rcvbuf; /* set frontend dgram rcvbuf to this value if not null */
+		uint backend_sndbuf;  /* set backend dgram sndbuf to this value if not null */
+		uint backend_rcvbuf;  /* set backend dgram rcvbuf to this value if not null */
+		uint pipesize;     /* pipe size in bytes, system defaults if zero */
 		int max_http_hdr;  /* max number of HTTP headers, use MAX_HTTP_HDR if zero */
 		int requri_len;    /* max len of request URI, use REQURI_LEN if zero */
 		int cookie_len;    /* max length of cookie captures */
@@ -198,6 +206,7 @@ struct global {
 		int default_shards; /* default shards for listeners, or -1 (by-thread) or -2 (by-group) */
 		uint max_checks_per_thread; /* if >0, no more than this concurrent checks per thread */
 		uint ring_queues;   /* if >0, #ring queues, otherwise equals #thread groups */
+		enum threadgroup_takeover tg_takeover; /* Policy for threadgroup takeover */
 #ifdef USE_QUIC
 		unsigned int quic_backend_max_idle_timeout;
 		unsigned int quic_frontend_max_idle_timeout;

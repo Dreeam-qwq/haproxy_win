@@ -60,6 +60,7 @@
 #include <haproxy/stats-proxy.h>
 #include <haproxy/stconn.h>
 #include <haproxy/stream.h>
+#include <haproxy/stress.h>
 #include <haproxy/task.h>
 #include <haproxy/ticks.h>
 #include <haproxy/time.h>
@@ -231,7 +232,8 @@ int stats_putchk(struct appctx *appctx, struct buffer *buf, struct htx *htx)
 	struct buffer *chk = &ctx->chunk;
 
 	if (htx) {
-		if (b_data(chk) > htx_free_data_space(htx)) {
+		if (STRESS_RUN1(!htx_is_empty(htx),
+		                b_data(chk) > htx_free_data_space(htx))) {
 			applet_fl_set(appctx, APPCTX_FL_OUTBLK_FULL);
 			return 0;
 		}
@@ -242,7 +244,7 @@ int stats_putchk(struct appctx *appctx, struct buffer *buf, struct htx *htx)
 		chunk_reset(chk);
 	}
 	else if (buf) {
-		if (b_data(chk) > b_room(buf)) {
+		if (STRESS_RUN1(b_data(buf), b_data(chk) > b_room(buf))) {
 			se_fl_set(appctx->sedesc, SE_FL_RCV_MORE | SE_FL_WANT_ROOM);
 			return 0;
 		}
@@ -250,29 +252,31 @@ int stats_putchk(struct appctx *appctx, struct buffer *buf, struct htx *htx)
 		chunk_reset(chk);
 	}
 	else {
-		if (applet_putchk(appctx, chk) == -1)
+		if (STRESS_RUN1(applet_putchk_stress(appctx, chk) == -1,
+		                applet_putchk(appctx, chk) == -1)) {
 			return 0;
+		}
 	}
 	return 1;
 }
 
-
 int stats_is_full(struct appctx *appctx, struct buffer *buf, struct htx *htx)
 {
 	if (htx) {
-		if (htx_almost_full(htx)) {
+		if (STRESS_RUN1(!htx_is_empty(htx), htx_almost_full(htx))) {
 			applet_fl_set(appctx, APPCTX_FL_OUTBLK_FULL);
 			goto full;
 		}
 	}
 	else if (buf) {
-		if (buffer_almost_full(buf)) {
+		if (STRESS_RUN1(b_data(buf), buffer_almost_full(buf))) {
 			se_fl_set(appctx->sedesc, SE_FL_RCV_MORE | SE_FL_WANT_ROOM);
 			goto full;
 		}
 	}
 	else {
-		if (buffer_almost_full(&appctx->outbuf))  {
+		if (STRESS_RUN1(b_data(&appctx->outbuf),
+		                buffer_almost_full(&appctx->outbuf))) {
 			applet_fl_set(appctx, APPCTX_FL_OUTBLK_FULL);
 			goto full;
 		}
@@ -289,9 +293,8 @@ const char *stats_scope_ptr(struct appctx *appctx)
 	struct htx_blk *blk;
 	struct ist uri;
 
-	blk = htx_get_head_blk(htx);
-	BUG_ON(!blk || htx_get_blk_type(blk) != HTX_BLK_REQ_SL);
-	ALREADY_CHECKED(blk);
+	blk = ASSUME_NONNULL(htx_get_head_blk(htx));
+	BUG_ON(htx_get_blk_type(blk) != HTX_BLK_REQ_SL);
 	uri = htx_sl_req_uri(htx_get_blk_ptr(htx, blk));
 	return uri.ptr + ctx->scope_str;
 }
@@ -929,6 +932,7 @@ static int cli_parse_show_stat(char **args, char *payload, struct appctx *appctx
 	ctx->scope_len = 0;
 	ctx->http_px = NULL; // not under http context
 	ctx->flags = STAT_F_SHNODE | STAT_F_SHDESC;
+	watcher_init(&ctx->srv_watch, &ctx->obj2, offsetof(struct server, watcher_list));
 
 	if ((strm_li(appctx_strm(appctx))->bind_conf->level & ACCESS_LVL_MASK) >= ACCESS_LVL_OPER)
 		ctx->flags |= STAT_F_SHLGNDS;
@@ -984,6 +988,14 @@ static int cli_parse_show_stat(char **args, char *payload, struct appctx *appctx
 	return 0;
 }
 
+static int cli_parse_show_schema_json(char **args, char *payload, struct appctx *appctx, void *private)
+{
+	struct show_stat_ctx *ctx = applet_reserve_svcctx(appctx, sizeof(*ctx));
+
+	/* ctx is allocated, nothing else to do */
+	return 0;
+}
+
 static int cli_io_handler_dump_info(struct appctx *appctx)
 {
 	struct show_stat_ctx *ctx = appctx->svcctx;
@@ -1004,9 +1016,8 @@ static int cli_io_handler_dump_stat(struct appctx *appctx)
 static void cli_io_handler_release_stat(struct appctx *appctx)
 {
 	struct show_stat_ctx *ctx = appctx->svcctx;
-
-	if (ctx->px_st == STAT_PX_ST_SV)
-		srv_drop(ctx->obj2);
+	if (ctx->px_st == STAT_PX_ST_SV && ctx->obj2)
+		watcher_detach(&ctx->srv_watch);
 }
 
 static int cli_io_handler_dump_json_schema(struct appctx *appctx)
@@ -1024,6 +1035,7 @@ static int cli_parse_dump_stat_file(char **args, char *payload,
 	ctx->chunk = b_make(trash.area, trash.size, 0, 0);
 	ctx->domain = STATS_DOMAIN_PROXY;
 	ctx->flags |= STAT_F_FMT_FILE;
+	watcher_init(&ctx->srv_watch, &ctx->obj2, offsetof(struct server, watcher_list));
 
 	return 0;
 }
@@ -1064,6 +1076,9 @@ static int cli_io_handler_dump_stat_file(struct appctx *appctx)
 
 static void cli_io_handler_release_dump_stat_file(struct appctx *appctx)
 {
+	struct show_stat_ctx *ctx = appctx->svcctx;
+	if (ctx->px_st == STAT_PX_ST_SV && ctx->obj2)
+		watcher_detach(&ctx->srv_watch);
 }
 
 int stats_allocate_proxy_counters_internal(struct extra_counters **counters,
@@ -1308,7 +1323,7 @@ static struct cli_kw_list cli_kws = {{ },{
 	{ { "clear", "counters",  NULL },      "clear counters [all]                    : clear max statistics counters (or all counters)", cli_parse_clear_counters, NULL, NULL },
 	{ { "show", "info",  NULL },           "show info [desc|json|typed|float]*      : report information about the running process",    cli_parse_show_info, cli_io_handler_dump_info, NULL },
 	{ { "show", "stat",  NULL },           "show stat [desc|json|no-maint|typed|up]*: report counters for each proxy and server",       cli_parse_show_stat, cli_io_handler_dump_stat, cli_io_handler_release_stat },
-	{ { "show", "schema",  "json", NULL }, "show schema json                        : report schema used for stats",                    NULL, cli_io_handler_dump_json_schema, NULL },
+	{ { "show", "schema",  "json", NULL }, "show schema json                        : report schema used for stats",                    cli_parse_show_schema_json, cli_io_handler_dump_json_schema, NULL },
 	{ { "dump", "stats-file", NULL },      "dump stats-file                         : dump stats for restore",                          cli_parse_dump_stat_file, cli_io_handler_dump_stat_file, cli_io_handler_release_dump_stat_file },
 	{{},}
 }};

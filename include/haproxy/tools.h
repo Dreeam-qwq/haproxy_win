@@ -27,6 +27,7 @@
 #define _GNU_SOURCE
 #endif
 
+#include <errno.h>
 #include <string.h>
 #include <stdio.h>
 #include <time.h>
@@ -642,7 +643,26 @@ extern time_t my_timegm(const struct tm *tm);
  * <ret> is left untouched.
  */
 extern const char *parse_time_err(const char *text, unsigned *ret, unsigned unit_flags);
-extern const char *parse_size_err(const char *text, unsigned *ret);
+extern const char *parse_size_ui(const char *text, unsigned *ret);
+extern const char *parse_size_ull(const char *text, ullong *ret);
+
+/* Parse a size from <_test> into <_ret> which must be compatible with a
+ * uint or ullong. The return value is a pointer to the first unparsable
+ * character (if any) or NULL if everything's OK.
+ */
+#define parse_size_err(_text, _ret) ({			\
+	const char *_err;				\
+	if (sizeof(*(_ret)) > sizeof(int)) {		\
+		unsigned long long _tmp;		\
+		_err = parse_size_ull(_text, &_tmp);	\
+		*_ret = _tmp;				\
+	} else {					\
+		unsigned int _tmp;			\
+		_err = parse_size_ui(_text, &_tmp);	\
+		*_ret = _tmp;				\
+	}						\
+	_err;						\
+})
 
 /*
  * Parse binary string written in hexadecimal (source) and store the decoded
@@ -1001,6 +1021,9 @@ int my_unsetenv(const char *name);
  * some expansion is made.
  */
 char *env_expand(char *in);
+int is_path_mode(mode_t mode, const char *path_fmt, ...);
+int is_file_present(const char *path_fmt, ...);
+int is_dir_present(const char *path_fmt, ...);
 uint32_t parse_line(char *in, char *out, size_t *outlen, char **args, int *nbargs, uint32_t opts, const char **errptr);
 ssize_t read_line_to_trash(const char *path_fmt, ...);
 size_t sanitize_for_printing(char *line, size_t pos, size_t width);
@@ -1009,9 +1032,27 @@ void make_word_fingerprint(uint8_t *fp, const char *word);
 int word_fingerprint_distance(const uint8_t *fp1, const uint8_t *fp2);
 
 /* debugging macro to emit messages using write() on fd #-1 so that strace sees
- * them.
+ * them. It relies on variadic macros with optional arguments so that any
+ * number of argument is accepted. If at least one argument is passed, the
+ * first one is a format string and the other ones are the arguments, exactly
+ * like printf(). The macro always prepends the function name and the location
+ * as file:line between square brackets on any line. If no format string is
+ * passed, then "\n" is used. Otherwise the caller has to deal with \n itself
+ * (format or data).
  */
-#define fddebug(msg...) do { char *_m = NULL; memprintf(&_m, ##msg); if (_m) write(-1, _m, strlen(_m)); free(_m); } while (0)
+#define fddebug(...) __fddebug(__VA_ARGS__)
+#define _fddebug(fmt, msg...) __fddebug("" ##fmt, ##msg)
+#define __fddebug(fmt, msg...) do {					\
+		char *_m = NULL;					\
+		memprintf(&_m,						\
+			  (""fmt)[0] ?					\
+			  ("[%s@%s:%d] " fmt) :				\
+			  ("[%s@%s:%d]\n"), __func__,			\
+			  __FILE__, __LINE__, ##msg);			\
+		if (_m)							\
+			write(-1, _m, strlen(_m));			\
+		free(_m);						\
+	} while (0)
 
 /* displays a <len> long memory block at <buf>, assuming first byte of <buf>
  * has address <baseaddr>. String <pfx> may be placed as a prefix in front of
@@ -1094,6 +1135,7 @@ void dump_area_with_syms(struct buffer *output, const void *base, const void *ad
 void dump_hex(struct buffer *out, const char *pfx, const void *buf, int len, int unsafe);
 int may_access(const void *ptr);
 const void *resolve_sym_name(struct buffer *buf, const char *pfx, const void *addr);
+const void *resolve_dso_name(struct buffer *buf, const char *pfx, const void *addr);
 const char *get_exec_path(void);
 void *get_sym_curr_addr(const char *name);
 void *get_sym_next_addr(const char *name);
@@ -1256,6 +1298,23 @@ static inline void update_char_fingerprint(uint8_t *fp, char prev, char curr)
 	fp[32 * from + to]++;
 }
 
+/* checks that the numerical argument, if passed without units and is non-zero,
+ * is at least as large as value <min>. It returns 1 if the value is too small,
+ * otherwise zero. This is used to warn about the use of small values without
+ * units.
+ */
+static inline int warn_if_lower(const char *text, long min)
+{
+	int digits;
+	long value;
+
+	digits = strspn(text, "0123456789");
+	if (digits < strlen(text))
+		return 0; // there are non-digits here.
+
+	value = atol(text);
+	return value && value < min;
+}
 
 /* compare the current OpenSSL version to a string */
 int openssl_compare_current_version(const char *version);
@@ -1273,5 +1332,59 @@ char *fgets_from_mem(char* buf, int size, const char **position, const char *end
 int backup_env(void);
 int clean_env(void);
 int restore_env(void);
+
+/* helper to print the name of errno's corresponding macro (for example "EINVAL"
+ * for errno=22) instead of calling strerror(errno).
+ */
+#define CASE_ERR(err) \
+	case err: return #err
+
+static inline const char *errname(int err_num, char **out)
+{
+	/* only currently used errno values, please, add a new one, if you
+	 * start using it in the code.
+	 */
+	switch (err_num) {
+	case 0: return "SUCCESS";
+	CASE_ERR(EPERM);
+	CASE_ERR(ENOENT);
+	CASE_ERR(EINTR);
+	CASE_ERR(EIO);
+	CASE_ERR(E2BIG);
+	CASE_ERR(EBADF);
+	CASE_ERR(ECHILD);
+	CASE_ERR(EAGAIN);
+	CASE_ERR(ENOMEM);
+	CASE_ERR(EACCES);
+	CASE_ERR(EFAULT);
+	CASE_ERR(EINVAL);
+	CASE_ERR(ENFILE);
+	CASE_ERR(EMFILE);
+	CASE_ERR(ENOSPC);
+	CASE_ERR(ERANGE);
+	CASE_ERR(ENOSYS);
+	CASE_ERR(EADDRINUSE);
+	CASE_ERR(ECONNABORTED);
+	CASE_ERR(ECONNRESET);
+	CASE_ERR(EINPROGRESS);
+	CASE_ERR(ENOTCONN);
+	CASE_ERR(EADDRNOTAVAIL);
+	CASE_ERR(ECONNREFUSED);
+	CASE_ERR(ENETUNREACH);
+	CASE_ERR(EPROTO);
+	CASE_ERR(ENOTSOCK);
+	CASE_ERR(EMSGSIZE);
+	CASE_ERR(EPROTONOSUPPORT);
+	CASE_ERR(EAFNOSUPPORT);
+	CASE_ERR(ENOBUFS);
+	CASE_ERR(EISCONN);
+	CASE_ERR(ETIMEDOUT);
+	CASE_ERR(EALREADY);
+
+	default:
+		memprintf(out, "%d", err_num);
+		return *out;
+	}
+}
 
 #endif /* _HAPROXY_TOOLS_H */

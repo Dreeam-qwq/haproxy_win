@@ -54,6 +54,7 @@ extern int ssl_client_sni_index;
 extern struct pool_head *pool_head_ssl_keylog;
 extern struct pool_head *pool_head_ssl_keylog_str;
 extern struct list openssl_providers;
+extern struct stats_module ssl_stats_module;
 
 int ssl_sock_prep_ctx_and_inst(struct bind_conf *bind_conf, struct ssl_bind_conf *ssl_conf,
 			       SSL_CTX *ctx, struct ckch_inst *ckch_inst, char **err);
@@ -67,8 +68,6 @@ void ssl_sock_free_srv_ctx(struct server *srv);
 void ssl_sock_free_all_ctx(struct bind_conf *bind_conf);
 int ssl_sock_get_alpn(const struct connection *conn, void *xprt_ctx,
                       const char **str, int *len);
-int ssl_sock_load_ca(struct bind_conf *bind_conf);
-void ssl_sock_free_ca(struct bind_conf *bind_conf);
 int ssl_bio_and_sess_init(struct connection *conn, SSL_CTX *ssl_ctx,
                           SSL **ssl, BIO **bio, BIO_METHOD *bio_meth, void *ctx);
 const char *ssl_sock_get_sni(struct connection *conn);
@@ -136,7 +135,7 @@ int ssl_sock_bind_verifycbk(int ok, X509_STORE_CTX *x_store);
 #ifdef HAVE_SSL_PROVIDERS
 int ssl_init_provider(const char *provider_name);
 #endif
-#if ((defined SSL_CTRL_SET_TLSEXT_STATUS_REQ_CB && !defined OPENSSL_NO_OCSP) && !defined OPENSSL_IS_BORINGSSL)
+#if (defined(HAVE_SSL_OCSP) && !defined OPENSSL_IS_BORINGSSL)
 int ssl_get_ocspresponse_detail(unsigned char *ocsp_certid, struct buffer *out);
 int ssl_ocsp_response_print(struct buffer *ocsp_response, struct buffer *out);
 #endif

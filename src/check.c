@@ -1027,8 +1027,8 @@ int httpchk_build_status_header(struct server *s, struct buffer *buf)
 		      global.node,
 		      (s->cur_eweight * s->proxy->lbprm.wmult + s->proxy->lbprm.wdiv - 1) / s->proxy->lbprm.wdiv,
 		      (s->proxy->lbprm.tot_weight * s->proxy->lbprm.wmult + s->proxy->lbprm.wdiv - 1) / s->proxy->lbprm.wdiv,
-		      s->cur_sess, s->proxy->beconn - s->proxy->queue.length,
-		      s->queue.length);
+		      s->cur_sess, s->proxy->beconn - s->proxy->queueslength,
+		      s->queueslength);
 
 	if ((s->cur_state == SRV_ST_STARTING) &&
 	    ns_to_sec(now_ns) < s->counters.last_change + s->slowstart &&
@@ -1667,6 +1667,10 @@ static int start_checks()
 	/* 0- init the dummy frontend used to create all checks sessions */
 	init_new_proxy(&checks_fe);
 	checks_fe.id = strdup("CHECKS-FE");
+	if (!checks_fe.id) {
+		ha_alert("Out of memory creating the checks frontend.\n");
+		return ERR_ALERT | ERR_FATAL;
+	}
 	checks_fe.cap = PR_CAP_FE | PR_CAP_BE;
         checks_fe.mode = PR_MODE_TCP;
 	checks_fe.maxconn = 0;
@@ -2190,6 +2194,12 @@ static int srv_parse_agent_inter(char **args, int *cur_arg, struct proxy *curpx,
 	}
 	srv->agent.inter = delay;
 
+	if (warn_if_lower(args[*cur_arg+1], 100)) {
+		memprintf(errmsg, "'%s %u' in server '%s' is suspiciously small for a value in milliseconds. Please use an explicit unit ('%ums') if that was the intent",
+		          args[*cur_arg], delay, srv->id, delay);
+		err_code |= ERR_WARN;
+	}
+
   out:
 	return err_code;
 
@@ -2459,6 +2469,12 @@ static int srv_parse_check_inter(char **args, int *cur_arg, struct proxy *curpx,
 	}
 	srv->check.inter = delay;
 
+	if (warn_if_lower(args[*cur_arg+1], 100)) {
+		memprintf(errmsg, "'%s %u' in server '%s' is suspiciously small for a value in milliseconds. Please use an explicit unit ('%ums') if that was the intent",
+		          args[*cur_arg], delay, srv->id, delay);
+		err_code |= ERR_WARN;
+	}
+
   out:
 	return err_code;
 
@@ -2504,6 +2520,12 @@ static int srv_parse_check_fastinter(char **args, int *cur_arg, struct proxy *cu
 	}
 	srv->check.fastinter = delay;
 
+	if (warn_if_lower(args[*cur_arg+1], 100)) {
+		memprintf(errmsg, "'%s %u' in server '%s' is suspiciously small for a value in milliseconds. Please use an explicit unit ('%ums') if that was the intent",
+		          args[*cur_arg], delay, srv->id, delay);
+		err_code |= ERR_WARN;
+	}
+
   out:
 	return err_code;
 
@@ -2548,6 +2570,12 @@ static int srv_parse_check_downinter(char **args, int *cur_arg, struct proxy *cu
 		goto error;
 	}
 	srv->check.downinter = delay;
+
+	if (warn_if_lower(args[*cur_arg+1], 100)) {
+		memprintf(errmsg, "'%s %u' in server '%s' is suspiciously small for a value in milliseconds. Please use an explicit unit ('%ums') if that was the intent",
+		          args[*cur_arg], delay, srv->id, delay);
+		err_code |= ERR_WARN;
+	}
 
   out:
 	return err_code;

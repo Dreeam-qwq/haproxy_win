@@ -38,10 +38,14 @@ DECLARE_STATIC_POOL(pool_head_sig_handlers, "sig_handlers", sizeof(struct sig_ha
  */
 void signal_handler(int sig)
 {
+	/* inform callees to be careful, we're in a signal handler! */
+	_HA_ATOMIC_OR(&th_ctx->flags, TH_FL_IN_SIG_HANDLER);
+
 	if (sig < 0 || sig >= MAX_SIGNAL) {
 		/* unhandled signal */
 		signal(sig, SIG_IGN);
 		qfprintf(stderr, "Received unhandled signal %d. Signal has been disabled.\n", sig);
+		_HA_ATOMIC_AND(&th_ctx->flags, ~TH_FL_IN_SIG_HANDLER);
 		return;
 	}
 
@@ -59,6 +63,7 @@ void signal_handler(int sig)
 
 	/* If the thread is TH_FL_SLEEPING we need to wake it */
 	wake_thread(tid);
+	_HA_ATOMIC_AND(&th_ctx->flags, ~TH_FL_IN_SIG_HANDLER);
 }
 
 /* Call handlers of all pending signals and clear counts and queue length. The
@@ -106,6 +111,13 @@ static void signal_init()
 {
 	int sig;
 
+	/* Need to register the handler for SIGINT explicitly, as we can be
+	 * laucned within the subshell and at background:
+	 * $ (./haproxy -f env4.cfg &). According to POSIX standard
+	 * (2.11. Signals and Error Handling), we will inherit from the subshell
+	 * in this case SIG_IGN signal handler for SIGINT and SIGQUIT.
+	 */
+	signal(SIGINT, SIG_DFL);
 	signal_queue_len = 0;
 	memset(signal_queue, 0, sizeof(signal_queue));
 	memset(signal_state, 0, sizeof(signal_state));

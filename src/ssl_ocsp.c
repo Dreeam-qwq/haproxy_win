@@ -53,6 +53,7 @@
 #include <haproxy/log.h>
 #include <haproxy/openssl-compat.h>
 #include <haproxy/proxy.h>
+#include <haproxy/quic_conn-t.h>
 #include <haproxy/shctx.h>
 #include <haproxy/ssl_ckch.h>
 #include <haproxy/ssl_ocsp-t.h>
@@ -62,6 +63,7 @@
 #include <haproxy/ticks.h>
 #include <haproxy/time.h>
 
+#ifdef HAVE_SSL_OCSP
 
 /* ***** READ THIS before adding code here! *****
  *
@@ -98,6 +100,10 @@ int ssl_sock_get_ocsp_arg_kt_index(int evp_keytype)
  */
 int ssl_sock_ocsp_stapling_cbk(SSL *ssl, void *arg)
 {
+	struct connection *conn = SSL_get_ex_data(ssl, ssl_app_data_index);
+	struct listener *li = NULL;
+	struct ssl_counters *counters = NULL;
+	struct ssl_counters *counters_px = NULL;
 	struct certificate_ocsp *ocsp;
 	struct ocsp_cbk_arg *ocsp_arg;
 	char *ssl_buf;
@@ -108,15 +114,31 @@ int ssl_sock_ocsp_stapling_cbk(SSL *ssl, void *arg)
 
 	ctx = SSL_get_SSL_CTX(ssl);
 	if (!ctx)
-		return SSL_TLSEXT_ERR_NOACK;
+		goto error;
+
+	if (conn && obj_type(conn->target) == OBJ_TYPE_LISTENER)
+		li = __objt_listener(conn->target);
+#ifdef USE_QUIC
+	else if (!conn) {
+		struct quic_conn *qc = SSL_get_ex_data(ssl, ssl_qc_app_data_index);
+
+		/* null if not a listener */
+		li = qc->li;
+	}
+#endif
+
+	if (li) {
+		counters = EXTRA_COUNTERS_GET(li->extra_counters, &ssl_stats_module);
+		counters_px = EXTRA_COUNTERS_GET(li->bind_conf->frontend->extra_counters_fe, &ssl_stats_module);
+	}
 
 	ocsp_arg = SSL_CTX_get_ex_data(ctx, ocsp_ex_index);
 	if (!ocsp_arg)
-		return SSL_TLSEXT_ERR_NOACK;
+		goto error;
 
 	ssl_pkey = SSL_get_privatekey(ssl);
 	if (!ssl_pkey)
-		return SSL_TLSEXT_ERR_NOACK;
+		goto error;
 
 	key_type = EVP_PKEY_base_id(ssl_pkey);
 
@@ -129,7 +151,7 @@ int ssl_sock_ocsp_stapling_cbk(SSL *ssl, void *arg)
 		index = ssl_sock_get_ocsp_arg_kt_index(key_type);
 
 		if (index < 0)
-			return SSL_TLSEXT_ERR_NOACK;
+			goto error;
 
 		ocsp = ocsp_arg->m_ocsp[index];
 
@@ -139,16 +161,32 @@ int ssl_sock_ocsp_stapling_cbk(SSL *ssl, void *arg)
 	    !ocsp->response.area ||
 	    !ocsp->response.data ||
 	    (ocsp->expire < date.tv_sec))
-		return SSL_TLSEXT_ERR_NOACK;
+		goto error;
 
 	ssl_buf = OPENSSL_malloc(ocsp->response.data);
 	if (!ssl_buf)
-		return SSL_TLSEXT_ERR_NOACK;
+		goto error;
+
 
 	memcpy(ssl_buf, ocsp->response.area, ocsp->response.data);
 	SSL_set_tlsext_status_ocsp_resp(ssl, (unsigned char*)ssl_buf, ocsp->response.data);
 
+	if (counters) {
+		HA_ATOMIC_INC(&counters->ocsp_staple);
+		HA_ATOMIC_INC(&counters_px->ocsp_staple);
+	}
+
 	return SSL_TLSEXT_ERR_OK;
+
+
+error:
+
+	if (counters) {
+		HA_ATOMIC_INC(&counters->failed_ocsp_staple);
+		HA_ATOMIC_INC(&counters_px->failed_ocsp_staple);
+	}
+
+	return SSL_TLSEXT_ERR_NOACK;
 }
 
 #endif /* !defined(OPENSSL_NO_OCSP) */
@@ -333,6 +371,11 @@ int ssl_sock_load_ocsp_response(struct buffer *ocsp_response,
 	}
 #endif
 
+	if (ocsp->expire < date.tv_sec) {
+		memprintf(err, "OCSP single response: no longer valid. Must be valid during at least %ds.", OCSP_MAX_RESPONSE_TIME_SKEW);
+		goto out;
+	}
+
 	ret = 0;
 out:
 	ERR_clear_error();
@@ -376,6 +419,7 @@ static void ssl_sock_free_ocsp_data(struct certificate_ocsp *ocsp)
 		ha_free(&ocsp->uri->area);
 		ha_free(&ocsp->uri);
 	}
+	ha_free(&ocsp->last_update_error);
 	free(ocsp);
 }
 
@@ -1097,8 +1141,10 @@ void ocsp_update_response_end_cb(struct httpclient *hc)
 static void ssl_ocsp_send_log()
 {
 	int status_str_len = 0;
-	char *status_str = NULL;
+	char *status_str = "";
 	struct certificate_ocsp *ocsp = ssl_ocsp_task_ctx.cur_ocsp;
+	char *last_error = NULL;
+	struct buffer *tmpbuf = get_trash_chunk();
 
 	if (!httpclient_ocsp_update_px)
 		return;
@@ -1106,15 +1152,20 @@ static void ssl_ocsp_send_log()
 	if (ocsp && ssl_ocsp_task_ctx.update_status < OCSP_UPDT_ERR_LAST) {
 		status_str_len = istlen(ocsp_update_errors[ssl_ocsp_task_ctx.update_status]);
 		status_str = istptr(ocsp_update_errors[ssl_ocsp_task_ctx.update_status]);
+		last_error = ocsp->last_update_error;
 	}
 
-	send_log(httpclient_ocsp_update_px, LOG_NOTICE, "%s %s %u \"%.*s\" %u %u",
-	         httpclient_ocsp_update_px->id,
-	         ocsp->path,
-	         ssl_ocsp_task_ctx.update_status,
-	         status_str_len, status_str,
-	         ocsp ? ocsp->num_failure : 0,
-	         ocsp ? ocsp->num_success : 0);
+	chunk_printf(tmpbuf, "%s %s %u \"%.*s", httpclient_ocsp_update_px->id,
+	             ocsp->path, ssl_ocsp_task_ctx.update_status,
+	             status_str_len, status_str);
+
+	if (last_error)
+		chunk_appendf(tmpbuf, " (%s)", last_error);
+
+	chunk_appendf(tmpbuf, "\" %u %u", ocsp ? ocsp->num_failure : 0,
+	              ocsp ? ocsp->num_success : 0);
+
+	send_log(httpclient_ocsp_update_px, LOG_NOTICE, "%.*s", (int)b_data(tmpbuf), b_orig(tmpbuf));
 }
 
 /*
@@ -1147,6 +1198,7 @@ static struct task *ssl_ocsp_update_responses(struct task *task, void *context, 
 	struct buffer *req_body = NULL;
 	OCSP_CERTID *certid = NULL;
 	struct ssl_ocsp_task_ctx *ctx = &ssl_ocsp_task_ctx;
+	char *err = NULL;
 
 	if (ctx->cur_ocsp) {
 		/* An update is in process */
@@ -1189,12 +1241,12 @@ static struct task *ssl_ocsp_update_responses(struct task *task, void *context, 
 			/* Process the body that must be complete since
 			 * HC_F_RES_END is set. */
 			if (ctx->flags & HC_F_RES_BODY) {
-				if (ssl_ocsp_check_response(ocsp->chain, ocsp->issuer, &hc->res.buf, NULL)) {
+				if (ssl_ocsp_check_response(ocsp->chain, ocsp->issuer, &hc->res.buf, &err)) {
 					ctx->update_status = OCSP_UPDT_ERR_CHECK;
 					goto http_error;
 				}
 
-				if (ssl_sock_update_ocsp_response(&hc->res.buf, NULL) != 0) {
+				if (ssl_sock_update_ocsp_response(&hc->res.buf, &err) != 0) {
 					ctx->update_status = OCSP_UPDT_ERR_INSERT;
 					goto http_error;
 				}
@@ -1208,6 +1260,7 @@ static struct task *ssl_ocsp_update_responses(struct task *task, void *context, 
 			ocsp->last_update = date.tv_sec;
 			ctx->update_status = OCSP_UPDT_OK;
 			ocsp->last_update_status = ctx->update_status;
+			ha_free(&ocsp->last_update_error);
 
 			ssl_ocsp_send_log();
 
@@ -1352,13 +1405,15 @@ wait:
 	return task;
 
 http_error:
-	ssl_ocsp_send_log();
 	/* Reinsert certificate into update list so that it can be updated later */
 	if (ocsp) {
 		++ocsp->num_failure;
 		ocsp->last_update_status = ctx->update_status;
+		ha_free(&ocsp->last_update_error);
+		ocsp->last_update_error = err;
 		ssl_ocsp_update_insert_after_error(ocsp);
 	}
+	ssl_ocsp_send_log();
 
 	if (hc)
 		httpclient_stop_and_destroy(hc);
@@ -1806,8 +1861,11 @@ static int dump_ocsp_update_info(struct certificate_ocsp *ocsp, struct buffer *o
 	/* Last update status str */
 	if (ocsp->last_update_status >= OCSP_UPDT_ERR_LAST)
 		chunk_appendf(out, "-");
-	else
+	else {
 		chunk_appendf(out, "%s", istptr(ocsp_update_errors[ocsp->last_update_status]));
+		if (ocsp->last_update_error)
+			chunk_appendf(out, " (%s)", ocsp->last_update_error);
+	}
 
 	chunk_appendf(out, "\n");
 
@@ -2053,6 +2111,8 @@ static struct cfg_kw_list cfg_kws = {ILH, {
 INITCALL1(STG_REGISTER, cfg_register_keywords, &cfg_kws);
 
 REGISTER_CONFIG_POSTPARSER("ocsp-update", ocsp_update_postparser_init);
+
+#endif /* HAVE_SSL_OCSP */
 /*
  * Local variables:
  *  c-indent-level: 8

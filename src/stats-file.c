@@ -279,13 +279,13 @@ static int parse_stat_line(struct ist line,
 
 		if (domain == STFILE_DOMAIN_PX_FE) {
 			if (!(px->cap & PR_CAP_FE))
-				goto err;
+				return 0; /* silently ignored fe/be mismatch */
 			base_off = (char *)&px->fe_counters;
 			off = 0;
 		}
 		else if (domain == STFILE_DOMAIN_PX_BE) {
 			if (!(px->cap & PR_CAP_BE))
-				goto err;
+				return 0; /* silently ignored fe/be mismatch */
 			base_off = (char *)&px->be_counters;
 			off = 1;
 		}
@@ -358,19 +358,19 @@ void apply_stats_file(void)
 
 	file = fopen(global.stats_file, "r");
 	if (!file) {
-		ha_warning("config: Can't load stats file: cannot open file.\n");
+		ha_warning("config: Can't load stats-file '%s': cannot open file.\n", global.stats_file);
 		return;
 	}
 
 	/* Generate stat columns map indexed by name. */
 	if (generate_stat_tree(&st_tree, stat_cols_px)) {
-		ha_warning("config: Can't load stats file: not enough memory.\n");
+		ha_warning("config: Can't load stats-file '%s': not enough memory.\n", global.stats_file);
 		goto out;
 	}
 
 	line = malloc(sizeof(char) * LINESIZE);
 	if (!line) {
-		ha_warning("config: Can't load stats file: line alloc error.\n");
+		ha_warning("config: Can't load stats-file '%s': line alloc error.\n", global.stats_file);
 		goto out;
 	}
 
@@ -385,28 +385,32 @@ void apply_stats_file(void)
 		if (!istlen(istline))
 			continue;
 
+		/* comment line starts by // */
+		if (istmatch(istline, ist("//")) != 0)
+			continue;
+
 		if (*istptr(istline) == '#') {
 			if (parse_header_line(istline, &st_tree, &domain, cols)) {
 				if (!valid_format) {
-					ha_warning("config: Invalid stats-file format.\n");
+					ha_warning("config: Invalid stats-file format in file '%s'.\n", global.stats_file);
 					break;
 				}
 
-				ha_warning("config: Ignored stats-file header line '%d'.\n", linenum);
+				ha_warning("config: Ignored stats-file header line '%d' in file '%s'.\n", linenum, global.stats_file);
 			}
 
 			valid_format = 1;
 		}
 		else if (domain != STFILE_DOMAIN_UNSET) {
 			if (parse_stat_line(istline, domain, cols))
-				ha_warning("config: Ignored stats-file line %d.\n", linenum);
+				ha_warning("config: Ignored stats-file line %d in file '%s'.\n", linenum, global.stats_file);
 		}
 		else {
 			/* Stop parsing if first line is not a valid header.
 			 * Allows to immediately stop reading garbage file.
 			 */
 			if (!valid_format) {
-				ha_warning("config: Invalid stats-file format.\n");
+				ha_warning("config: Invalid stats-file format in file '%s'.\n", global.stats_file);
 				break;
 			}
 		}

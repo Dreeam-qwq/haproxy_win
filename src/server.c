@@ -1706,6 +1706,7 @@ static int srv_parse_set_proxy_v2_tlv_fmt(char **args, int *cur_arg,
 		goto fail;
 	}
 	srv_tlv->type = tlv_type;
+	lf_expr_init(&srv_tlv->fmt);
 	srv_tlv->fmt_string = strdup(args[*cur_arg + 1]);
 	if (unlikely(!srv_tlv->fmt_string)) {
 		memprintf(err, "'%s' : failed to save format string for parsing", args[*cur_arg]);
@@ -1997,6 +1998,13 @@ static int srv_parse_weight(char **args, int *cur_arg, struct proxy *px, struct 
 	return 0;
 }
 
+static int srv_parse_strict_maxconn(char **args, int *cur_arg, struct proxy *px, struct server *newsrv, char **err)
+{
+
+	newsrv->flags |= SRV_F_STRICT_MAXCONN;
+
+	return 0;
+}
 /* Returns 1 if the server has streams pointing to it, and 0 otherwise.
  *
  * Must be called with the server lock held.
@@ -2092,13 +2100,13 @@ static void srv_append_more(struct buffer *msg, struct server *s,
 				" %d sessions active, %d requeued, %d remaining in queue",
 				s->proxy->srv_act, s->proxy->srv_bck,
 				(s->proxy->srv_bck && !s->proxy->srv_act) ? " Running on backup." : "",
-				s->cur_sess, xferred, s->queue.length);
+				s->cur_sess, xferred, s->queueslength);
 		else
 			chunk_appendf(msg, ". %d active and %d backup servers online.%s"
 				" %d sessions requeued, %d total in queue",
 				s->proxy->srv_act, s->proxy->srv_bck,
 				(s->proxy->srv_bck && !s->proxy->srv_act) ? " Running on backup." : "",
-				xferred, s->queue.length);
+				xferred, s->queueslength);
 	}
 }
 
@@ -2397,6 +2405,7 @@ static struct srv_kw_list srv_kws = { "ALL", { }, {
 	{ "slowstart",            srv_parse_slowstart,            1,  1,  1 }, /* Set the warm-up timer for a previously failed server */
 	{ "source",               srv_parse_source,              -1,  1,  1 }, /* Set the source address to be used to connect to the server */
 	{ "stick",                srv_parse_stick,                0,  1,  0 }, /* Enable stick-table persistence */
+	{ "strict-maxconn",       srv_parse_strict_maxconn,       0,  1,  1 }, /* Strictly enforces maxconn */
 	{ "tfo",                  srv_parse_tfo,                  0,  1,  1 }, /* enable TCP Fast Open of server */
 	{ "track",                srv_parse_track,                1,  1,  1 }, /* Set the current state of the server, tracking another one */
 	{ "socks4",               srv_parse_socks4,               1,  1,  0 }, /* Set the socks4 proxy of the server*/
@@ -2440,6 +2449,22 @@ void server_recalc_eweight(struct server *sv, int must_update)
 	/* propagate changes only if needed (i.e. not recursively) */
 	if (must_update)
 		srv_update_status(sv, 0, SRV_OP_STCHGC_NONE);
+}
+
+/* requeuing tasklet used to asynchronously queue the server into its tree in
+ * case of extreme contention. It is woken up by the code that failed to grab
+ * an important lock.
+ */
+struct task *server_requeue(struct task *t, void *context, unsigned int state)
+{
+	struct server *srv = context;
+
+	/* let's call the LB's requeue function. If it fails, it will itself
+	 * wake us up.
+	 */
+	if (srv->proxy->lbprm.server_requeue)
+		srv->proxy->lbprm.server_requeue(srv);
+	return t;
 }
 
 /*
@@ -2942,6 +2967,15 @@ void srv_settings_cpy(struct server *srv, const struct server *src, int srv_tmpl
 			break;
 		}
 		new_srv_tlv->type = srv_tlv->type;
+		lf_expr_init(&new_srv_tlv->fmt);
+		if (srv_tmpl) {
+			if (new_srv_tlv->fmt_string && unlikely(!parse_logformat_string(new_srv_tlv->fmt_string,
+			    srv->proxy, &new_srv_tlv->fmt, 0, SMP_VAL_BE_SRV_CON, NULL))) {
+				free(new_srv_tlv->fmt_string);
+				free(new_srv_tlv);
+				break;
+			}
+		}
 		LIST_APPEND(&srv->pp_tlvs, &new_srv_tlv->list);
 	}
 }
@@ -2961,12 +2995,10 @@ struct server *new_server(struct proxy *proxy)
 
 	srv->obj_type = OBJ_TYPE_SERVER;
 	srv->proxy = proxy;
-	queue_init(&srv->queue, proxy, srv);
 	MT_LIST_APPEND(&servers_list, &srv->global_list);
 	LIST_INIT(&srv->srv_rec_item);
 	LIST_INIT(&srv->ip_rec_item);
 	LIST_INIT(&srv->pp_tlvs);
-	MT_LIST_INIT(&srv->prev_deleted);
 	event_hdl_sub_list_init(&srv->e_subs);
 	srv->rid = 0; /* rid defaults to 0 */
 
@@ -2988,6 +3020,7 @@ struct server *new_server(struct proxy *proxy)
 	MT_LIST_INIT(&srv->sess_conns);
 
 	guid_init(&srv->guid);
+	MT_LIST_INIT(&srv->watcher_list);
 
 	srv->extra_counters = NULL;
 #ifdef USE_OPENSSL
@@ -3028,6 +3061,7 @@ void srv_free_params(struct server *srv)
 		deinit_log_target(srv->log_target);
 		free(srv->log_target);
 	}
+	free(srv->tmpl_info.prefix);
 
 	if (xprt_get(XPRT_SSL) && xprt_get(XPRT_SSL)->destroy_srv)
 		xprt_get(XPRT_SSL)->destroy_srv(srv);
@@ -3073,13 +3107,8 @@ struct server *srv_drop(struct server *srv)
 
 	guid_remove(&srv->guid);
 
-	/* make sure we are removed from our 'next->prev_deleted' list
-	 * This doesn't require full thread isolation as we're using mt lists
-	 * However this could easily be turned into regular list if required
-	 * (with the proper use of thread isolation)
-	 */
-	MT_LIST_DELETE(&srv->prev_deleted);
-
+	if (srv->requeue_tasklet)
+		tasklet_kill(srv->requeue_tasklet);
 	task_destroy(srv->warmup);
 	task_destroy(srv->srvrq_check);
 
@@ -3690,7 +3719,6 @@ static int _srv_parse_finalize(char **args, int cur_arg,
 	}
 
 	list_for_each_entry(srv_tlv, &srv->pp_tlvs, list) {
-		lf_expr_init(&srv_tlv->fmt);
 		if (srv_tlv->fmt_string && unlikely(!parse_logformat_string(srv_tlv->fmt_string,
 			srv->proxy, &srv_tlv->fmt, 0, SMP_VAL_BE_SRV_CON, &errmsg))) {
 			if (errmsg) {
@@ -5653,7 +5681,7 @@ static struct task *server_warmup(struct task *t, void *context, unsigned int st
 	server_recalc_eweight(s, 1);
 
 	/* probably that we can refill this server with a bit more connections */
-	pendconn_grab_from_px(s);
+	process_srv_queue(s);
 
 	HA_SPIN_UNLOCK(SERVER_LOCK, &s->lock);
 
@@ -5699,6 +5727,24 @@ static int init_srv_slowstart(struct server *srv)
 }
 REGISTER_POST_SERVER_CHECK(init_srv_slowstart);
 
+
+/* allocate the tasklet that's meant to permit a server */
+static int init_srv_requeue(struct server *srv)
+{
+	struct tasklet *t;
+
+	if ((t = tasklet_new()) == NULL) {
+		ha_alert("Cannot allocate a server requeuing tasklet for server %s/%s: out of memory.\n", srv->proxy->id, srv->id);
+		return ERR_ALERT | ERR_FATAL;
+	}
+
+	srv->requeue_tasklet = t;
+	t->process = server_requeue;
+	t->context = srv;
+	return ERR_NONE;
+}
+REGISTER_POST_SERVER_CHECK(init_srv_requeue);
+
 /* Memory allocation and initialization of the per_thr field.
  * Returns 0 if the field has been successfully initialized, -1 on failure.
  */
@@ -5719,6 +5765,9 @@ int srv_init_per_thr(struct server *srv)
 
 		LIST_INIT(&srv->per_thr[i].idle_conn_list);
 	}
+
+	for (i = 0; i < global.nbtgroups; i++)
+		queue_init(&srv->per_tgrp[i].queue, srv->proxy, srv);
 
 	return 0;
 }
@@ -5873,6 +5922,9 @@ static int cli_parse_add_server(char **args, char *payload, struct appctx *appct
 
 	/* Init slowstart if needed. */
 	if (init_srv_slowstart(srv))
+		goto out;
+
+	if (init_srv_requeue(srv) != 0)
 		goto out;
 
 	/* Attach the server to the end of the proxy linked list. Note that this
@@ -6048,7 +6100,7 @@ int srv_check_for_deletion(const char *bename, const char *svname, struct proxy 
 
 	/* Ensure that there is no active/pending connection on the server. */
 	if (srv->curr_used_conns ||
-	    !eb_is_empty(&srv->queue.head) || srv_has_streams(srv)) {
+	    srv->queueslength || srv_has_streams(srv)) {
 		msg = "Server still has connections attached to it, cannot remove it.";
 		goto leave;
 	}
@@ -6072,10 +6124,10 @@ static int cli_parse_delete_server(char **args, char *payload, struct appctx *ap
 {
 	struct proxy *be;
 	struct server *srv;
-	struct server *prev_del;
 	struct ist be_name, sv_name;
 	struct mt_list back;
 	struct sess_priv_conns *sess_conns = NULL;
+	struct watcher *srv_watch;
 	const char *msg;
 	int ret, i;
 
@@ -6177,31 +6229,17 @@ static int cli_parse_delete_server(char **args, char *payload, struct appctx *ap
 	if (srv->agent.state & CHK_ST_CONFIGURED)
 		check_purge(&srv->agent);
 
+	while (!MT_LIST_ISEMPTY(&srv->watcher_list)) {
+		srv_watch = MT_LIST_NEXT(&srv->watcher_list, struct watcher *, el);
+		BUG_ON(srv->next && srv->next->flags & SRV_F_DELETED);
+		watcher_next(srv_watch, srv->next);
+	}
+
 	/* detach the server from the proxy linked list
 	 * The proxy servers list is currently not protected by a lock, so this
 	 * requires thread_isolate/release.
 	 */
 	_srv_detach(srv);
-
-	/* Some deleted servers could still point to us using their 'next',
-	 * migrate them as needed
-	 */
-	MT_LIST_FOR_EACH_ENTRY_LOCKED(prev_del, &srv->prev_deleted, prev_deleted, back) {
-		/* update its 'next' ptr */
-		prev_del->next = srv->next;
-		if (srv->next) {
-			/* now it is our 'next' responsibility */
-			MT_LIST_APPEND(&srv->next->prev_deleted, &prev_del->prev_deleted);
-		}
-		else
-			mt_list_unlock_self(&prev_del->prev_deleted);
-		/* unlink from our list */
-		prev_del = NULL;
-	}
-
-	/* we ourselves need to inform our 'next' that we will still point it */
-	if (srv->next)
-		MT_LIST_APPEND(&srv->next->prev_deleted, &srv->prev_deleted);
 
 	/* remove srv from addr_node tree */
 	eb32_delete(&srv->conf.id);
@@ -6453,10 +6491,10 @@ static int _srv_update_status_op(struct server *s, enum srv_op_st_chg_cause caus
 		    !(s->flags & SRV_F_BACKUP) && s->next_eweight)
 			srv_shutdown_backup_streams(s->proxy, SF_ERR_UP);
 
-		/* check if we can handle some connections queued at the proxy. We
-		 * will take as many as we can handle.
+		/* check if we can handle some connections queued.
+		 * We will take as many as we can handle.
 		 */
-		xferred = pendconn_grab_from_px(s);
+		xferred = process_srv_queue(s);
 
 		tmptrash = alloc_trash_chunk();
 		if (tmptrash) {
@@ -6649,10 +6687,10 @@ static int _srv_update_status_adm(struct server *s, enum srv_adm_st_chg_cause ca
 		    !(s->flags & SRV_F_BACKUP) && s->next_eweight)
 			srv_shutdown_backup_streams(s->proxy, SF_ERR_UP);
 
-		/* check if we can handle some connections queued at the proxy. We
-		 * will take as many as we can handle.
+		/* check if we can handle some connections queued.
+		 * We will take as many as we can handle.
 		 */
-		xferred = pendconn_grab_from_px(s);
+		xferred = process_srv_queue(s);
 	}
 	else if (s->next_admin & SRV_ADMF_MAINT) {
 		/* remaining in maintenance mode, let's inform precisely about the
@@ -6855,6 +6893,14 @@ static void srv_update_status(struct server *s, int type, int cause)
 			s->counters.down_trans++;
 			_srv_event_hdl_publish(EVENT_HDL_SUB_SERVER_DOWN, cb_data.common, s);
 		}
+
+		/*
+		 * If the server is no longer running, let's not pretend
+		 * it can handle requests.
+		 */
+		if (s->cur_state != SRV_ST_RUNNING && s->proxy->ready_srv == s)
+			HA_ATOMIC_STORE(&s->proxy->ready_srv, NULL);
+
 		s->counters.last_change = ns_to_sec(now_ns);
 
 		/* publish the state change */

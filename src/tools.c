@@ -2780,7 +2780,8 @@ const char *parse_time_err(const char *text, unsigned *ret, unsigned unit_flags)
  * stored in <ret>. If an error is detected, the pointer to the unexpected
  * character is returned. If the conversion is successful, NULL is returned.
  */
-const char *parse_size_err(const char *text, unsigned *ret) {
+const char *parse_size_ui(const char *text, unsigned *ret)
+{
 	unsigned value = 0;
 
 	if (!isdigit((unsigned char)*text))
@@ -2821,6 +2822,76 @@ const char *parse_size_err(const char *text, unsigned *ret) {
 		if (value > ~0U >> 30)
 			return text;
 		value = value << 30;
+		break;
+	default:
+		return text;
+	}
+
+	if (*text != '\0' && *++text != '\0')
+		return text;
+
+	*ret = value;
+	return NULL;
+}
+
+/* this function converts the string starting at <text> to an ullong stored in
+ * <ret>. If an error is detected, the pointer to the unexpected character is
+ * returned. If the conversion is successful, NULL is returned.
+ */
+const char *parse_size_ull(const char *text, ullong *ret)
+{
+	ullong value = 0;
+
+	if (!isdigit((unsigned char)*text))
+		return text;
+
+	while (1) {
+		unsigned int j;
+
+		j = *text - '0';
+		if (j > 9)
+			break;
+		if (value > ~0ULL / 10)
+			return text;
+		value *= 10;
+		if (value > (value + j))
+			return text;
+		value += j;
+		text++;
+	}
+
+	switch (*text) {
+	case '\0':
+		break;
+	case 'K':
+	case 'k':
+		if (value > ~0ULL >> 10)
+			return text;
+		value = value << 10;
+		break;
+	case 'M':
+	case 'm':
+		if (value > ~0ULL >> 20)
+			return text;
+		value = value << 20;
+		break;
+	case 'G':
+	case 'g':
+		if (value > ~0ULL >> 30)
+			return text;
+		value = value << 30;
+		break;
+	case 'T':
+	case 't':
+		if (value > ~0ULL >> 40)
+			return text;
+		value = value << 40;
+		break;
+	case 'P':
+	case 'p':
+		if (value > ~0ULL >> 50)
+			return text;
+		value = value << 50;
 		break;
 	default:
 		return text;
@@ -5465,7 +5536,11 @@ const void *resolve_sym_name(struct buffer *buf, const char *pfx, const void *ad
 	};
 
 #if (defined(__ELF__) && !defined(__linux__)) || defined(USE_DL)
-	Dl_info dli, dli_main;
+	static Dl_info dli_main;
+	static int dli_main_done; // 0 = not resolved, 1 = resolve in progress, 2 = done
+	static __decl_thread(HA_SPINLOCK_T dladdr_lock);
+	int isolated;
+	Dl_info dli;
 	size_t size;
 	const char *fname, *p;
 #endif
@@ -5483,15 +5558,48 @@ const void *resolve_sym_name(struct buffer *buf, const char *pfx, const void *ad
 
 #if (defined(__ELF__) && !defined(__linux__)) || defined(USE_DL)
 	/* Now let's try to be smarter */
-	if (!dladdr_and_size(addr, &dli, &size))
+
+	/* dladdr_and_size() can be super expensive and will often rely on a
+	 * mutex inside the library to deal with concurrent accesses. We don't
+	 * want to inflict this to parallel callers who could wait much too
+	 * long (e.g. during a wdt warning). Thus, we'll do the following:
+	 *   - if we're isolated or in a panic, we're safe and don't need to
+	 *     lock so we don't wait.
+	 *   - otherwise we use a trylock and we fail on conflict so that
+	 *     noone waits when there is contention.
+	 */
+	isolated = thread_isolated() || (get_tainted() & TAINTED_PANIC);
+
+	if (!isolated &&
+	    HA_SPIN_TRYLOCK(OTHER_LOCK, &dladdr_lock) != 0)
+		goto unknown;
+
+	i = dladdr_and_size(addr, &dli, &size);
+	if (!isolated)
+		HA_SPIN_UNLOCK(OTHER_LOCK, &dladdr_lock);
+
+	if (!i)
 		goto unknown;
 
 	/* 1. prefix the library name if it's not the same object as the one
 	 * that contains the main function. The name is picked between last '/'
 	 * and first following '.'.
 	 */
-	if (!dladdr(main, &dli_main))
-		dli_main.dli_fbase = NULL;
+
+	/* let's check main only once, no need to do it all the time */
+
+	i = HA_ATOMIC_LOAD(&dli_main_done);
+	while (i < 2) {
+		i = 0;
+		if (HA_ATOMIC_CAS(&dli_main_done, &i, 1)) {
+			/* we're the first ones, resolve it */
+			if (!dladdr(main, &dli_main))
+				dli_main.dli_fbase = NULL;
+			HA_ATOMIC_STORE(&dli_main_done, 2); // done
+			break;
+		}
+		ha_thread_relax();
+	}
 
 	if (dli_main.dli_fbase != dli.dli_fbase) {
 		fname = dli.dli_fname;
@@ -5528,6 +5636,48 @@ const void *resolve_sym_name(struct buffer *buf, const char *pfx, const void *ad
 		chunk_appendf(buf, "main-%#lx", (long)((void*)main - addr));
 	else
 		chunk_appendf(buf, "main+%#lx", (long)(addr - (void*)main));
+	return NULL;
+}
+
+/* Tries to append to buffer <buf> the DSO name containing the symbol at address
+ * <addr>. The name (lib or executable) is limited to what lies between the last
+ * '/' and the first following '.'. An optional prefix <pfx> is prepended before
+ * the output if not null. It returns "*unknown*" when the symbol is not found.
+ *
+ * The symbol's address is returned, or NULL when unresolved, in order to allow
+ * the caller to match it against known ones.
+ */
+const void *resolve_dso_name(struct buffer *buf, const char *pfx, const void *addr)
+{
+#if (defined(__ELF__) && !defined(__linux__)) || defined(USE_DL)
+	Dl_info dli;
+	size_t size;
+	const char *fname, *p;
+
+	/* Now let's try to be smarter */
+	if (!dladdr_and_size(addr, &dli, &size))
+		goto unknown;
+
+	if (pfx) {
+		chunk_appendf(buf, "%s", pfx);
+		pfx = NULL;
+	}
+
+	/* keep the part between '/' and '.' */
+	fname = dli.dli_fname;
+	p = strrchr(fname, '/');
+	if (p++)
+		fname = p;
+	p = strchr(fname, '.');
+	if (!p)
+		p = fname + strlen(fname);
+	chunk_appendf(buf, "%.*s", (int)(long)(p - fname), fname);
+	return addr;
+ unknown:
+#endif /* __ELF__ && !__linux__ || USE_DL */
+
+	/* unknown symbol */
+	chunk_appendf(buf, "%s*unknown*", pfx ? pfx : "");
 	return NULL;
 }
 
@@ -5846,6 +5996,70 @@ void ha_generate_uuid_v7(struct buffer *output)
 	             (long long)((rnd[1] >> 14u) | ((uint64_t) rnd[2] << 18u)) & 0xFFFFFFFFFFFFull);
 }
 
+
+/* See is_path_mode(). This version is for internal use and uses a va_list. */
+static int _is_path_mode(mode_t mode, const char *path_fmt, va_list args)
+{
+	struct stat file_stat;
+	ssize_t ret;
+
+	chunk_reset(&trash);
+
+	ret = vsnprintf(trash.area, trash.size, path_fmt, args);
+	if (ret >= trash.size)
+		return 0;
+
+	if (stat(trash.area, &file_stat) != 0)
+		return 0;
+
+	return (file_stat.st_mode & S_IFMT) == mode;
+}
+
+/* Use <path_fmt> and following arguments as a printf format to build up the
+ * name of a file, which will be checked for existence and for mode matching
+ * <mode> among S_IF*. On success, non-zero is returned. On failure, zero is
+ * returned. The trash is destroyed.
+ */
+int is_path_mode(mode_t mode, const char *path_fmt, ...)
+{
+	va_list args;
+	int ret;
+
+	va_start(args, path_fmt);
+	ret = _is_path_mode(mode, path_fmt, args);
+	va_end(args);
+	return ret;
+}
+
+/* Use <path_fmt> and following arguments as a printf format to build up the
+ * name of a file, which will be checked for existence. On success, non-zero
+ * is returned. On failure, zero is returned. The trash is destroyed.
+ */
+int is_file_present(const char *path_fmt, ...)
+{
+	va_list args;
+	int ret;
+
+	va_start(args, path_fmt);
+	ret = _is_path_mode(S_IFREG, path_fmt, args);
+	va_end(args);
+	return ret;
+}
+
+/* Use <path_fmt> and following arguments as a printf format to build up the
+ * name of a directory, which will be checked for existence. On success, non-zero
+ * is returned. On failure, zero is returned. The trash is destroyed.
+ */
+int is_dir_present(const char *path_fmt, ...)
+{
+	va_list args;
+	int ret;
+
+	va_start(args, path_fmt);
+	ret = _is_path_mode(S_IFDIR, path_fmt, args);
+	va_end(args);
+	return ret;
+}
 
 /* only used by parse_line() below. It supports writing in place provided that
  * <in> is updated to the next location before calling it. In that case, the

@@ -42,11 +42,27 @@ enum memprof_method {
 	MEMPROF_METH_MALLOC,
 	MEMPROF_METH_CALLOC,
 	MEMPROF_METH_REALLOC,
+	MEMPROF_METH_STRDUP,
 	MEMPROF_METH_FREE,
 	MEMPROF_METH_P_ALLOC, // pool_alloc()
 	MEMPROF_METH_P_FREE,  // pool_free()
+	MEMPROF_METH_STRNDUP,        // _POSIX_C_SOURCE >= 200809L || glibc >= 2.10
+	MEMPROF_METH_VALLOC,         // _BSD_SOURCE || _XOPEN_SOURCE>=500 || glibc >= 2.12
+	MEMPROF_METH_ALIGNED_ALLOC,  // _ISOC11_SOURCE
+	MEMPROF_METH_POSIX_MEMALIGN, // _POSIX_C_SOURCE >= 200112L
+	MEMPROF_METH_MEMALIGN,       // obsolete
+	MEMPROF_METH_PVALLOC,        // obsolete
 	MEMPROF_METH_METHODS /* count, must be last */
 };
+
+/* mask of 1 << method to match those which free. Note that we don't count
+ * p_alloc among them since p_alloc only has an optionally valid free counter
+ * but which is reported by another call in any case since p_alloc itself does
+ * not free.
+ */
+#define MEMPROF_FREE_MASK   ((1UL << MEMPROF_METH_REALLOC) | \
+                             (1UL << MEMPROF_METH_FREE)    | \
+                             (1UL << MEMPROF_METH_P_FREE))
 
 /* stats:
  *   - malloc increases alloc

@@ -558,6 +558,11 @@ size_t appctx_rcv_buf(struct stconn *sc, struct buffer *buf, size_t count, unsig
 			se_fl_set(appctx->sedesc, SE_FL_ERROR);
 			TRACE_STATE("report ERROR to SE", APPLET_EV_RECV|APPLET_EV_BLK, appctx);
 		}
+
+		if (applet_fl_test(appctx, APPCTX_FL_ERROR))
+			se_report_term_evt(appctx->sedesc, !applet_fl_test(appctx, APPCTX_FL_EOI) ? se_tevt_type_truncated_rcv_err : se_tevt_type_rcv_err);
+		else if (applet_fl_test(appctx, APPCTX_FL_EOS))
+			se_report_term_evt(appctx->sedesc, !applet_fl_test(appctx, APPCTX_FL_EOI) ? se_tevt_type_truncated_eos : se_tevt_type_eos);
 	}
 
   end:
@@ -631,6 +636,9 @@ size_t appctx_snd_buf(struct stconn *sc, struct buffer *buf, size_t count, unsig
 	}
 
 	ret = appctx->applet->snd_buf(appctx, buf, count, flags);
+
+	if (applet_fl_test(appctx, (APPCTX_FL_ERROR|APPCTX_FL_ERR_PENDING)))
+		se_report_term_evt(appctx->sedesc, se_tevt_type_snd_err);
 
   end:
 	if (applet_fl_test(appctx, (APPCTX_FL_ERROR|APPCTX_FL_ERR_PENDING))) {
@@ -711,6 +719,11 @@ int appctx_fastfwd(struct stconn *sc, unsigned int count, unsigned int flags)
 	}
 	/* else */
 	/* 	applet_have_more_data(appctx); */
+
+	if (applet_fl_test(appctx, APPCTX_FL_ERROR))
+		se_report_term_evt(appctx->sedesc, !applet_fl_test(appctx, APPCTX_FL_EOI) ? se_tevt_type_truncated_rcv_err : se_tevt_type_rcv_err);
+	else if (applet_fl_test(appctx, APPCTX_FL_EOS))
+		se_report_term_evt(appctx->sedesc, !applet_fl_test(appctx, APPCTX_FL_EOI) ? se_tevt_type_truncated_eos : se_tevt_type_eos);
 
 	if (se_done_ff(sdo) != 0 || !(sdo->iobuf.flags & (IOBUF_FL_FF_BLOCKED|IOBUF_FL_FF_WANT_ROOM))) {
 		/* Something was forwarding or the consumer states it is not
@@ -908,11 +921,28 @@ struct task *task_process_applet(struct task *t, void *context, unsigned int sta
 
 	TRACE_POINT(APPLET_EV_PROCESS, app);
 
-	if (b_data(&app->outbuf) || se_fl_test(app->sedesc, SE_FL_MAY_FASTFWD_PROD) ||
-	    applet_fl_test(app, APPCTX_FL_EOI|APPCTX_FL_EOS|APPCTX_FL_ERROR))
+	if (b_data(&app->outbuf) || se_fl_test(app->sedesc, SE_FL_MAY_FASTFWD_PROD))
 		applet_have_more_data(app);
 
 	sc_applet_sync_recv(sc);
+
+	if (!se_fl_test(app->sedesc, SE_FL_WANT_ROOM)) {
+		/* Handle EOI/EOS/ERROR outside of data transfer. But take care
+		 * there are no pending data. Otherwise, we must wait.
+		 */
+		if (applet_fl_test(app, APPCTX_FL_EOI) && !se_fl_test(app->sedesc, SE_FL_EOI)) {
+			se_fl_set(app->sedesc, SE_FL_EOI);
+			TRACE_STATE("report EOI to SE", APPLET_EV_RECV|APPLET_EV_BLK, app);
+		}
+		if (applet_fl_test(app, APPCTX_FL_EOS) && !se_fl_test(app->sedesc, SE_FL_EOS)) {
+			se_fl_set(app->sedesc, SE_FL_EOS);
+			TRACE_STATE("report EOS to SE", APPLET_EV_RECV|APPLET_EV_BLK, app);
+		}
+		if (applet_fl_test(app, APPCTX_FL_ERROR) && !se_fl_test(app->sedesc, SE_FL_ERROR)) {
+			se_fl_set(app->sedesc, SE_FL_ERROR);
+			TRACE_STATE("report ERROR to SE", APPLET_EV_RECV|APPLET_EV_BLK, app);
+		}
+	}
 
 	/* TODO: May be move in appctx_rcv_buf or sc_applet_process ? */
 	if (sc_waiting_room(sc) && (sc->flags & SC_FL_ABRT_DONE)) {

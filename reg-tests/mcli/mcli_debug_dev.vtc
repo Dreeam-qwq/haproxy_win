@@ -1,3 +1,4 @@
+#EXCLUDE_TARGETS=osx
 varnishtest "Test master CLI multiple commands with export-mode"
 
 # This test only checks if the master CLI parsing with pipelined commands is working:
@@ -19,7 +20,7 @@ syslog S1 -level info {
 } -start
 
 
-haproxy h1 -W -S -conf {
+haproxy h1 -Ws -S -conf {
     global
 	log ${S1_addr}:${S1_port} local0 info
 

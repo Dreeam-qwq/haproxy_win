@@ -381,7 +381,7 @@ int ssl_sock_generate_certificate_from_conn(struct bind_conf *bind_conf, SSL *ss
 
 /* Load CA cert file and private key used to generate certificates */
 int
-ssl_sock_load_ca(struct bind_conf *bind_conf)
+ssl_sock_gencert_load_ca(struct bind_conf *bind_conf)
 {
 	struct proxy *px = bind_conf->frontend;
 	struct ckch_data *data = NULL;
@@ -415,7 +415,7 @@ ssl_sock_load_ca(struct bind_conf *bind_conf)
 	}
 
 	/* Try to parse file */
-	if (ssl_sock_load_files_into_ckch(bind_conf->ca_sign_file, data, &err)) {
+	if (ssl_sock_load_files_into_ckch(bind_conf->ca_sign_file, data, NULL, &err)) {
 		ha_alert("Proxy '%s': Failed to read CA certificate file '%s' at [%s:%d]. Chain loading failed: %s\n",
 			px->id, bind_conf->ca_sign_file, bind_conf->file, bind_conf->line, err);
 		free(err);
@@ -446,7 +446,7 @@ ssl_sock_load_ca(struct bind_conf *bind_conf)
 
 /* Release CA cert and private key used to generate certificated */
 void
-ssl_sock_free_ca(struct bind_conf *bind_conf)
+ssl_sock_gencert_free_ca(struct bind_conf *bind_conf)
 {
 	if (bind_conf->ca_sign_ckch) {
 		ssl_sock_free_cert_key_and_chain_contents(bind_conf->ca_sign_ckch);

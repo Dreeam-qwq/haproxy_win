@@ -27,7 +27,9 @@ server s1 -repeat 6 {
 
 haproxy h1 -conf {
     global
+    .if !ssllib_name_startswith(AWS-LC)
         tune.ssl.default-dh-param 2048
+    .endif
         tune.ssl.capture-buffer-size 2048
 
     defaults
@@ -38,7 +40,6 @@ haproxy h1 -conf {
         timeout connect "${HAPROXY_TEST_TIMEOUT-5s}"
         timeout client  "${HAPROXY_TEST_TIMEOUT-5s}"
         timeout server  "${HAPROXY_TEST_TIMEOUT-5s}"
-        option httpslog
 
     listen clear-lst
         bind "fd@${clearlst}"

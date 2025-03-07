@@ -18,8 +18,10 @@
 
 #include <haproxy/pool.h>
 #include <haproxy/trace.h>
+#include <haproxy/quic_cc_drs.h>
 #include <haproxy/quic_cid.h>
 #include <haproxy/quic_conn.h>
+#include <haproxy/quic_pacing.h>
 #include <haproxy/quic_retransmit.h>
 #include <haproxy/quic_retry.h>
 #include <haproxy/quic_sock.h>
@@ -293,7 +295,8 @@ static int qc_send_ppkts(struct buffer *buf, struct ssl_sock_ctx *ctx)
 		struct buffer tmpbuf = { };
 		struct quic_tx_packet *first_pkt, *pkt, *next_pkt;
 		uint16_t dglen, gso = 0, gso_fallback = 0;
-		unsigned int time_sent;
+		uint64_t time_sent_ns;
+		unsigned int time_sent_ms;
 
 		pos = (unsigned char *)b_head(buf);
 		dglen = read_u16(pos);
@@ -358,7 +361,8 @@ static int qc_send_ppkts(struct buffer *buf, struct ssl_sock_ctx *ctx)
 
 		b_del(buf, dglen + QUIC_DGRAM_HEADLEN);
 		qc->bytes.tx += tmpbuf.data;
-		time_sent = now_ms;
+		time_sent_ms = now_ms;
+		time_sent_ns = task_mono_time();
 
 		for (pkt = first_pkt; pkt; pkt = next_pkt) {
 			struct quic_cc *cc = &qc->path->cc;
@@ -389,12 +393,17 @@ static int qc_send_ppkts(struct buffer *buf, struct ssl_sock_ctx *ctx)
 
 			qc->cntrs.sent_pkt++;
 
-			pkt->time_sent = time_sent;
+			pkt->time_sent_ns = time_sent_ns;
+			pkt->time_sent_ms = time_sent_ms;
 			if (pkt->flags & QUIC_FL_TX_PACKET_ACK_ELICITING) {
-				pkt->pktns->tx.time_of_last_eliciting = time_sent;
+				pkt->pktns->tx.time_of_last_eliciting = time_sent_ms;
 				qc->path->ifae_pkts++;
 				if (qc->flags & QUIC_FL_CONN_IDLE_TIMER_RESTARTED_AFTER_READ)
 					qc_idle_timer_rearm(qc, 0, 0);
+				if (cc->algo->on_transmit)
+					cc->algo->on_transmit(cc);
+				if (cc->algo->drs_on_transmit)
+					cc->algo->drs_on_transmit(cc, pkt);
 			}
 			if (!(qc->flags & QUIC_FL_CONN_CLOSING) &&
 			    (pkt->flags & QUIC_FL_TX_PACKET_CC)) {
@@ -469,10 +478,12 @@ int qc_purge_txbuf(struct quic_conn *qc, struct buffer *buf)
  *
  * Returns the result from qc_send() function.
  */
-int qc_send_mux(struct quic_conn *qc, struct list *frms)
+enum quic_tx_err qc_send_mux(struct quic_conn *qc, struct list *frms,
+                             struct quic_pacer *pacer)
 {
 	struct list send_list = LIST_HEAD_INIT(send_list);
-	int ret;
+	enum quic_tx_err ret = QUIC_TX_ERR_NONE;
+	int max_dgram = 0, sent;
 
 	TRACE_ENTER(QUIC_EV_CONN_TXPKT, qc);
 	BUG_ON(qc->mux_state != QC_MUX_READY); /* Only MUX can uses this function so it must be ready. */
@@ -480,7 +491,7 @@ int qc_send_mux(struct quic_conn *qc, struct list *frms)
 	if (qc->conn->flags & CO_FL_SOCK_WR_SH) {
 		qc->conn->flags |= CO_FL_ERROR | CO_FL_SOCK_RD_SH;
 		TRACE_DEVEL("connection on error", QUIC_EV_CONN_TXPKT, qc);
-		return 0;
+		return QUIC_TX_ERR_FATAL;
 	}
 
 	/* Try to send post handshake frames first unless on 0-RTT. */
@@ -488,12 +499,30 @@ int qc_send_mux(struct quic_conn *qc, struct list *frms)
 	    qc->state >= QUIC_HS_ST_COMPLETE) {
 		quic_build_post_handshake_frames(qc);
 		qel_register_send(&send_list, qc->ael, &qc->ael->pktns->tx.frms);
-		qc_send(qc, 0, &send_list);
+		qc_send(qc, 0, &send_list, 0);
+	}
+
+	if (pacer) {
+		max_dgram = pacer->credit;
+		BUG_ON(max_dgram <= 0); /* pacer must specify a positive burst value. */
 	}
 
 	TRACE_STATE("preparing data (from MUX)", QUIC_EV_CONN_TXPKT, qc);
 	qel_register_send(&send_list, qc->ael, frms);
-	ret = qc_send(qc, 0, &send_list);
+	sent = qc_send(qc, 0, &send_list, max_dgram);
+
+	if (pacer && qc->path->cc.algo->check_app_limited)
+		qc->path->cc.algo->check_app_limited(&qc->path->cc, sent);
+
+	if (sent <= 0) {
+		ret = QUIC_TX_ERR_FATAL;
+	}
+	else if (pacer) {
+		BUG_ON(sent > max_dgram); /* Must not exceed pacing limit. */
+		if (max_dgram == sent && !LIST_ISEMPTY(frms))
+			ret = QUIC_TX_ERR_PACING;
+		quic_pacing_sent_done(pacer, sent);
+	}
 
 	TRACE_LEAVE(QUIC_EV_CONN_TXPKT, qc);
 	return ret;
@@ -520,26 +549,31 @@ static inline void qc_select_tls_ver(struct quic_conn *qc,
 	}
 }
 
-/* Prepare as much as possible QUIC datagrams/packets for sending from <qels>
- * list of encryption levels. Several packets can be coalesced into a single
+/* Prepare one or several QUIC datagrams/packets for sending from <qels> list
+ * of encryption levels. Several packets can be coalesced into a single
  * datagram. The result is written into <buf>.
+ *
+ * If <max_dgrams> is non null, it limits the number of prepared datagrams.
+ * Useful to support pacing emission.
  *
  * Each datagram is prepended by a two fields header : the datagram length and
  * the address of first packet in the datagram.
  *
- * Returns the number of bytes prepared in datragrams/packets if succeeded
- * (may be 0), or -1 if something wrong happened.
+ * Returns the number of prepared datagrams on success which may be 0. On error
+ * a negative error code is returned.
  */
 static int qc_prep_pkts(struct quic_conn *qc, struct buffer *buf,
-                         struct list *qels)
+                         struct list *qels, int max_dgrams)
 {
-	int ret, cc, padding;
+	int cc, padding;
 	struct quic_tx_packet *first_pkt, *prv_pkt;
 	unsigned char *end, *pos;
 	uint32_t wrlen; /* may differ from dglen if GSO used */
 	uint16_t dglen;
-	size_t total;
+	int total = 0;
 	struct quic_enc_level *qel, *tmp_qel;
+	int dgram_cnt = 0;
+	/* Restrict GSO emission to comply with sendmsg limitation. See QUIC_MAX_GSO_DGRAMS for more details. */
 	uchar gso_dgram_cnt = 0;
 
 	TRACE_ENTER(QUIC_EV_CONN_IO_CB, qc);
@@ -548,13 +582,11 @@ static int qc_prep_pkts(struct quic_conn *qc, struct buffer *buf,
 	 */
 	BUG_ON_HOT(buf->head || buf->data);
 
-	ret = -1;
 	cc =  qc->flags & QUIC_FL_CONN_IMMEDIATE_CLOSE;
 	padding = 0;
 	first_pkt = prv_pkt = NULL;
 	end = pos = (unsigned char *)b_head(buf);
 	dglen = wrlen = 0;
-	total = 0;
 
 	list_for_each_entry_safe(qel, tmp_qel, qels, el_send) {
 		struct quic_tls_ctx *tls_ctx;
@@ -589,6 +621,15 @@ static int qc_prep_pkts(struct quic_conn *qc, struct buffer *buf,
 			enum qc_build_pkt_err err;
 
 			TRACE_PROTO("TX prep pkts", QUIC_EV_CONN_PHPKTS, qc, qel);
+
+			/* Start to decrement <max_dgrams> after the first packet built. */
+			if (!dglen && pos != (unsigned char *)b_head(buf)) {
+				if (max_dgrams && !--max_dgrams) {
+					BUG_ON(LIST_ISEMPTY(frms));
+					TRACE_PROTO("reached max allowed built datagrams", QUIC_EV_CONN_PHPKTS, qc, qel);
+					goto out;
+				}
+			}
 
 			if (!first_pkt)
 				pos += QUIC_DGRAM_HEADLEN;
@@ -657,8 +698,9 @@ static int qc_prep_pkts(struct quic_conn *qc, struct buffer *buf,
 					 * except if it is an too short Initial.
 					 */
 					if (first_pkt && (first_pkt->type != QUIC_PACKET_TYPE_INITIAL ||
-					                  wrlen >= QUIC_INITIAL_PACKET_MINLEN))
+					                  wrlen >= QUIC_INITIAL_PACKET_MINLEN)) {
 						qc_txb_store(buf, wrlen, first_pkt);
+					}
 					TRACE_PROTO("could not prepare anymore packet", QUIC_EV_CONN_PHPKTS, qc, qel);
 					break;
 
@@ -668,7 +710,8 @@ static int qc_prep_pkts(struct quic_conn *qc, struct buffer *buf,
 				}
 
 				if (err == QC_BUILD_PKT_ERR_ALLOC || err == QC_BUILD_PKT_ERR_ENCRYPT)
-					goto leave;
+					goto err;
+				first_pkt = NULL;
 				goto out;
 			}
 
@@ -693,6 +736,12 @@ static int qc_prep_pkts(struct quic_conn *qc, struct buffer *buf,
 					cur_pkt->flags |= QUIC_FL_TX_PACKET_COALESCED;
 			}
 
+			/* If <dglen> is NULL at this stage, it means the built
+			 * packet is the first of a new datagram.
+			 */
+			if (!dglen)
+				++dgram_cnt;
+
 			total += cur_pkt->len;
 			dglen += cur_pkt->len;
 			wrlen += cur_pkt->len;
@@ -703,10 +752,8 @@ static int qc_prep_pkts(struct quic_conn *qc, struct buffer *buf,
 			BUG_ON(padding && !next_qel);
 
 			/* Build only one datagram when an immediate close is required. */
-			if (cc) {
-				qc_txb_store(buf, dglen, first_pkt);
+			if (cc)
 				goto out;
-			}
 
 			/* Only one short packet by datagram when probing. */
 			if (probe && qel == qc->ael)
@@ -720,7 +767,8 @@ static int qc_prep_pkts(struct quic_conn *qc, struct buffer *buf,
 			         !(HA_ATOMIC_LOAD(&qc->li->flags) & LI_F_UDP_GSO_NOTSUPP) &&
 			         dglen == qc->path->mtu &&
 			         (char *)end < b_wrap(buf) &&
-			         gso_dgram_cnt < 64) {
+			         ++gso_dgram_cnt < QUIC_MAX_GSO_DGRAMS) {
+
 				/* A datagram covering the full MTU has been
 				 * built, use GSO to built next entry. Do not
 				 * reserve extra space for datagram header.
@@ -728,11 +776,6 @@ static int qc_prep_pkts(struct quic_conn *qc, struct buffer *buf,
 				prv_pkt = cur_pkt;
 				dglen = 0;
 
-				/* man 7 udp UDP_SEGMENT
-				 * The segment size must be chosen such that at
-				 * most 64 datagrams are sent in a single call
-				 */
-				++gso_dgram_cnt;
 			}
 			else {
 				/* Finalize current datagram if not all frames sent. */
@@ -753,33 +796,43 @@ static int qc_prep_pkts(struct quic_conn *qc, struct buffer *buf,
 		TRACE_DEVEL("next encryption level", QUIC_EV_CONN_PHPKTS, qc);
 	}
 
+ out:
 	if (first_pkt)
 		qc_txb_store(buf, wrlen, first_pkt);
 
- out:
 	if (cc && total) {
 		BUG_ON(buf != &qc->tx.cc_buf);
 		BUG_ON(dglen != total);
 		qc->tx.cc_dgram_len = dglen;
 	}
 
-	ret = total;
- leave:
 	TRACE_LEAVE(QUIC_EV_CONN_PHPKTS, qc);
-	return ret;
+	return dgram_cnt;
+
+ err:
+	TRACE_DEVEL("leaving on error", QUIC_EV_CONN_PHPKTS, qc);
+	return -1;
 }
 
 /* Encode frames and send them as packets for <qc> connection. Input frames are
  * specified via quic_enc_level <send_list> through their send_frms member. Set
  * <old_data> when reemitted duplicated data.
  *
-* Returns 1 on success else 0. Note that <send_list> will always be reset
-* after qc_send() exit.
+ * If <max_dgrams> is non null, it limits the number of emitted datagrams.
+ * Useful to support pacing emission.
+ *
+ * Note that <send_list> will always be emptied on function completion, both on
+ * success and error.
+ *
+ * Returns the number of sent datagrams on success. It means either that all
+ * input frames were sent or emission is interrupted due to pacing. Else a
+ * negative error code is returned.
  */
-int qc_send(struct quic_conn *qc, int old_data, struct list *send_list)
+int qc_send(struct quic_conn *qc, int old_data, struct list *send_list,
+            int max_dgrams)
 {
 	struct quic_enc_level *qel, *tmp_qel;
-	int ret = 0, status = 0;
+	int prep = 0, ret = 0;
 	struct buffer *buf;
 
 	TRACE_ENTER(QUIC_EV_CONN_TXPKT, qc);
@@ -787,11 +840,13 @@ int qc_send(struct quic_conn *qc, int old_data, struct list *send_list)
 	buf = qc_get_txb(qc);
 	if (!buf) {
 		TRACE_ERROR("buffer allocation failed", QUIC_EV_CONN_TXPKT, qc);
+		ret = -1;
 		goto out;
 	}
 
 	if (b_data(buf) && !qc_purge_txbuf(qc, buf)) {
 		TRACE_ERROR("Could not purge TX buffer", QUIC_EV_CONN_TXPKT, qc);
+		ret = -1;
 		goto out;
 	}
 
@@ -807,22 +862,33 @@ int qc_send(struct quic_conn *qc, int old_data, struct list *send_list)
 	while (!LIST_ISEMPTY(send_list) &&
 	       (!(qc->flags & (QUIC_FL_CONN_CLOSING|QUIC_FL_CONN_DRAINING)) ||
 	        (qc->flags & QUIC_FL_CONN_IMMEDIATE_CLOSE))) {
+
 		/* Buffer must always be empty before qc_prep_pkts() usage.
 		 * qc_send_ppkts() ensures it is cleared on success.
 		 */
 		BUG_ON_HOT(b_data(buf));
 		b_reset(buf);
 
-		ret = qc_prep_pkts(qc, buf, send_list);
+		prep = qc_prep_pkts(qc, buf, send_list, max_dgrams ? max_dgrams - ret : 0);
+		BUG_ON(max_dgrams && prep > max_dgrams);
 
 		if (b_data(buf) && !qc_send_ppkts(buf, qc->xprt_ctx)) {
 			if (qc->flags & QUIC_FL_CONN_TO_KILL)
 				qc_txb_release(qc);
+			ret = -1;
 			goto out;
 		}
 
-		if (ret <= 0) {
+		if (prep <= 0) {
+			/* TODO should this be considered error if prep<0 ? */
 			TRACE_DEVEL("stopping on qc_prep_pkts() return", QUIC_EV_CONN_TXPKT, qc);
+			break;
+		}
+
+		ret += prep;
+		BUG_ON(max_dgrams && ret > max_dgrams);
+		if (max_dgrams && ret == max_dgrams && !LIST_ISEMPTY(send_list)) {
+			TRACE_DEVEL("stopping for artificial pacing", QUIC_EV_CONN_TXPKT, qc);
 			break;
 		}
 
@@ -834,10 +900,6 @@ int qc_send(struct quic_conn *qc, int old_data, struct list *send_list)
 	}
 
 	qc_txb_release(qc);
-	if (ret < 0)
-		goto out;
-
-	status = 1;
 
  out:
 	if (old_data) {
@@ -851,8 +913,8 @@ int qc_send(struct quic_conn *qc, int old_data, struct list *send_list)
 		qel->send_frms = NULL;
 	}
 
-	TRACE_DEVEL((status ? "leaving" : "leaving in error"), QUIC_EV_CONN_TXPKT, qc);
-	return status;
+	TRACE_DEVEL((ret > 0 ? "leaving" : "leaving in error"), QUIC_EV_CONN_TXPKT, qc);
+	return ret;
 }
 
 /* Insert <qel> into <send_list> in preparation for sending. Set its send
@@ -916,10 +978,10 @@ int qc_dgrams_retransmit(struct quic_conn *qc)
 				if (qc->hel)
 					qel_register_send(&send_list, qc->hel, &hfrms);
 
-				sret = qc_send(qc, 1, &send_list);
+				sret = qc_send(qc, 1, &send_list, 0);
 				qc_free_frm_list(qc, &ifrms);
 				qc_free_frm_list(qc, &hfrms);
-				if (!sret)
+				if (sret < 0)
 					goto leave;
 			}
 			else {
@@ -929,10 +991,10 @@ int qc_dgrams_retransmit(struct quic_conn *qc)
 				 */
 				ipktns->tx.pto_probe = 1;
 				qel_register_send(&send_list, qc->iel, &ifrms);
-				sret = qc_send(qc, 0, &send_list);
+				sret = qc_send(qc, 0, &send_list, 0);
 				qc_free_frm_list(qc, &ifrms);
 				qc_free_frm_list(qc, &hfrms);
-				if (!sret)
+				if (sret < 0)
 					goto leave;
 
 				break;
@@ -958,9 +1020,9 @@ int qc_dgrams_retransmit(struct quic_conn *qc)
 				if (!LIST_ISEMPTY(&frms1)) {
 					hpktns->tx.pto_probe = 1;
 					qel_register_send(&send_list, qc->hel, &frms1);
-					sret = qc_send(qc, 1, &send_list);
+					sret = qc_send(qc, 1, &send_list, 0);
 					qc_free_frm_list(qc, &frms1);
-					if (!sret)
+					if (sret < 0)
 						goto leave;
 				}
 			}
@@ -981,9 +1043,9 @@ int qc_dgrams_retransmit(struct quic_conn *qc)
 			if (!LIST_ISEMPTY(&frms1)) {
 				apktns->tx.pto_probe = 1;
 				qel_register_send(&send_list, qc->ael, &frms1);
-				sret = qc_send(qc, 1, &send_list);
+				sret = qc_send(qc, 1, &send_list, 0);
 				qc_free_frm_list(qc, &frms1);
-				if (!sret) {
+				if (sret < 0) {
 					qc_free_frm_list(qc, &frms2);
 					goto leave;
 				}
@@ -992,9 +1054,9 @@ int qc_dgrams_retransmit(struct quic_conn *qc)
 			if (!LIST_ISEMPTY(&frms2)) {
 				apktns->tx.pto_probe = 1;
 				qel_register_send(&send_list, qc->ael, &frms2);
-				sret = qc_send(qc, 1, &send_list);
+				sret = qc_send(qc, 1, &send_list, 0);
 				qc_free_frm_list(qc, &frms2);
-				if (!sret)
+				if (sret < 0)
 					goto leave;
 			}
 			TRACE_STATE("no more need to probe 01RTT packet number space",
@@ -1252,87 +1314,6 @@ static inline int quic_write_uint32(unsigned char **buf,
 	return 1;
 }
 
-/* Return the maximum number of bytes we must use to completely fill a
- * buffer with <sz> as size for a data field of bytes prefixed by its QUIC
- * variable-length (may be 0).
- * Also put in <*len_sz> the size of this QUIC variable-length.
- * So after returning from this function we have : <*len_sz> + <ret> <= <sz>
- * (<*len_sz> = { max(i), i + ret <= <sz> }) .
- */
-static inline size_t max_available_room(size_t sz, size_t *len_sz)
-{
-	size_t sz_sz, ret;
-	size_t diff;
-
-	sz_sz = quic_int_getsize(sz);
-	if (sz <= sz_sz)
-		return 0;
-
-	ret = sz - sz_sz;
-	*len_sz = quic_int_getsize(ret);
-	/* Difference between the two sizes. Note that <sz_sz> >= <*len_sz>. */
-	diff = sz_sz - *len_sz;
-	if (unlikely(diff > 0)) {
-		/* Let's try to take into an account remaining bytes.
-		 *
-		 *                  <----------------> <sz_sz>
-		 *  <--------------><-------->  +----> <max_int>
-		 *       <ret>       <len_sz>   |
-		 *  +---------------------------+-----------....
-		 *  <--------------------------------> <sz>
-		 */
-		size_t max_int = quic_max_int(*len_sz);
-
-		if (max_int + *len_sz <= sz)
-			ret = max_int;
-		else
-			ret = sz - diff;
-	}
-
-	return ret;
-}
-
-/* This function computes the maximum data we can put into a buffer with <sz> as
- * size prefixed with a variable-length field "Length" whose value is the
- * remaining data length, already filled of <ilen> bytes which must be taken
- * into an account by "Length" field, and finally followed by the data we want
- * to put in this buffer prefixed again by a variable-length field.
- * <sz> is the size of the buffer to fill.
- * <ilen> the number of bytes already put after the "Length" field.
- * <dlen> the number of bytes we want to at most put in the buffer.
- * Also set <*dlen_sz> to the size of the data variable-length we want to put in
- * the buffer. This is typically this function which must be used to fill as
- * much as possible a QUIC packet made of only one CRYPTO or STREAM frames.
- * Returns this computed size if there is enough room in the buffer, 0 if not.
- */
-static inline size_t max_stream_data_size(size_t sz, size_t ilen, size_t dlen)
-{
-	size_t ret, len_sz, dlen_sz;
-
-	/*
-	 * The length of variable-length QUIC integers are powers of two.
-	 * Look for the first 3length" field value <len_sz> which match our need.
-	 * As we must put <ilen> bytes in our buffer, the minimum value for
-	 * <len_sz> is the number of bytes required to encode <ilen>.
-	 */
-	for (len_sz = quic_int_getsize(ilen);
-	     len_sz <= QUIC_VARINT_MAX_SIZE;
-	     len_sz <<= 1) {
-		if (sz < len_sz + ilen)
-			return 0;
-
-		ret = max_available_room(sz - len_sz - ilen, &dlen_sz);
-		if (!ret)
-			return 0;
-
-		/* Check that <*len_sz> matches <ret> value */
-		if (len_sz + ilen + dlen_sz + ret <= quic_max_int(len_sz))
-			return ret < dlen ? ret : dlen;
-	}
-
-	return 0;
-}
-
 /* Return the length in bytes of <pn> packet number depending on
  * <largest_acked_pn> the largest ackownledged packet number.
  */
@@ -1551,66 +1532,40 @@ static int qc_build_frms(struct list *outlist, struct list *inlist,
 	 * in the switch/case block.
 	 */
 	list_for_each_entry_safe(cf, cfbak, inlist, list) {
-		/* header length, data length, frame length. */
-		size_t hlen, dlen, dlen_sz, avail_room, flen;
+		struct quic_frame *split_frm;
+		size_t flen, split_size;
 
 		if (!room)
 			break;
 
 		switch (cf->type) {
 		case QUIC_FT_CRYPTO:
-			TRACE_DEVEL("          New CRYPTO frame build (room, len)",
-			            QUIC_EV_CONN_BCFRMS, qc, &room, len);
-			/* Compute the length of this CRYPTO frame header */
-			hlen = 1 + quic_int_getsize(cf->crypto.offset);
-			/* Compute the data length of this CRYPTO frame. */
-			dlen = max_stream_data_size(room, hlen, cf->crypto.len);
-			TRACE_DEVEL(" CRYPTO data length (hlen, crypto.len, dlen)",
-			            QUIC_EV_CONN_BCFRMS, qc, &hlen, &cf->crypto.len, &dlen);
-			if (!dlen)
+			flen = quic_strm_frm_fillbuf(room, cf, &split_size);
+			if (!flen)
 				continue;
 
-			/* CRYPTO frame length. */
-			flen = hlen + quic_int_getsize(dlen) + dlen;
 			TRACE_DEVEL("                 CRYPTO frame length (flen)",
 			            QUIC_EV_CONN_BCFRMS, qc, &flen);
-			/* Add the CRYPTO data length and its encoded length to the packet
-			 * length and the length of this length.
-			 */
-			*len += flen;
-			room -= flen;
-			if (dlen == cf->crypto.len) {
-				/* <cf> CRYPTO data have been consumed. */
-				LIST_DEL_INIT(&cf->list);
-				LIST_APPEND(outlist, &cf->list);
-			}
-			else {
-				struct quic_frame *new_cf;
 
-				new_cf = qc_frm_alloc(QUIC_FT_CRYPTO);
-				if (!new_cf) {
+			if (split_size) {
+				split_frm = quic_strm_frm_split(cf, split_size);
+				if (!split_frm) {
 					TRACE_ERROR("No memory for new crypto frame", QUIC_EV_CONN_BCFRMS, qc);
 					continue;
 				}
-
-				new_cf->crypto.len = dlen;
-				new_cf->crypto.offset = cf->crypto.offset;
-				new_cf->crypto.qel = qel;
-				TRACE_DEVEL("split frame", QUIC_EV_CONN_PRSAFRM, qc, new_cf);
-				if (cf->origin) {
+				TRACE_DEVEL("split frame", QUIC_EV_CONN_PRSAFRM, qc, split_frm);
+				if (split_frm->origin)
 					TRACE_DEVEL("duplicated frame", QUIC_EV_CONN_PRSAFRM, qc);
-					/* This <cf> frame was duplicated */
-					LIST_APPEND(&cf->origin->reflist, &new_cf->ref);
-					new_cf->origin = cf->origin;
-					/* Detach the remaining CRYPTO frame from its original frame */
-					LIST_DEL_INIT(&cf->ref);
-					cf->origin = NULL;
-				}
-				LIST_APPEND(outlist, &new_cf->list);
-				/* Consume <dlen> bytes of the current frame. */
-				cf->crypto.len -= dlen;
-				cf->crypto.offset += dlen;
+				LIST_APPEND(outlist, &split_frm->list);
 			}
+			else {
+				LIST_DEL_INIT(&cf->list);
+				LIST_APPEND(outlist, &cf->list);
+			}
+
+			*len += flen;
+			room -= flen;
+
 			break;
 
 		case QUIC_FT_STREAM_8 ... QUIC_FT_STREAM_F:
@@ -1620,106 +1575,13 @@ static int qc_build_frms(struct list *outlist, struct list *inlist,
 					continue;
 				}
 			}
-			/* Note that these frames are accepted in short packets only without
-			 * "Length" packet field. Here, <*len> is used only to compute the
-			 * sum of the lengths of the already built frames for this packet.
-			 *
-			 * Compute the length of this STREAM frame "header" made a all the field
-			 * excepting the variable ones. Note that +1 is for the type of this frame.
-			 */
-			hlen = 1 + quic_int_getsize(cf->stream.id) +
-				((cf->type & QUIC_STREAM_FRAME_TYPE_OFF_BIT) ? quic_int_getsize(cf->stream.offset) : 0);
-			/* Compute the data length of this STREAM frame. */
-			avail_room = room - hlen;
-			if ((ssize_t)avail_room <= 0)
+
+			flen = quic_strm_frm_fillbuf(room, cf, &split_size);
+			if (!flen)
 				continue;
 
-			TRACE_DEVEL("          New STREAM frame build (room, len)",
-			            QUIC_EV_CONN_BCFRMS, qc, &room, len);
-
-			/* hlen contains STREAM id and offset. Ensure there is
-			 * enough room for length field.
-			 */
-			if (cf->type & QUIC_STREAM_FRAME_TYPE_LEN_BIT) {
-				dlen = QUIC_MIN((uint64_t)max_available_room(avail_room, &dlen_sz),
-				                cf->stream.len);
-				dlen_sz = quic_int_getsize(dlen);
-				flen = hlen + dlen_sz + dlen;
-			}
-			else {
-				dlen = QUIC_MIN((uint64_t)avail_room, cf->stream.len);
-				flen = hlen + dlen;
-			}
-
-			if (cf->stream.len && !dlen) {
-				/* Only a small gap is left on buffer, not
-				 * enough to encode the STREAM data length.
-				 */
-				continue;
-			}
-
-			TRACE_DEVEL(" STREAM data length (hlen, stream.len, dlen)",
-			            QUIC_EV_CONN_BCFRMS, qc, &hlen, &cf->stream.len, &dlen);
 			TRACE_DEVEL("                 STREAM frame length (flen)",
 			            QUIC_EV_CONN_BCFRMS, qc, &flen);
-			/* Add the STREAM data length and its encoded length to the packet
-			 * length and the length of this length.
-			 */
-			*len += flen;
-			room -= flen;
-			if (dlen == cf->stream.len) {
-				/* <cf> STREAM data have been consumed. */
-				LIST_DEL_INIT(&cf->list);
-				LIST_APPEND(outlist, &cf->list);
-
-				qc_stream_desc_send(cf->stream.stream,
-				                    cf->stream.offset,
-				                    cf->stream.len);
-			}
-			else {
-				struct quic_frame *new_cf;
-				struct buffer cf_buf;
-
-				new_cf = qc_frm_alloc(cf->type);
-				if (!new_cf) {
-					TRACE_ERROR("No memory for new STREAM frame", QUIC_EV_CONN_BCFRMS, qc);
-					continue;
-				}
-
-				new_cf->stream.stream = cf->stream.stream;
-				new_cf->stream.buf = cf->stream.buf;
-				new_cf->stream.id = cf->stream.id;
-				new_cf->stream.offset = cf->stream.offset;
-				new_cf->stream.len = dlen;
-				new_cf->type |= QUIC_STREAM_FRAME_TYPE_LEN_BIT;
-				/* FIN bit reset */
-				new_cf->type &= ~QUIC_STREAM_FRAME_TYPE_FIN_BIT;
-				new_cf->stream.data = cf->stream.data;
-				new_cf->stream.dup = cf->stream.dup;
-				TRACE_DEVEL("split frame", QUIC_EV_CONN_PRSAFRM, qc, new_cf);
-				if (cf->origin) {
-					TRACE_DEVEL("duplicated frame", QUIC_EV_CONN_PRSAFRM, qc);
-					/* This <cf> frame was duplicated */
-					LIST_APPEND(&cf->origin->reflist, &new_cf->ref);
-					new_cf->origin = cf->origin;
-					/* Detach this STREAM frame from its origin */
-					LIST_DEL_INIT(&cf->ref);
-					cf->origin = NULL;
-				}
-				LIST_APPEND(outlist, &new_cf->list);
-				cf->type |= QUIC_STREAM_FRAME_TYPE_OFF_BIT;
-				/* Consume <dlen> bytes of the current frame. */
-				cf_buf = b_make(b_orig(cf->stream.buf),
-				                b_size(cf->stream.buf),
-				                (char *)cf->stream.data - b_orig(cf->stream.buf), 0);
-				cf->stream.len -= dlen;
-				cf->stream.offset += dlen;
-				cf->stream.data = (unsigned char *)b_peek(&cf_buf, dlen);
-
-				qc_stream_desc_send(new_cf->stream.stream,
-				                    new_cf->stream.offset,
-				                    new_cf->stream.len);
-			}
 
 			/* TODO the MUX is notified about the frame sending via
 			 * previous qc_stream_desc_send call. However, the
@@ -1728,6 +1590,32 @@ static int qc_build_frms(struct list *outlist, struct list *inlist,
 			 * notified, the transport layer is responsible to
 			 * bufferize and resent the announced data later.
 			 */
+
+			if (split_size) {
+				split_frm = quic_strm_frm_split(cf, split_size);
+				if (!split_frm) {
+					TRACE_ERROR("No memory for new STREAM frame", QUIC_EV_CONN_BCFRMS, qc);
+					continue;
+				}
+
+				TRACE_DEVEL("split frame", QUIC_EV_CONN_PRSAFRM, qc, split_frm);
+				if (split_frm->origin)
+					TRACE_DEVEL("duplicated frame", QUIC_EV_CONN_PRSAFRM, qc);
+				LIST_APPEND(outlist, &split_frm->list);
+				qc_stream_desc_send(split_frm->stream.stream,
+				                    split_frm->stream.offset,
+				                    split_frm->stream.len);
+			}
+			else {
+				LIST_DEL_INIT(&cf->list);
+				LIST_APPEND(outlist, &cf->list);
+				qc_stream_desc_send(cf->stream.stream,
+				                    cf->stream.offset,
+				                    cf->stream.len);
+			}
+
+			*len += flen;
+			room -= flen;
 
 			break;
 
@@ -1846,7 +1734,7 @@ static int qc_do_build_pkt(unsigned char *pos, const unsigned char *end,
                            const struct quic_version *ver, struct list *frms)
 {
 	unsigned char *beg, *payload;
-	size_t len, len_sz, len_frms, padding_len;
+	size_t len, len_sz = 0, len_frms, padding_len;
 	struct quic_frame frm;
 	struct quic_frame ack_frm;
 	struct quic_frame cc_frm;
@@ -1901,6 +1789,17 @@ static int qc_do_build_pkt(unsigned char *pos, const unsigned char *end,
 	}
 
 	head_len = pos - beg;
+
+	if (pkt->type != QUIC_PACKET_TYPE_SHORT) {
+		/* Reserve enough bytes for packet length. Real value will be
+		 * recalculated later after payload length is determined.
+		 */
+		len_sz = quic_int_getsize(end - pos);
+		if (end - pos <= len_sz)
+			goto no_room;
+		pos += len_sz;
+	}
+
 	/* Build an ACK frame if required. */
 	ack_frm_len = 0;
 	/* Do not ack and probe at the same time. */
@@ -1950,7 +1849,23 @@ static int qc_do_build_pkt(unsigned char *pos, const unsigned char *end,
 				goto comp_pkt_len;
 			}
 
-			if (!ack_frm_len && !qel->pktns->tx.pto_probe)
+			if (qel->pktns->tx.pto_probe) {
+				/* If a probing packet was asked and could not be built,
+				 * this is not because there was not enough room, but due to
+				 * its frames which were already acknowledeged.
+				 * See qc_stream_frm_is_acked()) called by qc_build_frms().
+				 * Note that qc_stream_frm_is_acked() logs a trace in this
+				 * case mentionning some frames were already acknowledged.
+				 *
+				 * That said, the consequence must be the same: cancelling
+				 * the packet build as if there was not enough room in the
+				 * TX buffer.
+				 */
+				 qel->pktns->tx.pto_probe--;
+				 goto no_room;
+			}
+
+			if (!ack_frm_len)
 				goto no_room;
 		}
 	}
@@ -1972,11 +1887,15 @@ static int qc_do_build_pkt(unsigned char *pos, const unsigned char *end,
 	}
 	add_ping_frm = 0;
 	padding_len = 0;
-	len_sz = quic_int_getsize(len);
 	/* Add this packet size to <dglen> */
 	dglen += head_len + len;
-	if (pkt->type != QUIC_PACKET_TYPE_SHORT)
+
+	if (pkt->type != QUIC_PACKET_TYPE_SHORT) {
+		/* Remove reserved space for packet length. */
+		pos -= len_sz;
+		len_sz = quic_int_getsize(len);
 		dglen += len_sz;
+	}
 
 	if (padding && dglen < QUIC_INITIAL_PACKET_MINLEN) {
 		padding_len = QUIC_INITIAL_PACKET_MINLEN - dglen;
@@ -2127,7 +2046,8 @@ static inline void quic_tx_packet_init(struct quic_tx_packet *pkt, int type)
 	pkt->in_flight_len = 0;
 	pkt->pn_node.key = (uint64_t)-1;
 	LIST_INIT(&pkt->frms);
-	pkt->time_sent = TICK_ETERNITY;
+	pkt->time_sent_ms = TICK_ETERNITY;
+	pkt->time_sent_ns = 0;
 	pkt->next = NULL;
 	pkt->prev = NULL;
 	pkt->largest_acked_pn = -1;

@@ -1,6 +1,6 @@
 /*
  * HAProxy : High Availability-enabled HTTP/TCP proxy
- * Copyright 2000-2024 Willy Tarreau <willy@haproxy.org>.
+ * Copyright 2000-2025 Willy Tarreau <willy@haproxy.org>.
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License
@@ -23,8 +23,6 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <netdb.h>
-#include <fcntl.h>
-#include <errno.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <sys/resource.h>
@@ -58,9 +56,6 @@
 
 #ifdef DEBUG_FULL
 #include <assert.h>
-#endif
-#if defined(USE_SYSTEMD)
-#include <haproxy/systemd.h>
 #endif
 
 #include <import/sha1.h>
@@ -123,6 +118,7 @@
 #include <haproxy/stats-file.h>
 #include <haproxy/stats-t.h>
 #include <haproxy/stream.h>
+#include <haproxy/systemd.h>
 #include <haproxy/task.h>
 #include <haproxy/thread.h>
 #include <haproxy/time.h>
@@ -146,17 +142,12 @@ DECLARE_INIT_STAGES;
  */
 empty_t __read_mostly_align HA_SECTION("read_mostly") ALIGNED(64);
 
-#ifdef BUILD_FEATURES
-char *build_features = BUILD_FEATURES;
-#else
-char *build_features = "";
-#endif
-
 /* list of config files */
 static struct list cfg_cfgfiles = LIST_HEAD_INIT(cfg_cfgfiles);
 int  pid;			/* current process id */
 char **init_env;		/* to keep current process env variables backup */
 int  pidfd = -1;		/* FD to keep PID */
+int daemon_fd[2] = {-1, -1};	/* pipe to communicate with parent process */
 
 static unsigned long stopping_tgroup_mask; /* Thread groups acknowledging stopping */
 
@@ -231,7 +222,7 @@ int connected_peers = 0; /* number of connected peers (verified ones) */
 int arg_mode = 0;	/* MODE_DEBUG etc as passed on command line ... */
 char *change_dir = NULL; /* set when -C is passed */
 char *check_condition = NULL; /* check condition passed to -cc */
-char *progname;
+char *progname = NULL; /* HAProxy binary's name */
 
 /* Here we store information about the pids of the processes we may pause
  * or kill. We will send them a signal every 10 ms until we can bind to all
@@ -242,7 +233,7 @@ static int *oldpids = NULL;
 int oldpids_sig; /* use USR1 or TERM */
 
 /* Path to the unix socket we use to retrieve listener sockets from the old process */
-static const char *old_unixsocket;
+const char *old_unixsocket;
 
 int atexit_flag = 0;
 
@@ -255,17 +246,19 @@ char hostname[MAX_HOSTNAME_LEN];
 char *localpeer = NULL;
 static char *kwd_dump = NULL; // list of keyword dumps to produce
 
-static char **old_argv = NULL; /* previous argv but cleaned up */
+char **old_argv = NULL; /* previous argv but cleaned up */
 
 struct list proc_list = LIST_HEAD_INIT(proc_list);
+
+#ifdef DEBUG_UNIT
+struct list unittest_list = LIST_HEAD_INIT(unittest_list);
+static int unittest_argc = -1;
+#endif
 
 int master = 0; /* 1 if in master, 0 if in child */
 
 /* per-boot randomness */
 unsigned char boot_seed[20];        /* per-boot random seed (160 bits initially) */
-
-/* takes the thread config in argument or NULL for any thread */
-static void *run_thread_poll_loop(void *data);
 
 /* bitfield of a few warnings to emit just once (WARN_*) */
 unsigned int warned = 0;
@@ -302,6 +295,8 @@ struct build_opts_str {
 	const char *str;
 	int must_free;
 };
+
+int mode_stress_level = 0;
 
 /*********************************************************************/
 /*  general purpose functions  ***************************************/
@@ -357,13 +352,47 @@ void hap_register_feature(const char *name)
 	static int must_free = 0;
 	int new_len = strlen(build_features) + 2 + strlen(name);
 	char *new_features;
+	char *startp, *endp;
+	int found = 0;
 
 	new_features = malloc(new_len + 1);
 	if (!new_features)
 		return;
 
 	strlcpy2(new_features, build_features, new_len);
-	snprintf(new_features, new_len + 1, "%s +%s", build_features, name);
+
+	startp = new_features;
+
+	/* look if the string already exists */
+	while (startp) {
+		char *sign = startp;
+
+		/* tokenize for simpler strcmp */
+		endp = strchr(startp, ' ');
+		if (endp)
+			*endp = '\0';
+
+		startp++; /* skip sign */
+
+		if (strcmp(startp, name) == 0) {
+			*sign = '+';
+			found = 1;
+		}
+
+		/* couldn't find a space, that's the end of the string */
+		if (!endp)
+			break;
+
+		*endp = ' ';
+		startp = endp + 1;
+
+		if (found)
+			break;
+	}
+
+	/* if we didn't find the feature add it to the string */
+	if (!found)
+		snprintf(new_features, new_len + 1, "%s +%s", build_features, name);
 
 	if (must_free)
 		ha_free(&build_features);
@@ -371,6 +400,22 @@ void hap_register_feature(const char *name)
 	build_features = new_features;
 	must_free = 1;
 }
+
+#ifdef DEBUG_UNIT
+/* register a function that could be registered in "-U" argument */
+void hap_register_unittest(const char *name, int (*fct)(int argc, char **argv))
+{
+	struct unittest_fct *unit;
+
+	if (!name || !fct)
+		return;
+
+	unit = calloc(1, sizeof(*unit));
+	unit->fct = fct;
+	unit->name = name;
+	LIST_APPEND(&unittest_list, &unit->list);
+}
+#endif
 
 #define VERSION_MAX_ELTS  7
 
@@ -565,26 +610,12 @@ static void display_build_opts()
 {
 	const char **opt;
 
-	printf("Build options :"
-#ifdef BUILD_TARGET
-	       "\n  TARGET  = " BUILD_TARGET
-#endif
-#ifdef BUILD_CC
-	       "\n  CC      = " BUILD_CC
-#endif
-#ifdef BUILD_CFLAGS
-	       "\n  CFLAGS  = " BUILD_CFLAGS
-#endif
-#ifdef BUILD_OPTIONS
-	       "\n  OPTIONS = " BUILD_OPTIONS
-#endif
-#ifdef BUILD_DEBUG
-	       "\n  DEBUG   = " BUILD_DEBUG
-#endif
+	printf("Build options : %s"
 	       "\n\nFeature list : %s"
 	       "\n\nDefault settings :"
 	       "\n  bufsize = %d, maxrewrite = %d, maxpollevents = %d"
 	       "\n\n",
+	       build_opts_string,
 	       build_features, BUFSIZE, MAXREWRITE, MAX_POLL_EVENTS);
 
 	for (opt = NULL; (opt = hap_get_next_build_opt(opt)); puts(*opt))
@@ -592,6 +623,10 @@ static void display_build_opts()
 
 	putchar('\n');
 
+#ifdef DEBUG_UNIT
+	list_unittests();
+	putchar('\n');
+#endif
 	list_pollers(stdout);
 	putchar('\n');
 	list_mux_proto(stdout);
@@ -619,9 +654,7 @@ static void usage(char *name)
 		"        -V enters verbose mode (disables quiet mode)\n"
 		"        -D goes daemon ; -C changes to <dir> before loading files.\n"
 		"        -W master-worker mode.\n"
-#if defined(USE_SYSTEMD)
 		"        -Ws master-worker mode with systemd notify support.\n"
-#endif
 		"        -q quiet mode : don't display messages\n"
 		"        -c check mode : only check config files and exit\n"
 		"        -cc check condition : evaluate a condition and exit\n"
@@ -710,242 +743,6 @@ int delete_oldpid(int pid)
 	return 0;
 }
 
-
-/*
- * When called, this function reexec haproxy with -sf followed by current
- * children PIDs and possibly old children PIDs if they didn't leave yet.
- */
-static void mworker_reexec(int hardreload)
-{
-	char **next_argv = NULL;
-	int old_argc = 0; /* previous number of argument */
-	int next_argc = 0;
-	int i = 0;
-	char *msg = NULL;
-	struct rlimit limit;
-	struct mworker_proc *current_child = NULL;
-	int x_off = 0; /* disable -x by putting -x /dev/null */
-
-	mworker_block_signals();
-
-	/* restore initial environment (before parsing the config) and do re-exec.
-	 * The initial process environment should be restored here, preceded by
-	 * clean_env(), which do the same job as clearenv().
-	 * Otherwise, after the re-exec we will start the new worker in the
-	 * environment modified by '*env' keywords from the previous configuration,
-	 * i.e. existed before the reload.
-	 */
-	if (clean_env() != 0) {
-		ha_alert("Master encountered a non-recoverable error, exiting.\n");
-		exit(EXIT_FAILURE);
-	}
-
-	if (restore_env() != 0) {
-		ha_alert("Master encountered a non-recoverable error, exiting.\n");
-		exit(EXIT_FAILURE);
-	}
-
-	setenv("HAPROXY_MWORKER_REEXEC", "1", 1);
-
-	mworker_proc_list_to_env(); /* put the children description in the env */
-
-	/* during the reload we must ensure that every FDs that can't be
-	 * reuse (ie those that are not referenced in the proc_list)
-	 * are closed or they will leak. */
-
-	/* close the listeners FD */
-	mworker_cli_proxy_stop();
-
-	if (fdtab)
-		deinit_pollers();
-
-#ifdef HAVE_SSL_RAND_KEEP_RANDOM_DEVICES_OPEN
-	/* close random device FDs */
-	RAND_keep_random_devices_open(0);
-#endif
-
-	/* restore the initial FD limits */
-	limit.rlim_cur = rlim_fd_cur_at_boot;
-	limit.rlim_max = rlim_fd_max_at_boot;
-	if (raise_rlim_nofile(&limit, &limit) != 0) {
-		ha_warning("Failed to restore initial FD limits (cur=%u max=%u), using cur=%u max=%u\n",
-			   rlim_fd_cur_at_boot, rlim_fd_max_at_boot,
-			   (unsigned int)limit.rlim_cur, (unsigned int)limit.rlim_max);
-	}
-
-	/* compute length  */
-	while (old_argv[old_argc])
-		old_argc++;
-
-	/* 1 for haproxy -sf, 2 for -x /socket */
-	next_argv = calloc(old_argc + 1 + 2 + mworker_child_nb() + 1,
-			   sizeof(*next_argv));
-	if (next_argv == NULL)
-		goto alloc_error;
-
-	/* copy the program name */
-	next_argv[next_argc++] = old_argv[0];
-
-	/* we need to reintroduce /dev/null every time */
-	if (old_unixsocket && strcmp(old_unixsocket, "/dev/null") == 0)
-		x_off = 1;
-
-	/* insert the new options just after argv[0] in case we have a -- */
-
-	/* add -sf <PID>*  to argv */
-	if (mworker_child_nb() > 0) {
-		struct mworker_proc *child;
-
-		if (hardreload)
-			next_argv[next_argc++] = "-st";
-		else
-			next_argv[next_argc++] = "-sf";
-
-		list_for_each_entry(child, &proc_list, list) {
-			if (!(child->options & PROC_O_LEAVING) && (child->options & PROC_O_TYPE_WORKER))
-				current_child = child;
-
-			if (!(child->options & (PROC_O_TYPE_WORKER|PROC_O_TYPE_PROG)) || child->pid <= -1)
-				continue;
-			if ((next_argv[next_argc++] = memprintf(&msg, "%d", child->pid)) == NULL)
-				goto alloc_error;
-			msg = NULL;
-		}
-	}
-	if (!x_off && current_child) {
-		/* add the -x option with the socketpair of the current worker */
-		next_argv[next_argc++] = "-x";
-		if ((next_argv[next_argc++] = memprintf(&msg, "sockpair@%d", current_child->ipc_fd[0])) == NULL)
-			goto alloc_error;
-		msg = NULL;
-	}
-
-	if (x_off) {
-		/* if the cmdline contained a -x /dev/null, continue to use it */
-		next_argv[next_argc++] = "-x";
-		next_argv[next_argc++] = "/dev/null";
-	}
-
-	/* copy the previous options */
-	for (i = 1; i < old_argc; i++)
-		next_argv[next_argc++] = old_argv[i];
-
-	/* need to withdraw MODE_STARTING from master, because we have to free
-	 * the startup logs ring here, see more details in print_message()
-	 */
-	global.mode &= ~MODE_STARTING;
-	startup_logs_free(startup_logs);
-
-	signal(SIGPROF, SIG_IGN);
-	execvp(next_argv[0], next_argv);
-	ha_warning("Failed to reexecute the master process [%d]: %s\n", pid, strerror(errno));
-	ha_free(&next_argv);
-	return;
-
-alloc_error:
-	ha_free(&next_argv);
-	ha_warning("Failed to reexecute the master process [%d]: Cannot allocate memory\n", pid);
-	return;
-}
-
-/* reload haproxy and emit a warning */
-void mworker_reload(int hardreload)
-{
-	struct mworker_proc *child;
-	struct per_thread_deinit_fct *ptdf;
-
-	ha_notice("Reloading HAProxy%s\n", hardreload?" (hard-reload)":"");
-
-	/* close the poller FD and the thread waker pipe FD */
-	list_for_each_entry(ptdf, &per_thread_deinit_list, list)
-		ptdf->fct();
-
-	/* increment the number of reloads, child->reloads is checked in
-	 * mworker_env_to_proc_list() (after reload) in order to set
-	 * PROC_O_LEAVING flag for the process
-	 */
-	list_for_each_entry(child, &proc_list, list) {
-		child->reloads++;
-	}
-
-#if defined(USE_SYSTEMD)
-	if (global.tune.options & GTUNE_USE_SYSTEMD) {
-		struct timespec ts;
-
-		(void)clock_gettime(CLOCK_MONOTONIC, &ts);
-
-		sd_notifyf(0,
-		           "RELOADING=1\n"
-		               "STATUS=Reloading Configuration.\n"
-		               "MONOTONIC_USEC=%" PRIu64 "\n",
-		           (ts.tv_sec * 1000000ULL + ts.tv_nsec / 1000ULL));
-	}
-#endif
-	mworker_reexec(hardreload);
-}
-
-static void mworker_loop()
-{
-
-	/* Busy polling makes no sense in the master :-) */
-	global.tune.options &= ~GTUNE_BUSY_POLLING;
-
-
-	signal_unregister(SIGTTIN);
-	signal_unregister(SIGTTOU);
-	signal_unregister(SIGUSR1);
-	signal_unregister(SIGHUP);
-	signal_unregister(SIGQUIT);
-
-	signal_register_fct(SIGTERM, mworker_catch_sigterm, SIGTERM);
-	signal_register_fct(SIGUSR1, mworker_catch_sigterm, SIGUSR1);
-	signal_register_fct(SIGTTIN, mworker_broadcast_signal, SIGTTIN);
-	signal_register_fct(SIGTTOU, mworker_broadcast_signal, SIGTTOU);
-	signal_register_fct(SIGINT, mworker_catch_sigterm, SIGINT);
-	signal_register_fct(SIGHUP, mworker_catch_sighup, SIGHUP);
-	signal_register_fct(SIGUSR2, mworker_catch_sighup, SIGUSR2);
-	signal_register_fct(SIGCHLD, mworker_catch_sigchld, SIGCHLD);
-
-	mworker_unblock_signals();
-	mworker_cleantasks();
-
-	mworker_catch_sigchld(NULL); /* ensure we clean the children in case
-				     some SIGCHLD were lost */
-
-	jobs++; /* this is the "master" job, we want to take care of the
-		signals even if there is no listener so the poll loop don't
-		leave */
-
-	fork_poller();
-	run_thread_poll_loop(NULL);
-}
-
-/*
- * Reexec the process in failure mode, instead of exiting
- */
-void on_new_child_failure()
-{
-	struct mworker_proc *child;
-
-	/* increment the number of failed reloads */
-	list_for_each_entry(child, &proc_list, list) {
-		child->failedreloads++;
-	}
-
-	/* do not keep unused FDs retrieved from the previous process */
-	sock_drop_unused_old_sockets();
-
-	usermsgs_clr(NULL);
-	load_status = 0;
-	ha_warning("Failed to load worker!\n");
-#if defined(USE_SYSTEMD)
-	/* the sd_notify API is not able to send a reload failure signal. So
-	 * the READY=1 signal still need to be sent */
-	if (global.tune.options & GTUNE_USE_SYSTEMD)
-		sd_notify(0, "READY=1\nSTATUS=Reload failed!\n");
-#endif
-}
-
 /*
  * Exit with an error message upon a master recovery mode failure.
  */
@@ -1010,7 +807,7 @@ static void sig_dump_state(struct sig_handler *sh)
 			             "SIGHUP: Server %s/%s is %s. Conn: %d act, %d pend, %lld tot.",
 			             p->id, s->id,
 			             (s->cur_state != SRV_ST_STOPPED) ? "UP" : "DOWN",
-			             s->cur_sess, s->queue.length, s->counters.cum_sess);
+			             s->cur_sess, s->queueslength, s->counters.cum_sess);
 			ha_warning("%s\n", trash.area);
 			send_log(p, LOG_NOTICE, "%s\n", trash.area);
 			s = s->next;
@@ -1021,19 +818,19 @@ static void sig_dump_state(struct sig_handler *sh)
 			chunk_printf(&trash,
 			             "SIGHUP: Proxy %s has no servers. Conn: act(FE+BE): %d+%d, %d pend (%d unass), tot(FE+BE): %lld+%lld.",
 			             p->id,
-			             p->feconn, p->beconn, p->totpend, p->queue.length, p->fe_counters.cum_conn, p->be_counters.cum_sess);
+			             p->feconn, p->beconn, p->totpend, p->queueslength, p->fe_counters.cum_conn, p->be_counters.cum_sess);
 		} else if (p->srv_act == 0) {
 			chunk_printf(&trash,
 			             "SIGHUP: Proxy %s %s ! Conn: act(FE+BE): %d+%d, %d pend (%d unass), tot(FE+BE): %lld+%lld.",
 			             p->id,
 			             (p->srv_bck) ? "is running on backup servers" : "has no server available",
-			             p->feconn, p->beconn, p->totpend, p->queue.length, p->fe_counters.cum_conn, p->be_counters.cum_sess);
+			             p->feconn, p->beconn, p->totpend, p->queueslength, p->fe_counters.cum_conn, p->be_counters.cum_sess);
 		} else {
 			chunk_printf(&trash,
 			             "SIGHUP: Proxy %s has %d active servers and %d backup servers available."
 			             " Conn: act(FE+BE): %d+%d, %d pend (%d unass), tot(FE+BE): %lld+%lld.",
 			             p->id, p->srv_act, p->srv_bck,
-			             p->feconn, p->beconn, p->totpend, p->queue.length, p->fe_counters.cum_conn, p->be_counters.cum_sess);
+			             p->feconn, p->beconn, p->totpend, p->queueslength, p->fe_counters.cum_conn, p->be_counters.cum_sess);
 		}
 		ha_warning("%s\n", trash.area);
 		send_log(p, LOG_NOTICE, "%s\n", trash.area);
@@ -1056,7 +853,7 @@ static void dump(struct sig_handler *sh)
  *  In the case of chrooting, you have to open /dev/null before the chroot, and
  *  pass the <fd> to this function
  */
-static void stdio_quiet(int fd)
+void stdio_quiet(int fd)
 {
 	if (fd < 0)
 		fd = open("/dev/null", O_RDWR, 0);
@@ -1177,7 +974,7 @@ next_dir_entry:
  * frees in its stack the memory allocated for config files content, if it has
  * encountered an error.
  */
-static int load_cfg(char *progname)
+static int load_cfg()
 {
 	struct cfgfile *cfg, *cfg_tmp;
 
@@ -1205,7 +1002,7 @@ static int load_cfg(char *progname)
  * Otherwise, it returns an err_code, which may contain 0 (OK) or ERR_WARN,
  * ERR_ALERT.
  */
-static int read_cfg(char *progname)
+static int read_cfg()
 {
 	char *env_cfgfiles = NULL;
 	struct cfgfile *cfg;
@@ -1248,7 +1045,6 @@ static int read_cfg(char *progname)
 
 	}
 	/* remove temporary environment variables. */
-	unsetenv("HAPROXY_BRANCH");
 	unsetenv("HAPROXY_HTTP_LOG_FMT");
 	unsetenv("HAPROXY_HTTP_CLF_LOG_FMT");
 	unsetenv("HAPROXY_HTTPS_LOG_FMT");
@@ -1474,7 +1270,7 @@ static void ha_random_boot(char *const *argv)
  * configuration. Makes process to exit with 0, if the condition is true, with
  * 1, if the condition is false or with 2, if parse_line encounters an error.
  */
-static void do_check_condition(char *progname)
+static void do_check_condition()
 {
 	int result;
 	uint32_t err;
@@ -1546,7 +1342,7 @@ static void init_early(int argc, char **argv)
 	char *tmp;
 	int len;
 
-	setenv("HAPROXY_STARTUP_VERSION", HAPROXY_VERSION, 0);
+	setenv("HAPROXY_STARTUP_VERSION", haproxy_version, 0);
 
 	/* First, let's initialize most global variables */
 	totalconn = actconn = listeners = stopping = 0;
@@ -1580,9 +1376,8 @@ static void init_early(int argc, char **argv)
 	memset(hostname, 0, sizeof(hostname));
 	gethostname(hostname, sizeof(hostname) - 1);
 
-	/* preset some environment variables */
 	localpeer = strdup(hostname);
-	if (!localpeer || setenv("HAPROXY_LOCALPEER", localpeer, 1) < 0) {
+	if (!localpeer) {
 		ha_alert("Cannot allocate memory for local peer.\n");
 		exit(EXIT_FAILURE);
 	}
@@ -1601,7 +1396,7 @@ static void init_early(int argc, char **argv)
 		exit(EXIT_FAILURE);
 	}
 
-	chunk_initlen(&global.log_tag, progname, len, len);
+	chunk_initlen(&global.log_tag, strdup(progname), len, len);
 }
 
 /* handles program arguments. Very minimal parsing is performed, variables are
@@ -1611,8 +1406,6 @@ static void init_early(int argc, char **argv)
 static void init_args(int argc, char **argv)
 {
 	char *err_msg = NULL;
-
-	progname = global.log_tag.area;
 
 	/* pre-fill in the global tuning options before we let the cmdline
 	 * change them.
@@ -1759,10 +1552,18 @@ static void init_args(int argc, char **argv)
 			}
 			else if (*flag == 'd' && flag[1] == 't') {
 				if (argc > 1 && argv[1][0] != '-') {
-					if (trace_parse_cmd(argv[1], &err_msg)) {
-						ha_alert("-dt: %s.\n", err_msg);
-						ha_free(&err_msg);
-						exit(EXIT_FAILURE);
+					int ret = trace_parse_cmd(argv[1], &err_msg);
+					if (ret <= -1) {
+						if (ret < -1) {
+							ha_alert("-dt: %s.\n", err_msg);
+							ha_free(&err_msg);
+							exit(EXIT_FAILURE);
+						}
+						else {
+							printf("%s\n", err_msg);
+							ha_free(&err_msg);
+							exit(0);
+						}
 					}
 					argc--; argv++;
 				}
@@ -1784,12 +1585,7 @@ static void init_args(int argc, char **argv)
 				arg_mode |= MODE_DAEMON;
 			else if (*flag == 'W' && flag[1] == 's') {
 				arg_mode |= MODE_MWORKER | MODE_FOREGROUND;
-#if defined(USE_SYSTEMD)
 				global.tune.options |= GTUNE_USE_SYSTEMD;
-#else
-				ha_alert("master-worker mode with systemd support (-Ws) requested, but not compiled. Use master-worker mode (-W) if you are not using Type=notify in your unit file or recompile with USE_SYSTEMD=1.\n\n");
-				usage(progname);
-#endif
 			}
 			else if (*flag == 'W')
 				arg_mode |= MODE_MWORKER;
@@ -1858,6 +1654,19 @@ static void init_args(int argc, char **argv)
 					nb_oldpids++;
 				}
 			}
+#ifdef DEBUG_UNIT
+			else if (*flag == 'U')  {
+				if (argc <= 1) {
+					ha_alert("-U takes a least a unittest name in argument, and must be the last option\n");
+					usage(progname);
+				}
+				/* this is the last option, we keep the option position */
+				argv++;
+				argc--;
+				unittest_argc = argc;
+				break;
+			}
+#endif
 			else if (flag[0] == '-' && flag[1] == 0) { /* "--" */
 				/* now that's a cfgfile list */
 				argv++; argc--;
@@ -1888,7 +1697,6 @@ static void init_args(int argc, char **argv)
 						ha_alert("Cannot allocate memory for local peer.\n");
 						exit(EXIT_FAILURE);
 					}
-					setenv("HAPROXY_LOCALPEER", localpeer, 1);
 					global.localpeer_cmdline = 1;
 					break;
 				case 'f' :
@@ -2002,89 +1810,6 @@ static void generate_random_cluster_secret()
 	cluster_secret_isset = 1;
 }
 
-/* This function fills proc_list for master-worker mode and creates a sockpair,
- * copied after master-worker fork() to each process context to enable master
- * CLI at worker side (worker can send its status to master).It only returns if
- * everything is OK. If something fails, it exits.
- */
-static void prepare_master()
-{
-	struct mworker_proc *tmproc;
-
-	setenv("HAPROXY_MWORKER", "1", 1);
-
-	if (getenv("HAPROXY_MWORKER_REEXEC") == NULL) {
-
-		tmproc = mworker_proc_new();
-		if (!tmproc) {
-			ha_alert("Cannot allocate process structures.\n");
-			exit(EXIT_FAILURE);
-		}
-		tmproc->options |= PROC_O_TYPE_MASTER; /* master */
-		tmproc->pid = pid;
-		tmproc->timestamp = start_date.tv_sec;
-		proc_self = tmproc;
-
-		LIST_APPEND(&proc_list, &tmproc->list);
-	}
-
-	tmproc = mworker_proc_new();
-	if (!tmproc) {
-		ha_alert("Cannot allocate process structures.\n");
-		exit(EXIT_FAILURE);
-	}
-	/* worker */
-	tmproc->options |= (PROC_O_TYPE_WORKER | PROC_O_INIT);
-
-	/* create a sockpair to copy it via fork(), thus it will be in
-	 * master and in worker processes
-	 */
-	if (socketpair(AF_UNIX, SOCK_STREAM, 0, tmproc->ipc_fd) < 0) {
-		ha_alert("Cannot create worker master CLI socketpair.\n");
-		exit(EXIT_FAILURE);
-	}
-	LIST_APPEND(&proc_list, &tmproc->list);
-}
-
-static void run_master()
-{
-	struct mworker_proc *child, *it;
-
-	if ((!(global.mode & MODE_QUIET) || (global.mode & MODE_VERBOSE)) &&
-		(global.mode & MODE_DAEMON)) {
-		/* detach from the tty, this is required to properly daemonize. */
-		if ((getenv("HAPROXY_MWORKER_REEXEC") == NULL))
-			stdio_quiet(-1);
-		global.mode &= ~MODE_VERBOSE;
-		global.mode |= MODE_QUIET; /* ensure that we won't say anything from now */
-	}
-	proc_self->failedreloads = 0; /* reset the number of failure */
-	mworker_loop();
-#if defined(USE_OPENSSL) && !defined(OPENSSL_NO_DH)
-	ssl_free_dh();
-#endif
-	master = 0;
-	/* close useless master sockets */
-	mworker_cli_proxy_stop();
-
-	/* free proc struct of other processes  */
-	list_for_each_entry_safe(child, it, &proc_list, list) {
-		/* close the FD of the master side for all
-		 * workers, we don't need to close the worker
-		 * side of other workers since it's done with
-		 * the bind_proc */
-		if (child->ipc_fd[0] >= 0) {
-			close(child->ipc_fd[0]);
-			child->ipc_fd[0] = -1;
-		}
-		LIST_DELETE(&child->list);
-		mworker_free_child(child);
-		child = NULL;
-	}
-	/* master must leave */
-	exit(0);
-}
-
 /*
  * This function does daemonization fork. It only returns if everything is OK.
  * If something fails, it exits.
@@ -2092,6 +1817,17 @@ static void run_master()
 static void apply_daemon_mode()
 {
 	int ret;
+	int wstatus = 0;
+	int exitcode = 0;
+	pid_t child_pid;
+	char buf[2];
+
+	if (pipe(daemon_fd) < 0) {
+		ha_alert("[%s.main()] Cannot create pipe for getting the status of "
+			 "child process: %s.\n", progname, strerror(errno));
+
+		exit(EXIT_FAILURE);
+	}
 
 	ret = fork();
 	switch(ret) {
@@ -2103,17 +1839,49 @@ static void apply_daemon_mode()
 		/* in child, change the process group ID, in the master-worker
 		 * mode, this will be the master process
 		 */
+		close(daemon_fd[0]);
+		daemon_fd[0] = -1;
 		setsid();
 
 		break;
 	default:
-		/* in parent, which leaves to daemonize */
-		exit(0);
+		/* in parent */
+		close(daemon_fd[1]);
+		daemon_fd[1] = -1;
+		/* In standalone + daemon modes: parent (launcher process) tries
+		 * to read the child's (daemonized process) "READY" message. Child
+		 * writes this message, when he has finished initialization. If
+		 * child failed to start, we get his status.
+		 * In master-worker mode: daemonized process is the master. He
+		 * sends his READY message to launcher, only when
+		 * he has received the READY message from the worker, see
+		 * _send_status().
+		 */
+		if (read(daemon_fd[0], buf, 1) == 0) {
+			child_pid = waitpid(ret, &wstatus, 0);
+			if (child_pid < 0) {
+				ha_alert("[%s.main()] waitpid() failed: %s\n",
+					 progname, strerror(errno));
+				exit(EXIT_FAILURE);
+			}
+			if (WIFEXITED(wstatus))
+				wstatus = WEXITSTATUS(wstatus);
+			else if (WIFSIGNALED(wstatus))
+				wstatus = 128 + WTERMSIG(wstatus);
+			else
+				wstatus = 255;
+
+			ha_alert("Process %d exited with code %d (%s)\n",
+				 child_pid, wstatus, (wstatus >= 128) ? strsignal(wstatus - 128) : "Exit");
+			if (wstatus != 0 && wstatus != 143)
+				exitcode = wstatus;
+		}
+		exit(exitcode);
 	}
 }
 
-/* Only returns if everything is OK. If something fails, it exits. */
-static void handle_pidfile()
+/* Returns 0, if everything is OK. If open() fails, returns -1. */
+int handle_pidfile(void)
 {
 	char pidstr[100];
 
@@ -2121,123 +1889,15 @@ static void handle_pidfile()
 	pidfd = open(global.pidfile, O_CREAT | O_WRONLY | O_TRUNC, 0644);
 	if (pidfd < 0) {
 		ha_alert("[%s.main()] Cannot create pidfile %s\n", progname, global.pidfile);
-		if (nb_oldpids)
-			tell_old_pids(SIGTTIN);
-		protocol_unbind_all();
-		exit(1);
+		return -1;
 	}
 	snprintf(pidstr, sizeof(pidstr), "%d\n", (int)getpid());
 	DISGUISE(write(pidfd, pidstr, strlen(pidstr)));
-}
+	close(pidfd);
+	/* We won't ever use this anymore */
+	ha_free(&global.pidfile);
 
-/* This function at first does master-worker fork. It creates then GLOBAL and
- * MASTER proxies, allocates listeners for these proxies and binds a GLOBAL
- * proxy listener in worker process on ipc_fd[1] and MASTER proxy listener
- * in master process on ipc_fd[0]. ipc_fd[0] and ipc_fd[1] are the "ends" of the
- * sockpair, created in prepare_master(). This sockpair is copied via fork to
- * each process and serves as communication channel between master and worker
- * (master CLI applet is attached in master process to MASTER proxy). This
- * function returns only if everything is OK. If something fails, it exits.
- */
-static void apply_master_worker_mode()
-{
-	int worker_pid;
-	struct mworker_proc *child;
-	char *sock_name = NULL;
-	char *errmsg = NULL;
-
-	worker_pid = fork();
-	switch (worker_pid) {
-	case -1:
-		ha_alert("[%s.main()] Cannot fork.\n", progname);
-
-		exit(EXIT_FAILURE);
-	case 0:
-		/* This one must not be exported, it's internal! */
-		unsetenv("HAPROXY_MWORKER_REEXEC");
-		ha_random_jump96(1);
-
-		list_for_each_entry(child, &proc_list, list) {
-			if ((child->options & PROC_O_TYPE_WORKER) && (child->options & PROC_O_INIT)) {
-				close(child->ipc_fd[0]);
-				child->ipc_fd[0] = -1;
-				/* proc_self needs to point to the new forked worker in
-				 * worker's context, as it's dereferenced in
-				 * mworker_sockpair_register_per_thread(), called for
-				 * master and for worker.
-				 */
-				proc_self = child;
-				/* attach listener to GLOBAL proxy on child->ipc_fd[1] */
-				if (mworker_cli_global_proxy_new_listener(child) < 0)
-					exit(EXIT_FAILURE);
-
-				break;
-			}
-
-			/* need to close reload sockpair fds, inherited after master's execvp and fork(),
-			 * we can't close these fds in master before the fork(), as ipc_fd[1] serves after
-			 * the mworker_reexec to obtain the MCLI client connection fd, like this we can
-			 * write to this connection fd the content of the startup_logs ring.
-			 */
-			if (child->options & PROC_O_TYPE_MASTER) {
-				if (child->ipc_fd[0] > 0)
-					close(child->ipc_fd[0]);
-				if (child->ipc_fd[1] > 0)
-					close(child->ipc_fd[1]);
-			}
-		}
-		break;
-	default:
-		/* in parent */
-		ha_notice("Initializing new worker (%d)\n", worker_pid);
-		master = 1;
-
-		/* in exec mode, there's always exactly one thread. Failure to
-		 * set these ones now will result in nbthread being detected
-		 * automatically.
-		 */
-		global.nbtgroups = 1;
-		global.nbthread = 1;
-
-		/* creates MASTER proxy */
-		if (mworker_cli_create_master_proxy(&errmsg) < 0) {
-			ha_alert("Can't create MASTER proxy: %s\n", errmsg);
-			free(errmsg);
-			exit(EXIT_FAILURE);
-		}
-
-		/* attaches servers to all existed workers on its shared MCLI sockpair ends, ipc_fd[0] */
-		if (mworker_cli_attach_server(&errmsg) < 0) {
-			ha_alert("Can't attach servers needed for master CLI %s\n", errmsg ? errmsg : "");
-			free(errmsg);
-			exit(EXIT_FAILURE);
-		}
-
-		/* creates reload sockpair and listeners for master CLI (-S) */
-		mworker_create_master_cli();
-
-		/* find the right mworker_proc */
-		list_for_each_entry(child, &proc_list, list) {
-			if ((child->options & PROC_O_TYPE_WORKER) && (child->options & PROC_O_INIT)) {
-				child->timestamp = date.tv_sec;
-				child->pid = worker_pid;
-				child->version = strdup(haproxy_version);
-
-				close(child->ipc_fd[1]);
-				child->ipc_fd[1] = -1;
-
-				/* attach listener to MASTER proxy on child->ipc_fd[0] */
-				memprintf(&sock_name, "sockpair@%d", child->ipc_fd[0]);
-				if (mworker_cli_master_proxy_new_listener(sock_name) == NULL) {
-					ha_free(&sock_name);
-					exit(EXIT_FAILURE);
-				}
-				ha_free(&sock_name);
-
-				break;
-			}
-		}
-	}
+	return 0;
 }
 
 static void get_listeners_fd()
@@ -2290,7 +1950,6 @@ static void bind_listeners()
 		select(0, NULL, NULL, NULL, &w);
 		retry--;
 	}
-
 	/* Note: protocol_bind_all() sends an alert when it fails. */
 	if ((err & ~ERR_WARN) != ERR_NONE) {
 		ha_alert("[%s.main()] Some protocols failed to start their listeners! Exiting.\n", progname);
@@ -2348,7 +2007,7 @@ static void step_init_1()
 
 	/* Do check_condition, if we started with -cc, and exit. */
 	if (global.mode & MODE_CHECK_CONDITION)
-		do_check_condition(progname);
+		do_check_condition();
 
 	if (change_dir && chdir(change_dir) < 0) {
 		ha_alert("Could not change to directory %s : %s\n", change_dir, strerror(errno));
@@ -2370,7 +2029,6 @@ static void step_init_2(int argc, char** argv)
 	struct proxy *px;
 	struct post_check_fct *pcf;
 	struct pre_check_fct *prcf;
-	int ideal_maxconn;
 	const char *cc, *cflags, *opts;
 
 	/* destroy unreferenced defaults proxies  */
@@ -2394,6 +2052,10 @@ static void step_init_2(int argc, char** argv)
 
 	/* Note: global.nbthread will be initialized as part of this call */
 	err_code |= check_config_validity();
+	if (*initial_cwd && chdir(initial_cwd) == -1) {
+		ha_alert("Impossible to get back to initial directory '%s' : %s\n", initial_cwd, strerror(errno));
+		exit(1);
+	}
 
 	/* update the ready date to also account for the check time */
 	clock_update_date(0, 1);
@@ -2554,180 +2216,8 @@ static void step_init_2(int argc, char** argv)
 				global.maxsock += p->peers_fe->maxconn;
 	}
 
-	/* Now we want to compute the maxconn and possibly maxsslconn values.
-	 * It's a bit tricky. Maxconn defaults to the pre-computed value based
-	 * on rlim_fd_cur and the number of FDs in use due to the configuration,
-	 * and maxsslconn defaults to DEFAULT_MAXSSLCONN. On top of that we can
-	 * enforce a lower limit based on memmax.
-	 *
-	 * If memmax is set, then it depends on which values are set. If
-	 * maxsslconn is set, we use memmax to determine how many cleartext
-	 * connections may be added, and set maxconn to the sum of the two.
-	 * If maxconn is set and not maxsslconn, maxsslconn is computed from
-	 * the remaining amount of memory between memmax and the cleartext
-	 * connections. If neither are set, then it is considered that all
-	 * connections are SSL-capable, and maxconn is computed based on this,
-	 * then maxsslconn accordingly. We need to know if SSL is used on the
-	 * frontends, backends, or both, because when it's used on both sides,
-	 * we need twice the value for maxsslconn, but we only count the
-	 * handshake once since it is not performed on the two sides at the
-	 * same time (frontend-side is terminated before backend-side begins).
-	 * The SSL stack is supposed to have filled ssl_session_cost and
-	 * ssl_handshake_cost during its initialization. In any case, if
-	 * SYSTEM_MAXCONN is set, we still enforce it as an upper limit for
-	 * maxconn in order to protect the system.
-	 */
-	ideal_maxconn = compute_ideal_maxconn();
-
-	if (!global.rlimit_memmax) {
-		if (global.maxconn == 0) {
-			global.maxconn = ideal_maxconn;
-			if (global.mode & (MODE_VERBOSE|MODE_DEBUG))
-				fprintf(stderr, "Note: setting global.maxconn to %d.\n", global.maxconn);
-		}
-	}
-#ifdef USE_OPENSSL
-	else if (!global.maxconn && !global.maxsslconn &&
-		 (global.ssl_used_frontend || global.ssl_used_backend)) {
-		/* memmax is set, compute everything automatically. Here we want
-		 * to ensure that all SSL connections will be served. We take
-		 * care of the number of sides where SSL is used, and consider
-		 * the worst case : SSL used on both sides and doing a handshake
-		 * simultaneously. Note that we can't have more than maxconn
-		 * handshakes at a time by definition, so for the worst case of
-		 * two SSL conns per connection, we count a single handshake.
-		 */
-		int sides = !!global.ssl_used_frontend + !!global.ssl_used_backend;
-		int64_t mem = global.rlimit_memmax * 1048576ULL;
-		int retried = 0;
-
-		mem -= global.tune.sslcachesize * 200ULL; // about 200 bytes per SSL cache entry
-		mem -= global.maxzlibmem;
-		mem = mem * MEM_USABLE_RATIO;
-
-		/* Principle: we test once to set maxconn according to the free
-		 * memory. If it results in values the system rejects, we try a
-		 * second time by respecting rlim_fd_max. If it fails again, we
-		 * go back to the initial value and will let the final code
-		 * dealing with rlimit report the error. That's up to 3 attempts.
-		 */
-		do {
-			global.maxconn = mem /
-				((STREAM_MAX_COST + 2 * global.tune.bufsize) +    // stream + 2 buffers per stream
-				 sides * global.ssl_session_max_cost +            // SSL buffers, one per side
-				 global.ssl_handshake_max_cost);                  // 1 handshake per connection max
-
-			if (retried == 1)
-				global.maxconn = MIN(global.maxconn, ideal_maxconn);
-			global.maxconn = round_2dig(global.maxconn);
-#ifdef SYSTEM_MAXCONN
-			if (global.maxconn > SYSTEM_MAXCONN)
-				global.maxconn = SYSTEM_MAXCONN;
-#endif /* SYSTEM_MAXCONN */
-			global.maxsslconn = sides * global.maxconn;
-
-			if (check_if_maxsock_permitted(compute_ideal_maxsock(global.maxconn)))
-				break;
-		} while (retried++ < 2);
-
-		if (global.mode & (MODE_VERBOSE|MODE_DEBUG))
-			fprintf(stderr, "Note: setting global.maxconn to %d and global.maxsslconn to %d.\n",
-			        global.maxconn, global.maxsslconn);
-	}
-	else if (!global.maxsslconn &&
-		 (global.ssl_used_frontend || global.ssl_used_backend)) {
-		/* memmax and maxconn are known, compute maxsslconn automatically.
-		 * maxsslconn being forced, we don't know how many of it will be
-		 * on each side if both sides are being used. The worst case is
-		 * when all connections use only one SSL instance because
-		 * handshakes may be on two sides at the same time.
-		 */
-		int sides = !!global.ssl_used_frontend + !!global.ssl_used_backend;
-		int64_t mem = global.rlimit_memmax * 1048576ULL;
-		int64_t sslmem;
-
-		mem -= global.tune.sslcachesize * 200ULL; // about 200 bytes per SSL cache entry
-		mem -= global.maxzlibmem;
-		mem = mem * MEM_USABLE_RATIO;
-
-		sslmem = mem - global.maxconn * (int64_t)(STREAM_MAX_COST + 2 * global.tune.bufsize);
-		global.maxsslconn = sslmem / (global.ssl_session_max_cost + global.ssl_handshake_max_cost);
-		global.maxsslconn = round_2dig(global.maxsslconn);
-
-		if (sslmem <= 0 || global.maxsslconn < sides) {
-			ha_alert("Cannot compute the automatic maxsslconn because global.maxconn is already too "
-				 "high for the global.memmax value (%d MB). The absolute maximum possible value "
-				 "without SSL is %d, but %d was found and SSL is in use.\n",
-				 global.rlimit_memmax,
-				 (int)(mem / (STREAM_MAX_COST + 2 * global.tune.bufsize)),
-				 global.maxconn);
-			exit(1);
-		}
-
-		if (global.maxsslconn > sides * global.maxconn)
-			global.maxsslconn = sides * global.maxconn;
-
-		if (global.mode & (MODE_VERBOSE|MODE_DEBUG))
-			fprintf(stderr, "Note: setting global.maxsslconn to %d\n", global.maxsslconn);
-	}
-#endif
-	else if (!global.maxconn) {
-		/* memmax and maxsslconn are known/unused, compute maxconn automatically */
-		int sides = !!global.ssl_used_frontend + !!global.ssl_used_backend;
-		int64_t mem = global.rlimit_memmax * 1048576ULL;
-		int64_t clearmem;
-		int retried = 0;
-
-		if (global.ssl_used_frontend || global.ssl_used_backend)
-			mem -= global.tune.sslcachesize * 200ULL; // about 200 bytes per SSL cache entry
-
-		mem -= global.maxzlibmem;
-		mem = mem * MEM_USABLE_RATIO;
-
-		clearmem = mem;
-		if (sides)
-			clearmem -= (global.ssl_session_max_cost + global.ssl_handshake_max_cost) * (int64_t)global.maxsslconn;
-
-		/* Principle: we test once to set maxconn according to the free
-		 * memory. If it results in values the system rejects, we try a
-		 * second time by respecting rlim_fd_max. If it fails again, we
-		 * go back to the initial value and will let the final code
-		 * dealing with rlimit report the error. That's up to 3 attempts.
-		 */
-		do {
-			global.maxconn = clearmem / (STREAM_MAX_COST + 2 * global.tune.bufsize);
-			if (retried == 1)
-				global.maxconn = MIN(global.maxconn, ideal_maxconn);
-			global.maxconn = round_2dig(global.maxconn);
-#ifdef SYSTEM_MAXCONN
-			if (global.maxconn > SYSTEM_MAXCONN)
-				global.maxconn = SYSTEM_MAXCONN;
-#endif /* SYSTEM_MAXCONN */
-
-			if (clearmem <= 0 || !global.maxconn) {
-				ha_alert("Cannot compute the automatic maxconn because global.maxsslconn is already too "
-					 "high for the global.memmax value (%d MB). The absolute maximum possible value "
-					 "is %d, but %d was found.\n",
-					 global.rlimit_memmax,
-				 (int)(mem / (global.ssl_session_max_cost + global.ssl_handshake_max_cost)),
-					 global.maxsslconn);
-				exit(1);
-			}
-
-			if (check_if_maxsock_permitted(compute_ideal_maxsock(global.maxconn)))
-				break;
-		} while (retried++ < 2);
-
-		if (global.mode & (MODE_VERBOSE|MODE_DEBUG)) {
-			if (sides && global.maxsslconn > sides * global.maxconn) {
-				fprintf(stderr, "Note: global.maxsslconn is forced to %d which causes global.maxconn "
-				        "to be limited to %d. Better reduce global.maxsslconn to get more "
-				        "room for extra connections.\n", global.maxsslconn, global.maxconn);
-			}
-			fprintf(stderr, "Note: setting global.maxconn to %d\n", global.maxconn);
-		}
-	}
-
+	/* Compute the global.maxconn and possibly global.maxsslconn values */
+	set_global_maxconn();
 	global.maxsock = compute_ideal_maxsock(global.maxconn);
 	global.hardmaxconn = global.maxconn;
 	if (!global.maxpipes)
@@ -2741,6 +2231,9 @@ static void step_init_2(int argc, char** argv)
 
 	if (global.tune.maxpollevents <= 0)
 		global.tune.maxpollevents = MAX_POLL_EVENTS;
+
+	if (global.tune.max_rules_at_once <= 0)
+		global.tune.max_rules_at_once = MAX_RULES_AT_ONCE;
 
 	if (global.tune.runqueue_depth <= 0) {
 		/* tests on various thread counts from 1 to 64 have shown an
@@ -2852,23 +2345,11 @@ static void step_init_2(int argc, char** argv)
 #endif
 	/* toolchain opts */
 	cflags = chunk_newstr(&trash);
-#ifdef BUILD_CC
-	chunk_appendf(&trash, "%s", BUILD_CC);
-#endif
-#ifdef BUILD_CFLAGS
-	chunk_appendf(&trash, " %s", BUILD_CFLAGS);
-#endif
-#ifdef BUILD_DEBUG
-	chunk_appendf(&trash, " %s", BUILD_DEBUG);
-#endif
+	chunk_appendf(&trash, "%s", pm_toolchain_opts);
+
 	/* settings */
 	opts = chunk_newstr(&trash);
-#ifdef BUILD_TARGET
-	chunk_appendf(&trash, "TARGET='%s'", BUILD_TARGET);
-#endif
-#ifdef BUILD_OPTIONS
-	chunk_appendf(&trash, " %s", BUILD_OPTIONS);
-#endif
+	chunk_appendf(&trash, "TARGET='%s'", pm_target_opts);
 
 	post_mortem_add_component("haproxy", haproxy_version, cc, cflags, opts, argv[0]);
 }
@@ -2883,7 +2364,6 @@ static void step_init_2(int argc, char** argv)
  */
 static void step_init_3(void)
 {
-	struct rlimit limit;
 
 	signal_register_fct(SIGQUIT, dump, SIGQUIT);
 	signal_register_fct(SIGUSR1, sig_soft_stop, SIGUSR1);
@@ -2897,54 +2377,8 @@ static void step_init_3(void)
 	signal_register_fct(SIGPIPE, NULL, 0);
 
 	/* ulimits */
-	if (!global.rlimit_nofile)
-		global.rlimit_nofile = global.maxsock;
-
-	if (global.rlimit_nofile) {
-		limit.rlim_cur = global.rlimit_nofile;
-		limit.rlim_max = MAX(rlim_fd_max_at_boot, limit.rlim_cur);
-
-		if ((global.fd_hard_limit && limit.rlim_cur > global.fd_hard_limit) ||
-		    raise_rlim_nofile(NULL, &limit) != 0) {
-			getrlimit(RLIMIT_NOFILE, &limit);
-			if (global.fd_hard_limit && limit.rlim_cur > global.fd_hard_limit)
-				limit.rlim_cur = global.fd_hard_limit;
-
-			if (global.tune.options & GTUNE_STRICT_LIMITS) {
-				ha_alert("[%s.main()] Cannot raise FD limit to %d, limit is %d.\n",
-					 progname, global.rlimit_nofile, (int)limit.rlim_cur);
-				exit(1);
-			}
-			else {
-				/* try to set it to the max possible at least */
-				limit.rlim_cur = limit.rlim_max;
-				if (global.fd_hard_limit && limit.rlim_cur > global.fd_hard_limit)
-					limit.rlim_cur = global.fd_hard_limit;
-
-				if (raise_rlim_nofile(&limit, &limit) == 0)
-					getrlimit(RLIMIT_NOFILE, &limit);
-
-				ha_warning("[%s.main()] Cannot raise FD limit to %d, limit is %d.\n",
-					   progname, global.rlimit_nofile, (int)limit.rlim_cur);
-				global.rlimit_nofile = limit.rlim_cur;
-			}
-		}
-	}
-
-	if (global.rlimit_memmax) {
-		limit.rlim_cur = limit.rlim_max =
-			global.rlimit_memmax * 1048576ULL;
-		if (setrlimit(RLIMIT_DATA, &limit) == -1) {
-			if (global.tune.options & GTUNE_STRICT_LIMITS) {
-				ha_alert("[%s.main()] Cannot fix MEM limit to %d megs.\n",
-					 progname, global.rlimit_memmax);
-				exit(1);
-			}
-			else
-				ha_warning("[%s.main()] Cannot fix MEM limit to %d megs.\n",
-					   progname, global.rlimit_memmax);
-		}
-	}
+	apply_nofile_limit();
+	apply_memory_limit();
 
 #if defined(USE_LINUX_CAP)
 	/* If CAP_NET_BIND_SERVICE is in binary file permitted set and process
@@ -2952,7 +2386,7 @@ static void step_init_3(void)
 	 * binding to privileged ports.
 	 */
 	if (!master)
-	    prepare_caps_from_permitted_set(geteuid(), global.uid, progname);
+	    prepare_caps_from_permitted_set(geteuid(), global.uid);
 #endif
 }
 
@@ -2963,8 +2397,6 @@ static void step_init_3(void)
  */
 static void step_init_4(void)
 {
-	struct rlimit limit;
-
 	/* MODE_QUIET is applied here, it can inhibit alerts and warnings below this line */
 	if (getenv("HAPROXY_MWORKER_REEXEC") != NULL) {
 		/* either stdin/out/err are already closed or should stay as they are. */
@@ -2984,44 +2416,15 @@ static void step_init_4(void)
 	 * be able to restart the old pids.
 	 */
 
-	/* check ulimits */
-	limit.rlim_cur = limit.rlim_max = 0;
-	getrlimit(RLIMIT_NOFILE, &limit);
-	if (limit.rlim_cur < global.maxsock) {
-		if (global.tune.options & GTUNE_STRICT_LIMITS) {
-			ha_alert("[%s.main()] FD limit (%d) too low for maxconn=%d/maxsock=%d. "
-				 "Please raise 'ulimit-n' to %d or more to avoid any trouble.\n",
-			         progname, (int)limit.rlim_cur, global.maxconn, global.maxsock,
-				 global.maxsock);
-			exit(1);
-		}
-		else
-			ha_alert("[%s.main()] FD limit (%d) too low for maxconn=%d/maxsock=%d. "
-				 "Please raise 'ulimit-n' to %d or more to avoid any trouble.\n",
-			         progname, (int)limit.rlim_cur, global.maxconn, global.maxsock,
-				 global.maxsock);
-	}
-
-	if (global.prealloc_fd && fcntl((int)limit.rlim_cur - 1, F_GETFD) == -1) {
-		if (dup2(0, (int)limit.rlim_cur - 1) == -1)
-			ha_warning("[%s.main()] Unable to preallocate file descriptor %d : %s",
-				progname, (int)limit.rlim_cur - 1, strerror(errno));
-		else
-			close((int)limit.rlim_cur - 1);
-	}
+	/* check current nofile limit reported via getrlimit() and check if we
+	 * can preallocate FDs, if global.prealloc_fd is set.
+	 */
+	check_nofile_lim_and_prealloc_fd();
 
 	/* update the ready date a last time to also account for final setup time */
 	clock_update_date(0, 1);
 	clock_adjust_now_offset();
 	ready_date = date;
-
-	/* close the pidfile both in children and father */
-	if (pidfd >= 0) {
-		//lseek(pidfd, 0, SEEK_SET);  /* debug: emulate eglibc bug */
-		close(pidfd);
-	}
-	/* We won't ever use this anymore */
-	ha_free(&global.pidfile);
 }
 
 /* This function sets verbosity modes. Should be called after the first
@@ -3064,12 +2467,10 @@ static void run_master_in_recovery_mode(int argc, char **argv)
 	list_for_each_entry(proc, &proc_list, list) {
 		proc->failedreloads++;
 	}
-#if defined(USE_SYSTEMD)
 	/* the sd_notify API is not able to send a reload failure signal. So
 	 * the READY=1 signal still need to be sent */
 	if (global.tune.options & GTUNE_USE_SYSTEMD)
 		sd_notify(0, "READY=1\nSTATUS=Reload failed (master failed to load or to parse new configuration)!\n");
-#endif
 
 	global.nbtgroups = 1;
 	global.nbthread = 1;
@@ -3101,8 +2502,19 @@ static void run_master_in_recovery_mode(int argc, char **argv)
 	}
 
 	step_init_4();
+
+	/* set quiet mode if MODE_DAEMON */
+	if ((!(global.mode & MODE_QUIET) || (global.mode & MODE_VERBOSE)) &&
+		(global.mode & MODE_DAEMON)) {
+		/* detach from the tty, this is required to properly daemonize. */
+		if ((getenv("HAPROXY_MWORKER_REEXEC") == NULL))
+			stdio_quiet(-1);
+		global.mode &= ~MODE_VERBOSE;
+		global.mode |= MODE_QUIET; /* ensure that we won't say anything from now */
+	}
+
 	/* enter in master polling loop */
-	run_master();
+	mworker_run_master();
 }
 
 /* parse conf in disovery mode and set modes from config */
@@ -3115,7 +2527,7 @@ static void read_cfg_in_discovery_mode(int argc, char **argv)
 	global.mode |= MODE_DISCOVERY;
 
 	usermsgs_clr("config");
-	if (load_cfg(progname) < 0) {
+	if (load_cfg() < 0) {
 		if (getenv("HAPROXY_MWORKER_REEXEC") != NULL) {
 			ha_warning("Master failed to load new configuration and "
 				   "can't start a new worker. Already running worker "
@@ -3131,7 +2543,7 @@ static void read_cfg_in_discovery_mode(int argc, char **argv)
 			exit(1);
 	}
 
-	if (read_cfg(progname) < 0) {
+	if (read_cfg() < 0) {
 		list_for_each_entry_safe(cfg, cfg_tmp, &cfg_cfgfiles, list) {
 			ha_free(&cfg->content);
 			ha_free(&cfg->filename);
@@ -3380,6 +2792,7 @@ void deinit(void)
 		}
 		free(init_env);
 	}
+	free(progname);
 
 } /* end deinit() */
 
@@ -3410,6 +2823,9 @@ void run_poll_loop()
 
 		/* Process a few tasks */
 		process_runnable_tasks();
+
+		/* If this happens this is an accidental leak */
+		BUG_ON(HA_ATOMIC_LOAD(&th_ctx->flags) & TH_FL_DUMPING_OTHERS);
 
 		/* also stop  if we failed to cleanly stop all tasks */
 		if (killed > 1)
@@ -3489,7 +2905,7 @@ void run_poll_loop()
 	_HA_ATOMIC_AND(&th_ctx->flags, ~TH_FL_IN_LOOP);
 }
 
-static void *run_thread_poll_loop(void *data)
+void *run_thread_poll_loop(void *data)
 {
 	struct per_thread_alloc_fct  *ptaf;
 	struct per_thread_init_fct   *ptif;
@@ -3690,6 +3106,7 @@ int main(int argc, char **argv)
 	struct cfgfile *cfg, *cfg_tmp;
 	struct ring *tmp_startup_logs = NULL;
 	struct mworker_proc *proc;
+	char *msg = "READY\n";
 
 	/* Catch broken toolchains */
 	if (sizeof(long) != sizeof(void *) || (intovf + 0x7FFFFFFF >= intovf)) {
@@ -3713,23 +3130,8 @@ int main(int argc, char **argv)
 		fprintf(stderr,
 		        "FATAL ERROR: invalid code detected -- cannot go further, please recompile!\n"
 		        "%s"
-			"\nBuild options :"
-#ifdef BUILD_TARGET
-		        "\n  TARGET  = " BUILD_TARGET
-#endif
-#ifdef BUILD_CC
-		        "\n  CC      = " BUILD_CC
-#endif
-#ifdef BUILD_CFLAGS
-		        "\n  CFLAGS  = " BUILD_CFLAGS
-#endif
-#ifdef BUILD_OPTIONS
-		        "\n  OPTIONS = " BUILD_OPTIONS
-#endif
-#ifdef BUILD_DEBUG
-		        "\n  DEBUG   = " BUILD_DEBUG
-#endif
-		        "\n\n", msg);
+			"\nBuild options :%s"
+		        "\n\n", msg, build_opts_string);
 
 		return 1;
 	}
@@ -3772,6 +3174,26 @@ int main(int argc, char **argv)
 	 */
 	step_init_1();
 
+	/* call a function to be called with -U in order to make some tests */
+#ifdef DEBUG_UNIT
+	if (unittest_argc > -1) {
+		struct unittest_fct *unit;
+		int ret = 1;
+		int argc_start = argc - unittest_argc;
+
+		list_for_each_entry(unit, &unittest_list, list) {
+
+			if (strcmp(unit->name, argv[argc_start]) == 0) {
+				ret = unit->fct(unittest_argc, argv + argc_start);
+				break;
+			}
+		}
+
+		exit(ret);
+	}
+#endif
+
+
 	/* deserialize processes list, if we do reload in master-worker mode */
 	if ((getenv("HAPROXY_MWORKER_REEXEC") != NULL)) {
 		if (mworker_env_to_proc_list() < 0) {
@@ -3801,26 +3223,23 @@ int main(int argc, char **argv)
 	 * setenv("HAPROXY_MWORKER", "1", 1).
 	 */
 	if (global.mode & MODE_MWORKER)
-		prepare_master();
+		mworker_prepare_master();
 
 	/* If we are in a daemon mode and we might be also in master-worker mode:
 	 * we should do daemonization fork here to put the main process (which
 	 * will become then a master) in background, before it will fork a
 	 * worker, because the worker should be also in background for this case.
 	 */
-	if ((getenv("HAPROXY_MWORKER_REEXEC") == NULL) && (global.mode & MODE_DAEMON))
+	if ((getenv("HAPROXY_MWORKER_REEXEC") == NULL) && (global.mode & MODE_DAEMON)
+	    && !(global.mode & MODE_CHECK))
 		apply_daemon_mode();
-
-	/* Open pid file before the chroot */
-	if ((global.mode & MODE_DAEMON || global.mode & MODE_MWORKER) && global.pidfile != NULL)
-		handle_pidfile();
 
 	/* Master-worker and program forks */
 	if (global.mode & MODE_MWORKER) {
 		/* fork and run binary from command keyword in program section */
 		mworker_ext_launch_all();
 		/* fork worker */
-		apply_master_worker_mode();
+		mworker_apply_master_worker_mode();
 	}
 
 	/* Worker, daemon, foreground modes read the rest of the config */
@@ -3845,8 +3264,16 @@ int main(int argc, char **argv)
 			}
 			setenv("HAPROXY_MWORKER", "1", 1);
 		}
+
+		/* localpeer default value could be redefined via 'localpeer' keyword
+		 * from the global section, which has already parsed in MODE_DISCOVERY by
+		 * read_cfg_in_discovery_mode(). So, let's set HAPROXY_LOCALPEER explicitly
+		 * here.
+		 */
+		setenv("HAPROXY_LOCALPEER", localpeer, 1);
+
 		non_global_section_parsed = 0;
-		if (read_cfg(progname) < 0) {
+		if (read_cfg() < 0) {
 			list_for_each_entry_safe(cfg, cfg_tmp, &cfg_cfgfiles, list) {
 				ha_free(&cfg->content);
 				ha_free(&cfg->filename);
@@ -3856,6 +3283,7 @@ int main(int argc, char **argv)
 		/* all sections have been parsed, we can free the content */
 		list_for_each_entry_safe(cfg, cfg_tmp, &cfg_cfgfiles, list)
 			ha_free(&cfg->content);
+
 		usermsgs_clr(NULL);
 	}
 
@@ -3924,15 +3352,20 @@ int main(int argc, char **argv)
 
 	/* Master enters in its polling loop */
 	if (master) {
-		run_master();
+		mworker_run_master();
 		/* never get there in master context */
 	}
 
 	/* End of initialization for standalone and worker modes */
 	if (!(global.mode & MODE_QUIET) || (global.mode & MODE_VERBOSE)) {
-		devnullfd = open("/dev/null", (O_RDWR | O_CLOEXEC), 0);
+		devnullfd = open("/dev/null", O_RDWR, 0);
 		if (devnullfd < 0) {
 			ha_alert("Cannot open /dev/null\n");
+			exit(EXIT_FAILURE);
+		}
+		if (fcntl(devnullfd, FD_CLOEXEC) != 0) {
+			ha_alert("Cannot make /dev/null CLOEXEC\n");
+			close(devnullfd);
 			exit(EXIT_FAILURE);
 		}
 	}
@@ -3943,6 +3376,21 @@ int main(int argc, char **argv)
 		if (setpriority(PRIO_PROCESS, 0, global.tune.renice_runtime - 100) == -1) {
 			ha_warning("[%s.main()] couldn't set the runtime nice value to %d: %s\n",
 			           argv[0], global.tune.renice_runtime - 100, strerror(errno));
+		}
+	}
+
+	/* Open PID file before the chroot. In master-worker mode, it's master
+	 * who will create the pidfile, see _send_status().
+	 */
+	if (!(global.mode & MODE_MWORKER)) {
+		if (global.mode & MODE_DAEMON && (global.pidfile != NULL)) {
+			if (handle_pidfile() < 0) {
+				if (nb_oldpids) {
+					tell_old_pids(SIGTTIN);
+					protocol_unbind_all();
+				}
+				exit(1);
+			}
 		}
 	}
 
@@ -3960,10 +3408,15 @@ int main(int argc, char **argv)
 
 	ha_free(&global.chroot);
 
-	/* In master-worker mode master sends TERM to previous workers up to
-	 * receiving status READY
+
+	/* In standalone mode send USR1/TERM to the previous worker,
+	 * launched with -sf $(cat pidfile).
+	 * In master-worker mode, see _send_status(): master process sends
+	 * USR1/TERM to previous workers up to receiving status READY from the
+	 * worker, which is newly forked. Then master sends USR1 or TERM to previous
+	 * master, if it was launched with (-W -D -sf $(cat pidfile).
 	 */
-	if (!(global.mode & MODE_MWORKER) && nb_oldpids) {
+	if (!(global.mode & MODE_MWORKER) && (nb_oldpids > 0)) {
 		nb_oldpids = tell_old_pids(oldpids_sig);
 	}
 
@@ -4016,8 +3469,14 @@ int main(int argc, char **argv)
 		devnullfd = -1;
 	}
 	pid = getpid(); /* update pid */
-	setsid();
-	fork_poller();
+
+	/* This call is expensive, as it creates a new poller, scans and tries
+	 * to migrate to it all existing FDs until the highest known one. With
+	 * very high numbers of FDs, this can take several seconds to start.
+	 * So, it's only desirable for modes, when we perform a fork().
+	 */
+	if (global.mode & MODE_DAEMON)
+		fork_poller();
 
 	/* pass through every cli socket, and check if it's bound to
 	 * the current process and if it exposes listeners sockets.
@@ -4149,6 +3608,19 @@ int main(int argc, char **argv)
 			exit(EXIT_FAILURE);
 		startup_logs_free(startup_logs);
 		startup_logs = tmp_startup_logs;
+	}
+
+	/* worker is already sent its READY message to master. This applies only
+	 * for daemon standalone mode. Master in daemon mode will "forward" the READY
+	 * message received from the worker to the launching process, see _send_status().
+	 */
+	if ((global.mode & MODE_DAEMON) && !(global.mode & MODE_MWORKER)) {
+		if (write(daemon_fd[1], msg, strlen(msg)) < 0) {
+			ha_alert("[%s.main()] Failed to write into pipe with parent process: %s\n", progname, strerror(errno));
+			exit(1);
+		}
+		close(daemon_fd[1]);
+		daemon_fd[1] = -1;
 	}
 	/* can't unset MODE_STARTING earlier, otherwise worker's last alerts
 	 * should be not written in startup logs.

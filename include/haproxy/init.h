@@ -32,6 +32,17 @@ void hap_register_per_thread_init(int (*fct)());
 void hap_register_per_thread_deinit(void (*fct)());
 void hap_register_per_thread_free(void (*fct)());
 
+
+#ifdef DEBUG_UNIT
+void hap_register_unittest(const char *name, int (*fct)());
+/* Simplified way to register a unit test */
+#define REGISTER_UNITTEST(name, fct) \
+	INITCALL2(STG_REGISTER, hap_register_unittest, name, (fct))
+#else
+#define hap_register_unittest(a,b) ({})
+#define REGISTER_UNITTEST(name, fct)
+#endif
+
 /* simplified way to declare a pre-check callback in a file */
 #define REGISTER_PRE_CHECK(fct) \
 	INITCALL1(STG_REGISTER, hap_register_pre_check, (fct))

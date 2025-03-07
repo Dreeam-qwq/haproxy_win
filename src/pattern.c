@@ -1606,6 +1606,7 @@ int pat_ref_delete_by_id(struct pat_ref *ref, struct pat_ref_elt *refelt)
 	/* delete pattern from reference */
 	list_for_each_entry_safe(elt, safe, &ref->head, list) {
 		if (elt == refelt) {
+			event_hdl_publish(&ref->e_subs, EVENT_HDL_SUB_PAT_REF_DEL, NULL);
 			pat_ref_delete_by_ptr(ref, elt);
 			return 1;
 		}
@@ -1613,11 +1614,12 @@ int pat_ref_delete_by_id(struct pat_ref *ref, struct pat_ref_elt *refelt)
 	return 0;
 }
 
-/* This function removes all patterns matching <key> from the reference
- * and from each expr member of the reference. This function returns 1
- * if the deletion is done and returns 0 is the entry is not found.
+/* This function removes all elements belonging to <gen_id> and matching <key>
+ * from the reference <ref>.
+ * This function returns 1 if the deletion is done and returns 0 if
+ * the entry is not found.
  */
-int pat_ref_delete(struct pat_ref *ref, const char *key)
+int pat_ref_gen_delete(struct pat_ref *ref, unsigned int gen_id, const char *key)
 {
 	struct ebmb_node *node;
 	int found = 0;
@@ -1629,11 +1631,47 @@ int pat_ref_delete(struct pat_ref *ref, const char *key)
 
 		elt = ebmb_entry(node, struct pat_ref_elt, node);
 		node = ebmb_next_dup(node);
+		if (elt->gen_id != gen_id)
+			continue;
 		pat_ref_delete_by_ptr(ref, elt);
 		found = 1;
 	}
 
+	if (found)
+		event_hdl_publish(&ref->e_subs, EVENT_HDL_SUB_PAT_REF_DEL, NULL);
+
 	return found;
+}
+
+/* This function removes all patterns matching <key> from the reference
+ * and from each expr member of the reference. This function returns 1
+ * if the deletion is done and returns 0 is the entry is not found.
+ */
+int pat_ref_delete(struct pat_ref *ref, const char *key)
+{
+	return pat_ref_gen_delete(ref, ref->curr_gen, key);
+}
+
+/*
+ * find and return an element <elt> belonging to <gen_id> and matching <key> in a
+ * reference <ref> return NULL if not found
+ */
+struct pat_ref_elt *pat_ref_gen_find_elt(struct pat_ref *ref, unsigned int gen_id, const char *key)
+{
+	struct ebmb_node *node;
+	struct pat_ref_elt *elt;
+
+	node = ebst_lookup(&ref->ebmb_root, key);
+	while (node) {
+		elt = ebmb_entry(node, struct pat_ref_elt, node);
+		if (elt->gen_id == gen_id)
+			break;
+		node = ebmb_next_dup(node);
+	}
+	if (node)
+		return ebmb_entry(node, struct pat_ref_elt, node);
+
+	return NULL;
 }
 
 /*
@@ -1642,13 +1680,7 @@ int pat_ref_delete(struct pat_ref *ref, const char *key)
  */
 struct pat_ref_elt *pat_ref_find_elt(struct pat_ref *ref, const char *key)
 {
-	struct ebmb_node *node;
-
-	node = ebst_lookup(&ref->ebmb_root, key);
-	if (node)
-		return ebmb_entry(node, struct pat_ref_elt, node);
-
-	return NULL;
+	return pat_ref_gen_find_elt(ref, ref->curr_gen, key);
 }
 
 
@@ -1754,26 +1786,23 @@ int pat_ref_set_by_id(struct pat_ref *ref, struct pat_ref_elt *refelt, const cha
 	return 0;
 }
 
-/* This function modifies to <value> the sample of all patterns matching <key>
- * under <ref>.
- */
-int pat_ref_set(struct pat_ref *ref, const char *key, const char *value, char **err, struct pat_ref_elt *elt)
+static int pat_ref_set_from_node(struct pat_ref *ref, struct ebmb_node *node, const char *value, char **err)
 {
+	struct pat_ref_elt *elt;
+	unsigned int gen;
+	int first = 1;
 	int found = 0;
-	struct ebmb_node *node;
-
-	if (elt) {
-		node = &elt->node;
-	}
-	else {
-		/* Look for pattern in the reference. */
-		node = ebst_lookup(&ref->ebmb_root, key);
-	}
 
 	while (node) {
 		char *tmp_err = NULL;
 
 		elt = ebmb_entry(node, struct pat_ref_elt, node);
+		if (first)
+			gen = elt->gen_id;
+		else if (elt->gen_id != gen) {
+			/* only consider duplicate elements from the same gen! */
+			continue;
+		}
 		node = ebmb_next_dup(node);
 		if (!pat_ref_set_elt(ref, elt, value, &tmp_err)) {
 			if (err)
@@ -1783,13 +1812,53 @@ int pat_ref_set(struct pat_ref *ref, const char *key, const char *value, char **
 			return 0;
 		}
 		found = 1;
+		first = 0;
 	}
 
 	if (!found) {
 		memprintf(err, "entry not found");
 		return 0;
 	}
+
+	if (gen == ref->curr_gen) // gen cannot be uninitialized here
+		event_hdl_publish(&ref->e_subs, EVENT_HDL_SUB_PAT_REF_SET, NULL);
+
 	return 1;
+}
+
+/* modifies to <value> the sample for <elt> and all its duplicates */
+int pat_ref_set_elt_duplicate(struct pat_ref *ref, struct pat_ref_elt *elt, const char *value,
+                              char **err)
+{
+	return pat_ref_set_from_node(ref, &elt->node, value, err);
+}
+
+/* This function modifies to <value> the sample of all patterns matching <key>
+ * and belonging to <gen_id> under <ref>.
+ */
+int pat_ref_gen_set(struct pat_ref *ref, unsigned int gen_id,
+                    const char *key, const char *value, char **err)
+{
+	struct ebmb_node *node;
+	struct pat_ref_elt *elt;
+
+	/* Look for pattern in the reference. */
+	node = ebst_lookup(&ref->ebmb_root, key);
+	while (node) {
+		elt = ebmb_entry(node, struct pat_ref_elt, node);
+		if (elt->gen_id == gen_id)
+			break;
+		node = ebmb_next_dup(node);
+	}
+	return pat_ref_set_from_node(ref, node, value, err);
+}
+
+/* This function modifies to <value> the sample of all patterns matching <key>
+ * under <ref>.
+ */
+int pat_ref_set(struct pat_ref *ref, const char *key, const char *value, char **err)
+{
+	return pat_ref_gen_set(ref, ref->curr_gen, key, value, err);
 }
 
 /* helper function to create and initialize a generic pat_ref struct
@@ -1826,6 +1895,7 @@ static struct pat_ref *_pat_ref_new(const char *display, unsigned int flags)
 	ref->ebmb_root = EB_ROOT;
 	LIST_INIT(&ref->pat);
 	HA_RWLOCK_INIT(&ref->lock);
+	event_hdl_sub_list_init(&ref->e_subs);
 
 	return ref;
 }
@@ -1835,6 +1905,7 @@ static void pat_ref_free(struct pat_ref *ref)
 {
 	ha_free(&ref->reference);
 	ha_free(&ref->display);
+	event_hdl_sub_list_destroy(&ref->e_subs);
 	free(ref);
 }
 
@@ -2034,6 +2105,10 @@ struct pat_ref_elt *pat_ref_load(struct pat_ref *ref, unsigned int gen,
 	} else
 		memprintf(err, "out of memory error");
 
+	/* ignore if update requires committing to be seen */
+	if (elt && gen == ref->curr_gen)
+		event_hdl_publish(&ref->e_subs, EVENT_HDL_SUB_PAT_REF_ADD, NULL);
+
 	return elt;
 }
 
@@ -2105,6 +2180,12 @@ int pat_ref_purge_range(struct pat_ref *ref, uint from, uint to, int budget)
 
 	list_for_each_entry(expr, &ref->pat, list)
 		HA_RWLOCK_WRUNLOCK(PATEXP_LOCK, &expr->lock);
+
+	/* only publish when we're done and if curr_gen was impacted by the
+	 * purge
+	 */
+	if (done && ref->curr_gen - from <= to - from)
+		event_hdl_publish(&ref->e_subs, EVENT_HDL_SUB_PAT_REF_CLEAR, NULL);
 
 	return done;
 }

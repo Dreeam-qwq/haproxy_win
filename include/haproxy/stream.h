@@ -386,20 +386,52 @@ static inline int stream_check_conn_timeout(struct stream *s)
 }
 
 /* Wake a stream up for shutdown by sending it an event. The stream must be
- * locked one way or another so that it cannot leave (i.e. when inspecting
- * a locked list or under thread isolation). Process_stream() will recognize
- * the message and complete the job. <why> only supports SF_ERR_DOWN (mapped
- * to UEVT1) and SF_ERR_KILLED (mapped to UEVT2). Other values will just
- * trigger TASK_WOKEN_OTHER. The stream handler will first call function
- * stream_shutdown_self() on wakeup to complete the notification.
+ * locked one way or another so that it cannot leave (i.e. when inspecting a
+ * locked list or under thread isolation). Process_stream() will recognize the
+ * message and complete the job. <why> only supports SF_ERR_DOWN (mapped to
+ * STRM_EVT_SHUT_SRV_DOWN), SF_ERR_KILLED (mapped to STRM_EVT_KILLED) and
+ * SF_ERR_UP (mapped to STRM_EVT_SHUT_SRV_UP). Other values will just be
+ * ignored. The stream is woken up with TASK_WOKEN_OTHER reason. The stream
+ * handler will first call function stream_shutdown_self() on wakeup to complete
+ * the notification.
  */
 static inline void stream_shutdown(struct stream *s, int why)
 {
-	task_wakeup(s->task, TASK_WOKEN_OTHER |
-	            ((why == SF_ERR_DOWN) ? TASK_F_UEVT1 :
-	             (why == SF_ERR_KILLED) ? TASK_F_UEVT2 :
-	             0));
+	HA_ATOMIC_OR(&s->new_events, ((why == SF_ERR_DOWN) ? STRM_EVT_SHUT_SRV_DOWN :
+				      (why == SF_ERR_KILLED) ? STRM_EVT_KILLED :
+				      (why == SF_ERR_UP) ? STRM_EVT_SHUT_SRV_UP :
+				      0));
+	task_wakeup(s->task, TASK_WOKEN_OTHER);
 }
+
+/* Map task states to stream events. TASK_WOKEN_* are mapped on
+ * STRM_EVT_*. Not all states/flags are mapped, only those explicitly used by
+ * the stream.
+ */
+static inline unsigned int stream_map_task_state(unsigned int state)
+{
+	return ((state & TASK_WOKEN_TIMER) ? STRM_EVT_TIMER : 0)         |
+		((state & TASK_WOKEN_MSG)  ? STRM_EVT_MSG : 0)           |
+		((state & TASK_F_UEVT1)    ? STRM_EVT_SHUT_SRV_DOWN : 0) |
+		((state & TASK_F_UEVT3)    ? STRM_EVT_SHUT_SRV_UP : 0)   |
+		((state & TASK_F_UEVT2)    ? STRM_EVT_KILLED : 0)        |
+		0;
+}
+
+static inline void stream_report_term_evt(struct stconn *sc, enum strm_term_event_type type)
+{
+	struct stream *s = sc_strm(sc);
+	enum term_event_loc loc = tevt_loc_strm;
+
+	if (!s)
+		return;
+
+	if (sc->flags & SC_FL_ISBACK)
+		loc += 8;
+	s->term_evts_log = tevt_report_event(s->term_evts_log, loc, type);
+	sc->term_evts_log = tevt_report_event(sc->term_evts_log, loc, type);
+}
+
 
 int stream_set_timeout(struct stream *s, enum act_timeout_name name, int timeout);
 void stream_retnclose(struct stream *s, const struct buffer *msg);

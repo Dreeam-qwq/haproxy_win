@@ -288,6 +288,7 @@ static int val_fc_time_value(struct arg *args, char **err)
  * case, the argument is ignored and a warning is emitted. Returns 0 on error
  * and non-zero if OK.
  */
+#if defined(__linux__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__) || defined(__APPLE__)
 static int var_fc_counter(struct arg *args, char **err)
 {
 	if (args[0].type != ARGT_STOP) {
@@ -299,6 +300,7 @@ static int var_fc_counter(struct arg *args, char **err)
 
 	return 1;
 }
+#endif
 
 /* Returns some tcp_info data if it's available. "dir" must be set to 0 if
  * the client connection is required, otherwise it is set to 1. "val" represents
@@ -497,17 +499,25 @@ smp_fetch_accept_date(const struct arg *args, struct sample *smp, const char *kw
 	struct strm_logs *logs;
 	struct timeval tv;
 
-	if (!smp->strm)
+	if (smp->strm) {
+		logs = &smp->strm->logs;
+
+		if (kw[0] == 'r') {  /* request_date */
+			tv_ms_add(&tv, &logs->accept_date, logs->t_idle >= 0 ? logs->t_idle + logs->t_handshake : 0);
+		} else {             /* accept_date */
+			tv.tv_sec = logs->accept_date.tv_sec;
+			tv.tv_usec = logs->accept_date.tv_usec;
+		}
+	/* case of error-log-format */
+	} else if (smp->sess) {
+		if (kw[0] == 'r') {  /* request_date */
+			tv_ms_add(&tv, &smp->sess->accept_date, smp->sess->t_idle >= 0 ? smp->sess->t_idle + smp->sess->t_handshake : 0);
+		} else {             /* accept_date */
+			tv.tv_sec = smp->sess->accept_date.tv_sec;
+			tv.tv_usec = smp->sess->accept_date.tv_usec;
+		}
+	} else
 		return 0;
-
-	logs = &smp->strm->logs;
-
-	if (kw[0] == 'r') {  /* request_date */
-		tv_ms_add(&tv, &logs->accept_date, logs->t_idle >= 0 ? logs->t_idle + logs->t_handshake : 0);
-	} else {             /* accept_date */
-		tv.tv_sec = logs->accept_date.tv_sec;
-		tv.tv_usec = logs->accept_date.tv_usec;
-	}
 
 	smp->data.u.sint = tv.tv_sec;
 

@@ -36,6 +36,7 @@
 #include <haproxy/stick_table-t.h>
 #include <haproxy/xref-t.h>
 #include <haproxy/event_hdl-t.h>
+#include <haproxy/pattern-t.h>
 
 #define CLASS_CORE         "Core"
 #define CLASS_TXN          "TXN"
@@ -53,6 +54,7 @@
 #define CLASS_SERVER       "Server"
 #define CLASS_LISTENER     "Listener"
 #define CLASS_EVENT_SUB    "EventSub"
+#define CLASS_PATREF       "Patref"
 #define CLASS_REGEX        "Regex"
 #define CLASS_STKTABLE     "StickTable"
 #define CLASS_CERTCACHE    "CertCache"
@@ -228,8 +230,30 @@ struct hlua_server_list {
 };
 
 struct hlua_server_list_iterator_context {
-	struct server *cur;
-	struct proxy *px;
+	struct watcher srv_watch; /* watcher to automatically update next pointer
+	                           * on server deletion
+	                           */
+	struct server *next;      /* next server in list */
+	struct proxy *px;         /* to retrieve first server */
+};
+
+#define HLUA_PATREF_FL_NONE    0x00
+#define HLUA_PATREF_FL_GEN     0x01 /* patref update backed by specific subset, check curr_gen */
+
+/* pat_ref struct wrapper for lua */
+struct hlua_patref {
+	/* no need for lock-protecting the struct, it is not meant to
+	 * be used by parallel lua contexts
+	 */
+	struct pat_ref *ptr;
+	uint16_t flags; /* HLUA_PATREF_FL_* */
+	unsigned int curr_gen; /* relevant if HLUA_PATREF_FL_GEN is set */
+};
+
+struct hlua_patref_iterator_context {
+	struct hlua_patref *ref;
+	struct bref bref;       /* back-reference from the pat_ref_elt being accessed
+	                         * during listing */
 };
 
 #else /* USE_LUA */

@@ -70,7 +70,9 @@
 #include <haproxy/sink.h>
 #include <haproxy/mailers.h>
 #include <haproxy/namespace.h>
+#include <haproxy/quic_cc-t.h>
 #include <haproxy/quic_sock.h>
+#include <haproxy/quic_tune.h>
 #include <haproxy/obj_type-t.h>
 #include <haproxy/openssl-compat.h>
 #include <haproxy/peers-t.h>
@@ -119,7 +121,7 @@ static enum default_path_mode {
 	DEFAULT_PATH_ORIGIN,       /* "origin": paths are relative to default_path_origin */
 } default_path_mode;
 
-static char initial_cwd[PATH_MAX];
+char initial_cwd[PATH_MAX];
 static char current_cwd[PATH_MAX];
 
 /* List head of all known configuration keywords */
@@ -792,8 +794,10 @@ int cfg_parse_peers(const char *file, int linenum, char **args, int kwm)
 			goto out;
 		}
 
-		if (alertif_too_many_args(1, file, linenum, args, &err_code))
+		if (alertif_too_many_args(1, file, linenum, args, &err_code)) {
+			err_code |= ERR_ABORT;
 			goto out;
+		}
 
 		err = invalid_char(args[1]);
 		if (err) {
@@ -831,6 +835,7 @@ int cfg_parse_peers(const char *file, int linenum, char **args, int kwm)
 	}
 	else if (strcmp(args[0], "peer") == 0 ||
 	         strcmp(args[0], "server") == 0) { /* peer or server definition */
+		struct server *prev_srv;
 		int local_peer, peer;
 		int parse_addr = 0;
 
@@ -881,17 +886,25 @@ int cfg_parse_peers(const char *file, int linenum, char **args, int kwm)
 		 * or if we are parsing a "server" line and the current peer is not the local one.
 		 */
 		parse_addr = (peer || !local_peer) ? SRV_PARSE_PARSE_ADDR : 0;
+		prev_srv = curpeers->peers_fe->srv;
 		err_code |= parse_server(file, linenum, args, curpeers->peers_fe, NULL,
 		                         SRV_PARSE_IN_PEER_SECTION|parse_addr|SRV_PARSE_INITIAL_RESOLVE);
-		if (!curpeers->peers_fe->srv) {
-			/* Remove the newly allocated peer. */
-			if (newpeer != curpeers->local) {
-				struct peer *p;
+		if (curpeers->peers_fe->srv == prev_srv) {
+			/* parse_server didn't add a server:
+			 * Remove the newly allocated peer.
+			 */
+			struct peer *p;
 
-				p = curpeers->remote;
-				curpeers->remote = curpeers->remote->next;
-				free(p->id);
-				free(p);
+			p = curpeers->remote;
+			curpeers->remote = curpeers->remote->next;
+			free(p->id);
+			free(p);
+			if (newpeer == curpeers->local) {
+				/* reset curpeers and curpeers fields
+				 * that are local peer related
+				 */
+				curpeers->local = NULL;
+				ha_free(&curpeers->peers_fe->id);
 			}
 			goto out;
 		}
@@ -1405,6 +1418,15 @@ cfg_parse_users(const char *file, int linenum, char **args, int kwm)
 
 		while (*args[cur_arg]) {
 			if (strcmp(args[cur_arg], "users") == 0) {
+				if (ag->groupusers) {
+					ha_alert("parsing [%s:%d]: 'users' option already defined in '%s' name '%s'.\n",
+						 file, linenum, args[0], args[1]);
+					err_code |= ERR_ALERT | ERR_FATAL;
+					free(ag->groupusers);
+					free(ag->name);
+					free(ag);
+					goto out;
+				}
 				ag->groupusers = strdup(args[cur_arg + 1]);
 				cur_arg += 2;
 				continue;
@@ -2041,7 +2063,10 @@ next_line:
 
 				/* if a word is in sections list, is_sect = 1 */
 				list_for_each_entry(sect, &sections, list) {
-					if (strcmp(args[0], sect->section_name) == 0) {
+					/* look for a section_name, but also a section_parser, because there might be
+					 * only a post_section_parser */
+					if (strcmp(args[0], sect->section_name) == 0 &&
+					    sect->section_parser) {
 						is_sect = 1;
 						break;
 					}
@@ -2551,7 +2576,7 @@ next_line:
 
 		/* detect section start */
 		list_for_each_entry(ics, &sections, list) {
-			if (strcmp(args[0], ics->section_name) == 0) {
+			if (strcmp(args[0], ics->section_name) == 0 && ics->section_parser) {
 				cursection = ics->section_name;
 				pcs = cs;
 				cs = ics;
@@ -2562,23 +2587,33 @@ next_line:
 			}
 		}
 
-		if (pcs && pcs->post_section_parser) {
+		if (pcs) {
+			struct cfg_section *psect;
 			int status;
 
-			/* don't call post_section_parser in MODE_DISCOVERY, except program section */
-			if ((global.mode & MODE_DISCOVERY) && (strcmp(pcs->section_name, "program") != 0))
-				continue;
 
-			status = pcs->post_section_parser();
-			err_code |= status;
-			if (status & ERR_FATAL)
-				fatal++;
+			/* look for every post_section_parser for the previous section name */
+			list_for_each_entry(psect, &sections, list) {
+				if (strcmp(pcs->section_name, psect->section_name) == 0 &&
+						psect->post_section_parser) {
 
-			if (err_code & ERR_ABORT)
-				goto err;
+					/* don't call post_section_parser in MODE_DISCOVERY */
+					if (global.mode & MODE_DISCOVERY)
+						goto section_parser;
+
+					status = psect->post_section_parser();
+					err_code |= status;
+					if (status & ERR_FATAL)
+						fatal++;
+
+					if (err_code & ERR_ABORT)
+						goto err;
+				}
+			}
 		}
 		pcs = NULL;
 
+section_parser:
 		if (!cs) {
 			/* ignore unknown section names during the first read in MODE_DISCOVERY */
 			if (global.mode & MODE_DISCOVERY)
@@ -2611,17 +2646,35 @@ next_line:
 	}
 
 	ha_free(&global.cfg_curr_section);
-	if (cs && cs->post_section_parser)
-		err_code |= cs->post_section_parser();
+
+	/* call post_section_parser of the last section when there is no more lines */
+	if (cs) {
+		struct cfg_section *psect;
+		int status;
+
+		/* don't call post_section_parser in MODE_DISCOVERY */
+		if (!(global.mode & MODE_DISCOVERY)) {
+			list_for_each_entry(psect, &sections, list) {
+				if (strcmp(cs->section_name, psect->section_name) == 0 &&
+				     psect->post_section_parser) {
+
+					status = psect->post_section_parser();
+					if (status & ERR_FATAL)
+						fatal++;
+
+					err_code |= status;
+
+					if (err_code & ERR_ABORT)
+						goto err;
+
+				}
+			}
+		}
+	}
 
 	if (nested_cond_lvl) {
 		ha_alert("parsing [%s:%d]: non-terminated '.if' block.\n", file, linenum);
 		err_code |= ERR_ALERT | ERR_FATAL | ERR_ABORT;
-	}
-
-	if (*initial_cwd && chdir(initial_cwd) == -1) {
-		ha_alert("Impossible to get back to initial directory '%s' : %s\n", initial_cwd, strerror(errno));
-		err_code |= ERR_ALERT | ERR_FATAL;
 	}
 
 err:
@@ -3051,6 +3104,21 @@ init_proxies_list_stage1:
 #endif
 			} /* HTTP && bufsize < 16384 */
 #endif
+
+#ifdef USE_QUIC
+			if (bind_conf->xprt == xprt_get(XPRT_QUIC)) {
+				const struct quic_cc_algo *cc_algo = bind_conf->quic_cc_algo ?
+				  bind_conf->quic_cc_algo : default_quic_cc_algo;
+
+				if (!(cc_algo->flags & QUIC_CC_ALGO_FL_OPT_PACING) &&
+				    quic_tune.options & QUIC_TUNE_NO_PACING) {
+					ha_warning("Binding [%s:%d] for %s %s: using the selected congestion algorithm without pacing may cause slowdowns or high loss rates during transfers.\n",
+					           bind_conf->file, bind_conf->line,
+					           proxy_type_str(curproxy), curproxy->id);
+					err_code |= ERR_WARN;
+				}
+			}
+#endif /* USE_QUIC */
 
 			/* finish the bind setup */
 			ret = bind_complete_thread_setup(bind_conf, &err_code);
@@ -4307,6 +4375,7 @@ init_proxies_list_stage2:
 		struct listener *listener;
 		unsigned int next_id;
 
+		proxy_init_per_thr(curproxy);
 		/* Configure SSL for each bind line.
 		 * Note: if configuration fails at some point, the ->ctx member
 		 * remains NULL so that listeners can later detach.
@@ -4689,10 +4758,13 @@ int cfg_register_section(char *section_name,
 {
 	struct cfg_section *cs;
 
-	list_for_each_entry(cs, &sections, list) {
-		if (strcmp(cs->section_name, section_name) == 0) {
-			ha_alert("register section '%s': already registered.\n", section_name);
-			return 0;
+	if (section_parser) {
+		/* only checks if we register a section parser, not a post section callback */
+		list_for_each_entry(cs, &sections, list) {
+			if (strcmp(cs->section_name, section_name) == 0 && cs->section_parser) {
+				ha_alert("register section '%s': already registered.\n", section_name);
+				return 0;
+			}
 		}
 	}
 

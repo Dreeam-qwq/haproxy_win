@@ -34,12 +34,10 @@ extern struct pool_head *pool_head_pendconn;
 
 struct pendconn *pendconn_add(struct stream *strm);
 int pendconn_dequeue(struct stream *strm);
-void process_srv_queue(struct server *s);
+int process_srv_queue(struct server *s);
 unsigned int srv_dynamic_maxconn(const struct server *s);
 int pendconn_redistribute(struct server *s);
-int pendconn_grab_from_px(struct server *s);
 void pendconn_unlink(struct pendconn *p);
-int pendconn_must_try_again(struct pendconn *p);
 
 /* Removes the pendconn from the server/proxy queue. It supports being called
  * with NULL for pendconn and with a pendconn not in the list. It is the
@@ -88,7 +86,7 @@ static inline int server_has_room(const struct server *s) {
  * for and if/else usage.
  */
 static inline int may_dequeue_tasks(const struct server *s, const struct proxy *p) {
-	return (s && (s->queue.length || (p->queue.length && srv_currently_usable(s))) &&
+	return (s && (s->queueslength || (p->queueslength && srv_currently_usable(s))) &&
 		(!s->maxconn || s->cur_sess < srv_dynamic_maxconn(s)));
 }
 

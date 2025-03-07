@@ -23,14 +23,12 @@ feature cmd "command -v grep"
 #EXCLUDE_TARGETS=freebsd,osx,generic
 #REGTEST_TYPE=devel
 
-haproxy h1 -W -S -conf {
+haproxy h1 -Ws -S -conf {
   global
     stats socket "${tmpdir}/h1/stats" level admin expose-fd listeners
 
   defaults
     mode http
-    log global
-    option httplog
     timeout connect "${HAPROXY_TEST_TIMEOUT-5s}"
     timeout client  "${HAPROXY_TEST_TIMEOUT-5s}"
     timeout server  "${HAPROXY_TEST_TIMEOUT-5s}"

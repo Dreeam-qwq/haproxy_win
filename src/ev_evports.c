@@ -58,7 +58,7 @@ static inline void evports_resync_fd(int fd, int events)
 	if (events == 0)
 		port_dissociate(evports_fd[tid], PORT_SOURCE_FD, fd);
 	else
-		port_associate(evports_fd[tid], PORT_SOURCE_FD, fd, events, NULL);
+		port_associate(evports_fd[tid], PORT_SOURCE_FD, fd, events, (void *)(uintptr_t)fdtab[fd].generation);
 }
 
 static void _update_fd(int fd)
@@ -103,6 +103,14 @@ static void _update_fd(int fd)
 
 	}
 	evports_resync_fd(fd, events);
+}
+
+static void _do_fixup_tgid_takeover(struct poller *poller, const int fd, const int old_ltid, const int old_tgid)
+{
+
+	polled_mask[fd].poll_recv = 0;
+	polled_mask[fd].poll_send = 0;
+	fdtab[fd].update_mask = 0;
 }
 
 /*
@@ -243,10 +251,21 @@ static void _do_poll(struct poller *p, int exp, int wake)
 
 	for (i = 0; i < nevlist; i++) {
 		unsigned int n = 0;
+		unsigned int generation = (unsigned int)(uintptr_t)evports_evlist[i].portev_user;
 		int events, rebind_events;
 		int ret;
 
 		fd = evports_evlist[i].portev_object;
+
+		if (generation == fdtab[fd].generation && fd_tgid(fd) != tgid) {
+			/*
+			 * The FD was taken over by another tgid, forget about
+			 * it.
+			 */
+			port_dissociate(evports_fd[tid], PORT_SOURCE_FD, fd);
+			continue;
+		}
+
 		events = evports_evlist[i].portev_events;
 
 #ifdef DEBUG_FD
@@ -450,6 +469,7 @@ static void _do_register(void)
 	p->term = _do_term;
 	p->poll = _do_poll;
 	p->fork = _do_fork;
+	p->fixup_tgid_takeover = _do_fixup_tgid_takeover;
 }
 
 INITCALL0(STG_REGISTER, _do_register);

@@ -170,10 +170,12 @@ enum srv_init_state {
 #define SRV_F_NON_PURGEABLE 0x2000       /* this server cannot be removed at runtime */
 #define SRV_F_DEFSRV_USE_SSL 0x4000      /* default-server uses SSL */
 #define SRV_F_DELETED 0x8000             /* srv is deleted but not yet purged */
+#define SRV_F_STRICT_MAXCONN 0x10000     /* maxconn is to be strictly enforced, as a limit of outbound connections */
 
 /* configured server options for send-proxy (server->pp_opts) */
 #define SRV_PP_V1               0x0001   /* proxy protocol version 1 */
 #define SRV_PP_V2               0x0002   /* proxy protocol version 2 */
+#define SRV_PP_ENABLED          0x0003   /* proxy protocol version 1 or version 2 */
 #define SRV_PP_V2_SSL           0x0004   /* proxy protocol version 2 with SSL */
 #define SRV_PP_V2_SSL_CN        0x0008   /* proxy protocol version 2 with CN */
 #define SRV_PP_V2_SSL_KEY_ALG   0x0010   /* proxy protocol version 2 with cert key algorithm */
@@ -271,8 +273,12 @@ struct srv_per_thread {
 
 /* Each server will have one occurrence of this structure per thread group */
 struct srv_per_tgroup {
+	struct queue queue;			/* pending connections */
+	unsigned int last_other_tgrp_served;	/* Last other tgrp we dequeued from */
+	unsigned int self_served;		/* Number of connection we dequeued from our own queue */
+	unsigned int dequeuing;                 /* non-zero = dequeuing in progress (atomic) */
 	unsigned int next_takeover;             /* thread ID to try to steal connections from next time */
-};
+} THREAD_ALIGNED(64);
 
 /* Configure the protocol selection for websocket */
 enum __attribute__((__packed__)) srv_ws_mode {
@@ -303,7 +309,6 @@ struct server {
 	unsigned int pp_opts;                   /* proxy protocol options (SRV_PP_*) */
 	struct mt_list global_list;             /* attach point in the global servers_list */
 	struct server *next;
-	struct mt_list prev_deleted;            /* deleted servers with 'next' ptr pointing to us */
 	int cklen;				/* the len of the cookie, to speed up checks */
 	int rdr_len;				/* the length of the redirection prefix */
 	char *cookie;				/* the id set in the cookie */
@@ -315,7 +320,7 @@ struct server {
 	struct log_target *log_target;          /* when 'mode log' is enabled, target facility used to transport log messages */
 	unsigned maxconn, minconn;		/* max # of active sessions (0 = unlimited), min# for dynamic limit. */
 	struct srv_per_thread *per_thr;         /* array of per-thread stuff such as connections lists */
-	struct srv_per_tgroup *per_tgrp;        /* array of per-tgroup stuff such as idle conns */
+	struct srv_per_tgroup *per_tgrp;        /* array of per-tgroup stuff such as idle conns and queues */
 	unsigned int *curr_idle_thr;            /* Current number of orphan idling connections per thread */
 
 	char *pool_conn_name;
@@ -344,12 +349,14 @@ struct server {
 	unsigned rweight;			/* remainder of weight in the current LB tree */
 	unsigned cumulative_weight;		/* weight of servers prior to this one in the same group, for chash balancing */
 	int maxqueue;				/* maximum number of pending connections allowed */
+	unsigned int queueslength;		/* Sum of the length of each queue */
 	int shard;				/* shard (in peers protocol context only) */
 	int log_bufsize;			/* implicit ring bufsize (for log server only - in log backend) */
 
 	enum srv_ws_mode ws;                    /* configure the protocol selection for websocket */
 	/* 3 bytes hole here */
 
+	struct mt_list watcher_list;		/* list of elems which currently references this server instance */
 	uint refcount;                          /* refcount used to remove a server at runtime */
 
 	/* The elements below may be changed on every single request by any
@@ -361,12 +368,11 @@ struct server {
 	unsigned int curr_idle_nb;              /* Current number of connections in the idle list */
 	unsigned int curr_safe_nb;              /* Current number of connections in the safe list */
 	unsigned int curr_used_conns;           /* Current number of used connections */
+	unsigned int curr_total_conns;          /* Current number of total connections to the server, used or idle, only calculated if strict-maxconn is used */
 	unsigned int max_used_conns;            /* Max number of used connections (the counter is reset at each connection purges */
 	unsigned int est_need_conns;            /* Estimate on the number of needed connections (max of curr and previous max_used) */
 
-	struct queue queue;			/* pending connections */
 	struct mt_list sess_conns;		/* list of private conns managed by a session on this server */
-	unsigned int dequeuing;                 /* non-zero = dequeuing in progress (atomic) */
 
 	/* Element below are usd by LB algorithms and must be doable in
 	 * parallel to other threads reusing connections above.
@@ -392,6 +398,7 @@ struct server {
 
 	struct eb_root *lb_tree;                /* we want to know in what tree the server is */
 	struct tree_occ *lb_nodes;              /* lb_nodes_tot * struct tree_occ */
+	struct tasklet *requeue_tasklet;        /* tasklet to call to asynchronously requeue the server */
 	unsigned lb_nodes_tot;                  /* number of allocated lb_nodes (C-HASH) */
 	unsigned lb_nodes_now;                  /* number of lb_nodes placed in the tree (C-HASH) */
 	enum srv_hash_key hash_key;             /* method to compute node hash (C-HASH) */
