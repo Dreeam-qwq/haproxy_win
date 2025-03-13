@@ -112,9 +112,6 @@ struct qcc {
 	void *ctx; /* Application layer context */
 };
 
-/* Maximum size of stream Rx buffer. */
-#define QC_S_RX_BUF_SZ   (global.tune.bufsize - NCB_RESERVED_SZ)
-
 /* QUIC stream states
  *
  * On initialization a stream is put on idle state. It is opened as soon as
@@ -137,6 +134,15 @@ enum qcs_state {
 	QC_SS_CLO,      /* closed */
 } __attribute__((packed));
 
+/* STREAM receive buffer. Can handle out-of-order storage.
+ * Can be used as a tree node to allocate multiple entries ordered by offsets.
+ */
+struct qc_stream_rxbuf {
+	struct eb64_node off_node; /* base offset of current buffer, node for QCS rx.bufs */
+	struct ncbuf ncb;          /* data storage with support for out of order offset */
+	uint64_t off_end;          /* first offset directly outside of current buffer */
+};
+
 struct qcs {
 	struct qcc *qcc;
 	struct sedesc *sd;
@@ -145,9 +151,9 @@ struct qcs {
 	void *ctx;           /* app-ops context */
 
 	struct {
-		uint64_t offset; /* absolute current base offset of ncbuf */
+		uint64_t offset; /* read offset */
 		uint64_t offset_max; /* maximum absolute offset received */
-		struct ncbuf ncbuf; /* receive buffer - can handle out-of-order offset frames */
+		struct eb_root bufs; /* receive buffers tree ordered by offset */
 		struct buffer app_buf; /* receive buffer used by stconn layer */
 		uint64_t msd; /* current max-stream-data limit to enforce */
 		uint64_t msd_init; /* initial max-stream-data */

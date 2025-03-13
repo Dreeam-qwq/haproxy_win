@@ -34,6 +34,7 @@
 
 DECLARE_POOL(pool_head_qcc, "qcc", sizeof(struct qcc));
 DECLARE_POOL(pool_head_qcs, "qcs", sizeof(struct qcs));
+DECLARE_STATIC_POOL(pool_head_qc_stream_rxbuf, "qc_stream_rxbuf", sizeof(struct qc_stream_rxbuf));
 
 static void qmux_ctrl_send(struct qc_stream_desc *, uint64_t data, uint64_t offset);
 static void qmux_ctrl_room(struct qc_stream_desc *, uint64_t room);
@@ -44,23 +45,27 @@ static int qcc_is_pacing_active(const struct connection *conn)
 	return !(quic_tune.options & QUIC_TUNE_NO_PACING);
 }
 
-static void qcs_free_ncbuf(struct qcs *qcs, struct ncbuf *ncbuf)
+/* Free <rxbuf> instance and its inner data storage attached to <qcs> stream. */
+static void qcs_free_rxbuf(struct qcs *qcs, struct qc_stream_rxbuf *rxbuf)
 {
+	struct ncbuf *ncbuf;
 	struct buffer buf;
 
-	if (ncb_is_null(ncbuf))
-		return;
-
-	buf = b_make(ncbuf->area, ncbuf->size, 0, 0);
-	b_free(&buf);
-	offer_buffers(NULL, 1);
-
-	*ncbuf = NCBUF_NULL;
+	ncbuf = &rxbuf->ncb;
+	if (!ncb_is_null(ncbuf)) {
+		buf = b_make(ncbuf->area, ncbuf->size, 0, 0);
+		b_free(&buf);
+		offer_buffers(NULL, 1);
+	}
+	rxbuf->ncb = NCBUF_NULL;
 
 	/* Reset DEM_FULL as buffer is released. This ensures mux is not woken
 	 * up from rcv_buf stream callback when demux was previously blocked.
 	 */
 	qcs->flags &= ~QC_SF_DEM_FULL;
+
+	eb64_delete(&rxbuf->off_node);
+	pool_free(pool_head_qc_stream_rxbuf, rxbuf);
 }
 
 /* Free <qcs> instance. This function is reserved for internal usage : it must
@@ -70,6 +75,7 @@ static void qcs_free_ncbuf(struct qcs *qcs, struct ncbuf *ncbuf)
 static void qcs_free(struct qcs *qcs)
 {
 	struct qcc *qcc = qcs->qcc;
+	struct qc_stream_rxbuf *b;
 
 	TRACE_ENTER(QMUX_EV_QCS_END, qcc->conn, qcs);
 	TRACE_STATE("releasing QUIC stream", QMUX_EV_QCS_END, qcc->conn, qcs);
@@ -97,7 +103,11 @@ static void qcs_free(struct qcs *qcs)
 	}
 
 	/* Free Rx buffer. */
-	qcs_free_ncbuf(qcs, &qcs->rx.ncbuf);
+	while (!eb_is_empty(&qcs->rx.bufs)) {
+		b = container_of(eb64_first(&qcs->rx.bufs),
+		                 struct qc_stream_rxbuf, off_node);
+		qcs_free_rxbuf(qcs, b);
+	}
 
 	/* Remove qcs from qcc tree. */
 	eb64_delete(&qcs->by_id);
@@ -152,7 +162,7 @@ static struct qcs *qcs_new(struct qcc *qcc, uint64_t id, enum qcs_type type)
 		qfctl_init(&qcs->tx.fc, 0);
 	}
 
-	qcs->rx.ncbuf = NCBUF_NULL;
+	qcs->rx.bufs = EB_ROOT_UNIQUE;
 	qcs->rx.app_buf = BUF_NULL;
 	qcs->rx.offset = qcs->rx.offset_max = 0;
 
@@ -1074,33 +1084,136 @@ int qcc_get_qcs(struct qcc *qcc, uint64_t id, int receive_only, int send_only,
 	return 1;
 }
 
-/* Simple function to duplicate a buffer */
-static inline struct buffer qcs_b_dup(const struct ncbuf *b)
+/* Convert <b> out-of-order storage into a contiguous buffer. */
+static inline struct buffer qcs_b_dup(const struct qc_stream_rxbuf *b)
 {
-	return b_make(ncb_orig(b), b->size, b->head, ncb_data(b, 0));
+	if (b) {
+		const struct ncbuf *ncb = &b->ncb;
+		return b_make(ncb_orig(ncb), ncb->size, ncb->head, ncb_data(ncb, 0));
+	}
+	else {
+		return BUF_NULL;
+	}
 }
 
-/* Remove <bytes> from <qcs> Rx buffer. Flow-control for received offsets may
- * be allocated for the peer if needed.
+/* Transfer data into <qcs> stream <rxbuf> current Rx buffer from its directly
+ * following buffer. This is useful when parsing was interrupted due to partial
+ * data. If following buffer does not exists, nothing is done.
+ *
+ * Returns 0 if data transfer was performed.
  */
-static void qcs_consume(struct qcs *qcs, uint64_t bytes)
+static int qcs_transfer_rx_data(struct qcs *qcs, struct qc_stream_rxbuf *rxbuf)
+{
+	struct qc_stream_rxbuf *rxbuf_next;
+	struct eb64_node *next;
+	struct buffer b, b_next;
+	enum ncb_ret ncb_ret;
+	size_t to_copy;
+	int ret = 1;
+
+	BUG_ON(ncb_is_full(&rxbuf->ncb));
+
+	next = eb64_next(&rxbuf->off_node);
+	if (!next)
+		goto out;
+
+	rxbuf_next = container_of(next, struct qc_stream_rxbuf, off_node);
+	if (rxbuf_next->off_node.key == rxbuf->off_end &&
+	    ncb_data(&rxbuf_next->ncb, 0)) {
+		eb64_delete(&rxbuf->off_node);
+		eb64_delete(next);
+
+		b = qcs_b_dup(rxbuf);
+		b_next = qcs_b_dup(rxbuf_next);
+		to_copy = MIN(b_data(&b_next), ncb_size(&rxbuf->ncb) - b_data(&b));
+
+		ncb_ret = ncb_add(&rxbuf->ncb, ncb_data(&rxbuf->ncb, 0),
+		                  b_head(&b_next), to_copy, NCB_ADD_COMPARE);
+		BUG_ON(ncb_ret != NCB_RET_OK);
+
+		ncb_ret = ncb_advance(&rxbuf_next->ncb, to_copy);
+		BUG_ON(ncb_ret != NCB_RET_OK);
+
+		rxbuf->off_node.key = qcs->rx.offset;
+		rxbuf->off_end = qcs->rx.offset + b_data(&b) + to_copy;
+		eb64_insert(&qcs->rx.bufs, &rxbuf->off_node);
+
+		rxbuf_next->off_node.key += to_copy;
+		BUG_ON(rxbuf_next->off_node.key > rxbuf_next->off_end);
+
+		if (rxbuf_next->off_node.key == rxbuf_next->off_end) {
+			eb64_insert(&qcs->rx.bufs, &rxbuf_next->off_node);
+		}
+		else {
+			b_free(&b_next);
+			offer_buffers(NULL, 1);
+			pool_free(pool_head_qc_stream_rxbuf, rxbuf_next);
+		}
+
+		ret = 0;
+	}
+
+ out:
+	return ret;
+}
+
+/* Returns the Rx buffer instance for <qcs> stream read offset. May be NULL if
+ * not already allocated.
+ */
+static struct qc_stream_rxbuf *qcs_get_curr_rxbuf(struct qcs *qcs)
+{
+	struct eb64_node *node;
+	struct qc_stream_rxbuf *buf;
+
+	node = eb64_first(&qcs->rx.bufs);
+	if (!node)
+		return NULL;
+
+	buf = container_of(node, struct qc_stream_rxbuf, off_node);
+	if (qcs->rx.offset < buf->off_node.key) {
+		/* first buffer allocated for a future offset */
+		return NULL;
+	}
+
+	/* Ensures obsolete buffer are not kept inside QCS */
+	BUG_ON(buf->off_end < qcs->rx.offset);
+	return buf;
+}
+
+/* Returns the amount of data readable at <qcs> stream on current buffer. Note
+ * that this does account for hypothetical contiguous data divided on other
+ * Rx buffers instances.
+ */
+static ncb_sz_t qcs_rx_avail_data(struct qcs *qcs)
+{
+	struct qc_stream_rxbuf *b = qcs_get_curr_rxbuf(qcs);
+	return b ? ncb_data(&b->ncb, 0) : 0;
+}
+
+/* Remove <bytes> from <buf> current Rx buffer of <qcs> stream. Flow-control
+ * for received offsets may be allocated for the peer if needed.
+ */
+static void qcs_consume(struct qcs *qcs, uint64_t bytes, struct qc_stream_rxbuf *buf)
 {
 	struct qcc *qcc = qcs->qcc;
 	struct quic_frame *frm;
-	struct ncbuf *buf = &qcs->rx.ncbuf;
 	enum ncb_ret ret;
 
 	TRACE_ENTER(QMUX_EV_QCS_RECV, qcc->conn, qcs);
 
-	ret = ncb_advance(buf, bytes);
+	/* <buf> must be current QCS Rx buffer. */
+	BUG_ON_HOT(buf->off_node.key > qcs->rx.offset ||
+	           qcs->rx.offset >= buf->off_end);
+
+	ret = ncb_advance(&buf->ncb, bytes);
 	if (ret) {
 		ABORT_NOW(); /* should not happens because removal only in data */
 	}
 
-	if (ncb_is_empty(buf))
-		qcs_free_ncbuf(qcs, buf);
-
 	qcs->rx.offset += bytes;
+	/* QCS Rx offset must only point directly up to the next buffer. */
+	BUG_ON_HOT(qcs->rx.offset > buf->off_end);
+
 	/* Not necessary to emit a MAX_STREAM_DATA if all data received. */
 	if (qcs->flags & QC_SF_SIZE_KNOWN)
 		goto conn_fctl;
@@ -1144,12 +1257,16 @@ static void qcs_consume(struct qcs *qcs, uint64_t bytes)
 }
 
 /* Decode the content of STREAM frames already received on the stream instance
- * <qcs>.
+ * <qcs> from the <qcc> connection.
  *
- * Returns 0 on success else non-zero.
+ * Returns the result of app_ops rcv_buf callback, which is the number of bytes
+ * successfully transcoded, or a negative error code. If no error occurred but
+ * decoding cannot proceed due to missing data, the return value is 0. The
+ * value 0 may also be returned when dealing with a standalone FIN signal.
  */
 static int qcc_decode_qcs(struct qcc *qcc, struct qcs *qcs)
 {
+	struct qc_stream_rxbuf *rxbuf;
 	struct buffer b;
 	ssize_t ret;
 	int fin = 0;
@@ -1157,7 +1274,9 @@ static int qcc_decode_qcs(struct qcc *qcc, struct qcs *qcs)
 
 	TRACE_ENTER(QMUX_EV_QCS_RECV, qcc->conn, qcs);
 
-	b = qcs_b_dup(&qcs->rx.ncbuf);
+ restart:
+	rxbuf = qcs_get_curr_rxbuf(qcs);
+	b = qcs_b_dup(rxbuf);
 
 	/* Signal FIN to application if STREAM FIN received with all data. */
 	if (qcs_is_close_remote(qcs))
@@ -1174,6 +1293,18 @@ static int qcc_decode_qcs(struct qcc *qcc, struct qcs *qcs)
 			goto err;
 		}
 
+		/* App layer cannot decode due to partial data, which is stored
+		 * at a Rx buffer boundary. Try to realign data if possible and
+		 * restart decoding.
+		 */
+		if (!ret && rxbuf && !(qcs->flags & QC_SF_DEM_FULL) &&
+		    qcs->rx.offset + ncb_data(&rxbuf->ncb, 0) == rxbuf->off_end) {
+			if (!qcs_transfer_rx_data(qcs, rxbuf)) {
+				TRACE_DEVEL("restart parsing after data realignment", QMUX_EV_QCS_RECV, qcc->conn, qcs);
+				goto restart;
+			}
+		}
+
 		if (qcs->flags & QC_SF_TO_RESET) {
 			if (qcs_sc(qcs) && !se_fl_test(qcs->sd, SE_FL_ERROR|SE_FL_ERR_PENDING)) {
 				se_fl_set_error(qcs->sd);
@@ -1186,17 +1317,35 @@ static int qcc_decode_qcs(struct qcc *qcc, struct qcs *qcs)
 		ret = b_data(&b);
 	}
 
-	if (ret)
-		qcs_consume(qcs, ret);
+	if (rxbuf) {
+		if (ret)
+			qcs_consume(qcs, ret, rxbuf);
+
+		if (ncb_is_empty(&rxbuf->ncb)) {
+			qcs_free_rxbuf(qcs, rxbuf);
+
+			/* Close QCS remotely if only one Rx buffer remains and
+			 * all data with FIN already stored in it. This is
+			 * necessary to be performed before app_ops rcv_buf to
+			 * ensure FIN is correctly signalled.
+			 */
+			if (qcs->flags & QC_SF_SIZE_KNOWN && !eb_is_empty(&qcs->rx.bufs)) {
+				const ncb_sz_t avail = qcs_rx_avail_data(qcs);
+				if (qcs->rx.offset + avail == qcs->rx.offset_max)
+					qcs_close_remote(qcs);
+			}
+		}
+	}
+
 	if (ret || (!b_data(&b) && fin))
 		qcs_notify_recv(qcs);
 
 	TRACE_LEAVE(QMUX_EV_QCS_RECV, qcc->conn, qcs);
-	return 0;
+	return ret;
 
  err:
-	TRACE_LEAVE(QMUX_EV_QCS_RECV, qcc->conn, qcs);
-	return 1;
+	TRACE_DEVEL("leaving on error", QMUX_EV_QCS_RECV, qcc->conn, qcs);
+	return ret;
 }
 
 /* Allocate if needed and retrieve <qcs> stream buffer for data reception.
@@ -1489,6 +1638,62 @@ int qcc_install_app_ops(struct qcc *qcc, const struct qcc_app_ops *app_ops)
 	return 1;
 }
 
+/* Retrieves the Rx buffer instance usable to store STREAM data starting at
+ * <offset>. It is dynamically allocated if not already instantiated. <len>
+ * must contains the size of the STREAM frame. It may be reduced by the
+ * function if data is too large relative to the buffer starting offset.
+ * Another buffer instance should be allocated to store the remaining data.
+ *
+ * Returns the buffer instance or NULL in case of error.
+ */
+static struct qc_stream_rxbuf *qcs_get_rxbuf(struct qcs *qcs, uint64_t offset,
+                                             uint64_t *len)
+{
+	struct qcc *qcc = qcs->qcc;
+	struct eb64_node *node;
+	struct qc_stream_rxbuf *buf;
+	struct ncbuf *ncbuf;
+
+	TRACE_ENTER(QMUX_EV_QCS_RECV, qcs->qcc->conn, qcs);
+
+	node = eb64_lookup_le(&qcs->rx.bufs, offset);
+	if (node)
+		buf = container_of(node, struct qc_stream_rxbuf, off_node);
+
+	if (!node || offset >= buf->off_end) {
+		const uint64_t aligned_off = offset - (offset % qmux_stream_rx_bufsz());
+
+		TRACE_DEVEL("allocating a new entry", QMUX_EV_QCS_RECV, qcs->qcc->conn, qcs);
+		buf = pool_alloc(pool_head_qc_stream_rxbuf);
+		if (!buf) {
+			TRACE_ERROR("qcs rxbuf alloc error", QMUX_EV_QCC_RECV, qcc->conn, qcs);
+			goto err;
+		}
+
+		buf->ncb = NCBUF_NULL;
+		buf->off_node.key = aligned_off;
+		buf->off_end = aligned_off + qmux_stream_rx_bufsz();
+		eb64_insert(&qcs->rx.bufs, &buf->off_node);
+	}
+
+	ncbuf = &buf->ncb;
+	if (!qcs_get_ncbuf(qcs, ncbuf) || ncb_is_null(ncbuf)) {
+		TRACE_ERROR("receive ncbuf alloc failure", QMUX_EV_QCC_RECV|QMUX_EV_QCS_RECV, qcc->conn, qcs);
+		qcc_set_error(qcc, QC_ERR_INTERNAL_ERROR, 0);
+		goto err;
+	}
+
+	if (offset + *len > buf->off_end)
+		*len = buf->off_end - offset;
+
+	TRACE_LEAVE(QMUX_EV_QCS_RECV, qcs->qcc->conn, qcs);
+	return buf;
+
+ err:
+	TRACE_DEVEL("leaving on error", QMUX_EV_QCS_RECV, qcs->qcc->conn, qcs);
+	return NULL;
+}
+
 /* Handle a new STREAM frame for stream with id <id>. Payload is pointed by
  * <data> with length <len> and represents the offset <offset>. <fin> is set if
  * the QUIC frame FIN bit is set.
@@ -1499,8 +1704,11 @@ int qcc_install_app_ops(struct qcc *qcc, const struct qcc_app_ops *app_ops)
 int qcc_recv(struct qcc *qcc, uint64_t id, uint64_t len, uint64_t offset,
              char fin, char *data)
 {
+	const int fin_standalone = (!len && fin);
 	struct qcs *qcs;
-	enum ncb_ret ret;
+	enum ncb_ret ncb_ret;
+	uint64_t left;
+	int ret;
 
 	TRACE_ENTER(QMUX_EV_QCC_RECV, qcc->conn);
 
@@ -1575,12 +1783,6 @@ int qcc_recv(struct qcc *qcc, uint64_t id, uint64_t len, uint64_t offset,
 		}
 	}
 
-	if (!qcs_get_ncbuf(qcs, &qcs->rx.ncbuf) || ncb_is_null(&qcs->rx.ncbuf)) {
-		TRACE_ERROR("receive ncbuf alloc failure", QMUX_EV_QCC_RECV|QMUX_EV_QCS_RECV, qcc->conn, qcs);
-		qcc_set_error(qcc, QC_ERR_INTERNAL_ERROR, 0);
-		goto err;
-	}
-
 	TRACE_DATA("newly received offset", QMUX_EV_QCC_RECV|QMUX_EV_QCS_RECV, qcc->conn, qcs);
 	if (offset < qcs->rx.offset) {
 		size_t diff = qcs->rx.offset - offset;
@@ -1590,9 +1792,23 @@ int qcc_recv(struct qcc *qcc, uint64_t id, uint64_t len, uint64_t offset,
 		offset = qcs->rx.offset;
 	}
 
-	if (len) {
-		ret = ncb_add(&qcs->rx.ncbuf, offset - qcs->rx.offset, data, len, NCB_ADD_COMPARE);
-		switch (ret) {
+	left = len;
+	while (left) {
+		struct qc_stream_rxbuf *buf;
+		ncb_sz_t ncb_off;
+
+		buf = qcs_get_rxbuf(qcs, offset, &len);
+		if (!buf) {
+			TRACE_ERROR("rxbuf alloc failure", QMUX_EV_QCC_RECV|QMUX_EV_QCS_RECV, qcc->conn, qcs);
+			qcc_set_error(qcc, QC_ERR_INTERNAL_ERROR, 0);
+			goto err;
+		}
+
+		/* For oldest buffer, ncb_advance() may already have been performed. */
+		ncb_off = offset - MAX(qcs->rx.offset, buf->off_node.key);
+
+		ncb_ret = ncb_add(&buf->ncb, ncb_off, data, len, NCB_ADD_COMPARE);
+		switch (ncb_ret) {
 		case NCB_RET_OK:
 			break;
 
@@ -1617,20 +1833,32 @@ int qcc_recv(struct qcc *qcc, uint64_t id, uint64_t len, uint64_t offset,
 			           qcc->conn, qcs);
 			return 1;
 		}
+
+		offset += len;
+		data += len;
+		left -= len;
+		len = left;
 	}
 
 	if (fin)
 		qcs->flags |= QC_SF_SIZE_KNOWN;
 
 	if (qcs->flags & QC_SF_SIZE_KNOWN &&
-	    qcs->rx.offset_max == qcs->rx.offset + ncb_data(&qcs->rx.ncbuf, 0)) {
+	    qcs->rx.offset_max == qcs->rx.offset + qcs_rx_avail_data(qcs)) {
 		qcs_close_remote(qcs);
 	}
 
-	if ((ncb_data(&qcs->rx.ncbuf, 0) && !(qcs->flags & QC_SF_DEM_FULL)) || fin) {
-		qcc_decode_qcs(qcc, qcs);
+	while ((qcs_rx_avail_data(qcs) && !(qcs->flags & QC_SF_DEM_FULL)) ||
+	       unlikely(fin_standalone && qcs_is_close_remote(qcs))) {
+
+		ret = qcc_decode_qcs(qcc, qcs);
 		LIST_DEL_INIT(&qcs->el_recv);
 		qcc_refresh_timeout(qcc);
+
+		if (ret <= 0)
+			break;
+
+		BUG_ON_HOT(fin_standalone); /* On fin_standalone <ret> should be NULL, which ensures no infinite loop. */
 	}
 
  out:
@@ -1747,6 +1975,7 @@ int qcc_recv_max_stream_data(struct qcc *qcc, uint64_t id, uint64_t max)
 int qcc_recv_reset_stream(struct qcc *qcc, uint64_t id, uint64_t err, uint64_t final_size)
 {
 	struct qcs *qcs;
+	struct qc_stream_rxbuf *b;
 	int prev_glitches = qcc->glitches;
 
 	TRACE_ENTER(QMUX_EV_QCC_RECV, qcc->conn);
@@ -1803,7 +2032,11 @@ int qcc_recv_reset_stream(struct qcc *qcc, uint64_t id, uint64_t err, uint64_t f
 	 */
 	qcs->flags |= QC_SF_SIZE_KNOWN|QC_SF_RECV_RESET;
 	qcs_close_remote(qcs);
-	qcs_free_ncbuf(qcs, &qcs->rx.ncbuf);
+	while (!eb_is_empty(&qcs->rx.bufs)) {
+		b = container_of(eb64_first(&qcs->rx.bufs),
+		                 struct qc_stream_rxbuf, off_node);
+		qcs_free_rxbuf(qcs, b);
+	}
 
  out:
 	if (qcc->glitches != prev_glitches)
@@ -2685,6 +2918,7 @@ static void qcc_wait_for_hs(struct qcc *qcc)
 static int qcc_io_recv(struct qcc *qcc)
 {
 	struct qcs *qcs;
+	int ret;
 
 	TRACE_ENTER(QMUX_EV_QCC_RECV, qcc->conn);
 
@@ -2701,8 +2935,14 @@ static int qcc_io_recv(struct qcc *qcc)
 		qcs = LIST_ELEM(qcc->recv_list.n, struct qcs *, el_recv);
 		/* No need to add an uni local stream in recv_list. */
 		BUG_ON(quic_stream_is_uni(qcs->id) && quic_stream_is_local(qcc, qcs->id));
-		qcc_decode_qcs(qcc, qcs);
-		LIST_DEL_INIT(&qcs->el_recv);
+
+		while (qcs_rx_avail_data(qcs) && !(qcs->flags & QC_SF_DEM_FULL)) {
+			ret = qcc_decode_qcs(qcc, qcs);
+			LIST_DEL_INIT(&qcs->el_recv);
+
+			if (ret <= 0)
+				break;
+		}
 	}
 
 	TRACE_LEAVE(QMUX_EV_QCC_RECV, qcc->conn);
@@ -3343,7 +3583,7 @@ static size_t qmux_strm_rcv_buf(struct stconn *sc, struct buffer *buf,
 		/* Ensure DEM_FULL is only set if there is available data to
 		 * ensure we never do unnecessary wakeup here.
 		 */
-		BUG_ON(!ncb_data(&qcs->rx.ncbuf, 0));
+		BUG_ON(!qcs_rx_avail_data(qcs));
 
 		qcs->flags &= ~QC_SF_DEM_FULL;
 		if (!(qcc->flags & QC_CF_ERRL)) {

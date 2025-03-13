@@ -1455,6 +1455,7 @@ struct sockaddr_storage *str2sa_range(const char *str, int *port, int *low, int 
 /* converts <addr> and <port> into a string representation of the address and port. This is sort
  * of an inverse of str2sa_range, with some restrictions. The supported families are AF_INET,
  * AF_INET6, AF_UNIX, and AF_CUST_SOCKPAIR. If the family is unsopported NULL is returned.
+ * If port is special value '-1', then only the address is represented and <map_ports> is ignored.
  * If map_ports is true, then the sign of the port is included in the output, to indicate it is
  * relative to the incoming port. AF_INET and AF_INET6 will be in the form "<addr>:<port>".
  * AF_UNIX will either be just the path (if using a pathname) or "abns@<path>" if it is abstract.
@@ -1496,6 +1497,10 @@ char * sa2str(const struct sockaddr_storage *addr, int port, int map_ports)
 		BUG_ON(errno == ENOSPC);
 		return NULL;
 	}
+
+	if (port == -1)
+		return strdup(buffer); // address only
+
 	if (map_ports)
 		return memprintf(&out, "%s:%+d", buffer, port);
 	else
@@ -5538,7 +5543,7 @@ const void *resolve_sym_name(struct buffer *buf, const char *pfx, const void *ad
 #if (defined(__ELF__) && !defined(__linux__)) || defined(USE_DL)
 	static Dl_info dli_main;
 	static int dli_main_done; // 0 = not resolved, 1 = resolve in progress, 2 = done
-	static __decl_thread(HA_SPINLOCK_T dladdr_lock);
+	__decl_thread_var(static HA_SPINLOCK_T dladdr_lock);
 	int isolated;
 	Dl_info dli;
 	size_t size;

@@ -1322,21 +1322,8 @@ static ssize_t h3_rcv_buf(struct qcs *qcs, struct buffer *b, int fin)
 	}
 
 	if (!b_data(b) && fin && quic_stream_is_bidi(qcs->id)) {
-		struct buffer *appbuf;
-		struct htx *htx;
-		int eom;
-
 		TRACE_PROTO("received FIN without data", H3_EV_RX_FRAME, qcs->qcc->conn, qcs);
-		if (!(appbuf = qcc_get_stream_rxbuf(qcs))) {
-			TRACE_ERROR("data buffer alloc failure", H3_EV_RX_FRAME, qcs->qcc->conn, qcs);
-			qcc_set_error(qcs->qcc, H3_ERR_INTERNAL_ERROR, 1);
-			goto err;
-		}
-
-		htx = htx_from_buf(appbuf);
-		eom = htx_set_eom(htx);
-		htx_to_buf(htx, appbuf);
-		if (!eom) {
+		if (qcs_http_handle_standalone_fin(qcs)) {
 			TRACE_ERROR("cannot set EOM", H3_EV_RX_FRAME, qcs->qcc->conn, qcs);
 			qcc_set_error(qcs->qcc, H3_ERR_INTERNAL_ERROR, 1);
 			goto err;
@@ -1393,7 +1380,7 @@ static ssize_t h3_rcv_buf(struct qcs *qcs, struct buffer *b, int fin)
 			 * SETTINGS_MAX_FIELD_SECTION_SIZE parameter to prevent
 			 * excessive decompressed size.
 			 */
-			if (flen > QC_S_RX_BUF_SZ) {
+			if (flen > qmux_stream_rx_bufsz()) {
 				TRACE_ERROR("received a too big frame", H3_EV_RX_FRAME, qcs->qcc->conn, qcs);
 				qcc_set_error(qcs->qcc, H3_ERR_EXCESSIVE_LOAD, 1);
 				qcc_report_glitch(qcs->qcc, 1);

@@ -156,11 +156,7 @@ enum PR_SRV_STATE_FILE {
 #define PR_O2_RSTRICT_REQ_HDR_NAMES_NOOP 0x01000000 /* preserve request header names containing chars outside of [0-9a-zA-Z-] charset */
 #define PR_O2_RSTRICT_REQ_HDR_NAMES_MASK 0x01c00000 /* mask for restrict-http-header-names option */
 
-/* bits for log-forward proxies */
-#define PR_O2_DONTPARSELOG       0x02000000 /* don't parse log messages */
-#define PR_O2_ASSUME_RFC6587_NTF 0x04000000 /* assume that we are going to receive just non-transparent framing messages */
-
-/* unused : 0x08000000 */
+/* unused : 0x02000000 ... 0x08000000 */
 
 /* server health checks */
 #define PR_O2_CHK_NONE  0x00000000      /* no L7 health checks configured (TCP by default) */
@@ -169,6 +165,23 @@ enum PR_SRV_STATE_FILE {
 /* unused: 0xB0000000 to 0xF000000, reserved for health checks */
 #define PR_O2_CHK_ANY   0xF0000000      /* Mask to cover any check */
 /* end of proxy->options2 */
+
+/* bits for proxy->options3 */
+
+/*   bits for log-forward proxies */
+#define PR_O3_DONTPARSELOG       0x00000001 /* don't parse log messages */
+#define PR_O3_ASSUME_RFC6587_NTF 0x00000002 /* assume that we are going to receive just non-transparent framing messages */
+
+/* unused: 0x00000004 to 0x00000008 */
+
+#define PR_O3_LOGF_HOST_REPLACE  0x00000010
+#define PR_O3_LOGF_HOST_FILL     0x00000020
+#define PR_O3_LOGF_HOST_KEEP     0x00000040
+#define PR_O3_LOGF_HOST_APPEND   0x00000080
+#define PR_O3_LOGF_HOST          0x000000F0
+
+/* unused: 0x00000100 to  0x80000000 */
+/* end of proxy->options3 */
 
 /* Cookie settings for pr->ck_opts */
 #define PR_CK_RW        0x00000001      /* rewrite all direct cookies with the right serverid */
@@ -294,6 +307,7 @@ struct proxy {
 
 	int options;				/* PR_O_REDISP, PR_O_TRANSP, ... */
 	int options2;				/* PR_O2_* */
+	int options3;                           /* PR_O3_* */
 	unsigned int ck_opts;			/* PR_CK_* (cookie options) */
 	unsigned int fe_req_ana, be_req_ana;	/* bitmap of common request protocol analysers for the frontend and backend */
 	unsigned int fe_rsp_ana, be_rsp_ana;	/* bitmap of common response protocol analysers for the frontend and backend */
@@ -429,6 +443,7 @@ struct proxy {
 	/* used only during configuration parsing */
 	int no_options;				/* PR_O_REDISP, PR_O_TRANSP, ... */
 	int no_options2;			/* PR_O2_* */
+	int no_options3;                        /* PR_O3_* */
 
 	struct {
 		const char *file;		/* file where the section appears */

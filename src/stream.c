@@ -3269,10 +3269,14 @@ void list_services(FILE *out)
 /* flags used for show_sess_ctx.flags */
 #define CLI_SHOWSESS_F_SUSP     0x00000001   /* show only suspicious streams */
 #define CLI_SHOWSESS_F_DUMP_URI 0x00000002   /* Dump TXN's uri if available in dump */
+#define CLI_SHOWSESS_F_SERVER   0x00000004   /* show only streams attached to this server */
+#define CLI_SHOWSESS_F_BACKEND  0x00000008   /* show only streams attached to this backend */
+#define CLI_SHOWSESS_F_FRONTEND 0x00000010   /* show only streams attached to this frontend */
 
 struct show_sess_ctx {
 	struct bref bref;	/* back-reference from the session being dumped */
 	void *target;		/* session we want to dump, or NULL for all */
+	void *filter;           /* element to filter on (e.g. server if CLI_SHOWSESS_F_SERVER) */
 	unsigned int thr;       /* the thread number being explored (0..MAX_THREADS-1) */
 	unsigned int uid;	/* if non-null, the uniq_id of the session being dumped */
 	unsigned int min_age;   /* minimum age of streams to dump */
@@ -3297,6 +3301,7 @@ static void __strm_dump_to_buffer(struct buffer *buf, const struct show_sess_ctx
 	char pn[INET6_ADDRSTRLEN];
 	struct connection *conn;
 	struct appctx *tmpctx;
+	uint64_t request_ts;
 
 	pfx = pfx ? pfx : "";
 
@@ -3458,9 +3463,11 @@ static void __strm_dump_to_buffer(struct buffer *buf, const struct show_sess_ctx
 	             ha_thread_info[strm->task->tid].ltid,
 		     task_in_rq(strm->task) ? ", running" : "");
 
+	request_ts = strm->logs.accept_ts;
+	request_ts += ms_to_ns(strm->logs.t_idle >= 0 ? strm->logs.t_idle + strm->logs.t_handshake : 0);
 	chunk_appendf(buf,
-		     " age=%s)\n",
-		     human_time(ns_to_sec(now_ns) - ns_to_sec(strm->logs.request_ts), 1));
+		      " age=%s)\n",
+		      human_time(ns_to_sec(now_ns) - ns_to_sec(request_ts), 1));
 
 	if (strm->txn) {
 		chunk_appendf(buf,
@@ -3761,25 +3768,24 @@ static int cli_parse_show_sess(char **args, char *payload, struct appctx *appctx
 		ctx->target = (void *)-1; /* show all matching entries */
 		cur_arg +=2;
 	}
-	else if (*args[cur_arg] && strcmp(args[cur_arg], "susp") == 0) {
-		ctx->flags |= CLI_SHOWSESS_F_SUSP;
-		ctx->target = (void *)-1; /* show all matching entries */
-		cur_arg++;
-	}
 	else if (*args[cur_arg] && strcmp(args[cur_arg], "all") == 0) {
 		ctx->target = (void *)-1;
 		cur_arg++;
 	}
 	else if (*args[cur_arg] && strcmp(args[cur_arg], "help") == 0) {
 		chunk_printf(&trash,
-			     "Usage: show sess [<id> | older <age> | susp | all] [<options>*]\n"
+			     "Usage: show sess [<id> | all | help] [<options>*]\n"
 			     "Dumps active streams (formerly called 'sessions'). Available selectors:\n"
 			     "   <id>         dump only this stream identifier (0x...)\n"
-			     "   all          dump all stream in large format\n"
-			     "   older <age>  only display stream older than <age>\n"
+			     "   all          dump all matching streams in large format\n"
+			     "   help         show this message\n"
 			     "   susp         report streams considered suspicious\n"
 			     "Available options: \n"
 			     "   show-uri     also display the transaction URI, if available\n"
+			     "   older <age>  only display streams older than <age> seconds\n"
+			     "   server <b/s> only show streams attached to this backend+server\n"
+			     "   backend <b>  only show streams attached to this backend\n"
+			     "   frontend <f> only show streams attached to this frontend\n"
 			     "Without any argument, all streams are dumped in a shorter format.");
 		return cli_err(appctx, trash.area);
 	}
@@ -3793,6 +3799,66 @@ static int cli_parse_show_sess(char **args, char *payload, struct appctx *appctx
 	while (*args[cur_arg]) {
 		if (*args[cur_arg] && strcmp(args[cur_arg], "show-uri") == 0) {
 			ctx->flags |= CLI_SHOWSESS_F_DUMP_URI;
+		}
+		else if (*args[cur_arg] && strcmp(args[cur_arg], "susp") == 0) {
+			ctx->flags |= CLI_SHOWSESS_F_SUSP;
+		}
+		else if (*args[cur_arg] && strcmp(args[cur_arg], "server") == 0) {
+			struct ist be_name, sv_name;
+			struct proxy *be;
+			struct server *sv;
+
+			if (ctx->flags & (CLI_SHOWSESS_F_FRONTEND|CLI_SHOWSESS_F_BACKEND|CLI_SHOWSESS_F_SERVER))
+				return cli_err(appctx, "Only one of backend, frontend or server may be set.\n");
+
+			if (!*args[cur_arg + 1])
+				return cli_err(appctx, "Missing server name (<backend>/<server>).\n");
+
+			sv_name = ist(args[cur_arg + 1]);
+			be_name = istsplit(&sv_name, '/');
+			if (!istlen(sv_name))
+				return cli_err(appctx, "Require 'backend/server'.\n");
+
+			if (!(be = proxy_be_by_name(ist0(be_name))))
+				return cli_err(appctx, "No such backend.\n");
+
+			if (!(sv = server_find_by_name(be, ist0(sv_name))))
+				return cli_err(appctx, "No such server.\n");
+			ctx->flags |= CLI_SHOWSESS_F_SERVER;
+			ctx->filter = sv;
+			cur_arg++;
+		}
+		else if (*args[cur_arg] && strcmp(args[cur_arg], "backend") == 0) {
+			struct proxy *be;
+
+			if (ctx->flags & (CLI_SHOWSESS_F_FRONTEND|CLI_SHOWSESS_F_BACKEND|CLI_SHOWSESS_F_SERVER))
+				return cli_err(appctx, "Only one of backend, frontend or server may be set.\n");
+
+			if (!*args[cur_arg + 1])
+				return cli_err(appctx, "Missing backend name.\n");
+
+			if (!(be = proxy_be_by_name(args[cur_arg + 1])))
+				return cli_err(appctx, "No such backend.\n");
+
+			ctx->flags |= CLI_SHOWSESS_F_BACKEND;
+			ctx->filter = be;
+			cur_arg++;
+		}
+		else if (*args[cur_arg] && strcmp(args[cur_arg], "frontend") == 0) {
+			struct proxy *fe;
+
+			if (ctx->flags & (CLI_SHOWSESS_F_FRONTEND|CLI_SHOWSESS_F_BACKEND|CLI_SHOWSESS_F_SERVER))
+				return cli_err(appctx, "Only one of backend, frontend or server may be set.\n");
+
+			if (!*args[cur_arg + 1])
+				return cli_err(appctx, "Missing frontend name.\n");
+
+			if (!(fe = proxy_fe_by_name(args[cur_arg + 1])))
+				return cli_err(appctx, "No such frontend.\n");
+
+			ctx->flags |= CLI_SHOWSESS_F_FRONTEND;
+			ctx->filter = fe;
+			cur_arg++;
 		}
 		else {
 			chunk_printf(&trash, "Unsupported option '%s', try 'help' for more info.\n", args[cur_arg]);
@@ -3845,6 +3911,7 @@ static int cli_io_handler_dump_sess(struct appctx *appctx)
 	while (1) {
 		char pn[INET6_ADDRSTRLEN];
 		struct stream *curr_strm;
+		uint64_t request_ts;
 		int done= 0;
 
 		if (ctx->bref.ref == &ha_thread_ctx[ctx->thr].streams)
@@ -3869,6 +3936,16 @@ static int cli_io_handler_dump_sess(struct appctx *appctx)
 			if (age < ctx->min_age)
 				goto next_sess;
 		}
+
+		if ((ctx->flags & CLI_SHOWSESS_F_SERVER) &&
+		    (!(curr_strm->be->cap & PR_CAP_BE) || curr_strm->target != ctx->filter))
+			goto next_sess;
+
+		if ((ctx->flags & CLI_SHOWSESS_F_BACKEND) && (curr_strm->be != ctx->filter))
+			goto next_sess;
+
+		if ((ctx->flags & CLI_SHOWSESS_F_FRONTEND) && (curr_strm->sess->fe != ctx->filter))
+			goto next_sess;
 
 		if (ctx->flags & CLI_SHOWSESS_F_SUSP) {
 			/* only show suspicious streams. Non-suspicious ones have a valid
@@ -3931,10 +4008,12 @@ static int cli_io_handler_dump_sess(struct appctx *appctx)
 			break;
 		}
 
+		request_ts = curr_strm->logs.accept_ts;
+		request_ts += ms_to_ns(curr_strm->logs.t_idle >= 0 ? curr_strm->logs.t_idle + curr_strm->logs.t_handshake : 0);
 		chunk_appendf(&trash,
 			     " ts=%02x epoch=%#x age=%s calls=%u rate=%u cpu=%llu lat=%llu",
 		             curr_strm->task->state, curr_strm->stream_epoch,
-		             human_time(ns_to_sec(now_ns) - ns_to_sec(curr_strm->logs.request_ts), 1),
+		             human_time(ns_to_sec(now_ns) - ns_to_sec(request_ts), 1),
 		             curr_strm->task->calls, read_freq_ctr(&curr_strm->call_rate),
 		             (unsigned long long)curr_strm->cpu_time, (unsigned long long)curr_strm->lat_time);
 
@@ -4111,7 +4190,7 @@ static int cli_parse_shutdown_sessions_server(char **args, char *payload, struct
 
 /* register cli keywords */
 static struct cli_kw_list cli_kws = {{ },{
-	{ { "show", "sess",  NULL },             "show sess [help|<id>|all|susp|older...] : report the list of current streams or dump this exact stream", cli_parse_show_sess, cli_io_handler_dump_sess, cli_release_show_sess },
+	{ { "show", "sess",  NULL },             "show sess [help|<id>|all] [opts...]     : report the list of current streams or dump this exact stream",   cli_parse_show_sess, cli_io_handler_dump_sess, cli_release_show_sess },
 	{ { "shutdown", "session",  NULL },      "shutdown session [id]                   : kill a specific session",                                        cli_parse_shutdown_session, NULL, NULL },
 	{ { "shutdown", "sessions",  "server" }, "shutdown sessions server <bk>/<srv>     : kill sessions on a server",                                      cli_parse_shutdown_sessions_server, NULL, NULL },
 	{{},}

@@ -5711,18 +5711,78 @@ bad_format:
 	return;
 }
 
+/* helper function for syslog handlers: process input message sent by
+ * <saddr> and stored in <buf> according to <frontend> options, and send
+ * it to frontend loggers
+ *
+ * <saddr> may be NULL if sender information is not available.
+ */
+static void syslog_process_message(struct proxy *frontend, struct listener *l,
+                                   const struct sockaddr_storage *saddr,
+                                   struct buffer *buf)
+{
+	static THREAD_LOCAL struct ist metadata[LOG_META_FIELDS];
+	char *src_addr = NULL;
+	size_t size;
+	char *message;
+	int level;
+	int facility;
+
+	/* update counters */
+	_HA_ATOMIC_INC(&cum_log_messages);
+	proxy_inc_fe_req_ctr(l, frontend, 0);
+
+	prepare_log_message(buf->area, buf->data, &level, &facility, metadata, &message, &size);
+
+	if (frontend->options3 & PR_O3_DONTPARSELOG)
+		goto end;
+
+	parse_log_message(buf->area, buf->data, &level, &facility, metadata, &message, &size);
+
+	if (real_family(saddr->ss_family) == AF_UNIX)
+		saddr = NULL; /* no source information for UNIX addresses */
+
+	/* handle host options */
+	if (!(frontend->options3 & PR_O3_LOGF_HOST_KEEP)) {
+		if (saddr)
+			src_addr = sa2str(saddr, -1, 0);
+
+		if ((frontend->options3 & PR_O3_LOGF_HOST_REPLACE) && src_addr) {
+			/* unconditional replace, unless source is not available */
+			metadata[LOG_META_HOST] = ist(src_addr);
+		}
+		else if ((frontend->options3 & PR_O3_LOGF_HOST_FILL) &&
+		          src_addr && !metadata[LOG_META_HOST].len) {
+			/* only fill if missing */
+			metadata[LOG_META_HOST] = ist(src_addr);
+		}
+		else if ((frontend->options3 & PR_O3_LOGF_HOST_APPEND) && src_addr) {
+			/* append source after existing host */
+			if (metadata[LOG_META_HOST].len) {
+				memprintf(&src_addr, "%.*s,%s",
+				          (int)metadata[LOG_META_HOST].len,
+				          metadata[LOG_META_HOST].ptr, src_addr);
+				if (src_addr)
+					metadata[LOG_META_HOST] = ist(src_addr);
+			}
+			else
+				metadata[LOG_META_HOST] = ist(src_addr);
+		}
+	}
+	// else nothing to do
+
+ end:
+	process_send_log(NULL, &frontend->loggers, level, facility, metadata, message, size);
+	ha_free(&src_addr);
+}
+
 /*
  * UDP syslog fd handler
  */
 void syslog_fd_handler(int fd)
 {
-	static THREAD_LOCAL struct ist metadata[LOG_META_FIELDS];
 	ssize_t ret = 0;
 	struct buffer *buf = get_trash_chunk();
-	size_t size;
-	char *message;
-	int level;
-	int facility;
 	struct listener *l = objt_listener(fdtab[fd].owner);
 	struct proxy *frontend;
 	int max_accept;
@@ -5754,17 +5814,7 @@ void syslog_fd_handler(int fd)
 			}
 			buf->data = ret;
 
-			/* update counters */
-			_HA_ATOMIC_INC(&cum_log_messages);
-			proxy_inc_fe_req_ctr(l, frontend, 0);
-
-			prepare_log_message(buf->area, buf->data, &level, &facility, metadata, &message, &size);
-
-			if (!(frontend->options2 & PR_O2_DONTPARSELOG))
-				parse_log_message(buf->area, buf->data, &level, &facility, metadata, &message, &size);
-
-			process_send_log(NULL, &frontend->loggers, level, facility, metadata, message, size);
-
+			syslog_process_message(frontend, l, &saddr, buf);
 		} while (--max_accept);
 	}
 
@@ -5777,18 +5827,14 @@ out:
  */
 static void syslog_io_handler(struct appctx *appctx)
 {
-	static THREAD_LOCAL struct ist metadata[LOG_META_FIELDS];
 	struct stconn *sc = appctx_sc(appctx);
 	struct stream *s = __sc_strm(sc);
 	struct proxy *frontend = strm_fe(s);
 	struct listener *l = strm_li(s);
 	struct buffer *buf = get_trash_chunk();
+	struct connection *conn;
 	int max_accept;
 	int to_skip;
-	int facility;
-	int level;
-	char *message;
-	size_t size;
 
 	if (unlikely(se_fl_test(appctx->sedesc, (SE_FL_EOS|SE_FL_ERROR)))) {
 		co_skip(sc_oc(sc), co_data(sc_oc(sc)));
@@ -5797,6 +5843,7 @@ static void syslog_io_handler(struct appctx *appctx)
 
 	max_accept = l->bind_conf->maxaccept ? l->bind_conf->maxaccept : 1;
 	while (1) {
+		const struct sockaddr_storage *saddr = NULL;
 		char c;
 
 		if (max_accept <= 0)
@@ -5809,7 +5856,7 @@ static void syslog_io_handler(struct appctx *appctx)
 		else if (to_skip < 0)
 			goto cli_abort;
 
-		if (c == '<' || (frontend->options2 & PR_O2_ASSUME_RFC6587_NTF)) {
+		if (c == '<' || (frontend->options3 & PR_O3_ASSUME_RFC6587_NTF)) {
 			/* rfc-6587, Non-Transparent-Framing: messages separated by
 			 * a trailing LF or CR LF
 			 */
@@ -5869,17 +5916,11 @@ static void syslog_io_handler(struct appctx *appctx)
 
 		co_skip(sc_oc(sc), to_skip);
 
-		/* update counters */
-		_HA_ATOMIC_INC(&cum_log_messages);
-		proxy_inc_fe_req_ctr(l, frontend, 0);
+		conn = sc_conn(s->scf);
+		if (conn && conn_get_src(conn))
+			saddr = conn_src(conn);
 
-		prepare_log_message(buf->area, buf->data, &level, &facility, metadata, &message, &size);
-
-		if (!(frontend->options2 & PR_O2_DONTPARSELOG))
-			parse_log_message(buf->area, buf->data, &level, &facility, metadata, &message, &size);
-
-		process_send_log(NULL, &frontend->loggers, level, facility, metadata, message, size);
-
+		syslog_process_message(frontend, l, saddr, buf);
 	}
 
 missing_data:
@@ -6029,7 +6070,7 @@ int cfg_parse_log_forward(const char *file, int linenum, char **args, int kwm)
 		px->accept = frontend_accept;
 		px->default_target = &syslog_applet.obj_type;
 		px->id = strdup(args[1]);
-		px->options2 = 0;
+		px->options3 |= PR_O3_LOGF_HOST_FILL;
 	}
 	else if (strcmp(args[0], "maxconn") == 0) {  /* maxconn */
 		if (warnifnotcap(cfg_log_forward, PR_CAP_FE, file, linenum, args[0], " Maybe you want 'fullconn' instead ?"))
@@ -6218,13 +6259,48 @@ int cfg_parse_log_forward(const char *file, int linenum, char **args, int kwm)
 		/* only consider options that are frontend oriented and log oriented, such options may be set
 		 * in px->options2 because px->options is already full of tcp/http oriented options
 		 */
-		if (cfg_parse_listen_match_option(file, linenum, kwm, cfg_opts2, &err_code, args,
+		if (cfg_parse_listen_match_option(file, linenum, kwm, cfg_opts3, &err_code, args,
 		                                  PR_MODE_SYSLOG, PR_CAP_FE,
-		                                  &cfg_log_forward->options2, &cfg_log_forward->no_options2))
+		                                  &cfg_log_forward->options3, &cfg_log_forward->no_options3))
 			goto out;
 
 		if (err_code & ERR_CODE)
 			goto out;
+
+
+		if (strcmp(args[1], "host") == 0) {
+			int value = 0;
+
+			if (strcmp(args[2], "replace") == 0)
+				value = PR_O3_LOGF_HOST_REPLACE;
+			else if (strcmp(args[2], "fill") == 0)
+				value = PR_O3_LOGF_HOST_FILL;
+			else if (strcmp(args[2], "keep") == 0)
+				value = PR_O3_LOGF_HOST_KEEP;
+			else if (strcmp(args[2], "append") == 0)
+				value = PR_O3_LOGF_HOST_APPEND;
+
+			if (!value) {
+				ha_alert("parsing [%s:%d] : option 'host' expects {replace|fill|keep|append}.\n", file, linenum);
+				err_code |= ERR_ALERT | ERR_ABORT;
+				goto out;
+			}
+
+			cfg_log_forward->options3 &= ~PR_O3_LOGF_HOST;
+			cfg_log_forward->no_options3 &= ~PR_O3_LOGF_HOST;
+
+			switch (kwm) {
+				case KWM_STD:
+					cfg_log_forward->options3 |= value;
+					break;
+				case KWM_NO:
+					cfg_log_forward->no_options3 |= value;
+					break;
+				case KWM_DEF: /* already cleared */
+					break;
+			}
+			goto out;
+		}
 
 		ha_alert("parsing [%s:%d] : unknown option '%s' in log-forward section.\n", file, linenum, args[1]);
 		err_code |= ERR_ALERT | ERR_ABORT;
