@@ -5515,29 +5515,36 @@ const void *resolve_sym_name(struct buffer *buf, const char *pfx, const void *ad
 		const void *func;
 		const char *name;
 	} fcts[] = {
-		{ .func = process_stream, .name = "process_stream" },
-		{ .func = task_run_applet, .name = "task_run_applet" },
-		{ .func = sc_conn_io_cb, .name = "sc_conn_io_cb" },
-		{ .func = sock_conn_iocb, .name = "sock_conn_iocb" },
-		{ .func = dgram_fd_handler, .name = "dgram_fd_handler" },
-		{ .func = listener_accept, .name = "listener_accept" },
-		{ .func = manage_global_listener_queue, .name = "manage_global_listener_queue" },
-		{ .func = poller_pipe_io_handler, .name = "poller_pipe_io_handler" },
-		{ .func = mworker_accept_wrapper, .name = "mworker_accept_wrapper" },
-		{ .func = session_expire_embryonic, .name = "session_expire_embryonic" },
+#define DEF_SYM(sym, ...) { .func = ({ __VA_ARGS__; sym; }), .name = #sym }
+		DEF_SYM(process_stream),
+		DEF_SYM(task_run_applet),
+		DEF_SYM(run_poll_loop),
+		DEF_SYM(run_tasks_from_lists),
+		DEF_SYM(process_runnable_tasks),
+		DEF_SYM(sc_conn_io_cb),
+		DEF_SYM(sock_conn_iocb),
+		DEF_SYM(dgram_fd_handler),
+		DEF_SYM(listener_accept),
+		DEF_SYM(manage_global_listener_queue),
+		DEF_SYM(poller_pipe_io_handler),
+		DEF_SYM(mworker_accept_wrapper),
+		DEF_SYM(session_expire_embryonic),
+		DEF_SYM(ha_dump_backtrace, extern void ha_dump_backtrace(struct buffer, const char *, int)),
+		DEF_SYM(cli_io_handler, extern void cli_io_handler(struct appctx*)),
 #ifdef USE_THREAD
-		{ .func = accept_queue_process, .name = "accept_queue_process" },
+		DEF_SYM(accept_queue_process),
 #endif
 #ifdef USE_LUA
-		{ .func = hlua_process_task, .name = "hlua_process_task" },
+		DEF_SYM(hlua_process_task),
 #endif
 #ifdef SSL_MODE_ASYNC
-		{ .func = ssl_async_fd_free, .name = "ssl_async_fd_free" },
-		{ .func = ssl_async_fd_handler, .name = "ssl_async_fd_handler" },
+		DEF_SYM(ssl_async_fd_free),
+		DEF_SYM(ssl_async_fd_handler),
 #endif
 #ifdef USE_QUIC
-		{ .func = quic_conn_sock_fd_iocb, .name = "quic_conn_sock_fd_iocb" },
+		DEF_SYM(quic_conn_sock_fd_iocb),
 #endif
+#undef DEF_SYM
 	};
 
 #if (defined(__ELF__) && !defined(__linux__)) || defined(USE_DL)
@@ -5546,20 +5553,33 @@ const void *resolve_sym_name(struct buffer *buf, const char *pfx, const void *ad
 	__decl_thread_var(static HA_SPINLOCK_T dladdr_lock);
 	int isolated;
 	Dl_info dli;
-	size_t size;
+	size_t size = 0;
 	const char *fname, *p;
 #endif
-	int i;
+	size_t dist, best_dist;
+	int i, best_idx;
 
 	if (pfx)
 		chunk_appendf(buf, "%s", pfx);
 
+	best_idx = -1; best_dist = ~0;
 	for (i = 0; i < sizeof(fcts) / sizeof(fcts[0]); i++) {
-		if (addr == fcts[i].func) {
-			chunk_appendf(buf, "%s", fcts[i].name);
-			return addr;
+		if (addr < (void*)fcts[i].func)
+			continue;
+		dist = addr - (void*)fcts[i].func;
+		if (dist < (1<<18) && dist < best_dist) {
+			best_dist = dist;
+			best_idx = i;
+			if (!dist)
+				break;
 		}
 	}
+
+	/* if that's an exact match, no need to call dl_addr. This happends
+	 * when showing callback pointers for example, but not in backtraces.
+	 */
+	if (!best_dist)
+		goto use_array;
 
 #if (defined(__ELF__) && !defined(__linux__)) || defined(USE_DL)
 	/* Now let's try to be smarter */
@@ -5577,14 +5597,14 @@ const void *resolve_sym_name(struct buffer *buf, const char *pfx, const void *ad
 
 	if (!isolated &&
 	    HA_SPIN_TRYLOCK(OTHER_LOCK, &dladdr_lock) != 0)
-		goto unknown;
+		goto use_array;
 
 	i = dladdr_and_size(addr, &dli, &size);
 	if (!isolated)
 		HA_SPIN_UNLOCK(OTHER_LOCK, &dladdr_lock);
 
 	if (!i)
-		goto unknown;
+		goto use_array;
 
 	/* 1. prefix the library name if it's not the same object as the one
 	 * that contains the main function. The name is picked between last '/'
@@ -5635,9 +5655,15 @@ const void *resolve_sym_name(struct buffer *buf, const char *pfx, const void *ad
 		return NULL;
 	}
 #endif /* __ELF__ && !__linux__ || USE_DL */
- unknown:
-	/* unresolved symbol from the main file, report relative offset to main */
-	if ((void*)addr < (void*)main)
+ use_array:
+	/* either exact match from the array, or unresolved symbol for which we
+	 * may have a close match. Otherwise we report an offset relative to main.
+	 */
+	if (best_idx >= 0) {
+		chunk_appendf(buf, "%s+%#lx", fcts[best_idx].name, (long)best_dist);
+		return best_dist == 0 ? addr : NULL;
+	}
+	else if ((void*)addr < (void*)main)
 		chunk_appendf(buf, "main-%#lx", (long)((void*)main - addr));
 	else
 		chunk_appendf(buf, "main+%#lx", (long)(addr - (void*)main));

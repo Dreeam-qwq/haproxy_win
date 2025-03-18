@@ -1059,7 +1059,7 @@ size_t cli_snd_buf(struct appctx *appctx, struct buffer *buf, size_t count, unsi
  * CLI_ST_* constants. appctx->st1 is used to indicate whether prompt is enabled
  * or not.
  */
-static void cli_io_handler(struct appctx *appctx)
+void cli_io_handler(struct appctx *appctx)
 {
 	if (applet_fl_test(appctx, APPCTX_FL_OUTBLK_ALLOC|APPCTX_FL_OUTBLK_FULL))
 		goto out;
@@ -2127,9 +2127,7 @@ static int cli_io_handler_wait(struct appctx *appctx)
 
 	if (ctx->cond == CLI_WAIT_COND_SRV_UNUSED) {
 		/* check if the server in args[0]/args[1] can be released now */
-		thread_isolate();
 		ret = srv_check_for_deletion(ctx->args[0], ctx->args[1], NULL, NULL, NULL);
-		thread_release();
 
 		if (ret < 0) {
 			/* unrecoverable failure */

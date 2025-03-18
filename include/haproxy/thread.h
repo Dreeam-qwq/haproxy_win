@@ -47,6 +47,7 @@ int thread_detect_binding_discrepancies(void);
 int thread_detect_more_than_cpus(void);
 int thread_map_to_groups();
 int thread_resolve_group_mask(struct thread_set *ts, int defgrp, char **err);
+void thread_detect_count(void);
 int parse_thread_set(const char *arg, struct thread_set *ts, char **err);
 extern int thread_cpus_enabled_at_boot;
 
@@ -297,11 +298,6 @@ static inline unsigned long thread_isolated()
 {
 	return _HA_ATOMIC_LOAD(&isolated_thread) == tid;
 }
-
-/* Returns 1 if the cpu set is currently restricted for the process else 0.
- * Currently only implemented for the Linux platform.
- */
-int thread_cpu_mask_forced(void);
 
 #if !defined(DEBUG_THREAD) && !defined(DEBUG_FULL)
 

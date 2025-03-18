@@ -77,6 +77,7 @@
 #include <haproxy/connection.h>
 #ifdef USE_CPU_AFFINITY
 #include <haproxy/cpuset.h>
+#include <haproxy/cpu_topo.h>
 #endif
 #include <haproxy/debug.h>
 #include <haproxy/dns.h>
@@ -687,6 +688,9 @@ static void usage(char *name)
 #endif
 #if defined(HA_HAVE_DUMP_LIBS)
 		"        -dL dumps loaded object files after config checks\n"
+#endif
+#if defined(USE_CPU_AFFINITY)
+		"        -dc dumps the list of selected and evicted CPUs\n"
 #endif
 		"        -dK{class[,...]} dump registered keywords (use 'help' for list)\n"
 		"        -dr ignores server address resolution failures\n"
@@ -1492,6 +1496,10 @@ static void init_args(int argc, char **argv)
 			else if (*flag == 'd' && flag[1] == 'R')
 				protocol_clrf_all(PROTO_F_REUSEPORT_SUPPORTED);
 #endif
+#if defined(USE_CPU_AFFINITY)
+			else if (*flag == 'd' && flag[1] == 'c')
+				global.tune.debug |= GDBG_CPU_AFFINITY;
+#endif
 			else if (*flag == 'd' && flag[1] == 'F')
 				global.tune.options &= ~GTUNE_USE_FAST_FWD;
 			else if (*flag == 'd' && flag[1] == 'I')
@@ -2049,6 +2057,27 @@ static void step_init_2(int argc, char** argv)
 	clock_adjust_now_offset();
 	ready_date = date;
 
+#ifdef USE_CPU_AFFINITY
+	/* we've already read the config and know what CPUs are expected
+	 * to be used. Let's check which of these are usable.
+	 */
+	cpu_detect_usable();
+
+	/* Now detect how CPUs are arranged */
+	cpu_detect_topology();
+
+	/* fixup missing info */
+	cpu_fixup_topology();
+
+	/* compose clusters */
+	cpu_compose_clusters();
+
+	/* refine topology-based CPU sets */
+	cpu_refine_cpusets();
+#endif
+
+	/* detect the optimal thread-groups and nbthreads if not set */
+	thread_detect_count();
 
 	/* Note: global.nbthread will be initialized as part of this call */
 	err_code |= check_config_validity();

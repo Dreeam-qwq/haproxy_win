@@ -152,8 +152,14 @@ static int compute_ideal_maxconn()
 	if (!is_any_limit_configured())
 		global.fd_hard_limit = DEFAULT_MAXFD;
 
-	if (remain > global.fd_hard_limit)
+	if (global.fd_hard_limit && (remain > global.fd_hard_limit)) {
+		/* cap remain only when global.fd_hard_limit > 0, i.e.: either
+		 * there were no any other limits set and it's defined by lines
+		 * above as DEFAULT_MAXFD (100), or fd_hard_limit is explicitly
+		 * provided in config.
+		 */
 		remain = global.fd_hard_limit;
+	}
 
 	/* subtract listeners and checks */
 	remain -= global.maxsock;
@@ -221,7 +227,7 @@ int compute_ideal_maxsock(int maxconn)
 
 /* Tests if it is possible to set the current process's RLIMIT_NOFILE to
  * <maxsock>, then sets it back to the previous value. Returns non-zero if the
- * value is accepted, non-zero otherwise. This is used to determine if an
+ * value is accepted, zero otherwise. This is used to determine if an
  * automatic limit may be applied or not. When it is not, the caller knows that
  * the highest we can do is the rlim_max at boot. In case of error, we return
  * that the setting is possible, so that we defer the error processing to the

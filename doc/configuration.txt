@@ -1522,6 +1522,8 @@ The following keywords are supported in the "global" section :
    - chroot
    - cluster-secret
    - cpu-map
+   - cpu-policy
+   - cpu-set
    - crt-base
    - daemon
    - default-path
@@ -1945,6 +1947,103 @@ cpu-map [auto:]<thread-group>[/<thread-set>] <cpu-set>[,...] [...]
       cpu-map 3/1-40   40-79,120-159  # node1, siblings 0 & 1
       cpu-map 4/1-40   40-79,120-159
 
+
+cpu-policy <policy>
+  Selects the CPU allocation policy to be used.
+
+  On multi-CPU systems, there can be plenty of reasons for not using all
+  available CPU cores, and/or for grouping them into different thread groups,
+  for performance, latency, cost, or system-wide resource management. The
+  "cpu-set" directive already allows to evict a number of them, but once done,
+  it is necessary to decide how to assign the remaining ones to threads and
+  thread groups.
+
+  This mapping is normally performed using the "cpu-map" directive, though it
+  can be particularly difficult to maintain on heterogenous systems.
+
+  The "cpu-policy" directive chooses between a small number of allocation
+  policies which one to use instead, when "cpu-map" is not used. The following
+  policies are currently supported:
+
+   - none               no particular post-selection is performed. All enabled
+                        CPUs will be usable, and if the number of threads is
+                        not set, it will be set to the number of available CPUs
+                        but no more than 32 for 32-bit systems or 64 for 64-bit
+                        systems, per thread-group. The number of thread-groups,
+                        if not set, will be set to 1.
+
+   - efficiency         exactly like group-by-cluster below, except that CPU
+                        clusters whose performance is more than twice that of
+                        the next less performant one are evicted. These are
+                        typically "big" or "performance" cores. This means that
+                        if more than one type of CPU cores are detected, only
+                        the efficient one will be used. This can make sense for
+                        use with moderate loads when the most powerful cores
+                        need to be available to the application or a security
+                        component. Some modern CPUs have a large number of such
+                        efficient CPU cores which can collectively deliver a
+                        decent level of performance while using less power.
+
+   - first-usable-node  if the CPUs were not previously restricted at boot (for
+                        example using the "taskset" utility), and if the
+                        "nbthread" directive was not set, then the first NUMA
+                        node with enabled CPUs will be used, and this number of
+                        CPUs will be used as the number of threads. A single
+                        thread group will be enabled with all of them, within
+                        the limit of 32 or 64 depending on the system. This is
+                        the default policy.
+
+   - group-by-cluster   if neither "nbthread" not "nbtgroups" were set, then
+                        one thread group is created for each CPU cluster with
+                        available CPUs, each with as many threads as CPUs. All
+                        threads of a group are bound to all CPUs of the cluster
+                        so that intra-group communications remain local to the
+                        cluster without enforcing too strong a binding. The
+                        per-group thread limits and thread-group limits are
+                        respected. This is recommended on multi-socket and NUMA
+                        systems, as well as CPUs with bad inter-CCX latencies.
+
+   - performance        exactly like group-by-cluster above, except that CPU
+                        clusters whose performance is less than half of the
+                        next more performant one are evicted. These are
+                        typically "little" or "efficient" cores, whose addition
+                        generally doesn't bring significant gains and can
+                        easily be counter-productive (e.g. TLS handshakes).
+                        Often, keeping such cores for other tasks such as
+                        network handling is much more effective. On development
+                        systems, these can also be used to run auxiliary tools
+                        such as load generators and monitoring tools.
+
+   - resource           this is like group-by-cluster above, except that only
+                        the smallest and most efficient CPU cluster will be
+                        used, while all other ones will be ignored. This can be
+                        used to limit the resource usage to the strict minimum
+                        that still delivers decent performance, for example to
+                        try to further reduce power consumption or minimize the
+                        number of cores needed on some rented systems for a
+                        sidecar setup, in order to scale the system down more
+                        easily. Note that if a single cluster is present, it
+                        will still be fully used.
+
+  See also: "cpu-map", "cpu-set", "nbthread"
+
+cpu-set <directive>...
+  Allows to symbolically describe what sets of CPUs to run on. The directive
+  supports the following keyword:
+    - reset              this undoes any previous limitation that could have
+                         been inherited by a service manager or a "taskset"
+                         command for example.
+    - drop-cpu <set>     do not bind to CPUs in this set
+    - only-cpu <set>     do not bind to CPUs not in this set
+    - drop-node <set>    do not bind to CPUs belonging to this NUMA node
+    - only-node <set>    do not bind to CPUs not belonging to this NUMA node
+    - drop-cluster <set> do not bind to CPUs on this hardware cluster number
+    - only-cluster <set> do not bind to CPUs on other hardware cluster number
+    - drop-core <set>    do not bind to CPUs on this hardware core number
+    - only-core <set>    do not bind to CPUs on other hardware core number
+    - drop-thread <set>  do not bind to CPUs on this hardware thread number
+    - only-thread <set>  do not bind to CPUs on other hardware thread number
+  See also: "cpu-policy"
 
 crt-base <dir>
   Assigns a default directory to fetch SSL certificates from when a relative
@@ -2497,16 +2596,18 @@ no-quic
   processed by haproxy. See also "quic_enabled" sample fetch.
 
 numa-cpu-mapping
-  If running on a NUMA-aware platform, HAProxy inspects on startup the CPU
+  When running on a NUMA-aware platform with the cpu-policy is set to
+  "first-usable-node" (the default one), HAProxy inspects on startup the CPU
   topology of the machine. If a multi-socket machine is detected, the affinity
   is automatically calculated to run on the CPUs of a single node. This is done
   in order to not suffer from the performance penalties caused by the
   inter-socket bus latency. However, if the applied binding is non optimal on a
   particular architecture, it can be disabled with the statement 'no
   numa-cpu-mapping'. This automatic binding is also not applied if a nbthread
-  statement is present in the configuration, or the affinity of the process is
+  statement is present in the configuration, if the affinity of the process is
   already specified, for example via the 'cpu-map' directive or the taskset
-  utility.
+  utility, or if the cpu-policy is set to any other value. See also "cpu-map",
+  "cpu-policy", "cpu-set".
 
 ocsp-update.disable [ on | off ]
   Disable completely the ocsp-update in HAProxy. Any ocsp-update configuration
