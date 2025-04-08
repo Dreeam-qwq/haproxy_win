@@ -59,11 +59,14 @@ static int cpu_policy_resource(int policy, int tmin, int tmax, int gmin, int gma
 
 static struct ha_cpu_policy ha_cpu_policy[] = {
 	{ .name = "none",               .desc = "use all available CPUs",                           .fct = NULL   },
-	{ .name = "first-usable-node",  .desc = "use only first usable node if nbthreads not set",  .fct = cpu_policy_first_usable_node  },
-	{ .name = "group-by-cluster",   .desc = "make one thread group per core cluster",           .fct = cpu_policy_group_by_cluster   },
-	{ .name = "performance",        .desc = "make one thread group per perf. core cluster",     .fct = cpu_policy_performance        },
-	{ .name = "efficiency",         .desc = "make one thread group per eff. core cluster",      .fct = cpu_policy_efficiency         },
-	{ .name = "resource",           .desc = "make one thread group from the smallest cluster",  .fct = cpu_policy_resource           },
+	{ .name = "first-usable-node",  .desc = "use only first usable node if nbthreads not set",  .fct = cpu_policy_first_usable_node, .arg = 0 },
+	{ .name = "group-by-cluster",   .desc = "make one thread group per core cluster",           .fct = cpu_policy_group_by_cluster , .arg = 1 },
+	{ .name = "group-by-2-clusters",.desc = "make one thread group per 2 core clusters",        .fct = cpu_policy_group_by_cluster , .arg = 2 },
+	{ .name = "group-by-3-clusters",.desc = "make one thread group per 3 core clusters",        .fct = cpu_policy_group_by_cluster , .arg = 3 },
+	{ .name = "group-by-4-clusters",.desc = "make one thread group per 4 core clusters",        .fct = cpu_policy_group_by_cluster , .arg = 4 },
+	{ .name = "performance",        .desc = "make one thread group per perf. core cluster",     .fct = cpu_policy_performance      , .arg = 0 },
+	{ .name = "efficiency",         .desc = "make one thread group per eff. core cluster",      .fct = cpu_policy_efficiency       , .arg = 0 },
+	{ .name = "resource",           .desc = "make one thread group from the smallest cluster",  .fct = cpu_policy_resource         , .arg = 0 },
 	{ 0 } /* end */
 };
 
@@ -214,10 +217,14 @@ void cpu_dump_topology(const struct ha_cpu_topo *topo)
 {
 	int has_smt = 0;
 	int cpu, lvl;
+	int grp, thr;
 
-	for (cpu = 0; cpu <= cpu_topo_lastcpu; cpu++)
-		if (ha_cpu_topo[cpu].th_cnt > 1)
+	for (cpu = 0; cpu <= cpu_topo_lastcpu; cpu++) {
+		if (ha_cpu_topo[cpu].th_cnt > 1) {
 			has_smt = 1;
+			break;
+		}
+	}
 
 	for (cpu = 0; cpu <= cpu_topo_lastcpu; cpu++) {
 		if (ha_cpu_topo[cpu].st & HA_CPU_F_OFFLINE)
@@ -263,6 +270,67 @@ void cpu_dump_topology(const struct ha_cpu_topo *topo)
 		       ha_cpu_clusters[cpu].nb_cores,
 		       ha_cpu_clusters[cpu].capa);
 	}
+
+	printf("Thread CPU Bindings:\n  Tgrp/Thr  Tid        CPU set\n");
+	for (grp = 0; grp < global.nbtgroups; grp++) {
+		int first, last;
+		int min, max;
+
+		first = ha_tgroup_info[grp].base;
+		last  = ha_tgroup_info[grp].base + ha_tgroup_info[grp].count - 1;
+
+		min = max = -1;
+		for (thr = first; thr <= last; thr++) {
+			if (min < 0)
+				min = thr;
+
+			if (thr == last ||
+			    !ha_cpuset_isequal(&cpu_map[grp].thread[min - first],
+					       &cpu_map[grp].thread[thr + 1 - first]))
+				max = thr;
+
+			if (min >= 0 && max >= 0) {
+				/* we have a range */
+				char str[1024];
+				int len = 0;
+				int len2;
+
+				/* print group/thread-range */
+				len += snprintf(str + len, sizeof(str) - len, "%d/%d", grp + 1, min - first + 1);
+				if (min != max)
+					len += snprintf(str + len, sizeof(str) - len, "-%d", max - first + 1);
+
+				/* max len is 8: "64/64-64", plus 2 spaces = 10 */
+				while (len < 10) {
+					str[len++] = ' ';
+					str[len] = 0;
+				}
+
+				/* append global thread range */
+				len += snprintf(str + len, sizeof(str) - len, "%d", min + 1);
+				if (min != max)
+					len += snprintf(str + len, sizeof(str) - len, "-%d", max + 1);
+
+				/* max len is 9: "4096-4096", plus 2 spaces = 11, plus 10 initial chars = 21 */
+				while (len < 21) {
+					str[len++] = ' ';
+					str[len] = 0;
+				}
+
+				if (ha_cpuset_count(&cpu_map[grp].thread[thr - first]))
+					len += snprintf(str + len, sizeof(str) - len, "%d: ", ha_cpuset_count(&cpu_map[grp].thread[thr - first]));
+
+				len2 = print_cpu_set(str + len, sizeof(str) - len, &cpu_map[grp].thread[thr - first]);
+				if (len2 > sizeof(str) - len)
+					snprintf(str + len, sizeof(str) - len, "<too_large>");
+				else if (len2 == 0)
+					snprintf(str + len, sizeof(str) - len, "<all>");
+
+				printf("  %s\n", str);
+				min = max = -1;
+			}
+		}
+	}
 }
 
 /* function used by qsort to re-arrange CPUs by index only, to restore original
@@ -279,7 +347,7 @@ int _cmp_cpu_index(const void *a, const void *b)
 	if (l->idx > r->idx && r->idx >= 0)
 		return  1;
 
-	/* exactly the same (e.g. absent, should not happend) */
+	/* exactly the same (e.g. absent, should not happen) */
 	return 0;
 }
 
@@ -1001,6 +1069,8 @@ static int cpu_policy_first_usable_node(int policy, int tmin, int tmax, int gmin
  *  - otherwise tries to create one thread-group per cluster, with as many
  *    threads as CPUs in the cluster, and bind all the threads of this group
  *    to all the CPUs of the cluster.
+ * Also implements the variants "group-by-2-clusters", "group-by-3-clusters"
+ * and "group-by-4-clusters".
  */
 static int cpu_policy_group_by_cluster(int policy, int tmin, int tmax, int gmin, int gmax, char **err)
 {
@@ -1010,6 +1080,7 @@ static int cpu_policy_group_by_cluster(int policy, int tmin, int tmax, int gmin,
 	int cid, lcid;
 	int thr_per_grp, nb_grp;
 	int thr;
+	int div;
 
 	if (global.nbthread)
 		return 0;
@@ -1020,6 +1091,11 @@ static int cpu_policy_group_by_cluster(int policy, int tmin, int tmax, int gmin,
 	/* iterate over each new cluster */
 	lcid = -1;
 	cpu_start = 0;
+
+	/* used as a divisor of clusters*/
+	div = ha_cpu_policy[policy].arg;
+	div = div ? div : 1;
+
 	while (global.nbtgroups < MAX_TGROUPS && global.nbthread < MAX_THREADS) {
 		ha_cpuset_zero(&node_cpu_set);
 		cid = -1; cpu_count = 0;
@@ -1028,14 +1104,14 @@ static int cpu_policy_group_by_cluster(int policy, int tmin, int tmax, int gmin,
 			/* skip disabled and already visited CPUs */
 			if (ha_cpu_topo[cpu].st & HA_CPU_F_EXCL_MASK)
 				continue;
-			if (ha_cpu_topo[cpu].cl_gid <= lcid)
+			if ((ha_cpu_topo[cpu].cl_gid / div) <= lcid)
 				continue;
 
 			if (cid < 0) {
-				cid = ha_cpu_topo[cpu].cl_gid;
+				cid = ha_cpu_topo[cpu].cl_gid / div;
 				cpu_start = cpu + 1;
 			}
-			else if (cid != ha_cpu_topo[cpu].cl_gid)
+			else if (cid != ha_cpu_topo[cpu].cl_gid / div)
 				continue;
 
 			/* make a mask of all of this cluster's CPUs */
@@ -1282,7 +1358,7 @@ int cpu_detect_topology(void)
 		/* First, let's check the cache hierarchy. On systems exposing
 		 * it, index0 generally is the L1D cache, index1 the L1I, index2
 		 * the L2 and index3 the L3. But sometimes L1I/D are reversed,
-		 * and some CPUs also have L0 or L4. Maybe some heterogenous
+		 * and some CPUs also have L0 or L4. Maybe some heterogeneous
 		 * SoCs even have inconsistent levels between clusters... Thus
 		 * we'll scan all entries that we can find for each CPU and
 		 * assign levels based on what is reported. The types generally

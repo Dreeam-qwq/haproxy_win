@@ -225,7 +225,7 @@ static inline __attribute__((always_inline)) unsigned long mt_list_cpu_relax(uns
 	/* limit maximum wait time for unlucky threads */
 	loop = mt_list_wait(loop);
 
-	for (loop &= 0x7fffff; loop >= 32; loop--) {
+	for (loop &= 0xfffff; loop >= 32; loop--) {
 #if defined(__x86_64__)
 		/* This is a PAUSE instruction on x86_64 */
 		asm volatile("rep;nop\n");
@@ -776,6 +776,28 @@ static MT_INLINE struct mt_list mt_list_lock_prev(struct mt_list *lh)
 			continue;
 		}
 		break;
+	}
+	return el;
+}
+
+/*
+ * Same as mt_list_lock_prev(), except it doesn't wait if the prev
+ * is locked already, and just returns { NULL, NULL }
+ */
+static MT_INLINE struct mt_list mt_list_try_lock_prev(struct mt_list *lh)
+{
+	struct mt_list el;
+	struct mt_list missed = { NULL, NULL };
+
+	el.prev = __atomic_exchange_n(&lh->prev, MT_LIST_BUSY, __ATOMIC_RELAXED);
+	if (el.prev == MT_LIST_BUSY)
+		return missed;
+
+	el.next = __atomic_exchange_n(&el.prev->next, MT_LIST_BUSY, __ATOMIC_RELAXED);
+	if (el.next == MT_LIST_BUSY) {
+		lh->prev = el.prev;
+		__atomic_thread_fence(__ATOMIC_RELEASE);
+		return missed;
 	}
 	return el;
 }

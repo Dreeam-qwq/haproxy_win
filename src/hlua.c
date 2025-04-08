@@ -419,8 +419,8 @@ struct hlua_flt_ctx {
 struct hlua_csk_ctx {
 	int connected;
 	struct xref xref; /* cross reference with the Lua object owner. */
-	struct list wake_on_read;
-	struct list wake_on_write;
+	struct mt_list wake_on_read;
+	struct mt_list wake_on_write;
 	struct appctx *appctx;
 	struct server *srv;
 	int timeout;
@@ -599,7 +599,7 @@ static unsigned int hlua_nb_instruction = 0;
 
 /* Wrapper to retrieve the number of instructions between two interrupts
  * depending on user settings and current hlua context. If not already
- * explicitly set, we compute the ideal value using hard limits releaved
+ * explicitly set, we compute the ideal value using hard limits revealed
  * by Thierry Fournier's work, whose original notes may be found below:
  *
  * --
@@ -610,7 +610,7 @@ static unsigned int hlua_nb_instruction = 0;
  *
  *  configured    | Number of
  *  instructions  | loops executed
- *  between two   | in milions
+ *  between two   | in millions
  *  forced yields |
  * ---------------+---------------
  *  10            | 160
@@ -3771,8 +3771,8 @@ __LJMP static int hlua_socket_new(lua_State *L)
 	ctx->srv = NULL;
 	ctx->timeout = 0;
 	ctx->appctx = appctx;
-	LIST_INIT(&ctx->wake_on_write);
-	LIST_INIT(&ctx->wake_on_read);
+	MT_LIST_INIT(&ctx->wake_on_write);
+	MT_LIST_INIT(&ctx->wake_on_read);
 
 	hlua->gc_count++;
 
@@ -5312,11 +5312,10 @@ __LJMP static int hlua_applet_tcp_getline(lua_State *L)
 	return MAY_LJMP(hlua_applet_tcp_getline_yield(L, 0, 0));
 }
 
-/* If expected data not yet available, it returns a yield. This function
- * consumes the data in the buffer. It returns a string containing the
- * data. This string can be empty.
+/* returns 1 on success (number of bytes received is pushed on the stack)
+ * or 0 if yielding if required (not enough data available)
  */
-__LJMP static int hlua_applet_tcp_recv_yield(lua_State *L, int status, lua_KContext ctx)
+__LJMP static int hlua_applet_tcp_recv_try(lua_State *L)
 {
 	struct hlua_appctx *luactx = MAY_LJMP(hlua_checkapplet_tcp(L, 1));
 	struct stconn *sc = appctx_sc(luactx->appctx);
@@ -5343,7 +5342,7 @@ __LJMP static int hlua_applet_tcp_recv_yield(lua_State *L, int status, lua_KCont
 		}
 
 		applet_need_more_data(luactx->appctx);
-		MAY_LJMP(hlua_yieldk(L, 0, 0, hlua_applet_tcp_recv_yield, exp_date, 0));
+		return 0;
 	}
 
 	/* End of data: commit the total strings and return. */
@@ -5376,7 +5375,7 @@ __LJMP static int hlua_applet_tcp_recv_yield(lua_State *L, int status, lua_KCont
 		}
 
 		applet_need_more_data(luactx->appctx);
-		MAY_LJMP(hlua_yieldk(L, 0, 0, hlua_applet_tcp_recv_yield, exp_date, 0));
+		return 0;
 
 	} else {
 
@@ -5402,7 +5401,7 @@ __LJMP static int hlua_applet_tcp_recv_yield(lua_State *L, int status, lua_KCont
 			lua_pushinteger(L, len);
 			lua_replace(L, 2);
 			applet_need_more_data(luactx->appctx);
-			MAY_LJMP(hlua_yieldk(L, 0, 0, hlua_applet_tcp_recv_yield, exp_date, 0));
+			return 0;
 		}
 
 		/* return the result. */
@@ -5414,6 +5413,23 @@ __LJMP static int hlua_applet_tcp_recv_yield(lua_State *L, int status, lua_KCont
 	hlua_pusherror(L, "Lua: internal error");
 	WILL_LJMP(lua_error(L));
 	return 0;
+}
+
+/* If expected data not yet available, it returns a yield. This function
+ * consumes the data in the buffer. It returns a string containing the
+ * data. This string can be empty.
+ */
+__LJMP static int hlua_applet_tcp_recv_yield(lua_State *L, int status, lua_KContext ctx)
+{
+	int exp_date = MAY_LJMP(luaL_checkinteger(L, 3));
+	int ret;
+
+	ret = hlua_applet_tcp_recv_try(L);
+
+	if (ret == 0)
+		MAY_LJMP(hlua_yieldk(L, 0, 0, hlua_applet_tcp_recv_yield, exp_date, 0));
+
+	return ret;
 }
 
 /* Check arguments for the function "hlua_channel_get_yield". */
@@ -5446,6 +5462,34 @@ __LJMP static int hlua_applet_tcp_recv(lua_State *L)
 	luaL_buffinit(L, &luactx->b);
 
 	return MAY_LJMP(hlua_applet_tcp_recv_yield(L, 0, 0));
+}
+
+/* Check arguments for the function "hlua_channel_get_yield". */
+__LJMP static int hlua_applet_tcp_try_recv(lua_State *L)
+{
+	struct hlua_appctx *luactx = MAY_LJMP(hlua_checkapplet_tcp(L, 1));
+	int ret;
+
+	if (lua_gettop(L) > 1)
+		WILL_LJMP(luaL_error(L, "The 'try_recv' function only expects applet argument."));
+
+	/* Confirm or set the required length */
+	lua_pushinteger(L, -1);
+
+	/* set the expiration date (mandatory arg but not relevant here) */
+	lua_pushinteger(L, TICK_ETERNITY);
+
+	/* Initialise the string catenation. */
+	luaL_buffinit(L, &luactx->b);
+
+	ret = hlua_applet_tcp_recv_try(L);
+	if (!ret) {
+		/* return the result (may be empty). */
+		luaL_pushresult(&luactx->b);
+		return 1;
+	}
+
+	return ret;
 }
 
 /* Append data in the output side of the buffer. This data is immediately
@@ -9247,6 +9291,30 @@ __LJMP static int hlua_yield(lua_State *L)
 	return 0;
 }
 
+/* same as hlua_yield() but doesn't enforce CTRLYIELD so the Lua task won't be
+ * automatically woken up to resume ASAP, instead it means we will wait for
+ * an event to occur to wake the task. Only use when you're confident that
+ * something or someone will wake the task at some point.
+ *
+ * Takes optional <delay> argument as parameter, in which case an automatic
+ * wake will be performed after <delay>
+ */
+__LJMP static int hlua_wait(lua_State *L)
+{
+	int nb_arg;
+	unsigned int delay;
+	int wakeup_ms = TICK_ETERNITY; // tick value
+
+	nb_arg = lua_gettop(L);
+	if (nb_arg >= 1) {
+		delay = MAY_LJMP(luaL_checkinteger(L, 1));
+		wakeup_ms = tick_add(now_ms, delay);
+	}
+
+	MAY_LJMP(hlua_yieldk(L, 0, 0, hlua_yield_yield, wakeup_ms, 0));
+	return 0;
+}
+
 /* This function change the nice of the currently executed
  * task. It is used set low or high priority at the current
  * task.
@@ -9562,7 +9630,7 @@ static void hlua_event_handler(struct hlua *hlua)
 		hlua_timer_init(&hlua->timer, hlua_timeout_task);
 
 	/* make sure to reset the task expiry before each hlua_ctx_resume()
-	 * since the task is re-used for multiple cb function calls
+	 * since the task is reused for multiple cb function calls
 	 * We couldn't risk to have t->expire pointing to a past date because
 	 * it was set during last function invocation but was never reset since
 	 * (ie: E_AGAIN)
@@ -11880,6 +11948,8 @@ static void hlua_cli_io_release_fct(struct appctx *appctx)
 {
 	struct hlua_cli_ctx *ctx = appctx->svcctx;
 
+	task_destroy(ctx->task);
+	ctx->task = NULL;
 	hlua_ctx_destroy(ctx->hlua);
 	ctx->hlua = NULL;
 }
@@ -13875,6 +13945,7 @@ lua_State *hlua_init_state(int thread_num)
 	hlua_class_function(L, "register_cli", hlua_register_cli);
 	hlua_class_function(L, "register_filter", hlua_register_filter);
 	hlua_class_function(L, "yield", hlua_yield);
+	hlua_class_function(L, "wait", hlua_wait);
 	hlua_class_function(L, "set_nice", hlua_set_nice);
 	hlua_class_function(L, "sleep", hlua_sleep);
 	hlua_class_function(L, "msleep", hlua_msleep);
@@ -14246,6 +14317,7 @@ lua_State *hlua_init_state(int thread_num)
 	/* Register Lua functions. */
 	hlua_class_function(L, "getline",   hlua_applet_tcp_getline);
 	hlua_class_function(L, "receive",   hlua_applet_tcp_recv);
+	hlua_class_function(L, "try_receive", hlua_applet_tcp_try_recv);
 	hlua_class_function(L, "send",      hlua_applet_tcp_send);
 	hlua_class_function(L, "set_priv",  hlua_applet_tcp_set_priv);
 	hlua_class_function(L, "get_priv",  hlua_applet_tcp_get_priv);

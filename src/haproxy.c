@@ -101,6 +101,7 @@
 #include <haproxy/openssl-compat.h>
 #include <haproxy/quic_conn.h>
 #include <haproxy/quic_tp-t.h>
+#include <haproxy/quic_tune.h>
 #include <haproxy/pattern.h>
 #include <haproxy/peers.h>
 #include <haproxy/pool.h>
@@ -195,8 +196,10 @@ struct global global = {
 #ifdef USE_QUIC
 		.quic_backend_max_idle_timeout = QUIC_TP_DFLT_BACK_MAX_IDLE_TIMEOUT,
 		.quic_frontend_max_idle_timeout = QUIC_TP_DFLT_FRONT_MAX_IDLE_TIMEOUT,
+		.quic_frontend_max_data = 0,
 		.quic_frontend_max_streams_bidi = QUIC_TP_DFLT_FRONT_MAX_STREAMS_BIDI,
 		.quic_frontend_max_window_size = QUIC_DFLT_MAX_WINDOW_SIZE,
+		.quic_frontend_stream_data_ratio = QUIC_DFLT_FRONT_STREAM_DATA_RATIO,
 		.quic_reorder_ratio = QUIC_DFLT_REORDER_RATIO,
 		.quic_retry_threshold = QUIC_DFLT_RETRY_THRESHOLD,
 		.quic_max_frame_loss = QUIC_DFLT_MAX_FRAME_LOSS,
@@ -1436,15 +1439,16 @@ static void init_args(int argc, char **argv)
 #ifdef USE_THREAD
 	global.tune.options |= GTUNE_IDLE_POOL_SHARED;
 #endif
-#ifdef USE_QUIC
-	global.tune.options |= GTUNE_QUIC_SOCK_PER_CONN;
-#endif
 	global.tune.options |= GTUNE_STRICT_LIMITS;
 
 	global.tune.options |= GTUNE_USE_FAST_FWD; /* Use fast-forward by default */
 
 	/* Use zero-copy forwarding by default */
 	global.tune.no_zero_copy_fwd = 0;
+
+#ifdef USE_QUIC
+	quic_tune.options |= QUIC_TUNE_SOCK_PER_CONN;
+#endif
 
 	/* keep a copy of original arguments for the master process */
 	old_argv = copy_argv(argc, argv);
@@ -2546,7 +2550,7 @@ static void run_master_in_recovery_mode(int argc, char **argv)
 	mworker_run_master();
 }
 
-/* parse conf in disovery mode and set modes from config */
+/* parse conf in discovery mode and set modes from config */
 static void read_cfg_in_discovery_mode(int argc, char **argv)
 {
 	struct cfgfile *cfg, *cfg_tmp;
@@ -2600,7 +2604,7 @@ static void read_cfg_in_discovery_mode(int argc, char **argv)
 		exit(EXIT_FAILURE);
 	}
 
-	/* "progam" sections, if there are any, were alredy parsed only by master
+	/* "program" sections, if there are any, were already parsed only by master
 	 * and programs are forked before calling postparser functions from
 	 * postparser list. So, all checks related to "program" section integrity
 	 * and sections vs MODE_MWORKER combinations should be done here.
@@ -3238,7 +3242,7 @@ int main(int argc, char **argv)
 	if (backup_env() != 0)
 		exit(EXIT_FAILURE);
 
-	/* parse conf in disovery mode and set modes from config */
+	/* parse conf in discovery mode and set modes from config */
 	read_cfg_in_discovery_mode(argc, argv);
 
 	/* From this stage all runtime modes are known. So let's do below some
@@ -3343,8 +3347,8 @@ int main(int argc, char **argv)
 	 * forked. Thus the current worker inherits ipc_fd[0]s from the previous
 	 * ones by it's parent, master, because we have to keep shared sockpair
 	 * ipc_fd[0] always opened in master (master CLI server is listening on
-	 * this fd). It's safe to call close() at this point on these inhereted
-	 * ipc_fd[0]s, as they are inhereted after master re-exec unbound, we
+	 * this fd). It's safe to call close() at this point on these inherited
+	 * ipc_fd[0]s, as they are inherited after master re-exec unbound, we
 	 * keep them like this during bind_listeners() call. So, these fds were
 	 * never referenced in the current worker's fdtab.
 	 */
@@ -3400,7 +3404,7 @@ int main(int argc, char **argv)
 	}
 
         /* applies the renice value in the worker or standalone after configuration parsing
-         * but before chaning identity */
+         * but before changing identity */
         if (!master && global.tune.renice_runtime) {
 		if (setpriority(PRIO_PROCESS, 0, global.tune.renice_runtime - 100) == -1) {
 			ha_warning("[%s.main()] couldn't set the runtime nice value to %d: %s\n",

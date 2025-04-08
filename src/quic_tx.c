@@ -28,6 +28,7 @@
 #include <haproxy/quic_stream.h>
 #include <haproxy/quic_tls.h>
 #include <haproxy/quic_trace.h>
+#include <haproxy/quic_tune.h>
 #include <haproxy/ssl_sock-t.h>
 
 DECLARE_POOL(pool_head_quic_tx_packet, "quic_tx_packet", sizeof(struct quic_tx_packet));
@@ -152,7 +153,7 @@ struct buffer *qc_get_txb(struct quic_conn *qc)
 
 /* Commit a datagram payload written into <buf> of length <length>. <first_pkt>
  * must contains the address of the first packet stored in the payload. When
- * GSO is used, several datagrams can be commited at once. In this case,
+ * GSO is used, several datagrams can be committed at once. In this case,
  * <length> must be the total length of all consecutive datagrams.
  *
  * Caller is responsible that there is enough space in the buffer.
@@ -427,7 +428,7 @@ static int qc_send_ppkts(struct buffer *buf, struct ssl_sock_ctx *ctx)
 			}
 			qc->path->in_flight += pkt->in_flight_len;
 			pkt->pktns->tx.in_flight += pkt->in_flight_len;
-			if ((global.tune.options & GTUNE_QUIC_CC_HYSTART) && pkt->pktns == qc->apktns)
+			if ((quic_tune.options & QUIC_TUNE_CC_HYSTART) && pkt->pktns == qc->apktns)
 				cc->algo->hystart_start_round(cc, pkt->pn_node.key);
 			if (pkt->in_flight_len)
 				qc_set_timer(qc);
@@ -763,7 +764,7 @@ static int qc_prep_pkts(struct quic_conn *qc, struct buffer *buf,
 				/* Everything sent. Continue within the same datagram. */
 				prv_pkt = cur_pkt;
 			}
-			else if (!(global.tune.options & GTUNE_QUIC_NO_UDP_GSO) &&
+			else if (!(quic_tune.options & QUIC_TUNE_NO_UDP_GSO) &&
 			         !(HA_ATOMIC_LOAD(&qc->li->flags) & LI_F_UDP_GSO_NOTSUPP) &&
 			         dglen == qc->path->mtu &&
 			         (char *)end < b_wrap(buf) &&
@@ -1855,7 +1856,7 @@ static int qc_do_build_pkt(unsigned char *pos, const unsigned char *end,
 				 * its frames which were already acknowledeged.
 				 * See qc_stream_frm_is_acked()) called by qc_build_frms().
 				 * Note that qc_stream_frm_is_acked() logs a trace in this
-				 * case mentionning some frames were already acknowledged.
+				 * case mentioning some frames were already acknowledged.
 				 *
 				 * That said, the consequence must be the same: cancelling
 				 * the packet build as if there was not enough room in the

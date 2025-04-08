@@ -346,9 +346,12 @@ enum stat_idx_info {
 struct stat_col {
 	const char *name; /* short name, used notably in CSV headers */
 	const char *desc; /* user-friendly description */
+	const char *alt_name; /* name used by some stats provider such as promex addon, ignored if NULL */
 
 	uint32_t type;    /* combination of field_nature and field_format */
 	uint8_t cap;      /* mask of stats_domain_px_cap to restrain metrics to an object types subset */
+	uint8_t generic;  /* bit set if generic */
+	/* 2 bytes hole */
 
 	/* used only for generic metrics */
 	struct {
@@ -563,6 +566,7 @@ enum stats_domain_px_cap {
 #define STATS_PX_CAP__F__ (STATS_PX_CAP_FE)
 #define STATS_PX_CAP___BS (STATS_PX_CAP_BE|STATS_PX_CAP_SRV)
 #define STATS_PX_CAP____S (STATS_PX_CAP_SRV)
+#define STATS_PX_CAP___B_ (STATS_PX_CAP_BE)
 
 /* the context of a "show stat" command in progress on the CLI or the stats applet */
 struct show_stat_ctx {

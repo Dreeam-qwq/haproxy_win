@@ -457,7 +457,7 @@ struct server *get_server_hh(struct stream *s, const struct server *avoid)
 					break;
 			}
 			else if (*p == '.') {
-				/* The pointer is rewinded to the dot before the
+				/* The pointer is rewound to the dot before the
 				 * tld, we memorize the end of the domain and
 				 * can enter the domain processing. */
 				end = p;
@@ -858,13 +858,14 @@ out_ok:
 	return err;
 }
 
-/* Allocate an address for the destination endpoint
- * The address is taken from the currently assigned server, or from the
- * dispatch or transparent address.
+/* Allocate <*ss> address unless already set. Address is then set to the
+ * destination endpoint of <srv> server, or via <s> from a dispatch or
+ * transparent address.
  *
- * Returns SRV_STATUS_OK on success. Does nothing if the address was
- * already set.
- * On error, no address is allocated and SRV_STATUS_INTERNAL is returned.
+ * Note that no address is allocated if server relies on reverse HTTP.
+ *
+ * Returns SRV_STATUS_OK on success, or if already already set. Else an error
+ * code is returned and <*ss> is not allocated.
  */
 static int alloc_dst_address(struct sockaddr_storage **ss,
                              struct server *srv, struct stream *s)
@@ -874,6 +875,11 @@ static int alloc_dst_address(struct sockaddr_storage **ss,
 	if (*ss)
 		return SRV_STATUS_OK;
 
+	if (srv && (srv->flags & SRV_F_RHTTP)) {
+		/* For reverse HTTP, destination address is unknown. */
+		return SRV_STATUS_OK;
+	}
+
 	if ((s->flags & SF_DIRECT) || (s->be->lbprm.algo & BE_LB_KIND)) {
 		/* A server is necessarily known for this stream */
 		if (!(s->flags & SF_ASSIGNED))
@@ -881,6 +887,8 @@ static int alloc_dst_address(struct sockaddr_storage **ss,
 
 		if (!sockaddr_alloc(ss, NULL, 0))
 			return SRV_STATUS_INTERNAL;
+
+		ASSUME_NONNULL(srv); /* srv is guaranteed by SF_ASSIGNED */
 
 		**ss = srv->addr;
 		set_host_port(*ss, srv->svc_port);
@@ -1257,11 +1265,21 @@ int alloc_bind_address(struct sockaddr_storage **ss,
 	return SRV_STATUS_OK;
 }
 
-/* Attempt to get a backend connection from the specified mt_list array
- * (safe or idle connections). The <is_safe> argument means what type of
- * connection the caller wants.
+/* Attempt to retrieve a connection matching <hash> from <srv> server lists for
+ * connection reuse. If <is_safe> is true, only connections considered safe for
+ * reuse are inspected. Thread-local list is inspected first. If no matching
+ * connection is found, takeover may be performed to steal a connection from a
+ * foreign thread.
+ *
+ * If <reuse_mode> backend policy is safe and connection MUX is subject to
+ * head-of-line blocking, connection is attached to <sess> session, which
+ * prevents mixing several frontend client over it.
+ *
+ * Returns the connection instance if found.
  */
-struct connection *conn_backend_get(struct stream *s, struct server *srv, int is_safe, int64_t hash)
+struct connection *conn_backend_get(int reuse_mode,
+                                    struct server *srv, struct session *sess,
+                                    int is_safe, int64_t hash)
 {
 	const struct tgroup_info *curtg = tg;
 	struct connection *conn = NULL;
@@ -1387,17 +1405,16 @@ check_tgid:
 		conn->flags &= ~CO_FL_LIST_MASK;
 		__ha_barrier_atomic_store();
 
-		if ((s->be->options & PR_O_REUSE_MASK) == PR_O_REUSE_SAFE &&
-		    conn->mux->flags & MX_FL_HOL_RISK) {
-			/* attach the connection to the session private list
-			 */
-			conn->owner = s->sess;
-			session_add_conn(s->sess, conn, conn->target);
+		if (reuse_mode == PR_O_REUSE_SAFE && conn->mux->flags & MX_FL_HOL_RISK) {
+			/* attach the connection to the session private list */
+			conn->owner = sess;
+			session_add_conn(sess, conn, conn->target);
 		}
 		else {
 			srv_add_to_avail_list(srv, conn);
 		}
 	}
+
 	return conn;
 }
 
@@ -1516,90 +1533,68 @@ kill_random_idle_conn(struct server *srv)
 	return 0;
 }
 
-/*
- * This function initiates a connection to the server assigned to this stream
- * (s->target, (s->scb)->addr.to). It will assign a server if none
- * is assigned yet.
- * It can return one of :
- *  - SF_ERR_NONE if everything's OK
- *  - SF_ERR_SRVTO if there are no more servers
- *  - SF_ERR_SRVCL if the connection was refused by the server
- *  - SF_ERR_PRXCOND if the connection has been limited by the proxy (maxconn)
- *  - SF_ERR_RESOURCE if a system resource is lacking (eg: fd limits, ports, ...)
- *  - SF_ERR_INTERNAL for any other purely internal errors
- * Additionally, in the case of SF_ERR_RESOURCE, an emergency log will be emitted.
- * The server-facing stream connector is expected to hold a pre-allocated connection.
+/* Returns backend reuse policy depending on <be>. It can be forced to always
+ * mode if <srv> is not NULL and uses reverse HTTP.
  */
-int connect_server(struct stream *s)
+static int be_reuse_mode(struct proxy *be, struct server *srv)
 {
-	struct connection *cli_conn = objt_conn(strm_orig(s));
-	struct connection *srv_conn = NULL;
-	struct server *srv;
-	int reuse_mode = s->be->options & PR_O_REUSE_MASK;
-	int reuse = 0;
-	int init_mux = 0;
-	int err;
-	struct sample *name_smp = NULL;
-	struct sockaddr_storage *bind_addr = NULL;
-	int proxy_line_ret;
-	int64_t hash = 0;
+	if (srv && srv->flags & SRV_F_RHTTP) {
+		/* Override reuse-mode if reverse-connect is used. */
+		return PR_O_REUSE_ALWS;
+	}
+
+	return be->options & PR_O_REUSE_MASK;
+}
+
+/* Calculate hash to select a matching connection for reuse. Here is the list
+ * of input parameters :
+ * - <srv> is the server instance. Can be NULL on dispatch/transparent proxy.
+ * - <strm> is the stream instance. Can be NULL if no stream is used.
+ * - <src> is the bind address if an explicit source address is used.
+ * - <dst> is the destination address. Must be set in every cases, except on
+ *   reverse HTTP.
+ * - <name> is a string identifier associated to the connection. Set by
+ *   pool-conn-name, also used for SSL SNI matching.
+ *
+ * Note that all input parameters can be NULL. The only requirement is that
+ * it's not possible to have both <srv> and <strm> NULL at the same time.
+ *
+ * Returns the calculated hash.
+ */
+int64_t be_calculate_conn_hash(struct server *srv, struct stream *strm,
+                               struct session *sess,
+                               struct sockaddr_storage *src,
+                               struct sockaddr_storage *dst,
+                               struct ist name)
+{
 	struct conn_hash_params hash_params;
 
-	/* in standard configuration, srv will be valid
-	 * it can be NULL for dispatch mode or transparent backend */
-	srv = objt_server(s->target);
-
-	/* Override reuse-mode if reverse-connect is used. */
-	if (srv && srv->flags & SRV_F_RHTTP)
-		reuse_mode = PR_O_REUSE_ALWS;
-
-	err = alloc_dst_address(&s->scb->dst, srv, s);
-	if (err != SRV_STATUS_OK)
-		return SF_ERR_INTERNAL;
-
-	err = alloc_bind_address(&bind_addr, srv, s->be, s);
-	if (err != SRV_STATUS_OK)
-		return SF_ERR_INTERNAL;
-
-	if (srv && srv->pool_conn_name_expr) {
-		name_smp = sample_fetch_as_type(s->be, s->sess, s,
-		                                SMP_OPT_DIR_REQ | SMP_OPT_FINAL,
-		                                srv->pool_conn_name_expr, SMP_T_STR);
-	}
-
-	/* disable reuse if websocket stream and the protocol to use is not the
-	 * same as the main protocol of the server.
-	 */
-	if (unlikely(s->flags & SF_WEBSOCKET) && srv) {
-		if (!srv_check_reuse_ws(srv)) {
-			DBG_TRACE_STATE("skip idle connections reuse: websocket stream", STRM_EV_STRM_PROC|STRM_EV_CS_ST, s);
-			goto skip_reuse;
-		}
-	}
+	/* Caller cannot set both <srv> and <strm> to NULL. */
+	BUG_ON_HOT(!srv && !strm);
 
 	/* first, set unique connection parameters and then calculate hash */
 	memset(&hash_params, 0, sizeof(hash_params));
 
 	/* 1. target */
-	hash_params.target = s->target;
+	hash_params.target = srv ? &srv->obj_type : strm->target;
 
 	/* 2. pool-conn-name */
-	if (name_smp) {
+	if (istlen(name)) {
 		hash_params.name_prehash =
-		  conn_hash_prehash(name_smp->data.u.str.area,
-		                    name_smp->data.u.str.data);
+		  conn_hash_prehash(istptr(name), istlen(name));
 	}
 
 	/* 3. destination address */
-	if (srv && srv_is_transparent(srv))
-		hash_params.dst_addr = s->scb->dst;
+	hash_params.dst_addr = dst;
 
 	/* 4. source address */
-	hash_params.src_addr = bind_addr;
+	hash_params.src_addr = src;
 
 	/* 5. proxy protocol */
-	if (srv && (srv->pp_opts & SRV_PP_ENABLED)) {
-		proxy_line_ret = make_proxy_line(trash.area, trash.size, srv, cli_conn, s, strm_sess(s));
+	if (strm && srv && srv->pp_opts & SRV_PP_ENABLED) {
+		struct connection *cli_conn = objt_conn(strm_orig(strm));
+		int proxy_line_ret = make_proxy_line(trash.area, trash.size,
+		                                     srv, cli_conn, strm, sess);
 		if (proxy_line_ret) {
 			hash_params.proxy_prehash =
 			  conn_hash_prehash(trash.area, proxy_line_ret);
@@ -1607,7 +1602,7 @@ int connect_server(struct stream *s)
 	}
 
 	/* 6. Custom mark, tos? */
-	if (s->flags & (SF_BC_MARK | SF_BC_TOS)) {
+	if (strm && (strm->flags & (SF_BC_MARK | SF_BC_TOS))) {
 		/* mark: 32bits, tos: 8bits = 40bits
 		 * last 2 bits are there to indicate if mark and/or tos are set
 		 * total: 42bits:
@@ -1624,28 +1619,49 @@ int connect_server(struct stream *s)
 		 *  - mark is set, mark = 3
 		 *  - tos is set, tos = 7
 		 */
-		if (s->flags & SF_BC_MARK) {
-			hash_params.mark_tos_prehash |= s->bc_mark;
+		if (strm->flags & SF_BC_MARK) {
+			hash_params.mark_tos_prehash |= strm->bc_mark;
 			/* 41th bit: mark set */
 			hash_params.mark_tos_prehash |= 1ULL << 40;
 		}
-		if (s->flags & SF_BC_TOS) {
-			hash_params.mark_tos_prehash |= (uint64_t)s->bc_tos << 32;
+		if (strm->flags & SF_BC_TOS) {
+			hash_params.mark_tos_prehash |= (uint64_t)strm->bc_tos << 32;
 			/* 42th bit: tos set */
 			hash_params.mark_tos_prehash |= 1ULL << 41;
 		}
 	}
 
-	hash = conn_calculate_hash(&hash_params);
+	return conn_calculate_hash(&hash_params);
+}
+
+/* Try to reuse a connection, first from <sess> session, then to <srv> server
+ * lists if not NULL, matching <hash> value and <be> reuse policy. If reuse is
+ * on <be> proxy successful, connection is attached to <sc> stconn instance.
+ *
+ * <target> must point either to the server instance, or a stream target on
+ * dispatch/transparent proxy.
+ *
+ * <not_first_req> must be set if the underlying request is not the first one
+ * conducted on <sess> session. This allows to use a connection not yet
+ * labelled as safe under http-reuse safe policy.
+ *
+ * Returns SF_ERR_NONE if a connection has been reused. The connection instance
+ * can be retrieve via <sc> stconn. SF_ERR_RESOURCE is returned if no matching
+ * connection found. SF_ERR_INTERNAL is used on internal error.
+ */
+int be_reuse_connection(int64_t hash, struct session *sess,
+                        struct proxy *be, struct server *srv,
+                        struct stconn *sc, enum obj_type *target, int not_first_req)
+{
+	struct connection *srv_conn;
+	const int reuse_mode = be_reuse_mode(be, srv);
 
 	/* first, search for a matching connection in the session's idle conns */
-	srv_conn = session_get_conn(s->sess, s->target, hash);
+	srv_conn = session_get_conn(sess, target, hash);
 	if (srv_conn) {
-		DBG_TRACE_STATE("reuse connection from session", STRM_EV_STRM_PROC|STRM_EV_CS_ST, s);
-		reuse = 1;
+		//DBG_TRACE_STATE("reuse connection from session", STRM_EV_STRM_PROC|STRM_EV_CS_ST, strm);
 	}
-
-	if (srv && !reuse && reuse_mode != PR_O_REUSE_NEVR) {
+	else if (srv && reuse_mode != PR_O_REUSE_NEVR) {
 		/* Below we pick connections from the safe, idle  or
 		 * available (which are safe too) lists based
 		 * on the strategy, the fact that this is a first or second
@@ -1669,59 +1685,151 @@ int connect_server(struct stream *s)
 			if (srv_conn) {
 				/* connection cannot be in idle list if used as an avail idle conn. */
 				BUG_ON(LIST_INLIST(&srv_conn->idle_list));
-
-				DBG_TRACE_STATE("reuse connection from avail", STRM_EV_STRM_PROC|STRM_EV_CS_ST, s);
-				reuse = 1;
+				//DBG_TRACE_STATE("reuse connection from avail", STRM_EV_STRM_PROC|STRM_EV_CS_ST, strm);
 			}
 		}
 
 		/* if no available connections found, search for an idle/safe */
 		if (!srv_conn && srv->max_idle_conns && srv->curr_idle_conns > 0) {
-			const int not_first_req = s->txn && s->txn->flags & TX_NOT_FIRST;
 			const int idle = srv->curr_idle_nb > 0;
 			const int safe = srv->curr_safe_nb > 0;
-			const int retry_safe = (s->be->retry_type & (PR_RE_CONN_FAILED | PR_RE_DISCONNECTED | PR_RE_TIMEOUT)) ==
-			                                            (PR_RE_CONN_FAILED | PR_RE_DISCONNECTED | PR_RE_TIMEOUT);
+			const int retry_safe = (be->retry_type & (PR_RE_CONN_FAILED | PR_RE_DISCONNECTED | PR_RE_TIMEOUT)) ==
+			                                         (PR_RE_CONN_FAILED | PR_RE_DISCONNECTED | PR_RE_TIMEOUT);
 
-			/* second column of the tables above,
-			 * search for an idle then safe conn */
+			/* second column of the tables above, search for an idle then safe conn */
 			if (not_first_req || retry_safe) {
 				if (idle || safe)
-					srv_conn = conn_backend_get(s, srv, 0, hash);
+					srv_conn = conn_backend_get(reuse_mode, srv, sess, 0, hash);
 			}
 			/* first column of the tables above */
 			else if (reuse_mode >= PR_O_REUSE_AGGR) {
 				/* search for a safe conn */
 				if (safe)
-					srv_conn = conn_backend_get(s, srv, 1, hash);
+					srv_conn = conn_backend_get(reuse_mode, srv, sess, 1, hash);
 
-				/* search for an idle conn if no safe conn found
-				 * on always reuse mode */
+				/* search for an idle conn if no safe conn found on always reuse mode */
 				if (!srv_conn &&
 				    reuse_mode == PR_O_REUSE_ALWS && idle) {
-					/* TODO conn_backend_get should not check the
-					 * safe list is this case */
-					srv_conn = conn_backend_get(s, srv, 0, hash);
+					/* TODO conn_backend_get should not check the safe list is this case */
+					srv_conn = conn_backend_get(reuse_mode, srv, sess, 0, hash);
 				}
 			}
 
 			if (srv_conn) {
-				DBG_TRACE_STATE("reuse connection from idle/safe", STRM_EV_STRM_PROC|STRM_EV_CS_ST, s);
-				reuse = 1;
+				//DBG_TRACE_STATE("reuse connection from idle/safe", STRM_EV_STRM_PROC|STRM_EV_CS_ST, strm);
 			}
 		}
 	}
 
+	if (srv_conn) {
+		if (srv_conn->mux) {
+			int avail = srv_conn->mux->avail_streams(srv_conn);
 
-	/* here reuse might have been set above, indicating srv_conn finally
-	 * is OK.
+			if (avail <= 1) {
+				/* no more streams available, remove it from the list */
+				HA_SPIN_LOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
+				conn_delete_from_tree(srv_conn);
+				HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
+			}
+
+			if (avail >= 1) {
+				if (srv_conn->mux->attach(srv_conn, sc->sedesc, sess) == -1) {
+					if (sc_reset_endp(sc) < 0)
+						goto err;
+					sc_ep_clr(sc, ~SE_FL_DETACHED);
+				}
+			}
+			else {
+				/* TODO cannot reuse conn finally due to no more avail
+				 * streams. May be possible to lookup for a new conn
+				 * to improve reuse rate, with a max retry limit.
+				 */
+				srv_conn = NULL;
+			}
+		}
+	}
+
+	return srv_conn ? SF_ERR_NONE : SF_ERR_RESOURCE;
+
+ err:
+	return SF_ERR_INTERNAL;
+}
+
+/*
+ * This function initiates a connection to the server assigned to this stream
+ * (s->target, (s->scb)->addr.to). It will assign a server if none
+ * is assigned yet.
+ * It can return one of :
+ *  - SF_ERR_NONE if everything's OK
+ *  - SF_ERR_SRVTO if there are no more servers
+ *  - SF_ERR_SRVCL if the connection was refused by the server
+ *  - SF_ERR_PRXCOND if the connection has been limited by the proxy (maxconn)
+ *  - SF_ERR_RESOURCE if a system resource is lacking (eg: fd limits, ports, ...)
+ *  - SF_ERR_INTERNAL for any other purely internal errors
+ * Additionally, in the case of SF_ERR_RESOURCE, an emergency log will be emitted.
+ * The server-facing stream connector is expected to hold a pre-allocated connection.
+ */
+int connect_server(struct stream *s)
+{
+	struct connection *cli_conn = objt_conn(strm_orig(s));
+	struct connection *srv_conn = NULL;
+	struct server *srv;
+	int reuse_mode;
+	int reuse __maybe_unused = 0;
+	int init_mux = 0;
+	int err;
+	struct sockaddr_storage *bind_addr = NULL;
+	int64_t hash = 0;
+
+	/* in standard configuration, srv will be valid
+	 * it can be NULL for dispatch mode or transparent backend */
+	srv = objt_server(s->target);
+	reuse_mode = be_reuse_mode(s->be, srv);
+
+	err = alloc_dst_address(&s->scb->dst, srv, s);
+	if (err != SRV_STATUS_OK)
+		return SF_ERR_INTERNAL;
+
+	err = alloc_bind_address(&bind_addr, srv, s->be, s);
+	if (err != SRV_STATUS_OK)
+		return SF_ERR_INTERNAL;
+
+	/* disable reuse if websocket stream and the protocol to use is not the
+	 * same as the main protocol of the server.
 	 */
+	if (unlikely(s->flags & SF_WEBSOCKET) && srv && !srv_check_reuse_ws(srv)) {
+		DBG_TRACE_STATE("skip idle connections reuse: websocket stream", STRM_EV_STRM_PROC|STRM_EV_CS_ST, s);
+	}
+	else {
+		const int not_first_req = s->txn && s->txn->flags & TX_NOT_FIRST;
+		struct ist name = IST_NULL;
+		struct sample *name_smp;
+
+		if (srv && srv->pool_conn_name_expr) {
+			name_smp = sample_fetch_as_type(s->be, s->sess, s,
+			                                SMP_OPT_DIR_REQ | SMP_OPT_FINAL,
+			                                srv->pool_conn_name_expr, SMP_T_STR);
+			if (name_smp) {
+				name = ist2(name_smp->data.u.str.area,
+				            name_smp->data.u.str.data);
+			}
+		}
+
+		hash = be_calculate_conn_hash(srv, s, s->sess, bind_addr, s->scb->dst, name);
+		err = be_reuse_connection(hash, s->sess, s->be, srv, s->scb,
+		                          s->target, not_first_req);
+		if (err == SF_ERR_INTERNAL)
+			return err;
+
+		if (err == SF_ERR_NONE) {
+			srv_conn = sc_conn(s->scb);
+			reuse = 1;
+		}
+	}
 
 	if (ha_used_fds > global.tune.pool_high_count && srv) {
+		/* We have more FDs than deemed acceptable, attempt to kill an idling connection. */
 		struct connection *tokill_conn = NULL;
-		/* We can't reuse a connection, and e have more FDs than deemd
-		 * acceptable, attempt to kill an idling connection
-		 */
 		/* First, try from our own idle list */
 		HA_SPIN_LOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
 		if (!LIST_ISEMPTY(&srv->per_thr[tid].idle_conn_list)) {
@@ -1772,37 +1880,8 @@ int connect_server(struct stream *s)
 					break;
 			}
 		}
-
 	}
 
-	if (reuse) {
-		if (srv_conn->mux) {
-			int avail = srv_conn->mux->avail_streams(srv_conn);
-
-			if (avail <= 1) {
-				/* No more streams available, remove it from the list */
-				HA_SPIN_LOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
-				conn_delete_from_tree(srv_conn);
-				HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
-			}
-
-			if (avail >= 1) {
-				if (srv_conn->mux->attach(srv_conn, s->scb->sedesc, s->sess) == -1) {
-					srv_conn = NULL;
-					if (sc_reset_endp(s->scb) < 0)
-						return SF_ERR_INTERNAL;
-					sc_ep_clr(s->scb, ~SE_FL_DETACHED);
-				}
-			}
-			else
-				srv_conn = NULL;
-		}
-		/* otherwise srv_conn is left intact */
-	}
-	else
-		srv_conn = NULL;
-
-skip_reuse:
 	/* no reuse or failed to reuse the connection above, pick a new one */
 	if (!srv_conn) {
 		unsigned int total_conns;
@@ -1863,6 +1942,9 @@ skip_reuse:
 			srv_conn->src = bind_addr;
 			bind_addr = NULL;
 
+			/* copy the target address into the connection */
+			*srv_conn->dst = *s->scb->dst;
+
 			/* mark? */
 			if (s->flags & SF_BC_MARK) {
 				srv_conn->mark = s->bc_mark;
@@ -1886,9 +1968,6 @@ skip_reuse:
 	/* srv_conn is still NULL only on allocation failure */
 	if (!srv_conn)
 		return SF_ERR_RESOURCE;
-
-	/* copy the target address into the connection */
-	*srv_conn->dst = *s->scb->dst;
 
 	/* Copy network namespace from client connection */
 	srv_conn->proxy_netns = cli_conn ? cli_conn->proxy_netns : NULL;

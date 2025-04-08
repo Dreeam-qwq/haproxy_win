@@ -102,7 +102,7 @@ struct pool_dump_info {
 /* context used by "show pools" */
 struct show_pools_ctx {
 	char *prefix;  /* if non-null, match this prefix name for the pool */
-	int by_what; /* 0=no sort, 1=by name, 2=by item size, 3=by total alloc */
+	int how;     /* bits 0..3: 0=no sort, 1=by name, 2=by item size, 3=by total alloc */
 	int maxcnt;  /* 0=no limit, other=max number of output entries */
 };
 
@@ -293,11 +293,23 @@ static int mem_should_fail(const struct pool_head *pool)
 struct pool_head *create_pool(char *name, unsigned int size, unsigned int flags)
 {
 	unsigned int extra_mark, extra_caller, extra;
+	struct pool_registration *reg;
 	struct pool_head *pool;
 	struct pool_head *entry;
 	struct list *start;
 	unsigned int align;
+	unsigned int best_diff;
 	int thr __maybe_unused;
+
+	pool = NULL;
+	reg = calloc(1, sizeof(*reg));
+	if (!reg)
+		goto fail;
+
+	strlcpy2(reg->name, name, sizeof(reg->name));
+	reg->size = size;
+	reg->flags = flags;
+	reg->align = 0;
 
 	extra_mark = (pool_debugging & POOL_DBG_TAG) ? POOL_EXTRA_MARK : 0;
 	extra_caller = (pool_debugging & POOL_DBG_CALLER) ? POOL_EXTRA_CALLER : 0;
@@ -327,10 +339,18 @@ struct pool_head *create_pool(char *name, unsigned int size, unsigned int flags)
 	/* TODO: thread: we do not lock pool list for now because all pools are
 	 * created during HAProxy startup (so before threads creation) */
 	start = &pools;
-	pool = NULL;
+	best_diff = ~0U;
 
 	list_for_each_entry(entry, &pools, list) {
-		if (entry->size == size) {
+		if (entry->size == size ||
+		    (!(flags & MEM_F_EXACT) && !pool_allocated(entry) &&
+		     /* size within 1% of avg size */
+		     (((ullong)entry->sum_size * 100ULL < (ullong)size * entry->users * 101ULL &&
+		       (ullong)entry->sum_size * 101ULL > (ullong)size * entry->users * 100ULL) ||
+		      /* or +/- 16 compared to the current avg size */
+		      (entry->sum_size - 16 * entry->users < size * entry->users &&
+		       entry->sum_size + 16 * entry->users > size * entry->users)))) {
+
 			/* either we can share this place and we take it, or
 			 * we look for a shareable one or for the next position
 			 * before which we will insert a new one.
@@ -339,15 +359,28 @@ struct pool_head *create_pool(char *name, unsigned int size, unsigned int flags)
 			    (!(pool_debugging & POOL_DBG_DONT_MERGE) ||
 			     strcmp(name, entry->name) == 0)) {
 				/* we can share this one */
-				pool = entry;
-				DPRINTF(stderr, "Sharing %s with %s\n", name, pool->name);
-				break;
+				uint diff = (abs((int)(size * entry->users - entry->size)) + entry->users / 2) / entry->users;
+
+				/* the principle here is:
+				 *   - if the best pool is smaller and the current
+				 *     candidate larger, we prefer the larger one
+				 *     so as not to grow an existing pool;
+				 *   - otherwise we go for the smallest distance
+				 *     from the existing one.
+				 */
+				if (!pool || entry->size == size ||
+				    (pool->size != size &&
+				     ((pool->size < size && entry->size >= size) ||
+				      (diff == best_diff && entry->size >= size) ||
+				      (diff < best_diff)))) {
+					best_diff = diff;
+					pool = entry;
+				}
 			}
 		}
 		else if (entry->size > size) {
 			/* insert before this one */
 			start = &entry->list;
-			break;
 		}
 	}
 
@@ -356,7 +389,7 @@ struct pool_head *create_pool(char *name, unsigned int size, unsigned int flags)
 
 		pool_addr = calloc(1, sizeof(*pool) + __alignof__(*pool));
 		if (!pool_addr)
-			return NULL;
+			goto fail;
 
 		/* always provide an aligned pool */
 		pool = (struct pool_head*)((((size_t)pool_addr) + __alignof__(*pool)) & -(size_t)__alignof__(*pool));
@@ -368,6 +401,7 @@ struct pool_head *create_pool(char *name, unsigned int size, unsigned int flags)
 		pool->size = size;
 		pool->flags = flags;
 		LIST_APPEND(start, &pool->list);
+		LIST_INIT(&pool->regs);
 
 		if (!(pool_debugging & POOL_DBG_NO_CACHE)) {
 			/* update per-thread pool cache if necessary */
@@ -378,8 +412,23 @@ struct pool_head *create_pool(char *name, unsigned int size, unsigned int flags)
 			}
 		}
 	}
+	else {
+		/* we found the best one */
+		if (size > pool->size) {
+			pool->size = size;
+			pool->alloc_sz = size + extra;
+		}
+		DPRINTF(stderr, "Sharing %s with %s\n", name, pool->name);
+	}
+
+	LIST_APPEND(&pool->regs, &reg->list);
 	pool->users++;
+	pool->sum_size += size;
+
 	return pool;
+ fail:
+	free(reg);
+	return NULL;
 }
 
 /* Tries to allocate an object for the pool <pool> using the system's allocator
@@ -942,7 +991,16 @@ void *pool_destroy(struct pool_head *pool)
 			return pool;
 		pool->users--;
 		if (!pool->users) {
+			/* remove all registrations at once */
+			struct pool_registration *reg, *back;
+
+			list_for_each_entry_safe(reg, back, &pool->regs, list) {
+				LIST_DELETE(&reg->list);
+				free(reg);
+			}
+
 			LIST_DELETE(&pool->list);
+
 			/* note that if used == 0, the cache is empty */
 			free(pool->base_addr);
 		}
@@ -1132,11 +1190,11 @@ static int cmp_dump_pools_usage(const void *a, const void *b)
 #define POOLS_MAX_DUMPED_ENTRIES 1024
 
 /* This function dumps memory usage information into the trash buffer.
- * It may sort by a criterion if <by_what> is non-zero, and limit the
- * number of output lines if <max> is non-zero. It may limit only to
- * pools whose names start with <pfx> if <pfx> is non-null.
+ * It may sort by a criterion if bits 0..3 of <how> are non-zero, and
+ * limit the number of output lines if <max> is non-zero. It may limit
+ * only to pools whose names start with <pfx> if <pfx> is non-null.
  */
-void dump_pools_to_trash(int by_what, int max, const char *pfx)
+void dump_pools_to_trash(int how, int max, const char *pfx)
 {
 	struct pool_dump_info pool_info[POOLS_MAX_DUMPED_ENTRIES];
 	struct pool_head *entry;
@@ -1145,6 +1203,8 @@ void dump_pools_to_trash(int by_what, int max, const char *pfx)
 	unsigned long long cached_bytes = 0;
 	uint cached = 0;
 	uint alloc_items;
+	int by_what = how & 0xF; // bits 0..3 = sorting criterion
+	int detailed = !!(how & 0x10); // print details
 
 	allocated = used = nbpools = 0;
 
@@ -1203,6 +1263,12 @@ void dump_pools_to_trash(int by_what, int max, const char *pfx)
 		cached_bytes += pool_info[i].cached_items * (ulong)pool_info[i].entry->size;
 		allocated    += pool_info[i].alloc_items  * (ulong)pool_info[i].entry->size;
 		used         += pool_info[i].used_items   * (ulong)pool_info[i].entry->size;
+
+		if (detailed) {
+			struct pool_registration *reg;
+			list_for_each_entry(reg, &pool_info[i].entry->regs, list)
+				chunk_appendf(&trash, "      >  %-12s: size=%u flags=%#x align=%u\n", reg->name, reg->size, reg->flags, reg->align);
+		}
 	}
 
 	chunk_appendf(&trash, "Total: %d pools, %llu bytes allocated, %llu used"
@@ -1363,13 +1429,16 @@ static int cli_parse_show_pools(char **args, char *payload, struct appctx *appct
 
 	for (arg = 2; *args[arg]; arg++) {
 		if (strcmp(args[arg], "byname") == 0) {
-			ctx->by_what = 1; // sort output by name
+			ctx->how = (ctx->how & ~0xF) | 1; // sort output by name
 		}
 		else if (strcmp(args[arg], "bysize") == 0) {
-			ctx->by_what = 2; // sort output by item size
+			ctx->how = (ctx->how & ~0xF) | 2; // sort output by item size
 		}
 		else if (strcmp(args[arg], "byusage") == 0) {
-			ctx->by_what = 3; // sort output by total allocated size
+			ctx->how = (ctx->how & ~0xF) | 3; // sort output by total allocated size
+		}
+		else if (strcmp(args[arg], "detailed") == 0) {
+			ctx->how |= 0x10;                 // print detailed registrations
 		}
 		else if (strcmp(args[arg], "match") == 0 && *args[arg+1]) {
 			ctx->prefix = strdup(args[arg+1]); // only pools starting with this
@@ -1381,7 +1450,7 @@ static int cli_parse_show_pools(char **args, char *payload, struct appctx *appct
 			ctx->maxcnt = atoi(args[arg]); // number of entries to dump
 		}
 		else
-			return cli_err(appctx, "Expects either 'byname', 'bysize', 'byusage', 'match <pfx>', or a max number of output lines.\n");
+			return cli_err(appctx, "Expects either 'byname', 'bysize', 'byusage', 'match <pfx>', 'detailed', or a max number of output lines.\n");
 	}
 	return 0;
 }
@@ -1402,7 +1471,7 @@ static int cli_io_handler_dump_pools(struct appctx *appctx)
 {
 	struct show_pools_ctx *ctx = appctx->svcctx;
 
-	dump_pools_to_trash(ctx->by_what, ctx->maxcnt, ctx->prefix);
+	dump_pools_to_trash(ctx->how, ctx->maxcnt, ctx->prefix);
 	if (applet_putchk(appctx, &trash) == -1)
 		return 0;
 	return 1;

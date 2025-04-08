@@ -60,6 +60,7 @@
 #include <haproxy/quic_token.h>
 #include <haproxy/quic_tp.h>
 #include <haproxy/quic_trace.h>
+#include <haproxy/quic_tune.h>
 #include <haproxy/quic_tx.h>
 #include <haproxy/cbuf.h>
 #include <haproxy/proto_quic.h>
@@ -829,9 +830,9 @@ struct task *quic_conn_io_cb(struct task *t, void *context, unsigned int state)
 		/* Note: if no token for address validation was received
 		 * for a 0RTT connection, some 0RTT packet could still be
 		 * waiting for HP removal AFTER the successful handshake completion.
-		 * Indeed a successful handshake completion implicitely valids
+		 * Indeed a successful handshake completion implicitly valids
 		 * the peer address. In this case, one wants to process
-		 * these ORTT packets AFTER the succesful handshake completion.
+		 * these ORTT packets AFTER the successful handshake completion.
 		 *
 		 * On the contrary, when a token for address validation was received,
 		 * release 0RTT packets still waiting for HP removal. These
@@ -1174,7 +1175,7 @@ struct quic_conn *qc_new_conn(const struct quic_version *qv, int ipv4,
 	conn_id->qc = qc;
 
 	if (HA_ATOMIC_LOAD(&l->rx.quic_mode) == QUIC_SOCK_MODE_CONN &&
-	    (global.tune.options & GTUNE_QUIC_SOCK_PER_CONN) &&
+	    (quic_tune.options & QUIC_TUNE_SOCK_PER_CONN) &&
 	    is_addr(local_addr)) {
 		TRACE_USER("Allocate a socket for QUIC connection", QUIC_EV_CONN_INIT, qc);
 		qc_alloc_fd(qc, local_addr, peer_addr);
@@ -1930,7 +1931,7 @@ void qc_bind_tid_commit(struct quic_conn *qc, struct listener *new_li)
 	conn_id = eb64_entry(node, struct quic_connection_id, seq_num);
 
 	/* Rebinding is considered done when CID points to the new
-	 * thread. quic-conn instance cannot be derefence after it.
+	 * thread. quic-conn instance cannot be dereferenced after it.
 	 */
 	HA_ATOMIC_STORE(&conn_id->tid, new_tid);
 	qc = NULL;

@@ -79,14 +79,12 @@
 #define GTUNE_DISABLE_H2_WEBSOCKET (1<<21)
 #define GTUNE_DISABLE_ACTIVE_CLOSE (1<<22)
 #define GTUNE_QUICK_EXIT         (1<<23)
-#define GTUNE_QUIC_SOCK_PER_CONN (1<<24)
+/* (1<<24) unused */
 #define GTUNE_NO_QUIC            (1<<25)
 #define GTUNE_USE_FAST_FWD       (1<<26)
 #define GTUNE_LISTENER_MQ_FAIR   (1<<27)
 #define GTUNE_LISTENER_MQ_OPT    (1<<28)
 #define GTUNE_LISTENER_MQ_ANY    (GTUNE_LISTENER_MQ_FAIR | GTUNE_LISTENER_MQ_OPT)
-#define GTUNE_QUIC_CC_HYSTART    (1<<29)
-#define GTUNE_QUIC_NO_UDP_GSO    (1<<30)
 
 /* subsystem-specific debugging options for tune.debug */
 #define GDBG_CPU_AFFINITY           (1U<< 0)
@@ -171,7 +169,7 @@ struct global {
 	unsigned char cluster_secret[16]; /* 128 bits of an SHA1 digest of a secret defined as ASCII string */
 	struct {
 		int maxpollevents; /* max number of poll events at once */
-		int max_rules_at_once; /* max number of rules excecuted in a single evaluation loop */
+		int max_rules_at_once; /* max number of rules executed in a single evaluation loop */
 		int maxaccept;     /* max number of consecutive accept() */
 		int options;       /* various tuning options */
 		uint debug;        /* various debugging options (GDBG_*) */
@@ -215,8 +213,10 @@ struct global {
 		unsigned int quic_backend_max_idle_timeout;
 		unsigned int quic_frontend_max_idle_timeout;
 		unsigned int quic_frontend_glitches_threshold;
+		unsigned int quic_frontend_max_data;
 		unsigned int quic_frontend_max_streams_bidi;
 		size_t quic_frontend_max_window_size;
+		unsigned int quic_frontend_stream_data_ratio;
 		unsigned int quic_retry_threshold;
 		unsigned int quic_reorder_ratio;
 		unsigned int quic_max_frame_loss;

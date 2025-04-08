@@ -39,7 +39,7 @@ struct stconn;
  * the the number of entries in "enum stat_idx_px" and "enum stat_idx_info"
  */
 extern const struct stat_col stat_cols_px[];
-extern const struct name_desc stat_cols_info[];
+extern const struct stat_col stat_cols_info[];
 extern const char *stat_status_codes[];
 extern struct applet http_stats_applet;
 extern struct list stats_module_list[];
@@ -79,7 +79,7 @@ int stats_emit_field_tags(struct buffer *out, const struct field *f,
 /* Returns true if <col> is fully defined, false if only used as name-desc. */
 static inline int stcol_is_generic(const struct stat_col *col)
 {
-	return !!(col->cap);
+	return col->generic;
 }
 
 static inline enum field_format stcol_format(const struct stat_col *col)

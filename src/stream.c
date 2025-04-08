@@ -81,8 +81,8 @@ static void strm_trace(enum trace_level level, uint64_t mask,
 /* The event representation is split like this :
  *   strm  - stream
  *   sc    - stream connector
- *   http  - http analyzis
- *   tcp   - tcp analyzis
+ *   http  - http analysis
+ *   tcp   - tcp analysis
  *
  * STRM_EV_* macros are defined in <proto/stream.h>
  */
@@ -96,13 +96,13 @@ static const struct trace_event strm_trace_events[] = {
 	{ .mask = STRM_EV_CS_ST,        .name = "sc_state",     .desc = "processing connector states" },
 
 	{ .mask = STRM_EV_HTTP_ANA,     .name = "http_ana",     .desc = "HTTP analyzers" },
-	{ .mask = STRM_EV_HTTP_ERR,     .name = "http_err",     .desc = "error during HTTP analyzis" },
+	{ .mask = STRM_EV_HTTP_ERR,     .name = "http_err",     .desc = "error during HTTP analysis" },
 
 	{ .mask = STRM_EV_TCP_ANA,      .name = "tcp_ana",      .desc = "TCP analyzers" },
-	{ .mask = STRM_EV_TCP_ERR,      .name = "tcp_err",      .desc = "error during TCP analyzis" },
+	{ .mask = STRM_EV_TCP_ERR,      .name = "tcp_err",      .desc = "error during TCP analysis" },
 
 	{ .mask = STRM_EV_FLT_ANA,      .name = "flt_ana",      .desc = "Filter analyzers" },
-	{ .mask = STRM_EV_FLT_ERR,      .name = "flt_err",      .desc = "error during filter analyzis" },
+	{ .mask = STRM_EV_FLT_ERR,      .name = "flt_err",      .desc = "error during filter analysis" },
 	{}
 };
 
@@ -1148,7 +1148,7 @@ static int process_switching_rules(struct stream *s, struct channel *req, int an
 
 	}
 
-	/* Se the max connection retries for the stream. may be overwriten later */
+	/* Se the max connection retries for the stream. may be overwritten later */
 	s->max_retries = s->be->conn_retries;
 
 	/* we don't want to run the TCP or HTTP filters again if the backend has not changed */
@@ -1752,10 +1752,32 @@ struct task *process_stream(struct task *t, void *context, unsigned int state)
 	struct stconn *scf, *scb;
 	unsigned int rate;
 
-	DBG_TRACE_ENTER(STRM_EV_STRM_PROC, s);
-
 	activity[tid].stream_calls++;
 	stream_cond_update_cpu_latency(s);
+
+	req = &s->req;
+	res = &s->res;
+
+	scf = s->scf;
+	scb = s->scb;
+
+	DBG_TRACE_ENTER(STRM_EV_STRM_PROC, s);
+
+	/* This flag must explicitly be set every time */
+	req->flags &= ~CF_WAKE_WRITE;
+	res->flags &= ~CF_WAKE_WRITE;
+
+	/* Keep a copy of req/rep flags so that we can detect shutdowns */
+	rqf_last = req->flags & ~CF_MASK_ANALYSER;
+	rpf_last = res->flags & ~CF_MASK_ANALYSER;
+
+	/* we don't want the stream connector functions to recursively wake us up */
+	scf->flags |= SC_FL_DONT_WAKE;
+	scb->flags |= SC_FL_DONT_WAKE;
+
+	/* Keep a copy of SC flags */
+	scf_flags = scf->flags;
+	scb_flags = scb->flags;
 
 	/* update pending events */
 	s->pending_events |= stream_map_task_state(state);
@@ -1767,12 +1789,6 @@ struct task *process_stream(struct task *t, void *context, unsigned int state)
 					 (s->pending_events & STRM_EVT_SHUT_SRV_UP) ? SF_ERR_UP:
 					 SF_ERR_KILLED));
 	}
-
-	req = &s->req;
-	res = &s->res;
-
-	scf = s->scf;
-	scb = s->scb;
 
 	/* First, attempt to receive pending data from I/O layers */
 	sc_sync_recv(scf);
@@ -1791,22 +1807,6 @@ struct task *process_stream(struct task *t, void *context, unsigned int state)
 	/* this data may be no longer valid, clear it */
 	if (s->txn)
 		memset(&s->txn->auth, 0, sizeof(s->txn->auth));
-
-	/* This flag must explicitly be set every time */
-	req->flags &= ~CF_WAKE_WRITE;
-	res->flags &= ~CF_WAKE_WRITE;
-
-	/* Keep a copy of req/rep flags so that we can detect shutdowns */
-	rqf_last = req->flags & ~CF_MASK_ANALYSER;
-	rpf_last = res->flags & ~CF_MASK_ANALYSER;
-
-	/* we don't want the stream connector functions to recursively wake us up */
-	scf->flags |= SC_FL_DONT_WAKE;
-	scb->flags |= SC_FL_DONT_WAKE;
-
-	/* Keep a copy of SC flags */
-	scf_flags = scf->flags;
-	scb_flags = scb->flags;
 
 	/* 1a: Check for low level timeouts if needed. We just set a flag on
 	 * stream connectors when their timeouts have expired.
@@ -2767,7 +2767,7 @@ void sess_change_server(struct stream *strm, struct server *newsrv)
 		 * and that removal will be done under isolation anyway. Thus by
 		 * decrementing served after detaching from the list, we're
 		 * guaranteeing that served==0 implies that no stream is in the
-		 * list anymore, which is a sufficient guarantee for tha goal.
+		 * list anymore, which is a sufficient guarantee for that goal.
 		 */
 		_HA_ATOMIC_DEC(&oldsrv->proxy->served);
 		stream_del_srv_conn(strm);
@@ -2845,11 +2845,28 @@ void stream_shutdown_self(struct stream *stream, int why)
 	if (stream->scb->flags & (SC_FL_SHUT_DONE|SC_FL_SHUT_WANTED))
 		return;
 
-	sc_schedule_shutdown(stream->scb);
-	sc_schedule_abort(stream->scb);
 	stream->task->nice = 1024;
 	if (!(stream->flags & SF_ERR_MASK))
 		stream->flags |= why;
+
+	if (objt_server(stream->target)) {
+		if (stream->flags & SF_CURR_SESS) {
+			stream->flags &= ~SF_CURR_SESS;
+			_HA_ATOMIC_DEC(&__objt_server(stream->target)->cur_sess);
+		}
+
+		sess_change_server(stream, NULL);
+		if (may_dequeue_tasks(objt_server(stream->target), stream->be))
+			process_srv_queue(objt_server(stream->target));
+	}
+
+	/* shutw is enough to stop a connecting socket */
+	stream->scb->flags |= SC_FL_ERROR | SC_FL_NOLINGER;
+	sc_shutdown(stream->scb);
+
+	stream->scb->state = SC_ST_CLO;
+	if (stream->srv_error)
+		stream->srv_error(stream, stream->scb);
 }
 
 /* dumps an error message for type <type> at ptr <ptr> related to stream <s>,
@@ -3699,7 +3716,7 @@ static void __strm_dump_to_buffer(struct buffer *buf, const struct show_sess_ctx
 	}
 }
 
-/* Context-less function to append a complet dump of a stream state onto the
+/* Context-less function to append a complete dump of a stream state onto the
  * buffer. It relies on __strm_dump_to_buffer.
  */
 void strm_dump_to_buffer(struct buffer *buf, const struct stream *strm, const char *pfx, uint32_t anon_key)

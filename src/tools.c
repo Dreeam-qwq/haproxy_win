@@ -65,6 +65,7 @@ extern void *__elf_aux_vector;
 #include <haproxy/api.h>
 #include <haproxy/applet.h>
 #include <haproxy/chunk.h>
+#include <haproxy/compiler.h>
 #include <haproxy/dgram.h>
 #include <haproxy/global.h>
 #include <haproxy/hlua.h>
@@ -2038,7 +2039,7 @@ int addr_is_local(const struct netns_entry *ns,
  *
  * Return the address of the \0 character, or NULL on error
  */
-const char hextab[16] = "0123456789ABCDEF";
+const char hextab[16] __nonstring = "0123456789ABCDEF";
 char *encode_string(char *start, char *stop,
 		    const char escape, const long *map,
 		    const char *string)
@@ -5575,7 +5576,7 @@ const void *resolve_sym_name(struct buffer *buf, const char *pfx, const void *ad
 		}
 	}
 
-	/* if that's an exact match, no need to call dl_addr. This happends
+	/* if that's an exact match, no need to call dl_addr. This happens
 	 * when showing callback pointers for example, but not in backtraces.
 	 */
 	if (!best_dist)
@@ -7105,7 +7106,7 @@ int clean_env(void)
 /* Restores **environ from backup created by backup_env(). Must be always
  * preceded by clean_env() in order to properly restore the process environment.
  * global init_env ptr array must be freed by the upper layers.
- * Returns 0 on sucess and -1 in case if the process has run out of memory. If
+ * Returns 0 on success and -1 in case if the process has run out of memory. If
  * setenv() fails with EINVAL or the parsed string doesn't contain '=' (the
  * latter is mandatory format for strings kept in **environ), emits warning and
  * continues. This allows to terminate the process at the startup stage, if it
@@ -7213,6 +7214,32 @@ void free_all_file_names()
 	}
 
 	HA_RWLOCK_WRUNLOCK(OTHER_LOCK, &file_names.lock);
+}
+
+
+/*
+ * Fill a <dst> buffer with a path. <*dst> must be at least of size PATH_MAX.
+ * If a <base> is specified and the path does not start with "/", concatenate <base>/<path>
+ *
+ */
+int path_base(const char *path, const char *base, char *dst, char **err)
+{
+	int err_code = 0;
+	int rv = 0;
+
+	if (base && *base && *path != '/')
+		rv = snprintf(dst, PATH_MAX, "%s/%s", base, path);
+	else
+		rv = snprintf(dst, PATH_MAX, "%s", path);
+
+	if (rv >= PATH_MAX) {
+		memprintf(err, "'%s/%s' : path too long", base, path);
+		err_code |= ERR_ALERT | ERR_FATAL;
+		goto out;
+	}
+
+out:
+	return err_code;
 }
 
 /*

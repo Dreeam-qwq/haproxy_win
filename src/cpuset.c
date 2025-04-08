@@ -134,6 +134,20 @@ void ha_cpuset_assign(struct hap_cpuset *dst, struct hap_cpuset *src)
 #endif
 }
 
+/* returns true if the sets are equal */
+int ha_cpuset_isequal(const struct hap_cpuset *dst, const struct hap_cpuset *src)
+{
+#if defined(CPUSET_USE_CPUSET)
+	return CPU_EQUAL(&dst->cpuset, &src->cpuset);
+
+#elif defined(CPUSET_USE_FREEBSD_CPUSET)
+	return !CPU_CMP(&src->cpuset, &dst->cpuset);
+
+#elif defined(CPUSET_USE_ULONG)
+	return dst->cpuset == src->cpuset;
+#endif
+}
+
 int ha_cpuset_size()
 {
 #if defined(CPUSET_USE_CPUSET) || defined(CPUSET_USE_FREEBSD_CPUSET)
@@ -197,6 +211,60 @@ int parse_cpu_set(const char **args, struct hap_cpuset *cpu_set, char **err)
 		arg = comma ? comma + 1 : args[++cur_arg];
 	}
 	return 0;
+}
+
+/* Print a cpu-set as compactly as possible and returns the output length.
+ * Returns >size if it cannot emit anything due to length constraints, in which
+ * case it will match what is at least needed to go further, and may return 0
+ * for an empty set. It will emit series of comma-delimited ranges in the form
+ * "beg[-end]".
+ */
+int print_cpu_set(char *output, size_t size, const struct hap_cpuset *cpu_set)
+{
+	struct hap_cpuset set = *cpu_set;
+	int cpus = ha_cpuset_size();
+	int first = -1;
+	int len = 0;
+	int cpu;
+
+	for (cpu = 0; cpu < cpus; cpu++) {
+		if (!ha_cpuset_isset(&set, cpu))
+			continue;
+
+		ha_cpuset_clr(&set, cpu);
+
+		/* check if first of a series*/
+		if (first < 0) {
+			first = cpu;
+			len += snprintf(output + len, size - len, "%d", cpu);
+			if (len >= size)
+				return len + 1;
+
+			/* check if belongs to a range */
+			if (cpu < cpus - 1 && ha_cpuset_isset(&set, cpu + 1)) {
+				if (len + 1 >= size)
+					return len + 2;
+				output[len++] = '-';
+				output[len] = 0;
+			} else
+				first = -1;
+		}
+		else if (cpu >= cpus - 1 || !ha_cpuset_isset(&set, cpu + 1)) {
+			/* end of a series and not first */
+			len += snprintf(output + len, size - len, "%d", cpu);
+			if (len >= size)
+				return len + 1;
+			first = -1;
+		}
+
+		if (first < 0 && ha_cpuset_count(&set) > 0) {
+			if (len + 1 >= size)
+				return len + 2;
+			output[len++] = ',';
+			output[len] = 0;
+		}
+	}
+	return len;
 }
 
 /* Parse a linux cpu map string representing to a numeric cpu mask map

@@ -2884,7 +2884,7 @@ show errors [<iid>|<proxy>] [request|response]
     error was at byte 23. This is the slash ('/') in header name
     "header/bizarre", which is not a valid HTTP character for a header name.
 
-show events [<sink>] [-w] [-n]
+show events [<sink>] [-w] [-n] [-0]
   With no option, this lists all known event sinks and their types. With an
   option, it will dump all available events in the designated sink if it is of
   type buffer. If option "-w" is passed after the sink name, then once the end
@@ -2893,7 +2893,9 @@ show events [<sink>] [-w] [-n]
   be discarded) or by closing the session. Finally, option "-n" is used to
   directly seek to the end of the buffer, which is often convenient when
   combined with "-w" to only report new events. For convenience, "-wn" or "-nw"
-  may be used to enable both options at once.
+  may be used to enable both options at once. By default, all events are
+  delimited by a line feed character ('\n' or 10 or 0x0A). It is possible to
+  change this to the NUL character ('\0' or 0) by passing the "-0" argument.
 
 show fd [-!plcfbsd]* [<fd>]
   Dump the list of either all open file descriptors or just the one number <fd>
@@ -3125,7 +3127,7 @@ show peers [dict|-] [<peers section>]
             table:0x55871b5b46a0 id=stkt update=1 localupdate=0 \
               commitupdate=0 syncing=0
 
-show pools [byname|bysize|byusage] [match <pfx>] [<nb>]
+show pools [byname|bysize|byusage] [detailed] [match <pfx>] [<nb>]
   Dump the status of internal memory pools. This is useful to track memory
   usage when suspecting a memory leak for example. It does exactly the same
   as the SIGQUIT when running in foreground except that it does not flush the
@@ -3133,10 +3135,12 @@ show pools [byname|bysize|byusage] [match <pfx>] [<nb>]
   sorted by pool name; if "bysize" is specified, it is sorted by item size in
   reverse order; if "byusage" is specified, it is sorted by total usage in
   reverse order, and only used entries are shown. It is also possible to limit
-  the output to the <nb> first entries (e.g. when sorting by usage). Finally,
-  if "match" followed by a prefix is specified, then only pools whose name
-  starts with this prefix will be shown. The reported total only concerns pools
-  matching the filtering criteria. Example:
+  the output to the <nb> first entries (e.g. when sorting by usage). It is
+  possible to also dump more internal details, including the list of all pools
+  that were merged together, by specifying "detailed". Finally, if "match"
+  followed by a prefix is specified, then only pools whose name starts with
+  this prefix will be shown. The reported total only concerns pools matching
+  the filtering criteria. Example:
 
     $ socat - /tmp/haproxy.sock <<< "show pools match quic byusage"
     Dumping pools usage. Use SIGQUIT to flush them.
@@ -3337,7 +3341,7 @@ show sess [<options>*]
   output reports less entries than really exist because it will dump all
   existing streams up to the last one that was created before the command was
   entered; those which die in the mean time will not appear.
-  For supported opitons, see below.
+  For supported options, see below.
 
 show sess [<id> | all | help] [<options>*]
   Display a lot of internal information about the matching streams. The command
@@ -3805,7 +3809,7 @@ show ssl sni [-f <frontend>] [-A]
 
   The 'SNI' column shows the SNI, it can be either a CN, a SAN or a filter from a crt-list.
   The default certificates of a bind line, (which are either declared
-  explicitely by 'default-crt' or is implicitely the first certificate of a bind
+  explicitly by 'default-crt' or is implicitly the first certificate of a bind
   line when no 'strict-sni' is used) shows the '*' character in the SNI column.
 
   The 'Negative Filter' column is the list of negative filters associated to a

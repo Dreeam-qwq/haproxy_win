@@ -951,7 +951,7 @@ h2c_is_dead(const struct h2c *h2c)
  * a bit complex due to some API limits for now. The rules are the following :
  *   - if an error or a shutdown was detected on the connection, we must not
  *     attempt to receive
- *   - if we're subscribed for receving, no need to try again
+ *   - if we're subscribed for receiving, no need to try again
  *   - if the demux buf failed to be allocated, we must not try to receive and
  *     we know there is nothing pending (we'll be woken up once allocated)
  *   - if the demux buf is full, we will not be able to receive.
@@ -5540,8 +5540,11 @@ static void h2_do_shutr(struct h2s *h2s, struct se_abort_info *reason)
 		 * stream anymore. This may happen when the server responds
 		 * before the end of an upload and closes quickly (redirect,
 		 * deny, ...)
+		 *
+		 * RFC9113#8.1: Use NO_ERROR code after a complete response was
+		 *              sent (So frontend side and ES sent)
 		 */
-		h2s_error(h2s, H2_ERR_CANCEL);
+		h2s_error(h2s, (!(h2c->flags & H2_CF_IS_BACK) && (h2s->flags & H2_SF_ES_SENT)) ? H2_ERR_NO_ERROR : H2_ERR_CANCEL);
 	}
 
 	if (!(h2s->flags & H2_SF_RST_SENT) &&
@@ -5831,7 +5834,7 @@ next_frame:
 		if ((unsigned)hdr.len > (unsigned)global.tune.bufsize) {
 			/* RFC7540#4.2: invalid frame length */
 			h2c_report_glitch(h2c, 1, "too large CONTINUATION frame");
-			TRACE_STATE("too large CONTIUATION frame", H2_EV_RX_FRAME|H2_EV_RX_FHDR|H2_EV_RX_HDR|H2_EV_RX_CONT|H2_EV_H2C_ERR|H2_EV_PROTO_ERR, h2c->conn);
+			TRACE_STATE("too large CONTINUATION frame", H2_EV_RX_FRAME|H2_EV_RX_FHDR|H2_EV_RX_HDR|H2_EV_RX_CONT|H2_EV_H2C_ERR|H2_EV_PROTO_ERR, h2c->conn);
 			h2c_error(h2c, H2_ERR_FRAME_SIZE_ERROR);
 			goto fail;
 		}

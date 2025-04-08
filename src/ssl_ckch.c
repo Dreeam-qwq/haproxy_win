@@ -1604,7 +1604,7 @@ static void cli_release_show_sni(struct appctx *appctx)
 /* IO handler of "show ssl sni [<frontend>]".
  * It makes use of a show_sni_ctx context
  *
- * The fonction does loop over the frontend, the bind_conf and the sni_ctx.
+ * The function does loop over the frontend, the bind_conf and the sni_ctx.
  */
 static int cli_io_handler_show_sni(struct appctx *appctx)
 {
@@ -1652,7 +1652,7 @@ static int cli_io_handler_show_sni(struct appctx *appctx)
 					else
 						n = ebmb_first(&bind->sni_w_ctx);
 				}
-				/* emty SNI tree, skip */
+				/* empty SNI tree, skip */
 				if (!n)
 					continue;
 
@@ -4536,20 +4536,28 @@ static char *current_crtbase = NULL;
 static char *current_keybase = NULL;
 static int crtstore_load = 0; /* did we already load in this crt-store */
 
+/* declare the ckch_conf_load_* wrapper functions */
+DECLARE_CKCH_CONF_LOAD(pem,           current_crtbase, ssl_sock_load_pem_into_ckch);
+DECLARE_CKCH_CONF_LOAD(key,           current_keybase, ssl_sock_load_key_into_ckch);
+DECLARE_CKCH_CONF_LOAD(ocsp_response, current_crtbase, ssl_sock_load_ocsp_response_from_file);
+DECLARE_CKCH_CONF_LOAD(ocsp_issuer,   current_crtbase, ssl_sock_load_issuer_file_into_ckch);
+DECLARE_CKCH_CONF_LOAD(sctl,          current_crtbase, ssl_sock_load_sctl_from_file);
+
 struct ckch_conf_kws ckch_conf_kws[] = {
-	{ "alias",                               -1,                 PARSE_TYPE_NONE, NULL,                                  NULL },
-	{ "crt",    offsetof(struct ckch_conf, crt),    PARSE_TYPE_STR, ckch_conf_load_pem,           &current_crtbase },
-	{ "key",    offsetof(struct ckch_conf, key),    PARSE_TYPE_STR, ckch_conf_load_key,           &current_keybase },
+	{ "alias",        -1,                                           PARSE_TYPE_NONE,  NULL,                           },
+	{ "crt",          offsetof(struct ckch_conf, crt),              PARSE_TYPE_STR,   ckch_conf_load_pem,             },
+	{ "key",          offsetof(struct ckch_conf, key),              PARSE_TYPE_STR,   ckch_conf_load_key,             },
 #ifdef HAVE_SSL_OCSP
-	{ "ocsp",   offsetof(struct ckch_conf, ocsp),   PARSE_TYPE_STR, ckch_conf_load_ocsp_response, &current_crtbase },
+	{ "ocsp",         offsetof(struct ckch_conf, ocsp),             PARSE_TYPE_STR,   ckch_conf_load_ocsp_response,   },
 #endif
-	{ "issuer", offsetof(struct ckch_conf, issuer), PARSE_TYPE_STR, ckch_conf_load_ocsp_issuer,   &current_crtbase },
-	{ "sctl",   offsetof(struct ckch_conf, sctl),   PARSE_TYPE_STR, ckch_conf_load_sctl,          &current_crtbase },
+	{ "issuer",       offsetof(struct ckch_conf, issuer),           PARSE_TYPE_STR,   ckch_conf_load_ocsp_issuer,     },
+	{ "sctl",         offsetof(struct ckch_conf, sctl),             PARSE_TYPE_STR,   ckch_conf_load_sctl,            },
 #if defined(HAVE_SSL_OCSP)
-	{ "ocsp-update", offsetof(struct ckch_conf, ocsp_update_mode), PARSE_TYPE_ONOFF, ocsp_update_init, NULL   },
+	{ "ocsp-update",  offsetof(struct ckch_conf, ocsp_update_mode), PARSE_TYPE_ONOFF, ocsp_update_init,               },
 #endif
-	{ NULL,     -1,                                  PARSE_TYPE_STR, NULL,                                  NULL            }
+	{ NULL,          -1,                                            PARSE_TYPE_STR,   NULL,                           }
 };
+
 
 /* crt-store does not try to find files, but use the stored filename */
 int ckch_store_load_files(struct ckch_conf *f, struct ckch_store *c, int cli, char **err)
@@ -4574,28 +4582,15 @@ int ckch_store_load_files(struct ckch_conf *f, struct ckch_store *c, int cli, ch
 			case PARSE_TYPE_STR:
 			{
 				char *v;
-				char *path;
-				char **base = ckch_conf_kws[i].base;
-				char path_base[PATH_MAX];
 
 				v = *(char **)src;
 				if (!v)
 					goto next;
 
-				path = v;
-				if (base && *base && *path != '/') {
-					int rv = snprintf(path_base, sizeof(path_base), "%s/%s", *base, path);
-					if (rv >= sizeof(path_base)) {
-						memprintf(err, "'%s/%s' : path too long", *base, path);
-						err_code |= ERR_ALERT | ERR_FATAL;
-						goto out;
-					}
-					path = path_base;
-				}
-				rc = ckch_conf_kws[i].func(path, NULL, d, cli, err);
+				rc = ckch_conf_kws[i].func(v, NULL, d, cli, err);
 				if (rc) {
 					err_code |= ERR_ALERT | ERR_FATAL;
-					memprintf(err, "%s '%s' cannot be read or parsed.", err && *err ? *err : "", path);
+					memprintf(err, "%s '%s' cannot be read or parsed.", err && *err ? *err : "", v);
 					goto out;
 				}
 				break;
@@ -4806,6 +4801,62 @@ int ckch_conf_parse(char **args, int cur_arg, struct ckch_conf *f, int *found, c
 					err_code |= ERR_ALERT | ERR_ABORT;
 					goto out;
 				}
+			} else if (ckch_conf_kws[i].type == PARSE_TYPE_ARRAY_SUBSTR) {
+				char ***t = target;
+				char **r = NULL;
+				int n = 0;
+				char *b, *e;
+
+				/* split a string into substring split by colons */
+
+				e = b = args[cur_arg + 1];
+				do {
+					while (*e != ',' && *e != '\0')
+						e++;
+					r = realloc(r, sizeof(char *) * (n + 2));
+					if (!r) {
+						ha_alert("parsing [%s:%d]: out of memory.\n", file, linenum);
+						err_code |= ERR_ALERT | ERR_ABORT;
+						goto array_err;
+					}
+					r[n] = my_strndup(b, e - b);
+					if (!r[n]) {
+						ha_alert("parsing [%s:%d]: out of memory.\n", file, linenum);
+						err_code |= ERR_ALERT | ERR_ABORT;
+						goto array_err;
+					}
+
+					n++;
+
+					if (*e == '\0')
+						break;
+
+					e++; /* skip the separator */
+
+					/* skip trailing spaces */
+					while (*e == ' ')
+						e++;
+
+					b = e;
+
+				} while (*b);
+
+				r[n] = NULL; /* last element is NULL */
+				*t = r;
+// debug
+//				while (*r)
+//					fprintf(stderr, "sub: \"%s\"\n", *r++);
+
+				goto out;
+array_err:
+				while (r && *r) {
+					char *prev = *r;
+					r++;
+					free(prev);
+				}
+				free(r);
+
+
 			} else if (ckch_conf_kws[i].type == PARSE_TYPE_INT) {
 				int *t = target;
 				char *stop;

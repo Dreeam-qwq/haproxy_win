@@ -926,12 +926,25 @@ Core class
   its work and wants to give back the control to HAProxy without executing the
   remaining code. It can be seen as a multi-level "return".
 
+.. js:function:: core.wait([milliseconds])
+
+  **context**: task, action
+
+  Give back the hand at the HAProxy scheduler. Unlike :js:func:`core.yield`
+  the task will not be woken up automatically to resume as fast as possible.
+  Instead, it will wait for an event to wake the task. If milliseconds argument
+  is provided then the Lua excecution will be automatically resumed passed this
+  delay even if no event caused the task to wake itself up.
+
+  :param integer milliseconds: automatic wakeup passed this delay. (optional)
+
 .. js:function:: core.yield()
 
   **context**: task, action
 
   Give back the hand at the HAProxy scheduler. It is used when the LUA
-  processing consumes a lot of processing time.
+  processing consumes a lot of processing time. Lua excecution will be resumed
+  automatically (automatic reschedule).
 
 .. js:function:: core.parse_addr(address)
 
@@ -1868,6 +1881,17 @@ Queue class
   Of course, queue may also be used as a local storage mechanism.
 
   Use :js:func:`core.queue` to get a new Queue object.
+
+.. js:function:: Queue.alarm()
+
+  **context**: task, action, service
+
+  Sets a wakeup alarm on the current Lua context so that when new data
+  becomes available on the Queue, the current Lua context is woken up
+  automatically. It can be combined with :js:func:`core.wait` to wait
+  for Queue events.
+
+  :param class_queue queue: A :ref:`queue_class` to the current queue
 
 .. js:function:: Queue.size(queue)
 
@@ -3464,7 +3488,7 @@ Patref class
   in case of duplicated entries, only the first matching entry is returned.
 
   .. Warning::
-     Not meant to be shared bewteen multiple contexts. If multiple contexts
+     Not meant to be shared between multiple contexts. If multiple contexts
      need to work on the same pattern reference, each context should have
      its own patref object.
 
@@ -3494,7 +3518,7 @@ Patref class
 .. js:function:: Patref.commit(ref)
 
   Tries to commit pending Patref object updates, that is updates made to the
-  local object will be committed to the underlying patter reference storage
+  local object will be committed to the underlying pattern reference storage
   in an atomic manner upon success. Upon failure, local pending updates are
   lost. Upon success, all other pending updates on the pattern reference
   (e.g.: "prepare" from the cli or from other Patref Lua objects) started
@@ -3898,6 +3922,15 @@ AppletTCP class
   :param integer size: the required read size.
   :returns: always return a string, the string can be empty if the connection is
    closed.
+
+.. js:function:: AppletTCP.try_receive(applet)
+
+  Reads available data from the TCP stream and returns immediately. Returns a
+  string containing read bytes that may possibly be empty if no bytes are
+  available at that time.
+
+  :param class_AppletTCP applet: An :ref:`applettcp_class`
+  :returns: always return a string, the string can be empty.
 
 .. js:function:: AppletTCP.send(appletmsg)
 

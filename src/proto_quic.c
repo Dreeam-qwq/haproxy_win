@@ -44,6 +44,7 @@
 #include <haproxy/proxy-t.h>
 #include <haproxy/quic_conn.h>
 #include <haproxy/quic_sock.h>
+#include <haproxy/quic_tune.h>
 #include <haproxy/sock.h>
 #include <haproxy/sock_inet.h>
 #include <haproxy/task.h>
@@ -794,7 +795,7 @@ static int quic_test_gso(void)
  * mechanism. A message is notified in this case when running in diagnostic
  * mode.
  *
- * Returns ERR_NONE if every checks performed, wether or not some features are
+ * Returns ERR_NONE if every checks performed, whether or not some features are
  * not available. ERR_FATAL is reported if checks cannot be executed.
  */
 static int quic_test_socketopts(void)
@@ -802,7 +803,7 @@ static int quic_test_socketopts(void)
 	int ret;
 
 	/* Check for connection socket-owner mode support. */
-	if (global.tune.options & GTUNE_QUIC_SOCK_PER_CONN) {
+	if (quic_tune.options & QUIC_TUNE_SOCK_PER_CONN) {
 		ret = quic_test_conn_socket_owner();
 		if (ret < 0) {
 			goto err;
@@ -810,12 +811,12 @@ static int quic_test_socketopts(void)
 		else if (!ret) {
 			ha_diag_warning("Your platform does not seem to support UDP source address retrieval through IP_PKTINFO or an alternative flag. "
 			                "QUIC connections will use listener socket.\n");
-			global.tune.options &= ~GTUNE_QUIC_SOCK_PER_CONN;
+			quic_tune.options &= ~QUIC_TUNE_SOCK_PER_CONN;
 		}
 	}
 
 	/* Check for UDP GSO support. */
-	if (!(global.tune.options & GTUNE_QUIC_NO_UDP_GSO)) {
+	if (!(quic_tune.options & QUIC_TUNE_NO_UDP_GSO)) {
 		ret = quic_test_gso();
 		if (ret < 0) {
 			goto err;
@@ -823,7 +824,7 @@ static int quic_test_socketopts(void)
 		else if (!ret) {
 			ha_diag_warning("Your platform does not support UDP GSO. "
 			                "This will be automatically disabled for QUIC transfer.\n");
-			global.tune.options |= GTUNE_QUIC_NO_UDP_GSO;
+			quic_tune.options |= QUIC_TUNE_NO_UDP_GSO;
 		}
 	}
 

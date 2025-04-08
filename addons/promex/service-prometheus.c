@@ -97,187 +97,53 @@ struct promex_ctx {
  */
 #define PROMEX_MAX_METRIC_LENGTH 512
 
-/* Global metrics  */
-const struct promex_metric promex_global_metrics[ST_I_INF_MAX] = {
-	//[ST_I_INF_NAME]                           ignored
-	//[ST_I_INF_VERSION],                       ignored
-	//[ST_I_INF_RELEASE_DATE]                   ignored
-	[ST_I_INF_NBTHREAD]                       = { .n = IST("nbthread"),                      .type = PROMEX_MT_GAUGE,   .flags = PROMEX_FL_INFO_METRIC },
-	[ST_I_INF_NBPROC]                         = { .n = IST("nbproc"),                        .type = PROMEX_MT_GAUGE,   .flags = PROMEX_FL_INFO_METRIC },
-	[ST_I_INF_PROCESS_NUM]                    = { .n = IST("relative_process_id"),           .type = PROMEX_MT_GAUGE,   .flags = PROMEX_FL_INFO_METRIC },
-	//[ST_I_INF_PID]                            ignored
-	//[ST_I_INF_UPTIME]                         ignored
-	[ST_I_INF_UPTIME_SEC]                     = { .n = IST("uptime_seconds"),                .type = PROMEX_MT_GAUGE,   .flags = PROMEX_FL_INFO_METRIC },
-	[ST_I_INF_START_TIME_SEC]                 = { .n = IST("start_time_seconds"),            .type = PROMEX_MT_GAUGE,   .flags = PROMEX_FL_INFO_METRIC },
-	//[ST_I_INF_MEMMAX_MB]                      ignored
-	[ST_I_INF_MEMMAX_BYTES]                   = { .n = IST("max_memory_bytes"),              .type = PROMEX_MT_GAUGE,   .flags = PROMEX_FL_INFO_METRIC },
-	//[ST_I_INF_POOL_ALLOC_MB]                  ignored
-	[ST_I_INF_POOL_ALLOC_BYTES]               = { .n = IST("pool_allocated_bytes"),          .type = PROMEX_MT_GAUGE,   .flags = PROMEX_FL_INFO_METRIC },
-	//[ST_I_INF_POOL_USED_MB]                   ignored
-	[ST_I_INF_POOL_USED_BYTES]                = { .n = IST("pool_used_bytes"),               .type = PROMEX_MT_GAUGE,   .flags = PROMEX_FL_INFO_METRIC },
-	[ST_I_INF_POOL_FAILED]                    = { .n = IST("pool_failures_total"),           .type = PROMEX_MT_COUNTER, .flags = PROMEX_FL_INFO_METRIC },
-	[ST_I_INF_ULIMIT_N]                       = { .n = IST("max_fds"),                       .type = PROMEX_MT_GAUGE,   .flags = PROMEX_FL_INFO_METRIC },
-	[ST_I_INF_MAXSOCK]                        = { .n = IST("max_sockets"),                   .type = PROMEX_MT_GAUGE,   .flags = PROMEX_FL_INFO_METRIC },
-	[ST_I_INF_MAXCONN]                        = { .n = IST("max_connections"),               .type = PROMEX_MT_GAUGE,   .flags = PROMEX_FL_INFO_METRIC },
-	[ST_I_INF_HARD_MAXCONN]                   = { .n = IST("hard_max_connections"),          .type = PROMEX_MT_GAUGE,   .flags = PROMEX_FL_INFO_METRIC },
-	[ST_I_INF_CURR_CONN]                      = { .n = IST("current_connections"),           .type = PROMEX_MT_GAUGE,   .flags = PROMEX_FL_INFO_METRIC },
-	[ST_I_INF_CUM_CONN]                       = { .n = IST("connections_total"),             .type = PROMEX_MT_COUNTER, .flags = PROMEX_FL_INFO_METRIC },
-	[ST_I_INF_CUM_REQ]                        = { .n = IST("requests_total"),                .type = PROMEX_MT_COUNTER, .flags = PROMEX_FL_INFO_METRIC },
-	[ST_I_INF_MAX_SSL_CONNS]                  = { .n = IST("max_ssl_connections"),           .type = PROMEX_MT_GAUGE,   .flags = PROMEX_FL_INFO_METRIC },
-	[ST_I_INF_CURR_SSL_CONNS]                 = { .n = IST("current_ssl_connections"),       .type = PROMEX_MT_GAUGE,   .flags = PROMEX_FL_INFO_METRIC },
-	[ST_I_INF_CUM_SSL_CONNS]                  = { .n = IST("ssl_connections_total"),         .type = PROMEX_MT_COUNTER, .flags = PROMEX_FL_INFO_METRIC },
-	[ST_I_INF_MAXPIPES]                       = { .n = IST("max_pipes"),                     .type = PROMEX_MT_GAUGE,   .flags = PROMEX_FL_INFO_METRIC },
-	[ST_I_INF_PIPES_USED]                     = { .n = IST("pipes_used_total"),              .type = PROMEX_MT_COUNTER, .flags = PROMEX_FL_INFO_METRIC },
-	[ST_I_INF_PIPES_FREE]                     = { .n = IST("pipes_free_total"),              .type = PROMEX_MT_COUNTER, .flags = PROMEX_FL_INFO_METRIC },
-	[ST_I_INF_CONN_RATE]                      = { .n = IST("current_connection_rate"),       .type = PROMEX_MT_GAUGE,   .flags = PROMEX_FL_INFO_METRIC },
-	[ST_I_INF_CONN_RATE_LIMIT]                = { .n = IST("limit_connection_rate"),         .type = PROMEX_MT_GAUGE,   .flags = PROMEX_FL_INFO_METRIC },
-	[ST_I_INF_MAX_CONN_RATE]                  = { .n = IST("max_connection_rate"),           .type = PROMEX_MT_GAUGE,   .flags = PROMEX_FL_INFO_METRIC },
-	[ST_I_INF_SESS_RATE]                      = { .n = IST("current_session_rate"),          .type = PROMEX_MT_GAUGE,   .flags = PROMEX_FL_INFO_METRIC },
-	[ST_I_INF_SESS_RATE_LIMIT]                = { .n = IST("limit_session_rate"),            .type = PROMEX_MT_GAUGE,   .flags = PROMEX_FL_INFO_METRIC },
-	[ST_I_INF_MAX_SESS_RATE]                  = { .n = IST("max_session_rate"),              .type = PROMEX_MT_GAUGE,   .flags = PROMEX_FL_INFO_METRIC },
-	[ST_I_INF_SSL_RATE]                       = { .n = IST("current_ssl_rate"),              .type = PROMEX_MT_GAUGE,   .flags = PROMEX_FL_INFO_METRIC },
-	[ST_I_INF_SSL_RATE_LIMIT]                 = { .n = IST("limit_ssl_rate"),                .type = PROMEX_MT_GAUGE,   .flags = PROMEX_FL_INFO_METRIC },
-	[ST_I_INF_MAX_SSL_RATE]                   = { .n = IST("max_ssl_rate"),                  .type = PROMEX_MT_GAUGE,   .flags = PROMEX_FL_INFO_METRIC },
-	[ST_I_INF_SSL_FRONTEND_KEY_RATE]          = { .n = IST("current_frontend_ssl_key_rate"), .type = PROMEX_MT_GAUGE,   .flags = PROMEX_FL_INFO_METRIC },
-	[ST_I_INF_SSL_FRONTEND_MAX_KEY_RATE]      = { .n = IST("max_frontend_ssl_key_rate"),     .type = PROMEX_MT_GAUGE,   .flags = PROMEX_FL_INFO_METRIC },
-	[ST_I_INF_SSL_FRONTEND_SESSION_REUSE_PCT] = { .n = IST("frontend_ssl_reuse"),            .type = PROMEX_MT_GAUGE,   .flags = PROMEX_FL_INFO_METRIC },
-	[ST_I_INF_SSL_BACKEND_KEY_RATE]           = { .n = IST("current_backend_ssl_key_rate"),  .type = PROMEX_MT_GAUGE,   .flags = PROMEX_FL_INFO_METRIC },
-	[ST_I_INF_SSL_BACKEND_MAX_KEY_RATE]       = { .n = IST("max_backend_ssl_key_rate"),      .type = PROMEX_MT_GAUGE,   .flags = PROMEX_FL_INFO_METRIC },
-	[ST_I_INF_SSL_CACHE_LOOKUPS]              = { .n = IST("ssl_cache_lookups_total"),       .type = PROMEX_MT_COUNTER, .flags = PROMEX_FL_INFO_METRIC },
-	[ST_I_INF_SSL_CACHE_MISSES]               = { .n = IST("ssl_cache_misses_total"),        .type = PROMEX_MT_COUNTER, .flags = PROMEX_FL_INFO_METRIC },
-	[ST_I_INF_COMPRESS_BPS_IN]                = { .n = IST("http_comp_bytes_in_total"),      .type = PROMEX_MT_COUNTER, .flags = PROMEX_FL_INFO_METRIC },
-	[ST_I_INF_COMPRESS_BPS_OUT]               = { .n = IST("http_comp_bytes_out_total"),     .type = PROMEX_MT_COUNTER, .flags = PROMEX_FL_INFO_METRIC },
-	[ST_I_INF_COMPRESS_BPS_RATE_LIM]          = { .n = IST("limit_http_comp"),               .type = PROMEX_MT_GAUGE,   .flags = PROMEX_FL_INFO_METRIC },
-	[ST_I_INF_ZLIB_MEM_USAGE]                 = { .n = IST("current_zlib_memory"),           .type = PROMEX_MT_GAUGE,   .flags = PROMEX_FL_INFO_METRIC },
-	[ST_I_INF_MAX_ZLIB_MEM_USAGE]             = { .n = IST("max_zlib_memory"),               .type = PROMEX_MT_GAUGE,   .flags = PROMEX_FL_INFO_METRIC },
-	[ST_I_INF_TASKS]                          = { .n = IST("current_tasks"),                 .type = PROMEX_MT_GAUGE,   .flags = PROMEX_FL_INFO_METRIC },
-	[ST_I_INF_RUN_QUEUE]                      = { .n = IST("current_run_queue"),             .type = PROMEX_MT_GAUGE,   .flags = PROMEX_FL_INFO_METRIC },
-	[ST_I_INF_IDLE_PCT]                       = { .n = IST("idle_time_percent"),             .type = PROMEX_MT_GAUGE,   .flags = PROMEX_FL_INFO_METRIC },
-	[ST_I_INF_NODE]                           = { .n = IST("node"),                          .type = PROMEX_MT_GAUGE,   .flags = PROMEX_FL_INFO_METRIC },
-	[ST_I_INF_DESCRIPTION]                    = { .n = IST("description"),                   .type = PROMEX_MT_GAUGE,   .flags = PROMEX_FL_INFO_METRIC },
-	[ST_I_INF_STOPPING]                       = { .n = IST("stopping"),                      .type = PROMEX_MT_GAUGE,   .flags = PROMEX_FL_INFO_METRIC },
-	[ST_I_INF_JOBS]                           = { .n = IST("jobs"),                          .type = PROMEX_MT_GAUGE,   .flags = PROMEX_FL_INFO_METRIC },
-	[ST_I_INF_UNSTOPPABLE_JOBS]               = { .n = IST("unstoppable_jobs"),              .type = PROMEX_MT_GAUGE,   .flags = PROMEX_FL_INFO_METRIC },
-	[ST_I_INF_LISTENERS]                      = { .n = IST("listeners"),                     .type = PROMEX_MT_GAUGE,   .flags = PROMEX_FL_INFO_METRIC },
-	[ST_I_INF_ACTIVE_PEERS]                   = { .n = IST("active_peers"),                  .type = PROMEX_MT_GAUGE,   .flags = PROMEX_FL_INFO_METRIC },
-	[ST_I_INF_CONNECTED_PEERS]                = { .n = IST("connected_peers"),               .type = PROMEX_MT_GAUGE,   .flags = PROMEX_FL_INFO_METRIC },
-	[ST_I_INF_DROPPED_LOGS]                   = { .n = IST("dropped_logs_total"),            .type = PROMEX_MT_COUNTER, .flags = PROMEX_FL_INFO_METRIC },
-	[ST_I_INF_BUSY_POLLING]                   = { .n = IST("busy_polling_enabled"),          .type = PROMEX_MT_GAUGE,   .flags = PROMEX_FL_INFO_METRIC },
-	[ST_I_INF_FAILED_RESOLUTIONS]             = { .n = IST("failed_resolutions"),            .type = PROMEX_MT_COUNTER, .flags = PROMEX_FL_INFO_METRIC },
-	[ST_I_INF_TOTAL_BYTES_OUT]                = { .n = IST("bytes_out_total"),               .type = PROMEX_MT_COUNTER, .flags = PROMEX_FL_INFO_METRIC },
-	[ST_I_INF_TOTAL_SPLICED_BYTES_OUT]        = { .n = IST("spliced_bytes_out_total"),       .type = PROMEX_MT_COUNTER, .flags = PROMEX_FL_INFO_METRIC },
-	[ST_I_INF_BYTES_OUT_RATE]                 = { .n = IST("bytes_out_rate"),                .type = PROMEX_MT_GAUGE,   .flags = PROMEX_FL_INFO_METRIC },
-	//[ST_I_INF_DEBUG_COMMANDS_ISSUED]          ignored
-	[ST_I_INF_CUM_LOG_MSGS]                   = { .n = IST("recv_logs_total"),               .type = PROMEX_MT_COUNTER, .flags = PROMEX_FL_INFO_METRIC },
-	[ST_I_INF_BUILD_INFO]                     = { .n = IST("build_info"),                    .type = PROMEX_MT_GAUGE,   .flags = PROMEX_FL_INFO_METRIC },
-};
+static inline enum promex_mt_type promex_global_gettype(int index, enum field_nature nature)
+{
+	enum promex_mt_type type;
 
-/* frontend/backend/server fields */
-const struct promex_metric promex_st_metrics[ST_I_PX_MAX] = {
-	//[ST_I_PX_PXNAME]               ignored
-	//[ST_I_PX_SVNAME]               ignored
-	[ST_I_PX_QCUR]                 = { .n = IST("current_queue"),                    .type = PROMEX_MT_GAUGE,    .flags = (                                               PROMEX_FL_BACK_METRIC | PROMEX_FL_SRV_METRIC) },
-	[ST_I_PX_QMAX]                 = { .n = IST("max_queue"),                        .type = PROMEX_MT_GAUGE,    .flags = (                                               PROMEX_FL_BACK_METRIC | PROMEX_FL_SRV_METRIC) },
-	[ST_I_PX_SCUR]                 = { .n = IST("current_sessions"),                 .type = PROMEX_MT_GAUGE,    .flags = (PROMEX_FL_FRONT_METRIC | PROMEX_FL_LI_METRIC | PROMEX_FL_BACK_METRIC | PROMEX_FL_SRV_METRIC) },
-	[ST_I_PX_SMAX]                 = { .n = IST("max_sessions"),                     .type = PROMEX_MT_GAUGE,    .flags = (PROMEX_FL_FRONT_METRIC | PROMEX_FL_LI_METRIC | PROMEX_FL_BACK_METRIC | PROMEX_FL_SRV_METRIC) },
-	[ST_I_PX_SLIM]                 = { .n = IST("limit_sessions"),                   .type = PROMEX_MT_GAUGE,    .flags = (PROMEX_FL_FRONT_METRIC | PROMEX_FL_LI_METRIC | PROMEX_FL_BACK_METRIC | PROMEX_FL_SRV_METRIC) },
-	[ST_I_PX_STOT]                 = { .n = IST("sessions_total"),                   .type = PROMEX_MT_COUNTER,  .flags = (PROMEX_FL_FRONT_METRIC | PROMEX_FL_LI_METRIC | PROMEX_FL_BACK_METRIC | PROMEX_FL_SRV_METRIC) },
-	[ST_I_PX_BIN]                  = { .n = IST("bytes_in_total"),                   .type = PROMEX_MT_COUNTER,  .flags = (PROMEX_FL_FRONT_METRIC | PROMEX_FL_LI_METRIC | PROMEX_FL_BACK_METRIC | PROMEX_FL_SRV_METRIC) },
-	[ST_I_PX_BOUT]                 = { .n = IST("bytes_out_total"),                  .type = PROMEX_MT_COUNTER,  .flags = (PROMEX_FL_FRONT_METRIC | PROMEX_FL_LI_METRIC | PROMEX_FL_BACK_METRIC | PROMEX_FL_SRV_METRIC) },
-	[ST_I_PX_DREQ]                 = { .n = IST("requests_denied_total"),            .type = PROMEX_MT_COUNTER,  .flags = (PROMEX_FL_FRONT_METRIC | PROMEX_FL_LI_METRIC | PROMEX_FL_BACK_METRIC                       ) },
-	[ST_I_PX_DRESP]                = { .n = IST("responses_denied_total"),           .type = PROMEX_MT_COUNTER,  .flags = (PROMEX_FL_FRONT_METRIC | PROMEX_FL_LI_METRIC | PROMEX_FL_BACK_METRIC | PROMEX_FL_SRV_METRIC) },
-	[ST_I_PX_EREQ]                 = { .n = IST("request_errors_total"),             .type = PROMEX_MT_COUNTER,  .flags = (PROMEX_FL_FRONT_METRIC | PROMEX_FL_LI_METRIC                                               ) },
-	[ST_I_PX_ECON]                 = { .n = IST("connection_errors_total"),          .type = PROMEX_MT_COUNTER,  .flags = (                                               PROMEX_FL_BACK_METRIC | PROMEX_FL_SRV_METRIC) },
-	[ST_I_PX_ERESP]                = { .n = IST("response_errors_total"),            .type = PROMEX_MT_COUNTER,  .flags = (                                               PROMEX_FL_BACK_METRIC | PROMEX_FL_SRV_METRIC) },
-	[ST_I_PX_WRETR]                = { .n = IST("retry_warnings_total"),             .type = PROMEX_MT_COUNTER,  .flags = (                                               PROMEX_FL_BACK_METRIC | PROMEX_FL_SRV_METRIC) },
-	[ST_I_PX_WREDIS]               = { .n = IST("redispatch_warnings_total"),        .type = PROMEX_MT_COUNTER,  .flags = (                                               PROMEX_FL_BACK_METRIC | PROMEX_FL_SRV_METRIC) },
-	[ST_I_PX_STATUS]               = { .n = IST("status"),                           .type = PROMEX_MT_GAUGE,    .flags = (PROMEX_FL_FRONT_METRIC | PROMEX_FL_LI_METRIC | PROMEX_FL_BACK_METRIC | PROMEX_FL_SRV_METRIC) },
-	[ST_I_PX_WEIGHT]               = { .n = IST("weight"),                           .type = PROMEX_MT_GAUGE,    .flags = (                                               PROMEX_FL_BACK_METRIC | PROMEX_FL_SRV_METRIC) },
-	[ST_I_PX_ACT]                  = { .n = IST("active_servers"),                   .type = PROMEX_MT_GAUGE,    .flags = (                                               PROMEX_FL_BACK_METRIC | PROMEX_FL_SRV_METRIC) },
-	[ST_I_PX_BCK]                  = { .n = IST("backup_servers"),                   .type = PROMEX_MT_GAUGE,    .flags = (                                               PROMEX_FL_BACK_METRIC | PROMEX_FL_SRV_METRIC) },
-	[ST_I_PX_CHKFAIL]              = { .n = IST("check_failures_total"),             .type = PROMEX_MT_COUNTER,  .flags = (                                                                       PROMEX_FL_SRV_METRIC) },
-	[ST_I_PX_CHKDOWN]              = { .n = IST("check_up_down_total"),              .type = PROMEX_MT_COUNTER,  .flags = (                                               PROMEX_FL_BACK_METRIC | PROMEX_FL_SRV_METRIC) },
-	[ST_I_PX_LASTCHG]              = { .n = IST("check_last_change_seconds"),        .type = PROMEX_MT_GAUGE,    .flags = (                                               PROMEX_FL_BACK_METRIC | PROMEX_FL_SRV_METRIC) },
-	[ST_I_PX_DOWNTIME]             = { .n = IST("downtime_seconds_total"),           .type = PROMEX_MT_COUNTER,  .flags = (                                               PROMEX_FL_BACK_METRIC | PROMEX_FL_SRV_METRIC) },
-	[ST_I_PX_QLIMIT]               = { .n = IST("queue_limit"),                      .type = PROMEX_MT_GAUGE,    .flags = (                                                                       PROMEX_FL_SRV_METRIC) },
-	//[ST_I_PX_PID]                  ignored
-	//[ST_I_PX_IID]                  ignored
-	//[ST_I_PX_SID]                  ignored
-	[ST_I_PX_THROTTLE]             = { .n = IST("current_throttle"),                 .type = PROMEX_MT_GAUGE,    .flags = (                                                                       PROMEX_FL_SRV_METRIC) },
-	[ST_I_PX_LBTOT]                = { .n = IST("loadbalanced_total"),               .type = PROMEX_MT_COUNTER,  .flags = (                                               PROMEX_FL_BACK_METRIC | PROMEX_FL_SRV_METRIC) },
-	//[ST_I_PX_TRACKED]              ignored
-	//[ST_I_PX_TYPE]                 ignored
-	//[ST_I_PX_RATE]                 ignored
-	[ST_I_PX_RATE_LIM]             = { .n = IST("limit_session_rate"),               .type = PROMEX_MT_GAUGE,    .flags = (PROMEX_FL_FRONT_METRIC                                                                     ) },
-	[ST_I_PX_RATE_MAX]             = { .n = IST("max_session_rate"),                 .type = PROMEX_MT_GAUGE,    .flags = (PROMEX_FL_FRONT_METRIC |                       PROMEX_FL_BACK_METRIC | PROMEX_FL_SRV_METRIC) },
-	[ST_I_PX_CHECK_STATUS]         = { .n = IST("check_status"),                     .type = PROMEX_MT_GAUGE,    .flags = (                                                                       PROMEX_FL_SRV_METRIC) },
-	[ST_I_PX_CHECK_CODE]           = { .n = IST("check_code"),                       .type = PROMEX_MT_GAUGE,    .flags = (                                                                       PROMEX_FL_SRV_METRIC) },
-	[ST_I_PX_CHECK_DURATION]       = { .n = IST("check_duration_seconds"),           .type = PROMEX_MT_GAUGE,    .flags = (                                                                       PROMEX_FL_SRV_METRIC) },
-	[ST_I_PX_HRSP_1XX]             = { .n = IST("http_responses_total"),             .type = PROMEX_MT_COUNTER,  .flags = (PROMEX_FL_FRONT_METRIC |                       PROMEX_FL_BACK_METRIC | PROMEX_FL_SRV_METRIC) },
-	[ST_I_PX_HRSP_2XX]             = { .n = IST("http_responses_total"),             .type = PROMEX_MT_COUNTER,  .flags = (PROMEX_FL_FRONT_METRIC |                       PROMEX_FL_BACK_METRIC | PROMEX_FL_SRV_METRIC) },
-	[ST_I_PX_HRSP_3XX]             = { .n = IST("http_responses_total"),             .type = PROMEX_MT_COUNTER,  .flags = (PROMEX_FL_FRONT_METRIC |                       PROMEX_FL_BACK_METRIC | PROMEX_FL_SRV_METRIC) },
-	[ST_I_PX_HRSP_4XX]             = { .n = IST("http_responses_total"),             .type = PROMEX_MT_COUNTER,  .flags = (PROMEX_FL_FRONT_METRIC |                       PROMEX_FL_BACK_METRIC | PROMEX_FL_SRV_METRIC) },
-	[ST_I_PX_HRSP_5XX]             = { .n = IST("http_responses_total"),             .type = PROMEX_MT_COUNTER,  .flags = (PROMEX_FL_FRONT_METRIC |                       PROMEX_FL_BACK_METRIC | PROMEX_FL_SRV_METRIC) },
-	[ST_I_PX_HRSP_OTHER]           = { .n = IST("http_responses_total"),             .type = PROMEX_MT_COUNTER,  .flags = (PROMEX_FL_FRONT_METRIC |                       PROMEX_FL_BACK_METRIC | PROMEX_FL_SRV_METRIC) },
-	//[ST_I_PX_HANAFAIL]             ignored
-	//[ST_I_PX_REQ_RATE]             ignored
-	[ST_I_PX_REQ_RATE_MAX]         = { .n = IST("http_requests_rate_max"),           .type = PROMEX_MT_GAUGE,    .flags = (PROMEX_FL_FRONT_METRIC                                                                     ) },
-	[ST_I_PX_REQ_TOT]              = { .n = IST("http_requests_total"),              .type = PROMEX_MT_COUNTER,  .flags = (PROMEX_FL_FRONT_METRIC |                       PROMEX_FL_BACK_METRIC                       ) },
-	[ST_I_PX_CLI_ABRT]             = { .n = IST("client_aborts_total"),              .type = PROMEX_MT_COUNTER,  .flags = (                                               PROMEX_FL_BACK_METRIC | PROMEX_FL_SRV_METRIC) },
-	[ST_I_PX_SRV_ABRT]             = { .n = IST("server_aborts_total"),              .type = PROMEX_MT_COUNTER,  .flags = (                                               PROMEX_FL_BACK_METRIC | PROMEX_FL_SRV_METRIC) },
-	[ST_I_PX_COMP_IN]              = { .n = IST("http_comp_bytes_in_total"),         .type = PROMEX_MT_COUNTER,  .flags = (PROMEX_FL_FRONT_METRIC |                       PROMEX_FL_BACK_METRIC                       ) },
-	[ST_I_PX_COMP_OUT]             = { .n = IST("http_comp_bytes_out_total"),        .type = PROMEX_MT_COUNTER,  .flags = (PROMEX_FL_FRONT_METRIC |                       PROMEX_FL_BACK_METRIC                       ) },
-	[ST_I_PX_COMP_BYP]             = { .n = IST("http_comp_bytes_bypassed_total"),   .type = PROMEX_MT_COUNTER,  .flags = (PROMEX_FL_FRONT_METRIC |                       PROMEX_FL_BACK_METRIC                       ) },
-	[ST_I_PX_COMP_RSP]             = { .n = IST("http_comp_responses_total"),        .type = PROMEX_MT_COUNTER,  .flags = (PROMEX_FL_FRONT_METRIC |                       PROMEX_FL_BACK_METRIC                       ) },
-	[ST_I_PX_LASTSESS]             = { .n = IST("last_session_seconds"),             .type = PROMEX_MT_GAUGE,    .flags = (                                               PROMEX_FL_BACK_METRIC | PROMEX_FL_SRV_METRIC) },
-	//[ST_I_PX_LAST_CHK]             ignored
-	//[ST_I_PX_LAST_AGT]             ignored
-	[ST_I_PX_QTIME]                = { .n = IST("queue_time_average_seconds"),       .type = PROMEX_MT_GAUGE,    .flags = (                                               PROMEX_FL_BACK_METRIC | PROMEX_FL_SRV_METRIC) },
-	[ST_I_PX_CTIME]                = { .n = IST("connect_time_average_seconds"),     .type = PROMEX_MT_GAUGE,    .flags = (                                               PROMEX_FL_BACK_METRIC | PROMEX_FL_SRV_METRIC) },
-	[ST_I_PX_RTIME]                = { .n = IST("response_time_average_seconds"),    .type = PROMEX_MT_GAUGE,    .flags = (                                               PROMEX_FL_BACK_METRIC | PROMEX_FL_SRV_METRIC) },
-	[ST_I_PX_TTIME]                = { .n = IST("total_time_average_seconds"),       .type = PROMEX_MT_GAUGE,    .flags = (                                               PROMEX_FL_BACK_METRIC | PROMEX_FL_SRV_METRIC) },
-	//[ST_I_PX_AGENT_STATUS]         ignored
-	//[ST_I_PX_AGENT_CODE]           ignored
-	//[ST_I_PX_AGENT_DURATION]       ignored
-	//[ST_I_PX_CHECK_DESC]           ignored
-	//[ST_I_PX_AGENT_DESC]           ignored
-	//[ST_I_PX_CHECK_RISE]           ignored
-	//[ST_I_PX_CHECK_FALL]           ignored
-	//[ST_I_PX_CHECK_HEALTH]         ignored
-	//[ST_I_PX_AGENT_RISE]           ignored
-	//[ST_I_PX_AGENT_FALL]           ignored
-	//[ST_I_PX_AGENT_HEALTH]         ignored
-	//[ST_I_PX_ADDR]                 ignored
-	//[ST_I_PX_COOKIE]               ignored
-	//[ST_I_PX_MODE]                 ignored
-	//[ST_I_PX_ALGO]                 ignored
-	//[ST_I_PX_CONN_RATE]            ignored
-	[ST_I_PX_CONN_RATE_MAX]        = { .n = IST("connections_rate_max"),             .type = PROMEX_MT_GAUGE,    .flags = (PROMEX_FL_FRONT_METRIC                                                                     ) },
-	[ST_I_PX_CONN_TOT]             = { .n = IST("connections_total"),                .type = PROMEX_MT_COUNTER,  .flags = (PROMEX_FL_FRONT_METRIC                                                                     ) },
-	[ST_I_PX_INTERCEPTED]          = { .n = IST("intercepted_requests_total"),       .type = PROMEX_MT_COUNTER,  .flags = (PROMEX_FL_FRONT_METRIC                                                                     ) },
-	[ST_I_PX_DCON]                 = { .n = IST("denied_connections_total"),         .type = PROMEX_MT_COUNTER,  .flags = (PROMEX_FL_FRONT_METRIC | PROMEX_FL_LI_METRIC                                               ) },
-	[ST_I_PX_DSES]                 = { .n = IST("denied_sessions_total"),            .type = PROMEX_MT_COUNTER,  .flags = (PROMEX_FL_FRONT_METRIC | PROMEX_FL_LI_METRIC                                               ) },
-	[ST_I_PX_WREW]                 = { .n = IST("failed_header_rewriting_total"),    .type = PROMEX_MT_COUNTER,  .flags = (PROMEX_FL_FRONT_METRIC | PROMEX_FL_LI_METRIC | PROMEX_FL_BACK_METRIC | PROMEX_FL_SRV_METRIC) },
-	[ST_I_PX_CONNECT]              = { .n = IST("connection_attempts_total"),        .type = PROMEX_MT_COUNTER,  .flags = (                                               PROMEX_FL_BACK_METRIC | PROMEX_FL_SRV_METRIC) },
-	[ST_I_PX_REUSE]                = { .n = IST("connection_reuses_total"),          .type = PROMEX_MT_COUNTER,  .flags = (                                               PROMEX_FL_BACK_METRIC | PROMEX_FL_SRV_METRIC) },
-	[ST_I_PX_CACHE_LOOKUPS]        = { .n = IST("http_cache_lookups_total"),         .type = PROMEX_MT_COUNTER,  .flags = (PROMEX_FL_FRONT_METRIC |                       PROMEX_FL_BACK_METRIC                       ) },
-	[ST_I_PX_CACHE_HITS]           = { .n = IST("http_cache_hits_total"),            .type = PROMEX_MT_COUNTER,  .flags = (PROMEX_FL_FRONT_METRIC |                       PROMEX_FL_BACK_METRIC                       ) },
-	[ST_I_PX_SRV_ICUR]             = { .n = IST("idle_connections_current"),         .type = PROMEX_MT_GAUGE,    .flags = (                                                                       PROMEX_FL_SRV_METRIC) },
-	[ST_I_PX_SRV_ILIM]             = { .n = IST("idle_connections_limit"),           .type = PROMEX_MT_GAUGE,    .flags = (                                                                       PROMEX_FL_SRV_METRIC) },
-	[ST_I_PX_QT_MAX]               = { .n = IST("max_queue_time_seconds"),           .type = PROMEX_MT_GAUGE,    .flags = (                                               PROMEX_FL_BACK_METRIC | PROMEX_FL_SRV_METRIC) },
-	[ST_I_PX_CT_MAX]               = { .n = IST("max_connect_time_seconds"),         .type = PROMEX_MT_GAUGE,    .flags = (                                               PROMEX_FL_BACK_METRIC | PROMEX_FL_SRV_METRIC) },
-	[ST_I_PX_RT_MAX]               = { .n = IST("max_response_time_seconds"),        .type = PROMEX_MT_GAUGE,    .flags = (                                               PROMEX_FL_BACK_METRIC | PROMEX_FL_SRV_METRIC) },
-	[ST_I_PX_TT_MAX]               = { .n = IST("max_total_time_seconds"),           .type = PROMEX_MT_GAUGE,    .flags = (                                               PROMEX_FL_BACK_METRIC | PROMEX_FL_SRV_METRIC) },
-	[ST_I_PX_EINT]                 = { .n = IST("internal_errors_total"),            .type = PROMEX_MT_COUNTER,  .flags = (PROMEX_FL_FRONT_METRIC | PROMEX_FL_LI_METRIC | PROMEX_FL_BACK_METRIC | PROMEX_FL_SRV_METRIC) },
-	[ST_I_PX_IDLE_CONN_CUR]        = { .n = IST("unsafe_idle_connections_current"),  .type = PROMEX_MT_GAUGE,    .flags = (                                                                       PROMEX_FL_SRV_METRIC) },
-	[ST_I_PX_SAFE_CONN_CUR]        = { .n = IST("safe_idle_connections_current"),    .type = PROMEX_MT_GAUGE,    .flags = (                                                                       PROMEX_FL_SRV_METRIC) },
-	[ST_I_PX_USED_CONN_CUR]        = { .n = IST("used_connections_current"),         .type = PROMEX_MT_GAUGE,    .flags = (                                                                       PROMEX_FL_SRV_METRIC) },
-	[ST_I_PX_NEED_CONN_EST]        = { .n = IST("need_connections_current"),         .type = PROMEX_MT_GAUGE,    .flags = (                                                                       PROMEX_FL_SRV_METRIC) },
-	[ST_I_PX_UWEIGHT]              = { .n = IST("uweight"),                          .type = PROMEX_MT_GAUGE,    .flags = (                                               PROMEX_FL_BACK_METRIC | PROMEX_FL_SRV_METRIC) },
-	[ST_I_PX_AGG_SRV_CHECK_STATUS] = { .n = IST("agg_server_check_status"),	      .type = PROMEX_MT_GAUGE,    .flags = (                                               PROMEX_FL_BACK_METRIC                       ) },
-	[ST_I_PX_AGG_SRV_STATUS ]      = { .n = IST("agg_server_status"),	              .type = PROMEX_MT_GAUGE,    .flags = (                                               PROMEX_FL_BACK_METRIC                       ) },
-	[ST_I_PX_AGG_CHECK_STATUS]     = { .n = IST("agg_check_status"),	              .type = PROMEX_MT_GAUGE,    .flags = (                                               PROMEX_FL_BACK_METRIC                       ) },
-};
+	/* general rule that fits most types
+	 */
+	type = (nature == FN_COUNTER) ? PROMEX_MT_COUNTER : PROMEX_MT_GAUGE;
+
+	/* historically we used to consider some metrics as counters while haproxy
+	 * doesn't consider them as such
+	 * FIXME: maybe this is no longer needed
+	 */
+	switch (index) {
+		case ST_I_INF_POOL_FAILED:
+		case ST_I_INF_CUM_CONN:
+		case ST_I_INF_CUM_REQ:
+		case ST_I_INF_CUM_SSL_CONNS:
+		case ST_I_INF_PIPES_USED:
+		case ST_I_INF_PIPES_FREE:
+		case ST_I_INF_SSL_CACHE_LOOKUPS:
+		case ST_I_INF_SSL_CACHE_MISSES:
+		case ST_I_INF_COMPRESS_BPS_IN:
+		case ST_I_INF_COMPRESS_BPS_OUT:
+		case ST_I_INF_DROPPED_LOGS:
+		case ST_I_INF_FAILED_RESOLUTIONS:
+		case ST_I_INF_TOTAL_BYTES_OUT:
+		case ST_I_INF_TOTAL_SPLICED_BYTES_OUT:
+		case ST_I_INF_CUM_LOG_MSGS:
+			type = PROMEX_MT_COUNTER;
+			break;
+		default:
+			break;
+	}
+
+	return type;
+}
+
+static inline enum promex_mt_type promex_st_gettype(int index, enum field_nature nature)
+{
+	enum promex_mt_type type;
+
+	/* general rule that fits most types
+	 */
+	type = (nature == FN_COUNTER) ? PROMEX_MT_COUNTER : PROMEX_MT_GAUGE;
+
+	return type;
+}
 
 /* Specialized frontend metric names, to override default ones */
 const struct ist promex_st_front_metrics_names[ST_I_PX_MAX] = {
@@ -569,16 +435,20 @@ static int promex_dump_global_metrics(struct appctx *appctx, struct htx *htx)
 
 	for (; ctx->field_num < ST_I_INF_MAX; ctx->field_num++) {
 		struct promex_label labels[PROMEX_MAX_LABELS-1] = {};
+		enum promex_mt_type type;
 		int lb_idx = 0;
 
-		if (!(promex_global_metrics[ctx->field_num].flags & ctx->flags))
+		if (!stat_cols_info[ctx->field_num].alt_name)
 			continue;
 
-		name = promex_global_metrics[ctx->field_num].n;
+		name = ist(stat_cols_info[ctx->field_num].alt_name);
 		desc = ist(stat_cols_info[ctx->field_num].desc);
 
 		if (promex_filter_metric(appctx, prefix, name))
 			continue;
+
+		val = stat_line_info[ctx->field_num];
+		type = promex_global_gettype(ctx->field_num, (val.type & FN_MASK));
 
 		switch (ctx->field_num) {
 			case ST_I_INF_NODE:
@@ -602,7 +472,7 @@ static int promex_dump_global_metrics(struct appctx *appctx, struct htx *htx)
 				break;
 
 			default:
-				val = stat_line_info[ctx->field_num];
+				break;
 		}
 
 		if (global.desc && ((ctx->field_num == ST_I_INF_DESCRIPTION) || (ctx->flags & PROMEX_FL_DESC_LABELS))) {
@@ -612,7 +482,7 @@ static int promex_dump_global_metrics(struct appctx *appctx, struct htx *htx)
 		}
 
 		if (!promex_dump_ts(appctx, prefix, name, desc,
-				    promex_global_metrics[ctx->field_num].type,
+				    type,
 				    &val, labels, &out, max))
 			goto full;
 
@@ -648,14 +518,15 @@ static int promex_dump_front_metrics(struct appctx *appctx, struct htx *htx)
 	enum promex_front_state state;
 
 	for (;ctx->field_num < ST_I_PX_MAX; ctx->field_num++) {
-		if (!(promex_st_metrics[ctx->field_num].flags & ctx->flags))
+		if (!stat_cols_px[ctx->field_num].alt_name ||
+		    !(stat_cols_px[ctx->field_num].cap & STATS_PX_CAP_FE))
 			continue;
 
 		name = promex_st_front_metrics_names[ctx->field_num];
 		desc = promex_st_metric_desc[ctx->field_num];
 
 		if (!isttest(name))
-			name = promex_st_metrics[ctx->field_num].n;
+			name = ist(stat_cols_px[ctx->field_num].alt_name);
 		if (!isttest(desc))
 			desc = ist(stat_cols_px[ctx->field_num].desc);
 
@@ -667,6 +538,7 @@ static int promex_dump_front_metrics(struct appctx *appctx, struct htx *htx)
 
 		while (px) {
 			struct promex_label labels[PROMEX_MAX_LABELS-1] = {};
+			enum promex_mt_type type;
 			int lb_idx = 0;
 
 			labels[lb_idx].name  = ist("proxy");
@@ -686,6 +558,9 @@ static int promex_dump_front_metrics(struct appctx *appctx, struct htx *htx)
 			if (!stats_fill_fe_line(px, 0, stats, ST_I_PX_MAX, &(ctx->field_num)))
 				return -1;
 
+			val = stats[ctx->field_num];
+			type = promex_st_gettype(ctx->field_num, (val.type & FN_MASK));
+
 			switch (ctx->field_num) {
 				case ST_I_PX_STATUS:
 					state = !(px->flags & PR_FL_STOPPED);
@@ -695,7 +570,7 @@ static int promex_dump_front_metrics(struct appctx *appctx, struct htx *htx)
 						val = mkf_u32(FO_STATUS, state == ctx->obj_state);
 
 						if (!promex_dump_ts(appctx, prefix, name, desc,
-								    promex_st_metrics[ctx->field_num].type,
+								    type,
 								    &val, labels, &out, max))
 							goto full;
 					}
@@ -712,7 +587,6 @@ static int promex_dump_front_metrics(struct appctx *appctx, struct htx *htx)
 				case ST_I_PX_COMP_RSP:
 					if (px->mode != PR_MODE_HTTP)
 						goto next_px;
-					val = stats[ctx->field_num];
 					break;
 				case ST_I_PX_HRSP_1XX:
 				case ST_I_PX_HRSP_2XX:
@@ -726,15 +600,14 @@ static int promex_dump_front_metrics(struct appctx *appctx, struct htx *htx)
 						ctx->flags &= ~PROMEX_FL_METRIC_HDR;
 					labels[lb_idx].name = ist("code");
 					labels[lb_idx].value = promex_hrsp_code[ctx->field_num - ST_I_PX_HRSP_1XX];
-					val = stats[ctx->field_num];
 					break;
 
 				default:
-					val = stats[ctx->field_num];
+					break;
 			}
 
 			if (!promex_dump_ts(appctx, prefix, name, desc,
-					    promex_st_metrics[ctx->field_num].type,
+					    type,
 					    &val, labels, &out, max))
 				goto full;
 		  next_px:
@@ -849,14 +722,15 @@ static int promex_dump_listener_metrics(struct appctx *appctx, struct htx *htx)
 	enum li_status status;
 
 	for (;ctx->field_num < ST_I_PX_MAX; ctx->field_num++) {
-		if (!(promex_st_metrics[ctx->field_num].flags & ctx->flags))
+		if (!stat_cols_px[ctx->field_num].alt_name ||
+		    !(stat_cols_px[ctx->field_num].cap & STATS_PX_CAP_LI))
 			continue;
 
 		name = promex_st_li_metrics_names[ctx->field_num];
 		desc = promex_st_metric_desc[ctx->field_num];
 
 		if (!isttest(name))
-			name = promex_st_metrics[ctx->field_num].n;
+			name = ist(stat_cols_px[ctx->field_num].alt_name);
 		if (!isttest(desc))
 			desc = ist(stat_cols_px[ctx->field_num].desc);
 
@@ -889,6 +763,8 @@ static int promex_dump_listener_metrics(struct appctx *appctx, struct htx *htx)
 				li = LIST_NEXT(&px->conf.listeners, struct listener *, by_fe);
 
 			list_for_each_entry_from(li, &px->conf.listeners, by_fe) {
+				enum promex_mt_type type;
+
 				if (!li->counters)
 					continue;
 
@@ -899,6 +775,9 @@ static int promex_dump_listener_metrics(struct appctx *appctx, struct htx *htx)
 				                        ST_I_PX_MAX, &(ctx->field_num)))
 					return -1;
 
+				val = stats[ctx->field_num];
+				type = promex_st_gettype(ctx->field_num, (val.type & FN_MASK));
+
 				switch (ctx->field_num) {
 					case ST_I_PX_STATUS:
 						status = get_li_status(li);
@@ -907,18 +786,18 @@ static int promex_dump_listener_metrics(struct appctx *appctx, struct htx *htx)
 							labels[lb_idx+1].name = ist("state");
 							labels[lb_idx+1].value = ist(li_status_st[ctx->obj_state]);
 							if (!promex_dump_ts(appctx, prefix, name, desc,
-									    promex_st_metrics[ctx->field_num].type,
+									    type,
 									    &val, labels, &out, max))
 								goto full;
 						}
 						ctx->obj_state = 0;
 						continue;
 					default:
-						val = stats[ctx->field_num];
+						break;
 				}
 
 				if (!promex_dump_ts(appctx, prefix, name, desc,
-						    promex_st_metrics[ctx->field_num].type,
+						    type,
 						    &val, labels, &out, max))
 					goto full;
 			}
@@ -1051,14 +930,15 @@ static int promex_dump_back_metrics(struct appctx *appctx, struct htx *htx)
 	enum healthcheck_status srv_check_status;
 
 	for (;ctx->field_num < ST_I_PX_MAX; ctx->field_num++) {
-		if (!(promex_st_metrics[ctx->field_num].flags & ctx->flags))
+		if (!stat_cols_px[ctx->field_num].alt_name ||
+		    !(stat_cols_px[ctx->field_num].cap & STATS_PX_CAP_BE))
 			continue;
 
 		name = promex_st_back_metrics_names[ctx->field_num];
 		desc = promex_st_metric_desc[ctx->field_num];
 
 		if (!isttest(name))
-			name = promex_st_metrics[ctx->field_num].n;
+			name = ist(stat_cols_px[ctx->field_num].alt_name);
 		if (!isttest(desc))
 			desc = ist(stat_cols_px[ctx->field_num].desc);
 
@@ -1072,6 +952,7 @@ static int promex_dump_back_metrics(struct appctx *appctx, struct htx *htx)
 			struct promex_label labels[PROMEX_MAX_LABELS-1] = {};
 			unsigned int srv_state_count[PROMEX_SRV_STATE_COUNT] = { 0 };
 			unsigned int srv_check_count[HCHK_STATUS_SIZE] = { 0 };
+			enum promex_mt_type type;
 			const char *check_state;
 			int lb_idx = 0;
 
@@ -1093,6 +974,9 @@ static int promex_dump_back_metrics(struct appctx *appctx, struct htx *htx)
 			if (!stats_fill_be_line(px, 0, stats, ST_I_PX_MAX, &(ctx->field_num)))
 				return -1;
 
+			val = stats[ctx->field_num];
+			type = promex_st_gettype(ctx->field_num, (val.type & FN_MASK));
+
 			switch (ctx->field_num) {
 				case ST_I_PX_AGG_SRV_CHECK_STATUS: // DEPRECATED
 				case ST_I_PX_AGG_SRV_STATUS:
@@ -1109,7 +993,7 @@ static int promex_dump_back_metrics(struct appctx *appctx, struct htx *htx)
 						labels[lb_idx].name = ist("state");
 						labels[lb_idx].value = promex_srv_st[ctx->obj_state];
 						if (!promex_dump_ts(appctx, prefix, name, desc,
-								    promex_st_metrics[ctx->field_num].type,
+								    type,
 								    &val, labels, &out, max))
 							goto full;
 					}
@@ -1134,7 +1018,7 @@ static int promex_dump_back_metrics(struct appctx *appctx, struct htx *htx)
 						labels[lb_idx].name = ist("state");
 						labels[lb_idx].value = ist(check_state);
 						if (!promex_dump_ts(appctx, prefix, name, desc,
-								    promex_st_metrics[ctx->field_num].type,
+								    type,
 								    &val, labels, &out, max))
 							goto full;
 					}
@@ -1147,7 +1031,7 @@ static int promex_dump_back_metrics(struct appctx *appctx, struct htx *htx)
 						labels[lb_idx].value = promex_back_st[ctx->obj_state];
 						val = mkf_u32(FO_STATUS, bkd_state == ctx->obj_state);
 						if (!promex_dump_ts(appctx, prefix, name, desc,
-								    promex_st_metrics[ctx->field_num].type,
+								    type,
 								    &val, labels, &out, max))
 							goto full;
 					}
@@ -1194,7 +1078,6 @@ static int promex_dump_back_metrics(struct appctx *appctx, struct htx *htx)
 				case ST_I_PX_COMP_RSP:
 					if (px->mode != PR_MODE_HTTP)
 						goto next_px;
-					val = stats[ctx->field_num];
 					break;
 				case ST_I_PX_HRSP_1XX:
 				case ST_I_PX_HRSP_2XX:
@@ -1208,15 +1091,14 @@ static int promex_dump_back_metrics(struct appctx *appctx, struct htx *htx)
 						ctx->flags &= ~PROMEX_FL_METRIC_HDR;
 					labels[lb_idx].name = ist("code");
 					labels[lb_idx].value = promex_hrsp_code[ctx->field_num - ST_I_PX_HRSP_1XX];
-					val = stats[ctx->field_num];
 					break;
 
 				default:
-					val = stats[ctx->field_num];
+					break;
 			}
 
 			if (!promex_dump_ts(appctx, prefix, name, desc,
-					    promex_st_metrics[ctx->field_num].type,
+					    type,
 					    &val, labels, &out, max))
 				goto full;
 		  next_px:
@@ -1332,14 +1214,15 @@ static int promex_dump_srv_metrics(struct appctx *appctx, struct htx *htx)
 	const char *check_state;
 
 	for (;ctx->field_num < ST_I_PX_MAX; ctx->field_num++) {
-		if (!(promex_st_metrics[ctx->field_num].flags & ctx->flags))
+		if (!stat_cols_px[ctx->field_num].alt_name ||
+		    !(stat_cols_px[ctx->field_num].cap & STATS_PX_CAP_SRV))
 			continue;
 
 		name = promex_st_srv_metrics_names[ctx->field_num];
 		desc = promex_st_metric_desc[ctx->field_num];
 
 		if (!isttest(name))
-			name = promex_st_metrics[ctx->field_num].n;
+			name = ist(stat_cols_px[ctx->field_num].alt_name);
 		if (!isttest(desc))
 			desc = ist(stat_cols_px[ctx->field_num].desc);
 
@@ -1351,6 +1234,7 @@ static int promex_dump_srv_metrics(struct appctx *appctx, struct htx *htx)
 
 		while (px) {
 			struct promex_label labels[PROMEX_MAX_LABELS-1] = {};
+			enum promex_mt_type type;
 			int lb_idx = 0;
 
 			labels[lb_idx].name  = ist("proxy");
@@ -1380,6 +1264,9 @@ static int promex_dump_srv_metrics(struct appctx *appctx, struct htx *htx)
 				if ((ctx->flags & PROMEX_FL_NO_MAINT_SRV) && (sv->cur_admin & SRV_ADMF_MAINT))
 					goto next_sv;
 
+				val = stats[ctx->field_num];
+				type = promex_st_gettype(ctx->field_num, (val.type & FN_MASK));
+
 				switch (ctx->field_num) {
 					case ST_I_PX_STATUS:
 						state = promex_srv_status(sv);
@@ -1388,7 +1275,7 @@ static int promex_dump_srv_metrics(struct appctx *appctx, struct htx *htx)
 							labels[lb_idx+1].name = ist("state");
 							labels[lb_idx+1].value = promex_srv_st[ctx->obj_state];
 							if (!promex_dump_ts(appctx, prefix, name, desc,
-									    promex_st_metrics[ctx->field_num].type,
+									    type,
 									    &val, labels, &out, max))
 								goto full;
 						}
@@ -1438,7 +1325,7 @@ static int promex_dump_srv_metrics(struct appctx *appctx, struct htx *htx)
 							labels[lb_idx+1].name = ist("state");
 							labels[lb_idx+1].value = ist(check_state);
 							if (!promex_dump_ts(appctx, prefix, name, desc,
-									    promex_st_metrics[ctx->field_num].type,
+									    type,
 									    &val, labels, &out, max))
 								goto full;
 						}
@@ -1460,7 +1347,6 @@ static int promex_dump_srv_metrics(struct appctx *appctx, struct htx *htx)
 							sv = NULL;
 							goto next_px;
 						}
-						val = stats[ctx->field_num];
 						break;
 					case ST_I_PX_HRSP_1XX:
 					case ST_I_PX_HRSP_2XX:
@@ -1476,15 +1362,14 @@ static int promex_dump_srv_metrics(struct appctx *appctx, struct htx *htx)
 							ctx->flags &= ~PROMEX_FL_METRIC_HDR;
 						labels[lb_idx+1].name = ist("code");
 						labels[lb_idx+1].value = promex_hrsp_code[ctx->field_num - ST_I_PX_HRSP_1XX];
-						val = stats[ctx->field_num];
 						break;
 
 					default:
-						val = stats[ctx->field_num];
+						break;
 				}
 
 				if (!promex_dump_ts(appctx, prefix, name, desc,
-						    promex_st_metrics[ctx->field_num].type,
+						    type,
 						    &val, labels, &out, max))
 					goto full;
 			  next_sv:
@@ -1774,7 +1659,7 @@ static int promex_dump_metrics(struct appctx *appctx, struct stconn *sc, struct 
 
 	switch (appctx->st1) {
 		case PROMEX_DUMPER_INIT:
-			ctx->flags |= (PROMEX_FL_METRIC_HDR|PROMEX_FL_INFO_METRIC);
+			ctx->flags |= PROMEX_FL_METRIC_HDR;
 			ctx->obj_state = 0;
 			ctx->field_num = ST_I_INF_NAME;
 			appctx->st1 = PROMEX_DUMPER_GLOBAL;
@@ -1790,8 +1675,7 @@ static int promex_dump_metrics(struct appctx *appctx, struct stconn *sc, struct 
 				}
 			}
 
-			ctx->flags &= ~PROMEX_FL_INFO_METRIC;
-			ctx->flags |= (PROMEX_FL_METRIC_HDR|PROMEX_FL_FRONT_METRIC);
+			ctx->flags |= PROMEX_FL_METRIC_HDR;
 			ctx->obj_state = 0;
 			ctx->field_num = ST_I_PX_PXNAME;
 			ctx->mod_field_num = 0;
@@ -1808,8 +1692,7 @@ static int promex_dump_metrics(struct appctx *appctx, struct stconn *sc, struct 
 				}
 			}
 
-			ctx->flags &= ~PROMEX_FL_FRONT_METRIC;
-			ctx->flags |= (PROMEX_FL_METRIC_HDR|PROMEX_FL_LI_METRIC);
+			ctx->flags |= PROMEX_FL_METRIC_HDR;
 			ctx->obj_state = 0;
 			ctx->field_num = ST_I_PX_PXNAME;
 			ctx->mod_field_num = 0;
@@ -1826,8 +1709,7 @@ static int promex_dump_metrics(struct appctx *appctx, struct stconn *sc, struct 
 				}
 			}
 
-			ctx->flags &= ~PROMEX_FL_LI_METRIC;
-			ctx->flags |= (PROMEX_FL_METRIC_HDR|PROMEX_FL_BACK_METRIC);
+			ctx->flags |= PROMEX_FL_METRIC_HDR;
 			ctx->obj_state = 0;
 			ctx->field_num = ST_I_PX_PXNAME;
 			ctx->mod_field_num = 0;
@@ -1844,8 +1726,7 @@ static int promex_dump_metrics(struct appctx *appctx, struct stconn *sc, struct 
 				}
 			}
 
-			ctx->flags &= ~PROMEX_FL_BACK_METRIC;
-			ctx->flags |= (PROMEX_FL_METRIC_HDR|PROMEX_FL_SRV_METRIC);
+			ctx->flags |= PROMEX_FL_METRIC_HDR;
 			ctx->obj_state = 0;
 			ctx->field_num = ST_I_PX_PXNAME;
 			ctx->mod_field_num = 0;
@@ -1862,7 +1743,6 @@ static int promex_dump_metrics(struct appctx *appctx, struct stconn *sc, struct 
 				}
 			}
 
-			ctx->flags &= ~(PROMEX_FL_METRIC_HDR|PROMEX_FL_SRV_METRIC);
 			ctx->flags |= (PROMEX_FL_METRIC_HDR|PROMEX_FL_MODULE_METRIC);
 			ctx->field_num = 0;
 			ctx->mod_field_num = 0;

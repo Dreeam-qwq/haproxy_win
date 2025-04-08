@@ -2852,6 +2852,10 @@ void srv_settings_cpy(struct server *srv, const struct server *src, int srv_tmpl
 	srv->check.sni                = src->check.sni;
 	srv->check.alpn_str           = src->check.alpn_str;
 	srv->check.alpn_len           = src->check.alpn_len;
+	if (!(srv->flags & SRV_F_RHTTP))
+		srv->check.reuse_pool = src->check.reuse_pool;
+	if (src->check.pool_conn_name)
+		srv->check.pool_conn_name = strdup(src->check.pool_conn_name);
 	/* Note: 'flags' field has potentially been already initialized. */
 	srv->flags                   |= src->flags;
 	srv->do_check                 = src->do_check;
@@ -3113,6 +3117,9 @@ struct server *srv_drop(struct server *srv)
 	event_hdl_sub_list_destroy(&srv->e_subs);
 
 	EXTRA_COUNTERS_FREE(srv->extra_counters);
+
+	if (srv->proxy->lbprm.server_deinit)
+		srv->proxy->lbprm.server_deinit(srv);
 
 	ha_free(&srv);
 
@@ -3501,6 +3508,8 @@ static int _srv_parse_init(struct server **srv, char **args, int *cur_arg,
 			}
 			else {
 				newsrv->flags |= SRV_F_RHTTP;
+				/* Automatically activate check-reuse-pool for rhttp@ servers. */
+				newsrv->check.reuse_pool = 1;
 			}
 		}
 

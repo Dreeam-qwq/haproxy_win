@@ -8,6 +8,7 @@
 #include <haproxy/chunk.h>
 #include <haproxy/init.h>
 #include <haproxy/openssl-compat.h>
+#include <haproxy/ssl_utils.h>
 
 #if defined(HAVE_JWS)
 
@@ -37,47 +38,6 @@ int bn2base64url(const BIGNUM *bn, char *dst, size_t dsize)
 out:
 	return ret;
 }
-
-/* https://datatracker.ietf.org/doc/html/rfc8422#appendix-A */
-/* SECG to NIST curves name */
-static struct curves { char *name; int nid; } curves_list [] =
-{
-	{ "secp256r1",  NID_X9_62_prime256v1 },
-	{ "prime256v1", NID_X9_62_prime256v1 },
-	{ "P-256",      NID_X9_62_prime256v1 },
-
-	{ "secp384r1",  NID_secp384r1 },
-	{ "P-384",      NID_secp384r1 },
-
-	{ "secp521r1",  NID_secp521r1 },
-	{ "P-521",      NID_secp521r1 },
-	{ NULL,         0 },
-};
-
-/* convert a curves name to a openssl NID */
-int curves2nid(const char *curve)
-{
-	struct curves *curves = curves_list;
-
-	while (curves->name) {
-		if (strcmp(curve, curves->name) == 0)
-			return curves->nid;
-		curves++;
-	}
-	return -1;
-}
-
-/* convert an OpenSSL NID to a NIST curves name */
-const char *nid2nist(int nid)
-{
-	switch (nid) {
-		case NID_X9_62_prime256v1: return "P-256";
-		case NID_secp384r1:        return "P-384";
-		case NID_secp521r1:        return "P-521";
-		default:                   return NULL;
-	}
-}
-
 
 /*
  * Convert a EC <pkey> to a public key JWK
@@ -148,13 +108,13 @@ static int EVP_PKEY_EC_to_pub_jwk(EVP_PKEY *pkey, char *dst, size_t dsize)
 	if (str_x->data == 0 || str_y->data == 0)
 		goto out;
 
-	ret = snprintf(dst, dsize, "{\n"
-			"    \"kty\": \"%s\",\n"
-			"    \"crv\": \"%s\",\n"
-			"    \"x\":   \"%s\",\n"
-			"    \"y\":   \"%s\"\n"
-			"}\n",
-			"EC", crv, str_x->area, str_y->area);
+	ret = snprintf(dst, dsize, "{"
+			"\"crv\":\"%s\","
+			"\"kty\":\"%s\","
+			"\"x\":\"%s\","
+			"\"y\":\"%s\""
+			"}",
+			crv, "EC", str_x->area, str_y->area);
 	if (ret >= dsize)
 		ret = 0;
 
@@ -209,12 +169,12 @@ static int EVP_PKEY_RSA_to_pub_jwk(EVP_PKEY *pkey, char *dst, size_t dsize)
 	if (str_n->data == 0 || str_e->data == 0)
 		goto out;
 
-	ret = snprintf(dst, dsize, "{\n"
-			"    \"kty\": \"%s\",\n"
-			"    \"n\":   \"%s\",\n"
-			"    \"e\":   \"%s\"\n"
-			"}\n",
-			"RSA", str_n->area, str_e->area);
+	ret = snprintf(dst, dsize, "{"
+			"\"e\":\"%s\","
+			"\"kty\":\"%s\","
+			"\"n\":\"%s\""
+			"}",
+			str_e->area, "RSA", str_n->area );
 	if (ret >= dsize)
 		ret = 0;
 
@@ -454,7 +414,7 @@ int jws_b64_signature(EVP_PKEY *pkey, enum jwt_alg alg, char *b64protected, char
 		const BIGNUM *r = NULL, *s = NULL;
 		int bignum_len;
 
-		/* need to pad to byte size, essentialy for P-521 */
+		/* need to pad to byte size, essentially for P-521 */
 		bignum_len = (EVP_PKEY_bits(pkey) + 7) / 8;
 
 		if ((sig = d2i_ECDSA_SIG(NULL, (const unsigned char **)&sign->area, sign->data)) == NULL)
@@ -485,6 +445,44 @@ out:
 	return ret;
 
 }
+
+/*
+ * Fill a <dst> buffer of <dsize> size with a jwk thumbprint from a pkey
+ *
+ * Return the size of the data or 0
+ */
+int jws_thumbprint(EVP_PKEY *pkey, char *dst, size_t dsize)
+{
+	int ret = 0;
+	struct buffer *jwk = NULL;
+	unsigned char md[EVP_MAX_MD_SIZE];
+	unsigned int size;
+
+	if ((jwk = alloc_trash_chunk()) == NULL)
+		goto out;
+
+	switch (EVP_PKEY_base_id(pkey)) {
+		case EVP_PKEY_RSA:
+			jwk->data = EVP_PKEY_RSA_to_pub_jwk(pkey, jwk->area, jwk->size);
+			break;
+		case EVP_PKEY_EC:
+			jwk->data = EVP_PKEY_EC_to_pub_jwk(pkey, jwk->area, jwk->size);
+			break;
+		default:
+			break;
+	}
+
+
+	if (EVP_Digest(jwk->area, jwk->data, md, &size, EVP_sha256(), NULL) == 0)
+		goto out;
+
+	ret = a2base64url((const char *)md, size, dst, dsize);
+
+out:
+	free_trash_chunk(jwk);
+	return ret;
+}
+
 
 int jws_flattened(char *protected, char *payload, char *signature, char *dst, size_t dsize)
 {

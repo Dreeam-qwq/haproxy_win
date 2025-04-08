@@ -172,6 +172,7 @@ struct check {
 	char desc[HCHK_DESC_LEN];		/* health check description */
 	signed char use_ssl;			/* use SSL for health checks (1: on, 0: server mode, -1: off) */
 	int send_proxy;				/* send a PROXY protocol header with checks */
+	int reuse_pool;				/* try to reuse idle connections */
 	struct tcpcheck_rules *tcpcheck_rules;	/* tcp-check send / expect rules */
 	struct tcpcheck_rule *current_step;     /* current step when using tcpcheck */
 	int inter, fastinter, downinter;        /* checks: time in milliseconds */
@@ -187,6 +188,7 @@ struct check {
 	char **envp;				/* the environment to use if running a process-based check */
 	struct pid_list *curpid;		/* entry in pid_list used for current process-based test, or -1 if not in test */
 	struct sockaddr_storage addr;   	/* the address to check */
+	char *pool_conn_name;                   /* conn name used on reuse */
 	char *sni;				/* Server name */
 	char *alpn_str;                         /* ALPN to use for checks */
 	int alpn_len;                           /* ALPN string length */

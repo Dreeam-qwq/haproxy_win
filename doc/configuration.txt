@@ -3,7 +3,7 @@
                           Configuration Manual
                          ----------------------
                               version 3.2
-                              2025/03/07
+                              2025/04/02
 
 
 This document covers the configuration language as implemented in the version
@@ -1691,8 +1691,10 @@ The following keywords are supported in the "global" section :
    - tune.quic.disable-tx-pacing
    - tune.quic.disable-udp-gso
    - tune.quic.frontend.glitches-threshold
+   - tune.quic.frontend.max-data-size
    - tune.quic.frontend.max-idle-timeout
    - tune.quic.frontend.max-streams-bidi
+   - tune.quic.frontend.stream-data-ratio
    - tune.quic.frontend.default-max-window-size
    - tune.quic.max-frame-loss
    - tune.quic.reorder-ratio
@@ -1959,7 +1961,7 @@ cpu-policy <policy>
   thread groups.
 
   This mapping is normally performed using the "cpu-map" directive, though it
-  can be particularly difficult to maintain on heterogenous systems.
+  can be particularly difficult to maintain on heterogeneous systems.
 
   The "cpu-policy" directive chooses between a small number of allocation
   policies which one to use instead, when "cpu-map" is not used. The following
@@ -1992,6 +1994,33 @@ cpu-policy <policy>
                         thread group will be enabled with all of them, within
                         the limit of 32 or 64 depending on the system. This is
                         the default policy.
+
+   - group-by-2-clusters same as "group-by-cluster" but create a group every
+                        two clusters. This can make sense on CPUs having many
+                        clusters of few cores each, to avoid creating many
+                        groups, or to smooth the distribution a little bit when
+                        not all cores are in use. Please note that it can have
+                        very bad performance effects when the communication
+                        between clusters is slow. This is generally recommended
+                        against.
+
+   - group-by-3-clusters same as "group-by-cluster" but create a group every
+                        three clusters. This can make sense on CPUs having many
+                        clusters of few cores each, to avoid creating many
+                        groups, or to smooth the distribution a little bit when
+                        not all cores are in use. Please note that it can have
+                        very bad performance effects when the communication
+                        between clusters is slow. This is generally recommended
+                        against.
+
+   - group-by-4-clusters same as "group-by-cluster" but create a group every
+                        four clusters. This can make sense on CPUs having many
+                        clusters of few cores each, to avoid creating many
+                        groups, or to smooth the distribution a little bit when
+                        not all cores are in use. Please note that it can have
+                        very bad performance effects when the communication
+                        between clusters is slow. This is generally recommended
+                        against.
 
    - group-by-cluster   if neither "nbthread" not "nbtgroups" were set, then
                         one thread group is created for each CPU cluster with
@@ -4194,7 +4223,7 @@ tune.max-rules-at-once <number>
   cpu-demanding actions (e.g.: actions that work on content) may create thread
   contention as all the rules from a given ruleset are evaluated under the same
   polling loop if the evaluation is not interrupted. This option ensures that no
-  more than <number> number of rules may be excecuted under the same polling
+  more than <number> number of rules may be executed under the same polling
   loop for content-oriented rulesets (those that already support yielding due
   to content inspection). What it does is that it forces the evaluating function
   to yield, so that it comes back on the next polling loop to continues the
@@ -4336,6 +4365,21 @@ tune.quic.frontend.glitches-threshold <number>
 
   See also: fc_glitches
 
+tune.quic.frontend.max-data-size <size>
+  This setting is the hard limit for the number of data bytes in flight over a
+  QUIC frontend connection. It is reused as the value for the initial_max_data
+  transport parameter. It directly impacts the upload bandwidth for the peer
+  depending on the latency and the per-connection memory consumption in
+  haproxy.
+
+  By default, the value is set to 0, which indicates that it must be
+  automatically generated as the product between max-streams-bidi and bufsize.
+  This can be increased for example if a backend application relies on massive
+  uploads over high latency networks.
+
+  See also: "tune.quic.frontend.max-streams-bidi",
+            "tune.quic.frontend.stream-data-ratio"
+
 tune.quic.frontend.max-idle-timeout <timeout>
   Sets the QUIC max_idle_timeout transport parameters in milliseconds for
   frontends which determines the period of time after which a connection silently
@@ -4353,7 +4397,32 @@ tune.quic.frontend.max-streams-bidi <number>
   will be authorized to open. This determines the number of concurrent client
   requests.
 
-  The default value is 100.
+  The default value is 100. Note that if you reduces it, it can restrict the
+  buffering capabilities of streams on receive, which would result in poor
+  upload throughput. It can be corrected by increasing
+  tune.quic.frontend.max-data-size setting.
+
+  See also: "tune.quic.frontend.max-data-size",
+            "tune.quic.frontend.stream-data-ratio"
+
+tune.quic.frontend.stream-data-ratio  <0..100, in percent>
+  This setting allows to configure the hard limit of the number of data bytes
+  in flight over each stream. It is expressed as a percentage relative to
+  "tune.quic.frontend.max-data-size" setting, with the result rounded up to
+  bufsize.
+
+  The default value is 90. This is suitable with the most frequent web
+  scenario, where uploads is performed only for one or a few streams, whereas
+  the rest are used for download only. If max-data-size connection limit
+  remains at a reasonable level, it ensures that only a portion of opened
+  streams can allocate to their maximum capacity.
+
+  In the case of an application using many uploading streams in parallel and
+  suffering from unfairness between these streams, it can make sense to reduce
+  this ratio, to increase fairness and reduce the per-stream bandwidth.
+
+  See also: "tune.quic.frontend.max-data-size",
+            "tune.quic.frontend.max-streams-bidi"
 
 tune.quic.frontend.default-max-window-size <size>
   Sets the default maximum window size for the congestion controller of a
@@ -4814,9 +4883,9 @@ subsystem. This will dump debug messages about a specific subsystem. It is a
 very powerful tool to diagnose issues. Traces can be dynamically configured via
 the CLI. It is also possible to predefined some settings in the configuration
 file, in dedicated "traces" sections. More details about traces can be found in
-the management guide. It remains a developper tools used during complex
+the management guide. It remains a developer tools used during complex
 debugging sessions.  It is pretty verbose and have a cost, so use it with
-caution. And because it is a developper tool, there is no warranty about the
+caution. And because it is a developer tool, there is no warranty about the
 backward compatibility of this section.
 
 traces
@@ -5924,7 +5993,7 @@ specified in a previous "defaults" section. Keywords supported in defaults
 sections marked with "(!)" are only supported in named defaults sections, not
 anonymous ones.
 
-Note: Some dangerous and not recommanded directives are intentionnaly not
+Note: Some dangerous and not recommended directives are intentionnaly not
       listed in the following matrix. It is on purpose. These directives are
       documentated. But by not listing them below is one more way to discourage
       anyone to use it.
@@ -5969,6 +6038,7 @@ filter                                    -          X         X         X
 fullconn                                  X          -         X         X
 guid                                      -          X         X         X
 hash-balance-factor                       X          -         X         X
+hash-preserve-affinity                    X          -         X         X
 hash-type                                 X          -         X         X
 http-after-response                       X (!)      X         X         X
 http-check comment                        X          -         X         X
@@ -7188,63 +7258,6 @@ cookie <name> [ rewrite | insert | prefix ] [ indirect ] [ nocache ]
 
   See also : "balance source", "capture cookie", "server" and "ignore-persist".
 
-crt <crtname> [<sslbindconf> ...]*
-  Assignate a certificate to the current frontend.
-
-  May be used in the following contexts: tcp, http
-
-  May be used in sections :   defaults | frontend | listen | backend
-                                 no    |    yes   |   yes  |   no
-
-  Arguments :
-    <sslbindconf> supports the following keywords from the bind line
-    (see Section 5.1. Bind options):
-
-    - allow-0rtt
-    - alpn
-    - ca-file
-    - ca-verify-file
-    - ciphers
-    - ciphersuites
-    - client-sigalgs
-    - crl-file
-    - curves
-    - ecdhe
-    - no-alpn
-    - no-ca-names
-    - npn
-    - sigalgs
-    - ssl-min-ver
-    - ssl-max-ver
-    - verify
-
-    sslbindconf also supports the following keywords from the crt-store load
-    keyword (see Section 3.12.1. Load options):
-
-    - key
-    - ocsp
-    - issuer
-    - sctl
-    - ocsp-update
-
-  Assignate a certificate <crtname> to a crt-list created automatically with the
-  frontend name and prefixed by @ (ex: '@frontend1').
-
-  This implicit crt-list will be assigned to every "ssl" bind lines in a
-  frontend that does not already have the "crt" or the "crt-list" line.
-  crt-list commands from the stats socket are effective with this crt-list, so
-  one could replace, remove or add certificates and SSL options to it.
-
-  Example :
-
-    frontend https
-        bind :443 ssl
-        crt foobar.pem.rsa sigalgs "RSA-PSS+SHA256"
-        crt test.foobar.pem
-        crt test2.foobar.crt key test2.foobar.key ocsp test2.foobar.ocsp ocsp-update on
-
-  See also : "crt-list" and "crt".
-
 declare capture [ request | response ] len <length>
   Declares a capture slot.
 
@@ -7857,6 +7870,35 @@ hash-balance-factor <factor>
 
   See also : "balance" and "hash-type".
 
+hash-preserve-affinity { always | maxconn | maxqueue }
+  Specify a method for assigning streams to servers with hash load balancing
+  when servers are satured or have a full queue.
+
+  May be used in the following contexts: http
+
+  May be used in sections:   defaults | frontend | listen | backend
+                               yes    |    no    |   yes  |   yes
+
+  The following values can be specified:
+
+    - "always"   : this is the default strategy. A stream is assigned to a
+                   server based on hashing irrespective of whether the server
+                   is currently saturated.
+
+    - "maxconn"  : when selected, servers that have "maxconn" set and are
+                   currently saturated will be skipped. Another server will be
+                   picked by following the hashing ring. This has no effect on
+                   servers that do not set "maxconn". If all servers are
+                   saturated, the request is enqueued to the last server in the
+                   hash ring before the initially selected server.
+
+    - "maxqueue" : when selected, servers that have "maxconn" set, "maxqueue"
+                   set to a non-zero value (limited queue size) and currently
+                   have a full queue will be skipped. Another server will be
+                   picked by following the hashing ring. This has no effect on
+                   servers that do not set both "maxconn" and "maxqueue".
+
+  See also : "maxconn", "maxqueue", "hash-balance-factor"
 
 hash-type <method> <function> <modifier>
   Specify a method to use for mapping hashes to servers
@@ -7950,8 +7992,8 @@ hash-type <method> <function> <modifier>
   default function is "sdbm", the selection of a function should be based on
   the range of the values being hashed.
 
-  See also : "balance", "hash-balance-factor", "server"
-
+  See also : "balance", "hash-balance-factor", "hash-preserve-affinity",
+             "server"
 
 http-after-response <action> <options...> [ { if | unless } <condition> ]
   Access control for all Layer 7 responses (server, applet/service and internal
@@ -11968,7 +12010,7 @@ redirect scheme   <sch> [code <code>] <option> [{if | unless} <condition>]
       - "set-cookie-fmt <fmt>"
         It is equivaliant to the option above, except the "Set-Cookie" header
         will be filled with the result of the log-format string <fmt>
-        evaluation. Be carefull to respect the "NAME[=value]" format because no
+        evaluation. Be careful to respect the "NAME[=value]" format because no
         special check are performed during the configuration parsing.
 
       - "clear-cookie NAME[=]"
@@ -12557,6 +12599,63 @@ stats admin { if | unless } <cond>
   See also : "stats enable", "stats auth", "stats http-request", section 3.4
              about userlists and section 7 about ACL usage.
 
+ssl-f-use [<sslbindconf> ...]*
+  Assignate a certificate to the current frontend.
+
+  May be used in the following contexts: tcp, http
+
+  May be used in sections :   defaults | frontend | listen | backend
+                                 no    |    yes   |   yes  |   no
+
+  Arguments :
+    <sslbindconf> supports the following keywords from the bind line
+    (see Section 5.1. Bind options):
+
+    - allow-0rtt
+    - alpn
+    - ca-file
+    - ca-verify-file
+    - ciphers
+    - ciphersuites
+    - client-sigalgs
+    - crl-file
+    - curves
+    - ecdhe
+    - no-alpn
+    - no-ca-names
+    - npn
+    - sigalgs
+    - ssl-min-ver
+    - ssl-max-ver
+    - verify
+
+    sslbindconf also supports the following keywords from the crt-store load
+    keyword (see Section 3.12.1. Load options):
+
+    - crt
+    - key
+    - ocsp
+    - issuer
+    - sctl
+    - ocsp-update
+
+  Assignate a certificate <crtname> to a crt-list created automatically with the
+  frontend name and prefixed by @ (ex: '@frontend1').
+
+  This implicit crt-list will be assigned to every "ssl" bind lines in a
+  frontend that does not already have the "crt" or the "crt-list" line.
+  crt-list commands from the stats socket are effective with this crt-list, so
+  one could replace, remove or add certificates and SSL options to it.
+
+  Example :
+
+    frontend https
+        bind :443 ssl
+        ssl-f-use crt foobar.pem.rsa sigalgs "RSA-PSS+SHA256"
+        ssl-f-use crt test.foobar.pem
+        ssl-f-use crt test2.foobar.crt key test2.foobar.key ocsp test2.foobar.ocsp ocsp-update on
+
+  See also : "crt-list" and "crt".
 
 stats auth <user>:<passwd>
   Enable statistics with authentication and grant access to an account
@@ -13349,8 +13448,8 @@ stick-table type {ip | integer | string [len <length>] | binary [len <length>]}
                defined period. The factor must be greater than 0 and lower or
                equal to 1024.
 
-   [recv-only] indicates that we don't intent to use the table to perform
-               updates on it, but thay we only plan on using the table to
+   [recv-only] indicates that we don't intend to use the table to perform
+               updates on it, but that we only plan on using the table to
                retrieve data from a remote peer which we are interested in.
                Indeed, the use of this keyword enables the retrieval of
                local-only values such as conn_cur that are not learned by
@@ -14254,8 +14353,8 @@ tcp-request content <action> [{if | unless} <condition>]
         # and reject everything else. (works for HTTP/1 and HTTP/2 connections)
         acl is_host_com hdr(Host) -i example.com
         tcp-request inspect-delay 5s
-        tcp-request switch-mode http if HTTP
-        tcp-request reject   # non-HTTP traffic is implicit here
+        tcp-request content switch-mode http if HTTP
+        tcp-request content reject   # non-HTTP traffic is implicit here
         ...
         http-request reject unless is_host_com
 
@@ -17168,81 +17267,114 @@ crt-list <file>
 
         <crtfile> [\[<sslbindconf> ...\]] [[!]<snifilter> ...]
 
-  sslbindconf supports the following keywords from the bind line
-  (see Section 5.1. Bind options):
-
-  - allow-0rtt
-  - alpn
-  - ca-file
-  - ca-verify-file
-  - ciphers
-  - ciphersuites
-  - client-sigalgs
-  - crl-file
-  - curves
-  - ecdhe
-  - no-alpn
-  - no-ca-names
-  - npn
-  - sigalgs
-  - ssl-min-ver
-  - ssl-max-ver
-  - verify
-
-  sslbindconf also supports the following keywords from the crt-store load
-  keyword (see Section 3.12.1. Load options):
-
-  - crt
-  - key
-  - ocsp
-  - issuer
-  - sctl
-  - ocsp-update
-
-  It overrides the configuration set in bind line for the certificate.
-
-  Wildcards are supported in the SNI filter. Negative filter are also supported,
-  useful in combination with a wildcard filter to exclude a particular SNI, or
-  after the first certificate to exclude a pattern from its CN or Subject Alt
-  Name (SAN). The certificates will be presented to clients who provide a valid
-  TLS Server Name Indication field matching one of the SNI filters. If no SNI
-  filter is specified, the CN and SAN are used. This directive may be specified
-  multiple times. See the "crt" option for more information. The default
-  certificate is still needed to meet OpenSSL expectations. If it is not used,
-  the 'strict-sni' option may be used.
-
-  Multi-cert bundling (see "ssl-load-extra-files") is supported with crt-list,
-  as long as only the base name is given in the crt-list. SNI filter will do
-  the same work on all bundled certificates.
-
   Empty lines as well as lines beginning with a hash ('#') will be ignored.
 
-  The first declared certificate of a bind line is used as the default
-  certificate, either from crt or crt-list option, which HAProxy should use in
-  the TLS handshake if no other certificate matches. This certificate will also
-  be used if the provided SNI matches its CN or SAN, even if a matching SNI
-  filter is found on any crt-list. The SNI filter !* can be used after the first
-  declared certificate to not include its CN and SAN in the SNI tree, so it will
-  never match except if no other certificate matches. This way the first
-  declared certificate act as a fallback. It is also possible to declare a '*'
-  filter, which will allow to chose this certificate as default. When multiple
-  default certificates are defined, HAProxy is able to chose the right ECDSA or
-  RSA one depending on what the client supports.
+  The crt-list can be manipulated dynamically over the stats socket. (See "add
+  ssl crt-list", "del ssl crt-list", "show ssl crt-list" in the management
+  guide).
 
-  When no ALPN is set, the "bind" line's default one is used. If a "bind" line
-  has no "no-alpn", "alpn" nor "npn" set, a default value will be used
-  depending on the protocol (see "alpn" above). However if the "bind" line has
-  a different default, or explicitly disables ALPN using "no-alpn", it is
-  possible to force a specific value for a certificate.
+  crt-list are usually dedicated files, however a directory loaded with the "crt"
+  directive is represented internally as a crt-list. The "ssl-f-use" directive
+  in a frontend also declares a crt-list linked to this frontend.
 
-  crt-list file example:
-        cert1.pem !*
+  crtfile:
+
+    This is the filename of the certificate, or an identifier if it was declared
+    elsewhere (over the CLI or in a crt-store with an alias for example).
+
+    It is possible to use the same <crtfile> on multiple lines with different
+    options and filters.
+
+    Multi-cert bundling (see "ssl-load-extra-files") is supported in a
+    crt-list, as long as only the base name is given in <crtfile>. HAProxy
+    will duplicate the crt-list line internally, adding an algorithm extension
+    (.rsa, .ecdsa, .dsa) when loading the file.
+
+  sslbindconf:
+
+     <sslbindconf> supports the following keywords from the bind line (see
+     Section 5.1. Bind options):
+
+     - allow-0rtt
+     - alpn
+     - ca-file
+     - ca-verify-file
+     - ciphers
+     - ciphersuites
+     - client-sigalgs
+     - crl-file
+     - curves
+     - ecdhe
+     - no-alpn
+     - no-ca-names
+     - npn
+     - sigalgs
+     - ssl-min-ver
+     - ssl-max-ver
+     - verify
+
+     <sslbindconf> also supports the following keywords from the crt-store load
+     keyword (see Section 3.12.1. Load options):
+
+     - crt
+     - key
+     - ocsp
+     - issuer
+     - sctl
+     - ocsp-update
+
+    Parameters from the bind line are inherited in <sslbindconf>, if none were
+    specified, the default options are inherited, the parameters specified in
+    <sslbindconf> overwrite those inherited settings.
+
+  snifilter:
+
+    When the <snifilter> parameter is used on a crt-list line, the CN and SAN
+    are not used anymore to select the certificate on this line during the
+    handshake but the <snifilter> is used instead.
+
+    <snifilter> is a list of entries separated by spaces. This list can contain
+    domains, or wildcards. The wildcards are in wildcard DNS format, using a
+    single asterisk as the first character of the entry. It is possible to
+    exclude a domain from a wildcard with a negative filter by specifying a '!'
+    in front of a single domain. Having a ! in front of a * is ignored. Having
+    negative filters without a wildcard on the same line is not supported as
+    well. The special entry '*' is used to specify default certificates, which
+    are used as fallback when no domain matched.
+
+    The certificates will be presented to clients who provide a valid TLS
+    Server Name Indication field matching one of the SNI filters, or the CN and
+    SAN of a <crtfile>. The matching algorithm first looks for a positive domain
+    entry in the list, if not found it will try to look for a wildcard in the
+    list. If a wilcard match, haproxy checks for a negative filter from the
+    same line and unmatch if necessary. In case of multiple key algorithms
+    (RSA,ECDSA,DSA), HAProxy will try to match one certificate per type and
+    chose the right one depending on what is supported by the client.
+
+    If no SNI is presented by the client or if no certificate matched, this
+    will fallback to one of the default certificate. To disable the default
+    certificate fallback, the 'strict-sni' option may be used.
+    When multiple default certificates are defined, HAProxy is able to chose
+    the right ECDSA or RSA one depending on what the client supports.
+
+    The first declared certificate of a bind line is used as a default
+    certificate, either from crt or crt-list option.
+    It is also possible to declare a '*' filter, which will add this
+    certificate to the list of default certificates. To clarify the
+    configuration, the default certificates could be explicited (with a '*'
+    filter) at the beginning of the list, so an implicit default is not added
+    before.
+
+    The "show ssl sni" command on the stats socket could be used to debug your
+    configuration. (See "show ssl sni" in the management guide)
+
+  Example:
         # comment
-        cert2.pem [alpn h2,http/1.1]
-        certW.pem                   *.domain.tld !secure.domain.tld
-        certS.pem [curves X25519:P-256 ciphers ECDHE-ECDSA-AES256-GCM-SHA384] secure.domain.tld
         default.pem.rsa *
         default.pem.ecdsa *
+        cert2.pem [alpn h2,http/1.1]
+        certW.pem *.domain.tld !secure.domain.tld
+        certS.pem [curves X25519:P-256 ciphers ECDHE-ECDSA-AES256-GCM-SHA384] secure.domain.tld
         foo.crt [key bar.pem ocsp foo.ocsp ocsp-update on] foo.bar.com
 
 default-crt <cert>
@@ -17892,8 +18024,8 @@ agent-check
     to set the weight of a server. Setting it with the "weight:" prefix is
     preferred.
 
-  - The string "weight:" following by an positive interger or a positive
-    interger percentage, with no space. If the value ends with the '%' sign,
+  - The string "weight:" following by an positive integer or a positive
+    integer percentage, with no space. If the value ends with the '%' sign,
     then the new weight will be proportional to the initially weight of the
     server. Otherwise, the value is considered as an absolute weight and must
     be between 0 and 256. Servers which are part of a farm running a static
@@ -18104,6 +18236,23 @@ check
         tcp-check connect
         server s1 192.168.0.1:443 ssl check
 
+check-reuse-pool
+  May be used in the following contexts: tcp, http
+
+  This option permits checks to reuse idle connections if available instead of
+  opening a dedicated one. The connection is reinserted in the pool on check
+  completion. The main objective is to limit the number of connections opening
+  and closure on a specific server.
+
+  Note that for configuration simplicity, this option is silently ignored if
+  any specific check connect option is defined, either on the server line or
+  via a custom tcp-check connect rule.
+
+  This option is automatically enabled for servers acting as passive reverse
+  HTTP gateway, as for those servers connect is only supported through reuse.
+
+  See also: "check-pool-conn-name"
+
 check-send-proxy
   May be used in the following contexts: tcp, http
 
@@ -18121,6 +18270,16 @@ check-alpn <protocols>
   Defines which protocols to advertise with ALPN. The protocol list consists in
   a comma-delimited list of protocol names, for instance: "http/1.1,http/1.0"
   (without quotes). If it is not set, the server ALPN is used.
+
+check-pool-conn-name <name>
+  May be used in the following contexts: tcp, http
+
+  When connection reuse is performed for checks, uses <name> if set as a
+  connection identifier to match a corresponding connection in the pool. This
+  serves as the equivalent to the "pool-conn-name" server keyword. "check-sni"
+  will also be used as a fallback if the current option is not used.
+
+  See also: "check-reuse-pool"
 
 check-proto <name>
   May be used in the following contexts: tcp, http
@@ -18432,7 +18591,7 @@ init-state { fully-up | up | down | fully-down }
 
   The "init-state" option sets the initial state of the server:
     - when set to 'fully-up', the server is considered immediately available
-      and can turn to the DOWN sate when ALL health checks fail.
+      and can turn to the DOWN state when ALL health checks fail.
     - when set to 'up' (the default), the server is considered immediately
       available and will initiate a health check that can turn it to the DOWN
       state immediately if it fails.
@@ -18602,6 +18761,12 @@ no-check
   default value.
   It may also be used as "default-server" setting to reset any previous
   "default-server" "check" setting.
+
+no-check-reuse-pool
+  May be used in the following contexts: tcp, http
+
+  This option reverts any previous "check-reuse-pool" possibly inherited from a
+  "default-server". Any checks will be conducted on its dedicated connection.
 
 no-check-ssl
   May be used in the following contexts: tcp, http, log
@@ -18969,7 +19134,7 @@ resolve-opts <option>,<option>,...
     using an "agent-check" or through the runtime api.
 
   * prevent-dup-ip
-    Ensure HAProxy's default behavior is enforced on a server: prevent re-using
+    Ensure HAProxy's default behavior is enforced on a server: prevent reusing
     an IP address already set to a server in the same backend and sharing the
     same fqdn.
     This is the opposite of allow-dup-ip.
@@ -22143,7 +22308,7 @@ when(<condition>[,<args>...])
   some rarely needed data that should only be emitted under certain conditions,
   such as debugging information when an error is met.
 
-  The condition is made of a keyword among the list below, optionally preceeded
+  The condition is made of a keyword among the list below, optionally preceded
   by an exclamation mark ('!') to negate it, and optionally suffixed by some
   arguments specific to that condition:
 
@@ -22984,6 +23149,7 @@ bc_err_str                                         string
 bc_glitches                                        integer
 bc_http_major                                      integer
 bc_nb_streams                                      integer
+bc_reused                                          boolean
 bc_src                                             ip
 bc_src_port                                        integer
 bc_srv_queue                                       integer
@@ -23275,6 +23441,9 @@ bc_http_major : integer
 
 bc_nb_streams : integer
   Returns the number of streams opened on the backend connection.
+
+bc_reused : boolean
+  Returns true if the transfer was performed via a reused backend connection.
 
 bc_src : ip
   This is the source ip address of the connection on the server side, which is

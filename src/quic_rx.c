@@ -205,7 +205,7 @@ static int qc_pkt_decrypt(struct quic_conn *qc, struct quic_enc_level *qel,
 /* Handle <frm> frame whose packet it is attached to has just been acknowledged. The memory allocated
  * for this frame will be at least released in every cases.
  *
- * Returns 1 on sucess else 0.
+ * Returns 1 on success else 0.
  */
 static int qc_handle_newly_acked_frm(struct quic_conn *qc, struct quic_frame *frm)
 {
@@ -311,7 +311,7 @@ static void qc_newly_acked_pkts(struct quic_conn *qc, struct eb_root *pkts,
 
 /* Handle <newly_acked_pkts> list of newly acknowledged TX packets.
  *
- * Returns 1 on sucess else 0.
+ * Returns 1 on success else 0.
  */
 static int qc_handle_newly_acked_pkts(struct quic_conn *qc,
                                       unsigned int *pkt_flags, struct list *newly_acked_pkts)
@@ -1645,7 +1645,7 @@ static inline int quic_padding_check(const unsigned char *pos,
 
 /* Validate the token, retry or not (provided by NEW_TOKEN) parsed into
  * <pkt> RX packet from <dgram> datagram.
- * Return 1 if succeded, 0 if not.
+ * Return 1 if succeeded, 0 if not.
  */
 static inline int quic_token_validate(struct quic_rx_packet *pkt,
                                       struct quic_dgram *dgram,

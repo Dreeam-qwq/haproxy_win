@@ -177,9 +177,8 @@ const char *log_levels[NB_LOG_LEVELS] = {
 	"emerg", "alert", "crit", "err",
 	"warning", "notice", "info", "debug"
 };
-
-const char sess_term_cond[16] = "-LcCsSPRIDKUIIII"; /* normal, Local, CliTo, CliErr, SrvTo, SrvErr, PxErr, Resource, Internal, Down, Killed, Up, -- */
-const char sess_fin_state[8]  = "-RCHDLQT";	/* cliRequest, srvConnect, srvHeader, Data, Last, Queue, Tarpit */
+const char sess_term_cond[] = "-LcCsSPRIDKUIIII"; /* normal, Local, CliTo, CliErr, SrvTo, SrvErr, PxErr, Resource, Internal, Down, Killed, Up, -- */
+const char sess_fin_state[]  = "-RCHDLQT";	/* cliRequest, srvConnect, srvHeader, Data, Last, Queue, Tarpit */
 const struct buffer empty = { };
 
 
@@ -760,11 +759,17 @@ int lf_expr_compile(struct lf_expr *lf_expr,
 				else {
 					/* custom type */
 					*str = 0; // so that typecast_str is 0 terminated
-					typecast = type_to_smp(typecast_str);
-					if (typecast != SMP_T_STR && typecast != SMP_T_SINT &&
-					    typecast != SMP_T_BOOL) {
-						memprintf(err, "unexpected output type '%.*s' at position %d line : '%s'. Supported types are: str, sint, bool", (int)(str - typecast_str), typecast_str, (int)(typecast_str - backfmt), fmt);
-						goto fail;
+					if (strcmp(typecast_str, "raw") == 0) {
+						/* special case */
+						typecast = SMP_TYPES;
+					}
+					else {
+						typecast = type_to_smp(typecast_str);
+						if (typecast != SMP_T_STR && typecast != SMP_T_SINT &&
+						    typecast != SMP_T_BOOL) {
+							memprintf(err, "unexpected output type '%.*s' at position %d line : '%s'. Supported types are: str, sint, bool, raw", (int)(str - typecast_str), typecast_str, (int)(typecast_str - backfmt), fmt);
+							goto fail;
+						}
 					}
 				}
 				cformat = LF_EDONAME;
@@ -2007,8 +2012,6 @@ static char *_encode_byte_hex(char *start, char *stop, unsigned char byte)
 
 /* lf cbor function ptr used to encode a single byte according to RFC8949
  *
- * for now only hex form is supported.
- *
  * The function may only be called under CBOR context (that is when
  * LOG_OPT_ENCODE_CBOR option is set).
  *
@@ -2263,7 +2266,7 @@ static char *_lf_encode_bytes(char *start, char *stop,
 		encode_byte = _lf_map_escape_byte;
 
 	if (ctx->options & LOG_OPT_ENCODE_CBOR) {
-		if (!bytes_stop) {
+		if (!bytes_stop || ctx->in_text) {
 			/* printable chars: use cbor text */
 			cbor_string_prefix = 0x60;
 		}
@@ -3473,9 +3476,8 @@ struct ist *build_log_header(struct log_header hdr, size_t *nbelem)
 
 	return hdr_ctx.ist_vector;
 }
-
-const char sess_cookie[8]     = "NIDVEOU7";	/* No cookie, Invalid cookie, cookie for a Down server, Valid cookie, Expired cookie, Old cookie, Unused, unknown */
-const char sess_set_cookie[8] = "NPDIRU67";	/* No set-cookie, Set-cookie found and left unchanged (passive),
+const char sess_cookie[]     = "NIDVEOU7";	/* No cookie, Invalid cookie, cookie for a Down server, Valid cookie, Expired cookie, Old cookie, Unused, unknown */
+const char sess_set_cookie[] = "NPDIRU67";	/* No set-cookie, Set-cookie found and left unchanged (passive),
 						   Set-cookie Deleted, Set-Cookie Inserted, Set-cookie Rewritten,
 						   Set-cookie Updated, unknown, unknown */
 
@@ -4106,9 +4108,16 @@ int sess_build_logline_orig(struct session *sess, struct stream *s,
 			 * know how to deal with binary data.
 			 */
 			if (ctx->options & LOG_OPT_ENCODE) {
-				if (ctx->typecast == SMP_T_STR ||
-				    ctx->typecast == SMP_T_SINT ||
-				    ctx->typecast == SMP_T_BOOL) {
+				if (ctx->typecast == SMP_TYPES) {
+					/* raw data, ignore LOG opts and enforce binary
+					 * to dump smp as-is
+					 */
+					ctx->options = LOG_OPT_NONE;
+					type = SMP_T_BIN;
+				}
+				else if (ctx->typecast == SMP_T_STR ||
+				         ctx->typecast == SMP_T_SINT ||
+				         ctx->typecast == SMP_T_BOOL) {
 					/* enforce type */
 					type = ctx->typecast;
 				}
@@ -5967,7 +5976,7 @@ static struct applet syslog_applet = {
  * large msg). The input vectors are not modified. The caller is responsible for
  * making sure that there are at least ofs+len bytes in the input buffer.
  */
-ssize_t syslog_applet_append_event(void *ctx, struct ist v1, struct ist v2, size_t ofs, size_t len)
+ssize_t syslog_applet_append_event(void *ctx, struct ist v1, struct ist v2, size_t ofs, size_t len, char delim)
 {
 	struct appctx *appctx = ctx;
 	char *p;

@@ -660,7 +660,7 @@ static inline void h1c_report_term_evt(struct h1c *h1c, enum muxc_term_event_typ
 }
 
 /* Returns 1 if the H1 connection is alive (IDLE, EMBRYONIC, RUNNING or
- * DRAINING). Ortherwise 0 is returned.
+ * DRAINING). Otherwise 0 is returned.
  */
 static inline int h1_is_alive(const struct h1c *h1c)
 {
@@ -2731,7 +2731,7 @@ static size_t h1_make_eoh(struct h1s *h1s, struct h1m *h1m, struct htx *htx, siz
 		else {
 			/* Both headers are missing */
 			if (h1m->flags & H1_MF_RESP) {
-				/* It is a esponse: Switch to unknown xfer length */
+				/* It is a response: Switch to unknown xfer length */
 				h1m->flags &= ~(H1_MF_XFER_LEN|H1_MF_XFER_ENC|H1_MF_CLEN|H1_MF_CHNK);
 				h1s->flags &= ~(H1S_F_HAVE_CLEN|H1S_F_HAVE_CHNK);
 				TRACE_STATE("Switch response to unknown XFER length", H1_EV_TX_DATA|H1_EV_TX_HDRS, h1c->conn, h1s);

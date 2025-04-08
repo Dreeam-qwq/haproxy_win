@@ -357,7 +357,7 @@ static int cli_parse_show_events(char **args, char *payload, struct appctx *appc
 
 	if (!*args[1]) {
 		/* no arg => report the list of supported sink */
-		chunk_printf(&trash, "Supported events sinks are listed below. Add -w(wait), -n(new). Any key to stop\n");
+		chunk_printf(&trash, "Supported events sinks are listed below. Add -0(zero), -w(wait), -n(new). Any key to stop.\n");
 		list_for_each_entry(sink, &sink_list, sink_list) {
 			chunk_appendf(&trash, "    %-10s : type=%s, %u dropped, %s\n",
 				      sink->name,
@@ -387,6 +387,8 @@ static int cli_parse_show_events(char **args, char *payload, struct appctx *appc
 			ring_flags |= RING_WF_WAIT_MODE;
 		else if (strcmp(args[arg], "-n") == 0)
 			ring_flags |= RING_WF_SEEK_NEW;
+		else if (strcmp(args[arg], "-0") == 0)
+			ring_flags |= RING_WF_END_ZERO;
 		else if (strcmp(args[arg], "-nw") == 0 || strcmp(args[arg], "-wn") == 0)
 			ring_flags |= RING_WF_WAIT_MODE | RING_WF_SEEK_NEW;
 		else
@@ -412,7 +414,7 @@ void sink_setup_proxy(struct proxy *px)
 }
 
 static void _sink_forward_io_handler(struct appctx *appctx,
-                                     ssize_t (*msg_handler)(void *ctx, struct ist v1, struct ist v2, size_t ofs, size_t len))
+                                     ssize_t (*msg_handler)(void *ctx, struct ist v1, struct ist v2, size_t ofs, size_t len, char delim))
 {
 	struct stconn *sc = appctx_sc(appctx);
 	struct sink_forward_target *sft = appctx->svcctx;
@@ -446,7 +448,7 @@ static void _sink_forward_io_handler(struct appctx *appctx,
 	MT_LIST_DELETE(&appctx->wait_entry);
 
 	ret = ring_dispatch_messages(ring, appctx, &sft->ofs, &last_ofs, 0,
-	                             msg_handler, &processed);
+	                             msg_handler, '\n', &processed);
 	sft->e_processed += processed;
 
 	/* if server's max-reuse is set (>= 0), destroy the applet once the
@@ -676,7 +678,7 @@ static struct task *process_sink_forward(struct task * task, void *context, unsi
 		while (sft) {
 			HA_SPIN_LOCK(SFT_LOCK, &sft->lock);
 			/* If appctx is NULL, start a new session and perform the appctx
-			 * assigment right away since the applet is not supposed to change
+			 * assignment right away since the applet is not supposed to change
 			 * during the session lifetime. By doing the assignment now we
 			 * make sure to start the session exactly once.
 			 *
@@ -1312,7 +1314,7 @@ struct sink *sink_new_from_srv(struct server *srv, const char *from)
 	/* directly create a sink of BUF type, and use UNSPEC log format to
 	 * inherit from caller fmt in sink_write()
 	 *
-	 * sink_name must be unique to prevent existing sink from being re-used
+	 * sink_name must be unique to prevent existing sink from being reused
 	 */
 	sink = sink_new_buf(sink_name, trash.area, LOG_FORMAT_UNSPEC, bufsize);
 	ha_free(&sink_name); // no longer needed
@@ -1447,7 +1449,7 @@ REGISTER_POST_CHECK(sink_postcheck);
 REGISTER_POST_DEINIT(sink_deinit);
 
 static struct cli_kw_list cli_kws = {{ },{
-	{ { "show", "events", NULL }, "show events [<sink>] [-w] [-n]          : show event sink state", cli_parse_show_events, NULL, NULL },
+	{ { "show", "events", NULL }, "show events [<sink>] [-w] [-n] [-0]     : show event sink state", cli_parse_show_events, NULL, NULL },
 	{{},}
 }};
 
