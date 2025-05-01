@@ -20,8 +20,10 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
  */
 
+#include <haproxy/proto_quic.h>
 #include <haproxy/quic_cc.h>
 #include <haproxy/quic_pacing.h>
+#include <haproxy/thread.h>
 
 struct quic_cc_algo *default_quic_cc_algo = &quic_cc_algo_cubic;
 
@@ -58,7 +60,7 @@ uint quic_cc_default_pacing_inter(const struct quic_cc *cc)
 }
 
 /* Returns true if congestion window on path ought to be increased. */
-int quic_cwnd_may_increase(const struct quic_cc_path *path)
+static int quic_cwnd_may_increase(const struct quic_cc_path *path)
 {
 	/* RFC 9002 7.8. Underutilizing the Congestion Window
 	 *
@@ -74,4 +76,60 @@ int quic_cwnd_may_increase(const struct quic_cc_path *path)
 	 * not be restricted too much to prevent slow window growing.
 	 */
 	return 2 * path->in_flight >= path->cwnd  || path->cwnd < 16384;
+}
+
+/* Calculate ratio of free memory relative to the maximum configured limit. */
+static int quic_cc_max_win_ratio(void)
+{
+	uint64_t tot, free = 0;
+	int ratio = 100;
+
+	if (global.tune.quic_frontend_max_tx_mem) {
+		tot = cshared_read(&quic_mem_diff);
+		if (global.tune.quic_frontend_max_tx_mem > tot)
+			free = global.tune.quic_frontend_max_tx_mem - tot;
+		ratio = free * 100 / global.tune.quic_frontend_max_tx_mem;
+	}
+
+	return ratio;
+}
+
+/* Restore congestion window for <path> to its minimal value. */
+void quic_cc_path_reset(struct quic_cc_path *path)
+{
+	const uint64_t old = path->cwnd;
+	path->cwnd = path->limit_min;
+	cshared_add(&quic_mem_diff, path->cwnd - old);
+}
+
+/* Set congestion window for <path> to <val>. Min and max limits are enforced. */
+void quic_cc_path_set(struct quic_cc_path *path, uint64_t val)
+{
+	const uint64_t old = path->cwnd;
+	const uint64_t limit_max = path->limit_max * quic_cc_max_win_ratio() / 100;
+
+	path->cwnd = QUIC_MIN(val, limit_max);
+	path->cwnd = QUIC_MAX(path->cwnd, path->limit_min);
+	cshared_add(&quic_mem_diff, path->cwnd - old);
+
+	path->cwnd_last_max = QUIC_MAX(path->cwnd, path->cwnd_last_max);
+}
+
+/* Increment congestion window for <path> with <val>. Min and max limits are
+ * enforced. Contrary to quic_cc_path_set(), increase is performed only if a
+ * certain minimal level of the window was already filled.
+ */
+void quic_cc_path_inc(struct quic_cc_path *path, uint64_t val)
+{
+	const uint64_t old = path->cwnd;
+	uint64_t limit_max;
+
+	if (quic_cwnd_may_increase(path)) {
+		limit_max = path->limit_max * quic_cc_max_win_ratio() / 100;
+		path->cwnd = QUIC_MIN(path->cwnd + val, limit_max);
+		path->cwnd = QUIC_MAX(path->cwnd, path->limit_min);
+		cshared_add(&quic_mem_diff, path->cwnd - old);
+
+		path->cwnd_last_max = QUIC_MAX(path->cwnd, path->cwnd_last_max);
+	}
 }

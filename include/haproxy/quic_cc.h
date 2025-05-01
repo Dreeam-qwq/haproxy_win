@@ -29,9 +29,11 @@
 #include <haproxy/api.h>
 #include <haproxy/buf.h>
 #include <haproxy/chunk.h>
+#include <haproxy/proto_quic.h>
 #include <haproxy/quic_cc-t.h>
 #include <haproxy/quic_conn-t.h>
 #include <haproxy/quic_loss.h>
+#include <haproxy/thread.h>
 
 void quic_cc_init(struct quic_cc *cc, struct quic_cc_algo *algo, struct quic_conn *qc);
 void quic_cc_event(struct quic_cc *cc, struct quic_cc_event *ev);
@@ -91,9 +93,10 @@ static inline void quic_cc_path_init(struct quic_cc_path *path, int ipv4, unsign
 	*(size_t *)&path->mtu = max_dgram_sz;
 	path->initial_wnd = QUIC_MIN(10 * max_dgram_sz, QUIC_MAX(max_dgram_sz << 1, 14720U));
 	path->cwnd = path->initial_wnd;
-	path->mcwnd = path->cwnd;
-	path->max_cwnd = max_cwnd;
-	path->min_cwnd = max_dgram_sz << 1;
+	cshared_add(&quic_mem_diff, path->cwnd);
+	path->cwnd_last_max = path->cwnd;
+	path->limit_max = max_cwnd;
+	path->limit_min = max_dgram_sz << 1;
 	path->prep_in_flight = 0;
 	path->in_flight = 0;
 	path->ifae_pkts = 0;
@@ -115,7 +118,9 @@ static inline size_t quic_cc_path_prep_data(struct quic_cc_path *path)
 	return path->cwnd - path->prep_in_flight;
 }
 
-int quic_cwnd_may_increase(const struct quic_cc_path *path);
+void quic_cc_path_reset(struct quic_cc_path *path);
+void quic_cc_path_set(struct quic_cc_path *path, uint64_t val);
+void quic_cc_path_inc(struct quic_cc_path *path, uint64_t val);
 
 #endif /* USE_QUIC */
 #endif /* _PROTO_QUIC_CC_H */

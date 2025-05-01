@@ -274,10 +274,16 @@ struct srv_per_thread {
 /* Each server will have one occurrence of this structure per thread group */
 struct srv_per_tgroup {
 	struct queue queue;			/* pending connections */
+	struct server *server;                  /* pointer to the corresponding server */
+	struct eb32_node lb_node;               /* node used for tree-based load balancing */
+	struct server *next_full;               /* next server in the temporary full list */
 	unsigned int last_other_tgrp_served;	/* Last other tgrp we dequeued from */
 	unsigned int self_served;		/* Number of connection we dequeued from our own queue */
 	unsigned int dequeuing;                 /* non-zero = dequeuing in progress (atomic) */
 	unsigned int next_takeover;             /* thread ID to try to steal connections from next time */
+	struct eb_root *lb_tree;                 /* For LB algos with split between thread groups, the tree to be used, for each group */
+	unsigned npos, lpos;			/* next and last positions in the LB tree, protected by LB lock */
+	unsigned rweight;			/* remainder of weight in the current LB tree */
 } THREAD_ALIGNED(64);
 
 /* Configure the protocol selection for websocket */
@@ -340,13 +346,13 @@ struct server {
 	short onmarkeddown;			/* what to do when marked down: one of HANA_ONMARKEDDOWN_* */
 	short onmarkedup;			/* what to do when marked up: one of HANA_ONMARKEDUP_* */
 	int slowstart;				/* slowstart time in seconds (ms in the conf) */
+	int idle_ping;				/* MUX idle-ping interval in ms */
 
 	char *id;				/* just for identification */
 	uint32_t rid;				/* revision: if id has been reused for a new server, rid won't match */
 	unsigned iweight,uweight, cur_eweight;	/* initial weight, user-specified weight, and effective weight */
 	unsigned wscore;			/* weight score, used during srv map computation */
 	unsigned next_eweight;			/* next pending eweight to commit */
-	unsigned rweight;			/* remainder of weight in the current LB tree */
 	unsigned cumulative_weight;		/* weight of servers prior to this one in the same group, for chash balancing */
 	int maxqueue;				/* maximum number of pending connections allowed */
 	unsigned int queueslength;		/* Sum of the length of each queue */
@@ -379,7 +385,6 @@ struct server {
 	 */
 	THREAD_PAD(63);
 	__decl_thread(HA_SPINLOCK_T lock);      /* may enclose the proxy's lock, must not be taken under */
-	unsigned npos, lpos;			/* next and last positions in the LB tree, protected by LB lock */
 	union {
 		struct eb32_node lb_node;       /* node used for tree-based load balancing */
 		struct list lb_list;            /* elem used for list-based load balancing */
@@ -390,7 +395,6 @@ struct server {
 			int lb_lock;                    /* make sure we are the only one updating the server */
 		};
 	};
-	struct server *next_full;               /* next server in the temporary full list */
 
 	/* usually atomically updated by any thread during parsing or on end of request */
 	THREAD_PAD(63);

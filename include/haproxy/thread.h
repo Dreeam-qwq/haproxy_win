@@ -49,6 +49,7 @@ int thread_map_to_groups();
 int thread_resolve_group_mask(struct thread_set *ts, int defgrp, char **err);
 void thread_detect_count(void);
 int parse_thread_set(const char *arg, struct thread_set *ts, char **err);
+const char *lock_label(enum lock_label label);
 extern int thread_cpus_enabled_at_boot;
 
 
@@ -110,27 +111,32 @@ static inline void ha_set_thread(const struct thread_info *thr)
 
 static inline void thread_idle_now()
 {
+	tg_ctx->threads_idle |= ti->ltid_bit;
 }
 
 static inline void thread_idle_end()
 {
+	tg_ctx->threads_idle &= ~ti->ltid_bit;
 }
 
 static inline void thread_harmless_now()
 {
+	tg_ctx->threads_harmless |= ti->ltid_bit;
 }
 
 static inline int is_thread_harmless()
 {
-	return 1;
+	return 	!!(tg_ctx->threads_harmless & ti->ltid_bit);
 }
 
 static inline void thread_harmless_end()
 {
+	tg_ctx->threads_harmless &= ~ti->ltid_bit;
 }
 
 static inline void thread_harmless_end_sig()
 {
+	tg_ctx->threads_harmless &= ~ti->ltid_bit;
 }
 
 static inline void thread_isolate()
@@ -165,6 +171,23 @@ static inline void set_thread_cpu_affinity()
 static inline unsigned long long ha_get_pthread_id(unsigned int thr)
 {
 	return 0;
+}
+
+static inline void cshared_init(struct cshared *ctr, uint64_t *var, int lim)
+{
+	ctr->global = var;
+	ctr->diff = 0;
+	ctr->lim = 0;
+}
+
+static inline void cshared_add(struct cshared *ctr, int diff)
+{
+	ctr->global += diff;
+}
+
+static inline uint64_t cshared_read(struct cshared *ctr)
+{
+	return *ctr->global;
 }
 
 #else /* !USE_THREAD */
@@ -300,37 +323,90 @@ static inline unsigned long thread_isolated()
 	return _HA_ATOMIC_LOAD(&isolated_thread) == tid;
 }
 
-#if !defined(DEBUG_THREAD) && !defined(DEBUG_FULL)
+/* locking levels, for history and debugging */
+#define _LK_UN 0
+#define _LK_RD 1
+#define _LK_SK 2
+#define _LK_WR 3
+
+#if (DEBUG_THREAD < 1) && !defined(DEBUG_FULL)
+
+#define _lock_wait(_LK_, lbl, expr) do { (void)(expr); } while (0)
+#define _lock_cond(_LK_, lbl, expr) ({ typeof(expr) _expr = (expr); _expr; })
+
+#else
+
+#define _lock_wait(_LK_, lbl, expr) do {				\
+		(void)(expr);						\
+		th_ctx->lock_history = (th_ctx->lock_history << 8) + ((lbl + 1) << 2) + _LK_; \
+	} while (0)
+#define _lock_cond(_LK_, lbl, expr) ({					\
+		typeof(expr) _expr = (expr);				\
+		if (!_expr)						\
+			th_ctx->lock_history = (th_ctx->lock_history << 8) + ((lbl + 1) << 2) + _LK_; \
+		_expr; \
+	})
+
+#endif
+
+/* Init a shared counter <ctr> which references global value <var>. Update are
+ * performed each time the shared counter exceed <lim>, either on the positive
+ * or negative value.
+ */
+static inline void cshared_init(struct cshared *ctr, uint64_t *var, int lim)
+{
+	ctr->global = var;
+	ctr->diff = 0;
+	ctr->lim = lim;
+}
+
+/* Add <diff>, which may be positive or negative, to <ctr> shared counter. */
+static inline void cshared_add(struct cshared *ctr, int diff)
+{
+	ctr->diff += diff;
+	if (ctr->diff <= -(ctr->lim) || ctr->diff >= ctr->lim) {
+		HA_ATOMIC_ADD(ctr->global, ctr->diff);
+		ctr->diff = 0;
+	}
+}
+
+/* Atomically get current global value from <ctr> shared counter. */
+static inline uint64_t cshared_read(struct cshared *ctr)
+{
+	return HA_ATOMIC_LOAD(ctr->global);
+}
+
+#if (DEBUG_THREAD < 2) && !defined(DEBUG_FULL)
 
 /* Thread debugging is DISABLED, these are the regular locking functions */
 
 #define HA_SPIN_INIT(l)            ({ (*l) = 0; })
 #define HA_SPIN_DESTROY(l)         ({ (*l) = 0; })
-#define HA_SPIN_LOCK(lbl, l)       pl_take_s(l)
-#define HA_SPIN_TRYLOCK(lbl, l)    (!pl_try_s(l))
-#define HA_SPIN_UNLOCK(lbl, l)     pl_drop_s(l)
+#define HA_SPIN_LOCK(lbl, l)       _lock_wait(_LK_SK, lbl, pl_take_s(l))
+#define HA_SPIN_TRYLOCK(lbl, l)    _lock_cond(_LK_SK, lbl, !pl_try_s(l))
+#define HA_SPIN_UNLOCK(lbl, l)     _lock_wait(_LK_UN, lbl, pl_drop_s(l))
 
 #define HA_RWLOCK_INIT(l)          ({ (*l) = 0; })
 #define HA_RWLOCK_DESTROY(l)       ({ (*l) = 0; })
-#define HA_RWLOCK_WRLOCK(lbl,l)    pl_take_w(l)
-#define HA_RWLOCK_TRYWRLOCK(lbl,l) (!pl_try_w(l))
-#define HA_RWLOCK_WRUNLOCK(lbl,l)  pl_drop_w(l)
-#define HA_RWLOCK_RDLOCK(lbl,l)    pl_take_r(l)
-#define HA_RWLOCK_TRYRDLOCK(lbl,l) (!pl_try_r(l))
-#define HA_RWLOCK_RDUNLOCK(lbl,l)  pl_drop_r(l)
+#define HA_RWLOCK_WRLOCK(lbl,l)    _lock_wait(_LK_WR, lbl, pl_take_w(l))
+#define HA_RWLOCK_TRYWRLOCK(lbl,l) _lock_cond(_LK_WR, lbl, !pl_try_w(l))
+#define HA_RWLOCK_WRUNLOCK(lbl,l)  _lock_wait(_LK_UN, lbl, pl_drop_w(l))
+#define HA_RWLOCK_RDLOCK(lbl,l)    _lock_wait(_LK_RD, lbl, pl_take_r(l))
+#define HA_RWLOCK_TRYRDLOCK(lbl,l) _lock_cond(_LK_RD, lbl, (!pl_try_r(l)))
+#define HA_RWLOCK_RDUNLOCK(lbl,l)  _lock_wait(_LK_UN, lbl, pl_drop_r(l))
 
 /* rwlock upgrades via seek locks */
-#define HA_RWLOCK_SKLOCK(lbl,l)         pl_take_s(l)      /* N --> S */
-#define HA_RWLOCK_SKTOWR(lbl,l)         pl_stow(l)        /* S --> W */
-#define HA_RWLOCK_WRTOSK(lbl,l)         pl_wtos(l)        /* W --> S */
-#define HA_RWLOCK_SKTORD(lbl,l)         pl_stor(l)        /* S --> R */
-#define HA_RWLOCK_WRTORD(lbl,l)         pl_wtor(l)        /* W --> R */
-#define HA_RWLOCK_SKUNLOCK(lbl,l)       pl_drop_s(l)      /* S --> N */
-#define HA_RWLOCK_TRYSKLOCK(lbl,l)      (!pl_try_s(l))    /* N -?> S */
-#define HA_RWLOCK_TRYRDTOSK(lbl,l)      (!pl_try_rtos(l)) /* R -?> S */
-#define HA_RWLOCK_TRYRDTOWR(lbl, l)     (!pl_try_rtow(l)) /* R -?> W */
+#define HA_RWLOCK_SKLOCK(lbl,l)         _lock_wait(_LK_SK, lbl, pl_take_s(l))      /* N --> S */
+#define HA_RWLOCK_SKTOWR(lbl,l)         _lock_wait(_LK_WR, lbl, pl_stow(l))        /* S --> W */
+#define HA_RWLOCK_WRTOSK(lbl,l)         _lock_wait(_LK_SK, lbl, pl_wtos(l))        /* W --> S */
+#define HA_RWLOCK_SKTORD(lbl,l)         _lock_wait(_LK_RD, lbl, pl_stor(l))        /* S --> R */
+#define HA_RWLOCK_WRTORD(lbl,l)         _lock_wait(_LK_RD, lbl, pl_wtor(l))        /* W --> R */
+#define HA_RWLOCK_SKUNLOCK(lbl,l)       _lock_wait(_LK_UN, lbl, pl_drop_s(l))      /* S --> N */
+#define HA_RWLOCK_TRYSKLOCK(lbl,l)      _lock_cond(_LK_SK, lbl, !pl_try_s(l))      /* N -?> S */
+#define HA_RWLOCK_TRYRDTOSK(lbl,l)      _lock_cond(_LK_SK, lbl, !pl_try_rtos(l))   /* R -?> S */
+#define HA_RWLOCK_TRYRDTOWR(lbl, l)     _lock_cond(_LK_WR, lbl, !pl_try_rtow(l))   /* R -?> W */
 
-#else /* !defined(DEBUG_THREAD) && !defined(DEBUG_FULL) */
+#else /* (DEBUG_THREAD < 2) && !defined(DEBUG_FULL) */
 
 /* Thread debugging is ENABLED, these are the instrumented functions */
 
@@ -363,28 +439,28 @@ static inline unsigned long thread_isolated()
 #define HA_SPIN_INIT(l)            __spin_init(l)
 #define HA_SPIN_DESTROY(l)         __spin_destroy(l)
 
-#define HA_SPIN_LOCK(lbl, l)       __spin_lock(lbl, l, __func__, __FILE__, __LINE__)
-#define HA_SPIN_TRYLOCK(lbl, l)    __spin_trylock(lbl, l, __func__, __FILE__, __LINE__)
-#define HA_SPIN_UNLOCK(lbl, l)     __spin_unlock(lbl, l, __func__, __FILE__, __LINE__)
+#define HA_SPIN_LOCK(lbl, l)       _lock_wait(_LK_SK, lbl, __spin_lock(lbl, l, __func__, __FILE__, __LINE__))
+#define HA_SPIN_TRYLOCK(lbl, l)    _lock_cond(_LK_SK, lbl, __spin_trylock(lbl, l, __func__, __FILE__, __LINE__))
+#define HA_SPIN_UNLOCK(lbl, l)     _lock_wait(_LK_UN, lbl, __spin_unlock(lbl, l, __func__, __FILE__, __LINE__))
 
 #define HA_RWLOCK_INIT(l)          __ha_rwlock_init((l))
 #define HA_RWLOCK_DESTROY(l)       __ha_rwlock_destroy((l))
-#define HA_RWLOCK_WRLOCK(lbl,l)    __ha_rwlock_wrlock(lbl, l, __func__, __FILE__, __LINE__)
-#define HA_RWLOCK_TRYWRLOCK(lbl,l) __ha_rwlock_trywrlock(lbl, l, __func__, __FILE__, __LINE__)
-#define HA_RWLOCK_WRUNLOCK(lbl,l)  __ha_rwlock_wrunlock(lbl, l, __func__, __FILE__, __LINE__)
-#define HA_RWLOCK_RDLOCK(lbl,l)    __ha_rwlock_rdlock(lbl, l)
-#define HA_RWLOCK_TRYRDLOCK(lbl,l) __ha_rwlock_tryrdlock(lbl, l)
-#define HA_RWLOCK_RDUNLOCK(lbl,l)  __ha_rwlock_rdunlock(lbl, l)
+#define HA_RWLOCK_WRLOCK(lbl,l)    _lock_wait(_LK_WR, lbl, __ha_rwlock_wrlock(lbl, l, __func__, __FILE__, __LINE__))
+#define HA_RWLOCK_TRYWRLOCK(lbl,l) _lock_cond(_LK_WR, lbl, __ha_rwlock_trywrlock(lbl, l, __func__, __FILE__, __LINE__))
+#define HA_RWLOCK_WRUNLOCK(lbl,l)  _lock_wait(_LK_UN, lbl, __ha_rwlock_wrunlock(lbl, l, __func__, __FILE__, __LINE__))
+#define HA_RWLOCK_RDLOCK(lbl,l)    _lock_wait(_LK_RD, lbl, __ha_rwlock_rdlock(lbl, l))
+#define HA_RWLOCK_TRYRDLOCK(lbl,l) _lock_cond(_LK_RD, lbl, __ha_rwlock_tryrdlock(lbl, l))
+#define HA_RWLOCK_RDUNLOCK(lbl,l)  _lock_wait(_LK_UN, lbl, __ha_rwlock_rdunlock(lbl, l))
 
-#define HA_RWLOCK_SKLOCK(lbl,l)    __ha_rwlock_sklock(lbl, l, __func__, __FILE__, __LINE__)
-#define HA_RWLOCK_SKTOWR(lbl,l)    __ha_rwlock_sktowr(lbl, l, __func__, __FILE__, __LINE__)
-#define HA_RWLOCK_WRTOSK(lbl,l)    __ha_rwlock_wrtosk(lbl, l, __func__, __FILE__, __LINE__)
-#define HA_RWLOCK_SKTORD(lbl,l)    __ha_rwlock_sktord(lbl, l, __func__, __FILE__, __LINE__)
-#define HA_RWLOCK_WRTORD(lbl,l)    __ha_rwlock_wrtord(lbl, l, __func__, __FILE__, __LINE__)
-#define HA_RWLOCK_SKUNLOCK(lbl,l)  __ha_rwlock_skunlock(lbl, l, __func__, __FILE__, __LINE__)
-#define HA_RWLOCK_TRYSKLOCK(lbl,l) __ha_rwlock_trysklock(lbl, l, __func__, __FILE__, __LINE__)
-#define HA_RWLOCK_TRYRDTOSK(lbl,l) __ha_rwlock_tryrdtosk(lbl, l, __func__, __FILE__, __LINE__)
-#define HA_RWLOCK_TRYRDTOWR(lbl,l) __ha_rwlock_tryrdtowr(lbl, l, __func__, __FILE__, __LINE__)
+#define HA_RWLOCK_SKLOCK(lbl,l)    _lock_wait(_LK_SK, lbl, __ha_rwlock_sklock(lbl, l, __func__, __FILE__, __LINE__))
+#define HA_RWLOCK_SKTOWR(lbl,l)    _lock_wait(_LK_WR, lbl, __ha_rwlock_sktowr(lbl, l, __func__, __FILE__, __LINE__))
+#define HA_RWLOCK_WRTOSK(lbl,l)    _lock_wait(_LK_SK, lbl, __ha_rwlock_wrtosk(lbl, l, __func__, __FILE__, __LINE__))
+#define HA_RWLOCK_SKTORD(lbl,l)    _lock_wait(_LK_RD, lbl, __ha_rwlock_sktord(lbl, l, __func__, __FILE__, __LINE__))
+#define HA_RWLOCK_WRTORD(lbl,l)    _lock_wait(_LK_RD, lbl, __ha_rwlock_wrtord(lbl, l, __func__, __FILE__, __LINE__))
+#define HA_RWLOCK_SKUNLOCK(lbl,l)  _lock_wait(_LK_UN, lbl, __ha_rwlock_skunlock(lbl, l, __func__, __FILE__, __LINE__))
+#define HA_RWLOCK_TRYSKLOCK(lbl,l) _lock_cond(_LK_SK, lbl, __ha_rwlock_trysklock(lbl, l, __func__, __FILE__, __LINE__))
+#define HA_RWLOCK_TRYRDTOSK(lbl,l) _lock_cond(_LK_RD, lbl, __ha_rwlock_tryrdtosk(lbl, l, __func__, __FILE__, __LINE__))
+#define HA_RWLOCK_TRYRDTOWR(lbl,l) _lock_cond(_LK_WR, lbl, __ha_rwlock_tryrdtowr(lbl, l, __func__, __FILE__, __LINE__))
 
 /* Following functions are used to collect some stats about locks. We wrap
  * pthread functions to known how much time we wait in a lock. */

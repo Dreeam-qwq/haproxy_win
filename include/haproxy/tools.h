@@ -71,7 +71,7 @@
 #define HA_ANON_PATH(key, str) hash_anon(key, str, "PATH(", ")")
 
 /* use only in a function that contains an appctx (key comes from appctx). */
-#define HA_ANON_CLI(str) hash_anon(appctx->cli_anon_key, str, "", "")
+#define HA_ANON_CLI(str) hash_anon(appctx->cli_ctx.anon_key, str, "", "")
 
 
 /*
@@ -674,7 +674,7 @@ extern const char *parse_size_ull(const char *text, ullong *ret);
 int parse_binary(const char *source, char **binstr, int *binstrlen, char **err);
 
 /* copies at most <n> characters from <src> and always terminates with '\0' */
-char *my_strndup(const char *src, int n);
+char *my_strndup(const char *src, size_t n);
 
 /*
  * search needle in haystack

@@ -848,6 +848,9 @@ static void h2c_update_timeout(struct h2c *h2c)
 
 	TRACE_ENTER(H2_EV_H2C_WAKE, h2c->conn);
 
+	/* Always reset flag for PING emission prior to refresh timeout. */
+	h2c->flags &= ~H2_CF_IDL_PING;
+
 	if (!h2c->task)
 		goto leave;
 
@@ -856,36 +859,77 @@ static void h2c_update_timeout(struct h2c *h2c)
 		if (br_data(h2c->mbuf)) {
 			/* pending output data: always the regular data timeout */
 			h2c->task->expire = tick_add_ifset(now_ms, h2c->timeout);
-		} else {
-			/* no stream, no output data */
+		}
+		else {
+			int dft = TICK_ETERNITY;
+			int exp = TICK_ETERNITY;
+			int ping = TICK_ETERNITY;
+
+			/* idle connection : no stream, no output data */
 			if (h2c->flags & (H2_CF_GOAWAY_SENT|H2_CF_GOAWAY_FAILED)) {
 				/* GOAWAY sent (or failed), closing in progress */
-				int exp = tick_add_ifset(now_ms, h2c->shut_timeout);
+				dft = tick_add_ifset(now_ms, h2c->timeout);
 
-				h2c->task->expire = tick_first(h2c->task->expire, exp);
+				/* Use {client,server}-fin but do not reset if
+				 * already defined. Fallback to client/server if needed.
+				 */
+				exp = tick_add_ifset(now_ms, h2c->shut_timeout);
+				exp = tick_first(exp, h2c->task->expire);
+				if (!tick_isset(exp))
+					exp = dft;
+
 				is_idle_conn = 1;
 			}
-			else if (!(h2c->flags & H2_CF_IS_BACK)) {
-				int to;
+			else {
+				if (!(h2c->flags & H2_CF_IS_BACK)) {
+					int to;
 
-				if (h2c->max_id > 0 && !b_data(&h2c->dbuf) &&
-				    tick_isset(h2c->proxy->timeout.httpka)) {
-					/* idle after having seen one stream => keep-alive */
-					to = h2c->proxy->timeout.httpka;
-				} else {
-					/* before first request, or started to deserialize a
-					 * new req => http-request.
-					 */
-					to = h2c->proxy->timeout.httpreq;
+					dft = tick_add_ifset(now_ms, h2c->timeout);
+
+					if (h2c->max_id > 0 && !b_data(&h2c->dbuf) &&
+					    tick_isset(h2c->proxy->timeout.httpka)) {
+						/* idle after having seen one stream => keep-alive */
+						to = h2c->proxy->timeout.httpka;
+					}
+					else {
+						/* before first request, or started to deserialize a
+						 * new req => http-request.
+						 */
+						to = h2c->proxy->timeout.httpreq;
+					}
+
+					/* Use hr/ka timers. Fallback to client timeout only if unset. */
+					exp = tick_add_ifset(h2c->idle_start, to);
+					if (!tick_isset(exp))
+						exp = dft;
+
+					is_idle_conn = 1;
+				}
+				else {
+					/* Only idle-ping is relevant for backend idle conn. */
+					exp = TICK_ETERNITY;
 				}
 
-				h2c->task->expire = tick_add_ifset(h2c->idle_start, to);
-				is_idle_conn = 1;
+				if (!(h2c->proxy->flags & (PR_FL_DISABLED|PR_FL_STOPPED)))
+					ping = tick_add_ifset(now_ms, conn_idle_ping(h2c->conn));
+
+				exp = tick_first(exp, ping);
+
+				if (tick_isset(exp)) {
+					if (exp == ping && ping != dft) {
+						/* PING timer selected, set flag to prevent conn deletion on next timeout. */
+						if (!(h2c->flags & H2_CF_IDL_PING_SENT))
+							h2c->flags |= H2_CF_IDL_PING;
+					}
+					else if (h2c->flags & H2_CF_IDL_PING_SENT) {
+						/* timer other than ping selected, remove ping flag to allow GOAWAY on expiration. */
+						h2c->flags &= ~H2_CF_IDL_PING_SENT;
+						ABORT_NOW();
+					}
+				}
 			}
 
-			/* if a timeout above was not set, fall back to the default one */
-			if (!tick_isset(h2c->task->expire))
-				h2c->task->expire = tick_add_ifset(now_ms, h2c->timeout);
+			h2c->task->expire = exp;
 		}
 
 		if ((h2c->proxy->flags & (PR_FL_DISABLED|PR_FL_STOPPED)) &&
@@ -917,10 +961,20 @@ static void h2c_update_timeout(struct h2c *h2c)
 				task_wakeup(h2c->task, TASK_WOKEN_TIMER);
 			}
 		}
-
-	} else {
+	}
+	else {
 		h2c->task->expire = TICK_ETERNITY;
 	}
+
+	/* Timer may already be expired, in this case it must not be requeued.
+	 * Currently it may happen with idle conn calculation based on shut or
+	 * http-req/ka timeouts.
+	 */
+	if (unlikely(tick_is_expired(h2c->task->expire, now_ms))) {
+		task_wakeup(h2c->task, TASK_WOKEN_TIMER);
+		goto leave;
+	}
+
 	task_queue(h2c->task);
  leave:
 	TRACE_LEAVE(H2_EV_H2C_WAKE);
@@ -1276,7 +1330,8 @@ static int h2_init(struct connection *conn, struct proxy *prx, struct session *s
 	h2c->next_tasklet = NULL;
 	h2c->shared_rx_bufs = NULL;
 	h2c->idle_start = now_ms;
-	if (tick_isset(h2c->timeout)) {
+
+	if (tick_isset(h2c->timeout) || tick_isset(conn_idle_ping(conn))) {
 		t = task_new_here();
 		if (!t)
 			goto fail;
@@ -2856,9 +2911,17 @@ static int h2c_ack_settings(struct h2c *h2c)
  */
 static int h2c_handle_ping(struct h2c *h2c)
 {
-	/* schedule a response */
-	if (!(h2c->dff & H2_F_PING_ACK))
+	if (h2c->dff & H2_F_PING_ACK) {
+		TRACE_PROTO("receiving H2 PING ACK frame", H2_EV_RX_FRAME|H2_EV_RX_PING, h2c->conn);
+		if ((h2c->flags & (H2_CF_IDL_PING|H2_CF_IDL_PING_SENT)) == H2_CF_IDL_PING_SENT) {
+			h2c->flags &= ~H2_CF_IDL_PING_SENT;
+			h2c_update_timeout(h2c);
+		}
+	}
+	else {
+		/* schedule a response */
 		h2c->st0 = H2_CS_FRAME_A;
+	}
 	return 1;
 }
 
@@ -3072,10 +3135,12 @@ static int h2c_send_strm_wu(struct h2c *h2c)
 	return ret;
 }
 
-/* try to send an ACK for a ping frame on the connection. Returns > 0 on
- * success, 0 on missing data or one of the h2_status values.
+/* Try to send a PING frame for <h2c> connection. Set <ack> to respond to an
+ * incoming PING, in this case payload is copied from demux buffer.
+ *
+ * Returns a positive value on success, else 0.
  */
-static int h2c_ack_ping(struct h2c *h2c)
+static int h2c_send_ping(struct h2c *h2c, int ack)
 {
 	struct buffer *res;
 	char str[17];
@@ -3083,16 +3148,29 @@ static int h2c_ack_ping(struct h2c *h2c)
 
 	TRACE_ENTER(H2_EV_TX_FRAME|H2_EV_TX_PING, h2c->conn);
 
-	if (b_data(&h2c->dbuf) < 8)
-		goto out;
+	if (!ack) {
+		memcpy(str,
+		       "\x00\x00\x08"     /* length : 8 (same payload) */
+		       "\x06\x00"         /* type   : 6, flags : ACK   */
+		       "\x00\x00\x00\x00" /* stream ID */, 9);
 
-	memcpy(str,
-	       "\x00\x00\x08"     /* length : 8 (same payload) */
-	       "\x06" "\x01"      /* type   : 6, flags : ACK   */
-	       "\x00\x00\x00\x00" /* stream ID */, 9);
+		/* opaque data */
+		memcpy(str + 9, "\x00\x01\x02\x03\x04\x05\x06\x07", 8);
+	}
+	else {
+		if (b_data(&h2c->dbuf) < 8) {
+			/* incoming PING payload too short */
+			goto out;
+		}
 
-	/* copy the original payload */
-	h2_get_buf_bytes(str + 9, 8, &h2c->dbuf, 0);
+		memcpy(str,
+		       "\x00\x00\x08"     /* length : 8 (same payload) */
+		       "\x06\x01"         /* type   : 6, flags : ACK   */
+		       "\x00\x00\x00\x00" /* stream ID */, 9);
+
+		/* copy the original payload */
+		h2_get_buf_bytes(str + 9, 8, &h2c->dbuf, 0);
+	}
 
 	res = br_tail(h2c->mbuf);
  retry:
@@ -3987,6 +4065,8 @@ static int h2_conn_reverse(struct h2c *h2c)
 		struct proxy *prx = l->bind_conf->frontend;
 
 		h2c->flags &= ~H2_CF_IS_BACK;
+		/* Must manually init max_id so that GOAWAY can be emitted. */
+		h2c->max_id = 0;
 
 		h2c->shut_timeout = h2c->timeout = prx->timeout.client;
 		if (tick_isset(prx->timeout.clientfin))
@@ -4016,7 +4096,7 @@ static int h2_conn_reverse(struct h2c *h2c)
 	/* If only the new side has a defined timeout, task must be allocated.
 	 * On the contrary, if only old side has a timeout, it must be freed.
 	 */
-	if (!h2c->task && tick_isset(h2c->timeout)) {
+	if (!h2c->task && (tick_isset(h2c->timeout) || tick_isset(conn_idle_ping(conn)))) {
 		h2c->task = task_new_here();
 		if (!h2c->task)
 			goto err;
@@ -4024,16 +4104,14 @@ static int h2_conn_reverse(struct h2c *h2c)
 		h2c->task->process = h2_timeout_task;
 		h2c->task->context = h2c;
 	}
-	else if (!tick_isset(h2c->timeout)) {
+	else if (!tick_isset(h2c->timeout) && !tick_isset(conn_idle_ping(conn))) {
 		task_destroy(h2c->task);
 		h2c->task = NULL;
 	}
 
 	/* Requeue task if instantiated with the new timeout value. */
-	if (h2c->task) {
-		h2c->task->expire = tick_add(now_ms, h2c->timeout);
-		task_queue(h2c->task);
-	}
+	if (h2c->task)
+		h2c_update_timeout(h2c);
 
 	TRACE_LEAVE(H2_EV_H2C_WAKE, h2c->conn);
 	return 1;
@@ -4321,7 +4399,7 @@ static void h2_process_demux(struct h2c *h2c)
 
 			if (h2c->st0 == H2_CS_FRAME_A) {
 				TRACE_PROTO("sending H2 PING ACK frame", H2_EV_TX_FRAME|H2_EV_TX_SETTINGS, h2c->conn, h2s);
-				ret = h2c_ack_ping(h2c);
+				ret = h2c_send_ping(h2c, 1);
 			}
 			break;
 
@@ -4590,6 +4668,14 @@ static int h2_process_mux(struct h2c *h2c)
 	    !(h2c->flags & (H2_CF_MUX_MFULL | H2_CF_MUX_MALLOC)) &&
 	    h2c_send_conn_wu(h2c) < 0)
 		goto fail;
+
+	/* emit PING to test connection liveliness */
+	if ((h2c->flags & (H2_CF_IDL_PING|H2_CF_IDL_PING_SENT)) == (H2_CF_IDL_PING|H2_CF_IDL_PING_SENT)) {
+		if (!h2c_send_ping(h2c, 0))
+			goto fail;
+		TRACE_USER("sent ping", H2_EV_H2C_WAKE, h2c->conn);
+		h2c->flags &= ~H2_CF_IDL_PING;
+	}
 
 	/* First we always process the flow control list because the streams
 	 * waiting there were already elected for immediate emission but were
@@ -5123,6 +5209,15 @@ struct task *h2_timeout_task(struct task *t, void *context, unsigned int state)
 			return t;
 		}
 
+		if (h2c->flags & H2_CF_IDL_PING) {
+			h2c->flags |= H2_CF_IDL_PING_SENT;
+			tasklet_wakeup(h2c->wait_event.tasklet);
+			TRACE_DEVEL("leaving (idle ping)", H2_EV_H2C_WAKE, h2c->conn);
+			t->expire = conn_idle_ping(h2c->conn);
+			HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
+			return t;
+		}
+
 		/* We're about to destroy the connection, so make sure nobody attempts
 		 * to steal it from us.
 		 */
@@ -5130,6 +5225,12 @@ struct task *h2_timeout_task(struct task *t, void *context, unsigned int state)
 			conn_delete_from_tree(h2c->conn);
 
 		HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
+
+		if (h2c->flags & H2_CF_IDL_PING_SENT) {
+			TRACE_STATE("expired on idle ping", H2_EV_H2C_WAKE, h2c->conn);
+			/* Do not emit GOAWAY on idle ping expiration. */
+			goto do_leave;
+		}
 
 		/* Try to gracefully close idle connections by sending a GOAWAY first,
 		 * and then waiting for the fin timeout.
@@ -5420,6 +5521,12 @@ static void h2_detach(struct sedesc *sd)
 
 	if (h2c->flags & H2_CF_IS_BACK) {
 		if (!(h2c->flags & (H2_CF_RCVD_SHUT|H2_CF_ERR_PENDING|H2_CF_ERROR))) {
+			/* Ensure idle-ping is activated before going to idle. */
+			if (eb_is_empty(&h2c->streams_by_id) &&
+			    tick_isset(conn_idle_ping(h2c->conn))) {
+				h2c_update_timeout(h2c);
+			}
+
 			if (h2c->conn->flags & CO_FL_PRIVATE) {
 				/* Add the connection in the session server list, if not already done */
 				if (!session_add_conn(sess, h2c->conn, h2c->conn->target)) {
@@ -7303,6 +7410,12 @@ static size_t h2s_make_trailers(struct h2s *h2s, struct htx *htx)
 
 	/* get trailers. */
 	hdr = 0;
+
+	/* Skip the trailers because the corresponding conf option was set */
+	if ((!(h2c->flags & H2_CF_IS_BACK) && (h2c->proxy->options & PR_O_HTTP_DROP_RES_TRLS)) ||
+	    ((h2c->flags & H2_CF_IS_BACK) && (h2c->proxy->options & PR_O_HTTP_DROP_REQ_TRLS)))
+		goto skip_trailers;
+
 	for (blk = htx_get_head_blk(htx); blk; blk = htx_get_next_blk(htx, blk)) {
 		type = htx_get_blk_type(blk);
 
@@ -7327,6 +7440,7 @@ static size_t h2s_make_trailers(struct h2s *h2s, struct htx *htx)
 		}
 	}
 
+ skip_trailers:
 	/* marker for end of trailers */
 	list[hdr].n = ist("");
 

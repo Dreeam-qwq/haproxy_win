@@ -400,10 +400,12 @@ static int cli_parse_show_events(char **args, char *payload, struct appctx *appc
 /* Pre-configures a ring proxy to emit connections */
 void sink_setup_proxy(struct proxy *px)
 {
-	px->be_counters.last_change = ns_to_sec(now_ns);
-	px->cap = PR_CAP_BE;
 	px->maxconn = 0;
-	px->conn_retries = 1;
+	px->conn_retries = 1; /* FIXME ignored since 91e785ed
+	                       * ("MINOR: stream: Rely on a per-stream max connection retries value")
+	                       * If this is really expected this should be set on the stream directly
+	                       * because the proxy lacks the CAP_FE so this setting is not considered
+	                       */
 	px->timeout.server = TICK_ETERNITY;
 	px->timeout.client = TICK_ETERNITY;
 	px->timeout.connect = TICK_ETERNITY;
@@ -828,15 +830,11 @@ static struct sink *sink_new_ringbuf(const char *id, const char *description,
 	struct proxy *p = NULL; // forward_px
 
 	/* allocate new proxy to handle forwards */
-	p = calloc(1, sizeof(*p));
-	if (!p) {
-		memprintf(err_msg, "out of memory");
+	p = alloc_new_proxy(id, PR_CAP_BE, err_msg);
+	if (!p)
 		goto err;
-	}
 
-	init_new_proxy(p);
 	sink_setup_proxy(p);
-	p->id = strdup(id);
 	p->conf.args.file = p->conf.file = copy_file_name(file);
 	p->conf.args.line = p->conf.line = linenum;
 
@@ -1417,6 +1415,7 @@ static void sink_init()
 	sink_new_fd("stdout", "standard output (fd#1)", LOG_FORMAT_RAW, 1);
 	sink_new_fd("stderr", "standard output (fd#2)", LOG_FORMAT_RAW, 2);
 	sink_new_buf("buf0",  "in-memory ring buffer", LOG_FORMAT_TIMED, 1048576);
+	sink_new_buf("dpapi",  "DPAPI ring buffer", LOG_FORMAT_TIMED, 1048576);
 }
 
 static int sink_postcheck()

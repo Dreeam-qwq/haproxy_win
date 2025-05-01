@@ -192,6 +192,11 @@ list of options is :
 
   -Ws : master-worker mode with support of `notify` type of systemd service.
 
+  -4 : force DNS resolvers to query and accept IPv4 addresses only ("A"
+       records). This can be used when facing difficulties in certain
+       environments lacking end-to-end dual-stack connectivity. It overrides
+       the global "dns-accept-family" directive and forces it to "ipv4".
+
   -c : only performs a check of the configuration files and exits before trying
     to bind. The exit status is zero if everything is OK, or non-zero if an
     error is encountered. Presence of warnings will be reported if any.
@@ -1506,9 +1511,10 @@ that the terminal is handled by the readline library which supports line
 editing and history, which is very convenient when issuing repeated commands
 (eg: watch a counter).
 
-The socket supports two operation modes :
-  - interactive
-  - non-interactive
+The socket supports three operation modes :
+  - non-interactive, silent
+  - interactive, silent
+  - interactive with prompt
 
 The non-interactive mode is the default when socat connects to the socket. In
 this mode, a single line may be sent. It is processed as a whole, responses are
@@ -1522,12 +1528,25 @@ example :
 If a command needs to use a semi-colon or a backslash (eg: in a value), it
 must be preceded by a backslash ('\').
 
-The interactive mode displays a prompt ('>') and waits for commands to be
-entered on the line, then processes them, and displays the prompt again to wait
-for a new command. This mode is entered via the "prompt" command which must be
-sent on the first line in non-interactive mode. The mode is a flip switch, if
-"prompt" is sent in interactive mode, it is disabled and the connection closes
-after processing the last command of the same line.
+The interactive mode allows new commands to be sent after the ones from the
+previous lines finish. It exists in two variants, one silent, which works like
+the non-interactive mode except that the socket waits for a new command instead
+of closing, and one where a prompt is displayed ('>') at the beginning of the
+line. The interactive mode is preferred for advanced tools while the prompt
+mode is preferred for humans.
+
+The mode can be changed using the "prompt" command. By default, it toggles the
+interactive+prompt modes. Entering "prompt" in interactive mode will switch to
+prompt mode. The command optionally takes a specific mode among which:
+
+  - "n" : non-interactive mode (single command and quits)
+  - "i" : interactive mode (multiple commands, no prompt)
+  - "p" : prompt mode (multiple commands with a prompt)
+
+Since the default mode is non-interactive, "prompt" must be used as the first
+command in order to switch it, otherwise the previous command will cause the
+connection to be closed. Switching to non-interactive mode will result in the
+connection to be closed after all the commands of the same line complete.
 
 For this reason, when debugging by hand, it's quite common to start with the
 "prompt" command :
@@ -1537,6 +1556,9 @@ For this reason, when debugging by hand, it's quite common to start with the
    > show info
    ...
    >
+
+Interactive tools might prefer starting with "prompt i" to switch to interactive
+mode without the prompt.
 
 Optionally the process' uptime may be displayed in the prompt. In order to
 enable this, the "prompt timed" command will enable the prompt and toggle the
@@ -1618,6 +1640,20 @@ abort ssl crl-file <crlfile>
   Abort and destroy a temporary CRL file update transaction.
 
   See also "set ssl crl-file" and "commit ssl crl-file".
+
+acme ps
+  Show the running ACME tasks. See also "acme renew".
+
+  Example:
+    $ echo "@1 acme ps" | socat /run/haproxy-master.sock - | column -t -s $'\t'
+    # certificate     section   state
+    foobar.pem.rsa    LE1       Running
+    foobar.pem.ecdsa  LE2       Running
+
+acme renew <certificate>
+  Starts an ACME certificate generation task with the given certificate name.
+  The certificate must be linked to an acme section, see section 3.13. of the
+  configuration manual. See also "acme ps".
 
 add acl [@<ver>] <acl> <pattern>
   Add an entry into the acl <acl>. <acl> is the #<id> or the <name> returned by
@@ -1994,9 +2030,9 @@ commit ssl crl-file <crlfile>
   See also "new ssl crl-file", "set ssl crl-file", "abort ssl crl-file" and
   "add ssl crt-list".
 
-debug counters [reset|show|all|bug|chk|cnt|glt|?]*
+debug counters [reset|show|on|off|all|bug|chk|cnt|glt|?]*
   List internal counters placed in the code, which may vary depending on some
-  build options. Some of them depend on DEBUG_STRICT, others on DEBUG_GLITCHES.
+  build options. Some of them depend on DEBUG_STRICT, others on DEBUG_COUNTERS.
   The command takes a combination of multiple arguments, some defining actions
   and others defining filters:
     - bug     enables listing the counters for BUG_ON() statements
@@ -2004,6 +2040,8 @@ debug counters [reset|show|all|bug|chk|cnt|glt|?]*
     - chk     enables listing the counters for CHECK_IF() statements
     - glt     enables listing the counters for COUNT_GLITCH() statements
     - all     enables showing counters that never triggered (value 0)
+    - off     action: disables updating of the COUNT_IF() counters
+    - on      action: enables updating of the COUNT_IF() counters
     - reset   action: resets all specified counters
     - show    action: shows all specified counters
 
@@ -2357,15 +2395,27 @@ prepare map <map>
   committed. Version numbers are unsigned 32-bit values which wrap at the end,
   so care must be taken when comparing them in an external program.
 
-prompt
-  Toggle the prompt at the beginning of the line and enter or leave interactive
-  mode. In interactive mode, the connection is not closed after a command
-  completes. Instead, the prompt will appear again, indicating the user that
-  the interpreter is waiting for a new command. The prompt consists in a right
-  angle bracket followed by a space "> ". This mode is particularly convenient
-  when one wants to periodically check information such as stats or errors.
-  It is also a good idea to enter interactive mode before issuing a "help"
-  command.
+prompt [help | n | i | p | timed]*
+  Changes the behavior of the interactive mode and the prompt displayed at the
+  beginning of the line in interactive mode:
+    - "help"    : displays the command's usage
+    - "n"       : switches to non-interactive mode
+    - "i"       : switches to interactive mode
+    - "p"       : switches to interactive + prompt mode
+    - "timed"   : toggles displaying the time in the prompt
+
+  Without any option, this will cycle through prompt mode then non-interactive
+  mode. In non-interactive mode, the connection is closed after the last
+  command of the current line compltes. In interactive mode, the connection is
+  not closed after a command completes, so that a new one can be entered. In
+  prompt mode, the interactive mode is still in use, and a prompt will appear
+  at the beginning of the line, indicating to the user that the interpreter is
+  waiting for a new command. The prompt consists in a right angle bracket
+  followed by a space "> ".
+
+  The prompt mode is more suited to human users, the interactive mode to
+  advanced scripts, and the non-interactive mode (default) to basic scripts.
+  Note that the non-interactive mode is not available for the master socket.
 
 quit
   Close the connection when in interactive mode.
@@ -3793,7 +3843,7 @@ show ssl providers
         - fips
         - base
 
-show ssl sni [-f <frontend>] [-A]
+show ssl sni [-f <frontend>] [-A] [-t <offset>]
   Dump every SNI configured for the designated frontend, or all frontends if no
   frontend was specified. It allows to see what SNI are offered for a frontend,
   and to identify if a SNI is defined multiple times by multiple certificates for
@@ -3801,6 +3851,12 @@ show ssl sni [-f <frontend>] [-A]
 
   The -A option allows to filter the list and only displays the certificates
   that are past the notAfter date, allowing to show only expired certificates.
+
+  The -t option takes an offset in seconds, or with a time unit (s, m, h, d),
+  which is added to the current time, allowing to check which certificates
+  expired after the offset when combined with -A.
+  For example if you want to check which certificates would be expired in 30d,
+  just do "show ssl sni -A -t 30d".
 
   Columns are separated by a single \t, allowing to parse it simply.
 
@@ -3825,7 +3881,7 @@ show ssl sni [-f <frontend>] [-A]
   leaf certificate.
 
   Example:
-    $ echo "@1 show ssl sni" | socat /var/run/haproxy-master.sock - | column -t -s $'\t'
+    $ echo "@1 show ssl sni -A -t 30d" | socat /var/run/haproxy-master.sock - | column -t -s $'\t'
     # Frontend/Bind        SNI        Negative Filter  Type   Filename             NotAfter                  NotBefore
     li1/haproxy.cfg:10021  *.ex.lan   !m1.ex.lan       rsa    example.lan.pem      Jun 13 13:37:21 2024 GMT  May 14 13:37:21 2024 GMT
     li1/haproxy.cfg:10021  machine10  -                ecdsa  machine10.pem.ecdsa  Jun 13 13:37:21 2024 GMT  May 14 13:37:21 2024 GMT
@@ -4312,6 +4368,11 @@ Example:
   master. Leaving processes are only accessible with the PID as relative process
   number are only usable with the current processes.
 
+  This prefix may be used as a wrapper before a command, indicating that this
+  command and only this one will be sent to the designated process. In this
+  case the full command ends at the end of line or semi-colon like any regular
+  command.
+
   Examples:
 
     $ socat /var/run/haproxy-master.sock readline
@@ -4329,8 +4390,10 @@ Example:
     $ echo '@!1271 show info; @!1272 show info' | socat /var/run/haproxy-master.sock -
     [...]
 
-  A prefix could be use as a command, which will send every next commands to
-  the specified process.
+  The prefix may also be use as a standalone command to switch the default execution
+  context to the designated process, indicating that all subsequent commands will all
+  be executed in that process, until a new '@' command changes the execution context
+  again.
 
   Examples:
 
@@ -4346,6 +4409,52 @@ Example:
 
     $ echo '@1; show info; show stat; @2; show info; show stat' | socat /var/run/haproxy-master.sock -
     [...]
+
+  Note about limitations: a few rare commands alter a CLI session's state
+  (e.g. "set anon", "set timeout") and may not behave exactly similarly once
+  run from the master CLI due to commands being sent one at a time on their own
+  CLI session. Similarly, a few rare commands ("show events", "wait") actively
+  monitor the CLI for input or closure and are immediately interrupted when the
+  CLI is closed. These commands will not work as expected through the master
+  CLI because the command's input is closed after each command. For such rare
+  casesn the "@@" variant below might be more suited.
+
+@@<[!]pid> [command...]
+  This prefix or command is very similar to the "@" prefix documented above
+  except that it enters the worker process, delivers the whole command line
+  into it as-is and stays there until the command finishes. Semi-colons are
+  delivered as well, allowing to execute a full pipelined command in a worker
+  process. The connection with the work remains open until the list of commands
+  completes. Any data sent after the commands will be forwarded to the worker
+  process' CLI and may be consumed by the commands being executed and will be
+  lost for the master process' CLI, offering a truly bidirectional connection
+  with the worker process. As such, users of such commands must be very careful
+  to wait for the command's completion before sending new commands to the
+  master CLI.
+
+  Instead of executing a single command, it is also possible to open a fully
+  interactive session on the worker process by not specifying any command
+  (i.e. "@@1" on its own line). This session can be terminated either by
+  closing the connection or by quitting the worker process (using the "quit"
+  command). In this case, the prompt mode of the master socket (interactive,
+  prompt, timed) is propagated into the worker process.
+
+  Examples:
+    # gracefully close connections and delete a server once idle (wait max 10s)
+    $ socat -t 11 /var/run/haproxy-master.sock - <<< \
+       "@@1 disable server app2/srv36; \
+       wait 10000 srv-removable app2/srv36; \
+       del server app2/srv36"
+
+    # forcefully close connections and quickly delete a server
+    $ socat /var/run/haproxy-master.sock - <<< \
+       "@@1 disable server app2/srv36; \
+       shutdown sessions server app2/srv36; \
+       wait 100 srv-removable app2/srv36; \
+       del server app2/srv36"
+
+    # show messages arriving to this ring in real time ("tail -f" equivalent)
+    $ (echo "show events buf0 -w"; read) | socat /var/run/haproxy-master.sock -
 
 expert-mode [on|off]
   This command activates the "expert-mode" for every worker accessed from the

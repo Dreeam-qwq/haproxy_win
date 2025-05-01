@@ -41,7 +41,7 @@
 #define __decl_rwlock(lock)
 #define __decl_aligned_rwlock(lock)
 
-#elif !defined(DEBUG_THREAD) && !defined(DEBUG_FULL)
+#elif (DEBUG_THREAD < 1) && !defined(DEBUG_FULL)
 
 /************** THREADS ENABLED WITHOUT DEBUGGING **************/
 
@@ -94,11 +94,25 @@
 #define __HA_SPINLOCK_T     unsigned long
 #define __HA_RWLOCK_T       unsigned long
 
+/* Type used as a shared value from a global counter. Manipulation to the
+ * global value is thread-safe. Share counter can be increased/decreased
+ * without modifying the global value to reduce contention. The global value is
+ * modified only when the configured limit is reached.
+ *
+ * Typically a cshared is declared as a thread-local variable, with a reference
+ * to a process global value.
+ */
+struct cshared {
+	uint64_t *global;
+	int diff;
+	int lim;
+};
+
 
 /* When thread debugging is enabled, we remap HA_SPINLOCK_T and HA_RWLOCK_T to
  * complex structures which embed debugging info.
  */
-#if !defined(DEBUG_THREAD) && !defined(DEBUG_FULL)
+#if (DEBUG_THREAD < 2) && !defined(DEBUG_FULL)
 
 #define HA_SPINLOCK_T        __HA_SPINLOCK_T
 #define HA_RWLOCK_T          __HA_RWLOCK_T
@@ -171,6 +185,7 @@ enum lock_label {
 	LBPRM_LOCK,
 	SIGNALS_LOCK,
 	STK_TABLE_LOCK,
+	STK_TABLE_UPDT_LOCK,
 	STK_SESS_LOCK,
 	APPLETS_LOCK,
 	PEER_LOCK,

@@ -605,7 +605,7 @@ static int spop_avail_streams(struct connection *conn)
 	int ret1, ret2;
 
 	/* Don't open new stream if the connection is closed */
-	if (spop_conn->state == SPOP_CS_CLOSED)
+	if (spop_conn->state >= SPOP_CS_ERROR || (spop_conn->flags & (SPOP_CF_ERR_PENDING|SPOP_CF_ERROR)))
 		return 0;
 
 	/* May be negative if this setting has changed */
@@ -1291,7 +1291,8 @@ static void spop_strm_wake_one_stream(struct spop_strm *spop_strm)
 			spop_strm_close(spop_strm);
 	}
 
-	if (spop_conn->state == SPOP_CS_CLOSED || (spop_conn->flags & (SPOP_CF_ERR_PENDING|SPOP_CF_ERROR))) {
+
+	if (spop_conn->state >= SPOP_CS_ERROR || (spop_conn->flags & (SPOP_CF_ERR_PENDING|SPOP_CF_ERROR))) {
 		se_fl_set_error(spop_strm->sd);
 		spop_strm_propagate_term_flags(spop_conn, spop_strm);
 		if (!spop_strm->sd->abort_info.info) {
@@ -1547,11 +1548,15 @@ static int spop_conn_send_disconnect(struct spop_conn *spop_conn)
 
 	outbuf.data += p - b_tail(&outbuf);
 
+	if (outbuf.data - 4 > spop_conn->max_frame_size)
+		goto too_big;
+
 	/* update the frame's size now */
 	TRACE_PROTO("SPOP HAPROXY DISCONNECT frame xferred", SPOP_EV_TX_FRAME|SPOP_EV_TX_DISCO, spop_conn->conn, 0, 0, (size_t[]){outbuf.data});
 	spop_set_frame_size(outbuf.area, outbuf.data - 4);
 	b_add(mbuf, outbuf.data);
 	spop_conn->flags |= SPOP_CF_DISCO_SENT;
+	spop_conn->state = SPOP_CS_CLOSING;
 	ret = 1;
 
 	switch (spop_conn->errcode) {
@@ -1596,10 +1601,8 @@ static int spop_conn_send_disconnect(struct spop_conn *spop_conn)
 	return ret;
   full:
 	/* Too large to be encoded. For DISCONNECT frame, it is an error */
-	if (!b_data(mbuf)) {
-		TRACE_ERROR("SPOP HAPROXY DISCO frame too large", SPOP_EV_TX_FRAME|SPOP_EV_TX_DISCO|SPOP_EV_SPOP_CONN_ERR, spop_conn->conn);
-		goto fail;
-	}
+	if (!b_data(mbuf))
+		goto too_big;
 
 	if ((mbuf = br_tail_add(spop_conn->mbuf)) != NULL)
 		goto retry;
@@ -1608,6 +1611,10 @@ static int spop_conn_send_disconnect(struct spop_conn *spop_conn)
 	TRACE_STATE("mbuf ring full", SPOP_EV_TX_FRAME|SPOP_EV_SPOP_CONN_BLK, spop_conn->conn);
 	ret = 0;
 	goto end;
+
+  too_big:
+	TRACE_ERROR("SPOP HAPROXY DISCO frame too large", SPOP_EV_TX_FRAME|SPOP_EV_TX_DISCO|SPOP_EV_SPOP_CONN_ERR, spop_conn->conn);
+
   fail:
 	spop_conn->state = SPOP_CS_CLOSED;
 	TRACE_STATE("switching to CLOSED", SPOP_EV_TX_FRAME|SPOP_EV_TX_DISCO|SPOP_EV_SPOP_CONN_END, spop_conn->conn);
@@ -1777,12 +1784,11 @@ static int spop_conn_handle_hello(struct spop_conn *spop_conn)
 	TRACE_PROTO("SPOP AGENT HELLO frame rcvd", SPOP_EV_RX_FRAME|SPOP_EV_RX_HELLO, spop_conn->conn, 0, 0, (size_t[]){spop_conn->dfl});
 	b_del(&spop_conn->dbuf, spop_conn->dfl);
 	spop_conn->dfl = 0;
+	spop_conn->state = SPOP_CS_FRAME_H;
 	spop_wake_unassigned_streams(spop_conn);
 	TRACE_LEAVE(SPOP_EV_RX_FRAME|SPOP_EV_RX_HELLO, spop_conn->conn);
 	return 1;
   fail:
-	spop_conn->state = SPOP_CS_CLOSED;
-	TRACE_STATE("switching to CLOSED", SPOP_EV_RX_FRAME|SPOP_EV_RX_HELLO, spop_conn->conn);
 	TRACE_DEVEL("leaving on error", SPOP_EV_RX_FRAME|SPOP_EV_RX_HELLO|SPOP_EV_SPOP_CONN_ERR, spop_conn->conn);
 	return 0;
 }
@@ -1968,7 +1974,6 @@ static int spop_conn_handle_ack(struct spop_conn *spop_conn, struct spop_strm *s
 
 	sent = b_xfer(rxbuf, dbuf, flen);
 	BUG_ON(sent != flen);
-	/* b_del(&spop_conn->dbuf, sent); */
 	spop_conn->dfl -= sent;
 
   end:
@@ -2057,27 +2062,35 @@ static void spop_process_demux(struct spop_conn *spop_conn)
 
 	TRACE_ENTER(SPOP_EV_SPOP_CONN_WAKE, spop_conn->conn);
 
-	if (spop_conn->state >= SPOP_CS_ERROR)
+	if (spop_conn->state == SPOP_CS_CLOSED)
 		goto out;
 
-	if (unlikely(spop_conn->state < SPOP_CS_FRAME_H)) {
+	if (unlikely(spop_conn->state < SPOP_CS_FRAME_H || spop_conn->state == SPOP_CS_CLOSING)) {
 		if (spop_conn->state == SPOP_CS_HA_HELLO) {
 			TRACE_STATE("waiting AGENT HELLO frame to be sent", SPOP_EV_RX_FRAME|SPOP_EV_RX_FHDR|SPOP_EV_RX_HELLO, spop_conn->conn);
 			goto out;
 		}
-		if (spop_conn->state == SPOP_CS_AGENT_HELLO) {
-			/* ensure that what is pending is a valid AGENT HELLO frame. */
-			TRACE_STATE("receiving AGENT HELLO frame header", SPOP_EV_RX_FRAME|SPOP_EV_RX_FHDR, spop_conn->conn);
+		else { /* AGENT_HELLO OR CLOSING */
+			/* ensure that what is pending is a valid AGENT HELLO/DISCONNECT frame. */
+			TRACE_STATE("receiving AGENT HELLO/DISCONNECT frame header", SPOP_EV_RX_FRAME|SPOP_EV_RX_FHDR, spop_conn->conn);
 			if (!spop_get_frame_hdr(&spop_conn->dbuf, &hdr)) {
 				spop_conn->flags |= SPOP_CF_DEM_SHORT_READ;
 				TRACE_ERROR("header frame not available yet", SPOP_EV_RX_FRAME|SPOP_EV_RX_FHDR, spop_conn->conn);
 				goto done;
 			}
 
-			if (hdr.sid || hdr.fid || hdr.type != SPOP_FRM_T_AGENT_HELLO || !(hdr.flags & SPOP_FRM_FL_FIN)) {
+			if (spop_conn->state == SPOP_CS_AGENT_HELLO && hdr.type != SPOP_FRM_T_AGENT_HELLO) {
 				spop_conn_error(spop_conn, SPOP_ERR_INVALID);
 				spop_conn->state = SPOP_CS_CLOSED;
-				TRACE_ERROR("unexpected frame type or flags", SPOP_EV_RX_FRAME|SPOP_EV_RX_FHDR|SPOP_EV_RX_HELLO|SPOP_EV_SPOP_CONN_ERR, spop_conn->conn);
+				TRACE_ERROR("unexpected frame type (AGENT HELLO expected)", SPOP_EV_RX_FRAME|SPOP_EV_RX_FHDR|SPOP_EV_RX_HELLO|SPOP_EV_SPOP_CONN_ERR, spop_conn->conn);
+				TRACE_STATE("switching to CLOSED", SPOP_EV_RX_FRAME|SPOP_EV_RX_FHDR|SPOP_EV_RX_HELLO|SPOP_EV_SPOP_CONN_ERR, spop_conn->conn);
+				goto done;
+			}
+
+			if ((hdr.type == SPOP_FRM_T_AGENT_HELLO || hdr.type == SPOP_FRM_T_AGENT_DISCON) && (hdr.sid || hdr.fid || !(hdr.flags & SPOP_FRM_FL_FIN))) {
+				spop_conn_error(spop_conn, SPOP_ERR_INVALID);
+				spop_conn->state = SPOP_CS_CLOSED;
+				TRACE_ERROR("unexpected frame meta-data", SPOP_EV_RX_FRAME|SPOP_EV_RX_FHDR|SPOP_EV_RX_HELLO|SPOP_EV_SPOP_CONN_ERR, spop_conn->conn);
 				TRACE_STATE("switching to CLOSED", SPOP_EV_RX_FRAME|SPOP_EV_RX_FHDR|SPOP_EV_RX_HELLO|SPOP_EV_SPOP_CONN_ERR, spop_conn->conn);
 				goto done;
 			}
@@ -2123,13 +2136,14 @@ static void spop_process_demux(struct spop_conn *spop_conn)
 				break;
 			}
 
+			spop_conn->state = SPOP_CS_FRAME_P;
+
 		  new_frame:
 			spop_conn->dsi = hdr.sid;
 			spop_conn->dfi = hdr.fid;
 			spop_conn->dft = hdr.type;
 			spop_conn->dfl = hdr.len;
 			spop_conn->dff = hdr.flags;
-			spop_conn->state = SPOP_CS_FRAME_P;
 			TRACE_STATE("SPOP frame header rcvd, switching to FRAME_P", SPOP_EV_RX_FRAME|SPOP_EV_RX_FHDR, spop_conn->conn);
 
 			/* Perform sanity check on the frame header */
@@ -2207,12 +2221,10 @@ static void spop_process_demux(struct spop_conn *spop_conn)
 
 		switch (spop_conn->dft) {
 		case SPOP_FRM_T_AGENT_HELLO:
-			if (spop_conn->state == SPOP_CS_FRAME_P)
-				ret = spop_conn_handle_hello(spop_conn);
+			ret = spop_conn_handle_hello(spop_conn);
 			break;
 		case SPOP_FRM_T_AGENT_DISCON:
-			if (spop_conn->state == SPOP_CS_FRAME_P)
-				ret = spop_conn_handle_disconnect(spop_conn);
+			ret = spop_conn_handle_disconnect(spop_conn);
 			break;
 		case SPOP_FRM_T_AGENT_ACK:
 			if (spop_conn->state == SPOP_CS_FRAME_P)
@@ -2247,7 +2259,7 @@ static void spop_process_demux(struct spop_conn *spop_conn)
 				b_del(&spop_conn->dbuf, ret);
 				spop_conn->dfl -= ret;
 			}
-			if (!spop_conn->dfl) {
+			if (!spop_conn->dfl && spop_conn->state != SPOP_CS_FRAME_P) {
 				TRACE_STATE("switching to FRAME_H", SPOP_EV_RX_FRAME|SPOP_EV_RX_FHDR, spop_conn->conn);
 				spop_conn->state = SPOP_CS_FRAME_H;
 			}
@@ -2585,7 +2597,7 @@ static int spop_process(struct spop_conn *spop_conn)
 	    (b_data(&spop_conn->dbuf) || (spop_conn->flags & SPOP_CF_RCVD_SHUT))) {
 		spop_process_demux(spop_conn);
 
-		if (spop_conn->state >= SPOP_CS_ERROR || (spop_conn->flags & SPOP_CF_ERROR))
+		if (spop_conn->state == SPOP_CS_CLOSED || (spop_conn->flags & SPOP_CF_ERROR))
 			b_reset(&spop_conn->dbuf);
 
 		if (b_room(&spop_conn->dbuf))
@@ -2661,7 +2673,8 @@ static int spop_ctl(struct connection *conn, enum mux_ctl_type mux_ctl, void *ou
 
 	switch (mux_ctl) {
 	case MUX_CTL_STATUS:
-		if (!(conn->flags & CO_FL_WAIT_XPRT))
+		if ((spop_conn->state >= SPOP_CS_FRAME_H && spop_conn->state < SPOP_CS_ERROR) &&
+		    !(spop_conn->flags & (SPOP_CF_ERROR|SPOP_CF_ERR_PENDING|SPOP_CF_END_REACHED|SPOP_CF_RCVD_SHUT|SPOP_CF_DISCO_SENT|SPOP_CF_DISCO_FAILED)))
 			ret |= MUX_STATUS_READY;
 		return ret;
 	case MUX_CTL_EXIT_STATUS:
@@ -3215,6 +3228,9 @@ static size_t spop_strm_send_notify(struct spop_strm *spop_strm, struct buffer *
 
 	outbuf.data += p - b_tail(&outbuf);
 
+	if (outbuf.data - 4 > spop_conn->max_frame_size)
+		goto too_big;
+
 	/* update the frame's size now */
 	TRACE_PROTO("SPOP HAPROXY NOTIFY frame xferred", SPOP_EV_TX_FRAME|SPOP_EV_TX_NOTIFY, spop_conn->conn, spop_strm, 0, (size_t[]){outbuf.data});
 	spop_set_frame_size(outbuf.area, outbuf.data - 4);
@@ -3228,11 +3244,8 @@ static size_t spop_strm_send_notify(struct spop_strm *spop_strm, struct buffer *
 	return ret;
   full:
 	/* Too large to be encoded. For NOTIFY frame, it is an error */
-	if (!b_data(mbuf)) {
-		TRACE_ERROR("SPOP HAPROXY NOTIFY frame too large", SPOP_EV_TX_FRAME|SPOP_EV_TX_NOTIFY|SPOP_EV_SPOP_STRM_ERR, spop_conn->conn, spop_strm);
-		spop_strm_error(spop_strm, SPOP_ERR_TOO_BIG);
-		goto fail;
-	}
+	if (!b_data(mbuf))
+		goto too_big;
 
 	if ((mbuf = br_tail_add(spop_conn->mbuf)) != NULL)
 		goto retry;
@@ -3241,6 +3254,11 @@ static size_t spop_strm_send_notify(struct spop_strm *spop_strm, struct buffer *
 	TRACE_STATE("mbuf ring full", SPOP_EV_TX_FRAME|SPOP_EV_TX_NOTIFY|SPOP_EV_SPOP_STRM_BLK, spop_conn->conn, spop_strm);
 	ret = 0;
 	goto end;
+
+  too_big:
+	TRACE_ERROR("SPOP HAPROXY NOTIFY frame too large", SPOP_EV_TX_FRAME|SPOP_EV_TX_NOTIFY|SPOP_EV_SPOP_STRM_ERR, spop_conn->conn, spop_strm);
+	spop_strm_error(spop_strm, SPOP_ERR_TOO_BIG);
+
   fail:
 	TRACE_DEVEL("leaving on error", SPOP_EV_TX_FRAME|SPOP_EV_TX_NOTIFY|SPOP_EV_SPOP_STRM_ERR, spop_conn->conn, spop_strm);
 	return 0;

@@ -162,6 +162,8 @@ static struct qcs *qcs_new(struct qcc *qcc, uint64_t id, enum qcs_type type)
 		qfctl_init(&qcs->tx.fc, 0);
 	}
 
+	qcs->tx.msd_frm = NULL;
+
 	qcs->rx.bufs = EB_ROOT_UNIQUE;
 	qcs->rx.app_buf = BUF_NULL;
 	qcs->rx.offset = qcs->rx.offset_max = 0;
@@ -173,7 +175,7 @@ static struct qcs *qcs_new(struct qcc *qcc, uint64_t id, enum qcs_type type)
 	else if (quic_stream_is_remote(qcc, id)) {
 		qcs->rx.msd = qcc->lfctl.msd_uni_r;
 	}
-	qcs->rx.msd_init = qcs->rx.msd;
+	qcs->rx.msd_base = 0;
 
 	qcs->wait_event.tasklet = NULL;
 	qcs->wait_event.events = 0;
@@ -1198,6 +1200,7 @@ static void qcs_consume(struct qcs *qcs, uint64_t bytes, struct qc_stream_rxbuf 
 	struct qcc *qcc = qcs->qcc;
 	struct quic_frame *frm;
 	enum ncb_ret ret;
+	uint64_t diff, inc = 0;
 
 	TRACE_ENTER(QMUX_EV_QCS_RECV, qcc->conn, qcs);
 
@@ -1218,20 +1221,43 @@ static void qcs_consume(struct qcs *qcs, uint64_t bytes, struct qc_stream_rxbuf 
 	if (qcs->flags & QC_SF_SIZE_KNOWN)
 		goto conn_fctl;
 
-	if (qcs->rx.msd - qcs->rx.offset < qcs->rx.msd_init / 2) {
-		TRACE_DATA("increase stream credit via MAX_STREAM_DATA", QMUX_EV_QCS_RECV, qcc->conn, qcs);
-		frm = qc_frm_alloc(QUIC_FT_MAX_STREAM_DATA);
+	/* Check if a MAX_STREAM_DATA frame should be emitted, determined by
+	 * the consumed capacity. If no more than 2 Rx buffers can be allocated
+	 * per QCS, the limit is set to half the capacity. Else, the limit is
+	 * set to match bufsize.
+	 */
+	if (qcs->rx.msd - qcs->rx.msd_base < qmux_stream_rx_bufsz() * 2) {
+		if ((qcs->rx.offset - qcs->rx.msd_base) * 2 >= qcs->rx.msd - qcs->rx.msd_base)
+			inc = qcs->rx.offset - qcs->rx.msd_base;
+	}
+	else {
+		diff = qcs->rx.offset - qcs->rx.msd_base;
+		while (diff >= qmux_stream_rx_bufsz()) {
+			inc += qmux_stream_rx_bufsz();
+			diff -= qmux_stream_rx_bufsz();
+		}
+	}
+
+	if (inc) {
+		frm = qcs->tx.msd_frm;
 		if (!frm) {
-			qcc_set_error(qcc, QC_ERR_INTERNAL_ERROR, 0);
-			return;
+			frm = qc_frm_alloc(QUIC_FT_MAX_STREAM_DATA);
+			if (!frm) {
+				qcc_set_error(qcc, QC_ERR_INTERNAL_ERROR, 0);
+				return;
+			}
+
+			frm->max_stream_data.id = qcs->id;
+			LIST_APPEND(&qcc->lfctl.frms, &frm->list);
+			qcs->tx.msd_frm = frm;
 		}
 
-		qcs->rx.msd = qcs->rx.offset + qcs->rx.msd_init;
+		TRACE_DATA("increase stream credit via MAX_STREAM_DATA", QMUX_EV_QCS_RECV, qcc->conn, qcs);
+		qcs->rx.msd += inc;
+		qcs->rx.msd_base += inc;
 
-		frm->max_stream_data.id = qcs->id;
 		frm->max_stream_data.max_stream_data = qcs->rx.msd;
 
-		LIST_APPEND(&qcc->lfctl.frms, &frm->list);
 		tasklet_wakeup(qcc->wait_event.tasklet);
 	}
 
@@ -1259,6 +1285,10 @@ static void qcs_consume(struct qcs *qcs, uint64_t bytes, struct qc_stream_rxbuf 
 /* Decode the content of STREAM frames already received on the stream instance
  * <qcs> from the <qcc> connection.
  *
+ * It is safe to remove <qcs> from <qcc> recv_list after decoding is done. Even
+ * if an error is returned, caller should consider that no further Rx
+ * processing can be performed for the stream, until new bytes are available.
+ *
  * Returns the result of app_ops rcv_buf callback, which is the number of bytes
  * successfully transcoded, or a negative error code. If no error occurred but
  * decoding cannot proceed due to missing data, the return value is 0. The
@@ -1273,6 +1303,12 @@ static int qcc_decode_qcs(struct qcc *qcc, struct qcs *qcs)
 	int prev_glitches = qcc->glitches;
 
 	TRACE_ENTER(QMUX_EV_QCS_RECV, qcc->conn, qcs);
+
+	if (qcc->flags & QC_CF_ERRL) {
+		TRACE_DATA("connection on error", QMUX_EV_QCC_RECV, qcc->conn);
+		ret = -1;
+		goto err;
+	}
 
  restart:
 	rxbuf = qcs_get_curr_rxbuf(qcs);
@@ -2556,6 +2592,56 @@ static int qcs_send(struct qcs *qcs, struct list *frms, uint64_t window_conn)
 	return -1;
 }
 
+/* Emit prepared flow-control related frames from <qcc> list.
+ *
+ * Returns 0 on success else non zero.
+ */
+static int qcc_emit_fctl(struct qcc *qcc)
+{
+	struct list single_frm = LIST_HEAD_INIT(single_frm);
+	struct quic_frame *frm;
+	struct eb64_node *node;
+	struct qcs *qcs;
+	int64_t id;
+
+	TRACE_ENTER(QMUX_EV_QCC_END, qcc->conn);
+
+	while (!LIST_ISEMPTY(&qcc->lfctl.frms)) {
+		/* Each frame is sent individually in a single element list. */
+		frm = LIST_ELEM(qcc->lfctl.frms.n, struct quic_frame *, list);
+		id = frm->type == QUIC_FT_MAX_STREAM_DATA ?
+		     frm->max_stream_data.id : -1;
+
+		LIST_DELETE(&frm->list);
+		LIST_APPEND(&single_frm, &frm->list);
+
+		if (qcc_send_frames(qcc, &single_frm, 0)) {
+			/* replace frame that cannot be sent in qcc list. */
+			LIST_DELETE(&frm->list);
+			LIST_INSERT(&qcc->lfctl.frms, &frm->list);
+			goto err;
+		}
+
+		BUG_ON_HOT(!LIST_ISEMPTY(&single_frm));
+
+		/* If frame is MAX_STREAM_DATA, reset corresponding QCS msd_frm pointer. */
+		if (id >= 0) {
+			node = eb64_lookup(&qcc->streams_by_id, frm->max_stream_data.id);
+			if (node) {
+				qcs = eb64_entry(node, struct qcs, by_id);
+				qcs->tx.msd_frm = NULL;
+			}
+		}
+	}
+
+	TRACE_LEAVE(QMUX_EV_QCC_SEND, qcc->conn);
+	return 0;
+
+ err:
+	TRACE_DEVEL("leaving on error", QMUX_EV_QCC_SEND, qcc->conn);
+	return 1;
+}
+
 /* Send RESET_STREAM/STOP_SENDING for streams in <qcc> send_list if requested.
  * Each frame is encoded and emitted separately for now. If a frame cannot be
  * sent, send_list looping is interrupted.
@@ -2801,7 +2887,7 @@ static int qcc_io_send(struct qcc *qcc)
 	}
 
 	if (!LIST_ISEMPTY(&qcc->lfctl.frms)) {
-		if (qcc_send_frames(qcc, &qcc->lfctl.frms, 0)) {
+		if (qcc_emit_fctl(qcc)) {
 			TRACE_DEVEL("flow-control frames rejected by transport, aborting send", QMUX_EV_QCC_SEND, qcc->conn);
 			goto out;
 		}
@@ -2952,10 +3038,11 @@ static int qcc_io_recv(struct qcc *qcc)
 			LIST_DEL_INIT(&qcs->el_recv);
 
 			if (ret <= 0)
-				break;
+				goto done;
 		}
 	}
 
+ done:
 	TRACE_LEAVE(QMUX_EV_QCC_RECV, qcc->conn);
 	return 0;
 }
@@ -3206,7 +3293,7 @@ struct task *qcc_io_cb(struct task *t, void *ctx, unsigned int status)
 
 	TRACE_LEAVE(QMUX_EV_QCC_WAKE, qcc->conn);
 
-	return NULL;
+	return t;
 
  release:
 	qcc_shutdown(qcc);

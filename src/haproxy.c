@@ -110,6 +110,7 @@
 #include <haproxy/proto_tcp.h>
 #include <haproxy/proxy.h>
 #include <haproxy/regex.h>
+#include <haproxy/resolvers.h>
 #include <haproxy/sample.h>
 #include <haproxy/server.h>
 #include <haproxy/session.h>
@@ -198,6 +199,7 @@ struct global global = {
 		.quic_frontend_max_idle_timeout = QUIC_TP_DFLT_FRONT_MAX_IDLE_TIMEOUT,
 		.quic_frontend_max_data = 0,
 		.quic_frontend_max_streams_bidi = QUIC_TP_DFLT_FRONT_MAX_STREAMS_BIDI,
+		.quic_frontend_max_tx_mem = QUIC_MAX_TX_MEM,
 		.quic_frontend_max_window_size = QUIC_DFLT_MAX_WINDOW_SIZE,
 		.quic_frontend_stream_data_ratio = QUIC_DFLT_FRONT_STREAM_DATA_RATIO,
 		.quic_reorder_ratio = QUIC_DFLT_REORDER_RATIO,
@@ -662,6 +664,7 @@ static void usage(char *name)
 		"        -q quiet mode : don't display messages\n"
 		"        -c check mode : only check config files and exit\n"
 		"        -cc check condition : evaluate a condition and exit\n"
+		"        -4 force resolvers to consider IPv4 responses only\n"
 		"        -n sets the maximum total # of connections (uses ulimit -n)\n"
 		"        -m limits the usable amount of memory (in MB)\n"
 		"        -N sets the default, per-proxy maximum # of connections (%d)\n"
@@ -1591,6 +1594,8 @@ static void init_args(int argc, char **argv)
 				argc--;
 				check_condition = *argv;
 			}
+			else if (*flag == '4')
+				resolv_accept_families = RSLV_ACCEPT_IPV4 | RSLV_FORCED_FAMILY;
 			else if (*flag == 'c')
 				arg_mode |= MODE_CHECK;
 			else if (*flag == 'D')
@@ -2856,9 +2861,6 @@ void run_poll_loop()
 
 		/* Process a few tasks */
 		process_runnable_tasks();
-
-		/* If this happens this is an accidental leak */
-		BUG_ON(HA_ATOMIC_LOAD(&th_ctx->flags) & TH_FL_DUMPING_OTHERS);
 
 		/* also stop  if we failed to cleanly stop all tasks */
 		if (killed > 1)

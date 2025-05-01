@@ -51,6 +51,7 @@ int resume_proxy(struct proxy *p);
 void stop_proxy(struct proxy *p);
 int  stream_set_backend(struct stream *s, struct proxy *be);
 
+void deinit_proxy(struct proxy *p);
 void free_proxy(struct proxy *p);
 const char *proxy_cap_str(int cap);
 const char *proxy_mode_str(int mode);
@@ -70,6 +71,7 @@ void proxy_destroy_all_unref_defaults(void);
 void proxy_ref_defaults(struct proxy *px, struct proxy *defpx);
 void proxy_unref_defaults(struct proxy *px);
 void proxy_unref_or_destroy_defaults(struct proxy *px);
+int setup_new_proxy(struct proxy *px, const char *name, unsigned int cap, char **errmsg);
 struct proxy *alloc_new_proxy(const char *name, unsigned int cap,
                               char **errmsg);
 struct proxy *parse_new_proxy(const char *name, unsigned int cap,

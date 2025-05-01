@@ -626,6 +626,7 @@ struct task *quic_conn_app_io_cb(struct task *t, void *context, unsigned int sta
  out:
 	if ((qc->flags & QUIC_FL_CONN_CLOSING) && qc->mux_state != QC_MUX_READY) {
 		quic_conn_release(qc);
+		t = NULL;
 		qc = NULL;
 	}
 
@@ -1441,6 +1442,10 @@ void quic_conn_release(struct quic_conn *qc)
 		HA_ATOMIC_DEC(&qc->li->rx.quic_curr_accept);
 	}
 
+	/* Substract last congestion window from global memory counter. */
+	cshared_add(&quic_mem_diff, -qc->path->cwnd);
+	qc->path->cwnd = 0;
+
 	/* free remaining stream descriptors */
 	node = eb64_first(&qc->streams_by_id);
 	while (node) {
@@ -1860,7 +1865,7 @@ int qc_bind_tid_prep(struct quic_conn *qc, uint new_tid)
 	}
 
 	/* Reinit IO tasklet. */
-	if (qc->wait_event.tasklet->state & TASK_IN_LIST)
+	if (qc->wait_event.tasklet->state & TASK_QUEUED)
 		qc->flags |= QUIC_FL_CONN_IO_TO_REQUEUE;
 	tasklet_kill(qc->wait_event.tasklet);
 	/* In most cases quic_conn_app_io_cb is used but for 0-RTT quic_conn_io_cb can be still activated. */

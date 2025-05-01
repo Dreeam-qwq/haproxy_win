@@ -578,6 +578,7 @@ static void dns_session_io_handler(struct appctx *appctx)
 				LIST_APPEND(&ds->queries, &query->list);
 				eb32_insert(&ds->query_ids, &query->qid);
 				ds->onfly_queries++;
+				HA_ATOMIC_STORE(&ds->dss->consecutive_errors, 0);
 			}
 
 			/* update the tx_offset to handle output in 16k streams */
@@ -806,7 +807,7 @@ void dns_session_free(struct dns_session *ds)
 	pool_free(dns_session_pool, ds);
 }
 
-static struct appctx *dns_session_create(struct dns_session *ds);
+static struct appctx *dns_session_create(struct dns_session *ds, int tempo);
 
 static int dns_session_init(struct appctx *appctx)
 {
@@ -844,6 +845,7 @@ static void dns_session_release(struct appctx *appctx)
 {
 	struct dns_session *ds = appctx->svcctx;
 	struct dns_stream_server *dss __maybe_unused;
+	int consecutive_errors;
 
 	if (!ds)
 		return;
@@ -906,13 +908,24 @@ static void dns_session_release(struct appctx *appctx)
 	/* reset offset to be sure to start from message start */
 	ds->tx_msg_offset = 0;
 
+	consecutive_errors = HA_ATOMIC_LOAD(&ds->dss->consecutive_errors);
+	/* we know ds encountered an error because it failed to send all
+	 * its queries: increase consecutive_errors (we take some precautions
+	 * to prevent the counter from overflowing since it is atomically
+	 * updated)
+	 */
+	while (consecutive_errors < DNS_MAX_DSS_CONSECUTIVE_ERRORS &&
+	       !HA_ATOMIC_CAS(&ds->dss->consecutive_errors,
+	                      &consecutive_errors, consecutive_errors + 1) &&
+	       __ha_cpu_relax());
+
 	/* here the ofs and the attached counter
 	 * are kept unchanged
 	 */
 
 	/* Create a new appctx, We hope we can
 	 * create from the release callback! */
-	ds->appctx = dns_session_create(ds);
+	ds->appctx = dns_session_create(ds, 1);
 	if (!ds->appctx) {
 		dns_session_free(ds);
 		HA_SPIN_UNLOCK(DNS_LOCK, &dss->lock);
@@ -937,8 +950,10 @@ static struct applet dns_session_applet = {
 /*
  * Function used to create an appctx for a DNS session
  * It sets its context into appctx->svcctx.
+ * if <tempo> is set, then the session startup will be delayed by 1
+ * second
  */
-static struct appctx *dns_session_create(struct dns_session *ds)
+static struct appctx *dns_session_create(struct dns_session *ds, int tempo)
 {
 	struct appctx *appctx;
 
@@ -947,10 +962,14 @@ static struct appctx *dns_session_create(struct dns_session *ds)
 		goto out_close;
 	appctx->svcctx = (void *)ds;
 
-	if (appctx_init(appctx) == -1) {
-		ha_alert("out of memory in dns_session_create().\n");
-		goto out_free_appctx;
+	if (!tempo) {
+		if (appctx_init(appctx) == -1) {
+			ha_alert("out of memory in dns_session_create().\n");
+			goto out_free_appctx;
+		}
 	}
+	else
+		appctx_schedule(appctx, tick_add(now_ms, MS_TO_TICKS(1000)));
 
 	return appctx;
 
@@ -1037,6 +1056,9 @@ struct dns_session *dns_session_new(struct dns_stream_server *dss)
 	if (dss->maxconn && (dss->maxconn <= dss->cur_conns))
 		return NULL;
 
+	if (HA_ATOMIC_LOAD(&dss->consecutive_errors) >= DNS_MAX_DSS_CONSECUTIVE_ERRORS)
+		return NULL;
+
 	ds = pool_zalloc(dns_session_pool);
 	if (!ds)
 		return NULL;
@@ -1072,7 +1094,7 @@ struct dns_session *dns_session_new(struct dns_stream_server *dss)
 	ds->task_exp->process = dns_process_query_exp;
 	ds->task_exp->context = ds;
 
-	ds->appctx = dns_session_create(ds);
+	ds->appctx = dns_session_create(ds, 0);
 	if (!ds->appctx)
 		goto error;
 

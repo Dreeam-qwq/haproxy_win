@@ -261,9 +261,9 @@ endif
 # without appearing here. Currently defined DEBUG macros include DEBUG_FULL,
 # DEBUG_MEM_STATS, DEBUG_DONT_SHARE_POOLS, DEBUG_FD, DEBUG_POOL_INTEGRITY,
 # DEBUG_NO_POOLS, DEBUG_FAIL_ALLOC, DEBUG_STRICT_ACTION=[0-3], DEBUG_HPACK,
-# DEBUG_AUTH, DEBUG_SPOE, DEBUG_UAF, DEBUG_THREAD, DEBUG_STRICT, DEBUG_DEV,
+# DEBUG_AUTH, DEBUG_SPOE, DEBUG_UAF, DEBUG_THREAD=0-2, DEBUG_STRICT, DEBUG_DEV,
 # DEBUG_TASK, DEBUG_MEMORY_POOLS, DEBUG_POOL_TRACING, DEBUG_QPACK, DEBUG_LIST,
-# DEBUG_GLITCHES, DEBUG_STRESS, DEBUG_UNIT.
+# DEBUG_COUNTERS=[0-2], DEBUG_STRESS, DEBUG_UNIT.
 DEBUG =
 
 #### Trace options
@@ -401,7 +401,7 @@ ifeq ($(TARGET),linux-musl)
     USE_POLL USE_TPROXY USE_LIBCRYPT USE_DL USE_RT USE_CRYPT_H USE_NETFILTER  \
     USE_CPU_AFFINITY USE_THREAD USE_EPOLL USE_LINUX_TPROXY USE_LINUX_CAP      \
     USE_ACCEPT4 USE_LINUX_SPLICE USE_PRCTL USE_THREAD_DUMP USE_NS USE_TFO     \
-    USE_GETADDRINFO)
+    USE_GETADDRINFO USE_BACKTRACE)
   INSTALL = install -v
 endif
 
@@ -592,6 +592,7 @@ endif
 
 ifneq ($(USE_BACKTRACE:0=),)
   BACKTRACE_LDFLAGS = -Wl,$(if $(EXPORT_SYMBOL),$(EXPORT_SYMBOL),--export-dynamic)
+  BACKTRACE_CFLAGS  = -fno-omit-frame-pointer
 endif
 
 ifneq ($(USE_CPU_AFFINITY:0=),)
@@ -629,9 +630,10 @@ ifneq ($(USE_OPENSSL:0=),)
     SSL_LDFLAGS   := $(if $(SSL_LIB),-L$(SSL_LIB)) -lssl -lcrypto
   endif
   USE_SSL         := $(if $(USE_SSL:0=),$(USE_SSL:0=),implicit)
-  OPTIONS_OBJS += src/ssl_sock.o src/ssl_ckch.o src/ssl_ocsp.o src/ssl_crtlist.o     \
-                  src/ssl_sample.o src/cfgparse-ssl.o src/ssl_gencert.o              \
-                  src/ssl_utils.o src/jwt.o src/ssl_clienthello.o src/jws.o
+  OPTIONS_OBJS += src/ssl_sock.o src/ssl_ckch.o src/ssl_ocsp.o src/ssl_crtlist.o       \
+                  src/ssl_sample.o src/cfgparse-ssl.o src/ssl_gencert.o                \
+                  src/ssl_utils.o src/jwt.o src/ssl_clienthello.o src/jws.o src/acme.o \
+                  src/ssl_trace.o
 endif
 
 ifneq ($(USE_ENGINE:0=),)

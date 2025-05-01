@@ -594,6 +594,20 @@
 # define DEBUG_STRICT 1
 #endif
 
+/* Let's make DEBUG_THREAD default to 1, and make sure it has a value */
+#ifndef DEBUG_THREAD
+# if defined(USE_THREAD)
+#  define DEBUG_THREAD 1
+# else
+#  define DEBUG_THREAD 0
+# endif
+#endif
+
+/* Let's make DEBUG_COUNTERS default to 1 to have glitches counters by default */
+#ifndef DEBUG_COUNTERS
+# define DEBUG_COUNTERS 1
+#endif
+
 #if !defined(DEBUG_MEMORY_POOLS)
 # define DEBUG_MEMORY_POOLS 1
 #endif
@@ -630,5 +644,14 @@
 #ifndef FWLC_MIN_FREE_ENTRIES
 #define FWLC_MIN_FREE_ENTRIES 500
 #endif /* FWLC_MIN_FREE_ENTRIES */
+
+/*
+ * QUIC
+ */
+
+/* Memory usage in bytes on Tx side, 0 for unlimited. */
+#ifndef QUIC_MAX_TX_MEM
+#define QUIC_MAX_TX_MEM 0
+#endif
 
 #endif /* _HAPROXY_DEFAULTS_H */

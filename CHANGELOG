@@ -1,6 +1,293 @@
 ChangeLog :
 ===========
 
+2025/04/30 : 3.2-dev13
+    - MEDIUM: checks: Make sure we return the tasklet from srv_chk_io_cb
+    - MEDIUM: listener: Make sure w ereturn the tasklet from accept_queue_process
+    - MEDIUM: mux_fcgi: Make sure we return the tasklet from fcgi_deferred_shut
+    - MEDIUM: quic: Make sure we return the tasklet from qcc_io_cb
+    - MEDIUM: quic: Make sure we return NULL in quic_conn_app_io_cb if needed
+    - MEDIUM: quic: Make sure we return the tasklet from quic_accept_run
+    - BUG/MAJOR: tasklets: Make sure he tasklet can't run twice
+    - BUG/MAJOR: listeners: transfer connection accounting when switching listeners
+    - MINOR: ssl/cli: add a '-t' option to 'show ssl sni'
+    - DOC: config: fix ACME paragraph rendering issue
+    - DOC: config: clarify log-forward "host" option
+    - MINOR: promex: expose ST_I_PX_RATE (current_session_rate)
+    - BUILD: acme: use my_strndup() instead of strndup()
+    - BUILD: leastconn: fix build warning when building without threads on old machines
+    - MINOR: threads: prepare DEBUG_THREAD to receive more values
+    - MINOR: threads: turn the full lock debugging to DEBUG_THREAD=2
+    - MEDIUM: threads: keep history of taken locks with DEBUG_THREAD > 0
+    - MINOR: threads/cli: display the lock history on "show threads"
+    - MEDIUM: thread: set DEBUG_THREAD to 1 by default
+    - BUG/MINOR: ssl/acme: free EVP_PKEY upon error
+    - MINOR: acme: separate the code generating private keys
+    - MINOR: acme: failure when no directory is specified
+    - MEDIUM: acme: generate the account file when not found
+    - MEDIUM: acme: use 'crt-base' to load the account key
+    - MINOR: compiler: add more macros to detect macro definitions
+    - MINOR: cli: split APPCTX_CLI_ST1_PROMPT into two distinct flags
+    - MEDIUM: cli: make the prompt mode configurable between n/i/p
+    - MEDIUM: mcli: make the prompt mode configurable between i/p
+    - MEDIUM: mcli: replicate the current mode when enterin the worker process
+    - DOC: configuration: acme account key are auto generated
+    - CLEANUP: acme: remove old TODO for account key
+    - DOC: configuration: add quic4 to the ssl-f-use example
+    - BUG/MINOR: acme: does not try to unlock after a failed trylock
+    - BUG/MINOR: mux-h2: fix the offset of the pattern for the ping frame
+    - MINOR: tcp: add support for setting TCP_NOTSENT_LOWAT on both sides
+    - BUG/MINOR: acme: creating an account should not end the task
+    - MINOR: quic: rename min/max fields for congestion window algo
+    - MINOR: quic: refactor BBR API
+    - BUG/MINOR: quic: ensure cwnd limits are always enforced
+    - MINOR: thread: define cshared type
+    - MINOR: quic: account for global congestion window
+    - MEDIUM: quic: limit global Tx memory
+    - MEDIUM: acme: use a map to store tokens and thumbprints
+    - BUG/MINOR: acme: remove references to virt@acme
+    - MINOR: applet: add appctx_schedule() macro
+    - BUG/MINOR: dns: add tempo between 2 connection attempts for dns servers
+    - CLEANUP: dns: remove unused dns_stream_server struct member
+    - BUG/MINOR: dns: prevent ds accumulation within dss
+    - CLEANUP: proxy: mention that px->conn_retries isn't relevant in some cases
+    - DOC: ring: refer to newer RFC5424
+    - MINOR: tools: make my_strndup() take a size_t len instead of and int
+    - MINOR: Add "sigalg" to "sigalg name" helper function
+    - MINOR: ssl: Add traces to ssl init/close functions
+    - MINOR: ssl: Add traces to recv/send functions
+    - MINOR: ssl: Add traces to ssl_sock_io_cb function
+    - MINOR: ssl: Add traces around SSL_do_handshake call
+    - MINOR: ssl: Add traces to verify callback
+    - MINOR: ssl: Add ocsp stapling callback traces
+    - MINOR: ssl: Add traces to the switchctx callback
+    - MINOR: ssl: Add traces about sigalg extension parsing in clientHello callback
+    - MINOR: Add 'conn' param to ssl_sock_chose_sni_ctx
+    - BUG/MEDIUM: mux-spop: Wait end of handshake to declare a spop connection ready
+    - BUG/MEDIUM: mux-spop: Handle CLOSING state and wait for AGENT DISCONNECT frame
+    - BUG/MINOR: mux-h1: Don't pretend connection was released for TCP>H1>H2 upgrade
+    - BUG/MINOR: mux-h1: Fix trace message in h1_detroy() to not relay on connection
+    - BUILD: ssl: Fix wolfssl build
+    - BUG/MINOR: mux-spop: Use the right bitwise operator in spop_ctl()
+    - MEDIUM: mux-quic: increase flow-control on each bufsize
+    - MINOR: mux-quic: limit emitted MSD frames count per qcs
+    - MINOR: add hlua_yield_asap() helper
+    - MINOR: hlua_fcn: enforce yield after *_get_stats() methods
+    - DOC: config: restore default values for resolvers hold directive
+    - MINOR: ssl/cli: "acme ps" shows the acme tasks
+    - MINOR: acme: acme_ctx_destroy() returns upon NULL
+    - MINOR: acme: use acme_ctx_destroy() upon error
+    - MEDIUM: tasks: Mutualize code between tasks and tasklets.
+    - MEDIUM: tasks: More code factorization
+    - MEDIUM: tasks: Remove TASK_IN_LIST and use TASK_QUEUED instead.
+    - MINOR: tasks: Remove unused tasklet_remove_from_tasklet_list
+    - MEDIUM: tasks: Mutualize the TASK_KILLED code between tasks and tasklets
+    - BUG/MEDIUM: connections: Report connection closing in conn_create_mux()
+    - BUILD/MEDIUM: quic: Make sure we build with recent changes
+
+2025/04/25 : 3.2-dev12
+    - BUG/MINOR: quic: do not crash on CRYPTO ncbuf alloc failure
+    - BUG/MINOR: proxy: always detach a proxy from the names tree on free()
+    - CLEANUP: proxy: detach the name node in proxy_free_common() instead
+    - CLEANUP: Slightly reorder some proxy option flags to free slots
+    - MINOR: proxy: Add options to drop HTTP trailers during message forwarding
+    - MINOR: h1-htx: Skip C-L and T-E headers for 1xx and 204 messages during parsing
+    - MINOR: mux-h1: Keep custom "Content-Length: 0" header in 1xx and 204 messages
+    - MINOR: hlua/h1: Use http_parse_cont_len_header() to parse content-length value
+    - CLEANUP: h1: Remove now useless h1_parse_cont_len_header() function
+    - BUG/MEDIUM: mux-spop: Respect the negociated max-frame-size value to send frames
+    - MINOR: http-act: Add 'pause' action to temporarily suspend the message analysis
+    - MINOR: acme/cli: add the 'acme renew' command to the help message
+    - MINOR: httpclient: add an "https" log-format
+    - MEDIUM: acme: use a customized proxy
+    - MEDIUM: acme: rename "uri" into "directory"
+    - MEDIUM: acme: rename "account" into "account-key"
+    - MINOR: stick-table: use a separate lock label for updates
+    - MINOR: h3: simplify h3_rcv_buf return path
+    - BUG/MINOR: mux-quic: fix possible infinite loop during decoding
+    - BUG/MINOR: mux-quic: do not decode if conn in error
+    - BUG/MINOR: cli: Issue an error when too many args are passed for a command
+    - MINOR: cli: Use a full prompt command for bidir connections with workers
+    - MAJOR: cli: Refacor parsing and execution of pipelined commands
+    - MINOR: cli: Rename some CLI applet states to reflect recent refactoring
+    - CLEANUP: applet: Update st0/st1 comment in appctx structure
+    - BUG/MINOR: hlua: Fix I/O handler of lua CLI commands to not rely on the SC
+    - BUG/MINOR: ring: Fix I/O handler of "show event" command to not rely on the SC
+    - MINOR: cli/applet: Move appctx fields only used by the CLI in a private context
+    - MINOR: cache: Add a pointer on the cache in the cache applet context
+    - MINOR: hlua: Use the applet name in error messages for lua services
+    - MINOR: applet: Save the "use-service" rule in the stream to init a service applet
+    - CLEANUP: applet: Remove unsued rule pointer in appctx structure
+    - BUG/MINOR: master/cli: properly trim the '@@' process name in error messages
+    - MEDIUM: resolvers: add global "dns-accept-family" directive
+    - MINOR: resolvers: add command-line argument -4 to force IPv4-only DNS
+    - MINOR: sock-inet: detect apparent IPv6 connectivity
+    - MINOR: resolvers: add "dns-accept-family auto" to rely on detected IPv6
+    - MEDIUM: acme: use Retry-After value for retries
+    - MEDIUM: acme: reset the remaining retries
+    - MEDIUM: acme: better error/retry management of the challenge checks
+    - BUG/MEDIUM: cli: Handle applet shutdown when waiting for a command line
+    - Revert "BUG/MINOR: master/cli: properly trim the '@@' process name in error messages"
+    - BUG/MINOR: master/cli: only parse the '@@' prefix on complete lines
+    - MINOR: resolvers: use the runtime IPv6 status instead of boot time one
+
+2025/04/18 : 3.2-dev11
+    - CI: enable weekly QuicTLS build
+    - DOC: management: slightly clarify the prefix role of the '@' command
+    - DOC: management: add a paragraph about the limitations of the '@' prefix
+    - MINOR: master/cli: support bidirectional communications with workers
+    - MEDIUM: ssl/ckch: add filename and linenum argument to crt-store parsing
+    - MINOR: acme: add the acme section in the configuration parser
+    - MINOR: acme: add configuration for the crt-store
+    - MINOR: acme: add private key configuration
+    - MINOR: acme/cli: add the 'acme renew' command
+    - MINOR: acme: the acme section is experimental
+    - MINOR: acme: get the ACME directory
+    - MINOR: acme: handle the nonce
+    - MINOR: acme: check if the account exist
+    - MINOR: acme: generate new account
+    - MINOR: acme: newOrder request retrieve authorizations URLs
+    - MINOR: acme: allow empty payload in acme_jws_payload()
+    - MINOR: acme: get the challenges object from the Auth URL
+    - MINOR: acme: send the request for challenge ready
+    - MINOR: acme: implement a check on the challenge status
+    - MINOR: acme: generate the CSR in a X509_REQ
+    - MINOR: acme: finalize by sending the CSR
+    - MINOR: acme: verify the order status once finalized
+    - MINOR: acme: implement retrieval of the certificate
+    - BUG/MINOR: acme: ckch_conf_acme_init() when no filename
+    - MINOR: ssl/ckch: handle ckch_conf in ckchs_dup() and ckch_conf_clean()
+    - MINOR: acme: copy the original ckch_store
+    - MEDIUM: acme: replace the previous ckch instance with new ones
+    - MINOR: acme: schedule retries with a timer
+    - BUILD: acme: enable the ACME feature when JWS is present
+    - BUG/MINOR: cpu-topo: check the correct variable for NULL after malloc()
+    - BUG/MINOR: acme: key not restored upon error in acme_res_certificate()
+    - BUG/MINOR: thread: protect thread_cpus_enabled_at_boot with USE_THREAD
+    - MINOR: acme: default to 2048bits for RSA
+    - DOC: acme: explain how to configure and run ACME
+    - BUG/MINOR: debug: remove the trailing \n from BUG_ON() statements
+    - DOC: config: add the missing "profiling.memory" to the global kw index
+    - DOC: config: add the missing "force-cfg-parser-pause" to the global kw index
+    - DEBUG: init: report invalid characters in debug description strings
+    - DEBUG: rename DEBUG_GLITCHES to DEBUG_COUNTERS and enable it by default
+    - DEBUG: counters: make COUNT_IF() only appear at DEBUG_COUNTERS>=1
+    - DEBUG: counters: add the ability to enable/disable updating the COUNT_IF counters
+    - MINOR: tools: let dump_addr_and_bytes() support dumping before the offset
+    - MINOR: debug: in call traces, dump the 8 bytes before the return address, not after
+    - MINOR: debug: detect call instructions and show the branch target in backtraces
+    - BUG/MINOR: acme: fix possible NULL deref
+    - CLEANUP: acme: stored value is overwritten before it can be used
+    - BUILD: incompatible pointer type suspected with -DDEBUG_UNIT
+    - BUG/MINOR: http-ana: Properly detect client abort when forwarding the response
+    - BUG/MEDIUM: http-ana: Report 502 from req analyzer only during rsp forwarding
+    - CI: fedora rawhide: enable unit tests
+    - DOC: configuration: fix a typo in ACME documentation
+    - MEDIUM: sink: add a new dpapi ring buffer
+    - Revert "BUG/MINOR: acme: key not restored upon error in acme_res_certificate()"
+    - BUG/MINOR: acme: key not restored upon error in acme_res_certificate() V2
+    - BUG/MINOR: acme: fix the exponential backoff of retries
+    - DOC: configuration: specify limitations of ACME for 3.2
+    - MINOR: acme: emit logs instead of ha_notice
+    - MINOR: acme: add a success message to the logs
+    - BUG/MINOR: acme/cli: fix certificate name in error message
+    - MINOR: acme: register the task in the ckch_store
+    - MINOR: acme: free acme_ctx once the task is done
+    - BUG/MEDIUM: h3: trim whitespaces when parsing headers value
+    - BUG/MEDIUM: h3: trim whitespaces in header value prior to QPACK encoding
+    - BUG/MINOR: h3: filter upgrade connection header
+    - BUG/MINOR: h3: reject invalid :path in request
+    - BUG/MINOR: h3: reject request URI with invalid characters
+    - MEDIUM: h3: use absolute URI form with :authority
+    - BUG/MEDIUM: hlua: fix hlua_applet_{http,tcp}_fct() yield regression (lost data)
+    - BUG/MINOR: mux-h2: prevent past scheduling with idle connections
+    - BUG/MINOR: rhttp: fix reconnect if timeout connect unset
+    - BUG/MINOR: rhttp: ensure GOAWAY can be emitted after reversal
+    - BUG/MINOR: mux-h2: do not apply timer on idle backend connection
+    - MINOR: mux-h2: refactor idle timeout calculation
+    - MINOR: mux-h2: prepare to support PING emission
+    - MEDIUM: server/mux-h2: implement idle-ping on backend side
+    - MEDIUM: listener/mux-h2: implement idle-ping on frontend side
+    - MINOR: mux-h2: do not emit GOAWAY on idle ping expiration
+    - MINOR: mux-h2: handle idle-ping on conn reverse
+    - BUILD: makefile: enable backtrace by default on musl
+    - BUG/MINOR: threads: set threads_idle and threads_harmless even with no threads
+    - BUG/MINOR debug: fix !USE_THREAD_DUMP in ha_thread_dump_fill()
+    - BUG/MINOR: wdt/debug: avoid signal re-entrance between debugger and watchdog
+    - BUG/MINOR: debug: detect and prevent re-entrance in ha_thread_dump_fill()
+    - MINOR: debug: do not statify a few debugging functions often used with wdt/dbg
+    - MINOR: tools: also protect the library name resolution against concurrent accesses
+    - MINOR: tools: protect dladdr() against reentrant calls from the debug handler
+    - MINOR: debug: protect ha_dump_backtrace() against risks of re-entrance
+    - MINOR: tinfo: keep a copy of the pointer to the thread dump buffer
+    - MINOR: debug: always reset the dump pointer when done
+    - MINOR: debug: remove unused case of thr!=tid in ha_thread_dump_one()
+    - MINOR: pass a valid buffer pointer to ha_thread_dump_one()
+    - MEDIUM: wdt: always make the faulty thread report its own warnings
+    - MINOR: debug: make ha_stuck_warning() only work for the current thread
+    - MINOR: debug: make ha_stuck_warning() print the whole message at once
+    - CLEANUP: debug: no longer set nor use TH_FL_DUMPING_OTHERS
+    - MINOR: sched: add a new function is_sched_alive() to report scheduler's health
+    - MINOR: wdt: use is_sched_alive() instead of keeping a local ctxsw copy
+    - MINOR: sample: add 4 new sample fetches for clienthello parsing
+    - REGTEST: add new reg-test for the 4 new clienthello fetches
+    - MINOR: servers: Move the per-thread server initialization earlier
+    - MINOR: proxies: Initialize the per-thread structure earlier.
+    - MINOR: servers: Provide a pointer to the server in srv_per_tgroup.
+    - MINOR: lb_fwrr: Move the next weight out of fwrr_group.
+    - MINOR: proxies: Add a per-thread group lbprm struct.
+    - MEDIUM: lb_fwrr: Use one ebtree per thread group.
+    - MEDIUM: lb_fwrr: Don't start all thread groups on the same server.
+    - MINOR: proxies: Do stage2 initialization for sinks too
+
+2025/04/11 : 3.2-dev10
+    - REORG: ssl: move curves2nid and nid2nist to ssl_utils
+    - BUG/MEDIUM: stream: Fix a possible freeze during a forced shut on a stream
+    - MEDIUM: stream: Save SC and channel flags earlier in process_steam()
+    - BUG/MINOR: peers: fix expire learned from a peer not converted from ms to ticks
+    - BUG/MEDIUM: peers: prevent learning expiration too far in futur from unsync node
+    - CI: spell check: allow manual trigger
+    - CI: codespell: add "pres" to spellcheck whitelist
+    - CLEANUP: assorted typo fixes in the code, commits and doc
+    - CLEANUP: atomics: remove support for gcc < 4.7
+    - CLEANUP: atomics: also replace __sync_synchronize() with __atomic_thread_fence()
+    - TESTS: Fix build for filltab25.c
+    - MEDIUM: ssl: replace "crt" lines by "ssl-f-use" lines
+    - DOC: configuration: replace "crt" by "ssl-f-use" in listeners
+    - MINOR: backend: mark srv as nonnull in alloc_dst_address()
+    - BUG/MINOR: server: ensure check-reuse-pool is copied from default-server
+    - MINOR: server: activate automatically check reuse for rhttp@ protocol
+    - MINOR: check/backend: support conn reuse with SNI
+    - MINOR: check: implement check-pool-conn-name srv keyword
+    - MINOR: task: add thread safe notification_new and notification_wake variants
+    - BUG/MINOR: hlua_fcn: fix potential UAF with Queue:pop_wait()
+    - MINOR: hlua_fcn: register queue class using hlua_register_metatable()
+    - MINOR: hlua: add core.wait()
+    - MINOR: hlua: core.wait() takes optional delay paramater
+    - MINOR: hlua: split hlua_applet_tcp_recv_yield() in two functions
+    - MINOR: hlua: add AppletTCP:try_receive()
+    - MINOR: hlua_fcn: add Queue:alarm()
+    - MEDIUM: task: make notification_* API thread safe by default
+    - CLEANUP: log: adjust _lf_cbor_encode_byte() comment
+    - MEDIUM: ssl/crt-list: warn on negative wildcard filters
+    - MEDIUM: ssl/crt-list: warn on negative filters only
+    - BUILD: atomics: fix build issue on non-x86/non-arm systems
+    - BUG/MINOR: log: fix CBOR encoding with LOG_VARTEXT_START() + lf_encode_chunk()
+    - BUG/MEDIUM: sample: fix risk of overflow when replacing multiple regex back-refs
+    - DOC: configuration: rework the crt-list section
+    - MINOR: ring: support arbitrary delimiters through ring_dispatch_messages()
+    - MINOR: ring/cli: support delimiting events with a trailing \0 on "show events"
+    - DEV: h2: fix h2-tracer.lua nil value index
+    - BUG/MINOR: backend: do not use the source port when hashing clientip
+    - BUG/MINOR: hlua: fix invalid errmsg use in hlua_init()
+    - MINOR: proxy: add setup_new_proxy() function
+    - MINOR: checks: mark CHECKS-FE dummy frontend as internal
+    - MINOR: flt_spoe: mark spoe agent frontend as internal
+    - MEDIUM: tree-wide: avoid manually initializing proxies
+    - MINOR: proxy: add deinit_proxy() helper func
+    - MINOR: checks: deinit checks_fe upon deinit
+    - MINOR: flt_spoe: deinit spoe agent proxy upon agent release
+
 2025/04/02 : 3.2-dev9
     - MINOR: quic: move global tune options into quic_tune
     - CLEANUP: quic: reorganize TP flow-control initialization

@@ -86,6 +86,8 @@
 #include <haproxy/xxhash.h>
 #include <haproxy/istbuf.h>
 #include <haproxy/ssl_ocsp.h>
+#include <haproxy/trace.h>
+#include <haproxy/ssl_trace-t.h>
 
 
 /* ***** READ THIS before adding code here! *****
@@ -1469,6 +1471,7 @@ int ssl_sock_bind_verifycbk(int ok, X509_STORE_CTX *x_store)
 	if (conn) {
 		bind_conf = __objt_listener(conn->target)->bind_conf;
 		ctx = __conn_get_ssl_sock_ctx(conn);
+		TRACE_ENTER(SSL_EV_CONN_VFY_CB, conn);
 	}
 #ifdef USE_QUIC
 	else {
@@ -1486,8 +1489,10 @@ int ssl_sock_bind_verifycbk(int ok, X509_STORE_CTX *x_store)
 	depth = X509_STORE_CTX_get_error_depth(x_store);
 	err = X509_STORE_CTX_get_error(x_store);
 
-	if (ok) /* no errors */
+	if (ok) { /* no errors */
+		TRACE_LEAVE(SSL_EV_CONN_VFY_CB, conn);
 		return ok;
+	}
 
 	/* Keep a reference to the client's certificate in order to be able to
 	 * dump some fetches values in a log even when the verification process
@@ -1524,12 +1529,16 @@ int ssl_sock_bind_verifycbk(int ok, X509_STORE_CTX *x_store)
 		}
 
 		if (err <= SSL_MAX_VFY_ERROR_CODE &&
-		    cert_ignerr_bitfield_get(bind_conf->ca_ignerr_bitfield, err))
+		    cert_ignerr_bitfield_get(bind_conf->ca_ignerr_bitfield, err)) {
+			TRACE_STATE("Ignored ca-related error", SSL_EV_CONN_VFY_CB, conn, ssl, NULL, &err);
 			goto err_ignored;
+		}
 
 		/* TODO: for QUIC connection, this error code is lost */
-		if (conn)
+		if (conn) {
 			conn->err_code = CO_ER_SSL_CA_FAIL;
+			TRACE_ERROR("Verify callback error (ca)", SSL_EV_CONN_VFY_CB|SSL_EV_CONN_ERR, conn, ssl, &conn->err_code, &err);
+		}
 		return 0;
 	}
 
@@ -1538,17 +1547,22 @@ int ssl_sock_bind_verifycbk(int ok, X509_STORE_CTX *x_store)
 
 	/* check if certificate error needs to be ignored */
 	if (err <= SSL_MAX_VFY_ERROR_CODE &&
-	    cert_ignerr_bitfield_get(bind_conf->crt_ignerr_bitfield, err))
+	    cert_ignerr_bitfield_get(bind_conf->crt_ignerr_bitfield, err)) {
+		TRACE_STATE("Ignored crt-related error", SSL_EV_CONN_VFY_CB, conn, ssl, NULL, &err);
 		goto err_ignored;
+	}
 
 	/* TODO: for QUIC connection, this error code is lost */
-	if (conn)
+	if (conn) {
 		conn->err_code = CO_ER_SSL_CRT_FAIL;
+		TRACE_ERROR("Verify callback error (crt)", SSL_EV_CONN_VFY_CB|SSL_EV_CONN_ERR, conn, ssl, &conn->err_code, &err);
+	}
 	return 0;
 
  err_ignored:
 	ssl_sock_dump_errors(conn, qc);
 	ERR_clear_error();
+	TRACE_LEAVE(SSL_EV_CONN_VFY_CB, conn);
 	return 1;
 }
 
@@ -4773,7 +4787,7 @@ int ssl_sock_prepare_bind_conf(struct bind_conf *bind_conf)
 		struct sni_ctx *sni_ctx;
 
 		/* if we use the generate-certificates option, look for the first default cert available */
-		sni_ctx = ssl_sock_chose_sni_ctx(bind_conf, "", 1, 1);
+		sni_ctx = ssl_sock_chose_sni_ctx(bind_conf, NULL, "", 1, 1);
 		if (!sni_ctx) {
 			ha_alert("Proxy '%s': no SSL certificate specified for bind '%s' and 'generate-certificates' option at [%s:%d] (use 'crt').\n",
 				 px->id, bind_conf->arg, bind_conf->file, bind_conf->line);
@@ -5024,6 +5038,8 @@ static int ssl_sock_init(struct connection *conn, void **xprt_ctx)
 	struct ssl_sock_ctx *ctx;
 	int next_sslconn = 0;
 
+	TRACE_ENTER(SSL_EV_CONN_NEW, conn);
+
 	/* already initialized */
 	if (*xprt_ctx)
 		return 0;
@@ -5031,12 +5047,14 @@ static int ssl_sock_init(struct connection *conn, void **xprt_ctx)
 	ctx = pool_alloc(ssl_sock_ctx_pool);
 	if (!ctx) {
 		conn->err_code = CO_ER_SSL_NO_MEM;
+		TRACE_ERROR("ssl_sock_ctx allocation failure", SSL_EV_CONN_NEW|SSL_EV_CONN_ERR|SSL_EV_CONN_END, conn);
 		return -1;
 	}
 	ctx->wait_event.tasklet = tasklet_new();
 	if (!ctx->wait_event.tasklet) {
 		conn->err_code = CO_ER_SSL_NO_MEM;
 		pool_free(ssl_sock_ctx_pool, ctx);
+		TRACE_ERROR("tasklet allocation failure", SSL_EV_CONN_NEW|SSL_EV_CONN_ERR|SSL_EV_CONN_END, conn);
 		return -1;
 	}
 	ctx->wait_event.tasklet->process = ssl_sock_io_cb;
@@ -5054,6 +5072,7 @@ static int ssl_sock_init(struct connection *conn, void **xprt_ctx)
 	next_sslconn = increment_sslconn();
 	if (!next_sslconn) {
 		conn->err_code = CO_ER_SSL_TOO_MANY;
+		TRACE_ERROR("Too many SSL connections", SSL_EV_CONN_NEW|SSL_EV_CONN_ERR|SSL_EV_CONN_END, conn);
 		goto err;
 	}
 
@@ -5143,6 +5162,8 @@ static int ssl_sock_init(struct connection *conn, void **xprt_ctx)
 
 		_HA_ATOMIC_INC(&global.totalsslconns);
 		*xprt_ctx = ctx;
+
+		TRACE_LEAVE(SSL_EV_CONN_NEW, conn);
 		return 0;
 	}
 	else if (objt_listener(conn->target)) {
@@ -5175,6 +5196,8 @@ static int ssl_sock_init(struct connection *conn, void **xprt_ctx)
 
 		_HA_ATOMIC_INC(&global.totalsslconns);
 		*xprt_ctx = ctx;
+
+		TRACE_LEAVE(SSL_EV_CONN_NEW, conn);
 		return 0;
 	}
 	/* don't know how to handle such a target */
@@ -5185,6 +5208,7 @@ err:
 	if (ctx && ctx->wait_event.tasklet)
 		tasklet_free(ctx->wait_event.tasklet);
 	pool_free(ssl_sock_ctx_pool, ctx);
+	TRACE_DEVEL("leaving in error", SSL_EV_CONN_NEW|SSL_EV_CONN_ERR|SSL_EV_CONN_END);
 	return -1;
 }
 
@@ -5206,6 +5230,7 @@ static int ssl_sock_handshake(struct connection *conn, unsigned int flag)
 	socklen_t lskerr;
 	int skerr;
 
+	TRACE_ENTER(SSL_EV_CONN_HNDSHK, conn);
 
 	if (!conn_ctrl_ready(conn))
 		return 0;
@@ -5234,8 +5259,10 @@ static int ssl_sock_handshake(struct connection *conn, unsigned int flag)
 		goto out_error;
 
 	/* don't start calculating a handshake on a dead connection */
-	if (conn->flags & (CO_FL_ERROR | CO_FL_SOCK_RD_SH | CO_FL_SOCK_WR_SH))
+	if (conn->flags & (CO_FL_ERROR | CO_FL_SOCK_RD_SH | CO_FL_SOCK_WR_SH)) {
+		TRACE_ERROR("Trying to perform handshake on dead connection", SSL_EV_CONN_HNDSHK, conn, ctx->ssl);
 		goto out_error;
+	}
 
 	/* FIXME/WT: for now we don't have a clear way to inspect the connection
 	 * status from the lower layers, so let's check the FD directly. Ideally
@@ -5263,9 +5290,12 @@ static int ssl_sock_handshake(struct connection *conn, unsigned int flag)
 			ret = SSL_read_early_data(ctx->ssl,
 			    b_tail(&ctx->early_buf), b_room(&ctx->early_buf),
 			    &read_data);
-			if (ret == SSL_READ_EARLY_DATA_ERROR)
+			if (ret == SSL_READ_EARLY_DATA_ERROR) {
+				TRACE_ERROR("Read early data error", SSL_EV_CONN_HNDSHK, conn, ctx->ssl);
 				goto check_error;
+			}
 			if (read_data > 0) {
+				TRACE_DEVEL("Early data read", SSL_EV_CONN_HNDSHK, conn, ctx->ssl);
 				conn->flags |= CO_FL_EARLY_DATA;
 				b_add(&ctx->early_buf, read_data);
 			}
@@ -5273,6 +5303,7 @@ static int ssl_sock_handshake(struct connection *conn, unsigned int flag)
 				conn->flags &= ~CO_FL_EARLY_SSL_HS;
 				if (!b_data(&ctx->early_buf))
 					b_free(&ctx->early_buf);
+				TRACE_STATE("Read early data finish", SSL_EV_CONN_HNDSHK, conn, ctx->ssl);
 				break;
 			}
 		}
@@ -5287,6 +5318,8 @@ static int ssl_sock_handshake(struct connection *conn, unsigned int flag)
 	if (!(conn->flags & CO_FL_WAIT_L6_CONN) && SSL_renegotiate_pending(ctx->ssl)) {
 		char c;
 
+		TRACE_STATE("Renegotiate pending", SSL_EV_CONN_HNDSHK, conn, ctx->ssl);
+
 		ret = SSL_peek(ctx->ssl, &c, 1);
 		if (ret <= 0) {
 			/* handshake may have not been completed, let's find why */
@@ -5296,6 +5329,7 @@ static int ssl_sock_handshake(struct connection *conn, unsigned int flag)
 				/* SSL handshake needs to write, L4 connection may not be ready */
 				if (!(ctx->wait_event.events & SUB_RETRY_SEND))
 					ctx->xprt->subscribe(conn, ctx->xprt_ctx, SUB_RETRY_SEND, &ctx->wait_event);
+				TRACE_DEVEL("Renegotiate pending: want write", SSL_EV_CONN_HNDSHK, conn, ctx->ssl);
 				return 0;
 			}
 			else if (ret == SSL_ERROR_WANT_READ) {
@@ -5304,16 +5338,19 @@ static int ssl_sock_handshake(struct connection *conn, unsigned int flag)
                                  */
 				if (!SSL_renegotiate_pending(ctx->ssl)) {
 					ret = 1;
+					TRACE_DEVEL("Renegotiate pending: reneg ok", SSL_EV_CONN_HNDSHK, conn, ctx->ssl);
 					goto reneg_ok;
 				}
 				/* SSL handshake needs to read, L4 connection is ready */
 				if (!(ctx->wait_event.events & SUB_RETRY_RECV))
 					ctx->xprt->subscribe(conn, ctx->xprt_ctx, SUB_RETRY_RECV, &ctx->wait_event);
+				TRACE_DEVEL("Renegotiate pending: want read", SSL_EV_CONN_HNDSHK, conn, ctx->ssl);
 				return 0;
 			}
 #ifdef SSL_MODE_ASYNC
 			else if (ret == SSL_ERROR_WANT_ASYNC) {
 				ssl_async_process_fds(ctx);
+				TRACE_ERROR("Renegotiate pending: want async error", SSL_EV_CONN_HNDSHK, conn, ctx->ssl);
 				return 0;
 			}
 #endif
@@ -5357,6 +5394,7 @@ static int ssl_sock_handshake(struct connection *conn, unsigned int flag)
 					}
 #endif /* BoringSSL or LibreSSL */
 				}
+				TRACE_ERROR("Renegotiate pending: syscall error", SSL_EV_CONN_HNDSHK|SSL_EV_CONN_ERR, conn, ctx->ssl, &conn->err_code);
 				goto out_error;
 			}
 			else {
@@ -5370,9 +5408,11 @@ static int ssl_sock_handshake(struct connection *conn, unsigned int flag)
 				if (!conn->err_code)
 					conn->err_code = (ctx->xprt_st & SSL_SOCK_RECV_HEARTBEAT) ?
 						CO_ER_SSL_KILLED_HB : CO_ER_SSL_HANDSHAKE;
+				TRACE_ERROR("Renegotiate pending: other error", SSL_EV_CONN_HNDSHK, conn, ctx->ssl);
 				goto out_error;
 			}
 		}
+		TRACE_STATE("Renegotiate pending: reneg ok", SSL_EV_CONN_HNDSHK, conn, ctx->ssl);
 		/* read some data: consider handshake completed */
 		goto reneg_ok;
 	}
@@ -5389,6 +5429,7 @@ check_error:
 			/* SSL handshake needs to write, L4 connection may not be ready */
 			if (!(ctx->wait_event.events & SUB_RETRY_SEND))
 				ctx->xprt->subscribe(conn, ctx->xprt_ctx, SUB_RETRY_SEND, &ctx->wait_event);
+			TRACE_DEVEL("Want write (post SSL_do_handshake)", SSL_EV_CONN_HNDSHK, conn, ctx->ssl);
 			return 0;
 		}
 		else if (ret == SSL_ERROR_WANT_READ) {
@@ -5396,11 +5437,13 @@ check_error:
 			if (!(ctx->wait_event.events & SUB_RETRY_RECV))
 				ctx->xprt->subscribe(conn, ctx->xprt_ctx,
 				    SUB_RETRY_RECV, &ctx->wait_event);
+			TRACE_DEVEL("Want read (post SSL_do_handshake)", SSL_EV_CONN_HNDSHK, conn, ctx->ssl);
 			return 0;
 		}
 #ifdef SSL_MODE_ASYNC
 		else if (ret == SSL_ERROR_WANT_ASYNC) {
 			ssl_async_process_fds(ctx);
+			TRACE_ERROR("Want async error", SSL_EV_CONN_HNDSHK, conn, ctx->ssl);
 			return 0;
 		}
 #endif
@@ -5444,6 +5487,7 @@ check_error:
 				}
 #endif /* BoringSSL or LibreSSL */
 			}
+			TRACE_ERROR("Syscall error", SSL_EV_CONN_HNDSHK|SSL_EV_CONN_ERR, conn, ctx->ssl, &conn->err_code, &ctx->error_code);
 			goto out_error;
 
 		} else if (ret == SSL_ERROR_ZERO_RETURN) {
@@ -5451,6 +5495,7 @@ check_error:
 			 * sending a close_notify alert */
 			conn_ctrl_drain(conn);
 			conn->err_code = CO_ER_SSL_EMPTY;
+			TRACE_ERROR("Zero return error", SSL_EV_CONN_HNDSHK|SSL_EV_CONN_ERR, conn, ctx->ssl, &conn->err_code, &ctx->error_code);
 			goto out_error;
 
 		}
@@ -5465,11 +5510,13 @@ check_error:
 			if (!conn->err_code)
 				conn->err_code = (ctx->xprt_st & SSL_SOCK_RECV_HEARTBEAT) ?
 					CO_ER_SSL_KILLED_HB : CO_ER_SSL_HANDSHAKE;
+			TRACE_ERROR("Other error", SSL_EV_CONN_HNDSHK|SSL_EV_CONN_ERR, conn, ctx->ssl, &conn->err_code, &ctx->error_code);
 			goto out_error;
 		}
 	}
-#ifdef SSL_READ_EARLY_DATA_SUCCESS
 	else {
+		TRACE_STATE("Successful SSL_do_handshake", SSL_EV_CONN_HNDSHK, conn, ctx->ssl);
+#ifdef SSL_READ_EARLY_DATA_SUCCESS
 		/*
 		 * If the server refused the early data, we have to send a
 		 * 425 to the client, as we no longer have the data to sent
@@ -5478,11 +5525,12 @@ check_error:
 		if ((conn->flags & CO_FL_EARLY_DATA) && (objt_server(conn->target))) {
 			if (SSL_get_early_data_status(ctx->ssl) == SSL_EARLY_DATA_REJECTED) {
 				conn->err_code = CO_ER_SSL_EARLY_FAILED;
+				TRACE_ERROR("Early data rejected", SSL_EV_CONN_HNDSHK|SSL_EV_CONN_ERR, conn, ctx->ssl, &conn->err_code);
 				goto out_error;
 			}
 		}
-	}
 #endif
+	}
 
 
 reneg_ok:
@@ -5517,6 +5565,8 @@ reneg_ok:
 		HA_ATOMIC_INC(&counters->reused_sess);
 		HA_ATOMIC_INC(&counters_px->reused_sess);
 	}
+
+	TRACE_LEAVE(SSL_EV_CONN_HNDSHK, conn, ctx->ssl);
 
 	/* The connection is now established at both layers, it's time to leave */
 	conn->flags &= ~(flag | CO_FL_WAIT_L4_CONN | CO_FL_WAIT_L6_CONN);
@@ -5553,6 +5603,8 @@ reneg_ok:
 	conn->flags |= CO_FL_ERROR;
 	if (!conn->err_code)
 		conn->err_code = CO_ER_SSL_HANDSHAKE;
+
+	TRACE_ERROR("handshake error", SSL_EV_CONN_HNDSHK|SSL_EV_CONN_ERR, conn, ctx->ssl, &conn->err_code, &ctx->error_code);
 	return 0;
 }
 
@@ -5708,6 +5760,8 @@ struct task *ssl_sock_io_cb(struct task *t, void *context, unsigned int state)
 	int conn_in_list;
 	int ret = 0;
 
+	TRACE_ENTER(SSL_EV_CONN_IO_CB, ctx->conn);
+
 	if (state & TASK_F_USR1) {
 		/* the tasklet was idling on an idle connection, it might have
 		 * been stolen, let's be careful!
@@ -5759,10 +5813,17 @@ struct task *ssl_sock_io_cb(struct task *t, void *context, unsigned int state)
 		 * woke a tasklet already.
 		 */
 		if (ctx->conn->xprt_ctx == ctx) {
+			int closed_connection = 0;
+
 			if (!ctx->conn->mux)
-				ret = conn_create_mux(ctx->conn);
-			if (ret >= 0 && !woke && ctx->conn->mux && ctx->conn->mux->wake)
+				ret = conn_create_mux(ctx->conn, &closed_connection);
+			if (ret >= 0 && !woke && ctx->conn->mux && ctx->conn->mux->wake) {
 				ret = ctx->conn->mux->wake(ctx->conn);
+				if (ret < 0)
+					closed_connection = 1;
+			}
+			if (closed_connection)
+				t = NULL;
 			goto leave;
 		}
 	}
@@ -5780,10 +5841,12 @@ leave:
 	if (!ret && conn_in_list) {
 		struct server *srv = objt_server(conn->target);
 
+		TRACE_DEVEL("adding conn back to idle list", SSL_EV_CONN_IO_CB, conn);
 		HA_SPIN_LOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
 		_srv_add_idle(srv, conn, conn_in_list == CO_FL_SAFE_LIST);
 		HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
 	}
+	TRACE_LEAVE(SSL_EV_CONN_IO_CB, conn);
 	return t;
 }
 
@@ -5801,6 +5864,8 @@ static size_t ssl_sock_to_buf(struct connection *conn, void *xprt_ctx, struct bu
 	ssize_t ret;
 	size_t try, done = 0;
 
+	TRACE_ENTER(SSL_EV_CONN_RECV, conn);
+
 	if (!ctx)
 		goto out_error;
 
@@ -5814,13 +5879,16 @@ static size_t ssl_sock_to_buf(struct connection *conn, void *xprt_ctx, struct bu
 		b_del(&ctx->early_buf, try);
 		if (b_data(&ctx->early_buf) == 0)
 			b_free(&ctx->early_buf);
+		TRACE_STATE("read early data", SSL_EV_CONN_RECV|SSL_EV_CONN_RECV_EARLY, conn, &try);
 		return try;
 	}
 #endif
 
-	if (conn->flags & (CO_FL_WAIT_XPRT | CO_FL_SSL_WAIT_HS))
+	if (conn->flags & (CO_FL_WAIT_XPRT | CO_FL_SSL_WAIT_HS)) {
 		/* a handshake was requested */
+		TRACE_LEAVE(SSL_EV_CONN_RECV, conn);
 		return 0;
+	}
 
 	/* read the largest possible block. For this, we perform only one call
 	 * to recv() unless the buffer wraps and we exactly fill the first hunk,
@@ -5846,6 +5914,7 @@ static size_t ssl_sock_to_buf(struct connection *conn, void *xprt_ctx, struct bu
 			b_add(buf, ret);
 			done += ret;
 			count -= ret;
+			TRACE_DEVEL("Post SSL_read success", SSL_EV_CONN_RECV, conn, &ret);
 		}
 		else {
 			ret =  SSL_get_error(ctx->ssl, ret);
@@ -5858,6 +5927,7 @@ static size_t ssl_sock_to_buf(struct connection *conn, void *xprt_ctx, struct bu
 				if (global_ssl.async)
 					SSL_set_mode(ctx->ssl, SSL_MODE_ASYNC);
 #endif
+				TRACE_DEVEL("SSL want write", SSL_EV_CONN_RECV, conn);
 				break;
 			}
 			else if (ret == SSL_ERROR_WANT_READ) {
@@ -5874,10 +5944,12 @@ static size_t ssl_sock_to_buf(struct connection *conn, void *xprt_ctx, struct bu
 #endif
 					break;
 				}
+				TRACE_DEVEL("SSL want read", SSL_EV_CONN_RECV, conn);
 				break;
-			} else if (ret == SSL_ERROR_ZERO_RETURN)
+			} else if (ret == SSL_ERROR_ZERO_RETURN) {
+				TRACE_STATE("SSL read error (zero return)", SSL_EV_CONN_RECV, conn);
 				goto read0;
-			else if (ret == SSL_ERROR_SSL) {
+			} else if (ret == SSL_ERROR_SSL) {
 				struct ssl_sock_ctx *ctx = conn_get_ssl_sock_ctx(conn);
 				if (ctx && !ctx->error_code)
 					ctx->error_code = ERR_peek_error();
@@ -5886,13 +5958,17 @@ static size_t ssl_sock_to_buf(struct connection *conn, void *xprt_ctx, struct bu
 			/* For SSL_ERROR_SYSCALL, make sure to clear the error
 			 * stack before shutting down the connection for
 			 * reading. */
-			if (ret == SSL_ERROR_SYSCALL && (!errno || errno == EAGAIN || errno == EWOULDBLOCK))
+			if (ret == SSL_ERROR_SYSCALL && (!errno || errno == EAGAIN || errno == EWOULDBLOCK)) {
+				TRACE_PROTO("SSL read error (syscall)", SSL_EV_CONN_RECV, conn);
 				goto clear_ssl_error;
+			}
 			/* otherwise it's a real error */
+			TRACE_ERROR("rx fatal error", SSL_EV_CONN_RECV|SSL_EV_CONN_ERR, conn, &ret);
 			goto out_error;
 		}
 	}
  leave:
+	TRACE_LEAVE(SSL_EV_CONN_RECV, conn);
 	return done;
 
  clear_ssl_error:
@@ -5905,6 +5981,7 @@ static size_t ssl_sock_to_buf(struct connection *conn, void *xprt_ctx, struct bu
 	goto leave;
 
  out_error:
+	TRACE_ERROR("rx error", SSL_EV_CONN_RECV, conn);
 	conn_report_term_evt(conn, tevt_loc_xprt, xprt_tevt_type_rcv_err);
 	conn->flags |= CO_FL_ERROR;
 	/* Clear openssl global errors stack */
@@ -5932,14 +6009,18 @@ static size_t ssl_sock_from_buf(struct connection *conn, void *xprt_ctx, const s
 	ssize_t ret;
 	size_t try, done;
 
+	TRACE_ENTER(SSL_EV_CONN_SEND, conn);
+
 	done = 0;
 
 	if (!ctx)
 		goto out_error;
 
-	if (conn->flags & (CO_FL_WAIT_XPRT | CO_FL_SSL_WAIT_HS | CO_FL_EARLY_SSL_HS))
+	if (conn->flags & (CO_FL_WAIT_XPRT | CO_FL_SSL_WAIT_HS | CO_FL_EARLY_SSL_HS)) {
 		/* a handshake was requested */
+		TRACE_LEAVE(SSL_EV_CONN_SEND, conn);
 		return 0;
+	}
 
 	/* send the largest possible block. For this we perform only one call
 	 * to send() unless the buffer wraps and we exactly fill the first hunk,
@@ -6005,7 +6086,7 @@ static size_t ssl_sock_from_buf(struct connection *conn, void *xprt_ctx, const s
 					/* Initiate the handshake, now */
 					tasklet_wakeup(ctx->wait_event.tasklet);
 				}
-
+				TRACE_PROTO("Write early data", SSL_EV_CONN_SEND|SSL_EV_CONN_SEND_EARLY, conn, &ret);
 			}
 
 		} else
@@ -6022,6 +6103,7 @@ static size_t ssl_sock_from_buf(struct connection *conn, void *xprt_ctx, const s
 			ctx->xprt_st &= ~SSL_SOCK_SEND_UNLIMITED;
 			count -= ret;
 			done += ret;
+			TRACE_DEVEL("Post SSL_write success", SSL_EV_CONN_SEND, conn, &ret);
 		}
 		else {
 			ret = SSL_get_error(ctx->ssl, ret);
@@ -6038,7 +6120,7 @@ static size_t ssl_sock_from_buf(struct connection *conn, void *xprt_ctx, const s
 #endif
 					break;
 				}
-
+				TRACE_DEVEL("SSL want write", SSL_EV_CONN_SEND, conn);
 				break;
 			}
 			else if (ret == SSL_ERROR_WANT_READ) {
@@ -6052,6 +6134,7 @@ static size_t ssl_sock_from_buf(struct connection *conn, void *xprt_ctx, const s
 				if (global_ssl.async)
 					SSL_set_mode(ctx->ssl, SSL_MODE_ASYNC);
 #endif
+				TRACE_DEVEL("SSL want read", SSL_EV_CONN_SEND, conn);
 				break;
 			}
 			else if (ret == SSL_ERROR_SSL || ret == SSL_ERROR_SYSCALL) {
@@ -6060,18 +6143,20 @@ static size_t ssl_sock_from_buf(struct connection *conn, void *xprt_ctx, const s
 				if (ctx && !ctx->error_code)
 					ctx->error_code = ERR_peek_error();
 				conn->err_code = CO_ER_SSL_FATAL;
+				TRACE_ERROR("tx fatal error", SSL_EV_CONN_SEND|SSL_EV_CONN_ERR, conn, &ctx->error_code);
 			}
 			goto out_error;
 		}
 	}
  leave:
+	TRACE_LEAVE(SSL_EV_CONN_SEND, conn);
 	return done;
 
  out_error:
+	TRACE_ERROR("tx error", SSL_EV_CONN_SEND, conn);
 	/* Clear openssl global errors stack */
 	ssl_sock_dump_errors(conn, NULL);
 	ERR_clear_error();
-
 	conn_report_term_evt(conn, tevt_loc_xprt, xprt_tevt_type_snd_err);
 	conn->flags |= CO_FL_ERROR;
 	goto leave;
@@ -6081,6 +6166,7 @@ void ssl_sock_close(struct connection *conn, void *xprt_ctx) {
 
 	struct ssl_sock_ctx *ctx = xprt_ctx;
 
+	TRACE_ENTER(SSL_EV_CONN_CLOSE, conn);
 
 	if (ctx) {
 		if (ctx->wait_event.events != 0)
@@ -6103,6 +6189,7 @@ void ssl_sock_close(struct connection *conn, void *xprt_ctx) {
 			SSL_get_all_async_fds(ctx->ssl, NULL, &num_all_fds);
 			if (num_all_fds > 32) {
 				send_log(NULL, LOG_EMERG, "haproxy: openssl returns too many async fds. It seems a bug. Process may crash\n");
+				TRACE_ERROR("Too many async fds", SSL_EV_CONN_CLOSE|SSL_EV_CONN_ERR, conn);
 				return;
 			}
 
@@ -6128,6 +6215,7 @@ void ssl_sock_close(struct connection *conn, void *xprt_ctx) {
 				tasklet_free(ctx->wait_event.tasklet);
 				pool_free(ssl_sock_ctx_pool, ctx);
 				_HA_ATOMIC_INC(&jobs);
+				TRACE_DEVEL("async end", SSL_EV_CONN_CLOSE, conn);
 				return;
 			}
 			/* Else we can remove the fds from the fdtab
@@ -6152,6 +6240,7 @@ void ssl_sock_close(struct connection *conn, void *xprt_ctx) {
 		pool_free(ssl_sock_ctx_pool, ctx);
 		_HA_ATOMIC_DEC(&global.sslconns);
 	}
+	TRACE_LEAVE(SSL_EV_CONN_CLOSE, conn);
 }
 
 /* This function tries to perform a clean shutdown on an SSL connection, and in
@@ -6160,6 +6249,8 @@ void ssl_sock_close(struct connection *conn, void *xprt_ctx) {
 static void ssl_sock_shutw(struct connection *conn, void *xprt_ctx, int clean)
 {
 	struct ssl_sock_ctx *ctx = xprt_ctx;
+
+	TRACE_ENTER(SSL_EV_CONN_END, conn);
 
 	if (conn->flags & (CO_FL_WAIT_XPRT | CO_FL_SSL_WAIT_HS))
 		return;
@@ -6173,6 +6264,8 @@ static void ssl_sock_shutw(struct connection *conn, void *xprt_ctx, int clean)
 		ssl_sock_dump_errors(conn, NULL);
 		ERR_clear_error();
 	}
+
+	TRACE_LEAVE(SSL_EV_CONN_END, conn);
 }
 
 

@@ -40,6 +40,7 @@
 #include <haproxy/sample.h>
 #include <haproxy/sc_strm.h>
 #include <haproxy/server.h>
+#include <haproxy/sock_inet.h>
 #include <haproxy/stats.h>
 #include <haproxy/stconn.h>
 #include <haproxy/task.h>
@@ -69,6 +70,8 @@ DECLARE_POOL(resolv_requester_pool,  "resolv_requester",  sizeof(struct resolv_r
 
 static unsigned int resolution_uuid = 1;
 unsigned int resolv_failed_resolutions = 0;
+uint resolv_accept_families = RSLV_ACCEPT_IPV4 | RSLV_ACCEPT_IPV6;
+
 struct task *process_resolvers(struct task *t, void *context, unsigned int state);
 static void resolv_free_resolution(struct resolv_resolution *resolution);
 static void _resolv_unlink_resolution(struct resolv_requester *requester);
@@ -212,6 +215,23 @@ struct show_resolvers_ctx {
 	struct resolvers *resolvers;
 	struct dns_nameserver *ns;
 };
+
+/* returns the currently accepted address families as a combination of
+ * RSLV_ACCEPT_IPV4 and RSLV_ACCEPT_IPV6 only. It will dynamically adapt adapt
+ * the IPv6 status to sock_inet6_seems_reachable if RSLV_AUTO_FAMILY is set,
+ * otherwise returns the relevant bits of resolv_accept_families.
+ */
+static inline int resolv_active_families(void)
+{
+	if (resolv_accept_families & RSLV_AUTO_FAMILY) {
+		/* Let's adjust our default resolver families based on apparent IPv6 connectivity */
+		if (sock_inet6_seems_reachable)
+			return RSLV_ACCEPT_IPV4 | RSLV_ACCEPT_IPV6;
+		else
+			return RSLV_ACCEPT_IPV4;
+	}
+	return resolv_accept_families & RSLV_ACCEPT_MASK;
+}
 
 /* Returns a pointer to the resolvers matching the id <id>. NULL is returned if
  * no match is found.
@@ -1632,11 +1652,11 @@ int resolv_get_ip_from_response(struct resolv_response *r_res,
 		unsigned char ip_type;
 
 		record = eb32_entry(eb32, typeof(*record), link);
-		if (record->type == DNS_RTYPE_A) {
+		if (record->type == DNS_RTYPE_A && (resolv_active_families() & RSLV_ACCEPT_IPV4)) {
 			ip_type = AF_INET;
 			ip = &record->data.in4.sin_addr;
 		}
-		else if (record->type == DNS_RTYPE_AAAA) {
+		else if (record->type == DNS_RTYPE_AAAA && (resolv_active_families() & RSLV_ACCEPT_IPV6)) {
 			ip_type = AF_INET6;
 			ip = &record->data.in6.sin6_addr;
 		}
@@ -2067,9 +2087,12 @@ int resolv_link_resolution(void *requester, int requester_type, int requester_lo
 			hostname_dn     = &srv->hostname_dn;
 			hostname_dn_len = srv->hostname_dn_len;
 			resolvers       = srv->resolvers;
-			query_type      = ((srv->resolv_opts.family_prio == AF_INET)
+
+			query_type      = !(resolv_active_families() & RSLV_ACCEPT_IPV6) ? DNS_RTYPE_A :
+			                  !(resolv_active_families() & RSLV_ACCEPT_IPV4) ? DNS_RTYPE_AAAA :
+			                  (srv->resolv_opts.family_prio == AF_INET)
 					   ? DNS_RTYPE_A
-					   : DNS_RTYPE_AAAA);
+					   : DNS_RTYPE_AAAA;
 			break;
 
 		case OBJ_TYPE_SRVRQ:
@@ -2101,9 +2124,12 @@ int resolv_link_resolution(void *requester, int requester_type, int requester_lo
 			hostname_dn     = &stream->resolv_ctx.hostname_dn;
 			hostname_dn_len = stream->resolv_ctx.hostname_dn_len;
 			resolvers       = stream->resolv_ctx.parent->arg.resolv.resolvers;
-			query_type      = ((stream->resolv_ctx.parent->arg.resolv.opts->family_prio == AF_INET)
+
+			query_type      = !(resolv_active_families() & RSLV_ACCEPT_IPV6) ? DNS_RTYPE_A :
+			                  !(resolv_active_families() & RSLV_ACCEPT_IPV4) ? DNS_RTYPE_AAAA :
+			                  (stream->resolv_ctx.parent->arg.resolv.opts->family_prio == AF_INET)
 					   ? DNS_RTYPE_A
-					   : DNS_RTYPE_AAAA);
+					   : DNS_RTYPE_AAAA;
 			break;
 		default:
 			goto err;
@@ -2333,7 +2359,7 @@ static int resolv_process_responses(struct dns_nameserver *ns)
 				if (!res->try)
 					goto report_res_error;
 			}
-			else {
+			else if (resolv_active_families() == (RSLV_ACCEPT_IPV4 | RSLV_ACCEPT_IPV6)) {
 				/* Fallback from A to AAAA or the opposite and re-send
 				 * the resolution immediately. try counter is not
 				 * decremented. */
@@ -2462,9 +2488,11 @@ struct task *process_resolvers(struct task *t, void *context, unsigned int state
 				/* Fallback from A to AAAA or the opposite and re-send
 				 * the resolution immediately. try counter is not
 				 * decremented. */
-				if (res->prefered_query_type == DNS_RTYPE_A)
+				if (res->prefered_query_type == DNS_RTYPE_A &&
+				    (resolv_active_families() & RSLV_ACCEPT_IPV6))
 					res->query_type = DNS_RTYPE_AAAA;
-				else if (res->prefered_query_type == DNS_RTYPE_AAAA)
+				else if (res->prefered_query_type == DNS_RTYPE_AAAA &&
+				         (resolv_active_families() & RSLV_ACCEPT_IPV4))
 					res->query_type = DNS_RTYPE_A;
 				else
 					res->try--;
@@ -3327,10 +3355,14 @@ int check_action_do_resolve(struct act_rule *rule, struct proxy *px, char **err)
 
 void resolvers_setup_proxy(struct proxy *px)
 {
-	px->fe_counters.last_change = px->be_counters.last_change = ns_to_sec(now_ns);
-	px->cap = PR_CAP_FE | PR_CAP_BE;
 	px->maxconn = 0;
 	px->conn_retries = 1;
+	px->conn_retries = 1; /* FIXME ignored since 91e785ed
+	                       * ("MINOR: stream: Rely on a per-stream max connection retries value")
+	                       * If this is really expected this should be set on the stream directly
+	                       * because the proxy is not part of the main proxy list and thus
+	                       * lacks the required post init for this setting to be considered
+	                       */
 	px->timeout.server = TICK_ETERNITY;
 	px->timeout.client = TICK_ETERNITY;
 	px->timeout.connect = 1000; // by default same than timeout.resolve
@@ -3478,6 +3510,7 @@ static int resolvers_new(struct resolvers **resolvers, const char *id, const cha
 {
 	struct resolvers *r = NULL;
 	struct proxy *p = NULL;
+	char *errmsg = NULL;
 	int err_code = 0;
 
 	if ((r = calloc(1, sizeof(*r))) == NULL) {
@@ -3486,20 +3519,15 @@ static int resolvers_new(struct resolvers **resolvers, const char *id, const cha
 	}
 
 	/* allocate new proxy to tcp servers */
-	p = calloc(1, sizeof *p);
+	p = alloc_new_proxy(id, PR_CAP_FE | PR_CAP_BE, &errmsg);
 	if (!p) {
+		ha_free(&errmsg); // ignored
 		err_code |= ERR_ALERT | ERR_FATAL;
 		goto err_free_r;
 	}
 
-	init_new_proxy(p);
 	resolvers_setup_proxy(p);
 	p->parent = r;
-	p->id = strdup(id);
-	if (!p->id) {
-		err_code |= ERR_ALERT | ERR_FATAL;
-		goto err_free_p;
-	}
 	p->conf.args.file = p->conf.file = copy_file_name(file);
 	p->conf.args.line = p->conf.line = linenum;
 	r->px = p;
@@ -3509,7 +3537,7 @@ static int resolvers_new(struct resolvers **resolvers, const char *id, const cha
 	r->conf.file = strdup(file);
 	if (!r->conf.file) {
 		err_code |= ERR_ALERT | ERR_FATAL;
-		goto err_free_p_id;
+		goto err_free_p;
 	}
 	r->conf.line = linenum;
 	r->id = strdup(id);
@@ -3545,10 +3573,8 @@ out:
 /* free all allocated stuff and return err_code */
 err_free_conf_file:
 	ha_free((void **)&r->conf.file);
-err_free_p_id:
-	ha_free(&p->id);
 err_free_p:
-	ha_free(&p);
+	free_proxy(p);
 err_free_r:
 	ha_free(&r);
 	return err_code;
@@ -3932,6 +3958,54 @@ int cfg_post_parse_resolvers()
 	curr_resolvers = NULL;
 	return err_code;
 }
+
+/* config parser for global "dns-accept-family", accepts "ipv4", "ipv6" or both delimited by a comma */
+static int cfg_parse_dns_accept_family(char **args, int section_type, struct proxy *curpx,
+                                       const struct proxy *defpx, const char *file, int line,
+                                       char **err)
+{
+	char *arg, *comma;
+	int accept_families = 0;
+
+	if (too_many_args(1, args, err, NULL))
+		return -1;
+
+	if (!args[1][0])
+		goto usage;
+
+	for (arg = args[1]; arg && *arg; arg = comma) {
+		comma = strchr(arg, ',');
+		if (comma)
+			*(comma++) = 0;
+
+		if (strcmp(arg, "ipv4") == 0)
+			accept_families |= RSLV_ACCEPT_IPV4;
+		else if (strcmp(arg, "ipv6") == 0)
+			accept_families |= RSLV_ACCEPT_IPV6;
+		else if (strcmp(arg, "auto") == 0)
+			accept_families |= RSLV_AUTO_FAMILY;
+		else
+			goto usage;
+	}
+
+	/* we ignore the settings if it was forced on the cmdline, but we still
+	 * parse it for config validity checks.
+	 */
+	if (!(resolv_accept_families & RSLV_FORCED_FAMILY))
+		resolv_accept_families = accept_families;
+	return 0;
+ usage:
+	memprintf(err, "'%s' expects a comma-delimited list of 'ipv4' and 'ipv6' but got '%s'.", args[0], args[1]);
+	return -1;
+}
+
+/* config keyword parsers */
+static struct cfg_kw_list cfg_kws = {ILH, {
+	{ CFG_GLOBAL, "dns-accept-family",      cfg_parse_dns_accept_family   },
+	{ 0, NULL, NULL }
+}};
+
+INITCALL1(STG_REGISTER, cfg_register_keywords, &cfg_kws);
 
 REGISTER_CONFIG_SECTION("resolvers",      cfg_parse_resolvers, cfg_post_parse_resolvers);
 REGISTER_POST_DEINIT(resolvers_deinit);

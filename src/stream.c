@@ -1051,9 +1051,10 @@ enum act_return process_use_service(struct act_rule *rule, struct proxy *px,
 			return ACT_RET_ERR;
 
 		/* Finish initialisation of the context. */
-		appctx->rule = rule;
+		s->current_rule = rule;
 		if (appctx_init(appctx) == -1)
 			return ACT_RET_ERR;
+		s->current_rule = NULL;
 	}
 	else
 		appctx = __sc_appctx(s->scb);
@@ -3750,7 +3751,7 @@ static int stats_dump_full_strm_to_buffer(struct appctx *appctx, struct stream *
 		__fallthrough;
 
 	case 1:
-		__strm_dump_to_buffer(&trash, ctx, strm, "", appctx->cli_anon_key);
+		__strm_dump_to_buffer(&trash, ctx, strm, "", appctx->cli_ctx.anon_key);
 		if (applet_putchk(appctx, &trash) == -1)
 			goto full;
 

@@ -1015,7 +1015,7 @@ static int cli_io_handler_show_loadstatus(struct appctx *appctx)
 		return 0;
 
 	if (startup_logs) {
-		appctx->io_handler = NULL;
+		appctx->cli_ctx.io_handler = NULL;
 		ring_attach_cli(startup_logs, appctx, 0);
 		return 0;
 	}
@@ -1043,7 +1043,7 @@ static int mworker_parse_global_max_reloads(char **args, int section_type, struc
 			return -1;
 		}
 	} else {
-		BUG_ON(1, "Triggered in mworker_parse_global_max_reloads() by unsupported keyword.\n");
+		BUG_ON(1, "Triggered in mworker_parse_global_max_reloads() by unsupported keyword.");
 		return -1;
 	}
 

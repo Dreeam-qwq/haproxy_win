@@ -260,7 +260,7 @@ void wait_for_threads_completion()
 	for (i = 1; i < global.nbthread; i++)
 		pthread_join(ha_pthread[i], NULL);
 
-#if defined(DEBUG_THREAD) || defined(DEBUG_FULL)
+#if (DEBUG_THREAD > 1) || defined(DEBUG_FULL)
 	show_lock_stats();
 #endif
 }
@@ -392,14 +392,9 @@ static int thread_cpus_enabled()
 
 /* Below come the lock-debugging functions */
 
-#if defined(DEBUG_THREAD) || defined(DEBUG_FULL)
+#if (DEBUG_THREAD > 0) || defined(DEBUG_FULL)
 
-struct lock_stat lock_stats_rd[LOCK_LABELS] = { };
-struct lock_stat lock_stats_sk[LOCK_LABELS] = { };
-struct lock_stat lock_stats_wr[LOCK_LABELS] = { };
-
-/* this is only used below */
-static const char *lock_label(enum lock_label label)
+const char *lock_label(enum lock_label label)
 {
 	switch (label) {
 	case TASK_RQ_LOCK:         return "TASK_RQ";
@@ -410,6 +405,7 @@ static const char *lock_label(enum lock_label label)
 	case LBPRM_LOCK:           return "LBPRM";
 	case SIGNALS_LOCK:         return "SIGNALS";
 	case STK_TABLE_LOCK:       return "STK_TABLE";
+	case STK_TABLE_UPDT_LOCK:       return "STK_TABLE_UPDT";
 	case STK_SESS_LOCK:        return "STK_SESS";
 	case APPLETS_LOCK:         return "APPLETS";
 	case PEER_LOCK:            return "PEER";
@@ -453,6 +449,13 @@ static const char *lock_label(enum lock_label label)
 	/* only way to come here is consecutive to an internal bug */
 	abort();
 }
+#endif
+
+#if (DEBUG_THREAD > 1) || defined(DEBUG_FULL)
+
+struct lock_stat lock_stats_rd[LOCK_LABELS] = { };
+struct lock_stat lock_stats_sk[LOCK_LABELS] = { };
+struct lock_stat lock_stats_wr[LOCK_LABELS] = { };
 
 /* returns the num read/seek/write for a given label by summing buckets */
 static uint64_t get_lock_stat_num_read(int lbl)
@@ -1139,7 +1142,7 @@ void __spin_unlock(enum lock_label lbl, struct ha_spinlock *l,
 	HA_ATOMIC_INC(&lock_stats_sk[lbl].num_unlocked);
 }
 
-#endif // defined(DEBUG_THREAD) || defined(DEBUG_FULL)
+#endif // (DEBUG_THREAD > 1) || defined(DEBUG_FULL)
 
 
 #if defined(USE_PTHREAD_EMULATION)
@@ -1591,7 +1594,8 @@ int thread_resolve_group_mask(struct thread_set *ts, int defgrp, char **err)
  */
 void thread_detect_count(void)
 {
-	int thr_min, thr_max;
+	int thr_max;
+	int thr_min __maybe_unused;
 	int grp_min __maybe_unused;
 	int grp_max __maybe_unused;
 	int cpus_avail __maybe_unused;
@@ -1615,9 +1619,11 @@ void thread_detect_count(void)
 	if (global.nbtgroups)
 		grp_min = grp_max = global.nbtgroups;
 
+#if defined(USE_THREAD)
 	/* Adjust to boot settings if not forced */
 	if (thr_min <= thread_cpus_enabled_at_boot && thread_cpus_enabled_at_boot < thr_max)
 		thr_max = thread_cpus_enabled_at_boot;
+#endif
 
 	if (global.thread_limit && thr_max > global.thread_limit)
 		thr_max = global.thread_limit;

@@ -67,6 +67,10 @@ struct ckch_conf {
 	char *issuer;
 	char *sctl;
 	int ocsp_update_mode;
+	struct {
+		char *id;
+		char **domains;
+	} acme;
 };
 
 /*
@@ -83,6 +87,7 @@ struct ckch_store {
 	struct list ckch_inst; /* list of ckch_inst which uses this ckch_node */
 	struct list crtlist_entry; /* list of entries which use this store */
 	struct ckch_conf conf;
+	struct task *acme_task;
 	struct ebmb_node node;
 	char path[VAR_ARRAY];
 };
@@ -192,7 +197,7 @@ struct ckch_conf_kws {
 	const char *name;
 	ssize_t offset;
 	enum parse_type_t type;
-	int (*func)(void *value, char *buf, struct ckch_data *d, int cli, char **err);
+	int (*func)(void *value, char *buf, struct ckch_data *d, int cli, const char *filename, int linenum, char **err);
 };
 
 extern struct ckch_conf_kws ckch_conf_kws[];

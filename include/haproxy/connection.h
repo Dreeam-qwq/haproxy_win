@@ -75,7 +75,7 @@ int conn_send_socks4_proxy_request(struct connection *conn);
 int conn_recv_socks4_proxy_response(struct connection *conn);
 
 /* If we delayed the mux creation because we were waiting for the handshake, do it now */
-int conn_create_mux(struct connection *conn);
+int conn_create_mux(struct connection *conn, int *closed_connection);
 int conn_notify_mux(struct connection *conn, int old_flags, int forced_wake);
 int conn_upgrade_mux_fe(struct connection *conn, void *ctx, struct buffer *buf,
                         struct ist mux_proto, int mode);
@@ -706,6 +706,19 @@ static inline void conn_set_reverse(struct connection *conn, enum obj_type *targ
 	       (conn_is_back(conn) && !objt_listener(target)));
 
 	conn->reverse.target = target;
+}
+
+/* Returns idle-ping value for <conn> depending on its proxy side. */
+static inline int conn_idle_ping(const struct connection *conn)
+{
+	if (conn_is_back(conn)) {
+		struct server *srv = objt_server(conn->target);
+		return srv ? srv->idle_ping : TICK_ETERNITY;
+	}
+	else {
+		struct session *sess = conn->owner;
+		return sess->listener->bind_conf->idle_ping;
+	}
 }
 
 /* Returns the listener instance for connection used for active reverse. */

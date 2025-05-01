@@ -64,7 +64,7 @@ enum {
 #define TH_FL_SLEEPING          0x00000008  /* thread won't check its task list before next wakeup */
 #define TH_FL_STARTED           0x00000010  /* set once the thread starts */
 #define TH_FL_IN_LOOP           0x00000020  /* set only inside the polling loop */
-#define TH_FL_DUMPING_OTHERS    0x00000040  /* thread currently dumping other threads */
+/* unused                       0x00000040 */
 #define TH_FL_IN_SIG_HANDLER    0x00000080  /* thread currently in the generic signal handler */
 #define TH_FL_IN_DBG_HANDLER    0x00000100  /* thread currently in the debug signal handler */
 #define TH_FL_IN_WDT_HANDLER    0x00000200  /* thread currently in the wdt signal handler */
@@ -165,7 +165,7 @@ struct thread_ctx {
 	uint64_t prev_mono_time;            /* previous system wide monotonic time (leaving poll) */
 	uint64_t curr_mono_time;            /* latest system wide monotonic time (leaving poll) */
 
-	// around 8 bytes here for thread-local variables
+	ulong lock_history;                 /* history of used locks, see thread.h for more details */
 
 	// third cache line here on 64 bits: accessed mostly using atomic ops
 	ALWAYS_ALIGN(64);
@@ -188,6 +188,7 @@ struct thread_ctx {
 	unsigned long long out_bytes;           /* total #of bytes emitted */
 	unsigned long long spliced_out_bytes;   /* total #of bytes emitted though a kernel pipe */
 	struct buffer *thread_dump_buffer;      /* NULL out of dump, 0x02=to alloc, valid during a dump, |0x01 once done */
+	struct buffer *last_dump_buffer;        /* Copy of last buffer used for a dump; may be NULL or invalid; for post-mortem only */
 	unsigned long long total_streams;       /* Total number of streams created on this thread */
 	unsigned int stream_cnt;                /* Number of streams attached to this thread */
 

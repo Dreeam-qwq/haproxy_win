@@ -24,7 +24,7 @@
 
 #include <haproxy/applet-t.h>
 
-/* Access level for a stats socket (appctx->cli_level) */
+/* Access level for a stats socket (appctx->cli_ctx.level) */
 #define ACCESS_LVL_NONE     0x0000
 #define ACCESS_LVL_USER     0x0001
 #define ACCESS_LVL_OPER     0x0002
@@ -41,11 +41,12 @@
 #define ACCESS_MCLI_SEVERITY_STR 0x0200 /* 'set severity-output string' on master CLI */
 
 /* flags for appctx->st1 */
-#define APPCTX_CLI_ST1_PROMPT  (1 << 0)
-#define APPCTX_CLI_ST1_PAYLOAD (1 << 1)
-#define APPCTX_CLI_ST1_NOLF    (1 << 2)
-#define APPCTX_CLI_ST1_TIMED   (1 << 3)
-#define APPCTX_CLI_ST1_LASTCMD (1 << 4)
+#define APPCTX_CLI_ST1_PAYLOAD (1 << 0)
+#define APPCTX_CLI_ST1_NOLF    (1 << 1)
+#define APPCTX_CLI_ST1_LASTCMD (1 << 2)
+#define APPCTX_CLI_ST1_INTER   (1 << 3) /* interactive mode (i.e. don't close after 1st cmd) */
+#define APPCTX_CLI_ST1_PROMPT  (1 << 4) /* display prompt */
+#define APPCTX_CLI_ST1_TIMED   (1 << 5) /* display timer in prompt */
 
 #define CLI_PREFIX_KW_NB 5
 #define CLI_MAX_MATCHES 5
@@ -55,8 +56,8 @@
 enum {
 	CLI_ST_INIT = 0,   /* initial state, must leave to zero ! */
 	CLI_ST_END,        /* final state, let's close */
-	CLI_ST_GETREQ,     /* wait for a request */
-	CLI_ST_PARSEREQ,   /* parse a request */
+	CLI_ST_PARSE_CMDLINE, /* wait for a full command line */
+	CLI_ST_PROCESS_CMDLINE, /* process all commands on the command line */
 	CLI_ST_OUTPUT,     /* all states after this one are responses */
 	CLI_ST_PROMPT,     /* display the prompt (first output, same code) */
 	CLI_ST_PRINT,      /* display const message in cli->msg */

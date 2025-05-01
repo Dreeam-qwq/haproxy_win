@@ -26,6 +26,7 @@
 #include <import/ebpttree.h>
 #include <import/ebsttree.h>
 
+#include <haproxy/acme.h>
 #include <haproxy/applet.h>
 #include <haproxy/base64.h>
 #include <haproxy/cfgparse.h>
@@ -97,6 +98,7 @@ struct show_sni_ctx {
 	struct ebmb_node *n;
 	int nodetype;
 	int options;
+	unsigned int offset;
 };
 
 /* CLI context used by "dump ssl cert" */
@@ -1026,6 +1028,8 @@ error:
 struct ckch_store *ckchs_dup(const struct ckch_store *src)
 {
 	struct ckch_store *dst;
+	int n = 0;
+	char **r = NULL;
 
 	if (!src)
 		return NULL;
@@ -1040,9 +1044,50 @@ struct ckch_store *ckchs_dup(const struct ckch_store *src)
 
 	dst->conf.ocsp_update_mode = src->conf.ocsp_update_mode;
 
+        /* copy ckch_conf
+	 * XXX: could be automated for each fiedl with the
+         * ckch_conf array used for parsing */
+
+        if (src->conf.crt)
+		dst->conf.crt = strdup(src->conf.crt);
+	if (src->conf.key)
+		dst->conf.key = strdup(src->conf.key);
+	if (src->conf.ocsp)
+		dst->conf.ocsp = strdup(src->conf.ocsp);
+	if (src->conf.issuer)
+		dst->conf.issuer = strdup(src->conf.issuer);
+	if (src->conf.sctl)
+		dst->conf.sctl = strdup(src->conf.sctl);
+	if (src->conf.acme.id)
+		dst->conf.acme.id = strdup(src->conf.acme.id);
+	if (src->conf.acme.domains) {
+
+		/* copy the array of domain strings */
+
+		while (src->conf.acme.domains[n]) {
+			r = realloc(r, sizeof(char *) * (n + 2));
+			if (!r)
+				goto error;
+
+			r[n] = strdup(src->conf.acme.domains[n]);
+			if (!r[n]) {
+				goto error;
+			}
+			n++;
+		}
+		r[n] = 0;
+		dst->conf.acme.domains = r;
+	}
+
 	return dst;
 
 error:
+	while (r && *r) {
+		char *prev = *r;
+		r++;
+		free(prev);
+	}
+	free(r);
 	ckch_store_free(dst);
 
 	return NULL;
@@ -1095,7 +1140,7 @@ end:
  * This function allocate a ckch_store and populate it with certificates using
  * the ckch_conf structure.
  */
-struct ckch_store *ckch_store_new_load_files_conf(char *name, struct ckch_conf *conf, char **err)
+struct ckch_store *ckch_store_new_load_files_conf(char *name, struct ckch_conf *conf, const char *file, int linenum, char **err)
 {
 	struct ckch_store *ckchs;
 	int cfgerr = ERR_NONE;
@@ -1120,7 +1165,7 @@ struct ckch_store *ckch_store_new_load_files_conf(char *name, struct ckch_conf *
 	}
 
 	/* load files using the ckch_conf */
-	cfgerr = ckch_store_load_files(conf, ckchs, 0, err);
+	cfgerr = ckch_store_load_files(conf, ckchs, 0, file, linenum, err);
 	if (cfgerr & ERR_FATAL)
 		goto end;
 
@@ -1669,7 +1714,7 @@ static int cli_io_handler_show_sni(struct appctx *appctx)
 #ifdef HAVE_ASN1_TIME_TO_TM
 					if (ctx->options & SHOW_SNI_OPT_NOTAFTER) {
 						time_t notAfter = x509_get_notafter_time_t(sni->ckch_inst->ckch_store->data->cert);
-						if (!(date.tv_sec > notAfter))
+						if (!(date.tv_sec+ctx->offset > notAfter))
 							continue;
 					}
 #endif
@@ -1744,7 +1789,7 @@ yield:
 }
 
 
-/* parsing function for 'show ssl sni [-f <frontend>] [-A]' */
+/* parsing function for 'show ssl sni [-f <frontend>] [-A] [-t <offset>]' */
 static int cli_parse_show_sni(char **args, char *payload, struct appctx *appctx, void *private)
 {
 	struct show_sni_ctx *ctx = applet_reserve_svcctx(appctx, sizeof(*ctx));
@@ -1788,9 +1833,35 @@ static int cli_parse_show_sni(char **args, char *payload, struct appctx *appctx,
 			return cli_err(appctx, "'-A' option is only supported with OpenSSL >= 1.1.1!\n");
 #endif
 
+		} else if (strcmp(args[cur_arg], "-t") == 0) {
+			unsigned int offset;
+			const char *res;
+			char *err = NULL;
+
+			if (*args[cur_arg+1] == '\0')
+				return cli_err(appctx, "'-t' requires an offset argument!\n");
+
+			res = parse_time_err(args[cur_arg+1], &offset, TIME_UNIT_S);
+
+			if (res == PARSE_TIME_OVER) {
+				return cli_dynerr(appctx, memprintf(&err, "offset overflow '%s' (maximum value is 2147483647s or ~24855 days)", args[cur_arg+1]));
+			}
+			else if (res == PARSE_TIME_UNDER) {
+				return cli_dynerr(appctx, memprintf(&err, "timer underflow '%s' (minimum non-null value is 1s)", args[cur_arg+1]));
+			}
+			else if (res) {
+				return cli_dynerr(appctx, memprintf(&err, "'%s %s' : unexpected character '%c'", args[cur_arg], args[cur_arg+1], *res));
+			}
+
+			if (!offset) {
+				return cli_dynerr(appctx, memprintf(&err, "'%s' expects a positive value", args[cur_arg]));
+			}
+
+			ctx->offset = offset;
+			cur_arg++; /* skip the argument */
 		} else {
 
-			return cli_err(appctx, "Invalid parameters, 'show ssl sni' only supports '-f', or '-A' options!\n");
+			return cli_err(appctx, "Invalid parameters, 'show ssl sni' only supports '-f', '-A' or '-t' options!\n");
 		}
 		cur_arg++;
 	}
@@ -2331,10 +2402,10 @@ static int cli_parse_show_cert(char **args, char *payload, struct appctx *appctx
 		/* use the IO handler that shows details */
 		if (show_ocsp_detail) {
 			ctx->transaction = from_transaction;
-			appctx->io_handler = cli_io_handler_show_cert_ocsp_detail;
+			appctx->cli_ctx.io_handler = cli_io_handler_show_cert_ocsp_detail;
 		}
 		else
-			appctx->io_handler = cli_io_handler_show_cert_detail;
+			appctx->cli_ctx.io_handler = cli_io_handler_show_cert_detail;
 	}
 
 	return 0;
@@ -3725,7 +3796,7 @@ static int cli_parse_show_cafile(char **args, char *payload, struct appctx *appc
 
 		ctx->cur_cafile_entry = cafile_entry;
 		/* use the IO handler that shows details */
-		appctx->io_handler = cli_io_handler_show_cafile_detail;
+		appctx->cli_ctx.io_handler = cli_io_handler_show_cafile_detail;
 	}
 
 	return 0;
@@ -4403,7 +4474,7 @@ static int cli_parse_show_crlfile(char **args, char *payload, struct appctx *app
 		ctx->cafile_entry = cafile_entry;
 		ctx->index = index;
 		/* use the IO handler that shows details */
-		appctx->io_handler = cli_io_handler_show_crlfile_detail;
+		appctx->cli_ctx.io_handler = cli_io_handler_show_crlfile_detail;
 	}
 
 	return 0;
@@ -4555,12 +4626,16 @@ struct ckch_conf_kws ckch_conf_kws[] = {
 #if defined(HAVE_SSL_OCSP)
 	{ "ocsp-update",  offsetof(struct ckch_conf, ocsp_update_mode), PARSE_TYPE_ONOFF, ocsp_update_init,               },
 #endif
+#if defined(HAVE_ACME)
+	{ "acme",         offsetof(struct ckch_conf, acme.id),          PARSE_TYPE_STR,   ckch_conf_acme_init,            },
+#endif
+	{ "domains",      offsetof(struct ckch_conf, acme.domains),     PARSE_TYPE_ARRAY_SUBSTR,   NULL,            },
 	{ NULL,          -1,                                            PARSE_TYPE_STR,   NULL,                           }
 };
 
 
 /* crt-store does not try to find files, but use the stored filename */
-int ckch_store_load_files(struct ckch_conf *f, struct ckch_store *c, int cli, char **err)
+int ckch_store_load_files(struct ckch_conf *f, struct ckch_store *c, int cli, const char *file, int linenum, char **err)
 {
 	int i;
 	int err_code = 0;
@@ -4587,7 +4662,7 @@ int ckch_store_load_files(struct ckch_conf *f, struct ckch_store *c, int cli, ch
 				if (!v)
 					goto next;
 
-				rc = ckch_conf_kws[i].func(v, NULL, d, cli, err);
+				rc = ckch_conf_kws[i].func(v, NULL, d, cli, file, linenum, err);
 				if (rc) {
 					err_code |= ERR_ALERT | ERR_FATAL;
 					memprintf(err, "%s '%s' cannot be read or parsed.", err && *err ? *err : "", v);
@@ -4600,7 +4675,7 @@ int ckch_store_load_files(struct ckch_conf *f, struct ckch_store *c, int cli, ch
 			case PARSE_TYPE_ONOFF:
 			{
 				int v = *(int *)src;
-				rc = ckch_conf_kws[i].func(&v, NULL, d, cli, err);
+				rc = ckch_conf_kws[i].func(&v, NULL, d, cli, file, linenum, err);
 				if (rc) {
 					err_code |= ERR_ALERT | ERR_FATAL;
 					memprintf(err, "%s '%d' cannot be read or parsed.", err && *err ? *err : "", v);
@@ -4892,14 +4967,27 @@ out:
 /* freeing the content of a ckch_conf structure */
 void ckch_conf_clean(struct ckch_conf *conf)
 {
+	char **r;
+
 	if (!conf)
 		return;
 
-	free(conf->crt);
-	free(conf->key);
-	free(conf->ocsp);
-	free(conf->issuer);
-	free(conf->sctl);
+	ha_free(&conf->crt);
+	ha_free(&conf->key);
+	ha_free(&conf->ocsp);
+	ha_free(&conf->issuer);
+	ha_free(&conf->sctl);
+
+	ha_free(&conf->acme.id);
+
+	r = conf->acme.domains;
+	while (r && *r) {
+		char *prev = *r;
+		r++;
+		free(prev);
+	}
+	ha_free(&conf->acme.domains);
+
 }
 
 static char current_crtstore_name[PATH_MAX] = {};
@@ -5001,7 +5089,7 @@ static int crtstore_parse_load(char **args, int section_type, struct proxy *curp
 	if (!c)
 		goto alloc_error;
 
-	err_code |= ckch_store_load_files(&f, c,  0, err);
+	err_code |= ckch_store_load_files(&f, c,  0, file, linenum, err);
 	if (err_code & ERR_FATAL)
 		goto out;
 

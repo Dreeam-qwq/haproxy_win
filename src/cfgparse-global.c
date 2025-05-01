@@ -983,7 +983,7 @@ static int cfg_parse_global_mode(char **args, int section_type,
 		global.mode |= MODE_ZERO_WARNING;
 
 	} else {
-		BUG_ON(1, "Triggered in cfg_parse_global_mode() by unsupported keyword.\n");
+		BUG_ON(1, "Triggered in cfg_parse_global_mode() by unsupported keyword.");
 		return -1;
 	}
 
@@ -1014,7 +1014,7 @@ static int cfg_parse_global_disable_poller(char **args, int section_type,
 		global.tune.options &= ~GTUNE_USE_POLL;
 
 	} else {
-		BUG_ON(1, "Triggered in cfg_parse_global_disable_poller() by unsupported keyword.\n");
+		BUG_ON(1, "Triggered in cfg_parse_global_disable_poller() by unsupported keyword.");
 		return -1;
 	}
 
@@ -1042,7 +1042,7 @@ static int cfg_parse_global_pidfile(char **args, int section_type,
 		}
 		global.pidfile = strdup(args[1]);
 	} else {
-		BUG_ON(1, "Triggered in cfg_parse_global_pidfile() by unsupported keyword.\n");
+		BUG_ON(1, "Triggered in cfg_parse_global_pidfile() by unsupported keyword.");
 		return -1;
 	}
 
@@ -1062,7 +1062,7 @@ static int cfg_parse_global_non_std_directives(char **args, int section_type,
 	} else if (strcmp(args[0], "expose-experimental-directives") == 0) {
 		experimental_directives_allowed = 1;
 	} else {
-		BUG_ON(1, "Triggered in cfg_parse_global_non_std_directives() by unsupported keyword.\n");
+		BUG_ON(1, "Triggered in cfg_parse_global_non_std_directives() by unsupported keyword.");
 		return -1;
 	}
 
@@ -1282,6 +1282,46 @@ static int cfg_parse_global_tune_opts(char **args, int section_type,
 
 		return 0;
 	}
+	else if (strcmp(args[0], "tune.notsent-lowat.client") == 0) {
+#if defined(TCP_NOTSENT_LOWAT)
+		if (global.tune.client_notsent_lowat != 0) {
+			memprintf(err, "'%s' already specified. Continuing.", args[0]);
+			return 1;
+		}
+		if (*(args[1]) == 0) {
+			memprintf(err, "'%s' expects an integer argument.", args[0]);
+			return -1;
+		}
+		res = parse_size_err(args[1], &global.tune.client_notsent_lowat);
+		if (res != NULL)
+			goto size_err;
+
+		return 0;
+#else
+		memprintf(err, "'%s' is not supported on this system.", args[0]);
+		return -1;
+#endif
+	}
+	else if (strcmp(args[0], "tune.notsent-lowat.server") == 0) {
+#if defined(TCP_NOTSENT_LOWAT)
+		if (global.tune.server_notsent_lowat != 0) {
+			memprintf(err, "'%s' already specified. Continuing.", args[0]);
+			return 1;
+		}
+		if (*(args[1]) == 0) {
+			memprintf(err, "'%s' expects an integer argument.", args[0]);
+			return -1;
+		}
+		res = parse_size_err(args[1], &global.tune.server_notsent_lowat);
+		if (res != NULL)
+			goto size_err;
+
+		return 0;
+#else
+		memprintf(err, "'%s' is not supported on this system.", args[0]);
+		return -1;
+#endif
+	}
 	else if (strcmp(args[0], "tune.pipesize") == 0) {
 		if (*(args[1]) == 0) {
 			memprintf(err, "'%s' expects an integer argument.", args[0]);
@@ -1365,7 +1405,7 @@ static int cfg_parse_global_tune_opts(char **args, int section_type,
 		}
 	}
 	else {
-		BUG_ON(1, "Triggered in cfg_parse_global_tune_opts() by unsupported keyword.\n");
+		BUG_ON(1, "Triggered in cfg_parse_global_tune_opts() by unsupported keyword.");
 		return -1;
 	}
 
@@ -1398,7 +1438,7 @@ static int cfg_parse_global_tune_forward_opts(char **args, int section_type,
 		global.tune.no_zero_copy_fwd |= NO_ZERO_COPY_FWD;
 	}
 	else {
-		BUG_ON(1, "Triggered in cfg_parse_global_tune_forward_opts() by unsupported keyword.\n");
+		BUG_ON(1, "Triggered in cfg_parse_global_tune_forward_opts() by unsupported keyword.");
 		return -1;
 	}
 
@@ -1418,7 +1458,7 @@ static int cfg_parse_global_unsupported_opts(char **args, int section_type,
 		memprintf(err, "option '%s' is not supported any more (tune.bufsize is used instead).", args[0]);
 	}
 	else {
-		BUG_ON(1, "Triggered in cfg_parse_global_unsupported_opts() by unsupported keyword.\n");
+		BUG_ON(1, "Triggered in cfg_parse_global_unsupported_opts() by unsupported keyword.");
 	}
 
 	return -1;
@@ -1501,7 +1541,7 @@ static int cfg_parse_global_env_opts(char **args, int section_type,
 		}
 	}
 	else {
-		BUG_ON(1, "Triggered in cfg_parse_global_env_opts() by unsupported keyword.\n");
+		BUG_ON(1, "Triggered in cfg_parse_global_env_opts() by unsupported keyword.");
 		return -1;
 	}
 
@@ -1592,7 +1632,7 @@ static int cfg_parse_tune_renice(char **args, int section_type, struct proxy *cu
 		}
 
 	} else {
-		BUG_ON(1, "Triggered in cfg_parse_tune_renice() by unsupported keyword.\n");
+		BUG_ON(1, "Triggered in cfg_parse_tune_renice() by unsupported keyword.");
 	}
 
 	return 0;
@@ -1726,6 +1766,8 @@ static struct cfg_kw_list cfg_kws = {ILH, {
 	{ CFG_GLOBAL, "tune.rcvbuf.server", cfg_parse_global_tune_opts },
 	{ CFG_GLOBAL, "tune.sndbuf.client", cfg_parse_global_tune_opts },
 	{ CFG_GLOBAL, "tune.sndbuf.server", cfg_parse_global_tune_opts },
+	{ CFG_GLOBAL, "tune.notsent-lowat.client", cfg_parse_global_tune_opts },
+	{ CFG_GLOBAL, "tune.notsent-lowat.server", cfg_parse_global_tune_opts },
 	{ CFG_GLOBAL, "tune.pipesize", cfg_parse_global_tune_opts },
 	{ CFG_GLOBAL, "tune.http.cookielen", cfg_parse_global_tune_opts },
 	{ CFG_GLOBAL, "tune.http.logurilen", cfg_parse_global_tune_opts },

@@ -3,7 +3,7 @@
                           Configuration Manual
                          ----------------------
                               version 3.2
-                              2025/04/02
+                              2025/04/30
 
 
 This document covers the configuration language as implemented in the version
@@ -63,6 +63,7 @@ Summary
 3.11.     HTTPClient tuning
 3.12.     Certificate Storage
 3.12.1.       Load options
+3.13.     ACME
 
 4.    Proxies
 4.1.      Proxy keywords matrix
@@ -1532,6 +1533,7 @@ The following keywords are supported in the "global" section :
    - deviceatlas-log-level
    - deviceatlas-properties-cookie
    - deviceatlas-separator
+   - dns-accept-family
    - expose-deprecated-directives
    - expose-experimental-directives
    - external-check
@@ -1627,6 +1629,7 @@ The following keywords are supported in the "global" section :
    - nopoll
    - noreuseport
    - nosplice
+   - profiling.memory
    - profiling.tasks
    - server-state-base
    - server-state-file
@@ -1694,6 +1697,7 @@ The following keywords are supported in the "global" section :
    - tune.quic.frontend.max-data-size
    - tune.quic.frontend.max-idle-timeout
    - tune.quic.frontend.max-streams-bidi
+   - tune.quic.frontend.max-tx-mem
    - tune.quic.frontend.stream-data-ratio
    - tune.quic.frontend.default-max-window-size
    - tune.quic.max-frame-loss
@@ -1739,6 +1743,8 @@ The following keywords are supported in the "global" section :
 
  * Debugging
    - anonkey
+   - debug.counters
+   - force-cfg-parser-pause
    - quiet
    - warn-blocked-traffic-after
    - zero-warning
@@ -2160,6 +2166,26 @@ deviceatlas-properties-cookie <name>
 deviceatlas-separator <char>
   Sets the character separator for the API properties results. This directive
   is optional and set to | by default if not set.
+
+dns-accept-family <family>[,...]
+  By default, DNS resolvers accept both IPv4 and IPv6 addresses. This can be
+  influenced by the "resolve-prefer" keywords on server lines as well as the
+  family argument to the "do-resolve" action, but that is only a preference,
+  which does not block the other family from being used when it's alone. In
+  some environments where dual-stack is not usable, stumbling on an unreachable
+  IPv6-only DNS record can cause significant trouble as it will replace a
+  previous IPv4 one which would possibly have continued to work till next
+  request. The "dns-accept-family" global option permits to enforce usage of
+  only one (or both) address families. The argument is a comma-delimited list
+  of the following words:
+    - "ipv4": query and accept IPv4 addresses ("A" records)
+    - "ipv6": query and accept IPv6 addresses ("AAAA" records)
+    - "auto": use IPv4, and IPv6 if the system has a default gateway for it.
+
+  When a single family is used, no request will be sent to resolvers for the
+  other family, and any response for the othe family will be ignored. The
+  default value is "ipv4,ipv6", which effectively enables both families.
+  See also: "resolve-prefer", "do-resolve"
 
 expose-deprecated-directives
   This statement must appear before using some directives tagged as deprecated
@@ -4253,6 +4279,22 @@ tune.memory.hot-size <number>
   disable the per-thread CPU caches, using a very small value could work, but
   it is better to use "-dMno-cache" on the command-line.
 
+tune.notsent-lowat.client <size>
+tune.notsent-lowat.server <size>
+  Adjusts the kernel's per-socket buffering so as to report that the sending
+  side of a socket is full once the amount of buffered data equals this value
+  plus the measured window size. The principle is to let the strict minimum
+  needed amount of bytes in socket buffers, plus a small margin corresponding
+  to what would be sent by the time haproxy tries to send again. Setting this
+  to a low value (typically around tune.bufsize) allows to significantly reduce
+  the memory consumption in system buffers, and reduce the application level
+  latency incurred by flushing buffered data. This generally represents a more
+  effective and more accurate setting than tune.sndbuf.client and
+  tune.sndbuf.client for systems supporting it. This applies per connection
+  (connection from a client or connection to a server depending on the setting)
+  and is only used by TCP connections. The default is zero, which means
+  unlimited. This is only available on Linux.
+
 tune.pattern.cache-size <number>
   Sets the size of the pattern lookup cache to <number> entries. This is an LRU
   cache which reminds previous lookups and their results. It is used by ACLs
@@ -4404,6 +4446,14 @@ tune.quic.frontend.max-streams-bidi <number>
 
   See also: "tune.quic.frontend.max-data-size",
             "tune.quic.frontend.stream-data-ratio"
+
+tune.quic.frontend.max-tx-mem <size>
+  Sets the maximum amount of memory usable by QUIC stack at the transport layer
+  for emission. This serves both as a limit of in flight bytes and multiplexer
+  output buffers. Note that to prevent threads contention this limit is not
+  strictly enforced so it can be exceeded on some occasions. Also, each
+  connection will always be able to use a window of at least 2 datagrams, so a
+  proper maxconn should be used in conjunction.
 
 tune.quic.frontend.stream-data-ratio  <0..100, in percent>
   This setting allows to configure the hard limit of the number of data bytes
@@ -4608,7 +4658,9 @@ tune.sndbuf.server <size>
   of received data. Lower values will significantly increase CPU usage though.
   Another use case is to prevent write timeouts with extremely slow clients due
   to the kernel waiting for a large part of the buffer to be read before
-  notifying HAProxy again.
+  notifying HAProxy again. See also tune.notsent-lowat.client and
+  tune.notsent-lowat.server for more effective settings to more finely control
+  memory usage and responsiveness on Linux without hurting performance.
 
 tune.ssl.cachesize <number>
   Sets the size of the global SSL session cache, in a number of blocks. A block
@@ -4812,6 +4864,19 @@ anonkey <key>
   from the CLI command "set anon global-key". See also command line argument
   "-dC" in the management manual.
 
+debug.counters { on | off }
+  Enables ('on') or disables ('off') the updating of event counters in the
+  code. These are the counters reported under the type "CNT" in the CLI command
+  "debug counters". These counters are only available when the code was build
+  with DEBUG_COUNTERS set to a value 1 or above. With the value 1, the counters
+  are not updated by default ("debug.counters off"), and with value 2, they are
+  updated by default ("debug.counters on"). There is normally no reason to
+  change this setting unless a developer requests it, or unless it is suspected
+  to consume abnormal amounts of CPU (in which case a report to developers is
+  necessary with a dump of the counters). It is also possible to change this
+  status at run time using the "debug counters" CLI command. Please consult the
+  management manual.
+
 force-cfg-parser-pause <timeout>
   This command is pausing the configuration parser for <timeout> milliseconds.
   This is useful for development or for testing timeouts of init scripts,
@@ -4827,7 +4892,6 @@ force-cfg-parser-pause <timeout>
     global
         expose-experimental-directives
         force-cfg-parser-pause 10s
-
 
 quick-exit
   This speeds up the old process exit upon reload by skipping the releasing of
@@ -5448,7 +5512,7 @@ timeout server <timeout>
 
     ring myring
         description "My local buffer"
-        format rfc3164
+        format rfc5424
         maxlen 1200
         size 32764
         timeout connect 5s
@@ -5542,31 +5606,31 @@ option dont-parse-log
 
 option host { replace | fill | keep | append }
   Set the host strategy that should be used on the log-forward section
-  regarding syslog host field for outbound rfc3164 or rfc5424 messages.
+  regarding syslog hostname field for outbound rfc3164 or rfc5424 messages.
 
-      replace If input message already contains a value for the host field,
+      replace If input message already contains a value for the hostname field,
               we replace it by the source IP address from the sender.
-              If input message doesn't contain a value for the host field (ie:
-              '-' as input rfc5424 message or non compliant rfc3164 or rfc5424
-              message), we use the source IP address from the sender as host
-              field.
-
-      fill    If input message already contains a value for the host field,
-              we keep it.
-              If input message doesn't contain a value for the host field
+              If input message doesn't contain a value for the hostname field
               (ie: '-' as input rfc5424 message or non compliant rfc3164 or
               rfc5424 message), we use the source IP address from the sender as
-              host field.
+              hostname field.
+
+      fill    If input message already contains a value for the hostname field,
+              we keep it.
+              If input message doesn't contain a value for the hostname field
+              (ie: '-' as input rfc5424 message or non compliant rfc3164 or
+              rfc5424 message), we use the source IP address from the sender as
+              hostname field.
               (This is the default)
 
-      keep    If input message already contains a value for the host field,
+      keep    If input message already contains a value for the hostname field,
               we keep it.
-              If input message doesn't contain a value for the host field,
+              If input message doesn't contain a value for the hostname field,
               we set it to 'localhost' (rfc3164) or '-' (rfc5424).
 
-      append  If input message already contains a value for the host field,
+      append  If input message already contains a value for the hostname field,
               we append a comma followed by the IP address from the sender.
-              If input message doesn't contain a value for the host field,
+              If input message doesn't contain a value for the hostname field,
               we use the source IP address from the sender.
 
   For all options above, if the source IP address from the sender is not
@@ -5713,10 +5777,27 @@ crt <filename>
   private key.  If no private key is provided in this file, a key can be provided
   with the "key" keyword.
 
+acme <string>
+  This option allows to configure the ACME protocol for a given certificate.
+  This is an experimental feature which needs the
+  "expose-experimental-directives" keyword in the global section.
+
+  See also Section 3.13 ("ACME") and "domains" in this section.
+
 alias <string>
   Optional argument. Allow to name the certificate with an alias, so it can be
   referenced with it in the configuration. An alias must be prefixed with '@/'
   when called elsewhere in the configuration.
+
+domains <string>
+  Configure the list of domains that will be used for ACME certificates. The
+  first domain of the list is used as the CN. Domains are separated by commas in the list.
+
+  See also Section 3.13 ("ACME") and "acme" in this section.
+
+  Example:
+
+    load crt "example.com.pem" acme LE domains "bar.example.com,foo.example.com"
 
 key <filename>
   This argument is optional. Load a private key in PEM format. If a private key
@@ -5835,6 +5916,107 @@ ocsp-update [ off | on ]
   A more precise error message might also be displayed between parenthesis
   after the "generic" error message. It can happen for "OCSP response check
   failure" or "Error during insertion" errors.
+
+3.13. ACME
+----------
+
+The ACME protocol can be configured using the "acme" section. The section takes
+a "<name>" argument, which is used to link a certificate to the section.
+
+The ACME section allows to configure HAProxy as an ACMEv2 client. This feature
+is experimental meaning that "expose-experimental-directives" must be in the
+global section so this can be used.
+
+Current limitations as of 3.2: The feature is limited to the HTTP-01 challenge
+for now. The current HAProxy architecture is a non-blocking model, access to
+the disk is not supposed to be done after the configuration is loaded, because
+it could block the event loop, blocking the traffic on the same thread. Meaning
+that the certificates and keys generated from HAProxy will need to be dumped
+from outside HAProxy using "dump ssl cert" on the stats socket.
+The generation is not scheduled and must be triggered using the CLI command
+"acme renew". See also "acme ps" in the management guide.
+
+The following keywords are usable in the ACME section:
+
+account-key <filename>
+  Configure the path to the account key. The key need to be generated before
+  launching HAProxy. If no account keyword is used, the acme section will try
+  to load a filename using the section name "<name>.account.key". If the file
+  doesn't exist, HAProxy will generate one, using the parameters from the acme
+  section.
+
+  You can also generate manually an RSA private key with openssl:
+
+    openssl genrsa -out account.key 2048
+
+  Or an ecdsa one:
+
+    openssl ecparam -name secp384r1 -genkey -noout -out account.key
+
+bits <number>
+  Configure the number of bits to generate an RSA certificate. Default to 2048.
+  Setting a too high value can trigger a warning if your machine is not
+  powerful enough. (This can be configured with "warn-blocked-traffic-after"
+  but blocking the traffic too long could trigger the watchdog.)
+
+challenge <string>
+  Takes a challenge type as parameter, this must be HTTP-01 or DNS-01. When not
+  used the default is HTTP-01.
+
+contact <string>
+  The contact email that will be associated to the account key in the CA.
+
+curves <string>
+  When using the ECDSA keytype, configure the curves. The default is P-384.
+
+directory <string>
+  This keyword configures the directory URL for the CA used by this acme
+  section. This keyword is mandatory as there is no default URL.
+
+  Example:
+    directory https://acme-staging-v02.api.letsencrypt.org/directory
+
+keytype <string>
+  Configure the type of key that will be generated. Value can be either "RSA"
+  or "ECDSA". You can also configure the "curves" for ECDSA and the number of
+  "bits" for RSA. By default EC384 keys are generated.
+
+map <map>
+  Configure the map which will be used to store token (key) and thumbprint
+  (value), which is useful to reply to a challenge when there are multiple
+  account used. The acme task will add entries before validating the challenge
+  and will remove the entries at the end of the task.
+
+Example:
+
+  global
+      expose-experimental-directives
+      httpclient.resolvers.prefer ipv4
+
+  frontend in
+      bind *:80
+      bind *:443 ssl
+      http-request return status 200 content-type text/plain lf-string "%[path,field(-1,/)].%[path,field(-1,/),map(virt@acme)]\n" if { path_beg '/.well-known/acme-challenge/' }
+      ssl-f-use crt "foo.example.com.pem.rsa"   acme LE1 domains "foo.example.com.pem,bar.example.com"
+      ssl-f-use crt "foo.example.com.pem.ecdsa" acme LE2 domains "foo.example.com.pem,bar.example.com"
+
+  acme LE1
+      directory https://acme-staging-v02.api.letsencrypt.org/directory
+      account-key /etc/haproxy/letsencrypt.account.key
+      contact john.doe@example.com
+      challenge HTTP-01
+      keytype RSA
+      bits 2048
+      map virt@acme
+
+  acme LE2
+      directory https://acme-staging-v02.api.letsencrypt.org/directory
+      account-key /etc/haproxy/letsencrypt.account.key
+      contact john.doe@example.com
+      challenge HTTP-01
+      keytype ECDSA
+      curves P-384
+      map virt@acme
 
 4. Proxies
 ----------
@@ -6082,6 +6264,8 @@ option forwarded                     (*)  X          -         X         X
 option h1-case-adjust-bogus-client   (*)  X          X         X         -
 option h1-case-adjust-bogus-server   (*)  X          -         X         X
 option http-buffer-request           (*)  X          X         X         X
+option http-drop-request-trailers    (*)  X          -         -         X
+option http-drop-response-trailers   (*)  X          -         X         -
 option http-ignore-probes            (*)  X          X         X         -
 option http-keep-alive               (*)  X          X         X         X
 option http-no-delay                 (*)  X          X         X         X
@@ -10240,6 +10424,50 @@ no option http-buffer-request
   See also : "option http-no-delay", "timeout http-request",
              "http-request wait-for-body"
 
+option http-drop-request-trailers
+no option http-drop-request-trailers
+  Drop the HTTP trailers from the request when sent to the server
+
+  May be used in the following contexts: http
+
+  May be used in sections :   defaults | frontend | listen | backend
+                                 yes   |    no   |   no  |   yes
+
+  Arguments : none
+
+  When this option is enabled, any HTTP trailers found in a request will be
+  dropped before sending it to the server.
+
+  RFC9110#section-6.5.1 stated that trailer fields could be merged into the
+  header fields. It should be done on purpose, but it may be a problem for some
+  applications, espcially if malicious clients hide sensitive header fields in
+  the trailers part and some intermediaries merge them with headers with no
+  specific checks. In that case, this option can be enabled on the backend to
+  drop any trailer fields found in requests before sending them to the server.
+
+  If this option has been enabled in a "defaults" section, it can be disabled
+  in a specific instance by prepending the "no" keyword before it.
+
+  See also: "option http-drop-response-trailers"
+
+option http-drop-response-trailers
+no option http-drop-response-trailers
+  Drop the HTTP trailers from the response when sent to the client
+
+  May be used in the following contexts: http
+
+  May be used in sections :   defaults | frontend | listen | backend
+                                 yes   |    yes   |   yes  |   no
+
+  Arguments : none
+
+  This option is similar to "option http-drop-request-trailers" but it must be
+  used to drop trailer fields from responses before sending them to clients.
+
+  If this option has been enabled in a "defaults" section, it can be disabled
+  in a specific instance by prepending the "no" keyword before it.
+
+  See also: "option http-drop-request-trailers"
 
 option http-ignore-probes
 no option http-ignore-probes
@@ -12651,6 +12879,7 @@ ssl-f-use [<sslbindconf> ...]*
 
     frontend https
         bind :443 ssl
+        bind quic4@:443 ssl
         ssl-f-use crt foobar.pem.rsa sigalgs "RSA-PSS+SHA256"
         ssl-f-use crt test.foobar.pem
         ssl-f-use crt test2.foobar.crt key test2.foobar.key ocsp test2.foobar.ocsp ocsp-update on
@@ -15367,6 +15596,7 @@ early-hint                     -           -     -     -     -            X   - 
 expect-netscaler-cip           -           X     -     -     -            -   -   -
 expect-proxy layer4            -           X     -     -     -            -   -   -
 normalize-uri                  -           -     -     -     -            X   -   -
+pause                          -           -     -     -     -            X   X   -
 redirect                       -           -     -     -     -            X   X   -
 reject                         X           X     X     X     X            X   -   -
 replace-header                 -           -     -     -     -            X   X   X
@@ -15699,7 +15929,9 @@ do-resolve(<var>,<resolvers>[,ipv4|ipv6]) <expr>
   the result in the variable <var>. It uses the DNS resolvers section
   pointed by <resolvers>.
   It is possible to choose a resolution preference using the optional
-  arguments 'ipv4' or 'ipv6'.
+  arguments 'ipv4' or 'ipv6'. See also the global "dns-accept-family" keyword
+  to enforce strict usage of a specific family.
+
   When performing the DNS resolution, the client side connection is on
   pause waiting till the end of the resolution.
   If an IP address can be found, it is stored into <var>. If any kind of
@@ -15937,6 +16169,22 @@ normalize-uri query-sort-by-name
       - /?aaa=3&a=1&aa=2      -> /?a=1&aa=2&aaa=3
       - /?a=3&b=4&a=1&b=5&a=2 -> /?a=3&a=1&a=2&b=4&b=5
 
+pause { <timeout> | <expr> }
+  Usable in:  QUIC Ini|    TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
+                    - |          -  |   -  |   -  |   -  |          X |  X |  -
+
+  This suspends the message analysis for the sepcified number of milliseconds.
+  The timeout can be specified in milliseconds or with any other unit if the
+  number is suffixed by the unit as explained at the top of this document. It
+  is also possible to write an expression which must return a number
+  interpreted as a timeout in milliseconds. If the expression evaluation fails
+  or if it returns an invalid value, the action is ignored and the evaluation
+  continues.
+
+  This action may be used for debugging purpose. But it could also be used to
+  slow down some clients based on specific criteria. For instance, it is
+  possible to slow down clients if their requests rate is too high, by tracking
+  them via a "track-sc" rule.
 
 redirect <rule>
   Usable in:  QUIC Ini|    TCP RqCon| RqSes| RqCnt| RsCnt|    HTTP Req| Res| Aft
@@ -17497,6 +17745,22 @@ id <id>
   must be strictly positive and unique within the listener/frontend. This
   option can only be used when defining only a single socket.
 
+idle-ping <delay>
+  May be used in the following contexts: tcp, http, log
+
+  Define an interval for periodic liveliness on idle frontend connections. If
+  the peer is unable to respond before the next scheduled test, the connection
+  is closed. Else, the client timeout is refreshed and the connection is kept.
+  Note that http-request/http-keep-alive timers run in parallel and are not
+  refreshed by idle-ping.
+
+  This feature relies on specific underlying protocol support. For now, only H2
+  mux implements it. Idle-ping is simply ignored by other protocols.
+
+  This option is particularly useful when using reverse HTTP. Setting it on the
+  bind line is useful for the peer which is responsible to actively initiate
+  connections and will then receive incoming traffic through them.
+
 interface <interface>
   Restricts the socket to a specific interface. When specified, only packets
   received from that particular interface are processed by the socket. This is
@@ -18515,6 +18779,23 @@ id <value>
   the proxy. An unused ID will automatically be assigned if unset. The first
   assigned value will be 1. This ID is currently only returned in statistics.
 
+idle-ping <delay>
+  May be used in the following contexts: tcp, http, log
+
+  Define an interval for periodic liveliness on idle backend connections. If
+  the peer is unable to respond before the next scheduled test, the connection
+  is closed. This keyword refers to the backend side, so it is useful to check
+  that idle connections are still usable. Note that this won't prevent the
+  connection from being destroyed on idle pool purge.
+
+  This feature relies on specific underlying protocol support. For now, only H2
+  mux implements it. Idle-ping is simply ignored by other protocols.
+
+  This option is particularly useful when using reverse HTTP. Setting it on the
+  server line is useful for the peer which listen for incoming connections and
+  attach them to a corresponding server to be able to reuse later on traffic
+  forwarding.
+
 init-addr {last | libc | none | <ip>},[...]*
   May be used in the following contexts: tcp, http, log
 
@@ -19158,8 +19439,9 @@ resolve-prefer <family>
 
   When DNS resolution is enabled for a server and multiple IP addresses from
   different families are returned, HAProxy will prefer using an IP address
-  from the family mentioned in the "resolve-prefer" parameter.
-  Available families: "ipv4" and "ipv6"
+  from the family mentioned in the "resolve-prefer" parameter. See also the
+  global "dns-accept-family" keyword to enforce strict usage of a specific
+  family. Available families: "ipv4" and "ipv6".
 
   Default value: ipv6
 
@@ -19755,6 +20037,8 @@ hold <status> <period>
   valid status from the DNS server.
 
   A separate behavior exists for "hold valid" and "hold obsolete".
+
+  Default value is 10s for "valid", 0s for "obsolete" and 30s for others.
 
 resolve_retries <nb>
   Defines the number <nb> of queries to send to resolve a server name before
@@ -25527,6 +25811,10 @@ req_ssl_sni                                           string
 req.ssl_st_ext                                        integer
 req.ssl_ver                                           integer
 req_ssl_ver                                           integer
+req.ssl_cipherlist                                    binary
+req.ssl_sigalgs                                       binary
+req.ssl_keyshare_groups                               binary
+req.ssl_supported_groups                              binary
 res.len                                               integer
 res.payload(<offset>,<length>)                        binary
 res.payload_lv(<offset1>,<length>[,<offset2>])        binary
@@ -25730,6 +26018,68 @@ req_ssl_sni : string (deprecated)
      tcp-request content accept if { req.ssl_hello_type 1 }
      use_backend bk_allow if { req.ssl_sni -f allowed_sites }
      default_backend bk_sorry_page
+
+req.ssl_cipherlist binary
+  Returns the binary form of the list of symmetric cipher options supported by
+  the client as reported in the contents of a TLS ClientHello. Note that this
+  only applies to raw contents found in the request buffer and not to contents
+  deciphered via an SSL data layer, so this will not work with "bind" lines
+  having the "ssl" option. Refer to "ssl_fc_cipherlist_bin" which is the SSL
+  bind equivalent that can be used when the "ssl" option is specified.
+
+  Examples :
+    # Wait for a client hello for at most 5 seconds
+    tcp-request inspect-delay 5s
+    tcp-request content accept if { req.ssl_hello_type 1 }
+    use-server fe3 if { req.ssl_cipherlist,be2hex(:,2),lower -m sub 1302:009f }
+    server fe3  ${htst_fe3_addr}:${htst_fe3_port}
+
+req.ssl_sigalgs binary
+  Returns the binary form of the list of signature algorithms supported by the
+  client as reported in the TLS ClientHello. This is available as a client hello
+  extension. Note that this only applies to raw contents found in the request
+  buffer and not to contents deciphered via an SSL data layer, so this will not
+  work with "bind" lines having the "ssl" option. Refer to "ssl_fc_sigalgs_bin"
+  which is the SSL bind equivalent that can be used when the "ssl" option is
+  specified.
+
+  Examples :
+    # Wait for a client hello for at most 5 seconds
+    tcp-request inspect-delay 5s
+    tcp-request content accept if { req.ssl_hello_type 1 }
+    use-server fe4 if { req.ssl_sigalgs,be2hex(:,2),lower -m sub 0403:0805 }
+    server fe4  ${htst_fe4_addr}:${htst_fe4_port}
+
+req.ssl_keyshare_groups binary
+  Return the binary format of the list of cryptographic parameters for key exchange
+  supported by the client as reported in the TLS ClientHello. In TLS v1.3, keyshare
+  is part of the ClientHello message and is the final client hello extension. Note
+  that this only applies to raw contents found in the request buffer and not to
+  contents deciphered via an  SSL data layer, so this will not work with "bind"
+  lines having the "ssl" option.
+
+  Examples :
+    # Wait for a client hello for at most 5 seconds
+    tcp-request inspect-delay 5s
+    tcp-request content accept if { req.ssl_hello_type 1 }
+    use-server fe3 if { req.ssl_keyshare_groups,be2hex(:,2),lower -m sub 001d  }
+    server fe3  ${htst_fe3_addr}:${htst_fe3_port}
+
+req.ssl_supported_groups binary
+  Returns the binary form of the list of supported groups supported by the client
+  as reported in the TLS ClientHello and used for key exchange which can include
+  both elliptic curve and non-EC key exchange. Note that this only applies to raw
+  contents found in the request buffer and not to contents deciphered via an SSL
+  data layer, so this will not  work with "bind" lines having the "ssl" option.
+  Refer to "ssl_fc_eclist_bin" which is the SSL bind equivalent that can be used
+  when the "ssl" option is specified.
+
+  Examples :
+    # Wait for a client hello for at most 5 seconds
+    tcp-request inspect-delay 5s
+    tcp-request content accept if { req.ssl_hello_type 1 }
+    use-server fe3 if { req.ssl_supported_groups, be2hex(:,2),lower -m sub 0017 }
+    server fe3  ${htst_fe3_addr}:${htst_fe3_port}
 
 req.ssl_st_ext : integer
   Returns 0 if the client didn't send a SessionTicket TLS Extension (RFC5077)

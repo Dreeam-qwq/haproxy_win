@@ -556,19 +556,20 @@ static int init_peers_frontend(const char *file, int linenum,
                                const char *id, struct peers *peers)
 {
 	struct proxy *p;
+	char *errmsg = NULL;
 
 	if (peers->peers_fe) {
 		p = peers->peers_fe;
 		goto out;
 	}
 
-	p = calloc(1, sizeof *p);
+	p = alloc_new_proxy(NULL, PR_CAP_FE | PR_CAP_BE, &errmsg);
 	if (!p) {
-		ha_alert("parsing [%s:%d] : out of memory.\n", file, linenum);
+		ha_alert("parsing [%s:%d] : %s\n", file, linenum, errmsg);
+		ha_free(&errmsg);
 		return -1;
 	}
 
-	init_new_proxy(p);
 	peers_setup_frontend(p);
 	p->parent = peers;
 	/* Finally store this frontend. */
@@ -2788,6 +2789,32 @@ int check_config_validity()
 		proxies_list = next;
 	}
 
+	/*
+	 * we must finish to initialize certain things on the servers,
+	 * as some of the per_thr/per_tgrp fields may be accessed soon
+	 */
+
+	MT_LIST_FOR_EACH_ENTRY_LOCKED(newsrv, &servers_list, global_list, back) {
+		if (srv_init_per_thr(newsrv) == -1) {
+			ha_alert("parsing [%s:%d] : failed to allocate per-thread lists for server '%s'.\n",
+			         newsrv->conf.file, newsrv->conf.line, newsrv->id);
+			cfgerr++;
+			continue;
+		}
+
+		/* initialize idle conns lists */
+		if (newsrv->max_idle_conns != 0) {
+			newsrv->curr_idle_thr = calloc(global.nbthread, sizeof(*newsrv->curr_idle_thr));
+			if (!newsrv->curr_idle_thr) {
+				ha_alert("parsing [%s:%d] : failed to allocate idle connection tasks for server '%s'.\n",
+				         newsrv->conf.file, newsrv->conf.line, newsrv->id);
+				cfgerr++;
+				continue;
+			}
+
+		}
+	}
+
 	/* starting to initialize the main proxies list */
 	init_proxies_list = proxies_list;
 
@@ -2799,6 +2826,7 @@ init_proxies_list_stage1:
 		struct logger *tmplogger;
 		unsigned int next_id;
 
+		proxy_init_per_thr(curproxy);
 		if (!(curproxy->cap & PR_CAP_INT) && curproxy->uuid < 0) {
 			/* proxy ID not set, use automatic numbering with first
 			 * spare entry starting with next_pxid. We don't assign
@@ -4141,29 +4169,6 @@ out_uri_auth_compat:
 	/* At this point, target names have already been resolved. */
 	/***********************************************************/
 
-	/* we must finish to initialize certain things on the servers */
-
-	MT_LIST_FOR_EACH_ENTRY_LOCKED(newsrv, &servers_list, global_list, back) {
-		/* initialize idle conns lists */
-		if (srv_init_per_thr(newsrv) == -1) {
-			ha_alert("parsing [%s:%d] : failed to allocate per-thread lists for server '%s'.\n",
-			         newsrv->conf.file, newsrv->conf.line, newsrv->id);
-			cfgerr++;
-			continue;
-		}
-
-		if (newsrv->max_idle_conns != 0) {
-			newsrv->curr_idle_thr = calloc(global.nbthread, sizeof(*newsrv->curr_idle_thr));
-			if (!newsrv->curr_idle_thr) {
-				ha_alert("parsing [%s:%d] : failed to allocate idle connection tasks for server '%s'.\n",
-				         newsrv->conf.file, newsrv->conf.line, newsrv->id);
-				cfgerr++;
-				continue;
-			}
-
-		}
-	}
-
 	idle_conn_task = task_new_anywhere();
 	if (!idle_conn_task) {
 		ha_alert("parsing : failed to allocate global idle connection task.\n");
@@ -4198,7 +4203,6 @@ init_proxies_list_stage2:
 		struct listener *listener;
 		unsigned int next_id;
 
-		proxy_init_per_thr(curproxy);
 		/* Configure SSL for each bind line.
 		 * Note: if configuration fails at some point, the ->ctx member
 		 * remains NULL so that listeners can later detach.
@@ -4299,6 +4303,13 @@ init_proxies_list_stage2:
 	 */
 	if (init_proxies_list == proxies_list) {
 		init_proxies_list = cfg_log_forward;
+		/* check if list is not null to avoid infinite loop */
+		if (init_proxies_list)
+			goto init_proxies_list_stage2;
+	}
+
+	if (init_proxies_list == cfg_log_forward) {
+		init_proxies_list = sink_proxies_list;
 		/* check if list is not null to avoid infinite loop */
 		if (init_proxies_list)
 			goto init_proxies_list_stage2;

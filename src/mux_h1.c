@@ -2596,17 +2596,21 @@ static size_t h1_make_headers(struct h1s *h1s, struct h1m *h1m, struct htx *htx,
 				h1s->flags |= H1S_F_HAVE_CHNK;
                         }
 			else if (isteq(n, ist("content-length"))) {
-				if ((h1m->flags & H1_MF_RESP) && (h1s->status < 200 || h1s->status == 204))
-					goto nextblk;
+				unsigned long long body_len = h1m->body_len;
+
+				/* Report error for invalid content-length.
+				 * Skip custom content-length headers except "content-length: 0"
+				 * for 1xx and 204 messages.
+				 */
+				if (http_parse_cont_len_header(&v, &body_len, (h1s->flags & H1S_F_HAVE_CLEN)) < 0)
+					goto error;
+				if (!body_len && (h1m->flags & H1_MF_RESP) && (h1s->status < 200 || h1s->status == 204))
+					h1m->flags |= H1_MF_CLEN;
 				if (!(h1m->flags & H1_MF_CLEN))
 					goto nextblk;
-				if (!(h1s->flags & H1S_F_HAVE_CLEN))
-					h1m->flags &= ~H1_MF_CLEN;
-				/* Only skip C-L header with invalid value. */
-				if (h1_parse_cont_len_header(h1m, &v) < 0)
-					goto error;
 				if (h1s->flags & H1S_F_HAVE_CLEN)
 					goto nextblk;
+				h1m->curr_len = h1m->body_len = body_len;
 				h1s->flags |= H1S_F_HAVE_CLEN;
 			}
 			else if (isteq(n, ist("connection"))) {
@@ -3369,6 +3373,11 @@ static size_t h1_make_trailers(struct h1s *h1s, struct h1m *h1m, struct htx *htx
 			if (!(h1m->flags & H1_MF_CHNK) ||
 			    (!(h1m->flags & H1_MF_RESP) && (h1s->flags & H1S_F_BODYLESS_REQ)) ||
 			    ((h1m->flags & H1_MF_RESP) && (h1s->flags & H1S_F_BODYLESS_RESP)))
+				goto nextblk;
+
+			/* Skip the trailers because the corresponding conf option was set */
+			if ((!(h1m->flags & H1_MF_RESP) && (h1c->px->options & PR_O_HTTP_DROP_RES_TRLS)) ||
+			    ((h1m->flags & H1_MF_RESP) && (h1c->px->options & PR_O_HTTP_DROP_REQ_TRLS)))
 				goto nextblk;
 
 			n = htx_get_blk_name(htx, blk);
@@ -4241,6 +4250,7 @@ static int h1_process(struct h1c * h1c)
 		}
 		h1_alert(h1s);
 		TRACE_DEVEL("waiting to release the SC before releasing the connection", H1_EV_H1C_WAKE);
+		return 0;
 	}
 	else {
 		h1_release(h1c);
@@ -4478,7 +4488,7 @@ static void h1_destroy(void *ctx)
 {
 	struct h1c *h1c = ctx;
 
-	TRACE_POINT(H1_EV_H1C_END, h1c->conn);
+	TRACE_POINT(H1_EV_H1C_END);
 	if (!h1c->h1s || h1c->conn->ctx != h1c)
 		h1_release(h1c);
 }

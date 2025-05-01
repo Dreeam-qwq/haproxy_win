@@ -123,6 +123,12 @@ void wake_expired_tasks(void);
  */
 int next_timer_expiry(void);
 
+/* Pings the scheduler to verify that tasks continue running.
+ * Returns 1 if the scheduler made progress since last call,
+ * 0 if it looks stuck.
+ */
+int is_sched_alive(void);
+
 /*
  * Delete every tasks before running the master polling loop
  */
@@ -388,9 +394,9 @@ static inline void _tasklet_wakeup_on(struct tasklet *tl, int thr, uint f, const
 
 	do {
 		/* do nothing if someone else already added it */
-		if (state & TASK_IN_LIST)
+		if (state & TASK_QUEUED)
 			return;
-	} while (!_HA_ATOMIC_CAS(&tl->state, &state, state | TASK_IN_LIST));
+	} while (!_HA_ATOMIC_CAS(&tl->state, &state, state | TASK_QUEUED));
 
 	/* at this point we're the first ones to add this task to the list */
 	if (likely(caller)) {
@@ -495,9 +501,9 @@ static inline struct list *_tasklet_wakeup_after(struct list *head, struct taskl
 
 	do {
 		/* do nothing if someone else already added it */
-		if (state & TASK_IN_LIST)
+		if (state & TASK_QUEUED)
 			return head;
-	} while (!_HA_ATOMIC_CAS(&tl->state, &state, state | TASK_IN_LIST));
+	} while (!_HA_ATOMIC_CAS(&tl->state, &state, state | TASK_QUEUED));
 
 	/* at this point we're the first one to add this task to the list */
 	if (likely(caller)) {
@@ -527,21 +533,6 @@ static inline struct list *_tasklet_wakeup_after(struct list *head, struct taskl
 #else
 #define DEBUG_TASK_PRINT_CALLER(t) do { } while (0)
 #endif
-
-
-/* Try to remove a tasklet from the list. This call is inherently racy and may
- * only be performed on the thread that was supposed to dequeue this tasklet.
- * This way it is safe to call MT_LIST_DELETE without first removing the
- * TASK_IN_LIST bit, which must absolutely be removed afterwards in case
- * another thread would want to wake this tasklet up in parallel.
- */
-static inline void tasklet_remove_from_tasklet_list(struct tasklet *t)
-{
-	if (MT_LIST_DELETE(list_to_mt_list(&t->list))) {
-		_HA_ATOMIC_AND(&t->state, ~TASK_IN_LIST);
-		_HA_ATOMIC_DEC(&ha_thread_ctx[t->tid >= 0 ? t->tid : tid].rq_total);
-	}
-}
 
 /*
  * Initialize a new task. The bare minimum is performed (queue pointers and

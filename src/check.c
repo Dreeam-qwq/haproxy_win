@@ -1105,7 +1105,7 @@ struct task *srv_chk_io_cb(struct task *t, void *ctx, unsigned int state)
 	struct stconn *sc = ctx;
 
 	wake_srv_chk(sc);
-	return NULL;
+	return t;
 }
 
 /* returns <0, 0, >0 if check thread 1 is respectively less loaded than,
@@ -1664,16 +1664,15 @@ static int start_checks()
 
 	struct proxy *px;
 	struct server *s;
+	char *errmsg = NULL;
 	int nbcheck=0, mininter=0, srvpos=0;
 
 	/* 0- init the dummy frontend used to create all checks sessions */
-	init_new_proxy(&checks_fe);
-	checks_fe.id = strdup("CHECKS-FE");
-	if (!checks_fe.id) {
-		ha_alert("Out of memory creating the checks frontend.\n");
+	if (!setup_new_proxy(&checks_fe, "CHECKS-FE", PR_CAP_FE | PR_CAP_BE | PR_CAP_INT, &errmsg)) {
+		ha_alert("error during checks frontend creation: %s\n", errmsg);
+		ha_free(&errmsg);
 		return ERR_ALERT | ERR_FATAL;
 	}
-	checks_fe.cap = PR_CAP_FE | PR_CAP_BE;
         checks_fe.mode = PR_MODE_TCP;
 	checks_fe.maxconn = 0;
 	checks_fe.conn_retries = CONN_RETRIES;
@@ -1747,6 +1746,12 @@ static int start_checks()
 	return ERR_NONE;
 }
 
+/* called during deinit */
+static void clear_checks()
+{
+	if (checks_fe.id)
+		deinit_proxy(&checks_fe);
+}
 
 /*
  * Return value:
@@ -1999,6 +2004,7 @@ REGISTER_POST_CHECK(start_checks);
 
 REGISTER_SERVER_DEINIT(deinit_srv_check);
 REGISTER_SERVER_DEINIT(deinit_srv_agent_check);
+REGISTER_POST_DEINIT(clear_checks);
 
 /* perform minimal initializations */
 static void init_checks()

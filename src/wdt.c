@@ -20,6 +20,7 @@
 #include <haproxy/errors.h>
 #include <haproxy/global.h>
 #include <haproxy/signal-t.h>
+#include <haproxy/task.h>
 #include <haproxy/thread.h>
 #include <haproxy/tools.h>
 
@@ -40,7 +41,6 @@
  */
 static struct {
 	timer_t timer;
-	uint prev_ctxsw;
 } per_thread_wd_ctx[MAX_THREADS];
 
 /* warn about stuck tasks after this delay (ns) */
@@ -98,15 +98,13 @@ void wdt_handler(int sig, siginfo_t *si, void *arg)
 		if (!p)
 			goto update_and_leave;
 
-		if ((_HA_ATOMIC_LOAD(&ha_thread_ctx[thr].flags) & (TH_FL_SLEEPING|TH_FL_DUMPING_OTHERS)) ||
+		if ((_HA_ATOMIC_LOAD(&ha_thread_ctx[thr].flags) & TH_FL_SLEEPING) ||
 		    (_HA_ATOMIC_LOAD(&ha_tgroup_ctx[tgrp-1].threads_harmless) & thr_bit)) {
 			/* This thread is currently doing exactly nothing
 			 * waiting in the poll loop (unlikely but possible),
 			 * waiting for all other threads to join the rendez-vous
 			 * point (common), or waiting for another thread to
-			 * finish an isolated operation (unlikely but possible),
-			 * or waiting for another thread to finish dumping its
-			 * stack.
+			 * finish an isolated operation (unlikely but possible).
 			 */
 			goto update_and_leave;
 		}
@@ -123,27 +121,23 @@ void wdt_handler(int sig, siginfo_t *si, void *arg)
 		 * at least emit a warning.
 		 */
 		if (!(_HA_ATOMIC_LOAD(&ha_thread_ctx[thr].flags) & TH_FL_STUCK)) {
-			uint prev_ctxsw;
-
-			prev_ctxsw = HA_ATOMIC_LOAD(&per_thread_wd_ctx[thr].prev_ctxsw);
-
-			/* only after one second it's clear we're stuck */
+			/* after one second it's clear that we're stuck */
 			if (n - p >= 1000000000ULL)
 				_HA_ATOMIC_OR(&ha_thread_ctx[thr].flags, TH_FL_STUCK);
-
-			/* have we crossed the warning boundary ? If so we note were we
-			 * where, and second time called from the same place will trigger
-			 * a warning (unless already stuck).
-			 */
-			if (n - p >= (ullong)wdt_warn_blocked_traffic_ns) {
-				uint curr_ctxsw = HA_ATOMIC_LOAD(&activity[thr].ctxsw);
-
-				if (curr_ctxsw == prev_ctxsw)
-					ha_stuck_warning(thr);
-				HA_ATOMIC_STORE(&per_thread_wd_ctx[thr].prev_ctxsw, curr_ctxsw);
+			else if (n - p < (ullong)wdt_warn_blocked_traffic_ns) {
+				/* if we haven't crossed the warning boundary,
+				 * let's just refresh the reporting thread's timer.
+				 */
+				goto update_and_leave;
 			}
 
-			goto update_and_leave;
+			/* OK so we've crossed the warning boundary and possibly the
+			 * panic one as well. This may only be reported by the original
+			 * thread. Let's fall back to the common code below which will
+			 * possibly bounce to the reporting thread, which will then
+			 * check the ctxsw count and decide whether to do nothing, to
+			 * warn, or either panic.
+			 */
 		}
 
 		/* No doubt now, there's no hop to recover, die loudly! */
@@ -170,24 +164,34 @@ void wdt_handler(int sig, siginfo_t *si, void *arg)
 		return;
 	}
 
-	/* By default we terminate. If we're not on the victim thread, better
-	 * bounce the signal there so that we produce a cleaner stack trace
-	 * with the other thread interrupted exactly where it was running and
-	 * the current one not involved in this.
+	/* Right here, we either got a bounce from another thread's WDT to
+	 * report a crossed period, or we noticed it for the current thread.
+	 * For other threads, we're bouncing.
 	 */
 #ifdef USE_THREAD
-	if (thr != tid)
+	if (thr != tid) {
 		ha_tkill(thr, sig);
-	else
+		goto leave;
+	}
 #endif
+
+	/* Now the interesting things begin. The timer was at least as large
+	 * as the warning threshold. If the stuck bit was set, we must now
+	 * panic. Otherwise we're checking if we're still context-switching
+	 * or not and we'll either warn if not, or just update the ctxsw
+	 * counter to check next time.
+	 */
+	if (_HA_ATOMIC_LOAD(&th_ctx->flags) & TH_FL_STUCK)
 		ha_panic();
 
-	_HA_ATOMIC_AND(&th_ctx->flags, ~TH_FL_IN_WDT_HANDLER);
-	return;
+	if (!is_sched_alive())
+		ha_stuck_warning();
+
+	/* let's go on */
 
  update_and_leave:
 	wdt_ping(thr);
-
+ leave:
 	_HA_ATOMIC_AND(&th_ctx->flags, ~TH_FL_IN_WDT_HANDLER);
 }
 
@@ -263,6 +267,13 @@ int init_wdt()
 	sa.sa_handler = NULL;
 	sa.sa_sigaction = wdt_handler;
 	sigemptyset(&sa.sa_mask);
+	sigaddset(&sa.sa_mask, WDTSIG);
+#ifdef DEBUGSIG
+	sigaddset(&sa.sa_mask, DEBUGSIG);
+#endif
+#if defined(DEBUG_DEV)
+	sigaddset(&sa.sa_mask, SIGRTMAX);
+#endif
 	sa.sa_flags = SA_SIGINFO;
 	sigaction(WDTSIG, &sa, NULL);
 	return ERR_NONE;

@@ -35,6 +35,7 @@ extern void *__elf_aux_vector;
 #include <ctype.h>
 #include <errno.h>
 #include <netdb.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -2967,9 +2968,9 @@ bad_input:
 }
 
 /* copies at most <n> characters from <src> and always terminates with '\0' */
-char *my_strndup(const char *src, int n)
+char *my_strndup(const char *src, size_t n)
 {
-	int len = 0;
+	size_t len = 0;
 	char *ret;
 
 	while (len < n && src[len])
@@ -5184,13 +5185,23 @@ void dump_hex(struct buffer *out, const char *pfx, const void *buf, int len, int
  *    "0x7f10b6557690 [48 c7 c0 0f 00 00 00 0f]"
  * It relies on may_access() to know if the bytes are dumpable, otherwise "--"
  * is emitted. A NULL <pfx> will be considered empty.
+ * if <n> is negative, then the bytes before the address are dumped instead, so
+ * that the address ends after the last byte. This can be handy for call traces
+ * where the code that follows hasn't been executed but the code that precedes
+ * usually contains a call instruction. In this case, the opening bracket uses
+ * a '<' instead of '[' to indicate that the address is at the ']'.
  */
 void dump_addr_and_bytes(struct buffer *buf, const char *pfx, const void *addr, int n)
 {
 	int ok = 0;
 	int i;
 
-	chunk_appendf(buf, "%s%#14lx [", pfx ? pfx : "", (long)addr);
+	chunk_appendf(buf, "%s%#14lx %c", pfx ? pfx : "", (long)addr, (n < 0) ? '<' : '[');
+
+	if (n < 0) {
+		addr += n;
+		n = -n;
+	}
 
 	for (i = 0; i < n; i++) {
 		if (i == 0 || (((long)(addr + i) ^ (long)(addr)) & 4096))
@@ -5552,6 +5563,7 @@ const void *resolve_sym_name(struct buffer *buf, const char *pfx, const void *ad
 	static Dl_info dli_main;
 	static int dli_main_done; // 0 = not resolved, 1 = resolve in progress, 2 = done
 	__decl_thread_var(static HA_SPINLOCK_T dladdr_lock);
+	sigset_t new_mask, old_mask;
 	int isolated;
 	Dl_info dli;
 	size_t size = 0;
@@ -5600,12 +5612,30 @@ const void *resolve_sym_name(struct buffer *buf, const char *pfx, const void *ad
 	    HA_SPIN_TRYLOCK(OTHER_LOCK, &dladdr_lock) != 0)
 		goto use_array;
 
-	i = dladdr_and_size(addr, &dli, &size);
-	if (!isolated)
-		HA_SPIN_UNLOCK(OTHER_LOCK, &dladdr_lock);
+	/* make sure we don't re-enter from wdt nor debug coming from other
+	 * threads as dladdr() is not re-entrant. We'll block these sensitive
+	 * signals while possibly dumping a backtrace.
+	 */
+	sigemptyset(&new_mask);
+#ifdef WDTSIG
+	sigaddset(&new_mask, WDTSIG);
+#endif
+#ifdef DEBUGSIG
+	sigaddset(&new_mask, DEBUGSIG);
+#endif
+	ha_sigmask(SIG_BLOCK, &new_mask, &old_mask);
 
-	if (!i)
+	/* now resolve the symbol */
+	i = dladdr_and_size(addr, &dli, &size);
+
+	if (!i) {
+		/* unblock temporarily blocked signals */
+		ha_sigmask(SIG_SETMASK, &old_mask, NULL);
+
+		if (!isolated)
+			HA_SPIN_UNLOCK(OTHER_LOCK, &dladdr_lock);
 		goto use_array;
+	}
 
 	/* 1. prefix the library name if it's not the same object as the one
 	 * that contains the main function. The name is picked between last '/'
@@ -5626,6 +5656,12 @@ const void *resolve_sym_name(struct buffer *buf, const char *pfx, const void *ad
 		}
 		ha_thread_relax();
 	}
+
+	/* unblock temporarily blocked signals */
+	ha_sigmask(SIG_SETMASK, &old_mask, NULL);
+
+	if (!isolated)
+		HA_SPIN_UNLOCK(OTHER_LOCK, &dladdr_lock);
 
 	if (dli_main.dli_fbase != dli.dli_fbase) {
 		fname = dli.dli_fname;
@@ -7120,7 +7156,7 @@ int restore_env(void)
 	char *value;
 
 	BUG_ON(!init_env, "Triggered in restore_env(): must be preceded by "
-	       "backup_env(), which allocates init_env.\n");
+	       "backup_env(), which allocates init_env.");
 
 	while (*env) {
 		pos = strchr(*env, '=');

@@ -161,6 +161,8 @@ static __attribute__((noinline,noreturn,unused)) void abort_with_line(uint line)
  * COUNT_IF() invocation requires a special section ("dbg_cnt") hence a modern
  * linker.
  */
+extern unsigned int debug_enable_counters;
+
 #if !defined(USE_OBSOLETE_LINKER)
 
 /* type of checks that can be verified. We cannot really distinguish between
@@ -222,30 +224,44 @@ extern __attribute__((__weak__)) struct debug_count __stop_dbg_cnt  HA_SECTION_S
 		_HA_ATOMIC_INC(&__dbg_cnt_##_line.count);			\
 	} while (0)
 
-/* Core of the COUNT_IF() macro, checks the condition and counts one hit if
- * true.
- */
-#define _COUNT_IF(cond, file, line, ...)					\
-	(unlikely(cond) ? ({							\
-		__DBG_COUNT(cond, file, line, DBG_COUNT_IF, __VA_ARGS__);	\
-		1; /* let's return the true condition */			\
-	}) : 0)
 
-/* DEBUG_GLITCHES enables counting the number of glitches per line of code. The
+/* Matrix for DEBUG_COUNTERS:
+ *    0 : only BUG_ON() and CHECK_IF() are reported (super rare)
+ *    1 : COUNT_GLITCH() are also reported (rare)
+ *        COUNT_IF() are also reported only if debug_enable_counters was set
+ *    2 : COUNT_IF() are also reported unless debug_enable_counters was reset
+ */
+
+/* Core of the COUNT_IF() macro, checks the condition and counts one hit if
+ * true. It's only enabled at DEBUG_COUNTERS >= 1, and enabled by default if
+ * DEBUG_COUNTERS >= 2.
+ */
+# if defined(DEBUG_COUNTERS) && (DEBUG_COUNTERS >= 1)
+#  define _COUNT_IF(cond, file, line, ...)					  \
+	(unlikely(cond) ? ({							  \
+		if (debug_enable_counters)					  \
+			__DBG_COUNT(cond, file, line, DBG_COUNT_IF, __VA_ARGS__); \
+		1; /* let's return the true condition */			  \
+	}) : 0)
+# else
+#  define _COUNT_IF(cond, file, line, ...) DISGUISE(unlikely(cond) ? 1 : 0)
+# endif
+
+/* DEBUG_COUNTERS enables counting the number of glitches per line of code. The
  * condition is empty (nothing to write there), except maybe __VA_ARGS at the
  * end.
  */
-# if !defined(DEBUG_GLITCHES)
+# if !defined(DEBUG_COUNTERS) || (DEBUG_COUNTERS == 0)
 #  define _COUNT_GLITCH(file, line, ...) do { } while (0)
 # else
 #  define _COUNT_GLITCH(file, line, ...) do {						\
 		__DBG_COUNT(, file, line, DBG_GLITCH, __VA_ARGS__); 	\
 	} while (0)
-#  endif
+# endif
 
 #else /* USE_OBSOLETE_LINKER not defined below  */
 # define __DBG_COUNT(cond, file, line, type, ...) do { } while (0)
-# define _COUNT_IF(cond, file, line, ...) DISGUISE(cond)
+# define _COUNT_IF(cond, file, line, ...) DISGUISE(unlikely(cond) ? 1 : 0)
 # define _COUNT_GLITCH(file, line, ...) do { } while (0)
 #endif
 

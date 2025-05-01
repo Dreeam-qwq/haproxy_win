@@ -326,6 +326,7 @@ static const struct logformat_alias logformat_aliases[] = {
 };
 
 char httpclient_log_format[] = "%ci:%cp [%tr] %ft -/- %TR/%Tw/%Tc/%Tr/%Ta %ST %B %CC %CS %tsc %ac/%fc/%bc/%sc/%rc %sq/%bq %hr %hs %{+Q}r";
+char httpsclient_log_format[] = "%ci:%cp [%tr] %ft -/- %TR/%Tw/%Tc/%Tr/%Ta %ST %B %CC %CS %tsc %ac/%fc/%bc/%sc/%rc %sq/%bq %hr %hs %{+Q}r %[bc_err]/%[ssl_bc_err,hex]/-/-/%[ssl_bc_is_resumed] -/-/-";
 char default_http_log_format[] = "%ci:%cp [%tr] %ft %b/%s %TR/%Tw/%Tc/%Tr/%Ta %ST %B %CC %CS %tsc %ac/%fc/%bc/%sc/%rc %sq/%bq %hr %hs %{+Q}r"; // default format
 char default_https_log_format[] = "%ci:%cp [%tr] %ft %b/%s %TR/%Tw/%Tc/%Tr/%Ta %ST %B %CC %CS %tsc %ac/%fc/%bc/%sc/%rc %sq/%bq %hr %hs %{+Q}r %[fc_err]/%[ssl_fc_err,hex]/%[ssl_c_err]/%[ssl_c_ca_err]/%[ssl_fc_is_resumed] %[ssl_fc_sni]/%sslv/%sslc";
 char clf_http_log_format[] = "%{+Q}o %{-Q}ci - - [%trg] %r %ST %B \"\" \"\" %cp %ms %ft %b %s %TR %Tw %Tc %Tr %Ta %tsc %ac %fc %bc %sc %rc %sq %bq %CC %CS %hrl %hsl";
@@ -344,6 +345,7 @@ char default_rfc5424_sd_log_format[] = "- ";
 static inline int logformat_str_isdefault(const char *str)
 {
 	return str == httpclient_log_format ||
+	       str == httpsclient_log_format ||
 	       str == default_http_log_format ||
 	       str == default_https_log_format ||
 	       str == clf_http_log_format ||
@@ -6060,25 +6062,22 @@ int cfg_parse_log_forward(const char *file, int linenum, char **args, int kwm)
 			err_code |= ERR_WARN;
 		}
 
-		px = calloc(1, sizeof *px);
+		px = alloc_new_proxy(args[1], PR_CAP_FE, &errmsg);
 		if (!px) {
+			ha_alert("Parsing [%s:%d]: %s\n", file, linenum, errmsg);
 			err_code |= ERR_ALERT | ERR_FATAL;
 			goto out;
 		}
 
-		init_new_proxy(px);
 		px->next = cfg_log_forward;
 		cfg_log_forward = px;
 		px->conf.file = copy_file_name(file);
 		px->conf.line = linenum;
 		px->mode = PR_MODE_SYSLOG;
-		px->fe_counters.last_change = ns_to_sec(now_ns);
-		px->cap = PR_CAP_FE;
 		px->maxconn = 10;
 		px->timeout.client = TICK_ETERNITY;
 		px->accept = frontend_accept;
 		px->default_target = &syslog_applet.obj_type;
-		px->id = strdup(args[1]);
 		px->options3 |= PR_O3_LOGF_HOST_FILL;
 	}
 	else if (strcmp(args[0], "maxconn") == 0) {  /* maxconn */

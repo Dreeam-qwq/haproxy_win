@@ -1231,6 +1231,15 @@ int alloc_bind_address(struct sockaddr_storage **ss,
 			return SRV_STATUS_INTERNAL;
 
 		**ss = *addr;
+		if ((src->opts & CO_SRC_TPROXY_MASK) == CO_SRC_TPROXY_CIP) {
+			/* always set port to zero when using "clientip", or
+			 * the idle connection hash will include the port part.
+			 */
+			if (addr->ss_family == AF_INET)
+				((struct sockaddr_in *)*ss)->sin_port = 0;
+			else if (addr->ss_family == AF_INET6)
+				((struct sockaddr_in6 *)*ss)->sin6_port = 0;
+		}
 		break;
 
 	case CO_SRC_TPROXY_DYN:
@@ -2208,8 +2217,11 @@ int connect_server(struct stream *s)
 
 	/* catch all sync connect while the mux is not already installed */
 	if (!srv_conn->mux && !(srv_conn->flags & CO_FL_WAIT_XPRT)) {
-		if (conn_create_mux(srv_conn) < 0) {
-			conn_full_close(srv_conn);
+		int closed_connection;
+
+		if (conn_create_mux(srv_conn, &closed_connection) < 0) {
+			if (closed_connection == 0)
+				conn_full_close(srv_conn);
 			return SF_ERR_INTERNAL;
 		}
 	}

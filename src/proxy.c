@@ -87,6 +87,8 @@ const struct cfg_opt cfg_opts[] =
 	{ "contstats",    PR_O_CONTSTATS,  PR_CAP_FE, 0, 0 },
 	{ "dontlognull",  PR_O_NULLNOLOG,  PR_CAP_FE, 0, 0 },
 	{ "http-buffer-request", PR_O_WREQ_BODY,  PR_CAP_FE | PR_CAP_BE, 0, PR_MODE_HTTP },
+	{ "http-drop-request-trailers", PR_O_HTTP_DROP_REQ_TRLS, PR_CAP_BE, 0, PR_MODE_HTTP },
+	{ "http-drop-response-trailers", PR_O_HTTP_DROP_RES_TRLS, PR_CAP_FE, 0, PR_MODE_HTTP },
 	{ "http-ignore-probes", PR_O_IGNORE_PRB, PR_CAP_FE, 0, PR_MODE_HTTP },
 	{ "idle-close-on-response", PR_O_IDLE_CLOSE_RESP, PR_CAP_FE, 0, PR_MODE_HTTP },
 	{ "prefer-last-server", PR_O_PREF_LAST,  PR_CAP_BE, 0, PR_MODE_HTTP },
@@ -213,6 +215,8 @@ static inline void proxy_free_common(struct proxy *px)
 	struct lf_expr *lf, *lfb;
 	struct eb32_node *node;
 
+	/* note that the node's key points to p->id */
+	ebpt_delete(&px->conf.by_name);
 	ha_free(&px->id);
 	drop_file_name(&px->conf.file);
 	ha_free(&px->check_command);
@@ -284,7 +288,10 @@ static inline void proxy_free_common(struct proxy *px)
 	px->uri_auth = NULL;
 }
 
-void free_proxy(struct proxy *p)
+/* deinit all <p> proxy members, but doesn't touch to the parent pointer
+ * itself
+ */
+void deinit_proxy(struct proxy *p)
 {
 	struct server *s;
 	struct cap_hdr *h,*h_next;
@@ -424,6 +431,12 @@ void free_proxy(struct proxy *p)
 	HA_RWLOCK_DESTROY(&p->lock);
 
 	proxy_unref_defaults(p);
+}
+
+/* deinit and free <p> proxy */
+void free_proxy(struct proxy *p)
+{
+	deinit_proxy(p);
 	ha_free(&p);
 }
 
@@ -1674,12 +1687,47 @@ void proxy_unref_defaults(struct proxy *px)
 	px->defpx = NULL;
 }
 
+/* prepares a new proxy <name> of type <cap> from the provided <px>
+ * pointer.
+ * <px> is assumed to be freshly allocated
+ * <name> may be NULL: proxy id assigment will be skipped.
+ *
+ * Returns a 1 on success or 0 on failure (in which case errmsg must be checked
+ * then freed).
+ */
+int setup_new_proxy(struct proxy *px, const char *name, unsigned int cap, char **errmsg)
+{
+	uint last_change;
+
+	init_new_proxy(px);
+
+	last_change = ns_to_sec(now_ns);
+	if (cap & PR_CAP_FE)
+		px->fe_counters.last_change = last_change;
+	if (cap & PR_CAP_BE)
+		px->be_counters.last_change = last_change;
+
+	if (name) {
+		px->id = strdup(name);
+		if (!px->id) {
+			memprintf(errmsg, "proxy '%s': out of memory", name);
+			return 0;
+		}
+	}
+
+	px->cap = cap;
+
+	if (name && !(cap & PR_CAP_INT))
+		proxy_store_name(px);
+
+	return 1;
+}
+
 /* Allocates a new proxy <name> of type <cap>.
  * Returns the proxy instance on success. On error, NULL is returned.
  */
 struct proxy *alloc_new_proxy(const char *name, unsigned int cap, char **errmsg)
 {
-	uint last_change;
 	struct proxy *curproxy;
 
 	if ((curproxy = calloc(1, sizeof(*curproxy))) == NULL) {
@@ -1687,19 +1735,8 @@ struct proxy *alloc_new_proxy(const char *name, unsigned int cap, char **errmsg)
 		goto fail;
 	}
 
-	init_new_proxy(curproxy);
-
-	last_change = ns_to_sec(now_ns);
-	if (cap & PR_CAP_FE)
-		curproxy->fe_counters.last_change = last_change;
-	if (cap & PR_CAP_BE)
-		curproxy->be_counters.last_change = last_change;
-
-	curproxy->id = strdup(name);
-	curproxy->cap = cap;
-
-	if (!(cap & PR_CAP_INT))
-		proxy_store_name(curproxy);
+	if (!setup_new_proxy(curproxy, name, cap, errmsg))
+		goto fail;
 
  done:
 	return curproxy;
@@ -2888,7 +2925,7 @@ static int dump_servers_state(struct appctx *appctx)
 			             "\n",
 			             px->uuid, HA_ANON_CLI(px->id),
 			             srv->puid, HA_ANON_CLI(srv->id),
-				     hash_ipanon(appctx->cli_anon_key, srv_addr, 0),
+				     hash_ipanon(appctx->cli_ctx.anon_key, srv_addr, 0),
 			             srv->cur_state, srv->cur_admin, srv->uweight, srv->iweight,
 				     (long int)srv_time_since_last_change,
 			             srv->check.status, srv->check.result, srv->check.health,
@@ -2904,7 +2941,7 @@ static int dump_servers_state(struct appctx *appctx)
 			chunk_printf(&trash,
 			             "%s/%s %d/%d %s %u - %u %u %u %u %u %u %d %u",
 			             HA_ANON_CLI(px->id), HA_ANON_CLI(srv->id),
-			             px->uuid, srv->puid, hash_ipanon(appctx->cli_anon_key, srv_addr, 0),
+			             px->uuid, srv->puid, hash_ipanon(appctx->cli_ctx.anon_key, srv_addr, 0),
 			             srv->svc_port, srv->pool_purge_delay,
 			             srv->curr_used_conns, srv->max_used_conns, srv->est_need_conns,
 			             srv->curr_idle_nb, srv->curr_safe_nb, (int)srv->max_idle_conns, srv->curr_idle_conns);
