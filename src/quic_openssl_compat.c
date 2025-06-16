@@ -58,7 +58,7 @@ static int qc_ssl_compat_add_tps_cb(SSL *ssl, unsigned int ext_type, unsigned in
 int quic_tls_compat_init(struct bind_conf *bind_conf, SSL_CTX *ctx)
 {
 	/* Ignore non-QUIC connections */
-	if (bind_conf->xprt != xprt_get(XPRT_QUIC))
+	if (bind_conf && bind_conf->xprt != xprt_get(XPRT_QUIC))
 		return 1;
 
 	/* This callback is already registered if the TLS keylog is activated for
@@ -150,22 +150,22 @@ void quic_tls_compat_keylog_callback(const SSL *ssl, const char *line)
 	if (sizeof(QUIC_OPENSSL_COMPAT_CLIENT_HANDSHAKE) - 1 == n &&
 	    !strncmp(start, QUIC_OPENSSL_COMPAT_CLIENT_HANDSHAKE, n)) {
 		level = ssl_encryption_handshake;
-		write = 0;
+		write = qc_is_listener(qc) ? 0 : 1;
 	}
 	else if (sizeof(QUIC_OPENSSL_COMPAT_SERVER_HANDSHAKE) - 1 == n &&
 	         !strncmp(start, QUIC_OPENSSL_COMPAT_SERVER_HANDSHAKE, n)) {
 		level = ssl_encryption_handshake;
-		write = 1;
+		write = qc_is_listener(qc) ? 1 : 0;
 	}
 	else if (sizeof(QUIC_OPENSSL_COMPAT_CLIENT_APPLICATION) - 1 == n &&
 	         !strncmp(start, QUIC_OPENSSL_COMPAT_CLIENT_APPLICATION, n)) {
 		level = ssl_encryption_application;
-		write = 0;
+		write = qc_is_listener(qc) ? 0 : 1;
 	}
 	else if (sizeof(QUIC_OPENSSL_COMPAT_SERVER_APPLICATION) - 1 == n &&
 	         !strncmp(start, QUIC_OPENSSL_COMPAT_SERVER_APPLICATION, n)) {
 		level = ssl_encryption_application;
-		write = 1;
+		write = qc_is_listener(qc) ? 1 : 0;
 	}
 	else
 		goto leave;

@@ -17,6 +17,7 @@
 #include <haproxy/quic_frame-t.h>
 #include <haproxy/quic_pacing-t.h>
 #include <haproxy/quic_stream-t.h>
+#include <haproxy/quic_utils-t.h>
 #include <haproxy/stconn-t.h>
 #include <haproxy/task-t.h>
 #include <haproxy/time-t.h>
@@ -27,9 +28,6 @@ enum qcs_type {
 	QCS_SRV_BIDI,
 	QCS_CLT_UNI,
 	QCS_SRV_UNI,
-
-	/* Must be the last one */
-	QCS_MAX_TYPES
 };
 
 enum qcc_app_st {
@@ -157,6 +155,7 @@ struct qcs {
 		struct buffer app_buf; /* receive buffer used by stconn layer */
 		uint64_t msd; /* current max-stream-data limit to enforce */
 		uint64_t msd_base; /* max-stream-data previous to latest update */
+		struct bdata_ctr data; /* data utilization counter. Note that <tot> is now used for now as accounting may be difficult with ncbuf. */
 	} rx;
 	struct {
 		struct quic_fctl fc; /* stream flow control applied on sending */
@@ -203,7 +202,7 @@ struct qcc_app_ops {
 	/* Initialize <qcs> stream app context or leave it to NULL if rejected. */
 	int (*attach)(struct qcs *qcs, void *conn_ctx);
 
-	/* Convert received HTTP payload to HTX. */
+	/* Convert received HTTP payload to HTX. Returns amount of decoded bytes from <b> or a negative error code. */
 	ssize_t (*rcv_buf)(struct qcs *qcs, struct buffer *b, int fin);
 
 	/* Convert HTX to HTTP payload for sending. */
@@ -233,7 +232,7 @@ struct qcc_app_ops {
 
 #define QC_CF_ERRL      0x00000001 /* fatal error detected locally, connection should be closed soon */
 #define QC_CF_ERRL_DONE 0x00000002 /* local error properly handled, connection can be released */
-/* unused 0x00000004 */
+#define QC_CF_IS_BACK   0x00000004 /* backend side */
 #define QC_CF_CONN_FULL 0x00000008 /* no stream buffers available on connection */
 /* unused 0x00000010 */
 #define QC_CF_ERR_CONN  0x00000020 /* fatal error reported by transport layer */

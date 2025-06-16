@@ -72,6 +72,7 @@ s *     queue's lock.
 #include <import/eb32tree.h>
 #include <haproxy/api.h>
 #include <haproxy/backend.h>
+#include <haproxy/counters.h>
 #include <haproxy/http_rules.h>
 #include <haproxy/pool.h>
 #include <haproxy/queue.h>
@@ -103,6 +104,7 @@ DECLARE_POOL(pool_head_pendconn, "pendconn", sizeof(struct pendconn));
 unsigned int srv_dynamic_maxconn(const struct server *s)
 {
 	unsigned int max;
+	unsigned long last_change;
 
 	if (s->proxy->beconn >= s->proxy->fullconn)
 		/* no fullconn or proxy is full */
@@ -113,11 +115,13 @@ unsigned int srv_dynamic_maxconn(const struct server *s)
 	else max = MAX(s->minconn,
 		       s->proxy->beconn * s->maxconn / s->proxy->fullconn);
 
+	last_change = COUNTERS_SHARED_LAST(s->counters.shared->tg, last_change);
+
 	if ((s->cur_state == SRV_ST_STARTING) &&
-	    ns_to_sec(now_ns) < s->counters.last_change + s->slowstart &&
-	    ns_to_sec(now_ns) >= s->counters.last_change) {
+	    ns_to_sec(now_ns) < last_change + s->slowstart &&
+	    ns_to_sec(now_ns) >= last_change) {
 		unsigned int ratio;
-		ratio = 100 * (ns_to_sec(now_ns) - s->counters.last_change) / s->slowstart;
+		ratio = 100 * (ns_to_sec(now_ns) - last_change) / s->slowstart;
 		max = MAX(1, max * ratio / 100);
 	}
 	return max;
@@ -197,10 +201,14 @@ void pendconn_unlink(struct pendconn *p)
 
 	if (done) {
 		oldidx -= p->queue_idx;
-		if (sv)
+		if (sv) {
 			p->strm->logs.srv_queue_pos += oldidx;
-		else
+			_HA_ATOMIC_DEC(&sv->queueslength);
+		}
+		else {
 			p->strm->logs.prx_queue_pos += oldidx;
+			_HA_ATOMIC_DEC(&px->queueslength);
+		}
 
 		_HA_ATOMIC_DEC(&q->length);
 		_HA_ATOMIC_DEC(&px->totpend);
@@ -513,12 +521,15 @@ int process_srv_queue(struct server *s)
 		 * just in case try to run one more stream.
 		 */
 		for (i = 0; i < global.nbtgroups; i++) {
+			HA_SPIN_LOCK(QUEUE_LOCK, &s->per_tgrp[i].queue.lock);
 			if (pendconn_process_next_strm(s, p, px_ok, i + 1)) {
+				HA_SPIN_UNLOCK(QUEUE_LOCK, &s->per_tgrp[i].queue.lock);
 				_HA_ATOMIC_SUB(&p->totpend, 1);
 				_HA_ATOMIC_ADD(&p->served, 1);
 				done++;
 				break;
 			}
+			HA_SPIN_UNLOCK(QUEUE_LOCK, &s->per_tgrp[i].queue.lock);
 		}
 	}
 	return done;

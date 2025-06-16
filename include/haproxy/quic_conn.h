@@ -69,7 +69,8 @@ struct quic_conn *qc_new_conn(const struct quic_version *qv, int ipv4,
                               struct quic_connection_id *conn_id,
                               struct sockaddr_storage *local_addr,
                               struct sockaddr_storage *peer_addr,
-                              int server, int token, void *owner);
+                              int token, void *owner,
+                              struct connection *conn);
 int quic_build_post_handshake_frames(struct quic_conn *qc);
 const struct quic_version *qc_supported_version(uint32_t version);
 int quic_peer_validated_addr(struct quic_conn *qc);
@@ -163,6 +164,22 @@ static inline void quic_free_ncbuf(struct ncbuf *ncbuf)
 	*ncbuf = NCBUF_NULL;
 }
 
+/* Return the address of the QUIC counters attached to the proxy of
+ * the owner of the connection whose object type address is <o> for
+ * listener and servers, or NULL for others object type.
+ */
+static inline void *qc_counters(enum obj_type *o, const struct stats_module *m)
+{
+	struct proxy *p;
+	struct listener *l = objt_listener(o);
+	struct server *s = objt_server(o);
+
+	p = l ? l->bind_conf->frontend :
+		s ? s->proxy : NULL;
+
+	return p ? EXTRA_COUNTERS_GET(p->extra_counters_fe, m) : NULL;
+}
+
 void chunk_frm_appendf(struct buffer *buf, const struct quic_frame *frm);
 void quic_set_connection_close(struct quic_conn *qc, const struct quic_err err);
 void quic_set_tls_alert(struct quic_conn *qc, int alert);
@@ -174,7 +191,7 @@ int qc_notify_send(struct quic_conn *qc);
 
 void qc_check_close_on_released_mux(struct quic_conn *qc);
 
-void quic_conn_release(struct quic_conn *qc);
+int quic_conn_release(struct quic_conn *qc);
 
 void qc_kill_conn(struct quic_conn *qc);
 

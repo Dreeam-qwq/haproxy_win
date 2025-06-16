@@ -62,7 +62,7 @@
 #include <haproxy/quic_trace.h>
 #include <haproxy/quic_tune.h>
 #include <haproxy/quic_tx.h>
-#include <haproxy/cbuf.h>
+#include <haproxy/quic_utils.h>
 #include <haproxy/proto_quic.h>
 #include <haproxy/quic_tls.h>
 #include <haproxy/ssl_sock.h>
@@ -118,6 +118,10 @@ const struct quic_version quic_versions[] = {
 		.retry_tag_nonce  = (const unsigned char *)QUIC_TLS_RETRY_NONCE_V2,
 	},
 };
+
+const struct quic_version *quic_version_draft_29 = &quic_versions[0];
+const struct quic_version *quic_version_1 = &quic_versions[1];
+const struct quic_version *quic_version_2 = &quic_versions[2];
 
 /* Function pointers, can be used to compute a hash from first generated CID and to derive new CIDs */
 uint64_t (*quic_hash64_from_cid)(const unsigned char *cid, int size, const unsigned char *secret, size_t secretlen) = NULL;
@@ -625,8 +629,8 @@ struct task *quic_conn_app_io_cb(struct task *t, void *context, unsigned int sta
 
  out:
 	if ((qc->flags & QUIC_FL_CONN_CLOSING) && qc->mux_state != QC_MUX_READY) {
-		quic_conn_release(qc);
-		t = NULL;
+		if (quic_conn_release(qc))
+			t = NULL;
 		qc = NULL;
 	}
 
@@ -745,7 +749,7 @@ static struct quic_conn_closed *qc_new_cc_conn(struct quic_conn *qc)
 	cc_qc->dcid = qc->dcid;
 	cc_qc->scid = qc->scid;
 
-	cc_qc->li = qc->li;
+	cc_qc->target = qc->target;
 	cc_qc->cids = qc->cids;
 
 	cc_qc->idle_timer_task = qc->idle_timer_task;
@@ -771,6 +775,7 @@ struct task *quic_conn_io_cb(struct task *t, void *context, unsigned int state)
 	struct list send_list = LIST_HEAD_INIT(send_list);
 	struct quic_enc_level *qel;
 	int st;
+	int discard_hpktns = 0;
 	struct tasklet *tl = (struct tasklet *)t;
 
 	TRACE_ENTER(QUIC_EV_CONN_IO_CB, qc);
@@ -818,16 +823,30 @@ struct task *quic_conn_io_cb(struct task *t, void *context, unsigned int state)
 		goto out;
 
 	st = qc->state;
-	if (st >= QUIC_HS_ST_COMPLETE) {
-		if (!(qc->flags & QUIC_FL_CONN_HPKTNS_DCD)) {
-			/* Discard the Handshake packet number space. */
-			TRACE_PROTO("discarding Handshake pktns", QUIC_EV_CONN_PHPKTS, qc);
-			quic_pktns_discard(qc->hel->pktns, qc);
-			qc_set_timer(qc);
-			qc_el_rx_pkts_del(qc->hel);
-			qc_release_pktns_frms(qc, qc->hel->pktns);
-		}
 
+	if (qc_is_listener(qc)) {
+		if (st >= QUIC_HS_ST_COMPLETE && !quic_tls_pktns_is_dcd(qc, qc->hpktns))
+			discard_hpktns = 1;
+	}
+	else {
+		if (st >= QUIC_HS_ST_CONFIRMED && !quic_tls_pktns_is_dcd(qc, qc->hpktns))
+			discard_hpktns = 1;
+	}
+
+	if (discard_hpktns) {
+		/* Discard the Handshake packet number space. */
+		TRACE_PROTO("discarding Handshake pktns", QUIC_EV_CONN_PHPKTS, qc);
+		quic_pktns_discard(qc->hel->pktns, qc);
+		qc_set_timer(qc);
+		qc_el_rx_pkts_del(qc->hel);
+		qc_release_pktns_frms(qc, qc->hel->pktns);
+		if (!qc_is_listener(qc)) {
+			/* I/O callback switch */
+			qc->wait_event.tasklet->process = quic_conn_app_io_cb;
+		}
+	}
+
+	if (qc_is_listener(qc) && st >= QUIC_HS_ST_COMPLETE) {
 		/* Note: if no token for address validation was received
 		 * for a 0RTT connection, some 0RTT packet could still be
 		 * waiting for HP removal AFTER the successful handshake completion.
@@ -885,6 +904,26 @@ struct task *quic_conn_io_cb(struct task *t, void *context, unsigned int state)
 		goto out;
 	}
 
+	/* RFC 9001. 4.9.1. Discarding Initial Keys
+	 *
+	 * The successful use of Handshake packets indicates that no more Initial
+	 * packets need to be exchanged, as these keys can only be produced after
+	 * receiving all CRYPTO frames from Initial packets. Thus, a client MUST
+	 * discard Initial keys when it first sends a Handshake packet...
+	 */
+
+	if (!qc_is_listener(qc) && !quic_tls_pktns_is_dcd(qc, qc->ipktns) &&
+	    qc->hpktns && qc->hpktns->tx.in_flight > 0) {
+		/* Discard the Initial packet number space. */
+		TRACE_PROTO("discarding Initial pktns", QUIC_EV_CONN_PRSHPKT, qc);
+		quic_pktns_discard(qc->ipktns, qc);
+		qc_set_timer(qc);
+		qc_el_rx_pkts_del(qc->iel);
+		qc_release_pktns_frms(qc, qc->ipktns);
+	}
+
+	qc_txb_release(qc);
+
  out:
 	/* Release the Handshake encryption level and packet number space if
 	 * the Handshake is confirmed and if there is no need to send
@@ -904,7 +943,8 @@ struct task *quic_conn_io_cb(struct task *t, void *context, unsigned int state)
 	}
 
 	if ((qc->flags & QUIC_FL_CONN_CLOSING) && qc->mux_state != QC_MUX_READY) {
-		quic_conn_release(qc);
+		if (quic_conn_release(qc))
+			t = NULL;
 		qc = NULL;
 	}
 
@@ -1007,7 +1047,7 @@ struct task *qc_process_timer(struct task *task, void *ctx, unsigned int state)
 
 /* Allocate a new QUIC connection with <version> as QUIC version. <ipv4>
  * boolean is set to 1 for IPv4 connection, 0 for IPv6. <server> is set to 1
- * for QUIC servers (or haproxy listeners).
+ * for QUIC servers (or haproxy listeners), 0 for QUIC clients.
  * <dcid> is the destination connection ID, <scid> is the source connection ID.
  * This latter <scid> CID as the same value on the wire as the one for <conn_id>
  * which is the first CID of this connection but a different internal
@@ -1020,6 +1060,9 @@ struct task *qc_process_timer(struct task *task, void *ctx, unsigned int state)
  * into the Retry token sent to the client before instantiated this connection.
  * Endpoints addresses are specified via <local_addr> and <peer_addr>.
  * Returns the connection if succeeded, NULL if not.
+ * For QUIC clients, <dcid>, <scid>, <token_odcid>, <conn_id> must be null,
+ * and <token> value must be 0. This is the responsability of the caller to ensure
+ * this is the case.
  */
 struct quic_conn *qc_new_conn(const struct quic_version *qv, int ipv4,
                               struct quic_cid *dcid, struct quic_cid *scid,
@@ -1027,12 +1070,13 @@ struct quic_conn *qc_new_conn(const struct quic_version *qv, int ipv4,
                               struct quic_connection_id *conn_id,
                               struct sockaddr_storage *local_addr,
                               struct sockaddr_storage *peer_addr,
-                              int server, int token, void *owner)
+                              int token, void *target,
+                              struct connection *conn)
 {
-	int i;
 	struct quic_conn *qc = NULL;
-	struct listener *l = server ? owner : NULL;
-	struct proxy *prx = l ? l->bind_conf->frontend : NULL;
+	struct listener *l = objt_listener(target);
+	struct server *srv = objt_server(target);
+	struct proxy *prx = l ? l->bind_conf->frontend : __objt_server(target)->proxy;
 	struct quic_cc_algo *cc_algo = NULL;
 	unsigned int next_actconn = 0, next_sslconn = 0, next_handshake = 0;
 
@@ -1051,7 +1095,7 @@ struct quic_conn *qc_new_conn(const struct quic_version *qv, int ipv4,
 		goto err;
 	}
 
-	if (server) {
+	if (l) {
 		next_handshake = quic_increment_curr_handshake(l);
 		if (!next_handshake) {
 			TRACE_STATE("max handshake reached", QUIC_EV_CONN_INIT);
@@ -1065,6 +1109,14 @@ struct quic_conn *qc_new_conn(const struct quic_version *qv, int ipv4,
 		goto err;
 	}
 
+	qc->cids = pool_alloc(pool_head_quic_cids);
+	if (!qc->cids) {
+		TRACE_ERROR("Could not allocate a new CID tree", QUIC_EV_CONN_INIT, qc);
+		goto err;
+	}
+
+	qc->target = target;
+	*qc->cids = EB_ROOT;
 	/* Now that quic_conn instance is allocated, quic_conn_release() will
 	 * ensure global accounting is decremented.
 	 */
@@ -1082,7 +1134,6 @@ struct quic_conn *qc_new_conn(const struct quic_version *qv, int ipv4,
 	qc->streams_by_id = EB_ROOT_UNIQUE;
 
 	/* Required to call free_quic_conn_cids() from quic_conn_release() */
-	qc->cids = NULL;
 	qc->tx.cc_buf_area = NULL;
 	qc_init_fd(qc);
 
@@ -1096,7 +1147,7 @@ struct quic_conn *qc_new_conn(const struct quic_version *qv, int ipv4,
 	qc->idle_timer_task = NULL;
 
 	qc->xprt_ctx = NULL;
-	qc->conn = NULL;
+	qc->conn = conn;
 	qc->qcc = NULL;
 	qc->app_ops = NULL;
 	qc->path = NULL;
@@ -1108,22 +1159,21 @@ struct quic_conn *qc_new_conn(const struct quic_version *qv, int ipv4,
 	quic_tls_ku_reset(&qc->ku.nxt_rx);
 	quic_tls_ku_reset(&qc->ku.nxt_tx);
 
+#ifdef HAVE_OPENSSL_QUIC
+	qc->prot_level = OSSL_RECORD_PROTECTION_LEVEL_NONE;
+#endif
 	/* Encryption levels */
 	qc->iel = qc->eel = qc->hel = qc->ael = NULL;
 	LIST_INIT(&qc->qel_list);
 	/* Packet number spaces */
 	qc->ipktns = qc->hpktns = qc->apktns = NULL;
 	LIST_INIT(&qc->pktns_list);
-
-	/* Required to safely call quic_conn_prx_cntrs_update() from quic_conn_release(). */
-	qc->prx_counters = NULL;
+	qc->prx_counters = EXTRA_COUNTERS_GET(prx->extra_counters_fe, &quic_stats_module);
 
 	/* QUIC Server (or listener). */
-	if (server) {
+	if (l) {
 		cc_algo = l->bind_conf->quic_cc_algo;
 
-		qc->prx_counters = EXTRA_COUNTERS_GET(prx->extra_counters_fe,
-		                                      &quic_stats_module);
 		qc->flags = QUIC_FL_CONN_LISTENER;
 		/* Mark this connection as having not received any token when 0-RTT is enabled. */
 		if (l->bind_conf->ssl_conf.early_data && !token)
@@ -1134,29 +1184,52 @@ struct quic_conn *qc_new_conn(const struct quic_version *qv, int ipv4,
 		/* Copy the packet SCID to reuse it as DCID for sending */
 		qc->dcid = *scid;
 		qc->tx.buf = BUF_NULL;
-		qc->li = l;
+		conn_id->qc = qc;
 	}
 	/* QUIC Client (outgoing connection to servers) */
 	else {
+		struct quic_connection_id *conn_cid = NULL;
+
+		qc->flags = QUIC_FL_CONN_PEER_VALIDATED_ADDR;
 		qc->state = QUIC_HS_ST_CLIENT_INITIAL;
-		if (dcid->len)
-			memcpy(qc->dcid.data, dcid->data, dcid->len);
-		qc->dcid.len = dcid->len;
-		qc->li = NULL;
+
+		memset(&qc->odcid, 0, sizeof qc->odcid);
+		qc->odcid.len = 0;
+		/* This is the original connection ID from the peer server
+		 * point of view.
+		 */
+		if (RAND_bytes(qc->dcid.data, sizeof(qc->dcid.data)) != 1)
+			goto err;
+
+		qc->dcid.len = sizeof(qc->dcid.data);
+
+		conn_cid = new_quic_cid(qc->cids, qc, NULL, NULL);
+		if (!conn_cid)
+			goto err;
+
+		_quic_cid_insert(conn_cid);
+		dcid = &qc->dcid;
+		conn_id = conn_cid;
+
+		qc->tx.buf = BUF_NULL;
+		qc->next_cid_seq_num = 1;
+		conn->handle.qc = qc;
 	}
 	qc->mux_state = QC_MUX_NULL;
 	qc->err = quic_err_transport(QC_ERR_NO_ERROR);
 
-	/* If connection is instantiated due to an INITIAL packet with an
+	/* Listener only: if connection is instantiated due to an INITIAL packet with an
 	 * already checked token, consider the peer address as validated.
 	 */
-	if (token) {
-		TRACE_STATE("validate peer address due to initial token",
-		            QUIC_EV_CONN_INIT, qc);
-		qc->flags |= QUIC_FL_CONN_PEER_VALIDATED_ADDR;
-	}
-	else {
-		HA_ATOMIC_INC(&qc->prx_counters->half_open_conn);
+	if (l) {
+		if (token_odcid->len) {
+			TRACE_STATE("validate peer address due to initial token",
+						QUIC_EV_CONN_INIT, qc);
+			qc->flags |= QUIC_FL_CONN_PEER_VALIDATED_ADDR;
+		}
+		else {
+			HA_ATOMIC_INC(&qc->prx_counters->half_open_conn);
+		}
 	}
 
 	/* Now proceeds to allocation of qc members. */
@@ -1166,16 +1239,8 @@ struct quic_conn *qc_new_conn(const struct quic_version *qv, int ipv4,
 		goto err;
 	}
 
-	qc->cids = pool_alloc(pool_head_quic_cids);
-	if (!qc->cids) {
-		TRACE_ERROR("Could not allocate a new CID tree", QUIC_EV_CONN_INIT, qc);
-		goto err;
-	}
-	*qc->cids = EB_ROOT;
-
-	conn_id->qc = qc;
-
-	if (HA_ATOMIC_LOAD(&l->rx.quic_mode) == QUIC_SOCK_MODE_CONN &&
+	/* Listener only */
+	if (l && HA_ATOMIC_LOAD(&l->rx.quic_mode) == QUIC_SOCK_MODE_CONN &&
 	    (quic_tune.options & QUIC_TUNE_SOCK_PER_CONN) &&
 	    is_addr(local_addr)) {
 		TRACE_USER("Allocate a socket for QUIC connection", QUIC_EV_CONN_INIT, qc);
@@ -1212,8 +1277,11 @@ struct quic_conn *qc_new_conn(const struct quic_version *qv, int ipv4,
 	qc->bytes.rx = 0;
 	memset(&qc->rx.params, 0, sizeof(qc->rx.params));
 	qc->rx.buf = b_make(qc->rx.buf.area, QUIC_CONN_RX_BUFSZ, 0, 0);
-	for (i = 0; i < QCS_MAX_TYPES; i++)
-		qc->rx.strms[i].nb_streams = 0;
+	qc->rx.stream_max_uni = qc->rx.stream_max_bidi = 0;
+
+	qc->max_udp_payload = l ?
+	  l->bind_conf->quic_params.max_udp_payload_size :
+	  srv->quic_params.max_udp_payload_size;
 
 	qc->nb_pkt_for_cc = 1;
 	qc->nb_pkt_since_cc = 0;
@@ -1226,17 +1294,24 @@ struct quic_conn *qc_new_conn(const struct quic_version *qv, int ipv4,
 	qc->max_ack_delay = 0;
 	/* Only one path at this time (multipath not supported) */
 	qc->path = &qc->paths[0];
-	quic_cc_path_init(qc->path, ipv4, server ? l->bind_conf->max_cwnd : 0,
+	quic_cc_path_init(qc->path, ipv4, l ? l->bind_conf->max_cwnd : 0,
 	                  cc_algo ? cc_algo : default_quic_cc_algo, qc);
 
-	memcpy(&qc->local_addr, local_addr, sizeof(qc->local_addr));
+	if (local_addr)
+		memcpy(&qc->local_addr, local_addr, sizeof(qc->local_addr));
+	else
+		memset(&qc->local_addr, 0, sizeof(qc->local_addr));
 	memcpy(&qc->peer_addr, peer_addr, sizeof qc->peer_addr);
 
-	if (server && !qc_lstnr_params_init(qc, &l->bind_conf->quic_params,
-	                                    conn_id->stateless_reset_token,
-	                                    dcid->data, dcid->len,
-	                                    qc->scid.data, qc->scid.len, token_odcid))
-		goto err;
+	if (l) {
+		qc_lstnr_params_init(qc, &l->bind_conf->quic_params,
+		                     conn_id->stateless_reset_token,
+		                     qc->odcid.data, qc->odcid.len,
+		                     qc->scid.data, qc->scid.len, token_odcid);
+	}
+	else {
+		qc_srv_params_init(qc, &srv->quic_params, qc->scid.data, qc->scid.len);
+	}
 
 	/* Initialize the idle timeout of the connection at the "max_idle_timeout"
 	 * value from local transport parameters.
@@ -1257,12 +1332,12 @@ struct quic_conn *qc_new_conn(const struct quic_version *qv, int ipv4,
 	qc->wait_event.events = 0;
 	qc->subs = NULL;
 
-	if (qc_alloc_ssl_sock_ctx(qc) ||
+	if (qc_alloc_ssl_sock_ctx(qc, conn) ||
 	    !quic_conn_init_timer(qc) ||
 	    !quic_conn_init_idle_timer_task(qc, prx))
 		goto err;
 
-	if (!qc_new_isecs(qc, &qc->iel->tls_ctx, qc->original_version, dcid->data, dcid->len, 1))
+	if (!qc_new_isecs(qc, &qc->iel->tls_ctx, qc->original_version, dcid->data, dcid->len, !!l))
 		goto err;
 
 	/* Counters initialization */
@@ -1276,6 +1351,15 @@ struct quic_conn *qc_new_conn(const struct quic_version *qv, int ipv4,
 	return qc;
 
  err:
+	if (!l && !conn_id) {
+		/* For QUIC clients, <conn_id> is locally used and initialized to <conn_cid>
+		 * value as soon as this latter is attached to the CIDs tree. It must
+		 * be freed only if it has not been attached to this tree. This is
+		 * quic_conn_release() which free this CID when it is attached to the tree.
+		 */
+		pool_free(pool_head_quic_connection_id, conn_id);
+	}
+
 	quic_conn_release(qc);
 
 	/* Decrement global counters. Done only for errors happening before or
@@ -1312,7 +1396,7 @@ int qc_handle_conn_migration(struct quic_conn *qc,
 	 * used during the handshake, unless the endpoint has acted on a
 	 * preferred_address transport parameter from the peer.
 	 */
-	if (qc->li->bind_conf->quic_params.disable_active_migration) {
+	if (__objt_listener(qc->target)->bind_conf->quic_params.disable_active_migration) {
 		TRACE_ERROR("Active migration was disabled, datagram dropped", QUIC_EV_CONN_LPKT, qc);
 		goto err;
 	}
@@ -1392,12 +1476,15 @@ static inline void quic_conn_prx_cntrs_update(struct quic_conn *qc)
  *
  * This function must only be called by the thread responsible of the quic_conn
  * tasklet.
+ *
+ * Returns 1 if the tasklet was released, 0 otherwise
  */
-void quic_conn_release(struct quic_conn *qc)
+int quic_conn_release(struct quic_conn *qc)
 {
 	struct eb64_node *node;
 	struct quic_rx_packet *pkt, *pktback;
 	struct quic_conn_closed *cc_qc;
+	int ret = 0;
 
 	TRACE_ENTER(QUIC_EV_CONN_CLOSE, qc);
 
@@ -1425,6 +1512,7 @@ void quic_conn_release(struct quic_conn *qc)
 		qc->cids = NULL;
 		pool_free(pool_head_quic_cc_buf, qc->tx.cc_buf_area);
 		qc->tx.cc_buf_area = NULL;
+		ret = 1;
 	}
 
 	if (qc_test_fd(qc))
@@ -1438,13 +1526,15 @@ void quic_conn_release(struct quic_conn *qc)
 	 */
 	if (MT_LIST_INLIST(&qc->accept_list)) {
 		MT_LIST_DELETE(&qc->accept_list);
-		BUG_ON(qc->li->rx.quic_curr_accept == 0);
-		HA_ATOMIC_DEC(&qc->li->rx.quic_curr_accept);
+		BUG_ON(__objt_listener(qc->target)->rx.quic_curr_accept == 0);
+		HA_ATOMIC_DEC(&__objt_listener(qc->target)->rx.quic_curr_accept);
 	}
 
 	/* Substract last congestion window from global memory counter. */
-	cshared_add(&quic_mem_diff, -qc->path->cwnd);
-	qc->path->cwnd = 0;
+	if (qc->path) {
+		cshared_add(&quic_mem_diff, -qc->path->cwnd);
+		qc->path->cwnd = 0;
+	}
 
 	/* free remaining stream descriptors */
 	node = eb64_first(&qc->streams_by_id);
@@ -1507,8 +1597,8 @@ void quic_conn_release(struct quic_conn *qc)
 	/* Connection released before handshake completion. */
 	if (unlikely(qc->state < QUIC_HS_ST_COMPLETE)) {
 		if (qc_is_listener(qc)) {
-			BUG_ON(qc->li->rx.quic_curr_handshake == 0);
-			HA_ATOMIC_DEC(&qc->li->rx.quic_curr_handshake);
+			BUG_ON(__objt_listener(qc->target)->rx.quic_curr_handshake == 0);
+			HA_ATOMIC_DEC(&__objt_listener(qc->target)->rx.quic_curr_handshake);
 		}
 	}
 
@@ -1525,6 +1615,7 @@ void quic_conn_release(struct quic_conn *qc)
 	TRACE_PROTO("QUIC conn. freed", QUIC_EV_CONN_FREED, qc);
  leave:
 	TRACE_LEAVE(QUIC_EV_CONN_CLOSE, qc);
+	return ret;
 }
 
 /* Initialize the timer task of <qc> QUIC connection.
@@ -1915,8 +2006,8 @@ void qc_bind_tid_commit(struct quic_conn *qc, struct listener *new_li)
 	/* At this point no connection was accounted for yet on this
 	 * listener so it's OK to just swap the pointer.
 	 */
-	if (new_li && new_li != qc->li)
-		qc->li = new_li;
+	if (new_li && new_li != __objt_listener(qc->target))
+		qc->target = &new_li->obj_type;
 
 	/* Rebind the connection FD. */
 	if (qc_test_fd(qc)) {

@@ -22,6 +22,7 @@
 #include <haproxy/cfgparse.h>
 #include <haproxy/cli-t.h>
 #include <haproxy/connection.h>
+#include <haproxy/counters.h>
 #include <haproxy/errors.h>
 #include <haproxy/fd.h>
 #include <haproxy/freq_ctr.h>
@@ -932,6 +933,11 @@ struct listener *clone_listener(struct listener *src)
 		if (!l->name)
 			goto oom2;
 	}
+	if (l->label) {
+		l->label = strdup(l->label);
+		if (!l->label)
+			goto oom3;
+	}
 
 	l->rx.owner = l;
 	l->rx.shard_info = NULL;
@@ -952,6 +958,8 @@ struct listener *clone_listener(struct listener *src)
 	global.maxsock++;
 	return l;
 
+ oom3:
+	free(l->name);
  oom2:
 	free(l);
  oom1:
@@ -1082,11 +1090,23 @@ void listener_accept(struct listener *l)
 	}
 #endif
 	if (p && p->fe_sps_lim) {
-		int max = freq_ctr_remain(&p->fe_counters.sess_per_sec, p->fe_sps_lim, 0);
+		int max = 0;
+		int it;
+
+		for (it = 0; it < global.nbtgroups; it++)
+			max += freq_ctr_remain(&p->fe_counters.shared->tg[it]->sess_per_sec, p->fe_sps_lim, 0);
 
 		if (unlikely(!max)) {
+			unsigned int min_wait = 0;
+
+			for (it = 0; it < global.nbtgroups; it++) {
+				unsigned int cur_wait = next_event_delay(&p->fe_counters.shared->tg[it]->sess_per_sec, p->fe_sps_lim, 0);
+				if (!it || cur_wait < min_wait)
+					min_wait = cur_wait;
+			}
+
 			/* frontend accept rate limit was reached */
-			expire = tick_add(now_ms, next_event_delay(&p->fe_counters.sess_per_sec, p->fe_sps_lim, 0));
+			expire = tick_add(now_ms, min_wait);
 			goto limit_proxy;
 		}
 
@@ -1566,7 +1586,7 @@ void listener_accept(struct listener *l)
 		dequeue_all_listeners();
 
 		if (p && !MT_LIST_ISEMPTY(&p->listener_queue) &&
-		    (!p->fe_sps_lim || freq_ctr_remain(&p->fe_counters.sess_per_sec, p->fe_sps_lim, 0) > 0))
+		    (!p->fe_sps_lim || COUNTERS_SHARED_TOTAL_ARG2(p->fe_counters.shared->tg, sess_per_sec, freq_ctr_remain, p->fe_sps_lim, 0) > 0))
 			dequeue_proxy_listeners(p, 0);
 	}
 	return;
@@ -1625,14 +1645,14 @@ void listener_release(struct listener *l)
 	dequeue_all_listeners();
 
 	if (fe && !MT_LIST_ISEMPTY(&fe->listener_queue) &&
-	    (!fe->fe_sps_lim || freq_ctr_remain(&fe->fe_counters.sess_per_sec, fe->fe_sps_lim, 0) > 0))
+	    (!fe->fe_sps_lim || COUNTERS_SHARED_TOTAL_ARG2(fe->fe_counters.shared->tg, sess_per_sec, freq_ctr_remain, fe->fe_sps_lim, 0) > 0))
 		dequeue_proxy_listeners(fe, 0);
 	else if (fe) {
 		unsigned int wait;
 		int expire = TICK_ETERNITY;
 
 		if (fe->task && fe->fe_sps_lim &&
-		    (wait = next_event_delay(&fe->fe_counters.sess_per_sec,fe->fe_sps_lim, 0))) {
+		    (wait = COUNTERS_SHARED_TOTAL_ARG2(fe->fe_counters.shared->tg, sess_per_sec, next_event_delay, fe->fe_sps_lim, 0))) {
 			/* we're blocking because a limit was reached on the number of
 			 * requests/s on the frontend. We want to re-check ASAP, which
 			 * means in 1 ms before estimated expiration date, because the
@@ -2422,6 +2442,28 @@ static int bind_parse_name(char **args, int cur_arg, struct proxy *px, struct bi
 	return 0;
 }
 
+/* parse the "label" bind keyword */
+static int bind_parse_label(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
+{
+	struct listener *l;
+
+	if (!*args[cur_arg + 1]) {
+		memprintf(err, "'%s' : missing label", args[cur_arg]);
+		return ERR_ALERT | ERR_FATAL;
+	}
+
+	list_for_each_entry(l, &conf->listeners, by_bind) {
+		free(l->label);
+		l->label = strdup(args[cur_arg + 1]);
+		if (!l->label) {
+			memprintf(err, "'%s %s' : out of memory", args[cur_arg], args[cur_arg + 1]);
+			return ERR_ALERT | ERR_FATAL;
+		}
+	}
+
+	return 0;
+}
+
 /* parse the "nbconn" bind keyword */
 static int bind_parse_nbconn(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
 {
@@ -2628,6 +2670,7 @@ static struct bind_kw_list bind_kws = { "ALL", { }, {
 	{ "guid-prefix",  bind_parse_guid_prefix,  1, 1 }, /* set guid of listening socket */
 	{ "id",           bind_parse_id,           1, 1 }, /* set id of listening socket */
 	{ "idle-ping",    bind_parse_idle_ping,    1, 1 }, /* activate idle ping if mux support it */
+	{ "label",        bind_parse_label,        1, 1 }, /* set label of listening socket */
 	{ "maxconn",      bind_parse_maxconn,      1, 0 }, /* set maxconn of listening socket */
 	{ "name",         bind_parse_name,         1, 1 }, /* set name of listening socket */
 	{ "nbconn",       bind_parse_nbconn,       1, 1 }, /* set number of connection on active preconnect */

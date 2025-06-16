@@ -15,6 +15,7 @@
 #include <haproxy/api-t.h>
 #include <haproxy/chunk.h>
 #include <haproxy/quic_conn.h>
+#include <haproxy/quic_loss-t.h>
 #include <haproxy/quic_ssl.h>
 #include <haproxy/quic_tls.h>
 #include <haproxy/quic_trace.h>
@@ -116,6 +117,13 @@ static void quic_trace(enum trace_level level, uint64_t mask, const struct trace
 
 		chunk_appendf(&trace_buf, " : qc@%p idle_timer_task@%p flags=0x%x",
 		              qc, qc->idle_timer_task, qc->flags);
+		if (mask & QUIC_EV_CONN_NEW) {
+			const int *ssl_err = a2;
+
+			if (ssl_err)
+				chunk_appendf(&trace_buf, " ssl_err=%d", *ssl_err);
+		}
+
 		if (mask & QUIC_EV_CONN_INIT) {
 			chunk_appendf(&trace_buf, "\n  odcid");
 			quic_cid_dump(&trace_buf, &qc->odcid);

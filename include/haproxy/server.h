@@ -73,7 +73,7 @@ struct server *new_server(struct proxy *proxy);
 void srv_take(struct server *srv);
 struct server *srv_drop(struct server *srv);
 void srv_free_params(struct server *srv);
-int srv_init_per_thr(struct server *srv);
+int srv_init(struct server *srv);
 void srv_set_ssl(struct server *s, int use_ssl);
 const char *srv_adm_st_chg_cause(enum srv_adm_st_chg_cause cause);
 const char *srv_op_st_chg_cause(enum srv_op_st_chg_cause cause);
@@ -181,15 +181,16 @@ const struct mux_ops *srv_get_ws_proto(struct server *srv);
 /* increase the number of cumulated streams on the designated server */
 static inline void srv_inc_sess_ctr(struct server *s)
 {
-	_HA_ATOMIC_INC(&s->counters.cum_sess);
+	_HA_ATOMIC_INC(&s->counters.shared->tg[tgid - 1]->cum_sess);
+	update_freq_ctr(&s->counters.shared->tg[tgid - 1]->sess_per_sec, 1);
 	HA_ATOMIC_UPDATE_MAX(&s->counters.sps_max,
-	                     update_freq_ctr(&s->counters.sess_per_sec, 1));
+	                     update_freq_ctr(&s->counters._sess_per_sec, 1));
 }
 
 /* set the time of last session on the designated server */
 static inline void srv_set_sess_last(struct server *s)
 {
-	s->counters.last_sess = ns_to_sec(now_ns);
+	HA_ATOMIC_STORE(&s->counters.shared->tg[tgid - 1]->last_sess,  ns_to_sec(now_ns));
 }
 
 /* returns the current server throttle rate between 0 and 100% */
@@ -317,6 +318,39 @@ static inline int srv_is_transparent(const struct server *srv)
 	 */
 	return (!is_addr(&srv->addr) && !(srv->flags & SRV_F_RHTTP)) ||
 	       (srv->flags & SRV_F_MAPPORTS);
+}
+
+/* Detach server from proxy list. It is supported to call this
+ * even if the server is not yet in the list
+ * Must be called under thread isolation or when it is safe to assume
+ * that the parent proxy doesn't is not skimming through the server list
+ */
+static inline void srv_detach(struct server *srv)
+{
+	struct proxy *px = srv->proxy;
+
+	if (px->srv == srv)
+		px->srv = srv->next;
+	else {
+		struct server *prev;
+
+		for (prev = px->srv; prev && prev->next != srv; prev = prev->next)
+			;
+
+		BUG_ON(!prev);
+
+		prev->next = srv->next;
+	}
+}
+
+static inline int srv_is_quic(const struct server *srv)
+{
+#ifdef USE_QUIC
+	return srv->addr_type.proto_type == PROTO_TYPE_DGRAM &&
+	       srv->addr_type.xprt_type == PROTO_TYPE_STREAM;
+#else
+	return 0;
+#endif
 }
 
 #endif /* _HAPROXY_SERVER_H */

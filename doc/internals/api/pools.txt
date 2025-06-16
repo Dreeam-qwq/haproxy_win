@@ -204,6 +204,14 @@ the cache, when this option is set, objects are picked from the cache from the
 oldest one instead of the freshest one. This way even late memory corruptions
 have a chance to be detected.
 
+Another non-destructive approach is to use "-dMbackup". A full copy of the
+object is made after its end, which eases inspection (e.g. of the parts
+scratched by the pool_item elements), and a comparison is made upon allocation
+of that object, just like with "-dMintegrity", causing a crash on mismatch. The
+initial 4 words corresponding to the list are ignored as well. Note that when
+both "-dMbackup" and "-dMintegrity" are used, the copy is performed before
+being scratched, and the comparison is done by "-dMintegrity" only.
+
 When build option DEBUG_MEMORY_POOLS is set, or the boot-time option "-dMtag"
 is passed on the executable's command line, pool objects are allocated with
 one extra pointer compared to the requested size, so that the bytes that follow
@@ -342,7 +350,9 @@ struct pool_head *create_pool(char *name, uint size, uint flags)
         "-dMno-merge" is passed on the executable's command line, the pools
         also need to have the exact same name to be merged. In addition, unless
         MEM_F_EXACT is set in <flags>, the object size will usually be rounded
-        up to the size of pointers (16 or 32 bytes). The name that will appear
+        up to the size of pointers (16 or 32 bytes). MEM_F_UAF may be set on a
+        per-pool basis to enable the UAF detection only for this specific pool,
+        saving the massive overhead of global usage. The name that will appear
         in the pool upon merging is the name of the first created pool. The
         returned pointer is the new (or reused) pool head, or NULL upon error.
         Pools created this way must be destroyed using pool_destroy().

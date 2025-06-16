@@ -84,6 +84,9 @@ enum hlua_log_opt {
 /* default log options, made of flags in hlua_log_opt */
 static uint hlua_log_opts = HLUA_LOG_LOGGERS_ON | HLUA_LOG_STDERR_AUTO;
 
+/* set to 1 once some lua was loaded already */
+static uint8_t hlua_loaded = 0;
+
 #define HLUA_BOOL_SAMPLE_CONVERSION_UNK     0x0
 #define HLUA_BOOL_SAMPLE_CONVERSION_NORMAL  0x1
 #define HLUA_BOOL_SAMPLE_CONVERSION_BUG     0X2
@@ -3929,7 +3932,7 @@ __LJMP static int hlua_channel_get_data_yield(lua_State *L, int status, lua_KCon
 	struct channel *chn;
 	struct filter *filter;
 	size_t input, output;
-	int offset, len;
+	int offset, len = 0;
 
 	chn = MAY_LJMP(hlua_checkchannel(L, 1));
 
@@ -3946,11 +3949,14 @@ __LJMP static int hlua_channel_get_data_yield(lua_State *L, int status, lua_KCon
 		if (offset < 0)
 			offset = MAX(0, (int)input + offset);
 		offset += output;
-		if (offset < output || offset > input + output) {
+		if (offset < output) {
 			lua_pushfstring(L, "offset out of range.");
 			WILL_LJMP(lua_error(L));
 		}
 	}
+	if (offset >= output+input)
+		goto wait_more_data;
+
 	len = output + input - offset;
 	if (lua_gettop(L) == 3) {
 		len = MAY_LJMP(luaL_checkinteger(L, 3));
@@ -3968,15 +3974,21 @@ __LJMP static int hlua_channel_get_data_yield(lua_State *L, int status, lua_KCon
 	 * is no data or not enough data was received.
 	 */
 	if (!len || offset + len > output + input) {
+	  wait_more_data:
 		if (!HLUA_CANT_YIELD(hlua_gethlua(L)) && !channel_input_closed(chn) && channel_may_recv(chn)) {
 			/* Yield waiting for more data, as requested */
 			MAY_LJMP(hlua_yieldk(L, 0, 0, hlua_channel_get_data_yield, TICK_ETERNITY, 0));
 		}
 
-		/* Return 'nil' if there is no data and the channel can't receive more data */
-		if (!len) {
+		if (!input) {
+			/* Return 'nil' if there is no data and the channel can't receive more data */
 			lua_pushnil(L);
 			return -1;
+		}
+
+		if (!len) {
+			lua_pushstring(L, "");
+			return 1;
 		}
 
 		/* Otherwise, return all data */
@@ -4004,7 +4016,7 @@ __LJMP static int hlua_channel_get_line_yield(lua_State *L, int status, lua_KCon
 	struct channel *chn;
 	struct filter *filter;
 	size_t l, input, output;
-	int offset, len;
+	int offset, len = 0;
 
 	chn = MAY_LJMP(hlua_checkchannel(L, 1));
 	output = co_data(chn);
@@ -4020,11 +4032,13 @@ __LJMP static int hlua_channel_get_line_yield(lua_State *L, int status, lua_KCon
 		if (offset < 0)
 			offset = MAX(0, (int)input + offset);
 		offset += output;
-		if (offset < output || offset > input + output) {
+		if (offset < output) {
 			lua_pushfstring(L, "offset out of range.");
 			WILL_LJMP(lua_error(L));
 		}
 	}
+	if (offset > output + input)
+		goto wait_more_data;
 
 	len = output + input - offset;
 	if (lua_gettop(L) == 3) {
@@ -4052,15 +4066,21 @@ __LJMP static int hlua_channel_get_line_yield(lua_State *L, int status, lua_KCon
 	 * specified or not enough data was received.
 	 */
 	if (lua_gettop(L) != 3 ||  offset + len > output + input) {
+	  wait_more_data:
 		if (!HLUA_CANT_YIELD(hlua_gethlua(L)) && !channel_input_closed(chn) && channel_may_recv(chn)) {
 			/* Yield waiting for more data */
 			MAY_LJMP(hlua_yieldk(L, 0, 0, hlua_channel_get_line_yield, TICK_ETERNITY, 0));
 		}
 
-		/* Return 'nil' if there is no data and the channel can't receive more data */
-		if (!len) {
+		if (!input) {
+			/* Return 'nil' if there is no data and the channel can't receive more data */
 			lua_pushnil(L);
 			return -1;
+		}
+
+		if (!len) {
+			lua_pushstring(L, "");
+			return 1;
 		}
 
 		/* Otherwise, return all data */
@@ -5279,20 +5299,20 @@ __LJMP static int hlua_applet_tcp_get_priv(lua_State *L)
 __LJMP static int hlua_applet_tcp_getline_yield(lua_State *L, int status, lua_KContext ctx)
 {
 	struct hlua_appctx *luactx = MAY_LJMP(hlua_checkapplet_tcp(L, 1));
-	struct stconn *sc = appctx_sc(luactx->appctx);
 	int ret;
-	const char *blk1;
-	size_t len1;
-	const char *blk2;
-	size_t len2;
+	const char *blk1 = NULL;
+	size_t len1 = 0;
+	const char *blk2 = NULL;
+	size_t len2 = 0;
 
 	/* Read the maximum amount of data available. */
-	ret = co_getline_nc(sc_oc(sc), &blk1, &len1, &blk2, &len2);
+	ret = applet_getline_nc(luactx->appctx, &blk1, &len1, &blk2, &len2);
 
 	/* Data not yet available. return yield. */
 	if (ret == 0) {
 		applet_need_more_data(luactx->appctx);
 		MAY_LJMP(hlua_yieldk(L, 0, 0, hlua_applet_tcp_getline_yield, TICK_ETERNITY, 0));
+		return 0;
 	}
 
 	/* End of data: commit the total strings and return. */
@@ -5307,10 +5327,10 @@ __LJMP static int hlua_applet_tcp_getline_yield(lua_State *L, int status, lua_KC
 
 	/* don't check the max length read and don't check. */
 	luaL_addlstring(&luactx->b, blk1, len1);
-	luaL_addlstring(&luactx->b, blk2, len2);
+	if (len2)
+		luaL_addlstring(&luactx->b, blk2, len2);
 
-	/* Consume input channel output buffer data. */
-	co_skip(sc_oc(sc), len1 + len2);
+	applet_skip_input(luactx->appctx, len1+len2);
 	luaL_pushresult(&luactx->b);
 	return 1;
 }
@@ -5332,26 +5352,22 @@ __LJMP static int hlua_applet_tcp_getline(lua_State *L)
 __LJMP static int hlua_applet_tcp_recv_try(lua_State *L)
 {
 	struct hlua_appctx *luactx = MAY_LJMP(hlua_checkapplet_tcp(L, 1));
-	struct stconn *sc = appctx_sc(luactx->appctx);
 	size_t len = MAY_LJMP(luaL_checkinteger(L, 2));
 	int exp_date = MAY_LJMP(luaL_checkinteger(L, 3));
 	int ret;
-	const char *blk1;
-	size_t len1;
-	const char *blk2;
-	size_t len2;
+	const char *blk1 = NULL;
+	size_t len1 = 0;
+	const char *blk2 =  NULL;
+	size_t len2 = 0;
 
 	/* Read the maximum amount of data available. */
-	if (luactx->appctx->flags & APPCTX_FL_INOUT_BUFS)
-		ret = b_getblk_nc(&luactx->appctx->inbuf, &blk1, &len1, &blk2, &len2, 0, b_data(&luactx->appctx->inbuf));
-	else
-		ret = co_getblk_nc(sc_oc(sc), &blk1, &len1, &blk2, &len2);
+	ret = applet_getblk_nc(luactx->appctx, &blk1, &len1, &blk2, &len2);
 
 	/* Data not yet available. return yield. */
 	if (ret == 0) {
 		if (tick_is_expired(exp_date, now_ms)) {
 			/* return the result. */
-			luaL_pushresult(&luactx->b);
+			lua_pushnil(L);
 			return 1;
 		}
 
@@ -5376,11 +5392,9 @@ __LJMP static int hlua_applet_tcp_recv_try(lua_State *L)
 		 * the end of data stream.
 		 */
 		luaL_addlstring(&luactx->b, blk1, len1);
-		luaL_addlstring(&luactx->b, blk2, len2);
-		if (luactx->appctx->flags & APPCTX_FL_INOUT_BUFS)
-			b_del(&luactx->appctx->inbuf, len1 + len2);
-		else
-			co_skip(sc_oc(sc), len1 + len2);
+		if (len2)
+			luaL_addlstring(&luactx->b, blk2, len2);
+		applet_skip_input(luactx->appctx, len1+len2);
 
 		if (tick_is_expired(exp_date, now_ms)) {
 			/* return the result. */
@@ -5400,15 +5414,14 @@ __LJMP static int hlua_applet_tcp_recv_try(lua_State *L)
 		len -= len1;
 
 		/* Copy the second block. */
-		if (len2 > len)
-			len2 = len;
-		luaL_addlstring(&luactx->b, blk2, len2);
-		len -= len2;
+		if (len2) {
+			if (len2 > len)
+				len2 = len;
+			luaL_addlstring(&luactx->b, blk2, len2);
+			len -= len2;
+		}
 
-		if (luactx->appctx->flags & APPCTX_FL_INOUT_BUFS)
-			b_del(&luactx->appctx->inbuf, len1 + len2);
-		else
-			co_skip(sc_oc(sc), len1 + len2);
+		applet_skip_input(luactx->appctx, len1+len2);
 
 		/* If there is no other data available, yield waiting for new data. */
 		if (len > 0 && !tick_is_expired(exp_date, now_ms)) {
@@ -5491,7 +5504,7 @@ __LJMP static int hlua_applet_tcp_try_recv(lua_State *L)
 	lua_pushinteger(L, -1);
 
 	/* set the expiration date (mandatory arg but not relevant here) */
-	lua_pushinteger(L, TICK_ETERNITY);
+	lua_pushinteger(L, now_ms);
 
 	/* Initialise the string catenation. */
 	luaL_buffinit(L, &luactx->b);
@@ -5517,15 +5530,10 @@ __LJMP static int hlua_applet_tcp_send_yield(lua_State *L, int status, lua_KCont
 	struct hlua_appctx *luactx = MAY_LJMP(hlua_checkapplet_tcp(L, 1));
 	const char *str = MAY_LJMP(luaL_checklstring(L, 2, &len));
 	int l = MAY_LJMP(luaL_checkinteger(L, 3));
-	struct stconn *sc = appctx_sc(luactx->appctx);
-	struct channel *chn = sc_ic(sc);
 	int max;
 
 	/* Get the max amount of data which can be written */
-	if (luactx->appctx->flags & APPCTX_FL_INOUT_BUFS)
-		max = b_room(&luactx->appctx->outbuf);
-	else
-		max = channel_recv_max(chn);
+	max = applet_output_room(luactx->appctx);
 
 	if (max > (len - l))
 		max = len - l;
@@ -5542,10 +5550,7 @@ __LJMP static int hlua_applet_tcp_send_yield(lua_State *L, int status, lua_KCont
 	 * applet, and returns a yield.
 	 */
 	if (l < len) {
-		if (luactx->appctx->flags & APPCTX_FL_INOUT_BUFS)
-			applet_have_more_data(luactx->appctx);
-		else
-			sc_need_room(sc, channel_recv_max(chn) + 1);
+		applet_need_room(luactx->appctx, applet_output_room(luactx->appctx) + 1);
 		MAY_LJMP(hlua_yieldk(L, 0, 0, hlua_applet_tcp_send_yield, TICK_ETERNITY, 0));
 	}
 
@@ -7163,6 +7168,94 @@ __LJMP static int hlua_http_msg_set_status(lua_State *L)
 	return 1;
 }
 
+/* Change the body length. Accepts a positive integer or the string "chunked". */
+__LJMP static int hlua_http_msg_set_body_len(lua_State *L)
+{
+	struct http_msg *msg;
+	struct htx *htx;
+	struct htx_sl *sl;
+	int type;
+
+	MAY_LJMP(check_args(L, 2, "set_body_len"));
+	msg = MAY_LJMP(hlua_checkhttpmsg(L, 1));
+	if (msg->msg_state > HTTP_MSG_BODY)
+		WILL_LJMP(luaL_error(L, "The 'set_body_len' function cannot be called during the message forwarding"));
+	htx = htxbuf(&msg->chn->buf);
+	sl = ASSUME_NONNULL(http_get_stline(htx));
+	type = lua_type(L, 2);
+	if (type == LUA_TSTRING) {
+		const char *str = lua_tostring(L, 2);
+		struct http_hdr_ctx ctx;
+
+		if (strcmp(str, "chunked") != 0)
+			goto error;
+
+		/* Already chunked, nothing to do */
+		if (msg->flags & HTTP_MSGF_TE_CHNK)
+			goto success;
+
+		/* add "Transfer-Encoding: chunked" header */
+		if (!http_add_header(htx, ist("Transfer-Encoding"), ist("chunked")))
+			goto failure;
+		msg->flags |= (HTTP_MSGF_VER_11|HTTP_MSGF_XFER_LEN|HTTP_MSGF_TE_CHNK);
+		sl->flags |= (HTX_SL_F_VER_11|HTX_SL_F_XFER_LEN|HTX_SL_F_XFER_ENC|HTX_SL_F_CHNK);
+
+		/* remove any Content-Length header */
+		if (msg->flags & HTTP_MSGF_CNT_LEN) {
+			ctx.blk = NULL;
+			while (http_find_header(htx, ist("Content-Length"), &ctx, 1))
+				http_remove_header(htx, &ctx);
+			msg->flags &= ~HTTP_MSGF_CNT_LEN;
+			sl->flags &= ~HTX_SL_F_CLEN;
+		}
+	}
+	else if (type == LUA_TNUMBER) {
+		const char *clen;
+		ssize_t len;
+		struct http_hdr_ctx ctx;
+
+		len = lua_tointeger(L, 2);
+		if (len < 0)
+			goto error;
+		clen = ultoa(len);
+
+		/* remove any Content-Length header */
+		if (msg->flags & HTTP_MSGF_CNT_LEN) {
+			ctx.blk = NULL;
+			while (http_find_header(htx, ist("Content-Length"), &ctx, 1))
+				http_remove_header(htx, &ctx);
+		}
+
+		/* Now add Content-Length header */
+		if (!http_add_header(htx, ist("Content-Length"), ist(clen)))
+			goto failure;
+		msg->flags |= (HTTP_MSGF_VER_11|HTTP_MSGF_XFER_LEN|HTTP_MSGF_CNT_LEN);
+		sl->flags |= (HTX_SL_F_VER_11|HTX_SL_F_XFER_LEN|HTX_SL_F_CLEN);
+
+		/* remove any Transfer-Encoding header */
+		if (msg->flags & HTTP_MSGF_TE_CHNK) {
+			ctx.blk = NULL;
+			while (http_find_header(htx, ist("Transfer-Encoding"), &ctx, 1))
+				http_remove_header(htx, &ctx);
+			msg->flags &= ~HTTP_MSGF_TE_CHNK;
+			sl->flags &= ~(HTX_SL_F_XFER_ENC|HTX_SL_F_CHNK);
+		}
+	}
+	else {
+	  error:
+		WILL_LJMP(luaL_error(L, "The 'set_body_len' function expects a positive integer or the string 'chunked' as argument."));
+	}
+
+  success:
+	chn_prod(msg->chn)->flags |= SC_FL_NO_FASTFWD;
+	lua_pushboolean(L, 1);
+	return 1;
+
+  failure:
+	lua_pushboolean(L, 0);
+	return 1;
+}
+
 /* Returns true if the HTTP message is full. */
 __LJMP static int hlua_http_msg_is_full(lua_State *L)
 {
@@ -8184,6 +8277,12 @@ __LJMP static int hlua_httpclient_send(lua_State *L, enum http_meth_t meth)
 
 	hlua_hc = hlua_checkhttpclient(L, 1);
 
+	/* An HTTPclient instance must never process more that one request. So
+	 * at this stage, it must never have been started.
+	 */
+	if (httpclient_started(hlua_hc->hc))
+		WILL_LJMP(luaL_error(L, "httpclient instance cannot be reused. It must process at most one request"));
+
 	lua_pushnil(L);  /* first key */
 	while (lua_next(L, 2)) {
 		if (strcmp(lua_tostring(L, -2), "dst") == 0) {
@@ -8922,7 +9021,7 @@ __LJMP static int hlua_txn_done(lua_State *L)
 		/* let's log the request time */
 		s->logs.request_ts = now_ns;
 		if (s->sess->fe == s->be) /* report it if the request was intercepted by the frontend */
-			_HA_ATOMIC_INC(&s->sess->fe->fe_counters.intercepted_req);
+			_HA_ATOMIC_INC(&s->sess->fe->fe_counters.shared->tg[tgid - 1]->intercepted_req);
 	}
 
   done:
@@ -11113,10 +11212,7 @@ out:
 	if (yield)
 		return;
 
-	if (ctx->flags & APPCTX_FL_INOUT_BUFS)
-		b_reset(&ctx->inbuf);
-	else
-		co_skip(sc_oc(sc), co_data(sc_oc(sc)));
+	applet_reset_input(ctx);
 	return;
 
 error:
@@ -13084,17 +13180,28 @@ static int hlua_cfg_parse_bool_sample_conversion(char **args, int section_type, 
                                                  const struct proxy *defpx, const char *file, int line,
                                                  char **err)
 {
+	uint8_t set;
+
 	if (too_many_args(1, args, err, NULL))
 		return -1;
 
 	if (strcmp(args[1], "normal") == 0)
-		hlua_bool_sample_conversion = HLUA_BOOL_SAMPLE_CONVERSION_NORMAL;
+		set = HLUA_BOOL_SAMPLE_CONVERSION_NORMAL;
 	else if (strcmp(args[1], "pre-3.1-bug") == 0)
-		hlua_bool_sample_conversion = HLUA_BOOL_SAMPLE_CONVERSION_BUG;
+		set = HLUA_BOOL_SAMPLE_CONVERSION_BUG;
 	else {
 		memprintf(err, "'%s' expects either 'normal' or 'pre-3.1-bug' but got '%s'.", args[0], args[1]);
 		return -1;
 	}
+
+	if (hlua_loaded)
+		ha_warning("parsing [%s:%d] : %s", file, line, "ignored as some Lua was loaded "
+		           "already. \"tune.lua.bool-sample-conversion\" must be set before "
+		           "any \"lua-load\" or \"lua-load-per-thread\" directive for it to be "
+		           "considered.\n");
+	else
+		hlua_bool_sample_conversion = set;
+
 	return 0;
 }
 
@@ -13118,6 +13225,8 @@ static int hlua_load_state(char **args, lua_State *L, char **err)
 	int nargs;
 
 	if (ONLY_ONCE()) {
+		hlua_loaded = 1;
+
 		/* we know we get there if "lua-load" or "lua-load-per-thread" was
 		 * used in the config
 		 */
@@ -13128,7 +13237,8 @@ static int hlua_load_state(char **args, lua_State *L, char **err)
 			 */
 			ha_warning("hlua: please set \"tune.lua.bool-sample-conversion\" tunable "
 			           "to either \"normal\" or \"pre-3.1-bug\" explicitly to avoid "
-			           "ambiguities. Defaulting to \"pre-3.1-bug\".\n");
+			           "ambiguities. This must be set before any \"lua-load\" or "
+			           "\"lua-load-per-thread\" directive. Defaulting to \"pre-3.1-bug\".\n");
 		}
 	}
 
@@ -14287,6 +14397,7 @@ lua_State *hlua_init_state(int thread_num)
 	hlua_class_function(L, "set_query",   hlua_http_msg_set_query);
 	hlua_class_function(L, "set_uri",     hlua_http_msg_set_uri);
 	hlua_class_function(L, "set_status",  hlua_http_msg_set_status);
+	hlua_class_function(L, "set_body_len",hlua_http_msg_set_body_len);
 	hlua_class_function(L, "is_full",     hlua_http_msg_is_full);
 	hlua_class_function(L, "may_recv",    hlua_http_msg_may_recv);
 	hlua_class_function(L, "eom",         hlua_http_msg_is_eom);
@@ -14578,12 +14689,6 @@ static void hlua_deinit()
 		if (hlua_states[thr])
 			lua_close(hlua_states[thr]);
 	}
-
-	srv_drop(socket_tcp);
-
-#ifdef USE_OPENSSL
-	srv_drop(socket_ssl);
-#endif
 
 	free_proxy(socket_proxy);
 }

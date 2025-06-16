@@ -5541,7 +5541,7 @@ const void *resolve_sym_name(struct buffer *buf, const char *pfx, const void *ad
 		DEF_SYM(poller_pipe_io_handler),
 		DEF_SYM(mworker_accept_wrapper),
 		DEF_SYM(session_expire_embryonic),
-		DEF_SYM(ha_dump_backtrace, extern void ha_dump_backtrace(struct buffer, const char *, int)),
+		DEF_SYM(ha_dump_backtrace, extern void ha_dump_backtrace(struct buffer *, const char *, int)),
 		DEF_SYM(cli_io_handler, extern void cli_io_handler(struct appctx*)),
 #ifdef USE_THREAD
 		DEF_SYM(accept_queue_process),
@@ -6167,7 +6167,9 @@ int is_dir_present(const char *path_fmt, ...)
  * quote/brace is reported in <errptr> if not NULL. When using in-place parsing
  * error reporting might be difficult since zeroes will have been inserted into
  * the string. One solution for the caller may consist in replacing all args
- * delimiters with spaces in this case.
+ * delimiters with spaces in this case. As a convenience, the pointer to the
+ * first empty arg may be reported in errptr if that one was not assigned an
+ * error.
  */
 uint32_t parse_line(char *in, char *out, size_t *outlen, char **args, int *nbargs, uint32_t opts, const char **errptr)
 {
@@ -6178,10 +6180,16 @@ uint32_t parse_line(char *in, char *out, size_t *outlen, char **args, int *nbarg
 	size_t outmax = *outlen;
 	int argsmax = *nbargs - 1;
 	size_t outpos = 0;
+	size_t arg_start = 0; // copy of outpos before EMIT_CHAR().
+	const char *curr_in = in; // <in> at the beginning of the loop
+	const char *begin_new_arg = NULL; // <in> at transition to new arg
+	const char *empty_arg_ptr = NULL; // pos of first empty arg if any (wrt in)
 	int squote = 0;
 	int dquote = 0;
 	int arg = 0;
 	uint32_t err = 0;
+	int in_arg = 0;
+	int prev_in_arg = 0;
 
 	*nbargs = 0;
 	*outlen = 0;
@@ -6191,12 +6199,16 @@ uint32_t parse_line(char *in, char *out, size_t *outlen, char **args, int *nbarg
 		args[arg] = out;
 
 	while (1) {
+		prev_in_arg = in_arg;
+		arg_start = outpos;
+		curr_in = in;
+
 		if (*in >= '-' && *in != '\\') {
+			in_arg = 1;
 			/* speedup: directly send all regular chars starting
 			 * with '-', '.', '/', alnum etc...
 			 */
 			EMIT_CHAR(*in++);
-			continue;
 		}
 		else if (*in == '\0' || *in == '\n' || *in == '\r') {
 			/* end of line */
@@ -6207,6 +6219,7 @@ uint32_t parse_line(char *in, char *out, size_t *outlen, char **args, int *nbarg
 			break;
 		}
 		else if (*in == '"' && !squote && (opts & PARSE_OPT_DQUOTE)) {  /* double quote outside single quotes */
+			in_arg = 1;
 			if (dquote) {
 				dquote = 0;
 				quote = NULL;
@@ -6216,9 +6229,9 @@ uint32_t parse_line(char *in, char *out, size_t *outlen, char **args, int *nbarg
 				quote = in;
 			}
 			in++;
-			continue;
 		}
 		else if (*in == '\'' && !dquote && (opts & PARSE_OPT_SQUOTE)) { /* single quote outside double quotes */
+			in_arg = 1;
 			if (squote) {
 				squote = 0;
 				quote = NULL;
@@ -6228,7 +6241,6 @@ uint32_t parse_line(char *in, char *out, size_t *outlen, char **args, int *nbarg
 				quote = in;
 			}
 			in++;
-			continue;
 		}
 		else if (*in == '\\' && !squote && (opts & PARSE_OPT_BKSLASH)) {
 			/* first, we'll replace \\, \<space>, \#, \r, \n, \t, \xXX with their
@@ -6237,6 +6249,7 @@ uint32_t parse_line(char *in, char *out, size_t *outlen, char **args, int *nbarg
 			 */
 			char tosend = *in;
 
+			in_arg = 1;
 			switch (in[1]) {
 			case ' ':
 			case '\\':
@@ -6313,14 +6326,9 @@ uint32_t parse_line(char *in, char *out, size_t *outlen, char **args, int *nbarg
 		}
 		else if (isspace((unsigned char)*in) && !squote && !dquote) {
 			/* a non-escaped space is an argument separator */
+			in_arg = 0;
 			while (isspace((unsigned char)*in))
 				in++;
-			EMIT_CHAR(0);
-			arg++;
-			if (arg < argsmax)
-				args[arg] = out + outpos;
-			else
-				err |= PARSE_ERR_TOOMANY;
 		}
 		else if (*in == '$' && (opts & PARSE_OPT_ENV) && (dquote || !(opts & PARSE_OPT_DQUOTE))) {
 			/* environment variables are evaluated anywhere, or only
@@ -6414,19 +6422,30 @@ uint32_t parse_line(char *in, char *out, size_t *outlen, char **args, int *nbarg
 				while (*value) {
 					/* expand as individual parameters on a space character */
 					if (word_expand && isspace((unsigned char)*value)) {
-						EMIT_CHAR(0);
-						++arg;
-						if (arg < argsmax)
-							args[arg] = out + outpos;
-						else
-							err |= PARSE_ERR_TOOMANY;
+						in_arg = 0;
 
 						/* skip consecutive spaces */
 						while (isspace((unsigned char)*++value))
 							;
 					} else {
+						in_arg = 1;
 						EMIT_CHAR(*value++);
 					}
+					if (!prev_in_arg && in_arg) {
+						begin_new_arg = curr_in;
+						if (arg < argsmax)
+							args[arg] = out + arg_start;
+						else
+							err |= PARSE_ERR_TOOMANY;
+					}
+					if (prev_in_arg && !in_arg) {
+						if (!empty_arg_ptr && outpos == arg_start)
+							empty_arg_ptr = begin_new_arg;
+						EMIT_CHAR(0);
+						arg++;
+					}
+					prev_in_arg = in_arg;
+					arg_start = outpos;
 				}
 			}
 			else {
@@ -6434,6 +6453,7 @@ uint32_t parse_line(char *in, char *out, size_t *outlen, char **args, int *nbarg
 				 * Let's skip the trailing double-quote character
 				 * and spaces.
 				 */
+				in_arg = 1;
 				if (likely(*var_name != '.') && *in == '"') {
 					in++;
 					while (isspace((unsigned char)*in))
@@ -6448,20 +6468,35 @@ uint32_t parse_line(char *in, char *out, size_t *outlen, char **args, int *nbarg
 		}
 		else {
 			/* any other regular char */
+			in_arg = 1;
 			EMIT_CHAR(*in++);
+		}
+
+		if (!prev_in_arg && in_arg) {
+			begin_new_arg = curr_in;
+			if (arg < argsmax)
+				args[arg] = out + arg_start;
+			else
+				err |= PARSE_ERR_TOOMANY;
+		}
+
+		if (prev_in_arg && !in_arg) {
+			if (!empty_arg_ptr && outpos == arg_start)
+				empty_arg_ptr = begin_new_arg;
+			EMIT_CHAR(0);
+			arg++;
+			arg_start = outpos;
 		}
 	}
 
 	/* end of output string */
-	EMIT_CHAR(0);
-
-	/* Don't add an empty arg after trailing spaces. Note that args[arg]
-	 * may contain some distances relative to NULL if <out> was NULL, or
-	 * pointers beyond the end of <out> in case <outlen> is too short, thus
-	 * we must not dereference it.
-	 */
-	if (arg < argsmax && args[arg] != out + outpos - 1)
+	if (in_arg) {
+		if (!empty_arg_ptr && outpos == arg_start)
+			empty_arg_ptr = begin_new_arg;
+		EMIT_CHAR(0);
 		arg++;
+		arg_start = outpos;
+	}
 
 	if (quote) {
 		/* unmatched quote */
@@ -6471,6 +6506,10 @@ uint32_t parse_line(char *in, char *out, size_t *outlen, char **args, int *nbarg
 		goto leave;
 	}
  leave:
+	/* make sure empty lines are terminated */
+	if (!arg)
+		EMIT_CHAR(0);
+
 	*nbargs = arg;
 	*outlen = outpos;
 
@@ -6483,6 +6522,9 @@ uint32_t parse_line(char *in, char *out, size_t *outlen, char **args, int *nbarg
 	while (arg >= 0 && arg <= argsmax)
 		args[arg++] = out + outpos - 1;
 
+	/* if no error but an empty arg, report its pointer in errptr for convenience */
+	if (empty_arg_ptr && errptr && !err)
+		*errptr = empty_arg_ptr;
 	return err;
 }
 #undef EMIT_CHAR
@@ -7276,6 +7318,22 @@ int path_base(const char *path, const char *base, char *dst, char **err)
 
 out:
 	return err_code;
+}
+
+/*
+ * free() an array of strings terminated by a NULL entry
+ * set the pointer to NULL
+ */
+void ha_freearray(char ***array)
+{
+	int i;
+	char **r = *array;
+
+	for (i = 0; r && r[i]; i++) {
+		free(r[i]);
+		r[i] = NULL;
+	}
+	*array = NULL;
 }
 
 /*

@@ -49,6 +49,7 @@
 #include <haproxy/check.h>
 #include <haproxy/chunk.h>
 #include <haproxy/clock.h>
+#include <haproxy/counters.h>
 #ifdef USE_CPU_AFFINITY
 #include <haproxy/cpuset.h>
 #include <haproxy/cpu_topo.h>
@@ -1981,7 +1982,8 @@ next_line:
 
 		while (1) {
 			uint32_t err;
-			const char *errptr;
+			const char *errptr = NULL;
+			int check_arg;
 
 			arg = sizeof(args) / sizeof(*args);
 			outlen = outlinesize;
@@ -2062,6 +2064,34 @@ next_line:
 				err_code |= ERR_ALERT | ERR_FATAL;
 				fatal++;
 				goto next_line;
+			}
+
+			if ((global.mode & MODE_DISCOVERY)) {
+				/* Only print empty arg warning in discovery mode to prevent double display. */
+				for (check_arg = 0; check_arg < arg; check_arg++) {
+					if (!*args[check_arg]) {
+						size_t newpos;
+
+						/* if an empty arg was found, its pointer should be in <errptr>, except
+						 * for rare cases such as '\x00' etc. We need to check errptr in any case
+						 * and if it's not set, we'll fall back to args's position in the output
+						 * string instead (less accurate but still useful).
+						 */
+						if (!errptr) {
+							newpos = args[check_arg] - outline;
+							if (newpos >= strlen(line))
+								newpos = 0; // impossible to report anything, start at the beginning.
+							errptr = line + newpos;
+						}
+
+						/* sanitize input line in-place */
+						newpos = sanitize_for_printing(line, errptr - line, 80);
+						ha_warning("parsing [%s:%d]: argument number %d at position %d is empty and marks the end of the "
+						           "argument list; all subsequent arguments will be ignored:\n  %s\n  %*s\n",
+						           file, linenum, check_arg, (int)(errptr - thisline + 1), line, (int)(newpos + 1), "^");
+						break;
+					}
+				}
 			}
 
 			/* everything's OK */
@@ -2791,27 +2821,12 @@ int check_config_validity()
 
 	/*
 	 * we must finish to initialize certain things on the servers,
-	 * as some of the per_thr/per_tgrp fields may be accessed soon
+	 * as some of the fields may be accessed soon
 	 */
-
 	MT_LIST_FOR_EACH_ENTRY_LOCKED(newsrv, &servers_list, global_list, back) {
-		if (srv_init_per_thr(newsrv) == -1) {
-			ha_alert("parsing [%s:%d] : failed to allocate per-thread lists for server '%s'.\n",
-			         newsrv->conf.file, newsrv->conf.line, newsrv->id);
+		if (srv_init(newsrv) & ERR_CODE) {
 			cfgerr++;
 			continue;
-		}
-
-		/* initialize idle conns lists */
-		if (newsrv->max_idle_conns != 0) {
-			newsrv->curr_idle_thr = calloc(global.nbthread, sizeof(*newsrv->curr_idle_thr));
-			if (!newsrv->curr_idle_thr) {
-				ha_alert("parsing [%s:%d] : failed to allocate idle connection tasks for server '%s'.\n",
-				         newsrv->conf.file, newsrv->conf.line, newsrv->id);
-				cfgerr++;
-				continue;
-			}
-
 		}
 	}
 
@@ -3752,6 +3767,8 @@ out_uri_auth_compat:
 			    ((newsrv->flags & SRV_F_DEFSRV_USE_SSL) && newsrv->use_ssl != 1)) {
 				if (xprt_get(XPRT_SSL) && xprt_get(XPRT_SSL)->prepare_srv)
 					cfgerr += xprt_get(XPRT_SSL)->prepare_srv(newsrv);
+				else if (xprt_get(XPRT_QUIC) && xprt_get(XPRT_QUIC)->prepare_srv)
+					cfgerr += xprt_get(XPRT_QUIC)->prepare_srv(newsrv);
 			}
 
 			if ((newsrv->flags & SRV_F_FASTOPEN) &&
@@ -4098,6 +4115,13 @@ out_uri_auth_compat:
 			int mode = conn_pr_mode_to_proto_mode(curproxy->mode);
 			const struct mux_proto_list *mux_ent;
 
+			if (srv_is_quic(newsrv)) {
+				if (!newsrv->mux_proto) {
+					/* Force QUIC as mux-proto on server with quic addresses, similarly to bind on FE side. */
+					newsrv->mux_proto = get_mux_proto(ist("quic"));
+				}
+			}
+
 			if (!newsrv->mux_proto)
 				continue;
 
@@ -4247,6 +4271,15 @@ init_proxies_list_stage2:
 			/* enable separate counters */
 			if (curproxy->options2 & PR_O2_SOCKSTAT) {
 				listener->counters = calloc(1, sizeof(*listener->counters));
+				if (listener->counters) {
+					listener->counters->shared = counters_fe_shared_get(&listener->guid);
+					if (!listener->counters->shared) {
+						ha_free(&listener->counters);
+						ha_alert("config: %s '%s': out of memory.\n",
+							 proxy_type_str(curproxy), curproxy->id);
+					}
+
+				}
 				if (!listener->name)
 					memprintf(&listener->name, "sock-%d", listener->luid);
 			}
@@ -4674,8 +4707,8 @@ void cfg_restore_sections(struct list *backup_sections)
 /* dumps all registered keywords by section on stdout */
 void cfg_dump_registered_keywords()
 {
-	/*                             CFG_GLOBAL, CFG_LISTEN, CFG_USERLIST, CFG_PEERS, CFG_CRTLIST */
-	const char* sect_names[] = { "", "global", "listen", "userlist", "peers", "crt-list", 0 };
+	/*                             CFG_GLOBAL, CFG_LISTEN, CFG_USERLIST, CFG_PEERS, CFG_CRTLIST, CFG_CRTSTORE, CFG_TRACES, CFG_ACME */
+	const char* sect_names[] = { "", "global", "listen", "userlist", "peers", "crt-list", "crt-store", "traces", "acme", 0 };
 	int section;
 	int index;
 

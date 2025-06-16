@@ -2601,8 +2601,9 @@ int ckch_inst_rebuild(struct ckch_store *ckch_store, struct ckch_inst *ckchi,
 		fcount = ckchi->crtlist_entry->fcount;
 	}
 
-	if (ckchi->is_server_instance)
-		errcode |= ckch_inst_new_load_srv_store(ckch_store->path, ckch_store, new_inst, err);
+	if (ckchi->is_server_instance) {
+		errcode |= ckch_inst_new_load_srv_store(ckch_store->path, ckch_store, new_inst, err, srv_is_quic(ckchi->server));
+	}
 	else
 		errcode |= ckch_inst_new_load_store(ckch_store->path, ckch_store, ckchi->bind_conf, ckchi->ssl_conf, sni_filter, fcount, ckchi->is_default, new_inst, err);
 
@@ -4870,6 +4871,12 @@ int ckch_conf_parse(char **args, int cur_arg, struct ckch_conf *f, int *found, c
 			if (ckch_conf_kws[i].type == PARSE_TYPE_STR) {
 				char **t = target;
 
+				if (*t) {
+					ha_free(t);
+					memprintf(err, "'%s' already specified, overwriting.", ckch_conf_kws[i].name);
+					err_code |= ERR_WARN;
+				}
+
 				*t = strdup(args[cur_arg + 1]);
 				if (!*t) {
 					ha_alert("parsing [%s:%d]: out of memory.\n", file, linenum);
@@ -4883,7 +4890,11 @@ int ckch_conf_parse(char **args, int cur_arg, struct ckch_conf *f, int *found, c
 				char *b, *e;
 
 				/* split a string into substring split by colons */
-
+				if (*t) {
+					ha_freearray(t);
+					memprintf(err, "'%s' already specified, overwriting.", ckch_conf_kws[i].name);
+					err_code |= ERR_WARN;
+				}
 				e = b = args[cur_arg + 1];
 				do {
 					while (*e != ',' && *e != '\0')

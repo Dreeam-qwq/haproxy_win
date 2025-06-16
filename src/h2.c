@@ -203,6 +203,17 @@ static struct htx_sl *h2_prepare_htx_reqline(uint32_t fields, struct ist *phdr, 
 		}
 	}
 
+	/* We're going to concatenate :authority with :path to form a URI. Some
+	 * characters must absolutely be avoided in :authority to make sure not
+	 * to result in a broken concatenation. See the following links for a
+	 * discussion on this topic:
+	 *   https://github.com/httpwg/http2-spec/pull/936
+	 *   https://github.com/haproxy/haproxy/issues/2941
+	 */
+	if ((fields & H2_PHDR_FND_AUTH) &&
+	    http_authority_has_forbidden_char(phdr[H2_PHDR_IDX_AUTH]))
+		goto fail;
+
 	if (!(flags & HTX_SL_F_HAS_SCHM)) {
 		/* no scheme, use authority only (CONNECT) */
 		uri = phdr[H2_PHDR_IDX_AUTH];
@@ -400,10 +411,13 @@ int h2_make_htx_request(struct http_hdr *list, struct htx *htx, unsigned int *ms
 		}
 
 		if (isteq(list[idx].n, ist("host"))) {
+			/* skip duplicates */
 			if (fields & H2_PHDR_FND_HOST)
 				continue;
 
 			fields |= H2_PHDR_FND_HOST;
+			if (http_authority_has_forbidden_char(list[idx].v))
+				goto fail;
 		}
 
 		if (isteq(list[idx].n, ist("content-length"))) {

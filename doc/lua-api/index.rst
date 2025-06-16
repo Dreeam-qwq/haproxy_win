@@ -893,7 +893,9 @@ Core class
 
   **context**: init, task, action
 
-  This function returns a new object of a *httpclient* class.
+  This function returns a new object of a *httpclient* class. An *httpclient*
+  object must be used to process one and only one request. It must never be
+  reused to process several requests.
 
   :returns: A :ref:`httpclient_class` object.
 
@@ -2581,7 +2583,9 @@ HTTPClient class
 .. js:class:: HTTPClient
 
    The httpclient class allows issue of outbound HTTP requests through a simple
-   API without the knowledge of HAProxy internals.
+   API without the knowledge of HAProxy internals. Any instance must be used to
+   process one and only one request. It must never be reused to process several
+   requests.
 
 .. js:function:: HTTPClient.get(httpclient, request)
 .. js:function:: HTTPClient.head(httpclient, request)
@@ -3916,21 +3920,25 @@ AppletTCP class
   *size* is missing, the function tries to read all the content of the stream
   until the end. An optional timeout may be specified in milliseconds. In this
   case the function will return no longer than this delay, with the amount of
-  available data (possibly none).
+  available data, or nil if there is no data. An empty string is returned if the
+  connection is closed.
 
   :param class_AppletTCP applet: An :ref:`applettcp_class`
   :param integer size: the required read size.
-  :returns: always return a string, the string can be empty if the connection is
-   closed.
+  :returns: return nil if the timeout has expired and no data was available but
+   can still be received. Otherwise, a string is returned, possibly an empty
+   string if the connection is closed.
 
 .. js:function:: AppletTCP.try_receive(applet)
 
   Reads available data from the TCP stream and returns immediately. Returns a
-  string containing read bytes that may possibly be empty if no bytes are
-  available at that time.
+  string containing read bytes or nil if no bytes are available at that time. An
+  empty string is returned if the connection is closed.
 
   :param class_AppletTCP applet: An :ref:`applettcp_class`
-  :returns: always return a string, the string can be empty.
+  :returns: return nil if no data was available but can still be
+   received. Otherwise, a string is returned, possibly an empty string if the
+   connection is closed.
 
 .. js:function:: AppletTCP.send(appletmsg)
 
@@ -4606,6 +4614,27 @@ HTTPMessage class
   :param integer length: *optional* The length of data to replace. All incoming
    data by default.
   :returns: an integer containing the amount of bytes copied or -1.
+
+.. js:function:: HTTPMessage.set_body_len(http_msg, length)
+
+  This function changes the expected payload length of the HTTP message
+  **http_msg**. **length** can be an integer value. In that case, a
+  "Content-Length" header is added with the given value. It is also possible to
+  pass the **"chunked"** string instead of an integer value to force the HTTP
+  message to be chunk-encoded. In that case, a "Transfer-Encoding" header is
+  added with the "chunked" value. In both cases, all existing "Content-Length"
+  and "Transfer-Encoding" headers are removed.
+
+  This function should be used in the filter context to be able to alter the
+  payload of the HTTP message. The internal state of the HTTP message is updated
+  accordingly. :js:func:`HTTPMessage.add_header()` or
+  :js:func:`HTTPMessage.set_header()` functions must be used in that case.
+
+  :param class_httpmessage http_msg: The manipulated HTTP message.
+  :param type length: The new payload length to set. It can be an integer or
+		      the string "chunked".
+  :returns: true if the payload length was successfully updated, false
+	    otherwise.
 
 .. js:function:: HTTPMessage.set_eom(http_msg)
 

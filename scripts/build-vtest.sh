@@ -2,7 +2,7 @@
 
 set -eux
 
-curl -fsSL https://github.com/wlallemand/VTest/archive/refs/heads/haproxy-sd_notify.tar.gz -o VTest.tar.gz
+curl -fsSL https://github.com/vtest/VTest2/archive/main.tar.gz  -o VTest.tar.gz
 mkdir ../vtest
 tar xvf VTest.tar.gz -C ../vtest --strip-components=1
 # Special flags due to: https://github.com/vtest/VTest/issues/12
@@ -24,7 +24,7 @@ set -e
 # temporarily detect Apple Silicon (it's using /opt/homebrew instead of /usr/local)
 #
 if test -f /opt/homebrew/include/pcre2.h; then
-   make -j${CPUS} FLAGS="-O2 -s -Wall" INCS="-Isrc -Ilib -I/usr/local/include -I/opt/homebrew/include -pthread"
+   make -j${CPUS} FLAGS="-O2 -s -Wall" INCS="-I. -Isrc -Ilib -I/usr/local/include -I/opt/homebrew/include -pthread"
 else
    make -j${CPUS} FLAGS="-O2 -s -Wall"
 fi

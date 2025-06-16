@@ -1423,7 +1423,7 @@ static int h2_init(struct connection *conn, struct proxy *prx, struct session *s
 			goto fail_stream;
 	}
 
-	if (sess)
+	if (sess && !conn_is_back(conn))
 		proxy_inc_fe_cum_sess_ver_ctr(sess->listener, prx, 2);
 
 	/* Rhttp connections are only accounted after reverse completion. */
@@ -1682,7 +1682,8 @@ static inline int _h2c_report_glitch(struct h2c *h2c, int increment)
 		h2_be_glitches_threshold : h2_fe_glitches_threshold;
 
 	h2c->glitches += increment;
-	if (thres && h2c->glitches >= thres) {
+	if (thres && h2c->glitches >= thres &&
+	    (th_ctx->idle_pct <= global.tune.glitch_kill_maxidle)) {
 		h2c_error(h2c, H2_ERR_ENHANCE_YOUR_CALM);
 		return 1;
 	}

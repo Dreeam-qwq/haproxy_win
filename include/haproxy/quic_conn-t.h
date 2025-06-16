@@ -28,22 +28,22 @@
 
 #include <sys/socket.h>
 
-#include <haproxy/cbuf-t.h>
-#include <haproxy/list.h>
-#include <haproxy/show_flags-t.h>
+#include <import/ebtree-t.h>
 
+#include <haproxy/api-t.h>
+#include <haproxy/buf-t.h>
+#include <haproxy/listener-t.h>
 #include <haproxy/openssl-compat.h>
-#include <haproxy/mux_quic-t.h>
 #include <haproxy/quic_cid-t.h>
 #include <haproxy/quic_cc-t.h>
-#include <haproxy/quic_loss-t.h>
+#include <haproxy/quic_frame-t.h>
 #include <haproxy/quic_openssl_compat-t.h>
 #include <haproxy/quic_stats-t.h>
 #include <haproxy/quic_tls-t.h>
 #include <haproxy/quic_tp-t.h>
-#include <haproxy/task.h>
-
-#include <import/ebtree-t.h>
+#include <haproxy/show_flags-t.h>
+#include <haproxy/ssl_sock-t.h>
+#include <haproxy/task-t.h>
 
 typedef unsigned long long ull;
 
@@ -228,6 +228,9 @@ struct quic_version {
 extern const struct quic_version quic_versions[];
 extern const size_t quic_versions_nb;
 extern const struct quic_version *preferred_version;
+extern const struct quic_version *quic_version_draft_29;
+extern const struct quic_version *quic_version_1;
+extern const struct quic_version *quic_version_2;
 
 /* unused: 0x01 */
 /* Flag the packet number space as requiring an ACK frame to be sent. */
@@ -279,6 +282,10 @@ struct quic_conn_cntrs {
 	long long streams_blocked_uni;       /* total number of times STREAMS_BLOCKED_UNI frame was received */
 };
 
+struct connection;
+struct qcc;
+struct qcc_app_ops;
+
 #define QUIC_CONN_COMMON                               \
     struct {                                           \
         /* Connection owned socket FD. */              \
@@ -301,6 +308,7 @@ struct quic_conn_cntrs {
             /* Number of received bytes. */            \
             uint64_t rx;                               \
         } bytes;                                       \
+        size_t max_udp_payload;                        \
         /* First DCID used by client on its Initial packet. */                 \
         struct quic_cid odcid;                                                 \
         /* DCID of our endpoint - not updated when a new DCID is used */       \
@@ -311,7 +319,7 @@ struct quic_conn_cntrs {
          * with a connection                                                   \
          */                                                                    \
         struct eb_root *cids;                                                  \
-        struct listener *li; /* only valid for frontend connections */         \
+        enum obj_type *target;                                                 \
         /* Idle timer task */                                                  \
         struct task *idle_timer_task;                                          \
         unsigned int idle_expire;                                              \
@@ -334,7 +342,10 @@ struct quic_conn {
 	int tps_tls_ext;
 	int state;
 	enum qc_mux_state mux_state; /* status of the connection/mux layer */
-#ifdef USE_QUIC_OPENSSL_COMPAT
+#ifdef HAVE_OPENSSL_QUIC
+	uint32_t prot_level;
+#endif
+#if defined(USE_QUIC_OPENSSL_COMPAT) || defined(HAVE_OPENSSL_QUIC)
 	unsigned char enc_params[QUIC_TP_MAX_ENCLEN]; /* encoded QUIC transport parameters */
 	size_t enc_params_len;
 #endif
@@ -383,10 +394,10 @@ struct quic_conn {
 		/* RX buffer */
 		struct buffer buf;
 		struct list pkt_list;
-		struct {
-			/* Number of open or closed streams */
-			uint64_t nb_streams;
-		} strms[QCS_MAX_TYPES];
+
+		/* first unhandled streams ID, set by MUX after release */
+		uint64_t stream_max_uni;
+		uint64_t stream_max_bidi;
 	} rx;
 	struct {
 		struct quic_tls_kp prv_rx;
@@ -449,6 +460,7 @@ struct quic_conn_closed {
 #define QUIC_FL_CONN_HPKTNS_DCD                  (1U << 16) /* Handshake packet number space discarded  */
 #define QUIC_FL_CONN_PEER_VALIDATED_ADDR         (1U << 17) /* Peer address is considered as validated for this connection. */
 #define QUIC_FL_CONN_NO_TOKEN_RCVD               (1U << 18) /* Client dit not send any token */
+#define QUIC_FL_CONN_SCID_RECEIVED               (1U << 19) /* (client only: first Initial received. */
 /* gap here */
 #define QUIC_FL_CONN_TO_KILL                     (1U << 24) /* Unusable connection, to be killed */
 #define QUIC_FL_CONN_TX_TP_RECEIVED              (1U << 25) /* Peer transport parameters have been received (used for the transmitting part) */

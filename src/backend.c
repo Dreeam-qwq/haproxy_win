@@ -27,6 +27,7 @@
 #include <haproxy/backend.h>
 #include <haproxy/channel.h>
 #include <haproxy/check.h>
+#include <haproxy/counters.h>
 #include <haproxy/frontend.h>
 #include <haproxy/global.h>
 #include <haproxy/hash.h>
@@ -824,8 +825,8 @@ int assign_server(struct stream *s)
 			goto out;
 		}
 		else if (srv != prev_srv) {
-			_HA_ATOMIC_INC(&s->be->be_counters.cum_lbconn);
-			_HA_ATOMIC_INC(&srv->counters.cum_lbconn);
+			_HA_ATOMIC_INC(&s->be->be_counters.shared->tg[tgid - 1]->cum_lbconn);
+			_HA_ATOMIC_INC(&srv->counters.shared->tg[tgid - 1]->cum_lbconn);
 		}
 		s->target = &srv->obj_type;
 	}
@@ -999,11 +1000,11 @@ int assign_server_and_queue(struct stream *s)
 					s->txn->flags |= TX_CK_DOWN;
 				}
 				s->flags |= SF_REDISP;
-				_HA_ATOMIC_INC(&prev_srv->counters.redispatches);
-				_HA_ATOMIC_INC(&s->be->be_counters.redispatches);
+				_HA_ATOMIC_INC(&prev_srv->counters.shared->tg[tgid - 1]->redispatches);
+				_HA_ATOMIC_INC(&s->be->be_counters.shared->tg[tgid - 1]->redispatches);
 			} else {
-				_HA_ATOMIC_INC(&prev_srv->counters.retries);
-				_HA_ATOMIC_INC(&s->be->be_counters.retries);
+				_HA_ATOMIC_INC(&prev_srv->counters.shared->tg[tgid - 1]->retries);
+				_HA_ATOMIC_INC(&s->be->be_counters.shared->tg[tgid - 1]->retries);
 			}
 		}
 	}
@@ -1141,6 +1142,12 @@ int assign_server_and_queue(struct stream *s)
 					HA_SPIN_UNLOCK(QUEUE_LOCK, &p->queue->lock);
 
 					_HA_ATOMIC_DEC(&p->queue->length);
+
+					if (p->queue->sv)
+						_HA_ATOMIC_DEC(&p->queue->sv->queueslength);
+					else
+						_HA_ATOMIC_DEC(&p->queue->px->queueslength);
+
 					_HA_ATOMIC_INC(&p->queue->idx);
 					_HA_ATOMIC_DEC(&s->be->totpend);
 
@@ -1985,7 +1992,9 @@ int connect_server(struct stream *s)
 		/* set the correct protocol on the output stream connector */
 
 		if (srv) {
-			if (conn_prepare(srv_conn, protocol_lookup(srv_conn->dst->ss_family, PROTO_TYPE_STREAM, srv->alt_proto), srv->xprt)) {
+			struct protocol *proto = protocol_lookup(srv_conn->dst->ss_family, srv->addr_type.proto_type, srv->alt_proto);
+
+			if (conn_prepare(srv_conn, proto, srv->xprt)) {
 				conn_free(srv_conn);
 				return SF_ERR_INTERNAL;
 			}
@@ -2011,9 +2020,13 @@ int connect_server(struct stream *s)
 		srv_conn->ctx = s->scb;
 
 #if defined(USE_OPENSSL) && defined(TLSEXT_TYPE_application_layer_protocol_negotiation)
+		/* Delay mux initialization if SSL and ALPN/NPN is set. Note
+		 * that this is skipped in TCP mode as we only want mux-pt
+		 * anyway.
+		 */
 		if (!srv ||
 		    (srv->use_ssl != 1 || (!(srv->ssl_ctx.alpn_str) && !(srv->ssl_ctx.npn_str)) ||
-		     srv->mux_proto || !IS_HTX_STRM(s)))
+		     !IS_HTX_STRM(s)))
 #endif
 			init_mux = 1;
 
@@ -2078,13 +2091,13 @@ int connect_server(struct stream *s)
 		s->scb->flags |= SC_FL_NOLINGER;
 
 	if (s->flags & SF_SRV_REUSED) {
-		_HA_ATOMIC_INC(&s->be->be_counters.reuse);
+		_HA_ATOMIC_INC(&s->be->be_counters.shared->tg[tgid - 1]->reuse);
 		if (srv)
-			_HA_ATOMIC_INC(&srv->counters.reuse);
+			_HA_ATOMIC_INC(&srv->counters.shared->tg[tgid - 1]->reuse);
 	} else {
-		_HA_ATOMIC_INC(&s->be->be_counters.connect);
+		_HA_ATOMIC_INC(&s->be->be_counters.shared->tg[tgid - 1]->connect);
 		if (srv)
-			_HA_ATOMIC_INC(&srv->counters.connect);
+			_HA_ATOMIC_INC(&srv->counters.shared->tg[tgid - 1]->connect);
 	}
 
 	err = do_connect_server(s, srv_conn);
@@ -2273,8 +2286,8 @@ int srv_redispatch_connect(struct stream *s)
 			s->conn_err_type = STRM_ET_QUEUE_ERR;
 		}
 
-		_HA_ATOMIC_INC(&srv->counters.failed_conns);
-		_HA_ATOMIC_INC(&s->be->be_counters.failed_conns);
+		_HA_ATOMIC_INC(&srv->counters.shared->tg[tgid - 1]->failed_conns);
+		_HA_ATOMIC_INC(&s->be->be_counters.shared->tg[tgid - 1]->failed_conns);
 		return 1;
 
 	case SRV_STATUS_NOSRV:
@@ -2283,7 +2296,7 @@ int srv_redispatch_connect(struct stream *s)
 			s->conn_err_type = STRM_ET_CONN_ERR;
 		}
 
-		_HA_ATOMIC_INC(&s->be->be_counters.failed_conns);
+		_HA_ATOMIC_INC(&s->be->be_counters.shared->tg[tgid - 1]->failed_conns);
 		return 1;
 
 	case SRV_STATUS_QUEUED:
@@ -2312,8 +2325,8 @@ int srv_redispatch_connect(struct stream *s)
 		if (srv)
 			srv_set_sess_last(srv);
 		if (srv)
-			_HA_ATOMIC_INC(&srv->counters.failed_conns);
-		_HA_ATOMIC_INC(&s->be->be_counters.failed_conns);
+			_HA_ATOMIC_INC(&srv->counters.shared->tg[tgid - 1]->failed_conns);
+		_HA_ATOMIC_INC(&s->be->be_counters.shared->tg[tgid - 1]->failed_conns);
 
 		/* release other streams waiting for this server */
 		if (may_dequeue_tasks(srv, s->be))
@@ -2387,8 +2400,8 @@ void back_try_conn_req(struct stream *s)
 			if (srv)
 				srv_set_sess_last(srv);
 			if (srv)
-				_HA_ATOMIC_INC(&srv->counters.failed_conns);
-			_HA_ATOMIC_INC(&s->be->be_counters.failed_conns);
+				_HA_ATOMIC_INC(&srv->counters.shared->tg[tgid - 1]->failed_conns);
+			_HA_ATOMIC_INC(&s->be->be_counters.shared->tg[tgid - 1]->failed_conns);
 
 			/* release other streams waiting for this server */
 			sess_change_server(s, NULL);
@@ -2454,8 +2467,8 @@ void back_try_conn_req(struct stream *s)
 			pendconn_cond_unlink(s->pend_pos);
 
 			if (srv)
-				_HA_ATOMIC_INC(&srv->counters.failed_conns);
-			_HA_ATOMIC_INC(&s->be->be_counters.failed_conns);
+				_HA_ATOMIC_INC(&srv->counters.shared->tg[tgid - 1]->failed_conns);
+			_HA_ATOMIC_INC(&s->be->be_counters.shared->tg[tgid - 1]->failed_conns);
 			sc_abort(sc);
 			sc_shutdown(sc);
 			req->flags |= CF_WRITE_TIMEOUT;
@@ -2710,8 +2723,8 @@ void back_handle_st_cer(struct stream *s)
 		}
 
 		if (objt_server(s->target))
-			_HA_ATOMIC_INC(&objt_server(s->target)->counters.failed_conns);
-		_HA_ATOMIC_INC(&s->be->be_counters.failed_conns);
+			_HA_ATOMIC_INC(&objt_server(s->target)->counters.shared->tg[tgid - 1]->failed_conns);
+		_HA_ATOMIC_INC(&s->be->be_counters.shared->tg[tgid - 1]->failed_conns);
 		sess_change_server(s, NULL);
 		if (may_dequeue_tasks(objt_server(s->target), s->be))
 			process_srv_queue(objt_server(s->target));
@@ -2743,8 +2756,8 @@ void back_handle_st_cer(struct stream *s)
 			s->conn_err_type = STRM_ET_CONN_OTHER;
 
 		if (objt_server(s->target))
-			_HA_ATOMIC_INC(&objt_server(s->target)->counters.internal_errors);
-		_HA_ATOMIC_INC(&s->be->be_counters.internal_errors);
+			_HA_ATOMIC_INC(&objt_server(s->target)->counters.shared->tg[tgid - 1]->internal_errors);
+		_HA_ATOMIC_INC(&s->be->be_counters.shared->tg[tgid - 1]->internal_errors);
 		sess_change_server(s, NULL);
 		if (may_dequeue_tasks(objt_server(s->target), s->be))
 			process_srv_queue(objt_server(s->target));
@@ -2881,8 +2894,8 @@ void back_handle_st_rdy(struct stream *s)
  */
 void set_backend_down(struct proxy *be)
 {
-	be->be_counters.last_change = ns_to_sec(now_ns);
-	_HA_ATOMIC_INC(&be->be_counters.down_trans);
+	HA_ATOMIC_STORE(&be->be_counters.shared->tg[tgid - 1]->last_change, ns_to_sec(now_ns));
+	_HA_ATOMIC_INC(&be->be_counters.shared->tg[tgid - 1]->down_trans);
 
 	if (!(global.mode & MODE_STARTING)) {
 		ha_alert("%s '%s' has no server available!\n", proxy_type_str(be), be->id);
@@ -2954,10 +2967,12 @@ no_cookie:
 }
 
 int be_downtime(struct proxy *px) {
-	if (px->lbprm.tot_weight && px->be_counters.last_change < ns_to_sec(now_ns))  // ignore negative time
+	unsigned long last_change = COUNTERS_SHARED_LAST(px->be_counters.shared->tg, last_change);
+
+	if (px->lbprm.tot_weight && last_change < ns_to_sec(now_ns))  // ignore negative time
 		return px->down_time;
 
-	return ns_to_sec(now_ns) - px->be_counters.last_change + px->down_time;
+	return ns_to_sec(now_ns) - last_change + px->down_time;
 }
 
 /*
@@ -3395,7 +3410,7 @@ smp_fetch_be_sess_rate(const struct arg *args, struct sample *smp, const char *k
 
 	smp->flags = SMP_F_VOL_TEST;
 	smp->data.type = SMP_T_SINT;
-	smp->data.u.sint = read_freq_ctr(&px->be_counters.sess_per_sec);
+	smp->data.u.sint = COUNTERS_SHARED_TOTAL(px->be_counters.shared->tg, sess_per_sec, read_freq_ctr);
 	return 1;
 }
 
@@ -3578,7 +3593,7 @@ smp_fetch_srv_sess_rate(const struct arg *args, struct sample *smp, const char *
 {
 	smp->flags = SMP_F_VOL_TEST;
 	smp->data.type = SMP_T_SINT;
-	smp->data.u.sint = read_freq_ctr(&args->data.srv->counters.sess_per_sec);
+	smp->data.u.sint = COUNTERS_SHARED_TOTAL(args->data.srv->counters.shared->tg, sess_per_sec, read_freq_ctr);
 	return 1;
 }
 

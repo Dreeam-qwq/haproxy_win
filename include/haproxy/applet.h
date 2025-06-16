@@ -282,6 +282,92 @@ static inline void applet_expect_data(struct appctx *appctx)
 	se_fl_clr(appctx->sedesc, SE_FL_EXP_NO_DATA);
 }
 
+/* Returns the buffer containing data pushed to the applet by the stream. For
+ * applets using its own buffers it is the appctx input buffer. For legacy
+ * applet, it is the output channel buffer.
+ */
+static inline struct buffer *applet_get_inbuf(struct appctx *appctx)
+{
+	if (appctx->flags & APPCTX_FL_INOUT_BUFS)
+		return &appctx->inbuf;
+	else
+		return sc_ob(appctx_sc(appctx));
+}
+
+/* Returns the buffer containing data pushed by the applets to the stream. For
+ * applets using its own buffer it is the appctx output buffer. For legacy
+ * applet, it is the input channel buffer.
+ */
+static inline struct buffer *applet_get_outbuf(struct appctx *appctx)
+{
+	if (appctx->flags & APPCTX_FL_INOUT_BUFS)
+		return &appctx->outbuf;
+	else
+		return sc_ib(appctx_sc(appctx));
+}
+
+/* Returns the amount of data in the input buffer (see applet_get_inbuf) */
+static inline size_t applet_input_data(const struct appctx *appctx)
+{
+	if (appctx->flags & APPCTX_FL_INOUT_BUFS)
+		return b_data(&appctx->inbuf);
+	else
+		return co_data(sc_oc(appctx_sc(appctx)));
+}
+
+/* Skips <len> bytes from the input buffer (see applet_get_inbuf).
+ *
+ * This is useful when data have been read directly from the buffer. It is
+ * illegal to call this function with <len> causing a wrapping at the end of the
+ * buffer. It's the caller's responsibility to ensure that <len> is never larger
+ * than available ouput data.
+ */
+static inline void applet_skip_input(struct appctx *appctx, size_t len)
+{
+	if (appctx->flags & APPCTX_FL_INOUT_BUFS)
+		b_del(&appctx->inbuf, len);
+	else
+		co_skip(sc_oc(appctx_sc(appctx)), len);
+}
+
+/* Removes all bytes from the input buffer (see applet_get_inbuf).
+ */
+static inline void applet_reset_input(struct appctx *appctx)
+{
+	if (appctx->flags & APPCTX_FL_INOUT_BUFS) {
+		b_reset(&appctx->inbuf);
+		applet_fl_clr(appctx, APPCTX_FL_INBLK_FULL);
+	}
+	else
+		co_skip(sc_oc(appctx_sc(appctx)), co_data(sc_oc(appctx_sc(appctx))));
+}
+
+/* Returns the amout of space available at the output buffer (see applet_get_outbuf).
+ */
+static inline size_t applet_output_room(const struct appctx *appctx)
+{
+	if (appctx->flags & APPCTX_FL_INOUT_BUFS)
+		return b_room(&appctx->outbuf);
+	else
+		return channel_recv_max(sc_ic(appctx_sc(appctx)));
+}
+
+/*Indicates that the applet have more data to deliver and it needs more room in
+ * the output buffer to do so (see applet_get_outbuf).
+ *
+ * For applets using its own buffers, <room_needed> is not used and only
+ * <appctx> flags are updated. For legacy applets, the amount of free space
+ * required must be specified. In this last case, it is the caller
+ * responsibility to be sure <room_needed> is valid.
+ */
+static inline void applet_need_room(struct appctx *appctx, size_t room_needed)
+{
+	if (appctx->flags & APPCTX_FL_INOUT_BUFS)
+		applet_have_more_data(appctx);
+	else
+		sc_need_room(appctx_sc(appctx), room_needed);
+}
+
 /* Should only be used via wrappers applet_putchk() / applet_putchk_stress(). */
 static inline int _applet_putchk(struct appctx *appctx, struct buffer *chunk,
                                  int stress)
@@ -318,9 +404,10 @@ static inline int _applet_putchk(struct appctx *appctx, struct buffer *chunk,
 	return ret;
 }
 
-/* writes chunk <chunk> into the input channel of the stream attached to this
- * appctx's endpoint, and marks the SC_FL_NEED_ROOM on a channel full error.
- * See ci_putchk() for the list of return codes.
+/* writes chunk <chunk> into the applet output buffer (see applet_get_outbuf).
+ *
+ * Returns the number of written bytes on success or -1 on error (lake of space,
+ * shutdown, invalid call...)
  */
 static inline int applet_putchk(struct appctx *appctx, struct buffer *chunk)
 {
@@ -333,9 +420,10 @@ static inline int applet_putchk_stress(struct appctx *appctx, struct buffer *chu
 	return _applet_putchk(appctx, chunk, 1);
 }
 
-/* writes <len> chars from <blk> into the input channel of the stream attached
- * to this appctx's endpoint, and marks the SC_FL_NEED_ROOM on a channel full
- * error. See ci_putblk() for the list of return codes.
+/* writes <len> chars from <blk> into the applet output buffer (see applet_get_outbuf).
+ *
+ * Returns the number of written bytes on success or -1 on error (lake of space,
+ * shutdown, invalid call...)
  */
 static inline int applet_putblk(struct appctx *appctx, const char *blk, int len)
 {
@@ -367,10 +455,11 @@ static inline int applet_putblk(struct appctx *appctx, const char *blk, int len)
 	return ret;
 }
 
-/* writes chars from <str> up to the trailing zero (excluded) into the input
- * channel of the stream attached to this appctx's endpoint, and marks the
- * SC_FL_NEED_ROOM on a channel full error. See ci_putstr() for the list of
- * return codes.
+/* writes chars from <str> up to the trailing zero (excluded) into the applet
+ * output buffer (see applet_get_outbuf).
+ *
+ * Returns the number of written bytes on success or -1 on error (lake of space,
+ * shutdown, invalid call...)
  */
 static inline int applet_putstr(struct appctx *appctx, const char *str)
 {
@@ -403,9 +492,10 @@ static inline int applet_putstr(struct appctx *appctx, const char *str)
 	return ret;
 }
 
-/* writes character <chr> into the input channel of the stream attached to this
- * appctx's endpoint, and marks the SC_FL_NEED_ROOM on a channel full error.
- * See ci_putchr() for the list of return codes.
+/* writes character <chr> into the applet's output buffer (see applet_get_outbuf).
+ *
+ * Returns the number of written bytes on success or -1 on error (lake of space,
+ * shutdown, invalid call...)
  */
 static inline int applet_putchr(struct appctx *appctx, char chr)
 {
@@ -436,6 +526,283 @@ static inline int applet_putchr(struct appctx *appctx, char chr)
 		}
 	}
 	return ret;
+}
+
+static inline int applet_may_get(const struct appctx *appctx, size_t len)
+{
+	if (appctx->flags & APPCTX_FL_INOUT_BUFS) {
+		if (len > b_data(&appctx->inbuf)) {
+			if (se_fl_test(appctx->sedesc, SE_FL_SHW))
+				return -1;
+			return 0;
+		}
+	}
+	else {
+		const struct stconn *sc = appctx_sc(appctx);
+
+		if ((sc->flags & SC_FL_SHUT_DONE) || len > co_data(sc_oc(sc))) {
+			if (sc->flags & (SC_FL_SHUT_DONE|SC_FL_SHUT_WANTED))
+				return -1;
+			return 0;
+		}
+	}
+	return 1;
+}
+/* Gets one char from the applet input buffer (see appet_get_inbuf),
+ *
+ * Return values :
+ *    1 : number of bytes read, equal to requested size.
+ *   =0 : not enough data available. <c> is left undefined.
+ *   <0 : no more bytes readable because output is shut.
+ *
+ * The status of the corresponding buffer is not changed. The caller must call
+ * applet_skip_input() to update it.
+ */
+static inline int applet_getchar(const struct appctx *appctx, char *c)
+{
+	int ret;
+
+	ret = applet_may_get(appctx, 1);
+	if (ret <= 0)
+		return ret;
+	*c = ((appctx->flags & APPCTX_FL_INOUT_BUFS)
+	      ? *(b_head(&appctx->inbuf))
+	      : *(co_head(sc_oc(appctx_sc(appctx)))));
+
+	return 1;
+}
+
+/* Copies one full block of data from the applet input buffer (see
+ * appet_get_inbuf).
+ *
+ * <len> bytes are capied, starting at the offset <offset>.
+ *
+ * Return values :
+ *   >0 : number of bytes read, equal to requested size.
+ *   =0 : not enough data available. <blk> is left undefined.
+ *   <0 : no more bytes readable because output is shut.
+ *
+ * The status of the corresponding buffer is not changed. The caller must call
+ * applet_skip_input() to update it.
+ */
+static inline int applet_getblk(const struct appctx *appctx, char *blk, int len, int offset)
+{
+	const struct buffer *buf;
+	int ret;
+
+	ret = applet_may_get(appctx, len+offset);
+	if (ret <= 0)
+		return ret;
+
+	buf = ((appctx->flags & APPCTX_FL_INOUT_BUFS)
+	       ? &appctx->inbuf
+	       : sc_ob(appctx_sc(appctx)));
+	return b_getblk(buf, blk, len, offset);
+}
+
+/* Gets one text block representing a word from the applet input buffer (see
+ * appet_get_inbuf).
+ *
+ * The separator is waited for as long as some data can still be received and the
+ * destination is not full. Otherwise, the string may be returned as is, without
+ * the separator.
+ *
+ * Return values :
+ *   >0 : number of bytes read. Includes the separator if present before len or end.
+ *   =0 : no separator before end found. <str> is left undefined.
+ *   <0 : no more bytes readable because output is shut.
+ *
+ * The status of the corresponding buffer is not changed. The caller must call
+ * applet_skip_input() to update it.
+ */
+static inline int applet_getword(const struct appctx *appctx, char *str, int len, char sep)
+{
+	const struct buffer *buf;
+	char *p;
+	size_t input, max = len;
+	int ret = 0;
+
+	ret = applet_may_get(appctx, 1);
+	if (ret <= 0)
+		goto out;
+
+	if (appctx->flags & APPCTX_FL_INOUT_BUFS) {
+		buf = &appctx->inbuf;
+		input = b_data(buf);
+	}
+	else {
+		struct stconn *sc = appctx_sc(appctx);
+
+		buf = sc_ob(sc);
+		input = co_data(sc_oc(sc));
+	}
+
+	if (max > input) {
+		max = input;
+		str[max-1] = 0;
+	}
+
+	p = b_head(buf);
+
+	while (max) {
+		*str++ = *p;
+		ret++;
+		max--;
+		if (*p == sep)
+			goto out;
+		p = b_next(buf, p);
+	}
+
+	if (appctx->flags & APPCTX_FL_INOUT_BUFS) {
+		if (ret < len && (ret < input || b_room(buf)) &&
+		    !se_fl_test(appctx->sedesc, SE_FL_SHW))
+			ret = 0;
+	}
+	else {
+		struct stconn *sc = appctx_sc(appctx);
+
+		if (ret < len && (ret < input || channel_may_recv(sc_oc(sc))) &&
+		    !(sc->flags & (SC_FL_SHUT_DONE|SC_FL_SHUT_WANTED)))
+			ret = 0;
+	}
+ out:
+	if (max)
+		*str = 0;
+	return ret;
+}
+
+/* Gets one text block representing a line from the applet input buffer (see
+ * appet_get_inbuf).
+ *
+ * The '\n' is waited for as long as some data can still be received and the
+ * destination is not full. Otherwise, the string may be returned as is, without
+ * the '\n'.
+ *
+ * Return values :
+ *   >0 : number of bytes read. Includes the \n if present before len or end.
+ *   =0 : no '\n' before end found. <str> is left undefined.
+ *   <0 : no more bytes readable because output is shut.
+ *
+ * The status of the corresponding buffer is not changed. The caller must call
+ * applet_skip_input() to update it.
+ */
+static inline int applet_getline(const struct appctx *appctx, char *str, int len)
+{
+	return applet_getword(appctx, str, len, '\n');
+}
+
+/* Gets one or two blocks of data at once from the applet input buffer (see appet_get_inbuf),
+ *
+ * Data are not copied.
+ *
+ * Return values :
+ *   >0 : number of blocks filled (1 or 2). blk1 is always filled before blk2.
+ *   =0 : not enough data available. <blk*> are left undefined.
+ *   <0 : no more bytes readable because output is shut.
+ *
+ * The status of the corresponding buffer is not changed. The caller must call
+ * applet_skip_input() to update it.
+ */
+static inline int applet_getblk_nc(const struct appctx *appctx, const char **blk1, size_t *len1, const char **blk2, size_t *len2)
+{
+	const struct buffer *buf;
+	size_t max;
+	int ret;
+
+	ret = applet_may_get(appctx, 1);
+	if (ret <= 0)
+		return ret;
+
+	if (appctx->flags & APPCTX_FL_INOUT_BUFS) {
+		buf = &appctx->inbuf;
+		max = b_data(buf);
+	}
+	else {
+		struct stconn *sc = appctx_sc(appctx);
+
+		buf = sc_ob(sc);
+		max = co_data(sc_oc(sc));
+	}
+
+	return b_getblk_nc(buf, blk1, len1, blk2, len2, 0, max);
+}
+
+/* Gets one or two blocks of text representing a word from the applet input
+ * buffer (see appet_get_inbuf).
+ *
+ * Data are not copied. The separator is waited for as long as some data can
+ * still be received and the destination is not full. Otherwise, the string may
+ * be returned as is, without the separator.
+ *
+ * Return values :
+ *   >0 : number of bytes read. Includes the separator if present before len or end.
+ *   =0 : no separator before end found. <str> is left undefined.
+ *   <0 : no more bytes readable because output is shut.
+ *
+ * The status of the corresponding buffer is not changed. The caller must call
+ * applet_skip_input() to update it.
+ */
+static inline int applet_getword_nc(const struct appctx *appctx, const char **blk1, size_t *len1, const char **blk2, size_t *len2, char sep)
+{
+	int ret;
+	size_t l;
+
+	ret = applet_getblk_nc(appctx, blk1, len1, blk2, len2);
+	if (unlikely(ret <= 0))
+		return ret;
+
+	for (l = 0; l < *len1 && (*blk1)[l] != sep; l++);
+	if (l < *len1 && (*blk1)[l] == sep) {
+		*len1 = l + 1;
+		return 1;
+	}
+
+	if (ret >= 2) {
+		for (l = 0; l < *len2 && (*blk2)[l] != sep; l++);
+		if (l < *len2 && (*blk2)[l] == sep) {
+			*len2 = l + 1;
+			return 2;
+		}
+	}
+
+	/* If we have found no LF and the buffer is full or the SC is shut, then
+	 * the resulting string is made of the concatenation of the pending
+	 * blocks (1 or 2).
+	 */
+	if (appctx->flags & APPCTX_FL_INOUT_BUFS) {
+		if (b_full(&appctx->inbuf) || se_fl_test(appctx->sedesc, SE_FL_SHW))
+			return ret;
+	}
+	else {
+		struct stconn *sc = appctx_sc(appctx);
+
+		if (!channel_may_recv(sc_oc(sc)) || sc->flags & (SC_FL_SHUT_DONE|SC_FL_SHUT_WANTED))
+			return ret;
+	}
+
+	/* No LF yet and not shut yet */
+	return 0;
+}
+
+
+/* Gets one or two blocks of text representing a line from the applet input
+ * buffer (see appet_get_inbuf).
+ *
+ * Data are not copied. The '\n' is waited for as long as some data can still be
+ * received and the destination is not full. Otherwise, the string may be
+ * returned as is, without the '\n'.
+ *
+ * Return values :
+ *   >0 : number of bytes read. Includes the \n if present before len or end.
+ *   =0 : no '\n' before end found. <str> is left undefined.
+ *   <0 : no more bytes readable because output is shut.
+ *
+ * The status of the corresponding buffer is not changed. The caller must call
+ * applet_skip_input() to update it.
+ */
+static inline int applet_getline_nc(const struct appctx *appctx, const char **blk1, size_t *len1, const char **blk2, size_t *len2)
+{
+	return applet_getword_nc(appctx, blk1, len1, blk2, len2, '\n');
 }
 
 #endif /* _HAPROXY_APPLET_H */

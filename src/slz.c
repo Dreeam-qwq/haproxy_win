@@ -166,9 +166,9 @@ union ref {
  * 32-bit words into output buffer. X must not contain non-zero bits above
  * xbits.
  */
-static inline void enqueue24(struct slz_stream *strm, uint32_t x, uint32_t xbits)
+static inline void enqueue24(struct slz_stream *strm, uint64_t x, uint32_t xbits)
 {
-	uint64_t queue = strm->queue + ((uint64_t)x << strm->qbits);
+	uint64_t queue = strm->queue + (x << strm->qbits);
 	uint32_t qbits = strm->qbits + xbits;
 
 	if (__builtin_expect(qbits >= 32, 1)) {
@@ -293,7 +293,8 @@ static inline void copy_32b(struct slz_stream *strm, uint32_t x)
 	strm->outbuf += 4;
 }
 
-static inline void send_huff(struct slz_stream *strm, uint32_t code)
+/* Using long because faster on 64-bit (can save one shift) */
+static inline void send_huff(struct slz_stream *strm, unsigned long code)
 {
 	uint32_t bits;
 
@@ -382,6 +383,14 @@ static inline uint32_t slz_hash(uint32_t a)
 	__asm__ volatile("crc32w %0,%0,%1" : "+r"(a) : "r"(0));
 #  endif
 	return a >> (32 - HASH_BITS);
+#elif defined(__SSE4_2__) && defined(USE_CRC32C_HASH)
+	// SSE 4.2 offers CRC32C which is a bit slower than the multiply
+	// but provides a slightly smoother hash
+	__asm__ volatile("crc32l %1,%0" : "+r"(a) : "r"(0));
+	return a >> (32 - HASH_BITS);
+#elif defined(HAVE_FAST_MULT)
+	// optimal factor for HASH_BITS=12 and HASH_BITS=13 among 48k tested: 0x1af42f
+	return (a * 0x1af42f) >> (32 - HASH_BITS);
 #else
 	return ((a << 19) + (a << 6) - a) >> (32 - HASH_BITS);
 #endif
@@ -928,6 +937,7 @@ static inline uint32_t crc32_char(uint32_t crc, uint8_t x)
 	return crc;
 }
 
+#ifdef UNALIGNED_LE_OK
 static inline uint32_t crc32_uint32(uint32_t data)
 {
 #if defined(__ARM_FEATURE_CRC32)
@@ -947,6 +957,7 @@ static inline uint32_t crc32_uint32(uint32_t data)
 #endif
 	return data;
 }
+#endif
 
 /* Modified version originally from RFC1952, working with non-inverting CRCs */
 uint32_t slz_crc32_by1(uint32_t crc, const unsigned char *buf, int len)
@@ -1348,7 +1359,7 @@ long slz_rfc1950_encode(struct slz_stream *strm, unsigned char *out, const unsig
 	return ret;
 }
 
-/* Initializes stream <strm> for use with the zlib format (rfc1952). The
+/* Initializes stream <strm> for use with the zlib format (rfc1950). The
  * compression level passed in <level> is set. This value can only be 0 (no
  * compression) or 1 (compression) and other values will lead to unpredictable
  * behaviour. The function always returns 0.
@@ -1400,7 +1411,7 @@ int slz_rfc1950_finish(struct slz_stream *strm, unsigned char *buf)
 	strm->outbuf = buf;
 
 	if (__builtin_expect(strm->state == SLZ_ST_INIT, 0))
-		strm->outbuf += slz_rfc1952_send_header(strm, strm->outbuf);
+		strm->outbuf += slz_rfc1950_send_header(strm, strm->outbuf);
 
 	slz_rfc1951_finish(strm, strm->outbuf);
 	copy_8b(strm, (strm->crc32 >> 24) & 0xff);

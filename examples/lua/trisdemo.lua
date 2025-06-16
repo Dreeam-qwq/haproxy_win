@@ -112,7 +112,7 @@ local function rotate_piece(piece, piece_id, px, py, board)
 end
 
 function render(applet, board, piece, piece_id, px, py, score)
-    local output = clear_screen .. cursor_home
+    local output = cursor_home
     output = output .. game_name .. " - Lines: " .. score .. "\r\n"
     output = output .. "+" .. string.rep("-", board_width * 2) .. "+\r\n"
     for y = 1, board_height do
@@ -160,6 +160,7 @@ function handler(applet)
     end
 
     applet:send(cursor_hide)
+    applet:send(clear_screen)
 
     -- fall the piece by one line every delay
     local function fall_piece()
@@ -214,7 +215,7 @@ function handler(applet)
 
         local input = applet:receive(1, delay)
         if input then
-            if input == "q" then
+            if input == "" or input == "q" then
                 game_over = true
             elseif input == "\27" then
                 local a = applet:receive(1, delay)

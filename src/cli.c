@@ -770,7 +770,8 @@ static int cli_process_cmdline(struct appctx *appctx)
 				break;
 			}
 		}
-		*p++ = 0;
+		if (p < end)
+			*p++ = 0;
 
 		/* unescape backslashes (\) */
 		for (j = 0, k = 0; args[i][k]; k++) {
@@ -986,12 +987,18 @@ int cli_parse_cmdline(struct appctx *appctx)
 				continue;
 			}
 
+			if (!len)
+				goto process_cmdline;
+
 			/* The end of the command line was reached. Change the trailing \r, if any,
 			 * by a null byte. For the command line, the trailing \r and \n are removed,
 			 * but we conserve them for payload mode.
 			 */
-			if (str[len-1] == '\r')
+			if (str[len-1] == '\r') {
 				str[--len] = '\0';
+				if (!len)
+					goto process_cmdline;
+			}
 
 			/*
 			 * Look for the "payload start" pattern at the end of a
@@ -1054,6 +1061,7 @@ int cli_parse_cmdline(struct appctx *appctx)
 			}
 		}
 
+	  process_cmdline:
 		if (!(appctx->st1 & APPCTX_CLI_ST1_PAYLOAD)) {
 			appctx->st0 = CLI_ST_PROCESS_CMDLINE;
 			break;
@@ -1078,15 +1086,15 @@ int cli_parse_cmdline(struct appctx *appctx)
  */
 void cli_io_handler(struct appctx *appctx)
 {
-	if (applet_fl_test(appctx, APPCTX_FL_OUTBLK_ALLOC|APPCTX_FL_OUTBLK_FULL))
-		goto out;
-
-	if (!appctx_get_buf(appctx, &appctx->outbuf)) {
-		goto out;
-	}
 
 	if (unlikely(applet_fl_test(appctx, APPCTX_FL_EOS|APPCTX_FL_ERROR))) {
 		appctx->st0 = CLI_ST_END;
+		goto out;
+	}
+
+	if (applet_fl_test(appctx, APPCTX_FL_OUTBLK_ALLOC|APPCTX_FL_OUTBLK_FULL) ||
+	    !appctx_get_buf(appctx, &appctx->outbuf)) {
+                applet_wont_consume(appctx);
 		goto out;
 	}
 
@@ -1100,6 +1108,7 @@ void cli_io_handler(struct appctx *appctx)
 			break;
 		}
 		else if (appctx->st0 == CLI_ST_PARSE_CMDLINE) {
+			applet_will_consume(appctx);
 			if (cli_parse_cmdline(appctx) == 0) {
 				/* Now we close the output if we're not in interactive
 				 * mode and the request buffer is empty. This still
@@ -1415,7 +1424,8 @@ static int cli_io_handler_show_fd(struct appctx *appctx)
 #if defined(USE_QUIC)
 		else if (fdt.iocb == quic_conn_sock_fd_iocb) {
 			qc = fdtab[fd].owner;
-			li = qc ? qc->li : NULL;
+			li = qc ? objt_listener(qc->target) : NULL;
+			sv = qc ? objt_server(qc->target) : NULL;
 			xprt_ctx   = qc ? qc->xprt_ctx : NULL;
 			conn = qc ? qc->conn : NULL;
 			xprt = conn ? conn->xprt : NULL; // in fact it's &ssl_quic
@@ -3681,8 +3691,6 @@ int mworker_cli_attach_server(char **errmsg)
 		else
 			memprintf(&msg, "old-%d", child->pid);
 
-		newsrv->next = mworker_proxy->srv;
-		mworker_proxy->srv = newsrv;
 		newsrv->conf.file = strdup(msg);
 		newsrv->id = strdup(msg);
 		newsrv->conf.line = 0;

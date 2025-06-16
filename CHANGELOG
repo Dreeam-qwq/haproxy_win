@@ -1,6 +1,255 @@
 ChangeLog :
 ===========
 
+2025/06/11 : 3.3-dev1
+    - BUILD: tools: properly define ha_dump_backtrace() to avoid a build warning
+    - DOC: config: Fix a typo in 2.7 (Name format for maps and ACLs)
+    - REGTESTS: Do not use REQUIRE_VERSION for HAProxy 2.5+ (5)
+    - REGTESTS: Remove REQUIRE_VERSION=2.3 from all tests
+    - REGTESTS: Remove REQUIRE_VERSION=2.4 from all tests
+    - REGTESTS: Remove tests with REQUIRE_VERSION_BELOW=2.4
+    - REGTESTS: Remove support for REQUIRE_VERSION and REQUIRE_VERSION_BELOW
+    - MINOR: server: group postinit server tasks under _srv_postparse()
+    - MINOR: stats: add stat_col flags
+    - MINOR: stats: add ME_NEW_COMMON() helper
+    - MINOR: proxy: collect per-capability stat in proxy_cond_disable()
+    - MINOR: proxy: add a true list containing all proxies
+    - MINOR: log: only run postcheck_log_backend() checks on backend
+    - MEDIUM: proxy: use global proxy list for REGISTER_POST_PROXY_CHECK() hook
+    - MEDIUM: server: automatically add server to proxy list in new_server()
+    - MEDIUM: server: add and use srv_init() function
+    - BUG/MAJOR: leastconn: Protect tree_elt with the lbprm lock
+    - BUG/MEDIUM: check: Requeue healthchecks on I/O events to handle check timeout
+    - CLEANUP: applet: Update comment for applet_put* functions
+    - DEBUG: check: Add the healthcheck's expiration date in the trace messags
+    - BUG/MINOR: mux-spop: Fix null-pointer deref on SPOP stream allocation failure
+    - CLEANUP: sink: remove useless cleanup in sink_new_from_logger()
+    - MAJOR: counters: add shared counters base infrastructure
+    - MINOR: counters: add shared counters helpers to get and drop shared pointers
+    - MINOR: counters: add common struct and flags to {fe,be}_counters_shared
+    - MEDIUM: counters: manage shared counters using dedicated helpers
+    - CLEANUP: counters: merge some common counters between {fe,be}_counters_shared
+    - MINOR: counters: add local-only internal rates to compute some maxes
+    - MAJOR: counters: dispatch counters over thread groups
+    - BUG/MEDIUM: cli: Properly parse empty lines and avoid crashed
+    - BUG/MINOR: config: emit warning for empty args only in discovery mode
+    - BUG/MINOR: config: fix arg number reported on empty arg warning
+    - BUG/MINOR: quic: Missing SSL session object freeing
+    - MINOR: applet: Add API functions to manipulate input and output buffers
+    - MINOR: applet: Add API functions to get data from the input buffer
+    - CLEANUP: applet: Simplify a bit comments for applet_put* functions
+    - MEDIUM: hlua: Update TCP applet functions to use the new applet API
+    - BUG/MEDIUM: fd: Use the provided tgid in fd_insert() to get tgroup_info
+    - BUG/MINIR: h1: Fix doc of 'accept-unsafe-...-request' about URI parsing
+
+2025/05/28 : 3.3-dev0
+    - MINOR: version: mention that it's development again
+
+2025/05/28 : 3.2.0
+    - MINOR: promex: Add agent check status/code/duration metrics
+    - MINOR: ssl: support strict-sni in ssl-default-bind-options
+    - MINOR: ssl: also provide the "tls-tickets" bind option
+    - MINOR: server: define CLI I/O handler for "add server"
+    - MINOR: server: implement "add server help"
+    - MINOR: server: use stress mode for "add server help"
+    - BUG/MEDIUM: server: fix crash after duplicate GUID insertion
+    - BUG/MEDIUM: server: fix potential null-deref after previous fix
+    - MINOR: config: list recently added sections with -dKcfg
+    - BUG/MAJOR: cache: Crash because of wrong cache entry deleted
+    - DOC: configuration: fix the example in crt-store
+    - DOC: config: clarify the wording around single/double quotes
+    - DOC: config: clarify the legacy cookie and header captures
+    - DOC: config: fix alphabetical ordering of layer 7 sample fetch functions
+    - DOC: config: fix alphabetical ordering of layer 6 sample fetch functions
+    - DOC: config: fix alphabetical ordering of layer 5 sample fetch functions
+    - DOC: config: fix alphabetical ordering of layer 4 sample fetch functions
+    - DOC: config: fix alphabetical ordering of internal sample fetch functions
+    - BUG/MINOR: h3: Set HTX flags corresponding to the scheme found in the request
+    - BUG/MEDIUM: h3: Declare absolute URI as normalized when a :authority is found
+    - DOC: config: mention in bytes_in and bytes_out that they're read on input
+    - DOC: config: clarify the basics of ACLs (call point, multi-valued etc)
+    - REGTESTS: Make the script testing conditional set-var compatible with Vtest2
+    - REGTESTS: Explicitly allow failing shell commands in some scripts
+    - MINOR: listeners: Add support for a label on bind line
+    - BUG/MEDIUM: cli/ring: Properly handle shutdown in "show event" I/O handler
+    - BUG/MEDIUM: hlua: Properly detect shudowns for TCP applets based on the new API
+    - BUG/MEDIUM: hlua: Fix getline() for TCP applets to work with applet's buffers
+    - BUG/MEDIUM: hlua: Fix receive API for TCP applets to properly handle shutdowns
+    - CI: vtest: Rely on VTest2 to run regression tests
+    - CI: vtest: Fix the build script to properly work on MaOS
+    - CI: combine AWS-LC and AWS-LC-FIPS by template
+    - BUG/MEDIUM: httpclient: Throw an error if an lua httpclient instance is reused
+    - DOC: hlua: Add a note to warn user about httpclient object reuse
+    - DOC: hlua: fix a few typos in HTTPMessage.set_body_len() documentation
+    - DEV: patchbot: prepare for new version 3.3-dev
+    - MINOR: version: mention that it's 3.2 LTS now.
+
+2025/05/21 : 3.2-dev17
+    - DOC: configuration: explicit multi-choice on bind shards option
+    - BUG/MINOR: sink: detect and warn when using "send-proxy" options with ring servers
+    - BUG/MEDIUM: peers: also limit the number of incoming updates
+    - MEDIUM: hlua: Add function to change the body length of an HTTP Message
+    - BUG/MEDIUM: stconn: Disable 0-copy forwarding for filters altering the payload
+    - BUG/MINOR: h3: don't insert more than one Host header
+    - BUG/MEDIUM: h1/h2/h3: reject forbidden chars in the Host header field
+    - DOC: config: properly index "table and "stick-table" in their section
+    - DOC: management: change reference to configuration manual
+    - BUILD: debug: mark ha_crash_now() as attribute(noreturn)
+    - IMPORT: slz: avoid multiple shifts on 64-bits
+    - IMPORT: slz: support crc32c for lookup hash on sse4 but only if requested
+    - IMPORT: slz: use a better hash for machines with a fast multiply
+    - IMPORT: slz: fix header used for empty zlib message
+    - IMPORT: slz: silence a build warning on non-x86 non-arm
+    - BUG/MAJOR: leastconn: do not loop forever when facing saturated servers
+    - BUG/MAJOR: queue: properly keep count of the queue length
+    - BUG/MINOR: quic: fix crash on quic_conn alloc failure
+    - BUG/MAJOR: leastconn: never reuse the node after dropping the lock
+    - MINOR: acme: renewal notification over the dpapi sink
+    - CLEANUP: quic: Useless BIO_METHOD initialization
+    - MINOR: quic: Add useful error traces about qc_ssl_sess_init() failures
+    - MINOR: quic: Allow the use of the new OpenSSL 3.5.0 QUIC TLS API (to be completed)
+    - MINOR: quic: implement all remaining callbacks for OpenSSL 3.5 QUIC API
+    - MINOR: quic: OpenSSL 3.5 internal QUIC custom extension for transport parameters reset
+    - MINOR: quic: OpenSSL 3.5 trick to support 0-RTT
+    - DOC: update INSTALL for QUIC with OpenSSL 3.5 usages
+    - DOC: management: update 'acme status'
+    - BUG/MEDIUM: wdt: always ignore the first watchdog wakeup
+    - CLEANUP: wdt: clarify the comments on the common exit path
+    - BUILD: ssl: avoid possible printf format warning in traces
+    - BUILD: acme: fix build issue on 32-bit archs with 64-bit time_t
+    - DOC: management: precise some of the fields of "show servers conn"
+    - BUG/MEDIUM: mux-quic: fix BUG_ON() on rxbuf alloc error
+    - DOC: watchdog: update the doc to reflect the recent changes
+    - BUG/MEDIUM: acme: check if acme domains are configured
+    - BUG/MINOR: acme: fix formatting issue in error and logs
+    - EXAMPLES: lua: avoid screen refresh effect in "trisdemo"
+    - CLEANUP: quic: remove unused cbuf module
+    - MINOR: quic: move function to check stream type in utils
+    - MINOR: quic: refactor handling of streams after MUX release
+    - MINOR: quic: add some missing includes
+    - MINOR: quic: adjust quic_conn-t.h include list
+    - CLEANUP: cfgparse: alphabetically sort the global keywords
+    - MINOR: glitches: add global setting "tune.glitches.kill.cpu-usage"
+
+2025/05/14 : 3.2-dev16
+    - BUG/MEDIUM: mux-quic: fix crash on invalid fctl frame dereference
+    - DEBUG: pool: permit per-pool UAF configuration
+    - MINOR: acme: add the global option 'acme.scheduler'
+    - DEBUG: pools: add a new integrity mode "backup" to copy the released area
+    - MEDIUM: sock-inet: re-check IPv6 connectivity every 30s
+    - BUG/MINOR: ssl: doesn't fill conf->crt with first arg
+    - BUG/MINOR: ssl: prevent multiple 'crt' on the same ssl-f-use line
+    - BUG/MINOR: ssl/ckch: always free() the previous entry during parsing
+    - MINOR: tools: ha_freearray() frees an array of string
+    - BUG/MINOR: ssl/ckch: always ha_freearray() the previous entry during parsing
+    - MINOR: ssl/ckch: warn when the same keyword was used twice
+    - BUG/MINOR: threads: fix soft-stop without multithreading support
+    - BUG/MINOR: tools: improve parse_line()'s robustness against empty args
+    - BUG/MINOR: cfgparse: improve the empty arg position report's robustness
+    - BUG/MINOR: server: dont depend on proxy for server cleanup in srv_drop()
+    - BUG/MINOR: server: perform lbprm deinit for dynamic servers
+    - MINOR: http: add a function to validate characters of :authority
+    - BUG/MEDIUM: h2/h3: reject some forbidden chars in :authority before reassembly
+    - MINOR: quic: account Tx data per stream
+    - MINOR: mux-quic: account Rx data per stream
+    - MINOR: quic: add stream format for "show quic"
+    - MINOR: quic: display QCS info on "show quic stream"
+    - MINOR: quic: display stream age
+    - BUG/MINOR: cpu-topo: fix group-by-cluster policy for disordered clusters
+    - MINOR: cpu-topo: add a new "group-by-ccx" CPU policy
+    - MINOR: cpu-topo: provide a function to sort clusters by average capacity
+    - MEDIUM: cpu-topo: change "performance" to consider per-core capacity
+    - MEDIUM: cpu-topo: change "efficiency" to consider per-core capacity
+    - MEDIUM: cpu-topo: prefer grouping by CCX for "performance" and "efficiency"
+    - MEDIUM: config: change default limits to 1024 threads and 32 groups
+    - BUG/MINOR: hlua: Fix Channel:data() and Channel:line() to respect documentation
+    - DOC: config: Fix a typo in the "term_events" definition
+    - BUG/MINOR: spoe: Don't report error on applet release if filter is in DONE state
+    - BUG/MINOR: mux-spop: Don't report error for stream if ACK was already received
+    - BUG/MINOR: mux-spop: Make the demux stream ID a signed integer
+    - BUG/MINOR: mux-spop: Don't open new streams for SPOP connection on error
+    - MINOR: mux-spop: Don't set SPOP connection state to FRAME_H after ACK parsing
+    - BUG/MEDIUM: mux-spop: Remove frame parsing states from the SPOP connection state
+    - BUG/MEDIUM: mux-spop: Properly handle CLOSING state
+    - BUG/MEDIUM: spop-conn: Report short read for partial frames payload
+    - BUG/MEDIUM: mux-spop: Properly detect truncated frames on demux to report error
+    - BUG/MEDIUM: mux-spop; Don't report a read error if there are pending data
+    - DEBUG: mux-spop: Review some trace messages to adjust the message or the level
+    - DOC: config: move address formats definition to section 2
+    - DOC: config: move stick-tables and peers to their own section
+    - DOC: config: move the extraneous sections out of the "global" definition
+    - CI: AWS-LC(fips): enable unit tests
+    - CI: AWS-LC: enable unit tests
+    - CI: compliance: limit run on forks only to manual + cleanup
+    - CI: musl: enable unit tests
+    - CI: QuicTLS (weekly): limit run on forks only to manual dispatch
+    - CI: WolfSSL: enable unit tests
+
+2025/05/09 : 3.2-dev15
+    - BUG/MEDIUM: stktable: fix sc_*(<ctr>) BUG_ON() regression with ctx > 9
+    - BUG/MINOR: acme/cli: don't output error on success
+    - BUG/MINOR: tools: do not create an empty arg from trailing spaces
+    - MEDIUM: config: warn about the consequences of empty arguments on a config line
+    - MINOR: tools: make parse_line() provide hints about empty args
+    - MINOR: cfgparse: visually show the input line on empty args
+    - BUG/MINOR: tools: always terminate empty lines
+    - BUG/MINOR: tools: make parseline report the required space for the trailing 0
+    - DEBUG: threads: don't keep lock label "OTHER" in the per-thread history
+    - DEBUG: threads: merge successive idempotent lock operations in history
+    - DEBUG: threads: display held locks in threads dumps
+    - BUG/MINOR: proxy: only use proxy_inc_fe_cum_sess_ver_ctr() with frontends
+    - Revert "BUG/MEDIUM: mux-spop: Handle CLOSING state and wait for AGENT DISCONNECT frame"
+    - MINOR: acme/cli: 'acme status' show the status acme-configured certificates
+    - MEDIUM: acme/ssl: remove 'acme ps' in favor of 'acme status'
+    - DOC: configuration: add "acme" section to the keywords list
+    - DOC: configuration: add the "crt-store" keyword
+    - BUG/MAJOR: queue: lock around the call to pendconn_process_next_strm()
+    - MINOR: ssl: add filename and linenum for ssl-f-use errors
+    - BUG/MINOR: ssl: can't use crt-store some certificates in ssl-f-use
+    - BUG/MINOR: tools: only fill first empty arg when not out of range
+    - MINOR: debug: bump the dump buffer to 8kB
+    - MINOR: stick-tables: add "ipv4" as an alias for the "ip" type
+    - MINOR: quic: extend return value during TP parsing
+    - BUG/MINOR: quic: use proper error code on missing CID in TPs
+    - BUG/MINOR: quic: use proper error code on invalid server TP
+    - BUG/MINOR: quic: reject retry_source_cid TP on server side
+    - BUG/MINOR: quic: use proper error code on invalid received TP value
+    - BUG/MINOR: quic: fix TP reject on invalid max-ack-delay
+    - BUG/MINOR: quic: reject invalid max_udp_payload size
+    - BUG/MEDIUM: peers: hold the refcnt until updating ts->seen
+    - BUG/MEDIUM: stick-tables: close a tiny race in __stksess_kill()
+    - BUG/MINOR: cli: fix too many args detection for commands
+    - MINOR: server: ensure server postparse tasks are run for dynamic servers
+    - BUG/MEDIUM: stick-table: always remove update before adding a new one
+    - BUG/MEDIUM: quic: free stream_desc on all data acked
+    - BUG/MINOR: cfgparse: consider the special case of empty arg caused by \x00
+    - DOC: config: recommend disabling libc-based resolution with resolvers
+
+2025/05/02 : 3.2-dev14
+    - MINOR: acme: retry label always do a request
+    - MINOR: acme: does not leave task for next request
+    - BUG/MINOR: acme: reinit the retries only at next request
+    - MINOR: acme: change the default max retries to 5
+    - MINOR: acme: allow a delay after a valid response
+    - MINOR: acme: wait 5s before checking the challenges results
+    - MINOR: acme: emit a log when starting
+    - MINOR: acme: delay of 5s after the finalize
+    - BUG/MEDIUM: quic: Let it be known if the tasklet has been released.
+    - BUG/MAJOR: tasks: fix task accounting when killed
+    - CLEANUP: tasks: use the local state, not t->state, to check for tasklets
+    - DOC: acme: external account binding is not supported
+    - MINOR: hlua: ignore "tune.lua.bool-sample-conversion" if set after "lua-load"
+    - MEDIUM: peers: Give up if we fail to take locks in hot path
+    - MEDIUM: stick-tables: defer adding updates to a tasklet
+    - MEDIUM: stick-tables: Limit the number of old entries we remove
+    - MEDIUM: stick-tables: Limit the number of entries we expire
+    - MINOR: cfgparse-global: add explicit error messages in cfg_parse_global_env_opts
+    - MINOR: ssl: add function to extract X509 notBefore date in time_t
+    - BUILD: acme: need HAVE_ASN1_TIME_TO_TM
+    - MINOR: acme: move the acme task init in a dedicated function
+    - MEDIUM: acme: add a basic scheduler
+    - MINOR: acme: emit a log when the scheduler can't start the task
+
 2025/04/30 : 3.2-dev13
     - MEDIUM: checks: Make sure we return the tasklet from srv_chk_io_cb
     - MEDIUM: listener: Make sure w ereturn the tasklet from accept_queue_process

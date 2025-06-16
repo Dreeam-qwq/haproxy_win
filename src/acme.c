@@ -29,6 +29,7 @@
 #include <haproxy/list.h>
 #include <haproxy/log.h>
 #include <haproxy/pattern.h>
+#include <haproxy/sink.h>
 #include <haproxy/ssl_ckch.h>
 #include <haproxy/ssl_sock.h>
 #include <haproxy/ssl_utils.h>
@@ -51,6 +52,8 @@ enum acme_ret {
 };
 
 static EVP_PKEY *acme_EVP_PKEY_gen(int keytype, int curves, int bits, char **errmsg);
+static int acme_start_task(struct ckch_store *store, char **errmsg);
+static struct task *acme_scheduler(struct task *task, void *context, unsigned int state);
 
 /* Return an existing acme_cfg section */
 struct acme_cfg *get_acme_cfg(const char *name)
@@ -409,6 +412,34 @@ out:
 	return err_code;
 }
 
+/* parse 'acme.scheduler' option */
+static int cfg_parse_global_acme_sched(char **args, int section_type, struct proxy *curpx, const struct proxy *defpx,
+                                       const char *file, int linenum, char **err)
+{
+	int err_code = 0;
+
+	if (!*args[1]) {
+		memprintf(err, "parsing [%s:%d]: keyword '%s' in '%s' section requires an argument\n", file, linenum, args[0], cursection);
+		goto error;
+	}
+	if (alertif_too_many_args(1, file, linenum, args, &err_code))
+		goto error;
+
+	if (strcmp(args[1], "auto") == 0) {
+		global_ssl.acme_scheduler = 1;
+	} else if (strcmp(args[1], "off") == 0) {
+		global_ssl.acme_scheduler = 0;
+	} else {
+		memprintf(err, "parsing [%s:%d]: keyword '%s' in '%s' section requires either 'auto' or 'off' argument", file, linenum, args[0], cursection);
+		goto error;
+	}
+
+	return 0;
+
+error:
+	return -1;
+}
+
 /* Initialize stuff once the section is parsed */
 static int cfg_postsection_acme()
 {
@@ -527,6 +558,7 @@ out:
 static int cfg_postparser_acme()
 {
 	struct acme_cfg *tmp_acme = acme_cfgs;
+	struct task *task = NULL;
 	int ret = 0;
 
         /* first check if the ID was already used */
@@ -541,6 +573,18 @@ static int cfg_postparser_acme()
 		tmp_acme = tmp_acme->next;
 	}
 
+
+	if (acme_cfgs && global_ssl.acme_scheduler) {
+		task = task_new_anywhere();
+		if (!task) {
+			ret++;
+			ha_alert("acme: couldn't start the scheduler!\n");
+		}
+		task->nice = 0;
+		task->process = acme_scheduler;
+
+		task_wakeup(task, TASK_WOKEN_INIT);
+	}
 
 	return ret;
 }
@@ -574,6 +618,7 @@ static struct cfg_kw_list cfg_kws_acme = {ILH, {
 	{ CFG_ACME, "bits",  cfg_parse_acme_cfg_key },
 	{ CFG_ACME, "curves",  cfg_parse_acme_cfg_key },
 	{ CFG_ACME, "map",  cfg_parse_acme_kws },
+	{ CFG_GLOBAL, "acme.scheduler", cfg_parse_global_acme_sched },
 	{ 0, NULL, NULL },
 }};
 
@@ -802,6 +847,8 @@ int acme_update_certificate(struct task *task, struct acme_ctx *ctx, char **errm
 	int ret = 1;
 	struct ckch_store *old_ckchs, *new_ckchs;
 	struct ckch_inst *ckchi;
+	struct sink *dpapi;
+	struct ist line[3];
 
 	new_ckchs = ctx->store;
 
@@ -833,6 +880,15 @@ int acme_update_certificate(struct task *task, struct acme_ctx *ctx, char **errm
 	ckch_store_replace(old_ckchs, new_ckchs);
 
 	send_log(NULL, LOG_NOTICE,"acme: %s: Successful update of the certificate.\n", ctx->store->path);
+
+
+	line[0] = ist("acme newcert ");
+	line[1] = ist(ctx->store->path);
+	line[2] = ist("\n\0");
+
+	dpapi = sink_find("dpapi");
+	if (dpapi)
+		sink_write(dpapi, LOG_HEADER_NONE, 0, line, 3);
 
 	ctx->store = NULL;
 
@@ -1748,6 +1804,8 @@ struct task *acme_process(struct task *task, void *context, unsigned int state)
 	char *errmsg = NULL;
 	struct mt_list tmp = MT_LIST_LOCK_FULL(&ctx->el);
 
+re:
+
 	switch (st) {
 		case ACME_RESSOURCES:
 			if (http_st == ACME_HTTP_REQ) {
@@ -1757,12 +1815,10 @@ struct task *acme_process(struct task *task, void *context, unsigned int state)
 
 			if (http_st == ACME_HTTP_RES) {
 				if (acme_directory(task, ctx, &errmsg) != 0) {
-					http_st = ACME_HTTP_REQ;
 					goto retry;
 				}
 				st = ACME_NEWNONCE;
-				http_st = ACME_HTTP_REQ;
-				task_wakeup(task, TASK_WOKEN_MSG);
+				goto nextreq;
 			}
 		break;
 		case ACME_NEWNONCE:
@@ -1772,12 +1828,10 @@ struct task *acme_process(struct task *task, void *context, unsigned int state)
 			}
 			if (http_st == ACME_HTTP_RES) {
 				if (acme_nonce(task, ctx, &errmsg) != 0) {
-					http_st = ACME_HTTP_REQ;
 					goto retry;
 				}
 				st = ACME_CHKACCOUNT;
-				http_st = ACME_HTTP_REQ;
-				task_wakeup(task, TASK_WOKEN_MSG);
+				goto nextreq;
 			}
 
 		break;
@@ -1788,15 +1842,13 @@ struct task *acme_process(struct task *task, void *context, unsigned int state)
 			}
 			if (http_st == ACME_HTTP_RES) {
 				if (acme_res_account(task, ctx, 0, &errmsg) != 0) {
-					http_st = ACME_HTTP_REQ;
 					goto retry;
 				}
 				if (!isttest(ctx->kid))
 					st = ACME_NEWACCOUNT;
 				else
 					st = ACME_NEWORDER;
-				http_st = ACME_HTTP_REQ;
-				task_wakeup(task, TASK_WOKEN_MSG);
+				goto nextreq;
 			}
 		break;
 		case ACME_NEWACCOUNT:
@@ -1806,12 +1858,10 @@ struct task *acme_process(struct task *task, void *context, unsigned int state)
 			}
 			if (http_st == ACME_HTTP_RES) {
 				if (acme_res_account(task, ctx, 1, &errmsg) != 0) {
-					http_st = ACME_HTTP_REQ;
 					goto retry;
 				}
 				st = ACME_NEWORDER;
-				http_st = ACME_HTTP_REQ;
-				task_wakeup(task, TASK_WOKEN_MSG);
+				goto nextreq;
 			}
 
 
@@ -1823,12 +1873,10 @@ struct task *acme_process(struct task *task, void *context, unsigned int state)
 			}
 			if (http_st == ACME_HTTP_RES) {
 				if (acme_res_neworder(task, ctx, &errmsg) != 0) {
-					http_st = ACME_HTTP_REQ;
 					goto retry;
 				}
 				st = ACME_AUTH;
-				http_st = ACME_HTTP_REQ;
-				task_wakeup(task, TASK_WOKEN_MSG);
+				goto nextreq;
 			}
 		break;
 		case ACME_AUTH:
@@ -1838,16 +1886,14 @@ struct task *acme_process(struct task *task, void *context, unsigned int state)
 			}
 			if (http_st == ACME_HTTP_RES) {
 				if (acme_res_auth(task, ctx, ctx->next_auth, &errmsg) != 0) {
-					http_st = ACME_HTTP_REQ;
 					goto retry;
 				}
-				http_st = ACME_HTTP_REQ;
 				if ((ctx->next_auth = ctx->next_auth->next) == NULL) {
 					st = ACME_CHALLENGE;
 					ctx->next_auth = ctx->auths;
 				}
 				/* call with next auth or do the challenge step */
-				task_wakeup(task, TASK_WOKEN_MSG);
+				goto nextreq;
 			}
 		break;
 		case ACME_CHALLENGE:
@@ -1859,18 +1905,19 @@ struct task *acme_process(struct task *task, void *context, unsigned int state)
 				enum acme_ret ret = acme_res_challenge(task, ctx, ctx->next_auth, 0, &errmsg);
 
 				if (ret == ACME_RET_RETRY) {
-					http_st = ACME_HTTP_REQ;
 					goto retry;
 				} else if (ret == ACME_RET_FAIL) {
 					goto end;
 				}
-				http_st = ACME_HTTP_REQ;
 				if ((ctx->next_auth = ctx->next_auth->next) == NULL) {
 					st = ACME_CHKCHALLENGE;
 					ctx->next_auth = ctx->auths;
+					/* let 5 seconds before checking the challenge */
+					if (ctx->retryafter == 0)
+						ctx->retryafter = 5;
 				}
 				/* call with next auth or do the challenge step */
-				task_wakeup(task, TASK_WOKEN_MSG);
+				goto nextreq;
 			}
 		break;
 		case ACME_CHKCHALLENGE:
@@ -1881,17 +1928,15 @@ struct task *acme_process(struct task *task, void *context, unsigned int state)
 			if (http_st == ACME_HTTP_RES) {
 				enum acme_ret ret = acme_res_challenge(task, ctx, ctx->next_auth, 1, &errmsg);
 				if (ret == ACME_RET_RETRY) {
-					http_st = ACME_HTTP_REQ;
 					goto retry;
 				} else if (ret == ACME_RET_FAIL) {
 					goto abort;
 				}
-				http_st = ACME_HTTP_REQ;
 				if ((ctx->next_auth = ctx->next_auth->next) == NULL)
 					st = ACME_FINALIZE;
 
 				/* do it with the next auth or finalize */
-				task_wakeup(task, TASK_WOKEN_MSG);
+				goto nextreq;
 			}
 		break;
 		case ACME_FINALIZE:
@@ -1901,12 +1946,13 @@ struct task *acme_process(struct task *task, void *context, unsigned int state)
 			}
 			if (http_st == ACME_HTTP_RES) {
 				if (acme_res_finalize(task, ctx, &errmsg) != 0) {
-					http_st = ACME_HTTP_REQ;
 					goto retry;
 				}
-				http_st = ACME_HTTP_REQ;
+				/* let 5 seconds to the server to generate the cert */
+				if (ctx->retryafter == 0)
+					ctx->retryafter = 5;
 				st = ACME_CHKORDER;
-				task_wakeup(task, TASK_WOKEN_MSG);
+				goto nextreq;
 			}
 		break;
 		case ACME_CHKORDER:
@@ -1916,12 +1962,10 @@ struct task *acme_process(struct task *task, void *context, unsigned int state)
 			}
 			if (http_st == ACME_HTTP_RES) {
 				if (acme_res_chkorder(task, ctx, &errmsg) != 0) {
-					http_st = ACME_HTTP_REQ;
 					goto retry;
 				}
-				http_st = ACME_HTTP_REQ;
 				st = ACME_CERTIFICATE;
-				task_wakeup(task, TASK_WOKEN_MSG);
+				goto nextreq;
 			}
 		break;
 		case ACME_CERTIFICATE:
@@ -1931,10 +1975,8 @@ struct task *acme_process(struct task *task, void *context, unsigned int state)
 			}
 			if (http_st == ACME_HTTP_RES) {
 				if (acme_res_certificate(task, ctx, &errmsg) != 0) {
-					http_st = ACME_HTTP_REQ;
 					goto retry;
 				}
-				http_st = ACME_HTTP_REQ;
 				goto end;
 			}
 		break;
@@ -1945,15 +1987,32 @@ struct task *acme_process(struct task *task, void *context, unsigned int state)
 
 	}
 
+	/* this is called after initializing a request */
 	MT_LIST_UNLOCK_FULL(&ctx->el, tmp);
-	ctx->retries = ACME_RETRY;
 	ctx->http_state = http_st;
 	ctx->state = st;
 	task->expire = TICK_ETERNITY;
 	return task;
 
-retry:
+nextreq:
+	/* this is called when changing step in the state machine */
+	http_st = ACME_HTTP_REQ;
+	ctx->retries = ACME_RETRY; /* reinit the retries */
+
+	if (ctx->retryafter == 0)
+		goto re; /* optimize by not leaving the task for the next httpreq to init */
+
+	/* if we have a retryafter, wait before next request (usually finalize) */
+	task->expire = tick_add(now_ms, ctx->retryafter * 1000);
+	ctx->retryafter = 0;
 	ctx->http_state = http_st;
+	ctx->state = st;
+
+	MT_LIST_UNLOCK_FULL(&ctx->el, tmp);
+	return task;
+
+retry:
+	ctx->http_state = ACME_HTTP_REQ;
 	ctx->state = st;
 
 	ctx->retries--;
@@ -1974,7 +2033,7 @@ retry:
 		task->expire = tick_add(now_ms, delay * 1000);
 
 	} else {
-		send_log(NULL, LOG_NOTICE,"acme: %s: %s, aborting. (%d/%d)\n", ctx->store->path, errmsg ? errmsg : "", ACME_RETRY-ctx->retries, ACME_RETRY);
+		send_log(NULL, LOG_NOTICE,"acme: %s: %s Aborting. (%d/%d)\n", ctx->store->path, errmsg ? errmsg : "", ACME_RETRY-ctx->retries, ACME_RETRY);
 		goto end;
 	}
 
@@ -1984,7 +2043,7 @@ retry:
 	return task;
 
 abort:
-	send_log(NULL, LOG_NOTICE,"acme: %s: %s, aborting.\n", ctx->store->path, errmsg ? errmsg : "");
+	send_log(NULL, LOG_NOTICE,"acme: %s: %s Aborting.\n", ctx->store->path, errmsg ? errmsg : "");
 	ha_free(&errmsg);
 
 end:
@@ -1994,6 +2053,98 @@ end:
 	task_destroy(task);
 	task = NULL;
 
+	return task;
+}
+
+/*
+ * Return 1 if the certificate must be regenerated
+ * Check if the notAfter date will append in (validity period / 12) or 7 days per default
+ */
+int acme_will_expire(struct ckch_store *store)
+{
+	int diff = 0;
+	time_t notAfter = 0;
+	time_t notBefore = 0;
+
+	/* compute the validity period of the leaf certificate */
+	if (!store->data || !store->data->cert)
+		return 0;
+
+	notAfter = x509_get_notafter_time_t(store->data->cert);
+	notBefore = x509_get_notbefore_time_t(store->data->cert);
+
+	if (notAfter >= 0 && notBefore >= 0) {
+		diff = (notAfter - notBefore) / 12; /* validity period / 12 */
+	} else {
+		diff = 7 * 24 * 60 * 60; /* default to 7 days */
+	}
+
+	if (date.tv_sec + diff > notAfter)
+		return 1;
+
+	return 0;
+}
+
+/*
+ * Return when the next task is scheduled
+ * Check if the notAfter date will happen in (validity period / 12) or 7 days per default
+ */
+time_t acme_schedule_date(struct ckch_store *store)
+{
+	int diff = 0;
+	time_t notAfter = 0;
+	time_t notBefore = 0;
+
+	if (!global_ssl.acme_scheduler)
+		return 0;
+
+	/* compute the validity period of the leaf certificate */
+	if (!store->data || !store->data->cert)
+		return 0;
+
+	notAfter = x509_get_notafter_time_t(store->data->cert);
+	notBefore = x509_get_notbefore_time_t(store->data->cert);
+
+	if (notAfter >= 0 && notBefore >= 0) {
+		diff = (notAfter - notBefore) / 12; /* validity period / 12 */
+	} else {
+		diff = 7 * 24 * 60 * 60; /* default to 7 days */
+	}
+
+	return (notAfter - diff);
+}
+
+/* Does the scheduling of the ACME tasks
+ */
+struct task *acme_scheduler(struct task *task, void *context, unsigned int state)
+{
+	struct ebmb_node *node = NULL;
+	struct ckch_store *store = NULL;
+	char *errmsg = NULL;
+
+	if (HA_SPIN_TRYLOCK(CKCH_LOCK, &ckch_lock))
+		return task;
+
+	node = ebmb_first(&ckchs_tree);
+	while (node) {
+		store = ebmb_entry(node, struct ckch_store, node);
+
+		if (store->conf.acme.id) {
+
+			if (acme_will_expire(store)) {
+				if (acme_start_task(store, &errmsg) != 0) {
+					send_log(NULL, LOG_NOTICE,"acme: %s: %s Aborting.\n", store->path, errmsg ? errmsg : "");
+					ha_free(&errmsg);
+				}
+			}
+		}
+		node = ebmb_next(node);
+	}
+end:
+	HA_SPIN_UNLOCK(CKCH_LOCK, &ckch_lock);
+	/* call the task again in 12h */
+	/* XXX: need to be configured */
+	task->expire = tick_add(now_ms, 12 * 60 * 60 * 1000);
 	return task;
 }
 
@@ -2101,50 +2252,36 @@ err:
 	return pkey;
 }
 
-static int cli_acme_renew_parse(char **args, char *payload, struct appctx *appctx, void *private)
+/* start an ACME task */
+static int acme_start_task(struct ckch_store *store, char **errmsg)
 {
-	char *err = NULL;
-	struct acme_cfg *cfg;
 	struct task *task;
 	struct acme_ctx *ctx = NULL;
-	struct ckch_store *store = NULL, *newstore = NULL;
+	struct acme_cfg *cfg;
+	struct ckch_store *newstore = NULL;
 	EVP_PKEY *pkey = NULL;
 
-	if (!*args[1]) {
-		memprintf(&err, ": not enough parameters\n");
-		goto err;
-	}
-
-	if (HA_SPIN_TRYLOCK(CKCH_LOCK, &ckch_lock))
-		return cli_err(appctx, "Can't update: operations on certificates are currently locked!\n");
-
-	if ((store = ckchs_lookup(args[2])) == NULL) {
-		memprintf(&err, "Can't find the certificate '%s'.\n", args[2]);
-		goto err;
-	}
-
 	if (store->acme_task != NULL) {
-		memprintf(&err, "An ACME task is already running for certificate '%s'.\n", args[2]);
+		memprintf(errmsg, "An ACME task is already running for certificate '%s'.", store->path);
 		goto err;
 	}
 
-	if (store->conf.acme.id == NULL) {
-		memprintf(&err, "No ACME configuration defined for file '%s'.\n", args[2]);
+	if (!store->conf.acme.domains) {
+		memprintf(errmsg, "No 'domains' were configured for certificate. ");
 		goto err;
 	}
 
 	cfg = get_acme_cfg(store->conf.acme.id);
 	if (!cfg) {
-		memprintf(&err, "No ACME configuration found for file '%s'.\n", args[2]);
+		memprintf(errmsg, "No ACME configuration found for file '%s'.", store->path);
 		goto err;
 	}
 
 	newstore = ckchs_dup(store);
 	if (!newstore) {
-		memprintf(&err, "Out of memory.\n");
+		memprintf(errmsg, "Out of memory.");
 		goto err;
 	}
-
 
 	task = task_new_anywhere();
 	if (!task)
@@ -2157,18 +2294,17 @@ static int cli_acme_renew_parse(char **args, char *payload, struct appctx *appct
 	 */
         store->acme_task = task;
 
-	HA_SPIN_UNLOCK(CKCH_LOCK, &ckch_lock);
-
+	/* XXX: following init part could be done in the task */
 	ctx = calloc(1, sizeof *ctx);
 	if (!ctx) {
-		memprintf(&err, "Out of memory.\n");
+		memprintf(errmsg, "Out of memory.");
 		goto err;
 	}
 
 	/* set the number of remaining retries when facing an error */
 	ctx->retries = ACME_RETRY;
 
-	if ((pkey = acme_EVP_PKEY_gen(cfg->key.type, cfg->key.curves, cfg->key.bits, &err)) == NULL)
+	if ((pkey = acme_EVP_PKEY_gen(cfg->key.type, cfg->key.curves, cfg->key.bits, errmsg)) == NULL)
 		goto err;
 
 	EVP_PKEY_free(newstore->data->key);
@@ -2177,7 +2313,7 @@ static int cli_acme_renew_parse(char **args, char *payload, struct appctx *appct
 
 	ctx->req = acme_x509_req(newstore->data->key, store->conf.acme.domains);
 	if (!ctx->req) {
-		memprintf(&err, "%sCan't generate a CSR.\n", err ? err : "");
+		memprintf(errmsg, "%sCan't generate a CSR.", *errmsg ? *errmsg : "");
 		goto err;
 	}
 
@@ -2188,39 +2324,122 @@ static int cli_acme_renew_parse(char **args, char *payload, struct appctx *appct
 	MT_LIST_INIT(&ctx->el);
 	MT_LIST_APPEND(&acme_tasks, &ctx->el);
 
+	send_log(NULL, LOG_NOTICE, "acme: %s: Starting update of the certificate.\n", ctx->store->path);
+
 	task_wakeup(task, TASK_WOKEN_INIT);
 
 	return 0;
 
 err:
-	HA_SPIN_UNLOCK(CKCH_LOCK, &ckch_lock);
 	EVP_PKEY_free(pkey);
 	ckch_store_free(newstore);
 	acme_ctx_destroy(ctx);
-	memprintf(&err, "%sCan't start the ACME client.\n", err ? err : "");
-	return cli_dynerr(appctx, err);
+	memprintf(errmsg, "%sCan't start the ACME client.", *errmsg ? *errmsg : "");
+	return 1;
 }
 
-
-static int cli_acme_ps_io_handler(struct appctx *appctx)
+static int cli_acme_renew_parse(char **args, char *payload, struct appctx *appctx, void *private)
 {
-	struct mt_list back;
-	struct acme_ctx *ctx;
+	struct ckch_store *store = NULL;
+	char *errmsg = NULL;
+
+	if (!*args[1]) {
+		memprintf(&errmsg, ": not enough parameters\n");
+		goto err;
+	}
+
+	if (HA_SPIN_TRYLOCK(CKCH_LOCK, &ckch_lock))
+		return cli_err(appctx, "Can't update: operations on certificates are currently locked!\n");
+
+	if ((store = ckchs_lookup(args[2])) == NULL) {
+		memprintf(&errmsg, "Can't find the certificate '%s'.\n", args[2]);
+		goto err;
+	}
+
+	if (store->conf.acme.id == NULL) {
+		memprintf(&errmsg, "No ACME configuration defined for file '%s'.\n", args[2]);
+		goto err;
+	}
+
+	if (acme_start_task(store, &errmsg) != 0)
+		goto err;
+
+	HA_SPIN_UNLOCK(CKCH_LOCK, &ckch_lock);
+	return 0;
+err:
+	HA_SPIN_UNLOCK(CKCH_LOCK, &ckch_lock);
+	return cli_dynerr(appctx, errmsg);
+}
+
+static int cli_acme_status_io_handler(struct appctx *appctx)
+{
+	struct ebmb_node *node = NULL;
+	struct ckch_store *store = NULL;
+
+	if (HA_SPIN_TRYLOCK(CKCH_LOCK, &ckch_lock))
+		return 1;
 
 	chunk_reset(&trash);
 
-	chunk_appendf(&trash, "# certificate\tsection\tstate\n");
+	chunk_appendf(&trash, "# certificate\tsection\tstate\texpiration date (UTC)\texpires in\tscheduled date (UTC)\tscheduled in\n");
 	if (applet_putchk(appctx, &trash) == -1)
 		return 1;
 
-	MT_LIST_FOR_EACH_ENTRY_LOCKED(ctx, &acme_tasks, el, back) {
-		chunk_appendf(&trash, "%s\t%s\tRunning\n", ctx->store->path, ctx->cfg->name);
 
-		/* TODO: handle backref list when list of task > buffer size */
-		if (applet_putchk(appctx, &trash) == -1)
-			return 1;
+	if (applet_putchk(appctx, &trash) == -1)
+		return 1;
+
+	/* TODO: handle backref list when list of task > buffer size */
+	node = ebmb_first(&ckchs_tree);
+	while (node) {
+		store = ebmb_entry(node, struct ckch_store, node);
+
+		if (store->conf.acme.id) {
+			char str[50] = {};
+			char *state;
+			time_t notAfter = 0;
+			time_t sched = 0;
+			ullong remain = 0;
+			int running = !!store->acme_task;
+
+			if (global_ssl.acme_scheduler)
+				state = "Scheduled";
+			else
+				state = "Stopped";
+
+			if (running)
+				state = "Running";
+
+			chunk_appendf(&trash, "%s\t%s\t%s\t", store->path, store->conf.acme.id, state);
+
+			notAfter = x509_get_notafter_time_t(store->data->cert);
+			/* Expiration time */
+			if (notAfter > date.tv_sec)
+				remain = notAfter - date.tv_sec;
+			strftime(str, sizeof(str), "%Y-%m-%dT%H:%M:%SZ", gmtime(&notAfter));
+			chunk_appendf(&trash, "%s\t", str);
+			chunk_appendf(&trash, "%llud %lluh%02llum%02llus\t", remain / 86400, (remain % 86400) / 3600, (remain % 3600) / 60, (remain % 60));
+
+			/* Scheduled time */
+			remain = 0;
+			if (!running) /* if running no schedule date yet */
+				sched = acme_schedule_date(store);
+			if (sched > date.tv_sec)
+				remain = sched - date.tv_sec;
+			strftime(str, sizeof(str), "%Y-%m-%dT%H:%M:%SZ", gmtime(&sched));
+			chunk_appendf(&trash, "%s\t", sched ? str : "-");
+			if (sched)
+				chunk_appendf(&trash, "%llud %lluh%02llum%02llus\n", remain / 86400, (remain % 86400) / 3600, (remain % 3600) / 60, (remain % 60));
+			else
+				chunk_appendf(&trash, "%s\n", "-");
+
+			if (applet_putchk(appctx, &trash) == -1)
+				return 1;
+		}
+		node = ebmb_next(node);
 	}
-
+end:
+	HA_SPIN_UNLOCK(CKCH_LOCK, &ckch_lock);
 	return 1;
 }
 
@@ -2233,7 +2452,7 @@ static int cli_acme_ps(char **args, char *payload, struct appctx *appctx, void *
 
 static struct cli_kw_list cli_kws = {{ },{
 	{ { "acme", "renew", NULL },           "acme renew <certfile>                   : renew a certificate using the ACME protocol", cli_acme_renew_parse, NULL, NULL, NULL, 0 },
-	{ { "acme", "ps", NULL },              "acme ps                                 : show running ACME tasks", cli_acme_ps, cli_acme_ps_io_handler, NULL, NULL, 0 },
+	{ { "acme", "status", NULL },          "acme status                             : show status of certificates configured with ACME", cli_acme_ps, cli_acme_status_io_handler, NULL, NULL, 0 },
 	{ { NULL }, NULL, NULL, NULL }
 }};
 

@@ -7,6 +7,7 @@
 #include <haproxy/mux_quic.h>
 #include <haproxy/quic_conn-t.h>
 #include <haproxy/quic_frame-t.h>
+#include <haproxy/quic_utils.h>
 
 /* trace source and events */
 static void qmux_trace(enum trace_level level, uint64_t mask,
@@ -144,7 +145,7 @@ void qmux_dump_qcc_info(struct buffer *msg, const struct qcc *qcc)
 {
 	const struct quic_conn *qc = qcc->conn->handle.qc;
 
-	chunk_appendf(msg, " qcc=%p(F)", qcc);
+	chunk_appendf(msg, " qcc=%p(%c)", qcc, (qcc->flags & QC_CF_IS_BACK) ? 'B' : 'F');
 	if (qcc->conn->handle.qc)
 		chunk_appendf(msg, " qc=%p", qcc->conn->handle.qc);
 	chunk_appendf(msg, " .st=%s .sc=%llu .hreq=%llu .flg=0x%04x",
@@ -161,10 +162,15 @@ void qmux_dump_qcs_info(struct buffer *msg, const struct qcs *qcs)
 	chunk_appendf(msg, " qcs=%p .id=%llu .st=%s .flg=0x%04x", qcs, (ullong)qcs->id,
 	              qcs_st_to_str(qcs->st), qcs->flags);
 
-	chunk_appendf(msg, " .rx=%llu/%llu", (ullong)qcs->rx.offset_max, (ullong)qcs->rx.msd);
+	chunk_appendf(msg, " .rx=%llu/%llu rxb=%u(%u)",
+	              (ullong)qcs->rx.offset_max, (ullong)qcs->rx.msd,
+	              qcs->rx.data.bcnt, qcs->rx.data.bmax);
 	chunk_appendf(msg, " .tx=%llu %llu/%llu", (ullong)qcs->tx.fc.off_soft,
 	                                          (ullong)qcs->tx.fc.off_real,
 	                                          (ullong)qcs->tx.fc.limit);
+
+	if (qcs->stream)
+		bdata_ctr_print(msg, &qcs->stream->data, " buf=");
 
 	chunk_appendf(msg, " .ti=%u/%u/%u",
 	              tot_time_read(&qcs->timer.base),

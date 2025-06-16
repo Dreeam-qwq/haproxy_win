@@ -31,7 +31,7 @@ struct spop_conn {
 	uint32_t max_id;                     /* highest ID known on this connection, <0 before HELLO handshake */
 	uint32_t flags;                      /* Connection flags: SPOP_CF_* */
 
-	uint32_t dsi;                        /* dmux stream ID (<0 = idle ) */
+	int32_t dsi;                         /* dmux stream ID (<0 = idle ) */
 	uint32_t dfi;                        /* dmux frame ID (if dsi >= 0) */
 	uint32_t dfl;                        /* demux frame length (if dsi >= 0) */
 	uint32_t dff;                        /* demux frame flags */
@@ -834,7 +834,7 @@ static inline int spop_conn_is_dead(struct spop_conn *spop_conn)
 {
 	if (eb_is_empty(&spop_conn->streams_by_id) &&                   /* don't close if streams exist */
 	    ((spop_conn->flags & SPOP_CF_ERROR) ||                      /* errors close immediately */
-	     (spop_conn->flags & SPOP_CF_ERR_PENDING && spop_conn->state < SPOP_CS_FRAME_H) || /* early error during connect */
+	     (spop_conn->flags & SPOP_CF_ERR_PENDING && spop_conn->state < SPOP_CS_RUNNING) || /* early error during connect */
 	     (spop_conn->state == SPOP_CS_CLOSED && !spop_conn->task) ||/* a timeout stroke earlier */
 	     (!(spop_conn->conn->owner)) ||                             /* Nobody's left to take care of the connection, drop it now */
 	     (!br_data(spop_conn->mbuf) &&                              /* mux buffer empty, also process clean events below */
@@ -1260,7 +1260,8 @@ static struct spop_strm *spop_stconn_new(struct spop_conn *spop_conn, struct stc
 
   out:
 	TRACE_DEVEL("leaving on error", SPOP_EV_SPOP_STRM_NEW|SPOP_EV_SPOP_STRM_END|SPOP_EV_SPOP_STRM_ERR, spop_conn->conn);
-	spop_strm_destroy(spop_strm);
+	if (spop_strm)
+		spop_strm_destroy(spop_strm);
 	return NULL;
 }
 
@@ -1291,8 +1292,7 @@ static void spop_strm_wake_one_stream(struct spop_strm *spop_strm)
 			spop_strm_close(spop_strm);
 	}
 
-
-	if (spop_conn->state >= SPOP_CS_ERROR || (spop_conn->flags & (SPOP_CF_ERR_PENDING|SPOP_CF_ERROR))) {
+	if (!(spop_strm->flags & SPOP_SF_ACK_RCVD) && (spop_conn->state == SPOP_CS_CLOSED || (spop_conn->flags & (SPOP_CF_ERR_PENDING|SPOP_CF_ERROR)))) {
 		se_fl_set_error(spop_strm->sd);
 		spop_strm_propagate_term_flags(spop_conn, spop_strm);
 		if (!spop_strm->sd->abort_info.info) {
@@ -1644,6 +1644,7 @@ static int spop_conn_handle_hello(struct spop_conn *spop_conn)
 
 	/* process full record only */
 	if (b_data(dbuf) < (spop_conn->dfl)) {
+		spop_conn->flags |= SPOP_CF_DEM_SHORT_READ;
 		TRACE_DEVEL("leaving on missing data", SPOP_EV_RX_FRAME|SPOP_EV_RX_HELLO, spop_conn->conn);
 		return 0;
 	}
@@ -1784,7 +1785,7 @@ static int spop_conn_handle_hello(struct spop_conn *spop_conn)
 	TRACE_PROTO("SPOP AGENT HELLO frame rcvd", SPOP_EV_RX_FRAME|SPOP_EV_RX_HELLO, spop_conn->conn, 0, 0, (size_t[]){spop_conn->dfl});
 	b_del(&spop_conn->dbuf, spop_conn->dfl);
 	spop_conn->dfl = 0;
-	spop_conn->state = SPOP_CS_FRAME_H;
+	spop_conn->state = SPOP_CS_RUNNING;
 	spop_wake_unassigned_streams(spop_conn);
 	TRACE_LEAVE(SPOP_EV_RX_FRAME|SPOP_EV_RX_HELLO, spop_conn->conn);
 	return 1;
@@ -1815,6 +1816,7 @@ static int spop_conn_handle_disconnect(struct spop_conn *spop_conn)
 
 	/* process full record only */
 	if (b_data(dbuf) < (spop_conn->dfl)) {
+		spop_conn->flags |= SPOP_CF_DEM_SHORT_READ;
 		TRACE_DEVEL("leaving on missing data", SPOP_EV_RX_FRAME|SPOP_EV_RX_DISCO, spop_conn->conn);
 		return 0;
 	}
@@ -1926,6 +1928,7 @@ static int spop_conn_handle_ack(struct spop_conn *spop_conn, struct spop_strm *s
 
 	/* process full record only */
 	if (b_data(dbuf) < (spop_conn->dfl)) {
+		spop_conn->flags |= SPOP_CF_DEM_SHORT_READ;
 		TRACE_DEVEL("leaving on missing data", SPOP_EV_RX_FRAME|SPOP_EV_RX_DISCO, spop_conn->conn);
 		return 0;
 	}
@@ -1984,7 +1987,6 @@ static int spop_conn_handle_ack(struct spop_conn *spop_conn, struct spop_strm *s
 
 	spop_strm->flags |= SPOP_SF_ACK_RCVD;
 	TRACE_PROTO("SPOP AGENT ACK frame rcvd", SPOP_EV_RX_FRAME|SPOP_EV_RX_ACK, spop_conn->conn, spop_strm, 0, (size_t[]){sent});
-	spop_conn->state = SPOP_CS_FRAME_H;
 	TRACE_LEAVE(SPOP_EV_RX_FRAME|SPOP_EV_RX_ACK, spop_conn->conn, spop_strm);
 	return 1;
 
@@ -2065,17 +2067,17 @@ static void spop_process_demux(struct spop_conn *spop_conn)
 	if (spop_conn->state == SPOP_CS_CLOSED)
 		goto out;
 
-	if (unlikely(spop_conn->state < SPOP_CS_FRAME_H || spop_conn->state == SPOP_CS_CLOSING)) {
+	if (unlikely(spop_conn->state < SPOP_CS_RUNNING || spop_conn->state == SPOP_CS_CLOSING)) {
 		if (spop_conn->state == SPOP_CS_HA_HELLO) {
 			TRACE_STATE("waiting AGENT HELLO frame to be sent", SPOP_EV_RX_FRAME|SPOP_EV_RX_FHDR|SPOP_EV_RX_HELLO, spop_conn->conn);
 			goto out;
 		}
 		else { /* AGENT_HELLO OR CLOSING */
-			/* ensure that what is pending is a valid AGENT HELLO/DISCONNECT frame. */
+                       /* ensure that what is pending is a valid AGENT HELLO/DISCONNECT frame. */
 			TRACE_STATE("receiving AGENT HELLO/DISCONNECT frame header", SPOP_EV_RX_FRAME|SPOP_EV_RX_FHDR, spop_conn->conn);
 			if (!spop_get_frame_hdr(&spop_conn->dbuf, &hdr)) {
 				spop_conn->flags |= SPOP_CF_DEM_SHORT_READ;
-				TRACE_ERROR("header frame not available yet", SPOP_EV_RX_FRAME|SPOP_EV_RX_FHDR, spop_conn->conn);
+				TRACE_DEVEL("header frame not available yet", SPOP_EV_RX_FRAME|SPOP_EV_RX_FHDR, spop_conn->conn);
 				goto done;
 			}
 
@@ -2086,7 +2088,6 @@ static void spop_process_demux(struct spop_conn *spop_conn)
 				TRACE_STATE("switching to CLOSED", SPOP_EV_RX_FRAME|SPOP_EV_RX_FHDR|SPOP_EV_RX_HELLO|SPOP_EV_SPOP_CONN_ERR, spop_conn->conn);
 				goto done;
 			}
-
 			if ((hdr.type == SPOP_FRM_T_AGENT_HELLO || hdr.type == SPOP_FRM_T_AGENT_DISCON) && (hdr.sid || hdr.fid || !(hdr.flags & SPOP_FRM_FL_FIN))) {
 				spop_conn_error(spop_conn, SPOP_ERR_INVALID);
 				spop_conn->state = SPOP_CS_CLOSED;
@@ -2117,12 +2118,12 @@ static void spop_process_demux(struct spop_conn *spop_conn)
 			break;
 		}
 
-		if (spop_conn->state >= SPOP_CS_ERROR) {
+		if (spop_conn->state == SPOP_CS_CLOSED) {
 			TRACE_STATE("end of connection reported", SPOP_EV_RX_FRAME|SPOP_EV_RX_EOI, spop_conn->conn);
 			break;
 		}
 
-		if (spop_conn->state == SPOP_CS_FRAME_H) {
+		if (spop_conn->dsi == -1) {
 			TRACE_PROTO("receiving SPOP frame header", SPOP_EV_RX_FRAME|SPOP_EV_RX_FHDR, spop_conn->conn);
 			if (!spop_get_frame_hdr(&spop_conn->dbuf, &hdr)) {
 				spop_conn->flags |= SPOP_CF_DEM_SHORT_READ;
@@ -2132,11 +2133,9 @@ static void spop_process_demux(struct spop_conn *spop_conn)
 			if ((int)hdr.len < 0 || (int)hdr.len > spop_conn->max_frame_size) {
 				spop_conn_error(spop_conn, SPOP_ERR_BAD_FRAME_SIZE);
 				TRACE_ERROR("invalid SPOP frame length", SPOP_EV_RX_FRAME|SPOP_EV_RX_FHDR|SPOP_EV_SPOP_CONN_ERR, spop_conn->conn);
-				TRACE_STATE("switching to CLOSED", SPOP_EV_RX_FRAME|SPOP_EV_RX_FHDR|SPOP_EV_SPOP_CONN_ERR, spop_conn->conn);
+				TRACE_STATE("switching to ERROR", SPOP_EV_RX_FRAME|SPOP_EV_RX_FHDR|SPOP_EV_SPOP_CONN_ERR, spop_conn->conn);
 				break;
 			}
-
-			spop_conn->state = SPOP_CS_FRAME_P;
 
 		  new_frame:
 			spop_conn->dsi = hdr.sid;
@@ -2144,29 +2143,28 @@ static void spop_process_demux(struct spop_conn *spop_conn)
 			spop_conn->dft = hdr.type;
 			spop_conn->dfl = hdr.len;
 			spop_conn->dff = hdr.flags;
-			TRACE_STATE("SPOP frame header rcvd, switching to FRAME_P", SPOP_EV_RX_FRAME|SPOP_EV_RX_FHDR, spop_conn->conn);
+			TRACE_STATE("SPOP frame header rcvd", SPOP_EV_RX_FRAME|SPOP_EV_RX_FHDR, spop_conn->conn);
 
 			/* Perform sanity check on the frame header */
 			if (!(spop_conn->dff & SPOP_FRM_FL_FIN)) {
 				spop_conn_error(spop_conn, SPOP_ERR_FRAG_NOT_SUPPORTED);
 				TRACE_ERROR("frame fragmentation not supported", SPOP_EV_RX_FRAME|SPOP_EV_RX_FHDR|SPOP_EV_SPOP_CONN_ERR, spop_conn->conn);
-				TRACE_STATE("switching to CLOSED", SPOP_EV_RX_FRAME|SPOP_EV_RX_FHDR|SPOP_EV_SPOP_CONN_ERR, spop_conn->conn);
+				TRACE_STATE("switching to ERROR", SPOP_EV_RX_FRAME|SPOP_EV_RX_FHDR|SPOP_EV_SPOP_CONN_ERR, spop_conn->conn);
 				break;
 			}
 			if (!spop_conn->dsi && spop_conn->dft == SPOP_FRM_T_AGENT_ACK) {
 				spop_conn_error(spop_conn, SPOP_ERR_INVALID);
 				TRACE_ERROR("invalid SPOP frame (ACK && dsi == 0)", SPOP_EV_RX_FRAME|SPOP_EV_RX_FHDR|SPOP_EV_SPOP_CONN_ERR, spop_conn->conn);
-				TRACE_STATE("switching to CLOSED", SPOP_EV_RX_FRAME|SPOP_EV_RX_FHDR|SPOP_EV_SPOP_CONN_ERR, spop_conn->conn);
+				TRACE_STATE("switching to ERROR", SPOP_EV_RX_FRAME|SPOP_EV_RX_FHDR|SPOP_EV_SPOP_CONN_ERR, spop_conn->conn);
 				break;
 			}
 			if (spop_conn->dsi && !spop_conn->dfi) {
 				spop_conn_error(spop_conn, SPOP_ERR_INVALID);
 				TRACE_ERROR("invalid SPOP frame (dsi != 0 && dfi == 0)", SPOP_EV_RX_FRAME|SPOP_EV_RX_FHDR|SPOP_EV_SPOP_CONN_ERR, spop_conn->conn);
-				TRACE_STATE("switching to CLOSED", SPOP_EV_RX_FRAME|SPOP_EV_RX_FHDR|SPOP_EV_SPOP_CONN_ERR, spop_conn->conn);
+				TRACE_STATE("switching to ERROR", SPOP_EV_RX_FRAME|SPOP_EV_RX_FHDR|SPOP_EV_SPOP_CONN_ERR, spop_conn->conn);
 				break;
 			}
 		}
-
 
 		tmp_spop_strm = spop_conn_st_by_id(spop_conn, spop_conn->dsi);
 		if (tmp_spop_strm != spop_strm && spop_strm && spop_strm_sc(spop_strm) &&
@@ -2221,13 +2219,15 @@ static void spop_process_demux(struct spop_conn *spop_conn)
 
 		switch (spop_conn->dft) {
 		case SPOP_FRM_T_AGENT_HELLO:
-			ret = spop_conn_handle_hello(spop_conn);
+			if (spop_conn->dsi == 0)
+				ret = spop_conn_handle_hello(spop_conn);
 			break;
 		case SPOP_FRM_T_AGENT_DISCON:
-			ret = spop_conn_handle_disconnect(spop_conn);
+			if (spop_conn->dsi == 0)
+				ret = spop_conn_handle_disconnect(spop_conn);
 			break;
 		case SPOP_FRM_T_AGENT_ACK:
-			if (spop_conn->state == SPOP_CS_FRAME_P)
+			if (spop_conn->dsi > 0)
 				ret = spop_conn_handle_ack(spop_conn, spop_strm);
 			break;
 		default:
@@ -2252,16 +2252,16 @@ static void spop_process_demux(struct spop_conn *spop_conn)
 		if (ret <= 0)
 			break;
 
-		if (spop_conn->state != SPOP_CS_FRAME_H) {
+		if (spop_conn->dsi >= 0) {
 			if (spop_conn->dfl) {
 				TRACE_DEVEL("skipping remaining frame payload", SPOP_EV_RX_FRAME, spop_conn->conn, spop_strm);
 				ret = MIN(b_data(&spop_conn->dbuf), spop_conn->dfl);
 				b_del(&spop_conn->dbuf, ret);
 				spop_conn->dfl -= ret;
 			}
-			if (!spop_conn->dfl && spop_conn->state != SPOP_CS_FRAME_P) {
-				TRACE_STATE("switching to FRAME_H", SPOP_EV_RX_FRAME|SPOP_EV_RX_FHDR, spop_conn->conn);
-				spop_conn->state = SPOP_CS_FRAME_H;
+			if (!spop_conn->dfl) {
+				TRACE_STATE("reset dsi", SPOP_EV_RX_FRAME|SPOP_EV_RX_FHDR, spop_conn->conn);
+				spop_conn->dsi = -1;
 			}
 		}
 	}
@@ -2272,12 +2272,19 @@ static void spop_process_demux(struct spop_conn *spop_conn)
 			spop_conn->flags |= SPOP_CF_END_REACHED;
 	}
 
+	if (spop_conn_read0_pending(spop_conn) && (spop_conn->flags & SPOP_CF_DEM_SHORT_READ) && b_data(&spop_conn->dbuf)) {
+		spop_conn_error(spop_conn, SPOP_ERR_INVALID);
+		spop_conn->state = SPOP_CS_CLOSED;
+		TRACE_ERROR("truncated data", SPOP_EV_RX_FRAME|SPOP_EV_RX_FHDR|SPOP_EV_SPOP_CONN_ERR, spop_conn->conn);
+		TRACE_STATE("switching to CLOSED", SPOP_EV_RX_FRAME|SPOP_EV_RX_FHDR|SPOP_EV_SPOP_CONN_ERR, spop_conn->conn);
+	}
+
 	if (spop_conn->flags & SPOP_CF_ERROR)
-		spop_conn_report_term_evt(spop_conn, ((eb_is_empty(&spop_conn->streams_by_id) && (spop_conn->state == SPOP_CS_FRAME_H))
+		spop_conn_report_term_evt(spop_conn, ((eb_is_empty(&spop_conn->streams_by_id) && (spop_conn->state == SPOP_CS_RUNNING) && spop_conn->dsi == -1)
 						      ? muxc_tevt_type_rcv_err
 						      : muxc_tevt_type_truncated_rcv_err));
 	else if (spop_conn->flags & SPOP_CF_END_REACHED)
-		spop_conn_report_term_evt(spop_conn, ((eb_is_empty(&spop_conn->streams_by_id) && (spop_conn->state == SPOP_CS_FRAME_H))
+		spop_conn_report_term_evt(spop_conn, ((eb_is_empty(&spop_conn->streams_by_id) && (spop_conn->state == SPOP_CS_RUNNING) && spop_conn->dsi == -1)
 						      ? muxc_tevt_type_shutr
 						      : muxc_tevt_type_truncated_shutr));
 
@@ -2307,7 +2314,7 @@ static int spop_process_mux(struct spop_conn *spop_conn)
 {
 	TRACE_ENTER(SPOP_EV_SPOP_CONN_WAKE, spop_conn->conn);
 
-	if (unlikely(spop_conn->state < SPOP_CS_FRAME_H)) {
+	if (unlikely(spop_conn->state < SPOP_CS_RUNNING)) {
 		if (unlikely(spop_conn->state == SPOP_CS_HA_HELLO)) {
 			TRACE_PROTO("sending SPOP HAPROXY HELLO fraame", SPOP_EV_TX_FRAME, spop_conn->conn);
 			if (unlikely(!spop_conn_send_hello(spop_conn)))
@@ -2316,7 +2323,7 @@ static int spop_process_mux(struct spop_conn *spop_conn)
 			TRACE_STATE("waiting for SPOP AGENT HELLO reply", SPOP_EV_TX_FRAME|SPOP_EV_RX_FRAME, spop_conn->conn);
 		}
 		/* need to wait for the other side */
-		if (spop_conn->state < SPOP_CS_FRAME_H)
+		if (spop_conn->state < SPOP_CS_RUNNING)
 			goto done;
 	}
 
@@ -2374,7 +2381,8 @@ static int spop_recv(struct spop_conn *spop_conn)
 		TRACE_DATA("received read0", SPOP_EV_SPOP_CONN_RECV, conn);
 		spop_conn->flags |= SPOP_CF_RCVD_SHUT;
 	}
-	if (conn->flags & CO_FL_ERROR) {
+	if ((conn->flags & CO_FL_ERROR) &&
+	    (!b_data(&spop_conn->dbuf) || (spop_conn->flags & SPOP_CF_DEM_SHORT_READ))) {
 		TRACE_DATA("connection error", SPOP_EV_SPOP_CONN_RECV, conn);
 		spop_conn->flags |= SPOP_CF_ERROR;
 	}
@@ -2498,7 +2506,7 @@ static int spop_send(struct spop_conn *spop_conn)
 	/* We're not full anymore, so we can wake any task that are waiting
 	 * for us.
 	 */
-	if (!(spop_conn->flags & (SPOP_CF_MUX_MFULL | SPOP_CF_DEM_MROOM)) && spop_conn->state >= SPOP_CS_FRAME_H) {
+	if (!(spop_conn->flags & (SPOP_CF_MUX_MFULL | SPOP_CF_DEM_MROOM)) && spop_conn->state >= SPOP_CS_RUNNING) {
 		spop_conn->flags &= ~SPOP_CF_WAIT_INLIST;
 		spop_resume_each_sending_spop_strm(spop_conn, &spop_conn->send_list);
 	}
@@ -2597,7 +2605,7 @@ static int spop_process(struct spop_conn *spop_conn)
 	    (b_data(&spop_conn->dbuf) || (spop_conn->flags & SPOP_CF_RCVD_SHUT))) {
 		spop_process_demux(spop_conn);
 
-		if (spop_conn->state == SPOP_CS_CLOSED || (spop_conn->flags & SPOP_CF_ERROR))
+		if (spop_conn->state >= SPOP_CS_ERROR || (spop_conn->flags & SPOP_CF_ERROR))
 			b_reset(&spop_conn->dbuf);
 
 		if (b_room(&spop_conn->dbuf))
@@ -2673,7 +2681,7 @@ static int spop_ctl(struct connection *conn, enum mux_ctl_type mux_ctl, void *ou
 
 	switch (mux_ctl) {
 	case MUX_CTL_STATUS:
-		if ((spop_conn->state >= SPOP_CS_FRAME_H && spop_conn->state < SPOP_CS_ERROR) &&
+		if (spop_conn->state == SPOP_CS_RUNNING &&
 		    !(spop_conn->flags & (SPOP_CF_ERROR|SPOP_CF_ERR_PENDING|SPOP_CF_END_REACHED|SPOP_CF_RCVD_SHUT|SPOP_CF_DISCO_SENT|SPOP_CF_DISCO_FAILED)))
 			ret |= MUX_STATUS_READY;
 		return ret;
@@ -3336,7 +3344,7 @@ static size_t spop_snd_buf(struct stconn *sc, struct buffer *buf, size_t count, 
 	}
 	spop_strm->flags &= ~SPOP_SF_NOTIFIED;
 
-	if (spop_conn->state < SPOP_CS_FRAME_H) {
+	if (spop_conn->state < SPOP_CS_RUNNING) {
 		TRACE_DEVEL("connection not ready, leaving", SPOP_EV_STRM_SEND|SPOP_EV_SPOP_STRM_BLK, spop_conn->conn, spop_strm);
 		return 0;
 	}

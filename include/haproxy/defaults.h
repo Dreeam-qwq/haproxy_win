@@ -44,7 +44,7 @@
  * doesn't engage us too far.
  */
 #ifndef MAX_TGROUPS
-#define MAX_TGROUPS 16
+#define MAX_TGROUPS 32
 #endif
 
 #define MAX_THREADS_PER_GROUP __WORDSIZE
@@ -53,7 +53,7 @@
  * long bits if more tgroups are enabled.
  */
 #ifndef MAX_THREADS
-#define MAX_THREADS ((((MAX_TGROUPS) > 1) ? 4 : 1) * (MAX_THREADS_PER_GROUP))
+#define MAX_THREADS ((((MAX_TGROUPS) > 1) ? 16 : 1) * (MAX_THREADS_PER_GROUP))
 #endif
 
 #endif // USE_THREAD
@@ -347,6 +347,11 @@
  */
 #ifndef SRV_CHK_INTER_THRES
 #define SRV_CHK_INTER_THRES 1000
+#endif
+
+/* INET6 connectivity caching interval (in ms) */
+#ifndef INET6_CONNECTIVITY_CACHE_TIME
+#define INET6_CONNECTIVITY_CACHE_TIME 30000
 #endif
 
 /* Specifies the string used to report the version and release date on the
@@ -653,5 +658,9 @@
 #ifndef QUIC_MAX_TX_MEM
 #define QUIC_MAX_TX_MEM 0
 #endif
+
+#ifndef STKTABLE_MAX_UPDATES_AT_ONCE
+#define STKTABLE_MAX_UPDATES_AT_ONCE 100
+#endif /* STKTABLE_MAX_UPDATES_AT_ONCE */
 
 #endif /* _HAPROXY_DEFAULTS_H */

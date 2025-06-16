@@ -660,7 +660,7 @@ OPTIONS_OBJS += src/mux_quic.o src/h3.o src/quic_rx.o src/quic_tx.o	\
                 src/quic_cc_nocc.o src/quic_cc.o src/quic_pacing.o	\
                 src/h3_stats.o src/quic_stats.o src/qpack-enc.o		\
                 src/qpack-tbl.o src/quic_cc_drs.o src/quic_fctl.o	\
-                src/cbuf.o src/quic_enc.o
+                src/quic_enc.o
 endif
 
 ifneq ($(USE_QUIC_OPENSSL_COMPAT:0=),)
@@ -984,7 +984,7 @@ OBJS += src/mux_h2.o src/mux_h1.o src/mux_fcgi.o src/log.o		\
         src/lb_fas.o src/clock.o src/sock_inet.o src/ev_select.o	\
         src/lb_map.o src/shctx.o src/mworker-prog.o src/hpack-dec.o	\
         src/arg.o src/signal.o src/fix.o src/dynbuf.o src/guid.o	\
-        src/cfgparse-tcp.o src/lb_ss.o src/chunk.o			\
+        src/cfgparse-tcp.o src/lb_ss.o src/chunk.o src/counters.o	\
         src/cfgparse-unix.o src/regex.o src/fcgi.o src/uri_auth.o	\
         src/eb64tree.o src/eb32tree.o src/eb32sctree.o src/lru.o	\
         src/limits.o src/ebimtree.o src/wdt.o src/hpack-tbl.o		\

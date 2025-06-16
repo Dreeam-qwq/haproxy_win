@@ -52,6 +52,7 @@ static int cpu_policy = 1; // "first-usable-node"
 
 /* list of CPU policies for "cpu-policy". The default one is the first one. */
 static int cpu_policy_first_usable_node(int policy, int tmin, int tmax, int gmin, int gmax, char **err);
+static int cpu_policy_group_by_ccx(int policy, int tmin, int tmax, int gmin, int gmax, char **err);
 static int cpu_policy_group_by_cluster(int policy, int tmin, int tmax, int gmin, int gmax, char **err);
 static int cpu_policy_performance(int policy, int tmin, int tmax, int gmin, int gmax, char **err);
 static int cpu_policy_efficiency(int policy, int tmin, int tmax, int gmin, int gmax, char **err);
@@ -60,6 +61,10 @@ static int cpu_policy_resource(int policy, int tmin, int tmax, int gmin, int gma
 static struct ha_cpu_policy ha_cpu_policy[] = {
 	{ .name = "none",               .desc = "use all available CPUs",                           .fct = NULL   },
 	{ .name = "first-usable-node",  .desc = "use only first usable node if nbthreads not set",  .fct = cpu_policy_first_usable_node, .arg = 0 },
+	{ .name = "group-by-ccx",       .desc = "make one thread group per CCX",                    .fct = cpu_policy_group_by_ccx ,     .arg = 1 },
+	{ .name = "group-by-2-ccx",     .desc = "make one thread group per 2 CCX",                  .fct = cpu_policy_group_by_ccx ,     .arg = 2 },
+	{ .name = "group-by-3-ccx",     .desc = "make one thread group per 3 CCX",                  .fct = cpu_policy_group_by_ccx ,     .arg = 3 },
+	{ .name = "group-by-4-ccx",     .desc = "make one thread group per 4 CCX",                  .fct = cpu_policy_group_by_ccx ,     .arg = 4 },
 	{ .name = "group-by-cluster",   .desc = "make one thread group per core cluster",           .fct = cpu_policy_group_by_cluster , .arg = 1 },
 	{ .name = "group-by-2-clusters",.desc = "make one thread group per 2 core clusters",        .fct = cpu_policy_group_by_cluster , .arg = 2 },
 	{ .name = "group-by-3-clusters",.desc = "make one thread group per 3 core clusters",        .fct = cpu_policy_group_by_cluster , .arg = 3 },
@@ -615,8 +620,16 @@ int _cmp_cluster_index(const void *a, const void *b)
 	return l->idx - r->idx;
 }
 
-/* function used by qsort to order clustes by reverse capacity */
+/* function used by qsort to order clusters by reverse capacity */
 int _cmp_cluster_capa(const void *a, const void *b)
+{
+	const struct ha_cpu_cluster *l = (const struct ha_cpu_cluster *)a;
+	const struct ha_cpu_cluster *r = (const struct ha_cpu_cluster *)b;
+	return r->capa - l->capa;
+}
+
+/* function used by qsort to order clusters by average reverse capacity */
+int _cmp_cluster_avg_capa(const void *a, const void *b)
 {
 	const struct ha_cpu_cluster *l = (const struct ha_cpu_cluster *)a;
 	const struct ha_cpu_cluster *r = (const struct ha_cpu_cluster *)b;
@@ -633,6 +646,12 @@ void cpu_cluster_reorder_by_index(struct ha_cpu_cluster *clusters, int entries)
 void cpu_cluster_reorder_by_capa(struct ha_cpu_cluster *clusters, int entries)
 {
 	qsort(clusters, entries, sizeof(*clusters), _cmp_cluster_capa);
+}
+
+/* re-order a CPU topology array by locality and avg capacity to detect clusters. */
+void cpu_cluster_reorder_by_avg_capa(struct ha_cpu_cluster *clusters, int entries)
+{
+	qsort(clusters, entries, sizeof(*clusters), _cmp_cluster_avg_capa);
 }
 
 /* returns an optimal maxcpus for the current system. It will take into
@@ -1074,10 +1093,11 @@ static int cpu_policy_first_usable_node(int policy, int tmin, int tmax, int gmin
  */
 static int cpu_policy_group_by_cluster(int policy, int tmin, int tmax, int gmin, int gmax, char **err)
 {
+	struct hap_cpuset visited_cl_set;
 	struct hap_cpuset node_cpu_set;
 	int cpu, cpu_start;
 	int cpu_count;
-	int cid, lcid;
+	int cid;
 	int thr_per_grp, nb_grp;
 	int thr;
 	int div;
@@ -1088,8 +1108,9 @@ static int cpu_policy_group_by_cluster(int policy, int tmin, int tmax, int gmin,
 	if (global.nbtgroups)
 		return 0;
 
+	ha_cpuset_zero(&visited_cl_set);
+
 	/* iterate over each new cluster */
-	lcid = -1;
 	cpu_start = 0;
 
 	/* used as a divisor of clusters*/
@@ -1104,7 +1125,8 @@ static int cpu_policy_group_by_cluster(int policy, int tmin, int tmax, int gmin,
 			/* skip disabled and already visited CPUs */
 			if (ha_cpu_topo[cpu].st & HA_CPU_F_EXCL_MASK)
 				continue;
-			if ((ha_cpu_topo[cpu].cl_gid / div) <= lcid)
+
+			if (ha_cpuset_isset(&visited_cl_set, ha_cpu_topo[cpu].cl_gid / div))
 				continue;
 
 			if (cid < 0) {
@@ -1118,12 +1140,15 @@ static int cpu_policy_group_by_cluster(int policy, int tmin, int tmax, int gmin,
 			ha_cpuset_set(&node_cpu_set, ha_cpu_topo[cpu].idx);
 			cpu_count++;
 		}
+
 		/* now cid = next cluster_id or -1 if none; cpu_count is the
 		 * number of CPUs in this cluster, and cpu_start is the next
 		 * cpu to restart from to scan for new clusters.
 		 */
 		if (cid < 0 || !cpu_count)
 			break;
+
+		ha_cpuset_set(&visited_cl_set, cid);
 
 		/* check that we're still within limits. If there are too many
 		 * CPUs but enough groups left, we'll try to make more smaller
@@ -1163,8 +1188,122 @@ static int cpu_policy_group_by_cluster(int policy, int tmin, int tmax, int gmin,
 			if (global.nbtgroups >= MAX_TGROUPS || global.nbthread >= MAX_THREADS)
 				break;
 		}
+	}
 
-		lcid = cid; // last cluster_id
+	if (global.nbthread)
+		ha_diag_warning("Created %d threads split into %d groups\n", global.nbthread, global.nbtgroups);
+	else
+		ha_diag_warning("Could not determine any CPU cluster\n");
+
+	return 0;
+}
+
+/* the "group-by-ccx" cpu-policy:
+ *  - does nothing if nbthread or thread-groups are set
+ *  - otherwise tries to create one thread-group per CCX (defined as the ID of
+ *    the last level cache), with as many threads as CPUs in the CCX, and bind
+ *    all the threads of this group to all the CPUs of the CCX. In practice, an
+ *    ID of layer3 will have been assigned so we'll use this.
+ * Also implements the variants "group-by-2-ccx", "group-by-3-ccx" and
+ * "group-by-4-ccx".
+ */
+static int cpu_policy_group_by_ccx(int policy, int tmin, int tmax, int gmin, int gmax, char **err)
+{
+	struct hap_cpuset visited_ccx_set;
+	struct hap_cpuset node_cpu_set;
+	int cpu, cpu_start;
+	int cpu_count;
+	int l3id;
+	int thr_per_grp, nb_grp;
+	int thr;
+	int div;
+
+	if (global.nbthread)
+		return 0;
+
+	if (global.nbtgroups)
+		return 0;
+
+	ha_cpuset_zero(&visited_ccx_set);
+
+	/* iterate over each new ccx */
+	cpu_start = 0;
+
+	/* used as a divisor of ccx */
+	div = ha_cpu_policy[policy].arg;
+	div = div ? div : 1;
+
+	while (global.nbtgroups < MAX_TGROUPS && global.nbthread < MAX_THREADS) {
+		ha_cpuset_zero(&node_cpu_set);
+		l3id = -1; cpu_count = 0;
+
+		for (cpu = cpu_start; cpu <= cpu_topo_lastcpu; cpu++) {
+			/* skip disabled and already visited CPUs */
+			if (ha_cpu_topo[cpu].st & HA_CPU_F_EXCL_MASK)
+				continue;
+
+			if (ha_cpuset_isset(&visited_ccx_set, ha_cpu_topo[cpu].ca_id[3] / div))
+				continue;
+
+			if (l3id < 0) {
+				l3id = ha_cpu_topo[cpu].ca_id[3] / div;
+				cpu_start = cpu + 1;
+			}
+			else if (l3id != ha_cpu_topo[cpu].ca_id[3] / div)
+				continue;
+
+			/* make a mask of all of this cluster's CPUs */
+			ha_cpuset_set(&node_cpu_set, ha_cpu_topo[cpu].idx);
+			cpu_count++;
+		}
+
+		/* now l3id = next L3 ID or -1 if none; cpu_count is the
+		 * number of CPUs in this CCX, and cpu_start is the next
+		 * cpu to restart from to scan for new clusters.
+		 */
+		if (l3id < 0 || !cpu_count)
+			break;
+
+		ha_cpuset_set(&visited_ccx_set, l3id);
+
+		/* check that we're still within limits. If there are too many
+		 * CPUs but enough groups left, we'll try to make more smaller
+		 * groups, of the closest size each.
+		 */
+		nb_grp = (cpu_count + MAX_THREADS_PER_GROUP - 1) / MAX_THREADS_PER_GROUP;
+		if (nb_grp > MAX_TGROUPS - global.nbtgroups)
+			nb_grp = MAX_TGROUPS - global.nbtgroups;
+		thr_per_grp = (cpu_count + nb_grp - 1) / nb_grp;
+		if (thr_per_grp > MAX_THREADS_PER_GROUP)
+			thr_per_grp = MAX_THREADS_PER_GROUP;
+
+		while (nb_grp && cpu_count > 0) {
+			/* create at most thr_per_grp threads */
+			if (thr_per_grp > cpu_count)
+				thr_per_grp = cpu_count;
+
+			if (thr_per_grp + global.nbthread > MAX_THREADS)
+				thr_per_grp = MAX_THREADS - global.nbthread;
+
+			/* let's create the new thread group */
+			ha_tgroup_info[global.nbtgroups].base  = global.nbthread;
+			ha_tgroup_info[global.nbtgroups].count = thr_per_grp;
+
+			/* assign to this group the required number of threads */
+			for (thr = 0; thr < thr_per_grp; thr++) {
+				ha_thread_info[thr + global.nbthread].tgid = global.nbtgroups + 1;
+				ha_thread_info[thr + global.nbthread].tg = &ha_tgroup_info[global.nbtgroups];
+				ha_thread_info[thr + global.nbthread].tg_ctx = &ha_tgroup_ctx[global.nbtgroups];
+				/* map these threads to all the CPUs */
+				ha_cpuset_assign(&cpu_map[global.nbtgroups].thread[thr], &node_cpu_set);
+			}
+
+			cpu_count -= thr_per_grp;
+			global.nbthread += thr_per_grp;
+			global.nbtgroups++;
+			if (global.nbtgroups >= MAX_TGROUPS || global.nbthread >= MAX_THREADS)
+				break;
+		}
 	}
 
 	if (global.nbthread)
@@ -1177,7 +1316,7 @@ static int cpu_policy_group_by_cluster(int policy, int tmin, int tmax, int gmin,
 
 /* the "performance" cpu-policy:
  *  - does nothing if nbthread or thread-groups are set
- *  - eliminates clusters whose total capacity is below half of others
+ *  - eliminates clusters whose average capacity is less than 80% that of others
  *  - tries to create one thread-group per cluster, with as many
  *    threads as CPUs in the cluster, and bind all the threads of
  *    this group to all the CPUs of the cluster.
@@ -1190,33 +1329,39 @@ static int cpu_policy_performance(int policy, int tmin, int tmax, int gmin, int 
 	if (global.nbthread || global.nbtgroups)
 		return 0;
 
-	/* sort clusters by reverse capacity */
-	cpu_cluster_reorder_by_capa(ha_cpu_clusters, cpu_topo_maxcpus);
+	/* sort clusters by average reverse capacity */
+	cpu_cluster_reorder_by_avg_capa(ha_cpu_clusters, cpu_topo_maxcpus);
 
 	capa = 0;
 	for (cluster = 0; cluster < cpu_topo_maxcpus; cluster++) {
-		if (capa && ha_cpu_clusters[cluster].capa < capa / 2) {
-			/* This cluster is more than twice as slow as the
-			 * previous one, we're not interested in using it.
+		if (capa && ha_cpu_clusters[cluster].capa * 10 < ha_cpu_clusters[cluster].nb_cpu * capa * 8) {
+			/* This cluster is made of cores delivering less than
+			 * 80% of the performance of those of the previous
+			 * cluster, previous one, we're not interested in
+			 * using it.
 			 */
 			for (cpu = 0; cpu <= cpu_topo_lastcpu; cpu++) {
 				if (ha_cpu_topo[cpu].cl_gid == ha_cpu_clusters[cluster].idx)
 					ha_cpu_topo[cpu].st |= HA_CPU_F_IGNORED;
 			}
 		}
+		else if (ha_cpu_clusters[cluster].nb_cpu)
+			capa = ha_cpu_clusters[cluster].capa / ha_cpu_clusters[cluster].nb_cpu;
 		else
-			capa = ha_cpu_clusters[cluster].capa;
+			capa = 0;
 	}
 
 	cpu_cluster_reorder_by_index(ha_cpu_clusters, cpu_topo_maxcpus);
 
-	/* and finish using the group-by-cluster strategy */
-	return cpu_policy_group_by_cluster(policy, tmin, tmax, gmin, gmax, err);
+	/* and finish using the group-by-ccx strategy, which will split around
+	 * L3 rather than just cluster types.
+	 */
+	return cpu_policy_group_by_ccx(policy, tmin, tmax, gmin, gmax, err);
 }
 
 /* the "efficiency" cpu-policy:
  *  - does nothing if nbthread or thread-groups are set
- *  - eliminates clusters whose total capacity is above half of others
+ *  - eliminates clusters whose average per-cpu capacity is above 80% of others
  *  - tries to create one thread-group per cluster, with as many
  *    threads as CPUs in the cluster, and bind all the threads of
  *    this group to all the CPUs of the cluster.
@@ -1229,28 +1374,33 @@ static int cpu_policy_efficiency(int policy, int tmin, int tmax, int gmin, int g
 	if (global.nbthread || global.nbtgroups)
 		return 0;
 
-	/* sort clusters by reverse capacity */
-	cpu_cluster_reorder_by_capa(ha_cpu_clusters, cpu_topo_maxcpus);
+	/* sort clusters by average reverse capacity */
+	cpu_cluster_reorder_by_avg_capa(ha_cpu_clusters, cpu_topo_maxcpus);
 
 	capa = 0;
 	for (cluster = cpu_topo_maxcpus - 1; cluster >= 0; cluster--) {
-		if (capa && ha_cpu_clusters[cluster].capa > capa * 2) {
-			/* This cluster is more than twice as fast as the
-			 * previous one, we're not interested in using it.
+		if (capa && ha_cpu_clusters[cluster].capa * 8 >= ha_cpu_clusters[cluster].nb_cpu * capa * 10) {
+			/* This cluster is made of cores each at last 25% faster
+			 * than those of the previous cluster, previous one, we're
+			 * not interested in using it.
 			 */
 			for (cpu = 0; cpu <= cpu_topo_lastcpu; cpu++) {
 				if (ha_cpu_topo[cpu].cl_gid == ha_cpu_clusters[cluster].idx)
 					ha_cpu_topo[cpu].st |= HA_CPU_F_IGNORED;
 			}
 		}
+		else if (ha_cpu_clusters[cluster].nb_cpu)
+			capa = ha_cpu_clusters[cluster].capa / ha_cpu_clusters[cluster].nb_cpu;
 		else
-			capa = ha_cpu_clusters[cluster].capa;
+			capa = 0;
 	}
 
 	cpu_cluster_reorder_by_index(ha_cpu_clusters, cpu_topo_maxcpus);
 
-	/* and finish using the group-by-cluster strategy */
-	return cpu_policy_group_by_cluster(policy, tmin, tmax, gmin, gmax, err);
+	/* and finish using the group-by-ccx strategy, which will split around
+	 * L3 rather than just cluster types.
+	 */
+	return cpu_policy_group_by_ccx(policy, tmin, tmax, gmin, gmax, err);
 }
 
 

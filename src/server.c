@@ -25,6 +25,7 @@
 #include <haproxy/check.h>
 #include <haproxy/cli.h>
 #include <haproxy/connection.h>
+#include <haproxy/counters.h>
 #include <haproxy/dict-t.h>
 #include <haproxy/errors.h>
 #include <haproxy/global.h>
@@ -36,6 +37,7 @@
 #include <haproxy/protocol.h>
 #include <haproxy/proxy.h>
 #include <haproxy/queue.h>
+#include <haproxy/quic_tp.h>
 #include <haproxy/resolvers.h>
 #include <haproxy/sample.h>
 #include <haproxy/sc_strm.h>
@@ -43,6 +45,7 @@
 #include <haproxy/stats.h>
 #include <haproxy/stconn.h>
 #include <haproxy/stream.h>
+#include <haproxy/stress.h>
 #include <haproxy/task.h>
 #include <haproxy/tcpcheck.h>
 #include <haproxy/time.h>
@@ -141,10 +144,12 @@ const char *srv_op_st_chg_cause(enum srv_op_st_chg_cause cause)
 
 int srv_downtime(const struct server *s)
 {
-	if ((s->cur_state != SRV_ST_STOPPED) || s->counters.last_change >= ns_to_sec(now_ns))		// ignore negative time
+	unsigned long last_change = COUNTERS_SHARED_LAST(s->proxy->be_counters.shared->tg, last_change);
+
+	if ((s->cur_state != SRV_ST_STOPPED) || last_change >= ns_to_sec(now_ns))		// ignore negative time
 		return s->down_time;
 
-	return ns_to_sec(now_ns) - s->counters.last_change + s->down_time;
+	return ns_to_sec(now_ns) - last_change + s->down_time;
 }
 
 int srv_getinter(const struct check *check)
@@ -2455,10 +2460,11 @@ INITCALL1(STG_REGISTER, srv_register_keywords, &srv_kws);
  */
 void server_recalc_eweight(struct server *sv, int must_update)
 {
+	unsigned long last_change = COUNTERS_SHARED_LAST(sv->proxy->be_counters.shared->tg, last_change);
 	struct proxy *px = sv->proxy;
 	unsigned w;
 
-	if (ns_to_sec(now_ns) < sv->counters.last_change || ns_to_sec(now_ns) >= sv->counters.last_change + sv->slowstart) {
+	if (ns_to_sec(now_ns) < last_change || ns_to_sec(now_ns) >= last_change + sv->slowstart) {
 		/* go to full throttle if the slowstart interval is reached unless server is currently down */
 		if ((sv->cur_state != SRV_ST_STOPPED) && (sv->next_state == SRV_ST_STARTING))
 			sv->next_state = SRV_ST_RUNNING;
@@ -2470,7 +2476,7 @@ void server_recalc_eweight(struct server *sv, int must_update)
 	if ((sv->cur_state == SRV_ST_STOPPED) && (sv->next_state == SRV_ST_STARTING) && (px->lbprm.algo & BE_LB_PROP_DYN))
 		w = 1;
 	else if ((sv->next_state == SRV_ST_STARTING) && (px->lbprm.algo & BE_LB_PROP_DYN))
-		w = (px->lbprm.wdiv * (ns_to_sec(now_ns) - sv->counters.last_change) + sv->slowstart) / sv->slowstart;
+		w = (px->lbprm.wdiv * (ns_to_sec(now_ns) - last_change) + sv->slowstart) / sv->slowstart;
 	else
 		w = px->lbprm.wdiv;
 
@@ -3014,8 +3020,12 @@ void srv_settings_cpy(struct server *srv, const struct server *src, int srv_tmpl
 	}
 }
 
-/* allocate a server and attach it to the global servers_list. Returns
- * the server on success, otherwise NULL.
+/* allocate a server, attachs it to the global servers_list
+ * and adds it to <proxy> server list. Before deleting the server with
+ * srv_drop(), srv_detach() must be called to remove it from the parent
+ * proxy list
+ *
+ * Returns the server on success, otherwise NULL.
  */
 struct server *new_server(struct proxy *proxy)
 {
@@ -3037,7 +3047,6 @@ struct server *new_server(struct proxy *proxy)
 	srv->rid = 0; /* rid defaults to 0 */
 
 	srv->next_state = SRV_ST_RUNNING; /* early server setup */
-	srv->counters.last_change = ns_to_sec(now_ns);
 
 	srv->check.obj_type = OBJ_TYPE_CHECK;
 	srv->check.status = HCHK_STATUS_INI;
@@ -3060,6 +3069,24 @@ struct server *new_server(struct proxy *proxy)
 #ifdef USE_OPENSSL
 	HA_RWLOCK_INIT(&srv->ssl_ctx.lock);
 #endif
+
+	// add server to proxy list:
+	/* TODO use a double-linked list for px->srv */
+	if (!(proxy->flags & PR_FL_CHECKED) || !proxy->srv) {
+		/* they are linked backwards first during parsing
+		 * This will be restablished after parsing.
+		 */
+		srv->next = proxy->srv;
+		proxy->srv = srv;
+	}
+	else {
+		struct server *sv = proxy->srv;
+
+		// runtime, add the server at the end of the list
+		while (sv && sv->next)
+			sv = sv->next;
+		sv->next = srv;
+	}
 
 	/* please don't put default server settings here, they are set in
 	 * proxy_preset_defaults().
@@ -3091,6 +3118,7 @@ void srv_free_params(struct server *srv)
 	free(srv->resolvers_id);
 	free(srv->addr_node.key);
 	free(srv->lb_nodes);
+	counters_be_shared_drop(srv->counters.shared);
 	if (srv->log_target) {
 		deinit_log_target(srv->log_target);
 		free(srv->log_target);
@@ -3112,6 +3140,9 @@ void srv_free_params(struct server *srv)
 /* Deallocate a server <srv> and its member. <srv> must be allocated. For
  * dynamic servers, its refcount is decremented first. The free operations are
  * conducted only if the refcount is nul.
+ *
+ * A general rule is to assume that proxy may already be freed, so cleanup checks
+ * must not depend on the proxy
  *
  * As a convenience, <srv.next> is returned if srv is not NULL. It may be useful
  * when calling srv_drop on the list of servers.
@@ -3156,33 +3187,10 @@ struct server *srv_drop(struct server *srv)
 
 	EXTRA_COUNTERS_FREE(srv->extra_counters);
 
-	if (srv->proxy->lbprm.server_deinit)
-		srv->proxy->lbprm.server_deinit(srv);
-
 	ha_free(&srv);
 
  end:
 	return next;
-}
-
-/* Detach server from proxy list. It is supported to call this
- * even if the server is not yet in the list
- */
-static void _srv_detach(struct server *srv)
-{
-	struct proxy *be = srv->proxy;
-
-	if (be->srv == srv) {
-		be->srv = srv->next;
-	}
-	else {
-		struct server *prev;
-
-		for (prev = be->srv; prev && prev->next != srv; prev = prev->next)
-			;
-		if (prev)
-			prev->next = srv->next;
-	}
 }
 
 /* Remove a server <srv> from a tracking list if <srv> is tracking another
@@ -3318,10 +3326,6 @@ static int _srv_parse_tmpl_init(struct server *srv, struct proxy *px)
 		/* Set this new server ID. */
 		_srv_parse_set_id_from_prefix(newsrv, srv->tmpl_info.prefix, i);
 
-		/* Linked backwards first. This will be restablished after parsing. */
-		newsrv->next = px->srv;
-		px->srv = newsrv;
-
 		newsrv->conf.name.key = newsrv->id;
 		ebis_insert(&curproxy->conf.used_server_name, &newsrv->conf.name);
 	}
@@ -3344,7 +3348,7 @@ static int _srv_parse_tmpl_init(struct server *srv, struct proxy *px)
  * This function is expected to be called after _srv_parse_init() initialization
  * but only when the effective server's proxy mode is known, which is not always
  * the case during parsing time, in which case the function will be called during
- * postparsing thanks to the _srv_postparse() below.
+ * postparsing thanks to the srv_init() below.
  *
  * Returns ERR_NONE on success else a combination or ERR_CODE.
  */
@@ -3400,23 +3404,77 @@ static int _srv_check_proxy_mode(struct server *srv, char postparse)
 
 	return err_code;
 }
-
-/* Perform some server postparsing checks / tasks:
+/* Finish initializing the server after parsing
+ *
  * We must be careful that checks / postinits performed within this function
  * don't depend or conflict with other postcheck functions that are registered
  * using REGISTER_POST_SERVER_CHECK() hook.
  *
  * Returns ERR_NONE on success else a combination or ERR_CODE.
  */
-static int _srv_postparse(struct server *srv)
+static int init_srv_requeue(struct server *srv);
+static int init_srv_slowstart(struct server *srv);
+static int srv_init_per_thr(struct server *srv);
+int srv_init(struct server *srv)
 {
 	int err_code = ERR_NONE;
 
+	if (srv->flags & SRV_F_CHECKED)
+		return ERR_NONE; // nothing to do
+
 	err_code |= _srv_check_proxy_mode(srv, 1);
 
+	if (err_code & ERR_CODE)
+		goto out;
+
+	srv->counters.shared = counters_be_shared_get(&srv->guid);
+	if (!srv->counters.shared) {
+		ha_alert("memory error while setting up shared counters for %s/%s server\n", srv->proxy->id, srv->id);
+		err_code |= ERR_ALERT | ERR_FATAL;
+		goto out;
+	}
+
+	if (srv->flags & SRV_F_DYNAMIC) {
+		/* A dynamic server is disabled on startup */
+		srv->next_admin = SRV_ADMF_FMAINT;
+		srv->next_state = SRV_ST_STOPPED;
+		server_recalc_eweight(srv, 0); // relies on srv counters
+		srv_lb_commit_status(srv);
+	}
+
+	err_code |= init_srv_requeue(srv);
+
+	if (err_code & ERR_CODE)
+		goto out;
+
+	err_code |= init_srv_slowstart(srv);
+
+	if (err_code & ERR_CODE)
+		goto out;
+
+	if (srv_init_per_thr(srv) == -1) {
+		ha_alert("error during per-thread init for %s/%s server\n", srv->proxy->id, srv->id);
+		err_code |= ERR_ALERT | ERR_FATAL;
+		goto out;
+	}
+
+	/* initialize idle conns lists */
+	if (srv->max_idle_conns != 0) {
+		srv->curr_idle_thr = calloc(global.nbthread, sizeof(*srv->curr_idle_thr));
+		if (!srv->curr_idle_thr) {
+			ha_alert("memory error during idle conn list init for %s/%s server\n",
+			         srv->proxy->id, srv->id);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+	}
+
+ out:
+	if (!(err_code & ERR_CODE))
+		srv->flags |= SRV_F_CHECKED;
 	return err_code;
 }
-REGISTER_POST_SERVER_CHECK(_srv_postparse);
+REGISTER_POST_SERVER_CHECK(srv_init);
 
 /* Allocate a new server pointed by <srv> and try to parse the first arguments
  * in <args> as an address for a server or an address-range for a template or
@@ -3532,12 +3590,28 @@ static int _srv_parse_init(struct server **srv, char **args, int *cur_arg,
 		                  (parse_flags & SRV_PARSE_INITIAL_RESOLVE ? PA_O_RESOLVE : 0) | PA_O_PORT_OK |
 				  (parse_flags & SRV_PARSE_IN_PEER_SECTION ? PA_O_PORT_MAND : PA_O_PORT_OFS) |
 				  PA_O_STREAM | PA_O_DGRAM | PA_O_XPRT);
+
 		if (!sk) {
 			ha_alert("%s\n", errmsg);
 			err_code |= ERR_ALERT | ERR_FATAL;
 			ha_free(&errmsg);
 			goto out;
 		}
+
+#ifdef USE_QUIC
+		if (srv_is_quic(newsrv)) {
+			if (!experimental_directives_allowed) {
+				ha_alert("QUIC is experimental for server '%s',"
+				         " must be allowed via a global 'expose-experimental-directives'\n",
+				         newsrv->id);
+				err_code |= ERR_ALERT | ERR_FATAL;
+				goto out;
+			}
+
+			newsrv->xprt = xprt_get(XPRT_QUIC);
+			quic_transport_params_init(&newsrv->quic_params, 0);
+		}
+#endif
 
 		if (!port1 || !port2) {
 			if (sk->ss_family != AF_CUST_RHTTP_SRV) {
@@ -3596,14 +3670,8 @@ static int _srv_parse_init(struct server **srv, char **args, int *cur_arg,
 		if (!(parse_flags & SRV_PARSE_DYNAMIC)) {
 			/* Copy default server settings to new server */
 			srv_settings_cpy(newsrv, &curproxy->defsrv, 0);
-		} else {
+		} else
 			srv_settings_init(newsrv);
-
-			/* A dynamic server is disabled on startup */
-			newsrv->next_admin = SRV_ADMF_FMAINT;
-			newsrv->next_state = SRV_ST_STOPPED;
-			server_recalc_eweight(newsrv, 0);
-		}
 		HA_SPIN_INIT(&newsrv->lock);
 	}
 	else {
@@ -3768,6 +3836,15 @@ static int _srv_parse_finalize(char **args, int cur_arg,
 		}
 	}
 
+#ifdef USE_QUIC
+	if (srv_is_quic(srv)) {
+		if (!srv->use_ssl) {
+			ha_alert("QUIC protocol detected without explicit SSL requirement. Use 'ssl' to fix this.\n");
+			return ERR_ALERT | ERR_FATAL;
+		}
+	}
+#endif
+
 	srv_lb_commit_status(srv);
 
 	return 0;
@@ -3802,12 +3879,6 @@ int parse_server(const char *file, int linenum, char **args,
 
 	err_code = _srv_parse_init(&newsrv, args, &cur_arg, curproxy,
 	                           parse_flags);
-
-	/* the servers are linked backwards first */
-	if (newsrv && !(parse_flags & SRV_PARSE_DEFAULT_SERVER)) {
-		newsrv->next = curproxy->srv;
-		curproxy->srv = newsrv;
-	}
 
 	if (err_code & ERR_CODE)
 		goto out;
@@ -5758,14 +5829,12 @@ static int init_srv_slowstart(struct server *srv)
 		if (srv->next_state == SRV_ST_STARTING) {
 			task_schedule(srv->warmup,
 			              tick_add(now_ms,
-			                       MS_TO_TICKS(MAX(1000, (ns_to_sec(now_ns) - srv->counters.last_change)) / 20)));
+			                       MS_TO_TICKS(MAX(1000, (ns_to_sec(now_ns) - COUNTERS_SHARED_LAST(srv->proxy->be_counters.shared->tg, last_change))) / 20)));
 		}
 	}
 
 	return ERR_NONE;
 }
-REGISTER_POST_SERVER_CHECK(init_srv_slowstart);
-
 
 /* allocate the tasklet that's meant to permit a server */
 static int init_srv_requeue(struct server *srv)
@@ -5782,12 +5851,11 @@ static int init_srv_requeue(struct server *srv)
 	t->context = srv;
 	return ERR_NONE;
 }
-REGISTER_POST_SERVER_CHECK(init_srv_requeue);
 
 /* Memory allocation and initialization of the per_thr field.
  * Returns 0 if the field has been successfully initialized, -1 on failure.
  */
-int srv_init_per_thr(struct server *srv)
+static int srv_init_per_thr(struct server *srv)
 {
 	int i;
 
@@ -5813,11 +5881,79 @@ int srv_init_per_thr(struct server *srv)
 	return 0;
 }
 
-/* Parse a "add server" command
- * Returns 0 if the server has been successfully initialized, 1 on failure.
+/* Distinguish between "add server" default usage or one of its sub-commands. */
+enum add_srv_mode {
+	ADD_SRV_MODE_DEF,  /* default mode, IO handler should be skipped by parser. */
+	ADD_SRV_MODE_HELP, /* help mode to list supported keywords */
+};
+
+/* Context for "add server" CLI. */
+struct add_srv_ctx {
+	enum add_srv_mode mode;
+	void *obj1;
+	void *obj2;
+};
+
+/* Handler for "add server" command. Should be reserved to extra sub-commands
+ * such as "help".
+ */
+int cli_io_handler_add_server(struct appctx *appctx)
+{
+	struct add_srv_ctx *ctx = appctx->svcctx;
+	struct srv_kw_list *kwl = ctx->obj1;
+	struct srv_kw *kw;
+
+	switch (ctx->mode) {
+	case ADD_SRV_MODE_HELP:
+		if (!kwl) {
+			/* first invocation */
+			if (applet_putstr(appctx, "List of keywords supported for dynamic server:\n") < 0)
+				return cli_err(appctx, "output error");
+
+			kwl = LIST_NEXT(&srv_keywords.list, struct srv_kw_list *, list);
+			ctx->obj1 = kwl;
+			ctx->obj2 = kwl->kw;
+		}
+
+		while (kwl != &srv_keywords) {
+			for (kw = ctx->obj2; kw->kw; ++kw) {
+				if (!kw->dynamic_ok)
+					continue;
+
+				ctx->obj2 = kw;
+				chunk_reset(&trash);
+				chunk_printf(&trash, "%s\n", kw->kw);
+				if (STRESS_RUN1(applet_putchk_stress(appctx, &trash) == -1,
+				                applet_putchk(appctx, &trash) == -1)) {
+					goto full;
+				}
+			}
+
+			kwl = LIST_NEXT(&kwl->list, struct srv_kw_list *, list);
+			ctx->obj1 = kwl;
+			ctx->obj2 = kwl->kw;
+		}
+		break;
+
+	case ADD_SRV_MODE_DEF:
+		/* Add srv parser must return 1 to prevent I/O handler execution in default mode. */
+		ABORT_NOW();
+		break;
+	}
+
+	return 1;
+
+ full:
+	return 0;
+}
+
+/* Parse a "add server" command.
+ *
+ * Returns 1 to skip I/O handler processing, unless a sub-command is executed.
  */
 static int cli_parse_add_server(char **args, char *payload, struct appctx *appctx, void *private)
 {
+	struct add_srv_ctx *ctx = applet_reserve_svcctx(appctx, sizeof(*ctx));
 	struct proxy *be;
 	struct server *srv;
 	char *be_name, *sv_name;
@@ -5832,6 +5968,13 @@ static int cli_parse_add_server(char **args, char *payload, struct appctx *appct
 
 	++args;
 
+	if (strcmp(args[1], "help") == 0) {
+		ctx->mode = ADD_SRV_MODE_HELP;
+		ctx->obj2 = ctx->obj1 = NULL;
+		return 0;
+	}
+
+	ctx->mode = ADD_SRV_MODE_DEF;
 	sv_name = be_name = args[1];
 	/* split backend/server arg */
 	while (*sv_name && *(++sv_name)) {
@@ -5867,6 +6010,15 @@ static int cli_parse_add_server(char **args, char *payload, struct appctx *appct
 	 */
 	thread_isolate();
 
+	/*
+	 * If a server with the same name is found, reject the new one.
+	 */
+	if (server_find_by_name(be, sv_name)) {
+		thread_release();
+		cli_err(appctx, "Already exists a server with the same name in backend.\n");
+		return 1;
+	}
+
 	args[1] = sv_name;
 	errcode = _srv_parse_init(&srv, args, &argc, be, parse_flags);
 	if (errcode)
@@ -5898,19 +6050,6 @@ static int cli_parse_add_server(char **args, char *payload, struct appctx *appct
 
 		if (!mux_ent || !isteq(mux_ent->token, srv->mux_proto->token)) {
 			ha_alert("MUX protocol is not usable for server.\n");
-			goto out;
-		}
-	}
-
-	if (srv_init_per_thr(srv) == -1) {
-		ha_alert("failed to allocate per-thread lists for server.\n");
-		goto out;
-	}
-
-	if (srv->max_idle_conns != 0) {
-		srv->curr_idle_thr = calloc(global.nbthread, sizeof(*srv->curr_idle_thr));
-		if (!srv->curr_idle_thr) {
-			ha_alert("failed to allocate counters for server.\n");
 			goto out;
 		}
 	}
@@ -5961,43 +6100,9 @@ static int cli_parse_add_server(char **args, char *payload, struct appctx *appct
 		srv->agent.state &= ~CHK_ST_ENABLED;
 	}
 
-	/* Init slowstart if needed. */
-	if (init_srv_slowstart(srv))
+	errcode = srv_init(srv);
+	if (errcode)
 		goto out;
-
-	if (init_srv_requeue(srv) != 0)
-		goto out;
-
-	/* Attach the server to the end of the proxy linked list. Note that this
-	 * operation is not thread-safe so this is executed under thread
-	 * isolation.
-	 *
-	 * If a server with the same name is found, reject the new one.
-	 */
-
-	/* TODO use a double-linked list for px->srv */
-	if (be->srv) {
-		struct server *next = be->srv;
-
-		while (1) {
-			/* check for duplicate server */
-			if (strcmp(srv->id, next->id) == 0) {
-				ha_alert("Already exists a server with the same name in backend.\n");
-				goto out;
-			}
-
-			if (!next->next)
-				break;
-
-			next = next->next;
-		}
-
-		next->next = srv;
-	}
-	else {
-		srv->next = be->srv;
-		be->srv = srv;
-	}
 
 	/* generate the server id if not manually specified */
 	if (!srv->puid) {
@@ -6059,9 +6164,7 @@ static int cli_parse_add_server(char **args, char *payload, struct appctx *appct
 		ha_warning("Ignoring cookie as HTTP mode is disabled.\n");
 
 	ha_notice("New server registered.\n");
-	cli_umsg(appctx, LOG_INFO);
-
-	return 0;
+	return cli_umsg(appctx, LOG_INFO);
 
 out:
 	if (srv) {
@@ -6078,7 +6181,7 @@ out:
 		}
 
 		/* remove the server from the proxy linked list */
-		_srv_detach(srv);
+		srv_detach(srv);
 	}
 
 	thread_release();
@@ -6272,6 +6375,9 @@ static int cli_parse_delete_server(char **args, char *payload, struct appctx *ap
 	if (srv->agent.state & CHK_ST_CONFIGURED)
 		check_purge(&srv->agent);
 
+	if (srv->proxy->lbprm.server_deinit)
+		srv->proxy->lbprm.server_deinit(srv);
+
 	while (!MT_LIST_ISEMPTY(&srv->watcher_list)) {
 		srv_watch = MT_LIST_NEXT(&srv->watcher_list, struct watcher *, el);
 		BUG_ON(srv->next && srv->next->flags & SRV_F_DELETED);
@@ -6282,7 +6388,7 @@ static int cli_parse_delete_server(char **args, char *payload, struct appctx *ap
 	 * The proxy servers list is currently not protected by a lock, so this
 	 * requires thread_isolate/release.
 	 */
-	_srv_detach(srv);
+	srv_detach(srv);
 
 	/* remove srv from addr_node tree */
 	eb32_delete(&srv->conf.id);
@@ -6329,7 +6435,7 @@ static struct cli_kw_list cli_kws = {{ },{
 	{ { "set", "server", NULL },             "set server <bk>/<srv> [opts]            : change a server's state, weight, address or ssl",             cli_parse_set_server },
 	{ { "get", "weight", NULL },             "get weight <bk>/<srv>                   : report a server's current weight",                            cli_parse_get_weight },
 	{ { "set", "weight", NULL },             "set weight <bk>/<srv>  (DEPRECATED)     : change a server's weight (use 'set server' instead)",         cli_parse_set_weight },
-	{ { "add", "server", NULL },             "add server <bk>/<srv>                   : create a new server",                                         cli_parse_add_server, NULL },
+	{ { "add", "server", NULL },             "add server <bk>/<srv>                   : create a new server",                                         cli_parse_add_server, cli_io_handler_add_server },
 	{ { "del", "server", NULL },             "del server <bk>/<srv>                   : remove a dynamically added server",                           cli_parse_delete_server, NULL },
 	{{},}
 }};
@@ -6926,14 +7032,16 @@ static void srv_update_status(struct server *s, int type, int cause)
 	/* check if server stats must be updated due the the server state change */
 	if (srv_prev_state != s->cur_state) {
 		if (srv_prev_state == SRV_ST_STOPPED) {
+			unsigned long last_change = COUNTERS_SHARED_LAST(s->proxy->be_counters.shared->tg, last_change);
+
 			/* server was down and no longer is */
-			if (s->counters.last_change < ns_to_sec(now_ns))                        // ignore negative times
-				s->down_time += ns_to_sec(now_ns) - s->counters.last_change;
+			if (last_change < ns_to_sec(now_ns))                        // ignore negative times
+				s->down_time += ns_to_sec(now_ns) - last_change;
 			_srv_event_hdl_publish(EVENT_HDL_SUB_SERVER_UP, cb_data.common, s);
 		}
 		else if (s->cur_state == SRV_ST_STOPPED) {
 			/* server was up and is currently down */
-			s->counters.down_trans++;
+			HA_ATOMIC_INC(&s->counters.shared->tg[tgid - 1]->down_trans);
 			_srv_event_hdl_publish(EVENT_HDL_SUB_SERVER_DOWN, cb_data.common, s);
 		}
 
@@ -6944,7 +7052,7 @@ static void srv_update_status(struct server *s, int type, int cause)
 		if (s->cur_state != SRV_ST_RUNNING && s->proxy->ready_srv == s)
 			HA_ATOMIC_STORE(&s->proxy->ready_srv, NULL);
 
-		s->counters.last_change = ns_to_sec(now_ns);
+		HA_ATOMIC_STORE(&s->counters.shared->tg[tgid - 1]->last_change, ns_to_sec(now_ns));
 
 		/* publish the state change */
 		_srv_event_hdl_prepare_state(&cb_data.state,
@@ -6956,12 +7064,14 @@ static void srv_update_status(struct server *s, int type, int cause)
 	if (prev_srv_count && s->proxy->srv_bck == 0 && s->proxy->srv_act == 0)
 		set_backend_down(s->proxy); /* backend going down */
 	else if (!prev_srv_count && (s->proxy->srv_bck || s->proxy->srv_act)) {
+		unsigned long last_change = COUNTERS_SHARED_LAST(s->proxy->be_counters.shared->tg, last_change);
+
 		/* backend was down and is back up again:
 		 * no helper function, updating last_change and backend downtime stats
 		 */
-		if (s->proxy->be_counters.last_change < ns_to_sec(now_ns))         // ignore negative times
-			s->proxy->down_time += ns_to_sec(now_ns) - s->proxy->be_counters.last_change;
-		s->proxy->be_counters.last_change = ns_to_sec(now_ns);
+		if (last_change < ns_to_sec(now_ns))         // ignore negative times
+			s->proxy->down_time += ns_to_sec(now_ns) - last_change;
+		HA_ATOMIC_STORE(&s->proxy->be_counters.shared->tg[tgid - 1]->last_change, ns_to_sec(now_ns));
 	}
 }
 

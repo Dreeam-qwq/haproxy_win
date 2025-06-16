@@ -65,6 +65,7 @@
 #include <haproxy/proxy.h>
 #include <haproxy/quic_conn.h>
 #include <haproxy/quic_openssl_compat.h>
+#include <haproxy/quic_ssl.h>
 #include <haproxy/quic_tp.h>
 #include <haproxy/sample.h>
 #include <haproxy/sc_strm.h>
@@ -145,6 +146,10 @@ struct global_ssl global_ssl = {
 	.ocsp_update.mode = SSL_SOCK_OCSP_UPDATE_OFF,
 	.ocsp_update.disable = 0,
 #endif
+#ifdef HAVE_ACME
+	.acme_scheduler = 1,
+#endif
+
 };
 
 static BIO_METHOD *ha_meth;
@@ -921,7 +926,7 @@ static int ssl_tlsext_ticket_key_cb(SSL *s, unsigned char key_name[16], unsigned
 		ref  = __objt_listener(conn->target)->bind_conf->keys_ref;
 #ifdef USE_QUIC
 	else if (qc)
-		ref =  qc->li->bind_conf->keys_ref;
+		ref =  __objt_listener(qc->target)->bind_conf->keys_ref;
 #endif
 
 	if (!ref) {
@@ -1477,7 +1482,7 @@ int ssl_sock_bind_verifycbk(int ok, X509_STORE_CTX *x_store)
 	else {
 		qc = SSL_get_ex_data(ssl, ssl_qc_app_data_index);
 		BUG_ON(!qc); /* Must never happen */
-		bind_conf = qc->li->bind_conf;
+		bind_conf = __objt_listener(qc->target)->bind_conf;
 		ctx = qc->xprt_ctx;
 	}
 #endif
@@ -3035,6 +3040,20 @@ error:
 	return errcode;
 }
 
+#ifdef USE_QUIC
+static inline SSL_CTX *ssl_sock_new_ssl_ctx(int is_quic)
+{
+	if (is_quic)
+		return ssl_quic_srv_new_ssl_ctx();
+	else
+		return SSL_CTX_new(SSLv23_client_method());
+}
+#else
+static inline SSL_CTX *ssl_sock_new_ssl_ctx(int is_quic)
+{
+	return SSL_CTX_new(SSLv23_client_method());
+}
+#endif
 
 /*
  * This function allocate a ckch_inst that will be used on the backend side
@@ -3046,7 +3065,7 @@ error:
  *     ERR_WARN if a warning is available into err
  */
 int ckch_inst_new_load_srv_store(const char *path, struct ckch_store *ckchs,
-				 struct ckch_inst **ckchi, char **err)
+				 struct ckch_inst **ckchi, char **err, int is_quic)
 {
 	SSL_CTX *ctx;
 	struct ckch_data *data;
@@ -3060,7 +3079,7 @@ int ckch_inst_new_load_srv_store(const char *path, struct ckch_store *ckchs,
 
 	data = ckchs->data;
 
-	ctx = SSL_CTX_new(SSLv23_client_method());
+	ctx = ssl_sock_new_ssl_ctx(is_quic);
 	if (!ctx) {
 		memprintf(err, "%sunable to allocate SSL context for cert '%s'.\n",
 		          err && *err ? *err : "", path);
@@ -3131,7 +3150,8 @@ static int ssl_sock_load_srv_ckchs(const char *path, struct ckch_store *ckchs,
 	int errcode = 0;
 
 	/* we found the ckchs in the tree, we can use it directly */
-	errcode |= ckch_inst_new_load_srv_store(path, ckchs, ckch_inst, err);
+	errcode |= ckch_inst_new_load_srv_store(path, ckchs, ckch_inst, err,
+	                                        srv_is_quic(server));
 
 	if (errcode & ERR_CODE)
 		return errcode;
@@ -4394,7 +4414,9 @@ int ssl_sock_prepare_srv_ctx(struct server *srv)
 			return cfgerr;
 		}
 	}
-	if (srv->use_ssl == 1)
+
+	/* The QUIC server xprt has already been set. */
+	if (srv->use_ssl == 1 && !srv_is_quic(srv))
 		srv->xprt = &ssl_sock;
 
 	if (srv->ssl_ctx.client_crt) {
@@ -4421,7 +4443,7 @@ int ssl_sock_prepare_srv_ctx(struct server *srv)
 	/* The context will be uninitialized if there wasn't any "cert" option
 	 * in the server line. */
 	if (!ctx) {
-		ctx = SSL_CTX_new(SSLv23_client_method());
+		ctx = ssl_sock_new_ssl_ctx(srv_is_quic(srv));
 		if (!ctx) {
 			ha_alert("unable to allocate ssl context.\n");
 			cfgerr++;
@@ -4772,7 +4794,7 @@ int ssl_sock_prepare_bind_conf(struct bind_conf *bind_conf)
 
 	/* check if we have certificates */
 	if (eb_is_empty(&bind_conf->sni_ctx) && eb_is_empty(&bind_conf->sni_w_ctx)) {
-		if (bind_conf->strict_sni && !(bind_conf->options & BC_O_GENERATE_CERTS)) {
+		if ((bind_conf->ssl_options & BC_SSL_O_STRICT_SNI) && !(bind_conf->options & BC_O_GENERATE_CERTS)) {
 			ha_warning("Proxy '%s': no SSL certificate specified for bind '%s' at [%s:%d], ssl connections will fail (use 'crt').\n",
 				   px->id, bind_conf->arg, bind_conf->file, bind_conf->line);
 		}

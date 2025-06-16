@@ -75,6 +75,7 @@
 #include <haproxy/cli.h>
 #include <haproxy/clock.h>
 #include <haproxy/connection.h>
+#include <haproxy/counters.h>
 #ifdef USE_CPU_AFFINITY
 #include <haproxy/cpuset.h>
 #include <haproxy/cpu_topo.h>
@@ -187,6 +188,7 @@ struct global global = {
 		.sslcachesize = SSLCACHESIZE,
 #endif
 		.comp_maxlevel = 1,
+		.glitch_kill_maxidle = 100,
 #ifdef DEFAULT_IDLE_TIMER
 		.idle_timer = DEFAULT_IDLE_TIMER,
 #else
@@ -814,10 +816,10 @@ static void sig_dump_state(struct sig_handler *sh)
 		send_log(p, LOG_NOTICE, "SIGHUP received, dumping servers states for proxy %s.\n", p->id);
 		while (s) {
 			chunk_printf(&trash,
-			             "SIGHUP: Server %s/%s is %s. Conn: %d act, %d pend, %lld tot.",
+			             "SIGHUP: Server %s/%s is %s. Conn: %d act, %d pend, %llu tot.",
 			             p->id, s->id,
 			             (s->cur_state != SRV_ST_STOPPED) ? "UP" : "DOWN",
-			             s->cur_sess, s->queueslength, s->counters.cum_sess);
+			             s->cur_sess, s->queueslength, (ullong)COUNTERS_SHARED_TOTAL(s->counters.shared->tg, cum_sess, HA_ATOMIC_LOAD));
 			ha_warning("%s\n", trash.area);
 			send_log(p, LOG_NOTICE, "%s\n", trash.area);
 			s = s->next;
@@ -826,21 +828,21 @@ static void sig_dump_state(struct sig_handler *sh)
 		/* FIXME: those info are a bit outdated. We should be able to distinguish between FE and BE. */
 		if (!p->srv) {
 			chunk_printf(&trash,
-			             "SIGHUP: Proxy %s has no servers. Conn: act(FE+BE): %d+%d, %d pend (%d unass), tot(FE+BE): %lld+%lld.",
+			             "SIGHUP: Proxy %s has no servers. Conn: act(FE+BE): %d+%d, %d pend (%d unass), tot(FE+BE): %llu+%llu.",
 			             p->id,
-			             p->feconn, p->beconn, p->totpend, p->queueslength, p->fe_counters.cum_conn, p->be_counters.cum_sess);
+			             p->feconn, p->beconn, p->totpend, p->queueslength, (ullong)COUNTERS_SHARED_TOTAL(p->fe_counters.shared->tg, cum_conn, HA_ATOMIC_LOAD), (ullong)COUNTERS_SHARED_TOTAL(p->be_counters.shared->tg, cum_sess, HA_ATOMIC_LOAD));
 		} else if (p->srv_act == 0) {
 			chunk_printf(&trash,
-			             "SIGHUP: Proxy %s %s ! Conn: act(FE+BE): %d+%d, %d pend (%d unass), tot(FE+BE): %lld+%lld.",
+			             "SIGHUP: Proxy %s %s ! Conn: act(FE+BE): %d+%d, %d pend (%d unass), tot(FE+BE): %llu+%llu.",
 			             p->id,
 			             (p->srv_bck) ? "is running on backup servers" : "has no server available",
-			             p->feconn, p->beconn, p->totpend, p->queueslength, p->fe_counters.cum_conn, p->be_counters.cum_sess);
+			             p->feconn, p->beconn, p->totpend, p->queueslength, (ullong)COUNTERS_SHARED_TOTAL(p->fe_counters.shared->tg, cum_conn, HA_ATOMIC_LOAD), (ullong)COUNTERS_SHARED_TOTAL(p->be_counters.shared->tg, cum_sess, HA_ATOMIC_LOAD));
 		} else {
 			chunk_printf(&trash,
 			             "SIGHUP: Proxy %s has %d active servers and %d backup servers available."
-			             " Conn: act(FE+BE): %d+%d, %d pend (%d unass), tot(FE+BE): %lld+%lld.",
+			             " Conn: act(FE+BE): %d+%d, %d pend (%d unass), tot(FE+BE): %llu+%llu.",
 			             p->id, p->srv_act, p->srv_bck,
-			             p->feconn, p->beconn, p->totpend, p->queueslength, p->fe_counters.cum_conn, p->be_counters.cum_sess);
+			             p->feconn, p->beconn, p->totpend, p->queueslength, (ullong)COUNTERS_SHARED_TOTAL(p->fe_counters.shared->tg, cum_conn, HA_ATOMIC_LOAD), (ullong)COUNTERS_SHARED_TOTAL(p->be_counters.shared->tg, cum_sess, HA_ATOMIC_LOAD));
 		}
 		ha_warning("%s\n", trash.area);
 		send_log(p, LOG_NOTICE, "%s\n", trash.area);
@@ -2100,7 +2102,7 @@ static void step_init_2(int argc, char** argv)
 	clock_adjust_now_offset();
 	ready_date = date;
 
-	for (px = proxies_list; px; px = px->next) {
+	list_for_each_entry(px, &proxies, global_list) {
 		struct server *srv;
 		struct post_proxy_check_fct *ppcf;
 		struct post_server_check_fct *pscf;
@@ -2924,6 +2926,8 @@ void run_poll_loop()
 							wake_thread(i);
 					break;
 				}
+#else
+				break;
 #endif
 			}
 		}

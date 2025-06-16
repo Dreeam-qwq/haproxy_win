@@ -34,6 +34,7 @@
 #include <haproxy/cfgparse.h>
 #include <haproxy/check.h>
 #include <haproxy/chunk.h>
+#include <haproxy/counters.h>
 #include <haproxy/dgram.h>
 #include <haproxy/dynbuf.h>
 #include <haproxy/extcheck.h>
@@ -194,10 +195,11 @@ static void check_trace(enum trace_level level, uint64_t mask,
 			      ((check->type == PR_O2_EXT_CHK) ? 'E' : (check->state & CHK_ST_AGENT ? 'A' : 'H')),
 			      srv->id);
 
-		chunk_appendf(&trace_buf, " status=%d/%d %s",
+		chunk_appendf(&trace_buf, " status=%d/%d %s exp=%d",
 			      (check->health >= check->rise) ? check->health - check->rise + 1 : check->health,
 			      (check->health >= check->rise) ? check->fall : check->rise,
-			      (check->health >= check->rise) ? (srv->uweight ? "UP" : "DRAIN") : "DOWN");
+			      (check->health >= check->rise) ? (srv->uweight ? "UP" : "DRAIN") : "DOWN",
+			      (check->task->expire ? TICKS_TO_MS(check->task->expire - now_ms) : 0));
 	}
 	else
 		chunk_appendf(&trace_buf, " : [EMAIL]");
@@ -514,7 +516,7 @@ void set_server_check_status(struct check *check, short status, const char *desc
 		if ((!(check->state & CHK_ST_AGENT) ||
 		    (check->status >= HCHK_STATUS_L57DATA)) &&
 		    (check->health > 0)) {
-			_HA_ATOMIC_INC(&s->counters.failed_checks);
+			_HA_ATOMIC_INC(&s->counters.shared->tg[tgid - 1]->failed_checks);
 			report = 1;
 			check->health--;
 			if (check->health < check->rise)
@@ -742,7 +744,7 @@ void __health_adjust(struct server *s, short status)
 	HA_SPIN_UNLOCK(SERVER_LOCK, &s->lock);
 
 	HA_ATOMIC_STORE(&s->consecutive_errors, 0);
-	_HA_ATOMIC_INC(&s->counters.failed_hana);
+	_HA_ATOMIC_INC(&s->counters.shared->tg[tgid - 1]->failed_hana);
 
 	if (s->check.fastinter) {
 		/* timer might need to be advanced, it might also already be
@@ -822,9 +824,6 @@ void chk_report_conn_err(struct check *check, int errno_bck, int expired)
 	errno = unclean_errno(errno_bck);
 	if (conn && errno)
 		retrieve_errno_from_socket(conn);
-
-	if (conn && !(conn->flags & CO_FL_ERROR) && !sc_ep_test(sc, SE_FL_ERROR) && !expired)
-		return;
 
 	TRACE_ENTER(CHK_EV_HCHK_END|CHK_EV_HCHK_ERR, check, 0, 0, (size_t[]){expired});
 
@@ -978,6 +977,11 @@ void chk_report_conn_err(struct check *check, int errno_bck, int expired)
 		set_server_check_status(check, tout, err_msg);
 	}
 
+	if (check->result == CHK_RES_UNKNOWN) {
+		/* No other reason found, report a socket error (may be an internal or a ressournce error) */
+		set_server_check_status(check, HCHK_STATUS_SOCKERR, err_msg);
+	}
+
 	TRACE_LEAVE(CHK_EV_HCHK_END|CHK_EV_HCHK_ERR, check);
 	return;
 }
@@ -994,6 +998,7 @@ int httpchk_build_status_header(struct server *s, struct buffer *buf)
 				      "UP %d/%d", "UP",
 				      "NOLB %d/%d", "NOLB",
 				      "no check" };
+	unsigned long last_change = COUNTERS_SHARED_LAST(s->counters.shared->tg, last_change);
 
 	if (!(s->check.state & CHK_ST_ENABLED))
 		sv_state = 6;
@@ -1031,9 +1036,9 @@ int httpchk_build_status_header(struct server *s, struct buffer *buf)
 		      s->queueslength);
 
 	if ((s->cur_state == SRV_ST_STARTING) &&
-	    ns_to_sec(now_ns) < s->counters.last_change + s->slowstart &&
-	    ns_to_sec(now_ns) >= s->counters.last_change) {
-		ratio = MAX(1, 100 * (ns_to_sec(now_ns) - s->counters.last_change) / s->slowstart);
+	    ns_to_sec(now_ns) < last_change + s->slowstart &&
+	    ns_to_sec(now_ns) >= last_change) {
+		ratio = MAX(1, 100 * (ns_to_sec(now_ns) - last_change) / s->slowstart);
 		chunk_appendf(buf, "; throttle=%d%%", ratio);
 	}
 
@@ -1087,6 +1092,11 @@ int wake_srv_chk(struct stconn *sc)
 		 * the result is handled ASAP. */
 		ret = -1;
 		task_wakeup(check->task, TASK_WOKEN_IO);
+	}
+	else {
+		/* Check in progress. Queue it to eventually handle timeout
+		 * update */
+		task_queue(check->task);
 	}
 
 	if (check->server)

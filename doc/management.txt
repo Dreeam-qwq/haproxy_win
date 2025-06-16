@@ -1,7 +1,7 @@
                              ------------------------
                              HAProxy Management Guide
                              ------------------------
-                                   version 3.2
+                                   version 3.3
 
 
 This document describes how to start, stop, manage, and troubleshoot HAProxy,
@@ -324,6 +324,16 @@ list of options is :
         the allocated area to verify that it hasn't been modified since it was
         last released. This works best with "no-merge", "cold-first" and "tag".
         Enabling this option will slightly increase the CPU usage.
+
+      - backup / no-backup:
+        This option performs a copy of each released object at release time,
+        allowing developers to inspect them. It also performs a comparison at
+        allocation time to detect if anything changed in between, indicating a
+        use-after-free condition. This doubles the memory usage and slightly
+        increases the CPU usage (similar to "integrity"). If combined with
+        "integrity", it still duplicates the contents but doesn't perform the
+        comparison (which is performed by "integrity"). Just like "integrity",
+        it works best with "no-merge", "cold-first" and "tag".
 
       - no-global / global:
         Depending on the operating system, a process-wide global memory cache
@@ -1641,19 +1651,28 @@ abort ssl crl-file <crlfile>
 
   See also "set ssl crl-file" and "commit ssl crl-file".
 
-acme ps
-  Show the running ACME tasks. See also "acme renew".
-
-  Example:
-    $ echo "@1 acme ps" | socat /run/haproxy-master.sock - | column -t -s $'\t'
-    # certificate     section   state
-    foobar.pem.rsa    LE1       Running
-    foobar.pem.ecdsa  LE2       Running
-
 acme renew <certificate>
   Starts an ACME certificate generation task with the given certificate name.
-  The certificate must be linked to an acme section, see section 3.13. of the
-  configuration manual. See also "acme ps".
+  The certificate must be linked to an acme section, see section 12.8 "ACME"
+  of the configuration manual. See also "acme status".
+
+acme status
+  Show the status of every certificates that were configured with ACME.
+
+  This command outputs, separated by a tab:
+  - The name of the certificate configured in haproxy
+  - The acme section used in the configuration
+  - The state of the acme task, either "Running", "Scheduled" or "Stopped"
+  - The UTC expiration date of the certificate in ISO8601 format
+  - The relative expiration time (0d if expired)
+  - The UTC scheduled date of the certificate in ISO8601 format
+  - The relative schedule time (0d if Running)
+
+  Example:
+    $ echo "@1; acme status" | socat /tmp/master.sock - | column -t -s $'\t'
+    # certificate   section  state      expiration date (UTC)  expires in        scheduled date (UTC)  scheduled in
+    ecdsa.pem       LE       Running    2020-01-18T09:31:12Z   0d 0h00m00s       2020-01-15T21:31:12Z  0d 0h00m00s
+    foobar.pem.rsa  LE       Scheduled  2025-08-04T11:50:54Z   89d 23h01m13s     2025-07-27T23:50:55Z  82d 11h01m14s
 
 add acl [@<ver>] <acl> <pattern>
   Add an entry into the acl <acl>. <acl> is the #<id> or the <name> returned by
@@ -1705,8 +1724,9 @@ add server <backend>/<server> [args]*
   The <server> name must not be already used in the backend. A special
   restriction is put on the backend which must used a dynamic load-balancing
   algorithm. A subset of keywords from the server config file statement can be
-  used to configure the server behavior. Also note that no settings will be
-  reused from an hypothetical 'default-server' statement in the same backend.
+  used to configure the server behavior (see "add server help" to list them).
+  Also note that no settings will be reused from an hypothetical
+  'default-server' statement in the same backend.
 
   Currently a dynamic server is statically initialized with the "none"
   init-addr method. This means that no resolution will be undertaken if a FQDN
@@ -1736,78 +1756,10 @@ add server <backend>/<server> [args]*
   servers. Please refer to the "u-limit" global keyword documentation in this
   case.
 
-  Here is the list of the currently supported keywords :
-
-  - agent-addr
-  - agent-check
-  - agent-inter
-  - agent-port
-  - agent-send
-  - allow-0rtt
-  - alpn
-  - addr
-  - backup
-  - ca-file
-  - check
-  - check-alpn
-  - check-proto
-  - check-send-proxy
-  - check-sni
-  - check-ssl
-  - check-via-socks4
-  - ciphers
-  - ciphersuites
-  - cookie
-  - crl-file
-  - crt
-  - disabled
-  - downinter
-  - error-limit
-  - fall
-  - fastinter
-  - force-sslv3/tlsv10/tlsv11/tlsv12/tlsv13
-  - id
-  - init-state
-  - inter
-  - maxconn
-  - maxqueue
-  - minconn
-  - no-ssl-reuse
-  - no-sslv3/tlsv10/tlsv11/tlsv12/tlsv13
-  - no-tls-tickets
-  - npn
-  - observe
-  - on-error
-  - on-marked-down
-  - on-marked-up
-  - pool-low-conn
-  - pool-max-conn
-  - pool-purge-delay
-  - port
-  - proto
-  - proxy-v2-options
-  - rise
-  - send-proxy
-  - send-proxy-v2
-  - send-proxy-v2-ssl
-  - send-proxy-v2-ssl-cn
-  - slowstart
-  - sni
-  - source
-  - ssl
-  - ssl-max-ver
-  - ssl-min-ver
-  - tfo
-  - tls-tickets
-  - track
-  - usesrc
-  - verify
-  - verifyhost
-  - weight
-  - ws
-
-  Their syntax is similar to the server line from the configuration file,
-  please refer to their individual documentation for details.
+add server help
+  List the keywords supported for dynamic servers by the current haproxy
+  version. Keyword syntax is similar to the server line from the configuration
+  file, please refer to their individual documentation for details.
 
 add ssl ca-file <cafile> <payload>
    Add a new certificate to a ca-file. This command is useful when you reached
@@ -3255,11 +3207,11 @@ show quic [<format>] [<filter>]
 
   An optional argument can be specified to control the verbosity. Its value can
   be interpreted in different way. The first possibility is to used predefined
-  values, "oneline" for the default format and "full" to display all
-  information. Alternatively, a list of comma-delimited fields can be specified
-  to restrict output. Currently supported values are "tp", "sock", "pktns",
-  "cc" and "mux". Finally, "help" in the format will instead show a more
-  detailed help message.
+  values, "oneline" for the default format, "stream" to list every active
+  streams and "full" to display all information. Alternatively, a list of
+  comma-delimited fields can be specified to restrict output. Currently
+  supported values are "tp", "sock", "pktns", "cc" and "mux". Finally, "help"
+  in the format will instead show a more detailed help message.
 
   The final argument is used to restrict or extend the connection list. By
   default, connections on closing or draining state are not displayed. Use the
@@ -3274,7 +3226,29 @@ show servers conn [<backend>]
   The output consists in a header line showing the fields titles, then one
   server per line with for each, the backend name and ID, server name and ID,
   the address, port and a series or values. The number of fields varies
-  depending on thread count.
+  depending on thread count. The exact format of the output may vary slightly
+  across versions and depending on the number of threads. One needs to pay
+  attention to the header line to match columns when extracting output values,
+  and to the number of threads as the last columns are per-thread:
+
+     bkname/svname         Backend name '/' server name
+     bkid/svid             Backend ID '/' server ID
+     addr                  Server's IP address
+     port                  Server's port (or zero if none)
+     -                     Unused field, serves as a visual delimiter
+     purge_delay           Interval between connection purges, in milliseconds
+     used_cur              Number of connections currently in use
+     used_max              Highest value of used_cur since the process started
+     need_est              Floating estimate of total needed connections
+     unsafe_nb             Number of idle connections considered as "unsafe"
+     safe_nb               Number of idle connections considered as "safe"
+     idle_lim              Configured maximum number of idle connections
+     idle_cur              Total of the per-thread currently idle connections
+     idle_per_thr[NB]      Idle conns per thread for each one of the NB threads
+
+  HAProxy will kill a portion of <idle_cur> every <purge_delay> when the total
+  of <idle_cur> + <used_cur> exceeds the estimate <need_est>. This estimate
+  varies based on connection activity.
 
   Given the threaded nature of idle connections, it's important to understand
   that some values may change once read, and that as such, consistency within a

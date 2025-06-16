@@ -171,6 +171,7 @@ enum srv_init_state {
 #define SRV_F_DEFSRV_USE_SSL 0x4000      /* default-server uses SSL */
 #define SRV_F_DELETED 0x8000             /* srv is deleted but not yet purged */
 #define SRV_F_STRICT_MAXCONN 0x10000     /* maxconn is to be strictly enforced, as a limit of outbound connections */
+#define SRV_F_CHECKED      0x20000       /* set once server was postparsed */
 
 /* configured server options for send-proxy (server->pp_opts) */
 #define SRV_PP_V1               0x0001   /* proxy protocol version 1 */
@@ -477,6 +478,9 @@ struct server {
 		char *alpn_str;                 /* ALPN protocol string */
 		int alpn_len;                   /* ALPN protocol string length */
 	} ssl_ctx;
+#ifdef USE_QUIC
+	struct quic_transport_params quic_params; /* QUIC transport parameters */
+#endif
 	struct resolv_srvrq *srvrq;		/* Pointer representing the DNS SRV requeest, if any */
 	struct list srv_rec_item;		/* to attach server to a srv record item */
 	struct list ip_rec_item;		/* to attach server to a A or AAAA record item */

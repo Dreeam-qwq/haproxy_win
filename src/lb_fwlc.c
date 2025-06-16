@@ -496,9 +496,9 @@ static void fwlc_srv_reposition(struct server *s)
 	 */
 	mt_list_unlock_full(&s->lb_mt_list, list);
 
-	HA_RWLOCK_RDUNLOCK(LBPRM_LOCK, &s->proxy->lbprm.lock);
-
 	s->tree_elt = tree_elt;
+
+	HA_RWLOCK_RDUNLOCK(LBPRM_LOCK, &s->proxy->lbprm.lock);
 
 	if (allocated_elt)
 		s->free_elt = allocated_elt;
@@ -762,13 +762,14 @@ redo:
 	while (node) {
 		struct fwlc_tree_elt *tree_elt;
 		struct server *s;
+		int unusable = 0;
 		int orig_nb;
 		int i = 0;
 
 		tree_elt = eb32_entry(node, struct fwlc_tree_elt, lb_node);
 		orig_nb = statistical_prng_range(FWLC_LISTS_NB);
 
-		while (_HA_ATOMIC_LOAD(&tree_elt->elements) > 0) {
+		while (_HA_ATOMIC_LOAD(&tree_elt->elements) > unusable) {
 			struct mt_list mt_list;
 			mt_list.next = _HA_ATOMIC_LOAD(&tree_elt->srv_list[(i + orig_nb) % FWLC_LISTS_NB].next);
 
@@ -785,12 +786,16 @@ redo:
 						 * The server has more requests than expected,
 						 * let's try to reposition it, to avoid too
 						 * many threads using the same server at the
-						 * same time.
+						 * same time. From the moment we release the
+						 * lock, we cannot trust the node nor tree_elt
+						 * anymore, so we need to loop back to the
+						 * beginning.
 						 */
 						if (i >= FWLC_LISTS_NB) {
 							HA_RWLOCK_RDUNLOCK(LBPRM_LOCK, &p->lbprm.lock);
 							fwlc_srv_reposition(s);
 							HA_RWLOCK_RDLOCK(LBPRM_LOCK, &p->lbprm.lock);
+							goto redo;
 						}
 						i++;
 						continue;
@@ -802,6 +807,8 @@ redo:
                                         }
 					avoided = s;
 				}
+				else
+					unusable++;
 				i++;
 			} else if (mt_list.next == &tree_elt->srv_list[(i + orig_nb) % FWLC_LISTS_NB]) {
 				i++;

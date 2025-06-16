@@ -25,6 +25,7 @@
 #include <haproxy/capture-t.h>
 #include <haproxy/cfgparse.h>
 #include <haproxy/cli.h>
+#include <haproxy/counters.h>
 #include <haproxy/errors.h>
 #include <haproxy/fd.h>
 #include <haproxy/filters.h>
@@ -58,7 +59,8 @@
 
 
 int listeners;	/* # of proxy listeners, set by cfgparse */
-struct proxy *proxies_list  = NULL;	/* list of all existing proxies */
+struct proxy *proxies_list  = NULL;     /* list of main proxies */
+struct list proxies = LIST_HEAD_INIT(proxies); /* list of all proxies */
 struct eb_root used_proxy_id = EB_ROOT;	/* list of proxy IDs in use */
 struct eb_root proxy_by_name = EB_ROOT; /* tree of proxies sorted by name */
 struct eb_root defproxy_by_name = EB_ROOT; /* tree of default proxies sorted by name (dups possible) */
@@ -218,7 +220,10 @@ static inline void proxy_free_common(struct proxy *px)
 	/* note that the node's key points to p->id */
 	ebpt_delete(&px->conf.by_name);
 	ha_free(&px->id);
+	LIST_DEL_INIT(&px->global_list);
 	drop_file_name(&px->conf.file);
+	counters_fe_shared_drop(px->fe_counters.shared);
+	counters_be_shared_drop(px->be_counters.shared);
 	ha_free(&px->check_command);
 	ha_free(&px->check_path);
 	ha_free(&px->cookie_name);
@@ -371,6 +376,10 @@ void deinit_proxy(struct proxy *p)
 	while (s) {
 		list_for_each_entry(srvdf, &server_deinit_list, list)
 			srvdf->fct(s);
+
+		if (p->lbprm.server_deinit)
+			p->lbprm.server_deinit(s);
+
 		s = srv_drop(s);
 	}/* end while(s) */
 
@@ -387,8 +396,12 @@ void deinit_proxy(struct proxy *p)
 		LIST_DELETE(&l->by_fe);
 		LIST_DELETE(&l->by_bind);
 		free(l->name);
+		free(l->label);
 		free(l->per_thr);
-		free(l->counters);
+		if (l->counters) {
+			counters_fe_shared_drop(l->counters->shared);
+			free(l->counters);
+		}
 		task_destroy(l->rx.rhttp.task);
 
 		EXTRA_COUNTERS_FREE(l->extra_counters);
@@ -1463,6 +1476,7 @@ void init_new_proxy(struct proxy *p)
 {
 	memset(p, 0, sizeof(struct proxy));
 	p->obj_type = OBJ_TYPE_PROXY;
+	LIST_INIT(&p->global_list);
 	LIST_INIT(&p->acl);
 	LIST_INIT(&p->http_req_rules);
 	LIST_INIT(&p->http_res_rules);
@@ -1697,21 +1711,13 @@ void proxy_unref_defaults(struct proxy *px)
  */
 int setup_new_proxy(struct proxy *px, const char *name, unsigned int cap, char **errmsg)
 {
-	uint last_change;
-
 	init_new_proxy(px);
-
-	last_change = ns_to_sec(now_ns);
-	if (cap & PR_CAP_FE)
-		px->fe_counters.last_change = last_change;
-	if (cap & PR_CAP_BE)
-		px->be_counters.last_change = last_change;
 
 	if (name) {
 		px->id = strdup(name);
 		if (!px->id) {
-			memprintf(errmsg, "proxy '%s': out of memory", name);
-			return 0;
+			memprintf(errmsg, "out of memory");
+			goto fail;
 		}
 	}
 
@@ -1720,7 +1726,20 @@ int setup_new_proxy(struct proxy *px, const char *name, unsigned int cap, char *
 	if (name && !(cap & PR_CAP_INT))
 		proxy_store_name(px);
 
+	if (!(cap & PR_CAP_DEF))
+		LIST_APPEND(&proxies, &px->global_list);
+
 	return 1;
+
+ fail:
+	if (name)
+		memprintf(errmsg, "proxy '%s': %s", name, *errmsg);
+
+	ha_free(&px->id);
+	counters_fe_shared_drop(px->fe_counters.shared);
+	counters_be_shared_drop(px->be_counters.shared);
+
+	return 0;
 }
 
 /* Allocates a new proxy <name> of type <cap>.
@@ -1749,6 +1768,46 @@ struct proxy *alloc_new_proxy(const char *name, unsigned int cap, char **errmsg)
 	free(curproxy);
 	return NULL;
 }
+
+/* post-check for proxies */
+static int proxy_postcheck(struct proxy *px)
+{
+	int err_code = ERR_NONE;
+
+	/* allocate private memory for shared counters: used as a fallback
+	 * or when sharing is disabled. If sharing is enabled pointers will
+	 * be updated to point to the proper shared memory location during
+	 * proxy postparsing, see proxy_postparse()
+	 */
+	if (px->cap & PR_CAP_FE) {
+		px->fe_counters.shared = counters_fe_shared_get(&px->guid);
+		if (!px->fe_counters.shared) {
+			ha_alert("out of memory while setting up shared counters for %s %s\n",
+			         proxy_type_str(px), px->id);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+	}
+	if (px->cap & (PR_CAP_FE|PR_CAP_BE)) {
+		/* by default stream->be points to stream->fe, thus proxy
+		 * be_counters may be used even if the proxy lacks the backend
+		 * capability
+		 */
+		px->be_counters.shared = counters_be_shared_get(&px->guid);
+		if (!px->be_counters.shared) {
+			ha_alert("out of memory while setting up shared counters for %s %s\n",
+			         proxy_type_str(px), px->id);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+
+	}
+
+
+ out:
+	return err_code;
+}
+REGISTER_POST_PROXY_CHECK(proxy_postcheck);
 
 /* Copy the proxy settings from <defproxy> to <curproxy>.
  * Returns 0 on success.
@@ -2053,6 +2112,9 @@ void proxy_cond_resume(struct proxy *p)
  */
 void proxy_cond_disable(struct proxy *p)
 {
+	long long cum_conn = 0;
+	long long cum_sess = 0;
+
 	if (p->flags & (PR_FL_DISABLED|PR_FL_STOPPED))
 		return;
 
@@ -2067,13 +2129,18 @@ void proxy_cond_disable(struct proxy *p)
 	 * peers, etc) we must not report them at all as they're not really on
 	 * the data plane but on the control plane.
 	 */
+	if (p->cap & PR_CAP_FE)
+		cum_conn = COUNTERS_SHARED_TOTAL(p->fe_counters.shared->tg, cum_conn, HA_ATOMIC_LOAD);
+	if (p->cap & PR_CAP_BE)
+		cum_sess = COUNTERS_SHARED_TOTAL(p->be_counters.shared->tg, cum_sess, HA_ATOMIC_LOAD);
+
 	if ((p->mode == PR_MODE_TCP || p->mode == PR_MODE_HTTP || p->mode == PR_MODE_SYSLOG || p->mode == PR_MODE_SPOP) && !(p->cap & PR_CAP_INT))
 		ha_warning("Proxy %s stopped (cumulated conns: FE: %lld, BE: %lld).\n",
-			   p->id, p->fe_counters.cum_conn, p->be_counters.cum_sess);
+			   p->id, cum_conn, cum_sess);
 
 	if ((p->mode == PR_MODE_TCP || p->mode == PR_MODE_HTTP || p->mode == PR_MODE_SPOP) && !(p->cap & PR_CAP_INT))
 		send_log(p, LOG_WARNING, "Proxy %s stopped (cumulated conns: FE: %lld, BE: %lld).\n",
-			 p->id, p->fe_counters.cum_conn, p->be_counters.cum_sess);
+			 p->id, cum_conn, cum_sess);
 
 	if (p->table && p->table->size && p->table->sync_task)
 		task_wakeup(p->table->sync_task, TASK_WOKEN_MSG);
@@ -2160,7 +2227,8 @@ struct task *manage_proxy(struct task *t, void *context, unsigned int state)
 		goto out;
 
 	if (p->fe_sps_lim &&
-	    (wait = next_event_delay(&p->fe_counters.sess_per_sec, p->fe_sps_lim, 0))) {
+	    (wait = COUNTERS_SHARED_TOTAL_ARG2(p->fe_counters.shared->tg, sess_per_sec, next_event_delay, p->fe_sps_lim, 0))) {
+
 		/* we're blocking because a limit was reached on the number of
 		 * requests/s on the frontend. We want to re-check ASAP, which
 		 * means in 1 ms before estimated expiration date, because the
@@ -2904,7 +2972,7 @@ static int dump_servers_state(struct appctx *appctx)
 		dump_server_addr(&srv->check.addr, srv_check_addr);
 		dump_server_addr(&srv->agent.addr, srv_agent_addr);
 
-		srv_time_since_last_change = ns_to_sec(now_ns) - srv->counters.last_change;
+		srv_time_since_last_change = ns_to_sec(now_ns) - COUNTERS_SHARED_LAST(srv->counters.shared->tg, last_change);
 		bk_f_forced_id = px->options & PR_O_FORCED_ID ? 1 : 0;
 		srv_f_forced_id = srv->flags & SRV_F_FORCED_ID ? 1 : 0;
 

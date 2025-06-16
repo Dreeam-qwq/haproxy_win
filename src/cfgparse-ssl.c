@@ -1094,10 +1094,13 @@ static int srv_parse_tls_method_minmax(char **args, int *cur_arg, struct proxy *
 	return parse_tls_method_minmax(args, *cur_arg, &newsrv->ssl_ctx.methods, err);
 }
 
-/* parse the "no-tls-tickets" bind keyword */
+/* parse the "no-tls-tickets" and "tls-tickets" bind keywords */
 static int bind_parse_no_tls_tickets(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
 {
-	conf->ssl_options |= BC_SSL_O_NO_TLS_TICKETS;
+	if (strncmp(args[cur_arg], "no-", 3) == 0)
+		conf->ssl_options |= BC_SSL_O_NO_TLS_TICKETS;
+	else
+		conf->ssl_options &= ~BC_SSL_O_NO_TLS_TICKETS;
 	return 0;
 }
 
@@ -1307,10 +1310,13 @@ static int bind_parse_generate_certs(char **args, int cur_arg, struct proxy *px,
 	return 0;
 }
 
-/* parse the "strict-sni" bind keyword */
+/* parse the "strict-sni" and "no-strict-sni" bind keywords */
 static int bind_parse_strict_sni(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
 {
-	conf->strict_sni = 1;
+	if (strncmp(args[cur_arg], "no-", 3) != 0)
+		conf->ssl_options |= BC_SSL_O_STRICT_SNI;
+	else
+		conf->ssl_options &= ~BC_SSL_O_STRICT_SNI;
 	return 0;
 }
 
@@ -2027,8 +2033,14 @@ static int ssl_parse_default_bind_options(char **args, int section_type, struct 
 	while (*(args[i])) {
 		if (strcmp(args[i], "no-tls-tickets") == 0)
 			global_ssl.listen_default_ssloptions |= BC_SSL_O_NO_TLS_TICKETS;
+		else if (strcmp(args[i], "tls-tickets") == 0)
+			global_ssl.listen_default_ssloptions &= ~BC_SSL_O_NO_TLS_TICKETS;
 		else if (strcmp(args[i], "prefer-client-ciphers") == 0)
 			global_ssl.listen_default_ssloptions |= BC_SSL_O_PREF_CLIE_CIPH;
+		else if (strcmp(args[i], "strict-sni") == 0)
+			global_ssl.listen_default_ssloptions |= BC_SSL_O_STRICT_SNI;
+		else if (strcmp(args[i], "no-strict-sni") == 0)
+			global_ssl.listen_default_ssloptions &= ~BC_SSL_O_STRICT_SNI;
 		else if (strcmp(args[i], "ssl-min-ver") == 0 || strcmp(args[i], "ssl-max-ver") == 0) {
 			if (!parse_tls_method_minmax(args, i, &global_ssl.listen_default_sslmethods, err))
 				i++;
@@ -2186,6 +2198,13 @@ static int proxy_parse_ssl_f_use(char **args, int section_type, struct proxy *cu
 		memprintf(err, "not enough memory!");
 		goto error;
 	}
+	cfg_crt_node->filename = strdup(file);
+	if (!cfg_crt_node->filename) {
+		memprintf(err, "not enough memory!");
+		goto error;
+	}
+	cfg_crt_node->linenum = linenum;
+
 
 	ckch_conf = calloc(1, sizeof *ckch_conf);
 	if (!ckch_conf) {
@@ -2193,14 +2212,34 @@ static int proxy_parse_ssl_f_use(char **args, int section_type, struct proxy *cu
 		goto error;
 	}
 
-	ckch_conf->crt = strdup(args[1]);
-	if (!ckch_conf->crt) {
-		memprintf(err, "not enough memory!");
-		goto error;
-	}
-
 	while (*args[cur_arg]) {
-		int found = 0;
+		int foundcrtstore = 0; /* found a crt-store keyword */
+		int found = 0;         /* found a crt-list or crt-store keyword */
+
+		if (strcmp("crt", args[cur_arg]) == 0) {
+			char path[MAXPATHLEN+1];
+			const char *arg = args[cur_arg+1];
+
+			if (ckch_conf->crt) {
+				memprintf(err, "'%s' already specified, aborting.", "crt");
+				goto error;
+			}
+			if (*arg != '@' && *arg != '/' && global_ssl.crt_base) {
+				if ((strlen(global_ssl.crt_base) + 1 + strlen(arg)) > sizeof(path) ||
+				     snprintf(path, sizeof(path), "%s/%s",  global_ssl.crt_base, arg) > sizeof(path)) {
+					memprintf(err, "parsing [%s:%d]: '%s' : path too long",
+					          file, linenum, arg);
+					cfgerr |= ERR_ALERT | ERR_FATAL;
+					goto error;
+				}
+				arg = path;
+			}
+			free(ckch_conf->crt);
+			ckch_conf->crt = strdup(arg);
+			cur_arg += 2;
+			found = 1;
+			goto next;
+		}
 
 		/* first look for crt-list keywords */
 		for (i = 0; ssl_crtlist_kws[i].kw != NULL; i++) {
@@ -2223,10 +2262,11 @@ static int proxy_parse_ssl_f_use(char **args, int section_type, struct proxy *cu
 		}
 
 		/* then look for ckch_conf keywords */
-		cfgerr |= ckch_conf_parse(args, cur_arg, ckch_conf, &found, file, linenum, err);
+		cfgerr |= ckch_conf_parse(args, cur_arg, ckch_conf, &foundcrtstore, file, linenum, err);
 		if (cfgerr & ERR_CODE)
 			goto error;
-		if (found) {
+		if (foundcrtstore) {
+			found = 1;
 			cur_arg += 2;  /* skip 2 words if the keyword was found */
 			ckch_conf->used = CKCH_CONF_SET_CRTLIST; /* if they are options they must be used everywhere */
 			goto next;
@@ -2254,7 +2294,7 @@ error:
 }
 
 /*
- * After parsing the crt keywords in a frontend/listen section, create the corresponding crt-list and initialize the
+ * After parsing the ssl-f-use keywords in a frontend/listen section, create the corresponding crt-list and initialize the
  * certificates
  */
 
@@ -2418,6 +2458,7 @@ static struct bind_kw_list bind_kws = { "SSL", { }, {
 	{ "no-alpn",               bind_parse_no_alpn,            0 }, /* disable sending ALPN */
 	{ "no-ca-names",           bind_parse_no_ca_names,        0 }, /* do not send ca names to clients (ca_file related) */
 	{ "no-sslv3",              bind_parse_tls_method_options, 0 }, /* disable SSLv3 */
+	{ "no-strict-sni",         bind_parse_strict_sni,         0 }, /* do not refuse negotiation if sni doesn't match a certificate */
 	{ "no-tlsv10",             bind_parse_tls_method_options, 0 }, /* disable TLSv10 */
 	{ "no-tlsv11",             bind_parse_tls_method_options, 0 }, /* disable TLSv11 */
 	{ "no-tlsv12",             bind_parse_tls_method_options, 0 }, /* disable TLSv12 */
@@ -2428,6 +2469,7 @@ static struct bind_kw_list bind_kws = { "SSL", { }, {
 	{ "ssl-min-ver",           bind_parse_tls_method_minmax,  1 }, /* minimum version */
 	{ "ssl-max-ver",           bind_parse_tls_method_minmax,  1 }, /* maximum version */
 	{ "strict-sni",            bind_parse_strict_sni,         0 }, /* refuse negotiation if sni doesn't match a certificate */
+	{ "tls-tickets",           bind_parse_no_tls_tickets,     0 }, /* enable session resumption tickets */
 	{ "tls-ticket-keys",       bind_parse_tls_ticket_keys,    1 }, /* set file to load TLS ticket keys from */
 	{ "verify",                bind_parse_verify,             1 }, /* set SSL verify method */
 	{ "npn",                   bind_parse_npn,                1 }, /* set NPN supported protocols */

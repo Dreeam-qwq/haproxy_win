@@ -1348,7 +1348,7 @@ static int postcheck_log_backend(struct proxy *be)
 	int err_code = ERR_NONE;
 	int target_type = -1; // -1 is unused in log_tgt enum
 
-	if (be->mode != PR_MODE_SYSLOG ||
+	if (!(be->cap & PR_CAP_BE) || be->mode != PR_MODE_SYSLOG ||
 	    (be->flags & (PR_FL_DISABLED|PR_FL_STOPPED)))
 		return ERR_NONE; /* nothing to do */
 
@@ -5946,15 +5946,15 @@ missing_budget:
 
 parse_error:
 	if (l->counters)
-		_HA_ATOMIC_INC(&l->counters->failed_req);
-	_HA_ATOMIC_INC(&frontend->fe_counters.failed_req);
+		_HA_ATOMIC_INC(&l->counters->shared->tg[tgid - 1]->failed_req);
+	_HA_ATOMIC_INC(&frontend->fe_counters.shared->tg[tgid - 1]->failed_req);
 
 	goto error;
 
 cli_abort:
 	if (l->counters)
-		_HA_ATOMIC_INC(&l->counters->cli_aborts);
-	_HA_ATOMIC_INC(&frontend->fe_counters.cli_aborts);
+		_HA_ATOMIC_INC(&l->counters->shared->tg[tgid - 1]->cli_aborts);
+	_HA_ATOMIC_INC(&frontend->fe_counters.shared->tg[tgid - 1]->cli_aborts);
 
 error:
 	se_fl_set(appctx->sedesc, SE_FL_ERROR);

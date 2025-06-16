@@ -493,7 +493,7 @@ static struct eb32_node *insert_entry(struct cache *cache, struct cache_tree *tr
 			if (last_clear_ts == date.tv_sec) {
 				/* Too many entries for this primary key, clear the
 				 * one that was inserted. */
-				release_entry_locked(tree, entry);
+				release_entry_locked(tree, new_entry);
 				return NULL;
 			}
 
@@ -503,7 +503,7 @@ static struct eb32_node *insert_entry(struct cache *cache, struct cache_tree *tr
 				 * the newly inserted one. */
 				entry = container_of(prev, struct cache_entry, eb);
 				entry->last_clear_ts = date.tv_sec;
-				release_entry_locked(tree, entry);
+				release_entry_locked(tree, new_entry);
 				return NULL;
 			}
 		}
@@ -2133,9 +2133,9 @@ enum act_return http_action_req_cache_use(struct act_rule *rule, struct proxy *p
 		return ACT_RET_CONT;
 
 	if (px == strm_fe(s))
-		_HA_ATOMIC_INC(&px->fe_counters.p.http.cache_lookups);
+		_HA_ATOMIC_INC(&px->fe_counters.shared->tg[tgid - 1]->p.http.cache_lookups);
 	else
-		_HA_ATOMIC_INC(&px->be_counters.p.http.cache_lookups);
+		_HA_ATOMIC_INC(&px->be_counters.shared->tg[tgid - 1]->p.http.cache_lookups);
 
 	cache_tree = get_cache_tree_from_hash(cache, read_u32(s->txn->cache_hash));
 
@@ -2222,9 +2222,9 @@ enum act_return http_action_req_cache_use(struct act_rule *rule, struct proxy *p
                                 should_send_notmodified_response(cache, htxbuf(&s->req.buf), res);
 
 			if (px == strm_fe(s))
-				_HA_ATOMIC_INC(&px->fe_counters.p.http.cache_hits);
+				_HA_ATOMIC_INC(&px->fe_counters.shared->tg[tgid - 1]->p.http.cache_hits);
 			else
-				_HA_ATOMIC_INC(&px->be_counters.p.http.cache_hits);
+				_HA_ATOMIC_INC(&px->be_counters.shared->tg[tgid - 1]->p.http.cache_hits);
 			return ACT_RET_CONT;
 		} else {
 			s->target = NULL;

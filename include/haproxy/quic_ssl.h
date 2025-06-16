@@ -34,8 +34,10 @@
 #include <haproxy/ssl_sock-t.h>
 
 int ssl_quic_initial_ctx(struct bind_conf *bind_conf);
-int qc_alloc_ssl_sock_ctx(struct quic_conn *qc);
+SSL_CTX *ssl_quic_srv_new_ssl_ctx(void);
+int qc_alloc_ssl_sock_ctx(struct quic_conn *qc, struct connection *conn);
 int qc_ssl_provide_all_quic_data(struct quic_conn *qc, struct ssl_sock_ctx *ctx);
+int quic_ssl_set_tls_cbs(SSL *ssl);
 
 static inline void qc_free_ssl_sock_ctx(struct ssl_sock_ctx **ctx)
 {
