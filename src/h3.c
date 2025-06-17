@@ -1189,6 +1189,14 @@ static ssize_t h3_resp_headers_to_htx(struct qcs *qcs, const struct buffer *buf,
 		 * invalid token will be rejected in the else clause.
 		 */
 		if (isteq(list[hdr_idx].n, ist(":status"))) {
+			if (isttest(status)) {
+				TRACE_ERROR("duplicated status pseudo-header", H3_EV_RX_FRAME|H3_EV_RX_HDR, qcs->qcc->conn, qcs);
+				h3s->err = H3_ERR_MESSAGE_ERROR;
+				qcc_report_glitch(h3c->qcc, 1);
+				len = -1;
+				goto out;
+			}
+
 			status = list[hdr_idx].v;
 		}
 		else {
@@ -1205,6 +1213,25 @@ static ssize_t h3_resp_headers_to_htx(struct qcs *qcs, const struct buffer *buf,
 	flags |= HTX_SL_F_VER_11;
 	flags |= HTX_SL_F_XFER_LEN;
 
+	if (istlen(status) != 3) {
+		TRACE_ERROR("invalid status code", H3_EV_RX_FRAME|H3_EV_RX_HDR, qcs->qcc->conn, qcs);
+		h3s->err = H3_ERR_MESSAGE_ERROR;
+		qcc_report_glitch(qcs->qcc, 1);
+		len = -1;
+		goto out;
+	}
+
+	h = status.ptr[0] - '0';
+	t = status.ptr[1] - '0';
+	u = status.ptr[2] - '0';
+	if (h > 9 || t > 9 || u > 9) {
+		TRACE_ERROR("invalid status code", H3_EV_RX_FRAME|H3_EV_RX_HDR, qcs->qcc->conn, qcs);
+		h3s->err = H3_ERR_MESSAGE_ERROR;
+		qcc_report_glitch(qcs->qcc, 1);
+		len = -1;
+		goto out;
+	}
+
 	sl = htx_add_stline(htx, HTX_BLK_RES_SL, flags, ist("HTTP/3.0"), status, ist(""));
 	if (!sl) {
 		TRACE_ERROR("cannot allocate HTX start-line", H3_EV_RX_FRAME|H3_EV_RX_HDR, qcs->qcc->conn, qcs);
@@ -1216,15 +1243,6 @@ static ssize_t h3_resp_headers_to_htx(struct qcs *qcs, const struct buffer *buf,
 	if (fin)
 		sl->flags |= HTX_SL_F_BODYLESS;
 
-	h = status.ptr[0] - '0';
-	t = status.ptr[1] - '0';
-	u = status.ptr[2] - '0';
-	if (h > 9 || t > 9 || u > 9) {
-		TRACE_ERROR("invalid status code", H3_EV_RX_FRAME|H3_EV_RX_HDR, qcs->qcc->conn, qcs);
-		h3s->err = H3_ERR_MESSAGE_ERROR;
-		len = -1;
-		goto out;
-	}
 	sl->info.res.status = h * 100 + t * 10 + u;
 
 	/* now treat standard headers */
@@ -1978,7 +1996,7 @@ static int h3_req_headers_send(struct qcs *qcs, struct htx *htx)
 			break;
 
 		case HTX_BLK_REQ_SL:
-			BUG_ON_HOT(sl); /* Only one start-line expected */
+			BUG_ON(sl); /* Only one start-line expected */
 			sl = htx_get_blk_ptr(htx, blk);
 			meth = htx_sl_req_meth(sl);
 			uri = htx_sl_req_uri(sl);
@@ -2000,7 +2018,7 @@ static int h3_req_headers_send(struct qcs *qcs, struct htx *htx)
 	}
 
  end_loop:
-	BUG_ON_HOT(!sl); /* start-line must be present. */
+	BUG_ON(!sl); /* start-line must be present. */
 	/* marker for end of headers */
 	list[hdr].n = ist("");
 
