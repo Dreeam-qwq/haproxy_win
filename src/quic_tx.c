@@ -33,6 +33,7 @@
 
 DECLARE_POOL(pool_head_quic_tx_packet, "quic_tx_packet", sizeof(struct quic_tx_packet));
 DECLARE_POOL(pool_head_quic_cc_buf, "quic_cc_buf", QUIC_MAX_CC_BUFSIZE);
+DECLARE_POOL(pool_head_quic_be_cc_buf, "quic_be_cc_buf", QUIC_BE_MAX_CC_BUFSIZE);
 
 static struct quic_tx_packet *qc_build_pkt(unsigned char **pos, const unsigned char *buf_end,
                                            struct quic_enc_level *qel, struct quic_tls_ctx *ctx,
@@ -129,16 +130,28 @@ struct buffer *qc_get_txb(struct quic_conn *qc)
 	struct buffer *buf;
 
 	if (qc->flags & QUIC_FL_CONN_IMMEDIATE_CLOSE) {
+		struct pool_head *ph;
+		size_t psz;
+
+		if (objt_listener(qc->target)) {
+			ph = pool_head_quic_cc_buf;
+			psz = QUIC_MAX_CC_BUFSIZE;
+		}
+		else {
+			ph = pool_head_quic_be_cc_buf;
+			psz = QUIC_BE_MAX_CC_BUFSIZE;
+		}
+
 		TRACE_PROTO("Immediate close required", QUIC_EV_CONN_PHPKTS, qc);
 		buf = &qc->tx.cc_buf;
 		if (b_is_null(buf)) {
-			qc->tx.cc_buf_area = pool_alloc(pool_head_quic_cc_buf);
+			qc->tx.cc_buf_area = pool_alloc(ph);
 			if (!qc->tx.cc_buf_area)
 				goto err;
 		}
 
 		/* In every case, initialize ->tx.cc_buf */
-		qc->tx.cc_buf = b_make(qc->tx.cc_buf_area, QUIC_MAX_CC_BUFSIZE, 0, 0);
+		qc->tx.cc_buf = b_make(qc->tx.cc_buf_area, psz, 0, 0);
 	}
 	else {
 		buf = qc_txb_alloc(qc);
@@ -650,9 +663,7 @@ static int qc_prep_pkts(struct quic_conn *qc, struct buffer *buf,
 			 * to stay under MTU limit.
 			 */
 			if (!dglen) {
-				if (cc)
-					end = pos + QUIC_MIN_CC_PKTSIZE;
-				else if (!quic_peer_validated_addr(qc) && qc_is_listener(qc))
+				if (!quic_peer_validated_addr(qc) && qc_is_listener(qc))
 					end = pos + QUIC_MIN(qc->path->mtu, quic_may_send_bytes(qc));
 				else
 					end = pos + qc->path->mtu;
@@ -668,7 +679,7 @@ static int qc_prep_pkts(struct quic_conn *qc, struct buffer *buf,
 			 * datagrams carrying ack-eliciting Initial packets to at least the
 			 * smallest allowed maximum datagram size of 1200 bytes.
 			 */
-			if (qel == qc->iel && (!LIST_ISEMPTY(frms) || probe)) {
+			if (qel == qc->iel && (!l || !LIST_ISEMPTY(frms) || probe)) {
 				 /* Ensure that no ack-eliciting packets are sent into too small datagrams */
 				if (end - pos < QUIC_INITIAL_PACKET_MINLEN) {
 					TRACE_PROTO("No more enough room to build an Initial packet",
@@ -693,7 +704,7 @@ static int qc_prep_pkts(struct quic_conn *qc, struct buffer *buf,
 			 */
 			cur_pkt = qc_build_pkt(&pos, end, qel, tls_ctx, frms,
 			                       qc, ver, dglen, pkt_type, must_ack,
-			                       padding && !next_qel && (!probe || !LIST_ISEMPTY(frms)),
+			                       padding && (!l || (!next_qel && (!probe || !LIST_ISEMPTY(frms)))),
 			                       probe, cc, &err);
 			if (!cur_pkt) {
 				switch (err) {
@@ -1293,7 +1304,7 @@ int send_retry(int fd, struct sockaddr_storage *addr,
 	/* token integrity tag */
 	if ((sizeof(buf) - i < QUIC_TLS_TAG_LEN) ||
 	    !quic_tls_generate_retry_integrity_tag(pkt->dcid.data,
-	                                           pkt->dcid.len, buf, i, qv)) {
+	                                           pkt->dcid.len, buf, i, buf + i, qv)) {
 		TRACE_ERROR("quic_tls_generate_retry_integrity_tag() failed", QUIC_EV_CONN_TXPKT);
 		goto out;
 	}
@@ -1685,6 +1696,7 @@ static void qc_build_cc_frm(struct quic_conn *qc, struct quic_enc_level *qel,
 			 * converting to a CONNECTION_CLOSE of type 0x1c.
 			 */
 			out->type = QUIC_FT_CONNECTION_CLOSE;
+			out->connection_close.frame_type = 0;
 			out->connection_close.error_code = QC_ERR_APPLICATION_ERROR;
 			out->connection_close.reason_phrase_len = 0;
 		}
@@ -1696,6 +1708,7 @@ static void qc_build_cc_frm(struct quic_conn *qc, struct quic_enc_level *qel,
 	}
 	else {
 		out->type = QUIC_FT_CONNECTION_CLOSE;
+		out->connection_close.frame_type = 0;
 		out->connection_close.error_code = qc->err.code;
 		out->connection_close.reason_phrase_len = 0;
 	}
@@ -1796,10 +1809,14 @@ static int qc_do_build_pkt(unsigned char *pos, const unsigned char *end,
 
 	/* Encode the token length (0) for an Initial packet. */
 	if (pkt->type == QUIC_PACKET_TYPE_INITIAL) {
-		if (end <= pos)
+		if (!quic_enc_int(&pos, end, qc->retry_token_len) ||
+		    end - pos <= qc->retry_token_len)
 			goto no_room;
 
-		*pos++ = 0;
+		if (qc->retry_token_len) {
+			memcpy(pos, qc->retry_token, qc->retry_token_len);
+			pos += qc->retry_token_len;
+		}
 	}
 
 	head_len = pos - beg;

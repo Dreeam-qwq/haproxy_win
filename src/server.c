@@ -144,12 +144,10 @@ const char *srv_op_st_chg_cause(enum srv_op_st_chg_cause cause)
 
 int srv_downtime(const struct server *s)
 {
-	unsigned long last_change = COUNTERS_SHARED_LAST(s->proxy->be_counters.shared->tg, last_change);
-
-	if ((s->cur_state != SRV_ST_STOPPED) || last_change >= ns_to_sec(now_ns))		// ignore negative time
+	if ((s->cur_state != SRV_ST_STOPPED) || s->last_change >= ns_to_sec(now_ns))		// ignore negative time
 		return s->down_time;
 
-	return ns_to_sec(now_ns) - last_change + s->down_time;
+	return ns_to_sec(now_ns) - s->last_change + s->down_time;
 }
 
 int srv_getinter(const struct check *check)
@@ -2460,11 +2458,10 @@ INITCALL1(STG_REGISTER, srv_register_keywords, &srv_kws);
  */
 void server_recalc_eweight(struct server *sv, int must_update)
 {
-	unsigned long last_change = COUNTERS_SHARED_LAST(sv->proxy->be_counters.shared->tg, last_change);
 	struct proxy *px = sv->proxy;
 	unsigned w;
 
-	if (ns_to_sec(now_ns) < last_change || ns_to_sec(now_ns) >= last_change + sv->slowstart) {
+	if (ns_to_sec(now_ns) < sv->last_change || ns_to_sec(now_ns) >= sv->last_change + sv->slowstart) {
 		/* go to full throttle if the slowstart interval is reached unless server is currently down */
 		if ((sv->cur_state != SRV_ST_STOPPED) && (sv->next_state == SRV_ST_STARTING))
 			sv->next_state = SRV_ST_RUNNING;
@@ -2476,7 +2473,7 @@ void server_recalc_eweight(struct server *sv, int must_update)
 	if ((sv->cur_state == SRV_ST_STOPPED) && (sv->next_state == SRV_ST_STARTING) && (px->lbprm.algo & BE_LB_PROP_DYN))
 		w = 1;
 	else if ((sv->next_state == SRV_ST_STARTING) && (px->lbprm.algo & BE_LB_PROP_DYN))
-		w = (px->lbprm.wdiv * (ns_to_sec(now_ns) - last_change) + sv->slowstart) / sv->slowstart;
+		w = (px->lbprm.wdiv * (ns_to_sec(now_ns) - sv->last_change) + sv->slowstart) / sv->slowstart;
 	else
 		w = px->lbprm.wdiv;
 
@@ -2719,7 +2716,7 @@ static void srv_ssl_settings_cpy(struct server *srv, const struct server *src)
 		srv->ssl_ctx.client_crt = strdup(src->ssl_ctx.client_crt);
 
 	srv->ssl_ctx.verify = src->ssl_ctx.verify;
-
+	srv->ssl_ctx.renegotiate = src->ssl_ctx.renegotiate;
 
 	if (src->ssl_ctx.verify_host != NULL)
 		srv->ssl_ctx.verify_host = strdup(src->ssl_ctx.verify_host);
@@ -3047,6 +3044,7 @@ struct server *new_server(struct proxy *proxy)
 	srv->rid = 0; /* rid defaults to 0 */
 
 	srv->next_state = SRV_ST_RUNNING; /* early server setup */
+	srv->last_change = ns_to_sec(now_ns);
 
 	srv->check.obj_type = OBJ_TYPE_CHECK;
 	srv->check.status = HCHK_STATUS_INI;
@@ -3398,6 +3396,14 @@ static int _srv_check_proxy_mode(struct server *srv, char postparse)
 			err_code |= ERR_ALERT | ERR_FATAL;
 		}
 	}
+
+	if (srv->proxy->mode != PR_MODE_TCP && srv->proxy->mode != PR_MODE_HTTP &&
+	    srv->pp_opts) {
+		srv->pp_opts = 0;
+		ha_warning("'send-proxy*' server option is unsupported there, ignoring it\n");
+		err_code |= ERR_WARN;
+	}
+
  out:
 	if (srv->conf.file)
 		reset_usermsgs_ctx();
@@ -3680,14 +3686,6 @@ static int _srv_parse_init(struct server **srv, char **args, int *cur_arg,
 	}
 
 	free(fqdn);
-	if (!(curproxy->cap & PR_CAP_LB)) {
-		/* No need to wait for effective proxy mode, it is already known:
-		 * Only general purpose user-declared proxies ("listen", "frontend", "backend")
-		 * offer the possibility to configure the mode of the proxy. Hopefully for us,
-		 * they have the PR_CAP_LB set.
-		 */
-		return _srv_check_proxy_mode(newsrv, 0);
-	}
 	return 0;
 
 out:
@@ -3844,6 +3842,15 @@ static int _srv_parse_finalize(char **args, int cur_arg,
 		}
 	}
 #endif
+
+	if (!(srv->proxy->cap & PR_CAP_LB)) {
+		/* No need to wait for effective proxy mode, it is already known:
+		 * Only general purpose user-declared proxies ("listen", "frontend", "backend")
+		 * offer the possibility to configure the mode of the proxy. Hopefully for us,
+		 * they have the PR_CAP_LB set.
+		 */
+		return _srv_check_proxy_mode(srv, 0);
+	}
 
 	srv_lb_commit_status(srv);
 
@@ -5773,7 +5780,7 @@ static int srv_alloc_lb(struct server *sv, struct proxy *be)
 
 /* updates the server's weight during a warmup stage. Once the final weight is
  * reached, the task automatically stops. Note that any server status change
- * must have updated s->counters.last_change accordingly.
+ * must have updated server last_change accordingly.
  */
 static struct task *server_warmup(struct task *t, void *context, unsigned int state)
 {
@@ -5829,7 +5836,7 @@ static int init_srv_slowstart(struct server *srv)
 		if (srv->next_state == SRV_ST_STARTING) {
 			task_schedule(srv->warmup,
 			              tick_add(now_ms,
-			                       MS_TO_TICKS(MAX(1000, (ns_to_sec(now_ns) - COUNTERS_SHARED_LAST(srv->proxy->be_counters.shared->tg, last_change))) / 20)));
+			                       MS_TO_TICKS(MAX(1000, (ns_to_sec(now_ns) - srv->last_change)) / 20)));
 		}
 	}
 
@@ -6592,8 +6599,6 @@ static int _srv_update_status_op(struct server *s, enum srv_op_st_chg_cause caus
 			log_level = srv_was_stopping ? LOG_NOTICE : LOG_ALERT;
 			send_log(s->proxy, log_level, "%s.\n",
 				 tmptrash->area);
-			send_email_alert(s, log_level, "%s",
-					 tmptrash->area);
 			free_trash_chunk(tmptrash);
 		}
 	}
@@ -6657,8 +6662,6 @@ static int _srv_update_status_op(struct server *s, enum srv_op_st_chg_cause caus
 			ha_warning("%s.\n", tmptrash->area);
 			send_log(s->proxy, LOG_NOTICE, "%s.\n",
 				 tmptrash->area);
-			send_email_alert(s, LOG_NOTICE, "%s",
-					 tmptrash->area);
 			free_trash_chunk(tmptrash);
 		}
 	}
@@ -6918,8 +6921,6 @@ static int _srv_update_status_adm(struct server *s, enum srv_adm_st_chg_cause ca
 					ha_warning("%s.\n", tmptrash->area);
 					send_log(s->proxy, LOG_NOTICE, "%s.\n",
 						 tmptrash->area);
-					send_email_alert(s, LOG_NOTICE, "%s",
-							 tmptrash->area);
 				}
 				free_trash_chunk(tmptrash);
 			}
@@ -7032,11 +7033,9 @@ static void srv_update_status(struct server *s, int type, int cause)
 	/* check if server stats must be updated due the the server state change */
 	if (srv_prev_state != s->cur_state) {
 		if (srv_prev_state == SRV_ST_STOPPED) {
-			unsigned long last_change = COUNTERS_SHARED_LAST(s->proxy->be_counters.shared->tg, last_change);
-
 			/* server was down and no longer is */
-			if (last_change < ns_to_sec(now_ns))                        // ignore negative times
-				s->down_time += ns_to_sec(now_ns) - last_change;
+			if (s->last_change < ns_to_sec(now_ns))                        // ignore negative times
+				s->down_time += ns_to_sec(now_ns) - s->last_change;
 			_srv_event_hdl_publish(EVENT_HDL_SUB_SERVER_UP, cb_data.common, s);
 		}
 		else if (s->cur_state == SRV_ST_STOPPED) {
@@ -7052,7 +7051,8 @@ static void srv_update_status(struct server *s, int type, int cause)
 		if (s->cur_state != SRV_ST_RUNNING && s->proxy->ready_srv == s)
 			HA_ATOMIC_STORE(&s->proxy->ready_srv, NULL);
 
-		HA_ATOMIC_STORE(&s->counters.shared->tg[tgid - 1]->last_change, ns_to_sec(now_ns));
+		s->last_change = ns_to_sec(now_ns);
+		HA_ATOMIC_STORE(&s->counters.shared->tg[tgid - 1]->last_state_change, s->last_change);
 
 		/* publish the state change */
 		_srv_event_hdl_prepare_state(&cb_data.state,
@@ -7064,14 +7064,15 @@ static void srv_update_status(struct server *s, int type, int cause)
 	if (prev_srv_count && s->proxy->srv_bck == 0 && s->proxy->srv_act == 0)
 		set_backend_down(s->proxy); /* backend going down */
 	else if (!prev_srv_count && (s->proxy->srv_bck || s->proxy->srv_act)) {
-		unsigned long last_change = COUNTERS_SHARED_LAST(s->proxy->be_counters.shared->tg, last_change);
+		unsigned long last_change = s->proxy->last_change;
 
 		/* backend was down and is back up again:
 		 * no helper function, updating last_change and backend downtime stats
 		 */
 		if (last_change < ns_to_sec(now_ns))         // ignore negative times
 			s->proxy->down_time += ns_to_sec(now_ns) - last_change;
-		HA_ATOMIC_STORE(&s->proxy->be_counters.shared->tg[tgid - 1]->last_change, ns_to_sec(now_ns));
+		s->proxy->last_change = ns_to_sec(now_ns);
+		HA_ATOMIC_STORE(&s->proxy->be_counters.shared->tg[tgid - 1]->last_state_change, s->proxy->last_change);
 	}
 }
 

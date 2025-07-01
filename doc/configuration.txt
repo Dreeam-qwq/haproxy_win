@@ -3,7 +3,7 @@
                           Configuration Manual
                          ----------------------
                               version 3.3
-                              2025/06/11
+                              2025/06/26
 
 
 This document covers the configuration language as implemented in the version
@@ -149,7 +149,6 @@ Summary
 12.7.     Certificate Storage
 12.7.1.      Load options
 12.8.     ACME
-12.9.     Programs (deprecated)
 
 
 1. Quick reminder about HTTP
@@ -941,8 +940,8 @@ existing variables, not empty ones.
       user "$HAPROXY_USER"
 
 Some variables are defined by HAProxy, they can be used in the configuration
-file, or could be inherited by a program (See 12.9. Programs). These variables
-are listed in the matrix below, and they are classified among four categories:
+file. These variables are listed in the matrix below, and they are classified
+among four categories:
 
   * usable: the variable is accessible from the configuration, either to be
     resolved as-is, or used within conditional blocks or predicates to enable
@@ -954,10 +953,6 @@ are listed in the matrix below, and they are classified among four categories:
 
   * listed: the variable is listed in CLI's "show env" command output,
     described in section 9.3 "Unix Sockets commands" of the management guide.
-
-  * exported: variable is exported to launch programs in a modified environment
-    (See section 12.9 "Programs"). Note that this does not apply to external
-    checks which have their own rules regarding exported variables.
 
 There also two subcategories "master" and "worker", respectively marked 'M' and
 'W' in the table below, showing the differences between the two processes when
@@ -993,23 +988,23 @@ within conditional blocks and not to reference them in the global section's
 The table below summaries the status of each variable for the different working
 modes:
 
-  +--------------------------+----------+---------+------------+-----------+
-  |        variable          | exported | usable  | modifiable |  listed   |
-  |                          |          +---------+------------+-----------+
-  |                          |          |  M | W  |   M  |  W  |  M  |  W  |
-  +--------------------------+----------+----+----+------+-----+-----+-----+
-  | HAPROXY_STARTUP_VERSION  |    X     |  X | X  |      |     |  X  |  X  |
-  | HAPROXY_BRANCH           |    X     |  X | X  |      |     |  X  |  X  |
-  | HAPROXY_CFGFILES         |    X     |    |    |      |     |  X  |  X  |
-  | HAPROXY_MWORKER          |    X     |    |    |      |     |  X  |  X  |
-  | HAPROXY_CLI              |          |    |    |      |     |     |  X  |
-  | HAPROXY_MASTER_CLI       |          |    |    |      |     |  X  |     |
-  | HAPROXY_LOCALPEER        |          |    | X  |      |     |     |  X  |
-  | HAPROXY_HTTP_LOG_FMT     |          |    | X  |      |  X  |     |     |
-  | HAPROXY_HTTP_CLF_LOG_FMT |          |    | X  |      |  X  |     |     |
-  | HAPROXY_HTTPS_LOG_FMT    |          |    | X  |      |  X  |     |     |
-  | HAPROXY_TCP_LOG_FMT      |          |    | X  |      |  X  |     |     |
-  +--------------------------+----------+----+----+------+-----+-----+-----+
+  +--------------------------+---------+------------+-----------+
+  |        variable          | usable  | modifiable |  listed   |
+  |                          +---------+------------+-----------+
+  |                          |  M | W  |   M  |  W  |  M  |  W  |
+  +--------------------------+----+----+------+-----+-----+-----+
+  | HAPROXY_STARTUP_VERSION  |  X | X  |      |     |  X  |  X  |
+  | HAPROXY_BRANCH           |  X | X  |      |     |  X  |  X  |
+  | HAPROXY_CFGFILES         |    |    |      |     |  X  |  X  |
+  | HAPROXY_MWORKER          |    |    |      |     |  X  |  X  |
+  | HAPROXY_CLI              |    |    |      |     |     |  X  |
+  | HAPROXY_MASTER_CLI       |    |    |      |     |  X  |     |
+  | HAPROXY_LOCALPEER        |    | X  |      |     |     |  X  |
+  | HAPROXY_HTTP_LOG_FMT     |    | X  |      |  X  |     |     |
+  | HAPROXY_HTTP_CLF_LOG_FMT |    | X  |      |  X  |     |     |
+  | HAPROXY_HTTPS_LOG_FMT    |    | X  |      |  X  |     |     |
+  | HAPROXY_TCP_LOG_FMT      |    | X  |      |  X  |     |     |
+  +--------------------------+----+----+------+-----+-----+-----+
 
 The variables in question are the following:
 
@@ -2179,7 +2174,7 @@ cpu-policy <policy>
 
   The "cpu-policy" directive chooses between a small number of allocation
   policies which one to use instead, when "cpu-map" is not used. The following
-  policies are currently supported:
+  policies are currently supported, with "performance" being the default one:
 
    - none               no particular post-selection is performed. All enabled
                         CPUs will be usable, and if the number of threads is
@@ -2207,8 +2202,7 @@ cpu-policy <policy>
                         node with enabled CPUs will be used, and this number of
                         CPUs will be used as the number of threads. A single
                         thread group will be enabled with all of them, within
-                        the limit of 32 or 64 depending on the system. This is
-                        the default policy.
+                        the limit of 32 or 64 depending on the system.
 
    - group-by-2-ccx     same as "group-by-ccx" below but create a group every
                         two CCX. This can make sense on CPUs having many CCX of
@@ -2304,7 +2298,7 @@ cpu-policy <policy>
                         such as network handling is much more effective. On
                         development systems, these can also be used to run
                         auxiliary tools such as load generators and monitoring
-                        tools.
+                        tools. This is the default policy.
 
    - resource           this is like "group-by-cluster" above, except that only
                         the smallest and most efficient CPU cluster will be
@@ -2909,18 +2903,15 @@ no-quic
   processed by haproxy. See also "quic_enabled" sample fetch.
 
 numa-cpu-mapping
-  When running on a NUMA-aware platform with the cpu-policy is set to
-  "first-usable-node" (the default one), HAProxy inspects on startup the CPU
-  topology of the machine. If a multi-socket machine is detected, the affinity
-  is automatically calculated to run on the CPUs of a single node. This is done
-  in order to not suffer from the performance penalties caused by the
-  inter-socket bus latency. However, if the applied binding is non optimal on a
-  particular architecture, it can be disabled with the statement 'no
-  numa-cpu-mapping'. This automatic binding is also not applied if a nbthread
-  statement is present in the configuration, if the affinity of the process is
-  already specified, for example via the 'cpu-map' directive or the taskset
-  utility, or if the cpu-policy is set to any other value. See also "cpu-map",
-  "cpu-policy", "cpu-set".
+  When running on a NUMA-aware platform, this enables the "cpu-policy"
+  directive to inspect the topology and figure the best set of CPUs to use and
+  the corresponding number of threads. However, if the applied binding is non
+  optimal on a particular architecture, it can be disabled with the statement
+  'no numa-cpu-mapping'. This automatic binding is also not applied if a
+  'nbthread' statement is present in the configuration, if the affinity of the
+  process is already specified, for example via the 'cpu-map' directive or the
+  taskset utility, or if the cpu-policy is set to any other value. See also
+  "cpu-map", "cpu-policy", "cpu-set".
 
 ocsp-update.disable [ on | off ]
   Disable completely the ocsp-update in HAProxy. Any ocsp-update configuration
@@ -5345,11 +5336,11 @@ All proxy names must be formed from upper and lower case letters, digits,
 '-' (dash), '_' (underscore) , '.' (dot) and ':' (colon). ACL names are
 case-sensitive, which means that "www" and "WWW" are two different proxies.
 
-Historically, all proxy names could overlap, it just caused troubles in the
-logs. Since the introduction of content switching, it is mandatory that two
-proxies with overlapping capabilities (frontend/backend) have different names.
-However, it is still permitted that a frontend and a backend share the same
-name, as this configuration seems to be commonly encountered.
+Historically, all proxy names could overlap when certain conditions were met
+(e.g. when not having the same frontend/backend capabilities), but it used to
+cause too many problems in the logs as well as confusion on CLI operations,
+stick-tables naming and stats retrieval. It is now mandatory that two proxies
+have different names, regardless of their respective capabilities.
 
 Right now, two major proxy modes are supported : "tcp", also known as layer 4,
 and "http", also known as layer 7. In layer 4 mode, HAProxy simply forwards
@@ -5479,7 +5470,7 @@ default-server                            X          -         X         X
 default_backend                           X          X         X         -
 description                               -          X         X         X
 disabled                                  X          X         X         X
-dispatch                                  -          -         X         X
+dispatch                    (deprecated)  -          -         X         X
 email-alert from                          X          X         X         X
 email-alert level                         X          X         X         X
 email-alert mailers                       X          X         X         X
@@ -5583,7 +5574,7 @@ option tcp-smart-accept              (*)  X          X         X         -
 option tcp-smart-connect             (*)  X          -         X         X
 option tcpka                              X          X         X         X
 option tcplog                             X          X         X         -
-option transparent                   (*)  X          -         X         X
+option transparent      (deprecated) (*)  X          -         X         X
 option idle-close-on-response        (*)  X          X         X         -
 external-check command                    X          -         X         X
 external-check path                       X          -         X         X
@@ -6823,7 +6814,7 @@ disabled
   See also : "enabled"
 
 
-dispatch <address>:<port>
+dispatch <address>:<port>   (deprecated)
   Set a default server address
 
   May be used in the following contexts: tcp, http
@@ -6846,6 +6837,27 @@ dispatch <address>:<port>
   persistent connections to an auxiliary load balancer. Due to its simple
   syntax, it has also been used for simple TCP relays. It is recommended not to
   use it for more clarity, and to use the "server" directive instead.
+
+  This keyword has been deprecated in 3.3 and will be removed in 3.5 due to
+  some internal limitations (no support for SSL nor idle connections etc).
+  Using it will emit a warning that may be silenced by enabling directive
+  "expose-deprecated-directives" in the global section.
+
+  The correct way to proceed without this directive is to simply declare a
+  server with the same address and port. If the "dispatch" directive was
+  mixed with other servers, then these servers should be configured with a
+  weight of zero in order never to be elected by the load balancing algorithm.
+
+  Example:
+     backend deprecated_setup
+         dispatch 192.168.100.100:80 # external load balancer's address
+         server s1 192.168.100.1:80 cookie S1 check
+         server s2 192.168.100.2:80 cookie S2 check
+
+     backend modern_setup
+         server external_lb 192.168.100.100:80
+         server s1 192.168.100.1:80 cookie S1 check weight 0
+         server s2 192.168.100.2:80 cookie S2 check weight 0
 
   See also : "server"
 
@@ -11216,8 +11228,8 @@ option tcplog [clf]
   See also :  "option httplog", and section 8 about logging.
 
 
-option transparent
-no option transparent
+option transparent        (deprecated)
+no option transparent     (deprecated)
   Enable client-side transparent proxying
 
   May be used in the following contexts: tcp, http
@@ -11238,6 +11250,19 @@ no option transparent
 
   Note that contrary to a common belief, this option does NOT make HAProxy
   present the client's IP to the server when establishing the connection.
+
+  As of 3.3, this option is now deprecated because it used to suffer from a
+  number of internal technical limitations. Using it will emit a warning, which
+  can be avoided if really needed via the "expose-deprecated-directives" global
+  keyword.
+
+  The correct approach is to declare a server on address 0.0.0.0, which will
+  take care of connecting to the expected destination address. A server will
+  also properly handle idle connections to the target servers.
+
+  Example:
+       # option transparent  ## before 3.3
+       server transparent 0.0.0.0
 
   See also: the "usesrc" argument of the "source" keyword, and the
             "transparent" option of the "bind" keyword.
@@ -11722,6 +11747,7 @@ server <name> <address>[:[port]] [param*]
     <name>    is the internal name assigned to this server. This name will
               appear in logs and alerts. If "http-send-name-header" is
               set, it will be added to the request header sent to the server.
+              This name must be unique within the backend section.
 
     <address> is the IPv4 or IPv6 address of the server. Alternatively, a
               resolvable hostname is supported, but this name will be resolved
@@ -16553,6 +16579,10 @@ crt-list <file>
     configuration, the default certificates could be explicited (with a '*'
     filter) at the beginning of the list, so an implicit default is not added
     before.
+    Due to multi-cert bundles being duplicated for each algorithm in the
+    crt-list, only one algorithm will occupy the first line in the crt-list and
+    be considered as default. Either specify the entire bundle as default by
+    declaring '*' as the filter or setting it on the bind line.
 
     The "show ssl sni" command on the stats socket could be used to debug your
     configuration. (See "show ssl sni" in the management guide)
@@ -16882,9 +16912,16 @@ prefer-client-ciphers
   Use the client's preference when selecting the cipher suite, by default
   the server's preference is enforced. This option is also available on
   global statement "ssl-default-bind-options".
+
   Note that with OpenSSL >= 1.1.1 ChaCha20-Poly1305 is reprioritized anyway
   (without setting this option), if a ChaCha20-Poly1305 cipher is at the top of
   the client cipher list.
+
+  When using a dual algorithms setup (RSA + ECDSA), the selection algorithm
+  will chose between RSA and ECDSA and will always prioritize ECDSA. Once the
+  right certificate is chosen, it will let the SSL library prioritize ciphers,
+  curves etc. Meaning this option can't be used to prioritize an RSA
+  certificate over an ECDSA one.
 
 proto <name>
   Forces the multiplexer's protocol to use for the incoming connections. It
@@ -18025,6 +18062,21 @@ no-check-ssl
   It may also be used as "default-server" setting to reset any previous
   "default-server" "check-ssl" setting.
 
+no-renegotiate
+  May be used in the following contexts: tcp, http, log
+
+  This setting is only available when support for OpenSSL was built in. It
+  disables the renegotiation mechanisms, be it the legacy unsafe one or the
+  more recent "secure renegotation" one (RFC 5746 TLS Renegotiation Indication
+  Extension) for the given SSL backend. This option is also available on global
+  statement "ssl-default-server-options".
+  Renegotiation is not posible anymore in TLS 1.3.
+  If neither "renegotiate" nor "no-renegotiate" is specified, the SSL library's
+  default behavior is kept.
+  Note that for instance OpenSSL library enables secure renegotiation by
+  default while AWS-LC disable it.
+  See also "renegotiate".
+
 no-send-proxy
   May be used in the following contexts: tcp, http
 
@@ -18352,6 +18404,21 @@ redir <prefix>
   loop between the client and HAProxy!
 
   Example :  server srv1 192.168.1.1:80 redir http://image1.mydomain.com check
+
+renegotiate
+  May be used in the following contexts: tcp, http, log
+
+  This option enables the secure renegotiation mechanism (RFC 5746 TLS
+  Renegotiation Indication Extension) for a given SSL backend. It does not mean
+  that renegotiation requests will be sent by the SSL client, it only allows
+  backends to renegotiate when servers request it. It still requires that the
+  underlying SSL library actually supports renegotiation.
+  This option is also available on global statement "ssl-default-server-options".
+  Renegotiation is not posible anymore in TLS 1.3.
+  If neither "renegotiate" nor "no-renegotiate" is specified, the SSL library's
+  default behavior is kept.
+  Note that for instance OpenSSL library enables secure renegotiation by
+  default while AWS-LC disable it.
 
 rise <count>
   May be used in the following contexts: tcp, http, log
@@ -20451,11 +20518,19 @@ jwt_payload_query([<json_path>[,<output_type>]])
 jwt_verify(<alg>,<key>)
   Performs a signature verification for the JSON Web Token (JWT) given in input
   by using the <alg> algorithm and the <key> parameter, which should either
-  hold a secret or a path to a public certificate. Returns 1 in case of
-  verification success, 0 in case of verification error and a strictly negative
-  value for any other error. Because of all those non-null error return values,
-  the result of this converter should never be converted to a boolean. See
-  below for a full list of the possible return values.
+  hold a secret, a path to a public key or a path to a public certificate. When
+  using a public key, it should either be in the PKCS#1 format (for RSA keys,
+  starting with BEGIN RSA PUBLIC KEY) or SPKI format (Subject Public Key Info,
+  starting with BEGIN PUBLIC KEY). Certificates should be a regular PEM
+  certificate (starting with BEGIN CERTIFICATE). If a full-on certificate is
+  used, it can either be used directly in the converter or passed via a
+  variable if it was already known by haproxy (previously loaded in a crt-store
+  for instance).
+  Returns 1 in case of verification success, 0 in case of verification failure
+  and a strictly negative value for any other error. Because of all those
+  non-null error return values, the result of this converter should never be
+  converted to a boolean. See below for a full list of the possible return
+  values.
 
   For now, only JWS tokens using the Compact Serialization format can be
   processed (three dot-separated base64-url encoded strings). All the
@@ -20464,16 +20539,19 @@ jwt_verify(<alg>,<key>)
 
   If the used algorithm is of the HMAC family, <key> should be the secret used
   in the HMAC signature calculation. Otherwise, <key> should be the path to the
-  public certificate that can be used to validate the token's signature. All
-  the certificates that might be used to verify JWTs must be known during init
-  in order to be added into a dedicated certificate cache so that no disk
-  access is required during runtime. For this reason, any used certificate must
-  be mentioned explicitly at least once in a jwt_verify call. Passing an
-  intermediate variable as second parameter is then not advised.
+  public key or certificate that can be used to validate the token's signature.
+  All the public keys and certificates that might be used to verify JWTs must
+  be known during init in order to be added into a dedicated cache so that no
+  disk access is required during runtime. For this reason, any used public key
+  must be mentioned explicitly at least once in a jwt_verify call and every
+  certificate used must be loaded by haproxy (in a crt-store or mentioned
+  explicitly in a 'jwt_verify' call). Passing a variable as second parameter is
+  then not advised unless you only use certificates that fill one of those
+  prerequisites.
 
   This converter only verifies the signature of the token and does not perform
   a full JWT validation as specified in section 7.2 of RFC7519. We do not
-  ensure that the header and payload contents are fully valid JSON's once
+  ensure that the header and payload contents are fully valid JSONs once
   decoded for instance, and no checks are performed regarding their respective
   contents.
 
@@ -20489,6 +20567,7 @@ jwt_verify(<alg>,<key>)
   | -3 | "Invalid token"                                                      |
   | -4 | "Out of memory"                                                      |
   | -5 | "Unknown certificate"                                                |
+  | -6 | "Internal error"                                                     |
   +----+----------------------------------------------------------------------+
 
   Please note that this converter is only available when HAProxy has been
@@ -20500,7 +20579,7 @@ jwt_verify(<alg>,<key>)
      http-request set-var(txn.bearer) http_auth_bearer
      http-request set-var(txn.jwt_alg) var(txn.bearer),jwt_header_query('$.alg')
      http-request deny unless { var(txn.jwt_alg) -m str "RS256" }
-     http-request deny unless { var(txn.bearer),jwt_verify(txn.jwt_alg,"/path/to/crt.pem") 1 }
+     http-request deny unless { var(txn.bearer),jwt_verify(txn.jwt_alg,"/path/to/cert.pem") 1 }
 
 language(<value>[,<default>])
   Returns the value with the highest q-factor from a list as extracted from the
@@ -30368,59 +30447,6 @@ Example:
       keytype ECDSA
       curves P-384
       map virt@acme
-
-12.9. Programs (deprecated)
----------------------------
-
-This section is deprecated and should disappear with HAProxy 3.3. The section
-could be replaced easily by separated process managers. Systemd unit files or
-sysvinit scripts could replace this section as they are more reliable. In docker
-environments, some alternatives can also be found such as s6 or supervisord.
-
-In master-worker mode, it is possible to launch external binaries with the
-master, these processes are called programs. These programs are launched and
-managed the same way as the workers.
-
-Since version 3.1, the program section has a slightly different behavior, the
-section is parsed and the program is started from the master, but the rest of
-the configuration is loaded in the worker. This mean the program configuration
-is completely separated from the worker configuration, and a program could be
-reexecuted even if the worker configuration is wrong upon a reload.
-
-During a reload of HAProxy, those processes are dealing with the same
-sequence as a worker:
-
-  - the master is re-executed
-  - the master sends a SIGUSR1 signal to the program
-  - if "option start-on-reload" is not disabled, the master launches a new
-    instance of the program
-
-During a stop, or restart, a SIGTERM is sent to the programs.
-
-program <name>
-  This is a new program section, this section will create an instance <name>
-  which is visible in "show proc" on the master CLI. (See "9.4. Master CLI" in
-  the management guide).
-
-command <command> [arguments*]
-  Define the command to start with optional arguments. The command is looked
-  up in the current PATH if it does not include an absolute path. This is a
-  mandatory option of the program section. Arguments containing spaces must
-  be enclosed in quotes or double quotes or be prefixed by a backslash.
-
-user <user name>
-  Changes the executed command user ID to the <user name> from /etc/passwd.
-  See also "group".
-
-group <group name>
-  Changes the executed command group ID to the <group name> from /etc/group.
-  See also "user".
-
-option start-on-reload
-no option start-on-reload
-  Start (or not) a new instance of the program upon a reload of the master.
-  The default is to start a new instance. This option may only be used in a
-  program section.
 
 
 /*

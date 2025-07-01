@@ -19,6 +19,7 @@
 
 void qcc_set_error(struct qcc *qcc, int err, int app);
 int _qcc_report_glitch(struct qcc *qcc, int inc);
+int qcc_fctl_avail_streams(const struct qcc *qcc, int bidi);
 struct qcs *qcc_init_stream_local(struct qcc *qcc, int bidi);
 void qcs_send_metadata(struct qcs *qcs);
 int qcs_attach_sc(struct qcs *qcs, struct buffer *buf, char fin);
@@ -43,6 +44,7 @@ int qcc_recv(struct qcc *qcc, uint64_t id, uint64_t len, uint64_t offset,
              char fin, char *data);
 int qcc_recv_max_data(struct qcc *qcc, uint64_t max);
 int qcc_recv_max_stream_data(struct qcc *qcc, uint64_t id, uint64_t max);
+int qcc_recv_max_streams(struct qcc *qcc, uint64_t max, int bidi);
 int qcc_recv_reset_stream(struct qcc *qcc, uint64_t id, uint64_t err, uint64_t final_size);
 int qcc_recv_stop_sending(struct qcc *qcc, uint64_t id, uint64_t err);
 

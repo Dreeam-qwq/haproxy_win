@@ -379,9 +379,11 @@ int ssl_sock_switchctx_cbk(SSL *ssl, int *al, void *arg)
 				continue;
 
 			/* check if this cipher is available in haproxy configuration */
-#if defined(OPENSSL_IS_AWSLC)
+
+#if defined(OPENSSL_IS_AWSLC) && AWSLC_API_VERSION <= 32
                         /* because AWS-LC does not provide the TLSv1.3 ciphersuites (which are NID_auth_any) in ha_ciphers,
-                         * does not check if it's available when it's an NID_auth_any
+                         * does not check if it's available when it's an NID_auth_any.
+                         * This was fixed in v1.46.0, API version changed in v1.50.0
                          */
                         if (sk_SSL_CIPHER_find(ha_ciphers, cipher) == -1 && SSL_CIPHER_get_auth_nid(cipher) != NID_auth_any)
 				continue;
@@ -396,8 +398,16 @@ int ssl_sock_switchctx_cbk(SSL *ssl, int *al, void *arg)
 			if (cipher_id == SSL3_CK_SCSV || cipher_id == SSL3_CK_FALLBACK_SCSV)
 				continue;
 
-			if (SSL_CIPHER_get_auth_nid(cipher) == NID_auth_ecdsa
-			    || SSL_CIPHER_get_auth_nid(cipher) == NID_auth_any) {
+			if (SSL_CIPHER_get_auth_nid(cipher) == NID_auth_ecdsa) {
+				has_ecdsa_sig = 1;
+				break;
+			}
+			if (SSL_CIPHER_get_auth_nid(cipher) == NID_auth_any &&
+			    s->ssl_conf.ssl_methods.max >= CONF_TLSV13) {
+				/* Checking for TLSv1.3 ciphersuites require to check that we allow TLSv1.3, otherwise it would
+				 * chose an ECDSA cipher because of the TLS13 ciphersuites, but the TLS12 ciphers could
+				 * lack ECDSA capabilities.
+				 */
 				has_ecdsa_sig = 1;
 				break;
 			}

@@ -86,6 +86,8 @@ static uint hlua_log_opts = HLUA_LOG_LOGGERS_ON | HLUA_LOG_STDERR_AUTO;
 
 /* set to 1 once some lua was loaded already */
 static uint8_t hlua_loaded = 0;
+/* set to 1 during body evaluation (very early lua file loading), then 0 */
+static uint8_t hlua_body = 1;
 
 #define HLUA_BOOL_SAMPLE_CONVERSION_UNK     0x0
 #define HLUA_BOOL_SAMPLE_CONVERSION_NORMAL  0x1
@@ -2384,18 +2386,17 @@ __LJMP static int hlua_core_get_var(lua_State *L)
 	return MAY_LJMP(hlua_smp2lua(L, &smp));
 }
 
-/* This function disables the sending of email through the
- * legacy email sending function which is implemented using
- * checks.
+/* This function informs haproxy that native mailers config section is
+ * actually being used from Lua.
  *
- * It may not be used during runtime.
+ * It may not be used outside of body context.
  */
-__LJMP static int hlua_disable_legacy_mailers(lua_State *L)
+__LJMP static int hlua_use_native_mailers_config(lua_State *L)
 {
-	if (hlua_gethlua(L))
-		WILL_LJMP(luaL_error(L, "disable_legacy_mailers: "
-		                        "not available outside of init or body context"));
-	send_email_disabled = 1;
+	if (!hlua_body)
+		WILL_LJMP(luaL_error(L, "use_native_mailers_config: "
+	        "not available outside of body context"));
+	mailers_used_from_lua = 1;
 	return 0;
 }
 
@@ -4906,10 +4907,10 @@ __LJMP static int hlua_run_sample_fetch(lua_State *L)
 	hsmp = MAY_LJMP(hlua_checkfetches(L, 1));
 
 	/* Check execution authorization. */
-	if (f->use & SMP_USE_HTTP_ANY &&
-	    !(hsmp->flags & HLUA_F_MAY_USE_HTTP)) {
-		lua_pushfstring(L, "the sample-fetch '%s' needs an HTTP parser which "
-		                   "is not available in Lua services", f->kw);
+	if ((f->use & (SMP_USE_L6REQ|SMP_USE_L6RES|SMP_USE_HTTP_ANY)) &&
+	    !(hsmp->flags & HLUA_F_MAY_USE_CHANNELS_DATA)) {
+		lua_pushfstring(L, "the sample-fetch '%s' needs to access data from channel's buffer which"
+				" is not available in Lua services", f->kw);
 		WILL_LJMP(lua_error(L));
 	}
 
@@ -8587,13 +8588,13 @@ __LJMP static int hlua_txn_new(lua_State *L, struct stream *s, struct proxy *p, 
 
 	/* Create the "f" field that contains a list of fetches. */
 	lua_pushstring(L, "f");
-	if (!hlua_fetches_new(L, htxn, HLUA_F_MAY_USE_HTTP))
+	if (!hlua_fetches_new(L, htxn, HLUA_F_MAY_USE_CHANNELS_DATA))
 		return 0;
 	lua_rawset(L, -3);
 
 	/* Create the "sf" field that contains a list of stringsafe fetches. */
 	lua_pushstring(L, "sf");
-	if (!hlua_fetches_new(L, htxn, HLUA_F_MAY_USE_HTTP | HLUA_F_AS_STRING))
+	if (!hlua_fetches_new(L, htxn, HLUA_F_MAY_USE_CHANNELS_DATA | HLUA_F_AS_STRING))
 		return 0;
 	lua_rawset(L, -3);
 
@@ -11005,8 +11006,24 @@ static enum act_return hlua_action(struct act_rule *rule, struct proxy *px,
 	case HLUA_E_YIELD:
 	  err_yield:
 		act_ret = ACT_RET_CONT;
-		SEND_ERR(px, "Lua function '%s': yield not allowed.\n",
-		         rule->arg.hlua_rule->fcn->name);
+		if (flags & ACT_OPT_FINAL_EARLY) {
+			char *msg = NULL;
+
+			/* yield not allowed, but it is only caused because ruleset was ended earlier
+			 * than expected, so it is not a misuse of yield in the Lua script: simply emit
+			 * a log
+			 */
+			memprintf(&msg, "Lua function '%s': unable to yield, aborted Lua execution.\n",
+			          rule->arg.hlua_rule->fcn->name);
+			if (msg)
+				hlua_sendlog(px, LOG_WARNING, msg);
+			ha_free(&msg);
+		}
+		else {
+			/* invalid yield use */
+			SEND_ERR(px, "Lua function '%s': yield not allowed.\n",
+			         rule->arg.hlua_rule->fcn->name);
+		}
 		goto end;
 
 	case HLUA_E_ERR:
@@ -13810,6 +13827,8 @@ int hlua_post_init()
 	struct hlua_function *fcn;
 	struct hlua_reg_filter *reg_flt;
 
+	hlua_body = 0;
+
 #if defined(USE_OPENSSL)
 	/* Initialize SSL server. */
 	if (socket_ssl->xprt->prepare_srv) {
@@ -14107,7 +14126,7 @@ lua_State *hlua_init_state(int thread_num)
 	hlua_class_function(L, "Warning", hlua_log_warning);
 	hlua_class_function(L, "Alert", hlua_log_alert);
 	hlua_class_function(L, "done", hlua_done);
-	hlua_class_function(L, "disable_legacy_mailers", hlua_disable_legacy_mailers);
+	hlua_class_function(L, "use_native_mailers_config", hlua_use_native_mailers_config);
 	hlua_fcn_reg_core_fcn(L);
 
 	lua_setglobal(L, "core");

@@ -201,7 +201,6 @@ enum lock_label {
 	SPOE_APPLET_LOCK,
 	DNS_LOCK,
 	PID_LIST_LOCK,
-	EMAIL_ALERTS_LOCK,
 	PIPES_LOCK,
 	TLSKEYS_REF_LOCK,
 	AUTH_LOCK,
@@ -218,6 +217,7 @@ enum lock_label {
 	QC_CID_LOCK,
 	CACHE_LOCK,
 	GUID_LOCK,
+	JWT_LOCK,
 	OTHER_LOCK,
 	/* WT: make sure never to use these ones outside of development,
 	 * we need them for lock profiling!

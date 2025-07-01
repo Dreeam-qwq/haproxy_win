@@ -4457,6 +4457,7 @@ static int sample_conv_jwt_verify_check(struct arg *args, struct sample_conv *co
 					const char *file, int line, char **err)
 {
 	enum jwt_alg alg = JWT_ALG_DEFAULT;
+	int retval = 0;
 
 	vars_check_arg(&args[0], NULL);
 	vars_check_arg(&args[1], NULL);
@@ -4476,14 +4477,22 @@ static int sample_conv_jwt_verify_check(struct arg *args, struct sample_conv *co
 			JWS_ALG_HS384:
 			JWS_ALG_HS512:
 			/* don't try to load a file with HMAC algorithms */
+				retval = 1;
 				break;
 			default:
-				jwt_tree_load_cert(args[1].data.str.area, args[1].data.str.data, err);
+				retval = (jwt_tree_load_cert(args[1].data.str.area, args[1].data.str.data,
+				                             file, line, err) == 0);
 				break;
 		}
+	} else if (args[1].type == ARGT_VAR) {
+		/* We will try to resolve the var during runtime because the
+		 * processing might work if it actually points to an already
+		 * existing ckch_store.
+		 */
+		retval = 1;
 	}
 
-	return 1;
+	return retval;
 }
 
 /* Check that a JWT's signature is correct */
@@ -4491,19 +4500,53 @@ static int sample_conv_jwt_verify(const struct arg *args, struct sample *smp, vo
 {
 	struct sample alg_smp, key_smp;
 	enum jwt_vrfy_status ret;
+	struct buffer *input = NULL;
+	struct buffer *alg = NULL;
+	struct buffer *key = NULL;
+	int retval = 0;
+
+	/* The two following calls to 'sample_conv_var2smp_str' will both make
+	 * use of the preallocated trash buffer (via get_trash_chunk call in
+	 * smp_dup) which would end up erasing the contents of the 'smp' input
+	 * buffer.
+	 */
+	input = alloc_trash_chunk();
+	if (!input)
+		return 0;
+	alg = alloc_trash_chunk();
+	if (!alg)
+		goto end;
+	key = alloc_trash_chunk();
+	if (!key)
+		goto end;
+
+	if (!chunk_cpy(input, &smp->data.u.str))
+		goto end;
 
 	smp_set_owner(&alg_smp, smp->px, smp->sess, smp->strm, smp->opt);
-	smp_set_owner(&key_smp, smp->px, smp->sess, smp->strm, smp->opt);
 	if (!sample_conv_var2smp_str(&args[0], &alg_smp))
-		return 0;
-	if (!sample_conv_var2smp_str(&args[1], &key_smp))
-		return 0;
+		goto end;
+	if (chunk_printf(alg, "%.*s", (int)b_data(&alg_smp.data.u.str), b_orig(&alg_smp.data.u.str)) <= 0)
+		goto end;
 
-	ret = jwt_verify(&smp->data.u.str,  &alg_smp.data.u.str, &key_smp.data.u.str);
+	smp_set_owner(&key_smp, smp->px, smp->sess, smp->strm, smp->opt);
+	if (!sample_conv_var2smp_str(&args[1], &key_smp))
+		goto end;
+	if (chunk_printf(key, "%.*s", (int)b_data(&key_smp.data.u.str), b_orig(&key_smp.data.u.str)) <= 0)
+		goto end;
+
+	ret = jwt_verify(input, alg, key);
 
 	smp->data.type = SMP_T_SINT;
 	smp->data.u.sint = ret;
-	return 1;
+
+	retval = 1;
+
+end:
+	free_trash_chunk(input);
+	free_trash_chunk(alg);
+	free_trash_chunk(key);
+	return retval;
 }
 
 

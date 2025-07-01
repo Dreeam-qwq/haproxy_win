@@ -304,6 +304,13 @@ struct srv_pp_tlv_list {
 	unsigned char type;
 };
 
+/* Renegotiate mode */
+enum renegotiate_mode {
+	SSL_RENEGOTIATE_DFLT = 0,	/* Use the SSL library's default behavior */
+	SSL_RENEGOTIATE_OFF,		/* Disable secure renegotiation */
+	SSL_RENEGOTIATE_ON		/* Enable secure renegotiation */
+};
+
 struct proxy;
 struct server {
 	/* mostly config or admin stuff, doesn't change often */
@@ -348,6 +355,7 @@ struct server {
 	short onmarkedup;			/* what to do when marked up: one of HANA_ONMARKEDUP_* */
 	int slowstart;				/* slowstart time in seconds (ms in the conf) */
 	int idle_ping;				/* MUX idle-ping interval in ms */
+	unsigned long last_change;              /* internal use only (not for stats purpose): last time the server state was changed, doesn't change often, not updated atomically on purpose */
 
 	char *id;				/* just for identification */
 	uint32_t rid;				/* revision: if id has been reused for a new server, rid won't match */
@@ -477,6 +485,7 @@ struct server {
 		int npn_len;                    /* NPN protocol string length */
 		char *alpn_str;                 /* ALPN protocol string */
 		int alpn_len;                   /* ALPN protocol string length */
+		int renegotiate;		/* Renegotiate mode (SSL_RENEGOTIATE_ flag) */
 	} ssl_ctx;
 #ifdef USE_QUIC
 	struct quic_transport_params quic_params; /* QUIC transport parameters */

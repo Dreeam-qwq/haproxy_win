@@ -785,6 +785,21 @@ int _qcc_report_glitch(struct qcc *qcc, int inc)
 	return 0;
 }
 
+/* Returns the number of streams which can still be opened until flow-control limit. */
+int qcc_fctl_avail_streams(const struct qcc *qcc, int bidi)
+{
+	if (bidi) {
+		const uint64_t next = qcc->next_bidi_l / 4;
+		BUG_ON(qcc->rfctl.ms_bidi < next);
+		return qcc->rfctl.ms_bidi - next;
+	}
+	else {
+		const uint64_t next = qcc->next_uni_l / 4;
+		BUG_ON(qcc->rfctl.ms_uni < next);
+		return qcc->rfctl.ms_uni - next;
+	}
+}
+
 /* Open a locally initiated stream for the connection <qcc>. Set <bidi> for a
  * bidirectional stream, else an unidirectional stream is opened. The next
  * available ID on the connection will be used according to the stream type.
@@ -800,17 +815,16 @@ struct qcs *qcc_init_stream_local(struct qcc *qcc, int bidi)
 	TRACE_ENTER(QMUX_EV_QCS_NEW, qcc->conn);
 
 	if (bidi) {
+		/* Caller must ensure that max-streams peer flow-control won't be violated. */
+		BUG_ON(qcc->rfctl.ms_bidi * 4 < qcc->next_bidi_l);
 		next = &qcc->next_bidi_l;
 		type = conn_is_back(qcc->conn) ? QCS_CLT_BIDI : QCS_SRV_BIDI;
 	}
 	else {
+		BUG_ON(qcc->rfctl.ms_uni * 4 < qcc->next_uni_l);
 		next = &qcc->next_uni_l;
 		type = conn_is_back(qcc->conn) ? QCS_CLT_UNI : QCS_SRV_UNI;
 	}
-
-	/* TODO ensure that we won't overflow remote peer flow control limit on
-	 * streams. Else, we should emit a STREAMS_BLOCKED frame.
-	 */
 
 	qcs = qcs_new(qcc, *next, type);
 	if (!qcs) {
@@ -820,6 +834,7 @@ struct qcs *qcc_init_stream_local(struct qcc *qcc, int bidi)
 	}
 
 	TRACE_PROTO("opening local stream",  QMUX_EV_QCS_NEW, qcc->conn, qcs);
+	/* TODO emit STREAMS_BLOCKED if cannot create future streams. */
 	*next += 4;
 
 	TRACE_LEAVE(QMUX_EV_QCS_NEW, qcc->conn, qcs);
@@ -2020,6 +2035,57 @@ int qcc_recv_max_stream_data(struct qcc *qcc, uint64_t id, uint64_t max)
 	return 1;
 }
 
+/* Handle a MAX_STREAMS frame. <max> must contains the cumulative number of
+ * streams that can be opened. <bidi> is a boolean set if this refers to
+ * bidirectional streams.
+ *
+ * Returns 0 on success else non-zero. On error, the received frame should not
+ * be acknowledged.
+ */
+int qcc_recv_max_streams(struct qcc *qcc, uint64_t max, int bidi)
+{
+	TRACE_ENTER(QMUX_EV_QCC_RECV, qcc->conn);
+
+	if (qcc->flags & QC_CF_ERRL) {
+		TRACE_DATA("connection on error", QMUX_EV_QCC_RECV, qcc->conn);
+		goto err;
+	}
+
+	/* RFC 9000 19.11. MAX_STREAMS Frames
+	 *
+	 *  This value cannot exceed 2^60, as it is not possible to
+	 *  encode stream IDs larger than 2^62-1. Receipt of a frame that
+	 *  permits opening of a stream larger than this limit MUST be treated
+	 *  as a connection error of type FRAME_ENCODING_ERROR.
+	 */
+	if (max > QUIC_VARINT_8_BYTE_MAX) {
+		TRACE_ERROR("invalid MAX_STREAMS value", QMUX_EV_QCC_RECV, qcc->conn);
+		qcc_set_error(qcc, QC_ERR_FRAME_ENCODING_ERROR, 0);
+		goto err;
+	}
+
+	TRACE_PROTO("receiving MAX_STREAMS", QMUX_EV_QCC_RECV, qcc->conn);
+	if (bidi) {
+		if (max > qcc->rfctl.ms_bidi) {
+			TRACE_DATA("increase remote max-streams-bidi", QMUX_EV_QCC_RECV, qcc->conn);
+			qcc->rfctl.ms_bidi = max;
+		}
+	}
+	else {
+		/* TODO no extra unidirectional streams open after connection
+		 * startup, so uni MAX_STREAMS flow-control is not necessary
+		 * for now.
+		 */
+	}
+
+	TRACE_LEAVE(QMUX_EV_QCC_RECV, qcc->conn);
+	return 0;
+
+ err:
+	TRACE_DEVEL("leaving on error", QMUX_EV_QCC_RECV, qcc->conn);
+	return 1;
+}
+
 /* Handle a new RESET_STREAM frame from stream ID <id> with error code <err>
  * and final stream size <final_size>.
  *
@@ -3056,6 +3122,20 @@ static int qcc_io_recv(struct qcc *qcc)
 	return 0;
 }
 
+/* Calculate the number of bidirectional streams which can still be opened for
+ * <conn> connection. This depends on flow-control set by the peer.
+ *
+ * Returns the value which is a positive integer or 0 if no new stream
+ * currently available.
+ */
+static int qmux_avail_streams(struct connection *conn)
+{
+	struct server *srv = __objt_server(conn->target);
+	struct qcc *qcc = conn->ctx;
+
+	BUG_ON(srv->max_reuse >= 0); /* TODO ensure max-reuse is enforced. */
+	return qcc_fctl_avail_streams(qcc, 1);
+}
 
 /* Release all streams which have their transfer operation achieved. */
 static void qcc_purge_streams(struct qcc *qcc)
@@ -3439,6 +3519,8 @@ static int qmux_init(struct connection *conn, struct proxy *prx,
 
 	rparams = &conn->handle.qc->tx.params;
 	qfctl_init(&qcc->tx.fc, rparams->initial_max_data);
+	qcc->rfctl.ms_uni = rparams->initial_max_streams_uni;
+	qcc->rfctl.ms_bidi = rparams->initial_max_streams_bidi;
 	qcc->rfctl.msd_bidi_l = rparams->initial_max_stream_data_bidi_local;
 	qcc->rfctl.msd_bidi_r = rparams->initial_max_stream_data_bidi_remote;
 	qcc->rfctl.msd_uni_l = rparams->initial_max_stream_data_uni;
@@ -3563,6 +3645,13 @@ static int qmux_init(struct connection *conn, struct proxy *prx,
 		struct qcs *qcs;
 		struct stconn *sc = conn_ctx;
 
+		/* TODO how to properly handle initial value of max-bidi-stream set to 0 ? */
+		if (!qcc_fctl_avail_streams(qcc, 1)) {
+			TRACE_ERROR("peer does not allow any bidi stream, not yet supported",
+			            QMUX_EV_QCC_NEW|QMUX_EV_QCC_ERR, qcc->conn);
+			goto err;
+		}
+
 		qcs = qcc_init_stream_local(qcc, 1);
 		if (!qcs) {
 			TRACE_PROTO("Cannot allocate a new locally initiated streeam",
@@ -3610,6 +3699,37 @@ static void qmux_destroy(void *ctx)
 	TRACE_ENTER(QMUX_EV_QCC_END, qcc->conn);
 	qcc_release(qcc);
 	TRACE_LEAVE(QMUX_EV_QCC_END);
+}
+
+static int qmux_strm_attach(struct connection *conn, struct sedesc *sd, struct session *sess)
+{
+	struct qcs *qcs;
+	struct qcc *qcc = conn->ctx;
+
+	TRACE_ENTER(QMUX_EV_QCS_NEW, conn);
+
+	/* Flow control limit on bidi streams should already have
+	 * been checked by a prior qmux_avail_streams() invokation.
+	 */
+	BUG_ON(!qcc_fctl_avail_streams(qcc, 1));
+
+	qcs = qcc_init_stream_local(qcc, 1);
+	if (!qcs) {
+		TRACE_DEVEL("leaving on error", QMUX_EV_QCS_NEW, qcc->conn);
+		return -1;
+	}
+
+	if (sc_attach_mux(sd->sc, qcs, conn)) {
+		TRACE_DEVEL("leaving on error", QMUX_EV_QCS_NEW, qcc->conn);
+		qcs_free(qcs);
+		return -1;
+	}
+
+	qcs->sd = sd->sc->sedesc;
+	qcc->nb_sc++;
+
+	TRACE_LEAVE(QMUX_EV_QCS_NEW, conn);
+	return 0;
 }
 
 static void qmux_strm_detach(struct sedesc *sd)
@@ -4134,6 +4254,8 @@ static const struct mux_ops qmux_ops = {
 	.subscribe   = qmux_strm_subscribe,
 	.unsubscribe = qmux_strm_unsubscribe,
 	.wake        = qmux_wake,
+	.avail_streams = qmux_avail_streams,
+	.attach      = qmux_strm_attach,
 	.shut        = qmux_strm_shut,
 	.ctl         = qmux_ctl,
 	.sctl        = qmux_sctl,

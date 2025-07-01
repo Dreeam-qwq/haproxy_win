@@ -41,6 +41,7 @@
 #include <haproxy/ssl_utils.h>
 #include <haproxy/stconn.h>
 #include <haproxy/tools.h>
+#include <haproxy/jwt.h>
 
 /* Uncommitted CKCH transaction */
 
@@ -2729,6 +2730,8 @@ void ckch_store_replace(struct ckch_store *old_ckchs, struct ckch_store *new_ckc
 		__ckch_inst_free_locked(ckchi);
 	}
 
+	jwt_replace_ckch_store(old_ckchs, new_ckchs);
+
 	ckch_store_free(old_ckchs);
 	ebst_insert(&ckchs_tree, &new_ckchs->node);
 }
@@ -2876,13 +2879,8 @@ static int cli_parse_commit_cert(char **args, char *payload, struct appctx *appc
 		goto error;
 	}
 
-	/* if a certificate is here, a private key must be here too */
-	if (ckchs_transaction.new_ckchs->data->cert && !ckchs_transaction.new_ckchs->data->key) {
-		memprintf(&err, "The transaction must contain at least a certificate and a private key!\n");
-		goto error;
-	}
-
-	if (!X509_check_private_key(ckchs_transaction.new_ckchs->data->cert, ckchs_transaction.new_ckchs->data->key)) {
+	if (ckchs_transaction.new_ckchs->data->key &&
+	    !X509_check_private_key(ckchs_transaction.new_ckchs->data->cert, ckchs_transaction.new_ckchs->data->key)) {
 		memprintf(&err, "inconsistencies between private key and certificate loaded '%s'.\n", ckchs_transaction.path);
 		goto error;
 	}
@@ -3193,6 +3191,9 @@ static int cli_parse_del_cert(char **args, char *payload, struct appctx *appctx,
 	}
 	if (!LIST_ISEMPTY(&store->ckch_inst)) {
 		memprintf(&err, "certificate '%s' in use, can't be deleted!\n", filename);
+		goto error;
+	} else if (store->jwt_entry) {
+		memprintf(&err, "certificate '%s' in use for JWT validation, can't be deleted!\n", filename);
 		goto error;
 	}
 

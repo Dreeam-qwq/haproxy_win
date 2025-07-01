@@ -400,7 +400,13 @@ quic_transport_param_decode(struct quic_transport_params *p, int server,
 		if (!server)
 			return QUIC_TP_DEC_ERR_INVAL;
 
-		/* TODO implement parsing for client side */
+		if (len > sizeof p->retry_source_connection_id.data)
+			return QUIC_TP_DEC_ERR_TRUNC;
+
+		if (len)
+			memcpy(p->retry_source_connection_id.data, *buf, len);
+		p->retry_source_connection_id.len = len;
+		*buf += len;
 		break;
 	default:
 		*buf += len;
@@ -751,6 +757,16 @@ int quic_transport_params_store(struct quic_conn *qc, int server,
 	else if (err == QUIC_TP_DEC_ERR_TRUNC) {
 		TRACE_ERROR("error on transport parameters decoding", QUIC_EV_TRANSP_PARAMS, qc);
 		return 0;
+	}
+
+	if (server && qc->retry_token) {
+		if (!tx_params->retry_source_connection_id.len ||
+		    (qc->odcid.len != tx_params->retry_source_connection_id.len ||
+		     memcmp(qc->odcid.data, tx_params->retry_source_connection_id.data, qc->odcid.len) != 0)) {
+			quic_set_connection_close(qc, quic_err_transport(QC_ERR_TRANSPORT_PARAMETER_ERROR));
+			TRACE_ERROR("retry_source_connection_id absence or mismatch", QUIC_EV_TRANSP_PARAMS, qc);
+			return 1;
+		}
 	}
 
 	/* Update the connection from transport parameters received */

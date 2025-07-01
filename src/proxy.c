@@ -1722,6 +1722,7 @@ int setup_new_proxy(struct proxy *px, const char *name, unsigned int cap, char *
 	}
 
 	px->cap = cap;
+	px->last_change = ns_to_sec(now_ns);
 
 	if (name && !(cap & PR_CAP_INT))
 		proxy_store_name(px);
@@ -2972,7 +2973,7 @@ static int dump_servers_state(struct appctx *appctx)
 		dump_server_addr(&srv->check.addr, srv_check_addr);
 		dump_server_addr(&srv->agent.addr, srv_agent_addr);
 
-		srv_time_since_last_change = ns_to_sec(now_ns) - COUNTERS_SHARED_LAST(srv->counters.shared->tg, last_change);
+		srv_time_since_last_change = ns_to_sec(now_ns) - srv->last_change;
 		bk_f_forced_id = px->options & PR_O_FORCED_ID ? 1 : 0;
 		srv_f_forced_id = srv->flags & SRV_F_FORCED_ID ? 1 : 0;
 
