@@ -11,6 +11,14 @@
 #include <haproxy/trace.h>
 
 DECLARE_POOL(pool_head_quic_ssl_sock_ctx, "quic_ssl_sock_ctx", sizeof(struct ssl_sock_ctx));
+const char *quic_ciphers = "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384"
+                           ":TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_CCM_SHA256";
+#ifdef HAVE_OPENSSL_QUIC
+const char *quic_groups = "X25519:P-256:P-384:P-521:X25519MLKEM768";
+#else
+const char *quic_groups = "X25519:P-256:P-384:P-521";
+#endif
+
 
 /* Set the encoded version of the transport parameter into the TLS
  * stack depending on <ver> QUIC version and <server> boolean which must
@@ -224,7 +232,7 @@ static int ha_quic_set_encryption_secrets(SSL *ssl, enum ssl_encryption_level_t 
 	 * listener and if a token was received. Note that a listener derives only RX
 	 * secrets for this level.
 	 */
-	if (qc_is_listener(qc) && level == ssl_encryption_early_data) {
+	if (objt_listener(qc->target) && level == ssl_encryption_early_data) {
 		if (qc->flags & QUIC_FL_CONN_NO_TOKEN_RCVD) {
 			/* Leave a chance to the address validation to be completed by the
 			 * handshake without starting the mux: one does not want to process
@@ -273,7 +281,7 @@ write:
 	}
 
 	/* Set the transport parameters in the TLS stack. */
-	if (level == ssl_encryption_handshake && qc_is_listener(qc) &&
+	if (level == ssl_encryption_handshake && objt_listener(qc->target) &&
 	    !qc_ssl_set_quic_transport_params(qc->xprt_ctx->ssl, qc, ver, 1))
 		goto leave;
 
@@ -284,7 +292,7 @@ write:
 		struct quic_tls_kp *nxt_tx = &qc->ku.nxt_tx;
 
 #if !defined(USE_QUIC_OPENSSL_COMPAT) && !defined(HAVE_OPENSSL_QUIC)
-		if (!qc_is_listener(qc)) {
+		if (objt_server(qc->target)) {
 			const unsigned char *tp;
 			size_t tplen;
 
@@ -732,6 +740,26 @@ int ssl_quic_initial_ctx(struct bind_conf *bind_conf)
 	SSL_CTX_set_mode(ctx, SSL_MODE_RELEASE_BUFFERS);
 	SSL_CTX_set_min_proto_version(ctx, TLS1_3_VERSION);
 	SSL_CTX_set_max_proto_version(ctx, TLS1_3_VERSION);
+	if (SSL_CTX_set_ciphersuites(ctx, quic_ciphers) != 1) {
+		ha_warning("Binding [%s:%d] for %s %s: default QUIC cipher"
+		           " suites setting failed.\n",
+		           bind_conf->file, bind_conf->line,
+		           proxy_type_str(bind_conf->frontend),
+		           bind_conf->frontend->id);
+		cfgerr++;
+	}
+
+#ifndef HAVE_OPENSSL_QUICTLS
+	/* TODO: this should also work with QUICTLS */
+	if (SSL_CTX_set1_groups_list(ctx, quic_groups) != 1) {
+		ha_warning("Binding [%s:%d] for %s %s: default QUIC cipher"
+		           " groups setting failed.\n",
+		           bind_conf->file, bind_conf->line,
+		           proxy_type_str(bind_conf->frontend),
+		           bind_conf->frontend->id);
+		cfgerr++;
+	}
+#endif
 
 	if (bind_conf->ssl_conf.early_data) {
 #if !defined(HAVE_SSL_0RTT_QUIC)
@@ -771,19 +799,19 @@ int ssl_quic_initial_ctx(struct bind_conf *bind_conf)
 SSL_CTX *ssl_quic_srv_new_ssl_ctx(void)
 {
 	SSL_CTX *ctx = NULL;
-	/* XXX TODO: check this: XXX */
-	long options =
-		(SSL_OP_ALL & ~SSL_OP_DONT_INSERT_EMPTY_FRAGMENTS) |
-		SSL_OP_SINGLE_ECDH_USE |
-		SSL_OP_CIPHER_SERVER_PREFERENCE;
 
 	ctx = SSL_CTX_new(TLS_client_method());
 	if (!ctx)
 		goto err;
 
-	SSL_CTX_set_options(ctx, options);
 	SSL_CTX_set_min_proto_version(ctx, TLS1_3_VERSION);
 	SSL_CTX_set_max_proto_version(ctx, TLS1_3_VERSION);
+	if (SSL_CTX_set_ciphersuites(ctx, quic_ciphers) != 1)
+		goto err;
+
+	if (SSL_CTX_set1_groups_list(ctx, quic_groups) != 1)
+		goto err;
+
 #ifdef USE_QUIC_OPENSSL_COMPAT
 	if (!quic_tls_compat_init(NULL, ctx))
 		goto err;
@@ -928,7 +956,7 @@ static int qc_ssl_provide_quic_data(struct ncbuf *ncbuf,
 		 * provided by the stack. This happens after having received the peer
 		 * handshake level CRYPTO data which are validated by the TLS stack.
 		 */
-		if (qc_is_listener(qc)) {
+		if (objt_listener(qc->target)) {
 			if (__objt_listener(qc->target)->bind_conf->ssl_conf.early_data &&
 				(!qc->ael || !qc->ael->tls_ctx.rx.secret)) {
 				TRACE_PROTO("SSL handshake in progress",
@@ -942,7 +970,7 @@ static int qc_ssl_provide_quic_data(struct ncbuf *ncbuf,
 #endif
 
 		/* Check the alpn could be negotiated */
-		if (qc_is_listener(qc)) {
+		if (objt_listener(qc->target)) {
 			if (!qc->app_ops) {
 				TRACE_ERROR("No negotiated ALPN", QUIC_EV_CONN_IO_CB, qc, &state);
 				quic_set_tls_alert(qc, SSL_AD_NO_APPLICATION_PROTOCOL);
@@ -972,7 +1000,7 @@ static int qc_ssl_provide_quic_data(struct ncbuf *ncbuf,
 		}
 
 		qc->flags |= QUIC_FL_CONN_NEED_POST_HANDSHAKE_FRMS;
-		if (qc_is_listener(ctx->qc)) {
+		if (objt_listener(ctx->qc->target)) {
 			struct listener *l = __objt_listener(qc->target);
 			/* I/O callback switch */
 			qc->wait_event.tasklet->process = quic_conn_app_io_cb;
@@ -1092,8 +1120,8 @@ int qc_ssl_provide_all_quic_data(struct quic_conn *qc, struct ssl_sock_ctx *ctx)
 	return ret;
 }
 
-/* Simple helper to set the specifig OpenSSL/quictls QUIC API callbacks */
-int quic_ssl_set_tls_cbs(SSL *ssl)
+/* Simple helper to set the specific OpenSSL/quictls QUIC API callbacks */
+static int quic_ssl_set_tls_cbs(SSL *ssl)
 {
 #ifdef HAVE_OPENSSL_QUIC
 	return SSL_set_quic_tls_cbs(ssl, ha_quic_dispatch, NULL);
@@ -1217,7 +1245,7 @@ int qc_alloc_ssl_sock_ctx(struct quic_conn *qc, struct connection *conn)
 	ctx->sent_early_data = 0;
 	ctx->qc = qc;
 
-	if (qc_is_listener(qc)) {
+	if (objt_listener(qc->target)) {
 		struct bind_conf *bc = __objt_listener(qc->target)->bind_conf;
 
 		if (qc_ssl_sess_init(qc, bc->initial_ctx, &ctx->ssl, NULL, 1) == -1)

@@ -47,10 +47,16 @@
 #ifdef USE_QUIC_OPENSSL_COMPAT
 #include <haproxy/quic_openssl_compat.h>
 #else
+#define HAVE_OPENSSL_QUIC_CLIENT_SUPPORT
 #if defined(OSSL_FUNC_SSL_QUIC_TLS_CRYPTO_SEND)
 /* This macro is defined by the new OpenSSL 3.5.0 QUIC TLS API and it is not
  * defined by quictls.
  */
+
+#if defined(USE_QUIC) && (OPENSSL_VERSION_NUMBER < 0x30500010L)
+#error "OpenSSL 3.5 QUIC API should only be used with OpenSSL 3.5.1 version and newer"
+#endif
+
 #define HAVE_OPENSSL_QUIC
 #define SSL_set_quic_transport_params   SSL_set_quic_tls_transport_params
 #define SSL_set_quic_early_data_enabled SSL_set_quic_tls_early_data_enabled
@@ -63,6 +69,9 @@ enum ssl_encryption_level_t {
 	ssl_encryption_application
 };
 
+#else
+/* QUIC TLS API */
+#define HAVE_OPENSSL_QUICTLS
 #endif
 #endif /* USE_QUIC_OPENSSL_COMPAT */
 

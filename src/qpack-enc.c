@@ -69,8 +69,8 @@ int qpack_encode_int_status(struct buffer *out, unsigned int status)
 {
 	int status_size, idx = 0;
 
-	if (status < 100 || status > 999)
-		return 1;
+	/* HTTP layer must not encode invalid status codes. */
+	BUG_ON(status < 100 || status > 999);
 
 	switch (status) {
 	case 103: idx = 24; break;
@@ -191,10 +191,10 @@ int qpack_encode_scheme(struct buffer *out, const struct ist scheme)
 			b_putchr(out, istptr(scheme)[i]);
 	}
 	else {
-		int idx = 23;
+		const int idx = isteq(scheme, ist("https")) ?
+		  23 : /* :scheme: https */
+		  22;  /* :scheme: http */
 
-		if (unlikely(!isteq(scheme, ist("http"))))
-			idx = 22;
 		if (b_room(out) < 2)
 			return 1;
 

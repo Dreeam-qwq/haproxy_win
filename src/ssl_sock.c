@@ -88,7 +88,7 @@
 #include <haproxy/istbuf.h>
 #include <haproxy/ssl_ocsp.h>
 #include <haproxy/trace.h>
-#include <haproxy/ssl_trace-t.h>
+#include <haproxy/ssl_trace.h>
 
 
 /* ***** READ THIS before adding code here! *****
@@ -4492,6 +4492,10 @@ static int ssl_sock_prepare_srv_ssl_ctx(const struct server *srv, SSL_CTX *ctx)
 #endif
 	X509_STORE *store = SSL_CTX_get_cert_store(ctx);
 
+	/* QUIC supports only TLS 1.3. Skip these TLS versions settings. */
+	if (srv_is_quic(srv))
+		goto options;
+
 	if (conf_ssl_methods->flags && (conf_ssl_methods->min || conf_ssl_methods->max))
 		ha_warning("no-sslv3/no-tlsv1x are ignored for this server. "
 			   "Use only 'ssl-min-ver' and 'ssl-max-ver' to fix.\n");
@@ -4549,6 +4553,7 @@ static int ssl_sock_prepare_srv_ssl_ctx(const struct server *srv, SSL_CTX *ctx)
         methodVersions[max].ctx_set_version(ctx, SET_MAX);
 #endif
 
+ options:
 	if (srv->ssl_ctx.options & SRV_SSL_O_NO_TLS_TICKETS)
 		options |= SSL_OP_NO_TICKET;
 
@@ -5792,12 +5797,10 @@ static int ssl_remove_xprt(struct connection *conn, void *xprt_ctx, void *toremo
 struct task *ssl_sock_io_cb(struct task *t, void *context, unsigned int state)
 {
 	struct tasklet *tl = (struct tasklet *)t;
-	struct ssl_sock_ctx *ctx = context;
+	struct ssl_sock_ctx *ctx;
 	struct connection *conn;
 	int conn_in_list;
 	int ret = 0;
-
-	TRACE_ENTER(SSL_EV_CONN_IO_CB, ctx->conn);
 
 	if (state & TASK_F_USR1) {
 		/* the tasklet was idling on an idle connection, it might have
@@ -5809,15 +5812,19 @@ struct task *ssl_sock_io_cb(struct task *t, void *context, unsigned int state)
 			tasklet_free(tl);
 			return NULL;
 		}
+		ctx = context;
 		conn = ctx->conn;
 		conn_in_list = conn->flags & CO_FL_LIST_MASK;
 		if (conn_in_list)
 			conn_delete_from_tree(conn);
 		HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
 	} else {
+		ctx = context;
 		conn = ctx->conn;
 		conn_in_list = 0;
 	}
+
+	TRACE_ENTER(SSL_EV_CONN_IO_CB, ctx->conn);
 
 	/* First if we're doing an handshake, try that */
 	if (ctx->conn->flags & CO_FL_SSL_WAIT_HS) {

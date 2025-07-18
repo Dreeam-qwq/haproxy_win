@@ -3313,7 +3313,7 @@ init_proxies_list_stage1:
 
 			srule->dynamic = 0;
 			srule->srv.name = server_name;
-			target = findserver(curproxy, srule->srv.name);
+			target = server_find_by_name(curproxy, srule->srv.name);
 			err_code |= warnif_tcp_http_cond(curproxy, srule->cond);
 
 			if (!target) {
@@ -4129,6 +4129,24 @@ out_uri_auth_compat:
 					 newsrv->mux_proto->token.ptr,
 					 newsrv->id, newsrv->conf.file, newsrv->conf.line);
 				cfgerr++;
+			}
+			else {
+				if ((mux_ent->mux->flags & MX_FL_FRAMED) && !srv_is_quic(newsrv)) {
+					ha_alert("%s '%s' : MUX protocol '%.*s' is incompatible with stream transport used by server '%s' at [%s:%d].\n",
+					         proxy_type_str(curproxy), curproxy->id,
+					         (int)newsrv->mux_proto->token.len,
+					         newsrv->mux_proto->token.ptr,
+					         newsrv->id, newsrv->conf.file, newsrv->conf.line);
+					cfgerr++;
+				}
+				else if (!(mux_ent->mux->flags & MX_FL_FRAMED) && srv_is_quic(newsrv)) {
+					ha_alert("%s '%s' : MUX protocol '%.*s' is incompatible with framed transport used by server '%s' at [%s:%d].\n",
+					         proxy_type_str(curproxy), curproxy->id,
+					         (int)newsrv->mux_proto->token.len,
+					         newsrv->mux_proto->token.ptr,
+					         newsrv->id, newsrv->conf.file, newsrv->conf.line);
+					cfgerr++;
+				}
 			}
 
 			/* update the mux */

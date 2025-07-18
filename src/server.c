@@ -43,6 +43,7 @@
 #include <haproxy/sc_strm.h>
 #include <haproxy/server.h>
 #include <haproxy/stats.h>
+#include <haproxy/ssl_sock.h>
 #include <haproxy/stconn.h>
 #include <haproxy/stream.h>
 #include <haproxy/stress.h>
@@ -2705,7 +2706,7 @@ static void srv_ssl_settings_cpy(struct server *srv, const struct server *src)
 	/* <src> is the current proxy's default server and SSL is enabled */
 	BUG_ON(src->ssl_ctx.ctx != NULL); /* the SSL_CTX must never be initialized in a default-server */
 
-	if (src == &srv->proxy->defsrv && src->use_ssl == 1)
+	if (srv->proxy && src == srv->proxy->defsrv && src->use_ssl == 1)
 		srv->flags |= SRV_F_DEFSRV_USE_SSL;
 
 	if (src->ssl_ctx.ca_file != NULL)
@@ -2854,7 +2855,11 @@ void srv_settings_init(struct server *srv)
 
 /*
  * Copy <src> server settings to <srv> server allocating
- * everything needed.
+ * everything needed. This is used to pre-initialize a server from
+ * default-server settings. If the source is NULL (i.e. no defsrv)
+ * then we fall back to srv_settings_init() to pre-initialize a
+ * clean new server.
+ *
  * This function is not supposed to be called at any time, but only
  * during server settings parsing or during server allocations from
  * a server template, and just after having calloc()'ed a new server.
@@ -2866,6 +2871,11 @@ void srv_settings_init(struct server *srv)
 void srv_settings_cpy(struct server *srv, const struct server *src, int srv_tmpl)
 {
 	struct srv_pp_tlv_list *srv_tlv = NULL, *new_srv_tlv = NULL;
+
+	if (!src) {
+		srv_settings_init(srv);
+		return;
+	}
 
 	/* Connection source settings copy */
 	srv_conn_src_cpy(srv, src);
@@ -2972,6 +2982,10 @@ void srv_settings_cpy(struct server *srv, const struct server *src, int srv_tmpl
 #if defined(USE_OPENSSL)
 	srv_ssl_settings_cpy(srv, src);
 #endif
+#ifdef TCP_MD5SIG
+	if (src->tcp_md5sig != NULL)
+		srv->tcp_md5sig = strdup(src->tcp_md5sig);
+#endif
 #ifdef TCP_USER_TIMEOUT
 	srv->tcp_ut = src->tcp_ut;
 #endif
@@ -3017,7 +3031,7 @@ void srv_settings_cpy(struct server *srv, const struct server *src, int srv_tmpl
 	}
 }
 
-/* allocate a server, attachs it to the global servers_list
+/* Allocates a server, attaches it to the global servers_list
  * and adds it to <proxy> server list. Before deleting the server with
  * srv_drop(), srv_detach() must be called to remove it from the parent
  * proxy list
@@ -3114,6 +3128,7 @@ void srv_free_params(struct server *srv)
 	free(srv->pool_conn_name);
 	release_sample_expr(srv->pool_conn_name_expr);
 	free(srv->resolvers_id);
+	free(srv->tcp_md5sig);
 	free(srv->addr_node.key);
 	free(srv->lb_nodes);
 	counters_be_shared_drop(srv->counters.shared);
@@ -3125,6 +3140,8 @@ void srv_free_params(struct server *srv)
 
 	if (xprt_get(XPRT_SSL) && xprt_get(XPRT_SSL)->destroy_srv)
 		xprt_get(XPRT_SSL)->destroy_srv(srv);
+	else if (xprt_get(XPRT_QUIC) && xprt_get(XPRT_QUIC)->destroy_srv)
+		xprt_get(XPRT_QUIC)->destroy_srv(srv);
 
 	while (!LIST_ISEMPTY(&srv->pp_tlvs)) {
 		srv_tlv = LIST_ELEM(srv->pp_tlvs.n, struct srv_pp_tlv_list *, list);
@@ -3605,6 +3622,7 @@ static int _srv_parse_init(struct server **srv, char **args, int *cur_arg,
 		}
 
 #ifdef USE_QUIC
+#ifdef HAVE_OPENSSL_QUIC_CLIENT_SUPPORT
 		if (srv_is_quic(newsrv)) {
 			if (!experimental_directives_allowed) {
 				ha_alert("QUIC is experimental for server '%s',"
@@ -3617,6 +3635,14 @@ static int _srv_parse_init(struct server **srv, char **args, int *cur_arg,
 			newsrv->xprt = xprt_get(XPRT_QUIC);
 			quic_transport_params_init(&newsrv->quic_params, 0);
 		}
+#else
+		if (srv_is_quic(newsrv)) {
+			ha_alert("The SSL stack does not provide a support for QUIC server '%s'",
+			         newsrv->id);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+#endif
 #endif
 
 		if (!port1 || !port2) {
@@ -3675,13 +3701,29 @@ static int _srv_parse_init(struct server **srv, char **args, int *cur_arg,
  skip_addr:
 		if (!(parse_flags & SRV_PARSE_DYNAMIC)) {
 			/* Copy default server settings to new server */
-			srv_settings_cpy(newsrv, &curproxy->defsrv, 0);
+			srv_settings_cpy(newsrv, curproxy->defsrv, 0);
 		} else
 			srv_settings_init(newsrv);
 		HA_SPIN_INIT(&newsrv->lock);
 	}
 	else {
-		*srv = newsrv = &curproxy->defsrv;
+		/* This is a "default-server" line. Let's make certain the
+		 * current proxy's default server exists, otherwise it's
+		 * time to allocate it now.
+		 */
+		newsrv = curproxy->defsrv;
+		if (!newsrv) {
+			newsrv = calloc(1, sizeof(*newsrv));
+			if (!newsrv) {
+				ha_alert("out of memory.\n");
+				err_code |= ERR_ALERT | ERR_ABORT;
+				goto out;
+			}
+			newsrv->id = "default-server";
+			srv_settings_init(newsrv);
+			curproxy->defsrv = newsrv;
+		}
+		*srv = newsrv;
 		*cur_arg = 1;
 	}
 
@@ -3840,6 +3882,12 @@ static int _srv_parse_finalize(char **args, int cur_arg,
 			ha_alert("QUIC protocol detected without explicit SSL requirement. Use 'ssl' to fix this.\n");
 			return ERR_ALERT | ERR_FATAL;
 		}
+
+		if (!srv->ssl_ctx.alpn_str &&
+		    ssl_sock_parse_alpn("h3", &srv->ssl_ctx.alpn_str,
+		                        &srv->ssl_ctx.alpn_len, &errmsg) != 0) {
+			return ERR_ALERT | ERR_FATAL;
+		}
 	}
 #endif
 
@@ -3935,31 +3983,6 @@ int parse_server(const char *file, int linenum, char **args,
 	return err_code;
 }
 
-/* Returns a pointer to the first server matching either id <id>.
- * NULL is returned if no match is found.
- * the lookup is performed in the backend <bk>
- */
-struct server *server_find_by_id(struct proxy *bk, int id)
-{
-	struct eb32_node *eb32;
-	struct server *curserver;
-
-	if (!bk || (id ==0))
-		return NULL;
-
-	/* <bk> has no backend capabilities, so it can't have a server */
-	if (!(bk->cap & PR_CAP_BE))
-		return NULL;
-
-	curserver = NULL;
-
-	eb32 = eb32_lookup(&bk->conf.used_server_id, id);
-	if (eb32)
-		curserver = container_of(eb32, struct server, conf.id);
-
-	return curserver;
-}
-
 /*
  * This function finds a server with matching "<puid> x <rid>" within
  * selected backend <bk>.
@@ -3979,11 +4002,45 @@ struct server *server_find_by_id_unique(struct proxy *bk, int id, uint32_t rid)
 	return curserver;
 }
 
+/*
+ * This function returns the server with a matching name within selected proxy,
+ * or NULL if not found.
+ */
+struct server *server_find_by_name(struct proxy *px, const char *name)
+{
+	struct ebpt_node *node;
+	struct server *cursrv;
+
+	if (!px)
+		return NULL;
+
+	node = ebis_lookup(&px->conf.used_server_name, name);
+	cursrv = node ? container_of(node, struct server, conf.name) : NULL;
+	return cursrv;
+}
+
+/*
+ * This function returns the server with a matching address within selected
+ * proxy, or NULL if not found. The proxy lock is taken for reads during this
+ * operation since we don't want the address to change under us.
+ */
+struct server *server_find_by_addr(struct proxy *px, const char *addr)
+{
+	struct ebpt_node *node;
+	struct server *cursrv;
+
+	HA_RWLOCK_RDLOCK(PROXY_LOCK, &px->lock);
+	node = ebis_lookup(&px->used_server_addr, addr);
+	cursrv = node ? container_of(node, struct server, addr_node) : NULL;
+	HA_RWLOCK_RDUNLOCK(PROXY_LOCK, &px->lock);
+	return cursrv;
+}
+
 /* Returns a pointer to the first server matching either name <name>, or id
  * if <name> starts with a '#'. NULL is returned if no match is found.
  * the lookup is performed in the backend <bk>
  */
-struct server *server_find_by_name(struct proxy *bk, const char *name)
+struct server *server_find(struct proxy *bk, const char *name)
 {
 	struct server *curserver;
 
@@ -3999,11 +4056,7 @@ struct server *server_find_by_name(struct proxy *bk, const char *name)
 		curserver = server_find_by_id(bk, atoi(name + 1));
 	}
 	else {
-		struct ebpt_node *node;
-
-		node = ebis_lookup(&bk->conf.used_server_name, name);
-		if (node)
-			curserver = container_of(node, struct server, conf.name);
+		curserver = server_find_by_name(bk, name);
 	}
 
 	return curserver;
@@ -4026,11 +4079,11 @@ struct server *server_find_by_name(struct proxy *bk, const char *name)
  * a different server from the one we were expecting to match against at a given
  * time.
  */
-struct server *server_find_by_name_unique(struct proxy *bk, const char *name, uint32_t rid)
+struct server *server_find_unique(struct proxy *bk, const char *name, uint32_t rid)
 {
 	struct server *curserver;
 
-	curserver = server_find_by_name(bk, name);
+	curserver = server_find(bk, name);
 	if (!curserver || curserver->rid != rid)
 		return NULL;
 	return curserver;
@@ -4050,7 +4103,7 @@ struct server *server_find_best_match(struct proxy *bk, char *name, int id, int 
 	byname = byid = NULL;
 
 	if (name) {
-		byname = server_find_by_name(bk, name);
+		byname = server_find(bk, name);
 		if (byname && (!id || byname->puid == id))
 			return byname;
 	}
@@ -4972,7 +5025,7 @@ struct server *snr_check_ip_callback(struct server *srv, void *ip, unsigned char
 		HA_SPIN_LOCK(SERVER_LOCK, &tmpsrv->lock);
 		if ((tmpsrv->hostname_dn == NULL) ||
 		    (srv->hostname_dn_len != tmpsrv->hostname_dn_len) ||
-		    (strcasecmp(srv->hostname_dn, tmpsrv->hostname_dn) != 0) ||
+		    (memcmp(srv->hostname_dn, tmpsrv->hostname_dn, srv->hostname_dn_len) != 0) ||
 		    (srv->puid == tmpsrv->puid)) {
 			HA_SPIN_UNLOCK(SERVER_LOCK, &tmpsrv->lock);
 			continue;
@@ -5059,7 +5112,7 @@ int srv_set_fqdn(struct server *srv, const char *hostname, int resolv_locked)
 	if (resolution &&
 	    resolution->hostname_dn &&
 	    resolution->hostname_dn_len == hostname_dn_len &&
-	    strcasecmp(resolution->hostname_dn, hostname_dn) == 0)
+	    memcmp(resolution->hostname_dn, hostname_dn, hostname_dn_len) == 0)
 		goto end;
 
 	resolv_unlink_resolution(srv->resolv_requester);
@@ -5294,7 +5347,7 @@ struct server *cli_find_server(struct appctx *appctx, char *arg)
 		cli_err(appctx, "No such backend.\n");
 		return NULL;
 	}
-	if (!(sv = server_find_by_name(px, ist0(sv_name)))) {
+	if (!(sv = server_find(px, ist0(sv_name)))) {
 		cli_err(appctx, "No such server.\n");
 		return NULL;
 	}
@@ -5544,7 +5597,7 @@ static int cli_parse_get_weight(char **args, char *payload, struct appctx *appct
 
 	if (!(be = proxy_be_by_name(ist0(be_name))))
 		return cli_err(appctx, "No such backend.\n");
-	if (!(sv = server_find_by_name(be, ist0(sv_name))))
+	if (!(sv = server_find(be, ist0(sv_name))))
 		return cli_err(appctx, "No such server.\n");
 
 	/* return server's effective weight at the moment */
@@ -6020,7 +6073,7 @@ static int cli_parse_add_server(char **args, char *payload, struct appctx *appct
 	/*
 	 * If a server with the same name is found, reject the new one.
 	 */
-	if (server_find_by_name(be, sv_name)) {
+	if (server_find(be, sv_name)) {
 		thread_release();
 		cli_err(appctx, "Already exists a server with the same name in backend.\n");
 		return 1;
@@ -6049,6 +6102,14 @@ static int cli_parse_add_server(char **args, char *payload, struct appctx *appct
 	 */
 	srv->init_addr_methods = SRV_IADDR_NONE;
 
+	if (!srv->mux_proto && srv_is_quic(srv)) {
+		/* Force QUIC as mux-proto on server with quic addresses.
+		 * Incompatibilities with TCP proxy mode will be catch by the
+		 * next code block.
+		 */
+		srv->mux_proto = get_mux_proto(ist("quic"));
+	}
+
 	if (srv->mux_proto) {
 		int proto_mode = conn_pr_mode_to_proto_mode(be->mode);
 		const struct mux_proto_list *mux_ent;
@@ -6058,6 +6119,16 @@ static int cli_parse_add_server(char **args, char *payload, struct appctx *appct
 		if (!mux_ent || !isteq(mux_ent->token, srv->mux_proto->token)) {
 			ha_alert("MUX protocol is not usable for server.\n");
 			goto out;
+		}
+		else {
+			if ((mux_ent->mux->flags & MX_FL_FRAMED) && !srv_is_quic(srv)) {
+				ha_alert("MUX protocol is incompatible with stream transport used by server.\n");
+				goto out;
+			}
+			else if (!(mux_ent->mux->flags & MX_FL_FRAMED) && srv_is_quic(srv)) {
+				ha_alert("MUX protocol is incompatible with framed transport used by server.\n");
+				goto out;
+			}
 		}
 	}
 
@@ -6080,6 +6151,10 @@ static int cli_parse_add_server(char **args, char *payload, struct appctx *appct
 	    srv->check.use_ssl == 1) {
 		if (xprt_get(XPRT_SSL) && xprt_get(XPRT_SSL)->prepare_srv) {
 			if (xprt_get(XPRT_SSL)->prepare_srv(srv))
+				goto out;
+		}
+		else if (xprt_get(XPRT_QUIC) && xprt_get(XPRT_QUIC)->prepare_srv) {
+			if (xprt_get(XPRT_QUIC)->prepare_srv(srv))
 				goto out;
 		}
 	}
@@ -6229,7 +6304,7 @@ int srv_check_for_deletion(const char *bename, const char *svname, struct proxy 
 		goto leave;
 	}
 
-	if (!(srv = server_find_by_name(be, svname))) {
+	if (!(srv = server_find(be, svname))) {
 		msg = "No such server.";
 		goto leave;
 	}
@@ -6491,7 +6566,7 @@ int srv_apply_track(struct server *srv, struct proxy *curproxy)
 		px = curproxy;
 	}
 
-	strack = findserver(px, sname);
+	strack = server_find_by_name(px, sname);
 	if (!strack) {
 		ha_alert("unable to find required server '%s' for tracking.\n",
 		         sname);

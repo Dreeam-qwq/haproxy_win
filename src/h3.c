@@ -150,9 +150,11 @@ struct h3c {
 
 DECLARE_STATIC_POOL(pool_head_h3c, "h3c", sizeof(struct h3c));
 
-#define H3_SF_UNI_INIT  0x00000001  /* stream type not parsed for unidirectional stream */
-#define H3_SF_UNI_NO_H3 0x00000002  /* unidirectional stream does not carry H3 frames */
-#define H3_SF_HAVE_CLEN 0x00000004  /* content-length header is present; relevant either for request or response depending on the side of the connection */
+#define H3_SF_UNI_INIT     0x00000001  /* stream type not parsed for unidirectional stream */
+#define H3_SF_UNI_NO_H3    0x00000002  /* unidirectional stream does not carry H3 frames */
+#define H3_SF_HAVE_CLEN    0x00000004  /* content-length header is present; relevant either for request or response depending on the side of the connection */
+#define H3_SF_SENT_INTERIM 0x00000008  /* last response sent is 1xx interim. Used on FE side only. */
+#define H3_SF_RECV_INTERIM 0x00000010  /* last response sent is 1xx interim. Used on BE side only. */
 
 struct h3s {
 	struct h3c *h3c;
@@ -1091,6 +1093,9 @@ static ssize_t h3_req_headers_to_htx(struct qcs *qcs, const struct buffer *buf,
  * transcoded into HTX buffer of <qcs> stream. <fin> must be set if this is the
  * last data to transfer for this stream.
  *
+ * If the response handled was an interim one (1xx code), H3_SF_RECV_INTERIM
+ * flag will be set on h3 stream instance.
+ *
  * Returns the number of consumed bytes or a negative error code.
  */
 static ssize_t h3_resp_headers_to_htx(struct qcs *qcs, const struct buffer *buf,
@@ -1240,10 +1245,9 @@ static ssize_t h3_resp_headers_to_htx(struct qcs *qcs, const struct buffer *buf,
 		goto out;
 	}
 
-	if (fin)
-		sl->flags |= HTX_SL_F_BODYLESS;
-
 	sl->info.res.status = h * 100 + t * 10 + u;
+	if (fin || (sl->info.res.status >= 100 && sl->info.res.status < 200))
+		sl->flags |= HTX_SL_F_BODYLESS;
 
 	/* now treat standard headers */
 	while (1) {
@@ -1317,6 +1321,17 @@ static ssize_t h3_resp_headers_to_htx(struct qcs *qcs, const struct buffer *buf,
 
 	if (fin)
 		htx->flags |= HTX_FL_EOM;
+
+	/* Detect if an interim or final response was handled. */
+	if (sl->info.res.status >= 100 && sl->info.res.status < 200) {
+		TRACE_USER("receiving interim response", H3_EV_RX_FRAME|H3_EV_RX_HDR, qcs->qcc->conn, qcs);
+		BUG_ON(!conn_is_back(qcs->qcc->conn)); /* H3_SF_RECV_INTERIM is BE side only. */
+		h3s->flags |= H3_SF_RECV_INTERIM;
+	}
+	else {
+		TRACE_USER("receiving final response", H3_EV_RX_FRAME|H3_EV_RX_HDR, qcs->qcc->conn, qcs);
+		h3s->flags &= ~H3_SF_RECV_INTERIM;
+	}
 
  out:
 	if (appbuf)
@@ -1793,10 +1808,24 @@ static ssize_t h3_rcv_buf(struct qcs *qcs, struct buffer *b, int fin)
 			break;
 		case H3_FT_HEADERS:
 			if (h3s->st_req == H3S_ST_REQ_BEFORE) {
-				ret = !conn_is_back(qcs->qcc->conn) ?
-				  h3_req_headers_to_htx(qcs, b, flen, last_stream_frame) :
-				  h3_resp_headers_to_htx(qcs, b, flen, last_stream_frame);
-				h3s->st_req = H3S_ST_REQ_HEADERS;
+				if (!conn_is_back(qcs->qcc->conn)) {
+					ret = h3_req_headers_to_htx(qcs, b, flen, last_stream_frame);
+					h3s->st_req = H3S_ST_REQ_HEADERS;
+				}
+				else {
+					ret = h3_resp_headers_to_htx(qcs, b, flen, last_stream_frame);
+
+					/* Check if an interim or final response was parsed. */
+					if (h3s->flags & H3_SF_RECV_INTERIM) {
+						/* Interim resp: do not advance <st_req>. */
+						qcs->flags |= QC_SF_EOI_SUSPENDED;
+					}
+					else {
+						/* Final resp: mark <st_req> as headers received. */
+						h3s->st_req = H3S_ST_REQ_HEADERS;
+						qcs->flags &= ~QC_SF_EOI_SUSPENDED;
+					}
+				}
 			}
 			else {
 				ret = h3_trailers_to_htx(qcs, b, flen, last_stream_frame);
@@ -2146,8 +2175,8 @@ static int h3_req_headers_send(struct qcs *qcs, struct htx *htx)
  */
 static int h3_resp_headers_send(struct qcs *qcs, struct htx *htx)
 {
+	struct h3s *h3s = qcs->ctx;
 	int err;
-	struct buffer outbuf;
 	struct buffer headers_buf = BUF_NULL;
 	struct buffer *res;
 	struct http_hdr list[global.tune.max_http_hdr * 2];
@@ -2177,8 +2206,20 @@ static int h3_resp_headers_send(struct qcs *qcs, struct htx *htx)
 			/* start-line -> HEADERS h3 frame */
 			BUG_ON(sl);
 			sl = htx_get_blk_ptr(htx, blk);
-			/* TODO should be on h3 layer */
 			status = sl->info.res.status;
+			if (status < 100 || status > 999) {
+				TRACE_ERROR("invalid response status code", H3_EV_STRM_SEND, qcs->qcc->conn, qcs);
+				goto err;
+			}
+			else if (status >= 100 && status < 200) {
+				TRACE_USER("handling interim HTX response", H3_EV_STRM_SEND, qcs->qcc->conn, qcs);
+				BUG_ON(conn_is_back(qcs->qcc->conn)); /* H3_SF_SENT_INTERIM is FE side only. */
+				h3s->flags |= H3_SF_SENT_INTERIM;
+			}
+			else {
+				TRACE_USER("handling final HTX response", H3_EV_STRM_SEND, qcs->qcc->conn, qcs);
+				h3s->flags &= ~H3_SF_SENT_INTERIM;
+			}
 		}
 		else if (type == HTX_BLK_HDR) {
 			if (unlikely(hdr >= sizeof(list) / sizeof(list[0]) - 1)) {
@@ -2196,6 +2237,9 @@ static int h3_resp_headers_send(struct qcs *qcs, struct htx *htx)
 		}
 	}
 
+	/* Current function expects HTX start-line to be present. This also
+	 * ensures <status> conformance has been checked prior to encoding it.
+	 */
 	BUG_ON(!sl);
 
 	list[hdr].n = ist("");
@@ -2213,20 +2257,24 @@ static int h3_resp_headers_send(struct qcs *qcs, struct htx *htx)
 		goto end;
 	}
 
-	/* Buffer allocated just now : must be enough for frame type + length as a max varint size */
-	BUG_ON(b_room(res) < 5);
+	/* Reserve space for frame type + length as a max varint size. */
+	if (unlikely(b_contig_space(res) < 5)) {
+		/* Most of the times, h3_resp_headers_send() is only called one
+		 * time per stream, so buffer will be empty. However, this
+		 * assumption is invalid when handling interim responses, so
+		 * it's important to check out buffer remaining space.
+		 */
+		goto err_full;
+	}
 
-	b_reset(&outbuf);
-	outbuf = b_make(b_tail(res), b_contig_space(res), 0, 0);
 	/* Start the headers after frame type + length */
-	headers_buf = b_make(b_head(res) + 5, b_size(res) - 5, 0, 0);
+	headers_buf = b_make(b_tail(res) + 5, b_contig_space(res) - 5, 0, 0);
 
 	TRACE_DATA("encoding HEADERS frame", H3_EV_TX_FRAME|H3_EV_TX_HDR,
 	           qcs->qcc->conn, qcs);
 	if (qpack_encode_field_section_line(&headers_buf))
 		goto err_full;
 	if (qpack_encode_int_status(&headers_buf, status)) {
-		/* TODO handle invalid status code VS no buf space left */
 		TRACE_ERROR("error during status code encoding", H3_EV_TX_FRAME|H3_EV_TX_HDR, qcs->qcc->conn, qcs);
 		goto err_full;
 	}
@@ -2287,6 +2335,20 @@ static int h3_resp_headers_send(struct qcs *qcs, struct htx *htx)
 	return ret;
 
  err_full:
+	if (b_data(res)) {
+		/* Output buffer already contains data : this may happens after
+		 * HTTP interim response encoding. Try to release buffer to be
+		 * able to encode newer interim or final response.
+		 */
+		if (qcc_release_stream_txbuf(qcs)) {
+			TRACE_DEVEL("cannot release buf", H3_EV_TX_FRAME|H3_EV_TX_HDR, qcs->qcc->conn, qcs);
+			return 0;
+		}
+
+		TRACE_DEVEL("retry after buf release", H3_EV_TX_FRAME|H3_EV_TX_HDR, qcs->qcc->conn, qcs);
+		goto retry;
+	}
+
 	if (smallbuf) {
 		TRACE_DEVEL("retry with a full buffer", H3_EV_TX_FRAME|H3_EV_TX_HDR, qcs->qcc->conn, qcs);
 		smallbuf = 0;
@@ -2609,23 +2671,31 @@ static int h3_resp_data_send(struct qcs *qcs, struct htx *htx,
  * stream instance. Successfully transcoded HTX blocks are removed from input
  * buffer.
  *
+ * <fin> is used as an output boolean. It will be set if the last blocks of the
+ * HTX message were encoded, which should trigger a FIN STREAM emission.
+ *
  * Returns the amount of consumed bytes from <buf>. In case of error,
  * connection is flagged and transcoding is interrupted. The returned value is
  * unchanged though.
  */
-static size_t h3_snd_buf(struct qcs *qcs, struct buffer *buf, size_t count)
+static size_t h3_snd_buf(struct qcs *qcs, struct buffer *buf, size_t count, char *fin)
 {
+	struct h3s *h3s = qcs->ctx;
 	size_t total = 0;
 	enum htx_blk_type btype;
 	struct htx *htx;
 	struct htx_blk *blk;
 	uint32_t bsize;
 	int32_t idx;
+	char eom;
 	int ret = 0;
 
 	TRACE_ENTER(H3_EV_STRM_SEND, qcs->qcc->conn, qcs);
 
+	*fin = 0;
 	htx = htx_from_buf(buf);
+	/* EOM is saved here, useful if 0-copy is performed with HTX buf. */
+	eom = htx->flags & HTX_FL_EOM;
 
 	while (count && !htx_is_empty(htx) && qcc_stream_can_send(qcs) && ret >= 0) {
 		idx = htx_get_head(htx);
@@ -2645,7 +2715,7 @@ static size_t h3_snd_buf(struct qcs *qcs, struct buffer *buf, size_t count)
 			break;
 
 		case HTX_BLK_RES_SL:
-			/* start-line -> HEADERS h3 frame */
+			/* start-line -> HEADERS h3 frame (FE side) */
 			ret = h3_resp_headers_send(qcs, htx);
 			if (ret > 0) {
 				total += ret;
@@ -2726,6 +2796,10 @@ static size_t h3_snd_buf(struct qcs *qcs, struct buffer *buf, size_t count)
 #endif
 
  out:
+	if (eom && htx_is_empty(htx) && !(h3s->flags & H3_SF_SENT_INTERIM)) {
+		TRACE_USER("transcoding last HTX message", H3_EV_STRM_SEND, qcs->qcc->conn, qcs);
+		*fin = 1;
+	}
 	htx_to_buf(htx, buf);
 
 	TRACE_LEAVE(H3_EV_STRM_SEND, qcs->qcc->conn, qcs);

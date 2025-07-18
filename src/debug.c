@@ -34,6 +34,7 @@
 #include <haproxy/cfgparse.h>
 #include <haproxy/cli.h>
 #include <haproxy/clock.h>
+#include <haproxy/cpu_topo.h>
 #include <haproxy/debug.h>
 #include <haproxy/fd.h>
 #include <haproxy/global.h>
@@ -103,6 +104,7 @@ struct post_mortem {
 	char post_mortem_magic[32];     // "POST-MORTEM STARTS HERE+7654321\0"
 	struct {
 		struct utsname utsname; // OS name+ver+arch+hostname
+		char distro[64];	// Distro name and version from os-release file if exists
 		char hw_vendor[64];     // hardware/hypervisor vendor when known
 		char hw_family[64];     // hardware/hypervisor product family when known
 		char hw_model[64];      // hardware/hypervisor product/model when known
@@ -650,14 +652,14 @@ static int debug_parse_cli_show_dev(char **args, char *payload, struct appctx *a
 	chunk_reset(&trash);
 
 	chunk_appendf(&trash, "HAProxy version %s\n", haproxy_version);
-	chunk_appendf(&trash, "Features\n  %s\n", build_features);
+	chunk_appendf(&trash, "Features:\n  %s\n", build_features);
 
-	chunk_appendf(&trash, "Build options\n");
+	chunk_appendf(&trash, "Build options:\n");
 	for (build_opt = NULL; (build_opt = hap_get_next_build_opt(build_opt)); )
 		if (append_prefixed_str(&trash, *build_opt, "  ", '\n', 0) == 0)
 			chunk_strcat(&trash, "\n");
 
-	chunk_appendf(&trash, "Platform info\n");
+	chunk_appendf(&trash, "Platform info:\n");
 	if (*post_mortem.platform.hw_vendor)
 		chunk_appendf(&trash, "  machine vendor: %s\n", post_mortem.platform.hw_vendor);
 	if (*post_mortem.platform.hw_family)
@@ -688,8 +690,10 @@ static int debug_parse_cli_show_dev(char **args, char *payload, struct appctx *a
 		chunk_appendf(&trash, "  OS architecture: %s\n", post_mortem.platform.utsname.machine);
 	if (*post_mortem.platform.utsname.nodename)
 		chunk_appendf(&trash, "  node name: %s\n", HA_ANON_CLI(post_mortem.platform.utsname.nodename));
+	if (*post_mortem.platform.distro)
+		chunk_appendf(&trash, "  distro pretty name: %s\n", HA_ANON_CLI(post_mortem.platform.distro));
 
-	chunk_appendf(&trash, "Process info\n");
+	chunk_appendf(&trash, "Process info:\n");
 	chunk_appendf(&trash, "  pid: %d\n", post_mortem.process.pid);
 	chunk_appendf(&trash, "  cmdline: ");
 	for (i = 0; i < post_mortem.process.argc; i++)
@@ -748,6 +752,8 @@ static int debug_parse_cli_show_dev(char **args, char *payload, struct appctx *a
 		LIM2A(normalize_rlim((ulong)post_mortem.process.boot_lim_ram.rlim_max), "unlimited"),
 		LIM2A(normalize_rlim((ulong)post_mortem.process.run_lim_ram.rlim_max), "unlimited"));
 
+	cpu_topo_dump_summary(ha_cpu_topo, &trash);
+
 	ha_free(&err);
 
 	return cli_msg(appctx, LOG_INFO, trash.area);
@@ -768,7 +774,26 @@ void ha_panic()
 		return;
 	}
 
-	chunk_printf(&trash, "Thread %u is about to kill the process.\n", tid + 1);
+	chunk_printf(&trash, "\nPANIC! Thread %u is about to kill the process.\n", tid + 1);
+
+	/* dump a few of the post-mortem info */
+	chunk_appendf(&trash, "\nHAProxy info:\n  version: %s\n  features: %s\n",
+		      haproxy_version, build_features);
+
+	chunk_appendf(&trash, "\nOperating system info:\n");
+	if (*post_mortem.platform.virt_techno)
+		chunk_appendf(&trash, "  virtual machine: %s\n", post_mortem.platform.virt_techno);
+	if (*post_mortem.platform.cont_techno)
+		chunk_appendf(&trash, "  container: %s\n", post_mortem.platform.cont_techno);
+	if (*post_mortem.platform.utsname.sysname || *post_mortem.platform.utsname.release ||
+	    *post_mortem.platform.utsname.version || *post_mortem.platform.utsname.machine)
+		chunk_appendf(&trash, "  kernel: %s %s %s %s\n",
+			      post_mortem.platform.utsname.sysname, post_mortem.platform.utsname.release,
+			      post_mortem.platform.utsname.version, post_mortem.platform.utsname.machine);
+	if (*post_mortem.platform.distro)
+		chunk_appendf(&trash, "  userland: %s\n", post_mortem.platform.distro);
+
+	chunk_appendf(&trash, "\n");
 	DISGUISE(write(2, trash.area, trash.data));
 
 	for (thr = 0; thr < global.nbthread; thr++) {
@@ -2770,6 +2795,12 @@ static void feed_post_mortem_linux()
 
 static int feed_post_mortem()
 {
+	FILE *file;
+	struct stat statbuf;
+	char line[64];
+	char file_path[32];
+	int line_cnt = 0;
+
 	/* write an easily identifiable magic at the beginning of the struct */
 	strncpy(post_mortem.post_mortem_magic,
 		"POST-MORTEM STARTS HERE+7654321\0",
@@ -2777,6 +2808,49 @@ static int feed_post_mortem()
 	/* kernel type, version and arch */
 	uname(&post_mortem.platform.utsname);
 
+	/* try to find os-release file, this may give the current minor version of
+	 * distro if it was recently updated.
+	 */
+	snprintf(file_path, sizeof(file_path), "%s", "/etc/os-release");
+	if (stat(file_path, &statbuf) != 0) {
+		/* fallback to "/usr/lib/os-release" */
+		snprintf(file_path, sizeof(file_path), "%s", "/usr/lib/os-release");
+		if (stat(file_path, &statbuf) != 0 ) {
+			goto process_info;
+		}
+	}
+
+	/* try open and find the line with distro PRETTY_NAME (name + full version) */
+	if ((file = fopen(file_path, "r")) == NULL) {
+		goto process_info;
+	}
+
+	while ((fgets(line, sizeof(post_mortem.platform.distro), file)) && (line_cnt < MAX_LINES_TO_READ)) {
+		line_cnt++;
+		if (strncmp(line, "PRETTY_NAME=", 12) == 0) {
+			/* cut \n and trim possible quotes */
+			char *start = line + 12;
+			char *newline = strchr(start, '\n');
+
+			if (newline) {
+				*newline = '\0';
+			} else {
+				newline = start + strlen(start);
+			}
+
+			/* trim possible quotes */
+			if (*start == '"')
+				start++;
+			if (newline > start && *(newline - 1) == '"')
+				*(--newline) = '\0';
+
+			strlcpy2(post_mortem.platform.distro, start, sizeof(post_mortem.platform.distro));
+			break;
+		}
+	}
+	fclose(file);
+
+process_info:
 	/* some boot-time info related to the process */
 	post_mortem.process.pid = getpid();
 	post_mortem.process.boot_uid = geteuid();

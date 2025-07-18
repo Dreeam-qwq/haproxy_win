@@ -218,11 +218,10 @@ int cpu_map_configured(void)
 /* Dump the CPU topology <topo> for up to cpu_topo_maxcpus CPUs for
  * debugging purposes. Offline CPUs are skipped.
  */
-void cpu_dump_topology(const struct ha_cpu_topo *topo)
+void cpu_topo_debug(const struct ha_cpu_topo *topo)
 {
 	int has_smt = 0;
 	int cpu, lvl;
-	int grp, thr;
 
 	for (cpu = 0; cpu <= cpu_topo_lastcpu; cpu++) {
 		if (ha_cpu_topo[cpu].th_cnt > 1) {
@@ -265,18 +264,26 @@ void cpu_dump_topology(const struct ha_cpu_topo *topo)
 		}
 		putchar('\n');
 	}
+}
 
-	printf("CPU clusters:\n");
+/* Dump the summary of CPU topology <topo>: clusters info and thread-cpu
+ * bindings.
+ */
+void cpu_topo_dump_summary(const struct ha_cpu_topo *topo, struct buffer *trash)
+{
+	int cpu, grp, thr;
+
+	chunk_appendf(trash, "CPU clusters:\n");
 	for (cpu = 0; cpu < cpu_topo_maxcpus; cpu++) {
 		if (!ha_cpu_clusters[cpu].nb_cpu)
 			continue;
-		printf("  %3u  cpus=%3u cores=%3u capa=%u\n",
-		       cpu, ha_cpu_clusters[cpu].nb_cpu,
-		       ha_cpu_clusters[cpu].nb_cores,
-		       ha_cpu_clusters[cpu].capa);
+		chunk_appendf(trash, "  %3u  cpus=%3u cores=%3u capa=%u\n",
+			      cpu, ha_cpu_clusters[cpu].nb_cpu,
+			      ha_cpu_clusters[cpu].nb_cores,
+			      ha_cpu_clusters[cpu].capa);
 	}
 
-	printf("Thread CPU Bindings:\n  Tgrp/Thr  Tid        CPU set\n");
+	chunk_appendf(trash, "Thread CPU Bindings:\n  Tgrp/Thr  Tid        CPU set\n");
 	for (grp = 0; grp < global.nbtgroups; grp++) {
 		int first, last;
 		int min, max;
@@ -331,7 +338,7 @@ void cpu_dump_topology(const struct ha_cpu_topo *topo)
 				else if (len2 == 0)
 					snprintf(str + len, sizeof(str) - len, "<all>");
 
-				printf("  %s\n", str);
+				chunk_appendf(trash, "  %s\n", str);
 				min = max = -1;
 			}
 		}

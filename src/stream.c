@@ -1220,7 +1220,7 @@ static int process_server_rules(struct stream *s, struct channel *req, int an_bi
 				if (!build_logline(s, tmp->area, tmp->size, &rule->expr))
 					break;
 
-				srv = findserver(s->be, tmp->area);
+				srv = server_find_by_name(s->be, tmp->area);
 				if (!srv)
 					break;
 			}
@@ -1250,10 +1250,10 @@ static inline void sticking_rule_find_target(struct stream *s,
                                              struct stktable *t, struct stksess *ts)
 {
 	struct proxy *px = s->be;
-	struct eb32_node *node;
 	struct dict_entry *de;
 	void *ptr;
-	struct server *srv;
+	struct server *srv = NULL;
+	int id;
 
 	/* Look for the server name previously stored in <t> stick-table */
 	HA_RWLOCK_RDLOCK(STK_SESS_LOCK, &ts->lock);
@@ -1262,35 +1262,25 @@ static inline void sticking_rule_find_target(struct stream *s,
 	HA_RWLOCK_RDUNLOCK(STK_SESS_LOCK, &ts->lock);
 
 	if (de) {
-		struct ebpt_node *node;
+		if (t->server_key_type == STKTABLE_SRV_NAME)
+			srv = server_find_by_name(px, de->value.key);
+		else if (t->server_key_type == STKTABLE_SRV_ADDR)
+			srv = server_find_by_addr(px, de->value.key);
 
-		if (t->server_key_type == STKTABLE_SRV_NAME) {
-			node = ebis_lookup(&px->conf.used_server_name, de->value.key);
-			if (node) {
-				srv = container_of(node, struct server, conf.name);
-				goto found;
-			}
-		} else if (t->server_key_type == STKTABLE_SRV_ADDR) {
-			HA_RWLOCK_RDLOCK(PROXY_LOCK, &px->lock);
-			node = ebis_lookup(&px->used_server_addr, de->value.key);
-			HA_RWLOCK_RDUNLOCK(PROXY_LOCK, &px->lock);
-			if (node) {
-				srv = container_of(node, struct server, addr_node);
-				goto found;
-			}
-		}
+		if (srv)
+			goto found;
 	}
 
 	/* Look for the server ID */
 	HA_RWLOCK_RDLOCK(STK_SESS_LOCK, &ts->lock);
 	ptr = __stktable_data_ptr(t, ts, STKTABLE_DT_SERVER_ID);
-	node = eb32_lookup(&px->conf.used_server_id, stktable_data_cast(ptr, std_t_sint));
+	id = stktable_data_cast(ptr, std_t_sint);
 	HA_RWLOCK_RDUNLOCK(STK_SESS_LOCK, &ts->lock);
 
-	if (!node)
+	srv = server_find_by_id(px, id);
+	if (!srv)
 		return;
 
-	srv = container_of(node, struct server, conf.id);
  found:
 	if ((srv->cur_state != SRV_ST_STOPPED) ||
 	    (px->options & PR_O_PERSIST) || (s->flags & SF_FORCE_PRST)) {
@@ -3850,7 +3840,7 @@ static int cli_parse_show_sess(char **args, char *payload, struct appctx *appctx
 			if (!(be = proxy_be_by_name(ist0(be_name))))
 				return cli_err(appctx, "No such backend.\n");
 
-			if (!(sv = server_find_by_name(be, ist0(sv_name))))
+			if (!(sv = server_find(be, ist0(sv_name))))
 				return cli_err(appctx, "No such server.\n");
 			ctx->flags |= CLI_SHOWSESS_F_SERVER;
 			ctx->filter = sv;

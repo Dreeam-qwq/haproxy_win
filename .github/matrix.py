@@ -125,7 +125,7 @@ def main(ref_name):
     # Ubuntu
 
     if "haproxy-" in ref_name:
-        os = "ubuntu-22.04" # stable branch
+        os = "ubuntu-24.04" # stable branch
     else:
         os = "ubuntu-24.04" # development branch
 
@@ -218,6 +218,7 @@ def main(ref_name):
             "stock",
             "OPENSSL_VERSION=1.0.2u",
             "OPENSSL_VERSION=1.1.1s",
+            "OPENSSL_VERSION=3.5.1",
             "QUICTLS=yes",
             "WOLFSSL_VERSION=5.7.0",
             "AWS_LC_VERSION=1.39.0",
@@ -232,8 +233,7 @@ def main(ref_name):
 
         for ssl in ssl_versions:
             flags = ["USE_OPENSSL=1"]
-            if ssl == "BORINGSSL=yes" or ssl == "QUICTLS=yes" or "LIBRESSL" in ssl or "WOLFSSL" in ssl or "AWS_LC" in ssl:
-                flags.append("USE_QUIC=1")
+            skipdup=0
             if "WOLFSSL" in ssl:
                 flags.append("USE_OPENSSL_WOLFSSL=1")
             if "AWS_LC" in ssl:
@@ -243,8 +243,23 @@ def main(ref_name):
                 flags.append("SSL_INC=${HOME}/opt/include")
             if "LIBRESSL" in ssl and "latest" in ssl:
                 ssl = determine_latest_libressl(ssl)
+                skipdup=1
             if "OPENSSL" in ssl and "latest" in ssl:
                 ssl = determine_latest_openssl(ssl)
+                skipdup=1
+
+            # if "latest" equals a version already in the list
+            if ssl in ssl_versions and skipdup == 1:
+                continue
+
+            openssl_supports_quic = False
+            try:
+              openssl_supports_quic = version.Version(ssl.split("OPENSSL_VERSION=",1)[1]) >= version.Version("3.5.0")
+            except:
+              pass
+
+            if ssl == "BORINGSSL=yes" or ssl == "QUICTLS=yes" or "LIBRESSL" in ssl or "WOLFSSL" in ssl or "AWS_LC" in ssl or openssl_supports_quic:
+                flags.append("USE_QUIC=1")
 
             matrix.append(
                 {

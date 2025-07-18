@@ -33,7 +33,6 @@
 
 DECLARE_POOL(pool_head_quic_tx_packet, "quic_tx_packet", sizeof(struct quic_tx_packet));
 DECLARE_POOL(pool_head_quic_cc_buf, "quic_cc_buf", QUIC_MAX_CC_BUFSIZE);
-DECLARE_POOL(pool_head_quic_be_cc_buf, "quic_be_cc_buf", QUIC_BE_MAX_CC_BUFSIZE);
 
 static struct quic_tx_packet *qc_build_pkt(unsigned char **pos, const unsigned char *buf_end,
                                            struct quic_enc_level *qel, struct quic_tls_ctx *ctx,
@@ -130,28 +129,16 @@ struct buffer *qc_get_txb(struct quic_conn *qc)
 	struct buffer *buf;
 
 	if (qc->flags & QUIC_FL_CONN_IMMEDIATE_CLOSE) {
-		struct pool_head *ph;
-		size_t psz;
-
-		if (objt_listener(qc->target)) {
-			ph = pool_head_quic_cc_buf;
-			psz = QUIC_MAX_CC_BUFSIZE;
-		}
-		else {
-			ph = pool_head_quic_be_cc_buf;
-			psz = QUIC_BE_MAX_CC_BUFSIZE;
-		}
-
 		TRACE_PROTO("Immediate close required", QUIC_EV_CONN_PHPKTS, qc);
 		buf = &qc->tx.cc_buf;
 		if (b_is_null(buf)) {
-			qc->tx.cc_buf_area = pool_alloc(ph);
+			qc->tx.cc_buf_area = pool_alloc(pool_head_quic_cc_buf);
 			if (!qc->tx.cc_buf_area)
 				goto err;
 		}
 
 		/* In every case, initialize ->tx.cc_buf */
-		qc->tx.cc_buf = b_make(qc->tx.cc_buf_area, psz, 0, 0);
+		qc->tx.cc_buf = b_make(qc->tx.cc_buf_area, QUIC_MAX_CC_BUFSIZE, 0, 0);
 	}
 	else {
 		buf = qc_txb_alloc(qc);
@@ -663,7 +650,7 @@ static int qc_prep_pkts(struct quic_conn *qc, struct buffer *buf,
 			 * to stay under MTU limit.
 			 */
 			if (!dglen) {
-				if (!quic_peer_validated_addr(qc) && qc_is_listener(qc))
+				if (!quic_peer_validated_addr(qc) && objt_listener(qc->target))
 					end = pos + QUIC_MIN(qc->path->mtu, quic_may_send_bytes(qc));
 				else
 					end = pos + qc->path->mtu;
@@ -675,36 +662,50 @@ static int qc_prep_pkts(struct quic_conn *qc, struct buffer *buf,
 
 			/* RFC 9000 14.1 Initial datagram size
 			 *
+			 * A client MUST expand the payload of all UDP datagrams carrying Initial
+			 * packets to at least the smallest allowed maximum datagram size of 1200
+			 * bytes by adding PADDING frames to the Initial packet or by coalescing
+			 * the Initial packet; see Section 12.2. Initial packets can even be
+			 * coalesced with invalid packets, which a receiver will discard.
+			 *
 			 * Similarly, a server MUST expand the payload of all UDP
 			 * datagrams carrying ack-eliciting Initial packets to at least the
 			 * smallest allowed maximum datagram size of 1200 bytes.
 			 */
 			if (qel == qc->iel && (!l || !LIST_ISEMPTY(frms) || probe)) {
-				 /* Ensure that no ack-eliciting packets are sent into too small datagrams */
+				 /* Ensure that no Initial packets are sent into too small datagrams */
 				if (end - pos < QUIC_INITIAL_PACKET_MINLEN) {
 					TRACE_PROTO("No more enough room to build an Initial packet",
 					            QUIC_EV_CONN_PHPKTS, qc);
 					break;
 				}
 
-				/* padding will be set for last QEL, except when probing:
-				 * to build a PING only non coalesced Initial datagram for
-				 * instance when blocked by the anti-amplification limit,
-				 * this datagram MUST be padded.
+				/* padding MUST ALWAYS be set for the last QEL, except:
+				 * - for a listener, when probing, that is to say
+				 *   to build a PING only non coalesced Initial datagram for
+				 *   instance when blocked by the anti-amplification limit,
+				 *   this datagram MUST be padded.
 				 */
 				padding = 1;
 			}
 
 			pkt_type = quic_enc_level_pkt_type(qc, qel);
-			/* <paddding> parameter for qc_build_pkt() must not be set to 1 when
+			/* For listeners:
+			 * <paddding> parameter for qc_build_pkt() must not be set to 1 when
 			 * building PING only Initial datagram (a datagram with an Initial
 			 * packet inside containing only a PING frame as ack-eliciting
 			 * frame). This is the case when both <probe> and LIST_EMPTY(<frms>)
 			 * conditions are verified (see qc_do_build_pkt()).
+			 *
+			 * For clients:
+			 * <padding> must be set to 1 only the current packet cannot be coalesced,
+			 * i.e. if the next qel is not present or empty.
 			 */
 			cur_pkt = qc_build_pkt(&pos, end, qel, tls_ctx, frms,
 			                       qc, ver, dglen, pkt_type, must_ack,
-			                       padding && (!l || (!next_qel && (!probe || !LIST_ISEMPTY(frms)))),
+			                       padding &&
+			                       ((!l && (!next_qel || LIST_ISEMPTY(next_qel->send_frms))) ||
+			                        (l && !next_qel && (!probe || !LIST_ISEMPTY(frms)))),
 			                       probe, cc, &err);
 			if (!cur_pkt) {
 				switch (err) {
@@ -1773,6 +1774,10 @@ static int qc_do_build_pkt(unsigned char *pos, const unsigned char *end,
 	int ret = 0;
 
 	TRACE_ENTER(QUIC_EV_CONN_TXPKT, qc);
+	TRACE_PRINTF(TRACE_LEVEL_DEVELOPER, QUIC_EV_CONN_TXPKT, qc, 0, 0, 0,
+	             "dglen=%u pn=%llu must_ack=%d padding=%d cc=%d probe=%d qel=%c",
+	             (unsigned int)dglen, (ull)pn, must_ack, padding, cc, probe,
+	             quic_enc_level_char_from_qel(qel, qc));
 
 	/* Length field value with CRYPTO frames if present. */
 	len_frms = 0;

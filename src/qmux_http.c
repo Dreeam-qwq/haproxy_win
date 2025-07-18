@@ -33,8 +33,10 @@ size_t qcs_http_rcv_buf(struct qcs *qcs, struct buffer *buf, size_t count,
 	cs_htx = htx_from_buf(buf);
 	if (htx_is_empty(cs_htx) && htx_used_space(qcs_htx) <= count) {
 		/* EOM will be copied to cs_htx via b_xfer(). */
-		if (qcs_htx->flags & HTX_FL_EOM)
+		if ((qcs_htx->flags & HTX_FL_EOM) &&
+		    !(qcs->flags & QC_SF_EOI_SUSPENDED)) {
 			*fin = 1;
+		}
 
 		htx_to_buf(cs_htx, buf);
 		htx_to_buf(qcs_htx, &qcs->rx.app_buf);
@@ -48,7 +50,8 @@ size_t qcs_http_rcv_buf(struct qcs *qcs, struct buffer *buf, size_t count,
 	/* Copy EOM from src to dst buffer if all data copied. */
 	if (htx_is_empty(qcs_htx) && (qcs_htx->flags & HTX_FL_EOM)) {
 		cs_htx->flags |= HTX_FL_EOM;
-		*fin = 1;
+		if (!(qcs->flags & QC_SF_EOI_SUSPENDED))
+			*fin = 1;
 	}
 
 	cs_htx->extra = qcs_htx->extra ? (qcs_htx->data + qcs_htx->extra) : 0;
@@ -94,7 +97,6 @@ size_t qcs_http_snd_buf(struct qcs *qcs, struct buffer *buf, size_t count,
 {
 	struct htx *htx;
 	size_t ret;
-	int eom = 0;
 
 	TRACE_ENTER(QMUX_EV_STRM_SEND, qcs->qcc->conn, qcs);
 
@@ -108,9 +110,7 @@ size_t qcs_http_snd_buf(struct qcs *qcs, struct buffer *buf, size_t count,
 	if (htx->extra && htx->extra == HTX_UNKOWN_PAYLOAD_LENGTH)
 		qcs->flags |= QC_SF_UNKNOWN_PL_LENGTH;
 
-	eom = (htx->flags & HTX_FL_EOM);
-	ret = qcs->qcc->app_ops->snd_buf(qcs, buf, count);
-	*fin = (eom && !b_data(buf));
+	ret = qcs->qcc->app_ops->snd_buf(qcs, buf, count, fin);
 
 	TRACE_LEAVE(QMUX_EV_STRM_SEND, qcs->qcc->conn, qcs);
 
