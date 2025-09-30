@@ -60,5 +60,5 @@ jobs:
     - name: Upload haproxy Windows
       uses: actions/upload-artifact@v4
       with:
-        name: haproxy_win"
+        name: "haproxy_win"
         path: "./**.exe"
