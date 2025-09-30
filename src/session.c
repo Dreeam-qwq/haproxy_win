@@ -23,14 +23,14 @@
 #include <haproxy/proxy.h>
 #include <haproxy/session.h>
 #include <haproxy/tcp_rules.h>
+#include <haproxy/thread.h>
 #include <haproxy/tools.h>
 #include <haproxy/trace.h>
 #include <haproxy/vars.h>
 
 
-DECLARE_POOL(pool_head_session, "session", sizeof(struct session));
-DECLARE_POOL(pool_head_sess_priv_conns, "session priv conns list",
-             sizeof(struct sess_priv_conns));
+DECLARE_TYPED_POOL(pool_head_session, "session", struct session);
+DECLARE_TYPED_POOL(pool_head_sess_priv_conns, "session priv conns list", struct sess_priv_conns);
 
 int conn_complete_session(struct connection *conn);
 
@@ -99,6 +99,11 @@ struct session *session_new(struct proxy *fe, struct listener *li, enum obj_type
 		sess->flags = SESS_FL_NONE;
 		sess->src = NULL;
 		sess->dst = NULL;
+		sess->fe_tgcounters = sess->fe->fe_counters.shared.tg[tgid - 1];
+		if (sess->listener && sess->listener->counters)
+			sess->li_tgcounters = sess->listener->counters->shared.tg[tgid - 1];
+		else
+			sess->li_tgcounters = NULL;
 		TRACE_STATE("new session", SESS_EV_NEW, sess);
 	}
 	TRACE_LEAVE(SESS_EV_NEW);
@@ -113,6 +118,7 @@ void session_free(struct session *sess)
 {
 	struct connection *conn, *conn_back;
 	struct sess_priv_conns *pconns, *pconns_back;
+	struct list conn_tmp_list = LIST_HEAD_INIT(conn_tmp_list);
 
 	TRACE_ENTER(SESS_EV_END);
 	TRACE_STATE("releasing session", SESS_EV_END, sess);
@@ -129,16 +135,27 @@ void session_free(struct session *sess)
 	conn = objt_conn(sess->origin);
 	if (conn != NULL && conn->mux)
 		conn->mux->destroy(conn->ctx);
+
+	HA_SPIN_LOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
 	list_for_each_entry_safe(pconns, pconns_back, &sess->priv_conns, sess_el) {
 		list_for_each_entry_safe(conn, conn_back, &pconns->conn_list, sess_el) {
 			LIST_DEL_INIT(&conn->sess_el);
 			conn->owner = NULL;
-			conn->flags &= ~CO_FL_SESS_IDLE;
-			conn_release(conn);
+			LIST_APPEND(&conn_tmp_list, &conn->sess_el);
 		}
 		MT_LIST_DELETE(&pconns->srv_el);
 		pool_free(pool_head_sess_priv_conns, pconns);
 	}
+	HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
+
+	/* Release connections outside of idle lock. */
+	while (!LIST_ISEMPTY(&conn_tmp_list)) {
+		conn = LIST_ELEM(conn_tmp_list.n, struct connection *, sess_el);
+		/* Del-init sess_el to prevent session_unown_conn() via conn_backend_deinit(). */
+		LIST_DEL_INIT(&conn->sess_el);
+		conn_release(conn);
+	}
+
 	sockaddr_free(&sess->src);
 	sockaddr_free(&sess->dst);
 	pool_free(pool_head_session, sess);
@@ -574,6 +591,328 @@ void __session_add_glitch_ctr(struct session *sess, uint inc)
 	for (i = 0; i < global.tune.nb_stk_ctr; i++)
 		stkctr_add_glitch_ctr(&sess->stkctr[i], inc);
 }
+
+
+/* Session management of backend connections. */
+
+/* Allocate a storage element into <sess> session which refers to <target>
+ * endpoint. This storage can be used to attach new connections
+ * to the session.
+ *
+ * Returns the allocated element or NULL on failure.
+ */
+static struct sess_priv_conns *sess_alloc_sess_conns(struct session *sess,
+                                                     enum obj_type *target)
+{
+	struct sess_priv_conns *pconns;
+	struct server *srv;
+
+	pconns = pool_alloc(pool_head_sess_priv_conns);
+	if (!pconns)
+		return NULL;
+
+	pconns->target = target;
+	LIST_INIT(&pconns->conn_list);
+	LIST_APPEND(&sess->priv_conns, &pconns->sess_el);
+
+	MT_LIST_INIT(&pconns->srv_el);
+	/* If <target> endpoint is a server, also attach storage element into it. */
+	if ((srv = objt_server(target)))
+		MT_LIST_APPEND(&srv->per_thr[tid].sess_conns, &pconns->srv_el);
+
+	pconns->tid = tid;
+
+	return pconns;
+}
+
+/* Retrieve the backend connections storage element from <sess> session which
+ * refers to <target> endpoint.
+ *
+ * This function usage must be protected with idle_conns lock.
+ *
+ * Returns the storage element or NULL if not found;
+ */
+static struct sess_priv_conns *sess_get_sess_conns(struct session *sess,
+                                                   enum obj_type *target)
+{
+	struct sess_priv_conns *pconns;
+
+	list_for_each_entry(pconns, &sess->priv_conns, sess_el) {
+		if (pconns->target == target)
+			return pconns;
+	}
+
+	return NULL;
+}
+
+/* Add the connection <conn> to the private conns list of session <sess>. Each
+ * connection is indexed by their respective target in the session. Nothing is
+ * performed if the connection is already in the session list.
+ *
+ * Returns true if conn is inserted or already present else false if a failure
+ * occurs during insertion.
+ */
+int session_add_conn(struct session *sess, struct connection *conn)
+{
+	struct sess_priv_conns *pconns;
+	int ret = 0;
+
+	/* Connection target is used to index it in the session. Only BE conns are expected in session list. */
+	BUG_ON(!conn->target || objt_listener(conn->target));
+
+	/* A connection cannot be attached already to another session.
+	 *
+	 * This is safe as BE connections are flagged as private immediately
+	 * after being created during connect_server(). The only potential
+	 * issue would be if a connection is turned private later on during its
+	 * lifetime. Currently, this happens only on NTLM headers detection,
+	 * however this case is only implemented with HTTP/1.1 which cannot
+	 * multiplex several streams on the same connection.
+	 */
+	BUG_ON(conn->owner && conn->owner != sess);
+
+	HA_SPIN_LOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
+
+	/* Already attach to the session */
+	if (!LIST_ISEMPTY(&conn->sess_el)) {
+		ret = 1;
+		goto out;
+	}
+
+	pconns = sess_get_sess_conns(sess, conn->target);
+	if (!pconns) {
+		pconns = sess_alloc_sess_conns(sess, conn->target);
+		if (!pconns)
+			goto out;
+	}
+
+	LIST_APPEND(&pconns->conn_list, &conn->sess_el);
+	/* Ensure owner is set for connection. It could have been reset
+	 * prior on after a session_add_conn() failure.
+	 */
+	conn->owner = sess;
+	ret = 1;
+
+ out:
+	HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
+	return ret;
+}
+
+/* Reinsert a backend connection <conn> into <sess> session. This function is
+ * reserved for idle conns which were previously temporarily removed from
+ * session to protect it against other threads.
+ *
+ * Returns true on success else false.
+ */
+int session_reinsert_idle_conn(struct session *sess, struct connection *conn)
+{
+	struct sess_priv_conns *pconns;
+	int ret = 0;
+
+	/* This function is reserved for idle private connections. */
+	BUG_ON(!(conn->flags & CO_FL_SESS_IDLE));
+
+	HA_SPIN_LOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
+
+	pconns = sess_get_sess_conns(sess, conn->target);
+	if (!pconns) {
+		pconns = sess_alloc_sess_conns(sess, conn->target);
+		if (!pconns)
+			goto out;
+	}
+
+	LIST_APPEND(&pconns->conn_list, &conn->sess_el);
+	++sess->idle_conns;
+	ret = 1;
+
+ out:
+	HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
+	return ret;
+}
+
+/* Check that session <sess> is able to keep idle connection <conn>. This must
+ * be called each time a connection stored in a session becomes idle.
+ *
+ * If <conn> can be kept as idle in the session, idle sess conn counter of its
+ * target server will be incremented.
+ *
+ * Returns 0 if the connection is kept, else non-zero if the connection was
+ * explicitely removed from session.
+ */
+int session_check_idle_conn(struct session *sess, struct connection *conn)
+{
+	struct server *srv = objt_server(conn->target);
+
+	/* Connection must be attached to session prior to this function call. */
+	BUG_ON(!conn->owner || conn->owner != sess);
+
+	/* Connection is not attached to a session. */
+	if (!conn->owner)
+		return 0;
+
+	/* Ensure conn is not already accounted as idle to prevent sess idle count excess increment. */
+	BUG_ON(conn->flags & CO_FL_SESS_IDLE);
+
+	if (sess->idle_conns >= sess->fe->max_out_conns ||
+	    (srv && (srv->cur_admin & SRV_ADMF_MAINT))) {
+		session_unown_conn(sess, conn);
+		conn->owner = NULL;
+		return -1;
+	}
+	else {
+		conn->flags |= CO_FL_SESS_IDLE;
+		sess->idle_conns++;
+		if (srv)
+			HA_ATOMIC_INC(&srv->curr_sess_idle_conns);
+	}
+
+	return 0;
+}
+
+/* Look for an available connection matching the target <target> in the server
+ * list of the session <sess>. It returns a connection if found. Otherwise it
+ * returns NULL.
+ */
+struct connection *session_get_conn(struct session *sess, void *target, int64_t hash)
+{
+	struct connection *srv_conn, *res = NULL;
+	struct sess_priv_conns *pconns;
+	struct server *srv;
+
+	HA_SPIN_LOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
+
+	pconns = sess_get_sess_conns(sess, target);
+	if (!pconns)
+		goto end;
+
+	/* Search into pconns for a connection with matching params and available streams. */
+	list_for_each_entry(srv_conn, &pconns->conn_list, sess_el) {
+		if (srv_conn->hash_node.key == hash &&
+		    srv_conn->mux &&
+		    (srv_conn->mux->avail_streams(srv_conn) > 0) &&
+		    !(srv_conn->flags & CO_FL_WAIT_XPRT)) {
+			if (srv_conn->flags & CO_FL_SESS_IDLE) {
+				srv_conn->flags &= ~CO_FL_SESS_IDLE;
+				sess->idle_conns--;
+
+				srv = objt_server(srv_conn->target);
+				if (srv)
+					HA_ATOMIC_DEC(&srv->curr_sess_idle_conns);
+			}
+
+			res = srv_conn;
+			break;
+		}
+	}
+
+  end:
+	HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
+	return res;
+}
+
+/* Remove the connection from the session list, and destroy sess_priv_conns
+ * element if it's now empty.
+ */
+void session_unown_conn(struct session *sess, struct connection *conn)
+{
+	struct sess_priv_conns *pconns = NULL;
+
+	BUG_ON(objt_listener(conn->target));
+
+	HA_SPIN_LOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
+
+	/* WT: this currently is a workaround for an inconsistency between
+	 * the link status of the connection in the session list and the
+	 * connection's owner. This should be removed as soon as all this
+	 * is addressed. Right now it's possible to enter here with a non-null
+	 * conn->owner that points to a dead session, but in this case the
+	 * element is not linked.
+	 */
+	if (!LIST_INLIST(&conn->sess_el))
+		goto out;
+
+	if (conn->flags & CO_FL_SESS_IDLE)
+		sess->idle_conns--;
+	LIST_DEL_INIT(&conn->sess_el);
+	conn->owner = NULL;
+
+	pconns = sess_get_sess_conns(sess, conn->target);
+	BUG_ON(!pconns); /* if conn is attached to session, its sess_conn must exists. */
+	if (LIST_ISEMPTY(&pconns->conn_list)) {
+		LIST_DELETE(&pconns->sess_el);
+		MT_LIST_DELETE(&pconns->srv_el);
+		pool_free(pool_head_sess_priv_conns, pconns);
+	}
+
+ out:
+	HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
+}
+
+/* Remove <conn> connection from <sess> session. Contrary to
+ * session_unown_conn(), this function is not protected by a lock, so the
+ * caller is responsible to properly use idle_conns_lock prior to calling it.
+ *
+ * Another notable difference is that <owner> member of <conn> is not resetted.
+ * This is a convenience as this function usage is generally coupled with a
+ * following session_reinsert_idle_conn().
+ *
+ * Must be called with idle_conns_lock held.
+ *
+ * Returns true on connection removal, false if it was already not stored.
+ */
+int session_detach_idle_conn(struct session *sess, struct connection *conn)
+{
+	struct sess_priv_conns *pconns;
+
+	if (!LIST_INLIST(&conn->sess_el))
+		return 0;
+
+	/* This function is reserved for idle private connections. */
+	BUG_ON(!(conn->flags & CO_FL_SESS_IDLE));
+
+	--sess->idle_conns;
+	LIST_DEL_INIT(&conn->sess_el);
+
+	pconns = sess_get_sess_conns(sess, conn->target);
+	BUG_ON(!pconns); /* if conn is attached to session, its sess_conn must exists. */
+	if (LIST_ISEMPTY(&pconns->conn_list)) {
+		/* Remove sess_conn element as no connection left in it. */
+		LIST_DELETE(&pconns->sess_el);
+		MT_LIST_DELETE(&pconns->srv_el);
+		pool_free(pool_head_sess_priv_conns, pconns);
+	}
+
+	return 1;
+}
+
+/* Remove every idle backend connections stored in <sess_conns> and move them
+ * into the purge list. If <sess_conns> is empty it is also removed from the
+ * session and freed.
+ *
+ * Returns the number of connections moved to purge list.
+ */
+int sess_conns_cleanup_all_idle(struct sess_priv_conns *sess_conns)
+{
+	struct connection *conn, *back;
+	int conn_tid = sess_conns->tid;
+	int i = 0;
+
+	list_for_each_entry_safe(conn, back, &sess_conns->conn_list, sess_el) {
+		if (!(conn->flags & CO_FL_SESS_IDLE))
+			continue;
+
+		/* Decrement session idle counter. */
+		--((struct session *)conn->owner)->idle_conns;
+
+		LIST_DEL_INIT(&conn->sess_el);
+		MT_LIST_APPEND(&idle_conns[conn_tid].toremove_conns,
+		               &conn->toremove_list);
+		++i;
+	}
+
+	return i;
+}
+
 
 /*
  * Local variables:

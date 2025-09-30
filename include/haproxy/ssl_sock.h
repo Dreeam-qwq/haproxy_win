@@ -28,6 +28,7 @@
 #include <haproxy/openssl-compat.h>
 #include <haproxy/pool-t.h>
 #include <haproxy/proxy-t.h>
+#include <haproxy/quic_conn-t.h>
 #include <haproxy/ssl_sock-t.h>
 #include <haproxy/thread.h>
 
@@ -70,6 +71,7 @@ int ssl_sock_get_alpn(const struct connection *conn, void *xprt_ctx,
                       const char **str, int *len);
 int ssl_bio_and_sess_init(struct connection *conn, SSL_CTX *ssl_ctx,
                           SSL **ssl, BIO **bio, BIO_METHOD *bio_meth, void *ctx);
+void ssl_sock_srv_try_reuse_sess(struct ssl_sock_ctx *ctx, struct server *srv);
 const char *ssl_sock_get_sni(struct connection *conn);
 const char *ssl_sock_get_cert_sig(struct connection *conn);
 const char *ssl_sock_get_cipher_name(struct connection *conn);
@@ -186,6 +188,55 @@ static inline void cert_ignerr_bitfield_set_all(unsigned long long *bitfield)
 {
 	memset(bitfield, -1, IGNERR_BF_SIZE*sizeof(*bitfield));
 }
+
+/* Listener only function.
+ * Return the listener attached to <s> SSL object.
+ */
+static inline struct listener *ssl_sock_get_listener(const SSL *s)
+{
+	struct connection *conn = SSL_get_ex_data(s, ssl_app_data_index);
+#ifdef USE_QUIC
+	struct quic_conn *qc = SSL_get_ex_data(s, ssl_qc_app_data_index);
+#endif
+
+	if (conn)
+		return __objt_listener(conn->target);
+#ifdef USE_QUIC
+	else if (qc)
+		return qc->li;
+#endif
+	return NULL;
+}
+
+/* Return the connection from <s> SSL object.
+ * Note that for QUIC, this function must be called with very much attention.
+ * Indeed, for QUIC frontends, qc->conn is not always initialized.
+ * For QUIC backends, this is always the case if the SSL object is released
+ * at the same time as the connection.
+ */
+static inline struct connection *ssl_sock_get_conn(const SSL *s, struct ssl_sock_ctx **ctx)
+{
+	struct connection *ret = NULL;
+	struct connection *conn = SSL_get_ex_data(s, ssl_app_data_index);
+#ifdef USE_QUIC
+	struct quic_conn *qc = SSL_get_ex_data(s, ssl_qc_app_data_index);
+#endif
+
+	if (conn) {
+		ret = conn;
+		if (ctx)
+			*ctx = conn_get_ssl_sock_ctx(conn);
+	}
+#ifdef USE_QUIC
+	else if (qc) {
+		ret = qc->conn;
+		if (ctx)
+			*ctx = qc->xprt_ctx;
+	}
+#endif
+	return ret;
+}
+
 
 #endif /* USE_OPENSSL */
 #endif /* _HAPROXY_SSL_SOCK_H */

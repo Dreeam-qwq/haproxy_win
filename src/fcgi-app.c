@@ -35,9 +35,9 @@ static struct fcgi_app *fcgi_apps = NULL;
 struct flt_ops fcgi_flt_ops;
 const char *fcgi_flt_id = "FCGI filter";
 
-DECLARE_STATIC_POOL(pool_head_fcgi_flt_ctx, "fcgi_flt_ctx", sizeof(struct fcgi_flt_ctx));
-DECLARE_STATIC_POOL(pool_head_fcgi_param_rule, "fcgi_param_rule", sizeof(struct fcgi_param_rule));
-DECLARE_STATIC_POOL(pool_head_fcgi_hdr_rule, "fcgi_hdr_rule", sizeof(struct fcgi_hdr_rule));
+DECLARE_STATIC_TYPED_POOL(pool_head_fcgi_flt_ctx, "fcgi_flt_ctx", struct fcgi_flt_ctx);
+DECLARE_STATIC_TYPED_POOL(pool_head_fcgi_param_rule, "fcgi_param_rule", struct fcgi_param_rule);
+DECLARE_STATIC_TYPED_POOL(pool_head_fcgi_hdr_rule, "fcgi_hdr_rule", struct fcgi_hdr_rule);
 
 /**************************************************************************/
 /***************************** Uitls **************************************/
@@ -290,7 +290,7 @@ static int fcgi_flt_start(struct stream *s, struct filter *filter)
 
 static void fcgi_flt_stop(struct stream *s, struct filter *filter)
 {
-	struct flt_fcgi_ctx *fcgi_ctx = filter->ctx;
+	struct fcgi_flt_ctx *fcgi_ctx = filter->ctx;
 
 	if (!fcgi_ctx)
 		return;
@@ -446,12 +446,14 @@ static int fcgi_flt_http_headers(struct stream *s, struct filter *filter, struct
 	goto end;
 
   rewrite_err:
-	_HA_ATOMIC_INC(&sess->fe->fe_counters.shared->tg[tgid - 1]->failed_rewrites);
-	_HA_ATOMIC_INC(&s->be->be_counters.shared->tg[tgid - 1]->failed_rewrites);
-	if (sess->listener && sess->listener->counters)
-		_HA_ATOMIC_INC(&sess->listener->counters->shared->tg[tgid - 1]->failed_rewrites);
-	if (objt_server(s->target))
-		_HA_ATOMIC_INC(&__objt_server(s->target)->counters.shared->tg[tgid - 1]->failed_rewrites);
+	if (sess->fe_tgcounters)
+		_HA_ATOMIC_INC(&sess->fe_tgcounters->failed_rewrites);
+	if (s->be_tgcounters)
+		_HA_ATOMIC_INC(&s->be_tgcounters->failed_rewrites);
+	if (sess->li_tgcounters)
+		_HA_ATOMIC_INC(&sess->li_tgcounters->failed_rewrites);
+	if (s->sv_tgcounters)
+		_HA_ATOMIC_INC(&s->sv_tgcounters->failed_rewrites);
   hdr_rule_err:
 	node = ebpt_first(&hdr_rules);
 	while (node) {

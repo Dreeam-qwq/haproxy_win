@@ -47,7 +47,7 @@
 #define APPCTX_FL_ERROR          0x00000080
 #define APPCTX_FL_SHUTDOWN       0x00000100  /* applet was shut down (->release() called if any). No more data exchange with SCs */
 #define APPCTX_FL_WANT_DIE       0x00000200  /* applet was running and requested to die */
-#define APPCTX_FL_INOUT_BUFS     0x00000400  /* applet uses its own buffers */
+/* unused: 0x00000400 */
 #define APPCTX_FL_FASTFWD        0x00000800  /* zero-copy forwarding is in-use, don't fill the outbuf */
 #define APPCTX_FL_IN_MAYALLOC    0x00001000  /* applet may try again to allocate its inbuf */
 #define APPCTX_FL_OUT_MAYALLOC   0x00002000  /* applet may try again to allocate its outbuf */
@@ -73,17 +73,22 @@ static forceinline char *appctx_show_flags(char *buf, size_t len, const char *de
 	_(APPCTX_FL_OUTBLK_ALLOC, _(APPCTX_FL_OUTBLK_FULL,
 	_(APPCTX_FL_EOI, _(APPCTX_FL_EOS,
 	_(APPCTX_FL_ERR_PENDING, _(APPCTX_FL_ERROR,
-	_(APPCTX_FL_SHUTDOWN, _(APPCTX_FL_WANT_DIE, _(APPCTX_FL_INOUT_BUFS,
-	_(APPCTX_FL_FASTFWD, _(APPCTX_FL_IN_MAYALLOC, _(APPCTX_FL_OUT_MAYALLOC))))))))))))));
+	_(APPCTX_FL_SHUTDOWN, _(APPCTX_FL_WANT_DIE,
+	_(APPCTX_FL_FASTFWD, _(APPCTX_FL_IN_MAYALLOC, _(APPCTX_FL_OUT_MAYALLOC)))))))))))));
 	/* epilogue */
 	_(~0U);
 	return buf;
 #undef _
 }
 
+#define APPLET_FL_NEW_API 0x00000001 /* Set if the applet is based on the new API (using applet's buffers) */
+#define APPLET_FL_WARNED  0x00000002 /* Set when warning was already emitted about a legacy applet */
+#define APPLET_FL_HTX     0x00000004 /* Set if the applet is using HTX buffers */
+
 /* Applet descriptor */
 struct applet {
 	enum obj_type obj_type;            /* object type = OBJ_TYPE_APPLET */
+	unsigned int flags;                /* APPLET_FL_* flags */
 	/* 3 unused bytes here */
 	char *name;                        /* applet's name to report in logs */
 	int (*init)(struct appctx *);      /* callback to init resources, may be NULL.

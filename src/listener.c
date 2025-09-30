@@ -399,6 +399,23 @@ void stop_listener(struct listener *l, int lpx, int lpr, int lli)
 		HA_RWLOCK_WRUNLOCK(PROXY_LOCK, &px->lock);
 }
 
+/* This function returns the first unused listener ID greater than or equal to
+ * <from> in the proxy <px>. Zero is returned if no spare one is found (should
+ * never happen).
+ */
+uint listener_get_next_id(const struct proxy *px, uint from)
+{
+	const struct listener *li;
+
+	do {
+		li = ceb32_item_lookup_ge(&px->conf.used_listener_id, luid_node, luid, from, struct listener);
+		if (!li || li->luid > from)
+			return from; /* available */
+		from++;
+	} while (from);
+	return from;
+}
+
 /* This function adds the specified <listener> to the protocol <proto>. It
  * does nothing if the protocol was already added. The listener's state is
  * automatically updated from LI_INIT to LI_ASSIGNED. The number of listeners
@@ -1093,14 +1110,14 @@ void listener_accept(struct listener *l)
 		int max = 0;
 		int it;
 
-		for (it = 0; it < global.nbtgroups; it++)
-			max += freq_ctr_remain(&p->fe_counters.shared->tg[it]->sess_per_sec, p->fe_sps_lim, 0);
+		for (it = 0; (it < global.nbtgroups && p->fe_counters.shared.tg[it]); it++)
+			max += freq_ctr_remain(&p->fe_counters.shared.tg[it]->sess_per_sec, p->fe_sps_lim, 0);
 
 		if (unlikely(!max)) {
 			unsigned int min_wait = 0;
 
 			for (it = 0; it < global.nbtgroups; it++) {
-				unsigned int cur_wait = next_event_delay(&p->fe_counters.shared->tg[it]->sess_per_sec, p->fe_sps_lim, 0);
+				unsigned int cur_wait = next_event_delay(&p->fe_counters.shared.tg[it]->sess_per_sec, p->fe_sps_lim, 0);
 				if (!it || cur_wait < min_wait)
 					min_wait = cur_wait;
 			}
@@ -1586,7 +1603,7 @@ void listener_accept(struct listener *l)
 		dequeue_all_listeners();
 
 		if (p && !MT_LIST_ISEMPTY(&p->listener_queue) &&
-		    (!p->fe_sps_lim || COUNTERS_SHARED_TOTAL_ARG2(p->fe_counters.shared->tg, sess_per_sec, freq_ctr_remain, p->fe_sps_lim, 0) > 0))
+		    (!p->fe_sps_lim || COUNTERS_SHARED_TOTAL_ARG2(p->fe_counters.shared.tg, sess_per_sec, freq_ctr_remain, p->fe_sps_lim, 0) > 0))
 			dequeue_proxy_listeners(p, 0);
 	}
 	return;
@@ -1645,14 +1662,14 @@ void listener_release(struct listener *l)
 	dequeue_all_listeners();
 
 	if (fe && !MT_LIST_ISEMPTY(&fe->listener_queue) &&
-	    (!fe->fe_sps_lim || COUNTERS_SHARED_TOTAL_ARG2(fe->fe_counters.shared->tg, sess_per_sec, freq_ctr_remain, fe->fe_sps_lim, 0) > 0))
+	    (!fe->fe_sps_lim || COUNTERS_SHARED_TOTAL_ARG2(fe->fe_counters.shared.tg, sess_per_sec, freq_ctr_remain, fe->fe_sps_lim, 0) > 0))
 		dequeue_proxy_listeners(fe, 0);
 	else if (fe) {
 		unsigned int wait;
 		int expire = TICK_ETERNITY;
 
 		if (fe->task && fe->fe_sps_lim &&
-		    (wait = COUNTERS_SHARED_TOTAL_ARG2(fe->fe_counters.shared->tg, sess_per_sec, next_event_delay, fe->fe_sps_lim, 0))) {
+		    (wait = COUNTERS_SHARED_TOTAL_ARG2(fe->fe_counters.shared.tg, sess_per_sec, next_event_delay, fe->fe_sps_lim, 0))) {
 			/* we're blocking because a limit was reached on the number of
 			 * requests/s on the frontend. We want to re-check ASAP, which
 			 * means in 1 ms before estimated expiration date, because the
@@ -1853,11 +1870,11 @@ int bind_complete_thread_setup(struct bind_conf *bind_conf, int *err_code)
 						return cfgerr;
 					}
 					/* assign the ID to the first one only */
-					new_li->luid = new_li->conf.id.key = tmp_li->luid;
+					ceb32_item_delete(&fe->conf.used_listener_id, luid_node, luid, tmp_li);
+					new_li->luid = tmp_li->luid;
 					tmp_li->luid = 0;
-					eb32_delete(&tmp_li->conf.id);
 					if (new_li->luid)
-						eb32_insert(&fe->conf.used_listener_id, &new_li->conf.id);
+						listener_index_id(fe, new_li);
 					new_li = tmp_li;
 				}
 			}
@@ -1877,11 +1894,11 @@ int bind_complete_thread_setup(struct bind_conf *bind_conf, int *err_code)
 				return cfgerr;
 			}
 			/* assign the ID to the first one only */
-			new_li->luid = new_li->conf.id.key = li->luid;
+			ceb32_item_delete(&fe->conf.used_listener_id, luid_node, luid, li);
+			new_li->luid = li->luid;
 			li->luid = 0;
-			eb32_delete(&li->conf.id);
 			if (new_li->luid)
-				eb32_insert(&fe->conf.used_listener_id, &new_li->conf.id);
+				listener_index_id(fe, new_li);
 		}
 	}
 
@@ -2074,6 +2091,7 @@ struct bind_conf *bind_conf_alloc(struct proxy *fe, const char *file,
 	bind_conf->rhttp_srvname = NULL;
 
 	bind_conf->tcp_md5sig = NULL;
+	bind_conf->cc_algo = NULL;
 
 	return bind_conf;
 
@@ -2203,7 +2221,6 @@ static int bind_parse_guid_prefix(char **args, int cur_arg, struct proxy *px, st
 /* parse the "id" bind keyword */
 static int bind_parse_id(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
 {
-	struct eb32_node *node;
 	struct listener *l, *new;
 	char *error;
 
@@ -2223,23 +2240,21 @@ static int bind_parse_id(char **args, int cur_arg, struct proxy *px, struct bind
 		memprintf(err, "'%s' : expects an integer argument, found '%s'", args[cur_arg], args[cur_arg + 1]);
 		return ERR_ALERT | ERR_FATAL;
 	}
-	new->conf.id.key = new->luid;
 
 	if (new->luid <= 0) {
 		memprintf(err, "'%s' : custom id has to be > 0", args[cur_arg]);
 		return ERR_ALERT | ERR_FATAL;
 	}
 
-	node = eb32_lookup(&px->conf.used_listener_id, new->luid);
-	if (node) {
-		l = container_of(node, struct listener, conf.id);
+	l = ceb32_item_lookup(&px->conf.used_listener_id, luid_node, luid, new->luid, struct listener);
+	if (l) {
 		memprintf(err, "'%s' : custom id %d already used at %s:%d ('bind %s')",
 		          args[cur_arg], l->luid, l->bind_conf->file, l->bind_conf->line,
 		          l->bind_conf->arg);
 		return ERR_ALERT | ERR_FATAL;
 	}
 
-	eb32_insert(&px->conf.used_listener_id, &new->conf.id);
+	listener_index_id(px, new);
 	return 0;
 }
 

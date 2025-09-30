@@ -155,7 +155,7 @@ struct global_ssl global_ssl = {
 
 static BIO_METHOD *ha_meth;
 
-DECLARE_STATIC_POOL(ssl_sock_ctx_pool, "ssl_sock_ctx", sizeof(struct ssl_sock_ctx));
+DECLARE_STATIC_TYPED_POOL(ssl_sock_ctx_pool, "ssl_sock_ctx", struct ssl_sock_ctx);
 
 DECLARE_POOL(ssl_sock_client_sni_pool, "ssl_sock_client_sni", TLSEXT_MAXLEN_host_name + 1);
 
@@ -255,22 +255,67 @@ struct show_keys_ctx {
 struct task *ssl_sock_io_cb(struct task *, void *, unsigned int);
 static int ssl_sock_handshake(struct connection *conn, unsigned int flag);
 
+#if defined(USE_LINUX_SPLICE) && defined(HA_USE_KTLS)
+static int ssl_sock_to_pipe(struct connection *conn, void *xprt_ctx, struct pipe *pipe, unsigned int count)
+{
+	struct ssl_sock_ctx *ctx = xprt_ctx;
+
+	if (!(ctx->flags & SSL_SOCK_F_KTLS_RECV))
+		return -1;
+	return ctx->xprt->snd_pipe(conn, ctx->xprt_ctx, pipe, count);
+}
+
+static int ssl_sock_from_pipe(struct connection *conn, void *xprt_ctx, struct pipe *pipe, unsigned int count)
+{
+	struct ssl_sock_ctx *ctx = xprt_ctx;
+
+	if (!(ctx->flags & SSL_SOCK_F_KTLS_SEND))
+		return -1;
+	return ctx->xprt->rcv_pipe(conn, ctx->xprt_ctx, pipe, count);
+}
+#endif /* USE_LINUX_SPLICE && HA_USE_KTLS */
+
 /* Methods to implement OpenSSL BIO */
 static int ha_ssl_write(BIO *h, const char *buf, int num)
 {
+#ifdef HA_USE_KTLS
+#ifdef HAVE_VANILLA_OPENSSL
+	unsigned char cbuf[CMSG_SPACE(sizeof(unsigned char))];
+#endif
+#endif
 	struct buffer tmpbuf;
 	struct ssl_sock_ctx *ctx;
+	void *msg_control = NULL;
+	size_t msg_controllen = 0;
 	uint flags;
 	int ret;
 
 	ctx = BIO_get_data(h);
+#ifdef HA_USE_KTLS
+#ifdef HAVE_VANILLA_OPENSSL
+	if (ctx->flags & SSL_SOCK_F_CTRL_SEND) {
+		struct cmsghdr *cmsg = (void *)cbuf;
+
+		cmsg->cmsg_level = SOL_TLS;
+		cmsg->cmsg_type = TLS_SET_RECORD_TYPE;
+		cmsg->cmsg_len = CMSG_LEN(sizeof(unsigned char));
+		*((unsigned char *)CMSG_DATA(cmsg)) = ctx->record_type;
+		msg_controllen = cmsg->cmsg_len;
+		msg_control = cmsg;
+	}
+#endif
+#endif
 	tmpbuf.size = num;
 	tmpbuf.area = (void *)(uintptr_t)buf;
 	tmpbuf.data = num;
 	tmpbuf.head = 0;
 	flags = (ctx->xprt_st & SSL_SOCK_SEND_MORE) ? CO_SFL_MSG_MORE : 0;
-	ret = ctx->xprt->snd_buf(ctx->conn, ctx->xprt_ctx, &tmpbuf, num, flags);
+	ret = ctx->xprt->snd_buf(ctx->conn, ctx->xprt_ctx, &tmpbuf, num, msg_control, msg_controllen, flags);
 	BIO_clear_retry_flags(h);
+#ifdef HA_USE_KTLS
+	if (ret > 0)
+		ctx->flags &= ~SSL_SOCK_F_CTRL_SEND;
+#endif
 	if (ret == 0 && !(ctx->conn->flags & (CO_FL_ERROR | CO_FL_SOCK_WR_SH))) {
 		BIO_set_retry_write(h);
 		ret = -1;
@@ -292,33 +337,196 @@ static int ha_ssl_puts(BIO *h, const char *str)
 
 static int ha_ssl_read(BIO *h, char *buf, int size)
 {
+#ifdef HA_USE_KTLS
+#ifdef HAVE_VANILLA_OPENSSL
+	struct cmsghdr *cmsg;
+	union {
+		struct cmsghdr hdr;
+		char buf[CMSG_SPACE(sizeof(unsigned char))];
+	} cmsgbuf;
+	size_t msg_controllen = 0;
+#endif
+#endif
 	struct buffer tmpbuf;
 	struct ssl_sock_ctx *ctx;
+	void *msg_control = NULL;
+	size_t *msg_controllenp = NULL;
 	int ret;
 
 	ctx = BIO_get_data(h);
-	tmpbuf.size = size;
-	tmpbuf.area = buf;
+#ifdef HA_USE_KTLS
+#ifdef HAVE_VANILLA_OPENSSL
+	if (ctx->flags & SSL_SOCK_F_KTLS_RECV) {
+		if (ctx->conn->flags & CO_FL_WANT_SPLICING) {
+			/*
+			 * We want to use splicing at this point, so
+			 * pretend we had nothing to read with the hope
+			 * OpenSSL will empty its buffers, and we can
+			 * finally start splicing
+			 */
+			BIO_set_retry_read(h);
+			return -1;
+		}
+		msg_control = &cmsgbuf;
+		msg_controllen = sizeof(cmsgbuf);
+		msg_controllenp = &msg_controllen;
+		tmpbuf.size = size - (SSL3_RT_HEADER_LENGTH + EVP_GCM_TLS_TAG_LEN);
+		tmpbuf.area = buf + SSL3_RT_HEADER_LENGTH;
+	} else
+#endif
+#endif
+	{
+		tmpbuf.size = size;
+		tmpbuf.area = buf;
+	}
 	tmpbuf.data = 0;
 	tmpbuf.head = 0;
-	ret = ctx->xprt->rcv_buf(ctx->conn, ctx->xprt_ctx, &tmpbuf, size, 0);
+	ret = ctx->xprt->rcv_buf(ctx->conn, ctx->xprt_ctx, &tmpbuf, size, msg_control, msg_controllenp, 0);
 	BIO_clear_retry_flags(h);
 	if (ret == 0 && !(ctx->conn->flags & (CO_FL_ERROR | CO_FL_SOCK_RD_SH))) {
 		BIO_set_retry_read(h);
 		ret = -1;
 	}
+#ifdef HA_USE_KTLS
+#ifdef HAVE_VANILLA_OPENSSL
+	if (ret > 0 && msg_controllen > 0) {
+		cmsg = (void *)&cmsgbuf;
 
+		if (cmsg->cmsg_type == TLS_GET_RECORD_TYPE) {
+			/*
+			 * The kernel strips the TLS record header, but openssl
+			 * expects them back, so bring them back.
+			 */
+			buf[0] = *((unsigned char *)CMSG_DATA(cmsg));
+			buf[1] = TLS_1_2_VERSION_MAJOR;
+			buf[2] = TLS_1_2_VERSION_MINOR;
+			buf[3] = (ret >> 8) & 0xff;
+			buf[4] = ret & 0xff;
+			ret += SSL3_RT_HEADER_LENGTH;
+		}
+	}
+#endif
+#endif
 	return ret;
 }
 
+#ifdef HA_USE_KTLS
+/* Returns 0 on success, -1 on failure */
+static int ktls_set_key(struct ssl_sock_ctx *ctx, void *info, size_t info_len, int is_tx)
+{
+	int opt_to_use = is_tx ? TLS_TX : TLS_RX;
+
+	return setsockopt(ctx->conn->handle.fd, SOL_TLS, opt_to_use, info, info_len);
+}
+#endif
+
 static long ha_ssl_ctrl(BIO *h, int cmd, long arg1, void *arg2)
 {
+	struct ssl_sock_ctx *ctx __maybe_unused = BIO_get_data(h);
 	int ret = 0;
+
 	switch (cmd) {
 	case BIO_CTRL_DUP:
 	case BIO_CTRL_FLUSH:
 		ret = 1;
 		break;
+#ifdef HA_USE_KTLS
+#ifdef HAVE_VANILLA_OPENSSL
+	case BIO_CTRL_GET_KTLS_SEND:
+		if (ctx->flags & SSL_SOCK_F_KTLS_SEND)
+			return 1;
+		return 0;
+	case BIO_CTRL_GET_KTLS_RECV:
+		if (ctx->flags & SSL_SOCK_F_KTLS_RECV)
+			return 1;
+		return 0;
+	case BIO_CTRL_SET_KTLS_TX_SEND_CTRL_MSG:
+		ctx->flags |= SSL_SOCK_F_CTRL_SEND;
+		ctx->record_type = (unsigned char)arg1;
+		ret = 0;
+		break;
+	case BIO_CTRL_CLEAR_KTLS_TX_CTRL_MSG:
+		ctx->flags &= ~SSL_SOCK_F_CTRL_SEND;
+		ret = 0;
+		break;
+
+	case BIO_CTRL_SET_KTLS:
+	{
+		size_t info_len;
+		struct tls_crypto_info *info = arg2;
+
+		if (!(ctx->flags & SSL_SOCK_F_KTLS_ENABLED))
+			return 0;
+		/*
+		 * As OpenSSL doesn't export struct tls_crypto_info_all,
+		 * and it puts the size at the end of the struct,
+		 * we don't know where to look for it, so we have
+		 * to calculate the size depending on the algorithm
+		 * again. Of course, that means that if new algorithms
+		 * are added, they have to be added there too.
+		 */
+		switch (info->cipher_type) {
+			default:
+				/*
+				 * Unknown cipher, we don't support it
+				 */
+				return 0;
+#ifdef TLS_CIPHER_AES_GCM_128
+			case TLS_CIPHER_AES_GCM_128:
+				info_len = sizeof(struct tls12_crypto_info_aes_gcm_128);
+				break;
+#endif
+
+#ifdef TLS_CIPHER_AES_GCM_256
+			case TLS_CIPHER_AES_GCM_256:
+				info_len = sizeof(struct tls12_crypto_info_aes_gcm_256);
+				break;
+#endif
+
+#ifdef TLS_CIPHER_AES_CCM_128
+			case TLS_CIPHER_AES_CCM_128:
+				info_len = sizeof(struct tls12_crypto_info_aes_ccm_128);
+				break;
+#endif
+
+#ifdef TLS_CIPHER_CHACHA20_POLY1305
+			case TLS_CIPHER_CHACHA20_POLY1305:
+				info_len = sizeof(struct tls12_crypto_info_chacha20_poly1305);
+				break;
+#endif
+
+#ifdef TLS_CIPHER_SM4_GCM
+			case TLS_CIPHER_SM4_GCM:
+				info_len = sizeof(struct tls12_crypto_info_sm4_gcm);
+				break;
+#endif
+
+#ifdef TLS_CIPHER_SM4_CCM
+			case TLS_CIPHER_SM4_CCM:
+				info_len = sizeof(struct tls12_crypto_info_sm4_ccm);
+				break;
+#endif
+
+#ifdef TLS_CIPHER_ARIA_GCM_128
+			case TLS_CIPHER_ARIA_GCM_128:
+				info_len = sizeof(struct tls12_crypto_info_aria_gcm_128);
+				break;
+#endif
+
+#ifdef TLS_CIPHER_ARIA_GCM_256
+			case TLS_CIPHER_ARIA_GCM_256:
+				info_len = sizeof(struct tls12_crypto_info_aria_gcm_256);
+				break;
+#endif
+			}
+		if (ktls_set_key(ctx, info, info_len, arg1) == 0) {
+			ctx->flags |= arg1 ? SSL_SOCK_F_KTLS_SEND : SSL_SOCK_F_KTLS_RECV;
+			ret = 1;
+		}
+	}
+	break;
+#endif
+#endif
 	}
 	return ret;
 }
@@ -913,27 +1121,17 @@ static int ssl_hmac_init(MAC_CTX *hctx, unsigned char *key, int key_len, const E
 
 static int ssl_tlsext_ticket_key_cb(SSL *s, unsigned char key_name[16], unsigned char *iv, EVP_CIPHER_CTX *ectx, MAC_CTX *hctx, int enc)
 {
-	struct tls_keys_ref *ref = NULL;
 	union tls_sess_key *keys;
 	int head;
 	int i;
 	int ret = -1; /* error by default */
-	struct connection *conn = SSL_get_ex_data(s, ssl_app_data_index);
-#ifdef USE_QUIC
-	struct quic_conn *qc = SSL_get_ex_data(s, ssl_qc_app_data_index);
-#endif
+	struct listener *l;
+	struct tls_keys_ref *ref;
 
-	if (conn)
-		ref  = __objt_listener(conn->target)->bind_conf->keys_ref;
-#ifdef USE_QUIC
-	else if (qc)
-		ref =  __objt_listener(qc->target)->bind_conf->keys_ref;
-#endif
-
-	if (!ref) {
-		/* must never happen */
-		ABORT_NOW();
-	}
+	l = ssl_sock_get_listener(s);
+	BUG_ON(!l);
+	ref = l->bind_conf->keys_ref;
+	BUG_ON(!ref);
 
 	HA_RWLOCK_RDLOCK(TLSKEYS_REF_LOCK, &ref->lock);
 
@@ -1319,18 +1517,28 @@ static int ssl_sock_load_ocsp(const char *path, SSL_CTX *ctx, struct ckch_store 
 		 * prior to the activation of the ocsp auto update and in such a
 		 * case we must "force" insertion in the auto update tree.
 		 */
+		HA_SPIN_LOCK(OCSP_LOCK, &ocsp_tree_lock);
 		if (iocsp->next_update.node.leaf_p == NULL) {
-			ssl_ocsp_update_insert(iocsp);
-			/* If we are during init the update task is not
-			 * scheduled yet so a wakeup won't do anything.
-			 * Otherwise, if the OCSP was added through the CLI, we
-			 * wake the task up to manage the case of a new entry
-			 * that needs to be updated before the previous first
-			 * entry.
+			/* We might be facing an entry that is currently being
+			 * updated, which can take some time (especially if the
+			 * ocsp responder is unreachable).
+			 * The entry will be reinserted by the update task, it
+			 * mustn't be reinserted here.
 			 */
-			if (ocsp_update_task)
-				task_wakeup(ocsp_update_task, TASK_WOKEN_MSG);
+			if (!iocsp->updating) {
+				__ssl_ocsp_update_insert_unlocked(iocsp);
+				/* If we are during init the update task is not
+				 * scheduled yet so a wakeup won't do anything.
+				 * Otherwise, if the OCSP was added through the CLI, we
+				 * wake the task up to manage the case of a new entry
+				 * that needs to be updated before the previous first
+				 * entry.
+				 */
+				if (ocsp_update_task)
+					task_wakeup(ocsp_update_task, TASK_WOKEN_MSG);
+			}
 		}
+		HA_SPIN_UNLOCK(OCSP_LOCK, &ocsp_tree_lock);
 	}
 
 out:
@@ -1371,7 +1579,7 @@ static int ssl_sock_load_ocsp(const char *path, SSL_CTX *ctx, struct ckch_data *
 
 int sctl_ex_index = -1;
 
-int ssl_sock_sctl_add_cbk(SSL *ssl, unsigned ext_type, const unsigned char **out, size_t *outlen, int *al, void *add_arg)
+static __maybe_unused int ssl_sock_sctl_add_cbk(SSL *ssl, unsigned ext_type, const unsigned char **out, size_t *outlen, int *al, void *add_arg)
 {
 	struct buffer *sctl = add_arg;
 
@@ -1381,7 +1589,7 @@ int ssl_sock_sctl_add_cbk(SSL *ssl, unsigned ext_type, const unsigned char **out
 	return 1;
 }
 
-int ssl_sock_sctl_parse_cbk(SSL *s, unsigned int ext_type, const unsigned char *in, size_t inlen, int *al, void *parse_arg)
+static __maybe_unused int ssl_sock_sctl_parse_cbk(SSL *s, unsigned int ext_type, const unsigned char *in, size_t inlen, int *al, void *parse_arg)
 {
 	return 1;
 }
@@ -1403,30 +1611,18 @@ out:
 
 #endif
 
-void ssl_sock_infocbk(const SSL *ssl, int where, int ret)
+static void ssl_sock_infocbk(const SSL *ssl, int where, int ret)
 {
-	struct connection *conn = SSL_get_ex_data(ssl, ssl_app_data_index);
-#ifdef USE_QUIC
-	struct quic_conn *qc = SSL_get_ex_data(ssl, ssl_qc_app_data_index);
-#endif /* USE_QUIC */
+	struct connection *conn;
 	struct ssl_sock_ctx *ctx = NULL;
 
 	BIO *write_bio;
 	(void)ret; /* shut gcc stupid warning */
+	(void)conn;
 
-	if (conn)
-		ctx = conn_get_ssl_sock_ctx(conn);
-#ifdef USE_QUIC
-	else if (qc)
-		ctx = qc->xprt_ctx;
-#endif /* USE_QUIC */
-
-	if (!ctx) {
-		/* must never happen */
-		ABORT_NOW();
-		return;
-	}
-
+	conn = ssl_sock_get_conn(ssl, &ctx);
+	/* must never happen */
+	BUG_ON(!ctx);
 #ifndef SSL_OP_NO_RENEGOTIATION
 	/* Please note that BoringSSL defines this macro to zero so don't
 	 * change this to #if and do not assign a default value to this macro!
@@ -1483,7 +1679,7 @@ int ssl_sock_bind_verifycbk(int ok, X509_STORE_CTX *x_store)
 	else {
 		qc = SSL_get_ex_data(ssl, ssl_qc_app_data_index);
 		BUG_ON(!qc); /* Must never happen */
-		bind_conf = __objt_listener(qc->target)->bind_conf;
+		bind_conf = qc->li->bind_conf;
 		ctx = qc->xprt_ctx;
 	}
 #endif
@@ -1918,9 +2114,9 @@ static void ssl_init_keylog(struct connection *conn, int write_p, int version,
 #endif
 
 /* Callback is called for ssl protocol analyse */
-void ssl_sock_msgcbk(int write_p, int version, int content_type, const void *buf, size_t len, SSL *ssl, void *arg)
+static __maybe_unused void ssl_sock_msgcbk(int write_p, int version, int content_type, const void *buf, size_t len, SSL *ssl, void *arg)
 {
-	struct connection *conn = SSL_get_ex_data(ssl, ssl_app_data_index);
+	struct connection *conn = ssl_sock_get_conn(ssl, NULL);
 	struct ssl_sock_msg_callback *cbk;
 
 	/* Try to call all callback functions that were registered by using
@@ -1970,9 +2166,18 @@ static int ssl_sock_advertise_alpn_protos(SSL *s, const unsigned char **out,
                                           unsigned int server_len, void *arg)
 {
 	struct ssl_bind_conf *conf = arg;
+	struct connection *conn;
+	struct ssl_sock_ctx *ctx = NULL;
+
 #ifdef USE_QUIC
 	struct quic_conn *qc = SSL_get_ex_data(s, ssl_qc_app_data_index);
+	if (qc)
+		ctx = qc->xprt_ctx;
 #endif
+	if (!ctx) {
+		conn = SSL_get_ex_data(s, ssl_app_data_index);
+		ctx = __conn_get_ssl_sock_ctx(conn);
+	}
 
 	if (SSL_select_next_proto((unsigned char**) out, outlen, (const unsigned char *)conf->alpn_str,
 	                          conf->alpn_len, server, server_len) != OPENSSL_NPN_NEGOTIATED) {
@@ -1990,6 +2195,8 @@ static int ssl_sock_advertise_alpn_protos(SSL *s, const unsigned char **out,
 	}
 #endif
 
+	if (ctx)
+		ctx->flags |= SSL_SOCK_F_HAS_ALPN;
 	return SSL_TLSEXT_ERR_OK;
 }
 #endif
@@ -3003,7 +3210,7 @@ int ckch_inst_new_load_store(const char *path, struct ckch_store *ckchs, struct 
 	 */
 
 	if (is_default) {
-		ckch_inst->is_default = 1;
+		ckch_inst->is_default = is_default;
 
 		/* insert an empty SNI which will be used to lookup default certificate */
 		order = ckch_inst_add_cert_sni(ctx, ckch_inst, bind_conf, ssl_conf, kinfo, "*", order);
@@ -3239,14 +3446,14 @@ int ssl_sock_load_cert_list_file(char *file, int dir, struct bind_conf *bind_con
 	list_for_each_entry(entry, &crtlist->ord_entries, by_crtlist) {
 		struct ckch_store *store;
 		struct ckch_inst *ckch_inst = NULL;
-		int is_default = 0;
+		int is_default = CKCH_INST_NO_DEFAULT;
 
 		store = entry->node.key;
 
 		/* if the SNI trees were empty the first "crt" become a default certificate,
 		 * it can be applied on multiple certificates if it's a bundle */
 		if (eb_is_empty(&bind_conf->sni_ctx) && eb_is_empty(&bind_conf->sni_w_ctx))
-			is_default = 1;
+			is_default = CKCH_INST_IMPL_DEFAULT;
 
 
 		cfgerr |= ssl_sock_load_ckchs(store->path, store, bind_conf, entry->ssl_conf, entry->filters, entry->fcount, is_default, &ckch_inst, err);
@@ -3301,9 +3508,9 @@ int ssl_sock_load_cert(char *path, struct bind_conf *bind_conf, int is_default, 
 
 	/* if the SNI trees were empty the first "crt" become a default certificate,
 	 * it can be applied on multiple certificates if it's a bundle */
-	if (is_default == 0) {
+	if (is_default == CKCH_INST_NO_DEFAULT) {
 		if (eb_is_empty(&bind_conf->sni_ctx) && eb_is_empty(&bind_conf->sni_w_ctx))
-			is_default = 1;
+			is_default = CKCH_INST_IMPL_DEFAULT;
 	}
 
 	if ((ckchs = ckchs_lookup(path))) {
@@ -3643,10 +3850,11 @@ static int sh_ssl_sess_store(unsigned char *s_id, unsigned char *data, int data_
 /* SSL callback used when a new session is created while connecting to a server */
 static int ssl_sess_new_srv_cb(SSL *ssl, SSL_SESSION *sess)
 {
-	struct connection *conn = SSL_get_ex_data(ssl, ssl_app_data_index);
+	struct connection *conn = ssl_sock_get_conn(ssl, NULL);
 	struct server *s;
 	uint old_tid;
 
+	BUG_ON(!conn);
 	s = __objt_server(conn->target);
 
 	/* RWLOCK: only read lock the SSL cache even when writing in it because there is
@@ -3735,7 +3943,7 @@ static int ssl_sess_new_srv_cb(SSL *ssl, SSL_SESSION *sess)
 
 
 /* SSL callback used on new session creation */
-int sh_ssl_sess_new_cb(SSL *ssl, SSL_SESSION *sess)
+static int sh_ssl_sess_new_cb(SSL *ssl, SSL_SESSION *sess)
 {
 	unsigned char encsess[SHSESS_MAX_DATA_LEN];           /* encoded session  */
 	unsigned char encid[SSL_MAX_SSL_SESSION_ID_LENGTH];   /* encoded id */
@@ -3789,7 +3997,7 @@ err:
 }
 
 /* SSL callback used on lookup an existing session cause none found in internal cache */
-SSL_SESSION *sh_ssl_sess_get_cb(SSL *ssl, __OPENSSL_110_CONST__ unsigned char *key, int key_len, int *do_copy)
+static SSL_SESSION *sh_ssl_sess_get_cb(SSL *ssl, __OPENSSL_110_CONST__ unsigned char *key, int key_len, int *do_copy)
 {
 	struct sh_ssl_sess_hdr *sh_ssl_sess;
 	unsigned char data[SHSESS_MAX_DATA_LEN], *p;
@@ -3842,7 +4050,7 @@ SSL_SESSION *sh_ssl_sess_get_cb(SSL *ssl, __OPENSSL_110_CONST__ unsigned char *k
 
 
 /* SSL callback used to signal session is no more used in internal cache */
-void sh_ssl_sess_remove_cb(SSL_CTX *ctx, SSL_SESSION *sess)
+static void sh_ssl_sess_remove_cb(SSL_CTX *ctx, SSL_SESSION *sess)
 {
 	struct sh_ssl_sess_hdr *sh_ssl_sess;
 	unsigned char tmpkey[SSL_MAX_SSL_SESSION_ID_LENGTH];
@@ -3874,7 +4082,7 @@ void sh_ssl_sess_remove_cb(SSL_CTX *ctx, SSL_SESSION *sess)
 /* Set session cache mode to server and disable openssl internal cache.
  * Set shared cache callbacks on an ssl context.
  * Shared context MUST be firstly initialized */
-void ssl_set_shctx(SSL_CTX *ctx)
+static void ssl_set_shctx(SSL_CTX *ctx)
 {
 	SSL_CTX_set_session_id_context(ctx, (const unsigned char *)SHCTX_APPNAME, strlen(SHCTX_APPNAME));
 
@@ -3902,7 +4110,7 @@ void ssl_set_shctx(SSL_CTX *ctx)
  */
 
 #ifdef HAVE_SSL_KEYLOG
-void SSL_CTX_keylog(const SSL *ssl, const char *line)
+static void SSL_CTX_keylog(const SSL *ssl, const char *line)
 {
 	struct ssl_keylog *keylog;
 	char *lastarg = NULL;
@@ -4329,7 +4537,8 @@ static int ssl_sock_srv_verifycbk(int ok, X509_STORE_CTX *ctx)
 		return ok;
 
 	ssl = X509_STORE_CTX_get_ex_data(ctx, SSL_get_ex_data_X509_STORE_CTX_idx());
-	conn = SSL_get_ex_data(ssl, ssl_app_data_index);
+	conn = ssl_sock_get_conn(ssl, NULL);
+	BUG_ON(!conn);
 	ssl_ctx = __conn_get_ssl_sock_ctx(conn);
 
 	/* We're checking if the provided hostnames match the desired one. The
@@ -4819,6 +5028,34 @@ int ssl_sock_prepare_bind_conf(struct bind_conf *bind_conf)
 		}
 	}
 
+	/* check that we didn't use "strict-sni" and "default-crt" together */
+	if (bind_conf->ssl_options & BC_SSL_O_STRICT_SNI) {
+		struct ebmb_node *node, *n;
+		const char *wildp = "";
+		int is_default = CKCH_INST_NO_DEFAULT;
+
+		node = ebst_lookup(&bind_conf->sni_w_ctx, wildp);
+		for (n = node; n; n = ebmb_next_dup(n)) {
+			struct sni_ctx *sni;
+
+			sni = container_of(n, struct sni_ctx, name);
+			if (!sni->neg) {
+
+				if (sni->ckch_inst->is_default == CKCH_INST_EXPL_DEFAULT) {
+					is_default = CKCH_INST_EXPL_DEFAULT;
+					break;
+				}
+			}
+		}
+
+		if (is_default ==  CKCH_INST_EXPL_DEFAULT) {
+			ha_warning("Proxy '%s': both 'default-crt' and 'strict-sni' keywords are used in bind '%s' at [%s:%d], certificates won't be used as fallback (use 'crt' instead).\n",
+				   px->id, bind_conf->arg, bind_conf->file, bind_conf->line);
+		}
+
+	}
+
+
 	if ((bind_conf->options & BC_O_GENERATE_CERTS)) {
 		struct sni_ctx *sni_ctx;
 
@@ -4937,7 +5174,7 @@ void ssl_sock_free_all_ctx(struct bind_conf *bind_conf)
 }
 
 
-void ssl_sock_deinit()
+static void ssl_sock_deinit()
 {
 	crtlist_deinit(); /* must be free'd before the ckchs */
 	ckch_deinit();
@@ -5037,6 +5274,14 @@ static int ssl_sock_start(struct connection *conn, void *xprt_ctx)
 		if (ret < 0)
 			return ret;
 	}
+#ifdef HA_USE_KTLS
+	/*
+	 * Make the socket usable for kTLS. That does not mean that we will
+	 * use kTLS, though, just that the socket will be able to do it.
+	 */
+	if ((ctx->flags & SSL_SOCK_F_KTLS_ENABLED) && setsockopt(conn->handle.fd, SOL_TCP, TCP_ULP, "tls", sizeof("tls")) != 0)
+		ctx->flags &= ~SSL_SOCK_F_KTLS_ENABLED;
+#endif
 	tasklet_wakeup(ctx->wait_event.tasklet);
 
 	return 0;
@@ -5061,6 +5306,74 @@ int increment_sslconn()
 
  end:
 	return next_sslconn;
+}
+
+/* Try to reuse an SSL session (SSL_SESSION object) for <srv> server with <ctx>
+ * as SSL socket context.
+ */
+void ssl_sock_srv_try_reuse_sess(struct ssl_sock_ctx *ctx, struct server *srv)
+{
+	HA_RWLOCK_RDLOCK(SSL_SERVER_LOCK, &srv->ssl_ctx.lock);
+	if (srv->ssl_ctx.reused_sess[tid].ptr) {
+		/* let's recreate a session from (ptr,size) and assign
+		 * it to ctx->ssl. Its refcount will be updated by the
+		 * creation and by the assignment, so after assigning
+		 * it or failing to, we must always free it to decrement
+		 * the refcount.
+		 */
+		const unsigned char *ptr = srv->ssl_ctx.reused_sess[tid].ptr;
+		SSL_SESSION *sess = d2i_SSL_SESSION(NULL, &ptr, srv->ssl_ctx.reused_sess[tid].size);
+
+		if (sess && !SSL_set_session(ctx->ssl, sess)) {
+			uint old_tid = HA_ATOMIC_LOAD(&srv->ssl_ctx.last_ssl_sess_tid); // 0=none, >0 = tid + 1
+			if (old_tid == tid + 1)
+				HA_ATOMIC_CAS(&srv->ssl_ctx.last_ssl_sess_tid, &old_tid, 0); // no more valid
+			SSL_SESSION_free(sess);
+			HA_RWLOCK_WRLOCK(SSL_SERVER_LOCK, &srv->ssl_ctx.reused_sess[tid].sess_lock);
+			ha_free(&srv->ssl_ctx.reused_sess[tid].ptr);
+			HA_RWLOCK_WRTORD(SSL_SERVER_LOCK, &srv->ssl_ctx.reused_sess[tid].sess_lock);
+			if (srv->ssl_ctx.reused_sess[tid].sni)
+				SSL_set_tlsext_host_name(ctx->ssl, srv->ssl_ctx.reused_sess[tid].sni);
+			HA_RWLOCK_RDUNLOCK(SSL_SERVER_LOCK, &srv->ssl_ctx.reused_sess[tid].sess_lock);
+		} else if (sess) {
+			/* already assigned, not needed anymore */
+			SSL_SESSION_free(sess);
+			HA_RWLOCK_RDLOCK(SSL_SERVER_LOCK, &srv->ssl_ctx.reused_sess[tid].sess_lock);
+			if (srv->ssl_ctx.reused_sess[tid].sni)
+				SSL_set_tlsext_host_name(ctx->ssl, srv->ssl_ctx.reused_sess[tid].sni);
+			HA_RWLOCK_RDUNLOCK(SSL_SERVER_LOCK, &srv->ssl_ctx.reused_sess[tid].sess_lock);
+		}
+	} else {
+		/* No session available yet, let's see if we can pick one
+		 * from another thread. If old_tid is non-null, it designates
+		 * the index of a recently updated thread that might still have
+		 * a usable session. All threads are collectively responsible
+		 * for resetting the index if it fails.
+		 */
+		const unsigned char *ptr;
+		SSL_SESSION *sess;
+		uint old_tid = HA_ATOMIC_LOAD(&srv->ssl_ctx.last_ssl_sess_tid); // 0=none, >0 = tid + 1
+
+		if (old_tid) {
+			HA_RWLOCK_RDLOCK(SSL_SERVER_LOCK, &srv->ssl_ctx.reused_sess[old_tid-1].sess_lock);
+
+			ptr = srv->ssl_ctx.reused_sess[old_tid-1].ptr;
+			if (ptr) {
+				sess = d2i_SSL_SESSION(NULL, &ptr, srv->ssl_ctx.reused_sess[old_tid-1].size);
+				if (sess) {
+					if (!SSL_set_session(ctx->ssl, sess))
+						HA_ATOMIC_CAS(&srv->ssl_ctx.last_ssl_sess_tid, &old_tid, 0); // no more valid
+					SSL_SESSION_free(sess);
+				}
+			}
+
+			if (srv->ssl_ctx.reused_sess[old_tid-1].sni)
+				SSL_set_tlsext_host_name(ctx->ssl, srv->ssl_ctx.reused_sess[old_tid-1].sni);
+
+			HA_RWLOCK_RDUNLOCK(SSL_SERVER_LOCK, &srv->ssl_ctx.reused_sess[old_tid-1].sess_lock);
+		}
+	}
+	HA_RWLOCK_RDUNLOCK(SSL_SERVER_LOCK, &srv->ssl_ctx.lock);
 }
 
 /*
@@ -5104,6 +5417,10 @@ static int ssl_sock_init(struct connection *conn, void **xprt_ctx)
 	ctx->xprt_st = 0;
 	ctx->xprt_ctx = NULL;
 	ctx->error_code = 0;
+	ctx->flags = SSL_SOCK_F_EARLY_ENABLED;
+#ifdef HA_USE_KTLS
+	ctx->record_type = 0;
+#endif
 
 	next_sslconn = increment_sslconn();
 	if (!next_sslconn) {
@@ -5136,69 +5453,16 @@ static int ssl_sock_init(struct connection *conn, void **xprt_ctx)
 		if (srv->ssl_ctx.renegotiate == SSL_RENEGOTIATE_ON)
 			SSL_set_renegotiate_mode(ctx->ssl, ssl_renegotiate_freely);
 #endif
+		ssl_sock_srv_try_reuse_sess(ctx, srv);
 
-		HA_RWLOCK_RDLOCK(SSL_SERVER_LOCK, &srv->ssl_ctx.lock);
-		if (srv->ssl_ctx.reused_sess[tid].ptr) {
-			/* let's recreate a session from (ptr,size) and assign
-			 * it to ctx->ssl. Its refcount will be updated by the
-			 * creation and by the assignment, so after assigning
-			 * it or failing to, we must always free it to decrement
-			 * the refcount.
-			 */
-			const unsigned char *ptr = srv->ssl_ctx.reused_sess[tid].ptr;
-			SSL_SESSION *sess = d2i_SSL_SESSION(NULL, &ptr, srv->ssl_ctx.reused_sess[tid].size);
-
-			if (sess && !SSL_set_session(ctx->ssl, sess)) {
-				uint old_tid = HA_ATOMIC_LOAD(&srv->ssl_ctx.last_ssl_sess_tid); // 0=none, >0 = tid + 1
-				if (old_tid == tid + 1)
-					HA_ATOMIC_CAS(&srv->ssl_ctx.last_ssl_sess_tid, &old_tid, 0); // no more valid
-				SSL_SESSION_free(sess);
-				HA_RWLOCK_WRLOCK(SSL_SERVER_LOCK, &srv->ssl_ctx.reused_sess[tid].sess_lock);
-				ha_free(&srv->ssl_ctx.reused_sess[tid].ptr);
-				HA_RWLOCK_WRTORD(SSL_SERVER_LOCK, &srv->ssl_ctx.reused_sess[tid].sess_lock);
-				if (srv->ssl_ctx.reused_sess[tid].sni)
-					SSL_set_tlsext_host_name(ctx->ssl, srv->ssl_ctx.reused_sess[tid].sni);
-				HA_RWLOCK_RDUNLOCK(SSL_SERVER_LOCK, &srv->ssl_ctx.reused_sess[tid].sess_lock);
-			} else if (sess) {
-				/* already assigned, not needed anymore */
-				SSL_SESSION_free(sess);
-				HA_RWLOCK_RDLOCK(SSL_SERVER_LOCK, &srv->ssl_ctx.reused_sess[tid].sess_lock);
-				if (srv->ssl_ctx.reused_sess[tid].sni)
-					SSL_set_tlsext_host_name(ctx->ssl, srv->ssl_ctx.reused_sess[tid].sni);
-				HA_RWLOCK_RDUNLOCK(SSL_SERVER_LOCK, &srv->ssl_ctx.reused_sess[tid].sess_lock);
-			}
-		} else {
-			/* No session available yet, let's see if we can pick one
-			 * from another thread. If old_tid is non-null, it designates
-			 * the index of a recently updated thread that might still have
-			 * a usable session. All threads are collectively responsible
-			 * for resetting the index if it fails.
-			 */
-			const unsigned char *ptr;
-			SSL_SESSION *sess;
-			uint old_tid = HA_ATOMIC_LOAD(&srv->ssl_ctx.last_ssl_sess_tid); // 0=none, >0 = tid + 1
-
-			if (old_tid) {
-				HA_RWLOCK_RDLOCK(SSL_SERVER_LOCK, &srv->ssl_ctx.reused_sess[old_tid-1].sess_lock);
-
-				ptr = srv->ssl_ctx.reused_sess[old_tid-1].ptr;
-				if (ptr) {
-					sess = d2i_SSL_SESSION(NULL, &ptr, srv->ssl_ctx.reused_sess[old_tid-1].size);
-					if (sess) {
-						if (!SSL_set_session(ctx->ssl, sess))
-							HA_ATOMIC_CAS(&srv->ssl_ctx.last_ssl_sess_tid, &old_tid, 0); // no more valid
-						SSL_SESSION_free(sess);
-					}
-				}
-
-				if (srv->ssl_ctx.reused_sess[old_tid-1].sni)
-					SSL_set_tlsext_host_name(ctx->ssl, srv->ssl_ctx.reused_sess[old_tid-1].sni);
-
-				HA_RWLOCK_RDUNLOCK(SSL_SERVER_LOCK, &srv->ssl_ctx.reused_sess[old_tid-1].sess_lock);
-			}
+#ifdef HA_USE_KTLS
+		if ((srv->ssl_ctx.options & SRV_SSL_O_KTLS) && !(global.tune.options & GTUNE_NO_KTLS)) {
+#ifdef HAVE_VANILLA_OPENSSL
+			SSL_set_options(ctx->ssl, SSL_OP_ENABLE_KTLS);
+#endif
+			ctx->flags |= SSL_SOCK_F_KTLS_ENABLED;
 		}
-		HA_RWLOCK_RDUNLOCK(SSL_SERVER_LOCK, &srv->ssl_ctx.lock);
-
+#endif
 		/* leave init state and start handshake */
 		conn->flags |= CO_FL_SSL_WAIT_HS | CO_FL_WAIT_L6_CONN;
 
@@ -5236,6 +5500,14 @@ static int ssl_sock_init(struct connection *conn, void **xprt_ctx)
 			conn->flags |= CO_FL_EARLY_SSL_HS;
 #endif
 
+#ifdef HA_USE_KTLS
+		if (bc->ssl_conf.ktls && !(global.tune.options & GTUNE_NO_KTLS)) {
+#ifdef HAVE_VANILLA_OPENSSL
+			SSL_set_options(ctx->ssl, SSL_OP_ENABLE_KTLS);
+#endif
+			ctx->flags |= SSL_SOCK_F_KTLS_ENABLED;
+		}
+#endif
 		_HA_ATOMIC_INC(&global.totalsslconns);
 		*xprt_ctx = ctx;
 
@@ -5458,6 +5730,7 @@ static int ssl_sock_handshake(struct connection *conn, unsigned int flag)
 		/* read some data: consider handshake completed */
 		goto reneg_ok;
 	}
+	ctx->flags &=~ SSL_SOCK_F_EARLY_ENABLED;
 	ret = SSL_do_handshake(ctx->ssl);
 check_error:
 	if (ret != 1) {
@@ -5646,7 +5919,7 @@ reneg_ok:
 	if (!conn->err_code)
 		conn->err_code = CO_ER_SSL_HANDSHAKE;
 
-	TRACE_ERROR("handshake error", SSL_EV_CONN_HNDSHK|SSL_EV_CONN_ERR, conn, ctx->ssl, &conn->err_code, &ctx->error_code);
+	TRACE_ERROR("handshake error", SSL_EV_CONN_HNDSHK|SSL_EV_CONN_ERR, conn, ctx->ssl, &conn->err_code, (ctx ? &ctx->error_code : NULL));
 	return 0;
 }
 
@@ -5794,6 +6067,330 @@ static int ssl_remove_xprt(struct connection *conn, void *xprt_ctx, void *toremo
 	return (ctx->xprt->remove_xprt(conn, ctx->xprt_ctx, toremove_ctx, newops, newctx));
 }
 
+#ifdef HA_USE_KTLS
+#if defined(OPENSSL_IS_AWSLC) && AWSLC_API_VERSION >= 34 & !defined(HA_DISABLE_AWSLC_TLS13)
+static int ssl_sock_hkdf_expand_label(struct ssl_sock_ctx *ctx, uint8_t *secret, size_t secret_len, uint8_t *label, size_t label_len, uint8_t *out, size_t out_len)
+{
+	SSL *ssl = ctx->ssl;
+	/* 2 for length, 1 for the string length, label_len + 6 ("tls13 ") + 1 for the empty context string. */
+	int buf_len = 2 + 1 + label_len + 6 + 1;
+	/*
+	 * As we only labels we use are "salt" or "key", consider label_len
+	 * can only be 4 max.
+	 */
+	unsigned char buf[2 + 1 + 4 + 6 + 1];
+	const EVP_MD *digest;
+	uint16_t len = htons(out_len);
+
+	digest = SSL_CIPHER_get_handshake_digest(SSL_get_current_cipher(ssl));
+
+	BUG_ON(label_len > 4);
+	if (digest == NULL)
+		return -1;
+	/*
+	 * The label looks like :
+	 * 2 bytes for the length (in big engian)
+	 * 1 byte for the label length, and then the string
+	 * 1 byte for the context length, and then the context (we have no
+	 * context so it will always be 0
+	 */
+	memcpy(buf, &len, sizeof(len));
+	len = label_len + 6;
+	memcpy(&buf[2], &len, 1);
+	memcpy(&buf[3], "tls13 ", 6);
+	memcpy(&buf[9], label, label_len);
+	len = 0;
+	memcpy(&buf[9 + label_len], &len, 1);
+
+	return (HKDF_expand(out, out_len, digest, secret, secret_len, buf, buf_len) == 1 ? 0 : - 1);
+}
+#endif
+
+#if defined(OPENSSL_IS_AWSLC) || defined(OPENSSL_IS_BORINGSSL)
+static void ssl_sock_setup_ktls(struct ssl_sock_ctx *ctx)
+{
+	struct kinfo {
+		struct tls_crypto_info info;
+		/*
+		 * Should be enough for key + iv + salt + seq for
+		 * every cipher.
+		 */
+		unsigned char buf[68];
+	} info;
+	struct {
+		int nid;
+		int tls_cipher;
+		int key_size;
+		int salt_size;
+		int iv_size;
+		int seq_size;
+	} known_ciphers[] = {
+#ifdef TLS_CIPHER_AES_GCM_128
+		{ NID_aes_128_gcm, TLS_CIPHER_AES_GCM_128, TLS_CIPHER_AES_GCM_128_KEY_SIZE, TLS_CIPHER_AES_GCM_128_SALT_SIZE, TLS_CIPHER_AES_GCM_128_IV_SIZE, TLS_CIPHER_AES_GCM_128_REC_SEQ_SIZE },
+#endif
+#ifdef TLS_CIPHER_AES_GCM_256
+		{ NID_aes_256_gcm, TLS_CIPHER_AES_GCM_256, TLS_CIPHER_AES_GCM_256_KEY_SIZE, TLS_CIPHER_AES_GCM_256_SALT_SIZE, TLS_CIPHER_AES_GCM_256_IV_SIZE, TLS_CIPHER_AES_GCM_256_REC_SEQ_SIZE },
+#endif
+#ifdef TLS_CIPHER_AES_CCM_128
+		{ NID_aes_128_ccm, TLS_CIPHER_AES_CCM_128, TLS_CIPHER_AES_CCM_128_KEY_SIZE, TLS_CIPHER_AES_CCM_128_SALT_SIZE, TLS_CIPHER_AES_CCM_128_IV_SIZE, TLS_CIPHER_AES_CCM_128_REC_SEQ_SIZE },
+#endif
+#ifdef TLS_CIPHER_CHACHA20_POLY1305
+		{ NID_chacha20_poly1305, TLS_CIPHER_CHACHA20_POLY1305, TLS_CIPHER_CHACHA20_POLY1305_KEY_SIZE, TLS_CIPHER_CHACHA20_POLY1305_SALT_SIZE, TLS_CIPHER_CHACHA20_POLY1305_IV_SIZE, TLS_CIPHER_CHACHA20_POLY1305_REC_SEQ_SIZE },
+#endif
+#if defined(TLS_CIPHER_SM4_GCM) && defined(NID_sm4_gcm)
+		{ NID_sm4_gcm, TLS_CIPHER_SM4_GCM, TLS_CIPHER_SM4_GCM_KEY_SIZE,cTLS_CIPHER_SM4_GCM_SALT_SIZE, TLS_CIPHER_SM4_GCM_IV_SIZE, TLS_CIPHER_SM4_GCM_REC_SEQ_SIZE },
+#endif
+#if defined(TLS_CIPHER_SM4_CCM) && defined(NID_sm4_ccm)
+		{ NID_sm4_ccm, TLS_CIPHER_SM4_CCM, TLS_CIPHER_SM4_CCM_KEY_SIZE,cTLS_CIPHER_SM4_CCM_SALT_SIZE, TLS_CIPHER_SM4_CCM_IV_SIZE, TLS_CIPHER_SM4_CCM_REC_SEQ_SIZE },
+#endif
+#if defined(TLS_CIPHER_ARIA_GCM_128) && defined(NID_aria_128_gcm)
+		{ NID_aria_128_gcm, TLS_CIPHER_ARIA_GCM_128, TLS_CIPHER_ARIA_GCM_128_KEY_SIZE, TLS_CIPHER_ARIA_GCM_128_SALT_SIZE, TLS_CIPHER_ARIA_GCM_128_IV_SIZE, TLS_CIPHER_ARIA_GCM_128_REC_SEQ_SIZE },
+#endif
+#if defined(TLS_CIPHER_ARIA_GCM_256) && defined(NID_aria_256_gcm)
+		{ NID_aria_256_gcm, TLS_CIPHER_ARIA_GCM_256, TLS_CIPHER_ARIA_GCM_256_KEY_SIZE, TLS_CIPHER_ARIA_GCM_256_SALT_SIZE, TLS_CIPHER_ARIA_GCM_256_IV_SIZE, TLS_CIPHER_ARIA_GCM_256_REC_SEQ_SIZE },
+#endif
+
+	};
+
+	SSL *ssl = ctx->ssl;
+	unsigned char buf[128];
+	uint64_t seq;
+	int info_size;
+	int key_size, salt_size, iv_size, seq_size;
+	int is_tls_12;
+	int nid, i;
+
+	if (!(ctx->flags & SSL_SOCK_F_KTLS_ENABLED))
+		return;
+
+	switch (SSL_version(ctx->ssl)) {
+		case TLS_1_2_VERSION:
+			is_tls_12 = 1;
+			break;
+#if defined(OPENSSL_IS_AWSLC) && AWSLC_API_VERSION >= 34 & !defined(HA_DISABLE_AWSLC_TLS13)
+		/*
+		 * For now only AWS-LC >= 1.54 supports the API to export
+		 * TLS 1.3 secrets.
+		 * Unfortunately, AWSLC_API_VERSION hasn't been bumped when
+		 * those were added, so use the latest one. It will match
+		 * AWS-LC 1.52 and 1.53 too, but there's not much we
+		 * can do about it, one can define HA_DISABLE_AWSLC_TLS13
+		 * to build with AWS-LC 1.52 or 1.53.
+		 */
+		case TLS_1_3_VERSION:
+			is_tls_12 = 0;
+			break;
+#endif
+		default:
+			ctx->flags &= ~SSL_SOCK_F_KTLS_ENABLED;
+			return;
+	}
+
+	nid = SSL_CIPHER_get_cipher_nid(SSL_get_current_cipher(ssl));
+
+	for (i = 0; i < sizeof(known_ciphers) / sizeof(known_ciphers[0]); i++) {
+		if (known_ciphers[i].nid == nid)
+			break;
+	}
+	if (i == sizeof(known_ciphers) / sizeof(known_ciphers[0])) {
+		ctx->flags &= ~SSL_SOCK_F_KTLS_ENABLED;
+		return;
+	}
+
+	key_size = known_ciphers[i].key_size;
+	salt_size = known_ciphers[i].salt_size;
+	iv_size = known_ciphers[i].iv_size;
+	seq_size = known_ciphers[i].seq_size;
+
+	info_size = sizeof(struct tls_crypto_info) + key_size + salt_size + iv_size + seq_size;
+
+	/*
+	 * If new ciphers are added, wy may have to increase the buffer size
+	 */
+	BUG_ON(key_size + salt_size + iv_size + seq_size > sizeof(info.buf));
+
+	info.info.version = is_tls_12 ? TLS_1_2_VERSION : TLS_1_3_VERSION;
+	info.info.cipher_type = known_ciphers[i].tls_cipher;
+
+	if (is_tls_12) {
+		unsigned char iv[iv_size];
+		int block_key_size = 2 * key_size + 2 * salt_size;
+		int i;
+
+		/*
+		 * We may have to increase buf size if new ciphers are
+		 * added with bigger key/salt.
+		 */
+		BUG_ON(block_key_size > sizeof(buf));
+
+		if (SSL_get_key_block_len(ssl) != block_key_size) {
+			ctx->flags &= ~SSL_SOCK_F_KTLS_ENABLED;
+			goto out;
+		}
+
+		if (SSL_generate_key_block(ssl, buf, block_key_size) != 1) {
+			ctx->flags &= ~SSL_SOCK_F_KTLS_ENABLED;
+			goto out;
+		}
+
+		/*
+		 * The key block contains :
+		 * - client key
+		 *   server key
+		 *   client salt
+		 *   server salt
+		 */
+		/*
+		 * First, prepare the RX side
+		 * The oldest linux versions do not support RTX, that way
+		 * we will fail before setting the TX side.
+		 */
+		seq = SSL_get_read_sequence(ssl);
+		seq = my_htonll(seq);
+		for (i = 0; i < iv_size; i++)
+			iv[i] = (unsigned char)statistical_prng_range(256);
+		/* IV */
+		memcpy(&info.buf[0], &iv, iv_size);
+
+		if (!conn_is_back(ctx->conn)) {
+			/* Key */
+			memcpy(&info.buf[iv_size], &buf[0], key_size);
+			/* Salt */
+			memcpy(&info.buf[iv_size + key_size], &buf[2 * key_size], salt_size);
+		} else {
+			/* Key */
+			memcpy(&info.buf[iv_size], &buf[key_size], key_size);
+			/* Salt */
+			memcpy(&info.buf[iv_size + key_size], &buf[2 * key_size + salt_size], salt_size);
+		}
+		/* Record seq number */
+		memcpy(&info.buf[iv_size + key_size + salt_size], &seq, seq_size);
+		if (ktls_set_key(ctx, &info, info_size, 0) != 0) {
+			ctx->flags &= ~SSL_SOCK_F_KTLS_ENABLED;
+			goto out;
+		}
+		/*
+		 * Now do the TX side
+		 */
+		seq = SSL_get_write_sequence(ssl);
+		seq = my_htonll(seq);
+		for (i = 0; i < iv_size; i++)
+			iv[i] = (unsigned char)statistical_prng_range(256);
+		memcpy(&info.buf[0], &iv, iv_size);
+		if (!conn_is_back(ctx->conn)) {
+			/* Key */
+			memcpy(&info.buf[iv_size], &buf[key_size], key_size);
+			/* Salt */
+			memcpy(&info.buf[iv_size + key_size], &buf[2 * key_size + salt_size], salt_size);
+		} else {
+			/* Key */
+			memcpy(&info.buf[iv_size], &buf[0], key_size);
+			/* Salt */
+			memcpy(&info.buf[iv_size + key_size], &buf[2 * key_size], salt_size);
+		}
+		memcpy(&info.buf[iv_size + key_size + salt_size], &seq, seq_size);
+		if (ktls_set_key(ctx, &info, info_size, 1) != 0) {
+			/*
+			 * Not much we can do at this point. TLS has been
+			 * enabled for RX, we can't disable it, we won't
+			 * try to support only one side, so give up with
+			 * that connection.
+			 */
+			ctx->conn->flags |= CO_FL_ERROR;
+			ctx->flags &= ~SSL_SOCK_F_KTLS_ENABLED;
+			goto out;
+		}
+		ctx->flags |= SSL_SOCK_F_KTLS_SEND | SSL_SOCK_F_KTLS_RECV;
+	} else {
+#if defined(OPENSSL_IS_AWSLC) && AWSLC_API_VERSION >= 34 & !defined(HA_DISABLE_AWSLC_TLS13)
+		unsigned char iv[12];
+		size_t len;
+
+		/*
+		 * 12 is the maximum size for iv + salt currently supported
+		 * in Linux, if a new cipher is added that expands that,
+		 * then the buffer should be expanded.
+		 */
+		BUG_ON(iv_size + salt_size > sizeof(iv));
+		if (SSL_get_read_traffic_secret(ctx->ssl, NULL, &len) != 1) {
+			ctx->flags &= ~SSL_SOCK_F_KTLS_ENABLED;
+			goto out;
+		}
+		/*
+		 * We may have to increase buf size if a new cipher is
+		 * added and its secret size is too big.
+		 */
+		BUG_ON(len > sizeof(buf));
+
+		if (SSL_get_read_traffic_secret(ctx->ssl, buf, &len) != 1) {
+			ctx->flags &= ~SSL_SOCK_F_KTLS_ENABLED;
+			goto out;
+		}
+
+		if (ssl_sock_hkdf_expand_label(ctx, buf, len, (unsigned char *)"key", 3, &info.buf[iv_size], key_size) != 0) {
+			ctx->flags &= ~SSL_SOCK_F_KTLS_ENABLED;
+			goto out;
+		}
+		if (ssl_sock_hkdf_expand_label(ctx, buf, len, (unsigned char *)"iv", 2, iv, iv_size + salt_size) != 0) {
+			ctx->flags &= ~SSL_SOCK_F_KTLS_ENABLED;
+			goto out;
+		}
+		/*
+		 * iv contains both what should go to "iv" and "salt",
+		 * salt first, then iv.
+		 */
+		memcpy(&info.buf[0], iv + salt_size, iv_size);
+		memcpy(&info.buf[iv_size + key_size], iv, salt_size);
+		seq = SSL_get_read_sequence(ssl);
+		seq = my_htonll(seq);
+		memcpy(&info.buf[iv_size + key_size + salt_size], &seq, seq_size);
+		if (ktls_set_key(ctx, &info, info_size, 0) != 0) {
+			ctx->flags &= ~SSL_SOCK_F_KTLS_ENABLED;
+			goto out;
+		}
+		if (SSL_get_write_traffic_secret(ctx->ssl, NULL, &len) != 1) {
+			ctx->flags &= ~SSL_SOCK_F_KTLS_ENABLED;
+			goto out;
+		}
+		BUG_ON(len > sizeof(buf));
+
+		if (SSL_get_write_traffic_secret(ctx->ssl, buf, &len) != 1) {
+			ctx->flags &= ~SSL_SOCK_F_KTLS_ENABLED;
+			goto out;
+		}
+
+		if (ssl_sock_hkdf_expand_label(ctx, buf, len, (unsigned char *)"key", 3, &info.buf[iv_size], key_size) != 0) {
+			ctx->flags &= ~SSL_SOCK_F_KTLS_ENABLED;
+			goto out;
+		}
+		if (ssl_sock_hkdf_expand_label(ctx, buf, len, (unsigned char *)"iv", 2, iv, iv_size + salt_size) != 0) {
+			ctx->flags &= ~SSL_SOCK_F_KTLS_ENABLED;
+			goto out;
+		}
+		/*
+		 * iv contains both what should go to "iv" and "salt",
+		 * salt first, then iv.
+		 */
+		memcpy(&info.buf[0], iv + salt_size, iv_size);
+		memcpy(&info.buf[iv_size + key_size], iv, salt_size);
+		seq = SSL_get_write_sequence(ssl);
+		seq = my_htonll(seq);
+		memcpy(&info.buf[iv_size + key_size + salt_size], &seq, seq_size);
+		if (ktls_set_key(ctx, &info, info_size, 1) != 0) {
+			ctx->flags &= ~SSL_SOCK_F_KTLS_ENABLED;
+			goto out;
+		}
+		ctx->flags |= SSL_SOCK_F_KTLS_RECV | SSL_SOCK_F_KTLS_SEND;
+#endif
+
+	}
+out:
+	return;
+}
+
+#endif
+#endif
+
 struct task *ssl_sock_io_cb(struct task *t, void *context, unsigned int state)
 {
 	struct tasklet *tl = (struct tasklet *)t;
@@ -5814,9 +6411,21 @@ struct task *ssl_sock_io_cb(struct task *t, void *context, unsigned int state)
 		}
 		ctx = context;
 		conn = ctx->conn;
-		conn_in_list = conn->flags & CO_FL_LIST_MASK;
-		if (conn_in_list)
-			conn_delete_from_tree(conn);
+
+		/* Remove the connection from the list, to be sure nobody attempts
+		 * to use it while we handle the I/O events
+		 */
+		conn_in_list = conn->flags & (CO_FL_LIST_MASK|CO_FL_SESS_IDLE);
+		if (conn_in_list) {
+			if (conn->flags & CO_FL_SESS_IDLE) {
+				if (!session_detach_idle_conn(conn->owner, conn))
+					conn_in_list = 0;
+			}
+			else {
+				conn_delete_from_tree(conn, tid);
+			}
+		}
+
 		HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
 	} else {
 		ctx = context;
@@ -5832,6 +6441,12 @@ struct task *ssl_sock_io_cb(struct task *t, void *context, unsigned int state)
 		if (!(ctx->conn->flags & CO_FL_SSL_WAIT_HS)) {
 			/* handshake completed, leave the bulk queue */
 			_HA_ATOMIC_AND(&tl->state, ~TASK_HEAVY);
+#ifdef HA_USE_KTLS
+#if defined(OPENSSL_IS_AWSLC) || defined(OPENSSL_IS_BORINGSSL)
+			if (ctx->flags & SSL_SOCK_F_KTLS_ENABLED)
+				ssl_sock_setup_ktls(ctx);
+#endif
+#endif
 		}
 	}
 	/* If we had an error, or the handshake is done and I/O is available,
@@ -5840,7 +6455,13 @@ struct task *ssl_sock_io_cb(struct task *t, void *context, unsigned int state)
 	 * we can't be sure conn_fd_handler() will be called again.
 	 */
 	if ((ctx->conn->flags & CO_FL_ERROR) ||
-	    !(ctx->conn->flags & CO_FL_SSL_WAIT_HS)) {
+	    !(ctx->conn->flags & CO_FL_SSL_WAIT_HS)
+#ifdef SSL_READ_EARLY_DATA_SUCCESS
+	    || (b_data(&ctx->early_buf) && (ctx->flags & SSL_SOCK_F_HAS_ALPN ||
+	               (objt_listener(conn->target) &&
+		        __objt_listener(conn->target)->bind_conf->mux_proto)))
+#endif
+	    ) {
 		int woke = 0;
 
 		/* On error, wake any waiter */
@@ -5859,8 +6480,31 @@ struct task *ssl_sock_io_cb(struct task *t, void *context, unsigned int state)
 		if (ctx->conn->xprt_ctx == ctx) {
 			int closed_connection = 0;
 
-			if (!ctx->conn->mux)
+			if (!ctx->conn->mux) {
 				ret = conn_create_mux(ctx->conn, &closed_connection);
+				/*
+				 * For backend connections, attempt to
+				 * retrieve the ALPN, and store it into
+				 * the server's path_params, so that for
+				 * next connections, we'll know the ALPN
+				 * already, and immediately know which mux
+				 * to use, in case we want to use 0RTT.
+				 */
+				if (ret >= 0 && conn_is_back(conn)) {
+					struct server *srv;
+					const char *alpn;
+					int len;
+
+					if (ssl_sock_get_alpn(conn, ctx, &alpn, &len)) {
+						srv = objt_server(conn->target);
+						if (srv && len < sizeof(srv->path_params.nego_alpn)) {
+							memcpy(&srv->path_params.nego_alpn, alpn, len);
+							srv->path_params.nego_alpn[len] = 0;
+						}
+					}
+				}
+
+			}
 			if (ret >= 0 && !woke && ctx->conn->mux && ctx->conn->mux->wake) {
 				ret = ctx->conn->mux->wake(ctx->conn);
 				if (ret < 0)
@@ -5885,10 +6529,31 @@ leave:
 	if (!ret && conn_in_list) {
 		struct server *srv = objt_server(conn->target);
 
-		TRACE_DEVEL("adding conn back to idle list", SSL_EV_CONN_IO_CB, conn);
-		HA_SPIN_LOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
-		_srv_add_idle(srv, conn, conn_in_list == CO_FL_SAFE_LIST);
-		HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
+		/* Connection is idle which means MUX layer is already initialized. */
+		BUG_ON(!conn->mux);
+
+		if (!srv || !(srv->cur_admin & SRV_ADMF_MAINT)) {
+			if (conn->flags & CO_FL_SESS_IDLE) {
+				TRACE_DEVEL("adding conn back to session list", SSL_EV_CONN_IO_CB, conn);
+				if (!session_reinsert_idle_conn(conn->owner, conn)) {
+					/* session add conn failure */
+					conn->mux->destroy(conn->ctx);
+					t = NULL;
+				}
+			}
+			else {
+				ASSUME_NONNULL(srv); /* srv is guaranteed by CO_FL_LIST_MASK */
+				TRACE_DEVEL("adding conn back to idle list", SSL_EV_CONN_IO_CB, conn);
+				HA_SPIN_LOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
+				_srv_add_idle(srv, conn, conn_in_list == CO_FL_SAFE_LIST);
+				HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
+			}
+		}
+		else {
+			/* Do not store an idle conn if server in maintenance. */
+			conn->mux->destroy(conn->ctx);
+			t = NULL;
+		}
 	}
 	TRACE_LEAVE(SSL_EV_CONN_IO_CB, conn);
 	return t;
@@ -5902,7 +6567,7 @@ leave:
  * avoiding the call if inappropriate. The function does not call the
  * connection's polling update function, so the caller is responsible for this.
  */
-static size_t ssl_sock_to_buf(struct connection *conn, void *xprt_ctx, struct buffer *buf, size_t count, int flags)
+static size_t ssl_sock_to_buf(struct connection *conn, void *xprt_ctx, struct buffer *buf, size_t count, void *msg_control, size_t *msg_controllen, int flags)
 {
 	struct ssl_sock_ctx *ctx = xprt_ctx;
 	ssize_t ret;
@@ -5912,6 +6577,8 @@ static size_t ssl_sock_to_buf(struct connection *conn, void *xprt_ctx, struct bu
 
 	if (!ctx)
 		goto out_error;
+
+	BUG_ON_HOT(msg_control != NULL);
 
 #ifdef SSL_READ_EARLY_DATA_SUCCESS
 	if (b_data(&ctx->early_buf)) {
@@ -5928,7 +6595,12 @@ static size_t ssl_sock_to_buf(struct connection *conn, void *xprt_ctx, struct bu
 	}
 #endif
 
-	if (conn->flags & (CO_FL_WAIT_XPRT | CO_FL_SSL_WAIT_HS)) {
+	/*
+	 * We have to check SSL_SOCK_F_EARLY_ENABLED here, as the handshake flags
+	 * may have been removed in case we want to try to send early data.
+	 */
+	if ((ctx->flags & SSL_SOCK_F_EARLY_ENABLED) ||
+	    (conn->flags & (CO_FL_WAIT_XPRT | CO_FL_SSL_WAIT_HS))) {
 		/* a handshake was requested */
 		TRACE_LEAVE(SSL_EV_CONN_RECV, conn);
 		return 0;
@@ -5940,7 +6612,6 @@ static size_t ssl_sock_to_buf(struct connection *conn, void *xprt_ctx, struct bu
 	 * EINTR too.
 	 */
 	while (count > 0) {
-
 		try = b_contig_space(buf);
 		if (!try)
 			break;
@@ -5948,6 +6619,50 @@ static size_t ssl_sock_to_buf(struct connection *conn, void *xprt_ctx, struct bu
 		if (try > count)
 			try = count;
 
+#ifdef HA_USE_KTLS
+#if defined(OPENSSL_IS_BORINGSSL) || defined(OPENSSL_IS_AWSLC)
+		if (ctx->flags & SSL_SOCK_F_KTLS_RECV) {
+			unsigned char *tmpbuf = (unsigned char *)b_tail(buf);
+			unsigned char cbuf[CMSG_SPACE(sizeof(unsigned char))];
+			size_t msg_controllen = CMSG_LEN(sizeof(unsigned char));
+
+			ret = ctx->xprt->rcv_buf(ctx->conn, ctx->xprt_ctx, buf, try, cbuf, &msg_controllen, CO_RFL_READ_ONCE);
+			if (ret > 0 && msg_controllen > 0) {
+				struct cmsghdr *cmsg = (void *)cbuf;
+
+				if (cmsg->cmsg_type == TLS_GET_RECORD_TYPE) {
+					unsigned char record_type = *(unsigned char *)CMSG_DATA(cmsg);
+					/*
+					 * If this is not application data,
+					 * there is not much we can do
+					 */
+					if (record_type == SSL3_RT_HANDSHAKE && tmpbuf[0] == SSL3_MT_NEW_SESSION_TICKET) {
+						/*
+						 * Just ignore new session tickets
+						 */
+						b_del(buf, ret);
+						continue;
+
+					} else if (record_type != SSL3_RT_APPLICATION_DATA) {
+						/*
+						 * Special case: TLS alert "close notify"
+						 * We just register that as a read0, any other message is considered fatal
+						 */
+						if (record_type == SSL3_RT_ALERT && ret == 2 &&
+						    tmpbuf[0] == SSL_TLSEXT_ERR_ALERT_WARNING && tmpbuf[1] == SSL_AD_CLOSE_NOTIFY) {
+							b_del(buf, ret);
+							goto read0;
+						} else {
+							conn->err_code = CO_ER_SSL_FATAL;
+							goto out_error;
+						}
+					}
+
+				}
+			}
+		} else
+#endif
+#endif
 		ret = SSL_read(ctx->ssl, b_tail(buf), try);
 
 		if (conn->flags & CO_FL_ERROR) {
@@ -5955,12 +6670,33 @@ static size_t ssl_sock_to_buf(struct connection *conn, void *xprt_ctx, struct bu
 			goto out_error;
 		}
 		if (ret > 0) {
-			b_add(buf, ret);
+#ifdef HA_USE_KTLS
+#if defined(OPENSSL_IS_BORINGSSL) || defined(OPENSSL_IS_AWSLC)
+			/*
+			 * The next xprt already adjusted the buffer,
+			 * so we should not do it.
+			 */
+			if (!(ctx->flags & SSL_SOCK_F_KTLS_RECV))
+#endif
+#endif
+				b_add(buf, ret);
 			done += ret;
 			count -= ret;
 			TRACE_DEVEL("Post SSL_read success", SSL_EV_CONN_RECV, conn, &ret);
 		}
 		else {
+#ifdef HA_USE_KTLS
+#if defined(OPENSSL_IS_BORINGSSL) || defined(OPENSSL_IS_AWSLC)
+			if (ctx->flags & SSL_SOCK_F_KTLS_RECV)
+				/*
+				 * At this point the underlying xprt already
+				 * set any connection error, and we can't
+				 * ask the SSL lib, so we can stop now.
+				 */
+				break;
+			else
+#endif
+#endif
 			ret =  SSL_get_error(ctx->ssl, ret);
 			if (ret == SSL_ERROR_WANT_WRITE) {
 				/* handshake is running, and it needs to enable write */
@@ -6047,7 +6783,7 @@ static size_t ssl_sock_to_buf(struct connection *conn, void *xprt_ctx, struct bu
  * caller to take care of this. It's up to the caller to update the buffer's
  * contents based on the return value.
  */
-static size_t ssl_sock_from_buf(struct connection *conn, void *xprt_ctx, const struct buffer *buf, size_t count, int flags)
+static size_t ssl_sock_from_buf(struct connection *conn, void *xprt_ctx, const struct buffer *buf, size_t count, void *msg_control, size_t msg_controllen, int flags)
 {
 	struct ssl_sock_ctx *ctx = xprt_ctx;
 	ssize_t ret;
@@ -6060,6 +6796,8 @@ static size_t ssl_sock_from_buf(struct connection *conn, void *xprt_ctx, const s
 	if (!ctx)
 		goto out_error;
 
+	BUG_ON_HOT(msg_control != NULL);
+
 	if (conn->flags & (CO_FL_WAIT_XPRT | CO_FL_SSL_WAIT_HS | CO_FL_EARLY_SSL_HS)) {
 		/* a handshake was requested */
 		TRACE_LEAVE(SSL_EV_CONN_SEND, conn);
@@ -6071,6 +6809,12 @@ static size_t ssl_sock_from_buf(struct connection *conn, void *xprt_ctx, const s
 	 * in which case we accept to do it once again.
 	 */
 	while (count) {
+#ifdef HA_USE_KTLS
+#if defined(OPENSSL_IS_BORINGSSL) || defined(OPENSSL_IS_AWSLC)
+		int ktls_error = 0;
+#endif
+#endif
+
 #ifdef SSL_READ_EARLY_DATA_SUCCESS
 		size_t written_data;
 #endif
@@ -6101,7 +6845,7 @@ static size_t ssl_sock_from_buf(struct connection *conn, void *xprt_ctx, const s
 			ctx->xprt_st &= ~SSL_SOCK_SEND_MORE;
 
 #ifdef SSL_READ_EARLY_DATA_SUCCESS
-		if (!SSL_is_init_finished(ctx->ssl) && conn_is_back(conn)) {
+		if ((ctx->flags & SSL_SOCK_F_EARLY_ENABLED) && conn_is_back(conn)) {
 			unsigned int max_early;
 
 			if (objt_listener(conn->target))
@@ -6133,10 +6877,36 @@ static size_t ssl_sock_from_buf(struct connection *conn, void *xprt_ctx, const s
 				TRACE_PROTO("Write early data", SSL_EV_CONN_SEND|SSL_EV_CONN_SEND_EARLY, conn, &ret);
 			}
 
-		} else
+		} else {
 #endif
-			ret = SSL_write(ctx->ssl, b_peek(buf, done), try);
+#ifdef HA_USE_KTLS
+#if defined(OPENSSL_IS_BORINGSSL) || defined(OPENSSL_IS_AWSLC)
+			if (ctx->flags & SSL_SOCK_F_KTLS_SEND) {
+				struct buffer tmpbuf;
 
+				tmpbuf.size = b_data(buf) - done;
+				tmpbuf.data = tmpbuf.size;
+				tmpbuf.area = b_peek(buf, done);
+				tmpbuf.head = 0;
+				ret = ctx->xprt->snd_buf(ctx->conn, ctx->xprt_ctx, &tmpbuf, try, NULL, 0, (ctx->xprt_st & SSL_SOCK_SEND_MORE) ? CO_SFL_MSG_MORE : 0);
+				if (ret < try) {
+					if (errno == EINTR)
+						continue;
+					else if (!(conn->flags & CO_FL_ERROR))
+						ktls_error = SSL_ERROR_WANT_WRITE;
+					else {
+						ktls_error = SSL_ERROR_SSL;
+					}
+				}
+
+			} else
+#endif
+#endif
+				ret = SSL_write(ctx->ssl, b_peek(buf, done), try);
+
+#ifdef SSL_READ_EARLY_DATA_SUCCESS
+		}
+#endif
 		if (conn->flags & CO_FL_ERROR) {
 			/* CO_FL_ERROR may be set by ssl_sock_infocbk */
 			goto out_error;
@@ -6150,6 +6920,13 @@ static size_t ssl_sock_from_buf(struct connection *conn, void *xprt_ctx, const s
 			TRACE_DEVEL("Post SSL_write success", SSL_EV_CONN_SEND, conn, &ret);
 		}
 		else {
+#ifdef HA_USE_KTLS
+#if defined(OPENSSL_IS_BORINGSSL) || defined(OPENSSL_IS_AWSLC)
+			if (ctx->flags & SSL_SOCK_F_KTLS_SEND)
+				ret = ktls_error;
+			else
+#endif
+#endif
 			ret = SSL_get_error(ctx->ssl, ret);
 
 			if (ret == SSL_ERROR_WANT_WRITE) {
@@ -6206,7 +6983,7 @@ static size_t ssl_sock_from_buf(struct connection *conn, void *xprt_ctx, const s
 	goto leave;
 }
 
-void ssl_sock_close(struct connection *conn, void *xprt_ctx) {
+static void ssl_sock_close(struct connection *conn, void *xprt_ctx) {
 
 	struct ssl_sock_ctx *ctx = xprt_ctx;
 
@@ -6296,6 +7073,33 @@ static void ssl_sock_shutw(struct connection *conn, void *xprt_ctx, int clean)
 
 	TRACE_ENTER(SSL_EV_CONN_END, conn);
 
+#ifdef HA_USE_KTLS
+#if defined(OPENSSL_IS_AWSLC) || defined(OPENSSL_IS_BORINGSSL)
+	if (ctx->flags & (SSL_SOCK_F_KTLS_RECV | SSL_SOCK_F_KTLS_SEND)) {
+		unsigned char cbuf[CMSG_SPACE(sizeof(unsigned char))];
+		struct buffer tmpbuf;
+		struct cmsghdr *cmsg;
+		char buf[2];
+		size_t msg_controllen = CMSG_LEN(sizeof(unsigned char));
+		/*
+		 * Send a TLS alert "notify close"
+		 */
+		cmsg = (void *)cbuf;
+		cmsg->cmsg_type = TLS_SET_RECORD_TYPE;
+		cmsg->cmsg_level = SOL_TLS;
+		cmsg->cmsg_len = msg_controllen;
+		*(unsigned char *)CMSG_DATA(cmsg) = SSL3_RT_ALERT;
+		buf[0] = SSL_TLSEXT_ERR_ALERT_WARNING; /* Warning */
+		buf[1] = SSL_AD_CLOSE_NOTIFY; /* notify close */
+		tmpbuf.size = sizeof(buf);
+		tmpbuf.area = buf;
+		tmpbuf.data = tmpbuf.size;
+		tmpbuf.head = 0;
+		ctx->xprt->snd_buf(ctx->conn, ctx->xprt_ctx, &tmpbuf, sizeof(buf), cmsg, msg_controllen, 0);
+		return;
+	}
+#endif
+#endif
 	if (conn->flags & (CO_FL_WAIT_XPRT | CO_FL_SSL_WAIT_HS))
 		return;
 	conn_report_term_evt(conn, tevt_loc_xprt, xprt_tevt_type_shutw);
@@ -6970,6 +7774,39 @@ yield:
 }
 #endif
 
+static int ssl_sock_get_capability(struct connection *conn, void *xprt_ctx, enum xprt_capabilities cap, void *arg)
+{
+#ifdef HA_USE_KTLS
+	struct ssl_sock_ctx *ctx = xprt_ctx;
+	int *ret;
+
+	switch (cap) {
+		case XPRT_CAN_SPLICE:
+			ret = arg;
+			if ((ctx->flags & (SSL_SOCK_F_KTLS_RECV | SSL_SOCK_F_KTLS_SEND)) ==
+			                  (SSL_SOCK_F_KTLS_RECV | SSL_SOCK_F_KTLS_SEND)) {
+#ifdef USE_VANILLA_OPENSSL
+				/*
+				 * We can splice yet if there's still
+				 * data in OpenSSL internal buffers
+				 */
+				if (SSL_has_pending(ctx->ssl))
+					*ret = XPRT_CONN_COULD_SPLICE;
+				else
+#endif
+				{
+					ctx->conn->flags &= ~CO_FL_WANT_SPLICING;
+					*ret = XPRT_CONN_CAN_SPLICE;
+				}
+			} else if (ctx->flags & SSL_SOCK_F_KTLS_ENABLED)
+				*ret = XPRT_CONN_COULD_SPLICE;
+			else
+				*ret = XPRT_CONN_CAN_NOT_SPLICE;
+			return 0;
+	}
+#endif
+	return -1;
+}
 
 /* register cli keywords */
 static struct cli_kw_list cli_kws = {{ },{
@@ -6993,13 +7830,16 @@ struct xprt_ops ssl_sock = {
 	.unsubscribe = ssl_unsubscribe,
 	.remove_xprt = ssl_remove_xprt,
 	.add_xprt = ssl_add_xprt,
-	.rcv_pipe = NULL,
-	.snd_pipe = NULL,
+#if defined(HA_USE_KTLS) && defined(USE_LINUX_SPLICE)
+	.rcv_pipe = ssl_sock_from_pipe,
+	.snd_pipe = ssl_sock_to_pipe,
+#endif
 	.shutr    = NULL,
 	.shutw    = ssl_sock_shutw,
 	.close    = ssl_sock_close,
 	.init     = ssl_sock_init,
 	.start    = ssl_sock_start,
+	.get_capability = ssl_sock_get_capability,
 	.prepare_bind_conf = ssl_sock_prepare_bind_conf,
 	.destroy_bind_conf = ssl_sock_destroy_bind_conf,
 	.prepare_srv = ssl_sock_prepare_srv_ctx,
@@ -7013,7 +7853,7 @@ struct xprt_ops ssl_sock = {
 	.show_fd  = ssl_sock_show_fd,
 };
 
-enum act_return ssl_action_wait_for_hs(struct act_rule *rule, struct proxy *px,
+static enum act_return ssl_action_wait_for_hs(struct act_rule *rule, struct proxy *px,
                                        struct session *sess, struct stream *s, int flags)
 {
 	struct connection *conn;

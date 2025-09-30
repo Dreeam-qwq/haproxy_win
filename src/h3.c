@@ -148,7 +148,7 @@ struct h3c {
 	struct h3_counters *prx_counters;
 };
 
-DECLARE_STATIC_POOL(pool_head_h3c, "h3c", sizeof(struct h3c));
+DECLARE_STATIC_TYPED_POOL(pool_head_h3c, "h3c", struct h3c);
 
 #define H3_SF_UNI_INIT     0x00000001  /* stream type not parsed for unidirectional stream */
 #define H3_SF_UNI_NO_H3    0x00000002  /* unidirectional stream does not carry H3 frames */
@@ -171,7 +171,7 @@ struct h3s {
 	int err; /* used for stream reset */
 };
 
-DECLARE_STATIC_POOL(pool_head_h3s, "h3s", sizeof(struct h3s));
+DECLARE_STATIC_TYPED_POOL(pool_head_h3s, "h3s", struct h3s);
 
 /* Initialize an uni-stream <qcs> by reading its type from <b>.
  *
@@ -2002,8 +2002,8 @@ static int h3_encode_header(struct buffer *buf,
  */
 static int h3_req_headers_send(struct qcs *qcs, struct htx *htx)
 {
+	int err;
 	struct http_hdr list[global.tune.max_http_hdr * 2];
-	struct buffer outbuf;
 	struct buffer headers_buf = BUF_NULL;
 	struct buffer *res;
 	enum htx_blk_type type;
@@ -2011,7 +2011,11 @@ static int h3_req_headers_send(struct qcs *qcs, struct htx *htx)
 	struct htx_sl *sl;
 	struct ist meth, uri, scheme = IST_NULL, auth = IST_NULL;
 	int frame_length_size;  /* size in bytes of frame length varint field */
-	int ret, err, hdr;
+	int smallbuf = 1;
+	int ret = 0;
+	int hdr;
+
+	TRACE_ENTER(H3_EV_TX_FRAME|H3_EV_TX_HDR, qcs->qcc->conn, qcs);
 
 	hdr = 0;
 	sl = NULL;
@@ -2032,8 +2036,10 @@ static int h3_req_headers_send(struct qcs *qcs, struct htx *htx)
 			break;
 
 		case HTX_BLK_HDR:
-			if (unlikely(hdr >= sizeof(list) / sizeof(list[0]) - 1))
+			if (unlikely(hdr >= sizeof(list) / sizeof(list[0]) - 1)) {
+				TRACE_ERROR("too many headers", H3_EV_TX_FRAME|H3_EV_TX_HDR, qcs->qcc->conn, qcs);
 				goto err;
+			}
 
 			list[hdr].n = htx_get_blk_name(htx, blk);
 			list[hdr].v = htx_get_blk_value(htx, blk);
@@ -2051,19 +2057,32 @@ static int h3_req_headers_send(struct qcs *qcs, struct htx *htx)
 	/* marker for end of headers */
 	list[hdr].n = ist("");
 
-	res = qcc_get_stream_txbuf(qcs, &err, 0);
-	BUG_ON(!res);
+ retry:
+	res = smallbuf ? qcc_get_stream_txbuf(qcs, &err, 1) :
+	                 qcc_realloc_stream_txbuf(qcs);
+	if (!res) {
+		if (err) {
+			TRACE_ERROR("cannot allocate Tx buffer", H3_EV_TX_FRAME|H3_EV_TX_HDR, qcs->qcc->conn, qcs);
+			goto err;
+		}
 
-	b_reset(&outbuf);
-	outbuf = b_make(b_tail(res), b_contig_space(res), 0, 0);
+		TRACE_STATE("buf window full", H3_EV_TX_FRAME|H3_EV_TX_HDR, qcs->qcc->conn, qcs);
+		goto end;
+	}
+
+	if (unlikely(b_contig_space(res) < 5))
+		goto err_full;
+
 	/* Start the headers after frame type + length */
-	headers_buf = b_make(b_head(res) + 5, b_size(res) - 5, 0, 0);
+	headers_buf = b_make(b_tail(res) + 5, b_contig_space(res) - 5, 0, 0);
 
+	TRACE_DATA("encoding HEADERS frame", H3_EV_TX_FRAME|H3_EV_TX_HDR,
+	           qcs->qcc->conn, qcs);
 	if (qpack_encode_field_section_line(&headers_buf))
-		goto err;
+		goto err_full;
 
 	if (qpack_encode_method(&headers_buf, sl->info.req.meth, meth))
-		goto err;
+		goto err_full;
 
 	if (uri.ptr[0] != '/' && uri.ptr[0] != '*') {
 		int len = 1;
@@ -2094,14 +2113,14 @@ static int h3_req_headers_send(struct qcs *qcs, struct htx *htx)
 	}
 
 	if (qpack_encode_scheme(&headers_buf, scheme))
-		goto err;
+		goto err_full;
 
 	if (qpack_encode_path(&headers_buf, uri))
-		goto err;
+		goto err_full;
 
 	if (istlen(auth)) {
 		if (qpack_encode_auth(&headers_buf, auth))
-			goto err;
+			goto err_full;
 	}
 
 	/* Encode every parsed headers, stop at empty one. */
@@ -2138,7 +2157,7 @@ static int h3_req_headers_send(struct qcs *qcs, struct htx *htx)
 			continue;
 
 		if (h3_encode_header(&headers_buf, list[hdr].n, list[hdr].v))
-			goto err;
+			goto err_full;
 	}
 
 	/* Now that all headers are encoded, we are certain that res buffer is
@@ -2160,9 +2179,18 @@ static int h3_req_headers_send(struct qcs *qcs, struct htx *htx)
 			break;
 	}
 
+ end:
+	TRACE_LEAVE(H3_EV_TX_FRAME|H3_EV_TX_HDR, qcs->qcc->conn, qcs);
 	return ret;
 
+ err_full:
+	if (smallbuf) {
+		TRACE_DEVEL("retry with a full buffer", H3_EV_TX_FRAME|H3_EV_TX_HDR, qcs->qcc->conn, qcs);
+		smallbuf = 0;
+		goto retry;
+	}
  err:
+	TRACE_DEVEL("leaving on error", H3_EV_TX_FRAME|H3_EV_TX_HDR, qcs->qcc->conn, qcs);
 	return -1;
 }
 
@@ -2977,6 +3005,9 @@ static int h3_attach(struct qcs *qcs, void *conn_ctx)
 	 */
 	if (h3c->flags & H3_CF_GOAWAY_SENT && qcs->id >= h3c->id_goaway &&
 	    quic_stream_is_bidi(qcs->id)) {
+		/* Local stack should not attached stream on a closed connection. */
+		BUG_ON(quic_stream_is_local(qcs->qcc, qcs->id));
+
 		TRACE_STATE("close stream outside of goaway range", H3_EV_H3S_NEW, qcs->qcc->conn, qcs);
 		qcc_abort_stream_read(qcs);
 		qcc_reset_stream(qcs, H3_ERR_REQUEST_REJECTED);

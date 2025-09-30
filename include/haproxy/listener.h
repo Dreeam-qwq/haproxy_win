@@ -25,8 +25,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <import/ceb32_tree.h>
+
 #include <haproxy/api.h>
 #include <haproxy/listener-t.h>
+#include <haproxy/proxy-t.h>
 
 struct proxy;
 struct task;
@@ -81,6 +84,12 @@ int relax_listener(struct listener *l, int lpx, int lli);
  * ones, in this order.
  */
 void stop_listener(struct listener *l, int lpx, int lpr, int lli);
+
+/* This function returns the first unused listener ID greater than or equal to
+ * <from> in the proxy <px>. Zero is returned if no spare one is found (should
+ * never happen).
+ */
+uint listener_get_next_id(const struct proxy *px, uint from);
 
 /* This function adds the specified listener's file descriptor to the polling
  * lists if it is in the LI_LISTEN state. The listener enters LI_READY or
@@ -229,6 +238,12 @@ enum li_status get_li_status(struct listener *l);
 
 /* number of times an accepted connection resulted in maxconn being reached */
 extern ullong maxconn_reached;
+
+/* index listener <li>'s id into proxy <px>'s used_listener_id */
+static inline void listener_index_id(struct proxy *px, struct listener *li)
+{
+	ceb32_item_insert(&px->conf.used_listener_id, luid_node, luid, li);
+}
 
 static inline uint accept_queue_ring_len(const struct accept_queue_ring *ring)
 {

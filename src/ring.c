@@ -83,12 +83,12 @@ struct ring *ring_make_from_area(void *area, size_t size, int reset)
 	if (size < sizeof(*ring->storage) + 2)
 		return NULL;
 
-	ring = malloc(sizeof(*ring));
+	ring = ha_aligned_alloc_typed(1, typeof(*ring));
 	if (!ring)
 		goto fail;
 
 	if (!area)
-		area = malloc(size);
+		area = ha_aligned_alloc(__alignof__(*ring->storage), size);
 	else
 		flags |= RING_FL_MAPPED;
 
@@ -99,7 +99,7 @@ struct ring *ring_make_from_area(void *area, size_t size, int reset)
 	ring->flags |= flags;
 	return ring;
  fail:
-	free(ring);
+	ha_aligned_free(ring);
 	return NULL;
 }
 
@@ -125,7 +125,7 @@ struct ring *ring_resize(struct ring *ring, size_t size)
 		return ring;
 
 	old = ring->storage;
-	new = malloc(size);
+	new = ha_aligned_alloc(__alignof__(*ring->storage), size);
 	if (!new)
 		return NULL;
 
@@ -150,7 +150,7 @@ struct ring *ring_resize(struct ring *ring, size_t size)
 	thread_release();
 
 	/* free the unused one */
-	free(new);
+	ha_aligned_free(new);
 	return ring;
 }
 
@@ -162,8 +162,8 @@ void ring_free(struct ring *ring)
 
 	/* make sure it was not allocated by ring_make_from_area */
 	if (!(ring->flags & RING_FL_MAPPED))
-		free(ring->storage);
-	free(ring);
+		ha_aligned_free(ring->storage);
+	ha_aligned_free(ring);
 }
 
 /* Tries to send <npfx> parts from <prefix> followed by <nmsg> parts from <msg>
@@ -274,38 +274,51 @@ ssize_t ring_write(struct ring *ring, size_t maxlen, const struct ist pfx[], siz
 	 * threads check the tail.
 	 */
 
+	tail_ofs = 0;
 	while (1) {
-		if ((curr_cell = HA_ATOMIC_LOAD(ring_queue_ptr)) != &cell)
-			goto wait_for_flush;
-		__ha_cpu_relax_for_read();
-
-#if !defined(__ARM_FEATURE_ATOMICS)
-		/* ARMv8.1-a has a true atomic OR and doesn't need the preliminary read */
-		if ((tail_ofs = HA_ATOMIC_LOAD(tail_ptr)) & RING_TAIL_LOCK) {
-			__ha_cpu_relax_for_read();
-			continue;
-		}
+#if defined(__x86_64__)
+		/* read using a CAS on x86, as it will keep the cache line
+		 * in exclusive state for a few more cycles that will allow
+		 * us to release the queue without waiting after the loop.
+		 */
+		curr_cell = &cell;
+		HA_ATOMIC_CAS(ring_queue_ptr, &curr_cell, curr_cell);
+#else
+		curr_cell = HA_ATOMIC_LOAD(ring_queue_ptr);
 #endif
-		/* OK the queue is locked, let's attempt to get the tail lock */
-		tail_ofs = HA_ATOMIC_FETCH_OR(tail_ptr, RING_TAIL_LOCK);
-
-		/* did we get it ? */
-		if (!(tail_ofs & RING_TAIL_LOCK)) {
-			/* Here we own the tail. We can go on if we're still the leader,
-			 * which we'll confirm by trying to reset the queue. If we're
-			 * still the leader, we're done.
-			 */
-			if (HA_ATOMIC_CAS(ring_queue_ptr, &curr_cell, NULL))
-				break; // Won!
-
-			/* oops, no, let's give it back to another thread and wait.
-			 * This does not happen often enough to warrant more complex
-			 * approaches (tried already).
-			 */
-			HA_ATOMIC_STORE(tail_ptr, tail_ofs);
+		/* give up if another thread took the leadership of the queue */
+		if (curr_cell != &cell)
 			goto wait_for_flush;
-		}
-		__ha_cpu_relax_for_read();
+
+		/* OK the queue is locked, let's attempt to get the tail lock.
+		 * we'll atomically OR the lock on the pointer and check if
+		 * someone else had it already, otherwise we own it.
+		 */
+
+#if defined(__ARM_FEATURE_ATOMICS)
+		/* ARMv8.1-a has a true atomic OR and doesn't need the preliminary read */
+		tail_ofs = HA_ATOMIC_FETCH_OR(tail_ptr, RING_TAIL_LOCK);
+		if (!(tail_ofs & RING_TAIL_LOCK))
+			break;
+#else
+		if (HA_ATOMIC_CAS(tail_ptr, &tail_ofs, tail_ofs | RING_TAIL_LOCK))
+			break;
+		tail_ofs &= ~RING_TAIL_LOCK;
+#endif
+		__ha_cpu_relax();
+	}
+
+	/* Here we own the tail. We can go on if we're still the leader,
+	 * which we'll confirm by trying to reset the queue. If we're
+	 * still the leader, we're done.
+	 */
+	if (!HA_ATOMIC_CAS(ring_queue_ptr, &curr_cell, NULL)) {
+		/* oops, no, let's give it back to another thread and wait.
+		 * This does not happen often enough to warrant more complex
+		 * approaches (tried already).
+		 */
+		HA_ATOMIC_STORE(tail_ptr, tail_ofs);
+		goto wait_for_flush;
 	}
 
 	head_ofs = HA_ATOMIC_LOAD(&ring->storage->head);
@@ -320,7 +333,7 @@ ssize_t ring_write(struct ring *ring, size_t maxlen, const struct ist pfx[], siz
 
 	vp_ring_to_data(&v1, &v2, ring_area, ring_size, head_ofs, tail_ofs);
 
-	while (vp_size(v1, v2) > ring_size - needed - 1 - 1) {
+	while (vp_size(v1, v2) + needed + 1 + 1 > ring_size) {
 		/* we need to delete the oldest message (from the end),
 		 * and we have to stop if there's a reader stuck there.
 		 * Unless there's corruption in the buffer it's guaranteed
@@ -339,7 +352,7 @@ ssize_t ring_write(struct ring *ring, size_t maxlen, const struct ist pfx[], siz
 
 	/* now let's update the buffer with the new tail if our message will fit */
 	new_tail_ofs = tail_ofs;
-	if (vp_size(v1, v2) <= ring_size - needed - 1 - 1) {
+	if (vp_size(v1, v2) + needed + 1 + 1 <= ring_size) {
 		vp_data_to_ring(v1, v2, ring_area, ring_size, &head_ofs, &tail_ofs);
 
 		/* update the new space in the buffer */
@@ -456,7 +469,7 @@ ssize_t ring_write(struct ring *ring, size_t maxlen, const struct ist pfx[], siz
 	 */
 	do {
 		next_cell = HA_ATOMIC_LOAD(&cell.next);
-	} while (next_cell != &cell && __ha_cpu_relax_for_read());
+	} while (next_cell != &cell && __ha_cpu_relax());
 
 	/* OK our message was queued. Retrieving the sent size in the ring cell
 	 * allows another leader thread to zero it if it finally couldn't send

@@ -43,6 +43,13 @@ struct task *session_expire_embryonic(struct task *t, void *context, unsigned in
 void __session_add_glitch_ctr(struct session *sess, uint inc);
 void session_embryonic_build_legacy_err(struct session *sess, struct buffer *out);
 
+int session_add_conn(struct session *sess, struct connection *conn);
+int session_reinsert_idle_conn(struct session *sess, struct connection *conn);
+int session_check_idle_conn(struct session *sess, struct connection *conn);
+struct connection *session_get_conn(struct session *sess, void *target, int64_t hash);
+void session_unown_conn(struct session *sess, struct connection *conn);
+int session_detach_idle_conn(struct session *sess, struct connection *conn);
+int sess_conns_cleanup_all_idle(struct sess_priv_conns *sess_conns);
 
 /* Remove the refcount from the session to the tracked counters, and clear the
  * pointer to ensure this is only performed once. The caller is responsible for
@@ -134,143 +141,6 @@ static inline void session_add_glitch_ctr(struct session *sess, uint inc)
 {
 	if (sess->stkctr && inc)
 		__session_add_glitch_ctr(sess, inc);
-}
-
-/* Remove the connection from the session list, and destroy sess_priv_conns
- * element if it's now empty.
- */
-static inline void session_unown_conn(struct session *sess, struct connection *conn)
-{
-	struct sess_priv_conns *pconns = NULL;
-
-	BUG_ON(objt_listener(conn->target));
-
-	/* WT: this currently is a workaround for an inconsistency between
-	 * the link status of the connection in the session list and the
-	 * connection's owner. This should be removed as soon as all this
-	 * is addressed. Right now it's possible to enter here with a non-null
-	 * conn->owner that points to a dead session, but in this case the
-	 * element is not linked.
-	 */
-	if (!LIST_INLIST(&conn->sess_el))
-		return;
-
-	if (conn->flags & CO_FL_SESS_IDLE)
-		sess->idle_conns--;
-	LIST_DEL_INIT(&conn->sess_el);
-	conn->owner = NULL;
-	list_for_each_entry(pconns, &sess->priv_conns, sess_el) {
-		if (pconns->target == conn->target) {
-			if (LIST_ISEMPTY(&pconns->conn_list)) {
-				LIST_DELETE(&pconns->sess_el);
-				MT_LIST_DELETE(&pconns->srv_el);
-				pool_free(pool_head_sess_priv_conns, pconns);
-			}
-			break;
-		}
-	}
-}
-
-/* Add the connection <conn> to the private conns list of session <sess>. This
- * function is called only if the connection is private. Nothing is performed
- * if the connection is already in the session list or if the session does not
- * owned the connection.
- */
-static inline int session_add_conn(struct session *sess, struct connection *conn, void *target)
-{
-	struct sess_priv_conns *pconns = NULL;
-	struct server *srv = objt_server(conn->target);
-	int found = 0;
-
-	BUG_ON(objt_listener(conn->target));
-
-	/* Already attach to the session or not the connection owner */
-	if (!LIST_ISEMPTY(&conn->sess_el) || (conn->owner && conn->owner != sess))
-		return 1;
-
-	list_for_each_entry(pconns, &sess->priv_conns, sess_el) {
-		if (pconns->target == target) {
-			found = 1;
-			break;
-		}
-	}
-	if (!found) {
-		/* The session has no connection for the server, create a new entry */
-		pconns = pool_alloc(pool_head_sess_priv_conns);
-		if (!pconns)
-			return 0;
-		pconns->target = target;
-		LIST_INIT(&pconns->conn_list);
-		LIST_APPEND(&sess->priv_conns, &pconns->sess_el);
-
-		MT_LIST_INIT(&pconns->srv_el);
-		if (srv)
-			MT_LIST_APPEND(&srv->sess_conns, &pconns->srv_el);
-
-		pconns->tid = tid;
-	}
-	LIST_APPEND(&pconns->conn_list, &conn->sess_el);
-
-	/* Ensure owner is set for connection. It could have been reset
-	 * prior on after a session_add_conn() failure.
-	 */
-	conn->owner = sess;
-
-	return 1;
-}
-
-/* Returns 0 if the session can keep the idle conn, -1 if it was destroyed. The
- * connection must be private.
- */
-static inline int session_check_idle_conn(struct session *sess, struct connection *conn)
-{
-	/* Another session owns this connection */
-	if (conn->owner != sess)
-		return 0;
-
-	if (sess->idle_conns >= sess->fe->max_out_conns) {
-		session_unown_conn(sess, conn);
-		conn->owner = NULL;
-		conn->flags &= ~CO_FL_SESS_IDLE;
-		conn->mux->destroy(conn->ctx);
-		return -1;
-	} else {
-		conn->flags |= CO_FL_SESS_IDLE;
-		sess->idle_conns++;
-	}
-	return 0;
-}
-
-/* Look for an available connection matching the target <target> in the server
- * list of the session <sess>. It returns a connection if found. Otherwise it
- * returns NULL.
- */
-static inline struct connection *session_get_conn(struct session *sess, void *target, int64_t hash)
-{
-	struct connection *srv_conn = NULL;
-	struct sess_priv_conns *pconns;
-
-	list_for_each_entry(pconns, &sess->priv_conns, sess_el) {
-		if (pconns->target == target) {
-			list_for_each_entry(srv_conn, &pconns->conn_list, sess_el) {
-				if ((srv_conn->hash_node && srv_conn->hash_node->node.key == hash) &&
-				    srv_conn->mux &&
-				    (srv_conn->mux->avail_streams(srv_conn) > 0) &&
-				    !(srv_conn->flags & CO_FL_WAIT_XPRT)) {
-					if (srv_conn->flags & CO_FL_SESS_IDLE) {
-						srv_conn->flags &= ~CO_FL_SESS_IDLE;
-						sess->idle_conns--;
-					}
-					goto end;
-				}
-			}
-			srv_conn = NULL; /* No available connection found */
-			goto end;
-		}
-	}
-
-  end:
-	return srv_conn;
 }
 
 /* Returns the source address of the session and fallbacks on the client

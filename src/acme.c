@@ -34,9 +34,111 @@
 #include <haproxy/ssl_sock.h>
 #include <haproxy/ssl_utils.h>
 #include <haproxy/tools.h>
+#include <haproxy/trace.h>
+
+#define TRACE_SOURCE &trace_acme
 
 #if defined(HAVE_ACME)
 
+static void acme_trace(enum trace_level level, uint64_t mask, const struct trace_source *src,
+                       const struct ist where, const struct ist func,
+                       const void *a1, const void *a2, const void *a3, const void *a4);
+
+static const struct trace_event acme_trace_events[] = {
+	{ .mask = ACME_EV_SCHED,            .name = "acme_sched",            .desc = "Wakeup scheduled ACME task" },
+	{ .mask = ACME_EV_NEW,              .name = "acme_new",              .desc = "New ACME task" },
+	{ .mask = ACME_EV_TASK,             .name = "acme_task",             .desc = "ACME task" },
+	{ }
+};
+
+
+static const struct name_desc acme_trace_lockon_args[4] = {
+	/* arg1 */ { .name="acme_ctx", .desc="ACME context" },
+	/* arg2 */ { },
+	/* arg3 */ { },
+	/* arg4 */ { }
+};
+
+static const struct name_desc acme_trace_decoding[] = {
+	{ .name="clean",    .desc="only user-friendly stuff, generally suitable for level \"user\"" },
+	{ .name="minimal",  .desc="report only conn, no real decoding" },
+	{ .name="simple",   .desc="add error messages" },
+	{ .name="advanced", .desc="add handshake-related details" },
+	{ .name="complete", .desc="add full data dump when available" },
+	{ /* end */ }
+};
+
+
+struct trace_source trace_acme = {
+	.name = IST("acme"),
+	.desc = "ACME",
+	.arg_def = TRC_ARG_PRIV,
+	.default_cb = acme_trace,
+	.known_events = acme_trace_events,
+	.lockon_args = acme_trace_lockon_args,
+	.decoding = acme_trace_decoding,
+	.report_events = ~0,  /* report everything by default */
+};
+
+INITCALL1(STG_REGISTER, trace_register_source, &trace_acme);
+
+static void acme_trace(enum trace_level level, uint64_t mask, const struct trace_source *src,
+                      const struct ist where, const struct ist func,
+                      const void *a1, const void *a2, const void *a3, const void *a4)
+{
+	const struct acme_ctx *ctx = a1;
+
+	if (src->verbosity <= ACME_VERB_CLEAN)
+		return;
+
+	chunk_appendf(&trace_buf, " :");
+
+	if (mask >= ACME_EV_NEW)
+		chunk_appendf(&trace_buf, " acme_ctx=%p", ctx);
+
+
+	if (mask == ACME_EV_NEW)
+		chunk_appendf(&trace_buf, ", crt=%s", ctx->store->path);
+
+	if (mask >= ACME_EV_TASK) {
+
+		switch (ctx->http_state) {
+			case ACME_HTTP_REQ:
+				chunk_appendf(&trace_buf, ", http_st: ACME_HTTP_REQ");
+			break;
+			case ACME_HTTP_RES:
+				chunk_appendf(&trace_buf, ", http_st: ACME_HTTP_RES");
+			break;
+		}
+		chunk_appendf(&trace_buf, ", st: ");
+		switch (ctx->state) {
+			case ACME_RESOURCES:      chunk_appendf(&trace_buf, "ACME_RESOURCES");    break;
+			case ACME_NEWNONCE:       chunk_appendf(&trace_buf, "ACME_NEWNONCE");     break;
+			case ACME_CHKACCOUNT:     chunk_appendf(&trace_buf, "ACME_CHKACCOUNT");   break;
+			case ACME_NEWACCOUNT:     chunk_appendf(&trace_buf, "ACME_NEWACCOUNT");   break;
+			case ACME_NEWORDER:       chunk_appendf(&trace_buf, "ACME_NEWORDER");     break;
+			case ACME_AUTH:           chunk_appendf(&trace_buf, "ACME_AUTH");         break;
+			case ACME_CHALLENGE:      chunk_appendf(&trace_buf, "ACME_CHALLENGE");    break;
+			case ACME_CHKCHALLENGE:   chunk_appendf(&trace_buf, "ACME_CHKCHALLENGE"); break;
+			case ACME_FINALIZE:       chunk_appendf(&trace_buf, "ACME_FINALIZE");     break;
+			case ACME_CHKORDER:       chunk_appendf(&trace_buf, "ACME_CHKORDER");     break;
+			case ACME_CERTIFICATE:    chunk_appendf(&trace_buf, "ACME_CERTIFICATE");  break;
+			case ACME_END:            chunk_appendf(&trace_buf, "ACME_END");          break;
+		}
+	}
+	if (mask & (ACME_EV_REQ|ACME_EV_RES)) {
+		const struct ist *url = a2;
+		const struct buffer *buf = a3;
+
+		if (mask & ACME_EV_REQ)
+			chunk_appendf(&trace_buf, " url: %.*s", (int)url->len, url->ptr);
+
+		if (src->verbosity >= ACME_VERB_COMPLETE && level >= TRACE_LEVEL_DATA) {
+			chunk_appendf(&trace_buf, " Buffer Dump:\n");
+			chunk_appendf(&trace_buf, "%.*s", (int)buf->data, buf->area);
+		}
+	}
+}
 
 struct mt_list acme_tasks = MT_LIST_HEAD_INIT(acme_tasks);
 
@@ -88,7 +190,7 @@ struct acme_cfg *new_acme_cfg(const char *name)
 	/* 0 on the linenum just mean it was not initialized yet */
 	ret->linenum = 0;
 
-	ret->challenge = strdup("HTTP-01"); /* default value */
+	ret->challenge = strdup("http-01"); /* default value */
 
 	/* The default generated keys are EC-384 */
 	ret->key.type = EVP_PKEY_EC;
@@ -306,8 +408,8 @@ static int cfg_parse_acme_kws(char **args, int section_type, struct proxy *curpx
 			goto out;
 		}
 	} else if (strcmp(args[0], "challenge") == 0) {
-		if ((!*args[1]) ||  (strcmp("HTTP-01", args[1]) != 0 && (strcmp("DNS-01", args[1]) != 0))) {
-			ha_alert("parsing [%s:%d]: keyword '%s' in '%s' section requires a challenge type: HTTP-01 or DNS-01\n", file, linenum, args[0], cursection);
+		if ((!*args[1]) ||  (strcasecmp("http-01", args[1]) != 0 && (strcasecmp("dns-01", args[1]) != 0))) {
+			ha_alert("parsing [%s:%d]: keyword '%s' in '%s' section requires a challenge type: http-01 or dns-01\n", file, linenum, args[0], cursection);
 			err_code |= ERR_ALERT | ERR_FATAL;
 			goto out;
 		}
@@ -337,11 +439,100 @@ static int cfg_parse_acme_kws(char **args, int section_type, struct proxy *curpx
 			ha_alert("parsing [%s:%d]: out of memory.\n", file, linenum);
 			goto out;
 		}
+	} else if (strcmp(args[0], "reuse-key") == 0) {
+		if (!*args[1]) {
+			ha_alert("parsing [%s:%d]: keyword '%s' in '%s' section requires an argument\n", file, linenum, args[0], cursection);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+		if (alertif_too_many_args(1, file, linenum, args, &err_code))
+			goto out;
+
+		if (strcmp(args[1], "on") == 0) {
+			cur_acme->reuse_key = 1;
+		} else if (strcmp(args[1], "off") == 0) {
+			cur_acme->reuse_key = 0;
+		} else {
+			err_code |= ERR_ALERT | ERR_FATAL;
+			ha_alert("parsing [%s:%d]: keyword '%s' in '%s' section requires either the 'on' or 'off' parameter\n", file, linenum, args[0], cursection);
+			goto out;
+		}
 	} else if (*args[0] != 0) {
 		ha_alert("parsing [%s:%d]: unknown keyword '%s' in '%s' section\n", file, linenum, args[0], cursection);
 		err_code |= ERR_ALERT | ERR_FATAL;
 		goto out;
 	}
+out:
+	free(errmsg);
+	return err_code;
+}
+
+
+/* parsing "acme-provider" and "acme-vars" and add escaping of double quotes */
+static int cfg_parse_acme_vars_provider(char **args, int section_type, struct proxy *curpx, const struct proxy *defpx,
+                                        const char *file, int linenum, char **err)
+{
+	int err_code = 0;
+	char *errmsg = NULL;
+	char **dst = NULL;
+	char *src = args[1];
+	char *tmp = NULL;
+	int i = 0;
+	int len;
+
+	if (strcmp(args[0], "acme-vars") == 0) {
+		dst = &cur_acme->vars;
+	} else if (strcmp(args[0], "provider-name") == 0) {
+		dst = &cur_acme->provider;
+	} else {
+		err_code |= ERR_ALERT | ERR_FATAL;
+		ha_alert("parsing [%s:%d]: unsupported keyword '%s'.\n", file, linenum, args[0]);
+		goto out;
+	}
+
+	if (dst)
+		free(*dst);
+
+	if (!*args[1]) {
+		ha_alert("parsing [%s:%d]: keyword '%s' in '%s' section requires an argument\n", file, linenum, args[0], cursection);
+		err_code |= ERR_ALERT | ERR_FATAL;
+		goto out;
+	}
+	if (alertif_too_many_args(1, file, linenum, args, &err_code))
+		goto out;
+
+	len = strlen(src);
+	tmp = malloc(len + 1);
+	if (!tmp)
+		goto vars_end;
+
+	/* escape the " character */
+	while (*src) {
+		if (*src == '"') {
+			char *tmp2 = NULL;
+
+			len++;
+			tmp2 = realloc(tmp, len + 1);
+			if (!tmp2) {
+				ha_free(&tmp);
+				goto vars_end;
+			}
+			tmp = tmp2;
+			tmp[i++] = '\\'; /* add escaping */
+		}
+		tmp[i++] = *src;
+		src++;
+	}
+	tmp[i] = '\0';
+
+vars_end:
+	*dst = tmp;
+	if (!*dst) {
+		err_code |= ERR_ALERT | ERR_FATAL;
+		ha_alert("parsing [%s:%d]: out of memory.\n", file, linenum);
+		goto out;
+	}
+
 out:
 	free(errmsg);
 	return err_code;
@@ -443,7 +634,6 @@ error:
 /* Initialize stuff once the section is parsed */
 static int cfg_postsection_acme()
 {
-	struct acme_cfg *cur_acme = acme_cfgs;
 	struct ckch_store *store;
 	EVP_PKEY *key = NULL;
 	BIO *bio = NULL;
@@ -579,6 +769,7 @@ static int cfg_postparser_acme()
 		if (!task) {
 			ret++;
 			ha_alert("acme: couldn't start the scheduler!\n");
+			goto end;
 		}
 		task->nice = 0;
 		task->process = acme_scheduler;
@@ -586,6 +777,7 @@ static int cfg_postparser_acme()
 		task_wakeup(task, TASK_WOKEN_INIT);
 	}
 
+end:
 	return ret;
 }
 
@@ -603,6 +795,8 @@ void deinit_acme()
 		ha_free(&acme_cfgs->account.contact);
 		ha_free(&acme_cfgs->account.file);
 		ha_free(&acme_cfgs->account.thumbprint);
+		ha_free(&acme_cfgs->vars);
+		ha_free(&acme_cfgs->provider);
 
 		free(acme_cfgs);
 		acme_cfgs = next;
@@ -618,6 +812,9 @@ static struct cfg_kw_list cfg_kws_acme = {ILH, {
 	{ CFG_ACME, "bits",  cfg_parse_acme_cfg_key },
 	{ CFG_ACME, "curves",  cfg_parse_acme_cfg_key },
 	{ CFG_ACME, "map",  cfg_parse_acme_kws },
+	{ CFG_ACME, "reuse-key",  cfg_parse_acme_kws },
+	{ CFG_ACME, "acme-vars",  cfg_parse_acme_vars_provider },
+	{ CFG_ACME, "provider-name",  cfg_parse_acme_vars_provider },
 	{ CFG_GLOBAL, "acme.scheduler", cfg_parse_global_acme_sched },
 	{ 0, NULL, NULL },
 }};
@@ -639,9 +836,9 @@ static void acme_ctx_destroy(struct acme_ctx *ctx)
 	if (!ctx)
 		return;
 
-	istfree(&ctx->ressources.newNonce);
-	istfree(&ctx->ressources.newAccount);
-	istfree(&ctx->ressources.newOrder);
+	istfree(&ctx->resources.newNonce);
+	istfree(&ctx->resources.newAccount);
+	istfree(&ctx->resources.newOrder);
 	istfree(&ctx->nonce);
 	istfree(&ctx->kid);
 	istfree(&ctx->order);
@@ -652,6 +849,7 @@ static void acme_ctx_destroy(struct acme_ctx *ctx)
 
 		istfree(&auth->auth);
 		istfree(&auth->chall);
+		istfree(&auth->token);
 		istfree(&auth->token);
 		next = auth->next;
 		free(auth);
@@ -665,7 +863,6 @@ static void acme_ctx_destroy(struct acme_ctx *ctx)
 
 	X509_REQ_free(ctx->req);
 
-	MT_LIST_DELETE(&ctx->el);
 
 	free(ctx);
 }
@@ -787,6 +984,43 @@ error:
 	return 1;
 
 }
+
+/*
+ * compute a TXT record for dns-01 challenge
+ *  base64url(sha256(token || '.' || base64url(Thumbprint(accountKey))))
+ *
+ *  https://datatracker.ietf.org/doc/html/rfc8555/#section-8.4
+ *
+ */
+unsigned int acme_txt_record(const struct ist thumbprint, const struct ist token, struct buffer *output)
+{
+	unsigned char md[EVP_MAX_MD_SIZE];
+	struct buffer *tmp = NULL;
+	unsigned int size;
+	int ret = 0;
+
+
+	if ((tmp = alloc_trash_chunk()) == NULL)
+		goto out;
+
+	chunk_istcat(tmp, token);
+	chunk_appendf(tmp, ".");
+	chunk_istcat(tmp, thumbprint);
+
+	if (EVP_Digest(tmp->area, tmp->data, md, &size, EVP_sha256(), NULL) == 0)
+		goto out;
+
+	ret = a2base64url((const char *)md, size, output->area, output->size);
+	if (ret < 0)
+		ret = 0;
+	output->data = ret;
+
+out:
+	free_trash_chunk(tmp);
+
+	return ret;
+}
+
 
 int acme_jws_payload(struct buffer *req, struct ist nonce, struct ist url, EVP_PKEY *pkey, struct ist kid, struct buffer *output, char **errmsg)
 {
@@ -930,6 +1164,8 @@ int acme_res_certificate(struct task *task, struct acme_ctx *ctx, char **errmsg)
 		}
 	}
 
+	TRACE_DATA(__FUNCTION__, ACME_EV_RES, ctx, NULL, &hc->res.buf);
+
 	if (hc->res.status < 200 || hc->res.status >= 300) {
 		if ((ret = mjson_get_string(hc->res.buf.area, hc->res.buf.data, "$.detail", t1->area, t1->size)) > -1)
 			t1->data = ret;
@@ -1000,6 +1236,8 @@ int acme_res_chkorder(struct task *task, struct acme_ctx *ctx, char **errmsg)
 			ctx->retryafter = atol(hdr->v.ptr);
 		}
 	}
+
+	TRACE_DATA(__FUNCTION__, ACME_EV_RES, ctx, NULL, &hc->res.buf);
 
 	if (hc->res.status < 200 || hc->res.status >= 300) {
 		if ((ret = mjson_get_string(hc->res.buf.area, hc->res.buf.data, "$.detail", t1->area, t1->size)) > -1)
@@ -1079,7 +1317,7 @@ int acme_req_finalize(struct task *task, struct acme_ctx *ctx, char **errmsg)
 	csr->data = ret;
 
 	chunk_printf(req_in, "{ \"csr\": \"%.*s\" }", (int)csr->data, csr->area);
-	free(data);
+	OPENSSL_free(data);
 
 
 	if (acme_jws_payload(req_in, ctx->nonce, ctx->finalize, ctx->cfg->account.pkey, ctx->kid, req_out, errmsg) != 0)
@@ -1130,6 +1368,8 @@ int acme_res_finalize(struct task *task, struct acme_ctx *ctx, char **errmsg)
 		}
 	}
 
+	TRACE_DATA(__FUNCTION__, ACME_EV_RES, ctx, NULL, &hc->res.buf);
+
 	if (hc->res.status < 200 || hc->res.status >= 300) {
 		if ((ret = mjson_get_string(hc->res.buf.area, hc->res.buf.data, "$.detail", t1->area, t1->size)) > -1)
 			t1->data = ret;
@@ -1174,8 +1414,12 @@ int acme_req_challenge(struct task *task, struct acme_ctx *ctx, struct acme_auth
 
 	chunk_printf(req_in, "{}");
 
+	TRACE_DATA("REQ challenge dec", ACME_EV_REQ, ctx, &auth->chall, req_in);
+
 	if (acme_jws_payload(req_in, ctx->nonce, auth->chall, ctx->cfg->account.pkey, ctx->kid, req_out, errmsg) != 0)
 		goto error;
+
+	TRACE_DATA("REQ challenge enc", ACME_EV_REQ, ctx, &auth->chall, req_out);
 
 	if (acme_http_req(task, ctx, auth->chall, HTTP_METH_POST, hdrs, ist2(req_out->area, req_out->data)))
 		goto error;
@@ -1211,6 +1455,8 @@ enum acme_ret acme_res_challenge(struct task *task, struct acme_ctx *ctx, struct
 
 	hdrs = hc->res.hdrs;
 
+	TRACE_DATA(__FUNCTION__, ACME_EV_RES, ctx, NULL, &hc->res.buf);
+
 	for (hdr = hdrs; isttest(hdr->v); hdr++) {
 		if (isteqi(hdr->n, ist("Replay-Nonce"))) {
 			istfree(&ctx->nonce);
@@ -1230,7 +1476,7 @@ enum acme_ret acme_res_challenge(struct task *task, struct acme_ctx *ctx, struct
 	}
 	trash.data = res;
 
-	if (strncasecmp("pending", trash.area, trash.data) == 0) {
+	if (strncasecmp("pending", trash.area, trash.data) == 0 || strncasecmp("processing", trash.area, trash.data) == 0) {
 		if (chk) { /* during challenge chk */
 			memprintf(errmsg, "challenge status: %.*s", (int)trash.data, trash.area);
 			ret = ACME_RET_RETRY;
@@ -1241,14 +1487,8 @@ enum acme_ret acme_res_challenge(struct task *task, struct acme_ctx *ctx, struct
 		}
 	}
 
-	/* during challenge check */
 	if (strncasecmp("valid", trash.area, trash.data) == 0) {
 		ret = ACME_RET_OK;
-		goto out;
-	}
-	if (strncasecmp("processing", trash.area, trash.data) == 0) {
-		memprintf(errmsg, "challenge status: %.*s", (int)trash.data, trash.area);
-		ret = ACME_RET_RETRY;
 		goto out;
 	}
 
@@ -1274,11 +1514,8 @@ out:
 	return ret;
 }
 
-
-/*
- * Get an Auth URL
- */
-int acme_req_auth(struct task *task, struct acme_ctx *ctx, struct acme_auth *auth, char **errmsg)
+/* generate a POST-as-GET request */
+int acme_post_as_get(struct task *task, struct acme_ctx *ctx, struct ist url, char **errmsg)
 {
 	struct buffer *req_in = NULL;
 	struct buffer *req_out = NULL;
@@ -1289,26 +1526,40 @@ int acme_req_auth(struct task *task, struct acme_ctx *ctx, struct acme_auth *aut
 	int ret = 1;
 
         if ((req_in = alloc_trash_chunk()) == NULL)
-		goto error;
+		goto error_alloc;
         if ((req_out = alloc_trash_chunk()) == NULL)
-		goto error;
+		goto error_alloc;
+
+	TRACE_USER("POST-as-GET    ", ACME_EV_REQ, ctx, &url);
 
 	/* empty payload */
-	if (acme_jws_payload(req_in, ctx->nonce, auth->auth, ctx->cfg->account.pkey, ctx->kid, req_out, errmsg) != 0)
-		goto error;
+	if (acme_jws_payload(req_in, ctx->nonce, url, ctx->cfg->account.pkey, ctx->kid, req_out, errmsg) != 0)
+		goto error_jws;
 
-	if (acme_http_req(task, ctx, auth->auth, HTTP_METH_POST, hdrs, ist2(req_out->area, req_out->data)))
-		goto error;
+	TRACE_DATA("POST-as-GET enc", ACME_EV_REQ, ctx, &url, req_out);
+
+	if (acme_http_req(task, ctx, url, HTTP_METH_POST, hdrs, ist2(req_out->area, req_out->data)))
+		goto error_http;
 
 	ret = 0;
-error:
-	memprintf(errmsg, "couldn't generate the Authorizations request");
 
+error_jws:
+	memprintf(errmsg, "couldn't generate the JWS token: %s", errmsg ? *errmsg : "");
+	goto end;
+
+error_http:
+	memprintf(errmsg, "couldn't generate the http request");
+	goto end;
+
+error_alloc:
+	memprintf(errmsg, "couldn't allocate memory");
+	goto end;
+
+end:
 	free_trash_chunk(req_in);
 	free_trash_chunk(req_out);
 
 	return ret;
-
 }
 
 int acme_res_auth(struct task *task, struct acme_ctx *ctx, struct acme_auth *auth, char **errmsg)
@@ -1341,6 +1592,7 @@ int acme_res_auth(struct task *task, struct acme_ctx *ctx, struct acme_auth *aut
 		}
 
 	}
+	TRACE_DATA(__FUNCTION__, ACME_EV_RES, ctx, NULL, &hc->res.buf);
 
 	if (hc->res.status < 200 || hc->res.status >= 300) {
 		/* XXX: need a generic URN error parser */
@@ -1354,6 +1606,23 @@ int acme_res_auth(struct task *task, struct acme_ctx *ctx, struct acme_auth *aut
 			memprintf(errmsg, "invalid HTTP status code %d when getting Authorization URL", hc->res.status);
 		goto error;
 	}
+
+	/* check and save the DNS entry */
+	ret = mjson_get_string(hc->res.buf.area, hc->res.buf.data, "$.identifier.type", t1->area, t1->size);
+	if (ret == -1) {
+		memprintf(errmsg, "couldn't get a type \"dns\" from Authorization URL \"%s\"", auth->auth.ptr);
+		goto error;
+	}
+	t1->data = ret;
+
+	ret = mjson_get_string(hc->res.buf.area, hc->res.buf.data, "$.identifier.value", t2->area, t2->size);
+	if (ret == -1) {
+		memprintf(errmsg, "couldn't get a type \"dns\" from Authorization URL \"%s\"", auth->auth.ptr);
+		goto error;
+	}
+	t2->data = ret;
+
+	auth->dns = istdup(ist2(t2->area, t2->data));
 
 	/* get the multiple challenges and select the one from the configuration */
 	for (i = 0; ; i++) {
@@ -1404,6 +1673,46 @@ int acme_res_auth(struct task *task, struct acme_ctx *ctx, struct acme_auth *aut
 			goto error;
 		}
 
+		/* compute a response for the TXT entry */
+		if (strcasecmp(ctx->cfg->challenge, "dns-01") == 0) {
+			struct sink *dpapi;
+			struct ist line[13];
+			int nmsg = 0;
+
+			if (acme_txt_record(ist(ctx->cfg->account.thumbprint), auth->token, &trash) == 0) {
+				memprintf(errmsg, "couldn't compute the dns-01 challenge");
+				goto error;
+			}
+
+			send_log(NULL, LOG_NOTICE,"acme: %s: dns-01 requires to set the \"_acme-challenge.%.*s\" TXT record to \"%.*s\" and use the \"acme challenge_ready\" command over the CLI\n",
+			                                             ctx->store->path, (int)auth->dns.len, auth->dns.ptr, (int)trash.data, trash.area);
+
+			/* dump to the "dpapi" sink */
+			line[nmsg++] = ist("acme deploy ");
+			line[nmsg++] = ist(ctx->store->path);
+			line[nmsg++] = ist(" thumbprint ");
+			line[nmsg++] = ist(ctx->cfg->account.thumbprint);
+			line[nmsg++] = ist("\n");
+
+			if (ctx->cfg->provider) {
+				line[nmsg++] = ist("provider-name \"");
+				line[nmsg++] = ist(ctx->cfg->provider);
+				line[nmsg++] = ist("\"\n");
+			}
+			if (ctx->cfg->vars) {
+				line[nmsg++] = ist("acme-vars \"");
+				line[nmsg++] = ist(ctx->cfg->vars);
+				line[nmsg++] = ist("\"\n");
+			}
+			line[nmsg++] = ist2( hc->res.buf.area, hc->res.buf.data); /* dump the HTTP response */
+			line[nmsg++] = ist("\n\0");
+
+			dpapi = sink_find("dpapi");
+			if (dpapi)
+				sink_write(dpapi, LOG_HEADER_NONE, 0, line, nmsg);
+		}
+
+		/* only useful for http-01 */
 		if (acme_add_challenge_map(ctx->cfg->map, auth->token.ptr, ctx->cfg->account.thumbprint, errmsg) != 0) {
 			memprintf(errmsg, "couldn't add the token to the '%s' map: %s", ctx->cfg->map, *errmsg);
 			goto error;
@@ -1454,11 +1763,14 @@ int acme_req_neworder(struct task *task, struct acme_ctx *ctx, char **errmsg)
 
 	chunk_appendf(req_in, " ] }");
 
+	TRACE_DATA("NewOrder Decode", ACME_EV_REQ, ctx, &ctx->resources.newOrder, req_in);
 
-	if (acme_jws_payload(req_in, ctx->nonce, ctx->ressources.newOrder, ctx->cfg->account.pkey, ctx->kid, req_out, errmsg) != 0)
+
+	if (acme_jws_payload(req_in, ctx->nonce, ctx->resources.newOrder, ctx->cfg->account.pkey, ctx->kid, req_out, errmsg) != 0)
 		goto error;
 
-	if (acme_http_req(task, ctx, ctx->ressources.newOrder, HTTP_METH_POST, hdrs, ist2(req_out->area, req_out->data)))
+	TRACE_DATA("NewOrder JWS    ", ACME_EV_REQ, ctx, &ctx->resources.newOrder, req_out);
+	if (acme_http_req(task, ctx, ctx->resources.newOrder, HTTP_METH_POST, hdrs, ist2(req_out->area, req_out->data)))
 		goto error;
 
 	ret = 0;
@@ -1506,6 +1818,7 @@ int acme_res_neworder(struct task *task, struct acme_ctx *ctx, char **errmsg)
 			ctx->order = istdup(hdr->v);
 		}
 	}
+	TRACE_DATA(__FUNCTION__, ACME_EV_RES, ctx, NULL, &hc->res.buf);
 
 	if (hc->res.status < 200 || hc->res.status >= 300) {
 		if ((ret = mjson_get_string(hc->res.buf.area, hc->res.buf.data, "$.detail", t1->area, t1->size)) > -1)
@@ -1548,6 +1861,11 @@ int acme_res_neworder(struct task *task, struct acme_ctx *ctx, char **errmsg)
 			memprintf(errmsg, "out of memory");
 			goto error;
 		}
+
+                /* if the challenge is not dns-01, consider that the challenge
+                 * is ready because computed by HAProxy */
+                if (strcasecmp(ctx->cfg->challenge, "dns-01") != 0)
+			auth->ready = 1;
 
 		auth->next = ctx->auths;
 		ctx->auths = auth;
@@ -1609,10 +1927,12 @@ int acme_req_account(struct task *task, struct acme_ctx *ctx, int newaccount, ch
 	else
 		chunk_printf(req_in, "%s", accountreq);
 
-	if (acme_jws_payload(req_in, ctx->nonce, ctx->ressources.newAccount, ctx->cfg->account.pkey, ctx->kid, req_out, errmsg) != 0)
+	TRACE_DATA("newAccount Decoded", ACME_EV_REQ, ctx, &ctx->resources.newAccount, req_in);
+
+	if (acme_jws_payload(req_in, ctx->nonce, ctx->resources.newAccount, ctx->cfg->account.pkey, ctx->kid, req_out, errmsg) != 0)
 		goto error;
 
-	if (acme_http_req(task, ctx, ctx->ressources.newAccount, HTTP_METH_POST, hdrs, ist2(req_out->area, req_out->data)))
+	if (acme_http_req(task, ctx, ctx->resources.newAccount, HTTP_METH_POST, hdrs, ist2(req_out->area, req_out->data)))
 		goto error;
 
 	ret = 0;
@@ -1657,6 +1977,8 @@ int acme_res_account(struct task *task, struct acme_ctx *ctx, int newaccount, ch
 			ctx->nonce = istdup(hdr->v);
 		}
 	}
+
+	TRACE_DATA(__FUNCTION__, ACME_EV_RES, ctx, NULL, &hc->res.buf);
 
 	if (hc->res.status < 200 || hc->res.status >= 300) {
 		if ((ret = mjson_get_string(hc->res.buf.area, hc->res.buf.data, "$.detail", t1->area, t1->size)) > -1)
@@ -1704,6 +2026,8 @@ int acme_nonce(struct task *task, struct acme_ctx *ctx, char **errmsg)
 		goto error;
 	}
 
+	TRACE_DATA(__FUNCTION__, ACME_EV_RES, ctx, NULL, &hc->res.buf);
+
 	hdrs = hc->res.hdrs;
 
 	for (hdr = hdrs; isttest(hdr->v); hdr++) {
@@ -1742,12 +2066,14 @@ int acme_directory(struct task *task, struct acme_ctx *ctx, char **errmsg)
 		goto error;
 	}
 
+	TRACE_DATA(__FUNCTION__, ACME_EV_RES, ctx, NULL, &hc->res.buf);
+
 	if ((ret = mjson_get_string(hc->res.buf.area, hc->res.buf.data, "$.newNonce", trash.area, trash.size)) <= 0) {
 		memprintf(errmsg, "couldn't get newNonce URL from the directory URL");
 		goto error;
 	}
-	ctx->ressources.newNonce = istdup(ist2(trash.area, ret));
-	if (!isttest(ctx->ressources.newNonce)) {
+	ctx->resources.newNonce = istdup(ist2(trash.area, ret));
+	if (!isttest(ctx->resources.newNonce)) {
 		memprintf(errmsg, "couldn't get newNonce URL from the directory URL");
 		goto error;
 	}
@@ -1756,8 +2082,8 @@ int acme_directory(struct task *task, struct acme_ctx *ctx, char **errmsg)
 		memprintf(errmsg, "couldn't get newAccount URL from the directory URL");
 		goto error;
 	}
-	ctx->ressources.newAccount = istdup(ist2(trash.area, ret));
-	if (!isttest(ctx->ressources.newAccount)) {
+	ctx->resources.newAccount = istdup(ist2(trash.area, ret));
+	if (!isttest(ctx->resources.newAccount)) {
 		memprintf(errmsg, "couldn't get newAccount URL from the directory URL");
 		goto error;
 	}
@@ -1765,8 +2091,8 @@ int acme_directory(struct task *task, struct acme_ctx *ctx, char **errmsg)
 		memprintf(errmsg, "couldn't get newOrder URL from the directory URL");
 		goto error;
 	}
-	ctx->ressources.newOrder = istdup(ist2(trash.area, ret));
-	if (!isttest(ctx->ressources.newOrder)) {
+	ctx->resources.newOrder = istdup(ist2(trash.area, ret));
+	if (!isttest(ctx->resources.newOrder)) {
 		memprintf(errmsg, "couldn't get newOrder URL from the directory URL");
 		goto error;
 	}
@@ -1775,7 +2101,7 @@ int acme_directory(struct task *task, struct acme_ctx *ctx, char **errmsg)
 	ctx->hc = NULL;
 
 //	fprintf(stderr, "newNonce: %s\nnewAccount: %s\nnewOrder: %s\n",
-//	        ctx->ressources.newNonce.ptr, ctx->ressources.newAccount.ptr, ctx->ressources.newOrder.ptr);
+//	        ctx->resources.newNonce.ptr, ctx->resources.newAccount.ptr, ctx->resources.newOrder.ptr);
 
 	return 0;
 
@@ -1783,9 +2109,9 @@ error:
 	httpclient_destroy(hc);
 	ctx->hc = NULL;
 
-	istfree(&ctx->ressources.newNonce);
-	istfree(&ctx->ressources.newAccount);
-	istfree(&ctx->ressources.newOrder);
+	istfree(&ctx->resources.newNonce);
+	istfree(&ctx->resources.newAccount);
+	istfree(&ctx->resources.newOrder);
 
 	return 1;
 }
@@ -1805,9 +2131,10 @@ struct task *acme_process(struct task *task, void *context, unsigned int state)
 	struct mt_list tmp = MT_LIST_LOCK_FULL(&ctx->el);
 
 re:
+	TRACE_USER("ACME Task Handle", ACME_EV_TASK, ctx, &st);
 
 	switch (st) {
-		case ACME_RESSOURCES:
+		case ACME_RESOURCES:
 			if (http_st == ACME_HTTP_REQ) {
 				if (acme_http_req(task, ctx, ist(ctx->cfg->directory), HTTP_METH_GET, NULL, IST_NULL) != 0)
 					goto retry;
@@ -1823,7 +2150,7 @@ re:
 		break;
 		case ACME_NEWNONCE:
 			if (http_st == ACME_HTTP_REQ) {
-				if (acme_http_req(task, ctx, ctx->ressources.newNonce, HTTP_METH_HEAD, NULL, IST_NULL) != 0)
+				if (acme_http_req(task, ctx, ctx->resources.newNonce, HTTP_METH_HEAD, NULL, IST_NULL) != 0)
 					goto retry;
 			}
 			if (http_st == ACME_HTTP_RES) {
@@ -1881,7 +2208,7 @@ re:
 		break;
 		case ACME_AUTH:
 			if (http_st == ACME_HTTP_REQ) {
-				if (acme_req_auth(task, ctx, ctx->next_auth, &errmsg) != 0)
+				if (acme_post_as_get(task, ctx, ctx->next_auth->auth, &errmsg) != 0)
 					goto retry;
 			}
 			if (http_st == ACME_HTTP_RES) {
@@ -1898,6 +2225,11 @@ re:
 		break;
 		case ACME_CHALLENGE:
 			if (http_st == ACME_HTTP_REQ) {
+
+				/* if the challenge is not ready, wait to be wakeup */
+				if (!ctx->next_auth->ready)
+					goto wait;
+
 				if (acme_req_challenge(task, ctx, ctx->next_auth, &errmsg) != 0)
 					goto retry;
 			}
@@ -1922,7 +2254,7 @@ re:
 		break;
 		case ACME_CHKCHALLENGE:
 			if (http_st == ACME_HTTP_REQ) {
-				if (acme_http_req(task, ctx, ctx->next_auth->chall, HTTP_METH_GET, NULL, IST_NULL) != 0)
+				if (acme_post_as_get(task, ctx, ctx->next_auth->chall, &errmsg) != 0)
 					goto retry;
 			}
 			if (http_st == ACME_HTTP_RES) {
@@ -1957,7 +2289,7 @@ re:
 		break;
 		case ACME_CHKORDER:
 			if (http_st == ACME_HTTP_REQ) {
-				if (acme_http_req(task, ctx, ctx->order, HTTP_METH_GET, NULL, IST_NULL) != 0)
+				if (acme_post_as_get(task, ctx, ctx->order, &errmsg) != 0)
 					goto retry;
 			}
 			if (http_st == ACME_HTTP_RES) {
@@ -1970,7 +2302,7 @@ re:
 		break;
 		case ACME_CERTIFICATE:
 			if (http_st == ACME_HTTP_REQ) {
-				if (acme_http_req(task, ctx, ctx->certificate, HTTP_METH_GET, NULL, IST_NULL) != 0)
+				if (acme_post_as_get(task, ctx, ctx->certificate, &errmsg) != 0)
 					goto retry;
 			}
 			if (http_st == ACME_HTTP_RES) {
@@ -1998,6 +2330,8 @@ nextreq:
 	/* this is called when changing step in the state machine */
 	http_st = ACME_HTTP_REQ;
 	ctx->retries = ACME_RETRY; /* reinit the retries */
+	ctx->http_state = http_st;
+	ctx->state = st;
 
 	if (ctx->retryafter == 0)
 		goto re; /* optimize by not leaving the task for the next httpreq to init */
@@ -2005,8 +2339,6 @@ nextreq:
 	/* if we have a retryafter, wait before next request (usually finalize) */
 	task->expire = tick_add(now_ms, ctx->retryafter * 1000);
 	ctx->retryafter = 0;
-	ctx->http_state = http_st;
-	ctx->state = st;
 
 	MT_LIST_UNLOCK_FULL(&ctx->el, tmp);
 	return task;
@@ -2047,51 +2379,33 @@ abort:
 	ha_free(&errmsg);
 
 end:
-	MT_LIST_UNLOCK_FULL(&ctx->el, tmp);
 	acme_del_acme_ctx_map(ctx);
+	/* unlink ctx from the mtlist then destroy */
+	mt_list_unlock_link(tmp);
+	mt_list_unlock_self(&ctx->el);
 	acme_ctx_destroy(ctx);
 	task_destroy(task);
 	task = NULL;
 
 	return task;
-}
 
-/*
- * Return 1 if the certificate must be regenerated
- * Check if the notAfter date will append in (validity period / 12) or 7 days per default
- */
-int acme_will_expire(struct ckch_store *store)
-{
-	int diff = 0;
-	time_t notAfter = 0;
-	time_t notBefore = 0;
+wait:
+	/* wait for a task_wakeup */
+	ctx->http_state = ACME_HTTP_REQ;
+	ctx->state = st;
+	task->expire = TICK_ETERNITY;
 
-	/* compute the validity period of the leaf certificate */
-	if (!store->data || !store->data->cert)
-		return 0;
-
-	notAfter = x509_get_notafter_time_t(store->data->cert);
-	notBefore = x509_get_notbefore_time_t(store->data->cert);
-
-	if (notAfter >= 0 && notBefore >= 0) {
-		diff = (notAfter - notBefore) / 12; /* validity period / 12 */
-	} else {
-		diff = 7 * 24 * 60 * 60; /* default to 7 days */
-	}
-
-	if (date.tv_sec + diff > notAfter)
-		return 1;
-
-	return 0;
+	MT_LIST_UNLOCK_FULL(&ctx->el, tmp);
+	return task;
 }
 
 /*
  * Return when the next task is scheduled
  * Check if the notAfter date will happen in (validity period / 12) or 7 days per default
  */
-time_t acme_schedule_date(struct ckch_store *store)
+static time_t acme_schedule_date(struct ckch_store *store)
 {
-	int diff = 0;
+	time_t diff = 0;
 	time_t notAfter = 0;
 	time_t notBefore = 0;
 
@@ -2105,13 +2419,34 @@ time_t acme_schedule_date(struct ckch_store *store)
 	notAfter = x509_get_notafter_time_t(store->data->cert);
 	notBefore = x509_get_notbefore_time_t(store->data->cert);
 
-	if (notAfter >= 0 && notBefore >= 0) {
+	if ((notAfter >= 0 && notBefore >= 0)
+	   && (notAfter > notBefore)) {
 		diff = (notAfter - notBefore) / 12; /* validity period / 12 */
 	} else {
 		diff = 7 * 24 * 60 * 60; /* default to 7 days */
 	}
 
 	return (notAfter - diff);
+}
+
+/*
+ * Return 1 if the certificate must be regenerated
+ * Check if the notAfter date will append in (validity period / 12) or 7 days per default
+ */
+static int acme_will_expire(struct ckch_store *store)
+{
+	time_t notAfter = 0;
+
+	/* compute the validity period of the leaf certificate */
+	if (!store->data || !store->data->cert)
+		return 0;
+
+	notAfter = acme_schedule_date(store);
+
+	if (notAfter <= date.tv_sec)
+		return 1;
+
+	return 0;
 }
 
 /* Does the scheduling of the ACME tasks
@@ -2132,6 +2467,7 @@ struct task *acme_scheduler(struct task *task, void *context, unsigned int state
 		if (store->conf.acme.id) {
 
 			if (acme_will_expire(store)) {
+				TRACE_USER("ACME Scheduling start", ACME_EV_SCHED);
 				if (acme_start_task(store, &errmsg) != 0) {
 					send_log(NULL, LOG_NOTICE,"acme: %s: %s Aborting.\n", store->path, errmsg ? errmsg : "");
 					ha_free(&errmsg);
@@ -2304,12 +2640,14 @@ static int acme_start_task(struct ckch_store *store, char **errmsg)
 	/* set the number of remaining retries when facing an error */
 	ctx->retries = ACME_RETRY;
 
-	if ((pkey = acme_EVP_PKEY_gen(cfg->key.type, cfg->key.curves, cfg->key.bits, errmsg)) == NULL)
-		goto err;
+	if (!cfg->reuse_key) {
+		if ((pkey = acme_EVP_PKEY_gen(cfg->key.type, cfg->key.curves, cfg->key.bits, errmsg)) == NULL)
+			goto err;
 
-	EVP_PKEY_free(newstore->data->key);
-	newstore->data->key = pkey;
-	pkey = NULL;
+		EVP_PKEY_free(newstore->data->key);
+		newstore->data->key = pkey;
+		pkey = NULL;
+	}
 
 	ctx->req = acme_x509_req(newstore->data->key, store->conf.acme.domains);
 	if (!ctx->req) {
@@ -2320,12 +2658,14 @@ static int acme_start_task(struct ckch_store *store, char **errmsg)
 	ctx->store = newstore;
 	ctx->cfg = cfg;
 	task->context = ctx;
+	ctx->task = task;
 
 	MT_LIST_INIT(&ctx->el);
 	MT_LIST_APPEND(&acme_tasks, &ctx->el);
 
 	send_log(NULL, LOG_NOTICE, "acme: %s: Starting update of the certificate.\n", ctx->store->path);
 
+	TRACE_USER("ACME Task start", ACME_EV_NEW, ctx);
 	task_wakeup(task, TASK_WOKEN_INIT);
 
 	return 0;
@@ -2368,6 +2708,55 @@ static int cli_acme_renew_parse(char **args, char *payload, struct appctx *appct
 	return 0;
 err:
 	HA_SPIN_UNLOCK(CKCH_LOCK, &ckch_lock);
+	return cli_dynerr(appctx, errmsg);
+}
+
+static int cli_acme_chall_ready_parse(char **args, char *payload, struct appctx *appctx, void *private)
+{
+	char *errmsg = NULL;
+	const char *crt;
+	const char *dns;
+	struct mt_list back;
+	struct acme_ctx *ctx;
+	struct acme_auth *auth;
+	int found = 0;
+
+	if (!*args[2] && !*args[3] && !*args[4]) {
+		memprintf(&errmsg, ": not enough parameters\n");
+		goto err;
+	}
+
+	crt = args[2];
+	dns = args[4];
+
+
+	MT_LIST_FOR_EACH_ENTRY_LOCKED(ctx, &acme_tasks, el, back) {
+
+		if (strcmp(ctx->store->path, crt) != 0)
+			continue;
+
+		auth = ctx->auths;
+		while (auth) {
+			if (strncmp(dns, auth->dns.ptr, auth->dns.len) == 0) {
+				if (!auth->ready) {
+					auth->ready = 1;
+					task_wakeup(ctx->task, TASK_WOKEN_MSG);
+					found = 1;
+				} else {
+					memprintf(&errmsg, "ACME challenge for crt \"%s\" and dns \"%s\" was already READY !\n", crt, dns);
+				}
+				break;
+			}
+			auth = auth->next;
+		}
+	}
+	if (!found) {
+		memprintf(&errmsg, "Couldn't find the ACME task using crt \"%s\" and dns \"%s\" !\n", crt, dns);
+		goto err;
+	}
+
+	return cli_msg(appctx, LOG_INFO, "Challenge Ready!");
+err:
 	return cli_dynerr(appctx, errmsg);
 }
 
@@ -2453,11 +2842,17 @@ static int cli_acme_ps(char **args, char *payload, struct appctx *appctx, void *
 static struct cli_kw_list cli_kws = {{ },{
 	{ { "acme", "renew", NULL },           "acme renew <certfile>                   : renew a certificate using the ACME protocol", cli_acme_renew_parse, NULL, NULL, NULL, 0 },
 	{ { "acme", "status", NULL },          "acme status                             : show status of certificates configured with ACME", cli_acme_ps, cli_acme_status_io_handler, NULL, NULL, 0 },
+	{ { "acme", "challenge_ready", NULL }, "acme challenge_ready <certfile> domain <domain> : notify HAProxy that the ACME challenge is ready", cli_acme_chall_ready_parse, NULL, NULL, NULL, 0 },
 	{ { NULL }, NULL, NULL, NULL }
 }};
 
-
 INITCALL1(STG_REGISTER, cli_register_kw, &cli_kws);
+
+static void __acme_init(void)
+{
+	hap_register_feature("ACME");
+}
+INITCALL0(STG_REGISTER, __acme_init);
 
 #endif /* ! HAVE_ACME */
 

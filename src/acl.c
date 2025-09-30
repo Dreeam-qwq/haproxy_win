@@ -149,7 +149,7 @@ struct acl_expr *parse_acl_expr(const char **args, char **err, struct arg_list *
 	signed long long value, minor;
 	/* The following buffer contain two numbers, a ':' separator and the final \0. */
 	char buffer[NB_LLMAX_STR + 1 + NB_LLMAX_STR + 1];
-	int is_loaded;
+	int is_loaded, match_forced;
 	int unique_id;
 	char *error;
 	struct pat_ref *ref;
@@ -164,13 +164,15 @@ struct acl_expr *parse_acl_expr(const char **args, char **err, struct arg_list *
 
 	if (al) {
 		al->ctx  = ARGC_ACL;   // to report errors while resolving args late
-		al->kw   = *args;
 		al->conv = NULL;
 	}
 
 	aclkw = find_acl_kw(args[0]);
 	if (aclkw) {
 		/* OK we have a real ACL keyword */
+
+		if (al)
+			al->kw = aclkw->kw;
 
 		/* build new sample expression for this ACL */
 		smp = calloc(1, sizeof(*smp));
@@ -321,6 +323,7 @@ struct acl_expr *parse_acl_expr(const char **args, char **err, struct arg_list *
 	refflags = PAT_REF_ACL;
 	patflags = 0;
 	is_loaded = 0;
+	match_forced = 0;
 	unique_id = -1;
 	while (**args == '-') {
 		if (strcmp(*args, "-i") == 0)
@@ -360,6 +363,11 @@ struct acl_expr *parse_acl_expr(const char **args, char **err, struct arg_list *
 				memprintf(err, "'-m' must only be specified before patterns and files in parsing ACL expression");
 				goto out_free_expr;
 			}
+			if (match_forced) {
+				memprintf(err, "only one explicit matching method can be defined with '-m' parameter."
+					  " if migrating from an old version, just keep the last one");
+				goto out_free_expr;
+			}
 
 			idx = pat_find_match_name(args[1]);
 			if (idx < 0) {
@@ -377,6 +385,7 @@ struct acl_expr *parse_acl_expr(const char **args, char **err, struct arg_list *
 			expr->pat.match = pat_match_fcts[idx];
 			expr->pat.prune = pat_prune_fcts[idx];
 			expr->pat.expect_type = pat_match_types[idx];
+			match_forced = 1;
 			args++;
 		}
 		else if (strcmp(*args, "-M") == 0) {
@@ -398,6 +407,15 @@ struct acl_expr *parse_acl_expr(const char **args, char **err, struct arg_list *
 	if (!expr->pat.parse) {
 		memprintf(err, "matching method must be specified first (using '-m') when using a sample fetch of this type ('%s')", expr->kw);
 		goto out_free_expr;
+	}
+
+	if (aclkw) {
+		if (((aclkw->match_type == PAT_MATCH_BEG || aclkw->match_type == PAT_MATCH_DIR || aclkw->match_type == PAT_MATCH_DOM ||
+		     aclkw->match_type == PAT_MATCH_DOM || aclkw->match_type == PAT_MATCH_END || aclkw->match_type == PAT_MATCH_LEN ||
+		     aclkw->match_type == PAT_MATCH_REG) && expr->pat.match != pat_match_fcts[aclkw->match_type]) ||
+		    (aclkw->match && expr->pat.match != aclkw->match))
+			ha_warning("parsing [%s:%d] : original matching method '%s' was overwritten and will not be applied as expected.\n",
+				   file, line, aclkw->kw);
 	}
 
 	/* Create displayed reference */
@@ -1336,6 +1354,10 @@ int smp_fetch_acl_parse(struct arg *args, char **err_msg)
 	for (i = 0; args[i].type != ARGT_STOP; i++)
 		;
 	acl_sample = calloc(1, sizeof(struct acl_sample) + sizeof(struct acl_term) * i);
+	if (unlikely(!acl_sample)) {
+		memprintf(err_msg, "out of memory when parsing ACL expression");
+		return 0;
+	}
 	LIST_INIT(&acl_sample->suite.terms);
 	LIST_INIT(&acl_sample->cond.suites);
 	LIST_APPEND(&acl_sample->cond.suites, &acl_sample->suite.list);

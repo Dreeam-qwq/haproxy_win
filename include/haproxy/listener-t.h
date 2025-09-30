@@ -140,6 +140,7 @@ struct ssl_bind_conf {
 	unsigned int verify:3;     /* verify method (set of SSL_VERIFY_* flags) */
 	unsigned int no_ca_names:1;/* do not send ca names to clients (ca_file related) */
 	unsigned int early_data:1; /* early data allowed */
+	unsigned int ktls:1;       /* use kTLS if available */
 	char *ca_file;             /* CAfile to use on verify and ca-names */
 	char *ca_verify_file;      /* CAverify file to use on verify only */
 	char *crl_file;            /* CRLfile to use on verify */
@@ -194,6 +195,7 @@ struct bind_conf {
 	int maxseg;                /* for TCP, advertised MSS */
 	int tcp_ut;                /* for TCP, user timeout */
 	char *tcp_md5sig;          /* TCP MD5 signature password (RFC2385) */
+	char *cc_algo;             /* TCP congestion control algorithm ("cc" parameter) */
 	int idle_ping;             /* MUX idle-ping interval in ms */
 	int maxaccept;             /* if set, max number of connections accepted at once (-1 when disabled) */
 	unsigned int backlog;      /* if set, listen backlog */
@@ -237,7 +239,7 @@ struct listener {
 	enum obj_type obj_type;         /* object type = OBJ_TYPE_LISTENER */
 	enum li_state state;            /* state: NEW, INIT, ASSIGNED, LISTEN, READY, FULL */
 	uint16_t flags;                 /* listener flags: LI_F_* */
-	int luid;			/* listener universally unique ID, used for SNMP */
+	int luid;			/* listener universally unique ID, used for SNMP, indexed by <luid_node> below */
 	int nbconn;			/* current number of connections on this listener */
 	unsigned long thr_idx;          /* thread indexes for queue distribution (see listener_accept()) */
 	__decl_thread(HA_RWLOCK_T lock);
@@ -252,10 +254,7 @@ struct listener {
 	struct list by_bind;            /* chaining in bind_conf's list of listeners */
 	struct bind_conf *bind_conf;	/* "bind" line settings, include SSL settings among other things */
 	struct receiver rx;             /* network receiver parts */
-	struct {
-		struct eb32_node id;	/* place in the tree of used IDs */
-	} conf;				/* config information */
-
+	struct ceb_node luid_node;      /* place in the tree of used IDs, indexes <luid> above */
 	struct guid_node guid;		/* GUID global tree node */
 
 	struct li_per_thread *per_thr;  /* per-thread fields (one per thread in the group) */

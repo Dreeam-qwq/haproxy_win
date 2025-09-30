@@ -123,8 +123,20 @@ int raw_sock_to_pipe(struct connection *conn, void *xprt_ctx, struct pipe *pipe,
 				/* splice not supported on this end, disable it.
 				 * We can safely return -1 since there is no
 				 * chance that any data has been piped yet.
+				 * EINVAL, however, is a bit special.
+				 * If we're trying to splice from a KTLS
+				 * socket, the kernel may return EINVAL
+				 * to signal that the current TLS record
+				 * is not application data, and that we
+				 * have to call recvmsg() to get it.
+				 * This is not really an error, and doesn't
+				 * mean we won't be able to splice later.
+				 * Choosing EINVAL there is a bit unfortunate,
+				 * because it can mean many things, but we
+				 * should not get it for any other reason.
 				 */
-				retval = -1;
+				if (errno != EINVAL)
+					retval = -1;
 				goto leave;
 			}
 			else if (errno == EINTR) {
@@ -132,9 +144,11 @@ int raw_sock_to_pipe(struct connection *conn, void *xprt_ctx, struct pipe *pipe,
 				continue;
 			}
 			/* here we have another error */
-			conn_report_term_evt(conn, tevt_loc_fd, fd_tevt_type_rcv_err);
-			conn->flags |= CO_FL_ERROR;
-			conn_set_errno(conn, errno);
+			if (errno != EINVAL) {
+				conn_report_term_evt(conn, tevt_loc_fd, fd_tevt_type_rcv_err);
+				conn->flags |= CO_FL_ERROR;
+				conn_set_errno(conn, errno);
+			}
 			break;
 		} /* ret <= 0 */
 
@@ -235,7 +249,7 @@ int raw_sock_from_pipe(struct connection *conn, void *xprt_ctx, struct pipe *pip
  * errno is cleared before starting so that the caller knows that if it spots an
  * error without errno, it's pending and can be retrieved via getsockopt(SO_ERROR).
  */
-static size_t raw_sock_to_buf(struct connection *conn, void *xprt_ctx, struct buffer *buf, size_t count, int flags)
+static size_t raw_sock_to_buf(struct connection *conn, void *xprt_ctx, struct buffer *buf, size_t count, void *msg_control, size_t *msg_controllen, int flags)
 {
 	ssize_t ret;
 	size_t try, done = 0;
@@ -273,6 +287,9 @@ static size_t raw_sock_to_buf(struct connection *conn, void *xprt_ctx, struct bu
 	 * EINTR too.
 	 */
 	while (count > 0) {
+		struct msghdr msg;
+		struct iovec iov;
+
 		try = b_contig_space(buf);
 		if (!try)
 			break;
@@ -280,7 +297,17 @@ static size_t raw_sock_to_buf(struct connection *conn, void *xprt_ctx, struct bu
 		if (try > count)
 			try = count;
 
-		ret = recv(conn->handle.fd, b_tail(buf), try, 0);
+		memset(&msg, 0, sizeof(msg));
+		msg.msg_control = msg_control;
+		if (msg_controllen)
+			msg.msg_controllen = *msg_controllen;
+		iov.iov_base = b_tail(buf);
+		iov.iov_len = try;
+		msg.msg_iov = &iov;
+		msg.msg_iovlen = 1;
+		ret = recvmsg(conn->handle.fd, &msg, 0);
+		if (ret > 0 && msg_controllen != NULL)
+			*msg_controllen = msg.msg_controllen;
 
 		if (ret > 0) {
 			b_add(buf, ret);
@@ -367,7 +394,7 @@ static size_t raw_sock_to_buf(struct connection *conn, void *xprt_ctx, struct bu
  * is responsible for this. It's up to the caller to update the buffer's contents
  * based on the return value.
  */
-static size_t raw_sock_from_buf(struct connection *conn, void *xprt_ctx, const struct buffer *buf, size_t count, int flags)
+static size_t raw_sock_from_buf(struct connection *conn, void *xprt_ctx, const struct buffer *buf, size_t count, void *msg_control, size_t msg_controllen, int flags)
 {
 	ssize_t ret;
 	size_t try, done;
@@ -405,15 +432,23 @@ static size_t raw_sock_from_buf(struct connection *conn, void *xprt_ctx, const s
 	 * in which case we accept to do it once again.
 	 */
 	while (count) {
+		struct msghdr msg;
+		struct iovec iov;
 		try = b_contig_data(buf, done);
 		if (try > count)
 			try = count;
 
 		send_flag = MSG_DONTWAIT | MSG_NOSIGNAL;
+		memset(&msg, 0, sizeof(msg));
+		msg.msg_control = msg_control;
+		msg.msg_controllen = msg_controllen;
+		iov.iov_base = b_peek(buf, done);
+		iov.iov_len = try;
+		msg.msg_iov = &iov;
+		msg.msg_iovlen = 1;
 		if (try < count || flags & CO_SFL_MSG_MORE)
 			send_flag |= MSG_MORE;
-
-		ret = send(conn->handle.fd, b_peek(buf, done), try, send_flag);
+		ret = sendmsg(conn->handle.fd, &msg, send_flag);
 
 		if (ret > 0) {
 			count -= ret;
@@ -485,6 +520,19 @@ static int raw_sock_remove_xprt(struct connection *conn, void *xprt_ctx, void *t
 	return -1;
 }
 
+static int raw_sock_get_capability(struct connection *conn, void *xprt_ctx, enum xprt_capabilities cap, void *arg)
+{
+	int *ret;
+
+	switch (cap) {
+		case XPRT_CAN_SPLICE:
+			ret = arg;
+			*ret = XPRT_CONN_CAN_SPLICE;
+			return 0;
+	}
+	return -1;
+}
+
 /* transport-layer operations for RAW sockets */
 static struct xprt_ops raw_sock = {
 	.snd_buf  = raw_sock_from_buf,
@@ -496,6 +544,7 @@ static struct xprt_ops raw_sock = {
 	.rcv_pipe = raw_sock_to_pipe,
 	.snd_pipe = raw_sock_from_pipe,
 #endif
+	.get_capability = raw_sock_get_capability,
 	.shutr    = NULL,
 	.shutw    = NULL,
 	.close    = raw_sock_close,

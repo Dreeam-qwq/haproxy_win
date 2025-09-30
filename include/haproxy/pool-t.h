@@ -28,6 +28,7 @@
 #define MEM_F_SHARED	0x1
 #define MEM_F_EXACT	0x2
 #define MEM_F_UAF	0x4
+#define MEM_F_STATREG	0x8 /* static registration: do not free it! */
 
 /* A special pointer for the pool's free_list that indicates someone is
  * currently manipulating it. Serves as a short-lived lock.
@@ -69,9 +70,12 @@ struct pool_cache_head {
  */
 struct pool_registration {
 	struct list list;    /* link element */
-	char name[12];       /* name of the pool */
+	const char *name;    /* name of the pool */
+	const char *file;    /* where the pool is declared */
+	unsigned int line;   /* line in the file where the pool is declared, 0 if none */
 	unsigned int size;   /* expected object size */
 	unsigned int flags;  /* MEM_F_* */
+	unsigned int type_align;  /* type-imposed alignment; 0=unspecified */
 	unsigned int align;  /* expected alignment; 0=unspecified */
 };
 
@@ -125,6 +129,7 @@ struct pool_head {
 	unsigned int minavail;	/* how many chunks are expected to be used */
 	unsigned int size;	/* chunk size */
 	unsigned int flags;	/* MEM_F_* */
+	unsigned int align;     /* alignment size */
 	unsigned int users;	/* number of pools sharing this zone */
 	unsigned int alloc_sz;	/* allocated size (includes hidden fields) */
 	unsigned int sum_size;	/* sum of all registered users' size */

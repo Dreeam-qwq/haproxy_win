@@ -139,6 +139,7 @@ void thread_isolate()
 	 * 1) reset isolated_thread to ~0;
 	 * 2) decrement rdv_requests.
 	 */
+	th_ctx->lock_level += 128;
 }
 
 /* Isolates the current thread : request the ability to work while all other
@@ -212,6 +213,7 @@ void thread_isolate_full()
 	 * 1) reset isolated_thread to ~0;
 	 * 2) decrement rdv_requests.
 	 */
+	th_ctx->lock_level += 128;
 }
 
 /* Cancels the effect of thread_isolate() by resetting the ID of the isolated
@@ -224,6 +226,7 @@ void thread_release()
 {
 	HA_ATOMIC_STORE(&isolated_thread, ~0U);
 	HA_ATOMIC_DEC(&rdv_requests);
+	th_ctx->lock_level -= 128;
 }
 
 /* Sets up threads, signals and masks, and starts threads 2 and above.
@@ -1213,6 +1216,7 @@ int pthread_rwlock_unlock(pthread_rwlock_t *rwlock)
 }
 #endif // defined(USE_PTHREAD_EMULATION)
 
+#ifndef __APPLE__
 /* Depending on the platform and how libpthread was built, pthread_exit() may
  * involve some code in libgcc_s that would be loaded on exit for the first
  * time, causing aborts if the process is chrooted. It's harmless bit very
@@ -1233,12 +1237,15 @@ static inline void preload_libgcc_s(void)
 	if (pthread_create(&dummy_thread, NULL, dummy_thread_function, NULL) == 0)
 		pthread_join(dummy_thread, NULL);
 }
+#endif
 
 static void __thread_init(void)
 {
 	char *ptr = NULL;
 
+#ifndef __APPLE__
 	preload_libgcc_s();
+#endif
 
 	thread_cpus_enabled_at_boot = thread_cpus_enabled();
 	thread_cpus_enabled_at_boot = MIN(thread_cpus_enabled_at_boot, MAX_THREADS);

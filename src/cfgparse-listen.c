@@ -367,8 +367,10 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 
 		if ((*args[2] && (!*args[3] || strcmp(args[2], "from") != 0)) ||
 		    alertif_too_many_args(3, file, linenum, args, &err_code)) {
-			if (rc & PR_CAP_FE)
+			if (rc & PR_CAP_FE) {
+				err_code |= ERR_ALERT | ERR_FATAL;
 				ha_alert("parsing [%s:%d] : please use the 'bind' keyword for listening addresses.\n", file, linenum);
+			}
 			goto out;
 		}
 	}
@@ -730,7 +732,6 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 		}
 
 		curproxy->uuid = atol(args[1]);
-		curproxy->conf.id.key = curproxy->uuid;
 		curproxy->options |= PR_O_FORCED_ID;
 
 		if (curproxy->uuid <= 0) {
@@ -748,7 +749,7 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 			err_code |= ERR_ALERT | ERR_FATAL;
 			goto out;
 		}
-		eb32_insert(&used_proxy_id, &curproxy->conf.id);
+		proxy_index_id(curproxy);
 	}
 	else if (strcmp(args[0], "description") == 0) {
 		int i, len=0;
@@ -1474,6 +1475,15 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 			err_code |= ERR_ALERT | ERR_FATAL;
 			goto out;
 		}
+		if (strcasecmp(args[1], "host") == 0 ||
+		    strcasecmp(args[1], "content-length") == 0 ||
+		    strcasecmp(args[1], "transfer-encoding") == 0 ||
+		    strcasecmp(args[1], "connection") == 0) {
+			ha_alert("parsing [%s:%d] : '%s' cannot be used as header name for '%s' directive.\n",
+				 file, linenum, args[1], args[0]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
 
 		/* set the desired header name, in lower case */
 		istfree(&curproxy->server_id_hdr_name);
@@ -2018,6 +2028,12 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 					len += strlen(args[i]) + 1;
 
 				desc = d = calloc(1, len);
+				if (unlikely(!d)) {
+					ha_alert("parsing [%s:%d]: '%s %s' : memory allocation failed\n",
+							 file, linenum, args[0], args[1]);
+					err_code |= ERR_ALERT | ERR_FATAL;
+					goto out;
+				}
 
 				d += snprintf(d, desc + len - d, "%s", args[2]);
 				for (i = 3; *args[i]; i++)

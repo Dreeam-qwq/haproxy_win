@@ -887,6 +887,7 @@ int stats_dump_fields_html(struct buffer *out,
 		                "<tr><th>- unsafe:</th><td>%s</td></tr>"
 		                "<tr><th>- safe:</th><td>%s</td></tr>"
 		                "<tr><th>Estimated need of connections:</th><td>%s</td></tr>"
+		                "<tr><th>Private idle connections:</th><td>%s</td></tr>"
 		                "<tr><th>Active connections limit:</th><td>%s</td></tr>"
 		                "<tr><th>Idle connections limit:</th><td>%s</td></tr>"
 			        "</table></div></u>"
@@ -901,6 +902,7 @@ int stats_dump_fields_html(struct buffer *out,
 			      U2H(stats[ST_I_PX_IDLE_CONN_CUR].u.u32),
 			      U2H(stats[ST_I_PX_SAFE_CONN_CUR].u.u32),
 			      U2H(stats[ST_I_PX_NEED_CONN_EST].u.u32),
+			      U2H(stats[ST_I_PX_PRIV_IDLE_CUR].u.u32),
 
 			        LIM2A(stats[ST_I_PX_SLIM].u.u32, "-"),
 		                stats[ST_I_PX_SRV_ILIM].type ? U2H(stats[ST_I_PX_SRV_ILIM].u.u32) : "-",
@@ -2103,6 +2105,7 @@ static void http_stats_release(struct appctx *appctx)
 
 struct applet http_stats_applet = {
 	.obj_type = OBJ_TYPE_APPLET,
+	.flags = APPLET_FL_NEW_API|APPLET_FL_HTX,
 	.name = "<STATS>", /* used for logging */
 	.fct = http_stats_io_handler,
 	.rcv_buf = appctx_htx_rcv_buf,

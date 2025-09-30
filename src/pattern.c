@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <errno.h>
 
+#include <import/cebs_tree.h>
 #include <import/ebistree.h>
 #include <import/ebpttree.h>
 #include <import/ebsttree.h>
@@ -1536,9 +1537,11 @@ struct pat_ref *pat_ref_lookup(const char *reference)
 {
 	struct pat_ref *ref;
 
-	/* Skip file@ prefix, it is the default case. Can be mixed with ref omitting the prefix */
+	/* Skip file@ or opt@ prefix, it is the default case. Can be mixed with ref omitting the prefix */
 	if (strlen(reference) > 5 && strncmp(reference, "file@", 5) == 0)
 		reference += 5;
+	else if (strlen(reference) > 4 && strncmp(reference, "opt@", 4) == 0)
+		reference += 4;
 
 	list_for_each_entry(ref, &pattern_reference, list)
 		if (ref->reference && strcmp(reference, ref->reference) == 0)
@@ -1590,7 +1593,7 @@ void pat_ref_delete_by_ptr(struct pat_ref *ref, struct pat_ref_elt *elt)
 		HA_RWLOCK_WRUNLOCK(PATEXP_LOCK, &expr->lock);
 
 	LIST_DELETE(&elt->list);
-	ebmb_delete(&elt->node);
+	cebs_item_delete(&ref->ceb_root, node, pattern, elt);
 	free(elt->sample);
 	free(elt);
 	HA_ATOMIC_INC(&patterns_freed);
@@ -1625,20 +1628,18 @@ int pat_ref_delete_by_id(struct pat_ref *ref, struct pat_ref_elt *refelt)
  */
 int pat_ref_gen_delete(struct pat_ref *ref, unsigned int gen_id, const char *key)
 {
-	struct ebmb_node *node;
+	struct pat_ref_elt *elt, *elt2;
 	int found = 0;
 
 	/* delete pattern from reference */
-	node = ebst_lookup(&ref->ebmb_root, key);
-	while (node) {
-		struct pat_ref_elt *elt;
-
-		elt = ebmb_entry(node, struct pat_ref_elt, node);
-		node = ebmb_next_dup(node);
-		if (elt->gen_id != gen_id)
-			continue;
-		pat_ref_delete_by_ptr(ref, elt);
-		found = 1;
+	elt = cebs_item_lookup(&ref->ceb_root, node, pattern, key, struct pat_ref_elt);
+	while (elt) {
+		elt2 = cebs_item_next_dup(&ref->ceb_root, node, pattern, elt);
+		if (elt->gen_id == gen_id) {
+			pat_ref_delete_by_ptr(ref, elt);
+			found = 1;
+		}
+		elt = elt2;
 	}
 
 	if (found)
@@ -1662,20 +1663,15 @@ int pat_ref_delete(struct pat_ref *ref, const char *key)
  */
 struct pat_ref_elt *pat_ref_gen_find_elt(struct pat_ref *ref, unsigned int gen_id, const char *key)
 {
-	struct ebmb_node *node;
 	struct pat_ref_elt *elt;
 
-	node = ebst_lookup(&ref->ebmb_root, key);
-	while (node) {
-		elt = ebmb_entry(node, struct pat_ref_elt, node);
+	elt = cebs_item_lookup(&ref->ceb_root, node, pattern, key, struct pat_ref_elt);
+	while (elt) {
 		if (elt->gen_id == gen_id)
 			break;
-		node = ebmb_next_dup(node);
+		elt = cebs_item_next_dup(&ref->ceb_root, node, pattern, elt);
 	}
-	if (node)
-		return ebmb_entry(node, struct pat_ref_elt, node);
-
-	return NULL;
+	return elt;
 }
 
 /*
@@ -1790,24 +1786,24 @@ int pat_ref_set_by_id(struct pat_ref *ref, struct pat_ref_elt *refelt, const cha
 	return 0;
 }
 
-static int pat_ref_set_from_node(struct pat_ref *ref, struct ebmb_node *node, const char *value, char **err)
+static int pat_ref_set_from_elt(struct pat_ref *ref, struct pat_ref_elt *elt, const char *value, char **err)
 {
-	struct pat_ref_elt *elt;
 	unsigned int gen;
+	struct pat_ref_elt *elt2;
 	int first = 1;
 	int found = 0;
 
-	while (node) {
+	for (; elt; elt = elt2) {
 		char *tmp_err = NULL;
 
-		elt = ebmb_entry(node, struct pat_ref_elt, node);
+		elt2 = cebs_item_next_dup(&ref->ceb_root, node, pattern, elt);
 		if (first)
 			gen = elt->gen_id;
 		else if (elt->gen_id != gen) {
 			/* only consider duplicate elements from the same gen! */
 			continue;
 		}
-		node = ebmb_next_dup(node);
+
 		if (!pat_ref_set_elt(ref, elt, value, &tmp_err)) {
 			if (err)
 				*err = tmp_err;
@@ -1834,7 +1830,7 @@ static int pat_ref_set_from_node(struct pat_ref *ref, struct ebmb_node *node, co
 int pat_ref_set_elt_duplicate(struct pat_ref *ref, struct pat_ref_elt *elt, const char *value,
                               char **err)
 {
-	return pat_ref_set_from_node(ref, &elt->node, value, err);
+	return pat_ref_set_from_elt(ref, elt, value, err);
 }
 
 /* This function modifies to <value> the sample of all patterns matching <key>
@@ -1843,18 +1839,16 @@ int pat_ref_set_elt_duplicate(struct pat_ref *ref, struct pat_ref_elt *elt, cons
 int pat_ref_gen_set(struct pat_ref *ref, unsigned int gen_id,
                     const char *key, const char *value, char **err)
 {
-	struct ebmb_node *node;
 	struct pat_ref_elt *elt;
 
 	/* Look for pattern in the reference. */
-	node = ebst_lookup(&ref->ebmb_root, key);
-	while (node) {
-		elt = ebmb_entry(node, struct pat_ref_elt, node);
+	elt = cebs_item_lookup(&ref->ceb_root, node, pattern, key, struct pat_ref_elt);
+	while (elt) {
 		if (elt->gen_id == gen_id)
 			break;
-		node = ebmb_next_dup(node);
+		elt = cebs_item_next_dup(&ref->ceb_root, node, pattern, elt);
 	}
-	return pat_ref_set_from_node(ref, node, value, err);
+	return pat_ref_set_from_elt(ref, elt, value, err);
 }
 
 /* This function modifies to <value> the sample of all patterns matching <key>
@@ -1896,7 +1890,7 @@ static struct pat_ref *_pat_ref_new(const char *display, unsigned int flags)
 	ref->revision = 0;
 	ref->entry_cnt = 0;
 	LIST_INIT(&ref->head);
-	ref->ebmb_root = EB_ROOT;
+	ref->ceb_root = NULL;
 	LIST_INIT(&ref->pat);
 	HA_RWLOCK_INIT(&ref->lock);
 	event_hdl_sub_list_init(&ref->e_subs);
@@ -2002,9 +1996,7 @@ struct pat_ref_elt *pat_ref_append(struct pat_ref *ref, const char *pattern, con
 	elt->list_head = NULL;
 	elt->tree_head = NULL;
 	LIST_APPEND(&ref->head, &elt->list);
-	/* Even if calloc()'ed, ensure this node is not linked to a tree. */
-	elt->node.node.leaf_p = NULL;
-	ebst_insert(&ref->ebmb_root, &elt->node);
+	cebs_item_insert(&ref->ceb_root, node, pattern, elt);
 	HA_ATOMIC_INC(&patterns_added);
 	return elt;
  fail:
@@ -2178,7 +2170,7 @@ int pat_ref_purge_range(struct pat_ref *ref, uint from, uint to, int budget)
 		pat_delete_gen(ref, elt);
 
 		LIST_DELETE(&elt->list);
-		ebmb_delete(&elt->node);
+		cebs_item_delete(&ref->ceb_root, node, pattern, elt);
 		free(elt->sample);
 		free(elt);
 		HA_ATOMIC_INC(&patterns_freed);
@@ -2516,6 +2508,8 @@ int pattern_read_from_file(struct pattern_head *head, unsigned int refflags,
 					return 0;
 			}
 		}
+		else if ((ref->flags & PAT_REF_ID) && load_smp)
+			ref->flags |= PAT_REF_SMP;
 	}
 	else {
 		/* The reference already exists, check the map compatibility. */

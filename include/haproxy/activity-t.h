@@ -76,12 +76,12 @@ struct memprof_stats {
 	const void *caller;
 	enum memprof_method method;
 	/* 4-7 bytes hole here */
+	unsigned long long locked_calls;
 	unsigned long long alloc_calls;
 	unsigned long long free_calls;
 	unsigned long long alloc_tot;
 	unsigned long long free_tot;
 	void *info; // for pools, ptr to the pool
-	void *pad;  // pad to 64
 };
 #endif
 
@@ -143,6 +143,9 @@ struct sched_activity {
 	uint64_t calls;
 	uint64_t cpu_time;
 	uint64_t lat_time;
+	uint64_t lkw_time; /* lock waiting time */
+	uint64_t lkd_time; /* locked time */
+	uint64_t mem_time; /* memory ops wait time */
 };
 
 #endif /* _HAPROXY_ACTIVITY_T_H */

@@ -36,6 +36,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <import/cebis_tree.h>
+
 #include <haproxy/acl.h>
 #include <haproxy/action.h>
 #include <haproxy/api.h>
@@ -2824,10 +2826,9 @@ int check_config_validity()
 	 * as some of the fields may be accessed soon
 	 */
 	MT_LIST_FOR_EACH_ENTRY_LOCKED(newsrv, &servers_list, global_list, back) {
-		if (srv_init(newsrv) & ERR_CODE) {
-			cfgerr++;
-			continue;
-		}
+		err_code |= srv_preinit(newsrv);
+		if (err_code & ERR_CODE)
+			goto out;
 	}
 
 	/* starting to initialize the main proxies list */
@@ -2849,9 +2850,9 @@ init_proxies_list_stage1:
 			 * build or config options and we don't want them to
 			 * possibly reuse existing IDs.
 			 */
-			next_pxid = get_next_id(&used_proxy_id, next_pxid);
-			curproxy->conf.id.key = curproxy->uuid = next_pxid;
-			eb32_insert(&used_proxy_id, &curproxy->conf.id);
+			next_pxid = proxy_get_next_id(next_pxid);
+			curproxy->uuid = next_pxid;
+			proxy_index_id(curproxy);
 		}
 
 		if (curproxy->mode == PR_MODE_HTTP && global.tune.bufsize >= (256 << 20) && ONLY_ONCE()) {
@@ -3065,10 +3066,10 @@ init_proxies_list_stage1:
 			else if (!(curproxy->options & (PR_O_TRANSP | PR_O_DISPATCH))) {
 				/* If no LB algo is set in a backend, and we're not in
 				 * transparent mode, dispatch mode nor proxy mode, we
-				 * want to use balance roundrobin by default.
+				 * want to use balance random by default.
 				 */
 				curproxy->lbprm.algo &= ~BE_LB_ALGO;
-				curproxy->lbprm.algo |= BE_LB_ALGO_RR;
+				curproxy->lbprm.algo |= BE_LB_ALGO_RND;
 			}
 		}
 
@@ -3703,12 +3704,11 @@ out_uri_auth_compat:
 			/* Note: internal servers are not always registered and
 			 * they do not conflict.
 			 */
-			if (!newsrv->conf.name.node.leaf_p)
+			if (!ceb_intree(&newsrv->conf.name_node))
 				continue;
 
 			for (other_srv = newsrv;
-			     (other_srv = container_of_safe(ebpt_prev_dup(&other_srv->conf.name),
-			                                    struct server, conf.name)); ) {
+			     (other_srv = cebis_item_prev_dup(&curproxy->conf.used_server_name, conf.name_node, id, other_srv)); ) {
 				ha_alert("parsing [%s:%d] : %s '%s', another server named '%s' was already defined at line %d, please use distinct names.\n",
 					 newsrv->conf.file, newsrv->conf.line,
 					 proxy_type_str(curproxy), curproxy->id,
@@ -3726,9 +3726,9 @@ out_uri_auth_compat:
 				/* server ID not set, use automatic numbering with first
 				 * spare entry starting with next_svid.
 				 */
-				next_id = get_next_id(&curproxy->conf.used_server_id, next_id);
-				newsrv->conf.id.key = newsrv->puid = next_id;
-				eb32_insert(&curproxy->conf.used_server_id, &newsrv->conf.id);
+				next_id = server_get_next_id(curproxy, next_id);
+				newsrv->puid = next_id;
+				server_index_id(curproxy, newsrv);
 			}
 
 			next_id++;
@@ -3761,6 +3761,25 @@ out_uri_auth_compat:
 				else if (xprt_get(XPRT_QUIC) && xprt_get(XPRT_QUIC)->prepare_srv)
 					cfgerr += xprt_get(XPRT_QUIC)->prepare_srv(newsrv);
 			}
+
+			if (newsrv->use_ssl == 1 || ((newsrv->flags & SRV_F_DEFSRV_USE_SSL) && newsrv->use_ssl != 1)) {
+				/* In HTTP only, if the SNI not set and we can realy on the host
+				 * header value, fill the sni expression accordingly
+				 */
+				if (newsrv->proxy->mode == PR_MODE_HTTP && !(newsrv->ssl_ctx.options & SRV_SSL_O_NO_AUTO_SNI)) {
+					newsrv->sni_expr = strdup("req.hdr(host),field(1,:)");
+
+					err = NULL;
+					if (server_parse_exprs(newsrv, curproxy, &err)) {
+						ha_alert("parsing [%s:%d]: failed to parse auto SNI expression: %s\n",
+							 newsrv->conf.file, newsrv->conf.line, err);
+						free(err);
+						++cfgerr;
+						goto next_srv;
+					}
+				}
+			}
+
 
 			if ((newsrv->flags & SRV_F_FASTOPEN) &&
 			    ((curproxy->retry_type & (PR_RE_DISCONNECTED | PR_RE_TIMEOUT)) !=
@@ -4271,24 +4290,15 @@ init_proxies_list_stage2:
 					if (prev_li->luid)
 						next_id = prev_li->luid + 1;
 				}
-				next_id = get_next_id(&curproxy->conf.used_listener_id, next_id);
-				listener->conf.id.key = listener->luid = next_id;
-				eb32_insert(&curproxy->conf.used_listener_id, &listener->conf.id);
+				next_id = listener_get_next_id(curproxy, next_id);
+				listener->luid = next_id;
+				listener_index_id(curproxy, listener);
 			}
 			next_id++;
 
 			/* enable separate counters */
 			if (curproxy->options2 & PR_O2_SOCKSTAT) {
 				listener->counters = calloc(1, sizeof(*listener->counters));
-				if (listener->counters) {
-					listener->counters->shared = counters_fe_shared_get(&listener->guid);
-					if (!listener->counters->shared) {
-						ha_free(&listener->counters);
-						ha_alert("config: %s '%s': out of memory.\n",
-							 proxy_type_str(curproxy), curproxy->id);
-					}
-
-				}
 				if (!listener->name)
 					memprintf(&listener->name, "sock-%d", listener->luid);
 			}

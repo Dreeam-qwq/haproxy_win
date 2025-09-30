@@ -350,7 +350,7 @@
  * <type> which has its member <name> stored at address <ptr>.
  */
 #ifndef container_of
-#define container_of(ptr, type, name) ((type *)(((void *)(ptr)) - ((long)&((type *)0)->name)))
+#define container_of(ptr, type, name) ((type *)(((char *)(ptr)) - offsetof(type, name)))
 #endif
 
 /* returns a pointer to the structure of type <type> which has its member <name>
@@ -359,7 +359,7 @@
 #ifndef container_of_safe
 #define container_of_safe(ptr, type, name) \
 	({ void *__p = (ptr); \
-		__p ? (type *)(__p - ((long)&((type *)0)->name)) : (type *)0; \
+		__p ? (type *)((char *)__p - offsetof(type, name)) : (type *)0; \
 	})
 #endif
 
@@ -488,18 +488,31 @@
 #endif
 #endif
 
+/* add padding of the specified size */
+#define _PAD(x,l)  char __pad_##l[x]
+
 /* add optional padding of the specified size between fields in a structure,
  * only when threads are enabled. This is used to avoid false sharing of cache
  * lines for dynamically allocated structures which cannot guarantee alignment.
  */
 #ifndef THREAD_PAD
 # ifdef USE_THREAD
-#  define __THREAD_PAD(x,l)  char __pad_##l[x]
-#  define _THREAD_PAD(x,l)   __THREAD_PAD(x, l)
+#  define _THREAD_PAD(x,l)   _PAD(x, l)
 #  define THREAD_PAD(x)      _THREAD_PAD(x, __LINE__)
 # else
 #  define THREAD_PAD(x)
 # endif
+#endif
+
+/* add mandatory padding of the specified size between fields in a structure,
+ * This is used to avoid false sharing of cache lines for dynamically allocated
+ * structures which cannot guarantee alignment, or to ensure that the size of
+ * the struct remains consistent on architectures with different aligment
+ * constraints
+ */
+#ifndef ALWAYS_PAD
+#  define _ALWAYS_PAD(x,l)   _PAD(x, l)
+#  define ALWAYS_PAD(x)      _ALWAYS_PAD(x, __LINE__)
 #endif
 
 /* The THREAD_LOCAL type attribute defines thread-local storage and is defined

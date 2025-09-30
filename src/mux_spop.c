@@ -210,8 +210,8 @@ static struct trace_source trace_spop __read_mostly = {
 INITCALL1(STG_REGISTER, trace_register_source, TRACE_SOURCE);
 
 /* SPOP connection and stream pools */
-DECLARE_STATIC_POOL(pool_head_spop_conn, "spop_conn", sizeof(struct spop_conn));
-DECLARE_STATIC_POOL(pool_head_spop_strm, "spop_strm", sizeof(struct spop_strm));
+DECLARE_STATIC_TYPED_POOL(pool_head_spop_conn, "spop_conn", struct spop_conn);
+DECLARE_STATIC_TYPED_POOL(pool_head_spop_strm, "spop_strm", struct spop_strm);
 
 
 const struct ist spop_err_reasons[SPOP_ERR_ENTRIES] = {
@@ -712,10 +712,13 @@ static int spop_init(struct connection *conn, struct proxy *px, struct session *
 	sdo = spop_strm_opposite_sd(spop_strm);
 	if (sdo) {
 		spop_conn->agent = spoe_appctx_agent(sc_appctx(sdo->sc));
+		if (!spop_conn->agent) {
+			TRACE_ERROR("not a SPOP stream", SPOP_EV_SPOP_CONN_NEW|SPOP_EV_SPOP_CONN_END|SPOP_EV_SPOP_CONN_ERR, spop_conn->conn);
+			goto fail;
+		}
 		spop_conn->max_frame_size = spop_conn->agent->max_frame_size;
 		if (spop_conn->agent->flags & SPOE_FL_PIPELINING)
 			spop_conn->streams_limit = 20;
-		BUG_ON(!spop_conn->agent);
 	}
 
 	/* Repare to read something */
@@ -2368,7 +2371,7 @@ static int spop_recv(struct spop_conn *spop_conn)
 	}
 
 	max = b_room(buf);
-	ret = max ? conn->xprt->rcv_buf(conn, conn->xprt_ctx, buf, max, 0) : 0;
+	ret = max ? conn->xprt->rcv_buf(conn, conn->xprt_ctx, buf, max, NULL, NULL, 0) : 0;
 
 	if (max && !ret && spop_recv_allowed(spop_conn)) {
 		TRACE_DATA("failed to receive data, subscribing", SPOP_EV_SPOP_CONN_RECV, conn);
@@ -2469,7 +2472,7 @@ static int spop_send(struct spop_conn *spop_conn)
 			if (b_data(buf)) {
 				int ret;
 
-				ret = conn->xprt->snd_buf(conn, conn->xprt_ctx, buf, b_data(buf), flags);
+				ret = conn->xprt->snd_buf(conn, conn->xprt_ctx, buf, b_data(buf), NULL, 0, flags);
 				if (!ret) {
 					done = 1;
 					break;
@@ -2554,9 +2557,16 @@ static struct task *spop_io_cb(struct task *t, void *ctx, unsigned int state)
 		conn = spop_conn->conn;
 		TRACE_POINT(SPOP_EV_SPOP_CONN_WAKE, conn);
 
-		conn_in_list = conn->flags & CO_FL_LIST_MASK;
-		if (conn_in_list)
-			conn_delete_from_tree(conn);
+		conn_in_list = conn->flags & (CO_FL_LIST_MASK|CO_FL_SESS_IDLE);
+		if (conn_in_list) {
+			if (conn->flags & CO_FL_SESS_IDLE) {
+				if (!session_detach_idle_conn(conn->owner, conn))
+					conn_in_list = 0;
+			}
+			else {
+				conn_delete_from_tree(conn, tid);
+			}
+		}
 
 		HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
 	} else {
@@ -2582,13 +2592,32 @@ static struct task *spop_io_cb(struct task *t, void *ctx, unsigned int state)
 		t = NULL;
 
 	if (!ret && conn_in_list) {
-		struct server *srv = __objt_server(conn->target);
+		struct server *srv = objt_server(conn->target);
 
-		HA_SPIN_LOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
-		_srv_add_idle(srv, conn, conn_in_list == CO_FL_SAFE_LIST);
-		HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
+		if (!srv || !(srv->cur_admin & SRV_ADMF_MAINT)) {
+			if (conn->flags & CO_FL_SESS_IDLE) {
+				if (!session_reinsert_idle_conn(conn->owner, conn)) {
+					/* session add conn failure */
+					goto release;
+				}
+			}
+			else {
+				ASSUME_NONNULL(srv); /* srv is guaranteed by CO_FL_LIST_MASK */
+				HA_SPIN_LOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
+				_srv_add_idle(srv, conn, conn_in_list == CO_FL_SAFE_LIST);
+				HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
+			}
+		}
+		else {
+			/* Do not store an idle conn if server in maintenance. */
+			goto release;
+		}
 	}
 	return t;
+
+ release:
+	spop_release(spop_conn);
+	return NULL;
 }
 
 /* callback called on any event by the connection handler.
@@ -2647,7 +2676,7 @@ static int spop_process(struct spop_conn *spop_conn)
 		/* connections in error must be removed from the idle lists */
 		if (conn->flags & CO_FL_LIST_MASK) {
 			HA_SPIN_LOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
-			conn_delete_from_tree(conn);
+			conn_delete_from_tree(conn, tid);
 			HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
 		}
 	}
@@ -2770,7 +2799,9 @@ static struct task *spop_timeout_task(struct task *t, void *context, unsigned in
 		 * to steal it from us.
 		 */
 		if (spop_conn->conn->flags & CO_FL_LIST_MASK)
-			conn_delete_from_tree(spop_conn->conn);
+			conn_delete_from_tree(spop_conn->conn, tid);
+		else if (spop_conn->conn->flags & CO_FL_SESS_IDLE)
+			session_detach_idle_conn(spop_conn->conn->owner, spop_conn->conn);
 
 		HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
 
@@ -2808,7 +2839,7 @@ do_leave:
 		for (buf = br_head(spop_conn->mbuf); b_size(buf); buf = br_del_head(spop_conn->mbuf)) {
 			if (b_data(buf)) {
 				int ret = spop_conn->conn->xprt->snd_buf(spop_conn->conn, spop_conn->conn->xprt_ctx,
-									 buf, b_data(buf), 0);
+									 buf, b_data(buf), NULL, 0, 0);
 				if (!ret)
 					break;
 				b_del(buf, ret);
@@ -2977,24 +3008,36 @@ static void spop_detach(struct sedesc *sd)
 	if (!(spop_conn->flags & (SPOP_CF_RCVD_SHUT|SPOP_CF_ERR_PENDING|SPOP_CF_ERROR))) {
 		if (spop_conn->conn->flags & CO_FL_PRIVATE) {
 			/* Add the connection in the session server list, if not already done */
-			if (!session_add_conn(sess, spop_conn->conn, spop_conn->conn->target)) {
+			if (!session_add_conn(sess, spop_conn->conn))
 				spop_conn->conn->owner = NULL;
-				if (eb_is_empty(&spop_conn->streams_by_id)) {
+
+			if (eb_is_empty(&spop_conn->streams_by_id)) {
+				if (!spop_conn->conn->owner) {
+					/* Session insertion above has failed and connection is idle, remove it. */
 					spop_conn->conn->mux->destroy(spop_conn);
 					TRACE_DEVEL("leaving on error after killing outgoing connection", SPOP_EV_STRM_END|SPOP_EV_SPOP_CONN_ERR);
 					return;
 				}
-			}
-			if (eb_is_empty(&spop_conn->streams_by_id)) {
+
 				/* mark that the tasklet may lose its context to another thread and
 				 * that the handler needs to check it under the idle conns lock.
 				 */
 				HA_ATOMIC_OR(&spop_conn->wait_event.tasklet->state, TASK_F_USR1);
-				if (session_check_idle_conn(spop_conn->conn->owner, spop_conn->conn) != 0) {
-					/* At this point either the connection is destroyed, or it's been added to the server idle list, just stop */
+				xprt_set_idle(spop_conn->conn, spop_conn->conn->xprt, spop_conn->conn->xprt_ctx);
+
+				/* Ensure session can keep a new idle connection. */
+				if (session_check_idle_conn(sess, spop_conn->conn) != 0) {
+					spop_conn->conn->mux->destroy(spop_conn);
 					TRACE_DEVEL("leaving without reusable idle connection", SPOP_EV_STRM_END);
 					return;
 				}
+
+				/* At this point, the connection is inserted into
+				 * session list and marked as idle, so it may already
+				 * have been purged from another thread.
+				 */
+				TRACE_DEVEL("private connection marked as idle", SPOP_EV_STRM_END);
+				return;
 			}
 		}
 		else {
@@ -3026,7 +3069,7 @@ static void spop_detach(struct sedesc *sd)
 				TRACE_DEVEL("reusable idle connection", SPOP_EV_STRM_END);
 				return;
 			}
-			else if (!spop_conn->conn->hash_node->node.node.leaf_p &&
+			else if (!ceb_intree(&spop_conn->conn->hash_node.node) &&
 				 spop_avail_streams(spop_conn->conn) > 0 && objt_server(spop_conn->conn->target) &&
 				 !LIST_INLIST(&spop_conn->conn->sess_el)) {
 				srv_add_to_avail_list(__objt_server(spop_conn->conn->target), spop_conn->conn);
@@ -3591,17 +3634,21 @@ static int spop_takeover(struct connection *conn, int orig_tid, int release)
 	struct task *new_task = NULL;
 	struct tasklet *new_tasklet = NULL;
 
+	/* If the connection is attached to a buffer_wait (extremely rare),
+	 * it will be woken up at any instant by its own thread and we can't
+	 * undo it anyway, so let's give up on this one. It's not interesting
+	 * at least for reuse anyway since it's not usable right now.
+	 *
+	 * TODO if takeover is used to free conn (release == 1), buf_wait may
+	 * prevent this which is not desirable.
+	 */
+	if (LIST_INLIST(&spop_conn->buf_wait.list))
+		goto fail;
+
 	/* Pre-allocate tasks so that we don't have to roll back after the xprt
 	 * has been migrated.
 	 */
 	if (!release) {
-		/* If the connection is attached to a buffer_wait (extremely
-		 * rare), it will be woken up at any instant by its own thread
-		 * and we can't undo it anyway, so let's give up on this one.
-		 * It's not interesting anyway since it's not usable right now.
-		 */
-		if (LIST_INLIST(&spop_conn->buf_wait.list))
-			goto fail;
 
 		new_task = task_new_here();
 		new_tasklet = tasklet_new();
@@ -3657,20 +3704,6 @@ static int spop_takeover(struct connection *conn, int orig_tid, int release)
 		spop_conn->wait_event.tasklet->context = spop_conn;
 		spop_conn->conn->xprt->subscribe(spop_conn->conn, spop_conn->conn->xprt_ctx,
 						 SUB_RETRY_RECV, &spop_conn->wait_event);
-	}
-
-	if (release) {
-		/* we're being called for a server deletion and are running
-		 * under thread isolation. That's the only way we can
-		 * unregister a possible subscription of the original
-		 * connection from its owner thread's queue, as this involves
-		 * manipulating thread-unsafe areas. Note that it is not
-		 * possible to just call b_dequeue() here as it would update
-		 * the current thread's bufq_map and not the original one.
-		 */
-		BUG_ON(!thread_isolated());
-		if (LIST_INLIST(&spop_conn->buf_wait.list))
-			_b_dequeue(&spop_conn->buf_wait, orig_tid);
 	}
 
 	if (new_task)

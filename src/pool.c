@@ -20,6 +20,7 @@
 #include <haproxy/cfgparse.h>
 #include <haproxy/channel.h>
 #include <haproxy/cli.h>
+#include <haproxy/clock.h>
 #include <haproxy/errors.h>
 #include <haproxy/global.h>
 #include <haproxy/list.h>
@@ -105,6 +106,12 @@ struct show_pools_ctx {
 	char *prefix;  /* if non-null, match this prefix name for the pool */
 	int how;     /* bits 0..3: 0=no sort, 1=by name, 2=by item size, 3=by total alloc */
 	int maxcnt;  /* 0=no limit, other=max number of output entries */
+	int pool_idx; /* Index of the pool to restart the dump  (-1 means the header must be dumped) */
+	unsigned int nbpools; /* total number of pools */
+	unsigned long long allocated; /* total number of bytes allocated*/
+	unsigned long long used; /* total number of bytes used */
+	unsigned long long cached_bytes; /* total number of bytes cached */
+	struct pool_dump_info *pool_info; /* array containing info about all pools (contains nbpools entries) */
 };
 
 static int mem_fail_rate __read_mostly = 0;
@@ -290,27 +297,74 @@ static int mem_should_fail(const struct pool_head *pool)
  * is available for a new creation. Two flags are supported :
  *   - MEM_F_SHARED to indicate that the pool may be shared with other users
  *   - MEM_F_EXACT to indicate that the size must not be rounded up
+ * The name must be a stable pointer during all the program's life time.
+ * The file and line are passed to store the registration location in the
+ * registration struct. Use create_pool() instead which does it for free.
+ * The alignment will be stored as-is in the registration.
  */
-struct pool_head *create_pool(char *name, unsigned int size, unsigned int flags)
+struct pool_head *create_pool_with_loc(const char *name, unsigned int size,
+				       unsigned int align, unsigned int flags,
+				       const char *file, unsigned int line)
 {
-	unsigned int extra_mark, extra_caller, extra;
 	struct pool_registration *reg;
 	struct pool_head *pool;
+
+	reg = calloc(1, sizeof(*reg));
+	if (!reg)
+		return NULL;
+
+	reg->name = name;
+	reg->file = file;
+	reg->line = line;
+	reg->size = size;
+	reg->flags = flags;
+	reg->align = align;
+
+	pool = create_pool_from_reg(name, reg);
+	if (!pool)
+		free(reg);
+	return pool;
+}
+
+/* create a pool from a pool registration. All configuration is taken from
+ * there. The alignment will automatically be raised to sizeof(void*) or the
+ * next power of two so that it's always possible to lazily pass alignof() or
+ * sizeof(). Alignments are always respected when merging pools.
+ */
+struct pool_head *create_pool_from_reg(const char *name, struct pool_registration *reg)
+{
+	unsigned int extra_mark, extra_caller, extra;
+	unsigned int flags = reg->flags;
+	unsigned int size = reg->size;
+	unsigned int alignment = reg->align;
+	struct pool_head *pool = NULL;
 	struct pool_head *entry;
 	struct list *start;
 	unsigned int align;
 	unsigned int best_diff;
 	int thr __maybe_unused;
 
-	pool = NULL;
-	reg = calloc(1, sizeof(*reg));
-	if (!reg)
-		goto fail;
+	/* extend alignment if needed */
+	if (alignment < sizeof(void*))
+		alignment = sizeof(void*);
+	else if (alignment & (alignment - 1)) {
+		/* not power of two! round up to next power of two by filling
+		 * all LSB in O(log(log(N))) then increment the result.
+		 */
+		int shift = 1;
+		do {
+			alignment |= alignment >> shift;
+			shift *= 2;
+		} while (alignment & (alignment + 1));
+		alignment++;
+	}
 
-	strlcpy2(reg->name, name, sizeof(reg->name));
-	reg->size = size;
-	reg->flags = flags;
-	reg->align = 0;
+	if (reg->type_align && alignment < reg->type_align) {
+		ha_alert("BUG in the code: at %s:%u, requested creation of pool '%s' aligned to %u "
+			 "while type requires alignment of %u! Please report to developers. Aborting.\n",
+			 reg->file, reg->line, name, alignment, reg->type_align);
+		return NULL;
+	}
 
 	extra_mark = (pool_debugging & POOL_DBG_TAG) ? POOL_EXTRA_MARK : 0;
 	extra_caller = (pool_debugging & POOL_DBG_CALLER) ? POOL_EXTRA_CALLER : 0;
@@ -407,6 +461,7 @@ struct pool_head *create_pool(char *name, unsigned int size, unsigned int flags)
 			strlcpy2(pool->name, name, sizeof(pool->name));
 		pool->alloc_sz = size + extra;
 		pool->size = size;
+		pool->align = alignment;
 		pool->flags = flags;
 		LIST_APPEND(start, &pool->list);
 		LIST_INIT(&pool->regs);
@@ -426,6 +481,8 @@ struct pool_head *create_pool(char *name, unsigned int size, unsigned int flags)
 			pool->size = size;
 			pool->alloc_sz = size + extra;
 		}
+		if (alignment > pool->align)
+			pool->align = alignment;
 		DPRINTF(stderr, "Sharing %s with %s\n", name, pool->name);
 	}
 
@@ -433,10 +490,8 @@ struct pool_head *create_pool(char *name, unsigned int size, unsigned int flags)
 	pool->users++;
 	pool->sum_size += size;
 
-	return pool;
  fail:
-	free(reg);
-	return NULL;
+	return pool;
 }
 
 /* Tries to allocate an object for the pool <pool> using the system's allocator
@@ -449,9 +504,9 @@ void *pool_get_from_os_noinc(struct pool_head *pool)
 		void *ptr;
 
 		if ((pool_debugging & POOL_DBG_UAF) || (pool->flags & MEM_F_UAF))
-			ptr = pool_alloc_area_uaf(pool->alloc_sz);
+			ptr = pool_alloc_area_uaf(pool->alloc_sz, pool->align);
 		else
-			ptr = pool_alloc_area(pool->alloc_sz);
+			ptr = pool_alloc_area(pool->alloc_sz, pool->align);
 		if (ptr)
 			return ptr;
 		_HA_ATOMIC_INC(&pool->buckets[pool_tbucket()].failed);
@@ -733,10 +788,18 @@ void pool_put_to_cache(struct pool_head *pool, void *ptr, const void *caller)
 	pool_cache_bytes += pool->size;
 
 	if (unlikely(pool_cache_bytes > global.tune.pool_cache_size * 3 / 4)) {
+		uint64_t mem_wait_start = 0;
+
+		if (unlikely(th_ctx->flags & TH_FL_TASK_PROFILING))
+			mem_wait_start = now_mono_time();
+
 		if (ph->count >= 16 + pool_cache_count / 8 + CONFIG_HAP_POOL_CLUSTER_SIZE)
 			pool_evict_from_local_cache(pool, 0);
 		if (pool_cache_bytes > global.tune.pool_cache_size)
 			pool_evict_from_local_caches();
+
+		if (unlikely(mem_wait_start))
+			th_ctx->mem_wait_total += now_mono_time() - mem_wait_start;
 	}
 }
 
@@ -887,7 +950,11 @@ void pool_flush(struct pool_head *pool)
 void pool_gc(struct pool_head *pool_ctx)
 {
 	struct pool_head *entry;
+	uint64_t mem_wait_start = 0;
 	int isolated = thread_isolated();
+
+	if (unlikely(th_ctx->flags & TH_FL_TASK_PROFILING))
+		mem_wait_start = now_mono_time();
 
 	if (!isolated)
 		thread_isolate();
@@ -921,6 +988,9 @@ void pool_gc(struct pool_head *pool_ctx)
 
 	if (!isolated)
 		thread_release();
+
+	if (mem_wait_start)
+		th_ctx->mem_wait_total += now_mono_time() - mem_wait_start;
 }
 
 /*
@@ -941,8 +1011,18 @@ void *__pool_alloc(struct pool_head *pool, unsigned int flags)
 	if (likely(!(pool_debugging & POOL_DBG_NO_CACHE)) && !p)
 		p = pool_get_from_cache(pool, caller);
 
-	if (unlikely(!p))
+	if (unlikely(!p)) {
+		/* count allocation time only for cache misses */
+		uint64_t mem_wait_start = 0;
+
+		if (unlikely(th_ctx->flags & TH_FL_TASK_PROFILING))
+			mem_wait_start = now_mono_time();
+
 		p = pool_alloc_nocache(pool, caller);
+
+		if (unlikely(mem_wait_start))
+			th_ctx->mem_wait_total += now_mono_time() - mem_wait_start;
+	}
 
 	if (likely(p)) {
 #ifdef USE_MEMORY_PROFILING
@@ -951,6 +1031,8 @@ void *__pool_alloc(struct pool_head *pool, unsigned int flags)
 			struct memprof_stats *bin;
 
 			bin = memprof_get_bin(__builtin_return_address(0), MEMPROF_METH_P_ALLOC);
+			if (unlikely(th_ctx->lock_level & 0x7F))
+				_HA_ATOMIC_ADD(&bin->locked_calls, 1);
 			_HA_ATOMIC_ADD(&bin->alloc_calls, 1);
 			_HA_ATOMIC_ADD(&bin->alloc_tot, pool->size);
 			_HA_ATOMIC_STORE(&bin->info, pool);
@@ -989,6 +1071,8 @@ void __pool_free(struct pool_head *pool, void *ptr)
 		struct memprof_stats *bin;
 
 		bin = memprof_get_bin(__builtin_return_address(0), MEMPROF_METH_P_FREE);
+		if (unlikely(th_ctx->lock_level & 0x7F))
+			_HA_ATOMIC_ADD(&bin->locked_calls, 1);
 		_HA_ATOMIC_ADD(&bin->free_calls, 1);
 		_HA_ATOMIC_ADD(&bin->free_tot, pool->size);
 		_HA_ATOMIC_STORE(&bin->info, pool);
@@ -1007,11 +1091,20 @@ void __pool_free(struct pool_head *pool, void *ptr)
 	if (unlikely((pool_debugging & POOL_DBG_NO_CACHE) ||
 	             (pool->flags & MEM_F_UAF) ||
 		     global.tune.pool_cache_size < pool->size)) {
-		pool_free_nocache(pool, ptr);
-		return;
-	}
+		uint64_t mem_wait_start = 0;
 
-	pool_put_to_cache(pool, ptr, caller);
+		if (unlikely(th_ctx->flags & TH_FL_TASK_PROFILING))
+			mem_wait_start = now_mono_time();
+
+		pool_free_nocache(pool, ptr);
+
+		if (unlikely(mem_wait_start))
+			th_ctx->mem_wait_total += now_mono_time() - mem_wait_start;
+	}
+	else {
+		/* this one will count its own time itself */
+		pool_put_to_cache(pool, ptr, caller);
+	}
 }
 
 /*
@@ -1037,7 +1130,8 @@ void *pool_destroy(struct pool_head *pool)
 
 			list_for_each_entry_safe(reg, back, &pool->regs, list) {
 				LIST_DELETE(&reg->list);
-				free(reg);
+				if (!(reg->flags & MEM_F_STATREG))
+					free(reg);
 			}
 
 			LIST_DELETE(&pool->list);
@@ -1225,33 +1319,31 @@ static int cmp_dump_pools_usage(const void *a, const void *b)
 		return 0;
 }
 
-/* will not dump more than this number of entries. Anything beyond this will
- * likely not fit into a regular output buffer anyway.
+/* This function fills the show_pools_ctx context by looping on pools. It will
+ * count the number of pools and allocate the array to store info about each
+ * pool. It returns 0 on success and -1 on error.
+ *
+ * It may sort pools by a criterion if bits 0..3 of <ctx->how> are non-zero, and
+ * limit the number of output lines if <ctx->maxcnt> is non-zero. It may limit
+ * only to pools whose names start with <ctx->prefix> if not null.
  */
-#define POOLS_MAX_DUMPED_ENTRIES 1024
-
-/* This function dumps memory usage information into the trash buffer.
- * It may sort by a criterion if bits 0..3 of <how> are non-zero, and
- * limit the number of output lines if <max> is non-zero. It may limit
- * only to pools whose names start with <pfx> if <pfx> is non-null.
- */
-void dump_pools_to_trash(int how, int max, const char *pfx)
+static int get_show_pools_info(struct show_pools_ctx *ctx)
 {
-	struct pool_dump_info pool_info[POOLS_MAX_DUMPED_ENTRIES];
 	struct pool_head *entry;
-	unsigned long long allocated, used;
-	int nbpools, i;
-	unsigned long long cached_bytes = 0;
-	uint cached = 0;
-	uint alloc_items;
-	int by_what = how & 0xF; // bits 0..3 = sorting criterion
-	int detailed = !!(how & 0x10); // print details
+	int by_what = (ctx->how & 0xF); // bits 0..3 = sorting criterion
+	int n = 0;
 
-	allocated = used = nbpools = 0;
+	ctx->nbpools = 0;
+	list_for_each_entry(entry, &pools, list)
+		ctx->nbpools++;
+
+	ctx->pool_info = calloc(ctx->nbpools, sizeof(*ctx->pool_info));
+	if (ctx->pool_info == NULL)
+		return -1;
 
 	list_for_each_entry(entry, &pools, list) {
-		if (nbpools >= POOLS_MAX_DUMPED_ENTRIES)
-			break;
+		uint cached = 0;
+		uint alloc_items;
 
 		alloc_items = pool_allocated(entry);
 		/* do not dump unused entries when sorting by usage */
@@ -1259,71 +1351,98 @@ void dump_pools_to_trash(int how, int max, const char *pfx)
 			continue;
 
 		/* verify the pool name if a prefix is requested */
-		if (pfx && strncmp(entry->name, pfx, strlen(pfx)) != 0)
+		if (ctx->prefix && strncmp(entry->name, ctx->prefix, strlen(ctx->prefix)) != 0)
 			continue;
 
 		if (!(pool_debugging & POOL_DBG_NO_CACHE)) {
-			for (cached = i = 0; i < global.nbthread; i++)
+			int i;
+
+			for (i = 0; i < global.nbthread; i++)
 				cached += entry->cache[i].count;
 		}
-		pool_info[nbpools].entry = entry;
-		pool_info[nbpools].alloc_items = alloc_items;
-		pool_info[nbpools].alloc_bytes = (ulong)entry->size * alloc_items;
-		pool_info[nbpools].used_items = pool_used(entry);
-		pool_info[nbpools].cached_items = cached;
-		pool_info[nbpools].need_avg = swrate_avg(pool_needed_avg(entry), POOL_AVG_SAMPLES);
-		pool_info[nbpools].failed_items = pool_failed(entry);
-		nbpools++;
+		ctx->pool_info[n].entry = entry;
+		ctx->pool_info[n].alloc_items = alloc_items;
+		ctx->pool_info[n].alloc_bytes = (ulong)entry->size * alloc_items;
+		ctx->pool_info[n].used_items = pool_used(entry);
+		ctx->pool_info[n].cached_items = cached;
+		ctx->pool_info[n].need_avg = swrate_avg(pool_needed_avg(entry), POOL_AVG_SAMPLES);
+		ctx->pool_info[n].failed_items = pool_failed(entry);
+
+		ctx->cached_bytes += ctx->pool_info[n].cached_items * (ulong)ctx->pool_info[n].entry->size;
+		ctx->allocated    += ctx->pool_info[n].alloc_items  * (ulong)ctx->pool_info[n].entry->size;
+		ctx->used         += ctx->pool_info[n].used_items   * (ulong)ctx->pool_info[n].entry->size;
+		n++;
 	}
 
 	if (by_what == 1)  /* sort by name */
-		qsort(pool_info, nbpools, sizeof(pool_info[0]), cmp_dump_pools_name);
+		qsort(ctx->pool_info, ctx->nbpools, sizeof(*ctx->pool_info), cmp_dump_pools_name);
 	else if (by_what == 2)  /* sort by item size */
-		qsort(pool_info, nbpools, sizeof(pool_info[0]), cmp_dump_pools_size);
+		qsort(ctx->pool_info, ctx->nbpools, sizeof(*ctx->pool_info), cmp_dump_pools_size);
 	else if (by_what == 3)  /* sort by total usage */
-		qsort(pool_info, nbpools, sizeof(pool_info[0]), cmp_dump_pools_usage);
+		qsort(ctx->pool_info, ctx->nbpools, sizeof(*ctx->pool_info), cmp_dump_pools_usage);
 
-	chunk_printf(&trash, "Dumping pools usage");
-	if (!max || max >= POOLS_MAX_DUMPED_ENTRIES)
-		max = POOLS_MAX_DUMPED_ENTRIES;
-	if (nbpools >= max)
-		chunk_appendf(&trash, " (limited to the first %u entries)", max);
-	chunk_appendf(&trash, ". Use SIGQUIT to flush them.\n");
+	if (!ctx->maxcnt || ctx->maxcnt > ctx->nbpools)
+		ctx->maxcnt = ctx->nbpools;
+	ctx->pool_idx = -1;
+	return 0;
+}
 
-	for (i = 0; i < nbpools && i < max; i++) {
-		chunk_appendf(&trash, "  - Pool %s (%lu bytes) : %lu allocated (%lu bytes), %lu used"
-			      " (~%lu by thread caches)"
-			      ", needed_avg %lu, %lu failures, %u users, @%p%s\n",
-		              pool_info[i].entry->name, (ulong)pool_info[i].entry->size,
-			      pool_info[i].alloc_items, pool_info[i].alloc_bytes,
-			      pool_info[i].used_items, pool_info[i].cached_items,
-			      pool_info[i].need_avg, pool_info[i].failed_items,
-		              pool_info[i].entry->users, pool_info[i].entry,
-		              (pool_info[i].entry->flags & MEM_F_SHARED) ? " [SHARED]" : "");
+/* This function dumps information about pools found in the applet context.
+ */
+int dump_pools_info(struct appctx *appctx)
+{
+	struct show_pools_ctx *ctx = appctx->svcctx;
+	int i;
 
-		cached_bytes += pool_info[i].cached_items * (ulong)pool_info[i].entry->size;
-		allocated    += pool_info[i].alloc_items  * (ulong)pool_info[i].entry->size;
-		used         += pool_info[i].used_items   * (ulong)pool_info[i].entry->size;
+	if (ctx->pool_idx == -1) {
+		chunk_printf(&trash, "Dumping pools usage");
+		if (ctx->nbpools >= ctx->maxcnt)
+			chunk_appendf(&trash, " (limited to the first %u entries)", ctx->maxcnt);
+		chunk_appendf(&trash, ". Use SIGQUIT to flush them.\n");
 
-		if (detailed) {
+		if (applet_putchk(appctx, &trash) == -1)
+			return 0;
+
+		ctx->pool_idx = 0;
+	}
+
+	for (i = ctx->pool_idx; i < ctx->nbpools && i < ctx->maxcnt; i++) {
+		chunk_printf(&trash, "  - Pool %s (%u bytes/%u) : %lu allocated (%lu bytes), %lu used"
+			     " (~%lu by thread caches)"
+			     ", needed_avg %lu, %lu failures, %u users, @%p%s\n",
+			     ctx->pool_info[i].entry->name, ctx->pool_info[i].entry->size, ctx->pool_info[i].entry->align,
+			     ctx->pool_info[i].alloc_items, ctx->pool_info[i].alloc_bytes,
+			     ctx->pool_info[i].used_items, ctx->pool_info[i].cached_items,
+			     ctx->pool_info[i].need_avg, ctx->pool_info[i].failed_items,
+			     ctx->pool_info[i].entry->users, ctx->pool_info[i].entry,
+			     (ctx->pool_info[i].entry->flags & MEM_F_SHARED) ? " [SHARED]" : "");
+
+		if (ctx->how & 0x10) { // print details
 			struct pool_registration *reg;
-			list_for_each_entry(reg, &pool_info[i].entry->regs, list)
-				chunk_appendf(&trash, "      >  %-12s: size=%u flags=%#x align=%u\n", reg->name, reg->size, reg->flags, reg->align);
+
+			list_for_each_entry(reg, &ctx->pool_info[i].entry->regs, list) {
+				chunk_appendf(&trash, "      >  %-12s: size=%u flags=%#x align=%u", reg->name, reg->size, reg->flags, reg->align);
+				if (reg->file && reg->line)
+					chunk_appendf(&trash, " [%s:%u]", reg->file, reg->line);
+				chunk_appendf(&trash, "\n");
+			}
+		}
+
+		if (applet_putchk(appctx, &trash) == -1) {
+			ctx->pool_idx = i;
+			return 0;
 		}
 	}
 
-	chunk_appendf(&trash, "Total: %d pools, %llu bytes allocated, %llu used"
-		      " (~%llu by thread caches)"
-		      ".\n",
-	              nbpools, allocated, used, cached_bytes
-		      );
-}
+	chunk_printf(&trash, "Total: %d pools, %llu bytes allocated, %llu used"
+		     " (~%llu by thread caches)"
+		     ".\n",
+		     ctx->nbpools, ctx->allocated, ctx->used, ctx->cached_bytes
+		);
+	if (applet_putchk(appctx, &trash) == -1)
+		return 0;
 
-/* Dump statistics on pools usage. */
-void dump_pools(void)
-{
-	dump_pools_to_trash(0, 0, NULL);
-	qfprintf(stderr, "%s", trash.area);
+	return 1;
 }
 
 /* This function returns the total number of failed pool allocations */
@@ -1493,6 +1612,9 @@ static int cli_parse_show_pools(char **args, char *payload, struct appctx *appct
 		else
 			return cli_err(appctx, "Expects either 'byname', 'bysize', 'byusage', 'match <pfx>', 'detailed', or a max number of output lines.\n");
 	}
+
+	if (get_show_pools_info(ctx) == -1)
+		return cli_err(appctx, "Failed to get info about pools.\n");
 	return 0;
 }
 
@@ -1501,33 +1623,29 @@ static void cli_release_show_pools(struct appctx *appctx)
 {
 	struct show_pools_ctx *ctx = appctx->svcctx;
 
+	ha_free(&ctx->pool_info);
 	ha_free(&ctx->prefix);
 }
 
 /* This function dumps memory usage information onto the stream connector's
  * read buffer. It returns 0 as long as it does not complete, non-zero upon
- * completion. No state is used.
+ * completion.
  */
 static int cli_io_handler_dump_pools(struct appctx *appctx)
 {
-	struct show_pools_ctx *ctx = appctx->svcctx;
-
-	dump_pools_to_trash(ctx->how, ctx->maxcnt, ctx->prefix);
-	if (applet_putchk(appctx, &trash) == -1)
-		return 0;
-	return 1;
+	return dump_pools_info(appctx);
 }
 
 /* callback used to create early pool <name> of size <size> and store the
  * resulting pointer into <ptr>. If the allocation fails, it quits with after
  * emitting an error message.
  */
-void create_pool_callback(struct pool_head **ptr, char *name, unsigned int size)
+void create_pool_callback(struct pool_head **ptr, char *name, struct pool_registration *reg)
 {
-	*ptr = create_pool(name, size, MEM_F_SHARED);
+	*ptr = create_pool_from_reg(name, reg);
 	if (!*ptr) {
 		ha_alert("Failed to allocate pool '%s' of size %u : %s. Aborting.\n",
-			 name, size, strerror(errno));
+			 name, reg->size, strerror(errno));
 		exit(1);
 	}
 }

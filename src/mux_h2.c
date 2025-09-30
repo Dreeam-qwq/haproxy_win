@@ -448,10 +448,10 @@ static struct stats_module h2_stats_module = {
 INITCALL1(STG_REGISTER, stats_register_module, &h2_stats_module);
 
 /* the h2c connection pool */
-DECLARE_STATIC_POOL(pool_head_h2c, "h2c", sizeof(struct h2c));
+DECLARE_STATIC_TYPED_POOL(pool_head_h2c, "h2c", struct h2c);
 
 /* the h2s stream pool */
-DECLARE_STATIC_POOL(pool_head_h2s, "h2s", sizeof(struct h2s));
+DECLARE_STATIC_TYPED_POOL(pool_head_h2s, "h2s", struct h2s);
 
 /* the shared rx_bufs pool */
 struct pool_head *pool_head_h2_rx_bufs __read_mostly = NULL;
@@ -924,7 +924,6 @@ static void h2c_update_timeout(struct h2c *h2c)
 					else if (h2c->flags & H2_CF_IDL_PING_SENT) {
 						/* timer other than ping selected, remove ping flag to allow GOAWAY on expiration. */
 						h2c->flags &= ~H2_CF_IDL_PING_SENT;
-						ABORT_NOW();
 					}
 				}
 			}
@@ -1013,7 +1012,7 @@ h2c_is_dead(const struct h2c *h2c)
  */
 static inline int h2_recv_allowed(const struct h2c *h2c)
 {
-	if ((h2c->flags & (H2_CF_RCVD_SHUT|H2_CF_ERROR)) || h2c->st0 >= H2_CS_ERROR)
+	if (h2c->flags & (H2_CF_RCVD_SHUT|H2_CF_ERROR))
 		return 0;
 
 	if ((h2c->wait_event.events & SUB_RETRY_RECV))
@@ -1517,9 +1516,6 @@ static void h2_release(struct h2c *h2c)
 	pool_free(pool_head_h2c, h2c);
 
 	if (conn) {
-		if (!conn_is_back(conn))
-			LIST_DEL_INIT(&conn->stopping_list);
-
 		conn->mux = NULL;
 		conn->ctx = NULL;
 		TRACE_DEVEL("freeing conn", H2_EV_H2C_END, conn);
@@ -4754,7 +4750,7 @@ static int h2_recv(struct h2c *h2c)
 	else
 		max = b_room(buf);
 
-	ret = max ? conn->xprt->rcv_buf(conn, conn->xprt_ctx, buf, max, 0) : 0;
+	ret = max ? conn->xprt->rcv_buf(conn, conn->xprt_ctx, buf, max, NULL, NULL, 0) : 0;
 
 	if (max && !ret && h2_recv_allowed(h2c)) {
 		TRACE_DATA("failed to receive data, subscribing", H2_EV_H2C_RECV, h2c->conn);
@@ -4804,7 +4800,7 @@ static int h2_send(struct h2c *h2c)
 		TRACE_DEVEL("leaving on error", H2_EV_H2C_SEND, h2c->conn);
 		if (h2c->flags & H2_CF_END_REACHED)
 			h2c->flags |= H2_CF_ERROR;
-		b_reset(br_tail(h2c->mbuf));
+		h2_release_mbuf(h2c);
 		h2c->idle_start = now_ms;
 		return 1;
 	}
@@ -4862,7 +4858,7 @@ static int h2_send(struct h2c *h2c)
 
 		for (buf = br_head(h2c->mbuf); b_size(buf); buf = br_del_head(h2c->mbuf)) {
 			if (b_data(buf)) {
-				int ret = conn->xprt->snd_buf(conn, conn->xprt_ctx, buf, b_data(buf),
+				int ret = conn->xprt->snd_buf(conn, conn->xprt_ctx, buf, b_data(buf), NULL, 0,
 							      flags | (to_send > 1 ? CO_SFL_MSG_MORE : 0));
 				if (!ret) {
 					done = 1;
@@ -4903,7 +4899,7 @@ static int h2_send(struct h2c *h2c)
 		h2c_report_term_evt(h2c, muxc_tevt_type_snd_err);
 		if (h2c->flags & H2_CF_END_REACHED)
 			h2c->flags |= H2_CF_ERROR;
-		b_reset(br_tail(h2c->mbuf));
+		h2_release_mbuf(h2c);
 	}
 
 	/* We're not full anymore, so we can wake any task that are waiting
@@ -4963,9 +4959,16 @@ struct task *h2_io_cb(struct task *t, void *ctx, unsigned int state)
 		/* Remove the connection from the list, to be sure nobody attempts
 		 * to use it while we handle the I/O events
 		 */
-		conn_in_list = conn->flags & CO_FL_LIST_MASK;
-		if (conn_in_list)
-			conn_delete_from_tree(conn);
+		conn_in_list = conn->flags & (CO_FL_LIST_MASK|CO_FL_SESS_IDLE);
+		if (conn_in_list) {
+			if (conn->flags & CO_FL_SESS_IDLE) {
+				if (!session_detach_idle_conn(conn->owner, conn))
+					conn_in_list = 0;
+			}
+			else {
+				conn_delete_from_tree(conn, tid);
+			}
+		}
 
 		HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
 	} else {
@@ -4994,16 +4997,36 @@ struct task *h2_io_cb(struct task *t, void *ctx, unsigned int state)
 		h2c->next_tasklet = NULL;
 
 	if (!ret && conn_in_list) {
-		struct server *srv = __objt_server(conn->target);
+		struct server *srv = objt_server(conn->target);
 
-		HA_SPIN_LOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
-		_srv_add_idle(srv, conn, conn_in_list == CO_FL_SAFE_LIST);
-		HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
+		if (!srv || !(srv->cur_admin & SRV_ADMF_MAINT)) {
+			if (conn->flags & CO_FL_SESS_IDLE) {
+				if (!session_reinsert_idle_conn(conn->owner, conn)) {
+					/* session add conn failure */
+					goto release;
+				}
+			}
+			else {
+				ASSUME_NONNULL(srv); /* srv is guaranteed by CO_FL_LIST_MASK */
+				HA_SPIN_LOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
+				_srv_add_idle(srv, conn, conn_in_list == CO_FL_SAFE_LIST);
+				HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
+			}
+		}
+		else {
+			/* Do not store an idle conn if server in maintenance. */
+			goto release;
+		}
 	}
 
-leave:
+ leave:
 	TRACE_LEAVE(H2_EV_H2C_WAKE);
 	return t;
+
+ release:
+	TRACE_LEAVE(H2_EV_H2C_WAKE);
+	h2_release(h2c);
+	return NULL;
 }
 
 /* callback called on any event by the connection handler.
@@ -5014,6 +5037,7 @@ static int h2_process(struct h2c *h2c)
 {
 	struct connection *conn = h2c->conn;
 	int extra_reads = MIN(MAX(bl_avail(h2c->shared_rx_bufs), 1) - 1, 12);
+	int was_blocked = 0;
 
 	TRACE_ENTER(H2_EV_H2C_WAKE, conn);
 
@@ -5045,9 +5069,12 @@ static int h2_process(struct h2c *h2c)
 		if (h2c->glitches != prev_glitches && !(h2c->flags & H2_CF_IS_BACK))
 			session_add_glitch_ctr(h2c->conn->owner, h2c->glitches - prev_glitches);
 
-		if (h2c->st0 >= H2_CS_ERROR || (h2c->flags & H2_CF_ERROR))
+		if (h2c->st0 >= H2_CS_ERROR || (h2c->flags & H2_CF_ERROR)) {
 			b_reset(&h2c->dbuf);
+			h2c->flags &= ~H2_CF_DEM_DFULL;
+		}
 	}
+	was_blocked |= !!(h2c->flags & H2_CF_DEM_MROOM);
 	h2_send(h2c);
 
 	if (unlikely(h2c->proxy->flags & (PR_FL_DISABLED|PR_FL_STOPPED)) && !(h2c->flags & H2_CF_IS_BACK)) {
@@ -5116,7 +5143,7 @@ static int h2_process(struct h2c *h2c)
 		/* connections in error must be removed from the idle lists */
 		if (conn->flags & CO_FL_LIST_MASK) {
 			HA_SPIN_LOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
-			conn_delete_from_tree(conn);
+			conn_delete_from_tree(conn, tid);
 			HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
 		}
 	}
@@ -5124,7 +5151,7 @@ static int h2_process(struct h2c *h2c)
 		/* connections in error must be removed from the idle lists */
 		if (conn->flags & CO_FL_LIST_MASK) {
 			HA_SPIN_LOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
-			conn_delete_from_tree(conn);
+			conn_delete_from_tree(conn, tid);
 			HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
 		}
 	}
@@ -5140,7 +5167,13 @@ static int h2_process(struct h2c *h2c)
 		h2_release_mbuf(h2c);
 
 	h2c_update_timeout(h2c);
+
+	was_blocked |= !!(h2c->flags & H2_CF_DEM_MROOM);
 	h2_send(h2c);
+
+	if (was_blocked && !(h2c->flags & H2_CF_DEM_MROOM))
+		h2c_restart_reading(h2c, 1);
+
 	TRACE_LEAVE(H2_EV_H2C_WAKE, conn);
 	return 0;
 }
@@ -5226,7 +5259,9 @@ struct task *h2_timeout_task(struct task *t, void *context, unsigned int state)
 		 * to steal it from us.
 		 */
 		if (h2c->conn->flags & CO_FL_LIST_MASK)
-			conn_delete_from_tree(h2c->conn);
+			conn_delete_from_tree(h2c->conn, tid);
+		else if (h2c->conn->flags & CO_FL_SESS_IDLE)
+			session_detach_idle_conn(h2c->conn->owner, h2c->conn);
 
 		HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
 
@@ -5282,7 +5317,7 @@ do_leave:
 
 		for (buf = br_head(h2c->mbuf); b_size(buf); buf = br_del_head(h2c->mbuf)) {
 			if (b_data(buf)) {
-				int ret = h2c->conn->xprt->snd_buf(h2c->conn, h2c->conn->xprt_ctx, buf, b_data(buf), 0);
+				int ret = h2c->conn->xprt->snd_buf(h2c->conn, h2c->conn->xprt_ctx, buf, b_data(buf), NULL, 0, 0);
 				if (!ret)
 					break;
 				b_del(buf, ret);
@@ -5306,7 +5341,7 @@ do_leave:
 	/* in any case this connection must not be considered idle anymore */
 	if (h2c->conn->flags & CO_FL_LIST_MASK) {
 		HA_SPIN_LOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
-		conn_delete_from_tree(h2c->conn);
+		conn_delete_from_tree(h2c->conn, tid);
 		HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
 	}
 
@@ -5533,24 +5568,36 @@ static void h2_detach(struct sedesc *sd)
 
 			if (h2c->conn->flags & CO_FL_PRIVATE) {
 				/* Add the connection in the session server list, if not already done */
-				if (!session_add_conn(sess, h2c->conn, h2c->conn->target)) {
+				if (!session_add_conn(sess, h2c->conn))
 					h2c->conn->owner = NULL;
-					if (eb_is_empty(&h2c->streams_by_id)) {
+
+				if (eb_is_empty(&h2c->streams_by_id)) {
+					if (!h2c->conn->owner) {
+						/* Session insertion above has failed and connection is idle, remove it. */
 						h2c->conn->mux->destroy(h2c);
 						TRACE_DEVEL("leaving on error after killing outgoing connection", H2_EV_STRM_END|H2_EV_H2C_ERR);
 						return;
 					}
-				}
-				if (eb_is_empty(&h2c->streams_by_id)) {
+
 					/* mark that the tasklet may lose its context to another thread and
 					 * that the handler needs to check it under the idle conns lock.
 					 */
 					HA_ATOMIC_OR(&h2c->wait_event.tasklet->state, TASK_F_USR1);
-					if (session_check_idle_conn(h2c->conn->owner, h2c->conn) != 0) {
-						/* At this point either the connection is destroyed, or it's been added to the server idle list, just stop */
+					xprt_set_idle(h2c->conn, h2c->conn->xprt, h2c->conn->xprt_ctx);
+
+					/* Ensure session can keep a new idle connection. */
+					if (session_check_idle_conn(sess, h2c->conn) != 0) {
+						h2c->conn->mux->destroy(h2c);
 						TRACE_DEVEL("leaving without reusable idle connection", H2_EV_STRM_END);
 						return;
 					}
+
+					/* At this point, the connection is inserted into
+					 * session list and marked as idle, so it may already
+					 * have been purged from another thread.
+					 */
+					TRACE_DEVEL("private connection marked as idle", H2_EV_STRM_END);
+					return;
 				}
 			}
 			else {
@@ -5583,7 +5630,7 @@ static void h2_detach(struct sedesc *sd)
 					return;
 
 				}
-				else if (!h2c->conn->hash_node->node.node.leaf_p &&
+				else if (!ceb_intree(&h2c->conn->hash_node.node) &&
 					 h2_avail_streams(h2c->conn) > 0 && objt_server(h2c->conn->target) &&
 					 !LIST_INLIST(&h2c->conn->sess_el)) {
 					srv_add_to_avail_list(__objt_server(h2c->conn->target), h2c->conn);
@@ -7902,7 +7949,8 @@ static size_t h2_snd_buf(struct stconn *sc, struct buffer *buf, size_t count, in
 	}
 
 	/* RST are sent similarly to frame acks */
-	if (h2s->st == H2_SS_ERROR || h2s->flags & H2_SF_RST_RCVD) {
+	if (h2s->st == H2_SS_ERROR || h2s->flags & H2_SF_RST_RCVD ||
+	    ((h2s->h2c->flags & H2_CF_END_REACHED) && (h2s->flags & (H2_SF_BLK_SFCTL|H2_SF_BLK_MFCTL)))) {
 		TRACE_DEVEL("reporting RST/error to the app-layer stream", H2_EV_H2S_SEND|H2_EV_H2S_ERR|H2_EV_STRM_ERR, h2s->h2c->conn, h2s);
 		se_fl_set_error(h2s->sd);
 		se_report_term_evt(h2s->sd, se_tevt_type_snd_err);
@@ -8075,6 +8123,17 @@ static size_t h2_nego_ff(struct stconn *sc, struct buffer *input, size_t count, 
  end:
 	if (h2s->sd->iobuf.flags & IOBUF_FL_FF_BLOCKED)
 		h2s->flags &= ~H2_SF_NOTIFIED;
+
+	/* RST are sent similarly to frame acks */
+	if (h2s->st == H2_SS_ERROR || h2s->flags & H2_SF_RST_RCVD ||
+	    ((h2c->flags & H2_CF_END_REACHED) && (h2s->flags & (H2_SF_BLK_SFCTL|H2_SF_BLK_MFCTL)))) {
+		TRACE_DEVEL("reporting RST/error to the app-layer stream", H2_EV_H2S_SEND|H2_EV_H2S_ERR|H2_EV_STRM_ERR, h2s->h2c->conn, h2s);
+		se_fl_set_error(h2s->sd);
+		se_report_term_evt(h2s->sd, se_tevt_type_snd_err);
+		if (h2s_send_rst_stream(h2s->h2c, h2s) > 0)
+			h2s_close(h2s);
+	}
+
 	TRACE_LEAVE(H2_EV_H2S_SEND|H2_EV_STRM_SEND, h2s->h2c->conn, h2s);
 	return ret;
 }
@@ -8336,18 +8395,21 @@ static int h2_takeover(struct connection *conn, int orig_tid, int release)
 	struct task *new_task = NULL;
 	struct tasklet *new_tasklet = NULL;
 
+	/* If the connection is attached to a buffer_wait (extremely rare),
+	 * it will be woken up at any instant by its own thread and we can't
+	 * undo it anyway, so let's give up on this one. It's not interesting
+	 * at least for reuse anyway since it's not usable right now.
+	 *
+	 * TODO if takeover is used to free conn (release == 1), buf_wait may
+	 * prevent this which is not desirable.
+	 */
+	if (LIST_INLIST(&h2c->buf_wait.list))
+		goto fail;
+
 	/* Pre-allocate tasks so that we don't have to roll back after the xprt
 	 * has been migrated.
 	 */
 	if (!release) {
-		/* If the connection is attached to a buffer_wait (extremely
-		 * rare), it will be woken up at any instant by its own thread
-		 * and we can't undo it anyway, so let's give up on this one.
-		 * It's not interesting anyway since it's not usable right now.
-		 */
-		if (LIST_INLIST(&h2c->buf_wait.list))
-			goto fail;
-
 		new_task = task_new_here();
 		new_tasklet = tasklet_new();
 		if (!new_task || !new_tasklet)
@@ -8402,20 +8464,6 @@ static int h2_takeover(struct connection *conn, int orig_tid, int release)
 		h2c->wait_event.tasklet->context = h2c;
 		h2c->conn->xprt->subscribe(h2c->conn, h2c->conn->xprt_ctx,
 		                           SUB_RETRY_RECV, &h2c->wait_event);
-	}
-
-	if (release) {
-		/* we're being called for a server deletion and are running
-		 * under thread isolation. That's the only way we can
-		 * unregister a possible subscription of the original
-		 * connection from its owner thread's queue, as this involves
-		 * manipulating thread-unsafe areas. Note that it is not
-		 * possible to just call b_dequeue() here as it would update
-		 * the current thread's bufq_map and not the original one.
-		 */
-		BUG_ON(!thread_isolated());
-		if (LIST_INLIST(&h2c->buf_wait.list))
-			_b_dequeue(&h2c->buf_wait, orig_tid);
 	}
 
 	if (new_task)

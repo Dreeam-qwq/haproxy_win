@@ -27,13 +27,13 @@
 extern struct task *process_stream(struct task *t, void *context, unsigned int state);
 extern void stream_update_timings(struct task *t, uint64_t lat, uint64_t cpu);
 
-DECLARE_POOL(pool_head_task,    "task",    sizeof(struct task));
-DECLARE_POOL(pool_head_tasklet, "tasklet", sizeof(struct tasklet));
+DECLARE_TYPED_POOL(pool_head_task,    "task",    struct task, 0, 64);
+DECLARE_TYPED_POOL(pool_head_tasklet, "tasklet", struct tasklet, 0, 64);
 
 /* This is the memory pool containing all the signal structs. These
  * struct are used to store each required signal between two tasks.
  */
-DECLARE_POOL(pool_head_notification, "notification", sizeof(struct notification));
+DECLARE_TYPED_POOL(pool_head_notification, "notification", struct notification);
 
 /* The lock protecting all wait queues at once. For now we have no better
  * alternative since a task may have to be removed from a queue and placed
@@ -569,6 +569,9 @@ unsigned int run_tasks_from_lists(unsigned int budgets[])
 		process = t->process;
 		t->calls++;
 
+		th_ctx->lock_wait_total = 0;
+		th_ctx->mem_wait_total = 0;
+		th_ctx->locked_total = 0;
 		th_ctx->sched_wake_date = t->wake_date;
 		if (th_ctx->sched_wake_date || (t->state & TASK_F_WANTS_TIME)) {
 			/* take the most accurate clock we have, either
@@ -678,10 +681,18 @@ unsigned int run_tasks_from_lists(unsigned int budgets[])
 		__ha_barrier_store();
 
 		/* stats are only registered for non-zero wake dates */
-		if (unlikely(th_ctx->sched_wake_date))
+		if (unlikely(th_ctx->sched_wake_date)) {
 			HA_ATOMIC_ADD(&profile_entry->cpu_time, (uint32_t)(now_mono_time() - th_ctx->sched_call_date));
+			if (th_ctx->lock_wait_total)
+				HA_ATOMIC_ADD(&profile_entry->lkw_time, th_ctx->lock_wait_total);
+			if (th_ctx->mem_wait_total)
+				HA_ATOMIC_ADD(&profile_entry->mem_time, th_ctx->mem_wait_total);
+			if (th_ctx->locked_total)
+				HA_ATOMIC_ADD(&profile_entry->lkd_time, th_ctx->locked_total);
+		}
 	}
 	th_ctx->current_queue = -1;
+	th_ctx->sched_wake_date = TICK_ETERNITY;
 
 	return done;
 }

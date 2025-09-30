@@ -42,7 +42,7 @@ struct comp_state {
 };
 
 /* Pools used to allocate comp_state structs */
-DECLARE_STATIC_POOL(pool_head_comp_state, "comp_state", sizeof(struct comp_state));
+DECLARE_STATIC_TYPED_POOL(pool_head_comp_state, "comp_state", struct comp_state);
 
 static THREAD_LOCAL struct buffer tmpbuf;
 static THREAD_LOCAL struct buffer zbuf;
@@ -151,8 +151,9 @@ comp_prepare_compress_request(struct comp_state *st, struct stream *s, struct ht
 	comp_type = NULL;
 
 	/* compress only if body size is >= than the min size */
-	if ((s->be->comp && (comp_minsize = s->be->comp->minsize_req)) ||
-		(strm_fe(s)->comp && (comp_minsize = strm_fe(s)->comp->minsize_req))) {
+	if (((msg->flags & HTTP_MSGF_CNT_LEN) || (htx->flags & HTX_FL_EOM)) &&
+	    ((s->be->comp && (comp_minsize = s->be->comp->minsize_req)) ||
+	     (strm_fe(s)->comp && (comp_minsize = strm_fe(s)->comp->minsize_req)))) {
 		for (pos = htx_get_first(htx); pos != -1; pos = htx_get_next(htx, pos)) {
 			struct htx_blk *blk = htx_get_blk(htx, pos);
 			enum htx_blk_type type = htx_get_blk_type(blk);
@@ -393,14 +394,20 @@ comp_http_payload(struct stream *s, struct filter *filter, struct http_msg *msg,
 
 	if (st->comp_ctx[dir] && st->comp_ctx[dir]->cur_lvl > 0) {
 		update_freq_ctr(&global.comp_bps_in, consumed);
-		_HA_ATOMIC_ADD(&strm_fe(s)->fe_counters.shared->tg[tgid - 1]->comp_in[dir], consumed);
-		_HA_ATOMIC_ADD(&s->be->be_counters.shared->tg[tgid - 1]->comp_in[dir], consumed);
+		if (s->sess->fe_tgcounters) {
+			_HA_ATOMIC_ADD(&s->sess->fe_tgcounters->comp_in[dir], consumed);
+			_HA_ATOMIC_ADD(&s->sess->fe_tgcounters->comp_out[dir], to_forward);
+		}
+		if (s->be_tgcounters) {
+			_HA_ATOMIC_ADD(&s->be_tgcounters->comp_in[dir], consumed);
+			_HA_ATOMIC_ADD(&s->be_tgcounters->comp_out[dir], to_forward);
+		}
 		update_freq_ctr(&global.comp_bps_out, to_forward);
-		_HA_ATOMIC_ADD(&strm_fe(s)->fe_counters.shared->tg[tgid - 1]->comp_out[dir], to_forward);
-		_HA_ATOMIC_ADD(&s->be->be_counters.shared->tg[tgid - 1]->comp_out[dir], to_forward);
 	} else {
-		_HA_ATOMIC_ADD(&strm_fe(s)->fe_counters.shared->tg[tgid - 1]->comp_byp[dir], consumed);
-		_HA_ATOMIC_ADD(&s->be->be_counters.shared->tg[tgid - 1]->comp_byp[dir], consumed);
+		if (s->sess->fe_tgcounters)
+			_HA_ATOMIC_ADD(&s->sess->fe_tgcounters->comp_byp[dir], consumed);
+		if (s->be_tgcounters)
+			_HA_ATOMIC_ADD(&s->be_tgcounters->comp_byp[dir], consumed);
 	}
 	return to_forward;
 
@@ -418,10 +425,11 @@ comp_http_end(struct stream *s, struct filter *filter,
 	if (!(msg->chn->flags & CF_ISRESP) || !st || !st->comp_algo[COMP_DIR_RES])
 		goto end;
 
-	if (strm_fe(s)->mode == PR_MODE_HTTP)
-		_HA_ATOMIC_INC(&strm_fe(s)->fe_counters.shared->tg[tgid - 1]->p.http.comp_rsp);
-	if ((s->flags & SF_BE_ASSIGNED) && (s->be->mode == PR_MODE_HTTP))
-		_HA_ATOMIC_INC(&s->be->be_counters.shared->tg[tgid - 1]->p.http.comp_rsp);
+	if (strm_fe(s)->mode == PR_MODE_HTTP && s->sess->fe_tgcounters)
+		_HA_ATOMIC_INC(&s->sess->fe_tgcounters->p.http.comp_rsp);
+	if ((s->flags & SF_BE_ASSIGNED) && (s->be->mode == PR_MODE_HTTP) &&
+	    s->be_tgcounters)
+		_HA_ATOMIC_INC(&s->be_tgcounters->p.http.comp_rsp);
  end:
 	return 1;
 }
@@ -677,8 +685,9 @@ select_compression_response_header(struct comp_state *st, struct stream *s, stru
 		goto fail;
 
 	/* compress only if body size is >= than the min size */
-	if ((s->be->comp && (comp_minsize = s->be->comp->minsize_res)) ||
-		(strm_fe(s)->comp && (comp_minsize = strm_fe(s)->comp->minsize_res))) {
+	if (((msg->flags & HTTP_MSGF_CNT_LEN) || (htx->flags & HTX_FL_EOM)) &&
+	    ((s->be->comp && (comp_minsize = s->be->comp->minsize_res)) ||
+	     (strm_fe(s)->comp && (comp_minsize = strm_fe(s)->comp->minsize_res)))) {
 		for (pos = htx_get_first(htx); pos != -1; pos = htx_get_next(htx, pos)) {
 			struct htx_blk *blk = htx_get_blk(htx, pos);
 			enum htx_blk_type type = htx_get_blk_type(blk);
@@ -830,6 +839,11 @@ parse_compression_options(char **args, int section, struct proxy *proxy,
 
 	if (proxy->comp == NULL) {
 		comp = calloc(1, sizeof(*comp));
+		if (unlikely(!comp)) {
+			memprintf(err, "'%s': out of memory.", args[0]);
+			ret = -1;
+			goto end;
+		}
 		/* Always default to compress responses */
 		comp->flags = COMP_FL_DIR_RES;
 		proxy->comp = comp;

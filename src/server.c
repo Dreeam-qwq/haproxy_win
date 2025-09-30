@@ -16,7 +16,9 @@
 #include <ctype.h>
 #include <errno.h>
 
-#include <import/ebmbtree.h>
+#include <import/ceb64_tree.h>
+#include <import/cebis_tree.h>
+#include <import/eb64tree.h>
 
 #include <haproxy/api.h>
 #include <haproxy/applet-t.h>
@@ -53,7 +55,6 @@
 #include <haproxy/tools.h>
 #include <haproxy/xxhash.h>
 #include <haproxy/event_hdl.h>
-
 
 static void srv_update_status(struct server *s, int type, int cause);
 static int srv_apply_lastaddr(struct server *srv, int *err_code);
@@ -137,6 +138,11 @@ static const char *srv_op_st_chg_cause_str[] = {
 	[SRV_OP_STCHGC_STATS_WEB] = "changed from Web interface",
 	[SRV_OP_STCHGC_STATEFILE] = "changed from server-state after a reload"
 };
+
+static void srv_reset_path_parameters(struct server *s)
+{
+	s->path_params.nego_alpn[0] = 0;
+}
 
 const char *srv_op_st_chg_cause(enum srv_op_st_chg_cause cause)
 {
@@ -725,25 +731,25 @@ static void srv_set_addr_desc(struct server *s, int reattach)
 
 	key = sa2str(&s->addr, s->svc_port, s->flags & SRV_F_MAPPORTS);
 
-	if (s->addr_node.key) {
-		if (key && strcmp(key, s->addr_node.key) == 0) {
+	if (s->addr_key) {
+		if (key && strcmp(key, s->addr_key) == 0) {
 			free(key);
 			return;
 		}
 
 		HA_RWLOCK_WRLOCK(PROXY_LOCK, &p->lock);
-		ebpt_delete(&s->addr_node);
+		cebuis_item_delete(&p->used_server_addr, addr_node, addr_key, s);
 		HA_RWLOCK_WRUNLOCK(PROXY_LOCK, &p->lock);
 
-		free(s->addr_node.key);
+		free(s->addr_key);
 	}
 
-	s->addr_node.key = key;
+	s->addr_key = key;
 
 	if (reattach) {
-		if (s->addr_node.key) {
+		if (s->addr_key) {
 			HA_RWLOCK_WRLOCK(PROXY_LOCK, &p->lock);
-			ebis_insert(&p->used_server_addr, &s->addr_node);
+			cebuis_item_insert(&p->used_server_addr, addr_node, addr_key, s);
 			HA_RWLOCK_WRUNLOCK(PROXY_LOCK, &p->lock);
 		}
 	}
@@ -859,6 +865,23 @@ static const char *srv_find_best_kw(const char *word)
 		best_ptr = NULL;
 
 	return best_ptr;
+}
+
+/* This function returns the first unused server ID greater than or equal to
+ * <from> in the proxy <px>. Zero is returned if no spare one is found (should
+ * never happen).
+ */
+uint server_get_next_id(const struct proxy *px, uint from)
+{
+	const struct server *sv;
+
+	do {
+		sv = ceb32_item_lookup_ge(&px->conf.used_server_id, conf.puid_node, puid, from, struct server);
+		if (!sv || sv->puid > from)
+			return from; /* available */
+		from++;
+	} while (from);
+	return from;
 }
 
 /* Parse the "backup" server keyword */
@@ -1280,7 +1303,7 @@ static int srv_parse_pool_max_conn(char **args, int *cur_arg, struct proxy *curp
 /* parse the "id" server keyword */
 static int srv_parse_id(char **args, int *cur_arg, struct proxy *curproxy, struct server *newsrv, char **err)
 {
-	struct eb32_node *node;
+	struct server *target;
 
 	if (!*args[*cur_arg + 1]) {
 		memprintf(err, "'%s' : expects an integer argument", args[*cur_arg]);
@@ -1288,16 +1311,14 @@ static int srv_parse_id(char **args, int *cur_arg, struct proxy *curproxy, struc
 	}
 
 	newsrv->puid = atol(args[*cur_arg + 1]);
-	newsrv->conf.id.key = newsrv->puid;
 
 	if (newsrv->puid <= 0) {
 		memprintf(err, "'%s' : custom id has to be > 0", args[*cur_arg]);
 		return ERR_ALERT | ERR_FATAL;
 	}
 
-	node = eb32_lookup(&curproxy->conf.used_server_id, newsrv->puid);
-	if (node) {
-		struct server *target = container_of(node, struct server, conf.id);
+	target = server_find_by_id(curproxy, newsrv->puid);
+	if (target) {
 		memprintf(err, "'%s' : custom id %d already used at %s:%d ('server %s')",
 		          args[*cur_arg], newsrv->puid, target->conf.file, target->conf.line,
 		          target->id);
@@ -2761,16 +2782,29 @@ static void srv_ssl_settings_cpy(struct server *srv, const struct server *src)
  *
  * Must be called with the server lock held.
  */
-void srv_set_ssl(struct server *s, int use_ssl)
+int srv_set_ssl(struct server *s, int use_ssl)
 {
 	if (s->use_ssl == use_ssl)
-		return;
+		return 0;
 
 	s->use_ssl = use_ssl;
-	if (s->use_ssl)
+	if (s->use_ssl) {
+		if (server_parse_exprs(s, s->proxy, NULL))
+			return -1;
 		s->xprt = xprt_get(XPRT_SSL);
-	else
+	}
+	else {
+		if (s->sni_expr && s->pool_conn_name && strcmp(s->sni_expr, s->pool_conn_name) == 0) {
+			release_sample_expr(s->pool_conn_name_expr);
+			s->pool_conn_name_expr = NULL;
+		}
 		s->xprt = xprt_get(XPRT_RAW);
+	}
+	/* Check if we must rely on the server XPRT for the health-check */
+	if (!s->check.port && !is_addr(&s->check.addr) && !s->check.use_ssl)
+		s->check.xprt = s->xprt;
+
+	return 0;
 }
 
 #endif /* USE_OPENSSL */
@@ -2900,9 +2934,17 @@ void srv_settings_cpy(struct server *srv, const struct server *src, int srv_tmpl
 	srv->agent.addr               = src->agent.addr;
 	srv->check.use_ssl            = src->check.use_ssl;
 	srv->check.port               = src->check.port;
-	srv->check.sni                = src->check.sni;
-	srv->check.alpn_str           = src->check.alpn_str;
-	srv->check.alpn_len           = src->check.alpn_len;
+	if (src->check.sni != NULL)
+		srv->check.sni = strdup(src->check.sni);
+	if (src->check.alpn_str) {
+		srv->check.alpn_str = malloc(src->check.alpn_len);
+		if (srv->check.alpn_str) {
+			memcpy(srv->check.alpn_str, src->check.alpn_str,
+			       src->check.alpn_len);
+			srv->check.alpn_len = src->check.alpn_len;
+		}
+	}
+
 	if (!(srv->flags & SRV_F_RHTTP))
 		srv->check.reuse_pool = src->check.reuse_pool;
 	if (src->check.pool_conn_name)
@@ -2986,6 +3028,8 @@ void srv_settings_cpy(struct server *srv, const struct server *src, int srv_tmpl
 	if (src->tcp_md5sig != NULL)
 		srv->tcp_md5sig = strdup(src->tcp_md5sig);
 #endif
+	if (src->cc_algo != NULL)
+		srv->cc_algo = strdup(src->cc_algo);
 #ifdef TCP_USER_TIMEOUT
 	srv->tcp_ut = src->tcp_ut;
 #endif
@@ -3042,7 +3086,7 @@ struct server *new_server(struct proxy *proxy)
 {
 	struct server *srv;
 
-	srv = calloc(1, sizeof *srv);
+	srv = srv_alloc();
 	if (!srv)
 		return NULL;
 
@@ -3071,8 +3115,6 @@ struct server *new_server(struct proxy *proxy)
 	srv->agent.server = srv;
 	srv->agent.proxy = proxy;
 	srv->xprt  = srv->check.xprt = srv->agent.xprt = xprt_get(XPRT_RAW);
-
-	MT_LIST_INIT(&srv->sess_conns);
 
 	guid_init(&srv->guid);
 	MT_LIST_INIT(&srv->watcher_list);
@@ -3122,16 +3164,17 @@ void srv_free_params(struct server *srv)
 	free(srv->hostname);
 	free(srv->hostname_dn);
 	free((char*)srv->conf.file);
-	free(srv->per_thr);
-	free(srv->per_tgrp);
-	free(srv->curr_idle_thr);
+	ha_aligned_free(srv->per_thr);
+	ha_aligned_free(srv->per_tgrp);
+	ha_aligned_free(srv->curr_idle_thr);
 	free(srv->pool_conn_name);
 	release_sample_expr(srv->pool_conn_name_expr);
 	free(srv->resolvers_id);
+	free(srv->cc_algo);
 	free(srv->tcp_md5sig);
-	free(srv->addr_node.key);
+	free(srv->addr_key);
 	free(srv->lb_nodes);
-	counters_be_shared_drop(srv->counters.shared);
+	counters_be_shared_drop(&srv->counters.shared);
 	if (srv->log_target) {
 		deinit_log_target(srv->log_target);
 		free(srv->log_target);
@@ -3180,10 +3223,10 @@ struct server *srv_drop(struct server *srv)
 	/* This BUG_ON() is invalid for now as server released on deinit will
 	 * trigger it as they are not properly removed from their tree.
 	 */
-	//BUG_ON(srv->addr_node.node.leaf_p ||
+	//BUG_ON(ceb_intree(&srv->addr_node) ||
 	//       srv->idle_node.node.leaf_p ||
 	//       srv->conf.id.node.leaf_p ||
-	//       srv->conf.name.node.leaf_p);
+	//       ceb_intree(&srv->name_node));
 
 	guid_remove(&srv->guid);
 
@@ -3202,7 +3245,7 @@ struct server *srv_drop(struct server *srv)
 
 	EXTRA_COUNTERS_FREE(srv->extra_counters);
 
-	ha_free(&srv);
+	srv_free(&srv);
 
  end:
 	return next;
@@ -3282,6 +3325,41 @@ static inline void _srv_parse_set_id_from_prefix(struct server *srv,
 	srv->id = strdup(trash.area);
 }
 
+/* Parse the sni and pool-conn-name expressions. Returns 0 on success and non-zero on
+ * error. */
+int server_parse_exprs(struct server *srv, struct proxy *px, char **errmsg)
+{
+	int ret = 0;
+
+	if (srv->use_ssl == 1) {
+		/* Use sni as fallback if pool_conn_name isn't set, but only if
+		 * the server is configured to use SSL */
+		if (!srv->pool_conn_name && srv->sni_expr) {
+			srv->pool_conn_name = strdup(srv->sni_expr);
+			if (!srv->pool_conn_name) {
+				memprintf(errmsg, "cannot duplicate sni expression (out of memory)");
+				ret = ERR_ALERT | ERR_FATAL;
+				goto out;
+			}
+		}
+	}
+
+	if (srv->sni_expr && !srv->ssl_ctx.sni) {
+		ret = parse_srv_expr(srv->sni_expr, &srv->ssl_ctx.sni, px, errmsg);
+		if (ret)
+			goto out;
+	}
+
+	if (srv->pool_conn_name && !srv->pool_conn_name_expr) {
+		ret = parse_srv_expr(srv->pool_conn_name, &srv->pool_conn_name_expr, px, errmsg);
+		if (ret)
+			goto out;
+	}
+
+  out:
+	return ret;
+}
+
 /* Initialize as much as possible servers from <srv> server template.
  * Note that a server template is a special server with
  * a few different parameters than a server which has
@@ -3300,8 +3378,7 @@ static int _srv_parse_tmpl_init(struct server *srv, struct proxy *px)
 
 	/* Set the first server's ID. */
 	_srv_parse_set_id_from_prefix(srv, srv->tmpl_info.prefix, srv->tmpl_info.nb_low);
-	srv->conf.name.key = srv->id;
-	ebis_insert(&curproxy->conf.used_server_name, &srv->conf.name);
+	cebis_item_insert(&curproxy->conf.used_server_name, conf.name_node, id, srv);
 
 	/* then create other servers from this one */
 	for (i = srv->tmpl_info.nb_low + 1; i <= srv->tmpl_info.nb_high; i++) {
@@ -3315,24 +3392,8 @@ static int _srv_parse_tmpl_init(struct server *srv, struct proxy *px)
 		srv_settings_cpy(newsrv, srv, 1);
 		srv_prepare_for_resolution(newsrv, srv->hostname);
 
-		/* Use sni as fallback if pool_conn_name isn't set */
-		if (!newsrv->pool_conn_name && newsrv->sni_expr) {
-			newsrv->pool_conn_name = strdup(newsrv->sni_expr);
-			if (!newsrv->pool_conn_name)
-				goto err;
-		}
-
-		if (newsrv->pool_conn_name) {
-			newsrv->pool_conn_name_expr = _parse_srv_expr(srv->pool_conn_name, &px->conf.args, NULL, 0, NULL);
-			if (!newsrv->pool_conn_name_expr)
-				goto err;
-		}
-
-		if (newsrv->sni_expr) {
-			newsrv->ssl_ctx.sni = _parse_srv_expr(srv->sni_expr, &px->conf.args, NULL, 0, NULL);
-			if (!newsrv->ssl_ctx.sni)
-				goto err;
-		}
+	        if (server_parse_exprs(newsrv, px, NULL))
+			goto err;
 
 		/* append to list of servers available to receive an hostname */
 		if (newsrv->srvrq)
@@ -3341,8 +3402,7 @@ static int _srv_parse_tmpl_init(struct server *srv, struct proxy *px)
 		/* Set this new server ID. */
 		_srv_parse_set_id_from_prefix(newsrv, srv->tmpl_info.prefix, i);
 
-		newsrv->conf.name.key = newsrv->id;
-		ebis_insert(&curproxy->conf.used_server_name, &newsrv->conf.name);
+		cebis_item_insert(&curproxy->conf.used_server_name, conf.name_node, id, newsrv);
 	}
 
 	return i - srv->tmpl_info.nb_low;
@@ -3354,7 +3414,7 @@ static int _srv_parse_tmpl_init(struct server *srv, struct proxy *px)
 		free_check(&newsrv->check);
 		MT_LIST_DELETE(&newsrv->global_list);
 	}
-	free(newsrv);
+	srv_free(&newsrv);
 	return i - srv->tmpl_info.nb_low;
 }
 
@@ -3363,7 +3423,7 @@ static int _srv_parse_tmpl_init(struct server *srv, struct proxy *px)
  * This function is expected to be called after _srv_parse_init() initialization
  * but only when the effective server's proxy mode is known, which is not always
  * the case during parsing time, in which case the function will be called during
- * postparsing thanks to the srv_init() below.
+ * postparsing thanks to the srv_postinit() below.
  *
  * Returns ERR_NONE on success else a combination or ERR_CODE.
  */
@@ -3427,7 +3487,27 @@ static int _srv_check_proxy_mode(struct server *srv, char postparse)
 
 	return err_code;
 }
-/* Finish initializing the server after parsing
+
+/* Finish initializing the server after parsing and before config checks
+ *
+ * Returns ERR_NONE on success else a combination or ERR_CODE.
+ */
+static int srv_init_per_thr(struct server *srv);
+int srv_preinit(struct server *srv)
+{
+	int err_code = ERR_NONE;
+
+	if (srv_init_per_thr(srv) == -1) {
+		ha_alert("error during per-thread init for %s/%s server\n", srv->proxy->id, srv->id);
+		err_code |= ERR_ALERT | ERR_FATAL;
+		goto out;
+	}
+
+ out:
+	return err_code;
+}
+
+/* Finish initializing the server after parsing and config checks
  *
  * We must be careful that checks / postinits performed within this function
  * don't depend or conflict with other postcheck functions that are registered
@@ -3437,22 +3517,19 @@ static int _srv_check_proxy_mode(struct server *srv, char postparse)
  */
 static int init_srv_requeue(struct server *srv);
 static int init_srv_slowstart(struct server *srv);
-static int srv_init_per_thr(struct server *srv);
-int srv_init(struct server *srv)
+int srv_postinit(struct server *srv)
 {
 	int err_code = ERR_NONE;
-
-	if (srv->flags & SRV_F_CHECKED)
-		return ERR_NONE; // nothing to do
+	char *errmsg = NULL;
 
 	err_code |= _srv_check_proxy_mode(srv, 1);
 
 	if (err_code & ERR_CODE)
 		goto out;
 
-	srv->counters.shared = counters_be_shared_get(&srv->guid);
-	if (!srv->counters.shared) {
-		ha_alert("memory error while setting up shared counters for %s/%s server\n", srv->proxy->id, srv->id);
+	if (!counters_be_shared_prepare(&srv->counters.shared, &srv->guid, &errmsg)) {
+		ha_alert("memory error while setting up shared counters for %s/%s server : %s\n", srv->proxy->id, srv->id, errmsg);
+		ha_free(&errmsg);
 		err_code |= ERR_ALERT | ERR_FATAL;
 		goto out;
 	}
@@ -3475,15 +3552,9 @@ int srv_init(struct server *srv)
 	if (err_code & ERR_CODE)
 		goto out;
 
-	if (srv_init_per_thr(srv) == -1) {
-		ha_alert("error during per-thread init for %s/%s server\n", srv->proxy->id, srv->id);
-		err_code |= ERR_ALERT | ERR_FATAL;
-		goto out;
-	}
-
 	/* initialize idle conns lists */
 	if (srv->max_idle_conns != 0) {
-		srv->curr_idle_thr = calloc(global.nbthread, sizeof(*srv->curr_idle_thr));
+		srv->curr_idle_thr = ha_aligned_zalloc(64, global.nbthread * sizeof(*srv->curr_idle_thr));
 		if (!srv->curr_idle_thr) {
 			ha_alert("memory error during idle conn list init for %s/%s server\n",
 			         srv->proxy->id, srv->id);
@@ -3493,11 +3564,9 @@ int srv_init(struct server *srv)
 	}
 
  out:
-	if (!(err_code & ERR_CODE))
-		srv->flags |= SRV_F_CHECKED;
 	return err_code;
 }
-REGISTER_POST_SERVER_CHECK(srv_init);
+REGISTER_POST_SERVER_CHECK(srv_postinit);
 
 /* Allocate a new server pointed by <srv> and try to parse the first arguments
  * in <args> as an address for a server or an address-range for a template or
@@ -3713,7 +3782,7 @@ static int _srv_parse_init(struct server **srv, char **args, int *cur_arg,
 		 */
 		newsrv = curproxy->defsrv;
 		if (!newsrv) {
-			newsrv = calloc(1, sizeof(*newsrv));
+			newsrv = srv_alloc();
 			if (!newsrv) {
 				ha_alert("out of memory.\n");
 				err_code |= ERR_ALERT | ERR_ABORT;
@@ -3829,27 +3898,9 @@ static int _srv_parse_finalize(char **args, int cur_arg,
 		return ERR_ALERT | ERR_FATAL;
 	}
 
-	if ((ret = parse_srv_expr(srv->sni_expr, &srv->ssl_ctx.sni, px, &errmsg))) {
+	if ((ret = server_parse_exprs(srv, px, &errmsg))) {
 		if (errmsg) {
-			ha_alert("error detected while parsing sni expression : %s.\n", errmsg);
-			free(errmsg);
-		}
-		return ret;
-	}
-
-	/* Use sni as fallback if pool_conn_name isn't set */
-	if (!srv->pool_conn_name && srv->sni_expr) {
-		srv->pool_conn_name = strdup(srv->sni_expr);
-		if (!srv->pool_conn_name) {
-			ha_alert("out of memory\n");
-			return ERR_ALERT | ERR_FATAL;
-		}
-	}
-
-	if ((ret = parse_srv_expr(srv->pool_conn_name, &srv->pool_conn_name_expr,
-	                          px, &errmsg))) {
-		if (errmsg) {
-			ha_alert("error detected while parsing pool-conn-name expression : %s.\n", errmsg);
+			ha_alert("error detected while parsing sni or pool-conn-name expressions : %s.\n", errmsg);
 			free(errmsg);
 		}
 		return ret;
@@ -3959,8 +4010,7 @@ int parse_server(const char *file, int linenum, char **args,
 		_srv_parse_tmpl_init(newsrv, curproxy);
 	}
 	else if (!(parse_flags & SRV_PARSE_DEFAULT_SERVER)) {
-		newsrv->conf.name.key = newsrv->id;
-		ebis_insert(&curproxy->conf.used_server_name, &newsrv->conf.name);
+		cebis_item_insert(&curproxy->conf.used_server_name, conf.name_node, id, newsrv);
 	}
 
 	/* If the server id is fixed, insert it in the proxy used_id tree.
@@ -3970,7 +4020,7 @@ int parse_server(const char *file, int linenum, char **args,
 	 * check_config_validity.
 	 */
 	if (newsrv->flags & SRV_F_FORCED_ID)
-		eb32_insert(&curproxy->conf.used_server_id, &newsrv->conf.id);
+		server_index_id(curproxy, newsrv);
 
 	HA_DIAG_WARNING_COND((curproxy->cap & PR_CAP_LB) && !newsrv->uweight,
 	                     "configured with weight of 0 will never be selected by load balancing algorithms\n");
@@ -4008,15 +4058,10 @@ struct server *server_find_by_id_unique(struct proxy *bk, int id, uint32_t rid)
  */
 struct server *server_find_by_name(struct proxy *px, const char *name)
 {
-	struct ebpt_node *node;
-	struct server *cursrv;
-
 	if (!px)
 		return NULL;
 
-	node = ebis_lookup(&px->conf.used_server_name, name);
-	cursrv = node ? container_of(node, struct server, conf.name) : NULL;
-	return cursrv;
+	return cebis_item_lookup(&px->conf.used_server_name, conf.name_node, id, name, struct server);
 }
 
 /*
@@ -4026,12 +4071,10 @@ struct server *server_find_by_name(struct proxy *px, const char *name)
  */
 struct server *server_find_by_addr(struct proxy *px, const char *addr)
 {
-	struct ebpt_node *node;
 	struct server *cursrv;
 
 	HA_RWLOCK_RDLOCK(PROXY_LOCK, &px->lock);
-	node = ebis_lookup(&px->used_server_addr, addr);
-	cursrv = node ? container_of(node, struct server, addr_node) : NULL;
+	cursrv = cebuis_item_lookup(&px->used_server_addr, addr_node, addr_key, addr, struct server);
 	HA_RWLOCK_RDUNLOCK(PROXY_LOCK, &px->lock);
 	return cursrv;
 }
@@ -4575,6 +4618,10 @@ out:
 			s->check.addr = sk;
 		if (port)
 			s->check.port = new_port;
+
+		/* Fallback to raw XPRT for the health-check */
+		if (!s->check.use_ssl)
+			s->check.xprt = xprt_get(XPRT_RAW);
 	}
 	return NULL;
 }
@@ -5547,6 +5594,8 @@ static int cli_parse_set_server(char **args, char *payload, struct appctx *appct
 	}
 	else if (strcmp(args[3], "ssl") == 0) {
 #ifdef USE_OPENSSL
+		char *err = NULL;
+
 		if (sv->flags & SRV_F_DYNAMIC) {
 			cli_err(appctx, "'set server <srv> ssl' not supported on dynamic servers\n");
 			goto out;
@@ -5560,9 +5609,15 @@ static int cli_parse_set_server(char **args, char *payload, struct appctx *appct
 
 		HA_SPIN_LOCK(SERVER_LOCK, &sv->lock);
 		if (strcmp(args[4], "on") == 0) {
-			srv_set_ssl(sv, 1);
+			if (srv_set_ssl(sv, 1)) {
+				cli_dynerr(appctx, memprintf(&err, "failed to enable ssl for server %s.\n", args[2]));
+				goto out;
+			}
 		} else if (strcmp(args[4], "off") == 0) {
-			srv_set_ssl(sv, 0);
+			if (srv_set_ssl(sv, 0)) {
+				cli_dynerr(appctx, memprintf(&err, "failed to disable ssl for server %s.\n", args[2]));
+				goto out;
+			}
 		} else {
 			HA_SPIN_UNLOCK(SERVER_LOCK, &sv->lock);
 			cli_err(appctx, "'set server <srv> ssl' expects 'on' or 'off'.\n");
@@ -5919,15 +5974,16 @@ static int srv_init_per_thr(struct server *srv)
 {
 	int i;
 
-	srv->per_thr = calloc(global.nbthread, sizeof(*srv->per_thr));
-	srv->per_tgrp = calloc(global.nbtgroups, sizeof(*srv->per_tgrp));
+	srv->per_thr = ha_aligned_zalloc(64, global.nbthread * sizeof(*srv->per_thr));
+	srv->per_tgrp = ha_aligned_zalloc(64, global.nbtgroups * sizeof(*srv->per_tgrp));
 	if (!srv->per_thr || !srv->per_tgrp)
 		return -1;
 
 	for (i = 0; i < global.nbthread; i++) {
-		srv->per_thr[i].idle_conns = EB_ROOT;
-		srv->per_thr[i].safe_conns = EB_ROOT;
-		srv->per_thr[i].avail_conns = EB_ROOT;
+		srv->per_thr[i].idle_conns = NULL;
+		srv->per_thr[i].safe_conns = NULL;
+		srv->per_thr[i].avail_conns = NULL;
+		MT_LIST_INIT(&srv->per_thr[i].sess_conns);
 		MT_LIST_INIT(&srv->per_thr[i].streams);
 
 		LIST_INIT(&srv->per_thr[i].idle_conn_list);
@@ -6182,28 +6238,30 @@ static int cli_parse_add_server(char **args, char *payload, struct appctx *appct
 		srv->agent.state &= ~CHK_ST_ENABLED;
 	}
 
-	errcode = srv_init(srv);
+	errcode = srv_preinit(srv);
+	if (errcode)
+		goto out;
+	errcode = srv_postinit(srv);
 	if (errcode)
 		goto out;
 
 	/* generate the server id if not manually specified */
 	if (!srv->puid) {
-		next_id = get_next_id(&be->conf.used_server_id, 1);
+		next_id = server_get_next_id(be, 1);
 		if (!next_id) {
 			ha_alert("Cannot attach server : no id left in proxy\n");
 			goto out;
 		}
 
-		srv->conf.id.key = srv->puid = next_id;
+		srv->puid = next_id;
 	}
-	srv->conf.name.key = srv->id;
 
 	/* insert the server in the backend trees */
-	eb32_insert(&be->conf.used_server_id, &srv->conf.id);
-	ebis_insert(&be->conf.used_server_name, &srv->conf.name);
-	/* addr_node.key could be NULL if FQDN resolution is postponed (ie: add server from cli) */
-	if (srv->addr_node.key)
-		ebis_insert(&be->used_server_addr, &srv->addr_node);
+	server_index_id(be, srv);
+	cebis_item_insert(&be->conf.used_server_name, conf.name_node, id, srv);
+	/* addr_key could be NULL if FQDN resolution is postponed (ie: add server from cli) */
+	if (srv->addr_key)
+		cebuis_item_insert(&be->used_server_addr, addr_node, addr_key, srv);
 
 	/* check if LSB bit (odd bit) is set for reuse_cnt */
 	if (srv_id_reuse_cnt & 1) {
@@ -6326,9 +6384,12 @@ int srv_check_for_deletion(const char *bename, const char *svname, struct proxy 
 	/* Second, conditions that may change over time */
 	ret = 0;
 
-	/* Ensure that there is no active/pending connection on the server. */
+	/* Ensure that there is no active/pending/idle connection on the server.
+	 * Note that idle conns scheduled for purging are still accounted in idle counter.
+	 */
 	if (_HA_ATOMIC_LOAD(&srv->curr_used_conns) ||
-	    _HA_ATOMIC_LOAD(&srv->queueslength) || srv_has_streams(srv)) {
+	    _HA_ATOMIC_LOAD(&srv->queueslength) || srv_has_streams(srv) ||
+	    _HA_ATOMIC_LOAD(&srv->curr_idle_conns) || _HA_ATOMIC_LOAD(&srv->curr_sess_idle_conns)) {
 		msg = "Server still has connections attached to it, cannot remove it.";
 		goto leave;
 	}
@@ -6353,11 +6414,9 @@ static int cli_parse_delete_server(char **args, char *payload, struct appctx *ap
 	struct proxy *be;
 	struct server *srv;
 	struct ist be_name, sv_name;
-	struct mt_list back;
-	struct sess_priv_conns *sess_conns = NULL;
 	struct watcher *srv_watch;
 	const char *msg;
-	int ret, i;
+	int ret;
 
 	if (!cli_has_level(appctx, ACCESS_LVL_ADMIN))
 		return 1;
@@ -6384,62 +6443,6 @@ static int cli_parse_delete_server(char **args, char *payload, struct appctx *ap
 		/* failure (recoverable or not) */
 		cli_err(appctx, msg);
 		goto out;
-	}
-
-	/* Close idle connections attached to this server. */
-	for (i = tid;;) {
-		struct list *list = &srv->per_thr[i].idle_conn_list;
-		struct connection *conn;
-
-		while (!LIST_ISEMPTY(list)) {
-			conn = LIST_ELEM(list->n, struct connection *, idle_list);
-			if (i != tid) {
-				if (conn->mux && conn->mux->takeover)
-					conn->mux->takeover(conn, i, 1);
-				else if (conn->xprt && conn->xprt->takeover)
-					conn->xprt->takeover(conn, conn->ctx, i, 1);
-			}
-			conn_release(conn);
-		}
-
-		/* Also remove all purgeable conns as some of them may still
-		 * reference the currently deleted server.
-		 */
-		while ((conn = MT_LIST_POP(&idle_conns[i].toremove_conns,
-		                           struct connection *, toremove_list))) {
-			conn_release(conn);
-		}
-
-		if ((i = ((i + 1 == global.nbthread) ? 0 : i + 1)) == tid)
-			break;
-	}
-
-	/* All idle connections should be removed now. */
-	BUG_ON(srv->curr_idle_conns);
-
-	/* Close idle private connections attached to this server. */
-	MT_LIST_FOR_EACH_ENTRY_LOCKED(sess_conns, &srv->sess_conns, srv_el, back) {
-		struct connection *conn, *conn_back;
-		list_for_each_entry_safe(conn, conn_back, &sess_conns->conn_list, sess_el) {
-
-			/* Only idle connections should be present if srv_check_for_deletion() is true. */
-			BUG_ON(!(conn->flags & CO_FL_SESS_IDLE));
-
-			LIST_DEL_INIT(&conn->sess_el);
-			conn->owner = NULL;
-			conn->flags &= ~CO_FL_SESS_IDLE;
-			if (sess_conns->tid != tid) {
-				if (conn->mux && conn->mux->takeover)
-					conn->mux->takeover(conn, sess_conns->tid, 1);
-				else if (conn->xprt && conn->xprt->takeover)
-					conn->xprt->takeover(conn, conn->ctx, sess_conns->tid, 1);
-			}
-			conn_release(conn);
-		}
-
-		LIST_DELETE(&sess_conns->sess_el);
-		pool_free(pool_head_sess_priv_conns, sess_conns);
-		sess_conns = NULL;
 	}
 
 	/* removing cannot fail anymore when we reach this:
@@ -6473,9 +6476,9 @@ static int cli_parse_delete_server(char **args, char *payload, struct appctx *ap
 	srv_detach(srv);
 
 	/* remove srv from addr_node tree */
-	eb32_delete(&srv->conf.id);
-	ebpt_delete(&srv->conf.name);
-	ebpt_delete(&srv->addr_node);
+	ceb32_item_delete(&be->conf.used_server_id, conf.puid_node, puid, srv);
+	cebis_item_delete(&be->conf.used_server_name, conf.name_node, id, srv);
+	cebuis_item_delete(&be->used_server_addr, addr_node, addr_key, srv);
 
 	/* remove srv from idle_node tree for idle conn cleanup */
 	eb32_delete(&srv->idle_node);
@@ -6653,6 +6656,7 @@ static int _srv_update_status_op(struct server *s, enum srv_op_st_chg_cause caus
 		if (s->onmarkeddown & HANA_ONMARKEDDOWN_SHUTDOWNSESSIONS)
 			srv_shutdown_streams(s, SF_ERR_DOWN);
 
+		srv_reset_path_parameters(s);
 		/* we might have streams queued on this server and waiting for
 		 * a connection. Those which are redispatchable will be queued
 		 * to another server or to the proxy itself.
@@ -6680,6 +6684,7 @@ static int _srv_update_status_op(struct server *s, enum srv_op_st_chg_cause caus
 	else if ((s->cur_state != SRV_ST_STOPPING) && (s->next_state == SRV_ST_STOPPING)) {
 		srv_lb_propagate(s);
 
+		srv_reset_path_parameters(s);
 		/* we might have streams queued on this server and waiting for
 		 * a connection. Those which are redispatchable will be queued
 		 * to another server or to the proxy itself.
@@ -6784,12 +6789,17 @@ static int _srv_update_status_adm(struct server *s, enum srv_adm_st_chg_cause ca
 				}
 				free_trash_chunk(tmptrash);
 			}
+
+			/* force connection cleanup on the given server */
+			srv_cleanup_connections(s);
 		}
 		else {	/* server was still running */
 			s->check.health = 0; /* failure */
 
 			s->next_state = SRV_ST_STOPPED;
 			srv_lb_propagate(s);
+
+			srv_reset_path_parameters(s);
 
 			if (s->onmarkeddown & HANA_ONMARKEDDOWN_SHUTDOWNSESSIONS)
 				srv_shutdown_streams(s, SF_ERR_DOWN);
@@ -7115,7 +7125,8 @@ static void srv_update_status(struct server *s, int type, int cause)
 		}
 		else if (s->cur_state == SRV_ST_STOPPED) {
 			/* server was up and is currently down */
-			HA_ATOMIC_INC(&s->counters.shared->tg[tgid - 1]->down_trans);
+			if (s->counters.shared.tg[tgid - 1])
+				HA_ATOMIC_INC(&s->counters.shared.tg[tgid - 1]->down_trans);
 			_srv_event_hdl_publish(EVENT_HDL_SUB_SERVER_DOWN, cb_data.common, s);
 		}
 
@@ -7127,7 +7138,8 @@ static void srv_update_status(struct server *s, int type, int cause)
 			HA_ATOMIC_STORE(&s->proxy->ready_srv, NULL);
 
 		s->last_change = ns_to_sec(now_ns);
-		HA_ATOMIC_STORE(&s->counters.shared->tg[tgid - 1]->last_state_change, s->last_change);
+		if (s->counters.shared.tg[tgid - 1])
+			HA_ATOMIC_STORE(&s->counters.shared.tg[tgid - 1]->last_state_change, s->last_change);
 
 		/* publish the state change */
 		_srv_event_hdl_prepare_state(&cb_data.state,
@@ -7147,7 +7159,8 @@ static void srv_update_status(struct server *s, int type, int cause)
 		if (last_change < ns_to_sec(now_ns))         // ignore negative times
 			s->proxy->down_time += ns_to_sec(now_ns) - last_change;
 		s->proxy->last_change = ns_to_sec(now_ns);
-		HA_ATOMIC_STORE(&s->proxy->be_counters.shared->tg[tgid - 1]->last_state_change, s->proxy->last_change);
+		if (s->proxy->be_counters.shared.tg[tgid - 1])
+			HA_ATOMIC_STORE(&s->proxy->be_counters.shared.tg[tgid - 1]->last_state_change, s->proxy->last_change);
 	}
 }
 
@@ -7163,25 +7176,27 @@ struct task *srv_cleanup_toremove_conns(struct task *task, void *context, unsign
 	return task;
 }
 
-/* Move <toremove_nb> count connections from <list> storage to <toremove_list>
- * list storage. -1 means moving all of them.
+/* Move <toremove_nb> count connections from server <srv> list storage
+ * ->idle_conn_list to the idle_conns list 'toremove_conns' for thread <thr>.
+ * -1 means moving all of them.
  *
  * Returns the number of connections moved.
  *
  * Must be called with idle_conns_lock held.
  */
-static int srv_migrate_conns_to_remove(struct list *list, struct mt_list *toremove_list, int toremove_nb)
+
+static int srv_migrate_conns_to_remove(struct server *srv, int thr, int toremove_nb)
 {
 	struct connection *conn;
 	int i = 0;
 
-	while (!LIST_ISEMPTY(list)) {
+	while (!LIST_ISEMPTY(&srv->per_thr[thr].idle_conn_list)) {
 		if (toremove_nb != -1 && i >= toremove_nb)
 			break;
 
-		conn = LIST_ELEM(list->n, struct connection *, idle_list);
-		conn_delete_from_tree(conn);
-		MT_LIST_APPEND(toremove_list, &conn->toremove_list);
+		conn = LIST_ELEM(srv->per_thr[thr].idle_conn_list.n, struct connection *, idle_list);
+		conn_delete_from_tree(conn, thr);
+		MT_LIST_APPEND(&idle_conns[thr].toremove_conns, &conn->toremove_list);
 		i++;
 	}
 
@@ -7192,6 +7207,7 @@ static int srv_migrate_conns_to_remove(struct list *list, struct mt_list *toremo
  */
 static void srv_cleanup_connections(struct server *srv)
 {
+	struct sess_priv_conns *sess_conns;
 	int did_remove;
 	int i;
 
@@ -7203,8 +7219,23 @@ static void srv_cleanup_connections(struct server *srv)
 	for (i = tid;;) {
 		did_remove = 0;
 		HA_SPIN_LOCK(IDLE_CONNS_LOCK, &idle_conns[i].idle_conns_lock);
-		if (srv_migrate_conns_to_remove(&srv->per_thr[i].idle_conn_list, &idle_conns[i].toremove_conns, -1) > 0)
+
+		/* idle connections */
+		if (srv_migrate_conns_to_remove(srv, i, -1) > 0)
 			did_remove = 1;
+
+		/* session attached connections */
+		while ((sess_conns = MT_LIST_POP(&srv->per_thr[i].sess_conns, struct sess_priv_conns *, srv_el))) {
+			if (sess_conns_cleanup_all_idle(sess_conns)) {
+				did_remove = 1;
+
+				if (LIST_ISEMPTY(&sess_conns->conn_list)) {
+					LIST_DELETE(&sess_conns->sess_el);
+					pool_free(pool_head_sess_priv_conns, sess_conns);
+				}
+			}
+		}
+
 		HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[i].idle_conns_lock);
 		if (did_remove)
 			task_wakeup(idle_conns[i].cleanup_task, TASK_WOKEN_OTHER);
@@ -7217,7 +7248,11 @@ static void srv_cleanup_connections(struct server *srv)
 /* removes an idle conn after updating the server idle conns counters */
 void srv_release_conn(struct server *srv, struct connection *conn)
 {
-	if (conn->flags & CO_FL_LIST_MASK) {
+	if (conn->flags & CO_FL_SESS_IDLE) {
+		_HA_ATOMIC_DEC(&srv->curr_sess_idle_conns);
+		conn->flags &= ~CO_FL_SESS_IDLE;
+	}
+	else if (conn->flags & CO_FL_LIST_MASK) {
 		/* The connection is currently in the server's idle list, so tell it
 		 * there's one less connection available in that list.
 		 */
@@ -7233,9 +7268,9 @@ void srv_release_conn(struct server *srv, struct connection *conn)
 	}
 
 	/* Remove the connection from any tree (safe, idle or available) */
-	if (conn->hash_node) {
+	if (ceb_intree(&conn->hash_node.node)) {
 		HA_SPIN_LOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
-		conn_delete_from_tree(conn);
+		conn_delete_from_tree(conn, tid);
 		conn->flags &= ~CO_FL_LIST_MASK;
 		HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
 	}
@@ -7244,37 +7279,17 @@ void srv_release_conn(struct server *srv, struct connection *conn)
 /* retrieve a connection from its <hash> in <tree>
  * returns NULL if no connection found
  */
-struct connection *srv_lookup_conn(struct eb_root *tree, uint64_t hash)
+struct connection *srv_lookup_conn(struct ceb_root **tree, uint64_t hash)
 {
-	struct eb64_node *node = NULL;
-	struct connection *conn = NULL;
-	struct conn_hash_node *hash_node = NULL;
-
-	node = eb64_lookup(tree, hash);
-	if (node) {
-		hash_node = ebmb_entry(node, struct conn_hash_node, node);
-		conn = hash_node->conn;
-	}
-
-	return conn;
+	return ceb64_item_lookup(tree, hash_node.node, hash_node.key, hash, struct connection);
 }
 
 /* retrieve the next connection sharing the same hash as <conn>
  * returns NULL if no connection found
  */
-struct connection *srv_lookup_conn_next(struct connection *conn)
+struct connection *srv_lookup_conn_next(struct ceb_root **tree, struct connection *conn)
 {
-	struct eb64_node *node = NULL;
-	struct connection *next_conn = NULL;
-	struct conn_hash_node *hash_node = NULL;
-
-	node = eb64_next_dup(&conn->hash_node->node);
-	if (node) {
-		hash_node = eb64_entry(node, struct conn_hash_node, node);
-		next_conn = hash_node->conn;
-	}
-
-	return next_conn;
+	return ceb64_item_next_dup(tree, hash_node.node, hash_node.key, conn);
 }
 
 /* Add <conn> in <srv> idle trees. Set <is_safe> if connection is deemed safe
@@ -7289,11 +7304,11 @@ struct connection *srv_lookup_conn_next(struct connection *conn)
  */
 void _srv_add_idle(struct server *srv, struct connection *conn, int is_safe)
 {
-	struct eb_root *tree = is_safe ? &srv->per_thr[tid].safe_conns :
+	struct ceb_root **tree = is_safe ? &srv->per_thr[tid].safe_conns :
 	                                 &srv->per_thr[tid].idle_conns;
 
 	/* first insert in idle or safe tree. */
-	eb64_insert(tree, &conn->hash_node->node);
+	ceb64_item_insert(tree, hash_node.node, hash_node.key, conn);
 
 	/* insert in list sorted by connection usage. */
 	LIST_APPEND(&srv->per_thr[tid].idle_conn_list, &conn->idle_list);
@@ -7312,11 +7327,12 @@ int srv_add_to_idle_list(struct server *srv, struct connection *conn, int is_saf
 	 */
 	if (!(conn->flags & CO_FL_PRIVATE) &&
 	    srv && srv->pool_purge_delay > 0 &&
+	    !(srv->cur_admin & SRV_ADMF_MAINT) &&
 	    ((srv->proxy->options & PR_O_REUSE_MASK) != PR_O_REUSE_NEVR) &&
 	    ha_used_fds < global.tune.pool_high_count &&
 	    (srv->max_idle_conns == -1 || srv->max_idle_conns > srv->curr_idle_conns) &&
-	    ((eb_is_empty(&srv->per_thr[tid].safe_conns) &&
-	      (is_safe || eb_is_empty(&srv->per_thr[tid].idle_conns))) ||
+	    ((ceb_isempty(&srv->per_thr[tid].safe_conns) &&
+	      (is_safe || ceb_isempty(&srv->per_thr[tid].idle_conns))) ||
 	     (ha_used_fds < global.tune.pool_low_count &&
 	      (srv->curr_used_conns + srv->curr_idle_conns <=
 	       MAX(srv->curr_used_conns, srv->est_need_conns) + srv->low_idle_conns ||
@@ -7332,7 +7348,7 @@ int srv_add_to_idle_list(struct server *srv, struct connection *conn, int is_saf
 		_HA_ATOMIC_DEC(&srv->curr_used_conns);
 
 		HA_SPIN_LOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
-		conn_delete_from_tree(conn);
+		conn_delete_from_tree(conn, tid);
 
 		if (is_safe) {
 			conn->flags = (conn->flags & ~CO_FL_LIST_MASK) | CO_FL_SAFE_LIST;
@@ -7374,7 +7390,7 @@ void srv_add_to_avail_list(struct server *srv, struct connection *conn)
 {
 	/* connection cannot be in idle list if used as an avail idle conn. */
 	BUG_ON(LIST_INLIST(&conn->idle_list));
-	eb64_insert(&srv->per_thr[tid].avail_conns, &conn->hash_node->node);
+	ceb64_item_insert(&srv->per_thr[tid].avail_conns, hash_node.node, hash_node.key, conn);
 }
 
 struct task *srv_cleanup_idle_conns(struct task *task, void *context, unsigned int state)
@@ -7432,19 +7448,16 @@ struct task *srv_cleanup_idle_conns(struct task *task, void *context, unsigned i
 		/* check all threads starting with ours */
 		for (i = tid;;) {
 			int max_conn;
-			int j;
-			int did_remove = 0;
+			int removed;
 
 			max_conn = (exceed_conns * srv->curr_idle_thr[i]) /
 			           curr_idle + 1;
 
 			HA_SPIN_LOCK(IDLE_CONNS_LOCK, &idle_conns[i].idle_conns_lock);
-			j = srv_migrate_conns_to_remove(&srv->per_thr[i].idle_conn_list, &idle_conns[i].toremove_conns, max_conn);
-			if (j > 0)
-				did_remove = 1;
+			removed = srv_migrate_conns_to_remove(srv, i, max_conn);
 			HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[i].idle_conns_lock);
 
-			if (did_remove)
+			if (removed)
 				task_wakeup(idle_conns[i].cleanup_task, TASK_WOKEN_OTHER);
 
 			if ((i = ((i + 1 == global.nbthread) ? 0 : i + 1)) == tid)
@@ -7478,11 +7491,12 @@ remove:
  */
 static void srv_close_idle_conns(struct server *srv)
 {
-	struct eb_root **cleaned_tree;
+	struct ceb_root ***cleaned_tree;
+	struct connection *conn;
 	int i;
 
 	for (i = 0; i < global.nbthread; ++i) {
-		struct eb_root *conn_trees[] = {
+		struct ceb_root **conn_trees[] = {
 			&srv->per_thr[i].idle_conns,
 			&srv->per_thr[i].safe_conns,
 			&srv->per_thr[i].avail_conns,
@@ -7490,14 +7504,11 @@ static void srv_close_idle_conns(struct server *srv)
 		};
 
 		for (cleaned_tree = conn_trees; *cleaned_tree; ++cleaned_tree) {
-			while (!eb_is_empty(*cleaned_tree)) {
-				struct ebmb_node *node = ebmb_first(*cleaned_tree);
-				struct conn_hash_node *conn_hash_node = ebmb_entry(node, struct conn_hash_node, node);
-				struct connection *conn = conn_hash_node->conn;
-
+			while ((conn = ceb64_item_first(*cleaned_tree, hash_node.node,
+							hash_node.key, struct connection))) {
 				if (conn->ctrl->ctrl_close)
 					conn->ctrl->ctrl_close(conn);
-				conn_delete_from_tree(conn);
+				conn_delete_from_tree(conn, i);
 			}
 		}
 	}

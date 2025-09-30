@@ -39,8 +39,8 @@
 
 static THREAD_LOCAL char *dns_msg_trash;
 
-DECLARE_STATIC_POOL(dns_session_pool, "dns_session", sizeof(struct dns_session));
-DECLARE_STATIC_POOL(dns_query_pool, "dns_query", sizeof(struct dns_query));
+DECLARE_STATIC_TYPED_POOL(dns_session_pool, "dns_session", struct dns_session);
+DECLARE_STATIC_TYPED_POOL(dns_query_pool, "dns_query", struct dns_query);
 DECLARE_STATIC_POOL(dns_msg_buf, "dns_msg_buf", DNS_TCP_MSG_RING_MAX_SIZE);
 
 /* Opens an UDP socket on the namesaver's IP/Port, if required. Returns 0 on
@@ -65,12 +65,55 @@ static int dns_connect_nameserver(struct dns_nameserver *ns)
 			 ns->counters->pid, ns->id);
 		return -1;
 	}
-	if (connect(fd, (struct sockaddr*)&dgram->addr.to, get_addr_len(&dgram->addr.to)) == -1) {
-		send_log(NULL, LOG_WARNING,
-			 "DNS : section '%s': can't connect socket for nameserver '%s'.\n",
-			 ns->counters->id, ns->id);
+
+	switch (proto->fam->sock_domain) {
+	case AF_INET: {
+		struct sockaddr_in address = {
+			.sin_family = AF_INET,
+			.sin_port = 0,
+			.sin_addr = { .s_addr = INADDR_ANY }
+		};
+		if (bind(fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
+			send_log(NULL, LOG_WARNING,
+				 "DNS : section '%s': can't bind socket for nameserver '%s' on 0.0.0.0:0.\n",
+				 ns->counters->pid, ns->id);
+			close(fd);
+			return -1;
+		}
+		break;
+	}
+	case AF_INET6: {
+		struct sockaddr_in6 address6 = {
+			.sin6_family = AF_INET6,
+			.sin6_port = 0,
+			.sin6_addr = in6addr_any,
+			.sin6_flowinfo = 0,
+			.sin6_scope_id = 0
+		};
+		if (bind(fd, (struct sockaddr *)&address6, sizeof(address6)) < 0) {
+			send_log(NULL, LOG_WARNING,
+				 "DNS : section '%s': can't bind socket for nameserver '%s' on :::0.\n",
+				 ns->counters->pid, ns->id);
+			close(fd);
+			return -1;
+		}
+		break;
+	}
+	case AF_UNIX:
+		/* if IPC is used via local domain sockets, we don't expect that
+		 * the path to DNS server socket can change dynamically.
+		 */
+		if (connect(fd, (struct sockaddr*)&dgram->addr.to, get_addr_len(&dgram->addr.to)) == -1) {
+			send_log(NULL, LOG_WARNING,
+				 "DNS : section '%s': can't connect socket for nameserver '%s'.\n",
+				 ns->counters->id, ns->id);
+			close(fd);
+			return -1;
+		}
+		break;
+	default:
 		close(fd);
-		return -1;
+		BUG_ON(1, "DNS: Unsupported address family.");
 	}
 
 	/* Make the socket non blocking */
@@ -78,7 +121,13 @@ static int dns_connect_nameserver(struct dns_nameserver *ns)
 
 	/* Add the fd in the fd list and update its parameters */
 	dgram->t.sock.fd = fd;
-	fd_insert(fd, dgram, dgram_fd_handler, tgid, tg->threads_enabled);
+
+	/* let's stick the FD to the initiator thread, this will ensure that
+	 * most of the time, a resolver will not try to access its structure
+	 * at the same time as a response is processed, and will eliminate
+	 * locking contention.
+	 */
+	fd_insert(fd, dgram, dgram_fd_handler, tgid, ti->ltid_bit);
 	fd_want_recv(fd);
 	return 0;
 }
@@ -106,7 +155,17 @@ int dns_send_nameserver(struct dns_nameserver *ns, void *buf, size_t len)
 			fd = dgram->t.sock.fd;
 		}
 
-		ret = send(fd, buf, len, 0);
+		if (dgram->addr.to.ss_family == AF_UNIX) {
+			/* we do connect for AF_UNIX sockets and from the man
+			 * sendto: "If sendto() is  used on a connection-mode
+			 * (SOCK_STREAM, SOCK_SEQPACKET) socket, the arguments
+			 * dest_addr and addrlen are ignored (and the error
+			 * EISCONN may be returned when they are not NULL and 0)..."
+			 */
+			ret = send(fd, buf, len, 0);
+		} else
+			ret = sendto(fd, buf, len, 0, (struct sockaddr*)&dgram->addr.to, get_addr_len(&dgram->addr.to));
+
 		if (ret < 0) {
 			if (errno == EAGAIN || errno == EWOULDBLOCK) {
 				struct ist myist;
@@ -438,7 +497,6 @@ out:
  */
 static void dns_session_io_handler(struct appctx *appctx)
 {
-	struct stconn *sc = appctx_sc(appctx);
 	struct dns_session *ds = appctx->svcctx;
 	struct dns_ring *ring = &ds->ring;
 	struct buffer *buf = &ring->buf;
@@ -447,8 +505,8 @@ static void dns_session_io_handler(struct appctx *appctx)
 	size_t len, cnt, ofs;
 	int ret = 0;
 
-	if (unlikely(se_fl_test(appctx->sedesc, (SE_FL_EOS|SE_FL_ERROR)))) {
-		co_skip(sc_oc(sc), co_data(sc_oc(sc)));
+	if (unlikely(applet_fl_test(appctx, APPCTX_FL_EOS|APPCTX_FL_ERROR))) {
+		applet_reset_input(appctx);
 		goto out;
 	}
 
@@ -467,9 +525,13 @@ static void dns_session_io_handler(struct appctx *appctx)
 	/* if the connection is not established, inform the stream that we want
 	 * to be notified whenever the connection completes.
 	 */
-	if (sc_opposite(sc)->state < SC_ST_EST) {
+	if (se_fl_test(appctx->sedesc, SE_FL_APPLET_NEED_CONN)) {
 		applet_need_more_data(appctx);
-		se_need_remote_conn(appctx->sedesc);
+		applet_have_more_data(appctx);
+		goto out;
+	}
+
+	if (applet_get_outbuf(appctx) == NULL) {
 		applet_have_more_data(appctx);
 		goto out;
 	}
@@ -521,7 +583,7 @@ static void dns_session_io_handler(struct appctx *appctx)
 		BUG_ON(msg_len + ofs + cnt + 1 > b_data(buf));
 
 		/* retrieve available room on output channel */
-		available_room = channel_recv_max(sc_ic(sc));
+		available_room = applet_output_room(appctx);
 
 		/* tx_msg_offset null means we are at the start of a new message */
 		if (!ds->tx_msg_offset) {
@@ -529,7 +591,7 @@ static void dns_session_io_handler(struct appctx *appctx)
 
 			/* check if there is enough room to put message len and query id */
 			if (available_room < sizeof(slen) + sizeof(new_qid)) {
-				sc_need_room(sc, sizeof(slen) + sizeof(new_qid));
+				applet_have_more_data(appctx);
 				ret = 0;
 				break;
 			}
@@ -588,7 +650,7 @@ static void dns_session_io_handler(struct appctx *appctx)
 
 		/* check if it remains available room on output chan */
 		if (unlikely(!available_room)) {
-			sc_need_room(sc, 1);
+			applet_have_more_data(appctx);
 			ret = 0;
 			break;
 		}
@@ -622,7 +684,7 @@ static void dns_session_io_handler(struct appctx *appctx)
 
 		if (ds->tx_msg_offset) {
 			/* msg was not fully processed, we must  be awake to drain pending data */
-			sc_need_room(sc, 0);
+			applet_have_more_data(appctx);
 			ret = 0;
 			break;
 		}
@@ -651,6 +713,11 @@ static void dns_session_io_handler(struct appctx *appctx)
 	 */
 	__ha_barrier_load();
 	if (!LIST_INLIST_ATOMIC(&ds->waiter)) {
+		if (applet_get_inbuf(appctx) == NULL) {
+			applet_need_more_data(appctx);
+			goto out;
+		}
+
 		while (1) {
 			uint16_t query_id;
 			struct eb32_node *eb;
@@ -658,7 +725,7 @@ static void dns_session_io_handler(struct appctx *appctx)
 
 			if (!ds->rx_msg.len) {
 				/* retrieve message len */
-				ret = co_getblk(sc_oc(sc), (char *)&msg_len, 2, 0);
+				ret = applet_getblk(appctx, (char *)&msg_len, 2, 0);
 				if (ret <= 0) {
 					if (ret == -1)
 						goto error;
@@ -667,7 +734,7 @@ static void dns_session_io_handler(struct appctx *appctx)
 				}
 
 				/* mark as consumed */
-				co_skip(sc_oc(sc), 2);
+				applet_skip_input(appctx, 2);
 
 				/* store message len */
 				ds->rx_msg.len = ntohs(msg_len);
@@ -675,11 +742,11 @@ static void dns_session_io_handler(struct appctx *appctx)
 					continue;
 			}
 
-			if (co_data(sc_oc(sc)) + ds->rx_msg.offset < ds->rx_msg.len) {
+			if (applet_input_data(appctx) + ds->rx_msg.offset < ds->rx_msg.len) {
 				/* message only partially available */
 
 				/* read available data */
-				ret = co_getblk(sc_oc(sc), ds->rx_msg.area + ds->rx_msg.offset, co_data(sc_oc(sc)), 0);
+				ret = applet_getblk(appctx, ds->rx_msg.area + ds->rx_msg.offset, applet_input_data(appctx), 0);
 				if (ret <= 0) {
 					if (ret == -1)
 						goto error;
@@ -688,10 +755,10 @@ static void dns_session_io_handler(struct appctx *appctx)
 				}
 
 				/* update message offset */
-				ds->rx_msg.offset += co_data(sc_oc(sc));
+				ds->rx_msg.offset += applet_input_data(appctx);
 
 				/* consume all pending data from the channel */
-				co_skip(sc_oc(sc), co_data(sc_oc(sc)));
+				applet_skip_input(appctx, applet_input_data(appctx));
 
 				/* we need to wait for more data */
 				applet_need_more_data(appctx);
@@ -701,7 +768,7 @@ static void dns_session_io_handler(struct appctx *appctx)
 			/* enough data is available into the channel to read the message until the end */
 
 			/* read from the channel until the end of the message */
-			ret = co_getblk(sc_oc(sc), ds->rx_msg.area + ds->rx_msg.offset, ds->rx_msg.len - ds->rx_msg.offset, 0);
+			ret = applet_getblk(appctx, ds->rx_msg.area + ds->rx_msg.offset, ds->rx_msg.len - ds->rx_msg.offset, 0);
 			if (ret <= 0) {
 				if (ret == -1)
 					goto error;
@@ -710,7 +777,7 @@ static void dns_session_io_handler(struct appctx *appctx)
 			}
 
 			/* consume all data until the end of the message from the channel */
-			co_skip(sc_oc(sc), ds->rx_msg.len - ds->rx_msg.offset);
+			applet_skip_input(appctx, ds->rx_msg.len - ds->rx_msg.offset);
 
 			/* reset reader offset to 0 for next message reand */
 			ds->rx_msg.offset = 0;
@@ -759,11 +826,12 @@ out:
 	return;
 
 close:
-	se_fl_set(appctx->sedesc, SE_FL_EOS|SE_FL_EOI);
+	applet_set_eos(appctx);
 	goto out;
 
 error:
-	se_fl_set(appctx->sedesc, SE_FL_ERROR);
+	applet_set_eos(appctx);
+	applet_set_error(appctx);
 	goto out;
 }
 
@@ -824,14 +892,16 @@ static int dns_session_init(struct appctx *appctx)
 	s = appctx_strm(appctx);
 	s->scb->dst = addr;
 	s->scb->flags |= (SC_FL_RCV_ONCE|SC_FL_NOLINGER);
-	s->target = &ds->dss->srv->obj_type;
+	stream_set_srv_target(s, ds->dss->srv);
 	s->flags = SF_ASSIGNED;
 
 	s->do_log = NULL;
 	s->uniq_id = 0;
 
+	se_need_remote_conn(appctx->sedesc);
 	applet_expect_no_data(appctx);
 	ds->appctx = appctx;
+	appctx->t->expire = TICK_ETERNITY;
 	return 0;
 
   error:
@@ -941,8 +1011,11 @@ static void dns_session_release(struct appctx *appctx)
 /* DNS tcp session applet */
 static struct applet dns_session_applet = {
 	.obj_type = OBJ_TYPE_APPLET,
+	.flags = APPLET_FL_NEW_API,
 	.name = "<STRMDNS>", /* used for logging */
 	.fct = dns_session_io_handler,
+	.rcv_buf = appctx_raw_rcv_buf,
+	.snd_buf = appctx_raw_snd_buf,
 	.init = dns_session_init,
 	.release = dns_session_release,
 };

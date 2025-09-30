@@ -22,6 +22,8 @@
 #ifndef _HAPROXY_PROXY_H
 #define _HAPROXY_PROXY_H
 
+#include <import/ceb32_tree.h>
+
 #include <haproxy/api.h>
 #include <haproxy/applet-t.h>
 #include <haproxy/freq_ctr.h>
@@ -34,9 +36,9 @@
 
 extern struct proxy *proxies_list;
 extern struct list proxies;
-extern struct eb_root used_proxy_id;	/* list of proxy IDs in use */
+extern struct ceb_root *used_proxy_id;  /* list of proxy IDs in use */
 extern unsigned int error_snapshot_id;  /* global ID assigned to each error then incremented */
-extern struct eb_root proxy_by_name;    /* tree of proxies sorted by name */
+extern struct ceb_root *proxy_by_name;    /* tree of proxies sorted by name */
 
 extern const struct cfg_opt cfg_opts[];
 extern const struct cfg_opt cfg_opts2[];
@@ -57,6 +59,7 @@ void free_proxy(struct proxy *p);
 const char *proxy_cap_str(int cap);
 const char *proxy_mode_str(int mode);
 const char *proxy_find_best_option(const char *word, const char **extra);
+uint proxy_get_next_id(uint from);
 void proxy_store_name(struct proxy *px);
 struct proxy *proxy_find_by_id(int id, int cap, int table);
 struct proxy *proxy_find_by_name(const char *name, int cap, int table);
@@ -119,6 +122,12 @@ static inline struct proxy *proxy_be_by_name(const char *name)
 	return proxy_find_by_name(name, PR_CAP_BE, 0);
 }
 
+/* index proxy <px>'s id into used_proxy_id */
+static inline void proxy_index_id(struct proxy *px)
+{
+	ceb32_item_insert(&used_proxy_id, conf.uuid_node, uuid, px);
+}
+
 /* this function initializes all timeouts for proxy p */
 static inline void proxy_reset_timeouts(struct proxy *proxy)
 {
@@ -135,10 +144,12 @@ static inline void proxy_reset_timeouts(struct proxy *proxy)
 /* increase the number of cumulated connections received on the designated frontend */
 static inline void proxy_inc_fe_conn_ctr(struct listener *l, struct proxy *fe)
 {
-	_HA_ATOMIC_INC(&fe->fe_counters.shared->tg[tgid - 1]->cum_conn);
-	if (l && l->counters)
-		_HA_ATOMIC_INC(&l->counters->shared->tg[tgid - 1]->cum_conn);
-	update_freq_ctr(&fe->fe_counters.shared->tg[tgid - 1]->conn_per_sec, 1);
+	if (fe->fe_counters.shared.tg[tgid - 1])
+		_HA_ATOMIC_INC(&fe->fe_counters.shared.tg[tgid - 1]->cum_conn);
+	if (l && l->counters && l->counters->shared.tg[tgid - 1])
+		_HA_ATOMIC_INC(&l->counters->shared.tg[tgid - 1]->cum_conn);
+	if (fe->fe_counters.shared.tg[tgid - 1])
+		update_freq_ctr(&fe->fe_counters.shared.tg[tgid - 1]->conn_per_sec, 1);
 	HA_ATOMIC_UPDATE_MAX(&fe->fe_counters.cps_max,
 	                     update_freq_ctr(&fe->fe_counters._conn_per_sec, 1));
 }
@@ -146,11 +157,12 @@ static inline void proxy_inc_fe_conn_ctr(struct listener *l, struct proxy *fe)
 /* increase the number of cumulated connections accepted by the designated frontend */
 static inline void proxy_inc_fe_sess_ctr(struct listener *l, struct proxy *fe)
 {
-
-	_HA_ATOMIC_INC(&fe->fe_counters.shared->tg[tgid - 1]->cum_sess);
-	if (l && l->counters)
-		_HA_ATOMIC_INC(&l->counters->shared->tg[tgid - 1]->cum_sess);
-	update_freq_ctr(&fe->fe_counters.shared->tg[tgid - 1]->sess_per_sec, 1);
+	if (fe->fe_counters.shared.tg[tgid - 1])
+		_HA_ATOMIC_INC(&fe->fe_counters.shared.tg[tgid - 1]->cum_sess);
+	if (l && l->counters && l->counters->shared.tg[tgid - 1])
+		_HA_ATOMIC_INC(&l->counters->shared.tg[tgid - 1]->cum_sess);
+	if (fe->fe_counters.shared.tg[tgid - 1])
+		update_freq_ctr(&fe->fe_counters.shared.tg[tgid - 1]->sess_per_sec, 1);
 	HA_ATOMIC_UPDATE_MAX(&fe->fe_counters.sps_max,
 			     update_freq_ctr(&fe->fe_counters._sess_per_sec, 1));
 }
@@ -162,19 +174,22 @@ static inline void proxy_inc_fe_cum_sess_ver_ctr(struct listener *l, struct prox
                                                  unsigned int http_ver)
 {
 	if (http_ver == 0 ||
-	    http_ver > sizeof(fe->fe_counters.shared->tg[tgid - 1]->cum_sess_ver) / sizeof(*fe->fe_counters.shared->tg[tgid - 1]->cum_sess_ver))
+	    http_ver > sizeof(fe->fe_counters.shared.tg[tgid - 1]->cum_sess_ver) / sizeof(*fe->fe_counters.shared.tg[tgid - 1]->cum_sess_ver))
 	    return;
 
-	_HA_ATOMIC_INC(&fe->fe_counters.shared->tg[tgid - 1]->cum_sess_ver[http_ver - 1]);
-	if (l && l->counters)
-		_HA_ATOMIC_INC(&l->counters->shared->tg[tgid - 1]->cum_sess_ver[http_ver - 1]);
+	if (fe->fe_counters.shared.tg[tgid - 1])
+		_HA_ATOMIC_INC(&fe->fe_counters.shared.tg[tgid - 1]->cum_sess_ver[http_ver - 1]);
+	if (l && l->counters && l->counters->shared.tg[tgid - 1])
+		_HA_ATOMIC_INC(&l->counters->shared.tg[tgid - 1]->cum_sess_ver[http_ver - 1]);
 }
 
 /* increase the number of cumulated streams on the designated backend */
 static inline void proxy_inc_be_ctr(struct proxy *be)
 {
-	_HA_ATOMIC_INC(&be->be_counters.shared->tg[tgid - 1]->cum_sess);
-	update_freq_ctr(&be->be_counters.shared->tg[tgid - 1]->sess_per_sec, 1);
+	if (be->be_counters.shared.tg[tgid - 1])
+		_HA_ATOMIC_INC(&be->be_counters.shared.tg[tgid - 1]->cum_sess);
+	if (be->be_counters.shared.tg[tgid - 1])
+		update_freq_ctr(&be->be_counters.shared.tg[tgid - 1]->sess_per_sec, 1);
 	HA_ATOMIC_UPDATE_MAX(&be->be_counters.sps_max,
 			     update_freq_ctr(&be->be_counters._sess_per_sec, 1));
 }
@@ -186,13 +201,15 @@ static inline void proxy_inc_be_ctr(struct proxy *be)
 static inline void proxy_inc_fe_req_ctr(struct listener *l, struct proxy *fe,
                                         unsigned int http_ver)
 {
-	if (http_ver >= sizeof(fe->fe_counters.shared->tg[tgid - 1]->p.http.cum_req) / sizeof(*fe->fe_counters.shared->tg[tgid - 1]->p.http.cum_req))
+	if (http_ver >= sizeof(fe->fe_counters.shared.tg[tgid - 1]->p.http.cum_req) / sizeof(*fe->fe_counters.shared.tg[tgid - 1]->p.http.cum_req))
 	    return;
 
-	_HA_ATOMIC_INC(&fe->fe_counters.shared->tg[tgid - 1]->p.http.cum_req[http_ver]);
-	if (l && l->counters)
-		_HA_ATOMIC_INC(&l->counters->shared->tg[tgid - 1]->p.http.cum_req[http_ver]);
-	update_freq_ctr(&fe->fe_counters.shared->tg[tgid - 1]->req_per_sec, 1);
+	if (fe->fe_counters.shared.tg[tgid - 1])
+		_HA_ATOMIC_INC(&fe->fe_counters.shared.tg[tgid - 1]->p.http.cum_req[http_ver]);
+	if (l && l->counters && l->counters->shared.tg[tgid - 1])
+		_HA_ATOMIC_INC(&l->counters->shared.tg[tgid - 1]->p.http.cum_req[http_ver]);
+	if (fe->fe_counters.shared.tg[tgid - 1])
+		update_freq_ctr(&fe->fe_counters.shared.tg[tgid - 1]->req_per_sec, 1);
 	HA_ATOMIC_UPDATE_MAX(&fe->fe_counters.p.http.rps_max,
 	                     update_freq_ctr(&fe->fe_counters.p.http._req_per_sec, 1));
 }

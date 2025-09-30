@@ -24,6 +24,7 @@
 #include <haproxy/log.h>
 #include <haproxy/peers.h>
 #include <haproxy/protocol.h>
+#include <haproxy/stats-file.h>
 #include <haproxy/stress.h>
 #include <haproxy/tools.h>
 
@@ -168,7 +169,7 @@ int cfg_parse_global(const char *file, int linenum, char **args, int kwm)
 	else if (strcmp(args[0], "uid") == 0) {
 		if (alertif_too_many_args(1, file, linenum, args, &err_code))
 			goto out;
-		if (global.uid != 0) {
+		if (global.uid >= 0) {
 			ha_alert("parsing [%s:%d] : user/uid already specified. Continuing.\n", file, linenum);
 			err_code |= ERR_ALERT;
 			goto out;
@@ -188,7 +189,7 @@ int cfg_parse_global(const char *file, int linenum, char **args, int kwm)
 	else if (strcmp(args[0], "gid") == 0) {
 		if (alertif_too_many_args(1, file, linenum, args, &err_code))
 			goto out;
-		if (global.gid != 0) {
+		if (global.gid >= 0) {
 			ha_alert("parsing [%s:%d] : group/gid already specified. Continuing.\n", file, linenum);
 			err_code |= ERR_ALERT;
 			goto out;
@@ -221,11 +222,20 @@ int cfg_parse_global(const char *file, int linenum, char **args, int kwm)
 		struct passwd *ha_user;
 		if (alertif_too_many_args(1, file, linenum, args, &err_code))
 			goto out;
-		if (global.uid != 0) {
+		if (global.uid >= 0) {
 			ha_alert("parsing [%s:%d] : user/uid already specified. Continuing.\n", file, linenum);
 			err_code |= ERR_ALERT;
 			goto out;
 		}
+
+		if (build_is_static) {
+			ha_warning("parsing [%s:%d] : haproxy is built statically, the "
+			              "libc might crash when resolving \"user %s\", "
+			              "please use \"uid\" instead\n",
+			               file, linenum, args[1]);
+			err_code |= ERR_WARN;
+		}
+
 		errno = 0;
 		ha_user = getpwnam(args[1]);
 		if (ha_user != NULL) {
@@ -240,11 +250,21 @@ int cfg_parse_global(const char *file, int linenum, char **args, int kwm)
 		struct group *ha_group;
 		if (alertif_too_many_args(1, file, linenum, args, &err_code))
 			goto out;
-		if (global.gid != 0) {
+		if (global.gid >= 0) {
 			ha_alert("parsing [%s:%d] : gid/group was already specified. Continuing.\n", file, linenum);
 			err_code |= ERR_ALERT;
 			goto out;
 		}
+
+		if (build_is_static) {
+			ha_warning("parsing [%s:%d] : haproxy is built statically, the "
+			              "libc might crash when resolving \"group %s\", "
+			              "please use \"gid\" instead\n",
+			               file, linenum, args[1]);
+			err_code |= ERR_WARN;
+		}
+
+
 		errno = 0;
 		ha_group = getgrnam(args[1]);
 		if (ha_group != NULL) {
@@ -990,6 +1010,21 @@ static int cfg_parse_global_mode(char **args, int section_type,
 	return 0;
 }
 
+static int cfg_parse_global_disable_ktls(char **args, int section_type,
+					 struct proxy *curpx, const struct proxy *defpx,
+					 const char *file, int line, char **err)
+{
+	if (!(global.mode & MODE_DISCOVERY))
+                return 0;
+
+	if (too_many_args(0, args, err, NULL))
+		return -1;
+
+	global.tune.options |= GTUNE_NO_KTLS;
+
+	return 0;
+}
+
 /* Disable certain poller if set */
 static int cfg_parse_global_disable_poller(char **args, int section_type,
 					   struct proxy *curpx, const struct proxy *defpx,
@@ -1565,6 +1600,52 @@ static int cfg_parse_global_env_opts(char **args, int section_type,
 	return 0;
 }
 
+static int cfg_parse_global_shm_stats_file(char **args, int section_type,
+				           struct proxy *curpx, const struct proxy *defpx,
+				           const char *file, int line, char **err)
+{
+	if (!experimental_directives_allowed) {
+		memprintf(err, "'%s' directive is experimental, must be allowed via a global 'expose-experimental-directives'", args[0]);
+		return -1;
+	}
+
+	if (global.shm_stats_file != NULL) {
+		memprintf(err, "'%s' already specified.\n", args[0]);
+		return -1;
+	}
+
+	if (!*(args[1])) {
+		memprintf(err, "'%s' expect one argument: a file path.\n", args[0]);
+		return -1;
+	}
+
+	global.shm_stats_file = strdup(args[1]);
+	return 0;
+}
+
+static int cfg_parse_global_shm_stats_file_max_objects(char **args, int section_type,
+				                       struct proxy *curpx, const struct proxy *defpx,
+				                       const char *file, int line, char **err)
+{
+	if (!experimental_directives_allowed) {
+		memprintf(err, "'%s' directive is experimental, must be allowed via a global 'expose-experimental-directives'", args[0]);
+		return -1;
+	}
+
+	if (shm_stats_file_max_objects != -1) {
+		memprintf(err, "'%s' already specified.\n", args[0]);
+		return -1;
+	}
+
+	if (!*(args[1])) {
+		memprintf(err, "'%s' expect one argument: max objects number.\n", args[0]);
+		return -1;
+	}
+
+	shm_stats_file_max_objects = atoi(args[1]);
+	return 0;
+}
+
 static int cfg_parse_global_parser_pause(char **args, int section_type,
                                          struct proxy *curpx, const struct proxy *defpx,
                                          const char *file, int line, char **err)
@@ -1767,6 +1848,7 @@ static struct cfg_kw_list cfg_kws = {ILH, {
 	{ CFG_GLOBAL, "noepoll", cfg_parse_global_disable_poller, KWF_DISCOVERY },
 	{ CFG_GLOBAL, "noevports", cfg_parse_global_disable_poller, KWF_DISCOVERY },
 	{ CFG_GLOBAL, "nokqueue", cfg_parse_global_disable_poller, KWF_DISCOVERY },
+	{ CFG_GLOBAL, "noktls", cfg_parse_global_disable_ktls, KWF_DISCOVERY },
 	{ CFG_GLOBAL, "nopoll", cfg_parse_global_disable_poller, KWF_DISCOVERY },
 	{ CFG_GLOBAL, "pidfile", cfg_parse_global_pidfile, KWF_DISCOVERY },
 	{ CFG_GLOBAL, "prealloc-fd", cfg_parse_prealloc_fd },
@@ -1774,6 +1856,8 @@ static struct cfg_kw_list cfg_kws = {ILH, {
 	{ CFG_GLOBAL, "quiet", cfg_parse_global_mode, KWF_DISCOVERY },
 	{ CFG_GLOBAL, "resetenv", cfg_parse_global_env_opts, KWF_DISCOVERY },
 	{ CFG_GLOBAL, "setenv", cfg_parse_global_env_opts, KWF_DISCOVERY },
+	{ CFG_GLOBAL, "shm-stats-file", cfg_parse_global_shm_stats_file },
+	{ CFG_GLOBAL, "shm-stats-file-max-objects", cfg_parse_global_shm_stats_file_max_objects },
 	{ CFG_GLOBAL, "stress-level", cfg_parse_global_stress_level },
 	{ CFG_GLOBAL, "tune.bufsize", cfg_parse_global_tune_opts },
 	{ CFG_GLOBAL, "tune.chksize", cfg_parse_global_unsupported_opts },

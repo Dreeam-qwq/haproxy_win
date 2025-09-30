@@ -245,8 +245,8 @@ int curpxopts;
 int curpxopts2;
 
 /* Pools used to allocate SPOE structs */
-DECLARE_STATIC_POOL(pool_head_spoe_ctx,    "spoe_ctx",    sizeof(struct spoe_context));
-DECLARE_STATIC_POOL(pool_head_spoe_appctx, "spoe_appctx", sizeof(struct spoe_appctx));
+DECLARE_STATIC_TYPED_POOL(pool_head_spoe_ctx,    "spoe_ctx",    struct spoe_context);
+DECLARE_STATIC_TYPED_POOL(pool_head_spoe_appctx, "spoe_appctx", struct spoe_appctx);
 
 struct flt_ops spoe_ops;
 
@@ -434,6 +434,7 @@ static void spoe_release_appctx(struct appctx *appctx)
 	/* Shutdown the server connection, if needed */
 	if (appctx->st0 != SPOE_APPCTX_ST_END) {
 		appctx->st0 = SPOE_APPCTX_ST_END;
+		applet_set_error(appctx);
 		if (spoe_appctx->status_code == SPOP_ERR_NONE)
 			spoe_appctx->status_code = SPOP_ERR_IO;
 	}
@@ -504,14 +505,15 @@ static void spoe_handle_appctx(struct appctx *appctx)
 		goto out;
 	}
 
-	if (!SPOE_APPCTX(appctx)->spoe_ctx)
-		appctx->st0 =  SPOE_APPCTX_ST_EXIT;
-
   switchstate:
 	switch (appctx->st0) {
 		/* case SPOE_APPCTX_ST_PROCESSING: */
 		case SPOE_APPCTX_ST_WAITING_ACK:
-			if (!spoe_handle_receiving_frame_appctx(appctx))
+			if (!SPOE_APPCTX(appctx)->spoe_ctx) {
+				appctx->st0 = SPOE_APPCTX_ST_END;
+				applet_set_error(appctx);
+			}
+			else if (!spoe_handle_receiving_frame_appctx(appctx))
 				break;
 			goto switchstate;
 
@@ -538,6 +540,7 @@ static void spoe_handle_appctx(struct appctx *appctx)
 
 struct applet spoe_applet = {
 	.obj_type = OBJ_TYPE_APPLET,
+	.flags = APPLET_FL_NEW_API,
 	.name = "<SPOE>", /* used for logging */
 	.fct = spoe_handle_appctx,
 	.init = spoe_init_appctx,
@@ -646,13 +649,14 @@ static int spoe_encode_messages(struct stream *s, struct spoe_context *ctx,
 	struct spoe_config  *conf = FLT_CONF(ctx->filter);
 	struct spoe_agent   *agent = conf->agent;
 	struct spoe_message *msg;
-	char   *p, *end;
+	char   *p, *start, *end;
 
 	p   = b_head(&ctx->buffer);
 	end =  p + agent->max_frame_size - SPOP_FRAME_HDR_SIZE;
 
 	/* Set Frame type */
 	*p++ = SPOP_FRM_T_HAPROXY_NOTIFY;
+	start = p;
 
 	if (type == SPOE_MSGS_BY_EVENT) { /* Loop on messages by event */
 		list_for_each_entry(msg, messages, by_evt) {
@@ -672,7 +676,7 @@ static int spoe_encode_messages(struct stream *s, struct spoe_context *ctx,
 
 
 	/* nothing has been encoded */
-	if (p == b_head(&ctx->buffer))
+	if (p == start)
 		goto skip;
 
 	b_set_data(&ctx->buffer, p - b_head(&ctx->buffer));
@@ -1182,6 +1186,10 @@ static void spoe_destroy_context(struct filter *filter)
 	if (!ctx)
 		return;
 
+	if (ctx->state != SPOE_CTX_ST_NONE || ctx->state == SPOE_CTX_ST_READY) {
+		ctx->status_code = SPOE_CTX_ERR_INTERRUPT;
+		_HA_ATOMIC_INC(&conf->agent->counters.nb_errors);
+	}
 	spoe_stop_processing(conf->agent, ctx);
 	pool_free(pool_head_spoe_ctx, ctx);
 	filter->ctx = NULL;

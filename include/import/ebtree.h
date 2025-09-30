@@ -246,6 +246,7 @@
 #ifndef _EBTREE_H
 #define _EBTREE_H
 
+#include <stddef.h>
 #include <stdlib.h>
 #include <import/ebtree-t.h>
 #include <haproxy/api.h>
@@ -365,11 +366,20 @@ static inline unsigned int flsnz64(unsigned long long x)
 #define fls64(x) flsnz64(x)
 #define fls_auto(x) ((x) ? flsnz(x) : 0)
 
+/* offsetof() is provided as a builtin starting with gcc-4.1 */
+#ifndef offsetof
+# if (__GNUC__ > 4 || (__GNUC__ == 4 && __GNUC_MINOR__ >= 1))
+#  define offsetof(type, field)  __builtin_offsetof(type, field)
+# else
+#  define offsetof(type, field) ((__size_t)(__uintptr_t)((const volatile void *)&((type *)0)->field))
+# endif
+#endif
+
 /* Linux-like "container_of". It returns a pointer to the structure of type
  * <type> which has its member <name> stored at address <ptr>.
  */
 #ifndef container_of
-#define container_of(ptr, type, name) ((type *)(((void *)(ptr)) - ((long)&((type *)0)->name)))
+#define container_of(ptr, type, name) ((type *)(((char *)(ptr)) - offsetof(type, name)))
 #endif
 
 /* returns a pointer to the structure of type <type> which has its member <name>
@@ -378,7 +388,7 @@ static inline unsigned int flsnz64(unsigned long long x)
 #ifndef container_of_safe
 #define container_of_safe(ptr, type, name) \
 	({ void *__p = (ptr); \
-		__p ? (type *)(__p - ((long)&((type *)0)->name)) : (type *)0; \
+	   __p ? container_of(__p, type, name) : (type *)0; \
 	})
 #endif
 
@@ -498,6 +508,15 @@ __eb_insert_dup(struct eb_node *sub, struct eb_node *new)
 		return new;
 	}
 }
+
+/* __builtin_prefetch() appears in gcc-3.1 documentation */
+#if !defined(eb_prefetch)
+# if defined(__GNUC__) && ((__GNUC__ > 3) || ((__GNUC__ == 3) && (__GNUC_MINOR__ >= 1)))
+#  define eb_prefetch(a,b) __builtin_prefetch(a,b)
+# else
+#  define eb_prefetch(a,b) do { } while (0)
+# endif
+#endif
 
 
 /**************************************\

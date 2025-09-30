@@ -16,8 +16,8 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 
+#include <import/cebis_tree.h>
 #include <import/eb32tree.h>
-#include <import/ebistree.h>
 
 #include <haproxy/acl.h>
 #include <haproxy/api.h>
@@ -61,9 +61,9 @@
 int listeners;	/* # of proxy listeners, set by cfgparse */
 struct proxy *proxies_list  = NULL;     /* list of main proxies */
 struct list proxies = LIST_HEAD_INIT(proxies); /* list of all proxies */
-struct eb_root used_proxy_id = EB_ROOT;	/* list of proxy IDs in use */
-struct eb_root proxy_by_name = EB_ROOT; /* tree of proxies sorted by name */
-struct eb_root defproxy_by_name = EB_ROOT; /* tree of default proxies sorted by name (dups possible) */
+struct ceb_root *used_proxy_id = NULL; /* list of proxy IDs in use */
+struct ceb_root *proxy_by_name = NULL; /* tree of proxies sorted by name */
+struct ceb_root *defproxy_by_name = NULL; /* tree of default proxies sorted by name (dups possible) */
 struct proxy *orphaned_default_proxies = NULL; /* deleted ones with refcount != 0 */
 unsigned int error_snapshot_id = 0;     /* global ID assigned to each error then incremented */
 
@@ -215,15 +215,14 @@ static inline void proxy_free_common(struct proxy *px)
 	struct acl *acl, *aclb;
 	struct logger *log, *logb;
 	struct lf_expr *lf, *lfb;
-	struct eb32_node *node;
 
 	/* note that the node's key points to p->id */
-	ebpt_delete(&px->conf.by_name);
+	cebis_item_delete((px->cap & PR_CAP_DEF) ? &defproxy_by_name : &proxy_by_name, conf.name_node, id, px);
 	ha_free(&px->id);
 	LIST_DEL_INIT(&px->global_list);
 	drop_file_name(&px->conf.file);
-	counters_fe_shared_drop(px->fe_counters.shared);
-	counters_be_shared_drop(px->be_counters.shared);
+	counters_fe_shared_drop(&px->fe_counters.shared);
+	counters_be_shared_drop(&px->be_counters.shared);
 	ha_free(&px->check_command);
 	ha_free(&px->check_path);
 	ha_free(&px->cookie_name);
@@ -277,16 +276,6 @@ static inline void proxy_free_common(struct proxy *px)
 		LIST_DEL_INIT(&lf->list);
 
 	chunk_destroy(&px->log_tag);
-
-	node = eb32_first(&px->conf.log_steps);
-	while (node) {
-		struct eb32_node *prev_node = node;
-
-		/* log steps directly use the node key as id, they are not encapsulated */
-		node = eb32_next(node);
-		eb32_delete(prev_node);
-		free(prev_node);
-	}
 
 	free_email_alert(px);
 	stats_uri_auth_drop(px->uri_auth);
@@ -388,7 +377,7 @@ void deinit_proxy(struct proxy *p)
 	 */
 	if (p->defsrv) {
 		srv_free_params(p->defsrv);
-		ha_free(&p->defsrv);
+		srv_free(&p->defsrv);
 	}
 
 	if (p->lbprm.proxy_deinit)
@@ -402,7 +391,7 @@ void deinit_proxy(struct proxy *p)
 		free(l->label);
 		free(l->per_thr);
 		if (l->counters) {
-			counters_fe_shared_drop(l->counters->shared);
+			counters_fe_shared_drop(&l->counters->shared);
 			free(l->counters);
 		}
 		task_destroy(l->rx.rhttp.task);
@@ -422,6 +411,7 @@ void deinit_proxy(struct proxy *p)
 		free(bind_conf->guid_prefix);
 		free(bind_conf->rhttp_srvname);
 		free(bind_conf->tcp_md5sig);
+		free(bind_conf->cc_algo);
 #ifdef USE_QUIC
 		free(bind_conf->quic_cc_algo);
 #endif
@@ -547,6 +537,23 @@ const char *proxy_find_best_option(const char *word, const char **extra)
 	if (best_dist > 2 * strlen(word) || (best_ptr && best_dist > 2 * strlen(best_ptr)))
 		best_ptr = NULL;
 	return best_ptr;
+}
+
+/* This function returns the first unused proxy ID greater than or equal to
+ * <from> in used_proxy_id. Zero is returned if no spare one is found (should
+ * never happen).
+ */
+uint proxy_get_next_id(uint from)
+{
+	const struct proxy *px;
+
+	do {
+		px = ceb32_item_lookup_ge(&used_proxy_id, conf.uuid_node, uuid, from, struct proxy);
+		if (!px || px->uuid > from)
+			return from; /* available */
+		from++;
+	} while (from);
+	return from;
 }
 
 /* This function parses a "timeout" statement in a proxy section. It returns
@@ -1183,10 +1190,9 @@ static int proxy_parse_guid(char **args, int section_type, struct proxy *curpx,
  */
 void proxy_store_name(struct proxy *px)
 {
-	struct eb_root *root = (px->cap & PR_CAP_DEF) ? &defproxy_by_name : &proxy_by_name;
+	struct ceb_root **root = (px->cap & PR_CAP_DEF) ? &defproxy_by_name : &proxy_by_name;
 
-	px->conf.by_name.key = px->id;
-	ebis_insert(root, &px->conf.by_name);
+	cebis_item_insert(root, conf.name_node, id, px);
 }
 
 /* Returns a pointer to the first proxy matching capabilities <cap> and id
@@ -1195,14 +1201,10 @@ void proxy_store_name(struct proxy *px)
  */
 struct proxy *proxy_find_by_id(int id, int cap, int table)
 {
-	struct eb32_node *n;
+	struct proxy *px;
 
-	for (n = eb32_lookup(&used_proxy_id, id); n; n = eb32_next(n)) {
-		struct proxy *px = container_of(n, struct proxy, conf.id);
-
-		if (px->uuid != id)
-			break;
-
+	for (px = ceb32_item_lookup(&used_proxy_id, conf.uuid_node, uuid, id, struct proxy);
+	     px ; px = ceb32_item_next_dup(&used_proxy_id, conf.uuid_node, uuid, px)) {
 		if ((px->cap & cap) != cap)
 			continue;
 
@@ -1230,16 +1232,11 @@ struct proxy *proxy_find_by_name(const char *name, int cap, int table)
 			return curproxy;
 	}
 	else {
-		struct eb_root *root;
-		struct ebpt_node *node;
+		struct ceb_root **root;
 
 		root = (cap & PR_CAP_DEF) ? &defproxy_by_name : &proxy_by_name;
-		for (node = ebis_lookup(root, name); node; node = ebpt_next(node)) {
-			curproxy = container_of(node, struct proxy, conf.by_name);
-
-			if (strcmp(curproxy->id, name) != 0)
-				break;
-
+		for (curproxy = cebis_item_lookup(root, conf.name_node, id, name, struct proxy);
+		     curproxy; curproxy = cebis_item_next_dup(root, conf.name_node, id, curproxy)) {
 			if ((curproxy->cap & cap) != cap)
 				continue;
 
@@ -1480,10 +1477,9 @@ void init_new_proxy(struct proxy *p)
 
 	MT_LIST_INIT(&p->lbprm.lb_free_list);
 
-	p->conf.used_listener_id = EB_ROOT;
-	p->conf.used_server_id   = EB_ROOT;
-	p->used_server_addr      = EB_ROOT_UNIQUE;
-	p->conf.log_steps        = EB_ROOT_UNIQUE;
+	p->conf.used_listener_id = NULL;
+	p->conf.used_server_id   = NULL;
+	p->used_server_addr      = NULL;
 
 	/* Timeouts are defined as -1 */
 	proxy_reset_timeouts(p);
@@ -1560,7 +1556,7 @@ void proxy_free_defaults(struct proxy *defproxy)
 	if (defproxy->defsrv)
 		ha_free((char **)&defproxy->defsrv->conf.file);
 	ha_free(&defproxy->defbe.name);
-	ha_free(&defproxy->defsrv);
+	srv_free(&defproxy->defsrv);
 
 	h = defproxy->req_cap;
 	while (h) {
@@ -1595,7 +1591,8 @@ void proxy_destroy_defaults(struct proxy *px)
 	if (!(px->cap & PR_CAP_DEF))
 		return;
 	BUG_ON(px->conf.refcount != 0);
-	ebpt_delete(&px->conf.by_name);
+	cebis_item_delete((px->cap & PR_CAP_DEF) ? &defproxy_by_name : &proxy_by_name,
+			  conf.name_node, id, px);
 	proxy_free_defaults(px);
 	free(px);
 }
@@ -1605,14 +1602,11 @@ void proxy_destroy_defaults(struct proxy *px)
  */
 void proxy_destroy_all_unref_defaults()
 {
-	struct ebpt_node *n;
 	struct proxy *px, *nx;
 
-	n = ebpt_first(&defproxy_by_name);
-	while (n) {
-		px = container_of(n, struct proxy, conf.by_name);
+	for (px = cebis_item_first(&defproxy_by_name, conf.name_node, id, struct proxy); px; px = nx) {
 		BUG_ON(!(px->cap & PR_CAP_DEF));
-		n = ebpt_next(n);
+		nx = cebis_item_next(&defproxy_by_name, conf.name_node, id, px);
 		if (!px->conf.refcount)
 			proxy_destroy_defaults(px);
 	}
@@ -1636,7 +1630,7 @@ void proxy_unref_or_destroy_defaults(struct proxy *px)
 	if (!px || !(px->cap & PR_CAP_DEF))
 		return;
 
-	ebpt_delete(&px->conf.by_name);
+	cebis_item_delete((px->cap & PR_CAP_DEF) ? &defproxy_by_name : &proxy_by_name, conf.name_node, id, px);
 	if (px->conf.refcount) {
 		/* still referenced just append it to the orphaned list */
 		px->next = orphaned_default_proxies;
@@ -1708,10 +1702,10 @@ int setup_new_proxy(struct proxy *px, const char *name, unsigned int cap, char *
 	if (name)
 		memprintf(errmsg, "proxy '%s': %s", name, *errmsg);
 
-	ha_free(&px->defsrv);
+	srv_free(&px->defsrv);
 	ha_free(&px->id);
-	counters_fe_shared_drop(px->fe_counters.shared);
-	counters_be_shared_drop(px->be_counters.shared);
+	counters_fe_shared_drop(&px->fe_counters.shared);
+	counters_be_shared_drop(&px->be_counters.shared);
 
 	return 0;
 }
@@ -1740,7 +1734,7 @@ struct proxy *alloc_new_proxy(const char *name, unsigned int cap, char **errmsg)
 	 * quitting.
 	 */
 	if (curproxy)
-		free(curproxy->defsrv);
+		srv_free(&curproxy->defsrv);
 	free(curproxy);
 	return NULL;
 }
@@ -1748,6 +1742,8 @@ struct proxy *alloc_new_proxy(const char *name, unsigned int cap, char **errmsg)
 /* post-check for proxies */
 static int proxy_postcheck(struct proxy *px)
 {
+	struct listener *listener;
+	char *errmsg = NULL;
 	int err_code = ERR_NONE;
 
 	/* allocate private memory for shared counters: used as a fallback
@@ -1756,10 +1752,10 @@ static int proxy_postcheck(struct proxy *px)
 	 * proxy postparsing, see proxy_postparse()
 	 */
 	if (px->cap & PR_CAP_FE) {
-		px->fe_counters.shared = counters_fe_shared_get(&px->guid);
-		if (!px->fe_counters.shared) {
-			ha_alert("out of memory while setting up shared counters for %s %s\n",
-			         proxy_type_str(px), px->id);
+		if (!counters_fe_shared_prepare(&px->fe_counters.shared, &px->guid, &errmsg)) {
+			ha_alert("out of memory while setting up shared counters for %s %s : %s\n",
+			         proxy_type_str(px), px->id, errmsg);
+			ha_free(&errmsg);
 			err_code |= ERR_ALERT | ERR_FATAL;
 			goto out;
 		}
@@ -1769,16 +1765,28 @@ static int proxy_postcheck(struct proxy *px)
 		 * be_counters may be used even if the proxy lacks the backend
 		 * capability
 		 */
-		px->be_counters.shared = counters_be_shared_get(&px->guid);
-		if (!px->be_counters.shared) {
-			ha_alert("out of memory while setting up shared counters for %s %s\n",
-			         proxy_type_str(px), px->id);
+		if (!counters_be_shared_prepare(&px->be_counters.shared, &px->guid, &errmsg)) {
+			ha_alert("out of memory while setting up shared counters for %s %s : %s\n",
+			         proxy_type_str(px), px->id, errmsg);
+			ha_free(&errmsg);
 			err_code |= ERR_ALERT | ERR_FATAL;
 			goto out;
 		}
 
 	}
 
+	list_for_each_entry(listener, &px->conf.listeners, by_fe) {
+		if (listener->counters) {
+			if (!counters_fe_shared_prepare(&listener->counters->shared, &listener->guid, &errmsg)) {
+				ha_free(&listener->counters);
+				ha_alert("out of memory while setting up shared listener counters for %s %s : %s\n",
+				         proxy_type_str(px), px->id, errmsg);
+				ha_free(&errmsg);
+				err_code |= ERR_ALERT | ERR_FATAL;
+				goto out;
+			}
+		}
+	}
 
  out:
 	return err_code;
@@ -1794,7 +1802,6 @@ static int proxy_defproxy_cpy(struct proxy *curproxy, const struct proxy *defpro
 {
 	struct logger *tmplogger;
 	char *tmpmsg = NULL;
-	struct eb32_node *node;
 
 	/* set default values from the specified default proxy */
 
@@ -1804,7 +1811,7 @@ static int proxy_defproxy_cpy(struct proxy *curproxy, const struct proxy *defpro
 			 * none allocated yet in the current proxy so we have
 			 * to allocate and pre-initialize it right now.
 			 */
-			curproxy->defsrv = calloc(1, sizeof(*curproxy->defsrv));
+			curproxy->defsrv = srv_alloc();
 			if (!curproxy->defsrv) {
 				memprintf(errmsg, "proxy '%s': out of memory allocating default-server", curproxy->id);
 				return 1;
@@ -2023,24 +2030,8 @@ static int proxy_defproxy_cpy(struct proxy *curproxy, const struct proxy *defpro
 	curproxy->email_alert.level = defproxy->email_alert.level;
 	curproxy->email_alert.flags = defproxy->email_alert.flags;
 
-	/* defproxy is const pointer, so we need to typecast log_steps to
-	 * drop the const in order to use EB tree API, please note however
-	 * that the operations performed below should theoretically be read-only
-	 */
-	node = eb32_first((struct eb_root *)&defproxy->conf.log_steps);
-	while (node) {
-		struct eb32_node *new_node;
-
-		new_node = malloc(sizeof(*new_node));
-		if (!new_node) {
-			memprintf(errmsg, "proxy '%s': out of memory for log_steps option", curproxy->id);
-			return 1;
-		}
-
-		new_node->key = node->key;
-		eb32_insert(&curproxy->conf.log_steps, new_node);
-		node = eb32_next(node);
-	}
+	if (curproxy->cap & PR_CAP_FE) // don't inherit on backends
+		curproxy->conf.log_steps = defproxy->conf.log_steps;
 
 	return 0;
 }
@@ -2122,10 +2113,12 @@ void proxy_cond_disable(struct proxy *p)
 	 * peers, etc) we must not report them at all as they're not really on
 	 * the data plane but on the control plane.
 	 */
-	if (p->cap & PR_CAP_FE)
-		cum_conn = COUNTERS_SHARED_TOTAL(p->fe_counters.shared->tg, cum_conn, HA_ATOMIC_LOAD);
-	if (p->cap & PR_CAP_BE)
-		cum_sess = COUNTERS_SHARED_TOTAL(p->be_counters.shared->tg, cum_sess, HA_ATOMIC_LOAD);
+	if (!(global.mode & MODE_STARTING)) {
+		if (p->cap & PR_CAP_FE)
+			cum_conn = COUNTERS_SHARED_TOTAL(p->fe_counters.shared.tg, cum_conn, HA_ATOMIC_LOAD);
+		if (p->cap & PR_CAP_BE)
+			cum_sess = COUNTERS_SHARED_TOTAL(p->be_counters.shared.tg, cum_sess, HA_ATOMIC_LOAD);
+	}
 
 	if ((p->mode == PR_MODE_TCP || p->mode == PR_MODE_HTTP || p->mode == PR_MODE_SYSLOG || p->mode == PR_MODE_SPOP) && !(p->cap & PR_CAP_INT))
 		ha_warning("Proxy %s stopped (cumulated conns: FE: %lld, BE: %lld).\n",
@@ -2173,7 +2166,6 @@ struct task *manage_proxy(struct task *t, void *context, unsigned int state)
 			 * to push to a new process and
 			 * we are free to flush the table.
 			 */
-			int budget;
 			int cleaned_up;
 
 			/* We purposely enforce a budget limitation since we don't want
@@ -2186,14 +2178,12 @@ struct task *manage_proxy(struct task *t, void *context, unsigned int state)
 			 * Moreover, we must also anticipate the pool_gc() call which
 			 * will also be much slower if there is too much work at once
 			 */
-			budget = MIN(p->table->current, (1 << 15)); /* max: 32K */
-			cleaned_up = stktable_trash_oldest(p->table, budget);
+			cleaned_up = stktable_trash_oldest(p->table);
 			if (cleaned_up) {
 				/* immediately release freed memory since we are stopping */
 				pool_gc(NULL);
-				if (cleaned_up > (budget / 2)) {
-					/* most of the budget was used to purge entries,
-					 * it is very likely that there are still trashable
+				if (cleaned_up) {
+					/* it is very likely that there are still trashable
 					 * entries in the table, reschedule a new cleanup
 					 * attempt ASAP
 					 */
@@ -2220,7 +2210,7 @@ struct task *manage_proxy(struct task *t, void *context, unsigned int state)
 		goto out;
 
 	if (p->fe_sps_lim &&
-	    (wait = COUNTERS_SHARED_TOTAL_ARG2(p->fe_counters.shared->tg, sess_per_sec, next_event_delay, p->fe_sps_lim, 0))) {
+	    (wait = COUNTERS_SHARED_TOTAL_ARG2(p->fe_counters.shared.tg, sess_per_sec, next_event_delay, p->fe_sps_lim, 0))) {
 
 		/* we're blocking because a limit was reached on the number of
 		 * requests/s on the frontend. We want to re-check ASAP, which
@@ -2591,6 +2581,7 @@ int stream_set_backend(struct stream *s, struct proxy *be)
 		return 0;
 
 	s->be = be;
+	s->be_tgcounters = be->be_counters.shared.tg[tgid - 1];
 	HA_ATOMIC_UPDATE_MAX(&be->be_counters.conn_max,
 			     HA_ATOMIC_ADD_FETCH(&be->beconn, 1));
 	proxy_inc_be_ctr(be);
@@ -2823,6 +2814,8 @@ void proxy_adjust_all_maxconn()
  */
 static int post_section_px_cleanup()
 {
+	if (!curproxy)
+		return 0; // nothing to do
 	if ((curproxy->cap & PR_CAP_LISTEN) && !(curproxy->cap & PR_CAP_DEF)) {
 		/* This is a regular proxy (not defaults). It doesn't need
 		 * to keep a default-server section if it still had one. We
@@ -2831,7 +2824,7 @@ static int post_section_px_cleanup()
 
 		if (curproxy->defsrv) {
 			ha_free((char **)&curproxy->defsrv->conf.file);
-			ha_free(&curproxy->defsrv);
+			srv_free(&curproxy->defsrv);
 		}
 	}
 	return 0;
@@ -3024,11 +3017,13 @@ static int dump_servers_state(struct appctx *appctx)
 			int thr;
 
 			chunk_printf(&trash,
-			             "%s/%s %d/%d %s %u - %u %u %u %u %u %u %d %u",
+			             "%s/%s %d/%d %s %u - %u %u %u %u %u %u %u %u %d %u",
 			             HA_ANON_CLI(px->id), HA_ANON_CLI(srv->id),
 			             px->uuid, srv->puid, hash_ipanon(appctx->cli_ctx.anon_key, srv_addr, 0),
 			             srv->svc_port, srv->pool_purge_delay,
+			             srv->served,
 			             srv->curr_used_conns, srv->max_used_conns, srv->est_need_conns,
+			             srv->curr_sess_idle_conns,
 			             srv->curr_idle_nb, srv->curr_safe_nb, (int)srv->max_idle_conns, srv->curr_idle_conns);
 
 			for (thr = 0; thr < global.nbthread && srv->curr_idle_thr; thr++)
@@ -3058,7 +3053,7 @@ static int cli_io_handler_servers_state(struct appctx *appctx)
 			chunk_printf(&trash, "%d\n# %s\n", SRV_STATE_FILE_VERSION, SRV_STATE_FILE_FIELD_NAMES);
 		else
 			chunk_printf(&trash,
-			             "# bkname/svname bkid/svid addr port - purge_delay used_cur used_max need_est unsafe_nb safe_nb idle_lim idle_cur idle_per_thr[%d]\n",
+			             "# bkname/svname bkid/svid addr port - purge_delay served used_cur used_max need_est idle_sess unsafe_nb safe_nb idle_lim idle_cur idle_per_thr[%d]\n",
 			             global.nbthread);
 
 		if (applet_putchk(appctx, &trash) == -1)

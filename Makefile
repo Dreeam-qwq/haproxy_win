@@ -62,6 +62,8 @@
 #   USE_MEMORY_PROFILING    : enable the memory profiler. Linux-glibc only.
 #   USE_LIBATOMIC           : force to link with/without libatomic. Automatic.
 #   USE_PTHREAD_EMULATION   : replace pthread's rwlocks with ours
+#   USE_SHM_OPEN            : use shm_open() for features that can make use of shared memory
+#   USE_KTLS                : use kTLS.(requires at least Linux 4.17).
 #
 # Options can be forced by specifying "USE_xxx=1" or can be disabled by using
 # "USE_xxx=" (empty string). The list of enabled and disabled options for a
@@ -343,9 +345,10 @@ use_opts = USE_EPOLL USE_KQUEUE USE_NETFILTER USE_POLL                        \
            USE_MATH USE_DEVICEATLAS USE_51DEGREES                             \
            USE_WURFL USE_OBSOLETE_LINKER USE_PRCTL USE_PROCCTL                \
            USE_THREAD_DUMP USE_EVPORTS USE_OT USE_QUIC USE_PROMEX             \
-           USE_MEMORY_PROFILING                                               \
+           USE_MEMORY_PROFILING USE_SHM_OPEN                                  \
            USE_STATIC_PCRE USE_STATIC_PCRE2                                   \
-           USE_PCRE USE_PCRE_JIT USE_PCRE2 USE_PCRE2_JIT USE_QUIC_OPENSSL_COMPAT
+           USE_PCRE USE_PCRE_JIT USE_PCRE2 USE_PCRE2_JIT                      \
+           USE_QUIC_OPENSSL_COMPAT USE_KTLS
 
 # preset all variables for all supported build options among use_opts
 $(reset_opts_vars)
@@ -376,13 +379,13 @@ ifeq ($(TARGET),haiku)
   set_target_defaults = $(call default_opts,USE_POLL USE_TPROXY USE_OBSOLETE_LINKER)
 endif
 
-# For linux >= 2.6.28 and glibc
+# For linux >= 4.17 and glibc
 ifeq ($(TARGET),linux-glibc)
   set_target_defaults = $(call default_opts, \
     USE_POLL USE_TPROXY USE_LIBCRYPT USE_DL USE_RT USE_CRYPT_H USE_NETFILTER  \
     USE_CPU_AFFINITY USE_THREAD USE_EPOLL USE_LINUX_TPROXY USE_LINUX_CAP      \
     USE_ACCEPT4 USE_LINUX_SPLICE USE_PRCTL USE_THREAD_DUMP USE_NS USE_TFO     \
-    USE_GETADDRINFO USE_BACKTRACE)
+    USE_GETADDRINFO USE_BACKTRACE USE_SHM_OPEN USE_KTLS)
   INSTALL = install -v
 endif
 
@@ -395,13 +398,13 @@ ifeq ($(TARGET),linux-glibc-legacy)
   INSTALL = install -v
 endif
 
-# For linux >= 2.6.28 and musl
+# For linux >= 4.17 and musl
 ifeq ($(TARGET),linux-musl)
   set_target_defaults = $(call default_opts, \
     USE_POLL USE_TPROXY USE_LIBCRYPT USE_DL USE_RT USE_CRYPT_H USE_NETFILTER  \
     USE_CPU_AFFINITY USE_THREAD USE_EPOLL USE_LINUX_TPROXY USE_LINUX_CAP      \
     USE_ACCEPT4 USE_LINUX_SPLICE USE_PRCTL USE_THREAD_DUMP USE_NS USE_TFO     \
-    USE_GETADDRINFO USE_BACKTRACE)
+    USE_GETADDRINFO USE_BACKTRACE USE_SHM_OPEN USE_KTLS)
   INSTALL = install -v
 endif
 
@@ -959,15 +962,15 @@ OBJS += src/mux_h2.o src/mux_h1.o src/mux_fcgi.o src/log.o		\
         src/cache.o src/stconn.o src/http_htx.o src/debug.o		\
         src/check.o src/stats-html.o src/haproxy.o src/listener.o	\
         src/applet.o src/pattern.o src/cfgparse-listen.o		\
-        src/flt_spoe.o src/cebuis_tree.o src/http_ext.o			\
-        src/http_act.o src/http_fetch.o src/cebus_tree.o		\
-        src/cebuib_tree.o src/http_client.o src/dns.o			\
-        src/cebub_tree.o src/vars.o src/event_hdl.o src/tcp_rules.o	\
+        src/flt_spoe.o src/cebis_tree.o src/http_ext.o			\
+        src/http_act.o src/http_fetch.o src/cebs_tree.o			\
+        src/cebib_tree.o src/http_client.o src/dns.o			\
+        src/cebb_tree.o src/vars.o src/event_hdl.o src/tcp_rules.o	\
         src/trace.o src/stats-proxy.o src/pool.o src/stats.o		\
         src/cfgparse-global.o src/filters.o src/mux_pt.o		\
         src/flt_http_comp.o src/sock.o src/h1.o src/sink.o		\
-        src/cebua_tree.o src/session.o src/payload.o src/htx.o		\
-        src/cebul_tree.o src/cebu32_tree.o src/cebu64_tree.o		\
+        src/ceba_tree.o src/session.o src/payload.o src/htx.o		\
+        src/cebl_tree.o src/ceb32_tree.o src/ceb64_tree.o		\
         src/server_state.o src/proto_rhttp.o src/flt_trace.o src/fd.o	\
         src/task.o src/map.o src/fcgi-app.o src/h2.o src/mworker.o	\
         src/tcp_sample.o src/mjson.o src/h1_htx.o src/tcp_act.o		\
@@ -1280,6 +1283,8 @@ unit-tests:
 # options for all commits within RANGE. RANGE may be either a git range
 # such as ref1..ref2 or a single commit, in which case all commits from
 # the master branch to this one will be tested.
+# Will execute TEST_CMD for each commit if defined, and will stop in case of
+# failure.
 
 range:
 	$(Q)[ -d .git/. ] || { echo "## Fatal: \"make $@\" may only be used inside a Git repository."; exit 1; }
@@ -1305,6 +1310,7 @@ range:
 			echo "[ $$index/$$count ]   $$commit #############################"; \
 			git checkout -q $$commit || die 1; \
 			$(MAKE) all || die 1; \
+			[ -z "$(TEST_CMD)" ] || $(TEST_CMD) || die 1; \
 			index=$$((index + 1)); \
 		done; \
 		echo;echo "Done! $${count} commit(s) built successfully for RANGE $${RANGE}" ; \

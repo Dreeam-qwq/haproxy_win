@@ -115,6 +115,7 @@ static ssize_t hq_interop_rcv_buf_res(struct qcs *qcs, struct buffer *b, int fin
 		sl = htx_add_stline(htx, HTX_BLK_RES_SL, flags,
 		                    ist("HTTP/1.0"), ist("200"), ist(""));
 		BUG_ON(!sl);
+		sl->info.res.status = 200;
 		if (fin && !to_copy)
 			sl->flags |= HTX_SL_F_BODYLESS;
 		htx_add_endof(htx, HTX_BLK_EOH);
@@ -171,10 +172,13 @@ static size_t hq_interop_snd_buf(struct qcs *qcs, struct buffer *buf,
 	uint32_t bsize, fsize;
 	struct buffer *res = NULL;
 	size_t total = 0;
+	char eom;
 	int err;
 
 	*fin = 0;
 	htx = htx_from_buf(buf);
+	/* EOM is saved here, useful if 0-copy is performed with HTX buf. */
+	eom = htx->flags & HTX_FL_EOM;
 
 	while (count && !htx_is_empty(htx) && qcc_stream_can_send(qcs)) {
 		/* Not implemented : QUIC on backend side */
@@ -197,7 +201,7 @@ static size_t hq_interop_snd_buf(struct qcs *qcs, struct buffer *buf,
 			/* Only GET supported for HTTP/0.9. */
 			b_putist(res, ist("GET "));
 			b_putist(res, htx_sl_req_uri(sl));
-			b_putist(res, ist(" HTTP/0.9\r\n"));
+			b_putist(res, ist("\r\n"));
 			htx_remove_blk(htx, blk);
 			total += fsize;
 			break;
@@ -267,7 +271,7 @@ static size_t hq_interop_snd_buf(struct qcs *qcs, struct buffer *buf,
 	}
 
  end:
-	if (htx->flags & HTX_FL_EOM && htx_is_empty(htx))
+	if (eom && htx_is_empty(htx))
 		*fin = 1;
 	htx_to_buf(htx, buf);
 

@@ -4,25 +4,36 @@ set -eux
 BUILDSSL_DESTDIR=${BUILDSSL_DESTDIR:-${HOME}/opt}
 BUILDSSL_TMPDIR=${BUILDSSL_TMPDIR:-/tmp/download-cache}
 QUICTLS_URL=${QUICTLS_URL:-https://github.com/quictls/openssl}
-
 WOLFSSL_DEBUG=${WOLFSSL_DEBUG:-0}
+GIT_TYPE=${GIT_TYPE:-commit}
+
+
 
 download_openssl () {
-    if [ ! -f "${BUILDSSL_TMPDIR}/openssl-${OPENSSL_VERSION}.tar.gz" ]; then
 
-#
-# OpenSSL has different links for latest and previous releases
-# since we want to download several versions, let us try to treat
-# current version as latest, if it fails, follow with previous
-#
+	# chose between a release or a git version from github
+	if [ "${OPENSSL_VERSION%%-*}" != "git" ]; then
 
-	wget -P ${BUILDSSL_TMPDIR}/ \
-	    "https://www.openssl.org/source/openssl-${OPENSSL_VERSION}.tar.gz" || \
-        wget -P ${BUILDSSL_TMPDIR}/ \
-            "https://www.openssl.org/source/old/${OPENSSL_VERSION%[a-z]}/openssl-${OPENSSL_VERSION}.tar.gz" || \
-	wget -P ${BUILDSSL_TMPDIR}/ \
-	    "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz"
-    fi
+		if [ ! -f "${BUILDSSL_TMPDIR}/openssl-${OPENSSL_VERSION}.tar.gz" ]; then
+			# OpenSSL has different links for latest and previous releases
+			# since we want to download several versions, let us try to treat
+			# current version as latest, if it fails, follow with previous
+			wget -P ${BUILDSSL_TMPDIR}/ \
+			    "https://www.openssl.org/source/openssl-${OPENSSL_VERSION}.tar.gz" || \
+			wget -P ${BUILDSSL_TMPDIR}/ \
+			    "https://www.openssl.org/source/old/${OPENSSL_VERSION%[a-z]}/openssl-${OPENSSL_VERSION}.tar.gz" || \
+			wget -P ${BUILDSSL_TMPDIR}/ \
+			    "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz"
+		fi
+	else
+		if [ "${GIT_TYPE}" = "branch" ]; then
+			# update the openssl version using the commit ID of the branch HEAD
+			branch_name="${OPENSSL_VERSION##git-}"
+			OPENSSL_VERSION=git-$(wget -q -O- "https://api.github.com/repos/openssl/openssl/branches/$branch_name" |  grep '"sha":' | head -n 1 | sed -E 's/ *"sha": "(.*)",/\1/')
+		fi
+		wget -q -O "${BUILDSSL_TMPDIR}/openssl-${OPENSSL_VERSION}.tar.gz" \
+		    "https://github.com/openssl/openssl/archive/${OPENSSL_VERSION##git-}.tar.gz"
+	fi
 }
 
 # recent openssl versions support parallel builds and skipping the docs,
@@ -125,7 +136,6 @@ build_boringssl () {
 
 download_aws_lc () {
     if [ ! -f "${BUILDSSL_TMPDIR}/aws-lc-${AWS_LC_VERSION}.tar.gz" ]; then
-        mkdir -p "${BUILDSSL_TMPDIR}"
         wget -q -O "${BUILDSSL_TMPDIR}/aws-lc-${AWS_LC_VERSION}.tar.gz" \
           "https://github.com/aws/aws-lc/archive/refs/tags/v${AWS_LC_VERSION}.tar.gz"
     fi
@@ -151,7 +161,6 @@ build_aws_lc () {
 
 download_aws_lc_fips () {
     if [ ! -f "${BUILDSSL_TMPDIR}/aws-lc-${AWS_LC_FIPS_VERSION}.tar.gz" ]; then
-        mkdir -p "${BUILDSSL_TMPDIR}"
         wget -q -O "${BUILDSSL_TMPDIR}/aws-lc-fips-${AWS_LC_FIPS_VERSION}.tar.gz" \
           "https://github.com/aws/aws-lc/archive/refs/tags/AWS-LC-FIPS-${AWS_LC_FIPS_VERSION}.tar.gz"
     fi
@@ -211,7 +220,6 @@ build_quictls () {
 
 download_wolfssl () {
     if [ ! -f "${BUILDSSL_TMPDIR}/wolfssl-${WOLFSSL_VERSION}.tar.gz" ]; then
-      mkdir -p ${BUILDSSL_TMPDIR}
       if [ "${WOLFSSL_VERSION%%-*}" != "git" ]; then
         wget -q -O "${BUILDSSL_TMPDIR}/wolfssl-${WOLFSSL_VERSION}.tar.gz" \
              "https://github.com/wolfSSL/wolfssl/archive/refs/tags/v${WOLFSSL_VERSION}-stable.tar.gz"
@@ -244,7 +252,7 @@ build_wolfssl () {
 }
 
 mkdir -p "${BUILDSSL_DESTDIR}"
-
+mkdir -p "${BUILDSSL_TMPDIR}"
 
 if [ ! -z ${LIBRESSL_VERSION+x} ]; then
 	download_libressl

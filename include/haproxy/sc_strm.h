@@ -348,15 +348,6 @@ static inline void sc_sync_send(struct stconn *sc)
 {
 	if (sc_ep_test(sc, SE_FL_T_MUX))
 		sc_conn_sync_send(sc);
-	else if (sc_ep_test(sc, SE_FL_T_APPLET)) {
-		sc_applet_sync_send(sc);
-		if (sc_oc(sc)->flags & CF_WRITE_EVENT) {
-			/* Data was send, wake the applet up. It is safe to do so because sc_applet_sync_send()
-			 * removes CF_WRITE_EVENT flag from the channel before trying to send data to the applet.
-			 */
-			task_wakeup(__sc_appctx(sc)->t, TASK_WOKEN_OTHER);
-		}
-	}
 }
 
 /* Combines both sc_update_rx() and sc_update_tx() at once */
@@ -395,7 +386,19 @@ static inline int sc_is_send_allowed(const struct stconn *sc)
 	if (sc->flags & SC_FL_SHUT_DONE)
 		return 0;
 
-	return !sc_ep_test(sc, SE_FL_WAIT_DATA | SE_FL_WONT_CONSUME);
+	if (!sc_appctx(sc) || !(__sc_appctx(sc)->applet->flags & APPLET_FL_NEW_API))
+		return !sc_ep_test(sc, SE_FL_WAIT_DATA | SE_FL_WONT_CONSUME);
+
+	if (sc_ep_test(sc, SE_FL_WONT_CONSUME))
+		return 0;
+
+	if (sc_ep_test(sc, SE_FL_WAIT_DATA)) {
+		if (__sc_appctx(sc)->flags & (APPCTX_FL_INBLK_FULL|APPCTX_FL_INBLK_ALLOC))
+			return 0;
+		if (!co_data(sc_oc(sc)))
+			return 0;
+	}
+	return 1;
 }
 
 static inline int sc_rcv_may_expire(const struct stconn *sc)

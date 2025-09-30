@@ -41,6 +41,8 @@ static const struct trace_event ssl_trace_events[] = {
 	{ .mask = SSL_EV_CONN_SWITCHCTX_CB,   .name = "sslc_switchctx_cb",   .desc = "SSL switchctx callback"},
 	{ .mask = SSL_EV_CONN_CHOOSE_SNI_CTX, .name = "sslc_choose_sni_ctx", .desc = "SSL choose sni context"},
 	{ .mask = SSL_EV_CONN_SIGALG_EXT,     .name = "sslc_sigalg_ext",     .desc = "SSL sigalg extension parsing"},
+	{ .mask = SSL_EV_CONN_CIPHERS_EXT,    .name = "sslc_ciphers_ext",    .desc = "SSL ciphers extension parsing"},
+	{ .mask = SSL_EV_CONN_CURVES_EXT,     .name = "sslc_curves_ext",     .desc = "SSL curves extension parsing"},
 	{ }
 };
 
@@ -53,15 +55,10 @@ static const struct name_desc ssl_trace_lockon_args[4] = {
 };
 
 static const struct name_desc ssl_trace_decoding[] = {
-#define SSL_VERB_CLEAN    1
 	{ .name="clean",    .desc="only user-friendly stuff, generally suitable for level \"user\"" },
-#define SSL_VERB_MINIMAL  2
 	{ .name="minimal",  .desc="report only conn, no real decoding" },
-#define SSL_VERB_SIMPLE   3
 	{ .name="simple",   .desc="add error messages" },
-#define SSL_VERB_ADVANCED 4
 	{ .name="advanced", .desc="add handshake-related details" },
-#define SSL_VERB_COMPLETE 5
 	{ .name="complete", .desc="add full data dump when available" },
 	{ /* end */ }
 };
@@ -87,6 +84,7 @@ static void ssl_trace(enum trace_level level, uint64_t mask, const struct trace_
                       const struct ist where, const struct ist func,
                       const void *a1, const void *a2, const void *a3, const void *a4)
 {
+	const char *errstr = NULL;
 	struct connection *conn = (struct connection*)a1;
 
 	if (src->verbosity <= SSL_VERB_CLEAN)
@@ -96,6 +94,8 @@ static void ssl_trace(enum trace_level level, uint64_t mask, const struct trace_
 		struct proxy *px = conn_get_proxy(conn);
 		chunk_appendf(&trace_buf, " : [%c(%s)] conn=%p(0x%08x)", conn_is_back(conn) ? 'B' : 'F',
 			      px ? px->id : "", conn, conn->flags);
+
+		errstr = conn_err_code_str(conn);
 	}
 
 	if (src->verbosity <= SSL_VERB_MINIMAL)
@@ -153,7 +153,7 @@ static void ssl_trace(enum trace_level level, uint64_t mask, const struct trace_
 			 * error we had. */
 			if (a3) {
 				const unsigned int *err_code = a3;
-				chunk_appendf(&trace_buf, " err_code=%u err_str=\"%s\"", *err_code, conn_err_code_str(conn));
+				chunk_appendf(&trace_buf, " err_code=%u err_str=\"%s\"", *err_code, errstr);
 			}
 
 			if (a4) {
@@ -168,7 +168,7 @@ static void ssl_trace(enum trace_level level, uint64_t mask, const struct trace_
 		if (mask & SSL_EV_CONN_ERR) {
 			if (a3) {
 				const unsigned int *err_code = a3;
-				chunk_appendf(&trace_buf, " err_code=%u err_str=\"%s\"", *err_code, conn_err_code_str(conn));
+				chunk_appendf(&trace_buf, " err_code=%u err_str=\"%s\"", *err_code, errstr);
 			}
 			if (a4) {
 				const unsigned int *ssl_err_code = a4;
@@ -189,7 +189,7 @@ static void ssl_trace(enum trace_level level, uint64_t mask, const struct trace_
 		if (mask & SSL_EV_CONN_ERR) {
 			if (a3) {
 				const unsigned int *err_code = a3;
-				chunk_appendf(&trace_buf, " err_code=%u err_str=\"%s\"", *err_code, conn_err_code_str(conn));
+				chunk_appendf(&trace_buf, " err_code=%u err_str=\"%s\"", *err_code, errstr);
 			}
 		} else if (src->verbosity > SSL_VERB_SIMPLE) {
 			if (a3) {
@@ -205,7 +205,7 @@ static void ssl_trace(enum trace_level level, uint64_t mask, const struct trace_
 		}
 	}
 
-	if (mask & SSL_EV_CONN_CHOOSE_SNI_CTX && src->verbosity > SSL_VERB_ADVANCED) {
+	if (mask & SSL_EV_CONN_CHOOSE_SNI_CTX && src->verbosity >= SSL_VERB_ADVANCED) {
 		if (a2) {
 			const char *servername = a2;
 			chunk_appendf(&trace_buf, " : servername=\"%s\"", servername);
@@ -218,7 +218,9 @@ static void ssl_trace(enum trace_level level, uint64_t mask, const struct trace_
 		}
 	}
 
-	if (mask & SSL_EV_CONN_SIGALG_EXT && src->verbosity > SSL_VERB_ADVANCED) {
+#ifdef HAVE_SSL_CLIENT_HELLO_CB
+
+	if (mask & SSL_EV_CONN_SIGALG_EXT && src->verbosity >= SSL_VERB_ADVANCED) {
 		if (a2 && a3) {
 			const uint16_t *extension_data = a2;
 			size_t extension_len = *((size_t*)a3);
@@ -247,5 +249,68 @@ static void ssl_trace(enum trace_level level, uint64_t mask, const struct trace_
 			}
 		}
 	}
+
+	if (mask & SSL_EV_CONN_CIPHERS_EXT && src->verbosity >= SSL_VERB_ADVANCED) {
+		if (a2 && a3 && a4) {
+			SSL *ssl = (SSL*)a2;
+			const uint16_t *extension_data = a3;
+			size_t extension_len = *((size_t*)a4);
+			int first = 1;
+
+			chunk_appendf(&trace_buf, " value=");
+
+			while (extension_len > 1) {
+				const char *str;
+				const SSL_CIPHER *cipher;
+				uint16_t id = ntohs(*extension_data);
+#if defined(OPENSSL_IS_BORINGSSL)
+				cipher = SSL_get_cipher_by_value(id);
+#else
+				cipher = SSL_CIPHER_find(ssl, (unsigned char*)extension_data);
+#endif
+				str = SSL_CIPHER_get_name(cipher);
+				if (!str || strcmp(str, "(NONE)") == 0)
+					chunk_appendf(&trace_buf, "%sUNKNOWN(%04x)", first ? "" : ",", id);
+				else
+					chunk_appendf(&trace_buf, "%s%s", first ? "" : ",", str);
+
+				first = 0;
+
+				extension_len-=sizeof(*extension_data);
+				++extension_data;
+			}
+		}
+	}
+
+	if (mask & SSL_EV_CONN_CURVES_EXT && src->verbosity >= SSL_VERB_ADVANCED) {
+		if (a2 && a3) {
+			const uint16_t *extension_data = a2;
+			size_t extension_len = *((size_t*)a3);
+			int first = 1;
+
+			chunk_appendf(&trace_buf, " value=");
+
+			while (extension_len > 1) {
+				const char *curve_name = curveid2str(ntohs(*extension_data));
+
+				if (curve_name) {
+					chunk_appendf(&trace_buf, "%s%s(0x%02X%02X)", first ? "" : ":", curve_name,
+						      ((uint8_t*)extension_data)[0],
+						      ((uint8_t*)extension_data)[1]);
+				} else {
+					chunk_appendf(&trace_buf, "%s0x%02X%02X",
+						      first ? "" : ":",
+						      ((uint8_t*)extension_data)[0],
+						      ((uint8_t*)extension_data)[1]);
+				}
+
+				first = 0;
+
+				extension_len-=sizeof(*extension_data);
+				++extension_data;
+			}
+		}
+	}
+#endif /* HAVE_SSL_CLIENT_HELLO_CB */
 }
 

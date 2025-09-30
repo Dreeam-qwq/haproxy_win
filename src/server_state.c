@@ -13,7 +13,7 @@
 #include <errno.h>
 
 #include <import/eb64tree.h>
-#include <import/ebistree.h>
+#include <import/cebis_tree.h>
 
 #include <haproxy/api.h>
 #include <haproxy/backend.h>
@@ -322,7 +322,8 @@ static void srv_state_srv_update(struct server *srv, int version, char **params)
 	}
 
 	srv->last_change = ns_to_sec(now_ns) - srv_last_time_change;
-	HA_ATOMIC_STORE(&srv->counters.shared->tg[0]->last_state_change, srv->last_change);
+	if (srv->counters.shared.tg[0])
+		HA_ATOMIC_STORE(&srv->counters.shared.tg[0]->last_state_change, srv->last_change);
 	srv->check.status = srv_check_status;
 	srv->check.result = srv_check_result;
 
@@ -415,10 +416,9 @@ static void srv_state_srv_update(struct server *srv, int version, char **params)
 		 * since this server has an hostname
 		 */
 		LIST_DEL_INIT(&srv->srv_rec_item);
-		srv->host_dn.key = srv->hostname_dn;
 
 		/* insert in tree and set the srvrq expiration date */
-		ebis_insert(&srv->srvrq->named_servers, &srv->host_dn);
+		cebis_item_insert(&srv->srvrq->named_servers, host_dn, hostname_dn, srv);
 		task_schedule(srv->srvrq_check, tick_add(now_ms, srv->srvrq->resolvers->timeout.resolve +
 							 srv->srvrq->resolvers->resolve_retries *
 							 srv->srvrq->resolvers->timeout.retry));
@@ -440,8 +440,12 @@ static void srv_state_srv_update(struct server *srv, int version, char **params)
 		use_ssl = strtol(params[16], &p, 10);
 
 		/* configure ssl if connection has been initiated at startup */
-		if (srv->ssl_ctx.ctx != NULL)
-			srv_set_ssl(srv, use_ssl);
+		if (srv->ssl_ctx.ctx != NULL) {
+			if (srv_set_ssl(srv, use_ssl)) {
+				chunk_appendf(msg, ", failed to %s ssl for server '%s'", (use_ssl ? "enable" : "disable"), srv->id);
+				goto out;
+			}
+		}
 #endif
 	}
 

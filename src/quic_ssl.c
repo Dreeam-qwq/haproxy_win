@@ -10,7 +10,7 @@
 #include <haproxy/ssl_sock.h>
 #include <haproxy/trace.h>
 
-DECLARE_POOL(pool_head_quic_ssl_sock_ctx, "quic_ssl_sock_ctx", sizeof(struct ssl_sock_ctx));
+DECLARE_TYPED_POOL(pool_head_quic_ssl_sock_ctx, "quic_ssl_sock_ctx", struct ssl_sock_ctx);
 const char *quic_ciphers = "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384"
                            ":TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_CCM_SHA256";
 #ifdef HAVE_OPENSSL_QUIC
@@ -149,7 +149,7 @@ static int qc_ssl_crypto_data_cpy(struct quic_conn *qc, struct quic_enc_level *q
 				goto leave;
 			}
 
-			frm->crypto.offset = cf_offset;
+			frm->crypto.offset_node.key = cf_offset;
 			frm->crypto.len = cf_len;
 			frm->crypto.qel = qel;
 			LIST_APPEND(&qel->pktns->tx.frms, &frm->list);
@@ -232,7 +232,7 @@ static int ha_quic_set_encryption_secrets(SSL *ssl, enum ssl_encryption_level_t 
 	 * listener and if a token was received. Note that a listener derives only RX
 	 * secrets for this level.
 	 */
-	if (objt_listener(qc->target) && level == ssl_encryption_early_data) {
+	if (!qc_is_back(qc) && level == ssl_encryption_early_data) {
 		if (qc->flags & QUIC_FL_CONN_NO_TOKEN_RCVD) {
 			/* Leave a chance to the address validation to be completed by the
 			 * handshake without starting the mux: one does not want to process
@@ -281,7 +281,7 @@ write:
 	}
 
 	/* Set the transport parameters in the TLS stack. */
-	if (level == ssl_encryption_handshake && objt_listener(qc->target) &&
+	if (level == ssl_encryption_handshake && !qc_is_back(qc) &&
 	    !qc_ssl_set_quic_transport_params(qc->xprt_ctx->ssl, qc, ver, 1))
 		goto leave;
 
@@ -292,7 +292,7 @@ write:
 		struct quic_tls_kp *nxt_tx = &qc->ku.nxt_tx;
 
 #if !defined(USE_QUIC_OPENSSL_COMPAT) && !defined(HAVE_OPENSSL_QUIC)
-		if (objt_server(qc->target)) {
+		if (qc_is_back(qc)) {
 			const unsigned char *tp;
 			size_t tplen;
 
@@ -580,7 +580,6 @@ static int ha_quic_ossl_got_transport_params(SSL *ssl, const unsigned char *para
 {
 	int ret = 0;
 	struct quic_conn *qc = SSL_get_ex_data(ssl, ssl_qc_app_data_index);
-	struct listener *l = objt_listener(qc->target);
 
 	TRACE_ENTER(QUIC_EV_TRANSP_PARAMS, qc);
 
@@ -589,7 +588,7 @@ static int ha_quic_ossl_got_transport_params(SSL *ssl, const unsigned char *para
 		            QUIC_EV_TRANSP_PARAMS, qc);
 		ret = 1;
 	}
-	else if (!quic_transport_params_store(qc, !l, params, params + params_len)) {
+	else if (!quic_transport_params_store(qc, qc_is_back(qc), params, params + params_len)) {
 		goto err;
 	}
 
@@ -847,36 +846,18 @@ static forceinline void qc_ssl_dump_errors(struct connection *conn)
 	}
 }
 
-/* Provide CRYPTO data to the TLS stack found at <data> with <len> as length
- * from <qel> encryption level with <ctx> as QUIC connection context.
- * Remaining parameter are there for debugging purposes.
+/* Call SSL_do_handshake(). Then if the hanshaked has completed, accept the
+ * connection for servers or start the mux for clients.
  * Return 1 if succeeded, 0 if not.
  */
-static int qc_ssl_provide_quic_data(struct ncbuf *ncbuf,
-                                    enum ssl_encryption_level_t level,
-                                    struct ssl_sock_ctx *ctx,
-                                    const unsigned char *data, size_t len)
+int qc_ssl_do_hanshake(struct quic_conn *qc, struct ssl_sock_ctx *ctx)
 {
-#ifdef DEBUG_STRICT
-	enum ncb_ret ncb_ret;
-#endif
-	int ssl_err, state;
-	struct quic_conn *qc;
-	int ret = 0;
-
-	ssl_err = SSL_ERROR_NONE;
-	qc = ctx->qc;
+	int ret, ssl_err, state;
 
 	TRACE_ENTER(QUIC_EV_CONN_SSLDATA, qc);
 
-#ifndef HAVE_OPENSSL_QUIC
-	if (SSL_provide_quic_data(ctx->ssl, level, data, len) != 1) {
-		TRACE_ERROR("SSL_provide_quic_data() error",
-		            QUIC_EV_CONN_SSLDATA, qc, NULL, NULL, ctx->ssl);
-		goto leave;
-	}
-#endif
-
+	ret = 0;
+	ssl_err = SSL_ERROR_NONE;
 	state = qc->state;
 	if (state < QUIC_HS_ST_COMPLETE) {
 		ssl_err = SSL_do_handshake(ctx->ssl);
@@ -884,7 +865,7 @@ static int qc_ssl_provide_quic_data(struct ncbuf *ncbuf,
 
 		if (qc->flags & QUIC_FL_CONN_TO_KILL) {
 			TRACE_DEVEL("connection to be killed", QUIC_EV_CONN_IO_CB, qc, &state, NULL, ctx->ssl);
-			goto leave;
+			goto err;
 		}
 
 		/* Finalize the connection as soon as possible if the peer transport parameters
@@ -893,7 +874,7 @@ static int qc_ssl_provide_quic_data(struct ncbuf *ncbuf,
 		 */
 		if ((qc->flags & QUIC_FL_CONN_TX_TP_RECEIVED) && !qc_conn_finalize(qc, 1)) {
 			TRACE_ERROR("connection finalization failed", QUIC_EV_CONN_IO_CB, qc, &state);
-			goto leave;
+			goto err;
 		}
 
 		if (ssl_err != 1) {
@@ -908,7 +889,7 @@ static int qc_ssl_provide_quic_data(struct ncbuf *ncbuf,
 			HA_ATOMIC_INC(&qc->prx_counters->hdshk_fail);
 			qc_ssl_dump_errors(ctx->conn);
 			ERR_clear_error();
-			goto leave;
+			goto err;
 		}
 		else if (qc->flags & QUIC_FL_CONN_IMMEDIATE_CLOSE) {
 			/* Immediate close may be set due to invalid received
@@ -920,7 +901,7 @@ static int qc_ssl_provide_quic_data(struct ncbuf *ncbuf,
 			 */
 			TRACE_ERROR("SSL handshake error", QUIC_EV_CONN_IO_CB, qc, &state, &ssl_err);
 			HA_ATOMIC_INC(&qc->prx_counters->hdshk_fail);
-			goto leave;
+			goto err;
 		}
 
 #if defined(OPENSSL_IS_AWSLC)
@@ -956,8 +937,8 @@ static int qc_ssl_provide_quic_data(struct ncbuf *ncbuf,
 		 * provided by the stack. This happens after having received the peer
 		 * handshake level CRYPTO data which are validated by the TLS stack.
 		 */
-		if (objt_listener(qc->target)) {
-			if (__objt_listener(qc->target)->bind_conf->ssl_conf.early_data &&
+		if (!qc_is_back(qc)) {
+			if (qc->li->bind_conf->ssl_conf.early_data &&
 				(!qc->ael || !qc->ael->tls_ctx.rx.secret)) {
 				TRACE_PROTO("SSL handshake in progress",
 				            QUIC_EV_CONN_IO_CB, qc, &state, &ssl_err);
@@ -970,11 +951,11 @@ static int qc_ssl_provide_quic_data(struct ncbuf *ncbuf,
 #endif
 
 		/* Check the alpn could be negotiated */
-		if (objt_listener(qc->target)) {
+		if (!qc_is_back(qc)) {
 			if (!qc->app_ops) {
 				TRACE_ERROR("No negotiated ALPN", QUIC_EV_CONN_IO_CB, qc, &state);
 				quic_set_tls_alert(qc, SSL_AD_NO_APPLICATION_PROTOCOL);
-				goto leave;
+				goto err;
 			}
 		}
 		else {
@@ -986,12 +967,12 @@ static int qc_ssl_provide_quic_data(struct ncbuf *ncbuf,
 			    !quic_set_app_ops(qc, alpn, alpn_len)) {
 				TRACE_ERROR("No negotiated ALPN", QUIC_EV_CONN_IO_CB, qc, &state);
 				quic_set_tls_alert(qc, SSL_AD_NO_APPLICATION_PROTOCOL);
-				goto leave;
+				goto err;
 			}
 
 			if (conn_create_mux(ctx->conn, NULL) < 0) {
 				TRACE_ERROR("mux creation failed", QUIC_EV_CONN_IO_CB, qc, &state);
-				goto leave;
+				goto err;
 			}
 
 			/* Wake up MUX after its creation. Operation similar to TLS+ALPN on TCP stack. */
@@ -1000,8 +981,8 @@ static int qc_ssl_provide_quic_data(struct ncbuf *ncbuf,
 		}
 
 		qc->flags |= QUIC_FL_CONN_NEED_POST_HANDSHAKE_FRMS;
-		if (objt_listener(ctx->qc->target)) {
-			struct listener *l = __objt_listener(qc->target);
+		if (!qc_is_back(qc)) {
+			struct listener *l = qc->li;
 			/* I/O callback switch */
 			qc->wait_event.tasklet->process = quic_conn_app_io_cb;
 			qc->state = QUIC_HS_ST_CONFIRMED;
@@ -1027,7 +1008,7 @@ static int qc_ssl_provide_quic_data(struct ncbuf *ncbuf,
 		/* Prepare the next key update */
 		if (!quic_tls_key_update(qc)) {
 			TRACE_ERROR("quic_tls_key_update() failed", QUIC_EV_CONN_IO_CB, qc);
-			goto leave;
+			goto err;
 		}
 	}
 #ifndef HAVE_OPENSSL_QUIC
@@ -1043,12 +1024,52 @@ static int qc_ssl_provide_quic_data(struct ncbuf *ncbuf,
 
 			TRACE_ERROR("SSL post handshake error",
 			            QUIC_EV_CONN_IO_CB, qc, &state, &ssl_err);
-			goto leave;
+			goto err;
 		}
 
 		TRACE_STATE("SSL post handshake succeeded", QUIC_EV_CONN_IO_CB, qc, &state);
 	}
 #endif
+
+ out:
+	ret = 1;
+ leave:
+	TRACE_LEAVE(QUIC_EV_CONN_SSLDATA, qc);
+	return ret;
+ err:
+	TRACE_DEVEL("leaving on error", QUIC_EV_CONN_SSLDATA, qc);
+	goto leave;
+}
+
+#ifndef HAVE_OPENSSL_QUIC
+/* Provide CRYPTO data to the TLS stack found at <data> with <len> as length
+ * from <qel> encryption level with <ctx> as QUIC connection context.
+ * Remaining parameter are there for debugging purposes.
+ * Return 1 if succeeded, 0 if not.
+ */
+static int qc_ssl_provide_quic_data(struct ncbuf *ncbuf,
+                                    enum ssl_encryption_level_t level,
+                                    struct ssl_sock_ctx *ctx,
+                                    const unsigned char *data, size_t len)
+{
+#ifdef DEBUG_STRICT
+	enum ncb_ret ncb_ret;
+#endif
+	struct quic_conn *qc;
+	int ret = 0;
+
+	qc = ctx->qc;
+
+	TRACE_ENTER(QUIC_EV_CONN_SSLDATA, qc);
+
+	if (SSL_provide_quic_data(ctx->ssl, level, data, len) != 1) {
+		TRACE_ERROR("SSL_provide_quic_data() error",
+		            QUIC_EV_CONN_SSLDATA, qc, NULL, NULL, ctx->ssl);
+		goto leave;
+	}
+
+	if (!qc_ssl_do_hanshake(qc, ctx))
+		goto leave;
 
  out:
 	ret = 1;
@@ -1119,6 +1140,7 @@ int qc_ssl_provide_all_quic_data(struct quic_conn *qc, struct ssl_sock_ctx *ctx)
 	TRACE_LEAVE(QUIC_EV_CONN_PHPKTS, qc);
 	return ret;
 }
+#endif
 
 /* Simple helper to set the specific OpenSSL/quictls QUIC API callbacks */
 static int quic_ssl_set_tls_cbs(SSL *ssl)
@@ -1157,7 +1179,6 @@ static int qc_ssl_sess_init(struct quic_conn *qc, SSL_CTX *ssl_ctx, SSL **ssl,
 	}
 
 	if (!SSL_set_ex_data(*ssl, ssl_qc_app_data_index, qc) ||
-	    (!server && !SSL_set_ex_data(*ssl, ssl_app_data_index, conn)) ||
 	    !quic_ssl_set_tls_cbs(*ssl)) {
 		SSL_free(*ssl);
 		*ssl = NULL;
@@ -1245,8 +1266,8 @@ int qc_alloc_ssl_sock_ctx(struct quic_conn *qc, struct connection *conn)
 	ctx->sent_early_data = 0;
 	ctx->qc = qc;
 
-	if (objt_listener(qc->target)) {
-		struct bind_conf *bc = __objt_listener(qc->target)->bind_conf;
+	if (!qc_is_back(qc)) {
+		struct bind_conf *bc = qc->li->bind_conf;
 
 		if (qc_ssl_sess_init(qc, bc->initial_ctx, &ctx->ssl, NULL, 1) == -1)
 		        goto err;
@@ -1259,7 +1280,6 @@ int qc_alloc_ssl_sock_ctx(struct quic_conn *qc, struct connection *conn)
 		SSL_set_accept_state(ctx->ssl);
 	}
 	else {
-		int ssl_err;
 		struct server *srv = __objt_server(ctx->conn->target);
 
 		if (qc_ssl_sess_init(qc, srv->ssl_ctx.ctx, &ctx->ssl, conn, 0) == -1)
@@ -1268,25 +1288,8 @@ int qc_alloc_ssl_sock_ctx(struct quic_conn *qc, struct connection *conn)
 		if (!qc_ssl_set_quic_transport_params(ctx->ssl, qc, quic_version_1, 0))
 			goto err;
 
+		ssl_sock_srv_try_reuse_sess(ctx, srv);
 		SSL_set_connect_state(ctx->ssl);
-		ssl_err = SSL_do_handshake(ctx->ssl);
-		TRACE_PROTO("SSL_do_handshake() called", QUIC_EV_CONN_NEW, qc, &ssl_err);
-		if (ssl_err != 1) {
-			ssl_err = SSL_get_error(ctx->ssl, ssl_err);
-			if (ssl_err == SSL_ERROR_WANT_READ || ssl_err == SSL_ERROR_WANT_WRITE) {
-				TRACE_PROTO("SSL handshake in progress", QUIC_EV_CONN_NEW, qc, &ssl_err);
-			}
-			else {
-				TRACE_ERROR("SSL handshake error", QUIC_EV_CONN_NEW, qc, &ssl_err);
-				HA_ATOMIC_INC(&qc->prx_counters->hdshk_fail);
-				qc_ssl_dump_errors(ctx->conn);
-				ERR_clear_error();
-				goto err;
-			}
-		}
-
-		/* Wakeup the handshake I/O handler tasklet asap to send data */
-		tasklet_wakeup(qc->wait_event.tasklet);
 	}
 
 	ctx->xprt = xprt_get(XPRT_QUIC);

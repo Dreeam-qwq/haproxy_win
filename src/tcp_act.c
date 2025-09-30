@@ -396,17 +396,18 @@ static enum act_return tcp_exec_action_silent_drop(struct act_rule *rule, struct
 		stream_abort(strm);
 		strm->req.analysers &= AN_REQ_FLT_END;
 		strm->res.analysers &= AN_RES_FLT_END;
-		if (strm->flags & SF_BE_ASSIGNED)
-			_HA_ATOMIC_INC(&strm->be->be_counters.shared->tg[tgid - 1]->denied_req);
+		if ((strm->flags & SF_BE_ASSIGNED) && strm->be_tgcounters)
+			_HA_ATOMIC_INC(&strm->be_tgcounters->denied_req);
 		if (!(strm->flags & SF_ERR_MASK))
 			strm->flags |= SF_ERR_PRXCOND;
 		if (!(strm->flags & SF_FINST_MASK))
 			strm->flags |= SF_FINST_R;
 	}
 
-	_HA_ATOMIC_INC(&sess->fe->fe_counters.shared->tg[tgid - 1]->denied_req);
-	if (sess->listener && sess->listener->counters)
-		_HA_ATOMIC_INC(&sess->listener->counters->shared->tg[tgid - 1]->denied_req);
+	if (sess->fe_tgcounters)
+		_HA_ATOMIC_INC(&sess->fe_tgcounters->denied_req);
+	if (sess->li_tgcounters)
+		_HA_ATOMIC_INC(&sess->li_tgcounters->denied_req);
 
 	return ACT_RET_ABRT;
 }
@@ -514,12 +515,12 @@ static int tcp_check_attach_srv(struct act_rule *rule, struct proxy *px, char **
 	}
 
 	if (rule->arg.attach_srv.name) {
-		if (!srv->pool_conn_name) {
+		if (!srv->pool_conn_name_expr) {
 			memprintf(err, "attach-srv rule has a name argument while server '%s/%s' does not use pool-conn-name; either reconfigure the server or remove the name argument from this attach-srv rule", ist0(be_name), ist0(sv_name));
 			return 0;
 		}
 	} else {
-		if (srv->pool_conn_name) {
+		if (srv->pool_conn_name_expr) {
 			memprintf(err, "attach-srv rule has no name argument while server '%s/%s' uses pool-conn-name; either add a name argument to the attach-srv rule or reconfigure the server", ist0(be_name), ist0(sv_name));
 			return 0;
 		}

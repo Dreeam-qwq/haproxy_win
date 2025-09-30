@@ -62,7 +62,7 @@
 #include <haproxy/vars.h>
 
 
-DECLARE_POOL(pool_head_stream, "stream", sizeof(struct stream));
+DECLARE_TYPED_POOL(pool_head_stream, "stream", struct stream);
 DECLARE_POOL(pool_head_uniqueid, "uniqueid", UNIQUEID_LEN);
 
 /* incremented by each "show sess" to fix a delimiter between streams */
@@ -424,7 +424,7 @@ struct stream *stream_new(struct session *sess, struct stconn *sc, struct buffer
 
 	s->lat_time = s->cpu_time = 0;
 	s->call_rate.curr_tick = s->call_rate.curr_ctr = s->call_rate.prev_ctr = 0;
-	s->passes_stconn = s->passes_reqana = s->passes_resana = s->passes_propag = 0;
+	s->passes_connect = s->passes_stconn = s->passes_reqana = s->passes_resana = s->passes_propag = 0;
 	s->pcli_next_pid = 0;
 	s->pcli_flags = 0;
 	s->unique_id = IST_NULL;
@@ -450,6 +450,9 @@ struct stream *stream_new(struct session *sess, struct stconn *sc, struct buffer
 	 * when the default backend is assigned.
 	 */
 	s->be  = sess->fe;
+	s->be_tgcounters = sess->fe->be_counters.shared.tg[tgid - 1];
+	s->sv_tgcounters = NULL; // default value
+
 	s->req_cap = NULL;
 	s->res_cap = NULL;
 
@@ -823,14 +826,16 @@ void stream_process_counters(struct stream *s)
 	bytes = s->req.total - s->logs.bytes_in;
 	s->logs.bytes_in = s->req.total;
 	if (bytes) {
-		_HA_ATOMIC_ADD(&sess->fe->fe_counters.shared->tg[tgid - 1]->bytes_in, bytes);
-		_HA_ATOMIC_ADD(&s->be->be_counters.shared->tg[tgid - 1]->bytes_in,    bytes);
+		if (sess->fe_tgcounters)
+			_HA_ATOMIC_ADD(&sess->fe_tgcounters->bytes_in, bytes);
+		if (s->be_tgcounters)
+			_HA_ATOMIC_ADD(&s->be_tgcounters->bytes_in,    bytes);
 
-		if (objt_server(s->target))
-			_HA_ATOMIC_ADD(&__objt_server(s->target)->counters.shared->tg[tgid - 1]->bytes_in, bytes);
+		if (s->sv_tgcounters)
+			_HA_ATOMIC_ADD(&s->sv_tgcounters->bytes_in, bytes);
 
-		if (sess->listener && sess->listener->counters)
-			_HA_ATOMIC_ADD(&sess->listener->counters->shared->tg[tgid - 1]->bytes_in, bytes);
+		if (sess->li_tgcounters)
+			_HA_ATOMIC_ADD(&sess->li_tgcounters->bytes_in, bytes);
 
 		for (i = 0; i < global.tune.nb_stk_ctr; i++) {
 			if (!stkctr_inc_bytes_in_ctr(&s->stkctr[i], bytes))
@@ -841,14 +846,16 @@ void stream_process_counters(struct stream *s)
 	bytes = s->res.total - s->logs.bytes_out;
 	s->logs.bytes_out = s->res.total;
 	if (bytes) {
-		_HA_ATOMIC_ADD(&sess->fe->fe_counters.shared->tg[tgid - 1]->bytes_out, bytes);
-		_HA_ATOMIC_ADD(&s->be->be_counters.shared->tg[tgid - 1]->bytes_out,    bytes);
+		if (sess->fe_tgcounters)
+			_HA_ATOMIC_ADD(&sess->fe_tgcounters->bytes_out, bytes);
+		if (s->be_tgcounters)
+			_HA_ATOMIC_ADD(&s->be_tgcounters->bytes_out,    bytes);
 
-		if (objt_server(s->target))
-			_HA_ATOMIC_ADD(&__objt_server(s->target)->counters.shared->tg[tgid - 1]->bytes_out, bytes);
+		if (s->sv_tgcounters)
+			_HA_ATOMIC_ADD(&s->sv_tgcounters->bytes_out, bytes);
 
-		if (sess->listener && sess->listener->counters)
-			_HA_ATOMIC_ADD(&sess->listener->counters->shared->tg[tgid - 1]->bytes_out, bytes);
+		if (sess->li_tgcounters)
+			_HA_ATOMIC_ADD(&sess->li_tgcounters->bytes_out, bytes);
 
 		for (i = 0; i < global.tune.nb_stk_ctr; i++) {
 			if (!stkctr_inc_bytes_out_ctr(&s->stkctr[i], bytes))
@@ -1012,9 +1019,10 @@ void sess_set_term_flags(struct stream *s)
 	if (!(s->flags & SF_FINST_MASK)) {
 		if (s->scb->state == SC_ST_INI) {
 			/* anything before REQ in fact */
-			_HA_ATOMIC_INC(&strm_fe(s)->fe_counters.shared->tg[tgid - 1]->failed_req);
-			if (strm_li(s) && strm_li(s)->counters)
-				_HA_ATOMIC_INC(&strm_li(s)->counters->shared->tg[tgid - 1]->failed_req);
+			if (s->sess->fe_tgcounters)
+				_HA_ATOMIC_INC(&s->sess->fe_tgcounters->failed_req);
+			if (s->sess->li_tgcounters)
+				_HA_ATOMIC_INC(&s->sess->li_tgcounters->failed_req);
 
 			s->flags |= SF_FINST_R;
 		}
@@ -1060,8 +1068,9 @@ enum act_return process_use_service(struct act_rule *rule, struct proxy *px,
 		appctx = __sc_appctx(s->scb);
 
 	if (rule->from != ACT_F_HTTP_REQ) {
-		if (sess->fe == s->be) /* report it if the request was intercepted by the frontend */
-			_HA_ATOMIC_INC(&sess->fe->fe_counters.shared->tg[tgid - 1]->intercepted_req);
+		/* report it if the request was intercepted by the frontend */
+		if (sess->fe == s->be && sess->fe_tgcounters)
+			_HA_ATOMIC_INC(&sess->fe_tgcounters->intercepted_req);
 
 		/* The flag SF_ASSIGNED prevent from server assignment. */
 		s->flags |= SF_ASSIGNED;
@@ -1231,7 +1240,7 @@ static int process_server_rules(struct stream *s, struct channel *req, int an_bi
 			    (px->options & PR_O_PERSIST) ||
 			    (s->flags & SF_FORCE_PRST)) {
 				s->flags |= SF_DIRECT | SF_ASSIGNED;
-				s->target = &srv->obj_type;
+				stream_set_srv_target(s, srv);
 				break;
 			}
 			/* if the server is not UP, let's go on with next rules
@@ -1285,7 +1294,7 @@ static inline void sticking_rule_find_target(struct stream *s,
 	if ((srv->cur_state != SRV_ST_STOPPED) ||
 	    (px->options & PR_O_PERSIST) || (s->flags & SF_FORCE_PRST)) {
 		s->flags |= SF_DIRECT | SF_ASSIGNED;
-		s->target = &srv->obj_type;
+		stream_set_srv_target(s, srv);
 	}
 }
 
@@ -1437,7 +1446,7 @@ static int process_store_rules(struct stream *s, struct channel *rep, int an_bit
 		if (t->server_key_type == STKTABLE_SRV_NAME)
 			key = __objt_server(s->target)->id;
 		else if (t->server_key_type == STKTABLE_SRV_ADDR)
-			key = __objt_server(s->target)->addr_node.key;
+			key = __objt_server(s->target)->addr_key;
 		else
 			key = NULL;
 
@@ -1846,12 +1855,14 @@ struct task *process_stream(struct task *t, void *context, unsigned int state)
 			sc_shutdown(scf);
 			if (!(req->analysers) && !(res->analysers)) {
 				COUNT_IF(1, "Report a client abort (no analysers)");
-				_HA_ATOMIC_INC(&s->be->be_counters.shared->tg[tgid - 1]->cli_aborts);
-				_HA_ATOMIC_INC(&sess->fe->fe_counters.shared->tg[tgid - 1]->cli_aborts);
-				if (sess->listener && sess->listener->counters)
-					_HA_ATOMIC_INC(&sess->listener->counters->shared->tg[tgid - 1]->cli_aborts);
-				if (srv)
-					_HA_ATOMIC_INC(&srv->counters.shared->tg[tgid - 1]->cli_aborts);
+				if (s->be_tgcounters)
+					_HA_ATOMIC_INC(&s->be_tgcounters->cli_aborts);
+				if (sess->fe_tgcounters)
+					_HA_ATOMIC_INC(&sess->fe_tgcounters->cli_aborts);
+				if (sess->li_tgcounters)
+					_HA_ATOMIC_INC(&sess->li_tgcounters->cli_aborts);
+				if (s->sv_tgcounters)
+					_HA_ATOMIC_INC(&s->sv_tgcounters->cli_aborts);
 				if (!(s->flags & SF_ERR_MASK))
 					s->flags |= SF_ERR_CLICL;
 				if (!(s->flags & SF_FINST_MASK))
@@ -1864,17 +1875,20 @@ struct task *process_stream(struct task *t, void *context, unsigned int state)
 		if (sc_state_in(scb->state, SC_SB_EST|SC_SB_DIS)) {
 			sc_abort(scb);
 			sc_shutdown(scb);
-			_HA_ATOMIC_INC(&s->be->be_counters.shared->tg[tgid - 1]->failed_resp);
-			if (srv)
-				_HA_ATOMIC_INC(&srv->counters.shared->tg[tgid - 1]->failed_resp);
+			if (s->be_tgcounters)
+				_HA_ATOMIC_INC(&s->be_tgcounters->failed_resp);
+			if (s->sv_tgcounters)
+				_HA_ATOMIC_INC(&s->sv_tgcounters->failed_resp);
 			if (!(req->analysers) && !(res->analysers)) {
 				COUNT_IF(1, "Report a client abort (no analysers)");
-				_HA_ATOMIC_INC(&s->be->be_counters.shared->tg[tgid - 1]->srv_aborts);
-				_HA_ATOMIC_INC(&sess->fe->fe_counters.shared->tg[tgid - 1]->srv_aborts);
-				if (sess->listener && sess->listener->counters)
-					_HA_ATOMIC_INC(&sess->listener->counters->shared->tg[tgid - 1]->srv_aborts);
-				if (srv)
-					_HA_ATOMIC_INC(&srv->counters.shared->tg[tgid - 1]->srv_aborts);
+				if (s->be_tgcounters)
+					_HA_ATOMIC_INC(&s->be_tgcounters->srv_aborts);
+				if (sess->fe_tgcounters)
+					_HA_ATOMIC_INC(&sess->fe_tgcounters->srv_aborts);
+				if (sess->li_tgcounters)
+					_HA_ATOMIC_INC(&sess->li_tgcounters->srv_aborts);
+				if (s->sv_tgcounters)
+					_HA_ATOMIC_INC(&s->sv_tgcounters->srv_aborts);
 				if (!(s->flags & SF_ERR_MASK))
 					s->flags |= SF_ERR_SRVCL;
 				if (!(s->flags & SF_FINST_MASK))
@@ -2178,32 +2192,38 @@ struct task *process_stream(struct task *t, void *context, unsigned int state)
 			req->analysers &= AN_REQ_FLT_END;
 			channel_auto_close(req);
 			if (scf->flags & SC_FL_ERROR) {
-				_HA_ATOMIC_INC(&s->be->be_counters.shared->tg[tgid - 1]->cli_aborts);
-				_HA_ATOMIC_INC(&sess->fe->fe_counters.shared->tg[tgid - 1]->cli_aborts);
-				if (sess->listener && sess->listener->counters)
-					_HA_ATOMIC_INC(&sess->listener->counters->shared->tg[tgid - 1]->cli_aborts);
-				if (srv)
-					_HA_ATOMIC_INC(&srv->counters.shared->tg[tgid - 1]->cli_aborts);
+				if (s->be_tgcounters)
+					_HA_ATOMIC_INC(&s->be_tgcounters->cli_aborts);
+				if (sess->fe_tgcounters)
+					_HA_ATOMIC_INC(&sess->fe_tgcounters->cli_aborts);
+				if (sess->li_tgcounters)
+					_HA_ATOMIC_INC(&sess->li_tgcounters->cli_aborts);
+				if (s->sv_tgcounters)
+					_HA_ATOMIC_INC(&s->sv_tgcounters->cli_aborts);
 				s->flags |= SF_ERR_CLICL;
 				COUNT_IF(1, "Report unhandled client error");
 			}
 			else if (req->flags & CF_READ_TIMEOUT) {
-				_HA_ATOMIC_INC(&s->be->be_counters.shared->tg[tgid - 1]->cli_aborts);
-				_HA_ATOMIC_INC(&sess->fe->fe_counters.shared->tg[tgid - 1]->cli_aborts);
-				if (sess->listener && sess->listener->counters)
-					_HA_ATOMIC_INC(&sess->listener->counters->shared->tg[tgid - 1]->cli_aborts);
-				if (srv)
-					_HA_ATOMIC_INC(&srv->counters.shared->tg[tgid - 1]->cli_aborts);
+				if (s->be_tgcounters)
+					_HA_ATOMIC_INC(&s->be_tgcounters->cli_aborts);
+				if (sess->fe_tgcounters)
+					_HA_ATOMIC_INC(&sess->fe_tgcounters->cli_aborts);
+				if (sess->li_tgcounters)
+					_HA_ATOMIC_INC(&sess->li_tgcounters->cli_aborts);
+				if (s->sv_tgcounters)
+					_HA_ATOMIC_INC(&s->sv_tgcounters->cli_aborts);
 				s->flags |= SF_ERR_CLITO;
 				COUNT_IF(1, "Report unhandled client timeout (RD)");
 			}
 			else {
-				_HA_ATOMIC_INC(&s->be->be_counters.shared->tg[tgid - 1]->srv_aborts);
-				_HA_ATOMIC_INC(&sess->fe->fe_counters.shared->tg[tgid - 1]->srv_aborts);
-				if (sess->listener && sess->listener->counters)
-					_HA_ATOMIC_INC(&sess->listener->counters->shared->tg[tgid - 1]->srv_aborts);
-				if (srv)
-					_HA_ATOMIC_INC(&srv->counters.shared->tg[tgid - 1]->srv_aborts);
+				if (s->be_tgcounters)
+					_HA_ATOMIC_INC(&s->be_tgcounters->srv_aborts);
+				if (sess->fe_tgcounters)
+					_HA_ATOMIC_INC(&sess->fe_tgcounters->srv_aborts);
+				if (sess->li_tgcounters)
+					_HA_ATOMIC_INC(&sess->li_tgcounters->srv_aborts);
+				if (s->sv_tgcounters)
+					_HA_ATOMIC_INC(&s->sv_tgcounters->srv_aborts);
 				s->flags |= SF_ERR_SRVTO;
 				COUNT_IF(1, "Report unhandled server timeout (WR)");
 			}
@@ -2227,32 +2247,38 @@ struct task *process_stream(struct task *t, void *context, unsigned int state)
 			res->analysers &= AN_RES_FLT_END;
 			channel_auto_close(res);
 			if (scb->flags & SC_FL_ERROR) {
-				_HA_ATOMIC_INC(&s->be->be_counters.shared->tg[tgid - 1]->srv_aborts);
-				_HA_ATOMIC_INC(&sess->fe->fe_counters.shared->tg[tgid - 1]->srv_aborts);
-				if (sess->listener && sess->listener->counters)
-					_HA_ATOMIC_INC(&sess->listener->counters->shared->tg[tgid - 1]->srv_aborts);
-				if (srv)
-					_HA_ATOMIC_INC(&srv->counters.shared->tg[tgid - 1]->srv_aborts);
+				if (s->be_tgcounters)
+					_HA_ATOMIC_INC(&s->be_tgcounters->srv_aborts);
+				if (sess->fe_tgcounters)
+					_HA_ATOMIC_INC(&sess->fe_tgcounters->srv_aborts);
+				if (sess->li_tgcounters)
+					_HA_ATOMIC_INC(&sess->li_tgcounters->srv_aborts);
+				if (s->sv_tgcounters)
+					_HA_ATOMIC_INC(&s->sv_tgcounters->srv_aborts);
 				s->flags |= SF_ERR_SRVCL;
 				COUNT_IF(1, "Report unhandled server error");
 			}
 			else if (res->flags & CF_READ_TIMEOUT) {
-				_HA_ATOMIC_INC(&s->be->be_counters.shared->tg[tgid - 1]->srv_aborts);
-				_HA_ATOMIC_INC(&sess->fe->fe_counters.shared->tg[tgid - 1]->srv_aborts);
-				if (sess->listener && sess->listener->counters)
-					_HA_ATOMIC_INC(&sess->listener->counters->shared->tg[tgid - 1]->srv_aborts);
-				if (srv)
-					_HA_ATOMIC_INC(&srv->counters.shared->tg[tgid - 1]->srv_aborts);
+				if (s->be_tgcounters)
+					_HA_ATOMIC_INC(&s->be_tgcounters->srv_aborts);
+				if (sess->fe_tgcounters)
+					_HA_ATOMIC_INC(&sess->fe_tgcounters->srv_aborts);
+				if (sess->li_tgcounters)
+					_HA_ATOMIC_INC(&sess->li_tgcounters->srv_aborts);
+				if (s->sv_tgcounters)
+					_HA_ATOMIC_INC(&s->sv_tgcounters->srv_aborts);
 				s->flags |= SF_ERR_SRVTO;
 				COUNT_IF(1, "Report unhandled server timeout (RD)");
 			}
 			else {
-				_HA_ATOMIC_INC(&s->be->be_counters.shared->tg[tgid - 1]->cli_aborts);
-				_HA_ATOMIC_INC(&sess->fe->fe_counters.shared->tg[tgid - 1]->cli_aborts);
-				if (sess->listener && sess->listener->counters)
-					_HA_ATOMIC_INC(&sess->listener->counters->shared->tg[tgid - 1]->cli_aborts);
-				if (srv)
-					_HA_ATOMIC_INC(&srv->counters.shared->tg[tgid - 1]->cli_aborts);
+				if (s->be_tgcounters)
+					_HA_ATOMIC_INC(&s->be_tgcounters->cli_aborts);
+				if (sess->fe_tgcounters)
+					_HA_ATOMIC_INC(&sess->fe_tgcounters->cli_aborts);
+				if (sess->li_tgcounters)
+					_HA_ATOMIC_INC(&sess->li_tgcounters->cli_aborts);
+				if (s->sv_tgcounters)
+					_HA_ATOMIC_INC(&s->sv_tgcounters->cli_aborts);
 				s->flags |= SF_ERR_CLITO;
 				COUNT_IF(1, "Report unhandled client timeout (WR)");
 			}
@@ -2357,6 +2383,8 @@ struct task *process_stream(struct task *t, void *context, unsigned int state)
 		}
 
 		do {
+			s->passes_connect++;
+
 			/* nb: step 1 might switch from QUE to ASS, but we first want
 			 * to give a chance to step 2 to perform a redirect if needed.
 			 */
@@ -2622,13 +2650,14 @@ struct task *process_stream(struct task *t, void *context, unsigned int state)
 			if (n < 1 || n > 5)
 				n = 0;
 
-			if (sess->fe->mode == PR_MODE_HTTP) {
-				_HA_ATOMIC_INC(&sess->fe->fe_counters.shared->tg[tgid - 1]->p.http.rsp[n]);
+			if (sess->fe->mode == PR_MODE_HTTP && sess->fe_tgcounters) {
+				_HA_ATOMIC_INC(&sess->fe_tgcounters->p.http.rsp[n]);
 			}
 			if ((s->flags & SF_BE_ASSIGNED) &&
-			    (s->be->mode == PR_MODE_HTTP)) {
-				_HA_ATOMIC_INC(&s->be->be_counters.shared->tg[tgid - 1]->p.http.rsp[n]);
-				_HA_ATOMIC_INC(&s->be->be_counters.shared->tg[tgid - 1]->p.http.cum_req);
+			    (s->be->mode == PR_MODE_HTTP) &&
+			    s->be_tgcounters) {
+				_HA_ATOMIC_INC(&s->be_tgcounters->p.http.rsp[n]);
+				_HA_ATOMIC_INC(&s->be_tgcounters->p.http.cum_req);
 			}
 		}
 
@@ -2692,8 +2721,11 @@ void stream_update_time_stats(struct stream *s)
 
 	srv = objt_server(s->target);
 	if (srv) {
-		samples_window = (((s->be->mode == PR_MODE_HTTP) ?
-			HA_ATOMIC_LOAD(&srv->counters.shared->tg[tgid - 1]->p.http.cum_req) : HA_ATOMIC_LOAD(&srv->counters.shared->tg[tgid - 1]->cum_lbconn)) > TIME_STATS_SAMPLES) ? TIME_STATS_SAMPLES : 0;
+		if (s->sv_tgcounters)
+			samples_window = (((s->be->mode == PR_MODE_HTTP) ?
+				HA_ATOMIC_LOAD(&s->sv_tgcounters->p.http.cum_req) : HA_ATOMIC_LOAD(&s->sv_tgcounters->cum_lbconn)) > TIME_STATS_SAMPLES) ? TIME_STATS_SAMPLES : 0;
+		else
+			samples_window = 0;
 		swrate_add_dynamic(&srv->counters.q_time, samples_window, t_queue);
 		swrate_add_dynamic(&srv->counters.c_time, samples_window, t_connect);
 		swrate_add_dynamic(&srv->counters.d_time, samples_window, t_data);
@@ -2703,8 +2735,11 @@ void stream_update_time_stats(struct stream *s)
 		HA_ATOMIC_UPDATE_MAX(&srv->counters.dtime_max, t_data);
 		HA_ATOMIC_UPDATE_MAX(&srv->counters.ttime_max, t_close);
 	}
-	samples_window = (((s->be->mode == PR_MODE_HTTP) ?
-		HA_ATOMIC_LOAD(&s->be->be_counters.shared->tg[tgid - 1]->p.http.cum_req) : HA_ATOMIC_LOAD(&s->be->be_counters.shared->tg[tgid - 1]->cum_lbconn)) > TIME_STATS_SAMPLES) ? TIME_STATS_SAMPLES : 0;
+	if (s->be_tgcounters)
+		samples_window = (((s->be->mode == PR_MODE_HTTP) ?
+			HA_ATOMIC_LOAD(&s->be_tgcounters->p.http.cum_req) : HA_ATOMIC_LOAD(&s->be_tgcounters->cum_lbconn)) > TIME_STATS_SAMPLES) ? TIME_STATS_SAMPLES : 0;
+	else
+		samples_window = 0;
 	swrate_add_dynamic(&s->be->be_counters.q_time, samples_window, t_queue);
 	swrate_add_dynamic(&s->be->be_counters.c_time, samples_window, t_connect);
 	swrate_add_dynamic(&s->be->be_counters.d_time, samples_window, t_data);
@@ -3376,8 +3411,8 @@ static void __strm_dump_to_buffer(struct buffer *buf, const struct show_sess_ctx
 		     strm->conn_err_type, strm->srv_conn, strm->pend_pos,
 		     LIST_INLIST(&strm->buffer_wait.list), strm->stream_epoch);
 
-	chunk_appendf(buf, "%s  p_stc=%u p_req=%u p_res=%u p_prp=%u\n", pfx,
-		      strm->passes_stconn, strm->passes_reqana, strm->passes_resana, strm->passes_propag);
+	chunk_appendf(buf, "%s  p_con=%u p_stc=%u p_req=%u p_res=%u p_prp=%u\n", pfx,
+		      strm->passes_connect, strm->passes_stconn, strm->passes_reqana, strm->passes_resana, strm->passes_propag);
 
 	chunk_appendf(buf,
 		     "%s  frontend=%s (id=%u mode=%s), listener=%s (id=%u)", pfx,

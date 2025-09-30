@@ -342,6 +342,8 @@ void *malloc(size_t size)
 	size = malloc_usable_size(ret) + sizeof(void *);
 
 	bin = memprof_get_bin(__builtin_return_address(0), MEMPROF_METH_MALLOC);
+	if (unlikely(th_ctx->lock_level & 0x7F))
+		_HA_ATOMIC_ADD(&bin->locked_calls, 1);
 	_HA_ATOMIC_ADD(&bin->alloc_calls, 1);
 	_HA_ATOMIC_ADD(&bin->alloc_tot, size);
 	return ret;
@@ -367,6 +369,8 @@ void *calloc(size_t nmemb, size_t size)
 	size = malloc_usable_size(ret) + sizeof(void *);
 
 	bin = memprof_get_bin(__builtin_return_address(0), MEMPROF_METH_CALLOC);
+	if (unlikely(th_ctx->lock_level & 0x7F))
+		_HA_ATOMIC_ADD(&bin->locked_calls, 1);
 	_HA_ATOMIC_ADD(&bin->alloc_calls, 1);
 	_HA_ATOMIC_ADD(&bin->alloc_tot, size);
 	return ret;
@@ -400,6 +404,8 @@ void *realloc(void *ptr, size_t size)
 		size += sizeof(void *);
 
 	bin = memprof_get_bin(__builtin_return_address(0), MEMPROF_METH_REALLOC);
+	if (unlikely(th_ctx->lock_level & 0x7F))
+		_HA_ATOMIC_ADD(&bin->locked_calls, 1);
 	if (size > size_before) {
 		_HA_ATOMIC_ADD(&bin->alloc_calls, 1);
 		_HA_ATOMIC_ADD(&bin->alloc_tot, size - size_before);
@@ -431,6 +437,8 @@ char *strdup(const char *s)
 	size = malloc_usable_size(ret) + sizeof(void *);
 
 	bin = memprof_get_bin(__builtin_return_address(0), MEMPROF_METH_STRDUP);
+	if (unlikely(th_ctx->lock_level & 0x7F))
+		_HA_ATOMIC_ADD(&bin->locked_calls, 1);
 	_HA_ATOMIC_ADD(&bin->alloc_calls, 1);
 	_HA_ATOMIC_ADD(&bin->alloc_tot, size);
 	return ret;
@@ -461,6 +469,8 @@ void free(void *ptr)
 	memprof_free_handler(ptr);
 
 	bin = memprof_get_bin(__builtin_return_address(0), MEMPROF_METH_FREE);
+	if (unlikely(th_ctx->lock_level & 0x7F))
+		_HA_ATOMIC_ADD(&bin->locked_calls, 1);
 	_HA_ATOMIC_ADD(&bin->free_calls, 1);
 	_HA_ATOMIC_ADD(&bin->free_tot, size_before);
 }
@@ -481,6 +491,8 @@ char *strndup(const char *s, size_t size)
 
 	size = malloc_usable_size(ret) + sizeof(void *);
 	bin = memprof_get_bin(__builtin_return_address(0), MEMPROF_METH_STRNDUP);
+	if (unlikely(th_ctx->lock_level & 0x7F))
+		_HA_ATOMIC_ADD(&bin->locked_calls, 1);
 	_HA_ATOMIC_ADD(&bin->alloc_calls, 1);
 	_HA_ATOMIC_ADD(&bin->alloc_tot, size);
 	return ret;
@@ -500,6 +512,8 @@ void *valloc(size_t size)
 
 	size = malloc_usable_size(ret) + sizeof(void *);
 	bin = memprof_get_bin(__builtin_return_address(0), MEMPROF_METH_VALLOC);
+	if (unlikely(th_ctx->lock_level & 0x7F))
+		_HA_ATOMIC_ADD(&bin->locked_calls, 1);
 	_HA_ATOMIC_ADD(&bin->alloc_calls, 1);
 	_HA_ATOMIC_ADD(&bin->alloc_tot, size);
 	return ret;
@@ -519,6 +533,8 @@ void *pvalloc(size_t size)
 
 	size = malloc_usable_size(ret) + sizeof(void *);
 	bin = memprof_get_bin(__builtin_return_address(0), MEMPROF_METH_PVALLOC);
+	if (unlikely(th_ctx->lock_level & 0x7F))
+		_HA_ATOMIC_ADD(&bin->locked_calls, 1);
 	_HA_ATOMIC_ADD(&bin->alloc_calls, 1);
 	_HA_ATOMIC_ADD(&bin->alloc_tot, size);
 	return ret;
@@ -538,6 +554,8 @@ void *memalign(size_t align, size_t size)
 
 	size = malloc_usable_size(ret) + sizeof(void *);
 	bin = memprof_get_bin(__builtin_return_address(0), MEMPROF_METH_MEMALIGN);
+	if (unlikely(th_ctx->lock_level & 0x7F))
+		_HA_ATOMIC_ADD(&bin->locked_calls, 1);
 	_HA_ATOMIC_ADD(&bin->alloc_calls, 1);
 	_HA_ATOMIC_ADD(&bin->alloc_tot, size);
 	return ret;
@@ -557,6 +575,8 @@ void *aligned_alloc(size_t align, size_t size)
 
 	size = malloc_usable_size(ret) + sizeof(void *);
 	bin = memprof_get_bin(__builtin_return_address(0), MEMPROF_METH_ALIGNED_ALLOC);
+	if (unlikely(th_ctx->lock_level & 0x7F))
+		_HA_ATOMIC_ADD(&bin->locked_calls, 1);
 	_HA_ATOMIC_ADD(&bin->alloc_calls, 1);
 	_HA_ATOMIC_ADD(&bin->alloc_tot, size);
 	return ret;
@@ -579,6 +599,8 @@ int posix_memalign(void **ptr, size_t align, size_t size)
 
 	size = malloc_usable_size(*ptr) + sizeof(void *);
 	bin = memprof_get_bin(__builtin_return_address(0), MEMPROF_METH_POSIX_MEMALIGN);
+	if (unlikely(th_ctx->lock_level & 0x7F))
+		_HA_ATOMIC_ADD(&bin->locked_calls, 1);
 	_HA_ATOMIC_ADD(&bin->alloc_calls, 1);
 	_HA_ATOMIC_ADD(&bin->alloc_tot, size);
 	return ret;
@@ -715,6 +737,7 @@ static int cli_parse_set_profiling(char **args, char *payload, struct appctx *ap
 
 			/* also flush current profiling stats */
 			for (i = 0; i < sizeof(memprof_stats) / sizeof(memprof_stats[0]); i++) {
+				HA_ATOMIC_STORE(&memprof_stats[i].locked_calls, 0);
 				HA_ATOMIC_STORE(&memprof_stats[i].alloc_calls, 0);
 				HA_ATOMIC_STORE(&memprof_stats[i].free_calls, 0);
 				HA_ATOMIC_STORE(&memprof_stats[i].alloc_tot, 0);
@@ -757,6 +780,9 @@ static int cli_parse_set_profiling(char **args, char *payload, struct appctx *ap
 			HA_ATOMIC_STORE(&sched_activity[i].calls, 0);
 			HA_ATOMIC_STORE(&sched_activity[i].cpu_time, 0);
 			HA_ATOMIC_STORE(&sched_activity[i].lat_time, 0);
+			HA_ATOMIC_STORE(&sched_activity[i].lkw_time, 0);
+			HA_ATOMIC_STORE(&sched_activity[i].lkd_time, 0);
+			HA_ATOMIC_STORE(&sched_activity[i].mem_time, 0);
 			HA_ATOMIC_STORE(&sched_activity[i].func, NULL);
 			HA_ATOMIC_STORE(&sched_activity[i].caller, NULL);
 		}
@@ -978,6 +1004,9 @@ static int cli_io_handler_show_profiling(struct appctx *appctx)
 				tmp_activity[i].calls    += tmp_activity[j].calls;
 				tmp_activity[i].cpu_time += tmp_activity[j].cpu_time;
 				tmp_activity[i].lat_time += tmp_activity[j].lat_time;
+				tmp_activity[i].lkw_time += tmp_activity[j].lkw_time;
+				tmp_activity[i].lkd_time += tmp_activity[j].lkd_time;
+				tmp_activity[i].mem_time += tmp_activity[j].mem_time;
 				tmp_activity[j].calls = 0;
 			}
 		}
@@ -990,7 +1019,7 @@ static int cli_io_handler_show_profiling(struct appctx *appctx)
 
 	if (!ctx->linenum)
 		chunk_appendf(&trash, "Tasks activity over %.3f sec till %.3f sec ago:\n"
-		                      "  function                      calls   cpu_tot   cpu_avg   lat_tot   lat_avg\n",
+		                      "  function                      calls   cpu_tot   cpu_avg   lkw_avg   lkd_avg   mem_avg   lat_avg\n",
 			      (prof_task_start_ns ? (prof_task_stop_ns ? prof_task_stop_ns : now_ns) - prof_task_start_ns : 0) / 1000000000.0,
 			      (prof_task_stop_ns ? now_ns - prof_task_stop_ns : 0) / 1000000000.0);
 
@@ -1027,7 +1056,9 @@ static int cli_io_handler_show_profiling(struct appctx *appctx)
 
 		print_time_short(&trash, "   ", tmp_activity[i].cpu_time, "");
 		print_time_short(&trash, "   ", tmp_activity[i].cpu_time / tmp_activity[i].calls, "");
-		print_time_short(&trash, "   ", tmp_activity[i].lat_time, "");
+		print_time_short(&trash, "   ", tmp_activity[i].lkw_time / tmp_activity[i].calls, "");
+		print_time_short(&trash, "   ", tmp_activity[i].lkd_time / tmp_activity[i].calls, "");
+		print_time_short(&trash, "   ", tmp_activity[i].mem_time / tmp_activity[i].calls, "");
 		print_time_short(&trash, "   ", tmp_activity[i].lat_time / tmp_activity[i].calls, "");
 
 		if (caller && !ctx->aggr && caller->what <= WAKEUP_TYPE_APPCTX_WAKEUP)
@@ -1115,6 +1146,15 @@ static int cli_io_handler_show_profiling(struct appctx *appctx)
 			/* that's a pool name */
 			const struct pool_head *pool = entry->info;
 			chunk_appendf(&trash," [pool=%s]", pool->name);
+		}
+
+		if (entry->locked_calls) {
+			unsigned long long tot_calls = entry->alloc_calls + entry->free_calls;
+
+			chunk_appendf(&trash," [locked=%llu (%d.%1d %%)]",
+				      entry->locked_calls,
+				      (int)(100ULL * entry->locked_calls / tot_calls),
+				      (int)((1000ULL * entry->locked_calls / tot_calls) % 10));
 		}
 
 		chunk_appendf(&trash, "\n");
@@ -1296,7 +1336,7 @@ static int cli_io_handler_show_tasks(struct appctx *appctx)
 	const struct task *t;
 	uint64_t now_ns, lat;
 	struct eb32_node *rqnode;
-	uint64_t tot_calls;
+	uint64_t tot_calls, tot_cpu;
 	int thr, queue;
 	int i, max;
 
@@ -1309,7 +1349,9 @@ static int cli_io_handler_show_tasks(struct appctx *appctx)
 	 * reflect the latency when set. We prefer to take the time before
 	 * calling thread_isolate() so that the wait time doesn't impact the
 	 * measurement accuracy. However this requires to take care of negative
-	 * times since tasks might be queued after we retrieve it.
+	 * times since tasks might be queued after we retrieve it. The cpu_time
+	 * will store the total number of calls per task, allowing to sort out
+	 * the most vs least busy ones.
 	 */
 
 	now_ns = now_mono_time();
@@ -1327,10 +1369,11 @@ static int cli_io_handler_show_tasks(struct appctx *appctx)
 			t = eb32_entry(rqnode, struct task, rq);
 			entry = sched_activity_entry(tmp_activity, t->process, NULL);
 			if (t->wake_date) {
-				lat = now_ns - t->wake_date;
+				lat = (uint32_t)now_ns - t->wake_date;
 				if ((int64_t)lat > 0)
 					entry->lat_time += lat;
 			}
+			entry->cpu_time += t->calls;
 			entry->calls++;
 			rqnode = eb32_next(rqnode);
 		}
@@ -1344,10 +1387,11 @@ static int cli_io_handler_show_tasks(struct appctx *appctx)
 			t = eb32_entry(rqnode, struct task, rq);
 			entry = sched_activity_entry(tmp_activity, t->process, NULL);
 			if (t->wake_date) {
-				lat = now_ns - t->wake_date;
+				lat = (uint32_t)now_ns - t->wake_date;
 				if ((int64_t)lat > 0)
 					entry->lat_time += lat;
 			}
+			entry->cpu_time += t->calls;
 			entry->calls++;
 			rqnode = eb32_next(rqnode);
 		}
@@ -1357,10 +1401,11 @@ static int cli_io_handler_show_tasks(struct appctx *appctx)
 			t = (const struct task *)tl;
 			entry = sched_activity_entry(tmp_activity, t->process, NULL);
 			if (!TASK_IS_TASKLET(t) && t->wake_date) {
-				lat = now_ns - t->wake_date;
+				lat = (uint32_t)now_ns - t->wake_date;
 				if ((int64_t)lat > 0)
 					entry->lat_time += lat;
 			}
+			entry->cpu_time += t->calls;
 			entry->calls++;
 		}
 
@@ -1370,10 +1415,11 @@ static int cli_io_handler_show_tasks(struct appctx *appctx)
 				t = (const struct task *)tl;
 				entry = sched_activity_entry(tmp_activity, t->process, NULL);
 				if (!TASK_IS_TASKLET(t) && t->wake_date) {
-					lat = now_ns - t->wake_date;
+					lat = (uint32_t)now_ns - t->wake_date;
 					if ((int64_t)lat > 0)
 						entry->lat_time += lat;
 				}
+				entry->cpu_time += t->calls;
 				entry->calls++;
 			}
 		}
@@ -1384,14 +1430,17 @@ static int cli_io_handler_show_tasks(struct appctx *appctx)
 
 	chunk_reset(&trash);
 
-	tot_calls = 0;
-	for (i = 0; i < SCHED_ACT_HASH_BUCKETS; i++)
+	tot_calls = tot_cpu = 0;
+	for (i = 0; i < SCHED_ACT_HASH_BUCKETS; i++) {
 		tot_calls += tmp_activity[i].calls;
+		tot_cpu += tmp_activity[i].cpu_time;
+	}
+	tot_cpu = tot_cpu ? tot_cpu : 1; // prepare for the divide
 
 	qsort(tmp_activity, SCHED_ACT_HASH_BUCKETS, sizeof(tmp_activity[0]), cmp_sched_activity_calls);
 
 	chunk_appendf(&trash, "Running tasks: %d (%d threads)\n"
-		      "  function                     places     %%    lat_tot   lat_avg\n",
+		      "  function                     places     %%    lat_tot   lat_avg  calls_tot  calls_avg calls%%\n",
 		      (int)tot_calls, global.nbthread);
 
 	for (i = 0; i < SCHED_ACT_HASH_BUCKETS && tmp_activity[i].calls; i++) {
@@ -1413,7 +1462,11 @@ static int cli_io_handler_show_tasks(struct appctx *appctx)
 		              (int)(100ULL * tmp_activity[i].calls / tot_calls),
 		              (int)((1000ULL * tmp_activity[i].calls / tot_calls)%10));
 		print_time_short(&trash, "   ", tmp_activity[i].lat_time, "");
-		print_time_short(&trash, "   ", tmp_activity[i].lat_time / tmp_activity[i].calls, "\n");
+		print_time_short(&trash, "   ", tmp_activity[i].lat_time / tmp_activity[i].calls, "");
+		chunk_appendf(&trash, " %10llu %10llu  %3d.%1d\n",
+			      (ullong)tmp_activity[i].cpu_time, (ullong)tmp_activity[i].cpu_time / tmp_activity[i].calls,
+		              (int)(100ULL * tmp_activity[i].cpu_time / tot_cpu),
+		              (int)((1000ULL * tmp_activity[i].cpu_time / tot_cpu)%10));
 	}
 
 	if (applet_putchk(appctx, &trash) == -1) {

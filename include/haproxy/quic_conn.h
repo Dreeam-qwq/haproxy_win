@@ -47,6 +47,7 @@
 #include <haproxy/quic_loss.h>
 #include <haproxy/quic_pacing.h>
 #include <haproxy/quic_rx.h>
+#include <haproxy/quic_tune.h>
 #include <haproxy/mux_quic.h>
 
 #include <openssl/rand.h>
@@ -81,6 +82,12 @@ void qc_idle_timer_rearm(struct quic_conn *qc, int read, int arm_ack);
 void qc_check_close_on_released_mux(struct quic_conn *qc);
 int quic_stateless_reset_token_cpy(unsigned char *pos, size_t len,
                                    const unsigned char *salt, size_t saltlen);
+
+/* Returns true if <qc> is used on the backed side (as a client). */
+static inline int qc_is_back(const struct quic_conn *qc)
+{
+	return qc->flags & QUIC_FL_CONN_IS_BACK;
+}
 
 /* Free the CIDs attached to <conn> QUIC connection. */
 static inline void free_quic_conn_cids(struct quic_conn *conn)
@@ -166,9 +173,14 @@ static inline void quic_free_ncbuf(struct ncbuf *ncbuf)
 static inline void *qc_counters(enum obj_type *o, const struct stats_module *m)
 {
 	struct proxy *p;
-	struct listener *l = objt_listener(o);
-	struct server *s = objt_server(o);
+	struct listener *l;
+	struct server *s;
 
+	if (!o)
+		return NULL;
+
+	l = objt_listener(o);
+	s = objt_server(o);
 	p = l ? l->bind_conf->frontend :
 		s ? s->proxy : NULL;
 

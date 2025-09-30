@@ -58,7 +58,7 @@ extern void *__elf_aux_vector;
 #include <sys/prctl.h>
 #endif
 
-#include <import/cebus_tree.h>
+#include <import/cebs_tree.h>
 #include <import/eb32sctree.h>
 #include <import/eb32tree.h>
 #include <import/ebmbtree.h>
@@ -127,7 +127,7 @@ int build_is_static = 0;
 
 /* known file names, made of file_name_node, to be used with file_name_*() */
 struct {
-	struct ceb_node *root; // file names tree, used with cebus_*()
+	struct ceb_root *root; // file names tree, used with cebus_*()
 	__decl_thread(HA_RWLOCK_T lock);
 } file_names = { 0 };
 
@@ -4689,6 +4689,8 @@ char *indent_msg(char **out, int level)
 
 	needed = 1 + level * (lf + 1) + len + 1;
 	p = ret = malloc(needed);
+	if (unlikely(!ret))
+		return NULL;
 	in = *out;
 
 	/* skip initial LFs */
@@ -5697,7 +5699,9 @@ const void *resolve_sym_name(struct buffer *buf, const char *pfx, const void *ad
 	 * may have a close match. Otherwise we report an offset relative to main.
 	 */
 	if (best_idx >= 0) {
-		chunk_appendf(buf, "%s+%#lx", fcts[best_idx].name, (long)best_dist);
+		chunk_appendf(buf, "%s", fcts[best_idx].name);
+		if (best_dist)
+			chunk_appendf(buf, "+%#lx", (long)best_dist);
 		return best_dist == 0 ? addr : NULL;
 	}
 	else if ((void*)addr < (void*)main)
@@ -7243,20 +7247,18 @@ int restore_env(void)
 const char *copy_file_name(const char *name)
 {
 	struct file_name_node *file;
-	struct ceb_node *node;
+	struct file_name_node *file2;
 	size_t len;
 
 	if (!name)
 		return NULL;
 
 	HA_RWLOCK_RDLOCK(OTHER_LOCK, &file_names.lock);
-	node = cebus_lookup(&file_names.root, name);
+	file = cebus_item_lookup(&file_names.root, node, name, name, struct file_name_node);
 	HA_RWLOCK_RDUNLOCK(OTHER_LOCK, &file_names.lock);
 
-	if (node) {
-		file = container_of(node, struct file_name_node, node);
+	if (file)
 		return file->name;
-	}
 
 	len = strlen(name);
 	file = malloc(sizeof(struct file_name_node) + len + 1);
@@ -7265,13 +7267,13 @@ const char *copy_file_name(const char *name)
 
 	memcpy(file->name, name, len + 1);
 	HA_RWLOCK_WRLOCK(OTHER_LOCK, &file_names.lock);
-	node = cebus_insert(&file_names.root, &file->node);
+	file2 = cebus_item_insert(&file_names.root, node, name, file);
 	HA_RWLOCK_WRUNLOCK(OTHER_LOCK, &file_names.lock);
 
-	if (node != &file->node) {
+	if (file2 != file) {
 		/* the node was created in between */
 		free(file);
-		file = container_of(node, struct file_name_node, node);
+		file = file2;
 	}
 	return file->name;
 }
@@ -7280,13 +7282,11 @@ const char *copy_file_name(const char *name)
 void free_all_file_names()
 {
 	struct file_name_node *file;
-	struct ceb_node *node;
 
 	HA_RWLOCK_WRLOCK(OTHER_LOCK, &file_names.lock);
 
-	while ((node = cebus_first(&file_names.root))) {
-		file = container_of(node, struct file_name_node, node);
-		cebus_delete(&file_names.root, node);
+	while ((file = cebus_item_first(&file_names.root, node, name, struct file_name_node))) {
+		cebus_item_delete(&file_names.root, node, name, file);
 		free(file);
 	}
 

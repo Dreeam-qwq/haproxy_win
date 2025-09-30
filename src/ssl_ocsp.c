@@ -57,6 +57,7 @@
 #include <haproxy/shctx.h>
 #include <haproxy/ssl_ckch.h>
 #include <haproxy/ssl_ocsp-t.h>
+#include <haproxy/ssl_ocsp.h>
 #include <haproxy/ssl_sock.h>
 #include <haproxy/ssl_utils.h>
 #include <haproxy/task.h>
@@ -132,7 +133,7 @@ int ssl_sock_ocsp_stapling_cbk(SSL *ssl, void *arg)
 		struct quic_conn *qc = SSL_get_ex_data(ssl, ssl_qc_app_data_index);
 
 		/* null if not a listener */
-		li = objt_listener(qc->target);
+		li = qc->li;
 	}
 #endif
 
@@ -1046,8 +1047,9 @@ static inline void ssl_ocsp_set_next_update(struct certificate_ocsp *ocsp)
  * the system too much (in theory). Likewise, a minimum 5 minutes interval is
  * defined in order to avoid updating too often responses that have a really
  * short expire time or even no 'Next Update' at all.
+ * The ocsp_update_tree lock must be taken by the caller.
  */
-int ssl_ocsp_update_insert(struct certificate_ocsp *ocsp)
+int __ssl_ocsp_update_insert_unlocked(struct certificate_ocsp *ocsp)
 {
 	/* Set next_update based on current time and the various OCSP
 	 * minimum/maximum update times.
@@ -1056,13 +1058,23 @@ int ssl_ocsp_update_insert(struct certificate_ocsp *ocsp)
 
 	ocsp->fail_count = 0;
 
-	HA_SPIN_LOCK(OCSP_LOCK, &ocsp_tree_lock);
 	ocsp->updating = 0;
 	/* An entry with update_once set to 1 was only supposed to be updated
 	 * once, it does not need to be reinserted into the update tree.
 	 */
 	if (!ocsp->update_once)
 		eb64_insert(&ocsp_update_tree, &ocsp->next_update);
+
+	return 0;
+}
+
+/*
+ * Insert a certificate_ocsp structure into the ocsp_update_tree tree.
+ */
+int ssl_ocsp_update_insert(struct certificate_ocsp *ocsp)
+{
+	HA_SPIN_LOCK(OCSP_LOCK, &ocsp_tree_lock);
+	__ssl_ocsp_update_insert_unlocked(ocsp);
 	HA_SPIN_UNLOCK(OCSP_LOCK, &ocsp_tree_lock);
 
 	return 0;
@@ -1075,7 +1087,7 @@ int ssl_ocsp_update_insert(struct certificate_ocsp *ocsp)
  * for instance). This ensures that the entry does not get reinserted at the
  * beginning of the tree every time.
  */
-int ssl_ocsp_update_insert_after_error(struct certificate_ocsp *ocsp)
+static int ssl_ocsp_update_insert_after_error(struct certificate_ocsp *ocsp)
 {
 	int replay_delay = 0;
 
@@ -1112,7 +1124,7 @@ int ssl_ocsp_update_insert_after_error(struct certificate_ocsp *ocsp)
 	return 0;
 }
 
-void ocsp_update_response_stline_cb(struct httpclient *hc)
+static void ocsp_update_response_stline_cb(struct httpclient *hc)
 {
 	struct task *task = hc->caller;
 
@@ -1123,7 +1135,7 @@ void ocsp_update_response_stline_cb(struct httpclient *hc)
 	task_wakeup(task, TASK_WOKEN_MSG);
 }
 
-void ocsp_update_response_headers_cb(struct httpclient *hc)
+static void ocsp_update_response_headers_cb(struct httpclient *hc)
 {
 	struct task *task = hc->caller;
 
@@ -1134,7 +1146,7 @@ void ocsp_update_response_headers_cb(struct httpclient *hc)
 	task_wakeup(task, TASK_WOKEN_MSG);
 }
 
-void ocsp_update_response_body_cb(struct httpclient *hc)
+static void ocsp_update_response_body_cb(struct httpclient *hc)
 {
 	struct task *task = hc->caller;
 
@@ -1145,7 +1157,7 @@ void ocsp_update_response_body_cb(struct httpclient *hc)
 	task_wakeup(task, TASK_WOKEN_MSG);
 }
 
-void ocsp_update_response_end_cb(struct httpclient *hc)
+static void ocsp_update_response_end_cb(struct httpclient *hc)
 {
 	struct task *task = hc->caller;
 
@@ -2075,7 +2087,7 @@ static int ocsp_update_parse_global_http_proxy(char **args, int section_type, st
 	return 0;
 }
 
-int ocsp_update_init(void *value, char *buf, struct ckch_data *d, int cli, char *filename, int linenum, char **err)
+int ocsp_update_init(void *value, char *buf, struct ckch_data *d, int cli, const char *filename, int linenum, char **err)
 {
 	int ocsp_update_mode = *(int *)value;
 	int ret = 0;
@@ -2091,7 +2103,7 @@ int ocsp_update_init(void *value, char *buf, struct ckch_data *d, int cli, char 
 	return ret;
 }
 
-int ocsp_update_postparser_init()
+static int ocsp_update_postparser_init()
 {
 	int ret = 0;
 	char *err = NULL;

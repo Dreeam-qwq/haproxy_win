@@ -171,7 +171,8 @@ enum srv_init_state {
 #define SRV_F_DEFSRV_USE_SSL 0x4000      /* default-server uses SSL */
 #define SRV_F_DELETED 0x8000             /* srv is deleted but not yet purged */
 #define SRV_F_STRICT_MAXCONN 0x10000     /* maxconn is to be strictly enforced, as a limit of outbound connections */
-#define SRV_F_CHECKED      0x20000       /* set once server was postparsed */
+#define SRV_F_CHK_NO_AUTO_SNI 0x20000    /* disable automatic SNI selection for healthcheck */
+#define SRV_F_UDP_GSO_NOTSUPP 0x40000    /* UDP GSO is disabled due to a previous error encountered */
 
 /* configured server options for send-proxy (server->pp_opts) */
 #define SRV_PP_V1               0x0001   /* proxy protocol version 1 */
@@ -201,9 +202,11 @@ enum srv_init_state {
 
 /* server ssl options */
 #define SRV_SSL_O_NONE           0x0000
+#define SRV_SSL_O_NO_AUTO_SNI   0x0001  /* disable automatic SNI */
 #define SRV_SSL_O_NO_TLS_TICKETS 0x0100 /* disable session resumption tickets */
 #define SRV_SSL_O_NO_REUSE       0x200  /* disable session reuse */
 #define SRV_SSL_O_EARLY_DATA     0x400  /* Allow using early data */
+#define SRV_SSL_O_KTLS           0x800  /* Use kTLS if available */
 
 /* log servers ring's protocols options */
 enum srv_log_proto {
@@ -262,14 +265,17 @@ struct tree_occ {
 /* Each server will have one occurrence of this structure per thread */
 struct srv_per_thread {
 	struct mt_list streams;                 /* streams using this server (used by "shutdown server sessions") */
-	struct eb_root idle_conns;              /* Shareable idle connections */
-	struct eb_root safe_conns;              /* Safe idle connections */
-	struct eb_root avail_conns;             /* Connections in use, but with still new streams available */
+	struct mt_list sess_conns;              /* Connections attached to a session which cannot be shared across clients */
 
 	/* Secondary idle conn storage used in parallel to idle/safe trees.
 	 * Used to sort them by last usage and purge them in reverse order.
 	 */
 	struct list idle_conn_list;
+
+	/* connection trees to look them up by name */
+	struct ceb_root *idle_conns;            /* Shareable idle connections */
+	struct ceb_root *safe_conns;            /* Safe idle connections */
+	struct ceb_root *avail_conns;           /* Connections in use, but with still new streams available */
 };
 
 /* Each server will have one occurrence of this structure per thread group */
@@ -311,6 +317,12 @@ enum renegotiate_mode {
 	SSL_RENEGOTIATE_ON		/* Enable secure renegotiation */
 };
 
+#define MAX_ALPN_SIZE 16
+
+struct path_parameters {
+	char nego_alpn[MAX_ALPN_SIZE];
+};
+
 struct proxy;
 struct server {
 	/* mostly config or admin stuff, doesn't change often */
@@ -349,7 +361,6 @@ struct server {
 	struct server *trackers;                /* the list of servers tracking us, if any */
 	struct server *tracknext;               /* next server tracking <track> in <track>'s trackers list */
 	char *trackit;				/* temporary variable to make assignment deferrable */
-	int consecutive_errors_limit;		/* number of consecutive errors that triggers an event */
 	short observe, onerror;			/* observing mode: one of HANA_OBS_*; what to do on error: on of ANA_ONERR_* */
 	short onmarkeddown;			/* what to do when marked down: one of HANA_ONMARKEDDOWN_* */
 	short onmarkedup;			/* what to do when marked up: one of HANA_ONMARKEDUP_* */
@@ -358,6 +369,7 @@ struct server {
 	unsigned long last_change;              /* internal use only (not for stats purpose): last time the server state was changed, doesn't change often, not updated atomically on purpose */
 
 	char *id;				/* just for identification */
+
 	uint32_t rid;				/* revision: if id has been reused for a new server, rid won't match */
 	unsigned iweight,uweight, cur_eweight;	/* initial weight, user-specified weight, and effective weight */
 	unsigned wscore;			/* weight score, used during srv map computation */
@@ -377,7 +389,7 @@ struct server {
 	/* The elements below may be changed on every single request by any
 	 * thread, and generally at the same time.
 	 */
-	THREAD_PAD(63);
+	THREAD_ALIGN(64);
 	struct eb32_node idle_node;             /* When to next do cleanup in the idle connections */
 	unsigned int curr_idle_conns;           /* Current number of orphan idling connections, both the idle and the safe lists */
 	unsigned int curr_idle_nb;              /* Current number of connections in the idle list */
@@ -386,13 +398,16 @@ struct server {
 	unsigned int curr_total_conns;          /* Current number of total connections to the server, used or idle, only calculated if strict-maxconn is used */
 	unsigned int max_used_conns;            /* Max number of used connections (the counter is reset at each connection purges */
 	unsigned int est_need_conns;            /* Estimate on the number of needed connections (max of curr and previous max_used) */
+	unsigned int curr_sess_idle_conns;      /* Current number of idle connections attached to a session instead of idle/safe trees. */
 
-	struct mt_list sess_conns;		/* list of private conns managed by a session on this server */
+	/* elements only used during boot, do not perturb and plug the hole */
+	struct guid_node guid;			/* GUID global tree node */
+	int puid;				/* proxy-unique server ID, used for SNMP, and "first" LB algo, indexed via puid_node below */
 
 	/* Element below are usd by LB algorithms and must be doable in
 	 * parallel to other threads reusing connections above.
 	 */
-	THREAD_PAD(63);
+	THREAD_ALIGN(64);
 	__decl_thread(HA_SPINLOCK_T lock);      /* may enclose the proxy's lock, must not be taken under */
 	union {
 		struct eb32_node lb_node;       /* node used for tree-based load balancing */
@@ -406,14 +421,15 @@ struct server {
 	};
 
 	/* usually atomically updated by any thread during parsing or on end of request */
-	THREAD_PAD(63);
+	THREAD_ALIGN(64);
 	int cur_sess;				/* number of currently active sessions (including syn_sent) */
 	int served;				/* # of active sessions currently being served (ie not pending) */
 	int consecutive_errors;			/* current number of consecutive errors */
+	int consecutive_errors_limit;		/* number of consecutive errors that triggers an event */
 	struct be_counters counters;		/* statistics counters */
 
 	/* Below are some relatively stable settings, only changed under the lock */
-	THREAD_PAD(63);
+	THREAD_ALIGN(64);
 
 	struct eb_root *lb_tree;                /* we want to know in what tree the server is */
 	struct tree_occ *lb_nodes;              /* lb_nodes_tot * struct tree_occ */
@@ -429,9 +445,9 @@ struct server {
 	unsigned int svc_port;                  /* the port to connect to (for relevant families) */
 	unsigned down_time;			/* total time the server was down */
 
-	int puid;				/* proxy-unique server ID, used for SNMP, and "first" LB algo */
 	int tcp_ut;                             /* for TCP, user timeout */
 	char *tcp_md5sig;                       /* TCP MD5 signature password (RFC2385) */
+	char *cc_algo;                          /* TCP congestion control algorithm ("cc" argument) */
 
 	int do_check;                           /* temporary variable used during parsing to denote if health checks must be enabled */
 	int do_agent;                           /* temporary variable used during parsing to denote if an auxiliary agent check must be enabled */
@@ -444,7 +460,8 @@ struct server {
 	char *lastaddr;				/* the address string provided by the server-state file */
 	struct resolv_options resolv_opts;
 	int hostname_dn_len;			/* string length of the server hostname in Domain Name format */
-	char *hostname_dn;			/* server hostname in Domain Name format (name is lower cased) */
+	char *hostname_dn;			/* server hostname in Domain Name format (name is lower cased), key to host_dn below */
+
 	char *hostname;				/* server hostname */
 	struct sockaddr_storage init_addr;	/* plain IP address specified on the init-addr line */
 	unsigned int init_addr_methods;		/* initial address setting, 3-bit per method, ends at 0, enough to store 10 entries */
@@ -464,14 +481,14 @@ struct server {
 			char *sni; /* SNI used for the session */
 			__decl_thread(HA_RWLOCK_T sess_lock);
 		} * reused_sess;
-		uint last_ssl_sess_tid;         /* last tid+1 having updated reused_sess (0=none, >0=tid+1) */
 
 		struct ckch_inst *inst; /* Instance of the ckch_store in which the certificate was loaded (might be null if server has no certificate) */
 		__decl_thread(HA_RWLOCK_T lock); /* lock the cache and SSL_CTX during commit operations */
 
 		char *ciphers;			/* cipher suite to use if non-null */
-		char *ciphersuites;			/* TLS 1.3 cipher suite to use if non-null */
-		char *curves;                    /* TLS curves list */
+		char *ciphersuites;		/* TLS 1.3 cipher suite to use if non-null */
+		char *curves;			/* TLS curves list */
+		uint last_ssl_sess_tid;         /* last tid+1 having updated reused_sess (0=none, >0=tid+1) */
 		int options;			/* ssl options */
 		int verify;			/* verify method (set of SSL_VERIFY_* flags) */
 		struct tls_version_filter methods;	/* ssl methods */
@@ -483,27 +500,31 @@ struct server {
 		char *client_sigalgs;           /* Client Signature algorithms */
 		struct sample_expr *sni;        /* sample expression for SNI */
 		char *npn_str;                  /* NPN protocol string */
-		int npn_len;                    /* NPN protocol string length */
 		char *alpn_str;                 /* ALPN protocol string */
+		int npn_len;                    /* NPN protocol string length */
 		int alpn_len;                   /* ALPN protocol string length */
 		int renegotiate;		/* Renegotiate mode (SSL_RENEGOTIATE_ flag) */
 	} ssl_ctx;
 #ifdef USE_QUIC
 	struct quic_transport_params quic_params; /* QUIC transport parameters */
 #endif
+	struct path_parameters path_params;     /* Connection parameters for that server */
 	struct resolv_srvrq *srvrq;		/* Pointer representing the DNS SRV requeest, if any */
 	struct list srv_rec_item;		/* to attach server to a srv record item */
 	struct list ip_rec_item;		/* to attach server to a A or AAAA record item */
-	struct ebpt_node host_dn;		/* hostdn store for srvrq and state file matching*/
+	struct ceb_node host_dn;		/* hostdn store for srvrq and state file matching (uses hostname_dn above) */
 	struct list pp_tlvs;			/* to send out PROXY protocol v2 TLVs */
 	struct task *srvrq_check;               /* Task testing SRV record expiration date for this server */
 	struct {
 		const char *file;		/* file where the section appears */
-		struct eb32_node id;		/* place in the tree of used IDs */
-		struct ebpt_node name;		/* place in the tree of used names */
+		struct ceb_node puid_node;	/* place in the tree of used IDs, indexes <puid> above */
+		struct ceb_node name_node;	/* place in the tree of used names, indexes <id> above, not unique, indexed in px->used_server_name */
 		int line;			/* line where the section appears */
 	} conf;					/* config information */
-	struct ebpt_node addr_node;             /* Node for string representation of address for the server (including port number) */
+
+	struct ceb_node addr_node;              /* Indexing node for the addr_key below, from px->used_server_addr */
+	char *addr_key;                         /* string representation of address for the server (including port number) */
+
 	/* Template information used only for server objects which
 	 * serve as template filled at parsing time and used during
 	 * server allocations from server templates.
@@ -515,8 +536,6 @@ struct server {
 	} tmpl_info;
 
 	event_hdl_sub_list e_subs;		/* event_hdl: server's subscribers list (atomically updated) */
-
-	struct guid_node guid;			/* GUID global tree node */
 
 	/* warning, these structs are huge, keep them at the bottom */
 	struct conn_src conn_src;               /* connection source settings */

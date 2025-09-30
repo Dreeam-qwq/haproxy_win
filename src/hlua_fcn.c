@@ -517,7 +517,7 @@ struct hlua_queue_item {
 
 /* This is the memory pool containing struct hlua_queue_item (queue items)
  */
-DECLARE_STATIC_POOL(pool_head_hlua_queue, "hlua_queue", sizeof(struct hlua_queue_item));
+DECLARE_STATIC_TYPED_POOL(pool_head_hlua_queue, "hlua_queue", struct hlua_queue_item);
 
 static struct hlua_queue *hlua_check_queue(lua_State *L, int ud)
 {
@@ -1913,6 +1913,21 @@ int hlua_listable_servers_pairs_iterator(lua_State *L)
 	return 2;
 }
 
+/* ensure proper cleanup for listable_servers_pairs */
+int hlua_listable_servers_pairs_gc(lua_State *L)
+{
+	struct hlua_server_list_iterator_context *ctx;
+
+	ctx = lua_touserdata(L, 1);
+
+	/* we need to make sure that the watcher leaves in detached state even
+	 * if the iterator was interrupted (ie: "break" from the loop), else
+	 * the server watcher list will become corrupted
+	 */
+	watcher_detach(&ctx->srv_watch);
+	return 0;
+}
+
 /* init the iterator context, return iterator function
  * with context as closure. The only argument is a
  * server list object.
@@ -1925,6 +1940,12 @@ int hlua_listable_servers_pairs(lua_State *L)
 	hlua_srv_list = hlua_check_server_list(L, 1);
 
 	ctx = lua_newuserdata(L, sizeof(*ctx));
+
+	/* add gc metamethod to the newly created userdata */
+	lua_newtable(L);
+	hlua_class_function(L, "__gc", hlua_listable_servers_pairs_gc);
+	lua_setmetatable(L, -2);
+
 	ctx->px = hlua_srv_list->px;
 	ctx->next = NULL;
 	watcher_init(&ctx->srv_watch, &ctx->next, offsetof(struct server, watcher_list));

@@ -85,6 +85,7 @@
 #define GTUNE_LISTENER_MQ_FAIR   (1<<27)
 #define GTUNE_LISTENER_MQ_OPT    (1<<28)
 #define GTUNE_LISTENER_MQ_ANY    (GTUNE_LISTENER_MQ_FAIR | GTUNE_LISTENER_MQ_OPT)
+#define GTUNE_NO_KTLS            (1<<29)
 
 /* subsystem-specific debugging options for tune.debug */
 #define GDBG_CPU_AFFINITY           (1U<< 0)
@@ -166,6 +167,7 @@ struct global {
 	char *server_state_base;   /* path to a directory where server state files can be found */
 	char *server_state_file;   /* path to the file where server states are loaded from */
 	char *stats_file;          /* path to stats-file */
+	char *shm_stats_file;      /* path to shm-stats-file */
 	unsigned char cluster_secret[16]; /* 128 bits of an SHA1 digest of a secret defined as ASCII string */
 	struct {
 		int maxpollevents; /* max number of poll events at once */

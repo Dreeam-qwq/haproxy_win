@@ -789,7 +789,7 @@ static int bind_parse_ciphersuites(char **args, int cur_arg, struct proxy *px, s
 static int bind_parse_crt(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
 {
 	char path[MAXPATHLEN];
-	int default_crt = *args[cur_arg] == 'd' ? 1 : 0;
+	int default_crt = *args[cur_arg] == 'd' ? CKCH_INST_EXPL_DEFAULT : CKCH_INST_NO_DEFAULT;
 
 	if (!*args[cur_arg + 1]) {
 		memprintf(err, "'%s' : missing certificate location", args[cur_arg]);
@@ -872,6 +872,36 @@ static int ssl_bind_parse_curves(char **args, int cur_arg, struct proxy *px, str
 static int bind_parse_curves(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
 {
 	return ssl_bind_parse_curves(args, cur_arg, px, &conf->ssl_conf, 0, err);
+}
+
+/* parse the "ktls" bind keyword */
+static int ssl_bind_parse_ktls(char **args, int cur_arg, struct proxy *px, struct ssl_bind_conf *conf, int from_cli, char **err)
+{
+	if (!*args[cur_arg + 1]) {
+		memprintf(err, "'%s' expects \"on\" or \"off\" as an argument.",
+			  args[cur_arg]);
+		return ERR_ALERT | ERR_FATAL;
+	}
+	if (!experimental_directives_allowed) {
+		memprintf(err, "'%s' directive is experimental, must be allowed via a global 'expose-experimental-directive'", args[cur_arg]);
+		return ERR_ALERT | ERR_FATAL;
+	}
+	if (!strcasecmp(args[cur_arg + 1], "on")) {
+		conf->ktls = 1;
+	} else if (!strcasecmp(args[cur_arg + 1], "off")) {
+		conf->ktls = 0;
+	} else {
+		memprintf(err, "'%s' expects \"on\" or \"off\" as an argument, got '%s'.",
+			  args[cur_arg], args[cur_arg + 1]);
+		return ERR_ALERT | ERR_FATAL;
+	}
+	return 0;
+
+}
+
+static int bind_parse_ktls(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
+{
+	return ssl_bind_parse_ktls(args, cur_arg, px, &conf->ssl_conf, 0, err);
 }
 
 /* parse the "sigalgs" bind keyword */
@@ -1621,6 +1651,7 @@ static int srv_parse_check_sni(char **args, int *cur_arg, struct proxy *px, stru
 		return ERR_ALERT | ERR_FATAL;
 	}
 
+	free(newsrv->check.sni);
 	newsrv->check.sni = strdup(args[*cur_arg + 1]);
 	if (!newsrv->check.sni) {
 		memprintf(err, "'%s' : failed to allocate memory", args[*cur_arg]);
@@ -1847,6 +1878,20 @@ static int srv_parse_crt(char **args, int *cur_arg, struct proxy *px, struct ser
 	return 0;
 }
 
+/* parse the "check-sni-auto" server keyword */
+static int srv_parse_check_sni_auto(char **args, int *cur_arg, struct proxy *px, struct server *newsrv, char **err)
+{
+	newsrv->flags &= ~SRV_F_CHK_NO_AUTO_SNI;
+	return 0;
+}
+
+/* parse the "no-check-sni-auto" server keyword */
+static int srv_parse_no_check_sni_auto(char **args, int *cur_arg, struct proxy *px, struct server *newsrv, char **err)
+{
+	newsrv->flags |= SRV_F_CHK_NO_AUTO_SNI;
+	return 0;
+}
+
 /* parse the "no-check-ssl" server keyword */
 static int srv_parse_no_check_ssl(char **args, int *cur_arg, struct proxy *px, struct server *newsrv, char **err)
 {
@@ -1887,6 +1932,32 @@ static int srv_parse_no_ssl(char **args, int *cur_arg, struct proxy *px, struct 
 		ha_free(&newsrv->ssl_ctx.ciphers);
 	}
 	newsrv->use_ssl = -1;
+	return 0;
+}
+
+/* parse the "ktls" server keywod */
+static int srv_parse_ktls(char **args, int *cur_arg, struct proxy *px, struct server *newsrv, char **err)
+{
+	if (!*args[*cur_arg + 1]) {
+		memprintf(err, "'%s' expects \"on\" or \"off\" as an argument.",
+			  args[*cur_arg]);
+		return ERR_ALERT | ERR_FATAL;
+	}
+
+	if (!experimental_directives_allowed) {
+		memprintf(err, "'%s' directive is experimental, must be allowed via a global 'expose-experimental-directive'", args[*cur_arg]);
+		return ERR_ALERT | ERR_FATAL;
+	}
+
+	if (!strcasecmp(args[*cur_arg + 1], "on")) {
+		newsrv->ssl_ctx.options |= SRV_SSL_O_KTLS;
+	} else if (!strcasecmp(args[*cur_arg + 1], "off")) {
+		newsrv->ssl_ctx.options &= ~SRV_SSL_O_KTLS;
+	} else {
+		memprintf(err, "'%s' expects \"on\" or \"off\" as an argument, got '%s'.",
+			  args[*cur_arg], args[*cur_arg + 1]);
+		return ERR_ALERT | ERR_FATAL;
+	}
 	return 0;
 }
 
@@ -1974,6 +2045,20 @@ static int srv_parse_sni(char **args, int *cur_arg, struct proxy *px, struct ser
 
 	return 0;
 #endif
+}
+
+/* parse the "sni-auto" server keyword */
+static int srv_parse_sni_auto(char **args, int *cur_arg, struct proxy *px, struct server *newsrv, char **err)
+{
+	newsrv->ssl_ctx.options &= ~SRV_SSL_O_NO_AUTO_SNI;
+	return 0;
+}
+
+/* parse the "no-sni-auto" server keyword */
+static int srv_parse_no_sni_auto(char **args, int *cur_arg, struct proxy *px, struct server *newsrv, char **err)
+{
+	newsrv->ssl_ctx.options |= SRV_SSL_O_NO_AUTO_SNI;
+	return 0;
 }
 
 /* parse the "ssl" server keyword */
@@ -2386,14 +2471,12 @@ static int post_section_frontend_crt_init()
 			goto error;
 		}
 
-		/* look for "ssl" bind lines without any crt nor crt-line */
+		/* look for "ssl" bind lines */
 		list_for_each_entry(b, &curproxy->conf.bind, by_fe) {
 			if (b->options & BC_O_USE_SSL) {
-				if (eb_is_empty(&b->sni_ctx) && eb_is_empty(&b->sni_w_ctx)) {
-					err_code |= ssl_sock_load_cert_list_file(crtlist_name, 0, b, curproxy, &err);
-					if (err_code & ERR_CODE)
-						goto error;
-				}
+				err_code |= ssl_sock_load_cert_list_file(crtlist_name, 0, b, curproxy, &err);
+				if (err_code & ERR_CODE)
+					goto error;
 			}
 		}
 	}
@@ -2450,6 +2533,7 @@ struct ssl_crtlist_kw ssl_crtlist_kws[] = {
 	{ "crl-file",              ssl_bind_parse_crl_file,         1 }, /* set certificate revocation list file use on client cert verify */
 	{ "curves",                ssl_bind_parse_curves,           1 }, /* set SSL curve suite */
 	{ "ecdhe",                 ssl_bind_parse_ecdhe,            1 }, /* defines named curve for elliptic curve Diffie-Hellman */
+	{ "ktls",                  ssl_bind_parse_ktls,             1 }, /* enables or disables kTLS */
 	{ "no-alpn",               ssl_bind_parse_no_alpn,          0 }, /* disable sending ALPN */
 	{ "no-ca-names",           ssl_bind_parse_no_ca_names,      0 }, /* do not send ca names to clients (ca_file related) */
 	{ "npn",                   ssl_bind_parse_npn,              1 }, /* set NPN supported protocols */
@@ -2486,6 +2570,7 @@ static struct bind_kw_list bind_kws = { "SSL", { }, {
 	{ "force-tlsv12",          bind_parse_tls_method_options, 0 }, /* force TLSv12 */
 	{ "force-tlsv13",          bind_parse_tls_method_options, 0 }, /* force TLSv13 */
 	{ "generate-certificates", bind_parse_generate_certs,     0 }, /* enable the server certificates generation */
+	{ "ktls",                  bind_parse_ktls,               1 }, /* enable or disable kTLS */
 	{ "no-alpn",               bind_parse_no_alpn,            0 }, /* disable sending ALPN */
 	{ "no-ca-names",           bind_parse_no_ca_names,        0 }, /* do not send ca names to clients (ca_file related) */
 	{ "no-sslv3",              bind_parse_tls_method_options, 0 }, /* disable SSLv3 */
@@ -2523,6 +2608,7 @@ static struct srv_kw_list srv_kws = { "SSL", { }, {
 	{ "ca-file",                 srv_parse_ca_file,            1, 1, 1 }, /* set CAfile to process verify server cert */
 	{ "check-alpn",              srv_parse_check_alpn,         1, 1, 1 }, /* Set ALPN used for checks */
 	{ "check-sni",               srv_parse_check_sni,          1, 1, 1 }, /* set SNI */
+	{ "check-sni-auto",          srv_parse_check_sni_auto,     0, 1, 0 }, /* enable automatic SNI selection for health checks */
 	{ "check-ssl",               srv_parse_check_ssl,          0, 1, 1 }, /* enable SSL for health checks */
 	{ "ciphers",                 srv_parse_ciphers,            1, 1, 1 }, /* select the cipher suite */
 	{ "ciphersuites",            srv_parse_ciphersuites,       1, 1, 1 }, /* select the cipher suite */
@@ -2535,10 +2621,13 @@ static struct srv_kw_list srv_kws = { "SSL", { }, {
 	{ "force-tlsv11",            srv_parse_tls_method_options, 0, 1, 1 }, /* force TLSv11 */
 	{ "force-tlsv12",            srv_parse_tls_method_options, 0, 1, 1 }, /* force TLSv12 */
 	{ "force-tlsv13",            srv_parse_tls_method_options, 0, 1, 1 }, /* force TLSv13 */
+	{ "ktls",                    srv_parse_ktls,               1, 1, 1 }, /* enable or disable kTLS */
+	{ "no-check-sni-auto",       srv_parse_no_check_sni_auto,  0, 1, 0 }, /* disable automatic SNI selection for health checks */
 	{ "no-check-ssl",            srv_parse_no_check_ssl,       0, 1, 0 }, /* disable SSL for health checks */
 	{ "no-renegotiate",          srv_parse_renegotiate,        0, 1, 1 }, /* Disable renegotiation */
 	{ "no-send-proxy-v2-ssl",    srv_parse_no_send_proxy_ssl,  0, 1, 0 }, /* do not send PROXY protocol header v2 with SSL info */
 	{ "no-send-proxy-v2-ssl-cn", srv_parse_no_send_proxy_cn,   0, 1, 0 }, /* do not send PROXY protocol header v2 with CN */
+	{ "no-sni-auto",             srv_parse_no_sni_auto,        0, 1, 0 }, /* disable automatic SNI selection */
 	{ "no-ssl",                  srv_parse_no_ssl,             0, 1, 0 }, /* disable SSL processing */
 	{ "no-ssl-reuse",            srv_parse_no_ssl_reuse,       0, 1, 1 }, /* disable session reuse */
 	{ "no-sslv3",                srv_parse_tls_method_options, 0, 0, 1 }, /* disable SSLv3 */
@@ -2553,6 +2642,7 @@ static struct srv_kw_list srv_kws = { "SSL", { }, {
 	{ "send-proxy-v2-ssl-cn",    srv_parse_send_proxy_cn,      0, 1, 1 }, /* send PROXY protocol header v2 with CN */
 	{ "sigalgs",                 srv_parse_sigalgs,            1, 1, 1 }, /* signature algorithms */
 	{ "sni",                     srv_parse_sni,                1, 1, 1 }, /* send SNI extension */
+	{ "sni-auto",                srv_parse_sni_auto,           0, 1, 0 }, /* enable automatic SNI selection */
 	{ "ssl",                     srv_parse_ssl,                0, 1, 1 }, /* enable SSL processing */
 	{ "ssl-min-ver",             srv_parse_tls_method_minmax,  1, 1, 1 }, /* minimum version */
 	{ "ssl-max-ver",             srv_parse_tls_method_minmax,  1, 1, 1 }, /* maximum version */

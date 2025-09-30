@@ -119,14 +119,14 @@ static forceinline struct eb64_node *__eb64_lookup(struct eb_root *root, u64 x)
 {
 	struct eb64_node *node;
 	eb_troot_t *troot;
-	u64 y;
+	u64 y, z;
 
 	troot = root->b[EB_LEFT];
 	if (unlikely(troot == NULL))
 		return NULL;
 
 	while (1) {
-		if ((eb_gettag(troot) == EB_LEAF)) {
+		if (unlikely(eb_gettag(troot) == EB_LEAF)) {
 			node = container_of(eb_untag(troot, EB_LEAF),
 					    struct eb64_node, node.branches);
 			if (node->key == x)
@@ -137,7 +137,13 @@ static forceinline struct eb64_node *__eb64_lookup(struct eb_root *root, u64 x)
 		node = container_of(eb_untag(troot, EB_NODE),
 				    struct eb64_node, node.branches);
 
+		eb_prefetch(node->node.branches.b[0], 0);
+		eb_prefetch(node->node.branches.b[1], 0);
+
 		y = node->key ^ x;
+		z = 1ULL << (node->node.bit & 63);
+		troot = (x & z) ? node->node.branches.b[1] : node->node.branches.b[0];
+
 		if (!y) {
 			/* Either we found the node which holds the key, or
 			 * we have a dup tree. In the later case, we have to
@@ -153,10 +159,8 @@ static forceinline struct eb64_node *__eb64_lookup(struct eb_root *root, u64 x)
 			return node;
 		}
 
-		if ((y >> node->node.bit) >= EB_NODE_BRANCHES)
+		if (y & -(z << 1))
 			return NULL; /* no more common bits */
-
-		troot = node->node.branches.b[(x >> node->node.bit) & EB_NODE_BRANCH_MASK];
 	}
 }
 
@@ -169,14 +173,14 @@ static forceinline struct eb64_node *__eb64i_lookup(struct eb_root *root, s64 x)
 	struct eb64_node *node;
 	eb_troot_t *troot;
 	u64 key = x ^ (1ULL << 63);
-	u64 y;
+	u64 y, z;
 
 	troot = root->b[EB_LEFT];
 	if (unlikely(troot == NULL))
 		return NULL;
 
 	while (1) {
-		if ((eb_gettag(troot) == EB_LEAF)) {
+		if (unlikely(eb_gettag(troot) == EB_LEAF)) {
 			node = container_of(eb_untag(troot, EB_LEAF),
 					    struct eb64_node, node.branches);
 			if (node->key == (u64)x)
@@ -187,7 +191,13 @@ static forceinline struct eb64_node *__eb64i_lookup(struct eb_root *root, s64 x)
 		node = container_of(eb_untag(troot, EB_NODE),
 				    struct eb64_node, node.branches);
 
+		eb_prefetch(node->node.branches.b[0], 0);
+		eb_prefetch(node->node.branches.b[1], 0);
+
 		y = node->key ^ x;
+		z = 1ULL << (node->node.bit & 63);
+		troot = (key & z) ? node->node.branches.b[1] : node->node.branches.b[0];
+
 		if (!y) {
 			/* Either we found the node which holds the key, or
 			 * we have a dup tree. In the later case, we have to
@@ -203,10 +213,8 @@ static forceinline struct eb64_node *__eb64i_lookup(struct eb_root *root, s64 x)
 			return node;
 		}
 
-		if ((y >> node->node.bit) >= EB_NODE_BRANCHES)
+		if (y & -(z << 1))
 			return NULL; /* no more common bits */
-
-		troot = node->node.branches.b[(key >> node->node.bit) & EB_NODE_BRANCH_MASK];
 	}
 }
 
@@ -308,6 +316,10 @@ __eb64_insert(struct eb_root *root, struct eb64_node *new) {
 		/* OK we're walking down this link */
 		old = container_of(eb_untag(troot, EB_NODE),
 				    struct eb64_node, node.branches);
+
+		eb_prefetch(old->node.branches.b[0], 0);
+		eb_prefetch(old->node.branches.b[1], 0);
+
 		old_node_bit = old->node.bit;
 
 		/* Stop going down when we don't have common bits anymore. We
@@ -352,7 +364,6 @@ __eb64_insert(struct eb_root *root, struct eb64_node *new) {
 		}
 
 		/* walk down */
-		root = &old->node.branches;
 
 		if (sizeof(long) >= 8) {
 			side = newkey >> old_node_bit;
@@ -368,7 +379,8 @@ __eb64_insert(struct eb_root *root, struct eb64_node *new) {
 			}
 		}
 		side &= EB_NODE_BRANCH_MASK;
-		troot = root->b[side];
+		troot = side ? old->node.branches.b[1] : old->node.branches.b[0];
+		root = &old->node.branches;
 	}
 
 	/* Ok, now we are inserting <new> between <root> and <old>. <old>'s
@@ -490,6 +502,10 @@ __eb64i_insert(struct eb_root *root, struct eb64_node *new) {
 		/* OK we're walking down this link */
 		old = container_of(eb_untag(troot, EB_NODE),
 				    struct eb64_node, node.branches);
+
+		eb_prefetch(old->node.branches.b[0], 0);
+		eb_prefetch(old->node.branches.b[1], 0);
+
 		old_node_bit = old->node.bit;
 
 		/* Stop going down when we don't have common bits anymore. We
@@ -534,7 +550,6 @@ __eb64i_insert(struct eb_root *root, struct eb64_node *new) {
 		}
 
 		/* walk down */
-		root = &old->node.branches;
 
 		if (sizeof(long) >= 8) {
 			side = newkey >> old_node_bit;
@@ -550,7 +565,8 @@ __eb64i_insert(struct eb_root *root, struct eb64_node *new) {
 			}
 		}
 		side &= EB_NODE_BRANCH_MASK;
-		troot = root->b[side];
+		troot = side ? old->node.branches.b[1] : old->node.branches.b[0];
+		root = &old->node.branches;
 	}
 
 	/* Ok, now we are inserting <new> between <root> and <old>. <old>'s

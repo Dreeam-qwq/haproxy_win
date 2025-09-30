@@ -12,7 +12,7 @@
 
 #include <errno.h>
 
-#include <import/ebmbtree.h>
+#include <import/ceb64_tree.h>
 
 #include <haproxy/api.h>
 #include <haproxy/arg.h>
@@ -38,11 +38,10 @@
 #include <haproxy/xxhash.h>
 
 
-DECLARE_POOL(pool_head_connection,     "connection",     sizeof(struct connection));
-DECLARE_POOL(pool_head_conn_hash_node, "conn_hash_node", sizeof(struct conn_hash_node));
-DECLARE_POOL(pool_head_sockaddr,       "sockaddr",       sizeof(struct sockaddr_storage));
-DECLARE_POOL(pool_head_pp_tlv_128,     "pp_tlv_128",     sizeof(struct conn_tlv_list) + HA_PP2_TLV_VALUE_128);
-DECLARE_POOL(pool_head_pp_tlv_256,     "pp_tlv_256",     sizeof(struct conn_tlv_list) + HA_PP2_TLV_VALUE_256);
+DECLARE_TYPED_POOL(pool_head_connection,     "connection",     struct connection, 0, 64);
+DECLARE_TYPED_POOL(pool_head_sockaddr,       "sockaddr",       struct sockaddr_storage);
+DECLARE_TYPED_POOL(pool_head_pp_tlv_128,     "pp_tlv_128",     struct conn_tlv_list, HA_PP2_TLV_VALUE_128);
+DECLARE_TYPED_POOL(pool_head_pp_tlv_256,     "pp_tlv_256",     struct conn_tlv_list, HA_PP2_TLV_VALUE_256);
 
 struct idle_conns idle_conns[MAX_THREADS] = { };
 struct xprt_ops *registered_xprt[XPRT_ENTRIES] = { NULL, };
@@ -73,15 +72,34 @@ struct conn_tlv_list *conn_get_tlv(struct connection *conn, int type)
 	return NULL;
 }
 
-/* Remove <conn> idle connection from its attached tree (idle, safe or avail).
- * If also present in the secondary server idle list, conn is removed from it.
+/* Remove <conn> idle connection from its attached tree (idle, safe or avail)
+ * for the server in the connection's target and thread <thr>. If also present
+ * in the secondary server idle list, conn is removed from it.
  *
  * Must be called with idle_conns_lock held.
  */
-void conn_delete_from_tree(struct connection *conn)
+void conn_delete_from_tree(struct connection *conn, int thr)
 {
-	LIST_DEL_INIT(&conn->idle_list);
-	eb64_delete(&conn->hash_node->node);
+	struct ceb_root **conn_tree;
+	struct server *srv = __objt_server(conn->target);
+
+	/* We need to determine where the connection is attached, if at all.
+	 *  - if it's in a tree and not in the idle_list, it's the avail_tree
+	 *  - if it's in a tree and has CO_FL_SAFE_LIST, it's the safe_tree
+	 *  - if it's in a tree and has CO_FL_IDLE_LIST, it's the idle_tree
+	 *  - if it's not in a tree and has CO_FL_SESS_IDLE, it's in the
+	 *    session's list (but we don't care here).
+	 */
+	if (LIST_INLIST(&conn->idle_list)) {
+		LIST_DEL_INIT(&conn->idle_list);
+		conn_tree = (conn->flags & CO_FL_SAFE_LIST) ?
+			&srv->per_thr[thr].safe_conns :
+			&srv->per_thr[thr].idle_conns;
+	} else {
+		conn_tree = &srv->per_thr[thr].avail_conns;
+	}
+
+	ceb64_item_delete(conn_tree, hash_node.node, hash_node.key, conn);
 }
 
 int conn_create_mux(struct connection *conn, int *closed_connection)
@@ -117,7 +135,7 @@ int conn_create_mux(struct connection *conn, int *closed_connection)
 		}
 		else if (conn->flags & CO_FL_PRIVATE) {
 			/* If it fail now, the same will be done in mux->detach() callback */
-			session_add_conn(sess, conn, conn->target);
+			session_add_conn(sess, conn);
 		}
 		return 0;
 fail:
@@ -199,12 +217,18 @@ int conn_notify_mux(struct connection *conn, int old_flags, int forced_wake)
 	     ((conn->flags ^ old_flags) & CO_FL_NOTIFY_DONE) ||
 	     ((old_flags & CO_FL_WAIT_XPRT) && !(conn->flags & CO_FL_WAIT_XPRT))) &&
 	    conn->mux && conn->mux->wake) {
-		uint conn_in_list = conn->flags & CO_FL_LIST_MASK;
+		uint conn_in_list = conn->flags & (CO_FL_LIST_MASK|CO_FL_SESS_IDLE);
 		struct server *srv = objt_server(conn->target);
 
 		if (conn_in_list) {
 			HA_SPIN_LOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
-			conn_delete_from_tree(conn);
+			if (conn->flags & CO_FL_SESS_IDLE) {
+				if (!session_detach_idle_conn(conn->owner, conn))
+					conn_in_list = 0;
+			}
+			else {
+				conn_delete_from_tree(conn, tid);
+			}
 			HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
 		}
 
@@ -213,9 +237,26 @@ int conn_notify_mux(struct connection *conn, int old_flags, int forced_wake)
 			goto done;
 
 		if (conn_in_list) {
-			HA_SPIN_LOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
-			_srv_add_idle(srv, conn, conn_in_list == CO_FL_SAFE_LIST);
-			HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
+			if (srv && (srv->cur_admin & SRV_ADMF_MAINT)) {
+				/* Do not store an idle conn if server in maintenance. */
+				conn->mux->destroy(conn->ctx);
+				ret = -1;
+				goto done;
+			}
+
+			if (conn->flags & CO_FL_SESS_IDLE) {
+				if (!session_reinsert_idle_conn(conn->owner, conn)) {
+					/* session add conn failure */
+					conn->mux->destroy(conn->ctx);
+					ret = -1;
+				}
+			}
+			else {
+				ASSUME_NONNULL(srv); /* srv is guaranteed by CO_FL_LIST_MASK */
+				HA_SPIN_LOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
+				_srv_add_idle(srv, conn, conn_in_list == CO_FL_SAFE_LIST);
+				HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
+			}
 		}
 	}
  done:
@@ -332,7 +373,12 @@ int conn_install_mux_be(struct connection *conn, void *ctx, struct session *sess
 		int alpn_len = 0;
 		int mode = conn_pr_mode_to_proto_mode(prx->mode);
 
-		conn_get_alpn(conn, &alpn_str, &alpn_len);
+		if (!conn_get_alpn(conn, &alpn_str, &alpn_len)) {
+			if (srv && srv->path_params.nego_alpn[0]) {
+				alpn_str = srv->path_params.nego_alpn;
+				alpn_len = strlen(alpn_str);
+			}
+		}
 		mux_proto = ist2(alpn_str, alpn_len);
 
 		mux_ops = conn_get_best_mux(conn, mux_proto, PROTO_SIDE_BE, mode);
@@ -467,16 +513,12 @@ void conn_init(struct connection *conn, void *target)
 	conn->target = target;
 	conn->destroy_cb = NULL;
 	conn->proxy_netns = NULL;
-	MT_LIST_INIT(&conn->toremove_list);
-	if (conn_is_back(conn))
-		LIST_INIT(&conn->sess_el);
-	else
-		LIST_INIT(&conn->stopping_list);
 	LIST_INIT(&conn->tlv_list);
 	conn->subs = NULL;
 	conn->src = NULL;
 	conn->dst = NULL;
-	conn->hash_node = NULL;
+	conn->hash_node.key = 0;
+	ceb_init_node(&conn->hash_node.node);
 	conn->xprt = NULL;
 	conn->reverse.target = NULL;
 	conn->reverse.name = BUF_NULL;
@@ -488,14 +530,20 @@ void conn_init(struct connection *conn, void *target)
  */
 static int conn_backend_init(struct connection *conn)
 {
+	LIST_INIT(&conn->idle_list);
+	LIST_INIT(&conn->sess_el);
+	MT_LIST_INIT(&conn->toremove_list);
+
 	if (!sockaddr_alloc(&conn->dst, 0, 0))
 		return 1;
 
-	conn->hash_node = conn_alloc_hash_node(conn);
-	if (unlikely(!conn->hash_node))
-		return 1;
-
 	return 0;
+}
+
+/* Initialize members used only on frontend connections. */
+static void conn_frontend_init(struct connection *conn)
+{
+	LIST_INIT(&conn->stopping_list);
 }
 
 /* Release connection elements reserved for backend side usage. It also takes
@@ -513,21 +561,28 @@ static void conn_backend_deinit(struct connection *conn)
 	if (obj_type(conn->target) == OBJ_TYPE_SERVER) {
 		struct server *srv = __objt_server(conn->target);
 
-		/* If the connection is not private, it is accounted by the server. */
-		if (!(conn->flags & CO_FL_PRIVATE)) {
+		if (!(conn->flags & CO_FL_PRIVATE) || (conn->flags & CO_FL_SESS_IDLE))
 			srv_release_conn(srv, conn);
-		}
+
 		if (srv->flags & SRV_F_STRICT_MAXCONN)
 			_HA_ATOMIC_DEC(&srv->curr_total_conns);
 	}
 
 	/* Make sure the connection is not left in the idle connection tree */
-	if (conn->hash_node != NULL)
-		BUG_ON(conn->hash_node->node.node.leaf_p != NULL);
+	BUG_ON(ceb_intree(&conn->hash_node.node));
 
-	pool_free(pool_head_conn_hash_node, conn->hash_node);
-	conn->hash_node = NULL;
+	/* Remove from BE purge list. Necessary if conn already scheduled for
+	 * purge but finally freed before by another code path.
+	 */
+	MT_LIST_DELETE(&conn->toremove_list);
+}
 
+/* Ensure <conn> frontend connection is removed from its lists. This must be
+ * performed before freeing or reversing a connection.
+ */
+static void conn_frontend_deinit(struct connection *conn)
+{
+	LIST_DEL_INIT(&conn->stopping_list);
 }
 
 /* Tries to allocate a new connection and initialized its main fields. The
@@ -553,6 +608,9 @@ struct connection *conn_new(void *target)
 			return NULL;
 		}
 	}
+	else {
+		conn_frontend_init(conn);
+	}
 
 	return conn;
 }
@@ -564,14 +622,8 @@ void conn_free(struct connection *conn)
 
 	if (conn_is_back(conn))
 		conn_backend_deinit(conn);
-
-	/* Remove the conn from toremove_list.
-	 *
-	 * This is needed to prevent a double-free in case the connection was
-	 * already scheduled from cleaning but is freed before via another
-	 * call.
-	 */
-	MT_LIST_DELETE(&conn->toremove_list);
+	else
+		conn_frontend_deinit(conn);
 
 	sockaddr_free(&conn->src);
 	sockaddr_free(&conn->dst);
@@ -616,19 +668,6 @@ void conn_release(struct connection *conn)
 			conn->destroy_cb(conn);
 		conn_free(conn);
 	}
-}
-
-struct conn_hash_node *conn_alloc_hash_node(struct connection *conn)
-{
-	struct conn_hash_node *hash_node = NULL;
-
-	hash_node = pool_zalloc(pool_head_conn_hash_node);
-	if (unlikely(!hash_node))
-		return NULL;
-
-	hash_node->conn = conn;
-
-	return hash_node;
 }
 
 /* Allocates a struct sockaddr from the pool if needed, assigns it to *sap and
@@ -908,7 +947,7 @@ int conn_ctrl_send(struct connection *conn, const void *buf, int len, int flags)
 	/* snd_buf() already takes care of updating conn->flags and handling
 	 * the FD polling status.
 	 */
-	ret = xprt->snd_buf(conn, NULL, &buffer, buffer.data, flags);
+	ret = xprt->snd_buf(conn, NULL, &buffer, buffer.data, NULL, 0, flags);
 	if (conn->flags & CO_FL_ERROR)
 		ret = -1;
 	return ret;
@@ -2931,6 +2970,8 @@ int conn_reverse(struct connection *conn)
 		struct server *srv = objt_server(conn->reverse.target);
 		BUG_ON(!srv);
 
+		conn_frontend_deinit(conn);
+
 		if (conn_backend_init(conn))
 			return 1;
 
@@ -2948,13 +2989,12 @@ int conn_reverse(struct connection *conn)
 		}
 
 		hash = conn_calculate_hash(&hash_params);
-		conn->hash_node->node.key = hash;
+		conn->hash_node.key = hash;
 
 		conn->target = &srv->obj_type;
 		srv_use_conn(srv, conn);
 
 		/* Free the session after detaching the connection from it. */
-		session_unown_conn(sess, conn);
 		sess->origin = NULL;
 		session_free(sess);
 		conn_set_owner(conn, NULL, NULL);
@@ -2967,6 +3007,7 @@ int conn_reverse(struct connection *conn)
 
 		conn_backend_deinit(conn);
 
+		conn_frontend_init(conn);
 		conn->target = &l->obj_type;
 		conn->flags |= CO_FL_ACT_REVERSING;
 		task_wakeup(l->rx.rhttp.task, TASK_WOKEN_RES);

@@ -466,8 +466,8 @@ static struct proxy *cli_alloc_fe(const char *name, const char *file, int line)
 	fe->default_target = &cli_applet.obj_type;
 
 	/* the stats frontend is the only one able to assign ID #0 */
-	fe->conf.id.key = fe->uuid = 0;
-	eb32_insert(&used_proxy_id, &fe->conf.id);
+	fe->uuid = 0;
+	proxy_index_id(fe);
 	return fe;
 }
 
@@ -974,6 +974,7 @@ int cli_parse_cmdline(struct appctx *appctx)
 
 		b_del(&appctx->inbuf, len);
 		b_add(appctx->cli_ctx.cmdline,  len);
+		applet_fl_clr(appctx, APPCTX_FL_INBLK_FULL);
 
 		if (!(appctx->st1 & APPCTX_CLI_ST1_PAYLOAD)) {
 			char *last_arg;
@@ -1424,8 +1425,8 @@ static int cli_io_handler_show_fd(struct appctx *appctx)
 #if defined(USE_QUIC)
 		else if (fdt.iocb == quic_conn_sock_fd_iocb) {
 			qc = fdtab[fd].owner;
-			li = qc ? objt_listener(qc->target) : NULL;
-			sv = qc ? objt_server(qc->target) : NULL;
+			li = qc ? qc->li : NULL;
+			sv = qc ? (qc->conn ? objt_server(qc->conn->target) : NULL) : NULL;
 			xprt_ctx   = qc ? qc->xprt_ctx : NULL;
 			conn = qc ? qc->conn : NULL;
 			xprt = conn ? conn->xprt : NULL; // in fact it's &ssl_quic
@@ -2162,7 +2163,7 @@ static int cli_io_handler_wait(struct appctx *appctx)
 
 	if (ctx->cond == CLI_WAIT_COND_SRV_UNUSED) {
 		/* check if the server in args[0]/args[1] can be released now */
-		ret = srv_check_for_deletion(ctx->args[0], ctx->args[1], NULL, NULL, NULL);
+		ret = srv_check_for_deletion(ctx->args[0], ctx->args[1], NULL, NULL, &ctx->msg);
 
 		if (ret < 0) {
 			/* unrecoverable failure */
@@ -2214,23 +2215,23 @@ static int cli_io_handler_wait(struct appctx *appctx)
 static void cli_release_wait(struct appctx *appctx)
 {
 	struct cli_wait_ctx *ctx = appctx->svcctx;
-	const char *msg;
+	char *msg = NULL;
 	int i;
 
 	switch (ctx->error) {
-	case CLI_WAIT_ERR_EXP:      msg = "Wait delay expired.\n"; break;
-	case CLI_WAIT_ERR_INTR:     msg = "Interrupted.\n"; break;
-	case CLI_WAIT_ERR_FAIL:     msg = ctx->msg ? ctx->msg : "Failed.\n"; break;
-	default:                    msg = "Done.\n"; break;
+	case CLI_WAIT_ERR_EXP:  memprintf(&msg, "Wait delay expired. %s\n", ctx->msg); break;
+	case CLI_WAIT_ERR_INTR: memprintf(&msg, "Interrupted. %s\n", ctx->msg); break;
+	case CLI_WAIT_ERR_FAIL: memprintf(&msg, "Failed. %s\n", ctx->msg); break;
+	default:                memprintf(&msg, "Done.\n"); break;
 	}
 
 	for (i = 0; i < sizeof(ctx->args) / sizeof(ctx->args[0]); i++)
 		ha_free(&ctx->args[i]);
 
 	if (ctx->error == CLI_WAIT_ERR_DONE)
-		cli_msg(appctx, LOG_INFO, msg);
+		cli_dynmsg(appctx, LOG_INFO, msg);
 	else
-		cli_err(appctx, msg);
+		cli_dynerr(appctx, msg);
 }
 
 /* parse the "expose-fd" argument on the bind lines */
@@ -3364,6 +3365,8 @@ read_again:
 				target_pid = s->pcli_next_pid;
 			/* we can connect now */
 			s->target = pcli_pid_to_server(target_pid);
+			if (objt_server(s->target))
+				s->sv_tgcounters = __objt_server(s->target)->counters.shared.tg[tgid - 1];
 
 			if (!s->target)
 				goto server_disconnect;
@@ -3724,7 +3727,7 @@ error:
 	list_for_each_entry(child, &proc_list, list) {
 		free((char *)child->srv->conf.file); /* cast because of const char *  */
 		free(child->srv->id);
-		ha_free(&child->srv);
+		srv_free(&child->srv);
 	}
 	free(msg);
 
@@ -3899,6 +3902,7 @@ error:
 
 static struct applet cli_applet = {
 	.obj_type = OBJ_TYPE_APPLET,
+	.flags = APPLET_FL_NEW_API,
 	.name = "<CLI>", /* used for logging */
 	.fct = cli_io_handler,
 	.rcv_buf = appctx_raw_rcv_buf,
@@ -3909,6 +3913,7 @@ static struct applet cli_applet = {
 /* master CLI */
 static struct applet mcli_applet = {
 	.obj_type = OBJ_TYPE_APPLET,
+	.flags = APPLET_FL_NEW_API,
 	.name = "<MCLI>", /* used for logging */
 	.fct = cli_io_handler,
 	.rcv_buf = appctx_raw_rcv_buf,

@@ -145,6 +145,9 @@ enum quic_pkt_type {
 #define QUIC_PACKET_PNL_BITMASK      0x03
 #define QUIC_PACKET_PN_MAXLEN        4
 
+/* TLS algo supported by QUIC uses a 16-bytes sample for HP. */
+#define QUIC_HP_SAMPLE_LEN           16
+
 /*
  *  0                   1                   2                   3
  *  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
@@ -319,7 +322,7 @@ struct qcc_app_ops;
          * with a connection                                                   \
          */                                                                    \
         struct eb_root *cids;                                                  \
-        enum obj_type *target;                                                 \
+        struct listener *li;                                                   \
         /* Idle timer task */                                                  \
         struct task *idle_timer_task;                                          \
         unsigned int idle_expire;                                              \
@@ -448,9 +451,9 @@ struct quic_conn_closed {
 #define QUIC_FL_CONN_ANTI_AMPLIFICATION_REACHED  (1U << 0)
 #define QUIC_FL_CONN_SPIN_BIT                    (1U << 1) /* Spin bit set by remote peer */
 #define QUIC_FL_CONN_NEED_POST_HANDSHAKE_FRMS    (1U << 2) /* HANDSHAKE_DONE must be sent */
-/* gap here */
+#define QUIC_FL_CONN_IS_BACK                     (1U << 3) /* conn used on backend side */
 #define QUIC_FL_CONN_ACCEPT_REGISTERED           (1U << 4)
-/* gap here */
+#define QUIC_FL_CONN_UDP_GSO_EIO                 (1U << 5) /* GSO disabled due to a EIO occured on same listener */
 #define QUIC_FL_CONN_IDLE_TIMER_RESTARTED_AFTER_READ (1U << 6)
 #define QUIC_FL_CONN_RETRANS_NEEDED              (1U << 7)
 #define QUIC_FL_CONN_RETRANS_OLD_DATA            (1U << 8) /* retransmission in progress for probing with already sent data */
@@ -488,7 +491,9 @@ static forceinline char *qc_show_flags(char *buf, size_t len, const char *delim,
 	_(QUIC_FL_CONN_ANTI_AMPLIFICATION_REACHED,
 	_(QUIC_FL_CONN_SPIN_BIT,
 	_(QUIC_FL_CONN_NEED_POST_HANDSHAKE_FRMS,
+	_(QUIC_FL_CONN_IS_BACK,
 	_(QUIC_FL_CONN_ACCEPT_REGISTERED,
+	_(QUIC_FL_CONN_UDP_GSO_EIO,
 	_(QUIC_FL_CONN_IDLE_TIMER_RESTARTED_AFTER_READ,
 	_(QUIC_FL_CONN_RETRANS_NEEDED,
 	_(QUIC_FL_CONN_RETRANS_OLD_DATA,
@@ -501,13 +506,15 @@ static forceinline char *qc_show_flags(char *buf, size_t len, const char *delim,
 	_(QUIC_FL_CONN_IPKTNS_DCD,
 	_(QUIC_FL_CONN_HPKTNS_DCD,
 	_(QUIC_FL_CONN_PEER_VALIDATED_ADDR,
+	_(QUIC_FL_CONN_NO_TOKEN_RCVD,
+	_(QUIC_FL_CONN_SCID_RECEIVED,
 	_(QUIC_FL_CONN_TO_KILL,
 	_(QUIC_FL_CONN_TX_TP_RECEIVED,
 	_(QUIC_FL_CONN_FINALIZED,
 	_(QUIC_FL_CONN_EXP_TIMER,
 	_(QUIC_FL_CONN_CLOSING,
 	_(QUIC_FL_CONN_DRAINING,
-	_(QUIC_FL_CONN_IMMEDIATE_CLOSE)))))))))))))))))))))));
+	_(QUIC_FL_CONN_IMMEDIATE_CLOSE)))))))))))))))))))))))))));
 	/* epilogue */
 	_(~0U);
 	return buf;

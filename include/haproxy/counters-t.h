@@ -33,6 +33,11 @@
 	struct {                                                                     \
 		uint16_t flags;                         /* COUNTERS_SHARED_F flags */\
 	};
+
+/* /!\ any change performed here will impact shm-stats-file mapping because the
+ * struct is embedded in shm_stats_file_object struct, so proceed with caution
+ * and change shm stats file version if needed
+ */
 #define COUNTERS_SHARED_TG                                                           \
 	struct {                                                                     \
 		unsigned long last_state_change;        /* last time, when the state was changed */\
@@ -60,7 +65,11 @@ struct counters_shared {
 	} *tg[MAX_TGROUPS];
 };
 
-/* counters used by listeners and frontends */
+/*
+ * /!\ any change performed here will impact shm-stats-file mapping because the
+ * struct is embedded in shm_stats_file_object struct, so proceed with caution
+ * and change shm stats file version if needed
+ */
 struct fe_counters_shared_tg {
 	COUNTERS_SHARED_TG;
 
@@ -91,8 +100,9 @@ struct fe_counters_shared {
 	struct fe_counters_shared_tg *tg[MAX_TGROUPS];
 };
 
+/* counters used by listeners and frontends */
 struct fe_counters {
-	struct fe_counters_shared *shared;      /* shared counters */
+	struct fe_counters_shared shared;       /* shared counters */
 	unsigned int conn_max;                  /* max # of active sessions */
 
 	unsigned int cps_max;                   /* maximum of new connections received per second */
@@ -108,6 +118,10 @@ struct fe_counters {
 	} p;                                    /* protocol-specific stats */
 };
 
+/* /!\ any change performed here will impact shm-stats-file mapping because the
+ * struct is embedded in shm_stats_file_object struct, so proceed with caution
+ * and change shm stats file version if needed
+ */
 struct be_counters_shared_tg {
 	COUNTERS_SHARED_TG;
 
@@ -145,7 +159,7 @@ struct be_counters_shared {
 
 /* counters used by servers and backends */
 struct be_counters {
-	struct be_counters_shared *shared;      /* shared counters */
+	struct be_counters_shared shared;       /* shared counters */
 	unsigned int conn_max;                  /* max # of active sessions */
 
 	unsigned int cps_max;                   /* maximum of new connections received per second */

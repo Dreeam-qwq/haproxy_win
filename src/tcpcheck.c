@@ -72,7 +72,7 @@
 struct eb_root shared_tcpchecks = EB_ROOT;
 
 
-DECLARE_POOL(pool_head_tcpcheck_rule, "tcpcheck_rule", sizeof(struct tcpcheck_rule));
+DECLARE_TYPED_POOL(pool_head_tcpcheck_rule, "tcpcheck_rule", struct tcpcheck_rule);
 
 /**************************************************************************/
 /*************** Init/deinit tcp-check rules and ruleset ******************/
@@ -1221,6 +1221,38 @@ static inline int tcpcheck_use_nondefault_connect(const struct check *check,
 	  (connect->options & TCPCHK_MASK_OPTS_CONNECT);
 }
 
+/* Returns true if the connect rule uses SSL. */
+static inline int tcpcheck_connect_use_ssl(const struct check *check,
+					   const struct tcpcheck_connect *connect)
+{
+	if (connect->options & TCPCHK_OPT_SSL)
+		return 1;
+	if (connect->options & TCPCHK_OPT_DEFAULT_CONNECT)
+		return (check->xprt == xprt_get(XPRT_SSL));
+	return 0;
+}
+
+static inline void tcpcheck_connect_auto_sni(const struct check *check,
+					     const struct tcpcheck_connect *connect,
+					     struct buffer *chk)
+{
+	chunk_reset(chk);
+	chk->data = sess_build_logline(check->sess, NULL, b_orig(chk), b_size(chk), connect->sni_fmt);
+	if (b_data(chk)) {
+		char *beg = b_orig(chk);
+		char *end = b_tail(chk) - 1;
+		char *p;
+
+		for (p = end; p >= beg; p--) {
+			if (*p == ':' || *p == ']')
+				break;
+		}
+		if (p >= beg && *p == ':')
+			b_set_data(chk, p - beg);
+		*b_tail(chk) = 0;
+	}
+}
+
 /* Evaluates a TCPCHK_ACT_CONNECT rule. Returns TCPCHK_EVAL_WAIT to wait the
  * connection establishment, TCPCHK_EVAL_CONTINUE to evaluate the next rule or
  * TCPCHK_EVAL_STOP if an error occurred.
@@ -1236,6 +1268,7 @@ enum tcpcheck_eval_ret tcpcheck_eval_connect(struct check *check, struct tcpchec
 	struct protocol *proto;
 	struct xprt_ops *xprt;
 	struct tcpcheck_rule *next;
+	struct buffer *auto_sni = NULL;
 	int status, port;
 
 	TRACE_ENTER(CHK_EV_TCPCHK_CONN, check);
@@ -1264,9 +1297,24 @@ enum tcpcheck_eval_ret tcpcheck_eval_connect(struct check *check, struct tcpchec
 	check_release_buf(check, &check->bi);
 	check_release_buf(check, &check->bo);
 
+	/* Deal with automatic SNI selection now because it can be used as connection name  */
+	if (tcpcheck_connect_use_ssl(check, connect) && s && !(s->flags & SRV_F_CHK_NO_AUTO_SNI) && connect->sni_fmt) {
+		auto_sni = alloc_trash_chunk();
+		if (auto_sni) {
+			tcpcheck_connect_auto_sni(check, connect, auto_sni);
+			if (!b_data(auto_sni)) {
+				free_trash_chunk(auto_sni);
+				auto_sni = NULL;
+			}
+		}
+	}
+
+
 	if (!(check->state & CHK_ST_AGENT) && check->reuse_pool &&
-	    !tcpcheck_use_nondefault_connect(check, connect)) {
+	    !tcpcheck_use_nondefault_connect(check, connect) &&
+	    !srv_is_transparent(s)) {
 		struct ist pool_conn_name = IST_NULL;
+		struct sockaddr_storage *dst, dst_tmp;
 		int64_t hash;
 		int conn_err;
 
@@ -1274,12 +1322,26 @@ enum tcpcheck_eval_ret tcpcheck_eval_connect(struct check *check, struct tcpchec
 
 		if (check->pool_conn_name)
 			pool_conn_name = ist(check->pool_conn_name);
-		else if (connect->sni)
-			pool_conn_name = ist(connect->sni);
-		else if ((connect->options & TCPCHK_OPT_DEFAULT_CONNECT) && check->sni)
-			pool_conn_name = ist(check->sni);
+		else if (tcpcheck_connect_use_ssl(check, connect)) {
+			if (connect->sni)
+				pool_conn_name = ist(connect->sni);
+			else if ((connect->options & TCPCHK_OPT_DEFAULT_CONNECT) && check->sni)
+				pool_conn_name = ist(check->sni);
+			else if (auto_sni)
+				pool_conn_name = ist2(b_orig(auto_sni), b_data(auto_sni));
+		}
 
-		hash = be_calculate_conn_hash(s, NULL, check->sess, NULL, NULL, pool_conn_name);
+		if (!(s->flags & SRV_F_RHTTP)) {
+			dst_tmp = s->addr;
+			set_host_port(&dst_tmp, s->svc_port);
+			dst = &dst_tmp;
+		}
+		else {
+			/* For reverse HTTP, destination address is unknown. */
+			dst = NULL;
+		}
+
+		hash = be_calculate_conn_hash(s, NULL, check->sess, NULL, dst, pool_conn_name);
 		conn_err = be_reuse_connection(hash, check->sess, s->proxy, s,
 		                               check->sc, &s->obj_type, 0);
 		if (conn_err == SF_ERR_INTERNAL) {
@@ -1330,11 +1392,16 @@ enum tcpcheck_eval_ret tcpcheck_eval_connect(struct check *check, struct tcpchec
 	/* connect to the connect rule addr if specified, otherwise the check
 	 * addr if specified on the server. otherwise, use the server addr (it
 	 * MUST exist at this step).
+	 * TODO server address may be unset if server is transparent. In this
+	 * case and if there is no address configured via a check statement,
+	 * an error should be returned immediately.
 	 */
 	*conn->dst = (is_addr(&connect->addr)
 		      ? connect->addr
 		      : (is_addr(&check->addr) ? check->addr : s->addr));
-	proto = protocol_lookup(conn->dst->ss_family, PROTO_TYPE_STREAM, 0);
+	proto = s ?
+	  protocol_lookup(conn->dst->ss_family, s->addr_type.proto_type, s->alt_proto) :
+	  protocol_lookup(conn->dst->ss_family, PROTO_TYPE_STREAM, 0);
 
 	port = 0;
 	if (connect->port)
@@ -1411,15 +1478,19 @@ enum tcpcheck_eval_ret tcpcheck_eval_connect(struct check *check, struct tcpchec
 	conn->ctx = check->sc;
 
 #ifdef USE_OPENSSL
-	if (connect->sni)
-		ssl_sock_set_servername(conn, connect->sni);
-	else if ((connect->options & TCPCHK_OPT_DEFAULT_CONNECT) && s && s->check.sni)
-		ssl_sock_set_servername(conn, s->check.sni);
+	if (conn_is_ssl(conn)) {
+		if (connect->sni)
+			ssl_sock_set_servername(conn, connect->sni);
+		else if ((connect->options & TCPCHK_OPT_DEFAULT_CONNECT) && s && s->check.sni)
+			ssl_sock_set_servername(conn, s->check.sni);
+		else if (auto_sni)
+			ssl_sock_set_servername(conn, b_orig(auto_sni));
 
-	if (connect->alpn)
-		ssl_sock_set_alpn(conn, (unsigned char *)connect->alpn, connect->alpn_len);
-	else if ((connect->options & TCPCHK_OPT_DEFAULT_CONNECT) && s && s->check.alpn_str)
-		ssl_sock_set_alpn(conn, (unsigned char *)s->check.alpn_str, s->check.alpn_len);
+		if (connect->alpn)
+			ssl_sock_set_alpn(conn, (unsigned char *)connect->alpn, connect->alpn_len);
+		else if ((connect->options & TCPCHK_OPT_DEFAULT_CONNECT) && s && s->check.alpn_str)
+			ssl_sock_set_alpn(conn, (unsigned char *)s->check.alpn_str, s->check.alpn_len);
+	}
 #endif
 
 	if (conn_ctrl_ready(conn) && (connect->options & TCPCHK_OPT_LINGER) && !(conn->flags & CO_FL_FDLESS)) {
@@ -1442,7 +1513,8 @@ enum tcpcheck_eval_ret tcpcheck_eval_connect(struct check *check, struct tcpchec
 	 * is no alpn.
 	 */
 	if (!s || ((connect->options & TCPCHK_OPT_DEFAULT_CONNECT) && check->mux_proto) ||
-	    connect->mux_proto || (!connect->alpn && !check->alpn_str)) {
+	    connect->mux_proto ||
+	    (!conn_is_ssl(conn) || (!connect->alpn && !check->alpn_str && !s->ssl_ctx.alpn_str))) {
 		const struct mux_ops *mux_ops;
 
 		TRACE_DEVEL("try to install mux now", CHK_EV_TCPCHK_CONN, check);
@@ -1520,6 +1592,9 @@ enum tcpcheck_eval_ret tcpcheck_eval_connect(struct check *check, struct tcpchec
 
 	if (ret == TCPCHK_EVAL_CONTINUE && check->proxy->timeout.check)
 		check->task->expire = tick_add_ifset(now_ms, check->proxy->timeout.check);
+
+	if (auto_sni)
+		free_trash_chunk(auto_sni);
 
 	TRACE_LEAVE(CHK_EV_TCPCHK_CONN, check, 0, 0, (size_t[]){ret});
 	return ret;
@@ -3928,6 +4003,32 @@ static int check_proxy_tcpcheck(struct proxy *px)
 		chk->connect.options = (TCPCHK_OPT_DEFAULT_CONNECT|TCPCHK_OPT_IMPLICIT);
 		LIST_INSERT(px->tcpcheck_rules.list, &chk->list);
 	}
+
+	/* Now, back again on HTTP ruleset. Try to resolve the sni log-format
+	 * string if necessary, but onlu for implicit connect rules, by getting
+	 * it from the following send rule.
+	 */
+	if ((px->tcpcheck_rules.flags & TCPCHK_RULES_PROTO_CHK) == TCPCHK_RULES_HTTP_CHK) {
+		struct tcpcheck_connect *connect = NULL;
+
+		list_for_each_entry(chk, px->tcpcheck_rules.list, list) {
+			if (chk->action == TCPCHK_ACT_CONNECT && !chk->connect.sni &&
+			    (chk->connect.options & TCPCHK_OPT_IMPLICIT)) {
+				/* Only eval connect rule with no explici SNI */
+				connect = &chk->connect;
+			}
+			else if (connect && chk->action == TCPCHK_ACT_SEND) {
+				struct tcpcheck_http_hdr *hdr;
+
+				list_for_each_entry(hdr, &chk->send.http.hdrs, list) {
+					if (isteqi(hdr->name, ist("host")))
+						connect->sni_fmt = &hdr->value;
+				}
+				connect = NULL;
+			}
+		}
+	}
+
 
 	/* Remove all comment rules. To do so, when a such rule is found, the
 	 * comment is assigned to the following rule(s).

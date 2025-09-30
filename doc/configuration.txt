@@ -3,7 +3,7 @@
                           Configuration Manual
                          ----------------------
                               version 3.3
-                              2025/07/11
+                              2025/09/05
 
 
 This document covers the configuration language as implemented in the version
@@ -1272,8 +1272,8 @@ Four other directives are provided to report some status:
   - .warning "message" : emit this message at level WARNING
   - .alert "message"   : emit this message at level ALERT
 
-Messages emitted at level WARNING may cause the process to fail to start if the
-"strict-mode" is enabled. Messages emitted at level ALERT will always cause a
+Messages emitted at level WARNING may cause the process to fail to start if
+"zero-warning" is enabled. Messages emitted at level ALERT will always cause a
 fatal error. These can be used to detect some inappropriate conditions and
 provide advice to the user.
 
@@ -1514,6 +1514,11 @@ socket type and the transport method.
                the FD from the unix socket and uses it as if it were the FD
                of an accept(). Should be used carefully.
 
+               Bugs: This protocol is known to be unreliable on macOS because
+               of an issue in the macOS sendmsg(2) implementation. The
+               connection might not be accepted correctly.
+
+
 'unix@<path>'  following string is considered as a UNIX socket <path>. this
                prefix is useful to declare an UNIX socket path which don't
                start by slash '/'.
@@ -1744,6 +1749,7 @@ The following keywords are supported in the "global" section :
    - insecure-setuid-wanted
    - issuers-chain-path
    - key-base
+   - limited-quic
    - localpeer
    - log
    - log-send-hostname
@@ -1753,6 +1759,7 @@ The following keywords are supported in the "global" section :
    - lua-prepend-path
    - mworker-max-reloads
    - nbthread
+   - no-quic
    - node
    - numa-cpu-mapping
    - ocsp-update.disable
@@ -1817,6 +1824,7 @@ The following keywords are supported in the "global" section :
    - noevports
    - nogetaddrinfo
    - nokqueue
+   - noktls
    - nopoll
    - noreuseport
    - nosplice
@@ -1882,6 +1890,7 @@ The following keywords are supported in the "global" section :
    - tune.pool-low-fd-ratio
    - tune.pt.zero-copy-forwarding
    - tune.quic.cc-hystart
+   - tune.quic.cc.cubic.min-losses
    - tune.quic.disable-tx-pacing
    - tune.quic.disable-udp-gso
    - tune.quic.frontend.glitches-threshold
@@ -2763,11 +2772,21 @@ key-base <dir>
   ignore "key-base". This option only works with a crt-store load line.
 
 limited-quic
-  This setting must be used to explicitly enable the QUIC listener bindings when
-  haproxy is compiled against a TLS/SSL stack without QUIC support, typically
-  OpenSSL. It has no effect when haproxy is compiled against a TLS/SSL stack
-  with QUIC support, quictls for instance. Note that QUIC 0-RTT is not supported
-  when this setting is set.
+  This setting must be used to explicitly enable the QUIC listener bindings
+  when haproxy is compiled with a version of OpenSSL without QUIC support. It
+  activates an haproxy internal compatibility layer which must have been
+  selected at build time with USE_QUIC_OPENSSL_COMPAT=1. This compatibility
+  layer supports most of the necessary TLS operations, albeit without QUIC
+  0-RTT capability.
+
+  This feature is primarily targetted for OpenSSL prior to version 3.5.2, where
+  QUIC API was not implemented or only partially. The compatibility layer can
+  still be activated for version 3.5.2 and above, but this is probably
+  unnecessary.
+
+  If limited-quic is set but the compatibility layer was not selected at build
+  time, the option is silently ignored and QUIC TLS operations rely on the TLS
+  library.
 
 localpeer <name>
   Sets the local instance's peer name. It will be ignored if the "-L"
@@ -3090,6 +3109,34 @@ setenv <name> <value>
   is overwritten. The changes immediately take effect so that the next line in
   the configuration file sees the new value. See also "presetenv", "resetenv",
   and "unsetenv".
+
+shm-stats-file <name> [ EXPERIMENTAL ]
+  When this directive is set, it enables the use of shared memory for storing
+  stats counters. <name> is used as argument to shm_open() to open the shared
+  memory at a unique location. It also means that the directive is only
+  available on systems which support shm_open(). When SHM is used for stats, all
+  shareable counters for frontends, backends, listeners and servers will be
+  stored in the SHM, provided that they have a GUID set. When reloading haproxy,
+  new process will try to scan the SHM for objects that could be associated to
+  objects defined in the configuration based on GUID and type, the goal is to be
+  able to preserve some counters' values upon reload. On the other hand, when
+  haproxy is properly stopped, the SHM objects are released, which means counters
+  are effectively reset. It is also possible to manually remove the file before
+  starting a fresh process to force a reset.
+
+  See also "guid", "guid-prefix" and "shm-stats-file-max-objects"
+
+shm-stats-file-max-objects <number> [ EXPERIMENTAL ]
+  This setting defines the maximum number of objects the shared memory used
+  for shared counters will be able to store per thread group. It is directly
+  related to the maximum memory size of the shm and is used to "premap" the
+  shm to a given size in order to avoid runtime re-mapping. It defaults to 2k,
+  which should suit for most setups without risking unsuitable memory usage,
+  but can be easily changed if needed. haproxy will complain during startup if
+  this value is to low to register objects that are expected to be stored in
+  the shared memory. It is only relevant when "shm-stats-file" was defined.
+
+  See also "thread-groups"
 
 ssl-default-bind-ciphers <ciphers>
   This setting is only available when support for OpenSSL was built in. It sets
@@ -3787,6 +3834,10 @@ nokqueue
   Disables the use of the "kqueue" event polling system on BSD. It is
   equivalent to the command-line argument "-dk". The next polling system
   used will generally be "poll". See also "nopoll".
+
+noktls
+  Disables the use of ktls. It is equivalent to the command line argument
+  "-dT".
 
 nopoll
   Disables the use of the "poll" event polling system. It is equivalent to the
@@ -5969,7 +6020,7 @@ balance url_param <param> [check_post]
                 algorithms. Right now, only "url_param", "uri" and "log-hash"
                 support an optional argument.
 
-  The load balancing algorithm of a backend is set to roundrobin when no other
+  The load balancing algorithm of a backend is set to "random" when no other
   algorithm, mode nor option have been set. The algorithm may only be set once
   for each backend.
 
@@ -7310,7 +7361,7 @@ guid <string>
   types. Format is left unspecified to allow the user to select its naming
   policy. The only restriction is its length which cannot be greater than
   127 characters. All alphanumerical values and '.', ':', '-' and '_'
-  characters are valid.
+  characters are valid. See also "shm-stats-file".
 
 
 hash-balance-factor <factor>
@@ -8353,14 +8404,8 @@ http-send-name-header [<header>]
   very late in the connection setup, it may have unexpected effects on already
   modified headers. For example using it with transport-level header such as
   connection, content-length, transfer-encoding and so on will likely result in
-  invalid requests being sent to the server. Additionally it has been reported
-  that this directive is currently being used as a way to overwrite the Host
-  header field in outgoing requests; while this trick has been known to work
-  as a side effect of the feature for some time, it is not officially supported
-  and might possibly not work anymore in a future version depending on the
-  technical difficulties this feature induces. A long-term solution instead
-  consists in fixing the application which required this trick so that it binds
-  to the correct host name.
+  invalid requests being sent to the server. This is why following header names
+  are forbidden: host, content-length, transfer-encoding and connection.
 
   See also : "server"
 
@@ -8777,6 +8822,8 @@ log-steps <steps>
   used as-is in log-profiles (after 'on' directive). Combining "log-steps"
   with log-profiles is really interesting to have fine-grained control over
   logs automatically generated by haproxy during transaction processing.
+
+  This setting is only relevant on frontends, it is ignored on backends.
 
   See also : "log-profile"
 
@@ -12137,9 +12184,9 @@ stats admin { if | unless } <cond>
     # statistics admin level depends on the authenticated user
     userlist stats-auth
         group admin    users admin
-        user  admin    insecure-password AdMiN123
+        user  admin    insecure-password 'AdMiN123'
         group readonly users haproxy
-        user  haproxy  insecure-password haproxy
+        user  haproxy  insecure-password 'haproxy'
 
     backend stats_auth
         stats enable
@@ -12173,6 +12220,7 @@ ssl-f-use [<sslbindconf> ...]*
     - crl-file
     - curves
     - ecdhe
+    - ktls
     - no-alpn
     - no-ca-names
     - npn
@@ -12194,8 +12242,9 @@ ssl-f-use [<sslbindconf> ...]*
   Assignate a certificate <crtname> to a crt-list created automatically with the
   frontend name and prefixed by @ (ex: '@frontend1').
 
-  This implicit crt-list will be assigned to every "ssl" bind lines in a
-  frontend that does not already have the "crt" or the "crt-list" line.
+  This implicit crt-list will be assigned to every "ssl" bind lines in the
+  current frontend.
+
   crt-list commands from the stats socket are effective with this crt-list, so
   one could replace, remove or add certificates and SSL options to it.
 
@@ -16333,6 +16382,25 @@ ca-verify-file <cafile>
   be defined with intermediate certificates, and "ca-verify-file" with
   certificates to ending the chain, like root CA.
 
+cc <algo>
+  This setting is only available on systems which define TCP_CONGESTION, and
+  was validated on Linux and FreeBSD. It takes the name of a TCP congestion
+  control algorithm and configures the listener to use this algorithm on all
+  connections that are accepted from this listener. Typical names include
+  "reno", "cubic" and will depend on the operating system. On some systems,
+  special permissions may be required to configure certain algorithms. On
+  Linux, the list of available algorithms may be found in the sysctl
+  "net.ipv4.tcp_available_congestion_control", and the list of those permitted
+  without privileges is in "net.ipv4.tcp_allowed_congestion_control". In order
+  to access algorithms requiring extra permissions, the "cap_net_admin"
+  capability might be required (see "setcap" in the global section). In case of
+  failure to configure a specific congestion control algorithm, the default one
+  will remain unchanged and a warning will be emitted to report the problem.
+  See also: the "cc" server keyword (section 5.2). Example:
+
+    frontend public
+        bind :443 cc bbr   # use the BBR algorithm for high bandwidths
+
 ciphers <ciphers>
   This setting is only available when support for OpenSSL was built in. It sets
   the string describing the list of cipher algorithms ("cipher suite") that are
@@ -16599,9 +16667,13 @@ crt-list <file>
 
 default-crt <cert>
   This option does the same as the "crt" option, with the difference that this
-  certificate will be used as a default one. It is possible to add multiple
-  default certificates to have an ECDSA and an RSA one, having more is not
-  really useful.
+  certificate will be used as a default one as well. It is possible to add
+  multiple default certificates to have an ECDSA and an RSA one, having more is
+  not really useful.
+
+  This option does not disable implicit default certificates, if a 'crt'
+  certificate is declared first before any 'default-crt' or other 'crt' it will
+  still be used as a default certificate.
 
   A default certificate is used when no "strict-sni" option is used on the bind
   line. A default certificate is provided when the servername extension was not
@@ -16610,7 +16682,11 @@ default-crt <cert>
 
   Example:
 
+     # this bind line has 2 default certificates
      bind *:443 default-crt foobar.pem.rsa default-crt foobar.pem.ecdsa crt website.pem.rsa
+
+     # this bind line has 3 default certificates
+     bind *:443 crt website.pem.rsa default-crt foobar.pem.rsa default-crt foobar.pem.ecdsa
 
   See also the "crt" keyword.
 
@@ -16681,8 +16757,12 @@ generate-certificates
   name mismatch on the certificate presented to the client. With this option
   enabled, HAProxy will try to forge a certificate using the SNI hostname
   indicated by the client. This is done only if no certificate matches the SNI
-  hostname (see 'crt-list'). If an error occurs, the default certificate is
-  used, else the 'strict-sni' option is set.
+  hostname (see 'crt-list').
+
+  In the event of a certificate generation error, the connection will fall back
+  on the default certificate. When using 'strict-sni', the default certificate
+  will not be used and the connection will result in a handshake failure.
+
   It can also be used when HAProxy is configured as a reverse proxy to ease the
   deployment of an architecture with many backends.
 
@@ -16710,6 +16790,7 @@ guid-prefix <string>
   allocated on this bind line. Prefix will be concatenated to listeners
   position index on the current bind line, with character '-' as separator. See
   "guid" proxy keyword description for more information on its format.
+  See also "shm-stats-file".
 
 id <id>
   Fixes the socket ID. By default, socket IDs are automatically assigned, but
@@ -16746,6 +16827,11 @@ interface <interface>
   This can prove useful to address asymmetric routing issues when the same
   client IP addresses need to be able to reach frontends hosted on different
   interfaces.
+
+ktls <on|off> [ EXPERIMENTAL ]
+  Enables or disables ktls for those sockets. If enabled, kTLS will be used
+  if the kernel supports it and the cipher is compatible. This is only
+  available on Linux kernel 4.17 and above.
 
 label <label>
   Sets an optional label for these sockets. It could be used group sockets by
@@ -17449,6 +17535,22 @@ ca-file <cafile>
   could be used in place of the cafile. The location of this directory could be
   overwritten by setting the SSL_CERT_DIR environment variable.
 
+cc <algo>
+  May be used in the following contexts: tcp, http, log, peers, ring
+
+  This setting is only available on systems which define TCP_CONGESTION, and
+  was validated on Linux and FreeBSD. It takes the name of a TCP congestion
+  control algorithm and configures outgoing connections to use this algorithm.
+  Typical names include "reno" or "cubic" and will depend on the operating
+  system. On some systems, special permissions may be required to configure
+  certain algorithms. On Linux, available algorithms are listed in sysctl
+  "net.ipv4.tcp_available_congestion_control", and those permitted without
+  privileges are in "net.ipv4.tcp_allowed_congestion_control". In order to
+  access algorithms requiring extra permissions, the "cap_net_admin" capability
+  might be required (see "setcap" in the global section). In case of failure to
+  configure a specific congestion control algorithm, the default one remains
+  unchanged. See also: the "cc" bind keyword (section 5.1).
+
 check
   May be used in the following contexts: tcp, http, log
 
@@ -17577,6 +17679,28 @@ check-proto <name>
   Idea behind this option is to bypass the selection of the best multiplexer's
   protocol for health-check connections established to this server.
   If not defined, the server one will be used, if set.
+
+check-sni-auto
+  May be used in the following contexts: tcp, http, log
+
+  This option enables the automatic SNI selection when doing health checks over
+  SSL, if no value was already set. It is enabled by default but this parameter
+  may be used as "server" setting to reset any "no-check-sni-auto" setting
+  which would have been inherited from "default-server" directive as default
+  value. It may also be used as "default-server" setting to reset any previous
+  "default-server" "no-check-sni-auto" setting.
+
+  For HTTPS connections, the SNI is automatically selected but only if there is
+  no "http-check connect" rule. In that case, the selected SNI is based on the
+  host header value, specified via the "option httpchk" directive or a
+  "http-check send" rule. There is no automatic selection for "http-check
+  connect" rules. For other protocols, the option is ignored.
+
+  If the automatic selection of the SNI is used for health-checks, the value is
+  assigned to the connection name if "check-reuse-pool" setting is set, unless
+  overridden by the "check-pool-conn-name" server keyword.
+
+  See "sni-auto" option to enable automatic SNI selection for proxied traffic.
 
 check-sni <sni>
   May be used in the following contexts: tcp, http, log
@@ -17754,7 +17878,8 @@ guid <string>
 
   Specify a case-sensitive global unique ID for this server. This must be
   unique across all haproxy configuration on every object types. See "guid"
-  proxy keyword description for more information on its format.
+  proxy keyword description for more information on its format. See also
+  "shm-stats-file".
 
 hash-key <key>
   May be used in the following contexts: tcp, http, log
@@ -17920,6 +18045,13 @@ init-state { fully-up | up | down | fully-down }
 
 See also: "option tcp-check", "option httpchk"
 
+ktls <on|off> [ EXPERIMENTAL ]
+  May be used in the following contexts: tcp, http, log, peers, ring
+
+  Enables or disables ktls for those sockets. If enabled, kTLS will be used
+  if the kernel supports it and the cipher is compatible.
+  This is only available on Linux.
+
 log-bufsize <bufsize>
   May be used in the following contexts: log
 
@@ -18064,6 +18196,15 @@ no-check-reuse-pool
   This option reverts any previous "check-reuse-pool" possibly inherited from a
   "default-server". Any checks will be conducted on its dedicated connection.
 
+no-check-sni-auto
+  May be used in the following contexts: tcp, http, log
+
+  This option may be used as "server" setting to disable the automatic SNI
+  selection for SSL health checks which is enabled by default.
+
+  See "no-sni-auto" option to disable automatic SNI selection for proxied
+  traffic.
+
 no-check-ssl
   May be used in the following contexts: tcp, http, log
 
@@ -18123,6 +18264,15 @@ no-send-proxy-v2-ssl-cn
   default value.
   It may also be used as "default-server" setting to reset any previous
   "default-server" "send-proxy-v2-ssl-cn" setting.
+
+no-sni-auto
+  May be used in the following contexts: tcp, http, log, peers, ring
+
+  This option may be used as "server" setting to disable the automatic SNI
+  selection which is enabled by default.
+
+  See "no-check-sni-auto" option to disable automatic SNI selection for SSL
+  health checks.
 
 no-ssl
   May be used in the following contexts: tcp, http, log, peers, ring
@@ -18690,6 +18840,27 @@ sni <expression>
 
   By default, the SNI is assigned to the connection name for "http-reuse",
   unless overridden by the "pool-conn-name" server keyword.
+
+sni-auto
+  May be used in the following contexts: tcp, http, log, peers, ring
+
+  The "sni-auto" parameter enables the automatic SNI selection, if no value was
+  already set. It is enabled by default but this parameter may be used as
+  "server" setting to reset any "no-sni-auto" setting which would have been
+  inherited from "default-server" directive as default value.  It may also be
+  used as "default-server" setting to reset any previous "default-server"
+  "no-sni-auto" setting.
+
+  For HTTPS connections, the selected SNI is based on the request host header
+  value, if found. Otherwise it remains unset. For other protocols, the option
+  is ignored.
+
+  If the automatic selection of the SNI is used, the value is assigned to the
+  connection name for "http-reuse", unless overridden by the "pool-conn-name"
+  server keyword.
+
+  See "check-sni-auto" option to enable automatic SNI selection for SSL health
+  checks.
 
 source <addr>[:<pl>[-<ph>]] [usesrc { <addr2>[:<port2>] | client | clientip } ]
 source <addr>[:<port>] [usesrc { <addr2>[:<port2>] | hdr_ip(<hdr>[,<occ>]) } ]
@@ -19431,7 +19602,10 @@ obvious matching method (e.g. string or binary). When "-m" is specified and
 followed by a pattern matching method name, this method is used instead of the
 default one for the criterion. This makes it possible to match contents in ways
 that were not initially planned, or with sample fetch methods which return a
-string. The matching method also affects the way the patterns are parsed.
+string. The matching method also affects the way the patterns are parsed. So,
+it must not be used with sample fetches with a matching suffix (_beg, _end,
+_sub...). In addition, specifying several "-m" pattern matching methods is now
+allowed.
 
 The "-n" flag forbids the dns resolutions. It is used with the load of ip files.
 By default, if the parser cannot parse ip address it considers that the parsed
@@ -19894,8 +20068,10 @@ aes_gcm_dec(bits,nonce,key,aead_tag)               binary       binary
 aes_gcm_enc(bits,nonce,key,aead_tag)               binary       binary
 and(value)                                         integer      integer
 b64dec                                             string       binary
+base2                                              binary       string
 base64                                             binary       string
 be2dec(separator,chunk_size[,truncate])            binary       string
+le2dec(separator,chunk_size[,truncate])            binary       string
 be2hex([separator[,chunk_size[,truncate]]])        binary       string
 bool                                               integer      boolean
 bytes(offset[,length])                             binary       binary
@@ -19968,6 +20144,7 @@ secure_memcmp(var)                                 string       boolean
 set-var(var[,cond...])                              any          same
 sha1                                               binary       binary
 sha2([bits])                                       binary       binary
+srv_is_up                                          string       boolean
 srv_queue                                          string       integer
 strcmp(var)                                        string       boolean
 sub(value)                                         integer      integer
@@ -20117,6 +20294,12 @@ b64dec
   For base64url("URL and Filename Safe Alphabet" (RFC 4648)) variant
   see "ub64dec".
 
+base2
+  Converts a binary input sample to a binary string containing eight binary
+  digits per input byte. It is used to be able to perform longest prefix match
+  on types where the native representation does not allow prefix matching, for
+  example IP prefixes.
+
 base64
   Converts a binary input sample to a base64 string. It is used to log or
   transfer binary content in a way that can be reliably transferred (e.g.
@@ -20135,6 +20318,19 @@ be2dec(<separator>,<chunk_size>[,<truncate>])
       bin(01020304050607),be2dec(-,2,1) # 258-772-1286
       bin(01020304050607),be2dec(,2,1)  # 2587721286
       bin(7f000001),be2dec(.,1)         # 127.0.0.1
+
+le2dec(<separator>,<chunk_size>[,<truncate>])
+  Converts little-endian binary input sample to a string containing an unsigned
+  integer number per <chunk_size> input bytes. <separator> is inserted every
+  <chunk_size> binary input bytes if specified. The <truncate> flag indicates
+  whether the binary input is truncated at <chunk_size> boundaries. The maximum
+  value for <chunk_size> is limited by the size of long long int (8 bytes).
+
+  Example:
+      bin(01020304050607),le2dec(:,2)   # 513:1284:2055:7
+      bin(01020304050607),le2dec(-,2,1) # 513-1284-2055
+      bin(01020304050607),le2dec(,2,1)  # 51312842055
+      bin(7f000001),le2dec(.,1)         # 127.0.0.1
 
 be2hex([<separator>[,<chunk_size>[,<truncate>]]])
   Converts big-endian binary input sample to a hex string containing two hex
@@ -20539,52 +20735,78 @@ jwt_payload_query([<json_path>[,<output_type>]])
   compiled with USE_OPENSSL.
 
 jwt_verify(<alg>,<key>)
+
   Performs a signature verification for the JSON Web Token (JWT) given in input
-  by using the <alg> algorithm and the <key> parameter, which should either
-  hold a secret, a path to a public key or a path to a public certificate. When
-  using a public key, it should either be in the PKCS#1 format (for RSA keys,
-  starting with BEGIN RSA PUBLIC KEY) or SPKI format (Subject Public Key Info,
-  starting with BEGIN PUBLIC KEY). Certificates should be a regular PEM
-  certificate (starting with BEGIN CERTIFICATE). If a full-on certificate is
-  used, it can either be used directly in the converter or passed via a
-  variable if it was already known by haproxy (previously loaded in a crt-store
-  for instance).
-  Returns 1 in case of verification success, 0 in case of verification failure
-  and a strictly negative value for any other error. Because of all those
-  non-null error return values, the result of this converter should never be
-  converted to a boolean. See below for a full list of the possible return
-  values.
-
+  by using the <alg> algorithm and the <key> parameter.
   For now, only JWS tokens using the Compact Serialization format can be
-  processed (three dot-separated base64-url encoded strings). All the
-  algorithms mentioned in section 3.1 of RFC7518 are managed (HS, ES, RS and PS
-  with the 256, 384 or 512 key sizes, as well as the special "none" case).
-
-  If the used algorithm is of the HMAC family, <key> should be the secret used
-  in the HMAC signature calculation. Otherwise, <key> should be the path to the
-  public key or certificate that can be used to validate the token's signature.
-  All the public keys and certificates that might be used to verify JWTs must
-  be known during init in order to be added into a dedicated cache so that no
-  disk access is required during runtime. For this reason, any used public key
-  must be mentioned explicitly at least once in a jwt_verify call and every
-  certificate used must be loaded by haproxy (in a crt-store or mentioned
-  explicitly in a 'jwt_verify' call). Passing a variable as second parameter is
-  then not advised unless you only use certificates that fill one of those
-  prerequisites.
-
+  processed (three dot-separated base64-url encoded strings).
   This converter only verifies the signature of the token and does not perform
   a full JWT validation as specified in section 7.2 of RFC7519. We do not
   ensure that the header and payload contents are fully valid JSONs once
   decoded for instance, and no checks are performed regarding their respective
   contents.
 
+  - <alg> can be either a string or a variable name (See also "set-var") that
+    holds the name of the algorithm used to verify.
+
+    Algorithms mentioned in section 3.1 of RFC7518 are managed:
+
+   +--------------+---------------------------------------------------------+
+   | "alg" Param  | Digital Signature or MAC Algorithm                      |
+   | Value        |                                                         |
+   +--------------+---------------------------------------------------------+
+   | HS256        | HMAC using SHA-256                                      |
+   | HS384        | HMAC using SHA-384                                      |
+   | HS512        | HMAC using SHA-512                                      |
+   | RS256        | RSASSA-PKCS1-v1_5 using SHA-256                         |
+   | RS384        | RSASSA-PKCS1-v1_5 using SHA-384                         |
+   | RS512        | RSASSA-PKCS1-v1_5 using SHA-512                         |
+   | ES256        | ECDSA using P-256 and SHA-256                           |
+   | ES384        | ECDSA using P-384 and SHA-384                           |
+   | ES512        | ECDSA using P-521 and SHA-512                           |
+   | PS256        | RSASSA-PSS using SHA-256 and MGF1 with SHA-256          |
+   | PS384        | RSASSA-PSS using SHA-384 and MGF1 with SHA-384          |
+   | PS512        | RSASSA-PSS using SHA-512 and MGF1 with SHA-512          |
+   | none         | No digital signature or MAC performed                   |
+   +--------------+---------------------------------------------------------+
+
+  - <key> can be either a string or a variable name (See also "set-var") that
+    holds a secret, a public key path or a certificate path.
+
+    Secrets are only applicable when using HMAC algorithms.
+
+    Public keys must be in either the PKCS#1 format (for RSA keys, starting
+    with BEGIN RSA PUBLIC KEY) or SPKI format (Subject Public Key Info,
+    starting with BEGIN PUBLIC KEY). Public keys must be available during the
+    configuration parsing and cannot be updated or loaded at runtime unlike
+    certificates.
+
+    Certificates must be standard PEM certificates (starting with BEGIN
+    CERTIFICATE). When using a certificate its path can be passed directly to
+    the converter or referenced via a variable. Certificates can be either
+    declared in a crt-store, or dynamically loaded via the stats socket.
+
+    All the public keys and certificates that might be used to verify JWTs must
+    be known during init in order to be added into a dedicated cache so that no
+    disk access is required during runtime.
+
+    It is possible to update certificates dynamically and add new certificates
+    using the stats socket. See also "set ssl cert" and "new ssl cert" in the
+    management guide.
+
+  Returns 1 in case of verification success, 0 in case of verification failure
+  and a strictly negative value for any other error. Because of all those
+  non-null error return values, the result of this converter should never be
+  converted to a boolean. See below for a full list of the possible return
+  values.
+
   The possible return values are the following :
 
   +----+----------------------------------------------------------------------+
   | ID | message                                                              |
   +----+----------------------------------------------------------------------+
-  |  0 | "Verification failure"                                               |
   |  1 | "Verification success"                                               |
+  |  0 | "Verification failure"                                               |
   | -1 | "Unknown algorithm (not mentioned in RFC7518)"                       |
   | -2 | "Unmanaged algorithm"                                                |
   | -3 | "Invalid token"                                                      |
@@ -21184,12 +21406,25 @@ sha2([<bits>])
   Please note that this converter is only available when HAProxy has been
   compiled with USE_OPENSSL.
 
+srv_is_up
+  Takes an input value of type string, either a server name or <backend>/<server>
+  format and returns true when the designated server is currently UP. Can be used
+  in places where we want to look up a server status from a dynamic name, like a
+  cookie value (e.g. req.cook(SRVID),srv_is_up) and then make a decision to
+  direct a request elsewhere. Before using this, please keep in mind that using
+  this converter on uncontrolled data might allow an external observer to query
+  the state of any server in the whole configuration, which might possibly not
+  be acceptable in some environments.
+
 srv_queue
   Takes an input value of type string, either a server name or <backend>/<server>
   format and returns the number of queued streams on that server. Can be used
   in places where we want to look up queued streams from a dynamic name, like a
   cookie value (e.g. req.cook(SRVID),srv_queue) and then make a decision to break
-  persistence or direct a request elsewhere.
+  persistence or direct a request elsewhere. Before using this, please keep in
+  mind that using this converter on uncontrolled data might allow an external
+  observer to query the state of any server in the whole configuration, which
+  might possibly not be acceptable in some environments.
 
 strcmp(<var>)
   Compares the contents of <var> with the input value of type string. Returns
@@ -25393,6 +25628,9 @@ base : string
     base_reg : regex match
     base_sub : substring match
 
+  Note: ACL derivatives must not be used followed by a converter or in ACLs
+        with a "-m" pattern matching method.
+
 base32 : integer
   This returns a 32-bit hash of the value returned by the "base" fetch method
   above. This is useful to track per-URL activity on high traffic sites without
@@ -25551,6 +25789,9 @@ path : string
     path_reg : regex match
     path_sub : substring match
 
+  Note: ACL derivatives must not be used followed by a converter or in ACLs
+        with a "-m" pattern matching method.
+
 pathq : string
   This extracts the request's URL path with the query-string, which starts at
   the first slash. This sample fetch is pretty handy to always retrieve a
@@ -25627,6 +25868,9 @@ cook([<name>]) : string (deprecated)
     req.cook_reg([<name>]) : regex match
     req.cook_sub([<name>]) : substring match
 
+  Note: ACL derivatives must not be used followed by a converter or in ACLs
+        with a "-m" pattern matching method.
+
 req.cook_cnt([<name>]) : integer
 cook_cnt([<name>]) : integer (deprecated)
   Returns an integer value representing the number of occurrences of the cookie
@@ -25694,6 +25938,9 @@ req.hdr([<name>[,<occ>]]) : string
     hdr_len([<name>[,<occ>]]) : length match
     hdr_reg([<name>[,<occ>]]) : regex match
     hdr_sub([<name>[,<occ>]]) : substring match
+
+  Note: ACL derivatives must not be used followed by a converter or in ACLs
+        with a "-m" pattern matching method.
 
 req.hdr_cnt([<name>]) : integer
 hdr_cnt([<header>]) : integer (deprecated)
@@ -25929,6 +26176,9 @@ shdr([<name>[,<occ>]]) : string (deprecated)
     res.hdr_reg([<name>[,<occ>]]) : regex match
     res.hdr_sub([<name>[,<occ>]]) : substring match
 
+  Note: ACL derivatives must not be used followed by a converter or in ACLs
+        with a "-m" pattern matching method.
+
 res.hdr_cnt([<name>]) : integer
 shdr_cnt([<name>]) : integer (deprecated)
   This fetch works like the req.hdr_cnt() fetch with the difference that it
@@ -26067,6 +26317,9 @@ url : string
     url_reg : regex match
     url_sub : substring match
 
+  Note: ACL derivatives must not be used followed by a converter or in ACLs
+        with a "-m" pattern matching method.
+
 url32 : integer
   This returns a 32-bit hash of the value obtained by concatenating the first
   Host header and the whole URL including parameters (not only the path part of
@@ -26114,6 +26367,8 @@ url_param([<name>[,<delim>[,i]]]) : string
     urlp_reg(<name>[,<delim>]) : regex match
     urlp_sub(<name>[,<delim>]) : substring match
 
+  Note: ACL derivatives must not be used followed by a converter or in ACLs
+        with a "-m" pattern matching method.
 
   Example :
       # match http://example.com/foo?PHPSESSIONID=some_id
@@ -29780,22 +30035,26 @@ user <username> [password|insecure-password <password>]
   slower than their glibc counterparts when calculating hashes, so you might
   want to consider this aspect too.
 
+  All passwords are considered normal arguments and are therefor subject to
+  regular section 2.2 Quoting and escaping. Single quoting passwords is
+  therefor recommended.
+
   Example:
         userlist L1
           group G1 users tiger,scott
           group G2 users xdb,scott
 
           user tiger password $6$k6y3o.eP$JlKBx9za9667qe4(...)xHSwRv6J.C0/D7cV91
-          user scott insecure-password elgato
-          user xdb insecure-password hello
+          user scott insecure-password 'elgato'
+          user xdb insecure-password 'hello'
 
         userlist L2
           group G1
           group G2
 
           user tiger password $6$k6y3o.eP$JlKBx(...)xHSwRv6J.C0/D7cV91 groups G1
-          user scott insecure-password elgato groups G1,G2
-          user xdb insecure-password hello groups G2
+          user scott insecure-password 'elgato' groups G1,G2
+          user xdb insecure-password 'hello' groups G2
 
   Please note that both lists are functionally identical.
 
@@ -30413,8 +30672,8 @@ bits <number>
   but blocking the traffic too long could trigger the watchdog.)
 
 challenge <string>
-  Takes a challenge type as parameter, this must be HTTP-01 or DNS-01. When not
-  used the default is HTTP-01.
+  Takes a challenge type as parameter, this must be http-01 or dns-01. When not
+  used the default is http-01.
 
 contact <string>
   The contact email that will be associated to the account key in the CA.
@@ -30440,6 +30699,19 @@ map <map>
   account used. The acme task will add entries before validating the challenge
   and will remove the entries at the end of the task.
 
+reuse-key { on | off }
+  If set to "on", HAProxy won't generate a new private key and will keep the
+  previous one. Rotating private keys is recommended, when enabling this option
+  it is recommended to regenerate manually the keys regularly.
+
+  This option might be useful when using RSA keys bigger than 2048 that can
+  take time to generate and might slow down one thread doing so.
+
+  Using the same key can be useful when using the cache of your ACME server, it
+  can help to retrieve a valid certificate corresponding to the current key.
+
+  The default setting is "off".
+
 Example:
 
   global
@@ -30457,7 +30729,7 @@ Example:
       directory https://acme-staging-v02.api.letsencrypt.org/directory
       account-key /etc/haproxy/letsencrypt.account.key
       contact john.doe@example.com
-      challenge HTTP-01
+      challenge http-01
       keytype RSA
       bits 2048
       map virt@acme
@@ -30466,7 +30738,7 @@ Example:
       directory https://acme-staging-v02.api.letsencrypt.org/directory
       account-key /etc/haproxy/letsencrypt.account.key
       contact john.doe@example.com
-      challenge HTTP-01
+      challenge http-01
       keytype ECDSA
       curves P-384
       map virt@acme

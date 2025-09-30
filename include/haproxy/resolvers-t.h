@@ -133,6 +133,7 @@ struct resolv_answer_item {
 struct resolv_response {
 	struct dns_header header;
 	struct eb_root    answer_tree;
+	struct eb32_node *next; /* node to start eval on the next lookup to perform a round robin selection on entries (may be NULL) */
 	/* authority ignored for now */
 };
 
@@ -296,7 +297,7 @@ struct resolv_srvrq {
 	int                   hostname_dn_len;  /* string length of the server hostname in Domain Name format */
 	struct resolv_requester *requester;     /* used to link to its DNS resolution */
 	struct list attached_servers;           /* List of the servers free to use */
-	struct eb_root named_servers;           /* tree of servers indexed by hostnames found in server state file */
+	struct ceb_root *named_servers;         /* tree of servers indexed by hostnames found in server state file */
 	struct list list;                       /* Next SRV RQ for the same proxy */
 };
 

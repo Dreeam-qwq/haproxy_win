@@ -18,7 +18,7 @@
 #include <ctype.h>
 #include <sys/types.h>
 
-#include <import/ebmbtree.h>
+#include <import/ceb64_tree.h>
 
 #include <haproxy/api.h>
 #include <haproxy/acl.h>
@@ -660,7 +660,7 @@ int assign_server(struct stream *s)
 				list_for_each_entry(conn, &pconns->conn_list, sess_el) {
 					if (!(conn->flags & CO_FL_WAIT_XPRT)) {
 						srv = tmpsrv;
-						s->target = &srv->obj_type;
+						stream_set_srv_target(s, srv);
 						if (conn->flags & CO_FL_SESS_IDLE) {
 							conn->flags &= ~CO_FL_SESS_IDLE;
 							s->sess->idle_conns--;
@@ -825,10 +825,12 @@ int assign_server(struct stream *s)
 			goto out;
 		}
 		else if (srv != prev_srv) {
-			_HA_ATOMIC_INC(&s->be->be_counters.shared->tg[tgid - 1]->cum_lbconn);
-			_HA_ATOMIC_INC(&srv->counters.shared->tg[tgid - 1]->cum_lbconn);
+			if (s->be_tgcounters)
+				_HA_ATOMIC_INC(&s->be_tgcounters->cum_lbconn);
+			if (srv->counters.shared.tg[tgid - 1])
+				_HA_ATOMIC_INC(&srv->counters.shared.tg[tgid - 1]->cum_lbconn);
 		}
-		s->target = &srv->obj_type;
+		stream_set_srv_target(s, srv);
 	}
 	else if (s->be->options & (PR_O_DISPATCH | PR_O_TRANSP)) {
 		s->target = &s->be->obj_type;
@@ -1000,11 +1002,15 @@ int assign_server_and_queue(struct stream *s)
 					s->txn->flags |= TX_CK_DOWN;
 				}
 				s->flags |= SF_REDISP;
-				_HA_ATOMIC_INC(&prev_srv->counters.shared->tg[tgid - 1]->redispatches);
-				_HA_ATOMIC_INC(&s->be->be_counters.shared->tg[tgid - 1]->redispatches);
+				if (prev_srv->counters.shared.tg[tgid - 1])
+					_HA_ATOMIC_INC(&prev_srv->counters.shared.tg[tgid - 1]->redispatches);
+				if (s->be_tgcounters)
+					_HA_ATOMIC_INC(&s->be_tgcounters->redispatches);
 			} else {
-				_HA_ATOMIC_INC(&prev_srv->counters.shared->tg[tgid - 1]->retries);
-				_HA_ATOMIC_INC(&s->be->be_counters.shared->tg[tgid - 1]->retries);
+				if (prev_srv->counters.shared.tg[tgid - 1])
+					_HA_ATOMIC_INC(&prev_srv->counters.shared.tg[tgid - 1]->retries);
+				if (s->be_tgcounters)
+					_HA_ATOMIC_INC(&s->be_tgcounters->retries);
 			}
 		}
 	}
@@ -1154,7 +1160,8 @@ int assign_server_and_queue(struct stream *s)
 					pool_free(pool_head_pendconn, p);
 
 					s->flags |= SF_ASSIGNED;
-					s->target = &newserv->obj_type;
+					stream_set_srv_target(s, newserv);
+
 					s->pend_pos = NULL;
 					sess_change_server(s, newserv);
 					return SRV_STATUS_OK;
@@ -1312,7 +1319,7 @@ struct connection *conn_backend_get(int reuse_mode,
 	HA_SPIN_LOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
 	conn = srv_lookup_conn(is_safe ? &srv->per_thr[tid].safe_conns : &srv->per_thr[tid].idle_conns, hash);
 	if (conn)
-		conn_delete_from_tree(conn);
+		conn_delete_from_tree(conn, tid);
 
 	/* If we failed to pick a connection from the idle list, let's try again with
 	 * the safe list.
@@ -1320,7 +1327,7 @@ struct connection *conn_backend_get(int reuse_mode,
 	if (!conn && !is_safe && srv->curr_safe_nb > 0) {
 		conn = srv_lookup_conn(&srv->per_thr[tid].safe_conns, hash);
 		if (conn) {
-			conn_delete_from_tree(conn);
+			conn_delete_from_tree(conn, tid);
 			is_safe = 1;
 		}
 	}
@@ -1360,37 +1367,36 @@ struct connection *conn_backend_get(int reuse_mode,
 check_tgid:
 	i = stop;
 	do {
+		/* safe requests looked up conns in idle tree first, then safe
+		 * tree; unsafe requests are looked up in the safe conns tree.
+		 */
+		int search_tree = is_safe ? 1 : 0; // 0 = idle, 1 = safe
+		struct ceb_root **tree;
+
 		if (!srv->curr_idle_thr[i] || i == tid)
 			continue;
 
 		if (HA_SPIN_TRYLOCK(IDLE_CONNS_LOCK, &idle_conns[i].idle_conns_lock) != 0)
 			continue;
-		conn = srv_lookup_conn(is_safe ? &srv->per_thr[i].safe_conns : &srv->per_thr[i].idle_conns, hash);
-		while (conn) {
-			if (conn->mux->takeover && conn->mux->takeover(conn, i, 0) == 0) {
-				conn_delete_from_tree(conn);
-				_HA_ATOMIC_INC(&activity[tid].fd_takeover);
-				found = 1;
-				break;
-			}
 
-			conn = srv_lookup_conn_next(conn);
-		}
+		do {
+			if ((search_tree && !srv->curr_safe_nb) ||
+			    (!search_tree && !srv->curr_idle_nb))
+				continue;
 
-		if (!found && !is_safe && srv->curr_safe_nb > 0) {
-			conn = srv_lookup_conn(&srv->per_thr[i].safe_conns, hash);
+			tree = search_tree ? &srv->per_thr[i].safe_conns : &srv->per_thr[i].idle_conns;
+			conn = srv_lookup_conn(tree, hash);
 			while (conn) {
 				if (conn->mux->takeover && conn->mux->takeover(conn, i, 0) == 0) {
-					conn_delete_from_tree(conn);
+					conn_delete_from_tree(conn, i);
 					_HA_ATOMIC_INC(&activity[tid].fd_takeover);
 					found = 1;
-					is_safe = 1;
 					break;
 				}
-
-				conn = srv_lookup_conn_next(conn);
+				conn = srv_lookup_conn_next(tree, conn);
 			}
-		}
+		} while (!found && ++search_tree <= 1);
+
 		HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[i].idle_conns_lock);
 	} while (!found && (i = (i + 1 == curtg->base + curtg->count) ? curtg->base : i + 1) != stop);
 
@@ -1424,7 +1430,7 @@ check_tgid:
 		if (reuse_mode == PR_O_REUSE_SAFE && conn->mux->flags & MX_FL_HOL_RISK) {
 			/* attach the connection to the session private list */
 			conn->owner = sess;
-			session_add_conn(sess, conn, conn->target);
+			session_add_conn(sess, conn);
 		}
 		else {
 			srv_add_to_avail_list(srv, conn);
@@ -1477,20 +1483,17 @@ static int do_connect_server(struct stream *s, struct connection *conn)
  * if any.
  */
 static struct connection *
-takeover_random_idle_conn(struct eb_root *root, int curtid)
+takeover_random_idle_conn(struct ceb_root **root, int curtid)
 {
-	struct conn_hash_node *hash_node;
 	struct connection *conn = NULL;
-	struct eb64_node *node = eb64_first(root);
 
-	while (node) {
-		hash_node = eb64_entry(node, struct conn_hash_node, node);
-		conn = hash_node->conn;
-		if (conn && conn->mux->takeover && conn->mux->takeover(conn, curtid, 0) == 0) {
-			conn_delete_from_tree(conn);
+	conn = ceb64_item_first(root, hash_node.node, hash_node.key, struct connection);
+	while (conn) {
+		if (conn->mux->takeover && conn->mux->takeover(conn, curtid, 1) == 0) {
+			conn_delete_from_tree(conn, curtid);
 			return conn;
 		}
-		node = eb64_next(node);
+		conn = ceb64_item_next(root, hash_node.node, hash_node.key, conn);
 	}
 
 	return NULL;
@@ -1696,7 +1699,7 @@ int be_reuse_connection(int64_t hash, struct session *sess,
 		 * Idle conns are necessarily looked up on the same thread so
 		 * that there is no concurrency issues.
 		 */
-		if (!eb_is_empty(&srv->per_thr[tid].avail_conns)) {
+		if (!ceb_isempty(&srv->per_thr[tid].avail_conns)) {
 			srv_conn = srv_lookup_conn(&srv->per_thr[tid].avail_conns, hash);
 			if (srv_conn) {
 				/* connection cannot be in idle list if used as an avail idle conn. */
@@ -1744,7 +1747,7 @@ int be_reuse_connection(int64_t hash, struct session *sess,
 			if (avail <= 1) {
 				/* no more streams available, remove it from the list */
 				HA_SPIN_LOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
-				conn_delete_from_tree(srv_conn);
+				conn_delete_from_tree(srv_conn, tid);
 				HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
 			}
 
@@ -1792,7 +1795,8 @@ int connect_server(struct stream *s)
 	struct server *srv;
 	int reuse_mode;
 	int reuse __maybe_unused = 0;
-	int init_mux = 0;
+	int may_use_early_data __maybe_unused = 1; // are we allowed to use early data ?
+	int may_start_mux_now = 1; // are we allowed to start the mux now ?
 	int err;
 	struct sockaddr_storage *bind_addr = NULL;
 	int64_t hash = 0;
@@ -1840,6 +1844,7 @@ int connect_server(struct stream *s)
 		if (err == SF_ERR_NONE) {
 			srv_conn = sc_conn(s->scb);
 			reuse = 1;
+			may_start_mux_now = 0;
 		}
 	}
 
@@ -1850,7 +1855,7 @@ int connect_server(struct stream *s)
 		HA_SPIN_LOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
 		if (!LIST_ISEMPTY(&srv->per_thr[tid].idle_conn_list)) {
 			tokill_conn = LIST_ELEM(srv->per_thr[tid].idle_conn_list.n, struct connection *, idle_list);
-			conn_delete_from_tree(tokill_conn);
+			conn_delete_from_tree(tokill_conn, tid);
 			HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
 
 			/* Release the idle lock before calling mux->destroy.
@@ -1879,7 +1884,7 @@ int connect_server(struct stream *s)
 
 				if (!LIST_ISEMPTY(&srv->per_thr[i].idle_conn_list)) {
 					tokill_conn = LIST_ELEM(srv->per_thr[i].idle_conn_list.n, struct connection *, idle_list);
-					conn_delete_from_tree(tokill_conn);
+					conn_delete_from_tree(tokill_conn, i);
 				}
 				HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[i].idle_conns_lock);
 
@@ -1973,7 +1978,7 @@ int connect_server(struct stream *s)
 				srv_conn->flags |= CO_FL_OPT_TOS;
 			}
 
-			srv_conn->hash_node->node.key = hash;
+			srv_conn->hash_node.key = hash;
 		} else if (srv && (srv->flags & SRV_F_STRICT_MAXCONN))
 			_HA_ATOMIC_DEC(&srv->curr_total_conns);
 	}
@@ -1984,6 +1989,35 @@ int connect_server(struct stream *s)
 	/* srv_conn is still NULL only on allocation failure */
 	if (!srv_conn)
 		return SF_ERR_RESOURCE;
+
+#if defined(HAVE_SSL_0RTT)
+	/* We may be allowed to use 0-RTT involving early data, to send
+	 * the request. This may only be done in the following conditions:
+	 *   - the SSL ctx does not support early data
+	 *   - the connection was not reused (it must be a new one)
+	 *   - the client already used early data, or we have L7 retries on
+	 *   - 0rtt is configured on the server line and we have not yet failed
+	 *     any connection attempt on this stream (in order to avoid failing
+	 *     multiple times in a row)
+	 *   - there are data to be sent
+	 * otherwise we cannot make use of early data. Let's first eliminate
+	 * the cases which don't match this above. The conditions will tighten
+	 * later in the function when needed.
+	 */
+
+	if (!srv || !(srv->ssl_ctx.options & SRV_SSL_O_EARLY_DATA))
+		may_use_early_data = 0;
+
+	if (reuse)
+		may_use_early_data = 0;
+
+	if (!(cli_conn && cli_conn->flags & CO_FL_EARLY_DATA) &&
+	    (!(s->be->retry_type & PR_RE_EARLY_ERROR) || s->conn_retries > 0))
+		may_use_early_data = 0;
+
+	if (!co_data(sc_oc(s->scb)))
+		may_use_early_data = 0;
+#endif
 
 	/* Copy network namespace from client connection */
 	srv_conn->proxy_netns = cli_conn ? cli_conn->proxy_netns : NULL;
@@ -2024,11 +2058,11 @@ int connect_server(struct stream *s)
 		 * that this is skipped in TCP mode as we only want mux-pt
 		 * anyway.
 		 */
-		if (!srv ||
-		    (srv->use_ssl != 1 || (!(srv->ssl_ctx.alpn_str) && !(srv->ssl_ctx.npn_str)) ||
-		     !IS_HTX_STRM(s)))
+		if (IS_HTX_STRM(s) && srv && srv->use_ssl &&
+		    (srv->ssl_ctx.alpn_str || srv->ssl_ctx.npn_str) &&
+		    srv->path_params.nego_alpn[0] == 0)
+			may_start_mux_now = 0;
 #endif
-			init_mux = 1;
 
 		/* process the case where the server requires the PROXY protocol to be sent */
 		srv_conn->send_proxy_ofs = 0;
@@ -2091,13 +2125,15 @@ int connect_server(struct stream *s)
 		s->scb->flags |= SC_FL_NOLINGER;
 
 	if (s->flags & SF_SRV_REUSED) {
-		_HA_ATOMIC_INC(&s->be->be_counters.shared->tg[tgid - 1]->reuse);
-		if (srv)
-			_HA_ATOMIC_INC(&srv->counters.shared->tg[tgid - 1]->reuse);
+		if (s->be_tgcounters)
+			_HA_ATOMIC_INC(&s->be_tgcounters->reuse);
+		if (s->sv_tgcounters)
+			_HA_ATOMIC_INC(&s->sv_tgcounters->reuse);
 	} else {
-		_HA_ATOMIC_INC(&s->be->be_counters.shared->tg[tgid - 1]->connect);
-		if (srv)
-			_HA_ATOMIC_INC(&srv->counters.shared->tg[tgid - 1]->connect);
+		if (s->be_tgcounters)
+			_HA_ATOMIC_INC(&s->be_tgcounters->connect);
+		if (s->sv_tgcounters)
+			_HA_ATOMIC_INC(&s->sv_tgcounters->connect);
 	}
 
 	err = do_connect_server(s, srv_conn);
@@ -2106,7 +2142,7 @@ int connect_server(struct stream *s)
 
 #ifdef USE_OPENSSL
 	/* Set socket SNI unless connection is reused. */
-	if (srv && srv->ssl_ctx.sni && !(s->flags & SF_SRV_REUSED)) {
+	if (conn_is_ssl(srv_conn) && srv && srv->ssl_ctx.sni && !(s->flags & SF_SRV_REUSED)) {
 		struct sample *sni_smp = NULL;
 
 		sni_smp = sample_fetch_as_type(s->be, s->sess, s,
@@ -2133,7 +2169,7 @@ int connect_server(struct stream *s)
 	 * initialized, or any attempt to recv during the mux init may
 	 * fail, and flag the connection as CO_FL_ERROR.
 	 */
-	if (init_mux) {
+	if (may_start_mux_now) {
 		const struct mux_ops *alt_mux =
 		  likely(!(s->flags & SF_WEBSOCKET)) ? NULL : srv_get_ws_proto(srv);
 		if (conn_install_mux_be(srv_conn, s->scb, s->sess, alt_mux) < 0) {
@@ -2158,23 +2194,25 @@ int connect_server(struct stream *s)
 			         (reuse_mode == PR_O_REUSE_SAFE &&
 			          srv_conn->mux->flags & MX_FL_HOL_RISK)) {
 				/* If it fail now, the same will be done in mux->detach() callback */
-				session_add_conn(s->sess, srv_conn, srv_conn->target);
+				session_add_conn(s->sess, srv_conn);
 			}
 		}
 	}
 
-#if defined(USE_OPENSSL) && (defined(OPENSSL_IS_BORINGSSL) || (HA_OPENSSL_VERSION_NUMBER >= 0x10101000L))
-
-	if (!reuse && cli_conn && srv && srv_conn->mux &&
-	    (srv->ssl_ctx.options & SRV_SSL_O_EARLY_DATA) &&
-	    /* Only attempt to use early data if either the client sent
-	     * early data, so that we know it can handle a 425, or if
-	     * we are allowed to retry requests on early data failure, and
-	     * it's our first try
-	     */
-	    ((cli_conn->flags & CO_FL_EARLY_DATA) ||
-	     ((s->be->retry_type & PR_RE_EARLY_ERROR) && !s->conn_retries)) &&
-	    co_data(sc_oc(s->scb)) &&
+#if defined(HAVE_SSL_0RTT)
+	/* The flags change below deserve some explanation: when we want to
+	 * use early data, we first want to make sure that a mux is installed
+	 * (otherwise we'll have nothing to send), and then we'll temporarily
+	 * pretend that we're done with the SSL handshake. This way the data
+	 * layer of the stack will be able to start sending data. The xprt
+	 * layer will notice that these data are sent in the context of 0-rtt,
+	 * and will produce early data, and then immediately restore these
+	 * flags to say "I was lying, the SSL layer is not ready in fact". This
+	 * effectively allows early data to be sent with the very first SSL
+	 * communication with the server, while still having the ability to
+	 * later wait for the end of the handshake.
+	 */
+	if (may_use_early_data && srv && srv_conn->mux &&
 	    srv_conn->flags & CO_FL_SSL_WAIT_HS)
 		srv_conn->flags &= ~(CO_FL_SSL_WAIT_HS | CO_FL_WAIT_L6_CONN);
 #endif
@@ -2286,8 +2324,10 @@ int srv_redispatch_connect(struct stream *s)
 			s->conn_err_type = STRM_ET_QUEUE_ERR;
 		}
 
-		_HA_ATOMIC_INC(&srv->counters.shared->tg[tgid - 1]->failed_conns);
-		_HA_ATOMIC_INC(&s->be->be_counters.shared->tg[tgid - 1]->failed_conns);
+		if (s->sv_tgcounters)
+			_HA_ATOMIC_INC(&s->sv_tgcounters->failed_conns);
+		if (s->be_tgcounters)
+			_HA_ATOMIC_INC(&s->be_tgcounters->failed_conns);
 		return 1;
 
 	case SRV_STATUS_NOSRV:
@@ -2296,7 +2336,8 @@ int srv_redispatch_connect(struct stream *s)
 			s->conn_err_type = STRM_ET_CONN_ERR;
 		}
 
-		_HA_ATOMIC_INC(&s->be->be_counters.shared->tg[tgid - 1]->failed_conns);
+		if (s->be_tgcounters)
+			_HA_ATOMIC_INC(&s->be_tgcounters->failed_conns);
 		return 1;
 
 	case SRV_STATUS_QUEUED:
@@ -2324,9 +2365,10 @@ int srv_redispatch_connect(struct stream *s)
 			srv_inc_sess_ctr(srv);
 		if (srv)
 			srv_set_sess_last(srv);
-		if (srv)
-			_HA_ATOMIC_INC(&srv->counters.shared->tg[tgid - 1]->failed_conns);
-		_HA_ATOMIC_INC(&s->be->be_counters.shared->tg[tgid - 1]->failed_conns);
+		if (s->sv_tgcounters)
+			_HA_ATOMIC_INC(&s->sv_tgcounters->failed_conns);
+		if (s->be_tgcounters)
+			_HA_ATOMIC_INC(&s->be_tgcounters->failed_conns);
 
 		/* release other streams waiting for this server */
 		if (may_dequeue_tasks(srv, s->be))
@@ -2399,9 +2441,10 @@ void back_try_conn_req(struct stream *s)
 				srv_inc_sess_ctr(srv);
 			if (srv)
 				srv_set_sess_last(srv);
-			if (srv)
-				_HA_ATOMIC_INC(&srv->counters.shared->tg[tgid - 1]->failed_conns);
-			_HA_ATOMIC_INC(&s->be->be_counters.shared->tg[tgid - 1]->failed_conns);
+			if (s->sv_tgcounters)
+				_HA_ATOMIC_INC(&s->sv_tgcounters->failed_conns);
+			if (s->be_tgcounters)
+				_HA_ATOMIC_INC(&s->be_tgcounters->failed_conns);
 
 			/* release other streams waiting for this server */
 			sess_change_server(s, NULL);
@@ -2466,9 +2509,10 @@ void back_try_conn_req(struct stream *s)
 			/* we may need to know the position in the queue for logging */
 			pendconn_cond_unlink(s->pend_pos);
 
-			if (srv)
-				_HA_ATOMIC_INC(&srv->counters.shared->tg[tgid - 1]->failed_conns);
-			_HA_ATOMIC_INC(&s->be->be_counters.shared->tg[tgid - 1]->failed_conns);
+			if (s->sv_tgcounters)
+				_HA_ATOMIC_INC(&s->sv_tgcounters->failed_conns);
+			if (s->be_tgcounters)
+				_HA_ATOMIC_INC(&s->be_tgcounters->failed_conns);
 			sc_abort(sc);
 			sc_shutdown(sc);
 			req->flags |= CF_WRITE_TIMEOUT;
@@ -2722,9 +2766,10 @@ void back_handle_st_cer(struct stream *s)
 			s->conn_err_type = STRM_ET_CONN_ERR;
 		}
 
-		if (objt_server(s->target))
-			_HA_ATOMIC_INC(&objt_server(s->target)->counters.shared->tg[tgid - 1]->failed_conns);
-		_HA_ATOMIC_INC(&s->be->be_counters.shared->tg[tgid - 1]->failed_conns);
+		if (s->sv_tgcounters)
+			_HA_ATOMIC_INC(&s->sv_tgcounters->failed_conns);
+		if (s->be_tgcounters)
+			_HA_ATOMIC_INC(&s->be_tgcounters->failed_conns);
 		sess_change_server(s, NULL);
 		if (may_dequeue_tasks(objt_server(s->target), s->be))
 			process_srv_queue(objt_server(s->target));
@@ -2755,9 +2800,10 @@ void back_handle_st_cer(struct stream *s)
 		if (!s->conn_err_type)
 			s->conn_err_type = STRM_ET_CONN_OTHER;
 
-		if (objt_server(s->target))
-			_HA_ATOMIC_INC(&objt_server(s->target)->counters.shared->tg[tgid - 1]->internal_errors);
-		_HA_ATOMIC_INC(&s->be->be_counters.shared->tg[tgid - 1]->internal_errors);
+		if (s->sv_tgcounters)
+			_HA_ATOMIC_INC(&s->sv_tgcounters->internal_errors);
+		if (s->be_tgcounters)
+			_HA_ATOMIC_INC(&s->be_tgcounters->internal_errors);
 		sess_change_server(s, NULL);
 		if (may_dequeue_tasks(objt_server(s->target), s->be))
 			process_srv_queue(objt_server(s->target));
@@ -2895,8 +2941,8 @@ void back_handle_st_rdy(struct stream *s)
 void set_backend_down(struct proxy *be)
 {
 	be->last_change = ns_to_sec(now_ns);
-	HA_ATOMIC_STORE(&be->be_counters.shared->tg[tgid - 1]->last_state_change, be->last_change);
-	_HA_ATOMIC_INC(&be->be_counters.shared->tg[tgid - 1]->down_trans);
+	HA_ATOMIC_STORE(&be->be_counters.shared.tg[tgid - 1]->last_state_change, be->last_change);
+	_HA_ATOMIC_INC(&be->be_counters.shared.tg[tgid - 1]->down_trans);
 
 	if (!(global.mode & MODE_STARTING)) {
 		ha_alert("%s '%s' has no server available!\n", proxy_type_str(be), be->id);
@@ -2953,7 +2999,7 @@ int tcp_persist_rdp_cookie(struct stream *s, struct channel *req, int an_bit)
 			if ((srv->cur_state != SRV_ST_STOPPED) || (px->options & PR_O_PERSIST)) {
 				/* we found the server and it is usable */
 				s->flags |= SF_DIRECT | SF_ASSIGNED;
-				s->target = &srv->obj_type;
+				stream_set_srv_target(s, srv);
 				break;
 			}
 		}
@@ -3017,9 +3063,9 @@ const char *backend_lb_algo_str(int algo) {
 int backend_parse_balance(const char **args, char **err, struct proxy *curproxy)
 {
 	if (!*(args[0])) {
-		/* if no option is set, use round-robin by default */
+		/* if no option is set, use random by default */
 		curproxy->lbprm.algo &= ~BE_LB_ALGO;
-		curproxy->lbprm.algo |= BE_LB_ALGO_RR;
+		curproxy->lbprm.algo |= BE_LB_ALGO_RND;
 		return 0;
 	}
 
@@ -3409,7 +3455,7 @@ smp_fetch_be_sess_rate(const struct arg *args, struct sample *smp, const char *k
 
 	smp->flags = SMP_F_VOL_TEST;
 	smp->data.type = SMP_T_SINT;
-	smp->data.u.sint = COUNTERS_SHARED_TOTAL(px->be_counters.shared->tg, sess_per_sec, read_freq_ctr);
+	smp->data.u.sint = COUNTERS_SHARED_TOTAL(px->be_counters.shared.tg, sess_per_sec, read_freq_ctr);
 	return 1;
 }
 
@@ -3592,7 +3638,7 @@ smp_fetch_srv_sess_rate(const struct arg *args, struct sample *smp, const char *
 {
 	smp->flags = SMP_F_VOL_TEST;
 	smp->data.type = SMP_T_SINT;
-	smp->data.u.sint = COUNTERS_SHARED_TOTAL(args->data.srv->counters.shared->tg, sess_per_sec, read_freq_ctr);
+	smp->data.u.sint = COUNTERS_SHARED_TOTAL(args->data.srv->counters.shared.tg, sess_per_sec, read_freq_ctr);
 	return 1;
 }
 
@@ -3692,11 +3738,9 @@ static int sample_conv_nbsrv(const struct arg *args, struct sample *smp, void *p
 	return 1;
 }
 
-static int
-sample_conv_srv_queue(const struct arg *args, struct sample *smp, void *private)
+static struct server *sample_conv_srv(struct sample *smp)
 {
 	struct proxy *px;
-	struct server *srv;
 	char *bksep;
 
 	if (!smp_make_safe(smp))
@@ -3708,15 +3752,39 @@ sample_conv_srv_queue(const struct arg *args, struct sample *smp, void *private)
 		*bksep = '\0';
 		px = proxy_find_by_name(smp->data.u.str.area, PR_CAP_BE, 0);
 		if (!px)
-			return 0;
+			return NULL;
 		smp->data.u.str.area = bksep + 1;
 	} else {
 		if (!(smp->px->cap & PR_CAP_BE))
-			return 0;
+			return NULL;
 		px = smp->px;
 	}
 
-	srv = server_find(px, smp->data.u.str.area);
+	return server_find(px, smp->data.u.str.area);
+}
+
+static int
+sample_conv_srv_is_up(const struct arg *args, struct sample *smp, void *private)
+{
+	struct server *srv = sample_conv_srv(smp);
+
+	if (!srv)
+		return 0;
+
+	smp->data.type = SMP_T_BOOL;
+	if (!(srv->cur_admin & SRV_ADMF_MAINT) &&
+	    (!(srv->check.state & CHK_ST_CONFIGURED) || (srv->cur_state != SRV_ST_STOPPED)))
+		smp->data.u.sint = 1;
+	else
+		smp->data.u.sint = 0;
+	return 1;
+}
+
+static int
+sample_conv_srv_queue(const struct arg *args, struct sample *smp, void *private)
+{
+	struct server *srv = sample_conv_srv(smp);
+
 	if (!srv)
 		return 0;
 
@@ -3758,6 +3826,7 @@ INITCALL1(STG_REGISTER, sample_register_fetches, &smp_kws);
 /* Note: must not be declared <const> as its list will be overwritten */
 static struct sample_conv_kw_list sample_conv_kws = {ILH, {
 	{ "nbsrv",     sample_conv_nbsrv,     0, NULL, SMP_T_STR, SMP_T_SINT },
+	{ "srv_is_up", sample_conv_srv_is_up, 0, NULL, SMP_T_STR, SMP_T_BOOL },
 	{ "srv_queue", sample_conv_srv_queue, 0, NULL, SMP_T_STR, SMP_T_SINT },
 	{ /* END */ },
 }};

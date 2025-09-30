@@ -311,6 +311,7 @@ struct proxy {
 	char flags;                             /* bit field PR_FL_* */
 	enum pr_mode mode;                      /* mode = PR_MODE_TCP, PR_MODE_HTTP, ... */
 	char cap;                               /* supported capabilities (PR_CAP_*) */
+	int to_log;				/* things to be logged (LW_*), special value LW_LOGSTEPS == follow log-steps */
 	unsigned long last_change;              /* internal use only: last time the proxy state was changed */
 
 	struct list global_list;                /* list member for global proxy list */
@@ -378,6 +379,7 @@ struct proxy {
 	int srvtcpka_cnt;                       /* The maximum number of keepalive probes TCP should send before dropping the connection. (server side) */
 	int srvtcpka_idle;                      /* The time (in seconds) the connection needs to remain idle before TCP starts sending keepalive probes. (server side) */
 	int srvtcpka_intvl;                     /* The time (in seconds) between individual keepalive probes. (server side) */
+	unsigned int tot_fe_maxconn;		/* #maxconn of frontends linked to that backend, it is used to compute fullconn */
 	struct ist monitor_uri;			/* a special URI to which we respond with HTTP/200 OK */
 	struct list mon_fail_cond;              /* list of conditions to fail monitoring requests (chained) */
 	struct {				/* WARNING! check proxy_reset_timeouts() in proxy.h !!! */
@@ -396,14 +398,14 @@ struct proxy {
 	} timeout;
 	__decl_thread(HA_RWLOCK_T lock);        /* may be taken under the server's lock */
 
-	char *id, *desc;			/* proxy id (name) and description */
+	char *id;				/* proxy id (name), indexed by <conf.name_node> below */
+	char *desc;				/* proxy description */
 	struct proxy_per_tgroup *per_tgrp;	/* array of per-tgroup stuff such as queues */
 	unsigned int queueslength;		/* Sum of the length of each queue */
 	int totpend;				/* total number of pending connections on this instance (for stats) */
 	unsigned int feconn, beconn;		/* # of active frontend and backends streams */
 	unsigned int fe_sps_lim;		/* limit on new sessions per second on the frontend */
 	unsigned int fullconn;			/* #conns on backend above which servers are used at full load */
-	unsigned int tot_fe_maxconn;		/* #maxconn of frontends linked to that backend, it is used to compute fullconn */
 	struct ist server_id_hdr_name;                   /* the header to use to send the server id (name) */
 	int conn_retries;			/* maximum number of connect retries */
 	unsigned int retry_type;                /* Type of retry allowed */
@@ -422,7 +424,6 @@ struct proxy {
 	struct buffer log_tag;                   /* override default syslog tag */
 	struct ist header_unique_id; 		/* unique-id header */
 	struct lf_expr format_unique_id;        /* unique-id format */
-	int to_log;				/* things to be logged (LW_*), special value LW_LOGSTEPS == follow log-steps */
 	int nb_req_cap, nb_rsp_cap;		/* # of headers to be captured */
 	struct cap_hdr *req_cap;		/* chained list of request headers to be captured */
 	struct cap_hdr *rsp_cap;		/* chained list of response headers to be captured */
@@ -440,7 +441,7 @@ struct proxy {
 	char *check_path;			/* PATH environment to use for external agent checks */
 	struct http_reply *replies[HTTP_ERR_SIZE]; /* HTTP replies for known errors */
 	unsigned int log_count;			/* number of logs produced by the frontend */
-	int uuid;				/* universally unique proxy ID, used for SNMP */
+	int uuid;				/* universally unique proxy ID, used for SNMP, indexed by conf.uuid_node below */
 	unsigned int backlog;			/* force the frontend's listen backlog */
 	unsigned int li_all;                    /* total number of listeners attached to this proxy */
 	unsigned int li_paused;                 /* total number of listeners paused (LI_PAUSED) */
@@ -459,24 +460,24 @@ struct proxy {
 
 	struct {
 		const char *file;		/* file where the section appears */
-		struct eb32_node id;		/* place in the tree of used IDs */
+		struct ceb_node uuid_node;	/* place in the tree of used IDs, indexes <uuid> above */
 		int line;			/* line where the section appears */
-		struct eb_root used_listener_id;/* list of listener IDs in use */
-		struct eb_root used_server_id;	/* list of server IDs in use */
-		struct eb_root used_server_name; /* list of server names in use */
+		struct ceb_root *used_listener_id; /* list of listener IDs in use */
+		struct ceb_root *used_server_id;   /* list of server IDs in use */
+		struct ceb_root *used_server_name; /* list of server names in use */
 		struct list bind;		/* list of bind settings */
 		struct list listeners;		/* list of listeners belonging to this frontend */
 		struct list errors;             /* list of all custom error files */
 		struct arg_list args;           /* sample arg list that need to be resolved */
-		struct ebpt_node by_name;       /* proxies are stored sorted by name here */
+		struct ceb_node name_node;	/* proxies are stored sorted by name here; indexes <id> below */
 		struct list lf_checks;          /* list of logformats found in the proxy section that needs to be checked during postparse */
-		struct eb_root log_steps;       /* tree of log origins where log should be generated during request handling */
+		struct log_steps log_steps;     /* bitfield of log origins where log should be generated during request handling */
 		const char *file_prev;          /* file of the previous instance found with the same name, or NULL */
 		int line_prev;                  /* line of the previous instance found with the same name, or 0 */
 		unsigned int refcount;          /* refcount on this proxy (only used for default proxy for now) */
 	} conf;					/* config information */
 	struct http_ext *http_ext;	        /* http ext options */
-	struct eb_root used_server_addr;        /* list of server addresses in use */
+	struct ceb_root *used_server_addr;      /* list of server addresses in use */
 	void *parent;				/* parent of the proxy when applicable */
 	struct comp *comp;			/* http compression */
 

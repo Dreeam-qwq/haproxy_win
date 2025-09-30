@@ -513,7 +513,8 @@ void set_server_check_status(struct check *check, short status, const char *desc
 		if ((!(check->state & CHK_ST_AGENT) ||
 		    (check->status >= HCHK_STATUS_L57DATA)) &&
 		    (check->health > 0)) {
-			_HA_ATOMIC_INC(&s->counters.shared->tg[tgid - 1]->failed_checks);
+			if (s->counters.shared.tg[tgid - 1])
+				_HA_ATOMIC_INC(&s->counters.shared.tg[tgid - 1]->failed_checks);
 			report = 1;
 			check->health--;
 			if (check->health < check->rise)
@@ -740,7 +741,8 @@ void __health_adjust(struct server *s, short status)
 	HA_SPIN_UNLOCK(SERVER_LOCK, &s->lock);
 
 	HA_ATOMIC_STORE(&s->consecutive_errors, 0);
-	_HA_ATOMIC_INC(&s->counters.shared->tg[tgid - 1]->failed_hana);
+	if (s->counters.shared.tg[tgid - 1])
+		_HA_ATOMIC_INC(&s->counters.shared.tg[tgid - 1]->failed_hana);
 
 	if (s->check.fastinter) {
 		/* timer might need to be advanced, it might also already be
@@ -1574,7 +1576,8 @@ void free_check(struct check *check)
 	}
 
 	ha_free(&check->pool_conn_name);
-
+	ha_free(&check->sni);
+	ha_free(&check->alpn_str);
 	task_destroy(check->task);
 
 	check_release_buf(check, &check->bi);
@@ -1813,10 +1816,8 @@ int init_srv_check(struct server *srv)
 		 * specified.
 		 */
 		if (!srv->check.port && !is_addr(&srv->check.addr)) {
-			if (!srv->check.use_ssl && srv->use_ssl != -1) {
-				srv->check.use_ssl = srv->use_ssl;
-				srv->check.xprt    = srv->xprt;
-			}
+			if (!srv->check.use_ssl && srv->use_ssl != -1)
+				srv->check.xprt = srv->xprt;
 			else if (srv->check.use_ssl == 1)
 				srv->check.xprt = xprt_get(XPRT_SSL);
 			srv->check.send_proxy |= (srv->pp_opts);
@@ -1854,6 +1855,27 @@ int init_srv_check(struct server *srv)
 	}
 
 	/* validate <srv> server health-check settings */
+
+	if (srv_is_quic(srv)) {
+		if (srv->check.mux_proto && srv->check.mux_proto != get_mux_proto(ist("quic"))) {
+			ha_alert("config: %s '%s': QUIC server '%s' uses an incompatible MUX protocol for checks.\n",
+			         proxy_type_str(srv->proxy), srv->proxy->id, srv->id);
+			ret |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+
+		if (srv->check.use_ssl < 0) {
+			ha_alert("config: %s '%s': SSL is mandatory for checks on QUIC server '%s'.\n",
+			         proxy_type_str(srv->proxy), srv->proxy->id, srv->id);
+			ret |= ERR_ALERT | ERR_FATAL;
+		}
+
+		if (srv->check.send_proxy) {
+			ha_alert("config: %s '%s': cannot use PROXY protocol for checks on QUIC server '%s'.\n",
+			         proxy_type_str(srv->proxy), srv->proxy->id, srv->id);
+			ret |= ERR_ALERT | ERR_FATAL;
+		}
+	}
 
 	/* We need at least a service port, a check port or the first tcp-check
 	 * rule must be a 'connect' one when checking an IPv4/IPv6 server.

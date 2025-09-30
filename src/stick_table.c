@@ -14,9 +14,9 @@
 #include <string.h>
 #include <errno.h>
 
+#include <import/cebis_tree.h>
 #include <import/ebmbtree.h>
 #include <import/ebsttree.h>
-#include <import/ebistree.h>
 
 #include <haproxy/api.h>
 #include <haproxy/applet.h>
@@ -64,7 +64,7 @@ static THREAD_LOCAL struct stktable_key static_table_key;
 static int (*smp_fetch_src)(const struct arg *, struct sample *, const char *, void *);
 struct pool_head *pool_head_stk_ctr __read_mostly = NULL;
 struct stktable *stktables_list;
-struct eb_root stktable_by_name = EB_ROOT;
+struct ceb_root *stktable_by_name = NULL;
 
 #define round_ptr_size(i) (((i) + (sizeof(void *) - 1)) &~ (sizeof(void *) - 1))
 
@@ -74,23 +74,12 @@ struct eb_root stktable_by_name = EB_ROOT;
  */
 void stktable_store_name(struct stktable *t)
 {
-	t->name.key = t->id;
-	ebis_insert(&stktable_by_name, &t->name);
+	cebis_item_insert(&stktable_by_name, id_node, id, t);
 }
 
 struct stktable *stktable_find_by_name(const char *name)
 {
-	struct ebpt_node *node;
-	struct stktable *t;
-
-	node = ebis_lookup(&stktable_by_name, name);
-	if (node) {
-		t = container_of(node, struct stktable, name);
-		if (strcmp(t->id, name) == 0)
-			return t;
-	}
-
-	return NULL;
+	return cebis_item_lookup(&stktable_by_name, id_node, id, name, struct stktable);
 }
 
 /*
@@ -286,12 +275,12 @@ static struct stksess *__stksess_init(struct stktable *t, struct stksess * ts)
 }
 
 /*
- * Trash oldest <to_batch> sticky sessions from table <t>
- * Returns number of trashed sticky sessions. It may actually trash less
- * than expected if finding these requires too long a search time (e.g.
- * most of them have ts->ref_cnt>0). This function locks the table.
+ * Trash up to STKTABLE_MAX_UPDATES_AT_ONCE oldest sticky sessions from table
+ * <t>. Returns non-null if it managed to release at least one entry. It will
+ * avoid waiting on a lock if it managed to release at least one object. It
+ * tries hard to limit the time spent evicting objects.
  */
-int stktable_trash_oldest(struct stktable *t, int to_batch)
+int stktable_trash_oldest(struct stktable *t)
 {
 	struct stksess *ts;
 	struct eb32_node *eb;
@@ -299,24 +288,34 @@ int stktable_trash_oldest(struct stktable *t, int to_batch)
 	int max_per_shard;
 	int done_per_shard;
 	int batched = 0;
+	int to_batch;
 	int updt_locked;
+	int failed_once = 0;
 	int looped;
 	int shard;
+	int init_shard;
 
-	shard = 0;
+	/* start from a random shard number to avoid starvation in the last ones */
+	shard = init_shard = statistical_prng_range(CONFIG_HAP_TBL_BUCKETS - 1);
 
-	if (to_batch > STKTABLE_MAX_UPDATES_AT_ONCE)
-		to_batch = STKTABLE_MAX_UPDATES_AT_ONCE;
+	to_batch = STKTABLE_MAX_UPDATES_AT_ONCE;
 
 	max_search = to_batch * 2; // no more than 50% misses
 	max_per_shard = (to_batch + CONFIG_HAP_TBL_BUCKETS - 1) / CONFIG_HAP_TBL_BUCKETS;
 
-	while (batched < to_batch) {
+	do {
 		done_per_shard = 0;
 		looped = 0;
 		updt_locked = 0;
 
-		HA_RWLOCK_WRLOCK(STK_TABLE_LOCK, &t->shards[shard].sh_lock);
+		if (HA_RWLOCK_TRYWRLOCK(STK_TABLE_LOCK, &t->shards[shard].sh_lock) != 0) {
+			if (batched)
+				break; // no point insisting, we have or made some room
+			if (failed_once)
+				break; // already waited once, that's enough
+			failed_once = 1;
+			HA_RWLOCK_WRLOCK(STK_TABLE_LOCK, &t->shards[shard].sh_lock);
+		}
 
 		eb = eb32_lookup_ge(&t->shards[shard].exps, now_ms - TIMER_LOOK_BACK);
 		while (batched < to_batch && done_per_shard < max_per_shard) {
@@ -341,15 +340,20 @@ int stktable_trash_oldest(struct stktable *t, int to_batch)
 			ts = eb32_entry(eb, struct stksess, exp);
 			eb = eb32_next(eb);
 
-			/* don't delete an entry which is currently referenced */
-			if (HA_ATOMIC_LOAD(&ts->ref_cnt) != 0)
-				continue;
-
+			/* This entry's key is expired, we must delete it. It
+			 * may be properly requeued if the element is still in
+			 * use or not really expired though.
+			 */
 			eb32_delete(&ts->exp);
 
-			if (ts->expire != ts->exp.key) {
-				if (!tick_isset(ts->expire))
+			if (ts->expire != ts->exp.key || HA_ATOMIC_LOAD(&ts->ref_cnt) != 0) {
+			requeue:
+				if (!tick_isset(ts->expire)) {
+					/* don't waste more time here it we're not alone */
+					if (failed_once)
+						break;
 					continue;
+				}
 
 				ts->exp.key = ts->expire;
 				eb32_insert(&t->shards[shard].exps, &ts->exp);
@@ -368,6 +372,9 @@ int stktable_trash_oldest(struct stktable *t, int to_batch)
 				if (!eb || tick_is_lt(ts->exp.key, eb->key))
 					eb = &ts->exp;
 
+				/* don't waste more time here it we're not alone */
+				if (failed_once)
+					break;
 				continue;
 			}
 
@@ -385,7 +392,7 @@ int stktable_trash_oldest(struct stktable *t, int to_batch)
 			 * existing ones already have the ref_cnt.
 			 */
 			if (HA_ATOMIC_LOAD(&ts->ref_cnt))
-				continue;
+				goto requeue;
 
 			/* session expired, trash it */
 			ebmb_delete(&ts->key);
@@ -394,6 +401,10 @@ int stktable_trash_oldest(struct stktable *t, int to_batch)
 			__stksess_free(t, ts);
 			batched++;
 			done_per_shard++;
+
+			/* don't waste more time here it we're not alone */
+			if (failed_once)
+				break;
 		}
 
 		if (updt_locked)
@@ -401,13 +412,10 @@ int stktable_trash_oldest(struct stktable *t, int to_batch)
 
 		HA_RWLOCK_WRUNLOCK(STK_TABLE_LOCK, &t->shards[shard].sh_lock);
 
-		if (max_search <= 0)
-			break;
-
-		shard = (shard + 1) % CONFIG_HAP_TBL_BUCKETS;
-		if (!shard)
-			break;
-	}
+		shard++;
+		if (shard >= CONFIG_HAP_TBL_BUCKETS)
+			shard = 0;
+	} while (max_search > 0 && shard != init_shard);
 
 	return batched;
 }
@@ -429,11 +437,15 @@ struct stksess *stksess_new(struct stktable *t, struct stktable_key *key)
 
 	if (unlikely(current >= t->size)) {
 		/* the table was already full, we may have to purge entries */
-		if ((t->flags & STK_FL_NOPURGE) ||
-		    !stktable_trash_oldest(t, (t->size >> 8) + 1)) {
+		if (t->flags & STK_FL_NOPURGE) {
 			HA_ATOMIC_DEC(&t->current);
 			return NULL;
 		}
+		/* note that it may fail to find any releasable slot due to
+		 * locking contention but it's not a problem in practice,
+		 * these will be recovered later.
+		 */
+		stktable_trash_oldest(t);
 	}
 
 	ts = pool_alloc(t->pool);
@@ -701,21 +713,27 @@ void stktable_requeue_exp(struct stktable *t, const struct stksess *ts)
 	old_exp = HA_ATOMIC_LOAD(&t->exp_task->expire);
 	new_exp = tick_first(expire, old_exp);
 
-	/* let's not go further if we're already up to date */
-	if (new_exp == old_exp)
+	/* let's not go further if we're already up to date. We have
+	 * to make sure the compared date doesn't change under us.
+	 */
+	if (new_exp == old_exp &&
+	    HA_ATOMIC_CAS(&t->exp_task->expire, &old_exp, new_exp))
 		return;
 
 	HA_RWLOCK_WRLOCK(STK_TABLE_LOCK, &t->lock);
 
-	while (new_exp != old_exp &&
-	       !HA_ATOMIC_CAS(&t->exp_task->expire, &old_exp, new_exp)) {
+	while (!HA_ATOMIC_CAS(&t->exp_task->expire, &old_exp, new_exp)) {
+		if (new_exp == old_exp)
+			break;
 		__ha_cpu_relax();
 		new_exp = tick_first(expire, old_exp);
 	}
 
-	task_queue(t->exp_task);
-
 	HA_RWLOCK_WRUNLOCK(STK_TABLE_LOCK, &t->lock);
+
+	/* the timer was advanced, only the task can update it */
+	if (!tick_isset(old_exp) || tick_is_lt(new_exp, old_exp))
+		task_wakeup(t->exp_task, TASK_WOKEN_OTHER);
 }
 
 /* Returns a valid or initialized stksess for the specified stktable_key in the
@@ -782,15 +800,18 @@ struct stksess *stktable_get_entry(struct stktable *table, struct stktable_key *
 	return ts;
 }
 
-static struct task *stktable_add_pend_updates(struct task *t, void *ctx, unsigned int state)
+struct task *stktable_add_pend_updates(struct task *t, void *ctx, unsigned int state)
 {
 	struct stktable *table = ctx;
 	struct eb32_node *eb;
-	int i, is_local, cur_tgid = tgid - 1, empty_tgid = 0;
+	int i = 0, is_local, cur_tgid = tgid - 1, empty_tgid = 0;
 
-	HA_RWLOCK_WRLOCK(STK_TABLE_UPDT_LOCK, &table->updt_lock);
+	/* we really don't want to wait on this one */
+	if (HA_RWLOCK_TRYWRLOCK(STK_TABLE_LOCK, &table->updt_lock) != 0)
+		goto leave;
+
 	for (i = 0; i < STKTABLE_MAX_UPDATES_AT_ONCE; i++) {
-		struct stksess *stksess = MT_LIST_POP(&table->pend_updts[cur_tgid], typeof(stksess), pend_updts);
+		struct stksess *stksess = MT_LIST_POP_LOCKED(&table->pend_updts[cur_tgid], typeof(stksess), pend_updts);
 
 		if (!stksess) {
 			empty_tgid++;
@@ -827,10 +848,18 @@ static struct task *stktable_add_pend_updates(struct task *t, void *ctx, unsigne
 			eb32_delete(eb);
 			eb32_insert(&table->updates, &stksess->upd);
 		}
+		/*
+		 * Now that we're done inserting the stksess, unlock it.
+		 * It is kept locked here to prevent a race condition
+		 * when stksess_kill() could free() it after we removed
+		 * it from the list, but before we inserted it into the tree
+		 */
+		MT_LIST_INIT(&stksess->pend_updts);
 	}
 
 	HA_RWLOCK_WRUNLOCK(STK_TABLE_UPDT_LOCK, &table->updt_lock);
 
+leave:
 	/* There's more to do, let's schedule another session */
 	if (empty_tgid < global.nbtgroups)
 		tasklet_wakeup(table->updt_task);
@@ -897,24 +926,37 @@ struct task *process_table_expire(struct task *task, void *context, unsigned int
 	struct stktable *t = context;
 	struct stksess *ts;
 	struct eb32_node *eb;
-	int need_resched = 0;
 	int updt_locked;
-	int expired;
+	int to_visit = STKTABLE_MAX_UPDATES_AT_ONCE;
 	int looped;
 	int exp_next;
 	int task_exp;
-	int shard;
+	int shard, init_shard;
+	int failed_once = 0;
+	int purged = 0;
 
 	task_exp = TICK_ETERNITY;
 
-	for (shard = 0; shard < CONFIG_HAP_TBL_BUCKETS; shard++) {
+	/* start from a random shard number to avoid starvation in the last ones */
+	shard = init_shard = statistical_prng_range(CONFIG_HAP_TBL_BUCKETS - 1);
+	do {
 		updt_locked = 0;
 		looped = 0;
-		HA_RWLOCK_WRLOCK(STK_TABLE_LOCK, &t->shards[shard].sh_lock);
-		eb = eb32_lookup_ge(&t->shards[shard].exps, now_ms - TIMER_LOOK_BACK);
-		expired = 0;
 
-		while (1) {
+		if (HA_RWLOCK_TRYWRLOCK(STK_TABLE_LOCK, &t->shards[shard].sh_lock) != 0) {
+			if (purged || failed_once) {
+				/* already purged or second failed lock, yield and come back later */
+				to_visit = 0;
+				break;
+			}
+			/* make sure we succeed at least once */
+			failed_once = 1;
+			HA_RWLOCK_WRLOCK(STK_TABLE_LOCK, &t->shards[shard].sh_lock);
+		}
+
+		eb = eb32_lookup_ge(&t->shards[shard].exps, now_ms - TIMER_LOOK_BACK);
+
+		while (to_visit >= 0) {
 			if (unlikely(!eb)) {
 				/* we might have reached the end of the tree, typically because
 				 * <now_ms> is in the first half and we're first scanning the last
@@ -935,15 +977,28 @@ struct task *process_table_expire(struct task *task, void *context, unsigned int
 				goto out_unlock;
 			}
 
+			/* Let's quit earlier if we currently hold the update lock */
+			to_visit -= 1 + 3 * updt_locked;
+
 			/* timer looks expired, detach it from the queue */
 			ts = eb32_entry(eb, struct stksess, exp);
 			eb = eb32_next(eb);
 
-			/* don't delete an entry which is currently referenced */
-			if (HA_ATOMIC_LOAD(&ts->ref_cnt) != 0)
-				continue;
-
+			/* This entry's key is expired, we must delete it. It
+			 * may be properly requeued if the element is still in
+			 * use or not really expired though.
+			 */
 			eb32_delete(&ts->exp);
+
+			if (HA_ATOMIC_LOAD(&ts->ref_cnt) != 0) {
+			requeue:
+				/* we can't trash this entry yet because it's in use,
+				 * so we must refresh it with the table's lifetime to
+				 * postpone its expiration.
+				 */
+				if (tick_is_expired(ts->expire, now_ms))
+					ts->expire = tick_add(now_ms, MS_TO_TICKS(t->expire));
+			}
 
 			if (!tick_is_expired(ts->expire, now_ms)) {
 				if (!tick_isset(ts->expire))
@@ -968,14 +1023,6 @@ struct task *process_table_expire(struct task *task, void *context, unsigned int
 				continue;
 			}
 
-			if (updt_locked == 1) {
-				expired++;
-				if (expired == STKTABLE_MAX_UPDATES_AT_ONCE) {
-					need_resched = 1;
-					exp_next = TICK_ETERNITY;
-					goto out_unlock;
-				}
-			}
 			/* if the entry is in the update list, we must be extremely careful
 			 * because peers can see it at any moment and start to use it. Peers
 			 * will take the table's updt_lock for reading when doing that, and
@@ -990,13 +1037,14 @@ struct task *process_table_expire(struct task *task, void *context, unsigned int
 			 * existing ones already have the ref_cnt.
 			 */
 			if (HA_ATOMIC_LOAD(&ts->ref_cnt))
-				continue;
+				goto requeue;
 
 			/* session expired, trash it */
 			ebmb_delete(&ts->key);
 			MT_LIST_DELETE(&ts->pend_updts);
 			eb32_delete(&ts->upd);
 			__stksess_free(t, ts);
+			purged++;
 		}
 
 		/* We have found no task to expire in any tree */
@@ -1008,9 +1056,13 @@ struct task *process_table_expire(struct task *task, void *context, unsigned int
 
 		task_exp = tick_first(task_exp, exp_next);
 		HA_RWLOCK_WRUNLOCK(STK_TABLE_LOCK, &t->shards[shard].sh_lock);
-	}
 
-	if (need_resched) {
+		shard++;
+		if (shard >= CONFIG_HAP_TBL_BUCKETS)
+			shard = 0;
+	} while (to_visit > 0 && shard != init_shard);
+
+	if (to_visit <= 0) {
 		task_wakeup(task, TASK_WOKEN_OTHER);
 	} else {
 		/* Reset the task's expiration. We do this under the lock so as not
@@ -1033,6 +1085,7 @@ struct task *process_table_expire(struct task *task, void *context, unsigned int
  */
 int stktable_init(struct stktable *t, char **err_msg)
 {
+	static int operating_thread = 0;
 	int peers_retval = 0;
 	int shard;
 	int i;
@@ -1052,9 +1105,11 @@ int stktable_init(struct stktable *t, char **err_msg)
 		t->pool = create_pool("sticktables", sizeof(struct stksess) + round_ptr_size(t->data_size) + t->key_size, MEM_F_SHARED);
 
 		if ( t->expire ) {
-			t->exp_task = task_new_anywhere();
+			t->exp_task = task_new_on(operating_thread);
 			if (!t->exp_task)
 				goto mem_error;
+			operating_thread = (operating_thread + 1) % global.nbthread;
+
 			t->exp_task->process = process_table_expire;
 			t->exp_task->context = (void *)t;
 		}
@@ -3157,9 +3212,9 @@ static enum act_parse_ret parse_add_gpc(const char **args, int *arg, struct prox
 			return ACT_RET_PRS_ERR;
 		}
 
-		if (rule->arg.gpc.sc >= MAX_SESS_STKCTR) {
-			memprintf(err, "invalid stick table track ID '%s' for '%s'. The max allowed ID is %d",
-				  cmd_name, args[*arg-1], MAX_SESS_STKCTR-1);
+		if (rule->arg.gpc.sc >= global.tune.nb_stk_ctr) {
+			memprintf(err, "invalid stick table track ID '%s'. The max allowed ID is %d (tune.stick-counters)",
+				  args[*arg-1], global.tune.nb_stk_ctr - 1);
 			return ACT_RET_PRS_ERR;
 		}
 	}
@@ -5287,10 +5342,11 @@ struct show_table_ctx {
 /* Processes a single table entry <ts>.
  * returns 0 if it wants to be called again, 1 if has ended processing.
  */
-static int table_process_entry(struct appctx *appctx, struct stksess *ts, char **args)
+static int table_process_entry(struct appctx *appctx, struct stksess **tsptr, char **args)
 {
 	struct show_table_ctx *ctx = appctx->svcctx;
 	struct stktable *t = ctx->target;
+	struct stksess *ts = *tsptr;
 	long long value;
 	int data_type;
 	int cur_arg;
@@ -5327,20 +5383,22 @@ static int table_process_entry(struct appctx *appctx, struct stksess *ts, char *
 	case STK_CLI_ACT_SHOW:
 		chunk_reset(&trash);
 		if (!table_dump_head_to_buffer(&trash, appctx, t, t)) {
-			stktable_release(t, ts);
 			return 0;
 		}
 		HA_RWLOCK_RDLOCK(STK_SESS_LOCK, &ts->lock);
 		if (!table_dump_entry_to_buffer(&trash, appctx, t, ts)) {
 			HA_RWLOCK_RDUNLOCK(STK_SESS_LOCK, &ts->lock);
-			stktable_release(t, ts);
 			return 0;
 		}
 		HA_RWLOCK_RDUNLOCK(STK_SESS_LOCK, &ts->lock);
-		stktable_release(t, ts);
 		break;
 
 	case STK_CLI_ACT_CLR:
+		/*
+		 * Now matter if we managed to kill the stksess or not,
+		 * the ref_cnt will be decremented, so let the caller know.
+		 */
+		*tsptr = NULL;
 		if (!stksess_kill(t, ts)) {
 			/* don't delete an entry which is currently referenced */
 			return cli_err(appctx, "Entry currently in use, cannot remove\n");
@@ -5355,7 +5413,7 @@ static int table_process_entry(struct appctx *appctx, struct stksess *ts, char *
 			if (strncmp(args[cur_arg], "data.", 5) != 0) {
 				cli_err(appctx, "\"data.<type>\" followed by a value expected\n");
 				HA_RWLOCK_WRUNLOCK(STK_SESS_LOCK, &ts->lock);
-				stktable_touch_local(t, ts, 1);
+				stktable_touch_local(t, ts, 0);
 				return 1;
 			}
 
@@ -5363,21 +5421,21 @@ static int table_process_entry(struct appctx *appctx, struct stksess *ts, char *
 			if (data_type < 0) {
 				cli_err(appctx, "Unknown data type\n");
 				HA_RWLOCK_WRUNLOCK(STK_SESS_LOCK, &ts->lock);
-				stktable_touch_local(t, ts, 1);
+				stktable_touch_local(t, ts, 0);
 				return 1;
 			}
 
 			if (!t->data_ofs[data_type]) {
 				cli_err(appctx, "Data type not stored in this table\n");
 				HA_RWLOCK_WRUNLOCK(STK_SESS_LOCK, &ts->lock);
-				stktable_touch_local(t, ts, 1);
+				stktable_touch_local(t, ts, 0);
 				return 1;
 			}
 
 			if (!*args[cur_arg+1] || strl2llrc(args[cur_arg+1], strlen(args[cur_arg+1]), &value) != 0) {
 				cli_err(appctx, "Require a valid integer value to store\n");
 				HA_RWLOCK_WRUNLOCK(STK_SESS_LOCK, &ts->lock);
-				stktable_touch_local(t, ts, 1);
+				stktable_touch_local(t, ts, 0);
 				return 1;
 			}
 
@@ -5386,7 +5444,7 @@ static int table_process_entry(struct appctx *appctx, struct stksess *ts, char *
 				if (!ptr) {
 					cli_err(appctx, "index out of range in this data array\n");
 					HA_RWLOCK_WRUNLOCK(STK_SESS_LOCK, &ts->lock);
-					stktable_touch_local(t, ts, 1);
+					stktable_touch_local(t, ts, 0);
 					return 1;
 				}
 			}
@@ -5421,7 +5479,7 @@ static int table_process_entry(struct appctx *appctx, struct stksess *ts, char *
 			}
 		}
 		HA_RWLOCK_WRUNLOCK(STK_SESS_LOCK, &ts->lock);
-		stktable_touch_local(t, ts, 1);
+		stktable_touch_local(t, ts, 0);
 		break;
 
 	default:
@@ -5440,6 +5498,7 @@ static int table_process_entry_per_key(struct appctx *appctx, char **args)
 	struct stktable *t = ctx->target;
 	struct stksess *ts;
 	struct sample key;
+	int ret;
 
 	if (!*args[4])
 		return cli_err(appctx, "Key value expected\n");
@@ -5477,7 +5536,10 @@ static int table_process_entry_per_key(struct appctx *appctx, char **args)
 	} else
 		ts = stktable_lookup_key(t, &static_table_key);
 
-	return table_process_entry(appctx, ts, args);
+	ret = table_process_entry(appctx, &ts, args);
+	if (ts)
+		stktable_release(t, ts);
+	return ret;
 }
 
 /* Processes a single table entry matching a specific ptr passed in argument.
@@ -5490,6 +5552,7 @@ static int table_process_entry_per_ptr(struct appctx *appctx, char **args)
 	ulong ptr;
 	char *error;
 	struct stksess *ts;
+	int ret;
 
 	if (!*args[4] || args[4][0] != '0' || args[4][1] != 'x')
 		return cli_err(appctx, "Pointer expected (0xffff notation)\n");
@@ -5503,7 +5566,10 @@ static int table_process_entry_per_ptr(struct appctx *appctx, char **args)
 	if (!ts)
 		return cli_err(appctx, "No entry can be found matching ptr.\n");
 
-	return table_process_entry(appctx, ts, args);
+	ret = table_process_entry(appctx, &ts, args);
+	if (ts)
+		stktable_release(t, ts);
+	return ret;
 }
 
 /* Prepares the appctx fields with the data-based filters from the command line.

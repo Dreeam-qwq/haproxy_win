@@ -24,6 +24,8 @@
 
 #include <unistd.h>
 
+#include <import/ceb32_tree.h>
+
 #include <haproxy/api.h>
 #include <haproxy/applet-t.h>
 #include <haproxy/arg-t.h>
@@ -52,6 +54,7 @@ int parse_server(const char *file, int linenum, char **args, struct proxy *curpr
 int srv_update_addr(struct server *s, void *ip, int ip_sin_family, struct server_inetaddr_updater updater);
 struct sample_expr *_parse_srv_expr(char *expr, struct arg_list *args_px,
                                     const char *file, int linenum, char **err);
+int server_parse_exprs(struct server *srv, struct proxy *px, char **err);
 int server_set_inetaddr(struct server *s, const struct server_inetaddr *inetaddr, struct server_inetaddr_updater updater, struct buffer *msg);
 int server_set_inetaddr_warn(struct server *s, const struct server_inetaddr *inetaddr, struct server_inetaddr_updater updater);
 void server_get_inetaddr(struct server *s, struct server_inetaddr *inetaddr);
@@ -65,6 +68,7 @@ struct server *server_find_by_addr(struct proxy *px, const char *addr);
 struct server *server_find(struct proxy *bk, const char *name);
 struct server *server_find_unique(struct proxy *bk, const char *name, uint32_t rid);
 struct server *server_find_best_match(struct proxy *bk, char *name, int id, int *diff);
+uint server_get_next_id(const struct proxy *px, uint from);
 void apply_server_state(void);
 void srv_compute_all_admin_states(struct proxy *px);
 int srv_set_addr_via_libc(struct server *srv, int *err_code);
@@ -74,8 +78,8 @@ struct server *new_server(struct proxy *proxy);
 void srv_take(struct server *srv);
 struct server *srv_drop(struct server *srv);
 void srv_free_params(struct server *srv);
-int srv_init(struct server *srv);
-void srv_set_ssl(struct server *s, int use_ssl);
+int srv_preinit(struct server *srv);
+int srv_set_ssl(struct server *s, int use_ssl);
 const char *srv_adm_st_chg_cause(enum srv_adm_st_chg_cause cause);
 const char *srv_op_st_chg_cause(enum srv_op_st_chg_cause cause);
 void srv_event_hdl_publish_check(struct server *srv, struct check *check);
@@ -92,8 +96,8 @@ int snr_resolution_error_cb(struct resolv_requester *requester, int error_code);
 struct server *snr_check_ip_callback(struct server *srv, void *ip, unsigned char *ip_family);
 struct task *srv_cleanup_idle_conns(struct task *task, void *ctx, unsigned int state);
 void srv_release_conn(struct server *srv, struct connection *conn);
-struct connection *srv_lookup_conn(struct eb_root *tree, uint64_t hash);
-struct connection *srv_lookup_conn_next(struct connection *conn);
+struct connection *srv_lookup_conn(struct ceb_root **tree, uint64_t hash);
+struct connection *srv_lookup_conn_next(struct ceb_root **tree, struct connection *conn);
 
 void _srv_add_idle(struct server *srv, struct connection *conn, int is_safe);
 int srv_add_to_idle_list(struct server *srv, struct connection *conn, int is_safe);
@@ -179,11 +183,34 @@ void srv_set_dyncookie(struct server *s);
 int srv_check_reuse_ws(struct server *srv);
 const struct mux_ops *srv_get_ws_proto(struct server *srv);
 
+/* allocate a new server and return it (or NULL on failure). The structure is
+ * zeroed.
+ */
+static inline struct server *srv_alloc(void)
+{
+	return ha_aligned_zalloc_typed(1, struct server);
+}
+
+/* free a previously allocated server an nullifies the pointer */
+static inline void srv_free(struct server **srv_ptr)
+{
+	ha_aligned_free(*srv_ptr);
+	*srv_ptr = NULL;
+}
+
+/* index server <srv>'s id into proxy <px>'s used_server_id */
+static inline void server_index_id(struct proxy *px, struct server *srv)
+{
+	ceb32_item_insert(&px->conf.used_server_id, conf.puid_node, puid, srv);
+}
+
 /* increase the number of cumulated streams on the designated server */
 static inline void srv_inc_sess_ctr(struct server *s)
 {
-	_HA_ATOMIC_INC(&s->counters.shared->tg[tgid - 1]->cum_sess);
-	update_freq_ctr(&s->counters.shared->tg[tgid - 1]->sess_per_sec, 1);
+	if (s->counters.shared.tg[tgid - 1]) {
+		_HA_ATOMIC_INC(&s->counters.shared.tg[tgid - 1]->cum_sess);
+		update_freq_ctr(&s->counters.shared.tg[tgid - 1]->sess_per_sec, 1);
+	}
 	HA_ATOMIC_UPDATE_MAX(&s->counters.sps_max,
 	                     update_freq_ctr(&s->counters._sess_per_sec, 1));
 }
@@ -191,7 +218,8 @@ static inline void srv_inc_sess_ctr(struct server *s)
 /* set the time of last session on the designated server */
 static inline void srv_set_sess_last(struct server *s)
 {
-	HA_ATOMIC_STORE(&s->counters.shared->tg[tgid - 1]->last_sess,  ns_to_sec(now_ns));
+	if (s->counters.shared.tg[tgid - 1])
+		HA_ATOMIC_STORE(&s->counters.shared.tg[tgid - 1]->last_sess,  ns_to_sec(now_ns));
 }
 
 /* returns the current server throttle rate between 0 and 100% */
@@ -349,10 +377,7 @@ static inline void srv_detach(struct server *srv)
  */
 static inline struct server *server_find_by_id(struct proxy *bk, int id)
 {
-	struct eb32_node *eb32;
-
-	eb32 = eb32_lookup(&bk->conf.used_server_id, id);
-	return eb32 ? container_of(eb32, struct server, conf.id) : NULL;
+	return ceb32_item_lookup(&bk->conf.used_server_id, conf.puid_node, puid, id, struct server);
 }
 
 

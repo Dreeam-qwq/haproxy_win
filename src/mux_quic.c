@@ -33,9 +33,9 @@
 #include <haproxy/trace.h>
 #include <haproxy/xref.h>
 
-DECLARE_POOL(pool_head_qcc, "qcc", sizeof(struct qcc));
-DECLARE_POOL(pool_head_qcs, "qcs", sizeof(struct qcs));
-DECLARE_STATIC_POOL(pool_head_qc_stream_rxbuf, "qc_stream_rxbuf", sizeof(struct qc_stream_rxbuf));
+DECLARE_TYPED_POOL(pool_head_qcc, "qcc", struct qcc);
+DECLARE_TYPED_POOL(pool_head_qcs, "qcs", struct qcs);
+DECLARE_STATIC_TYPED_POOL(pool_head_qc_stream_rxbuf, "qc_stream_rxbuf", struct qc_stream_rxbuf);
 
 static void qmux_ctrl_send(struct qc_stream_desc *, uint64_t data, uint64_t offset);
 static void qmux_ctrl_room(struct qc_stream_desc *, uint64_t room);
@@ -134,6 +134,7 @@ static struct qcs *qcs_new(struct qcc *qcc, uint64_t id, enum qcs_type type)
 
 	qcs->stream = NULL;
 	qcs->qcc = qcc;
+	qcs->sess = NULL;
 	qcs->sd = NULL;
 	qcs->flags = QC_SF_NONE;
 	qcs->st = QC_SS_IDLE;
@@ -315,25 +316,26 @@ static void qcc_refresh_timeout(struct qcc *qcc)
 		goto leave;
 	}
 
-	/* Frontend timeout management
-	 * - shutdown done -> timeout client-fin
+	/* Timeout management
 	 * - detached streams with data left to send -> default timeout
-	 * - stream waiting on incomplete request or no stream yet activated -> timeout http-request
-	 * - idle after stream processing -> timeout http-keep-alive
+	 * - shutdown done -> timeout client-fin
+	 * - (FE only) stream waiting on incomplete request or no stream yet activated -> timeout http-request
+	 * - (FE only) idle after stream processing -> timeout http-keep-alive
 	 *
 	 * If proxy stop-stop in progress, immediate or spread close will be
 	 * processed if shutdown already one or connection is idle.
 	 */
-	if (!conn_is_back(qcc->conn)) {
-		if (qcc->nb_hreq && qcc->app_st < QCC_APP_ST_SHUT) {
-			TRACE_DEVEL("one or more requests still in progress", QMUX_EV_QCC_WAKE, qcc->conn);
-			qcc->task->expire = tick_add_ifset(now_ms, qcc->timeout);
-			task_queue(qcc->task);
-			goto leave;
-		}
-
-		if ((!LIST_ISEMPTY(&qcc->opening_list) || unlikely(!qcc->largest_bidi_r)) &&
-		    qcc->app_st < QCC_APP_ST_SHUT) {
+	if (!LIST_ISEMPTY(&qcc->send_list) || !LIST_ISEMPTY(&qcc->tx.frms)) {
+		TRACE_DEVEL("pending output data", QMUX_EV_QCC_WAKE, qcc->conn);
+		qcc->task->expire = tick_add_ifset(now_ms, qcc->timeout);
+	}
+	else if (qcc->app_st >= QCC_APP_ST_SHUT) {
+		TRACE_DEVEL("connection in closing", QMUX_EV_QCC_WAKE, qcc->conn);
+		qcc->task->expire = tick_add_ifset(now_ms,
+		                                   qcc->shut_timeout);
+	}
+	else if (!conn_is_back(qcc->conn)) {
+		if (!LIST_ISEMPTY(&qcc->opening_list) || unlikely(!qcc->largest_bidi_r)) {
 			int timeout = px->timeout.httpreq;
 			struct qcs *qcs = NULL;
 			int base_time;
@@ -349,62 +351,52 @@ static void qcc_refresh_timeout(struct qcc *qcc)
 			qcc->task->expire = tick_add_ifset(base_time, timeout);
 		}
 		else {
-			if (qcc->app_st >= QCC_APP_ST_SHUT) {
-				TRACE_DEVEL("connection in closing", QMUX_EV_QCC_WAKE, qcc->conn);
-				qcc->task->expire = tick_add_ifset(now_ms,
-				                                   qcc->shut_timeout);
-			}
-			else {
-				/* Use http-request timeout if keep-alive timeout not set */
-				int timeout = tick_isset(px->timeout.httpka) ?
-				              px->timeout.httpka : px->timeout.httpreq;
-				TRACE_DEVEL("at least one request achieved but none currently in progress", QMUX_EV_QCC_WAKE, qcc->conn);
-				qcc->task->expire = tick_add_ifset(qcc->idle_start, timeout);
-			}
+			/* Use http-request timeout if keep-alive timeout not set */
+			int timeout = tick_isset(px->timeout.httpka) ?
+			              px->timeout.httpka : px->timeout.httpreq;
+			TRACE_DEVEL("at least one request achieved but none currently in progress", QMUX_EV_QCC_WAKE, qcc->conn);
+			qcc->task->expire = tick_add_ifset(qcc->idle_start, timeout);
+		}
 
-			/* If proxy soft-stop in progress and connection is
-			 * inactive, close the connection immediately. If a
-			 * close-spread-time is configured, randomly spread the
-			 * timer over a closing window.
-			 */
-			if ((qcc->proxy->flags & (PR_FL_DISABLED|PR_FL_STOPPED)) &&
-			    !(global.tune.options & GTUNE_DISABLE_ACTIVE_CLOSE)) {
-
-				/* Wake timeout task immediately if window already expired. */
-				int remaining_window = tick_isset(global.close_spread_end) ?
-				  tick_remain(now_ms, global.close_spread_end) : 0;
-
-				TRACE_DEVEL("proxy disabled, prepare connection soft-stop", QMUX_EV_QCC_WAKE, qcc->conn);
-				if (remaining_window) {
-					/* We don't need to reset the expire if it would
-					 * already happen before the close window end.
-					 */
-					if (!tick_isset(qcc->task->expire) ||
-					    tick_is_le(global.close_spread_end, qcc->task->expire)) {
-						/* Set an expire value shorter than the current value
-						 * because the close spread window end comes earlier.
-						 */
-						qcc->task->expire = tick_add(now_ms,
-						                             statistical_prng_range(remaining_window));
-					}
-				}
-				else {
-					/* We are past the soft close window end, wake the timeout
-					 * task up immediately.
-					 */
-					qcc->task->expire = tick_add(now_ms, 0);
-					task_wakeup(qcc->task, TASK_WOKEN_TIMER);
-				}
-			}
+		/* Fallback to client timeout if specific value not set. */
+		if (!tick_isset(qcc->task->expire)) {
+			TRACE_DEVEL("fallback to default timeout", QMUX_EV_QCC_WAKE, qcc->conn);
+			qcc->task->expire = tick_add_ifset(now_ms, qcc->timeout);
 		}
 	}
 
-	/* fallback to default timeout if frontend specific undefined or for
-	 * backend connections.
+	/* If proxy soft-stop in progress and connection is inactive,
+	 * close the connection immediately. If a close-spread-time is
+	 * configured, randomly spread the timer over a closing window.
 	 */
-	if (!tick_isset(qcc->task->expire)) {
-		TRACE_DEVEL("fallback to default timeout", QMUX_EV_QCC_WAKE, qcc->conn);
-		qcc->task->expire = tick_add_ifset(now_ms, qcc->timeout);
+	if ((qcc->proxy->flags & (PR_FL_DISABLED|PR_FL_STOPPED)) &&
+	    !(global.tune.options & GTUNE_DISABLE_ACTIVE_CLOSE)) {
+
+		/* Wake timeout task immediately if window already expired. */
+		int remaining_window = tick_isset(global.close_spread_end) ?
+		  tick_remain(now_ms, global.close_spread_end) : 0;
+
+		TRACE_DEVEL("proxy disabled, prepare connection soft-stop", QMUX_EV_QCC_WAKE, qcc->conn);
+		if (remaining_window) {
+			/* We don't need to reset the expire if it would
+			 * already happen before the close window end.
+			 */
+			if (!tick_isset(qcc->task->expire) ||
+			    tick_is_le(global.close_spread_end, qcc->task->expire)) {
+				/* Set an expire value shorter than the current value
+				 * because the close spread window end comes earlier.
+				 */
+				qcc->task->expire = tick_add(now_ms,
+				                             statistical_prng_range(remaining_window));
+			}
+		}
+		else {
+			/* We are past the soft close window end, wake the timeout
+			 * task up immediately.
+			 */
+			qcc->task->expire = tick_add(now_ms, 0);
+			task_wakeup(qcc->task, TASK_WOKEN_TIMER);
+		}
 	}
 
 	task_queue(qcc->task);
@@ -768,6 +760,10 @@ void qcc_set_error(struct qcc *qcc, int err, int app)
 int _qcc_report_glitch(struct qcc *qcc, int inc)
 {
 	const int max = global.tune.quic_frontend_glitches_threshold;
+
+	/* TODO add a BE limit for glitch counter */
+	if (qcc->flags & QC_CF_IS_BACK)
+		return 0;
 
 	qcc->glitches += inc;
 	if (max && qcc->glitches >= max && !(qcc->flags & QC_CF_ERRL) &&
@@ -1342,7 +1338,7 @@ static int qcc_decode_qcs(struct qcc *qcc, struct qcs *qcs)
 	if (!(qcs->flags & QC_SF_READ_ABORTED)) {
 		ret = qcc->app_ops->rcv_buf(qcs, &b, fin);
 
-		if (qcc->glitches != prev_glitches)
+		if (qcc->glitches != prev_glitches && !(qcc->flags & QC_CF_IS_BACK))
 			session_add_glitch_ctr(qcc->conn->owner, qcc->glitches - prev_glitches);
 
 		if (ret < 0) {
@@ -1861,6 +1857,14 @@ int qcc_recv(struct qcc *qcc, uint64_t id, uint64_t len, uint64_t offset,
 		offset = qcs->rx.offset;
 	}
 
+	if (len && (qcc->flags & QC_CF_WAIT_HS)) {
+		if (!(qcc->conn->flags & CO_FL_EARLY_DATA)) {
+			/* Ensure 'Early-data: 1' will be set on the request. */
+			TRACE_PROTO("received early data", QMUX_EV_QCC_RECV|QMUX_EV_QCS_RECV, qcc->conn, qcs);
+			qcc->conn->flags |= CO_FL_EARLY_DATA;
+		}
+	}
+
 	left = len;
 	while (left) {
 		struct qc_stream_rxbuf *buf;
@@ -2159,7 +2163,7 @@ int qcc_recv_reset_stream(struct qcc *qcc, uint64_t id, uint64_t err, uint64_t f
 	}
 
  out:
-	if (qcc->glitches != prev_glitches)
+	if (qcc->glitches != prev_glitches && !(qcc->flags & QC_CF_IS_BACK))
 		session_add_glitch_ctr(qcc->conn->owner, qcc->glitches - prev_glitches);
 
 	TRACE_LEAVE(QMUX_EV_QCC_RECV, qcc->conn);
@@ -2265,7 +2269,7 @@ int qcc_recv_stop_sending(struct qcc *qcc, uint64_t id, uint64_t err)
 		qcc_refresh_timeout(qcc);
 
  out:
-	if (qcc->glitches != prev_glitches)
+	if (qcc->glitches != prev_glitches && !(qcc->flags & QC_CF_IS_BACK))
 		session_add_glitch_ctr(qcc->conn->owner, qcc->glitches - prev_glitches);
 
 	TRACE_LEAVE(QMUX_EV_QCC_RECV, qcc->conn);
@@ -3137,6 +3141,15 @@ static int qmux_avail_streams(struct connection *conn)
 	return qcc_fctl_avail_streams(qcc, 1);
 }
 
+/* Returns the number of streams currently attached into <conn> connection.
+ * Used to determine if a connection can be considered as idle or not.
+ */
+static int qmux_used_streams(struct connection *conn)
+{
+	struct qcc *qcc = conn->ctx;
+	return qcc->nb_sc;
+}
+
 /* Release all streams which have their transfer operation achieved. */
 static void qcc_purge_streams(struct qcc *qcc)
 {
@@ -3189,6 +3202,10 @@ static void qcc_shutdown(struct qcc *qcc)
 	 */
 	if (!(qcc->conn->handle.qc->flags & QUIC_FL_CONN_IMMEDIATE_CLOSE))
 		qcc->conn->handle.qc->err = qcc->err;
+
+	/* A connection is not reusable if app layer is closed. */
+	if (qcc->flags & QC_CF_IS_BACK)
+		conn_delete_from_tree(qcc->conn, tid);
 
  out:
 	qcc->app_st = QCC_APP_ST_SHUT;
@@ -3343,8 +3360,6 @@ static void qcc_release(struct qcc *qcc)
 	pool_free(pool_head_qcc, qcc);
 
 	if (conn) {
-		LIST_DEL_INIT(&conn->stopping_list);
-
 		conn->mux = NULL;
 		conn->ctx = NULL;
 
@@ -3360,11 +3375,49 @@ static void qcc_release(struct qcc *qcc)
 	TRACE_LEAVE(QMUX_EV_QCC_END);
 }
 
-struct task *qcc_io_cb(struct task *t, void *ctx, unsigned int status)
+struct task *qcc_io_cb(struct task *t, void *ctx, unsigned int state)
 {
 	struct qcc *qcc = ctx;
+	struct connection *conn;
+	int conn_in_list;
 
-	TRACE_ENTER(QMUX_EV_QCC_WAKE, qcc->conn);
+	if (state & TASK_F_USR1) {
+		/* the tasklet was idling on an idle connection, it might have
+		 * been stolen, let's be careful!
+		 */
+		HA_SPIN_LOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
+		if (t->context == NULL) {
+			/* The connection has been taken over by another thread,
+			 * we're no longer responsible for it, so just free the
+			 * tasklet, and do nothing.
+			 */
+			HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
+			tasklet_free((struct tasklet *)t);
+			t = NULL;
+			TRACE_LEAVE(QMUX_EV_QCC_WAKE);
+			return NULL;
+		}
+		conn = qcc->conn;
+		TRACE_ENTER(QMUX_EV_QCC_WAKE, conn);
+
+		/* Remove the connection from the list, to be sure nobody attempts
+		 * to use it while we handle the I/O events
+		 */
+		conn_in_list = conn->flags & (CO_FL_LIST_MASK|CO_FL_SESS_IDLE);
+		if (conn_in_list) {
+			if (conn->flags & CO_FL_SESS_IDLE)
+				session_detach_idle_conn(conn->owner, conn);
+			else
+				conn_delete_from_tree(conn, tid);
+		}
+
+		HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
+	} else {
+		/* we're certain the connection was not in an idle list */
+		conn = qcc->conn;
+		TRACE_ENTER(QMUX_EV_QCC_WAKE, conn);
+		conn_in_list = 0;
+	}
 
 	if (!(qcc->wait_event.events & SUB_RETRY_SEND))
 		qcc_io_send(qcc);
@@ -3372,19 +3425,43 @@ struct task *qcc_io_cb(struct task *t, void *ctx, unsigned int status)
 	qcc_io_recv(qcc);
 
 	if (qcc_io_process(qcc)) {
-		TRACE_STATE("releasing dead connection", QMUX_EV_QCC_WAKE, qcc->conn);
+		TRACE_STATE("releasing dead connection", QMUX_EV_QCC_WAKE, conn);
 		goto release;
 	}
 
 	qcc_refresh_timeout(qcc);
 
 	/* Trigger pacing task is emission should be retried after some delay. */
-	if (qcc_is_pacing_active(qcc->conn)) {
+	if (qcc_is_pacing_active(conn)) {
 		if (tick_isset(qcc->pacing_task->expire))
 			task_queue(qcc->pacing_task);
 	}
 
-	TRACE_LEAVE(QMUX_EV_QCC_WAKE, qcc->conn);
+	if (conn_in_list) {
+		struct server *srv = __objt_server(conn->target);
+
+		if (srv->cur_admin & SRV_ADMF_MAINT) {
+			/* Do not store an idle conn if server in maintenance. */
+			goto release;
+		}
+
+		if (conn->flags & CO_FL_SESS_IDLE) {
+			if (!session_reinsert_idle_conn(conn->owner, conn)) {
+				/* session add conn failure */
+				goto release;
+			}
+		}
+		else {
+			HA_SPIN_LOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
+			_srv_add_idle(srv, conn, conn_in_list == CO_FL_SAFE_LIST);
+			HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
+		}
+
+		/* Do not access conn without protection as soon as it is reinserted in idle list. */
+		conn = NULL;
+	}
+
+	TRACE_LEAVE(QMUX_EV_QCC_WAKE, conn);
 
 	return t;
 
@@ -3426,16 +3503,40 @@ static struct task *qcc_timeout_task(struct task *t, void *ctx, unsigned int sta
 	TRACE_ENTER(QMUX_EV_QCC_WAKE, qcc ? qcc->conn : NULL);
 
 	if (qcc) {
+		 /* Make sure nobody stole the connection from us */
+		HA_SPIN_LOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
+
+		/* Somebody already stole the connection from us, so we should
+		 * not free it, we just have to free the task.
+		 */
+		if (!t->context) {
+			qcc = NULL;
+			HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
+			goto out;
+		}
+
 		if (!expired) {
+			HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
 			TRACE_DEVEL("not expired", QMUX_EV_QCC_WAKE, qcc->conn);
 			goto requeue;
 		}
 
 		if (!qcc_may_expire(qcc)) {
+			HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
 			TRACE_DEVEL("cannot expired", QMUX_EV_QCC_WAKE, qcc->conn);
 			t->expire = TICK_ETERNITY;
 			goto requeue;
 		}
+
+		/* We're about to destroy the connection, so make sure nobody
+		 * attempts to steal it from us.
+		 */
+		if (qcc->conn->flags & CO_FL_LIST_MASK)
+			conn_delete_from_tree(qcc->conn, tid);
+		else if (qcc->conn->flags & CO_FL_SESS_IDLE)
+			session_unown_conn(qcc->conn->owner, qcc->conn);
+
+		HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
 	}
 
 	task_destroy(t);
@@ -3666,6 +3767,7 @@ static int qmux_init(struct connection *conn, struct proxy *prx,
 			goto err;
 		}
 
+		qcs->sess = sess;
 		qcs->sd = sc->sedesc;
 		qcc->nb_sc++;
 	}
@@ -3688,7 +3790,7 @@ static int qmux_init(struct connection *conn, struct proxy *prx,
 		conn->ctx = NULL;
 	}
 
-	TRACE_DEVEL("leaving on error", QMUX_EV_QCC_NEW, conn);
+	TRACE_DEVEL("leaving on error", QMUX_EV_QCC_NEW, qcc ? conn : NULL);
 	return -1;
 }
 
@@ -3713,6 +3815,9 @@ static int qmux_strm_attach(struct connection *conn, struct sedesc *sd, struct s
 	 */
 	BUG_ON(!qcc_fctl_avail_streams(qcc, 1));
 
+	/* Connnection should not be reused if already on error/closed. */
+	BUG_ON(qcc->flags & QC_CF_ERRL || qcc->app_st >= QCC_APP_ST_SHUT);
+
 	qcs = qcc_init_stream_local(qcc, 1);
 	if (!qcs) {
 		TRACE_DEVEL("leaving on error", QMUX_EV_QCS_NEW, qcc->conn);
@@ -3725,8 +3830,13 @@ static int qmux_strm_attach(struct connection *conn, struct sedesc *sd, struct s
 		return -1;
 	}
 
+	qcs->sess = sess;
 	qcs->sd = sd->sc->sedesc;
 	qcc->nb_sc++;
+
+	/* the connection is not idle anymore, let's mark this */
+	HA_ATOMIC_AND(&qcc->wait_event.tasklet->state, ~TASK_F_USR1);
+	xprt_set_used(qcc->conn, qcc->conn->xprt, qcc->conn->xprt_ctx);
 
 	TRACE_LEAVE(QMUX_EV_QCS_NEW, conn);
 	return 0;
@@ -3736,8 +3846,10 @@ static void qmux_strm_detach(struct sedesc *sd)
 {
 	struct qcs *qcs = sd->se;
 	struct qcc *qcc = qcs->qcc;
+	struct connection *conn = qcc->conn;
+	struct session *sess = qcs->sess;
 
-	TRACE_ENTER(QMUX_EV_STRM_END, qcc->conn, qcs);
+	TRACE_ENTER(QMUX_EV_STRM_END, conn, qcs);
 
 	/* TODO this BUG_ON_HOT() is not correct as the stconn layer may detach
 	 * from the stream even if it is not closed remotely at the QUIC layer.
@@ -3752,7 +3864,7 @@ static void qmux_strm_detach(struct sedesc *sd)
 
 	if (!qcs_is_close_local(qcs) &&
 	    !(qcc->flags & (QC_CF_ERR_CONN|QC_CF_ERRL))) {
-		TRACE_STATE("remaining data, detaching qcs", QMUX_EV_STRM_END, qcc->conn, qcs);
+		TRACE_STATE("remaining data, detaching qcs", QMUX_EV_STRM_END, conn, qcs);
 		qcs->flags |= QC_SF_DETACH;
 		qcc_refresh_timeout(qcc);
 
@@ -3762,16 +3874,88 @@ static void qmux_strm_detach(struct sedesc *sd)
 
 	qcs_destroy(qcs);
 
+	/* Backend connection can be reused unless it is already on error/closed. */
+	if ((qcc->flags & QC_CF_IS_BACK) && !qcc_is_dead(qcc) &&
+	    qcc->app_st == QCC_APP_ST_INIT) {
+		if (conn->flags & CO_FL_PRIVATE) {
+			TRACE_DEVEL("handle private connection reuse", QMUX_EV_STRM_END, conn);
+
+			/* Ensure conn is attached into session. Most of the times
+			 * this is already done during connect so this is a no-op.
+			 */
+			if (!session_add_conn(sess, conn)) {
+				TRACE_ERROR("error during connection insert into session list", QMUX_EV_STRM_END, conn);
+				conn->owner = NULL;
+			}
+
+			if (!qcc->nb_sc) {
+				if (!conn->owner) {
+					/* Session insertion above has failed and connection is idle, remove it. */
+					goto release;
+				}
+
+				/* mark that the tasklet may lose its context to another thread and
+				 * that the handler needs to check it under the idle conns lock.
+				 */
+				HA_ATOMIC_OR(&qcc->wait_event.tasklet->state, TASK_F_USR1);
+				xprt_set_idle(qcc->conn, qcc->conn->xprt, qcc->conn->xprt_ctx);
+
+				/* Ensure session can keep a new idle connection. */
+				if (session_check_idle_conn(sess, conn)) {
+					TRACE_DEVEL("idle conn rejected by session", QMUX_EV_STRM_END, conn);
+					goto release;
+				}
+				/* At this point, the connection is inserted into
+				 * session list and marked as idle, so it may already
+				 * have been purged from another thread.
+				 */
+				conn = NULL;
+				goto end;
+			}
+		}
+		else {
+			if (!qcc->nb_sc) {
+				TRACE_DEVEL("prepare for idle connection reuse", QMUX_EV_STRM_END, conn);
+
+				/* mark that the tasklet may lose its context to another thread and
+				 * that the handler needs to check it under the idle conns lock.
+				 */
+				HA_ATOMIC_OR(&qcc->wait_event.tasklet->state, TASK_F_USR1);
+				xprt_set_idle(qcc->conn, qcc->conn->xprt, qcc->conn->xprt_ctx);
+
+				if (!srv_add_to_idle_list(objt_server(conn->target), conn, 1)) {
+					/* Idle conn insert failure, gracefully close the connection. */
+					TRACE_DEVEL("idle connection cannot be kept on the server", QMUX_EV_STRM_END, conn);
+					goto release;
+				}
+
+				/* At this point, the connection has been added to the
+				 * server idle list, so another thread may already have
+				 * hijacked it, so we can't do anything with it.
+				 */
+				conn = NULL;
+				goto end;
+			}
+			else if (!ceb_intree(&conn->hash_node.node) &&
+			         qmux_avail_streams(conn) &&
+			         objt_server(conn->target)) {
+				TRACE_DEVEL("mark connection as available for reuse", QMUX_EV_STRM_END, conn);
+				srv_add_to_avail_list(__objt_server(conn->target), conn);
+			}
+		}
+	}
+
 	if (qcc_is_dead(qcc)) {
-		TRACE_STATE("killing dead connection", QMUX_EV_STRM_END, qcc->conn);
+		TRACE_STATE("killing dead connection", QMUX_EV_STRM_END, conn);
 		goto release;
 	}
 	else {
-		TRACE_DEVEL("refreshing connection's timeout", QMUX_EV_STRM_END, qcc->conn);
+		TRACE_DEVEL("refreshing connection's timeout", QMUX_EV_STRM_END, conn);
 		qcc_refresh_timeout(qcc);
 	}
 
-	TRACE_LEAVE(QMUX_EV_STRM_END, qcc->conn);
+ end:
+	TRACE_LEAVE(QMUX_EV_STRM_END, conn);
 	return;
 
  release:
@@ -3868,9 +4052,6 @@ static size_t qmux_strm_snd_buf(struct stconn *sc, struct buffer *buf,
 
 	TRACE_ENTER(QMUX_EV_STRM_SEND, qcs->qcc->conn, qcs);
 
-	/* Stream must not be woken up if already waiting for conn buffer. */
-	BUG_ON(LIST_INLIST(&qcs->el_buf));
-
 	/* Sending forbidden if QCS is locally closed (FIN or RESET_STREAM sent). */
 	BUG_ON(qcs_is_close_local(qcs) || (qcs->flags & QC_SF_TO_RESET));
 
@@ -3881,6 +4062,11 @@ static size_t qmux_strm_snd_buf(struct stconn *sc, struct buffer *buf,
 	if (qcs->qcc->flags & (QC_CF_ERR_CONN|QC_CF_ERRL)) {
 		se_fl_set(qcs->sd, SE_FL_ERROR);
 		TRACE_DEVEL("connection in error", QMUX_EV_STRM_SEND, qcs->qcc->conn, qcs);
+		goto end;
+	}
+
+	if (LIST_INLIST(&qcs->el_buf)) {
+		TRACE_DEVEL("leaving on no buf avail", QMUX_EV_STRM_SEND, qcs->qcc->conn, qcs);
 		goto end;
 	}
 
@@ -3934,9 +4120,6 @@ static size_t qmux_strm_nego_ff(struct stconn *sc, struct buffer *input,
 
 	TRACE_ENTER(QMUX_EV_STRM_SEND, qcs->qcc->conn, qcs);
 
-	/* Stream must not be woken up if already waiting for conn buffer. */
-	BUG_ON(LIST_INLIST(&qcs->el_buf));
-
 	/* Sending forbidden if QCS is locally closed (FIN or RESET_STREAM sent). */
 	BUG_ON(qcs_is_close_local(qcs) || (qcs->flags & QC_SF_TO_RESET));
 
@@ -3955,6 +4138,12 @@ static size_t qmux_strm_nego_ff(struct stconn *sc, struct buffer *input,
 		 */
 		TRACE_DEVEL("connection in error", QMUX_EV_STRM_SEND, qcs->qcc->conn, qcs);
 		qcs->sd->iobuf.flags |= IOBUF_FL_NO_FF;
+		goto end;
+	}
+
+	if (LIST_INLIST(&qcs->el_buf)) {
+		TRACE_DEVEL("leaving on no buf avail", QMUX_EV_STRM_SEND, qcs->qcc->conn, qcs);
+		qcs->sd->iobuf.flags |= IOBUF_FL_FF_BLOCKED;
 		goto end;
 	}
 
@@ -4255,6 +4444,8 @@ static const struct mux_ops qmux_ops = {
 	.unsubscribe = qmux_strm_unsubscribe,
 	.wake        = qmux_wake,
 	.avail_streams = qmux_avail_streams,
+	.used_streams = qmux_used_streams,
+	.takeover    = NULL,  /* QUIC takeover support not implemented yet */
 	.attach      = qmux_strm_attach,
 	.shut        = qmux_strm_shut,
 	.ctl         = qmux_ctl,

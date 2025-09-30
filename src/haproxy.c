@@ -157,6 +157,8 @@ static unsigned long stopping_tgroup_mask; /* Thread groups acknowledging stoppi
 
 /* global options */
 struct global global = {
+	.uid = -1, // not set
+	.gid = -1, // not set
 	.hard_stop_after = TICK_ETERNITY,
 	.close_spread_time = TICK_ETERNITY,
 	.close_spread_end = TICK_ETERNITY,
@@ -614,6 +616,42 @@ void display_version()
 	}
 }
 
+/* display_mode:
+ * 0 = short version (e.g., "3.3.1")
+ * 1 = full version (e.g., "3.3.1-dev5-1bb975-71")
+ * 2 = branch version (e.g., "3.3")
+ */
+void display_version_plain(int display_mode)
+{
+	char out[30] = "";
+	int dots = 0;
+	int i;
+
+	if (display_mode == 1) {
+		printf("%s\n", haproxy_version);
+		return;
+	}
+
+	for (i = 0; i < sizeof(out) - 1 && haproxy_version[i]; i++) {
+		if (display_mode == 2) {
+			if (haproxy_version[i] == '.') dots++;
+			if (dots == 2 || haproxy_version[i] == '-') {
+				out[i] = '\0';
+				break;
+			}
+		} else {
+			if ((haproxy_version[i] < '0' || haproxy_version[i] > '9') && haproxy_version[i] != '.') {
+				out[i] = '\0';
+				break;
+			}
+		}
+		out[i] = haproxy_version[i];
+		out[i+1] = '\0';
+	}
+
+	printf("%s\n", out);
+}
+
 static void display_build_opts()
 {
 	const char **opt;
@@ -656,9 +694,10 @@ static void usage(char *name)
 		"D ] [ -n <maxconn> ] [ -N <maxpconn> ]\n"
 		"        [ -p <pidfile> ] [ -m <max megs> ] [ -C <dir> ] [-- <cfgfile>*]\n"
 		"        -v displays version ; -vv shows known build options.\n"
+		"        -vq/-vqs/-vqb only displays version, short version, branch.\n"
 		"        -d enters debug mode ; -db only disables background mode.\n"
 		"        -dM[<byte>,help,...] debug memory (default: poison with <byte>/0x50)\n"
-		"        -dt activate traces on stderr\n"
+		"        -dt activate traces on stderr; see '-dt help'\n"
 		"        -V enters verbose mode (disables quiet mode)\n"
 		"        -D goes daemon ; -C changes to <dir> before loading files.\n"
 		"        -W master-worker mode.\n"
@@ -708,6 +747,9 @@ static void usage(char *name)
 		"        -dF disable fast-forward\n"
 		"        -dI enable insecure fork\n"
 		"        -dZ disable zero-copy forwarding\n"
+#if defined(HA_USE_KTLS)
+		"        -dT disable kTLS\n"
+#endif
 		"        -sf/-st [pid ]* finishes/terminates old pids.\n"
 		"        -x <unix_socket> get listening sockets from a unix socket\n"
 		"        -S <bind>[,<bind options>...] new master CLI\n"
@@ -819,7 +861,7 @@ static void sig_dump_state(struct sig_handler *sh)
 			             "SIGHUP: Server %s/%s is %s. Conn: %d act, %d pend, %llu tot.",
 			             p->id, s->id,
 			             (s->cur_state != SRV_ST_STOPPED) ? "UP" : "DOWN",
-			             s->cur_sess, s->queueslength, (ullong)COUNTERS_SHARED_TOTAL(s->counters.shared->tg, cum_sess, HA_ATOMIC_LOAD));
+			             s->cur_sess, s->queueslength, (ullong)COUNTERS_SHARED_TOTAL(s->counters.shared.tg, cum_sess, HA_ATOMIC_LOAD));
 			ha_warning("%s\n", trash.area);
 			send_log(p, LOG_NOTICE, "%s\n", trash.area);
 			s = s->next;
@@ -830,19 +872,19 @@ static void sig_dump_state(struct sig_handler *sh)
 			chunk_printf(&trash,
 			             "SIGHUP: Proxy %s has no servers. Conn: act(FE+BE): %d+%d, %d pend (%d unass), tot(FE+BE): %llu+%llu.",
 			             p->id,
-			             p->feconn, p->beconn, p->totpend, p->queueslength, (ullong)COUNTERS_SHARED_TOTAL(p->fe_counters.shared->tg, cum_conn, HA_ATOMIC_LOAD), (ullong)COUNTERS_SHARED_TOTAL(p->be_counters.shared->tg, cum_sess, HA_ATOMIC_LOAD));
+			             p->feconn, p->beconn, p->totpend, p->queueslength, (ullong)COUNTERS_SHARED_TOTAL(p->fe_counters.shared.tg, cum_conn, HA_ATOMIC_LOAD), (ullong)COUNTERS_SHARED_TOTAL(p->be_counters.shared.tg, cum_sess, HA_ATOMIC_LOAD));
 		} else if (p->srv_act == 0) {
 			chunk_printf(&trash,
 			             "SIGHUP: Proxy %s %s ! Conn: act(FE+BE): %d+%d, %d pend (%d unass), tot(FE+BE): %llu+%llu.",
 			             p->id,
 			             (p->srv_bck) ? "is running on backup servers" : "has no server available",
-			             p->feconn, p->beconn, p->totpend, p->queueslength, (ullong)COUNTERS_SHARED_TOTAL(p->fe_counters.shared->tg, cum_conn, HA_ATOMIC_LOAD), (ullong)COUNTERS_SHARED_TOTAL(p->be_counters.shared->tg, cum_sess, HA_ATOMIC_LOAD));
+			             p->feconn, p->beconn, p->totpend, p->queueslength, (ullong)COUNTERS_SHARED_TOTAL(p->fe_counters.shared.tg, cum_conn, HA_ATOMIC_LOAD), (ullong)COUNTERS_SHARED_TOTAL(p->be_counters.shared.tg, cum_sess, HA_ATOMIC_LOAD));
 		} else {
 			chunk_printf(&trash,
 			             "SIGHUP: Proxy %s has %d active servers and %d backup servers available."
 			             " Conn: act(FE+BE): %d+%d, %d pend (%d unass), tot(FE+BE): %llu+%llu.",
 			             p->id, p->srv_act, p->srv_bck,
-			             p->feconn, p->beconn, p->totpend, p->queueslength, (ullong)COUNTERS_SHARED_TOTAL(p->fe_counters.shared->tg, cum_conn, HA_ATOMIC_LOAD), (ullong)COUNTERS_SHARED_TOTAL(p->be_counters.shared->tg, cum_sess, HA_ATOMIC_LOAD));
+			             p->feconn, p->beconn, p->totpend, p->queueslength, (ullong)COUNTERS_SHARED_TOTAL(p->fe_counters.shared.tg, cum_conn, HA_ATOMIC_LOAD), (ullong)COUNTERS_SHARED_TOTAL(p->be_counters.shared.tg, cum_sess, HA_ATOMIC_LOAD));
 		}
 		ha_warning("%s\n", trash.area);
 		send_log(p, LOG_NOTICE, "%s\n", trash.area);
@@ -853,8 +895,7 @@ static void sig_dump_state(struct sig_handler *sh)
 
 static void dump(struct sig_handler *sh)
 {
-	/* dump memory usage then free everything possible */
-	dump_pools();
+	/* free everything possible */
 	pool_gc(NULL);
 }
 
@@ -1472,10 +1513,24 @@ static void init_args(int argc, char **argv)
 
 			/* 1 arg */
 			if (*flag == 'v') {
-				display_version();
-				if (flag[1] == 'v')  /* -vv */
-					display_build_opts();
-				deinit_and_exit(0);
+				if (flag[1] == 'q' && flag[2] == 's' && flag[3] == '\0') {
+					display_version_plain(0);  // -vqs
+					deinit_and_exit(0);
+				}
+				else if (flag[1] == 'q' && flag[2] == 'b' && flag[3] == '\0') {
+					display_version_plain(2);  // -vqb
+					deinit_and_exit(0);
+				}
+				else if (flag[1] == 'q' && flag[2] == '\0') {
+					display_version_plain(1);  // -vq
+					deinit_and_exit(0);
+				}
+				else {
+					display_version();
+					if (flag[1] == 'v')  // -vv
+						display_build_opts();
+					deinit_and_exit(0);
+				}
 			}
 #if defined(USE_EPOLL)
 			else if (*flag == 'd' && flag[1] == 'e')
@@ -1568,26 +1623,33 @@ static void init_args(int argc, char **argv)
 				kwd_dump = flag + 2;
 			}
 			else if (*flag == 'd' && flag[1] == 't') {
-				if (argc > 1 && argv[1][0] != '-') {
-					int ret = trace_parse_cmd(argv[1], &err_msg);
-					if (ret <= -1) {
-						if (ret < -1) {
-							ha_alert("-dt: %s.\n", err_msg);
-							ha_free(&err_msg);
-							exit(EXIT_FAILURE);
-						}
-						else {
-							printf("%s\n", err_msg);
-							ha_free(&err_msg);
-							exit(0);
-						}
-					}
+				char *arg = flag + 2;
+				int ret;
+
+				if (!*arg && argc > 1 && argv[1][0] != '-') {
+					arg = argv[1];
 					argc--; argv++;
 				}
-				else {
-					trace_parse_cmd(NULL, NULL);
+
+				ret = trace_parse_cmd(arg, &err_msg);
+				if (ret <= -1) {
+					if (ret < -1) {
+						ha_alert("-dt: %s.\n", err_msg);
+						ha_free(&err_msg);
+						exit(EXIT_FAILURE);
+					}
+					else {
+						printf("%s\n", err_msg);
+						ha_free(&err_msg);
+						exit(0);
+					}
 				}
 			}
+#ifdef HA_USE_KTLS
+			else if (*flag == 'd' && flag[1] == 'T') {
+				global.tune.options |= GTUNE_NO_KTLS;
+			}
+#endif
 			else if (*flag == 'd')
 				arg_mode |= MODE_DEBUG;
 			else if (*flag == 'c' && flag[1] == 'c') {
@@ -2053,12 +2115,12 @@ static void step_init_2(int argc, char** argv)
 	/* destroy unreferenced defaults proxies  */
 	proxy_destroy_all_unref_defaults();
 
-	list_for_each_entry(prcf, &pre_check_list, list)
+	list_for_each_entry(prcf, &pre_check_list, list) {
 		err_code |= prcf->fct();
-
-	if (err_code & (ERR_ABORT|ERR_FATAL)) {
-		ha_alert("Fatal errors found in configuration.\n");
-		exit(1);
+		if (err_code & (ERR_ABORT|ERR_FATAL)) {
+			ha_alert("Fatal errors found in configuration.\n");
+			exit(1);
+		}
 	}
 
 	/* update the ready date that will be used to count the startup time
@@ -2097,6 +2159,13 @@ static void step_init_2(int argc, char** argv)
 		exit(1);
 	}
 
+	/* now that config was parsed and checked
+	 * prepare and preload shm-stats-file (if set)
+	 */
+	err_code |= shm_stats_file_prepare();
+	if (err_code & (ERR_ABORT|ERR_FATAL))
+		exit(1);
+
 	/* update the ready date to also account for the check time */
 	clock_update_date(0, 1);
 	clock_adjust_now_offset();
@@ -2111,16 +2180,23 @@ static void step_init_2(int argc, char** argv)
 			continue;
 
 		list_for_each_entry(pscf, &post_server_check_list, list) {
-			for (srv = px->srv; srv; srv = srv->next)
+			for (srv = px->srv; srv; srv = srv->next) {
 				err_code |= pscf->fct(srv);
+				if (err_code & (ERR_ABORT|ERR_FATAL)) {
+					ha_alert("Fatal errors found in configuration.\n");
+					exit(1);
+				}
+			}
 		}
-		list_for_each_entry(ppcf, &post_proxy_check_list, list)
+		list_for_each_entry(ppcf, &post_proxy_check_list, list) {
 			err_code |= ppcf->fct(px);
+			if (err_code & (ERR_ABORT|ERR_FATAL)) {
+				ha_alert("Fatal errors found in configuration.\n");
+				exit(1);
+			}
+
+		}
 		px->flags |= PR_FL_CHECKED;
-	}
-	if (err_code & (ERR_ABORT|ERR_FATAL)) {
-		ha_alert("Fatal errors found in configuration.\n");
-		exit(1);
 	}
 
 	err_code |= pattern_finalize_config();
@@ -2214,19 +2290,6 @@ static void step_init_2(int argc, char** argv)
 
 	if (global.mode & MODE_DUMP_CFG)
 		deinit_and_exit(0);
-
-#ifdef USE_OPENSSL
-
-	/* Initialize SSL random generator. Must be called before chroot for
-	 * access to /dev/urandom, and before ha_random_boot() which may use
-	 * RAND_bytes().
-	 */
-	if (!ssl_initialize_random()) {
-		ha_alert("OpenSSL random data generator initialization failed.\n");
-		exit(EXIT_FAILURE);
-	}
-#endif
-	ha_random_boot(argv); // the argv pointer brings some kernel-fed entropy
 
 	/* now we know the buffer size, we can initialize the channels and buffers */
 	init_buffer();
@@ -2856,7 +2919,11 @@ void run_poll_loop()
 				wake = 0;
 		}
 
-		if (!wake) {
+		/* Note below: threads only check the quit condition when idle,
+		 * but for tid>0 we also need to skip that if the signal queue
+		 * is non-empty otherwise we risk quitting too early.
+		 */
+		if (!wake && !signal_queue_len) {
 			int i;
 
 			if (stopping) {
@@ -3071,7 +3138,7 @@ static void set_identity(const char *program_name)
 {
 	int from_uid __maybe_unused = geteuid();
 
-	if (global.gid) {
+	if (global.gid > 0) {
 		if (getgroups(0, NULL) > 0 && setgroups(0, NULL) == -1)
 			ha_warning("[%s.main()] Failed to drop supplementary groups. Using 'gid'/'group'"
 				   " without 'uid'/'user' is generally useless.\n", program_name);
@@ -3091,7 +3158,7 @@ static void set_identity(const char *program_name)
 	}
 #endif
 
-	if (global.uid && setuid(global.uid) == -1) {
+	if (global.uid > 0 && setuid(global.uid) == -1) {
 		ha_alert("[%s.main()] Cannot set uid %d.\n", program_name, global.uid);
 		protocol_unbind_all();
 		exit(1);
@@ -3153,6 +3220,19 @@ int main(int argc, char **argv)
 		limit.rlim_max = limit.rlim_cur;
 	rlim_fd_cur_at_boot = limit.rlim_cur;
 	rlim_fd_max_at_boot = limit.rlim_max;
+
+#ifdef USE_OPENSSL
+
+	/* Initialize SSL random generator. Must be called before chroot for
+	 * access to /dev/urandom, and before ha_random_boot() which may use
+	 * RAND_bytes().
+	 */
+	if (!ssl_initialize_random()) {
+		ha_alert("OpenSSL random data generator initialization failed.\n");
+		exit(EXIT_FAILURE);
+	}
+#endif
+	ha_random_boot(argv); // the argv pointer brings some kernel-fed entropy
 
 	/* process all initcalls in order of potential dependency */
 	RUN_INITCALLS(STG_PREPARE);
@@ -3437,7 +3517,7 @@ int main(int argc, char **argv)
 		 * and ruid by set_identity() just above, so it's better to
 		 * remind the user to fix uncoherent settings.
 		 */
-		if (global.uid) {
+		if (global.uid > 0) {
 			ha_alert("[%s.main()] Some configuration options require full "
 				 "privileges, so global.uid cannot be changed.\n", argv[0]);
 #if defined(USE_LINUX_CAP)
@@ -3455,6 +3535,22 @@ int main(int argc, char **argv)
 		ha_warning("[%s.main()] Some options which require full privileges"
 			   " might not work well.\n", argv[0]);
 	}
+
+	if (global.uid < 0 && geteuid() == 0)
+		ha_warning("[%s.main()] HAProxy was started as the root user and does "
+			   "not make use of 'user' nor 'uid' global options to drop the "
+			   "privileges. This is generally considered as a bad practice "
+			   "security-wise. If running as root is intentional, please make "
+			   "it explicit using 'uid 0' or 'user root', and also please "
+			   "consider using the 'chroot' directive to isolate the process "
+			   "into a totally empty and read-only directory if possible."
+#if defined(USE_LINUX_CAP)
+			   " Also, since your operating system supports it, always prefer "
+			   "relying on capabilities with unprivileged users than running "
+			   "with full privileges (look for 'setcap' in the configuration"
+			   "manual)."
+#endif
+			   "\n", argv[0]);
 
 	/*
 	 * This is only done in daemon mode because we might want the
@@ -3575,6 +3671,8 @@ int main(int argc, char **argv)
 		struct mworker_proc *proc;
 		int sock_pair[2];
 		char *msg = NULL;
+		char c;
+		int r __maybe_unused;
 
 		if (socketpair(PF_UNIX, SOCK_STREAM, 0, sock_pair) == -1) {
 			ha_alert("[%s.main()] Cannot create socketpair to update the new worker state\n",
@@ -3596,7 +3694,6 @@ int main(int argc, char **argv)
 
 			exit(1);
 		}
-		close(sock_pair[0]);
 
 		memprintf(&msg, "_send_status READY %d\n", getpid());
 		if (send(sock_pair[1], msg, strlen(msg), 0) != strlen(msg)) {
@@ -3604,7 +3701,17 @@ int main(int argc, char **argv)
 
 			exit(1);
 		}
+
+		/* in macOS, the sock_pair[0] might be received in the master
+		 * process after it was closed in the worker, which is a
+		 * documented bug in sendmsg(2). We need to close the fd only
+		 * after confirming receipt of the "\n" from the CLI applet, so
+		 * we make sure that the fd is received correctly.
+		 */
+		shutdown(sock_pair[1], SHUT_WR);
+		r = read(sock_pair[1], &c, 1);
 		close(sock_pair[1]);
+		close(sock_pair[0]);
 		ha_free(&msg);
 
 		/* at this point the worker must have his own startup_logs buffer */

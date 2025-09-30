@@ -61,6 +61,26 @@ static int bind_parse_transparent(char **args, int cur_arg, struct proxy *px, st
 }
 #endif
 
+#if defined(TCP_CONGESTION)
+/* parse the "cc" bind keyword */
+static int bind_parse_cc(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
+{
+	if (!*args[cur_arg + 1]) {
+		memprintf(err, "'%s' : missing TCP congestion control algorithm", args[cur_arg]);
+		return ERR_ALERT | ERR_FATAL;
+	}
+
+	ha_free(&conf->cc_algo);
+	conf->cc_algo = strdup(args[cur_arg + 1]);
+	if (!conf->cc_algo) {
+		memprintf(err, "'%s %s' : out of memory", args[cur_arg], args[cur_arg + 1]);
+		return ERR_ALERT | ERR_FATAL;
+	}
+
+	return 0;
+}
+#endif
+
 #if defined(TCP_DEFER_ACCEPT) || defined(SO_ACCEPTFILTER)
 /* parse the "defer-accept" bind keyword */
 static int bind_parse_defer_accept(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
@@ -204,6 +224,25 @@ static int bind_parse_namespace(char **args, int cur_arg, struct proxy *px, stru
 }
 #endif
 
+#if defined(TCP_CONGESTION)
+/* parse the "cc" server keyword */
+static int srv_parse_cc(char **args, int *cur_arg, struct proxy *px, struct server *newsrv, char **err)
+{
+	if (!*args[*cur_arg + 1]) {
+		memprintf(err, "'%s' : missing TCP congestion control algorithm", args[*cur_arg]);
+		return ERR_ALERT | ERR_FATAL;
+	}
+
+	ha_free(&newsrv->cc_algo);
+	newsrv->cc_algo = strdup(args[*cur_arg + 1]);
+	if (!newsrv->cc_algo) {
+		memprintf(err, "'%s %s' : out of memory", args[*cur_arg], args[*cur_arg + 1]);
+		return ERR_ALERT | ERR_FATAL;
+	}
+	return 0;
+}
+#endif
+
 #if defined(__linux__) && defined(TCP_MD5SIG)
 /* parse the "tcp-md5sig" server keyword */
 static int srv_parse_tcp_md5sig(char **args, int *cur_arg, struct proxy *px, struct server *newsrv, char **err)
@@ -278,6 +317,9 @@ static int srv_parse_tcp_ut(char **args, int *cur_arg, struct proxy *px, struct 
  * not enabled.
  */
 static struct bind_kw_list bind_kws = { "TCP", { }, {
+#if defined(TCP_CONGESTION)
+	{ "cc",            bind_parse_cc,           1 }, /* set TCP congestion control algorithm */
+#endif
 #if defined(TCP_DEFER_ACCEPT) || defined(SO_ACCEPTFILTER)
 	{ "defer-accept",  bind_parse_defer_accept, 0 }, /* wait for some data for 1 second max before doing accept */
 #endif
@@ -319,6 +361,9 @@ static struct bind_kw_list bind_kws = { "TCP", { }, {
 INITCALL1(STG_REGISTER, bind_register_keywords, &bind_kws);
 
 static struct srv_kw_list srv_kws = { "TCP", { }, {
+#if defined(TCP_CONGESTION)
+	{ "cc",            srv_parse_cc,            1,  1,  0 }, /* set TCP congestion control algorithm */
+#endif
 #if defined(__linux__) && defined(TCP_MD5SIG)
 	{ "tcp-md5sig",    srv_parse_tcp_md5sig,    1,  1,  0 }, /* set TCP MD5 signature password on server */
 #endif

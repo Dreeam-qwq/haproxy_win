@@ -97,7 +97,7 @@
  * since it's used only once.
  * Example: LIST_ELEM(cur_node->args.next, struct node *, args)
  */
-#define LIST_ELEM(lh, pt, el) ((pt)(((const char *)(lh)) - ((size_t)&((pt)NULL)->el)))
+#define LIST_ELEM(lh, pt, el) ((pt)(((const char *)(lh)) - offsetof(typeof(*(pt)NULL), el)))
 
 /* checks if the list head <lh> is empty or not */
 #define LIST_ISEMPTY(lh) ((lh)->n == (lh))
@@ -284,10 +284,11 @@ static __inline void watcher_attach(struct watcher *w, void *target)
 		MT_LIST_APPEND(list, &w->el);
 }
 
-/* Untracks target via <w> watcher. Invalid if <w> is not attached first. */
+/* Untracks target via <w> watcher. Does nothing if <w> is not attached */
 static __inline void watcher_detach(struct watcher *w)
 {
-	BUG_ON_HOT(!MT_LIST_INLIST(&w->el));
+	if (!MT_LIST_INLIST(&w->el))
+		return;
 	*w->pptr = NULL;
 	MT_LIST_DELETE(&w->el);
 }

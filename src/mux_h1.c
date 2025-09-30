@@ -333,8 +333,8 @@ INITCALL1(STG_REGISTER, stats_register_module, &h1_stats_module);
 
 
 /* the h1c and h1s pools */
-DECLARE_STATIC_POOL(pool_head_h1c, "h1c", sizeof(struct h1c));
-DECLARE_STATIC_POOL(pool_head_h1s, "h1s", sizeof(struct h1s));
+DECLARE_STATIC_TYPED_POOL(pool_head_h1c, "h1c", struct h1c);
+DECLARE_STATIC_TYPED_POOL(pool_head_h1s, "h1s", struct h1s);
 
 static int h1_recv(struct h1c *h1c);
 static int h1_send(struct h1c *h1c);
@@ -527,7 +527,8 @@ static inline int h1_recv_allowed(const struct h1c *h1c)
 		return 0;
 	}
 
-	if (h1c->conn->flags & (CO_FL_WAIT_L4_CONN|CO_FL_WAIT_L6_CONN)) {
+	if (h1c->conn->flags & (CO_FL_WAIT_L4_CONN|CO_FL_WAIT_L6_CONN) &&
+	    !(h1c->conn->flags & CO_FL_EARLY_DATA)) {
 		TRACE_DEVEL("recv not allowed because of (waitl4|waitl6) on connection", H1_EV_H1C_RECV|H1_EV_H1C_BLK, h1c->conn);
 		return 0;
 	}
@@ -1138,22 +1139,34 @@ static int h1s_finish_detach(struct h1s *h1s)
 
 		if (h1c->conn->flags & CO_FL_PRIVATE) {
 			/* Add the connection in the session server list, if not already done */
-			if (!session_add_conn(sess, h1c->conn, h1c->conn->target)) {
+			if (!session_add_conn(sess, h1c->conn)) {
+				/* HTTP/1.1 conn is always idle after detach, can be removed if session insert failed. */
 				h1c->conn->owner = NULL;
 				h1c->conn->mux->destroy(h1c);
 				goto released;
 			}
-			/* Always idle at this step */
+
+			/* HTTP/1.1 conn is always idle after detach. */
 
 			/* mark that the tasklet may lose its context to another thread and
 			 * that the handler needs to check it under the idle conns lock.
 			 */
 			HA_ATOMIC_OR(&h1c->wait_event.tasklet->state, TASK_F_USR1);
+			h1c->conn->xprt->subscribe(h1c->conn, h1c->conn->xprt_ctx, SUB_RETRY_RECV, &h1c->wait_event);
+			xprt_set_idle(h1c->conn, h1c->conn->xprt, h1c->conn->xprt_ctx);
+
+			/* Ensure session can keep a new idle connection. */
 			if (session_check_idle_conn(sess, h1c->conn)) {
-				/* The connection got destroyed, let's leave */
-				TRACE_DEVEL("outgoing connection killed", H1_EV_STRM_END|H1_EV_H1C_END);
+				TRACE_DEVEL("outgoing connection rejected", H1_EV_STRM_END|H1_EV_H1C_END, h1c->conn);
+				h1c->conn->mux->destroy(h1c);
 				goto released;
 			}
+
+			/* At this point, the connection is inserted into
+			 * session list and marked as idle, so it may already
+			 * have been purged from another thread.
+			 */
+			goto end;
 		}
 		else {
 			if (h1c->conn->owner == sess)
@@ -1400,9 +1413,6 @@ static void h1_release(struct h1c *h1c)
 	pool_free(pool_head_h1c, h1c);
 
 	if (conn) {
-		if (!conn_is_back(conn))
-			LIST_DEL_INIT(&conn->stopping_list);
-
 		conn->mux = NULL;
 		conn->ctx = NULL;
 		TRACE_DEVEL("freeing conn", H1_EV_H1C_END, conn);
@@ -3735,10 +3745,12 @@ static int h1_handle_internal_err(struct h1c *h1c)
 	}
 	session_inc_http_req_ctr(sess);
 	proxy_inc_fe_req_ctr(sess->listener, sess->fe, 1);
-	_HA_ATOMIC_INC(&sess->fe->fe_counters.shared->tg[tgid - 1]->p.http.rsp[5]);
-	_HA_ATOMIC_INC(&sess->fe->fe_counters.shared->tg[tgid - 1]->internal_errors);
-	if (sess->listener && sess->listener->counters)
-		_HA_ATOMIC_INC(&sess->listener->counters->shared->tg[tgid - 1]->internal_errors);
+	if (sess->fe_tgcounters) {
+		_HA_ATOMIC_INC(&sess->fe_tgcounters->p.http.rsp[5]);
+		_HA_ATOMIC_INC(&sess->fe_tgcounters->internal_errors);
+	}
+	if (sess->li_tgcounters)
+		_HA_ATOMIC_INC(&sess->li_tgcounters->internal_errors);
 
 	h1c->errcode = 500;
 	ret = h1_send_error(h1c);
@@ -3771,10 +3783,12 @@ static int h1_handle_parsing_error(struct h1c *h1c)
 	session_inc_http_req_ctr(sess);
 	session_inc_http_err_ctr(sess);
 	proxy_inc_fe_req_ctr(sess->listener, sess->fe, 1);
-	_HA_ATOMIC_INC(&sess->fe->fe_counters.shared->tg[tgid - 1]->p.http.rsp[4]);
-	_HA_ATOMIC_INC(&sess->fe->fe_counters.shared->tg[tgid - 1]->failed_req);
-	if (sess->listener && sess->listener->counters)
-		_HA_ATOMIC_INC(&sess->listener->counters->shared->tg[tgid - 1]->failed_req);
+	if (sess->fe_tgcounters) {
+		_HA_ATOMIC_INC(&sess->fe_tgcounters->p.http.rsp[4]);
+		_HA_ATOMIC_INC(&sess->fe_tgcounters->failed_req);
+	}
+	if (sess->li_tgcounters)
+		_HA_ATOMIC_INC(&sess->li_tgcounters->failed_req);
 
 	if (!h1c->errcode)
 		h1c->errcode = 400;
@@ -3808,10 +3822,12 @@ static int h1_handle_not_impl_err(struct h1c *h1c)
 
 	session_inc_http_req_ctr(sess);
 	proxy_inc_fe_req_ctr(sess->listener, sess->fe, 1);
-	_HA_ATOMIC_INC(&sess->fe->fe_counters.shared->tg[tgid - 1]->p.http.rsp[4]);
-	_HA_ATOMIC_INC(&sess->fe->fe_counters.shared->tg[tgid - 1]->failed_req);
-	if (sess->listener && sess->listener->counters)
-		_HA_ATOMIC_INC(&sess->listener->counters->shared->tg[tgid - 1]->failed_req);
+	if (sess->fe_tgcounters) {
+		_HA_ATOMIC_INC(&sess->fe_tgcounters->p.http.rsp[4]);
+		_HA_ATOMIC_INC(&sess->fe_tgcounters->failed_req);
+	}
+	if (sess->li_tgcounters)
+		_HA_ATOMIC_INC(&sess->li_tgcounters->failed_req);
 
 	h1c->errcode = 501;
 	ret = h1_send_error(h1c);
@@ -3843,10 +3859,12 @@ static int h1_handle_req_tout(struct h1c *h1c)
 
 	session_inc_http_req_ctr(sess);
 	proxy_inc_fe_req_ctr(sess->listener, sess->fe, 1);
-	_HA_ATOMIC_INC(&sess->fe->fe_counters.shared->tg[tgid - 1]->p.http.rsp[4]);
-	_HA_ATOMIC_INC(&sess->fe->fe_counters.shared->tg[tgid - 1]->failed_req);
-	if (sess->listener && sess->listener->counters)
-		_HA_ATOMIC_INC(&sess->listener->counters->shared->tg[tgid - 1]->failed_req);
+	if (sess->fe_tgcounters) {
+		_HA_ATOMIC_INC(&sess->fe_tgcounters->p.http.rsp[4]);
+		_HA_ATOMIC_INC(&sess->fe_tgcounters->failed_req);
+	}
+	if (sess->li_tgcounters)
+		_HA_ATOMIC_INC(&sess->li_tgcounters->failed_req);
 
 	h1c->errcode = 408;
 	ret = h1_send_error(h1c);
@@ -3927,7 +3945,7 @@ static int h1_recv(struct h1c *h1c)
 			 */
 			h1c->ibuf.head  = sizeof(struct htx);
 		}
-		ret = conn->xprt->rcv_buf(conn, conn->xprt_ctx, &h1c->ibuf, max, flags);
+		ret = conn->xprt->rcv_buf(conn, conn->xprt_ctx, &h1c->ibuf, max, NULL, 0, flags);
 		HA_ATOMIC_ADD(&h1c->px_counters->bytes_in, ret);
 	}
 
@@ -3989,7 +4007,7 @@ static int h1_send(struct h1c *h1c)
 	if (h1c->flags & H1C_F_CO_STREAMER)
 		flags |= CO_SFL_STREAMER;
 
-	ret = conn->xprt->snd_buf(conn, conn->xprt_ctx, &h1c->obuf, b_data(&h1c->obuf), flags);
+	ret = conn->xprt->snd_buf(conn, conn->xprt_ctx, &h1c->obuf, b_data(&h1c->obuf), NULL, 0, flags);
 	if (ret > 0) {
 		TRACE_DATA("data sent", H1_EV_H1C_SEND, h1c->conn, 0, 0, (size_t[]){ret});
 		if (h1c->flags & H1C_F_OUT_FULL) {
@@ -4294,9 +4312,16 @@ struct task *h1_io_cb(struct task *t, void *ctx, unsigned int state)
 		/* Remove the connection from the list, to be sure nobody attempts
 		 * to use it while we handle the I/O events
 		 */
-		conn_in_list = conn->flags & CO_FL_LIST_MASK;
-		if (conn_in_list)
-			conn_delete_from_tree(conn);
+		conn_in_list = conn->flags & (CO_FL_LIST_MASK|CO_FL_SESS_IDLE);
+		if (conn_in_list) {
+			if (conn->flags & CO_FL_SESS_IDLE) {
+				if (!session_detach_idle_conn(conn->owner, conn))
+					conn_in_list = 0;
+			}
+			else {
+				conn_delete_from_tree(conn, tid);
+			}
+		}
 
 		HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
 	} else {
@@ -4322,13 +4347,32 @@ struct task *h1_io_cb(struct task *t, void *ctx, unsigned int state)
 		t = NULL;
 
 	if (!ret && conn_in_list) {
-		struct server *srv = __objt_server(conn->target);
+		struct server *srv = objt_server(conn->target);
 
-		HA_SPIN_LOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
-		_srv_add_idle(srv, conn, conn_in_list == CO_FL_SAFE_LIST);
-		HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
+		if (!srv || !(srv->cur_admin & SRV_ADMF_MAINT)) {
+			if (conn->flags & CO_FL_SESS_IDLE) {
+				if (!session_reinsert_idle_conn(conn->owner, conn)) {
+					/* session add conn failure */
+					goto release;
+				}
+			}
+			else {
+				ASSUME_NONNULL(srv); /* srv is guaranteed by CO_FL_LIST_MASK */
+				HA_SPIN_LOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
+				_srv_add_idle(srv, conn, conn_in_list == CO_FL_SAFE_LIST);
+				HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
+			}
+		}
+		else {
+			/* Do not store an idle conn if server in maintenance. */
+			goto release;
+		}
 	}
 	return t;
+
+ release:
+	h1_release(h1c);
+	return NULL;
 }
 
 static int h1_wake(struct connection *conn)
@@ -4406,7 +4450,7 @@ struct task *h1_timeout_task(struct task *t, void *context, unsigned int state)
 			se_fl_set(h1c->h1s->sd, SE_FL_EOS | SE_FL_ERROR);
 			h1_alert(h1c->h1s);
 			h1_refresh_timeout(h1c);
-			HA_SPIN_UNLOCK(OTHER_LOCK, &idle_conns[tid].idle_conns_lock);
+			HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
 			TRACE_DEVEL("waiting to release the SC before releasing the connection", H1_EV_H1C_WAKE);
 			return t;
 		}
@@ -4415,7 +4459,7 @@ struct task *h1_timeout_task(struct task *t, void *context, unsigned int state)
 		 * to steal it from us.
 		 */
 		if (h1c->conn->flags & CO_FL_LIST_MASK)
-			conn_delete_from_tree(h1c->conn);
+			conn_delete_from_tree(h1c->conn, tid);
 
 		HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
 
@@ -4852,16 +4896,35 @@ static size_t h1_nego_ff(struct stconn *sc, struct buffer *input, size_t count, 
 	 *       supported to mix data.
 	 */
 	if (!b_data(input) && !b_data(&h1c->obuf) && (flags & NEGO_FF_FL_MAY_SPLICE)) {
+		int can_splice = XPRT_CONN_CAN_NOT_SPLICE;
 #if defined(USE_LINUX_SPLICE)
-		if (h1c->conn->xprt->snd_pipe && (h1s->sd->iobuf.pipe || (pipes_used < global.maxpipes && (h1s->sd->iobuf.pipe = get_pipe())))) {
+
+		if (h1c->conn->xprt->snd_pipe &&
+		    h1c->conn->xprt->get_capability &&
+		    h1c->conn->xprt->get_capability(h1c->conn, h1c->conn->xprt_ctx, XPRT_CAN_SPLICE, &can_splice) == 0 &&
+		    can_splice == XPRT_CONN_CAN_SPLICE &&
+		    (h1s->sd->iobuf.pipe || (pipes_used < global.maxpipes && (h1s->sd->iobuf.pipe = get_pipe())))) {
 			h1s->sd->iobuf.offset = 0;
 			h1s->sd->iobuf.data = 0;
 			ret = count;
 			goto out;
 		}
 #endif
-		h1s->sd->iobuf.flags |= IOBUF_FL_NO_SPLICING;
-		TRACE_DEVEL("Unable to allocate pipe for splicing, fallback to buffer", H1_EV_STRM_SEND, h1c->conn, h1s);
+		/*
+		 * If can_splice is XPRT_CONN_COULD_SPLICE, it means
+		 * that it can not splice right now, but it may at a later
+		 * time, so don't disable it completely, just do not attempt
+		 * to splice right now. If we got that, then no pipe has
+		 * been allowed, so we should not try to splice.
+		 * Set CO_FL_WANT_SPLICING to let the upper layers know that
+		 * we would love to be able to use splicing if possible.
+		 */
+		if (can_splice == XPRT_CONN_COULD_SPLICE) {
+			h1c->conn->flags |= CO_FL_WANT_SPLICING;
+		} else {
+			h1s->sd->iobuf.flags |= IOBUF_FL_NO_SPLICING;
+			TRACE_DEVEL("Unable to allocate pipe for splicing, fallback to buffer", H1_EV_STRM_SEND, h1c->conn, h1s);
+		}
 	}
 
   no_splicing:
@@ -5044,8 +5107,16 @@ static int h1_fastfwd(struct stconn *sc, unsigned int count, unsigned int flags)
 		count = h1m->curr_len;
 	}
 
-	if (h1c->conn->xprt->rcv_pipe && !!(flags & CO_RFL_MAY_SPLICE) && !(sdo->iobuf.flags & IOBUF_FL_NO_SPLICING))
-		nego_flags |= NEGO_FF_FL_MAY_SPLICE;
+	if (h1c->conn->xprt->rcv_pipe && !!(flags & CO_RFL_MAY_SPLICE) && !(sdo->iobuf.flags & IOBUF_FL_NO_SPLICING)) {
+		int can_splice = XPRT_CONN_CAN_NOT_SPLICE;
+
+		if (h1c->conn->xprt->get_capability &&
+		    h1c->conn->xprt->get_capability(h1c->conn, h1c->conn->xprt_ctx, XPRT_CAN_SPLICE, &can_splice) == 0 &&
+		    can_splice == XPRT_CONN_CAN_SPLICE)
+			nego_flags |= NEGO_FF_FL_MAY_SPLICE;
+		else if (can_splice == XPRT_CONN_COULD_SPLICE)
+			h1c->conn->flags |= CO_FL_WANT_SPLICING;
+	}
 
 	try = se_nego_ff(sdo, &h1c->ibuf, count, nego_flags);
 	if (b_room(&h1c->ibuf) && (h1c->flags & H1C_F_IN_FULL)) {
@@ -5093,7 +5164,7 @@ static int h1_fastfwd(struct stconn *sc, unsigned int count, unsigned int flags)
 #endif
 	if (!sdo->iobuf.pipe) {
 		b_add(sdo->iobuf.buf, sdo->iobuf.offset);
-		ret = h1c->conn->xprt->rcv_buf(h1c->conn, h1c->conn->xprt_ctx, sdo->iobuf.buf, try, flags);
+		ret = h1c->conn->xprt->rcv_buf(h1c->conn, h1c->conn->xprt_ctx, sdo->iobuf.buf, try, NULL, NULL, flags);
 		if (ret < try) {
 			TRACE_STATE("failed to receive data, subscribing", H1_EV_STRM_RECV, h1c->conn);
 			h1c->conn->xprt->subscribe(h1c->conn, h1c->conn->xprt_ctx, SUB_RETRY_RECV, &h1c->wait_event);
@@ -5532,18 +5603,21 @@ static int h1_takeover(struct connection *conn, int orig_tid, int release)
 	struct task *new_task = NULL;
 	struct tasklet *new_tasklet = NULL;
 
+	/* If the connection is attached to a buffer_wait (extremely rare),
+	 * it will be woken up at any instant by its own thread and we can't
+	 * undo it anyway, so let's give up on this one. It's not interesting
+	 * at least for reuse anyway since it's not usable right now.
+	 *
+	 * TODO if takeover is used to free conn (release == 1), buf_wait may
+	 * prevent this which is not desirable.
+	 */
+	if (LIST_INLIST(&h1c->buf_wait.list))
+		goto fail;
+
 	/* Pre-allocate tasks so that we don't have to roll back after the xprt
 	 * has been migrated.
 	 */
 	if (!release) {
-		/* If the connection is attached to a buffer_wait (extremely
-		 * rare), it will be woken up at any instant by its own thread
-		 * and we can't undo it anyway, so let's give up on this one.
-		 * It's not interesting anyway since it's not usable right now.
-		 */
-		if (LIST_INLIST(&h1c->buf_wait.list))
-			goto fail;
-
 		new_task = task_new_here();
 		new_tasklet = tasklet_new();
 		if (!new_task || !new_tasklet)
@@ -5598,20 +5672,6 @@ static int h1_takeover(struct connection *conn, int orig_tid, int release)
 		h1c->wait_event.tasklet->context = h1c;
 		h1c->conn->xprt->subscribe(h1c->conn, h1c->conn->xprt_ctx,
 		                           SUB_RETRY_RECV, &h1c->wait_event);
-	}
-
-	if (release) {
-		/* we're being called for a server deletion and are running
-		 * under thread isolation. That's the only way we can
-		 * unregister a possible subscription of the original
-		 * connection from its owner thread's queue, as this involves
-		 * manipulating thread-unsafe areas. Note that it is not
-		 * possible to just call b_dequeue() here as it would update
-		 * the current thread's bufq_map and not the original one.
-		 */
-		BUG_ON(!thread_isolated());
-		if (LIST_INLIST(&h1c->buf_wait.list))
-			_b_dequeue(&h1c->buf_wait, orig_tid);
 	}
 
 	if (new_task)

@@ -125,11 +125,12 @@ enum tcpcheck_rule_type {
 struct check;
 struct tcpcheck_connect {
 	char *sni;                     /* server name to use for SSL connections */
+	struct lf_expr *sni_fmt;       /* log-format string used for SNI. if defined, point on the following HTTP host header value */
 	char *alpn;                    /* ALPN to use for the SSL connection */
 	int alpn_len;                  /* ALPN string length */
-	const struct mux_proto_list *mux_proto; /* the mux to use for all outgoing connections (specified by the "proto" keyword) */
 	uint16_t options;              /* options when setting up a new connection */
 	uint16_t port;                 /* port to connect to */
+	const struct mux_proto_list *mux_proto; /* the mux to use for all outgoing connections (specified by the "proto" keyword) */
 	struct sample_expr *port_expr; /* sample expr to determine the port, may be NULL */
 	struct sockaddr_storage addr;  /* the address to the connect */
 };

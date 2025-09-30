@@ -28,7 +28,7 @@
 #include <netinet/ip.h>
 #include <netinet/ip6.h>
 
-#include <import/ebtree-t.h>
+#include <import/cebtree.h>
 #include <import/ist.h>
 
 #include <haproxy/api-t.h>
@@ -144,8 +144,7 @@ enum {
 	 */
 	CO_FL_WAIT_ROOM     = 0x00000800,  /* data sink is full */
 
-	/* These flags are used to report whether the from/to addresses are set or not */
-	/* unused: 0x00001000 */
+	CO_FL_WANT_SPLICING = 0x00001000,  /* we wish to use splicing on the connection when possible */
 	/* unused: 0x00002000 */
 
 	CO_FL_EARLY_SSL_HS  = 0x00004000,  /* We have early data pending, don't start SSL handshake yet */
@@ -433,14 +432,24 @@ union conn_handle {
 	int fd;                 /* file descriptor, for regular sockets (CO_FL_FDLESS=0) */
 };
 
+enum xprt_capabilities {
+	XPRT_CAN_SPLICE,
+};
+
+enum xprt_splice_cap {
+	XPRT_CONN_CAN_NOT_SPLICE, /* This connection can't, and won't ever be able to splice */
+	XPRT_CONN_COULD_SPLICE, /* This connection can't splice, but may later */
+	XPRT_CONN_CAN_SPLICE /* This connection can splice */
+};
+
 /* xprt_ops describes transport-layer operations for a connection. They
  * generally run over a socket-based control layer, but not always. Some
  * of them are used for data transfer with the upper layer (rcv_*, snd_*)
  * and the other ones are used to setup and release the transport layer.
  */
 struct xprt_ops {
-	size_t (*rcv_buf)(struct connection *conn, void *xprt_ctx, struct buffer *buf, size_t count, int flags); /* recv callback */
-	size_t (*snd_buf)(struct connection *conn, void *xprt_ctx, const struct buffer *buf, size_t count, int flags); /* send callback */
+	size_t (*rcv_buf)(struct connection *conn, void *xprt_ctx, struct buffer *buf, size_t count, void *msg_control, size_t *msg_controllen, int flags); /* recv callback */
+	size_t (*snd_buf)(struct connection *conn, void *xprt_ctx, const struct buffer *buf, size_t count, void *msg_control, size_t msg_controllen, int flags); /* send callback */
 	int  (*rcv_pipe)(struct connection *conn, void *xprt_ctx, struct pipe *pipe, unsigned int count); /* recv-to-pipe callback */
 	int  (*snd_pipe)(struct connection *conn, void *xprt_ctx, struct pipe *pipe, unsigned int count); /* send-to-pipe callback */
 	void (*shutr)(struct connection *conn, void *xprt_ctx, int);    /* shutr function */
@@ -464,6 +473,12 @@ struct xprt_ops {
 	struct ssl_sock_ctx *(*get_ssl_sock_ctx)(struct connection *); /* retrieve the ssl_sock_ctx in use, or NULL if none */
 	int (*show_fd)(struct buffer *, const struct connection *, const void *ctx); /* append some data about xprt for "show fd"; returns non-zero if suspicious */
 	void (*dump_info)(struct buffer *, const struct connection *);
+	/*
+	 * Returns the value for various capabilities.
+	 * Returns 0 if the capability is known, iwth the actual value in arg,
+	 * or -1 otherwise
+	 */
+	int (*get_capability)(struct connection *connection, void *xprt_ctx, enum xprt_capabilities, void *arg);
 };
 
 /* mux_ops describes the mux operations, which are to be performed at the
@@ -551,7 +566,7 @@ enum conn_hash_params_t {
 #define CONN_HASH_PARAMS_TYPE_COUNT 7
 
 #define CONN_HASH_PAYLOAD_LEN \
-	(((sizeof(((struct conn_hash_node *)0)->node.key)) * 8) - CONN_HASH_PARAMS_TYPE_COUNT)
+	(((sizeof(((struct conn_hash_node *)0)->key)) * 8) - CONN_HASH_PARAMS_TYPE_COUNT)
 
 #define CONN_HASH_GET_PAYLOAD(hash) \
 	(((hash) << CONN_HASH_PARAMS_TYPE_COUNT) >> CONN_HASH_PARAMS_TYPE_COUNT)
@@ -583,6 +598,14 @@ struct conn_tlv_list {
 } __attribute__((packed));
 
 
+/* node for backend connection in the idle trees for http-reuse
+ * A connection is identified by a hash generated from its specific parameters
+ */
+struct conn_hash_node {
+	struct ceb_node node;    /* indexes the hashing key for safe/idle/avail */
+	uint64_t key;            /* the hashing key, also used by session-owned */
+};
+
 /* This structure describes a connection with its methods and data.
  * A connection may be performed to proxy or server via a local or remote
  * socket, and can also be made to an internal applet. It can support
@@ -607,12 +630,14 @@ struct connection {
 	/* second cache line */
 	struct wait_event *subs; /* Task to wake when awaited events are ready */
 	union {
-		struct list    idle_list; /* list element for idle connection in server idle list */
-		struct mt_list toremove_list; /* list element when idle connection is ready to be purged */
-	};
-	union {
-		struct list sess_el;       /* used by private backend conns, list elem into session */
-		struct list stopping_list; /* used by frontend conns, attach point in mux stopping list */
+		/* Backend connections only */
+		struct {
+			struct mt_list toremove_list; /* list element when idle connection is ready to be purged */
+			struct list    idle_list;     /* list element for idle connection in server idle list */
+			struct list    sess_el;       /* used by private connections, list elem into session */
+		};
+		/* Frontend connections only */
+		struct list stopping_list; /* attach point in mux stopping list */
 	};
 	union conn_handle handle;     /* connection handle at the socket layer */
 	const struct netns_entry *proxy_netns;
@@ -626,7 +651,7 @@ struct connection {
 	/* used to identify a backend connection for http-reuse,
 	 * thus only present if conn.target is of type OBJ_TYPE_SERVER
 	 */
-	struct conn_hash_node *hash_node;
+	struct conn_hash_node hash_node;
 
 	/* Members used if connection must be reversed. */
 	struct {
@@ -637,14 +662,6 @@ struct connection {
 	uint32_t term_evts_log;        /* Termination events log: first 4 events reported from fd, handshake or xprt */
 	uint32_t mark;                 /* set network mark, if CO_FL_OPT_MARK is set */
 	uint8_t tos;                   /* set ip tos, if CO_FL_OPT_TOS is set */
-};
-
-/* node for backend connection in the idle trees for http-reuse
- * A connection is identified by a hash generated from its specific parameters
- */
-struct conn_hash_node {
-	struct eb64_node node;   /* contains the hashing key */
-	struct connection *conn; /* connection owner of the node */
 };
 
 struct mux_proto_list {

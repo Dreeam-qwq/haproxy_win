@@ -31,8 +31,8 @@ jobs:
           - USE_THREAD=1
           - USE_ZLIB=1
     steps:
-    - uses: actions/checkout@main
-    - uses: msys2/setup-msys2@dist
+    - uses: actions/checkout@v5
+    - uses: msys2/setup-msys2@v2
       with:
         install: >-
           coreutils

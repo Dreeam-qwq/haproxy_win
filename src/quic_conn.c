@@ -138,11 +138,10 @@ const struct quic_version *preferred_version;
  */
 const struct quic_version quic_version_VN_reserved = { .num = 0, };
 
-DECLARE_STATIC_POOL(pool_head_quic_conn, "quic_conn", sizeof(struct quic_conn));
-DECLARE_STATIC_POOL(pool_head_quic_conn_closed, "quic_conn_closed", sizeof(struct quic_conn_closed));
-DECLARE_STATIC_POOL(pool_head_quic_cids, "quic_cids", sizeof(struct eb_root));
-DECLARE_POOL(pool_head_quic_connection_id,
-             "quic_connection_id", sizeof(struct quic_connection_id));
+DECLARE_STATIC_TYPED_POOL(pool_head_quic_conn, "quic_conn", struct quic_conn);
+DECLARE_STATIC_TYPED_POOL(pool_head_quic_conn_closed, "quic_conn_closed", struct quic_conn_closed);
+DECLARE_STATIC_TYPED_POOL(pool_head_quic_cids, "quic_cids", struct eb_root);
+DECLARE_TYPED_POOL(pool_head_quic_connection_id, "quic_connection_id", struct quic_connection_id);
 
 struct task *quic_conn_app_io_cb(struct task *t, void *context, unsigned int state);
 static int quic_conn_init_timer(struct quic_conn *qc);
@@ -151,7 +150,7 @@ static int quic_conn_init_idle_timer_task(struct quic_conn *qc, struct proxy *px
 /* Returns 1 if the peer has validated <qc> QUIC connection address, 0 if not. */
 int quic_peer_validated_addr(struct quic_conn *qc)
 {
-	if (objt_server(qc->target))
+	if (qc_is_back(qc))
 		return 1;
 
 	if (qc->flags & QUIC_FL_CONN_PEER_VALIDATED_ADDR)
@@ -478,7 +477,7 @@ int quic_build_post_handshake_frames(struct quic_conn *qc)
 
 	qel = qc->ael;
 	/* Only servers must send a HANDSHAKE_DONE frame. */
-	if (objt_listener(qc->target)) {
+	if (!qc_is_back(qc)) {
 		size_t new_token_frm_len;
 
 		frm = qc_frm_alloc(QUIC_FT_HANDSHAKE_DONE);
@@ -750,7 +749,7 @@ static struct quic_conn_closed *qc_new_cc_conn(struct quic_conn *qc)
 	cc_qc->dcid = qc->dcid;
 	cc_qc->scid = qc->scid;
 
-	cc_qc->target = qc->target;
+	cc_qc->li = qc->li;
 	cc_qc->cids = qc->cids;
 
 	cc_qc->idle_timer_task = qc->idle_timer_task;
@@ -786,7 +785,11 @@ struct task *quic_conn_io_cb(struct task *t, void *context, unsigned int state)
 
 	/* TASK_HEAVY is set when received CRYPTO data have to be handled. */
 	if (HA_ATOMIC_LOAD(&tl->state) & TASK_HEAVY) {
+#ifdef HAVE_OPENSSL_QUIC
+		qc_ssl_do_hanshake(qc, qc->xprt_ctx);
+#else
 		qc_ssl_provide_all_quic_data(qc, qc->xprt_ctx);
+#endif
 		HA_ATOMIC_AND(&tl->state, ~TASK_HEAVY);
 	}
 
@@ -825,7 +828,7 @@ struct task *quic_conn_io_cb(struct task *t, void *context, unsigned int state)
 
 	st = qc->state;
 
-	if (objt_listener(qc->target)) {
+	if (!qc_is_back(qc)) {
 		if (st >= QUIC_HS_ST_COMPLETE && !quic_tls_pktns_is_dcd(qc, qc->hpktns))
 			discard_hpktns = 1;
 	}
@@ -841,13 +844,13 @@ struct task *quic_conn_io_cb(struct task *t, void *context, unsigned int state)
 		qc_set_timer(qc);
 		qc_el_rx_pkts_del(qc->hel);
 		qc_release_pktns_frms(qc, qc->hel->pktns);
-		if (objt_server(qc->target)) {
+		if (qc_is_back(qc)) {
 			/* I/O callback switch */
 			qc->wait_event.tasklet->process = quic_conn_app_io_cb;
 		}
 	}
 
-	if (objt_listener(qc->target) && st >= QUIC_HS_ST_COMPLETE) {
+	if (!qc_is_back(qc) && st >= QUIC_HS_ST_COMPLETE) {
 		/* Note: if no token for address validation was received
 		 * for a 0RTT connection, some 0RTT packet could still be
 		 * waiting for HP removal AFTER the successful handshake completion.
@@ -913,7 +916,7 @@ struct task *quic_conn_io_cb(struct task *t, void *context, unsigned int state)
 	 * discard Initial keys when it first sends a Handshake packet...
 	 */
 
-	if (objt_server(qc->target) && !quic_tls_pktns_is_dcd(qc, qc->ipktns) &&
+	if (qc_is_back(qc) && qc->ipktns && !quic_tls_pktns_is_dcd(qc, qc->ipktns) &&
 	    qc->hpktns && qc->hpktns->tx.in_flight > 0) {
 		/* Discard the Initial packet number space. */
 		TRACE_PROTO("discarding Initial pktns", QUIC_EV_CONN_PRSHPKT, qc);
@@ -1029,7 +1032,7 @@ struct task *qc_process_timer(struct task *task, void *ctx, unsigned int state)
 			}
 		}
 	}
-	else if (objt_server(qc->target) && qc->state <= QUIC_HS_ST_COMPLETE) {
+	else if (qc_is_back(qc) && qc->state <= QUIC_HS_ST_COMPLETE) {
 		if (quic_tls_has_tx_sec(qc->hel))
 			qc->hel->pktns->tx.pto_probe = 1;
 		if (quic_tls_has_tx_sec(qc->iel))
@@ -1110,14 +1113,7 @@ struct quic_conn *qc_new_conn(const struct quic_version *qv, int ipv4,
 		goto err;
 	}
 
-	qc->cids = pool_alloc(pool_head_quic_cids);
-	if (!qc->cids) {
-		TRACE_ERROR("Could not allocate a new CID tree", QUIC_EV_CONN_INIT, qc);
-		goto err;
-	}
-
-	qc->target = target;
-	*qc->cids = EB_ROOT;
+	qc->li = l;
 	/* Now that quic_conn instance is allocated, quic_conn_release() will
 	 * ensure global accounting is decremented.
 	 */
@@ -1135,9 +1131,11 @@ struct quic_conn *qc_new_conn(const struct quic_version *qv, int ipv4,
 	qc->streams_by_id = EB_ROOT_UNIQUE;
 
 	/* Required to call free_quic_conn_cids() from quic_conn_release() */
+	qc->cids = NULL;
 	qc->tx.cc_buf_area = NULL;
 	qc_init_fd(qc);
-
+	/* Required to call pool_free() from quic_conn_release() */
+	qc->rx.buf.area = NULL;
 	LIST_INIT(&qc->back_refs);
 	LIST_INIT(&qc->el_th_ctx);
 
@@ -1148,7 +1146,8 @@ struct quic_conn *qc_new_conn(const struct quic_version *qv, int ipv4,
 	qc->idle_timer_task = NULL;
 
 	qc->xprt_ctx = NULL;
-	qc->conn = conn;
+	 /* We must not free the quic-conn if upper conn is still allocated. */
+	qc->conn = NULL;
 	qc->qcc = NULL;
 	qc->app_ops = NULL;
 	qc->path = NULL;
@@ -1178,6 +1177,11 @@ struct quic_conn *qc_new_conn(const struct quic_version *qv, int ipv4,
 		cc_algo = l->bind_conf->quic_cc_algo;
 
 		qc->flags = 0;
+
+		/* Duplicate GSO status on listener to connection */
+		if (HA_ATOMIC_LOAD(&l->flags) & LI_F_UDP_GSO_NOTSUPP)
+			qc->flags |= QUIC_FL_CONN_UDP_GSO_EIO;
+
 		/* Mark this connection as having not received any token when 0-RTT is enabled. */
 		if (l->bind_conf->ssl_conf.early_data && !token)
 			qc->flags |= QUIC_FL_CONN_NO_TOKEN_RCVD;
@@ -1186,14 +1190,17 @@ struct quic_conn *qc_new_conn(const struct quic_version *qv, int ipv4,
 		qc->odcid = *dcid;
 		/* Copy the packet SCID to reuse it as DCID for sending */
 		qc->dcid = *scid;
-		qc->tx.buf = BUF_NULL;
 		conn_id->qc = qc;
 	}
 	/* QUIC Client (outgoing connection to servers) */
 	else {
 		struct quic_connection_id *conn_cid = NULL;
 
-		qc->flags = QUIC_FL_CONN_PEER_VALIDATED_ADDR;
+		qc->flags = QUIC_FL_CONN_IS_BACK|QUIC_FL_CONN_PEER_VALIDATED_ADDR;
+		/* Duplicate GSO status on server to connection */
+		if (HA_ATOMIC_LOAD(&srv->flags) & SRV_F_UDP_GSO_NOTSUPP)
+			qc->flags |= QUIC_FL_CONN_UDP_GSO_EIO;
+
 		qc->state = QUIC_HS_ST_CLIENT_INITIAL;
 
 		/* This is the original connection ID from the peer server
@@ -1207,7 +1214,7 @@ struct quic_conn *qc_new_conn(const struct quic_version *qv, int ipv4,
 		memcpy(&qc->odcid, qc->dcid.data, sizeof(qc->dcid.data));
 		qc->odcid.len = qc->dcid.len;
 
-		conn_cid = new_quic_cid(qc->cids, qc, NULL, NULL);
+		conn_cid = new_quic_cid(NULL, qc, NULL, NULL);
 		if (!conn_cid)
 			goto err;
 
@@ -1215,7 +1222,6 @@ struct quic_conn *qc_new_conn(const struct quic_version *qv, int ipv4,
 		dcid = &qc->dcid;
 		conn_id = conn_cid;
 
-		qc->tx.buf = BUF_NULL;
 		qc->next_cid_seq_num = 1;
 		conn->handle.qc = qc;
 	}
@@ -1243,10 +1249,21 @@ struct quic_conn *qc_new_conn(const struct quic_version *qv, int ipv4,
 		goto err;
 	}
 
-	/* Listener only */
-	if (l && HA_ATOMIC_LOAD(&l->rx.quic_mode) == QUIC_SOCK_MODE_CONN &&
+	qc->cids = pool_alloc(pool_head_quic_cids);
+	if (!qc->cids) {
+		TRACE_ERROR("Could not allocate a new CID tree", QUIC_EV_CONN_INIT, qc);
+		goto err;
+	}
+
+	*qc->cids = EB_ROOT;
+	if (!l) {
+		/* Attach the current CID to the connection */
+		eb64_insert(qc->cids, &conn_id->seq_num);
+	}
+	else if (HA_ATOMIC_LOAD(&l->rx.quic_mode) == QUIC_SOCK_MODE_CONN &&
 	    (quic_tune.options & QUIC_TUNE_SOCK_PER_CONN) &&
 	    is_addr(local_addr)) {
+		/* Listener only */
 		TRACE_USER("Allocate a socket for QUIC connection", QUIC_EV_CONN_INIT, qc);
 		qc_alloc_fd(qc, local_addr, peer_addr);
 
@@ -1344,6 +1361,7 @@ struct quic_conn *qc_new_conn(const struct quic_version *qv, int ipv4,
 	if (!qc_new_isecs(qc, &qc->iel->tls_ctx, qc->original_version, dcid->data, dcid->len, !!l))
 		goto err;
 
+	qc->conn = conn;
 	/* Counters initialization */
 	memset(&qc->cntrs, 0, sizeof qc->cntrs);
 
@@ -1400,7 +1418,7 @@ int qc_handle_conn_migration(struct quic_conn *qc,
 	 * used during the handshake, unless the endpoint has acted on a
 	 * preferred_address transport parameter from the peer.
 	 */
-	if (__objt_listener(qc->target)->bind_conf->quic_params.disable_active_migration) {
+	if (qc->li->bind_conf->quic_params.disable_active_migration) {
 		TRACE_ERROR("Active migration was disabled, datagram dropped", QUIC_EV_CONN_LPKT, qc);
 		goto err;
 	}
@@ -1530,8 +1548,8 @@ int quic_conn_release(struct quic_conn *qc)
 	 */
 	if (MT_LIST_INLIST(&qc->accept_list)) {
 		MT_LIST_DELETE(&qc->accept_list);
-		BUG_ON(__objt_listener(qc->target)->rx.quic_curr_accept == 0);
-		HA_ATOMIC_DEC(&__objt_listener(qc->target)->rx.quic_curr_accept);
+		BUG_ON(qc->li->rx.quic_curr_accept == 0);
+		HA_ATOMIC_DEC(&qc->li->rx.quic_curr_accept);
 	}
 
 	/* Subtract last congestion window from global memory counter. */
@@ -1603,9 +1621,9 @@ int quic_conn_release(struct quic_conn *qc)
 
 	/* Connection released before handshake completion. */
 	if (unlikely(qc->state < QUIC_HS_ST_COMPLETE)) {
-		if (objt_listener(qc->target)) {
-			BUG_ON(__objt_listener(qc->target)->rx.quic_curr_handshake == 0);
-			HA_ATOMIC_DEC(&__objt_listener(qc->target)->rx.quic_curr_handshake);
+		if (!qc_is_back(qc)) {
+			BUG_ON(qc->li->rx.quic_curr_handshake == 0);
+			HA_ATOMIC_DEC(&qc->li->rx.quic_curr_handshake);
 		}
 	}
 
@@ -2013,8 +2031,15 @@ void qc_bind_tid_commit(struct quic_conn *qc, struct listener *new_li)
 	/* At this point no connection was accounted for yet on this
 	 * listener so it's OK to just swap the pointer.
 	 */
-	if (new_li && new_li != __objt_listener(qc->target))
-		qc->target = &new_li->obj_type;
+	if (new_li && new_li != qc->li) {
+		qc->li = new_li;
+
+		/* Update GSO conn support based on new listener status. */
+		if (HA_ATOMIC_LOAD(&new_li->flags) & LI_F_UDP_GSO_NOTSUPP)
+			qc->flags |= QUIC_FL_CONN_UDP_GSO_EIO;
+		else
+			qc->flags &= ~QUIC_FL_CONN_UDP_GSO_EIO;
+	}
 
 	/* Rebind the connection FD. */
 	if (qc_test_fd(qc)) {

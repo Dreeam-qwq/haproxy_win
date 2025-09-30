@@ -197,8 +197,8 @@ static int hc_cli_io_handler(struct appctx *appctx)
 	}
 
 	if (ctx->flags & HC_F_RES_HDR) {
-		chunk_reset(&trash);
 		if (!ctx->is_htx) {
+			chunk_reset(&trash);
 			hdrs = hc->res.hdrs;
 			for (hdr = hdrs; isttest(hdr->v); hdr++) {
 				if (!h1_format_htx_hdr(hdr->n, hdr->v, &trash))
@@ -206,9 +206,9 @@ static int hc_cli_io_handler(struct appctx *appctx)
 			}
 			if (!chunk_memcat(&trash, "\r\n", 2))
 				goto too_many_hdrs;
+			if (applet_putchk(appctx, &trash) == -1)
+				goto more;
 		}
-		if (applet_putchk(appctx, &trash) == -1)
-			goto more;
 		ctx->flags &= ~HC_F_RES_HDR;
 	}
 
@@ -223,15 +223,11 @@ static int hc_cli_io_handler(struct appctx *appctx)
 	}
 
 	if (ctx->is_htx && hc_htx) {
-		struct htx_blk *blk = NULL;
-
 		chunk_reset(&trash);
 		htx_dump(&trash, hc_htx, 1);
 		if (applet_putchk(appctx, &trash) == -1)
 			goto more;
-		blk = htx_get_head_blk(hc_htx);
-		while (blk)
-			blk = htx_remove_blk(hc_htx, blk);
+		htx_reset(hc_htx);
 		htx_to_buf(hc_htx, &hc->res.buf);
 
 	}

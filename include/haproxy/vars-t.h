@@ -50,7 +50,7 @@ enum vars_scope {
 
 #define VAR_NAME_ROOTS	4
 struct vars {
-	struct ceb_node *name_root[VAR_NAME_ROOTS];
+	struct ceb_root *name_root[VAR_NAME_ROOTS];
 	enum vars_scope scope;
 	unsigned int size;
 	__decl_thread(HA_RWLOCK_T rwlock);
@@ -66,8 +66,8 @@ struct var_desc {
 };
 
 struct var {
-	struct ceb_node node; /* Used for chaining vars. */
-	uint64_t name_hash;      /* XXH3() of the variable's name, must be just after node */
+	struct ceb_node name_node; /* indexes <name_hash> below */
+	uint64_t name_hash;        /* XXH3() of the variable's name, indexed by <name_node> */
 	uint flags;       // VF_*
 	/* 32-bit hole here */
 	struct sample_data data; /* data storage. */

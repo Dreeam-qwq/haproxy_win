@@ -142,8 +142,7 @@ struct thread_ctx {
 	uint8_t tl_class_mask;              /* bit mask of non-empty tasklets classes */
 	uint8_t bufq_map;                   /* one bit per non-empty buffer_wq */
 	uint8_t trc_disable_ctr;            /* cumulative counter to temporarily disable tracing */
-
-	// 1 byte hole here
+	uint8_t lock_level;                 /* locking level for that thread. 0=unlocked, +128=isolated. */
 	unsigned int nb_rhttp_conns;        /* count of current conns used for active reverse HTTP */
 	struct sched_activity *sched_profile_entry; /* profile entry in use by the current task/tasklet, only if sched_wake_date>0 */
 
@@ -161,13 +160,19 @@ struct thread_ctx {
 
 	uint32_t sched_wake_date;           /* current task/tasklet's wake date in 32-bit ns or 0 if not supported */
 	uint64_t sched_call_date;           /* current task/tasklet's call date in ns */
+	uint64_t lock_wait_total;           /* total time in ns spent waiting for a lock (task prof) */
+	uint64_t mem_wait_total;            /* total time in ns spent allocating/freeing memory (task prof) */
+	uint64_t lock_start_date;           /* date when first locked was obtained (task prof) */
+	uint64_t locked_total;              /* total time in ns spent with at least one lock held (task prof) */
 
 	uint64_t prev_mono_time;            /* previous system wide monotonic time (leaving poll) */
 	uint64_t curr_mono_time;            /* latest system wide monotonic time (leaving poll) */
 
 	ulong lock_history;                 /* history of used locks, see thread.h for more details */
 
-	// third cache line here on 64 bits: accessed mostly using atomic ops
+	/* around 56 unused bytes here */
+
+	// fourth cache line here on 64 bits: accessed mostly using atomic ops
 	ALWAYS_ALIGN(64);
 	struct mt_list shared_tasklet_list; /* Tasklet to be run, woken up by other threads */
 	unsigned int rqueue_ticks;          /* Insertion counter for the run queue */

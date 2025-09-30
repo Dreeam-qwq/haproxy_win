@@ -637,7 +637,7 @@ static inline void peer_set_update_msg_type(char *msg_type, int use_identifier, 
  * If function returns 0, the caller should consider we were unable to encode this message (TODO:
  * check size)
  */
-static int peer_prepare_updatemsg(char *msg, size_t size, struct peer_prep_params *p)
+int peer_prepare_updatemsg(char *msg, size_t size, struct peer_prep_params *p)
 {
 	uint32_t netinteger;
 	unsigned short datalen;
@@ -1080,7 +1080,7 @@ static int peer_session_init(struct appctx *appctx)
 	s->scb->dst = addr;
 	s->scb->flags |= (SC_FL_RCV_ONCE|SC_FL_NOLINGER);
 	s->flags = SF_ASSIGNED;
-	s->target = peer_session_target(peer, s);
+	stream_set_srv_target(s, peer->srv);
 
 	s->do_log = NULL;
 	s->uniq_id = 0;
@@ -1153,12 +1153,18 @@ static int peer_get_version(const char *str,
  */
 static inline int peer_getline(struct appctx  *appctx)
 {
-	struct stconn *sc = appctx_sc(appctx);
 	int n;
 
-	n = co_getline(sc_oc(sc), trash.area, trash.size);
-	if (!n)
+	if (applet_get_inbuf(appctx) == NULL || !applet_input_data(appctx)) {
+		applet_need_more_data(appctx);
 		return 0;
+	}
+
+	n = applet_getline(appctx, trash.area, trash.size);
+	if (!n) {
+		applet_need_more_data(appctx);
+		return 0;
+	}
 
 	if (n < 0 || trash.area[n - 1] != '\n') {
 		appctx->st0 = PEER_SESS_ST_END;
@@ -1170,8 +1176,7 @@ static inline int peer_getline(struct appctx  *appctx)
 	else
 		trash.area[n - 1] = 0;
 
-	co_skip(sc_oc(sc), n);
-
+	applet_skip_input(appctx, n);
 	return n;
 }
 
@@ -1545,12 +1550,13 @@ static inline struct stksess *peer_teach_stage2_stksess_lookup(struct shared_tab
  * If it returns 0 or -1, this function leave <st> locked if already locked when entering this function
  * unlocked if not already locked when entering this function.
  */
-static inline int peer_send_teachmsgs(struct appctx *appctx, struct peer *p,
-                                      struct stksess *(*peer_stksess_lookup)(struct shared_table *),
-                                      struct shared_table *st)
+int peer_send_teachmsgs(struct appctx *appctx, struct peer *p,
+                        struct stksess *(*peer_stksess_lookup)(struct shared_table *),
+                        struct shared_table *st)
 {
 	int ret, new_pushed, use_timed;
 	int updates_sent = 0;
+	int failed_once = 0;
 
 	ret = 1;
 	use_timed = 0;
@@ -1568,7 +1574,12 @@ static inline int peer_send_teachmsgs(struct appctx *appctx, struct peer *p,
 	/* We force new pushed to 1 to force identifier in update message */
 	new_pushed = 1;
 
-	HA_RWLOCK_RDLOCK(STK_TABLE_UPDT_LOCK, &st->table->updt_lock);
+	if (HA_RWLOCK_TRYRDLOCK(STK_TABLE_UPDT_LOCK, &st->table->updt_lock) != 0) {
+		/* just don't engage here if there is any contention */
+		applet_have_more_data(appctx);
+		ret = -1;
+		goto out_unlocked;
+	}
 
 	while (1) {
 		struct stksess *ts;
@@ -1593,7 +1604,25 @@ static inline int peer_send_teachmsgs(struct appctx *appctx, struct peer *p,
 		HA_RWLOCK_RDUNLOCK(STK_TABLE_UPDT_LOCK, &st->table->updt_lock);
 
 		ret = peer_send_updatemsg(st, appctx, ts, updateid, new_pushed, use_timed);
-		HA_RWLOCK_RDLOCK(STK_TABLE_UPDT_LOCK, &st->table->updt_lock);
+
+		if (HA_RWLOCK_TRYRDLOCK(STK_TABLE_UPDT_LOCK, &st->table->updt_lock) != 0) {
+			if (failed_once) {
+				/* we've already faced contention twice in this
+				 * loop, this is getting serious, do not insist
+				 * anymore and come back later
+				 */
+				HA_ATOMIC_DEC(&ts->ref_cnt);
+				applet_have_more_data(appctx);
+				ret = -1;
+				goto out_unlocked;
+			}
+			/* OK contention happens, for this one we'll wait on the
+			 * lock, but only once.
+			 */
+			failed_once++;
+			HA_RWLOCK_RDLOCK(STK_TABLE_UPDT_LOCK, &st->table->updt_lock);
+		}
+
 		HA_ATOMIC_DEC(&ts->ref_cnt);
 		if (ret <= 0)
 			break;
@@ -1623,6 +1652,7 @@ static inline int peer_send_teachmsgs(struct appctx *appctx, struct peer *p,
 
  out:
 	HA_RWLOCK_RDUNLOCK(STK_TABLE_UPDT_LOCK, &st->table->updt_lock);
+ out_unlocked:
 	return ret;
 }
 
@@ -1689,8 +1719,8 @@ static inline int peer_send_teach_stage2_msgs(struct appctx *appctx, struct peer
  * update ID.
  * <totl> is the length of the stick-table update message computed upon receipt.
  */
-static int peer_treat_updatemsg(struct appctx *appctx, struct peer *p, int updt, int exp,
-                                char **msg_cur, char *msg_end, int msg_len, int totl)
+int peer_treat_updatemsg(struct appctx *appctx, struct peer *p, int updt, int exp,
+                         char **msg_cur, char *msg_end, int msg_len, int totl)
 {
 	struct shared_table *st = p->remote_table;
 	struct stktable *table;
@@ -2404,10 +2434,9 @@ static inline int peer_recv_msg(struct appctx *appctx, char *msg_head, size_t ms
                                 uint32_t *msg_len, int *totl)
 {
 	int reql;
-	struct stconn *sc = appctx_sc(appctx);
 	char *cur;
 
-	reql = co_getblk(sc_oc(sc), msg_head, 2 * sizeof(char), *totl);
+	reql = applet_getblk(appctx, msg_head, 2 * sizeof(char), *totl);
 	if (reql <= 0) /* closed or EOL not found */
 		goto incomplete;
 
@@ -2421,11 +2450,11 @@ static inline int peer_recv_msg(struct appctx *appctx, char *msg_head, size_t ms
 	/* Read and Decode message length */
 	msg_head    += *totl;
 	msg_head_sz -= *totl;
-	reql = co_data(sc_oc(sc)) - *totl;
+	reql = applet_input_data(appctx) - *totl;
 	if (reql > msg_head_sz)
 		reql = msg_head_sz;
 
-	reql = co_getblk(sc_oc(sc), msg_head, reql, *totl);
+	reql = applet_getblk(appctx, msg_head, reql, *totl);
 	if (reql <= 0) /* closed */
 		goto incomplete;
 
@@ -2451,7 +2480,7 @@ static inline int peer_recv_msg(struct appctx *appctx, char *msg_head, size_t ms
 			return -1;
 		}
 
-		reql = co_getblk(sc_oc(sc), trash.area, *msg_len, *totl);
+		reql = applet_getblk(appctx, trash.area, *msg_len, *totl);
 		if (reql <= 0) /* closed */
 			goto incomplete;
 		*totl += reql;
@@ -2460,7 +2489,7 @@ static inline int peer_recv_msg(struct appctx *appctx, char *msg_head, size_t ms
 	return 1;
 
  incomplete:
-	if (reql < 0 || (sc->flags & (SC_FL_SHUT_DONE|SC_FL_SHUT_WANTED))) {
+	if (reql < 0 || se_fl_test(appctx->sedesc, SE_FL_SHW)) {
 		/* there was an error or the message was truncated */
 		appctx->st0 = PEER_SESS_ST_END;
 		return -1;
@@ -2604,8 +2633,8 @@ static inline int peer_treat_awaited_msg(struct appctx *appctx, struct peer *pee
  * only reset at the end. In the mean time, it always point on a table.
  */
 
-static inline int peer_send_msgs(struct appctx *appctx,
-                                 struct peer *peer, struct peers *peers)
+int peer_send_msgs(struct appctx *appctx,
+                   struct peer *peer, struct peers *peers)
 {
 	int repl;
 
@@ -2792,8 +2821,7 @@ static inline int peer_getline_last(struct appctx *appctx, struct peer **curpeer
 	char *p;
 	int reql;
 	struct peer *peer;
-	struct stream *s = appctx_strm(appctx);
-	struct peers *peers = strm_fe(s)->parent;
+	struct peers *peers = strm_fe(appctx_strm(appctx))->parent;
 
 	reql = peer_getline(appctx);
 	if (!reql)
@@ -2895,11 +2923,8 @@ static inline void init_connected_peer(struct peer *peer, struct peers *peers)
 /*
  * IO Handler to handle message exchange with a peer
  */
-static void peer_io_handler(struct appctx *appctx)
+void peer_io_handler(struct appctx *appctx)
 {
-	struct stconn *sc = appctx_sc(appctx);
-	struct stream *s = __sc_strm(sc);
-	struct peers *curpeers = strm_fe(s)->parent;
 	struct peer *curpeer = NULL;
 	int reql = 0;
 	int repl = 0;
@@ -2907,14 +2932,14 @@ static void peer_io_handler(struct appctx *appctx)
 	int prev_state;
 	int msg_done = 0;
 
-	if (unlikely(se_fl_test(appctx->sedesc, (SE_FL_EOS|SE_FL_ERROR)))) {
-		co_skip(sc_oc(sc), co_data(sc_oc(sc)));
+	if (unlikely(applet_fl_test(appctx, APPCTX_FL_EOS|APPCTX_FL_ERROR))) {
+		applet_reset_input(appctx);
 		goto out;
 	}
 
-	/* Check if the input buffer is available. */
-	if (sc_ib(sc)->size == 0) {
-		sc_need_room(sc, 0);
+	/* Check if the out buffer is available. */
+	if (!applet_get_outbuf(appctx)) {
+		applet_have_more_data(appctx);
 		goto out;
 	}
 
@@ -3015,7 +3040,7 @@ switchstate:
 				curpeer->statuscode = PEER_SESS_SC_SUCCESSCODE;
 				curpeer->last_hdshk = now_ms;
 
-				init_connected_peer(curpeer, curpeers);
+				init_connected_peer(curpeer, curpeer->peers);
 
 				/* switch to waiting message state */
 				_HA_ATOMIC_INC(&connected_peers);
@@ -3054,9 +3079,7 @@ switchstate:
 						goto switchstate;
 					}
 				}
-
-				if (sc_ic(sc)->flags & CF_WROTE_DATA)
-					curpeer->statuscode = PEER_SESS_SC_CONNECTEDCODE;
+				curpeer->statuscode = PEER_SESS_SC_CONNECTEDCODE;
 
 				reql = peer_getline(appctx);
 				if (!reql)
@@ -3070,11 +3093,11 @@ switchstate:
 				curpeer->last_hdshk = now_ms;
 
 				/* Awake main task */
-				task_wakeup(curpeers->sync_task, TASK_WOKEN_MSG);
+				task_wakeup(curpeer->peers->sync_task, TASK_WOKEN_MSG);
 
 				/* If status code is success */
 				if (curpeer->statuscode == PEER_SESS_SC_SUCCESSCODE) {
-					init_connected_peer(curpeer, curpeers);
+					init_connected_peer(curpeer, curpeer->peers);
 				}
 				else {
 					if (curpeer->statuscode == PEER_SESS_SC_ERRVERSION)
@@ -3141,7 +3164,7 @@ switchstate:
 				curpeer->flags |= PEER_F_ALIVE;
 
 				/* skip consumed message */
-				co_skip(sc_oc(sc), totl);
+				applet_skip_input(appctx, totl);
 
 				/* make sure we don't process too many at once */
 				if (msg_done >= peers_max_updates_at_once)
@@ -3154,7 +3177,7 @@ switchstate:
 send_msgs:
 				if (curpeer->flags & PEER_F_HEARTBEAT) {
 					curpeer->flags &= ~PEER_F_HEARTBEAT;
-					repl = peer_send_heartbeatmsg(appctx, curpeer, curpeers);
+					repl = peer_send_heartbeatmsg(appctx, curpeer, curpeer->peers);
 					if (repl <= 0) {
 						if (repl == -1)
 							goto out;
@@ -3163,7 +3186,7 @@ send_msgs:
 					curpeer->tx_hbt++;
 				}
 				/* we get here when a peer_recv_msg() returns 0 in reql */
-				repl = peer_send_msgs(appctx, curpeer, curpeers);
+				repl = peer_send_msgs(appctx, curpeer, curpeer->peers);
 				if (repl <= 0) {
 					if (repl == -1)
 						goto out;
@@ -3214,14 +3237,14 @@ send_msgs:
 					HA_SPIN_UNLOCK(PEER_LOCK, &curpeer->lock);
 					curpeer = NULL;
 				}
-				se_fl_set(appctx->sedesc, SE_FL_EOS|SE_FL_EOI);
-				co_skip(sc_oc(sc), co_data(sc_oc(sc)));
+				applet_set_eos(appctx);
+				applet_reset_input(appctx);
 				goto out;
 			}
 		}
 	}
 out:
-	sc_opposite(sc)->flags |= SC_FL_RCV_ONCE;
+	/* sc_opposite(sc)->flags |= SC_FL_RCV_ONCE; */
 
 	if (curpeer)
 		HA_SPIN_UNLOCK(PEER_LOCK, &curpeer->lock);
@@ -3230,8 +3253,11 @@ out:
 
 static struct applet peer_applet = {
 	.obj_type = OBJ_TYPE_APPLET,
+	.flags = APPLET_FL_NEW_API,
 	.name = "<PEER>", /* used for logging */
 	.fct = peer_io_handler,
+	.rcv_buf = appctx_raw_rcv_buf,
+	.snd_buf = appctx_raw_snd_buf,
 	.init = peer_session_init,
 	.release = peer_session_release,
 };
@@ -3757,13 +3783,18 @@ struct task *process_peer_sync(struct task * task, void *context, unsigned int s
  */
 int peers_init_sync(struct peers *peers)
 {
+	static uint operating_thread = 0;
 	struct peer * curpeer;
 
 	for (curpeer = peers->remote; curpeer; curpeer = curpeer->next) {
 		peers->peers_fe->maxconn += 3;
 	}
 
-	peers->sync_task = task_new_anywhere();
+	/* go backwards so as to distribute the load to other threads
+	 * than the ones operating the stick-tables for small confs.
+	 */
+	operating_thread = (operating_thread - 1) % global.nbthread;
+	peers->sync_task = task_new_on(operating_thread);
 	if (!peers->sync_task)
 		return 0;
 

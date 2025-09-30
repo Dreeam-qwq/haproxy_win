@@ -229,7 +229,7 @@ static struct list caches = LIST_HEAD_INIT(caches);
 static struct list caches_config = LIST_HEAD_INIT(caches_config); /* cache config to init */
 static struct cache *tmp_cache_config = NULL;
 
-DECLARE_STATIC_POOL(pool_head_cache_st, "cache_st", sizeof(struct cache_st));
+DECLARE_STATIC_TYPED_POOL(pool_head_cache_st, "cache_st", struct cache_st);
 
 static struct eb32_node *insert_entry(struct cache *cache, struct cache_tree *tree, struct cache_entry *new_entry);
 static void delete_entry(struct cache_entry *del_entry);
@@ -2132,10 +2132,14 @@ enum act_return http_action_req_cache_use(struct act_rule *rule, struct proxy *p
 	if (s->txn->flags & TX_CACHE_IGNORE)
 		return ACT_RET_CONT;
 
-	if (px == strm_fe(s))
-		_HA_ATOMIC_INC(&px->fe_counters.shared->tg[tgid - 1]->p.http.cache_lookups);
-	else
-		_HA_ATOMIC_INC(&px->be_counters.shared->tg[tgid - 1]->p.http.cache_lookups);
+	if (px == strm_fe(s)) {
+		if (px->fe_counters.shared.tg[tgid - 1])
+			_HA_ATOMIC_INC(&px->fe_counters.shared.tg[tgid - 1]->p.http.cache_lookups);
+	}
+	else {
+		if (px->be_counters.shared.tg[tgid - 1])
+			_HA_ATOMIC_INC(&px->be_counters.shared.tg[tgid - 1]->p.http.cache_lookups);
+	}
 
 	cache_tree = get_cache_tree_from_hash(cache, read_u32(s->txn->cache_hash));
 
@@ -2221,10 +2225,14 @@ enum act_return http_action_req_cache_use(struct act_rule *rule, struct proxy *p
 			ctx->send_notmodified =
                                 should_send_notmodified_response(cache, htxbuf(&s->req.buf), res);
 
-			if (px == strm_fe(s))
-				_HA_ATOMIC_INC(&px->fe_counters.shared->tg[tgid - 1]->p.http.cache_hits);
-			else
-				_HA_ATOMIC_INC(&px->be_counters.shared->tg[tgid - 1]->p.http.cache_hits);
+			if (px == strm_fe(s)) {
+				if (px->fe_counters.shared.tg[tgid - 1])
+					_HA_ATOMIC_INC(&px->fe_counters.shared.tg[tgid - 1]->p.http.cache_hits);
+			}
+			else {
+				if (px->be_counters.shared.tg[tgid - 1])
+					_HA_ATOMIC_INC(&px->be_counters.shared.tg[tgid - 1]->p.http.cache_hits);
+			}
 			return ACT_RET_CONT;
 		} else {
 			s->target = NULL;
@@ -3139,6 +3147,7 @@ INITCALL1(STG_REGISTER, http_req_keywords_register, &http_req_actions);
 
 struct applet http_cache_applet = {
 	.obj_type = OBJ_TYPE_APPLET,
+	.flags = APPLET_FL_NEW_API|APPLET_FL_HTX,
 	.name = "<CACHE>", /* used for logging */
 	.fct = http_cache_io_handler,
 	.rcv_buf = appctx_htx_rcv_buf,

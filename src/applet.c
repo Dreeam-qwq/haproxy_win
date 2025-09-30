@@ -19,6 +19,7 @@
 #include <haproxy/channel.h>
 #include <haproxy/htx.h>
 #include <haproxy/list.h>
+#include <haproxy/log.h>
 #include <haproxy/sc_strm.h>
 #include <haproxy/stconn.h>
 #include <haproxy/stream.h>
@@ -28,7 +29,7 @@
 
 unsigned int nb_applets = 0;
 
-DECLARE_POOL(pool_head_appctx,  "appctx",  sizeof(struct appctx));
+DECLARE_TYPED_POOL(pool_head_appctx,  "appctx",  struct appctx);
 
 
 /* trace source and events */
@@ -232,6 +233,13 @@ struct appctx *appctx_new_on(struct applet *applet, struct sedesc *sedesc, int t
 
 	TRACE_ENTER(APPLET_EV_NEW);
 
+	if (unlikely(!(applet->flags & (APPLET_FL_NEW_API|APPLET_FL_WARNED)))) {
+		send_log(NULL, LOG_WARNING,
+			 "Applet '%s' is based on a deprecated API. Please report this error to developers\n",
+			 applet->name);
+		applet->flags |= APPLET_FL_WARNED;
+	}
+
 	appctx = pool_zalloc(pool_head_appctx);
 	if (unlikely(!appctx)) {
 		TRACE_ERROR("APPCTX allocation failure", APPLET_EV_NEW|APPLET_EV_ERR);
@@ -266,9 +274,17 @@ struct appctx *appctx_new_on(struct applet *applet, struct sedesc *sedesc, int t
 	appctx->outbuf = BUF_NULL;
 	appctx->to_forward = 0;
 
-	if (applet->rcv_buf != NULL && applet->snd_buf != NULL) {
+	if (applet->flags & APPLET_FL_NEW_API) {
 		appctx->t->process = task_process_applet;
-		applet_fl_set(appctx, APPCTX_FL_INOUT_BUFS);
+		/* Automatically set .rcv_buf and .snd_buf callback functions on default ones if not set */
+		if (applet->rcv_buf == NULL)
+			applet->rcv_buf = (applet->flags & APPLET_FL_HTX
+					   ? appctx_htx_rcv_buf
+					   : appctx_raw_rcv_buf);
+		if (applet->snd_buf == NULL)
+			applet->snd_buf = (applet->flags & APPLET_FL_HTX
+					   ? appctx_htx_snd_buf
+					   : appctx_raw_snd_buf);
 	}
 	else
 		appctx->t->process = task_run_applet;

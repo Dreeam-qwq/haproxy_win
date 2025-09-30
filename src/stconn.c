@@ -24,8 +24,8 @@
 #include <haproxy/stconn.h>
 #include <haproxy/xref.h>
 
-DECLARE_POOL(pool_head_connstream, "stconn", sizeof(struct stconn));
-DECLARE_POOL(pool_head_sedesc, "sedesc", sizeof(struct sedesc));
+DECLARE_TYPED_POOL(pool_head_connstream, "stconn", struct stconn);
+DECLARE_TYPED_POOL(pool_head_sedesc, "sedesc", struct sedesc);
 
 /* functions used by default on a detached stream connector */
 static void sc_app_abort(struct stconn *sc);
@@ -1806,6 +1806,8 @@ void sc_conn_sync_send(struct stconn *sc)
 		return;
 
 	sc_conn_send(sc);
+	if (oc->flags & CF_WRITE_EVENT)
+		oc->flags |= CF_WAKE_ONCE;
 }
 
 /* Called by I/O handlers after completion.. It propagates
@@ -2194,7 +2196,7 @@ int sc_applet_recv(struct stconn *sc)
  */
 int sc_applet_sync_recv(struct stconn *sc)
 {
-	if (!(__sc_appctx(sc)->flags & APPCTX_FL_INOUT_BUFS))
+	if (!appctx_app_test(__sc_appctx(sc), APPLET_FL_NEW_API))
 		return 0;
 
 	if (!sc_state_in(sc->state, SC_SB_RDY|SC_SB_EST))
@@ -2295,7 +2297,7 @@ void sc_applet_sync_send(struct stconn *sc)
 
 	oc->flags &= ~CF_WRITE_EVENT;
 
-	if (!(__sc_appctx(sc)->flags & APPCTX_FL_INOUT_BUFS))
+	if (!appctx_app_test(__sc_appctx(sc), APPLET_FL_NEW_API))
 		return;
 
 	if (sc->flags & SC_FL_SHUT_DONE)
@@ -2311,6 +2313,8 @@ void sc_applet_sync_send(struct stconn *sc)
 		return;
 
 	sc_applet_send(sc);
+	if (oc->flags & CF_WRITE_EVENT)
+		oc->flags |= CF_WAKE_ONCE;
 }
 
 /* Callback to be used by applet handlers upon completion. It updates the stream

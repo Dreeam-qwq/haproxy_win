@@ -34,7 +34,9 @@
 #include <haproxy/cfgparse.h>
 #include <haproxy/cli.h>
 #include <haproxy/clock.h>
+#ifdef USE_CPU_AFFINITY
 #include <haproxy/cpu_topo.h>
+#endif
 #include <haproxy/debug.h>
 #include <haproxy/fd.h>
 #include <haproxy/global.h>
@@ -322,7 +324,7 @@ void ha_thread_dump_one(struct buffer *buf, int is_caller)
 
 	chunk_appendf(buf,
 	              "%c%cThread %-2u: id=0x%llx act=%d glob=%d wq=%d rq=%d tl=%d tlsz=%d rqsz=%d\n"
-	              "     %2u/%-2u   stuck=%d prof=%d",
+	              "     %2u/%-2u   loops=%u ctxsw=%u stuck=%d prof=%d",
 	              (is_caller) ? '*' : ' ', stuck ? '>' : ' ', tid + 1,
 		      ha_get_pthread_id(tid),
 		      thread_has_tasks(),
@@ -336,6 +338,7 @@ void ha_thread_dump_one(struct buffer *buf, int is_caller)
 	              th_ctx->tasks_in_list,
 	              th_ctx->rq_total,
 		      ti->tgid, ti->ltid + 1,
+		      activity[tid].loops, activity[tid].ctxsw,
 	              stuck,
 	              !!(th_ctx->flags & TH_FL_TASK_PROFILING));
 
@@ -345,9 +348,24 @@ void ha_thread_dump_one(struct buffer *buf, int is_caller)
 	              !!(_HA_ATOMIC_LOAD(&tg_ctx->threads_harmless) & ti->ltid_bit),
 		      isolated_thread == tid);
 #endif
+#if (DEBUG_THREAD > 0) || defined(DEBUG_FULL)
+	chunk_appendf(buf, " locks=%d", th_ctx->lock_level);
+#endif
 
 	chunk_appendf(buf, "\n");
 	chunk_appendf(buf, "             cpu_ns: poll=%llu now=%llu diff=%llu\n", p, n, n-p);
+
+	/* also try to indicate for how long we've entered the current task.
+	 * Note that the task's wake date only contains the 32 lower bits of
+	 * the current time.
+	 */
+	if (th_ctx->current && tick_isset(th_ctx->sched_wake_date)) {
+		unsigned long long now = now_mono_time();
+
+		chunk_appendf(buf, "             current call: wake=%u ns ago, call=%llu ns ago\n",
+			      (uint)(now - th_ctx->sched_wake_date),
+			      (now - th_ctx->sched_call_date));
+	}
 
 	/* this is the end of what we can dump from outside the current thread */
 
@@ -751,8 +769,9 @@ static int debug_parse_cli_show_dev(char **args, char *payload, struct appctx *a
 	chunk_appendf(&trash, "  %-22s  %-11s  %-11s \n", "    ram limit (hard):",
 		LIM2A(normalize_rlim((ulong)post_mortem.process.boot_lim_ram.rlim_max), "unlimited"),
 		LIM2A(normalize_rlim((ulong)post_mortem.process.run_lim_ram.rlim_max), "unlimited"));
-
+#ifdef USE_CPU_AFFINITY
 	cpu_topo_dump_summary(ha_cpu_topo, &trash);
+#endif
 
 	ha_free(&err);
 
@@ -774,7 +793,7 @@ void ha_panic()
 		return;
 	}
 
-	chunk_printf(&trash, "\nPANIC! Thread %u is about to kill the process.\n", tid + 1);
+	chunk_printf(&trash, "\nPANIC! Thread %u is about to kill the process (pid %d).\n", tid + 1, pid);
 
 	/* dump a few of the post-mortem info */
 	chunk_appendf(&trash, "\nHAProxy info:\n  version: %s\n  features: %s\n",
@@ -920,7 +939,7 @@ void ha_stuck_warning(void)
 			     "          'global' section of your configuration to avoid this in the future.\n");
 	}
 
-	chunk_appendf(&buf, " => Trying to gracefully recover now.\n");
+	chunk_appendf(&buf, " => Trying to gracefully recover now (pid %d).\n", pid);
 
 	/* Note: it's important to dump the whole buffer at once to avoid
 	 * interleaved outputs from multiple threads dumping in parallel.
@@ -2250,9 +2269,9 @@ static int debug_iohandler_memstats(struct appctx *appctx)
 		func = ptr->caller.func;
 
 		switch (ptr->caller.what) {
-		case MEM_STATS_TYPE_CALLOC:  type = "CALLOC";  direction =  1; break;
+		case MEM_STATS_TYPE_CALLOC:  type = "CALLOC";  direction =  1; if (ptr->extra) info = (const char *)ptr->extra; break;
 		case MEM_STATS_TYPE_FREE:    type = "FREE";    direction = -1; break;
-		case MEM_STATS_TYPE_MALLOC:  type = "MALLOC";  direction =  1; break;
+		case MEM_STATS_TYPE_MALLOC:  type = "MALLOC";  direction =  1; if (ptr->extra) info = (const char *)ptr->extra; break;
 		case MEM_STATS_TYPE_REALLOC: type = "REALLOC"; break;
 		case MEM_STATS_TYPE_STRDUP:  type = "STRDUP";  direction =  1; break;
 		case MEM_STATS_TYPE_P_ALLOC: type = "P_ALLOC"; direction =  1; if (ptr->extra) info = ((const struct pool_head *)ptr->extra)->name; break;
