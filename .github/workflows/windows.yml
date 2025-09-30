@@ -57,11 +57,8 @@ jobs:
           DEBUG="-DDEBUG_POOL_INTEGRITY" \
           ${{ join(matrix.FLAGS, ' ') }}
 
-    - name: Release haproxy Windows
-      uses: marvinpinto/action-automatic-releases@master
+    - name: Upload haproxy Windows
+      uses: actions/upload-artifact@v4
       with:
-        title: "haproxy_win"
-        automatic_release_tag: "build_haproxy"
-        repo_token: "${{ secrets.GITHUB_TOKEN }}"
-        files: "./**.exe"
-        prerelease: true
+        name: haproxy_win"
+        path: "./**.exe"
